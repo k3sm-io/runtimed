@@ -1,0 +1,26 @@
+;; k3sm runtime — VALIDATED default-deny Seatbelt profile for a native pod process
+;; running at host paths (NO chroot). Confirmed on macOS 26.5.1 (arm64): a
+;; Foundation/CoreFoundation-linked arm64 binary launches, links frameworks and the
+;; dyld shared cache, and runs; /Users is denied; the pod dir is writable.
+;;
+;; The SBPL generator substitutes @@POD_ROOT@@ (and will inject per-pod network rules).
+;; CRITICAL: (import "system.sb") supplies the dyld/mach baseline — without it the
+;; process aborts (SIGABRT) during dynamic-linker init.
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-exec*)
+(allow process-fork)
+(allow file-read*
+  (subpath "/System")
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/Library")
+  (subpath "/private/var/db/dyld")
+  (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom")
+  (subpath "@@POD_ROOT@@"))
+(allow file-write*
+  (subpath "@@POD_ROOT@@")
+  (literal "/dev/null"))
+;; TODO(M2): tighten /usr and /Library to specific subpaths; inject per-pod network
+;; rules (network-bind/outbound scoped to the pod IP) supplied by darwin-net.
