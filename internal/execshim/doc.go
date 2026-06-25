@@ -1,7 +1,9 @@
-// Package execshim is the in-process Seatbelt apply + execve core of the
-// k3sm-execshim helper. It exposes a single Go function, ConfineAndExec, that
-// compiles+applies an SBPL profile to the CURRENT process via the private
-// libsandbox SPI and then execve's the pod binary, preserving the environment.
+// Package execshim is the in-process privilege-drop + Seatbelt apply + execve
+// core of the k3sm-execshim helper. It exposes a single Go function, RunPodLaunch,
+// that — in the irreversible order supervisor.RunLaunchSequence enforces — drops
+// to the pod's securityContext identity (setgid→initgroups→setuid), compiles and
+// applies an SBPL profile to the CURRENT process via the private libsandbox SPI,
+// and then execve's the pod binary, preserving the environment.
 //
 // This is the only place the libsandbox cgo lives (execshim_darwin.go); it is
 // linked into the cmd/k3sm-execshim helper. The helper is the M1 sandbox.Backend

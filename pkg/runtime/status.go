@@ -33,8 +33,9 @@ func newBroker() *broker {
 }
 
 // subscribe registers a watcher for podID ("" = all pods) and returns its event
-// channel plus a cancel func that unregisters and closes the channel. The caller
-// (WatchPodStatus) should send any current snapshots after subscribing.
+// channel plus a cancel func that unregisters the subscriber. The caller
+// (WatchPodStatus) should send any current snapshots after subscribing and
+// terminates on its own ctx (not on a channel close — see cancel).
 func (b *broker) subscribe(podID string) (<-chan *runtimev1.PodStatusEvent, func()) {
 	b.mu.Lock()
 	id := b.next
@@ -43,12 +44,14 @@ func (b *broker) subscribe(podID string) (<-chan *runtimev1.PodStatusEvent, func
 	b.subs[id] = sub
 	b.mu.Unlock()
 
+	// cancel only unregisters; it does NOT close ch. publish is the sender and
+	// sends OUTSIDE the lock, so a receiver-side close would race a concurrent
+	// send (send-on-closed-channel) — the "sender closes, never the receiver"
+	// rule. The unreferenced buffered channel is GC'd once the consumer (which is
+	// the sole reader and the caller of cancel) returns on its ctx.
 	cancel := func() {
 		b.mu.Lock()
-		if s, ok := b.subs[id]; ok {
-			delete(b.subs, id)
-			close(s.ch)
-		}
+		delete(b.subs, id)
 		b.mu.Unlock()
 	}
 	return sub.ch, cancel

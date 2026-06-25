@@ -42,7 +42,7 @@ func genProfile(t *testing.T, dataVol string, extraRead ...string) string {
 	out, err := Generate(&runtimev1.SandboxProfile{
 		DataVolumePath: dataVol,
 		ExtraReadPaths: extraRead,
-	})
+	}, GenerateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,9 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	full := append([]string{pf}, argv...)
+	// New shim contract: <uid> <gid> <groups-csv> <profile.sb> <pod-binary>...
+	// "-1 -1 -" requests no privilege drop (run as the test/daemon identity).
+	full := append([]string{"-1", "-1", "-", pf}, argv...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shim, full...)

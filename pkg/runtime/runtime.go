@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -64,16 +65,17 @@ type Config struct {
 type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
-	cfg     Config
-	log     *slog.Logger
-	cache   *image.Cache
-	puller  Puller
-	signer  Signer
-	backend sandbox.Backend
-	spawner supervisor.Spawner
-	waiter  supervisor.ExitWaiter
-	network supervisor.PodNetwork
-	broker  *broker
+	cfg      Config
+	log      *slog.Logger
+	cache    *image.Cache
+	puller   Puller
+	signer   Signer
+	backend  sandbox.Backend
+	spawner  supervisor.Spawner
+	waiter   supervisor.ExitWaiter
+	network  supervisor.PodNetwork
+	resolver mount.Resolver
+	broker   *broker
 
 	mu   sync.Mutex
 	pods map[string]*pod
@@ -90,6 +92,11 @@ type Deps struct {
 	Spawner supervisor.Spawner
 	Waiter  supervisor.ExitWaiter
 	Network supervisor.PodNetwork
+	// Resolver supplies ConfigMap/Secret data and SA tokens for volume
+	// materialization (M2.2). It has NO production default: runtimed never talks
+	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
+	// client. A pod with a data-backed volume and no Resolver fails closed.
+	Resolver mount.Resolver
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -142,17 +149,18 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 
 	return &Runtime{
-		cfg:     cfg,
-		log:     log,
-		cache:   cache,
-		puller:  puller,
-		signer:  signer,
-		backend: backend,
-		spawner: spawner,
-		waiter:  waiter,
-		network: network,
-		broker:  newBroker(),
-		pods:    make(map[string]*pod),
+		cfg:      cfg,
+		log:      log,
+		cache:    cache,
+		puller:   puller,
+		signer:   signer,
+		backend:  backend,
+		spawner:  spawner,
+		waiter:   waiter,
+		network:  network,
+		resolver: deps.Resolver,
+		broker:   newBroker(),
+		pods:     make(map[string]*pod),
 	}, nil
 }
 
