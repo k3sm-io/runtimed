@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -30,20 +31,39 @@ const (
 
 // Puller is the image-pull seam the Runtime consumes (the concrete *image.Puller
 // satisfies it). Defined at the consumer per the standards so tests can inject a
-// fake that never touches a registry.
+// fake that never touches a registry. cred (M2.6) is the imagePullSecret
+// credential, consumed only by the pull client; nil = anonymous pull.
 type Puller interface {
-	Pull(ctx context.Context, ref string) (*image.PullResult, error)
+	Pull(ctx context.Context, ref string, cred *image.RegistryCredential) (*image.PullResult, error)
 }
 
 // Signer ad-hoc signs a pulled binary and gates it against a SignaturePolicy
 // before exec. The image package provides both halves; the Runtime consumes them
-// as one seam (fakeable in tests).
+// as one seam (fakeable in tests). gateSignature orders the two correctly per
+// policy (M2.6): ad-hoc sign ONLY for adhoc-ok; check-without-sign for
+// require-signed/require-notarized so a real signature is never silently
+// downgraded.
 type Signer interface {
 	// Sign ad-hoc signs the Mach-O at path (codesign -s - -f, no hardened
 	// runtime) so a later DYLD insert can load.
 	Sign(ctx context.Context, path string) error
 	// Check enforces policy against path's signature, fail-closed on UNSPECIFIED.
 	Check(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error
+}
+
+// CredentialResolver resolves the registry pull credential for an image from the
+// pod's imagePullSecrets (M2.6). Like mount.Resolver it is a consumer-side seam:
+// runtimed never reads the apiserver, so the provider (k3sm) supplies one backed
+// by its client (it reads the referenced docker-config Secrets); unit tests fake
+// it. A nil resolver, an empty imagePullSecrets list, or an ok==false result means
+// an anonymous pull (public images).
+//
+// The resolved credential is consumed ONLY by the image pull client and is NEVER
+// written into the pod dir / materialized filesystem — the M2.6 security invariant.
+type CredentialResolver interface {
+	// PullCredential returns the credential for pulling ref given the pod's
+	// namespace-local imagePullSecret references, or ok=false for an anonymous pull.
+	PullCredential(ctx context.Context, namespace string, secrets []*runtimev1.LocalObjectReference, ref string) (cred *image.RegistryCredential, ok bool, err error)
 }
 
 // Config configures a Runtime. Zero values get sensible defaults via New.
@@ -55,6 +75,9 @@ type Config struct {
 	RuntimeVersion string
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
+	// SampleInterval is the memory sampler's polling period (M2.5). Defaults to
+	// 1s (the ~1 Hz the design calls for); tests set it small.
+	SampleInterval time.Duration
 }
 
 // Runtime is the in-process node runtime implementing runtimev1.RuntimeServer.
@@ -65,17 +88,24 @@ type Config struct {
 type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
-	cfg      Config
-	log      *slog.Logger
-	cache    *image.Cache
-	puller   Puller
-	signer   Signer
-	backend  sandbox.Backend
-	spawner  supervisor.Spawner
-	waiter   supervisor.ExitWaiter
-	network  supervisor.PodNetwork
-	resolver mount.Resolver
-	broker   *broker
+	cfg         Config
+	log         *slog.Logger
+	cache       *image.Cache
+	puller      Puller
+	signer      Signer
+	credentials CredentialResolver
+	backend     sandbox.Backend
+	spawner     supervisor.Spawner
+	waiter      supervisor.ExitWaiter
+	network     supervisor.PodNetwork
+	resolver    mount.Resolver
+	footprinter supervisor.Footprinter
+	broker      *broker
+
+	// signalGroup signals a pod's process GROUP (supervisor.SignalGroup in
+	// production); it is a field so the graceful-stop (M2.4) and OOM-kill (M2.5)
+	// paths are unit-testable with a recorder.
+	signalGroup func(pgid int, sig os.Signal) error
 
 	mu   sync.Mutex
 	pods map[string]*pod
@@ -97,6 +127,17 @@ type Deps struct {
 	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
 	// client. A pod with a data-backed volume and no Resolver fails closed.
 	Resolver mount.Resolver
+	// Credentials resolves imagePullSecret registry credentials (M2.6). Like
+	// Resolver it has NO production default (runtimed never reads the apiserver):
+	// the provider wires one. nil means anonymous pulls only.
+	Credentials CredentialResolver
+	// Footprinter samples per-PID memory footprints for the OOM/metering sampler
+	// (M2.5). Defaults to supervisor.PhysFootprinter (proc_pid_rusage); tests
+	// inject a fake.
+	Footprinter supervisor.Footprinter
+	// SignalGroup signals a process group (M2.4 graceful stop / M2.5 OOM kill).
+	// Defaults to supervisor.SignalGroup; tests inject a recorder.
+	SignalGroup func(pgid int, sig os.Signal) error
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -147,21 +188,41 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if network == nil {
 		network = supervisor.NodeNetwork{}
 	}
+	footprinter := deps.Footprinter
+	if footprinter == nil {
+		footprinter = supervisor.PhysFootprinter{}
+	}
+	signalGroup := deps.SignalGroup
+	if signalGroup == nil {
+		signalGroup = supervisor.SignalGroup
+	}
 
 	return &Runtime{
-		cfg:      cfg,
-		log:      log,
-		cache:    cache,
-		puller:   puller,
-		signer:   signer,
-		backend:  backend,
-		spawner:  spawner,
-		waiter:   waiter,
-		network:  network,
-		resolver: deps.Resolver,
-		broker:   newBroker(),
-		pods:     make(map[string]*pod),
+		cfg:         cfg,
+		log:         log,
+		cache:       cache,
+		puller:      puller,
+		signer:      signer,
+		credentials: deps.Credentials,
+		backend:     backend,
+		spawner:     spawner,
+		waiter:      waiter,
+		network:     network,
+		resolver:    deps.Resolver,
+		footprinter: footprinter,
+		signalGroup: signalGroup,
+		broker:      newBroker(),
+		pods:        make(map[string]*pod),
 	}, nil
+}
+
+// sampleInterval is the memory sampler's polling period (Config.SampleInterval,
+// default 1s ≈ the ~1 Hz the M2.5 design calls for).
+func (r *Runtime) sampleInterval() time.Duration {
+	if r.cfg.SampleInterval > 0 {
+		return r.cfg.SampleInterval
+	}
+	return time.Second
 }
 
 // defaultSigner is the production Signer backed by the image package's codesign

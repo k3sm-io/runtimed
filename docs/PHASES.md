@@ -93,7 +93,8 @@ phases:
 
   - id: M2
     title: Daemon split (root gRPC) + mounts + privilege drop + grace + OOMKill/QoS/Summary + canary
-    status: todo
+    status: done
+    completed: 2026-06-25
     depends_on:
       - apis:M2.1
     subphases:
@@ -180,63 +181,71 @@ phases:
             test: pkg/supervisor.TestChownForFSGroup + pkg/supervisor.TestChownForFSGroupRejectsRootGid
       - id: M2.4
         title: terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL
-        status: todo
+        status: done
+        completed: 2026-06-25
         depends_on:
           - apis:M2.1
         deliverables:
           - id: M2.4-d1
-            done: false
-            desc: pkg/supervisor — NET-NEW graceful stop (DeletePod currently hardwires SIGKILL and ignores grace_period_seconds). Implement SIGTERM → a per-PID grace timer RACED AGAINST the kqueue(EVFILT_PROC) reaper (an early voluntary exit cancels the timer and skips the SIGKILL) → SIGKILL escalation on timer expiry
+            done: true
+            desc: pkg/supervisor — NET-NEW graceful stop. supervisor.GracefulStop (pure Go, signals injected) sends SIGTERM then RACES a per-PID grace timer against the kqueue reaper via Process.Done() — an early voluntary exit stops the timer (no leak) and SKIPS the SIGKILL; the deadline (or ctx cancel) escalates to SIGKILL; grace 0 is an immediate SIGKILL (no SIGTERM). The kqueue reaper stays the SOLE reaper (GracefulStop only OBSERVES Done, never wait4s). Wired into pkg/runtime.DeletePod (was a hardwired SIGKILL ignoring grace_period_seconds) via the runtime signalGroup seam; resolveGrace uses DeletePodRequest.grace_period_seconds, falling back to PodBox.termination_grace_period_seconds (0 = immediate; the k8s 30s default for UNSET is applied provider-side since proto3 can't distinguish unset from explicit 0)
         acceptance:
           - id: M2.4-a1
-            met: false
-            check: a pod that exits on SIGTERM within the grace period is reaped without a SIGKILL; a pod that ignores SIGTERM is SIGKILLed after grace_period_seconds
-            method: integration
+            met: true
+            check: a pod that exits on SIGTERM within the grace period is reaped without a SIGKILL; a pod that ignores SIGTERM is SIGKILLed after grace_period_seconds; grace 0 is an immediate SIGKILL. Proven root-free with fake signal/reaper seams (SIGTERM-first, early-exit-skips-SIGKILL + timer stopped, deadline→SIGKILL, ctx-cancel→SIGKILL, grace0→immediate); the live real-signal kill is the m2.sh e2e under root
+            method: unit
+            test: pkg/supervisor.TestGracefulStop + pkg/runtime.TestDeletePodGracefulStop
       - id: M2.5
         title: proc_pid_rusage memory sampler → OOMKilled + Summary API (best-effort CPU QoS)
-        status: todo
+        status: done
+        completed: 2026-06-25
         depends_on:
           - apis:M2.1
         deliverables:
           - id: M2.5-d1
-            done: false
-            desc: pkg/supervisor (cgo *_darwin.go) — NET-NEW cgo subsystem (no proc_pid_rusage / memorystatus binding exists yet). Sample ri_phys_footprint at ~1 Hz, SIGKILL the pod on a memory-limit breach and emit an OOMKilled termination reason; isolate the SPI behind a clean Go interface + the M2.1 symbol-canary
+            done: true
+            desc: pkg/supervisor — NET-NEW cgo subsystem. rusage_darwin.go binds proc_pid_rusage(RUSAGE_INFO_V2) → ri_phys_footprint behind the Footprinter Go interface (PhysFootprinter; rusage_other.go stub off darwin), re-verified by the M2.1 symbol-canary. MemorySampler (pure Go) samples the pod's summed footprint at ~1 Hz, fires onBreach ONCE on a memory-limit breach, exposes Last() for metering, and stops on ctx cancel (Done closes — no goroutine leak). pkg/runtime.oomKill SIGKILLs the pod on breach and watchContainerExit records the OOMKilled termination reason. The memory limit is carried by the k3sm.io/memory-limit-bytes annotation (interim, until the apis:M2.2 typed PodBox field lands; the proto reserves the band but has not defined it)
           - id: M2.5-d2
-            done: false
-            desc: pkg/runtime — surface the sampled footprint to the Summary API so kubectl top reports pod memory; CPU limits are best-effort QoS (taskpolicy / setpriority), explicitly documented as NOT CFS millicores
+            done: true
+            desc: pkg/runtime — Runtime.PodMetrics surfaces the sampled footprint (WorkingSetBytes from ri_phys_footprint) as the kubectl-top / Summary-API source the provider wires to the kubelet Summary endpoint (Wave 3). CPU limits are best-effort QoS (taskpolicy / setpriority), explicitly documented as NOT CFS millicores; QoS APPLICATION is deferred with the apis:M2.2 CPU-limit field (no proto field to read a CPU limit from yet)
           - id: M2.5-d3
-            done: false
-            desc: docs — document that ri_phys_footprint is NOT RSS (it counts compressed + IOKit-mapped memory) so the kubectl top number and the OOM threshold are explained
+            done: true
+            desc: docs/resources.md — documents that ri_phys_footprint is NOT RSS (resident + compressed + wired + IOKit-mapped, the jetsam/memorystatus figure), that the memory limit + kubectl-top working set are compared/reported in those units, that child PIDs aren't summed in M2, and that CPU is best-effort QoS not CFS millicores. Referenced from the PhysFootprinter / MemorySampler / PodMetrics doc comments
         acceptance:
           - id: M2.5-a1
-            met: false
-            check: a pod that exceeds its memory limit is SIGKILLed and its ContainerStatus reports OOMKilled
-            method: integration
+            met: true
+            check: a pod that exceeds its memory limit is SIGKILLed and its ContainerStatus reports OOMKilled. Proven root-free with a fake rusage source + a fake signalGroup driving the full breach→SIGKILL→reaper→OOMKilled-reason chain (and the sampler-stops-on-exit / breach-fires-once / no-leak mechanics); the real-proc_pid_rusage binding is exercised on self, and the live OOM under a real limit is the m2.sh e2e
+            method: unit
+            test: pkg/supervisor.TestMemorySamplerOOMBreachFiresOnce + pkg/supervisor.TestPhysFootprinterSelf + pkg/runtime.TestCreatePodOOMKilled
           - id: M2.5-a2
-            met: false
-            check: the Summary API returns a non-zero working-set for a running pod (kubectl top path) sourced from ri_phys_footprint
-            method: integration
+            met: true
+            check: the Summary API (Runtime.PodMetrics) returns a non-zero working-set for a metered running pod sourced from ri_phys_footprint (the kubectl top path); the live number under load is the m2.sh e2e
+            method: unit
+            test: pkg/supervisor.TestMemorySamplerMetersWorkingSet + pkg/runtime.TestPodMetricsSurfacesFootprint
       - id: M2.6
         title: imagePullSecrets — registry auth confined to the pull client, signature policy before ad-hoc-sign
-        status: todo
+        status: done
+        completed: 2026-06-25
         depends_on:
           - apis:M2.1
         deliverables:
           - id: M2.6-d1
-            done: false
-            desc: pkg/image — consume the imagePullSecret registry credential ONLY inside the pull client (go-containerregistry authn), NEVER written into the pod dir
+            done: true
+            desc: pkg/image — RegistryCredential is consumed ONLY inside the pull client (go-containerregistry authn via remote.WithAuth on the fetch transport); the FetchFunc/RemoteFetch/Puller.Pull seam carries it, it is never written to the cache or pod dir. The proto carries only a LocalObjectReference list; the actual docker-config credential is supplied by the consumer-side CredentialResolver seam (pkg/runtime; the provider resolves the Secret, runtimed never reads the apiserver) — mirroring the mount.Resolver pattern. nil resolver / empty list / ok=false ⇒ anonymous pull
           - id: M2.6-d2
-            done: false
-            desc: pkg/image — enforce the SignaturePolicy (require-notarized / require-signed / adhoc-ok) BEFORE the codesign -s - -f ad-hoc-sign step (a require-notarized image must not be silently downgraded by ad-hoc signing)
+            done: true
+            desc: pkg/runtime — gateSignature enforces the SignaturePolicy in the correct order relative to ad-hoc signing. ADHOC_OK signs then checks; REQUIRE_SIGNED / REQUIRE_NOTARIZED check the AS-PULLED binary and NEVER ad-hoc sign it (codesign -s - -f would strip notarization / replace a real authority — a silent downgrade); UNSPECIFIED fails closed. Replaces the prior unconditional sign-then-check in startContainer
         acceptance:
           - id: M2.6-a1
-            met: false
-            check: a private image pulls with the imagePullSecret credential and the credential never appears on disk in the pod dir
-            method: integration
+            met: true
+            check: a private image pulls with the imagePullSecret credential and the credential never appears on disk in the pod dir. Proven with a fake CredentialResolver + a fake Puller recording the received cred + a pod-dir walk asserting the secret bytes are absent; the live private-registry pull is the m2.sh e2e
+            method: unit
+            test: pkg/runtime.TestCreatePodImagePullSecretConfinedToPuller + pkg/image.TestPullPassesCredentialToFetch
           - id: M2.6-a2
-            met: false
-            check: require-notarized / require-signed reject before the ad-hoc-sign step; adhoc-ok proceeds to ad-hoc sign
-            method: integration
+            met: true
+            check: require-notarized / require-signed reject BEFORE (and instead of) the ad-hoc-sign step (no silent downgrade); adhoc-ok proceeds to ad-hoc sign then check. Asserted on a fake signer recording the Sign/Check call order; the live codesign/spctl behavior is the m2.sh e2e
+            method: unit
+            test: pkg/runtime.TestGateSignatureOrdering
 
   - id: M3
     title: APFS-backed persistent volume (PV/PVC) — stable same-volume dir, seed-once, lifecycle-decoupled
@@ -355,7 +364,7 @@ relocation. Streaming RPCs `Exec`/`Attach`/`PortForward` are stubbed `Unimplemen
 - ✅ `M1.2-a2` generated SBPL always imports `system.sb`; rejects a profile without it — `TestGenerateGolden` + `TestValidate`
 - ✅ `M1.2-a3` no `sandbox-exec` call leaks outside `pkg/sandbox` — one `sandbox.Backend` interface; no `/usr/bin/sandbox-exec` call
 
-## M2 — Daemon split + mounts + privilege drop + grace + resources + canary 🟡
+## M2 — Daemon split + mounts + privilege drop + grace + resources + canary ✅
 **Cross-repo dep:** `apis:M2.1` (the additive `PodBox`/`Container` fields — volumes, volumeMounts,
 securityContext, terminationGracePeriodSeconds, imagePullSecret — plus the matching `ContainerStatus`
 mirror fields, and the `GetRuntimeInfoResponse.api_version` handshake for the provider↔runtimed
@@ -432,45 +441,63 @@ daemon split). All M2 sub-phases below are NET-NEW capabilities (not "wire an ex
 - ✅ `M2.3-a2` with `fsGroup` set the writable mount root is group-owned by `fsGroup` and group-accessible,
   set before the drop — `pkg/supervisor.TestChownForFSGroup` (live arbitrary-gid chown is the `m2.sh` e2e).
 
-### M2.4 — terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL ⬜
+### M2.4 — terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL ✅
 **Deliverables**
-- ⬜ `M2.4-d1` `pkg/supervisor`: **NET-NEW** graceful stop (`DeletePod` currently hardwires SIGKILL and
-  ignores `grace_period_seconds`). `SIGTERM` → a per-PID grace timer **raced against the
-  `kqueue(EVFILT_PROC)` reaper** (an early voluntary exit cancels the timer and skips the SIGKILL) →
-  `SIGKILL` escalation on timer expiry.
+- ✅ `M2.4-d1` `pkg/supervisor`: **NET-NEW** graceful stop. `supervisor.GracefulStop` (pure Go, signals
+  injected) sends `SIGTERM` then **races a per-PID grace timer against the `kqueue(EVFILT_PROC)` reaper**
+  via `Process.Done()` — an early voluntary exit stops the timer (no leak) and **skips the SIGKILL**; the
+  deadline (or ctx cancel) escalates to `SIGKILL`; grace 0 is an immediate `SIGKILL`. The kqueue reaper
+  stays the **sole reaper** (GracefulStop only *observes* `Done`). Wired into `pkg/runtime.DeletePod` (was a
+  hardwired SIGKILL) via the `signalGroup` seam; `resolveGrace` reads `DeletePodRequest.grace_period_seconds`
+  → falls back to `PodBox.termination_grace_period_seconds` (0 = immediate; the k8s 30s default for *unset*
+  is applied provider-side, since proto3 can't tell unset from an explicit 0).
 
 **Acceptance (exit gate)**
-- ⬜ `M2.4-a1` a pod that exits on SIGTERM within grace is reaped without a SIGKILL; a pod that ignores
-  SIGTERM is SIGKILLed after `grace_period_seconds`.
+- ✅ `M2.4-a1` SIGTERM-first; early exit within grace → no SIGKILL + timer stopped; deadline → SIGKILL;
+  grace 0 → immediate SIGKILL — `pkg/supervisor.TestGracefulStop` + `pkg/runtime.TestDeletePodGracefulStop`
+  (root-free fake signal/reaper seams; the live real-signal kill is the `m2.sh` e2e under root).
 
-### M2.5 — `proc_pid_rusage` memory sampler → OOMKilled + Summary API (best-effort CPU QoS) ⬜
+### M2.5 — `proc_pid_rusage` memory sampler → OOMKilled + Summary API (best-effort CPU QoS) ✅
 **Deliverables**
-- ⬜ `M2.5-d1` `pkg/supervisor` (cgo `*_darwin.go`): **NET-NEW** cgo subsystem (no `proc_pid_rusage` /
-  `memorystatus` binding exists yet). Sample `ri_phys_footprint` (~1 Hz), SIGKILL on a memory-limit
-  breach + emit `OOMKilled`; isolate the SPI behind a clean Go interface + the M2.1 canary.
-- ⬜ `M2.5-d2` `pkg/runtime`: surface the footprint to the **Summary API** so `kubectl top` reports pod
-  memory; CPU limits are **best-effort QoS** (`taskpolicy`/`setpriority`), explicitly **NOT CFS millicores**.
-- ⬜ `M2.5-d3` docs: `ri_phys_footprint` **≠ RSS** (it counts compressed + IOKit-mapped memory) — explain
-  the `kubectl top` number and the OOM threshold.
+- ✅ `M2.5-d1` `pkg/supervisor`: **NET-NEW** cgo subsystem. `rusage_darwin.go` binds
+  `proc_pid_rusage(RUSAGE_INFO_V2)` → `ri_phys_footprint` behind the `Footprinter` interface
+  (`PhysFootprinter`; `rusage_other.go` stub off darwin), re-verified by the M2.1 symbol-canary.
+  `MemorySampler` (pure Go) sums the pod footprint ~1 Hz, fires `onBreach` **once**, exposes `Last()`, and
+  stops on ctx cancel (`Done` closes — no leak). `pkg/runtime.oomKill` SIGKILLs on breach;
+  `watchContainerExit` records the **`OOMKilled`** reason. The limit rides the `k3sm.io/memory-limit-bytes`
+  annotation (interim, pending the `apis:M2.2` typed field).
+- ✅ `M2.5-d2` `pkg/runtime`: `Runtime.PodMetrics` surfaces the footprint (`WorkingSetBytes`) as the
+  **Summary-API / kubectl top** source the provider wires to the kubelet Summary endpoint (Wave 3). CPU is
+  **best-effort QoS** (`taskpolicy`/`setpriority`), **NOT CFS millicores**; QoS *application* is deferred
+  with the `apis:M2.2` CPU-limit field.
+- ✅ `M2.5-d3` `docs/resources.md`: `ri_phys_footprint` **≠ RSS** (resident + compressed + wired +
+  IOKit-mapped; the jetsam figure) — the limit + working set are in those units; CPU best-effort, not CFS.
 
 **Acceptance (exit gate)**
-- ⬜ `M2.5-a1` a pod over its memory limit is SIGKILLed and its `ContainerStatus` reports `OOMKilled`.
-- ⬜ `M2.5-a2` the Summary API returns a non-zero working-set (the `kubectl top` path) sourced from
-  `ri_phys_footprint`.
+- ✅ `M2.5-a1` a pod over its memory limit is SIGKILLed and its `ContainerStatus` reports `OOMKilled` —
+  `pkg/supervisor.TestMemorySamplerOOMBreachFiresOnce` + `TestPhysFootprinterSelf` +
+  `pkg/runtime.TestCreatePodOOMKilled` (fake rusage source; the live OOM under a real limit is the `m2.sh` e2e).
+- ✅ `M2.5-a2` the Summary API (`PodMetrics`) returns a non-zero working-set sourced from `ri_phys_footprint`
+  — `pkg/supervisor.TestMemorySamplerMetersWorkingSet` + `pkg/runtime.TestPodMetricsSurfacesFootprint`.
 
-### M2.6 — imagePullSecrets — registry auth confined to the pull client, policy before ad-hoc-sign ⬜
+### M2.6 — imagePullSecrets — registry auth confined to the pull client, policy before ad-hoc-sign ✅
 **Deliverables**
-- ⬜ `M2.6-d1` `pkg/image`: consume the registry credential **only** inside the pull client
-  (go-containerregistry authn), **never** written into the pod dir.
-- ⬜ `M2.6-d2` `pkg/image`: enforce the `SignaturePolicy` (`require-notarized`/`require-signed`/`adhoc-ok`)
-  **before** the `codesign -s - -f` ad-hoc-sign step (a `require-notarized` image must not be silently
-  downgraded by ad-hoc signing).
+- ✅ `M2.6-d1` `pkg/image`: `RegistryCredential` is consumed **only** in the pull client
+  (go-containerregistry `remote.WithAuth` on the fetch transport) — the `FetchFunc`/`Pull` seam carries it,
+  it is **never** written to the cache or pod dir. The proto carries a `LocalObjectReference` list; the
+  docker-config credential comes from the consumer-side `CredentialResolver` seam (the provider resolves
+  the Secret; runtimed never reads the apiserver), mirroring `mount.Resolver`.
+- ✅ `M2.6-d2` `pkg/runtime`: `gateSignature` enforces the `SignaturePolicy` in the correct order —
+  `adhoc-ok` signs then checks; `require-signed`/`require-notarized` check the **as-pulled** binary and
+  **never** ad-hoc sign it (`codesign -s - -f` would strip notarization / downgrade a real authority);
+  `UNSPECIFIED` fails closed.
 
 **Acceptance (exit gate)**
-- ⬜ `M2.6-a1` a private image pulls with the `imagePullSecret` and the credential never lands on disk in
-  the pod dir.
-- ⬜ `M2.6-a2` `require-notarized`/`require-signed` reject **before** the ad-hoc-sign step; `adhoc-ok`
-  proceeds to ad-hoc sign.
+- ✅ `M2.6-a1` a private image pulls with the `imagePullSecret` and the credential never lands on disk in
+  the pod dir — `pkg/runtime.TestCreatePodImagePullSecretConfinedToPuller` +
+  `pkg/image.TestPullPassesCredentialToFetch` (the live private-registry pull is the `m2.sh` e2e).
+- ✅ `M2.6-a2` `require-notarized`/`require-signed` reject **before** (and instead of) ad-hoc signing;
+  `adhoc-ok` proceeds to sign-then-check — `pkg/runtime.TestGateSignatureOrdering` (fake signer, call-order).
 
 ## M3 — APFS-backed persistent volume (PV/PVC) ⬜
 **Cross-repo dep:** `apis:M3.1` (the PV/PVC volume source on `PodBox`; **NodePort needs no `apis`
@@ -517,14 +544,23 @@ macOS-arm64 CI for the cgo build; node-conformance-subset hooks.
 - ⬜ `M5.1-a2` the SPI symbol-canary set is **unchanged** by M5 (VZ is public, not an SPI).
 
 ## Next
-M1 is complete (library form: `pkg/image`, `pkg/sandbox`, `pkg/supervisor`, `pkg/runtime`
-implementing `apis runtime/v1` in-process; exec-shim Seatbelt confinement with `DYLD_INSERT_LIBRARIES`
-preserved — the darwin-net DNS-shim enabler). M2 is the **stockkitty-readiness** milestone for the
-native runtime (`../../docs/stockkitty-readiness.md`): split `k3sm-runtimed` into a root gRPC daemon
-(a relocation of the existing `*runtime.Runtime`) and grow `internal/spicanary` to `memorystatus` /
-`proc_pid_rusage` (M2.1); then the NET-NEW capabilities — volume-mount materialization + validated
-SBPL extra-path injection (M2.2), the `setgid→initgroups→setuid` privilege drop + `fsGroup` chown
-before `sandbox_apply` (M2.3), SIGTERM/grace-timer/SIGKILL graceful stop raced against the reaper
-(M2.4), the `proc_pid_rusage` memory sampler → `OOMKilled` + Summary API (M2.5), and imagePullSecret
-auth confined to the pull client (M2.6). M3 adds the APFS-backed PV/PVC (stable same-volume dir,
-seed-once, lifecycle-decoupled); M5 adds the Virtualization.framework `vm` backend for Linux images.
+M1 and M2 are complete at the **runtimed unit-provable level**. M2 (the **stockkitty-readiness**
+milestone, `../../docs/stockkitty-readiness.md`) split `k3sm-runtimed` into a root gRPC daemon + grew
+`internal/spicanary` (M2.1); volume-mount materialization + validated SBPL extra-path injection (M2.2);
+the `setgid→initgroups→setuid` drop + `fsGroup` chown before `sandbox_apply` (M2.3); SIGTERM/grace-timer/
+SIGKILL graceful stop raced against the reaper (M2.4); the `proc_pid_rusage` memory sampler → `OOMKilled`
++ `PodMetrics` Summary source (M2.5); and imagePullSecret auth confined to the pull client + signature
+policy before ad-hoc sign (M2.6).
+
+**Two milestone-gate items remain outside runtimed's per-repo `status: done`** (ROADMAP §phase-gate #2/#3,
+the orchestrator's responsibility): the workspace `k3sm/hack/acceptance/m2.sh` **root e2e** (real
+signals/uid/registry/OOM under a real memory limit), and the **Wave-3 `k3sm` provider wiring** — map
+`Runtime.PodMetrics` to the kubelet Summary endpoint, implement the `CredentialResolver` (docker-config
+Secret → `image.RegistryCredential`) and the `mount.Resolver`, derive `DeletePodRequest.grace_period_seconds`
+(applying the k8s 30s default), and set the `k3sm.io/memory-limit-bytes` annotation. **apis follow-up:**
+`apis:M2.2` should add the first-class `PodBox` memory-limit field + a Summary/pod-stats message + the
+`ContainerStatus.resources` mirror; until then the limit rides the annotation and `PodMetrics` is a
+runtimed-internal type.
+
+M3 adds the APFS-backed PV/PVC (stable same-volume dir, seed-once, lifecycle-decoupled); M5 adds the
+Virtualization.framework `vm` backend for Linux images.
