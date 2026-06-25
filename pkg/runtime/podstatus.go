@@ -22,12 +22,15 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 		st.PodIps = []string{p.podIP}
 	}
 	for _, cp := range p.containers {
-		// Clone the per-container status so callers can't mutate pod state.
+		// Clone the per-container status so callers can't mutate pod state. The
+		// volume_mount + user mirrors (M2.2/M2.3) are carried through losslessly.
 		cs := &runtimev1.ContainerStatus{
-			Name:  cp.state.GetName(),
-			Image: cp.state.GetImage(),
-			State: cp.state.GetState(),
-			Ready: cp.state.GetState().GetRunning() != nil,
+			Name:         cp.state.GetName(),
+			Image:        cp.state.GetImage(),
+			State:        cp.state.GetState(),
+			Ready:        cp.state.GetState().GetRunning() != nil,
+			VolumeMounts: cp.state.GetVolumeMounts(),
+			User:         cp.state.GetUser(),
 		}
 		st.ContainerStatuses = append(st.ContainerStatuses, cs)
 	}

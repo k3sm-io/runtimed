@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -67,23 +68,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 			fmt.Errorf("pod %s: sandbox_profile is required", box.GetPodId())
 	}
 
-	profile, err := sandbox.Generate(sp)
-	if err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-			fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
-	}
-
 	ip, err := r.network.Setup(ctx, box.GetPodId())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
 			fmt.Errorf("network setup pod %s: %w", box.GetPodId(), err)
-	}
-
-	p := &pod{
-		box:     box,
-		profile: profile,
-		phase:   runtimev1.PodPhase_POD_PHASE_PENDING,
-		podIP:   ip,
 	}
 
 	rootfs := box.GetRootfsPath()
@@ -93,6 +81,46 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
+	}
+
+	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
+	// projected) into the pod data volume. Secrets + the projected SA-token come
+	// back as credential paths that get the SBPL read-only sub-scope below. (M2.2)
+	var credPaths []string
+	if len(box.GetVolumes()) > 0 {
+		layout, merr := mount.Materialize(ctx, box, rootfs, ip, r.resolver)
+		if merr != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("materialize volumes for pod %s: %w", box.GetPodId(), merr)
+		}
+		credPaths = layout.CredentialPaths()
+	}
+
+	// Generate the SBPL AFTER materialization so the credential mounts get the
+	// read-only sub-scope. The generator validates any extra paths against the
+	// protected deny-set and emits the protected denies last (last-match-wins).
+	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{ReadOnlyPaths: credPaths})
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
+	}
+
+	// fsGroup: chown the writable pod data volume to the supplemental group
+	// ROOT-SIDE, BEFORE any container's privilege drop (a uid-dropped, sandboxed
+	// process can no longer chown). The supervisor runs this synchronously here,
+	// strictly before posix_spawn → the exec-shim drop. (M2.3)
+	if fsGroup := int(box.GetPodSecurityContext().GetFsGroup()); fsGroup > 0 {
+		if err := supervisor.ChownForFSGroup(rootfs, fsGroup); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("fsGroup chown for pod %s: %w", box.GetPodId(), err)
+		}
+	}
+
+	p := &pod{
+		box:     box,
+		profile: profile,
+		phase:   runtimev1.PodPhase_POD_PHASE_PENDING,
+		podIP:   ip,
 	}
 
 	// init_containers run first, sequentially, each to completion; then the main
@@ -149,9 +177,11 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
-	// Wrap the command so the spawned process confines itself to the profile and
-	// then execs the pod binary, preserving env.
-	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, argv)
+	// Resolve the container's securityContext identity, then wrap the command so
+	// the spawned exec-shim drops to it, confines itself to the profile, and then
+	// execs the pod binary — in that irreversible order (M2.3). env is preserved.
+	cred := resolveCredential(p.box, c)
+	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, argv, cred)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
@@ -174,6 +204,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			State: &runtimev1.ContainerState{
 				Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()},
 			},
+			// Lossless status mirrors of the M2.1 spec fields (M2.2 volume_mounts,
+			// M2.3 user) so kubectl Pod state does not degrade across the boundary.
+			VolumeMounts: volumeMountStatuses(c),
+			User:         containerUser(cred),
 		},
 	}
 	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, logs.write)

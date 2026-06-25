@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"testing"
 
+	"k3sm.io/runtimed/pkg/supervisor"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -69,13 +71,14 @@ func TestWrapCommand(t *testing.T) {
 		t.Skip("WrapCommand exercises Available() which requires darwin")
 	}
 	b := newTestBackend(t, 26, nil)
-	good, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"})
+	good, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"}, GenerateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Run("valid", func(t *testing.T) {
-		path, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo", "hi"})
+	t.Run("valid-no-drop", func(t *testing.T) {
+		// No securityContext → no-drop credential → sentinel tokens "-1 -1 -".
+		path, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo", "hi"}, supervisor.Credential{})
 		if err != nil {
 			t.Fatalf("WrapCommand: %v", err)
 		}
@@ -83,11 +86,14 @@ func TestWrapCommand(t *testing.T) {
 		if path != b.shimPath {
 			t.Errorf("path=%q, want shim %q", path, b.shimPath)
 		}
-		// argv = [shim, profilePath, /bin/echo, hi]
-		if len(argv) != 4 || argv[0] != b.shimPath || argv[2] != "/bin/echo" || argv[3] != "hi" {
+		// argv = [shim, <uid>, <gid>, <groups>, profilePath, /bin/echo, hi]
+		if len(argv) != 7 || argv[0] != b.shimPath || argv[5] != "/bin/echo" || argv[6] != "hi" {
 			t.Fatalf("unexpected argv: %v", argv)
 		}
-		profilePath := argv[1]
+		if argv[1] != "-1" || argv[2] != "-1" || argv[3] != "-" {
+			t.Errorf("no-drop credential tokens = %q, want [-1 -1 -]", argv[1:4])
+		}
+		profilePath := argv[4]
 		data, rerr := os.ReadFile(profilePath)
 		if rerr != nil {
 			t.Fatalf("staged profile unreadable: %v", rerr)
@@ -103,15 +109,27 @@ func TestWrapCommand(t *testing.T) {
 		}
 	})
 
+	t.Run("carries-drop-credential", func(t *testing.T) {
+		cred := supervisor.Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true}
+		_, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo"}, cred)
+		if err != nil {
+			t.Fatalf("WrapCommand: %v", err)
+		}
+		defer cleanup()
+		if argv[1] != "501" || argv[2] != "20" || argv[3] != "20,999" {
+			t.Errorf("drop credential tokens = %q, want [501 20 20,999]", argv[1:4])
+		}
+	})
+
 	t.Run("rejects-failopen-profile", func(t *testing.T) {
-		_, _, _, err := b.WrapCommand(context.Background(), "(version 1)\n(allow default)\n", []string{"/bin/echo"})
+		_, _, _, err := b.WrapCommand(context.Background(), "(version 1)\n(allow default)\n", []string{"/bin/echo"}, supervisor.Credential{})
 		if !errors.Is(err, ErrMissingDenyDefault) {
 			t.Fatalf("want ErrMissingDenyDefault, got %v", err)
 		}
 	})
 
 	t.Run("rejects-empty-argv", func(t *testing.T) {
-		_, _, _, err := b.WrapCommand(context.Background(), good, nil)
+		_, _, _, err := b.WrapCommand(context.Background(), good, nil, supervisor.Credential{})
 		if err == nil {
 			t.Fatal("want error for empty argv")
 		}

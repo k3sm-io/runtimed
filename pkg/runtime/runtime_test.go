@@ -3,6 +3,9 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,11 +25,14 @@ type fakeBackend struct{ available bool }
 
 func (f fakeBackend) Available() bool { return f.available }
 func (f fakeBackend) Name() string    { return "fake" }
-func (f fakeBackend) WrapCommand(_ context.Context, profile string, argv []string) (string, []string, func() error, error) {
+func (f fakeBackend) WrapCommand(_ context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
 	if err := sandbox.Validate(profile); err != nil {
 		return "", nil, nil, err
 	}
-	wrapped := append([]string{"/fake/shim", "/tmp/profile.sb"}, argv...)
+	// Mirror the production shim argv shape: [shim, <uid>, <gid>, <groups>, profile, argv...].
+	wrapped := append([]string{"/fake/shim"}, cred.ShimArgs()...)
+	wrapped = append(wrapped, "/tmp/profile.sb")
+	wrapped = append(wrapped, argv...)
 	return "/fake/shim", wrapped, func() error { return nil }, nil
 }
 
@@ -515,6 +521,103 @@ func TestGetRuntimeInfo(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeResolver serves canned ConfigMap/Secret data + a token for the volume
+// materializer (the provider's apiserver-backed Resolver stands in here).
+type fakeResolver struct{}
+
+func (fakeResolver) ConfigMap(_ context.Context, _, name string) (map[string][]byte, error) {
+	return map[string][]byte{"app.conf": []byte("k=v")}, nil
+}
+func (fakeResolver) Secret(_ context.Context, _, name string) (map[string][]byte, error) {
+	return map[string][]byte{"id_rsa": []byte("PRIVATE")}, nil
+}
+func (fakeResolver) ServiceAccountToken(_ context.Context, _, _ string, _ int64) (string, error) {
+	return "TOKEN", nil
+}
+
+// TestCreatePodMaterializesVolumesAndDrops ties M2.2 + M2.3 together through the
+// CreatePod spine: a pod with a configMap + secret volume and a securityContext
+// drop (1) materializes the volume files into the pod data volume, (2) gets the
+// secret's read-only sub-scope into the generated SBPL, and (3) carries the
+// run-as uid/gid through WrapCommand into the spawned exec-shim argv.
+func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
+	dataVol := t.TempDir()
+	sp := &fakeSpawner{}
+	w := newBlockingWaiter()
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w, Resolver: fakeResolver{}})
+
+	box := &runtimev1.PodBox{
+		PodId:      "pod-vol",
+		Namespace:  "default",
+		Name:       "demo",
+		RootfsPath: dataVol,
+		// SBPL data volume == on-disk rootfs so the credential paths validate.
+		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},
+		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
+		Volumes: []*runtimev1.Volume{
+			{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "app-config"}},
+			{Name: "sec", Secret: &runtimev1.SecretVolumeSource{SecretName: "git-key"}},
+		},
+		Containers: []*runtimev1.Container{{
+			Name:  "main",
+			Image: "/bin/sleep",
+			VolumeMounts: []*runtimev1.VolumeMount{
+				{Name: "cfg", MountPath: "/etc/cfg"},
+				{Name: "sec", MountPath: "/etc/sec", ReadOnly: true},
+			},
+			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 501, RunAsGroup: 20},
+		}},
+	}
+	// fsGroup chown is exercised only when the test gid is a real (>0) group.
+	if gid := os.Getgid(); gid > 0 {
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: int64(gid)}
+	}
+
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
+	}
+
+	// (1) materialized files landed inside the pod data volume.
+	if got, _ := os.ReadFile(filepath.Join(dataVol, "etc/cfg/app.conf")); string(got) != "k=v" {
+		t.Errorf("configMap not materialized: %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dataVol, "etc/sec/id_rsa")); string(got) != "PRIVATE" {
+		t.Errorf("secret not materialized: %q", got)
+	}
+
+	// (2) the generated SBPL carries the secret's read-only sub-scope.
+	rt.mu.Lock()
+	profile := rt.pods["pod-vol"].profile
+	rt.mu.Unlock()
+	secPath := filepath.Join(dataVol, "etc/sec")
+	if !strings.Contains(profile, "(deny file-write*\n  (subpath \""+secPath+"\")") {
+		t.Errorf("SBPL missing secret read-only sub-scope for %s:\n%s", secPath, profile)
+	}
+
+	// (3) the run-as identity reached the spawned exec-shim argv (fakeBackend
+	// mirrors the shim arg shape [shim, uid, gid, groups, profile, argv...]).
+	argv := sp.specs[len(sp.specs)-1].Argv
+	if len(argv) < 4 || argv[1] != "501" || argv[2] != "20" {
+		t.Errorf("drop credential not in spawn argv: %v", argv)
+	}
+
+	// (4) the status mirrors the volume mounts + effective user.
+	gs, _ := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: "pod-vol"})
+	cs := gs.GetStatus().GetContainerStatuses()
+	if len(cs) != 1 || len(cs[0].GetVolumeMounts()) != 2 {
+		t.Fatalf("container status volume_mounts mirror missing: %+v", cs)
+	}
+	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 501 || u.GetGid() != 20 {
+		t.Errorf("container status user mirror = %+v, want uid 501 gid 20", u)
+	}
+
+	w.release(1001)
 }
 
 // guard against accidentally importing a real registry in unit tests.

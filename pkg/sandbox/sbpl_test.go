@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,14 +11,15 @@ import (
 )
 
 // TestGenerateGolden pins the full rendered profile against the golden file:
-// acceptance M1.2-a2 (always (import "system.sb")) and the tightened deny-set.
-// Run with -update to regenerate the golden.
+// acceptance M1.2-a2 (always (import "system.sb")) and the M2.2 rule ordering
+// (protected denies after the allows, narrow re-allows last). Run with -update to
+// regenerate the golden.
 func TestGenerateGolden(t *testing.T) {
 	sp := &runtimev1.SandboxProfile{
 		DataVolumePath: "/var/lib/k3sm/pods/pod-abc123/rootfs",
 		AllowNetwork:   true,
 	}
-	got, err := Generate(sp)
+	got, err := Generate(sp, GenerateOptions{})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -37,14 +39,14 @@ func TestGenerateGolden(t *testing.T) {
 	}
 }
 
-// TestGenerateDenySet asserts the full deny-set (NOT just /Users): the profile is
-// default-deny, imports system.sb, denies /private/var/db (with the dyld-only
-// read exception), denies the shared pods root, and scopes file-write* to the pod
-// data volume. This is the security contract of M1.2-a1's static half.
+// TestGenerateDenySet asserts the full deny-set: the profile is default-deny,
+// imports system.sb, denies /Users, /private/var/db (with the dyld-only read
+// exception), the shared pods root, and the dyld cryptex (write), then re-allows
+// the pod's own data volume. This is the security contract of M1.2-a1 + M2.2.
 func TestGenerateDenySet(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
 	sp := &runtimev1.SandboxProfile{DataVolumePath: dataVol, AllowNetwork: true}
-	out, err := Generate(sp)
+	out, err := Generate(sp, GenerateOptions{})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -54,10 +56,12 @@ func TestGenerateDenySet(t *testing.T) {
 	}{
 		{"deny-default", "(deny default)"},
 		{"import-system", `(import "system.sb")`},
+		{"deny-users", "(deny file-read* file-write*\n  (subpath \"/Users\"))"},
 		{"deny-var-db", "(deny file-read* file-write*\n  (subpath \"/private/var/db\"))"},
-		{"dyld-read-exception", "(subpath \"/private/var/db/dyld\")"},
 		{"deny-pods-root", "(deny file-read* file-write*\n  (subpath \"/var/lib/k3sm/pods\"))"},
-		{"write-scoped-datavol", "(allow file-write*\n  (subpath \"" + dataVol + "\")"},
+		{"deny-cryptex-write", "(deny file-write*\n  (subpath \"/System/Volumes/Preboot/Cryptexes\")"},
+		{"dyld-read-exception", "(subpath \"/private/var/db/dyld\")"},
+		{"datavol-reallow", "(allow file-read* file-write*\n  (subpath \"" + dataVol + "\"))"},
 		{"read-system", "(subpath \"/System\")"},
 		{"net-dns-vip", `(remote ip "10.96.0.10:53")`},
 		{"mach-dns", `(global-name "com.apple.mDNSResponder")`},
@@ -70,10 +74,10 @@ func TestGenerateDenySet(t *testing.T) {
 		})
 	}
 
-	// The pod must NOT be granted blanket write outside its data volume, and the
-	// home dir must never be granted.
+	// /Users must never appear in an allow, and the var-db store must never be
+	// granted write.
 	mustNotContain := []struct{ name, frag string }{
-		{"no-users-allow", `(allow file-read* file-write*\n  (subpath "/Users"`},
+		{"no-users-allow", "(allow file-read* file-write*\n  (subpath \"/Users\""},
 		{"no-write-var-db", "(allow file-write*\n  (subpath \"/private/var/db\")"},
 	}
 	for _, tc := range mustNotContain {
@@ -82,6 +86,94 @@ func TestGenerateDenySet(t *testing.T) {
 				t.Errorf("profile unexpectedly contains %s: %q", tc.name, tc.frag)
 			}
 		})
+	}
+}
+
+// TestGenerateProtectedDeniesAfterExtraAllows is acceptance M2.2-a2 (ordering
+// half): SBPL is last-match-wins, so the protected denies MUST be emitted AFTER
+// any extra-path allow (a hostPath-style extra path cannot override them), and
+// the pod's own data-volume re-allow MUST come after the pods-root deny (so the
+// pod keeps its own dir).
+func TestGenerateProtectedDeniesAfterExtraAllows(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	out, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath: dataVol,
+		ExtraReadPaths: []string{"/opt/data"},
+	}, GenerateOptions{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	iExtra := strings.Index(out, `(subpath "/opt/data")`)
+	iDenyUsers := strings.Index(out, `(subpath "/Users")`)
+	iDenyPods := strings.Index(out, `(subpath "/var/lib/k3sm/pods")`)
+	iDataReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\"))")
+	for name, i := range map[string]int{"extra": iExtra, "deny-users": iDenyUsers, "deny-pods": iDenyPods, "datavol-reallow": iDataReallow} {
+		if i < 0 {
+			t.Fatalf("fragment %q not found in profile:\n%s", name, out)
+		}
+	}
+	if iExtra >= iDenyUsers || iExtra >= iDenyPods {
+		t.Errorf("extra-path allow (%d) must precede the protected denies (users=%d pods=%d) so the denies win", iExtra, iDenyUsers, iDenyPods)
+	}
+	if iDenyPods >= iDataReallow {
+		t.Errorf("pods-root deny (%d) must precede the pod's own data-volume re-allow (%d) so the pod keeps its dir", iDenyPods, iDataReallow)
+	}
+}
+
+// TestGenerateRejectsProtectedExtraPath is acceptance M2.2-a2 (rejection half): a
+// caller-supplied extra path at/under the protected deny-set is rejected with
+// ErrProtectedPath, so a hostPath can never widen the allow-list into /Users, the
+// secrets store, a sibling pod's dir, or the dyld cryptex.
+func TestGenerateRejectsProtectedExtraPath(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	cases := []struct {
+		name string
+		sp   *runtimev1.SandboxProfile
+		opts GenerateOptions
+	}{
+		{"users", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraReadPaths: []string{"/Users/alice/.ssh"}}, GenerateOptions{}},
+		{"sibling-pod", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraWritePaths: []string{"/var/lib/k3sm/pods/other/rootfs"}}, GenerateOptions{}},
+		{"var-db", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraReadPaths: []string{"/private/var/db/secret"}}, GenerateOptions{}},
+		{"cryptex", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraReadPaths: []string{"/System/Volumes/Preboot/Cryptexes/OS"}}, GenerateOptions{}},
+		{"whole-fs", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraReadPaths: []string{"/"}}, GenerateOptions{}},
+		{"relative", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraWritePaths: []string{"opt/rel"}}, GenerateOptions{}},
+		{"cred-under-users", &runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{ReadOnlyPaths: []string{"/Users/alice/token"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Generate(tc.sp, tc.opts); !errors.Is(err, ErrProtectedPath) {
+				t.Fatalf("want ErrProtectedPath, got %v", err)
+			}
+		})
+	}
+}
+
+// TestGenerateSecretReadOnlySubScope is acceptance M2.2-a3 (SBPL half): a
+// credential mount (secret / SA-token) gets file-read* AND an explicit
+// file-write* deny, emitted LAST so the write-deny wins even though the secret
+// lives inside the writable data volume — a pod can read but not overwrite its
+// credentials.
+func TestGenerateSecretReadOnlySubScope(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	secret := dataVol + "/volumes/git-ssh-key"
+	out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+		ReadOnlyPaths: []string{secret},
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	if !strings.Contains(out, "(allow file-read*\n  (subpath \""+secret+"\")") {
+		t.Errorf("secret missing file-read* sub-scope:\n%s", out)
+	}
+	iDataWrite := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\"))")
+	iCredDeny := strings.Index(out, "(deny file-write*\n  (subpath \""+secret+"\")")
+	if iDataWrite < 0 || iCredDeny < 0 {
+		t.Fatalf("missing data-vol write re-allow (%d) or credential write-deny (%d):\n%s", iDataWrite, iCredDeny, out)
+	}
+	if iCredDeny <= iDataWrite {
+		t.Errorf("credential write-deny (%d) must come AFTER the data-volume write re-allow (%d) to win (last-match-wins)", iCredDeny, iDataWrite)
 	}
 }
 
@@ -102,7 +194,7 @@ func TestGenerateNetworkGating(t *testing.T) {
 			out, err := Generate(&runtimev1.SandboxProfile{
 				DataVolumePath: "/var/lib/k3sm/pods/p/rootfs",
 				AllowNetwork:   tc.allow,
-			})
+			}, GenerateOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,14 +206,14 @@ func TestGenerateNetworkGating(t *testing.T) {
 	}
 }
 
-// TestGenerateExtraPaths confirms extra read/write paths are merged, cleaned, and
-// deterministically ordered.
+// TestGenerateExtraPaths confirms allowed extra read/write paths (outside the
+// protected deny-set) are merged, cleaned, and deterministically ordered.
 func TestGenerateExtraPaths(t *testing.T) {
 	out, err := Generate(&runtimev1.SandboxProfile{
 		DataVolumePath:  "/var/lib/k3sm/pods/p/rootfs",
 		ExtraReadPaths:  []string{"/opt/data", "/opt/data"}, // dup collapses
 		ExtraWritePaths: []string{"/var/scratch"},
-	})
+	}, GenerateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +240,7 @@ func TestGenerateInvalid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Generate(tc.sp); err == nil {
+			if _, err := Generate(tc.sp, GenerateOptions{}); err == nil {
 				t.Fatal("want error, got nil")
 			}
 		})
@@ -159,7 +251,7 @@ func TestGenerateInvalid(t *testing.T) {
 // and (import "system.sb"); the generator's output passes, a hand-rolled profile
 // lacking either is rejected (acceptance M1.2-a2).
 func TestValidate(t *testing.T) {
-	good, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"})
+	good, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"}, GenerateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
