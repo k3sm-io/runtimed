@@ -2,7 +2,7 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M1
-updated: 2026-06-24
+updated: 2026-06-25
 updated_by: agent
 
 phases:
@@ -92,23 +92,202 @@ phases:
             test: sandbox.Backend single interface; no /usr/bin/sandbox-exec call anywhere
 
   - id: M2
-    title: Daemon split (root gRPC) + userspace OOMKill + QoS + Summary API + symbol-canary
+    title: Daemon split (root gRPC) + mounts + privilege drop + grace + OOMKill/QoS/Summary + canary
     status: todo
     depends_on:
       - apis:M2.1
-    subphases: []
+    subphases:
+      - id: M2.1
+        title: Split k3sm-runtimed into a root gRPC daemon + grow the SPI symbol-canary
+        status: todo
+        deliverables:
+          - id: M2.1-d1
+            done: false
+            desc: cmd/k3sm-runtimed — register the existing *runtime.Runtime with a gRPC server over the root unix socket per apis:M2.1 (a relocation, not a redesign; var _ runtimev1.RuntimeServer already satisfied), behind the GetRuntimeInfoResponse.api_version handshake so the provider↔runtimed IPC stays consumer-first additive
+          - id: M2.1-d2
+            done: false
+            desc: internal/spicanary — grow the CI symbol-canary from libsandbox/clonefile to also re-verify the memorystatus / proc_pid_rusage export set the new userspace resource subsystems link (VZ is a PUBLIC framework and is explicitly NOT a canary case)
+        acceptance:
+          - id: M2.1-a1
+            met: false
+            check: the root daemon serves the full runtime/v1 surface over the unix socket and the provider negotiates api_version; an older provider tolerates a newer daemon (additive fields only)
+            method: integration
+          - id: M2.1-a2
+            met: false
+            check: the symbol-canary fails the build if libsandbox / memorystatus / proc_pid_rusage / clonefile exports the runtime depends on disappear
+            method: build
+      - id: M2.2
+        title: Volume-mount materialization into the pod dir + validated SBPL extra-path injection
+        status: todo
+        depends_on:
+          - apis:M2.1
+        deliverables:
+          - id: M2.2-d1
+            done: false
+            desc: pkg/runtime (or pkg/mount) — render configMap / secret / emptyDir / downwardAPI / projected-serviceAccountToken volume sources into the pod dir; each writable mount root lives INSIDE the pod data volume by default
+          - id: M2.2-d2
+            done: false
+            desc: pkg/sandbox — caller-supplied mount roots that fall outside the pod data volume are injected as SandboxProfile extra_write_paths / extra_read_paths, VALIDATED against a protected deny-set (/Users, /private/var/db, the pods-root, the dyld cryptex); the protected (deny ...) blocks are emitted AFTER the extra-path allows (SBPL is last-match-wins, so an unvalidated hostPath could otherwise override the denies)
+          - id: M2.2-d3
+            done: false
+            desc: pkg/sandbox — secrets + the projected SA-token get a read-only sub-scope (granted file-read*, denied file-write*) so a pod cannot overwrite its own credentials
+        acceptance:
+          - id: M2.2-a1
+            met: false
+            check: a configMap / secret / emptyDir / downwardAPI / projected-SA-token source materializes at its mount path inside the pod and is readable by the pod process
+            method: integration
+          - id: M2.2-a2
+            met: false
+            check: an extra write/read path inside the protected deny-set is rejected; an allowed extra path does NOT override the protected denies (golden-SBPL last-match-wins ordering)
+            method: unit
+          - id: M2.2-a3
+            met: false
+            check: a pod can read its mounted secret / SA-token but a write to it is denied by the sandbox (read-only sub-scope)
+            method: integration
+      - id: M2.3
+        title: securityContext privilege drop (runAsUser/runAsGroup/fsGroup) before sandbox_apply
+        status: todo
+        depends_on:
+          - apis:M2.1
+        deliverables:
+          - id: M2.3-d1
+            done: false
+            desc: pkg/supervisor — NET-NEW privilege drop (no setuid/setgid exists in runtimed today; pods run as the daemon uid=root). Implement setgid → initgroups → setuid to the per-pod uid/gid BEFORE sandbox_apply (the sandbox is irreversible, so the drop must precede it); isolate the syscalls behind a *_darwin.go interface
+          - id: M2.3-d2
+            done: false
+            desc: pkg/supervisor — fsGroup chown of the writable mounts root performed ROOT-SIDE, BEFORE the uid/gid drop (the daemon still has privilege at chown time)
+          - id: M2.3-d3
+            done: false
+            desc: docs — until this lands native pods are root-in-Seatbelt; document that untrusted tenancy routes to the M5 vm backend
+        acceptance:
+          - id: M2.3-a1
+            met: false
+            check: a pod with runAsUser/runAsGroup runs as that uid/gid (verified via the process credential), and the credential change happens before the sandbox profile is applied
+            method: integration
+          - id: M2.3-a2
+            met: false
+            check: with fsGroup set, the writable mount root is group-owned by fsGroup and group-writable, set before the privilege drop
+            method: integration
+      - id: M2.4
+        title: terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL
+        status: todo
+        depends_on:
+          - apis:M2.1
+        deliverables:
+          - id: M2.4-d1
+            done: false
+            desc: pkg/supervisor — NET-NEW graceful stop (DeletePod currently hardwires SIGKILL and ignores grace_period_seconds). Implement SIGTERM → a per-PID grace timer RACED AGAINST the kqueue(EVFILT_PROC) reaper (an early voluntary exit cancels the timer and skips the SIGKILL) → SIGKILL escalation on timer expiry
+        acceptance:
+          - id: M2.4-a1
+            met: false
+            check: a pod that exits on SIGTERM within the grace period is reaped without a SIGKILL; a pod that ignores SIGTERM is SIGKILLed after grace_period_seconds
+            method: integration
+      - id: M2.5
+        title: proc_pid_rusage memory sampler → OOMKilled + Summary API (best-effort CPU QoS)
+        status: todo
+        depends_on:
+          - apis:M2.1
+        deliverables:
+          - id: M2.5-d1
+            done: false
+            desc: pkg/supervisor (cgo *_darwin.go) — NET-NEW cgo subsystem (no proc_pid_rusage / memorystatus binding exists yet). Sample ri_phys_footprint at ~1 Hz, SIGKILL the pod on a memory-limit breach and emit an OOMKilled termination reason; isolate the SPI behind a clean Go interface + the M2.1 symbol-canary
+          - id: M2.5-d2
+            done: false
+            desc: pkg/runtime — surface the sampled footprint to the Summary API so kubectl top reports pod memory; CPU limits are best-effort QoS (taskpolicy / setpriority), explicitly documented as NOT CFS millicores
+          - id: M2.5-d3
+            done: false
+            desc: docs — document that ri_phys_footprint is NOT RSS (it counts compressed + IOKit-mapped memory) so the kubectl top number and the OOM threshold are explained
+        acceptance:
+          - id: M2.5-a1
+            met: false
+            check: a pod that exceeds its memory limit is SIGKILLed and its ContainerStatus reports OOMKilled
+            method: integration
+          - id: M2.5-a2
+            met: false
+            check: the Summary API returns a non-zero working-set for a running pod (kubectl top path) sourced from ri_phys_footprint
+            method: integration
+      - id: M2.6
+        title: imagePullSecrets — registry auth confined to the pull client, signature policy before ad-hoc-sign
+        status: todo
+        depends_on:
+          - apis:M2.1
+        deliverables:
+          - id: M2.6-d1
+            done: false
+            desc: pkg/image — consume the imagePullSecret registry credential ONLY inside the pull client (go-containerregistry authn), NEVER written into the pod dir
+          - id: M2.6-d2
+            done: false
+            desc: pkg/image — enforce the SignaturePolicy (require-notarized / require-signed / adhoc-ok) BEFORE the codesign -s - -f ad-hoc-sign step (a require-notarized image must not be silently downgraded by ad-hoc signing)
+        acceptance:
+          - id: M2.6-a1
+            met: false
+            check: a private image pulls with the imagePullSecret credential and the credential never appears on disk in the pod dir
+            method: integration
+          - id: M2.6-a2
+            met: false
+            check: require-notarized / require-signed reject before the ad-hoc-sign step; adhoc-ok proceeds to ad-hoc sign
+            method: integration
 
   - id: M3
-    title: (no runtimed-specific work)
+    title: APFS-backed persistent volume (PV/PVC) — stable same-volume dir, seed-once, lifecycle-decoupled
     status: todo
-    depends_on: []
-    subphases: []
+    depends_on:
+      - apis:M3.1
+    subphases:
+      - id: M3.1
+        title: APFS-backed PV/PVC volume materialization
+        status: todo
+        deliverables:
+          - id: M3.1-d1
+            done: false
+            desc: pkg/volume (or pkg/mount) — a stable per-PVC directory on the SAME APFS volume as /var/lib/k3sm (a cross-volume clonefile silently byte-copies, defeating CoW + the same-fs assumption), EMPTY-CREATED on the hot path
+          - id: M3.1-d2
+            done: false
+            desc: pkg/volume — clonefile is used ONLY to SEED a PVC from a StorageClass template, NEVER on the empty-PVC hot path
+          - id: M3.1-d3
+            done: false
+            desc: pkg/volume + pkg/runtime — the PV lifecycle is DECOUPLED from pod-dir teardown (do NOT RemoveAll the PV on pod restart); the PV mount root is added to the pod's SBPL write-scope
+        acceptance:
+          - id: M3.1-a1
+            met: false
+            check: a PVC-backed dir is created empty on the same APFS volume as /var/lib/k3sm and is writable by the pod within its SBPL scope
+            method: integration
+          - id: M3.1-a2
+            met: false
+            check: data written to the PV survives a pod restart (the PV is not removed with the pod dir); a template-seeded PVC is a clone, an unseeded one is empty
+            method: integration
 
   - id: M4
     title: uidjail fallback backend + packaging hooks + cgo macOS CI
     status: todo
     depends_on: []
     subphases: []
+
+  - id: M5
+    title: vm sandbox backend — Virtualization.framework Linux micro-VM behind sandbox.Backend
+    status: todo
+    depends_on:
+      - apis:M5.1
+    subphases:
+      - id: M5.1
+        title: Virtualization.framework Linux micro-VM backend
+        status: todo
+        deliverables:
+          - id: M5.1-d1
+            done: false
+            desc: pkg/sandbox — a vm Backend impl backed by Virtualization.framework (a Linux micro-VM), implementing the existing swappable sandbox.Backend interface and gated by Backend.Available() (VZ + the com.apple.security.virtualization entitlement). VZ is a PUBLIC framework — it is NOT a libsandbox/memorystatus SPI symbol-canary case (do not add it to the canary set)
+          - id: M5.1-d2
+            done: false
+            desc: pkg/sandbox (or pkg/image) — Linux rootfs handling for the guest (the OCI payload is a Linux rootfs, not arm64 Mach-O, so codesign/ad-hoc-sign is N/A inside the VM; digest-pin tenant images)
+        acceptance:
+          - id: M5.1-a1
+            met: false
+            check: Backend.Available() reports the vm backend present only when VZ + the entitlement are available; a Linux image runs under the vm backend on a capable host
+            method: integration
+          - id: M5.1-a2
+            met: false
+            check: the SPI symbol-canary set is unchanged by M5 (VZ is public, not an SPI)
+            method: build
 ---
 
 # runtimed — Phase roadmap
@@ -166,23 +345,155 @@ relocation. Streaming RPCs `Exec`/`Attach`/`PortForward` are stubbed `Unimplemen
 - ✅ `M1.2-a2` generated SBPL always imports `system.sb`; rejects a profile without it — `TestGenerateGolden` + `TestValidate`
 - ✅ `M1.2-a3` no `sandbox-exec` call leaks outside `pkg/sandbox` — one `sandbox.Backend` interface; no `/usr/bin/sandbox-exec` call
 
-## M2 — Daemon split + resources + canary ⬜
-Decomposed when M1 closes. Headline: split `k3sm-runtimed` (root, gRPC per `apis:M2.1`); userspace
-memory kill (`proc_pid_rusage(ri_phys_footprint)` ~1 Hz → SIGKILL → `OOMKilled`); QoS via
-`taskpolicy`; Summary API via `proc_pid_rusage` → `kubectl top`; CI **symbol-canary** re-verifying
-`libsandbox` / `memorystatus` / `clonefile` exports (scaffold lives at `internal/spicanary/`).
+## M2 — Daemon split + mounts + privilege drop + grace + resources + canary ⬜
+**Cross-repo dep:** `apis:M2.1` (the additive `PodBox`/`Container` fields — volumes, volumeMounts,
+securityContext, terminationGracePeriodSeconds, imagePullSecret — plus the matching `ContainerStatus`
+mirror fields, and the `GetRuntimeInfoResponse.api_version` handshake for the provider↔runtimed
+daemon split). All M2 sub-phases below are NET-NEW capabilities (not "wire an existing field"). Decomposed when M1 closes.
 
-## M3 — (no runtimed-specific work) ⬜
-Multi-node join + mesh is `k3sm` (join/token) + `darwin-net` (wireguard). runtimed's only multi-node
-touch — binding pod processes to their lo0 IP — lands in M2 via `darwin-net`'s `PodNetwork` seam.
+### M2.1 — Daemon split + grow the SPI symbol-canary ⬜
+**Deliverables**
+- ⬜ `M2.1-d1` `cmd/k3sm-runtimed`: register the existing `*runtime.Runtime` with a gRPC server over
+  the root unix socket per `apis:M2.1` (a **relocation** — `var _ runtimev1.RuntimeServer` is already
+  satisfied), behind the `GetRuntimeInfoResponse.api_version` handshake so the IPC stays consumer-first additive.
+- ⬜ `M2.1-d2` `internal/spicanary`: grow the CI symbol-canary from `libsandbox`/`clonefile` to also
+  re-verify the `memorystatus` / `proc_pid_rusage` export set. **VZ is a PUBLIC framework and is
+  explicitly NOT a canary case.**
+
+**Acceptance (exit gate)**
+- ⬜ `M2.1-a1` the root daemon serves the full `runtime/v1` surface over the socket; an older provider
+  tolerates a newer daemon (additive only).
+- ⬜ `M2.1-a2` the symbol-canary fails the build if the `libsandbox` / `memorystatus` / `proc_pid_rusage`
+  / `clonefile` exports disappear.
+
+### M2.2 — Volume-mount materialization + validated SBPL extra-path injection ⬜
+**Deliverables**
+- ⬜ `M2.2-d1` render configMap / secret / emptyDir / downwardAPI / projected-serviceAccountToken
+  sources into the pod dir; each writable mount root lives **inside the pod data volume** by default.
+- ⬜ `M2.2-d2` `pkg/sandbox`: mount roots outside the pod data volume are injected as `SandboxProfile`
+  `extra_write_paths`/`extra_read_paths`, **validated against a protected deny-set** (`/Users`,
+  `/private/var/db`, the pods-root, the dyld cryptex); the protected `(deny ...)` blocks are emitted
+  **after** the extra-path allows (**SBPL is last-match-wins** — an unvalidated hostPath could otherwise
+  override the denies).
+- ⬜ `M2.2-d3` `pkg/sandbox`: secrets + the projected SA-token get a **read-only sub-scope** (granted
+  `file-read*`, denied `file-write*`) so a pod can't overwrite its own credentials.
+
+**Acceptance (exit gate)**
+- ⬜ `M2.2-a1` each source materializes at its mount path and is readable by the pod process.
+- ⬜ `M2.2-a2` an extra path inside the protected deny-set is rejected; an allowed extra path does **not**
+  override the protected denies (golden-SBPL last-match-wins ordering).
+- ⬜ `M2.2-a3` a pod can read its mounted secret/SA-token but a write to it is sandbox-denied.
+
+### M2.3 — securityContext privilege drop (runAsUser/runAsGroup/fsGroup) before `sandbox_apply` ⬜
+**Deliverables**
+- ⬜ `M2.3-d1` `pkg/supervisor`: **NET-NEW** privilege drop (no setuid/setgid exists today; pods run as
+  the daemon uid = root). `setgid → initgroups → setuid` to the per-pod uid/gid **before**
+  `sandbox_apply` (the sandbox is **irreversible**, so the drop must precede it); isolate the syscalls
+  behind a `*_darwin.go` interface.
+- ⬜ `M2.3-d2` `pkg/supervisor`: `fsGroup` chown of the writable mounts root, performed **root-side,
+  before** the uid/gid drop (the daemon still has privilege at chown time).
+- ⬜ `M2.3-d3` docs: until this lands native pods are **root-in-Seatbelt**; document that untrusted
+  tenancy routes to the **M5 `vm` backend**.
+
+**Acceptance (exit gate)**
+- ⬜ `M2.3-a1` a pod with `runAsUser`/`runAsGroup` runs as that uid/gid, and the credential change
+  happens **before** the sandbox profile is applied.
+- ⬜ `M2.3-a2` with `fsGroup` set, the writable mount root is group-owned by `fsGroup` and group-writable,
+  set before the privilege drop.
+
+### M2.4 — terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL ⬜
+**Deliverables**
+- ⬜ `M2.4-d1` `pkg/supervisor`: **NET-NEW** graceful stop (`DeletePod` currently hardwires SIGKILL and
+  ignores `grace_period_seconds`). `SIGTERM` → a per-PID grace timer **raced against the
+  `kqueue(EVFILT_PROC)` reaper** (an early voluntary exit cancels the timer and skips the SIGKILL) →
+  `SIGKILL` escalation on timer expiry.
+
+**Acceptance (exit gate)**
+- ⬜ `M2.4-a1` a pod that exits on SIGTERM within grace is reaped without a SIGKILL; a pod that ignores
+  SIGTERM is SIGKILLed after `grace_period_seconds`.
+
+### M2.5 — `proc_pid_rusage` memory sampler → OOMKilled + Summary API (best-effort CPU QoS) ⬜
+**Deliverables**
+- ⬜ `M2.5-d1` `pkg/supervisor` (cgo `*_darwin.go`): **NET-NEW** cgo subsystem (no `proc_pid_rusage` /
+  `memorystatus` binding exists yet). Sample `ri_phys_footprint` (~1 Hz), SIGKILL on a memory-limit
+  breach + emit `OOMKilled`; isolate the SPI behind a clean Go interface + the M2.1 canary.
+- ⬜ `M2.5-d2` `pkg/runtime`: surface the footprint to the **Summary API** so `kubectl top` reports pod
+  memory; CPU limits are **best-effort QoS** (`taskpolicy`/`setpriority`), explicitly **NOT CFS millicores**.
+- ⬜ `M2.5-d3` docs: `ri_phys_footprint` **≠ RSS** (it counts compressed + IOKit-mapped memory) — explain
+  the `kubectl top` number and the OOM threshold.
+
+**Acceptance (exit gate)**
+- ⬜ `M2.5-a1` a pod over its memory limit is SIGKILLed and its `ContainerStatus` reports `OOMKilled`.
+- ⬜ `M2.5-a2` the Summary API returns a non-zero working-set (the `kubectl top` path) sourced from
+  `ri_phys_footprint`.
+
+### M2.6 — imagePullSecrets — registry auth confined to the pull client, policy before ad-hoc-sign ⬜
+**Deliverables**
+- ⬜ `M2.6-d1` `pkg/image`: consume the registry credential **only** inside the pull client
+  (go-containerregistry authn), **never** written into the pod dir.
+- ⬜ `M2.6-d2` `pkg/image`: enforce the `SignaturePolicy` (`require-notarized`/`require-signed`/`adhoc-ok`)
+  **before** the `codesign -s - -f` ad-hoc-sign step (a `require-notarized` image must not be silently
+  downgraded by ad-hoc signing).
+
+**Acceptance (exit gate)**
+- ⬜ `M2.6-a1` a private image pulls with the `imagePullSecret` and the credential never lands on disk in
+  the pod dir.
+- ⬜ `M2.6-a2` `require-notarized`/`require-signed` reject **before** the ad-hoc-sign step; `adhoc-ok`
+  proceeds to ad-hoc sign.
+
+## M3 — APFS-backed persistent volume (PV/PVC) ⬜
+**Cross-repo dep:** `apis:M3.1` (the PV/PVC volume source on `PodBox`; **NodePort needs no `apis`
+change**). The multi-node join/mesh work is `k3sm` (join/token) + `darwin-net` (wireguard); runtimed's
+M3 contribution is the **APFS-backed persistent volume**.
+
+### M3.1 — APFS-backed PV/PVC volume materialization ⬜
+**Deliverables**
+- ⬜ `M3.1-d1` a **stable per-PVC directory on the SAME APFS volume** as `/var/lib/k3sm` (a cross-volume
+  `clonefile` silently byte-copies, defeating CoW + the same-fs assumption), **empty-created** on the hot path.
+- ⬜ `M3.1-d2` `clonefile` is used **only to seed** a PVC from a StorageClass template — **never** on the
+  empty-PVC hot path.
+- ⬜ `M3.1-d3` the PV lifecycle is **decoupled from pod-dir teardown** (do **not** `RemoveAll` the PV on
+  pod restart); the PV mount root is added to the pod's SBPL write-scope.
+
+**Acceptance (exit gate)**
+- ⬜ `M3.1-a1` a PVC-backed dir is created empty on the same APFS volume as `/var/lib/k3sm` and is
+  writable by the pod within its SBPL scope.
+- ⬜ `M3.1-a2` data written to the PV survives a pod restart (the PV is not removed with the pod dir); a
+  template-seeded PVC is a clone, an unseeded one is empty.
 
 ## M4 — Hardening + packaging hooks ⬜
 Headline: `uidjail` fallback `Backend` impl; participate in the codesign/notarize entitlement set;
 macOS-arm64 CI for the cgo build; node-conformance-subset hooks.
 
+## M5 — `vm` sandbox backend (Virtualization.framework Linux micro-VM) ⬜
+**Cross-repo dep:** `apis:M5.1` (the `runtime.k3sm.io` handler-config mapping `runtimeClassName: vm` →
+`SANDBOX_BACKEND_VM`). The committed direction for the Linux-only components stockkitty needs
+(Postgres/pgvector and the amd64 images): a Virtualization.framework Linux micro-VM behind the
+**existing swappable `sandbox.Backend` interface**.
+
+### M5.1 — Virtualization.framework Linux micro-VM backend ⬜
+**Deliverables**
+- ⬜ `M5.1-d1` `pkg/sandbox`: a `vm` `Backend` impl backed by **Virtualization.framework** (a Linux
+  micro-VM), implementing the existing swappable `sandbox.Backend` interface, gated by
+  `Backend.Available()` (VZ + the `com.apple.security.virtualization` entitlement). **VZ is a PUBLIC
+  framework — it is NOT a `libsandbox`/`memorystatus` SPI symbol-canary case; do not add it to the canary set.**
+- ⬜ `M5.1-d2` Linux **rootfs handling** for the guest (the OCI payload is a Linux rootfs, not arm64
+  Mach-O, so codesign/ad-hoc-sign is N/A inside the VM; digest-pin tenant images).
+
+**Acceptance (exit gate)**
+- ⬜ `M5.1-a1` `Backend.Available()` reports the `vm` backend present only when VZ + the entitlement are
+  available; a Linux image runs under the `vm` backend on a capable host.
+- ⬜ `M5.1-a2` the SPI symbol-canary set is **unchanged** by M5 (VZ is public, not an SPI).
+
 ## Next
 M1 is complete (library form: `pkg/image`, `pkg/sandbox`, `pkg/supervisor`, `pkg/runtime`
 implementing `apis runtime/v1` in-process; exec-shim Seatbelt confinement with `DYLD_INSERT_LIBRARIES`
-preserved — the darwin-net DNS-shim enabler). M2 — split `k3sm-runtimed` into a root gRPC daemon
-(register the existing `*runtime.Runtime` with a gRPC server — a relocation), add userspace
-OOMKill + QoS + Summary API, and grow `internal/spicanary` to the `memorystatus` symbol.
+preserved — the darwin-net DNS-shim enabler). M2 is the **stockkitty-readiness** milestone for the
+native runtime (`../../docs/stockkitty-readiness.md`): split `k3sm-runtimed` into a root gRPC daemon
+(a relocation of the existing `*runtime.Runtime`) and grow `internal/spicanary` to `memorystatus` /
+`proc_pid_rusage` (M2.1); then the NET-NEW capabilities — volume-mount materialization + validated
+SBPL extra-path injection (M2.2), the `setgid→initgroups→setuid` privilege drop + `fsGroup` chown
+before `sandbox_apply` (M2.3), SIGTERM/grace-timer/SIGKILL graceful stop raced against the reaper
+(M2.4), the `proc_pid_rusage` memory sampler → `OOMKilled` + Summary API (M2.5), and imagePullSecret
+auth confined to the pull client (M2.6). M3 adds the APFS-backed PV/PVC (stable same-volume dir,
+seed-once, lifecycle-decoupled); M5 adds the Virtualization.framework `vm` backend for Linux images.
