@@ -1,0 +1,40 @@
+;; k3sm per-pod Seatbelt profile — GENERATED, do not edit.
+;; Default-deny; runs a native pod process at host paths (no chroot).
+;; Tightens prototypes/seatbelt-hostpath/pod.sb: denies /private/var/db
+;; (dyld-cache read excepted) and the shared pods root (sibling pods).
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-exec*)
+(allow process-fork)
+;; tighten: deny the system secrets/state store outright ...
+(deny file-read* file-write*
+  (subpath "/private/var/db"))
+;; ... except the dyld closure cache the linker reads at init.
+(allow file-read*
+  (subpath "/private/var/db/dyld"))
+;; tighten: deny the shared pods root (other pods' dirs) ...
+(deny file-read* file-write*
+  (subpath "/var/lib/k3sm/pods"))
+;; read: OS + frameworks + dyld cache + this pod's dir.
+(allow file-read*
+  (subpath "/Library")
+  (subpath "/System")
+  (subpath "/bin")
+  (subpath "/usr")
+  (subpath "/private/var/db/dyld")
+  (literal "/dev/null") (literal "/dev/zero")
+  (literal "/dev/random") (literal "/dev/urandom")
+  (subpath "/var/lib/k3sm/pods/pod-abc123/rootfs"))
+;; write: ONLY this pod's data volume (+ /dev/null).
+(allow file-write*
+  (subpath "/var/lib/k3sm/pods/pod-abc123/rootfs")
+  (literal "/dev/null"))
+;; network: outbound to the cluster DNS resolver VIP only.
+(allow network-outbound
+  (remote ip "10.96.0.10:53")
+  (remote ip "10.96.0.10:0"))
+;; mach-lookup the DNS resolver path (mDNSResponder) needs.
+(allow mach-lookup
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.mDNSResponder"))
