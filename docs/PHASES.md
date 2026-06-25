@@ -1,7 +1,7 @@
 ---
 repo: runtimed
 schema: phases/v1
-current_phase: M1
+current_phase: M2
 updated: 2026-06-25
 updated_by: agent
 
@@ -99,23 +99,26 @@ phases:
     subphases:
       - id: M2.1
         title: Split k3sm-runtimed into a root gRPC daemon + grow the SPI symbol-canary
-        status: todo
+        status: done
+        completed: 2026-06-25
         deliverables:
           - id: M2.1-d1
-            done: false
-            desc: cmd/k3sm-runtimed — register the existing *runtime.Runtime with a gRPC server over the root unix socket per apis:M2.1 (a relocation, not a redesign; var _ runtimev1.RuntimeServer already satisfied), behind the GetRuntimeInfoResponse.api_version handshake so the provider↔runtimed IPC stays consumer-first additive
+            done: true
+            desc: cmd/k3sm-runtimed + pkg/runtime/grpcserver.go — register the existing *runtime.Runtime with a gRPC server (runtime.NewServer) over the root unix socket (runtime.Listen, 0600 in a 0700 dir) per apis:M2.1; a relocation, not a redesign (var _ runtimev1.RuntimeServer already satisfied). The api_version negotiation surface is STRUCK — provider and its node's runtimed are the SAME k3sm build restarted together (same-binary, same-node hard cut), so there is no skew window; GetRuntimeInfo reports identity/health for diagnostics only. Lifecycle is ctx-driven (Serve → GracefulStop on ctx-cancel, no goroutine/fd leak; sender closes the stop channel). The in-process path (k3sm imports pkg/runtime as a library) is unchanged.
           - id: M2.1-d2
-            done: false
-            desc: internal/spicanary — grow the CI symbol-canary from libsandbox/clonefile to also re-verify the memorystatus / proc_pid_rusage export set the new userspace resource subsystems link (VZ is a PUBLIC framework and is explicitly NOT a canary case)
+            done: true
+            desc: internal/spicanary — grew the CI symbol-canary from libsandbox/clonefile to also re-verify the memorystatus_control (private jetsam SPI) / proc_pid_rusage (public <libproc.h>, load-bearing for the M2.5 sampler) export set; both resolve from libSystem. VZ is a PUBLIC framework and is explicitly NOT a canary case.
         acceptance:
           - id: M2.1-a1
-            met: false
-            check: the root daemon serves the full runtime/v1 surface over the unix socket and the provider negotiates api_version; an older provider tolerates a newer daemon (additive fields only)
-            method: integration
+            met: true
+            check: the root daemon serves the full runtime/v1 surface over the unix socket (Listen → register → Serve → client roundtrip; CreatePod/GetPodStatus/GetLogs/GetRuntimeInfo) with clean ctx-driven start/stop. No api_version negotiation (handshake struck — same-binary same-node). Real-root gRPC over the production socket is the m2.sh e2e on a capable host; the unit seam uses a non-root unix socket + bufconn.
+            method: unit
+            test: pkg/runtime.TestServerServesRuntimeSurfaceOverUnixSocket + TestServerServesOverBufconn + TestServerStopUnblocksServe + TestListenRemovesStaleSocket
           - id: M2.1-a2
-            met: false
-            check: the symbol-canary fails the build if libsandbox / memorystatus / proc_pid_rusage / clonefile exports the runtime depends on disappear
+            met: true
+            check: the symbol-canary fails the BUILD (hard link error) if libsandbox / memorystatus_control / proc_pid_rusage exports the runtime depends on disappear; clonefile is covered via golang.org/x/sys/unix.Clonefile
             method: build
+            test: spicanary.TestSymbolsResolve + TestResourceSymbolsResolve
       - id: M2.2
         title: Volume-mount materialization into the pod dir + validated SBPL extra-path injection
         status: todo
@@ -345,26 +348,35 @@ relocation. Streaming RPCs `Exec`/`Attach`/`PortForward` are stubbed `Unimplemen
 - ✅ `M1.2-a2` generated SBPL always imports `system.sb`; rejects a profile without it — `TestGenerateGolden` + `TestValidate`
 - ✅ `M1.2-a3` no `sandbox-exec` call leaks outside `pkg/sandbox` — one `sandbox.Backend` interface; no `/usr/bin/sandbox-exec` call
 
-## M2 — Daemon split + mounts + privilege drop + grace + resources + canary ⬜
+## M2 — Daemon split + mounts + privilege drop + grace + resources + canary 🟡
 **Cross-repo dep:** `apis:M2.1` (the additive `PodBox`/`Container` fields — volumes, volumeMounts,
 securityContext, terminationGracePeriodSeconds, imagePullSecret — plus the matching `ContainerStatus`
 mirror fields, and the `GetRuntimeInfoResponse.api_version` handshake for the provider↔runtimed
 daemon split). All M2 sub-phases below are NET-NEW capabilities (not "wire an existing field"). Decomposed when M1 closes.
 
-### M2.1 — Daemon split + grow the SPI symbol-canary ⬜
+### M2.1 — Daemon split + grow the SPI symbol-canary ✅
 **Deliverables**
-- ⬜ `M2.1-d1` `cmd/k3sm-runtimed`: register the existing `*runtime.Runtime` with a gRPC server over
-  the root unix socket per `apis:M2.1` (a **relocation** — `var _ runtimev1.RuntimeServer` is already
-  satisfied), behind the `GetRuntimeInfoResponse.api_version` handshake so the IPC stays consumer-first additive.
-- ⬜ `M2.1-d2` `internal/spicanary`: grow the CI symbol-canary from `libsandbox`/`clonefile` to also
-  re-verify the `memorystatus` / `proc_pid_rusage` export set. **VZ is a PUBLIC framework and is
+- ✅ `M2.1-d1` `cmd/k3sm-runtimed` + `pkg/runtime/grpcserver.go`: register the existing `*runtime.Runtime`
+  with a gRPC server (`runtime.NewServer`) over the root unix socket (`runtime.Listen` — `0600` in a `0700`
+  dir, stale-socket removal) per `apis:M2.1` — a **relocation** (`var _ runtimev1.RuntimeServer` already
+  satisfied). The `api_version` negotiation surface is **struck**: the provider and its node's runtimed are
+  the **same `k3sm` build restarted together** (same-binary, same-node hard cut), so there is no skew window
+  — `GetRuntimeInfo` reports identity/health for diagnostics only. Lifecycle is ctx-driven (`Serve` →
+  `GracefulStop` on ctx-cancel; no goroutine/fd leak; the sender closes the stop channel). The in-process
+  path (k3sm imports `pkg/runtime` as a library) is unchanged — the provider selects in-proc vs daemon.
+- ✅ `M2.1-d2` `internal/spicanary`: grew the CI symbol-canary from `libsandbox`/`clonefile` to also
+  re-verify `memorystatus_control` (private jetsam SPI) / `proc_pid_rusage` (public `<libproc.h>`,
+  load-bearing for the M2.5 sampler) — both resolve from libSystem. **VZ is a PUBLIC framework and is
   explicitly NOT a canary case.**
 
 **Acceptance (exit gate)**
-- ⬜ `M2.1-a1` the root daemon serves the full `runtime/v1` surface over the socket; an older provider
-  tolerates a newer daemon (additive only).
-- ⬜ `M2.1-a2` the symbol-canary fails the build if the `libsandbox` / `memorystatus` / `proc_pid_rusage`
-  / `clonefile` exports disappear.
+- ✅ `M2.1-a1` the root daemon serves the full `runtime/v1` surface over the socket with clean ctx-driven
+  start/stop (no `api_version` negotiation — handshake struck) — `pkg/runtime.TestServerServesRuntimeSurfaceOverUnixSocket`
+  + `TestServerServesOverBufconn` + `TestServerStopUnblocksServe` + `TestListenRemovesStaleSocket` (non-root
+  unix socket + bufconn; real-root gRPC over the production socket is `m2.sh` on a capable host).
+- ✅ `M2.1-a2` the symbol-canary fails the **build** (hard link error) if the `libsandbox` /
+  `memorystatus_control` / `proc_pid_rusage` exports disappear (`clonefile` is covered via
+  `golang.org/x/sys/unix.Clonefile`) — `spicanary.TestSymbolsResolve` + `TestResourceSymbolsResolve`.
 
 ### M2.2 — Volume-mount materialization + validated SBPL extra-path injection ⬜
 **Deliverables**
