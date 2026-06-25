@@ -5,6 +5,8 @@ isolated **native processes** — `pkg/sandbox` (Seatbelt/SBPL backends), a supe
 (posix_spawn/kqueue, userspace memory/CPU limits), image (OCI → APFS `clonefile`), exposing a gRPC
 runtime API defined in `k3sm.io/apis`.
 
+> Roadmap & current phase: `docs/PHASES.md` (workspace matrix: `../ROADMAP.md`).
+
 ## Build / test (**cgo** — darwin syscall shims)
 ```sh
 gofmt -l .
