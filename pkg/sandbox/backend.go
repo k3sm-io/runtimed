@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // Backend is the swappable pod-isolation seam: it turns a desired pod command
@@ -27,10 +29,12 @@ type Backend interface {
 
 	// WrapCommand validates profile (it must be fail-closed — see Validate),
 	// persists it as needed, and returns the path + argv to spawn so that the
-	// spawned process confines itself to profile and then execs argv[0]+argv[1:]
-	// as the pod process. cleanup releases any backing resources (e.g. the
-	// profile temp file) and must be called after the pod process has exited.
-	WrapCommand(ctx context.Context, profile string, argv []string) (path string, args []string, cleanup func() error, err error)
+	// spawned process drops to cred (the securityContext identity), confines
+	// itself to profile, and then execs argv[0]+argv[1:] as the pod process — in
+	// that irreversible order (see supervisor.RunLaunchSequence). cleanup releases
+	// any backing resources (e.g. the profile temp file) and must be called after
+	// the pod process has exited.
+	WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (path string, args []string, cleanup func() error, err error)
 
 	// Name identifies the backend for logging/diagnostics.
 	Name() string

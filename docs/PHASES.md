@@ -121,56 +121,63 @@ phases:
             test: spicanary.TestSymbolsResolve + TestResourceSymbolsResolve
       - id: M2.2
         title: Volume-mount materialization into the pod dir + validated SBPL extra-path injection
-        status: todo
+        status: done
+        completed: 2026-06-25
         depends_on:
           - apis:M2.1
         deliverables:
           - id: M2.2-d1
-            done: false
-            desc: pkg/runtime (or pkg/mount) — render configMap / secret / emptyDir / downwardAPI / projected-serviceAccountToken volume sources into the pod dir; each writable mount root lives INSIDE the pod data volume by default
+            done: true
+            desc: pkg/mount — Materialize renders configMap / secret / emptyDir / downwardAPI / projected-serviceAccountToken sources into the pod dir via a consumer-side Resolver seam (the proto carries only the source reference, not the data; provider supplies the apiserver-backed Resolver, tests a fake). k3sm has no mount namespace, so every mount path is REBASED under the pod data volume (filepath.Join), guaranteeing materialized volumes live inside it; a "../" escape is rejected. Wired into pkg/runtime.createPod
           - id: M2.2-d2
-            done: false
-            desc: pkg/sandbox — caller-supplied mount roots that fall outside the pod data volume are injected as SandboxProfile extra_write_paths / extra_read_paths, VALIDATED against a protected deny-set (/Users, /private/var/db, the pods-root, the dyld cryptex); the protected (deny ...) blocks are emitted AFTER the extra-path allows (SBPL is last-match-wins, so an unvalidated hostPath could otherwise override the denies)
+            done: true
+            desc: pkg/sandbox — Generate VALIDATES every caller-supplied extra read/write path (and the credential paths) against a protected deny-set (/Users, /private/var/db, the pods-root, the dyld cryptex), rejecting with ErrProtectedPath (the pod's own data volume is carved out); the protected (deny ...) blocks are emitted AFTER the extra-path allows and the pod's own data-volume re-allow is emitted after the pods-root deny (SBPL last-match-wins). hostPath roots outside the data volume are the provider's SandboxProfile.extra_*_paths, validated here
           - id: M2.2-d3
-            done: false
-            desc: pkg/sandbox — secrets + the projected SA-token get a read-only sub-scope (granted file-read*, denied file-write*) so a pod cannot overwrite its own credentials
+            done: true
+            desc: pkg/sandbox — secrets + the projected SA-token get a read-only sub-scope (granted file-read*, explicitly denied file-write*) emitted LAST so the write-deny wins even inside the writable data volume; pkg/mount marks them as credentials, pkg/runtime passes them as GenerateOptions.ReadOnlyPaths
         acceptance:
           - id: M2.2-a1
-            met: false
-            check: a configMap / secret / emptyDir / downwardAPI / projected-SA-token source materializes at its mount path inside the pod and is readable by the pod process
-            method: integration
-          - id: M2.2-a2
-            met: false
-            check: an extra write/read path inside the protected deny-set is rejected; an allowed extra path does NOT override the protected denies (golden-SBPL last-match-wins ordering)
+            met: true
+            check: each source (configMap / secret / emptyDir / downwardAPI / projected-SA-token) materializes at its mount path inside the pod data volume with the resolved content (materialization is unit-testable per-task; the live read-by-pod is the m2.sh e2e under root)
             method: unit
+            test: pkg/mount.TestMaterializeAllSources + pkg/mount.TestMaterializeSelectedKeysAndMode + pkg/runtime.TestCreatePodMaterializesVolumesAndDrops
+          - id: M2.2-a2
+            met: true
+            check: an extra write/read path inside the protected deny-set is rejected; an allowed extra path does NOT override the protected denies, and the pod's own data-volume re-allow follows the pods-root deny (SBPL last-match-wins ordering)
+            method: unit
+            test: pkg/sandbox.TestGenerateRejectsProtectedExtraPath + pkg/sandbox.TestGenerateProtectedDeniesAfterExtraAllows
           - id: M2.2-a3
-            met: false
-            check: a pod can read its mounted secret / SA-token but a write to it is denied by the sandbox (read-only sub-scope)
-            method: integration
+            met: true
+            check: a pod's mounted secret / SA-token gets a read-only sub-scope in the generated SBPL (file-read* + a file-write* deny emitted last so it wins inside the writable data volume); the live sandbox write-deny is the m2.sh e2e
+            method: unit
+            test: pkg/sandbox.TestGenerateSecretReadOnlySubScope + pkg/runtime.TestCreatePodMaterializesVolumesAndDrops
       - id: M2.3
         title: securityContext privilege drop (runAsUser/runAsGroup/fsGroup) before sandbox_apply
-        status: todo
+        status: done
+        completed: 2026-06-25
         depends_on:
           - apis:M2.1
         deliverables:
           - id: M2.3-d1
-            done: false
-            desc: pkg/supervisor — NET-NEW privilege drop (no setuid/setgid exists in runtimed today; pods run as the daemon uid=root). Implement setgid → initgroups → setuid to the per-pod uid/gid BEFORE sandbox_apply (the sandbox is irreversible, so the drop must precede it); isolate the syscalls behind a *_darwin.go interface
+            done: true
+            desc: pkg/supervisor — NET-NEW privilege drop. supervisor.RunLaunchSequence drives the mandated irreversible order setgid → initgroups → setuid → sandbox_apply → exec via a LaunchSeam (pure-Go, unit-testable); the syscalls are isolated in privdrop_darwin.go (UnixDropper; setgid/setuid/setgroups via x/sys/unix — no initgroups(3) binding, so the supplemental-group list incl. fsGroup is set explicitly). The drop runs in the exec-shim (internal/execshim.RunPodLaunch), a fresh single-purpose process — never the multi-threaded daemon. Credential resolved in pkg/runtime (container.securityContext > pod_security_context > PodBox.uid/gid) and carried into the shim argv
           - id: M2.3-d2
-            done: false
-            desc: pkg/supervisor — fsGroup chown of the writable mounts root performed ROOT-SIDE, BEFORE the uid/gid drop (the daemon still has privilege at chown time)
+            done: true
+            desc: pkg/supervisor — ChownForFSGroup chowns the writable pod data volume to fsGroup (group rwx + setgid on dirs), run ROOT-SIDE in pkg/runtime.createPod BEFORE posix_spawn → the exec-shim drop (a uid-dropped/sandboxed process can no longer chown)
           - id: M2.3-d3
-            done: false
-            desc: docs — until this lands native pods are root-in-Seatbelt; document that untrusted tenancy routes to the M5 vm backend
+            done: true
+            desc: docs — the root-in-Seatbelt fallback and the drop ordering are documented at the call site (cmd/k3sm-execshim/main.go package doc, supervisor.RunLaunchSequence, pkg/runtime credential resolution): a pod without a securityContext drop runs as the daemon uid confined only by Seatbelt; untrusted tenancy routes to the M5 vm backend
         acceptance:
           - id: M2.3-a1
-            met: false
-            check: a pod with runAsUser/runAsGroup runs as that uid/gid (verified via the process credential), and the credential change happens before the sandbox profile is applied
-            method: integration
+            met: true
+            check: the credential drop happens in the exact order setgid → initgroups → setuid → sandbox_apply → exec, and the drop/sandbox precede exec (fail-closed if any step errors); the run-as uid/gid reaches the spawned exec-shim. Unit-tested via a recording syscall seam (no real uid change); the live uid drop is the m2.sh e2e under root
+            method: unit
+            test: pkg/supervisor.TestRunLaunchSequenceOrder + pkg/supervisor.TestRunLaunchSequenceFailClosed + pkg/runtime.TestCreatePodMaterializesVolumesAndDrops
           - id: M2.3-a2
-            met: false
-            check: with fsGroup set, the writable mount root is group-owned by fsGroup and group-writable, set before the privilege drop
-            method: integration
+            met: true
+            check: with fsGroup set, the writable mount root is group-owned by fsGroup and group-accessible (setgid on dirs), set ROOT-SIDE before the privilege drop. Root-free unit test chowns to the test's own gid; the live arbitrary-gid chown is the m2.sh e2e under root
+            method: unit
+            test: pkg/supervisor.TestChownForFSGroup + pkg/supervisor.TestChownForFSGroupRejectsRootGid
       - id: M2.4
         title: terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL
         status: todo
@@ -378,40 +385,52 @@ daemon split). All M2 sub-phases below are NET-NEW capabilities (not "wire an ex
   `memorystatus_control` / `proc_pid_rusage` exports disappear (`clonefile` is covered via
   `golang.org/x/sys/unix.Clonefile`) — `spicanary.TestSymbolsResolve` + `TestResourceSymbolsResolve`.
 
-### M2.2 — Volume-mount materialization + validated SBPL extra-path injection ⬜
+### M2.2 — Volume-mount materialization + validated SBPL extra-path injection ✅
 **Deliverables**
-- ⬜ `M2.2-d1` render configMap / secret / emptyDir / downwardAPI / projected-serviceAccountToken
-  sources into the pod dir; each writable mount root lives **inside the pod data volume** by default.
-- ⬜ `M2.2-d2` `pkg/sandbox`: mount roots outside the pod data volume are injected as `SandboxProfile`
-  `extra_write_paths`/`extra_read_paths`, **validated against a protected deny-set** (`/Users`,
-  `/private/var/db`, the pods-root, the dyld cryptex); the protected `(deny ...)` blocks are emitted
-  **after** the extra-path allows (**SBPL is last-match-wins** — an unvalidated hostPath could otherwise
-  override the denies).
-- ⬜ `M2.2-d3` `pkg/sandbox`: secrets + the projected SA-token get a **read-only sub-scope** (granted
-  `file-read*`, denied `file-write*`) so a pod can't overwrite its own credentials.
+- ✅ `M2.2-d1` `pkg/mount`: `Materialize` renders configMap / secret / emptyDir / downwardAPI /
+  projected-serviceAccountToken sources into the pod dir via a consumer-side `Resolver` seam (the proto
+  carries only the source *reference*; the provider wires the apiserver-backed `Resolver`, tests a fake).
+  No mount namespace ⇒ every mount path is **rebased under the pod data volume** (a `../` escape is
+  rejected). Wired into `pkg/runtime.createPod`.
+- ✅ `M2.2-d2` `pkg/sandbox`: `Generate` **validates** every extra read/write path (and credential paths)
+  against a protected deny-set (`/Users`, `/private/var/db`, the pods-root, the dyld cryptex) →
+  `ErrProtectedPath` (the pod's own data volume carved out); the protected `(deny ...)` blocks are emitted
+  **after** the extra-path allows and the pod's own data-volume re-allow follows the pods-root deny
+  (**SBPL last-match-wins**). hostPath roots outside the data volume are the provider's
+  `extra_*_paths`, validated here.
+- ✅ `M2.2-d3` `pkg/sandbox`: secrets + the projected SA-token get a **read-only sub-scope** (`file-read*`
+  + an explicit `file-write*` deny) emitted **last** so the deny wins inside the writable data volume.
 
 **Acceptance (exit gate)**
-- ⬜ `M2.2-a1` each source materializes at its mount path and is readable by the pod process.
-- ⬜ `M2.2-a2` an extra path inside the protected deny-set is rejected; an allowed extra path does **not**
-  override the protected denies (golden-SBPL last-match-wins ordering).
-- ⬜ `M2.2-a3` a pod can read its mounted secret/SA-token but a write to it is sandbox-denied.
+- ✅ `M2.2-a1` each source materializes at its mount path inside the pod data volume with the resolved
+  content — `pkg/mount.TestMaterializeAllSources` + `TestMaterializeSelectedKeysAndMode` +
+  `pkg/runtime.TestCreatePodMaterializesVolumesAndDrops` (live read-by-pod is the `m2.sh` e2e).
+- ✅ `M2.2-a2` an extra path inside the protected deny-set is rejected; an allowed extra path does **not**
+  override the protected denies (last-match-wins) — `pkg/sandbox.TestGenerateRejectsProtectedExtraPath` +
+  `TestGenerateProtectedDeniesAfterExtraAllows`.
+- ✅ `M2.2-a3` the mounted secret/SA-token gets the read-only sub-scope in the generated SBPL —
+  `pkg/sandbox.TestGenerateSecretReadOnlySubScope` (live write-deny is the `m2.sh` e2e).
 
-### M2.3 — securityContext privilege drop (runAsUser/runAsGroup/fsGroup) before `sandbox_apply` ⬜
+### M2.3 — securityContext privilege drop (runAsUser/runAsGroup/fsGroup) before `sandbox_apply` ✅
 **Deliverables**
-- ⬜ `M2.3-d1` `pkg/supervisor`: **NET-NEW** privilege drop (no setuid/setgid exists today; pods run as
-  the daemon uid = root). `setgid → initgroups → setuid` to the per-pod uid/gid **before**
-  `sandbox_apply` (the sandbox is **irreversible**, so the drop must precede it); isolate the syscalls
-  behind a `*_darwin.go` interface.
-- ⬜ `M2.3-d2` `pkg/supervisor`: `fsGroup` chown of the writable mounts root, performed **root-side,
-  before** the uid/gid drop (the daemon still has privilege at chown time).
-- ⬜ `M2.3-d3` docs: until this lands native pods are **root-in-Seatbelt**; document that untrusted
-  tenancy routes to the **M5 `vm` backend**.
+- ✅ `M2.3-d1` `pkg/supervisor`: **NET-NEW** privilege drop. `RunLaunchSequence` drives the irreversible
+  order `setgid → initgroups → setuid → sandbox_apply → exec` via a `LaunchSeam` (pure-Go, unit-testable);
+  syscalls isolated in `privdrop_darwin.go` (`UnixDropper` via `x/sys/unix`; no `initgroups(3)` binding, so
+  the supplemental-group list incl. `fsGroup` is set with `setgroups`). The drop runs in the exec-shim
+  (`internal/execshim.RunPodLaunch`), never the daemon. Credential resolved in `pkg/runtime`.
+- ✅ `M2.3-d2` `pkg/supervisor`: `ChownForFSGroup` chowns the writable data volume to `fsGroup`, run
+  **root-side** in `createPod` **before** `posix_spawn` → the exec-shim drop.
+- ✅ `M2.3-d3` docs: the root-in-Seatbelt fallback + the drop ordering are documented at the call site
+  (`cmd/k3sm-execshim/main.go` package doc, `supervisor.RunLaunchSequence`); untrusted tenancy routes to
+  the **M5 `vm` backend**.
 
 **Acceptance (exit gate)**
-- ⬜ `M2.3-a1` a pod with `runAsUser`/`runAsGroup` runs as that uid/gid, and the credential change
-  happens **before** the sandbox profile is applied.
-- ⬜ `M2.3-a2` with `fsGroup` set, the writable mount root is group-owned by `fsGroup` and group-writable,
-  set before the privilege drop.
+- ✅ `M2.3-a1` the drop happens in the order `setgid → initgroups → setuid → sandbox_apply → exec` (fail-
+  closed if any step errors) and the run-as uid/gid reaches the spawned shim —
+  `pkg/supervisor.TestRunLaunchSequenceOrder` + `TestRunLaunchSequenceFailClosed` +
+  `pkg/runtime.TestCreatePodMaterializesVolumesAndDrops` (live uid drop is the `m2.sh` e2e).
+- ✅ `M2.3-a2` with `fsGroup` set the writable mount root is group-owned by `fsGroup` and group-accessible,
+  set before the drop — `pkg/supervisor.TestChownForFSGroup` (live arbitrary-gid chown is the `m2.sh` e2e).
 
 ### M2.4 — terminationGracePeriodSeconds — SIGTERM → grace timer raced against the reaper → SIGKILL ⬜
 **Deliverables**

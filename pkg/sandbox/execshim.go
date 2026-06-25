@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // ExecShimName is the basename of the ad-hoc-signed helper that applies a pod's
@@ -91,11 +93,13 @@ func (b *ExecShimBackend) Available() bool {
 // WrapCommand validates profile (fail-closed), writes it to a per-pod temp file
 // under the backend's profile dir, and returns the shim path plus argv:
 //
-//	[shimPath, profilePath, pod, args...]
+//	[shimPath, <uid>, <gid>, <groups-csv>, profilePath, pod, args...]
 //
-// so the spawned shim applies profile to itself and execs pod with args,
-// preserving envp. cleanup removes the staged profile file.
-func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv []string) (string, []string, func() error, error) {
+// where the three credential tokens (cred.ShimArgs) tell the shim which identity
+// to drop to. The spawned shim drops to cred, applies profile to itself, and
+// execs pod with args — in that irreversible order — preserving envp. cleanup
+// removes the staged profile file.
+func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, nil, err
 	}
@@ -125,8 +129,11 @@ func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv 
 		return "", nil, nil, fmt.Errorf("close sbpl profile %s: %w", profilePath, err)
 	}
 
-	args := make([]string, 0, len(argv)+2)
-	args = append(args, b.shimPath, profilePath)
+	credArgs := cred.ShimArgs() // [uid, gid, groups]
+	args := make([]string, 0, len(argv)+len(credArgs)+2)
+	args = append(args, b.shimPath)
+	args = append(args, credArgs...)
+	args = append(args, profilePath)
 	args = append(args, argv...)
 	return b.shimPath, args, cleanup, nil
 }

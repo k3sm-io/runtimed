@@ -21,6 +21,21 @@ const podsRoot = "/var/lib/k3sm/pods"
 // opening all egress. Overridable per-pod is an M2 concern.
 const resolverVIP = "10.96.0.10"
 
+// protectedPrefixes are the host subtrees a pod may NEVER be granted via a
+// caller-supplied extra path: user homes, the system secrets/state store, the
+// shared pods root (sibling pods), and the dyld cryptex (the system read-only
+// content volume). validateExtraPaths rejects any extra read/write path at or
+// under one of these (the pod's OWN data volume is carved out), and Generate
+// emits a matching (deny ...) for each AFTER the extra-path allows so an
+// unvalidated path cannot override the deny (SBPL is last-match-wins).
+var protectedPrefixes = []string{
+	"/Users",
+	"/private/var/db",
+	podsRoot,
+	"/System/Volumes/Preboot/Cryptexes",
+	"/System/Cryptexes",
+}
+
 // ErrMissingDenyDefault reports an SBPL profile that does not start its rule set
 // with (deny default) — a profile without it is fail-open and is rejected.
 var ErrMissingDenyDefault = errors.New("sbpl: profile missing (deny default)")
@@ -34,19 +49,43 @@ var ErrMissingSystemImport = errors.New(`sbpl: profile missing (import "system.s
 // nowhere the pod may write, so the profile cannot be generated.
 var ErrNoDataVolume = errors.New("sbpl: sandbox profile has no data_volume_path")
 
-// Generate renders a default-deny SBPL profile for one pod from sp.
+// ErrProtectedPath reports a caller-supplied extra read/write path that resolves
+// at or under a protected prefix (see protectedPrefixes). Such a path is rejected
+// rather than emitted, so a hostPath-style mount can never widen the allow-list
+// into /Users, the secrets store, a sibling pod's dir, or the dyld cryptex.
+var ErrProtectedPath = errors.New("sbpl: extra path is under a protected deny-set")
+
+// GenerateOptions carries the runtimed-internal SBPL inputs that are NOT part of
+// the cross-repo SandboxProfile proto. They are computed during pod setup (by the
+// volume materializer in pkg/mount), not supplied by the provider over the wire.
+type GenerateOptions struct {
+	// ReadOnlyPaths get a read-only sub-scope: granted file-read* and explicitly
+	// denied file-write*, emitted LAST so the write-deny wins even when the path
+	// lies inside the writable data volume. These are the credential mounts
+	// (secrets + the projected ServiceAccount token) a pod must not overwrite.
+	ReadOnlyPaths []string
+}
+
+// Generate renders a default-deny SBPL profile for one pod from sp and opts.
 //
 // The output ALWAYS begins (version 1) / (deny default) / (import "system.sb"),
 // then grants the minimal allow-list: read the OS (/System, /usr, /bin,
-// /Library, the dyld cache), read+write the pod's own data volume, and — when
-// sp.AllowNetwork is set — outbound to the cluster DNS VIP plus the mach-lookup
-// the resolver path needs. It TIGHTENS the validated prototype by denying
-// /private/var/db (keeping only the dyld-cache read exception) and denying the
-// shared pods root so sibling pod dirs are unreachable.
+// /Library) plus validated extra read paths, read+write the pod's own data
+// volume, and — when sp.AllowNetwork is set — outbound to the cluster DNS VIP.
 //
-// Generate returns an error only on invalid input (no data volume); the rendered
-// profile is otherwise always well-formed and passes Validate.
-func Generate(sp *runtimev1.SandboxProfile) (string, error) {
+// Rule ORDER is security-critical because SBPL is last-match-wins. Generate emits
+// (in increasing precedence): the OS/extra-path allows; THEN the protected denies
+// (/Users, /private/var/db, the pods root, the dyld cryptex) so a caller's extra
+// path can never override them; THEN the narrow re-allows the protected denies
+// would otherwise clobber (the dyld closure-cache read and this pod's own data
+// volume, which lives under the denied pods root); and LAST the read-only
+// credential sub-scope, whose file-write* deny therefore wins even inside the
+// writable data volume.
+//
+// Generate returns ErrNoDataVolume if sp has no data volume and ErrProtectedPath
+// if any extra/credential path is under the protected deny-set; otherwise the
+// rendered profile is always well-formed and passes Validate.
+func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
 	if sp == nil {
 		return "", ErrNoDataVolume
 	}
@@ -55,19 +94,27 @@ func Generate(sp *runtimev1.SandboxProfile) (string, error) {
 		return "", ErrNoDataVolume
 	}
 
+	// Validate every caller-supplied path BEFORE emitting any allow: a path under
+	// the protected deny-set is rejected outright (fail closed). The pod's own
+	// data volume is carved out (it is re-allowed by design below).
+	if err := validateExtraPaths(dataVol, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths); err != nil {
+		return "", err
+	}
+
 	readPaths := dedupeSorted(append([]string{
 		"/System",
 		"/usr",
 		"/bin",
 		"/Library",
 	}, sp.GetExtraReadPaths()...))
-	writePaths := dedupeSorted(append([]string{dataVol}, sp.GetExtraWritePaths()...))
+	writePaths := dedupeSorted(sp.GetExtraWritePaths())
+	credPaths := dedupeSorted(opts.ReadOnlyPaths)
 
 	var b strings.Builder
 	b.WriteString(";; k3sm per-pod Seatbelt profile — GENERATED, do not edit.\n")
 	b.WriteString(";; Default-deny; runs a native pod process at host paths (no chroot).\n")
-	b.WriteString(";; Tightens prototypes/seatbelt-hostpath/pod.sb: denies /private/var/db\n")
-	b.WriteString(";; (dyld-cache read excepted) and the shared pods root (sibling pods).\n")
+	b.WriteString(";; Rule order is last-match-wins: OS/extra allows, THEN protected\n")
+	b.WriteString(";; denies (so extra paths can't override them), THEN narrow re-allows.\n")
 	b.WriteString("(version 1)\n")
 	b.WriteString("(deny default)\n")
 	// system.sb supplies the dyld shared-cache mapping + mach bootstrap baseline.
@@ -77,35 +124,17 @@ func Generate(sp *runtimev1.SandboxProfile) (string, error) {
 	b.WriteString("(allow process-exec*)\n")
 	b.WriteString("(allow process-fork)\n")
 
-	// Explicit deny of the secrets/state store. system.sb grants some db reads
-	// back; the documented dyld-cache exception below is the only db read this
-	// profile intends to permit. (deny ...) here makes the intent auditable and
-	// overrides any broad db allow the baseline might carry.
-	b.WriteString(";; tighten: deny the system secrets/state store outright ...\n")
-	b.WriteString("(deny file-read* file-write*\n")
-	b.WriteString("  (subpath \"/private/var/db\"))\n")
-	// ... except the dyld closure cache, which the dynamic linker reads at init.
-	b.WriteString(";; ... except the dyld closure cache the linker reads at init.\n")
-	b.WriteString("(allow file-read*\n")
-	b.WriteString("  (subpath \"/private/var/db/dyld\"))\n")
-
-	// Deny the whole pods root so a pod cannot read or write a sibling pod's
-	// dir; the pod's own data volume is re-allowed by the write/read blocks below.
-	b.WriteString(";; tighten: deny the shared pods root (other pods' dirs) ...\n")
-	b.WriteString("(deny file-read* file-write*\n")
-	b.WriteString(fmt.Sprintf("  (subpath %q))\n", podsRoot))
-
-	b.WriteString(";; read: OS + frameworks + dyld cache + this pod's dir.\n")
+	// --- allows (lowest precedence) ---------------------------------------
+	b.WriteString(";; read: OS + frameworks + validated extra read paths.\n")
 	b.WriteString("(allow file-read*\n")
 	for _, p := range readPaths {
 		b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
 	}
-	b.WriteString("  (subpath \"/private/var/db/dyld\")\n")
 	b.WriteString("  (literal \"/dev/null\") (literal \"/dev/zero\")\n")
-	b.WriteString("  (literal \"/dev/random\") (literal \"/dev/urandom\")\n")
-	b.WriteString(fmt.Sprintf("  (subpath %q))\n", dataVol))
+	b.WriteString("  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n")
 
-	b.WriteString(";; write: ONLY this pod's data volume (+ /dev/null).\n")
+	b.WriteString(";; write: validated extra write paths (+ /dev/null); the pod's own\n")
+	b.WriteString(";; data volume is re-allowed below, after the protected denies.\n")
 	b.WriteString("(allow file-write*\n")
 	for _, p := range writePaths {
 		b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
@@ -128,7 +157,88 @@ func Generate(sp *runtimev1.SandboxProfile) (string, error) {
 		b.WriteString(";; network: default-deny (no allow-network).\n")
 	}
 
+	// --- protected denies (higher precedence than the extra-path allows) --
+	// Emitted AFTER the allows so a caller's extra path can never override them.
+	b.WriteString(";; PROTECTED: deny user homes, the secrets/state store, and the\n")
+	b.WriteString(";; shared pods root (sibling pods) — read+write, AFTER the allows.\n")
+	b.WriteString("(deny file-read* file-write*\n")
+	b.WriteString("  (subpath \"/Users\"))\n")
+	b.WriteString("(deny file-read* file-write*\n")
+	b.WriteString("  (subpath \"/private/var/db\"))\n")
+	b.WriteString("(deny file-read* file-write*\n")
+	b.WriteString(fmt.Sprintf("  (subpath %q))\n", podsRoot))
+	// The dyld cryptex is denied WRITE only: the dynamic linker must still READ
+	// the shared cache it holds, so denying read would SIGABRT every pod.
+	b.WriteString(";; dyld cryptex: deny WRITE only (read is needed at link time).\n")
+	b.WriteString("(deny file-write*\n")
+	b.WriteString("  (subpath \"/System/Volumes/Preboot/Cryptexes\")\n")
+	b.WriteString("  (subpath \"/System/Cryptexes\"))\n")
+
+	// --- narrow re-allows (higher precedence than the protected denies) ---
+	b.WriteString(";; re-allow the dyld closure cache read the /private/var/db deny clobbers.\n")
+	b.WriteString("(allow file-read*\n")
+	b.WriteString("  (subpath \"/private/var/db/dyld\"))\n")
+	b.WriteString(";; re-allow THIS pod's own data volume (under the denied pods root).\n")
+	b.WriteString("(allow file-read* file-write*\n")
+	b.WriteString(fmt.Sprintf("  (subpath %q))\n", dataVol))
+
+	// --- credential read-only sub-scope (highest precedence) --------------
+	// LAST, so this file-write* deny wins even though the credential lives inside
+	// the writable data volume just re-allowed above: a pod can READ its mounted
+	// secret / SA-token but cannot OVERWRITE it.
+	if len(credPaths) > 0 {
+		b.WriteString(";; credentials (secrets / SA-token): read-only sub-scope, emitted\n")
+		b.WriteString(";; LAST so the write-deny wins inside the writable data volume.\n")
+		b.WriteString("(allow file-read*\n")
+		for _, p := range credPaths {
+			b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
+		}
+		b.WriteString("  )\n")
+		b.WriteString("(deny file-write*\n")
+		for _, p := range credPaths {
+			b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
+		}
+		b.WriteString("  )\n")
+	}
+
 	return b.String(), nil
+}
+
+// validateExtraPaths rejects any path in groups that is at or under a protected
+// prefix, returning ErrProtectedPath. The pod's own data volume (dataVol) is
+// always permitted (it is re-allowed by Generate). Non-absolute paths and "/" are
+// rejected — a relative or whole-filesystem grant is never intended.
+func validateExtraPaths(dataVol string, groups ...[]string) error {
+	cleanData := filepath.Clean(dataVol)
+	for _, g := range groups {
+		for _, raw := range g {
+			p := filepath.Clean(raw)
+			if p == "" || p == "." {
+				continue
+			}
+			if !filepath.IsAbs(p) {
+				return fmt.Errorf("%w: %q is not absolute", ErrProtectedPath, raw)
+			}
+			if p == "/" {
+				return fmt.Errorf("%w: %q grants the entire filesystem", ErrProtectedPath, raw)
+			}
+			if isUnder(p, cleanData) {
+				continue // the pod's own dir is always allowed
+			}
+			for _, pre := range protectedPrefixes {
+				if isUnder(p, pre) {
+					return fmt.Errorf("%w: %q is under protected %q", ErrProtectedPath, raw, pre)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// isUnder reports whether path is prefix itself or a descendant of it. Both are
+// assumed already filepath.Clean'd.
+func isUnder(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // Validate checks that a rendered SBPL profile is fail-closed: it MUST contain

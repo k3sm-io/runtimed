@@ -42,12 +42,8 @@ static int k3sm_apply_sbpl(const char *profile, char **errmsg) {
 import "C"
 
 import (
-	"errors"
 	"fmt"
-	"os"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 // confine compiles+applies the SBPL profile to the current process via
@@ -70,24 +66,4 @@ func confine(profile string) error {
 		return fmt.Errorf("libsandbox apply failed (rc=%d)", int(rc))
 	}
 	return fmt.Errorf("libsandbox apply failed (rc=%d): %s", int(rc), msg)
-}
-
-// ConfineAndExec applies the SBPL profile to the current process and then
-// execve's argv[0] with argv, PRESERVING the current process environment (so
-// DYLD_INSERT_LIBRARIES survives into the pod). It never returns on success
-// (the image is replaced); any return is an error.
-func ConfineAndExec(profile string, argv []string) error {
-	if len(argv) == 0 {
-		return errors.New("execshim: empty argv")
-	}
-	if err := confine(profile); err != nil {
-		return err
-	}
-	// os.Environ() is the inherited environment, unmodified — this is the
-	// load-bearing guarantee: DYLD_INSERT_LIBRARIES set by the supervisor flows
-	// through to the pod process.
-	if err := unix.Exec(argv[0], argv, os.Environ()); err != nil {
-		return fmt.Errorf("execve %s: %w", argv[0], err)
-	}
-	return nil // unreachable on success
 }
