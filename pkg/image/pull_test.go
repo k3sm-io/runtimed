@@ -9,14 +9,18 @@ import (
 )
 
 // fakeFetch returns a fixed in-memory image, counting calls so the test can
-// assert the cache hit path does (or does not) re-fetch.
+// assert the cache hit path does (or does not) re-fetch. It also records the last
+// credential it received (M2.6) so a test can assert the imagePullSecret reaches
+// the pull client.
 type fakeFetch struct {
-	img   ggcrv1.Image
-	calls int
+	img      ggcrv1.Image
+	calls    int
+	lastCred *RegistryCredential
 }
 
-func (f *fakeFetch) fetch(_ context.Context, _ string) (ggcrv1.Image, error) {
+func (f *fakeFetch) fetch(_ context.Context, _ string, cred *RegistryCredential) (ggcrv1.Image, error) {
 	f.calls++
+	f.lastCred = cred
 	return f.img, nil
 }
 
@@ -36,7 +40,7 @@ func TestPullCachesAndHits(t *testing.T) {
 	}
 	p := NewPuller(cache, ff.fetch)
 
-	res1, err := p.Pull(context.Background(), "example.com/app:v1")
+	res1, err := p.Pull(context.Background(), "example.com/app:v1", nil)
 	if err != nil {
 		t.Fatalf("first pull: %v", err)
 	}
@@ -59,7 +63,7 @@ func TestPullCachesAndHits(t *testing.T) {
 		}
 	}
 
-	res2, err := p.Pull(context.Background(), "example.com/app:v1")
+	res2, err := p.Pull(context.Background(), "example.com/app:v1", nil)
 	if err != nil {
 		t.Fatalf("second pull: %v", err)
 	}
@@ -68,6 +72,34 @@ func TestPullCachesAndHits(t *testing.T) {
 	}
 	if ff.calls != 2 {
 		t.Errorf("fetch called %d times, want 2 (pull still resolves the manifest)", ff.calls)
+	}
+}
+
+// TestPullPassesCredentialToFetch is the image-level half of M2.6-a1: the
+// imagePullSecret credential is handed to the pull client (the FetchFunc) and is
+// not dropped on the floor. The on-disk confinement (credential never in the pod
+// dir) is asserted at the runtime level.
+func TestPullPassesCredentialToFetch(t *testing.T) {
+	img, err := random.Image(256, 1)
+	if err != nil {
+		t.Fatalf("random image: %v", err)
+	}
+	ff := &fakeFetch{img: img}
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewPuller(cache, ff.fetch)
+
+	cred := &RegistryCredential{Username: "robot", Password: "s3cret"}
+	if _, err := p.Pull(context.Background(), "example.com/private/app:v1", cred); err != nil {
+		t.Fatalf("pull with cred: %v", err)
+	}
+	if ff.lastCred == nil {
+		t.Fatal("credential was not passed to the fetch client")
+	}
+	if ff.lastCred.Username != "robot" || ff.lastCred.Password != "s3cret" {
+		t.Errorf("fetch received cred %+v, want robot/s3cret", ff.lastCred)
 	}
 }
 

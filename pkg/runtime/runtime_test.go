@@ -64,11 +64,14 @@ func (f *fakeSpawner) lastEnv() []string {
 	return f.specs[len(f.specs)-1].Env
 }
 
-// blockingWaiter blocks until released, so created pods stay "running".
+// blockingWaiter blocks until released, so created pods stay "running". On
+// release it reports code/sig (sig defaults to 0; the OOM test sets sig=9, code=137
+// to simulate a SIGKILLed container).
 type blockingWaiter struct {
 	mu       sync.Mutex
 	released map[int]chan struct{}
 	code     int
+	sig      int
 }
 
 func newBlockingWaiter() *blockingWaiter {
@@ -82,10 +85,11 @@ func (w *blockingWaiter) WaitExit(ctx context.Context, pid int) (int, int, error
 		ch = make(chan struct{})
 		w.released[pid] = ch
 	}
+	code, sig := w.code, w.sig
 	w.mu.Unlock()
 	select {
 	case <-ch:
-		return w.code, 0, nil
+		return code, sig, nil
 	case <-ctx.Done():
 		return 0, 0, ctx.Err()
 	}
@@ -107,14 +111,31 @@ type instantWaiter struct{ code int }
 
 func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return w.code, 0, nil }
 
-// fakePuller never touches a registry.
-type fakePuller struct{ err error }
+// fakePuller never touches a registry. It records the last credential it received
+// (M2.6) so a test can assert the imagePullSecret reaches the pull client.
+type fakePuller struct {
+	err error
 
-func (f fakePuller) Pull(context.Context, string) (*image.PullResult, error) {
+	mu       sync.Mutex
+	lastCred *image.RegistryCredential
+	lastRef  string
+}
+
+func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential) (*image.PullResult, error) {
+	f.mu.Lock()
+	f.lastRef = ref
+	f.lastCred = cred
+	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
 	return &image.PullResult{Manifest: &runtimev1.ImageManifest{}, CacheHit: true}, nil
+}
+
+func (f *fakePuller) credential() *image.RegistryCredential {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastCred
 }
 
 // fakeSigner records sign calls and applies a policy-gate decision.
@@ -160,7 +181,7 @@ func newTestRuntime(t *testing.T, d Deps) *Runtime {
 		d.Waiter = newBlockingWaiter()
 	}
 	if d.Puller == nil {
-		d.Puller = fakePuller{}
+		d.Puller = &fakePuller{}
 	}
 	if d.Signer == nil {
 		d.Signer = &fakeSigner{}
