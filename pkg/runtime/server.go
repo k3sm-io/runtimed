@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -49,8 +51,10 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	return &runtimev1.CreatePodResponse{Status: st}, nil
 }
 
-// DeletePod kills the pod's process group and forgets it. Idempotent: deleting an
-// unknown pod succeeds.
+// DeletePod gracefully stops the pod's containers and forgets it. Each container
+// process group gets the M2.4 SIGTERM → grace timer (raced against the kqueue
+// reaper) → SIGKILL escalation; grace 0 is an immediate SIGKILL. Idempotent:
+// deleting an unknown pod succeeds.
 func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	r.mu.Lock()
 	p, ok := r.pods[req.GetPodId()]
@@ -62,6 +66,13 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		return &runtimev1.DeletePodResponse{}, nil // idempotent
 	}
 
+	// Stop the memory sampler (M2.5): the pod is going away.
+	if p.memCancel != nil {
+		p.memCancel()
+	}
+
+	grace := resolveGrace(req, p)
+
 	p.mu.Lock()
 	procs := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range p.containers {
@@ -69,15 +80,25 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 	p.mu.Unlock()
 
-	// Signal each container's process group (SIGKILL for grace 0). The kqueue
-	// reaper observes the exits.
+	// Graceful stop each container's process group concurrently: the per-PID grace
+	// timers start together, so a multi-container pod shares one effective grace
+	// window. GracefulStop only OBSERVES proc.Done (the kqueue reaper stays the
+	// sole reaper) — an early voluntary exit skips the SIGKILL.
+	var wg sync.WaitGroup
 	for _, proc := range procs {
-		if pid := proc.PID(); pid > 0 {
-			if err := supervisor.SignalGroup(pid, killSignal); err != nil {
-				r.log.Warn("signal pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
-			}
+		pid := proc.PID()
+		if pid <= 0 {
+			continue
 		}
+		wg.Add(1)
+		go func(proc *supervisor.Process, pid int) {
+			defer wg.Done()
+			if _, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(), termSignal, killSignal, r.signalGroup); err != nil {
+				r.log.Warn("graceful stop pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
+			}
+		}(proc, pid)
 	}
+	wg.Wait()
 
 	st := r.podStatus(p)
 	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
@@ -86,6 +107,24 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 	}
 	return &runtimev1.DeletePodResponse{}, nil
+}
+
+// resolveGrace computes the SIGTERM→SIGKILL window for a DeletePod: the request's
+// grace_period_seconds if non-zero, else the pod's
+// PodBox.termination_grace_period_seconds. A resolved value of 0 means IMMEDIATE
+// kill (no SIGTERM) — the apis contract. runtimed honors the value literally; the
+// Kubernetes 30s default for an UNSET grace is applied provider-side, since proto3
+// cannot distinguish "unset" from an explicit 0 at this boundary (and mapping 0→30s
+// would make an explicit immediate-kill unreachable).
+func resolveGrace(req *runtimev1.DeletePodRequest, p *pod) time.Duration {
+	secs := req.GetGracePeriodSeconds()
+	if secs == 0 {
+		secs = p.box.GetTerminationGracePeriodSeconds()
+	}
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // UpdatePod applies an in-place spec change. M1 supports labels/annotations only;
@@ -256,9 +295,6 @@ func (r *Runtime) findContainer(p *pod, name string) *containerProc {
 	return nil
 }
 
-// killSignal is SIGKILL via the supervisor's signal type (set in server_signal.go
-// so the os.Signal value is platform-correct).
-//
 // createFailure builds a CreatePodResponse carrying a structured failure.
 func createFailure(reason runtimev1.FailureReason, err error) *runtimev1.CreatePodResponse {
 	code := codes.Internal

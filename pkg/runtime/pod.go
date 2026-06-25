@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -38,6 +39,27 @@ type pod struct {
 	message    string
 	podIP      string
 	containers []*containerProc
+
+	// M2.5 memory metering/OOM state. oomKilled is set by the sampler before it
+	// SIGKILLs the pod, so watchContainerExit records the OOMKilled reason.
+	// memSampler/memCancel are nil when the pod has no memory limit (no sampler).
+	oomKilled  bool
+	memSampler *supervisor.MemorySampler
+	memCancel  context.CancelFunc
+}
+
+// containerPIDs returns the pod's currently-running container PIDs (the memory
+// sampler's PID set; re-evaluated each tick so an exited container drops out).
+func (p *pod) containerPIDs() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pids := make([]int, 0, len(p.containers))
+	for _, cp := range p.containers {
+		if pid := cp.proc.PID(); pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
 }
 
 // containerProc is one running container within a pod.
@@ -156,7 +178,50 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 	p.mu.Lock()
 	p.phase = runtimev1.PodPhase_POD_PHASE_RUNNING
 	p.mu.Unlock()
+
+	// Memory sampler (M2.5): for a pod with a memory limit, sample
+	// ri_phys_footprint at ~1 Hz; on breach SIGKILL the pod and record OOMKilled.
+	// The sampler's lifetime is the pod — cancelled on DeletePod and on pod
+	// termination (watchContainerExit), so the goroutine never leaks. Pods without
+	// a limit run no sampler (the metering/OOM path is limit-driven in M2).
+	if limit := podMemoryLimitBytes(box); limit > 0 {
+		sampCtx, cancel := context.WithCancel(context.Background())
+		sampler := supervisor.NewMemorySampler(r.footprinter, p.containerPIDs, limit, func(footprint uint64) {
+			r.oomKill(p, footprint)
+		})
+		p.mu.Lock()
+		p.memSampler = sampler
+		p.memCancel = cancel
+		p.mu.Unlock()
+		sampler.Start(sampCtx, r.sampleInterval())
+	}
+
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// oomKill is the memory sampler's onBreach callback (M2.5): it marks the pod
+// OOMKilled and SIGKILLs every container's process group. The kqueue reaper then
+// collects the exits and watchContainerExit records the OOMKilled termination
+// reason. Called from the sampler goroutine; it takes p.mu only to snapshot state
+// and signals OUTSIDE the lock (the re-entrancy rule).
+func (r *Runtime) oomKill(p *pod, footprint uint64) {
+	p.mu.Lock()
+	p.oomKilled = true
+	procs := make([]*supervisor.Process, 0, len(p.containers))
+	for _, cp := range p.containers {
+		procs = append(procs, cp.proc)
+	}
+	p.mu.Unlock()
+
+	r.log.Warn("pod exceeded memory limit; OOMKilling",
+		"pod", p.box.GetPodId(), "footprint_bytes", footprint)
+	for _, proc := range procs {
+		if pid := proc.PID(); pid > 0 {
+			if err := r.signalGroup(pid, killSignal); err != nil {
+				r.log.Warn("oom sigkill pod group", "pod", p.box.GetPodId(), "pid", pid, "err", err)
+			}
+		}
+	}
 }
 
 // startContainer resolves the container's binary (image path convention),
@@ -168,12 +233,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		return nil, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err
 	}
 
-	// Ad-hoc sign on pull, then enforce the signature policy BEFORE exec.
-	if err := r.signer.Sign(ctx, binPath); err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED,
-			fmt.Errorf("ad-hoc sign %s: %w", binPath, err)
-	}
-	if err := r.signer.Check(ctx, p.box.GetSignaturePolicy(), binPath); err != nil {
+	// Enforce the signature policy in the correct order relative to ad-hoc signing
+	// (M2.6), BEFORE exec.
+	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), binPath); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
@@ -239,17 +301,29 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 		Signal:     int32(sig),
 		FinishedAt: nowProto(),
 	}
-	if err != nil {
+	switch {
+	case p.oomKilled && (sig != 0 || code != 0):
+		// The memory sampler SIGKILLed this pod for a limit breach (M2.5): a
+		// container that exited by signal / non-zero is reported OOMKilled.
+		term.Reason = "OOMKilled"
+	case err != nil:
 		term.Reason = "Error"
 		term.Message = err.Error()
-	} else if code == 0 {
+	case code == 0:
 		term.Reason = "Completed"
-	} else {
+	default:
 		term.Reason = "Error"
 	}
 	cp.state.State = &runtimev1.ContainerState{Terminated: term}
 	r.recomputePhaseLocked(p)
+	terminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED || p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
+	cancel := p.memCancel
 	p.mu.Unlock()
+
+	// Stop the memory sampler once the pod is fully terminated (no goroutine leak).
+	if terminal && cancel != nil {
+		cancel()
+	}
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 }
@@ -280,6 +354,32 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 	}
 }
 
+// gateSignature enforces the SignaturePolicy in the correct order relative to the
+// ad-hoc-sign step (M2.6-d2), fail-closed, BEFORE exec:
+//
+//   - ADHOC_OK: ad-hoc signing is the point (an unsigned arm64 Mach-O is signed so
+//     it execs under AMFI with a later DYLD insert) — so SIGN, then Check confirms
+//     the signature took.
+//   - REQUIRE_SIGNED / REQUIRE_NOTARIZED: enforce the policy on the AS-PULLED
+//     binary and NEVER ad-hoc sign it — `codesign -s - -f` would strip an existing
+//     notarization / replace a real authority with an ad-hoc signature, silently
+//     downgrading the binary past the policy. A failing image is rejected here.
+//   - UNSPECIFIED / unknown: Check fails closed (ErrPolicyUnspecified); no signing.
+//
+// Both Sign and Check errors are returned wrapped (ErrSignatureRejected /
+// ErrPolicyUnspecified), which the caller maps to SIGNATURE_REJECTED.
+func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error {
+	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK {
+		if err := r.signer.Sign(ctx, path); err != nil {
+			return fmt.Errorf("ad-hoc sign %s: %w", path, err)
+		}
+		return r.signer.Check(ctx, policy, path)
+	}
+	// require-signed / require-notarized / unspecified: check the as-pulled binary;
+	// do NOT ad-hoc sign (no silent downgrade).
+	return r.signer.Check(ctx, policy, path)
+}
+
 // resolveBinary determines the pod binary path + argv for a container. M1
 // convention (mirrors the proto): if command+args are empty the image reference
 // is the host binary path; otherwise the image is pulled+materialized and argv =
@@ -295,8 +395,15 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 		return bin, []string{bin}, nil
 	}
 
+	// Resolve the imagePullSecret credential (M2.6) via the consumer-side seam. It
+	// is passed ONLY to the pull client below and is NEVER written to the pod dir.
+	cred, err := r.pullCredential(ctx, box, c.GetImage())
+	if err != nil {
+		return "", nil, err
+	}
+
 	// Pull + materialize the image into the pod rootfs, then run command/args.
-	if _, err := r.puller.Pull(ctx, c.GetImage()); err != nil {
+	if _, err := r.puller.Pull(ctx, c.GetImage(), cred); err != nil {
 		return "", nil, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
 	}
 	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
@@ -309,6 +416,25 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 	argv := append(append([]string{}, cmd...), c.GetArgs()...)
 	argv[0] = bin
 	return bin, argv, nil
+}
+
+// pullCredential resolves the registry pull credential for ref from the pod's
+// imagePullSecrets via the consumer-side CredentialResolver seam (M2.6). It
+// returns nil (anonymous pull) when there is no resolver, no imagePullSecrets, or
+// no matching credential. The credential never touches disk — it flows straight
+// into the pull client.
+func (r *Runtime) pullCredential(ctx context.Context, box *runtimev1.PodBox, ref string) (*image.RegistryCredential, error) {
+	if r.credentials == nil || len(box.GetImagePullSecrets()) == 0 {
+		return nil, nil
+	}
+	cred, ok, err := r.credentials.PullCredential(ctx, box.GetNamespace(), box.GetImagePullSecrets(), ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve imagePullSecret for %q: %w", ref, err)
+	}
+	if !ok {
+		return nil, nil
+	}
+	return cred, nil
 }
 
 // containerEnv builds the child environment: the container's EnvVars plus the

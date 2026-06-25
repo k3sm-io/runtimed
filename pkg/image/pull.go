@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
@@ -15,18 +16,58 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// FetchFunc resolves an image reference to a go-containerregistry image. The
-// production fetcher is RemoteFetch (a registry pull); tests inject an in-memory
-// image so pull/cache logic is exercised with no network.
-type FetchFunc func(ctx context.Context, ref string) (ggcrv1.Image, error)
+// RegistryCredential is a private-registry pull credential (an imagePullSecret,
+// M2.6). It is consumed ONLY by the pull client (passed to the registry transport
+// as an Authorization header) and is NEVER written to disk / the pod dir — the
+// M2.6 security invariant. The provider resolves it from the referenced
+// docker-config Secret and supplies it via the runtime's CredentialResolver seam;
+// the proto carries only a LocalObjectReference, never the bytes.
+//
+// The fields mirror a docker-config auth entry; either Username+Password or one of
+// the token forms is set. The zero value authenticates anonymously.
+type RegistryCredential struct {
+	// Username and Password are basic-auth credentials.
+	Username string
+	// Password pairs with Username.
+	Password string
+	// Auth is the base64("username:password") form a docker config stores.
+	Auth string
+	// IdentityToken is an OAuth2 refresh/identity token (token-based registries).
+	IdentityToken string
+	// RegistryToken is a bearer token sent directly to the registry.
+	RegistryToken string
+}
+
+// authenticator converts the credential to a go-containerregistry Authenticator.
+func (c *RegistryCredential) authenticator() authn.Authenticator {
+	return authn.FromConfig(authn.AuthConfig{
+		Username:      c.Username,
+		Password:      c.Password,
+		Auth:          c.Auth,
+		IdentityToken: c.IdentityToken,
+		RegistryToken: c.RegistryToken,
+	})
+}
+
+// FetchFunc resolves an image reference to a go-containerregistry image, using
+// cred for private-registry auth (nil = anonymous). The production fetcher is
+// RemoteFetch (a registry pull); tests inject an in-memory image so pull/cache
+// logic is exercised with no network.
+type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential) (ggcrv1.Image, error)
 
 // RemoteFetch fetches ref from a remote registry. It is the production FetchFunc.
-func RemoteFetch(ctx context.Context, ref string) (ggcrv1.Image, error) {
+// When cred is non-nil it authenticates with that credential (the imagePullSecret,
+// M2.6); the credential lives only in this transport, never on disk.
+func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential) (ggcrv1.Image, error) {
 	r, err := name.ParseReference(ref)
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w", ref, err)
 	}
-	img, err := remote.Image(r, remote.WithContext(ctx))
+	opts := []remote.Option{remote.WithContext(ctx)}
+	if cred != nil {
+		opts = append(opts, remote.WithAuth(cred.authenticator()))
+	}
+	img, err := remote.Image(r, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
@@ -61,12 +102,14 @@ func NewPuller(cache *Cache, fetch FetchFunc) *Puller {
 // Pull fetches ref and stores its config + layer blobs in the content-addressed
 // cache, returning the manifest and whether it was a full cache hit. Blobs
 // already present are not re-written, so the second pull of identical content
-// reports CacheHit == true (acceptance M1.1-a1).
-func (p *Puller) Pull(ctx context.Context, ref string) (*PullResult, error) {
+// reports CacheHit == true (acceptance M1.1-a1). cred (M2.6) is the imagePullSecret
+// credential used for the registry fetch; it is confined to the fetch transport
+// and never written to the cache or pod dir.
+func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential) (*PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	img, err := p.fetch(ctx, ref)
+	img, err := p.fetch(ctx, ref, cred)
 	if err != nil {
 		return nil, err
 	}

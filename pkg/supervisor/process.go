@@ -182,6 +182,14 @@ func (p *Process) PID() int {
 	return p.pid
 }
 
+// Done returns a channel closed once the process has been reaped (the single
+// kqueue reaper observed its exit and recorded the final status). It is a
+// broadcast signal safe for multiple observers — e.g. Wait and the M2.4
+// graceful-stop timer both select on it — and is NEVER used to wait4: the kqueue
+// reaper stays the sole reaper. The channel exists from NewProcess; it is only
+// closed after Start → reap.
+func (p *Process) Done() <-chan struct{} { return p.done }
+
 // State returns the current lifecycle state.
 func (p *Process) State() ProcessState {
 	p.mu.Lock()
