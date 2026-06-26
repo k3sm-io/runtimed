@@ -5,7 +5,9 @@
 //
 // The three leading tokens are the pod's securityContext identity
 // (supervisor.Credential, encoded by Credential.ShimArgs); "-1 -1 -" means "no
-// drop" (run as the daemon identity — root-in-Seatbelt). The shim then, in the
+// drop" — run at the daemon's OWN uid, confined by Seatbelt (the unprivileged
+// _k3sm posture, not root). A drop is refused unless the shim is root
+// (RunLaunchSequence → Credential.Validate). The shim then, in the
 // SECURITY-CRITICAL order supervisor.RunLaunchSequence enforces:
 //
 //	(1) drops privilege: setgid → initgroups → setuid   (setgid BEFORE setuid;
@@ -21,10 +23,12 @@
 // The fsGroup chown of the writable volumes happens ROOT-SIDE in the daemon
 // BEFORE this shim is spawned (a dropped process can no longer chown).
 //
-// Privilege-model note (runtimed M2.3): until an untrusted-tenancy backend
-// lands, a pod with no securityContext drop runs as the daemon uid (root)
-// confined only by Seatbelt — "root-in-Seatbelt". Untrusted tenancy routes to
-// the M5 vm backend (a Virtualization.framework micro-VM), not this path.
+// Privilege-model note (runtimed): the daemon runs unprivileged as _k3sm and the
+// only root component is a separate k3sm-netd networking helper. A pod with no
+// securityContext drop runs at the daemon's own (_k3sm) uid, confined by Seatbelt
+// — there is NO per-pod uid isolation (pods share the runtime uid), which is why
+// the SBPL must explicitly deny the helper socket and why untrusted tenancy
+// routes to the vm backend (a Virtualization.framework micro-VM), not this path.
 //
 // The shim must be ad-hoc signed with hardened-runtime and library-validation
 // STRIPPED (codesign -s - -f, no -o runtime/library) so a later DYLD insert can

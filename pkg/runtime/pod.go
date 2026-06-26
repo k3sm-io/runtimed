@@ -86,11 +86,14 @@ type containerProc struct {
 // backend with DYLD_INSERT_LIBRARIES carried through. It returns the started pod
 // or a typed failure.
 func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, runtimev1.FailureReason, error) {
-	// Fail closed: the sandbox backend MUST be available, else refuse the pod
-	// (never run unconfined).
-	if !r.backend.Available() {
+	// Fail closed via the isolation ladder: not-root drops the uidjail rung, and
+	// an unavailable Seatbelt (tripped symbol-canary / missing SPI) degrades to
+	// the stronger vm rung or, with no vm backend yet, refuses — NEVER falls
+	// through to running the pod unconfined. r.backend is the Seatbelt rung (the
+	// only one implemented); vm is not yet wired, so its probe is false here.
+	if _, err := sandbox.SelectBackend(os.Geteuid() == 0, r.backend.Available(), false); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-			fmt.Errorf("sandbox backend %q unavailable: refusing to start pod unconfined", r.backend.Name())
+			fmt.Errorf("sandbox backend %q unavailable: refusing to start pod unconfined: %w", r.backend.Name(), err)
 	}
 
 	sp := box.GetSandboxProfile()
@@ -152,6 +155,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 	// The generator validates every extra/PV path against the protected deny-set and
 	// emits the protected denies last (last-match-wins).
 	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{
+		Posture: sandbox.Posture{
+			// Pin the pods-root and protected denies under the runtime work-dir;
+			// home (when set) bounds it so a misconfigured work-dir can't point a
+			// pod's writable re-allow outside the daemon's data area.
+			WorkDir: r.cfg.Root,
+			Home:    r.home,
+		},
+		PodIP:         ip,
 		ReadOnlyPaths: credPaths,
 		WritePaths:    pvWritePaths,
 		ReadPaths:     pvReadPaths,

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,7 +92,13 @@ type Config struct {
 type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
-	cfg         Config
+	cfg Config
+	// home is the daemon user's home when the work-dir (cfg.Root) lives under it
+	// (the unprivileged user-space posture); else "". It is passed to the SBPL
+	// generator as the work-dir containment bound (sandbox.Posture.Home) so a
+	// misconfigured work-dir cannot point a pod's writable re-allow outside the
+	// daemon's data area. Empty disables the check (legacy root work-dir / tests).
+	home        string
 	log         *slog.Logger
 	cache       *image.Cache
 	puller      Puller
@@ -218,6 +225,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 
 	return &Runtime{
 		cfg:         cfg,
+		home:        daemonHome(cfg.Root),
 		log:         log,
 		cache:       cache,
 		puller:      puller,
@@ -259,3 +267,23 @@ func (defaultSigner) Check(ctx context.Context, policy runtimev1.SignaturePolicy
 
 // nowProto returns the current time as a proto timestamp (indirected for tests).
 var nowProto = func() *timestamppb.Timestamp { return timestamppb.New(time.Now()) }
+
+// daemonHome returns the daemon user's home directory when workDir lives under
+// it (the unprivileged user-space posture, where the runtime work-dir is inside
+// the _k3sm home), enabling the SBPL generator's work-dir containment check
+// (sandbox.Posture.Home). It returns "" — disabling the check — when the home
+// cannot be determined or workDir is elsewhere (the legacy /var/lib root work-dir
+// or a test temp dir), where the generator falls back to its intrinsic work-dir
+// sanity check (absolute, clean, not the filesystem root).
+func daemonHome(workDir string) string {
+	h, err := os.UserHomeDir()
+	if err != nil || h == "" {
+		return ""
+	}
+	h = filepath.Clean(h)
+	wd := filepath.Clean(workDir)
+	if wd == h || strings.HasPrefix(wd, h+string(filepath.Separator)) {
+		return h
+	}
+	return ""
+}
