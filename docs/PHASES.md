@@ -1,7 +1,7 @@
 ---
 repo: runtimed
 schema: phases/v1
-current_phase: M2
+current_phase: M3
 updated: 2026-06-25
 updated_by: agent
 
@@ -305,32 +305,36 @@ phases:
 
   - id: M3
     title: APFS-backed persistent volume (PV/PVC) — stable same-volume dir, seed-once, lifecycle-decoupled
-    status: todo
+    status: done
+    completed: 2026-06-25
     depends_on:
       - apis:M3.1
     subphases:
       - id: M3.1
         title: APFS-backed PV/PVC volume materialization
-        status: todo
+        status: done
+        completed: 2026-06-25
         deliverables:
           - id: M3.1-d1
-            done: false
-            desc: pkg/volume (or pkg/mount) — a stable per-PVC directory on the SAME APFS volume as /var/lib/k3sm (a cross-volume clonefile silently byte-copies, defeating CoW + the same-fs assumption), EMPTY-CREATED on the hot path
+            done: true
+            desc: pkg/volume — NET-NEW. A volume.Binder materializes a PVC-backed volume as a STABLE per-claim dir at storagev1.LocalPathClass.DataDir(namespace, claimName) on the SAME APFS volume as /var/lib/k3sm — the production Binder roots BasePath at <Config.Root>/storage, a sibling of the pods root (so it shares the APFS volume kine's SQLite uses but is NOT under the pod dir removePodDir tears down). The dir is EMPTY-CREATED (os.MkdirAll, never a clonefile) on the hot path; the claim is keyed by (namespace, claimName) so the same claim is stable across pods/restarts. Bind symlinks each container mount of the claim into the pod rootfs (k3sm has no mount namespace) so the confined pod reaches the persistent dir at its mount path. PVC capacity is NOT enforced vs APFS free space (over-commit → write-time ENOSPC; documented in pkg/volume/doc.go + storagev1). pkg/mount.Materialize SKIPS PVC sources (they are not pod-ephemeral)
           - id: M3.1-d2
-            done: false
-            desc: pkg/volume — clonefile is used ONLY to SEED a PVC from a StorageClass template, NEVER on the empty-PVC hot path
+            done: true
+            desc: pkg/volume — clonefile (via the pkg/image Cloner → image.MaterializeTree CoW seam) is used ONLY to SEED a fresh PVC from a StorageClass template, gated by a consumer-side TemplateResolver seam (nil/ok=false ⇒ empty-create; runtimed never reads the apiserver, so the provider supplies the template, tests fake it). Seeding is SEED-ONCE: a reused (already-present) dir is never re-seeded, and the clonefile path is NEVER reached on the empty-PVC hot path
           - id: M3.1-d3
-            done: false
-            desc: pkg/volume + pkg/runtime — the PV lifecycle is DECOUPLED from pod-dir teardown (do NOT RemoveAll the PV on pod restart); the PV mount root is added to the pod's SBPL write-scope
+            done: true
+            desc: pkg/volume + pkg/runtime — the PV lifecycle is DECOUPLED from pod-dir teardown. The PV dir lives under <Root>/storage, a sibling of <Root>/pods, so DeletePod's removePodDir (which only removes <Root>/pods/<id>) never touches it (ReclaimPolicy Retain — there is NO volume-delete RPC and root-rmdir would bypass the SBPL deny-set, so neither is implemented); the pod-side symlink is removed but os.RemoveAll unlinks it without following, so the target survives pod stop/restart/delete. createPod adds each PV mount root to the pod's SBPL scope via the NET-NEW sandbox.GenerateOptions.WritePaths (read+write) / ReadPaths (read-only), validated against the M2.2 protected deny-set
         acceptance:
           - id: M3.1-a1
-            met: false
-            check: a PVC-backed dir is created empty on the same APFS volume as /var/lib/k3sm and is writable by the pod within its SBPL scope
-            method: integration
+            met: true
+            check: a PVC-backed dir is created empty on the same APFS volume as /var/lib/k3sm (the <Root>/storage sibling), stable across calls for the same (namespace, claim), and the PV mount root is granted file-write* in the pod's SBPL scope (a read-only PVC gets read but not write) while the protected denies still win. Root-free unit-provable; the live Seatbelt-confined write is the m3.sh e2e
+            method: unit
+            test: pkg/volume.TestPVCMaterializeStableDir + pkg/sandbox.TestPVCInSBPLWriteScope
           - id: M3.1-a2
-            met: false
-            check: data written to the PV survives a pod restart (the PV is not removed with the pod dir); a template-seeded PVC is a clone, an unseeded one is empty
-            method: integration
+            met: true
+            check: data written to the PV survives the pod-teardown path (the PV dir is NOT removed with the pod dir), while the pod rootfs IS removed; a fresh pod for the same claim reuses the dir with prior data intact; a template-seeded PVC is a clone (seed-once), an unseeded one is empty. Root-free with the real Binder + a temp root; the live clonefile seed is the m3.sh e2e
+            method: unit
+            test: pkg/runtime.TestPVCSurvivesPodTeardown + pkg/volume.TestPVCSeedOnce
 
   - id: M4
     title: uidjail fallback backend + packaging hooks + cgo macOS CI
@@ -620,25 +624,45 @@ fields and serve the two RPCs `apis:M2.2` appended.
 - ✅ `M2.8-a3` a sampled pod's footprint maps onto `PodStats.containers[].memory.working_set_bytes`; empty
   `pod_id` returns all metered pods; an unsampled pod is omitted — `pkg/runtime.TestListPodStatsMapsFootprint`.
 
-## M3 — APFS-backed persistent volume (PV/PVC) ⬜
-**Cross-repo dep:** `apis:M3.1` (the PV/PVC volume source on `PodBox`; **NodePort needs no `apis`
-change**). The multi-node join/mesh work is `k3sm` (join/token) + `darwin-net` (wireguard); runtimed's
-M3 contribution is the **APFS-backed persistent volume**.
+## M3 — APFS-backed persistent volume (PV/PVC) ✅
+**Cross-repo dep:** `apis:M3.1` (the PV/PVC volume source on `PodBox` —
+`Volume.persistent_volume_claim` + the plain-Go `k3sm.io/apis/storage/v1` provisioner contract;
+**NodePort needs no `apis` change**). The multi-node join/mesh work is `k3sm` (join/token) +
+`darwin-net` (wireguard); runtimed's M3 contribution is the **APFS-backed persistent volume**.
 
-### M3.1 — APFS-backed PV/PVC volume materialization ⬜
+### M3.1 — APFS-backed PV/PVC volume materialization ✅
 **Deliverables**
-- ⬜ `M3.1-d1` a **stable per-PVC directory on the SAME APFS volume** as `/var/lib/k3sm` (a cross-volume
-  `clonefile` silently byte-copies, defeating CoW + the same-fs assumption), **empty-created** on the hot path.
-- ⬜ `M3.1-d2` `clonefile` is used **only to seed** a PVC from a StorageClass template — **never** on the
-  empty-PVC hot path.
-- ⬜ `M3.1-d3` the PV lifecycle is **decoupled from pod-dir teardown** (do **not** `RemoveAll` the PV on
-  pod restart); the PV mount root is added to the pod's SBPL write-scope.
+- ✅ `M3.1-d1` `pkg/volume` (NET-NEW): a `volume.Binder` materializes a PVC-backed volume as a **stable
+  per-claim dir** at `storagev1.LocalPathClass.DataDir(namespace, claimName)` on the **same APFS volume** as
+  `/var/lib/k3sm` — the production Binder roots `BasePath` at `<Config.Root>/storage`, a **sibling of the
+  pods root** (shares the volume kine's SQLite uses, but is **not** under the pod dir). **Empty-created**
+  (`os.MkdirAll`, never `clonefile`) on the hot path; keyed by `(namespace, claimName)` so the claim is
+  stable across pods/restarts. `Bind` **symlinks** each container mount into the pod rootfs (no mount
+  namespace) so the confined pod reaches the dir at its mount path. Capacity is **not** enforced vs APFS
+  free space (over-commit → write-time `ENOSPC`). `pkg/mount.Materialize` **skips** PVC sources.
+- ✅ `M3.1-d2` `clonefile` (via the `pkg/image` `Cloner` → `image.MaterializeTree` CoW seam) is used
+  **only to seed** a fresh PVC from a StorageClass template, gated by a consumer-side `TemplateResolver`
+  seam (nil / `ok=false` ⇒ empty-create; the provider supplies the template, tests fake it). **Seed-once**:
+  a reused dir is never re-seeded and the `clonefile` path is **never** on the empty-PVC hot path.
+- ✅ `M3.1-d3` the PV lifecycle is **decoupled from pod-dir teardown**: the PV dir lives under
+  `<Root>/storage` (sibling of `<Root>/pods`), so `DeletePod`'s `removePodDir` (which only removes
+  `<Root>/pods/<id>`) never touches it (**ReclaimPolicy Retain** — no volume-delete RPC, no root-`rmdir`).
+  The pod-side symlink is removed but `os.RemoveAll` unlinks it **without following**, so the target
+  survives. `createPod` adds each PV mount root to the pod's SBPL scope via the NET-NEW
+  `sandbox.GenerateOptions.WritePaths` (read+write) / `ReadPaths` (read-only), validated against the M2.2
+  protected deny-set.
 
 **Acceptance (exit gate)**
-- ⬜ `M3.1-a1` a PVC-backed dir is created empty on the same APFS volume as `/var/lib/k3sm` and is
-  writable by the pod within its SBPL scope.
-- ⬜ `M3.1-a2` data written to the PV survives a pod restart (the PV is not removed with the pod dir); a
-  template-seeded PVC is a clone, an unseeded one is empty.
+- ✅ `M3.1-a1` a PVC-backed dir is created empty on the same APFS volume as `/var/lib/k3sm` (the
+  `<Root>/storage` sibling), stable across calls for the same `(namespace, claim)`, and the PV mount root
+  is granted `file-write*` in the pod's SBPL scope (a read-only PVC gets read but not write) while the
+  protected denies still win — `pkg/volume.TestPVCMaterializeStableDir` + `pkg/sandbox.TestPVCInSBPLWriteScope`
+  (the live Seatbelt-confined write is the `m3.sh` e2e).
+- ✅ `M3.1-a2` data written to the PV survives the pod-teardown path (the PV dir is **not** removed with
+  the pod dir) while the pod rootfs **is** removed; a fresh pod for the same claim reuses the dir with prior
+  data intact; a template-seeded PVC is a clone (seed-once), an unseeded one is empty —
+  `pkg/runtime.TestPVCSurvivesPodTeardown` + `pkg/volume.TestPVCSeedOnce` (the live `clonefile` seed is the
+  `m3.sh` e2e).
 
 ## M4 — Hardening + packaging hooks ⬜
 Headline: `uidjail` fallback `Backend` impl; participate in the codesign/notarize entitlement set;
@@ -665,7 +689,7 @@ macOS-arm64 CI for the cgo build; node-conformance-subset hooks.
 - ⬜ `M5.1-a2` the SPI symbol-canary set is **unchanged** by M5 (VZ is public, not an SPI).
 
 ## Next
-M1 and M2 are complete at the **runtimed unit-provable level**. M2 (the **stockkitty-readiness**
+M1, M2, and M3 are complete at the **runtimed unit-provable level**. M2 (the **stockkitty-readiness**
 milestone, `../../docs/stockkitty-readiness.md`) split `k3sm-runtimed` into a root gRPC daemon + grew
 `internal/spicanary` (M2.1); volume-mount materialization + validated SBPL extra-path injection (M2.2);
 the `setgid→initgroups→setuid` drop + `fsGroup` chown before `sandbox_apply` (M2.3); SIGTERM/grace-timer/
@@ -690,5 +714,14 @@ typed `PodBox` resource fields + the `PodStats`/`ContainerStats`/`MemoryStats` S
 **Deferred runtimed follow-ups** (own sub-phase + acceptance test): `rlimits` via `setrlimit(2)` in the
 M2.3 launch sequence, and `qos_class` best-effort CPU-QoS application.
 
-M3 adds the APFS-backed PV/PVC (stable same-volume dir, seed-once, lifecycle-decoupled); M5 adds the
+**M3 is complete** (runtimed slice): `pkg/volume` materializes a PVC-backed volume as a **stable per-claim
+dir** on the `<Root>/storage` APFS sibling (empty-create, **seed-once** from a StorageClass template via
+the `clonefile` Cloner), symlinks it into the pod rootfs, and the dir is **lifecycle-decoupled** from
+pod-dir teardown (`removePodDir` only touches `<Root>/pods/<id>` — ReclaimPolicy Retain); `createPod` adds
+the PV mount root to the pod's SBPL scope via the new `sandbox.GenerateOptions.WritePaths`/`ReadPaths`,
+validated against the M2.2 protected deny-set (M3.1). **Outside runtimed's per-repo `status: done`** (the
+orchestrator's milestone gate): the multi-node join/mesh/NodePort/provisioner work in `k3sm` +
+`darwin-net`, the workspace `k3sm/hack/acceptance/m3.sh` root/lab e2e (live Seatbelt-confined PV write +
+real `clonefile` seed), and the Wave-3 `k3sm` provider wiring (the local-path provisioner that creates the
+PV/PVC objects + the `TemplateResolver`, if a class carries a seed template). M5 adds the
 Virtualization.framework `vm` backend for Linux images.
