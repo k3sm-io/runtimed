@@ -502,21 +502,6 @@ func TestUnknownPodErrors(t *testing.T) {
 	}
 }
 
-// TestStreamingUnimplemented confirms Exec/Attach/PortForward report Unimplemented
-// in M1.
-func TestStreamingUnimplemented(t *testing.T) {
-	rt := newTestRuntime(t, Deps{})
-	if err := rt.Exec(nil); err == nil {
-		t.Error("Exec should be Unimplemented in M1")
-	}
-	if err := rt.Attach(nil); err == nil {
-		t.Error("Attach should be Unimplemented in M1")
-	}
-	if err := rt.PortForward(nil); err == nil {
-		t.Error("PortForward should be Unimplemented in M1")
-	}
-}
-
 // TestGetRuntimeInfo reflects backend health.
 func TestGetRuntimeInfo(t *testing.T) {
 	cases := []struct {
