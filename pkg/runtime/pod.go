@@ -65,13 +65,19 @@ func (p *pod) containerPIDs() []int {
 // containerProc is one running container within a pod.
 type containerProc struct {
 	name string
-	// spec is the container's PodBox definition, retained so Exec can re-resolve
-	// its securityContext/env/workingDir to re-enter the same confinement domain.
+	// spec is the container's PodBox definition, retained so Exec (and
+	// RestartContainer) can re-resolve its securityContext/env/workingDir to
+	// re-enter the same confinement domain and re-spawn from the same spec.
 	spec *runtimev1.Container
 	proc *supervisor.Process
 	logs *logBuffer
 	// state is updated as the container runs/terminates.
 	state *runtimev1.ContainerStatus
+	// restarting marks the container as mid-RestartContainer: its old process is
+	// being terminated and replaced, so recomputePhaseLocked must NOT treat its
+	// transient termination as a pod-terminal event (which would flip the pod to
+	// Succeeded/Failed and cancel the memory sampler). Guarded by pod.mu.
+	restarting bool
 }
 
 // createPod is the CreatePod spine (called with no lock held). It materializes
@@ -99,10 +105,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 			fmt.Errorf("network setup pod %s: %w", box.GetPodId(), err)
 	}
 
-	rootfs := box.GetRootfsPath()
-	if rootfs == "" {
-		rootfs = r.cache.PodRootfs(box.GetPodId())
-	}
+	rootfs := r.rootfsPath(box)
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
@@ -341,6 +344,12 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 	allTerminated := true
 	anyFailed := false
 	for _, cp := range p.containers {
+		// A container mid-restart is being re-spawned: do not let its transient
+		// termination conclude the pod (the new process is about to replace it).
+		if cp.restarting {
+			allTerminated = false
+			continue
+		}
 		term := cp.state.GetState().GetTerminated()
 		if term == nil {
 			allTerminated = false
@@ -460,6 +469,17 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) []
 		}
 	}
 	return env
+}
+
+// rootfsPath returns the on-disk pod data volume for box: its explicit
+// rootfs_path when set, else the cache-derived default under the runtime root.
+// createPod, Exec, and RestartContainer share it so the pod cwd/SBPL scope is
+// resolved one way.
+func (r *Runtime) rootfsPath(box *runtimev1.PodBox) string {
+	if rootfs := box.GetRootfsPath(); rootfs != "" {
+		return rootfs
+	}
+	return r.cache.PodRootfs(box.GetPodId())
 }
 
 // podDir returns the per-pod directory under the cache root.

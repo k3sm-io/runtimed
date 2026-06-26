@@ -67,10 +67,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	}
 	defer func() { _ = cleanup() }()
 
-	rootfs := p.box.GetRootfsPath()
-	if rootfs == "" {
-		rootfs = r.cache.PodRootfs(p.box.GetPodId())
-	}
+	rootfs := r.rootfsPath(p.box)
 	dir := c.GetWorkingDir()
 	if dir == "" {
 		dir = rootfs
