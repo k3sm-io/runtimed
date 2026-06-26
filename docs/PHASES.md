@@ -246,6 +246,30 @@ phases:
             check: require-notarized / require-signed reject BEFORE (and instead of) the ad-hoc-sign step (no silent downgrade); adhoc-ok proceeds to ad-hoc sign then check. Asserted on a fake signer recording the Sign/Check call order; the live codesign/spctl behavior is the m2.sh e2e
             method: unit
             test: pkg/runtime.TestGateSignatureOrdering
+      - id: M2.7
+        title: serve Exec/Attach/PortForward RPCs — live kubectl exec/port-forward
+        status: done
+        completed: 2026-06-25
+        depends_on:
+          - apis:M1.1
+        deliverables:
+          - id: M2.7-d1
+            done: true
+            desc: pkg/runtime/exec.go — Exec runs the requested argv INSIDE the pod's existing confinement domain by reusing the M2.3 exec-shim seam (sandbox.Backend.WrapCommand → supervisor.RunLaunchSequence confine → setgid/initgroups/setuid → sandbox_apply → execve the user's argv instead of the pod entrypoint), so an exec is a fresh equally-confined process and cannot escape the sandbox. Spawned via os/exec (transient, NOT the kqueue-reaped pod-supervision path; the reaper is per-pid so no double-reap), stdin/stdout/stderr streamed over the bidi gRPC stream (Send serialized), tty honored via an in-tree darwin pty (pty_darwin.go: /dev/ptmx + TIOCPTYGRANT/UNLK/GNAME via x/sys/unix; pty_other.go fails closed) with terminal-resize (TIOCSWINSZ); exit code returned as ExecResult (signal → 128+signo). The container's securityContext/env/workingDir are re-resolved from the retained containerProc.spec
+          - id: M2.7-d2
+            done: true
+            desc: pkg/runtime/exec.go — PortForward dials the pod's lo0 pod IP (darwin-net M2.1 alias; loopback on-node) at the requested port and proxies bytes both directions over the stream, multiplexing connections by connection_id; clean teardown closes all conns + reader goroutines on stream end / ctx cancel. Attach follows a RUNNING container's combined output live (logBuffer gains a bounded follower seam, drop-on-slow so the supervisor log pump never blocks) + delivers the exit code; interactive stdin/tty attach is reported Unimplemented (native pods are posix_spawn'd with stdin NOT retained — documented limitation, kubectl exec is the interactive path) rather than faked
+        acceptance:
+          - id: M2.7-a1
+            met: true
+            check: exec a trivial command via the real spawn/stream path (root-free, non-dropping) streams stdout + returns exit code 0, a command exiting N returns N, stdin piped to the command reaches it, and the exec goes through the WrapCommand confinement seam with the SAME pod SBPL profile (so a future profile change covers exec); the live Seatbelt-enforced exec is the m2.sh root e2e
+            method: unit
+            test: pkg/runtime.TestExecRunsAndReturnsExitCode + pkg/runtime.TestExecStreamsStdin + pkg/runtime.TestOpenPTYAllocatesTTY
+          - id: M2.7-a2
+            met: true
+            check: port-forward proxies bytes both ways through a local listener standing in for the pod port; attach streams a running container's live output and rejects interactive stdin (documented M2 limitation)
+            method: unit
+            test: pkg/runtime.TestPortForwardProxiesBytes + pkg/runtime.TestAttachStreamsContainerOutput + pkg/runtime.TestAttachRejectsStdin
 
   - id: M3
     title: APFS-backed persistent volume (PV/PVC) — stable same-volume dir, seed-once, lifecycle-decoupled
@@ -331,7 +355,7 @@ exist before runtimed implements against it. (In M1 runtimed is still imported b
 library; the gRPC *daemon split* is M2 — but it implements against the M1 proto so M2 is a
 relocation, not a redesign.) The in-process `RuntimeServer` (`pkg/runtime`) implements the full
 `apis runtime/v1` surface (`var _ runtimev1.RuntimeServer = (*Runtime)(nil)`), so M2 is a
-relocation. Streaming RPCs `Exec`/`Attach`/`PortForward` are stubbed `Unimplemented` (M2).
+relocation. Streaming RPCs `Exec`/`Attach`/`PortForward` are stubbed `Unimplemented` here and served in M2.7.
 
 ### M1.1 — OCI pull → cache → clonefile + ad-hoc sign ✅
 **Deliverables**
@@ -499,6 +523,36 @@ daemon split). All M2 sub-phases below are NET-NEW capabilities (not "wire an ex
 - ✅ `M2.6-a2` `require-notarized`/`require-signed` reject **before** (and instead of) ad-hoc signing;
   `adhoc-ok` proceeds to sign-then-check — `pkg/runtime.TestGateSignatureOrdering` (fake signer, call-order).
 
+### M2.7 — serve `Exec`/`Attach`/`PortForward` RPCs (live `kubectl exec`/`port-forward`) ✅
+The three bidi streaming RPCs (stubbed `Unimplemented` since M1) are implemented in
+`pkg/runtime/exec.go`, closing the last gap for live `kubectl exec`/`port-forward` (the `k3sm`
+provider side was already fake-proven in M2.5).
+**Deliverables**
+- ✅ `M2.7-d1` `Exec` runs the requested argv **inside the pod's existing confinement domain** by
+  **reusing the M2.3 exec-shim seam** — `sandbox.Backend.WrapCommand` → `supervisor.RunLaunchSequence`
+  (confine → `setgid`/`initgroups`/`setuid` → `sandbox_apply` → `execve` the user's argv instead of the
+  pod entrypoint), so an exec is a fresh, equally-confined process and **cannot escape** the sandbox. The
+  transient process is spawned via `os/exec` (NOT the kqueue-reaped pod-supervision path; the reaper is
+  per-pid so there is no double-reap), stdin/stdout/stderr stream over the bidi stream (`Send` serialized),
+  **tty** is honored via an in-tree darwin pty (`pty_darwin.go`: `/dev/ptmx` + `TIOCPTYGRANT`/`UNLK`/
+  `GNAME` via `x/sys/unix`; `pty_other.go` fails closed) with terminal-resize (`TIOCSWINSZ`), and the exit
+  code returns as `ExecResult` (signal → `128+signo`).
+- ✅ `M2.7-d2` `PortForward` dials the pod's **lo0 pod IP** (darwin-net M2.1 alias; loopback on-node) at
+  the requested port and proxies bytes both ways, multiplexing by `connection_id` with clean teardown.
+  `Attach` follows a **running** container's live combined output (a bounded `logBuffer` follower seam,
+  drop-on-slow so the supervisor's log pump never blocks) and delivers the exit code; interactive
+  **stdin/tty attach is `Unimplemented`** (native pods are `posix_spawn`'d with stdin **not retained** —
+  a documented limitation, `kubectl exec` is the interactive path) rather than faked.
+
+**Acceptance (exit gate)**
+- ✅ `M2.7-a1` exec streams stdout + returns exit code 0, a command exiting N returns N, piped stdin
+  reaches the command, and the exec goes through the `WrapCommand` confinement seam with the **same** pod
+  SBPL profile — `pkg/runtime.TestExecRunsAndReturnsExitCode` + `TestExecStreamsStdin` +
+  `TestOpenPTYAllocatesTTY` (the live Seatbelt-enforced exec is the `m2.sh` e2e).
+- ✅ `M2.7-a2` port-forward proxies bytes both ways through a local listener; attach streams a running
+  container's output and rejects interactive stdin — `pkg/runtime.TestPortForwardProxiesBytes` +
+  `TestAttachStreamsContainerOutput` + `TestAttachRejectsStdin`.
+
 ## M3 — APFS-backed persistent volume (PV/PVC) ⬜
 **Cross-repo dep:** `apis:M3.1` (the PV/PVC volume source on `PodBox`; **NodePort needs no `apis`
 change**). The multi-node join/mesh work is `k3sm` (join/token) + `darwin-net` (wireguard); runtimed's
@@ -549,8 +603,9 @@ milestone, `../../docs/stockkitty-readiness.md`) split `k3sm-runtimed` into a ro
 `internal/spicanary` (M2.1); volume-mount materialization + validated SBPL extra-path injection (M2.2);
 the `setgid→initgroups→setuid` drop + `fsGroup` chown before `sandbox_apply` (M2.3); SIGTERM/grace-timer/
 SIGKILL graceful stop raced against the reaper (M2.4); the `proc_pid_rusage` memory sampler → `OOMKilled`
-+ `PodMetrics` Summary source (M2.5); and imagePullSecret auth confined to the pull client + signature
-policy before ad-hoc sign (M2.6).
++ `PodMetrics` Summary source (M2.5); imagePullSecret auth confined to the pull client + signature
+policy before ad-hoc sign (M2.6); and served the `Exec`/`Attach`/`PortForward` streaming RPCs by reusing
+the exec-shim confinement seam — live `kubectl exec`/`port-forward` (M2.7).
 
 **Two milestone-gate items remain outside runtimed's per-repo `status: done`** (ROADMAP §phase-gate #2/#3,
 the orchestrator's responsibility): the workspace `k3sm/hack/acceptance/m2.sh` **root e2e** (real

@@ -65,6 +65,9 @@ func (p *pod) containerPIDs() []int {
 // containerProc is one running container within a pod.
 type containerProc struct {
 	name string
+	// spec is the container's PodBox definition, retained so Exec can re-resolve
+	// its securityContext/env/workingDir to re-enter the same confinement domain.
+	spec *runtimev1.Container
 	proc *supervisor.Process
 	logs *logBuffer
 	// state is updated as the container runs/terminates.
@@ -259,6 +262,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	}
 	cp := &containerProc{
 		name: c.GetName(),
+		spec: c,
 		logs: logs,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
@@ -472,24 +476,58 @@ func (r *Runtime) removePodDir(podID string) error {
 	return os.RemoveAll(dir)
 }
 
-// logBuffer is an in-memory ring of a container's combined output for GetLogs.
+// logBuffer is an in-memory ring of a container's combined output for GetLogs,
+// plus a set of live followers (Attach) that receive lines as they are written.
 //
-// Concurrency: mu guards lines; write is the LogSink (called from the
-// supervisor's pump goroutine).
+// Concurrency: mu guards lines AND subs; write (the supervisor.LogSink, called
+// from the supervisor's pump goroutine) appends under mu and fans out to each
+// follower under the same lock; a follower's cancel removes it under mu. So a
+// follower never receives after cancel and the log pump never blocks (a slow
+// follower drops lines rather than stalling the pump).
 type logBuffer struct {
-	mu    sync.Mutex
-	lines [][]byte
+	mu      sync.Mutex
+	lines   [][]byte
+	subs    map[int]chan []byte
+	nextSub int
 }
 
 func newLogBuffer() *logBuffer { return &logBuffer{} }
 
-// write appends a line (the supervisor.LogSink).
+// write appends a line (the supervisor.LogSink) and fans it out to live followers.
 func (l *logBuffer) write(line []byte) {
 	cp := make([]byte, len(line))
 	copy(cp, line)
 	l.mu.Lock()
 	l.lines = append(l.lines, cp)
+	for _, ch := range l.subs {
+		select {
+		case ch <- cp: // cp is never mutated after this, so sharing it is safe
+		default: // slow follower: drop rather than block the supervisor's log pump
+		}
+	}
 	l.mu.Unlock()
+}
+
+// subscribe registers a follower that receives lines written AFTER the call,
+// returning the channel and a cancel that deregisters it. The channel is buffered
+// and is NOT closed by cancel (the consumer — Attach — exits on its own ctx /
+// the container's Done, never on a channel close), so there is no sender/receiver
+// close race.
+func (l *logBuffer) subscribe() (<-chan []byte, func()) {
+	ch := make(chan []byte, 256)
+	l.mu.Lock()
+	if l.subs == nil {
+		l.subs = make(map[int]chan []byte)
+	}
+	id := l.nextSub
+	l.nextSub++
+	l.subs[id] = ch
+	l.mu.Unlock()
+	return ch, func() {
+		l.mu.Lock()
+		delete(l.subs, id)
+		l.mu.Unlock()
+	}
 }
 
 // snapshot returns a copy of the buffered lines, optionally only the last n.
