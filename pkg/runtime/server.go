@@ -239,20 +239,9 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStrea
 	return nil
 }
 
-// Exec runs a command in a container. M2 work; returns Unimplemented in M1.
-func (r *Runtime) Exec(grpc.BidiStreamingServer[runtimev1.ExecRequest, runtimev1.ExecResponse]) error {
-	return status.Error(codes.Unimplemented, "Exec is implemented in M2")
-}
-
-// Attach attaches to a container's streams. M2 work; returns Unimplemented in M1.
-func (r *Runtime) Attach(grpc.BidiStreamingServer[runtimev1.AttachRequest, runtimev1.AttachResponse]) error {
-	return status.Error(codes.Unimplemented, "Attach is implemented in M2")
-}
-
-// PortForward forwards a local stream to a pod port. M2 work; Unimplemented in M1.
-func (r *Runtime) PortForward(grpc.BidiStreamingServer[runtimev1.PortForwardRequest, runtimev1.PortForwardResponse]) error {
-	return status.Error(codes.Unimplemented, "PortForward is implemented in M2")
-}
+// Exec, Attach, and PortForward (the bidi streaming RPCs) are implemented in
+// exec.go: Exec re-enters the pod's confinement via the exec-shim; Attach
+// follows a running container's output; PortForward proxies to the pod's lo0 IP.
 
 // GetRuntimeInfo reports the daemon version + health for the M2 handshake.
 func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
