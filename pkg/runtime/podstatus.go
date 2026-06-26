@@ -22,19 +22,25 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 		st.PodIps = []string{p.podIP}
 	}
 	for _, cp := range p.containers {
-		// Clone the per-container status so callers can't mutate pod state. The
-		// volume_mount + user mirrors (M2.2/M2.3) are carried through losslessly.
-		cs := &runtimev1.ContainerStatus{
-			Name:         cp.state.GetName(),
-			Image:        cp.state.GetImage(),
-			State:        cp.state.GetState(),
-			Ready:        cp.state.GetState().GetRunning() != nil,
-			VolumeMounts: cp.state.GetVolumeMounts(),
-			User:         cp.state.GetUser(),
-		}
-		st.ContainerStatuses = append(st.ContainerStatuses, cs)
+		st.ContainerStatuses = append(st.ContainerStatuses, containerStatusOf(cp))
 	}
 	return st
+}
+
+// containerStatusOf clones a container's status so callers can't mutate pod state.
+// The restart_count + last_termination_state (M2.2) and volume_mount + user
+// mirrors (M2.2/M2.3) are carried through losslessly. The caller holds pod.mu.
+func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
+	return &runtimev1.ContainerStatus{
+		Name:                 cp.state.GetName(),
+		Image:                cp.state.GetImage(),
+		State:                cp.state.GetState(),
+		Ready:                cp.state.GetState().GetRunning() != nil,
+		RestartCount:         cp.state.GetRestartCount(),
+		LastTerminationState: cp.state.GetLastTerminationState(),
+		VolumeMounts:         cp.state.GetVolumeMounts(),
+		User:                 cp.state.GetUser(),
+	}
 }
 
 // publish renders the event and fans it out to WatchPodStatus subscribers. Called

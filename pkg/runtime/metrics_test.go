@@ -107,6 +107,60 @@ func TestPodMetricsSurfacesFootprint(t *testing.T) {
 	}
 }
 
+// TestMemoryLimitFromTypedField is the M2.8 typed-contract proof: podMemoryLimitBytes
+// reads the typed PodBox.memory_limit_bytes (apis:M2.2) first, falls back to the
+// legacy k3sm.io/memory-limit-bytes annotation when the typed field is unset, and
+// the typed field WINS when both are set — the consumer half of the annotation→typed
+// swap, with no transition window in either land order.
+func TestMemoryLimitFromTypedField(t *testing.T) {
+	const annotated = "1048576" // 1 MiB, as a string annotation
+	cases := []struct {
+		name  string
+		typed int64
+		annot string
+		want  uint64
+	}{
+		{"typed-only", 8 << 20, "", 8 << 20},
+		{"annotation-fallback-when-typed-unset", 0, annotated, 1 << 20},
+		{"typed-wins-over-annotation", 8 << 20, annotated, 8 << 20},
+		{"neither-is-unlimited", 0, "", 0},
+		{"unparseable-annotation-is-unlimited", 0, "not-a-number", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			box := hostBinBox("pod-lim")
+			box.MemoryLimitBytes = tc.typed
+			if tc.annot != "" {
+				box.Annotations = map[string]string{memoryLimitAnnotation: tc.annot}
+			}
+			if got := podMemoryLimitBytes(box); got != tc.want {
+				t.Errorf("podMemoryLimitBytes = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreatePodOOMKilledTypedLimit proves the typed field drives the OOM sampler
+// end-to-end (the annotation is no longer required): a pod carrying only
+// PodBox.memory_limit_bytes is metered and OOMKilled on a breach.
+func TestCreatePodOOMKilledTypedLimit(t *testing.T) {
+	w := newBlockingWaiter()
+	w.code, w.sig = 137, 9
+	ff := runtimeFakeFootprinter{bytes: 8 << 20} // over the 1 MiB typed limit
+	rt := newTestRuntime(t, Deps{Waiter: w, Footprinter: ff})
+	rt.cfg.SampleInterval = 5 * time.Millisecond
+	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
+	rt.signalGroup = rec.signal
+
+	box := hostBinBox("pod-oom-typed")
+	box.MemoryLimitBytes = 1 << 20 // typed field only, no annotation
+	mustCreatePod(t, rt, box)
+
+	if reason := waitTerminatedReason(t, rt, "pod-oom-typed", 3*time.Second); reason != "OOMKilled" {
+		t.Fatalf("terminated reason = %q, want OOMKilled (typed limit)", reason)
+	}
+}
+
 // waitTerminatedReason polls GetPodStatus until the (sole) container terminates,
 // returning its reason, or fails on timeout.
 func waitTerminatedReason(t *testing.T, rt *Runtime, podID string, timeout time.Duration) string {

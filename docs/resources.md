@@ -49,11 +49,14 @@ terminated reason to **`OOMKilled`** (`pkg/runtime/pod.go` `oomKill` +
 `watchContainerExit`). The kqueue reaper stays the sole reaper — the sampler only
 triggers the signal; it never `wait4`s.
 
-The memory limit is carried (interim) by the `k3sm.io/memory-limit-bytes` pod
-annotation until `apis` defines the first-class `PodBox` memory-limit field
-(`apis:M2.2`, reserved band `100..199`). The provider sets the annotation from the
-pod's summed container limits; when the typed field lands, `podMemoryLimitBytes`
-reads it instead.
+The memory limit is read from the typed **`PodBox.memory_limit_bytes`** field
+(`apis:M2.2`, allocated from the reserved `100..199` band) — the provider converts
+the pod's `resources.limits.memory`. `podMemoryLimitBytes` (`pkg/runtime/metrics.go`,
+M2.8) prefers that typed field and falls back to the legacy
+`k3sm.io/memory-limit-bytes` annotation **only** when it is unset, so OOM
+enforcement holds in either land order while the provider switches to writing the
+typed field; the annotation fallback is transitional and removable once every
+provider writes the typed field. `0` means no limit (BestEffort → no sampler).
 
 ## CPU: best-effort QoS, NOT CFS millicores
 
@@ -63,9 +66,17 @@ Darwin QoS classes): it can *deprioritize* a greedy pod under contention, but it
 **cannot** enforce a hard "500m = half a core" guarantee the way Linux CFS quotas
 do. runtimed therefore does **not** claim a CPU limit is honored as millicores.
 
-CPU-QoS *application* is deferred with the `apis` CPU-limit field (`apis:M2.2`):
-there is no proto field to read a CPU request/limit from yet, and wiring an
-unconfigurable `setpriority` would over-promise. When the field lands, the
-best-effort QoS knob attaches at the same spawn/launch seam as the memory sampler.
-Until then this file is the standing honesty note: **CPU is best-effort, memory is
-enforced (in phys_footprint units).**
+`apis:M2.2` added **`PodBox.qos_class`** (an enum mirroring corev1 `PodQOSClass`),
+but CPU-QoS *application* (`taskpolicy` / `setpriority`) is **still deferred**: a
+QoS class is not a CPU millicore request, and wiring `setpriority` to a class
+without a contention-policy decision would over-promise. When the best-effort QoS
+knob is built it attaches at the same spawn/launch seam as the memory sampler and
+reads `qos_class`. Until then this file is the standing honesty note: **CPU is
+best-effort, memory is enforced (in phys_footprint units).**
+
+`apis:M2.2` also added **`PodBox.rlimits`** (OCI-style `setrlimit(2)` caps, e.g.
+`RLIMIT_NOFILE`). Applying them is **deferred to a follow-up** because `setrlimit`
+must run in the exec-shim *before* exec and is ordered relative to the M2.3
+privilege drop (the hard-limit raise needs privilege, so it precedes `setuid`) —
+extending the security-critical `RunLaunchSequence` deserves its own ordering test
+(mirroring `TestRunLaunchSequenceOrder`) rather than being bolted on untested.

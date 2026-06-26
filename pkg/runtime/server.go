@@ -117,7 +117,15 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 // cannot distinguish "unset" from an explicit 0 at this boundary (and mapping 0→30s
 // would make an explicit immediate-kill unreachable).
 func resolveGrace(req *runtimev1.DeletePodRequest, p *pod) time.Duration {
-	secs := req.GetGracePeriodSeconds()
+	return graceDuration(req.GetGracePeriodSeconds(), p)
+}
+
+// graceDuration resolves the SIGTERM→SIGKILL window for a stop: secs if non-zero,
+// else the pod's PodBox.termination_grace_period_seconds; a resolved 0 means an
+// IMMEDIATE kill (no SIGTERM). Shared by DeletePod (resolveGrace) and
+// RestartContainer, both of which honor an explicit per-request grace and
+// otherwise fall back to the pod's configured grace.
+func graceDuration(secs int64, p *pod) time.Duration {
 	if secs == 0 {
 		secs = p.box.GetTerminationGracePeriodSeconds()
 	}

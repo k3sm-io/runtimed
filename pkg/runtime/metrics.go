@@ -7,21 +7,37 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// memoryLimitAnnotation carries the pod's memory limit in BYTES. It is the interim
-// carrier for the OOM threshold + kubectl-top metering trigger until apis defines
-// the first-class PodBox memory-limit field (apis:M2.2): the proto RESERVES the
-// band (PodBox 100..199, "resource limits") but has not defined the field yet, so
-// — exactly as the DYLD-insert dylib path rides k3sm.io/dyld-insert-libraries —
-// the provider sets this from the pod's summed container memory limits. The value
-// is in ri_phys_footprint units (NOT RSS); see docs/resources.md. When apis:M2.2
-// lands the typed field, podMemoryLimitBytes switches to reading it.
+// memoryLimitAnnotation carried the pod's memory limit in BYTES before apis:M2.2
+// defined the first-class PodBox.memory_limit_bytes field. It is now the
+// TRANSITIONAL FALLBACK only: podMemoryLimitBytes prefers the typed field and
+// reads this annotation solely when the typed field is unset, so OOM enforcement
+// holds regardless of land order while the k3sm provider switches to writing the
+// typed field (a sibling PR). Once every provider writes the typed field this
+// fallback (and the annotation) can be deleted. The value is in ri_phys_footprint
+// units (NOT RSS); see docs/resources.md.
 const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 
 // podMemoryLimitBytes returns the pod's memory limit in bytes, or 0 for unlimited
-// (no OOM enforcement, no sampler). Parsed from memoryLimitAnnotation; an
-// unparseable value is treated as unlimited (the provider is the trusted producer
-// of this annotation).
+// (no OOM enforcement, no sampler). It reads the typed PodBox.memory_limit_bytes
+// (apis:M2.2) first; the typed field WINS whenever it is set (> 0). When it is
+// unset (0) the legacy memoryLimitAnnotation is consulted as a transitional
+// fallback (see memoryLimitAnnotation) so there is no transition window in either
+// land order. An unparseable annotation is treated as unlimited (the provider is
+// the trusted producer of both carriers).
+//
+// qos_class and rlimits also ride apis:M2.2's PodBox resource band. qos_class is
+// informational for runtimed today (CPU is best-effort QoS, not CFS millicores —
+// the taskpolicy/setpriority application is deferred, see docs/resources.md and
+// PodBox.qos_class); rlimits are applied via setrlimit(2) in the exec-shim before
+// exec — deferred to a follow-up that extends the M2.3 security-critical launch
+// sequence (a setrlimit step ordered before the uid drop) with its own ordering
+// test, rather than bolted on here untested.
 func podMemoryLimitBytes(box *runtimev1.PodBox) uint64 {
+	if typed := box.GetMemoryLimitBytes(); typed > 0 {
+		return uint64(typed)
+	}
+	// Transitional fallback: the legacy annotation, until the provider writes the
+	// typed field everywhere.
 	v := box.GetAnnotations()[memoryLimitAnnotation]
 	if v == "" {
 		return 0
