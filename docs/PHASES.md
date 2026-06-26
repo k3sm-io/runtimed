@@ -270,6 +270,38 @@ phases:
             check: port-forward proxies bytes both ways through a local listener standing in for the pod port; attach streams a running container's live output and rejects interactive stdin (documented M2 limitation)
             method: unit
             test: pkg/runtime.TestPortForwardProxiesBytes + pkg/runtime.TestAttachStreamsContainerOutput + pkg/runtime.TestAttachRejectsStdin
+      - id: M2.8
+        title: consume the apis:M2.2 typed resource contract (replace the annotation seam) + serve RestartContainer/ListPodStats
+        status: done
+        completed: 2026-06-25
+        depends_on:
+          - apis:M2.2
+        deliverables:
+          - id: M2.8-d1
+            done: true
+            desc: pkg/runtime/metrics.go — podMemoryLimitBytes now reads the typed PodBox.memory_limit_bytes (apis:M2.2) and the typed field WINS when set; it falls back to the legacy k3sm.io/memory-limit-bytes annotation ONLY when the typed field is unset (0). The fallback is TRANSITIONAL (documented as such) so there is NO transition window regardless of land order — the k3sm provider starts writing the typed field in a sibling PR. qos_class and rlimits ride the same PodBox resource band but their ENFORCEMENT is deferred and documented (docs/resources.md): qos_class CPU-QoS application (taskpolicy/setpriority) needs a contention-policy decision, and rlimits via setrlimit(2) must extend the M2.3 security-critical RunLaunchSequence (a setrlimit step ordered before setuid) with its own ordering test — neither is bolted on untested here
+          - id: M2.8-d2
+            done: true
+            desc: pkg/runtime/restart.go — serve RestartContainer: terminate the named container's process group within the grace window (reuses the M2.4 supervisor.GracefulStop SIGTERM→grace→SIGKILL escalation), wait for the kqueue reaper to collect it, then RE-SPAWN FROM THE SAME SPEC via the existing startContainer path (so the replacement gets the SAME already-generated SBPL profile, the SAME M2.3 exec-shim setgid/initgroups/setuid drop, and the SAME mounts). restart_count is incremented and the prior run recorded in last_termination_state; a per-container `restarting` guard keeps the transient termination from flipping the pod phase or cancelling the memory sampler; the re-spawn supervision is detached from the RPC ctx (context.WithoutCancel) so it outlives the call. Unknown pod/container return a structured NOT_FOUND. restart_count + last_termination_state are added to the ContainerStatus status mirror (containerStatusOf, shared with podStatus)
+          - id: M2.8-d3
+            done: true
+            desc: pkg/runtime/stats.go — serve ListPodStats: map the M2.5 sampler's ri_phys_footprint working set onto the apis PodStats/ContainerStats/MemoryStats wire types (replacing the runtimed-internal-only PodMetrics path). Pod-level working_set_bytes comes from PodMetrics (the sampler, the same value OOMKilled is judged against); per-container working sets are sampled from the same proc_pid_rusage Footprinter seam at request time (each M2 container is one process). Empty pod_id returns ALL metered pods (the Summary shape); a pod with no memory sampler (unmetered in M2) or an unknown/gone pod_id is OMITTED (empty list, not an error); CPU is left unset (best-effort QoS, no accounting)
+        acceptance:
+          - id: M2.8-a1
+            met: true
+            check: the memory limit is read from the typed PodBox.memory_limit_bytes; it falls back to the annotation when the typed field is unset; the typed field wins when both are set. The typed limit also drives the OOM sampler end-to-end (no annotation required)
+            method: unit
+            test: pkg/runtime.TestMemoryLimitFromTypedField + pkg/runtime.TestCreatePodOOMKilledTypedLimit
+          - id: M2.8-a2
+            met: true
+            check: RestartContainer stops the old process group and relaunches the container through the startContainer path (a new spawn) and bumps restart_count; an unknown pod or container is NOT_FOUND. The live Seatbelt-confined re-exec under a real liveness restart is the m2.sh e2e
+            method: unit
+            test: pkg/runtime.TestRestartContainerReExecs
+          - id: M2.8-a3
+            met: true
+            check: a sampled (metered) pod's footprint maps onto PodStats.containers[].memory.working_set_bytes; empty pod_id returns all metered pods; an unsampled (unmetered) pod is omitted
+            method: unit
+            test: pkg/runtime.TestListPodStatsMapsFootprint
 
   - id: M3
     title: APFS-backed persistent volume (PV/PVC) — stable same-volume dir, seed-once, lifecycle-decoupled
@@ -553,6 +585,41 @@ provider side was already fake-proven in M2.5).
   container's output and rejects interactive stdin — `pkg/runtime.TestPortForwardProxiesBytes` +
   `TestAttachStreamsContainerOutput` + `TestAttachRejectsStdin`.
 
+### M2.8 — consume the `apis:M2.2` typed resource contract + serve `RestartContainer`/`ListPodStats` ✅
+The runtimed half of the M2.2 consumer swap: replace the M2.5 annotation seam with the typed `PodBox`
+fields and serve the two RPCs `apis:M2.2` appended.
+**Deliverables**
+- ✅ `M2.8-d1` `pkg/runtime/metrics.go`: `podMemoryLimitBytes` reads the typed **`PodBox.memory_limit_bytes`**
+  (the typed field **wins** when set) and falls back to the legacy `k3sm.io/memory-limit-bytes` annotation
+  **only** when it is unset — a **transitional** fallback so there is **no transition window** regardless of
+  land order (the `k3sm` provider starts writing the typed field in a sibling PR). `qos_class`/`rlimits` ride
+  the same band but their **enforcement is deferred + documented** (`docs/resources.md`): CPU-QoS application
+  needs a contention-policy decision, and `setrlimit` must extend the M2.3 security-critical
+  `RunLaunchSequence` (a step ordered before `setuid`) with its own ordering test — neither is bolted on
+  untested here.
+- ✅ `M2.8-d2` `pkg/runtime/restart.go`: serve **`RestartContainer`** — terminate the named container's
+  process group within the grace window (reuses the M2.4 `supervisor.GracefulStop`), wait for the kqueue
+  reaper, then **re-spawn from the same spec via the existing `startContainer` path** (same SBPL profile +
+  M2.3 exec-shim uid drop + mounts), incrementing `restart_count` and recording `last_termination_state`. A
+  per-container `restarting` guard keeps the transient termination from flipping the pod phase / cancelling
+  the sampler; the re-spawn supervision is detached from the RPC ctx so it outlives the call. Unknown
+  pod/container → structured `NOT_FOUND`. `restart_count` + `last_termination_state` join the
+  `ContainerStatus` mirror.
+- ✅ `M2.8-d3` `pkg/runtime/stats.go`: serve **`ListPodStats`** — map the M2.5 sampler's `ri_phys_footprint`
+  onto the apis `PodStats`/`ContainerStats`/`MemoryStats` (pod-level from `PodMetrics`, per-container from the
+  `Footprinter` at request time). Empty `pod_id` = all **metered** pods (the Summary shape); unmetered/unknown
+  omitted; CPU left unset (best-effort QoS).
+
+**Acceptance (exit gate)**
+- ✅ `M2.8-a1` limit read from the typed field; annotation fallback when unset; typed wins when both set (and
+  the typed limit drives the OOM path) — `pkg/runtime.TestMemoryLimitFromTypedField` +
+  `TestCreatePodOOMKilledTypedLimit`.
+- ✅ `M2.8-a2` `RestartContainer` stops+relaunches via the `startContainer` path and bumps `restart_count`;
+  `NOT_FOUND` for an unknown pod/container (the live confined re-exec is the `m2.sh` e2e) —
+  `pkg/runtime.TestRestartContainerReExecs`.
+- ✅ `M2.8-a3` a sampled pod's footprint maps onto `PodStats.containers[].memory.working_set_bytes`; empty
+  `pod_id` returns all metered pods; an unsampled pod is omitted — `pkg/runtime.TestListPodStatsMapsFootprint`.
+
 ## M3 — APFS-backed persistent volume (PV/PVC) ⬜
 **Cross-repo dep:** `apis:M3.1` (the PV/PVC volume source on `PodBox`; **NodePort needs no `apis`
 change**). The multi-node join/mesh work is `k3sm` (join/token) + `darwin-net` (wireguard); runtimed's
@@ -604,18 +671,24 @@ milestone, `../../docs/stockkitty-readiness.md`) split `k3sm-runtimed` into a ro
 the `setgid→initgroups→setuid` drop + `fsGroup` chown before `sandbox_apply` (M2.3); SIGTERM/grace-timer/
 SIGKILL graceful stop raced against the reaper (M2.4); the `proc_pid_rusage` memory sampler → `OOMKilled`
 + `PodMetrics` Summary source (M2.5); imagePullSecret auth confined to the pull client + signature
-policy before ad-hoc sign (M2.6); and served the `Exec`/`Attach`/`PortForward` streaming RPCs by reusing
-the exec-shim confinement seam — live `kubectl exec`/`port-forward` (M2.7).
+policy before ad-hoc sign (M2.6); served the `Exec`/`Attach`/`PortForward` streaming RPCs by reusing
+the exec-shim confinement seam — live `kubectl exec`/`port-forward` (M2.7); and **consumed the
+`apis:M2.2` typed resource contract** — `podMemoryLimitBytes` reads `PodBox.memory_limit_bytes` (annotation
+fallback only, transitional), `RestartContainer` re-execs a container via the `startContainer` path
+(liveness restart), and `ListPodStats` maps the sampler footprint onto the `PodStats` wire types (M2.8).
 
 **Two milestone-gate items remain outside runtimed's per-repo `status: done`** (ROADMAP §phase-gate #2/#3,
 the orchestrator's responsibility): the workspace `k3sm/hack/acceptance/m2.sh` **root e2e** (real
-signals/uid/registry/OOM under a real memory limit), and the **Wave-3 `k3sm` provider wiring** — map
-`Runtime.PodMetrics` to the kubelet Summary endpoint, implement the `CredentialResolver` (docker-config
-Secret → `image.RegistryCredential`) and the `mount.Resolver`, derive `DeletePodRequest.grace_period_seconds`
-(applying the k8s 30s default), and set the `k3sm.io/memory-limit-bytes` annotation. **apis follow-up:**
-`apis:M2.2` should add the first-class `PodBox` memory-limit field + a Summary/pod-stats message + the
-`ContainerStatus.resources` mirror; until then the limit rides the annotation and `PodMetrics` is a
-runtimed-internal type.
+signals/uid/registry/OOM under a real memory limit), and the **Wave-3 `k3sm` provider wiring** — serve the
+kubelet Summary endpoint from `ListPodStats`, drive `RestartContainer` from the liveness-probe runner,
+implement the `CredentialResolver` (docker-config Secret → `image.RegistryCredential`) and the
+`mount.Resolver`, derive `DeletePodRequest.grace_period_seconds` (applying the k8s 30s default), and
+**write the typed `PodBox.memory_limit_bytes`/`qos_class`/`rlimits`** (the `k3sm.io/memory-limit-bytes`
+annotation is now only runtimed's transitional fallback). **apis follow-up landed:** `apis:M2.2` added the
+typed `PodBox` resource fields + the `PodStats`/`ContainerStats`/`MemoryStats` Summary messages + the
+`ContainerStatus.resources` mirror + the `RestartContainer`/`ListPodStats` RPCs, all consumed here.
+**Deferred runtimed follow-ups** (own sub-phase + acceptance test): `rlimits` via `setrlimit(2)` in the
+M2.3 launch sequence, and `qos_class` best-effort CPU-QoS application.
 
 M3 adds the APFS-backed PV/PVC (stable same-volume dir, seed-once, lifecycle-decoupled); M5 adds the
 Virtualization.framework `vm` backend for Linux images.
