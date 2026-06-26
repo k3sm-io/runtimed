@@ -139,6 +139,8 @@ func TestGenerateRejectsProtectedExtraPath(t *testing.T) {
 		{"whole-fs", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraReadPaths: []string{"/"}}, GenerateOptions{}},
 		{"relative", &runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraWritePaths: []string{"opt/rel"}}, GenerateOptions{}},
 		{"cred-under-users", &runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{ReadOnlyPaths: []string{"/Users/alice/token"}}},
+		{"pv-write-under-users", &runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{WritePaths: []string{"/Users/bob/data"}}},
+		{"pv-read-under-var-db", &runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{ReadPaths: []string{"/private/var/db/x"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,6 +176,53 @@ func TestGenerateSecretReadOnlySubScope(t *testing.T) {
 	}
 	if iCredDeny <= iDataWrite {
 		t.Errorf("credential write-deny (%d) must come AFTER the data-volume write re-allow (%d) to win (last-match-wins)", iCredDeny, iDataWrite)
+	}
+}
+
+// TestPVCInSBPLWriteScope is acceptance runtimed:M3.1-a1 (SBPL half): a read-write
+// persistent-volume mount root (opts.WritePaths) — which lives OUTSIDE the pod data
+// volume on the APFS storage root — gets BOTH a file-write* and a file-read* allow,
+// a read-only PV root (opts.ReadPaths) gets read but NOT write, and the protected
+// denies (e.g. /Users) still win regardless.
+func TestPVCInSBPLWriteScope(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	const pvWrite = "/var/lib/k3sm/storage/prod/pgdata"
+
+	out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+		WritePaths: []string{pvWrite},
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	// The PV root is granted file-write* (the write block carries the subpath).
+	wantWriteBlock := "(allow file-write*\n  (subpath \"" + pvWrite + "\")\n  (literal \"/dev/null\"))"
+	if !strings.Contains(out, wantWriteBlock) {
+		t.Errorf("PV mount root missing file-write* allow:\n%s", out)
+	}
+	// A read-write PV must be readable too (it joins the read allow).
+	if !strings.Contains(out, "(subpath \""+pvWrite+"\")\n  (literal \"/dev/null\") (literal \"/dev/zero\")") {
+		t.Errorf("PV mount root missing file-read* allow:\n%s", out)
+	}
+	// The protected denies still win: /Users is denied AFTER the allows.
+	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \"/Users\"))") {
+		t.Errorf("protected /Users deny missing — PV write-scope must not weaken it:\n%s", out)
+	}
+
+	// A READ-ONLY PV root gets a read allow but NO write allow (default-deny then
+	// blocks writes): the write block stays the bare /dev/null default.
+	const pvRO = "/var/lib/k3sm/storage/prod/config"
+	ro, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+		ReadPaths: []string{pvRO},
+	})
+	if err != nil {
+		t.Fatalf("Generate (read-only): %v", err)
+	}
+	if !strings.Contains(ro, "(subpath \""+pvRO+"\")") {
+		t.Errorf("read-only PV root missing file-read* allow:\n%s", ro)
+	}
+	if !strings.Contains(ro, "(allow file-write*\n  (literal \"/dev/null\"))") {
+		t.Errorf("read-only PV root must NOT get a file-write* allow:\n%s", ro)
 	}
 }
 

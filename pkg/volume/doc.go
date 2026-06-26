@@ -1,0 +1,25 @@
+// Package volume materializes APFS-backed persistent volumes (PVCs) for a pod
+// (runtimed M3.1). It is the durable counterpart to pkg/mount: where pkg/mount
+// renders pod-ephemeral sources (configMap/secret/emptyDir/downwardAPI/projected)
+// INTO the pod data volume — torn down with the pod — a PVC-backed dir lives at a
+// STABLE per-claim path on the APFS storage root OUTSIDE the pod tree and SURVIVES
+// pod stop/restart/delete (ReclaimPolicy Retain).
+//
+// The path two repos agree on is k3sm.io/apis/storage/v1: the provisioner
+// controller (k3sm) writes the bound PersistentVolume's local path as
+// LocalPathClass.DataDir(namespace, claimName), and the Binder here resolves the
+// same dir from the PodBox alone (namespace + the PVC source's claim_name) —
+// runtimed never needs the PV object. The storage root is the SAME APFS volume as
+// /var/lib/k3sm (kine's SQLite shares it), so seeding can clonefile-CoW and a
+// runaway PVC can fill the datastore volume: capacity is NOT enforced vs free
+// space (over-commit → write-time ENOSPC) — see docs/m3-plan.md (runtimed:M3.1).
+//
+// The Binder EMPTY-CREATEs a fresh claim's dir (the hot path — never a clonefile),
+// and SEEDs-once from a StorageClass template only when one is configured, via the
+// pkg/image Cloner (clonefile-CoW). It then symlinks each container mount of the
+// claim into the pod rootfs so the confined pod reaches the persistent dir at its
+// mount path; the symlink lives in the pod dir (removed on teardown) while its
+// target does not. The Binder NEVER deletes a PV dir — there is no volume-delete
+// RPC and root-rmdir would bypass the pod SBPL deny-set (Retain only). The PV dir
+// is added to the pod's SBPL write-scope by the caller (pkg/runtime → pkg/sandbox).
+package volume
