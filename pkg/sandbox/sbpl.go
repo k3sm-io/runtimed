@@ -57,13 +57,24 @@ var ErrProtectedPath = errors.New("sbpl: extra path is under a protected deny-se
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are NOT part of
 // the cross-repo SandboxProfile proto. They are computed during pod setup (by the
-// volume materializer in pkg/mount), not supplied by the provider over the wire.
+// volume materializer in pkg/mount and the persistent-volume binder in pkg/volume),
+// not supplied by the provider over the wire.
 type GenerateOptions struct {
 	// ReadOnlyPaths get a read-only sub-scope: granted file-read* and explicitly
 	// denied file-write*, emitted LAST so the write-deny wins even when the path
 	// lies inside the writable data volume. These are the credential mounts
 	// (secrets + the projected ServiceAccount token) a pod must not overwrite.
 	ReadOnlyPaths []string
+	// WritePaths get a read+write allow: the read-write PERSISTENT-VOLUME mount
+	// roots (M3.1). A PVC-backed dir lives OUTSIDE the pod data volume on the APFS
+	// storage root (so it survives pod teardown — ReclaimPolicy Retain), so unlike
+	// the pod's own data volume it needs an explicit allow. Validated against the
+	// protected deny-set exactly like the extra paths; a read-only PVC uses
+	// ReadPaths instead.
+	WritePaths []string
+	// ReadPaths get a read-only allow (no write): the read_only PERSISTENT-VOLUME
+	// mount roots (M3.1). Default-deny then blocks writes to them.
+	ReadPaths []string
 }
 
 // Generate renders a default-deny SBPL profile for one pod from sp and opts.
@@ -71,7 +82,10 @@ type GenerateOptions struct {
 // The output ALWAYS begins (version 1) / (deny default) / (import "system.sb"),
 // then grants the minimal allow-list: read the OS (/System, /usr, /bin,
 // /Library) plus validated extra read paths, read+write the pod's own data
-// volume, and — when sp.AllowNetwork is set — outbound to the cluster DNS VIP.
+// volume and any read-write persistent-volume mount roots (opts.WritePaths, which
+// live outside the data volume on the APFS storage root), read-only
+// persistent-volume roots (opts.ReadPaths), and — when sp.AllowNetwork is set —
+// outbound to the cluster DNS VIP.
 //
 // Rule ORDER is security-critical because SBPL is last-match-wins. Generate emits
 // (in increasing precedence): the OS/extra-path allows; THEN the protected denies
@@ -97,17 +111,23 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// Validate every caller-supplied path BEFORE emitting any allow: a path under
 	// the protected deny-set is rejected outright (fail closed). The pod's own
 	// data volume is carved out (it is re-allowed by design below).
-	if err := validateExtraPaths(dataVol, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths); err != nil {
+	if err := validateExtraPaths(dataVol, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths); err != nil {
 		return "", err
 	}
 
+	// Read scope: the OS baseline + extra read paths + every PV mount root (a
+	// read-write PV must be readable too, so its dir joins the read allow).
+	readExtra := append([]string{}, sp.GetExtraReadPaths()...)
+	readExtra = append(readExtra, opts.ReadPaths...)
+	readExtra = append(readExtra, opts.WritePaths...)
 	readPaths := dedupeSorted(append([]string{
 		"/System",
 		"/usr",
 		"/bin",
 		"/Library",
-	}, sp.GetExtraReadPaths()...))
-	writePaths := dedupeSorted(sp.GetExtraWritePaths())
+	}, readExtra...))
+	// Write scope: extra write paths + the read-write PV mount roots.
+	writePaths := dedupeSorted(append(append([]string{}, sp.GetExtraWritePaths()...), opts.WritePaths...))
 	credPaths := dedupeSorted(opts.ReadOnlyPaths)
 
 	var b strings.Builder

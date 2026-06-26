@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -14,8 +15,10 @@ import (
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
+	"k3sm.io/runtimed/pkg/volume"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	storagev1 "k3sm.io/apis/storage/v1"
 )
 
 // Ensure Runtime implements the apis runtime/v1 server contract. The M2 daemon
@@ -99,6 +102,7 @@ type Runtime struct {
 	waiter      supervisor.ExitWaiter
 	network     supervisor.PodNetwork
 	resolver    mount.Resolver
+	binder      *volume.Binder
 	footprinter supervisor.Footprinter
 	broker      *broker
 
@@ -131,6 +135,11 @@ type Deps struct {
 	// Resolver it has NO production default (runtimed never reads the apiserver):
 	// the provider wires one. nil means anonymous pulls only.
 	Credentials CredentialResolver
+	// Binder materializes APFS-backed persistent volumes (PVCs) for a pod (M3.1).
+	// Defaults to a volume.Binder rooted at <Config.Root>/storage with the default
+	// local-path class and empty-create only (no seed template). Tests inject one
+	// with a custom class/template; the provider may wire a TemplateResolver.
+	Binder *volume.Binder
 	// Footprinter samples per-PID memory footprints for the OOM/metering sampler
 	// (M2.5). Defaults to supervisor.PhysFootprinter (proc_pid_rusage); tests
 	// inject a fake.
@@ -196,6 +205,16 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if signalGroup == nil {
 		signalGroup = supervisor.SignalGroup
 	}
+	binder := deps.Binder
+	if binder == nil {
+		// The PV storage root is a sibling of the pods root under the runtime root
+		// (so it shares the APFS volume but is NOT under the pod dir removePodDir
+		// tears down — that is the lifecycle decoupling). With the default
+		// Config.Root this is storagev1.DefaultBasePath (/var/lib/k3sm/storage).
+		class := storagev1.DefaultLocalPathClass()
+		class.BasePath = filepath.Join(cfg.Root, "storage")
+		binder = volume.NewBinder(class, image.APFSCloner{}, nil, log)
+	}
 
 	return &Runtime{
 		cfg:         cfg,
@@ -209,6 +228,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		waiter:      waiter,
 		network:     network,
 		resolver:    deps.Resolver,
+		binder:      binder,
 		footprinter: footprinter,
 		signalGroup: signalGroup,
 		broker:      newBroker(),

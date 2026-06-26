@@ -114,6 +114,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
 	// projected) into the pod data volume. Secrets + the projected SA-token come
 	// back as credential paths that get the SBPL read-only sub-scope below. (M2.2)
+	// PVC sources are skipped here and bound by the volume.Binder below — they are
+	// durable, lifecycle-decoupled, and live OUTSIDE the pod data volume.
 	var credPaths []string
 	if len(box.GetVolumes()) > 0 {
 		layout, merr := mount.Materialize(ctx, box, rootfs, ip, r.resolver)
@@ -124,10 +126,36 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 		credPaths = layout.CredentialPaths()
 	}
 
-	// Generate the SBPL AFTER materialization so the credential mounts get the
-	// read-only sub-scope. The generator validates any extra paths against the
-	// protected deny-set and emits the protected denies last (last-match-wins).
-	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{ReadOnlyPaths: credPaths})
+	// Bind APFS-backed persistent volumes (PVCs): ensure each claim's STABLE dir on
+	// the storage root (empty-create / seed-once), symlink it into the pod rootfs,
+	// and collect its dir as the SBPL read/write scope. The dir lives outside the
+	// pod tree, so DeletePod's removePodDir never touches it (ReclaimPolicy Retain).
+	// (M3.1)
+	var pvWritePaths, pvReadPaths []string
+	if hasPersistentVolume(box) {
+		bindings, berr := r.binder.Bind(ctx, box, rootfs)
+		if berr != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("bind persistent volumes for pod %s: %w", box.GetPodId(), berr)
+		}
+		for _, bd := range bindings {
+			if bd.ReadOnly {
+				pvReadPaths = append(pvReadPaths, bd.DataDir)
+			} else {
+				pvWritePaths = append(pvWritePaths, bd.DataDir)
+			}
+		}
+	}
+
+	// Generate the SBPL AFTER materialization + PV binding so the credential mounts
+	// get the read-only sub-scope and the PV mount roots get the read/write scope.
+	// The generator validates every extra/PV path against the protected deny-set and
+	// emits the protected denies last (last-match-wins).
+	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{
+		ReadOnlyPaths: credPaths,
+		WritePaths:    pvWritePaths,
+		ReadPaths:     pvReadPaths,
+	})
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
@@ -488,12 +516,32 @@ func (r *Runtime) podDir(podID string) string {
 }
 
 // removePodDir deletes a pod's on-disk dir (best-effort, on delete).
+//
+// It removes ONLY <Root>/pods/<podID>. Persistent-volume dirs live under
+// <Root>/storage (a sibling of the pods root), so a PVC's data is intentionally
+// NOT removed here — that is the M3.1 lifecycle decoupling (ReclaimPolicy Retain):
+// the PV survives pod stop/restart/delete and the next pod that mounts the same
+// claim reuses it. A PVC's pod-side symlink lives inside the pod dir and IS
+// removed, but os.RemoveAll unlinks the symlink without following it, so the
+// target dir under <Root>/storage is untouched.
 func (r *Runtime) removePodDir(podID string) error {
 	dir := r.podDir(podID)
 	if dir == "" || dir == "/" || !strings.HasPrefix(dir, r.cfg.Root) {
 		return nil
 	}
 	return os.RemoveAll(dir)
+}
+
+// hasPersistentVolume reports whether box carries any PVC-backed volume source
+// (the trigger to run the persistent-volume binder). Ephemeral sources
+// (configMap/secret/emptyDir/downwardAPI/projected) do not.
+func hasPersistentVolume(box *runtimev1.PodBox) bool {
+	for _, v := range box.GetVolumes() {
+		if v.GetPersistentVolumeClaim() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // logBuffer is an in-memory ring of a container's combined output for GetLogs,
