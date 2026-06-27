@@ -161,6 +161,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 			// pod's writable re-allow outside the daemon's data area.
 			WorkDir: r.cfg.Root,
 			Home:    r.home,
+			// Scope per-pod egress to the cluster DNS + in-cluster API VIPs. Empty
+			// keeps the SBPL's back-compatible default DNS VIP / no API rule.
+			ResolverVIP:  r.cfg.ResolverVIP,
+			APIServerVIP: r.cfg.APIServerVIP,
 		},
 		PodIP:         ip,
 		ReadOnlyPaths: credPaths,

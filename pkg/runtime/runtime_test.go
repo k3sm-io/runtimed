@@ -164,6 +164,14 @@ func (f *fakeSigner) Check(_ context.Context, policy runtimev1.SignaturePolicy, 
 // to "available + blocking" unless overridden.
 func newTestRuntime(t *testing.T, d Deps) *Runtime {
 	t.Helper()
+	return newTestRuntimeCfg(t, Config{}, d)
+}
+
+// newTestRuntimeCfg is newTestRuntime with a caller-supplied Config (an empty
+// Root defaults to a test temp dir), so a test can exercise Config-level knobs
+// (e.g. the per-pod SBPL egress VIPs) over the same fake subsystem seams.
+func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
+	t.Helper()
 	cache, err := image.NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +197,10 @@ func newTestRuntime(t *testing.T, d Deps) *Runtime {
 	if d.Network == nil {
 		d.Network = supervisor.NodeNetwork{IP: "10.1.2.3"}
 	}
-	rt, err := New(Config{Root: t.TempDir()}, d)
+	if cfg.Root == "" {
+		cfg.Root = t.TempDir()
+	}
+	rt, err := New(cfg, d)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,6 +635,74 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	}
 
 	w.release(1001)
+}
+
+// TestRuntimeConfigThreadsPostureVIPs is the M3.3 control-plane seam: the cluster
+// DNS VIP and the in-cluster API VIP set on runtime.Config must reach the per-pod
+// SBPL egress allow-list via sandbox.Posture (pod.go), so a Seatbelt-confined
+// pod's in-pod DNS and client-go rest.InClusterConfig() can dial the datapath
+// VIPs. With both set the profile scopes egress to <ResolverVIP>:53 and
+// <APIServerVIP>:443; an empty Config stays back-compatible (the SBPL's built-in
+// default DNS VIP, no API rule). Egress is gated on allow_network, so the box
+// opts in.
+func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {
+	const (
+		resolverVIP = "10.43.0.10"
+		apiVIP      = "10.43.0.1"
+	)
+	cases := []struct {
+		name        string
+		cfg         Config
+		wantPresent []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "vips-set",
+			cfg:         Config{ResolverVIP: resolverVIP, APIServerVIP: apiVIP},
+			wantPresent: []string{`(remote ip "10.43.0.10:53")`, `(remote ip "10.43.0.1:443")`},
+			wantAbsent:  []string{`(remote ip "10.96.0.10:53")`}, // not the built-in default
+		},
+		{
+			name:        "vips-unset-backcompat",
+			cfg:         Config{},
+			wantPresent: []string{`(remote ip "10.96.0.10:53")`}, // sandbox.DefaultResolverVIP
+			wantAbsent:  []string{`:443")`},                      // no API-server egress at all
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newBlockingWaiter()
+			rt := newTestRuntimeCfg(t, tc.cfg, Deps{Waiter: w})
+
+			box := hostBinBox("pod-vip")
+			box.SandboxProfile.AllowNetwork = true // egress rules are gated on allow_network
+
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			if resp.GetError() != nil {
+				t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
+			}
+
+			rt.mu.Lock()
+			profile := rt.pods["pod-vip"].profile
+			rt.mu.Unlock()
+
+			for _, frag := range tc.wantPresent {
+				if !strings.Contains(profile, frag) {
+					t.Errorf("SBPL missing %q (Config VIP not threaded into Posture):\n%s", frag, profile)
+				}
+			}
+			for _, frag := range tc.wantAbsent {
+				if strings.Contains(profile, frag) {
+					t.Errorf("SBPL unexpectedly contains %q:\n%s", frag, profile)
+				}
+			}
+
+			w.release(1001)
+		})
+	}
 }
 
 // guard against accidentally importing a real registry in unit tests.
