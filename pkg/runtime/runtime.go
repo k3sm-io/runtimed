@@ -82,6 +82,19 @@ type Config struct {
 	// SampleInterval is the memory sampler's polling period (M2.5). Defaults to
 	// 1s (the ~1 Hz the design calls for); tests set it small.
 	SampleInterval time.Duration
+	// ResolverVIP is the cluster DNS Service VIP the per-pod SBPL egress allow-list
+	// is scoped to (threaded into sandbox.Posture.ResolverVIP), so a
+	// Seatbelt-confined pod can reach in-cluster DNS. The control plane (k3sm) sets
+	// it from the cluster service CIDR. Empty is back-compatible: the SBPL keeps
+	// its built-in default (sandbox.DefaultResolverVIP).
+	ResolverVIP string
+	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the `kubernetes`
+	// ClusterIP) the per-pod SBPL egress allow-list is scoped to (threaded into
+	// sandbox.Posture.APIServerVIP), so a confined pod's client-go
+	// rest.InClusterConfig() can reach the API server. The control plane (k3sm)
+	// sets it from the cluster service CIDR. Empty is back-compatible: no
+	// API-server egress rule is emitted.
+	APIServerVIP string
 }
 
 // Runtime is the in-process node runtime implementing runtimev1.RuntimeServer.

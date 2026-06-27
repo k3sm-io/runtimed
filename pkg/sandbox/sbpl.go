@@ -75,11 +75,12 @@ var ErrWorkDirEscapesHome = errors.New("sbpl: work-dir escapes home")
 
 // Posture is the NODE-LEVEL SBPL configuration: the runtimed work-dir the
 // per-pod pods-root and protected-prefix denies are derived from, plus the
-// cluster DNS resolver VIP egress is scoped to. Unlike the per-pod
-// GenerateOptions it is the same for every pod on a node, so the caller builds
-// it once from the runtime Config and passes it on each Generate. The zero value
-// is usable: an empty WorkDir falls back to DefaultWorkDir and an empty
-// ResolverVIP to DefaultResolverVIP (the legacy root-daemon defaults).
+// cluster DNS resolver VIP and in-cluster API-server VIP egress is scoped to.
+// Unlike the per-pod GenerateOptions it is the same for every pod on a node, so
+// the caller builds it once from the runtime Config and passes it on each
+// Generate. The zero value is usable: an empty WorkDir falls back to
+// DefaultWorkDir and an empty ResolverVIP to DefaultResolverVIP (the legacy
+// root-daemon defaults); an empty APIServerVIP emits no API-server egress rule.
 type Posture struct {
 	// WorkDir is the runtimed on-disk work-dir (== runtime Config.Root). The
 	// per-pod pods-root is pinned at <WorkDir>/pods and the protected-prefix
@@ -96,6 +97,13 @@ type Posture struct {
 	// ResolverVIP is the cluster DNS Service VIP outbound is scoped to when a pod
 	// sets allow_network. Empty defaults to DefaultResolverVIP.
 	ResolverVIP string
+	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the `kubernetes`
+	// ClusterIP, e.g. 10.43.0.1) outbound is ADDITIONALLY scoped to when a pod
+	// sets allow_network, so an in-pod client-go rest.InClusterConfig() can reach
+	// the API server through the datapath VIP. Unlike ResolverVIP it has NO
+	// default: empty emits no API-server egress rule, so a zero Posture renders an
+	// unchanged profile. The caller (k3sm) sets it from the cluster service CIDR.
+	APIServerVIP string
 }
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are NOT part of
@@ -104,9 +112,10 @@ type Posture struct {
 // and the node-level Posture from the runtime Config), not supplied by the
 // provider over the wire.
 type GenerateOptions struct {
-	// Posture is the node-level configuration (work-dir, home, resolver VIP) the
-	// pods-root, the protected-prefix denies, and the DNS egress derive from. The
-	// zero value uses the legacy defaults (DefaultWorkDir, DefaultResolverVIP).
+	// Posture is the node-level configuration (work-dir, home, resolver +
+	// API-server VIPs) the pods-root, the protected-prefix denies, and the DNS +
+	// API-server egress derive from. The zero value uses the legacy defaults
+	// (DefaultWorkDir, DefaultResolverVIP) and emits no API-server egress rule.
 	Posture Posture
 	// PodIP, when non-empty and sp.AllowNetwork is set, scopes the pod's
 	// network-bind allow to (local ip <PodIP>) so a pod cannot bind() a neighbor
@@ -139,7 +148,8 @@ type GenerateOptions struct {
 // volume and any read-write persistent-volume mount roots (opts.WritePaths, which
 // live outside the data volume on the APFS storage root), read-only
 // persistent-volume roots (opts.ReadPaths), and — when sp.AllowNetwork is set —
-// outbound to the cluster DNS VIP (plus, when opts.PodIP is known, a network-bind
+// outbound to the cluster DNS VIP (and, when opts.Posture.APIServerVIP is set,
+// the in-cluster API-server VIP; plus, when opts.PodIP is known, a network-bind
 // scoped to that IP).
 //
 // The pods-root, the protected-prefix deny-set, and the resolver VIP are derived
@@ -180,7 +190,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 	// Derive the node-level deny-set from the configured work-dir, rejecting a
 	// malformed or home-escaping work-dir BEFORE emitting anything (fail closed).
-	podsRoot, protectedPrefixes, resolverVIP, err := resolvePosture(opts.Posture)
+	podsRoot, protectedPrefixes, resolverVIP, apiServerVIP, err := resolvePosture(opts.Posture)
 	if err != nil {
 		return "", err
 	}
@@ -247,6 +257,16 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("(allow network-outbound\n")
 		b.WriteString(fmt.Sprintf("  (remote ip %q)\n", fmt.Sprintf("%s:53", resolverVIP)))
 		b.WriteString(fmt.Sprintf("  (remote ip %q))\n", fmt.Sprintf("%s:0", resolverVIP)))
+		if apiServerVIP != "" {
+			// Additionally scope egress to the in-cluster API-server VIP (the
+			// kubernetes ClusterIP) so an in-pod client-go rest.InClusterConfig()
+			// reaches the API server through the datapath VIP. Paired :443/:0 mirrors
+			// the DNS-VIP idiom above; emitted ONLY when the node sets APIServerVIP.
+			b.WriteString(";; network: outbound to the in-cluster API-server VIP.\n")
+			b.WriteString("(allow network-outbound\n")
+			b.WriteString(fmt.Sprintf("  (remote ip %q)\n", fmt.Sprintf("%s:443", apiServerVIP)))
+			b.WriteString(fmt.Sprintf("  (remote ip %q))\n", fmt.Sprintf("%s:0", apiServerVIP)))
+		}
 		b.WriteString(";; mach-lookup the DNS resolver path (mDNSResponder) needs.\n")
 		b.WriteString("(allow mach-lookup\n")
 		b.WriteString("  (global-name \"com.apple.dnssd.service\")\n")
@@ -327,29 +347,30 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 // resolvePosture validates p.WorkDir and returns the derived pods-root, the
 // ordered protected-prefix deny-set (the fixed system subtrees plus the
-// pods-root), and the resolver VIP. An empty WorkDir falls back to
-// DefaultWorkDir; a non-empty WorkDir must be absolute and clean
+// pods-root), the resolver VIP, and the API-server VIP. An empty WorkDir falls
+// back to DefaultWorkDir; a non-empty WorkDir must be absolute and clean
 // (ErrInvalidWorkDir) and — when p.Home is set — must reside under Home
-// (ErrWorkDirEscapesHome). An empty ResolverVIP falls back to DefaultResolverVIP.
-func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, resolverVIP string, err error) {
+// (ErrWorkDirEscapesHome). An empty ResolverVIP falls back to DefaultResolverVIP;
+// an empty APIServerVIP is returned as-is (no default — no rule is emitted).
+func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, resolverVIP, apiServerVIP string, err error) {
 	workDir := p.WorkDir
 	if workDir == "" {
 		workDir = DefaultWorkDir
 	} else {
 		if !filepath.IsAbs(workDir) {
-			return "", nil, "", fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
+			return "", nil, "", "", fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
 		}
 		if workDir == "/" {
-			return "", nil, "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
+			return "", nil, "", "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
 		}
 		if filepath.Clean(workDir) != workDir {
-			return "", nil, "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
+			return "", nil, "", "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
 		}
 	}
 	if p.Home != "" {
 		home := filepath.Clean(p.Home)
 		if !isUnder(workDir, home) {
-			return "", nil, "", fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
+			return "", nil, "", "", fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
 		}
 	}
 	podsRoot = filepath.Join(workDir, "pods")
@@ -360,7 +381,10 @@ func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, res
 	if resolverVIP == "" {
 		resolverVIP = DefaultResolverVIP
 	}
-	return podsRoot, protectedPrefixes, resolverVIP, nil
+	// APIServerVIP has no default: empty means "emit no API-server egress rule"
+	// (back-compatible — a zero Posture renders an unchanged profile).
+	apiServerVIP = p.APIServerVIP
+	return podsRoot, protectedPrefixes, resolverVIP, apiServerVIP, nil
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected
