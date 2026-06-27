@@ -70,6 +70,30 @@ type CredentialResolver interface {
 	PullCredential(ctx context.Context, namespace string, secrets []*runtimev1.LocalObjectReference, ref string) (cred *image.RegistryCredential, ok bool, err error)
 }
 
+// VMBackend is the consumer-side seam for the Virtualization.framework micro-VM
+// isolation backend (M5.1). The Runtime queries Available() during fail-closed
+// backend selection — a pod that requested the vm backend on a host without it is
+// REFUSED, never downgraded to Seatbelt — and, when the vm rung is selected,
+// routes the pod to CreateVM instead of the host-process exec-shim path. The
+// concrete *sandbox.VMBackend satisfies it; tests inject a fake. It is
+// intentionally NARROWER than sandbox.Backend: the vm path never uses WrapCommand
+// (a Linux guest is not a confined host process).
+type VMBackend interface {
+	// Available reports whether the vm backend can run a guest on this host
+	// (Virtualization.framework supported + the com.apple.security.virtualization
+	// entitlement). It is a SAFE probe — it never constructs or boots a VM.
+	Available() bool
+	// Name identifies the backend for logging/diagnostics.
+	Name() string
+	// CreateVM boots the pod's Linux guest from spec. In M5.1 it is a lab-gated
+	// stub returning sandbox.ErrVMBootNotImplemented (the live boot needs a
+	// VZ-capable, entitled Mac).
+	CreateVM(ctx context.Context, spec sandbox.VMSpec) error
+}
+
+// Ensure the concrete vm backend satisfies the consumer seam.
+var _ VMBackend = (*sandbox.VMBackend)(nil)
+
 // Config configures a Runtime. Zero values get sensible defaults via New.
 type Config struct {
 	// Root is the on-disk root (image cache + pod dirs). Defaults to
@@ -118,6 +142,10 @@ type Runtime struct {
 	signer      Signer
 	credentials CredentialResolver
 	backend     sandbox.Backend
+	// vmBackend is the Virtualization.framework micro-VM rung (M5.1). createPod
+	// queries Available() so a vm-requested pod fails closed when it is absent, and
+	// routes a selected vm pod to CreateVM (away from the host-process path).
+	vmBackend   VMBackend
 	spawner     supervisor.Spawner
 	waiter      supervisor.ExitWaiter
 	network     supervisor.PodNetwork
@@ -143,9 +171,14 @@ type Deps struct {
 	Puller  Puller
 	Signer  Signer
 	Backend sandbox.Backend
-	Spawner supervisor.Spawner
-	Waiter  supervisor.ExitWaiter
-	Network supervisor.PodNetwork
+	// VMBackend is the Virtualization.framework micro-VM backend (M5.1). Defaults
+	// to sandbox.NewVMBackend(), whose Available() is false unless the host has
+	// Virtualization.framework + the com.apple.security.virtualization entitlement
+	// (so a vm-requested pod fails closed off a capable host). Tests inject a fake.
+	VMBackend VMBackend
+	Spawner   supervisor.Spawner
+	Waiter    supervisor.ExitWaiter
+	Network   supervisor.PodNetwork
 	// Resolver supplies ConfigMap/Secret data and SA tokens for volume
 	// materialization (M2.2). It has NO production default: runtimed never talks
 	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
@@ -205,6 +238,13 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		backend = b
 	}
+	vmBackend := deps.VMBackend
+	if vmBackend == nil {
+		// Available() is false unless this host has Virtualization.framework + the
+		// com.apple.security.virtualization entitlement, so a vm-requested pod fails
+		// closed off a capable host (and the live boot is the lab-gated remainder).
+		vmBackend = sandbox.NewVMBackend()
+	}
 	spawner := deps.Spawner
 	if spawner == nil {
 		spawner = supervisor.PosixSpawner{}
@@ -245,6 +285,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		signer:      signer,
 		credentials: deps.Credentials,
 		backend:     backend,
+		vmBackend:   vmBackend,
 		spawner:     spawner,
 		waiter:      waiter,
 		network:     network,
