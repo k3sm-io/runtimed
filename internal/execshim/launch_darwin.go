@@ -50,6 +50,9 @@ func RunPodLaunch(profile string, argv []string, cred supervisor.Credential) err
 		return errors.New("execshim: empty argv")
 	}
 	seam := &podLaunchSeam{profile: profile, argv: argv}
-	_, err := supervisor.RunLaunchSequence(seam, cred)
+	// euid is the shim's own effective uid (== the daemon's). RunLaunchSequence
+	// refuses a drop when it is non-root, so an unprivileged _k3sm daemon fails
+	// closed rather than attempting a doomed setuid.
+	_, err := supervisor.RunLaunchSequence(seam, cred, os.Geteuid())
 	return err
 }

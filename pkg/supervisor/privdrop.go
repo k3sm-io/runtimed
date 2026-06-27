@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,10 +17,14 @@ import (
 //
 // Drop reports whether a drop is requested at all. It is a separate bool because
 // the proto's int64 run_as_* fields cannot distinguish "unset" from 0 (0 == root,
-// which is also the daemon identity and the no-op); the provider resolves the
-// effective identity and sets Drop only for a non-root target. When Drop is
-// false the pod runs as the daemon identity (root-in-Seatbelt — see the runtimed
-// privilege-model note in docs/).
+// which is also a no-op for a root daemon); the provider resolves the effective
+// identity and sets Drop only for a non-root target. A drop REQUIRES root —
+// setuid/setgid to another identity is privileged — so on the unprivileged _k3sm
+// daemon Drop MUST be false (Validate enforces this). When Drop is false the pod
+// runs at the daemon's OWN uid confined by Seatbelt: on today's user-space daemon
+// that is _k3sm-in-Seatbelt, NOT root. There is no per-pod uid isolation in this
+// posture (the documented residual limitation — untrusted tenancy routes to the
+// vm backend).
 type Credential struct {
 	// UID is the target user id (effective uid after the drop).
 	UID int
@@ -30,8 +35,32 @@ type Credential struct {
 	// group access to its fsGroup-owned volumes.
 	Groups []int
 	// Drop requests the privilege drop. When false, UID/GID/Groups are ignored
-	// and the pod keeps the daemon (root) identity.
+	// and the pod keeps the daemon's own (unprivileged _k3sm) identity. A true
+	// Drop requires the daemon to be root (Validate); the default posture is
+	// false.
 	Drop bool
+}
+
+// ErrDropRequiresRoot reports a requested privilege drop (Credential.Drop) on a
+// non-root process. setuid/setgid to another identity is privileged, so a drop
+// is only possible as root (euid 0). On the unprivileged _k3sm daemon Drop MUST
+// be false — the supervisor runs pods at its own uid, confined by Seatbelt —
+// rather than silently leaving a pod at the wrong identity or attempting a
+// setuid that can only fail.
+var ErrDropRequiresRoot = errors.New("supervisor: credential drop requires root")
+
+// Validate checks c against euid, the effective uid the drop would run under
+// (the exec-shim's euid, == the daemon's). A drop (Drop=true) requires root
+// (euid 0); on a non-root process it returns ErrDropRequiresRoot rather than
+// attempting a doomed setuid. A non-drop credential (Drop=false) is always valid:
+// the pod keeps the daemon's own (unprivileged _k3sm) identity, confined by
+// Seatbelt. RunLaunchSequence calls this first, so the invariant is enforced
+// fail-closed before any irreversible step.
+func (c Credential) Validate(euid int) error {
+	if c.Drop && euid != 0 {
+		return fmt.Errorf("%w: euid=%d", ErrDropRequiresRoot, euid)
+	}
+	return nil
 }
 
 // noDropSentinel is the uid/gid argv token meaning "no privilege drop". It is
@@ -147,12 +176,16 @@ type LaunchSeam interface {
 }
 
 // RunLaunchSequence drives seam through the SECURITY-CRITICAL, irreversible pod
-// launch order (M2.3). The ordering is load-bearing — getting it wrong silently
-// runs the pod with the wrong identity or unconfined:
+// launch order (M2.3). euid is the effective uid the sequence runs under (the
+// exec-shim's, == the daemon's); it gates the drop. The ordering is load-bearing
+// — getting it wrong silently runs the pod with the wrong identity or unconfined:
 //
 //		when cred.Drop:  Setgid(gid) → Initgroups(groups) → Setuid(uid)
 //		always:          SandboxApply → Exec
 //
+//	  - a drop is refused up front when euid != 0 (cred.Validate): setuid/setgid
+//	    to another identity needs root, so on the unprivileged _k3sm daemon Drop
+//	    must be false and the pod runs at the daemon's own uid in Seatbelt;
 //	  - setgid BEFORE setuid: after setuid drops to a non-root uid the process can
 //	    no longer change its gid, so the gid must be set while still privileged;
 //	  - initgroups (supplemental groups, incl. fsGroup) BETWEEN them — also a
@@ -163,10 +196,14 @@ type LaunchSeam interface {
 //	  - SandboxApply BEFORE Exec: the pod binary must start already confined.
 //
 // It returns the steps executed (for assertions) and stops at the FIRST error —
-// fail-closed: a failed drop or failed sandbox apply means Exec is never reached,
-// so the pod never runs with the wrong credential or outside the sandbox.
-func RunLaunchSequence(seam LaunchSeam, cred Credential) ([]LaunchStep, error) {
+// fail-closed: a refused/failed drop or failed sandbox apply means Exec is never
+// reached, so the pod never runs with the wrong credential or outside the
+// sandbox.
+func RunLaunchSequence(seam LaunchSeam, cred Credential, euid int) ([]LaunchStep, error) {
 	var done []LaunchStep
+	if err := cred.Validate(euid); err != nil {
+		return done, err
+	}
 	if cred.Drop {
 		if err := seam.Setgid(cred.GID); err != nil {
 			return done, fmt.Errorf("setgid(%d): %w", cred.GID, err)

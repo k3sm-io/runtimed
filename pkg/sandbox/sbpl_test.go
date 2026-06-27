@@ -330,3 +330,163 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+// TestGenerateDeniedUnixSockets is deliverable #1 (the AF_UNIX barrier): for each
+// SandboxProfile.denied_unix_socket_paths the generator emits an explicit
+// (deny network-outbound (remote unix-socket (path-equal …))) on top of the
+// default-deny. Because pods share the runtime client's uid (no per-pod uid
+// isolation), this Seatbelt deny is the ONLY barrier keeping a pod off the
+// privileged k3sm-netd helper socket, so it must hold whether or not the pod is
+// granted network egress — and, when egress is allowed, come AFTER the outbound
+// allow (last-match-wins).
+func TestGenerateDeniedUnixSockets(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	// Two paths, supplied out of order, to also prove dedupe/sort determinism.
+	sockets := []string{"/var/run/k3sm/other.sock", "/var/run/k3sm/netd.sock"}
+	for _, allowNet := range []bool{false, true} {
+		name := "network-denied"
+		if allowNet {
+			name = "network-allowed"
+		}
+		t.Run(name, func(t *testing.T) {
+			out, err := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath:        dataVol,
+				AllowNetwork:          allowNet,
+				DeniedUnixSocketPaths: sockets,
+			}, GenerateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range sockets {
+				frag := `(remote unix-socket (path-equal "` + s + `"))`
+				if !strings.Contains(out, frag) {
+					t.Errorf("missing AF_UNIX deny for %q:\n%s", s, out)
+				}
+			}
+			// The path is denied (under a (deny network-outbound …) block), never
+			// allowed. netd.sock sorts before other.sock, so it heads the block.
+			if !strings.Contains(out, "(deny network-outbound\n  (remote unix-socket (path-equal \"/var/run/k3sm/netd.sock\"))") {
+				t.Errorf("AF_UNIX path must lead a (deny network-outbound …) block:\n%s", out)
+			}
+			if strings.Contains(out, "(allow network-outbound\n  (remote unix-socket") {
+				t.Errorf("AF_UNIX socket must never be ALLOWed:\n%s", out)
+			}
+			if allowNet {
+				iAllow := strings.Index(out, "(allow network-outbound")
+				iDeny := strings.Index(out, "(deny network-outbound")
+				if iAllow < 0 || iDeny < 0 || iDeny <= iAllow {
+					t.Errorf("AF_UNIX deny (%d) must come AFTER the network-outbound allow (%d) to win", iDeny, iAllow)
+				}
+			}
+		})
+	}
+
+	// No configured sockets => no unix-socket rule at all.
+	out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "unix-socket") {
+		t.Errorf("no denied sockets configured, but profile emits a unix-socket rule:\n%s", out)
+	}
+}
+
+// TestGeneratePostureWorkDir is deliverable #2 (posture-aware SBPL): a $HOME-style
+// work-dir pins the pods-root UNDER it and the protected denies track it (no
+// hardcoded /var/lib), while the fixed /Users deny survives and the pod's own
+// data-volume re-allow still wins (emitted after the denies). A work-dir that
+// escapes the configured home, or is otherwise malformed, is rejected.
+func TestGeneratePostureWorkDir(t *testing.T) {
+	const home = "/Users/_k3sm"
+	const workDir = home + "/Library/k3sm"
+	const podsRoot = workDir + "/pods"
+	const dataVol = podsRoot + "/pod-abc/rootfs"
+
+	out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+		Posture: Posture{WorkDir: workDir, Home: home},
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	// The pods-root deny tracks the work-dir (NOT the legacy /var/lib/k3sm/pods).
+	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \""+podsRoot+"\"))") {
+		t.Errorf("pods-root deny does not track the work-dir (%q):\n%s", podsRoot, out)
+	}
+	if strings.Contains(out, "/var/lib/k3sm/pods") {
+		t.Errorf("profile still references the legacy /var/lib/k3sm/pods despite a configured work-dir:\n%s", out)
+	}
+	// The fixed /Users protected deny survives (the daemon home is under /Users,
+	// but only THIS pod's data volume is re-allowed; siblings/other homes stay
+	// denied).
+	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \"/Users\"))") {
+		t.Errorf("fixed /Users deny missing under a $HOME-style work-dir:\n%s", out)
+	}
+	// The pod's own data volume is re-allowed AFTER the pods-root deny (last-match-wins).
+	iDeny := strings.Index(out, "(subpath \""+podsRoot+"\")")
+	iReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\"))")
+	if iDeny < 0 || iReallow < 0 {
+		t.Fatalf("pods-root deny (%d) or data-vol re-allow (%d) missing:\n%s", iDeny, iReallow, out)
+	}
+	if iDeny >= iReallow {
+		t.Errorf("pods-root deny (%d) must precede the data-vol re-allow (%d)", iDeny, iReallow)
+	}
+
+	// Rejections: an escaping work-dir and malformed work-dirs fail closed.
+	reject := []struct {
+		name    string
+		posture Posture
+		wantErr error
+	}{
+		{"escapes-home", Posture{WorkDir: "/Users/operator/k3sm", Home: home}, ErrWorkDirEscapesHome},
+		{"relative", Posture{WorkDir: "relative/k3sm"}, ErrInvalidWorkDir},
+		{"filesystem-root", Posture{WorkDir: "/"}, ErrInvalidWorkDir},
+		{"unclean", Posture{WorkDir: "/var/lib//k3sm"}, ErrInvalidWorkDir},
+		{"dotdot", Posture{WorkDir: "/Users/_k3sm/../miko", Home: home}, ErrInvalidWorkDir},
+	}
+	for _, tc := range reject {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{Posture: tc.posture}); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("want %v, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestGenerateNetworkBindScoped is deliverable #5 (network-bind scoping): when a
+// pod is granted egress AND its IP is known to the generator, the network-bind
+// allow is scoped to (local ip <podIP>) so a pod cannot bind() a neighbor's lo0
+// /32. The bind rule must NOT appear without a pod IP or without allow_network.
+func TestGenerateNetworkBindScoped(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	const podIP = "10.1.2.3"
+	cases := []struct {
+		name      string
+		allowNet  bool
+		podIP     string
+		wantBind  bool
+		wantLocal string
+	}{
+		{"net+ip-scoped", true, podIP, true, "(allow network-bind\n  (local ip \"10.1.2.3:*\"))"},
+		{"net-without-ip", true, "", false, ""},
+		{"ip-without-net", false, podIP, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath: dataVol,
+				AllowNetwork:   tc.allowNet,
+			}, GenerateOptions{PodIP: tc.podIP})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotBind := strings.Contains(out, "(allow network-bind")
+			if gotBind != tc.wantBind {
+				t.Fatalf("network-bind present=%v, want %v:\n%s", gotBind, tc.wantBind, out)
+			}
+			if tc.wantBind && !strings.Contains(out, tc.wantLocal) {
+				t.Errorf("network-bind not scoped to the pod IP; want %q:\n%s", tc.wantLocal, out)
+			}
+		})
+	}
+}
