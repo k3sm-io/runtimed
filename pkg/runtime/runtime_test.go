@@ -36,6 +36,63 @@ func (f fakeBackend) WrapCommand(_ context.Context, profile string, argv []strin
 	return "/fake/shim", wrapped, func() error { return nil }, nil
 }
 
+// recordingBackend is a sandbox.Backend that records whether WrapCommand was
+// called, so a test can assert the VM-routed path never touches the host-process
+// exec-shim seam. It otherwise behaves like fakeBackend.
+type recordingBackend struct {
+	available bool
+	mu        sync.Mutex
+	wrapped   int
+}
+
+func (b *recordingBackend) Available() bool { return b.available }
+func (b *recordingBackend) Name() string    { return "recording" }
+func (b *recordingBackend) WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+	b.mu.Lock()
+	b.wrapped++
+	b.mu.Unlock()
+	return fakeBackend{available: b.available}.WrapCommand(ctx, profile, argv, cred)
+}
+
+func (b *recordingBackend) wrapCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.wrapped
+}
+
+// fakeVMBackend is the runtime.VMBackend seam: its availability is settable and
+// CreateVM records the call + the spec it received. It returns the real
+// sandbox.ErrVMBootNotImplemented by default (the lab-gated stub behavior) so a
+// VM-routed pod surfaces a failure, mirroring production.
+type fakeVMBackend struct {
+	available bool
+
+	mu          sync.Mutex
+	createCalls int
+	lastSpec    sandbox.VMSpec
+	err         error
+}
+
+func (b *fakeVMBackend) Available() bool { return b.available }
+func (b *fakeVMBackend) Name() string    { return "fake-vm" }
+func (b *fakeVMBackend) CreateVM(_ context.Context, spec sandbox.VMSpec) error {
+	b.mu.Lock()
+	b.createCalls++
+	b.lastSpec = spec
+	err := b.err
+	b.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return sandbox.ErrVMBootNotImplemented
+}
+
+func (b *fakeVMBackend) created() (int, sandbox.VMSpec) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.createCalls, b.lastSpec
+}
+
 // fakeSpawner returns sequential pids and records argv/env.
 type fakeSpawner struct {
 	mu    sync.Mutex
@@ -182,6 +239,12 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.Backend == nil {
 		d.Backend = fakeBackend{available: true}
 	}
+	// Default the vm backend UNavailable so existing host-process tests are
+	// deterministic regardless of the test host's real VZ capability (the routing
+	// test opts in with an available fake). Unit tests never use real privilege.
+	if d.VMBackend == nil {
+		d.VMBackend = &fakeVMBackend{available: false}
+	}
 	if d.Spawner == nil {
 		d.Spawner = &fakeSpawner{}
 	}
@@ -306,6 +369,130 @@ func TestCreatePodFailClosed(t *testing.T) {
 	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP {
 		t.Errorf("failure reason = %v, want SANDBOX_SETUP", resp.GetFailureReason())
 	}
+}
+
+// TestCreatePodVMRoutingBypassesHostProcessSteps is the M5.1 routing proof: a pod
+// whose SandboxProfile.backend is SANDBOX_BACKEND_VM, on a host where the vm
+// backend is available, routes to vmBackend.CreateVM and runs NONE of the
+// host-process (Mach-O) steps — no image pull / resolveBinary, no ad-hoc sign /
+// gateSignature, no WrapCommand exec-shim, no posix_spawn. The symmetric control
+// case proves an UNSPECIFIED (host-process) pod still drives exactly those steps
+// (byte-unchanged), and a vm-requested pod on a host WITHOUT the vm backend fails
+// closed (never downgrades, never routes to CreateVM).
+func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
+	t.Run("vm-routed-bypasses-host-process-steps", func(t *testing.T) {
+		signer := &fakeSigner{}
+		sp := &fakeSpawner{}
+		backend := &recordingBackend{available: true}
+		vmb := &fakeVMBackend{available: true}
+		rt := newTestRuntime(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb})
+
+		box := hostBinBox("pod-vm")
+		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+		box.SandboxProfile.VmVcpus = 2
+		box.SandboxProfile.VmMemoryBytes = 1 << 30
+
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport error: %v", err)
+		}
+		// The vm boot is a lab-gated stub, so the pod surfaces a SANDBOX_SETUP error.
+		if resp.GetError() == nil {
+			t.Fatal("vm-routed pod should surface the lab-gated boot error")
+		}
+		if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP {
+			t.Errorf("reason = %v, want SANDBOX_SETUP", resp.GetFailureReason())
+		}
+
+		// It routed to CreateVM with the stamped sizing.
+		n, spec := vmb.created()
+		if n != 1 {
+			t.Fatalf("CreateVM called %d times, want 1", n)
+		}
+		if spec.Vcpus != 2 || spec.MemoryBytes != 1<<30 || spec.PodID != "pod-vm" {
+			t.Errorf("VMSpec = %+v, want {PodID:pod-vm Vcpus:2 MemoryBytes:%d}", spec, int64(1<<30))
+		}
+
+		// And it touched NONE of the host-process steps.
+		if got := backend.wrapCalls(); got != 0 {
+			t.Errorf("vm path called WrapCommand %d times; must be 0 (no exec-shim)", got)
+		}
+		signer.mu.Lock()
+		nsigned := len(signer.signed)
+		signer.mu.Unlock()
+		if nsigned != 0 {
+			t.Errorf("vm path ad-hoc signed %d binaries; must be 0 (no host-process codesign)", nsigned)
+		}
+		sp.mu.Lock()
+		nspawn := len(sp.specs)
+		sp.mu.Unlock()
+		if nspawn != 0 {
+			t.Errorf("vm path posix_spawned %d processes; must be 0 (no host-process exec)", nspawn)
+		}
+	})
+
+	t.Run("vm-requested-unavailable-fails-closed", func(t *testing.T) {
+		vmb := &fakeVMBackend{available: false} // no Virtualization.framework / entitlement
+		rt := newTestRuntime(t, Deps{VMBackend: vmb})
+
+		box := hostBinBox("pod-vm-noavail")
+		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport error: %v", err)
+		}
+		if resp.GetError() == nil {
+			t.Fatal("vm-requested pod on a host without the vm backend must fail closed")
+		}
+		if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP {
+			t.Errorf("reason = %v, want SANDBOX_SETUP", resp.GetFailureReason())
+		}
+		// Fail-closed means it never even reached the (stubbed) boot.
+		if n, _ := vmb.created(); n != 0 {
+			t.Errorf("CreateVM called %d times on an unavailable vm backend; must be 0 (fail closed before routing)", n)
+		}
+	})
+
+	t.Run("host-process-path-unaffected", func(t *testing.T) {
+		signer := &fakeSigner{}
+		sp := &fakeSpawner{}
+		backend := &recordingBackend{available: true}
+		vmb := &fakeVMBackend{available: true} // available, but NOT requested
+		w := newBlockingWaiter()
+		rt := newTestRuntime(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb, Waiter: w})
+
+		// UNSPECIFIED backend (the host-process default) — the byte-unchanged path.
+		box := hostBinBox("pod-host")
+
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		if resp.GetError() != nil {
+			t.Fatalf("host-process pod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
+		}
+		// It drove the host-process steps and never routed to the vm backend.
+		if got := backend.wrapCalls(); got == 0 {
+			t.Error("host-process path did not call WrapCommand (exec-shim seam)")
+		}
+		signer.mu.Lock()
+		nsigned := len(signer.signed)
+		signer.mu.Unlock()
+		if nsigned == 0 {
+			t.Error("host-process path did not ad-hoc sign (gateSignature)")
+		}
+		sp.mu.Lock()
+		nspawn := len(sp.specs)
+		sp.mu.Unlock()
+		if nspawn == 0 {
+			t.Error("host-process path did not posix_spawn")
+		}
+		if n, _ := vmb.created(); n != 0 {
+			t.Errorf("host-process path called CreateVM %d times; must be 0", n)
+		}
+		w.release(1001)
+	})
 }
 
 // TestCreatePodValidation covers PodBox validation incl. fail-closed signature

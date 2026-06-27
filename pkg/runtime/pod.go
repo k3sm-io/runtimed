@@ -86,20 +86,31 @@ type containerProc struct {
 // backend with DYLD_INSERT_LIBRARIES carried through. It returns the started pod
 // or a typed failure.
 func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, runtimev1.FailureReason, error) {
-	// Fail closed via the isolation ladder: not-root drops the uidjail rung, and
-	// an unavailable Seatbelt (tripped symbol-canary / missing SPI) degrades to
-	// the stronger vm rung or, with no vm backend yet, refuses — NEVER falls
-	// through to running the pod unconfined. r.backend is the Seatbelt rung (the
-	// only one implemented); vm is not yet wired, so its probe is false here.
-	if _, err := sandbox.SelectBackend(os.Geteuid() == 0, r.backend.Available(), false); err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-			fmt.Errorf("sandbox backend %q unavailable: refusing to start pod unconfined: %w", r.backend.Name(), err)
-	}
-
 	sp := box.GetSandboxProfile()
 	if sp == nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("pod %s: sandbox_profile is required", box.GetPodId())
+	}
+
+	// Fail-closed backend selection (M5.1): honor the backend the provider stamped
+	// on the SandboxProfile. UNSPECIFIED — the host-process default — walks the
+	// host-OS-gated Seatbelt ladder (not-root drops the uidjail rung; an unavailable
+	// Seatbelt degrades ONLY to the stronger vm rung, else refuses — NEVER runs
+	// unconfined). A pod that requested the vm backend (Linux image / untrusted
+	// tenancy) on a host without Virtualization.framework + the entitlement is
+	// REFUSED here, never silently downgraded to the weaker Seatbelt rung.
+	selected, err := sandbox.SelectBackend(sp.GetBackend(), os.Geteuid() == 0, r.backend.Available(), r.vmBackend.Available())
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			fmt.Errorf("select sandbox backend for pod %s: %w", box.GetPodId(), err)
+	}
+
+	// Route the vm rung AWAY from the host-process (Mach-O) spine: a Linux guest has
+	// no host binary to resolve, ad-hoc codesign, signature-gate, SBPL-confine, or
+	// attach to lo0 — those steps are meaningless for it. The host-process path
+	// below is reached only for the Seatbelt rungs and is byte-unchanged.
+	if selected == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		return r.createVMPod(ctx, box, sp)
 	}
 
 	ip, err := r.network.Setup(ctx, box.GetPodId())
@@ -246,6 +257,37 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 	}
 
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// createVMPod is the M5.1 vm-backend routing target (SKELETON). The vm path is
+// deliberately SEPARATE from the host-process spine (createPod above): it does NOT
+// resolveBinary, ad-hoc codesign / gateSignature, generate+apply an SBPL profile,
+// or set up lo0 networking — a Linux guest runs none of those. It hands the pod's
+// sizing (vm_vcpus / vm_memory_bytes) + rootfs to the vm backend's CreateVM.
+//
+// The live VM boot is LAB-GATED: it needs a Virtualization.framework-capable Mac
+// signed with com.apple.security.virtualization, so CreateVM is a documented stub
+// returning sandbox.ErrVMBootNotImplemented. On a non-entitled host SelectBackend
+// already fails closed (vmBackend.Available() == false) before this path is
+// reached; on a capable host this is where the lab remainder lands — the
+// cmd/k3sm-vmhost helper lifecycle, the OCI-Linux-rootfs→bootable-root builder,
+// and guest-agent VM metering (see pkg/sandbox vm.go).
+func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile) (*pod, runtimev1.FailureReason, error) {
+	spec := sandbox.VMSpec{
+		PodID:       box.GetPodId(),
+		Vcpus:       sp.GetVmVcpus(),
+		MemoryBytes: sp.GetVmMemoryBytes(),
+		RootfsPath:  r.rootfsPath(box),
+	}
+	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err)
+	}
+	// Unreachable in M5.1 (CreateVM is a lab-gated stub): when the live boot lands,
+	// CreateVM returns nil and this is replaced by the running-VM pod assembly
+	// (phase RUNNING, guest-agent metering wired in place of the M2.5 sampler).
+	return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
+		fmt.Errorf("pod %s: vm backend lifecycle not implemented", box.GetPodId())
 }
 
 // oomKill is the memory sampler's onBreach callback (M2.5): it marks the pod
