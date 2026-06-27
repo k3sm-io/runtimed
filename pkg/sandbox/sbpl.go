@@ -10,28 +10,31 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// podsRoot is the parent of every per-pod rootfs (rootfs_path is
-// podsRoot/<id>/rootfs). The generator denies read+write to it broadly so one
-// pod cannot reach another pod's dir, then re-allows only this pod's own subpath.
-const podsRoot = "/var/lib/k3sm/pods"
+// DefaultWorkDir is the runtimed on-disk work-dir assumed when a Posture leaves
+// WorkDir empty: the legacy root-daemon location. The per-pod pods-root is
+// pinned at <WorkDir>/pods and the protected-prefix denies track it. The
+// unprivileged user-space posture (the _k3sm daemon) passes an explicit WorkDir
+// under the daemon's home instead of relying on this default.
+const DefaultWorkDir = "/var/lib/k3sm"
 
-// resolverVIP is the CoreDNS Service VIP the pod's resolver path dials. M1 is
-// single-node and the cluster DNS Service is a lo0 alias; allow-network scopes
-// outbound to this address (and the mach-lookup the resolver needs) rather than
-// opening all egress. Overridable per-pod is an M2 concern.
-const resolverVIP = "10.96.0.10"
+// DefaultResolverVIP is the cluster DNS Service VIP egress is scoped to when a
+// Posture leaves ResolverVIP empty. M1 is single-node and the cluster DNS
+// Service is a lo0 alias; allow-network scopes outbound to this address (and the
+// mach-lookup the resolver needs) rather than opening all egress. Overridable
+// per-node via Posture; broader per-Service egress is an M2 concern.
+const DefaultResolverVIP = "10.96.0.10"
 
-// protectedPrefixes are the host subtrees a pod may NEVER be granted via a
-// caller-supplied extra path: user homes, the system secrets/state store, the
-// shared pods root (sibling pods), and the dyld cryptex (the system read-only
-// content volume). validateExtraPaths rejects any extra read/write path at or
-// under one of these (the pod's OWN data volume is carved out), and Generate
-// emits a matching (deny ...) for each AFTER the extra-path allows so an
-// unvalidated path cannot override the deny (SBPL is last-match-wins).
-var protectedPrefixes = []string{
+// systemProtectedPrefixes are the FIXED host subtrees a pod may NEVER be granted
+// via a caller-supplied extra path, independent of the work-dir: user homes, the
+// system secrets/state store, and the dyld cryptex (the system read-only content
+// volume). resolvePosture appends the work-dir-derived pods-root (sibling pods)
+// to this set. validateExtraPaths rejects any extra read/write path at or under
+// one of these (the pod's OWN data volume is carved out), and Generate emits a
+// matching (deny ...) for each AFTER the extra-path allows so an unvalidated path
+// cannot override the deny (SBPL is last-match-wins).
+var systemProtectedPrefixes = []string{
 	"/Users",
 	"/private/var/db",
-	podsRoot,
 	"/System/Volumes/Preboot/Cryptexes",
 	"/System/Cryptexes",
 }
@@ -50,16 +53,67 @@ var ErrMissingSystemImport = errors.New(`sbpl: profile missing (import "system.s
 var ErrNoDataVolume = errors.New("sbpl: sandbox profile has no data_volume_path")
 
 // ErrProtectedPath reports a caller-supplied extra read/write path that resolves
-// at or under a protected prefix (see protectedPrefixes). Such a path is rejected
-// rather than emitted, so a hostPath-style mount can never widen the allow-list
-// into /Users, the secrets store, a sibling pod's dir, or the dyld cryptex.
+// at or under a protected prefix (see systemProtectedPrefixes + the pods-root).
+// Such a path is rejected rather than emitted, so a hostPath-style mount can
+// never widen the allow-list into /Users, the secrets store, a sibling pod's
+// dir, or the dyld cryptex.
 var ErrProtectedPath = errors.New("sbpl: extra path is under a protected deny-set")
+
+// ErrInvalidWorkDir reports a Posture.WorkDir that is not a usable runtime
+// work-dir: it must be an absolute, clean path other than the filesystem root.
+// A relative, unclean (".."/trailing-slash/double-slash), or "/" work-dir would
+// point the per-pod pods-root — and thus a pod's writable data-volume re-allow —
+// at an unintended location, so it is rejected (fail closed).
+var ErrInvalidWorkDir = errors.New("sbpl: invalid work-dir")
+
+// ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
+// not reside under the configured Posture.Home. In the unprivileged user-space
+// posture the daemon's data area lives under its home; a work-dir outside it
+// would let a pod's data-volume re-allow grant write access into another user's
+// tree, so it is rejected.
+var ErrWorkDirEscapesHome = errors.New("sbpl: work-dir escapes home")
+
+// Posture is the NODE-LEVEL SBPL configuration: the runtimed work-dir the
+// per-pod pods-root and protected-prefix denies are derived from, plus the
+// cluster DNS resolver VIP egress is scoped to. Unlike the per-pod
+// GenerateOptions it is the same for every pod on a node, so the caller builds
+// it once from the runtime Config and passes it on each Generate. The zero value
+// is usable: an empty WorkDir falls back to DefaultWorkDir and an empty
+// ResolverVIP to DefaultResolverVIP (the legacy root-daemon defaults).
+type Posture struct {
+	// WorkDir is the runtimed on-disk work-dir (== runtime Config.Root). The
+	// per-pod pods-root is pinned at <WorkDir>/pods and the protected-prefix
+	// denies track it. Empty defaults to DefaultWorkDir. A non-empty WorkDir
+	// must be absolute and clean (ErrInvalidWorkDir otherwise) and — when Home
+	// is set — must reside under Home (ErrWorkDirEscapesHome otherwise).
+	WorkDir string
+	// Home, when non-empty, is the directory WorkDir must reside under (the
+	// _k3sm daemon user's home in the unprivileged user-space posture). It is the
+	// containment check that keeps a misconfigured work-dir from pointing a pod's
+	// writable re-allow outside the daemon's data area. Empty disables the check
+	// (the legacy root posture, where WorkDir is the trusted /var/lib/k3sm).
+	Home string
+	// ResolverVIP is the cluster DNS Service VIP outbound is scoped to when a pod
+	// sets allow_network. Empty defaults to DefaultResolverVIP.
+	ResolverVIP string
+}
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are NOT part of
 // the cross-repo SandboxProfile proto. They are computed during pod setup (by the
-// volume materializer in pkg/mount and the persistent-volume binder in pkg/volume),
-// not supplied by the provider over the wire.
+// volume materializer in pkg/mount and the persistent-volume binder in pkg/volume,
+// and the node-level Posture from the runtime Config), not supplied by the
+// provider over the wire.
 type GenerateOptions struct {
+	// Posture is the node-level configuration (work-dir, home, resolver VIP) the
+	// pods-root, the protected-prefix denies, and the DNS egress derive from. The
+	// zero value uses the legacy defaults (DefaultWorkDir, DefaultResolverVIP).
+	Posture Posture
+	// PodIP, when non-empty and sp.AllowNetwork is set, scopes the pod's
+	// network-bind allow to (local ip <PodIP>) so a pod cannot bind() a neighbor
+	// pod's /32 alias on the shared lo0 loopback. It is the pod IP the network
+	// setup assigned; empty leaves bind default-denied. Not in the proto: it is
+	// computed during pod setup, not supplied by the provider.
+	PodIP string
 	// ReadOnlyPaths get a read-only sub-scope: granted file-read* and explicitly
 	// denied file-write*, emitted LAST so the write-deny wins even when the path
 	// lies inside the writable data volume. These are the credential mounts
@@ -85,20 +139,36 @@ type GenerateOptions struct {
 // volume and any read-write persistent-volume mount roots (opts.WritePaths, which
 // live outside the data volume on the APFS storage root), read-only
 // persistent-volume roots (opts.ReadPaths), and — when sp.AllowNetwork is set —
-// outbound to the cluster DNS VIP.
+// outbound to the cluster DNS VIP (plus, when opts.PodIP is known, a network-bind
+// scoped to that IP).
+//
+// The pods-root, the protected-prefix deny-set, and the resolver VIP are derived
+// from opts.Posture (the node-level work-dir), so a user-space daemon whose
+// work-dir lives under its home pins every per-pod path under that work-dir
+// rather than the legacy /var/lib/k3sm. A work-dir that is malformed or escapes
+// the configured home is rejected (ErrInvalidWorkDir / ErrWorkDirEscapesHome).
+//
+// Because the unprivileged posture runs pods at the same uid as the runtime
+// client (no per-pod uid isolation), the Seatbelt default-deny is the ONLY
+// barrier keeping a pod off the privileged k3sm-netd helper socket: for each
+// sp.DeniedUnixSocketPaths entry Generate emits an explicit
+// (deny network-outbound (remote unix-socket (path-equal …))) on top of the
+// default-deny, AFTER the network allow so last-match-wins keeps it denied.
 //
 // Rule ORDER is security-critical because SBPL is last-match-wins. Generate emits
-// (in increasing precedence): the OS/extra-path allows; THEN the protected denies
-// (/Users, /private/var/db, the pods root, the dyld cryptex) so a caller's extra
-// path can never override them; THEN the narrow re-allows the protected denies
-// would otherwise clobber (the dyld closure-cache read and this pod's own data
-// volume, which lives under the denied pods root); and LAST the read-only
-// credential sub-scope, whose file-write* deny therefore wins even inside the
-// writable data volume.
+// (in increasing precedence): the OS/extra-path allows + the network allows; THEN
+// the AF_UNIX helper-socket denies and the protected file denies (/Users,
+// /private/var/db, the pods root, the dyld cryptex) so a caller's extra path can
+// never override them; THEN the narrow re-allows the protected denies would
+// otherwise clobber (the dyld closure-cache read and this pod's own data volume,
+// which lives under the denied pods root); and LAST the read-only credential
+// sub-scope, whose file-write* deny therefore wins even inside the writable data
+// volume.
 //
-// Generate returns ErrNoDataVolume if sp has no data volume and ErrProtectedPath
-// if any extra/credential path is under the protected deny-set; otherwise the
-// rendered profile is always well-formed and passes Validate.
+// Generate returns ErrNoDataVolume if sp has no data volume, ErrProtectedPath if
+// any extra/credential path is under the protected deny-set, and the work-dir
+// errors above for a bad Posture; otherwise the rendered profile is always
+// well-formed and passes Validate.
 func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
 	if sp == nil {
 		return "", ErrNoDataVolume
@@ -108,10 +178,17 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		return "", ErrNoDataVolume
 	}
 
+	// Derive the node-level deny-set from the configured work-dir, rejecting a
+	// malformed or home-escaping work-dir BEFORE emitting anything (fail closed).
+	podsRoot, protectedPrefixes, resolverVIP, err := resolvePosture(opts.Posture)
+	if err != nil {
+		return "", err
+	}
+
 	// Validate every caller-supplied path BEFORE emitting any allow: a path under
 	// the protected deny-set is rejected outright (fail closed). The pod's own
 	// data volume is carved out (it is re-allowed by design below).
-	if err := validateExtraPaths(dataVol, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths); err != nil {
+	if err := validateExtraPaths(dataVol, protectedPrefixes, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths); err != nil {
 		return "", err
 	}
 
@@ -129,6 +206,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// Write scope: extra write paths + the read-write PV mount roots.
 	writePaths := dedupeSorted(append(append([]string{}, sp.GetExtraWritePaths()...), opts.WritePaths...))
 	credPaths := dedupeSorted(opts.ReadOnlyPaths)
+	deniedSockets := dedupeSorted(sp.GetDeniedUnixSocketPaths())
 
 	var b strings.Builder
 	b.WriteString(";; k3sm per-pod Seatbelt profile — GENERATED, do not edit.\n")
@@ -173,8 +251,31 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("(allow mach-lookup\n")
 		b.WriteString("  (global-name \"com.apple.dnssd.service\")\n")
 		b.WriteString("  (global-name \"com.apple.mDNSResponder\"))\n")
+		if opts.PodIP != "" {
+			// network-bind: scope to the pod's OWN lo0 IP so it cannot bind() a
+			// neighbor pod's /32 alias on the shared loopback (pods share lo0).
+			b.WriteString(";; network-bind: scope to the pod's own lo0 IP (pods share lo0).\n")
+			b.WriteString("(allow network-bind\n")
+			b.WriteString(fmt.Sprintf("  (local ip %q))\n", fmt.Sprintf("%s:*", opts.PodIP)))
+		}
 	} else {
 		b.WriteString(";; network: default-deny (no allow-network).\n")
+	}
+
+	// --- AF_UNIX helper-socket denies (higher precedence than network allows) --
+	// Pods share the runtime client's uid (the unprivileged _k3sm posture has no
+	// per-pod uid isolation), so LOCAL_PEERCRED cannot keep a pod off the
+	// privileged k3sm-netd helper socket — the Seatbelt deny is the ONLY barrier.
+	// Make it explicit: deny connect() to each helper socket path, AFTER any
+	// network allow so last-match-wins keeps it denied even for a networked pod.
+	if len(deniedSockets) > 0 {
+		b.WriteString(";; AF_UNIX: explicitly deny connect() to the privileged helper\n")
+		b.WriteString(";; socket(s) — same-uid pods can't be kept off them any other way.\n")
+		b.WriteString("(deny network-outbound\n")
+		for _, p := range deniedSockets {
+			b.WriteString(fmt.Sprintf("  (remote unix-socket (path-equal %q))\n", filepath.Clean(p)))
+		}
+		b.WriteString("  )\n")
 	}
 
 	// --- protected denies (higher precedence than the extra-path allows) --
@@ -224,11 +325,49 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	return b.String(), nil
 }
 
+// resolvePosture validates p.WorkDir and returns the derived pods-root, the
+// ordered protected-prefix deny-set (the fixed system subtrees plus the
+// pods-root), and the resolver VIP. An empty WorkDir falls back to
+// DefaultWorkDir; a non-empty WorkDir must be absolute and clean
+// (ErrInvalidWorkDir) and — when p.Home is set — must reside under Home
+// (ErrWorkDirEscapesHome). An empty ResolverVIP falls back to DefaultResolverVIP.
+func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, resolverVIP string, err error) {
+	workDir := p.WorkDir
+	if workDir == "" {
+		workDir = DefaultWorkDir
+	} else {
+		if !filepath.IsAbs(workDir) {
+			return "", nil, "", fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
+		}
+		if workDir == "/" {
+			return "", nil, "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
+		}
+		if filepath.Clean(workDir) != workDir {
+			return "", nil, "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
+		}
+	}
+	if p.Home != "" {
+		home := filepath.Clean(p.Home)
+		if !isUnder(workDir, home) {
+			return "", nil, "", fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
+		}
+	}
+	podsRoot = filepath.Join(workDir, "pods")
+	// Pin the pods-root into the protected deny-set so a caller's extra path can
+	// never reach a sibling pod, then keep the fixed system subtrees.
+	protectedPrefixes = append([]string{podsRoot}, systemProtectedPrefixes...)
+	resolverVIP = p.ResolverVIP
+	if resolverVIP == "" {
+		resolverVIP = DefaultResolverVIP
+	}
+	return podsRoot, protectedPrefixes, resolverVIP, nil
+}
+
 // validateExtraPaths rejects any path in groups that is at or under a protected
 // prefix, returning ErrProtectedPath. The pod's own data volume (dataVol) is
 // always permitted (it is re-allowed by Generate). Non-absolute paths and "/" are
 // rejected — a relative or whole-filesystem grant is never intended.
-func validateExtraPaths(dataVol string, groups ...[]string) error {
+func validateExtraPaths(dataVol string, protectedPrefixes []string, groups ...[]string) error {
 	cleanData := filepath.Clean(dataVol)
 	for _, g := range groups {
 		for _, raw := range g {
