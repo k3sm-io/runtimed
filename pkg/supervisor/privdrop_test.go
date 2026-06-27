@@ -38,33 +38,38 @@ func (s *recordingSeam) SandboxApply() error      { return s.step(StepSandboxApp
 func (s *recordingSeam) Exec() error              { return s.step(StepExec) }
 
 // TestRunLaunchSequenceOrder is the M2.3-a1 ordering proof: with a securityContext
-// drop requested, the exec-shim sequence is EXACTLY
+// drop requested (as root), the exec-shim sequence is EXACTLY
 // setgid → initgroups → setuid → sandbox_apply → exec, and without a drop it is
-// sandbox_apply → exec. setgid must precede setuid (gid is unchangeable after the
-// uid drop); the whole drop must precede sandbox_apply (the sandbox is
-// irreversible and a dropped/sandboxed process cannot setuid/chown); sandbox_apply
-// must precede exec (the pod starts confined).
+// sandbox_apply → exec — even on a non-root daemon, where NO setuid is attempted
+// (the unprivileged _k3sm posture: the pod runs at the daemon's own uid). setgid
+// must precede setuid (gid is unchangeable after the uid drop); the whole drop
+// must precede sandbox_apply (the sandbox is irreversible and a dropped/sandboxed
+// process cannot setuid/chown); sandbox_apply must precede exec (the pod starts
+// confined).
 func TestRunLaunchSequenceOrder(t *testing.T) {
 	cases := []struct {
 		name string
 		cred Credential
+		euid int
 		want []LaunchStep
 	}{
 		{
-			name: "drop-requested",
+			name: "drop-requested-as-root",
 			cred: Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true},
+			euid: 0,
 			want: []LaunchStep{StepSetgid, StepInitgroups, StepSetuid, StepSandboxApply, StepExec},
 		},
 		{
-			name: "no-drop-root-in-seatbelt",
+			name: "no-drop-unprivileged-in-seatbelt",
 			cred: Credential{Drop: false},
+			euid: 501, // non-root daemon: Drop=false must NOT attempt any setuid
 			want: []LaunchStep{StepSandboxApply, StepExec},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seam := &recordingSeam{}
-			done, err := RunLaunchSequence(seam, tc.cred)
+			done, err := RunLaunchSequence(seam, tc.cred, tc.euid)
 			if err != nil {
 				t.Fatalf("RunLaunchSequence: %v", err)
 			}
@@ -127,7 +132,9 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seam := &recordingSeam{hasFail: true, failAt: tc.failAt, failErr: boom}
-			_, err := RunLaunchSequence(seam, Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true})
+			// euid 0 (root): the drop is permitted, so the injected failAt — not
+			// the euid guard — is what stops the sequence.
+			_, err := RunLaunchSequence(seam, Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}, 0)
 			if !errors.Is(err, boom) {
 				t.Fatalf("want wrapped boom, got %v", err)
 			}
@@ -138,6 +145,53 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 				if idx(seam.calls, st) != -1 {
 					t.Errorf("%v must NOT run after the failure", st)
 				}
+			}
+		})
+	}
+}
+
+// TestRunLaunchSequenceRefusesDropAsNonRoot proves the credential posture: a
+// drop requested on a non-root daemon (euid != 0) is REFUSED with
+// ErrDropRequiresRoot before ANY step runs — no setgid/setuid is attempted, the
+// sandbox is not applied, and the pod is not exec'd. This is the unprivileged
+// _k3sm posture: pods run at the daemon's own uid (Drop=false), never root, and
+// a stray Drop=true fails closed rather than silently mis-running the pod.
+func TestRunLaunchSequenceRefusesDropAsNonRoot(t *testing.T) {
+	seam := &recordingSeam{}
+	done, err := RunLaunchSequence(seam, Credential{UID: 501, GID: 20, Drop: true}, 501)
+	if !errors.Is(err, ErrDropRequiresRoot) {
+		t.Fatalf("want ErrDropRequiresRoot, got %v", err)
+	}
+	if len(done) != 0 || len(seam.calls) != 0 {
+		t.Fatalf("no step must run when a non-root drop is refused; done=%v calls=%v", done, seam.calls)
+	}
+}
+
+// TestCredentialValidate is the unit table for the euid guard: a drop needs root,
+// a non-drop credential is always valid (it keeps the daemon's own uid).
+func TestCredentialValidate(t *testing.T) {
+	cases := []struct {
+		name    string
+		cred    Credential
+		euid    int
+		wantErr bool
+	}{
+		{"drop-as-root-ok", Credential{UID: 501, GID: 20, Drop: true}, 0, false},
+		{"drop-as-nonroot-refused", Credential{UID: 501, GID: 20, Drop: true}, 501, true},
+		{"no-drop-as-nonroot-ok", Credential{Drop: false}, 501, false},
+		{"no-drop-as-root-ok", Credential{Drop: false}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cred.Validate(tc.euid)
+			if tc.wantErr {
+				if !errors.Is(err, ErrDropRequiresRoot) {
+					t.Fatalf("want ErrDropRequiresRoot, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("want nil, got %v", err)
 			}
 		})
 	}
