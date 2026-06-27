@@ -490,3 +490,83 @@ func TestGenerateNetworkBindScoped(t *testing.T) {
 		})
 	}
 }
+
+// TestGenerateAPIServerVIPEgress is the M3 in-pod-kubectl fix (M3.3): when the
+// node sets Posture.APIServerVIP, a networked pod gets an egress allow to
+// <VIP>:443 (paired with :0, mirroring the DNS-VIP idiom) so an in-pod client-go
+// rest.InClusterConfig() can reach the in-cluster `kubernetes` ClusterIP through
+// the datapath VIP — without it the dial is denied at Seatbelt (fail-closed). An
+// empty APIServerVIP emits NO such rule (back-compatible: a zero Posture renders
+// an unchanged profile, asserted by TestGenerateGolden). The rule is gated on
+// allow_network and must never weaken the DNS-VIP egress or the AF_UNIX
+// helper-socket deny.
+func TestGenerateAPIServerVIPEgress(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	const apiVIP = "10.43.0.1"
+	const netdSock = "/var/run/k3sm/netd.sock"
+
+	apiFrag := `(remote ip "` + apiVIP + `:443")`
+	api0Frag := `(remote ip "` + apiVIP + `:0")`
+
+	cases := []struct {
+		name     string
+		apiVIP   string
+		allowNet bool
+		wantRule bool
+	}{
+		{"set-with-network", apiVIP, true, true},
+		{"unset-with-network", "", true, false},
+		{"set-without-network", apiVIP, false, false},
+		{"unset-without-network", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath:        dataVol,
+				AllowNetwork:          tc.allowNet,
+				DeniedUnixSocketPaths: []string{netdSock},
+			}, GenerateOptions{
+				Posture: Posture{APIServerVIP: tc.apiVIP},
+			})
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+
+			// The API-VIP :443 allow appears iff APIServerVIP is set AND the pod has
+			// network egress; the paired :0 follows the same idiom.
+			if got := strings.Contains(out, apiFrag); got != tc.wantRule {
+				t.Errorf("API-VIP :443 egress present=%v, want %v:\n%s", got, tc.wantRule, out)
+			}
+			if got := strings.Contains(out, api0Frag); got != tc.wantRule {
+				t.Errorf("API-VIP :0 egress present=%v, want %v:\n%s", got, tc.wantRule, out)
+			}
+
+			// The DNS-VIP rule is unaffected whenever egress is allowed: APIServerVIP
+			// must not perturb the default cluster-DNS egress (M3.3 regression guard).
+			if tc.allowNet {
+				if !strings.Contains(out, `(remote ip "`+DefaultResolverVIP+`:53")`) {
+					t.Errorf("DNS-VIP :53 egress missing — APIServerVIP must not perturb it:\n%s", out)
+				}
+			}
+
+			// The AF_UNIX helper-socket deny is intact and never turned into an allow,
+			// regardless of the API-VIP rule.
+			if !strings.Contains(out, `(remote unix-socket (path-equal "`+netdSock+`"))`) {
+				t.Errorf("AF_UNIX helper-socket deny missing:\n%s", out)
+			}
+			if strings.Contains(out, "(allow network-outbound\n  (remote unix-socket") {
+				t.Errorf("AF_UNIX socket must never be ALLOWed:\n%s", out)
+			}
+
+			// When present, the API-VIP allow must precede the AF_UNIX deny so
+			// last-match-wins keeps the helper socket denied for a networked pod.
+			if tc.wantRule {
+				iAPI := strings.Index(out, apiFrag)
+				iDeny := strings.Index(out, "(deny network-outbound")
+				if iAPI < 0 || iDeny < 0 || iDeny <= iAPI {
+					t.Errorf("API-VIP allow (%d) must come BEFORE the AF_UNIX deny (%d) to stay denied:\n%s", iAPI, iDeny, out)
+				}
+			}
+		})
+	}
+}
