@@ -19,8 +19,11 @@ package supervisor
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // Credential is the POSIX identity a pod process drops to before its Seatbelt
@@ -140,8 +143,13 @@ func ParseCredential(uidArg, gidArg, groupsArg string) (Credential, error) {
 type LaunchStep int
 
 const (
+	// StepSetrlimit applies the pod's explicit POSIX resource limits
+	// (setrlimit(2)). It is FIRST — before the privilege drop — because raising a
+	// hard limit requires euid 0, and the limits must hold whether or not a uid
+	// drop is requested.
+	StepSetrlimit LaunchStep = iota
 	// StepSetgid sets the primary gid (must precede StepSetuid).
-	StepSetgid LaunchStep = iota
+	StepSetgid
 	// StepInitgroups sets the supplemental group list (incl. fsGroup).
 	StepInitgroups
 	// StepSetuid sets the uid (must follow StepSetgid/StepInitgroups).
@@ -155,6 +163,8 @@ const (
 // String renders the LaunchStep for diagnostics/tests.
 func (s LaunchStep) String() string {
 	switch s {
+	case StepSetrlimit:
+		return "setrlimit"
 	case StepSetgid:
 		return "setgid"
 	case StepInitgroups:
@@ -170,13 +180,35 @@ func (s LaunchStep) String() string {
 	}
 }
 
+// PlannedRlimit is one resolved POSIX resource limit ready for setrlimit(2): the
+// darwin RLIMIT_* resource selector plus the soft (Cur) / hard (Max) pair as a
+// unix.Rlimit. The daemon resolves a []PlannedRlimit from a pod's EXPLICIT
+// PodBox.rlimits[] (runtime.resolveRlimitPlan) and RunLaunchSequence applies the
+// slice — before the privilege drop — through the LaunchSeam. It is the resolved,
+// proto-free plan, so the supervisor stays decoupled from apis (mirroring how
+// Credential is the resolved form of a pod's securityContext).
+type PlannedRlimit struct {
+	// Resource is the darwin RLIMIT_* selector (e.g. unix.RLIMIT_NOFILE).
+	Resource int
+	// Lim is the soft (Cur) and hard (Max) limit pair applied via setrlimit(2).
+	Lim unix.Rlimit
+}
+
 // LaunchSeam is the ordered set of irreversible operations the exec-shim performs
 // to become a confined, privilege-dropped pod process. It is a seam (consumer-
 // side interface) so RunLaunchSequence's ordering can be unit-tested with a fake
 // that records calls and performs no real syscall; the production implementation
-// lives in internal/execshim (drop via golang.org/x/sys/unix, SandboxApply via
-// libsandbox cgo, Exec via execve).
+// lives in internal/execshim (drop + rlimits via golang.org/x/sys/unix,
+// SandboxApply via libsandbox cgo, Exec via execve).
 type LaunchSeam interface {
+	// Setrlimit applies one POSIX resource limit (setrlimit(2)) to the current
+	// process. Called BEFORE the uid drop, while euid is still privileged, so a
+	// hard-limit raise is permitted.
+	Setrlimit(resource int, lim unix.Rlimit) error
+	// Getrlimit reads the current/inherited limit for resource (getrlimit(2)) — the
+	// ceiling a denied hard-limit raise is clamped down to in the unprivileged
+	// posture.
+	Getrlimit(resource int) (unix.Rlimit, error)
 	// Setgid sets the process primary group id.
 	Setgid(gid int) error
 	// Initgroups sets the supplemental group list (the initgroups equivalent).
@@ -196,12 +228,18 @@ type LaunchSeam interface {
 // exec-shim's, == the daemon's); it gates the drop. The ordering is load-bearing
 // — getting it wrong silently runs the pod with the wrong identity or unconfined:
 //
-//		when cred.Drop:  Setgid(gid) → Initgroups(groups) → Setuid(uid)
-//		always:          SandboxApply → Exec
+//		when len(plan)>0: Setrlimit(plan...)         [before the drop]
+//		when cred.Drop:   Setgid(gid) → Initgroups(groups) → Setuid(uid)
+//		always:           SandboxApply → Exec
 //
 //	  - a drop is refused up front when euid != 0 (cred.Validate): setuid/setgid
 //	    to another identity needs root, so on the unprivileged _k3sm daemon Drop
 //	    must be false and the pod runs at the daemon's own uid in Seatbelt;
+//	  - rlimits FIRST, before the drop: raising a hard limit needs euid 0; a
+//	    non-root process that tries to raise a hard limit above its inherited
+//	    ceiling gets EPERM, so setrlimitClamped reduces it to the inherited limit
+//	    (with a warning) rather than failing the pod; the plan applies even when
+//	    Drop is false (the unprivileged posture still gets its explicit limits);
 //	  - setgid BEFORE setuid: after setuid drops to a non-root uid the process can
 //	    no longer change its gid, so the gid must be set while still privileged;
 //	  - initgroups (supplemental groups, incl. fsGroup) BETWEEN them — also a
@@ -215,10 +253,21 @@ type LaunchSeam interface {
 // fail-closed: a refused/failed drop or failed sandbox apply means Exec is never
 // reached, so the pod never runs with the wrong credential or outside the
 // sandbox.
-func RunLaunchSequence(seam LaunchSeam, cred Credential, euid int) ([]LaunchStep, error) {
+func RunLaunchSequence(seam LaunchSeam, cred Credential, plan []PlannedRlimit, euid int) ([]LaunchStep, error) {
 	var done []LaunchStep
 	if err := cred.Validate(euid); err != nil {
 		return done, err
+	}
+	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the
+	// limits apply whether or not a uid drop is requested (the unprivileged posture
+	// gets them too, clamped to the inherited ceiling). An empty plan adds no step.
+	if len(plan) > 0 {
+		for _, pr := range plan {
+			if err := setrlimitClamped(seam, pr); err != nil {
+				return done, fmt.Errorf("setrlimit resource=%d: %w", pr.Resource, err)
+			}
+		}
+		done = append(done, StepSetrlimit)
 	}
 	if cred.Drop {
 		if err := seam.Setgid(cred.GID); err != nil {
@@ -243,4 +292,35 @@ func RunLaunchSequence(seam LaunchSeam, cred Credential, euid int) ([]LaunchStep
 	}
 	done = append(done, StepExec) // unreachable on success: exec replaced the image
 	return done, nil
+}
+
+// setrlimitClamped applies one planned rlimit, CLAMPING a denied hard-limit raise
+// down to the process's inherited ceiling instead of failing the pod. In the
+// unprivileged posture (a non-root daemon, Credential.Drop==false) the kernel
+// returns EPERM when a process tries to RAISE a hard limit above what it
+// inherited; rather than abort the launch, the limit is reduced to the inherited
+// hard limit (getrlimit(2)) and a warning is logged. Root never reaches this
+// branch (it may raise hard limits), so the EPERM is itself the non-root signal —
+// no euid test is needed. A non-EPERM error is a genuine failure and is returned.
+func setrlimitClamped(seam LaunchSeam, pr PlannedRlimit) error {
+	err := seam.Setrlimit(pr.Resource, pr.Lim)
+	if err == nil || !errors.Is(err, unix.EPERM) {
+		return err
+	}
+	inherited, gerr := seam.Getrlimit(pr.Resource)
+	if gerr != nil {
+		return err // can't read the inherited ceiling; surface the original EPERM
+	}
+	clamped := pr.Lim
+	if clamped.Max > inherited.Max {
+		clamped.Max = inherited.Max
+	}
+	if clamped.Cur > clamped.Max {
+		clamped.Cur = clamped.Max
+	}
+	slog.Warn("rlimit hard-limit raise denied by kernel; clamped to inherited ceiling",
+		"resource", pr.Resource,
+		"requested_hard", pr.Lim.Max,
+		"inherited_hard", inherited.Max)
+	return seam.Setrlimit(pr.Resource, clamped)
 }

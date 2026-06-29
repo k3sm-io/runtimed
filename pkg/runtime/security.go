@@ -17,6 +17,10 @@ limitations under the License.
 package runtime
 
 import (
+	"log/slog"
+
+	"golang.org/x/sys/unix"
+
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -65,6 +69,75 @@ func firstNonZero(vals ...int) int {
 		}
 	}
 	return 0
+}
+
+// rlimitResource maps a ResourceLimit.type name to its darwin RLIMIT_* selector.
+// The lookup is comma-ok ON PURPOSE: an unknown name returns ok=false so
+// resolveRlimitPlan SKIPS it (with a warning) rather than defaulting to the
+// zero-value resource — on darwin RLIMIT_CPU is 0x0, so a zero-value miss would
+// silently install a cumulative-CPU-seconds killer. RLIMIT_CPU is therefore only
+// ever selected when a type explicitly names it.
+var rlimitResource = map[string]int{
+	"RLIMIT_NOFILE": unix.RLIMIT_NOFILE,
+	"RLIMIT_NPROC":  unix.RLIMIT_NPROC,
+	"RLIMIT_AS":     unix.RLIMIT_AS,
+	"RLIMIT_CORE":   unix.RLIMIT_CORE,
+	"RLIMIT_STACK":  unix.RLIMIT_STACK,
+	"RLIMIT_DATA":   unix.RLIMIT_DATA,
+	"RLIMIT_FSIZE":  unix.RLIMIT_FSIZE,
+	"RLIMIT_CPU":    unix.RLIMIT_CPU,
+}
+
+// resolveRlimitPlan computes the setrlimit(2) plan from a pod's EXPLICIT
+// PodBox.rlimits[] — and ONLY those. It deliberately synthesizes NO rlimit from
+// memory_limit_bytes or a cpu quota:
+//   - memory is enforced out-of-band by the proc_pid_rusage→OOMKilled sampler;
+//     RLIMIT_AS caps virtual address space (≠ phys_footprint) and would crash Go
+//     pods at startup while erasing the OOMKilled reason;
+//   - RLIMIT_CPU is cumulative CPU-SECONDS, not a rate, so it cannot express a cpu
+//     quota.
+//
+// Each explicit entry maps type→RLIMIT_* via the comma-ok rlimitResource table;
+// an UNKNOWN type is skipped with a warning (never silently applied as the
+// zero-value RLIMIT_CPU). "Unlimited" (^uint64(0) or RLIM_INFINITY's bit pattern)
+// maps to unix.RLIM_INFINITY; soft and hard are otherwise carried verbatim. The
+// supervisor applies the returned plan via RunLaunchSequence, before the uid drop.
+func resolveRlimitPlan(box *runtimev1.PodBox) []supervisor.PlannedRlimit {
+	rls := box.GetRlimits()
+	if len(rls) == 0 {
+		return nil
+	}
+	plan := make([]supervisor.PlannedRlimit, 0, len(rls))
+	for _, rl := range rls {
+		name := rl.GetType()
+		resource, ok := rlimitResource[name]
+		if !ok {
+			slog.Warn("skipping unknown rlimit type", "type", name)
+			continue
+		}
+		plan = append(plan, supervisor.PlannedRlimit{
+			Resource: resource,
+			Lim: unix.Rlimit{
+				Cur: rlimitValue(rl.GetSoft()),
+				Max: rlimitValue(rl.GetHard()),
+			},
+		})
+	}
+	if len(plan) == 0 {
+		return nil
+	}
+	return plan
+}
+
+// rlimitValue normalizes a proto rlimit magnitude to a kernel rlim_t, mapping the
+// "unlimited" sentinels to unix.RLIM_INFINITY. A pod author (or the kube→proto
+// mapping) may express unlimited as all-ones (^uint64(0)) or as RLIM_INFINITY's
+// own bit pattern; both become unix.RLIM_INFINITY. Any other value is verbatim.
+func rlimitValue(v uint64) uint64 {
+	if v == ^uint64(0) || v == uint64(unix.RLIM_INFINITY) {
+		return uint64(unix.RLIM_INFINITY)
+	}
+	return v
 }
 
 // volumeMountStatuses builds the ContainerStatus.volume_mounts mirror from a

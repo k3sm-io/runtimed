@@ -44,10 +44,13 @@ const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 // qos_class and rlimits also ride apis:M2.2's PodBox resource band. qos_class is
 // informational for runtimed today (CPU is best-effort QoS, not CFS millicores —
 // the taskpolicy/setpriority application is deferred, see docs/resources.md and
-// PodBox.qos_class); rlimits are applied via setrlimit(2) in the exec-shim before
-// exec — deferred to a follow-up that extends the M2.3 security-critical launch
-// sequence (a setrlimit step ordered before the uid drop) with its own ordering
-// test, rather than bolted on here untested.
+// PodBox.qos_class). rlimits from the EXPLICIT PodBox.rlimits[] are resolved
+// daemon-side by resolveRlimitPlan into a supervisor.PlannedRlimit plan that
+// RunLaunchSequence applies via setrlimit(2) as StepSetrlimit, ordered before the
+// uid drop. No rlimit is synthesized from memory_limit_bytes or a cpu quota:
+// memory is metered by the proc_pid_rusage→OOMKilled sampler, and RLIMIT_CPU is
+// cumulative CPU-seconds, not a rate. Transporting the resolved plan from the
+// daemon to the exec-shim via argv is the remaining wiring.
 func podMemoryLimitBytes(box *runtimev1.PodBox) uint64 {
 	if typed := box.GetMemoryLimitBytes(); typed > 0 {
 		return uint64(typed)
