@@ -69,6 +69,11 @@ func RunPodLaunch(profile string, argv []string, cred supervisor.Credential) err
 	// euid is the shim's own effective uid (== the daemon's). RunLaunchSequence
 	// refuses a drop when it is non-root, so an unprivileged _k3sm daemon fails
 	// closed rather than attempting a doomed setuid.
-	_, err := supervisor.RunLaunchSequence(seam, cred, os.Geteuid())
+	//
+	// The rlimit plan is nil here: the daemon resolves it (runtime.resolveRlimitPlan
+	// from PodBox.rlimits[]) and its transport to this exec-shim via argv — mirroring
+	// Credential.ShimArgs/ParseCredential — is the sibling follow-up. Until then the
+	// shim applies no rlimits (the pre-rlimit behavior, an empty StepSetrlimit).
+	_, err := supervisor.RunLaunchSequence(seam, cred, nil, os.Geteuid())
 	return err
 }

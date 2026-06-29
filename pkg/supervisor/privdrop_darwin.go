@@ -52,3 +52,19 @@ func (UnixDropper) Initgroups(groups []int) error {
 // Initgroups), since dropping the uid first would forfeit the privilege the group
 // changes require.
 func (UnixDropper) Setuid(uid int) error { return unix.Setuid(uid) }
+
+// Setrlimit applies one POSIX resource limit via setrlimit(2). Called from the
+// exec-shim BEFORE the uid drop, while euid is still 0, so a hard-limit raise is
+// permitted. setrlimit(2) is a standard POSIX call (not private SPI) but, like the
+// drop, is process-global, so UnixDropper is only ever used from the exec-shim.
+func (UnixDropper) Setrlimit(resource int, lim unix.Rlimit) error {
+	return unix.Setrlimit(resource, &lim)
+}
+
+// Getrlimit reads the current limit for resource via getrlimit(2) — the inherited
+// ceiling RunLaunchSequence clamps a denied hard-limit raise down to.
+func (UnixDropper) Getrlimit(resource int) (unix.Rlimit, error) {
+	var lim unix.Rlimit
+	err := unix.Getrlimit(resource, &lim)
+	return lim, err
+}
