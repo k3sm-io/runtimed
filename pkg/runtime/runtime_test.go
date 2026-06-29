@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,6 +108,34 @@ func (b *fakeVMBackend) created() (int, sandbox.VMSpec) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.createCalls, b.lastSpec
+}
+
+// recordingNetwork is a supervisor.PodNetwork that records each Setup call — the
+// /32 lo0-alias allocation a host-process pod gets. The vm (guest) route must
+// NEVER call it: a NAT-attached guest is reached over the VZNATNetworkDeviceAttachment,
+// not a host lo0 alias. So a test asserts setupCount()==0 on the vm route and a
+// host pod still allocates exactly one alias.
+type recordingNetwork struct {
+	ip string
+
+	mu     sync.Mutex
+	setups []string
+}
+
+func (n *recordingNetwork) Setup(_ context.Context, podID string) (string, error) {
+	n.mu.Lock()
+	n.setups = append(n.setups, podID)
+	n.mu.Unlock()
+	if n.ip == "" {
+		return "10.1.2.3", nil
+	}
+	return n.ip, nil
+}
+
+func (n *recordingNetwork) setupCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.setups)
 }
 
 // fakeSpawner returns sequential pids and records argv/env.
@@ -506,6 +535,99 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		}
 		if n, _ := vmb.created(); n != 0 {
 			t.Errorf("host-process path called CreateVM %d times; must be 0", n)
+		}
+		w.release(1001)
+	})
+}
+
+// TestCreateVMPod_GuestNetworkPlumbing proves the runtimed-side guest-network seam
+// (B2): a vm-RuntimeClass pod's GuestNetworkConfig (the rendered resolv.conf + the
+// NAT advisory fields) is threaded INERT through createPod → createVMPod into the
+// VMSpec the vm backend's CreateVM receives, while the host-process path never sees
+// it and a NAT-attached guest binds NO lo0 alias.
+//
+// It asserts the behavioral FORK, not a tautology: the SAME populated config is fed
+// to createPod for both a vm pod and a host pod. For the vm pod it reaches
+// VMSpec.Network (resolv.conf nameserver+search+ndots and the NAT fields intact)
+// AND the route allocates zero lo0 aliases; for the host pod it never reaches
+// createVMPod (CreateVM call count 0) AND the route allocates its one lo0 alias.
+func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
+	// The rendered /etc/resolv.conf the guest provisioner pins (pkg/dns.GuestResolvConf
+	// shape): nameserver + search + options ndots: — the operative Linux-guest DNS
+	// artifact that must survive the seam intact.
+	const resolvConf = "nameserver 10.43.0.10\n" +
+		"search default.svc.cluster.local svc.cluster.local cluster.local\n" +
+		"options ndots:5\n"
+	netCfg := sandbox.GuestNetworkConfig{
+		ResolvConf: resolvConf,
+		PodIP:      netip.MustParseAddr("10.42.0.7"),
+		Gateway:    netip.MustParseAddr("192.168.66.1"),
+		NATSubnet:  netip.MustParsePrefix("192.168.66.0/24"),
+		DNSVIP:     netip.MustParseAddr("10.43.0.10"),
+	}
+
+	t.Run("vm-pod-carries-config-no-lo0-alias", func(t *testing.T) {
+		vmb := &fakeVMBackend{available: true}
+		net := &recordingNetwork{}
+		rt := newTestRuntime(t, Deps{VMBackend: vmb, Network: net})
+
+		box := hostBinBox("pod-vm-net")
+		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+
+		// Put the config at the create input. The lab-gated boot stub then surfaces an
+		// error, which is expected and orthogonal to the plumbing assertion.
+		if _, _, err := rt.createPod(context.Background(), box, netCfg); err == nil {
+			t.Fatal("vm createPod should surface the lab-gated boot error")
+		}
+
+		// X reached CreateVM: the recorded VMSpec.Network is the config we fed in.
+		n, spec := vmb.created()
+		if n != 1 {
+			t.Fatalf("CreateVM called %d times, want 1", n)
+		}
+		if spec.Network.ResolvConf != resolvConf {
+			t.Errorf("VMSpec.Network.ResolvConf = %q, want %q", spec.Network.ResolvConf, resolvConf)
+		}
+		// nameserver + search + ndots survived the seam intact.
+		for _, frag := range []string{"nameserver 10.43.0.10", "search default.svc.cluster.local", "options ndots:5"} {
+			if !strings.Contains(spec.Network.ResolvConf, frag) {
+				t.Errorf("resolv.conf missing %q:\n%s", frag, spec.Network.ResolvConf)
+			}
+		}
+		// The NAT advisory fields survived too.
+		if spec.Network.PodIP != netCfg.PodIP || spec.Network.Gateway != netCfg.Gateway ||
+			spec.Network.NATSubnet != netCfg.NATSubnet || spec.Network.DNSVIP != netCfg.DNSVIP {
+			t.Errorf("VMSpec.Network NAT fields = %+v, want %+v", spec.Network, netCfg)
+		}
+		// A NAT-attached guest binds NO lo0 alias: the vm route never calls network.Setup.
+		if got := net.setupCount(); got != 0 {
+			t.Errorf("vm route allocated %d lo0 aliases; must be 0 (guest is NAT-attached)", got)
+		}
+	})
+
+	t.Run("host-pod-never-gets-config-binds-lo0-alias", func(t *testing.T) {
+		vmb := &fakeVMBackend{available: true} // available, but NOT requested
+		net := &recordingNetwork{}
+		w := newBlockingWaiter()
+		rt := newTestRuntime(t, Deps{VMBackend: vmb, Network: net, Waiter: w})
+
+		// UNSPECIFIED backend → the host-process route. Feed the SAME populated config.
+		box := hostBinBox("pod-host-net")
+
+		p, _, err := rt.createPod(context.Background(), box, netCfg)
+		if err != nil {
+			t.Fatalf("host createPod failed: %v", err)
+		}
+		if p == nil {
+			t.Fatal("host createPod returned nil pod")
+		}
+		// It never routed to createVMPod, so the config never reached a VMSpec.
+		if n, _ := vmb.created(); n != 0 {
+			t.Errorf("host route called CreateVM %d times; must be 0 (config must not reach the guest seam)", n)
+		}
+		// The host process binds its one /32 lo0 alias (network.Setup fires here).
+		if got := net.setupCount(); got != 1 {
+			t.Errorf("host route allocated %d lo0 aliases; want 1", got)
 		}
 		w.release(1001)
 	})

@@ -19,6 +19,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"runtime"
 
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -50,6 +51,51 @@ var ErrVMBootNotImplemented = errors.New("sandbox: vm backend boot not implement
 // path. Compare with errors.Is.
 var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-process exec-shim path; route the pod via CreateVM")
 
+// GuestNetworkConfig is the runtimed-LOCAL network contract the vm backend applies
+// to a pod's Linux guest (M5.1): the rendered /etc/resolv.conf content plus the
+// NAT-attachment advisory fields.
+//
+// It is an INTENTIONAL decoupling DTO. It mirrors darwin-net's podnet.GuestNetwork
+// (the NAT-attachment config) folded together with the rendered resolv.conf from
+// darwin-net's pkg/dns.GuestResolvConf — NEITHER of which runtimed may import:
+// darwin-net and runtimed are CO-EQUAL LEAVES of the cross-repo DAG (the shared
+// contract lives in k3sm.io/apis; neither leaf imports the other). The k3sm
+// provider is the named mapper: it owns both darwin-net producers and STAMPS this
+// struct as plain data, exactly as it already threads DeniedUnixSocketPaths "as
+// data because runtimed cannot import darwin-net" (k3sm/pkg/provider/runtimed.go,
+// RuntimedConfig.DeniedUnixSocketPaths).
+//
+// The zero value networks no guest (no resolver injected, no NAT advisory). In
+// M5.1 it IS zero in production — no producer is wired yet; the end-to-end provider
+// wiring is the separate k3sm successor.
+type GuestNetworkConfig struct {
+	// ResolvConf is the rendered /etc/resolv.conf CONTENT the guest provisioner pins
+	// into the Linux guest (the pkg/dns.GuestResolvConf output): a `nameserver` line
+	// (the cluster DNS VIP), the `search` list, and `options ndots:`. It is the
+	// OPERATIVE Linux-guest DNS artifact — the Darwin getaddrinfo DYLD shim that
+	// serves a host-process pod is meaningless in a Linux guest (no dyld; glibc/musl
+	// NSS instead), so the guest is pointed at the cluster resolver the standard
+	// Linux way. Empty means no resolver is injected.
+	ResolvConf string
+	// PodIP is the pod's cluster identity, allocated from the node podCIDR by
+	// darwin-net's IPAM (mirrors podnet.GuestNetwork.PodIP). ADVISORY: an intended
+	// value runtimed reconciles from the live attachment — under a NAT attachment the
+	// guest's on-the-wire address is macOS-assigned (vmnet DHCP) and may differ.
+	PodIP netip.Addr
+	// Gateway is the NAT gateway the guest routes through (mirrors
+	// podnet.GuestNetwork.Gateway). ADVISORY: macOS-assigned; an intended value
+	// runtimed reconciles from the live attachment.
+	Gateway netip.Addr
+	// NATSubnet is the subnet the guest's interface address sits in behind the
+	// VZNATNetworkDeviceAttachment (mirrors podnet.GuestNetwork.NATSubnet). ADVISORY:
+	// macOS-assigned; an intended value runtimed reconciles from the live attachment.
+	NATSubnet netip.Prefix
+	// DNSVIP is the cluster DNS VIP the ResolvConf `nameserver` points at (mirrors
+	// podnet.GuestNetwork.DNSVIP) — a cluster fact carried alongside the rendered
+	// resolv.conf for reconciliation/diagnostics.
+	DNSVIP netip.Addr
+}
+
 // VMSpec is the sizing + image contract for a pod's Linux guest VM (M5.1). The
 // provider stamps Vcpus / MemoryBytes onto the SandboxProfile (vm_vcpus /
 // vm_memory_bytes); a zero value means "let the backend choose a default".
@@ -64,6 +110,12 @@ type VMSpec struct {
 	// RootfsPath is the on-disk pod data volume the OCI-Linux-rootfs→bootable-root
 	// builder (lab-gated) turns into the guest root.
 	RootfsPath string
+	// Network is the guest's network config (M5.1): the rendered resolv.conf content
+	// plus the NAT advisory fields the vm backend applies to the guest. The provider
+	// stamps it as data (runtimed cannot import darwin-net — see GuestNetworkConfig);
+	// a zero value networks no guest. A NAT-attached guest gets its network via the
+	// VZNATNetworkDeviceAttachment, NEVER a host lo0 alias.
+	Network GuestNetworkConfig
 }
 
 // VMBackend is the Virtualization.framework micro-VM isolation backend (M5.1) —
