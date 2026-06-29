@@ -23,3 +23,9 @@ See [DESIGN.md §5a](https://github.com/k3sm-io/k3sm/blob/main/docs/DESIGN.md).
 
 CGO is required (`CGO_ENABLED=1`). Integration tests are build-tagged: `go test -tags integration ./...`
 (some need root; they `t.Skip` otherwise).
+
+## License
+
+[Apache License 2.0](LICENSE). Contributions require a Developer Certificate of Origin sign-off
+(`git commit -s`) — see [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md),
+and [SECURITY.md](SECURITY.md).
