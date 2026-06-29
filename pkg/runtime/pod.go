@@ -101,7 +101,13 @@ type containerProc struct {
 // generates+validates the SBPL, and spawns each container through the exec-shim
 // backend with DYLD_INSERT_LIBRARIES carried through. It returns the started pod
 // or a typed failure.
-func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, runtimev1.FailureReason, error) {
+//
+// netcfg is the pod's guest network config (rendered resolv.conf + NAT advisory
+// fields). It is INERT on the host-process spine — a host process binds a /32 lo0
+// alias via r.network.Setup and never reads it — and flows ONLY to the vm route
+// (createVMPod), where it lands in VMSpec.Network. In M5.1 it is zero-valued in
+// production (no producer wired yet; the k3sm provider populates it later).
+func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg sandbox.GuestNetworkConfig) (*pod, runtimev1.FailureReason, error) {
 	sp := box.GetSandboxProfile()
 	if sp == nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -123,10 +129,11 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 
 	// Route the vm rung AWAY from the host-process (Mach-O) spine: a Linux guest has
 	// no host binary to resolve, ad-hoc codesign, signature-gate, SBPL-confine, or
-	// attach to lo0 — those steps are meaningless for it. The host-process path
-	// below is reached only for the Seatbelt rungs and is byte-unchanged.
+	// attach to lo0 — those steps are meaningless for it. The guest network config
+	// (netcfg) flows ONLY here, into the vm path; the host-process path below is
+	// reached only for the Seatbelt rungs and is byte-unchanged.
 	if selected == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
-		return r.createVMPod(ctx, box, sp)
+		return r.createVMPod(ctx, box, sp, netcfg)
 	}
 
 	ip, err := r.network.Setup(ctx, box.GetPodId())
@@ -281,6 +288,13 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 // or set up lo0 networking — a Linux guest runs none of those. It hands the pod's
 // sizing (vm_vcpus / vm_memory_bytes) + rootfs to the vm backend's CreateVM.
 //
+// netcfg is threaded INERT into VMSpec.Network: the rendered resolv.conf content
+// plus the NAT advisory fields the vm backend applies to the guest. This path runs
+// NO IPAM, NO supervisor.PodNetwork.Setup, and binds NO lo0 alias — a NAT-attached
+// guest is reached over the VZNATNetworkDeviceAttachment, never a host lo0 alias.
+// The config is plain data because runtimed cannot import darwin-net (see
+// sandbox.GuestNetworkConfig); the k3sm provider is the producer/mapper.
+//
 // The live VM boot is LAB-GATED: it needs a Virtualization.framework-capable Mac
 // signed with com.apple.security.virtualization, so CreateVM is a documented stub
 // returning sandbox.ErrVMBootNotImplemented. On a non-entitled host SelectBackend
@@ -288,12 +302,13 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (*pod, r
 // reached; on a capable host this is where the lab remainder lands — the
 // cmd/k3sm-vmhost helper lifecycle, the OCI-Linux-rootfs→bootable-root builder,
 // and guest-agent VM metering (see pkg/sandbox vm.go).
-func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile) (*pod, runtimev1.FailureReason, error) {
+func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile, netcfg sandbox.GuestNetworkConfig) (*pod, runtimev1.FailureReason, error) {
 	spec := sandbox.VMSpec{
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
 		RootfsPath:  r.rootfsPath(box),
+		Network:     netcfg,
 	}
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
