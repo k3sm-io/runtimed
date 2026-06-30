@@ -121,6 +121,15 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 	wg.Wait()
 
+	// End the pod-lifetime supervision context AFTER the graceful stop: the reapers
+	// have collected the real exits (GracefulStop observed proc.Done), so canceling
+	// now only unblocks any watchContainerExit drain-wait still in flight — it must
+	// NOT precede GracefulStop, or a grace>0 container would be seen as exited and
+	// never SIGKILLed. Fired here it mirrors p.memCancel: pod teardown, no leak.
+	if p.cancel != nil {
+		p.cancel()
+	}
+
 	st := r.podStatus(p)
 	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)

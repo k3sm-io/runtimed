@@ -25,6 +25,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -67,12 +70,20 @@ func (w cannedWaiter) WaitExit(context.Context, int) (int, int, error) { return 
 // timing; nil writes straight into the container's logBuffer.
 func startTermProc(t *testing.T, name, payload string, w supervisor.ExitWaiter, decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
 	t.Helper()
+	return startTermProcSpawner(t, name, pipeSpawner{payload: payload}, w, decorate)
+}
+
+// startTermProcSpawner is startTermProc over an arbitrary supervisor.Spawner, so a
+// test can drive a pipe whose write-end is held open past the child's exit (the
+// leaked-grandchild case) instead of the EOF-on-exit pipeSpawner.
+func startTermProcSpawner(t *testing.T, name string, spawner supervisor.Spawner, w supervisor.ExitWaiter, decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
+	t.Helper()
 	logs := newLogBuffer()
 	var sink supervisor.LogSink = logs.write
 	if decorate != nil {
 		sink = decorate(logs.write)
 	}
-	proc := supervisor.NewProcess(pipeSpawner{payload: payload}, w,
+	proc := supervisor.NewProcess(spawner, w,
 		supervisor.SpawnSpec{Path: "/term-test", Argv: []string{"/term-test"}}, sink)
 	if err := proc.Start(context.Background()); err != nil {
 		t.Fatalf("start %s process: %v", name, err)
@@ -86,6 +97,53 @@ func startTermProc(t *testing.T, name, payload string, w supervisor.ExitWaiter, 
 			Image: "/term-test",
 			State: &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()}},
 		},
+	}
+}
+
+// heldWriteEnd is a supervisor.Spawner that writes payload to the child's combined
+// stdout+stderr fd and then DUPS that write-end into an independent descriptor it
+// holds open — modeling a forked grandchild that inherits and retains the pipe after
+// the direct child exits. Because a write-end stays open, the supervisor pump never
+// reaches EOF and LogsDrained never closes, so watchContainerExit can only finalize
+// via its bounded drainGrace timeout. release() closes the held fd (test cleanup) so
+// the pump goroutine can finally drain and exit.
+type heldWriteEnd struct {
+	payload string
+
+	mu   sync.Mutex
+	held *os.File
+}
+
+func (s *heldWriteEnd) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
+	if spec.LogFD == 0 {
+		return 4242, nil
+	}
+	// Dup the inherited write-end into a fd of our own (independent of the parent's
+	// logW, which Start closes right after Spawn returns) and keep it open.
+	dupFD, err := unix.Dup(int(spec.LogFD))
+	if err != nil {
+		return 0, fmt.Errorf("dup logfd: %w", err)
+	}
+	held := os.NewFile(uintptr(dupFD), "held-logfd")
+	if s.payload != "" {
+		if _, err := held.WriteString(s.payload); err != nil {
+			_ = held.Close()
+			return 0, fmt.Errorf("write held logfd: %w", err)
+		}
+	}
+	s.mu.Lock()
+	s.held = held
+	s.mu.Unlock()
+	return 4242, nil
+}
+
+func (s *heldWriteEnd) release() {
+	s.mu.Lock()
+	h := s.held
+	s.held = nil
+	s.mu.Unlock()
+	if h != nil {
+		_ = h.Close()
 	}
 }
 
@@ -235,6 +293,109 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		if !strings.Contains(term.GetMessage(), last) {
 			t.Fatalf("final log line lost to the pump/reaper race.\n got: %q\nwant contains: %q\n"+
 				"(the drain-wait before snapshot is what makes the last line land)", term.GetMessage(), last)
+		}
+	})
+
+	// held-open pipe → bounded snapshot, NO hang: a forked grandchild holds the
+	// stdout/stderr write-end open after the direct child exits, so the supervisor
+	// pump never reaches EOF and LogsDrained never closes. watchContainerExit MUST
+	// still finalize the terminated status within ~drainGrace (snapshotting whatever
+	// tail is buffered), never wedge the pod in Running forever. Run under -race.
+	t.Run("held-open-pipe-bounded-snapshot-no-hang", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{})
+		rt.drainGrace = 60 * time.Millisecond // small + real so the timeout arm is fast
+
+		const lastLine = "panic: held-pipe diagnostic"
+		// Every line (incl. the diagnostic) is newline-terminated so the pump delivers
+		// it to the buffer before blocking on the never-closing pipe — the missing EOF
+		// is what keeps LogsDrained from closing, not a missing final line.
+		held := &heldWriteEnd{payload: "starting\nworking\n" + lastLine + "\n"}
+		t.Cleanup(held.release) // let the pipe finally EOF so the pump goroutine exits
+
+		cp := startTermProcSpawner(t, "main", held, cannedWaiter{code: 2}, nil)
+		p := &pod{box: hostBinBox("pod-held"), containers: []*containerProc{cp}}
+
+		done := make(chan struct{})
+		go func() {
+			rt.watchContainerExit(context.Background(), p, cp, nil)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("watchContainerExit hung on a held-open pipe (drain-wait was not bounded)")
+		}
+
+		// Prove we finalized via the timeout, not EOF: LogsDrained is still open.
+		select {
+		case <-cp.proc.LogsDrained():
+			t.Fatal("LogsDrained closed; the held-open-pipe case did not exercise the bounded timeout")
+		default:
+		}
+
+		term := cp.state.GetState().GetTerminated()
+		if term == nil {
+			t.Fatal("container has no terminated state after the bounded drain")
+		}
+		if !strings.Contains(term.GetMessage(), lastLine) {
+			t.Errorf("message = %q, want the buffered tail %q (partial snapshot on the drain timeout)", term.GetMessage(), lastLine)
+		}
+	})
+
+	// capture despite request-ctx cancel: under the M2 daemon split the CreatePod ctx
+	// is canceled when the unary handler returns. The fallback must STILL capture the
+	// log tail, proving watchContainerExit + the reaper run on the detached pod-lifetime
+	// ctx, not the request ctx. Pre-detach this is a silent no-op: canceling makes the
+	// reaper record a bogus context-canceled exit and the drain-wait snapshot nothing.
+	t.Run("capture-despite-request-ctx-cancel", func(t *testing.T) {
+		const lastLine = "fatal: detached-supervision diagnostic"
+		w := newBlockingWaiter()
+		w.code = 1 // a failing container → the fallback fires
+		rt := newTestRuntime(t, Deps{
+			Spawner: pipeSpawner{payload: "boot\nserve\n" + lastLine},
+			Waiter:  w,
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-detach")})
+		if err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		if resp.GetError() != nil {
+			t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
+		}
+
+		cancel()        // the unary RPC returns → request ctx is canceled
+		w.release(4242) // pipeSpawner's pid: now the container exits
+
+		if reason := waitTerminatedReason(t, rt, "pod-detach", 3*time.Second); reason != "Error" {
+			t.Fatalf("terminated reason = %q, want Error (a canceled request ctx must not corrupt the exit)", reason)
+		}
+		gs, _ := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: "pod-detach"})
+		msg := gs.GetStatus().GetContainerStatuses()[0].GetState().GetTerminated().GetMessage()
+		if !strings.Contains(msg, lastLine) {
+			t.Errorf("message = %q, want the captured tail %q despite request-ctx cancel (detach failed)", msg, lastLine)
+		}
+	})
+
+	// UTF-8 boundary: the 2048-byte tail cut must round UP to a rune boundary so
+	// term.Message is valid UTF-8 (a sliced multi-byte rune would corrupt it), while
+	// still honoring the byte cap.
+	t.Run("utf8-tail-cut-rounds-to-rune-boundary", func(t *testing.T) {
+		logs := newLogBuffer()
+		// One line of 3-byte runes longer than the byte cap, so the last-2048-byte cut
+		// lands INSIDE a rune (2048 % 3 != 0): the naive slice would start on a UTF-8
+		// continuation byte.
+		logs.write([]byte(strings.Repeat("世", 1000))) // 3000 bytes > 2048
+		msg := terminationMessageFromLogs(logs)
+		if len(msg) > maxTerminationMessageLogBytes {
+			t.Errorf("len(msg) = %d, want <= %d (byte cap must hold)", len(msg), maxTerminationMessageLogBytes)
+		}
+		if !utf8.ValidString(msg) {
+			t.Errorf("message is not valid UTF-8 after the tail cut (rune sliced)")
+		}
+		if !strings.HasSuffix(msg, "世") {
+			t.Error("message lost its tail end (the cut should trim only the leading partial rune)")
 		}
 	})
 }

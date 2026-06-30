@@ -212,6 +212,27 @@ func TestSpawnFailure(t *testing.T) {
 	}
 }
 
+// TestStartErrorClosesDrained guards the start-error footgun: a Process with a
+// sink whose Start fails at spawn must still close the drain edge, so a
+// LogsDrained() waiter (watchContainerExit's drain-wait) is never wedged forever
+// on a Process that never pumped a byte.
+func TestStartErrorClosesDrained(t *testing.T) {
+	boom := errors.New("posix_spawn boom")
+	// A non-nil sink forces the pipe path, so the spawn-error return is the one
+	// that must close drained (the pipe was created, the pump never launched).
+	sink := func([]byte) {}
+	p := NewProcess(&fakeSpawner{err: boom}, fakeWaiter{},
+		SpawnSpec{Path: "/x", Argv: []string{"/x"}}, sink)
+	if err := p.Start(context.Background()); !errors.Is(err, boom) {
+		t.Fatalf("want wrapped spawn error, got %v", err)
+	}
+	select {
+	case <-p.LogsDrained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("LogsDrained blocked after a failed Start (drained never closed)")
+	}
+}
+
 // TestWaitBeforeStart returns ErrNotStarted.
 func TestWaitBeforeStart(t *testing.T) {
 	p := NewProcess(&fakeSpawner{}, fakeWaiter{}, SpawnSpec{Path: "/x", Argv: []string{"/x"}}, nil)
