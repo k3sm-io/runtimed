@@ -82,7 +82,9 @@ type Process struct {
 	logR *os.File // read end of the combined-log pipe (parent side)
 	logW *os.File // write end handed to the child (closed in parent after spawn)
 
-	done chan struct{} // closed once the process is reaped
+	done      chan struct{} // closed once the process is reaped
+	drained   chan struct{} // closed once the log pump has copied output to EOF
+	drainOnce sync.Once     // guards the single close of drained (idempotent, panic-safe)
 }
 
 // NewProcess builds a Process. spawner and waiter are the spawn/reap seams; spec
@@ -95,6 +97,7 @@ func NewProcess(spawner Spawner, waiter ExitWaiter, spec SpawnSpec, sink LogSink
 		sink:    sink,
 		state:   StateInit,
 		done:    make(chan struct{}),
+		drained: make(chan struct{}),
 	}
 }
 
@@ -114,6 +117,9 @@ func (p *Process) Start(ctx context.Context) error {
 	if p.sink != nil {
 		r, w, err := os.Pipe()
 		if err != nil {
+			// No pump will ever run on this Process — close the drain edge so a
+			// LogsDrained() waiter is not wedged forever by a failed Start.
+			p.closeDrained()
 			return fmt.Errorf("log pipe: %w", err)
 		}
 		p.logR, p.logW = r, w
@@ -123,6 +129,9 @@ func (p *Process) Start(ctx context.Context) error {
 	pid, err := p.spawner.Spawn(ctx, p.spec)
 	if err != nil {
 		p.closePipes()
+		// Spawn failed: no pump and no reaper start, so nothing else will ever
+		// close drained. Close it here (idempotent) so LogsDrained() never blocks.
+		p.closeDrained()
 		return fmt.Errorf("spawn %s: %w", p.spec.Path, err)
 	}
 
@@ -139,14 +148,21 @@ func (p *Process) Start(ctx context.Context) error {
 
 	if p.sink != nil {
 		go p.pumpLogs()
+	} else {
+		// No sink → no log pump → nothing to drain; make the edge immediately
+		// observable so LogsDrained() never blocks a waiter on a sink-less process.
+		p.closeDrained()
 	}
 	go p.reap(ctx, pid)
 	return nil
 }
 
 // pumpLogs streams the combined-output pipe to the sink until EOF (child closed
-// its fds / exited). It is the sole reader of logR and closes it on return.
+// its fds / exited). It is the sole reader of logR and closes it on return, then
+// closes drained to signal that every byte the child emitted has reached the sink
+// (the "logs drained" edge LogsDrained exposes).
 func (p *Process) pumpLogs() {
+	defer p.closeDrained()
 	defer p.logR.Close()
 	sc := bufio.NewScanner(p.logR)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -206,11 +222,31 @@ func (p *Process) PID() int {
 // closed after Start → reap.
 func (p *Process) Done() <-chan struct{} { return p.done }
 
+// LogsDrained returns a channel closed once the log pump has copied the child's
+// combined stdout+stderr to EOF (the child closed its write end) and flushed every
+// line to the sink. It is the observable "logs fully drained" edge: the runtime
+// waits on it before snapshotting a terminated container's log tail for the
+// FallbackToLogsOnError termination message, so the final, most-diagnostic lines
+// (a panic / stack trace) are not lost to the pump-vs-reaper race — the pump drains
+// the dying child's bytes INDEPENDENTLY of the kqueue reaper that unblocks Wait.
+// Like Done it is broadcast-safe for multiple observers and exists from NewProcess;
+// it is only closed after Start (immediately when the process has no sink → no pump).
+func (p *Process) LogsDrained() <-chan struct{} { return p.drained }
+
 // State returns the current lifecycle state.
 func (p *Process) State() ProcessState {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.state
+}
+
+// closeDrained closes the drained edge exactly once. It is the single owner of
+// that close: the log pump (at EOF), the no-sink Start branch, and the failed-Start
+// returns all funnel through it, so a Process whose Start never reached the pump
+// (pipe/spawn error) still releases LogsDrained() waiters — and a retried Start
+// after such a failure can never double-close.
+func (p *Process) closeDrained() {
+	p.drainOnce.Do(func() { close(p.drained) })
 }
 
 // closePipes closes any open pipe ends (used on spawn failure).

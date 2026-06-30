@@ -17,12 +17,15 @@ limitations under the License.
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
@@ -62,6 +65,14 @@ type pod struct {
 	oomKilled  bool
 	memSampler *supervisor.MemorySampler
 	memCancel  context.CancelFunc
+
+	// cancel ends the pod-lifetime supervision context — the per-container reapers
+	// (supervisor.Process.reap) and the watchContainerExit drain-wait. It is derived
+	// from context.Background() (NOT the CreatePod request ctx, which is canceled
+	// when the unary RPC returns under the daemon split), mirroring memCancel, and
+	// is fired on pod teardown (DeletePod). Stored as the CancelFunc only — the
+	// context itself is passed down to the goroutines, never held in this struct.
+	cancel context.CancelFunc
 }
 
 // containerPIDs returns the pod's currently-running container PIDs (the memory
@@ -107,7 +118,7 @@ type containerProc struct {
 // alias via r.network.Setup and never reads it — and flows ONLY to the vm route
 // (createVMPod), where it lands in VMSpec.Network. In M5.1 it is zero-valued in
 // production (no producer wired yet; the k3sm provider populates it later).
-func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg sandbox.GuestNetworkConfig) (*pod, runtimev1.FailureReason, error) {
+func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg sandbox.GuestNetworkConfig) (_ *pod, _ runtimev1.FailureReason, retErr error) {
 	sp := box.GetSandboxProfile()
 	if sp == nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -221,23 +232,41 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		}
 	}
 
+	// Pod-lifetime supervision context. The per-container reaper and the
+	// watchContainerExit drain-wait must OUTLIVE the CreatePod RPC — under the M2
+	// daemon split the request ctx is canceled when the unary handler returns, which
+	// would otherwise make the kqueue reaper (it honors ctx) record a bogus
+	// context-canceled exit and the drain-wait snapshot an empty tail the instant
+	// CreatePod replies. So derive a fresh cancelable ctx from Background — the SAME
+	// pattern the M2.5 sampler uses — stored on the pod and fired on teardown. On a
+	// FAILED create (a later container won't start) unwind the supervision we already
+	// launched instead of leaking it; on success the cancel rides on the pod.
+	podCtx, podCancel := context.WithCancel(context.Background())
+	defer func() {
+		if retErr != nil {
+			podCancel()
+		}
+	}()
+
 	p := &pod{
 		box:     box,
 		profile: profile,
 		phase:   runtimev1.PodPhase_POD_PHASE_PENDING,
 		podIP:   ip,
+		cancel:  podCancel,
 	}
 
 	// init_containers run first, sequentially, each to completion; then the main
 	// containers start. M1 starts all main containers and tracks them; the
 	// per-container sequencing of init containers is honored by starting+waiting
-	// them in order.
+	// them in order. The supervision runs under podCtx (detached from the request
+	// ctx), so an init container's exit is reaped even after CreatePod returns.
 	for _, c := range box.GetInitContainers() {
-		cp, reason, err := r.startContainer(ctx, p, rootfs, c, true)
+		cp, reason, err := r.startContainer(podCtx, p, rootfs, c, true)
 		if err != nil {
 			return nil, reason, err
 		}
-		code, _, werr := cp.proc.Wait(ctx)
+		code, _, werr := cp.proc.Wait(podCtx)
 		if werr != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 				fmt.Errorf("init container %s wait: %w", c.GetName(), werr)
@@ -249,7 +278,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	}
 
 	for _, c := range box.GetContainers() {
-		cp, reason, err := r.startContainer(ctx, p, rootfs, c, false)
+		cp, reason, err := r.startContainer(podCtx, p, rootfs, c, false)
 		if err != nil {
 			return nil, reason, err
 		}
@@ -349,6 +378,11 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // startContainer resolves the container's binary (image path convention),
 // ad-hoc signs + gates it, and spawns it under the pod's Seatbelt profile via the
 // exec-shim backend. It returns the running containerProc.
+//
+// ctx is the pod-lifetime SUPERVISION context (createPod's podCtx; restart passes a
+// context.WithoutCancel) — NOT the CreatePod request ctx. It scopes the spawn, the
+// kqueue reaper, and the watchContainerExit drain-wait to the pod's lifetime so they
+// survive the unary RPC's return under the daemon split.
 func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
 	binPath, argv, err := r.resolveBinary(ctx, p.box, rootfs, c)
 	if err != nil {
@@ -405,8 +439,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	}
 
 	// Reap-completion goroutine: when the container exits, record terminated
-	// state, clean up the staged profile, and publish a status update. Lifetime
-	// is bounded by the process exit.
+	// state, clean up the staged profile, and publish a status update. It runs under
+	// the pod-lifetime supervision ctx (above), so it outlives the CreatePod RPC and
+	// is canceled on pod teardown.
 	go r.watchContainerExit(ctx, p, cp, cleanup)
 	return cp, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
@@ -418,6 +453,32 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	if cleanup != nil {
 		_ = cleanup()
 	}
+
+	// Wait for the container's log pump to copy the dying child's combined output to
+	// EOF BEFORE snapshotting it below for the FallbackToLogsOnError termination
+	// message. The supervisor's pump drains the final bytes — the panic / stack
+	// trace that is the most diagnostic part of a failure — INDEPENDENTLY of the
+	// kqueue reaper that just unblocked Wait; snapshotting straight away races the
+	// pump and intermittently loses those last lines. This drain-wait sits OUTSIDE
+	// pod.mu so the lock order stays leaf-ward (pod.mu → logBuffer.mu, never inverted).
+	//
+	// The wait is BOUNDED by drainGrace, independent of ctx: a pod process commonly
+	// forks a grandchild (shell → daemon) that inherits and holds the stdout/stderr
+	// pipe write-end open after the direct child exits, so the pump never reaches EOF
+	// and LogsDrained never closes. Without the timeout this select would block
+	// forever — and for a RESTARTED container ctx is a context.WithoutCancel whose
+	// Done() never fires, so LogsDrained would be the ONLY reachable arm. The
+	// terminated-status path MUST finalize regardless (else the pod shows Running
+	// while dead and restartPolicy never fires), so on the deadline we snapshot
+	// whatever the pump has buffered so far — a partial tail is still diagnostic.
+	drainTimer := time.NewTimer(r.drainGraceDuration())
+	defer drainTimer.Stop()
+	select {
+	case <-cp.proc.LogsDrained():
+	case <-drainTimer.C:
+	case <-ctx.Done():
+	}
+
 	p.mu.Lock()
 	term := &runtimev1.ContainerStateTerminated{
 		ExitCode:   int32(code),
@@ -437,6 +498,24 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	default:
 		term.Reason = "Error"
 	}
+
+	// terminationMessagePolicy=FallbackToLogsOnError: when a container FAILS (non-zero
+	// exit OR a signal-kill — including OOMKilled, sig 9 / code 137) and nothing above
+	// set a message, fill term.Message from the tail of its combined log. runtimed
+	// applies this policy UNCONDITIONALLY — there is no per-container
+	// terminationMessagePolicy in apis, and the default `File` policy is unimplementable
+	// on darwin (no /dev/termination-log bind mount), so every container is treated as
+	// FallbackToLogsOnError. That is a documented divergent-by-design choice, strictly
+	// more diagnostic than the unavoidable File-empty message. Only term.Message is
+	// touched: term.Reason keeps the tested OOMKilled/Completed/Error strings, an
+	// already-set wait-error message (above) is never clobbered, and a successful
+	// (exit-0) container keeps an empty message (upstream NodeConformance asserts that).
+	if (code != 0 || sig != 0) && term.Message == "" {
+		if msg := terminationMessageFromLogs(cp.logs); msg != "" {
+			term.Message = msg
+		}
+	}
+
 	cp.state.State = &runtimev1.ContainerState{Terminated: term}
 	r.recomputePhaseLocked(p)
 	terminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED || p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
@@ -449,6 +528,41 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	}
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+}
+
+// Upstream kubelet caps for a FallbackToLogsOnError termination message sourced from
+// the container LOG (kubernetes/pkg/kubelet/container/helpers.go):
+// MaxContainerTerminationMessageLogLines (80) and
+// MaxContainerTerminationMessageLogLength (2048). These are the LOG-fallback caps;
+// the larger 4096 cap is the /dev/termination-log File-read cap, which does NOT apply
+// here — the File policy is unimplementable on darwin (see watchContainerExit).
+const (
+	maxTerminationMessageLogLines = 80
+	maxTerminationMessageLogBytes = 2048
+)
+
+// terminationMessageFromLogs renders a FallbackToLogsOnError termination message from
+// the tail of a container's combined (stdout+stderr) log: the last
+// maxTerminationMessageLogLines lines joined with "\n", then truncated tail-biased to
+// the last maxTerminationMessageLogBytes bytes (the most recent output is the most
+// diagnostic). It returns "" when the log is empty.
+func terminationMessageFromLogs(logs *logBuffer) string {
+	lines := logs.snapshot(maxTerminationMessageLogLines)
+	if len(lines) == 0 {
+		return ""
+	}
+	msg := bytes.Join(lines, []byte("\n"))
+	if len(msg) > maxTerminationMessageLogBytes {
+		msg = msg[len(msg)-maxTerminationMessageLogBytes:]
+		// The byte-count tail cut can land inside a multi-byte UTF-8 rune, leaving
+		// orphan continuation bytes at the front. Advance to the next rune boundary
+		// so term.Message is valid UTF-8 — this only ever TRIMS, so the <=2048-byte
+		// cap still holds (the tail end, the most diagnostic bytes, is untouched).
+		for len(msg) > 0 && !utf8.RuneStart(msg[0]) {
+			msg = msg[1:]
+		}
+	}
+	return string(msg)
 }
 
 // recomputePhaseLocked updates the pod phase from its containers' states. Caller

@@ -175,6 +175,12 @@ type Runtime struct {
 	// paths are unit-testable with a recorder.
 	signalGroup func(pgid int, sig os.Signal) error
 
+	// drainGrace bounds watchContainerExit's wait for a terminated container's log
+	// pump to reach EOF before snapshotting the FallbackToLogsOnError message; 0
+	// selects defaultDrainGrace. It is a field (not a const) so tests can shrink it
+	// for fast, deterministic runs — there is no clock seam in this package.
+	drainGrace time.Duration
+
 	mu   sync.Mutex
 	pods map[string]*pod
 }
@@ -321,6 +327,22 @@ func (r *Runtime) sampleInterval() time.Duration {
 		return r.cfg.SampleInterval
 	}
 	return time.Second
+}
+
+// defaultDrainGrace bounds the log-drain wait when a leaked/inherited stdout+stderr
+// pipe write-end (a forked grandchild that outlives the direct child) defers the
+// supervisor pump's EOF indefinitely. It is small: the terminated-status path must
+// finalize promptly with whatever tail is buffered, not wedge the pod in Running.
+const defaultDrainGrace = 2 * time.Second
+
+// drainGraceDuration is the bounded wait (Runtime.drainGrace, default
+// defaultDrainGrace) watchContainerExit gives the log pump to reach EOF before it
+// snapshots the terminated container's log tail.
+func (r *Runtime) drainGraceDuration() time.Duration {
+	if r.drainGrace > 0 {
+		return r.drainGrace
+	}
+	return defaultDrainGrace
 }
 
 // defaultSigner is the production Signer backed by the image package's codesign
