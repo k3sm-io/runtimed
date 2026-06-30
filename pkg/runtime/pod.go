@@ -17,6 +17,7 @@ limitations under the License.
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -418,6 +419,20 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	if cleanup != nil {
 		_ = cleanup()
 	}
+
+	// Wait for the container's log pump to copy the dying child's combined output to
+	// EOF BEFORE snapshotting it below for the FallbackToLogsOnError termination
+	// message. The supervisor's pump drains the final bytes — the panic / stack
+	// trace that is the most diagnostic part of a failure — INDEPENDENTLY of the
+	// kqueue reaper that just unblocked Wait; snapshotting straight away races the
+	// pump and intermittently loses those last lines. This drain-wait sits OUTSIDE
+	// pod.mu so the lock order stays leaf-ward (pod.mu → logBuffer.mu, never
+	// inverted), and honors ctx so a torn-down supervision can't wedge it.
+	select {
+	case <-cp.proc.LogsDrained():
+	case <-ctx.Done():
+	}
+
 	p.mu.Lock()
 	term := &runtimev1.ContainerStateTerminated{
 		ExitCode:   int32(code),
@@ -437,6 +452,24 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	default:
 		term.Reason = "Error"
 	}
+
+	// terminationMessagePolicy=FallbackToLogsOnError: when a container FAILS (non-zero
+	// exit OR a signal-kill — including OOMKilled, sig 9 / code 137) and nothing above
+	// set a message, fill term.Message from the tail of its combined log. runtimed
+	// applies this policy UNCONDITIONALLY — there is no per-container
+	// terminationMessagePolicy in apis, and the default `File` policy is unimplementable
+	// on darwin (no /dev/termination-log bind mount), so every container is treated as
+	// FallbackToLogsOnError. That is a documented divergent-by-design choice, strictly
+	// more diagnostic than the unavoidable File-empty message. Only term.Message is
+	// touched: term.Reason keeps the tested OOMKilled/Completed/Error strings, an
+	// already-set wait-error message (above) is never clobbered, and a successful
+	// (exit-0) container keeps an empty message (upstream NodeConformance asserts that).
+	if (code != 0 || sig != 0) && term.Message == "" {
+		if msg := terminationMessageFromLogs(cp.logs); msg != "" {
+			term.Message = msg
+		}
+	}
+
 	cp.state.State = &runtimev1.ContainerState{Terminated: term}
 	r.recomputePhaseLocked(p)
 	terminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED || p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
@@ -449,6 +482,34 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	}
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+}
+
+// Upstream kubelet caps for a FallbackToLogsOnError termination message sourced from
+// the container LOG (kubernetes/pkg/kubelet/container/helpers.go):
+// MaxContainerTerminationMessageLogLines (80) and
+// MaxContainerTerminationMessageLogLength (2048). These are the LOG-fallback caps;
+// the larger 4096 cap is the /dev/termination-log File-read cap, which does NOT apply
+// here — the File policy is unimplementable on darwin (see watchContainerExit).
+const (
+	maxTerminationMessageLogLines = 80
+	maxTerminationMessageLogBytes = 2048
+)
+
+// terminationMessageFromLogs renders a FallbackToLogsOnError termination message from
+// the tail of a container's combined (stdout+stderr) log: the last
+// maxTerminationMessageLogLines lines joined with "\n", then truncated tail-biased to
+// the last maxTerminationMessageLogBytes bytes (the most recent output is the most
+// diagnostic). It returns "" when the log is empty.
+func terminationMessageFromLogs(logs *logBuffer) string {
+	lines := logs.snapshot(maxTerminationMessageLogLines)
+	if len(lines) == 0 {
+		return ""
+	}
+	msg := bytes.Join(lines, []byte("\n"))
+	if len(msg) > maxTerminationMessageLogBytes {
+		msg = msg[len(msg)-maxTerminationMessageLogBytes:]
+	}
+	return string(msg)
 }
 
 // recomputePhaseLocked updates the pod phase from its containers' states. Caller

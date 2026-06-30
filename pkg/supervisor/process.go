@@ -82,7 +82,8 @@ type Process struct {
 	logR *os.File // read end of the combined-log pipe (parent side)
 	logW *os.File // write end handed to the child (closed in parent after spawn)
 
-	done chan struct{} // closed once the process is reaped
+	done    chan struct{} // closed once the process is reaped
+	drained chan struct{} // closed once the log pump has copied output to EOF
 }
 
 // NewProcess builds a Process. spawner and waiter are the spawn/reap seams; spec
@@ -95,6 +96,7 @@ func NewProcess(spawner Spawner, waiter ExitWaiter, spec SpawnSpec, sink LogSink
 		sink:    sink,
 		state:   StateInit,
 		done:    make(chan struct{}),
+		drained: make(chan struct{}),
 	}
 }
 
@@ -139,14 +141,21 @@ func (p *Process) Start(ctx context.Context) error {
 
 	if p.sink != nil {
 		go p.pumpLogs()
+	} else {
+		// No sink → no log pump → nothing to drain; make the edge immediately
+		// observable so LogsDrained() never blocks a waiter on a sink-less process.
+		close(p.drained)
 	}
 	go p.reap(ctx, pid)
 	return nil
 }
 
 // pumpLogs streams the combined-output pipe to the sink until EOF (child closed
-// its fds / exited). It is the sole reader of logR and closes it on return.
+// its fds / exited). It is the sole reader of logR and closes it on return, then
+// closes drained to signal that every byte the child emitted has reached the sink
+// (the "logs drained" edge LogsDrained exposes).
 func (p *Process) pumpLogs() {
+	defer close(p.drained)
 	defer p.logR.Close()
 	sc := bufio.NewScanner(p.logR)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -205,6 +214,17 @@ func (p *Process) PID() int {
 // reaper stays the sole reaper. The channel exists from NewProcess; it is only
 // closed after Start → reap.
 func (p *Process) Done() <-chan struct{} { return p.done }
+
+// LogsDrained returns a channel closed once the log pump has copied the child's
+// combined stdout+stderr to EOF (the child closed its write end) and flushed every
+// line to the sink. It is the observable "logs fully drained" edge: the runtime
+// waits on it before snapshotting a terminated container's log tail for the
+// FallbackToLogsOnError termination message, so the final, most-diagnostic lines
+// (a panic / stack trace) are not lost to the pump-vs-reaper race — the pump drains
+// the dying child's bytes INDEPENDENTLY of the kqueue reaper that unblocks Wait.
+// Like Done it is broadcast-safe for multiple observers and exists from NewProcess;
+// it is only closed after Start (immediately when the process has no sink → no pump).
+func (p *Process) LogsDrained() <-chan struct{} { return p.drained }
 
 // State returns the current lifecycle state.
 func (p *Process) State() ProcessState {

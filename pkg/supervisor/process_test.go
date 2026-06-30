@@ -153,6 +153,52 @@ func TestProcessLogCapture(t *testing.T) {
 	}
 }
 
+// TestProcessLogsDrained checks the drain edge: with a sink, LogsDrained closes only
+// AFTER the pump has flushed every line to the sink (the B11 "logs fully drained"
+// guarantee watchContainerExit relies on); with no sink there is no pump, so it is
+// closed at Start.
+func TestProcessLogsDrained(t *testing.T) {
+	t.Run("closes-after-all-lines-flushed", func(t *testing.T) {
+		sp := &fakeSpawner{pid: 1, logLine: "final-diagnostic-line"}
+		var mu sync.Mutex
+		var got []string
+		sink := func(line []byte) {
+			mu.Lock()
+			got = append(got, string(line))
+			mu.Unlock()
+		}
+		p := NewProcess(sp, fakeWaiter{code: 1, delay: 20 * time.Millisecond},
+			SpawnSpec{Path: "/bin/echo", Argv: []string{"/bin/echo"}}, sink)
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		select {
+		case <-p.LogsDrained():
+		case <-time.After(2 * time.Second):
+			t.Fatal("LogsDrained did not close")
+		}
+		// Once drained, every emitted line is already in the sink.
+		mu.Lock()
+		defer mu.Unlock()
+		if len(got) != 1 || got[0] != "final-diagnostic-line" {
+			t.Fatalf("after drain, sink = %v, want [final-diagnostic-line]", got)
+		}
+	})
+
+	t.Run("no-sink-drained-at-start", func(t *testing.T) {
+		p := NewProcess(&fakeSpawner{pid: 2}, fakeWaiter{code: 0},
+			SpawnSpec{Path: "/x", Argv: []string{"/x"}}, nil)
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		select {
+		case <-p.LogsDrained():
+		case <-time.After(time.Second):
+			t.Fatal("LogsDrained must be closed for a sink-less process")
+		}
+	})
+}
+
 // TestSpawnFailure surfaces a spawn error and leaves the process unstarted.
 func TestSpawnFailure(t *testing.T) {
 	boom := errors.New("posix_spawn boom")
