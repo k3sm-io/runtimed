@@ -383,6 +383,87 @@ phases:
             check: VMBackend.Available() reports false on a host WITHOUT the com.apple.security.virtualization entitlement and does NOT crash (the safe probe never constructs/boots a VM); the CGO_ENABLED=0 lane builds via the vm_other.go stub
             method: unit
             test: pkg/sandbox.TestVMBackendAvailableFalseWithoutEntitlement + TestVMBackendAvailableComposition
+
+  - id: M7
+    title: Public CI workflow + SkipUnless conversions (release-engineering slice)
+    status: todo
+    depends_on:
+      - apis:M7.1
+    subphases:
+      - id: M7.1
+        title: public CI workflow + SkipUnless conversions
+        status: todo
+        size: M
+        strategy: hard cut
+        strategy_rationale: release infrastructure is additive — a new thin GitHub Actions workflow wrapping the existing hack/ci.sh, a mechanical raw-t.Skip→SkipUnless conversion, and a README header; no runtime, proto, or datastore change. One signed binary, one deploy.
+        deliverables:
+          - id: M7.1-d1
+            done: false
+            desc: .github/workflows/ci.yml — a THIN wrapper over the existing hack/ci.sh (no logic duplication) on macos-15 arm64 runners, CGO_ENABLED=1; runs unit + -race + the internal/spicanary symbol-canary on EVERY matrix image (the canary is the runner-macOS-15-vs-target-macOS-26 skew tripwire, m7-plan M7.2)
+          - id: M7.1-d2
+            done: false
+            desc: convert this repo's raw t.Skip integration sites to the apis-hosted k3smtest.SkipUnless(t, cap) helper (m7-plan Resolution 4) over the owned capability taxonomy (root/lo0/utun/pf/clang/apple-gpu/macos-26/network); the lint scope is integration ∥ e2e tags and no raw t.Skip remains in those files
+          - id: M7.1-d3
+            done: false
+            desc: README.md — a "part of k3sm" front-door header (badges, the one-line pitch, a pointer to the workspace) refreshing the pre-launch scaffold copy
+        acceptance:
+          - id: M7.1-a1
+            met: false
+            check: the PR CI workflow runs green on GitHub Actions (macos-15 arm64, CGO_ENABLED=1) with the internal/spicanary symbol-canary executing on every matrix image
+            method: integration
+          - id: M7.1-a2
+            met: false
+            check: no raw t.Skip remains in -tags integration (∥ e2e) files — every integration skip routes through the apis-hosted k3smtest.SkipUnless (the lint)
+            method: build
+
+  - id: M8
+    title: MLX — native Apple-Silicon ML serving (runtimed slice — Metal SBPL + egress + tree signing + GPUFacts + OCI unpacker)
+    status: todo
+    depends_on:
+      - apis:M8.1
+    subphases:
+      - id: M8.2
+        title: Metal SBPL + egress branch + tree signing + GPUFacts + OCI-layer unpacker
+        status: todo
+        size: L
+        strategy: hard cut
+        strategy_rationale: additive — the new SandboxProfile booleans (allow_gpu, allow_internet_egress) default false so an old runtimed ignores them and an old provider never sets them (no provider↔runtimed phased exception); the proto fields are carved from the reserved bands in apis:M8.1; the host-process Seatbelt path and existing golden SBPL fixtures stay byte-green. One signed binary.
+        deliverables:
+          - id: M8.2-d0
+            done: false
+            desc: pkg/image — OCI-layer unpacker producing a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. PREREQUISITE (m8-plan Phase B Resolution 1) — today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder, so the whole M8 product path is blocked on this substrate; d3 AdHocSignTree walks and clonefiles from it
+          - id: M8.2-d1
+            done: false
+            desc: pkg/sandbox/metal.go — the S1-derived Metal SBPL allow-set behind allow_gpu, expressed as per-chip-family data (AGX user-client class names vary M1→M4) with golden SBPL fixtures per family in pkg/sandbox/testdata; launch families SCOPED to the dev-mac's own family for v1 (Resolution 15), an unknown/absent family FAILS CLOSED (sandbox_gpu_supported=false + metal.go errors on a family miss, Resolution 14), and the shader-cache write scope is CONTRACT-BOUNDED (per-pod redirect or an enumerated narrow subpath) NOT denial-log-derived (Resolution 11). Emitted in the existing rule order (allows → protected denies → narrow re-allows)
+          - id: M8.2-d2
+            done: false
+            desc: pkg/sandbox — IP-scoped egress branch behind allow_internet_egress. The wide allow is (allow network-outbound (remote ip …)) — NEVER unqualified (AF_UNIX stays default-denied) — followed last-match-wins by RANGE-BASED host-local denies (the whole of 127/8 incl. kine's plaintext datastore, 169.254/16, all of 100.64/10, the node's RFC1918 subnets) with tier-3 re-allows for the pod's own IP + the cluster DNS/apiserver VIPs (Resolution 12); allow_internet_egress IMPLIES allow_network so DNS-VIP routing is preserved. sandbox.Validate gains an s-expression-aware (balanced-paren token scan) reject-unfiltered-network-outbound check (Resolution 13)
+          - id: M8.2-d3
+            done: false
+            desc: pkg/image — AdHocSignTree beside AdHocSign, run ONCE at pull/materialize time over the d0 content-addressed tree (policy-keyed variant); in-process Mach-O magic detection, signs only invalid/unsigned Mach-Os (ad-hoc signatures are content-addressed and survive clonefile — never de-CoW a clean file); CONTAINMENT-CHECKED (lstat, never follow symlinks/hardlinks, every candidate resolves under the rootfs) and STRUCTURALLY UNREACHABLE under REQUIRE_SIGNED/REQUIRE_NOTARIZED. gateSignature (pkg/runtime/pod.go) becomes check-then-sign-only-if-invalid — no unconditional -f re-sign, which would de-CoW argv[0] every start (Resolution 13) — and keeps verifying argv[0] only per start
+          - id: M8.2-d4
+            done: false
+            desc: pkg/sandbox (or pkg/runtime) — GPUFacts population for GetRuntimeInfoResponse.gpu (field 100, apis:M8.1). Sysctls + a FUNCTIONAL Metal compile+dispatch probe (cgo-isolated in *_darwin.go), NOT a nil-check — the probe DISCRIMINATES the VZ paravirtual Metal device (MTLCreateSystemDefaultDevice is non-nil in VZ guests incl. GitHub macOS runners, so a VM node must never advertise GPU); populates iogpu_wired_limit_bytes with the explicit 0-sentinel (kernel default, not "unknown"), recommended_max_working_set_bytes (the MTLDevice working-set ceiling), and sandbox_gpu_supported scoped to the currently selected backend
+          - id: M8.2-d5
+            done: false
+            desc: pkg/supervisor — CONTINGENT / PRE-AUTHORIZED (Resolution 18, default NOT built). Spike S3(5) verifies the S5-engine winner's process model against the sampler's leader-PID-only coverage (pod.go containerPIDs); IF the engine forks, a proc_listpids(PROC_PGRP_ONLY, …) pgid-enumeration deliverable (public libproc, the rusage_darwin.go pattern + an internal/spicanary entry) is pre-authorized. Default disposition — pin the winner single-process at M8.4
+        acceptance:
+          - id: M8.2-a1
+            met: false
+            check: golden SBPL tests assert the generated profile — allow_gpu on/off (per-family Metal allow-set), the egress filter + last-match-wins ordering, the range-based deny ordering, and adversarially-formatted profiles rejected by the s-expression-aware Validate
+            method: unit
+          - id: M8.2-a2
+            met: false
+            check: AdHocSignTree table test with a fake signer — hardlink/symlink escape cases rejected (containment), non-Mach-O skipped, already-signed skipped, policy gating (unreachable under REQUIRE_SIGNED/REQUIRE_NOTARIZED)
+            method: unit
+          - id: M8.2-a3
+            met: false
+            check: materialize-then-exec integration test — the d0 unpacker produces an unpacked tree that createPod materializes via MaterializeTree and execs argv[0] out of a multi-layer image
+            method: integration
+          - id: M8.2-a4
+            met: false
+            check: a real MLX matmul (full inference round-trip) runs under the generated allow_gpu profile on a GPU dev-mac (integration tier, k3smtest.SkipUnless(t, "apple-gpu"))
+            method: integration
 ---
 
 # runtimed — Phase roadmap
@@ -740,6 +821,92 @@ This chunk delivers the **verifiable foundation + the VZ scaffold**; the live bo
 - ✅ `M5.1-a4` `VMBackend.Available()` is **false** on a host without the entitlement and does **not** crash
   (the safe probe never constructs/boots a VM); the `CGO_ENABLED=0` lane builds via the `vm_other.go` stub —
   `pkg/sandbox.TestVMBackendAvailableFalseWithoutEntitlement` + `TestVMBackendAvailableComposition`.
+
+## M7 — Public CI workflow + SkipUnless conversions ⬜
+**Cross-repo dep:** `apis:M7.1` (the DAG-legal home for the shared `k3smtest.SkipUnless(t, cap)` helper +
+its owned capability taxonomy — `runtimed`, `darwin-net`, and `k3sm` all import it; a leaf copy would
+drift or force a sideways import; m7-plan Resolution 4). runtimed's M7 slice is the **release-engineering
+plumbing**: a public CI workflow + the skip-site conversion, not a runtime change.
+
+### M7.1 — public CI workflow + SkipUnless conversions ⬜
+**Strategy: hard cut** — additive release infrastructure (a thin workflow, a mechanical conversion, a
+README header); no runtime/proto/datastore change. One signed binary.
+**Deliverables**
+- ⬜ `M7.1-d1` `.github/workflows/ci.yml`: a **thin** wrapper over the existing `hack/ci.sh` (no logic
+  duplication) on **macos-15 arm64** runners, `CGO_ENABLED=1`; unit + `-race` + the `internal/spicanary`
+  **symbol-canary on every matrix image** (the canary is the runner-macOS-15-vs-target-macOS-26 skew
+  tripwire; m7-plan M7.2).
+- ⬜ `M7.1-d2` convert this repo's raw `t.Skip` integration sites to the **apis-hosted**
+  `k3smtest.SkipUnless(t, cap)` helper (m7-plan **Resolution 4**) over the owned capability taxonomy
+  (`root`/`lo0`/`utun`/`pf`/`clang`/`apple-gpu`/`macos-26`/`network`); the lint scope is `integration ∥ e2e`
+  tags and **no raw `t.Skip`** remains in those files.
+- ⬜ `M7.1-d3` `README.md`: a **"part of k3sm"** front-door header (badges, one-line pitch, a workspace
+  pointer) refreshing the pre-launch scaffold copy.
+
+**Acceptance (exit gate)**
+- ⬜ `M7.1-a1` the PR CI workflow runs **green** on GitHub Actions (macos-15 arm64, `CGO_ENABLED=1`) with the
+  symbol-canary executing on every matrix image.
+- ⬜ `M7.1-a2` **no raw `t.Skip`** in `-tags integration` (∥ `e2e`) files — every integration skip routes
+  through the apis-hosted `k3smtest.SkipUnless` (the lint).
+
+## M8 — MLX: native Apple-Silicon ML serving (runtimed slice) ⬜
+**Cross-repo dep:** `apis:M8.1` (the `SandboxProfile` booleans `allow_gpu = 102` / `allow_internet_egress
+= 103` and the `GetRuntimeInfoResponse.gpu = 100` `GPUFacts` message, all carved from the reserved bands).
+DAG: `M8.1 apis → M8.2 runtimed`. runtimed owns **M8.2 (size L)** — the heaviest M8 sub-phase; product
+design `k3sm/docs/DESIGN.md` §5a/§5c, security posture `docs/privilege-model.md`.
+
+### M8.2 — Metal SBPL + egress branch + tree signing + GPUFacts + OCI-layer unpacker ⬜ (L)
+**Strategy: hard cut** — the new `SandboxProfile` booleans default false (an old runtimed ignores them, an
+old provider never sets them — **no** provider↔runtimed phased exception), the proto fields ride the
+reserved bands (`apis:M8.1`), and the host-process Seatbelt path + existing golden SBPL fixtures stay
+**byte-green**. One signed binary.
+**Deliverables**
+- ⬜ `M8.2-d0` **(PREREQUISITE, m8-plan Resolution 1)** `pkg/image`: an **OCI-layer unpacker** →
+  per-image **unpacked content-addressed tree** (digest+policy-keyed), applied via a **containment-checked
+  tar apply** (symlink/hardlink-safe, `com.apple.quarantine`-xattr discipline per `clone.go`, same-APFS-
+  volume placement per `cache.go`), wired into `pkg/runtime.createPod` via `MaterializeTree`. Today only
+  **compressed** layer blobs exist (`blobs/<algo>/<hex>`) and `resolveBinary` is the M1 materialization
+  placeholder, so the **whole M8 product path is blocked on this substrate**; `d3` `AdHocSignTree` walks
+  and clonefiles from it.
+- ⬜ `M8.2-d1` `pkg/sandbox/metal.go`: the S1-derived Metal SBPL allow-set behind `allow_gpu`, **per-chip-
+  family data** (AGX user-client class names vary M1→M4) with **golden SBPL fixtures per family** in
+  `pkg/sandbox/testdata`; launch families **scoped to the dev-mac's own** for v1 (**Res. 15**), an
+  **unknown/absent family fails closed** (`sandbox_gpu_supported=false` + `metal.go` errors on a family
+  miss, **Res. 14**), and the shader-cache write scope is **contract-bounded** (per-pod redirect or an
+  enumerated narrow subpath), **not** denial-log-derived (**Res. 11**). Emitted in the existing rule order
+  (allows → protected denies → narrow re-allows).
+- ⬜ `M8.2-d2` `pkg/sandbox`: an **IP-scoped egress branch** behind `allow_internet_egress` — the wide
+  allow is `(allow network-outbound (remote ip …))`, **never unqualified** (AF_UNIX stays default-denied),
+  followed (last-match-wins) by **range-based** host-local denies (the whole of **127/8** incl. kine's
+  plaintext datastore, **169.254/16**, all of **100.64/10**, the node's **RFC1918** subnets) + **tier-3
+  re-allows** for the pod's own IP + the cluster DNS/apiserver VIPs (**Res. 12**); `allow_internet_egress`
+  **implies `allow_network`** so DNS-VIP routing is preserved. `sandbox.Validate` gains an
+  **s-expression-aware** (balanced-paren token scan) **reject-unfiltered-`network-outbound`** check
+  (**Res. 13**).
+- ⬜ `M8.2-d3` `pkg/image`: **`AdHocSignTree`** beside `AdHocSign`, run **once at materialize time** over
+  the `d0` content-addressed tree; **containment-checked** (lstat, never follow symlinks/hardlinks) and
+  **structurally unreachable** under `REQUIRE_SIGNED`/`REQUIRE_NOTARIZED`. `gateSignature`
+  (`pkg/runtime/pod.go`) becomes **check-then-sign-only-if-invalid** (no unconditional `-f` re-sign — it
+  would de-CoW `argv[0]` every start) and keeps verifying `argv[0]` only per start (**Res. 13**).
+- ⬜ `M8.2-d4` **`GPUFacts`** population (field `100`): sysctls + a **functional** Metal compile+dispatch
+  probe that **discriminates the VZ paravirtual device** (`MTLCreateSystemDefaultDevice` is non-nil in VZ
+  guests incl. GitHub macOS runners — a VM node must never advertise GPU; a **functional compile+dispatch,
+  not a nil-check**), the `iogpu` **0-sentinel** + `recommendedMaxWorkingSetSize`, and
+  `sandbox_gpu_supported` scoped to the **currently selected backend**.
+- ⬜ `M8.2-d5` **contingent / pre-authorized** (`pkg/supervisor`, **Res. 18**, default **not** built): spike
+  `S3(5)` verifies the S5-engine process model against the sampler's **leader-PID-only** coverage; a
+  **pgid-enumeration** deliverable (`proc_listpids(PROC_PGRP_ONLY, …)`) is **pre-authorized** if the engine
+  forks (default — pin the winner single-process at M8.4).
+
+**Acceptance (exit gate)**
+- ⬜ `M8.2-a1` **golden SBPL tests** — `allow_gpu` on/off, egress filter + ordering, deny-ordering,
+  adversarial formatting rejected by the s-expr-aware `Validate`.
+- ⬜ `M8.2-a2` **`AdHocSignTree` table test** with a fake signer + hardlink/symlink escape cases (non-Mach-O
+  skip, already-signed skip, policy gating).
+- ⬜ `M8.2-a3` **materialize-then-exec integration test** — the `d0` unpacker produces a tree `createPod`
+  materializes via `MaterializeTree` and execs `argv[0]` out of a multi-layer image.
+- ⬜ `M8.2-a4` a **real MLX matmul** (full inference round-trip) under the generated `allow_gpu` profile on a
+  GPU dev-mac (integration tier, `k3smtest.SkipUnless(t, "apple-gpu")`).
 
 ## Next
 M1, M2, and M3 are complete at the **runtimed unit-provable level**. M2 (the **stockkitty-readiness**
