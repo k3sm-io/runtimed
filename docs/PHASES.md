@@ -2,7 +2,7 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M5
-updated: 2026-06-27
+updated: 2026-07-02
 updated_by: agent
 
 phases:
@@ -464,6 +464,78 @@ phases:
             met: false
             check: a real MLX matmul (full inference round-trip) runs under the generated allow_gpu profile on a GPU dev-mac (integration tier, k3smtest.SkipUnless(t, "apple-gpu"))
             method: integration
+
+  - id: M10
+    title: Kubernetes conformance hardening (runtimed slice — per-pod-IP podnet adapter + workload-execution fidelity)
+    status: todo
+    depends_on:
+      - apis:M10.2
+    subphases:
+      - id: M10.1
+        title: per-pod-IP — podnet adapter over the NodeNetwork no-op seam (converge on the runtimed path)
+        status: todo
+        size: M
+        strategy: phased (named exception: VK provider ↔ runtimed gRPC contract)
+        strategy_rationale: >-
+          m10-plan Res.1 — M10.1 is real cross-repo adapter wiring, not a hardcode deletion: today
+          runtime.go:280 wires supervisor.NodeNetwork{} (a no-op seam that returns the node IP, so
+          translate.go:877 reads back ≈nodeIP), and the HostProcess os/exec path is REJECTED for
+          per-pod IP (no bind discipline → a cosmetic /32 the server never binds). Converging the
+          pod-IP path on runtimed likely flips the DEFAULT runtime to runtimed (HostProcess → an
+          explicit rootless-dev opt-in) — a provider↔runtimed contract change rolled per the named
+          exception; the SBPL bind-scope already exists so the SBPL/golden path stays byte-green.
+        deliverables:
+          - id: M10.1-d1
+            done: false
+            desc: pkg/supervisor + pkg/runtime — replace supervisor.NodeNetwork{} (runtime.go:280 — the no-op seam whose Setup returns the node IP) with an ADAPTER over darwin-net's podnet.Network, bridging the two PodNetwork interfaces (supervisor's Setup returns string, podnet's returns netip.Addr) through a NAMED seam — an adapter type, not open-coded per call site — so translate.go:877 reads back a distinct per-pod /32 instead of ≈nodeIP (m10-plan Res.1)
+          - id: M10.1-d2
+            done: false
+            desc: pkg/supervisor — IPAM ownership is a PASS-THROUGH — darwin-net stays the sole node-/24 IPAM owner (253/node via podnet.Network); runtimed's seam allocates nothing and adds no second allocator. The existing SBPL bind-scope (sbpl.go:290 `(allow network-bind (local ip "<PodIP>:*"))`) already consumes the real /32, so it is byte-unchanged and now scopes the pod to its own distinct address rather than the node IP
+          - id: M10.1-d3
+            done: false
+            desc: docs — record the load-bearing decision that converging per-pod IP on the runtimed path likely makes runtimed the DEFAULT runtime (HostProcess → an explicit rootless-dev opt-in), documented at the adapter seam; the HostProcess os/exec per-pod-IP option is REJECTED (INADDR_ANY wildcard bind → a Potemkin /32 the server never binds; two same-node pods collide on shared lo0) per m10-plan Correction 2 / Res.1
+        acceptance:
+          - id: M10.1-a1
+            met: false
+            check: a pod created through the runtimed path is assigned a DISTINCT per-pod /32 from the podnet adapter (not ≈nodeIP), read back via the pod-status path; two pods on the same node get different IPs. Golden/table test over the adapter seam plus a materialize-then-exec integration test proving the podnet adapter allocates and binds a real /32 end-to-end
+            method: unit
+            test: pkg/runtime.TestCreatePodAssignsDistinctPodIP (golden/table) + pkg/supervisor.TestPodNetAdapterMaterializeThenExec (integration)
+          - id: M10.1-a2
+            met: false
+            check: the podnet seam is a pass-through — runtimed allocates no IP itself (darwin-net's podnet.Network is the sole allocator) and the existing SBPL bind-scope consumes the adapter's /32 unchanged (golden SBPL stays byte-green)
+            method: unit
+            test: pkg/supervisor.TestPodNetAdapterIsPassThrough + pkg/sandbox.TestGenerateGolden (unchanged)
+      - id: M10.2
+        title: workload-execution fidelity — native sidecar lifecycle + subPath volume materialization
+        status: todo
+        size: L
+        strategy: phased (named exception: apis CRD/proto change (consumer-first))
+        strategy_rationale: >-
+          m10-plan Res.8 — the sidecar signal (initContainer restartPolicy:Always) cannot cross the
+          provider↔runtimed gRPC contract today: the Container proto has no restart_policy field and
+          translate.go:507 drops it. The field is added in apis:M10.2 (wave 1, consumer-first: runtimed
+          ships the tolerant reader first), NEVER a k3sm.io/* annotation. subPath is a self-contained
+          hard-cut materialization addition (B77). One signed binary.
+        depends_on:
+          - apis:M10.2
+        deliverables:
+          - id: M10.2-d1
+            done: false
+            desc: pkg/supervisor + pkg/runtime — native sidecar process lifecycle keyed on the new apis Container.restart_policy field (apis:M10.2): a long-running initContainer with restartPolicy:Always is STARTED before the main containers and STAYS RUNNING during them (rather than run-to-completion), and pod teardown stops sidecars in REVERSE start order after the main containers exit. Consumer-first tolerant reader — a container with restart_policy unset behaves exactly as an M2 init/regular container (no behavior change until the provider sets the field)
+          - id: M10.2-d2
+            done: false
+            desc: pkg/mount — subPath volume materialization (B77) — volumeMounts[].subPath mounts a SUB-DIRECTORY of the source volume at the mount path (not the whole volume), rebased under the pod data volume like every other mount (no mount namespace), with the same "../" escape rejection as M2.2 Materialize so a subPath cannot climb out of its source
+        acceptance:
+          - id: M10.2-a1
+            met: false
+            check: an initContainer with restartPolicy:Always (native sidecar) is started before the main containers, STAYS RUNNING while they run, and is torn down in reverse order after they exit; a container with restart_policy unset is unchanged from M2. Root-free with fake spawn/reaper seams
+            method: unit
+            test: pkg/runtime.TestNativeSidecarStaysRunning + pkg/supervisor.TestSidecarReverseOrderTeardown
+          - id: M10.2-a2
+            met: false
+            check: a volumeMount with subPath materializes only the named sub-directory of the source volume at the mount path (inside the pod data volume), and a subPath attempting a "../" escape is rejected
+            method: unit
+            test: pkg/mount.TestVolumeSubPathMaterialization + pkg/mount.TestVolumeSubPathRejectsEscape
 ---
 
 # runtimed — Phase roadmap
