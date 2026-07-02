@@ -1,5 +1,7 @@
 # runtimed — k3sm native macOS runtime
 
+> Part of **[k3sm](https://github.com/k3sm-io/k3sm)** — a macOS-native Kubernetes distribution for Apple Silicon. Start at the [k3sm repo](https://github.com/k3sm-io/k3sm) for the product overview and quickstart.
+
 `k3sm.io/runtimed` is the native-Darwin container runtime for
 [k3sm](https://github.com/k3sm-io/k3sm) — the rough analog of containerd. It turns a Kubernetes Pod
 spec into isolated, resource-limited **native arm64 processes** (no Linux, **no chroot**):
