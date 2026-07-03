@@ -25,6 +25,8 @@ import (
 	"sort"
 	"strings"
 
+	"k3sm.io/runtimed/pkg/image"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -81,6 +83,14 @@ func (l *Layout) CredentialPaths() []string {
 // is rejected (fail closed). A persistentVolumeClaim mount is SKIPPED here — it is
 // durable and lifecycle-decoupled, bound by pkg/volume to a stable dir outside the
 // pod tree (M3.1), not materialized into the pod data volume.
+// seenMount is the identity that claimed a rebased destination in the conflict
+// guard: the volume name plus its subPath selection (a destination holds exactly
+// one selection on k3sm's mount-namespace-free shared tree).
+type seenMount struct {
+	name    string
+	subPath string
+}
+
 func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP string, r Resolver) (*Layout, error) {
 	dataVol = filepath.Clean(dataVol)
 	volumes := make(map[string]*runtimev1.Volume, len(box.GetVolumes()))
@@ -89,7 +99,10 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 	}
 
 	layout := &Layout{}
-	seen := make(map[string]string) // target path -> volume name (conflict guard)
+	// conflict guard: rebased destination -> the (volume, subPath) that claimed it.
+	// The subPath is part of the identity because k3sm has no mount namespace, so a
+	// single on-disk destination can hold exactly one selection.
+	seen := make(map[string]seenMount)
 
 	containers := make([]*runtimev1.Container, 0, len(box.GetInitContainers())+len(box.GetContainers()))
 	containers = append(containers, box.GetInitContainers()...)
@@ -107,25 +120,41 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 			if vol.GetPersistentVolumeClaim() != nil {
 				continue
 			}
-			target, err := resolveTarget(dataVol, vm.GetMountPath(), vm.GetSubPath())
+			// The destination is the rebased mount path ONLY — subPath selects a
+			// source element (applied below), it is NOT folded into the destination.
+			dest, err := resolveTarget(dataVol, vm.GetMountPath())
 			if err != nil {
 				return nil, fmt.Errorf("volume %s: %w", vm.GetName(), err)
 			}
-			if prev, dup := seen[target]; dup {
-				if prev == vm.GetName() {
-					continue // same volume mounted into multiple containers at the same path
+			// The conflict guard keys on the destination (rebased mount path, no
+			// subPath): two subPaths of one volume at DIFFERENT mount paths do not
+			// false-conflict. A repeat of the SAME (volume, subPath) at the same path
+			// de-dups (the same volume mounted into multiple containers). But two
+			// mounts that target one destination with DIFFERENT selections — a distinct
+			// volume, OR the same volume with a different subPath — cannot both be
+			// materialized on the shared tree, so that is a hard error rather than a
+			// silent first-wins.
+			if prev, dup := seen[dest]; dup {
+				if prev.name == vm.GetName() && prev.subPath == vm.GetSubPath() {
+					continue // identical selection into multiple containers at one path
 				}
-				return nil, fmt.Errorf("volumes %q and %q both target %q", prev, vm.GetName(), target)
+				return nil, fmt.Errorf("mounts %q(subPath %q) and %q(subPath %q) both target %q",
+					prev.name, prev.subPath, vm.GetName(), vm.GetSubPath(), dest)
 			}
-			seen[target] = vm.GetName()
+			seen[dest] = seenMount{name: vm.GetName(), subPath: vm.GetSubPath()}
 
-			credential, err := materializeVolume(ctx, box.GetNamespace(), podIP, vol, target, box, r)
+			var credential bool
+			if sub := vm.GetSubPath(); sub != "" {
+				credential, err = materializeSubPath(ctx, box.GetNamespace(), podIP, vol, dataVol, dest, sub, box, r)
+			} else {
+				credential, err = materializeVolume(ctx, box.GetNamespace(), podIP, vol, dest, box, r)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("materialize volume %s: %w", vm.GetName(), err)
 			}
 			layout.Mounts = append(layout.Mounts, Mount{
 				Name:       vm.GetName(),
-				Path:       target,
+				Path:       dest,
 				ReadOnly:   vm.GetReadOnly() || credential || vol.GetProjected() != nil,
 				Credential: credential,
 			})
@@ -134,17 +163,19 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 	return layout, nil
 }
 
-// resolveTarget rebases mountPath (and optional subPath) under dataVol. Because
-// k3sm has no mount namespace, an absolute mountPath like "/etc/config" is
-// interpreted relative to the pod data volume, not the host root. A path that
-// would escape dataVol (via "..") is rejected.
-func resolveTarget(dataVol, mountPath, subPath string) (string, error) {
+// resolveTarget rebases mountPath under dataVol, returning the container-visible
+// destination. Because k3sm has no mount namespace, an absolute mountPath like
+// "/etc/config" is interpreted relative to the pod data volume, not the host root.
+// A path that would escape dataVol (via "..") is rejected. subPath is deliberately
+// NOT folded in here: a subPath selects an element of the source (see
+// materializeSubPath), it does not change the destination level.
+func resolveTarget(dataVol, mountPath string) (string, error) {
 	if mountPath == "" {
 		return "", errors.New("mount_path is empty")
 	}
-	target := filepath.Join(dataVol, mountPath, subPath)
+	target := filepath.Join(dataVol, mountPath)
 	if !isUnder(target, dataVol) {
-		return "", fmt.Errorf("mount_path %q escapes the pod data volume", filepath.Join(mountPath, subPath))
+		return "", fmt.Errorf("mount_path %q escapes the pod data volume", mountPath)
 	}
 	return target, nil
 }
@@ -169,6 +200,114 @@ func materializeVolume(ctx context.Context, ns, podIP string, vol *runtimev1.Vol
 	default:
 		return false, fmt.Errorf("volume %s has no recognized source", vol.GetName())
 	}
+}
+
+// materializeSubPath implements k8s subPath semantics: the container's mount path
+// exposes ONLY the volume's <subPath> element (a single file or subdirectory
+// WITHIN the volume), never the whole volume. It renders vol's full source into a
+// STAGING directory OUTSIDE the pod's readable data volume (a sibling of dataVol),
+// selects <staging>/<subPath>, CoW-clones ONLY that element into dest (the rebased
+// mount path), then removes the staging dir — so no un-selected sibling (e.g. the
+// other ConfigMap/Secret keys) is ever left readable under dataVol. Returns whether
+// the source is a credential (so dest still gets the SBPL read-only sub-scope).
+//
+// subPath is CVE-2021-25741 class, so the selection is guarded twice: a lexical
+// isUnder check (rejects a ".."-heavy subPath after Clean) and a symlink-safe
+// EvalSymlinks + re-check (rejects an in-volume symlink pointing outside the
+// volume root). A subPath naming a non-existent element fails closed, except for an
+// emptyDir, whose missing subPath directory is created (kubelet parity for a
+// writable ephemeral volume). The file-vs-dir branch below is load-bearing: a
+// blanket MkdirAll(dest) for a file element would make the workload's open(2) hit
+// EISDIR.
+func materializeSubPath(ctx context.Context, ns, podIP string, vol *runtimev1.Volume, dataVol, dest, subPath string, box *runtimev1.PodBox, r Resolver) (credential bool, err error) {
+	// Stage OUTSIDE dataVol (a sibling of the pod data volume) so no un-selected
+	// sibling element is ever readable under the pod tree, and on the same volume so
+	// the clone into dest is CoW. Removed unconditionally afterwards.
+	staging, err := os.MkdirTemp(filepath.Dir(dataVol), ".k3sm-subpath-*")
+	if err != nil {
+		return false, fmt.Errorf("create subPath staging dir: %w", err)
+	}
+	defer func() {
+		if rmErr := os.RemoveAll(staging); rmErr != nil && err == nil {
+			err = fmt.Errorf("remove subPath staging dir %s: %w", staging, rmErr)
+		}
+	}()
+
+	credential, err = materializeVolume(ctx, ns, podIP, vol, staging, box, r)
+	if err != nil {
+		return credential, err
+	}
+
+	// Source-side lexical guard: the selection must stay within the volume root.
+	sel := filepath.Join(staging, subPath)
+	if !isUnder(sel, staging) {
+		return credential, fmt.Errorf("sub_path %q escapes the volume", subPath)
+	}
+
+	if _, statErr := os.Lstat(sel); errors.Is(statErr, os.ErrNotExist) {
+		// A missing subPath fails closed, except for an emptyDir: kubelet creates a
+		// missing subPath directory in a writable ephemeral volume.
+		if vol.GetEmptyDir() == nil {
+			return credential, fmt.Errorf("sub_path %q not found in volume", subPath)
+		}
+		if mkErr := os.MkdirAll(sel, 0o755); mkErr != nil {
+			return credential, fmt.Errorf("create emptyDir sub_path %q: %w", subPath, mkErr)
+		}
+	} else if statErr != nil {
+		return credential, fmt.Errorf("lstat sub_path %q: %w", subPath, statErr)
+	}
+
+	// Symlink-safe defense-in-depth: resolve any symlink and re-check containment so
+	// an in-volume symlink cannot redirect the selection outside the volume root.
+	// The staging root is resolved too (its parent may itself traverse a symlink,
+	// e.g. macOS /var -> /private/var) so the comparison is resolved-vs-resolved.
+	// (Materialize runs once, up front, before any container can write a symlink into
+	// an emptyDir — no restart path re-invokes it — so this is cheap insurance today.)
+	stagingResolved, evalErr := filepath.EvalSymlinks(staging)
+	if evalErr != nil {
+		return credential, fmt.Errorf("resolve staging dir: %w", evalErr)
+	}
+	resolved, evalErr := filepath.EvalSymlinks(sel)
+	if evalErr != nil {
+		return credential, fmt.Errorf("resolve sub_path %q: %w", subPath, evalErr)
+	}
+	if !isUnder(resolved, stagingResolved) {
+		return credential, fmt.Errorf("sub_path %q resolves outside the volume", subPath)
+	}
+	kind, statErr := os.Stat(resolved)
+	if statErr != nil {
+		return credential, fmt.Errorf("stat sub_path %q: %w", subPath, statErr)
+	}
+
+	// Destination-side branch on element kind. A DIR element is the mount path's
+	// tree (MaterializeTree); a FILE element IS the mount path (clone the file only,
+	// after creating its parent) — never MkdirAll(dest) for a file (that is EISDIR).
+	//
+	// SECURITY INVARIANT (dir case): MaterializeTree copies interior symlinks
+	// verbatim, and containment is verified only at the selection point (resolved),
+	// not per interior entry. This is safe ONLY because every source materialized
+	// here renders REGULAR FILES ONLY — configMap/secret/downwardAPI/projected write
+	// key->bytes, and an emptyDir is empty at this up-front, once-per-pod-create pass
+	// (no restart path re-materializes a container-populated emptyDir). If a future
+	// source can contain a symlink, the dir path MUST re-check containment per entry:
+	// an absolute interior symlink would resolve against the HOST root at runtime
+	// (k3sm has no mount namespace) — the CVE-2021-25741 escape class.
+	if kind.IsDir() {
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			return credential, fmt.Errorf("create sub_path mount dir %s: %w", dest, err)
+		}
+		if _, err := image.MaterializeTree(defaultCloner(), resolved, dest); err != nil {
+			return credential, fmt.Errorf("materialize sub_path dir %q: %w", subPath, err)
+		}
+		return credential, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return credential, fmt.Errorf("create sub_path parent %s: %w", filepath.Dir(dest), err)
+	}
+	if _, err := defaultCloner().Clone(resolved, dest); err != nil {
+		return credential, fmt.Errorf("clone sub_path file %q: %w", subPath, err)
+	}
+	return credential, nil
 }
 
 // renderConfigMap writes a ConfigMap's keys as files under target.
