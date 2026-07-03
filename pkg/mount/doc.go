@@ -39,4 +39,27 @@ limitations under the License.
 // the returned Layout so the caller hands them to sandbox.Generate as the
 // read-only sub-scope (file-read* + an explicit file-write* deny) — a pod can
 // read its credentials but never overwrite them.
+//
+// # subPath
+//
+// A VolumeMount subPath selects a single element WITHIN the volume: the container
+// mount path exposes only the volume's <subPath> file or subdirectory, never the
+// whole volume. subPath does NOT change the destination level — the destination is
+// always the rebased mountPath (filepath.Join(dataVol, mountPath)); the empty-
+// subPath path is unchanged (whole volume materialized at the mount path). For a
+// non-empty subPath the model is: materialize the whole volume into a STAGING dir
+// OUTSIDE the readable data volume → validate + select <staging>/<subPath> → CoW-
+// clone ONLY that element into the rebased mount path → remove the staging dir, so
+// no un-selected sibling (e.g. the volume's other keys) is ever left readable under
+// the pod tree.
+//
+// The selection is validated before it is used (subPath is CVE-2021-25741 class):
+// a lexical isUnder check rejects a "../"-escaping subPath (beside the mountPath
+// "../" rejection above), and a symlink-safe EvalSymlinks + re-check rejects an
+// in-volume symlink pointing outside the volume root. The placed element is then
+// branched on kind: a FILE element IS the mount path (clone the file only — never
+// MkdirAll it, which would give the workload's open(2) an EISDIR), a DIR element is
+// the mount path's tree. A subPath naming a non-existent element fails closed,
+// except for an emptyDir, whose missing subPath directory is created (kubelet
+// parity). subPathExpr (env-var-expanded subPath) is not yet implemented.
 package mount
