@@ -37,8 +37,15 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 	if p.podIP != "" {
 		st.PodIps = []string{p.podIP}
 	}
+	// Long-lived containers split by declaration list: an init-declared container
+	// (today only native sidecars are tracked long-lived from the init list)
+	// reports under init_container_statuses, mains under container_statuses.
 	for _, cp := range p.containers {
-		st.ContainerStatuses = append(st.ContainerStatuses, containerStatusOf(cp))
+		if cp.initDeclared {
+			st.InitContainerStatuses = append(st.InitContainerStatuses, containerStatusOf(cp))
+		} else {
+			st.ContainerStatuses = append(st.ContainerStatuses, containerStatusOf(cp))
+		}
 	}
 	return st
 }
@@ -47,7 +54,7 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 // The restart_count + last_termination_state (M2.2) and volume_mount + user
 // mirrors (M2.2/M2.3) are carried through losslessly. The caller holds pod.mu.
 func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
-	return &runtimev1.ContainerStatus{
+	st := &runtimev1.ContainerStatus{
 		Name:                 cp.state.GetName(),
 		Image:                cp.state.GetImage(),
 		State:                cp.state.GetState(),
@@ -57,6 +64,15 @@ func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 		VolumeMounts:         cp.state.GetVolumeMounts(),
 		User:                 cp.state.GetUser(),
 	}
+	if cp.sidecar() {
+		// A native sidecar reports started while running (spawn-equals-started:
+		// startup-probe gating is deliberately out of scope per the apis
+		// restart_policy contract); an exited/mid-restart sidecar reads
+		// started=false until its replacement runs.
+		st.Started = st.Ready
+		st.StartedSet = true
+	}
+	return st
 }
 
 // publish renders the event and fans it out to WatchPodStatus subscribers. Called

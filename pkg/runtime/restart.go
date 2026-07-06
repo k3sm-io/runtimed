@@ -62,6 +62,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	oldRestartCount := oldCP.state.GetRestartCount()
 	oldStarted := oldCP.state.GetState().GetRunning().GetStartedAt()
 	spec := oldCP.spec
+	initDeclared := oldCP.initDeclared
 	oldCP.restarting = true
 	p.mu.Unlock()
 
@@ -85,10 +86,20 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		oldCode, oldSig, _ = oldProc.Wait(ctx) // already reaped: returns recorded status
 	}
 
-	// Re-spawn from the same spec. The supervision (reaper + watchContainerExit)
-	// must outlive THIS RPC, so detach the spawn context from the RPC's
-	// cancellation (the pull/sign/wrap during a restart are fast/cache-backed).
-	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, r.rootfsPath(p.box), spec, false)
+	// Re-spawn from the same spec, in the same LIFECYCLE CLASS: initDeclared is
+	// threaded through so an init-declared native sidecar stays a sidecar across a
+	// provider-driven restart (this RPC is the ONLY sidecar restart path — the
+	// provider owns the restart decision/backoff; runtimed performs no exit-driven
+	// restarts). The flag never alters confinement — the SBPL profile is
+	// pod-scoped (p.profile) and the rootfs resolution (r.rootfsPath) is
+	// pod-scoped, identical for init and main containers — but it derives
+	// sidecar(): dropping it would silently re-classify the restarted sidecar as a
+	// MAIN, so its next exit would wrongly conclude the pod (mains-only phase
+	// accounting) and it would miss the reverse-order teardown. The supervision
+	// (reaper + watchContainerExit) must outlive THIS RPC, so detach the spawn
+	// context from the RPC's cancellation (the pull/sign/wrap during a restart are
+	// fast/cache-backed).
+	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, r.rootfsPath(p.box), spec, initDeclared)
 	if err != nil {
 		r.clearRestarting(p, oldCP)
 		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", err)

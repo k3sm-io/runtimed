@@ -74,8 +74,11 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 
 // DeletePod gracefully stops the pod's containers and forgets it. Each container
 // process group gets the M2.4 SIGTERM → grace timer (raced against the kqueue
-// reaper) → SIGKILL escalation; grace 0 is an immediate SIGKILL. Idempotent:
-// deleting an unknown pod succeeds.
+// reaper) → SIGKILL escalation; grace 0 is an immediate SIGKILL. The teardown is
+// TWO-PHASE (M10.2): the MAIN containers are stopped first (concurrently, as
+// before), then any native sidecars in REVERSE start order with whatever REMAINS
+// of the one pod-level grace budget (see resolveGrace / stopSidecars).
+// Idempotent: deleting an unknown pod succeeds.
 func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	r.mu.Lock()
 	p, ok := r.pods[req.GetPodId()]
@@ -93,20 +96,31 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 
 	grace := resolveGrace(req, p)
+	// The ONE pod-level grace budget (M10.2): anchor its deadline BEFORE the
+	// mains are stopped so the sidecars that follow get only the REMAINDER.
+	deadline := time.Now().Add(grace)
 
 	p.mu.Lock()
-	procs := make([]*supervisor.Process, 0, len(p.containers))
+	mains := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range p.containers {
-		procs = append(procs, cp.proc)
+		if cp.sidecar() {
+			continue
+		}
+		mains = append(mains, cp.proc)
 	}
+	sidecars := sidecarsLocked(p)
+	// Claim the sidecar teardown for THIS delete: the main exits phase 1 induces
+	// would otherwise conclude the pod in watchContainerExit and trigger the
+	// voluntary-completion teardown concurrently with phase 2 (a double stop).
+	p.sidecarTeardown = true
 	p.mu.Unlock()
 
-	// Graceful stop each container's process group concurrently: the per-PID grace
-	// timers start together, so a multi-container pod shares one effective grace
-	// window. GracefulStop only OBSERVES proc.Done (the kqueue reaper stays the
-	// sole reaper) — an early voluntary exit skips the SIGKILL.
+	// Phase 1: graceful-stop each MAIN container's process group concurrently: the
+	// per-PID grace timers start together, so a multi-container pod shares one
+	// effective grace window. GracefulStop only OBSERVES proc.Done (the kqueue
+	// reaper stays the sole reaper) — an early voluntary exit skips the SIGKILL.
 	var wg sync.WaitGroup
-	for _, proc := range procs {
+	for _, proc := range mains {
 		pid := proc.PID()
 		if pid <= 0 {
 			continue
@@ -120,6 +134,12 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		}(proc, pid)
 	}
 	wg.Wait()
+
+	// Phase 2 (M10.2): stop the native sidecars in REVERSE start order with the
+	// budget's remainder — mains first, then their support processes, mirroring
+	// the kubelet's KEP-753 termination order. A remainder <= 0 (the mains ran
+	// the budget out) is the immediate-SIGKILL path.
+	r.stopSidecars(ctx, req.GetPodId(), sidecars, deadline)
 
 	// End the pod-lifetime supervision context AFTER the graceful stop: the reapers
 	// have collected the real exits (GracefulStop observed proc.Done), so canceling
@@ -153,6 +173,14 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 // Kubernetes 30s default for an UNSET grace is applied provider-side, since proto3
 // cannot distinguish "unset" from an explicit 0 at this boundary (and mapping 0→30s
 // would make an explicit immediate-kill unreachable).
+//
+// The resolved value is ONE pod-level budget shared by the whole teardown
+// (M10.2): the MAIN containers are stopped first, concurrently, against the full
+// budget; then the native sidecars are stopped in REVERSE start order with
+// whatever REMAINS of it (elapsed time subtracted; a remainder <= 0 is the
+// immediate-SIGKILL path). Sidecars never extend the pod's grace. The same rule
+// governs voluntary completion (watchContainerExit), where the mains exited on
+// their own and the sidecars start with the whole budget.
 func resolveGrace(req *runtimev1.DeletePodRequest, p *pod) time.Duration {
 	return graceDuration(req.GetGracePeriodSeconds(), p)
 }
