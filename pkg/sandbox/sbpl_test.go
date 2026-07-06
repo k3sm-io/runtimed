@@ -79,7 +79,8 @@ func TestGenerateDenySet(t *testing.T) {
 		{"dyld-read-exception", "(subpath \"/private/var/db/dyld\")"},
 		{"datavol-reallow", "(allow file-read* file-write*\n  (subpath \"" + dataVol + "\"))"},
 		{"read-system", "(subpath \"/System\")"},
-		{"net-dns-vip", `(remote ip "10.96.0.10:53")`},
+		{"net-outbound-unfiltered", "(allow network-outbound)"},
+		{"net-bind-unfiltered", "(allow network-bind)"},
 		{"mach-dns", `(global-name "com.apple.mDNSResponder")`},
 	}
 	for _, tc := range mustContain {
@@ -90,11 +91,14 @@ func TestGenerateDenySet(t *testing.T) {
 		})
 	}
 
-	// /Users must never appear in an allow, and the var-db store must never be
-	// granted write.
+	// /Users must never appear in an allow, the var-db store must never be
+	// granted write, and no per-IP network filter may ever be emitted (it does
+	// not compile on macOS 26 — the M10.1 P0).
 	mustNotContain := []struct{ name, frag string }{
 		{"no-users-allow", "(allow file-read* file-write*\n  (subpath \"/Users\""},
 		{"no-write-var-db", "(allow file-write*\n  (subpath \"/private/var/db\")"},
+		{"no-remote-ip-filter", "(remote ip"},
+		{"no-local-ip-filter", "(local ip"},
 	}
 	for _, tc := range mustNotContain {
 		t.Run(tc.name, func(t *testing.T) {
@@ -469,23 +473,24 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 	}
 }
 
-// TestGenerateNetworkBindScoped is deliverable #5 (network-bind scoping): when a
-// pod is granted egress AND its IP is known to the generator, the network-bind
-// allow is scoped to (local ip <podIP>) so a pod cannot bind() a neighbor's lo0
-// /32. The bind rule must NOT appear without a pod IP or without allow_network.
-func TestGenerateNetworkBindScoped(t *testing.T) {
+// TestGenerateNetworkBindUnfiltered is the M10.1 P0 contract: an allow_network
+// pod gets an UNFILTERED (allow network-bind) — never the pre-M10.1 (local ip
+// "<PodIP>:*") scoping, which the macOS 26 Seatbelt grammar rejects at
+// sandbox_apply ("host must be * or localhost in network address"), making
+// every networked pod fail to spawn. A known PodIP must NOT change the rendered
+// profile (it is plumbing-only), and without allow_network no bind is granted.
+func TestGenerateNetworkBindUnfiltered(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
 	const podIP = "10.1.2.3"
 	cases := []struct {
-		name      string
-		allowNet  bool
-		podIP     string
-		wantBind  bool
-		wantLocal string
+		name     string
+		allowNet bool
+		podIP    string
+		wantBind bool
 	}{
-		{"net+ip-scoped", true, podIP, true, "(allow network-bind\n  (local ip \"10.1.2.3:*\"))"},
-		{"net-without-ip", true, "", false, ""},
-		{"ip-without-net", false, podIP, false, ""},
+		{"net-with-ip", true, podIP, true},
+		{"net-without-ip", true, "", true},
+		{"ip-without-net", false, podIP, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -496,44 +501,56 @@ func TestGenerateNetworkBindScoped(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			gotBind := strings.Contains(out, "(allow network-bind")
+			gotBind := strings.Contains(out, "(allow network-bind)")
 			if gotBind != tc.wantBind {
-				t.Fatalf("network-bind present=%v, want %v:\n%s", gotBind, tc.wantBind, out)
+				t.Fatalf("unfiltered network-bind present=%v, want %v:\n%s", gotBind, tc.wantBind, out)
 			}
-			if tc.wantBind && !strings.Contains(out, tc.wantLocal) {
-				t.Errorf("network-bind not scoped to the pod IP; want %q:\n%s", tc.wantLocal, out)
+			// The uncompilable per-IP filter must never come back, and the pod IP
+			// must never leak into the profile at all.
+			if strings.Contains(out, "(local ip") {
+				t.Errorf("profile emits a (local ip …) filter — does not compile on macOS 26:\n%s", out)
+			}
+			if tc.podIP != "" && strings.Contains(out, tc.podIP) {
+				t.Errorf("PodIP is plumbing-only and must not render into the SBPL:\n%s", out)
 			}
 		})
 	}
+
+	// PodIP must not perturb the rendered profile byte-for-byte (plumbing-only).
+	withIP, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol, AllowNetwork: true}, GenerateOptions{PodIP: podIP})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutIP, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol, AllowNetwork: true}, GenerateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withIP != withoutIP {
+		t.Errorf("PodIP changed the rendered profile; it must be plumbing-only.\n--- with ---\n%s\n--- without ---\n%s", withIP, withoutIP)
+	}
 }
 
-// TestGenerateAPIServerVIPEgress is the M3 in-pod-kubectl fix (M3.3): when the
-// node sets Posture.APIServerVIP, a networked pod gets an egress allow to
-// <VIP>:443 (paired with :0, mirroring the DNS-VIP idiom) so an in-pod client-go
-// rest.InClusterConfig() can reach the in-cluster `kubernetes` ClusterIP through
-// the datapath VIP — without it the dial is denied at Seatbelt (fail-closed). An
-// empty APIServerVIP emits NO such rule (back-compatible: a zero Posture renders
-// an unchanged profile, asserted by TestGenerateGolden). The rule is gated on
-// allow_network and must never weaken the DNS-VIP egress or the AF_UNIX
-// helper-socket deny.
-func TestGenerateAPIServerVIPEgress(t *testing.T) {
+// TestGenerateVIPsDoNotRenderSBPL is the M10.1 P0 contract for the node VIPs:
+// Posture.ResolverVIP and Posture.APIServerVIP are plumbing-only — they render
+// NO (remote ip …) filter, because per-IP network filters do not compile on
+// macOS 26 (the pre-M10.1 VIP-scoped egress failed sandbox_apply and no
+// networked pod could spawn). A networked pod instead gets the unfiltered
+// (allow network-outbound), and the AF_UNIX helper-socket deny stays intact and
+// AFTER it (last-match-wins keeps the socket denied).
+func TestGenerateVIPsDoNotRenderSBPL(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
 	const apiVIP = "10.43.0.1"
+	const resolverVIP = "10.43.0.10"
 	const netdSock = "/var/run/k3sm/netd.sock"
-
-	apiFrag := `(remote ip "` + apiVIP + `:443")`
-	api0Frag := `(remote ip "` + apiVIP + `:0")`
 
 	cases := []struct {
 		name     string
-		apiVIP   string
+		posture  Posture
 		allowNet bool
-		wantRule bool
 	}{
-		{"set-with-network", apiVIP, true, true},
-		{"unset-with-network", "", true, false},
-		{"set-without-network", apiVIP, false, false},
-		{"unset-without-network", "", false, false},
+		{"vips-set-with-network", Posture{ResolverVIP: resolverVIP, APIServerVIP: apiVIP}, true},
+		{"vips-unset-with-network", Posture{}, true},
+		{"vips-set-without-network", Posture{ResolverVIP: resolverVIP, APIServerVIP: apiVIP}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -541,32 +558,29 @@ func TestGenerateAPIServerVIPEgress(t *testing.T) {
 				DataVolumePath:        dataVol,
 				AllowNetwork:          tc.allowNet,
 				DeniedUnixSocketPaths: []string{netdSock},
-			}, GenerateOptions{
-				Posture: Posture{APIServerVIP: tc.apiVIP},
-			})
+			}, GenerateOptions{Posture: tc.posture})
 			if err != nil {
 				t.Fatalf("Generate: %v", err)
 			}
 
-			// The API-VIP :443 allow appears iff APIServerVIP is set AND the pod has
-			// network egress; the paired :0 follows the same idiom.
-			if got := strings.Contains(out, apiFrag); got != tc.wantRule {
-				t.Errorf("API-VIP :443 egress present=%v, want %v:\n%s", got, tc.wantRule, out)
+			// NO per-IP filter, ever — it does not compile on macOS 26. The VIPs
+			// must not leak into the profile in any form.
+			if strings.Contains(out, "(remote ip") || strings.Contains(out, "(local ip") {
+				t.Errorf("profile emits a per-IP network filter — does not compile on macOS 26:\n%s", out)
 			}
-			if got := strings.Contains(out, api0Frag); got != tc.wantRule {
-				t.Errorf("API-VIP :0 egress present=%v, want %v:\n%s", got, tc.wantRule, out)
-			}
-
-			// The DNS-VIP rule is unaffected whenever egress is allowed: APIServerVIP
-			// must not perturb the default cluster-DNS egress (M3.3 regression guard).
-			if tc.allowNet {
-				if !strings.Contains(out, `(remote ip "`+DefaultResolverVIP+`:53")`) {
-					t.Errorf("DNS-VIP :53 egress missing — APIServerVIP must not perturb it:\n%s", out)
+			for _, vip := range []string{apiVIP, resolverVIP, DefaultResolverVIP} {
+				if strings.Contains(out, vip) {
+					t.Errorf("VIP %s is plumbing-only and must not render into the SBPL:\n%s", vip, out)
 				}
 			}
 
-			// The AF_UNIX helper-socket deny is intact and never turned into an allow,
-			// regardless of the API-VIP rule.
+			// A networked pod gets the unfiltered allows; a non-networked pod none.
+			gotOut := strings.Contains(out, "(allow network-outbound)")
+			if gotOut != tc.allowNet {
+				t.Errorf("unfiltered network-outbound present=%v, want %v:\n%s", gotOut, tc.allowNet, out)
+			}
+
+			// The AF_UNIX helper-socket deny is intact and never turned into an allow.
 			if !strings.Contains(out, `(remote unix-socket (path-equal "`+netdSock+`"))`) {
 				t.Errorf("AF_UNIX helper-socket deny missing:\n%s", out)
 			}
@@ -574,13 +588,13 @@ func TestGenerateAPIServerVIPEgress(t *testing.T) {
 				t.Errorf("AF_UNIX socket must never be ALLOWed:\n%s", out)
 			}
 
-			// When present, the API-VIP allow must precede the AF_UNIX deny so
-			// last-match-wins keeps the helper socket denied for a networked pod.
-			if tc.wantRule {
-				iAPI := strings.Index(out, apiFrag)
+			// For a networked pod the unfiltered allow must precede the AF_UNIX deny
+			// so last-match-wins keeps the helper socket denied.
+			if tc.allowNet {
+				iAllow := strings.Index(out, "(allow network-outbound)")
 				iDeny := strings.Index(out, "(deny network-outbound")
-				if iAPI < 0 || iDeny < 0 || iDeny <= iAPI {
-					t.Errorf("API-VIP allow (%d) must come BEFORE the AF_UNIX deny (%d) to stay denied:\n%s", iAPI, iDeny, out)
+				if iAllow < 0 || iDeny < 0 || iDeny <= iAllow {
+					t.Errorf("network allow (%d) must come BEFORE the AF_UNIX deny (%d) to stay denied:\n%s", iAllow, iDeny, out)
 				}
 			}
 		})

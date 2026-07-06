@@ -126,6 +126,68 @@ func TestIntegrationConfinement(t *testing.T) {
 	})
 }
 
+// TestIntegrationNetworkStanzaCompiles is the M10.1 P0 regression gate: a
+// profile generated with the FULL production networked-pod shape —
+// AllowNetwork=true, a PodIP, and both node VIPs set — must actually COMPILE
+// and APPLY through the real exec-shim/libsandbox path. On macOS 26 Seatbelt
+// network filters accept only localhost/* hosts, so the pre-M10.1 IP-scoped
+// stanza ((remote ip "<VIP>:53"), (local ip "<PodIP>:*")) failed sandbox_apply
+// ("host must be * or localhost in network address") and EVERY networked pod
+// died at spawn. This test goes red if such a filter ever returns. User-space
+// only: ad-hoc sign, no root.
+func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
+	shim := buildExecShim(t)
+	work := t.TempDir()
+
+	profile, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath: work,
+		AllowNetwork:   true,
+		ExtraReadPaths: []string{"/private/tmp", "/private/var/folders"},
+	}, GenerateOptions{
+		Posture: Posture{ResolverVIP: "10.43.0.10", APIServerVIP: "10.43.0.1"},
+		PodIP:   "10.64.0.7",
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	t.Run("profile-compiles-and-applies", func(t *testing.T) {
+		out, err := runUnderShim(t, shim, profile, os.Environ(), "/usr/bin/true")
+		if err != nil {
+			t.Fatalf("networked-pod profile failed to compile/apply at sandbox_apply: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("bind-loopback-succeeds", func(t *testing.T) {
+		// A tiny helper that binds 127.0.0.1:0 proves the unfiltered
+		// (allow network-bind) actually grants bind() under the applied profile.
+		bin := filepath.Join(work, "bindbin")
+		src := filepath.Join(work, "bind.c")
+		if err := os.WriteFile(src, []byte(
+			"#include <stdio.h>\n#include <string.h>\n#include <arpa/inet.h>\n#include <sys/socket.h>\n#include <unistd.h>\n"+
+				"int main(void){int fd=socket(AF_INET,SOCK_STREAM,0);if(fd<0){perror(\"socket\");return 1;}\n"+
+				"struct sockaddr_in a;memset(&a,0,sizeof a);a.sin_family=AF_INET;a.sin_port=0;a.sin_addr.s_addr=inet_addr(\"127.0.0.1\");\n"+
+				"if(bind(fd,(struct sockaddr*)&a,sizeof a)!=0){perror(\"bind\");return 1;}\n"+
+				"printf(\"BIND-OK\\n\");close(fd);return 0;}\n"),
+			0o644); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("clang", "-o", bin, src).CombinedOutput(); err != nil {
+			t.Skipf("clang unavailable to build bind helper (%v): %s", err, out)
+		}
+		if out, err := exec.Command("codesign", "-s", "-", "-f", bin).CombinedOutput(); err != nil {
+			t.Fatalf("codesign bind helper: %v\n%s", err, out)
+		}
+		out, err := runUnderShim(t, shim, profile, os.Environ(), bin)
+		if err != nil {
+			t.Fatalf("bind(127.0.0.1:0) failed under the networked-pod profile: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "BIND-OK") {
+			t.Fatalf("bind helper did not report success:\n%s", out)
+		}
+	})
+}
+
 // TestIntegrationDYLDPreserved is the KEY cross-repo enabler: a process spawned
 // by the exec-shim still sees DYLD_INSERT_LIBRARIES in its environment. This is
 // what unblocks darwin-net's DNS shim and what /usr/bin/sandbox-exec would break.

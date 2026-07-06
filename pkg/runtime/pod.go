@@ -152,6 +152,17 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
 			fmt.Errorf("network setup pod %s: %w", box.GetPodId(), err)
 	}
+	// Unwind the successful Setup if any LATER create step fails: without this,
+	// a failed create leaks the pod's /32 (real IPAM allocates one per Setup and
+	// DeletePod never runs for a pod that was never created). Best-effort
+	// log-and-continue, mirroring the delete-path Teardown.
+	defer func() {
+		if retErr != nil {
+			if terr := r.network.Teardown(box.GetPodId()); terr != nil {
+				r.log.Warn("network teardown after failed create", "pod", box.GetPodId(), "err", terr)
+			}
+		}
+	}()
 
 	rootfs := r.rootfsPath(box)
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
@@ -206,8 +217,9 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 			// pod's writable re-allow outside the daemon's data area.
 			WorkDir: r.cfg.Root,
 			Home:    r.home,
-			// Scope per-pod egress to the cluster DNS + in-cluster API VIPs. Empty
-			// keeps the SBPL's back-compatible default DNS VIP / no API rule.
+			// The VIPs are plumbing-only (DNS env/status): since M10.1 they render
+			// NO SBPL rule — per-IP network filters do not compile on macOS 26
+			// (see sandbox.Generate's AllowNetwork stanza).
 			ResolverVIP:  r.cfg.ResolverVIP,
 			APIServerVIP: r.cfg.APIServerVIP,
 		},

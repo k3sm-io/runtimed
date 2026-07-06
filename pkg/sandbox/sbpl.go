@@ -33,11 +33,12 @@ import (
 // under the daemon's home instead of relying on this default.
 const DefaultWorkDir = "/var/lib/k3sm"
 
-// DefaultResolverVIP is the cluster DNS Service VIP egress is scoped to when a
-// Posture leaves ResolverVIP empty. M1 is single-node and the cluster DNS
-// Service is a lo0 alias; allow-network scopes outbound to this address (and the
-// mach-lookup the resolver needs) rather than opening all egress. Overridable
-// per-node via Posture; broader per-Service egress is an M2 concern.
+// DefaultResolverVIP is the cluster DNS Service VIP assumed when a Posture
+// leaves ResolverVIP empty. It is PLUMBING-ONLY: since M10.1 the VIP renders NO
+// SBPL rule (the macOS 26 Seatbelt grammar cannot express per-IP network
+// filters — see the AllowNetwork stanza in Generate), but the field and its
+// default are kept as the node-level DNS configuration the env/status plumbing
+// reads. Overridable per-node via Posture.
 const DefaultResolverVIP = "10.96.0.10"
 
 // systemProtectedPrefixes are the FIXED host subtrees a pod may NEVER be granted
@@ -91,12 +92,15 @@ var ErrWorkDirEscapesHome = errors.New("sbpl: work-dir escapes home")
 
 // Posture is the NODE-LEVEL SBPL configuration: the runtimed work-dir the
 // per-pod pods-root and protected-prefix denies are derived from, plus the
-// cluster DNS resolver VIP and in-cluster API-server VIP egress is scoped to.
+// cluster DNS resolver VIP and in-cluster API-server VIP the node advertises.
 // Unlike the per-pod GenerateOptions it is the same for every pod on a node, so
 // the caller builds it once from the runtime Config and passes it on each
 // Generate. The zero value is usable: an empty WorkDir falls back to
-// DefaultWorkDir and an empty ResolverVIP to DefaultResolverVIP (the legacy
-// root-daemon defaults); an empty APIServerVIP emits no API-server egress rule.
+// DefaultWorkDir and an empty ResolverVIP to DefaultResolverVIP.
+//
+// The VIP fields are PLUMBING-ONLY since M10.1: they render NO SBPL rule
+// (per-IP network filters do not compile on macOS 26 — see the AllowNetwork
+// stanza in Generate) and are carried for the DNS env/status plumbing.
 type Posture struct {
 	// WorkDir is the runtimed on-disk work-dir (== runtime Config.Root). The
 	// per-pod pods-root is pinned at <WorkDir>/pods and the protected-prefix
@@ -110,15 +114,17 @@ type Posture struct {
 	// writable re-allow outside the daemon's data area. Empty disables the check
 	// (the legacy root posture, where WorkDir is the trusted /var/lib/k3sm).
 	Home string
-	// ResolverVIP is the cluster DNS Service VIP outbound is scoped to when a pod
-	// sets allow_network. Empty defaults to DefaultResolverVIP.
+	// ResolverVIP is the cluster DNS Service VIP for this node. Empty defaults to
+	// DefaultResolverVIP. PLUMBING-ONLY: it renders NO SBPL rule (the macOS 26
+	// Seatbelt grammar rejects per-IP network filters — the pre-M10.1 VIP-scoped
+	// egress allow failed sandbox_apply); it exists for the DNS env/status
+	// plumbing that tells a pod where the resolver lives.
 	ResolverVIP string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the `kubernetes`
-	// ClusterIP, e.g. 10.43.0.1) outbound is ADDITIONALLY scoped to when a pod
-	// sets allow_network, so an in-pod client-go rest.InClusterConfig() can reach
-	// the API server through the datapath VIP. Unlike ResolverVIP it has NO
-	// default: empty emits no API-server egress rule, so a zero Posture renders an
-	// unchanged profile. The caller (k3sm) sets it from the cluster service CIDR.
+	// ClusterIP, e.g. 10.43.0.1). No default: empty means "not configured".
+	// PLUMBING-ONLY: like ResolverVIP it renders NO SBPL rule since M10.1 — an
+	// allow_network pod has unfiltered egress (see Generate) — and is carried for
+	// the env/status plumbing. The caller (k3sm) sets it from the service CIDR.
 	APIServerVIP string
 }
 
@@ -133,11 +139,14 @@ type GenerateOptions struct {
 	// API-server egress derive from. The zero value uses the legacy defaults
 	// (DefaultWorkDir, DefaultResolverVIP) and emits no API-server egress rule.
 	Posture Posture
-	// PodIP, when non-empty and sp.AllowNetwork is set, scopes the pod's
-	// network-bind allow to (local ip <PodIP>) so a pod cannot bind() a neighbor
-	// pod's /32 alias on the shared lo0 loopback. It is the pod IP the network
-	// setup assigned; empty leaves bind default-denied. Not in the proto: it is
-	// computed during pod setup, not supplied by the provider.
+	// PodIP is the pod IP the network setup assigned. PLUMBING-ONLY since M10.1:
+	// it renders NO SBPL rule. The pre-M10.1 (allow network-bind (local ip
+	// "<PodIP>:*")) scoping does not compile on macOS 26 (Seatbelt network
+	// filters accept only localhost/* hosts) and failed sandbox_apply for every
+	// networked pod; bind-scoping a pod to its own lo0 /32 is NOT expressible.
+	// The field is kept because pod setup computes it and the DNS env/status
+	// plumbing consumes it. Not in the proto: it is computed during pod setup,
+	// not supplied by the provider.
 	PodIP string
 	// ReadOnlyPaths get a read-only sub-scope: granted file-read* and explicitly
 	// denied file-write*, emitted LAST so the write-deny wins even when the path
@@ -164,15 +173,15 @@ type GenerateOptions struct {
 // volume and any read-write persistent-volume mount roots (opts.WritePaths, which
 // live outside the data volume on the APFS storage root), read-only
 // persistent-volume roots (opts.ReadPaths), and — when sp.AllowNetwork is set —
-// outbound to the cluster DNS VIP (and, when opts.Posture.APIServerVIP is set,
-// the in-cluster API-server VIP; plus, when opts.PodIP is known, a network-bind
-// scoped to that IP).
+// UNFILTERED network-outbound and network-bind (plus the mach-lookup rules the
+// DNS resolver path needs). Per-IP scoping (VIP egress, per-pod-IP bind) is NOT
+// expressible in the macOS 26 Seatbelt grammar — see the AllowNetwork stanza.
 //
-// The pods-root, the protected-prefix deny-set, and the resolver VIP are derived
-// from opts.Posture (the node-level work-dir), so a user-space daemon whose
-// work-dir lives under its home pins every per-pod path under that work-dir
-// rather than the legacy /var/lib/k3sm. A work-dir that is malformed or escapes
-// the configured home is rejected (ErrInvalidWorkDir / ErrWorkDirEscapesHome).
+// The pods-root and the protected-prefix deny-set are derived from opts.Posture
+// (the node-level work-dir), so a user-space daemon whose work-dir lives under
+// its home pins every per-pod path under that work-dir rather than the legacy
+// /var/lib/k3sm. A work-dir that is malformed or escapes the configured home is
+// rejected (ErrInvalidWorkDir / ErrWorkDirEscapesHome).
 //
 // Because the unprivileged posture runs pods at the same uid as the runtime
 // client (no per-pod uid isolation), the Seatbelt default-deny is the ONLY
@@ -206,7 +215,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 	// Derive the node-level deny-set from the configured work-dir, rejecting a
 	// malformed or home-escaping work-dir BEFORE emitting anything (fail closed).
-	podsRoot, protectedPrefixes, resolverVIP, apiServerVIP, err := resolvePosture(opts.Posture)
+	podsRoot, protectedPrefixes, err := resolvePosture(opts.Posture)
 	if err != nil {
 		return "", err
 	}
@@ -266,34 +275,41 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("  (literal \"/dev/null\"))\n")
 
 	if sp.GetAllowNetwork() {
-		// Scope egress to the cluster DNS resolver VIP + the system DNS resolver
-		// the libresolv path consults via mach. This is the minimum a pod needs
-		// to resolve Service names; broader egress is an explicit M2 opt-in.
-		b.WriteString(";; network: outbound to the cluster DNS resolver VIP only.\n")
-		b.WriteString("(allow network-outbound\n")
-		b.WriteString(fmt.Sprintf("  (remote ip %q)\n", fmt.Sprintf("%s:53", resolverVIP)))
-		b.WriteString(fmt.Sprintf("  (remote ip %q))\n", fmt.Sprintf("%s:0", resolverVIP)))
-		if apiServerVIP != "" {
-			// Additionally scope egress to the in-cluster API-server VIP (the
-			// kubernetes ClusterIP) so an in-pod client-go rest.InClusterConfig()
-			// reaches the API server through the datapath VIP. Paired :443/:0 mirrors
-			// the DNS-VIP idiom above; emitted ONLY when the node sets APIServerVIP.
-			b.WriteString(";; network: outbound to the in-cluster API-server VIP.\n")
-			b.WriteString("(allow network-outbound\n")
-			b.WriteString(fmt.Sprintf("  (remote ip %q)\n", fmt.Sprintf("%s:443", apiServerVIP)))
-			b.WriteString(fmt.Sprintf("  (remote ip %q))\n", fmt.Sprintf("%s:0", apiServerVIP)))
-		}
+		// ============================================================================
+		// macOS 26 SBPL GRAMMAR CEILING — per-IP network scoping DOES NOT COMPILE.
+		//
+		// PROBE-VERIFIED on macOS 26.5.1 through the real k3sm-execshim/libsandbox
+		// path: Seatbelt network-address filters accept ONLY `localhost` or `*` as
+		// the host. (remote ip "10.43.0.10:53"), (local ip "<PodIP>:*"), and every
+		// tcp4/ip4/tcp dialect variant FAIL to compile with "host must be * or
+		// localhost in network address" — so the pre-M10.1 VIP-scoped outbound
+		// allows and PodIP-scoped bind allow made EVERY AllowNetwork pod fail at
+		// sandbox_apply (networked pods could not spawn at all).
+		//
+		// What the grammar DOES support: per-PORT scoping compiles and enforces
+		// precisely ((local ip "*:8899") allowed :8899 and denied :8898), and
+		// localhost-host filters compile. Whether `localhost` matches lo0-ALIASED
+		// per-pod addresses is UNKNOWN without a root-gated lab probe, so
+		// port-scoped and localhost-scoped TIGHTENINGS are a named follow-up —
+		// not emitted here.
+		//
+		// Honest consequence: for an allow_network pod, networking allowed means
+		// networking ALLOWED — unfiltered outbound + bind under the profile's
+		// (deny default). The isolation story for a networked pod stays fs/exec
+		// confinement plus the vm RuntimeClass for untrusted tenancy; NEVER claim
+		// network isolation from Seatbelt. Posture.ResolverVIP/APIServerVIP and
+		// GenerateOptions.PodIP are plumbing-only (DNS env/status) — they render
+		// no SBPL.
+		// ============================================================================
+		b.WriteString(";; network: ALLOWED — unfiltered outbound+bind under (deny default).\n")
+		b.WriteString(";; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;\n")
+		b.WriteString(";; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.\n")
+		b.WriteString("(allow network-outbound)\n")
+		b.WriteString("(allow network-bind)\n")
 		b.WriteString(";; mach-lookup the DNS resolver path (mDNSResponder) needs.\n")
 		b.WriteString("(allow mach-lookup\n")
 		b.WriteString("  (global-name \"com.apple.dnssd.service\")\n")
 		b.WriteString("  (global-name \"com.apple.mDNSResponder\"))\n")
-		if opts.PodIP != "" {
-			// network-bind: scope to the pod's OWN lo0 IP so it cannot bind() a
-			// neighbor pod's /32 alias on the shared loopback (pods share lo0).
-			b.WriteString(";; network-bind: scope to the pod's own lo0 IP (pods share lo0).\n")
-			b.WriteString("(allow network-bind\n")
-			b.WriteString(fmt.Sprintf("  (local ip %q))\n", fmt.Sprintf("%s:*", opts.PodIP)))
-		}
 	} else {
 		b.WriteString(";; network: default-deny (no allow-network).\n")
 	}
@@ -361,46 +377,39 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	return b.String(), nil
 }
 
-// resolvePosture validates p.WorkDir and returns the derived pods-root, the
+// resolvePosture validates p.WorkDir and returns the derived pods-root and the
 // ordered protected-prefix deny-set (the fixed system subtrees plus the
-// pods-root), the resolver VIP, and the API-server VIP. An empty WorkDir falls
-// back to DefaultWorkDir; a non-empty WorkDir must be absolute and clean
-// (ErrInvalidWorkDir) and — when p.Home is set — must reside under Home
-// (ErrWorkDirEscapesHome). An empty ResolverVIP falls back to DefaultResolverVIP;
-// an empty APIServerVIP is returned as-is (no default — no rule is emitted).
-func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, resolverVIP, apiServerVIP string, err error) {
+// pods-root). An empty WorkDir falls back to DefaultWorkDir; a non-empty WorkDir
+// must be absolute and clean (ErrInvalidWorkDir) and — when p.Home is set — must
+// reside under Home (ErrWorkDirEscapesHome). The Posture VIP fields are NOT
+// consumed here: since M10.1 they render no SBPL (see the AllowNetwork stanza in
+// Generate) and exist only for the DNS env/status plumbing.
+func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, err error) {
 	workDir := p.WorkDir
 	if workDir == "" {
 		workDir = DefaultWorkDir
 	} else {
 		if !filepath.IsAbs(workDir) {
-			return "", nil, "", "", fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
+			return "", nil, fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
 		}
 		if workDir == "/" {
-			return "", nil, "", "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
+			return "", nil, fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
 		}
 		if filepath.Clean(workDir) != workDir {
-			return "", nil, "", "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
+			return "", nil, fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
 		}
 	}
 	if p.Home != "" {
 		home := filepath.Clean(p.Home)
 		if !isUnder(workDir, home) {
-			return "", nil, "", "", fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
+			return "", nil, fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
 		}
 	}
 	podsRoot = filepath.Join(workDir, "pods")
 	// Pin the pods-root into the protected deny-set so a caller's extra path can
 	// never reach a sibling pod, then keep the fixed system subtrees.
 	protectedPrefixes = append([]string{podsRoot}, systemProtectedPrefixes...)
-	resolverVIP = p.ResolverVIP
-	if resolverVIP == "" {
-		resolverVIP = DefaultResolverVIP
-	}
-	// APIServerVIP has no default: empty means "emit no API-server egress rule"
-	// (back-compatible — a zero Posture renders an unchanged profile).
-	apiServerVIP = p.APIServerVIP
-	return podsRoot, protectedPrefixes, resolverVIP, apiServerVIP, nil
+	return podsRoot, protectedPrefixes, nil
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected

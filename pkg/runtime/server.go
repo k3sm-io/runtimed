@@ -133,6 +133,13 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	st := r.podStatus(p)
 	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
+	// Release the pod's networking (with real IPAM behind the seam, its /32 lo0
+	// alias — skipping this leaks one address of the 253/node pool per pod
+	// churn). Best-effort log-and-continue: a teardown error never blocks the
+	// delete (the startup reconcile sweeps any stragglers).
+	if err := r.network.Teardown(req.GetPodId()); err != nil {
+		r.log.Warn("network teardown", "pod", req.GetPodId(), "err", err)
+	}
 	if err := r.removePodDir(req.GetPodId()); err != nil {
 		r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 	}
