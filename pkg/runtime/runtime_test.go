@@ -110,32 +110,52 @@ func (b *fakeVMBackend) created() (int, sandbox.VMSpec) {
 	return b.createCalls, b.lastSpec
 }
 
-// recordingNetwork is a supervisor.PodNetwork that records each Setup call — the
-// /32 lo0-alias allocation a host-process pod gets. The vm (guest) route must
-// NEVER call it: a NAT-attached guest is reached over the VZNATNetworkDeviceAttachment,
-// not a host lo0 alias. So a test asserts setupCount()==0 on the vm route and a
-// host pod still allocates exactly one alias.
+// recordingNetwork is a supervisor.PodNetwork that records each Setup and
+// Teardown call — the /32 lo0-alias allocation/release a host-process pod gets.
+// The vm (guest) route must NEVER call it: a NAT-attached guest is reached over
+// the VZNATNetworkDeviceAttachment, not a host lo0 alias. So a test asserts
+// setupCount()==0 on the vm route and a host pod still allocates exactly one
+// alias; the M10.1 tests assert Teardown fires on delete and on create-unwind.
 type recordingNetwork struct {
-	ip string
+	ip          string
+	setupErr    error
+	teardownErr error
 
-	mu     sync.Mutex
-	setups []string
+	mu        sync.Mutex
+	setups    []string
+	teardowns []string
 }
 
 func (n *recordingNetwork) Setup(_ context.Context, podID string) (string, error) {
 	n.mu.Lock()
 	n.setups = append(n.setups, podID)
 	n.mu.Unlock()
+	if n.setupErr != nil {
+		return "", n.setupErr
+	}
 	if n.ip == "" {
 		return "10.1.2.3", nil
 	}
 	return n.ip, nil
 }
 
+func (n *recordingNetwork) Teardown(podID string) error {
+	n.mu.Lock()
+	n.teardowns = append(n.teardowns, podID)
+	n.mu.Unlock()
+	return n.teardownErr
+}
+
 func (n *recordingNetwork) setupCount() int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return len(n.setups)
+}
+
+func (n *recordingNetwork) teardownCalls() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]string{}, n.teardowns...)
 }
 
 // fakeSpawner returns sequential pids and records argv/env.
@@ -962,14 +982,13 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	w.release(1001)
 }
 
-// TestRuntimeConfigThreadsPostureVIPs is the M3.3 control-plane seam: the cluster
-// DNS VIP and the in-cluster API VIP set on runtime.Config must reach the per-pod
-// SBPL egress allow-list via sandbox.Posture (pod.go), so a Seatbelt-confined
-// pod's in-pod DNS and client-go rest.InClusterConfig() can dial the datapath
-// VIPs. With both set the profile scopes egress to <ResolverVIP>:53 and
-// <APIServerVIP>:443; an empty Config stays back-compatible (the SBPL's built-in
-// default DNS VIP, no API rule). Egress is gated on allow_network, so the box
-// opts in.
+// TestRuntimeConfigThreadsPostureVIPs pins the M10.1 posture: the cluster VIPs
+// set on runtime.Config still thread into sandbox.Posture (pod.go — the DNS
+// env/status plumbing reads them) but are PLUMBING-ONLY and must render NO SBPL
+// rule, because per-IP network filters do not compile on macOS 26 — the
+// pre-M10.1 VIP-scoped stanza failed sandbox_apply and no networked pod could
+// spawn. A networked pod's profile instead carries the unfiltered
+// (allow network-outbound) / (allow network-bind), VIPs set or not.
 func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {
 	const (
 		resolverVIP = "10.43.0.10"
@@ -982,16 +1001,17 @@ func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {
 		wantAbsent  []string
 	}{
 		{
-			name:        "vips-set",
+			name:        "vips-set-plumbing-only",
 			cfg:         Config{ResolverVIP: resolverVIP, APIServerVIP: apiVIP},
-			wantPresent: []string{`(remote ip "10.43.0.10:53")`, `(remote ip "10.43.0.1:443")`},
-			wantAbsent:  []string{`(remote ip "10.96.0.10:53")`}, // not the built-in default
+			wantPresent: []string{"(allow network-outbound)", "(allow network-bind)"},
+			// The VIPs must not leak into the SBPL in any form (no per-IP filter).
+			wantAbsent: []string{"(remote ip", "(local ip", resolverVIP, apiVIP},
 		},
 		{
-			name:        "vips-unset-backcompat",
+			name:        "vips-unset-same-profile",
 			cfg:         Config{},
-			wantPresent: []string{`(remote ip "10.96.0.10:53")`}, // sandbox.DefaultResolverVIP
-			wantAbsent:  []string{`:443")`},                      // no API-server egress at all
+			wantPresent: []string{"(allow network-outbound)", "(allow network-bind)"},
+			wantAbsent:  []string{"(remote ip", "(local ip"},
 		},
 	}
 	for _, tc := range cases {

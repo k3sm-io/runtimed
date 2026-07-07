@@ -19,8 +19,8 @@ package supervisor
 import "context"
 
 // NodeNetwork is the M1 single-node PodNetwork: every pod shares the node IP (no
-// per-pod lo0 alias yet). It is the no-op seam darwin-net replaces with real IPAM
-// + a Service proxy in a later milestone.
+// per-pod lo0 alias yet). It is the no-op seam the k3sm-injected adapter over
+// darwin-net's podnet IPAM replaces (M10.1).
 type NodeNetwork struct {
 	// IP is the node IP handed to every pod. Empty yields the loopback default.
 	IP string
@@ -33,3 +33,7 @@ func (n NodeNetwork) Setup(_ context.Context, _ string) (string, error) {
 	}
 	return n.IP, nil
 }
+
+// Teardown is a no-op: NodeNetwork allocates nothing per pod, so there is
+// nothing to release. The real IPAM adapter releases the pod's /32 lo0 alias.
+func (n NodeNetwork) Teardown(_ string) error { return nil }
