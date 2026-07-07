@@ -68,6 +68,15 @@ func NewServer(rt *Runtime, opts ...grpc.ServerOption) *Server {
 // clean shutdown (a closed listener / cancelled ctx). The caller owns lis and may
 // close it to force-stop; Serve never closes lis itself.
 func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
+	// Reconcile pod-network startup state BEFORE accepting any CreatePod: the
+	// real IPAM adapter's in-memory allocator must be re-synced with the durable
+	// lo0 aliases a `kickstart -k` restart left behind, or new allocations
+	// collide with stale aliases and orphans leak the pool. Runs exactly once
+	// per Runtime (sticky), a no-op when the network has no reconciler.
+	if err := s.rt.reconcileNetworkStartup(ctx); err != nil {
+		return fmt.Errorf("reconcile pod network startup state: %w", err)
+	}
+
 	// Watch ctx: on cancellation, GracefulStop unblocks grpc.Serve. The goroutine
 	// always exits — either ctx fires (we stop, Serve returns) or Serve returns
 	// for another reason and we close stopped to release the goroutine.

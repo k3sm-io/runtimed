@@ -122,18 +122,17 @@ type Config struct {
 	// SampleInterval is the memory sampler's polling period (M2.5). Defaults to
 	// 1s (the ~1 Hz the design calls for); tests set it small.
 	SampleInterval time.Duration
-	// ResolverVIP is the cluster DNS Service VIP the per-pod SBPL egress allow-list
-	// is scoped to (threaded into sandbox.Posture.ResolverVIP), so a
-	// Seatbelt-confined pod can reach in-cluster DNS. The control plane (k3sm) sets
-	// it from the cluster service CIDR. Empty is back-compatible: the SBPL keeps
-	// its built-in default (sandbox.DefaultResolverVIP).
+	// ResolverVIP is the cluster DNS Service VIP for this node, threaded into
+	// sandbox.Posture.ResolverVIP. PLUMBING-ONLY since M10.1: it renders NO SBPL
+	// rule (per-IP network filters do not compile on macOS 26 — see
+	// sandbox.Generate); it is the node-level DNS configuration the env/status
+	// plumbing reads. The control plane (k3sm) sets it from the service CIDR;
+	// empty falls back to sandbox.DefaultResolverVIP.
 	ResolverVIP string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the `kubernetes`
-	// ClusterIP) the per-pod SBPL egress allow-list is scoped to (threaded into
-	// sandbox.Posture.APIServerVIP), so a confined pod's client-go
-	// rest.InClusterConfig() can reach the API server. The control plane (k3sm)
-	// sets it from the cluster service CIDR. Empty is back-compatible: no
-	// API-server egress rule is emitted.
+	// ClusterIP), threaded into sandbox.Posture.APIServerVIP. PLUMBING-ONLY since
+	// M10.1: like ResolverVIP it renders NO SBPL rule — an allow_network pod has
+	// unfiltered egress. The control plane (k3sm) sets it from the service CIDR.
 	APIServerVIP string
 }
 
@@ -181,8 +180,47 @@ type Runtime struct {
 	// for fast, deterministic runs — there is no clock seam in this package.
 	drainGrace time.Duration
 
+	// netReconcileOnce/netReconcileErr make the optional network startup
+	// reconcile (NetworkReconciler) run exactly once per Runtime, BEFORE any
+	// CreatePod is served. Once.Do provides the happens-before for the error
+	// read; a repeated Serve re-reports the sticky first result.
+	netReconcileOnce sync.Once
+	netReconcileErr  error
+
 	mu   sync.Mutex
 	pods map[string]*pod
+}
+
+// NetworkReconciler is the OPTIONAL startup-reconcile seam a Deps.Network may
+// additionally implement. The real IPAM adapter (k3sm-injected, over
+// darwin-net's podnet) keeps its allocation state IN MEMORY while the /32 lo0
+// aliases it binds are DURABLE on the interface — so after a daemon restart
+// (`launchctl kickstart -k`) the fresh allocator and the surviving aliases
+// disagree: new allocations collide with stale aliases and orphaned aliases
+// leak pool addresses. ReconcileStartup runs once, before the runtime serves
+// CreatePod, to sweep stale aliases / reattach state (implemented adapter-side;
+// runtimed only provides the hook). The no-op NodeNetwork does not implement it.
+type NetworkReconciler interface {
+	// ReconcileStartup reconciles durable node network state (lo0 aliases)
+	// with the adapter's allocator before any pod is created.
+	ReconcileStartup(ctx context.Context) error
+}
+
+// reconcileNetworkStartup runs the network's optional startup reconcile exactly
+// once (see NetworkReconciler). A Network that does not implement the seam is a
+// nil hook: the call is a no-op returning nil. The first result is sticky — a
+// failed reconcile keeps failing every Serve rather than serving CreatePod over
+// an inconsistent alias table (fail closed).
+func (r *Runtime) reconcileNetworkStartup(ctx context.Context) error {
+	r.netReconcileOnce.Do(func() {
+		nr, ok := r.network.(NetworkReconciler)
+		if !ok {
+			return
+		}
+		r.log.Info("reconciling pod network startup state")
+		r.netReconcileErr = nr.ReconcileStartup(ctx)
+	})
+	return r.netReconcileErr
 }
 
 // Deps are the swappable subsystem seams a Runtime is built from. New fills any

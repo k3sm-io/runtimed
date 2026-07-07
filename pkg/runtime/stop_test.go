@@ -32,21 +32,27 @@ type sentSignal struct {
 }
 
 // recordingSignalGroup records the signals DeletePod / oomKill send to process
-// groups, and optionally (onKill) runs a hook when a SIGKILL is recorded — the OOM
-// test wires it to release a fake waiter so the "killed" container actually exits.
+// groups, and optionally runs a hook when a SIGKILL (onKill) or SIGTERM (onTerm)
+// is recorded — tests wire the hooks to release a fake waiter so the signaled
+// container actually exits.
 type recordingSignalGroup struct {
 	mu     sync.Mutex
 	sent   []sentSignal
 	onKill func(pid int)
+	onTerm func(pid int)
 }
 
 func (r *recordingSignalGroup) signal(pid int, sig os.Signal) error {
 	r.mu.Lock()
 	r.sent = append(r.sent, sentSignal{pid, sig})
 	onKill := r.onKill
+	onTerm := r.onTerm
 	r.mu.Unlock()
 	if onKill != nil && sig == killSignal {
 		onKill(pid)
+	}
+	if onTerm != nil && sig == termSignal {
+		onTerm(pid)
 	}
 	return nil
 }
@@ -59,6 +65,14 @@ func (r *recordingSignalGroup) signals() []os.Signal {
 		out[i] = s.sig
 	}
 	return out
+}
+
+// sentSignals returns a copy of every recorded (pid, signal) pair in send order,
+// so the sidecar tests can assert reverse-start-order teardown across pids.
+func (r *recordingSignalGroup) sentSignals() []sentSignal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]sentSignal{}, r.sent...)
 }
 
 func (r *recordingSignalGroup) sawKill() bool {

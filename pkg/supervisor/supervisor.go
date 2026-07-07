@@ -46,13 +46,19 @@ type Spawner interface {
 	Spawn(ctx context.Context, spec SpawnSpec) (pid int, err error)
 }
 
-// PodNetwork sets up pod networking and returns the pod IP to bind/advertise.
-// M1 wires a node-IP/no-op implementation (single node); darwin-net supplies the
-// real lo0 IPAM + Service proxy later. Defined here at the consumer per the
-// standards (small, 1 method).
+// PodNetwork sets up and tears down pod networking. M1 wires a node-IP/no-op
+// implementation (NodeNetwork); the k3sm-injected adapter over darwin-net's
+// podnet IPAM supplies the real per-pod /32 lo0 aliases (M10.1). Defined here at
+// the consumer per the standards (small, 2 methods).
 type PodNetwork interface {
 	// Setup provisions networking for podID and returns the pod's IP.
 	Setup(ctx context.Context, podID string) (ip string, err error)
+	// Teardown releases podID's networking (with real IPAM behind the seam, the
+	// pod's /32 lo0 alias — without it every pod churn leaks one address of the
+	// 253/node pool). It must be idempotent and tolerate an unknown podID (a pod
+	// whose Setup never ran, e.g. the vm route): best-effort, callers
+	// log-and-continue and never block pod deletion on its error.
+	Teardown(podID string) error
 }
 
 // ExitWaiter blocks until the process pid exits and returns its wait status,

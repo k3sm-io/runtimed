@@ -19,10 +19,11 @@
 ;; data volume is re-allowed below, after the protected denies.
 (allow file-write*
   (literal "/dev/null"))
-;; network: outbound to the cluster DNS resolver VIP only.
-(allow network-outbound
-  (remote ip "10.96.0.10:53")
-  (remote ip "10.96.0.10:0"))
+;; network: ALLOWED — unfiltered outbound+bind under (deny default).
+;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
+;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.
+(allow network-outbound)
+(allow network-bind)
 ;; mach-lookup the DNS resolver path (mDNSResponder) needs.
 (allow mach-lookup
   (global-name "com.apple.dnssd.service")

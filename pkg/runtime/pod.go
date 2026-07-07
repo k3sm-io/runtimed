@@ -73,6 +73,12 @@ type pod struct {
 	// is fired on pod teardown (DeletePod). Stored as the CancelFunc only — the
 	// context itself is passed down to the goroutines, never held in this struct.
 	cancel context.CancelFunc
+
+	// sidecarTeardown marks the voluntary-completion sidecar teardown as claimed
+	// (guarded by mu): the first main-container exit that concludes the pod stops
+	// the native sidecars exactly once, even when several mains terminate
+	// concurrently (see watchContainerExit / stopSidecars).
+	sidecarTeardown bool
 }
 
 // containerPIDs returns the pod's currently-running container PIDs (the memory
@@ -105,6 +111,25 @@ type containerProc struct {
 	// transient termination as a pod-terminal event (which would flip the pod to
 	// Succeeded/Failed and cancel the memory sampler). Guarded by pod.mu.
 	restarting bool
+	// initDeclared marks a container declared in the pod's INIT list. Combined
+	// with the retained spec's restart_policy it derives sidecar(); deriving the
+	// class from the spec (rather than copying a second flag) means a
+	// RestartContainer re-spawn keeps the same lifecycle class as long as
+	// initDeclared is threaded through (see RestartContainer). Immutable after
+	// startContainer.
+	initDeclared bool
+}
+
+// sidecar reports whether cp is a NATIVE SIDECAR (KEP-753): an init-declared
+// container with restart_policy ALWAYS. A sidecar is long-lived — spawned in its
+// init-list position but not waited to completion — EXCLUDED from the mains-only
+// terminal phase accounting (recomputePhaseLocked), reported under
+// init_container_statuses, and stopped in reverse start order after the mains
+// (stopSidecars). Per the apis restart_policy contract the field is meaningful
+// ONLY on an init container, so a main container carrying ALWAYS is NOT a sidecar.
+func (cp *containerProc) sidecar() bool {
+	return cp.initDeclared &&
+		cp.spec.GetRestartPolicy() == runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS
 }
 
 // createPod is the CreatePod spine (called with no lock held). It materializes
@@ -152,6 +177,17 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
 			fmt.Errorf("network setup pod %s: %w", box.GetPodId(), err)
 	}
+	// Unwind the successful Setup if any LATER create step fails: without this,
+	// a failed create leaks the pod's /32 (real IPAM allocates one per Setup and
+	// DeletePod never runs for a pod that was never created). Best-effort
+	// log-and-continue, mirroring the delete-path Teardown.
+	defer func() {
+		if retErr != nil {
+			if terr := r.network.Teardown(box.GetPodId()); terr != nil {
+				r.log.Warn("network teardown after failed create", "pod", box.GetPodId(), "err", terr)
+			}
+		}
+	}()
 
 	rootfs := r.rootfsPath(box)
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
@@ -206,8 +242,9 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 			// pod's writable re-allow outside the daemon's data area.
 			WorkDir: r.cfg.Root,
 			Home:    r.home,
-			// Scope per-pod egress to the cluster DNS + in-cluster API VIPs. Empty
-			// keeps the SBPL's back-compatible default DNS VIP / no API rule.
+			// The VIPs are plumbing-only (DNS env/status): since M10.1 they render
+			// NO SBPL rule — per-IP network filters do not compile on macOS 26
+			// (see sandbox.Generate's AllowNetwork stanza).
 			ResolverVIP:  r.cfg.ResolverVIP,
 			APIServerVIP: r.cfg.APIServerVIP,
 		},
@@ -256,15 +293,32 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		cancel:  podCancel,
 	}
 
-	// init_containers run first, sequentially, each to completion; then the main
-	// containers start. M1 starts all main containers and tracks them; the
-	// per-container sequencing of init containers is honored by starting+waiting
-	// them in order. The supervision runs under podCtx (detached from the request
-	// ctx), so an init container's exit is reaped even after CreatePod returns.
+	// init_containers run first, sequentially; then the main containers start.
+	// A plain init container (restart_policy UNSPECIFIED — the byte-legacy apis
+	// contract) runs TO COMPLETION before the next init step, exactly as in M1.
+	// An init container with restart_policy ALWAYS is a NATIVE SIDECAR (KEP-753,
+	// M10.2): it is spawned in its init-list position through the same
+	// startContainer machinery (same confinement class + rootfs resolution) but
+	// NOT waited — the sequence proceeds once it is started (spawn-equals-started;
+	// startup-probe gating of progression is deliberately out of scope per the
+	// apis restart_policy contract). A sidecar joins p.containers so the status
+	// stream and RestartContainer find it by name; it is excluded from the
+	// mains-only phase accounting (recomputePhaseLocked) and torn down in reverse
+	// start order after the mains (stopSidecars). runtimed performs NO exit-driven
+	// sidecar restarts — the provider is the single restart authority via
+	// RestartContainer. The supervision runs under podCtx (detached from the
+	// request ctx), so an init container's exit is reaped even after CreatePod
+	// returns.
 	for _, c := range box.GetInitContainers() {
 		cp, reason, err := r.startContainer(podCtx, p, rootfs, c, true)
 		if err != nil {
 			return nil, reason, err
+		}
+		if cp.sidecar() {
+			p.mu.Lock()
+			p.containers = append(p.containers, cp)
+			p.mu.Unlock()
+			continue
 		}
 		code, _, werr := cp.proc.Wait(podCtx)
 		if werr != nil {
@@ -379,6 +433,12 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // ad-hoc signs + gates it, and spawns it under the pod's Seatbelt profile via the
 // exec-shim backend. It returns the running containerProc.
 //
+// isInit records that c was declared in the pod's init list (containerProc.
+// initDeclared), from which sidecar() derives the lifecycle class. It does NOT
+// alter confinement: the SBPL profile is pod-scoped (p.profile) and the rootfs
+// resolution is pod-scoped too (the caller passes r.rootfsPath), identical for
+// init, sidecar, and main containers.
+//
 // ctx is the pod-lifetime SUPERVISION context (createPod's podCtx; restart passes a
 // context.WithoutCancel) — NOT the CreatePod request ctx. It scopes the spawn, the
 // kqueue reaper, and the watchContainerExit drain-wait to the pod's lifetime so they
@@ -414,9 +474,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		Dir:  c.GetWorkingDir(),
 	}
 	cp := &containerProc{
-		name: c.GetName(),
-		spec: c,
-		logs: logs,
+		name:         c.GetName(),
+		spec:         c,
+		initDeclared: isInit,
+		logs:         logs,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
@@ -520,11 +581,30 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	r.recomputePhaseLocked(p)
 	terminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED || p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
 	cancel := p.memCancel
+	// Voluntary-completion sidecar teardown (M10.2): the mains just concluded the
+	// pod (mains-only accounting above), so any still-running native sidecars are
+	// stopped in REVERSE start order BEFORE the terminal publish below. The claim
+	// is made under p.mu so concurrent main exits initiate the teardown exactly
+	// once — and DeletePod claims it up front, so a delete-driven main exit defers
+	// to the delete's own two-phase stop.
+	var sidecars []*containerProc
+	if terminal && !p.sidecarTeardown {
+		p.sidecarTeardown = true
+		sidecars = sidecarsLocked(p)
+	}
 	p.mu.Unlock()
 
 	// Stop the memory sampler once the pod is fully terminated (no goroutine leak).
 	if terminal && cancel != nil {
 		cancel()
+	}
+
+	if len(sidecars) > 0 {
+		// One pod-level grace budget, anchored NOW: the mains exited on their own
+		// (voluntary completion) and consumed none of it, so the sidecars share the
+		// whole configured budget in reverse start order (see stopSidecars).
+		deadline := time.Now().Add(graceDuration(0, p))
+		r.stopSidecars(ctx, p.box.GetPodId(), sidecars, deadline)
 	}
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
@@ -565,15 +645,21 @@ func terminationMessageFromLogs(logs *logBuffer) string {
 	return string(msg)
 }
 
-// recomputePhaseLocked updates the pod phase from its containers' states. Caller
-// holds p.mu.
+// recomputePhaseLocked updates the pod phase from its MAIN containers' states.
+// Native sidecars are EXCLUDED from the terminal accounting (the mains-only rule
+// of the apis restart_policy contract): when every main has terminated the pod
+// goes Succeeded/Failed on the mains alone, even with sidecars still running (the
+// Job-with-sidecar case), and a crashed/exited sidecar never concludes the pod by
+// itself. Caller holds p.mu.
 func (r *Runtime) recomputePhaseLocked(p *pod) {
-	if len(p.containers) == 0 {
-		return
-	}
+	mains := 0
 	allTerminated := true
 	anyFailed := false
 	for _, cp := range p.containers {
+		if cp.sidecar() {
+			continue
+		}
+		mains++
 		// A container mid-restart is being re-spawned: do not let its transient
 		// termination conclude the pod (the new process is about to replace it).
 		if cp.restarting {
@@ -588,6 +674,9 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 		if term.GetExitCode() != 0 {
 			anyFailed = true
 		}
+	}
+	if mains == 0 {
+		return
 	}
 	switch {
 	case allTerminated && anyFailed:
