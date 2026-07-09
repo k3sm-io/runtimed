@@ -885,6 +885,43 @@ func TestGetRuntimeInfo(t *testing.T) {
 	}
 }
 
+// TestGetRuntimeInfo_VMAvailability asserts GetRuntimeInfo advertises the vm
+// backend's availability as a VMBackendAvailable RuntimeCondition, driven by the
+// injectable VMBackend seam (fakeVMBackend): probe available => TRUE, else FALSE.
+// No real VZ hardware (B1 — the node reads this to set k3sm.io/vm-capable).
+func TestGetRuntimeInfo_VMAvailability(t *testing.T) {
+	cases := []struct {
+		name        string
+		vmAvailable bool
+		want        runtimev1.ConditionStatus
+	}{
+		{"vm available", true, runtimev1.ConditionStatus_CONDITION_STATUS_TRUE},
+		{"vm unavailable", false, runtimev1.ConditionStatus_CONDITION_STATUS_FALSE},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newTestRuntime(t, Deps{VMBackend: &fakeVMBackend{available: tc.vmAvailable}})
+			info, err := rt.GetRuntimeInfo(context.Background(), &runtimev1.GetRuntimeInfoRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got *runtimev1.RuntimeCondition
+			for _, c := range info.GetConditions() {
+				if c.GetType() == "VMBackendAvailable" {
+					got = c
+					break
+				}
+			}
+			if got == nil {
+				t.Fatalf("GetRuntimeInfo did not advertise a VMBackendAvailable condition; conditions = %v", info.GetConditions())
+			}
+			if got.GetStatus() != tc.want {
+				t.Errorf("VMBackendAvailable status = %v, want %v", got.GetStatus(), tc.want)
+			}
+		})
+	}
+}
+
 // fakeResolver serves canned ConfigMap/Secret data + a token for the volume
 // materializer (the provider's apiserver-backed Resolver stands in here).
 type fakeResolver struct{}
