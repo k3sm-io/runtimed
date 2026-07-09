@@ -327,17 +327,39 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 		reason = "Unavailable"
 		msg = fmt.Sprintf("sandbox backend %q unavailable (pods would run unconfined; refusing)", r.backend.Name())
 	}
+	// VMBackendAvailable advertises whether this host can run the vm RuntimeClass
+	// (Virtualization.framework isSupported + the com.apple.security.virtualization
+	// entitlement — the SAFE probe on r.vmBackend, which never boots a VM). k3sm
+	// reads it at node bring-up to label the node truthfully (k3sm.io/vm-capable),
+	// so a VZ-incapable node is not silently offered as vm-schedulable. Carried as
+	// an additive RuntimeCondition Type — no proto change (B1).
+	vmCond := runtimev1.ConditionStatus_CONDITION_STATUS_FALSE
+	vmReason := "Unavailable"
+	vmMsg := "vm backend unavailable (Virtualization.framework unsupported or process unentitled); vm-RuntimeClass pods fail closed"
+	if r.vmBackend != nil && r.vmBackend.Available() {
+		vmCond = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+		vmReason = "Available"
+		vmMsg = fmt.Sprintf("vm backend %q available", r.vmBackend.Name())
+	}
 	return &runtimev1.GetRuntimeInfoResponse{
 		RuntimeName:    RuntimeName,
 		RuntimeVersion: r.cfg.RuntimeVersion,
 		ApiVersion:     apiVersion,
 		Healthy:        healthy,
-		Conditions: []*runtimev1.RuntimeCondition{{
-			Type:    "SandboxBackend",
-			Status:  cond,
-			Reason:  reason,
-			Message: msg,
-		}},
+		Conditions: []*runtimev1.RuntimeCondition{
+			{
+				Type:    "SandboxBackend",
+				Status:  cond,
+				Reason:  reason,
+				Message: msg,
+			},
+			{
+				Type:    "VMBackendAvailable",
+				Status:  vmCond,
+				Reason:  vmReason,
+				Message: vmMsg,
+			},
+		},
 	}, nil
 }
 
