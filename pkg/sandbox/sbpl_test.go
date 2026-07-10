@@ -74,10 +74,12 @@ func TestGenerateDenySet(t *testing.T) {
 		{"import-system", `(import "system.sb")`},
 		{"deny-users", "(deny file-read* file-write*\n  (subpath \"/Users\"))"},
 		{"deny-var-db", "(deny file-read* file-write*\n  (subpath \"/private/var/db\"))"},
-		{"deny-pods-root", "(deny file-read* file-write*\n  (subpath \"/var/lib/k3sm/pods\"))"},
+		{"deny-pods-root", "(deny file-read* file-write*\n  (subpath \"/var/lib/k3sm/pods\")"},
+		{"deny-pods-root-firmlink", "(subpath \"/private/var/lib/k3sm/pods\")"},
 		{"deny-cryptex-write", "(deny file-write*\n  (subpath \"/System/Volumes/Preboot/Cryptexes\")"},
 		{"dyld-read-exception", "(subpath \"/private/var/db/dyld\")"},
-		{"datavol-reallow", "(allow file-read* file-write*\n  (subpath \"" + dataVol + "\"))"},
+		{"datavol-reallow", "(allow file-read* file-write*\n  (subpath \"" + dataVol + "\")"},
+		{"datavol-reallow-firmlink", "(subpath \"/private" + dataVol + "\")"},
 		{"read-system", "(subpath \"/System\")"},
 		{"net-outbound-unfiltered", "(allow network-outbound)"},
 		{"net-bind-unfiltered", "(allow network-bind)"},
@@ -127,7 +129,7 @@ func TestGenerateProtectedDeniesAfterExtraAllows(t *testing.T) {
 	iExtra := strings.Index(out, `(subpath "/opt/data")`)
 	iDenyUsers := strings.Index(out, `(subpath "/Users")`)
 	iDenyPods := strings.Index(out, `(subpath "/var/lib/k3sm/pods")`)
-	iDataReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\"))")
+	iDataReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\")")
 	for name, i := range map[string]int{"extra": iExtra, "deny-users": iDenyUsers, "deny-pods": iDenyPods, "datavol-reallow": iDataReallow} {
 		if i < 0 {
 			t.Fatalf("fragment %q not found in profile:\n%s", name, out)
@@ -189,7 +191,7 @@ func TestGenerateSecretReadOnlySubScope(t *testing.T) {
 	if !strings.Contains(out, "(allow file-read*\n  (subpath \""+secret+"\")") {
 		t.Errorf("secret missing file-read* sub-scope:\n%s", out)
 	}
-	iDataWrite := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\"))")
+	iDataWrite := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\")")
 	iCredDeny := strings.Index(out, "(deny file-write*\n  (subpath \""+secret+"\")")
 	if iDataWrite < 0 || iCredDeny < 0 {
 		t.Fatalf("missing data-vol write re-allow (%d) or credential write-deny (%d):\n%s", iDataWrite, iCredDeny, out)
@@ -215,14 +217,15 @@ func TestPVCInSBPLWriteScope(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	// The PV root is granted file-write* (the write block carries the subpath).
-	wantWriteBlock := "(allow file-write*\n  (subpath \"" + pvWrite + "\")\n  (literal \"/dev/null\"))"
+	// The PV root (under the /var firmlink) is granted file-write* in BOTH the raw
+	// and /private-resolved form (the write block carries both subpaths).
+	wantWriteBlock := "(allow file-write*\n  (subpath \"" + pvWrite + "\")\n  (subpath \"/private" + pvWrite + "\")\n  (literal \"/dev/null\"))"
 	if !strings.Contains(out, wantWriteBlock) {
-		t.Errorf("PV mount root missing file-write* allow:\n%s", out)
+		t.Errorf("PV mount root missing file-write* allow (both firmlink forms):\n%s", out)
 	}
-	// A read-write PV must be readable too (it joins the read allow).
-	if !strings.Contains(out, "(subpath \""+pvWrite+"\")\n  (literal \"/dev/null\") (literal \"/dev/zero\")") {
-		t.Errorf("PV mount root missing file-read* allow:\n%s", out)
+	// A read-write PV must be readable too (it joins the read allow, both forms).
+	if !strings.Contains(out, "(subpath \""+pvWrite+"\")\n  (subpath \"/private"+pvWrite+"\")\n  (literal \"/dev/null\") (literal \"/dev/zero\")") {
+		t.Errorf("PV mount root missing file-read* allow (both firmlink forms):\n%s", out)
 	}
 	// The protected denies still win: /Users is denied AFTER the allows.
 	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \"/Users\"))") {
@@ -430,7 +433,7 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 	}
 
 	// The pods-root deny tracks the work-dir (NOT the legacy /var/lib/k3sm/pods).
-	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \""+podsRoot+"\"))") {
+	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \""+podsRoot+"\")") {
 		t.Errorf("pods-root deny does not track the work-dir (%q):\n%s", podsRoot, out)
 	}
 	if strings.Contains(out, "/var/lib/k3sm/pods") {
@@ -444,7 +447,7 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 	}
 	// The pod's own data volume is re-allowed AFTER the pods-root deny (last-match-wins).
 	iDeny := strings.Index(out, "(subpath \""+podsRoot+"\")")
-	iReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\"))")
+	iReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\")")
 	if iDeny < 0 || iReallow < 0 {
 		t.Fatalf("pods-root deny (%d) or data-vol re-allow (%d) missing:\n%s", iDeny, iReallow, out)
 	}

@@ -262,18 +262,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// --- allows (lowest precedence) ---------------------------------------
 	b.WriteString(";; read: OS + frameworks + validated extra read paths.\n")
 	b.WriteString("(allow file-read*\n")
-	for _, p := range readPaths {
-		b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
-	}
+	writeFirmlinkSubpaths(&b, readPaths)
 	b.WriteString("  (literal \"/dev/null\") (literal \"/dev/zero\")\n")
 	b.WriteString("  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n")
 
 	b.WriteString(";; write: validated extra write paths (+ /dev/null); the pod's own\n")
 	b.WriteString(";; data volume is re-allowed below, after the protected denies.\n")
 	b.WriteString("(allow file-write*\n")
-	for _, p := range writePaths {
-		b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
-	}
+	writeFirmlinkSubpaths(&b, writePaths)
 	b.WriteString("  (literal \"/dev/null\"))\n")
 
 	if sp.GetAllowNetwork() {
@@ -343,7 +339,8 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/private/var/db\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
-	b.WriteString(fmt.Sprintf("  (subpath %q))\n", podsRoot))
+	writeFirmlinkSubpaths(&b, []string{podsRoot})
+	b.WriteString("  )\n")
 	// The dyld cryptex is denied WRITE only: the dynamic linker must still READ
 	// the shared cache it holds, so denying read would SIGABRT every pod.
 	b.WriteString(";; dyld cryptex: deny WRITE only (read is needed at link time).\n")
@@ -357,7 +354,8 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("  (subpath \"/private/var/db/dyld\"))\n")
 	b.WriteString(";; re-allow THIS pod's own data volume (under the denied pods root).\n")
 	b.WriteString("(allow file-read* file-write*\n")
-	b.WriteString(fmt.Sprintf("  (subpath %q))\n", dataVol))
+	writeFirmlinkSubpaths(&b, []string{dataVol})
+	b.WriteString("  )\n")
 
 	// --- credential read-only sub-scope (highest precedence) --------------
 	// LAST, so this file-write* deny wins even though the credential lives inside
@@ -367,14 +365,10 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString(";; credentials (secrets / SA-token): read-only sub-scope, emitted\n")
 		b.WriteString(";; LAST so the write-deny wins inside the writable data volume.\n")
 		b.WriteString("(allow file-read*\n")
-		for _, p := range credPaths {
-			b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
-		}
+		writeFirmlinkSubpaths(&b, credPaths)
 		b.WriteString("  )\n")
 		b.WriteString("(deny file-write*\n")
-		for _, p := range credPaths {
-			b.WriteString(fmt.Sprintf("  (subpath %q)\n", filepath.Clean(p)))
-		}
+		writeFirmlinkSubpaths(&b, credPaths)
 		b.WriteString("  )\n")
 	}
 
@@ -475,6 +469,20 @@ func firmlinkForms(p string) []string {
 		}
 	}
 	return forms
+}
+
+// writeFirmlinkSubpaths writes a `(subpath …)` line for EVERY firmlink form of each
+// path (firmlinkForms). libsandbox matches a file path against its SYMLINK-RESOLVED
+// form, so a rule written only against the /var,/tmp,/etc firmlink silently
+// misfires — an ALLOW fails closed (the pod cannot read its own rebased volume
+// under /var/lib/k3sm/pods/…, which resolves to /private/var/…), a DENY fails OPEN.
+// Emitting both forms makes the rule hold regardless of which alias is addressed.
+func writeFirmlinkSubpaths(b *strings.Builder, paths []string) {
+	for _, p := range paths {
+		for _, form := range firmlinkForms(p) {
+			b.WriteString(fmt.Sprintf("  (subpath %q)\n", form))
+		}
+	}
 }
 
 // Validate checks that a rendered SBPL profile is fail-closed: it MUST contain
