@@ -260,6 +260,14 @@ func (f *fakePuller) credential() *image.RegistryCredential {
 	return f.lastCred
 }
 
+// ref returns the last image ref passed to Pull ("" if Pull was never called), so
+// a test can assert the native-sentinel path skips the registry entirely.
+func (f *fakePuller) ref() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastRef
+}
+
 // fakeSigner records sign calls and applies a policy-gate decision.
 type fakeSigner struct {
 	mu        sync.Mutex
