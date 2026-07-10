@@ -3,7 +3,7 @@
 Integration-tier proof of the runtimed **AF_UNIX barrier** (the `k3sm-netd-helper`
 change, deliverable #1): a pod confined by a generated SBPL profile **cannot
 `connect()`** to a denied AF_UNIX socket path — the explicit
-`(deny network-outbound (remote unix-socket (path-equal "…")))` that
+`(deny network-outbound (remote unix-socket (literal "…")))` that
 `sandbox.Generate` emits for each `SandboxProfile.denied_unix_socket_paths`.
 
 ## Why it exists

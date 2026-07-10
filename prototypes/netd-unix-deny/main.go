@@ -29,7 +29,7 @@ limitations under the License.
 // _k3sm uid (no per-pod uid isolation), so LOCAL_PEERCRED on the k3sm-netd helper
 // socket cannot tell a pod apart from the legitimate runtime client. The Seatbelt
 // default-deny already blocks the connect(), and sandbox.Generate emits an
-// EXPLICIT (deny network-outbound (remote unix-socket (path-equal …))) on top of
+// EXPLICIT (deny network-outbound (remote unix-socket (literal …))) on top of
 // it as the load-bearing, future-proof barrier. This prototype demonstrates the
 // live denial on macOS 26.
 //
