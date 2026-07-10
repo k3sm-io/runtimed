@@ -712,12 +712,36 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 	return r.signer.Check(ctx, policy, path)
 }
 
+// NativeImage is the k3sm HostProcess sentinel image reference (DESIGN §M0;
+// examples/hello-native.yaml). A container whose image is "native" runs its
+// command[0] as an absolute HOST binary in place — no registry pull, no rootfs
+// materialization — which is how every M2 conformance pod (and hello-native.yaml)
+// executes. It is the with-command analog of the empty-command host-binary
+// convention below (there the image itself is the path; here command[0] is).
+const NativeImage = "native"
+
 // resolveBinary determines the pod binary path + argv for a container. M1
 // convention (mirrors the proto): if command+args are empty the image reference
-// is the host binary path; otherwise the image is pulled+materialized and argv =
+// is the host binary path; if the image is the "native" sentinel the command runs
+// in place as a host binary; otherwise the image is pulled+materialized and argv =
 // command+args. The returned path is the on-disk executable to confine.
 func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, rootfs string, c *runtimev1.Container) (string, []string, error) {
 	cmd := c.GetCommand()
+
+	// Native HostProcess sentinel: run command[0] as an absolute host binary with
+	// no pull. Checked BEFORE the pull path — a "native" pod carries a command, so
+	// it would otherwise fall through and fail trying to fetch docker.io/library/native.
+	if c.GetImage() == NativeImage {
+		if len(cmd) == 0 {
+			return "", nil, fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage)
+		}
+		bin := cmd[0]
+		if !filepath.IsAbs(bin) {
+			return "", nil, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
+		}
+		return bin, append(append([]string{}, cmd...), c.GetArgs()...), nil
+	}
+
 	if len(cmd) == 0 && len(c.GetArgs()) == 0 {
 		// Host-binary convention: image is an absolute path run in place.
 		bin := c.GetImage()
