@@ -399,10 +399,10 @@ phases:
         deliverables:
           - id: M7.1-d1
             done: false
-            desc: .github/workflows/ci.yml — a THIN wrapper over the existing hack/ci.sh (no logic duplication) on macos-15 arm64 runners, CGO_ENABLED=1; runs unit + -race + the internal/spicanary symbol-canary on EVERY matrix image (the canary is the runner-macOS-15-vs-target-macOS-26 skew tripwire, m7-plan M7.2)
+            desc: .github/workflows/ci.yml — a THIN wrapper over the existing hack/ci.sh (no logic duplication) on macos-15 arm64 runners, CGO_ENABLED=1; runs unit + -race + the internal/spicanary symbol-canary on EVERY matrix image (the canary is the runner-macOS-15-vs-target-macOS-26 skew tripwire)
           - id: M7.1-d2
             done: false
-            desc: convert this repo's raw t.Skip integration sites to the apis-hosted k3smtest.SkipUnless(t, cap) helper (m7-plan Resolution 4) over the owned capability taxonomy (root/lo0/utun/pf/clang/apple-gpu/macos-26/network); the lint scope is integration ∥ e2e tags and no raw t.Skip remains in those files
+            desc: convert this repo's raw t.Skip integration sites to the apis-hosted k3smtest.SkipUnless(t, cap) helper over the owned capability taxonomy (root/lo0/utun/pf/clang/apple-gpu/macos-26/network); the lint scope is integration ∥ e2e tags and no raw t.Skip remains in those files
           - id: M7.1-d3
             done: false
             desc: README.md — a "part of k3sm" front-door header (badges, the one-line pitch, a pointer to the workspace) refreshing the pre-launch scaffold copy
@@ -431,7 +431,7 @@ phases:
         deliverables:
           - id: M8.2-d0
             done: false
-            desc: pkg/image — OCI-layer unpacker producing a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. PREREQUISITE (m8-plan Phase B Resolution 1) — today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder, so the whole M8 product path is blocked on this substrate; d3 AdHocSignTree walks and clonefiles from it
+            desc: pkg/image — OCI-layer unpacker producing a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. PREREQUISITE — today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder, so the whole M8 product path is blocked on this substrate; d3 AdHocSignTree walks and clonefiles from it
           - id: M8.2-d1
             done: false
             desc: pkg/sandbox/metal.go — the S1-derived Metal SBPL allow-set behind allow_gpu, expressed as per-chip-family data (AGX user-client class names vary M1→M4) with golden SBPL fixtures per family in pkg/sandbox/testdata; launch families SCOPED to the dev-mac's own family for v1 (Resolution 15), an unknown/absent family FAILS CLOSED (sandbox_gpu_supported=false + metal.go errors on a family miss, Resolution 14), and the shader-cache write scope is CONTRACT-BOUNDED (per-pod redirect or an enumerated narrow subpath) NOT denial-log-derived (Resolution 11). Emitted in the existing rule order (allows → protected denies → narrow re-allows)
@@ -479,7 +479,7 @@ phases:
         size: M
         strategy: phased (named exception: VK provider ↔ runtimed gRPC contract)
         strategy_rationale: >-
-          m10-plan Res.1 — M10.1 is real cross-repo adapter wiring, not a hardcode deletion: today
+          M10.1 is real cross-repo adapter wiring, not a hardcode deletion: today
           runtime.go:280 wires supervisor.NodeNetwork{} (a no-op seam that returns the node IP, so
           translate.go:877 reads back ≈nodeIP), and the HostProcess os/exec path is REJECTED for
           per-pod IP (no bind discipline → a cosmetic /32 the server never binds). Converging the
@@ -497,13 +497,13 @@ phases:
         deliverables:
           - id: M10.1-d1
             done: true
-            desc: pkg/supervisor + pkg/runtime — replace supervisor.NodeNetwork{} (runtime.go:280 — the no-op seam whose Setup returns the node IP) with an ADAPTER over darwin-net's podnet.Network, bridging the two PodNetwork interfaces (supervisor's Setup returns string, podnet's returns netip.Addr) through a NAMED seam — an adapter type, not open-coded per call site — so translate.go:877 reads back a distinct per-pod /32 instead of ≈nodeIP (m10-plan Res.1)
+            desc: pkg/supervisor + pkg/runtime — replace supervisor.NodeNetwork{} (runtime.go:280 — the no-op seam whose Setup returns the node IP) with an ADAPTER over darwin-net's podnet.Network, bridging the two PodNetwork interfaces (supervisor's Setup returns string, podnet's returns netip.Addr) through a NAMED seam — an adapter type, not open-coded per call site — so translate.go:877 reads back a distinct per-pod /32 instead of ≈nodeIP
           - id: M10.1-d2
             done: true
             desc: pkg/supervisor — IPAM ownership is a PASS-THROUGH — darwin-net stays the sole node-/24 IPAM owner (253/node via podnet.Network); runtimed's seam allocates nothing and adds no second allocator. The existing SBPL bind-scope (sbpl.go:290 `(allow network-bind (local ip "<PodIP>:*"))`) already consumes the real /32, so it is byte-unchanged and now scopes the pod to its own distinct address rather than the node IP
           - id: M10.1-d3
             done: true
-            desc: docs — record the load-bearing decision that converging per-pod IP on the runtimed path likely makes runtimed the DEFAULT runtime (HostProcess → an explicit rootless-dev opt-in), documented at the adapter seam; the HostProcess os/exec per-pod-IP option is REJECTED (INADDR_ANY wildcard bind → a Potemkin /32 the server never binds; two same-node pods collide on shared lo0) per m10-plan Correction 2 / Res.1
+            desc: docs — record the load-bearing decision that converging per-pod IP on the runtimed path likely makes runtimed the DEFAULT runtime (HostProcess → an explicit rootless-dev opt-in), documented at the adapter seam; the HostProcess os/exec per-pod-IP option is REJECTED (INADDR_ANY wildcard bind → a Potemkin /32 the server never binds; two same-node pods collide on shared lo0)
         acceptance:
           - id: M10.1-a1
             met: true
@@ -521,7 +521,7 @@ phases:
         size: L
         strategy: phased (named exception: apis CRD/proto change (consumer-first))
         strategy_rationale: >-
-          m10-plan Res.8 — the sidecar signal (initContainer restartPolicy:Always) cannot cross the
+          The sidecar signal (initContainer restartPolicy:Always) cannot cross the
           provider↔runtimed gRPC contract today: the Container proto has no restart_policy field and
           translate.go:507 drops it. The field is added in apis:M10.2 (wave 1, consumer-first: runtimed
           ships the tolerant reader first), NEVER a k3sm.io/* annotation. subPath is a self-contained
@@ -550,8 +550,7 @@ phases:
 
 # runtimed — Phase roadmap
 
-> Per-repo slice of the k3sm milestones (workspace matrix: `../../ROADMAP.md`; product design:
-> `../../k3sm/docs/DESIGN.md` §5a). The YAML frontmatter above is **authoritative**; this prose
+> Per-repo slice of the k3sm milestones. The YAML frontmatter above is **authoritative**; this prose
 > mirrors it. Status: ✅ done · 🟡 in-progress · ⛔ blocked · ⬜ todo.
 
 `runtimed` is **Wave 2** (with `darwin-net`): it imports `apis` and is imported by `k3sm`.
@@ -907,7 +906,7 @@ This chunk delivers the **verifiable foundation + the VZ scaffold**; the live bo
 ## M7 — Public CI workflow + SkipUnless conversions ⬜
 **Cross-repo dep:** `apis:M7.1` (the DAG-legal home for the shared `k3smtest.SkipUnless(t, cap)` helper +
 its owned capability taxonomy — `runtimed`, `darwin-net`, and `k3sm` all import it; a leaf copy would
-drift or force a sideways import; m7-plan Resolution 4). runtimed's M7 slice is the **release-engineering
+drift or force a sideways import). runtimed's M7 slice is the **release-engineering
 plumbing**: a public CI workflow + the skip-site conversion, not a runtime change.
 
 ### M7.1 — public CI workflow + SkipUnless conversions ⬜
@@ -917,9 +916,9 @@ README header); no runtime/proto/datastore change. One signed binary.
 - ⬜ `M7.1-d1` `.github/workflows/ci.yml`: a **thin** wrapper over the existing `hack/ci.sh` (no logic
   duplication) on **macos-15 arm64** runners, `CGO_ENABLED=1`; unit + `-race` + the `internal/spicanary`
   **symbol-canary on every matrix image** (the canary is the runner-macOS-15-vs-target-macOS-26 skew
-  tripwire; m7-plan M7.2).
+  tripwire).
 - ⬜ `M7.1-d2` convert this repo's raw `t.Skip` integration sites to the **apis-hosted**
-  `k3smtest.SkipUnless(t, cap)` helper (m7-plan **Resolution 4**) over the owned capability taxonomy
+  `k3smtest.SkipUnless(t, cap)` helper over the owned capability taxonomy
   (`root`/`lo0`/`utun`/`pf`/`clang`/`apple-gpu`/`macos-26`/`network`); the lint scope is `integration ∥ e2e`
   tags and **no raw `t.Skip`** remains in those files.
 - ⬜ `M7.1-d3` `README.md`: a **"part of k3sm"** front-door header (badges, one-line pitch, a workspace
@@ -943,7 +942,7 @@ old provider never sets them — **no** provider↔runtimed phased exception), t
 reserved bands (`apis:M8.1`), and the host-process Seatbelt path + existing golden SBPL fixtures stay
 **byte-green**. One signed binary.
 **Deliverables**
-- ⬜ `M8.2-d0` **(PREREQUISITE, m8-plan Resolution 1)** `pkg/image`: an **OCI-layer unpacker** →
+- ⬜ `M8.2-d0` **(PREREQUISITE)** `pkg/image`: an **OCI-layer unpacker** →
   per-image **unpacked content-addressed tree** (digest+policy-keyed), applied via a **containment-checked
   tar apply** (symlink/hardlink-safe, `com.apple.quarantine`-xattr discipline per `clone.go`, same-APFS-
   volume placement per `cache.go`), wired into `pkg/runtime.createPod` via `MaterializeTree`. Today only
@@ -991,8 +990,8 @@ reserved bands (`apis:M8.1`), and the host-process Seatbelt path + existing gold
   GPU dev-mac (integration tier, `k3smtest.SkipUnless(t, "apple-gpu")`).
 
 ## Next
-M1, M2, and M3 are complete at the **runtimed unit-provable level**. M2 (the **stockkitty-readiness**
-milestone, `../../docs/stockkitty-readiness.md`) split `k3sm-runtimed` into a root gRPC daemon + grew
+M1, M2, and M3 are complete at the **runtimed unit-provable level**. M2 (the reference-workload readiness
+milestone) split `k3sm-runtimed` into a root gRPC daemon + grew
 `internal/spicanary` (M2.1); volume-mount materialization + validated SBPL extra-path injection (M2.2);
 the `setgid→initgroups→setuid` drop + `fsGroup` chown before `sandbox_apply` (M2.3); SIGTERM/grace-timer/
 SIGKILL graceful stop raced against the reaper (M2.4); the `proc_pid_rusage` memory sampler → `OOMKilled`

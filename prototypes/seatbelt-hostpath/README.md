@@ -11,7 +11,7 @@ makes impossible.
 |---|---|---|
 | `plutil -p SystemVersion.plist` (Foundation) under profile | runs, prints dict | ✅ rc=0 |
 | `sw_vers` under profile | runs | ✅ rc=0 |
-| read `/Users/miko` | denied | ✅ `Operation not permitted` |
+| read `/Users/you` | denied | ✅ `Operation not permitted` |
 | write inside pod dir | allowed | ✅ |
 | write into `/Users` | denied | ✅ `Operation not permitted` |
 
