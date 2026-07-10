@@ -67,16 +67,26 @@ func (s *orderedSigner) seq() []string {
 // (no silent downgrade), while adhoc-ok signs then checks.
 func TestGateSignatureOrdering(t *testing.T) {
 	cases := []struct {
-		name     string
-		policy   runtimev1.SignaturePolicy
-		checkErr error
-		wantSeq  []string
-		wantErr  bool
+		name       string
+		policy     runtimev1.SignaturePolicy
+		hostBinary bool
+		checkErr   error
+		wantSeq    []string
+		wantErr    bool
 	}{
 		{
 			name:    "adhoc-ok-signs-then-checks",
 			policy:  runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 			wantSeq: []string{"sign", "check"},
+		},
+		{
+			// A host binary (native pod / host path) is already signed + read-only:
+			// verify only, NEVER ad-hoc re-sign — even under the ADHOC_OK policy.
+			// This is the fix for `codesign -s - -f /bin/sh` failing on a SIP binary.
+			name:       "adhoc-ok-host-binary-checks-without-signing",
+			policy:     runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
+			hostBinary: true,
+			wantSeq:    []string{"check"},
 		},
 		{
 			name:    "require-signed-checks-without-signing",
@@ -101,7 +111,7 @@ func TestGateSignatureOrdering(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			signer := &orderedSigner{checkErr: tc.checkErr}
 			rt := newTestRuntime(t, Deps{Signer: signer})
-			err := rt.gateSignature(context.Background(), tc.policy, "/fake/bin")
+			err := rt.gateSignature(context.Background(), tc.policy, "/fake/bin", tc.hostBinary)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("gateSignature err = %v, wantErr = %v", err, tc.wantErr)
 			}
@@ -109,11 +119,12 @@ func TestGateSignatureOrdering(t *testing.T) {
 			if strings.Join(got, ",") != strings.Join(tc.wantSeq, ",") {
 				t.Errorf("call order = %v, want %v", got, tc.wantSeq)
 			}
-			// The load-bearing invariant: require-* / unspecified never ad-hoc sign.
-			if tc.policy != runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK {
+			// The load-bearing invariant: require-* / unspecified / any host binary
+			// never ad-hoc sign (silent downgrade / re-signing a signed host binary).
+			if tc.policy != runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK || tc.hostBinary {
 				for _, c := range got {
 					if c == "sign" {
-						t.Errorf("policy %v must NOT ad-hoc sign (silent downgrade)", tc.policy)
+						t.Errorf("policy %v hostBinary %v must NOT ad-hoc sign", tc.policy, tc.hostBinary)
 					}
 				}
 			}
