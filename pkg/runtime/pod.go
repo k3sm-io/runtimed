@@ -810,25 +810,58 @@ func (r *Runtime) pullCredential(ctx context.Context, box *runtimev1.PodBox, ref
 	return cred, nil
 }
 
-// containerEnv builds the child environment: the container's EnvVars plus the
-// pod's DYLD insert (from the box annotation) so the DNS shim loads. The order
-// puts DYLD_INSERT_LIBRARIES last so an explicit container env can override it if
-// needed (rare).
+// pathShimRootfsEnv / pathShimMountsEnv are the env the path-rebase shim reads
+// (shim/pathrebase_shim.c): the pod data volume the mounts are rebased under, and
+// the ':'-joined absolute mount prefixes to rebase.
+const (
+	pathShimRootfsEnv = "K3SM_ROOTFS"
+	pathShimMountsEnv = "K3SM_MOUNT_PATHS"
+)
+
+// containerEnv builds the child environment: the container's EnvVars plus the DYLD
+// inserts that make cluster features work in-pod — the path-rebase shim (so an
+// absolute volume mount resolves to its materialized copy under the pod data
+// volume, no chroot) and the DNS shim (box annotation). DYLD_INSERT_LIBRARIES is
+// appended last so an explicit container env can override it (rare). A container
+// that sets DYLD_INSERT_LIBRARIES itself opts out of both shims.
 func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) []string {
-	env := make([]string, 0, len(c.GetEnv())+1)
-	haveDyld := false
+	env := make([]string, 0, len(c.GetEnv())+3)
 	for _, e := range c.GetEnv() {
 		env = append(env, e.GetName()+"="+e.GetValue())
 		if e.GetName() == dyldInsertEnv {
-			haveDyld = true
+			return env // explicit container DYLD wins; do not inject shims
 		}
 	}
-	if !haveDyld {
-		if ins := box.GetAnnotations()[dyldInsertAnnotation]; ins != "" {
-			env = append(env, dyldInsertEnv+"="+ins)
-		}
+
+	var inserts []string
+	// Path-rebase shim: only when the shim is configured AND this container mounts
+	// a volume (nothing to rebase otherwise). K3SM_ROOTFS/K3SM_MOUNT_PATHS configure
+	// it; a workload NOT loading the shim (a SIP platform binary) just ignores them.
+	if paths := containerMountPaths(c); r.cfg.PathShimPath != "" && len(paths) > 0 {
+		inserts = append(inserts, r.cfg.PathShimPath)
+		env = append(env,
+			pathShimRootfsEnv+"="+r.rootfsPath(box),
+			pathShimMountsEnv+"="+strings.Join(paths, ":"))
+	}
+	if ins := box.GetAnnotations()[dyldInsertAnnotation]; ins != "" {
+		inserts = append(inserts, ins)
+	}
+	if len(inserts) > 0 {
+		env = append(env, dyldInsertEnv+"="+strings.Join(inserts, ":"))
 	}
 	return env
+}
+
+// containerMountPaths returns c's absolute volume-mount container paths (the
+// prefixes the path-rebase shim rewrites under the pod data volume).
+func containerMountPaths(c *runtimev1.Container) []string {
+	var paths []string
+	for _, vm := range c.GetVolumeMounts() {
+		if p := vm.GetMountPath(); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 // rootfsPath returns the on-disk pod data volume for box: its explicit
