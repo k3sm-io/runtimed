@@ -35,7 +35,9 @@
 (deny file-read* file-write*
   (subpath "/private/var/db"))
 (deny file-read* file-write*
-  (subpath "/var/lib/k3sm/pods"))
+  (subpath "/var/lib/k3sm/pods")
+  (subpath "/private/var/lib/k3sm/pods")
+  )
 ;; dyld cryptex: deny WRITE only (read is needed at link time).
 (deny file-write*
   (subpath "/System/Volumes/Preboot/Cryptexes")
@@ -45,4 +47,6 @@
   (subpath "/private/var/db/dyld"))
 ;; re-allow THIS pod's own data volume (under the denied pods root).
 (allow file-read* file-write*
-  (subpath "/var/lib/k3sm/pods/pod-abc123/rootfs"))
+  (subpath "/var/lib/k3sm/pods/pod-abc123/rootfs")
+  (subpath "/private/var/lib/k3sm/pods/pod-abc123/rootfs")
+  )
