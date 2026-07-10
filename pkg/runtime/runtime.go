@@ -134,6 +134,15 @@ type Config struct {
 	// M10.1: like ResolverVIP it renders NO SBPL rule — an allow_network pod has
 	// unfiltered egress. The control plane (k3sm) sets it from the service CIDR.
 	APIServerVIP string
+	// PathShimPath is the on-disk path of the path-rebase DYLD interpose shim
+	// (shim/pathrebase_shim.c). When set, containerEnv injects it into a mounting
+	// container's DYLD_INSERT_LIBRARIES with K3SM_ROOTFS + K3SM_MOUNT_PATHS so an
+	// absolute volume mount resolves to its materialized copy under the pod data
+	// volume (no chroot — see pod.go containerEnv). Empty disables the rebase (a
+	// pod's absolute mount path then reaches the host, the pre-shim behavior). The
+	// shim cannot load into a SIP platform binary (/bin/sh) — only custom Go/C
+	// workloads — a documented ceiling.
+	PathShimPath string
 }
 
 // Runtime is the in-process node runtime implementing runtimev1.RuntimeServer.
