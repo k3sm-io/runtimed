@@ -23,6 +23,7 @@ package supervisor
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/types.h>
 
 extern char **environ;
@@ -38,6 +39,18 @@ extern char **environ;
 // child (pgid == child pid), which is what DeletePod signals, and detaches it
 // from the daemon's controlling tty.
 //
+// SETSIGMASK + SETSIGDEF reset the child's signal STATE, which is
+// SECURITY/CORRECTNESS-CRITICAL for graceful termination. The supervisor is a Go
+// process, and the Go runtime BLOCKS most signals on its worker threads; a raw
+// posix_spawn (unlike os/exec, which resets it) leaves the child with the CALLING
+// THREAD's signal mask, and execve PRESERVES a blocked mask. Without SETSIGMASK a
+// pod inherits a BLOCKED SIGTERM, silently ignores k8s graceful termination, and
+// runs to the SIGKILL deadline (terminationGracePeriodSeconds wasted every time).
+// SETSIGDEF additionally restores the default disposition for every signal so an
+// inherited SIG_IGN (e.g. Go's default-ignored SIGPIPE) does not leak into the
+// pod. Probe-verified on macOS 26.5.1: a blocked-SIGTERM parent + SETSID-only →
+// child survives SIGTERM; adding SETSIGMASK(empty) → child terminates on SIGTERM.
+//
 // Raw posix_spawn (not os/exec) is deliberate: the supervisor owns a single
 // reaper (kqueue), and posix_spawn_file_actions gives precise fd control for the
 // combined-log pipe without a fork+exec dance in Go.
@@ -52,7 +65,16 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 		return rc;
 	}
 
-	short flags = POSIX_SPAWN_SETSID;
+	// Reset the child's signal mask (unblock everything) and dispositions (all
+	// default) so a pod does not inherit the Go runtime's blocked/ignored signals
+	// — otherwise a blocked SIGTERM makes graceful termination a no-op.
+	sigset_t emptyMask, allSignals;
+	sigemptyset(&emptyMask);
+	sigfillset(&allSignals);
+	posix_spawnattr_setsigmask(&attr, &emptyMask);
+	posix_spawnattr_setsigdefault(&attr, &allSignals);
+
+	short flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
 	posix_spawnattr_setflags(&attr, flags);
 
 	if (logFD >= 0) {
