@@ -56,6 +56,45 @@ func TestGeneratedProfileAppliesOnDarwin(t *testing.T) {
 	}
 }
 
+// TestGeneratedProfileAllowsRebasedFileRead is the file-read counterpart to the
+// socket guard: it proves a pod CAN read a file under its own data volume via the
+// path a macOS firmlink resolves to (/var,/tmp,/etc → /private/…). Before the
+// firmlink fix the profile allowed only the raw /var form, so libsandbox (which
+// matches the RESOLVED path) denied the rebased read with EPERM — every volume
+// mount criterion failed. dataVol is under /tmp so the test needs no root.
+func TestGeneratedProfileAllowsRebasedFileRead(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not present")
+	}
+	base := filepath.Join("/tmp", "k3sm-fr-"+strconv.Itoa(os.Getpid()))
+	dataVol := filepath.Join(base, "rootfs")
+	// runtimed writes the materialized volume at dataVol; the OS lands it under the
+	// /private-resolved path, which is what libsandbox matches.
+	realDir := "/private" + filepath.Join(dataVol, "etc", "nats")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll("/private" + base)
+	if err := os.WriteFile(filepath.Join(realDir, "nats.conf"), []byte("port: 4222\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	sb := filepath.Join(t.TempDir(), "fr.sb")
+	if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A pod's rebased path is the RAW /tmp firmlink alias; test -r does the
+	// access(R_OK) the sandbox gates. exit 0 = the read is allowed.
+	target := filepath.Join(dataVol, "etc", "nats", "nats.conf")
+	if out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, "/bin/test", "-r", target).CombinedOutput(); err != nil {
+		t.Fatalf("rebased read of %s was DENIED under the generated profile (firmlink allow missing): %v\n%s\n--- profile ---\n%s", target, err, out, prof)
+	}
+}
+
 // TestSocketDenyBlocksFirmlinkConnect is the fail-open regression guard: it proves
 // the generated deny actually BLOCKS a connect() to a socket reached through a
 // macOS firmlink (/tmp → /private/tmp), the exact case a raw-path literal misses.
