@@ -353,7 +353,7 @@ func TestValidate(t *testing.T) {
 
 // TestGenerateDeniedUnixSockets is deliverable #1 (the AF_UNIX barrier): for each
 // SandboxProfile.denied_unix_socket_paths the generator emits an explicit
-// (deny network-outbound (remote unix-socket (path-equal …))) on top of the
+// (deny network-outbound (remote unix-socket (literal …))) on top of the
 // default-deny. Because pods share the runtime client's uid (no per-pod uid
 // isolation), this Seatbelt deny is the ONLY barrier keeping a pod off the
 // privileged k3sm-netd helper socket, so it must hold whether or not the pod is
@@ -378,14 +378,14 @@ func TestGenerateDeniedUnixSockets(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, s := range sockets {
-				frag := `(remote unix-socket (path-equal "` + s + `"))`
+				frag := `(remote unix-socket (literal "` + s + `"))`
 				if !strings.Contains(out, frag) {
 					t.Errorf("missing AF_UNIX deny for %q:\n%s", s, out)
 				}
 			}
 			// The path is denied (under a (deny network-outbound …) block), never
 			// allowed. netd.sock sorts before other.sock, so it heads the block.
-			if !strings.Contains(out, "(deny network-outbound\n  (remote unix-socket (path-equal \"/var/run/k3sm/netd.sock\"))") {
+			if !strings.Contains(out, "(deny network-outbound\n  (remote unix-socket (literal \"/var/run/k3sm/netd.sock\"))") {
 				t.Errorf("AF_UNIX path must lead a (deny network-outbound …) block:\n%s", out)
 			}
 			if strings.Contains(out, "(allow network-outbound\n  (remote unix-socket") {
@@ -581,7 +581,7 @@ func TestGenerateVIPsDoNotRenderSBPL(t *testing.T) {
 			}
 
 			// The AF_UNIX helper-socket deny is intact and never turned into an allow.
-			if !strings.Contains(out, `(remote unix-socket (path-equal "`+netdSock+`"))`) {
+			if !strings.Contains(out, `(remote unix-socket (literal "`+netdSock+`"))`) {
 				t.Errorf("AF_UNIX helper-socket deny missing:\n%s", out)
 			}
 			if strings.Contains(out, "(allow network-outbound\n  (remote unix-socket") {
@@ -598,5 +598,29 @@ func TestGenerateVIPsDoNotRenderSBPL(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestFirmlinkForms proves a firmlinked socket path also gets its /private-resolved
+// form — without it the socket deny fails open, since libsandbox matches a connect()
+// target against the symlink-resolved path (verified against macOS 26 libsandbox).
+func TestFirmlinkForms(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"/var/lib/k3sm/run/netd.sock", []string{"/var/lib/k3sm/run/netd.sock", "/private/var/lib/k3sm/run/netd.sock"}},
+		{"/tmp/x.sock", []string{"/tmp/x.sock", "/private/tmp/x.sock"}},
+		{"/etc/y.sock", []string{"/etc/y.sock", "/private/etc/y.sock"}},
+		{"/var", []string{"/var", "/private/var"}},
+		{"/var/lib/../lib/x.sock", []string{"/var/lib/x.sock", "/private/var/lib/x.sock"}}, // cleaned first
+		{"/private/var/lib/x.sock", []string{"/private/var/lib/x.sock"}},                   // already resolved
+		{"/Users/a/x.sock", []string{"/Users/a/x.sock"}},                                   // not a firmlink
+		{"/variant/x.sock", []string{"/variant/x.sock"}},                                   // /var-prefixed but not under /var/
+	}
+	for _, tc := range cases {
+		if got := firmlinkForms(tc.in); strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("firmlinkForms(%q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }

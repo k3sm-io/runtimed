@@ -187,8 +187,10 @@ type GenerateOptions struct {
 // client (no per-pod uid isolation), the Seatbelt default-deny is the ONLY
 // barrier keeping a pod off the privileged k3sm-netd helper socket: for each
 // sp.DeniedUnixSocketPaths entry Generate emits an explicit
-// (deny network-outbound (remote unix-socket (path-equal …))) on top of the
+// (deny network-outbound (remote unix-socket (literal …))) on top of the
 // default-deny, AFTER the network allow so last-match-wins keeps it denied.
+// (The path filter is `literal`, an exact-path match — macOS 26 libsandbox
+// rejects the non-existent `path-equal` filter with "unbound variable".)
 //
 // Rule ORDER is security-critical because SBPL is last-match-wins. Generate emits
 // (in increasing precedence): the OS/extra-path allows + the network allows; THEN
@@ -325,7 +327,9 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString(";; socket(s) — same-uid pods can't be kept off them any other way.\n")
 		b.WriteString("(deny network-outbound\n")
 		for _, p := range deniedSockets {
-			b.WriteString(fmt.Sprintf("  (remote unix-socket (path-equal %q))\n", filepath.Clean(p)))
+			for _, form := range firmlinkForms(p) {
+				b.WriteString(fmt.Sprintf("  (remote unix-socket (literal %q))\n", form))
+			}
 		}
 		b.WriteString("  )\n")
 	}
@@ -447,6 +451,30 @@ func validateExtraPaths(dataVol string, protectedPrefixes []string, groups ...[]
 // assumed already filepath.Clean'd.
 func isUnder(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+// macOSFirmlinks are the synthetic APFS firmlinks the macOS boot volume presents:
+// /var, /tmp, /etc resolve to /private/var, /private/tmp, /private/etc.
+var macOSFirmlinks = []string{"/var", "/tmp", "/etc"}
+
+// firmlinkForms returns the SBPL literal path form(s) a unix-socket deny must cover
+// so it holds regardless of which alias a pod connect()s through. libsandbox matches
+// a connect() target against the SYMLINK-RESOLVED path, so a deny filter written
+// against a macOS firmlink (e.g. /var/lib/k3sm/run/netd.sock) FAILS OPEN — the pod's
+// resolved target is /private/var/…, which the /var literal never matches (verified
+// on macOS 26). This returns the cleaned path PLUS, when it sits under a firmlink,
+// the /private-resolved form. It is deterministic (no filesystem stat), so it works
+// at profile-generation time whether or not the socket exists yet.
+func firmlinkForms(p string) []string {
+	p = filepath.Clean(p)
+	forms := []string{p}
+	for _, fl := range macOSFirmlinks {
+		if isUnder(p, fl) {
+			forms = append(forms, "/private"+p)
+			break
+		}
+	}
+	return forms
 }
 
 // Validate checks that a rendered SBPL profile is fail-closed: it MUST contain
