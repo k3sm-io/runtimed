@@ -444,14 +444,14 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // kqueue reaper, and the watchContainerExit drain-wait to the pod's lifetime so they
 // survive the unary RPC's return under the daemon split.
 func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
-	binPath, argv, err := r.resolveBinary(ctx, p.box, rootfs, c)
+	binPath, argv, hostBinary, err := r.resolveBinary(ctx, p.box, rootfs, c)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err
 	}
 
 	// Enforce the signature policy in the correct order relative to ad-hoc signing
-	// (M2.6), BEFORE exec.
-	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), binPath); err != nil {
+	// (M2.6), BEFORE exec. A host binary is never ad-hoc re-signed (hostBinary).
+	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), binPath, hostBinary); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
@@ -689,9 +689,16 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 // gateSignature enforces the SignaturePolicy in the correct order relative to the
 // ad-hoc-sign step (M2.6-d2), fail-closed, BEFORE exec:
 //
-//   - ADHOC_OK: ad-hoc signing is the point (an unsigned arm64 Mach-O is signed so
-//     it execs under AMFI with a later DYLD insert) — so SIGN, then Check confirms
-//     the signature took.
+//   - hostBinary (native pod / host-path convention): NEVER ad-hoc sign. A host
+//     binary is an already-signed system or operator binary at a read-only host
+//     path — `codesign -s - -f /bin/sh` fails ("internal error in Code Signing
+//     subsystem": a SIP-protected Apple platform binary cannot be re-signed) and
+//     would strip a real authority on any notarized one. Only CHECK the existing
+//     signature (ADHOC_OK accepts an Apple-signed /bin/sh and an ad-hoc-signed
+//     host helper alike), so the binary execs unmodified.
+//   - ADHOC_OK (pulled image): ad-hoc signing is the point (an unsigned arm64
+//     Mach-O in the writable pod rootfs is signed so it execs under AMFI with a
+//     later DYLD insert) — so SIGN, then Check confirms the signature took.
 //   - REQUIRE_SIGNED / REQUIRE_NOTARIZED: enforce the policy on the AS-PULLED
 //     binary and NEVER ad-hoc sign it — `codesign -s - -f` would strip an existing
 //     notarization / replace a real authority with an ad-hoc signature, silently
@@ -700,7 +707,11 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //
 // Both Sign and Check errors are returned wrapped (ErrSignatureRejected /
 // ErrPolicyUnspecified), which the caller maps to SIGNATURE_REJECTED.
-func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error {
+func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignaturePolicy, path string, hostBinary bool) error {
+	if hostBinary {
+		// Already signed + read-only: verify the existing signature, never re-sign.
+		return r.signer.Check(ctx, policy, path)
+	}
 	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK {
 		if err := r.signer.Sign(ctx, path); err != nil {
 			return fmt.Errorf("ad-hoc sign %s: %w", path, err)
@@ -725,7 +736,13 @@ const NativeImage = "native"
 // is the host binary path; if the image is the "native" sentinel the command runs
 // in place as a host binary; otherwise the image is pulled+materialized and argv =
 // command+args. The returned path is the on-disk executable to confine.
-func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, rootfs string, c *runtimev1.Container) (string, []string, error) {
+//
+// hostBinary reports whether the resolved binary is a HOST binary (the native
+// sentinel or the empty-command host-path convention) rather than a pulled-image
+// payload. A host binary is already validly signed and lives at a read-only host
+// path, so it must NEVER be ad-hoc re-signed (see gateSignature) — only a pulled,
+// possibly-unsigned image payload in the writable pod rootfs is ad-hoc signed.
+func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, rootfs string, c *runtimev1.Container) (path string, argv []string, hostBinary bool, err error) {
 	cmd := c.GetCommand()
 
 	// Native HostProcess sentinel: run command[0] as an absolute host binary with
@@ -733,34 +750,34 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 	// it would otherwise fall through and fail trying to fetch docker.io/library/native.
 	if c.GetImage() == NativeImage {
 		if len(cmd) == 0 {
-			return "", nil, fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage)
+			return "", nil, false, fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage)
 		}
 		bin := cmd[0]
 		if !filepath.IsAbs(bin) {
-			return "", nil, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
+			return "", nil, false, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
 		}
-		return bin, append(append([]string{}, cmd...), c.GetArgs()...), nil
+		return bin, append(append([]string{}, cmd...), c.GetArgs()...), true, nil
 	}
 
 	if len(cmd) == 0 && len(c.GetArgs()) == 0 {
 		// Host-binary convention: image is an absolute path run in place.
 		bin := c.GetImage()
 		if !filepath.IsAbs(bin) {
-			return "", nil, fmt.Errorf("container %s: image %q is not an absolute host path and no command given", c.GetName(), bin)
+			return "", nil, false, fmt.Errorf("container %s: image %q is not an absolute host path and no command given", c.GetName(), bin)
 		}
-		return bin, []string{bin}, nil
+		return bin, []string{bin}, true, nil
 	}
 
 	// Resolve the imagePullSecret credential (M2.6) via the consumer-side seam. It
 	// is passed ONLY to the pull client below and is NEVER written to the pod dir.
 	cred, err := r.pullCredential(ctx, box, c.GetImage())
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 
 	// Pull + materialize the image into the pod rootfs, then run command/args.
 	if _, err := r.puller.Pull(ctx, c.GetImage(), cred); err != nil {
-		return "", nil, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
+		return "", nil, false, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
 	}
 	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
 	// materializer lands with the rootfs format. For now argv[0] is command[0]
@@ -769,9 +786,9 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 	if !filepath.IsAbs(bin) {
 		bin = filepath.Join(rootfs, bin)
 	}
-	argv := append(append([]string{}, cmd...), c.GetArgs()...)
+	argv = append(append([]string{}, cmd...), c.GetArgs()...)
 	argv[0] = bin
-	return bin, argv, nil
+	return bin, argv, false, nil
 }
 
 // pullCredential resolves the registry pull credential for ref from the pod's

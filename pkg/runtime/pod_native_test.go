@@ -35,9 +35,9 @@ func TestResolveBinaryNativeSentinel(t *testing.T) {
 	box := hostBinBox("pod-native")
 	rootfs := "/var/lib/k3sm/pods/pod-native/rootfs"
 
-	t.Run("runs command[0] as the host binary, skips the pull", func(t *testing.T) {
+	t.Run("runs command[0] as the host binary, skips the pull, flags hostBinary", func(t *testing.T) {
 		c := &runtimev1.Container{Name: "app", Image: NativeImage, Command: []string{"/bin/sh", "-c", "echo ok"}}
-		bin, argv, err := rt.resolveBinary(context.Background(), box, rootfs, c)
+		bin, argv, hostBinary, err := rt.resolveBinary(context.Background(), box, rootfs, c)
 		if err != nil {
 			t.Fatalf("resolveBinary native: %v", err)
 		}
@@ -51,18 +51,22 @@ func TestResolveBinaryNativeSentinel(t *testing.T) {
 		if pull.ref() != "" {
 			t.Errorf("native pod pulled %q; the sentinel must skip the registry entirely", pull.ref())
 		}
+		// hostBinary must be true so gateSignature never ad-hoc re-signs /bin/sh.
+		if !hostBinary {
+			t.Error("native binary must be flagged hostBinary=true (never ad-hoc re-signed)")
+		}
 	})
 
 	t.Run("native image with no command is rejected", func(t *testing.T) {
 		c := &runtimev1.Container{Name: "app", Image: NativeImage}
-		if _, _, err := rt.resolveBinary(context.Background(), box, rootfs, c); err == nil {
+		if _, _, _, err := rt.resolveBinary(context.Background(), box, rootfs, c); err == nil {
 			t.Fatal("want an error for a native image with no command")
 		}
 	})
 
 	t.Run("native command that is not absolute is rejected", func(t *testing.T) {
 		c := &runtimev1.Container{Name: "app", Image: NativeImage, Command: []string{"sh", "-c", "true"}}
-		if _, _, err := rt.resolveBinary(context.Background(), box, rootfs, c); err == nil {
+		if _, _, _, err := rt.resolveBinary(context.Background(), box, rootfs, c); err == nil {
 			t.Fatal("want an error for a relative native command path")
 		}
 	})

@@ -549,11 +549,15 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		if got := backend.wrapCalls(); got == 0 {
 			t.Error("host-process path did not call WrapCommand (exec-shim seam)")
 		}
+		// The signature was gated (gateSignature ran — CreatePod would have failed
+		// above otherwise), but a HOST binary (hostBinBox runs /bin/sleep) is already
+		// signed and read-only, so it must NEVER be ad-hoc re-signed (`codesign -s -
+		// -f /bin/sleep` fails on a SIP platform binary — the M2-hardware bug).
 		signer.mu.Lock()
 		nsigned := len(signer.signed)
 		signer.mu.Unlock()
-		if nsigned == 0 {
-			t.Error("host-process path did not ad-hoc sign (gateSignature)")
+		if nsigned != 0 {
+			t.Errorf("host-process path ad-hoc signed a host binary %d time(s); a signed, read-only host binary must never be re-signed", nsigned)
 		}
 		sp.mu.Lock()
 		nspawn := len(sp.specs)
