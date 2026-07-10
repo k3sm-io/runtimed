@@ -128,9 +128,15 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		wg.Add(1)
 		go func(proc *supervisor.Process, pid int) {
 			defer wg.Done()
-			if _, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(), termSignal, killSignal, r.signalGroup); err != nil {
+			escalated, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(), termSignal, killSignal, r.signalGroup)
+			if err != nil {
 				r.log.Warn("graceful stop pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
 			}
+			// Diagnostic: escalated=true means the grace timer fired (SIGTERM did NOT
+			// cause an exit → SIGKILL); escalated=false means the process exited within
+			// grace (SIGTERM honored). Localizes a slow delete to runtimed vs the caller.
+			r.log.Info("pod container graceful-stop outcome",
+				"pod", req.GetPodId(), "pid", pid, "grace", grace.String(), "escalated", escalated)
 		}(proc, pid)
 	}
 	wg.Wait()
