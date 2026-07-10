@@ -28,7 +28,7 @@ limitations under the License.
 // runtimed never needs the PV object. The storage root is the SAME APFS volume as
 // /var/lib/k3sm (kine's SQLite shares it), so seeding can clonefile-CoW and a
 // runaway PVC can fill the datastore volume: capacity is NOT enforced vs free
-// space (over-commit → write-time ENOSPC) — see docs/m3-plan.md (runtimed:M3.1).
+// space (over-commit → write-time ENOSPC).
 //
 // The Binder EMPTY-CREATEs a fresh claim's dir (the hot path — never a clonefile),
 // and SEEDs-once from a StorageClass template only when one is configured, via the

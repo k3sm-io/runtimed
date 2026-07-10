@@ -458,7 +458,7 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 		posture Posture
 		wantErr error
 	}{
-		{"escapes-home", Posture{WorkDir: "/Users/operator/k3sm", Home: home}, ErrWorkDirEscapesHome},
+		{"escapes-home", Posture{WorkDir: "/Users/dev/k3sm", Home: home}, ErrWorkDirEscapesHome},
 		{"relative", Posture{WorkDir: "relative/k3sm"}, ErrInvalidWorkDir},
 		{"filesystem-root", Posture{WorkDir: "/"}, ErrInvalidWorkDir},
 		{"unclean", Posture{WorkDir: "/var/lib//k3sm"}, ErrInvalidWorkDir},
