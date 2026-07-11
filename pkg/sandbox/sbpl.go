@@ -299,11 +299,19 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		// GenerateOptions.PodIP are plumbing-only (DNS env/status) — they render
 		// no SBPL.
 		// ============================================================================
-		b.WriteString(";; network: ALLOWED — unfiltered outbound+bind under (deny default).\n")
+		b.WriteString(";; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).\n")
 		b.WriteString(";; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;\n")
 		b.WriteString(";; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.\n")
 		b.WriteString("(allow network-outbound)\n")
 		b.WriteString("(allow network-bind)\n")
+		// network-inbound authorizes listen()/accept(). A bare (allow network-bind)
+		// passes bind() but a TCP server's listen() is gated by the SEPARATE
+		// network-inbound operation, so without this EVERY listening pod (a Service
+		// target, a readiness/liveness HTTP server) fails listen() with EPERM under
+		// (deny default). Regression from M10.1 dropping the PodIP-scoped bind (which
+		// implied inbound) for a bare bind; probe-verified through the real
+		// execshim/libsandbox path on macOS 26.5.1 (both :8080 and :8081).
+		b.WriteString("(allow network-inbound)\n")
 		b.WriteString(";; mach-lookup the DNS resolver path (mDNSResponder) needs.\n")
 		b.WriteString("(allow mach-lookup\n")
 		b.WriteString("  (global-name \"com.apple.dnssd.service\")\n")

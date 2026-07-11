@@ -19,11 +19,12 @@
 ;; data volume is re-allowed below, after the protected denies.
 (allow file-write*
   (literal "/dev/null"))
-;; network: ALLOWED — unfiltered outbound+bind under (deny default).
+;; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).
 ;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
 ;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.
 (allow network-outbound)
 (allow network-bind)
+(allow network-inbound)
 ;; mach-lookup the DNS resolver path (mDNSResponder) needs.
 (allow mach-lookup
   (global-name "com.apple.dnssd.service")
