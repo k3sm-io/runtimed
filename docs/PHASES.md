@@ -546,6 +546,75 @@ phases:
             check: a volumeMount with subPath materializes only the named sub-directory of the source volume at the mount path (inside the pod data volume), and a subPath attempting a "../" escape is rejected
             method: unit
             test: pkg/mount.TestVolumeSubPathMaterialization + pkg/mount.TestVolumeSubPathRejectsEscape
+
+  - id: M11
+    title: Linux containers & multi-arch (runtimed slice — platform selection, Linux rootfs, k3sm-vmhost, guest init/agent)
+    status: todo
+    depends_on: []
+    notes: >-
+      The XL heart of M11 (docs/m11-plan.md — authoritative). ABSORBS AND SUPERSEDES the
+      M5.1-d2 lab remainder (live VM boot, k3sm-vmhost, the OCI-Linux-rootfs→bootable-root
+      builder, VM metering, entitlement split). Hard cut: everything is additive beside
+      the fail-closed SANDBOX_BACKEND_VM fork; the host-process spine stays byte-green.
+      Dependency hygiene: github.com/Code-Hex/vz/v3 is confined to pkg/vmhost +
+      cmd/k3sm-vmhost — the shipped k3sm product binary NEVER links it, enforced by a
+      go-list-deps canary in hack/ci.sh (the symbol-canary precedent);
+      internal/spicanary stays byte-unchanged (VZ is public — the M5.1-d1 statement).
+      Cross-milestone dep: M11.2-d1 extends the M8.2-d0 OCI-layer unpacker.
+      Lifecycle invariant that keeps hard cut truthful: vmhost children die with
+      io.k3sm.server — no VM outlives the binary version that booted it.
+    subphases:
+      - id: M11.2
+        title: platform selection + Linux rootfs builder + vmhost + guest init + vsock agent + volumes + metering
+        status: todo
+        depends_on: [apis:M11.1, runtimed:M8.2]
+        deliverables:
+          - id: M11.2-d0
+            done: false
+            desc: "Image platform selection (B99 — /go-drainable now): pure PlatformPolicy{Backend, HostRosetta, GuestRosetta, Override} → ordered Candidates() in pkg/image/platform.go (native: darwin/arm64 [+darwin/amd64 iff host Rosetta]; vm: linux/arm64 variant \"\"≡v8 [+linux/amd64 iff guest Rosetta]; Override ⇒ exactly that platform). RemoteFetch becomes candidate-aware: remote.Get → explicit index traversal in candidate order (skip attestation manifests) → single-manifest os/arch verified → sentinel ErrNoPlatformMatch carrying the image's available platforms. Structurally removes ggcr's implicit linux/amd64 default (the latent bug at pull.go:86). Resolved platform recorded via ImageManifest.platform/index_digest. Deliberate divergence registered: upstream runs a mismatched single-manifest image to an exec-format crash; k3sm refuses at pull (divergent-by-design)."
+          - id: M11.2-d1
+            done: false
+            desc: "Linux rootfs builder (B100; EXTENDS the M8.2-d0 unpacker): OCI whiteouts (.wh.*/.wh..wh..opq), hardlink safety (os.Root.Link, in-root targets), per-layer diffID re-verification before a ChainID-keyed snapshot commit (snapshots/<algo>/<chainid>/rootfs + meta.json, staged+os.Rename), PAX xattrs dropped by default (documented loss: security.capability), device/FIFO/socket skip+count, FAIL-CLOSED case/normalization-collision detection, ownership SIDECAR (path→uid,gid,mode,xattrs; guest apply order chown→chmod→setxattr — chown clears setuid). Snapshot store + vm pod rootfs dirs on a DEDICATED CASE-SENSITIVE APFS VOLUME, co-located (cross-volume clonefile degrades to byte-copy) — m11-plan Resolution 8. MergeRunSpec (image config merged per the k8s four-quadrant table + $(VAR) expansion; kubelet-verbatim runAsNonRoot numeric-USER rule) with the DISCRIMINATOR: absolute-path image ⇒ M0 host-binary convention; OCI ref ⇒ pull+unpack+merge — replaces the resolveBinary M1 placeholder (shippable native-path increment)."
+          - id: M11.2-d2
+            done: false
+            desc: "pkg/vmhost + cmd/k3sm-vmhost (one per VM pod, dumb by design): reads vmhost.spec.json (guest/v1 proto-JSON), pure-Go MachineConfig assembly (table-tested anywhere) realized by a one-way vz_darwin.go translator — VZLinuxBootLoader (pinned kernel + initramfs), virtiofs root (all rootfs shares READ-ONLY AT THE VZ DEVICE; guest composes writability via overlay), NAT-only virtio-net (deterministic MAC from pod_id; never bridged), one vsock device, Rosetta share when enabled, virtio console → size-capped console.log (deleted with the pod), entropy, balloon attached-unused. Proxies the RUNTIMED-PRIVATE run/vm/<pod>/agent.sock (NOT the poddir; no pod SBPL ever allows any agent.sock — table-tested invariant) ↔ guest vsock; vmhost never parses the gRPC. machineRunner fake for -race lifecycle tests (TestMachineConfigFromSpec, TestLifecycleStateMachine, TestProxyRelayShutdown — named, not say-so). ENTITLEMENT: only vmhost carries com.apple.security.virtualization (dev = ad-hoc codesign --entitlements; release = human-gated B110). Available() retarget is ADDITIVE: macOS≥26 ∧ vzSupported ∧ vmhost present ∧ statically entitled ∧ SecStaticCodeCheckValidity — one probe, both consumers (SelectBackend + the B1 condition). Seatbelt confinement of vmhost itself decided by spike S1(4)/S3(6), else documented residual."
+          - id: M11.2-d3
+            done: false
+            desc: "Guest artifacts (B108 mechanism / B111 human-gated producer): EnsureGuestArtifacts — INSTALL-TIME/daemon-start ensure, never lazy-on-first-pod (the M7.1-d1 no-runtime-fetch posture; divergence from full bundling named — kernel+initramfs out of the bottle for size, verify-then-use at install; air-gap = pre-seed); sha256 PINNED IN CODE, verify-then-delete-on-mismatch; sha-keyed retention of prior versions (offline rollback); VMArtifactsAvailable condition. initramfs = cpio-wrapped k3sm-guest-init (pure-Go newc writer, BYTE-DETERMINISTIC: zeroed mtimes/uid/gid, sorted entries — golden-tested); composed at RELEASE TIME (goreleaser member; B108's pin covers the released pair). --guest-artifacts-dir is DEV-MODE-ONLY: refused fail-fast under launchd, argv-only, node condition while active."
+          - id: M11.2-d4
+            done: false
+            desc: "pkg/guestinit + cmd/k3sm-guest-init (B102): pure plan producers (mount plans incl. per-container /etc bind set + musl-safe search list, Rosetta binfmt line — flags POCF, F-rationale recorded, user resolution, sidecar apply, tmpfs-upper size bound) darwin-testable; the PID1 reaper + Stop(grace) state machine GOOS-PORTABLE behind a proc seam with a NAMED -race suite (the milestone's most concurrency-sensitive code); cmd/ is the thin GOOS=linux CGO=0 executor. Boot: mounts → guest-spec.json → per-container overlay (virtiofs lower RO + bounded tmpfs upper, metacopy=on) → sidecar → binfmt → hostname → /etc binds into EVERY container rootfs (chroot shadows guest /etc — kubelet contract) → eth0 DHCP (pure-Go; the agent-Health lease is the SINGLE live-address authority — the 'runtimed reconciles from the attachment' comments in vm.go/guest.go are retired; closes darwin-net M5.2 caveat (a)) → init then main containers (cgroup2 leaf, chroot, workdir, k8s uid/gid precedence, fsGroup supplemental + idmapped volume mounts) → reap → Stop: TERM→grace→KILL→sync→poweroff. Guest link MTU ≤1380 if cross-node is ever claimed. Cross-build + vet lane wired into runtimed's per-CI gate."
+          - id: M11.2-d5
+            done: false
+            desc: "Volumes into guests (B106): hybrid share model — projected/Secret/ConfigMap/downwardAPI via the EXISTING mount.Materialize → dedicated READ-ONLY k3sm.proj share (RO at the VZ device); emptyDir default under the RW k3sm.vols share; medium:Memory = guest tmpfs with sizeLimit (never crosses virtiofs). Share-set invariants table-tested: per-pod roots inside the owning pod dir; pairwise-disjoint (k3sm.vols never an ancestor of the projected tree); per-container bind visibility; credentials never on a RW share. fsGroup = guest-side idmapped mounts (mount_setattr MOUNT_ATTR_IDMAP: host _k3sm owner → effective container uid/fsGroup — zero chown anywhere; fsGroupChangePolicy moot) CONTINGENT on spike S3(2) — Apple's virtiofs device must advertise FUSE idmap support; kernel ≥6.12 is necessary-not-sufficient; NO chmod fallback is encoded (banned dual path — if S3 disproves idmap, a human-reviewed re-plan). ALL guest hostPath (Directory shares AND File snapshots) FAIL-CLOSED REJECTED until human-gated B98 lands; /var/lib/k3sm denied unconditionally."
+          - id: M11.2-d6
+            done: false
+            desc: "vm-pod verbs + metering (B101/B107): Exec/GetLogs/ListPodStats route vm pods to a guest/v1 client on the private agent.sock behind an injectable transport seam (bufconn — full RPC round-trips, no VM); Exec asserts exit-code round-trip + stream demux/close. Stats ON DEMAND at ListPodStats (or ≥30s heartbeat), NEVER the 1 Hz supervisor tick (no OOM race — VZ memorySize is the hypervisor-enforced ceiling); agent unreachable ⇒ stats omitted + condition, never zeros-as-data; agent responses are UNTRUSTED guest data (bounded reads, no host transitions beyond that pod's status). OOMKilled derives from agent ContainerEvents ONLY — the host rusage sampler never emits it for a vm pod; vmhost proc_pid_rusage feeds node-level accounting only (the B24 three-figures doctrine extended). LIFECYCLE-ACROSS-RESTART contract (m11-plan Resolution 5): vmhost dies with the daemon; Stop(grace) clamped inside the plist ExitTimeOut:45 (+Warn); the startup reconcile sweeps orphaned vmhosts + stale VM pod dirs; boot deadline (VM created → Health within N s else legible pod failure); RestartContainer on a vm pod → typed UNIMPLEMENTED (provider recreates the pod under CrashLoopBackOff); PGDATA crash-consistency documented (WAL recovery)."
+        acceptance:
+          - id: M11.2-a1
+            met: false
+            check: "platform selection table green incl. the NEGATIVE no-linux/amd64-default regression; rootfs builder fixtures green (whiteout/opaque, hardlink escape, setuid re-mode, capability-tagged documented-loss, case-collision fail-closed); MergeRunSpec four-quadrant + discriminator table; all -race"
+            method: unit
+            test: pkg/image.TestManifestListPlatformSelection + pkg/image.TestLinuxRootfsWhiteoutOpaqueApply
+          - id: M11.2-a2
+            met: false
+            check: "vmhost MachineConfig golden + lifecycle state machine (machineRunner fake) + proxy relay shutdown races under -race; Available() additive-conjunction table incl. broken-signature ⇒ unavailable; artifact ensure: corrupted-byte mismatch-reject, retention, launchd-mode --guest-artifacts-dir refusal (fake fetcher, zero network)"
+            method: unit
+            test: pkg/vmhost.TestMachineConfigFromSpec + pkg/vmhost.TestLifecycleStateMachine + pkg/sandbox.TestVMAvailableRequiresEntitledHelper
+          - id: M11.2-a3
+            met: false
+            check: "guest-init plan tables + the PID1 reaper -race suite green on darwin; GOOS=linux GOARCH=arm64 CGO_ENABLED=0 build+vet lane green in per-repo CI; cpio writer golden byte-deterministic"
+            method: unit
+            test: pkg/guestinit.TestMountPlan + pkg/guestinit.TestPID1ReapAndForward
+          - id: M11.2-a4
+            met: false
+            check: "createVMPod spine with fake vmhost + fake agent: volume share-set invariants (per-pod roots, disjoint, device-RO, per-container visibility, credentials-never-RW, medium:Memory-not-shared, hostPath fail-closed rejected), exec exit-code round-trip, stats no-ticker + omit-with-condition, OOMKilled-from-events-only"
+            method: unit
+            test: pkg/runtime.TestCreateVMPodVolumeSharePlan + pkg/runtime.TestVMPodExecRoutesToGuestAgent + pkg/supervisor.TestVMPodStatsFromGuestAgentNotRusage
+          - id: M11.2-a5
+            met: false
+            check: "the k3sm product binary's module graph excludes github.com/Code-Hex/vz (go-list-deps canary in hack/ci.sh); internal/spicanary byte-unchanged; live VM boot / Rosetta / virtiofs-attach legs are the M11.5 lab gate (hack/lab/m11.sh), never auto-greened"
+            method: build
 ---
 
 # runtimed — Phase roadmap
@@ -1026,3 +1095,35 @@ orchestrator's milestone gate): the multi-node join/mesh/NodePort/provisioner wo
 real `clonefile` seed), and the Wave-3 `k3sm` provider wiring (the local-path provisioner that creates the
 PV/PVC objects + the `TemplateResolver`, if a class carries a seed template). M5 adds the
 Virtualization.framework `vm` backend for Linux images.
+
+## M11 — Linux containers & multi-arch (runtimed slice) 🔩⬜
+The XL heart of M11 (`docs/m11-plan.md` is authoritative; encoded 2026-07-10). **Absorbs and
+supersedes the `M5.1-d2` lab remainder** (live VM boot, `k3sm-vmhost`, the OCI-rootfs→bootable-root
+builder, VM metering, entitlement split). **Hard cut** — additive beside the fail-closed
+`SANDBOX_BACKEND_VM` fork; the host-process spine stays byte-green; **no VM outlives the binary
+version that booted it** (vmhost children die with `io.k3sm.server` — the invariant that keeps hard
+cut truthful for the two new cross-process contracts). `Code-Hex/vz` confined to `pkg/vmhost`
+(go-list-deps canary — the k3sm product binary never links it); `internal/spicanary` byte-unchanged.
+
+### M11.2 — platform selection + Linux rootfs + vmhost + guest init/agent + volumes + metering ⬜ (XL)
+**Cross-repo dep:** `apis:M11.1` (guest/v1 + platform fields) + `runtimed:M8.2` (the M8.2-d0
+OCI-layer unpacker is the extraction substrate d1 extends).
+**Deliverables** — see the frontmatter `M11.2-d0…d6` for the binding detail: d0 platform selection
+(B99, drainable now — fixes the silent linux/amd64 default); d1 Linux rootfs builder + ownership
+sidecar + case-sensitive-APFS snapshot volume + `MergeRunSpec` (B100 — also completes the native
+image path); d2 `pkg/vmhost`/`cmd/k3sm-vmhost` (Code-Hex/vz; entitled helper; additive `Available()`
+retarget incl. `SecStaticCodeCheckValidity`; private `agent.sock`); d3 guest artifacts (install-time
+ensure, sha-in-code, retention, `VMArtifactsAvailable`; dev-only `--guest-artifacts-dir` refused
+under launchd; producer = human-gated B111); d4 `pkg/guestinit` + `cmd/k3sm-guest-init` (GOOS-portable
+`-race`'d PID1 reaper; per-container /etc binds; Rosetta binfmt; DHCP with agent-Health as the single
+live-address authority); d5 volumes (share-set invariants; fsGroup via idmapped mounts contingent on
+S3(2); **guest hostPath fail-closed until B98**); d6 vm-pod exec/logs/stats + the
+lifecycle-across-restart contract (Stop ≤ ExitTimeOut, orphan sweep, boot deadline,
+OOMKilled-from-events-only, restart = whole-pod recreate).
+**Packaging deliverables** (with k3sm M11.4, m11-plan Resolution 9): goreleaser second build entry
+(`dir:`-based; `cmd/k3sm-vmhost` stays here), archive membership + install path, the bidirectional
+entitlement assert ("vmhost carries exactly `com.apple.security.virtualization`, never the
+code-running trio"), the brew source-build entitlement step, release-time initramfs composition.
+`doc.go` for `pkg/vmhost` + `pkg/guestinit`.
+**Acceptance (exit gate)** — frontmatter `M11.2-a1…a5`; the live boot/Rosetta/virtiofs legs are the
+M11.5 lab gate (`hack/lab/m11.sh`), never auto-greened.
