@@ -158,9 +158,13 @@ func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 		}
 	})
 
-	t.Run("bind-loopback-succeeds", func(t *testing.T) {
-		// A tiny helper that binds 127.0.0.1:0 proves the unfiltered
-		// (allow network-bind) actually grants bind() under the applied profile.
+	t.Run("bind-and-listen-succeeds", func(t *testing.T) {
+		// A tiny server helper that binds AND listen()s proves both (allow
+		// network-bind) grants bind() and (allow network-inbound) grants listen().
+		// The listen() leg is load-bearing: a bare network-bind passes bind() but a
+		// TCP server's listen() is gated by the SEPARATE network-inbound operation, so
+		// without it EVERY server pod (a Service target, a readiness/liveness HTTP
+		// server) fails listen() with EPERM (the M10.1 regression this test now guards).
 		bin := filepath.Join(work, "bindbin")
 		src := filepath.Join(work, "bind.c")
 		if err := os.WriteFile(src, []byte(
@@ -168,7 +172,8 @@ func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 				"int main(void){int fd=socket(AF_INET,SOCK_STREAM,0);if(fd<0){perror(\"socket\");return 1;}\n"+
 				"struct sockaddr_in a;memset(&a,0,sizeof a);a.sin_family=AF_INET;a.sin_port=0;a.sin_addr.s_addr=inet_addr(\"127.0.0.1\");\n"+
 				"if(bind(fd,(struct sockaddr*)&a,sizeof a)!=0){perror(\"bind\");return 1;}\n"+
-				"printf(\"BIND-OK\\n\");close(fd);return 0;}\n"),
+				"if(listen(fd,1)!=0){perror(\"listen\");return 1;}\n"+
+				"printf(\"LISTEN-OK\\n\");close(fd);return 0;}\n"),
 			0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -180,10 +185,10 @@ func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 		}
 		out, err := runUnderShim(t, shim, profile, os.Environ(), bin)
 		if err != nil {
-			t.Fatalf("bind(127.0.0.1:0) failed under the networked-pod profile: %v\n%s", err, out)
+			t.Fatalf("bind+listen(127.0.0.1) failed under the networked-pod profile (network-inbound missing?): %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "BIND-OK") {
-			t.Fatalf("bind helper did not report success:\n%s", out)
+		if !strings.Contains(out, "LISTEN-OK") {
+			t.Fatalf("server helper did not report listen success:\n%s", out)
 		}
 	})
 }
