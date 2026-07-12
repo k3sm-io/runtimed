@@ -2,8 +2,8 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M5
-updated: 2026-07-02
-updated_by: agent
+updated: 2026-07-11
+updated_by: roadmap-encoder
 
 phases:
   - id: M0
@@ -615,6 +615,40 @@ phases:
             met: false
             check: "the k3sm product binary's module graph excludes github.com/Code-Hex/vz (go-list-deps canary in hack/ci.sh); internal/spicanary byte-unchanged; live VM boot / Rosetta / virtiofs-attach legs are the M11.5 lab gate (hack/lab/m11.sh), never auto-greened"
             method: build
+
+  - id: M12
+    title: Images & build engine (runtimed slice — local image index, pull-policy honor, policy-gated tree signing)
+    status: todo
+    depends_on: []
+    notes: >-
+      docs/m12-plan.md is authoritative (Phase C encoded from it). CONSUMES M8.2-d0 (the
+      OCI-layer unpacker + tree signing) + queue items B99 (platform selection) and B100
+      (snapshot store + MergeRunSpec + the OCI-ref discriminator) — those surfaces are
+      owned THERE; an M12 builder finding itself editing them stops and reports. Hard cut.
+    subphases:
+      - id: M12.1
+        title: local image index + imagePullPolicy honor + pull-failure classification + policy-gated tree signing
+        status: todo
+        depends_on: [runtimed:M8.2, apis:M12.1]
+        deliverables:
+          - id: M12.1-d1
+            done: false
+            desc: "Local image index beside the blob CAS: ref→resolved-digest keyed (reference × platform, per ImageManifest.platform/index_digest); staged+os.Rename commit; self-authenticating on read-through. The SINGLE shared substrate for IfNotPresent/Never decisions, the image CLI's ls (queue item B117 links this package in-process), and the cache GC's refcounting (B114 cites it) — one owner, here."
+          - id: M12.1-d2
+            done: false
+            desc: "Puller honors the stamped policy: Always=re-resolve; IfNotPresent=index-hit with ZERO registry traffic (a warm cache runs offline); Never=fail-if-absent with NO pull attempt; UNSPECIFIED=legacy pull-through. Pull failures are CLASSIFIED for the provider's waiting-reason taxonomy (invalid ref / auth / not-found / platform mismatch) and NEVER fail CreatePod wholesale — the container parks Waiting (queue item B119 consumes the classification)."
+          - id: M12.1-d3
+            done: false
+            desc: "Tree signing is ADHOC_OK-gated exactly like the single-binary gate (under require-signed/require-notarized: NEVER sign, check as-pulled — no silent signature downgrade); the per-binary gate fires on the post-merge argv[0]; signature policy becomes pod-selectable with ADHOC_OK the default. SBPL invariant: the per-pod clonefiled rootfs lives UNDER the pod's data volume (covered by the existing re-allow) — never a read-allow over the shared snapshot store."
+        acceptance:
+          - id: M12.1-a1
+            met: false
+            check: "policy×cache-state table green incl. UNSPECIFIED=legacy and an offline IfNotPresent warm-cache row (fake fetcher counts zero registry calls); presence-by-reference decidable offline via the index"
+            method: unit
+          - id: M12.1-a2
+            met: false
+            check: "policy-gated tree-sign table: ADHOC_OK signs the materialized tree; require-signed/require-notarized never sign and verify as-pulled; the live materialize-then-exec-under-profile leg rides the M8.2 integration gate"
+            method: unit
 ---
 
 # runtimed — Phase roadmap
