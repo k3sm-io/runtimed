@@ -417,21 +417,19 @@ phases:
             method: build
 
   - id: M8
-    title: MLX — native Apple-Silicon ML serving (runtimed slice — Metal SBPL + egress + tree signing + GPUFacts + OCI unpacker)
+    title: MLX — native Apple-Silicon ML serving (runtimed slice — Metal SBPL + egress + tree signing + GPUFacts; consumes the M11.2-d7 unpacker)
     status: todo
     depends_on:
       - apis:M8.1
     subphases:
       - id: M8.2
-        title: Metal SBPL + egress branch + tree signing + GPUFacts + OCI-layer unpacker
+        title: Metal SBPL + egress branch + tree signing + GPUFacts (consumes the M11.2-d7 unpacker)
         status: todo
         size: L
+        depends_on: [runtimed:M11.2]
         strategy: hard cut
-        strategy_rationale: additive — the new SandboxProfile booleans (allow_gpu, allow_internet_egress) default false so an old runtimed ignores them and an old provider never sets them (no provider↔runtimed phased exception); the proto fields are carved from the reserved bands in apis:M8.1; the host-process Seatbelt path and existing golden SBPL fixtures stay byte-green. One signed binary.
+        strategy_rationale: additive — the new SandboxProfile booleans (allow_gpu, allow_internet_egress) default false so an old runtimed ignores them and an old provider never sets them (no provider↔runtimed phased exception); the proto fields are carved from the reserved bands in apis:M8.1; the host-process Seatbelt path and existing golden SBPL fixtures stay byte-green. One signed binary. RE-HOME NOTE (2026-07-11): the OCI-layer unpacker (formerly the M8.2-d0 deliverable here) moved to runtimed M11.2-d7 with the Linux-layer re-sequencing — this sub-phase CONSUMES it via the depends edge above; its materialize-then-exec acceptance moved with it (now M11.2-a6).
         deliverables:
-          - id: M8.2-d0
-            done: false
-            desc: pkg/image — OCI-layer unpacker producing a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. PREREQUISITE — today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder, so the whole M8 product path is blocked on this substrate; d3 AdHocSignTree walks and clonefiles from it
           - id: M8.2-d1
             done: false
             desc: pkg/sandbox/metal.go — the S1-derived Metal SBPL allow-set behind allow_gpu, expressed as per-chip-family data (AGX user-client class names vary M1→M4) with golden SBPL fixtures per family in pkg/sandbox/testdata; launch families SCOPED to the dev-mac's own family for v1 (Resolution 15), an unknown/absent family FAILS CLOSED (sandbox_gpu_supported=false + metal.go errors on a family miss, Resolution 14), and the shader-cache write scope is CONTRACT-BOUNDED (per-pod redirect or an enumerated narrow subpath) NOT denial-log-derived (Resolution 11). Emitted in the existing rule order (allows → protected denies → narrow re-allows)
@@ -440,7 +438,7 @@ phases:
             desc: pkg/sandbox — IP-scoped egress branch behind allow_internet_egress. The wide allow is (allow network-outbound (remote ip …)) — NEVER unqualified (AF_UNIX stays default-denied) — followed last-match-wins by RANGE-BASED host-local denies (the whole of 127/8 incl. kine's plaintext datastore, 169.254/16, all of 100.64/10, the node's RFC1918 subnets) with tier-3 re-allows for the pod's own IP + the cluster DNS/apiserver VIPs (Resolution 12); allow_internet_egress IMPLIES allow_network so DNS-VIP routing is preserved. sandbox.Validate gains an s-expression-aware (balanced-paren token scan) reject-unfiltered-network-outbound check (Resolution 13)
           - id: M8.2-d3
             done: false
-            desc: pkg/image — AdHocSignTree beside AdHocSign, run ONCE at pull/materialize time over the d0 content-addressed tree (policy-keyed variant); in-process Mach-O magic detection, signs only invalid/unsigned Mach-Os (ad-hoc signatures are content-addressed and survive clonefile — never de-CoW a clean file); CONTAINMENT-CHECKED (lstat, never follow symlinks/hardlinks, every candidate resolves under the rootfs) and STRUCTURALLY UNREACHABLE under REQUIRE_SIGNED/REQUIRE_NOTARIZED. gateSignature (pkg/runtime/pod.go) becomes check-then-sign-only-if-invalid — no unconditional -f re-sign, which would de-CoW argv[0] every start (Resolution 13) — and keeps verifying argv[0] only per start
+            desc: pkg/image — AdHocSignTree beside AdHocSign, run ONCE at pull/materialize time over the M11.2-d7 content-addressed tree (policy-keyed variant; the unpacker re-homed 2026-07-11); in-process Mach-O magic detection, signs only invalid/unsigned Mach-Os (ad-hoc signatures are content-addressed and survive clonefile — never de-CoW a clean file); CONTAINMENT-CHECKED (lstat, never follow symlinks/hardlinks, every candidate resolves under the rootfs) and STRUCTURALLY UNREACHABLE under REQUIRE_SIGNED/REQUIRE_NOTARIZED. gateSignature (pkg/runtime/pod.go) becomes check-then-sign-only-if-invalid — no unconditional -f re-sign, which would de-CoW argv[0] every start (Resolution 13) — and keeps verifying argv[0] only per start
           - id: M8.2-d4
             done: false
             desc: pkg/sandbox (or pkg/runtime) — GPUFacts population for GetRuntimeInfoResponse.gpu (field 100, apis:M8.1). Sysctls + a FUNCTIONAL Metal compile+dispatch probe (cgo-isolated in *_darwin.go), NOT a nil-check — the probe DISCRIMINATES the VZ paravirtual Metal device (MTLCreateSystemDefaultDevice is non-nil in VZ guests incl. GitHub macOS runners, so a VM node must never advertise GPU); populates iogpu_wired_limit_bytes with the explicit 0-sentinel (kernel default, not "unknown"), recommended_max_working_set_bytes (the MTLDevice working-set ceiling), and sandbox_gpu_supported scoped to the currently selected backend
@@ -456,10 +454,6 @@ phases:
             met: false
             check: AdHocSignTree table test with a fake signer — hardlink/symlink escape cases rejected (containment), non-Mach-O skipped, already-signed skipped, policy gating (unreachable under REQUIRE_SIGNED/REQUIRE_NOTARIZED)
             method: unit
-          - id: M8.2-a3
-            met: false
-            check: materialize-then-exec integration test — the d0 unpacker produces an unpacked tree that createPod materializes via MaterializeTree and execs argv[0] out of a multi-layer image
-            method: integration
           - id: M8.2-a4
             met: false
             check: a real MLX matmul (full inference round-trip) runs under the generated allow_gpu profile on a GPU dev-mac (integration tier, k3smtest.SkipUnless(t, "apple-gpu"))
@@ -560,21 +554,25 @@ phases:
       cmd/k3sm-vmhost — the shipped k3sm product binary NEVER links it, enforced by a
       go-list-deps canary in hack/ci.sh (the symbol-canary precedent);
       internal/spicanary stays byte-unchanged (VZ is public — the M5.1-d1 statement).
-      Cross-milestone dep: M11.2-d1 extends the M8.2-d0 OCI-layer unpacker.
+      RE-SEQUENCED PRE-LAUNCH (2026-07-11, docs/m11-plan.md R16): this wave ships
+      functional-EXPERIMENTAL at v0.1; run out of ledger order with recorded rationale —
+      the M10 remainder is hardware-gated and not a dependency. The OCI-layer unpacker is
+      OWNED HERE as M11.2-d7 (re-homed from the MLX milestone; built FIRST within this
+      wave — d1 extends it in-wave; the MLX slice consumes it via its depends edge).
       Lifecycle invariant that keeps hard cut truthful: vmhost children die with
       io.k3sm.server — no VM outlives the binary version that booted it.
     subphases:
       - id: M11.2
-        title: platform selection + Linux rootfs builder + vmhost + guest init + vsock agent + volumes + metering
+        title: platform selection + OCI-layer unpacker + Linux rootfs builder + vmhost + guest init + vsock agent + volumes + metering
         status: todo
-        depends_on: [apis:M11.1, runtimed:M8.2]
+        depends_on: [apis:M11.1]
         deliverables:
           - id: M11.2-d0
             done: false
             desc: "Image platform selection (B99 — /go-drainable now): pure PlatformPolicy{Backend, HostRosetta, GuestRosetta, Override} → ordered Candidates() in pkg/image/platform.go (native: darwin/arm64 [+darwin/amd64 iff host Rosetta]; vm: linux/arm64 variant \"\"≡v8 [+linux/amd64 iff guest Rosetta]; Override ⇒ exactly that platform). RemoteFetch becomes candidate-aware: remote.Get → explicit index traversal in candidate order (skip attestation manifests) → single-manifest os/arch verified → sentinel ErrNoPlatformMatch carrying the image's available platforms. Structurally removes ggcr's implicit linux/amd64 default (the latent bug at pull.go:86). Resolved platform recorded via ImageManifest.platform/index_digest. Deliberate divergence registered: upstream runs a mismatched single-manifest image to an exec-format crash; k3sm refuses at pull (divergent-by-design)."
           - id: M11.2-d1
             done: false
-            desc: "Linux rootfs builder (B100; EXTENDS the M8.2-d0 unpacker): OCI whiteouts (.wh.*/.wh..wh..opq), hardlink safety (os.Root.Link, in-root targets), per-layer diffID re-verification before a ChainID-keyed snapshot commit (snapshots/<algo>/<chainid>/rootfs + meta.json, staged+os.Rename), PAX xattrs dropped by default (documented loss: security.capability), device/FIFO/socket skip+count, FAIL-CLOSED case/normalization-collision detection, ownership SIDECAR (path→uid,gid,mode,xattrs; guest apply order chown→chmod→setxattr — chown clears setuid). Snapshot store + vm pod rootfs dirs on a DEDICATED CASE-SENSITIVE APFS VOLUME, co-located (cross-volume clonefile degrades to byte-copy) — m11-plan Resolution 8. MergeRunSpec (image config merged per the k8s four-quadrant table + $(VAR) expansion; kubelet-verbatim runAsNonRoot numeric-USER rule) with the DISCRIMINATOR: absolute-path image ⇒ M0 host-binary convention; OCI ref ⇒ pull+unpack+merge — replaces the resolveBinary M1 placeholder (shippable native-path increment)."
+            desc: "Linux rootfs builder (B100; EXTENDS the M11.2-d7 unpacker in-wave — d7 builds first): OCI whiteouts (.wh.*/.wh..wh..opq), hardlink safety (os.Root.Link, in-root targets), per-layer diffID re-verification before a ChainID-keyed snapshot commit (snapshots/<algo>/<chainid>/rootfs + meta.json, staged+os.Rename), PAX xattrs dropped by default (documented loss: security.capability), device/FIFO/socket skip+count, FAIL-CLOSED case/normalization-collision detection, ownership SIDECAR (path→uid,gid,mode,xattrs; guest apply order chown→chmod→setxattr — chown clears setuid). Snapshot store + vm pod rootfs dirs on a DEDICATED CASE-SENSITIVE APFS VOLUME, co-located (cross-volume clonefile degrades to byte-copy) — m11-plan Resolution 8. MergeRunSpec (image config merged per the k8s four-quadrant table + $(VAR) expansion; kubelet-verbatim runAsNonRoot numeric-USER rule) with the DISCRIMINATOR: absolute-path image ⇒ M0 host-binary convention; OCI ref ⇒ pull+unpack+merge — replaces the resolveBinary M1 placeholder (shippable native-path increment)."
           - id: M11.2-d2
             done: false
             desc: "pkg/vmhost + cmd/k3sm-vmhost (one per VM pod, dumb by design): reads vmhost.spec.json (guest/v1 proto-JSON), pure-Go MachineConfig assembly (table-tested anywhere) realized by a one-way vz_darwin.go translator — VZLinuxBootLoader (pinned kernel + initramfs), virtiofs root (all rootfs shares READ-ONLY AT THE VZ DEVICE; guest composes writability via overlay), NAT-only virtio-net (deterministic MAC from pod_id; never bridged), one vsock device, Rosetta share when enabled, virtio console → size-capped console.log (deleted with the pod), entropy, balloon attached-unused. Proxies the RUNTIMED-PRIVATE run/vm/<pod>/agent.sock (NOT the poddir; no pod SBPL ever allows any agent.sock — table-tested invariant) ↔ guest vsock; vmhost never parses the gRPC. machineRunner fake for -race lifecycle tests (TestMachineConfigFromSpec, TestLifecycleStateMachine, TestProxyRelayShutdown — named, not say-so). ENTITLEMENT: only vmhost carries com.apple.security.virtualization (dev = ad-hoc codesign --entitlements; release = human-gated B110). Available() retarget is ADDITIVE: macOS≥26 ∧ vzSupported ∧ vmhost present ∧ statically entitled ∧ SecStaticCodeCheckValidity — one probe, both consumers (SelectBackend + the B1 condition). Seatbelt confinement of vmhost itself decided by spike S1(4)/S3(6), else documented residual."
@@ -590,6 +588,9 @@ phases:
           - id: M11.2-d6
             done: false
             desc: "vm-pod verbs + metering (B101/B107): Exec/GetLogs/ListPodStats route vm pods to a guest/v1 client on the private agent.sock behind an injectable transport seam (bufconn — full RPC round-trips, no VM); Exec asserts exit-code round-trip + stream demux/close. Stats ON DEMAND at ListPodStats (or ≥30s heartbeat), NEVER the 1 Hz supervisor tick (no OOM race — VZ memorySize is the hypervisor-enforced ceiling); agent unreachable ⇒ stats omitted + condition, never zeros-as-data; agent responses are UNTRUSTED guest data (bounded reads, no host transitions beyond that pod's status). OOMKilled derives from agent ContainerEvents ONLY — the host rusage sampler never emits it for a vm pod; vmhost proc_pid_rusage feeds node-level accounting only (the B24 three-figures doctrine extended). LIFECYCLE-ACROSS-RESTART contract (m11-plan Resolution 5): vmhost dies with the daemon; Stop(grace) clamped inside the plist ExitTimeOut:45 (+Warn); the startup reconcile sweeps orphaned vmhosts + stale VM pod dirs; boot deadline (VM created → Health within N s else legible pod failure); RestartContainer on a vm pod → typed UNIMPLEMENTED (provider recreates the pod under CrashLoopBackOff); PGDATA crash-consistency documented (WAL recovery)."
+          - id: M11.2-d7
+            done: false
+            desc: "OCI-layer unpacker (the SUBSTRATE — built FIRST within this wave; re-homed here 2026-07-11 from the MLX slice, verbatim scope; m11-plan R17): pkg/image — a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. Today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder — this is the substrate d1 (Linux rootfs builder) extends in-wave, the MLX tree-signing walks (that slice consumes it via its depends edge), and the images milestone's native semantics consume."
         acceptance:
           - id: M11.2-a1
             met: false
@@ -615,14 +616,19 @@ phases:
             met: false
             check: "the k3sm product binary's module graph excludes github.com/Code-Hex/vz (go-list-deps canary in hack/ci.sh); internal/spicanary byte-unchanged; live VM boot / Rosetta / virtiofs-attach legs are the M11.5 lab gate (hack/lab/m11.sh), never auto-greened"
             method: build
+          - id: M11.2-a6
+            met: false
+            check: "materialize-then-exec integration test — the d7 unpacker produces an unpacked tree that createPod materializes via MaterializeTree and execs argv[0] out of a multi-layer image (the acceptance re-homed with the deliverable, 2026-07-11)"
+            method: integration
 
   - id: M12
     title: Images & build engine (runtimed slice — local image index, pull-policy honor, policy-gated tree signing)
     status: todo
     depends_on: []
     notes: >-
-      docs/m12-plan.md is authoritative (Phase C encoded from it). CONSUMES M8.2-d0 (the
-      OCI-layer unpacker + tree signing) + queue items B99 (platform selection) and B100
+      docs/m12-plan.md is authoritative (Phase C encoded from it). CONSUMES M11.2-d7 (the
+      OCI-layer unpacker — re-homed 2026-07-11) + the MLX slice's tree signing + queue items
+      B99 (platform selection) and B100
       (snapshot store + MergeRunSpec + the OCI-ref discriminator) — those surfaces are
       owned THERE; an M12 builder finding itself editing them stops and reports. Hard cut.
     subphases:
@@ -1039,13 +1045,15 @@ README header); no runtime/proto/datastore change. One signed binary.
 DAG: `M8.1 apis → M8.2 runtimed`. runtimed owns **M8.2 (size L)** — the heaviest M8 sub-phase; product
 design `k3sm/docs/DESIGN.md` §5a/§5c, security posture `docs/privilege-model.md`.
 
-### M8.2 — Metal SBPL + egress branch + tree signing + GPUFacts + OCI-layer unpacker ⬜ (L)
+### M8.2 — Metal SBPL + egress branch + tree signing + GPUFacts ⬜ (L; consumes the M11.2-d7 unpacker)
 **Strategy: hard cut** — the new `SandboxProfile` booleans default false (an old runtimed ignores them, an
 old provider never sets them — **no** provider↔runtimed phased exception), the proto fields ride the
 reserved bands (`apis:M8.1`), and the host-process Seatbelt path + existing golden SBPL fixtures stay
-**byte-green**. One signed binary.
+**byte-green**. One signed binary. **RE-HOME (2026-07-11):** the unpacker below moved to
+`M11.2-d7` with the Linux-layer re-sequencing (`depends_on: [runtimed:M11.2]` in the frontmatter);
+the spec text is preserved here for the historical record only.
 **Deliverables**
-- ⬜ `M8.2-d0` **(PREREQUISITE)** `pkg/image`: an **OCI-layer unpacker** →
+- ⬜ ~~`M8.2-d0`~~ → **`M11.2-d7`** **(PREREQUISITE, re-homed)** `pkg/image`: an **OCI-layer unpacker** →
   per-image **unpacked content-addressed tree** (digest+policy-keyed), applied via a **containment-checked
   tar apply** (symlink/hardlink-safe, `com.apple.quarantine`-xattr discipline per `clone.go`, same-APFS-
   volume placement per `cache.go`), wired into `pkg/runtime.createPod` via `MaterializeTree`. Today only
@@ -1139,10 +1147,12 @@ version that booted it** (vmhost children die with `io.k3sm.server` — the inva
 cut truthful for the two new cross-process contracts). `Code-Hex/vz` confined to `pkg/vmhost`
 (go-list-deps canary — the k3sm product binary never links it); `internal/spicanary` byte-unchanged.
 
-### M11.2 — platform selection + Linux rootfs + vmhost + guest init/agent + volumes + metering ⬜ (XL)
-**Cross-repo dep:** `apis:M11.1` (guest/v1 + platform fields) + `runtimed:M8.2` (the M8.2-d0
-OCI-layer unpacker is the extraction substrate d1 extends).
-**Deliverables** — see the frontmatter `M11.2-d0…d6` for the binding detail: d0 platform selection
+### M11.2 — platform selection + unpacker + Linux rootfs + vmhost + guest init/agent + volumes + metering ⬜ (XL)
+**Cross-repo dep:** `apis:M11.1` (guest/v1 + platform fields). The OCI-layer unpacker is
+**owned here as `M11.2-d7`** (re-homed 2026-07-11; built FIRST in-wave — d1 extends it; the MLX
+slice consumes it via its `depends_on: [runtimed:M11.2]` edge). RE-SEQUENCED PRE-LAUNCH per the
+authoritative plan doc — ships functional-EXPERIMENTAL at v0.1.
+**Deliverables** — see the frontmatter `M11.2-d0…d7` for the binding detail: d0 platform selection
 (B99, drainable now — fixes the silent linux/amd64 default); d1 Linux rootfs builder + ownership
 sidecar + case-sensitive-APFS snapshot volume + `MergeRunSpec` (B100 — also completes the native
 image path); d2 `pkg/vmhost`/`cmd/k3sm-vmhost` (Code-Hex/vz; entitled helper; additive `Available()`
