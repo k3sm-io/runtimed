@@ -196,6 +196,23 @@ type Runtime struct {
 	netReconcileOnce sync.Once
 	netReconcileErr  error
 
+	// procStart reports a live process's kernel start time — the leader
+	// identity recorded at spawn for the startup pod reap (podreap.go).
+	// Production wires supervisor.ProcStartTimeNano; tests inject a fake table.
+	procStart procStartTime
+
+	// procGroup reports the live members' start times of a process group — the
+	// startup reap probes the GROUP (not just the leader) so grandchildren that
+	// outlive a reaped-zombie leader are still caught (podreap.go). Production
+	// wires supervisor.ProcGroupStartsNano; tests inject a fake group table.
+	procGroup procGroupInspector
+
+	// podReapOnce/podReapErr make the startup pod reap run exactly once per
+	// Runtime, BEFORE any CreatePod is served (same shape as the network
+	// startup reconcile above, and like it sticky/fail-closed).
+	podReapOnce sync.Once
+	podReapErr  error
+
 	mu   sync.Mutex
 	pods map[string]*pod
 }
@@ -269,6 +286,14 @@ type Deps struct {
 	// SignalGroup signals a process group (M2.4 graceful stop / M2.5 OOM kill).
 	// Defaults to supervisor.SignalGroup; tests inject a recorder.
 	SignalGroup func(pgid int, sig os.Signal) error
+	// ProcStartTime reports a live process's kernel start time (the leader
+	// identity recorded at spawn). Defaults to supervisor.ProcStartTimeNano;
+	// tests inject a fake process table.
+	ProcStartTime func(pid int) (startUnixNano int64, ok bool)
+	// ProcGroup reports a process group's live member start times (the startup
+	// reap's group probe). Defaults to supervisor.ProcGroupStartsNano; tests
+	// inject a fake group table.
+	ProcGroup func(pgid int) (memberStartsNano []int64, ok bool)
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -334,6 +359,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if signalGroup == nil {
 		signalGroup = supervisor.SignalGroup
 	}
+	procStart := deps.ProcStartTime
+	if procStart == nil {
+		procStart = supervisor.ProcStartTimeNano
+	}
+	procGroup := deps.ProcGroup
+	if procGroup == nil {
+		procGroup = supervisor.ProcGroupStartsNano
+	}
 	binder := deps.Binder
 	if binder == nil {
 		// The PV storage root is a sibling of the pods root under the runtime root
@@ -362,6 +395,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		binder:      binder,
 		footprinter: footprinter,
 		signalGroup: signalGroup,
+		procStart:   procStart,
+		procGroup:   procGroup,
 		broker:      newBroker(),
 		pods:        make(map[string]*pod),
 	}, nil
