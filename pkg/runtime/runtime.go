@@ -201,10 +201,11 @@ type Runtime struct {
 	// Production wires supervisor.ProcStartTimeNano; tests inject a fake table.
 	procStart procStartTime
 
-	// procGroup reports the live members' start times of a process group — the
-	// startup reap probes the GROUP (not just the leader) so grandchildren that
-	// outlive a reaped-zombie leader are still caught (podreap.go). Production
-	// wires supervisor.ProcGroupStartsNano; tests inject a fake group table.
+	// procGroup reports the live members (pid + start time) of a process group —
+	// the startup reap probes the GROUP so it can match the leader member
+	// (Pid == pgid) exactly and see a leaked group whose leader has exited
+	// (podreap.go). Production wires supervisor.ProcGroupMembers; tests inject a
+	// fake group table.
 	procGroup procGroupInspector
 
 	// podReapOnce/podReapErr make the startup pod reap run exactly once per
@@ -290,10 +291,10 @@ type Deps struct {
 	// identity recorded at spawn). Defaults to supervisor.ProcStartTimeNano;
 	// tests inject a fake process table.
 	ProcStartTime func(pid int) (startUnixNano int64, ok bool)
-	// ProcGroup reports a process group's live member start times (the startup
-	// reap's group probe). Defaults to supervisor.ProcGroupStartsNano; tests
+	// ProcGroup reports a process group's live members (pid + start time — the
+	// startup reap's group probe). Defaults to supervisor.ProcGroupMembers; tests
 	// inject a fake group table.
-	ProcGroup func(pgid int) (memberStartsNano []int64, ok bool)
+	ProcGroup func(pgid int) (members []supervisor.ProcMember, ok bool)
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -365,7 +366,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	procGroup := deps.ProcGroup
 	if procGroup == nil {
-		procGroup = supervisor.ProcGroupStartsNano
+		procGroup = supervisor.ProcGroupMembers
 	}
 	binder := deps.Binder
 	if binder == nil {

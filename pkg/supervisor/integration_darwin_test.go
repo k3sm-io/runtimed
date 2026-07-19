@@ -115,3 +115,84 @@ func TestIntegrationSignalGroupKills(t *testing.T) {
 		t.Errorf("after SIGKILL got (code=%d sig=%d), want (137,9)", code, sig)
 	}
 }
+
+// neverLivePgid is a pid/pgid that is effectively never live (the same pattern
+// rusage_darwin_test.go uses for a dead pid): kern.proc.pgrp reports an empty
+// group and kill(-pgid) reports ESRCH.
+const neverLivePgid = 0x7FFFFFFE
+
+// TestIntegrationProcGroupMembersEmptyGroupDrops pins the reap's drop contract:
+// an inspectable-but-empty (dead) process group returns an EMPTY slice with
+// ok=true — NOT an error. The startup reap reads ok=true + empty as "the group
+// is gone, drop the record", whereas ok=false would keep the record forever. A
+// never-live pgid must therefore report (empty, true), never (nil, false).
+func TestIntegrationProcGroupMembersEmptyGroupDrops(t *testing.T) {
+	members, ok := ProcGroupMembers(neverLivePgid)
+	if !ok {
+		t.Fatalf("ProcGroupMembers(dead pgid) ok=false; want ok=true so the reap DROPS the record (ok=false keeps it forever)")
+	}
+	if len(members) != 0 {
+		t.Fatalf("ProcGroupMembers(dead pgid) = %v, want empty slice", members)
+	}
+}
+
+// TestIntegrationProcStartDerivationIdentity closes the "both paths read the
+// same field" gap the fake-group unit tests hard-code away: it spawns one real
+// child in its own process group (POSIX_SPAWN_SETSID → pid == pgid) and asserts
+// ProcStartTimeNano(pid) EQUALS the ProcGroupMembers(pgid) member whose Pid==pid.
+// The reap's exact-equality kill decision depends on both derivations being
+// bit-identical; a silent divergence would fail OPEN (the reaper stops killing
+// its own orphans), so this must be an exact match, not an approximate one.
+func TestIntegrationProcStartDerivationIdentity(t *testing.T) {
+	spec := SpawnSpec{
+		Path: "/bin/sh",
+		Argv: []string{"/bin/sh", "-c", "sleep 60"},
+		Env:  os.Environ(),
+	}
+	p := NewProcess(PosixSpawner{}, KqueueReaper{}, spec, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Tear the group down at the end regardless of assertions.
+	defer func() {
+		_ = SignalGroup(p.PID(), unixSIGKILL())
+		_, _, _ = p.Wait(ctx)
+	}()
+
+	pid := p.PID()
+	// The SETSID leader's pid is its pgid.
+	leaderStart, ok := ProcStartTimeNano(pid)
+	if !ok {
+		t.Fatalf("ProcStartTimeNano(%d) ok=false for a live leader", pid)
+	}
+	members, ok := ProcGroupMembers(pid)
+	if !ok {
+		t.Fatalf("ProcGroupMembers(%d) ok=false for a live group", pid)
+	}
+	var found bool
+	for _, m := range members {
+		if m.Pid == pid {
+			found = true
+			if m.StartUnixNano != leaderStart {
+				t.Errorf("derivation divergence: ProcGroupMembers leader start=%d, ProcStartTimeNano=%d — the reap's exact-equality kill needs these bit-identical",
+					m.StartUnixNano, leaderStart)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ProcGroupMembers(%d) did not include the leader pid; members=%v", pid, members)
+	}
+}
+
+// TestIntegrationSignalGroupESRCHIsNil pins the mapping the startup reap leans on
+// (podreap.go): SignalGroup of an already-gone / never-live group maps the
+// kernel's ESRCH to a nil error, so a reap of a group that vanished between the
+// probe and the signal is a no-op, not a spurious failure that would keep the
+// record and re-alert forever.
+func TestIntegrationSignalGroupESRCHIsNil(t *testing.T) {
+	if err := SignalGroup(neverLivePgid, unixSIGKILL()); err != nil {
+		t.Fatalf("SignalGroup(never-live pgid) = %v, want nil (ESRCH maps to nil)", err)
+	}
+}

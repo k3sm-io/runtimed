@@ -33,6 +33,17 @@ import (
 // under the daemon's home instead of relying on this default.
 const DefaultWorkDir = "/var/lib/k3sm"
 
+// PodReapSubdir is the daemon-private startup-reap store dir name: a sibling of
+// the pods root under the runtime work-dir (<WorkDir>/podreap) holding one
+// <podID>/<pgid>.json record per live container process group. It is exported so
+// pkg/runtime single-sources the on-disk store name from the SAME literal the
+// SBPL generator defends: resolvePosture pins <WorkDir>/podreap into the
+// protected deny-set and Generate emits a matching (deny ...) for it, so a
+// confined pod can never forge a reap record (which would drive a root-SIGKILL
+// at a process group of its choosing). If the two literals drifted, the deny
+// would protect a non-existent sibling while the real store stayed writable.
+const PodReapSubdir = "podreap"
+
 // DefaultResolverVIP is the cluster DNS Service VIP assumed when a Posture
 // leaves ResolverVIP empty. It is PLUMBING-ONLY: since M10.1 the VIP renders NO
 // SBPL rule (the macOS 26 Seatbelt grammar cannot express per-IP network
@@ -45,10 +56,11 @@ const DefaultResolverVIP = "10.96.0.10"
 // via a caller-supplied extra path, independent of the work-dir: user homes, the
 // system secrets/state store, and the dyld cryptex (the system read-only content
 // volume). resolvePosture appends the work-dir-derived pods-root (sibling pods)
-// to this set. validateExtraPaths rejects any extra read/write path at or under
-// one of these (the pod's OWN data volume is carved out), and Generate emits a
-// matching (deny ...) for each AFTER the extra-path allows so an unvalidated path
-// cannot override the deny (SBPL is last-match-wins).
+// AND the daemon-private podreap store (<WorkDir>/podreap) to this set.
+// validateExtraPaths rejects any extra read/write path at or under one of these
+// (the pod's OWN data volume is carved out), and Generate emits a matching
+// (deny ...) for each AFTER the extra-path allows so an unvalidated path cannot
+// override the deny (SBPL is last-match-wins).
 var systemProtectedPrefixes = []string{
 	"/Users",
 	"/private/var/db",
@@ -195,8 +207,9 @@ type GenerateOptions struct {
 // Rule ORDER is security-critical because SBPL is last-match-wins. Generate emits
 // (in increasing precedence): the OS/extra-path allows + the network allows; THEN
 // the AF_UNIX helper-socket denies and the protected file denies (/Users,
-// /private/var/db, the pods root, the dyld cryptex) so a caller's extra path can
-// never override them; THEN the narrow re-allows the protected denies would
+// /private/var/db, the pods root, the podreap store, the dyld cryptex) so a
+// caller's extra path can never override them; THEN the narrow re-allows the
+// protected denies would
 // otherwise clobber (the dyld closure-cache read and this pod's own data volume,
 // which lives under the denied pods root); and LAST the read-only credential
 // sub-scope, whose file-write* deny therefore wins even inside the writable data
@@ -217,7 +230,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 	// Derive the node-level deny-set from the configured work-dir, rejecting a
 	// malformed or home-escaping work-dir BEFORE emitting anything (fail closed).
-	podsRoot, protectedPrefixes, err := resolvePosture(opts.Posture)
+	workDirDenyRoots, protectedPrefixes, err := resolvePosture(opts.Posture)
 	if err != nil {
 		return "", err
 	}
@@ -340,14 +353,16 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 	// --- protected denies (higher precedence than the extra-path allows) --
 	// Emitted AFTER the allows so a caller's extra path can never override them.
-	b.WriteString(";; PROTECTED: deny user homes, the secrets/state store, and the\n")
-	b.WriteString(";; shared pods root (sibling pods) — read+write, AFTER the allows.\n")
+	b.WriteString(";; PROTECTED: deny user homes, the secrets/state store, the\n")
+	b.WriteString(";; shared pods root AND the daemon-private podreap store (sibling\n")
+	b.WriteString(";; dirs under the work-dir) — read+write, AFTER the allows so a\n")
+	b.WriteString(";; caller's extra path (even an ancestor work-dir grant) can't win.\n")
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/private/var/db\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
-	writeFirmlinkSubpaths(&b, []string{podsRoot})
+	writeFirmlinkSubpaths(&b, workDirDenyRoots)
 	b.WriteString("  )\n")
 	// The dyld cryptex is denied WRITE only: the dynamic linker must still READ
 	// the shared cache it holds, so denying read would SIGABRT every pod.
@@ -383,39 +398,47 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	return b.String(), nil
 }
 
-// resolvePosture validates p.WorkDir and returns the derived pods-root and the
-// ordered protected-prefix deny-set (the fixed system subtrees plus the
-// pods-root). An empty WorkDir falls back to DefaultWorkDir; a non-empty WorkDir
-// must be absolute and clean (ErrInvalidWorkDir) and — when p.Home is set — must
-// reside under Home (ErrWorkDirEscapesHome). The Posture VIP fields are NOT
-// consumed here: since M10.1 they render no SBPL (see the AllowNetwork stanza in
-// Generate) and exist only for the DNS env/status plumbing.
-func resolvePosture(p Posture) (podsRoot string, protectedPrefixes []string, err error) {
+// resolvePosture validates p.WorkDir and returns the work-dir-derived denied
+// roots (the pods-root AND the daemon-private podreap store, both read+write
+// denied with firmlink forms by Generate) and the ordered protected-prefix
+// deny-set (those two roots plus the fixed system subtrees). An empty WorkDir
+// falls back to DefaultWorkDir; a non-empty WorkDir must be absolute and clean
+// (ErrInvalidWorkDir) and — when p.Home is set — must reside under Home
+// (ErrWorkDirEscapesHome). The Posture VIP fields are NOT consumed here: since
+// M10.1 they render no SBPL (see the AllowNetwork stanza in Generate) and exist
+// only for the DNS env/status plumbing.
+func resolvePosture(p Posture) (workDirDenyRoots []string, protectedPrefixes []string, err error) {
 	workDir := p.WorkDir
 	if workDir == "" {
 		workDir = DefaultWorkDir
 	} else {
 		if !filepath.IsAbs(workDir) {
-			return "", nil, fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
+			return nil, nil, fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
 		}
 		if workDir == "/" {
-			return "", nil, fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
+			return nil, nil, fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
 		}
 		if filepath.Clean(workDir) != workDir {
-			return "", nil, fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
+			return nil, nil, fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
 		}
 	}
 	if p.Home != "" {
 		home := filepath.Clean(p.Home)
 		if !isUnder(workDir, home) {
-			return "", nil, fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
+			return nil, nil, fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
 		}
 	}
-	podsRoot = filepath.Join(workDir, "pods")
-	// Pin the pods-root into the protected deny-set so a caller's extra path can
-	// never reach a sibling pod, then keep the fixed system subtrees.
-	protectedPrefixes = append([]string{podsRoot}, systemProtectedPrefixes...)
-	return podsRoot, protectedPrefixes, nil
+	podsRoot := filepath.Join(workDir, "pods")
+	// The daemon-private startup-reap store: records here drive a root-privileged
+	// kill(-pgid), so a confined pod must never be able to write (or read) them.
+	// Single-sourced with pkg/runtime via PodReapSubdir.
+	podReapRoot := filepath.Join(workDir, PodReapSubdir)
+	workDirDenyRoots = []string{podsRoot, podReapRoot}
+	// Pin BOTH work-dir roots into the protected deny-set so a caller's extra
+	// path can never reach a sibling pod or the reap store, then keep the fixed
+	// system subtrees.
+	protectedPrefixes = append(append([]string{}, workDirDenyRoots...), systemProtectedPrefixes...)
+	return workDirDenyRoots, protectedPrefixes, nil
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected

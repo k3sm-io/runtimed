@@ -80,8 +80,12 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	// Reap pod process groups a dead daemon left behind, also BEFORE any
 	// CreatePod: pods are SETSID session leaders that reparent to launchd on a
 	// daemon crash and keep holding ports. Only durably-recorded pgids are
-	// considered, each guarded by a start-time identity check (podreap.go) —
-	// never a name/path heuristic. Fail-closed like the network reconcile.
+	// considered, each guarded by an exact-instance start-time identity check
+	// (podreap.go) — never a name/path heuristic. Unlike the network reconcile
+	// this DEGRADES rather than fails closed: reaping a best-effort orphan store
+	// is not a scheduling precondition, so reapOrphanedPods always returns nil
+	// (it alerts + skips on an unreadable store) — a store fault must never
+	// crash-loop the node out of serving CreatePod.
 	if err := s.rt.reapOrphanedPods(); err != nil {
 		return fmt.Errorf("reap orphaned pod process groups: %w", err)
 	}

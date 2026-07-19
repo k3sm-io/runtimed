@@ -18,15 +18,25 @@ limitations under the License.
 
 package supervisor
 
+// ProcMember is one live member of a process group (pid + start time). Off
+// darwin it is never populated (ProcGroupMembers reports ok=false), but the type
+// is declared so the cross-repo signatures compile on every platform.
+type ProcMember struct {
+	// Pid is the member's process id.
+	Pid int
+	// StartUnixNano is the member's kernel start time in unix nanoseconds.
+	StartUnixNano int64
+}
+
 // ProcStartTimeNano is unavailable off darwin (the runtime targets macOS; this
 // stub keeps cross-compiles building). It reports no identity.
 func ProcStartTimeNano(pid int) (startUnixNano int64, ok bool) {
 	return 0, false
 }
 
-// ProcGroupStartsNano is unavailable off darwin. It reports ok=false (cannot
+// ProcGroupMembers is unavailable off darwin. It reports ok=false (cannot
 // inspect), which the startup pod reap treats as "keep the record, retry" —
 // never as an empty group — so a cross-built binary never signals blindly.
-func ProcGroupStartsNano(pgid int) (memberStartsNano []int64, ok bool) {
+func ProcGroupMembers(pgid int) (members []ProcMember, ok bool) {
 	return nil, false
 }

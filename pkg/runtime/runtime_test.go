@@ -333,6 +333,19 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.Network == nil {
 		d.Network = supervisor.NodeNetwork{IP: "10.1.2.3"}
 	}
+	// Default the startup-reap seams to deterministic fakes so pod-lifecycle unit
+	// tests never fall through to the real kern.proc.* sysctls (nondeterministic,
+	// and a unit-tier dependency on the live process table). ProcStartTime reports
+	// a fixed non-zero identity; ProcGroup reports an empty-but-inspectable group
+	// (ok=true), which watchContainerExit reads as "group drained" so a completed
+	// container's reap record is cleaned up. Tests that exercise the reap decision
+	// (podreap_test.go) inject their own fake tables over these.
+	if d.ProcStartTime == nil {
+		d.ProcStartTime = func(int) (int64, bool) { return 1, true }
+	}
+	if d.ProcGroup == nil {
+		d.ProcGroup = func(int) ([]supervisor.ProcMember, bool) { return nil, true }
+	}
 	if cfg.Root == "" {
 		cfg.Root = t.TempDir()
 	}
