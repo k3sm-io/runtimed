@@ -1,10 +1,11 @@
-# runtimed resource accounting & limits (M2.5)
+# runtimed resource accounting & limits (M2.5, B7)
 
-How runtimed meters pod memory, enforces a memory limit (OOMKilled), and what it
-does — and deliberately does **not** — promise for CPU. This is the note the
-PHASES `M2.5-d3` deliverable points to; the code at the call sites
-(`pkg/supervisor` `PhysFootprinter` / `MemorySampler`, `pkg/runtime` `PodMetrics`)
-references it.
+How runtimed meters pod memory, enforces a memory limit (OOMKilled), applies
+explicit rlimits and the best-effort QoS band, and what it does — and
+deliberately does **not** — promise for CPU. This is the note the PHASES
+`M2.5-d3` deliverable points to; the code at the call sites (`pkg/supervisor`
+`PhysFootprinter` / `MemorySampler` / `RunLaunchSequence`, `pkg/runtime`
+`PodMetrics` / `resolveRlimitPlan` / `resolveBgQoS`) references it.
 
 ## Memory: `ri_phys_footprint`, NOT RSS
 
@@ -61,22 +62,85 @@ provider writes the typed field. `0` means no limit (BestEffort → no sampler).
 ## CPU: best-effort QoS, NOT CFS millicores
 
 k3sm has **no CFS / cgroup CPU controller** — pods are native Darwin processes.
-Any CPU shaping is **best-effort QoS** only (`taskpolicy` / `setpriority` /
-Darwin QoS classes): it can *deprioritize* a greedy pod under contention, but it
-**cannot** enforce a hard "500m = half a core" guarantee the way Linux CFS quotas
-do. runtimed therefore does **not** claim a CPU limit is honored as millicores.
+Any CPU shaping is **best-effort QoS** only: it can *deprioritize* a greedy pod
+under contention, but it **cannot** enforce a hard "500m = half a core"
+guarantee the way Linux CFS quotas do. runtimed therefore does **not** claim a
+CPU limit is honored as millicores. **CPU is best-effort, memory is enforced
+(in phys_footprint units).**
 
-`apis:M2.2` added **`PodBox.qos_class`** (an enum mirroring corev1 `PodQOSClass`),
-but CPU-QoS *application* (`taskpolicy` / `setpriority`) is **still deferred**: a
-QoS class is not a CPU millicore request, and wiring `setpriority` to a class
-without a contention-policy decision would over-promise. When the best-effort QoS
-knob is built it attaches at the same spawn/launch seam as the memory sampler and
-reads `qos_class`. Until then this file is the standing honesty note: **CPU is
-best-effort, memory is enforced (in phys_footprint units).**
+### QoS application (B7): BestEffort → the darwin background band
 
-`apis:M2.2` also added **`PodBox.rlimits`** (OCI-style `setrlimit(2)` caps, e.g.
-`RLIMIT_NOFILE`). Applying them is **deferred to a follow-up** because `setrlimit`
-must run in the exec-shim *before* exec and is ordered relative to the M2.3
-privilege drop (the hard-limit raise needs privilege, so it precedes `setuid`) —
-extending the security-critical `RunLaunchSequence` deserves its own ordering test
-(mirroring `TestRunLaunchSequenceOrder`) rather than being bolted on untested.
+Since B7 the launch sequence *applies* **`PodBox.qos_class`** (the apis enum
+mirroring corev1 `PodQOSClass`), pre-exec in the exec-shim
+(`supervisor.RunLaunchSequence` `StepSetpriority`, before the sandbox is
+applied so a default-deny SBPL cannot block it and every descendant inherits
+it):
+
+- **`BestEffort` (and an unspecified class) →
+  `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`.** This is the
+  **deliberate contention policy**: a BestEffort pod yields to everything else
+  on the node.
+- **`Guaranteed` and `Burstable` → untouched.** No `setpriority` call is made
+  at all — the policy is **downward-only**; the default band is the *absence*
+  of the call, never an explicit reset-to-0.
+
+**Honesty notes a reader must keep straight:**
+
+- **Darwin BG is a COUPLED band, unlike Linux `cpu.shares`.** `PRIO_DARWIN_BG`
+  throttles CPU scheduling **and** moves the process's disk I/O to the
+  throttled tier **and** marks its network traffic background class, together.
+  A BestEffort pod is deprioritized on all three axes at once; there is no
+  per-axis knob here.
+- **It is COOPERATIVE, not enforcement.** `setpriority(2)` is public API, and
+  the pod process can **self-revert** the band with its own
+  `setpriority(PRIO_DARWIN_PROCESS, 0, 0)` call. This is best-effort QoS by
+  construction — a malicious/greedy pod is not contained by it (untrusted
+  tenancy routes to the vm backend, as everywhere else in the privilege
+  model).
+- **BG'd pods will legitimately report LOW CPU** once CPU accounting lands: a
+  throttled pod's low usage is the policy working, not an accounting bug. Do
+  not "fix" it by unthrottling.
+- **jetsam/memorystatus interaction is B46's lane.** Darwin couples the BG
+  band with jetsam/memorystatus behavior; how the band shifts a pod's
+  memory-pressure treatment (and whether it fights the M2.5 sampler) is
+  explicitly **not** decided here — the B7 lab leg measures the band's effect
+  before/after BG and feeds B46.
+
+## Explicit rlimits (B7): applied, with darwin caveats
+
+**`PodBox.rlimits`** (OCI-style `setrlimit(2)` caps, `apis:M2.2`) are applied
+since B7: the daemon resolves the EXPLICIT entries to a numeric plan
+(`runtime.resolveRlimitPlan` — nothing is ever synthesized from
+`memory_limit_bytes` or a cpu quota), threads it through the one
+`sandbox.Backend.WrapCommand` choke-point (container starts AND `kubectl exec`
+sessions — an exec gets the **pod's** limits, one code path), and the exec-shim
+applies it FIRST in the launch sequence, before the privilege drop. The
+argv codec and its fail-closed decode contract are documented on
+`cmd/k3sm-execshim` and `supervisor.EncodeRlimits`/`ParseRlimits`.
+
+**Darwin-specific behavior at the apply site
+(`supervisor.setrlimitClamped`):**
+
+- **`RLIMIT_NOFILE`**: darwin `setrlimit(2)` returns **EINVAL** — it does NOT
+  clamp — for `rlim_cur = RLIM_INFINITY` on `RLIMIT_NOFILE` (man-page
+  COMPATIBILITY section), so an infinite/oversized soft limit is pre-clamped
+  to `min(OPEN_MAX 10240, hard)`; and a too-tight soft limit is **floored up
+  to 256** (`minNOFILESoft`) with a warning, because a starved descriptor
+  budget breaks `sandbox_compile`'s profile read and the exec'd image's dyld
+  (+ the DYLD-inserted DNS shim) AFTER confinement, with misleading errors.
+  The lab leg confirms the floor's sufficiency on hardware.
+- **`RLIMIT_NPROC` counts per-UID, not per-pod.** In the no-drop posture every
+  pod runs as the shared `_k3sm` uid, so a pod-level nproc limit **measures
+  the whole node's `_k3sm` process count, not the pod** — one pod's fork load
+  can trip another pod's limit. It is honored verbatim because it is explicit,
+  but treat it as a node-wide brake unless the pod uses a per-pod uid drop.
+- **`RLIMIT_AS` / `RLIMIT_DATA` are accepted but effectively INERT on
+  darwin.** Mach VM allocations bypass the BSD data/address-space ledgers, so
+  these caps do not bound a real workload's memory. **Memory enforcement
+  remains the phys_footprint sampler + OOMKilled** (above); do not expect an
+  AS/DATA cap to fire first.
+- **EPERM hard-raise clamps are logged, not surfaced.** In the unprivileged
+  posture a hard-limit raise above the inherited ceiling is clamped down with
+  a `slog` warning; surfacing that clamp to `PodStatus`/events is
+  **DEFERRED** (not in the B7 diff) — today the operator sees it only in the
+  daemon log.
