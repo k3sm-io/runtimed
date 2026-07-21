@@ -310,8 +310,10 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 	})
 
-	// (e) a non-root hard-limit raise is clamped to the inherited ceiling, with a
-	// warning — NOT a fatal EPERM.
+	// (e) a hard-limit raise above the inherited ceiling is clamped, with a
+	// warning — NOT a fatal EPERM. (Since the unconditional security clamp the
+	// pre-clamp fires BEFORE the kernel would even see the raise; the seam's
+	// EPERM emulation stays as the defense-in-depth backstop.)
 	t.Run("nonroot-hard-raise-clamped-not-fatal", func(t *testing.T) {
 		var buf bytes.Buffer
 		old := slog.Default()
@@ -347,6 +349,52 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 		if !strings.Contains(buf.String(), "clamped to inherited") {
 			t.Errorf("expected a clamp warning, slog output = %q", buf.String())
+		}
+	})
+
+	// (B7 post-critique, security HIGH) the inherited-ceiling clamp is
+	// UNCONDITIONAL: even in the ROOT posture — where a euid-0 setrlimit hard
+	// raise would SUCCEED (the EPERM clamp never fires for root) — a pod-sourced
+	// plan must not raise limits above the daemon's inherited posture, or a pod
+	// annotation becomes a node-wide escalation lever (e.g. RLIMIT_NPROC on the
+	// shared _k3sm uid). The seam accepts everything (no epermAbove — the root
+	// emulation); the clamp alone must cap the request.
+	t.Run("root-posture-hard-raise-clamped-to-inherited", func(t *testing.T) {
+		seam := &recordingSeam{
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_NPROC: {Cur: 512, Max: 1024}},
+			// no epermAbove: emulates root, where the kernel would permit the raise.
+		}
+		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 2048, Max: 4096}}}
+		// Root drop posture: euid 0, full sequence.
+		if _, err := RunLaunchSequence(seam, LaunchSpec{
+			Cred:    Credential{UID: 501, GID: 20, Drop: true},
+			Rlimits: plan,
+		}, 0); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.rlimitCalls) != 1 {
+			t.Fatalf("want exactly one Setrlimit, got %+v", seam.rlimitCalls)
+		}
+		if got := seam.rlimitCalls[0].lim; got != (unix.Rlimit{Cur: 1024, Max: 1024}) {
+			t.Errorf("root-posture raise = %+v, want clamped to inherited hard {Cur:1024 Max:1024}", got)
+		}
+	})
+
+	// The complement: a plan at-or-below the inherited ceiling passes through
+	// verbatim — the clamp only ever TIGHTENS, it never rewrites a valid request.
+	t.Run("below-inherited-passes-through-verbatim", func(t *testing.T) {
+		seam := &recordingSeam{
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_NPROC: {Cur: 512, Max: 1024}},
+		}
+		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 100, Max: 200}}}
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.rlimitCalls) != 1 {
+			t.Fatalf("want exactly one Setrlimit, got %+v", seam.rlimitCalls)
+		}
+		if got := seam.rlimitCalls[0].lim; got != (unix.Rlimit{Cur: 100, Max: 200}) {
+			t.Errorf("below-inherited plan = %+v, want verbatim {Cur:100 Max:200}", got)
 		}
 	})
 

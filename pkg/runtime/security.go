@@ -80,18 +80,20 @@ func firstNonZero(vals ...int) int {
 //     setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) — the deliberate
 //     contention policy (a BestEffort pod yields CPU/IO/network to the rest of
 //     the node; darwin's background band couples all three);
-//   - GUARANTEED and BURSTABLE → false: NO setpriority call AT ALL. The policy
-//     is downward-only — the default band is the absence of the call, never an
-//     explicit reset-to-0.
+//   - GUARANTEED, BURSTABLE, and ANY unknown/future enum value → false: NO
+//     setpriority call AT ALL. The policy is downward-only — the default band
+//     is the absence of the call, never an explicit reset-to-0. Backgrounding
+//     is the EXPLICITLY-ENUMERATED branch on purpose: a future additive apis
+//     QOSClass value must not be silently BG-throttled by a stale runtimed.
 //
 // See docs/resources.md for the honesty notes (the band is cooperative, not
 // enforcement) and resolveLaunchSpec for where this joins the spawn path.
 func resolveBgQoS(box *runtimev1.PodBox) bool {
 	switch box.GetQosClass() {
-	case runtimev1.QOSClass_QOS_CLASS_GUARANTEED, runtimev1.QOSClass_QOS_CLASS_BURSTABLE:
-		return false
-	default:
+	case runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT, runtimev1.QOSClass_QOS_CLASS_UNSPECIFIED:
 		return true
+	default:
+		return false
 	}
 }
 

@@ -249,11 +249,13 @@ type LaunchSeam interface {
 //	  - a drop is refused up front when euid != 0 (cred.Validate): setuid/setgid
 //	    to another identity needs root, so on the unprivileged _k3sm daemon Drop
 //	    must be false and the pod runs at the daemon's own uid in Seatbelt;
-//	  - rlimits FIRST, before the drop: raising a hard limit needs euid 0; a
-//	    non-root process that tries to raise a hard limit above its inherited
-//	    ceiling gets EPERM, so setrlimitClamped reduces it to the inherited limit
-//	    (with a warning) rather than failing the pod; the plan applies even when
-//	    Drop is false (the unprivileged posture still gets its explicit limits);
+//	  - rlimits FIRST, before the drop — and pod limits may only TIGHTEN, never
+//	    widen: setrlimitClamped clamps every entry to the shim's inherited hard
+//	    ceiling UNCONDITIONALLY (root included — a euid-0 hard raise would
+//	    succeed, turning a pod annotation into a node-wide escalation lever),
+//	    with the non-root EPERM retry-clamp kept as defense-in-depth; the plan
+//	    applies even when Drop is false (the unprivileged posture still gets
+//	    its explicit limits);
 //	  - setgid BEFORE setuid: after setuid drops to a non-root uid the process can
 //	    no longer change its gid, so the gid must be set while still privileged;
 //	  - initgroups (supplemental groups, incl. fsGroup) BETWEEN them — also a
@@ -369,18 +371,25 @@ func normalizeNOFILE(lim unix.Rlimit) unix.Rlimit {
 	return lim
 }
 
-// setrlimitClamped applies one planned rlimit, CLAMPING a denied hard-limit raise
-// down to the process's inherited ceiling instead of failing the pod. In the
-// unprivileged posture (a non-root daemon, Credential.Drop==false) the kernel
-// returns EPERM when a process tries to RAISE a hard limit above what it
-// inherited; rather than abort the launch, the limit is reduced to the inherited
-// hard limit (getrlimit(2)) and a warning is logged. Root never reaches this
-// branch (it may raise hard limits), so the EPERM is itself the non-root signal —
-// no euid test is needed. A non-EPERM error is a genuine failure and is returned.
+// setrlimitClamped applies one planned rlimit, never letting a POD-SOURCED plan
+// RAISE the process's limits above its inherited posture:
 //
-// RLIMIT_NOFILE additionally goes through normalizeNOFILE first: the darwin
-// EINVAL ceiling (infinite soft is NOT clamped by the kernel — the launch would
-// abort) and the minNOFILESoft floor.
+//  1. RLIMIT_NOFILE first goes through normalizeNOFILE: the darwin EINVAL
+//     ceiling (infinite soft is NOT clamped by the kernel — the launch would
+//     abort) and the minNOFILESoft floor;
+//  2. the requested hard (and, transitively, soft) limit is then clamped DOWN
+//     to the shim's own inherited hard limit (getrlimit(2)) UNCONDITIONALLY —
+//     regardless of euid. This is a SECURITY clamp, not just EPERM avoidance:
+//     in the root-daemon posture a euid-0 setrlimit may legally raise hard
+//     limits, so without it a pod's rlimits[] annotation would be a node-wide
+//     escalation lever (e.g. raising RLIMIT_NPROC on the shared _k3sm uid — a
+//     per-uid limit — above the operator's configured posture). Pod limits may
+//     only ever TIGHTEN, never widen, what the daemon inherited;
+//  3. the EPERM retry-clamp is kept as defense-in-depth for the unprivileged
+//     posture: if the kernel still denies a raise (e.g. an inherited-ceiling
+//     read that disagrees with the kernel's), the limit is reduced to the
+//     inherited hard limit and retried, with a warning, rather than failing
+//     the pod. A non-EPERM error is a genuine failure and is returned.
 func setrlimitClamped(seam LaunchSeam, pr PlannedRlimit) error {
 	if pr.Resource == unix.RLIMIT_NOFILE {
 		if norm := normalizeNOFILE(pr.Lim); norm != pr.Lim {
@@ -392,13 +401,26 @@ func setrlimitClamped(seam LaunchSeam, pr PlannedRlimit) error {
 			pr.Lim = norm
 		}
 	}
+	// Unconditional inherited-ceiling clamp (the security clamp — see the doc
+	// comment). Fail closed on an unreadable ceiling: without it we cannot prove
+	// the pod plan does not widen the node posture.
+	inherited, gerr := seam.Getrlimit(pr.Resource)
+	if gerr != nil {
+		return fmt.Errorf("read inherited rlimit ceiling: %w", gerr)
+	}
+	if pr.Lim.Max > inherited.Max {
+		slog.Warn("pod rlimit hard limit exceeds the shim's inherited posture; clamped to inherited ceiling",
+			"resource", pr.Resource,
+			"requested_hard", pr.Lim.Max,
+			"inherited_hard", inherited.Max)
+		pr.Lim.Max = inherited.Max
+	}
+	if pr.Lim.Cur > pr.Lim.Max {
+		pr.Lim.Cur = pr.Lim.Max
+	}
 	err := seam.Setrlimit(pr.Resource, pr.Lim)
 	if err == nil || !errors.Is(err, unix.EPERM) {
 		return err
-	}
-	inherited, gerr := seam.Getrlimit(pr.Resource)
-	if gerr != nil {
-		return err // can't read the inherited ceiling; surface the original EPERM
 	}
 	clamped := pr.Lim
 	if clamped.Max > inherited.Max {

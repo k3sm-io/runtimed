@@ -118,6 +118,12 @@ applies it FIRST in the launch sequence, before the privilege drop. The
 argv codec and its fail-closed decode contract are documented on
 `cmd/k3sm-execshim` and `supervisor.EncodeRlimits`/`ParseRlimits`.
 
+**Provider↔runtimed gRPC skew window:** `PodBox.rlimits`/`qos_class` are
+additive proto fields, so an OLD (pre-B7) runtimed handed them by a newer
+provider **silently drops them** — annotated pods launch unconstrained (and
+un-backgrounded) during a rolling restart; the deploy order is
+**restart-runtimed-first**, then the provider.
+
 **Darwin-specific behavior at the apply site
 (`supervisor.setrlimitClamped`):**
 
