@@ -53,6 +53,17 @@ func (UnixDropper) Initgroups(groups []int) error {
 // changes require.
 func (UnixDropper) Setuid(uid int) error { return unix.Setuid(uid) }
 
+// Setpriority applies one setpriority(2) call via golang.org/x/sys/unix. The
+// launch sequence uses it only as Setpriority(PRIO_DARWIN_PROCESS, 0,
+// PRIO_DARWIN_BG) — placing the calling (exec-shim) process in the darwin
+// background band pre-exec so the pod image inherits it. setpriority(2) with the
+// PRIO_DARWIN_* selectors is public API (<sys/resource.h>, see qos_darwin.go) —
+// not private SPI — and lowering one's own priority needs no privilege, so it is
+// safe after the uid drop.
+func (UnixDropper) Setpriority(which, who, prio int) error {
+	return unix.Setpriority(which, who, prio)
+}
+
 // Setrlimit applies one POSIX resource limit via setrlimit(2). Called from the
 // exec-shim BEFORE the uid drop, while euid is still 0, so a hard-limit raise is
 // permitted. setrlimit(2) is a standard POSIX call (not private SPI) but, like the

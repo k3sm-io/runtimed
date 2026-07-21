@@ -109,13 +109,18 @@ func (b *ExecShimBackend) Available() bool {
 // WrapCommand validates profile (fail-closed), writes it to a per-pod temp file
 // under the backend's profile dir, and returns the shim path plus argv:
 //
-//	[shimPath, <uid>, <gid>, <groups-csv>, profilePath, pod, args...]
+//	[shimPath, <uid>, <gid>, <groups-csv>, <rlimits>, <qos>, profilePath, pod, args...]
 //
-// where the three credential tokens (cred.ShimArgs) tell the shim which identity
-// to drop to. The spawned shim drops to cred, applies profile to itself, and
-// execs pod with args — in that irreversible order — preserving envp. cleanup
-// removes the staged profile file.
-func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+// where the three credential tokens (spec.Cred.ShimArgs) tell the shim which
+// identity to drop to, and the rlimit + qos tokens (supervisor.EncodeRlimits /
+// EncodeQoS, "-" sentinels when empty) carry the resolved numeric setrlimit(2)
+// plan and the darwin background-QoS decision. The two launch-spec tokens sit
+// BEFORE the profile path so binary skew fails closed: an old shim reads the
+// rlimit token as its profile path and aborts on the ReadFile. The spawned shim
+// applies the limits, drops to the credential, backgrounds itself if requested,
+// applies profile to itself, and execs pod with args — in that irreversible
+// order — preserving envp. cleanup removes the staged profile file.
+func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, nil, err
 	}
@@ -145,10 +150,11 @@ func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv 
 		return "", nil, nil, fmt.Errorf("close sbpl profile %s: %w", profilePath, err)
 	}
 
-	credArgs := cred.ShimArgs() // [uid, gid, groups]
-	args := make([]string, 0, len(argv)+len(credArgs)+2)
+	credArgs := spec.Cred.ShimArgs() // [uid, gid, groups]
+	args := make([]string, 0, len(argv)+len(credArgs)+4)
 	args = append(args, b.shimPath)
 	args = append(args, credArgs...)
+	args = append(args, supervisor.EncodeRlimits(spec.Rlimits), supervisor.EncodeQoS(spec.BgQoS))
 	args = append(args, profilePath)
 	args = append(args, argv...)
 	return b.shimPath, args, cleanup, nil

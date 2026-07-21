@@ -49,12 +49,20 @@ type recordingSeam struct {
 	rlimitCalls []setrlimitCall     // every Setrlimit(resource, lim) the seam accepted
 	inherited   map[int]unix.Rlimit // what Getrlimit returns per resource (the inherited ceiling)
 	epermAbove  map[int]uint64      // Setrlimit returns EPERM when lim.Max exceeds this (a non-root hard-raise denial)
+
+	// qos recording: every Setpriority(which, who, prio) the seam saw (B7).
+	prioCalls []setprioCall
 }
 
 // setrlimitCall records one Setrlimit(resource, lim) the recording seam accepted.
 type setrlimitCall struct {
 	resource int
 	lim      unix.Rlimit
+}
+
+// setprioCall records one Setpriority(which, who, prio) the recording seam saw.
+type setprioCall struct {
+	which, who, prio int
 }
 
 func (s *recordingSeam) step(st LaunchStep) error {
@@ -70,6 +78,12 @@ func (s *recordingSeam) Initgroups(g []int) error { s.gotGroup = g; return s.ste
 func (s *recordingSeam) Setuid(uid int) error     { s.gotUID = uid; return s.step(StepSetuid) }
 func (s *recordingSeam) SandboxApply() error      { return s.step(StepSandboxApply) }
 func (s *recordingSeam) Exec() error              { return s.step(StepExec) }
+
+// Setpriority records the qos call (which/who/prio) — no real setpriority(2) runs.
+func (s *recordingSeam) Setpriority(which, who, prio int) error {
+	s.prioCalls = append(s.prioCalls, setprioCall{which: which, who: who, prio: prio})
+	return s.step(StepSetpriority)
+}
 
 // Setrlimit records an accepted apply, or returns EPERM (without recording) when
 // the request raises the hard limit above epermAbove[resource] — emulating the
@@ -124,7 +138,7 @@ func TestRunLaunchSequenceOrder(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seam := &recordingSeam{}
-			done, err := RunLaunchSequence(seam, tc.cred, nil, tc.euid)
+			done, err := RunLaunchSequence(seam, LaunchSpec{Cred: tc.cred}, tc.euid)
 			if err != nil {
 				t.Fatalf("RunLaunchSequence: %v", err)
 			}
@@ -189,7 +203,7 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 			seam := &recordingSeam{hasFail: true, failAt: tc.failAt, failErr: boom}
 			// euid 0 (root): the drop is permitted, so the injected failAt — not
 			// the euid guard — is what stops the sequence.
-			_, err := RunLaunchSequence(seam, Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}, nil, 0)
+			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}}, 0)
 			if !errors.Is(err, boom) {
 				t.Fatalf("want wrapped boom, got %v", err)
 			}
@@ -213,7 +227,7 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 // a stray Drop=true fails closed rather than silently mis-running the pod.
 func TestRunLaunchSequenceRefusesDropAsNonRoot(t *testing.T) {
 	seam := &recordingSeam{}
-	done, err := RunLaunchSequence(seam, Credential{UID: 501, GID: 20, Drop: true}, nil, 501)
+	done, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 501, GID: 20, Drop: true}}, 501)
 	if !errors.Is(err, ErrDropRequiresRoot) {
 		t.Fatalf("want ErrDropRequiresRoot, got %v", err)
 	}
@@ -235,7 +249,10 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		seam := &recordingSeam{}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}}
 		// drop requested as root: the full sequence runs.
-		done, err := RunLaunchSequence(seam, Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}, plan, 0)
+		done, err := RunLaunchSequence(seam, LaunchSpec{
+			Cred:    Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true},
+			Rlimits: plan,
+		}, 0)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -261,7 +278,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 			{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 256, Max: 512}},
 			{Resource: unix.RLIMIT_AS, Lim: unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}},
 		}
-		done, err := RunLaunchSequence(seam, Credential{Drop: false}, plan, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -281,7 +298,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 	// An empty plan adds no StepSetrlimit and calls the seam zero times.
 	t.Run("empty-plan-adds-no-step", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, Credential{Drop: false}, nil, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{}, 501)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -293,8 +310,10 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 	})
 
-	// (e) a non-root hard-limit raise is clamped to the inherited ceiling, with a
-	// warning — NOT a fatal EPERM.
+	// (e) a hard-limit raise above the inherited ceiling is clamped, with a
+	// warning — NOT a fatal EPERM. (Since the unconditional security clamp the
+	// pre-clamp fires BEFORE the kernel would even see the raise; the seam's
+	// EPERM emulation stays as the defense-in-depth backstop.)
 	t.Run("nonroot-hard-raise-clamped-not-fatal", func(t *testing.T) {
 		var buf bytes.Buffer
 		old := slog.Default()
@@ -309,7 +328,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		// Request hard = 1<<20 (a RAISE above the inherited 4096): the unprivileged
 		// posture cannot raise it, so it must be clamped to 4096, not fail the pod.
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 8192, Max: 1 << 20}}}
-		done, err := RunLaunchSequence(seam, Credential{Drop: false}, plan, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
 		if err != nil {
 			t.Fatalf("clamp must not be fatal, got err=%v", err)
 		}
@@ -330,6 +349,187 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 		if !strings.Contains(buf.String(), "clamped to inherited") {
 			t.Errorf("expected a clamp warning, slog output = %q", buf.String())
+		}
+	})
+
+	// (B7 post-critique, security HIGH) the inherited-ceiling clamp is
+	// UNCONDITIONAL: even in the ROOT posture — where a euid-0 setrlimit hard
+	// raise would SUCCEED (the EPERM clamp never fires for root) — a pod-sourced
+	// plan must not raise limits above the daemon's inherited posture, or a pod
+	// annotation becomes a node-wide escalation lever (e.g. RLIMIT_NPROC on the
+	// shared _k3sm uid). The seam accepts everything (no epermAbove — the root
+	// emulation); the clamp alone must cap the request.
+	t.Run("root-posture-hard-raise-clamped-to-inherited", func(t *testing.T) {
+		seam := &recordingSeam{
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_NPROC: {Cur: 512, Max: 1024}},
+			// no epermAbove: emulates root, where the kernel would permit the raise.
+		}
+		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 2048, Max: 4096}}}
+		// Root drop posture: euid 0, full sequence.
+		if _, err := RunLaunchSequence(seam, LaunchSpec{
+			Cred:    Credential{UID: 501, GID: 20, Drop: true},
+			Rlimits: plan,
+		}, 0); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.rlimitCalls) != 1 {
+			t.Fatalf("want exactly one Setrlimit, got %+v", seam.rlimitCalls)
+		}
+		if got := seam.rlimitCalls[0].lim; got != (unix.Rlimit{Cur: 1024, Max: 1024}) {
+			t.Errorf("root-posture raise = %+v, want clamped to inherited hard {Cur:1024 Max:1024}", got)
+		}
+	})
+
+	// The complement: a plan at-or-below the inherited ceiling passes through
+	// verbatim — the clamp only ever TIGHTENS, it never rewrites a valid request.
+	t.Run("below-inherited-passes-through-verbatim", func(t *testing.T) {
+		seam := &recordingSeam{
+			inherited: map[int]unix.Rlimit{unix.RLIMIT_NPROC: {Cur: 512, Max: 1024}},
+		}
+		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 100, Max: 200}}}
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.rlimitCalls) != 1 {
+			t.Fatalf("want exactly one Setrlimit, got %+v", seam.rlimitCalls)
+		}
+		if got := seam.rlimitCalls[0].lim; got != (unix.Rlimit{Cur: 100, Max: 200}) {
+			t.Errorf("below-inherited plan = %+v, want verbatim {Cur:100 Max:200}", got)
+		}
+	})
+
+	// (B7) darwin NOFILE taxonomy: an infinite soft NOFILE is clamped DOWN before
+	// the syscall (darwin setrlimit(2) returns EINVAL for rlim_cur=RLIM_INFINITY on
+	// RLIMIT_NOFILE — the launch would abort), so the seam receives the OPEN_MAX
+	// ceiling, never RLIM_INFINITY, in Cur.
+	t.Run("nofile-infinite-cur-normalized-before-syscall", func(t *testing.T) {
+		seam := &recordingSeam{}
+		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{
+			Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}}}
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.rlimitCalls) != 1 {
+			t.Fatalf("want exactly one Setrlimit, got %+v", seam.rlimitCalls)
+		}
+		got := seam.rlimitCalls[0].lim
+		if got.Cur != 10240 {
+			t.Errorf("normalized NOFILE Cur = %d, want the OPEN_MAX ceiling 10240", got.Cur)
+		}
+		if got.Max != uint64(unix.RLIM_INFINITY) {
+			t.Errorf("NOFILE Max = %d, want RLIM_INFINITY carried verbatim", got.Max)
+		}
+	})
+
+	// (B7) shim NOFILE floor: a too-tight soft NOFILE starves sandbox_compile's
+	// profile read and the exec'd image's dyld AFTER confinement, so Cur is raised
+	// to the named floor (256) with a warning before the syscall.
+	t.Run("nofile-tight-soft-floored-up-with-warning", func(t *testing.T) {
+		var buf bytes.Buffer
+		old := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(old)
+
+		seam := &recordingSeam{}
+		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 16, Max: 1024}}}
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.rlimitCalls) != 1 {
+			t.Fatalf("want exactly one Setrlimit, got %+v", seam.rlimitCalls)
+		}
+		if got := seam.rlimitCalls[0].lim; got != (unix.Rlimit{Cur: 256, Max: 1024}) {
+			t.Errorf("floored NOFILE = %+v, want {Cur:256 Max:1024}", got)
+		}
+		if !strings.Contains(buf.String(), "RLIMIT_NOFILE") {
+			t.Errorf("expected a NOFILE normalization warning, slog output = %q", buf.String())
+		}
+	})
+}
+
+// TestRunLaunchSequence_QoSPriority is the B7 qos slice: a background (BestEffort
+// / unspecified — the mapping from the apis QOSClass enum to the supervisor-local
+// BgQoS bool lives daemon-side in runtime.resolveBgQoS) launch performs EXACTLY
+// one Setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) call, positioned BEFORE
+// StepSandboxApply (a default-deny SBPL may deny setpriority afterward; pre-exec
+// means the band is inherited by the exec'd image and all descendants,
+// race-free). Guaranteed/Burstable (BgQoS=false) is the ABSENCE of the call —
+// downward-only, never an explicit reset-to-0.
+func TestRunLaunchSequence_QoSPriority(t *testing.T) {
+	t.Run("bg-with-drop-ordered-after-drop-before-sandbox", func(t *testing.T) {
+		seam := &recordingSeam{}
+		spec := LaunchSpec{
+			Cred:    Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true},
+			Rlimits: []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}},
+			BgQoS:   true,
+		}
+		done, err := RunLaunchSequence(seam, spec, 0)
+		if err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		want := []LaunchStep{StepSetrlimit, StepSetgid, StepInitgroups, StepSetuid,
+			StepSetpriority, StepSandboxApply, StepExec}
+		if !reflect.DeepEqual(done, want) {
+			t.Fatalf("steps = %v, want %v", done, want)
+		}
+		if len(seam.prioCalls) != 1 {
+			t.Fatalf("Setpriority calls = %+v, want exactly one", seam.prioCalls)
+		}
+		if got := seam.prioCalls[0]; got != (setprioCall{which: prioDarwinProcess, who: 0, prio: prioDarwinBG}) {
+			t.Errorf("Setpriority = %+v, want {which:PRIO_DARWIN_PROCESS(4) who:0 prio:PRIO_DARWIN_BG(0x1000)}", got)
+		}
+		// The load-bearing orderings: qos strictly before sandbox_apply, and (as
+		// today) rlimits strictly before the drop.
+		if idx(done, StepSetpriority) >= idx(done, StepSandboxApply) {
+			t.Error("StepSetpriority must come before StepSandboxApply")
+		}
+		if idx(done, StepSetrlimit) >= idx(done, StepSetgid) {
+			t.Error("StepSetrlimit must come before the privilege drop")
+		}
+	})
+
+	t.Run("bg-no-drop-unprivileged", func(t *testing.T) {
+		seam := &recordingSeam{}
+		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		if err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		want := []LaunchStep{StepSetpriority, StepSandboxApply, StepExec}
+		if !reflect.DeepEqual(done, want) {
+			t.Fatalf("steps = %v, want %v", done, want)
+		}
+		if len(seam.prioCalls) != 1 {
+			t.Fatalf("Setpriority calls = %+v, want exactly one", seam.prioCalls)
+		}
+	})
+
+	// Guaranteed/Burstable: the seam's Setpriority is NEVER called — the darwin
+	// default band is the absence of the call, not an explicit reset.
+	t.Run("guaranteed-burstable-no-call-at-all", func(t *testing.T) {
+		seam := &recordingSeam{}
+		done, err := RunLaunchSequence(seam, LaunchSpec{}, 501)
+		if err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+		if len(seam.prioCalls) != 0 {
+			t.Fatalf("Setpriority must NEVER be called for BgQoS=false; got %+v", seam.prioCalls)
+		}
+		if idx(done, StepSetpriority) != -1 {
+			t.Errorf("no StepSetpriority must be recorded; done=%v", done)
+		}
+	})
+
+	// Fail-closed: a failed Setpriority aborts the launch before sandbox_apply /
+	// exec, consistent with the sequence's stop-at-first-error contract.
+	t.Run("setpriority-failure-fail-closed", func(t *testing.T) {
+		boom := errors.New("boom")
+		seam := &recordingSeam{hasFail: true, failAt: StepSetpriority, failErr: boom}
+		_, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		if !errors.Is(err, boom) {
+			t.Fatalf("want wrapped boom, got %v", err)
+		}
+		if idx(seam.calls, StepSandboxApply) != -1 || idx(seam.calls, StepExec) != -1 {
+			t.Errorf("sandbox_apply/exec must NOT run after a Setpriority failure; calls=%v", seam.calls)
 		}
 	})
 }

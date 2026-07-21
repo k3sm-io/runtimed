@@ -71,6 +71,45 @@ func firstNonZero(vals ...int) int {
 	return 0
 }
 
+// resolveBgQoS maps the pod's declared kube QoS class (the apis QOSClass enum,
+// PodBox.qos_class) to the supervisor-local background flag — the B7 mapping
+// decision lives HERE, in the runtime layer, so the supervisor stays decoupled
+// from apis (mirroring resolveRlimitPlan/PlannedRlimit):
+//
+//   - BEST_EFFORT and UNSPECIFIED → true: the launch sequence issues one
+//     setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) — the deliberate
+//     contention policy (a BestEffort pod yields CPU/IO/network to the rest of
+//     the node; darwin's background band couples all three);
+//   - GUARANTEED, BURSTABLE, and ANY unknown/future enum value → false: NO
+//     setpriority call AT ALL. The policy is downward-only — the default band
+//     is the absence of the call, never an explicit reset-to-0. Backgrounding
+//     is the EXPLICITLY-ENUMERATED branch on purpose: a future additive apis
+//     QOSClass value must not be silently BG-throttled by a stale runtimed.
+//
+// See docs/resources.md for the honesty notes (the band is cooperative, not
+// enforcement) and resolveLaunchSpec for where this joins the spawn path.
+func resolveBgQoS(box *runtimev1.PodBox) bool {
+	switch box.GetQosClass() {
+	case runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT, runtimev1.QOSClass_QOS_CLASS_UNSPECIFIED:
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveLaunchSpec bundles the pod-scoped launch inputs — the explicit rlimit
+// plan and the qos decision — with the container-scoped credential into the one
+// supervisor.LaunchSpec the sandbox backend threads to the exec-shim. It is used
+// by BOTH spawn callers (startContainer and exec sessions): an exec session
+// deliberately re-enters the pod's rlimits and qos band, one code path.
+func resolveLaunchSpec(box *runtimev1.PodBox, cred supervisor.Credential) supervisor.LaunchSpec {
+	return supervisor.LaunchSpec{
+		Cred:    cred,
+		Rlimits: resolveRlimitPlan(box),
+		BgQoS:   resolveBgQoS(box),
+	}
+}
+
 // rlimitResource maps a ResourceLimit.type name to its darwin RLIMIT_* selector.
 // The lookup is comma-ok ON PURPOSE: an unknown name returns ok=false so
 // resolveRlimitPlan SKIPS it (with a warning) rather than defaulting to the
