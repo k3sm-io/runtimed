@@ -39,13 +39,13 @@ const pumpChunkSize = 32 * 1024
 
 // Exec runs a command inside a pod's existing confinement domain (`kubectl
 // exec`). It does NOT open a privileged shell: it re-enters the SAME Seatbelt
-// profile, the SAME securityContext uid/gid drop, and the SAME pod data-volume
-// cwd as the pod's containers by spawning the requested argv through the
-// exec-shim backend — sandbox.Backend.WrapCommand produces the k3sm-execshim
-// invocation that runs supervisor.RunLaunchSequence (confine → setgid →
-// initgroups → setuid → sandbox_apply → execve the user's argv instead of the
-// pod entrypoint). An exec is therefore a fresh, equally-confined process and
-// cannot escape the pod's sandbox.
+// profile, the SAME securityContext uid/gid drop, and the SAME pod launch spec
+// (rlimits + qos) and data-volume cwd as the pod's containers by spawning the
+// requested argv through the exec-shim backend — sandbox.Backend.WrapCommand
+// produces the k3sm-execshim invocation that runs supervisor.RunLaunchSequence
+// (the single source of truth for the launch order) with the user's argv in
+// place of the pod entrypoint. An exec is therefore a fresh, equally-confined
+// process and cannot escape the pod's sandbox.
 //
 // The first ExecRequest carries the parameters (pod_id, container, command, tty,
 // stdin); subsequent frames carry stdin bytes and tty resize events. stdout and
@@ -74,10 +74,12 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	cred := resolveCredential(p.box, c)
 
 	// Reuse the pod's confinement: WrapCommand returns the exec-shim invocation
-	// that re-applies the pod's profile + drop, then execs the user's argv. This is
-	// the SAME seam the container spawn (startContainer) and the M2.3 launch-order
-	// tests exercise, so a future profile change automatically covers exec too.
-	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, cred)
+	// that re-applies the pod's profile + drop + rlimit plan + qos band (the full
+	// supervisor.LaunchSpec — an exec session gets the POD's limits, one code
+	// path). This is the SAME seam the container spawn (startContainer) and the
+	// M2.3/B7 launch-order tests exercise, so a future profile change
+	// automatically covers exec too.
+	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return status.Errorf(codes.Internal, "exec: wrap command: %v", err)
 	}

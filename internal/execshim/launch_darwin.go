@@ -90,14 +90,18 @@ func (s *podLaunchSeam) Exec() error {
 	return nil // unreachable on success
 }
 
-// RunPodLaunch becomes a confined, privilege-dropped pod process: it drops to
-// cred (when cred.Drop), applies the SBPL profile, and execve's argv — in the
-// SECURITY-CRITICAL order supervisor.RunLaunchSequence enforces
-// (setgid→initgroups→setuid → sandbox_apply → exec). It returns only on error;
-// a successful exec never returns. The ordering rationale lives at
+// RunPodLaunch becomes a confined, privilege-dropped pod process: it applies
+// spec's decoded rlimit plan, drops to spec.Cred (when Drop), backgrounds itself
+// (when spec.BgQoS), applies the SBPL profile, and execve's argv — in the
+// SECURITY-CRITICAL order supervisor.RunLaunchSequence enforces (setrlimit →
+// setgid→initgroups→setuid → setpriority → sandbox_apply → exec). spec is the
+// launch spec main() decoded from the shim argv (supervisor.ParseCredential /
+// ParseRlimits / ParseQoS — a decode failure is fatal BEFORE this is reached, so
+// the plan handed here is exactly what the daemon resolved). It returns only on
+// error; a successful exec never returns. The ordering rationale lives at
 // supervisor.RunLaunchSequence (the single source of truth, also unit-tested
 // there with a recording seam).
-func RunPodLaunch(profile string, argv []string, cred supervisor.Credential) error {
+func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec) error {
 	if len(argv) == 0 {
 		return errors.New("execshim: empty argv")
 	}
@@ -105,11 +109,6 @@ func RunPodLaunch(profile string, argv []string, cred supervisor.Credential) err
 	// euid is the shim's own effective uid (== the daemon's). RunLaunchSequence
 	// refuses a drop when it is non-root, so an unprivileged _k3sm daemon fails
 	// closed rather than attempting a doomed setuid.
-	//
-	// The rlimit plan is nil here: the daemon resolves it (runtime.resolveRlimitPlan
-	// from PodBox.rlimits[]) and its transport to this exec-shim via argv — mirroring
-	// Credential.ShimArgs/ParseCredential — is the sibling follow-up. Until then the
-	// shim applies no rlimits (the pre-rlimit behavior, an empty StepSetrlimit).
-	_, err := supervisor.RunLaunchSequence(seam, cred, nil, os.Geteuid())
+	_, err := supervisor.RunLaunchSequence(seam, spec, os.Geteuid())
 	return err
 }

@@ -131,6 +131,36 @@ func TestResolveRlimitPlan(t *testing.T) {
 	}
 }
 
+// TestResolveBgQoS pins the B7 QoS mapping decision (apis QOSClass → the
+// supervisor-local background flag), made HERE in the runtime layer so the
+// supervisor stays decoupled from apis: BEST_EFFORT and UNSPECIFIED map to the
+// darwin background band (PRIO_DARWIN_BG via the launch sequence); GUARANTEED,
+// BURSTABLE, and any UNKNOWN/future enum value map to NO setpriority call at all
+// (downward-only — the default band is the absence of the call, never an
+// explicit reset-to-0). The unknown-value case is load-bearing: backgrounding
+// must be the explicitly-enumerated branch, so a future additive apis QOSClass
+// value is never silently BG-throttled by a stale runtimed.
+func TestResolveBgQoS(t *testing.T) {
+	cases := []struct {
+		name string
+		qos  runtimev1.QOSClass
+		want bool
+	}{
+		{"besteffort-backgrounds", runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT, true},
+		{"unspecified-backgrounds", runtimev1.QOSClass_QOS_CLASS_UNSPECIFIED, true},
+		{"guaranteed-untouched", runtimev1.QOSClass_QOS_CLASS_GUARANTEED, false},
+		{"burstable-untouched", runtimev1.QOSClass_QOS_CLASS_BURSTABLE, false},
+		{"unknown-future-enum-value-untouched", runtimev1.QOSClass(99), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveBgQoS(&runtimev1.PodBox{QosClass: tc.qos}); got != tc.want {
+				t.Fatalf("resolveBgQoS(%v) = %v, want %v", tc.qos, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestResolveRlimitPlan_UnknownTypeWarnsAndSkips proves the comma-ok contract:
 // an unrecognized type is SKIPPED with a slog.Warn and is NEVER applied as the
 // zero-value resource — which on darwin is RLIMIT_CPU (0x0), a cumulative

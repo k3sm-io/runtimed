@@ -22,10 +22,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -42,12 +45,14 @@ type fakeBackend struct{ available bool }
 
 func (f fakeBackend) Available() bool { return f.available }
 func (f fakeBackend) Name() string    { return "fake" }
-func (f fakeBackend) WrapCommand(_ context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+func (f fakeBackend) WrapCommand(_ context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	if err := sandbox.Validate(profile); err != nil {
 		return "", nil, nil, err
 	}
-	// Mirror the production shim argv shape: [shim, <uid>, <gid>, <groups>, profile, argv...].
-	wrapped := append([]string{"/fake/shim"}, cred.ShimArgs()...)
+	// Mirror the production shim argv shape:
+	// [shim, <uid>, <gid>, <groups>, <rlimits>, <qos>, profile, argv...].
+	wrapped := append([]string{"/fake/shim"}, spec.Cred.ShimArgs()...)
+	wrapped = append(wrapped, supervisor.EncodeRlimits(spec.Rlimits), supervisor.EncodeQoS(spec.BgQoS))
 	wrapped = append(wrapped, "/tmp/profile.sb")
 	wrapped = append(wrapped, argv...)
 	return "/fake/shim", wrapped, func() error { return nil }, nil
@@ -60,21 +65,29 @@ type recordingBackend struct {
 	available bool
 	mu        sync.Mutex
 	wrapped   int
+	specs     []supervisor.LaunchSpec
 }
 
 func (b *recordingBackend) Available() bool { return b.available }
 func (b *recordingBackend) Name() string    { return "recording" }
-func (b *recordingBackend) WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+func (b *recordingBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	b.mu.Lock()
 	b.wrapped++
+	b.specs = append(b.specs, spec)
 	b.mu.Unlock()
-	return fakeBackend{available: b.available}.WrapCommand(ctx, profile, argv, cred)
+	return fakeBackend{available: b.available}.WrapCommand(ctx, profile, argv, spec)
 }
 
 func (b *recordingBackend) wrapCalls() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.wrapped
+}
+
+func (b *recordingBackend) lastSpec() supervisor.LaunchSpec {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.specs[len(b.specs)-1]
 }
 
 // fakeVMBackend is the runtime.VMBackend seam: its availability is settable and
@@ -1029,6 +1042,68 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	}
 
 	w.release(1001)
+}
+
+// TestCreatePodThreadsRlimitQoSLaunchSpec is the B7 WIRING proof that kills the
+// resolveRlimitPlan dead-path: a PodBox with explicit rlimits[] and a BestEffort
+// qos_class (1) reaches WrapCommand as a resolved supervisor.LaunchSpec (the
+// resolver runs LIVE in the spawn path), (2) produces a spawned shim argv
+// carrying the encoded rlimit + qos tokens at their fixed positions BEFORE the
+// profile path, and (3) the rlimit token decodes — via the same ParseRlimits the
+// shim's main() performs — back to the NON-NIL numeric plan, so the shim hands
+// RunLaunchSequence a non-nil plan (never the historical plan=nil).
+func TestCreatePodThreadsRlimitQoSLaunchSpec(t *testing.T) {
+	sp := &fakeSpawner{}
+	w := newBlockingWaiter()
+	be := &recordingBackend{available: true}
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w, Backend: be})
+
+	box := hostBinBox("pod-rlimit-qos")
+	box.Rlimits = []*runtimev1.ResourceLimit{
+		{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 4096},
+		{Type: "RLIMIT_NPROC", Soft: 64, Hard: 128},
+	}
+	box.QosClass = runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT
+	mustCreatePod(t, rt, box)
+	defer w.release(1001)
+
+	wantPlan := []supervisor.PlannedRlimit{
+		{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}},
+		{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 64, Max: 128}},
+	}
+
+	// (1) the backend received the resolved LaunchSpec — resolveRlimitPlan and
+	// resolveBgQoS ran live in startContainer.
+	spec := be.lastSpec()
+	if !reflect.DeepEqual(spec.Rlimits, wantPlan) {
+		t.Errorf("WrapCommand spec.Rlimits = %+v, want %+v", spec.Rlimits, wantPlan)
+	}
+	if !spec.BgQoS {
+		t.Error("WrapCommand spec.BgQoS = false, want true for a BestEffort pod")
+	}
+
+	// (2) the spawned argv carries the encoded tokens at the fixed positions
+	// (fakeBackend mirrors the production shape [shim, uid, gid, groups, rlimits,
+	// qos, profile, argv...]).
+	argv := sp.specs[len(sp.specs)-1].Argv
+	if len(argv) < 7 {
+		t.Fatalf("spawn argv too short: %v", argv)
+	}
+	if want := supervisor.EncodeRlimits(wantPlan); argv[4] != want {
+		t.Errorf("rlimit argv token = %q, want %q", argv[4], want)
+	}
+	if argv[5] != "q=bg" {
+		t.Errorf("qos argv token = %q, want %q", argv[5], "q=bg")
+	}
+
+	// (3) the token decodes — the shim-side decode — to the NON-NIL plan.
+	decoded, err := supervisor.ParseRlimits(argv[4])
+	if err != nil {
+		t.Fatalf("ParseRlimits(%q): %v", argv[4], err)
+	}
+	if decoded == nil || !reflect.DeepEqual(decoded, wantPlan) {
+		t.Errorf("decoded plan = %+v, want non-nil %+v", decoded, wantPlan)
+	}
 }
 
 // TestRuntimeConfigThreadsPostureVIPs pins the M10.1 posture: the cluster VIPs

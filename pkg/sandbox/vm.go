@@ -208,7 +208,7 @@ func (b *VMBackend) Available() bool {
 // host process, so the vm backend does not implement the host-process exec-shim
 // seam. The runtime routes a vm pod to CreateVM; this method exists only so
 // VMBackend totally satisfies sandbox.Backend and fails CLOSED on a mis-route.
-func (b *VMBackend) WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+func (b *VMBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	return "", nil, nil, ErrVMUsesCreateVM
 }
 
