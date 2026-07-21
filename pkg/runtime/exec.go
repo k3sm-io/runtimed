@@ -74,10 +74,12 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	cred := resolveCredential(p.box, c)
 
 	// Reuse the pod's confinement: WrapCommand returns the exec-shim invocation
-	// that re-applies the pod's profile + drop, then execs the user's argv. This is
-	// the SAME seam the container spawn (startContainer) and the M2.3 launch-order
-	// tests exercise, so a future profile change automatically covers exec too.
-	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, cred)
+	// that re-applies the pod's profile + drop + rlimit plan + qos band (the full
+	// supervisor.LaunchSpec — an exec session gets the POD's limits, one code
+	// path). This is the SAME seam the container spawn (startContainer) and the
+	// M2.3/B7 launch-order tests exercise, so a future profile change
+	// automatically covers exec too.
+	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return status.Errorf(codes.Internal, "exec: wrap command: %v", err)
 	}

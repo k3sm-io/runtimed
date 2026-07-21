@@ -45,12 +45,15 @@ type Backend interface {
 
 	// WrapCommand validates profile (it must be fail-closed — see Validate),
 	// persists it as needed, and returns the path + argv to spawn so that the
-	// spawned process drops to cred (the securityContext identity), confines
-	// itself to profile, and then execs argv[0]+argv[1:] as the pod process — in
-	// that irreversible order (see supervisor.RunLaunchSequence). cleanup releases
-	// any backing resources (e.g. the profile temp file) and must be called after
-	// the pod process has exited.
-	WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (path string, args []string, cleanup func() error, err error)
+	// spawned process applies spec (the resolved supervisor.LaunchSpec: the
+	// explicit rlimit plan, the securityContext identity drop, and the darwin
+	// background-QoS decision), confines itself to profile, and then execs
+	// argv[0]+argv[1:] as the pod process — in that irreversible order (see
+	// supervisor.RunLaunchSequence). WrapCommand is the single spawn choke-point:
+	// container starts AND exec sessions both come through it, so both carry the
+	// pod's full launch posture. cleanup releases any backing resources (e.g. the
+	// profile temp file) and must be called after the pod process has exited.
+	WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (path string, args []string, cleanup func() error, err error)
 
 	// Name identifies the backend for logging/diagnostics.
 	Name() string

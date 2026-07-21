@@ -455,11 +455,13 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
-	// Resolve the container's securityContext identity, then wrap the command so
-	// the spawned exec-shim drops to it, confines itself to the profile, and then
-	// execs the pod binary — in that irreversible order (M2.3). env is preserved.
+	// Resolve the container's securityContext identity plus the pod's rlimit plan
+	// and qos decision (one supervisor.LaunchSpec — B7), then wrap the command so
+	// the spawned exec-shim applies the limits, drops to the identity, backgrounds
+	// itself if BestEffort, confines itself to the profile, and then execs the pod
+	// binary — in that irreversible order (M2.3/B7). env is preserved.
 	cred := resolveCredential(p.box, c)
-	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, argv, cred)
+	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, argv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
