@@ -216,16 +216,27 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 
 // TestSidecarMainsOnlyPhase is the M10.2 phase proof: the pod's terminal phase
 // derives from the MAIN containers only. A main exiting 0 makes the pod
-// Succeeded (and tears the sidecar down); a main exiting non-zero makes it
-// Failed; a sidecar exit alone — even a crash — never flips the phase.
+// Succeeded; a main exiting non-zero makes it Failed; a sidecar exit alone —
+// even a crash — never flips the phase.
+//
+// It is ALSO the B26 truly-terminal proof on the teardown axis: only the
+// Succeeded transition (voluntary completion) tears the sidecar down. A FAILED
+// pod is the restart-expected case (CrashLoopBackOff — the provider re-execs it
+// via RestartContainer), so its sidecars MUST survive; DeletePod remains the
+// backstop that stops them for a pod that is never restarted.
 func TestSidecarMainsOnlyPhase(t *testing.T) {
+	const (
+		pidSC   = 1001
+		pidMain = 1002
+	)
 	cases := []struct {
-		name      string
-		exitCode  int // every released pid reports this code
-		wantPhase runtimev1.PodPhase
+		name         string
+		exitCode     int // every released pid reports this code
+		wantPhase    runtimev1.PodPhase
+		wantTeardown bool
 	}{
-		{"main-exit-0-pod-succeeded", 0, runtimev1.PodPhase_POD_PHASE_SUCCEEDED},
-		{"main-exit-nonzero-pod-failed", 5, runtimev1.PodPhase_POD_PHASE_FAILED},
+		{"main-exit-0-pod-succeeded-tears-sidecar-down", 0, runtimev1.PodPhase_POD_PHASE_SUCCEEDED, true},
+		{"main-exit-nonzero-pod-failed-sidecar-survives", 5, runtimev1.PodPhase_POD_PHASE_FAILED, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -235,25 +246,62 @@ func TestSidecarMainsOnlyPhase(t *testing.T) {
 			rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 			rt.signalGroup = rec.signal
 
-			mustCreatePod(t, rt, sidecarBox("pod-ph", "sc")) // sc=1001, main=1002
+			mustCreatePod(t, rt, sidecarBox("pod-ph", "sc"))
 
-			w.release(1002) // the main terminates on its own
+			// Subscribe BEFORE the main exits: the MODIFIED event for that exit is
+			// published at the END of watchContainerExit, strictly AFTER the
+			// teardown block — so observing it is a race-free barrier for the
+			// negative (no-teardown) assertion below.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stream := newFakeWatchStream(ctx)
+			go func() { _ = rt.WatchPodStatus(&runtimev1.WatchPodStatusRequest{PodId: "pod-ph"}, stream) }()
+			stream.recv(t, 2*time.Second) // the initial snapshot
+
+			w.release(pidMain) // the main terminates on its own
 			waitFor(t, 5*time.Second, "terminal phase on mains alone", func() bool {
 				return podPhase(t, rt, "pod-ph") == tc.wantPhase
 			})
 
-			// Voluntary-completion teardown: the still-running sidecar was stopped
-			// (SIGTERM under the 30s pod grace; the hook released it).
-			waitFor(t, 5*time.Second, "sidecar teardown signal", func() bool {
+			sidecarTermed := func() bool {
 				for _, s := range rec.sentSignals() {
-					if s.pid == 1001 && s.sig == termSignal {
+					if s.pid == pidSC && s.sig == termSignal {
+						return true
+					}
+				}
+				return false
+			}
+			if tc.wantTeardown {
+				// Voluntary-completion teardown: the still-running sidecar was stopped
+				// (SIGTERM under the 30s pod grace; the hook released it).
+				waitFor(t, 5*time.Second, "sidecar teardown signal", sidecarTermed)
+				if rec.sawKill() {
+					t.Error("sidecar honored SIGTERM within grace; must not escalate to SIGKILL")
+				}
+				return
+			}
+
+			// Barrier: the terminated-main publish means watchContainerExit ran its
+			// teardown block to completion. Any signal it would have sent is
+			// already recorded.
+			waitFor(t, 5*time.Second, "the main's terminated publish", func() bool {
+				ev := stream.recv(t, 5*time.Second)
+				for _, cs := range ev.GetStatus().GetContainerStatuses() {
+					if cs.GetName() == "main" && cs.GetState().GetTerminated() != nil {
 						return true
 					}
 				}
 				return false
 			})
-			if rec.sawKill() {
-				t.Error("sidecar honored SIGTERM within grace; must not escalate to SIGKILL")
+			if sidecarTermed() || rec.sawKill() {
+				t.Errorf("sidecar was torn down on a FAILED pod: %+v — a failed pod is restart-expected, "+
+					"tearing it down leaves a re-execed main with no sidecars", rec.sentSignals())
+			}
+			// It is still RUNNING and reported as such.
+			gs, _ := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: "pod-ph"})
+			ics := gs.GetStatus().GetInitContainerStatuses()
+			if len(ics) != 1 || ics[0].GetState().GetRunning() == nil {
+				t.Errorf("sidecar status after a FAILED main = %+v, want still Running", ics)
 			}
 		})
 	}

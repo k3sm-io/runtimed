@@ -33,9 +33,13 @@ import (
 // already-generated SBPL profile, the M2.3 uid/gid drop via the exec-shim backend,
 // and the same mounts — so the replacement runs in exactly the same confinement
 // domain. The restart_count is incremented and the prior run is recorded in
-// last_termination_state. A failed liveness probe drives this (the provider's
-// probe runner invokes it); it is NOT a pod-level restart (other containers and
-// the memory sampler are untouched).
+// last_termination_state. A failed liveness probe or a CrashLoopBackOff re-exec
+// drives this (the provider's probe/backoff runner invokes it); it is NOT a
+// pod-level restart — other containers are untouched.
+//
+// A re-exec is also how a pod LEAVES a terminal phase: the swap below feeds
+// recomputePhaseLocked, which de-escalates the pod back to Running (B26), and
+// re-arms the memory sampler if that terminal transition had cancelled it.
 //
 // Unknown pod / container return a structured NOT_FOUND (RestartContainerResponse
 // carries a google.rpc.Status, matching CreatePod/UpdatePod) rather than a
@@ -108,7 +112,16 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 
 	// Swap the new container in for the old (the old is now reaped + detached),
 	// carrying the incremented restart_count and the prior run's termination state.
+	//
+	// ATOMICITY INVARIANT (B26): the count bump, the last_termination_state, the
+	// container swap, the phase recompute and the status snapshot all happen
+	// under ONE hold of p.mu. No observer — GetPodStatus, WatchPodStatus, or this
+	// response — can ever see a bumped restart_count next to the PREVIOUS run's
+	// terminated state; the count and the state advance together. The k3sm
+	// provider's terminationKey restart idempotency rests entirely on that, so
+	// never split this block.
 	p.mu.Lock()
+	wasTerminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 	newCP.state.RestartCount = oldRestartCount + 1
 	newCP.state.LastTerminationState = lastTerminationState(oldCP, oldCode, oldSig, oldStarted, req.GetReason())
 	for i, cp := range p.containers {
@@ -118,8 +131,21 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		}
 	}
 	r.recomputePhaseLocked(p)
+	// A re-exec de-escalates the pod out of a terminal phase (recomputePhaseLocked
+	// is a pure function of the container states, never a latch).
+	deEscalated := wasTerminal && p.phase == runtimev1.PodPhase_POD_PHASE_RUNNING
 	status := containerStatusOf(newCP)
 	p.mu.Unlock()
+
+	if deEscalated {
+		// The pod had reached Succeeded, so watchContainerExit's truly-terminal
+		// transition already cancelled the memory sampler. The replacement main is
+		// Running again, so re-arm it: a resurrected container must not run
+		// without the OOM enforcement its memory limit promises. (Sidecars stopped
+		// by that same transition CANNOT be resurrected — the documented residual
+		// in watchContainerExit's invariant comment.)
+		r.armMemorySampler(p)
+	}
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 	return &runtimev1.RestartContainerResponse{Status: status}, nil
