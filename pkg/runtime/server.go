@@ -67,6 +67,11 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	r.pods[box.GetPodId()] = p
 	r.mu.Unlock()
 
+	// Arm the M2.5 memory sampler only NOW, after registration: armMemorySampler
+	// refuses to arm a pod absent from r.pods (its anti-stranding guard, B26), so
+	// arming inside createPod would leave every limited pod unenforced.
+	r.armMemorySampler(p)
+
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_ADDED, st)
 	return &runtimev1.CreatePodResponse{Status: st}, nil
@@ -90,9 +95,19 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		return &runtimev1.DeletePodResponse{}, nil // idempotent
 	}
 
-	// Stop the memory sampler (M2.5): the pod is going away.
-	if p.memCancel != nil {
-		p.memCancel()
+	// Stop the memory sampler (M2.5): the pod is going away. The read takes p.mu —
+	// memCancel is REPLACED at arbitrary runtime by armMemorySampler (a
+	// RestartContainer re-exec re-arms it), so an unsynchronized read here is a
+	// data race that can cancel a stale sampler and strand the live one on a
+	// deleted pod (B26). armMemorySampler's own guard closes the other side: the
+	// r.pods delete above already happened, so a concurrent arm is refused, and
+	// p.cancel below tears down any sampler that slipped through (it is rooted at
+	// p.supCtx).
+	p.mu.Lock()
+	memCancel := p.memCancel
+	p.mu.Unlock()
+	if memCancel != nil {
+		memCancel()
 	}
 
 	grace := resolveGrace(req, p)

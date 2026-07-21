@@ -83,7 +83,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		select {
 		case <-oldProc.Done():
 		case <-ctx.Done():
-			r.clearRestarting(p, oldCP)
+			r.clearRestarting(ctx, p, oldCP)
 			return restartFailure(codes.Canceled, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
 				"restart %s/%s: %v", req.GetPodId(), oldCP.name, ctx.Err()), nil
 		}
@@ -105,7 +105,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// fast/cache-backed).
 	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, r.rootfsPath(p.box), spec, initDeclared)
 	if err != nil {
-		r.clearRestarting(p, oldCP)
+		r.clearRestarting(ctx, p, oldCP)
 		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", err)
 		return restartFailure(codes.Internal, reason, "restart %s/%s: %v", req.GetPodId(), oldCP.name, err), nil
 	}
@@ -121,7 +121,13 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// provider's terminationKey restart idempotency rests entirely on that, so
 	// never split this block.
 	p.mu.Lock()
-	wasTerminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED
+	// Both terminal phases count: a Succeeded OR Failed pod has already had its
+	// memory sampler cancelled by the truly-terminal teardown (trulyTerminalLocked),
+	// so a re-exec out of EITHER must re-arm it. Failed is the CrashLoopBackOff
+	// case and thus the common one — omitting it would leave every re-execed
+	// crash-looping pod permanently unenforced (B26).
+	wasTerminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED ||
+		p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
 	newCP.state.RestartCount = oldRestartCount + 1
 	newCP.state.LastTerminationState = lastTerminationState(oldCP, oldCode, oldSig, oldStarted, req.GetReason())
 	for i, cp := range p.containers {
@@ -134,18 +140,35 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// A re-exec de-escalates the pod out of a terminal phase (recomputePhaseLocked
 	// is a pure function of the container states, never a latch).
 	deEscalated := wasTerminal && p.phase == runtimev1.PodPhase_POD_PHASE_RUNNING
+	// If it did NOT de-escalate, this swap just spawned a process into a pod that
+	// is STILL terminal, and it is this function's job to notice. Two ways in:
+	// restarting a SIDECAR held trulyTerminalLocked false via oldCP.restarting and
+	// the swap drops that flag (the mid-restart guard must be a DEFERRAL, never a
+	// permanent skip); or the pod was already torn down and the provider re-execed
+	// a sidecar into it anyway. In both, p.sidecarTeardown is a latch recording
+	// that SOME earlier transition claimed the teardown — it cannot have covered a
+	// process spawned after it — so a terminal pod re-claims its LIVE sidecars
+	// outright. stopSidecars skips already-reaped procs, so the re-claim can only
+	// stop something genuinely still running.
+	td := claimTerminalTeardownLocked(p)
+	if trulyTerminalLocked(p) {
+		td.sidecars = liveSidecarsLocked(p)
+	}
 	status := containerStatusOf(newCP)
 	p.mu.Unlock()
 
 	if deEscalated {
-		// The pod had reached Succeeded, so watchContainerExit's truly-terminal
-		// transition already cancelled the memory sampler. The replacement main is
-		// Running again, so re-arm it: a resurrected container must not run
-		// without the OOM enforcement its memory limit promises. (Sidecars stopped
-		// by that same transition CANNOT be resurrected — the documented residual
-		// in watchContainerExit's invariant comment.)
+		// The pod had reached Succeeded or Failed, so the truly-terminal transition
+		// already cancelled the memory sampler. The replacement main is Running
+		// again, so re-arm it: a resurrected container must not run without the OOM
+		// enforcement its memory limit promises. (Sidecars stopped by that same
+		// transition CANNOT be resurrected — the documented residual in
+		// trulyTerminalLocked.)
 		r.armMemorySampler(p)
 	}
+	// Detached for the same reason as the re-spawn above: a teardown that stops
+	// root-owned process groups must not be truncated by this RPC returning.
+	r.runTerminalTeardown(context.WithoutCancel(ctx), p, td)
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 	return &runtimev1.RestartContainerResponse{Status: status}, nil
@@ -154,10 +177,21 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 // clearRestarting resets the restarting flag on a failed restart so the container
 // resumes normal phase accounting (its old process is gone, so the pod will
 // reflect the failure on the next reap/status).
-func (r *Runtime) clearRestarting(p *pod, cp *containerProc) {
+//
+// Dropping the flag can RELEASE a teardown that trulyTerminalLocked deferred
+// while the restart was in flight (the pod concluded meanwhile), and no reap will
+// re-evaluate it — this container's exit was already recorded. So the predicate is
+// re-checked here too; without it a failed restart is the second way the
+// mid-restart guard could turn a deferral into a permanent skip (B26).
+func (r *Runtime) clearRestarting(ctx context.Context, p *pod, cp *containerProc) {
 	p.mu.Lock()
 	cp.restarting = false
+	r.recomputePhaseLocked(p)
+	td := claimTerminalTeardownLocked(p)
 	p.mu.Unlock()
+	// Detached: one of the two callers is the ctx-cancelled path, and a teardown
+	// that stops root-owned processes must not be truncated by the RPC's fate.
+	r.runTerminalTeardown(context.WithoutCancel(ctx), p, td)
 }
 
 // lastTerminationState builds the ContainerStatus.last_termination_state for the

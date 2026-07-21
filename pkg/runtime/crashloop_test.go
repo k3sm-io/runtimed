@@ -214,31 +214,371 @@ func TestRestartAfterCrashClearsTerminalPhase(t *testing.T) {
 
 // --- Defect 2: irreversible teardown fires only on a TRULY terminal pod ------
 
-// TestFailedPodKeepsMemoryEnforcement is the B26 truly-terminal proof on the
-// OOM-enforcement axis: reaching Failed must NOT cancel the memory sampler,
-// because a Failed pod is the restart-expected case — a re-exec would otherwise
-// resurrect the main into a pod with no limit enforcement at all.
-func TestFailedPodKeepsMemoryEnforcement(t *testing.T) {
+// samplingStopped reports whether the sampler has quiesced: two reads across a
+// window with no new sample. A live 2ms-interval sampler produces many.
+func samplingStopped(ff *countingFootprinter) bool {
+	a := ff.samples.Load()
+	time.Sleep(20 * time.Millisecond)
+	return ff.samples.Load() == a
+}
+
+// TestTrulyTerminalPredicate is the B26 unit proof of trulyTerminalLocked — the
+// gate on the two IRREVERSIBLE pod-teardown side effects. Both terminal phases
+// qualify (a restartPolicy Never/OnFailure pod that FAILS is genuinely finished
+// and Kubernetes retains it, so withholding the teardown leaks the sampler
+// goroutine and the sidecar process tree forever), and any container mid-restart
+// DEFERS it — including a sidecar, which the phase accounting skips entirely.
+func TestTrulyTerminalPredicate(t *testing.T) {
+	cases := []struct {
+		name       string
+		phase      runtimev1.PodPhase
+		containers []*containerProc
+		want       bool
+	}{
+		{
+			name:       "succeeded-no-restart-is-terminal",
+			phase:      runtimev1.PodPhase_POD_PHASE_SUCCEEDED,
+			containers: []*containerProc{testCP("main", exited(0), false, false)},
+			want:       true,
+		},
+		{
+			name:       "failed-no-restart-is-terminal",
+			phase:      runtimev1.PodPhase_POD_PHASE_FAILED,
+			containers: []*containerProc{testCP("main", exited(5), false, false)},
+			want:       true,
+		},
+		{
+			name:       "running-is-not-terminal",
+			phase:      runtimev1.PodPhase_POD_PHASE_RUNNING,
+			containers: []*containerProc{testCP("main", nil, false, false)},
+			want:       false,
+		},
+		{
+			name:       "pending-is-not-terminal",
+			phase:      runtimev1.PodPhase_POD_PHASE_PENDING,
+			containers: []*containerProc{testCP("main", nil, false, false)},
+			want:       false,
+		},
+		{
+			name:       "failed-with-a-main-mid-restart-defers",
+			phase:      runtimev1.PodPhase_POD_PHASE_FAILED,
+			containers: []*containerProc{testCP("main", exited(5), true, false)},
+			want:       false,
+		},
+		{
+			name:  "failed-with-a-SIDECAR-mid-restart-defers",
+			phase: runtimev1.PodPhase_POD_PHASE_FAILED,
+			containers: []*containerProc{
+				testCP("sc", nil, true, true), // the phase accounting skips sidecars entirely
+				testCP("main", exited(5), false, false),
+			},
+			want: false,
+		},
+		{
+			name:  "succeeded-with-a-SIDECAR-mid-restart-defers",
+			phase: runtimev1.PodPhase_POD_PHASE_SUCCEEDED,
+			containers: []*containerProc{
+				testCP("sc", nil, true, true),
+				testCP("main", exited(0), false, false),
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &pod{box: &runtimev1.PodBox{PodId: "p"}, phase: tc.phase, containers: tc.containers}
+			p.mu.Lock()
+			got := trulyTerminalLocked(p)
+			p.mu.Unlock()
+			if got != tc.want {
+				t.Errorf("trulyTerminalLocked = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTerminalTeardownClaimDeferralIsReleased proves the mid-restart guard is a
+// DEFERRAL, not a permanent skip: while a sidecar is mid-restart the claim yields
+// nothing, and the moment the flag clears the SAME pod yields its teardown. A
+// permanent skip would be the very leak the predicate exists to close.
+func TestTerminalTeardownClaimDeferralIsReleased(t *testing.T) {
+	sc := testCP("sc", nil, true, true) // mid-restart sidecar
+	p := &pod{
+		box:        &runtimev1.PodBox{PodId: "p"},
+		phase:      runtimev1.PodPhase_POD_PHASE_FAILED,
+		containers: []*containerProc{sc, testCP("main", exited(5), false, false)},
+	}
+
+	p.mu.Lock()
+	deferred := claimTerminalTeardownLocked(p)
+	p.mu.Unlock()
+	if deferred.sidecars != nil || p.sidecarTeardown {
+		t.Fatalf("claimed a teardown while a sidecar was mid-restart: %+v (claimed=%v)", deferred.sidecars, p.sidecarTeardown)
+	}
+
+	p.mu.Lock()
+	sc.restarting = false
+	released := claimTerminalTeardownLocked(p)
+	p.mu.Unlock()
+	if len(released.sidecars) != 1 || released.sidecars[0] != sc {
+		t.Errorf("teardown after the restart cleared = %+v, want the one sidecar (the deferral must RELEASE)", released.sidecars)
+	}
+
+	// And it stays once-only: a second claim yields nothing.
+	p.mu.Lock()
+	again := claimTerminalTeardownLocked(p)
+	p.mu.Unlock()
+	if again.sidecars != nil {
+		t.Errorf("second claim = %+v, want nil (the teardown is claimed exactly once)", again.sidecars)
+	}
+}
+
+// TestFailedPodIsTrulyTerminal is the corrected B26 leak proof, end to end: a
+// restartPolicy Never/OnFailure pod whose main FAILS is genuinely terminal —
+// nothing will restart it, and Kubernetes RETAINS it (the Job controller keeps it
+// under backoffLimit, podgc only collects at --terminated-pod-gc-threshold). So
+// BOTH irreversible side effects must fire: the ~1Hz memory sampler (a root
+// goroutine whose breach path SIGKILLs a process group) is cancelled, and the
+// native sidecars are torn down. Leaving them running leaks per failed pod, with
+// no cgroup parent to collect them and no operator-visible signal.
+func TestFailedPodIsTrulyTerminal(t *testing.T) {
+	const (
+		pidSC   = 1001
+		pidMain = 1002
+	)
 	w := newBlockingWaiter()
-	w.code = 5 // the main crashes → Failed
+	w.code = 5 // the main FAILS
+	ff := &countingFootprinter{bytes: 1 << 20}
+	rt := newTestRuntime(t, Deps{Waiter: w, Footprinter: ff})
+	rt.cfg.SampleInterval = 2 * time.Millisecond
+	rel := releaseOnce(w)
+	rec := &recordingSignalGroup{onTerm: rel, onKill: rel}
+	rt.signalGroup = rec.signal
+
+	box := sidecarBox("pod-fail-term", "sc")
+	box.MemoryLimitBytes = 100 << 20 // no breach; the sampler simply runs
+	mustCreatePod(t, rt, box)
+
+	// The sampler is demonstrably ALIVE before the failure, so its silence below
+	// is a cancellation and not a sampler that never started.
+	waitFor(t, 5*time.Second, "the memory sampler to start", func() bool {
+		return ff.samples.Load() > 0
+	})
+
+	rel(pidMain)
+	waitFor(t, 5*time.Second, "pod Failed", func() bool {
+		return podPhase(t, rt, "pod-fail-term") == runtimev1.PodPhase_POD_PHASE_FAILED
+	})
+
+	// (1) The sidecar is torn down — NOT left as an orphan process tree.
+	waitFor(t, 5*time.Second, "sidecar teardown on a FAILED pod", func() bool {
+		for _, s := range rec.sentSignals() {
+			if s.pid == pidSC && s.sig == termSignal {
+				return true
+			}
+		}
+		return false
+	})
+
+	// (2) The memory sampler goroutine is cancelled — NOT left sampling forever.
+	waitFor(t, 5*time.Second, "the memory sampler to stop on a FAILED pod", func() bool {
+		return samplingStopped(ff)
+	})
+}
+
+// TestRestartAfterCrashRearmsMemorySampler closes the other half of the above: a
+// FAILED pod IS torn down, so the CrashLoopBackOff re-exec must RE-ARM the memory
+// sampler. Without it every crash-looping pod would run permanently unenforced
+// after its first crash — the regression the truly-terminal fix would otherwise
+// introduce.
+func TestRestartAfterCrashRearmsMemorySampler(t *testing.T) {
+	w := newBlockingWaiter()
+	w.code = 5 // the main crashes → Failed → truly terminal
+	ff := &countingFootprinter{bytes: 1 << 20}
+	rt := newTestRuntime(t, Deps{Waiter: w, Footprinter: ff})
+	rt.cfg.SampleInterval = 2 * time.Millisecond
+	rel := releaseOnce(w)
+	rec := &recordingSignalGroup{onKill: rel, onTerm: rel}
+	rt.signalGroup = rec.signal
+
+	box := hostBinBox("pod-clbo-mem")
+	box.MemoryLimitBytes = 100 << 20
+	mustCreatePod(t, rt, box)
+
+	rel(1001)
+	waitFor(t, 5*time.Second, "pod Failed", func() bool {
+		return podPhase(t, rt, "pod-clbo-mem") == runtimev1.PodPhase_POD_PHASE_FAILED
+	})
+	waitFor(t, 5*time.Second, "the sampler cancelled by the terminal transition", func() bool {
+		return samplingStopped(ff)
+	})
+
+	resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
+		PodId: "pod-clbo-mem", Container: "main", Reason: "back-off restart",
+	})
+	if err != nil {
+		t.Fatalf("RestartContainer: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("RestartContainer failed: %v", resp.GetError())
+	}
+	if got := podPhase(t, rt, "pod-clbo-mem"); got != runtimev1.PodPhase_POD_PHASE_RUNNING {
+		t.Errorf("phase after the re-exec = %v, want RUNNING", got)
+	}
+
+	stopped := ff.samples.Load()
+	waitFor(t, 5*time.Second, "the sampler re-armed by the crash-loop re-exec", func() bool {
+		return ff.samples.Load() > stopped
+	})
+
+	// Exactly ONE sampler enforces the limit: DeletePod stops it for good.
+	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-clbo-mem"}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	waitFor(t, 5*time.Second, "all sampling to stop after delete", func() bool {
+		return samplingStopped(ff)
+	})
+}
+
+// TestSidecarRespawnedIntoTerminalPodIsTornDown proves the once-only
+// p.sidecarTeardown latch cannot strand a process spawned AFTER the claim: the
+// pod fails, its sidecar is torn down, and a provider re-exec of that sidecar into
+// the still-terminal pod is stopped again rather than left running forever.
+func TestSidecarRespawnedIntoTerminalPodIsTornDown(t *testing.T) {
+	// Spawn order: sidecar=1001, main=1002, re-spawned sidecar=1003.
+	const (
+		pidSC    = 1001
+		pidMain  = 1002
+		pidNewSC = 1003
+	)
+	w := newBlockingWaiter()
+	w.code = 5 // the main FAILS
+	rt := newTestRuntime(t, Deps{Waiter: w})
+	rel := releaseOnce(w)
+	rec := &recordingSignalGroup{onTerm: rel, onKill: rel}
+	rt.signalGroup = rec.signal
+
+	mustCreatePod(t, rt, sidecarBox("pod-sc-respawn", "sc"))
+
+	rel(pidMain)
+	waitFor(t, 5*time.Second, "pod Failed", func() bool {
+		return podPhase(t, rt, "pod-sc-respawn") == runtimev1.PodPhase_POD_PHASE_FAILED
+	})
+	waitFor(t, 5*time.Second, "the first sidecar teardown", func() bool {
+		for _, s := range rec.sentSignals() {
+			if s.pid == pidSC {
+				return true
+			}
+		}
+		return false
+	})
+
+	resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
+		PodId: "pod-sc-respawn", Container: "sc", Reason: "provider re-exec",
+	})
+	if err != nil {
+		t.Fatalf("RestartContainer: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("RestartContainer failed: %v", resp.GetError())
+	}
+
+	// The pod is still terminal (a sidecar never de-escalates the mains-only
+	// phase), so the freshly spawned sidecar must be stopped, not orphaned.
+	if got := podPhase(t, rt, "pod-sc-respawn"); got != runtimev1.PodPhase_POD_PHASE_FAILED {
+		t.Fatalf("phase after a sidecar re-exec = %v, want FAILED (sidecars never de-escalate)", got)
+	}
+	var stopped bool
+	for _, s := range rec.sentSignals() {
+		if s.pid == pidNewSC {
+			stopped = true
+		}
+	}
+	if !stopped {
+		t.Errorf("the re-spawned sidecar (pid %d) was never stopped: %+v — a terminal pod must leave "+
+			"no sidecar running; the once-only teardown latch cannot cover a later spawn",
+			pidNewSC, rec.sentSignals())
+	}
+}
+
+// TestLiveContainersExcludeTerminated pins the PID-reuse defense:
+// supervisor.Process.PID() keeps reporting the last pid after the reaper collects
+// it, so the memory sampler's PID set (and, load-bearing, oomKill's root SIGKILL
+// target list) must drop terminated containers. Darwin recycles pgids, so a stale
+// entry aims an uncatchable root signal at an unrelated process group.
+func TestLiveContainersExcludeTerminated(t *testing.T) {
+	live := testCP("live", nil, false, false)
+	dead := testCP("dead", exited(0), false, false)
+	deadSC := testCP("dead-sc", exited(1), false, true)
+	liveSC := testCP("live-sc", nil, false, true)
+	p := &pod{
+		box:        &runtimev1.PodBox{PodId: "p"},
+		containers: []*containerProc{live, dead, deadSC, liveSC},
+	}
+
+	p.mu.Lock()
+	got := liveContainersLocked(p)
+	sidecars := liveSidecarsLocked(p)
+	p.mu.Unlock()
+
+	if len(got) != 2 || got[0] != live || got[1] != liveSC {
+		names := make([]string, 0, len(got))
+		for _, cp := range got {
+			names = append(names, cp.name)
+		}
+		t.Errorf("liveContainersLocked = %v, want [live live-sc] (terminated containers must drop out)", names)
+	}
+	if len(sidecars) != 1 || sidecars[0] != liveSC {
+		t.Errorf("liveSidecarsLocked = %+v, want the one live sidecar", sidecars)
+	}
+}
+
+// TestSamplerRefusesToArmDeletedPod is the anti-stranding proof (B26): a sampler
+// is a root-daemon goroutine whose breach path SIGKILLs a process group, so
+// arming one for a pod already removed from r.pods — the reachable
+// DeletePod-cancels-then-RestartContainer-arms interleaving — must be REFUSED.
+// Otherwise nothing can ever cancel it.
+func TestSamplerRefusesToArmDeletedPod(t *testing.T) {
+	w := newBlockingWaiter()
 	ff := &countingFootprinter{bytes: 1 << 20}
 	rt := newTestRuntime(t, Deps{Waiter: w, Footprinter: ff})
 	rt.cfg.SampleInterval = 2 * time.Millisecond
 	rt.signalGroup = (&recordingSignalGroup{}).signal
 
-	box := hostBinBox("pod-fail-mem")
-	box.MemoryLimitBytes = 100 << 20 // no breach
+	box := hostBinBox("pod-unreg")
+	box.MemoryLimitBytes = 100 << 20
 	mustCreatePod(t, rt, box)
-
-	w.release(1001)
-	waitFor(t, 5*time.Second, "pod Failed", func() bool {
-		return podPhase(t, rt, "pod-fail-mem") == runtimev1.PodPhase_POD_PHASE_FAILED
+	waitFor(t, 5*time.Second, "the memory sampler to start", func() bool {
+		return ff.samples.Load() > 0
 	})
 
-	before := ff.samples.Load()
-	waitFor(t, 5*time.Second, "the sampler to keep sampling a Failed pod", func() bool {
-		return ff.samples.Load() > before
-	})
+	rt.mu.Lock()
+	p := rt.pods["pod-unreg"]
+	rt.mu.Unlock()
+
+	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-unreg"}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	waitFor(t, 5*time.Second, "sampling to stop on delete", func() bool { return samplingStopped(ff) })
+
+	p.mu.Lock()
+	before := p.memSampler
+	p.mu.Unlock()
+
+	// The late arm a racing RestartContainer would issue. A successful arm INSTALLS
+	// a new sampler (p.memSampler), so an unchanged pointer is the direct evidence
+	// the guard refused — not merely that the sampler happened to stay quiet.
+	rt.armMemorySampler(p)
+
+	p.mu.Lock()
+	after := p.memSampler
+	p.mu.Unlock()
+	if after != before {
+		t.Error("armMemorySampler installed a sampler for a pod no longer in r.pods — nothing can cancel it")
+	}
+	if !samplingStopped(ff) {
+		t.Error("a sampler is running for a deleted pod")
+	}
 }
 
 // TestRestartRearmsMemorySamplerAfterCompletion is the B26 residual-closure

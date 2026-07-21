@@ -66,18 +66,31 @@ type pod struct {
 	memSampler *supervisor.MemorySampler
 	memCancel  context.CancelFunc
 
-	// cancel ends the pod-lifetime supervision context — the per-container reapers
-	// (supervisor.Process.reap) and the watchContainerExit drain-wait. It is derived
+	// supCtx / cancel are the pod-lifetime SUPERVISION context and its cancel —
+	// the scope of the per-container reapers (supervisor.Process.reap), the
+	// watchContainerExit drain-wait, and the M2.5 memory sampler. It is derived
 	// from context.Background() (NOT the CreatePod request ctx, which is canceled
-	// when the unary RPC returns under the daemon split), mirroring memCancel, and
-	// is fired on pod teardown (DeletePod). Stored as the CancelFunc only — the
-	// context itself is passed down to the goroutines, never held in this struct.
+	// when the unary RPC returns under the daemon split) and fired on pod teardown
+	// (DeletePod).
+	//
+	// Holding the CONTEXT here is a deliberate, narrow exception to the
+	// "never store a Context in a struct" rule (docs/GO-STANDARDS.md §Context),
+	// taken for the same reason net/http.Server keeps a BaseContext: the field is
+	// NOT a request scope but the object's own LIFETIME, and goroutines started
+	// long after CreatePod returned — RestartContainer re-arming the memory
+	// sampler — must be rooted at it. Without that, a re-armed sampler was rooted
+	// at context.Background() and p.cancel could not stop it, leaving a root
+	// daemon goroutine able to SIGKILL a process group forever (B26). Never pass
+	// supCtx to a request-scoped call; it outlives every RPC.
+	supCtx context.Context
 	cancel context.CancelFunc
 
-	// sidecarTeardown marks the voluntary-completion sidecar teardown as claimed
-	// (guarded by mu): the first main-container exit that concludes the pod stops
-	// the native sidecars exactly once, even when several mains terminate
-	// concurrently (see watchContainerExit / stopSidecars).
+	// sidecarTeardown marks the terminal sidecar teardown as claimed (guarded by
+	// mu): the first main-container exit that concludes the pod stops the native
+	// sidecars exactly once, even when several mains terminate concurrently (see
+	// claimTerminalTeardownLocked / stopSidecars). It is a one-shot latch, so it
+	// cannot cover a sidecar spawned AFTER the claim — RestartContainer re-claims
+	// the live sidecars of a still-terminal pod for exactly that reason.
 	sidecarTeardown bool
 }
 
@@ -87,12 +100,34 @@ func (p *pod) containerPIDs() []int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pids := make([]int, 0, len(p.containers))
-	for _, cp := range p.containers {
+	for _, cp := range liveContainersLocked(p) {
 		if pid := cp.proc.PID(); pid > 0 {
 			pids = append(pids, pid)
 		}
 	}
 	return pids
+}
+
+// liveContainersLocked returns the pod's containers that have NOT terminated.
+//
+// The filter is load-bearing, not cosmetic: supervisor.Process.PID() keeps
+// returning the LAST pid after the reaper collects the process, so an unfiltered
+// walk hands a dead pid to the two consumers that act on it — the memory
+// sampler's PID set (containerPIDs) and, worse, oomKill, which SIGKILLs the whole
+// PROCESS GROUP as root. Darwin recycles pids/pgids, so a stale entry is a root
+// daemon aiming an uncatchable signal at whatever now owns that group. Dropping
+// terminated containers is the defense-in-depth half of that (the other half is
+// the truly-terminal teardown that stops the sampler at all — see
+// trulyTerminalLocked). Caller holds p.mu.
+func liveContainersLocked(p *pod) []*containerProc {
+	out := make([]*containerProc, 0, len(p.containers))
+	for _, cp := range p.containers {
+		if cp.state.GetState().GetTerminated() != nil {
+			continue
+		}
+		out = append(out, cp)
+	}
+	return out
 }
 
 // containerProc is one running container within a pod.
@@ -290,6 +325,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		profile: profile,
 		phase:   runtimev1.PodPhase_POD_PHASE_PENDING,
 		podIP:   ip,
+		supCtx:  podCtx,
 		cancel:  podCancel,
 	}
 
@@ -345,7 +381,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	p.phase = runtimev1.PodPhase_POD_PHASE_RUNNING
 	p.mu.Unlock()
 
-	r.armMemorySampler(p)
+	// NOTE: the memory sampler is armed by the CALLER (CreatePod), strictly AFTER
+	// the pod is registered in r.pods. armMemorySampler refuses to arm an
+	// unregistered pod (its anti-stranding guard, B26), so arming here — before
+	// registration — would silently leave every limited pod unenforced.
 
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
@@ -353,23 +392,48 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 // armMemorySampler starts the pod's memory sampler (M2.5): for a pod with a
 // memory limit it samples ri_phys_footprint at ~1 Hz and, on breach, SIGKILLs the
 // pod and records OOMKilled. The sampler's lifetime is the pod — cancelled on
-// DeletePod and on TRULY-terminal pod completion (watchContainerExit) — so the
-// goroutine never leaks. A pod without a limit runs no sampler (the metering/OOM
-// path is limit-driven in M2).
+// DeletePod and on any TRULY-terminal transition, Succeeded OR Failed
+// (trulyTerminalLocked) — so the goroutine never leaks. A pod without a limit
+// runs no sampler (the metering/OOM path is limit-driven in M2).
 //
-// It is called on the create path and AGAIN by RestartContainer when a re-exec
-// de-escalates a pod out of Succeeded, because that terminal transition already
-// cancelled the sampler: the replacement main must never run without the OOM
-// enforcement its limit promises. Any predecessor sampler is therefore cancelled
-// here, so EXACTLY ONE sampler ever enforces the limit. Call with p.mu NOT held —
-// the cancel is issued outside the lock (the sampler's onBreach callback takes
-// p.mu), per the callbacks-outside-locks discipline.
+// It is called by CreatePod (after the pod is registered) and AGAIN by
+// RestartContainer when a re-exec de-escalates a pod out of a terminal phase,
+// because that terminal transition already cancelled the sampler: the
+// replacement main must never run without the OOM enforcement its limit
+// promises. Any predecessor sampler is therefore cancelled here, so EXACTLY ONE
+// sampler ever enforces the limit. Call with p.mu NOT held — the cancel is issued
+// outside the lock (the sampler's onBreach callback takes p.mu), per the
+// callbacks-outside-locks discipline.
+//
+// ANTI-STRANDING (B26). A sampler is a root-daemon goroutine whose breach path
+// SIGKILLs a process GROUP, so it must never outlive its pod. Two independent
+// stoppers close that, in the r.mu → p.mu lock order the whole package uses:
+//
+//  1. It REFUSES to arm a pod that is no longer registered in r.pods. DeletePod
+//     removes the pod under r.mu BEFORE it cancels, so an arm that loses that
+//     race is dropped rather than stranded on a deleted pod. (RestartContainer
+//     resolves *pod up front and then blocks in GracefulStop for the whole grace
+//     window before reaching here, so the losing interleaving is reachable, not
+//     theoretical.)
+//  2. The sampler ctx is rooted at the pod-lifetime p.supCtx, NOT
+//     context.Background(). If the delete instead lands just after the check
+//     above, p.cancel (DeletePod) tears this sampler down too. The two stoppers
+//     are therefore ORDER-INDEPENDENT: whichever side wins, the goroutine dies.
 func (r *Runtime) armMemorySampler(p *pod) {
 	limit := podMemoryLimitBytes(p.box)
 	if limit == 0 {
 		return
 	}
-	sampCtx, cancel := context.WithCancel(context.Background())
+	r.mu.Lock()
+	registered := r.pods[p.box.GetPodId()] == p
+	r.mu.Unlock()
+	if !registered {
+		// Deleted (or replaced) while we were getting here: arming now would strand
+		// a root SIGKILL-capable goroutine on a pod nothing will ever cancel.
+		r.log.Debug("skip memory sampler arm for an unregistered pod", "pod", p.box.GetPodId())
+		return
+	}
+	sampCtx, cancel := context.WithCancel(p.supCtx)
 	sampler := supervisor.NewMemorySampler(r.footprinter, p.containerPIDs, limit, func(footprint uint64) {
 		r.oomKill(p, footprint)
 	})
@@ -431,8 +495,13 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 func (r *Runtime) oomKill(p *pod, footprint uint64) {
 	p.mu.Lock()
 	p.oomKilled = true
-	procs := make([]*supervisor.Process, 0, len(p.containers))
-	for _, cp := range p.containers {
+	// Only LIVE containers are signalled: PID() still reports the last pid of a
+	// reaped container, and darwin recycles pgids, so signalling a terminated
+	// container's group is a root SIGKILL aimed at an unrelated process group
+	// (see liveContainersLocked).
+	live := liveContainersLocked(p)
+	procs := make([]*supervisor.Process, 0, len(live))
+	for _, cp := range live {
 		procs = append(procs, cp.proc)
 	}
 	p.mu.Unlock()
@@ -629,66 +698,18 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	restarting := cp.restarting
 	r.recomputePhaseLocked(p)
 
-	// TRULY-TERMINAL invariant (B26): the two side effects below are
-	// IRREVERSIBLE — memCancel stops the memory sampler that ENFORCES the pod's
-	// limit, and the sidecar teardown kills processes that cannot be resurrected
-	// — so they may fire ONLY on a transition the pod cannot leave.
-	//
-	// `allTerminated` (equivalently: phase in {Succeeded, Failed}) is NOT that
-	// transition. runtimed performs NO exit-driven restarts: the provider owns
-	// the restart decision + backoff and executes it via RestartContainer, so a
-	// FAILED pod is PRECISELY the restart-expected case (CrashLoopBackOff). A
-	// pod torn down there would have its main re-execed into a pod with no OOM
-	// enforcement and no sidecars.
-	//
-	// The predicate is therefore the SUCCEEDED phase alone: every main
-	// terminated, none mid-restart, none failed — the "voluntary completion"
-	// the apis restart_policy contract names as the sidecar teardown trigger.
-	// Binding it to the phase (rather than to a second flag) is sound only
-	// because recomputePhaseLocked is a pure function of the container states
-	// and de-escalates: the phase can no longer be a stale latch, and a
-	// container mid-restart holds it at Running.
-	//
-	// A pod left FAILED leaks nothing: DeletePod unconditionally fires memCancel
-	// and claims the sidecar teardown, so both side effects still run exactly
-	// once for a pod that is never restarted.
-	//
-	// RESIDUAL, documented: a restartPolicy:Always pod whose main exits 0 IS
-	// restarted by the provider, yet reaches Succeeded here and is torn down.
-	// runtimed cannot distinguish it — PodBox carries no POD-level restartPolicy
-	// (only the container-level KEP-753 field, meaningful on init containers).
-	// RestartContainer re-arms the memory sampler when it de-escalates such a
-	// pod, closing the OOM-enforcement half; sidecars cannot be resurrected.
-	trulyTerminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED
-	var cancel context.CancelFunc
-	// Voluntary-completion sidecar teardown (M10.2): the mains just concluded the
-	// pod (mains-only accounting above), so any still-running native sidecars are
-	// stopped in REVERSE start order BEFORE the terminal publish below. The claim
-	// is made under p.mu so concurrent main exits initiate the teardown exactly
-	// once — and DeletePod claims it up front, so a delete-driven main exit defers
-	// to the delete's own two-phase stop.
-	var sidecars []*containerProc
-	if trulyTerminal {
-		cancel = p.memCancel
-		if !p.sidecarTeardown {
-			p.sidecarTeardown = true
-			sidecars = sidecarsLocked(p)
-		}
-	}
+	// The mains just concluded the pod (mains-only accounting above). If that
+	// conclusion is TRULY terminal, claim the irreversible teardown — stop the
+	// memory sampler and stop the native sidecars in REVERSE start order — BEFORE
+	// the terminal publish below. See trulyTerminalLocked for the predicate and
+	// claimTerminalTeardownLocked for the exactly-once claim.
+	td := claimTerminalTeardownLocked(p)
 	p.mu.Unlock()
 
-	// Stop the memory sampler once the pod is truly terminated (no goroutine leak).
-	if cancel != nil {
-		cancel()
-	}
-
-	if len(sidecars) > 0 {
-		// One pod-level grace budget, anchored NOW: the mains exited on their own
-		// (voluntary completion) and consumed none of it, so the sidecars share the
-		// whole configured budget in reverse start order (see stopSidecars).
-		deadline := time.Now().Add(graceDuration(0, p))
-		r.stopSidecars(ctx, p.box.GetPodId(), sidecars, deadline)
-	}
+	// One pod-level grace budget, anchored NOW: the mains exited on their own
+	// (voluntary completion) and consumed none of it, so the sidecars share the
+	// whole configured budget in reverse start order (see stopSidecars).
+	r.runTerminalTeardown(ctx, p, td)
 
 	// Suppress the TRANSIENT terminated publish of a container the provider is
 	// already restarting (B26). The state write above stands — RestartContainer
@@ -740,6 +761,108 @@ func terminationMessageFromLogs(logs *logBuffer) string {
 	return string(msg)
 }
 
+// trulyTerminalLocked reports whether the pod has reached a state it can NEVER
+// leave on its own — the ONLY transition allowed to fire the two IRREVERSIBLE
+// pod-teardown side effects (cancelling the memory sampler that ENFORCES the
+// pod's limit, and stopping the native sidecars, which cannot be resurrected).
+// Caller holds p.mu, and must have recomputed the phase first.
+//
+// The predicate is: a terminal PHASE (Succeeded OR Failed) with NO container
+// mid-restart.
+//
+// Both halves are load-bearing:
+//
+//   - Failed MUST be included. A restartPolicy Never/OnFailure pod whose main
+//     fails is genuinely finished — nothing will ever restart it — yet Kubernetes
+//     RETAINS it: the Job controller keeps the failed pod under
+//     backoffLimit/podFailurePolicy (ttlSecondsAfterFinished is commonly unset)
+//     and podgc only collects at --terminated-pod-gc-threshold (default 12500).
+//     "DeletePod is the backstop" is therefore FALSE for exactly the workload
+//     native sidecars exist to serve. On k3sm a pod is native Darwin processes
+//     with no cgroup/namespace parent to collect them, so a teardown that never
+//     fires is PERMANENT: N such pods leave N ~1 Hz sampler goroutines (each able
+//     to root-SIGKILL a process group) and N live sidecar process trees, unbounded
+//     and with no operator-visible signal.
+//
+//   - The mid-restart guard is what makes including Failed SAFE, and it is sound
+//     precisely because recomputePhaseLocked de-escalates: a MAIN mid-restart
+//     holds the phase at Running (allTerminated is false), so a Failed phase
+//     already implies no main is restarting — the scan below is a defensive
+//     restatement for the mains and the REAL work for SIDECARS, which
+//     recomputePhaseLocked skips entirely. Tearing down a sidecar that
+//     RestartContainer is mid-swap on would stop the OLD process and then let the
+//     replacement spawn into a pod nothing will ever tear down again — the same
+//     orphan this predicate exists to prevent. RestartContainer re-evaluates this
+//     predicate after the swap (and clearRestarting after a failed one), so the
+//     deferred teardown is never merely skipped.
+//
+// The CrashLoopBackOff surface is preserved by RestartContainer, not by
+// withholding the teardown: a re-exec de-escalates the pod back to Running and
+// re-arms the memory sampler, so a resurrected main never runs unenforced.
+//
+// RESIDUAL, documented: sidecars stopped by a terminal transition are NOT
+// resurrected by a later re-exec. This applies to a restartPolicy:Always pod
+// whose main exits 0 or crashes — runtimed cannot tell it apart from Never/
+// OnFailure, because PodBox carries no POD-level restartPolicy (only the
+// container-level KEP-753 field, meaningful on init containers). Closing it needs
+// an apis field, which is out of scope here; the leak above is the strictly worse
+// failure, and this is the delivered M10.2/B74 teardown behaviour unchanged.
+func trulyTerminalLocked(p *pod) bool {
+	switch p.phase {
+	case runtimev1.PodPhase_POD_PHASE_SUCCEEDED, runtimev1.PodPhase_POD_PHASE_FAILED:
+	default:
+		return false
+	}
+	for _, cp := range p.containers {
+		if cp.restarting {
+			return false
+		}
+	}
+	return true
+}
+
+// terminalTeardown is the irreversible teardown work claimed by a truly-terminal
+// transition. It is assembled UNDER p.mu (claimTerminalTeardownLocked) and RUN
+// outside it (runTerminalTeardown), because both halves block: the sampler cancel
+// races the sampler's own onBreach callback, which takes p.mu, and the sidecar
+// stop spans a whole grace window.
+type terminalTeardown struct {
+	cancel   context.CancelFunc
+	sidecars []*containerProc
+}
+
+// claimTerminalTeardownLocked evaluates trulyTerminalLocked and, when it holds,
+// CLAIMS the teardown: it hands back the memory-sampler cancel and — at most once
+// per pod — the sidecars to stop. The once-only claim (p.sidecarTeardown, guarded
+// by p.mu) means concurrent main exits initiate the sidecar stop exactly once, and
+// DeletePod claims it up front so a delete-driven main exit defers to the delete's
+// own two-phase stop. A non-terminal pod yields the zero value (a no-op).
+// Caller holds p.mu.
+func claimTerminalTeardownLocked(p *pod) terminalTeardown {
+	if !trulyTerminalLocked(p) {
+		return terminalTeardown{}
+	}
+	td := terminalTeardown{cancel: p.memCancel}
+	if !p.sidecarTeardown {
+		p.sidecarTeardown = true
+		td.sidecars = sidecarsLocked(p)
+	}
+	return td
+}
+
+// runTerminalTeardown executes a claimed teardown with p.mu NOT held: it cancels
+// the memory sampler (no root-SIGKILL-capable goroutine outlives the pod) and
+// stops the claimed sidecars in reverse start order against one whole pod grace
+// budget anchored now — the mains exited on their own, so they consumed none of it.
+func (r *Runtime) runTerminalTeardown(ctx context.Context, p *pod, td terminalTeardown) {
+	if td.cancel != nil {
+		td.cancel()
+	}
+	if len(td.sidecars) > 0 {
+		r.stopSidecars(ctx, p.box.GetPodId(), td.sidecars, time.Now().Add(graceDuration(0, p)))
+	}
+}
+
 // recomputePhaseLocked updates the pod phase from its MAIN containers' states.
 // Native sidecars are EXCLUDED from the terminal accounting (the mains-only rule
 // of the apis restart_policy contract): when every main has terminated the pod
@@ -750,7 +873,8 @@ func terminationMessageFromLogs(logs *logBuffer) string {
 // The phase is a pure FUNCTION of the current main-container states, NEVER a
 // latch: it de-escalates back to Running as soon as a main is running again (see
 // the default arm). Every consumer of p.phase may therefore read it as
-// state-derived — watchContainerExit's truly-terminal predicate depends on that.
+// state-derived — trulyTerminalLocked depends on it, and specifically on the fact
+// that a MAIN mid-restart holds the phase at Running.
 func (r *Runtime) recomputePhaseLocked(p *pod) {
 	mains := 0
 	allTerminated := true
