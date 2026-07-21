@@ -249,6 +249,65 @@ func TestPVCInSBPLWriteScope(t *testing.T) {
 	}
 }
 
+// TestGeneratePodReapStoreDenied is the podreap trust-boundary contract: the
+// daemon-private startup-reap store (<WorkDir>/podreap) MUST be read+write denied
+// so a confined pod can never forge a reap record (which drives a root-privileged
+// kill(-pgid) at a group of its choosing). The load-bearing case is an ANCESTOR
+// extra_write_path: even when a caller grants write to the whole work-dir, the
+// emitted podreap deny — placed AFTER the allows (last-match-wins) — must still
+// re-deny the store. A validate-set entry alone would not close this; the emitted
+// deny is the barrier.
+func TestGeneratePodReapStoreDenied(t *testing.T) {
+	const workDir = "/var/lib/k3sm"
+	const dataVol = workDir + "/pods/p1/rootfs"
+	const podReapRoot = workDir + "/" + PodReapSubdir
+
+	// Grant write to the work-dir ITSELF — an ancestor of the reap store. This
+	// passes validateExtraPaths (an ancestor is not "under" a protected prefix),
+	// so it emits an (allow file-write* (subpath "/var/lib/k3sm")) with no
+	// implicit protection of the podreap child.
+	out, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath:  dataVol,
+		ExtraWritePaths: []string{workDir},
+	}, GenerateOptions{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	// The ancestor allow is present (proving this is the dangerous shape, not a
+	// validation rejection).
+	ancestorAllow := "(allow file-write*\n  (subpath \"" + workDir + "\")"
+	iAllow := strings.Index(out, ancestorAllow)
+	if iAllow < 0 {
+		t.Fatalf("expected the ancestor work-dir write allow in the profile:\n%s", out)
+	}
+
+	// The podreap store is denied in BOTH firmlink forms.
+	for _, frag := range []string{
+		"(subpath \"" + podReapRoot + "\")",
+		"(subpath \"/private" + podReapRoot + "\")",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("podreap store not denied (missing %q):\n%s", frag, out)
+		}
+	}
+
+	// And the deny is emitted AFTER the ancestor allow so last-match-wins keeps
+	// the store denied despite the ancestor write grant.
+	iDeny := strings.Index(out, "(deny file-read* file-write*\n  (subpath \""+workDir+"/pods\")")
+	if iDeny < 0 {
+		t.Fatalf("work-dir protected deny stanza missing:\n%s", out)
+	}
+	if iDeny <= iAllow {
+		t.Errorf("podreap deny (%d) must come AFTER the ancestor work-dir allow (%d) to win (last-match-wins)", iDeny, iAllow)
+	}
+
+	// The store dir name is single-sourced: pkg/runtime references this const.
+	if PodReapSubdir != "podreap" {
+		t.Errorf("PodReapSubdir = %q, want \"podreap\" (single-sourced with pkg/runtime)", PodReapSubdir)
+	}
+}
+
 // TestGenerateNetworkGating checks that without AllowNetwork the profile emits no
 // network-outbound allow (default-deny egress).
 func TestGenerateNetworkGating(t *testing.T) {
