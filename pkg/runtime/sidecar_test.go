@@ -402,11 +402,11 @@ type profileRecordingBackend struct {
 
 func (b *profileRecordingBackend) Available() bool { return true }
 func (b *profileRecordingBackend) Name() string    { return "profile-recording" }
-func (b *profileRecordingBackend) WrapCommand(ctx context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+func (b *profileRecordingBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	b.mu.Lock()
 	b.profiles = append(b.profiles, profile)
 	b.mu.Unlock()
-	return fakeBackend{available: true}.WrapCommand(ctx, profile, argv, cred)
+	return fakeBackend{available: true}.WrapCommand(ctx, profile, argv, spec)
 }
 
 func (b *profileRecordingBackend) recorded() []string {

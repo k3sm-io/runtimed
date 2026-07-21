@@ -21,8 +21,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -93,8 +96,9 @@ func TestWrapCommand(t *testing.T) {
 	}
 
 	t.Run("valid-no-drop", func(t *testing.T) {
-		// No securityContext → no-drop credential → sentinel tokens "-1 -1 -".
-		path, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo", "hi"}, supervisor.Credential{})
+		// No securityContext → no-drop credential → sentinel tokens "-1 -1 -";
+		// no rlimits/qos → "-" "-" sentinels in the two launch-spec positions.
+		path, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo", "hi"}, supervisor.LaunchSpec{})
 		if err != nil {
 			t.Fatalf("WrapCommand: %v", err)
 		}
@@ -102,14 +106,17 @@ func TestWrapCommand(t *testing.T) {
 		if path != b.shimPath {
 			t.Errorf("path=%q, want shim %q", path, b.shimPath)
 		}
-		// argv = [shim, <uid>, <gid>, <groups>, profilePath, /bin/echo, hi]
-		if len(argv) != 7 || argv[0] != b.shimPath || argv[5] != "/bin/echo" || argv[6] != "hi" {
+		// argv = [shim, <uid>, <gid>, <groups>, <rlimits>, <qos>, profilePath, /bin/echo, hi]
+		if len(argv) != 9 || argv[0] != b.shimPath || argv[7] != "/bin/echo" || argv[8] != "hi" {
 			t.Fatalf("unexpected argv: %v", argv)
 		}
 		if argv[1] != "-1" || argv[2] != "-1" || argv[3] != "-" {
 			t.Errorf("no-drop credential tokens = %q, want [-1 -1 -]", argv[1:4])
 		}
-		profilePath := argv[4]
+		if argv[4] != "-" || argv[5] != "-" {
+			t.Errorf("empty rlimit/qos tokens = %q, want [- -]", argv[4:6])
+		}
+		profilePath := argv[6]
 		data, rerr := os.ReadFile(profilePath)
 		if rerr != nil {
 			t.Fatalf("staged profile unreadable: %v", rerr)
@@ -126,8 +133,8 @@ func TestWrapCommand(t *testing.T) {
 	})
 
 	t.Run("carries-drop-credential", func(t *testing.T) {
-		cred := supervisor.Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true}
-		_, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo"}, cred)
+		spec := supervisor.LaunchSpec{Cred: supervisor.Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true}}
+		_, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo"}, spec)
 		if err != nil {
 			t.Fatalf("WrapCommand: %v", err)
 		}
@@ -137,15 +144,47 @@ func TestWrapCommand(t *testing.T) {
 		}
 	})
 
+	t.Run("carries-rlimits-and-qos-before-profile", func(t *testing.T) {
+		plan := []supervisor.PlannedRlimit{
+			{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}},
+		}
+		spec := supervisor.LaunchSpec{Rlimits: plan, BgQoS: true}
+		_, argv, cleanup, err := b.WrapCommand(context.Background(), good, []string{"/bin/echo"}, spec)
+		if err != nil {
+			t.Fatalf("WrapCommand: %v", err)
+		}
+		defer cleanup()
+		// The tokens sit at the fixed positions BEFORE the profile path — an OLD
+		// shim (pre-B7 arity) would read argv[4] as its profile path, fail the
+		// ReadFile, and exit 3: fail-closed under daemon/shim binary skew.
+		if want := supervisor.EncodeRlimits(plan); argv[4] != want {
+			t.Errorf("rlimit token = %q, want %q", argv[4], want)
+		}
+		if argv[5] != "q=bg" {
+			t.Errorf("qos token = %q, want %q", argv[5], "q=bg")
+		}
+		// Round-trip through the shim-side decoders: the plan survives, non-nil.
+		decoded, derr := supervisor.ParseRlimits(argv[4])
+		if derr != nil || !reflect.DeepEqual(decoded, plan) {
+			t.Errorf("ParseRlimits(%q) = (%+v, %v), want (%+v, nil)", argv[4], decoded, derr, plan)
+		}
+		if bg, qerr := supervisor.ParseQoS(argv[5]); qerr != nil || !bg {
+			t.Errorf("ParseQoS(%q) = (%v, %v), want (true, nil)", argv[5], bg, qerr)
+		}
+		if _, rerr := os.ReadFile(argv[6]); rerr != nil {
+			t.Errorf("profile path shifted off position 6: %v", rerr)
+		}
+	})
+
 	t.Run("rejects-failopen-profile", func(t *testing.T) {
-		_, _, _, err := b.WrapCommand(context.Background(), "(version 1)\n(allow default)\n", []string{"/bin/echo"}, supervisor.Credential{})
+		_, _, _, err := b.WrapCommand(context.Background(), "(version 1)\n(allow default)\n", []string{"/bin/echo"}, supervisor.LaunchSpec{})
 		if !errors.Is(err, ErrMissingDenyDefault) {
 			t.Fatalf("want ErrMissingDenyDefault, got %v", err)
 		}
 	})
 
 	t.Run("rejects-empty-argv", func(t *testing.T) {
-		_, _, _, err := b.WrapCommand(context.Background(), good, nil, supervisor.Credential{})
+		_, _, _, err := b.WrapCommand(context.Background(), good, nil, supervisor.LaunchSpec{})
 		if err == nil {
 			t.Fatal("want error for empty argv")
 		}

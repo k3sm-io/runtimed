@@ -20,11 +20,13 @@ import (
 	"context"
 	"io"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -46,18 +48,24 @@ type recordingExecBackend struct {
 	mu       sync.Mutex
 	profiles []string
 	argvs    [][]string
-	creds    []supervisor.Credential
+	specs    []supervisor.LaunchSpec
 }
 
 func (b *recordingExecBackend) Available() bool { return true }
 func (b *recordingExecBackend) Name() string    { return "recording-exec" }
-func (b *recordingExecBackend) WrapCommand(_ context.Context, profile string, argv []string, cred supervisor.Credential) (string, []string, func() error, error) {
+func (b *recordingExecBackend) WrapCommand(_ context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	b.mu.Lock()
 	b.profiles = append(b.profiles, profile)
 	b.argvs = append(b.argvs, append([]string{}, argv...))
-	b.creds = append(b.creds, cred)
+	b.specs = append(b.specs, spec)
 	b.mu.Unlock()
 	return argv[0], append([]string{}, argv...), func() error { return nil }, nil
+}
+
+func (b *recordingExecBackend) lastSpec() supervisor.LaunchSpec {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.specs[len(b.specs)-1]
 }
 
 func (b *recordingExecBackend) lastProfile() string {
@@ -193,6 +201,42 @@ func TestExecRunsAndReturnsExitCode(t *testing.T) {
 			t.Errorf("Exec(unknown pod) code = %v, want NotFound", status.Code(err))
 		}
 	})
+}
+
+// TestExecCarriesPodLaunchSpec pins the B7 one-code-path decision: an exec
+// session re-enters the pod's FULL confinement domain — not just profile + uid
+// drop but the pod's explicit rlimits and its qos class too — because Exec goes
+// through the same WrapCommand choke-point as startContainer with the same
+// resolved supervisor.LaunchSpec.
+func TestExecCarriesPodLaunchSpec(t *testing.T) {
+	be := &recordingExecBackend{}
+	w := newBlockingWaiter()
+	rt := newTestRuntime(t, Deps{Backend: be, Waiter: w})
+
+	box := hostBinBox("pod-exec-spec")
+	box.Rlimits = []*runtimev1.ResourceLimit{{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 4096}}
+	box.QosClass = runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT
+	mustCreatePod(t, rt, box)
+	defer w.release(1001)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := newFakeExecStream(ctx)
+	st.feed(&runtimev1.ExecRequest{PodId: "pod-exec-spec", Command: []string{"/bin/echo", "hi"}})
+	st.closeSend()
+	if err := rt.Exec(st); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	st.collect(t)
+
+	spec := be.lastSpec()
+	want := []supervisor.PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}}
+	if !reflect.DeepEqual(spec.Rlimits, want) {
+		t.Errorf("exec WrapCommand spec.Rlimits = %+v, want the POD's plan %+v", spec.Rlimits, want)
+	}
+	if !spec.BgQoS {
+		t.Error("exec WrapCommand spec.BgQoS = false, want true (the pod's BestEffort class)")
+	}
 }
 
 // TestExecStreamsStdin pipes stdin to the command and asserts it reaches it (cat

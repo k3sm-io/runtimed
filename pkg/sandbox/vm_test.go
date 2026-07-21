@@ -95,7 +95,7 @@ func TestVMBackendAvailableComposition(t *testing.T) {
 // a mis-routed vm pod can never be run through the Seatbelt host-process path.
 func TestVMBackendWrapCommandRefuses(t *testing.T) {
 	b := NewVMBackend()
-	_, _, _, err := b.WrapCommand(context.Background(), "(version 1)(deny default)(import \"system.sb\")", []string{"/bin/true"}, supervisor.Credential{})
+	_, _, _, err := b.WrapCommand(context.Background(), "(version 1)(deny default)(import \"system.sb\")", []string{"/bin/true"}, supervisor.LaunchSpec{})
 	if !errors.Is(err, ErrVMUsesCreateVM) {
 		t.Errorf("WrapCommand err = %v, want ErrVMUsesCreateVM", err)
 	}
