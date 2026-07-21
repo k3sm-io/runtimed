@@ -214,11 +214,21 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 	})
 }
 
-// TestSidecarMainsOnlyPhase is the M10.2 phase proof: the pod's terminal phase
-// derives from the MAIN containers only. A main exiting 0 makes the pod
+// TestSidecarMainsOnlyPhase is the M10.2/B74 phase proof: the pod's terminal
+// phase derives from the MAIN containers only. A main exiting 0 makes the pod
 // Succeeded (and tears the sidecar down); a main exiting non-zero makes it
 // Failed; a sidecar exit alone — even a crash — never flips the phase.
+//
+// The teardown assertion holds for BOTH terminal phases and is the delivered
+// milestone gate, restored after B26 briefly inverted the Failed case: a pod is
+// terminal on Failed too (restartPolicy Never/OnFailure), and Kubernetes RETAINS
+// failed pods, so withholding the teardown there leaks the sidecar process tree
+// forever. See trulyTerminalLocked.
 func TestSidecarMainsOnlyPhase(t *testing.T) {
+	const (
+		pidSC   = 1001
+		pidMain = 1002
+	)
 	cases := []struct {
 		name      string
 		exitCode  int // every released pid reports this code
@@ -235,18 +245,18 @@ func TestSidecarMainsOnlyPhase(t *testing.T) {
 			rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 			rt.signalGroup = rec.signal
 
-			mustCreatePod(t, rt, sidecarBox("pod-ph", "sc")) // sc=1001, main=1002
+			mustCreatePod(t, rt, sidecarBox("pod-ph", "sc"))
 
-			w.release(1002) // the main terminates on its own
+			w.release(pidMain) // the main terminates on its own
 			waitFor(t, 5*time.Second, "terminal phase on mains alone", func() bool {
 				return podPhase(t, rt, "pod-ph") == tc.wantPhase
 			})
 
-			// Voluntary-completion teardown: the still-running sidecar was stopped
-			// (SIGTERM under the 30s pod grace; the hook released it).
+			// Terminal teardown: the still-running sidecar was stopped (SIGTERM under
+			// the 30s pod grace; the hook released it).
 			waitFor(t, 5*time.Second, "sidecar teardown signal", func() bool {
 				for _, s := range rec.sentSignals() {
-					if s.pid == 1001 && s.sig == termSignal {
+					if s.pid == pidSC && s.sig == termSignal {
 						return true
 					}
 				}
