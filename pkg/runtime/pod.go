@@ -501,6 +501,19 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("spawn container %s: %w", c.GetName(), err)
 	}
 
+	// Durably record the spawned process group BEFORE the spawn is acknowledged
+	// (the startup pod reap's input, podreap.go). Failure fails the container:
+	// an unrecorded pod process would be invisible to the reap and could orphan
+	// across a daemon death — exactly the hole the record exists to close. The
+	// just-spawned group is torn down through the injected seam (not a direct
+	// supervisor call) so the failure path is unit-observable.
+	if err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID()); err != nil {
+		_ = r.signalGroup(proc.PID(), killSignal)
+		_ = cleanup()
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+			fmt.Errorf("record container %s process group: %w", c.GetName(), err)
+	}
+
 	// Reap-completion goroutine: when the container exits, record terminated
 	// state, clean up the staged profile, and publish a status update. It runs under
 	// the pod-lifetime supervision ctx (above), so it outlives the CreatePod RPC and
@@ -515,6 +528,17 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	code, sig, err := cp.proc.Wait(ctx)
 	if cleanup != nil {
 		_ = cleanup()
+	}
+
+	// Drop the durable reap record ONLY once the process GROUP is empty. The
+	// leader exit that unblocked Wait does not imply forked grandchildren are
+	// gone (the drain-wait below exists precisely because they commonly are
+	// not), and on the ctx-cancel arm the leader itself may still be alive — so
+	// removing the record here unconditionally would erase a live process's
+	// record. A record left behind is harmless (identity-guarded) and is
+	// retired by DeletePod's teardown or the next startup reap's group probe.
+	if members, ok := r.procGroup(cp.proc.PID()); ok && len(members) == 0 {
+		r.removePodProcRecord(p.box.GetPodId(), cp.proc.PID())
 	}
 
 	// Wait for the container's log pump to copy the dying child's combined output to

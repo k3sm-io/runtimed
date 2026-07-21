@@ -29,8 +29,10 @@
 (allow mach-lookup
   (global-name "com.apple.dnssd.service")
   (global-name "com.apple.mDNSResponder"))
-;; PROTECTED: deny user homes, the secrets/state store, and the
-;; shared pods root (sibling pods) — read+write, AFTER the allows.
+;; PROTECTED: deny user homes, the secrets/state store, the
+;; shared pods root AND the daemon-private podreap store (sibling
+;; dirs under the work-dir) — read+write, AFTER the allows so a
+;; caller's extra path (even an ancestor work-dir grant) can't win.
 (deny file-read* file-write*
   (subpath "/Users"))
 (deny file-read* file-write*
@@ -38,6 +40,8 @@
 (deny file-read* file-write*
   (subpath "/var/lib/k3sm/pods")
   (subpath "/private/var/lib/k3sm/pods")
+  (subpath "/var/lib/k3sm/podreap")
+  (subpath "/private/var/lib/k3sm/podreap")
   )
 ;; dyld cryptex: deny WRITE only (read is needed at link time).
 (deny file-write*

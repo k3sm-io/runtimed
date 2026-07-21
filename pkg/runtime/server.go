@@ -169,6 +169,10 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	if err := r.removePodDir(req.GetPodId()); err != nil {
 		r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 	}
+	// Drop the pod's reap records: its groups were just SIGKILL-escalated above,
+	// so the durable records (stored outside the pod dir, so removePodDir does
+	// not touch them) have served their purpose.
+	r.removePodReapRecords(req.GetPodId())
 	return &runtimev1.DeletePodResponse{}, nil
 }
 
