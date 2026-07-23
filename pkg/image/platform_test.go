@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -47,11 +48,18 @@ import (
 
 // ---------------------------------------------------------------------------
 // Fixtures. The end-to-end cases run against go-containerregistry's in-module
-// pkg/registry over httptest: it pulls in only stdlib + ggcr-internal packages,
-// so it adds no go.mod requirement, and name.Registry.Scheme() returns http for
-// a 127.0.0.1:PORT authority (reLoopback), so no TLS fixture is needed. Every
+// pkg/registry over httptest, and name.Registry.Scheme() returns http for a
+// 127.0.0.1:PORT authority (reLoopback), so no TLS fixture is needed. Every
 // response is a 200 or a 404 — never a retryable 5xx, which ggcr would retry
 // with a 1s backoff and turn a 10ms assertion into a multi-second "flake".
+//
+// Its dependency COST, stated honestly: pkg/registry's own code pulls in only
+// stdlib + ggcr-internal packages, so go.mod gained no requirement — but go.sum
+// gained 4 lines (golang.org/x/mod, golang.org/x/tools). That is not
+// pkg/registry itself: its depcheck_test.go imports ggcr's internal/depcheck,
+// which imports golang.org/x/tools/go/packages, and `go mod tidy` records the
+// checksums needed to build the tests of every imported package (`go test all`).
+// Nothing new is linked into the daemon.
 // ---------------------------------------------------------------------------
 
 // testRegistry starts an in-process OCI registry and returns its host:port.
@@ -738,6 +746,54 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		}
 	})
 
+	t.Run("select/digest_less_child_never_selected", func(t *testing.T) {
+		// A child that OMITS the digest key never invokes v1.Hash.UnmarshalJSON
+		// (an absent JSON key is not decoded at all), so it keeps the ZERO
+		// v1.Hash — which renders as ":" and is otherwise a perfectly selectable
+		// image child. Selection is first-match-wins, so a hostile index can
+		// place a digest-less darwin/arm64 child AHEAD of the real one and
+		// deterministically shadow it. The outcome stays fail-closed downstream
+		// (ggcr refuses the malformed reference), but the allowlist is POSITIVE
+		// and the OCI spec makes digest REQUIRED, so it is rejected here.
+		t.Run("absent_digest_key_parses_as_a_selectable_zero_hash", func(t *testing.T) {
+			var idx ggcrv1.IndexManifest
+			body := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[` +
+				`{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":1,` +
+				`"platform":{"os":"darwin","architecture":"arm64"}}]}`
+			if err := json.Unmarshal([]byte(body), &idx); err != nil {
+				t.Fatalf("an index whose child omits digest must still parse: %v", err)
+			}
+			if got := idx.Manifests[0].Digest.String(); got != ":" {
+				t.Fatalf("digest of a digest-less child = %q, want the zero hash %q", got, ":")
+			}
+			if !idx.Manifests[0].MediaType.IsImage() {
+				t.Fatal("the child is not image-typed, so this fixture proves nothing")
+			}
+			if _, err := SelectManifest(&idx, mustCandidates(t, nativePolicy())); !errors.Is(err, ErrNoPlatformMatch) {
+				t.Fatalf("error = %v, want ErrNoPlatformMatch", err)
+			}
+		})
+		t.Run("cannot_shadow_the_real_child", func(t *testing.T) {
+			shadow := imageDesc("a", "darwin", "arm64", "")
+			shadow.Digest = ggcrv1.Hash{}
+			genuine := imageDesc("b", "darwin", "arm64", "")
+			got, err := SelectManifest(indexOf(shadow, genuine), mustCandidates(t, nativePolicy()))
+			if err != nil {
+				t.Fatalf("SelectManifest: %v", err)
+			}
+			if got.Digest != genuine.Digest {
+				t.Errorf("selected %q, want the child with a real digest %s", got.Digest, genuine.Digest)
+			}
+		})
+		t.Run("empty_hex_is_rejected_too", func(t *testing.T) {
+			half := imageDesc("a", "darwin", "arm64", "")
+			half.Digest = ggcrv1.Hash{Algorithm: "sha256"}
+			if _, err := SelectManifest(indexOf(half), mustCandidates(t, nativePolicy())); !errors.Is(err, ErrNoPlatformMatch) {
+				t.Fatalf("error = %v, want ErrNoPlatformMatch", err)
+			}
+		})
+	})
+
 	t.Run("select/unknown_unknown_skipped_and_unlisted", func(t *testing.T) {
 		idx := indexOf(
 			imageDesc("a", "unknown", "unknown", ""),
@@ -979,6 +1035,105 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		}
 		if strings.Contains(msg, "arch11") {
 			t.Errorf("error %q renders past the cap", msg)
+		}
+	})
+
+	t.Run("error/available_is_deduplicated", func(t *testing.T) {
+		// Two children of the same platform are one entry, so a 500-child index
+		// of one platform does not exhaust the collection cap with repeats.
+		_, err := SelectManifest(indexOf(
+			imageDesc("a", "linux", "amd64", ""),
+			imageDesc("b", "linux", "amd64", ""),
+			imageDesc("c", "linux", "riscv64", ""),
+		), mustCandidates(t, nativePolicy()))
+		var mm *PlatformMismatchError
+		if !errors.As(err, &mm) {
+			t.Fatalf("error %v is not a *PlatformMismatchError", err)
+		}
+		if len(mm.Available) != 2 || mm.Omitted != 0 {
+			t.Errorf("Available = %v (omitted %d), want the 2 distinct platforms", mm.Available, mm.Omitted)
+		}
+	})
+
+	t.Run("error/bounded_third_party_error_keeps_its_chain", func(t *testing.T) {
+		// boundErr caps the RENDERING of a foreign error, not the error: a
+		// caller must still be able to classify the cause. (ggcr's transport
+		// errors are the real case — errors.As on a *transport.Error is how a
+		// consumer tells an auth failure from a 404.)
+		cause := errors.New("registry said no")
+		hostile := fmt.Errorf("%w: %s", cause, strings.Repeat("é", 4096))
+		wrapped := fmt.Errorf("pull %q: %w", "example.com/x:v1", boundErr(hostile))
+		if !errors.Is(wrapped, cause) {
+			t.Error("boundErr dropped the cause: errors.Is no longer reaches it")
+		}
+		msg := wrapped.Error()
+		if len(msg) > maxWrappedErrLen*4 {
+			t.Errorf("bounded message is %d bytes for a %d-byte cause", len(msg), len(hostile.Error()))
+		}
+		if !utf8.ValidString(msg) {
+			t.Errorf("bounded message is not valid UTF-8: %q", msg)
+		}
+		if strings.ContainsAny(msg, "\n\r\x1b") {
+			t.Errorf("bounded message carries a raw control character: %q", msg)
+		}
+	})
+
+	t.Run("error/hand_built_carrier_is_still_capped", func(t *testing.T) {
+		// PlatformMismatchError is exported with exported fields, so a consumer
+		// (or a future in-repo caller) can build one that never went through
+		// availablePlatforms. Rendering therefore keeps its own cap.
+		var many []Platform
+		for i := 0; i < maxRenderedPlatforms*3; i++ {
+			many = append(many, Platform{OS: "linux", Architecture: fmt.Sprintf("arch%d", i)})
+		}
+		err := error(&PlatformMismatchError{Wanted: []Platform{platDarwinARM64}, Available: many})
+		msg := err.Error()
+		if want := fmt.Sprintf("(+%d more)", len(many)-maxRenderedPlatforms); !strings.Contains(msg, want) {
+			t.Errorf("error %q does not collapse the tail with %q", msg, want)
+		}
+		if strings.Contains(msg, fmt.Sprintf("arch%d", len(many)-1)) {
+			t.Errorf("error %q renders past the render cap", msg)
+		}
+	})
+
+	t.Run("error/available_is_capped_at_collection", func(t *testing.T) {
+		// maxRenderedPlatforms caps what is PRINTED. Without a COLLECTION cap the
+		// carrier still retains one Platform per index child — over an index
+		// bounded only by ggcr's 100 MiB manifest limit (~700k descriptors), that
+		// is hundreds of MB held alive by a single error value.
+		const children = 64
+		var many []ggcrv1.Descriptor
+		for i := 0; i < children; i++ {
+			many = append(many, imageDesc("a", "linux", fmt.Sprintf("arch%d", i), strings.Repeat("Z", 4096)))
+		}
+		_, err := SelectManifest(indexOf(many...), mustCandidates(t, nativePolicy()))
+		var mm *PlatformMismatchError
+		if !errors.As(err, &mm) {
+			t.Fatalf("error %v is not a *PlatformMismatchError", err)
+		}
+		if len(mm.Available) > maxCollectedPlatforms {
+			t.Errorf("Available retains %d platforms, want <= %d", len(mm.Available), maxCollectedPlatforms)
+		}
+		// Stated absolutely as well as symbolically: retention must not scale
+		// with the index, whatever the constants are later tuned to.
+		if len(mm.Available) >= children {
+			t.Errorf("Available retains %d of %d children — retention scales with the index", len(mm.Available), children)
+		}
+		if got := len(mm.Available) + mm.Omitted; got != children {
+			t.Errorf("Available(%d) + Omitted(%d) = %d, want %d: the children are not accounted for",
+				len(mm.Available), mm.Omitted, got, children)
+		}
+		for _, p := range mm.Available {
+			for _, tok := range []string{p.OS, p.Architecture, p.Variant, p.OSVersion} {
+				if len(tok) > maxTokenLen+1 {
+					t.Errorf("a retained token is %d bytes, want <= %d", len(tok), maxTokenLen+1)
+				}
+			}
+		}
+		// The rendered tail still accounts for every child, so capping retention
+		// does not cost the human the "there were more" signal.
+		if want := fmt.Sprintf("(+%d more)", children-maxRenderedPlatforms); !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not report %q", err, want)
 		}
 	})
 

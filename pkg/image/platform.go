@@ -144,6 +144,30 @@ func (p Platform) isUnknown() bool {
 	return p.OS == "unknown" || p.Architecture == "unknown"
 }
 
+// boundTokens returns p with every token capped at maxTokenLen bytes. It is
+// applied when a registry-controlled platform is RETAINED (in an error), never
+// on the matching path: a token longer than any candidate can never match one,
+// so nothing is lost, and the cut is safe because the render boundary
+// (sanitizeToken) escapes whatever byte it lands on.
+func (p Platform) boundTokens() Platform {
+	return Platform{
+		OS:           boundToken(p.OS),
+		Architecture: boundToken(p.Architecture),
+		Variant:      boundToken(p.Variant),
+		OSVersion:    boundToken(p.OSVersion),
+	}
+}
+
+// boundToken caps one token's LENGTH. Charset is not its business — that is the
+// render boundary's job (sanitizeToken), which still sees an over-long token as
+// over-long because the cut is one byte past the cap.
+func boundToken(s string) string {
+	if len(s) > maxTokenLen {
+		return s[:maxTokenLen+1]
+	}
+	return s
+}
+
 // normalizeToken trims and lowercases one platform token. OCI os/architecture
 // values are lowercase GOOS/GOARCH strings by convention; folding case here
 // cannot cross an ABI boundary (there is no platform that differs from another
@@ -291,6 +315,8 @@ const attestationRefType = "vnd.docker.reference.type"
 //
 //   - its media type is an image manifest type (never an index — see
 //     ErrNestedIndex — and never an unknown type);
+//   - it carries a non-empty digest (see selectableChild: an absent digest key
+//     leaves the zero v1.Hash, which is otherwise selectable);
 //   - it declares a platform. A child with NO platform field is UNKNOWN and is
 //     skipped. go-containerregistry does the opposite: index.go substitutes its
 //     package default (linux/amd64) for a nil child platform, which is how a
@@ -336,11 +362,21 @@ func SelectManifest(idx *ggcrv1.IndexManifest, want []Platform) (ggcrv1.Descript
 		}
 	}
 
-	return ggcrv1.Descriptor{}, &PlatformMismatchError{Wanted: wanted, Available: availablePlatforms(idx)}
+	available, omitted := availablePlatforms(idx)
+	return ggcrv1.Descriptor{}, &PlatformMismatchError{Wanted: wanted, Available: available, Omitted: omitted}
 }
 
 // selectableChild is the positive allowlist SelectManifest applies to one index
 // child. See SelectManifest for the rationale of each clause.
+//
+// The digest clause closes a first-match-wins shadowing move: an ABSENT digest
+// key never invokes v1.Hash.UnmarshalJSON (an absent JSON key is not decoded at
+// all), so the child keeps the ZERO v1.Hash — which renders as ":" and is
+// otherwise perfectly selectable. A hostile index could then place a digest-less
+// darwin/arm64 child AHEAD of the real one and deterministically shadow it. The
+// end state was already fail-closed (go-containerregistry refuses the malformed
+// reference downstream), but this allowlist is POSITIVE and the OCI spec makes
+// digest REQUIRED, so the child is rejected here rather than downstream.
 //
 // The artifactType clause is narrow ON PURPOSE. Per the OCI 1.1 descriptor
 // rules a plain image's artifactType defaults to its CONFIG media type — and
@@ -354,6 +390,9 @@ func selectableChild(d ggcrv1.Descriptor) bool {
 		return false
 	}
 	if d.Platform == nil {
+		return false
+	}
+	if d.Digest.Algorithm == "" || d.Digest.Hex == "" {
 		return false
 	}
 	if d.ArtifactType != "" && !types.MediaType(d.ArtifactType).IsConfig() {
@@ -380,28 +419,46 @@ func platformFromGGCR(p ggcrv1.Platform) Platform {
 }
 
 // availablePlatforms lists, de-duplicated and in index order, the platforms idx
-// actually offers — the "image provides ..." half of a mismatch error. Children
-// with no platform contribute nothing (there is no name to report) and the
-// unknown/unknown attestation markers are excluded so the message a human reads
-// names only real platforms.
-func availablePlatforms(idx *ggcrv1.IndexManifest) []Platform {
-	seen := make(map[Platform]struct{}, len(idx.Manifests))
-	out := make([]Platform, 0, len(idx.Manifests))
+// actually offers — the "image provides ..." half of a mismatch error — plus the
+// number of further platform-bearing children it deliberately did NOT retain.
+// Children with no platform contribute nothing (there is no name to report) and
+// the unknown/unknown attestation markers are excluded so the message a human
+// reads names only real platforms.
+//
+// The cap is applied at COLLECTION, not at rendering: maxRenderedPlatforms
+// bounds what is PRINTED, but without this the returned error would RETAIN one
+// Platform (and its map entry) per index child, over an index bounded only by
+// go-containerregistry's 100 MiB manifest limit — hundreds of MB of hostile
+// content held alive by one error value. Each retained token is length-bounded
+// for the same reason; charset sanitising still happens once, at the render
+// boundary (Platform.String), so this is a memory bound and not a second
+// sanitiser.
+//
+// Beyond the cap the children are no longer de-duplicated (de-duplicating them
+// needs exactly the unbounded map this cap removes), so the returned count is an
+// UPPER BOUND on the platforms not shown, not an exact distinct count.
+func availablePlatforms(idx *ggcrv1.IndexManifest) (out []Platform, omitted int) {
+	seen := make(map[Platform]struct{}, maxCollectedPlatforms)
+	out = make([]Platform, 0, maxCollectedPlatforms)
 	for _, d := range idx.Manifests {
 		if d.Platform == nil {
 			continue
 		}
-		p := platformFromGGCR(*d.Platform)
+		p := platformFromGGCR(*d.Platform).boundTokens()
 		if p.isUnknown() {
 			continue
 		}
 		if _, dup := seen[p]; dup {
 			continue
 		}
+		if len(out) == maxCollectedPlatforms {
+			omitted++
+			continue
+		}
 		seen[p] = struct{}{}
 		out = append(out, p)
 	}
-	return out
+	return out, omitted
 }
 
 // VerifyConfigPlatform checks an image's OWN CONFIG against the candidates and
@@ -454,6 +511,10 @@ const (
 	// maxRenderedPlatforms bounds how many platforms one list names before it
 	// collapses to a "(+N more)" tail.
 	maxRenderedPlatforms = 8
+	// maxCollectedPlatforms bounds how many platforms a mismatch error RETAINS
+	// (see availablePlatforms). It matches maxRenderedPlatforms because holding
+	// more than is ever printed only feeds a hostile index.
+	maxCollectedPlatforms = maxRenderedPlatforms
 	// maxErrorLen bounds the whole rendered message.
 	maxErrorLen = 512
 	// maxMediaTypeLen bounds a rendered media type.
@@ -485,14 +546,21 @@ const truncatedSuffix = " (truncated)"
 type PlatformMismatchError struct {
 	// Wanted is the candidate list, in preference order.
 	Wanted []Platform
-	// Available is what the image offers (attestation markers excluded).
+	// Available is what the image offers (attestation markers excluded), CAPPED
+	// at maxCollectedPlatforms entries with every token length-bounded, so one
+	// error can never retain a hostile index's whole manifest list.
 	Available []Platform
+	// Omitted is how many further platform-bearing children the image offered
+	// beyond Available. Past the cap the children are no longer de-duplicated,
+	// so it is an UPPER BOUND on the platforms not named, not an exact distinct
+	// count (see availablePlatforms).
+	Omitted int
 }
 
 // Error renders the mismatch, sanitised and bounded.
 func (e *PlatformMismatchError) Error() string {
 	msg := fmt.Sprintf("%s: want [%s], image provides [%s]",
-		ErrNoPlatformMatch.Error(), renderPlatforms(e.Wanted), renderPlatforms(e.Available))
+		ErrNoPlatformMatch.Error(), renderPlatforms(e.Wanted, 0), renderPlatforms(e.Available, e.Omitted))
 	if len(msg) > maxErrorLen {
 		// Safe to cut on a byte boundary: every token was already sanitised to
 		// ASCII — conforming ([A-Za-z0-9._-]), or a strconv.QuoteToASCII literal
@@ -510,9 +578,11 @@ func (e *PlatformMismatchError) Error() string {
 func (e *PlatformMismatchError) Unwrap() error { return ErrNoPlatformMatch }
 
 // renderPlatforms joins a platform list for a message, capped at
-// maxRenderedPlatforms with a "(+N more)" tail.
-func renderPlatforms(ps []Platform) string {
-	if len(ps) == 0 {
+// maxRenderedPlatforms with a "(+N more)" tail. omitted is what the COLLECTION
+// cap already dropped (availablePlatforms), so the tail still tells a human how
+// much the image offered beyond what is named.
+func renderPlatforms(ps []Platform, omitted int) string {
+	if len(ps) == 0 && omitted == 0 {
 		return "none"
 	}
 	shown := ps
@@ -523,8 +593,8 @@ func renderPlatforms(ps []Platform) string {
 	for _, p := range shown {
 		parts = append(parts, p.String())
 	}
-	if len(ps) > len(shown) {
-		parts = append(parts, fmt.Sprintf("(+%d more)", len(ps)-len(shown)))
+	if extra := len(ps) - len(shown) + omitted; extra > 0 {
+		parts = append(parts, fmt.Sprintf("(+%d more)", extra))
 	}
 	return strings.Join(parts, ", ")
 }
