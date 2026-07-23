@@ -22,22 +22,31 @@ import (
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/random"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 // fakeFetch returns a fixed in-memory image, counting calls so the test can
 // assert the cache hit path does (or does not) re-fetch. It also records the last
-// credential it received (M2.6) so a test can assert the imagePullSecret reaches
-// the pull client.
+// credential it received (M2.6) and the last platform policy (B99) so a test can
+// assert both reach the pull client.
 type fakeFetch struct {
-	img      ggcrv1.Image
-	calls    int
-	lastCred *RegistryCredential
+	img        ggcrv1.Image
+	calls      int
+	lastCred   *RegistryCredential
+	lastPolicy PlatformPolicy
 }
 
-func (f *fakeFetch) fetch(_ context.Context, _ string, cred *RegistryCredential) (ggcrv1.Image, error) {
+func (f *fakeFetch) fetch(_ context.Context, _ string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
 	f.calls++
 	f.lastCred = cred
+	f.lastPolicy = policy
 	return f.img, nil
+}
+
+// nativePolicy is the darwin/arm64-only policy the pkg/image tests pull under.
+func nativePolicy() PlatformPolicy {
+	return PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 }
 
 // TestPullCachesAndHits is the unit form of acceptance M1.1-a1: the first pull
@@ -56,7 +65,7 @@ func TestPullCachesAndHits(t *testing.T) {
 	}
 	p := NewPuller(cache, ff.fetch)
 
-	res1, err := p.Pull(context.Background(), "example.com/app:v1", nil)
+	res1, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
 	if err != nil {
 		t.Fatalf("first pull: %v", err)
 	}
@@ -79,7 +88,7 @@ func TestPullCachesAndHits(t *testing.T) {
 		}
 	}
 
-	res2, err := p.Pull(context.Background(), "example.com/app:v1", nil)
+	res2, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
 	if err != nil {
 		t.Fatalf("second pull: %v", err)
 	}
@@ -108,7 +117,7 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 	p := NewPuller(cache, ff.fetch)
 
 	cred := &RegistryCredential{Username: "robot", Password: "s3cret"}
-	if _, err := p.Pull(context.Background(), "example.com/private/app:v1", cred); err != nil {
+	if _, err := p.Pull(context.Background(), "example.com/private/app:v1", cred, nativePolicy()); err != nil {
 		t.Fatalf("pull with cred: %v", err)
 	}
 	if ff.lastCred == nil {
@@ -116,6 +125,10 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 	}
 	if ff.lastCred.Username != "robot" || ff.lastCred.Password != "s3cret" {
 		t.Errorf("fetch received cred %+v, want robot/s3cret", ff.lastCred)
+	}
+	// B99: the per-call platform policy rides the same seam and is not dropped.
+	if ff.lastPolicy != nativePolicy() {
+		t.Errorf("fetch received policy %+v, want %+v", ff.lastPolicy, nativePolicy())
 	}
 }
 

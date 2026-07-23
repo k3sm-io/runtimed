@@ -18,16 +18,16 @@ package image
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-
-	"github.com/google/go-containerregistry/pkg/name"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -66,15 +66,43 @@ func (c *RegistryCredential) authenticator() authn.Authenticator {
 }
 
 // FetchFunc resolves an image reference to a go-containerregistry image, using
-// cred for private-registry auth (nil = anonymous). The production fetcher is
+// cred for private-registry auth (nil = anonymous) and policy to decide WHICH
+// platform of a multi-platform image to resolve. The production fetcher is
 // RemoteFetch (a registry pull); tests inject an in-memory image so pull/cache
 // logic is exercised with no network.
-type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential) (ggcrv1.Image, error)
+//
+// policy is a per-call argument (see PlatformPolicy): the effective sandbox
+// backend is decided per pod, so it cannot be fixed at Puller construction.
+type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error)
 
-// RemoteFetch fetches ref from a remote registry. It is the production FetchFunc.
-// When cred is non-nil it authenticates with that credential (the imagePullSecret,
-// M2.6); the credential lives only in this transport, never on disk.
-func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential) (ggcrv1.Image, error) {
+// RemoteFetch fetches ref from a remote registry, resolving a multi-platform
+// image to the one manifest policy allows. It is the production FetchFunc, and
+// it is GLUE: every decision it makes lives in the pure, exported seams of
+// platform.go (Candidates / SelectManifest / VerifyConfigPlatform).
+//
+// When cred is non-nil it authenticates with that credential (the
+// imagePullSecret, M2.6); the credential lives only in this transport, never on
+// disk.
+//
+// It closes every re-entry point for go-containerregistry's implicit
+// linux/amd64 default (remote.makeOptions seeds options.platform with it):
+//
+//   - remote.WithPlatform is never passed, and remote.Image is never called on a
+//     tag/ambiguous reference — the index is traversed explicitly here;
+//   - Descriptor.Image() is called ONLY after the descriptor's media type is
+//     asserted to be an image type, never on an index (where it would resolve
+//     the child by the defaulted platform);
+//   - ImageIndex.Image(hash) is never called (same defaulting);
+//   - the selected child is re-resolved by EXPLICIT DIGEST
+//     (ref.Context().Digest(...)), which go-containerregistry verifies against
+//     the bytes it received;
+//   - the resolved image's own config is verified last, so a mislabelled index
+//     entry cannot smuggle a foreign-platform image through.
+func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
+	want, err := Candidates(policy)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
 	r, err := name.ParseReference(ref)
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w", ref, err)
@@ -83,11 +111,78 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential) (ggc
 	if cred != nil {
 		opts = append(opts, remote.WithAuth(cred.authenticator()))
 	}
-	img, err := remote.Image(r, opts...)
+	desc, err := remote.Get(r, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
+	img, err := resolveImage(r, desc, want, opts)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
+	// The child's own config is the authority — an index descriptor's platform
+	// is unsigned parent metadata (see VerifyConfigPlatform).
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: image config: %w", ref, err)
+	}
+	if _, err := VerifyConfigPlatform(cfg, want); err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
 	return img, nil
+}
+
+// resolveImage turns the fetched manifest descriptor into the one image want
+// allows: an index is traversed explicitly, a single manifest is taken as-is
+// (and verified by the caller), anything else is refused.
+func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, opts []remote.Option) (ggcrv1.Image, error) {
+	switch {
+	case desc.MediaType.IsIndex():
+		var idx ggcrv1.IndexManifest
+		if err := json.Unmarshal(desc.Manifest, &idx); err != nil {
+			return nil, fmt.Errorf("parse image index: %w", err)
+		}
+		selected, err := SelectManifest(&idx, want)
+		if err != nil {
+			return nil, err
+		}
+		return imageByDigest(r.Context().Digest(selected.Digest.String()), opts)
+	case desc.MediaType.IsImage():
+		// Safe: Descriptor.Image() applies the (defaulted) platform ONLY on the
+		// index branch, which this is not.
+		return desc.Image()
+	default:
+		// Decided verdict: REFUSE anything else rather than guess. This covers
+		// the legacy Docker schema-1 types (which carry no platform information
+		// at all) and a registry that serves a manifest with a missing or
+		// unrecognised Content-Type — the OCI distribution spec requires that
+		// header, and go-containerregistry's alternative (assume "image" and
+		// warn) is precisely the kind of guess this item removes. The error
+		// names the media type, so the case is diagnosable.
+		return nil, fmt.Errorf("unsupported manifest media type %s: %w",
+			quoteBounded(string(desc.MediaType), maxMediaTypeLen), ErrNoPlatformMatch)
+	}
+}
+
+// imageByDigest resolves one index child by its EXPLICIT digest.
+// go-containerregistry verifies the returned bytes against that digest, and the
+// media type is re-asserted here so an index can never reach Descriptor.Image()
+// (where the linux/amd64 default would resolve a child for us).
+//
+// name.Repository.Digest does not itself validate the string, but the digest
+// reaching it came from a v1.Hash that json.Unmarshal already validated
+// (known algorithm, hex body, exact length), so a malformed value cannot become
+// a request path.
+func imageByDigest(ref name.Digest, opts []remote.Option) (ggcrv1.Image, error) {
+	d, err := remote.Get(ref, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if !d.MediaType.IsImage() {
+		return nil, fmt.Errorf("child %s served media type %s: %w",
+			quoteBounded(ref.DigestStr(), maxDigestLen),
+			quoteBounded(string(d.MediaType), maxMediaTypeLen), ErrNestedIndex)
+	}
+	return d.Image()
 }
 
 // PullResult reports the outcome of a Pull: the resolved manifest (as the apis
@@ -121,11 +216,16 @@ func NewPuller(cache *Cache, fetch FetchFunc) *Puller {
 // reports CacheHit == true (acceptance M1.1-a1). cred (M2.6) is the imagePullSecret
 // credential used for the registry fetch; it is confined to the fetch transport
 // and never written to the cache or pod dir.
-func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential) (*PullResult, error) {
+//
+// policy selects WHICH platform of a multi-platform image is pulled. It is a
+// per-call argument because the sandbox backend is resolved per pod; a zero
+// policy fails closed in the fetcher (see PlatformPolicy). The blob CAS is
+// unaffected — digests are already per-platform.
+func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (*PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	img, err := p.fetch(ctx, ref, cred)
+	img, err := p.fetch(ctx, ref, cred, policy)
 	if err != nil {
 		return nil, err
 	}

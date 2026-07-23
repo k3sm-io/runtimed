@@ -247,24 +247,35 @@ type instantWaiter struct{ code int }
 func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return w.code, 0, nil }
 
 // fakePuller never touches a registry. It records the last credential it received
-// (M2.6) so a test can assert the imagePullSecret reaches the pull client.
+// (M2.6) and the last platform policy (B99) so a test can assert both reach the
+// pull client.
 type fakePuller struct {
 	err error
 
-	mu       sync.Mutex
-	lastCred *image.RegistryCredential
-	lastRef  string
+	mu         sync.Mutex
+	lastCred   *image.RegistryCredential
+	lastRef    string
+	lastPolicy image.PlatformPolicy
 }
 
-func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential) (*image.PullResult, error) {
+func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy) (*image.PullResult, error) {
 	f.mu.Lock()
 	f.lastRef = ref
 	f.lastCred = cred
+	f.lastPolicy = policy
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
 	return &image.PullResult{Manifest: &runtimev1.ImageManifest{}, CacheHit: true}, nil
+}
+
+// policy returns the last platform policy passed to Pull, so a test can assert
+// the host-process spine pulls a native (never a defaulted linux/amd64) image.
+func (f *fakePuller) policy() image.PlatformPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastPolicy
 }
 
 func (f *fakePuller) credential() *image.RegistryCredential {
