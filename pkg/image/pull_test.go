@@ -57,13 +57,16 @@ func TestPullCachesAndHits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("random image: %v", err)
 	}
-	ff := &fakeFetch{img: img}
+	// Pull verifies the fetched image's own config against the policy at the
+	// choke point (B99), so the fixture declares the native platform — a plain
+	// random.Image declares none and is refused.
+	ff := &fakeFetch{img: withPlatform(t, img, "darwin", "arm64", "")}
 
 	cache, err := NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := NewPuller(cache, ff.fetch)
+	p := mustPuller(t, cache, ff.fetch)
 
 	res1, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
 	if err != nil {
@@ -109,12 +112,12 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("random image: %v", err)
 	}
-	ff := &fakeFetch{img: img}
+	ff := &fakeFetch{img: withPlatform(t, img, "darwin", "arm64", "")}
 	cache, err := NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := NewPuller(cache, ff.fetch)
+	p := mustPuller(t, cache, ff.fetch)
 
 	cred := &RegistryCredential{Username: "robot", Password: "s3cret"}
 	if _, err := p.Pull(context.Background(), "example.com/private/app:v1", cred, nativePolicy()); err != nil {

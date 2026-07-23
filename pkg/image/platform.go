@@ -49,6 +49,20 @@ var ErrNoPlatformMatch = errors.New("no image manifest matches a runnable platfo
 // run here" must test both sentinels.
 var ErrNestedIndex = errors.New("image index child is itself an index (nested index traversal is refused)")
 
+// IsTerminalPlatformError reports whether err is a PERMANENT k3sm image-platform
+// refusal: no manifest matches a runnable platform (ErrNoPlatformMatch) or the
+// matching child is itself an index (ErrNestedIndex).
+//
+// The two sentinels stay distinct so each message describes its own failure, but
+// they share one property a consumer must act on: retrying is futile, because
+// nothing about the node or the image will change. This predicate is that shared
+// verdict, so a caller cannot half-implement it — testing only the documented
+// ErrNoPlatformMatch (the natural reading of "this image cannot run here") would
+// park a pod in an infinite ImagePullBackOff over an index-of-index.
+func IsTerminalPlatformError(err error) bool {
+	return errors.Is(err, ErrNoPlatformMatch) || errors.Is(err, ErrNestedIndex)
+}
+
 // Platform is the (os, architecture, variant, os.version) tuple k3sm matches an
 // OCI manifest against.
 //
@@ -442,7 +456,16 @@ const (
 	maxMediaTypeLen = 96
 	// maxDigestLen bounds a rendered digest (algorithm:hex).
 	maxDigestLen = 96
+	// maxWrappedErrLen bounds how much of a THIRD-PARTY error message (a
+	// go-containerregistry parse/transport error, which formats registry-supplied
+	// bytes into itself) k3sm re-renders. It is smaller than maxErrorLen because
+	// the quoted rendering can expand up to 4x, so this is the effective ~1 KiB
+	// ceiling on one embedded foreign message.
+	maxWrappedErrLen = 256
 )
+
+// truncatedSuffix marks a message the whole-message cap cut short.
+const truncatedSuffix = " (truncated)"
 
 // PlatformMismatchError is the typed carrier for a fail-closed platform
 // decision: what the node can run, and what the image actually offers. It
@@ -467,9 +490,13 @@ func (e *PlatformMismatchError) Error() string {
 		ErrNoPlatformMatch.Error(), renderPlatforms(e.Wanted), renderPlatforms(e.Available))
 	if len(msg) > maxErrorLen {
 		// Safe to cut on a byte boundary: every token was already sanitised to
-		// ASCII (conforming, or a quoted escape), so truncation can neither
-		// split a rune nor re-expose a control byte.
-		msg = msg[:maxErrorLen] + " (truncated)"
+		// ASCII — conforming ([A-Za-z0-9._-]), or a strconv.QuoteToASCII literal
+		// whose non-ASCII runes and invalid bytes are \u/\x escapes — so
+		// truncation can neither split a rune nor re-expose a control byte. The
+		// cut therefore leaves a string that is still valid UTF-8, which is what
+		// keeps the google.rpc.Status carrying it marshalable (proto3 strings
+		// reject invalid UTF-8).
+		msg = msg[:maxErrorLen] + truncatedSuffix
 	}
 	return msg
 }
@@ -499,15 +526,22 @@ func renderPlatforms(ps []Platform) string {
 
 // sanitizeToken renders one registry-controlled token safely: a token that is
 // short and inside the [A-Za-z0-9._-] allowlist passes through verbatim (so
-// darwin/arm64/v8 reads naturally); anything else becomes a quoted Go literal,
-// which escapes control characters (newline, ANSI ESC) as \n / \x1b and bounds
-// what a hostile registry can inject into a log line or a Pod status.
+// darwin/arm64/v8 reads naturally); anything else becomes a quoted ASCII Go
+// literal, which escapes control characters (newline, ANSI ESC) as \n / \x1b and
+// bounds what a hostile registry can inject into a log line or a Pod status.
+//
+// QuoteToASCII, never Quote: Quote escapes only NON-PRINTABLE runes, so a
+// printable non-ASCII token (é, あ) survives it as raw multi-byte UTF-8. That
+// would make the whole-message byte cut in PlatformMismatchError.Error able to
+// split a rune, and the resulting invalid UTF-8 makes proto.Marshal reject the
+// google.rpc.Status the failure travels in — a registry-chosen way to suppress
+// the typed failure. ASCII out means every downstream byte boundary is safe.
 func sanitizeToken(s string) string {
 	if len(s) > maxTokenLen {
 		return quoteBounded(s, maxTokenLen)
 	}
 	if !conformingToken(s) {
-		return strconv.Quote(s)
+		return strconv.QuoteToASCII(s)
 	}
 	return s
 }
@@ -526,12 +560,37 @@ func conformingToken(s string) bool {
 	return true
 }
 
-// quoteBounded truncates s to max bytes and renders it as a quoted Go literal.
-// strconv.Quote escapes an invalid UTF-8 byte left by the cut as \x.., so a
-// mid-rune truncation cannot emit a malformed sequence.
+// boundErr wraps a THIRD-PARTY error so embedding it in a k3sm error message
+// cannot echo unbounded registry content. The chain is preserved (Unwrap), so
+// errors.Is/As still see the original cause; only the RENDERING is capped and
+// escaped to ASCII.
+//
+// It is needed because go-containerregistry formats registry-supplied bytes into
+// its own error strings — v1.Hash's parser prints the offending digest verbatim
+// ("unsupported hash: %q"), and transport.Error carries up to 64 KiB of the
+// registry's response body — while the manifest those bytes came from is capped
+// only by ggcr's 100 MiB limit. Everything this package returns reaches slog,
+// the Pod status message and kine, so a foreign message is DATA to be quoted,
+// never a message to be adopted.
+func boundErr(err error) error { return &boundedError{err: err} }
+
+// boundedError is boundErr's carrier.
+type boundedError struct{ err error }
+
+// Error renders the wrapped message capped at maxWrappedErrLen and ASCII-escaped.
+func (e *boundedError) Error() string { return quoteBounded(e.err.Error(), maxWrappedErrLen) }
+
+// Unwrap keeps the original cause visible to errors.Is / errors.As.
+func (e *boundedError) Unwrap() error { return e.err }
+
+// quoteBounded truncates s to max bytes and renders it as a quoted ASCII Go
+// literal. QuoteToASCII escapes every non-ASCII rune as \u.... and any invalid
+// UTF-8 byte left by the cut as \x.., so the result is pure ASCII: a mid-rune
+// truncation cannot emit a malformed sequence, and no later byte-boundary cut of
+// a message built from it can create one either (see sanitizeToken).
 func quoteBounded(s string, max int) string {
 	if len(s) > max {
-		return strconv.Quote(s[:max]) + "..."
+		return strconv.QuoteToASCII(s[:max]) + "..."
 	}
-	return strconv.Quote(s)
+	return strconv.QuoteToASCII(s)
 }

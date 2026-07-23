@@ -18,14 +18,18 @@ package image
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
@@ -35,6 +39,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/protobuf/proto"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -60,6 +66,51 @@ func testRegistry(t *testing.T) string {
 	return u.Host
 }
 
+// rawResponse is one canned registry reply: the Content-Type header (which is
+// where go-containerregistry reads a manifest's media type from) and the exact
+// bytes.
+type rawResponse struct {
+	mediaType string
+	body      []byte
+}
+
+// rawRegistry serves a fixed path → rawResponse map, so a test can choose a
+// hostile or malformed reply byte for byte. ggcr's pkg/registry only publishes
+// WELL-FORMED artifacts, so the fail-closed verdicts that fire on a malformed
+// one — a 200 kB digest algorithm, an unsupported manifest media type, a child
+// SERVED as an index after its parent descriptor promised an image — are
+// unreachable through it. Unknown paths 404 and every served path is a 200, so
+// no reply is retryable (see the fixture header).
+func rawRegistry(t *testing.T, responses map[string]rawResponse) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" { // the ggcr ping: anonymous, no auth challenge
+			return
+		}
+		resp, ok := responses[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", resp.mediaType)
+		w.Header().Set("Docker-Content-Digest", digestOf(resp.body))
+		_, _ = w.Write(resp.body)
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse raw registry url %q: %v", srv.URL, err)
+	}
+	return u.Host
+}
+
+// digestOf is the sha256 descriptor digest of some served bytes — ggcr verifies
+// it whenever the fixture is fetched by digest.
+func digestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 // testImage builds a one-layer image whose CONFIG declares the given platform —
 // the config is what VerifyConfigPlatform reads, so it is what the fixture must
 // control.
@@ -69,6 +120,15 @@ func testImage(t *testing.T, os, arch, variant string) ggcrv1.Image {
 	if err != nil {
 		t.Fatalf("random image: %v", err)
 	}
+	return withPlatform(t, img, os, arch, variant)
+}
+
+// withPlatform rewrites img's CONFIG to declare the given platform. Every
+// fixture that must survive a Pull needs one, because Pull verifies the config
+// against the policy at the choke point and a plain random.Image declares no
+// platform at all.
+func withPlatform(t *testing.T, img ggcrv1.Image, os, arch, variant string) ggcrv1.Image {
+	t.Helper()
 	cf, err := img.ConfigFile()
 	if err != nil {
 		t.Fatalf("config file: %v", err)
@@ -174,6 +234,17 @@ func vmPolicy() PlatformPolicy {
 
 func vmPolicyRosetta() PlatformPolicy {
 	return PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_VM, GuestRosetta: true}
+}
+
+// mustPuller builds a Puller or fails the test — NewPuller has no implicit
+// fetcher, so every caller names the one it means.
+func mustPuller(t *testing.T, cache *Cache, fetch FetchFunc) *Puller {
+	t.Helper()
+	p, err := NewPuller(cache, fetch)
+	if err != nil {
+		t.Fatalf("NewPuller: %v", err)
+	}
+	return p
 }
 
 // mustCandidates fails the test if the policy has no candidates.
@@ -318,9 +389,9 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		}
 	})
 
-	// The production path itself, not a fake: NewPuller(cache, nil) is EXACTLY
-	// how runtime.New builds the daemon's puller, so this subtest is the only
-	// thing standing between a green table and a green table that never
+	// The production path itself, not a fake: NewPuller(cache, RemoteFetch) is
+	// EXACTLY how runtime.New builds the daemon's puller, so this subtest is the
+	// only thing standing between a green table and a green table that never
 	// executed RemoteFetch (the pre-B99 pull tests all replaced the fetcher).
 	t.Run("e2e/production_puller_fails_closed", func(t *testing.T) {
 		ref := pushIndex(t, host, "prodlinuxonly",
@@ -331,13 +402,176 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		p := NewPuller(cache, nil) // nil fetch ⇒ RemoteFetch, as runtime.New does
+		p := mustPuller(t, cache, RemoteFetch) // as runtime.New does
 		res, err := p.Pull(context.Background(), ref, nil, nativePolicy())
 		if res != nil {
 			t.Errorf("a pull result was returned for an unrunnable index: %+v", res.Manifest)
 		}
 		if !errors.Is(err, ErrNoPlatformMatch) {
 			t.Fatalf("error = %v, want ErrNoPlatformMatch", err)
+		}
+	})
+
+	// The binding itself: a Puller has NO default fetcher to fall back to, so a
+	// caller cannot acquire one without naming which fetcher it wants.
+	t.Run("puller/nil_fetch_is_an_error_not_a_default", func(t *testing.T) {
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p, err := NewPuller(cache, nil); err == nil {
+			t.Errorf("NewPuller(cache, nil) returned %+v; a nil fetcher must be refused, not defaulted", p)
+		}
+		if p, err := NewPuller(nil, RemoteFetch); err == nil {
+			t.Errorf("NewPuller(nil, RemoteFetch) returned %+v; a nil cache must be refused", p)
+		}
+	})
+
+	// The choke point: Pull verifies the fetched image's own config against the
+	// policy, so a FetchFunc that skips the check cannot seed the cache with
+	// foreign-platform bytes. The fake below is the in-tree demonstration of that
+	// bypass — a plain random.Image declares no platform at all.
+	t.Run("puller/verifies_platform_at_the_choke_point", func(t *testing.T) {
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := []struct {
+			name string
+			img  ggcrv1.Image
+		}{
+			{"platform_less_image", func() ggcrv1.Image { i, _ := random.Image(64, 1); return i }()},
+			{"foreign_platform_image", linuxAMD64},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				p := mustPuller(t, cache, func(context.Context, string, *RegistryCredential, PlatformPolicy) (ggcrv1.Image, error) {
+					return tc.img, nil
+				})
+				res, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
+				if res != nil {
+					t.Errorf("a pull result was returned for an unrunnable image: %+v", res.Manifest)
+				}
+				if !errors.Is(err, ErrNoPlatformMatch) {
+					t.Fatalf("error = %v, want ErrNoPlatformMatch", err)
+				}
+			})
+		}
+	})
+
+	// -----------------------------------------------------------------
+	// End-to-end against a registry that serves MALFORMED or hostile bytes —
+	// the fail-closed verdicts a conforming registry cannot produce.
+	// -----------------------------------------------------------------
+
+	// A 200 kB digest ALGORITHM. go-containerregistry's v1.Hash parser formats
+	// the offending string into its error verbatim (hash.go "unsupported hash:
+	// %q"), and the index body it came from is capped only by ggcr's 100 MiB
+	// manifest limit — so echoing that error with %w hands a registry a
+	// megabyte-scale write into slog, the Pod status message and kine.
+	hugeAlgorithm := strings.Repeat("z", 200_000)
+
+	t.Run("e2e/index_parse_error_is_bounded", func(t *testing.T) {
+		body := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[` +
+			`{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":2,"digest":"` + hugeAlgorithm + `:abc",` +
+			`"platform":{"os":"darwin","architecture":"arm64"}}]}`)
+		host := rawRegistry(t, map[string]rawResponse{
+			"/v2/badindex/manifests/v1": {mediaType: string(types.OCIImageIndex), body: body},
+		})
+		img, err := RemoteFetch(context.Background(), host+"/badindex:v1", nil, nativePolicy())
+		if img != nil {
+			t.Errorf("an image was returned for an unparseable index")
+		}
+		if err == nil {
+			t.Fatal("an unparseable index must fail closed")
+		}
+		if n := len(err.Error()); n > maxWrappedErrLen*4 {
+			t.Errorf("error message is %d bytes for a %d-byte hostile input: registry content is unbounded",
+				n, len(hugeAlgorithm))
+		}
+		// An index that cannot be parsed can never yield a runnable manifest, so
+		// the failure is TERMINAL — a consumer must not retry it forever.
+		if !IsTerminalPlatformError(err) {
+			t.Errorf("error %v is not a terminal platform error", err)
+		}
+	})
+
+	t.Run("e2e/image_config_parse_error_is_bounded", func(t *testing.T) {
+		// Same ggcr hash parser, reached through the CONFIG blob (a config's
+		// rootfs.diff_ids are v1.Hash values), i.e. the second unbounded echo.
+		cfg := []byte(`{"architecture":"arm64","os":"darwin","rootfs":{"type":"layers","diff_ids":["` +
+			hugeAlgorithm + `:abc"]}}`)
+		mfst := []byte(fmt.Sprintf(
+			`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":%d,"digest":%q},"layers":[]}`,
+			types.OCIManifestSchema1, types.OCIConfigJSON, len(cfg), digestOf(cfg)))
+		host := rawRegistry(t, map[string]rawResponse{
+			"/v2/badconfig/manifests/v1":           {mediaType: string(types.OCIManifestSchema1), body: mfst},
+			"/v2/badconfig/blobs/" + digestOf(cfg): {mediaType: string(types.OCIConfigJSON), body: cfg},
+		})
+		img, err := RemoteFetch(context.Background(), host+"/badconfig:v1", nil, nativePolicy())
+		if img != nil {
+			t.Errorf("an image was returned for an unparseable config")
+		}
+		if err == nil {
+			t.Fatal("an unparseable image config must fail closed")
+		}
+		if n := len(err.Error()); n > maxWrappedErrLen*4 {
+			t.Errorf("error message is %d bytes for a %d-byte hostile input: registry content is unbounded",
+				n, len(hugeAlgorithm))
+		}
+		if !strings.Contains(err.Error(), "image config") {
+			t.Errorf("error %q does not say which step failed", err)
+		}
+	})
+
+	t.Run("e2e/unsupported_manifest_media_type_refused", func(t *testing.T) {
+		// A legacy Docker schema-1 manifest (no platform information at all).
+		// k3sm REFUSES it rather than guessing; ggcr's own alternative is to
+		// assume "image" and warn. The branch is only reachable from a registry
+		// that serves a non-image, non-index Content-Type.
+		host := rawRegistry(t, map[string]rawResponse{
+			"/v2/schema1/manifests/v1": {
+				mediaType: string(types.DockerManifestSchema1Signed),
+				body:      []byte(`{"schemaVersion":1,"name":"schema1","tag":"v1"}`),
+			},
+		})
+		img, err := RemoteFetch(context.Background(), host+"/schema1:v1", nil, nativePolicy())
+		if img != nil {
+			t.Errorf("an image was returned for an unsupported manifest media type")
+		}
+		if !errors.Is(err, ErrNoPlatformMatch) {
+			t.Fatalf("error = %v, want ErrNoPlatformMatch", err)
+		}
+		if !strings.Contains(err.Error(), "schema1") {
+			t.Errorf("error %q does not name the media type, so the case is not diagnosable", err)
+		}
+	})
+
+	t.Run("e2e/served_child_index_is_refused", func(t *testing.T) {
+		// The parent index DESCRIBES the child as an image manifest (so
+		// SelectManifest selects it), and the registry then SERVES an index at
+		// that digest. The descriptor's media type is unsigned parent metadata,
+		// so only re-asserting it on the served child closes this — otherwise
+		// Descriptor.Image() would resolve a child of the nested index by
+		// ggcr's defaulted platform.
+		nested := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
+		parent := []byte(fmt.Sprintf(
+			`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":%d,"digest":%q,`+
+				`"platform":{"os":"darwin","architecture":"arm64"}}]}`,
+			types.OCIImageIndex, types.OCIManifestSchema1, len(nested), digestOf(nested)))
+		host := rawRegistry(t, map[string]rawResponse{
+			"/v2/liarindex/manifests/v1":                  {mediaType: string(types.OCIImageIndex), body: parent},
+			"/v2/liarindex/manifests/" + digestOf(nested): {mediaType: string(types.OCIImageIndex), body: nested},
+		})
+		img, err := RemoteFetch(context.Background(), host+"/liarindex:v1", nil, nativePolicy())
+		if img != nil {
+			t.Errorf("an image was returned for a child SERVED as an index")
+		}
+		if !errors.Is(err, ErrNestedIndex) {
+			t.Fatalf("error = %v, want ErrNestedIndex", err)
+		}
+		if !IsTerminalPlatformError(err) {
+			t.Errorf("error %v is not a terminal platform error", err)
 		}
 	})
 
@@ -698,6 +932,38 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		}
 	})
 
+	t.Run("error/terminality_is_one_predicate", func(t *testing.T) {
+		// Both refusals are PERMANENT, so a consumer must treat them alike or it
+		// parks a pod in an infinite ImagePullBackOff over the one it forgot.
+		// The sentinels stay distinct (each message describes its own failure),
+		// which is exactly why the shared verdict is exported as a predicate.
+		cases := []struct {
+			name string
+			err  error
+			want bool
+		}{
+			{"no_platform_match", ErrNoPlatformMatch, true},
+			{"nested_index", ErrNestedIndex, true},
+			{"typed_carrier", error(&PlatformMismatchError{Wanted: []Platform{platDarwinARM64}}), true},
+			{"wrapped", fmt.Errorf("pull %q: %w", "example.com/x:v1", ErrNestedIndex), true},
+			{"unrelated", errors.New("connection refused"), false},
+			{"nil", nil, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := IsTerminalPlatformError(tc.err); got != tc.want {
+					t.Errorf("IsTerminalPlatformError(%v) = %v, want %v", tc.err, got, tc.want)
+				}
+			})
+		}
+		// ErrNestedIndex is NOT reachable through ErrNoPlatformMatch, so a
+		// consumer testing only the documented sentinel would miss it — the
+		// defect the predicate exists to prevent.
+		if errors.Is(ErrNestedIndex, ErrNoPlatformMatch) {
+			t.Error("ErrNestedIndex must stay distinct from ErrNoPlatformMatch")
+		}
+	})
+
 	t.Run("error/available_list_is_bounded", func(t *testing.T) {
 		var many []ggcrv1.Descriptor
 		for i := 0; i < 12; i++ {
@@ -717,19 +983,54 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	t.Run("error/registry_content_is_sanitised", func(t *testing.T) {
-		hostile := imageDesc("a", "linux",
-			"amd64\n2026-07-22 FATAL forged log line \x1b[31mred\x1b[0m", "")
-		huge := imageDesc("b", "linux", strings.Repeat("A", 4096), "")
-		_, err := SelectManifest(indexOf(hostile, huge), mustCandidates(t, nativePolicy()))
+		// The fixture must be big enough to EXECUTE the whole-message truncation
+		// branch: with two hostile children the rendered message stayed under
+		// maxErrorLen, so this case passed for a reason unrelated to the
+		// mechanism it names. Nine children (each carrying a hostile
+		// architecture AND variant) put it comfortably over the cap.
+		//
+		// The é/あ tokens are PRINTABLE NON-ASCII: strconv.Quote passes them
+		// through as raw multi-byte UTF-8, so a byte-boundary cut of the message
+		// lands mid-rune and emits an invalid UTF-8 string — which
+		// google.golang.org/protobuf then REFUSES to marshal into the proto3
+		// string field of the pod's failure status (rpcStatus/google.rpc.Status),
+		// letting a hostile registry choose whether the operator sees the typed
+		// failure at all. strconv.QuoteToASCII is what makes the cut safe.
+		hostile := []ggcrv1.Descriptor{
+			imageDesc("a", "linux", "amd64\n2026-07-22 FATAL forged log line \x1b[31mred\x1b[0m", ""),
+			imageDesc("b", "linux", strings.Repeat("A", 4096), ""),
+		}
+		for i := 0; i < 9; i++ {
+			hostile = append(hostile, imageDesc(string(rune('c'+i)), "linux",
+				fmt.Sprintf("%d%s", i, strings.Repeat("é", 14)), strings.Repeat("あ", 10)))
+		}
+		_, err := SelectManifest(indexOf(hostile...), mustCandidates(t, nativePolicy()))
 		if !errors.Is(err, ErrNoPlatformMatch) {
 			t.Fatalf("error = %v, want ErrNoPlatformMatch", err)
 		}
 		msg := err.Error()
+		if !strings.HasSuffix(msg, truncatedSuffix) {
+			t.Fatalf("the truncation branch did not execute (%d bytes): %q", len(msg), msg)
+		}
+		// The decisive assertion: the truncated message must still be a legal
+		// proto3 string. A byte-boundary cut is only safe because every token was
+		// rendered ASCII-only.
+		if !utf8.ValidString(msg) {
+			t.Errorf("truncated message is not valid UTF-8 (tail % x): %q", msg[maxErrorLen-4:], msg)
+		}
+		// ... and the consequence itself, not a proxy for it: this string is
+		// carried to the provider in a google.rpc.Status (pkg/runtime rpcStatus →
+		// CreatePodResponse.error), whose Message is a PROTO3 STRING. An invalid
+		// UTF-8 byte makes proto.Marshal fail, so a hostile registry would decide
+		// whether the operator ever sees the typed IMAGE_PULL failure.
+		if _, merr := proto.Marshal(&rpcstatus.Status{Code: 13, Message: msg}); merr != nil {
+			t.Errorf("the failure status carrying this message does not marshal: %v", merr)
+		}
 		if strings.ContainsAny(msg, "\n\r\x1b") {
 			t.Errorf("error message carries a raw control character: %q", msg)
 		}
-		if len(msg) > maxErrorLen+len(" (truncated)") {
-			t.Errorf("error message is %d bytes, want <= %d", len(msg), maxErrorLen+len(" (truncated)"))
+		if len(msg) > maxErrorLen+len(truncatedSuffix) {
+			t.Errorf("error message is %d bytes, want <= %d", len(msg), maxErrorLen+len(truncatedSuffix))
 		}
 		if strings.Contains(msg, strings.Repeat("A", maxTokenLen+1)) {
 			t.Errorf("error message carries an unbounded token: %q", msg)

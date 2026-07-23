@@ -323,7 +323,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	puller := deps.Puller
 	if puller == nil {
-		puller = image.NewPuller(cache, nil)
+		// image.RemoteFetch is named EXPLICITLY: it is the decision that chooses
+		// which platform's bytes a pod runs, so the daemon states its production
+		// fetcher here instead of inheriting a constructor default (B99).
+		p, err := image.NewPuller(cache, image.RemoteFetch)
+		if err != nil {
+			return nil, fmt.Errorf("init image puller: %w", err)
+		}
+		puller = p
 	}
 	signer := deps.Signer
 	if signer == nil {

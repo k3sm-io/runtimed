@@ -19,6 +19,7 @@ package image
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -105,7 +106,7 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	}
 	r, err := name.ParseReference(ref)
 	if err != nil {
-		return nil, fmt.Errorf("parse reference %q: %w", ref, err)
+		return nil, fmt.Errorf("parse reference %q: %w", ref, boundErr(err))
 	}
 	opts := []remote.Option{remote.WithContext(ctx)}
 	if cred != nil {
@@ -113,7 +114,7 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	}
 	desc, err := remote.Get(r, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("pull %q: %w", ref, err)
+		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
 	}
 	img, err := resolveImage(r, desc, want, opts)
 	if err != nil {
@@ -123,7 +124,7 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	// is unsigned parent metadata (see VerifyConfigPlatform).
 	cfg, err := img.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("pull %q: image config: %w", ref, err)
+		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
 	}
 	if _, err := VerifyConfigPlatform(cfg, want); err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
@@ -134,12 +135,22 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 // resolveImage turns the fetched manifest descriptor into the one image want
 // allows: an index is traversed explicitly, a single manifest is taken as-is
 // (and verified by the caller), anything else is refused.
+//
+// Every error it returns is already bounded — either a k3sm platform error or a
+// third-party one passed through boundErr — so the caller re-wraps it without a
+// second bound.
 func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, opts []remote.Option) (ggcrv1.Image, error) {
 	switch {
 	case desc.MediaType.IsIndex():
 		var idx ggcrv1.IndexManifest
 		if err := json.Unmarshal(desc.Manifest, &idx); err != nil {
-			return nil, fmt.Errorf("parse image index: %w", err)
+			// An index whose bytes do not parse can never yield a runnable
+			// manifest, so the verdict is TERMINAL (ErrNoPlatformMatch) and the
+			// json/ggcr message is quoted as bounded DATA rather than adopted:
+			// v1.Hash's parser formats the whole offending digest string into
+			// its error, and the index body is capped only by ggcr's 100 MiB
+			// manifest limit.
+			return nil, fmt.Errorf("parse image index: %v: %w", boundErr(err), ErrNoPlatformMatch)
 		}
 		selected, err := SelectManifest(&idx, want)
 		if err != nil {
@@ -149,7 +160,11 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 	case desc.MediaType.IsImage():
 		// Safe: Descriptor.Image() applies the (defaulted) platform ONLY on the
 		// index branch, which this is not.
-		return desc.Image()
+		img, err := desc.Image()
+		if err != nil {
+			return nil, fmt.Errorf("resolve image manifest: %w", boundErr(err))
+		}
+		return img, nil
 	default:
 		// Decided verdict: REFUSE anything else rather than guess. This covers
 		// the legacy Docker schema-1 types (which carry no platform information
@@ -168,21 +183,29 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 // media type is re-asserted here so an index can never reach Descriptor.Image()
 // (where the linux/amd64 default would resolve a child for us).
 //
-// name.Repository.Digest does not itself validate the string, but the digest
-// reaching it came from a v1.Hash that json.Unmarshal already validated
-// (known algorithm, hex body, exact length), so a malformed value cannot become
-// a request path.
+// name.Repository.Digest does not itself validate the string. What makes that
+// safe is a two-part invariant on the digest reaching it:
+//
+//   - a PRESENT digest key was validated by v1.Hash.UnmarshalJSON during
+//     json.Unmarshal of the index (known algorithm, hex body, exact length);
+//   - an ABSENT digest key never invokes UnmarshalJSON at all — it leaves the
+//     ZERO v1.Hash, which renders as ":" — so selectableChild rejects a child
+//     with an empty algorithm or hex before selection can reach here.
 func imageByDigest(ref name.Digest, opts []remote.Option) (ggcrv1.Image, error) {
 	d, err := remote.Get(ref, opts...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch child %s: %w", quoteBounded(ref.DigestStr(), maxDigestLen), boundErr(err))
 	}
 	if !d.MediaType.IsImage() {
 		return nil, fmt.Errorf("child %s served media type %s: %w",
 			quoteBounded(ref.DigestStr(), maxDigestLen),
 			quoteBounded(string(d.MediaType), maxMediaTypeLen), ErrNestedIndex)
 	}
-	return d.Image()
+	img, err := d.Image()
+	if err != nil {
+		return nil, fmt.Errorf("resolve child %s: %w", quoteBounded(ref.DigestStr(), maxDigestLen), boundErr(err))
+	}
+	return img, nil
 }
 
 // PullResult reports the outcome of a Pull: the resolved manifest (as the apis
@@ -201,13 +224,23 @@ type Puller struct {
 	fetch FetchFunc
 }
 
-// NewPuller returns a Puller writing into cache and fetching via fetch
-// (RemoteFetch if nil).
-func NewPuller(cache *Cache, fetch FetchFunc) *Puller {
-	if fetch == nil {
-		fetch = RemoteFetch
+// NewPuller returns a Puller writing into cache and fetching via fetch.
+//
+// Both arguments are REQUIRED: a nil fetch is an error, never a silent default
+// to RemoteFetch. Which fetcher runs is the decision that chooses which
+// platform's bytes land in the cache, so it is spelled out at the call site that
+// makes it (runtime.New passes image.RemoteFetch) rather than substituted here.
+// An implicit default is the exact shape of bug this package exists to remove —
+// and it also hides the binding from tests, which then cannot tell a production
+// wiring from a mis-wiring.
+func NewPuller(cache *Cache, fetch FetchFunc) (*Puller, error) {
+	if cache == nil {
+		return nil, errors.New("image puller: cache is required")
 	}
-	return &Puller{cache: cache, fetch: fetch}
+	if fetch == nil {
+		return nil, errors.New("image puller: fetch is required (the production fetcher is image.RemoteFetch)")
+	}
+	return &Puller{cache: cache, fetch: fetch}, nil
 }
 
 // Pull fetches ref and stores its config + layer blobs in the content-addressed
@@ -219,15 +252,35 @@ func NewPuller(cache *Cache, fetch FetchFunc) *Puller {
 //
 // policy selects WHICH platform of a multi-platform image is pulled. It is a
 // per-call argument because the sandbox backend is resolved per pod; a zero
-// policy fails closed in the fetcher (see PlatformPolicy). The blob CAS is
-// unaffected — digests are already per-platform.
+// policy fails closed here, before any round trip (see PlatformPolicy). The
+// fetched image's own config is verified against the policy before a single blob
+// is written, so the cache never holds bytes this node cannot run. The blob CAS
+// is unaffected — digests are already per-platform.
 func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (*PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// The policy is resolved BEFORE any round trip (a zero policy fails closed
+	// with no network at all), and the image's own config is verified against it
+	// HERE — at the choke point every pull traverses — not only inside one
+	// FetchFunc. RemoteFetch verifies it too, because it is exported and
+	// independently callable; but a FetchFunc is a SEAM, and a fetcher that
+	// omits the check (or a test fake that returns a platform-less image) must
+	// not be able to put foreign-platform bytes in the cache.
+	want, err := Candidates(policy)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
 	img, err := p.fetch(ctx, ref, cred, policy)
 	if err != nil {
 		return nil, err
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
+	}
+	if _, err := VerifyConfigPlatform(cfg, want); err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
 
 	wroteAny := false
@@ -235,11 +288,11 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	// Config blob.
 	cfgDigest, err := img.ConfigName()
 	if err != nil {
-		return nil, fmt.Errorf("config digest %q: %w", ref, err)
+		return nil, fmt.Errorf("config digest %q: %w", ref, boundErr(err))
 	}
 	rawCfg, err := img.RawConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("config file %q: %w", ref, err)
+		return nil, fmt.Errorf("config file %q: %w", ref, boundErr(err))
 	}
 	wrote, err := p.writeBlob(cfgDigest.String(), func(w io.Writer) error {
 		_, werr := w.Write(rawCfg)
@@ -252,7 +305,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	mfst, err := img.Manifest()
 	if err != nil {
-		return nil, fmt.Errorf("manifest %q: %w", ref, err)
+		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
 	}
 
 	out := &runtimev1.ImageManifest{
@@ -264,12 +317,12 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	layers, err := img.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("layers %q: %w", ref, err)
+		return nil, fmt.Errorf("layers %q: %w", ref, boundErr(err))
 	}
 	for i, layer := range layers {
 		dig, err := layer.Digest()
 		if err != nil {
-			return nil, fmt.Errorf("layer %d digest %q: %w", i, ref, err)
+			return nil, fmt.Errorf("layer %d digest %q: %w", i, ref, boundErr(err))
 		}
 		wrote, err := p.writeBlob(dig.String(), func(w io.Writer) error {
 			rc, oerr := layer.Compressed()
@@ -311,8 +364,10 @@ func (p *Puller) writeBlob(digest string, fill func(io.Writer) error) (wrote boo
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after successful rename
 	if err := fill(tmp); err != nil {
+		// fill streams REGISTRY bytes (layer.Compressed / io.Copy), so its error
+		// is third-party content — bounded, never adopted.
 		tmp.Close()
-		return false, fmt.Errorf("write blob %s: %w", digest, err)
+		return false, fmt.Errorf("write blob %s: %w", digest, boundErr(err))
 	}
 	if err := tmp.Close(); err != nil {
 		return false, fmt.Errorf("close blob %s: %w", digest, err)
