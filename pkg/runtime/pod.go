@@ -1033,11 +1033,11 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 // than a stub: createPod resolves the backend with sandbox.SelectBackend and
 // routes a resolved vm backend to createVMPod BEFORE resolveBinary is reached,
 // so every pull that flows through here is for a darwin host process. When the
-// vm path grows a pull (the OCI -> Linux-rootfs builder, m11-plan §M11.2-d1/d7)
+// vm path grows a pull (the OCI -> Linux-rootfs builder, a later deliverable)
 // it supplies its own policy with Backend = SANDBOX_BACKEND_VM.
 //
-// HostRosetta is false: the host-Rosetta capability probe is B103 (m11-plan
-// §M11.4). Until it lands, a darwin/amd64-only image is REFUSED at pull with a
+// HostRosetta is false: the host-Rosetta capability probe is B103.
+// Until it lands, a darwin/amd64-only image is REFUSED at pull with a
 // legible image.ErrNoPlatformMatch instead of being silently mis-selected.
 func nativePullPolicy() image.PlatformPolicy {
 	return image.PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}

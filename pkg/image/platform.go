@@ -34,7 +34,7 @@ import (
 // it across the k3sm -> runtimed edge.
 //
 // The deliberate divergence from upstream Kubernetes (registered
-// divergent-by-design, m11-plan §M11.2-d0): containerd pulls a mismatched
+// divergent-by-design): containerd pulls a mismatched
 // single-manifest image and the container dies at exec with an opaque
 // exec-format error; k3sm refuses at PULL with a legible error naming the
 // platforms the image actually offers.
@@ -160,14 +160,14 @@ var (
 // have one today. Runtime.resolveBinary (pkg/runtime/pod.go) is reached solely
 // from the host-process spine — createPod routes a resolved vm backend to
 // createVMPod BEFORE resolveBinary, and createVMPod pulls nothing (the OCI ->
-// Linux-rootfs builder is m11-plan §M11.2-d1/d7 and vm exec is §M11.2-d6). The
+// Linux-rootfs builder and vm exec are separate, later deliverables). The
 // vm candidate rows and GuestRosetta are therefore exercised by tests only until
 // those land; a green table here is NOT evidence that vm image selection works
 // end to end.
 //
 // HostRosetta / GuestRosetta are capability INPUTS, not probes: this file stays
-// GOOS-agnostic and cgo-free, and the probes that fill them are B103's job
-// (m11-plan §M11.4). Until B103 lands them the call site passes false, so a
+// GOOS-agnostic and cgo-free, and the probes that fill them are B103's job.
+// Until B103 lands them the call site passes false, so a
 // darwin/amd64-only image is refused with a legible error rather than silently
 // mis-selected.
 type PlatformPolicy struct {
@@ -447,8 +447,8 @@ const (
 // PlatformMismatchError is the typed carrier for a fail-closed platform
 // decision: what the node can run, and what the image actually offers. It
 // Unwraps to ErrNoPlatformMatch so errors.Is keeps working, and it is the shape
-// k3sm/pkg/provider reads to render a Pod status (m11-plan §M11.2-d0,
-// m12-plan §M12.1-d3) without string-matching an error.
+// k3sm/pkg/provider reads to render a Pod status without string-matching an
+// error.
 //
 // Available is REGISTRY-CONTROLLED. Error() is therefore the sanitising choke
 // point: every token is charset-checked (non-conforming tokens are rendered as a

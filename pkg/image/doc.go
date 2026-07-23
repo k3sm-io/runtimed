@@ -28,7 +28,7 @@ limitations under the License.
 //     no path on which go-containerregistry's implicit linux/amd64 default can
 //     fire. platform.go is pure, GOOS-agnostic and cgo-free: the Rosetta
 //     capabilities it consumes are INPUTS, and probing for them belongs to
-//     B103 (m11-plan §M11.4), not here.
+//     B103, not here.
 //   - Pull: fetch an OCI image by reference into a content-addressed blob cache
 //     under /var/lib/k3sm (default; configurable). Blobs are keyed by digest, so
 //     a second pull of the same content is a cache hit.
@@ -64,7 +64,7 @@ limitations under the License.
 // The SUBSTITUTE control for a Linux payload is a different mechanism, not a
 // weakened one: per-layer diffID re-verification when the rootfs is built (so
 // the bytes are self-authenticating against the manifest that was pulled) plus
-// the pinned guest TCB (kernel + init), per B100 and m11-plan §M11.2-d1/d7.
+// the pinned guest TCB (kernel + init), per B100.
 // Platform selection (platform.go) is the upstream half of that chain: it is
 // what guarantees the payload being verified is the one this node asked for.
 package image

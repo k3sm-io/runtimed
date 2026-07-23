@@ -190,7 +190,7 @@ func mustCandidates(t *testing.T, p PlatformPolicy) []Platform {
 // The gate.
 // ---------------------------------------------------------------------------
 
-// TestManifestListPlatformSelection is the B99 gate (m11-plan §M11.2-d0): k3sm
+// TestManifestListPlatformSelection is the B99 gate: k3sm
 // selects the manifest of a multi-platform image by an explicit, fail-closed
 // policy, and there is structurally no path left on which
 // go-containerregistry's implicit linux/amd64 default can fire.
