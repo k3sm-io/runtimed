@@ -59,7 +59,10 @@ type pod struct {
 	// pod rather than riding as a parameter. It is what the image-platform
 	// policy of a pull is derived from (image.PlatformPolicy.Backend is defined
 	// as the resolved backend), so a pull can never be run under a rung the pod
-	// is not actually confined by. Immutable after createPod.
+	// is not actually confined by. Immutable after createPod. A future spine that
+	// assembles a pod of its own (createVMPod, once the live boot lands) records
+	// its own resolved backend here; leaving it zero fails CLOSED at the next
+	// pull (UNSPECIFIED has no image-platform candidates) rather than defaulting.
 	backend runtimev1.SandboxBackend
 
 	mu         sync.Mutex

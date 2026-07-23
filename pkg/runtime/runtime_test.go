@@ -326,6 +326,26 @@ func newTestRuntime(t *testing.T, d Deps) *Runtime {
 // (e.g. the per-pod SBPL egress VIPs) over the same fake subsystem seams.
 func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	t.Helper()
+	d = testDeps(t, d)
+	if d.Puller == nil {
+		d.Puller = &fakePuller{}
+	}
+	if cfg.Root == "" {
+		cfg.Root = t.TempDir()
+	}
+	rt, err := New(cfg, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rt
+}
+
+// testDeps fills the deterministic fake subsystem seams every pkg/runtime unit
+// test shares. It deliberately does NOT default Puller: newTestRuntimeCfg adds
+// the fake one, while the production-wiring test leaves it nil so New builds the
+// daemon's own image.NewPuller(cache, image.RemoteFetch).
+func testDeps(t *testing.T, d Deps) Deps {
+	t.Helper()
 	cache, err := image.NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -348,9 +368,6 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.Waiter == nil {
 		d.Waiter = newBlockingWaiter()
 	}
-	if d.Puller == nil {
-		d.Puller = &fakePuller{}
-	}
 	if d.Signer == nil {
 		d.Signer = &fakeSigner{}
 	}
@@ -370,14 +387,7 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.ProcGroup == nil {
 		d.ProcGroup = func(int) ([]supervisor.ProcMember, bool) { return nil, true }
 	}
-	if cfg.Root == "" {
-		cfg.Root = t.TempDir()
-	}
-	rt, err := New(cfg, d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return rt
+	return d
 }
 
 // hostBinBox builds a minimal valid PodBox running a host-binary container.
