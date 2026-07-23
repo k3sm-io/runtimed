@@ -30,8 +30,11 @@ import (
 
 // ErrNoPlatformMatch is the sentinel every fail-closed platform decision wraps:
 // no manifest in the image declares a platform this node can run. Compare with
-// errors.Is, never by string (GO-STANDARDS §Errors) — k3sm/pkg/provider consumes
-// it across the k3sm -> runtimed edge.
+// errors.Is, never by string (GO-STANDARDS §Errors). Its INTENDED consumer is
+// k3sm/pkg/provider, which will read it across the k3sm -> runtimed edge to
+// render a Pod status; today that repo references neither this sentinel nor
+// PlatformMismatchError, so changing their shape is a runtimed-local change,
+// not a cross-repo break.
 //
 // The deliberate divergence from upstream Kubernetes (registered
 // divergent-by-design): containerd pulls a mismatched
@@ -171,13 +174,14 @@ var (
 // and "no constraint" is precisely the bug this type exists to remove.
 //
 // LIVE CALL SITES (be honest about the green test table): only the NATIVE rows
-// have one today. Runtime.resolveBinary (pkg/runtime/pod.go) is reached solely
-// from the host-process spine — createPod routes a resolved vm backend to
-// createVMPod BEFORE resolveBinary, and createVMPod pulls nothing (the OCI ->
-// Linux-rootfs builder and vm exec are separate, later deliverables). The
-// vm candidate rows and GuestRosetta are therefore exercised by tests only until
-// those land; a green table here is NOT evidence that vm image selection works
-// end to end.
+// have one today. Runtime.resolveBinary (pkg/runtime/pod.go) threads the backend
+// its pod resolved (pod.backend, recorded by createPod from
+// sandbox.SelectBackend) into this field, and it is reached solely from the
+// host-process spine — createPod routes a resolved vm backend to createVMPod
+// BEFORE resolveBinary, and createVMPod pulls nothing (the OCI -> Linux-rootfs
+// builder and vm exec are separate, later deliverables). The vm candidate rows
+// and GuestRosetta are therefore exercised by tests only until those land; a
+// green table here is NOT evidence that vm image selection works end to end.
 //
 // HostRosetta / GuestRosetta are capability INPUTS, not probes: this file stays
 // GOOS-agnostic and cgo-free, and the probes that fill them are B103's job.
@@ -470,8 +474,9 @@ const truncatedSuffix = " (truncated)"
 // PlatformMismatchError is the typed carrier for a fail-closed platform
 // decision: what the node can run, and what the image actually offers. It
 // Unwraps to ErrNoPlatformMatch so errors.Is keeps working, and it is the shape
-// k3sm/pkg/provider reads to render a Pod status without string-matching an
-// error.
+// k3sm/pkg/provider is INTENDED to read so it can render a Pod status without
+// string-matching an error. No such consumer exists yet (grep k3sm: zero
+// references), so today this type is exercised only from within runtimed.
 //
 // Available is REGISTRY-CONTROLLED. Error() is therefore the sanitising choke
 // point: every token is charset-checked (non-conforming tokens are rendered as a

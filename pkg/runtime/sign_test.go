@@ -189,10 +189,13 @@ func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
 	}
 	// (1b) B99: the host-process spine pulls under a NATIVE platform policy, so a
 	// multi-platform image resolves to darwin/arm64 and never to
-	// go-containerregistry's implicit linux/amd64 default.
+	// go-containerregistry's implicit linux/amd64 default. This runs through the
+	// REAL createPod, so it also proves the wiring the unit test cannot: the
+	// backend sandbox.SelectBackend resolved is what reached the puller (an
+	// unset pod.backend would arrive as UNSPECIFIED, which has no candidates).
 	pol := pull.policy()
 	if pol.Backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC {
-		t.Errorf("pull policy backend = %v, want SEATBELT_INPROC (native)", pol.Backend)
+		t.Errorf("pull policy backend = %v, want the resolved SEATBELT_INPROC rung", pol.Backend)
 	}
 	cands, err := image.Candidates(pol)
 	if err != nil {
