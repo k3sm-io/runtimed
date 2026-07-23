@@ -52,6 +52,19 @@ type pod struct {
 	box     *runtimev1.PodBox
 	profile string
 
+	// backend is the sandbox backend sandbox.SelectBackend RESOLVED for this pod
+	// — never the one the PodBox requested. It is recorded once by createPod and
+	// read on every (re-)spawn, including RestartContainer, which re-enters
+	// startContainer long after CreatePod returned; that is why it lives on the
+	// pod rather than riding as a parameter. It is what the image-platform
+	// policy of a pull is derived from (image.PlatformPolicy.Backend is defined
+	// as the resolved backend), so a pull can never be run under a rung the pod
+	// is not actually confined by. Immutable after createPod. A future spine that
+	// assembles a pod of its own (createVMPod, once the live boot lands) records
+	// its own resolved backend here; leaving it zero fails CLOSED at the next
+	// pull (UNSPECIFIED has no image-platform candidates) rather than defaulting.
+	backend runtimev1.SandboxBackend
+
 	mu         sync.Mutex
 	phase      runtimev1.PodPhase
 	reason     string
@@ -323,6 +336,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	p := &pod{
 		box:     box,
 		profile: profile,
+		backend: selected,
 		phase:   runtimev1.PodPhase_POD_PHASE_PENDING,
 		podIP:   ip,
 		supCtx:  podCtx,
@@ -532,7 +546,7 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // kqueue reaper, and the watchContainerExit drain-wait to the pod's lifetime so they
 // survive the unary RPC's return under the daemon split.
 func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
-	binPath, argv, hostBinary, err := r.resolveBinary(ctx, p.box, rootfs, c)
+	binPath, argv, hostBinary, err := r.resolveBinary(ctx, p, rootfs, c)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err
 	}
@@ -977,7 +991,10 @@ const NativeImage = "native"
 // payload. A host binary is already validly signed and lives at a read-only host
 // path, so it must NEVER be ad-hoc re-signed (see gateSignature) — only a pulled,
 // possibly-unsigned image payload in the writable pod rootfs is ad-hoc signed.
-func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, rootfs string, c *runtimev1.Container) (path string, argv []string, hostBinary bool, err error) {
+// p supplies BOTH the PodBox (for the imagePullSecret lookup) and the RESOLVED
+// sandbox backend the pull's image-platform policy is derived from — see
+// pullPolicy and the pod.backend field.
+func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container) (path string, argv []string, hostBinary bool, err error) {
 	cmd := c.GetCommand()
 
 	// Native HostProcess sentinel: run command[0] as an absolute host binary with
@@ -1005,13 +1022,13 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 
 	// Resolve the imagePullSecret credential (M2.6) via the consumer-side seam. It
 	// is passed ONLY to the pull client below and is NEVER written to the pod dir.
-	cred, err := r.pullCredential(ctx, box, c.GetImage())
+	cred, err := r.pullCredential(ctx, p.box, c.GetImage())
 	if err != nil {
 		return "", nil, false, err
 	}
 
 	// Pull + materialize the image into the pod rootfs, then run command/args.
-	if _, err := r.puller.Pull(ctx, c.GetImage(), cred); err != nil {
+	if _, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend)); err != nil {
 		return "", nil, false, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
 	}
 	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
@@ -1024,6 +1041,27 @@ func (r *Runtime) resolveBinary(ctx context.Context, box *runtimev1.PodBox, root
 	argv = append(append([]string{}, cmd...), c.GetArgs()...)
 	argv[0] = bin
 	return bin, argv, false, nil
+}
+
+// pullPolicy is the image-platform policy for a pull, built from the pod's
+// RESOLVED sandbox backend (pod.backend, recorded by createPod) — which is
+// exactly what image.PlatformPolicy.Backend is documented to carry. The resolved
+// value is threaded rather than restated as a constant so the contract and the
+// call site cannot drift: a future native rung whose image-platform class
+// differed would be refused by image.Candidates instead of silently mis-selected
+// through a valid enum value.
+//
+// backend is always a NATIVE rung here — the host-process (Mach-O) spine is the
+// only spine that pulls today (B99). createPod routes a resolved vm backend to
+// createVMPod BEFORE resolveBinary is reached, and createVMPod pulls nothing
+// yet; when the vm path grows a pull (the OCI -> Linux-rootfs builder, a later
+// deliverable) it passes its own resolved backend through this same seam.
+//
+// HostRosetta is false: the host-Rosetta capability probe is B103. Until it
+// lands, a darwin/amd64-only image is REFUSED at pull with a legible
+// image.ErrNoPlatformMatch instead of being silently mis-selected.
+func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
+	return image.PlatformPolicy{Backend: backend}
 }
 
 // pullCredential resolves the registry pull credential for ref from the pod's

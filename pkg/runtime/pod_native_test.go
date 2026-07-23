@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
 )
 
 // TestResolveBinaryNativeSentinel proves the "native" HostProcess sentinel runs
@@ -32,12 +33,12 @@ import (
 func TestResolveBinaryNativeSentinel(t *testing.T) {
 	pull := &fakePuller{}
 	rt := newTestRuntime(t, Deps{Puller: pull})
-	box := hostBinBox("pod-native")
+	p := &pod{box: hostBinBox("pod-native"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 	rootfs := "/var/lib/k3sm/pods/pod-native/rootfs"
 
 	t.Run("runs command[0] as the host binary, skips the pull, flags hostBinary", func(t *testing.T) {
 		c := &runtimev1.Container{Name: "app", Image: NativeImage, Command: []string{"/bin/sh", "-c", "echo ok"}}
-		bin, argv, hostBinary, err := rt.resolveBinary(context.Background(), box, rootfs, c)
+		bin, argv, hostBinary, err := rt.resolveBinary(context.Background(), p, rootfs, c)
 		if err != nil {
 			t.Fatalf("resolveBinary native: %v", err)
 		}
@@ -59,15 +60,58 @@ func TestResolveBinaryNativeSentinel(t *testing.T) {
 
 	t.Run("native image with no command is rejected", func(t *testing.T) {
 		c := &runtimev1.Container{Name: "app", Image: NativeImage}
-		if _, _, _, err := rt.resolveBinary(context.Background(), box, rootfs, c); err == nil {
+		if _, _, _, err := rt.resolveBinary(context.Background(), p, rootfs, c); err == nil {
 			t.Fatal("want an error for a native image with no command")
 		}
 	})
 
 	t.Run("native command that is not absolute is rejected", func(t *testing.T) {
 		c := &runtimev1.Container{Name: "app", Image: NativeImage, Command: []string{"sh", "-c", "true"}}
-		if _, _, _, err := rt.resolveBinary(context.Background(), box, rootfs, c); err == nil {
+		if _, _, _, err := rt.resolveBinary(context.Background(), p, rootfs, c); err == nil {
 			t.Fatal("want an error for a relative native command path")
 		}
 	})
+}
+
+// TestResolveBinaryPullPolicyCarriesResolvedBackend proves a pull runs under the
+// pod's RESOLVED sandbox backend, which is what image.PlatformPolicy.Backend is
+// contractually defined to carry — not a constant that merely happens to be
+// behaviourally equivalent today.
+//
+// A hardcoded stand-in is exact only while every native rung maps to the same
+// image-platform candidate list. A future native rung that did not would be
+// mis-selected through a VALID enum value, so the fail-closed default in
+// image.Candidates could never fire — the failure would be silent, which is the
+// class of bug B99 exists to remove.
+func TestResolveBinaryPullPolicyCarriesResolvedBackend(t *testing.T) {
+	backends := []runtimev1.SandboxBackend{
+		runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC,
+		runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_EXEC,
+		runtimev1.SandboxBackend_SANDBOX_BACKEND_UIDJAIL,
+	}
+	for _, backend := range backends {
+		t.Run(backend.String(), func(t *testing.T) {
+			pull := &fakePuller{}
+			rt := newTestRuntime(t, Deps{Puller: pull})
+			p := &pod{box: hostBinBox("pod-policy"), backend: backend}
+			c := &runtimev1.Container{Name: "app", Image: "example.com/app:v1", Command: []string{"/app"}}
+			if _, _, _, err := rt.resolveBinary(context.Background(), p, "/var/lib/k3sm/pods/pod-policy/rootfs", c); err != nil {
+				t.Fatalf("resolveBinary: %v", err)
+			}
+			pol := pull.policy()
+			if pol.Backend != backend {
+				t.Errorf("pull policy backend = %v, want the pod's resolved backend %v", pol.Backend, backend)
+			}
+			// Every native rung must still resolve to darwin/arm64 only: the
+			// host-process spine runs Mach-O, and HostRosetta stays false until
+			// the capability probe lands (B103).
+			cands, err := image.Candidates(pol)
+			if err != nil {
+				t.Fatalf("pull policy has no candidates: %v", err)
+			}
+			if len(cands) != 1 || cands[0].OS != "darwin" || cands[0].Architecture != "arm64" {
+				t.Errorf("candidates = %v, want [darwin/arm64/v8]", cands)
+			}
+		})
+	}
 }

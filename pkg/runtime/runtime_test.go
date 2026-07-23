@@ -247,24 +247,35 @@ type instantWaiter struct{ code int }
 func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return w.code, 0, nil }
 
 // fakePuller never touches a registry. It records the last credential it received
-// (M2.6) so a test can assert the imagePullSecret reaches the pull client.
+// (M2.6) and the last platform policy (B99) so a test can assert both reach the
+// pull client.
 type fakePuller struct {
 	err error
 
-	mu       sync.Mutex
-	lastCred *image.RegistryCredential
-	lastRef  string
+	mu         sync.Mutex
+	lastCred   *image.RegistryCredential
+	lastRef    string
+	lastPolicy image.PlatformPolicy
 }
 
-func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential) (*image.PullResult, error) {
+func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy) (*image.PullResult, error) {
 	f.mu.Lock()
 	f.lastRef = ref
 	f.lastCred = cred
+	f.lastPolicy = policy
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
 	return &image.PullResult{Manifest: &runtimev1.ImageManifest{}, CacheHit: true}, nil
+}
+
+// policy returns the last platform policy passed to Pull, so a test can assert
+// the host-process spine pulls a native (never a defaulted linux/amd64) image.
+func (f *fakePuller) policy() image.PlatformPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastPolicy
 }
 
 func (f *fakePuller) credential() *image.RegistryCredential {
@@ -315,6 +326,26 @@ func newTestRuntime(t *testing.T, d Deps) *Runtime {
 // (e.g. the per-pod SBPL egress VIPs) over the same fake subsystem seams.
 func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	t.Helper()
+	d = testDeps(t, d)
+	if d.Puller == nil {
+		d.Puller = &fakePuller{}
+	}
+	if cfg.Root == "" {
+		cfg.Root = t.TempDir()
+	}
+	rt, err := New(cfg, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rt
+}
+
+// testDeps fills the deterministic fake subsystem seams every pkg/runtime unit
+// test shares. It deliberately does NOT default Puller: newTestRuntimeCfg adds
+// the fake one, while the production-wiring test leaves it nil so New builds the
+// daemon's own image.NewPuller(cache, image.RemoteFetch).
+func testDeps(t *testing.T, d Deps) Deps {
+	t.Helper()
 	cache, err := image.NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -337,9 +368,6 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.Waiter == nil {
 		d.Waiter = newBlockingWaiter()
 	}
-	if d.Puller == nil {
-		d.Puller = &fakePuller{}
-	}
 	if d.Signer == nil {
 		d.Signer = &fakeSigner{}
 	}
@@ -359,14 +387,7 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.ProcGroup == nil {
 		d.ProcGroup = func(int) ([]supervisor.ProcMember, bool) { return nil, true }
 	}
-	if cfg.Root == "" {
-		cfg.Root = t.TempDir()
-	}
-	rt, err := New(cfg, d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return rt
+	return d
 }
 
 // hostBinBox builds a minimal valid PodBox running a host-binary container.
