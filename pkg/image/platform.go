@@ -48,8 +48,8 @@ var ErrNoPlatformMatch = errors.New("no image manifest matches a runnable platfo
 // recursive traversal is an unbounded, registry-controlled fan-out, and no
 // registry in the k3sm target set publishes one. It is deliberately NOT wrapped
 // around ErrNoPlatformMatch — the platform may well be present, so reporting "no
-// match" would misdescribe the failure. Callers that mean "this image cannot
-// run here" must test both sentinels.
+// match" would misdescribe the failure. Callers that mean "this image cannot run
+// here" must test both sentinels, which is what IsTerminalPlatformError is for.
 var ErrNestedIndex = errors.New("image index child is itself an index (nested index traversal is refused)")
 
 // IsTerminalPlatformError reports whether err is a PERMANENT k3sm image-platform
