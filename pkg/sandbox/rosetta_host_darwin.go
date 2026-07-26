@@ -116,7 +116,9 @@ func hostRosettaProbe(ctx context.Context) HostRosettaState {
 //   - stdout/stderr left nil, which os/exec wires to /dev/null: output is
 //     discarded without any copier goroutine that could outlive the probe;
 //   - Setpgid, plus a Cancel that SIGKILLs the whole GROUP (-pgid) rather than the
-//     direct child, so a timeout cannot strand a grandchild;
+//     direct child, so a timeout cannot strand a grandchild — gated on a race-free
+//     "is the child still ours?" check so a Cancel that fires after the reap cannot
+//     signal a recycled pgid;
 //   - WaitDelay, so Wait itself is bounded even if the group survives the kill.
 //
 // The verdict is the exit status only; nothing the child writes is parsed.
@@ -133,6 +135,19 @@ func runTranslatedProbe(ctx context.Context) error {
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return os.ErrProcessDone
+		}
+		// Kill the DIRECT child through os.Process first. That is not redundant with
+		// the group kill below: os/exec runs Cancel on its watchCtx goroutine, which
+		// can lose the race with Wait and fire AFTER the child was reaped — at which
+		// point -pid may name a RECYCLED process group, and since the daemon runs as
+		// _k3sm alongside every pod process the blast radius is not empty. os.Process
+		// tracks the reap under its own lock and answers ErrProcessDone once it has
+		// happened, so this is the only race-FREE way to ask (reading cmd.ProcessState
+		// instead would be a real data race: exec.go writes it on the Wait goroutine
+		// before it ever synchronises with this one). os/exec makes the same
+		// Process.Kill() move in its own WaitDelay path.
+		if err := cmd.Process.Kill(); err != nil {
+			return err
 		}
 		// Negative pid = the process GROUP. os/exec's default Cancel kills only the
 		// direct child, which would leak any grandchild arch(1) left running.

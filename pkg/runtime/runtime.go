@@ -421,11 +421,21 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// Runtime pointer escapes: the results then need no synchronisation in the
 	// concurrent GetRuntimeInfo handler (see the rosettaHost/rosettaGuest fields).
 	//
-	// context.Background() is deliberate and is NOT a "background context deep in a
-	// call tree": New is the top of the daemon's own call tree and takes no ctx
-	// (changing that signature is a cross-repo break for a probe that must degrade
-	// anyway), and the host probe carries its own short internal timeout, so the
-	// constructor cannot wedge on it.
+	// context.Background() here is a KNOWN RESIDUAL, not a claim that no ctx exists.
+	// New takes none, and BOTH production callers hold a live one they DROP: this
+	// repo's own cmd/k3sm-runtimed/main.go builds a signal.NotifyContext in the very
+	// function that calls New, and in the shipped single binary k3sm's startNode(ctx) →
+	// buildProvider(ctx, …) → provider.NewRuntimed(cfg) drops the ctx at the provider
+	// boundary. So this genuinely IS a background context below a live one, and the
+	// GO-STANDARDS §Context rule against that is not satisfied by call depth.
+	//
+	// What makes it SAFE is the probe's own internal ceiling, chosen as the deliberate
+	// substitute for cancellation: sandbox.ProbeHostRosetta time-boxes its spawn leg
+	// (2s) and bounds Wait after cancellation (500ms WaitDelay), so the constructor
+	// cannot wedge even on a never-done ctx. Fixing it properly means New(ctx, …) — a
+	// signature change across this repo's daemon main AND k3sm's provider — for a
+	// probe that must degrade anyway; that cross-repo cut is B103's filed residual and
+	// is deliberately not taken here.
 	rosettaHost := evalHostRosetta(context.Background(), hostRosettaProbe)
 	rosettaGuest := evalGuestRosetta(vmBackend, guestRosettaProbe)
 	// Log BOTH outcomes, available or not. GetRuntimeInfo's consumer discards Reason

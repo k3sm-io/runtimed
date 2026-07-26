@@ -1,11 +1,17 @@
 //go:build darwin && cgo
 
-// Obj-C shim for the vm sandbox backend's SAFE availability probes (M5.1). It is
-// isolated here so the only Objective-C / Virtualization.framework surface the
-// rest of runtimed sees is the two C entry points in vm_darwin.h. NEITHER entry
-// point constructs or boots a VZVirtualMachine — doing so without the
-// com.apple.security.virtualization entitlement raises an uncaught NSException →
-// SIGABRT, so both are additionally wrapped in @try/@catch and @autoreleasepool.
+// Obj-C shim for the vm sandbox backend's SAFE availability probes (M5.1, plus the
+// guest-Rosetta availability read added by B103). It is isolated here so the only
+// Objective-C / Virtualization.framework surface the rest of runtimed sees is the
+// THREE C entry points in vm_darwin.h. NO entry point constructs or boots a
+// VZVirtualMachine — doing so without the com.apple.security.virtualization
+// entitlement raises an uncaught NSException → SIGABRT, so all three are
+// additionally wrapped in @try/@catch and @autoreleasepool.
+//
+// The COUNT is load-bearing, not prose: this comment and vm_darwin.h are the stated
+// inventory a reviewer audits the Virtualization attack surface against, so adding an
+// entry point means bumping the count in BOTH places — a stale count is how a fourth
+// one arrives unreviewed.
 //
 // The live VM boot (a VZVirtualMachineConfiguration on a per-VM serial dispatch
 // queue, behind an opaque handle) is the LAB-GATED remainder and is NOT here.

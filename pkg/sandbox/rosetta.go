@@ -76,6 +76,11 @@ func (s HostRosettaState) String() string {
 
 // Available reports whether s is the one genuinely-usable state. Every other
 // state — including an out-of-range one — is unavailable (fail closed).
+//
+// This is the ONE home of the host fail-closed rule, and it SHIPS: pkg/runtime's
+// evalHostRosetta calls it to decide the RuntimeCondition status instead of
+// re-deriving the comparison, so the predicate the tests below pin is the same one
+// the daemon advertises.
 func (s HostRosettaState) Available() bool { return s == HostRosettaAvailable }
 
 // GuestRosettaState is the verdict of the GUEST-Rosetta (Rosetta for Linux,
@@ -121,6 +126,10 @@ func (s GuestRosettaState) String() string {
 
 // Available reports whether s is the one genuinely-usable state. Every other
 // state — including an out-of-range one — is unavailable (fail closed).
+//
+// Like its host sibling it is the ONE home of the guest fail-closed rule and it
+// SHIPS: pkg/runtime's evalGuestRosetta calls it rather than re-deriving the
+// comparison.
 func (s GuestRosettaState) Available() bool { return s == GuestRosettaInstalled }
 
 // ProbeHostRosetta reports whether this host can translate darwin/amd64 Mach-O

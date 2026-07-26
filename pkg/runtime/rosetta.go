@@ -88,20 +88,31 @@ func logRosettaProbe(log *slog.Logger, condType string, c rosettaCondition) {
 // evalHostRosetta turns the host-Rosetta probe's state into the condition data.
 // ONLY sandbox.HostRosettaAvailable maps to TRUE; every other state — including one
 // out of range — is FALSE with its own Reason, so the condition fails closed.
+//
+// That available/not decision has exactly ONE home: sandbox.HostRosettaState.Available().
+// The switch below therefore chooses only the operator MESSAGE (and names an
+// unrecognized state). Re-deriving `state == sandbox.HostRosettaAvailable` here would
+// give the fail-closed rule two homes, and the copy pkg/sandbox's tests pin would not
+// be the copy that ships — a divergence would leave those tests green while the shipped
+// condition mislabels a state.
 func evalHostRosetta(ctx context.Context, probe func(context.Context) sandbox.HostRosettaState) rosettaCondition {
 	state := probe(ctx)
 	c := rosettaCondition{status: runtimev1.ConditionStatus_CONDITION_STATUS_FALSE, reason: state.String()}
+	if state.Available() {
+		c.status = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+	}
 	switch state {
 	case sandbox.HostRosettaAvailable:
-		c.status = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
 		c.message = "Rosetta 2 present and a translated exec succeeded; this host can run darwin/amd64 Mach-O payloads"
 	case sandbox.HostRosettaTranslationFailed:
 		c.message = "the Rosetta 2 runtime is installed but a translated exec did not succeed (non-zero exit, spawn error, or probe timeout); treating darwin/amd64 as unrunnable"
 	case sandbox.HostRosettaAbsent:
 		c.message = "the Rosetta 2 runtime is not installed on this host; darwin/amd64 Mach-O payloads cannot be translated"
 	default:
-		// An unknown state cannot be reported available; name it rather than
-		// silently folding it into one of the known Reasons.
+		// An unrecognized state has no Message of its own: NAME it rather than
+		// silently folding it into one of the known Reasons. Its status needs no
+		// override here — Available() is false for every state outside the known
+		// set, which is where the fail-closed guarantee actually comes from.
 		c.reason = "Unknown"
 		c.message = fmt.Sprintf("the host-Rosetta probe returned an unrecognized state (%d); failing closed", int(state))
 	}
@@ -117,7 +128,9 @@ func evalHostRosetta(ctx context.Context, probe func(context.Context) sandbox.Ho
 // keeps a Virtualization.framework call off every unentitled Mac. When
 // short-circuited the condition is FALSE naming that cause, never TRUE.
 //
-// ONLY sandbox.GuestRosettaInstalled maps to TRUE.
+// ONLY sandbox.GuestRosettaInstalled maps to TRUE, and — exactly as in
+// evalHostRosetta — that decision has ONE home, sandbox.GuestRosettaState.Available();
+// the switch chooses only the operator Message.
 func evalGuestRosetta(vmBackend VMBackend, probe func() sandbox.GuestRosettaState) rosettaCondition {
 	if vmBackend == nil || !vmBackend.Available() {
 		return rosettaCondition{
@@ -128,9 +141,11 @@ func evalGuestRosetta(vmBackend VMBackend, probe func() sandbox.GuestRosettaStat
 	}
 	state := probe()
 	c := rosettaCondition{status: runtimev1.ConditionStatus_CONDITION_STATUS_FALSE, reason: state.String()}
+	if state.Available() {
+		c.status = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+	}
 	switch state {
 	case sandbox.GuestRosettaInstalled:
-		c.status = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
 		c.message = "Rosetta for Linux is installed; a Linux guest on this host can run linux/amd64 ELF payloads"
 	case sandbox.GuestRosettaNotInstalled:
 		c.message = "Rosetta for Linux is supported but not installed; runtimed never installs it (the framework's install entry points prompt the user, which a GUI-less daemon cannot answer)"
@@ -139,6 +154,7 @@ func evalGuestRosetta(vmBackend VMBackend, probe func() sandbox.GuestRosettaStat
 	case sandbox.GuestRosettaQueryFailed:
 		c.message = "the guest-Rosetta availability query could not answer (no Virtualization.framework in this build lane, or an unexpected framework result); failing closed"
 	default:
+		// As in evalHostRosetta: name the state; Available() already made it FALSE.
 		c.reason = "Unknown"
 		c.message = fmt.Sprintf("the guest-Rosetta probe returned an unrecognized state (%d); failing closed", int(state))
 	}

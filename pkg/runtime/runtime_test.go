@@ -330,6 +330,24 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.Puller == nil {
 		d.Puller = &fakePuller{}
 	}
+	// Default the two Rosetta probe seams to deterministic FAIL-CLOSED fakes. Left
+	// nil they fall through in New to the real sandbox.ProbeHostRosetta, which stats
+	// a SIP path and — on a Rosetta-2-installed host — forks /usr/bin/arch, once per
+	// construction: ~85 real stats and up to ~85 real forks per run of this package,
+	// i.e. host-dependent wall time in the unit tier (GO-STANDARDS §Testing: fake at
+	// seams, no real privilege). Fail-closed states are the deterministic choice for
+	// the same reason fakeVMBackend defaults to unavailable.
+	//
+	// They are defaulted HERE and not in testDeps for exactly the reason Puller is:
+	// rosetta_test.go's default_probe_wiring subtest calls New(…, testDeps(t, Deps{}))
+	// directly to reach the REAL nil-deps wiring, and that is the one test that would
+	// go green against a New which never wires the real probes at all.
+	if d.HostRosetta == nil {
+		d.HostRosetta = func(context.Context) sandbox.HostRosettaState { return sandbox.HostRosettaAbsent }
+	}
+	if d.GuestRosetta == nil {
+		d.GuestRosetta = func() sandbox.GuestRosettaState { return sandbox.GuestRosettaQueryFailed }
+	}
 	if cfg.Root == "" {
 		cfg.Root = t.TempDir()
 	}
@@ -341,9 +359,11 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 }
 
 // testDeps fills the deterministic fake subsystem seams every pkg/runtime unit
-// test shares. It deliberately does NOT default Puller: newTestRuntimeCfg adds
-// the fake one, while the production-wiring test leaves it nil so New builds the
-// daemon's own image.NewPuller(cache, image.RemoteFetch).
+// test shares. It deliberately does NOT default Puller, HostRosetta or GuestRosetta:
+// newTestRuntimeCfg adds fakes for those three, while the production-wiring tests
+// (pull_wiring_test.go, and rosetta_test.go's default_probe_wiring) call
+// New(…, testDeps(t, Deps{})) directly and leave them nil so New builds the daemon's
+// own image.NewPuller(cache, image.RemoteFetch) / sandbox.Probe*Rosetta.
 func testDeps(t *testing.T, d Deps) Deps {
 	t.Helper()
 	cache, err := image.NewCache(t.TempDir())

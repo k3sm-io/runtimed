@@ -402,8 +402,23 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 	// machine does not, so any value assertion would flip per host. What it does
 	// catch is a builder who forgot to wire the real probes at all — the conditions
 	// would then be missing, or would carry no Reason.
+	//
+	// It constructs through testDeps rather than the info/newTestRuntime helper on
+	// purpose — the same split pull_wiring_test.go uses for Puller. newTestRuntimeCfg
+	// defaults the two probe seams to fakes, so the ~85 constructions that go through
+	// it cost no stat and no fork; testDeps leaves them nil, which is how THIS subtest
+	// still reaches the real sandbox.Probe*Rosetta. (A few other constructions fall
+	// through to the real probes too — pull_wiring_test.go's two and volume_test.go's
+	// hand-rolled Deps literal — but this is the only one that ASSERTS on them.)
 	t.Run("default_probe_wiring", func(t *testing.T) {
-		resp := info(t, Deps{})
+		rt, err := New(Config{Root: t.TempDir()}, testDeps(t, Deps{}))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		resp, err := rt.GetRuntimeInfo(context.Background(), &runtimev1.GetRuntimeInfoRequest{})
+		if err != nil {
+			t.Fatalf("GetRuntimeInfo: %v", err)
+		}
 		for _, ct := range []string{ConditionRosettaHostAvailable, ConditionRosettaGuestAvailable} {
 			c := findCondition(resp, ct)
 			if c == nil {
