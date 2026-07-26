@@ -39,3 +39,24 @@ func vzSupported() bool {
 func vzEntitled() bool {
 	return C.k3sm_vz_has_entitlement() != 0
 }
+
+// vzRosettaAvailability reports the host's Rosetta-for-Linux (GUEST translation)
+// availability via the Obj-C shim's +[VZLinuxRosettaDirectoryShare availability]
+// class-property read — a SAFE, ENTITLEMENT-FREE probe that constructs no object
+// and never attempts an install (B103). The raw 3-valued enum is preserved, plus
+// the shim's QUERY_FAILED sentinel; see GuestRosettaState and ProbeGuestRosetta.
+//
+// The shim's own arch guard makes the non-arm64 compile lane return NOT_SUPPORTED,
+// so this wrapper is arch-agnostic.
+func vzRosettaAvailability() GuestRosettaState {
+	switch C.k3sm_vz_rosetta_availability() {
+	case C.K3SM_VZ_ROSETTA_INSTALLED:
+		return GuestRosettaInstalled
+	case C.K3SM_VZ_ROSETTA_NOT_INSTALLED:
+		return GuestRosettaNotInstalled
+	case C.K3SM_VZ_ROSETTA_NOT_SUPPORTED:
+		return GuestRosettaNotSupported
+	default:
+		return GuestRosettaQueryFailed
+	}
+}
