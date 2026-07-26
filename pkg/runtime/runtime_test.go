@@ -947,7 +947,7 @@ func TestGetRuntimeInfo(t *testing.T) {
 // TestGetRuntimeInfo_VMAvailability asserts GetRuntimeInfo advertises the vm
 // backend's availability as a VMBackendAvailable RuntimeCondition, driven by the
 // injectable VMBackend seam (fakeVMBackend): probe available => TRUE, else FALSE.
-// No real VZ hardware (B1 — the node reads this to set k3sm.io/vm-capable).
+// No real VZ hardware (B1 — the node reads this to set k3sm.io/virtualization).
 func TestGetRuntimeInfo_VMAvailability(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -964,13 +964,7 @@ func TestGetRuntimeInfo_VMAvailability(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var got *runtimev1.RuntimeCondition
-			for _, c := range info.GetConditions() {
-				if c.GetType() == "VMBackendAvailable" {
-					got = c
-					break
-				}
-			}
+			got := findCondition(info, ConditionVMBackendAvailable)
 			if got == nil {
 				t.Fatalf("GetRuntimeInfo did not advertise a VMBackendAvailable condition; conditions = %v", info.GetConditions())
 			}

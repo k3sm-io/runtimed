@@ -208,10 +208,15 @@ var (
 // green table here is NOT evidence that vm image selection works end to end.
 //
 // HostRosetta / GuestRosetta are capability INPUTS, not probes: this file stays
-// GOOS-agnostic and cgo-free, and the probes that fill them are B103's job.
-// Until B103 lands them the call site passes false, so a
-// darwin/amd64-only image is refused with a legible error rather than silently
-// mis-selected.
+// GOOS-agnostic and cgo-free. The probes that answer them SHIPPED with B103
+// (sandbox.ProbeHostRosetta / sandbox.ProbeGuestRosetta, advertised as the
+// RosettaHostAvailable / RosettaGuestAvailable RuntimeConditions), but the live pull
+// call site still passes FALSE on purpose — consuming them waits on B105, the
+// Seatbelt x Rosetta spawn proof (an unsigned x86_64 Mach-O is not AMFI-killed the
+// way an unsigned arm64 one is, so selecting amd64 payloads would quietly weaken the
+// signature policy's kernel backstop). See pkg/runtime/pod.go's pullPolicy. Until
+// then a darwin/amd64-only image is refused with a legible error rather than
+// silently mis-selected.
 type PlatformPolicy struct {
 	// Backend is the RESOLVED sandbox backend for this pod.
 	Backend runtimev1.SandboxBackend
