@@ -466,7 +466,8 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // deliberately SEPARATE from the host-process spine (createPod above): it does NOT
 // resolveBinary, ad-hoc codesign / gateSignature, generate+apply an SBPL profile,
 // or set up lo0 networking — a Linux guest runs none of those. It hands the pod's
-// sizing (vm_vcpus / vm_memory_bytes) + rootfs to the vm backend's CreateVM.
+// sizing (vm_vcpus / vm_memory_bytes) + rootfs + the virtiofs volume share plan
+// (B106, computed below) to the vm backend's CreateVM.
 //
 // netcfg is threaded INERT into VMSpec.Network: the rendered resolv.conf content
 // plus the NAT advisory fields the vm backend applies to the guest. This path runs
@@ -483,12 +484,31 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // cmd/k3sm-vmhost helper lifecycle, the OCI-Linux-rootfs→bootable-root builder,
 // and guest-agent VM metering (see pkg/sandbox vm.go).
 func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile, netcfg sandbox.GuestNetworkConfig) (*pod, runtimev1.FailureReason, error) {
+	// Compute the virtiofs share-device plan from the box's volumes (B106) —
+	// pure data: no filesystem access and no chown (the planner plans; the VZ
+	// device config enforces writability, guest-init composes the binds —
+	// B102). The pod dir is derived LOCALLY (r.podDir) and the planner ignores
+	// box.rootfs_path for share roots: that field is caller-supplied and
+	// unvalidated (rootfsPath below still honors it for the host-side
+	// VMSpec.RootfsPath, unchanged here).
+	//
+	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
+	// pattern (validate.go) — deliberately NOT the ROOTFS_SETUP the native
+	// spine folds mount.Materialize failures into (createPod above): that
+	// conflation is the native path's own divergence; here nothing has touched
+	// disk — the box itself is unplannable.
+	plan, err := mount.ComputeSharePlan(box, r.podDir(box.GetPodId()), r.cfg.Root, r.binder.Class())
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
+	}
 	spec := sandbox.VMSpec{
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
 		RootfsPath:  r.rootfsPath(box),
 		Network:     netcfg,
+		Volumes:     vmVolumePlan(plan),
 	}
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
@@ -499,6 +519,54 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// (phase RUNNING, guest-agent metering wired in place of the M2.5 sampler).
 	return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
 		fmt.Errorf("pod %s: vm backend lifecycle not implemented", box.GetPodId())
+}
+
+// vmVolumePlan maps the pkg/mount share plan onto the sandbox DTO, value for
+// value. createVMPod is the NAMED MAPPER on this seam: sandbox must not import
+// pkg/mount (the GuestNetworkConfig decoupling precedent — sandbox.VMVolumePlan
+// is plain data), and pkg/mount stays the single volume/path authority.
+func vmVolumePlan(plan mount.SharePlan) sandbox.VMVolumePlan {
+	out := sandbox.VMVolumePlan{}
+	if len(plan.Shares) > 0 {
+		out.Shares = make([]sandbox.VMShare, 0, len(plan.Shares))
+		for _, s := range plan.Shares {
+			out.Shares = append(out.Shares, sandbox.VMShare{Tag: s.Tag, Root: s.Root, Writable: s.Writable})
+		}
+	}
+	if len(plan.Binds) > 0 {
+		out.Binds = make(map[string][]sandbox.VMBind, len(plan.Binds))
+		for name, bs := range plan.Binds {
+			mapped := make([]sandbox.VMBind, 0, len(bs))
+			for _, b := range bs {
+				mapped = append(mapped, sandbox.VMBind{
+					VolumeName: b.VolumeName,
+					ShareTag:   b.ShareTag,
+					SourceRel:  b.SourceRel,
+					MountPath:  b.MountPath,
+					SubPath:    b.SubPath,
+					ReadOnly:   b.ReadOnly,
+				})
+			}
+			out.Binds[name] = mapped
+		}
+	}
+	if len(plan.Tmpfs) > 0 {
+		out.Tmpfs = make(map[string][]sandbox.VMTmpfs, len(plan.Tmpfs))
+		for name, ts := range plan.Tmpfs {
+			mapped := make([]sandbox.VMTmpfs, 0, len(ts))
+			for _, tm := range ts {
+				mapped = append(mapped, sandbox.VMTmpfs{
+					VolumeName: tm.VolumeName,
+					MountPath:  tm.MountPath,
+					SubPath:    tm.SubPath,
+					SizeLimit:  tm.SizeLimit,
+					ReadOnly:   tm.ReadOnly,
+				})
+			}
+			out.Tmpfs[name] = mapped
+		}
+	}
+	return out
 }
 
 // oomKill is the memory sampler's onBreach callback (M2.5): it marks the pod

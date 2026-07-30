@@ -557,3 +557,16 @@ func isUnder(path, base string) bool {
 	base = filepath.Clean(base)
 	return path == base || strings.HasPrefix(path, base+string(filepath.Separator))
 }
+
+// isStrictlyUnder reports whether path is a PROPER descendant of base (both
+// cleaned): equality is FALSE — which is exactly why the share-plan containment
+// guards cannot reuse isUnder above — and the check is separator-aware, so
+// /a/b is under /a but the sibling /a/bc is NOT under /a/b.
+func isStrictlyUnder(path, base string) bool {
+	path = filepath.Clean(path)
+	base = filepath.Clean(base)
+	if base == string(filepath.Separator) {
+		return path != base && filepath.IsAbs(path)
+	}
+	return strings.HasPrefix(path, base+string(filepath.Separator))
+}
