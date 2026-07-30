@@ -1057,9 +1057,21 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 // yet; when the vm path grows a pull (the OCI -> Linux-rootfs builder, a later
 // deliverable) it passes its own resolved backend through this same seam.
 //
-// HostRosetta is false: the host-Rosetta capability probe is B103. Until it
-// lands, a darwin/amd64-only image is REFUSED at pull with a legible
-// image.ErrNoPlatformMatch instead of being silently mis-selected.
+// HostRosetta is false DELIBERATELY, and NOT for want of a probe: the probe exists
+// as of B103 (sandbox.ProbeHostRosetta, advertised on GetRuntimeInfo as the
+// RosettaHostAvailable condition). The pull path does not consume it until the
+// Seatbelt x Rosetta spawn is PROVEN — B105 — for two reasons that both cut the
+// same way:
+//
+//   - a darwin/amd64 payload's behaviour inside a Seatbelt profile is unverified, so
+//     selecting one would trade a legible pull-time refusal for an unexplained
+//     runtime failure;
+//   - AMFI does NOT kill an unsigned x86_64 Mach-O the way it kills an unsigned
+//     arm64 one (measured), so selecting amd64 payloads would silently drop the
+//     kernel backstop that stands behind the signature policy.
+//
+// So a darwin/amd64-only image stays REFUSED at pull with a legible
+// image.ErrNoPlatformMatch. Do not flip this to r.rosettaHost without B105.
 func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
 	return image.PlatformPolicy{Backend: backend}
 }

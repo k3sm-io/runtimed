@@ -173,14 +173,21 @@ type Runtime struct {
 	// vmBackend is the Virtualization.framework micro-VM rung (M5.1). createPod
 	// queries Available() so a vm-requested pod fails closed when it is absent, and
 	// routes a selected vm pod to CreateVM (away from the host-process path).
-	vmBackend   VMBackend
-	spawner     supervisor.Spawner
-	waiter      supervisor.ExitWaiter
-	network     supervisor.PodNetwork
-	resolver    mount.Resolver
-	binder      *volume.Binder
-	footprinter supervisor.Footprinter
-	broker      *broker
+	vmBackend VMBackend
+	// rosettaHost / rosettaGuest are the two Rosetta capability probes' outcomes
+	// (B103), evaluated EAGERLY EXACTLY ONCE in New and IMMUTABLE thereafter, so the
+	// concurrent GetRuntimeInfo handler reads them with no lock and no race (see
+	// rosetta.go for why eager beats a sync.Once cache here). They are advertised as
+	// additive RuntimeConditions ONLY — nothing in the pod spine consumes them.
+	rosettaHost  rosettaCondition
+	rosettaGuest rosettaCondition
+	spawner      supervisor.Spawner
+	waiter       supervisor.ExitWaiter
+	network      supervisor.PodNetwork
+	resolver     mount.Resolver
+	binder       *volume.Binder
+	footprinter  supervisor.Footprinter
+	broker       *broker
 
 	// signalGroup signals a pod's process GROUP (supervisor.SignalGroup in
 	// production); it is a field so the graceful-stop (M2.4) and OOM-kill (M2.5)
@@ -267,9 +274,21 @@ type Deps struct {
 	// Virtualization.framework + the com.apple.security.virtualization entitlement
 	// (so a vm-requested pod fails closed off a capable host). Tests inject a fake.
 	VMBackend VMBackend
-	Spawner   supervisor.Spawner
-	Waiter    supervisor.ExitWaiter
-	Network   supervisor.PodNetwork
+	// HostRosetta probes whether this host can translate darwin/amd64 MACH-O
+	// payloads (Rosetta 2 — the NATIVE host-process spine's capability). Defaults to
+	// sandbox.ProbeHostRosetta; tests inject a fake. New calls it EAGERLY EXACTLY
+	// ONCE (see the rosettaHost field), so it forks at most once per daemon lifetime.
+	HostRosetta func(ctx context.Context) sandbox.HostRosettaState
+	// GuestRosetta probes whether a Linux GUEST on this host could translate
+	// linux/amd64 ELF payloads (Rosetta for Linux — the vm backend's capability).
+	// Defaults to sandbox.ProbeGuestRosetta; tests inject a fake. It takes no ctx
+	// because the underlying framework-property read has nothing to cancel (its host
+	// sibling spawns a process and therefore does). New calls it EAGERLY EXACTLY
+	// ONCE, and only when VMBackend.Available() — see evalGuestRosetta.
+	GuestRosetta func() sandbox.GuestRosettaState
+	Spawner      supervisor.Spawner
+	Waiter       supervisor.ExitWaiter
+	Network      supervisor.PodNetwork
 	// Resolver supplies ConfigMap/Secret data and SA tokens for volume
 	// materialization (M2.2). It has NO production default: runtimed never talks
 	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
@@ -351,6 +370,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// closed off a capable host (and the live boot is the lab-gated remainder).
 		vmBackend = sandbox.NewVMBackend()
 	}
+	hostRosettaProbe := deps.HostRosetta
+	if hostRosettaProbe == nil {
+		hostRosettaProbe = sandbox.ProbeHostRosetta
+	}
+	guestRosettaProbe := deps.GuestRosetta
+	if guestRosettaProbe == nil {
+		guestRosettaProbe = sandbox.ProbeGuestRosetta
+	}
 	spawner := deps.Spawner
 	if spawner == nil {
 		spawner = supervisor.PosixSpawner{}
@@ -390,27 +417,56 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		binder = volume.NewBinder(class, image.APFSCloner{}, nil, log)
 	}
 
+	// Evaluate the two Rosetta capability probes EAGERLY, EXACTLY ONCE, before the
+	// Runtime pointer escapes: the results then need no synchronisation in the
+	// concurrent GetRuntimeInfo handler (see the rosettaHost/rosettaGuest fields).
+	//
+	// context.Background() here is a KNOWN RESIDUAL, not a claim that no ctx exists.
+	// New takes none, and BOTH production callers hold a live one they DROP: this
+	// repo's own cmd/k3sm-runtimed/main.go builds a signal.NotifyContext in the very
+	// function that calls New, and in the shipped single binary k3sm's startNode(ctx) →
+	// buildProvider(ctx, …) → provider.NewRuntimed(cfg) drops the ctx at the provider
+	// boundary. So this genuinely IS a background context below a live one, and the
+	// GO-STANDARDS §Context rule against that is not satisfied by call depth.
+	//
+	// What makes it SAFE is the probe's own internal ceiling, chosen as the deliberate
+	// substitute for cancellation: sandbox.ProbeHostRosetta time-boxes its spawn leg
+	// (2s) and bounds Wait after cancellation (500ms WaitDelay), so the constructor
+	// cannot wedge even on a never-done ctx. Fixing it properly means New(ctx, …) — a
+	// signature change across this repo's daemon main AND k3sm's provider — for a
+	// probe that must degrade anyway; that cross-repo cut is B103's filed residual and
+	// is deliberately not taken here.
+	rosettaHost := evalHostRosetta(context.Background(), hostRosettaProbe)
+	rosettaGuest := evalGuestRosetta(vmBackend, guestRosettaProbe)
+	// Log BOTH outcomes, available or not. GetRuntimeInfo's consumer discards Reason
+	// and Message today, so this pair of lines is the only place an operator can
+	// answer "why is my node not labelled for Rosetta?".
+	logRosettaProbe(log, ConditionRosettaHostAvailable, rosettaHost)
+	logRosettaProbe(log, ConditionRosettaGuestAvailable, rosettaGuest)
+
 	return &Runtime{
-		cfg:         cfg,
-		home:        daemonHome(cfg.Root),
-		log:         log,
-		cache:       cache,
-		puller:      puller,
-		signer:      signer,
-		credentials: deps.Credentials,
-		backend:     backend,
-		vmBackend:   vmBackend,
-		spawner:     spawner,
-		waiter:      waiter,
-		network:     network,
-		resolver:    deps.Resolver,
-		binder:      binder,
-		footprinter: footprinter,
-		signalGroup: signalGroup,
-		procStart:   procStart,
-		procGroup:   procGroup,
-		broker:      newBroker(),
-		pods:        make(map[string]*pod),
+		cfg:          cfg,
+		home:         daemonHome(cfg.Root),
+		log:          log,
+		cache:        cache,
+		puller:       puller,
+		signer:       signer,
+		credentials:  deps.Credentials,
+		backend:      backend,
+		vmBackend:    vmBackend,
+		rosettaHost:  rosettaHost,
+		rosettaGuest: rosettaGuest,
+		spawner:      spawner,
+		waiter:       waiter,
+		network:      network,
+		resolver:     deps.Resolver,
+		binder:       binder,
+		footprinter:  footprinter,
+		signalGroup:  signalGroup,
+		procStart:    procStart,
+		procGroup:    procGroup,
+		broker:       newBroker(),
+		pods:         make(map[string]*pod),
 	}, nil
 }
 

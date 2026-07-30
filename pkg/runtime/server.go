@@ -341,6 +341,40 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStrea
 // exec.go: Exec re-enters the pod's confinement via the exec-shim; Attach
 // follows a running container's output; PortForward proxies to the pod's lo0 IP.
 
+// The RuntimeCondition Types GetRuntimeInfo advertises.
+//
+// These string VALUES are a CROSS-REPO WIRE CONTRACT carried as DATA. The proto's
+// Conditions field is `repeated` and Type is a free string, so adding a capability
+// needs NO proto change (the B1 precedent) — but that also means nothing but these
+// constants binds producer to consumer. k3sm's provider IMPORTS them, so a rename on
+// either side becomes a COMPILE error instead of a node label that is silently,
+// permanently absent. Never change a value; only ever add.
+//
+// The node labels k3sm derives from them (for orientation only — the mapping is
+// k3sm's, not runtimed's): VMBackendAvailable drives k3sm.io/virtualization, and the
+// two Rosetta conditions drive the k3sm.io/rosetta{,-linux} pair, the guest one
+// composed as VMBackendAvailable AND RosettaGuestAvailable.
+const (
+	// ConditionSandboxBackend reports the health of the confinement backend that
+	// runs host-process pods. It is the one condition mirrored into the response's
+	// Healthy field: a false SandboxBackend means pods would run unconfined, which
+	// runtimed refuses.
+	ConditionSandboxBackend = "SandboxBackend"
+	// ConditionVMBackendAvailable reports whether this host can run the vm
+	// RuntimeClass (Virtualization.framework isSupported AND the
+	// com.apple.security.virtualization entitlement — the SAFE probe that never
+	// boots a VM).
+	ConditionVMBackendAvailable = "VMBackendAvailable"
+	// ConditionRosettaHostAvailable reports whether this host can translate
+	// darwin/amd64 MACH-O payloads via Rosetta 2 (the NATIVE host-process spine's
+	// capability). B103.
+	ConditionRosettaHostAvailable = "RosettaHostAvailable"
+	// ConditionRosettaGuestAvailable reports whether a Linux GUEST on this host
+	// could translate linux/amd64 ELF payloads via Rosetta for Linux (the vm
+	// backend's capability). B103.
+	ConditionRosettaGuestAvailable = "RosettaGuestAvailable"
+)
+
 // GetRuntimeInfo reports the daemon version + health for the M2 handshake.
 func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
 	healthy := r.backend.Available()
@@ -355,7 +389,7 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 	// VMBackendAvailable advertises whether this host can run the vm RuntimeClass
 	// (Virtualization.framework isSupported + the com.apple.security.virtualization
 	// entitlement — the SAFE probe on r.vmBackend, which never boots a VM). k3sm
-	// reads it at node bring-up to label the node truthfully (k3sm.io/vm-capable),
+	// reads it at node bring-up to label the node truthfully (k3sm.io/virtualization),
 	// so a VZ-incapable node is not silently offered as vm-schedulable. Carried as
 	// an additive RuntimeCondition Type — no proto change (B1).
 	vmCond := runtimev1.ConditionStatus_CONDITION_STATUS_FALSE
@@ -373,17 +407,24 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 		Healthy:        healthy,
 		Conditions: []*runtimev1.RuntimeCondition{
 			{
-				Type:    "SandboxBackend",
+				Type:    ConditionSandboxBackend,
 				Status:  cond,
 				Reason:  reason,
 				Message: msg,
 			},
 			{
-				Type:    "VMBackendAvailable",
+				Type:    ConditionVMBackendAvailable,
 				Status:  vmCond,
 				Reason:  vmReason,
 				Message: vmMsg,
 			},
+			// The two Rosetta capability conditions are ADDITIVE — they are appended
+			// to, never a replacement for, the two above (B103). Their values were
+			// computed once in New and are immutable, so this handler only stamps them
+			// into fresh proto messages; a probe that reported UNAVAILABLE is a
+			// capability absence, NOT a handshake failure, so err stays nil.
+			r.rosettaHost.condition(ConditionRosettaHostAvailable),
+			r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
 		},
 	}, nil
 }
