@@ -56,10 +56,15 @@ const (
 // (podDir is its Dir, so Join(podDir, vmRootfsDirName) re-derives the same
 // path). proj/vols coincide with their tags today but are separate constants:
 // the tag is the guest-visible contract, the dir name the host-disk one.
+// vmPodsDirName MUST stay the "pods" component of the same Cache layout
+// (<workRoot>/pods/<podID>/rootfs): guardShareRoots bounds every planned
+// podDir to sit strictly inside <workRoot>/pods, so a drift between this
+// constant and the cache layout would reject every vm pod (fail closed, loud).
 const (
 	vmRootfsDirName = "rootfs"
 	vmProjDirName   = "k3sm.proj"
 	vmVolsDirName   = "k3sm.vols"
+	vmPodsDirName   = "pods"
 )
 
 // emptyDirMediumMemory is the single non-default value of the CLOSED emptyDir
@@ -133,15 +138,25 @@ type Bind struct {
 
 // Tmpfs is one Memory-medium emptyDir mount: guest-RAM tmpfs at MountPath,
 // never a virtiofs share (the contents must live in guest memory, not on the
-// host filesystem). Composed by guest-init (B102).
+// host filesystem). Composed by guest-init (B102). It carries the same
+// per-mount SubPath/ReadOnly intent a Bind does — upstream permits both on a
+// Memory emptyDir, so dropping either here would be a silent narrowing the
+// native path (materialize.go) does not have.
 type Tmpfs struct {
 	// VolumeName is the PodBox volume the tmpfs realizes.
 	VolumeName string
 	// MountPath is the guest path the container sees the tmpfs at.
 	MountPath string
+	// SubPath is the volumeMount sub_path, verbatim (lexically validated
+	// exactly like Bind.SubPath); guest-init applies it inside the tmpfs.
+	SubPath string
 	// SizeLimit is the emptyDir size_limit VERBATIM (the proto's
 	// resource.Quantity string, e.g. "64Mi"; "" = unset). No parsing here.
 	SizeLimit string
+	// ReadOnly is the volumeMount's read_only intent for this container's
+	// mount of the tmpfs (no class term: an emptyDir source carries no
+	// read_only of its own, mirroring Materialize's derivation).
+	ReadOnly bool
 }
 
 // ComputeSharePlan computes the virtiofs share-device plan for a
@@ -149,9 +164,12 @@ type Tmpfs struct {
 // podDir is the pod's on-disk directory (the runtime-derived
 // <root>/pods/<podID> — NEVER box.rootfs_path, which is caller-supplied and
 // unvalidated), workRoot is the runtime work dir (Config.Root), and class is
-// the local-path storage class PVC roots derive from. It is pure data: no
-// filesystem access, no chown. Any box the planner cannot prove safe is
-// rejected with an error (fail closed).
+// the local-path storage class PVC roots derive from. podDir is ENFORCED to
+// sit strictly inside <workRoot>/pods (guardShareRoots): a caller-derived pod
+// dir relocated wholesale — e.g. by a traversing pod_id surviving a future
+// derivation change — rejects instead of anchoring every pod-dir share at the
+// relocated tree. It is pure data: no filesystem access, no chown. Any box
+// the planner cannot prove safe is rejected with an error (fail closed).
 func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class storagev1.LocalPathClass) (SharePlan, error) {
 	if box == nil {
 		return SharePlan{}, errors.New("nil pod box")
@@ -198,7 +216,8 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 	// Assemble the shares in the plan's deterministic order: rootfs always,
 	// proj/vols only when a declared volume of the class exists, then the PVC
 	// shares in sorted-volume-name order. Every pod-dir root derives from
-	// podDir + a fixed literal; the PVC root is EXACTLY the class DataDir.
+	// podDir + a fixed literal; the PVC root is EXACTLY the class DataDir over
+	// SINGLE-COMPONENT names (validated + re-derivation-asserted below).
 	shares := []Share{{Tag: ShareTagRootfs, Root: filepath.Join(podDir, vmRootfsDirName)}}
 	if haveProj {
 		shares = append(shares, Share{Tag: ShareTagProj, Root: filepath.Join(podDir, vmProjDirName)})
@@ -209,11 +228,31 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 	podDirShares := len(shares)
 	sort.Strings(pvcNames)
 	pvcTags := make(map[string]string, len(pvcNames))
+	if len(pvcNames) > 0 {
+		// The namespace becomes a PATH COMPONENT of every PVC root below, so
+		// it is validated here — where it turns into a path — not at box
+		// ingress (the non-PVC classes never use it as one).
+		if err := validateVMPathComponent("namespace", box.GetNamespace()); err != nil {
+			return SharePlan{}, err
+		}
+	}
 	for i, name := range pvcNames {
 		src := vols[name].vol.GetPersistentVolumeClaim()
-		root, err := class.DataDir(box.GetNamespace(), src.GetClaimName())
+		claim := src.GetClaimName()
+		if err := validateVMPathComponent("claim_name", claim); err != nil {
+			return SharePlan{}, fmt.Errorf("volume %s: %w", name, err)
+		}
+		root, err := class.DataDir(box.GetNamespace(), claim)
 		if err != nil {
 			return SharePlan{}, fmt.Errorf("volume %s: %w", name, err)
+		}
+		// The R24(b) "equality-derived" property, asserted rather than trusted:
+		// the root must re-derive as EXACTLY <BasePath>/<namespace>/<claim>.
+		// Redundant with the single-component validation above BY DESIGN — a
+		// future DataDir change (a different join, a hashed layout) cannot
+		// silently widen what a box-supplied name addresses.
+		if filepath.Dir(root) != filepath.Join(class.BasePath, box.GetNamespace()) || filepath.Base(root) != claim {
+			return SharePlan{}, fmt.Errorf("volume %s: pvc share root %q does not re-derive as %q/<namespace>/<claim_name>", name, root, class.BasePath)
 		}
 		tag := fmt.Sprintf("%s%d", ShareTagPVCPrefix, i)
 		pvcTags[name] = tag
@@ -267,17 +306,12 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 			}
 			switch info.class {
 			case vmClassTmpfs:
-				if sp != "" {
-					// The tmpfs DTO carries no sub_path, so it cannot be
-					// honored verbatim — dropping it silently would mount the
-					// whole tmpfs where a narrowed view was declared. Fail
-					// closed instead.
-					return SharePlan{}, fmt.Errorf("container %s: volume_mount %q: sub_path is not supported on a Memory-medium emptyDir", cname, m.GetName())
-				}
 				tmpfs[cname] = append(tmpfs[cname], Tmpfs{
 					VolumeName: m.GetName(),
 					MountPath:  mp,
+					SubPath:    sp,
 					SizeLimit:  info.vol.GetEmptyDir().GetSizeLimit(),
+					ReadOnly:   m.GetReadOnly(),
 				})
 			case vmClassPVC:
 				binds[cname] = append(binds[cname], Bind{
@@ -436,6 +470,33 @@ func validateVMSubPath(sp string) error {
 	return nil
 }
 
+// validateVMPathComponent validates a PodBox-supplied name (namespace,
+// claim_name) that becomes a SINGLE path component of a derived share root:
+// non-empty, not "." or ".." (either addresses an ANCESTOR of the intended
+// root — a "." claim is the whole namespace tree), and free of "/" (a
+// multi-component or absolute name addresses a sibling namespace's tree or an
+// unrelated one) and of `\` (never a separator on darwin, but rejected so the
+// name stays one component under ANY future path handling). The
+// clean-invariance check is redundant with those for a separator-free string
+// and kept as an explicit belt against future edits loosening the ones above.
+//
+// R24(b) is what this enforces structurally: the PVC root is
+// <base>/<namespace>/<claim> and never <base>, an ancestor of it, or a lateral
+// tree — single-component inputs make the DataDir join unable to produce
+// those.
+func validateVMPathComponent(field, v string) error {
+	if v == "" {
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	if v == "." || v == ".." || strings.ContainsAny(v, `/\`) {
+		return fmt.Errorf("%s %q must be a single path component", field, v)
+	}
+	if filepath.Clean(v) != v {
+		return fmt.Errorf("%s %q is not a clean path component", field, v)
+	}
+	return nil
+}
+
 // guardShareRoots is the fail-closed defence-in-depth over the assembled share
 // roots. shares[:podDirShares] are the pod-dir shares (Join(podDir, <fixed
 // literal>)); the rest are PVC shares (the class DataDir join).
@@ -451,6 +512,16 @@ func validateVMSubPath(sp string) error {
 // /private/var), which is the case lexical comparison cannot judge. Keep that
 // precondition true when extending the planner.
 func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePath string) error {
+	// The pod dir must itself sit STRICTLY inside the runtime pod tree
+	// <workRoot>/pods before it may anchor any share root. The three pod-dir
+	// roots are Join(podDir, <fixed literal>) — strictly under podDir BY
+	// CONSTRUCTION — so the per-share containment below holds for ANY podDir,
+	// including one relocated wholesale (a traversing pod_id, a mis-wired
+	// caller). Bounding podDir is what gives those checks their meaning.
+	podsRoot := filepath.Join(workRoot, vmPodsDirName)
+	if !isStrictlyUnder(podDir, podsRoot) {
+		return fmt.Errorf("pod dir %q is not strictly under the runtime pods root %q", podDir, podsRoot)
+	}
 	runDir := filepath.Join(workRoot, "run")
 	for i, s := range shares {
 		if s.Root == "" {
@@ -464,9 +535,13 @@ func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePat
 				return fmt.Errorf("share %s root %q escapes the pod dir %q", s.Tag, s.Root, podDir)
 			}
 		} else {
-			// A PVC root is equality-derived from class.DataDir, and even so
-			// must never be the storage root itself nor escape it (a
-			// namespace/claim crafted to traverse the join lands here).
+			// A PVC root is already re-derivation-asserted at build time
+			// (single-component namespace/claim, root == <base>/<ns>/<claim>),
+			// so no crafted box name reaches here — a lateral ../<other-ns>
+			// or ancestor-addressing "." claim rejects at derivation, not
+			// here. These checks stay as DEFENCE IN DEPTH for the inputs the
+			// derivation assert does not see: a mis-rooted class, or a future
+			// change to the root derivation itself.
 			if s.Root == basePath {
 				return fmt.Errorf("share %s root equals the storage base path %q", s.Tag, basePath)
 			}

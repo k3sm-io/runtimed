@@ -21,9 +21,12 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
+	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/volume"
 
@@ -65,7 +68,11 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 				Name:  "main",
 				Image: "/bin/sleep",
 				VolumeMounts: []*runtimev1.VolumeMount{
-					{Name: "cfg", MountPath: "/etc/app"},
+					// cfg carries a sub_path so the wiring row pins the MAPPER
+					// carrying SubPath through to the VMBind (a mapping drop
+					// would otherwise survive: field parity checks names, not
+					// values).
+					{Name: "cfg", MountPath: "/etc/app", SubPath: "app.yaml"},
 					{Name: "creds", MountPath: "/etc/creds"},
 					{Name: "token", MountPath: "/var/run/secrets/token", ReadOnly: true},
 					{Name: "scratch", MountPath: "/scratch"},
@@ -78,12 +85,31 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 	}
 }
 
+// vmPodConfig returns a Config+Deps pair whose image cache is rooted at
+// Config.Root — the production New() wiring (runtime.go builds the cache from
+// cfg.Root when none is injected). Every test that drives a vm pod to the
+// backend needs this alignment: the share planner bounds the pod dir to
+// <Config.Root>/pods (mount.ComputeSharePlan via guardShareRoots), so
+// testDeps's default split-root cache (a separate t.TempDir()) would reject
+// every vm pod before CreateVM.
+func vmPodConfig(t *testing.T, d Deps) (Config, Deps) {
+	t.Helper()
+	root := t.TempDir()
+	cache, err := image.NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Cache = cache
+	return Config{Root: root}, d
+}
+
 // newVMPlanRuntime builds a Runtime whose vm backend is the available
 // fakeVMBackend recorder — the real vm wiring with the boot stub at the end.
 func newVMPlanRuntime(t *testing.T) (*Runtime, *fakeVMBackend) {
 	t.Helper()
 	vmb := &fakeVMBackend{available: true}
-	rt := newTestRuntime(t, Deps{VMBackend: vmb})
+	cfg, d := vmPodConfig(t, Deps{VMBackend: vmb})
+	rt := newTestRuntimeCfg(t, cfg, d)
 	return rt, vmb
 }
 
@@ -106,8 +132,12 @@ func mustPlanVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.Po
 }
 
 // mustRejectVM drives box through createPod and asserts the share-plan reject
-// contract: an error wrapping errInvalidPodBox, FailureReason INVALID_POD_BOX,
-// and CreateVM NEVER called (reject strictly before the backend).
+// contract: an error wrapping errInvalidPodBox whose wrap NAMES the share
+// planner ("share plan" — createVMPod's wrap text), FailureReason
+// INVALID_POD_BOX, and CreateVM NEVER called (reject strictly before the
+// backend). The fragment check keeps the helper from becoming vacuously
+// satisfiable if another INVALID_POD_BOX exit is later wrapped in the same
+// sentinel.
 func mustRejectVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.PodBox) {
 	t.Helper()
 	_, reason, err := rt.createPod(context.Background(), box, sandbox.GuestNetworkConfig{})
@@ -116,6 +146,9 @@ func mustRejectVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.
 	}
 	if !errors.Is(err, errInvalidPodBox) {
 		t.Errorf("reject error = %v, want errInvalidPodBox in the chain", err)
+	}
+	if !strings.Contains(err.Error(), "share plan") {
+		t.Errorf("reject error %q does not come from the share planner (want a %q fragment in the wrap)", err, "share plan")
 	}
 	if reason != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
 		t.Errorf("reason = %v, want INVALID_POD_BOX", reason)
@@ -176,11 +209,11 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 		spec := mustPlanVM(t, rt, vmb, vmShareBox("pod-plan-wire"))
 
-		podDir := rt.podDir("pod-plan-wire")
-		dataDir, err := rt.binder.Class().DataDir("default", "pgdata")
-		if err != nil {
-			t.Fatal(err)
-		}
+		// Every expected path is derived from Config.Root + the documented
+		// layout literals — never from the same rt.podDir/binder helpers the
+		// plan itself consumed, which would compare a derivation to itself.
+		podDir := filepath.Join(rt.cfg.Root, "pods", "pod-plan-wire")
+		dataDir := filepath.Join(rt.cfg.Root, "storage", "default", "pgdata")
 		wantShares := []sandbox.VMShare{
 			{Tag: "k3sm.rootfs", Root: filepath.Join(podDir, "rootfs"), Writable: false},
 			{Tag: "k3sm.proj", Root: filepath.Join(podDir, "k3sm.proj"), Writable: false},
@@ -192,7 +225,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		}
 
 		wantMain := []sandbox.VMBind{
-			{VolumeName: "cfg", ShareTag: "k3sm.proj", SourceRel: "cfg", MountPath: "/etc/app"},
+			{VolumeName: "cfg", ShareTag: "k3sm.proj", SourceRel: "cfg", MountPath: "/etc/app", SubPath: "app.yaml"},
 			{VolumeName: "creds", ShareTag: "k3sm.proj", SourceRel: "creds", MountPath: "/etc/creds", ReadOnly: true},
 			{VolumeName: "token", ShareTag: "k3sm.proj", SourceRel: "token", MountPath: "/var/run/secrets/token", ReadOnly: true},
 			{VolumeName: "scratch", ShareTag: "k3sm.vols", SourceRel: "scratch", MountPath: "/scratch"},
@@ -216,13 +249,22 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 	t.Run("share-roots-inside-owning-pod-dir", func(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 		spec := mustPlanVM(t, rt, vmb, vmShareBox("pod-plan-dir"))
-		podDir := rt.podDir("pod-plan-dir")
+
+		// Containment is asserted against the CONFIG-derived pod tree
+		// (<Config.Root>/pods/<podID>) — never against the same rt.podDir(...)
+		// the plan was built from, which the three pod-dir roots satisfy BY
+		// CONSTRUCTION (each is Join(podDir, <literal>)) for any podDir at all.
+		podsRoot := filepath.Join(rt.cfg.Root, "pods")
+		wantPodDir := filepath.Join(podsRoot, "pod-plan-dir")
 
 		// Non-vacuity anchor: the three pod-dir shares must exist at all.
 		for _, tag := range []string{"k3sm.rootfs", "k3sm.proj", "k3sm.vols"} {
 			s := findVMShare(t, spec, tag)
-			if !underStrict(s.Root, podDir) {
-				t.Errorf("share %s root %q is not strictly inside the owning pod dir %q", tag, s.Root, podDir)
+			if !underStrict(s.Root, wantPodDir) {
+				t.Errorf("share %s root %q is not strictly inside the config-derived pod dir %q", tag, s.Root, wantPodDir)
+			}
+			if !underStrict(s.Root, podsRoot) {
+				t.Errorf("share %s root %q is not strictly inside the runtime pods root %q", tag, s.Root, podsRoot)
 			}
 		}
 	})
@@ -341,7 +383,11 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 		box := vmShareBox("pod-plan-mem")
 		// Narrow to the Memory emptyDir alone: with no default-medium emptyDir
-		// declared, no vols share may be emitted either.
+		// declared, no vols share may be emitted either. The mount is
+		// read_only + sub_path-narrowed: BOTH must ride the VMTmpfs verbatim
+		// (the native path honors read_only on a Memory emptyDir and upstream
+		// permits sub_path on one — dropping either would be a silent vm-path
+		// narrowing).
 		box.Volumes = []*runtimev1.Volume{
 			{Name: "mem", EmptyDir: &runtimev1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: "64Mi"}},
 		}
@@ -349,13 +395,13 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		box.Containers = []*runtimev1.Container{{
 			Name:         "main",
 			Image:        "/bin/sleep",
-			VolumeMounts: []*runtimev1.VolumeMount{{Name: "mem", MountPath: "/cache"}},
+			VolumeMounts: []*runtimev1.VolumeMount{{Name: "mem", MountPath: "/cache", ReadOnly: true, SubPath: "warm"}},
 		}}
 		spec := mustPlanVM(t, rt, vmb, box)
 
-		wantTmpfs := []sandbox.VMTmpfs{{VolumeName: "mem", MountPath: "/cache", SizeLimit: "64Mi"}}
+		wantTmpfs := []sandbox.VMTmpfs{{VolumeName: "mem", MountPath: "/cache", SubPath: "warm", SizeLimit: "64Mi", ReadOnly: true}}
 		if !reflect.DeepEqual(spec.Volumes.Tmpfs["main"], wantTmpfs) {
-			t.Errorf("main tmpfs = %+v, want %+v (SizeLimit carried verbatim)", spec.Volumes.Tmpfs["main"], wantTmpfs)
+			t.Errorf("main tmpfs = %+v, want %+v (SizeLimit/SubPath verbatim, ReadOnly honored)", spec.Volumes.Tmpfs["main"], wantTmpfs)
 		}
 		for _, b := range spec.Volumes.Binds["main"] {
 			if b.VolumeName == "mem" {
@@ -408,6 +454,21 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 			box.Volumes = append(box.Volumes, &runtimev1.Volume{Name: "mystery"})
 			mustRejectVM(t, rt, vmb, box)
 		})
+	})
+
+	t.Run("pvc-crafted-claim-rejected-before-backend", func(t *testing.T) {
+		// The fix-round probe case, bound into the gate: a lateral
+		// "../<other-ns>/…" claim stays INSIDE the storage root (so the
+		// escapes-base guard alone never fires) but addresses a sibling
+		// namespace's tree — the single-path-component rule must reject it
+		// before the backend ever sees a plan.
+		rt, vmb := newVMPlanRuntime(t)
+		box := vmShareBox("pod-plan-crafted")
+		box.Volumes = append(box.Volumes, &runtimev1.Volume{
+			Name:                  "lateral",
+			PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "../tenant-b/pgdata"},
+		})
+		mustRejectVM(t, rt, vmb, box)
 	})
 
 	t.Run("pvc-share-root-equality-derived-from-datadir", func(t *testing.T) {
@@ -466,12 +527,48 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		// share root may ever land in that tree (R7), even one that satisfies
 		// every other derivation rule.
 		vmb := &fakeVMBackend{available: true}
-		root := t.TempDir()
-		class := storagev1.LocalPathClass{BasePath: filepath.Join(root, "run", "storage")}
-		binder := volume.NewBinder(class, nil, nil, nil)
-		rt := newTestRuntimeCfg(t, Config{Root: root}, Deps{VMBackend: vmb, Binder: binder})
+		cfg, d := vmPodConfig(t, Deps{VMBackend: vmb})
+		class := storagev1.LocalPathClass{BasePath: filepath.Join(cfg.Root, "run", "storage")}
+		d.Binder = volume.NewBinder(class, nil, nil, nil)
+		rt := newTestRuntimeCfg(t, cfg, d)
 
 		box := vmShareBox("pod-plan-rundir")
 		mustRejectVM(t, rt, vmb, box)
 	})
+}
+
+// TestVMVolumePlanFieldParity asserts the pkg/mount plan types and the
+// sandbox DTO types expose IDENTICAL field-name sets, pairwise. vmVolumePlan
+// (pod.go) maps the plan onto the DTO value for value; a field added to a
+// planner type but not the DTO (or vice versa) would otherwise ship silently
+// unmapped — this reds the suite instead, naming the divergence.
+func TestVMVolumePlanFieldParity(t *testing.T) {
+	fieldNames := func(v any) []string {
+		typ := reflect.TypeOf(v)
+		names := make([]string, 0, typ.NumField())
+		for i := 0; i < typ.NumField(); i++ {
+			names = append(names, typ.Field(i).Name)
+		}
+		sort.Strings(names)
+		return names
+	}
+	cases := []struct {
+		name string
+		mnt  any
+		dto  any
+	}{
+		{"plan", mount.SharePlan{}, sandbox.VMVolumePlan{}},
+		{"share", mount.Share{}, sandbox.VMShare{}},
+		{"bind", mount.Bind{}, sandbox.VMBind{}},
+		{"tmpfs", mount.Tmpfs{}, sandbox.VMTmpfs{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, d := fieldNames(tc.mnt), fieldNames(tc.dto)
+			if !reflect.DeepEqual(m, d) {
+				t.Errorf("field sets diverge (a new planner field must be mirrored in the DTO and mapped in vmVolumePlan):\n  %T: %v\n  %T: %v",
+					tc.mnt, m, tc.dto, d)
+			}
+		})
+	}
 }

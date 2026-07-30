@@ -93,6 +93,9 @@ func TestValidateVMSubPath(t *testing.T) {
 		{"simple", "conf", false},
 		{"nested", "a/b/c", false},
 		{"dotfile", ".hidden", false},
+		// "." selects the volume root (clean-invariant, no ".." segment) —
+		// accepted and carried verbatim, pinned so a tightening is deliberate.
+		{"dot-selects-the-volume-root", ".", false},
 		{"absolute", "/etc/passwd", true},
 		{"dotdot-alone", "..", true},
 		{"leading-dotdot-clean-invariant", "../x", true},
@@ -154,9 +157,10 @@ func TestClassifyVMVolumeArity(t *testing.T) {
 
 // TestComputeSharePlanRejects table-drives the planner's fail-closed rejects
 // beyond the classification table above: undeclared mounts, duplicate
-// identities, malformed inputs, and every share-root guard (storage-root
-// escape via a traversing claim name, the <workRoot>/run socket tree, nested
-// roots).
+// identities, malformed inputs, and every share-root guard (the
+// single-path-component rule on PVC namespace/claim names, the
+// <workRoot>/pods bound on the pod dir, the <workRoot>/run socket tree,
+// aliased roots).
 func TestComputeSharePlanRejects(t *testing.T) {
 	const root = "/work"
 	pod := root + "/pods/pod-1"
@@ -226,21 +230,118 @@ func TestComputeSharePlanRejects(t *testing.T) {
 			wantFrag: "sub_path",
 		},
 		{
-			name: "subpath-on-memory-emptydir",
+			name: "tmpfs-subpath-traversal",
 			box: func() *runtimev1.PodBox {
+				// sub_path IS carried on a Memory-medium emptyDir (upstream
+				// permits it), so the lexical validation must keep applying
+				// to the tmpfs class too.
 				b := planBox(&runtimev1.Volume{Name: "v", EmptyDir: &runtimev1.EmptyDirVolumeSource{Medium: "Memory"}})
-				b.Containers[0].VolumeMounts[0].SubPath = "sub"
+				b.Containers[0].VolumeMounts[0].SubPath = "../creds"
 				return b
 			}(),
-			wantFrag: "not supported on a Memory-medium emptyDir",
+			wantFrag: "sub_path",
+		},
+		// The single-path-component guard on PVC names — one row per probe
+		// shape. Each name states what the crafted input would have addressed:
+		// a lateral row is a SIBLING NAMESPACE's tree (inside the storage
+		// root, so the escapes-base guard alone never fires), the "."/"/"
+		// rows are the whole namespace tree (an ANCESTOR of every claim root),
+		// and only the multi-".." row actually leaves the storage root.
+		{
+			name: "pvc-claim-lateral-into-sibling-namespace",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "../tenant-b/pgdata"},
+			}),
+			wantFrag: "single path component",
 		},
 		{
-			name: "pvc-claim-traversal-escapes-storage-root",
+			name: "pvc-claim-dot-addresses-the-namespace-tree",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "."},
+			}),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-slash-addresses-the-namespace-tree",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "/"},
+			}),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-self-cancelling-traversal",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "a/.."},
+			}),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-upward-traversal-out-of-storage",
 			box: planBox(&runtimev1.Volume{
 				Name:                  "v",
 				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "../../etc"},
 			}),
-			wantFrag: "escapes the storage base path",
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-multi-component",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "a/b"},
+			}),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-absolute",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "/var/lib/pg"},
+			}),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-backslash",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: `..\tenant-b`},
+			}),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-claim-empty",
+			box: planBox(&runtimev1.Volume{
+				Name:                  "v",
+				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: ""},
+			}),
+			wantFrag: "claim_name must not be empty",
+		},
+		{
+			name: "pvc-namespace-traversal",
+			box: func() *runtimev1.PodBox {
+				b := planBox(&runtimev1.Volume{
+					Name:                  "v",
+					PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "good"},
+				})
+				b.Namespace = "../tenant-b"
+				return b
+			}(),
+			wantFrag: "single path component",
+		},
+		{
+			name: "pvc-namespace-empty",
+			box: func() *runtimev1.PodBox {
+				b := planBox(&runtimev1.Volume{
+					Name:                  "v",
+					PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "good"},
+				})
+				b.Namespace = ""
+				return b
+			}(),
+			wantFrag: "namespace must not be empty",
 		},
 		{
 			name: "pvc-claim-traversal-into-run-tree",
@@ -254,12 +355,28 @@ func TestComputeSharePlanRejects(t *testing.T) {
 			wantFrag: "intersects the runtime socket tree",
 		},
 		{
-			name: "pvc-roots-nested-via-claim-names",
+			name: "pvc-shares-alias-one-dir-same-claim-twice",
+			// Two volumes on the SAME claim derive the identical root — two
+			// devices aliasing one host tree — which the pairwise-disjoint
+			// guard refuses. (A nested pair via a multi-component claim like
+			// "c/nested" now rejects earlier, at the single-component check.)
 			box: planBox(
 				&runtimev1.Volume{Name: "a", PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}},
-				&runtimev1.Volume{Name: "b", PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "c/nested"}},
+				&runtimev1.Volume{Name: "b", PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}},
 			),
 			wantFrag: "are nested",
+		},
+		{
+			name:     "pod-dir-outside-the-pods-root",
+			box:      planBox(),
+			podDir:   "/stray/desktop",
+			wantFrag: "not strictly under the runtime pods root",
+		},
+		{
+			name:     "pod-dir-equals-the-pods-root",
+			box:      planBox(),
+			podDir:   root + "/pods",
+			wantFrag: "not strictly under the runtime pods root",
 		},
 		{
 			name:     "relative-pod-dir",
@@ -368,6 +485,24 @@ func TestComputeSharePlanShapes(t *testing.T) {
 		}
 		if got := plan.Binds["main"][0].SubPath; got != "keys/tls.crt" {
 			t.Errorf("SubPath = %q, want verbatim %q", got, "keys/tls.crt")
+		}
+	})
+
+	t.Run("tmpfs-carries-subpath-readonly-and-sizelimit", func(t *testing.T) {
+		// A read_only volumeMount of a Memory emptyDir, narrowed by sub_path:
+		// both must ride the Tmpfs verbatim — the native path honors read_only
+		// on a Memory emptyDir (materialize.go) and upstream permits sub_path
+		// on one, so dropping either would be a silent vm-path narrowing.
+		box := planBox(&runtimev1.Volume{Name: "mem", EmptyDir: &runtimev1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: "64Mi"}})
+		box.Containers[0].VolumeMounts[0].SubPath = "warm"
+		box.Containers[0].VolumeMounts[0].ReadOnly = true
+		plan, err := ComputeSharePlan(box, pod, root, class)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Tmpfs{{VolumeName: "mem", MountPath: "/mnt/mem", SubPath: "warm", SizeLimit: "64Mi", ReadOnly: true}}
+		if !reflect.DeepEqual(plan.Tmpfs["main"], want) {
+			t.Errorf("main tmpfs = %+v, want %+v", plan.Tmpfs["main"], want)
 		}
 	})
 

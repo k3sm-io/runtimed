@@ -505,7 +505,11 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		sp := &fakeSpawner{}
 		backend := &recordingBackend{available: true}
 		vmb := &fakeVMBackend{available: true}
-		rt := newTestRuntime(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb})
+		// vmPodConfig: the share planner requires the pod dir under
+		// <Config.Root>/pods, so the cache must be rooted at Config.Root as
+		// production wires it.
+		cfg, d := vmPodConfig(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb})
+		rt := newTestRuntimeCfg(t, cfg, d)
 
 		box := hostBinBox("pod-vm")
 		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
@@ -648,7 +652,11 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 	t.Run("vm-pod-carries-config-no-lo0-alias", func(t *testing.T) {
 		vmb := &fakeVMBackend{available: true}
 		net := &recordingNetwork{}
-		rt := newTestRuntime(t, Deps{VMBackend: vmb, Network: net})
+		// vmPodConfig: the share planner requires the pod dir under
+		// <Config.Root>/pods, so the cache must be rooted at Config.Root as
+		// production wires it.
+		cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Network: net})
+		rt := newTestRuntimeCfg(t, cfg, d)
 
 		box := hostBinBox("pod-vm-net")
 		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM

@@ -558,7 +558,9 @@ func vmVolumePlan(plan mount.SharePlan) sandbox.VMVolumePlan {
 				mapped = append(mapped, sandbox.VMTmpfs{
 					VolumeName: tm.VolumeName,
 					MountPath:  tm.MountPath,
+					SubPath:    tm.SubPath,
 					SizeLimit:  tm.SizeLimit,
+					ReadOnly:   tm.ReadOnly,
 				})
 			}
 			out.Tmpfs[name] = mapped
