@@ -116,6 +116,11 @@ type VMSpec struct {
 	// a zero value networks no guest. A NAT-attached guest gets its network via the
 	// VZNATNetworkDeviceAttachment, NEVER a host lo0 alias.
 	Network GuestNetworkConfig
+	// Volumes is the virtiofs share-device plan for the pod's volumes (B106),
+	// stamped as data by createVMPod (pkg/runtime), the named mapper from
+	// pkg/mount's planner — sandbox imports neither. The zero value plans
+	// nothing (safe); see VMVolumePlan.
+	Volumes VMVolumePlan
 }
 
 // VMBackend is the Virtualization.framework micro-VM isolation backend (M5.1) —
