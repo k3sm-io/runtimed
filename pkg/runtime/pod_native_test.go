@@ -103,8 +103,10 @@ func TestResolveBinaryPullPolicyCarriesResolvedBackend(t *testing.T) {
 				t.Errorf("pull policy backend = %v, want the pod's resolved backend %v", pol.Backend, backend)
 			}
 			// Every native rung must still resolve to darwin/arm64 only: the
-			// host-process spine runs Mach-O, and HostRosetta stays false until
-			// the capability probe lands (B103).
+			// host-process spine runs Mach-O, and HostRosetta stays false even
+			// though the capability probe now EXISTS (B103) — the pull path
+			// deliberately does not consume it until the Seatbelt x Rosetta spawn
+			// is proven (B105). This assertion is what keeps that decision honest.
 			cands, err := image.Candidates(pol)
 			if err != nil {
 				t.Fatalf("pull policy has no candidates: %v", err)

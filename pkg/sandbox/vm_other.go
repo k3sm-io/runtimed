@@ -27,3 +27,11 @@ package sandbox
 func vzSupported() bool { return false }
 
 func vzEntitled() bool { return false }
+
+// vzRosettaAvailability is the OFF-PLATFORM guest-Rosetta probe: on any lane that
+// is NOT darwin+cgo the Virtualization.framework shim is not compiled in, so the
+// probe cannot answer and reports GuestRosettaQueryFailed — which fails closed
+// (GuestRosettaState.Available() is false). It is deliberately QueryFailed rather
+// than NotSupported: "this build cannot ask" is a different fact from "Apple says
+// this host cannot translate", and the RuntimeCondition Reason keeps them apart.
+func vzRosettaAvailability() GuestRosettaState { return GuestRosettaQueryFailed }
