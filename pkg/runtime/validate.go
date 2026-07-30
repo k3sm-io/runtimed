@@ -19,6 +19,7 @@ package runtime
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -34,9 +35,9 @@ func validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod is nil", errInvalidPodBox)
 	}
-	if box.GetPodId() == "" {
+	if err := validPodID(box.GetPodId()); err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: pod_id is required", errInvalidPodBox)
+			fmt.Errorf("%w: %v", errInvalidPodBox, err)
 	}
 	if box.GetSandboxProfile() == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -53,6 +54,25 @@ func validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 			fmt.Errorf("%w: signature_policy is UNSPECIFIED (fail-closed)", errInvalidPodBox)
 	}
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// validPodID requires the pod id to be a single, clean path component. The id
+// is spliced into on-disk paths (<root>/pods/<podID> — image.Cache.PodRootfs,
+// removePodDir, the SBPL profile paths), so this is the narrowest ingress at
+// which every consumer inherits traversal safety: no separators, no "..", no
+// ".", never empty, no NUL. CreatePod rejects a violation as INVALID_POD_BOX
+// before any path is derived; removePodDir independently re-checks containment
+// (defense in depth for ids arriving on other RPCs).
+func validPodID(id string) error {
+	switch {
+	case id == "":
+		return errors.New("pod_id is required")
+	case id == "." || id == "..":
+		return fmt.Errorf("pod_id %q is not a valid path component", id)
+	case strings.ContainsAny(id, `/\`) || strings.ContainsRune(id, 0):
+		return fmt.Errorf("pod_id %q must be a single path component (no separators or NUL)", id)
+	}
+	return nil
 }
 
 // updatableOnly verifies that newBox changes only in-place-updatable fields

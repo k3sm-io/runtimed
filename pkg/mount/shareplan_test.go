@@ -74,8 +74,8 @@ func TestIsStrictlyUnder(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isStrictlyUnder(tc.path, tc.base); got != tc.want {
-				t.Errorf("isStrictlyUnder(%q, %q) = %v, want %v", tc.path, tc.base, got, tc.want)
+			if got := IsStrictlyUnder(tc.path, tc.base); got != tc.want {
+				t.Errorf("IsStrictlyUnder(%q, %q) = %v, want %v", tc.path, tc.base, got, tc.want)
 			}
 		})
 	}

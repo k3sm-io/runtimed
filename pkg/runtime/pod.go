@@ -1242,10 +1242,18 @@ func (r *Runtime) podDir(podID string) string {
 // claim reuses it. A PVC's pod-side symlink lives inside the pod dir and IS
 // removed, but os.RemoveAll unlinks the symlink without following it, so the
 // target dir under <Root>/storage is untouched.
+//
+// Containment is separator-aware (mount.IsStrictlyUnder against <Root>/pods),
+// not a bare prefix check: a hostile podID with ".." components collapses OUT
+// of the pods root under filepath.Join, and a prefix check would still bless a
+// SIBLING of Root (HasPrefix("/x-evil", "/x")). CreatePod already rejects such
+// ids (validPodID), but ids reach here from other RPCs too, so the guard is
+// re-derived where the RemoveAll happens.
 func (r *Runtime) removePodDir(podID string) error {
 	dir := r.podDir(podID)
-	if dir == "" || dir == "/" || !strings.HasPrefix(dir, r.cfg.Root) {
-		return nil
+	podsRoot := filepath.Join(r.cfg.Root, "pods")
+	if !mount.IsStrictlyUnder(dir, podsRoot) {
+		return fmt.Errorf("refusing to remove pod dir %q: not strictly under %q", dir, podsRoot)
 	}
 	return os.RemoveAll(dir)
 }
