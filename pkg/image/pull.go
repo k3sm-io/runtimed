@@ -326,9 +326,12 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	// Persist the raw manifest bytes into the CAS, keyed by the manifest's own
 	// digest (content-addressed, idempotent, temp+rename like every blob). This
 	// is the EDGE RECORD for prune reachability (Cache.EnumerateBlobs parses
-	// these to learn which config/layer blobs each image names); the M12.1-d1
-	// ref→digest index (docs/m12-plan.md) will consume these persisted manifests
-	// — do not grow this into an index. It is written FIRST, before config and
+	// these to learn which config/layer blobs each image names). The local
+	// ref→digest image index, when it lands, will CONSUME these persisted
+	// manifests — do not grow this into an index: the CAS keyed by manifest
+	// digest answers "which blobs does this image name", never "which digest
+	// does this tag mean", and conflating the two would put mutable tag state
+	// in a content-addressed store. It is written FIRST, before config and
 	// layers, so a pull that dies mid-stream leaves blobs that are still NAMED
 	// (and thus prunable once unreferenced) rather than orphans the fail-closed
 	// planner must keep forever.
