@@ -241,10 +241,17 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		}
 
 		// Same pod, hostile box.rootfs_path (the runtime work root itself). A
-		// failed vm create registers nothing, so the same pod id re-runs.
+		// failed vm create registers nothing, so the same pod id re-runs on the
+		// same runtime; the recorder count is cumulative, hence want 2 here.
 		hostileBox := vmShareBox("pod-plan-hostile")
 		hostileBox.RootfsPath = rt.cfg.Root
-		hostile := mustPlanVM(t, rt, vmb, hostileBox)
+		if _, _, err := rt.createPod(context.Background(), hostileBox, sandbox.GuestNetworkConfig{}); err == nil {
+			t.Fatal("vm createPod should surface the lab-gated boot error")
+		}
+		n, hostile := vmb.created()
+		if n != 2 {
+			t.Fatalf("CreateVM called %d times, want 2 (the hostile run must still reach the backend)", n)
+		}
 
 		if got := vmShareRoots(hostile); !reflect.DeepEqual(got, cleanRoots) {
 			t.Errorf("hostile rootfs_path moved share roots:\n  hostile: %v\n  clean:   %v", got, cleanRoots)

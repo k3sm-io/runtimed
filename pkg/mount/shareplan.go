@@ -17,6 +17,12 @@ limitations under the License.
 package mount
 
 import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	storagev1 "k3sm.io/apis/storage/v1"
 )
@@ -43,6 +49,23 @@ const (
 	// volumes.
 	ShareTagPVCPrefix = "k3sm.pvc"
 )
+
+// vmRootfsDirName / vmProjDirName / vmVolsDirName are the fixed on-disk
+// directory names under the pod dir that the pod-dir shares export.
+// vmRootfsDirName MUST stay the "rootfs" component of image.Cache.PodRootfs
+// (podDir is its Dir, so Join(podDir, vmRootfsDirName) re-derives the same
+// path). proj/vols coincide with their tags today but are separate constants:
+// the tag is the guest-visible contract, the dir name the host-disk one.
+const (
+	vmRootfsDirName = "rootfs"
+	vmProjDirName   = "k3sm.proj"
+	vmVolsDirName   = "k3sm.vols"
+)
+
+// emptyDirMediumMemory is the single non-default value of the CLOSED emptyDir
+// medium set ("" → a vols-share bind, "Memory" → guest tmpfs); any other value
+// is rejected, never approximated.
+const emptyDirMediumMemory = "Memory"
 
 // SharePlan is the virtiofs share-device plan computed for a vm-RuntimeClass
 // pod's volumes: which host directories become VZ shared-directory devices
@@ -130,5 +153,345 @@ type Tmpfs struct {
 // filesystem access, no chown. Any box the planner cannot prove safe is
 // rejected with an error (fail closed).
 func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class storagev1.LocalPathClass) (SharePlan, error) {
-	return SharePlan{}, nil
+	if box == nil {
+		return SharePlan{}, errors.New("nil pod box")
+	}
+	podDir = filepath.Clean(podDir)
+	workRoot = filepath.Clean(workRoot)
+	if !filepath.IsAbs(podDir) {
+		return SharePlan{}, fmt.Errorf("pod dir %q must be absolute", podDir)
+	}
+	if !filepath.IsAbs(workRoot) {
+		return SharePlan{}, fmt.Errorf("work root %q must be absolute", workRoot)
+	}
+	class = class.WithDefaults()
+
+	// Classify the DECLARATION set — every volume in box.volumes, mounted or
+	// not — so an unknown-source volume rejects even before (or without) any
+	// container mounting it.
+	vols := make(map[string]vmVolume, len(box.GetVolumes()))
+	haveProj, haveVols := false, false
+	var pvcNames []string
+	for _, v := range box.GetVolumes() {
+		name := v.GetName()
+		if name == "" {
+			return SharePlan{}, errors.New("volume with empty name")
+		}
+		if _, dup := vols[name]; dup {
+			return SharePlan{}, fmt.Errorf("duplicate volume name %q", name)
+		}
+		info, err := classifyVMVolume(v)
+		if err != nil {
+			return SharePlan{}, fmt.Errorf("volume %s: %w", name, err)
+		}
+		vols[name] = info
+		switch info.class {
+		case vmClassProj:
+			haveProj = true
+		case vmClassVols:
+			haveVols = true
+		case vmClassPVC:
+			pvcNames = append(pvcNames, name)
+		}
+	}
+
+	// Assemble the shares in the plan's deterministic order: rootfs always,
+	// proj/vols only when a declared volume of the class exists, then the PVC
+	// shares in sorted-volume-name order. Every pod-dir root derives from
+	// podDir + a fixed literal; the PVC root is EXACTLY the class DataDir.
+	shares := []Share{{Tag: ShareTagRootfs, Root: filepath.Join(podDir, vmRootfsDirName)}}
+	if haveProj {
+		shares = append(shares, Share{Tag: ShareTagProj, Root: filepath.Join(podDir, vmProjDirName)})
+	}
+	if haveVols {
+		shares = append(shares, Share{Tag: ShareTagVols, Root: filepath.Join(podDir, vmVolsDirName), Writable: true})
+	}
+	podDirShares := len(shares)
+	sort.Strings(pvcNames)
+	pvcTags := make(map[string]string, len(pvcNames))
+	for i, name := range pvcNames {
+		src := vols[name].vol.GetPersistentVolumeClaim()
+		root, err := class.DataDir(box.GetNamespace(), src.GetClaimName())
+		if err != nil {
+			return SharePlan{}, fmt.Errorf("volume %s: %w", name, err)
+		}
+		tag := fmt.Sprintf("%s%d", ShareTagPVCPrefix, i)
+		pvcTags[name] = tag
+		shares = append(shares, Share{Tag: tag, Root: root, Writable: !src.GetReadOnly()})
+	}
+
+	// Binds and tmpfs per container — init and main lists alike, each keyed by
+	// ITS name over ITS declared volumeMounts only (never a pod-wide union: in
+	// the guest each container has its own mount namespace, so what container
+	// A mounts must never leak into container B's view).
+	binds := make(map[string][]Bind)
+	tmpfs := make(map[string][]Tmpfs)
+	containers := make([]*runtimev1.Container, 0, len(box.GetInitContainers())+len(box.GetContainers()))
+	containers = append(containers, box.GetInitContainers()...)
+	containers = append(containers, box.GetContainers()...)
+	seenContainer := make(map[string]bool, len(containers))
+	for _, c := range containers {
+		cname := c.GetName()
+		if cname == "" {
+			return SharePlan{}, errors.New("container with empty name")
+		}
+		if seenContainer[cname] {
+			// The per-container keying below would silently merge two
+			// same-named containers' mounts — reject instead (fail closed;
+			// Kubernetes forbids duplicate container names pod-wide anyway).
+			return SharePlan{}, fmt.Errorf("duplicate container name %q", cname)
+		}
+		seenContainer[cname] = true
+		seenPath := make(map[string]bool, len(c.GetVolumeMounts()))
+		for _, m := range c.GetVolumeMounts() {
+			info, ok := vols[m.GetName()]
+			if !ok {
+				return SharePlan{}, fmt.Errorf("container %s: volume_mount %q references undeclared volume", cname, m.GetName())
+			}
+			mp := m.GetMountPath()
+			if mp == "" {
+				return SharePlan{}, fmt.Errorf("container %s: volume_mount %q has an empty mount_path", cname, m.GetName())
+			}
+			// Mirror the native seenMount conflict discipline at this path's
+			// scope: within ONE container a guest mount path holds exactly one
+			// selection, so a repeated mount_path is a hard error.
+			if seenPath[mp] {
+				return SharePlan{}, fmt.Errorf("container %s: duplicate mount_path %q", cname, mp)
+			}
+			seenPath[mp] = true
+			sp := m.GetSubPath()
+			if sp != "" {
+				if err := validateVMSubPath(sp); err != nil {
+					return SharePlan{}, fmt.Errorf("container %s: volume_mount %q: %w", cname, m.GetName(), err)
+				}
+			}
+			switch info.class {
+			case vmClassTmpfs:
+				if sp != "" {
+					// The tmpfs DTO carries no sub_path, so it cannot be
+					// honored verbatim — dropping it silently would mount the
+					// whole tmpfs where a narrowed view was declared. Fail
+					// closed instead.
+					return SharePlan{}, fmt.Errorf("container %s: volume_mount %q: sub_path is not supported on a Memory-medium emptyDir", cname, m.GetName())
+				}
+				tmpfs[cname] = append(tmpfs[cname], Tmpfs{
+					VolumeName: m.GetName(),
+					MountPath:  mp,
+					SizeLimit:  info.vol.GetEmptyDir().GetSizeLimit(),
+				})
+			case vmClassPVC:
+				binds[cname] = append(binds[cname], Bind{
+					VolumeName: m.GetName(),
+					ShareTag:   pvcTags[m.GetName()],
+					MountPath:  mp,
+					SubPath:    sp,
+					ReadOnly:   m.GetReadOnly() || info.vol.GetPersistentVolumeClaim().GetReadOnly(),
+				})
+			default:
+				tag := ShareTagProj
+				if info.class == vmClassVols {
+					tag = ShareTagVols
+				}
+				binds[cname] = append(binds[cname], Bind{
+					VolumeName: m.GetName(),
+					ShareTag:   tag,
+					SourceRel:  m.GetName(),
+					MountPath:  mp,
+					SubPath:    sp,
+					// Mirrors Materialize's read-only derivation
+					// (materialize.go: read_only || credential || projected).
+					ReadOnly: m.GetReadOnly() || info.credential || info.projected,
+				})
+			}
+		}
+	}
+
+	if err := guardShareRoots(shares, podDirShares, podDir, workRoot, class.BasePath); err != nil {
+		return SharePlan{}, err
+	}
+	if len(binds) == 0 {
+		binds = nil
+	}
+	if len(tmpfs) == 0 {
+		tmpfs = nil
+	}
+	return SharePlan{Shares: shares, Binds: binds, Tmpfs: tmpfs}, nil
+}
+
+// vmVolClass is the planner's classification of a declared volume.
+type vmVolClass int
+
+const (
+	// vmClassProj — configMap / secret / projected / downwardAPI, bound from
+	// the read-only pooled proj share.
+	vmClassProj vmVolClass = iota
+	// vmClassVols — default-medium emptyDir, bound from the writable pooled
+	// vols share.
+	vmClassVols
+	// vmClassTmpfs — Memory-medium emptyDir, a guest tmpfs (never a share).
+	vmClassTmpfs
+	// vmClassPVC — persistentVolumeClaim, one share per volume.
+	vmClassPVC
+)
+
+// vmVolume is one classified declared volume.
+type vmVolume struct {
+	vol   *runtimev1.Volume
+	class vmVolClass
+	// credential mirrors Materialize's classification: a secret, or a
+	// projected volume containing a secret / serviceAccountToken source.
+	credential bool
+	// projected marks a projected volume (always read-only, mirroring
+	// Materialize's `|| vol.GetProjected() != nil` term).
+	projected bool
+}
+
+// classifyVMVolume ARITY-CHECKS a declared volume's source union and
+// classifies the single set source. The union is NOT a proto oneof, so the
+// dispatch COUNTS the set sources across the known source getters (proto
+// fields 2–7) and rejects anything but exactly one:
+//
+//   - a FUTURE source field (host_path = 8, and 9, 10, … after it) is unknown
+//     to this build, sets none of the known getters, and lands in the
+//     count == 0 reject BY CONSTRUCTION — where a first-match dispatch would
+//     silently plan an empty/wrong device for it (fail open);
+//   - a TWO-source volume (representable on the wire for the same non-oneof
+//     reason) rejects as count == 2 instead of first-match-wins.
+func classifyVMVolume(v *runtimev1.Volume) (vmVolume, error) {
+	count := 0
+	for _, set := range []bool{
+		v.GetConfigMap() != nil,
+		v.GetSecret() != nil,
+		v.GetEmptyDir() != nil,
+		v.GetDownwardApi() != nil,
+		v.GetProjected() != nil,
+		v.GetPersistentVolumeClaim() != nil,
+	} {
+		if set {
+			count++
+		}
+	}
+	if count != 1 {
+		return vmVolume{}, fmt.Errorf("%d volume sources set, want exactly 1 (unknown or multi-source volumes fail closed)", count)
+	}
+	info := vmVolume{vol: v}
+	switch {
+	case v.GetConfigMap() != nil, v.GetDownwardApi() != nil:
+		info.class = vmClassProj
+	case v.GetSecret() != nil:
+		info.class = vmClassProj
+		info.credential = true
+	case v.GetProjected() != nil:
+		info.class = vmClassProj
+		info.projected = true
+		info.credential = projectedCredential(v.GetProjected())
+	case v.GetEmptyDir() != nil:
+		switch v.GetEmptyDir().GetMedium() {
+		case "":
+			info.class = vmClassVols
+		case emptyDirMediumMemory:
+			info.class = vmClassTmpfs
+		default:
+			return vmVolume{}, fmt.Errorf("emptyDir medium %q is not in the closed set (%q or %q)",
+				v.GetEmptyDir().GetMedium(), "", emptyDirMediumMemory)
+		}
+	case v.GetPersistentVolumeClaim() != nil:
+		info.class = vmClassPVC
+	}
+	return info, nil
+}
+
+// projectedCredential mirrors renderProjected's credential classification
+// without rendering anything: a projected volume is a credential iff any of
+// its sources is a secret or a serviceAccountToken.
+func projectedCredential(src *runtimev1.ProjectedVolumeSource) bool {
+	for _, p := range src.GetSources() {
+		if p.GetSecret() != nil || p.GetServiceAccountToken() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// validateVMSubPath lexically validates a volumeMount sub_path carried on a
+// bind: relative, already clean, no ".." segment. Both halves are
+// load-bearing: "../x" IS already clean (Clean is a no-op on it), so the
+// clean-invariance check alone would pass it — the segment scan catches it;
+// "a/../b" cleans to "b", so the segment scan alone would run on the wrong
+// string — the clean check catches it first. Purely lexical: the planner never
+// resolves the path (guest-init applies it inside the guest, where its own
+// containment applies).
+func validateVMSubPath(sp string) error {
+	if filepath.IsAbs(sp) {
+		return fmt.Errorf("sub_path %q must be relative", sp)
+	}
+	if filepath.Clean(sp) != sp {
+		return fmt.Errorf("sub_path %q is not a clean path", sp)
+	}
+	for _, seg := range strings.Split(sp, string(filepath.Separator)) {
+		if seg == ".." {
+			return fmt.Errorf("sub_path %q must not contain a %q segment", sp, "..")
+		}
+	}
+	return nil
+}
+
+// guardShareRoots is the fail-closed defence-in-depth over the assembled share
+// roots. shares[:podDirShares] are the pod-dir shares (Join(podDir, <fixed
+// literal>)); the rest are PVC shares (the class DataDir join).
+//
+// The comparisons are LEXICAL — no filepath.EvalSymlinks — and that is SOUND
+// HERE only because of a load-bearing precondition: every compared path
+// derives from a configured root string (podDir/workRoot from the runtime
+// config, the PVC roots from class.BasePath) joined with fixed literals and
+// PodBox NAME COMPONENTS, and no caller-supplied absolute PATH survives to the
+// comparison (a hostPath source is outside the arity check's closed set and
+// rejects; box.rootfs_path is ignored by the planner). Operands of one
+// derivation cannot disagree about firmlink/symlink spellings (/var vs
+// /private/var), which is the case lexical comparison cannot judge. Keep that
+// precondition true when extending the planner.
+func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePath string) error {
+	runDir := filepath.Join(workRoot, "run")
+	for i, s := range shares {
+		if s.Root == "" {
+			return fmt.Errorf("share %s has an empty root", s.Tag)
+		}
+		if i < podDirShares {
+			// A pod-dir share stays STRICTLY inside the owning pod dir —
+			// equality would export the whole pod dir, which is exactly why
+			// this uses isStrictlyUnder and not isUnder (equality-true).
+			if !isStrictlyUnder(s.Root, podDir) {
+				return fmt.Errorf("share %s root %q escapes the pod dir %q", s.Tag, s.Root, podDir)
+			}
+		} else {
+			// A PVC root is equality-derived from class.DataDir, and even so
+			// must never be the storage root itself nor escape it (a
+			// namespace/claim crafted to traverse the join lands here).
+			if s.Root == basePath {
+				return fmt.Errorf("share %s root equals the storage base path %q", s.Tag, basePath)
+			}
+			if !isStrictlyUnder(s.Root, basePath) {
+				return fmt.Errorf("share %s root %q escapes the storage base path %q", s.Tag, s.Root, basePath)
+			}
+		}
+		// R7: no share may export, sit inside, or contain the daemon socket
+		// tree <workRoot>/run (netd.sock, runtimed.sock, run/keys) — a guest
+		// handed any slice of it could reach the daemon control sockets.
+		if s.Root == runDir || isStrictlyUnder(s.Root, runDir) || isStrictlyUnder(runDir, s.Root) {
+			return fmt.Errorf("share %s root %q intersects the runtime socket tree %q", s.Tag, s.Root, runDir)
+		}
+	}
+	// Pairwise disjoint (strict, separator-aware): a nested pair would alias
+	// one host tree through two devices with potentially different
+	// writability, and the sibling-prefix case (/a/b vs /a/bc) must NOT be
+	// treated as nested.
+	for i := 0; i < len(shares); i++ {
+		for j := i + 1; j < len(shares); j++ {
+			a, b := shares[i], shares[j]
+			if a.Root == b.Root || isStrictlyUnder(a.Root, b.Root) || isStrictlyUnder(b.Root, a.Root) {
+				return fmt.Errorf("share roots %q (%s) and %q (%s) are nested", a.Root, a.Tag, b.Root, b.Tag)
+			}
+		}
+	}
+	return nil
 }
