@@ -345,7 +345,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// image.RemoteFetch is named EXPLICITLY: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
-		p, err := image.NewPuller(cache, image.RemoteFetch)
+		p, err := image.NewPuller(cache, image.RemoteFetch, image.WithPressureLogger(log))
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)
 		}

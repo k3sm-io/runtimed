@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // DefaultRoot is the on-disk root for the content-addressed image cache and pod
@@ -34,8 +35,15 @@ const DefaultRoot = "/var/lib/k3sm"
 //
 // Cache is safe for use by one process; concurrent writers to the same digest
 // race on the temp+rename and are harmless (identical content).
+//
+// Locking: pruneMu serializes prune execution against blob writes IN THIS
+// PROCESS — Puller.writeBlob holds the read side for the duration of one blob
+// write (concurrent pulls proceed), Cache.ExecutePrune holds the write side.
+// Two Cache values pointing at the same directory do not serialize; the daemon
+// holds exactly one.
 type Cache struct {
-	root string
+	root    string
+	pruneMu sync.RWMutex
 }
 
 // NewCache returns a Cache rooted at root (DefaultRoot if empty), creating the

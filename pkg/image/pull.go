@@ -22,8 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -213,15 +216,21 @@ func imageByDigest(ref name.Digest, opts []remote.Option) (ggcrv1.Image, error) 
 type PullResult struct {
 	// Manifest is the pulled image manifest in the shared apis form.
 	Manifest *runtimev1.ImageManifest
-	// CacheHit is true when the config and all layers were already cached (no
-	// blob was newly written) — i.e. a second pull of the same content.
+	// ManifestDigest is the digest of the resolved manifest itself
+	// ("<algo>:<hex>") — the key under which Pull persisted the manifest blob,
+	// and the identity a caller supplies in PlanPrune's in-use set to protect
+	// this image's chain.
+	ManifestDigest string
+	// CacheHit is true when the manifest, config and all layers were already
+	// cached (no blob was newly written) — i.e. a second pull of the same content.
 	CacheHit bool
 }
 
 // Puller pulls OCI images into a Cache using a FetchFunc.
 type Puller struct {
-	cache *Cache
-	fetch FetchFunc
+	cache    *Cache
+	fetch    FetchFunc
+	pressure *pressureGate
 }
 
 // NewPuller returns a Puller writing into cache and fetching via fetch.
@@ -233,14 +242,38 @@ type Puller struct {
 // An implicit default is the exact shape of bug this package exists to remove —
 // and it also hides the binding from tests, which then cannot tell a production
 // wiring from a mis-wiring.
-func NewPuller(cache *Cache, fetch FetchFunc) (*Puller, error) {
+//
+// opts tune the disk-pressure stop-new-pulls gate (threshold, sampler seam,
+// logger); the defaults are DefaultMinFreeBytes over StatfsFreeBytes on the
+// cache root, logging discarded.
+func NewPuller(cache *Cache, fetch FetchFunc, opts ...PullerOption) (*Puller, error) {
 	if cache == nil {
 		return nil, errors.New("image puller: cache is required")
 	}
 	if fetch == nil {
 		return nil, errors.New("image puller: fetch is required (the production fetcher is image.RemoteFetch)")
 	}
-	return &Puller{cache: cache, fetch: fetch}, nil
+	o := pullerOptions{
+		minFreeBytes: DefaultMinFreeBytes,
+		freeBytes:    StatfsFreeBytes,
+		log:          slog.New(slog.DiscardHandler),
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return &Puller{
+		cache: cache,
+		fetch: fetch,
+		pressure: &pressureGate{
+			// The cache root is the volume the blobs are about to be written to.
+			root:      cache.Root(),
+			threshold: o.minFreeBytes,
+			freeBytes: o.freeBytes,
+			interval:  pressureSampleInterval,
+			now:       time.Now,
+			log:       o.log,
+		},
+	}, nil
 }
 
 // Pull fetches ref and stores its config + layer blobs in the content-addressed
@@ -285,6 +318,37 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	wroteAny := false
 
+	mfst, err := img.Manifest()
+	if err != nil {
+		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
+	}
+
+	// Persist the raw manifest bytes into the CAS, keyed by the manifest's own
+	// digest (content-addressed, idempotent, temp+rename like every blob). This
+	// is the EDGE RECORD for prune reachability (Cache.EnumerateBlobs parses
+	// these to learn which config/layer blobs each image names); the M12.1-d1
+	// ref→digest index (docs/m12-plan.md) will consume these persisted manifests
+	// — do not grow this into an index. It is written FIRST, before config and
+	// layers, so a pull that dies mid-stream leaves blobs that are still NAMED
+	// (and thus prunable once unreferenced) rather than orphans the fail-closed
+	// planner must keep forever.
+	rawMfst, err := img.RawManifest()
+	if err != nil {
+		return nil, fmt.Errorf("raw manifest %q: %w", ref, boundErr(err))
+	}
+	mfstDigest, err := img.Digest()
+	if err != nil {
+		return nil, fmt.Errorf("manifest digest %q: %w", ref, boundErr(err))
+	}
+	wrote, err := p.writeBlob(mfstDigest.String(), int64(len(rawMfst)), func(w io.Writer) error {
+		_, werr := w.Write(rawMfst)
+		return werr
+	})
+	if err != nil {
+		return nil, err
+	}
+	wroteAny = wroteAny || wrote
+
 	// Config blob.
 	cfgDigest, err := img.ConfigName()
 	if err != nil {
@@ -294,7 +358,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err != nil {
 		return nil, fmt.Errorf("config file %q: %w", ref, boundErr(err))
 	}
-	wrote, err := p.writeBlob(cfgDigest.String(), func(w io.Writer) error {
+	wrote, err = p.writeBlob(cfgDigest.String(), mfst.Config.Size, func(w io.Writer) error {
 		_, werr := w.Write(rawCfg)
 		return werr
 	})
@@ -302,11 +366,6 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		return nil, err
 	}
 	wroteAny = wroteAny || wrote
-
-	mfst, err := img.Manifest()
-	if err != nil {
-		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
-	}
 
 	out := &runtimev1.ImageManifest{
 		Reference:   ref,
@@ -319,12 +378,15 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err != nil {
 		return nil, fmt.Errorf("layers %q: %w", ref, boundErr(err))
 	}
+	if len(layers) != len(mfst.Layers) {
+		return nil, fmt.Errorf("pull %q: image reports %d layers, manifest declares %d", ref, len(layers), len(mfst.Layers))
+	}
 	for i, layer := range layers {
 		dig, err := layer.Digest()
 		if err != nil {
 			return nil, fmt.Errorf("layer %d digest %q: %w", i, ref, boundErr(err))
 		}
-		wrote, err := p.writeBlob(dig.String(), func(w io.Writer) error {
+		wrote, err := p.writeBlob(dig.String(), mfst.Layers[i].Size, func(w io.Writer) error {
 			rc, oerr := layer.Compressed()
 			if oerr != nil {
 				return oerr
@@ -340,19 +402,46 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		out.Layers = append(out.Layers, descriptorFromGGCR(mfst.Layers[i]))
 	}
 
-	return &PullResult{Manifest: out, CacheHit: !wroteAny}, nil
+	return &PullResult{Manifest: out, ManifestDigest: mfstDigest.String(), CacheHit: !wroteAny}, nil
 }
 
-// writeBlob writes the blob for digest via fill, atomically (temp+rename), unless
-// it already exists. It returns whether a new blob was written (false == cache
-// hit for this blob).
-func (p *Puller) writeBlob(digest string, fill func(io.Writer) error) (wrote bool, err error) {
+// writeBlob writes the blob for digest via fill, atomically (temp+rename),
+// unless it already exists. It returns whether a new blob was written (false ==
+// cache hit for this blob). declared is the manifest-declared blob size: the
+// disk-pressure gate reserves it before any byte streams, and the stream is
+// hard-capped at it (ErrOversizeBlob) so a lying registry cannot occupy more
+// disk than it declared — digest verification already guards content, this
+// guards bytes-on-disk.
+//
+// The cache-hit path bumps the blob's mtime (one Chtimes syscall) so a blob a
+// pull just vouched for is always younger than any sane prune grace window.
+// Residual TOCTOU: a prune executing in another PROCESS between this vouch and
+// the pod's materialize can still win the race for one microsecond-scale
+// window; the worst case is a clean re-pull at materialize time. In-process,
+// the cache's prune lock (held below for the write, write-held by ExecutePrune)
+// closes the window entirely.
+func (p *Puller) writeBlob(digest string, declared int64, fill func(io.Writer) error) (wrote bool, err error) {
+	p.cache.pruneMu.RLock()
+	defer p.cache.pruneMu.RUnlock()
+
 	dst, err := p.cache.blobPath(digest)
 	if err != nil {
 		return false, err
 	}
 	if _, serr := os.Stat(dst); serr == nil {
-		return false, nil // cache hit
+		now := time.Now()
+		terr := os.Chtimes(dst, now, now)
+		if terr == nil {
+			return false, nil // cache hit, freshness vouched
+		}
+		if !errors.Is(terr, fs.ErrNotExist) {
+			return false, fmt.Errorf("refresh blob %s: %w", digest, terr)
+		}
+		// The blob vanished between stat and chtimes (an out-of-process prune):
+		// fall through and re-write it.
+	}
+	if err := p.pressure.admit(declared); err != nil {
+		return false, fmt.Errorf("blob %s: %w", digest, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return false, fmt.Errorf("mkdir blob dir: %w", err)
@@ -363,10 +452,14 @@ func (p *Puller) writeBlob(digest string, fill func(io.Writer) error) (wrote boo
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after successful rename
-	if err := fill(tmp); err != nil {
+	bw := &boundedWriter{w: tmp, remaining: declared}
+	if err := fill(bw); err != nil {
+		tmp.Close()
+		if bw.exceeded {
+			return false, fmt.Errorf("write blob %s: declared %d bytes: %w", digest, declared, ErrOversizeBlob)
+		}
 		// fill streams REGISTRY bytes (layer.Compressed / io.Copy), so its error
 		// is third-party content — bounded, never adopted.
-		tmp.Close()
 		return false, fmt.Errorf("write blob %s: %w", digest, boundErr(err))
 	}
 	if err := tmp.Close(); err != nil {
@@ -376,6 +469,30 @@ func (p *Puller) writeBlob(digest string, fill func(io.Writer) error) (wrote boo
 		return false, fmt.Errorf("commit blob %s: %w", digest, err)
 	}
 	return true, nil
+}
+
+// boundedWriter caps writes at the manifest-declared blob size (exact — no
+// slack): the first byte past remaining fails the write with errBlobTooLarge,
+// which writeBlob translates to ErrOversizeBlob.
+type boundedWriter struct {
+	w         io.Writer
+	remaining int64
+	exceeded  bool
+}
+
+// errBlobTooLarge is boundedWriter's internal write error; writeBlob reports it
+// as ErrOversizeBlob (the exceeded flag, not string matching, carries the
+// verdict past io.Copy's wrapping).
+var errBlobTooLarge = errors.New("blob larger than declared size")
+
+func (b *boundedWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > b.remaining {
+		b.exceeded = true
+		return 0, errBlobTooLarge
+	}
+	n, err := b.w.Write(p)
+	b.remaining -= int64(n)
+	return n, err
 }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
