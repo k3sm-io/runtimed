@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +74,7 @@ func TestSnapshotPrune(t *testing.T) {
 	t.Run("planner input errors", testPrunePlannerErrors)
 	t.Run("enumerate and execute round trip", testPruneRoundTrip)
 	t.Run("executor re-verify", testPruneExecutorReverify)
+	t.Run("hostile plan cannot escape blobs", testPruneHostilePlan)
 }
 
 func testPrunePlanner(t *testing.T) {
@@ -173,6 +175,33 @@ func testPrunePlanner(t *testing.T) {
 			wantKeep: map[string]PruneReason{
 				"sha256/0badc0de": ReasonKeptUnknownProvenance,
 				"sha256/deadfeed": ReasonKeptUnknownProvenance,
+			},
+		},
+		{
+			// A manifest-kind blob on disk that NO edge record describes — the
+			// shape an UNPARSEABLE persisted manifest leaves behind (the
+			// enumerator refuses to name its blobs, so the image's chain is
+			// unknowable). Old, not in use, and still KEPT: fail-closed. This is
+			// the manifest sibling of the config/layer !namedByAny branch above,
+			// and the accompanying well-formed unreferenced image proves the row
+			// is not vacuous — that chain IS deleted in the same plan.
+			name: "manifest with no edge record is kept-unknown, not deleted",
+			nodes: []BlobNode{
+				cnode("bad0bad0", BlobKindManifest, oldT), // no edge names it
+				cnode("aaaa1111", BlobKindManifest, oldT), // well-formed, unreferenced
+				cnode("caaa1111", BlobKindConfig, oldT),
+				cnode("11111111", BlobKindLayer, oldT),
+			},
+			edges: []ImageEdge{
+				{Manifest: "sha256:aaaa1111", Config: "sha256:caaa1111", Layers: []string{"sha256:11111111"}},
+			},
+			wantDelete: map[string]PruneReason{
+				"sha256/aaaa1111": ReasonDeleteUnreferenced,
+				"sha256/caaa1111": ReasonDeleteUnreferenced,
+				"sha256/11111111": ReasonDeleteUnreferenced,
+			},
+			wantKeep: map[string]PruneReason{
+				"sha256/bad0bad0": ReasonKeptUnknownProvenance,
 			},
 		},
 		{
@@ -670,4 +699,88 @@ func testPruneExecutorReverify(t *testing.T) {
 		t.Errorf("outside file removed: %v", err)
 	}
 	_ = digest
+}
+
+// testPruneHostilePlan is the containment tripwire: feed ExecutePrune a plan
+// that is ENTIRELY hostile — no entry came from PlanPrune — and assert the
+// executor is structurally incapable of reaching outside blobs/. Every sibling
+// tree the daemon owns (server/ datastore, run/ keys, storage/ PV data,
+// pods/ rootfs) is planted with a crown-jewel file first, so an escape is a
+// destroyed file, not a subtle reason mismatch.
+//
+// The last entry is a SYMLINK inside blobs/ whose path is valid blob grammar
+// and whose target is the datastore: it must be refused as non-regular, never
+// followed, and never itself unlinked.
+func testPruneHostilePlan(t *testing.T) {
+	root := t.TempDir()
+	c, err := NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "blobs", "sha256"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jewels := []string{"server/db/state.db", "run/keys/token", "storage/pvc/data", "pods/p1/rootfs/bin/sh"}
+	for _, p := range jewels {
+		full := filepath.Join(root, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("precious"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkRel := "sha256/aa" + strings.Repeat("b", 62)
+	link := filepath.Join(root, "blobs", linkRel)
+	if err := os.Symlink(filepath.Join(root, "server", "db", "state.db"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	hostile := []string{
+		"../server/db/state.db",
+		"../../etc/passwd",
+		"/etc/passwd",
+		".",
+		"/",
+		"..",
+		"sha256/../../server/db/state.db",
+		"sha256/./" + strings.Repeat("c", 64),
+		"pods/p1/rootfs/bin/sh",
+		"../run/keys/token",
+		"../storage/pvc/data",
+		linkRel, // valid grammar, must be refused as non-regular
+	}
+	plan := &PrunePlan{}
+	for _, h := range hostile {
+		plan.Delete = append(plan.Delete, PruneDecision{
+			Node:   BlobNode{Path: h, Kind: BlobKindLayer, ModTime: oldT, Size: 1},
+			Reason: ReasonDeleteUnreferenced,
+		})
+	}
+
+	rep, err := c.ExecutePrune(plan, pruneGrace, pruneNow)
+	if err != nil {
+		t.Fatalf("ExecutePrune errored on a hostile plan; it must skip-and-report, never error: %v", err)
+	}
+	if rep.Deleted != 0 {
+		t.Errorf("containment breach: executor deleted %d entries from a wholly hostile plan (want 0)", rep.Deleted)
+	}
+	if len(rep.Skipped) != len(hostile) {
+		t.Errorf("executor recorded %d skips for %d hostile entries; every refusal must be reported", len(rep.Skipped), len(hostile))
+	}
+	skippedWhy := make(map[string]string, len(rep.Skipped))
+	for _, s := range rep.Skipped {
+		skippedWhy[s.Path] = s.Reason
+	}
+	if why := skippedWhy[linkRel]; !strings.Contains(why, "not a regular file") {
+		t.Errorf("in-blobs symlink %q skip reason = %q, want a non-regular-file refusal (it must not be followed)", linkRel, why)
+	}
+	for _, p := range jewels {
+		if _, err := os.Stat(filepath.Join(root, p)); err != nil {
+			t.Errorf("containment breach: %s was destroyed by a blobs-only executor: %v", p, err)
+		}
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("the refused symlink was itself unlinked; a skipped entry must be left in place: %v", err)
+	}
 }
