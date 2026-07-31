@@ -31,7 +31,10 @@ limitations under the License.
 //     B103, not here.
 //   - Pull: fetch an OCI image by reference into a content-addressed blob cache
 //     under /var/lib/k3sm (default; configurable). Blobs are keyed by digest, so
-//     a second pull of the same content is a cache hit.
+//     a second pull of the same content is a cache hit. Every blob is re-hashed
+//     against the digest its MANIFEST DESCRIPTOR claims before it is committed —
+//     see Cache.CommitBlob, the single home of that invariant, and the ceiling
+//     below.
 //   - Materialize: copy the cached payload into the per-pod rootfs using APFS
 //     copy-on-write via golang.org/x/sys/unix.Clonefile. The cache and pod
 //     rootfs MUST be on the same APFS volume for the clone to succeed; on EXDEV
@@ -46,6 +49,28 @@ limitations under the License.
 //
 // CoW and codesign touch Darwin specifics; the cgo-free Clonefile binding lives
 // behind cowCopy (clonefile_darwin.go) so callers stay platform-agnostic.
+//
+// # The CAS verification ceiling
+//
+// Cache.CommitBlob is the ONE place the content-addressed store checks that the
+// bytes it commits hash to the digest they are named by, and it is deliberately a
+// WRITE-time check only. Three limits follow, and none of them is hidden:
+//
+//   - The cache-hit fast path is an os.Stat of a regular file. A blob already on
+//     disk is trusted on its NAME, and every downstream reader (materialize, the
+//     unpacker) trusts the on-disk bytes.
+//   - Every blob written BEFORE this check existed was never hashed by this repo
+//     at all, so an existing cache carries unverified content indefinitely.
+//   - The check proves the fetcher did not corrupt or substitute what the network
+//     gave it. It does NOT authenticate the image: a wholly hostile FetchFunc
+//     supplies the manifest the claimed digests come from, so it can make both
+//     sides agree. Authenticity is a signature problem (SignaturePolicy), not a
+//     CAS problem.
+//
+// Verify-on-read is NOT the answer and is deliberately absent: it is O(image
+// bytes) on the hot path and would regress the M1.1-a1 cache-hit acceptance path.
+// The natural closer is M11.2-d7, the unpacker, which already reads each blob
+// once per rootfs creation and can hash it there for free.
 //
 // # Non-Mach-O payloads and the signature gate
 //

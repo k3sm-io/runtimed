@@ -22,8 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -285,16 +283,26 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	wroteAny := false
 
-	// Config blob.
-	cfgDigest, err := img.ConfigName()
+	// The MANIFEST is resolved before any blob is written, because it — not the
+	// object that hands over the bytes — is where every claimed digest comes from
+	// (B129). img.ConfigName() and layer.Digest() are NOT used as claimed values:
+	// go-containerregistry's partial helpers derive both by hashing the very
+	// content being checked when the implementation carries no descriptor, so
+	// comparing against them would prove self-consistency, not authenticity, and
+	// could never fail in exactly the seam-swap this check exists to catch. The
+	// manifest descriptors are additionally what the digest-pinned re-resolution
+	// in imageByDigest anchored.
+	mfst, err := img.Manifest()
 	if err != nil {
-		return nil, fmt.Errorf("config digest %q: %w", ref, boundErr(err))
+		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
 	}
+
+	// Config blob.
 	rawCfg, err := img.RawConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("config file %q: %w", ref, boundErr(err))
 	}
-	wrote, err := p.writeBlob(cfgDigest.String(), func(w io.Writer) error {
+	wrote, err := p.writeBlob(mfst.Config.Digest.String(), mfst.Config.Size, func(w io.Writer) error {
 		_, werr := w.Write(rawCfg)
 		return werr
 	})
@@ -302,11 +310,6 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		return nil, err
 	}
 	wroteAny = wroteAny || wrote
-
-	mfst, err := img.Manifest()
-	if err != nil {
-		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
-	}
 
 	out := &runtimev1.ImageManifest{
 		Reference:   ref,
@@ -319,12 +322,17 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err != nil {
 		return nil, fmt.Errorf("layers %q: %w", ref, boundErr(err))
 	}
+	// The loop pairs layers[i] with mfst.Layers[i], so a divergence between the
+	// two lists is refused here rather than indexed past (it used to panic on a
+	// longer layer list, and silently mis-pair on an equal-length reordering — the
+	// reordering is now also caught by the per-blob digest check below).
+	if len(layers) != len(mfst.Layers) {
+		return nil, fmt.Errorf("pull %q: image has %d layers but its manifest lists %d: %w",
+			ref, len(layers), len(mfst.Layers), ErrManifestInconsistent)
+	}
 	for i, layer := range layers {
-		dig, err := layer.Digest()
-		if err != nil {
-			return nil, fmt.Errorf("layer %d digest %q: %w", i, ref, boundErr(err))
-		}
-		wrote, err := p.writeBlob(dig.String(), func(w io.Writer) error {
+		desc := mfst.Layers[i]
+		wrote, err := p.writeBlob(desc.Digest.String(), desc.Size, func(w io.Writer) error {
 			rc, oerr := layer.Compressed()
 			if oerr != nil {
 				return oerr
@@ -337,45 +345,23 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 			return nil, err
 		}
 		wroteAny = wroteAny || wrote
-		out.Layers = append(out.Layers, descriptorFromGGCR(mfst.Layers[i]))
+		out.Layers = append(out.Layers, descriptorFromGGCR(desc))
 	}
 
 	return &PullResult{Manifest: out, CacheHit: !wroteAny}, nil
 }
 
-// writeBlob writes the blob for digest via fill, atomically (temp+rename), unless
-// it already exists. It returns whether a new blob was written (false == cache
-// hit for this blob).
-func (p *Puller) writeBlob(digest string, fill func(io.Writer) error) (wrote bool, err error) {
-	dst, err := p.cache.blobPath(digest)
-	if err != nil {
-		return false, err
-	}
-	if _, serr := os.Stat(dst); serr == nil {
-		return false, nil // cache hit
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return false, fmt.Errorf("mkdir blob dir: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".blob-*")
-	if err != nil {
-		return false, fmt.Errorf("temp blob: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after successful rename
-	if err := fill(tmp); err != nil {
-		// fill streams REGISTRY bytes (layer.Compressed / io.Copy), so its error
-		// is third-party content — bounded, never adopted.
-		tmp.Close()
-		return false, fmt.Errorf("write blob %s: %w", digest, boundErr(err))
-	}
-	if err := tmp.Close(); err != nil {
-		return false, fmt.Errorf("close blob %s: %w", digest, err)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return false, fmt.Errorf("commit blob %s: %w", digest, err)
-	}
-	return true, nil
+// writeBlob commits the blob for digest via fill, verifying the bytes against
+// digest. size is the descriptor's declared size (the CommitBlob resource guard).
+// It returns whether a new blob was written (false == cache hit for this blob).
+//
+// It is a THIN DELEGATION to Cache.CommitBlob, deliberately: the CAS integrity
+// invariant has exactly one home, and that home is on *Cache — reachable by any
+// ingest path (B117's tarball ingest links this package in-process) rather than
+// locked behind a *Puller, whose constructor requires a FetchFunc an ingest path
+// has no business supplying.
+func (p *Puller) writeBlob(digest string, size int64, fill func(io.Writer) error) (wrote bool, err error) {
+	return p.cache.CommitBlob(digest, size, fill)
 }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
