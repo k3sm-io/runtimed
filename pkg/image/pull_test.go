@@ -136,18 +136,27 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 }
 
 // TestCacheBlobPathValidation rejects malformed digests (no path traversal).
+//
+// It attacks the HEX half only; the algorithm half — the one that was actually
+// traversable before B129 — is attacked by the gate
+// (TestWriteBlobRejectsDigestMismatch/rejects_unsupported_or_malformed_digest).
 func TestCacheBlobPathValidation(t *testing.T) {
 	c, err := NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad := []string{"", "sha256", ":abc", "sha256:", "sha256:../escape", "sha256:a/b"}
+	bad := []string{
+		"", "sha256", ":abc", "sha256:", "sha256:../escape", "sha256:a/b",
+		// B129: the hex body must be the algorithm's exact length. A short body
+		// was accepted before, and no real blob can ever hash to one.
+		"sha256:deadbeef",
+	}
 	for _, d := range bad {
 		if _, err := c.blobPath(d); err == nil {
 			t.Errorf("blobPath(%q) should error", d)
 		}
 	}
-	if _, err := c.blobPath("sha256:deadbeef"); err != nil {
+	if _, err := c.blobPath(digestOf([]byte("anything"))); err != nil {
 		t.Errorf("blobPath(valid) errored: %v", err)
 	}
 }
