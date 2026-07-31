@@ -344,13 +344,13 @@ phases:
 
   - id: M5
     title: vm sandbox backend — Virtualization.framework Linux micro-VM behind sandbox.Backend
-    status: in_progress
+    status: in-progress
     depends_on:
       - apis:M5.1
     subphases:
       - id: M5.1
         title: Virtualization.framework Linux micro-VM backend
-        status: in_progress
+        status: in-progress
         strategy: hard cut
         strategy_rationale: the vm backend is additive behind the existing swappable sandbox.Backend ladder; the host-process Seatbelt path is byte-unchanged (golden SBPL + existing tests stay green); one signed binary. No proto/CRD/datastore change beyond apis:M5.1 (already landed). The live VM boot is lab-gated, not phased.
         deliverables:
