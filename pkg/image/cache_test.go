@@ -131,6 +131,22 @@ type lyingImage struct {
 	ggcrv1.Image
 }
 
+// shortManifestImage reports MORE layers than its manifest lists — the shape that
+// used to index past mfst.Layers and PANIC inside the root daemon.
+type shortManifestImage struct {
+	ggcrv1.Image
+}
+
+func (i shortManifestImage) Manifest() (*ggcrv1.Manifest, error) {
+	m, err := i.Image.Manifest()
+	if err != nil {
+		return nil, err
+	}
+	trimmed := *m
+	trimmed.Layers = append([]ggcrv1.Descriptor(nil), m.Layers[:len(m.Layers)-1]...)
+	return &trimmed, nil
+}
+
 func (i lyingImage) Layers() ([]ggcrv1.Layer, error) {
 	ls, err := i.Image.Layers()
 	if err != nil {
@@ -192,7 +208,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		if !c.Has(dig) {
 			t.Fatalf("blob %s not cached after a successful commit", dig)
 		}
-		p, err := c.blobPath(dig)
+		p, err := c.BlobPath(dig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -340,7 +356,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 				}
 				// blobPath must not hand out a path either — every path-building
 				// caller (Has, B117's ingest) inherits the same allowlist.
-				if p, perr := c.blobPath(tc.digest); perr == nil {
+				if p, perr := c.BlobPath(tc.digest); perr == nil {
 					t.Errorf("blobPath(%q) returned %q, want an error", tc.digest, p)
 				}
 				if c.Has(tc.digest) {
@@ -359,7 +375,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 	t.Run("cache hit skips verification (the documented ceiling)", func(t *testing.T) {
 		c, _ := deepCache(t)
 		dig := digestOf([]byte("the honest bytes"))
-		p, err := c.blobPath(dig)
+		p, err := c.BlobPath(dig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -393,7 +409,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 	t.Run("cache hit requires a regular file", func(t *testing.T) {
 		c, _ := deepCache(t)
 		dig := digestOf([]byte("blocked by a directory"))
-		p, err := c.blobPath(dig)
+		p, err := c.BlobPath(dig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -404,12 +420,100 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		wrote, err := c.CommitBlob(dig, 64, writeAll([]byte("blocked by a directory")))
-		if err == nil && !wrote {
-			t.Error("a directory at the blob path was reported as a cache hit")
+		// Assert the SPECIFIC outcome, not merely "some error": accepting any error
+		// pins no forward behaviour, so a later change that turned this into a
+		// silent success or a different failure would stay green.
+		wrote, err := c.CommitBlob(dig, 22, writeAll([]byte("blocked by a directory")))
+		if err == nil {
+			t.Errorf("CommitBlob over a directory = (wrote=%v, nil), want a rename failure", wrote)
+		}
+		if wrote {
+			t.Error("CommitBlob reported wrote=true over a directory")
 		}
 		if c.Has(dig) {
 			t.Error("Has reported a hit for a directory at the blob path")
+		}
+	})
+
+	// F1: os.Stat FOLLOWS symlinks, so a bare Stat+IsRegular would accept a
+	// symlink→regular as a cached blob — suppressing verification forever for that
+	// digest and pointing every downstream reader (materialize, the M11.2-d7
+	// unpacker) at bytes outside the cache root, as root. Lstat is what makes the
+	// doc comment true.
+	t.Run("a symlink at the blob path is not a cache hit", func(t *testing.T) {
+		c, _ := deepCache(t)
+		body := []byte("real blob bytes")
+		dig := digestOf(body)
+		p, err := c.BlobPath(dig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		outside := filepath.Join(t.TempDir(), "outside")
+		if err := os.WriteFile(outside, []byte("attacker-controlled"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, p); err != nil {
+			t.Fatal(err)
+		}
+		if c.Has(dig) {
+			t.Error("Has accepted a symlink as a cached blob")
+		}
+		wrote, err := c.CommitBlob(dig, int64(len(body)), writeAll(body))
+		if err != nil {
+			t.Fatalf("CommitBlob over a symlink: %v", err)
+		}
+		if !wrote {
+			t.Error("a symlink was treated as a cache hit; verification was skipped")
+		}
+		// rename(2) replaces the symlink, so the store self-heals to real bytes.
+		got, err := os.ReadFile(p)
+		if err != nil || string(got) != string(body) {
+			t.Errorf("blob = %q, %v; want the committed bytes (the symlink must be replaced)", got, err)
+		}
+		if out, _ := os.ReadFile(outside); string(out) != "attacker-controlled" {
+			t.Error("the symlink target was written through, not replaced")
+		}
+	})
+
+	// F2: size 0 is a REAL cap (the empty blob), not "no cap" — only the explicit
+	// SizeUnknown sentinel opts out. A `size > 0` guard would silently disable the
+	// cap for any descriptor declaring zero.
+	t.Run("size 0 caps rather than disabling the guard", func(t *testing.T) {
+		c, _ := deepCache(t)
+		dig := digestOf([]byte("not empty"))
+		if _, err := c.CommitBlob(dig, 0, writeAll([]byte("not empty"))); !errors.Is(err, ErrBlobTooLarge) {
+			t.Errorf("CommitBlob(size=0, non-empty body) err = %v, want ErrBlobTooLarge", err)
+		}
+		if c.Has(dig) {
+			t.Error("an over-cap blob was committed")
+		}
+		empty := digestOf(nil)
+		if _, err := c.CommitBlob(empty, 0, writeAll(nil)); err != nil {
+			t.Errorf("CommitBlob(size=0, empty body) = %v, want the empty blob to commit", err)
+		}
+	})
+
+	// F8: a fill that DISCARDS its write error must not let an oversized input be
+	// relabelled as a poisoned blob — the two imply different remediations.
+	t.Run("an oversized stream stays ErrBlobTooLarge even if fill swallows the error", func(t *testing.T) {
+		c, _ := deepCache(t)
+		dig := digestOf([]byte("declared short"))
+		swallow := func(w io.Writer) error {
+			_, _ = w.Write([]byte("declared short")) // error deliberately discarded
+			return nil
+		}
+		_, err := c.CommitBlob(dig, 4, swallow)
+		if !errors.Is(err, ErrBlobTooLarge) {
+			t.Errorf("err = %v, want ErrBlobTooLarge (not a digest mismatch)", err)
+		}
+		if errors.Is(err, ErrDigestMismatch) {
+			t.Error("an oversized input was reported as a poisoned blob")
+		}
+		if c.Has(dig) {
+			t.Error("an over-cap blob was committed")
 		}
 	})
 
@@ -462,6 +566,30 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 			if c.Has(d.String()) {
 				t.Errorf("substituted bytes were committed under their OWN digest %s", d)
 			}
+		}
+	})
+
+	// F3: a self-contradictory manifest is NOT a poisoned blob — no blob was
+	// hashed, so ErrDigestMismatch's message would be false. The two sentinels stay
+	// distinguishable because the remediations differ: reject the source vs
+	// quarantine the blob.
+	t.Run("a manifest disagreeing about its layer count is ErrManifestInconsistent", func(t *testing.T) {
+		base, err := random.Image(512, 2)
+		if err != nil {
+			t.Fatalf("random image: %v", err)
+		}
+		img := shortManifestImage{Image: withPlatform(t, base, "darwin", "arm64", "")}
+		ff := &fakeFetch{img: img}
+
+		c, _ := deepCache(t)
+		p := mustPuller(t, c, ff.fetch)
+
+		res, err := p.Pull(context.Background(), "example.com/arity:v1", nil, nativePolicy())
+		if !errors.Is(err, ErrManifestInconsistent) {
+			t.Fatalf("Pull(layer-count divergence) = (%+v, %v), want ErrManifestInconsistent", res, err)
+		}
+		if errors.Is(err, ErrDigestMismatch) {
+			t.Error("a manifest inconsistency was reported as a blob digest mismatch")
 		}
 	})
 }

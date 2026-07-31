@@ -152,11 +152,11 @@ func TestCacheBlobPathValidation(t *testing.T) {
 		"sha256:deadbeef",
 	}
 	for _, d := range bad {
-		if _, err := c.blobPath(d); err == nil {
+		if _, err := c.BlobPath(d); err == nil {
 			t.Errorf("blobPath(%q) should error", d)
 		}
 	}
-	if _, err := c.blobPath(digestOf([]byte("anything"))); err != nil {
+	if _, err := c.BlobPath(digestOf([]byte("anything"))); err != nil {
 		t.Errorf("blobPath(valid) errored: %v", err)
 	}
 }

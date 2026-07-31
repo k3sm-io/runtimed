@@ -59,10 +59,24 @@ func NewCache(root string) (*Cache, error) {
 }
 
 // Root returns the cache root dir.
+//
+// The LAYOUT BENEATH IT IS NOT PUBLIC API. Do not join "blobs"/<algo>/<hex> onto
+// this yourself — that re-derives the content-addressed layout rule in a second
+// place, without the digest allowlist that makes it safe. Use BlobPath (or Has /
+// CommitBlob), which are the only sanctioned ways to reach a blob, so the layout
+// and its validation can only ever be changed here.
 func (c *Cache) Root() string { return c.root }
 
 // blobsDir is the content-addressed blob store.
 func (c *Cache) blobsDir() string { return filepath.Join(c.root, "blobs") }
+
+// pathFor is the ONE place the content-addressed layout is expressed. Every
+// path-producing entry point goes through it, so a future change (a sharded
+// blobs/<algo>/<xx>/<hex>, B128's GC) has exactly one edit site. It takes a
+// PARSED hash, so it is unreachable without parseBlobDigest having run.
+func (c *Cache) pathFor(h ggcrv1.Hash) string {
+	return filepath.Join(c.blobsDir(), h.Algorithm, h.Hex)
+}
 
 // ErrUnsupportedDigestAlgorithm is returned for a digest whose ALGORITHM half is
 // not in the closed allowlist below. It is distinct from ErrInvalidDigest so a
@@ -75,17 +89,37 @@ var ErrUnsupportedDigestAlgorithm = errors.New("image: unsupported digest algori
 // algorithm: bad shape, a non-lowercase-hex body, or the wrong hex length.
 var ErrInvalidDigest = errors.New("image: malformed digest")
 
-// ErrDigestMismatch reports that content contradicts the manifest that named it.
-// CommitBlob returns it when the bytes written hash to something other than the
-// digest they were committed under — the blob is NOT committed and the
-// destination path is left untouched — and Pull returns it when a fetched image
-// disagrees with its own manifest about how many layers it has.
+// ErrDigestMismatch reports that a BLOB's bytes contradict the digest they were
+// committed under: CommitBlob returns it when the bytes written hash to something
+// else — the blob is NOT committed and the destination path is left untouched.
+//
+// It is deliberately NOT reused for a manifest that contradicts itself (see
+// ErrManifestInconsistent). The two imply different remediations — refetch the
+// blob versus reject the whole source — so a caller branching on the sentinel
+// must be able to tell them apart.
 var ErrDigestMismatch = errors.New("image: blob content does not match its claimed digest")
+
+// ErrManifestInconsistent reports that an image's own manifest is
+// self-contradictory — today, that it disagrees with the fetched image about how
+// many layers it has. No blob was hashed when this is returned, which is exactly
+// why it is not an ErrDigestMismatch: that sentinel's message would be false here,
+// and a consumer (B117's ingest, the M12 pull-failure taxonomy) needs "this source
+// is malformed" to stay distinguishable from "this blob is poisoned".
+var ErrManifestInconsistent = errors.New("image: image contradicts its own manifest")
 
 // ErrBlobTooLarge is returned by CommitBlob when fill streams more bytes than the
 // declared size. It is a RESOURCE GUARD, not an integrity mechanism — see
 // CommitBlob.
 var ErrBlobTooLarge = errors.New("image: blob exceeds its declared size")
+
+// SizeUnknown is the explicit "no declared size" value for CommitBlob's size
+// parameter — the ONLY way to opt out of the resource guard.
+//
+// It is a named sentinel rather than 0 or a negative range because 0 is a real,
+// legitimate size (the empty blob), and the caller who supplies the size is the
+// same actor a swapped fetcher controls: an opt-out spelled "0" would be
+// reachable by exactly the party the guard defends against, and silently so.
+const SizeUnknown int64 = -1
 
 // blobHashers is the CLOSED ALLOWLIST of digest algorithms this store accepts,
 // and simultaneously the way it verifies them. Membership in this one table is
@@ -96,8 +130,12 @@ var ErrBlobTooLarge = errors.New("image: blob exceeds its declared size")
 // sha512 is deliberately ABSENT. go-containerregistry v0.21.6's v1.Hasher
 // supports sha256 only, so a sha512 digest cannot be parsed, fetched or verified
 // anywhere else on this pull path; admitting it here would create a directory
-// this package can never validate. Adding an algorithm means adding it here, and
-// nowhere else.
+// this package can never validate.
+//
+// Adding an algorithm means adding it here AND in the parser: parseBlobDigest
+// delegates body validation to ggcrv1.NewHash, which accepts sha256 only, so an
+// entry added here alone would clear the allowlist and then be rejected by the
+// parser as ErrInvalidDigest rather than ErrUnsupportedDigestAlgorithm.
 var blobHashers = map[string]func() hash.Hash{
 	"sha256": sha256.New,
 }
@@ -116,7 +154,7 @@ var blobHashers = map[string]func() hash.Hash{
 // path metacharacter. The digest is untrusted registry input, so it is rendered
 // bounded (quoteBounded) in every error.
 func parseBlobDigest(digest string) (ggcrv1.Hash, error) {
-	algo, _, ok := cutAlgorithm(digest)
+	algo, ok := cutAlgorithm(digest)
 	if !ok {
 		return ggcrv1.Hash{}, fmt.Errorf("digest %s: %w", quoteBounded(digest, maxDigestLen), ErrInvalidDigest)
 	}
@@ -133,14 +171,19 @@ func parseBlobDigest(digest string) (ggcrv1.Hash, error) {
 	return h, nil
 }
 
-// cutAlgorithm splits "<algo>:<body>" into its two halves, reporting false when
-// the string has no separator or an empty half.
-func cutAlgorithm(digest string) (algo, body string, ok bool) {
+// cutAlgorithm returns the ALGORITHM half of "<algo>:<body>", reporting false
+// when the string has no separator or an empty half. The body is deliberately not
+// returned: it is validated by ggcrv1.NewHash on the whole string, so handing a
+// caller an unvalidated body would invite exactly the "sanitize one half only"
+// bug B129 fixed.
+func cutAlgorithm(digest string) (algo string, ok bool) {
 	algo, body, found := strings.Cut(digest, ":")
-	return algo, body, found && algo != "" && body != ""
+	return algo, found && algo != "" && body != ""
 }
 
-// blobPath maps a digest ("<algo>:<hex>") to its on-disk path.
+// BlobPath maps a digest ("<algo>:<hex>") to its on-disk path, validating the
+// digest first. It is the ONLY sanctioned way for an out-of-package caller
+// (B117's tarball ingest, B128's GC) to name a blob on disk.
 //
 // It validates through parseBlobDigest and builds the path from the PARSED
 // halves, never the raw string, so no caller can construct a path outside the
@@ -148,25 +191,35 @@ func cutAlgorithm(digest string) (algo, body string, ok bool) {
 // allowlisted one has a fixed hex body. (Before B129 the algorithm half flowed
 // into filepath.Join unchecked, so "../../etc:passwd" resolved to
 // /var/lib/etc/passwd — which pull.go then MkdirAll'd as the root LaunchDaemon.)
-func (c *Cache) blobPath(digest string) (string, error) {
+//
+// A returned path is validated, NOT verified: it names where the blob for digest
+// belongs, and says nothing about what is there. Reading it is subject to the
+// verification ceiling documented on CommitBlob — in particular, a path that
+// exists may be a symlink planted after the commit, so a reader that opens it as
+// the root daemon should do so O_NOFOLLOW.
+func (c *Cache) BlobPath(digest string) (string, error) {
 	h, err := parseBlobDigest(digest)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(c.blobsDir(), h.Algorithm, h.Hex), nil
+	return c.pathFor(h), nil
 }
 
 // Has reports whether the blob for digest is already cached.
 //
-// A non-regular file at the blob path (a directory, a symlink, a device node) is
-// NOT a cache hit — only a regular file can be a blob, and treating anything else
-// as one would let a planted directory suppress a pull.
+// A non-regular file at the blob path (a directory, a SYMLINK, a device node) is
+// NOT a cache hit — only a regular file can be a blob. It uses Lstat, not Stat,
+// precisely so a symlink is judged on ITSELF: Stat resolves the link, so a
+// symlink pointing at any regular file anywhere satisfied IsRegular and was
+// accepted as a cached blob, which suppressed verification for that digest
+// forever and pointed every downstream reader — running as the root daemon — at
+// an attacker-chosen path.
 func (c *Cache) Has(digest string) bool {
-	p, err := c.blobPath(digest)
+	p, err := c.BlobPath(digest)
 	if err != nil {
 		return false
 	}
-	fi, err := os.Stat(p)
+	fi, err := os.Lstat(p)
 	return err == nil && fi.Mode().IsRegular()
 }
 
@@ -181,17 +234,24 @@ func (c *Cache) Has(digest string) bool {
 // # What this defends against, honestly
 //
 // The claimed digest MUST come from the image manifest descriptor, not from the
-// object that supplies the bytes (see Puller.Pull). Given that, this check
-// defends against a FetchFunc that does not verify what the network gave it, and
-// against write-path corruption between the fetcher and the disk. It does NOT
-// authenticate the image: a wholly hostile FetchFunc supplies the manifest too,
-// and can therefore make its bytes and its claimed digests agree. Image
-// authenticity is a signature problem, not a CAS problem.
+// object that supplies the bytes (see Puller.Pull). Given that — AND given a
+// FetchFunc whose Manifest() is the registry's own manifest, as RemoteFetch's is
+// — this check defends against a fetcher that does not verify what the network
+// gave it, and against write-path corruption between the fetcher and the disk.
+//
+// That qualifier is load-bearing, not boilerplate. For an image whose manifest is
+// SYNTHESIZED from its content — any go-containerregistry partial/tarball-backed
+// image, a test fake, a future local-layout fetcher, i.e. exactly B117/M12's
+// neighbourhood — mfst.*.Digest is derived from the very bytes being checked, so
+// the comparison is a tautology that cannot fail. It does NOT authenticate the
+// image either: a wholly hostile FetchFunc supplies the manifest too, and can
+// therefore make its bytes and its claimed digests agree. Image authenticity is a
+// signature problem, not a CAS problem.
 //
 // # The verification ceiling
 //
 // Verification happens at WRITE time only. The cache-hit fast path below is an
-// os.Stat, and every downstream reader (materialize, the unpacker) trusts the
+// os.Lstat, and every downstream reader (materialize, the unpacker) trusts the
 // on-disk bytes; every blob written before B129 was never hashed by this repo at
 // all. Verify-on-read is deliberately NOT done here — it is O(image bytes) on the
 // hot path and would regress the M1.1-a1 cache-hit acceptance path. The natural
@@ -206,18 +266,33 @@ func (c *Cache) Has(digest string) bool {
 // datastore, so filling it takes the control plane down. size (the descriptor's
 // declared size) caps the write: an overrun fails with ErrBlobTooLarge. It is not
 // an integrity check — a stream that is short, or that is the wrong bytes at the
-// right length, is caught by the ONE digest comparison, not by size. size <= 0
-// means unbounded; the pull path always passes the declared size, and a
-// legitimately empty blob is unbounded-but-still-verified, which is harmless.
+// right length, is caught by the ONE digest comparison, not by size.
+//
+// size must be >= 0, or exactly SizeUnknown to opt out of the guard; any other
+// negative value is an error. 0 means an EMPTY blob and is enforced as such — it
+// is NOT an opt-out. The pull path always passes the descriptor's declared size.
 func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error) (wrote bool, err error) {
 	want, err := parseBlobDigest(digest)
 	if err != nil {
 		return false, err
 	}
-	dst := filepath.Join(c.blobsDir(), want.Algorithm, want.Hex)
-	// Cache hit — a REGULAR file only. A directory or a symlink at the blob path
-	// is not a blob, and accepting one would let it suppress the write forever.
-	if fi, serr := os.Stat(dst); serr == nil && fi.Mode().IsRegular() {
+	if fill == nil {
+		// Explicit, like NewPuller's required-argument checks: this is an exported
+		// API called from the root daemon, and a nil fill must not panic there.
+		return false, fmt.Errorf("commit blob %s: fill is required", quoteBounded(digest, maxDigestLen))
+	}
+	if size < 0 && size != SizeUnknown {
+		return false, fmt.Errorf("commit blob %s: negative size %d (use SizeUnknown to opt out of the size guard)",
+			quoteBounded(digest, maxDigestLen), size)
+	}
+	dst := c.pathFor(want)
+	// Cache hit — a REGULAR file only, judged by Lstat so a SYMLINK is not
+	// silently accepted (Stat would resolve it and report the target's mode). A
+	// directory or a symlink at the blob path is not a blob, and accepting one
+	// would suppress the write — and with it the verification — forever. Falling
+	// through is safe and self-healing: rename(2) replaces a symlink at the
+	// destination with the verified file.
+	if fi, serr := os.Lstat(dst); serr == nil && fi.Mode().IsRegular() {
 		return false, nil
 	}
 	dir := filepath.Dir(dst)
@@ -240,8 +315,14 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 	// io.ReaderFrom, which is what keeps the hasher on the path.
 	hasher := blobHashers[want.Algorithm]()
 	var w io.Writer = io.MultiWriter(tmp, hasher)
-	if size > 0 {
-		w = &cappedWriter{w: w, remaining: size}
+	// size == 0 is a REAL cap (the empty blob), not "no cap": only the explicit
+	// SizeUnknown sentinel opts out. A `size > 0` test here would silently disable
+	// the guard for any descriptor declaring zero, and the actor who can author
+	// that descriptor is the same one the guard defends against.
+	var capped *cappedWriter
+	if size != SizeUnknown {
+		capped = &cappedWriter{w: w, remaining: size}
+		w = capped
 	}
 	if ferr := fill(w); ferr != nil {
 		// A short write (io.ErrShortWrite, from MultiWriter) surfaces here rather
@@ -254,6 +335,13 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 		// fill streams REGISTRY bytes (layer.Compressed / io.Copy), so its error is
 		// third-party content — bounded, never adopted.
 		return false, fmt.Errorf("write blob %s: %w", quoteBounded(digest, maxDigestLen), boundErr(ferr))
+	}
+	// fill returned nil but the cap fired: it swallowed the write error. The bytes
+	// were bounded either way, but the VERDICT would otherwise fall through to the
+	// digest comparison and be reported as a mismatch — see cappedWriter.
+	if capped != nil && capped.overflowed {
+		tmp.Close()
+		return false, fmt.Errorf("write blob %s: %w", quoteBounded(digest, maxDigestLen), ErrBlobTooLarge)
 	}
 	// rename(2) on APFS orders metadata but not data, so without this fsync a
 	// crash can leave a correctly-NAMED but truncated blob — the one blob for
@@ -287,15 +375,23 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 
 // cappedWriter fails once more than remaining bytes are written. It is the
 // CommitBlob resource guard (see there); it is not an integrity check.
+//
+// overflowed latches the refusal so the verdict survives a fill that discards its
+// write error. Without it, such a fill returns nil, control falls through to the
+// digest comparison, and an OVERSIZED input gets reported as a POISONED blob —
+// the wrong operator signal (reject the source vs quarantine the blob), and
+// exactly the taxonomy collapse ErrManifestInconsistent was split out to avoid.
 type cappedWriter struct {
-	w         io.Writer
-	remaining int64
+	w          io.Writer
+	remaining  int64
+	overflowed bool
 }
 
 // Write rejects the whole overrunning write rather than passing a prefix through,
 // so at most the declared number of bytes ever reaches the disk.
 func (c *cappedWriter) Write(p []byte) (int, error) {
 	if int64(len(p)) > c.remaining {
+		c.overflowed = true
 		return 0, ErrBlobTooLarge
 	}
 	n, err := c.w.Write(p)

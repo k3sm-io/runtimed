@@ -328,7 +328,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	// reordering is now also caught by the per-blob digest check below).
 	if len(layers) != len(mfst.Layers) {
 		return nil, fmt.Errorf("pull %q: image has %d layers but its manifest lists %d: %w",
-			ref, len(layers), len(mfst.Layers), ErrDigestMismatch)
+			ref, len(layers), len(mfst.Layers), ErrManifestInconsistent)
 	}
 	for i, layer := range layers {
 		desc := mfst.Layers[i]
