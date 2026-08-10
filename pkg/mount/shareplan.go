@@ -519,7 +519,7 @@ func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePat
 	// including one relocated wholesale (a traversing pod_id, a mis-wired
 	// caller). Bounding podDir is what gives those checks their meaning.
 	podsRoot := filepath.Join(workRoot, vmPodsDirName)
-	if !isStrictlyUnder(podDir, podsRoot) {
+	if !IsStrictlyUnder(podDir, podsRoot) {
 		return fmt.Errorf("pod dir %q is not strictly under the runtime pods root %q", podDir, podsRoot)
 	}
 	runDir := filepath.Join(workRoot, "run")
@@ -530,8 +530,8 @@ func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePat
 		if i < podDirShares {
 			// A pod-dir share stays STRICTLY inside the owning pod dir —
 			// equality would export the whole pod dir, which is exactly why
-			// this uses isStrictlyUnder and not isUnder (equality-true).
-			if !isStrictlyUnder(s.Root, podDir) {
+			// this uses IsStrictlyUnder and not isUnder (equality-true).
+			if !IsStrictlyUnder(s.Root, podDir) {
 				return fmt.Errorf("share %s root %q escapes the pod dir %q", s.Tag, s.Root, podDir)
 			}
 		} else {
@@ -545,14 +545,14 @@ func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePat
 			if s.Root == basePath {
 				return fmt.Errorf("share %s root equals the storage base path %q", s.Tag, basePath)
 			}
-			if !isStrictlyUnder(s.Root, basePath) {
+			if !IsStrictlyUnder(s.Root, basePath) {
 				return fmt.Errorf("share %s root %q escapes the storage base path %q", s.Tag, s.Root, basePath)
 			}
 		}
 		// R7: no share may export, sit inside, or contain the daemon socket
 		// tree <workRoot>/run (netd.sock, runtimed.sock, run/keys) — a guest
 		// handed any slice of it could reach the daemon control sockets.
-		if s.Root == runDir || isStrictlyUnder(s.Root, runDir) || isStrictlyUnder(runDir, s.Root) {
+		if s.Root == runDir || IsStrictlyUnder(s.Root, runDir) || IsStrictlyUnder(runDir, s.Root) {
 			return fmt.Errorf("share %s root %q intersects the runtime socket tree %q", s.Tag, s.Root, runDir)
 		}
 	}
@@ -563,7 +563,7 @@ func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePat
 	for i := 0; i < len(shares); i++ {
 		for j := i + 1; j < len(shares); j++ {
 			a, b := shares[i], shares[j]
-			if a.Root == b.Root || isStrictlyUnder(a.Root, b.Root) || isStrictlyUnder(b.Root, a.Root) {
+			if a.Root == b.Root || IsStrictlyUnder(a.Root, b.Root) || IsStrictlyUnder(b.Root, a.Root) {
 				return fmt.Errorf("share roots %q (%s) and %q (%s) are nested", a.Root, a.Tag, b.Root, b.Tag)
 			}
 		}

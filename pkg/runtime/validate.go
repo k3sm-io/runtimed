@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
 )
 
 // errInvalidPodBox is the sentinel for PodBox validation failures (mapped to
@@ -34,9 +35,13 @@ func validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod is nil", errInvalidPodBox)
 	}
-	if box.GetPodId() == "" {
+	// pod_id becomes a directory name the ROOT daemon creates, writes into and
+	// removes, so it is validated at the seam as well as at the derivation. The
+	// seam check is what makes the rule total: it covers every derivation of the
+	// id, including ones that do not go through the image cache.
+	if _, err := image.ParsePodID(box.GetPodId()); err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: pod_id is required", errInvalidPodBox)
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
 	if box.GetSandboxProfile() == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,

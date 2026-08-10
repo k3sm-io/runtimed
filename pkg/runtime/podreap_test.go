@@ -239,7 +239,10 @@ func TestPodProcRecordRoundTrip(t *testing.T) {
 		t.Fatal("recordPodProc(pgid=1) must be refused")
 	}
 	// A malformed record file must be quarantined, not break listing.
-	badDir := rt.podReapDir("pod-b")
+	badDir, badDirErr := rt.podReapDir("pod-b")
+	if badDirErr != nil {
+		t.Fatalf("podReapDir: %v", badDirErr)
+	}
 	if err := os.MkdirAll(badDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
