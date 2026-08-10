@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"testing"
 
@@ -115,7 +116,7 @@ func TestCreatePodRejectsTraversingPodID(t *testing.T) {
 		})
 	}
 
-	if got := tree(t, outside); !sameTree(before, got) {
+	if got := tree(t, outside); !slices.Equal(before, got) {
 		t.Errorf("a hostile pod id mutated the filesystem\nbefore: %v\nafter:  %v", before, got)
 	}
 
@@ -148,16 +149,4 @@ func mustWrite(t *testing.T, p, content string) {
 	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", p, err)
 	}
-}
-
-func sameTree(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

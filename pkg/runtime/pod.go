@@ -1287,7 +1287,7 @@ func (r *Runtime) removePodDir(podID string) error {
 	// outside the pods tree — including the control-plane state dir. The
 	// separator-aware check bounds the target strictly under <root>/pods, which
 	// is the only tree this function is ever entitled to delete.
-	if !mount.IsStrictlyUnder(dir, filepath.Join(r.cache.Root(), "pods")) {
+	if !mount.IsStrictlyUnder(dir, r.cache.PodsRoot()) {
 		return nil
 	}
 	return os.RemoveAll(dir)

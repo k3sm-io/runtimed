@@ -54,10 +54,7 @@ func TestContainerEnvPathShim(t *testing.T) {
 	box, _ := mountingBox("pod-1", "/etc/nats", "/scratch")
 	c := box.GetContainers()[0]
 
-	env, envErr := rt.containerEnv(box, c)
-	if envErr != nil {
-		t.Fatalf("containerEnv: %v", envErr)
-	}
+	env := mustEnv(t, rt, box, c)
 	if got, _ := envValue(env, pathShimRootfsEnv); got != "/var/lib/k3sm/pods/pod-1/rootfs" {
 		t.Errorf("%s = %q, want the pod rootfs", pathShimRootfsEnv, got)
 	}
@@ -96,10 +93,7 @@ func TestContainerEnvNoShimWhenNoMounts(t *testing.T) {
 	box, _ := mountingBox("pod-3") // no mounts
 	c := box.GetContainers()[0]
 
-	env, envErr := rt.containerEnv(box, c)
-	if envErr != nil {
-		t.Fatalf("containerEnv: %v", envErr)
-	}
+	env := mustEnv(t, rt, box, c)
 	if _, ok := envValue(env, pathShimMountsEnv); ok {
 		t.Error("no volume mounts: must not set K3SM_MOUNT_PATHS")
 	}

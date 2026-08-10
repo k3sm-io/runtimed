@@ -407,7 +407,18 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 // containment structural: a caller cannot derive a pod path from an untrusted
 // identifier even by forgetting to check it, because it has nothing to pass.
 func (c *Cache) PodRootfs(podID PodID) string {
-	return filepath.Join(c.root, "pods", podID.String(), "rootfs")
+	return filepath.Join(c.PodsRoot(), podID.String(), "rootfs")
+}
+
+// PodsRoot returns the directory every pod dir lives under (<root>/pods).
+//
+// It exists so a caller that must BOUND an operation to the pods tree — the
+// daemon's pod-dir delete, for one — asks this package where that tree is
+// instead of re-spelling the component. A guard and the deriver it guards must
+// agree on the root or the guard means nothing, and two string literals in two
+// packages have no coupling that would catch a drift.
+func (c *Cache) PodsRoot() string {
+	return filepath.Join(c.root, "pods")
 }
 
 // PodDir returns the per-pod directory itself (<root>/pods/<podID>), the parent
@@ -415,5 +426,5 @@ func (c *Cache) PodRootfs(podID PodID) string {
 // layout with filepath.Dir on a rootfs path, which would put a second copy of
 // the layout outside this file.
 func (c *Cache) PodDir(podID PodID) string {
-	return filepath.Join(c.root, "pods", podID.String())
+	return filepath.Join(c.PodsRoot(), podID.String())
 }
