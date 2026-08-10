@@ -19,6 +19,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -314,8 +315,23 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	// ROOT-SIDE, BEFORE any container's privilege drop (a uid-dropped, sandboxed
 	// process can no longer chown). The supervisor runs this synchronously here,
 	// strictly before posix_spawn → the exec-shim drop. (M2.3)
+	//
+	// The walk's BOUND is THIS POD'S OWN DIR, not the shared pods root: rootfs is
+	// already the validated derivation (rootfsPath), so this is defence at the
+	// sink — the recursive group-rwx + setgid grant refuses any root outside that
+	// dir regardless of how the caller obtained it (B140), the same shape
+	// removePodDir puts on its RemoveAll. The pods root would be one level too
+	// wide to be a real second layer: <PodsRoot>/<VICTIM-ID>/rootfs is strictly
+	// under it, so a pods-root bound would wave through the cross-pod case that is
+	// hazard #1 for the primary guard — the two layers would then fail together,
+	// which is the one property a defence-in-depth layer must not have.
+	podDir, err := r.podDir(box.GetPodId())
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
 	if fsGroup := int(box.GetPodSecurityContext().GetFsGroup()); fsGroup > 0 {
-		if err := supervisor.ChownForFSGroup(rootfs, fsGroup); err != nil {
+		if err := supervisor.ChownForFSGroup(podDir, rootfs, fsGroup); err != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("fsGroup chown for pod %s: %w", box.GetPodId(), err)
 		}
@@ -492,9 +508,9 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
 	// B102). The pod dir is derived LOCALLY (r.podDir) and the planner ignores
-	// box.rootfs_path for share roots: that field is caller-supplied and
-	// unvalidated (rootfsPath below still honors it for the host-side
-	// VMSpec.RootfsPath, unchanged here).
+	// box.rootfs_path for share roots; rootfsPath below now derives the host-side
+	// VMSpec.RootfsPath the same way, accepting a caller-supplied rootfs_path
+	// only when it is byte-equal to that derivation (B140).
 	//
 	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
 	// pattern (validate.go) — deliberately NOT the ROOTFS_SETUP the native
@@ -1238,19 +1254,70 @@ func containerMountPaths(c *runtimev1.Container) []string {
 	return paths
 }
 
-// rootfsPath returns the on-disk pod data volume for box: its explicit
-// rootfs_path when set, else the cache-derived default under the runtime root.
-// createPod, Exec, and RestartContainer share it so the pod cwd/SBPL scope is
-// resolved one way.
+// errUncontainedRootfs is the sentinel for a box whose rootfs_path is not this
+// pod's own derived data volume. Callers surface it as an invalid-argument
+// failure (FAILURE_REASON_INVALID_POD_BOX); it is never retried, since the value
+// cannot become acceptable without the caller changing it.
+var errUncontainedRootfs = errors.New("rootfs_path is not the pod's derived data volume")
+
+// rootfsPath returns the on-disk pod data volume for box: always the
+// cache-derived <Root>/pods/<pod_id>/rootfs. A non-empty box.rootfs_path is
+// accepted ONLY when it is BYTE-EQUAL to that derived path; anything else is
+// refused with errUncontainedRootfs and no path at all, so no caller can act on
+// a value that was never checked. createPod, createVMPod, containerEnv, Exec and
+// RestartContainer share it, so the pod cwd / SBPL scope / VM rootfs is resolved
+// one way.
+//
+// WHY THIS IS A ROOT-DAEMON HOLE. rootfs_path arrives over the runtimed gRPC
+// seam, and the daemon's socket is NOT denied by the default pod sandbox profile
+// (only the netd helper socket is) while pods run at the daemon's own uid — so a
+// confined pod can issue CreatePod itself. The value then flows into
+// os.MkdirAll, mount.Materialize, volume.Binder.Bind, supervisor.ChownForFSGroup
+// (a recursive Lchown + Chmod that grants the group the owner's rwx and sets
+// setgid on every directory), the resolved binary path, the K3SM_ROOTFS shim env,
+// the Exec cwd and sandbox.VMSpec.RootfsPath. Unvalidated, that is
+// privilege-escalation-from-a-confined-pod, not merely a control-plane-compromise
+// amplifier.
+//
+// WHY BYTE-EQUALITY AND NOT "STRICTLY UNDER THE PODS ROOT". A containment
+// predicate is weaker in three distinct ways, each of which byte-equality makes
+// structurally impossible without resolving anything on disk:
+//
+//   - Cross-pod. <PodsRoot>/<VICTIM-ID>/rootfs passes any prefix test, handing
+//     the caller another pod's materialized secrets and projected SA-token — and
+//     removePodDir derives its target from the ATTACKER's id, so the damage is
+//     never cleaned up.
+//   - Symlink-blind. A lexical check cannot see that <PodsRoot>/<own-id>/rootfs/
+//     link is a symlink to /var/lib/k3sm/server: the pod's own data volume is
+//     writable at both the POSIX and the SBPL layer (it is re-allowed after the
+//     protected denies), and MkdirAll / Materialize follow the link.
+//   - Case aliasing. The default APFS volume is case-insensitive, so an
+//     uppercase spelling of another pod's id names that pod's directory — the
+//     same class podIDRe's lowercase-only rule closed for pod_id itself.
+//
+// Firmlink spellings (/var vs /private/var) are likewise REFUSED, because the
+// derived path is the only accepted spelling. That is fail-CLOSED and
+// deliberate: normalizing aliases would mean resolving the path, and a resolver
+// that mis-parses fails OPEN. Every producer today leaves the field empty (no
+// caller in k3sm sets it), so the guard is behaviour-neutral: the accept branch
+// can only ever return the value the derivation already computes.
+//
+// SCOPE, HONESTLY. This closes the rootfs_path DAEMON-INPUT hole only. It does
+// NOT make same-node pods mutually isolated — pods still share the daemon's uid,
+// so untrusted multi-tenancy still routes to the vm RuntimeClass. And it says
+// nothing about SandboxProfile.data_volume_path, which remains a separate,
+// producer-set, unvalidated SBPL input: do not read this as "wire paths are
+// validated".
 func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
-	if rootfs := box.GetRootfsPath(); rootfs != "" {
-		return rootfs, nil
-	}
 	id, err := image.ParsePodID(box.GetPodId())
 	if err != nil {
 		return "", err
 	}
-	return r.cache.PodRootfs(id), nil
+	derived := r.cache.PodRootfs(id)
+	if rootfs := box.GetRootfsPath(); rootfs != "" && rootfs != derived {
+		return "", fmt.Errorf("%w: %q is not %q", errUncontainedRootfs, rootfs, derived)
+	}
+	return derived, nil
 }
 
 // podDir returns the per-pod directory under the cache root. It returns an error

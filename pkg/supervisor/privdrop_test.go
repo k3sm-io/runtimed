@@ -620,7 +620,10 @@ func TestChownForFSGroup(t *testing.T) {
 	if gid <= 0 {
 		t.Skip("test process gid <= 0 (running as root?); fsGroup chown asserts a >0 gid")
 	}
-	root := t.TempDir()
+	// The walk is bounded by the pods root; root is a pod's data volume strictly
+	// inside it, mirroring the daemon's real shape.
+	podsRoot := t.TempDir()
+	root := filepath.Join(podsRoot, "pod-a", "rootfs")
 	sub := filepath.Join(root, "vol")
 	if err := os.MkdirAll(sub, 0o700); err != nil {
 		t.Fatal(err)
@@ -630,7 +633,7 @@ func TestChownForFSGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ChownForFSGroup(root, gid); err != nil {
+	if err := ChownForFSGroup(podsRoot, root, gid); err != nil {
 		t.Fatalf("ChownForFSGroup: %v", err)
 	}
 
@@ -664,9 +667,130 @@ func TestChownForFSGroup(t *testing.T) {
 // TestChownForFSGroupRejectsRootGid rejects a non-positive fsGroup (0 = wheel is
 // never a valid target; negative is a bug).
 func TestChownForFSGroupRejectsRootGid(t *testing.T) {
-	if err := ChownForFSGroup(t.TempDir(), 0); err == nil {
-		t.Error("ChownForFSGroup(_, 0) = nil, want error")
+	bound := t.TempDir()
+	if err := ChownForFSGroup(bound, filepath.Join(bound, "pod-a", "rootfs"), 0); err == nil {
+		t.Error("ChownForFSGroup(_, _, 0) = nil, want error")
 	}
+}
+
+// TestChownForFSGroupRejectsUnboundedRoot is the B140 sink-side half: the
+// recursive group-rwx + setgid grant refuses a root outside the permitted tree
+// REGARDLESS of the caller, and refuses it BEFORE touching the filesystem. The
+// pre-created victim's mode is asserted unchanged, because an error return alone
+// would not distinguish "refused" from "escalated, then failed late".
+func TestChownForFSGroupRejectsUnboundedRoot(t *testing.T) {
+	gid := os.Getgid()
+	if gid <= 0 {
+		t.Skip("test process gid <= 0 (running as root?); fsGroup chown asserts a >0 gid")
+	}
+	outside := t.TempDir()
+	bound := filepath.Join(outside, "pods")
+	victim := filepath.Join(outside, "server")
+	if err := os.MkdirAll(filepath.Join(victim, "db"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A sibling whose name merely starts with the bound — the classic
+	// prefix-check bypass.
+	sibling := filepath.Join(outside, "podsevil")
+	if err := os.MkdirAll(sibling, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(bound, "pod-a", "rootfs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		root string
+	}{
+		{"outside-the-bound", victim},
+		{"the-bound-itself", bound},           // equality is refused: never the shared root
+		{"sibling-sharing-a-prefix", sibling}, // /x/podsevil is not under /x/pods
+		{"parent-of-the-bound", outside},
+		{"relative", "pods/pod-a/rootfs"},   // a relative root resolves against cwd
+		{"traversal", bound + "/../server"}, // cleaned, this leaves the bound
+		{"filesystem-root", string(os.PathSeparator)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := modeOf(t, victim)
+			err := ChownForFSGroup(bound, tc.root, gid)
+			if !errors.Is(err, ErrFSGroupRootUnbounded) {
+				t.Errorf("ChownForFSGroup(%q, %q, %d) = %v, want ErrFSGroupRootUnbounded", bound, tc.root, gid, err)
+			}
+			if got := modeOf(t, victim); got != before {
+				t.Errorf("victim %s mode changed %v -> %v; the refusal must precede any chmod", victim, before, got)
+			}
+		})
+	}
+
+	// POSITIVE CONTROL: a root strictly inside the bound is still walked, so the
+	// table above cannot pass by refusing everything.
+	pod := filepath.Join(bound, "pod-a", "rootfs")
+	if err := ChownForFSGroup(bound, pod, gid); err != nil {
+		t.Fatalf("ChownForFSGroup(bound, %q, %d) = %v, want nil", pod, gid, err)
+	}
+	if got := modeOf(t, pod); got.Perm()&0o070 != 0o070 || got&os.ModeSetgid == 0 {
+		t.Errorf("pod rootfs mode = %v, want group rwx + setgid (the walk must be reachable)", got)
+	}
+}
+
+// TestStrictlyUnder pins the containment predicate the fsGroup bound rests on.
+// It is the local twin of mount.IsStrictlyUnder; the two tables must agree.
+func TestStrictlyUnder(t *testing.T) {
+	cases := []struct {
+		path, base string
+		want       bool
+	}{
+		{"/a/b/c", "/a/b", true},
+		{"/a/b", "/a/b", false},   // equality is NOT under
+		{"/a/bc", "/a/b", false},  // separator-aware: a sibling sharing a prefix
+		{"/a", "/a/b", false},     // the parent is not under the child
+		{"/a/b/../c", "/a", true}, // cleaned first
+		{"/a/b/../../c", "/a", false},
+		{"/a", "/", true},
+		{"/", "/", false},
+		{"a/b", "/a", false}, // relative path
+		{"/a/b", "a", false}, // relative base
+		{"", "/a", false},
+		{"/a/b", "", false},
+		{"/a/b/", "/a", true}, // trailing separator is cleaned away
+	}
+	// The DELIBERATE asymmetry with pkg/mount.IsStrictlyUnder, pinned so the
+	// divergence cannot be "reconciled" by loosening this one. mount's variant
+	// answers true for both of these (it does not require absolute operands),
+	// which is harmless where its inputs are absolute by construction but is a
+	// fail-OPEN shape for a bound on a recursive privilege grant: a relative base
+	// would resolve against the process working directory.
+	stricterThanMount := []struct {
+		path, base string
+	}{
+		{"a/b", "a"},
+		{"a/b/c", "a/b"},
+	}
+	for _, tc := range stricterThanMount {
+		if strictlyUnder(tc.path, tc.base) {
+			t.Errorf("strictlyUnder(%q, %q) = true; this predicate is deliberately STRICTER than mount.IsStrictlyUnder and must refuse relative operands", tc.path, tc.base)
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.path+"|"+tc.base, func(t *testing.T) {
+			if got := strictlyUnder(tc.path, tc.base); got != tc.want {
+				t.Errorf("strictlyUnder(%q, %q) = %v, want %v", tc.path, tc.base, got, tc.want)
+			}
+		})
+	}
+}
+
+// modeOf returns p's full FileMode (permissions + setgid), failing the test if
+// it cannot be stat'd.
+func modeOf(t *testing.T, p string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat %s: %v", p, err)
+	}
+	return fi.Mode()
 }
 
 // idx returns the index of step in calls, or -1 if absent.

@@ -410,6 +410,25 @@ func testDeps(t *testing.T, d Deps) Deps {
 	return d
 }
 
+// derivedRootfs is the ONE way a test spells a pod's on-disk data volume.
+//
+// Since B140 a box's rootfs_path is accepted only when it is BYTE-EQUAL to this
+// derivation, so a test that wants an on-disk pod dir asks the runtime for it
+// instead of inventing a t.TempDir(). Callers that set box.rootfs_path must set
+// SandboxProfile.data_volume_path to the SAME value: sandbox.Generate carves the
+// credential read-only sub-scope only out of paths under the data volume, and
+// the pods root is otherwise in the protected deny-set — so moving one field
+// without the other makes credential-path validation fail for reasons that have
+// nothing to do with the test's subject.
+func derivedRootfs(t *testing.T, rt *Runtime, podID string) string {
+	t.Helper()
+	id, err := image.ParsePodID(podID)
+	if err != nil {
+		t.Fatalf("ParsePodID(%q): %v", podID, err)
+	}
+	return rt.cache.PodRootfs(id)
+}
+
 // hostBinBox builds a minimal valid PodBox running a host-binary container.
 func hostBinBox(podID string) *runtimev1.PodBox {
 	return &runtimev1.PodBox{
@@ -1023,10 +1042,10 @@ func (fakeResolver) ServiceAccountToken(_ context.Context, _, _ string, _ int64)
 // secret's read-only sub-scope into the generated SBPL, and (3) carries the
 // run-as uid/gid through WrapCommand into the spawned exec-shim argv.
 func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
-	dataVol := t.TempDir()
 	sp := &fakeSpawner{}
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w, Resolver: fakeResolver{}})
+	dataVol := derivedRootfs(t, rt, "pod-vol")
 
 	box := &runtimev1.PodBox{
 		PodId:      "pod-vol",

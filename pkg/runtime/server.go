@@ -41,7 +41,7 @@ import (
 // itself returns (response, nil) so the typed failure crosses the wire.
 func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	box := req.GetPod()
-	if reason, err := validatePodBox(box); err != nil {
+	if reason, err := r.validatePodBox(box); err != nil {
 		return createFailure(reason, err), nil
 	}
 

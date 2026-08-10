@@ -162,9 +162,11 @@ type Tmpfs struct {
 // ComputeSharePlan computes the virtiofs share-device plan for a
 // vm-RuntimeClass pod from the PodBox's declared volumes and volumeMounts.
 // podDir is the pod's on-disk directory (the runtime-derived
-// <root>/pods/<podID> — NEVER box.rootfs_path, which is caller-supplied and
-// unvalidated), workRoot is the runtime work dir (Config.Root), and class is
-// the local-path storage class PVC roots derive from. podDir is ENFORCED to
+// <root>/pods/<podID> — NEVER box.rootfs_path, which is caller-supplied; the
+// runtime now also refuses any rootfs_path that is not byte-equal to that same
+// derivation (B140), so the two agree, but the planner still derives its own
+// rather than trusting the box). workRoot is the runtime work dir (Config.Root),
+// and class is the local-path storage class PVC roots derive from. podDir is ENFORCED to
 // sit strictly inside <workRoot>/pods (guardShareRoots): a caller-derived pod
 // dir relocated wholesale — e.g. by a traversing pod_id surviving a future
 // derivation change — rejects instead of anchoring every pod-dir share at the
