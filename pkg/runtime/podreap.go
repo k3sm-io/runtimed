@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
@@ -115,8 +116,17 @@ func (r *Runtime) podReapRoot() string {
 	return filepath.Join(r.cache.Root(), sandbox.PodReapSubdir)
 }
 
-func (r *Runtime) podReapDir(podID string) string {
-	return filepath.Join(r.podReapRoot(), podID)
+// podReapDir returns a pod's reap-record dir. It returns an error for an id that
+// is not a legal path component: this is the SECOND derivation of pod_id into a
+// path in the daemon, and its RemoveAll had no containment guard at all, so an
+// unvalidated id here was the shortest route from a hostile CreatePod to an
+// arbitrary recursive delete running as root.
+func (r *Runtime) podReapDir(podID string) (string, error) {
+	id, err := image.ParsePodID(podID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(r.podReapRoot(), id.String()), nil
 }
 
 // recordPodProc durably records a just-spawned container's process group BEFORE
@@ -134,7 +144,10 @@ func (r *Runtime) recordPodProc(podID, container string, pgid int) error {
 		start = 0
 	}
 	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start}
-	dir := r.podReapDir(podID)
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return fmt.Errorf("reap record dir for pod %s: %w", podID, err)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create reap record dir for pod %s: %w", podID, err)
 	}
@@ -157,13 +170,21 @@ func (r *Runtime) recordPodProc(podID, container string, pgid int) error {
 // is observed empty (best-effort: a leftover record is harmless — the reap's
 // identity check drops it unsignaled).
 func (r *Runtime) removePodProcRecord(podID string, pgid int) {
-	_ = os.Remove(filepath.Join(r.podReapDir(podID), strconv.Itoa(pgid)+".json"))
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return // an unvalidated id never produced a record
+	}
+	_ = os.Remove(filepath.Join(dir, strconv.Itoa(pgid)+".json"))
 }
 
 // removePodReapRecords drops every process-group record for a pod, on teardown
 // (DeletePod) after its groups have been signalled. Best-effort.
 func (r *Runtime) removePodReapRecords(podID string) {
-	_ = os.RemoveAll(r.podReapDir(podID))
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return // an unvalidated id never produced records
+	}
+	_ = os.RemoveAll(dir)
 }
 
 // listPodProcRecords loads every durable process-group record under

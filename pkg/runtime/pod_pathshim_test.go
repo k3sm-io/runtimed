@@ -54,7 +54,10 @@ func TestContainerEnvPathShim(t *testing.T) {
 	box, _ := mountingBox("pod-1", "/etc/nats", "/scratch")
 	c := box.GetContainers()[0]
 
-	env := rt.containerEnv(box, c)
+	env, envErr := rt.containerEnv(box, c)
+	if envErr != nil {
+		t.Fatalf("containerEnv: %v", envErr)
+	}
 	if got, _ := envValue(env, pathShimRootfsEnv); got != "/var/lib/k3sm/pods/pod-1/rootfs" {
 		t.Errorf("%s = %q, want the pod rootfs", pathShimRootfsEnv, got)
 	}
@@ -77,7 +80,7 @@ func TestContainerEnvPathShimWithDNS(t *testing.T) {
 	box.Annotations = map[string]string{dyldInsertAnnotation: "/opt/k3sm/libdnsshim.dylib"}
 	c := box.GetContainers()[0]
 
-	dyld, _ := envValue(rt.containerEnv(box, c), dyldInsertEnv)
+	dyld, _ := envValue(mustEnv(t, rt, box, c), dyldInsertEnv)
 	got := strings.Split(dyld, ":")
 	want := []string{testShim, "/opt/k3sm/libdnsshim.dylib"}
 	if !slices.Equal(got, want) {
@@ -93,7 +96,10 @@ func TestContainerEnvNoShimWhenNoMounts(t *testing.T) {
 	box, _ := mountingBox("pod-3") // no mounts
 	c := box.GetContainers()[0]
 
-	env := rt.containerEnv(box, c)
+	env, envErr := rt.containerEnv(box, c)
+	if envErr != nil {
+		t.Fatalf("containerEnv: %v", envErr)
+	}
 	if _, ok := envValue(env, pathShimMountsEnv); ok {
 		t.Error("no volume mounts: must not set K3SM_MOUNT_PATHS")
 	}
@@ -103,7 +109,7 @@ func TestContainerEnvNoShimWhenNoMounts(t *testing.T) {
 
 	rt.cfg.PathShimPath = "" // disabled
 	box2, _ := mountingBox("pod-4", "/etc/nats")
-	if _, ok := envValue(rt.containerEnv(box2, box2.GetContainers()[0]), pathShimMountsEnv); ok {
+	if _, ok := envValue(mustEnv(t, rt, box2, box2.GetContainers()[0]), pathShimMountsEnv); ok {
 		t.Error("PathShimPath empty: must not inject the rebase env")
 	}
 }
@@ -116,11 +122,23 @@ func TestContainerEnvExplicitDyldWins(t *testing.T) {
 	box, c := mountingBox("pod-5", "/etc/nats")
 	c.Env = []*runtimev1.EnvVar{{Name: dyldInsertEnv, Value: "/custom.dylib"}}
 
-	dyld, _ := envValue(rt.containerEnv(box, c), dyldInsertEnv)
+	dyld, _ := envValue(mustEnv(t, rt, box, c), dyldInsertEnv)
 	if dyld != "/custom.dylib" {
 		t.Errorf("explicit DYLD must win: got %q", dyld)
 	}
-	if _, ok := envValue(rt.containerEnv(box, c), pathShimMountsEnv); ok {
+	if _, ok := envValue(mustEnv(t, rt, box, c), pathShimMountsEnv); ok {
 		t.Error("explicit DYLD opts out: must not inject K3SM_MOUNT_PATHS")
 	}
+}
+
+// mustEnv is a test helper: containerEnv now returns an error because the
+// path-rebase shim's rootfs is derived from a validated pod id, and a test that
+// silently dropped that error would hide a rejected id behind an empty env.
+func mustEnv(t *testing.T, rt *Runtime, box *runtimev1.PodBox, c *runtimev1.Container) []string {
+	t.Helper()
+	env, err := rt.containerEnv(box, c)
+	if err != nil {
+		t.Fatalf("containerEnv: %v", err)
+	}
+	return env
 }

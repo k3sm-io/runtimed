@@ -401,6 +401,19 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 
 // PodRootfs returns the per-pod rootfs dir under the cache root:
 // <root>/pods/<podID>/rootfs. It does not create it.
-func (c *Cache) PodRootfs(podID string) string {
-	return filepath.Join(c.root, "pods", podID, "rootfs")
+//
+// It takes a PodID, not a string, so — like pathFor and its parsed digest — the
+// layout is unreachable without validation having run. That is what keeps the
+// containment structural: a caller cannot derive a pod path from an untrusted
+// identifier even by forgetting to check it, because it has nothing to pass.
+func (c *Cache) PodRootfs(podID PodID) string {
+	return filepath.Join(c.root, "pods", podID.String(), "rootfs")
+}
+
+// PodDir returns the per-pod directory itself (<root>/pods/<podID>), the parent
+// of PodRootfs. It exists so callers that need the pod dir do not re-derive the
+// layout with filepath.Dir on a rootfs path, which would put a second copy of
+// the layout outside this file.
+func (c *Cache) PodDir(podID PodID) string {
+	return filepath.Join(c.root, "pods", podID.String())
 }

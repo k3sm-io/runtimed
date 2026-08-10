@@ -562,6 +562,13 @@ func isUnder(path, base string) bool {
 // cleaned): equality is FALSE — which is exactly why the share-plan containment
 // guards cannot reuse isUnder above — and the check is separator-aware, so
 // /a/b is under /a but the sibling /a/bc is NOT under /a/b.
+// IsStrictlyUnder reports whether path sits strictly inside base (never equal to
+// it), comparing on path SEPARATORS so a sibling whose name merely starts with
+// base ("/var/lib/k3sm-evil" against "/var/lib/k3sm") is not treated as
+// contained. Exported so the runtime package can bound its destructive pod-dir
+// operations with the same predicate rather than open-coding a third prefix check.
+func IsStrictlyUnder(path, base string) bool { return isStrictlyUnder(path, base) }
+
 func isStrictlyUnder(path, base string) bool {
 	path = filepath.Clean(path)
 	base = filepath.Clean(base)
