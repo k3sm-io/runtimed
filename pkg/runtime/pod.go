@@ -237,7 +237,11 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		}
 	}()
 
-	rootfs := r.rootfsPath(box)
+	rootfs, err := r.rootfsPath(box)
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
@@ -497,7 +501,17 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// spine folds mount.Materialize failures into (createPod above): that
 	// conflation is the native path's own divergence; here nothing has touched
 	// disk — the box itself is unplannable.
-	plan, err := mount.ComputeSharePlan(box, r.podDir(box.GetPodId()), r.cfg.Root, r.binder.Class())
+	podDir, err := r.podDir(box.GetPodId())
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	vmRootfs, err := r.rootfsPath(box)
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	plan, err := mount.ComputeSharePlan(box, podDir, r.cfg.Root, r.binder.Class())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
@@ -506,7 +520,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
-		RootfsPath:  r.rootfsPath(box),
+		RootfsPath:  vmRootfs,
 		Network:     netcfg,
 		Volumes:     vmVolumePlan(plan),
 	}
@@ -637,7 +651,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
 	}
 
-	env := r.containerEnv(p.box, c)
+	env, err := r.containerEnv(p.box, c)
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
+	}
 	logs := newLogBuffer()
 	spec := supervisor.SpawnSpec{
 		Path: shimPath,
@@ -1177,12 +1194,12 @@ const (
 // volume, no chroot) and the DNS shim (box annotation). DYLD_INSERT_LIBRARIES is
 // appended last so an explicit container env can override it (rare). A container
 // that sets DYLD_INSERT_LIBRARIES itself opts out of both shims.
-func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) []string {
+func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) ([]string, error) {
 	env := make([]string, 0, len(c.GetEnv())+3)
 	for _, e := range c.GetEnv() {
 		env = append(env, e.GetName()+"="+e.GetValue())
 		if e.GetName() == dyldInsertEnv {
-			return env // explicit container DYLD wins; do not inject shims
+			return env, nil // explicit container DYLD wins; do not inject shims
 		}
 	}
 
@@ -1191,9 +1208,13 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) []
 	// a volume (nothing to rebase otherwise). K3SM_ROOTFS/K3SM_MOUNT_PATHS configure
 	// it; a workload NOT loading the shim (a SIP platform binary) just ignores them.
 	if paths := containerMountPaths(c); r.cfg.PathShimPath != "" && len(paths) > 0 {
+		rootfs, err := r.rootfsPath(box)
+		if err != nil {
+			return nil, err
+		}
 		inserts = append(inserts, r.cfg.PathShimPath)
 		env = append(env,
-			pathShimRootfsEnv+"="+r.rootfsPath(box),
+			pathShimRootfsEnv+"="+rootfs,
 			pathShimMountsEnv+"="+strings.Join(paths, ":"))
 	}
 	if ins := box.GetAnnotations()[dyldInsertAnnotation]; ins != "" {
@@ -1202,7 +1223,7 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) []
 	if len(inserts) > 0 {
 		env = append(env, dyldInsertEnv+"="+strings.Join(inserts, ":"))
 	}
-	return env
+	return env, nil
 }
 
 // containerMountPaths returns c's absolute volume-mount container paths (the
@@ -1221,16 +1242,26 @@ func containerMountPaths(c *runtimev1.Container) []string {
 // rootfs_path when set, else the cache-derived default under the runtime root.
 // createPod, Exec, and RestartContainer share it so the pod cwd/SBPL scope is
 // resolved one way.
-func (r *Runtime) rootfsPath(box *runtimev1.PodBox) string {
+func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
 	if rootfs := box.GetRootfsPath(); rootfs != "" {
-		return rootfs
+		return rootfs, nil
 	}
-	return r.cache.PodRootfs(box.GetPodId())
+	id, err := image.ParsePodID(box.GetPodId())
+	if err != nil {
+		return "", err
+	}
+	return r.cache.PodRootfs(id), nil
 }
 
-// podDir returns the per-pod directory under the cache root.
-func (r *Runtime) podDir(podID string) string {
-	return filepath.Dir(r.cache.PodRootfs(podID))
+// podDir returns the per-pod directory under the cache root. It returns an error
+// rather than a path for an invalid id, so a caller cannot act on a directory
+// derived from an identifier that was never checked.
+func (r *Runtime) podDir(podID string) (string, error) {
+	id, err := image.ParsePodID(podID)
+	if err != nil {
+		return "", err
+	}
+	return r.cache.PodDir(id), nil
 }
 
 // removePodDir deletes a pod's on-disk dir (best-effort, on delete).
@@ -1243,8 +1274,20 @@ func (r *Runtime) podDir(podID string) string {
 // removed, but os.RemoveAll unlinks the symlink without following it, so the
 // target dir under <Root>/storage is untouched.
 func (r *Runtime) removePodDir(podID string) error {
-	dir := r.podDir(podID)
-	if dir == "" || dir == "/" || !strings.HasPrefix(dir, r.cfg.Root) {
+	dir, err := r.podDir(podID)
+	if err != nil {
+		// An id that is not a legal path component never produced a directory,
+		// so there is nothing to remove and nothing to report.
+		return nil
+	}
+	// Defence in depth behind the validated id. The previous guard was a bare
+	// strings.HasPrefix on the root, which is not containment: with root
+	// /var/lib/k3sm it admits /var/lib/k3sm-evil (a sibling whose name merely
+	// starts the same), and it admits any path that stays inside the root but
+	// outside the pods tree — including the control-plane state dir. The
+	// separator-aware check bounds the target strictly under <root>/pods, which
+	// is the only tree this function is ever entitled to delete.
+	if !mount.IsStrictlyUnder(dir, r.cache.PodsRoot()) {
 		return nil
 	}
 	return os.RemoveAll(dir)

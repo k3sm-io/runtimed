@@ -85,7 +85,10 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	}
 	defer func() { _ = cleanup() }()
 
-	rootfs := r.rootfsPath(p.box)
+	rootfs, err := r.rootfsPath(p.box)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "exec: %v", err)
+	}
 	dir := c.GetWorkingDir()
 	if dir == "" {
 		dir = rootfs
@@ -93,7 +96,11 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 
 	cmd := exec.CommandContext(ctx, shimPath)
 	cmd.Args = shimArgv
-	cmd.Env = r.containerEnv(p.box, c)
+	cmdEnv, err := r.containerEnv(p.box, c)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "exec: %v", err)
+	}
+	cmd.Env = cmdEnv
 	cmd.Dir = dir
 	return r.runExec(stream, cmd, first.GetTty(), first.GetStdin())
 }

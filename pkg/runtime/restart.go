@@ -103,7 +103,11 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// (reaper + watchContainerExit) must outlive THIS RPC, so detach the spawn
 	// context from the RPC's cancellation (the pull/sign/wrap during a restart are
 	// fast/cache-backed).
-	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, r.rootfsPath(p.box), spec, initDeclared)
+	restartRootfs, err := r.rootfsPath(p.box)
+	if err != nil {
+		return restartFailure(codes.InvalidArgument, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, "restart %s: %v", req.GetPodId(), err), nil
+	}
+	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, restartRootfs, spec, initDeclared)
 	if err != nil {
 		r.clearRestarting(ctx, p, oldCP)
 		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", err)

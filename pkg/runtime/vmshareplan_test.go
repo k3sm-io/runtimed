@@ -277,7 +277,10 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		if len(cleanRoots) == 0 {
 			t.Fatal("unhostile run recorded no shares (vacuous comparison)")
 		}
-		podDir := rt.podDir("pod-plan-hostile")
+		podDir, podDirErr := rt.podDir("pod-plan-hostile")
+		if podDirErr != nil {
+			t.Fatalf("podDir: %v", podDirErr)
+		}
 		if got, want := findVMShare(t, clean, "k3sm.rootfs").Root, filepath.Join(podDir, "rootfs"); got != want {
 			t.Errorf("rootfs share root = %q, want the podDir-derived %q", got, want)
 		}
@@ -308,7 +311,10 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 	t.Run("share-roots-pairwise-disjoint-vols-not-ancestor-of-proj", func(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 		spec := mustPlanVM(t, rt, vmb, vmShareBox("pod-plan-disjoint"))
-		podDir := rt.podDir("pod-plan-disjoint")
+		podDir, podDirErr := rt.podDir("pod-plan-disjoint")
+		if podDirErr != nil {
+			t.Fatalf("podDir: %v", podDirErr)
+		}
 
 		// The sibling-prefix regression probe: the proj and vols roots are the
 		// EXACT expected siblings (a proj dir renamed to share the vols name as
