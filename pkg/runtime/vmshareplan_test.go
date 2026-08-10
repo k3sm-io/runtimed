@@ -269,6 +269,13 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		}
 	})
 
+	// B140 INVERTS the second half of this case. It used to assert that a hostile
+	// box.rootfs_path was merely INERT for share roots — the plan ignored it, but
+	// the pod still reached the vm backend carrying that path as
+	// VMSpec.RootfsPath. It is now REFUSED outright, strictly before the backend,
+	// because rootfs_path must be byte-equal to the runtime's derived pod data
+	// volume. The share-root half is unchanged and still meaningful: it pins that
+	// the planner derives roots locally rather than from the box.
 	t.Run("box-supplied-rootfs-path-never-moves-a-share-root", func(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 
@@ -285,26 +292,43 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 			t.Errorf("rootfs share root = %q, want the podDir-derived %q", got, want)
 		}
 
-		// Same pod, hostile box.rootfs_path (the runtime work root itself). A
-		// failed vm create registers nothing, so the same pod id re-runs on the
-		// same runtime; the recorder count is cumulative, hence want 2 here.
-		hostileBox := vmShareBox("pod-plan-hostile")
-		hostileBox.RootfsPath = rt.cfg.Root
-		if _, _, err := rt.createPod(context.Background(), hostileBox, sandbox.GuestNetworkConfig{}); err == nil {
+		// The DERIVED spelling is still accepted, so the guard is byte-equality and
+		// not "any rootfs_path is fatal". A failed vm create registers nothing, so
+		// the same pod id re-runs on the same runtime; the recorder count is
+		// cumulative, hence want 2 here.
+		derivedBox := vmShareBox("pod-plan-hostile")
+		derivedBox.RootfsPath = filepath.Join(podDir, "rootfs")
+		if _, _, err := rt.createPod(context.Background(), derivedBox, sandbox.GuestNetworkConfig{}); err == nil {
 			t.Fatal("vm createPod should surface the lab-gated boot error")
 		}
-		n, hostile := vmb.created()
+		n, derived := vmb.created()
 		if n != 2 {
-			t.Fatalf("CreateVM called %d times, want 2 (the hostile run must still reach the backend)", n)
+			t.Fatalf("CreateVM called %d times, want 2 (the derived-spelling run must still reach the backend)", n)
+		}
+		if got := vmShareRoots(derived); !reflect.DeepEqual(got, cleanRoots) {
+			t.Errorf("derived rootfs_path moved share roots:\n  derived: %v\n  clean:   %v", got, cleanRoots)
+		}
+		if got, want := derived.RootfsPath, filepath.Join(podDir, "rootfs"); got != want {
+			t.Errorf("VMSpec.RootfsPath = %q, want the derived %q", got, want)
 		}
 
-		if got := vmShareRoots(hostile); !reflect.DeepEqual(got, cleanRoots) {
-			t.Errorf("hostile rootfs_path moved share roots:\n  hostile: %v\n  clean:   %v", got, cleanRoots)
+		// Hostile box.rootfs_path (the runtime work root itself): REFUSED before
+		// the backend — the vm path must never carry an uncontained host path into
+		// VMSpec.RootfsPath.
+		hostileBox := vmShareBox("pod-plan-hostile")
+		hostileBox.RootfsPath = rt.cfg.Root
+		_, reason, err := rt.createPod(context.Background(), hostileBox, sandbox.GuestNetworkConfig{})
+		if err == nil {
+			t.Fatal("a hostile rootfs_path must be refused, got nil error")
 		}
-		for _, r := range vmShareRoots(hostile) {
-			if r == rt.cfg.Root {
-				t.Errorf("share root %q equals the hostile box rootfs_path (work root)", r)
-			}
+		if !errors.Is(err, errUncontainedRootfs) {
+			t.Errorf("reject error = %v, want errUncontainedRootfs in the chain", err)
+		}
+		if reason != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			t.Errorf("reason = %v, want INVALID_POD_BOX", reason)
+		}
+		if n2, _ := vmb.created(); n2 != 2 {
+			t.Errorf("CreateVM called %d times, want a still-2 count (the hostile run must NOT reach the backend)", n2)
 		}
 	})
 

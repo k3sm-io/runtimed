@@ -154,11 +154,11 @@ func (f *fakeCredentialResolver) PullCredential(_ context.Context, ns string, se
 // pod dir / materialized filesystem.
 func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
 	const secret = "topsecret-REGISTRY-PASSWORD"
-	dataVol := t.TempDir()
 	w := newBlockingWaiter()
 	pull := &fakePuller{}
 	resolver := &fakeCredentialResolver{cred: &image.RegistryCredential{Username: "robot", Password: secret}}
 	rt := newTestRuntime(t, Deps{Waiter: w, Puller: pull, Credentials: resolver})
+	dataVol := derivedRootfs(t, rt, "pod-pull")
 
 	box := &runtimev1.PodBox{
 		PodId:           "pod-pull",

@@ -35,9 +35,25 @@ func envValue(env []string, key string) (string, bool) {
 	return "", false
 }
 
-func mountingBox(podID string, mountPaths ...string) (*runtimev1.PodBox, *runtimev1.Container) {
+// mustEnvValue fails the test when key is absent, so a comparison against an
+// expected path cannot silently pass on "" == "" if injection stopped happening.
+func mustEnvValue(t *testing.T, env []string, key string) string {
+	t.Helper()
+	v, ok := envValue(env, key)
+	if !ok {
+		t.Fatalf("env %s not set; env = %v", key, env)
+	}
+	return v
+}
+
+// mountingBox builds a mounting host-binary box whose rootfs_path is the
+// runtime's OWN derived pod data volume. It was a hard-coded /var/lib/k3sm/...
+// literal, which B140 now refuses: rootfs_path must be byte-equal to the
+// derivation, and a literal cannot match a test runtime's temp-dir cache root.
+func mountingBox(t *testing.T, rt *Runtime, podID string, mountPaths ...string) (*runtimev1.PodBox, *runtimev1.Container) {
+	t.Helper()
 	box := hostBinBox(podID)
-	box.RootfsPath = "/var/lib/k3sm/pods/" + podID + "/rootfs"
+	box.RootfsPath = derivedRootfs(t, rt, podID)
 	c := box.GetContainers()[0]
 	for _, mp := range mountPaths {
 		c.VolumeMounts = append(c.VolumeMounts, &runtimev1.VolumeMount{Name: "v", MountPath: mp})
@@ -51,12 +67,12 @@ func mountingBox(podID string, mountPaths ...string) (*runtimev1.PodBox, *runtim
 func TestContainerEnvPathShim(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	rt.cfg.PathShimPath = testShim
-	box, _ := mountingBox("pod-1", "/etc/nats", "/scratch")
+	box, _ := mountingBox(t, rt, "pod-1", "/etc/nats", "/scratch")
 	c := box.GetContainers()[0]
 
 	env := mustEnv(t, rt, box, c)
-	if got, _ := envValue(env, pathShimRootfsEnv); got != "/var/lib/k3sm/pods/pod-1/rootfs" {
-		t.Errorf("%s = %q, want the pod rootfs", pathShimRootfsEnv, got)
+	if got, want := mustEnvValue(t, env, pathShimRootfsEnv), derivedRootfs(t, rt, "pod-1"); got != want {
+		t.Errorf("%s = %q, want the derived pod rootfs %q", pathShimRootfsEnv, got, want)
 	}
 	if got, _ := envValue(env, pathShimMountsEnv); got != "/etc/nats:/scratch" {
 		t.Errorf("%s = %q, want /etc/nats:/scratch", pathShimMountsEnv, got)
@@ -73,7 +89,7 @@ func TestContainerEnvPathShim(t *testing.T) {
 func TestContainerEnvPathShimWithDNS(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	rt.cfg.PathShimPath = testShim
-	box, _ := mountingBox("pod-2", "/etc/nats")
+	box, _ := mountingBox(t, rt, "pod-2", "/etc/nats")
 	box.Annotations = map[string]string{dyldInsertAnnotation: "/opt/k3sm/libdnsshim.dylib"}
 	c := box.GetContainers()[0]
 
@@ -90,7 +106,7 @@ func TestContainerEnvPathShimWithDNS(t *testing.T) {
 func TestContainerEnvNoShimWhenNoMounts(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	rt.cfg.PathShimPath = testShim
-	box, _ := mountingBox("pod-3") // no mounts
+	box, _ := mountingBox(t, rt, "pod-3") // no mounts
 	c := box.GetContainers()[0]
 
 	env := mustEnv(t, rt, box, c)
@@ -102,7 +118,7 @@ func TestContainerEnvNoShimWhenNoMounts(t *testing.T) {
 	}
 
 	rt.cfg.PathShimPath = "" // disabled
-	box2, _ := mountingBox("pod-4", "/etc/nats")
+	box2, _ := mountingBox(t, rt, "pod-4", "/etc/nats")
 	if _, ok := envValue(mustEnv(t, rt, box2, box2.GetContainers()[0]), pathShimMountsEnv); ok {
 		t.Error("PathShimPath empty: must not inject the rebase env")
 	}
@@ -113,7 +129,7 @@ func TestContainerEnvNoShimWhenNoMounts(t *testing.T) {
 func TestContainerEnvExplicitDyldWins(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	rt.cfg.PathShimPath = testShim
-	box, c := mountingBox("pod-5", "/etc/nats")
+	box, c := mountingBox(t, rt, "pod-5", "/etc/nats")
 	c.Env = []*runtimev1.EnvVar{{Name: dyldInsertEnv, Value: "/custom.dylib"}}
 
 	dyld, _ := envValue(mustEnv(t, rt, box, c), dyldInsertEnv)

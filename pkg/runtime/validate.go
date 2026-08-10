@@ -30,7 +30,11 @@ var errInvalidPodBox = errors.New("invalid pod box")
 
 // validatePodBox checks the minimum a PodBox needs to be instantiable. It returns
 // a typed FailureReason and an errInvalidPodBox-wrapped error on failure.
-func validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
+//
+// It is a method because the rootfs_path check below is decided against the
+// runtime's own cache-derived pod layout — the seam cannot restate that layout
+// without the guard and the deriver drifting apart.
+func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 	if box == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod is nil", errInvalidPodBox)
@@ -40,6 +44,23 @@ func validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 	// seam check is what makes the rule total: it covers every derivation of the
 	// id, including ones that do not go through the image cache.
 	if _, err := image.ParsePodID(box.GetPodId()); err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	// rootfs_path is the same shape of hazard one level up: the directory the
+	// ROOT daemon MkdirAll's, materializes secrets into and recursively chowns
+	// for fsGroup. Reject it here, at the seam, for the same reason pod_id is
+	// rejected here — the seam check makes the rule total across every ingress,
+	// not just the ones that happen to call rootfsPath.
+	//
+	// It is asked of rootfsPath rather than restated, so there is ONE predicate
+	// (byte-equality with the cache derivation; see rootfsPath for why not
+	// containment). Note that UpdatePod does NOT run validatePodBox — it runs
+	// updatableOnly, whose rootfs_path comparison below is an IMMUTABILITY check,
+	// not a validation. The structural guard inside rootfsPath is what covers
+	// that ingress, which is precisely why the load-bearing check lives there and
+	// this one is defence in depth.
+	if _, err := r.rootfsPath(box); err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
