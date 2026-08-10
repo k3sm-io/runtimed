@@ -109,10 +109,23 @@ func TestCreatePodRejectsTraversingPodID(t *testing.T) {
 			}
 		})
 		t.Run("delete/"+id, func(t *testing.T) {
-			// DeletePod reaches removePodDir's RemoveAll with the raw id, and the
-			// reap store's RemoveAll with no containment guard at all — so it is
-			// exercised independently of CreatePod having succeeded.
+			// WHAT THIS DOES AND DOES NOT COVER: DeletePod returns early
+			// (idempotently) for a pod that is not in the registry, so for a
+			// hostile id it never reaches removePodDir. It runs here to pin that
+			// idempotent return, but it is NOT the coverage for the delete path.
 			_, _ = rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: id})
+
+			// The reap store is the SECOND derivation of pod_id into a path, and
+			// its RemoveAll had no containment guard at all. No RPC reaches it with
+			// an unregistered id, so the derivations are asserted directly —
+			// otherwise a mutation reverting podreap.go alone would leave this
+			// gate green while the commit claims that hole is closed.
+			if _, err := rt.podReapDir(id); err == nil {
+				t.Errorf("podReapDir(%q) returned a path; a hostile id must be refused at the derivation", id)
+			}
+			if _, err := rt.podDir(id); err == nil {
+				t.Errorf("podDir(%q) returned a path; a hostile id must be refused at the derivation", id)
+			}
 		})
 	}
 
