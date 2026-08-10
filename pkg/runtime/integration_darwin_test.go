@@ -91,13 +91,18 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Ask the runtime for the derived pod data volume rather than re-spelling the
+	// layout: B140 accepts rootfs_path only when it is byte-equal to it, and the
+	// SBPL data volume moves with it.
+	intRootfs := derivedRootfs(t, rt, "pod-int")
+
 	box := &runtimev1.PodBox{
 		PodId:      "pod-int",
 		Namespace:  "default",
 		Name:       "int",
-		RootfsPath: filepath.Join(root, "pods", "pod-int", "rootfs"),
+		RootfsPath: intRootfs,
 		SandboxProfile: &runtimev1.SandboxProfile{
-			DataVolumePath: filepath.Join(root, "pods", "pod-int", "rootfs"),
+			DataVolumePath: intRootfs,
 			// Allow reading the pod binary's dir and the OS.
 			ExtraReadPaths: []string{podDir, "/private/tmp", "/private/var/folders", root},
 		},

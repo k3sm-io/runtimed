@@ -327,6 +327,15 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if cfg.Root == "" {
 		cfg.Root = image.DefaultRoot
 	}
+	// Absolute is required, not merely conventional: the fsGroup sink bounds its
+	// recursive chown with a strict-containment check that admits nothing when
+	// either operand is relative (supervisor.ChownForFSGroup). A relative --root
+	// would therefore refuse fsGroup for EVERY pod on the node at create time,
+	// reported as a per-pod rootfs-setup failure. Failing here turns a node-wide
+	// outage with a misleading reason into one clear startup error.
+	if !filepath.IsAbs(cfg.Root) {
+		return nil, fmt.Errorf("runtime root %q must be an absolute path", cfg.Root)
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
