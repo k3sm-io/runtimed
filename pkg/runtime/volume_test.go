@@ -35,9 +35,10 @@ import (
 // (the contrast). It also asserts the PV mount root landed in the pod's SBPL
 // write-scope so the confined pod could write to it.
 //
-// The image cache and the runtime root share ONE dir here (unlike newTestRuntime,
-// which splits them) so the pod rootfs (cache-derived) and the PV storage root
-// (Config.Root/storage) are siblings under one root and removePodDir actually fires.
+// The image cache and the runtime root share ONE dir (as they do in production,
+// and as newTestRuntime now arranges too) so the pod rootfs (cache-derived) and
+// the PV storage root (Config.Root/storage) are siblings under one root and
+// removePodDir actually fires.
 func TestPVCSurvivesPodTeardown(t *testing.T) {
 	w := newBlockingWaiter()
 	root := t.TempDir()

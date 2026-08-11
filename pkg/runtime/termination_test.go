@@ -248,7 +248,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newTestRuntime(t, Deps{})
 			cp := startTermProc(t, "main", tc.payload, tc.waiter, nil)
-			p := &pod{box: hostBinBox("pod-term"), oomKilled: tc.oomKilled, containers: []*containerProc{cp}}
+			p := &pod{box: hostBinBox(rt, "pod-term"), oomKilled: tc.oomKilled, containers: []*containerProc{cp}}
 
 			rt.watchContainerExit(context.Background(), p, cp, nil)
 
@@ -282,7 +282,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 			}
 		}
 		cp := startTermProc(t, "main", payload, cannedWaiter{code: 2}, gate)
-		p := &pod{box: hostBinBox("pod-term-race"), containers: []*containerProc{cp}}
+		p := &pod{box: hostBinBox(rt, "pod-term-race"), containers: []*containerProc{cp}}
 
 		rt.watchContainerExit(context.Background(), p, cp, nil)
 
@@ -313,7 +313,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		t.Cleanup(held.release) // let the pipe finally EOF so the pump goroutine exits
 
 		cp := startTermProcSpawner(t, "main", held, cannedWaiter{code: 2}, nil)
-		p := &pod{box: hostBinBox("pod-held"), containers: []*containerProc{cp}}
+		p := &pod{box: hostBinBox(rt, "pod-held"), containers: []*containerProc{cp}}
 
 		done := make(chan struct{})
 		go func() {
@@ -357,7 +357,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
-		resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-detach")})
+		resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-detach")})
 		if err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}

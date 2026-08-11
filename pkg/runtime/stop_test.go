@@ -108,7 +108,7 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		rec := &recordingSignalGroup{}
 		rt.signalGroup = rec.signal
 
-		mustCreatePod(t, rt, hostBinBox("pod-g0")) // no grace anywhere → 0 → immediate
+		mustCreatePod(t, rt, hostBinBox(rt, "pod-g0")) // no grace anywhere → 0 → immediate
 		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-g0"}); err != nil {
 			t.Fatalf("DeletePod: %v", err)
 		}
@@ -124,7 +124,7 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		rec := &recordingSignalGroup{}
 		rt.signalGroup = rec.signal
 
-		box := hostBinBox("pod-gp")
+		box := hostBinBox(rt, "pod-gp")
 		box.TerminationGracePeriodSeconds = 30 // long grace from the PodBox
 		mustCreatePod(t, rt, box)
 
@@ -149,7 +149,7 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		rt := newTestRuntime(t, Deps{Waiter: w})
 		rec := &recordingSignalGroup{}
 		rt.signalGroup = rec.signal
-		box := hostBinBox("pod-gr")
+		box := hostBinBox(rt, "pod-gr")
 		box.TerminationGracePeriodSeconds = 30
 		mustCreatePod(t, rt, box)
 		w.release(1001)

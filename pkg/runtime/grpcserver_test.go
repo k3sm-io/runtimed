@@ -119,7 +119,7 @@ func TestServerServesRuntimeSurfaceOverUnixSocket(t *testing.T) {
 		t.Errorf("runtime name = %q, want %q", info.GetRuntimeName(), RuntimeName)
 	}
 
-	cresp, err := client.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-grpc")})
+	cresp, err := client.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-grpc")})
 	if err != nil {
 		t.Fatalf("CreatePod over socket: %v", err)
 	}

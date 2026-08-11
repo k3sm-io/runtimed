@@ -61,13 +61,19 @@ func TestGeneratedProfileAppliesOnDarwin(t *testing.T) {
 // path a macOS firmlink resolves to (/var,/tmp,/etc → /private/…). Before the
 // firmlink fix the profile allowed only the raw /var form, so libsandbox (which
 // matches the RESOLVED path) denied the rebased read with EPERM — every volume
-// mount criterion failed. dataVol is under /tmp so the test needs no root.
+// mount criterion failed. The work-dir is under /tmp so the test needs no root.
+//
+// The data volume is sited at <WorkDir>/pods/<id>/rootfs — the production layout
+// — because Generate now bounds it there (ErrDataVolumeUnbounded). Keeping this
+// test on an arbitrary /tmp dir would mean loosening the bound; this test and the
+// integration one are the ONLY two that exercise real libsandbox, so re-siting
+// them is strictly cheaper than letting them rot.
 func TestGeneratedProfileAllowsRebasedFileRead(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
 	}
 	base := filepath.Join("/tmp", "k3sm-fr-"+strconv.Itoa(os.Getpid()))
-	dataVol := filepath.Join(base, "rootfs")
+	dataVol := filepath.Join(base, "pods", "pod-fr", "rootfs")
 	// runtimed writes the materialized volume at dataVol; the OS lands it under the
 	// /private-resolved path, which is what libsandbox matches.
 	realDir := "/private" + filepath.Join(dataVol, "etc", "nats")
@@ -79,7 +85,9 @@ func TestGeneratedProfileAllowsRebasedFileRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{})
+	prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+		Posture: Posture{WorkDir: base},
+	})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}

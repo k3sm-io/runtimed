@@ -90,11 +90,19 @@ func main() {
 }
 
 func run() error {
-	work, err := os.MkdirTemp("", "netd-unix-deny-*")
+	// The temp dir stands in for the runtimed work-dir, and the pod data volume
+	// sits at its production place underneath (<WorkDir>/pods/<id>/rootfs):
+	// sandbox.Generate bounds the data volume to the posture's pods root, so a
+	// bare temp dir is refused (sandbox.ErrDataVolumeUnbounded).
+	workDir, err := os.MkdirTemp("", "netd-unix-deny-*")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(work)
+	defer os.RemoveAll(workDir)
+	work := filepath.Join(workDir, "pods", "pod-proto", "rootfs")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		return err
+	}
 
 	// The "helper" socket: a live AF_UNIX listener the pod must not reach.
 	sockPath := filepath.Join(work, "netd.sock")
@@ -128,7 +136,7 @@ func run() error {
 	profile, err := sandbox.Generate(&runtimev1.SandboxProfile{
 		DataVolumePath:        work,
 		DeniedUnixSocketPaths: []string{sockPath},
-	}, sandbox.GenerateOptions{})
+	}, sandbox.GenerateOptions{Posture: sandbox.Posture{WorkDir: workDir}})
 	if err != nil {
 		return fmt.Errorf("generate sbpl: %w", err)
 	}

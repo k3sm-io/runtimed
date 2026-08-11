@@ -37,7 +37,7 @@ func TestRestartContainerReExecs(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
 
-	mustCreatePod(t, rt, hostBinBox("pod-r"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-r"))
 
 	sp.mu.Lock()
 	spawnsBefore := len(sp.specs)

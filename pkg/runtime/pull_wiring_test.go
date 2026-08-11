@@ -69,7 +69,7 @@ func TestDefaultPullerPlatformWiring(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			p := &pod{box: hostBinBox("pod-wiring"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+			p := &pod{box: hostBinBox(rt, "pod-wiring"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 			c := &runtimev1.Container{Name: "app", Image: ref, Command: []string{"/app"}}
 			bin, _, _, rerr := rt.resolveBinary(context.Background(), p, t.TempDir(), c)
 			if !tc.wantErr {

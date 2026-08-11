@@ -47,7 +47,7 @@ func TestCreatePodOOMKilled(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
 
-	box := hostBinBox("pod-oom")
+	box := hostBinBox(rt, "pod-oom")
 	box.Annotations = map[string]string{memoryLimitAnnotation: "1048576"} // 1 MiB limit
 	mustCreatePod(t, rt, box)
 
@@ -71,7 +71,7 @@ func TestCreatePodNoLimitNoOOM(t *testing.T) {
 	rec := &recordingSignalGroup{}
 	rt.signalGroup = rec.signal
 
-	mustCreatePod(t, rt, hostBinBox("pod-nolimit")) // no memory-limit annotation
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-nolimit")) // no memory-limit annotation
 
 	// Give a would-be sampler time to (not) fire.
 	time.Sleep(50 * time.Millisecond)
@@ -94,7 +94,7 @@ func TestPodMetricsSurfacesFootprint(t *testing.T) {
 	rt.cfg.SampleInterval = 5 * time.Millisecond
 	rt.signalGroup = (&recordingSignalGroup{}).signal // no real signals
 
-	box := hostBinBox("pod-top")
+	box := hostBinBox(rt, "pod-top")
 	box.Annotations = map[string]string{memoryLimitAnnotation: "104857600"} // 100 MiB, no breach
 	mustCreatePod(t, rt, box)
 
@@ -129,6 +129,7 @@ func TestPodMetricsSurfacesFootprint(t *testing.T) {
 // the typed field WINS when both are set — the consumer half of the annotation→typed
 // swap, with no transition window in either land order.
 func TestMemoryLimitFromTypedField(t *testing.T) {
+	rt := newTestRuntime(t, Deps{})
 	const annotated = "1048576" // 1 MiB, as a string annotation
 	cases := []struct {
 		name  string
@@ -144,7 +145,7 @@ func TestMemoryLimitFromTypedField(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			box := hostBinBox("pod-lim")
+			box := hostBinBox(rt, "pod-lim")
 			box.MemoryLimitBytes = tc.typed
 			if tc.annot != "" {
 				box.Annotations = map[string]string{memoryLimitAnnotation: tc.annot}
@@ -168,7 +169,7 @@ func TestCreatePodOOMKilledTypedLimit(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
 
-	box := hostBinBox("pod-oom-typed")
+	box := hostBinBox(rt, "pod-oom-typed")
 	box.MemoryLimitBytes = 1 << 20 // typed field only, no annotation
 	mustCreatePod(t, rt, box)
 
