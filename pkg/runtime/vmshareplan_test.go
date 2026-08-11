@@ -89,9 +89,12 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 // Config.Root — the production New() wiring (runtime.go builds the cache from
 // cfg.Root when none is injected). Every test that drives a vm pod to the
 // backend needs this alignment: the share planner bounds the pod dir to
-// <Config.Root>/pods (mount.ComputeSharePlan via guardShareRoots), so
-// testDeps's default split-root cache (a separate t.TempDir()) would reject
-// every vm pod before CreateVM.
+// <Config.Root>/pods (mount.ComputeSharePlan via guardShareRoots), so a cache
+// rooted anywhere else rejects every vm pod before CreateVM.
+//
+// Since B142 testDeps no longer splits the two, so this states the requirement
+// locally rather than repairing a harness default — a test that names the
+// alignment it depends on does not silently lose it to a future harness change.
 func vmPodConfig(t *testing.T, d Deps) (Config, Deps) {
 	t.Helper()
 	root := t.TempDir()

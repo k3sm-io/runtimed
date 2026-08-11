@@ -60,10 +60,12 @@ func tree(t *testing.T, root string) []string {
 // Two harness details are load-bearing, both learned from the guard this fix
 // replaces:
 //
-//   - ONE shared root. The default test harness gives Config.Root and the image
-//     cache two DIFFERENT temp dirs, which makes removePodDir's containment check
-//     unsatisfiable and its RemoveAll leg unreachable — the destructive path
-//     would never execute and the test would pass against unfixed code.
+//   - ONE shared root. Config.Root and the image cache must name the same dir, or
+//     removePodDir's containment check is unsatisfiable and its RemoveAll leg
+//     unreachable — the destructive path would never execute and the test would
+//     pass against unfixed code. This harness builds the pair explicitly because
+//     it also nests them (below); the default one (testDeps) stopped splitting
+//     them under B142, which is the production wiring.
 //   - The root is nested inside an observable parent, so an escape ABOVE it is
 //     detectable. A test that only watched the root itself could not see the very
 //     traversal it exists to catch.
@@ -102,7 +104,7 @@ func TestCreatePodRejectsTraversingPodID(t *testing.T) {
 			// this request is the pod id itself. A box that failed validation for
 			// an unrelated reason would make this test pass without ever reaching
 			// the filesystem — the vacuity this whole gate exists to avoid.
-			box := hostBinBox(id)
+			box := hostBinBox(rt, id)
 			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 			if err == nil && resp.GetError() == nil {
 				t.Fatalf("CreatePod(pod_id=%q) succeeded; a traversing id must be refused", id)

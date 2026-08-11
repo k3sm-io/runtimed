@@ -33,6 +33,8 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
+	"google.golang.org/protobuf/proto"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -283,6 +285,29 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 			}
 		}
 	}
+
+	// The data volume the profile is about to re-allow read+write must be one this
+	// runtime derived for THIS pod (B142). Asked here, immediately before the only
+	// call that consumes it: sandbox.Generate emits it after the protected denies,
+	// where last-match-wins makes an unchecked value beat every one of them, and
+	// uses it as the carve-out base for every other caller-supplied path. The seam
+	// (validatePodBox) asks the same question earlier for the CreatePod ingress; a
+	// caller that reached this spine another way is refused here.
+	if _, err := r.dataVolumePath(box); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	// Having ACCEPTED either derived spelling, EMIT the narrower one. The accept
+	// set is a compatibility surface (the producer sends the pod dir); the emitted
+	// value is a privilege surface, and nothing a Seatbelt pod needs lives above
+	// <podDir>/rootfs — materialization, the PV binds, the resolved binary and the
+	// fsGroup walk are all rootfs-scoped, the staged profile lives at the runtime
+	// root, and the vm-only share roots never reach this generator. Narrowing here
+	// closes the "a future artifact under <podDir> becomes pod-writable silently"
+	// residual outright, in this repo, with no cross-repo change and no skew
+	// window. sp is the caller's message, so copy before mutating it.
+	sp = proto.Clone(sp).(*runtimev1.SandboxProfile)
+	sp.DataVolumePath = rootfs
 
 	// Generate the SBPL AFTER materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
@@ -1318,6 +1343,72 @@ func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
 		return "", fmt.Errorf("%w: %q is not %q", errUncontainedRootfs, rootfs, derived)
 	}
 	return derived, nil
+}
+
+// errUnderivedDataVolume is the sentinel for a box whose
+// sandbox_profile.data_volume_path is not one of this pod's own derived data
+// volumes. Like errUncontainedRootfs it surfaces as FAILURE_REASON_INVALID_POD_BOX
+// and is never retried: the value cannot become acceptable without the caller
+// changing it.
+var errUnderivedDataVolume = errors.New("data_volume_path is not the pod's derived data volume")
+
+// dataVolumePath returns the SandboxProfile.data_volume_path box is entitled to.
+// It accepts EXACTLY the two runtime-derived spellings for the box's own pod id —
+// <Root>/pods/<pod_id> (the pod dir) and <Root>/pods/<pod_id>/rootfs (the rootfs
+// under it) — and refuses everything else with errUnderivedDataVolume and no
+// path, so no caller can act on a value that was never checked.
+//
+// WHAT THE VALUE REACHES. data_volume_path is a producer-set field on the
+// cross-repo SandboxProfile that flows into sandbox.Generate, which emits it as
+// (allow file-read* file-write* (subpath dataVol)) in the NARROW RE-ALLOW tier —
+// AFTER the protected denies. SBPL is last-match-wins, so a hostile value
+// overrides the whole deny-set (user homes, the pods root, the podreap store,
+// and the control-plane/daemon trees B141 added) in a single emitted line. It is
+// ALSO the carve-out base in validateExtraPaths (`if isUnder(p, cleanData) {
+// continue }`), so one hostile value additionally disarms the protected-prefix
+// validator for every other path in the same box.
+//
+// WHY AN EQUALITY CHECK HERE AND CONTAINMENT AT THE SINK. sandbox.Generate
+// receives no pod id, so it cannot ask this question at all — the strongest thing
+// it can do is bound the value to the pods root (sandbox.ErrDataVolumeUnbounded),
+// which by construction ACCEPTS <PodsRoot>/<VICTIM-ID>/rootfs. pkg/runtime is
+// where the authoritative value is derived, so this is where cross-pod is
+// refused. The two layers therefore fail on DIFFERENT input classes — the
+// property a second layer must have to be a layer (the B140 lesson): this one
+// catches cross-pod and every absolute path off the pods tree, the sink catches
+// the ancestor/whole-tree class ("/", "/var/lib", the work-dir itself) for any
+// future caller of the exported Generate.
+//
+// WHY BOTH SPELLINGS ARE ACCEPTED — and this is not laziness:
+//
+//   - PodDir is what the ONLY producer sends. The k3sm provider stamps
+//     data_volume_path from its podRoot(id) == <root>/pods/<id> (pkg/provider,
+//     translate.go), and k3sm's go.mod carries `replace k3sm.io/runtimed =>
+//     ../runtimed`, so there is no version-skew window: accepting only the rootfs
+//     spelling would refuse EVERY POD ON EVERY NODE on the next build, reported
+//     per-pod as an invalid box — a node-wide outage wearing a per-pod costume.
+//   - PodRootfs is one level DEEPER, i.e. STRICTLY LESS privilege, and is what
+//     the tests and in-repo prototypes pass. Accepting a strictly narrower value
+//     is safe by construction.
+//
+// RESIDUAL, recorded rather than hidden: PodDir grants one directory level more
+// than any Seatbelt pod needs. Everything a pod runs against is materialized
+// under <podDir>/rootfs; the k3sm.proj / k3sm.vols siblings are vm-only and the
+// vm path never calls sandbox.Generate, and the staged .sb profile lives under
+// <Root>, not the pod dir. So a FUTURE artifact placed under <podDir> outside
+// rootfs/ becomes pod-writable silently. Narrowing to PodRootfs alone is a
+// producer-side change in k3sm (send the deeper spelling), not a change here.
+func (r *Runtime) dataVolumePath(box *runtimev1.PodBox) (string, error) {
+	id, err := image.ParsePodID(box.GetPodId())
+	if err != nil {
+		return "", err
+	}
+	podDir, rootfs := r.cache.PodDir(id), r.cache.PodRootfs(id)
+	dataVol := box.GetSandboxProfile().GetDataVolumePath()
+	if dataVol != podDir && dataVol != rootfs {
+		return "", fmt.Errorf("%w: %q is neither %q nor %q", errUnderivedDataVolume, dataVol, podDir, rootfs)
+	}
+	return dataVol, nil
 }
 
 // podDir returns the per-pod directory under the cache root. It returns an error

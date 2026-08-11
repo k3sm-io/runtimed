@@ -37,13 +37,13 @@ func TestListPodStatsMapsFootprint(t *testing.T) {
 
 	// Two metered pods (one via the typed field, one via the legacy annotation, to
 	// prove both feed the sampler gate) + one unmetered pod (no limit → no sampler).
-	typed := hostBinBox("pod-a")
+	typed := hostBinBox(rt, "pod-a")
 	typed.MemoryLimitBytes = 100 << 20 // no breach
-	annotated := hostBinBox("pod-b")
+	annotated := hostBinBox(rt, "pod-b")
 	annotated.Annotations = map[string]string{memoryLimitAnnotation: "104857600"}
 	mustCreatePod(t, rt, typed)
 	mustCreatePod(t, rt, annotated)
-	mustCreatePod(t, rt, hostBinBox("pod-unmetered"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-unmetered"))
 
 	// empty pod_id returns all METERED pods, each with the per-container working set;
 	// the unmetered pod is omitted. (Container working set is sampled at request time

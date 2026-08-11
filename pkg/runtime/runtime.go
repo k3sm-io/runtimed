@@ -336,6 +336,18 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if !filepath.IsAbs(cfg.Root) {
 		return nil, fmt.Errorf("runtime root %q must be an absolute path", cfg.Root)
 	}
+	// CLEAN is required for the same class of reason, and the failure it prevents
+	// already exists: the root is passed through as sandbox.Posture.WorkDir, which
+	// resolvePosture rejects unless filepath.Clean(workDir) == workDir — so an
+	// unclean root ("/var/lib/k3sm/", "/var/lib//k3sm") fails SBPL generation for
+	// every pod on the node, reported per-pod as a sandbox-setup fault. It also
+	// splits the pod-path derivations: the provider spells the data volume by
+	// concatenation while the cache spells it with filepath.Join, and the two agree
+	// only when the root is already clean (B142's byte-equality). One startup error
+	// beats a node-wide outage reported one pod at a time.
+	if filepath.Clean(cfg.Root) != cfg.Root {
+		return nil, fmt.Errorf("runtime root %q must be a clean path (no trailing or doubled separator, no \"..\")", cfg.Root)
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)

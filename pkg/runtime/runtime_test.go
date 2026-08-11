@@ -364,15 +364,19 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 // (pull_wiring_test.go, and rosetta_test.go's default_probe_wiring) call
 // New(…, testDeps(t, Deps{})) directly and leave them nil so New builds the daemon's
 // own image.NewPuller(cache, image.RemoteFetch) / sandbox.Probe*Rosetta.
+//
+// It also does NOT default Cache — New builds one rooted at Config.Root, which is
+// the PRODUCTION wiring (runtime.go; the daemon and the k3sm provider both pass
+// Deps without a Cache). The old default handed the runtime a cache at a SECOND
+// t.TempDir(), so Config.Root and the pod layout disagreed and every guard bounded
+// to <Config.Root>/pods was unsatisfiable in the unit tier: B136 and B140 each had
+// to hand-build a shared-root harness to reach their sink at all, vmshareplan_test
+// states the alignment locally for the share planner, and B142's data-volume bound
+// (Posture.WorkDir is Config.Root, the data volume is cache-derived) would have
+// refused every pod.
+// A test that wants the two split still injects its own Cache.
 func testDeps(t *testing.T, d Deps) Deps {
 	t.Helper()
-	cache, err := image.NewCache(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d.Cache == nil {
-		d.Cache = cache
-	}
 	if d.Backend == nil {
 		d.Backend = fakeBackend{available: true}
 	}
@@ -429,14 +433,29 @@ func derivedRootfs(t *testing.T, rt *Runtime, podID string) string {
 	return rt.cache.PodRootfs(id)
 }
 
-// hostBinBox builds a minimal valid PodBox running a host-binary container.
-func hostBinBox(podID string) *runtimev1.PodBox {
+// hostBinBox builds a minimal valid PodBox running a host-binary container,
+// against rt's own derived pod layout.
+//
+// It takes the runtime because since B142 sandbox_profile.data_volume_path is
+// accepted only when it is byte-equal to <Config.Root>/pods/<pod_id>{,/rootfs},
+// and the runtime under test is rooted at a t.TempDir() — the hard-coded
+// /var/lib/k3sm spelling this used to carry named a tree no test ever touched.
+// Deriving it in this ONE helper is what keeps ~60 call sites out of the layout.
+//
+// An id ParsePodID rejects gets the naive spelling: the hostile-id tests pass one
+// deliberately, and their subject is the id check (which runs first), so the box
+// must stay valid in every OTHER respect for those tests to be about anything.
+func hostBinBox(rt *Runtime, podID string) *runtimev1.PodBox {
+	dataVol := filepath.Join(rt.cache.PodsRoot(), podID, "rootfs")
+	if id, err := image.ParsePodID(podID); err == nil {
+		dataVol = rt.cache.PodRootfs(id)
+	}
 	return &runtimev1.PodBox{
 		PodId:     podID,
 		Namespace: "default",
 		Name:      "p",
 		SandboxProfile: &runtimev1.SandboxProfile{
-			DataVolumePath: "/var/lib/k3sm/pods/" + podID + "/rootfs",
+			DataVolumePath: dataVol,
 		},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Containers: []*runtimev1.Container{
@@ -461,7 +480,7 @@ func TestCreatePodLifecycle(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w})
 
-	box := hostBinBox("pod-1")
+	box := hostBinBox(rt, "pod-1")
 	box.Annotations = map[string]string{dyldInsertAnnotation: "/opt/k3sm/libdnsshim.dylib"}
 
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
@@ -518,7 +537,7 @@ func TestCreatePodLifecycle(t *testing.T) {
 // requirement.
 func TestCreatePodFailClosed(t *testing.T) {
 	rt := newTestRuntime(t, Deps{Backend: fakeBackend{available: false}})
-	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-x")})
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-x")})
 	if err != nil {
 		t.Fatalf("CreatePod transport error: %v", err)
 	}
@@ -550,7 +569,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		cfg, d := vmPodConfig(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb})
 		rt := newTestRuntimeCfg(t, cfg, d)
 
-		box := hostBinBox("pod-vm")
+		box := hostBinBox(rt, "pod-vm")
 		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 		box.SandboxProfile.VmVcpus = 2
 		box.SandboxProfile.VmMemoryBytes = 1 << 30
@@ -598,7 +617,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		vmb := &fakeVMBackend{available: false} // no Virtualization.framework / entitlement
 		rt := newTestRuntime(t, Deps{VMBackend: vmb})
 
-		box := hostBinBox("pod-vm-noavail")
+		box := hostBinBox(rt, "pod-vm-noavail")
 		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 
 		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
@@ -626,7 +645,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		rt := newTestRuntime(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb, Waiter: w})
 
 		// UNSPECIFIED backend (the host-process default) — the byte-unchanged path.
-		box := hostBinBox("pod-host")
+		box := hostBinBox(rt, "pod-host")
 
 		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 		if err != nil {
@@ -697,7 +716,7 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Network: net})
 		rt := newTestRuntimeCfg(t, cfg, d)
 
-		box := hostBinBox("pod-vm-net")
+		box := hostBinBox(rt, "pod-vm-net")
 		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 
 		// Put the config at the create input. The lab-gated boot stub then surfaces an
@@ -738,7 +757,7 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		rt := newTestRuntime(t, Deps{VMBackend: vmb, Network: net, Waiter: w})
 
 		// UNSPECIFIED backend → the host-process route. Feed the SAME populated config.
-		box := hostBinBox("pod-host-net")
+		box := hostBinBox(rt, "pod-host-net")
 
 		p, _, err := rt.createPod(context.Background(), box, netCfg)
 		if err != nil {
@@ -777,7 +796,7 @@ func TestCreatePodValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			box := hostBinBox("pod-v")
+			box := hostBinBox(rt, "pod-v")
 			tc.mutate(box)
 			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 			if err != nil {
@@ -798,7 +817,7 @@ func TestCreatePodValidation(t *testing.T) {
 func TestCreatePodSignatureRejected(t *testing.T) {
 	signer := &fakeSigner{checkErr: image.ErrSignatureRejected}
 	rt := newTestRuntime(t, Deps{Signer: signer})
-	box := hostBinBox("pod-sig")
+	box := hostBinBox(rt, "pod-sig")
 	box.SignaturePolicy = runtimev1.SignaturePolicy_SIGNATURE_POLICY_REQUIRE_SIGNED
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
@@ -818,7 +837,7 @@ func TestInitContainerSequencing(t *testing.T) {
 	w := &seqWaiter{block: newBlockingWaiter()}
 	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w})
 
-	box := hostBinBox("pod-init")
+	box := hostBinBox(rt, "pod-init")
 	box.InitContainers = []*runtimev1.Container{{Name: "init", Image: "/bin/true"}}
 
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
@@ -860,7 +879,7 @@ func (w *seqWaiter) WaitExit(ctx context.Context, pid int) (int, int, error) {
 func TestWatchPodStatus(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
-	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-w")}); err != nil {
+	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-w")}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -897,7 +916,7 @@ func TestWatchPodStatus(t *testing.T) {
 func TestGetLogs(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
-	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-l")}); err != nil {
+	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-l")}); err != nil {
 		t.Fatal(err)
 	}
 	// Inject a log line directly into the container buffer.
@@ -921,13 +940,13 @@ func TestGetLogs(t *testing.T) {
 func TestUpdatePod(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
-	box := hostBinBox("pod-u")
+	box := hostBinBox(rt, "pod-u")
 	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box}); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Run("annotation-ok", func(t *testing.T) {
-		nb := hostBinBox("pod-u")
+		nb := hostBinBox(rt, "pod-u")
 		nb.Annotations = map[string]string{"k3sm.io/foo": "bar"}
 		resp, err := rt.UpdatePod(context.Background(), &runtimev1.UpdatePodRequest{Pod: nb})
 		if err != nil {
@@ -939,7 +958,7 @@ func TestUpdatePod(t *testing.T) {
 	})
 
 	t.Run("spec-change-not-updatable", func(t *testing.T) {
-		nb := hostBinBox("pod-u")
+		nb := hostBinBox(rt, "pod-u")
 		nb.Uid = 501
 		resp, err := rt.UpdatePod(context.Background(), &runtimev1.UpdatePodRequest{Pod: nb})
 		if err != nil {
@@ -1133,7 +1152,7 @@ func TestCreatePodThreadsRlimitQoSLaunchSpec(t *testing.T) {
 	be := &recordingBackend{available: true}
 	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w, Backend: be})
 
-	box := hostBinBox("pod-rlimit-qos")
+	box := hostBinBox(rt, "pod-rlimit-qos")
 	box.Rlimits = []*runtimev1.ResourceLimit{
 		{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 4096},
 		{Type: "RLIMIT_NPROC", Soft: 64, Hard: 128},
@@ -1218,7 +1237,7 @@ func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {
 			w := newBlockingWaiter()
 			rt := newTestRuntimeCfg(t, tc.cfg, Deps{Waiter: w})
 
-			box := hostBinBox("pod-vip")
+			box := hostBinBox(rt, "pod-vip")
 			box.SandboxProfile.AllowNetwork = true // egress rules are gated on allow_network
 
 			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})

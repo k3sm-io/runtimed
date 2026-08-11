@@ -51,11 +51,12 @@ const PodReapSubdir = "podreap"
 // (deny ...) for it. A second, drifted literal would leave the deny guarding a
 // non-existent sibling while the real tree stayed writable.
 //
-// HONEST SCOPE — these denies close the CALLER-SUPPLIED extra/PV-path tier
-// only. They do NOT close the class: a hostile data_volume_path still defeats
-// them two independent ways, because validateExtraPaths carves out every path
-// under the data volume, and Generate re-allows the data volume AFTER these
-// denies (SBPL is last-match-wins). Closing that tier is separate work.
+// SCOPE — these denies close the CALLER-SUPPLIED extra/PV-path tier. The
+// data-volume tier that used to defeat them (validateExtraPaths carves out every
+// path under the data volume, and Generate re-allows the data volume AFTER these
+// denies, so SBPL's last-match-wins beat them) is closed separately, by the
+// ErrDataVolumeUnbounded bound Generate applies to dataVol BEFORE either of those
+// two consumers runs.
 const (
 	// ServerSubdir is the control-plane state dir (<WorkDir>/server): the cluster
 	// CA private keys, the generated kubeconfigs, and the kine SQLite datastore.
@@ -119,8 +120,12 @@ var ErrMissingDenyDefault = errors.New("sbpl: profile missing (deny default)")
 // init, so a profile lacking it is rejected.
 var ErrMissingSystemImport = errors.New(`sbpl: profile missing (import "system.sb")`)
 
-// ErrNoDataVolume reports a SandboxProfile with no data_volume_path: there is
-// nowhere the pod may write, so the profile cannot be generated.
+// ErrNoDataVolume reports a SandboxProfile with no data_volume_path (empty, or a
+// path that cleans to "."): there is nowhere the pod may write, so the profile
+// cannot be generated. A data_volume_path that is PRESENT but too wide — "/"
+// included — is ErrDataVolumeUnbounded instead: "the caller sent nothing" and
+// "the caller sent the whole filesystem" are different operator signals, and only
+// the second is an attempted grant.
 var ErrNoDataVolume = errors.New("sbpl: sandbox profile has no data_volume_path")
 
 // ErrProtectedPath reports a caller-supplied extra read/write path that resolves
@@ -130,6 +135,25 @@ var ErrNoDataVolume = errors.New("sbpl: sandbox profile has no data_volume_path"
 // /Users, the secrets store, a sibling pod's dir, a control-plane/daemon tree,
 // or the dyld cryptex.
 var ErrProtectedPath = errors.New("sbpl: extra path is under a protected deny-set")
+
+// ErrDataVolumeUnbounded reports a SandboxProfile.data_volume_path that is not a
+// PROPER DESCENDANT of the posture's pods root (<Posture.WorkDir>/pods). The data
+// volume is the one tree Generate re-allows read+write AFTER the protected denies
+// (SBPL is last-match-wins) and the one carve-out validateExtraPaths grants every
+// other caller-supplied path, so an unbounded value overrides the whole deny-set
+// in a single emitted line and disarms the extra-path validator with it.
+//
+// It is a DISTINCT sentinel from ErrProtectedPath, not a reuse, for two reasons:
+//
+//   - The inputs are different classes. ErrProtectedPath is documented for a
+//     caller-supplied EXTRA path that lands INSIDE the deny-set; the values this
+//     rejects are mostly ANCESTORS of every protected prefix (`/`, `/var/lib`, the
+//     work-dir itself, the pods root itself), which are under none of them. A
+//     deny-set membership test would wave all of those through.
+//   - ErrProtectedPath is already returned for eight distinct conditions, so a
+//     test asserting it could pass because an unrelated fixture path tripped the
+//     same sentinel, proving nothing about this bound.
+var ErrDataVolumeUnbounded = errors.New("sbpl: data volume is not under the pods root")
 
 // ErrInvalidWorkDir reports a Posture.WorkDir that is not a usable runtime
 // work-dir: it must be an absolute, clean path other than the filesystem root.
@@ -259,24 +283,49 @@ type GenerateOptions struct {
 // sub-scope, whose file-write* deny therefore wins even inside the writable data
 // volume.
 //
-// Generate returns ErrNoDataVolume if sp has no data volume, ErrProtectedPath if
-// any extra/credential path is under the protected deny-set, and the work-dir
-// errors above for a bad Posture; otherwise the rendered profile is always
-// well-formed and passes Validate.
+// The DATA VOLUME ITSELF IS BOUNDED (see ErrDataVolumeUnbounded): it must be a
+// PROPER DESCENDANT of <Posture.WorkDir>/pods. That bound is POSITIVE
+// CONTAINMENT rather than a protected-prefix membership test because the most
+// damaging values are ANCESTORS of every protected prefix and are under none of
+// them — `/`, `/var/lib`, or the work-dir itself would pass a deny-list check and
+// then clobber pods/podreap/server/agent/run/blobs with the one re-allow below.
+// One containment predicate forecloses all of them plus the pods root itself.
+// The bound is applied BEFORE validateExtraPaths, whose data-volume carve-out
+// inherits its entire safety from it: a check placed after would leave a window
+// in which the extra-path validator is already disarmed.
+//
+// It is the VALUE that is constrained, never the emission order: the data-volume
+// re-allow MUST stay after the protected denies, because the pod's own volume
+// lives under the denied pods root and would otherwise be unwritable.
+//
+// Generate returns ErrNoDataVolume if sp has no data volume,
+// ErrDataVolumeUnbounded if that volume is not under the posture's pods root,
+// ErrProtectedPath if any extra/credential path is under the protected deny-set,
+// and the work-dir errors above for a bad Posture; otherwise the rendered profile
+// is always well-formed and passes Validate.
 func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
 	if sp == nil {
 		return "", ErrNoDataVolume
 	}
 	dataVol := filepath.Clean(sp.GetDataVolumePath())
-	if dataVol == "" || dataVol == "." || dataVol == "/" {
+	if dataVol == "" || dataVol == "." {
 		return "", ErrNoDataVolume
 	}
 
 	// Derive the node-level deny-set from the configured work-dir, rejecting a
 	// malformed or home-escaping work-dir BEFORE emitting anything (fail closed).
-	workDirDenyRoots, protectedPrefixes, err := resolvePosture(opts.Posture)
+	podsRoot, workDirDenyRoots, protectedPrefixes, err := resolvePosture(opts.Posture)
 	if err != nil {
 		return "", err
+	}
+
+	// BOUND the data volume before anything consumes it — the re-allow below wins
+	// over every protected deny (last-match-wins) and validateExtraPaths carves
+	// every other path out against it, so an unbounded value defeats both at once.
+	// STRICT containment: the pods root ITSELF is refused, since re-allowing it
+	// would hand the pod every sibling pod's materialized secrets.
+	if !strictlyUnder(dataVol, podsRoot) {
+		return "", fmt.Errorf("%w: %q is not a proper descendant of %q", ErrDataVolumeUnbounded, sp.GetDataVolumePath(), podsRoot)
 	}
 
 	// Validate every caller-supplied path BEFORE emitting any allow: a path under
@@ -443,38 +492,42 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	return b.String(), nil
 }
 
-// resolvePosture validates p.WorkDir and returns the work-dir-derived denied
-// roots (the pods-root, the daemon-private podreap store, and the
+// resolvePosture validates p.WorkDir and returns the pods root (<WorkDir>/pods —
+// the bound Generate holds the data volume to), the work-dir-derived denied
+// roots (that pods-root, the daemon-private podreap store, and the
 // control-plane/daemon trees <WorkDir>/{server,agent,run,blobs} — all read+write
 // denied with firmlink forms by Generate) and the ordered protected-prefix
-// deny-set (those roots plus the fixed system subtrees). An empty WorkDir
+// deny-set (those roots plus the fixed system subtrees). The pods root is
+// returned EXPLICITLY rather than read back out of the deny-root slice by index,
+// so the data-volume bound and the deny it is carved out of cannot drift. An
+// empty WorkDir
 // falls back to DefaultWorkDir; a non-empty WorkDir must be absolute and clean
 // (ErrInvalidWorkDir) and — when p.Home is set — must reside under Home
 // (ErrWorkDirEscapesHome). The Posture VIP fields are NOT consumed here: since
 // M10.1 they render no SBPL (see the AllowNetwork stanza in Generate) and exist
 // only for the DNS env/status plumbing.
-func resolvePosture(p Posture) (workDirDenyRoots []string, protectedPrefixes []string, err error) {
+func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, protectedPrefixes []string, err error) {
 	workDir := p.WorkDir
 	if workDir == "" {
 		workDir = DefaultWorkDir
 	} else {
 		if !filepath.IsAbs(workDir) {
-			return nil, nil, fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
+			return "", nil, nil, fmt.Errorf("%w: %q is not absolute", ErrInvalidWorkDir, workDir)
 		}
 		if workDir == "/" {
-			return nil, nil, fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
+			return "", nil, nil, fmt.Errorf("%w: %q is the filesystem root", ErrInvalidWorkDir, workDir)
 		}
 		if filepath.Clean(workDir) != workDir {
-			return nil, nil, fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
+			return "", nil, nil, fmt.Errorf("%w: %q is not a clean path", ErrInvalidWorkDir, workDir)
 		}
 	}
 	if p.Home != "" {
 		home := filepath.Clean(p.Home)
 		if !isUnder(workDir, home) {
-			return nil, nil, fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
+			return "", nil, nil, fmt.Errorf("%w: %q is not under %q", ErrWorkDirEscapesHome, workDir, home)
 		}
 	}
-	podsRoot := filepath.Join(workDir, "pods")
+	podsRoot = filepath.Join(workDir, "pods")
 	// The daemon-private startup-reap store: records here drive a root-privileged
 	// kill(-pgid), so a confined pod must never be able to write (or read) them.
 	// Single-sourced with pkg/runtime via PodReapSubdir.
@@ -518,7 +571,7 @@ func resolvePosture(p Posture) (workDirDenyRoots []string, protectedPrefixes []s
 	// path can never reach a sibling pod, the reap store, or a control-plane
 	// tree, then keep the fixed system subtrees.
 	protectedPrefixes = append(append([]string{}, workDirDenyRoots...), systemProtectedPrefixes...)
-	return workDirDenyRoots, protectedPrefixes, nil
+	return podsRoot, workDirDenyRoots, protectedPrefixes, nil
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected
@@ -556,6 +609,42 @@ func validateExtraPaths(dataVol string, protectedPrefixes []string, groups ...[]
 // assumed already filepath.Clean'd.
 func isUnder(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+// strictlyUnder reports whether path is a PROPER DESCENDANT of prefix — the same
+// test as isUnder MINUS the equality case. A relative path never satisfies it
+// against an absolute prefix, which is what makes it reject a relative data
+// volume.
+//
+// Unlike isUnder it CLEANS ITS OWN OPERANDS rather than documenting the
+// precondition. That is deliberate: this is the sink tier, whose stated job is to
+// hold when the primary guard is bypassed or when a future caller reaches the
+// exported Generate some other way — and a sink whose correctness is inherited
+// from the caller it exists to distrust is a primary in disguise. Uncleaned,
+// "<prefix>/../../../etc" satisfies a raw prefix test. The live path is already
+// safe (Generate cleans first), so this costs nothing and removes the residual.
+//
+// The one-word difference from isUnder is the whole point, so it is pinned by
+// test (TestDataVolumePathRejectsProtectedTree/predicate) rather than asserted
+// here: equality-inclusive vs strict is exactly the difference between accepting
+// and rejecting the PODS ROOT ITSELF as a data volume, and re-allowing the pods
+// root read+write after the protected denies would hand one pod every sibling
+// pod's materialized secrets and projected SA-token.
+//
+// It is a third strict variant in this repo, alongside mount.IsStrictlyUnder and
+// pkg/supervisor's local one, and that duplication is deliberate rather than
+// laziness: pkg/sandbox must NOT import pkg/mount (the same layering rule that
+// makes sandbox.VMVolumePlan plain data — see the mapper note in
+// pkg/runtime/pod.go), and the supervisor variant is unexported and DELIBERATELY
+// stricter (absolute operands only, since a relative base would resolve against
+// the process working directory). Importing either would invert layering to save
+// one line.
+func strictlyUnder(path, prefix string) bool {
+	path, prefix = filepath.Clean(path), filepath.Clean(prefix)
+	if prefix == string(filepath.Separator) {
+		return path != prefix && filepath.IsAbs(path)
+	}
+	return path != prefix && isUnder(path, prefix)
 }
 
 // macOSFirmlinks are the synthetic APFS firmlinks the macOS boot volume presents:

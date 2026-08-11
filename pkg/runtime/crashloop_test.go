@@ -178,7 +178,7 @@ func TestRestartAfterCrashClearsTerminalPhase(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: rel, onTerm: rel}
 	rt.signalGroup = rec.signal
 
-	mustCreatePod(t, rt, hostBinBox("pod-clbo")) // main = pid 1001
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-clbo")) // main = pid 1001
 
 	rel(1001)
 	waitFor(t, 5*time.Second, "pod Failed after the crash", func() bool {
@@ -355,7 +355,7 @@ func TestFailedPodIsTrulyTerminal(t *testing.T) {
 	rec := &recordingSignalGroup{onTerm: rel, onKill: rel}
 	rt.signalGroup = rec.signal
 
-	box := sidecarBox("pod-fail-term", "sc")
+	box := sidecarBox(rt, "pod-fail-term", "sc")
 	box.MemoryLimitBytes = 100 << 20 // no breach; the sampler simply runs
 	mustCreatePod(t, rt, box)
 
@@ -401,7 +401,7 @@ func TestRestartAfterCrashRearmsMemorySampler(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: rel, onTerm: rel}
 	rt.signalGroup = rec.signal
 
-	box := hostBinBox("pod-clbo-mem")
+	box := hostBinBox(rt, "pod-clbo-mem")
 	box.MemoryLimitBytes = 100 << 20
 	mustCreatePod(t, rt, box)
 
@@ -458,7 +458,7 @@ func TestSidecarRespawnedIntoTerminalPodIsTornDown(t *testing.T) {
 	rec := &recordingSignalGroup{onTerm: rel, onKill: rel}
 	rt.signalGroup = rec.signal
 
-	mustCreatePod(t, rt, sidecarBox("pod-sc-respawn", "sc"))
+	mustCreatePod(t, rt, sidecarBox(rt, "pod-sc-respawn", "sc"))
 
 	rel(pidMain)
 	waitFor(t, 5*time.Second, "pod Failed", func() bool {
@@ -545,7 +545,7 @@ func TestSamplerRefusesToArmDeletedPod(t *testing.T) {
 	rt.cfg.SampleInterval = 2 * time.Millisecond
 	rt.signalGroup = (&recordingSignalGroup{}).signal
 
-	box := hostBinBox("pod-unreg")
+	box := hostBinBox(rt, "pod-unreg")
 	box.MemoryLimitBytes = 100 << 20
 	mustCreatePod(t, rt, box)
 	waitFor(t, 5*time.Second, "the memory sampler to start", func() bool {
@@ -595,7 +595,7 @@ func TestRestartRearmsMemorySamplerAfterCompletion(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: rel, onTerm: rel}
 	rt.signalGroup = rec.signal
 
-	box := hostBinBox("pod-rearm")
+	box := hostBinBox(rt, "pod-rearm")
 	box.MemoryLimitBytes = 100 << 20
 	mustCreatePod(t, rt, box)
 
@@ -656,7 +656,7 @@ func TestNoTransientTerminatedPublishWhileRestarting(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: rel, onTerm: rel}
 	rt.signalGroup = rec.signal
 
-	mustCreatePod(t, rt, hostBinBox("pod-nopub"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-nopub"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -732,7 +732,7 @@ func TestStatusNeverPairsBumpedCountWithPreviousTerminatedState(t *testing.T) {
 			rec := &recordingSignalGroup{onKill: rel, onTerm: rel}
 			rt.signalGroup = rec.signal
 
-			mustCreatePod(t, rt, hostBinBox("pod-inv"))
+			mustCreatePod(t, rt, hostBinBox(rt, "pod-inv"))
 
 			if tc.crash {
 				rel(1001)
