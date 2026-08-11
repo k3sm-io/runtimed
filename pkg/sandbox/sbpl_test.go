@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
 )
 
 // TestGenerateGolden pins the full rendered profile against the golden file:
@@ -306,6 +307,162 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 	if PodReapSubdir != "podreap" {
 		t.Errorf("PodReapSubdir = %q, want \"podreap\" (single-sourced with pkg/runtime)", PodReapSubdir)
 	}
+}
+
+// TestWorkDirDenyRootsCoverControlPlaneTrees is the control-plane-tree contract:
+// the work-dir siblings that hold the cluster CA keys + kine datastore
+// (<WorkDir>/server), the node-agent state (<WorkDir>/agent), the daemon control
+// sockets + wireguard mesh private key (<WorkDir>/run) and the content-addressed
+// blob store (<WorkDir>/blobs) MUST be BOTH rejected as caller-supplied paths and
+// EMITTED as denies after the allows — a validate-set entry alone would not
+// survive an ancestor grant, and an emitted deny placed before the allows would
+// be worthless (SBPL is last-match-wins).
+//
+// The work-dir is a t.TempDir(), so a hard-coded /var/lib/k3sm literal cannot
+// pass, and the positive control keeps the table honest: a legitimate PV path
+// under <WorkDir>/storage must still be granted.
+func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
+	workDir := t.TempDir()
+	dataVol := filepath.Join(workDir, "pods", "p1", "rootfs")
+	posture := Posture{WorkDir: workDir}
+	subdirs := []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir}
+
+	// (0) The mesh private key's ABSOLUTE home is denied even though this posture's
+	// work-dir is elsewhere. Everything else in the deny-set moves with the
+	// work-dir; the key does not, because the installer writes it at a fixed path.
+	// Without this the unprivileged home-rooted posture would guard an empty
+	// sibling while the key stayed grantable — and note workDir here is a TempDir,
+	// so a hard-coded /var/lib/k3sm elsewhere could not make this pass.
+	t.Run("the absolute mesh-key dir is denied under a non-default work-dir", func(t *testing.T) {
+		absRun := DefaultWorkDir + "/" + RunSubdir
+		_, protected, err := resolvePosture(posture)
+		if err != nil {
+			t.Fatalf("resolvePosture: %v", err)
+		}
+		if err := validateExtraPaths(dataVol, protected, []string{absRun}); !errors.Is(err, ErrProtectedPath) {
+			t.Errorf("validateExtraPaths(%q) = %v, want ErrProtectedPath", absRun, err)
+		}
+		out, gerr := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{Posture: posture})
+		if gerr != nil {
+			t.Fatalf("Generate: %v", gerr)
+		}
+		if !strings.Contains(out, `(subpath "`+absRun+`")`) {
+			t.Errorf("rendered profile does not deny the absolute mesh-key dir %q", absRun)
+		}
+	})
+
+	// (1) Rejection: a caller-supplied path AT or UNDER one of the trees is
+	// refused outright, whichever path group it arrives in.
+	t.Run("rejected as a caller-supplied path", func(t *testing.T) {
+		for _, sub := range subdirs {
+			root := filepath.Join(workDir, sub)
+			for _, p := range []string{root, filepath.Join(root, "child")} {
+				for name, opts := range map[string]GenerateOptions{
+					"write-path": {Posture: posture, WritePaths: []string{p}},
+					"read-path":  {Posture: posture, ReadPaths: []string{p}},
+					"credential": {Posture: posture, ReadOnlyPaths: []string{p}},
+				} {
+					t.Run(sub+"/"+name+"/"+filepath.Base(p), func(t *testing.T) {
+						sp := &runtimev1.SandboxProfile{DataVolumePath: dataVol}
+						if _, err := Generate(sp, opts); !errors.Is(err, ErrProtectedPath) {
+							t.Fatalf("Generate with %s %q: err = %v, want ErrProtectedPath", name, p, err)
+						}
+					})
+				}
+			}
+			// The same verdict at the validation seam Generate calls, so a future
+			// refactor that stops routing through it still fails here.
+			_, protected, err := resolvePosture(posture)
+			if err != nil {
+				t.Fatalf("resolvePosture: %v", err)
+			}
+			if err := validateExtraPaths(dataVol, protected, []string{root}); !errors.Is(err, ErrProtectedPath) {
+				t.Fatalf("validateExtraPaths(%q) = %v, want ErrProtectedPath", root, err)
+			}
+		}
+	})
+
+	// (2) Emission + ordering: grant write to the work-dir ITSELF (an ancestor,
+	// which validateExtraPaths permits) and require every tree to be re-denied
+	// AFTER that allow, by byte index.
+	t.Run("emitted deny follows the ancestor allow", func(t *testing.T) {
+		out, err := Generate(&runtimev1.SandboxProfile{
+			DataVolumePath:  dataVol,
+			ExtraWritePaths: []string{workDir},
+		}, GenerateOptions{Posture: posture})
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		iAllow := strings.Index(out, "(allow file-write*\n  (subpath \""+workDir+"\")")
+		if iAllow < 0 {
+			t.Fatalf("expected the ancestor work-dir write allow in the profile:\n%s", out)
+		}
+		for _, sub := range subdirs {
+			root := filepath.Join(workDir, sub)
+			iDeny := strings.Index(out, "(deny file-read* file-write*\n")
+			if iDeny < 0 {
+				t.Fatalf("protected deny stanza missing:\n%s", out)
+			}
+			iRoot := strings.Index(out, "(subpath \""+root+"\")")
+			if iRoot < 0 {
+				t.Fatalf("%s tree %q is not denied:\n%s", sub, root, out)
+			}
+			if iRoot <= iAllow {
+				t.Errorf("%s deny (%d) must come AFTER the ancestor work-dir allow (%d) to win (last-match-wins)", sub, iRoot, iAllow)
+			}
+			// Both firmlink forms, since a deny written only against the
+			// firmlink spelling fails OPEN.
+			for _, form := range firmlinkForms(root) {
+				if !strings.Contains(out, "(subpath \""+form+"\")") {
+					t.Errorf("%s tree missing deny form %q:\n%s", sub, form, out)
+				}
+			}
+		}
+	})
+
+	// (3) POSITIVE CONTROL: a legitimate PV mount root under <WorkDir>/storage is
+	// still granted and is not covered by any denied root. Without this the table
+	// cannot tell "control-plane trees protected" from "all PV volumes broken".
+	t.Run("legitimate pv path still granted", func(t *testing.T) {
+		pv := filepath.Join(workDir, "storage", "prod", "pgdata")
+		out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+			Posture:    posture,
+			WritePaths: []string{pv},
+		})
+		if err != nil {
+			t.Fatalf("Generate with a PV write path: %v", err)
+		}
+		if !strings.Contains(out, "(allow file-write*\n  (subpath \""+pv+"\")") {
+			t.Fatalf("PV mount root %q lost its file-write* allow:\n%s", pv, out)
+		}
+		denyRoots, _, err := resolvePosture(posture)
+		if err != nil {
+			t.Fatalf("resolvePosture: %v", err)
+		}
+		for _, root := range denyRoots {
+			if isUnder(pv, root) {
+				t.Fatalf("PV path %q is under denied root %q — the deny-set would clobber every PVC", pv, root)
+			}
+		}
+	})
+
+	// (4) The blobs leaf name is single-sourced in spirit with pkg/image, which
+	// derives the same dir from its own literal: if the two drift, this deny
+	// guards an empty sibling while the real store stays writable.
+	t.Run("blobs leaf agrees with the image store layout", func(t *testing.T) {
+		root := t.TempDir()
+		c, err := image.NewCache(root)
+		if err != nil {
+			t.Fatalf("NewCache: %v", err)
+		}
+		blob, err := c.BlobPath("sha256:" + strings.Repeat("a", 64))
+		if err != nil {
+			t.Fatalf("BlobPath: %v", err)
+		}
+		if want := filepath.Join(root, BlobsSubdir); !isUnder(blob, want) {
+			t.Errorf("image blob %q is not under %q — BlobsSubdir has drifted from pkg/image", blob, want)
+		}
+	})
 }
 
 // TestGenerateNetworkGating checks that without AllowNetwork the profile emits no
