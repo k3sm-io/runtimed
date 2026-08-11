@@ -142,7 +142,7 @@ func TestExecRunsAndReturnsExitCode(t *testing.T) {
 	be := &recordingExecBackend{}
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Backend: be, Waiter: w})
-	mustCreatePod(t, rt, hostBinBox("pod-exec"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-exec"))
 	defer w.release(1001)
 
 	rt.mu.Lock()
@@ -213,7 +213,7 @@ func TestExecCarriesPodLaunchSpec(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Backend: be, Waiter: w})
 
-	box := hostBinBox("pod-exec-spec")
+	box := hostBinBox(rt, "pod-exec-spec")
 	box.Rlimits = []*runtimev1.ResourceLimit{{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 4096}}
 	box.QosClass = runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT
 	mustCreatePod(t, rt, box)
@@ -245,7 +245,7 @@ func TestExecStreamsStdin(t *testing.T) {
 	be := &recordingExecBackend{}
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Backend: be, Waiter: w})
-	mustCreatePod(t, rt, hostBinBox("pod-stdin"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-stdin"))
 	defer w.release(1001)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -319,7 +319,7 @@ func (s *fakeAttachStream) recv(t *testing.T, d time.Duration) *runtimev1.Attach
 func TestAttachStreamsContainerOutput(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
-	mustCreatePod(t, rt, hostBinBox("pod-attach"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-attach"))
 	defer w.release(1001)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -357,7 +357,7 @@ func TestAttachStreamsContainerOutput(t *testing.T) {
 func TestAttachRejectsStdin(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
-	mustCreatePod(t, rt, hostBinBox("pod-attach-stdin"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-attach-stdin"))
 	defer w.release(1001)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -444,7 +444,7 @@ func TestPortForwardProxiesBytes(t *testing.T) {
 	// The pod IP is loopback so the proxy dial reaches the local listener.
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w, Network: supervisor.NodeNetwork{IP: "127.0.0.1"}})
-	mustCreatePod(t, rt, hostBinBox("pod-pf"))
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-pf"))
 	defer w.release(1001)
 
 	ctx, cancel := context.WithCancel(context.Background())

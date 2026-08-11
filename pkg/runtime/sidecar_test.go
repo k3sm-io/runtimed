@@ -30,8 +30,8 @@ import (
 // sidecarBox builds a PodBox whose init list declares native sidecars (KEP-753:
 // init containers with restart_policy ALWAYS) named scNames, plus the hostBinBox
 // main container. The pod grace is 30s so graceful teardown SIGTERMs first.
-func sidecarBox(podID string, scNames ...string) *runtimev1.PodBox {
-	box := hostBinBox(podID)
+func sidecarBox(rt *Runtime, podID string, scNames ...string) *runtimev1.PodBox {
+	box := hostBinBox(rt, podID)
 	box.TerminationGracePeriodSeconds = 30
 	for _, n := range scNames {
 		box.InitContainers = append(box.InitContainers, &runtimev1.Container{
@@ -78,7 +78,7 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w})
 
-	box := sidecarBox("pod-sc", "sc")
+	box := sidecarBox(rt, "pod-sc", "sc")
 	// Append a PLAIN init container AFTER the sidecar: it must run to completion
 	// (pid 1002, pre-released below) while the sidecar (pid 1001) stays blocked.
 	box.InitContainers = append(box.InitContainers, &runtimev1.Container{Name: "ip", Image: "/bin/true"})
@@ -158,7 +158,7 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w})
 
-		box := hostBinBox("pod-legacy")
+		box := hostBinBox(rt, "pod-legacy")
 		box.InitContainers = []*runtimev1.Container{{Name: "ip", Image: "/bin/true"}} // UNSPECIFIED
 
 		done := make(chan struct{})
@@ -199,7 +199,7 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 
 	t.Run("nonzero-init-exit-fails-create", func(t *testing.T) {
 		rt := newTestRuntime(t, Deps{Waiter: instantWaiter{code: 1}})
-		box := hostBinBox("pod-legacy-fail")
+		box := hostBinBox(rt, "pod-legacy-fail")
 		box.InitContainers = []*runtimev1.Container{{Name: "ip", Image: "/bin/false"}}
 		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 		if err != nil {
@@ -245,7 +245,7 @@ func TestSidecarMainsOnlyPhase(t *testing.T) {
 			rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 			rt.signalGroup = rec.signal
 
-			mustCreatePod(t, rt, sidecarBox("pod-ph", "sc"))
+			mustCreatePod(t, rt, sidecarBox(rt, "pod-ph", "sc"))
 
 			w.release(pidMain) // the main terminates on its own
 			waitFor(t, 5*time.Second, "terminal phase on mains alone", func() bool {
@@ -273,7 +273,7 @@ func TestSidecarMainsOnlyPhase(t *testing.T) {
 		w.code = 7 // the sidecar CRASHES
 		rt := newTestRuntime(t, Deps{Waiter: w})
 
-		mustCreatePod(t, rt, sidecarBox("pod-scx", "sc")) // sc=1001, main=1002
+		mustCreatePod(t, rt, sidecarBox(rt, "pod-scx", "sc")) // sc=1001, main=1002
 
 		w.release(1001) // only the sidecar exits
 		waitFor(t, 5*time.Second, "sidecar terminated status", func() bool {
@@ -311,7 +311,7 @@ func TestSidecarReverseOrderTeardown(t *testing.T) {
 		rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 		rt.signalGroup = rec.signal
 
-		mustCreatePod(t, rt, sidecarBox("pod-rev", "sc-a", "sc-b"))
+		mustCreatePod(t, rt, sidecarBox(rt, "pod-rev", "sc-a", "sc-b"))
 
 		w.release(pidMain) // the last main terminates voluntarily
 		waitFor(t, 5*time.Second, "both sidecars SIGTERMed", func() bool {
@@ -338,7 +338,7 @@ func TestSidecarReverseOrderTeardown(t *testing.T) {
 		rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 		rt.signalGroup = rec.signal
 
-		mustCreatePod(t, rt, sidecarBox("pod-del", "sc-a", "sc-b"))
+		mustCreatePod(t, rt, sidecarBox(rt, "pod-del", "sc-a", "sc-b"))
 
 		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-del"}); err != nil {
 			t.Fatalf("DeletePod: %v", err)
@@ -378,7 +378,7 @@ func TestDeletePodSidecarRemainingGrace(t *testing.T) {
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
 
-	box := sidecarBox("pod-rem", "sc-a", "sc-b")
+	box := sidecarBox(rt, "pod-rem", "sc-a", "sc-b")
 	box.TerminationGracePeriodSeconds = 1 // the smallest non-zero budget
 	mustCreatePod(t, rt, box)
 
@@ -446,7 +446,7 @@ func TestSidecarRestartPreservesClass(t *testing.T) {
 	}
 	rt.signalGroup = rec.signal
 
-	mustCreatePod(t, rt, sidecarBox("pod-rc", "sc"))
+	mustCreatePod(t, rt, sidecarBox(rt, "pod-rc", "sc"))
 
 	resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
 		PodId: "pod-rc", Container: "sc", Reason: "liveness probe failed",

@@ -211,7 +211,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			box := hostBinBox(tc.podID)
+			box := hostBinBox(rt, tc.podID)
 			box.RootfsPath = tc.rootfs
 			box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: int64(gid)}
 
@@ -266,7 +266,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 // and materialized <PodsRoot>/<podID>/rootfs — the guard's accept branch.
 func assertCreatesDerivedRootfs(t *testing.T, rt *Runtime, cache *image.Cache, podID, rootfsPath string) {
 	t.Helper()
-	box := hostBinBox(podID)
+	box := hostBinBox(rt, podID)
 	box.RootfsPath = rootfsPath
 
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})

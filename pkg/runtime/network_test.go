@@ -82,7 +82,7 @@ func TestDeletePodReleasesPodNetwork(t *testing.T) {
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{Network: pn, Waiter: w})
 
-		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-td")}); err != nil {
+		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-td")}); err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}
 		if got := pn.teardownCalls(); len(got) != 0 {
@@ -103,7 +103,7 @@ func TestDeletePodReleasesPodNetwork(t *testing.T) {
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{Network: pn, Waiter: w})
 
-		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-td-err")}); err != nil {
+		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-td-err")}); err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}
 		w.release(1001)
@@ -128,7 +128,7 @@ func TestCreatePodUnwindReleasesPodNetwork(t *testing.T) {
 		Spawner: &fakeSpawner{err: errors.New("spawn boom")},
 	})
 
-	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-uw")})
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-uw")})
 	if err != nil {
 		t.Fatalf("CreatePod transport error: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestNetworkReconcileStartup(t *testing.T) {
 		})
 		ctx, cctx := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cctx()
-		if resp, err := client.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-rec")}); err != nil || resp.GetError() != nil {
+		if resp, err := client.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-rec")}); err != nil || resp.GetError() != nil {
 			t.Fatalf("CreatePod over bufconn: %v / %v", err, resp.GetError())
 		}
 
@@ -247,7 +247,7 @@ func TestNetworkReconcileStartup(t *testing.T) {
 		})
 		ctx, cctx := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cctx()
-		if resp, err := client.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox("pod-noop")}); err != nil || resp.GetError() != nil {
+		if resp, err := client.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-noop")}); err != nil || resp.GetError() != nil {
 			t.Fatalf("CreatePod with NodeNetwork default: %v / %v", err, resp.GetError())
 		}
 		w.release(1001)

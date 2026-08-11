@@ -33,7 +33,7 @@ import (
 func TestResolveBinaryNativeSentinel(t *testing.T) {
 	pull := &fakePuller{}
 	rt := newTestRuntime(t, Deps{Puller: pull})
-	p := &pod{box: hostBinBox("pod-native"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+	p := &pod{box: hostBinBox(rt, "pod-native"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 	rootfs := "/var/lib/k3sm/pods/pod-native/rootfs"
 
 	t.Run("runs command[0] as the host binary, skips the pull, flags hostBinary", func(t *testing.T) {
@@ -93,7 +93,7 @@ func TestResolveBinaryPullPolicyCarriesResolvedBackend(t *testing.T) {
 		t.Run(backend.String(), func(t *testing.T) {
 			pull := &fakePuller{}
 			rt := newTestRuntime(t, Deps{Puller: pull})
-			p := &pod{box: hostBinBox("pod-policy"), backend: backend}
+			p := &pod{box: hostBinBox(rt, "pod-policy"), backend: backend}
 			c := &runtimev1.Container{Name: "app", Image: "example.com/app:v1", Command: []string{"/app"}}
 			if _, _, _, err := rt.resolveBinary(context.Background(), p, "/var/lib/k3sm/pods/pod-policy/rootfs", c); err != nil {
 				t.Fatalf("resolveBinary: %v", err)

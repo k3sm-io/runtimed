@@ -68,6 +68,24 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: sandbox_profile is required", errInvalidPodBox)
 	}
+	// sandbox_profile.data_volume_path is the same shape of hazard again, one tier
+	// over: it is not a directory the daemon writes but the tree the emitted SBPL
+	// re-allows read+write AFTER the protected denies (last-match-wins), and the
+	// carve-out base every other caller-supplied path is validated against. It is
+	// asked of dataVolumePath rather than restated, for the same single-predicate
+	// reason rootfs_path is asked of rootfsPath — see that method for why equality
+	// with the derivation, why BOTH derived spellings, and how it divides labour
+	// with the sink-side bound in sandbox.Generate. It sits AFTER the nil-profile
+	// check above so a missing profile keeps its own clear reason.
+	//
+	// UpdatePod does not run validatePodBox (it runs updatableOnly, which does not
+	// compare this field at all), so an update cannot smuggle a new value in: the
+	// stored box's profile is the one that was validated at create, and the
+	// structural check inside createPod covers the spine directly.
+	if _, err := r.dataVolumePath(box); err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
 	if len(box.GetContainers()) == 0 && len(box.GetInitContainers()) == 0 {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod %s has no containers", errInvalidPodBox, box.GetPodId())

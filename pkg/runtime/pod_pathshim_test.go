@@ -52,7 +52,7 @@ func mustEnvValue(t *testing.T, env []string, key string) string {
 // derivation, and a literal cannot match a test runtime's temp-dir cache root.
 func mountingBox(t *testing.T, rt *Runtime, podID string, mountPaths ...string) (*runtimev1.PodBox, *runtimev1.Container) {
 	t.Helper()
-	box := hostBinBox(podID)
+	box := hostBinBox(rt, podID)
 	box.RootfsPath = derivedRootfs(t, rt, podID)
 	c := box.GetContainers()[0]
 	for _, mp := range mountPaths {

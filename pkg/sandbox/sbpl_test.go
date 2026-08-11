@@ -335,7 +335,7 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 	// so a hard-coded /var/lib/k3sm elsewhere could not make this pass.
 	t.Run("the absolute mesh-key dir is denied under a non-default work-dir", func(t *testing.T) {
 		absRun := DefaultWorkDir + "/" + RunSubdir
-		_, protected, err := resolvePosture(posture)
+		_, _, protected, err := resolvePosture(posture)
 		if err != nil {
 			t.Fatalf("resolvePosture: %v", err)
 		}
@@ -372,7 +372,7 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 			}
 			// The same verdict at the validation seam Generate calls, so a future
 			// refactor that stops routing through it still fails here.
-			_, protected, err := resolvePosture(posture)
+			_, _, protected, err := resolvePosture(posture)
 			if err != nil {
 				t.Fatalf("resolvePosture: %v", err)
 			}
@@ -435,7 +435,7 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		if !strings.Contains(out, "(allow file-write*\n  (subpath \""+pv+"\")") {
 			t.Fatalf("PV mount root %q lost its file-write* allow:\n%s", pv, out)
 		}
-		denyRoots, _, err := resolvePosture(posture)
+		_, denyRoots, _, err := resolvePosture(posture)
 		if err != nil {
 			t.Fatalf("resolvePosture: %v", err)
 		}

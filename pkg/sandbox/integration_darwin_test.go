@@ -50,15 +50,34 @@ func buildExecShim(t *testing.T) string {
 	return shim
 }
 
-// genProfileAllowing renders a generated profile whose data volume is dataVol and
-// that additionally reads the extra paths (so test binaries under /private/tmp
-// can be exec'd and read).
-func genProfile(t *testing.T, dataVol string, extraRead ...string) string {
+// podVolume returns a node posture rooted at a fresh t.TempDir() work-dir plus
+// the pod data volume derived under it (<WorkDir>/pods/<podID>/rootfs), created
+// on disk so a test can build its helper binaries inside it.
+//
+// Every live-libsandbox test here goes through it because Generate bounds the
+// data volume to the posture's pods root (ErrDataVolumeUnbounded); a bare
+// t.TempDir() data volume is exactly the unbounded shape the bound refuses. It
+// also makes these tests render the production path layout instead of an
+// arbitrary one.
+func podVolume(t *testing.T, podID string) (Posture, string) {
+	t.Helper()
+	workDir := t.TempDir()
+	dataVol := filepath.Join(workDir, "pods", podID, "rootfs")
+	if err := os.MkdirAll(dataVol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return Posture{WorkDir: workDir}, dataVol
+}
+
+// genProfile renders a generated profile whose data volume is dataVol under
+// posture, and that additionally reads the extra paths (so test binaries under
+// /private/tmp can be exec'd and read).
+func genProfile(t *testing.T, posture Posture, dataVol string, extraRead ...string) string {
 	t.Helper()
 	out, err := Generate(&runtimev1.SandboxProfile{
 		DataVolumePath: dataVol,
 		ExtraReadPaths: extraRead,
-	}, GenerateOptions{})
+	}, GenerateOptions{Posture: posture})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +110,8 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 // under a generated profile reads /System but is DENIED /Users.
 func TestIntegrationConfinement(t *testing.T) {
 	shim := buildExecShim(t)
-	dataVol := t.TempDir()
-	profile := genProfile(t, dataVol, "/private/tmp", "/private/var/folders")
+	posture, dataVol := podVolume(t, "pod-confine")
+	profile := genProfile(t, posture, dataVol, "/private/tmp", "/private/var/folders")
 
 	t.Run("reads-System", func(t *testing.T) {
 		out, err := runUnderShim(t, shim, profile, os.Environ(),
@@ -137,14 +156,15 @@ func TestIntegrationConfinement(t *testing.T) {
 // only: ad-hoc sign, no root.
 func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 	shim := buildExecShim(t)
-	work := t.TempDir()
+	posture, work := podVolume(t, "pod-net")
+	posture.ResolverVIP, posture.APIServerVIP = "10.43.0.10", "10.43.0.1"
 
 	profile, err := Generate(&runtimev1.SandboxProfile{
 		DataVolumePath: work,
 		AllowNetwork:   true,
 		ExtraReadPaths: []string{"/private/tmp", "/private/var/folders"},
 	}, GenerateOptions{
-		Posture: Posture{ResolverVIP: "10.43.0.10", APIServerVIP: "10.43.0.1"},
+		Posture: posture,
 		PodIP:   "10.64.0.7",
 	})
 	if err != nil {
@@ -198,7 +218,7 @@ func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 // what unblocks darwin-net's DNS shim and what /usr/bin/sandbox-exec would break.
 func TestIntegrationDYLDPreserved(t *testing.T) {
 	shim := buildExecShim(t)
-	work := t.TempDir()
+	posture, work := podVolume(t, "pod-dyld")
 
 	// A dylib whose constructor announces it ran (proves DYLD actually inserted).
 	dylib := filepath.Join(work, "libmarker.dylib")
@@ -228,7 +248,7 @@ func TestIntegrationDYLDPreserved(t *testing.T) {
 		t.Fatalf("codesign pod: %v\n%s", err, out)
 	}
 
-	profile := genProfile(t, work, "/private/tmp", "/private/var/folders", work)
+	profile := genProfile(t, posture, work, "/private/tmp", "/private/var/folders", work)
 	env := append(os.Environ(), "DYLD_INSERT_LIBRARIES="+dylib)
 
 	out, err := runUnderShim(t, shim, profile, env, pod)
