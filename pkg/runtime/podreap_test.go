@@ -301,8 +301,8 @@ func TestReapOrphanedPods(t *testing.T) {
 		seedPodProcRecord(t, rt, rec)
 	}
 
-	if err := rt.reapOrphanedPods(); err != nil {
-		t.Fatalf("reapOrphanedPods: %v", err)
+	if err := rt.ReapOrphanedPods(); err != nil {
+		t.Fatalf("ReapOrphanedPods: %v", err)
 	}
 	mu.Lock()
 	got := append([]int(nil), killed...)
@@ -321,7 +321,7 @@ func TestReapOrphanedPods(t *testing.T) {
 	// Sticky once-per-Runtime: seeding a new record and re-running must not
 	// signal again.
 	seedPodProcRecord(t, rt, podProcRecord{PodID: "p9", Container: "c", Pgid: 100, StartUnixNano: 5})
-	if err := rt.reapOrphanedPods(); err != nil {
+	if err := rt.ReapOrphanedPods(); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -344,8 +344,8 @@ func TestReapKeepsRecordOnKillFailure(t *testing.T) {
 	})
 	seedPodProcRecord(t, rt, podProcRecord{PodID: "p1", Container: "c", Pgid: 100, StartUnixNano: 5})
 
-	if err := rt.reapOrphanedPods(); err != nil {
-		t.Fatalf("reapOrphanedPods: %v", err)
+	if err := rt.ReapOrphanedPods(); err != nil {
+		t.Fatalf("ReapOrphanedPods: %v", err)
 	}
 	records, _, err := rt.listPodProcRecords()
 	if err != nil {

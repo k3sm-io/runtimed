@@ -356,7 +356,7 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 	return found && leader.StartUnixNano == rec.StartUnixNano
 }
 
-// reapOrphanedPods reaps pod process groups recorded by a previous daemon run,
+// ReapOrphanedPods reaps pod process groups recorded by a previous daemon run,
 // exactly once per Runtime, BEFORE CreatePod is served (a sibling of the network
 // startup reconcile). Unlike that reconcile it DEGRADES rather than fails
 // closed: reaping a best-effort orphan store is NOT a scheduling precondition,
@@ -366,7 +366,14 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 // exactly-once semantics). Kills are SIGKILL to the whole group with no grace
 // period: the orphans' supervising reapers died with the previous daemon, so
 // there is no graceful-stop path left to run.
-func (r *Runtime) reapOrphanedPods() error {
+//
+// It is exported because it has TWO call sites: the standalone daemon's
+// Server.Serve (grpcserver.go), and the embedded k3sm node path, which drives
+// this Runtime by direct RPC and never runs Serve — the same reason the network
+// startup reconcile needs an explicit call on the embedded path. The sticky
+// exactly-once semantics make the two call sites safe to combine: whichever runs
+// first performs the reap, the other observes the cached result.
+func (r *Runtime) ReapOrphanedPods() error {
 	r.podReapOnce.Do(func() {
 		r.podReapErr = r.reapOrphanedPodsOnce()
 	})

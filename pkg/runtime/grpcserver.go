@@ -83,10 +83,12 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	// considered, each guarded by an exact-instance start-time identity check
 	// (podreap.go) — never a name/path heuristic. Unlike the network reconcile
 	// this DEGRADES rather than fails closed: reaping a best-effort orphan store
-	// is not a scheduling precondition, so reapOrphanedPods always returns nil
+	// is not a scheduling precondition, so ReapOrphanedPods always returns nil
 	// (it alerts + skips on an unreadable store) — a store fault must never
-	// crash-loop the node out of serving CreatePod.
-	if err := s.rt.reapOrphanedPods(); err != nil {
+	// crash-loop the node out of serving CreatePod. It is exported because the
+	// embedded k3sm node path never runs Serve and must call it directly; the
+	// sticky once makes the reap happen exactly once either way.
+	if err := s.rt.ReapOrphanedPods(); err != nil {
 		return fmt.Errorf("reap orphaned pod process groups: %w", err)
 	}
 
