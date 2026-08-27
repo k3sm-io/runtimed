@@ -92,9 +92,12 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// New shim contract: <uid> <gid> <groups-csv> <profile.sb> <pod-binary>...
-	// "-1 -1 -" requests no privilege drop (run as the test/daemon identity).
-	full := append([]string{"-1", "-1", "-", pf}, argv...)
+	// Shim contract: <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary>...
+	// "-1 -1 -" requests no privilege drop (run as the test/daemon identity); the
+	// two launch-spec tokens are the empty sentinels supervisor.EncodeRlimits(nil)
+	// and EncodeQoS(false) both emit — no setrlimit plan, no background QoS. They
+	// sit BEFORE the profile path so binary skew fails closed (execshim.go).
+	full := append([]string{"-1", "-1", "-", "-", "-", pf}, argv...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shim, full...)
