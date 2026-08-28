@@ -307,9 +307,27 @@ func (r *Runtime) WatchPodStatus(req *runtimev1.WatchPodStatusRequest, stream gr
 	}
 }
 
-// GetLogs streams a container's buffered combined output. follow keeps the
-// stream open for new lines; M1 serves the current buffer (tail honored) and,
-// when follow is set, blocks until the context ends.
+// GetLogs streams a container's combined output under the full GetLogsRequest
+// option set, in the order the kubelet applies them:
+//
+//  1. tail_lines selects positionally from the end of the buffer;
+//  2. since_time then drops entries older than the cutoff (so tail+since compose
+//     to FEWER than tail lines, never to "the newest N recent ones");
+//  3. timestamps renders the RFC3339 prefix and limit_bytes caps the result
+//     (logEmitter, logs.go).
+//
+// follow keeps the stream open and delivers lines as the supervisor's pump writes
+// them, applying the same since/presentation options, until the container exits
+// (a clean end — `kubectl logs -f` returns) or the client goes away. The follower
+// is registered BEFORE the buffer snapshot so no line is lost in between; the
+// cost of that ordering is that a line written in the gap can be delivered twice,
+// which is the same trade Attach makes and the right way round (a duplicate line
+// is recoverable, a dropped one is not).
+//
+// previous is REFUSED. runtimed keeps one in-memory buffer per LIVE container and
+// a restart replaces it, so the previous instance's output does not exist to
+// serve; answering from the running instance would hand `kubectl logs -p` the
+// wrong output labelled as the crashed run's, which is worse than an error.
 func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStreamingServer[runtimev1.LogEntry]) error {
 	r.mu.Lock()
 	p, ok := r.pods[req.GetPodId()]
@@ -322,19 +340,83 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStrea
 	if cp == nil {
 		return status.Errorf(codes.NotFound, "container %s not found in pod %s", req.GetContainer(), req.GetPodId())
 	}
+	if req.GetPrevious() {
+		return status.Errorf(codes.Unimplemented,
+			"logs of the previous instance of %s/%s are not retained: runtimed buffers only the live container",
+			req.GetPodId(), req.GetContainer())
+	}
 
-	for _, line := range cp.logs.snapshot(int(req.GetTailLines())) {
-		if err := stream.Send(&runtimev1.LogEntry{
-			Line:   line,
-			Stream: runtimev1.LogStream_LOG_STREAM_STDOUT,
-		}); err != nil {
+	var since time.Time
+	if ts := req.GetSinceTime(); ts.IsValid() {
+		since = ts.AsTime()
+	}
+	// Register the follower before snapshotting (see the doc comment's ordering
+	// note); a non-follow request never subscribes.
+	var live <-chan logLine
+	if req.GetFollow() {
+		ch, cancel := cp.logs.subscribe()
+		defer cancel()
+		live = ch
+	}
+
+	em := newLogEmitter(stream, req)
+	send := func(ent logLine) error {
+		if ent.at.Before(since) {
+			return nil
+		}
+		return em.send(ent)
+	}
+	for _, ent := range cp.logs.snapshotEntries(int(req.GetTailLines())) {
+		if err := send(ent); err != nil {
+			if errors.Is(err, errLogLimitReached) {
+				return nil
+			}
 			return err
 		}
 	}
-	if req.GetFollow() {
-		<-stream.Context().Done()
+	if !req.GetFollow() {
+		return nil
 	}
-	return nil
+
+	ctx := stream.Context()
+	// A nil Done channel (a container with no process, which only a test builds)
+	// blocks forever, leaving ctx as the sole exit — the right degradation.
+	var exited <-chan struct{}
+	if cp.proc != nil {
+		exited = cp.proc.Done()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ent := <-live:
+			if err := send(ent); err != nil {
+				if errors.Is(err, errLogLimitReached) {
+					return nil
+				}
+				return err
+			}
+		case <-exited:
+			// Flush whatever the pump had already handed the buffer before the
+			// exit was observed, then end the stream cleanly. A line still in
+			// flight inside the pump goroutine can still be missed — the same
+			// unavoidable race Attach has — but everything already written is
+			// delivered rather than cut off.
+			for {
+				select {
+				case ent := <-live:
+					if err := send(ent); err != nil {
+						if errors.Is(err, errLogLimitReached) {
+							return nil
+						}
+						return err
+					}
+				default:
+					return nil
+				}
+			}
+		}
+	}
 }
 
 // Exec, Attach, and PortForward (the bidi streaming RPCs) are implemented in

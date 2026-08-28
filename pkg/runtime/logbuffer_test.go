@@ -31,7 +31,7 @@ func retained(l *logBuffer) (payload, accounted, lines int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, ln := range l.lines {
-		payload += len(ln)
+		payload += len(ln.line)
 	}
 	return payload, l.bytes, len(l.lines)
 }
@@ -196,8 +196,8 @@ func TestLogBufferIsBounded(t *testing.T) {
 		l.write([]byte("after-eviction"))
 		select {
 		case got := <-ch:
-			if string(got) != "after-eviction" {
-				t.Errorf("follower got %q, want %q", got, "after-eviction")
+			if string(got.line) != "after-eviction" {
+				t.Errorf("follower got %q, want %q", got.line, "after-eviction")
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("follower received nothing after eviction started")
