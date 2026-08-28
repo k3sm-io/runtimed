@@ -57,8 +57,13 @@ const (
 // policy (B99) chooses which platform of a multi-platform image is pulled. It
 // rides on the CALL, not on the Puller, because the sandbox backend that decides
 // it is resolved per pod (sandbox.SelectBackend in createPod).
+//
+// pull (M12.1) is the container's STAMPED imagePullPolicy, forwarded from the
+// PodBox exactly as the provider translated it from the apiserver-defaulted pod
+// spec. runtimed never derives it from the image tag, and never reads the
+// UNSPECIFIED zero value as anything but the legacy pull-through.
 type Puller interface {
-	Pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy) (*image.PullResult, error)
+	Pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy, pull runtimev1.ImagePullPolicy) (*image.PullResult, error)
 }
 
 // Signer ad-hoc signs a pulled binary and gates it against a SignaturePolicy
@@ -366,7 +371,11 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// image.RemoteFetch is named EXPLICITLY: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
-		p, err := image.NewPuller(cache, image.RemoteFetch)
+		// image.NoLocalIndex is the presence-by-reference binding this daemon has
+		// today: the on-disk ref->digest index is a separate deliverable, so every
+		// reference reports absent. IfNotPresent therefore behaves exactly as the
+		// legacy pull-through, and Never has no local image to run.
+		p, err := image.NewPuller(cache, image.RemoteFetch, image.NoLocalIndex{})
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)
 		}
