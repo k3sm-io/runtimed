@@ -248,7 +248,14 @@ func vmPolicyRosetta() PlatformPolicy {
 // fetcher, so every caller names the one it means.
 func mustPuller(t *testing.T, cache *Cache, fetch FetchFunc) *Puller {
 	t.Helper()
-	p, err := NewPuller(cache, fetch)
+	return mustPullerIndex(t, cache, fetch, NoLocalIndex{})
+}
+
+// mustPullerIndex is mustPuller with an explicit LocalIndex, for the tests that
+// put a reference in the "recorded on this node" state.
+func mustPullerIndex(t *testing.T, cache *Cache, fetch FetchFunc, index LocalIndex) *Puller {
+	t.Helper()
+	p, err := NewPuller(cache, fetch, index)
 	if err != nil {
 		t.Fatalf("NewPuller: %v", err)
 	}
@@ -411,7 +418,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := mustPuller(t, cache, RemoteFetch) // as runtime.New does
-		res, err := p.Pull(context.Background(), ref, nil, nativePolicy())
+		res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED)
 		if res != nil {
 			t.Errorf("a pull result was returned for an unrunnable index: %+v", res.Manifest)
 		}
@@ -420,18 +427,22 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		}
 	})
 
-	// The binding itself: a Puller has NO default fetcher to fall back to, so a
-	// caller cannot acquire one without naming which fetcher it wants.
+	// The binding itself: a Puller has NO default fetcher (and no default
+	// presence index) to fall back to, so a caller cannot acquire one without
+	// naming which fetcher and which index it wants.
 	t.Run("puller/nil_fetch_is_an_error_not_a_default", func(t *testing.T) {
 		cache, err := NewCache(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p, err := NewPuller(cache, nil); err == nil {
-			t.Errorf("NewPuller(cache, nil) returned %+v; a nil fetcher must be refused, not defaulted", p)
+		if p, err := NewPuller(cache, nil, NoLocalIndex{}); err == nil {
+			t.Errorf("NewPuller(cache, nil, NoLocalIndex{}) returned %+v; a nil fetcher must be refused, not defaulted", p)
 		}
-		if p, err := NewPuller(nil, RemoteFetch); err == nil {
-			t.Errorf("NewPuller(nil, RemoteFetch) returned %+v; a nil cache must be refused", p)
+		if p, err := NewPuller(nil, RemoteFetch, NoLocalIndex{}); err == nil {
+			t.Errorf("NewPuller(nil, RemoteFetch, NoLocalIndex{}) returned %+v; a nil cache must be refused", p)
+		}
+		if p, err := NewPuller(cache, RemoteFetch, nil); err == nil {
+			t.Errorf("NewPuller(cache, RemoteFetch, nil) returned %+v; a nil index must be refused (NoLocalIndex{} is the explicit none)", p)
 		}
 	})
 
@@ -456,7 +467,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 				p := mustPuller(t, cache, func(context.Context, string, *RegistryCredential, PlatformPolicy) (ggcrv1.Image, error) {
 					return tc.img, nil
 				})
-				res, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
+				res, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED)
 				if res != nil {
 					t.Errorf("a pull result was returned for an unrunnable image: %+v", res.Manifest)
 				}

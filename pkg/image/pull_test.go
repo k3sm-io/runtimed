@@ -68,7 +68,7 @@ func TestPullCachesAndHits(t *testing.T) {
 	}
 	p := mustPuller(t, cache, ff.fetch)
 
-	res1, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
+	res1, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("first pull: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestPullCachesAndHits(t *testing.T) {
 		}
 	}
 
-	res2, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy())
+	res2, err := p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("second pull: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 	p := mustPuller(t, cache, ff.fetch)
 
 	cred := &RegistryCredential{Username: "robot", Password: "s3cret"}
-	if _, err := p.Pull(context.Background(), "example.com/private/app:v1", cred, nativePolicy()); err != nil {
+	if _, err := p.Pull(context.Background(), "example.com/private/app:v1", cred, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED); err != nil {
 		t.Fatalf("pull with cred: %v", err)
 	}
 	if ff.lastCred == nil {

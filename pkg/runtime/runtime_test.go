@@ -252,17 +252,19 @@ func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return
 type fakePuller struct {
 	err error
 
-	mu         sync.Mutex
-	lastCred   *image.RegistryCredential
-	lastRef    string
-	lastPolicy image.PlatformPolicy
+	mu             sync.Mutex
+	lastCred       *image.RegistryCredential
+	lastRef        string
+	lastPolicy     image.PlatformPolicy
+	lastPullPolicy runtimev1.ImagePullPolicy
 }
 
-func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy) (*image.PullResult, error) {
+func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy, pull runtimev1.ImagePullPolicy) (*image.PullResult, error) {
 	f.mu.Lock()
 	f.lastRef = ref
 	f.lastCred = cred
 	f.lastPolicy = policy
+	f.lastPullPolicy = pull
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
@@ -276,6 +278,14 @@ func (f *fakePuller) policy() image.PlatformPolicy {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lastPolicy
+}
+
+// pullPolicy returns the last stamped imagePullPolicy passed to Pull, so a test
+// can assert the PodBox value reaches the puller unmodified.
+func (f *fakePuller) pullPolicy() runtimev1.ImagePullPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastPullPolicy
 }
 
 func (f *fakePuller) credential() *image.RegistryCredential {
