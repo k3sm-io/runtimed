@@ -280,8 +280,8 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 		case <-cp.proc.Done():
 			code, _, _ := cp.proc.Wait(ctx)
 			return send(&runtimev1.AttachResponse{Exit: &runtimev1.ExecResult{ExitCode: int32(code)}})
-		case line := <-follow:
-			if err := send(&runtimev1.AttachResponse{Stdout: appendNewline(line)}); err != nil {
+		case ent := <-follow:
+			if err := send(&runtimev1.AttachResponse{Stdout: appendNewline(ent.line)}); err != nil {
 				return err
 			}
 		}
