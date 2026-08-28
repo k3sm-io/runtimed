@@ -250,6 +250,16 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
 	}
+	// Give the pod dir its reachability record the moment the dir exists, even
+	// for a pod that will never pull (a native host-binary pod). The image GC
+	// reads an ABSENT record as "this pod's references are unknown" and refuses
+	// to reclaim anything at all (image.ErrRootsIncomplete), so a pod dir without
+	// one is an outage of the GC rather than a risk to the pod — but it is still
+	// an outage, and creating the record here is what keeps absence rare enough
+	// to stay a genuine anomaly.
+	if err := r.recordPodReferences(box.GetPodId()); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
+	}
 
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
 	// projected) into the pod data volume. Secrets + the projected SA-token come
@@ -1154,9 +1164,21 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// stamped it (M12.1): the puller decides Always/IfNotPresent/Never against
 	// the node's local image store, and an unset value is the legacy
 	// pull-through. Nothing here re-derives a policy from the image tag.
-	if _, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy()); err != nil {
+	res, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy())
+	if err != nil {
 		return "", nil, false, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
 	}
+	// RECORD THE ROOT, THEN RELEASE THE LEASE — in that order, and never the
+	// reverse. Pull returns with its blobs pinned by a lease precisely because
+	// they are on disk and named by nothing yet; recording the reference is what
+	// makes them reachable, so releasing first would reopen the window a
+	// concurrent reclaim deletes into. The record is what a later prune consults,
+	// the lease is what covers the instant before it exists.
+	if err := r.recordPodImage(p.box.GetPodId(), res.Manifest); err != nil {
+		res.Lease.Release()
+		return "", nil, false, err
+	}
+	res.Lease.Release()
 	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
 	// materializer lands with the rootfs format. For now argv[0] is command[0]
 	// resolved against the rootfs if relative, else as-is.
@@ -1329,10 +1351,10 @@ var errUncontainedRootfs = errors.New("rootfs_path is not the pod's derived data
 //
 // SCOPE, HONESTLY. This closes the rootfs_path DAEMON-INPUT hole only. It does
 // NOT make same-node pods mutually isolated — pods still share the daemon's uid,
-// so untrusted multi-tenancy still routes to the vm RuntimeClass. And it says
-// nothing about SandboxProfile.data_volume_path, which remains a separate,
-// producer-set, unvalidated SBPL input: do not read this as "wire paths are
-// validated".
+// so untrusted multi-tenancy still routes to the vm RuntimeClass. The sibling
+// wire path SandboxProfile.data_volume_path is validated SEPARATELY, by
+// dataVolumePath below (which accepts only this pod's own two derived
+// spellings); do not read either check as "wire paths are validated" in general.
 func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
 	id, err := image.ParsePodID(box.GetPodId())
 	if err != nil {
@@ -1409,6 +1431,42 @@ func (r *Runtime) dataVolumePath(box *runtimev1.PodBox) (string, error) {
 		return "", fmt.Errorf("%w: %q is neither %q nor %q", errUnderivedDataVolume, dataVol, podDir, rootfs)
 	}
 	return dataVol, nil
+}
+
+// recordPodReferences creates the pod's empty image-reachability record. It is
+// called as the pod dir is created; see image.Cache.EnsurePodReferences for why
+// a pod that pulls nothing still gets one.
+func (r *Runtime) recordPodReferences(podID string) error {
+	id, err := image.ParsePodID(podID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	if err := r.cache.EnsurePodReferences(id); err != nil {
+		return fmt.Errorf("record image references for pod %s: %w", podID, err)
+	}
+	return nil
+}
+
+// recordPodImage records that podID references mfst's blobs, making them
+// reachable to the image GC.
+//
+// This is the DAEMON authoring a reachability root from what it itself resolved
+// for a pod it itself created — the only provenance a root may have. The
+// manifest's registry-supplied bytes contribute the digests; they do not
+// contribute the decision that this pod references them.
+func (r *Runtime) recordPodImage(podID string, mfst *runtimev1.ImageManifest) error {
+	id, err := image.ParsePodID(podID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	root := image.ImageRoot{Reference: mfst.GetReference(), Config: mfst.GetConfig().GetDigest()}
+	for _, l := range mfst.GetLayers() {
+		root.Layers = append(root.Layers, l.GetDigest())
+	}
+	if err := r.cache.RecordPodImage(id, root); err != nil {
+		return fmt.Errorf("record image references for pod %s: %w", podID, err)
+	}
+	return nil
 }
 
 // podDir returns the per-pod directory under the cache root. It returns an error

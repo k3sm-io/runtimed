@@ -26,6 +26,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 )
@@ -43,6 +45,22 @@ const DefaultRoot = "/var/lib/k3sm"
 // race on the temp+rename and are harmless (identical content).
 type Cache struct {
 	root string
+
+	// pruneMu serializes a prune's plan+unlink against another prune. It is NOT
+	// a lock against ingest: no lock a prune can hold is also held across the
+	// pull path's commit, which is why the in-flight window is closed by a Lease
+	// (lease.go) rather than by mutual exclusion.
+	pruneMu sync.Mutex
+
+	// leaseMu guards leases and nextLease. See lease.go.
+	leaseMu   sync.Mutex
+	leases    map[uint64]*Lease
+	nextLease uint64
+
+	// now is the clock every time-dependent decision in this package reads. It
+	// is a field, not a call to time.Now, so the lease TTL and the reclaim grace
+	// window are testable without sleeping.
+	now func() time.Time
 }
 
 // NewCache returns a Cache rooted at root (DefaultRoot if empty), creating the
@@ -51,7 +69,11 @@ func NewCache(root string) (*Cache, error) {
 	if root == "" {
 		root = DefaultRoot
 	}
-	c := &Cache{root: root}
+	c := &Cache{
+		root:   root,
+		leases: make(map[uint64]*Lease),
+		now:    time.Now,
+	}
 	if err := os.MkdirAll(c.blobsDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("create image cache %s: %w", c.blobsDir(), err)
 	}

@@ -27,14 +27,22 @@ import (
 	"google.golang.org/grpc"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
 )
 
-// DefaultSocketPath is the root unix socket the k3sm-runtimed daemon listens on
-// and the k3sm provider dials. It lives under image.DefaultRoot so the runtime
-// root and its control socket share one tree. The daemon runs as root; the
-// socket is created 0600 inside a 0700 dir so only root can dial it (the
-// provider runs as the same uid — they are the same k3sm build, restarted
-// together, so there is no cross-uid IPC and no version-negotiation surface).
+// DefaultSocketPath is the unix socket the k3sm-runtimed daemon listens on and
+// the k3sm provider dials. It lives under image.DefaultRoot so the runtime root
+// and its control socket share one tree.
+//
+// SOCKET POSTURE, accurately. The socket is created 0600 inside a 0700 dir, so
+// only the DAEMON'S OWN UID can dial it. That uid is `_k3sm` in the shipped
+// install, not root (the privilege model: k3sm runs unprivileged apart from the
+// minimal netd root helper), so "only root can dial" would be false — the
+// correct statement is that the dialer must be the daemon's uid. The provider
+// runs as that same uid from the same k3sm build, restarted together, so there
+// is no cross-uid IPC and no version-negotiation surface. Every service
+// registered on this server — Runtime and Images alike — inherits exactly this
+// socket and no other.
 const DefaultSocketPath = "/var/lib/k3sm/run/runtimed.sock"
 
 // Server hosts a *Runtime behind a gRPC server on a net.Listener. It is the M2
@@ -59,6 +67,15 @@ type Server struct {
 func NewServer(rt *Runtime, opts ...grpc.ServerOption) *Server {
 	gs := grpc.NewServer(opts...)
 	runtimev1.RegisterRuntimeServer(gs, rt)
+	// ONE grpc.Server, therefore ONE listener, therefore ONE socket posture. The
+	// Images service (ListImages / ImageFsInfo / RemoveImage / PruneImages) is
+	// registered HERE, on the identical server the Runtime service is registered
+	// on, so it inherits the 0700-dir / 0600-socket permissions documented on
+	// DefaultSocketPath and cannot acquire a laxer posture of its own. A separate
+	// listener "just for the image commands" is the shape that would silently
+	// hand every local uid PruneImages; images.proto records the obligation and
+	// this line is the only place it can actually be discharged.
+	runtimev1.RegisterImagesServer(gs, &imagesService{rt: rt})
 	return &Server{rt: rt, grpc: gs, log: rt.log}
 }
 
@@ -92,6 +109,16 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 		return fmt.Errorf("reap orphaned pod process groups: %w", err)
 	}
 
+	// Start the daemon-side image GC. It is bound to a ctx cancelled when Serve
+	// returns (by the defer below), so the goroutine cannot outlive the daemon
+	// loop, and it is started AFTER the startup reconciles above so a pass can
+	// never race pod-dir reconstruction — a pod dir that has not been rebuilt yet
+	// has no reachability record, which the GC correctly reads as "refuse", but
+	// there is no reason to make it do that work.
+	gcCtx, gcCancel := context.WithCancel(ctx)
+	defer gcCancel()
+	go s.rt.RunImageGC(gcCtx, 0, image.ReclaimConfig{})
+
 	// Watch ctx: on cancellation, GracefulStop unblocks grpc.Serve. The goroutine
 	// always exits — either ctx fires (we stop, Serve returns) or Serve returns
 	// for another reason and we close stopped to release the goroutine.
@@ -124,9 +151,11 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 // safe to call concurrently with a Serve that is being torn down by ctx.
 func (s *Server) Stop() { s.grpc.GracefulStop() }
 
-// Listen creates the root unix-socket listener for the daemon at path, removing a
-// stale socket left by an unclean shutdown and tightening permissions so only the
-// owning (root) uid can dial: the parent dir is 0700 and the socket node 0600.
+// Listen creates the daemon's unix-socket listener at path, removing a stale
+// socket left by an unclean shutdown and tightening permissions so only the
+// OWNING uid can dial: the parent dir is 0700 and the socket node 0600. The
+// owning uid is whatever euid the daemon runs as — `_k3sm` in the shipped
+// install, not root; see DefaultSocketPath.
 // The caller passes the returned listener to Serve and is responsible for closing
 // it. On any error the partially-created socket is cleaned up.
 func Listen(path string) (net.Listener, error) {
