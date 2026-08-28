@@ -1492,7 +1492,7 @@ type logBuffer struct {
 	log *slog.Logger
 
 	mu    sync.Mutex
-	lines [][]byte
+	lines []logLine
 	// bytes is the accounted retention cost of lines (payload + per-line
 	// overhead), kept incrementally so write stays O(evicted) rather than
 	// O(retained).
@@ -1500,8 +1500,18 @@ type logBuffer struct {
 	droppedLines int
 	droppedBytes int
 	warned       bool
-	subs         map[int]chan []byte
+	subs         map[int]chan logLine
 	nextSub      int
+}
+
+// logLine is one retained line together with the wall-clock instant runtimed
+// received it. The timestamp is what GetLogs evaluates since_time against and
+// what it renders for the timestamps option, so it has to be captured at write
+// time: the supervisor's LogSink hands over bytes only, and nothing downstream
+// can reconstruct when a line was produced once it is sitting in the ring.
+type logLine struct {
+	at   time.Time
+	line []byte
 }
 
 const (
@@ -1519,11 +1529,14 @@ const (
 
 	// logLineOverheadBytes is charged per retained line on top of its payload,
 	// so that a flood of EMPTY lines is bounded too: without it, "0 bytes of
-	// payload" would retain unbounded lines, each still costing a []byte header
-	// in the lines slice plus a heap allocation. 48 ≈ the 24-byte slice header
-	// plus a minimum-size allocation, which also caps the retained line COUNT at
-	// logBufferMaxBytes/48. It is a retention budget, not an exact heap measure.
-	logLineOverheadBytes = 48
+	// payload" would retain unbounded lines, each still costing a logLine entry
+	// in the lines slice plus a heap allocation. 72 ≈ the 48-byte logLine entry
+	// (a 24-byte slice header plus the 24-byte time.Time stamp GetLogs filters
+	// and renders on) plus a minimum-size allocation, which also caps the
+	// retained line COUNT at logBufferMaxBytes/72. It is a retention budget, not
+	// an exact heap measure — but it must never UNDER-state the entry, or the
+	// cap above stops being the ceiling it is documented to be.
+	logLineOverheadBytes = 72
 )
 
 // newLogBuffer returns an empty bounded buffer. log receives the one-shot
@@ -1552,22 +1565,22 @@ func (l *logBuffer) write(line []byte) {
 	if maxLine := logBufferMaxBytes - logLineOverheadBytes; len(line) > maxLine {
 		line = utf8TailBytes(line, maxLine)
 	}
-	cp := make([]byte, len(line))
-	copy(cp, line)
+	ent := logLine{at: time.Now(), line: make([]byte, len(line))}
+	copy(ent.line, line)
 
 	l.mu.Lock()
-	l.lines = append(l.lines, cp)
-	l.bytes += logLineCost(cp)
+	l.lines = append(l.lines, ent)
+	l.bytes += logLineCost(ent.line)
 	// Evict oldest-first. The newest line is never evicted (len > 1): it is
 	// admitted pre-truncated to fit, so the loop always terminates within cap.
 	for l.bytes > logBufferMaxBytes && len(l.lines) > 1 {
 		evicted := l.lines[0]
-		l.bytes -= logLineCost(evicted)
+		l.bytes -= logLineCost(evicted.line)
 		l.droppedLines++
-		l.droppedBytes += len(evicted)
+		l.droppedBytes += len(evicted.line)
 		// Drop the reference before reslicing so the evicted payload is
 		// collectable immediately rather than pinned by the backing array.
-		l.lines[0] = nil
+		l.lines[0] = logLine{}
 		l.lines = l.lines[1:]
 	}
 	warn := l.droppedLines > 0 && !l.warned
@@ -1578,7 +1591,7 @@ func (l *logBuffer) write(line []byte) {
 	}
 	for _, ch := range l.subs {
 		select {
-		case ch <- cp: // cp is never mutated after this, so sharing it is safe
+		case ch <- ent: // ent.line is never mutated after this, so sharing it is safe
 		default: // slow follower: drop rather than block the supervisor's log pump
 		}
 	}
@@ -1610,11 +1623,11 @@ func utf8TailBytes(b []byte, n int) []byte {
 // and is NOT closed by cancel (the consumer — Attach — exits on its own ctx /
 // the container's Done, never on a channel close), so there is no sender/receiver
 // close race.
-func (l *logBuffer) subscribe() (<-chan []byte, func()) {
-	ch := make(chan []byte, 256)
+func (l *logBuffer) subscribe() (<-chan logLine, func()) {
+	ch := make(chan logLine, 256)
 	l.mu.Lock()
 	if l.subs == nil {
-		l.subs = make(map[int]chan []byte)
+		l.subs = make(map[int]chan logLine)
 	}
 	id := l.nextSub
 	l.nextSub++
@@ -1627,19 +1640,35 @@ func (l *logBuffer) subscribe() (<-chan []byte, func()) {
 	}
 }
 
-// snapshot returns a copy of the buffered lines, optionally only the last n.
-func (l *logBuffer) snapshot(tail int) [][]byte {
+// snapshotEntries returns a copy of the buffered lines with their timestamps,
+// optionally only the last n (the tail_lines selection, which is POSITIONAL and
+// therefore applied before any since_time filtering — the same order the kubelet
+// uses when it seeks back n lines in a log file and then drops the ones older
+// than --since).
+func (l *logBuffer) snapshotEntries(tail int) []logLine {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	start := 0
 	if tail > 0 && tail < len(l.lines) {
 		start = len(l.lines) - tail
 	}
-	out := make([][]byte, 0, len(l.lines)-start)
+	out := make([]logLine, 0, len(l.lines)-start)
 	for _, ln := range l.lines[start:] {
-		c := make([]byte, len(ln))
-		copy(c, ln)
-		out = append(out, c)
+		c := make([]byte, len(ln.line))
+		copy(c, ln.line)
+		out = append(out, logLine{at: ln.at, line: c})
+	}
+	return out
+}
+
+// snapshot returns a copy of the buffered lines, optionally only the last n, for
+// the callers that need the bytes alone (the attach replay and the termination
+// message).
+func (l *logBuffer) snapshot(tail int) [][]byte {
+	ents := l.snapshotEntries(tail)
+	out := make([][]byte, len(ents))
+	for i, e := range ents {
+		out[i] = e.line
 	}
 	return out
 }
