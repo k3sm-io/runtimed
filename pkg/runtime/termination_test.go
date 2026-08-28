@@ -78,7 +78,7 @@ func startTermProc(t *testing.T, name, payload string, w supervisor.ExitWaiter, 
 // leaked-grandchild case) instead of the EOF-on-exit pipeSpawner.
 func startTermProcSpawner(t *testing.T, name string, spawner supervisor.Spawner, w supervisor.ExitWaiter, decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
 	t.Helper()
-	logs := newLogBuffer()
+	logs := newLogBuffer(nil)
 	var sink supervisor.LogSink = logs.write
 	if decorate != nil {
 		sink = decorate(logs.write)
@@ -382,7 +382,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 	// term.Message is valid UTF-8 (a sliced multi-byte rune would corrupt it), while
 	// still honoring the byte cap.
 	t.Run("utf8-tail-cut-rounds-to-rune-boundary", func(t *testing.T) {
-		logs := newLogBuffer()
+		logs := newLogBuffer(nil)
 		// One line of 3-byte runes longer than the byte cap, so the last-2048-byte cut
 		// lands INSIDE a rune (2048 % 3 != 0): the naive slice would start on a UTF-8
 		// continuation byte.

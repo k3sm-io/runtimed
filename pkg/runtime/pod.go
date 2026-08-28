@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -696,7 +697,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
-	logs := newLogBuffer()
+	logs := newLogBuffer(r.log.With("pod", p.box.GetPodId(), "container", c.GetName()))
 	spec := supervisor.SpawnSpec{
 		Path: shimPath,
 		Argv: shimArgv,
@@ -887,17 +888,12 @@ func terminationMessageFromLogs(logs *logBuffer) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	msg := bytes.Join(lines, []byte("\n"))
-	if len(msg) > maxTerminationMessageLogBytes {
-		msg = msg[len(msg)-maxTerminationMessageLogBytes:]
-		// The byte-count tail cut can land inside a multi-byte UTF-8 rune, leaving
-		// orphan continuation bytes at the front. Advance to the next rune boundary
-		// so term.Message is valid UTF-8 — this only ever TRIMS, so the <=2048-byte
-		// cap still holds (the tail end, the most diagnostic bytes, is untouched).
-		for len(msg) > 0 && !utf8.RuneStart(msg[0]) {
-			msg = msg[1:]
-		}
-	}
+	// The byte-count tail cut can land inside a multi-byte UTF-8 rune, leaving
+	// orphan continuation bytes at the front, so it goes through utf8TailBytes
+	// (shared with logBuffer.write's oversized-line admission): term.Message stays
+	// valid UTF-8, and because the rounding only ever TRIMS, the <=2048-byte cap
+	// still holds (the tail end, the most diagnostic bytes, is untouched).
+	msg := utf8TailBytes(bytes.Join(lines, []byte("\n")), maxTerminationMessageLogBytes)
 	return string(msg)
 }
 
@@ -1466,26 +1462,120 @@ func hasPersistentVolume(box *runtimev1.PodBox) bool {
 // logBuffer is an in-memory ring of a container's combined output for GetLogs,
 // plus a set of live followers (Attach) that receive lines as they are written.
 //
-// Concurrency: mu guards lines AND subs; write (the supervisor.LogSink, called
-// from the supervisor's pump goroutine) appends under mu and fans out to each
-// follower under the same lock; a follower's cancel removes it under mu. So a
-// follower never receives after cancel and the log pump never blocks (a slow
-// follower drops lines rather than stalling the pump).
+// Bounded by BYTES, not by line count (logBufferMaxBytes): the retention budget
+// has to be denominated in the resource it protects. A line-count cap is not a
+// memory bound at all — the supervisor's pump admits a single token up to 1 MiB
+// (supervisor.pumpLogs' bufio.Scanner max), so "keep the last 5000 lines" is
+// "keep up to 5 GiB" in the worst case, and to make the count safe you would have
+// to shrink it until an ordinary 80-byte-per-line pod loses its useful tail. The
+// byte cap bounds both shapes with one number, and it is the unit the read side
+// already speaks (GetLogsRequest.limit_bytes in k3sm.io/apis).
+//
+// Eviction is true ring behaviour: the OLDEST lines go first, so the newest
+// output — the part `kubectl logs` and the FallbackToLogsOnError termination
+// message are actually asked for — always survives. A reader is NOT told that
+// eviction happened: LogEntry carries no truncation marker (that would be an
+// apis change), and synthesizing a "N lines dropped" line into the stream would
+// be indistinguishable from container output, which is worse than silence. The
+// signal instead goes to the OPERATOR: the first eviction on a buffer logs one
+// warning naming the pod/container (once per buffer — the pump calls write per
+// line and a chatty pod would otherwise flood the daemon log).
+//
+// Concurrency: mu guards lines, bytes, the drop counters AND subs; write (the
+// supervisor.LogSink, called from the supervisor's pump goroutine) appends under
+// mu, evicts under mu, and fans out to each follower under the same lock; a
+// follower's cancel removes it under mu. So a follower never receives after
+// cancel and the log pump never blocks (a slow follower drops lines rather than
+// stalling the pump; the one-shot eviction warning is emitted after the unlock,
+// so logging never widens the critical section).
 type logBuffer struct {
-	mu      sync.Mutex
-	lines   [][]byte
-	subs    map[int]chan []byte
-	nextSub int
+	log *slog.Logger
+
+	mu    sync.Mutex
+	lines [][]byte
+	// bytes is the accounted retention cost of lines (payload + per-line
+	// overhead), kept incrementally so write stays O(evicted) rather than
+	// O(retained).
+	bytes        int
+	droppedLines int
+	droppedBytes int
+	warned       bool
+	subs         map[int]chan []byte
+	nextSub      int
 }
 
-func newLogBuffer() *logBuffer { return &logBuffer{} }
+const (
+	// logBufferMaxBytes is the accounted retention budget for ONE container's
+	// buffer. 256 KiB is chosen against both ends of the trade: a chatty pod
+	// emitting ~100-byte lines still keeps ~2.5k lines of tail — far more than
+	// the 80-line termination message or a typical `kubectl logs --tail` window
+	// — while the NODE-wide worst case stays affordable, which is the failure
+	// this bound exists to prevent: runtimed holds one buffer per container of
+	// every pod on the node, so at the upstream default of 110 pods with two
+	// containers each the ceiling is ~55 MiB of daemon heap. A 1 MiB cap would
+	// make that same ceiling ~220 MiB of unpageable heap in the daemon whose
+	// death takes every pod's supervision with it, to buy tail nobody reads.
+	logBufferMaxBytes = 256 << 10
 
-// write appends a line (the supervisor.LogSink) and fans it out to live followers.
+	// logLineOverheadBytes is charged per retained line on top of its payload,
+	// so that a flood of EMPTY lines is bounded too: without it, "0 bytes of
+	// payload" would retain unbounded lines, each still costing a []byte header
+	// in the lines slice plus a heap allocation. 48 ≈ the 24-byte slice header
+	// plus a minimum-size allocation, which also caps the retained line COUNT at
+	// logBufferMaxBytes/48. It is a retention budget, not an exact heap measure.
+	logLineOverheadBytes = 48
+)
+
+// newLogBuffer returns an empty bounded buffer. log receives the one-shot
+// warning emitted when the buffer first evicts (nil = no warning; the caller
+// should pass a logger already tagged with the pod and container).
+func newLogBuffer(log *slog.Logger) *logBuffer {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &logBuffer{log: log}
+}
+
+// logLineCost is a retained line's charge against logBufferMaxBytes.
+func logLineCost(line []byte) int { return len(line) + logLineOverheadBytes }
+
+// write appends a line (the supervisor.LogSink), evicts the oldest lines until
+// the buffer is back within logBufferMaxBytes, and fans the new line out to live
+// followers.
 func (l *logBuffer) write(line []byte) {
+	// A single line can exceed the whole budget (the pump admits up to 1 MiB).
+	// Evicting everything else would still leave the buffer over cap, so an
+	// oversized line is stored truncated to its TAIL — the same bias
+	// terminationMessageFromLogs applies, for the same reason (the most recent
+	// bytes are the most diagnostic), and with the same rune-boundary rounding
+	// so the retained bytes stay valid UTF-8.
+	if maxLine := logBufferMaxBytes - logLineOverheadBytes; len(line) > maxLine {
+		line = utf8TailBytes(line, maxLine)
+	}
 	cp := make([]byte, len(line))
 	copy(cp, line)
+
 	l.mu.Lock()
 	l.lines = append(l.lines, cp)
+	l.bytes += logLineCost(cp)
+	// Evict oldest-first. The newest line is never evicted (len > 1): it is
+	// admitted pre-truncated to fit, so the loop always terminates within cap.
+	for l.bytes > logBufferMaxBytes && len(l.lines) > 1 {
+		evicted := l.lines[0]
+		l.bytes -= logLineCost(evicted)
+		l.droppedLines++
+		l.droppedBytes += len(evicted)
+		// Drop the reference before reslicing so the evicted payload is
+		// collectable immediately rather than pinned by the backing array.
+		l.lines[0] = nil
+		l.lines = l.lines[1:]
+	}
+	warn := l.droppedLines > 0 && !l.warned
+	var droppedLines, droppedBytes int
+	if warn {
+		l.warned = true
+		droppedLines, droppedBytes = l.droppedLines, l.droppedBytes
+	}
 	for _, ch := range l.subs {
 		select {
 		case ch <- cp: // cp is never mutated after this, so sharing it is safe
@@ -1493,6 +1583,26 @@ func (l *logBuffer) write(line []byte) {
 		}
 	}
 	l.mu.Unlock()
+
+	if warn {
+		l.log.Warn("container log buffer full; oldest output evicted",
+			"cap_bytes", logBufferMaxBytes,
+			"dropped_lines", droppedLines, "dropped_bytes", droppedBytes)
+	}
+}
+
+// utf8TailBytes returns the last n bytes of b, advanced to the next UTF-8 rune
+// start so the result never begins with orphan continuation bytes (this only
+// ever trims, so the n-byte bound still holds).
+func utf8TailBytes(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	b = b[len(b)-n:]
+	for len(b) > 0 && !utf8.RuneStart(b[0]) {
+		b = b[1:]
+	}
+	return b
 }
 
 // subscribe registers a follower that receives lines written AFTER the call,
