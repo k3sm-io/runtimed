@@ -20,8 +20,15 @@ OUT="${OUT_DIR}/libk3sm_pathrebase_shim.dylib"
 
 mkdir -p "$OUT_DIR"
 
+# arm64 + x86_64 universal (fat) dylib so it loads regardless of the pod binary's
+# arch: dyld HARD-TERMINATES a process whose DYLD_INSERT_LIBRARIES library lacks a
+# slice for that process's architecture, so an arm64-only shim would kill a
+# darwin/amd64 pod payload running under Rosetta rather than merely skip path
+# rebasing. Asserted on the built Mach-O by pkg/runtime TestPathShimIsUniversalBinary
+# -- assert the ARTIFACT, never these flags, since flags drift from comments.
 clang \
   -arch arm64 \
+  -arch x86_64 \
   -dynamiclib \
   -fPIC \
   -O2 \
