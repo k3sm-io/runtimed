@@ -214,6 +214,18 @@ type PullResult struct {
 	// CacheHit is true when the config and all layers were already cached (no
 	// blob was newly written) — i.e. a second pull of the same content.
 	CacheHit bool
+
+	// Lease pins this result's blobs against image GC and is returned HELD. The
+	// caller releases it once it has recorded the reference that makes those
+	// blobs reachable (Cache.RecordPodImage) — not before, or the window between
+	// "the blob is on disk" and "something names it" reopens, and that is exactly
+	// the window a concurrent reclaim would delete into.
+	//
+	// It is nil-safe: Release on a nil *Lease is a no-op, so a caller that fails
+	// before recording, or a test that ignores the field, needs no branch. An
+	// unreleased lease EXPIRES (DefaultLeaseTTL) rather than pinning the store
+	// forever, so forgetting it costs a bounded delay in reclaim, never a leak.
+	Lease *Lease
 }
 
 // ErrImageNotPresent is the decided verdict for a reference that is not present
@@ -326,7 +338,7 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex) (*Puller, error)
 // here already decided. A second derivation point would be free to disagree with
 // the stamped spec, and `kubectl get pod -o yaml` would stop describing what the
 // node did.
-func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy, pull runtimev1.ImagePullPolicy) (*PullResult, error) {
+func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy, pull runtimev1.ImagePullPolicy) (_ *PullResult, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -346,13 +358,14 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT ||
 		pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
-		mfst, present, err := p.presentLocally(ctx, ref, policy)
+		mfst, lease, present, err := p.presentLocally(ctx, ref, policy)
 		if err != nil {
 			return nil, err
 		}
 		if present {
-			// No blob was written and no registry was contacted.
-			return &PullResult{Manifest: mfst, CacheHit: true}, nil
+			// No blob was written and no registry was contacted. The lease comes
+			// back HELD — see PullResult.Lease.
+			return &PullResult{Manifest: mfst, CacheHit: true, Lease: lease}, nil
 		}
 		if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
 			return nil, fmt.Errorf("image %q: %w", ref, ErrImageNotPresent)
@@ -386,6 +399,20 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err != nil {
 		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
 	}
+
+	// LEASE THE WHOLE DIGEST SET before a single blob is even looked at — not
+	// before the first WRITE. CommitBlob returns (false, nil) on a cache hit
+	// without touching the file, so a blob this pull depends on can already be
+	// present, already be old, and be named by nothing: deletable by a concurrent
+	// reclaim during the very pull that needs it. The caller releases the lease
+	// after it records the reference (PullResult.Lease); a failure below releases
+	// it here, since a pull that returns an error records nothing.
+	lease := p.cache.AcquireLease(manifestDescriptorDigests(mfst), 0)
+	defer func() {
+		if retErr != nil {
+			lease.Release()
+		}
+	}()
 
 	// Config blob.
 	rawCfg, err := img.RawConfigFile()
@@ -438,7 +465,20 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		out.Layers = append(out.Layers, descriptorFromGGCR(desc))
 	}
 
-	return &PullResult{Manifest: out, CacheHit: !wroteAny}, nil
+	return &PullResult{Manifest: out, CacheHit: !wroteAny, Lease: lease}, nil
+}
+
+// manifestDescriptorDigests is every blob digest a go-containerregistry manifest
+// names (config + layers), read from the MANIFEST DESCRIPTORS — the same values
+// the blobs are committed under, so the lease and the commits structurally cannot
+// name different content.
+func manifestDescriptorDigests(mfst *ggcrv1.Manifest) []string {
+	out := make([]string, 0, len(mfst.Layers)+1)
+	out = append(out, mfst.Config.Digest.String())
+	for _, l := range mfst.Layers {
+		out = append(out, l.Digest.String())
+	}
+	return out
 }
 
 // presentLocally reports whether ref is on this node for policy's platform: the
@@ -450,23 +490,48 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 // would otherwise start a container whose layers are gone — so a recorded
 // reference with missing blobs is a MISS, which sends IfNotPresent back to the
 // registry and fails Never honestly.
-func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
+func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, *Lease, bool, error) {
 	mfst, ok, err := p.index.Lookup(ctx, ref, policy)
 	if err != nil {
-		return nil, false, fmt.Errorf("image index lookup %q: %w", ref, err)
+		return nil, nil, false, fmt.Errorf("image index lookup %q: %w", ref, err)
 	}
 	if !ok || mfst == nil {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
+	// LEASE BEFORE THE PRESENCE CHECK, not after it. This path writes nothing at
+	// all, so there is no commit to hang a pin on and no mtime change for a grace
+	// window to notice: the blobs are old, present, and — until the caller records
+	// the reference — named by nothing. Checking presence first and leasing second
+	// would leave the whole check-then-use interval open to a reclaim that deletes
+	// the very blobs just found present.
+	lease := p.cache.AcquireLease(manifestDigests(mfst), 0)
 	if !p.cache.Has(mfst.GetConfig().GetDigest()) {
-		return nil, false, nil
+		lease.Release()
+		return nil, nil, false, nil
 	}
 	for _, l := range mfst.GetLayers() {
 		if !p.cache.Has(l.GetDigest()) {
-			return nil, false, nil
+			lease.Release()
+			return nil, nil, false, nil
 		}
 	}
-	return mfst, true, nil
+	return mfst, lease, true, nil
+}
+
+// manifestDigests is every blob digest a resolved manifest names — the config
+// plus the layers, which is exactly what the content-addressed store holds for an
+// image (the manifest itself is never committed as a blob).
+func manifestDigests(mfst *runtimev1.ImageManifest) []string {
+	out := make([]string, 0, len(mfst.GetLayers())+1)
+	if d := mfst.GetConfig().GetDigest(); d != "" {
+		out = append(out, d)
+	}
+	for _, l := range mfst.GetLayers() {
+		if d := l.GetDigest(); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // writeBlob commits the blob for digest via fill, verifying the bytes against
