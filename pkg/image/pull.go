@@ -216,29 +216,80 @@ type PullResult struct {
 	CacheHit bool
 }
 
-// Puller pulls OCI images into a Cache using a FetchFunc.
+// ErrImageNotPresent is the decided verdict for a reference that is not present
+// on this node under a policy that forbids fetching it (IMAGE_PULL_POLICY_NEVER).
+// No registry round trip has been made when it is returned.
+//
+// It is deliberately a PLAIN sentinel and not a classified pull failure: the
+// kubelet waiting-reason taxonomy (ErrImageNeverPull and its siblings) is a
+// separate deliverable that consumes this sentinel with errors.Is — the wrapped
+// chain out of Pull is the contract it builds on.
+var ErrImageNotPresent = errors.New("image not present locally and the pull policy forbids fetching it")
+
+// LocalIndex answers presence-BY-REFERENCE for the node: it records which
+// references have been resolved locally, keyed (reference x platform), which the
+// content-addressed blob store cannot answer on its own (blobs are keyed by
+// digest, and a reference resolves to a digest only by asking a registry).
+//
+// It is a consumer-side seam, per the standards: the Puller states what it needs
+// to decide IfNotPresent/Never, and the on-disk index that implements it is a
+// separate deliverable (M12.1-d1). NoLocalIndex is the binding until it lands.
+type LocalIndex interface {
+	// Lookup returns the manifest recorded for ref under policy's platform, and
+	// ok=false when the reference has not been recorded.
+	//
+	// An index that cannot be READ returns an error, which is NOT a miss: a miss
+	// would fail Never for an image that is present, and would send an
+	// IfNotPresent pod to the registry at exactly the moment the operator asked
+	// it not to go. The caller propagates the error instead.
+	Lookup(ctx context.Context, ref string, policy PlatformPolicy) (manifest *runtimev1.ImageManifest, ok bool, err error)
+}
+
+// NoLocalIndex is the LocalIndex that records nothing: every reference is absent.
+//
+// It is the honest production binding until the on-disk index (M12.1-d1) exists,
+// and it is named rather than a nil check so the call site that has no index says
+// so. Its consequences are the safe ones: IfNotPresent degrades to the legacy
+// pull-through (identical to today's behavior), and Never — which by definition
+// never fetches — has no local image to run and fails with ErrImageNotPresent.
+type NoLocalIndex struct{}
+
+// Lookup reports every reference absent.
+func (NoLocalIndex) Lookup(context.Context, string, PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
+	return nil, false, nil
+}
+
+// Puller pulls OCI images into a Cache using a FetchFunc, honoring the
+// per-container imagePullPolicy against a LocalIndex.
 type Puller struct {
 	cache *Cache
 	fetch FetchFunc
+	index LocalIndex
 }
 
-// NewPuller returns a Puller writing into cache and fetching via fetch.
+// NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
+// presence-by-reference via index.
 //
-// Both arguments are REQUIRED: a nil fetch is an error, never a silent default
-// to RemoteFetch. Which fetcher runs is the decision that chooses which
+// All three arguments are REQUIRED: a nil fetch is an error, never a silent
+// default to RemoteFetch. Which fetcher runs is the decision that chooses which
 // platform's bytes land in the cache, so it is spelled out at the call site that
 // makes it (runtime.New passes image.RemoteFetch) rather than substituted here.
 // An implicit default is the exact shape of bug this package exists to remove —
 // and it also hides the binding from tests, which then cannot tell a production
-// wiring from a mis-wiring.
-func NewPuller(cache *Cache, fetch FetchFunc) (*Puller, error) {
+// wiring from a mis-wiring. index is required for the same reason: a caller with
+// no index passes NoLocalIndex explicitly, so "this node cannot decide presence
+// by reference yet" is stated rather than inferred from a nil field.
+func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex) (*Puller, error) {
 	if cache == nil {
 		return nil, errors.New("image puller: cache is required")
 	}
 	if fetch == nil {
 		return nil, errors.New("image puller: fetch is required (the production fetcher is image.RemoteFetch)")
 	}
-	return &Puller{cache: cache, fetch: fetch}, nil
+	if index == nil {
+		return nil, errors.New("image puller: index is required (pass image.NoLocalIndex{} when the node has none)")
+	}
+	return &Puller{cache: cache, fetch: fetch, index: index}, nil
 }
 
 // Pull fetches ref and stores its config + layer blobs in the content-addressed
@@ -254,21 +305,60 @@ func NewPuller(cache *Cache, fetch FetchFunc) (*Puller, error) {
 // fetched image's own config is verified against the policy before a single blob
 // is written, so the cache never holds bytes this node cannot run. The blob CAS
 // is unaffected — digests are already per-platform.
-func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (*PullResult, error) {
+//
+// pull is the container's stamped imagePullPolicy and is OBEYED AS GIVEN:
+//
+//   - ALWAYS re-resolves the reference on every call, even for a reference this
+//     node already has (cached blobs are still reused; it is the resolution that
+//     must be fresh);
+//   - IF_NOT_PRESENT returns the locally recorded image with ZERO registry
+//     traffic, and falls through to a pull only on a miss — so a warm node
+//     starts pods through a registry outage;
+//   - NEVER makes no fetch attempt at all: a locally absent reference is
+//     ErrImageNotPresent;
+//   - UNSPECIFIED is the legacy pull-through — the pre-M12 behavior, which is
+//     what an old provider that never stamps the field must keep getting. It is
+//     never read as an implicit NEVER.
+//
+// This function NEVER derives a policy from the image tag. Defaulting
+// (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
+// it on the pod spec; the provider forwards that value verbatim and it arrives
+// here already decided. A second derivation point would be free to disagree with
+// the stamped spec, and `kubectl get pod -o yaml` would stop describing what the
+// node did.
+func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy, pull runtimev1.ImagePullPolicy) (*PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	// The policy is resolved BEFORE any round trip (a zero policy fails closed
-	// with no network at all), and the image's own config is verified against it
-	// HERE — at the choke point every pull traverses — not only inside one
-	// FetchFunc. RemoteFetch verifies it too, because it is exported and
-	// independently callable; but a FetchFunc is a SEAM, and a fetcher that
-	// omits the check (or a test fake that returns a platform-less image) must
-	// not be able to put foreign-platform bytes in the cache.
+	// with no network at all) AND before the presence decision, so an invalid
+	// platform policy is refused on every path rather than only the fetching
+	// ones. The image's own config is verified against it HERE — at the choke
+	// point every pull traverses — not only inside one FetchFunc. RemoteFetch
+	// verifies it too, because it is exported and independently callable; but a
+	// FetchFunc is a SEAM, and a fetcher that omits the check (or a test fake
+	// that returns a platform-less image) must not be able to put
+	// foreign-platform bytes in the cache.
 	want, err := Candidates(policy)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
+
+	if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT ||
+		pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
+		mfst, present, err := p.presentLocally(ctx, ref, policy)
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			// No blob was written and no registry was contacted.
+			return &PullResult{Manifest: mfst, CacheHit: true}, nil
+		}
+		if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
+			return nil, fmt.Errorf("image %q: %w", ref, ErrImageNotPresent)
+		}
+	}
+
 	img, err := p.fetch(ctx, ref, cred, policy)
 	if err != nil {
 		return nil, err
@@ -349,6 +439,34 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	}
 
 	return &PullResult{Manifest: out, CacheHit: !wroteAny}, nil
+}
+
+// presentLocally reports whether ref is on this node for policy's platform: the
+// index must have recorded it AND every blob its manifest names must still be in
+// the content-addressed store.
+//
+// The second half is not belt-and-braces. Presence-by-reference and the bytes
+// have independent lifetimes (the cache GC evicts blobs), and a stale index entry
+// would otherwise start a container whose layers are gone — so a recorded
+// reference with missing blobs is a MISS, which sends IfNotPresent back to the
+// registry and fails Never honestly.
+func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
+	mfst, ok, err := p.index.Lookup(ctx, ref, policy)
+	if err != nil {
+		return nil, false, fmt.Errorf("image index lookup %q: %w", ref, err)
+	}
+	if !ok || mfst == nil {
+		return nil, false, nil
+	}
+	if !p.cache.Has(mfst.GetConfig().GetDigest()) {
+		return nil, false, nil
+	}
+	for _, l := range mfst.GetLayers() {
+		if !p.cache.Has(l.GetDigest()) {
+			return nil, false, nil
+		}
+	}
+	return mfst, true, nil
 }
 
 // writeBlob commits the blob for digest via fill, verifying the bytes against

@@ -30,6 +30,8 @@ import (
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/random"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 // ---------------------------------------------------------------------------
@@ -538,7 +540,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		c, _ := deepCache(t)
 		p := mustPuller(t, c, ff.fetch)
 
-		res, err := p.Pull(context.Background(), "example.com/lying:v1", nil, nativePolicy())
+		res, err := p.Pull(context.Background(), "example.com/lying:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED)
 		if !errors.Is(err, ErrDigestMismatch) {
 			t.Fatalf("Pull(lying layer) = (%+v, %v), want ErrDigestMismatch", res, err)
 		}
@@ -584,7 +586,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		c, _ := deepCache(t)
 		p := mustPuller(t, c, ff.fetch)
 
-		res, err := p.Pull(context.Background(), "example.com/arity:v1", nil, nativePolicy())
+		res, err := p.Pull(context.Background(), "example.com/arity:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED)
 		if !errors.Is(err, ErrManifestInconsistent) {
 			t.Fatalf("Pull(layer-count divergence) = (%+v, %v), want ErrManifestInconsistent", res, err)
 		}

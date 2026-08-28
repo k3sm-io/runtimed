@@ -128,3 +128,41 @@ func pushPlatformImage(t *testing.T, host, repo, os, arch string) string {
 	}
 	return ref.String()
 }
+
+// TestPullPolicyForwardedToPuller pins the runtimed half of the M12.1 skew
+// contract: the container's STAMPED imagePullPolicy reaches the puller exactly
+// as the PodBox carried it, and an unset field arrives as UNSPECIFIED (the
+// legacy pull-through) rather than being re-derived from the tag.
+//
+// Every case uses a `:latest` reference — the tag whose corev1 default is
+// Always — so a re-derivation anywhere on this path would show up as a policy
+// the PodBox never stamped.
+func TestPullPolicyForwardedToPuller(t *testing.T) {
+	for _, want := range []runtimev1.ImagePullPolicy{
+		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED,
+		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
+		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
+		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
+	} {
+		t.Run(want.String(), func(t *testing.T) {
+			pull := &fakePuller{}
+			rt := newTestRuntime(t, Deps{Puller: pull})
+			p := &pod{
+				box:     hostBinBox(rt, "pod-pullpolicy"),
+				backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC,
+			}
+			c := &runtimev1.Container{
+				Name:            "app",
+				Image:           "example.com/app:latest",
+				Command:         []string{"/app"}, // command set → the image is pulled
+				ImagePullPolicy: want,
+			}
+			if _, _, _, err := rt.resolveBinary(context.Background(), p, t.TempDir(), c); err != nil {
+				t.Fatalf("resolveBinary: %v", err)
+			}
+			if got := pull.pullPolicy(); got != want {
+				t.Errorf("puller received pull policy %v, want %v", got, want)
+			}
+		})
+	}
+}

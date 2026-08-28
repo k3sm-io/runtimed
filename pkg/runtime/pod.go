@@ -1150,7 +1150,11 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 
 	// Pull + materialize the image into the pod rootfs, then run command/args.
-	if _, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend)); err != nil {
+	// The container's imagePullPolicy is forwarded exactly as the provider
+	// stamped it (M12.1): the puller decides Always/IfNotPresent/Never against
+	// the node's local image store, and an unset value is the legacy
+	// pull-through. Nothing here re-derives a policy from the image tag.
+	if _, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy()); err != nil {
 		return "", nil, false, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
 	}
 	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
