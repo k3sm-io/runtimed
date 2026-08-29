@@ -40,7 +40,7 @@ import (
 //	10 GiB  DefaultReclaimTargetFreeBytes  reclaim stops here
 //	 5 GiB  DefaultReclaimHighFreeBytes    reclaim STARTS here
 //	 3 GiB  DefaultPullRefuseFreeBytes     new pulls are REFUSED here
-//	 2 GiB  (B27's proposed node DiskPressure floor)  the node is tainted here
+//	 2 GiB  (the proposed node DiskPressure floor)  the node is tainted here
 //
 // The ordering is the design: the GC gets a 2 GiB window to reclaim before any
 // pod is denied its image, and pull refusal gets a further 1 GiB window to stop
@@ -53,7 +53,7 @@ import (
 // against the reclaim constants by symbol rather than trusting the numbers here.
 //
 // 3 GiB is a reasoned round number in that window, not a measured one; it is
-// the figure most likely to want lab tuning, alongside B27's 2 GiB.
+// the figure most likely to want lab tuning, alongside the DiskPressure floor.
 const DefaultPullRefuseFreeBytes uint64 = 3 << 30 // 3 GiB
 
 // ErrPullRefusedDiskPressure reports that a pull was refused BEFORE any registry
@@ -114,7 +114,7 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 // or Never serve is never affected, and no code path can acquire new content
 // without passing here.
 //
-// RECORDED RESIDUAL, not fixed here: the ingest path (LoadImage, B117-B121)
+// RECORDED RESIDUAL, not fixed here: the ingest path (LoadImage and the image-load CLI)
 // writes the same store without traversing this function, so an operator
 // streaming a tarball can still fill the volume. That path is not a pull and its
 // admission is its own item's business.
