@@ -37,6 +37,12 @@ import (
 // moves as sibling volumes grow. An absolute floor states the invariant that
 // actually matters on a single Mac — leave the kine datastore sharing this volume
 // this many bytes of headroom.
+//
+// They are the top two rungs of a ladder whose lower rungs are
+// DefaultPullRefuseFreeBytes and B27's node DiskPressure floor; the ordering
+// between them is the design, and it is stated once, at
+// DefaultPullRefuseFreeBytes. Changing either value here without reading that
+// comment can invert it.
 const (
 	DefaultReclaimHighFreeBytes   uint64 = 5 << 30  // 5 GiB
 	DefaultReclaimTargetFreeBytes uint64 = 10 << 30 // 10 GiB
