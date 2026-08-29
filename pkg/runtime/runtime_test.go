@@ -365,6 +365,14 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Shrink the post-SIGKILL exit-observation bound for the unit tier. Every
+	// escalating stop now WAITS for the reaper to report the exit (B40), and most
+	// tests here drive a fake waiter they never release for a killed container —
+	// which is the bound's timeout arm, at its production 2s, once per such stop.
+	// The production default is pinned by TestExitObservationGraceDefault and the
+	// waiting behaviour itself is gated in pkg/supervisor, so shrinking it here
+	// hides nothing; a test that needs the real value sets the field back.
+	rt.exitObsGrace = 50 * time.Millisecond
 	return rt
 }
 
