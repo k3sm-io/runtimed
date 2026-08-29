@@ -143,7 +143,8 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		wg.Add(1)
 		go func(proc *supervisor.Process, pid int) {
 			defer wg.Done()
-			escalated, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(), termSignal, killSignal, r.signalGroup)
+			escalated, observed, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
+				termSignal, killSignal, r.signalGroup, r.exitObservationGrace())
 			if err != nil {
 				r.log.Warn("graceful stop pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
 			}
@@ -152,6 +153,16 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			// grace (SIGTERM honored). Localizes a slow delete to runtimed vs the caller.
 			r.log.Info("pod container graceful-stop outcome",
 				"pod", req.GetPodId(), "pid", pid, "grace", grace.String(), "escalated", escalated)
+			// observed=false means the reaper did not report the exit within the
+			// observation bound, so the p.cancel below CAN still preempt it and the
+			// container's terminated status may read "context canceled" for a group
+			// the daemon SIGKILLed. The cancel is never dropped for it (a pod whose
+			// process refuses to die must not wedge teardown), so this line is the
+			// only record that the status which follows is not trustworthy.
+			if !observed {
+				r.log.Warn("pod container exit not observed before teardown deadline",
+					"pod", req.GetPodId(), "pid", pid, "bound", r.exitObservationGrace().String())
+			}
 		}(proc, pid)
 	}
 	wg.Wait()
@@ -159,14 +170,21 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// Phase 2 (M10.2): stop the native sidecars in REVERSE start order with the
 	// budget's remainder — mains first, then their support processes, mirroring
 	// the kubelet's KEP-753 termination order. A remainder <= 0 (the mains ran
-	// the budget out) is the immediate-SIGKILL path.
+	// the budget out) is the immediate-SIGKILL path — which now includes the case
+	// where a main's post-SIGKILL exit-observation wait ran past the budget: the
+	// grace window is the workload's promise, and a main that had to be killed
+	// and then waited for has already spent it.
 	r.stopSidecars(ctx, req.GetPodId(), sidecars, deadline)
 
 	// End the pod-lifetime supervision context AFTER the graceful stop: the reapers
-	// have collected the real exits (GracefulStop observed proc.Done), so canceling
-	// now only unblocks any watchContainerExit drain-wait still in flight — it must
-	// NOT precede GracefulStop, or a grace>0 container would be seen as exited and
-	// never SIGKILLed. Fired here it mirrors p.memCancel: pod teardown, no leak.
+	// have collected the real exits — GracefulStop now WAITS for each observation
+	// (bounded by exitObservationGrace) rather than merely racing it, so canceling
+	// here only unblocks any watchContainerExit drain-wait still in flight instead
+	// of preempting a reaper mid-kill. It must NOT precede GracefulStop, or a
+	// grace>0 container would be seen as exited and never SIGKILLed. Fired here it
+	// mirrors p.memCancel: pod teardown, no leak. On the bound's expiry (logged
+	// above) the cancel still fires: teardown must never hang on a process that
+	// refuses to die.
 	if p.cancel != nil {
 		p.cancel()
 	}
