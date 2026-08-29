@@ -60,9 +60,11 @@ func TestCreatePodOOMKilled(t *testing.T) {
 	}
 }
 
-// TestCreatePodNoLimitNoOOM confirms a pod with no memory limit runs no sampler
-// and is never OOMKilled even with a huge footprint (metering is limit-driven in
-// M2; existing no-limit pods are unaffected).
+// TestCreatePodNoLimitNoOOM confirms a pod with no memory limit is METERED but
+// never OOMKilled, even with a huge footprint: the limit selects enforcement, not
+// metering (supervisor.NewMemorySampler with limitBytes == 0 is meter-only and can
+// never fire onBreach), so `kubectl top` covers unlimited pods — which is most of
+// them — without ever killing one.
 func TestCreatePodNoLimitNoOOM(t *testing.T) {
 	w := newBlockingWaiter()
 	ff := runtimeFakeFootprinter{bytes: 64 << 20}
@@ -78,8 +80,8 @@ func TestCreatePodNoLimitNoOOM(t *testing.T) {
 	if rec.sawKill() {
 		t.Error("a pod without a memory limit must not be OOMKilled")
 	}
-	if _, ok := rt.PodMetrics("pod-nolimit"); ok {
-		t.Error("a pod without a memory limit has no sampler, so PodMetrics is ok=false")
+	if _, ok := rt.PodMetrics("pod-nolimit"); !ok {
+		t.Error("a pod without a memory limit must still be metered (PodMetrics ok=true)")
 	}
 	w.release(1001)
 }

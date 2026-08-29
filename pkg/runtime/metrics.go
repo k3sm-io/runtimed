@@ -84,10 +84,11 @@ type PodMetrics struct {
 	Timestamp time.Time
 }
 
-// PodMetrics returns the latest memory sample for podID. ok is false when the pod
-// is unknown or has no memory sampler (no memory limit set — only limited pods are
-// metered in M2; broadening to all pods awaits the apis Summary message so the
-// metering posture and the wire type land together).
+// PodMetrics returns the latest memory sample for podID. ok is false only when the
+// pod is unknown or its sampler was never armed (the anti-stranding refusal for an
+// unregistered pod). EVERY pod is metered — the memory limit selects OOM
+// enforcement, not metering, so an unlimited pod is reported like any other rather
+// than silently omitted from `kubectl top` (see armMemorySampler).
 func (r *Runtime) PodMetrics(podID string) (PodMetrics, bool) {
 	r.mu.Lock()
 	p, found := r.pods[podID]
