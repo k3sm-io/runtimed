@@ -415,6 +415,53 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 			t.Errorf("plan condemns %+v, want nothing: a pod root protects these blobs", plan.Delete)
 		}
 	})
+
+	// The two legs above pin the PURE layers (Roots, PlanPrune). This leg pins the
+	// COMPOSED production path: a "helpfully" index-aware ReclaimUnderPressure —
+	// protection injected at the call site rather than in Roots — would pass both
+	// pure legs and still ship the regression. Found by an orchestrator mutation
+	// that did exactly that and stayed green against the pure legs.
+	t.Run("the_production_reclaim_deletes_index_named_blobs_end_to_end", func(t *testing.T) {
+		cache, idx := newIndexedCache(t)
+		mfst := primeIndexedPull(t, cache, idx, ref, nativePolicy())
+
+		rep, err := cache.ReclaimUnderPressure(context.Background(), ReclaimConfig{
+			HighFreeBytes:   100,
+			TargetFreeBytes: 150,
+			Grace:           1, // nanosecond: nothing is saved by age
+			Force:           true,
+			FreeBytes:       func(string) (uint64, error) { return 10, nil },
+		})
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		want := map[string]bool{mfst.GetConfig().GetDigest(): false}
+		for _, l := range mfst.GetLayers() {
+			want[l.GetDigest()] = false
+		}
+		for _, d := range rep.Removed {
+			if _, ok := want[d]; ok {
+				want[d] = true
+			}
+		}
+		for d, removed := range want {
+			if !removed {
+				t.Errorf("index-named blob %s survived the production reclaim — an index entry must never protect content", d)
+			}
+		}
+		// And composed presence now answers honestly: the record remains (Lookup's
+		// contract is "is there a record"), but the Puller's presence check sees the
+		// evicted blobs — so Never fails with ErrImageNotPresent and no fetch happens.
+		off := &offlineFetch{}
+		p := mustPullerIndex(t, cache, off.fetch, idx)
+		if _, err := p.Pull(context.Background(), ref, nil, nativePolicy(),
+			runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER); !errors.Is(err, ErrImageNotPresent) {
+			t.Errorf("Never after reclaim: err = %v, want ErrImageNotPresent", err)
+		}
+		if off.calls != 0 {
+			t.Errorf("Never performed %d fetches; want zero registry traffic", off.calls)
+		}
+	})
 }
 
 // newIndexedCache returns a fresh cache and the on-disk index over it.
