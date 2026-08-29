@@ -232,10 +232,10 @@ func TestPodProcRecordRoundTrip(t *testing.T) {
 		ProcStartTime: func(int) (int64, bool) { return 55, true },
 	})
 
-	if err := rt.recordPodProc("pod-a", "main", 4242); err != nil {
+	if _, err := rt.recordPodProc("pod-a", "main", 4242); err != nil {
 		t.Fatalf("recordPodProc: %v", err)
 	}
-	if err := rt.recordPodProc("pod-x", "main", 1); err == nil {
+	if _, err := rt.recordPodProc("pod-x", "main", 1); err == nil {
 		t.Fatal("recordPodProc(pgid=1) must be refused")
 	}
 	// A malformed record file must be quarantined, not break listing.
@@ -362,7 +362,7 @@ func seedPodProcRecord(t *testing.T, rt *Runtime, rec podProcRecord) {
 	t.Helper()
 	saved := rt.procStart
 	rt.procStart = func(int) (int64, bool) { return rec.StartUnixNano, true }
-	if err := rt.recordPodProc(rec.PodID, rec.Container, rec.Pgid); err != nil {
+	if _, err := rt.recordPodProc(rec.PodID, rec.Container, rec.Pgid); err != nil {
 		t.Fatal(err)
 	}
 	rt.procStart = saved

@@ -218,6 +218,9 @@ func lastTerminationState(oldCP *containerProc, code, sig int, startedAt *timest
 		Message:    reqReason,
 		StartedAt:  startedAt,
 		FinishedAt: nowProto(),
+		// The PREDECESSOR's id: this state describes the run being replaced, so
+		// it carries oldCP's identity — never the replacement's.
+		ContainerId: oldCP.state.GetContainerId(),
 	}}
 }
 

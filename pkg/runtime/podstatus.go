@@ -55,8 +55,15 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 // mirrors (M2.2/M2.3) are carried through losslessly. The caller holds pod.mu.
 func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 	st := &runtimev1.ContainerStatus{
-		Name:                 cp.state.GetName(),
-		Image:                cp.state.GetImage(),
+		Name:  cp.state.GetName(),
+		Image: cp.state.GetImage(),
+		// The identity pair: image_id is the pulled image's config digest (empty
+		// on the host-binary routes, which have no manifest — see
+		// resolvedBinary.imageID), container_id is derived from the container's
+		// reap record (podProcRecord.containerID). Both are stamped at spawn and
+		// carried through verbatim; nothing is re-derived at status time.
+		ImageId:              cp.state.GetImageId(),
+		ContainerId:          cp.state.GetContainerId(),
 		State:                cp.state.GetState(),
 		Ready:                cp.state.GetState().GetRunning() != nil,
 		RestartCount:         cp.state.GetRestartCount(),
