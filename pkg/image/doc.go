@@ -35,6 +35,14 @@ limitations under the License.
 //     against the digest its MANIFEST DESCRIPTOR claims before it is committed —
 //     see Cache.CommitBlob, the single home of that invariant, and the ceiling
 //     below.
+//   - Record: write the (reference x platform) -> manifest entry to the on-disk
+//     index (index.go) once the pull has fully succeeded, so this node can
+//     answer presence BY REFERENCE — which the digest-keyed blob store cannot.
+//     That record is what makes imagePullPolicy IfNotPresent serve a warm
+//     reference with zero registry traffic and Never satisfiable at all. Index
+//     entries are EDGES, never reachability roots: they can never protect a blob
+//     from the GC, whose root set stays daemon-authored (see FileIndex,
+//     ImageRoot).
 //   - Materialize: copy the cached payload into the per-pod rootfs using APFS
 //     copy-on-write via golang.org/x/sys/unix.Clonefile. The cache and pod
 //     rootfs MUST be on the same APFS volume for the clone to succeed; on EXDEV

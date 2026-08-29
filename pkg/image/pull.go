@@ -243,9 +243,13 @@ var ErrImageNotPresent = errors.New("image not present locally and the pull poli
 // content-addressed blob store cannot answer on its own (blobs are keyed by
 // digest, and a reference resolves to a digest only by asking a registry).
 //
-// It is a consumer-side seam, per the standards: the Puller states what it needs
-// to decide IfNotPresent/Never, and the on-disk index that implements it is a
-// separate deliverable (M12.1-d1). NoLocalIndex is the binding until it lands.
+// It is a consumer-side seam, per the standards: the Puller states exactly what
+// it needs to decide IfNotPresent/Never and to keep the record current.
+// FileIndex is the production implementation; NoLocalIndex is the explicit
+// "this node records nothing".
+//
+// Its entries are EDGES, never reachability roots — see FileIndex — so an
+// implementation may never be consulted by the image GC.
 type LocalIndex interface {
 	// Lookup returns the manifest recorded for ref under policy's platform, and
 	// ok=false when the reference has not been recorded.
@@ -255,20 +259,39 @@ type LocalIndex interface {
 	// IfNotPresent pod to the registry at exactly the moment the operator asked
 	// it not to go. The caller propagates the error instead.
 	Lookup(ctx context.Context, ref string, policy PlatformPolicy) (manifest *runtimev1.ImageManifest, ok bool, err error)
+
+	// Record records that ref resolved to manifest for platform.
+	//
+	// The Puller calls it ONLY after a pull has fully succeeded, with the
+	// manifest IT resolved and verified and after every blob was committed. That
+	// is the contract that keeps a recorded reference honest: an index written
+	// from anything else — bytes re-fetched at lookup time, a manifest recorded
+	// before its blobs landed — could report an image present that this node
+	// never verified.
+	Record(ctx context.Context, ref string, platform Platform, manifest *runtimev1.ImageManifest) error
 }
 
 // NoLocalIndex is the LocalIndex that records nothing: every reference is absent.
 //
-// It is the honest production binding until the on-disk index (M12.1-d1) exists,
-// and it is named rather than a nil check so the call site that has no index says
-// so. Its consequences are the safe ones: IfNotPresent degrades to the legacy
-// pull-through (identical to today's behavior), and Never — which by definition
-// never fetches — has no local image to run and fails with ErrImageNotPresent.
+// The daemon's production binding is FileIndex; this one is for a caller that
+// deliberately keeps no record (an ingest path with no presence question to
+// answer, a test that wants the cold-node behavior). It is named rather than a
+// nil check so such a call site says so. Its consequences are the safe ones:
+// IfNotPresent degrades to the legacy pull-through (identical to the pre-M12
+// behavior), and Never — which by definition never fetches — has no local image
+// to run and fails with ErrImageNotPresent.
 type NoLocalIndex struct{}
 
 // Lookup reports every reference absent.
 func (NoLocalIndex) Lookup(context.Context, string, PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
 	return nil, false, nil
+}
+
+// Record discards the record. Under-recording is the SAFE direction — it can
+// only send a pull to the registry that a record would have served locally, and
+// can never make presence lie.
+func (NoLocalIndex) Record(context.Context, string, Platform, *runtimev1.ImageManifest) error {
+	return nil
 }
 
 // Puller pulls OCI images into a Cache using a FetchFunc, honoring the
@@ -380,7 +403,12 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
 	}
-	if _, err := VerifyConfigPlatform(cfg, want); err != nil {
+	// The platform the image's OWN config declares, as verified against this
+	// pod's candidates — that is the half of the index key the reference does not
+	// carry, and taking it from the verifier means the recorded key can only ever
+	// be a platform this pull proved runnable here.
+	resolved, err := VerifyConfigPlatform(cfg, want)
+	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
 
@@ -463,6 +491,25 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		}
 		wroteAny = wroteAny || wrote
 		out.Layers = append(out.Layers, descriptorFromGGCR(desc))
+	}
+
+	// Record the reference LAST: every blob it names is now committed and
+	// digest-verified, and the manifest recorded is the one this pull resolved —
+	// never bytes re-read at lookup time. Recording earlier would let a lookup
+	// answer "present" for a pull that had not finished writing.
+	//
+	// The entry is an EDGE, not a root (see FileIndex): it makes nothing
+	// reachable, so it neither replaces the lease nor delays its release, and a
+	// blob it names is still reclaimable the moment no pod records it.
+	//
+	// A failed record FAILS THE PULL. The blobs are on disk and re-pulling is
+	// idempotent, so nothing is lost; and the two ways this can fail — the index
+	// tree is unwritable, or it is not the tree this daemon owns
+	// (ErrIndexNotOwned) — are exactly the conditions under which a LOOKUP must
+	// not be believed either. Continuing would keep serving pods from an index
+	// this daemon has just discovered it cannot maintain.
+	if err := p.index.Record(ctx, ref, resolved, out); err != nil {
+		return nil, fmt.Errorf("pull %q: record image index: %w", ref, err)
 	}
 
 	return &PullResult{Manifest: out, CacheHit: !wroteAny, Lease: lease}, nil
