@@ -29,15 +29,19 @@ import (
 )
 
 // fakeIndex is a LocalIndex whose whole state is an in-memory map, so a test can
-// put a reference in the "recorded locally" state without an on-disk index (the
-// index itself is M12.1-d1). It can fail, because "the index could not be read"
-// is deliberately NOT a miss.
+// put a reference in the "recorded locally" state directly. It keeps THIS
+// table about the puller's policy branching: the on-disk index's own rules
+// (platform keying, corruption, ownership) are gated by
+// TestRefDigestIndexDecidesPresence, which drives the real FileIndex. It can
+// fail, because "the index could not be read" is deliberately NOT a miss.
 type fakeIndex struct {
 	entries map[string]*runtimev1.ImageManifest
 	err     error
 	// lastPolicy records the platform policy the key was resolved under — the
 	// index is keyed (reference x platform), so the policy must reach it.
 	lastPolicy PlatformPolicy
+	// records counts Record calls: a successful pull must keep the index current.
+	records int
 }
 
 func (f *fakeIndex) Lookup(_ context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
@@ -47,6 +51,14 @@ func (f *fakeIndex) Lookup(_ context.Context, ref string, policy PlatformPolicy)
 	}
 	m, ok := f.entries[ref]
 	return m, ok, nil
+}
+
+// Record mirrors Lookup's ref-only keying: the platform half is asserted through
+// the real index, not here.
+func (f *fakeIndex) Record(_ context.Context, ref string, _ Platform, mfst *runtimev1.ImageManifest) error {
+	f.records++
+	f.entries[ref] = mfst
+	return nil
 }
 
 // offlineFetch is a FetchFunc that fails the way a blackholed network fails. Any
@@ -288,9 +300,11 @@ func TestPullPolicyHonored(t *testing.T) {
 		}
 	})
 
-	// NoLocalIndex is the production binding until M12.1-d1 lands. It reports
-	// every reference absent, so IfNotPresent degrades to today's pull-through
-	// (safe) and Never has nothing to run.
+	// NoLocalIndex is the explicit "this caller keeps no record" binding (the
+	// daemon's own binding is the on-disk FileIndex). It reports every reference
+	// absent, so IfNotPresent degrades to the pre-M12 pull-through (safe) and
+	// Never has nothing to run — the cold-node behavior, which must stay
+	// reachable and unchanged.
 	t.Run("no_local_index_reports_absent", func(t *testing.T) {
 		cache, err := NewCache(t.TempDir())
 		if err != nil {

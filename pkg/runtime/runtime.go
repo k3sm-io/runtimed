@@ -371,11 +371,18 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// image.RemoteFetch is named EXPLICITLY: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
-		// image.NoLocalIndex is the presence-by-reference binding this daemon has
-		// today: the on-disk ref->digest index is a separate deliverable, so every
-		// reference reports absent. IfNotPresent therefore behaves exactly as the
-		// legacy pull-through, and Never has no local image to run.
-		p, err := image.NewPuller(cache, image.RemoteFetch, image.NoLocalIndex{})
+		// The on-disk ref->digest index is the presence-by-reference binding: it
+		// records what THIS daemon pulled and verified, which is what makes
+		// IfNotPresent serve a warm reference with no registry traffic and Never
+		// satisfiable at all. It is constructed here — not lazily on first use —
+		// so a node whose index tree is missing, substituted, or not owned by this
+		// daemon (image.ErrIndexNotOwned) fails at startup with one clear error
+		// instead of one per pod.
+		index, err := image.NewFileIndex(cache)
+		if err != nil {
+			return nil, fmt.Errorf("init image index: %w", err)
+		}
+		p, err := image.NewPuller(cache, image.RemoteFetch, index)
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)
 		}
