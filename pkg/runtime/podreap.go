@@ -17,6 +17,8 @@ limitations under the License.
 package runtime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -96,6 +99,41 @@ type podProcRecord struct {
 	StartUnixNano int64 `json:"startUnixNano"`
 }
 
+// containerID derives the container's PUBLISHED identity — ContainerStatus.
+// container_id — from this record.
+//
+// It is a DERIVATION of the reap record's exact-instance identity, never a
+// second identity scheme. (Pgid, StartUnixNano) is already the pair this daemon
+// trusts to authorize a root SIGKILL of a process group, so an id computed from
+// anything else could disagree with it, and a disagreement between "the id I
+// published" and "the group I am willing to signal" is invisible until it aims a
+// signal at a recycled pgid. Deriving both from one record makes that
+// disagreement unreachable: a pgid the kernel recycled has a strictly different
+// leader start, so it yields a different id.
+//
+// The derivation is ONE-WAY (sha256, hex) on purpose. A pod's status is readable
+// by anyone holding pods/get, so publishing the host pgid verbatim would be host
+// process-table disclosure from a root daemon. The hash is stable for the life of
+// the incarnation, unique per (pod, container, incarnation), and reveals nothing
+// about the host. It is an OPAQUE identifier — nothing may parse it back.
+//
+// The fields are NUL-separated so no pair of distinct inputs can concatenate to
+// the same string (a container legitimately named "a\x00b" is impossible: names
+// are validated k8s identifiers).
+//
+// A record whose StartUnixNano is 0 (the child died between spawn and record)
+// still yields an id: the value is a display identity, and a container that never
+// reached a stable incarnation is about to report terminated anyway.
+func (rec podProcRecord) containerID() string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		rec.PodID,
+		rec.Container,
+		strconv.Itoa(rec.Pgid),
+		strconv.FormatInt(rec.StartUnixNano, 10),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
 // procStartTime reports a live process's kernel start time in unix nanoseconds
 // (the leader identity recorded at spawn). ok is false when the process does
 // not exist or its start time cannot be read.
@@ -133,9 +171,15 @@ func (r *Runtime) podReapDir(podID string) (string, error) {
 // the spawn is acknowledged to the caller (CreatePod's return). Write failure
 // fails the container start: an unrecorded pod process would be invisible to
 // the startup reap, which is exactly the orphan class this file closes.
-func (r *Runtime) recordPodProc(podID, container string, pgid int) error {
+//
+// It returns the record it wrote so the caller can derive the container's
+// PUBLISHED identity (podProcRecord.containerID) from the very same
+// (pgid, leader start) pair the reap will later match on. Returning it — rather
+// than letting the caller re-probe the process table — is what makes a
+// disagreement between the two structurally impossible.
+func (r *Runtime) recordPodProc(podID, container string, pgid int) (podProcRecord, error) {
 	if pgid <= 1 {
-		return fmt.Errorf("refusing to record pod %s process group with pgid %d (must be > 1)", podID, pgid)
+		return podProcRecord{}, fmt.Errorf("refusing to record pod %s process group with pgid %d (must be > 1)", podID, pgid)
 	}
 	start, ok := r.procStart(pgid)
 	if !ok {
@@ -146,24 +190,24 @@ func (r *Runtime) recordPodProc(podID, container string, pgid int) error {
 	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start}
 	dir, err := r.podReapDir(podID)
 	if err != nil {
-		return fmt.Errorf("reap record dir for pod %s: %w", podID, err)
+		return podProcRecord{}, fmt.Errorf("reap record dir for pod %s: %w", podID, err)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create reap record dir for pod %s: %w", podID, err)
+		return podProcRecord{}, fmt.Errorf("create reap record dir for pod %s: %w", podID, err)
 	}
 	data, err := json.Marshal(rec)
 	if err != nil {
-		return fmt.Errorf("marshal reap record for pod %s: %w", podID, err)
+		return podProcRecord{}, fmt.Errorf("marshal reap record for pod %s: %w", podID, err)
 	}
 	final := filepath.Join(dir, strconv.Itoa(pgid)+".json")
 	tmp := final + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write reap record for pod %s: %w", podID, err)
+		return podProcRecord{}, fmt.Errorf("write reap record for pod %s: %w", podID, err)
 	}
 	if err := os.Rename(tmp, final); err != nil {
-		return fmt.Errorf("commit reap record for pod %s: %w", podID, err)
+		return podProcRecord{}, fmt.Errorf("commit reap record for pod %s: %w", podID, err)
 	}
-	return nil
+	return rec, nil
 }
 
 // removePodProcRecord drops a container's process-group record once its group

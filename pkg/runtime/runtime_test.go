@@ -251,6 +251,10 @@ func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return
 // pull client.
 type fakePuller struct {
 	err error
+	// manifest, when set, is what Pull returns — so a test can control the
+	// resolved CONFIG digest a status must publish as image_id (B132). Nil keeps
+	// the historical empty manifest.
+	manifest *runtimev1.ImageManifest
 
 	mu             sync.Mutex
 	lastCred       *image.RegistryCredential
@@ -265,11 +269,15 @@ func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCre
 	f.lastCred = cred
 	f.lastPolicy = policy
 	f.lastPullPolicy = pull
+	mfst := f.manifest
 	f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &image.PullResult{Manifest: &runtimev1.ImageManifest{}, CacheHit: true}, nil
+	if mfst == nil {
+		mfst = &runtimev1.ImageManifest{}
+	}
+	return &image.PullResult{Manifest: mfst, CacheHit: true}, nil
 }
 
 // policy returns the last platform policy passed to Pull, so a test can assert
