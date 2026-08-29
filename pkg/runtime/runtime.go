@@ -205,6 +205,12 @@ type Runtime struct {
 	// for fast, deterministic runs — there is no clock seam in this package.
 	drainGrace time.Duration
 
+	// exitObsGrace bounds every graceful stop's post-SIGKILL wait for the kqueue
+	// reaper's exit observation (supervisor.GracefulStop); 0 selects
+	// supervisor.DefaultExitObservationGrace. A field for the same reason
+	// drainGrace is one: tests shrink it, there being no clock seam here.
+	exitObsGrace time.Duration
+
 	// netReconcileOnce/netReconcileErr make the optional network startup
 	// reconcile (NetworkReconciler) run exactly once per Runtime, BEFORE any
 	// CreatePod is served. Once.Do provides the happens-before for the error
@@ -523,6 +529,19 @@ func (r *Runtime) drainGraceDuration() time.Duration {
 		return r.drainGrace
 	}
 	return defaultDrainGrace
+}
+
+// exitObservationGrace is the bounded post-SIGKILL wait every graceful stop
+// gives the kqueue reaper to report the exit before the teardown continues
+// (Runtime.exitObsGrace, default supervisor.DefaultExitObservationGrace). It is
+// what keeps a SIGKILLed container's terminated status honest: the pod-lifetime
+// cancel that follows a stop would otherwise be able to preempt the reaper and
+// record "context canceled" for a process the daemon killed (B40).
+func (r *Runtime) exitObservationGrace() time.Duration {
+	if r.exitObsGrace > 0 {
+		return r.exitObsGrace
+	}
+	return supervisor.DefaultExitObservationGrace
 }
 
 // defaultSigner is the production Signer backed by the image package's codesign

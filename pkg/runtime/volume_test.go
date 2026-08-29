@@ -58,7 +58,11 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := &recordingSignalGroup{}
+	// The SIGKILL hook releases the fake reaper for the signalled pid, so the
+	// fake behaves like a real process group: it dies when killed. DeletePod now
+	// WAITS for the reaper's exit observation before returning (B40), so a fake
+	// that never reports the exit would spend the full observation bound here.
+	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
 
 	const podID = "pod-pvc"
@@ -114,11 +118,11 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 		t.Fatalf("write did not land in the persistent dir: %q", got)
 	}
 
-	// Tear the pod down (grace 0 → immediate SIGKILL recorded; release the reaper).
+	// Tear the pod down (grace 0 → immediate SIGKILL; the onKill hook above lets
+	// the fake reaper report the exit, as a killed group would).
 	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: podID}); err != nil {
 		t.Fatalf("DeletePod: %v", err)
 	}
-	w.release(1001)
 
 	// The PV dir + its contents SURVIVE teardown (lifecycle-decoupled, Retain).
 	if got, err := os.ReadFile(persisted); err != nil || string(got) != "durable" {
@@ -155,5 +159,4 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-pvc-2"}); err != nil {
 		t.Fatalf("DeletePod 2: %v", err)
 	}
-	w.release(1002)
 }

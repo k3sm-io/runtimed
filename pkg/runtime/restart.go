@@ -77,7 +77,8 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	grace := graceDuration(req.GetGracePeriodSeconds(), p)
 	var oldCode, oldSig int
 	if oldPID := oldProc.PID(); oldPID > 0 {
-		if _, err := supervisor.GracefulStop(ctx, oldPID, grace, oldProc.Done(), termSignal, killSignal, r.signalGroup); err != nil {
+		if _, _, err := supervisor.GracefulStop(ctx, oldPID, grace, oldProc.Done(),
+			termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
 			r.log.Warn("restart: graceful stop", "pod", req.GetPodId(), "container", oldCP.name, "pid", oldPID, "err", err)
 		}
 		select {

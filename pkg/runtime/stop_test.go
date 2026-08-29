@@ -21,6 +21,9 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -161,4 +164,21 @@ func TestDeletePodGracefulStop(t *testing.T) {
 			t.Errorf("signals = %v, want SIGTERM first (PodBox grace honored)", got)
 		}
 	})
+}
+
+// TestExitObservationGraceDefault pins the post-SIGKILL observation bound's
+// production default. The shared test helper shrinks the field (see
+// newTestRuntimeCfg), so without this the daemon could ship a zero — which
+// GracefulStop reads as "use its own default" today, but which no longer states
+// the runtime's own intent — or a value nobody chose.
+func TestExitObservationGraceDefault(t *testing.T) {
+	rt := newTestRuntime(t, Deps{})
+	rt.exitObsGrace = 0
+	if got := rt.exitObservationGrace(); got != supervisor.DefaultExitObservationGrace {
+		t.Errorf("exitObservationGrace = %v, want %v", got, supervisor.DefaultExitObservationGrace)
+	}
+	rt.exitObsGrace = 7 * time.Millisecond
+	if got := rt.exitObservationGrace(); got != 7*time.Millisecond {
+		t.Errorf("exitObservationGrace = %v, want the field override", got)
+	}
 }
