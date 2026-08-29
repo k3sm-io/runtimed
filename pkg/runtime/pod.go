@@ -680,14 +680,14 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // kqueue reaper, and the watchContainerExit drain-wait to the pod's lifetime so they
 // survive the unary RPC's return under the daemon split.
 func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
-	binPath, argv, hostBinary, err := r.resolveBinary(ctx, p, rootfs, c)
+	rb, err := r.resolveBinary(ctx, p, rootfs, c)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err
 	}
 
 	// Enforce the signature policy in the correct order relative to ad-hoc signing
 	// (M2.6), BEFORE exec. A host binary is never ad-hoc re-signed (hostBinary).
-	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), binPath, hostBinary); err != nil {
+	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rb.path, rb.hostBinary); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
@@ -697,7 +697,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// itself if BestEffort, confines itself to the profile, and then execs the pod
 	// binary — in that irreversible order (M2.3/B7). env is preserved.
 	cred := resolveCredential(p.box, c)
-	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, argv, resolveLaunchSpec(p.box, cred))
+	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, rb.argv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
@@ -722,6 +722,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
+			// The image's CONTENT identity (config digest), empty on the two
+			// host-binary routes — see resolvedBinary.imageID.
+			ImageId: rb.imageID,
 			State: &runtimev1.ContainerState{
 				Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()},
 			},
@@ -746,12 +749,20 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// across a daemon death — exactly the hole the record exists to close. The
 	// just-spawned group is torn down through the injected seam (not a direct
 	// supervisor call) so the failure path is unit-observable.
-	if err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID()); err != nil {
+	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID())
+	if err != nil {
 		_ = r.signalGroup(proc.PID(), killSignal)
 		_ = cleanup()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("record container %s process group: %w", c.GetName(), err)
 	}
+
+	// Publish this incarnation's identity, DERIVED from the reap record just
+	// written (podProcRecord.containerID) — the same (pgid, leader start) pair the
+	// reap matches on, never a second scheme. Written here, before the reaper
+	// goroutine below exists, so cp is still owned solely by this goroutine and no
+	// lock is needed; every later reader takes pod.mu.
+	cp.state.ContainerId = rec.containerID()
 
 	// Reap-completion goroutine: when the container exits, record terminated
 	// state, clean up the staged profile, and publish a status update. It runs under
@@ -810,6 +821,12 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 		ExitCode:   int32(code),
 		Signal:     int32(sig),
 		FinishedAt: nowProto(),
+		// THIS container's own id — the incarnation that just died. The
+		// terminated mirror is read as the identity of the run being reported, so
+		// it must never be filled from a live containerProc that replaced it: a
+		// successor's id published as the predecessor's is exactly the confusion
+		// CRI container ids exist to prevent.
+		ContainerId: cp.state.GetContainerId(),
 	}
 	switch {
 	case p.oomKilled && (sig != 0 || code != 0):
@@ -1112,21 +1129,47 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 // convention below (there the image itself is the path; here command[0] is).
 const NativeImage = "native"
 
+// resolvedBinary is what resolveBinary determined for one container: the on-disk
+// executable to confine, its argv, whether it is a host binary, and the image
+// identity to publish for it.
+type resolvedBinary struct {
+	// path is the on-disk executable to confine and spawn.
+	path string
+	// argv is the child's argument vector (argv[0] is path).
+	argv []string
+	// hostBinary reports whether path is a HOST binary (the native sentinel or
+	// the empty-command host-path convention) rather than a pulled-image payload.
+	// A host binary is already validly signed and lives at a read-only host path,
+	// so it must NEVER be ad-hoc re-signed (see gateSignature).
+	hostBinary bool
+	// imageID is the pulled image's CONFIG DIGEST ("<algo>:<hex>") — the
+	// per-platform content identity of the image this container runs, and what
+	// ContainerStatus.image_id publishes. It comes from the manifest the pull
+	// path itself resolved and verified (every blob is checked against that
+	// manifest's descriptors at commit), so it is never re-derived from registry
+	// bytes at status time.
+	//
+	// It is EMPTY, and that is CORRECT, for both host-binary routes: the native
+	// sentinel and the absolute-host-path convention run an already-present host
+	// executable with no registry round trip and no manifest at all, so there is
+	// no content digest to report. An empty image_id degrades visibly (kubectl
+	// shows a blank IMAGE ID); a substitute — the mutable image reference, a
+	// synthesized value — would be a lie in a content-addressable field, which is
+	// strictly worse: a scanner or admission-audit tool resolves the WRONG
+	// artifact and never knows.
+	imageID string
+}
+
 // resolveBinary determines the pod binary path + argv for a container. M1
 // convention (mirrors the proto): if command+args are empty the image reference
 // is the host binary path; if the image is the "native" sentinel the command runs
 // in place as a host binary; otherwise the image is pulled+materialized and argv =
-// command+args. The returned path is the on-disk executable to confine.
+// command+args.
 //
-// hostBinary reports whether the resolved binary is a HOST binary (the native
-// sentinel or the empty-command host-path convention) rather than a pulled-image
-// payload. A host binary is already validly signed and lives at a read-only host
-// path, so it must NEVER be ad-hoc re-signed (see gateSignature) — only a pulled,
-// possibly-unsigned image payload in the writable pod rootfs is ad-hoc signed.
 // p supplies BOTH the PodBox (for the imagePullSecret lookup) and the RESOLVED
 // sandbox backend the pull's image-platform policy is derived from — see
 // pullPolicy and the pod.backend field.
-func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container) (path string, argv []string, hostBinary bool, err error) {
+func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container) (resolvedBinary, error) {
 	cmd := c.GetCommand()
 
 	// Native HostProcess sentinel: run command[0] as an absolute host binary with
@@ -1134,29 +1177,31 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// it would otherwise fall through and fail trying to fetch docker.io/library/native.
 	if c.GetImage() == NativeImage {
 		if len(cmd) == 0 {
-			return "", nil, false, fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage)
+			return resolvedBinary{}, fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage)
 		}
 		bin := cmd[0]
 		if !filepath.IsAbs(bin) {
-			return "", nil, false, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
+			return resolvedBinary{}, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
 		}
-		return bin, append(append([]string{}, cmd...), c.GetArgs()...), true, nil
+		// No manifest exists on this route, so imageID stays empty (see the field).
+		return resolvedBinary{path: bin, argv: append(append([]string{}, cmd...), c.GetArgs()...), hostBinary: true}, nil
 	}
 
 	if len(cmd) == 0 && len(c.GetArgs()) == 0 {
 		// Host-binary convention: image is an absolute path run in place.
 		bin := c.GetImage()
 		if !filepath.IsAbs(bin) {
-			return "", nil, false, fmt.Errorf("container %s: image %q is not an absolute host path and no command given", c.GetName(), bin)
+			return resolvedBinary{}, fmt.Errorf("container %s: image %q is not an absolute host path and no command given", c.GetName(), bin)
 		}
-		return bin, []string{bin}, true, nil
+		// No manifest exists on this route either — imageID stays empty.
+		return resolvedBinary{path: bin, argv: []string{bin}, hostBinary: true}, nil
 	}
 
 	// Resolve the imagePullSecret credential (M2.6) via the consumer-side seam. It
 	// is passed ONLY to the pull client below and is NEVER written to the pod dir.
 	cred, err := r.pullCredential(ctx, p.box, c.GetImage())
 	if err != nil {
-		return "", nil, false, err
+		return resolvedBinary{}, err
 	}
 
 	// Pull + materialize the image into the pod rootfs, then run command/args.
@@ -1166,7 +1211,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// pull-through. Nothing here re-derives a policy from the image tag.
 	res, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy())
 	if err != nil {
-		return "", nil, false, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
+		return resolvedBinary{}, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
 	}
 	// RECORD THE ROOT, THEN RELEASE THE LEASE — in that order, and never the
 	// reverse. Pull returns with its blobs pinned by a lease precisely because
@@ -1176,7 +1221,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// the lease is what covers the instant before it exists.
 	if err := r.recordPodImage(p.box.GetPodId(), res.Manifest); err != nil {
 		res.Lease.Release()
-		return "", nil, false, err
+		return resolvedBinary{}, err
 	}
 	res.Lease.Release()
 	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
@@ -1186,9 +1231,17 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	if !filepath.IsAbs(bin) {
 		bin = filepath.Join(rootfs, bin)
 	}
-	argv = append(append([]string{}, cmd...), c.GetArgs()...)
+	argv := append(append([]string{}, cmd...), c.GetArgs()...)
 	argv[0] = bin
-	return bin, argv, false, nil
+	// The CONFIG digest, not the index digest and not the reference: it is the
+	// per-platform content identity (the same value a containerd-backed kubelet
+	// reports), whereas an index digest is shared by every platform of a
+	// multi-platform image and a reference is a mutable tag. Both alternatives
+	// would resolve the WRONG artifact in a field consumers read as
+	// content-addressable. It is the digest recorded as this pod's reachability
+	// root (recordPodImage above, image.ImageRoot.Config), so status and GC name
+	// the same blob.
+	return resolvedBinary{path: bin, argv: argv, imageID: res.Manifest.GetConfig().GetDigest()}, nil
 }
 
 // pullPolicy is the image-platform policy for a pull, built from the pod's

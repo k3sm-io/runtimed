@@ -71,13 +71,13 @@ func TestDefaultPullerPlatformWiring(t *testing.T) {
 			}
 			p := &pod{box: hostBinBox(rt, "pod-wiring"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 			c := &runtimev1.Container{Name: "app", Image: ref, Command: []string{"/app"}}
-			bin, _, _, rerr := rt.resolveBinary(context.Background(), p, t.TempDir(), c)
+			rb, rerr := rt.resolveBinary(context.Background(), p, t.TempDir(), c)
 			if !tc.wantErr {
 				if rerr != nil {
 					t.Fatalf("resolveBinary: %v", rerr)
 				}
-				if bin != "/app" {
-					t.Errorf("bin = %q, want /app", bin)
+				if rb.path != "/app" {
+					t.Errorf("bin = %q, want /app", rb.path)
 				}
 				return
 			}
@@ -157,7 +157,7 @@ func TestPullPolicyForwardedToPuller(t *testing.T) {
 				Command:         []string{"/app"}, // command set → the image is pulled
 				ImagePullPolicy: want,
 			}
-			if _, _, _, err := rt.resolveBinary(context.Background(), p, t.TempDir(), c); err != nil {
+			if _, err := rt.resolveBinary(context.Background(), p, t.TempDir(), c); err != nil {
 				t.Fatalf("resolveBinary: %v", err)
 			}
 			if got := pull.pullPolicy(); got != want {
