@@ -38,6 +38,43 @@ type Footprinter interface {
 	Footprint(pid int) (bytes uint64, err error)
 }
 
+// RUsage is ONE proc_pid_rusage(RUSAGE_INFO_V2) sample: the memory footprint and
+// the cumulative CPU time, read out of the SAME kernel struct by the SAME call.
+// Reading both from one sample is the point — a stats snapshot whose memory and
+// CPU came from two calls would straddle two instants, and the extra call would
+// double the per-container syscall cost of every scrape.
+type RUsage struct {
+	// PhysFootprintBytes is ri_phys_footprint — identical to Footprint's value
+	// (NOT RSS; see the Footprinter doc).
+	PhysFootprintBytes uint64
+	// CPUTimeNanos is ri_user_time + ri_system_time CONVERTED TO NANOSECONDS via
+	// the host mach timebase (see MachTimebase — the raw fields are mach absolute
+	// time units, not nanoseconds). It is the process's CUMULATIVE CPU time since
+	// exec, i.e. a counter, and is the source of the kubelet Summary API's
+	// CPUStats.usage_core_nano_seconds.
+	//
+	// It is USAGE accounting, never a millicore guarantee: k3sm enforces no CFS
+	// quota (see docs/resources.md), so this number says what a pod consumed, not
+	// what it was entitled to.
+	CPUTimeNanos uint64
+}
+
+// RUsager is the richer proc_pid_rusage seam: a Footprinter that can also report
+// cumulative CPU time. PhysFootprinter implements it; test fakes that only need
+// the OOM/memory path may implement Footprinter alone.
+//
+// It is a SEPARATE (optional) interface rather than two methods on Footprinter so
+// the memory sampler — which needs nothing else — keeps its 1-method consumer
+// interface, and so a CPU-blind Footprinter stays a legal injection. A consumer
+// type-asserts for it and reports no CPU when it is absent; the k3sm provider
+// then withholds that pod from /metrics/resource entirely, because metrics-server
+// has no memory-only path (see the provider's resource-metrics builder).
+type RUsager interface {
+	Footprinter
+	// RUsage returns pid's combined memory + cumulative-CPU sample.
+	RUsage(pid int) (RUsage, error)
+}
+
 // MemorySampler polls a pod's physical-memory footprint at a fixed interval and,
 // when the summed footprint of its sampled PIDs first exceeds limitBytes, invokes
 // onBreach EXACTLY ONCE (the runtime then SIGKILLs the pod and records OOMKilled).

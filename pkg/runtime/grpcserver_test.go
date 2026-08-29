@@ -149,15 +149,15 @@ func TestServerServesRuntimeSurfaceOverUnixSocket(t *testing.T) {
 		}
 	}
 
-	// The M2.2 ListPodStats RPC must answer over the wire too (read-only — pod-grpc
-	// has no memory limit so it is unmetered and the snapshot is empty, which is the
-	// correct Summary-shape response, not an error).
+	// The M2.2 ListPodStats RPC must answer over the wire too. pod-grpc carries no
+	// memory limit, which now selects OOM enforcement only, not metering — so it is
+	// sampled like any other pod and appears in the snapshot.
 	stats, err := client.ListPodStats(ctx, &runtimev1.ListPodStatsRequest{})
 	if err != nil {
 		t.Fatalf("ListPodStats over socket: %v", err)
 	}
-	if len(stats.GetPodStats()) != 0 {
-		t.Errorf("ListPodStats = %d pods, want 0 (pod-grpc is unmetered)", len(stats.GetPodStats()))
+	if len(stats.GetPodStats()) != 1 || stats.GetPodStats()[0].GetPodId() != "pod-grpc" {
+		t.Errorf("ListPodStats = %+v, want exactly pod-grpc (an unlimited pod is metered)", stats.GetPodStats())
 	}
 
 	// Clean ctx-driven shutdown: cancel → GracefulStop → Serve returns nil, no leak.

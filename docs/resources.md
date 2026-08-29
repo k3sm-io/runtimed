@@ -10,7 +10,13 @@ deliberately does **not** — promise for CPU. This is the note the PHASES
 ## Memory: `ri_phys_footprint`, NOT RSS
 
 The sampler reads **`ri_phys_footprint`** from `proc_pid_rusage(pid,
-RUSAGE_INFO_V2, …)` (`pkg/supervisor/rusage_darwin.go`), at ~1 Hz per metered pod.
+RUSAGE_INFO_V2, …)` (`pkg/supervisor/rusage_darwin.go`), at ~1 Hz per pod.
+
+**Every pod is metered.** A memory limit selects OOM **enforcement**, not
+metering: a pod with no limit still runs the sampler (meter-only, `limitBytes ==
+0`, which can never fire the breach callback), so it appears in the Summary API
+and in `kubectl top`. Metering only limited pods would have hidden most of a
+real cluster — a memory limit is optional in Kubernetes and commonly unset.
 
 `ri_phys_footprint` is the kernel's **phys_footprint ledger** for the task. It is
 **not** RSS (`ri_resident_size`). It counts, in bytes:
@@ -59,14 +65,41 @@ enforcement holds in either land order while the provider switches to writing th
 typed field; the annotation fallback is transitional and removable once every
 provider writes the typed field. `0` means no limit (BestEffort → no sampler).
 
-## CPU: best-effort QoS, NOT CFS millicores
+## CPU: usage IS accounted; the LIMIT is best-effort QoS, NOT CFS millicores
 
-k3sm has **no CFS / cgroup CPU controller** — pods are native Darwin processes.
-Any CPU shaping is **best-effort QoS** only: it can *deprioritize* a greedy pod
-under contention, but it **cannot** enforce a hard "500m = half a core"
-guarantee the way Linux CFS quotas do. runtimed therefore does **not** claim a
-CPU limit is honored as millicores. **CPU is best-effort, memory is enforced
-(in phys_footprint units).**
+Two different things live under "CPU", and conflating them is the mistake this
+section exists to prevent.
+
+**CPU *limits* are best-effort QoS.** k3sm has **no CFS / cgroup CPU
+controller** — pods are native Darwin processes. Any CPU shaping is
+*deprioritization* under contention; it **cannot** enforce a hard "500m = half a
+core" guarantee the way Linux CFS quotas do. runtimed therefore does **not**
+claim a CPU limit is honored as millicores. **The CPU limit is best-effort,
+memory is enforced (in phys_footprint units).**
+
+**CPU *usage* is accounted, exactly.** `ri_user_time` + `ri_system_time` come out
+of the **same `rusage_info_v2` struct** the memory footprint does, so a
+container's CPU and memory are one kernel sample at no extra syscall cost
+(`supervisor.PhysFootprinter.RUsage`). The cumulative nanosecond total is
+surfaced as `PodStats.cpu.usage_core_nano_seconds` per container and per pod, and
+the k3sm provider transcodes it to `container_cpu_usage_seconds_total` on
+`/metrics/resource` — so `kubectl top` and HPA-on-CPU work against an
+operator-installed metrics-server. Being usage, not entitlement, a pod can and
+will exceed any `limits.cpu` it declares.
+
+Two accounting details that are load-bearing:
+
+- **The raw fields are MACH ABSOLUTE TIME UNITS, not nanoseconds.** XNU copies
+  them out of the task's thread timers, which tick at the mach timebase. On
+  x86_64 the timebase is 1/1, so an unscaled read is accidentally correct; on
+  Apple Silicon it is 125/3, so an unscaled read **undercounts CPU by ~41.67x**.
+  The scaling lives in `supervisor.MachTimebase` and is unit-tested against a
+  faked ratio precisely because the bug is invisible on Intel.
+- **The counter is carried across container restarts.** A restarted container is
+  a new pid whose counter restarts at zero; `runtime.cpuAccumulator` folds the
+  retired process's last reading into a per-container total so the value stays
+  MONOTONE, which the consumer requires (metrics-server derives a rate from two
+  cumulative samples and rejects a decreasing pair).
 
 ### QoS application (B7): BestEffort → the darwin background band
 
@@ -97,7 +130,7 @@ it):
   construction — a malicious/greedy pod is not contained by it (untrusted
   tenancy routes to the vm backend, as everywhere else in the privilege
   model).
-- **BG'd pods will legitimately report LOW CPU** once CPU accounting lands: a
+- **BG'd pods legitimately report LOW CPU** now that usage accounting is live: a
   throttled pod's low usage is the policy working, not an accounting bug. Do
   not "fix" it by unthrottling.
 - **jetsam/memorystatus interaction is B46's lane.** Darwin couples the BG

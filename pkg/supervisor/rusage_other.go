@@ -22,5 +22,13 @@ package supervisor
 // for linux CI; production runs on darwin (proc_pid_rusage is a darwin SPI).
 type PhysFootprinter struct{}
 
+var (
+	_ Footprinter = PhysFootprinter{}
+	_ RUsager     = PhysFootprinter{}
+)
+
 // Footprint is unsupported off darwin/cgo.
 func (PhysFootprinter) Footprint(int) (uint64, error) { return 0, errUnsupported }
+
+// RUsage is unsupported off darwin/cgo.
+func (PhysFootprinter) RUsage(int) (RUsage, error) { return RUsage{}, errUnsupported }
