@@ -253,13 +253,24 @@ func mustPuller(t *testing.T, cache *Cache, fetch FetchFunc) *Puller {
 
 // mustPullerIndex is mustPuller with an explicit LocalIndex, for the tests that
 // put a reference in the "recorded on this node" state.
+//
+// It pins the disk-pressure sampler to a fixed roomy value, so every OTHER test
+// in this package states a free volume rather than inheriting the developer's
+// actual disk — a machine below DefaultPullRefuseFreeBytes would otherwise red
+// the whole pull suite for a reason none of those tests is about. The admission
+// rule itself is driven, with its own sampler, by TestPullRefusesUnderDiskPressure.
 func mustPullerIndex(t *testing.T, cache *Cache, fetch FetchFunc, index LocalIndex) *Puller {
 	t.Helper()
-	p, err := NewPuller(cache, fetch, index)
+	p, err := NewPuller(cache, fetch, index, WithFreeBytes(fixedFreeBytes(64<<30)))
 	if err != nil {
 		t.Fatalf("NewPuller: %v", err)
 	}
 	return p
+}
+
+// fixedFreeBytes is a FreeBytesFunc that always reports n bytes available.
+func fixedFreeBytes(n uint64) FreeBytesFunc {
+	return func(string) (uint64, error) { return n, nil }
 }
 
 // mustCandidates fails the test if the policy has no candidates.
