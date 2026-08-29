@@ -78,10 +78,20 @@ type pod struct {
 
 	// M2.5 memory metering/OOM state. oomKilled is set by the sampler before it
 	// SIGKILLs the pod, so watchContainerExit records the OOMKilled reason.
-	// memSampler/memCancel are nil when the pod has no memory limit (no sampler).
+	// memSampler/memCancel are nil only if arming was refused (an unregistered
+	// pod); EVERY pod is metered, and the sampler enforces an OOM threshold only
+	// when the pod carries a memory limit — see armMemorySampler.
 	oomKilled  bool
 	memSampler *supervisor.MemorySampler
 	memCancel  context.CancelFunc
+
+	// cpuAcc carries each container's cumulative CPU across restarts so the value
+	// ListPodStats reports is monotone for the pod's whole life (see
+	// cpuAccumulator: a restarted container is a new pid whose raw counter starts
+	// over, and the metrics consumer rejects a counter that goes backwards). It has
+	// its OWN lock and is deliberately NOT guarded by p.mu — it is written from the
+	// stats read path, which must not contend with the pod lifecycle.
+	cpuAcc cpuAccumulator
 
 	// supCtx / cancel are the pod-lifetime SUPERVISION context and its cancel —
 	// the scope of the per-container reapers (supervisor.Process.reap), the
@@ -459,12 +469,22 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
 
-// armMemorySampler starts the pod's memory sampler (M2.5): for a pod with a
-// memory limit it samples ri_phys_footprint at ~1 Hz and, on breach, SIGKILLs the
-// pod and records OOMKilled. The sampler's lifetime is the pod — cancelled on
-// DeletePod and on any TRULY-terminal transition, Succeeded OR Failed
-// (trulyTerminalLocked) — so the goroutine never leaks. A pod without a limit
-// runs no sampler (the metering/OOM path is limit-driven in M2).
+// armMemorySampler starts the pod's resource sampler: it samples
+// ri_phys_footprint at ~1 Hz and, for a pod that carries a memory limit, SIGKILLs
+// the pod and records OOMKilled on the first breach. The sampler's lifetime is the
+// pod — cancelled on DeletePod and on any TRULY-terminal transition, Succeeded OR
+// Failed (trulyTerminalLocked) — so the goroutine never leaks.
+//
+// EVERY pod is sampled, limit or none. The limit selects OOM ENFORCEMENT only
+// (supervisor.NewMemorySampler with limitBytes == 0 is meter-only and can never
+// fire onBreach). The earlier limit-driven arming left an unlimited pod with no
+// sampler at all, so it was absent from PodMetrics and therefore from ListPodStats
+// and from `kubectl top pod` — a metering surface that silently omits most of the
+// cluster (a memory limit is optional in Kubernetes and commonly unset) lies by
+// omission, which is worse than reporting a pod with no limit. The stated reason
+// for the narrowing — that broadening "awaits the apis Summary message" — expired
+// when PodStats shipped in apis:M2.2. The cost is one goroutine and one
+// proc_pid_rusage per container per second per pod, which is what a kubelet does.
 //
 // It is called by CreatePod (after the pod is registered) and AGAIN by
 // RestartContainer when a re-exec de-escalates a pod out of a terminal phase,
@@ -490,10 +510,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 //     above, p.cancel (DeletePod) tears this sampler down too. The two stoppers
 //     are therefore ORDER-INDEPENDENT: whichever side wins, the goroutine dies.
 func (r *Runtime) armMemorySampler(p *pod) {
+	// limit == 0 means unlimited: still metered, never OOM-enforced.
 	limit := podMemoryLimitBytes(p.box)
-	if limit == 0 {
-		return
-	}
 	r.mu.Lock()
 	registered := r.pods[p.box.GetPodId()] == p
 	r.mu.Unlock()

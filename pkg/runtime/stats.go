@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // ListPodStats returns point-in-time resource-usage snapshots for pods on the
@@ -31,11 +32,11 @@ import (
 // provider serves.
 //
 // pod_id empty returns every metered pod (the Summary shape); pod_id set returns
-// just that pod. A pod with NO memory sampler is OMITTED: only pods with a memory
-// limit are metered in M2 (the sampler is limit-driven), matching PodMetrics'
-// ok==false — broadening metering to all pods awaits the same posture decision as
-// PodMetrics. An unknown pod_id yields an empty list (not an error): a stats query
-// races pod teardown, so "gone" is an empty snapshot, not a failure.
+// just that pod. EVERY running pod is metered — the memory limit selects OOM
+// enforcement, not metering (see armMemorySampler) — so a pod is omitted only when
+// its sampler was never armed, matching PodMetrics' ok==false. An unknown pod_id
+// yields an empty list (not an error): a stats query races pod teardown, so "gone"
+// is an empty snapshot, not a failure.
 func (r *Runtime) ListPodStats(_ context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
 	ids := r.statsTargets(req.GetPodId())
 	out := make([]*runtimev1.PodStats, 0, len(ids))
@@ -67,16 +68,32 @@ func (r *Runtime) statsTargets(podID string) []string {
 }
 
 // podStats builds the wire PodStats for podID, or nil when the pod is unknown or
-// not metered (no M2.5 memory sampler → omitted, the PodMetrics ok==false gate).
+// has no sampler (the PodMetrics ok==false gate).
 //
 // The pod-level working set is the sampler's latest summed ri_phys_footprint
 // (PodMetrics — the same value OOMKilled is judged against); per-container working
-// sets are sampled from the same proc_pid_rusage Footprinter seam at request time
-// (the M2 sampler tracks only the pod sum, and each M2 container is a single
-// process, so a per-PID footprint is the container's working set). CPU is left
-// unset: k3sm has no CPU accounting (best-effort QoS only — see docs/resources.md).
+// sets and CPU are sampled from the proc_pid_rusage seam at request time (the
+// sampler tracks only the pod-wide memory sum, and each host-process container is
+// a single process, so a per-PID rusage IS the container's sample).
+//
+// CPU: ri_user_time + ri_system_time come out of the SAME rusage_info_v2 struct as
+// the footprint, so a container's CPU and memory are one kernel sample, not two —
+// which matters because the /metrics/resource consumer publishes a pod only when it
+// has BOTH. The value is cumulative and carried across restarts by the pod's
+// cpuAccumulator so it never goes backwards. It is USAGE accounting only: k3sm
+// enforces no CFS millicore quota (best-effort QoS — see docs/resources.md), so
+// this says what a pod consumed, never what it was entitled to.
+//
+// A Footprinter that is not also a supervisor.RUsager (a memory-only test fake)
+// leaves every CPU field nil; the k3sm provider then withholds the pod from
+// /metrics/resource entirely rather than publishing a memory-only sample the
+// consumer would drop anyway.
+//
+// Only LIVE containers are reported. A terminated container has no process to
+// sample, so it could only contribute a zero working set — and a zero working set
+// is not "idle", it is a missing sample that makes the consumer drop the whole pod.
 func (r *Runtime) podStats(podID string) *runtimev1.PodStats {
-	// PodMetrics gates inclusion (ok==false for an unknown/unmetered pod) and
+	// PodMetrics gates inclusion (ok==false for an unknown/unsampled pod) and
 	// supplies the pod-level working set sourced from the sampler.
 	m, ok := r.PodMetrics(podID)
 	if !ok {
@@ -90,37 +107,59 @@ func (r *Runtime) podStats(podID string) *runtimev1.PodStats {
 		return nil
 	}
 
-	// Snapshot each container's name + current pid under p.mu; sample footprints
-	// OUTSIDE the lock (the Footprinter may syscall).
+	// Snapshot each live container's name + current pid under p.mu; sample rusage
+	// OUTSIDE the lock (the sampler syscalls).
 	type ctr struct {
 		name string
 		pid  int
 	}
 	p.mu.Lock()
 	ns, name := p.box.GetNamespace(), p.box.GetName()
-	ctrs := make([]ctr, 0, len(p.containers))
-	for _, cp := range p.containers {
+	live := liveContainersLocked(p)
+	ctrs := make([]ctr, 0, len(live))
+	for _, cp := range live {
 		ctrs = append(ctrs, ctr{name: cp.name, pid: cp.proc.PID()})
 	}
 	p.mu.Unlock()
 
+	// The richer rusage seam is optional (see supervisor.RUsager): production wires
+	// PhysFootprinter, which reads memory and CPU in one call.
+	ru, withCPU := r.footprinter.(supervisor.RUsager)
+
 	ts := timestamppb.New(m.Timestamp)
 	containers := make([]*runtimev1.ContainerStats, 0, len(ctrs))
+	// podCPUComplete tracks whether every LIVE container yielded a CPU sample; the
+	// VALUE reported is the accumulator's sum over EVERY container it has seen (see
+	// cpuAccumulator.sum), so a container that has since exited keeps contributing.
+	podCPUComplete := len(ctrs) > 0
 	for _, c := range ctrs {
 		var ws uint64
 		if c.pid > 0 {
-			if fp, err := r.footprinter.Footprint(c.pid); err == nil {
+			if withCPU {
+				if s, err := ru.RUsage(c.pid); err == nil {
+					ws = s.PhysFootprintBytes
+					p.cpuAcc.observe(c.name, c.pid, s.CPUTimeNanos)
+				}
+			} else if fp, err := r.footprinter.Footprint(c.pid); err == nil {
 				ws = fp
 			}
 		}
-		containers = append(containers, &runtimev1.ContainerStats{
+		cs := &runtimev1.ContainerStats{
 			Name:      c.name,
 			Timestamp: ts,
 			Memory:    &runtimev1.MemoryStats{Timestamp: ts, WorkingSetBytes: ws},
-		})
+		}
+		// Read the accumulated total rather than this call's raw sample: it is the
+		// restart-carrying, monotone figure, and it survives a sample that failed.
+		if cum, seen := p.cpuAcc.total(c.name); seen {
+			cs.Cpu = &runtimev1.CPUStats{Timestamp: ts, UsageCoreNanoSeconds: cum}
+		} else {
+			podCPUComplete = false
+		}
+		containers = append(containers, cs)
 	}
 
-	return &runtimev1.PodStats{
+	ps := &runtimev1.PodStats{
 		PodId:      podID,
 		Namespace:  ns,
 		Name:       name,
@@ -128,4 +167,11 @@ func (r *Runtime) podStats(podID string) *runtimev1.PodStats {
 		Memory:     &runtimev1.MemoryStats{Timestamp: ts, WorkingSetBytes: m.WorkingSetBytes},
 		Containers: containers,
 	}
+	// The pod-level counter is reported only when EVERY live container contributed
+	// — a partial sum is not a pod total, and publishing one would understate the
+	// pod and (being a counter) could fall when the missing container reappears.
+	if podTotal, seen := p.cpuAcc.sum(); podCPUComplete && seen {
+		ps.Cpu = &runtimev1.CPUStats{Timestamp: ts, UsageCoreNanoSeconds: podTotal}
+	}
+	return ps
 }
