@@ -211,6 +211,10 @@ type Runtime struct {
 	// drainGrace is one: tests shrink it, there being no clock seam here.
 	exitObsGrace time.Duration
 
+	// closeGrace bounds Close's per-pod wait for the supervision goroutines to
+	// observe the shutdown cancel; 0 selects defaultCloseGrace. Same rationale.
+	closeGrace time.Duration
+
 	// netReconcileOnce/netReconcileErr make the optional network startup
 	// reconcile (NetworkReconciler) run exactly once per Runtime, BEFORE any
 	// CreatePod is served. Once.Do provides the happens-before for the error

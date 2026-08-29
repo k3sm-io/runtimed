@@ -80,5 +80,22 @@ func run(socketPath, root, version string, log *slog.Logger) error {
 	defer func() { _ = lis.Close() }()
 
 	log.Info("k3sm-runtimed serving", "socket", socketPath, "root", root)
-	return runtime.NewServer(rt).Serve(ctx, lis)
+	serveErr := runtime.NewServer(rt).Serve(ctx, lis)
+
+	// Serve has returned, so this process is going away: stop the supervision of
+	// every pod still live on the node (reapers, watchContainerExit completions,
+	// the ~1 Hz memory samplers) instead of letting the exit collect them. It is
+	// the shutdown counterpart of DeletePod's per-pod teardown. The pod PROCESSES
+	// are deliberately left running — they outlive the daemon and the startup pod
+	// reap reconciles them — and a supervision that misses the bound is reported,
+	// never fatal: the daemon is exiting either way, so it must not mask the
+	// serve error.
+	//
+	// It sits HERE and not in Serve because Serve's contract is a listener loop a
+	// caller may end (by closing its listener) while keeping the Runtime; daemon
+	// shutdown is this function.
+	if err := rt.Close(); err != nil {
+		log.Warn("pod supervision did not fully stop at shutdown", "err", err)
+	}
+	return serveErr
 }
