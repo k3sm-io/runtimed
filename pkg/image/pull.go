@@ -300,6 +300,11 @@ type Puller struct {
 	cache *Cache
 	fetch FetchFunc
 	index LocalIndex
+
+	// floorBytes and freeBytes are the disk-pressure admission seam (pullgate.go).
+	// Both zero values mean the production defaults, which are fail-closed.
+	floorBytes uint64
+	freeBytes  FreeBytesFunc
 }
 
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
@@ -314,7 +319,10 @@ type Puller struct {
 // wiring from a mis-wiring. index is required for the same reason: a caller with
 // no index passes NoLocalIndex explicitly, so "this node cannot decide presence
 // by reference yet" is stated rather than inferred from a nil field.
-func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex) (*Puller, error) {
+//
+// opts adjust only the disk-pressure admission seam, whose defaults are
+// fail-closed and therefore safe to leave implicit — see PullerOption.
+func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOption) (*Puller, error) {
 	if cache == nil {
 		return nil, errors.New("image puller: cache is required")
 	}
@@ -324,7 +332,11 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex) (*Puller, error)
 	if index == nil {
 		return nil, errors.New("image puller: index is required (pass image.NoLocalIndex{} when the node has none)")
 	}
-	return &Puller{cache: cache, fetch: fetch, index: index}, nil
+	p := &Puller{cache: cache, fetch: fetch, index: index}
+	for _, o := range opts {
+		o(p)
+	}
+	return p, nil
 }
 
 // Pull fetches ref and stores its config + layer blobs in the content-addressed
@@ -354,6 +366,10 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex) (*Puller, error)
 //   - UNSPECIFIED is the legacy pull-through — the pre-M12 behavior, which is
 //     what an old provider that never stamps the field must keep getting. It is
 //     never read as an implicit NEVER.
+//
+// Under DISK PRESSURE on the store volume, a pull that would FETCH is refused
+// before any round trip with ErrPullRefusedDiskPressure; a warm IfNotPresent or
+// Never serve is unaffected (see admitFetch).
 //
 // This function NEVER derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
@@ -393,6 +409,22 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
 			return nil, fmt.Errorf("image %q: %w", ref, ErrImageNotPresent)
 		}
+	}
+
+	// DISK-PRESSURE ADMISSION, at the one choke point every fetching path
+	// traverses and BEFORE the fetch, so a refused pull performs no registry
+	// traffic at all. It sits AFTER the presence decision on purpose: a reference
+	// already on this node is served under pressure, because answering presence
+	// writes nothing (see admitFetch).
+	//
+	// ALWAYS is refused here even when every blob happens to be cached. That is
+	// deliberate and it is not over-blocking: ALWAYS means re-resolve the
+	// reference, and whether the resolved digest is one this node already holds
+	// is knowable only by making the very round trip being refused. Serving the
+	// recorded content instead would silently answer IfNotPresent for a pod that
+	// asked for ALWAYS.
+	if err := p.admitFetch(ref); err != nil {
+		return nil, err
 	}
 
 	img, err := p.fetch(ctx, ref, cred, policy)
