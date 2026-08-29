@@ -31,17 +31,33 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// buildExecShim builds and ad-hoc signs the k3sm-execshim helper into a temp dir
-// and returns its path. The ad-hoc signature is plain (flags=0x2): hardened
-// runtime and library validation are NOT applied, so a DYLD insert can load.
+// buildExecShim builds and ad-hoc signs the k3sm-execshim helper for the ambient
+// toolchain's architecture. Callers that care which architecture the confiner is
+// use buildExecShimForGOARCH.
 func buildExecShim(t *testing.T) string {
+	t.Helper()
+	return buildExecShimForGOARCH(t, "")
+}
+
+// buildExecShimForGOARCH builds and ad-hoc signs the k3sm-execshim helper into a
+// temp dir and returns its path. The ad-hoc signature is plain (flags=0x2):
+// hardened runtime and library validation are NOT applied, so a DYLD insert can
+// load.
+//
+// goarch pins GOARCH for the build; empty means "whatever the toolchain defaults
+// to". Pinning matters wherever a test's meaning depends on the confiner's
+// architecture, because the toolchain's own arch is not necessarily the host's.
+func buildExecShimForGOARCH(t *testing.T, goarch string) string {
 	t.Helper()
 	dir := t.TempDir()
 	shim := filepath.Join(dir, ExecShimName)
 	cmd := exec.Command("go", "build", "-o", shim, "k3sm.io/runtimed/cmd/k3sm-execshim")
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	if goarch != "" {
+		cmd.Env = append(cmd.Env, "GOARCH="+goarch)
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build k3sm-execshim: %v\n%s", err, out)
+		t.Fatalf("build k3sm-execshim (GOARCH=%q): %v\n%s", goarch, err, out)
 	}
 	// Ad-hoc sign, stripping hardened-runtime/library-validation (no -o options).
 	if out, err := exec.Command("codesign", "-s", "-", "-f", shim).CombinedOutput(); err != nil {
