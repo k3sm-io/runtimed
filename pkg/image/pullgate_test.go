@@ -88,13 +88,13 @@ func sameFileSet(a, b map[string]struct{}) bool {
 	return true
 }
 
-// TestPullRefusesUnderDiskPressure is the B114 gate: past a free-space floor the
+// TestPullRefusesUnderDiskPressure is the disk-pressure gate: past a free-space floor the
 // puller REFUSES TO BEGIN a new fetch, fail-closed, while content already on the
 // node is still served.
 //
 // The property it defends is not a node inconvenience. /var/lib/k3sm is shared
 // with kine's state.db, so a puller that keeps streaming layers into a nearly
-// full volume takes the control plane down with it — and B130b's reclaim cannot
+// full volume takes the control plane down with it — and the reclaimer cannot
 // prevent that, because reclaim frees only what nothing references and a fully
 // referenced store has nothing to give back.
 //
@@ -106,8 +106,8 @@ func sameFileSet(a, b map[string]struct{}) bool {
 // whose images this node already holds, at exactly the moment it cannot fetch
 // them again.
 //
-// NOTE ON THE SPLIT: the backlog names TestSnapshotPrune for B114's other half —
-// pruning extracted snapshot TREES — which stays blocked on B100 because the
+// NOTE ON THE SPLIT: TestSnapshotPrune is the name reserved for the other half —
+// pruning extracted snapshot TREES — which stays blocked because the
 // snapshot store does not exist yet. This gate covers the disk-pressure
 // stop-new-pulls condition only.
 func TestPullRefusesUnderDiskPressure(t *testing.T) {
@@ -366,10 +366,10 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 	// thresholds either side of it, so the ordering — not the number — is what
 	// is pinned. Re-ordering it (a floor above the GC trigger) must fail here.
 	t.Run("floor_composes_with_the_reclaim_constants", func(t *testing.T) {
-		// B27's proposed node DiskPressure floor (docs/BACKLOG.md B27: "ABSOLUTE
+		// the proposed node DiskPressure floor (an ABSOLUTE
 		// floor, True below 2 GiB free, clearing at 10 GiB"). It is spelled here
 		// as a literal because it is a PROPOSAL — no shipped symbol carries it
-		// yet — and this assertion is what will red when B27 lands a value that
+		// yet — and this assertion is what will red when a value lands that
 		// does not fit under the pull floor.
 		const proposedDiskPressureFloorBytes uint64 = 2 << 30
 
