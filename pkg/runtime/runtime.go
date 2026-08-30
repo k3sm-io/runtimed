@@ -80,8 +80,14 @@ type Puller interface {
 // policy (the layer dialect) rides on the CALL for the same reason the pull's
 // PlatformPolicy does: the dialect follows the pod's resolved sandbox backend,
 // which is decided per pod.
+//
+// ImageRunConfig is the second half of the same seam and is deliberately on the
+// SAME interface: the run config and the tree come from one image, read through
+// one verified config blob, so a fake that serves a tree without a matching
+// config could make the merge green against an image the pod would never run.
 type Unpacker interface {
 	MaterializeTree(ctx context.Context, mfst *runtimev1.ImageManifest, policy image.UnpackPolicy, dstRootfs string) (*image.MaterializeResult, error)
+	ImageRunConfig(mfst *runtimev1.ImageManifest) (image.ImageRunConfig, error)
 }
 
 // Signer ad-hoc signs a pulled binary and gates it against a SignaturePolicy
