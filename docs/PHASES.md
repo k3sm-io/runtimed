@@ -424,7 +424,8 @@ phases:
     subphases:
       - id: M8.2
         title: Metal SBPL + egress branch + tree signing + GPUFacts (consumes the M11.2-d7 unpacker)
-        status: in-progress
+        status: done
+        completed: 2026-08-30
         size: L
         depends_on: [runtimed:M11.2-d7]
         strategy: hard cut
@@ -490,7 +491,7 @@ phases:
             check: GPUFacts population is unit-proven over a fake probe seam — the VZ-paravirtual discrimination (functional-probe verdict false ⇒ metal_available=false and the node-facing fields cleared), the iogpu_wired_limit_bytes 0-sentinel, recommended_max_working_set_bytes pass-through, and sandbox_gpu_supported scoped to the currently selected backend
             method: unit
           - id: M8.2-a4
-            met: false  # lab-ledger carve-out: owned by the M8.6 lab session on the apple-gpu rig (SkipUnless-gated; compiled + skipping locally; the full path proven to the engine-import boundary via K3SM_CAP_APPLE_GPU)
+            met: true  # 2026-08-30 run5 on the apple-gpu rig: TestIntegrationMetalMatmulUnderProfile RAN fatal-not-skip (K3SM_CI_REQUIRE) — matmul MATMUL_OK + denied_without_allow_gpu + the full generation leg (GENERATE_OK 69 tok); absence counterfactual FAILs as designed
             check: a real MLX matmul (full inference round-trip) runs under the generated allow_gpu profile on a GPU dev-mac (integration tier, k3smtest.SkipUnless(t, "apple-gpu"))
             method: integration
 
