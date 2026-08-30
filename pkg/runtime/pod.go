@@ -85,6 +85,23 @@ type pod struct {
 	memSampler *supervisor.MemorySampler
 	memCancel  context.CancelFunc
 
+	// M11.2-d6 vm-pod metering state (B107), guarded by mu. A vm pod is metered
+	// from the GUEST — the two fields below are the host-side record of that, and
+	// the memSampler/memCancel pair above is always nil for one (armMemorySampler
+	// refuses a vm pod).
+	//
+	// guestStats is the outcome of the last on-demand guest-agent Stats call,
+	// rendered as the GuestStatsConditionType pod condition so an omitted sample
+	// is a STATED fact rather than silence.
+	guestStats guestStatsRecord
+	// guestContainers holds the per-container statuses folded from the agent's
+	// ContainerEvents stream — the only source of a vm pod's OOMKilled — keyed by
+	// container name, with guestContainerOrder preserving first-sight order so
+	// the reported list is stable. A vm pod's containers are guest processes, so
+	// they have no containerProc and cannot ride the p.containers list.
+	guestContainers     map[string]*runtimev1.ContainerStatus
+	guestContainerOrder []string
+
 	// cpuAcc carries each container's cumulative CPU across restarts so the value
 	// ListPodStats reports is monotone for the pod's whole life (see
 	// cpuAccumulator: a restarted container is a new pid whose raw counter starts
@@ -518,6 +535,23 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 //     above, p.cancel (DeletePod) tears this sampler down too. The two stoppers
 //     are therefore ORDER-INDEPENDENT: whichever side wins, the goroutine dies.
 func (r *Runtime) armMemorySampler(p *pod) {
+	// THE NO-TICKER REFUSAL (B107). A vm pod is NEVER host-sampled. The sampler's
+	// two jobs are metering and winning the OOM race, and a vm pod has neither
+	// here: its working set lives in the guest's cgroup2 hierarchy (pulled on
+	// demand by vmPodStats, so a host sample would meter the vmhost helper rather
+	// than the workload), and its memory ceiling is the VZ memorySize the
+	// hypervisor itself enforces — an OOM arrives as a guest ContainerEvent, not
+	// as something the host could ever have observed in time. Arming anyway would
+	// buy nothing and spend one wakeup per second per vm pod on an idle guest.
+	//
+	// This refusal is also what makes the kill-reason fork total: no sampler ⇒ no
+	// onBreach ⇒ no path by which a host figure could reach oomKill for a vm pod
+	// (which refuses one anyway, defence in depth).
+	if p.isVM() {
+		r.log.Debug("vm pod: no host memory sampler (guest-agent metering; VZ memorySize is the ceiling)",
+			"pod", p.box.GetPodId())
+		return
+	}
 	// limit == 0 means unlimited: still metered, never OOM-enforced.
 	limit := podMemoryLimitBytes(p.box)
 	r.mu.Lock()
@@ -667,6 +701,20 @@ func vmVolumePlan(plan mount.SharePlan) sandbox.VMVolumePlan {
 // reason. Called from the sampler goroutine; it takes p.mu only to snapshot state
 // and signals OUTSIDE the lock (the re-entrancy rule).
 func (r *Runtime) oomKill(p *pod, footprint uint64) {
+	// THE KILL-REASON FORK (B107). A vm pod's OOMKilled comes from the guest
+	// agent's ContainerEvents stream and NOWHERE else: the kill happens in the
+	// guest kernel's cgroup, so a host rusage figure is not evidence of it — it
+	// measures the vmhost helper. armMemorySampler already refuses to arm a vm
+	// pod, so nothing should reach here; this is the second, independent stopper,
+	// because the failure it prevents is silent and expensive (upstream reads
+	// OOMKilled as the pod's own fault and counts it against a Job's backoff),
+	// and because the alternative kill path would SIGKILL host process groups a
+	// vm pod does not own.
+	if p.isVM() {
+		r.log.Error("refusing a host-sampler OOM kill for a vm pod: guest OOM is observable only via the agent's ContainerEvents",
+			"pod", p.box.GetPodId(), "footprint_bytes", footprint)
+		return
+	}
 	p.mu.Lock()
 	p.oomKilled = true
 	// Only LIVE containers are signalled: PID() still reports the last pid of a
