@@ -206,7 +206,16 @@ type Runtime struct {
 	// (verify every blob, then lease, then commit, then record — see
 	// image.Loader), and a fakeable seam here would let the daemon's tests go
 	// green against an implementation that does not have it.
-	loader      *image.Loader
+	loader *image.Loader
+	// index is the node's ref->digest image index — the record of which
+	// references this daemon pulled or ingested, and to which manifest. It is
+	// the SAME instance the puller and the loader write through (New builds
+	// exactly one), which is what makes the Images service's listing agree with
+	// what a warm IfNotPresent pull will find.
+	//
+	// It is the LISTING source, never a GC input: entries are edges, and no
+	// reachability enumerator can reach this tree (see image.FileIndex).
+	index       *image.FileIndex
 	signer      Signer
 	credentials CredentialResolver
 	backend     sandbox.Backend
@@ -595,6 +604,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		puller:       puller,
 		unpacker:     unpacker,
 		loader:       loader,
+		index:        index,
 		signer:       signer,
 		credentials:  deps.Credentials,
 		backend:      backend,
