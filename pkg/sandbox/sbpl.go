@@ -256,6 +256,12 @@ type GenerateOptions struct {
 // DNS resolver path needs). Per-IP scoping (VIP egress, per-pod-IP bind) is NOT
 // expressible in the macOS 26 Seatbelt grammar — see the AllowNetwork stanza.
 //
+// When sp.AllowGpu is set the allow tier additionally carries the Metal
+// user-client opens (metal.go). It is a per-pod WIDENING, never a capability
+// claim: a host with no usable Metal device honours the flag by granting access
+// that then finds no device, and GetRuntimeInfo's GPUFacts is where a caller
+// learns what the host actually has.
+//
 // The pods-root and the protected-prefix deny-set are derived from opts.Posture
 // (the node-level work-dir), so a user-space daemon whose work-dir lives under
 // its home pins every per-pod path under that work-dir rather than the legacy
@@ -424,6 +430,13 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("  (global-name \"com.apple.mDNSResponder\"))\n")
 	} else {
 		b.WriteString(";; network: default-deny (no allow-network).\n")
+	}
+
+	// GPU (allow_gpu): the Metal user-client opens, emitted in the ALLOWS tier like
+	// every other grant, so the protected denies below still outrank it. See
+	// metal.go for what the two class names are and why nothing else is granted.
+	if sp.GetAllowGpu() {
+		b.WriteString(metalStanza)
 	}
 
 	// --- AF_UNIX helper-socket denies (higher precedence than network allows) --
