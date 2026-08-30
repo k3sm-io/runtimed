@@ -208,6 +208,10 @@ type Runtime struct {
 	// queries Available() so a vm-requested pod fails closed when it is absent, and
 	// routes a selected vm pod to CreateVM (away from the host-process path).
 	vmBackend VMBackend
+	// guestDialer dials a vm pod's runtimed-private guest-agent socket (M11.2-d6).
+	// It is the transport seam under the Exec/GetLogs vm route; production dials
+	// the unix socket, tests inject an in-process listener. Never nil after New.
+	guestDialer GuestDialer
 	// rosettaHost / rosettaGuest are the two Rosetta capability probes' outcomes
 	// (B103), evaluated EAGERLY EXACTLY ONCE in New and IMMUTABLE thereafter, so the
 	// concurrent GetRuntimeInfo handler reads them with no lock and no race (see
@@ -333,6 +337,12 @@ type Deps struct {
 	// Virtualization.framework + the com.apple.security.virtualization entitlement
 	// (so a vm-requested pod fails closed off a capable host). Tests inject a fake.
 	VMBackend VMBackend
+	// GuestDialer dials one vm pod's guest-agent socket for the Exec/GetLogs vm
+	// route (M11.2-d6). Defaults to dialGuestUnix, a plain unix-domain dial of
+	// the vmhost-proxied <Root>/run/vm/<pod>/agent.sock; tests inject a dialer
+	// backed by an in-process listener so the whole gRPC round trip runs against
+	// a fake GuestAgent with no VM. See GuestDialer (guest.go).
+	GuestDialer GuestDialer
 	// HostRosetta probes whether this host can translate darwin/amd64 MACH-O
 	// payloads (Rosetta 2 — the NATIVE host-process spine's capability). Defaults to
 	// sandbox.ProbeHostRosetta; tests inject a fake. New calls it EAGERLY EXACTLY
@@ -482,6 +492,10 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// closed off a capable host (and the live boot is the lab-gated remainder).
 		vmBackend = sandbox.NewVMBackend()
 	}
+	guestDialer := deps.GuestDialer
+	if guestDialer == nil {
+		guestDialer = dialGuestUnix
+	}
 	hostRosettaProbe := deps.HostRosetta
 	if hostRosettaProbe == nil {
 		hostRosettaProbe = sandbox.ProbeHostRosetta
@@ -579,6 +593,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		credentials:  deps.Credentials,
 		backend:      backend,
 		vmBackend:    vmBackend,
+		guestDialer:  guestDialer,
 		rosettaHost:  rosettaHost,
 		rosettaGuest: rosettaGuest,
 		gpuFacts:     gpuFacts,

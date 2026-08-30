@@ -69,6 +69,14 @@ func newLogEmitter(stream grpc.ServerStreamingServer[runtimev1.LogEntry], req *r
 // the entry's instant, which a non-kubectl consumer of the stream should not have
 // to parse back out of the line.
 func (e *logEmitter) send(ent logLine) error {
+	return e.sendEntry(ent, runtimev1.LogStream_LOG_STREAM_STDOUT)
+}
+
+// sendEntry is send with an explicit stream label. The host-process path has
+// only a COMBINED buffer, so send fixes the label at stdout; the vm route
+// (getLogsGuest) is told stdout vs stderr by the guest agent and must not lose
+// that distinction on the way through, so it supplies the label per entry.
+func (e *logEmitter) sendEntry(ent logLine, kind runtimev1.LogStream) error {
 	line := ent.line
 	if e.timestamps {
 		line = append([]byte(ent.at.UTC().Format(time.RFC3339Nano)+" "), line...)
@@ -94,7 +102,7 @@ func (e *logEmitter) send(ent logLine) error {
 	return e.stream.Send(&runtimev1.LogEntry{
 		Line:      line,
 		Timestamp: timestamppb.New(ent.at),
-		Stream:    runtimev1.LogStream_LOG_STREAM_STDOUT,
+		Stream:    kind,
 	})
 }
 

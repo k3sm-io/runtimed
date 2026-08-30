@@ -353,6 +353,11 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStrea
 	if !ok {
 		return status.Errorf(codes.NotFound, "pod %s not found", req.GetPodId())
 	}
+	// Route dispatch (M11.2-d6): a vm pod's output lives in the guest, which
+	// holds it — there is no host log buffer to serve from (see getLogsGuest).
+	if p.isVM() {
+		return r.getLogsGuest(req, stream, p)
+	}
 
 	cp := r.findContainer(p, req.GetContainer())
 	if cp == nil {

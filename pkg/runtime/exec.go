@@ -58,6 +58,15 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return err // includes io.EOF if the client gave up before sending params
 	}
+	// Route dispatch (M11.2-d6). A vm pod's containers are guest processes with
+	// no host containerProc and no host confinement to re-enter, so the whole
+	// host-process body below is meaningless for one: it proxies to the pod's
+	// guest agent instead. A pod that is not a vm pod — or an id no pod has —
+	// falls through to the byte-unchanged host-process path.
+	if p, ok := r.lookupPod(first.GetPodId()); ok && p.isVM() {
+		return r.execGuest(stream, p, first)
+	}
+
 	p, cp, err := r.lookupContainer(first.GetPodId(), first.GetContainer())
 	if err != nil {
 		return err
