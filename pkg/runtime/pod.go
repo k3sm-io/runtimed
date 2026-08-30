@@ -180,6 +180,14 @@ type containerProc struct {
 	// initDeclared is threaded through (see RestartContainer). Immutable after
 	// startContainer.
 	initDeclared bool
+	// env and workingDir are the RESOLVED launch environment and working
+	// directory this container was spawned with (resolvedBinary). They are
+	// retained rather than re-derived because an Exec session must enter the
+	// same environment the container runs in — for a pulled image that includes
+	// the image config's own $PATH, which the container spec alone does not
+	// carry, and re-deriving it in Exec would mean a second pull.
+	env        []string
+	workingDir string
 }
 
 // sidecar reports whether cp is a NATIVE SIDECAR (KEP-753): an init-declared
@@ -721,7 +729,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
 	}
 
-	env, err := r.containerEnv(p.box, c)
+	env, err := r.containerEnv(p.box, c, rb.env)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
@@ -730,13 +738,15 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		Path: shimPath,
 		Argv: shimArgv,
 		Env:  env,
-		Dir:  c.GetWorkingDir(),
+		Dir:  rb.workingDir,
 	}
 	cp := &containerProc{
 		name:         c.GetName(),
 		spec:         c,
 		initDeclared: isInit,
 		logs:         logs,
+		env:          env,
+		workingDir:   rb.workingDir,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
@@ -1189,17 +1199,39 @@ type resolvedBinary struct {
 	// strictly worse: a scanner or admission-audit tool resolves the WRONG
 	// artifact and never knows.
 	imageID string
+	// env is the container's MERGED environment in "K=V" form — the image
+	// config's Env with the pod's env overriding by name (image.MergeRunSpec).
+	// It is NIL on both host-binary routes, where there is no image config to
+	// merge and containerEnv keeps its pre-M11.2-d1 behaviour of building the
+	// environment from the container spec alone.
+	env []string
+	// workingDir is the container's effective working directory: the pod's
+	// working_dir when set, else the image config's, else empty. On a
+	// host-binary route it is the pod's value verbatim.
+	workingDir string
 }
 
-// resolveBinary determines the pod binary path + argv for a container. M1
-// convention (mirrors the proto): if command+args are empty the image reference
-// is the host binary path; if the image is the "native" sentinel the command runs
-// in place as a host binary; otherwise the image is pulled+materialized and argv =
-// command+args.
+// resolveBinary determines the pod binary path + argv for a container.
+//
+// # The discriminator
+//
+// What happens is decided by the SHAPE of the image reference, not by the
+// emptiness of command (apis runtime/v1 Container.command):
+//
+//   - the "native" sentinel — command[0] is an absolute HOST binary, run in
+//     place, no pull;
+//   - an ABSOLUTE PATH with no command/args — the M0 host-binary convention: the
+//     reference IS the binary. Unchanged, and deliberately so; it stays the
+//     native path's way to run a host binary with no image at all;
+//   - an OCI REFERENCE — pull, materialize, and merge the image config with the
+//     container spec (image.MergeRunSpec). This is what replaced the M1
+//     placeholder that made argv literally command+args and therefore PANICKED
+//     on a container with args and no command, and refused a container with
+//     neither even though its image declared an Entrypoint.
 //
 // p supplies BOTH the PodBox (for the imagePullSecret lookup) and the RESOLVED
-// sandbox backend the pull's image-platform policy is derived from — see
-// pullPolicy and the pod.backend field.
+// sandbox backend the pull's image-platform policy AND the unpack dialect are
+// derived from — see pullPolicy, unpackPolicy and the pod.backend field.
 func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container) (resolvedBinary, error) {
 	cmd := c.GetCommand()
 
@@ -1215,17 +1247,31 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 			return resolvedBinary{}, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
 		}
 		// No manifest exists on this route, so imageID stays empty (see the field).
-		return resolvedBinary{path: bin, argv: append(append([]string{}, cmd...), c.GetArgs()...), hostBinary: true}, nil
+		return resolvedBinary{
+			path:       bin,
+			argv:       append(append([]string{}, cmd...), c.GetArgs()...),
+			hostBinary: true,
+			workingDir: c.GetWorkingDir(),
+		}, nil
 	}
 
-	if len(cmd) == 0 && len(c.GetArgs()) == 0 {
-		// Host-binary convention: image is an absolute path run in place.
+	if c.GetImage() == "" {
+		return resolvedBinary{}, fmt.Errorf("container %s: image is required", c.GetName())
+	}
+
+	// THE DISCRIMINATOR, on the no-command route: the SHAPE of the reference
+	// decides, not the emptiness (apis runtime/v1 Container.command).
+	//
+	// An ABSOLUTE PATH is the M0 host-binary convention and is UNCHANGED — the
+	// reference IS the binary, run in place with no pull. An OCI reference falls
+	// through to the pull path below, where the image config's Entrypoint/Cmd
+	// supply the argv. Before M11.2-d1 that fall-through did not exist and this
+	// branch REFUSED an OCI-referenced container with no command, so a perfectly
+	// ordinary `image: nginx` pod could not run.
+	if len(cmd) == 0 && len(c.GetArgs()) == 0 && image.IsHostPathReference(c.GetImage()) {
 		bin := c.GetImage()
-		if !filepath.IsAbs(bin) {
-			return resolvedBinary{}, fmt.Errorf("container %s: image %q is not an absolute host path and no command given", c.GetName(), bin)
-		}
 		// No manifest exists on this route either — imageID stays empty.
-		return resolvedBinary{path: bin, argv: []string{bin}, hostBinary: true}, nil
+		return resolvedBinary{path: bin, argv: []string{bin}, hostBinary: true, workingDir: c.GetWorkingDir()}, nil
 	}
 
 	// Resolve the imagePullSecret credential (M2.6) via the consumer-side seam. It
@@ -1272,7 +1318,11 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// degradation: a partial rootfs is a pod that starts and then behaves in a
 	// way no manifest describes, and the tree is committed atomically precisely
 	// so the only two outcomes are the whole image or an error.
-	mat, err := r.unpacker.MaterializeTree(ctx, res.Manifest, unpackPolicy(), rootfs)
+	policy, err := unpackPolicy(p.backend)
+	if err != nil {
+		return resolvedBinary{}, fmt.Errorf("container %s: %w", c.GetName(), err)
+	}
+	mat, err := r.unpacker.MaterializeTree(ctx, res.Manifest, policy, rootfs)
 	if err != nil {
 		return resolvedBinary{}, fmt.Errorf("materialize image %q: %w", c.GetImage(), err)
 	}
@@ -1280,17 +1330,36 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		"pod", p.box.GetPodId(), "container", c.GetName(), "image", c.GetImage(),
 		"tree", mat.Tree.Key, "tree_cache_hit", mat.Tree.CacheHit, "cloned", mat.Cloned)
 
-	// argv[0] is command[0] resolved against the pod rootfs when relative, else
-	// taken as-is (an absolute path names a host binary the image does not
-	// supply). Deriving argv from the IMAGE CONFIG's Entrypoint/Cmd when the pod
-	// supplies neither — the k8s four-quadrant merge — is M11.2-d1's MergeRunSpec,
-	// not this deliverable: it is a spec-merge decision, and doing half of it here
-	// would put two producers of argv on one path.
-	bin := cmd[0]
+	// MERGE the image config with the container spec: the k8s four-quadrant
+	// command/args table, $(VAR) expansion, the image's Env under the pod's, the
+	// image's WorkingDir under the pod's, and upstream's runAsNonRoot rule. This
+	// is the ONE producer of argv on this route.
+	//
+	// The uid handed to the merge is the SAME one the spawn will drop to
+	// (resolveCredential, from the container > pod > box precedence chain), so
+	// the runAsNonRoot verdict is made about the identity that actually runs and
+	// not about a second reading of the security context.
+	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
+	if err != nil {
+		return resolvedBinary{}, fmt.Errorf("read image config for %q: %w", c.GetImage(), err)
+	}
+	run, err := image.MergeRunSpec(runCfg, image.RunSpecRequest{
+		Container:    c,
+		RunAsUID:     int64(resolveCredential(p.box, c).UID),
+		RunAsNonRoot: effectiveRunAsNonRoot(c),
+	})
+	if err != nil {
+		return resolvedBinary{}, err
+	}
+
+	// argv[0] is the merged program resolved against the pod rootfs when
+	// relative, else taken as-is (an absolute path names a host binary the image
+	// does not supply).
+	bin := run.Argv[0]
 	if !filepath.IsAbs(bin) {
 		bin = filepath.Join(rootfs, bin)
 	}
-	argv := append(append([]string{}, cmd...), c.GetArgs()...)
+	argv := append([]string{}, run.Argv...)
 	argv[0] = bin
 	// The CONFIG digest, not the index digest and not the reference: it is the
 	// per-platform content identity (the same value a containerd-backed kubelet
@@ -1300,7 +1369,34 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// content-addressable. It is the digest recorded as this pod's reachability
 	// root (recordPodImage above, image.ImageRoot.Config), so status and GC name
 	// the same blob.
-	return resolvedBinary{path: bin, argv: argv, imageID: res.Manifest.GetConfig().GetDigest()}, nil
+	return resolvedBinary{
+		path:       bin,
+		argv:       argv,
+		imageID:    res.Manifest.GetConfig().GetDigest(),
+		env:        run.Env,
+		workingDir: run.WorkingDir,
+	}, nil
+}
+
+// effectiveRunAsNonRoot resolves runAsNonRoot for a container.
+//
+// It reads the CONTAINER's securityContext only, and that is a faithful reading
+// of the contract available to it rather than a shortcut: apis
+// PodSecurityContext carries fs_group, run_as_user and run_as_group but NO
+// run_as_non_root, so a pod-scoped `securityContext.runAsNonRoot: true` has
+// nowhere to land on the wire and cannot reach this daemon. resolveCredential
+// has the same shape for the same reason — it consults psc for the uid/gid,
+// which psc HAS, and could not consult it for this.
+//
+// KNOWN CONTRACT GAP, deliberately not closed here: a pod-level runAsNonRoot is
+// therefore not enforced on a container that does not repeat it. Closing it is
+// an apis change (an additive PodSecurityContext.run_as_non_root plus the k3sm
+// provider stamping it), which belongs in that repo's wave, not in a runtimed
+// merge function. Composition, when the field arrives, is a LOGICAL OR: the
+// proto's bool has no presence, so a container-level false cannot be
+// distinguished from unset and must never weaken a pod-level assertion.
+func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
+	return c.GetSecurityContext().GetRunAsNonRoot()
 }
 
 // pullPolicy is the image-platform policy for a pull, built from the pod's
@@ -1336,19 +1432,23 @@ func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
 	return image.PlatformPolicy{Backend: backend}
 }
 
-// unpackPolicy is the layer-application dialect a materialization uses. It takes
-// no argument today because the host-process (Mach-O) spine is the only spine
-// that materializes: createPod routes a resolved vm backend to createVMPod
-// BEFORE resolveBinary is reached, so every caller of this function is native by
-// construction.
+// unpackPolicy is the layer-application dialect a materialization uses, derived
+// from the pod's RESOLVED sandbox backend (pod.backend, recorded by createPod) —
+// the same value pullPolicy threads into the image-platform policy, so the
+// platform a pull selects and the dialect its layers are applied in can never
+// disagree about which spine the pod is on.
 //
-// It is a function rather than a constant at the call site so the dialect has
-// ONE producer when M11.2-d1 adds the Linux dialect: d1 gives this function the
-// pod's resolved backend and returns its own image.LayerSemantics for the vm
-// rung. Spelling image.NativeUnpackPolicy() inline at the call site would put
-// that discriminator wherever the next caller happens to be.
-func unpackPolicy() image.UnpackPolicy {
-	return image.NativeUnpackPolicy()
+// It FAILS CLOSED on an unset or unknown backend (image.UnpackPolicyFor): a
+// missing dialect is an error at create time rather than a silent fall-through
+// to the native rules, which would apply Mach-O semantics to a Linux image and
+// commit the result under a key claiming otherwise.
+//
+// Every LIVE caller is still native, and the honesty note is worth keeping:
+// createPod routes a resolved vm backend to createVMPod BEFORE resolveBinary is
+// reached, so the Linux branch is exercised by tests until the vm spine
+// materializes its own rootfs.
+func unpackPolicy(backend runtimev1.SandboxBackend) (image.UnpackPolicy, error) {
+	return image.UnpackPolicyFor(backend)
 }
 
 // pullCredential resolves the registry pull credential for ref from the pod's
@@ -1378,17 +1478,29 @@ const (
 	pathShimMountsEnv = "K3SM_MOUNT_PATHS"
 )
 
-// containerEnv builds the child environment: the container's EnvVars plus the DYLD
-// inserts that make cluster features work in-pod — the path-rebase shim (so an
-// absolute volume mount resolves to its materialized copy under the pod data
-// volume, no chroot) and the DNS shim (box annotation). DYLD_INSERT_LIBRARIES is
-// appended last so an explicit container env can override it (rare). A container
-// that sets DYLD_INSERT_LIBRARIES itself opts out of both shims.
-func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container) ([]string, error) {
-	env := make([]string, 0, len(c.GetEnv())+3)
-	for _, e := range c.GetEnv() {
-		env = append(env, e.GetName()+"="+e.GetValue())
-		if e.GetName() == dyldInsertEnv {
+// containerEnv builds the child environment: a BASE set plus the DYLD inserts
+// that make cluster features work in-pod — the path-rebase shim (so an absolute
+// volume mount resolves to its materialized copy under the pod data volume, no
+// chroot) and the DNS shim (box annotation). DYLD_INSERT_LIBRARIES is appended
+// last so an explicit container env can override it (rare). A container that
+// sets DYLD_INSERT_LIBRARIES itself opts out of both shims.
+//
+// base is the MERGED environment resolveBinary produced for a pulled image (the
+// image config's Env under the container's, image.MergeRunSpec) — the source of
+// $PATH, $HOME and everything else an image ships. It is NIL on the two
+// host-binary routes and for a caller that has no merge to offer, and then the
+// base is the container's own EnvVars, byte-for-byte the pre-M11.2-d1 behaviour.
+func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, base []string) ([]string, error) {
+	if base == nil {
+		base = make([]string, 0, len(c.GetEnv()))
+		for _, e := range c.GetEnv() {
+			base = append(base, e.GetName()+"="+e.GetValue())
+		}
+	}
+	env := make([]string, 0, len(base)+3)
+	for _, e := range base {
+		env = append(env, e)
+		if name, _, _ := strings.Cut(e, "="); name == dyldInsertEnv {
 			return env, nil // explicit container DYLD wins; do not inject shims
 		}
 	}

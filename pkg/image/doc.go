@@ -29,12 +29,14 @@ limitations under the License.
 //     fire. platform.go is pure, GOOS-agnostic and cgo-free: the Rosetta
 //     capabilities it consumes are INPUTS, and probing for them belongs to
 //     B103, not here.
+//
 //   - Pull: fetch an OCI image by reference into a content-addressed blob cache
 //     under /var/lib/k3sm (default; configurable). Blobs are keyed by digest, so
 //     a second pull of the same content is a cache hit. Every blob is re-hashed
 //     against the digest its MANIFEST DESCRIPTOR claims before it is committed —
 //     see Cache.CommitBlob, the single home of that invariant, and the ceiling
 //     below.
+//
 //   - Record: write the (reference x platform) -> manifest entry to the on-disk
 //     index (index.go) once the pull has fully succeeded, so this node can
 //     answer presence BY REFERENCE — which the digest-keyed blob store cannot.
@@ -43,6 +45,7 @@ limitations under the License.
 //     entries are EDGES, never reachability roots: they can never protect a blob
 //     from the GC, whose root set stays daemon-authored (see FileIndex,
 //     ImageRoot).
+//
 //   - Ingest: admit an archive that arrived from OUTSIDE the registry path — a
 //     `docker save` tar or a tarred OCI layout streamed by `k3sm image
 //     load`/`import` (load.go). It reduces to the same store primitives Pull
@@ -55,25 +58,41 @@ limitations under the License.
 //     is the one where the claim genuinely descends from a document whose own
 //     digest is pinned. Loaded images are provenance-free by design: no
 //     SignaturePolicy is evaluated here.
-//   - Unpack: apply the image's layer blobs, in manifest order, into a per-image
-//     UNPACKED TREE keyed by (config digest x layer digests x unpack policy)
-//     under <root>/unpacked (unpack.go, tarapply.go). The apply is
-//     containment-checked twice over — an os.Root anchored at the tree, plus a
-//     name/link-target sanitizer that refuses an absolute or "../" path outright
-//     — because the tree is later cloned verbatim into a pod rootfs that has no
-//     chroot around it. The tree is staged and committed by one os.Rename, so a
-//     failed unpack commits nothing. Layer dialects are named (LayerSemantics)
-//     and part of the key: the native dialect is here, the Linux
-//     whiteout/opaque one is M11.2-d1's.
+//
+//   - Unpack: apply the image's layer blobs, in manifest order, into ONE tree
+//     (unpack.go, tarapply.go), staged and committed by a single os.Rename so a
+//     failed unpack commits nothing. The apply is containment-checked twice over
+//     — an os.Root anchored at the tree, plus a name/link-target sanitizer — and
+//     every layer's compressed digest AND decompressed diffID are re-verified on
+//     the one read before the commit.
+//
+//     The DIALECT (LayerSemantics, part of the key) decides both the rules and
+//     the store. The NATIVE dialect files under <root>/unpacked keyed by
+//     (config digest x layer digests x policy): whiteouts are ordinary files,
+//     an absolute symlink is refused, nothing is recorded, because the tree is
+//     cloned verbatim into a pod rootfs with no chroot around it. The LINUX
+//     dialect (linuxlayer.go) files under <root>/snapshots keyed by the OCI
+//     CHAIN ID: OCI whiteouts are interpreted, absolute symlinks are admitted
+//     (the guest chroots into the tree), the tar's true uid/gid/mode goes to an
+//     ownership sidecar the guest re-applies, and two paths a case-insensitive
+//     volume would merge are refused fail-closed.
+//
+//   - MergeRunSpec: merge the image config's Entrypoint/Cmd/Env/WorkingDir/User
+//     with a container's pod spec per the k8s four-quadrant table, with $(VAR)
+//     expansion and upstream's runAsNonRoot rule (runspec.go). It is the one
+//     producer of a pulled container's argv.
+//
 //   - Materialize: copy the unpacked tree into the per-pod rootfs using APFS
 //     copy-on-write via golang.org/x/sys/unix.Clonefile. The cache and pod
 //     rootfs MUST be on the same APFS volume for the clone to succeed; on EXDEV
 //     (cross-device) or ENOTSUP (non-APFS) the copier falls back to copyfile /
 //     byte-copy. Materialization is idempotent and asserts no
 //     com.apple.quarantine xattr is left on the result.
+//
 //   - Sign: ad-hoc codesign pulled Mach-O binaries (codesign -s - -f) STRIPPING
 //     hardened-runtime and library-validation flags, so a later DYLD insert (the
 //     darwin-net DNS shim) can load. Hardened runtime would block the insert.
+//
 //   - SignaturePolicy gate: enforce runtimev1.SignaturePolicy before exec.
 //     UNSPECIFIED is fail-closed (refuse to run).
 //

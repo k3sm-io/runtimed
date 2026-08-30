@@ -317,6 +317,11 @@ func (f *fakePuller) ref() string {
 // never committed, so the real unpacker could not serve it.
 type fakeUnpacker struct {
 	err error
+	// runCfg is what ImageRunConfig serves, and cfgErr fails that half
+	// independently of MaterializeTree — the two are separate seam methods and a
+	// test that needs one to fail must not be forced to fail the other.
+	runCfg image.ImageRunConfig
+	cfgErr error
 
 	mu       sync.Mutex
 	calls    int
@@ -336,6 +341,19 @@ func (f *fakeUnpacker) MaterializeTree(_ context.Context, mfst *runtimev1.ImageM
 		return nil, f.err
 	}
 	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:fake", Rootfs: dst, Policy: policy}}, nil
+}
+
+// ImageRunConfig serves the fake's configured image run config. The zero value
+// is an image that declares NOTHING — no Entrypoint, no Cmd, no Env — which is
+// the shape every pre-M11.2-d1 test implicitly assumed, so those tests keep
+// asserting on a pod-supplied command alone.
+func (f *fakeUnpacker) ImageRunConfig(_ *runtimev1.ImageManifest) (image.ImageRunConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cfgErr != nil {
+		return image.ImageRunConfig{}, f.cfgErr
+	}
+	return f.runCfg, nil
 }
 
 // observed returns the call count and the last (policy, destination) pair, so a
