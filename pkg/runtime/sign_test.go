@@ -32,9 +32,14 @@ import (
 // orderedSigner records the ORDER of Sign/Check calls so a test can assert the
 // policy gate runs in the right sequence relative to the ad-hoc-sign step (M2.6).
 type orderedSigner struct {
-	mu       sync.Mutex
-	calls    []string
+	mu    sync.Mutex
+	calls []string
+	// checkErr is the verdict Check returns once checkErrSeq is exhausted.
 	checkErr error
+	// checkErrSeq is consumed one entry per Check call, before checkErr applies. It
+	// exists for the ADHOC_OK path, whose whole point is that the FIRST check and a
+	// later one can differ: unsigned, then signed.
+	checkErrSeq []error
 }
 
 func (s *orderedSigner) Sign(context.Context, string) error {
@@ -47,11 +52,17 @@ func (s *orderedSigner) Sign(context.Context, string) error {
 func (s *orderedSigner) Check(_ context.Context, policy runtimev1.SignaturePolicy, _ string) error {
 	s.mu.Lock()
 	s.calls = append(s.calls, "check")
+	var queued error
+	if len(s.checkErrSeq) > 0 {
+		queued, s.checkErrSeq = s.checkErrSeq[0], s.checkErrSeq[1:]
+	} else {
+		queued = s.checkErr
+	}
 	s.mu.Unlock()
 	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_UNSPECIFIED {
 		return image.ErrPolicyUnspecified
 	}
-	return s.checkErr
+	return queued
 }
 
 func (s *orderedSigner) seq() []string {
@@ -67,17 +78,30 @@ func (s *orderedSigner) seq() []string {
 // (no silent downgrade), while adhoc-ok signs then checks.
 func TestGateSignatureOrdering(t *testing.T) {
 	cases := []struct {
-		name       string
-		policy     runtimev1.SignaturePolicy
-		hostBinary bool
-		checkErr   error
-		wantSeq    []string
-		wantErr    bool
+		name        string
+		policy      runtimev1.SignaturePolicy
+		hostBinary  bool
+		checkErr    error
+		checkErrSeq []error
+		wantSeq     []string
+		wantErr     bool
 	}{
 		{
-			name:    "adhoc-ok-signs-then-checks",
+			// CHECK FIRST. A binary that is already validly signed — the ordinary
+			// case for a rootfs cloned from a tree signed once at pull time — is
+			// NEVER re-signed: `codesign -f` would rewrite it and de-CoW argv[0] on
+			// every start.
+			name:    "adhoc-ok-already-valid-checks-without-signing",
 			policy:  runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
-			wantSeq: []string{"sign", "check"},
+			wantSeq: []string{"check"},
+		},
+		{
+			// An unsigned binary still gets signed, and the signature is still
+			// confirmed before exec: check (fails) -> sign -> check.
+			name:        "adhoc-ok-unsigned-signs-then-rechecks",
+			policy:      runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
+			checkErrSeq: []error{image.ErrSignatureRejected},
+			wantSeq:     []string{"check", "sign", "check"},
 		},
 		{
 			// A host binary (native pod / host path) is already signed + read-only:
@@ -109,7 +133,7 @@ func TestGateSignatureOrdering(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			signer := &orderedSigner{checkErr: tc.checkErr}
+			signer := &orderedSigner{checkErr: tc.checkErr, checkErrSeq: tc.checkErrSeq}
 			rt := newTestRuntime(t, Deps{Signer: signer})
 			err := rt.gateSignature(context.Background(), tc.policy, "/fake/bin", tc.hostBinary)
 			if (err != nil) != tc.wantErr {

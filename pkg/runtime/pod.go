@@ -1114,7 +1114,13 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //     host helper alike), so the binary execs unmodified.
 //   - ADHOC_OK (pulled image): ad-hoc signing is the point (an unsigned arm64
 //     Mach-O in the writable pod rootfs is signed so it execs under AMFI with a
-//     later DYLD insert) — so SIGN, then Check confirms the signature took.
+//     later DYLD insert) — but CHECK FIRST and sign only if the check fails. An
+//     ad-hoc signature is content-addressed and survives clonefile verbatim, so a
+//     pod rootfs cloned from an already-signed tree needs no signing at all; an
+//     unconditional `codesign -s - -f` would rewrite argv[0] on EVERY START and
+//     de-CoW it, turning a free clone into a full copy each time the pod restarts.
+//     When the first check fails the binary is signed and re-checked, so the
+//     signature is still confirmed before exec.
 //   - REQUIRE_SIGNED / REQUIRE_NOTARIZED: enforce the policy on the AS-PULLED
 //     binary and NEVER ad-hoc sign it — `codesign -s - -f` would strip an existing
 //     notarization / replace a real authority with an ad-hoc signature, silently
@@ -1129,6 +1135,13 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 		return r.signer.Check(ctx, policy, path)
 	}
 	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK {
+		// Already valid: return WITHOUT signing — this is the clone-preserving path
+		// (see the ADHOC_OK bullet above). A check that fails for a reason other than
+		// an absent signature (a codesign tool failure) also falls through to sign +
+		// re-check, which surfaces the underlying error rather than hiding it.
+		if err := r.signer.Check(ctx, policy, path); err == nil {
+			return nil
+		}
 		if err := r.signer.Sign(ctx, path); err != nil {
 			return fmt.Errorf("ad-hoc sign %s: %w", path, err)
 		}
