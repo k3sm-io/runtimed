@@ -597,7 +597,7 @@ func validateExtraPaths(dataVol string, protectedPrefixes []string, groups ...[]
 			}
 			for _, pre := range protectedPrefixes {
 				if isUnder(p, pre) {
-					return fmt.Errorf("%w: %q is under protected %q", ErrProtectedPath, raw, pre)
+					return fmt.Errorf("%w: %q is under protected %q; relocate the runtime root off this prefix with the k3sm server --pod-root flag", ErrProtectedPath, raw, pre)
 				}
 			}
 		}
