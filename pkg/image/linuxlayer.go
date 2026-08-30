@@ -28,7 +28,7 @@ import (
 
 // SemanticsLinux is the LINUX layer dialect: an OCI image whose payload is ELF
 // and runs inside a micro-VM guest that CHROOTS (or pivot_roots) into the
-// materialized rootfs (m11-plan §M11.2-d1).
+// materialized rootfs.
 //
 // Everything this dialect does differently from SemanticsNative follows from
 // that one fact — there IS a root, and it is the tree:
@@ -66,7 +66,7 @@ func LinuxUnpackPolicy() UnpackPolicy { return UnpackPolicy{Semantics: Semantics
 // never a silent merge — because the two outcomes of a merge are both
 // unacceptable: the later entry's content silently replaces the earlier one's
 // under a name the image never wrote, and the resulting tree is then committed
-// under a ChainID that claims to be the image. m11-plan Resolution 8 puts the
+// under a ChainID that claims to be the image. The design puts the
 // snapshot store on a dedicated case-sensitive APFS volume so this condition
 // should be unreachable in production; this check is the defense in depth that
 // makes a mis-provisioned volume LOUD instead of silently lossy.

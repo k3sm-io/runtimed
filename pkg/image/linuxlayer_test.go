@@ -447,7 +447,7 @@ func TestLinuxRootfsHardlinkContainment(t *testing.T) {
 	})
 }
 
-// TestLinuxRootfsCaseCollisionFailsClosed pins m11-plan Resolution 8's defense
+// TestLinuxRootfsCaseCollisionFailsClosed pins the case-collision defense
 // in depth: two paths a case-insensitive or normalization-insensitive volume
 // would merge are a TYPED error and nothing is committed.
 //

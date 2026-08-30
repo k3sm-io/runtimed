@@ -99,7 +99,7 @@ func TestEgressImpliesNetwork(t *testing.T) {
 
 // TestEgressRetiredRules pins what the egress branch must NOT emit. The
 // range-based deny set, the tier-3 re-allows, and the kine-loopback deny were
-// retired from this milestone (m8-plan Resolution 21): per-IP filters do not
+// retired from this surface: per-IP filters do not
 // compile on macOS 26, so emitting one would not tighten anything — it would make
 // every networked pod fail at sandbox_apply while LOOKING like enforcement.
 // Network-layer enforcement is the networking datapath's future work.

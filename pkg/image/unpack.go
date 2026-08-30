@@ -76,7 +76,7 @@ const (
 
 // SnapshotsSubdir is the cache-root-relative directory the LINUX dialect's
 // ChainID-keyed snapshots live in: <root>/snapshots, a sibling of unpacked/,
-// blobs/, pods/, index/ and ingest/ (m11-plan §M11.2-d1).
+// blobs/, pods/, index/ and ingest/.
 //
 // It is a SEPARATE store from unpacked/, not a second dialect filed in the same
 // one, for two reasons that are both about the key rather than about tidiness:
@@ -90,7 +90,7 @@ const (
 //   - the chain id is the ONLY key that lets two different images sharing a
 //     layer prefix share stored bytes, and it is the key the guest's rootfs
 //     shares are named by — so the snapshot store is what moves to the
-//     dedicated case-sensitive APFS volume (m11-plan Resolution 8), while
+//     dedicated case-sensitive APFS volume (by design), while
 //     unpacked/ stays with the rest of the cache.
 //
 // Snapshots inherit unpacked/'s honest limitation verbatim: neither GC
@@ -682,7 +682,7 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 	// The staging directory is created under the SAME store the tree commits
 	// into, because the commit is an os.Rename and rename(2) cannot cross a
 	// filesystem — and the Linux dialect's store is, by design, a different
-	// APFS volume from the rest of the cache (m11-plan Resolution 8). Staging
+	// APFS volume from the rest of the cache (the case-sensitivity decision). Staging
 	// under a fixed root would make every snapshot commit fail with EXDEV on a
 	// correctly provisioned node.
 	parent := u.cache.UnpackedRoot()
