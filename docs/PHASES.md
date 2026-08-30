@@ -418,7 +418,8 @@ phases:
 
   - id: M8
     title: MLX — native Apple-Silicon ML serving (runtimed slice — Metal SBPL + egress + tree signing + GPUFacts; consumes the M11.2-d7 unpacker)
-    status: todo
+    status: done
+    completed: 2026-08-29
     depends_on:
       - apis:M8.1
     subphases:
