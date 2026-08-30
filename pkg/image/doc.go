@@ -43,6 +43,18 @@ limitations under the License.
 //     entries are EDGES, never reachability roots: they can never protect a blob
 //     from the GC, whose root set stays daemon-authored (see FileIndex,
 //     ImageRoot).
+//   - Ingest: admit an archive that arrived from OUTSIDE the registry path — a
+//     `docker save` tar or a tarred OCI layout streamed by `k3sm image
+//     load`/`import` (load.go). It reduces to the same store primitives Pull
+//     uses, in a strict order: EVERY blob is re-hashed against the digest the
+//     archive's own manifest claims for it BEFORE a lease is taken or anything
+//     is committed, so a mismatch rejects the whole load and leaves the store
+//     untouched — not even the blobs that verified. The reference is recorded
+//     last. The docker-save leg's per-blob check is self-consistency (that
+//     format's descriptors are synthesized from the bytes); the OCI-layout leg
+//     is the one where the claim genuinely descends from a document whose own
+//     digest is pinned. Loaded images are provenance-free by design: no
+//     SignaturePolicy is evaluated here.
 //   - Materialize: copy the cached payload into the per-pod rootfs using APFS
 //     copy-on-write via golang.org/x/sys/unix.Clonefile. The cache and pod
 //     rootfs MUST be on the same APFS volume for the clone to succeed; on EXDEV
