@@ -66,6 +66,24 @@ type Puller interface {
 	Pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy, pull runtimev1.ImagePullPolicy) (*image.PullResult, error)
 }
 
+// Unpacker turns a PULLED image into files in a pod's rootfs (M11.2-d7): it
+// builds (or serves) the image's content-addressed unpacked tree and clones that
+// tree into the pod rootfs. The concrete *image.Unpacker satisfies it; it is
+// defined at the consumer per the standards so tests can inject a fake that
+// touches no blob store.
+//
+// It is ONE method, not "unpack" plus "materialize", on purpose. Splitting it
+// would let a caller record an image as materialized when only the tree was
+// built — the exact half-done state the M1 placeholder left behind, where the
+// blobs were cached and the pod rootfs was empty.
+//
+// policy (the layer dialect) rides on the CALL for the same reason the pull's
+// PlatformPolicy does: the dialect follows the pod's resolved sandbox backend,
+// which is decided per pod.
+type Unpacker interface {
+	MaterializeTree(ctx context.Context, mfst *runtimev1.ImageManifest, policy image.UnpackPolicy, dstRootfs string) (*image.MaterializeResult, error)
+}
+
 // Signer ad-hoc signs a pulled binary and gates it against a SignaturePolicy
 // before exec. The image package provides both halves; the Runtime consumes them
 // as one seam (fakeable in tests). gateSignature orders the two correctly per
@@ -172,6 +190,10 @@ type Runtime struct {
 	log    *slog.Logger
 	cache  *image.Cache
 	puller Puller
+	// unpacker materializes a pulled image's unpacked tree into the pod rootfs
+	// (M11.2-d7). It is the seam that replaced resolveBinary's M1 "the blobs are
+	// cached, the rootfs is empty" placeholder.
+	unpacker Unpacker
 	// loader is the archive-ingest path the Images service's LoadImage serves
 	// (`k3sm image load` / `import`). It is a CONCRETE *image.Loader, not a seam:
 	// the property that makes an ingest safe is the store's own commit ordering
@@ -287,10 +309,16 @@ func (r *Runtime) reconcileNetworkStartup(ctx context.Context) error {
 // nil field with its production default (real image puller/signer, the exec-shim
 // sandbox backend, posix_spawn/kqueue, single-node network).
 type Deps struct {
-	Cache   *image.Cache
-	Puller  Puller
-	Signer  Signer
-	Backend sandbox.Backend
+	Cache  *image.Cache
+	Puller Puller
+	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
+	// Defaults to image.NewUnpacker(cache) — the SAME cache the puller commits
+	// blobs to, which is load-bearing: an unpacker over a different store could
+	// not verify a byte it applies, because the digests it checks against come
+	// from the manifest that store's pull resolved. Tests inject a fake.
+	Unpacker Unpacker
+	Signer   Signer
+	Backend  sandbox.Backend
 	// VMBackend is the Virtualization.framework micro-VM backend (M5.1). Defaults
 	// to sandbox.NewVMBackend(), whose Available() is false unless the host has
 	// Virtualization.framework + the com.apple.security.virtualization entitlement
@@ -407,6 +435,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		puller = p
 	}
+	unpacker := deps.Unpacker
+	if unpacker == nil {
+		u, err := image.NewUnpacker(cache)
+		if err != nil {
+			return nil, fmt.Errorf("init image unpacker: %w", err)
+		}
+		unpacker = u
+	}
 	loader, err := image.NewLoader(cache, index)
 	if err != nil {
 		return nil, fmt.Errorf("init image loader: %w", err)
@@ -510,6 +546,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		log:          log,
 		cache:        cache,
 		puller:       puller,
+		unpacker:     unpacker,
 		loader:       loader,
 		signer:       signer,
 		credentials:  deps.Credentials,
