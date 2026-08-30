@@ -98,16 +98,30 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "exec: %v", err)
 	}
-	dir := c.GetWorkingDir()
+	// The container's OWN working directory and environment, as
+	// startContainer resolved them — which for a pulled image includes the
+	// image config's WorkingDir and Env (image.MergeRunSpec). An exec session
+	// that re-derived them from the container spec alone would run with a
+	// different $PATH than the container it is exec'ing into, which is exactly
+	// the surprise `kubectl exec` must not produce. The fallback keeps a
+	// container spawned before this field existed (and every host-binary route,
+	// where the two are identical) working unchanged.
+	dir := cp.workingDir
+	if dir == "" {
+		dir = c.GetWorkingDir()
+	}
 	if dir == "" {
 		dir = rootfs
 	}
 
 	cmd := exec.CommandContext(ctx, shimPath)
 	cmd.Args = shimArgv
-	cmdEnv, err := r.containerEnv(p.box, c)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "exec: %v", err)
+	cmdEnv := cp.env
+	if cmdEnv == nil {
+		cmdEnv, err = r.containerEnv(p.box, c, nil)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "exec: %v", err)
+		}
 	}
 	cmd.Env = cmdEnv
 	cmd.Dir = dir

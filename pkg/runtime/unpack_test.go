@@ -306,3 +306,233 @@ func hexRun(c byte) string {
 	}
 	return string(b)
 }
+
+// TestUnpackPolicyFollowsTheResolvedBackend pins the dialect discriminator at
+// the ONE place that produces it: the pod's RESOLVED sandbox backend, the same
+// value pullPolicy reads. A pod on the vm rung must materialize under the LINUX
+// dialect, and an unset backend must fail closed rather than silently apply
+// Mach-O rules to a Linux image.
+func TestUnpackPolicyFollowsTheResolvedBackend(t *testing.T) {
+	cases := []struct {
+		backend runtimev1.SandboxBackend
+		want    image.UnpackPolicy
+		wantErr bool
+	}{
+		{runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC, image.NativeUnpackPolicy(), false},
+		{runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_EXEC, image.NativeUnpackPolicy(), false},
+		{runtimev1.SandboxBackend_SANDBOX_BACKEND_UIDJAIL, image.NativeUnpackPolicy(), false},
+		{runtimev1.SandboxBackend_SANDBOX_BACKEND_VM, image.LinuxUnpackPolicy(), false},
+		{runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED, image.UnpackPolicy{}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.backend.String(), func(t *testing.T) {
+			got, err := unpackPolicy(tc.backend)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("unpackPolicy(%v) = %+v, want an error", tc.backend, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unpackPolicy: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("policy = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	// Through resolveBinary: a pod whose resolved backend is the vm rung
+	// materializes under the Linux dialect, not the native one.
+	t.Run("through_resolve_binary", func(t *testing.T) {
+		unpack := &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}}
+		rt := newTestRuntime(t, Deps{
+			Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.com/app:v1"}},
+			Unpacker: unpack,
+		})
+		p := &pod{box: hostBinBox(rt, "pod-vm"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_VM}
+		if _, err := rt.resolveBinary(context.Background(), p, derivedRootfs(t, rt, "pod-vm"),
+			&runtimev1.Container{Name: "app", Image: "example.com/app:v1"}); err != nil {
+			t.Fatalf("resolveBinary: %v", err)
+		}
+		if _, policy, _ := unpack.observed(); policy != image.LinuxUnpackPolicy() {
+			t.Errorf("materialized under %+v, want the linux dialect", policy)
+		}
+	})
+
+	// An unresolved backend refuses the container instead of materializing it.
+	t.Run("unset_backend_refuses", func(t *testing.T) {
+		unpack := &fakeUnpacker{}
+		rt := newTestRuntime(t, Deps{
+			Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.com/app:v1"}},
+			Unpacker: unpack,
+		})
+		p := &pod{box: hostBinBox(rt, "pod-nobackend")}
+		_, err := rt.resolveBinary(context.Background(), p, derivedRootfs(t, rt, "pod-nobackend"),
+			&runtimev1.Container{Name: "app", Image: "example.com/app:v1", Command: []string{"app"}})
+		if err == nil {
+			t.Fatal("resolveBinary accepted a pod with no resolved backend")
+		}
+		if calls, _, _ := unpack.observed(); calls != 0 {
+			t.Errorf("MaterializeTree called %d times with no resolved backend, want 0", calls)
+		}
+	})
+}
+
+// TestResolveBinaryMergesTheImageConfig pins the M11.2-d1 wiring of
+// image.MergeRunSpec into the OCI route — the replacement for the M1 placeholder
+// that made argv literally command+args.
+//
+// Two rows are RED AT MAIN in the strongest sense: a container with args and no
+// command PANICKED on cmd[0], and a container with neither was refused outright
+// even though its image declared an Entrypoint.
+func TestResolveBinaryMergesTheImageConfig(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      image.ImageRunConfig
+		command  []string
+		args     []string
+		wantArgv []string
+		wantEnv  []string
+		wantDir  string
+	}{
+		{
+			name:     "image_entrypoint_and_cmd_with_no_pod_command",
+			cfg:      image.ImageRunConfig{Entrypoint: []string{"bin/server"}, Cmd: []string{"--serve"}, Env: []string{"PATH=/usr/bin"}, WorkingDir: "/srv"},
+			wantArgv: []string{"bin/server", "--serve"},
+			wantEnv:  []string{"PATH=/usr/bin"},
+			wantDir:  "/srv",
+		},
+		{
+			name:     "pod_args_over_image_entrypoint",
+			cfg:      image.ImageRunConfig{Entrypoint: []string{"bin/server"}, Cmd: []string{"--serve"}},
+			args:     []string{"--other"},
+			wantArgv: []string{"bin/server", "--other"},
+		},
+		{
+			name:     "pod_command_discards_image_cmd",
+			cfg:      image.ImageRunConfig{Entrypoint: []string{"bin/server"}, Cmd: []string{"--serve"}},
+			command:  []string{"bin/other"},
+			wantArgv: []string{"bin/other"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unpack := &fakeUnpacker{runCfg: tc.cfg}
+			rt := newTestRuntime(t, Deps{
+				Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.com/app:v1"}},
+				Unpacker: unpack,
+			})
+			p := &pod{box: hostBinBox(rt, "pod-merge"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+			rootfs := derivedRootfs(t, rt, "pod-merge")
+			rb, err := rt.resolveBinary(context.Background(), p, rootfs,
+				&runtimev1.Container{Name: "app", Image: "example.com/app:v1", Command: tc.command, Args: tc.args})
+			if err != nil {
+				t.Fatalf("resolveBinary: %v", err)
+			}
+			// argv[0] is the merged program resolved against the pod rootfs.
+			want := append([]string{}, tc.wantArgv...)
+			want[0] = filepath.Join(rootfs, want[0])
+			if len(rb.argv) != len(want) {
+				t.Fatalf("argv = %v, want %v", rb.argv, want)
+			}
+			for i := range want {
+				if rb.argv[i] != want[i] {
+					t.Fatalf("argv = %v, want %v", rb.argv, want)
+				}
+			}
+			if rb.path != want[0] {
+				t.Errorf("path = %q, want %q", rb.path, want[0])
+			}
+			if tc.wantEnv != nil {
+				if len(rb.env) != len(tc.wantEnv) || rb.env[0] != tc.wantEnv[0] {
+					t.Errorf("env = %v, want %v", rb.env, tc.wantEnv)
+				}
+			}
+			if rb.workingDir != tc.wantDir {
+				t.Errorf("workingDir = %q, want %q", rb.workingDir, tc.wantDir)
+			}
+		})
+	}
+
+	// A container that neither the pod nor the image gives a command to is a
+	// legible REFUSAL, not an empty argv handed to a spawn.
+	t.Run("nothing_to_run_is_refused", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{
+			Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.com/app:v1"}},
+			Unpacker: &fakeUnpacker{},
+		})
+		p := &pod{box: hostBinBox(rt, "pod-nocmd"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+		_, err := rt.resolveBinary(context.Background(), p, derivedRootfs(t, rt, "pod-nocmd"),
+			&runtimev1.Container{Name: "app", Image: "example.com/app:v1"})
+		if !errors.Is(err, image.ErrRunSpecInvalid) {
+			t.Fatalf("resolveBinary error = %v, want image.ErrRunSpecInvalid", err)
+		}
+	})
+
+	// The runAsNonRoot rule reaches the container: an image whose USER is a NAME
+	// under runAsNonRoot is refused, because the host will not resolve a name out
+	// of the image's own /etc/passwd to decide a privilege question.
+	t.Run("run_as_non_root_with_a_named_image_user_is_refused", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{
+			Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.com/app:v1"}},
+			Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}, User: "nobody"}},
+		})
+		p := &pod{box: hostBinBox(rt, "pod-nonroot"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+		_, err := rt.resolveBinary(context.Background(), p, derivedRootfs(t, rt, "pod-nonroot"),
+			&runtimev1.Container{
+				Name: "app", Image: "example.com/app:v1",
+				SecurityContext: &runtimev1.SecurityContext{RunAsNonRoot: true},
+			})
+		if !errors.Is(err, image.ErrRunSpecInvalid) {
+			t.Fatalf("resolveBinary error = %v, want image.ErrRunSpecInvalid", err)
+		}
+	})
+
+	// The HOST-BINARY routes never consult the image config: there is no image.
+	t.Run("host_binary_routes_carry_no_merged_env", func(t *testing.T) {
+		for _, c := range []*runtimev1.Container{
+			{Name: "app", Image: NativeImage, Command: []string{"/bin/sleep"}, WorkingDir: "/w"},
+			{Name: "app", Image: "/bin/sleep", WorkingDir: "/w"},
+		} {
+			rt := newTestRuntime(t, Deps{Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Env: []string{"LEAK=1"}}}})
+			p := &pod{box: hostBinBox(rt, "pod-host2"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+			rb, err := rt.resolveBinary(context.Background(), p, derivedRootfs(t, rt, "pod-host2"), c)
+			if err != nil {
+				t.Fatalf("resolveBinary: %v", err)
+			}
+			if rb.env != nil {
+				t.Errorf("host-binary route carried a merged env %v", rb.env)
+			}
+			if rb.workingDir != "/w" {
+				t.Errorf("workingDir = %q, want the pod's own /w", rb.workingDir)
+			}
+		}
+	})
+}
+
+// TestContainerEnvMergesTheImageEnvironment pins the env seam: a pulled image's
+// $PATH reaches the child, the pod's entries still override it, and the DYLD
+// shim injection is unchanged on top of the merged base.
+func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
+	rt := newTestRuntime(t, Deps{})
+	box := hostBinBox(rt, "pod-env")
+	c := &runtimev1.Container{Name: "app", Env: []*runtimev1.EnvVar{{Name: "POD", Value: "1"}}}
+
+	merged, err := rt.containerEnv(box, c, []string{"PATH=/usr/bin", "POD=1"})
+	if err != nil {
+		t.Fatalf("containerEnv: %v", err)
+	}
+	if len(merged) != 2 || merged[0] != "PATH=/usr/bin" || merged[1] != "POD=1" {
+		t.Errorf("env = %v, want the merged base verbatim", merged)
+	}
+
+	// nil base keeps the pre-M11.2-d1 behaviour byte for byte.
+	fallback, err := rt.containerEnv(box, c, nil)
+	if err != nil {
+		t.Fatalf("containerEnv: %v", err)
+	}
+	if len(fallback) != 1 || fallback[0] != "POD=1" {
+		t.Errorf("fallback env = %v, want [POD=1]", fallback)
+	}
+}

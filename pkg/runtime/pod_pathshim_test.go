@@ -146,7 +146,7 @@ func TestContainerEnvExplicitDyldWins(t *testing.T) {
 // silently dropped that error would hide a rejected id behind an empty env.
 func mustEnv(t *testing.T, rt *Runtime, box *runtimev1.PodBox, c *runtimev1.Container) []string {
 	t.Helper()
-	env, err := rt.containerEnv(box, c)
+	env, err := rt.containerEnv(box, c, nil)
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)
 	}
