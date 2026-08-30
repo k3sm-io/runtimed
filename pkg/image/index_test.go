@@ -346,7 +346,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 				nodes, len(manifestDigests(mfst)))
 		}
 
-		plan, err := PlanPrune(nodes, roots, nil, 0, time.Now())
+		plan, err := PlanPrune(nodes, nil, roots, nil, 0, time.Now())
 		if err != nil {
 			t.Fatalf("PlanPrune: %v", err)
 		}
@@ -407,7 +407,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnumerateBlobs: %v", err)
 		}
-		plan, err := PlanPrune(nodes, roots, nil, 0, time.Now())
+		plan, err := PlanPrune(nodes, nil, roots, nil, 0, time.Now())
 		if err != nil {
 			t.Fatalf("PlanPrune: %v", err)
 		}

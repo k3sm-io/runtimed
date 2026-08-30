@@ -39,9 +39,10 @@ import (
 // in: <root>/index, a SIBLING of blobs/ and pods/.
 //
 // Being a sibling is the structural half of the edge-not-root invariant (see
-// FileIndex): the GC's two enumerators read blobs/ (Cache.EnumerateBlobs) and
-// pods/ (Cache.Roots) and neither can reach this tree, so an index entry cannot
-// become a reachability root by any code path — not merely by convention.
+// FileIndex): the GC's enumerators read blobs/ (Cache.EnumerateBlobs), pods/
+// (Cache.Roots) and the tree stores (Cache.EnumerateTrees), and none of them can
+// reach this tree, so an index entry cannot become a reachability root by any
+// code path — not merely by convention.
 //
 // It is a named constant because a confined pod must never be able to write
 // here (a writable index is a way to make a reference resolve to another

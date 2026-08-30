@@ -86,6 +86,12 @@ const (
 	// ReasonDeleteStaleTemp marks an abandoned CommitBlob temp file older than
 	// grace.
 	ReasonDeleteStaleTemp PruneReason = "delete-stale-temp"
+	// ReasonDeleteUnusableTree marks an unpacked tree whose daemon-authored
+	// record is missing, unreadable or self-contradictory. Such a tree can no
+	// longer be served (Unpacker.openCommitted refuses it), so it holds space
+	// while satisfying nothing; rebuilding it is the only way back. It is a
+	// TREE-ONLY verdict: no blob is ever deleted for being unreadable.
+	ReasonDeleteUnusableTree PruneReason = "delete-unusable-tree"
 )
 
 // PruneDecision pairs an inventory node with the reason it was decided.
@@ -101,21 +107,35 @@ type PruneDecision struct {
 // would be a node the plan says nothing about, and the executor's contract
 // ("delete exactly what the plan condemns") would then be silently narrower than
 // the planner's contract ("account for everything").
+//
+// The same partition is asserted over the TREE inventory: DeleteTrees and
+// KeepTrees are the same exact partition of the caller-supplied TreeNodes, kept
+// in their own fields because the two halves are executed by different, mutually
+// unreachable executors (ExecutePrune touches only blobs/, ExecuteTreePrune only
+// the tree stores) and a single mixed list would have to be re-split by kind at
+// every use.
 type PrunePlan struct {
 	Delete []PruneDecision
 	Keep   []PruneDecision
+	// DeleteTrees and KeepTrees are the tree-store half of the plan (treeprune.go).
+	DeleteTrees []TreeDecision
+	KeepTrees   []TreeDecision
 }
 
-// DeletedBytes is the summed logical size of the plan's Delete set.
+// DeletedBytes is the summed logical size of everything the plan condemns —
+// blobs AND trees.
 //
 // It is what a DRY RUN reports as reclaimable, and it is deliberately an
-// over-estimate rather than a prediction: under APFS clonefile a blob whose
-// extents are still shared with a materialized pod rootfs frees NOTHING when it
-// is unlinked. Real reclaim is therefore measured with statfs after the fact
-// (see ReclaimUnderPressure), never computed from this number.
+// over-estimate rather than a prediction: under APFS clonefile a blob or a tree
+// whose extents are still shared with a materialized pod rootfs frees NOTHING
+// when it is removed. Real reclaim is therefore measured with statfs after the
+// fact (see ReclaimUnderPressure), never computed from this number.
 func (p *PrunePlan) DeletedBytes() int64 {
 	var n int64
 	for _, d := range p.Delete {
+		n += d.Node.Size
+	}
+	for _, d := range p.DeleteTrees {
 		n += d.Node.Size
 	}
 	return n
@@ -173,10 +193,12 @@ func validKind(k BlobKind) bool {
 // PlanPrune computes a prune plan over caller-supplied data. It performs NO
 // filesystem access and reads no clock: now is injected.
 //
-// nodes is the store inventory (Cache.EnumerateBlobs, or a fixture); roots is
-// the COMPLETE daemon-authored root set (Cache.Roots — an incomplete one must
-// never reach here); leased is the digest set in-flight ingests hold; grace is
-// the minimum age a node must have before it is delete-eligible.
+// nodes is the blob inventory (Cache.EnumerateBlobs, or a fixture); trees is the
+// tree-store inventory (Cache.EnumerateTrees, or a fixture, or nil to plan blobs
+// alone); roots is the COMPLETE daemon-authored root set (Cache.Roots — an
+// incomplete one must never reach here); leased is the digest set in-flight
+// ingests hold; grace is the minimum age a node must have before it is
+// delete-eligible.
 //
 // Reachability is the whole rule and it is one line: a content blob is KEPT iff
 // some root names it or some lease pins it. There is no promotion rule, no
@@ -188,7 +210,13 @@ func validKind(k BlobKind) bool {
 //   - a node younger than grace is KEPT;
 //   - a structurally invalid input (empty/duplicate path, unknown kind, negative
 //     size, zero now, negative grace) is an ERROR and nothing is planned.
-func PlanPrune(nodes []BlobNode, roots []ImageRoot, leased []string, grace time.Duration, now time.Time) (*PrunePlan, error) {
+//
+// Trees are decided from the SAME root and lease sets by planTrees (treeprune.go),
+// which states their own — deliberately different — root-set rule. The one rule
+// that spans both halves is the one this function enforces by construction: a
+// tree's record contributes NOTHING to blob reachability, so derived content can
+// never keep a blob alive.
+func PlanPrune(nodes []BlobNode, trees []TreeNode, roots []ImageRoot, leased []string, grace time.Duration, now time.Time) (*PrunePlan, error) {
 	if now.IsZero() {
 		return nil, errors.New("plan prune: zero reference time")
 	}
@@ -209,6 +237,26 @@ func PlanPrune(nodes []BlobNode, roots []ImageRoot, leased []string, grace time.
 		}
 		if n.Size < 0 {
 			return nil, fmt.Errorf("plan prune: node %q has negative size %d", n.Path, n.Size)
+		}
+	}
+	seenTrees := make(map[string]bool, len(trees))
+	for i, n := range trees {
+		if n.Path == "" {
+			return nil, fmt.Errorf("plan prune: tree %d has an empty path", i)
+		}
+		id := string(n.Store) + "/" + n.Path
+		if seenTrees[id] {
+			return nil, fmt.Errorf("plan prune: duplicate tree inventory path %q", id)
+		}
+		seenTrees[id] = true
+		if n.Store != TreeStoreUnpacked && n.Store != TreeStoreSnapshots {
+			return nil, fmt.Errorf("plan prune: tree %q has unknown store %q", n.Path, n.Store)
+		}
+		if !validTreeKind(n.Kind) {
+			return nil, fmt.Errorf("plan prune: tree %q has unknown kind %q", n.Path, n.Kind)
+		}
+		if n.Size < 0 {
+			return nil, fmt.Errorf("plan prune: tree %q has negative size %d", n.Path, n.Size)
 		}
 	}
 
@@ -259,6 +307,8 @@ func PlanPrune(nodes []BlobNode, roots []ImageRoot, leased []string, grace time.
 		}
 	}
 
+	planTrees(plan, trees, reachable, leasedSet, grace, now)
+
 	sort.Slice(plan.Delete, func(i, j int) bool { return plan.Delete[i].Node.Path < plan.Delete[j].Node.Path })
 	sort.Slice(plan.Keep, func(i, j int) bool { return plan.Keep[i].Node.Path < plan.Keep[j].Node.Path })
 
@@ -280,6 +330,25 @@ func PlanPrune(nodes []BlobNode, roots []ImageRoot, leased []string, grace time.
 	for p := range seen {
 		if !part[p] {
 			return nil, fmt.Errorf("plan prune: internal partition violation: %q undecided", p)
+		}
+	}
+	if got := len(plan.DeleteTrees) + len(plan.KeepTrees); got != len(trees) {
+		return nil, fmt.Errorf("plan prune: internal partition violation: %d tree decisions for %d trees", got, len(trees))
+	}
+	treePart := make(map[string]bool, len(trees))
+	for _, d := range plan.DeleteTrees {
+		treePart[string(d.Node.Store)+"/"+d.Node.Path] = true
+	}
+	for _, d := range plan.KeepTrees {
+		id := string(d.Node.Store) + "/" + d.Node.Path
+		if treePart[id] {
+			return nil, fmt.Errorf("plan prune: internal partition violation: %q in both tree sets", id)
+		}
+		treePart[id] = true
+	}
+	for id := range seenTrees {
+		if !treePart[id] {
+			return nil, fmt.Errorf("plan prune: internal partition violation: %q undecided", id)
 		}
 	}
 	return plan, nil
