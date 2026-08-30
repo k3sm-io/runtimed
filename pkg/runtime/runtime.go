@@ -215,13 +215,22 @@ type Runtime struct {
 	// additive RuntimeConditions ONLY — nothing in the pod spine consumes them.
 	rosettaHost  rosettaCondition
 	rosettaGuest rosettaCondition
-	spawner      supervisor.Spawner
-	waiter       supervisor.ExitWaiter
-	network      supervisor.PodNetwork
-	resolver     mount.Resolver
-	binder       *volume.Binder
-	footprinter  supervisor.Footprinter
-	broker       *broker
+	// gpuFacts is the host's GPU observation (M8.2-d4), probed EAGERLY EXACTLY ONCE
+	// in New and IMMUTABLE thereafter — so the concurrent GetRuntimeInfo handler
+	// reads it with no lock and no race, and the Metal driver round trip happens
+	// once per daemon lifetime (see gpu.go). Plain data, never a proto pointer.
+	gpuFacts sandbox.GPUFacts
+	// gpuDevice is the probed Metal device name, kept beside the facts for the one
+	// construction-time log line: it is a diagnostic string, never a reported fact
+	// (a device name is not a scheduling input), so it is not on the wire.
+	gpuDevice   string
+	spawner     supervisor.Spawner
+	waiter      supervisor.ExitWaiter
+	network     supervisor.PodNetwork
+	resolver    mount.Resolver
+	binder      *volume.Binder
+	footprinter supervisor.Footprinter
+	broker      *broker
 
 	// signalGroup signals a pod's process GROUP (supervisor.SignalGroup in
 	// production); it is a field so the graceful-stop (M2.4) and OOM-kill (M2.5)
@@ -336,9 +345,16 @@ type Deps struct {
 	// sibling spawns a process and therefore does). New calls it EAGERLY EXACTLY
 	// ONCE, and only when VMBackend.Available() — see evalGuestRosetta.
 	GuestRosetta func() sandbox.GuestRosettaState
-	Spawner      supervisor.Spawner
-	Waiter       supervisor.ExitWaiter
-	Network      supervisor.PodNetwork
+	// GPUProbe observes this host's GPU: the FUNCTIONAL Metal compile+dispatch probe
+	// plus the host sysctl facts (M8.2-d4). Defaults to sandbox.ProbeGPU; tests
+	// inject a fake, which is what makes the whole advertisement decision — the
+	// VZ-paravirtual discrimination, the wired-limit sentinel, the backend scoping —
+	// unit-provable on a machine with no GPU. New calls it EAGERLY EXACTLY ONCE (see
+	// the gpuFacts field), so the GPU driver is touched once per daemon lifetime.
+	GPUProbe func() sandbox.GPUProbeResult
+	Spawner  supervisor.Spawner
+	Waiter   supervisor.ExitWaiter
+	Network  supervisor.PodNetwork
 	// Resolver supplies ConfigMap/Secret data and SA tokens for volume
 	// materialization (M2.2). It has NO production default: runtimed never talks
 	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
@@ -534,11 +550,22 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// is deliberately not taken here.
 	rosettaHost := evalHostRosetta(context.Background(), hostRosettaProbe)
 	rosettaGuest := evalGuestRosetta(vmBackend, guestRosettaProbe)
+	// The GPU probe joins them on the same terms (eager, once, immutable). It is
+	// scoped to the HOST-PROCESS backend resolved above, because that is the rung
+	// whose profile can carry the Metal allow-set — sandbox_gpu_supported is a
+	// property of the selected backend, not of the machine.
+	gpuProbe := deps.GPUProbe
+	if gpuProbe == nil {
+		gpuProbe = sandbox.ProbeGPU
+	}
+	gpuResult := gpuProbe()
+	gpuFacts := sandbox.DeriveGPUFacts(gpuResult, backend)
 	// Log BOTH outcomes, available or not. GetRuntimeInfo's consumer discards Reason
 	// and Message today, so this pair of lines is the only place an operator can
 	// answer "why is my node not labelled for Rosetta?".
 	logRosettaProbe(log, ConditionRosettaHostAvailable, rosettaHost)
 	logRosettaProbe(log, ConditionRosettaGuestAvailable, rosettaGuest)
+	logGPUProbe(log, gpuFacts, gpuResult.Metal.DeviceName)
 
 	return &Runtime{
 		cfg:          cfg,
@@ -554,6 +581,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		vmBackend:    vmBackend,
 		rosettaHost:  rosettaHost,
 		rosettaGuest: rosettaGuest,
+		gpuFacts:     gpuFacts,
+		gpuDevice:    gpuResult.Metal.DeviceName,
 		spawner:      spawner,
 		waiter:       waiter,
 		network:      network,

@@ -160,6 +160,13 @@ type MetalStatus struct {
 	Reason string
 }
 
+// Available reports the ONE availability verdict derived from a probe: the GPU
+// worked AND it is a real GPU. It is the single home of that rule — SandboxGPUSupported
+// and DeriveGPUFacts both call it rather than re-deriving the conjunction, so the
+// paravirtual discrimination cannot be honoured in one place and forgotten in the
+// other (the same one-home discipline HostRosettaState.Available() enforces).
+func (m MetalStatus) Available() bool { return m.Functional && !m.Paravirtual }
+
 // SandboxGPUSupported reports GPUFacts.sandbox_gpu_supported: whether THIS daemon,
 // as configured, can grant a pod GPU access at all. It is the fail-closed
 // advertisement control (m8-plan Resolution 14) and it is scoped to the SELECTED
@@ -173,8 +180,8 @@ type MetalStatus struct {
 //     Metal device to open, so vm reports false rather than a grant that cannot
 //     take effect. An unavailable backend reports false because a pod cannot run
 //     on it at all.
-//   - metal.Functional must be true — the FUNCTIONAL compile+dispatch probe, not a
-//     device nil-check. This is where the family residual documented on
+//   - metal.Available() must be true — the FUNCTIONAL compile+dispatch probe passed
+//     and the device is not the VZ paravirtual one, not a device nil-check. This is where the family residual documented on
 //     metalUserClientClasses is discharged: a host whose user-client classes differ
 //     from the two encoded above cannot complete the probe under this profile, so
 //     it never advertises GPU.
@@ -187,5 +194,5 @@ func SandboxGPUSupported(backend Backend, metal MetalStatus) bool {
 	if backend.Name() != ExecShimBackendName {
 		return false
 	}
-	return metal.Functional
+	return metal.Available()
 }

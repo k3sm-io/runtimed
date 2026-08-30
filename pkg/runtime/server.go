@@ -526,6 +526,12 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 			r.rosettaHost.condition(ConditionRosettaHostAvailable),
 			r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
 		},
+		// GPU facts (M8.2-d4), stamped fresh from the immutable observation New
+		// made. ALWAYS present on a daemon that can probe: the apis contract reads
+		// an absent gpu as "this daemon does not report GPU facts", which is a
+		// different fact from a host with no usable GPU, and collapsing the two
+		// would advertise a GPU resource on nodes that have none.
+		Gpu: gpuFactsProto(r.gpuFacts),
 	}, nil
 }
 

@@ -489,6 +489,15 @@ func testDeps(t *testing.T, d Deps) Deps {
 	if d.ProcGroup == nil {
 		d.ProcGroup = func(int) ([]supervisor.ProcMember, bool) { return nil, true }
 	}
+	// Default the GPU probe to a deterministic "no usable GPU" observation, for the
+	// same reason the vm backend defaults unavailable: otherwise every runtime unit
+	// test would run the REAL Metal compile+dispatch probe and its result would
+	// depend on the test host's hardware. The GPU tests inject their own.
+	if d.GPUProbe == nil {
+		d.GPUProbe = func() sandbox.GPUProbeResult {
+			return sandbox.GPUProbeResult{Metal: sandbox.MetalStatus{Reason: sandbox.MetalReasonNoDevice}}
+		}
+	}
 	return d
 }
 
