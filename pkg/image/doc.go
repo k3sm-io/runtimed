@@ -55,7 +55,17 @@ limitations under the License.
 //     is the one where the claim genuinely descends from a document whose own
 //     digest is pinned. Loaded images are provenance-free by design: no
 //     SignaturePolicy is evaluated here.
-//   - Materialize: copy the cached payload into the per-pod rootfs using APFS
+//   - Unpack: apply the image's layer blobs, in manifest order, into a per-image
+//     UNPACKED TREE keyed by (config digest x layer digests x unpack policy)
+//     under <root>/unpacked (unpack.go, tarapply.go). The apply is
+//     containment-checked twice over — an os.Root anchored at the tree, plus a
+//     name/link-target sanitizer that refuses an absolute or "../" path outright
+//     — because the tree is later cloned verbatim into a pod rootfs that has no
+//     chroot around it. The tree is staged and committed by one os.Rename, so a
+//     failed unpack commits nothing. Layer dialects are named (LayerSemantics)
+//     and part of the key: the native dialect is here, the Linux
+//     whiteout/opaque one is M11.2-d1's.
+//   - Materialize: copy the unpacked tree into the per-pod rootfs using APFS
 //     copy-on-write via golang.org/x/sys/unix.Clonefile. The cache and pod
 //     rootfs MUST be on the same APFS volume for the clone to succeed; on EXDEV
 //     (cross-device) or ENOTSUP (non-APFS) the copier falls back to copyfile /
@@ -77,8 +87,7 @@ limitations under the License.
 // WRITE-time check only. Three limits follow, and none of them is hidden:
 //
 //   - The cache-hit fast path is an os.Stat of a regular file. A blob already on
-//     disk is trusted on its NAME, and every downstream reader (materialize, the
-//     unpacker) trusts the on-disk bytes.
+//     disk is trusted on its NAME by every reader that does not itself re-hash it.
 //   - Every blob written BEFORE this check existed was never hashed by this repo
 //     at all, so an existing cache carries unverified content indefinitely.
 //   - The check proves the fetcher did not corrupt or substitute what the network
@@ -87,10 +96,15 @@ limitations under the License.
 //     sides agree. Authenticity is a signature problem (SignaturePolicy), not a
 //     CAS problem.
 //
-// Verify-on-read is NOT the answer and is deliberately absent: it is O(image
-// bytes) on the hot path and would regress the M1.1-a1 cache-hit acceptance path.
-// The natural closer is M11.2-d7, the unpacker, which already reads each blob
-// once per rootfs creation and can hash it there for free.
+// A general verify-on-read is still deliberately absent — it is O(image bytes) on
+// the hot path and would regress the M1.1-a1 cache-hit acceptance. What M11.2-d7
+// closes is the path that MATTERS, for free: Unpacker.Unpack already streams every
+// blob of an image end to end to build the tree, so it re-hashes each one against
+// its manifest descriptor (ErrDigestMismatch) and each layer's decompressed bytes
+// against the config's diffID (ErrDiffIDMismatch) on that single read. So a blob
+// corrupted or substituted on disk AFTER it was committed is caught before it is
+// unpacked, and therefore before a pod can execute it. The ceiling that remains is
+// exactly the third bullet above: content-addressing is not authenticity.
 //
 // # Non-Mach-O payloads and the signature gate
 //
