@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -157,6 +158,117 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 		})
 	}
 	return out, nil
+}
+
+// LoadImage ingests a client-streamed image archive — the `k3sm image load` /
+// `import` path — and records it under the reference the first frame names.
+//
+// THE DAEMON IS THE SOLE STORE WRITER here (the M12 images plan, Resolution 8 as
+// amended): the client opens the operator's archive, which the daemon generally
+// cannot read, and streams the bytes; it never writes the content store itself.
+// Everything that decides whether those bytes are admitted lives below this
+// method, in image.Loader — every blob is re-hashed against the digest the
+// archive's own manifest claims for it, and NOTHING is committed, leased or
+// recorded until all of them have.
+//
+// The metadata rides the FIRST frame only. Per the wire contract a later frame's
+// reference/format/digest/size are IGNORED rather than merged: a stream whose
+// identity could change halfway through is one where the bytes admitted and the
+// bytes described need not be the same archive.
+//
+// A failure is returned as a gRPC STATUS, not in the response's error field —
+// the same posture as every other method on this service, and what the proto
+// means by "a digest mismatch fails the call and commits nothing". No
+// LoadImageResponse is sent at all in that case.
+func (s *imagesService) LoadImage(stream runtimev1.Images_LoadImageServer) error {
+	ctx := stream.Context()
+	first, err := stream.Recv()
+	if errors.Is(err, io.EOF) {
+		return status.Error(codes.InvalidArgument,
+			"LoadImage: the stream carried no frames; the first frame must name the reference and format")
+	}
+	if err != nil {
+		// A transport/cancellation error from Recv is already a status.
+		return err
+	}
+	res, err := s.rt.loader.Load(ctx, image.LoadRequest{
+		Reference: first.GetReference(),
+		Format:    first.GetFormat(),
+		Digest:    first.GetDigest(),
+		Size:      first.GetSize(),
+	}, &loadStream{stream: stream, buf: first.GetChunk()})
+	if err != nil {
+		return loadStatusError(err)
+	}
+	s.rt.log.Info("ingested image archive",
+		"reference", res.Manifest.GetReference(), "digest", res.Descriptor.GetDigest(),
+		"platform", res.Platform.String(), "bytes", res.ReceivedBytes)
+	return stream.SendAndClose(&runtimev1.LoadImageResponse{
+		Images: []*runtimev1.Image{{
+			ManifestDescriptor: res.Descriptor,
+			Manifest:           res.Manifest,
+		}},
+		ReceivedBytes: res.ReceivedBytes,
+	})
+}
+
+// loadStream adapts the LoadImage frame stream to the io.Reader the ingest reads
+// the archive through.
+//
+// It is a plain sequential adapter and holds at most ONE frame's chunk: the
+// archive itself is spooled by the ingest, so nothing here needs to buffer more
+// than the frame in hand. Chunk boundaries carry no meaning (the proto says so);
+// a frame with an empty chunk is skipped rather than read as EOF, so a client
+// that sends a keepalive-shaped frame does not truncate its own upload.
+type loadStream struct {
+	stream runtimev1.Images_LoadImageServer
+	buf    []byte
+}
+
+// Read returns the next archive bytes, pulling frames as it drains them.
+func (l *loadStream) Read(p []byte) (int, error) {
+	for len(l.buf) == 0 {
+		req, err := l.stream.Recv()
+		if err != nil {
+			// io.EOF is the client's half-close: the archive is complete. Any
+			// other error propagates and aborts the ingest, which commits nothing.
+			return 0, err
+		}
+		l.buf = req.GetChunk()
+	}
+	n := copy(p, l.buf)
+	l.buf = l.buf[n:]
+	return n, nil
+}
+
+// loadStatusError maps an ingest failure onto a gRPC status.
+//
+// Every archive-content fault is INVALID_ARGUMENT: the caller supplied an
+// archive the daemon will not admit, and the remedy is the caller's (re-export
+// it, re-transfer it, split it into one image per archive). That includes
+// ErrArchiveUnsupported, which is deliberately NOT reported as UNIMPLEMENTED —
+// the RPC is implemented; it is the archive that is out of scope, and an
+// UNIMPLEMENTED status is the one a client reads as "this daemon has no image
+// service" (see images.proto's skew note).
+func loadStatusError(err error) error {
+	for _, sentinel := range []error{
+		image.ErrLoadReferenceInvalid,
+		image.ErrArchiveMalformed,
+		image.ErrArchiveUnsupported,
+		image.ErrArchiveMultipleImages,
+		image.ErrArchiveForeignLayer,
+		image.ErrArchiveClaimMismatch,
+		image.ErrDigestMismatch,
+		image.ErrManifestInconsistent,
+		image.ErrBlobTooLarge,
+		image.ErrInvalidDigest,
+		image.ErrUnsupportedDigestAlgorithm,
+	} {
+		if errors.Is(err, sentinel) {
+			return status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+	return imageStatusError(err)
 }
 
 // pruneSkipReason maps this repo's keep verdicts onto the wire enum. The mapping
