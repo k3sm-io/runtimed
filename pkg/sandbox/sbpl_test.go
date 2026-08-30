@@ -174,6 +174,28 @@ func TestGenerateRejectsProtectedExtraPath(t *testing.T) {
 	}
 }
 
+// TestProtectedPathRefusalNamesPodRootRemedy is B179: a protected-path refusal
+// must name its remedy, not just its cause. It goes through Generate (never
+// validateExtraPaths directly) with the SAME trigger as the
+// "pv-write-under-users" case above — a WritePaths entry under /Users — so this
+// assertion and that table can never diverge on what actually rejects. The
+// error must still satisfy errors.Is(err, ErrProtectedPath) AND its text must
+// name --pod-root (the k3sm server flag that relocates the runtimed on-disk
+// root off the protected prefix) — not --work-dir, which does not.
+func TestProtectedPathRefusalNamesPodRootRemedy(t *testing.T) {
+	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
+	sp := &runtimev1.SandboxProfile{DataVolumePath: dataVol}
+	opts := GenerateOptions{WritePaths: []string{"/Users/bob/data"}}
+
+	_, err := Generate(sp, opts)
+	if !errors.Is(err, ErrProtectedPath) {
+		t.Fatalf("want ErrProtectedPath, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "--pod-root") {
+		t.Fatalf("error %q must name the --pod-root remedy", err.Error())
+	}
+}
+
 // TestGenerateSecretReadOnlySubScope is acceptance M2.2-a3 (SBPL half): a
 // credential mount (secret / SA-token) gets file-read* AND an explicit
 // file-write* deny, emitted LAST so the write-deny wins even though the secret
