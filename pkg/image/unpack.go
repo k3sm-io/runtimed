@@ -41,23 +41,22 @@ import (
 // ingest/.
 //
 // Being a sibling is deliberate, exactly as it is for IndexSubdir and
-// IngestSubdir: the image GC's two enumerators read blobs/
-// (Cache.EnumerateBlobs) and pods/ (Cache.Roots), so an unpacked tree can
-// neither be mistaken for a content blob of unknown provenance nor become a
-// reachability root. A tree is DERIVED content — every byte in it is
-// reconstructible from blobs the manifest names — so it must never be able to
-// keep a blob alive.
+// IngestSubdir: the blob inventory reads blobs/ (Cache.EnumerateBlobs) and the
+// root set reads pods/ (Cache.Roots), so an unpacked tree can neither be
+// mistaken for a content blob of unknown provenance nor become a reachability
+// root. A tree is DERIVED content — every byte in it is reconstructible from
+// blobs the manifest names — so it must never be able to keep a blob alive, and
+// nothing under here does.
 //
-// The honest consequence, stated where a reader will meet it: those same two
-// enumerators are the ONLY things that walk the store, so a tree under here is
-// today invisible to both the prune planner and the disk-pressure accounting
-// (Cache.StoreBytes). Trees are not reclaimed. The bound on their growth is that
-// the key is content-addressed — a re-pull of the same (image x policy) is a hit
-// that writes nothing — so the store holds one tree per distinct image ever run
-// on the node, not one per pod. Extending the GC to a second sweepable tree is a
-// separate deliverable with its own root-set question ("which trees may a live
-// pod's clone still depend on?"), and improvising it here would put a delete
-// path in the store that no reachability rule covers.
+// Trees ARE swept, by a third enumerator of their own (Cache.EnumerateTrees):
+// they are counted by the disk-pressure accounting (Cache.StoreBytes) and
+// offered to the prune planner, which decides them under the separate root-set
+// rule stated at planTrees ("which trees may a live pod's clone still depend
+// on?" — answered by the backing image's own reclaim-eligibility, since under
+// clonefile removing a tree breaks a restart, never a running pod). Their growth
+// was bounded even before that: the key is content-addressed, so a re-pull of
+// the same (image x policy) is a hit that writes nothing and the store holds one
+// tree per distinct image ever run on the node, not one per pod.
 const UnpackedSubdir = "unpacked"
 
 // TreeRootfsName is the subdirectory of a committed tree that holds the applied
@@ -93,11 +92,12 @@ const (
 //     dedicated case-sensitive APFS volume (by design), while
 //     unpacked/ stays with the rest of the cache.
 //
-// Snapshots inherit unpacked/'s honest limitation verbatim: neither GC
-// enumerator walks this directory, so a snapshot is invisible to the prune
-// planner and to Cache.StoreBytes and is never reclaimed. The same bound
-// applies — the key is content-addressed, so the store holds one snapshot per
-// distinct layer chain ever run on the node, not one per pod.
+// Snapshots are swept on exactly unpacked/'s terms: Cache.EnumerateTrees walks
+// this directory too, so a snapshot is counted by Cache.StoreBytes and offered
+// to the prune planner under the same rule (planTrees), with meta.json in the
+// role tree.json plays there. The same bound applies — the key is
+// content-addressed, so the store holds one snapshot per distinct layer chain
+// ever run on the node, not one per pod.
 const SnapshotsSubdir = "snapshots"
 
 // SnapshotRecordName is the daemon-authored record beside a committed snapshot,

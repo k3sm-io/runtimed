@@ -146,7 +146,7 @@ func TestPlanPruneReachability(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			plan, err := PlanPrune(tc.nodes, tc.roots, tc.leased, time.Minute, planNow)
+			plan, err := PlanPrune(tc.nodes, nil, tc.roots, tc.leased, time.Minute, planNow)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("PlanPrune succeeded; want an error")
@@ -189,7 +189,7 @@ func TestPlanPruneIsAnExactPartition(t *testing.T) {
 		{Path: "sha256/.blob-9", Kind: BlobKindTemp, ModTime: planNow.Add(-time.Hour)},
 		{Path: "weird", Kind: BlobKindUnknown, ModTime: planNow.Add(-time.Hour)},
 	}
-	plan, err := PlanPrune(nodes, []ImageRoot{{Reference: "r", Config: nodes[0].Digest}}, nil, time.Minute, planNow)
+	plan, err := PlanPrune(nodes, nil, []ImageRoot{{Reference: "r", Config: nodes[0].Digest}}, nil, time.Minute, planNow)
 	if err != nil {
 		t.Fatalf("PlanPrune: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestEnumerateBlobsReadsNoContent(t *testing.T) {
 	}
 	// Both are equally unreferenced, so both must be planned for deletion: the
 	// manifest-shaped one gets no authority from its bytes.
-	plan, err := PlanPrune(nodes, nil, nil, time.Minute, planNow)
+	plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, planNow)
 	if err != nil {
 		t.Fatalf("PlanPrune: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestExecutePruneReVerifiesBeforeUnlink(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnumerateBlobs: %v", err)
 		}
-		plan, err := PlanPrune(nodes, nil, nil, time.Minute, f.clock)
+		plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
 		if err != nil {
 			t.Fatalf("PlanPrune: %v", err)
 		}
@@ -302,7 +302,7 @@ func TestExecutePruneReVerifiesBeforeUnlink(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnumerateBlobs: %v", err)
 		}
-		plan, err := PlanPrune(nodes, nil, nil, time.Minute, f.clock)
+		plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
 		if err != nil {
 			t.Fatalf("PlanPrune: %v", err)
 		}

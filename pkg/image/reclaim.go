@@ -118,11 +118,26 @@ func StatfsSample(path string) (FilesystemSample, error) {
 	}, nil
 }
 
-// StoreBytes is the summed logical size of the content-addressed store's blobs.
+// StoreBytes is what the image store holds: the summed logical size of the
+// content-addressed blobs PLUS the accounted size of every committed tree in
+// unpacked/ and snapshots/.
 //
-// It is a RAW MEASUREMENT of what the store holds, and it is explicitly NOT an
-// estimate of what a prune could reclaim: a blob whose extents are cloned into a
-// live pod rootfs contributes its full size here and frees nothing when unlinked.
+// Both halves are counted because both are content this daemon wrote and only
+// this daemon removes. Counting blobs alone under-reported the store by the
+// whole derived-content set — one tree per distinct (image x policy) ever run on
+// the node, unbounded in time and, for a base image, larger than the compressed
+// blobs it was built from.
+//
+// The halves are measured differently, and neither is a reclaim estimate:
+//
+//   - a blob contributes its Lstat size;
+//   - a tree contributes the size its own record accounts for, not a walk of its
+//     files (see EnumerateTrees for why, and for what that figure over- and
+//     under-counts).
+//
+// It is explicitly NOT an estimate of what a prune could reclaim: blobs and tree
+// payloads whose extents are cloned into a live pod rootfs contribute their full
+// size here and free nothing when they are removed.
 func (c *Cache) StoreBytes() (int64, error) {
 	nodes, err := c.EnumerateBlobs()
 	if err != nil {
@@ -131,6 +146,13 @@ func (c *Cache) StoreBytes() (int64, error) {
 	var n int64
 	for _, b := range nodes {
 		n += b.Size
+	}
+	trees, err := c.EnumerateTrees()
+	if err != nil {
+		return 0, err
+	}
+	for _, t := range trees {
+		n += t.Size
 	}
 	return n, nil
 }
@@ -185,15 +207,41 @@ type ReclaimReport struct {
 	// Removed are the digests unlinked, or — under DryRun — the ones that would
 	// have been.
 	Removed []string
-	// ReclaimedBytes is the summed logical size of what was unlinked. Under
-	// APFS clonefile this OVERSTATES what the volume got back; FreeAfter minus
-	// FreeBefore is the measured truth.
+	// ReclaimedBytes is the summed logical size of what was removed, blobs and
+	// trees together. Under APFS clonefile this OVERSTATES what the volume got
+	// back; FreeAfter minus FreeBefore is the measured truth.
 	ReclaimedBytes int64
 	// Kept is every blob the pass considered and did not delete, with its
 	// verdict — the planner's Keep set plus anything the executor refused.
 	Kept []KeptBlob
+	// RemovedTrees are the keys of the unpacked/snapshot trees removed, or —
+	// under DryRun — the ones that would have been. They are reported separately
+	// from Removed because a tree key is not a blob digest: it names DERIVED
+	// content, and a caller that conflated the two would report a blob as gone
+	// while it is still in the store.
+	RemovedTrees []string
+	// KeptTrees is every tree the pass considered and did not remove, with its
+	// verdict.
+	KeptTrees []KeptTree
 	// ReachedTarget reports whether measured free space met TargetFreeBytes.
 	ReachedTarget bool
+}
+
+// KeptTree is one tree a reclaim pass kept, with the typed verdict.
+type KeptTree struct {
+	// Store is which tree store the tree lives in.
+	Store TreeStore
+	// Key is the tree's content-addressed identity; empty for a node outside the
+	// key grammar.
+	Key string
+	// Path is the store-root-relative path (populated for every kept node, so a
+	// node with no key is still identifiable).
+	Path string
+	// Reason is the typed verdict.
+	Reason PruneReason
+	// Detail is a human-readable amplification for an executor refusal; empty
+	// for a planner verdict.
+	Detail string
 }
 
 // KeptBlob is one blob a reclaim pass kept, with the typed verdict.
@@ -232,6 +280,12 @@ type KeptBlob struct {
 // reachability record, or pinned by any live ingest lease, is never in the delete
 // plan — and if the root set cannot be enumerated in full, NOTHING is deleted
 // (ErrRootsIncomplete). Reclaim is not best-effort about liveness; it refuses.
+//
+// The pass sweeps TWO stores: the content-addressed blobs, and the derived trees
+// under unpacked/ and snapshots/. Trees are decided from the same root set under
+// their own rule (planTrees) and removed FIRST, by a separate executor that
+// cannot reach a blob. The one property that spans both: nothing read out of a
+// tree can keep a blob alive.
 func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -293,6 +347,13 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	if err != nil {
 		return nil, err
 	}
+	// The tree inventory is read in the same phase, and for the same reason: a
+	// tree committed after this read is not a candidate at all, while a root
+	// recorded after it still protects one.
+	trees, err := c.EnumerateTrees()
+	if err != nil {
+		return nil, err
+	}
 	if cfg.afterInventory != nil {
 		cfg.afterInventory()
 	}
@@ -305,18 +366,26 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	for d := range c.leasedDigests() {
 		leased = append(leased, d)
 	}
-	plan, err := PlanPrune(nodes, roots, leased, grace, now())
+	plan, err := PlanPrune(nodes, trees, roots, leased, grace, now())
 	if err != nil {
 		return nil, err
 	}
 	for _, k := range plan.Keep {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: k.Node.Digest, Path: k.Node.Path, Reason: k.Reason})
 	}
+	for _, k := range plan.KeepTrees {
+		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: k.Node.Store, Key: k.Node.Key, Path: k.Node.Path, Reason: k.Reason})
+	}
 
 	if cfg.DryRun {
 		for _, d := range plan.Delete {
 			if d.Node.Digest != "" {
 				rep.Removed = append(rep.Removed, d.Node.Digest)
+			}
+		}
+		for _, d := range plan.DeleteTrees {
+			if d.Node.Key != "" {
+				rep.RemovedTrees = append(rep.RemovedTrees, d.Node.Key)
 			}
 		}
 		rep.ReclaimedBytes = plan.DeletedBytes()
@@ -348,12 +417,29 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		}
 		return f >= target
 	}
+	// TREES BEFORE BLOBS. A tree is DERIVED content: it is rebuildable from the
+	// blobs the image names, so removing it costs a re-unpack, while removing the
+	// blobs costs a registry round-trip the node may not be able to make. Running
+	// the tree half first also means a pass that stops on its measured target
+	// stops having given up the cheaper thing — and it can never orphan a tree,
+	// because a tree is only ever condemned in the same pass that condemns the
+	// blobs it was built from.
+	treeExec, err := c.ExecuteTreePrune(plan, grace, now(), stop)
+	if err != nil {
+		return nil, err
+	}
+	rep.RemovedTrees = treeExec.Removed
+	rep.ReclaimedBytes = treeExec.DeletedBytes
+	for _, s := range treeExec.Skipped {
+		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
+	}
+
 	exec, err := c.ExecutePrune(plan, grace, now(), stop)
 	if err != nil {
 		return nil, err
 	}
 	rep.Removed = exec.Removed
-	rep.ReclaimedBytes = exec.DeletedBytes
+	rep.ReclaimedBytes += exec.DeletedBytes
 	for _, s := range exec.Skipped {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: s.Digest, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
@@ -363,7 +449,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		// The unlinks happened; only the closing measurement is unavailable. Report
 		// what is known rather than discarding a successful reclaim.
 		log.Warn("image reclaim: closing free-space sample failed",
-			"root", c.root, "err", ferr, "deleted", exec.Deleted)
+			"root", c.root, "err", ferr, "deleted", exec.Deleted, "trees_deleted", treeExec.Deleted)
 		rep.FreeAfter = before
 		return rep, nil
 	}
@@ -372,10 +458,11 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	if !rep.ReachedTarget {
 		log.Warn("image reclaim did not reach its free-space target",
 			"root", c.root, "free_bytes", after, "target_bytes", target,
-			"deleted", exec.Deleted, "sample_err", sampleErr)
+			"deleted", exec.Deleted, "trees_deleted", treeExec.Deleted, "sample_err", sampleErr)
 	} else {
 		log.Info("image reclaim freed space on the store volume",
-			"root", c.root, "free_before", before, "free_after", after, "deleted", exec.Deleted)
+			"root", c.root, "free_before", before, "free_after", after,
+			"deleted", exec.Deleted, "trees_deleted", treeExec.Deleted)
 	}
 	return rep, nil
 }

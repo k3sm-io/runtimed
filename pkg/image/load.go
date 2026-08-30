@@ -42,10 +42,10 @@ import (
 // staged in while it is being read: <root>/ingest, a SIBLING of blobs/, pods/
 // and index/.
 //
-// Being a sibling is deliberate, exactly as it is for IndexSubdir: the GC's two
-// enumerators read blobs/ (Cache.EnumerateBlobs) and pods/ (Cache.Roots), so a
-// staged archive can neither be mistaken for a blob of unknown provenance nor
-// become a reachability root. The staged file itself is UNLINKED the instant it
+// Being a sibling is deliberate, exactly as it is for IndexSubdir: the GC's
+// enumerators read blobs/ (Cache.EnumerateBlobs), pods/ (Cache.Roots) and the
+// tree stores (Cache.EnumerateTrees), so a staged archive can neither be
+// mistaken for a blob of unknown provenance nor become a reachability root. The staged file itself is UNLINKED the instant it
 // is created (see stageArchive), so the directory is normally empty and a
 // crashed ingest leaves nothing behind at all.
 const IngestSubdir = "ingest"
