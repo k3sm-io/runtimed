@@ -23,6 +23,7 @@ import (
 	"log"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -71,13 +72,19 @@ func TestDefaultPullerPlatformWiring(t *testing.T) {
 			}
 			p := &pod{box: hostBinBox(rt, "pod-wiring"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 			c := &runtimev1.Container{Name: "app", Image: ref, Command: []string{"/app"}}
-			rb, rerr := rt.resolveBinary(context.Background(), p, t.TempDir(), c)
+			rootfs := t.TempDir()
+			rb, rerr := rt.resolveBinary(context.Background(), p, rootfs, c)
 			if !tc.wantErr {
 				if rerr != nil {
 					t.Fatalf("resolveBinary: %v", rerr)
 				}
-				if rb.path != "/app" {
-					t.Errorf("bin = %q, want /app", rb.path)
+				// The command is absolute, and on a PULLED image that names a path
+				// in the IMAGE, not on the host — so it resolves under this pod's
+				// rootfs (B197). The subject here is still the platform wiring;
+				// the argv rule itself is gated by
+				// TestPulledImageAbsoluteArgvResolvesInRootfs.
+				if want := filepath.Join(rootfs, "app"); rb.path != want {
+					t.Errorf("bin = %q, want %q", rb.path, want)
 				}
 				return
 			}

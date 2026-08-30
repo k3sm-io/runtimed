@@ -1277,6 +1277,13 @@ type resolvedBinary struct {
 //     on a container with args and no command, and refused a container with
 //     neither even though its image declared an Entrypoint.
 //
+// The discriminator decides argv[0] too, and ONLY the discriminator does: on the
+// OCI arm argv[0] names a file in the IMAGE, so it is resolved inside the pod's
+// materialized rootfs whether or not it leads with a slash (resolveImageArgv0);
+// on the two host-binary arms it names a host path and is taken verbatim. argv's
+// own shape is never consulted — see resolveImageArgv0 for the M8 failure that
+// rule produced.
+//
 // p supplies BOTH the PodBox (for the imagePullSecret lookup) and the RESOLVED
 // sandbox backend the pull's image-platform policy AND the unpack dialect are
 // derived from — see pullPolicy, unpackPolicy and the pod.backend field.
@@ -1400,12 +1407,12 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		return resolvedBinary{}, err
 	}
 
-	// argv[0] is the merged program resolved against the pod rootfs when
-	// relative, else taken as-is (an absolute path names a host binary the image
-	// does not supply).
-	bin := run.Argv[0]
-	if !filepath.IsAbs(bin) {
-		bin = filepath.Join(rootfs, bin)
+	// argv[0] is the merged program resolved INSIDE this pod's materialized
+	// rootfs — whether or not it carries a leading slash. See resolveImageArgv0
+	// for why the leading slash carries no meaning on this route.
+	bin, err := resolveImageArgv0(rootfs, run.Argv[0])
+	if err != nil {
+		return resolvedBinary{}, fmt.Errorf("container %s: %w", c.GetName(), err)
 	}
 	argv := append([]string{}, run.Argv...)
 	argv[0] = bin
@@ -1424,6 +1431,62 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		env:        run.Env,
 		workingDir: run.WorkingDir,
 	}, nil
+}
+
+// ErrImageArgvEscapes reports that a pulled image's argv[0] resolves outside the
+// pod rootfs it must run from. It is a sentinel so a caller (and a test) can
+// name the refusal without matching on the message.
+var ErrImageArgvEscapes = errors.New("image program escapes the pod rootfs")
+
+// resolveImageArgv0 resolves a pulled image's argv[0] against the pod's
+// materialized rootfs and refuses anything that lands outside it.
+//
+// # Why a leading slash means nothing here
+//
+// The absolute-path-is-a-host-binary rule belongs to the IMAGE-REFERENCE
+// discriminator, not to argv: resolveBinary decides between "run a host binary
+// in place" and "pull, materialize, merge" by the shape of the image REFERENCE
+// (image.IsHostPathReference — an OCI reference can never begin with '/'), and
+// this function is only ever reached on the second arm, after MaterializeTree
+// has populated rootfs. On that arm argv[0] came out of image.MergeRunSpec,
+// i.e. out of the image's own ENTRYPOINT/CMD or the pod's command — all of
+// which name paths in the IMAGE's filesystem, where a leading slash means the
+// image root and nothing else.
+//
+// Keying on argv's own shape instead was the M8 blocker (B197): mlx-serve's
+// ENTRYPOINT is /bin/python3.12, so the previous "absolute means the host
+// supplies it" rule sent the signature gate at the HOST's /bin/python3.12,
+// which on a stock macOS does not exist — the pod failed
+// FAILURE_REASON_SIGNATURE_REJECTED with "no such file or directory" while the
+// byte-identical image with a relative argv[0] ran to completion. An image
+// cannot be expected to rewrite its own entrypoint to suit a runtime, and a
+// path that resolved to a host binary would be worse than a failure anyway: it
+// would run host code with the pod's identity under the pod's profile.
+//
+// # Containment
+//
+// filepath.Join cleans, so "../.." and "/../../usr/bin/env" are resolved before
+// the check rather than pattern-matched, and the result must be a PROPER
+// descendant of rootfs. The refusal is fail-closed and deliberate: the merged
+// argv is partly image-supplied, and an image that could name a path above its
+// own root would choose which host binary the daemon signs and spawns.
+//
+// It is a containment check, NOT a sandbox: rootfs is not a chroot (DESIGN §M2
+// — confinement is Seatbelt at host paths), so a symlink INSIDE the tree that
+// points out of it still resolves out of it at exec time. Resolving symlinks
+// here would not close that (the tree is writable by the pod, so any answer is
+// stale the moment it is given); the profile is what bounds what the process
+// may then touch, and this check is what keeps the daemon from being the one
+// that walks out.
+func resolveImageArgv0(rootfs, argv0 string) (string, error) {
+	if argv0 == "" {
+		return "", errors.New("image program is empty")
+	}
+	bin := filepath.Join(rootfs, argv0)
+	if !mount.IsStrictlyUnder(bin, rootfs) {
+		return "", fmt.Errorf("%w: %q resolves to %q, outside %q", ErrImageArgvEscapes, argv0, bin, rootfs)
+	}
+	return bin, nil
 }
 
 // effectiveRunAsNonRoot resolves runAsNonRoot for a container.
