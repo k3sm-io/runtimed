@@ -37,7 +37,7 @@ import (
 
 // The runtimed-PRIVATE guest-agent socket layout: <Root>/run/vm/<pod>/agent.sock.
 //
-// It is DELIBERATELY NOT in the pod dir (m11-plan Resolution 7). The pod dir is
+// It is DELIBERATELY NOT in the pod dir. The pod dir is
 // the one tree a pod's own confinement can reach — the SBPL re-allow tier is
 // built from it — so an agent.sock placed there would put the pod's own control
 // channel inside the pod's reach: a workload could then speak GuestAgent for its

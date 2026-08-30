@@ -134,7 +134,7 @@ func containerStatusByName(st *runtimev1.PodStatus) map[string]*runtimev1.Contai
 // --- the B107 gate --------------------------------------------------------
 
 // TestVMPodStatsFromGuestAgentNotRusage is the B107 gate: the vm-pod METERING
-// and KILL-REASON fork (m11-plan §M11.2-d6 + §D7), asserted in four parts.
+// and KILL-REASON fork, asserted in four parts.
 //
 // It lives in pkg/runtime, not pkg/supervisor, because that is where the fork
 // actually is: pkg/supervisor owns the proc_pid_rusage sampler mechanism and has

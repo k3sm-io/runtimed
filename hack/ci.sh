@@ -35,7 +35,7 @@ if [ -n "$go_pkgs" ]; then
 	# The guest init (cmd/k3sm-guest-init) is PID 1 of a vm-pod's micro-VM and
 	# is GOOS=linux only, so the darwin build above never compiles it. This
 	# cross-lane is the only thing standing between an unrelated change and a
-	# guest that no longer builds (m11-plan §M11.2-d4). CGO stays OFF: the
+	# guest that no longer builds (the guest-init cross-build contract). CGO stays OFF: the
 	# binary ships inside the pinned initramfs, which has no libc.
 	if [ -d cmd/k3sm-guest-init ]; then
 		echo "==> [runtimed] guest-init cross-build (linux/arm64 + linux/amd64, CGO off)"
