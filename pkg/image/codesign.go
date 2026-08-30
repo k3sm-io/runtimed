@@ -34,7 +34,23 @@ type CodesignTool struct{}
 // Signed reports whether path has any valid code signature (ad-hoc included):
 // `codesign --verify` exits 0.
 func (CodesignTool) Signed(ctx context.Context, path string) (bool, error) {
-	err := exec.CommandContext(ctx, "codesign", "--verify", "--strict", path).Run()
+	return runCodesignVerify(ctx, []string{"--verify", "--strict", path})
+}
+
+// runCodesignVerify runs codesign with a verification argv and maps its exit status
+// to a verdict: exit 0 is "validly signed", ANY non-zero exit is "not validly
+// signed", and only a failure to run the tool at all is an error.
+//
+// It is shared by the per-binary inspector and the tree signer so both read a
+// non-zero exit the same way. That reading is deliberately coarse — codesign exits
+// non-zero for "unsigned", for "signature invalid", and for "this arch is not in
+// this file" alike — and the coarseness is safe in one direction only: every
+// non-zero verdict leads a caller to sign or to refuse, never to trust. A caller
+// that needs the distinction must name the arch it is asking about (see
+// CodesignTreeSigner.VerifyArch and pickVerifyArch, which is why that choice is
+// made from the file's OWN slice list rather than assumed).
+func runCodesignVerify(ctx context.Context, args []string) (bool, error) {
+	err := exec.CommandContext(ctx, "codesign", args...).Run()
 	if err == nil {
 		return true, nil
 	}

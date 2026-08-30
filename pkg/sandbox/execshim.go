@@ -83,8 +83,16 @@ func NewExecShimBackend(shimPath, profileDir string) (*ExecShimBackend, error) {
 	}, nil
 }
 
+// ExecShimBackendName identifies the host-process Seatbelt rung in
+// logging/diagnostics. It is an exported const rather than a literal inside Name
+// because a capability decision keys on it: SandboxGPUSupported reports
+// GPUFacts.sandbox_gpu_supported only for THIS rung (it is the only backend whose
+// generated profile carries the Metal allow-set), and a drifted second spelling
+// would silently make that advertisement false on a perfectly capable node.
+const ExecShimBackendName = "seatbelt-execshim"
+
 // Name returns the backend identifier.
-func (b *ExecShimBackend) Name() string { return "seatbelt-execshim" }
+func (b *ExecShimBackend) Name() string { return ExecShimBackendName }
 
 // Available reports whether the exec-shim backend can confine pods: the host
 // must be darwin at or above the gated minimum macOS major version and the shim

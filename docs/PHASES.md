@@ -424,14 +424,14 @@ phases:
     subphases:
       - id: M8.2
         title: Metal SBPL + egress branch + tree signing + GPUFacts (consumes the M11.2-d7 unpacker)
-        status: todo
+        status: in-progress
         size: L
         depends_on: [runtimed:M11.2-d7]
         strategy: hard cut
         strategy_rationale: additive — the new SandboxProfile booleans (allow_gpu, allow_internet_egress) default false so an old runtimed ignores them and an old provider never sets them (no provider↔runtimed phased exception); the proto fields are carved from the reserved bands in apis:M8.1; the host-process Seatbelt path and existing golden SBPL fixtures stay byte-green. One signed binary. RE-HOME NOTE (2026-07-11): the OCI-layer unpacker (formerly the M8.2-d0 deliverable here) moved to runtimed M11.2-d7 with the Linux-layer re-sequencing — this sub-phase CONSUMES it via the depends edge above; edge NARROWED 2026-08-29 to the d7 deliverable ONLY (operator-directed re-sequencing, m11-plan R25) — d1–d5 need only d7's output, so M8.2 does NOT wait on the rest of the M11.2 wave; its materialize-then-exec acceptance moved with it (now M11.2-a6).
         deliverables:
           - id: M8.2-d1
-            done: false
+            done: true  # orchestrate/M8.2 wave, 2026-08-29
             desc: >-
               pkg/sandbox/metal.go — the Metal SBPL allow-set behind allow_gpu. PRIMARY (m8-plan R22,
               amended 2026-08-29, operator-directed): Apple's own practice — a single prefix rule
@@ -451,7 +451,7 @@ phases:
               (Resolution 11). Emitted in the existing rule order (allows → protected denies → narrow
               re-allows)
           - id: M8.2-d2
-            done: false
+            done: true  # orchestrate/M8.2 wave, 2026-08-29
             desc: >-
               pkg/sandbox — the egress branch behind allow_internet_egress, RE-FOUNDED 2026-08-29 (m8-plan
               R21, operator-directed) as the API contract, NOT an SBPL filter: per-IP SBPL scoping does not
@@ -468,29 +468,29 @@ phases:
               Resolution 12/13 is superseded): network-layer (PF) enforcement is a FILED FUTURE item (B188,
               darwin-net-owned), NOT an M8 deliverable; Seatbelt is never claimed as network isolation
           - id: M8.2-d3
-            done: false
+            done: true  # orchestrate/M8.2 wave, 2026-08-29
             desc: pkg/image — AdHocSignTree beside AdHocSign, run ONCE at pull/materialize time over the M11.2-d7 content-addressed tree (policy-keyed variant; the unpacker re-homed 2026-07-11); in-process Mach-O magic detection, signs only invalid/unsigned Mach-Os (ad-hoc signatures are content-addressed and survive clonefile — never de-CoW a clean file); CONTAINMENT-CHECKED (lstat, never follow symlinks/hardlinks, every candidate resolves under the rootfs) and STRUCTURALLY UNREACHABLE under REQUIRE_SIGNED/REQUIRE_NOTARIZED. gateSignature (pkg/runtime/pod.go) becomes check-then-sign-only-if-invalid — no unconditional -f re-sign, which would de-CoW argv[0] every start (Resolution 13) — and keeps verifying argv[0] only per start
           - id: M8.2-d4
-            done: false
+            done: true  # orchestrate/M8.2 wave, 2026-08-29
             desc: pkg/sandbox (or pkg/runtime) — GPUFacts population for GetRuntimeInfoResponse.gpu (field 100, apis:M8.1). Sysctls + a FUNCTIONAL Metal compile+dispatch probe (cgo-isolated in *_darwin.go), NOT a nil-check — the probe DISCRIMINATES the VZ paravirtual Metal device (MTLCreateSystemDefaultDevice is non-nil in VZ guests incl. GitHub macOS runners, so a VM node must never advertise GPU); populates iogpu_wired_limit_bytes with the explicit 0-sentinel (kernel default, not "unknown"), recommended_max_working_set_bytes (the MTLDevice working-set ceiling), and sandbox_gpu_supported scoped to the currently selected backend
           - id: M8.2-d5
-            done: false
+            done: true  # orchestrate/M8.2 wave, 2026-08-29
             desc: pkg/supervisor — CONTINGENT / PRE-AUTHORIZED (Resolution 18, default NOT built). Spike S3(5) verifies the S5-engine winner's process model against the sampler's leader-PID-only coverage (pod.go containerPIDs); IF the engine forks, a proc_listpids(PROC_PGRP_ONLY, …) pgid-enumeration deliverable (public libproc, the rusage_darwin.go pattern + an internal/spicanary entry) is pre-authorized. Default disposition — pin the winner single-process at M8.4
         acceptance:
           - id: M8.2-a1
-            met: false
+            met: true  # 2026-08-29 — orchestrator-verified (goldens + mutations)
             check: golden SBPL tests assert the generated profile — allow_gpu on/off (the prefix-rule allow-set; per-family goldens only on the R22 fallback path), the egress/network stanza byte-pinned (documented-ceiling form), and adversarially-formatted profiles rejected by the s-expression-aware Validate
             method: unit
           - id: M8.2-a2
-            met: false
+            met: true  # 2026-08-29 — orchestrator-verified (goldens + mutations)
             check: AdHocSignTree table test with a fake signer — hardlink/symlink escape cases rejected (containment), non-Mach-O skipped, already-signed skipped, policy gating (unreachable under REQUIRE_SIGNED/REQUIRE_NOTARIZED)
             method: unit
           - id: M8.2-a3
-            met: false
+            met: true  # 2026-08-29 — orchestrator-verified (goldens + mutations)
             check: GPUFacts population is unit-proven over a fake probe seam — the VZ-paravirtual discrimination (functional-probe verdict false ⇒ metal_available=false and the node-facing fields cleared), the iogpu_wired_limit_bytes 0-sentinel, recommended_max_working_set_bytes pass-through, and sandbox_gpu_supported scoped to the currently selected backend
             method: unit
           - id: M8.2-a4
-            met: false
+            met: false  # lab-ledger carve-out: owned by the M8.6 lab session on the apple-gpu rig (SkipUnless-gated; compiled + skipping locally; the full path proven to the engine-import boundary via K3SM_CAP_APPLE_GPU)
             check: a real MLX matmul (full inference round-trip) runs under the generated allow_gpu profile on a GPU dev-mac (integration tier, k3smtest.SkipUnless(t, "apple-gpu"))
             method: integration
 
@@ -599,7 +599,7 @@ phases:
     subphases:
       - id: M11.2
         title: platform selection + OCI-layer unpacker + Linux rootfs builder + vmhost + guest init + vsock agent + volumes + metering
-        status: todo
+        status: in-progress
         depends_on: [apis:M11.1]
         deliverables:
           - id: M11.2-d0
@@ -624,7 +624,7 @@ phases:
             done: false
             desc: "vm-pod verbs + metering (B101/B107): Exec/GetLogs/ListPodStats route vm pods to a guest/v1 client on the private agent.sock behind an injectable transport seam (bufconn — full RPC round-trips, no VM); Exec asserts exit-code round-trip + stream demux/close. Stats ON DEMAND at ListPodStats (or ≥30s heartbeat), NEVER the 1 Hz supervisor tick (no OOM race — VZ memorySize is the hypervisor-enforced ceiling); agent unreachable ⇒ stats omitted + condition, never zeros-as-data; agent responses are UNTRUSTED guest data (bounded reads, no host transitions beyond that pod's status). OOMKilled derives from agent ContainerEvents ONLY — the host rusage sampler never emits it for a vm pod; vmhost proc_pid_rusage feeds node-level accounting only (the B24 three-figures doctrine extended). LIFECYCLE-ACROSS-RESTART contract (m11-plan Resolution 5): vmhost dies with the daemon; Stop(grace) clamped inside the plist ExitTimeOut:45 (+Warn); the startup reconcile sweeps orphaned vmhosts + stale VM pod dirs; boot deadline (VM created → Health within N s else legible pod failure); RestartContainer on a vm pod → typed UNIMPLEMENTED (provider recreates the pod under CrashLoopBackOff); PGDATA crash-consistency documented (WAL recovery)."
           - id: M11.2-d7
-            done: false
+            done: true  # runtimed#72, 2026-08-29 — a6 green unprivileged (materialize-then-exec)
             desc: "OCI-layer unpacker (the SUBSTRATE — built FIRST within this wave; re-homed here 2026-07-11 from the MLX slice, verbatim scope; m11-plan R17): pkg/image — a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. Today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder — this is the substrate d1 (Linux rootfs builder) extends in-wave, the MLX tree-signing walks (that slice consumes it via its depends edge), and the images milestone's native semantics consume."
         acceptance:
           - id: M11.2-a1
@@ -652,7 +652,7 @@ phases:
             check: "the k3sm product binary's module graph excludes github.com/Code-Hex/vz (go-list-deps canary in hack/ci.sh); internal/spicanary byte-unchanged; live VM boot / Rosetta / virtiofs-attach legs are the M11.5 lab gate (hack/lab/m11.sh), never auto-greened"
             method: build
           - id: M11.2-a6
-            met: false
+            met: true  # 2026-08-29 — runs unprivileged on the dev host; layer-order-sensitive fixture
             check: "materialize-then-exec integration test — the d7 unpacker produces an unpacked tree that createPod materializes via MaterializeTree and execs argv[0] out of a multi-layer image (the acceptance re-homed with the deliverable, 2026-07-11)"
             method: integration
 
