@@ -151,6 +151,19 @@ type ApplyStats struct {
 	StrippedSetIDs int `json:"stripped_setids"`
 	// Bytes is the total decompressed regular-file content written.
 	Bytes int64 `json:"bytes"`
+	// Whiteouts and OpaqueDirs count the OCI deletion markers the LINUX dialect
+	// applied (".wh.<name>" and ".wh..wh..opq"). WhiteoutMeta counts the AUFS
+	// bookkeeping entries skipped. All three are structurally zero under
+	// SemanticsNative, where those names are ordinary files — which is why they
+	// are omitempty: a native tree's record is byte-identical to the one it
+	// carried before this dialect existed.
+	Whiteouts    int `json:"whiteouts,omitempty"`
+	OpaqueDirs   int `json:"opaque_dirs,omitempty"`
+	WhiteoutMeta int `json:"whiteout_meta,omitempty"`
+	// DroppedXattrs counts PAX extended attributes the xattr allowlist refused.
+	// It is the ONE number that makes the documented security.capability loss
+	// visible without re-reading the image (see xattrAllowlist).
+	DroppedXattrs int `json:"dropped_xattrs,omitempty"`
 }
 
 // add accumulates o into s (per-layer stats summed across a whole tree).
@@ -162,6 +175,10 @@ func (s *ApplyStats) add(o ApplyStats) {
 	s.SkippedSpecial += o.SkippedSpecial
 	s.StrippedSetIDs += o.StrippedSetIDs
 	s.Bytes += o.Bytes
+	s.Whiteouts += o.Whiteouts
+	s.OpaqueDirs += o.OpaqueDirs
+	s.WhiteoutMeta += o.WhiteoutMeta
+	s.DroppedXattrs += o.DroppedXattrs
 }
 
 // LayerApplier applies decompressed OCI layer tar streams, in order, into ONE
@@ -185,12 +202,22 @@ func (s *ApplyStats) add(o ApplyStats) {
 //   - a HARD LINK's target must already exist in the tree as a regular file, so
 //     a link can never alias a node the layer did not itself supply.
 //
-// # What it does NOT do
+// # Dialects
 //
-// It does not interpret OCI whiteouts, record ownership, or preserve xattrs or
-// mtimes — those are the Linux dialect's (M11.2-d1), which extends this type
-// under its own LayerSemantics. Under SemanticsNative a ".wh."-prefixed name is
-// an ordinary file, and that is correct: nothing on the native path consumes it.
+// Everything above holds under EVERY dialect. What varies is selected once, at
+// construction, from policy.Semantics (see LayerSemantics) and is switched on by
+// the linux field rather than re-derived per entry:
+//
+//   - SemanticsNative — the original behaviour, unchanged. Whiteouts are
+//     ordinary files, no ownership is recorded, an absolute symlink is refused.
+//   - SemanticsLinux — OCI whiteouts are interpreted, absolute symlinks are
+//     admitted (the guest chroots), the tar's true ownership is recorded for the
+//     ownership sidecar, and two paths that a case-insensitive volume would
+//     merge are refused (ErrPathCollision).
+//
+// It still does not preserve mtimes under either dialect, and it applies no
+// extended attribute under either: the Linux dialect RECORDS the allowlisted
+// ones (the allowlist is empty — see xattrAllowlist) and counts the rest.
 type LayerApplier struct {
 	root   *os.Root
 	policy UnpackPolicy
@@ -198,6 +225,35 @@ type LayerApplier struct {
 	stats  ApplyStats
 	// entries counts applied entries against limits.MaxEntries.
 	entries int
+	// linux is policy.Semantics == SemanticsLinux, resolved once at
+	// construction. It is a cached DISCRIMINATOR, never a second source of
+	// truth: NewLayerApplier is the only writer and it derives it from the
+	// validated policy, so it cannot disagree with the key the tree commits
+	// under.
+	linux bool
+	// nodes is the LINUX dialect's tree model, keyed by foldKey(path) so it
+	// answers the collision question and the ownership question with one map:
+	// a lookup that hits with a DIFFERENT Path is a case/normalization
+	// collision, and the values in path order ARE the ownership sidecar.
+	//
+	// It is nil under the native dialect (which records nothing and detects no
+	// collision), so that dialect pays neither the memory nor the work.
+	// Memory is O(entries) and therefore bounded by ApplyLimits.MaxEntries.
+	nodes map[string]*treeNode
+	// layerPaths is the set of tree paths the CURRENT layer created, reset at
+	// the start of every Apply. It exists solely for the opaque-directory rule:
+	// ".wh..wh..opq" erases what the LOWER layers contributed to a directory
+	// and must preserve what this layer put there, and those two are
+	// indistinguishable on disk.
+	layerPaths map[string]bool
+}
+
+// treeNode is one node of the linux dialect's tree model: the path as the
+// archive spelled it (the collision map is keyed by its folded form, which
+// cannot be un-folded) plus the ownership the sidecar will record.
+type treeNode struct {
+	path string
+	own  OwnershipEntry
 }
 
 // NewLayerApplier returns an applier writing into the tree anchored at root
@@ -217,7 +273,30 @@ func NewLayerApplier(root *os.Root, policy UnpackPolicy, limits ApplyLimits) (*L
 	if err != nil {
 		return nil, err
 	}
-	return &LayerApplier{root: root, policy: policy, limits: lim}, nil
+	a := &LayerApplier{root: root, policy: policy, limits: lim, linux: policy.Semantics == SemanticsLinux}
+	if a.linux {
+		a.nodes = make(map[string]*treeNode)
+	}
+	return a, nil
+}
+
+// Ownership returns the ownership sidecar for the tree built so far: one entry
+// per node the tree holds, in path order (see sortOwnership).
+//
+// It is EMPTY under the native dialect, which records nothing — not because the
+// information is uninteresting there but because nothing consumes it: a native
+// pod is a host process at the daemon's own uid, so there is no second
+// filesystem namespace for a uid/mode to be re-applied in.
+func (a *LayerApplier) Ownership() []OwnershipEntry {
+	if len(a.nodes) == 0 {
+		return nil
+	}
+	out := make([]OwnershipEntry, 0, len(a.nodes))
+	for _, n := range a.nodes {
+		out = append(out, n.own)
+	}
+	sortOwnership(out)
+	return out
 }
 
 // Stats returns the counts accumulated across every Apply so far.
@@ -232,6 +311,13 @@ func (a *LayerApplier) Stats() ApplyStats { return a.stats }
 // that division is deliberate: a rollback inside the applier would have to
 // delete files it cannot prove it wrote.
 func (a *LayerApplier) Apply(ctx context.Context, r io.Reader) error {
+	// The per-LAYER state resets here, and only here. The opaque-directory rule
+	// is defined against "what THIS layer created", so carrying the set across
+	// layers would make an opaque marker preserve a previous layer's files —
+	// precisely the lower-layer content it exists to erase.
+	if a.linux {
+		a.layerPaths = make(map[string]bool)
+	}
 	tr := tar.NewReader(r)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -278,6 +364,27 @@ func (a *LayerApplier) applyEntry(hdr *tar.Header, content io.Reader) error {
 		return err
 	}
 
+	// WHITEOUTS come before the typeflag switch because a marker is not a node:
+	// it is spelled as a zero-length regular file (and occasionally as a
+	// directory) and would otherwise be MATERIALIZED under its literal
+	// ".wh."-prefixed name — which is exactly what the native dialect does, and
+	// exactly what a chrooting guest must not see.
+	if a.linux {
+		kind, target, werr := classifyWhiteout(name)
+		if werr != nil {
+			return werr
+		}
+		switch kind {
+		case whiteoutFile:
+			return a.applyWhiteoutFile(target)
+		case whiteoutOpaque:
+			return a.applyOpaqueDir(path.Dir(name))
+		case whiteoutMeta:
+			a.stats.WhiteoutMeta++
+			return nil
+		}
+	}
+
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		return a.applyDir(name, hdr)
@@ -288,8 +395,10 @@ func (a *LayerApplier) applyEntry(hdr *tar.Header, content io.Reader) error {
 	case tar.TypeLink:
 		return a.applyHardlink(name, hdr)
 	case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
-		// Skipped and COUNTED — an unprivileged daemon cannot mknod, and a
-		// native pod reads none of these. See ApplyStats.SkippedSpecial.
+		// Skipped and COUNTED — an unprivileged daemon cannot mknod, and neither
+		// spine reads one out of the tree: a native pod has no device nodes at
+		// all, and a Linux guest gets its own devtmpfs. See
+		// ApplyStats.SkippedSpecial.
 		a.stats.SkippedSpecial++
 		return nil
 	default:
@@ -298,12 +407,222 @@ func (a *LayerApplier) applyEntry(hdr *tar.Header, content io.Reader) error {
 	}
 }
 
+// note records one node in the linux dialect's tree model and is the ONLY place
+// a case/normalization collision can be detected, so every creating path calls
+// it BEFORE it writes anything.
+//
+// Detecting before writing is not cosmetic: a collision found after the write
+// has already merged the two files on disk, and while the staging tree is
+// discarded either way, the error would then describe a tree state that no
+// longer matches what the archive asked for.
+func (a *LayerApplier) note(name string, hdr *tar.Header, typ OwnershipEntryType) error {
+	if !a.linux {
+		return nil
+	}
+	if err := a.noteAncestors(name); err != nil {
+		return err
+	}
+	xattrs, dropped := selectXattrs(hdr.PAXRecords)
+	a.stats.DroppedXattrs += dropped
+	return a.put(name, OwnershipEntry{
+		Path:   name,
+		Type:   typ,
+		UID:    int64(hdr.Uid),
+		GID:    int64(hdr.Gid),
+		Mode:   uint32(hdr.Mode & 0o7777),
+		Xattrs: xattrs,
+	}, true)
+}
+
+// noteAncestors records the directories ensureParent will create on demand.
+//
+// A tar is not required to carry a directory entry before the files under it, so
+// an ancestor may exist ONLY implicitly — and an unrecorded ancestor is a hole
+// in BOTH of this map's jobs: "Foo/a" and "foo/b" would collide on APFS with
+// neither "Foo" nor "foo" ever appearing as an entry, and the guest would find a
+// directory with no ownership to apply. The implicit mode is 0o755 root:root,
+// which is what every OCI runtime materializes for an unlisted parent.
+func (a *LayerApplier) noteAncestors(name string) error {
+	dir := path.Dir(name)
+	if dir == "." {
+		return nil
+	}
+	var built string
+	for _, comp := range strings.Split(dir, "/") {
+		if built == "" {
+			built = comp
+		} else {
+			built += "/" + comp
+		}
+		if err := a.put(built, OwnershipEntry{
+			Path: built,
+			Type: OwnershipTypeDir,
+			Mode: 0o755,
+		}, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// put inserts or updates one node, refusing a case/normalization collision.
+//
+// explicit distinguishes a node the archive NAMED from an implicit parent: an
+// explicit entry overwrites whatever ownership an implicit one guessed (and
+// whatever an earlier layer recorded, which is "later layer wins"), while an
+// implicit parent never overwrites a recorded one.
+func (a *LayerApplier) put(name string, own OwnershipEntry, explicit bool) error {
+	key := foldKey(name)
+	if prev, ok := a.nodes[key]; ok {
+		if prev.path != name {
+			return fmt.Errorf("%w: %s and %s are distinct Linux paths that resolve to one file",
+				ErrPathCollision, quoteBounded(prev.path, maxLayerEntryNameLen),
+				quoteBounded(name, maxLayerEntryNameLen))
+		}
+		if explicit {
+			prev.own = own
+		}
+		a.layerPaths[name] = true
+		return nil
+	}
+	a.nodes[key] = &treeNode{path: name, own: own}
+	a.layerPaths[name] = true
+	return nil
+}
+
+// forget drops name — and, when it named a directory, everything beneath it —
+// from the tree model, so a whited-out node stops appearing in the ownership
+// sidecar and stops holding its folded key against a later entry.
+//
+// The recursive case is a linear scan of the model, which is why the callers
+// pass dir=false for the overwhelmingly common file replacement: a scan per
+// regular-file write would make the applier quadratic in entry count, while a
+// scan per DIRECTORY deletion is bounded by how rare those are in a layer.
+func (a *LayerApplier) forget(name string, dir bool) {
+	if !a.linux {
+		return
+	}
+	delete(a.nodes, foldKey(name))
+	delete(a.layerPaths, name)
+	if dir {
+		a.forgetChildren(name)
+	}
+}
+
+// forgetChildren drops everything BENEATH name, keeping name itself. It is what
+// a later layer replacing a populated directory with a file needs: the directory
+// node is immediately re-recorded as the new node, but its former contents are
+// gone from the tree and must be gone from the model.
+func (a *LayerApplier) forgetChildren(name string) {
+	if !a.linux {
+		return
+	}
+	prefix := name + "/"
+	for k, n := range a.nodes {
+		if strings.HasPrefix(n.path, prefix) {
+			delete(a.nodes, k)
+			delete(a.layerPaths, n.path)
+		}
+	}
+}
+
+// applyWhiteoutFile applies a ".wh.<name>" marker: the named sibling, as
+// contributed by the LOWER layers, is deleted.
+//
+// An ABSENT target is not an error. A layer may legitimately white out a path no
+// lower layer supplied (a builder emits the marker from a `rm` that ran against
+// a path the previous stage had already removed), and refusing it would make a
+// large share of real images unrunnable over a no-op.
+func (a *LayerApplier) applyWhiteoutFile(target string) error {
+	fi, err := a.root.Lstat(target)
+	isDir := err == nil && fi.IsDir()
+	if err == nil {
+		if rerr := a.root.RemoveAll(target); rerr != nil {
+			return fmt.Errorf("whiteout %s: %w", quoteBounded(target, maxLayerEntryNameLen), rerr)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("whiteout %s: %w", quoteBounded(target, maxLayerEntryNameLen), err)
+	}
+	a.forget(target, isDir)
+	a.stats.Whiteouts++
+	return nil
+}
+
+// applyOpaqueDir applies a ".wh..wh..opq" marker: everything the LOWER layers
+// put in dir disappears, and only what THIS layer put there remains.
+//
+// The two sets are indistinguishable on disk, which is what layerPaths is for.
+// The walk recurses into a directory this layer created rather than stopping at
+// it, because "created" for a directory can mean "re-moded an existing one"
+// (applyDir keeps a directory it finds) — so a kept directory may still hold
+// lower-layer children that the marker must erase.
+//
+// dir == "." means the tree ROOT is opaque, which is legal and means the image
+// discards every lower layer wholesale.
+func (a *LayerApplier) applyOpaqueDir(dir string) error {
+	a.stats.OpaqueDirs++
+	if err := a.clearOpaque(dir); err != nil {
+		return fmt.Errorf("opaque directory %s: %w", quoteBounded(dir, maxLayerEntryNameLen), err)
+	}
+	return nil
+}
+
+// clearOpaque is applyOpaqueDir's recursion. dir is tree-relative ("." for the
+// root) and every operation goes through the os.Root anchor.
+func (a *LayerApplier) clearOpaque(dir string) error {
+	f, err := a.root.Open(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		// Nothing to make opaque: no lower layer contributed this directory.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	names, err := f.Readdirnames(-1)
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, base := range names {
+		child := base
+		if dir != "." {
+			child = dir + "/" + base
+		}
+		fi, serr := a.root.Lstat(child)
+		if errors.Is(serr, fs.ErrNotExist) {
+			continue
+		}
+		if serr != nil {
+			return serr
+		}
+		if a.layerPaths[child] {
+			if fi.IsDir() {
+				if rerr := a.clearOpaque(child); rerr != nil {
+					return rerr
+				}
+			}
+			continue
+		}
+		if rerr := a.root.RemoveAll(child); rerr != nil {
+			return rerr
+		}
+		a.forget(child, fi.IsDir())
+	}
+	return nil
+}
+
 // applyDir creates (or re-modes) a directory.
 //
 // An existing directory is kept and re-moded rather than replaced: replacing it
 // would delete every earlier layer's contents under it, which is precisely the
 // silent data loss OCI's "later layer wins" rule does NOT mean for directories.
 func (a *LayerApplier) applyDir(name string, hdr *tar.Header) error {
+	if err := a.note(name, hdr, OwnershipTypeDir); err != nil {
+		return err
+	}
 	perm := a.entryPerm(hdr, 0o700)
 	if fi, err := a.root.Lstat(name); err == nil {
 		if !fi.IsDir() {
@@ -345,6 +664,9 @@ func (a *LayerApplier) applyRegular(name string, hdr *tar.Header, content io.Rea
 	if hdr.Size < 0 {
 		return fmt.Errorf("%w: entry %s declares negative size %d",
 			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen), hdr.Size)
+	}
+	if err := a.note(name, hdr, OwnershipTypeFile); err != nil {
+		return err
 	}
 	if err := a.ensureParent(name); err != nil {
 		return err
@@ -393,7 +715,10 @@ func (a *LayerApplier) applyRegular(name string, hdr *tar.Header, content io.Rea
 // root the first time the pod followed it.
 func (a *LayerApplier) applySymlink(name string, hdr *tar.Header) error {
 	target := hdr.Linkname
-	if err := symlinkTargetContained(name, target); err != nil {
+	if err := symlinkTargetContained(name, target, a.linux); err != nil {
+		return err
+	}
+	if err := a.note(name, hdr, OwnershipTypeSymlink); err != nil {
 		return err
 	}
 	if err := a.ensureParent(name); err != nil {
@@ -432,6 +757,9 @@ func (a *LayerApplier) applyHardlink(name string, hdr *tar.Header) error {
 			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen),
 			quoteBounded(target, maxLayerEntryNameLen), fi.Mode().Type())
 	}
+	if err := a.note(name, hdr, OwnershipTypeFile); err != nil {
+		return err
+	}
 	if err := a.ensureParent(name); err != nil {
 		return err
 	}
@@ -468,6 +796,16 @@ func (a *LayerApplier) ensureParent(name string) error {
 // populated DIRECTORY with a file. It is bounded by the os.Root anchor, so the
 // recursive delete provably cannot reach outside the tree being built.
 func (a *LayerApplier) replace(name string) error {
+	// Lstat first, so the LINUX dialect can drop the replaced directory's
+	// children from the tree model. It is Lstat and not Stat for the same
+	// reason the doc above gives: a symlink at the name is judged on itself.
+	// The extra syscall is paid only where it can matter — the native dialect
+	// keeps no model and skips it.
+	if a.linux {
+		if fi, err := a.root.Lstat(name); err == nil && fi.IsDir() {
+			a.forgetChildren(name)
+		}
+	}
 	if err := a.root.RemoveAll(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("replace %s: %w", quoteBounded(name, maxLayerEntryNameLen), err)
 	}
@@ -549,17 +887,35 @@ func layerEntryPath(name string) (string, error) {
 }
 
 // symlinkTargetContained reports whether a symlink at the (already sanitized)
-// tree-relative path name may point at target.
+// tree-relative path name may point at target, under the dialect linux selects.
 //
-// The rule is the whole native dialect in one place: the target must be
-// RELATIVE, and resolving it against the link's own directory must not leave the
-// tree. Both conditions are checked on the STRING, before anything is created,
-// because the link's target need not exist yet and so cannot be checked by
-// stat'ing it.
+// Both conditions are checked on the STRING, before anything is created, because
+// the link's target need not exist yet and so cannot be checked by stat'ing it.
 //
-// Containment composes: every link in the tree resolves to a path inside the
-// tree, so a chain of links does too, and no chain can therefore reach outside.
-func symlinkTargetContained(name, target string) error {
+// # The one per-dialect rule in this package
+//
+// An ABSOLUTE target is REFUSED natively and ADMITTED under Linux, and the
+// asymmetry is the presence or absence of a root:
+//
+//   - natively there is no chroot. The tree is cloned verbatim into a pod rootfs
+//     and the pod is a host process, so a surviving "/etc/passwd" link resolves
+//     against the HOST root the first time the pod follows it.
+//   - under Linux the guest chroots into this very tree, so "/etc/passwd" names
+//     the image's own file. Refusing it would refuse essentially every real base
+//     image — "/usr/bin/sh -> /bin/busybox" and the whole usr-merge symlink farm
+//     are absolute by construction.
+//
+// A RELATIVE target that resolves above the tree is refused under BOTH dialects.
+// Linux would clamp such a link at the chroot root rather than escape, so the
+// refusal is stricter than the guest needs; it is kept because the tree is
+// walked, cloned and signed HOST-side before any guest exists, where no clamp
+// applies — and a builder that means "the root" can spell it absolutely, which
+// the Linux dialect now admits.
+//
+// Containment composes: under the native dialect every link in the tree resolves
+// to a path inside the tree, so a chain of links does too, and no chain can
+// reach outside.
+func symlinkTargetContained(name, target string, linux bool) error {
 	if target == "" {
 		return fmt.Errorf("%w: symlink %s has an empty target",
 			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen))
@@ -569,6 +925,9 @@ func symlinkTargetContained(name, target string) error {
 			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen))
 	}
 	if path.IsAbs(target) {
+		if linux {
+			return nil
+		}
 		return fmt.Errorf("%w: symlink %s targets the absolute path %s",
 			ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
 			quoteBounded(target, maxLayerEntryNameLen))

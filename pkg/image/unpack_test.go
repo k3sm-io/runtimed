@@ -220,7 +220,7 @@ func TestTreeKey(t *testing.T) {
 		}{
 			{"nil_manifest", nil, NativeUnpackPolicy()},
 			{"empty_policy", base, UnpackPolicy{}},
-			{"unknown_policy", base, UnpackPolicy{Semantics: "linux"}},
+			{"unknown_policy", base, UnpackPolicy{Semantics: "windows"}},
 			{"no_config", &runtimev1.ImageManifest{Layers: base.Layers}, NativeUnpackPolicy()},
 			{"bad_config_algo", &runtimev1.ImageManifest{
 				Config: &runtimev1.Descriptor{Digest: "md5:" + hexOf('a')},
@@ -471,7 +471,9 @@ func TestUnpackVerifiesContent(t *testing.T) {
 func TestUnpackRefusesUnsupportedLayerMediaType(t *testing.T) {
 	c, u := newTestUnpacker(t)
 	mfst := commitImage(t, c, imageFrom(t, layerFrom(t, []tarSpec{{name: "app", mode: 0o755, data: "V1"}})))
-	mfst.Layers[0].MediaType = "application/vnd.oci.image.layer.v1.tar+zstd"
+	// xz, not zstd: zstd joined the allowlist with the Linux dialect (M11.2-d1),
+	// and a row that pins "refused" must name a media type nothing decompresses.
+	mfst.Layers[0].MediaType = "application/vnd.oci.image.layer.v1.tar+xz"
 	_, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy())
 	if !errors.Is(err, ErrUnsupportedLayerMediaType) {
 		t.Fatalf("Unpack error = %v, want ErrUnsupportedLayerMediaType", err)

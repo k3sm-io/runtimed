@@ -35,6 +35,12 @@ type tarSpec struct {
 	mode int64
 	data string
 	link string
+	// uid, gid and pax are the LINUX dialect's inputs: the ownership sidecar
+	// records the first two, and pax carries PAX extended attributes (the
+	// "SCHILY.xattr." records archive/tar and every OCI builder use).
+	uid int
+	gid int
+	pax map[string]string
 }
 
 // buildTar renders specs as an UNCOMPRESSED tar. The applier consumes a
@@ -55,6 +61,15 @@ func buildTar(t *testing.T, specs []tarSpec) []byte {
 			Mode:     s.mode,
 			Linkname: s.link,
 			Size:     int64(len(s.data)),
+			Uid:      s.uid,
+			Gid:      s.gid,
+		}
+		if len(s.pax) > 0 {
+			// PAXRecords need the PAX format explicitly; the writer's USTAR
+			// default would silently drop them and the xattr rows would then
+			// pass with zero xattr handling present.
+			hdr.PAXRecords = s.pax
+			hdr.Format = tar.FormatPAX
 		}
 		if typ != tar.TypeReg {
 			hdr.Size = 0
@@ -75,8 +90,16 @@ func buildTar(t *testing.T, specs []tarSpec) []byte {
 }
 
 // applyInto applies specs into a fresh tree under t.TempDir and returns the tree
-// path, the accumulated stats, and the apply error.
+// path, the accumulated stats, and the apply error, under the NATIVE dialect.
 func applyInto(t *testing.T, limits ApplyLimits, layers ...[]tarSpec) (string, ApplyStats, error) {
+	t.Helper()
+	tree, _, stats, err := applyIntoApplier(t, NativeUnpackPolicy(), limits, layers...)
+	return tree, stats, err
+}
+
+// applyIntoApplier is applyInto under an EXPLICIT dialect, returning the applier
+// as well so a Linux-dialect test can read the ownership records the apply built.
+func applyIntoApplier(t *testing.T, policy UnpackPolicy, limits ApplyLimits, layers ...[]tarSpec) (string, *LayerApplier, ApplyStats, error) {
 	t.Helper()
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "rootfs")
@@ -88,16 +111,16 @@ func applyInto(t *testing.T, limits ApplyLimits, layers ...[]tarSpec) (string, A
 		t.Fatal(err)
 	}
 	defer root.Close()
-	a, err := NewLayerApplier(root, NativeUnpackPolicy(), limits)
+	a, err := NewLayerApplier(root, policy, limits)
 	if err != nil {
 		t.Fatalf("NewLayerApplier: %v", err)
 	}
 	for _, specs := range layers {
 		if err := a.Apply(context.Background(), bytes.NewReader(buildTar(t, specs))); err != nil {
-			return tree, a.Stats(), err
+			return tree, a, a.Stats(), err
 		}
 	}
-	return tree, a.Stats(), nil
+	return tree, a, a.Stats(), nil
 }
 
 // TestLayerEntryPath pins the FIRST of the unpacker's two independent
@@ -175,7 +198,7 @@ func TestSymlinkTargetContained(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := symlinkTargetContained(tc.link, tc.target)
+			err := symlinkTargetContained(tc.link, tc.target, false)
 			if tc.wantErr == nil {
 				if err != nil {
 					t.Fatalf("symlinkTargetContained(%q, %q): %v", tc.link, tc.target, err)
@@ -503,13 +526,15 @@ func TestApplyLayerLimits(t *testing.T) {
 
 // TestNewLayerApplierRequiresAValidPolicy pins the fail-closed dialect check: an
 // unset or unknown LayerSemantics never falls through to the native rules.
+// "linux" is a REAL dialect since M11.2-d1, so the unknown-value rows name
+// values no dialect will ever claim.
 func TestNewLayerApplierRequiresAValidPolicy(t *testing.T) {
 	root, err := os.OpenRoot(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	for _, p := range []UnpackPolicy{{}, {Semantics: "linux"}, {Semantics: "NATIVE"}} {
+	for _, p := range []UnpackPolicy{{}, {Semantics: "windows"}, {Semantics: "NATIVE"}, {Semantics: "LINUX"}} {
 		if _, err := NewLayerApplier(root, p, ApplyLimits{}); err == nil {
 			t.Errorf("NewLayerApplier accepted policy %+v", p)
 		}
