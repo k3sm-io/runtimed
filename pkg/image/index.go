@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -420,29 +421,146 @@ func (x *FileIndex) lookupOne(root *os.Root, ref string, p Platform) (*runtimev1
 		}
 		return nil, false, fmt.Errorf("%w: read %q: %v", ErrIndexEntryCorrupt, ref, err)
 	}
-	var e indexEntry
-	if err := json.Unmarshal(buf, &e); err != nil {
-		return nil, false, fmt.Errorf("%w: decode %q: %v", ErrIndexEntryCorrupt, ref, err)
-	}
-	if e.Schema != indexSchema {
-		return nil, false, fmt.Errorf("%w: %q was written under schema %d, this daemon speaks %d",
-			ErrIndexEntryCorrupt, ref, e.Schema, indexSchema)
+	e, mfst, err := decodeEntry(ref, buf)
+	if err != nil {
+		return nil, false, err
 	}
 	if e.Reference != ref || e.Platform.platform() != p.Normalize() {
 		return nil, false, fmt.Errorf("%w: %q is recorded as %q/%s",
 			ErrIndexEntryCorrupt, ref, e.Reference, e.Platform.platform())
 	}
+	return mfst, true, nil
+}
+
+// decodeEntry decodes one on-disk record and checks that it is SELF-consistent:
+// a schema this daemon speaks, and a manifest that names the record's own
+// reference.
+//
+// It deliberately does NOT check the record against a key. The two callers hold
+// DIFFERENT keys — lookupOne holds the (reference x platform) that was asked
+// for, List holds the file name the record was found under — and each applies
+// its own, because a shared "check the key" would have to be one or the other
+// and the unchecked caller would then serve a record it never bound to
+// anything. what names the record in the error text (a reference, or a file
+// name).
+func decodeEntry(what string, buf []byte) (indexEntry, *runtimev1.ImageManifest, error) {
+	var e indexEntry
+	if err := json.Unmarshal(buf, &e); err != nil {
+		return e, nil, fmt.Errorf("%w: decode %q: %v", ErrIndexEntryCorrupt, what, err)
+	}
+	if e.Schema != indexSchema {
+		return e, nil, fmt.Errorf("%w: %q was written under schema %d, this daemon speaks %d",
+			ErrIndexEntryCorrupt, what, e.Schema, indexSchema)
+	}
 	mfst := &runtimev1.ImageManifest{}
 	if err := protojson.Unmarshal(e.Manifest, mfst); err != nil {
-		return nil, false, fmt.Errorf("%w: decode manifest for %q: %v", ErrIndexEntryCorrupt, ref, err)
+		return e, nil, fmt.Errorf("%w: decode manifest for %q: %v", ErrIndexEntryCorrupt, what, err)
 	}
 	// The manifest is what the caller will act on, so it must name the reference
-	// it was found under: RecordPodImage keys a pod's reachability root on
-	// ImageManifest.Reference, and a manifest naming something else would record
-	// a root for a reference this pod never asked for.
-	if mfst.GetReference() != ref {
-		return nil, false, fmt.Errorf("%w: manifest for %q names %q",
-			ErrIndexEntryCorrupt, ref, mfst.GetReference())
+	// the record was written for: RecordPodImage keys a pod's reachability root
+	// on ImageManifest.Reference, and a manifest naming something else would
+	// record a root for a reference this pod never asked for.
+	if mfst.GetReference() != e.Reference {
+		return e, nil, fmt.Errorf("%w: manifest for %q names %q",
+			ErrIndexEntryCorrupt, what, mfst.GetReference())
 	}
-	return mfst, true, nil
+	return e, mfst, nil
+}
+
+// IndexEntry is one recorded (reference x platform) -> manifest binding, as
+// returned by List.
+//
+// It carries the KEY's platform, not the manifest's: ImageManifest.platform is
+// populated only for a reference that resolved through a multi-platform index,
+// whereas the key's platform is what the entry is filed under and therefore
+// what a per-platform filter must match.
+type IndexEntry struct {
+	// Reference is the pull reference the entry was recorded for.
+	Reference string
+	// Platform is the resolved platform half of the entry's key.
+	Platform Platform
+	// Manifest is the manifest the pull (or ingest) resolved and verified.
+	Manifest *runtimev1.ImageManifest
+}
+
+// List returns every entry recorded in the index, sorted by reference then
+// platform.
+//
+// This is the LISTING authority for the node's images, and it is deliberately a
+// different question from the GC's. Reachability roots (Cache.Roots) answer
+// "what is some pod still using"; an image that no pod references has no root
+// and yet is unambiguously present — which is why a freshly `image load`ed
+// archive was invisible to a listing built on roots while `image df` measured
+// its bytes. Listing from here does not make an entry a root: entries are edges
+// and this tree is unreachable from every GC enumerator (see FileIndex), so a
+// listed image with no pod behind it stays reclaim-eligible.
+//
+// It fails CLOSED on a damaged record, exactly as Lookup does: a listing that
+// silently omitted an unreadable entry would report a smaller store than the
+// node has, and the operator asking what is on this node is the person who most
+// needs to hear that the index is broken.
+//
+// An absent index directory is an empty listing, not an error: nothing has been
+// recorded yet.
+func (x *FileIndex) List(ctx context.Context) ([]IndexEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	root, err := x.open()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer root.Close()
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("open image index %s: %w", x.dir, err)
+	}
+	names, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read image index %s: %w", x.dir, err)
+	}
+	out := make([]IndexEntry, 0, len(names))
+	for _, d := range names {
+		name := d.Name()
+		// Entry names are hex hashes with a .json suffix (entryName). Anything
+		// else is not a record this daemon wrote: a ".index-" temp left by a
+		// crashed commit, or a node some other party dropped in. Skipping is not
+		// a relaxation — a planted record still has to hash-match the name it
+		// sits under, which is checked below.
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") || !d.Type().IsRegular() {
+			continue
+		}
+		buf, err := readAnchored(root, name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // raced with a concurrent replace; the next list sees it
+			}
+			return nil, fmt.Errorf("%w: read %q: %v", ErrIndexEntryCorrupt, name, err)
+		}
+		e, mfst, err := decodeEntry(name, buf)
+		if err != nil {
+			return nil, err
+		}
+		// The same key re-derivation lookupOne applies, from the other side: the
+		// file name is a hash of the key, so a record moved, copied or planted
+		// under another key's name is refused rather than listed under a
+		// reference it was never recorded for.
+		p := e.Platform.platform()
+		if entryName(e.Reference, p) != name {
+			return nil, fmt.Errorf("%w: %q holds the record for %q/%s",
+				ErrIndexEntryCorrupt, name, e.Reference, p)
+		}
+		out = append(out, IndexEntry{Reference: e.Reference, Platform: p, Manifest: mfst})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Reference != out[j].Reference {
+			return out[i].Reference < out[j].Reference
+		}
+		return out[i].Platform.String() < out[j].Platform.String()
+	})
+	return out, nil
 }
