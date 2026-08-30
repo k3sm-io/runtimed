@@ -17,6 +17,8 @@ limitations under the License.
 package runtime
 
 import (
+	"google.golang.org/protobuf/proto"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -47,7 +49,40 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 			st.ContainerStatuses = append(st.ContainerStatuses, containerStatusOf(cp))
 		}
 	}
+	// A vm pod's containers are GUEST processes with no host containerProc, so
+	// their statuses come from the agent's ContainerEvents fold instead of the
+	// loop above (which is empty for one), and its metering availability rides as
+	// a condition. Both are vm-only: nothing here changes a host-process pod.
+	if p.isVM() {
+		if cond := guestStatsConditionLocked(p); cond != nil {
+			st.Conditions = append(st.Conditions, cond)
+		}
+		appendGuestContainerStatusesLocked(st, p)
+	}
 	return st
+}
+
+// appendGuestContainerStatusesLocked adds p's guest-derived container statuses
+// to st, split by declaration list exactly as the host-process path splits its
+// own. Each status is COPIED so a caller cannot mutate pod state through the
+// snapshot — the same guarantee containerStatusOf gives. The caller holds p.mu.
+func appendGuestContainerStatusesLocked(st *runtimev1.PodStatus, p *pod) {
+	inits := map[string]bool{}
+	for _, c := range p.box.GetInitContainers() {
+		inits[c.GetName()] = true
+	}
+	for _, name := range p.guestContainerOrder {
+		src := p.guestContainers[name]
+		if src == nil {
+			continue
+		}
+		cs, _ := proto.Clone(src).(*runtimev1.ContainerStatus)
+		if inits[name] {
+			st.InitContainerStatuses = append(st.InitContainerStatuses, cs)
+		} else {
+			st.ContainerStatuses = append(st.ContainerStatuses, cs)
+		}
+	}
 }
 
 // containerStatusOf clones a container's status so callers can't mutate pod state.

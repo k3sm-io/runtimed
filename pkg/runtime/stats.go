@@ -33,10 +33,18 @@ import (
 //
 // pod_id empty returns every metered pod (the Summary shape); pod_id set returns
 // just that pod. EVERY running pod is metered — the memory limit selects OOM
-// enforcement, not metering (see armMemorySampler) — so a pod is omitted only when
-// its sampler was never armed, matching PodMetrics' ok==false. An unknown pod_id
-// yields an empty list (not an error): a stats query races pod teardown, so "gone"
-// is an empty snapshot, not a failure.
+// enforcement, not metering (see armMemorySampler) — so a HOST-PROCESS pod is
+// omitted only when its sampler was never armed, matching PodMetrics' ok==false,
+// and a VM pod only when its guest agent had no readable sample to give
+// (vmPodStats, which also states the reason as a pod condition). An unknown
+// pod_id yields an empty list (not an error): a stats query races pod teardown,
+// so "gone" is an empty snapshot, not a failure.
+//
+// A vm pod's sample is an on-demand RPC, so this walk performs one bounded
+// guest round trip per vm pod, sequentially. That is affordable because it is
+// bounded twice — by guestStatsTimeout per pod and by the caller's own ctx
+// overall — and because a node runs few vm pods; it is also the whole reason
+// there is no 1 Hz guest ticker (see vmPodStats).
 func (r *Runtime) ListPodStats(ctx context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
 	ids := r.statsTargets(req.GetPodId())
 	out := make([]*runtimev1.PodStats, 0, len(ids))
@@ -91,7 +99,10 @@ func (r *Runtime) podStats(ctx context.Context, podID string) *runtimev1.PodStat
 }
 
 // hostPodStats builds the wire PodStats for a HOST-PROCESS pod, or nil when it
-// has no sampler (the PodMetrics ok==false gate).
+// has no sampler (the PodMetrics ok==false gate). It takes a ctx it does not use
+// — every source in this fork is reached through the same seam, and a signature
+// that differed by branch would invite the caller to decide per branch whether a
+// deadline applies; proc_pid_rusage simply has nothing to cancel.
 //
 // The pod-level working set is the sampler's latest summed ri_phys_footprint
 // (PodMetrics — the same value OOMKilled is judged against); per-container working
