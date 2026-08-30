@@ -388,7 +388,7 @@ phases:
     title: Public CI workflow + SkipUnless conversions (release-engineering slice)
     status: todo
     depends_on:
-      - apis:M7.1
+      - apis:M7.2
     subphases:
       - id: M7.1
         title: public CI workflow + SkipUnless conversions
@@ -426,16 +426,47 @@ phases:
         title: Metal SBPL + egress branch + tree signing + GPUFacts (consumes the M11.2-d7 unpacker)
         status: todo
         size: L
-        depends_on: [runtimed:M11.2]
+        depends_on: [runtimed:M11.2-d7]
         strategy: hard cut
-        strategy_rationale: additive — the new SandboxProfile booleans (allow_gpu, allow_internet_egress) default false so an old runtimed ignores them and an old provider never sets them (no provider↔runtimed phased exception); the proto fields are carved from the reserved bands in apis:M8.1; the host-process Seatbelt path and existing golden SBPL fixtures stay byte-green. One signed binary. RE-HOME NOTE (2026-07-11): the OCI-layer unpacker (formerly the M8.2-d0 deliverable here) moved to runtimed M11.2-d7 with the Linux-layer re-sequencing — this sub-phase CONSUMES it via the depends edge above; its materialize-then-exec acceptance moved with it (now M11.2-a6).
+        strategy_rationale: additive — the new SandboxProfile booleans (allow_gpu, allow_internet_egress) default false so an old runtimed ignores them and an old provider never sets them (no provider↔runtimed phased exception); the proto fields are carved from the reserved bands in apis:M8.1; the host-process Seatbelt path and existing golden SBPL fixtures stay byte-green. One signed binary. RE-HOME NOTE (2026-07-11): the OCI-layer unpacker (formerly the M8.2-d0 deliverable here) moved to runtimed M11.2-d7 with the Linux-layer re-sequencing — this sub-phase CONSUMES it via the depends edge above; edge NARROWED 2026-08-29 to the d7 deliverable ONLY (operator-directed re-sequencing, m11-plan R25) — d1–d5 need only d7's output, so M8.2 does NOT wait on the rest of the M11.2 wave; its materialize-then-exec acceptance moved with it (now M11.2-a6).
         deliverables:
           - id: M8.2-d1
             done: false
-            desc: pkg/sandbox/metal.go — the S1-derived Metal SBPL allow-set behind allow_gpu, expressed as per-chip-family data (AGX user-client class names vary M1→M4) with golden SBPL fixtures per family in pkg/sandbox/testdata; launch families SCOPED to the dev-mac's own family for v1 (Resolution 15), an unknown/absent family FAILS CLOSED (sandbox_gpu_supported=false + metal.go errors on a family miss, Resolution 14), and the shader-cache write scope is CONTRACT-BOUNDED (per-pod redirect or an enumerated narrow subpath) NOT denial-log-derived (Resolution 11). Emitted in the existing rule order (allows → protected denies → narrow re-allows)
+            desc: >-
+              pkg/sandbox/metal.go — the Metal SBPL allow-set behind allow_gpu. PRIMARY (m8-plan R22,
+              amended 2026-08-29, operator-directed): Apple's own practice — a single prefix rule
+              (iokit-registry-entry-class-prefix "AGXAcceleratorG") plus the S1-derived mach-lookup +
+              shader-cache scope, covering AGX user-client class variation M1→M4 WITHOUT a per-family
+              table; golden fixture — ONE prefix-rule golden. FALLBACK (S1-evaluated, adopted only if the
+              prefix rule under- or over-scopes on the lab rig): the per-chip-family data table (AGX
+              user-client class names vary M1→M4) with per-family golden SBPL fixtures in
+              pkg/sandbox/testdata, launch families SCOPED to the dev-mac's own family for v1 (Resolution
+              15). Res. 14's fail-closed control SURVIVES as the OPERATIVE control: metal.go's per-family
+              Go-side data + the sandbox_gpu_supported advertisement gate remain the gate for whether a
+              family's GPU surface is reachable; the SBPL prefix is a static ceiling, not a family
+              approximation — an unknown/absent family FAILS CLOSED (sandbox_gpu_supported=false +
+              metal.go errors on a family miss on the fallback path; on the prefix-rule path fail-closed
+              keys on the functional probe of M8.2-d4). The shader-cache write scope stays
+              CONTRACT-BOUNDED (per-pod redirect or an enumerated narrow subpath) NOT denial-log-derived
+              (Resolution 11). Emitted in the existing rule order (allows → protected denies → narrow
+              re-allows)
           - id: M8.2-d2
             done: false
-            desc: pkg/sandbox — IP-scoped egress branch behind allow_internet_egress. The wide allow is (allow network-outbound (remote ip …)) — NEVER unqualified (AF_UNIX stays default-denied) — followed last-match-wins by RANGE-BASED host-local denies (the whole of 127/8 incl. kine's plaintext datastore, 169.254/16, all of 100.64/10, the node's RFC1918 subnets) with tier-3 re-allows for the pod's own IP + the cluster DNS/apiserver VIPs (Resolution 12); allow_internet_egress IMPLIES allow_network so DNS-VIP routing is preserved. sandbox.Validate gains an s-expression-aware (balanced-paren token scan) reject-unfiltered-network-outbound check (Resolution 13)
+            desc: >-
+              pkg/sandbox — the egress branch behind allow_internet_egress, RE-FOUNDED 2026-08-29 (m8-plan
+              R21, operator-directed) as the API contract, NOT an SBPL filter: per-IP SBPL scoping does not
+              compile on macOS 26 (probe-verified through the real execshim/libsandbox path —
+              sbpl.go:382-411, where network filters accept only localhost/* hosts). runtimed CONSUMES
+              allow_internet_egress (which IMPLIES allow_network — the pairing is enforced in
+              translate/Validate) and emits the documented unfiltered-but-compilable network stanza — the
+              same stanza allow_network emits, golden-pinned byte-for-byte and matching sbpl.go's ceiling
+              comment; a DOCUMENTED CEILING, stated in limitations.md / privilege-model.md. sandbox.Validate
+              is RE-SCOPED to what is expressible — network forms appear ONLY when allow_network ∨
+              allow_internet_egress is set, the implies-pairing holds, and the emitted stanza matches the
+              golden and COMPILES (the TestIntegrationNetworkStanzaCompiles pattern). The range-based deny
+              set, the tier-3 re-allows, and the kine-loopback deny are RETIRED from M8 (the SBPL half of
+              Resolution 12/13 is superseded): network-layer (PF) enforcement is a FILED FUTURE item (B188,
+              darwin-net-owned), NOT an M8 deliverable; Seatbelt is never claimed as network isolation
           - id: M8.2-d3
             done: false
             desc: pkg/image — AdHocSignTree beside AdHocSign, run ONCE at pull/materialize time over the M11.2-d7 content-addressed tree (policy-keyed variant; the unpacker re-homed 2026-07-11); in-process Mach-O magic detection, signs only invalid/unsigned Mach-Os (ad-hoc signatures are content-addressed and survive clonefile — never de-CoW a clean file); CONTAINMENT-CHECKED (lstat, never follow symlinks/hardlinks, every candidate resolves under the rootfs) and STRUCTURALLY UNREACHABLE under REQUIRE_SIGNED/REQUIRE_NOTARIZED. gateSignature (pkg/runtime/pod.go) becomes check-then-sign-only-if-invalid — no unconditional -f re-sign, which would de-CoW argv[0] every start (Resolution 13) — and keeps verifying argv[0] only per start
@@ -448,11 +479,15 @@ phases:
         acceptance:
           - id: M8.2-a1
             met: false
-            check: golden SBPL tests assert the generated profile — allow_gpu on/off (per-family Metal allow-set), the egress filter + last-match-wins ordering, the range-based deny ordering, and adversarially-formatted profiles rejected by the s-expression-aware Validate
+            check: golden SBPL tests assert the generated profile — allow_gpu on/off (the prefix-rule allow-set; per-family goldens only on the R22 fallback path), the egress/network stanza byte-pinned (documented-ceiling form), and adversarially-formatted profiles rejected by the s-expression-aware Validate
             method: unit
           - id: M8.2-a2
             met: false
             check: AdHocSignTree table test with a fake signer — hardlink/symlink escape cases rejected (containment), non-Mach-O skipped, already-signed skipped, policy gating (unreachable under REQUIRE_SIGNED/REQUIRE_NOTARIZED)
+            method: unit
+          - id: M8.2-a3
+            met: false
+            check: GPUFacts population is unit-proven over a fake probe seam — the VZ-paravirtual discrimination (functional-probe verdict false ⇒ metal_available=false and the node-facing fields cleared), the iogpu_wired_limit_bytes 0-sentinel, recommended_max_working_set_bytes pass-through, and sandbox_gpu_supported scoped to the currently selected backend
             method: unit
           - id: M8.2-a4
             met: false
@@ -1013,7 +1048,7 @@ This chunk delivers the **verifiable foundation + the VZ scaffold**; the live bo
   `pkg/sandbox.TestVMBackendAvailableFalseWithoutEntitlement` + `TestVMBackendAvailableComposition`.
 
 ## M7 — Public CI workflow + SkipUnless conversions ⬜
-**Cross-repo dep:** `apis:M7.1` (the DAG-legal home for the shared `k3smtest.SkipUnless(t, cap)` helper +
+**Cross-repo dep:** `apis:M7.2` (the DAG-legal home for the shared `k3smtest.SkipUnless(t, cap)` helper +
 its owned capability taxonomy — `runtimed`, `darwin-net`, and `k3sm` all import it; a leaf copy would
 drift or force a sideways import). runtimed's M7 slice is the **release-engineering
 plumbing**: a public CI workflow + the skip-site conversion, not a runtime change.
@@ -1044,13 +1079,18 @@ README header); no runtime/proto/datastore change. One signed binary.
 = 103` and the `GetRuntimeInfoResponse.gpu = 100` `GPUFacts` message, all carved from the reserved bands).
 DAG: `M8.1 apis → M8.2 runtimed`. runtimed owns **M8.2 (size L)** — the heaviest M8 sub-phase; product
 design `k3sm/docs/DESIGN.md` §5a/§5c, security posture `docs/privilege-model.md`.
+**Entry (amended 2026-08-29, operator-directed):** the M11.2 edge is **narrowed to the
+`runtimed:M11.2-d7` deliverable only** (d1–d5 need only d7's output — m11-plan R25), so M8.2 does not wait
+on the rest of the M11.2 wave; entry is **additionally gated on the recorded S1/S2/S3 findings**
+(`k3sm:M8.0`, lab-run).
 
 ### M8.2 — Metal SBPL + egress branch + tree signing + GPUFacts ⬜ (L; consumes the M11.2-d7 unpacker)
 **Strategy: hard cut** — the new `SandboxProfile` booleans default false (an old runtimed ignores them, an
 old provider never sets them — **no** provider↔runtimed phased exception), the proto fields ride the
 reserved bands (`apis:M8.1`), and the host-process Seatbelt path + existing golden SBPL fixtures stay
 **byte-green**. One signed binary. **RE-HOME (2026-07-11):** the unpacker below moved to
-`M11.2-d7` with the Linux-layer re-sequencing (`depends_on: [runtimed:M11.2]` in the frontmatter);
+`M11.2-d7` with the Linux-layer re-sequencing (`depends_on: [runtimed:M11.2-d7]` in the frontmatter,
+narrowed 2026-08-29);
 the spec text is preserved here for the historical record only.
 **Deliverables**
 - ⬜ ~~`M8.2-d0`~~ → **`M11.2-d7`** **(PREREQUISITE, re-homed)** `pkg/image`: an **OCI-layer unpacker** →
@@ -1060,23 +1100,37 @@ the spec text is preserved here for the historical record only.
   **compressed** layer blobs exist (`blobs/<algo>/<hex>`) and `resolveBinary` is the M1 materialization
   placeholder, so the **whole M8 product path is blocked on this substrate**; `d3` `AdHocSignTree` walks
   and clonefiles from it.
-- ⬜ `M8.2-d1` `pkg/sandbox/metal.go`: the S1-derived Metal SBPL allow-set behind `allow_gpu`, **per-chip-
-  family data** (AGX user-client class names vary M1→M4) with **golden SBPL fixtures per family** in
-  `pkg/sandbox/testdata`; launch families **scoped to the dev-mac's own** for v1 (**Res. 15**), an
-  **unknown/absent family fails closed** (`sandbox_gpu_supported=false` + `metal.go` errors on a family
-  miss, **Res. 14**), and the shader-cache write scope is **contract-bounded** (per-pod redirect or an
-  enumerated narrow subpath), **not** denial-log-derived (**Res. 11**). Emitted in the existing rule order
-  (allows → protected denies → narrow re-allows).
-- ⬜ `M8.2-d2` `pkg/sandbox`: an **IP-scoped egress branch** behind `allow_internet_egress` — the wide
-  allow is `(allow network-outbound (remote ip …))`, **never unqualified** (AF_UNIX stays default-denied),
-  followed (last-match-wins) by **range-based** host-local denies (the whole of **127/8** incl. kine's
-  plaintext datastore, **169.254/16**, all of **100.64/10**, the node's **RFC1918** subnets) + **tier-3
-  re-allows** for the pod's own IP + the cluster DNS/apiserver VIPs (**Res. 12**); `allow_internet_egress`
-  **implies `allow_network`** so DNS-VIP routing is preserved. `sandbox.Validate` gains an
-  **s-expression-aware** (balanced-paren token scan) **reject-unfiltered-`network-outbound`** check
-  (**Res. 13**).
+- ⬜ `M8.2-d1` `pkg/sandbox/metal.go`: the Metal SBPL allow-set behind `allow_gpu`.
+  **PRIMARY (R22 — amended 2026-08-29, operator-directed):** Apple's own practice — a single **prefix
+  rule** (`(iokit-registry-entry-class-prefix "AGXAcceleratorG")`) plus the S1-derived **mach-lookup +
+  shader-cache scope**, covering AGX user-client class variation M1→M4 **without** a per-family table;
+  **one prefix-rule golden** fixture. **FALLBACK (S1-evaluated, adopted only if the prefix rule under- or
+  over-scopes on the lab rig):** the **per-chip-family data table** (AGX user-client class names vary
+  M1→M4) with **per-family goldens** in `pkg/sandbox/testdata`, launch families **scoped to the dev-mac's
+  own** for v1 (**Res. 15**). **Res. 14's fail-closed control SURVIVES as the OPERATIVE control:**
+  `metal.go`'s per-family Go-side data + the `sandbox_gpu_supported` advertisement gate remain the gate for
+  whether a family's GPU surface is reachable; the SBPL prefix is a **static ceiling, not a family
+  approximation** — an **unknown/absent family fails closed** (`sandbox_gpu_supported=false` + `metal.go`
+  errors on a family miss on the **fallback** path; on the **prefix-rule** path fail-closed keys on the
+  **functional probe** of `M8.2-d4`). The shader-cache write scope stays **contract-bounded** (per-pod
+  redirect or an enumerated narrow subpath), **not** denial-log-derived (**Res. 11**). Emitted in the
+  existing rule order (allows → protected denies → narrow re-allows).
+- ⬜ `M8.2-d2` `pkg/sandbox`: the egress branch behind `allow_internet_egress` — **RE-FOUNDED 2026-08-29
+  (m8-plan R21, operator-directed) as the API contract, not an SBPL filter.** Per-IP SBPL scoping **does
+  not compile on macOS 26** (probe-verified through the real execshim/`libsandbox` path —
+  `sbpl.go:382-411`, where network filters accept only `localhost`/`*` hosts). runtimed **consumes**
+  `allow_internet_egress` (which **implies `allow_network`** — the pairing is enforced in
+  translate/`Validate`) and **emits the documented unfiltered-but-compilable network stanza** — the same
+  stanza `allow_network` emits, **golden-pinned** byte-for-byte and matching `sbpl.go`'s ceiling comment;
+  a **documented ceiling**, stated in `limitations.md` / `privilege-model.md`. `sandbox.Validate` is
+  **re-scoped** to what is expressible — network forms appear **only** when `allow_network ∨
+  allow_internet_egress` is set, the implies-pairing holds, and the emitted stanza matches the golden
+  **and compiles** (the `TestIntegrationNetworkStanzaCompiles` pattern). The range-based deny set, the
+  tier-3 re-allows, and the kine-loopback deny are **retired from M8** (the SBPL half of **Res. 12**/
+  **Res. 13** is superseded): **network-layer (PF) enforcement is a FILED FUTURE item (B188,
+  darwin-net-owned), NOT an M8 deliverable**; Seatbelt is never claimed as network isolation.
 - ⬜ `M8.2-d3` `pkg/image`: **`AdHocSignTree`** beside `AdHocSign`, run **once at materialize time** over
-  the `d0` content-addressed tree; **containment-checked** (lstat, never follow symlinks/hardlinks) and
+  the **`M11.2-d7`** content-addressed tree; **containment-checked** (lstat, never follow symlinks/hardlinks) and
   **structurally unreachable** under `REQUIRE_SIGNED`/`REQUIRE_NOTARIZED`. `gateSignature`
   (`pkg/runtime/pod.go`) becomes **check-then-sign-only-if-invalid** (no unconditional `-f` re-sign — it
   would de-CoW `argv[0]` every start) and keeps verifying `argv[0]` only per start (**Res. 13**).
@@ -1091,12 +1145,17 @@ the spec text is preserved here for the historical record only.
   forks (default — pin the winner single-process at M8.4).
 
 **Acceptance (exit gate)**
-- ⬜ `M8.2-a1` **golden SBPL tests** — `allow_gpu` on/off, egress filter + ordering, deny-ordering,
+- ⬜ `M8.2-a1` **golden SBPL tests** — `allow_gpu` on/off (the prefix-rule allow-set; per-family goldens
+  only on the R22 fallback path), the **egress/network stanza byte-pinned** (documented-ceiling form), and
   adversarial formatting rejected by the s-expr-aware `Validate`.
 - ⬜ `M8.2-a2` **`AdHocSignTree` table test** with a fake signer + hardlink/symlink escape cases (non-Mach-O
   skip, already-signed skip, policy gating).
-- ⬜ `M8.2-a3` **materialize-then-exec integration test** — the `d0` unpacker produces a tree `createPod`
-  materializes via `MaterializeTree` and execs `argv[0]` out of a multi-layer image.
+- ⬜ `M8.2-a3` **`GPUFacts` fake-seam unit test** — population is unit-proven over a **fake probe seam**:
+  the VZ-paravirtual discrimination (functional-probe verdict false ⇒ `metal_available=false` and the
+  node-facing fields cleared), the `iogpu_wired_limit_bytes` **0-sentinel**,
+  `recommended_max_working_set_bytes` pass-through, and `sandbox_gpu_supported` scoped to the **currently
+  selected backend**. (The materialize-then-exec integration acceptance moved to `M11.2-a6` with the
+  unpacker re-home — 2026-07-11.)
 - ⬜ `M8.2-a4` a **real MLX matmul** (full inference round-trip) under the generated `allow_gpu` profile on a
   GPU dev-mac (integration tier, `k3smtest.SkipUnless(t, "apple-gpu")`).
 
