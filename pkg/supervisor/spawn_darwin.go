@@ -20,6 +20,7 @@ package supervisor
 
 /*
 #include <spawn.h>
+#include <Availability.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -28,10 +29,48 @@ package supervisor
 
 extern char **environ;
 
+// k3sm_spawn_addchdir is the posix_spawn file-action that gives the child its
+// own working directory before exec (B202). DARWIN SPI DISCIPLINE, per
+// docs/GO-STANDARDS.md Â§Darwin/cgo: there is NO golang.org/x/sys/unix binding
+// for a posix_spawn file action (unix exposes no posix_spawn at all), and the
+// Go-level alternative — fork+chdir+exec via os/exec — is exactly what this
+// supervisor rejected for pod spawns, because it gives up the single-kqueue
+// reaper and the precise file-action fd control the combined-log pipe needs. So
+// cgo it is, isolated in this file behind the Spawner interface.
+//
+// TWO SPELLINGS, ONE MEANING, chosen by DEPLOYMENT TARGET so the build is
+// warning-free on either:
+//
+//   - posix_spawn_file_actions_addchdir     â the POSIX-standard name, NEW in
+//     macOS 26.0. Not declared at all by an older SDK.
+//   - posix_spawn_file_actions_addchdir_np  â the Darwin/BSD extension it
+//     replaced (macOS 10.15+), DEPRECATED as of macOS 26.0.
+//
+// The _np arm is the deprecated-SPI use the standards require documenting: it is
+// a published, headered, non-private extension (unlike libsandbox or
+// memorystatus), it is the only spelling that exists below macOS 26, and clang
+// only warns about it when the deployment target is >= 26.0 — which is exactly
+// when this macro selects the other one instead. Neither arm needs a symbol
+// canary: both are declared in <spawn.h> and a missing one is a compile error,
+// not a runtime surprise.
+#if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
+#define k3sm_spawn_addchdir posix_spawn_file_actions_addchdir
+#else
+#define k3sm_spawn_addchdir posix_spawn_file_actions_addchdir_np
+#endif
+
 // k3sm_posix_spawn spawns argv[0] with argv/envp in its OWN session (and thus
-// its own process group, since the session leader's pgid == its pid), dup2'ing
-// logFD onto the child's stdout(1) and stderr(2) when logFD >= 0. Returns 0 and
-// writes the pid to *outPid on success, or an errno.
+// its own process group, since the session leader's pgid == its pid), chdir'ing
+// into dir when dir is non-NULL and dup2'ing logFD onto the child's stdout(1)
+// and stderr(2) when logFD >= 0. Returns 0 and writes the pid to *outPid on
+// success, or an errno.
+//
+// A dir that cannot be chdir'd into FAILS THE SPAWN with that chdir's errno
+// (ENOENT / ENOTDIR / EACCES) and no child survives it â posix_spawn evaluates
+// file actions in the kernel and reports the first failure to the caller. There
+// is no arm in which the child runs with the caller's cwd instead; the Go side
+// (planSpawn) refuses an unusable dir before it gets here, and this is the
+// TOCTOU backstop behind that refusal.
 //
 // POSIX_SPAWN_SETSID alone is used (NOT also POSIX_SPAWN_SETPGROUP): on macOS the
 // two together return EPERM, because a freshly-created session leader cannot also
@@ -54,7 +93,7 @@ extern char **environ;
 // Raw posix_spawn (not os/exec) is deliberate: the supervisor owns a single
 // reaper (kqueue), and posix_spawn_file_actions gives precise fd control for the
 // combined-log pipe without a fork+exec dance in Go.
-static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], int logFD, pid_t *outPid) {
+static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int logFD, pid_t *outPid) {
 	posix_spawnattr_t attr;
 	posix_spawn_file_actions_t fa;
 	int rc;
@@ -76,6 +115,13 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 
 	short flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
 	posix_spawnattr_setflags(&attr, flags);
+
+	// The child's working directory. File actions run in order, and this one
+	// touches no descriptor, so it is independent of the dup2s below; it is added
+	// first only so the child is in its own directory for everything that follows.
+	if (dir != NULL) {
+		if ((rc = k3sm_spawn_addchdir(&fa, dir)) != 0) goto done;
+	}
 
 	if (logFD >= 0) {
 		// Combined log: child's fd 1 and fd 2 both go to logFD.
@@ -115,7 +161,13 @@ type PosixSpawner struct{}
 
 // Spawn posix_spawns spec into its own process group and returns the child pid.
 // It passes spec.Env verbatim (so DYLD_INSERT_LIBRARIES flows through to the
-// pod) and wires spec.LogFD as the child's combined stdout+stderr.
+// pod), gives the child spec.Dir as its working directory, and wires spec.LogFD
+// as the child's combined stdout+stderr.
+//
+// spec.Dir is honored through a posix_spawn chdir file action, never by chdir'ing
+// the daemon: this process is shared by every pod, so a parent-side chdir would
+// be a data race with every other spawn in flight. An unusable Dir fails the
+// spawn with ErrWorkingDir (planSpawn) and starts nothing.
 func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -137,13 +189,25 @@ func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		envp = envArr.ptr
 	}
 
+	// Resolve (and refuse) the working directory BEFORE any allocation: an
+	// unusable Dir must fail typed, never fall back to the daemon's cwd.
+	plan, err := planSpawn(spec)
+	if err != nil {
+		return 0, err
+	}
+	var cDir *C.char
+	if plan.ChangeDir != "" {
+		cDir = C.CString(plan.ChangeDir)
+		defer C.free(unsafe.Pointer(cDir))
+	}
+
 	logFD := C.int(-1)
 	if spec.LogFD != 0 {
 		logFD = C.int(spec.LogFD)
 	}
 
 	var pid C.pid_t
-	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, logFD, &pid)
+	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, logFD, &pid)
 	if rc != 0 {
 		return 0, fmt.Errorf("posix_spawn %s: %w", spec.Path, syscallErrno(rc))
 	}

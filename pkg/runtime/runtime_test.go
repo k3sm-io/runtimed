@@ -190,6 +190,18 @@ func (f *fakeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, 
 	return 1000 + f.next, nil
 }
 
+// lastSpec returns the whole SpawnSpec of the most recent spawn, so a test can
+// assert on the seam's other fields (SpawnSpec.Dir — the pod cwd) and not only
+// on the environment.
+func (f *fakeSpawner) lastSpec() supervisor.SpawnSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.specs) == 0 {
+		return supervisor.SpawnSpec{}
+	}
+	return f.specs[len(f.specs)-1]
+}
+
 func (f *fakeSpawner) lastEnv() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

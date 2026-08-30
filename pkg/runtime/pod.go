@@ -198,11 +198,12 @@ type containerProc struct {
 	// startContainer.
 	initDeclared bool
 	// env and workingDir are the RESOLVED launch environment and working
-	// directory this container was spawned with (resolvedBinary). They are
-	// retained rather than re-derived because an Exec session must enter the
-	// same environment the container runs in — for a pulled image that includes
-	// the image config's own $PATH, which the container spec alone does not
-	// carry, and re-deriving it in Exec would mean a second pull.
+	// directory this container was spawned with (resolvedBinary, plus
+	// startContainer's pod-data-volume default for an unset working directory).
+	// They are retained rather than re-derived because an Exec session must
+	// enter the same environment the container runs in — for a pulled image that
+	// includes the image config's own $PATH, which the container spec alone does
+	// not carry, and re-deriving it in Exec would mean a second pull.
 	env        []string
 	workingDir string
 }
@@ -781,12 +782,32 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
+	// THE POD CWD (B202). The merged working directory — the pod's working_dir,
+	// else the image config's (image.MergeRunSpec) — is what the child chdirs
+	// into. When neither is set the default is THE POD DATA VOLUME, never the
+	// inherited cwd: this daemon's cwd is its own working directory, the pod's
+	// SBPL profile denies that tree (and the user homes above it), so a pod that
+	// inherited it started in a directory it may not even stat. That was the M8
+	// run-3 failure, and it was invisible because the field was set here and
+	// dropped at the spawn — the supervisor now refuses an unusable Dir typed
+	// (supervisor.ErrWorkingDir) rather than falling back to it.
+	//
+	// It is the SAME default and the same precedence an exec session already
+	// resolves (exec.go), so `kubectl exec` and the container it enters agree on
+	// where they are. It applies uniformly to the host-binary routes (the native
+	// sentinel and the M0 absolute-path convention): no test pinned their cwd
+	// byte-wise, and "inherit the daemon's cwd" is not a behaviour worth
+	// preserving on any route.
+	workingDir := rb.workingDir
+	if workingDir == "" {
+		workingDir = rootfs
+	}
 	logs := newLogBuffer(r.log.With("pod", p.box.GetPodId(), "container", c.GetName()))
 	spec := supervisor.SpawnSpec{
 		Path: shimPath,
 		Argv: shimArgv,
 		Env:  env,
-		Dir:  rb.workingDir,
+		Dir:  workingDir,
 	}
 	cp := &containerProc{
 		name:         c.GetName(),
@@ -794,7 +815,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		initDeclared: isInit,
 		logs:         logs,
 		env:          env,
-		workingDir:   rb.workingDir,
+		workingDir:   workingDir,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
