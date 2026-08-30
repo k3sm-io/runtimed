@@ -31,6 +31,21 @@ if [ -n "$go_pkgs" ]; then
 	echo "==> [runtimed] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [runtimed] go build"; CGO_ENABLED=$CGO go build ./...
 	echo "==> [runtimed] go test";  CGO_ENABLED=$CGO go test ./...
+
+	# The guest init (cmd/k3sm-guest-init) is PID 1 of a vm-pod's micro-VM and
+	# is GOOS=linux only, so the darwin build above never compiles it. This
+	# cross-lane is the only thing standing between an unrelated change and a
+	# guest that no longer builds (m11-plan §M11.2-d4). CGO stays OFF: the
+	# binary ships inside the pinned initramfs, which has no libc.
+	if [ -d cmd/k3sm-guest-init ]; then
+		echo "==> [runtimed] guest-init cross-build (linux/arm64 + linux/amd64, CGO off)"
+		guestout="$(mktemp -d)"
+		for arch in arm64 amd64; do
+			GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -o "$guestout/k3sm-guest-init.$arch" ./cmd/k3sm-guest-init
+		done
+		GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./cmd/k3sm-guest-init
+		rm -rf "$guestout"
+	fi
 else
 	echo "==> [runtimed] (no Go packages yet — skipping vet/build/test)"
 fi
