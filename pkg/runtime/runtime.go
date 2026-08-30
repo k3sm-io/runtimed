@@ -168,10 +168,17 @@ type Runtime struct {
 	// generator as the work-dir containment bound (sandbox.Posture.Home) so a
 	// misconfigured work-dir cannot point a pod's writable re-allow outside the
 	// daemon's data area. Empty disables the check (legacy root work-dir / tests).
-	home        string
-	log         *slog.Logger
-	cache       *image.Cache
-	puller      Puller
+	home   string
+	log    *slog.Logger
+	cache  *image.Cache
+	puller Puller
+	// loader is the archive-ingest path the Images service's LoadImage serves
+	// (`k3sm image load` / `import`). It is a CONCRETE *image.Loader, not a seam:
+	// the property that makes an ingest safe is the store's own commit ordering
+	// (verify every blob, then lease, then commit, then record — see
+	// image.Loader), and a fakeable seam here would let the daemon's tests go
+	// green against an implementation that does not have it.
+	loader      *image.Loader
 	signer      Signer
 	credentials CredentialResolver
 	backend     sandbox.Backend
@@ -376,27 +383,33 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		cache = c
 	}
+	// The on-disk ref->digest index is the presence-by-reference binding: it
+	// records what THIS daemon pulled or ingested and verified, which is what
+	// makes IfNotPresent serve a warm reference with no registry traffic and
+	// Never satisfiable at all. It is constructed here — not lazily on first use
+	// — so a node whose index tree is missing, substituted, or not owned by this
+	// daemon (image.ErrIndexNotOwned) fails at startup with one clear error
+	// instead of one per pod. It is built OUTSIDE the puller branch because the
+	// ingest path records into the same index: two indexes would let a loaded
+	// reference and a pulled one disagree about what this node has.
+	index, err := image.NewFileIndex(cache)
+	if err != nil {
+		return nil, fmt.Errorf("init image index: %w", err)
+	}
 	puller := deps.Puller
 	if puller == nil {
 		// image.RemoteFetch is named EXPLICITLY: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
-		// The on-disk ref->digest index is the presence-by-reference binding: it
-		// records what THIS daemon pulled and verified, which is what makes
-		// IfNotPresent serve a warm reference with no registry traffic and Never
-		// satisfiable at all. It is constructed here — not lazily on first use —
-		// so a node whose index tree is missing, substituted, or not owned by this
-		// daemon (image.ErrIndexNotOwned) fails at startup with one clear error
-		// instead of one per pod.
-		index, err := image.NewFileIndex(cache)
-		if err != nil {
-			return nil, fmt.Errorf("init image index: %w", err)
-		}
 		p, err := image.NewPuller(cache, image.RemoteFetch, index)
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)
 		}
 		puller = p
+	}
+	loader, err := image.NewLoader(cache, index)
+	if err != nil {
+		return nil, fmt.Errorf("init image loader: %w", err)
 	}
 	signer := deps.Signer
 	if signer == nil {
@@ -497,6 +510,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		log:          log,
 		cache:        cache,
 		puller:       puller,
+		loader:       loader,
 		signer:       signer,
 		credentials:  deps.Credentials,
 		backend:      backend,
