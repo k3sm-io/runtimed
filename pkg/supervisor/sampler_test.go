@@ -65,9 +65,10 @@ func TestMemorySamplerMetersWorkingSet(t *testing.T) {
 	}
 }
 
-// TestMemorySamplerOOMBreachFiresOnce proves the OOM path: the summed footprint
-// exceeding the limit fires onBreach exactly once, Last() tracks the sample, and
-// the loop stops (Done closes) on ctx cancel — the no-goroutine-leak signal.
+// TestMemorySamplerOOMBreachFiresOnce proves the OOM path: a SUSTAINED over-limit
+// footprint fires onBreach exactly once after DefaultBreachSamples consecutive
+// samples, Last() tracks the sample, and the loop stops (Done closes) on ctx
+// cancel — the no-goroutine-leak signal.
 func TestMemorySamplerOOMBreachFiresOnce(t *testing.T) {
 	ff := newFakeFootprinter()
 	ff.set(10, 8<<20)     // 8 MiB, over the limit
@@ -80,7 +81,17 @@ func TestMemorySamplerOOMBreachFiresOnce(t *testing.T) {
 	ticks := make(chan time.Time)
 	go s.loop(ctx, ticks)
 
-	ticks <- time.Now() // breach
+	// The first DefaultBreachSamples-1 over-limit samples must NOT fire: a single
+	// spike is allocator churn, not an over-limit pod.
+	for i := 0; i < DefaultBreachSamples-1; i++ {
+		ticks <- time.Now()
+		select {
+		case b := <-breaches:
+			t.Fatalf("onBreach fired after %d over-limit sample(s) (footprint %d); want %d consecutive", i+1, b, DefaultBreachSamples)
+		default:
+		}
+	}
+	ticks <- time.Now() // the sample that completes the run
 	select {
 	case b := <-breaches:
 		if b <= limit {
@@ -130,5 +141,62 @@ func TestMemorySamplerUnderLimitNoBreach(t *testing.T) {
 	case <-breaches:
 		t.Error("onBreach fired for a pod under its memory limit")
 	default:
+	}
+}
+
+// TestMemorySamplerBreachRequiresConsecutiveSamples pins the SUSTAINED-breach rule
+// and its reset: an oscillating footprint — which is what a GPU inference pod's
+// allocator actually produces, with transient peaks a few percent above a healthy
+// steady state — must not accumulate its spikes into a kill.
+func TestMemorySamplerBreachRequiresConsecutiveSamples(t *testing.T) {
+	ff := newFakeFootprinter()
+	const limit = 1 << 20
+
+	breaches := make(chan uint64, 4)
+	s := NewMemorySampler(ff, func() []int { return []int{10} }, limit, func(b uint64) { breaches <- b },
+		WithBreachSamples(3))
+
+	ticks := make(chan time.Time)
+	go s.loop(context.Background(), ticks)
+
+	// Two over-limit samples interrupted by one under-limit sample: the run resets,
+	// so no kill — even though 4 of the 5 samples below are over the limit.
+	for _, fp := range []uint64{8 << 20, 8 << 20, 512 << 10, 8 << 20, 8 << 20} {
+		ff.set(10, fp)
+		ticks <- time.Now()
+	}
+	select {
+	case b := <-breaches:
+		t.Fatalf("onBreach fired on an oscillating footprint (got %d)", b)
+	default:
+	}
+
+	// One more consecutive over-limit sample completes the run of three.
+	ff.set(10, 8<<20)
+	ticks <- time.Now()
+	select {
+	case <-breaches:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onBreach did not fire after three consecutive over-limit samples")
+	}
+}
+
+// TestWithBreachSamplesClamp pins the clamp: "kill on the first sample" is a
+// coherent policy, "kill on zero samples" is not.
+func TestWithBreachSamplesClamp(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		ff := newFakeFootprinter()
+		ff.set(10, 8<<20)
+		breaches := make(chan uint64, 1)
+		s := NewMemorySampler(ff, func() []int { return []int{10} }, 1<<20, func(b uint64) { breaches <- b },
+			WithBreachSamples(n))
+		ticks := make(chan time.Time)
+		go s.loop(context.Background(), ticks)
+		ticks <- time.Now()
+		select {
+		case <-breaches:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("WithBreachSamples(%d) did not clamp to 1 (no breach on the first over-limit sample)", n)
+		}
 	}
 }

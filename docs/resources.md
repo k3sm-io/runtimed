@@ -44,17 +44,40 @@ phys_footprint that matters for "is this pod over its limit".
   *different* measurement than Linux; do not compare them 1:1.
 - runtimed samples the **tracked container PID's** footprint (summed across a
   multi-container pod). Children a container forks are separate tasks and are **not**
-  summed in M2 — full process-group accounting (`proc_listpids` over the pgid) is
-  future work. A fork-heavy workload can therefore under-report; the limit still
-  catches the common single-process-tree case.
+  summed — full process-group accounting (`proc_listpids` over the pgid) is not built.
+  A fork-heavy workload therefore under-reports, and the under-count is large:
+  measured against a deliberately forking process, a leader holding 200 MB with two
+  300 MB children reported **207 MB against a true group working set of 817 MB**
+  (3.9×, growing with the worker count). The limit catches the common
+  single-process-tree case, which is what k3sm's shipped workload images use — the
+  GPU inference image pins a **single-process** engine, so the leader's footprint is
+  the pod's. Adopting a forking engine makes group accounting **required**, not an
+  optimization.
+- **RSS is not a substitute, and the gap is not small.** A process holding 24 GiB of
+  GPU (Metal) buffers reports `ri_phys_footprint` ≈ 24 593 MB and
+  `ri_resident_size` ≈ **31 MB** — RSS does not move at all across the ramp, because
+  it is blind to the unified-memory working set. Only file-backed (mmap'd) pages
+  appear in both.
 
 ## OOMKilled
 
-When a metered pod's summed phys_footprint first exceeds its limit, the sampler
-fires once: the runtime SIGKILLs every container process group and sets the
-terminated reason to **`OOMKilled`** (`pkg/runtime/pod.go` `oomKill` +
-`watchContainerExit`). The kqueue reaper stays the sole reaper — the sampler only
-triggers the signal; it never `wait4`s.
+When a metered pod's summed phys_footprint exceeds its limit for
+**`supervisor.DefaultBreachSamples` consecutive samples** (3, i.e. ~3 s at the
+default 1 Hz), the sampler fires once: the runtime SIGKILLs every container process
+group and sets the terminated reason to **`OOMKilled`** (`pkg/runtime/pod.go`
+`oomKill` + `watchContainerExit`). The kqueue reaper stays the sole reaper — the
+sampler only triggers the signal; it never `wait4`s.
+
+**Why a run of samples and not the first one.** A GPU inference workload's footprint
+oscillates as its allocator returns and re-takes buffers: measured transient peaks
+run ~60–130 MB above a ~2 GB steady state (~6%) on a healthy pod. Killing on a
+single sample would OOMKill it for behaving normally, and `OOMKilled` is not a soft
+signal upstream (restart, and a count against a Job's `backoffLimit`). One
+under-limit sample resets the run, so spikes never accumulate into a kill. The cost
+is that a genuinely over-limit pod is killed up to ~3 s later — affordable because
+**this sampler is the only killer in the range k3sm operates in**: the Metal wired
+limit is a residency *hint* (allocation 8× past it succeeded with no eviction) and
+jetsam did not engage even at 24 GiB on a 64 GiB host.
 
 The memory limit is read from the typed **`PodBox.memory_limit_bytes`** field
 (`apis:M2.2`, allocated from the reserved `100..199` band) — the provider converts
