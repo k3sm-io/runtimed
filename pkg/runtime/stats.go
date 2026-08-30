@@ -37,11 +37,11 @@ import (
 // its sampler was never armed, matching PodMetrics' ok==false. An unknown pod_id
 // yields an empty list (not an error): a stats query races pod teardown, so "gone"
 // is an empty snapshot, not a failure.
-func (r *Runtime) ListPodStats(_ context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
+func (r *Runtime) ListPodStats(ctx context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
 	ids := r.statsTargets(req.GetPodId())
 	out := make([]*runtimev1.PodStats, 0, len(ids))
 	for _, id := range ids {
-		if st := r.podStats(id); st != nil {
+		if st := r.podStats(ctx, id); st != nil {
 			out = append(out, st)
 		}
 	}
@@ -68,6 +68,29 @@ func (r *Runtime) statsTargets(podID string) []string {
 }
 
 // podStats builds the wire PodStats for podID, or nil when the pod is unknown or
+// has no sample to report.
+//
+// THE SOURCE FORK (B107). Which KERNEL produced a pod's figures is decided here,
+// once, by the pod's RESOLVED backend: a vm pod's working set and CPU come from
+// the guest's own cgroup2 hierarchy over the agent's Stats verb (vmPodStats),
+// and a host-process pod's come from Darwin proc_pid_rusage (hostPodStats). The
+// two are never mixed and neither is ever a fallback for the other — a host
+// rusage figure for a vm pod would meter the vmhost helper process, not the
+// workload, and would be off by the whole guest.
+func (r *Runtime) podStats(ctx context.Context, podID string) *runtimev1.PodStats {
+	r.mu.Lock()
+	p := r.pods[podID]
+	r.mu.Unlock()
+	if p == nil {
+		return nil
+	}
+	if p.isVM() {
+		return r.vmPodStats(ctx, p)
+	}
+	return r.hostPodStats(ctx, p)
+}
+
+// hostPodStats builds the wire PodStats for a HOST-PROCESS pod, or nil when it
 // has no sampler (the PodMetrics ok==false gate).
 //
 // The pod-level working set is the sampler's latest summed ri_phys_footprint
@@ -92,18 +115,12 @@ func (r *Runtime) statsTargets(podID string) []string {
 // Only LIVE containers are reported. A terminated container has no process to
 // sample, so it could only contribute a zero working set — and a zero working set
 // is not "idle", it is a missing sample that makes the consumer drop the whole pod.
-func (r *Runtime) podStats(podID string) *runtimev1.PodStats {
+func (r *Runtime) hostPodStats(_ context.Context, p *pod) *runtimev1.PodStats {
+	podID := p.box.GetPodId()
 	// PodMetrics gates inclusion (ok==false for an unknown/unsampled pod) and
 	// supplies the pod-level working set sourced from the sampler.
 	m, ok := r.PodMetrics(podID)
 	if !ok {
-		return nil
-	}
-
-	r.mu.Lock()
-	p := r.pods[podID]
-	r.mu.Unlock()
-	if p == nil {
 		return nil
 	}
 

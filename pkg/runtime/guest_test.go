@@ -177,10 +177,19 @@ func addVMPod(t *testing.T, rt *Runtime, podID string, containers ...string) *po
 	for _, name := range containers {
 		box.Containers = append(box.Containers, &runtimev1.Container{Name: name, Image: "docker.io/library/busybox:latest"})
 	}
+	// The pod-lifetime supervision context is set exactly as createPod sets it:
+	// it is what every per-pod goroutine (and, on the host spine, the memory
+	// sampler) is rooted at, so a stand-in without one would make an arm attempt
+	// panic instead of being refused — which would hide the very refusal B107's
+	// no-ticker assertion is about.
+	podCtx, podCancel := context.WithCancel(context.Background())
+	t.Cleanup(podCancel)
 	p := &pod{
 		box:     box,
 		backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_VM,
 		phase:   runtimev1.PodPhase_POD_PHASE_RUNNING,
+		supCtx:  podCtx,
+		cancel:  podCancel,
 	}
 	rt.mu.Lock()
 	rt.pods[podID] = p
