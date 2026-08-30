@@ -141,6 +141,74 @@ func TestContainerEnvExplicitDyldWins(t *testing.T) {
 	}
 }
 
+// TestContainerEnvKeepsEntriesAfterDYLD is the B205 regression gate: an
+// explicit DYLD_INSERT_LIBRARIES entry mid-slice must not truncate the base
+// env at that point — every entry before AND after it must survive, in
+// order, and the injected-annotation (non-explicit) DYLD path must still
+// carry the whole base too. Asserts the full resulting slice, not membership.
+func TestContainerEnvKeepsEntriesAfterDYLD(t *testing.T) {
+	t.Run("explicit spec DYLD preserves entries before and after it", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{})
+		box, c := mountingBox(t, rt, "pod-6")
+		c.Env = []*runtimev1.EnvVar{
+			{Name: "A", Value: "1"},
+			{Name: dyldInsertEnv, Value: "/custom.dylib"},
+			{Name: "B", Value: "2"},
+		}
+
+		env := mustEnv(t, rt, box, c)
+		want := []string{
+			tmpDirEnv + "=" + podTmpDir(derivedRootfs(t, rt, "pod-6")),
+			"A=1",
+			dyldInsertEnv + "=/custom.dylib",
+			"B=2",
+		}
+		if !slices.Equal(env, want) {
+			t.Errorf("containerEnv = %v, want %v", env, want)
+		}
+	})
+
+	t.Run("no DYLD entry: base order unchanged", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{})
+		box, c := mountingBox(t, rt, "pod-7")
+		c.Env = []*runtimev1.EnvVar{
+			{Name: "A", Value: "1"},
+			{Name: "B", Value: "2"},
+		}
+
+		env := mustEnv(t, rt, box, c)
+		want := []string{
+			tmpDirEnv + "=" + podTmpDir(derivedRootfs(t, rt, "pod-7")),
+			"A=1",
+			"B=2",
+		}
+		if !slices.Equal(env, want) {
+			t.Errorf("containerEnv = %v, want %v", env, want)
+		}
+	})
+
+	t.Run("annotation-injected DYLD (not explicit) still carries the whole base", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{})
+		box, c := mountingBox(t, rt, "pod-8")
+		box.Annotations = map[string]string{dyldInsertAnnotation: "/opt/k3sm/libdnsshim.dylib"}
+		c.Env = []*runtimev1.EnvVar{
+			{Name: "A", Value: "1"},
+			{Name: "B", Value: "2"},
+		}
+
+		env := mustEnv(t, rt, box, c)
+		want := []string{
+			tmpDirEnv + "=" + podTmpDir(derivedRootfs(t, rt, "pod-8")),
+			"A=1",
+			"B=2",
+			dyldInsertEnv + "=/opt/k3sm/libdnsshim.dylib",
+		}
+		if !slices.Equal(env, want) {
+			t.Errorf("containerEnv = %v, want %v", env, want)
+		}
+	})
+}
+
 // mustEnv is a test helper: containerEnv now returns an error because the
 // path-rebase shim's rootfs is derived from a validated pod id, and a test that
 // silently dropped that error would hide a rejected id behind an empty env.

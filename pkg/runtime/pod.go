@@ -1699,11 +1699,18 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		}
 		env = append(env, tmpDirEnv+"="+podTmpDir(dataVol))
 	}
+	explicitDyld := false
 	for _, e := range base {
 		env = append(env, e)
 		if name, _, _ := strings.Cut(e, "="); name == dyldInsertEnv {
-			return env, nil // explicit container DYLD wins; do not inject shims
+			explicitDyld = true
 		}
+	}
+	if explicitDyld {
+		// explicit container DYLD wins; do not inject shims. The full base is
+		// already appended above (B205): an explicit DYLD entry mid-slice must
+		// not truncate whatever base env follows it.
+		return env, nil
 	}
 
 	var inserts []string
