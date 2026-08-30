@@ -31,7 +31,15 @@ type SpawnSpec struct {
 	// Env is the child environment. It MUST already contain any
 	// DYLD_INSERT_LIBRARIES the pod needs; the spawner passes it through verbatim.
 	Env []string
-	// Dir is the child working directory ("" = inherit).
+	// Dir is the child working directory: an ABSOLUTE path the child chdirs
+	// into before exec (a posix_spawn chdir file action, never a chdir of this
+	// shared daemon process). "" means "inherit the caller's cwd".
+	//
+	// A Dir that is set but unusable — relative, missing, or not a directory —
+	// FAILS the spawn with ErrWorkingDir. It never silently falls back to the
+	// inherited cwd; see that sentinel for why. Callers that own a pod-safe
+	// default (pkg/runtime defaults it to the pod data volume) must apply it
+	// before they build the spec: this package cannot.
 	Dir string
 	// LogFD is the write end of the combined stdout+stderr pipe; the child's
 	// fd 1 and fd 2 are dup2'd onto it. If 0, the child inherits the parent's.
