@@ -46,43 +46,67 @@ type imagesService struct {
 	rt *Runtime
 }
 
-// ListImages returns the images this node has recorded roots for.
+// ListImages returns the images this node has recorded, from the ref->digest
+// index (image.FileIndex) — the record of what this daemon pulled or ingested
+// and verified.
 //
-// The entries are assembled from the DAEMON-AUTHORED per-pod reachability
-// records, which are the only local index that exists today: a reference-to-
-// digest index keyed (reference x platform) is a separate deliverable. Two
-// consequences are stated rather than papered over — the listing carries no
-// manifest descriptor (the store never commits a manifest blob, so there is no
-// digest to report), and an image that no pod references is not listed even if
-// its blobs are still cached.
+// It listed the per-pod REACHABILITY ROOTS until B198, which made the answer
+// wrong in the one direction an operator notices: a freshly `k3sm image
+// load`ed archive has no pod behind it, so it had no root, so `image ls`
+// showed nothing while `image df` reported its bytes. "What is on this node"
+// and "what is some pod still using" are different questions, and roots only
+// ever answered the second.
+//
+// The GC is untouched by this. Cache.Roots remains the sole reachability
+// authority; index entries are edges that no enumerator can reach, so an image
+// listed here with no pod behind it is still reclaimed by the next prune (see
+// image.FileIndex). That is deliberate, not a gap: a listing that pinned
+// content would turn every `image ls` row into an un-reclaimable root.
+//
+// The listing carries no manifest_descriptor: the store commits config and
+// layer blobs but never the manifest itself, so there is no digest to report
+// for it. Filtering is exact-match on the request's reference and, because the
+// index is keyed (reference x platform), on its platform when one is given.
 func (s *imagesService) ListImages(ctx context.Context, req *runtimev1.ListImagesRequest) (*runtimev1.ListImagesResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
 	}
-	roots, err := s.rt.cache.Roots()
+	entries, err := s.rt.index.List(ctx)
 	if err != nil {
 		return nil, imageStatusError(err)
 	}
-	seen := make(map[string]bool, len(roots))
+	want := requestedPlatform(req.GetPlatform())
 	out := &runtimev1.ListImagesResponse{}
-	for _, r := range roots {
-		if req.GetReference() != "" && r.Reference != req.GetReference() {
+	for _, e := range entries {
+		if req.GetReference() != "" && e.Reference != req.GetReference() {
 			continue
 		}
-		if seen[r.Reference] {
+		if want != nil && e.Platform != *want {
 			continue
 		}
-		seen[r.Reference] = true
-		mfst := &runtimev1.ImageManifest{
-			Reference: r.Reference,
-			Config:    &runtimev1.Descriptor{Digest: r.Config},
-		}
-		for _, l := range r.Layers {
-			mfst.Layers = append(mfst.Layers, &runtimev1.Descriptor{Digest: l})
-		}
-		out.Images = append(out.Images, &runtimev1.Image{Manifest: mfst})
+		out.Images = append(out.Images, &runtimev1.Image{Manifest: e.Manifest})
 	}
 	return out, nil
+}
+
+// requestedPlatform converts a ListImages platform filter to the normalized
+// image.Platform the index is keyed by, or nil when no filter was given.
+//
+// An all-empty message is "no filter" rather than "the empty platform": the
+// proto has no presence for a message's emptiness beyond the message itself,
+// and treating a zero-valued filter as a match target would make an unset field
+// silently list nothing.
+func requestedPlatform(p *runtimev1.Platform) *image.Platform {
+	if p == nil || (p.GetOs() == "" && p.GetArchitecture() == "" && p.GetVariant() == "" && p.GetOsVersion() == "") {
+		return nil
+	}
+	n := image.Platform{
+		OS:           p.GetOs(),
+		Architecture: p.GetArchitecture(),
+		Variant:      p.GetVariant(),
+		OSVersion:    p.GetOsVersion(),
+	}.Normalize()
+	return &n
 }
 
 // ImageFsInfo returns raw statfs measurements for the volume backing the image

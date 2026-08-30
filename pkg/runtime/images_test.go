@@ -253,12 +253,18 @@ func TestPruneImagesRefusesAndReportsTypedReasons(t *testing.T) {
 }
 
 // TestImagesListAndFsInfo covers the two read RPCs: the listing is assembled
-// from the daemon-authored records, and the filesystem info is a raw statfs
+// from the node's ref->digest index, and the filesystem info is a raw statfs
 // measurement of the store volume.
+//
+// The pod root is still recorded here even though the listing no longer reads
+// it (B198): this is the ordinary shape — an image that was pulled AND is in
+// use — and keeping both records is what makes the row a check that the two
+// sources agree rather than a check that only one of them exists.
 func TestImagesListAndFsInfo(t *testing.T) {
 	client, rt := imagesTestClient(t)
 	cfg := putBlob(t, rt, "cfg")
 	layer := putBlob(t, rt, "layer")
+	recordIndex(t, rt, "example.test/app:v1", cfg, layer)
 	putPod(t, rt, "pod-a", image.ImageRoot{Reference: "example.test/app:v1", Config: cfg, Layers: []string{layer}})
 
 	list, err := client.ListImages(context.Background(), &runtimev1.ListImagesRequest{})
