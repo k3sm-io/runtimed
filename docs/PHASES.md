@@ -580,7 +580,7 @@ phases:
 
   - id: M11
     title: Linux containers & multi-arch (runtimed slice — platform selection, Linux rootfs, k3sm-vmhost, guest init/agent)
-    status: todo
+    status: in-progress  # 2026-08-30 ledger repair: M11.2 has been in-progress with d1/d4/d6/d7 landed (and d0/d5 written back the same day); a todo top-level contradicted its own sub-phase
     depends_on: []
     notes: >-
       The XL heart of M11 (docs/m11-plan.md — authoritative). ABSORBS AND SUPERSEDES the
@@ -605,7 +605,7 @@ phases:
         depends_on: [apis:M11.1]
         deliverables:
           - id: M11.2-d0
-            done: false
+            done: true  # 2026-07-23, B99 (runtimed#38) — platform selection + ErrNoPlatformMatch shipped; ledger write-back 2026-08-30
             desc: "Image platform selection (B99 — /go-drainable now): pure PlatformPolicy{Backend, HostRosetta, GuestRosetta, Override} → ordered Candidates() in pkg/image/platform.go (native: darwin/arm64 [+darwin/amd64 iff host Rosetta]; vm: linux/arm64 variant \"\"≡v8 [+linux/amd64 iff guest Rosetta]; Override ⇒ exactly that platform). RemoteFetch becomes candidate-aware: remote.Get → explicit index traversal in candidate order (skip attestation manifests) → single-manifest os/arch verified → sentinel ErrNoPlatformMatch carrying the image's available platforms. Structurally removes ggcr's implicit linux/amd64 default (the latent bug at pull.go:86). Resolved platform recorded via ImageManifest.platform/index_digest. Deliberate divergence registered: upstream runs a mismatched single-manifest image to an exec-format crash; k3sm refuses at pull (divergent-by-design)."
           - id: M11.2-d1
             done: true  # 2026-08-30, B100 (runtimed#76) — Linux dialect over the d7 substrate; whiteouts/collision-fail-closed/ChainID snapshots/ownership sidecar/MergeRunSpec
@@ -620,7 +620,7 @@ phases:
             done: true  # 2026-08-30, B102 (runtimed#75) — pkg/guestinit plan producers + cmd/k3sm-guest-init + the portable PID1 reaper (-race suite); linux cross-build in repo ci
             desc: "pkg/guestinit + cmd/k3sm-guest-init (B102): pure plan producers (mount plans incl. per-container /etc bind set + musl-safe search list, Rosetta binfmt line — flags POCF, F-rationale recorded, user resolution, sidecar apply, tmpfs-upper size bound) darwin-testable; the PID1 reaper + Stop(grace) state machine GOOS-PORTABLE behind a proc seam with a NAMED -race suite (the milestone's most concurrency-sensitive code); cmd/ is the thin GOOS=linux CGO=0 executor. Boot: mounts → guest-spec.json → per-container overlay (virtiofs lower RO + bounded tmpfs upper, metacopy=on) → sidecar → binfmt → hostname → /etc binds into EVERY container rootfs (chroot shadows guest /etc — kubelet contract) → eth0 DHCP (pure-Go; the agent-Health lease is the SINGLE live-address authority — the 'runtimed reconciles from the attachment' comments in vm.go/guest.go are retired; closes darwin-net M5.2 caveat (a)) → init then main containers (cgroup2 leaf, chroot, workdir, k8s uid/gid precedence, fsGroup supplemental + idmapped volume mounts) → reap → Stop: TERM→grace→KILL→sync→poweroff. Guest link MTU ≤1380 if cross-node is ever claimed. Cross-build + vet lane wired into runtimed's per-CI gate."
           - id: M11.2-d5
-            done: false
+            done: true  # 2026-07-29, B106 (runtimed#40) — virtiofs share plans + share-set invariants; ledger write-back 2026-08-30 (fsGroup/idmap request plumbing only; the guest-side apply stays S3(2)-contingent)
             desc: "Volumes into guests (B106): hybrid share model — projected/Secret/ConfigMap/downwardAPI via the EXISTING mount.Materialize → dedicated READ-ONLY k3sm.proj share (RO at the VZ device); emptyDir default under the RW k3sm.vols share; medium:Memory = guest tmpfs with sizeLimit (never crosses virtiofs). Share-set invariants table-tested: per-pod roots inside the owning pod dir; pairwise-disjoint (k3sm.vols never an ancestor of the projected tree); per-container bind visibility; credentials never on a RW share. fsGroup = guest-side idmapped mounts (mount_setattr MOUNT_ATTR_IDMAP: host _k3sm owner → effective container uid/fsGroup — zero chown anywhere; fsGroupChangePolicy moot) CONTINGENT on spike S3(2) — Apple's virtiofs device must advertise FUSE idmap support; kernel ≥6.12 is necessary-not-sufficient; NO chmod fallback is encoded (banned dual path — if S3 disproves idmap, a human-reviewed re-plan). ALL guest hostPath (Directory shares AND File snapshots) FAIL-CLOSED REJECTED until human-gated B98 lands; /var/lib/k3sm denied unconditionally."
           - id: M11.2-d6
             done: true  # 2026-08-30, B101 (runtimed#74) + B107 (runtimed#77) — vm Exec/Logs bridge over the private agent.sock + the stats/kill-reason fork (agent truth, no ticker)
@@ -628,6 +628,9 @@ phases:
           - id: M11.2-d7
             done: true  # runtimed#72, 2026-08-29 — a6 green unprivileged (materialize-then-exec)
             desc: "OCI-layer unpacker (the SUBSTRATE — built FIRST within this wave; re-homed here 2026-07-11 from the MLX slice, verbatim scope; m11-plan R17): pkg/image — a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. Today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder — this is the substrate d1 (Linux rootfs builder) extends in-wave, the MLX tree-signing walks (that slice consumes it via its depends edge), and the images milestone's native semantics consume."
+          - id: M11.2-d8
+            done: false
+            desc: "Guest-network consumer seam (the runtimed half of B6; filed 2026-08-30 — the deliverable M11.4-d4 has nothing to plug into, which is exactly what re-blocked B6): pkg/runtime.Deps.Network gains an OPTIONAL consumer interface mirroring the existing NetworkReconciler pattern — GuestNetworker{ GuestNetwork(podID string) (sandbox.GuestNetworkConfig, bool) } — type-asserted at createPod so the vm branch fetches the provider-produced config instead of server.go's literal sandbox.GuestNetworkConfig{}. NO new proto field (m11-plan R3 honored: the provider is the producer/mapper), NO new Deps field, fake on both sides. sandbox.GuestNetworkConfig additionally gains STRUCTURED Nameservers/Searches/Options alongside the rendered ResolvConf: guest/v1 GuestSpec.resolv_conf is structured precisely so the guest can render it musl-safely (alpine ignores options ndots), and a rendered-string-only carrier would force the host to re-parse its own output — the round-trip the proto exists to prevent. Teardown stays PROVIDER-side via releasePodNetwork (M10.1's no-auto-release rule: runtimed must not release what it did not allocate; two owners is how double-release ships)."
         acceptance:
           - id: M11.2-a1
             met: false
@@ -651,7 +654,7 @@ phases:
             test: pkg/runtime.TestCreateVMPodVolumeSharePlan + pkg/runtime.TestVMPodExecRoutesToGuestAgent + pkg/supervisor.TestVMPodStatsFromGuestAgentNotRusage
           - id: M11.2-a5
             met: false
-            check: "the k3sm product binary's module graph excludes github.com/Code-Hex/vz (go-list-deps canary in hack/ci.sh); internal/spicanary byte-unchanged; live VM boot / Rosetta / virtiofs-attach legs are the M11.5 lab gate (hack/lab/m11.sh), never auto-greened"
+            check: "the k3sm product binary's PACKAGE and LINK graphs exclude github.com/Code-Hex/vz: go list -deps ./cmd/k3sm carries neither vz nor runtimed/pkg/vmhost, go mod why -m github.com/Code-Hex/vz/v3 reports does-not-need, and otool -L on the built binary links no Virtualization framework (canaries in k3sm/hack/ci.sh); a runtimed-side go list -deps guard over pkg/{runtime,sandbox,image,mount,supervisor} fires in the PR that adds a bad import. RECORDED EXCEPTION: k3sm/go.sum carries a /go.mod-only hash line for Code-Hex/vz (module-graph pruning loads runtimed's go.mod), asserted to carry no bare h1: zip line. CORRECTED 2026-08-30: the prior text said module graph, but go list -deps is a PACKAGE-graph tool and the literal module graph cannot be kept clean while vmhost lives in the runtimed module (a deliberate siting decision — one version pin with apis/guest/v1, not two). internal/spicanary byte-unchanged; live VM boot / Rosetta / virtiofs-attach legs are the M11.5 lab gate (hack/lab/m11.sh), never auto-greened"
             method: build
           - id: M11.2-a6
             met: true  # 2026-08-29 — runs unprivileged on the dev host; layer-order-sensitive fixture
