@@ -310,6 +310,50 @@ func (f *fakePuller) ref() string {
 	return f.lastRef
 }
 
+// fakeUnpacker is the runtime.Unpacker seam: it records what MaterializeTree was
+// asked to do and, unless told to fail, reports a tree without touching a blob
+// store. Every unit test that drives a pulled image gets this by default (see
+// newTestRuntimeCfg) — a fakePuller returns a manifest naming blobs that were
+// never committed, so the real unpacker could not serve it.
+type fakeUnpacker struct {
+	err error
+
+	mu       sync.Mutex
+	calls    int
+	lastMfst *runtimev1.ImageManifest
+	lastPol  image.UnpackPolicy
+	lastDst  string
+}
+
+func (f *fakeUnpacker) MaterializeTree(_ context.Context, mfst *runtimev1.ImageManifest, policy image.UnpackPolicy, dst string) (*image.MaterializeResult, error) {
+	f.mu.Lock()
+	f.calls++
+	f.lastMfst = mfst
+	f.lastPol = policy
+	f.lastDst = dst
+	f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:fake", Rootfs: dst, Policy: policy}}, nil
+}
+
+// observed returns the call count and the last (policy, destination) pair, so a
+// test can assert the spine materializes exactly once per pulled container and
+// into the pod's own rootfs.
+func (f *fakeUnpacker) observed() (int, image.UnpackPolicy, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.lastPol, f.lastDst
+}
+
+// manifest returns the last manifest handed to MaterializeTree.
+func (f *fakeUnpacker) manifest() *runtimev1.ImageManifest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastMfst
+}
+
 // fakeSigner records sign calls and applies a policy-gate decision.
 type fakeSigner struct {
 	mu        sync.Mutex
@@ -347,6 +391,14 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	d = testDeps(t, d)
 	if d.Puller == nil {
 		d.Puller = &fakePuller{}
+	}
+	// Defaulted HERE and not in testDeps for the same reason Puller is:
+	// pull_wiring_test.go's TestDefaultPullerPlatformWiring calls
+	// New(..., testDeps(t, Deps{})) to reach the daemon's REAL image wiring, and
+	// that is the one test that would go green against a New which never builds
+	// an unpacker at all.
+	if d.Unpacker == nil {
+		d.Unpacker = &fakeUnpacker{}
 	}
 	// Default the two Rosetta probe seams to deterministic FAIL-CLOSED fakes. Left
 	// nil they fall through in New to the real sandbox.ProbeHostRosetta, which stats

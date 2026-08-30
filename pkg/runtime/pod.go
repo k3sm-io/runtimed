@@ -1242,9 +1242,37 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		return resolvedBinary{}, err
 	}
 	res.Lease.Release()
-	// M1 materialization placeholder: the cache holds the blobs; a layer-applying
-	// materializer lands with the rootfs format. For now argv[0] is command[0]
-	// resolved against the rootfs if relative, else as-is.
+
+	// MATERIALIZE. Until M11.2-d7 this was the M1 placeholder: the blobs were in
+	// the cache, the pod rootfs was empty, and argv[0] was resolved against a
+	// directory that held nothing — so a container whose command lived IN its
+	// image could never start. The unpacker applies the image's layers in order
+	// into a content-addressed tree and CoW-clones that tree into this pod's
+	// rootfs, so a relative command[0] now names a real file.
+	//
+	// It runs AFTER the lease release deliberately: the reachability root
+	// recorded just above is what protects these blobs from a concurrent
+	// reclaim for the whole of the unpack, and it is a durable record rather
+	// than an expiring pin.
+	//
+	// A failure here FAILS THE CONTAINER. There is no "materialize what we can"
+	// degradation: a partial rootfs is a pod that starts and then behaves in a
+	// way no manifest describes, and the tree is committed atomically precisely
+	// so the only two outcomes are the whole image or an error.
+	mat, err := r.unpacker.MaterializeTree(ctx, res.Manifest, unpackPolicy(), rootfs)
+	if err != nil {
+		return resolvedBinary{}, fmt.Errorf("materialize image %q: %w", c.GetImage(), err)
+	}
+	r.log.Debug("materialized image tree",
+		"pod", p.box.GetPodId(), "container", c.GetName(), "image", c.GetImage(),
+		"tree", mat.Tree.Key, "tree_cache_hit", mat.Tree.CacheHit, "cloned", mat.Cloned)
+
+	// argv[0] is command[0] resolved against the pod rootfs when relative, else
+	// taken as-is (an absolute path names a host binary the image does not
+	// supply). Deriving argv from the IMAGE CONFIG's Entrypoint/Cmd when the pod
+	// supplies neither — the k8s four-quadrant merge — is M11.2-d1's MergeRunSpec,
+	// not this deliverable: it is a spec-merge decision, and doing half of it here
+	// would put two producers of argv on one path.
 	bin := cmd[0]
 	if !filepath.IsAbs(bin) {
 		bin = filepath.Join(rootfs, bin)
@@ -1293,6 +1321,21 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 // image.ErrNoPlatformMatch. Do not flip this to r.rosettaHost without B105.
 func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
 	return image.PlatformPolicy{Backend: backend}
+}
+
+// unpackPolicy is the layer-application dialect a materialization uses. It takes
+// no argument today because the host-process (Mach-O) spine is the only spine
+// that materializes: createPod routes a resolved vm backend to createVMPod
+// BEFORE resolveBinary is reached, so every caller of this function is native by
+// construction.
+//
+// It is a function rather than a constant at the call site so the dialect has
+// ONE producer when M11.2-d1 adds the Linux dialect: d1 gives this function the
+// pod's resolved backend and returns its own image.LayerSemantics for the vm
+// rung. Spelling image.NativeUnpackPolicy() inline at the call site would put
+// that discriminator wherever the next caller happens to be.
+func unpackPolicy() image.UnpackPolicy {
+	return image.NativeUnpackPolicy()
 }
 
 // pullCredential resolves the registry pull credential for ref from the pod's
