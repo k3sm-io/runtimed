@@ -169,7 +169,7 @@ func (m MetalStatus) Available() bool { return m.Functional && !m.Paravirtual }
 
 // SandboxGPUSupported reports GPUFacts.sandbox_gpu_supported: whether THIS daemon,
 // as configured, can grant a pod GPU access at all. It is the fail-closed
-// advertisement control (m8-plan Resolution 14) and it is scoped to the SELECTED
+// advertisement control (the fail-closed family gate) and it is scoped to the SELECTED
 // backend on purpose — the same machine supports GPU pods under the Seatbelt rung
 // and not under the vm rung, so it is not a hardware property.
 //

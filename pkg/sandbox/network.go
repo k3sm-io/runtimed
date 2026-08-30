@@ -99,7 +99,7 @@ var ErrNetworkStanzaMismatch = errors.New("sbpl: profile network stanza is not t
 
 // ErrEgressPairingViolated reports a rendered profile that requested
 // allow_internet_egress but carries no network grant — the implies-pairing broken.
-// allow_internet_egress IMPLIES allow_network (m8-plan Resolution 21), so a
+// allow_internet_egress IMPLIES allow_network, so a
 // generated profile that dropped the grant would leave a workload that declared it
 // needs the internet with no network at all.
 var ErrEgressPairingViolated = errors.New("sbpl: allow_internet_egress did not yield a network grant")
@@ -123,7 +123,7 @@ func networkRequested(sp *runtimev1.SandboxProfile) bool {
 }
 
 // ValidateNetworkScope checks a RENDERED profile's network grant against what sp
-// requested. It is the re-scoped network check (m8-plan Resolution 21) — scoped to
+// requested. It is the re-scoped network check — scoped to
 // what macOS 26 can actually express, which is the shape of the grant, never a
 // per-IP filter it would reject at compile time:
 //

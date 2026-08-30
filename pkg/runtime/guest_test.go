@@ -693,7 +693,7 @@ func TestVMPodLogsRouteToGuestAgent(t *testing.T) {
 	})
 }
 
-// TestGuestAgentSocketIsRuntimedPrivate pins m11-plan Resolution 7 as a property
+// TestGuestAgentSocketIsRuntimedPrivate pins the runtimed-private socket placement as a property
 // of the LAYOUT: the agent socket lives under <Root>/run, never inside the pod
 // tree a pod's own SBPL re-allow is built from — so "no pod profile allows any
 // agent.sock" cannot be broken by a future profile edit.
@@ -725,7 +725,7 @@ func TestGuestAgentSocketIsRuntimedPrivate(t *testing.T) {
 			t.Fatal(err)
 		}
 		if mount.IsStrictlyUnder(sock, podDir) || sock == podDir {
-			t.Errorf("agent socket %q is inside the pod dir %q (m11-plan Resolution 7 forbids it)", sock, podDir)
+			t.Errorf("agent socket %q is inside the pod dir %q (the private-placement contract forbids it)", sock, podDir)
 		}
 	})
 
