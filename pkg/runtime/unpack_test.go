@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -514,6 +515,11 @@ func TestResolveBinaryMergesTheImageConfig(t *testing.T) {
 // TestContainerEnvMergesTheImageEnvironment pins the env seam: a pulled image's
 // $PATH reaches the child, the pod's entries still override it, and the DYLD
 // shim injection is unchanged on top of the merged base.
+//
+// The runtime's OWN injections are excluded from the comparison rather than
+// spelled out here: this test is about what the MERGE contributes, and each
+// injection is pinned by the test that owns it (TMPDIR by
+// TestPodLaunchEnvCarriesTmpInDataVolume, the shims by pod_pathshim_test.go).
 func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	box := hostBinBox(rt, "pod-env")
@@ -523,7 +529,7 @@ func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)
 	}
-	if len(merged) != 2 || merged[0] != "PATH=/usr/bin" || merged[1] != "POD=1" {
+	if got := withoutName(merged, tmpDirEnv); len(got) != 2 || got[0] != "PATH=/usr/bin" || got[1] != "POD=1" {
 		t.Errorf("env = %v, want the merged base verbatim", merged)
 	}
 
@@ -532,7 +538,19 @@ func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)
 	}
-	if len(fallback) != 1 || fallback[0] != "POD=1" {
+	if got := withoutName(fallback, tmpDirEnv); len(got) != 1 || got[0] != "POD=1" {
 		t.Errorf("fallback env = %v, want [POD=1]", fallback)
 	}
+}
+
+// withoutName drops every "name=..." entry from env, so a test can assert on the
+// entries it is actually about.
+func withoutName(env []string, name string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if k, _, _ := strings.Cut(e, "="); k != name {
+			out = append(out, e)
+		}
+	}
+	return out
 }

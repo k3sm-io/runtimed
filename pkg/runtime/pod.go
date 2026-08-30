@@ -198,11 +198,12 @@ type containerProc struct {
 	// startContainer.
 	initDeclared bool
 	// env and workingDir are the RESOLVED launch environment and working
-	// directory this container was spawned with (resolvedBinary). They are
-	// retained rather than re-derived because an Exec session must enter the
-	// same environment the container runs in — for a pulled image that includes
-	// the image config's own $PATH, which the container spec alone does not
-	// carry, and re-deriving it in Exec would mean a second pull.
+	// directory this container was spawned with (resolvedBinary, plus
+	// startContainer's pod-data-volume default for an unset working directory).
+	// They are retained rather than re-derived because an Exec session must
+	// enter the same environment the container runs in — for a pulled image that
+	// includes the image config's own $PATH, which the container spec alone does
+	// not carry, and re-deriving it in Exec would mean a second pull.
 	env        []string
 	workingDir string
 }
@@ -284,6 +285,11 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
+	}
+	// The pod's temp directory, before anything can need it (B203). See
+	// provisionPodTmpDir for why a pod has none otherwise.
+	if err := provisionPodTmpDir(rootfs); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
 	}
 	// Give the pod dir its reachability record the moment the dir exists, even
 	// for a pod that will never pull (a native host-binary pod). The image GC
@@ -781,12 +787,32 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
+	// THE POD CWD (B202). The merged working directory — the pod's working_dir,
+	// else the image config's (image.MergeRunSpec) — is what the child chdirs
+	// into. When neither is set the default is THE POD DATA VOLUME, never the
+	// inherited cwd: this daemon's cwd is its own working directory, the pod's
+	// SBPL profile denies that tree (and the user homes above it), so a pod that
+	// inherited it started in a directory it may not even stat. That was the M8
+	// run-3 failure, and it was invisible because the field was set here and
+	// dropped at the spawn — the supervisor now refuses an unusable Dir typed
+	// (supervisor.ErrWorkingDir) rather than falling back to it.
+	//
+	// It is the SAME default and the same precedence an exec session already
+	// resolves (exec.go), so `kubectl exec` and the container it enters agree on
+	// where they are. It applies uniformly to the host-binary routes (the native
+	// sentinel and the M0 absolute-path convention): no test pinned their cwd
+	// byte-wise, and "inherit the daemon's cwd" is not a behaviour worth
+	// preserving on any route.
+	workingDir := rb.workingDir
+	if workingDir == "" {
+		workingDir = rootfs
+	}
 	logs := newLogBuffer(r.log.With("pod", p.box.GetPodId(), "container", c.GetName()))
 	spec := supervisor.SpawnSpec{
 		Path: shimPath,
 		Argv: shimArgv,
 		Env:  env,
-		Dir:  rb.workingDir,
+		Dir:  workingDir,
 	}
 	cp := &containerProc{
 		name:         c.GetName(),
@@ -794,7 +820,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		initDeclared: isInit,
 		logs:         logs,
 		env:          env,
-		workingDir:   rb.workingDir,
+		workingDir:   workingDir,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
@@ -1589,18 +1615,75 @@ const (
 	pathShimMountsEnv = "K3SM_MOUNT_PATHS"
 )
 
-// containerEnv builds the child environment: a BASE set plus the DYLD inserts
-// that make cluster features work in-pod — the path-rebase shim (so an absolute
-// volume mount resolves to its materialized copy under the pod data volume, no
-// chroot) and the DNS shim (box annotation). DYLD_INSERT_LIBRARIES is appended
-// last so an explicit container env can override it (rare). A container that
-// sets DYLD_INSERT_LIBRARIES itself opts out of both shims.
+// tmpDirEnv is the environment variable every POSIX temp-file API consults, and
+// podTmpDirName is the directory inside the pod data volume runtimed provisions
+// for it (B203).
+const (
+	tmpDirEnv     = "TMPDIR"
+	podTmpDirName = "tmp"
+)
+
+// podTmpDir is the pod's own temp directory: one subdirectory of the pod data
+// volume, and the SINGLE derivation of that path — provisionPodTmpDir creates it
+// and containerEnv publishes it, so the directory a pod is told about is the
+// directory that was made.
+func podTmpDir(dataVol string) string { return filepath.Join(dataVol, podTmpDirName) }
+
+// provisionPodTmpDir creates the pod's temp directory inside its data volume.
+//
+// WHY THIS EXISTS. A confined pod has NO usable temp directory at all: the SBPL
+// profile does not write-allow /tmp or /var/tmp, and nothing sets TMPDIR, so a
+// workload that asks the platform for one exhausts its whole candidate list and
+// fails — Python's tempfile.gettempdir() raising after /tmp, /var/tmp and
+// $TMPDIR all fail is the M8 lab shape, and it takes the whole process down
+// before any of its own code runs. The data volume is already the pod's
+// read/write scope in the generated profile, so a directory inside it needs ZERO
+// SBPL change; this is the one place the writable tree a pod already has is
+// given the name the platform looks for.
+//
+// It is created at CREATE time, before any container is spawned and before the
+// fsGroup walk, so the directory a container's TMPDIR names always exists by the
+// time that container runs and inherits the fsGroup grant when one is set.
+//
+// 0700 is deliberate: a pod temp directory holds whatever the workload puts
+// there and no other pod's process ever has a reason to read it. RESIDUAL,
+// recorded rather than hidden: same-node pods share this daemon's uid (the
+// documented host-process ceiling — untrusted tenancy routes to the vm
+// RuntimeClass), so 0700 is defence against an unrelated LOCAL uid, not against
+// another pod. A container that drops to a DIFFERENT uid reaches this directory
+// only through fsGroup, exactly as it reaches the rest of the data volume.
+func provisionPodTmpDir(dataVol string) error {
+	dir := podTmpDir(dataVol)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create pod tmp dir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// containerEnv builds the child environment: a BASE set, plus TMPDIR pointing
+// into the pod data volume, plus the DYLD inserts that make cluster features work
+// in-pod — the path-rebase shim (so an absolute volume mount resolves to its
+// materialized copy under the pod data volume, no chroot) and the DNS shim (box
+// annotation). DYLD_INSERT_LIBRARIES is appended last so an explicit container
+// env can override it (rare). A container that sets DYLD_INSERT_LIBRARIES itself
+// opts out of both shims.
+//
+// TMPDIR (B203) is injected ONLY when the base does not already carry one, so a
+// container that names its own temp directory keeps it — the same
+// spec-beats-injection rule DYLD_INSERT_LIBRARIES follows, and the reason the
+// injected entry is PREPENDED rather than appended: it is added only in the
+// absence of a spec entry, so there is never a duplicate whose resolution would
+// depend on which end of environ getenv walks from. It is injected here, at the
+// one seam both the container spawn and an Exec session pass through, so a
+// `kubectl exec` shell has the same temp directory the container does.
 //
 // base is the MERGED environment resolveBinary produced for a pulled image (the
 // image config's Env under the container's, image.MergeRunSpec) — the source of
 // $PATH, $HOME and everything else an image ships. It is NIL on the two
 // host-binary routes and for a caller that has no merge to offer, and then the
 // base is the container's own EnvVars, byte-for-byte the pre-M11.2-d1 behaviour.
+// TMPDIR is injected on every one of those routes: a host-process pod is
+// confined by the same profile and has the same no-usable-tmp problem.
 func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, base []string) ([]string, error) {
 	if base == nil {
 		base = make([]string, 0, len(c.GetEnv()))
@@ -1608,7 +1691,14 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 			base = append(base, e.GetName()+"="+e.GetValue())
 		}
 	}
-	env := make([]string, 0, len(base)+3)
+	env := make([]string, 0, len(base)+4)
+	if !envHasName(base, tmpDirEnv) {
+		dataVol, err := r.rootfsPath(box)
+		if err != nil {
+			return nil, err
+		}
+		env = append(env, tmpDirEnv+"="+podTmpDir(dataVol))
+	}
 	for _, e := range base {
 		env = append(env, e)
 		if name, _, _ := strings.Cut(e, "="); name == dyldInsertEnv {
@@ -1637,6 +1727,17 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		env = append(env, dyldInsertEnv+"="+strings.Join(inserts, ":"))
 	}
 	return env, nil
+}
+
+// envHasName reports whether env (in "K=V" form) already sets name. It is how
+// an injected entry stays out of the way of one the spec supplied.
+func envHasName(env []string, name string) bool {
+	for _, e := range env {
+		if k, _, _ := strings.Cut(e, "="); k == name {
+			return true
+		}
+	}
+	return false
 }
 
 // containerMountPaths returns c's absolute volume-mount container paths (the
