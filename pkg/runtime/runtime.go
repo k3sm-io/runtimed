@@ -343,6 +343,59 @@ func (r *Runtime) reconcileNetworkStartup(ctx context.Context) error {
 	return r.netReconcileErr
 }
 
+// GuestNetworker is the OPTIONAL guest-network seam a Deps.Network may
+// additionally implement (M11.2-d8), mirroring NetworkReconciler above. A vm pod
+// runs no host process, binds no lo0 alias, and reaches the cluster over its
+// NAT attachment — so PodNetwork.Setup, which allocates and returns a host /32,
+// answers the wrong question for it. GuestNetwork answers the right one: the DNS
+// configuration plus the NAT advisory fields the guest is provisioned with.
+//
+// It is the SOLE production source of sandbox.VMSpec.Network. runtimed cannot
+// import darwin-net (the two are co-equal leaves of the cross-repo DAG), so the
+// config arrives as plain data from the k3sm provider — which owns both
+// darwin-net producers and is therefore the one mapper. The seam is a type
+// assertion rather than a Deps field for the same reason NetworkReconciler is:
+// the capability belongs to the adapter that already holds the pod's network
+// state, and a second field would let a node wire two disagreeing producers.
+//
+// Teardown stays PROVIDER-side (releasePodNetwork): runtimed must not release
+// what it did not allocate, so there is deliberately no release counterpart here.
+type GuestNetworker interface {
+	// GuestNetwork returns the guest network config the provider allocated for
+	// podID. The bool is comma-ok: false means this producer has no config for
+	// this pod (not an error — the pod is networked by something else, or the
+	// allocation has not happened), and the caller uses the inert zero value.
+	GuestNetwork(podID string) (sandbox.GuestNetworkConfig, bool)
+}
+
+// guestNetworkConfig resolves the pod's guest network config through the optional
+// GuestNetworker seam. A Network that does not implement the seam, or that
+// reports no config for this pod, yields the INERT zero value — the guest then
+// boots with no /etc/resolv.conf and no NAT advisory.
+//
+// Both misses are LOGGED, which is the deliberate divergence from
+// reconcileNetworkStartup's silent nil hook: a vm pod with no resolver boots
+// healthy, passes readiness, and fails only on the first in-app DNS lookup —
+// indistinguishable at that point from an application bug. The log is what makes
+// the node-side cause visible. It is emitted here, on the vm route, and never for
+// a host-process pod, which is served by PodNetwork.Setup and wants no guest
+// config at all.
+func (r *Runtime) guestNetworkConfig(podID string) sandbox.GuestNetworkConfig {
+	gn, ok := r.network.(GuestNetworker)
+	if !ok {
+		r.log.Warn("vm pod has no guest network config",
+			"pod", podID, "reason", "no GuestNetworker producer is wired")
+		return sandbox.GuestNetworkConfig{}
+	}
+	cfg, ok := gn.GuestNetwork(podID)
+	if !ok {
+		r.log.Warn("vm pod has no guest network config",
+			"pod", podID, "reason", "the GuestNetworker producer reported no config for this pod")
+		return sandbox.GuestNetworkConfig{}
+	}
+	return cfg
+}
+
 // Deps are the swappable subsystem seams a Runtime is built from. New fills any
 // nil field with its production default (real image puller/signer, the exec-shim
 // sandbox backend, posix_spawn/kqueue, single-node network).

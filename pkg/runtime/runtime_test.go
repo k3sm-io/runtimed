@@ -805,16 +805,17 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 }
 
 // TestCreateVMPod_GuestNetworkPlumbing proves the runtimed-side guest-network seam
-// (B2): a vm-RuntimeClass pod's GuestNetworkConfig (the rendered resolv.conf + the
-// NAT advisory fields) is threaded INERT through createPod → createVMPod into the
-// VMSpec the vm backend's CreateVM receives, while the host-process path never sees
-// it and a NAT-attached guest binds NO lo0 alias.
+// (B2): a vm-RuntimeClass pod's GuestNetworkConfig (the DNS configuration + the NAT
+// advisory fields) reaches the VMSpec the vm backend's CreateVM receives, while the
+// host-process path never sees it and a NAT-attached guest binds NO lo0 alias.
 //
-// It asserts the behavioral FORK, not a tautology: the SAME populated config is fed
-// to createPod for both a vm pod and a host pod. For the vm pod it reaches
+// It asserts the behavioral FORK, not a tautology: the SAME producer — a
+// Deps.Network implementing the M11.2-d8 GuestNetworker seam, holding one populated
+// config — serves both a vm pod and a host pod. For the vm pod the config reaches
 // VMSpec.Network (resolv.conf nameserver+search+ndots and the NAT fields intact)
-// AND the route allocates zero lo0 aliases; for the host pod it never reaches
-// createVMPod (CreateVM call count 0) AND the route allocates its one lo0 alias.
+// AND the route allocates zero lo0 aliases; for the host pod the producer is never
+// even consulted, nothing reaches createVMPod (CreateVM call count 0), AND the route
+// allocates its one lo0 alias.
 func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 	// The rendered /etc/resolv.conf the guest provisioner pins (pkg/dns.GuestResolvConf
 	// shape): nameserver + search + options ndots: — the operative Linux-guest DNS
@@ -823,16 +824,19 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		"search default.svc.cluster.local svc.cluster.local cluster.local\n" +
 		"options ndots:5\n"
 	netCfg := sandbox.GuestNetworkConfig{
-		ResolvConf: resolvConf,
-		PodIP:      netip.MustParseAddr("10.42.0.7"),
-		Gateway:    netip.MustParseAddr("192.168.66.1"),
-		NATSubnet:  netip.MustParsePrefix("192.168.66.0/24"),
-		DNSVIP:     netip.MustParseAddr("10.43.0.10"),
+		Nameservers: []string{"10.43.0.10"},
+		Searches:    []string{"default.svc.cluster.local", "svc.cluster.local", "cluster.local"},
+		Options:     []string{"ndots:5"},
+		ResolvConf:  resolvConf,
+		PodIP:       netip.MustParseAddr("10.42.0.7"),
+		Gateway:     netip.MustParseAddr("192.168.66.1"),
+		NATSubnet:   netip.MustParsePrefix("192.168.66.0/24"),
+		DNSVIP:      netip.MustParseAddr("10.43.0.10"),
 	}
 
 	t.Run("vm-pod-carries-config-no-lo0-alias", func(t *testing.T) {
 		vmb := &fakeVMBackend{available: true}
-		net := &recordingNetwork{}
+		net := &guestNetworkerNetwork{cfg: netCfg, ok: true}
 		// vmPodConfig: the share planner requires the pod dir under
 		// <Config.Root>/pods, so the cache must be rooted at Config.Root as
 		// production wires it.
@@ -842,9 +846,10 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		box := hostBinBox(rt, "pod-vm-net")
 		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 
-		// Put the config at the create input. The lab-gated boot stub then surfaces an
-		// error, which is expected and orthogonal to the plumbing assertion.
-		if _, _, err := rt.createPod(context.Background(), box, netCfg); err == nil {
+		// The producer holds the config; createVMPod pulls it through the seam. The
+		// lab-gated boot stub then surfaces an error, which is expected and orthogonal
+		// to the plumbing assertion.
+		if _, _, err := rt.createPod(context.Background(), box); err == nil {
 			t.Fatal("vm createPod should surface the lab-gated boot error")
 		}
 
@@ -875,14 +880,14 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 
 	t.Run("host-pod-never-gets-config-binds-lo0-alias", func(t *testing.T) {
 		vmb := &fakeVMBackend{available: true} // available, but NOT requested
-		net := &recordingNetwork{}
+		net := &guestNetworkerNetwork{cfg: netCfg, ok: true}
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{VMBackend: vmb, Network: net, Waiter: w})
 
-		// UNSPECIFIED backend → the host-process route. Feed the SAME populated config.
+		// UNSPECIFIED backend → the host-process route, over the SAME populated producer.
 		box := hostBinBox(rt, "pod-host-net")
 
-		p, _, err := rt.createPod(context.Background(), box, netCfg)
+		p, _, err := rt.createPod(context.Background(), box)
 		if err != nil {
 			t.Fatalf("host createPod failed: %v", err)
 		}
@@ -892,6 +897,12 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		// It never routed to createVMPod, so the config never reached a VMSpec.
 		if n, _ := vmb.created(); n != 0 {
 			t.Errorf("host route called CreateVM %d times; must be 0 (config must not reach the guest seam)", n)
+		}
+		// The producer is not even consulted: a host process is served by
+		// PodNetwork.Setup and wants no guest config, so no absent-config warning
+		// can ever be emitted for it either.
+		if got := net.guestNetworkCalls(); len(got) != 0 {
+			t.Errorf("host route consulted the GuestNetworker for %v; must consult it for nothing", got)
 		}
 		// The host process binds its one /32 lo0 alias (network.Setup fires here).
 		if got := net.setupCount(); got != 1 {
