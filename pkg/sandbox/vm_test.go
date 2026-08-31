@@ -57,13 +57,24 @@ func TestVMBackendWrapCommandRefuses(t *testing.T) {
 	}
 }
 
-// TestVMBackendCreateVMLabGated asserts CreateVM is the documented lab-gated stub
-// (the live boot needs a VZ-capable, entitled Mac). The routing + fail-closed
-// dispatch are what M5.1 verifies; the boot is the lab remainder.
-func TestVMBackendCreateVMLabGated(t *testing.T) {
-	b := NewVMBackend()
+// TestVMBackendCreateVMRejectsAnUnderivedSpec asserts the vm spine refuses a spec
+// whose pod paths were not stamped by the runtime's own derivations, BEFORE it
+// resolves artifacts, writes a file, or spawns anything.
+//
+// The order is the property. PodDir and AgentSocketPath are handed to a child
+// process and used to write and later recursively delete a tree, so a spec that
+// reached the spawn with either unset would be acting on a path nothing checked.
+// The stamped values come from pkg/runtime's podDir / guestAgentSocket, which
+// parse the pod id first; this is the fail-closed backstop behind them.
+func TestVMBackendCreateVMRejectsAnUnderivedSpec(t *testing.T) {
+	// A locator that would panic if consulted: reaching it means validation ran
+	// too late, which is exactly the ordering being asserted.
+	b := NewVMBackend(WithGuestArtifacts(func() (GuestArtifacts, error) {
+		t.Error("the artifact locator was consulted for a spec that should have been refused first")
+		return GuestArtifacts{}, nil
+	}))
 	err := b.CreateVM(context.Background(), VMSpec{PodID: "p", Vcpus: 2, MemoryBytes: 1 << 30})
-	if !errors.Is(err, ErrVMBootNotImplemented) {
-		t.Errorf("CreateVM err = %v, want ErrVMBootNotImplemented", err)
+	if !errors.Is(err, ErrInvalidVMSpec) {
+		t.Errorf("CreateVM err = %v, want ErrInvalidVMSpec", err)
 	}
 }

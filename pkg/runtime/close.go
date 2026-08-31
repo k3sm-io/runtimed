@@ -17,6 +17,7 @@ limitations under the License.
 package runtime
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -76,28 +77,71 @@ func (r *Runtime) Close() error {
 		pods = append(pods, p)
 	}
 	r.mu.Unlock()
-	if len(pods) == 0 {
-		return nil
+
+	if len(pods) > 0 {
+		r.log.Info("stopping pod supervision for daemon shutdown", "pods", len(pods))
 	}
-	r.log.Info("stopping pod supervision for daemon shutdown", "pods", len(pods))
 
 	// Phase 1: fire every cancel BEFORE waiting on any of them. Cancelling is
 	// non-blocking, so this stops the whole node's supervision at once and leaves
 	// the bound below to be shared rather than spent pod by pod (a wedged pod
 	// would otherwise consume a healthy successor's budget).
+	//
+	// It also runs BEFORE the vm stop below, which is load-bearing rather than
+	// incidental: watchVMHelperExit would otherwise observe the shutdown's own
+	// stop as a crash and publish a Failed status for every vm pod on the way
+	// out. Contexts are monotonic, so cancelling first settles that
+	// deterministically instead of by winning a race (see DeletePod's vm branch,
+	// where the live smoke found the same ordering bug).
 	waits := make([]supervisionWait, 0, len(pods))
 	for _, p := range pods {
 		waits = append(waits, r.cancelPodSupervision(p))
 	}
 
+	// THE VM CARVE-OUT, and it is the exact OPPOSITE of the rule above. A host
+	// pod's processes survive the daemon by design; a vm pod's helper must not —
+	// "no VM outlives the binary that booted it" (cmd/k3sm-vmhost) — because an
+	// orphaned helper holds a whole machine that nothing on the node can talk to,
+	// adopt, or stop. So every live helper is stopped here, CONCURRENTLY inside
+	// the backend.
+	//
+	// The concurrency is a requirement, not a tidiness: each helper's graceful
+	// stop can spend up to the vm host's 30-second ceiling, and launchd gives the
+	// daemon 45 seconds total, so a serial sweep blows the ExitTimeOut with two vm
+	// pods — and launchd's answer to a blown timeout is SIGKILL of the daemon,
+	// stranding exactly the helpers this sweep exists to stop.
+	//
+	// It runs even with no registered pods: the pod registry and the backend's
+	// handle map are different records, and a helper whose CreatePod failed to
+	// register is precisely the one worth catching.
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), vmShutdownBound)
+	defer cancelStop()
+	vmErr := r.vmBackend.StopAllVMs(stopCtx)
+	if vmErr != nil {
+		r.log.Warn("some vm host helpers did not stop cleanly during shutdown", "err", vmErr)
+	}
+	if len(pods) == 0 {
+		return vmErr
+	}
+
 	// Phase 2: confirm the cancels were observed.
 	deadline := time.Now().Add(r.closeGraceDuration())
-	var errs []error
+	errs := []error{vmErr}
 	for _, w := range waits {
 		errs = append(errs, w.await(deadline)...)
 	}
 	return errors.Join(errs...)
 }
+
+// vmShutdownBound caps the whole concurrent vm-helper stop at shutdown.
+//
+// It is sized against launchd's 45-second ExitTimeOut, NOT against one helper:
+// the helpers stop in parallel, so the node's cost is one budget rather than one
+// per pod, and this leaves room for the supervision waits that follow plus the
+// daemon's own teardown. A helper still running when it expires is left to the
+// next start's orphan sweep, which is the backstop that makes this a bound rather
+// than a promise.
+const vmShutdownBound = 35 * time.Second
 
 // supervisionWait is one pod's set of "the cancel was observed" edges: the
 // per-container reaper completions (Process.Done, closed when the reaper returns
