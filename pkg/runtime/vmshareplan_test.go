@@ -124,7 +124,7 @@ func newVMPlanRuntime(t *testing.T) (*Runtime, *fakeVMBackend) {
 // READ-ONLY by every caller.
 func mustPlanVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.PodBox) sandbox.VMSpec {
 	t.Helper()
-	if _, _, err := rt.createPod(context.Background(), box, sandbox.GuestNetworkConfig{}); err == nil {
+	if _, _, err := rt.createPod(context.Background(), box); err == nil {
 		t.Fatal("vm createPod should surface the lab-gated boot error")
 	}
 	n, spec := vmb.created()
@@ -143,7 +143,7 @@ func mustPlanVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.Po
 // sentinel.
 func mustRejectVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.PodBox) {
 	t.Helper()
-	_, reason, err := rt.createPod(context.Background(), box, sandbox.GuestNetworkConfig{})
+	_, reason, err := rt.createPod(context.Background(), box)
 	if err == nil {
 		t.Fatal("want a share-plan reject, got nil error")
 	}
@@ -301,7 +301,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		// cumulative, hence want 2 here.
 		derivedBox := vmShareBox("pod-plan-hostile")
 		derivedBox.RootfsPath = filepath.Join(podDir, "rootfs")
-		if _, _, err := rt.createPod(context.Background(), derivedBox, sandbox.GuestNetworkConfig{}); err == nil {
+		if _, _, err := rt.createPod(context.Background(), derivedBox); err == nil {
 			t.Fatal("vm createPod should surface the lab-gated boot error")
 		}
 		n, derived := vmb.created()
@@ -320,7 +320,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		// VMSpec.RootfsPath.
 		hostileBox := vmShareBox("pod-plan-hostile")
 		hostileBox.RootfsPath = rt.cfg.Root
-		_, reason, err := rt.createPod(context.Background(), hostileBox, sandbox.GuestNetworkConfig{})
+		_, reason, err := rt.createPod(context.Background(), hostileBox)
 		if err == nil {
 			t.Fatal("a hostile rootfs_path must be refused, got nil error")
 		}

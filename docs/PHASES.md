@@ -2,8 +2,8 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M5
-updated: 2026-07-11
-updated_by: roadmap-encoder
+updated: 2026-08-31
+updated_by: orchestrator
 
 phases:
   - id: M0
@@ -629,7 +629,7 @@ phases:
             done: true  # runtimed#72, 2026-08-29 — a6 green unprivileged (materialize-then-exec)
             desc: "OCI-layer unpacker (the SUBSTRATE — built FIRST within this wave; re-homed here 2026-07-11 from the MLX slice, verbatim scope; m11-plan R17): pkg/image — a per-image unpacked content-addressed tree (digest+policy-keyed), applied via a containment-checked tar apply (symlink/hardlink-safe, com.apple.quarantine-xattr discipline per clone.go, same-APFS-volume placement per cache.go), wired into pkg/runtime.createPod via MaterializeTree. Today only compressed layer blobs exist under blobs/<algo>/<hex> and resolveBinary is the M1 materialization placeholder — this is the substrate d1 (Linux rootfs builder) extends in-wave, the MLX tree-signing walks (that slice consumes it via its depends edge), and the images milestone's native semantics consume."
           - id: M11.2-d8
-            done: false
+            done: true  # 2026-08-31 — GuestNetworker seam landed; the netcfg parameter was REMOVED from createPod/createVMPod so the type assertion is the sole production source (two authorities for one value had no stated precedence)
             desc: "Guest-network consumer seam (the runtimed half of B6; filed 2026-08-30 — the deliverable M11.4-d4 has nothing to plug into, which is exactly what re-blocked B6): pkg/runtime.Deps.Network gains an OPTIONAL consumer interface mirroring the existing NetworkReconciler pattern — GuestNetworker{ GuestNetwork(podID string) (sandbox.GuestNetworkConfig, bool) } — type-asserted at createPod so the vm branch fetches the provider-produced config instead of server.go's literal sandbox.GuestNetworkConfig{}. NO new proto field (m11-plan R3 honored: the provider is the producer/mapper), NO new Deps field, fake on both sides. sandbox.GuestNetworkConfig additionally gains STRUCTURED Nameservers/Searches/Options alongside the rendered ResolvConf: guest/v1 GuestSpec.resolv_conf is structured precisely so the guest can render it musl-safely (alpine ignores options ndots), and a rendered-string-only carrier would force the host to re-parse its own output — the round-trip the proto exists to prevent. Teardown stays PROVIDER-side via releasePodNetwork (M10.1's no-auto-release rule: runtimed must not release what it did not allocate; two owners is how double-release ships)."
         acceptance:
           - id: M11.2-a1
@@ -660,6 +660,11 @@ phases:
             met: true  # 2026-08-29 — runs unprivileged on the dev host; layer-order-sensitive fixture
             check: "materialize-then-exec integration test — the d7 unpacker produces an unpacked tree that createPod materializes via MaterializeTree and execs argv[0] out of a multi-layer image (the acceptance re-homed with the deliverable, 2026-07-11)"
             method: integration
+          - id: M11.2-a7
+            met: true  # 2026-08-31 — FILED WITH THE DELIVERABLE: d8 previously had no acceptance criterion at all (a1-a6 name no guest-network test), so it had no gate that could honestly flip it done. Non-vacuity mutation-checked: forcing the type assertion to miss, and ignoring the comma-ok, each turn a named test red.
+            check: "guest-network consumer seam: a Deps.Network implementing the optional GuestNetworker has its config reach the VM backend verbatim — asserted on the VMSpec the backend RECEIVES, never on the fake's own input; a Network that does not implement the seam, and one reporting no config for this pod, both fall back to the inert zero value and log a DISTINCT reason; a host-process pod never consults the producer; all -race"
+            method: unit
+            test: pkg/runtime.TestCreateVMPodUsesGuestNetworkerWhenPresent + pkg/runtime.TestCreateVMPodFallsBackWhenGuestNetworkerAbsent
 
   - id: M12
     title: Images & build engine (runtimed slice — local image index, pull-policy honor, policy-gated tree signing)
