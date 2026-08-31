@@ -96,6 +96,11 @@ func (b *recordingBackend) lastSpec() supervisor.LaunchSpec {
 // VM-routed pod surfaces a failure, mirroring production.
 type fakeVMBackend struct {
 	available bool
+	// rosettaShare is the B229 seam: whether the guests this node's VM host would
+	// build carry a Rosetta directory share. It defaults to FALSE, matching the
+	// shipped helper (sandbox.VMHostRosettaShareSupported), so a test that means to
+	// exercise the guest-Rosetta advertisement must say so explicitly.
+	rosettaShare bool
 
 	mu          sync.Mutex
 	createCalls int
@@ -103,8 +108,9 @@ type fakeVMBackend struct {
 	err         error
 }
 
-func (b *fakeVMBackend) Available() bool { return b.available }
-func (b *fakeVMBackend) Name() string    { return "fake-vm" }
+func (b *fakeVMBackend) Available() bool                  { return b.available }
+func (b *fakeVMBackend) Name() string                     { return "fake-vm" }
+func (b *fakeVMBackend) GuestRosettaShareSupported() bool { return b.rosettaShare }
 func (b *fakeVMBackend) CreateVM(_ context.Context, spec sandbox.VMSpec) error {
 	b.mu.Lock()
 	b.createCalls++

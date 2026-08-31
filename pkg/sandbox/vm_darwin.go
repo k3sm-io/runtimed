@@ -20,9 +20,12 @@ package sandbox
 
 /*
 #cgo darwin LDFLAGS: -framework Virtualization -framework Foundation -framework CoreFoundation -framework Security
+#include <stdlib.h>
 #include "vm_darwin.h"
 */
 import "C"
+
+import "unsafe"
 
 // vzSupported reports +[VZVirtualMachine isSupported] via the Obj-C shim
 // (vm_darwin.m) — a SAFE probe that never constructs a VM. See VMBackend.
@@ -38,6 +41,22 @@ func vzSupported() bool {
 // Virtualization.framework's VM-construction path.
 func vzEntitled() bool {
 	return C.k3sm_vz_has_entitlement() != 0
+}
+
+// vzStaticCodeEntitled reports whether the binary at path has a signature that
+// passes SecStaticCodeCheckValidity AND carries com.apple.security.virtualization,
+// read via Security.framework in the Obj-C shim (B227).
+//
+// It answers about ANOTHER binary (the k3sm-vmhost helper), which is why it is a
+// separate entry point from vzEntitled's SecCodeCopySelf read: the daemon is
+// deliberately unentitled and asking about itself would always say no.
+func vzStaticCodeEntitled(path string) bool {
+	if path == "" {
+		return false
+	}
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	return C.k3sm_vz_static_code_entitled(cpath) != 0
 }
 
 // vzRosettaAvailability reports the host's Rosetta-for-Linux (GUEST translation)

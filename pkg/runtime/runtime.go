@@ -138,6 +138,16 @@ type VMBackend interface {
 	// stub returning sandbox.ErrVMBootNotImplemented (the live boot needs a
 	// VZ-capable, entitled Mac).
 	CreateVM(ctx context.Context, spec sandbox.VMSpec) error
+	// GuestRosettaShareSupported reports whether the guests this node builds carry
+	// a Rosetta directory share — i.e. whether a linux/amd64 ELF could actually
+	// execute in one of them. It is a SECOND, INDEPENDENT term of the node's
+	// guest-Rosetta advertisement (B229), distinct from Deps.GuestRosetta: Apple's
+	// probe answers "can this Mac do Rosetta for Linux", while this answers "does
+	// the VM this node builds carry it". Advertising on the first alone would put
+	// linux/amd64 in the pull candidate set for every vm pod on a host whose
+	// helper attaches no share, so every amd64 image would be pulled and then fail
+	// to exec. See evalGuestRosetta.
+	GuestRosettaShareSupported() bool
 }
 
 // Ensure the concrete vm backend satisfies the consumer seam.
