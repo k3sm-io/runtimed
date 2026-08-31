@@ -363,7 +363,7 @@ func (b *VMBackend) clearOrphanRunDir(rec vmProcRecord) {
 	}
 	runRoot := filepath.Join(b.stateRoot, "run")
 	clean := filepath.Clean(rec.RunDir)
-	if clean != runRoot && !isUnderDir(clean, runRoot) {
+	if clean != runRoot && !isAtOrUnderDir(clean, runRoot) {
 		b.logger().Warn("ignoring a vm reap record whose run dir is outside this node's run tree",
 			"pod", rec.PodID, "dir", rec.RunDir, "run_root", runRoot)
 		return
@@ -371,13 +371,4 @@ func (b *VMBackend) clearOrphanRunDir(rec vmProcRecord) {
 	if err := os.RemoveAll(clean); err != nil {
 		b.logger().Warn("could not remove an orphaned vm pod's run dir", "pod", rec.PodID, "dir", clean, "err", err)
 	}
-}
-
-// isUnderDir reports whether path lies strictly beneath dir, separator-aware so a
-// sibling whose name merely starts the same ("/x/run-evil" under "/x/run") is not
-// admitted.
-func isUnderDir(path, dir string) bool {
-	return len(path) > len(dir)+1 &&
-		path[:len(dir)] == dir &&
-		path[len(dir)] == filepath.Separator
 }

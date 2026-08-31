@@ -76,6 +76,9 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 				ErrGuestArtifactsUnavailable, art.KernelPath, art.InitramfsPath))
 	}
 
+	if err := ensurePodShareRoots(spec); err != nil {
+		return fail(VMBootSpecWriteFailed, "", err)
+	}
 	specPath, err := writeVMHostSpec(spec.PodDir, buildVMHostSpec(spec, art))
 	if err != nil {
 		return fail(VMBootSpecWriteFailed, "", err)

@@ -278,6 +278,20 @@ func TestCreateVMWritesTheMachineDescription(t *testing.T) {
 		}
 	})
 
+	t.Run("every pod-contained share root exists before the helper is spawned", func(t *testing.T) {
+		// FOUND BY THE LIVE SMOKE, not by review: VZ refuses a shared directory
+		// that does not exist, and the planner deliberately touches no disk, so
+		// the first real boot died with
+		//   virtiofs share "k3sm.rootfs" (<podDir>/rootfs): no such file or directory
+		// after a whole spawn. A missing root must never cost a spawn to learn.
+		for _, sh := range spec.Volumes.Shares {
+			fi, err := os.Stat(sh.Root)
+			if err != nil || !fi.IsDir() {
+				t.Errorf("share %q root %s does not exist (stat err %v); VZ would refuse the device", sh.Tag, sh.Root, err)
+			}
+		}
+	})
+
 	t.Run("the helper argv carries the clamped stop grace", func(t *testing.T) {
 		argv := sp.argv()
 		want := []string{
@@ -291,6 +305,31 @@ func TestCreateVMWritesTheMachineDescription(t *testing.T) {
 			t.Errorf("helper argv =\n %v\nwant\n %v", argv, want)
 		}
 	})
+}
+
+// TestCreateVMDoesNotFabricateOutOfPodShareRoots is the other half of the
+// share-root rule, and the more important one.
+//
+// A plan legitimately carries roots OUTSIDE the pod dir — a PVC's data dir lives
+// under <Root>/storage precisely so it can outlive the pod — and those belong to
+// the persistent-volume binder, with its own class, ownership and reclaim policy.
+// A CreateVM that created them would fabricate an EMPTY volume where a bound
+// claim was expected, turning "your PVC is not bound yet" into "your database is
+// empty" with no error anywhere.
+func TestCreateVMDoesNotFabricateOutOfPodShareRoots(t *testing.T) {
+	root := t.TempDir()
+	spec := labSpec(t, root)
+	claimRoot := filepath.Join(root, "storage", "default", "pgdata")
+	spec.Volumes = VMVolumePlan{Shares: []VMShare{
+		{Tag: "k3sm.pvc.default.pgdata", Root: claimRoot, Writable: true},
+	}}
+	b, _, _, _ := labBackend(t, root, func(context.Context, string) error { return nil })
+	if err := b.CreateVM(context.Background(), spec); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	if _, err := os.Stat(claimRoot); !os.IsNotExist(err) {
+		t.Errorf("CreateVM created a claim root outside the pod dir (%s, stat err %v); an unbound claim must surface as the helper's refusal, not as an empty volume", claimRoot, err)
+	}
 }
 
 // TestCreateVMFailsClosedWithoutArtifacts asserts a node with no pinned guest

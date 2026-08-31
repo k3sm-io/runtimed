@@ -255,6 +255,45 @@ func writeVMHostSpec(podDir string, hs *guestv1.VMHostSpec) (string, error) {
 	return final, nil
 }
 
+// ensurePodShareRoots creates every planned share root that lies inside the pod's
+// own directory.
+//
+// VZ REFUSES A SHARED DIRECTORY THAT DOES NOT EXIST, and the refusal arrives as a
+// framework error at machine construction — which the helper reports and dies on,
+// costing a whole spawn to learn that a directory was missing. The planner PLANS
+// (it touches no disk, deliberately) and the guest composes; nothing between them
+// created the trees, so this closes that gap at the one place that already writes
+// into the pod dir.
+//
+// IT IS BOUNDED TO THE POD DIR, and the bound is the point rather than a
+// nicety. A plan legitimately carries roots OUTSIDE it — a PVC's data dir lives
+// under <Root>/storage so it can outlive the pod — and those are the persistent-
+// volume binder's to create, with its own class, ownership and reclaim policy. A
+// CreateVM that created them would fabricate an empty volume where a bound claim
+// was expected, turning "your PVC is not bound yet" into "your database is
+// empty". So an out-of-pod root that is missing stays the helper's legible
+// refusal, naming the tag and the path.
+func ensurePodShareRoots(spec VMSpec) error {
+	for _, sh := range spec.Volumes.Shares {
+		root := filepath.Clean(sh.Root)
+		if root != spec.PodDir && !isAtOrUnderDir(root, spec.PodDir) {
+			continue
+		}
+		if err := os.MkdirAll(root, 0o750); err != nil {
+			return fmt.Errorf("create the %s share root for pod %s: %w", sh.Tag, spec.PodID, err)
+		}
+	}
+	return nil
+}
+
+// isAtOrUnderDir reports whether path lies strictly beneath dir, separator-aware
+// so a sibling whose name merely starts the same is not admitted.
+func isAtOrUnderDir(path, dir string) bool {
+	return len(path) > len(dir)+1 &&
+		path[:len(dir)] == dir &&
+		path[len(dir)] == filepath.Separator
+}
+
 // clampStopGrace resolves the grace budget the helper will actually honour,
 // applying the SAME rule NewLifecycle applies on the other side of the process
 // boundary (0 takes the default, anything above the ceiling is clamped).
