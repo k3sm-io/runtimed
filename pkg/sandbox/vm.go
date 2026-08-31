@@ -19,8 +19,12 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/netip"
+	"os"
 	"runtime"
+	"sync"
+	"time"
 
 	"k3sm.io/runtimed/pkg/supervisor"
 )
@@ -35,13 +39,19 @@ const VMBackendName = "vm"
 // is well supported). Below it Available reports false.
 const vmMinMacOSMajor = 26
 
-// ErrVMBootNotImplemented reports that the vm backend's live guest boot is not
-// implemented in this build. The boot path is LAB-GATED: it requires a
-// Virtualization.framework-capable Mac signed with the
-// com.apple.security.virtualization entitlement, so it cannot run in ordinary CI
-// or on a non-entitled host. The runtime surfaces it as the pod failure until the
-// lab remainder lands (see the VMBackend type doc). Compare with errors.Is.
-var ErrVMBootNotImplemented = errors.New("sandbox: vm backend boot not implemented — lab-gated (requires a Virtualization.framework-capable Mac + the com.apple.security.virtualization entitlement)")
+// ErrVMBootNotImplemented reports that this BUILD LANE cannot boot a guest.
+//
+// The live boot landed (CreateVM spawns the k3sm-vmhost helper and waits for its
+// guest agent), but it is darwin-only by construction: the helper is a macOS
+// binary carrying com.apple.security.virtualization and the readiness handshake
+// crosses a Virtualization.framework vsock device. On any other lane — the
+// pure-Go CGO_ENABLED=0 build, a linux CI runner — CreateVM is a TYPED REFUSAL
+// returning this, rather than code that compiles and then fails at a syscall.
+//
+// It is retained rather than renamed because it is exactly the same statement it
+// always made ("no guest can boot here"); only the reason narrowed, from "not
+// written yet" to "not on this lane". Compare with errors.Is.
+var ErrVMBootNotImplemented = errors.New("sandbox: the vm backend cannot boot a guest on this build lane (the k3sm-vmhost helper and its Virtualization.framework guest are darwin-only)")
 
 // ErrVMUsesCreateVM reports that the vm backend was asked to WrapCommand — the
 // host-process exec-shim seam — which it does not implement. A Linux guest is not
@@ -148,6 +158,31 @@ type VMSpec struct {
 	// pkg/mount's planner — sandbox imports neither. The zero value plans
 	// nothing (safe); see VMVolumePlan.
 	Volumes VMVolumePlan
+	// PodDir is the pod's on-disk directory (<Root>/pods/<pod_id>): where the
+	// machine description (VMSpecFileName), the guest console log
+	// (VMConsoleLogName) and the k3sm.spec share root live.
+	//
+	// It is STAMPED by createVMPod rather than derived here. pkg/runtime owns
+	// every pod-path derivation in this daemon (r.podDir parses the id first),
+	// and a second derivation in this package would be a second answer to
+	// "where does this pod live" that could disagree with the first — which is
+	// the class of bug rootfsPath's byte-equality rule exists to foreclose.
+	PodDir string
+	// AgentSocketPath is the runtimed-PRIVATE unix socket the helper binds and
+	// relays to the guest agent's vsock port. Stamped by createVMPod from
+	// pkg/runtime's guestAgentSocket, which is also what the daemon's own
+	// GuestDialer reaches — so the socket the helper serves and the socket the
+	// Exec/Logs route dials are the same string by construction.
+	//
+	// It is deliberately NOT under PodDir: the pod dir is the one tree a pod's
+	// own confinement can reach, so an agent socket there would put the pod's
+	// control channel inside the pod's reach.
+	AgentSocketPath string
+	// StopGrace is the pod's termination grace, threaded to the helper's
+	// -stop-grace so ONE budget governs both ends of the shutdown. Zero selects
+	// the helper's default; the daemon clamps its own escalation wait to the
+	// same resolved value (clampStopGrace) so the two timers cannot race.
+	StopGrace time.Duration
 }
 
 // VMBackend is the Virtualization.framework micro-VM isolation backend (M5.1) —
@@ -203,6 +238,122 @@ type VMBackend struct {
 	// Security.framework probe on darwin+cgo; a false stub otherwise). Injectable
 	// for tests.
 	helperEntitledFn func(path string) bool
+
+	// artifacts resolves this node's pinned guest kernel + initramfs. NIL BY
+	// DEFAULT, and CreateVM fails closed on nil: the production feeder is its
+	// own deliverable, and a backend that guessed a path would boot whatever
+	// happened to be on disk under a digest pin it never checked.
+	artifacts GuestArtifactLocator
+	// stateRoot is the runtime work-dir the orphan-record store lives under
+	// (<stateRoot>/vmreap). Empty disables the store — the posture for a
+	// backend constructed without one, which is only ever a test double.
+	stateRoot string
+	// spawner / waiter are pkg/supervisor's spawn and reap seams. The helper is
+	// started and reaped through the SAME primitives every pod process is, so
+	// the SETSID group, the signal-mask reset, the combined-output pipe and the
+	// single-kqueue-reaper guarantee are inherited rather than re-derived.
+	spawner supervisor.Spawner
+	waiter  supervisor.ExitWaiter
+	// health is the readiness probe: a real guest/v1 Health round trip, never a
+	// socket dial. See GuestHealthFunc for why the distinction is load-bearing.
+	health GuestHealthFunc
+	// signal sends a signal to a process GROUP (supervisor.SignalGroup in
+	// production); a field so the whole stop/escalate/reap policy is testable
+	// against a recorder.
+	signal func(pgid int, sig os.Signal) error
+	// procStart / procGroup are the process-table probes the orphan store's
+	// exact-instance identity is built from (leader pid + immutable start time).
+	procStart func(pid int) (int64, bool)
+	procGroup func(pgid int) ([]supervisor.ProcMember, bool)
+	// log receives the vm spine's narration; nil means slog.Default (see
+	// logger). It is a field rather than a package logger so a node's vm
+	// activity rides the daemon's configured handler.
+	log *slog.Logger
+
+	// mu guards live only. Every helper call — spawn, health, signal — is made
+	// with mu RELEASED, so a blocked boot never blocks a concurrent StopVM or a
+	// GetRuntimeInfo probe.
+	mu sync.Mutex
+	// live maps pod id to its running helper. A pod is in it only between a
+	// SUCCESSFUL CreateVM and its stop, so membership means "this node holds a
+	// booted guest for this pod".
+	live map[string]*vmProc
+}
+
+// VMBackendOption configures a VMBackend at construction.
+//
+// Options rather than a config struct because the shipped daemon sets exactly
+// one of them today (the state root) while a test sets five, and a struct would
+// make every unset field a decision someone has to read past. They are also what
+// keeps NewVMBackend's existing zero-argument call sites compiling unchanged.
+type VMBackendOption func(*VMBackend)
+
+// WithGuestArtifacts supplies the locator for this node's pinned guest kernel and
+// initramfs. Without it CreateVM fails closed with ErrGuestArtifactsUnavailable —
+// see GuestArtifactLocator for why the shipped constructor leaves it unset.
+func WithGuestArtifacts(locator GuestArtifactLocator) VMBackendOption {
+	return func(b *VMBackend) { b.artifacts = locator }
+}
+
+// WithStateRoot supplies the runtime work-dir the vm orphan-record store lives
+// under. Without it the store is disabled and a helper this daemon spawns cannot
+// be swept after a `kill -9`, so the daemon always sets it.
+func WithStateRoot(root string) VMBackendOption {
+	return func(b *VMBackend) { b.stateRoot = root }
+}
+
+// WithLogger supplies the logger the vm spine narrates through.
+func WithLogger(log *slog.Logger) VMBackendOption {
+	return func(b *VMBackend) { b.log = log }
+}
+
+// WithVMProcessSeams replaces the spawn/reap/health/signal/process-table seams.
+// It is the TEST seam for the whole boot and teardown state machine: with a fake
+// spawner, a fake reaper and a fake agent, readiness, the pre-ready death race,
+// the deadline kill and the orphan sweep all run with no VM and no entitlement.
+// A nil argument leaves that seam at its production default.
+func WithVMProcessSeams(
+	spawner supervisor.Spawner,
+	waiter supervisor.ExitWaiter,
+	health GuestHealthFunc,
+	signal func(pgid int, sig os.Signal) error,
+	procStart func(pid int) (int64, bool),
+	procGroup func(pgid int) ([]supervisor.ProcMember, bool),
+) VMBackendOption {
+	return func(b *VMBackend) {
+		if spawner != nil {
+			b.spawner = spawner
+		}
+		if waiter != nil {
+			b.waiter = waiter
+		}
+		if health != nil {
+			b.health = health
+		}
+		if signal != nil {
+			b.signal = signal
+		}
+		if procStart != nil {
+			b.procStart = procStart
+		}
+		if procGroup != nil {
+			b.procGroup = procGroup
+		}
+	}
+}
+
+// WithVMHostLocator replaces the k3sm-vmhost lookup. Test-only: production always
+// resolves the helper beside the daemon or on PATH (FindVMHost).
+func WithVMHostLocator(fn func() (string, error)) VMBackendOption {
+	return func(b *VMBackend) { b.vmHostFn = fn }
+}
+
+// logger returns the configured logger, or the process default.
+func (b *VMBackend) logger() *slog.Logger {
+	if b.log != nil {
+		return b.log
+	}
+	return slog.Default()
 }
 
 // Ensure VMBackend satisfies the swappable Backend seam.
@@ -213,14 +364,25 @@ var _ Backend = (*VMBackend)(nil)
 // frameworks (vm_darwin.go); on every other build lane they report false
 // (vm_other.go), so Available is false and the pure-Go (CGO_ENABLED=0) build lane
 // stays unbroken.
-func NewVMBackend() *VMBackend {
-	return &VMBackend{
+func NewVMBackend(opts ...VMBackendOption) *VMBackend {
+	b := &VMBackend{
 		minMajor:         vmMinMacOSMajor,
 		osMajorFn:        darwinMajorVersion,
 		supportedFn:      vzSupported,
 		vmHostFn:         FindVMHost,
 		helperEntitledFn: vzStaticCodeEntitled,
+		spawner:          supervisor.PosixSpawner{},
+		waiter:           supervisor.KqueueReaper{},
+		health:           dialGuestHealth,
+		signal:           supervisor.SignalGroup,
+		procStart:        supervisor.ProcStartTimeNano,
+		procGroup:        supervisor.ProcGroupMembers,
+		live:             make(map[string]*vmProc),
 	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // Name returns the backend identifier ("vm").
@@ -287,14 +449,4 @@ func (b *VMBackend) GuestRosettaShareSupported() bool { return VMHostRosettaShar
 // VMBackend totally satisfies sandbox.Backend and fails CLOSED on a mis-route.
 func (b *VMBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	return "", nil, nil, ErrVMUsesCreateVM
-}
-
-// CreateVM boots the pod's Linux guest from spec. In M5.1 it is a documented,
-// LAB-GATED STUB returning ErrVMBootNotImplemented: the live boot needs a
-// Virtualization.framework-capable Mac signed with com.apple.security.virtualization
-// (see the type doc's lab-gated remainder). This is the seam the live boot lands
-// behind; on a non-entitled host SelectBackend fails a vm pod closed before
-// CreateVM is ever reached.
-func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
-	return ErrVMBootNotImplemented
 }

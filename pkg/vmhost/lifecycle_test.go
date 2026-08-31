@@ -25,6 +25,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // fakeMachine is the machineRunner seam: it records the order of the calls it
@@ -481,5 +483,32 @@ func assertCalls(t *testing.T, got, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("calls = %v, want %v (differ at %d)", got, want, i)
 		}
+	}
+}
+
+// TestStopGraceBoundsAreSingleValued binds this helper's grace bounds to the
+// daemon's mirrored copies, exactly as TestRosettaShareCapabilityIsSingleValued
+// binds the Rosetta capability and for the same import reason: pkg/sandbox is
+// linked into the daemon and this package imports Code-Hex/vz, so neither may
+// import the other, and a test that can import both is where the agreement lives.
+//
+// A DISAGREEMENT IS THE POWER-CUT BUG. The daemon computes the grace the helper
+// will actually honour (sandbox.clampStopGrace, applying these same two bounds)
+// and makes its own SIGTERM->SIGKILL escalation at least that long. If the
+// daemon's ceiling were the LOWER of the two, it would SIGKILL a helper still
+// inside its graceful sequence — the guest asked to stop, mid-sync — which is the
+// hard stop the whole grace protocol exists to avoid. If it were the higher, a
+// deleted pod's teardown would idle for the difference on every vm pod.
+func TestStopGraceBoundsAreSingleValued(t *testing.T) {
+	if DefaultStopGrace != sandbox.VMHostDefaultStopGrace {
+		t.Errorf("vmhost.DefaultStopGrace = %s but sandbox.VMHostDefaultStopGrace = %s; "+
+			"the daemon would time its escalation against a budget this helper never uses",
+			DefaultStopGrace, sandbox.VMHostDefaultStopGrace)
+	}
+	if MaxStopGrace != sandbox.VMHostMaxStopGrace {
+		t.Errorf("vmhost.MaxStopGrace = %s but sandbox.VMHostMaxStopGrace = %s; "+
+			"a lower daemon-side ceiling SIGKILLs a helper mid-graceful-stop (a power cut for the guest); "+
+			"a higher one idles every vm pod's teardown by the difference",
+			MaxStopGrace, sandbox.VMHostMaxStopGrace)
 	}
 }
