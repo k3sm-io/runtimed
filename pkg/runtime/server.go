@@ -66,6 +66,10 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	// refuses to arm a pod absent from r.pods (its anti-stranding guard, B26), so
 	// arming inside createPod would leave every limited pod unenforced.
 	r.armMemorySampler(p)
+	// Same ordering, same reason (B237): the lease watcher refuses a pod absent
+	// from r.pods, so arming it inside createVMPod would leave every vm pod
+	// without a live transport address. It is a no-op for a host-process pod.
+	r.armGuestLeaseWatcher(p)
 
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_ADDED, st)
