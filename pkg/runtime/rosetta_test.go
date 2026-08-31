@@ -90,9 +90,12 @@ func (p *countingGuestProbe) calledTimes() int {
 
 // rosettaDeps builds the Deps for a Rosetta-condition case: the two probe fakes
 // plus a vm backend whose availability decides whether the guest probe runs at all.
+// rosettaShare is set TRUE here because these cases are about the PROBE's states;
+// the share term is B229's own gate and is exercised by
+// TestGuestRosettaWithheldWithoutVMHostShare.
 func rosettaDeps(host *countingHostProbe, guest *countingGuestProbe, vmAvailable bool) Deps {
 	return Deps{
-		VMBackend:    &fakeVMBackend{available: vmAvailable},
+		VMBackend:    &fakeVMBackend{available: vmAvailable, rosettaShare: true},
 		HostRosetta:  host.probe,
 		GuestRosetta: guest.probe,
 	}
@@ -430,6 +433,96 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 			if c.GetMessage() == "" {
 				t.Errorf("%s has an empty Message under the default wiring", ct)
 			}
+		}
+	})
+}
+
+// TestGuestRosettaWithheldWithoutVMHostShare is B229's gate: a node must not
+// advertise a capability it lacks.
+//
+// The regression it forecloses is specific and would have arrived silently. The
+// moment the vm backend becomes available on an entitled Mac, evalGuestRosetta
+// would reach the framework probe; +[VZLinuxRosettaDirectoryShare availability]
+// says Installed on any recent Apple-Silicon Mac with the payload present; the
+// node would then report RosettaGuestAvailable=TRUE, k3sm would label it
+// k3sm.io/rosetta-linux, and pkg/image's PlatformPolicy would add linux/amd64 to
+// the pull candidate set for every vm pod — while the k3sm-vmhost helper attaches
+// no Rosetta share, so each of those images would be pulled and then fail to
+// execute in a guest with no interpreter registered.
+//
+// So the assertions are: with the share unsupported the condition is FALSE with
+// its OWN Reason, the framework probe is never called at all (a capability that
+// cannot matter is not queried), and — the term-independence check — the same
+// probe state DOES report TRUE once the share term holds, which is what proves the
+// FALSE above came from the share gate and not from a probe that had been broken.
+func TestGuestRosettaWithheldWithoutVMHostShare(t *testing.T) {
+	const condFalse = runtimev1.ConditionStatus_CONDITION_STATUS_FALSE
+	const condTrue = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+
+	t.Run("share-unsupported-withholds-the-capability", func(t *testing.T) {
+		guest := &countingGuestProbe{state: sandbox.GuestRosettaInstalled}
+		rt := newTestRuntime(t, Deps{
+			// Available, entitled, and the host framework says Rosetta for Linux
+			// IS installed — every term except the one that matters.
+			VMBackend:    &fakeVMBackend{available: true, rosettaShare: false},
+			HostRosetta:  (&countingHostProbe{state: sandbox.HostRosettaAvailable}).probe,
+			GuestRosetta: guest.probe,
+		})
+		resp, err := rt.GetRuntimeInfo(context.Background(), &runtimev1.GetRuntimeInfoRequest{})
+		if err != nil {
+			t.Fatalf("GetRuntimeInfo: %v", err)
+		}
+		c := findCondition(resp, ConditionRosettaGuestAvailable)
+		if c == nil {
+			t.Fatalf("no %s condition; conditions = %v", ConditionRosettaGuestAvailable, resp.GetConditions())
+		}
+		if c.GetStatus() != condFalse {
+			t.Errorf("%s status = %v, want FALSE: the VM host attaches no Rosetta share, so a linux/amd64 ELF cannot run in a guest on this node",
+				ConditionRosettaGuestAvailable, c.GetStatus())
+		}
+		if c.GetReason() != reasonRosettaGuestShareUnsupported {
+			t.Errorf("%s reason = %q, want %q — the operator must be able to tell this apart from a node that cannot run guests at all",
+				ConditionRosettaGuestAvailable, c.GetReason(), reasonRosettaGuestShareUnsupported)
+		}
+		if c.GetMessage() == "" {
+			t.Errorf("%s message is empty; an operator needs it to explain the status", ConditionRosettaGuestAvailable)
+		}
+		if n := guest.calledTimes(); n != 0 {
+			t.Errorf("guest-Rosetta probe called %d times; want 0 — the framework's answer cannot change a capability the VM host does not build", n)
+		}
+		// The HOST capability is a different translation engine and must be
+		// untouched by the guest-side gate.
+		if h := findCondition(resp, ConditionRosettaHostAvailable); h.GetStatus() != condTrue {
+			t.Errorf("%s status = %v, want TRUE; the vm-host share gate must not drag the host capability down",
+				ConditionRosettaHostAvailable, h.GetStatus())
+		}
+	})
+
+	t.Run("share-supported-restores-the-capability", func(t *testing.T) {
+		guest := &countingGuestProbe{state: sandbox.GuestRosettaInstalled}
+		rt := newTestRuntime(t, Deps{
+			VMBackend:    &fakeVMBackend{available: true, rosettaShare: true},
+			HostRosetta:  (&countingHostProbe{state: sandbox.HostRosettaAbsent}).probe,
+			GuestRosetta: guest.probe,
+		})
+		resp, err := rt.GetRuntimeInfo(context.Background(), &runtimev1.GetRuntimeInfoRequest{})
+		if err != nil {
+			t.Fatalf("GetRuntimeInfo: %v", err)
+		}
+		if c := findCondition(resp, ConditionRosettaGuestAvailable); c.GetStatus() != condTrue {
+			t.Errorf("%s status = %v, want TRUE once the VM host attaches the share; the FALSE above must come from the share gate, not from a broken probe",
+				ConditionRosettaGuestAvailable, c.GetStatus())
+		}
+		if n := guest.calledTimes(); n != 1 {
+			t.Errorf("guest-Rosetta probe called %d times; want exactly 1 (eager, once)", n)
+		}
+	})
+
+	t.Run("the-shipped-backend-withholds-it", func(t *testing.T) {
+		// The production wiring, not a fake: whatever the fakes above prove about
+		// the composition, the binary that ships must answer false today.
+		if sandbox.NewVMBackend().GuestRosettaShareSupported() {
+			t.Error("the shipped sandbox.VMBackend reports a guest Rosetta share; k3sm-vmhost attaches none")
 		}
 	})
 }

@@ -209,6 +209,18 @@ func (b *VMBackend) Available() bool {
 	return b.supportedFn() && b.entitledFn()
 }
 
+// GuestRosettaShareSupported reports whether the k3sm-vmhost helper attaches a
+// Rosetta directory share to the guests it builds — i.e. whether a linux/amd64 ELF
+// could actually execute in one of this node's guests.
+//
+// It is the SECOND, INDEPENDENT term of the node's guest-Rosetta advertisement
+// (B229): Apple's availability probe answers "can this Mac do Rosetta for Linux",
+// which is a different question from "does the VM this node builds carry it". The
+// answer is the compile-time VMHostRosettaShareSupported; see that constant for why
+// the advertisement must be gated on what the helper builds rather than on what the
+// framework says the host could do.
+func (b *VMBackend) GuestRosettaShareSupported() bool { return VMHostRosettaShareSupported }
+
 // WrapCommand always fails with ErrVMUsesCreateVM: a Linux guest is not a confined
 // host process, so the vm backend does not implement the host-process exec-shim
 // seam. The runtime routes a vm pod to CreateVM; this method exists only so
