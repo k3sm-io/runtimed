@@ -31,6 +31,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"k3sm.io/runtimed/pkg/guestinit"
+	"k3sm.io/runtimed/pkg/supervisor"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 )
@@ -628,21 +629,24 @@ func TestCreateVMWritesTheGuestSpec(t *testing.T) {
 	spec.Network, spec.Containers, spec.Volumes = fixture.Network, fixture.Containers, fixture.Volumes
 
 	specPath := filepath.Join(spec.PodDir, guestinit.SpecShareTag, VMGuestSpecFileName)
-	// The health seam is the first thing that runs after the spawn, so it is the
-	// earliest point from which the file's pre-spawn existence can be observed.
-	var atSpawn os.FileInfo
-	b, _, _, _ := labBackend(t, root, func(context.Context, string) error {
-		if atSpawn == nil {
-			atSpawn, _ = os.Stat(specPath)
-		}
-		return nil
-	})
+	// The observation is taken INSIDE the spawner, which is the exact instant
+	// the helper is handed its arguments — the earliest moment a guest could
+	// begin to exist. Observing anywhere later (in the health probe, say) would
+	// pass even if the write had been moved after the spawn, which is precisely
+	// the regression this row exists to catch.
+	watcher := &specWatchingSpawner{path: specPath, next: &fakeSpawner{}}
+	b, _, _, _ := labBackend(t, root, func(context.Context, string) error { return nil },
+		WithVMProcessSeams(watcher, nil, nil, nil, nil, nil))
 	if err := b.CreateVM(context.Background(), spec); err != nil {
 		t.Fatalf("CreateVM: %v", err)
 	}
 
+	atSpawn := watcher.seen
+	if !watcher.spawned {
+		t.Fatal("no helper was spawned; the ordering assertion below would be vacuous")
+	}
 	if atSpawn == nil {
-		t.Fatal("the guest spec did not exist when the helper was already running; it must be committed before the spawn")
+		t.Fatal("the guest spec did not exist at the instant the helper was spawned; it must be committed BEFORE the spawn, because that is the window in which no guest holds the share")
 	}
 	if mode := atSpawn.Mode().Perm(); mode != 0o444 {
 		t.Errorf("guest spec mode = %04o, want 0444 (defence in depth behind the device read-only flag)", mode)
@@ -701,4 +705,23 @@ func (f *fakeSpawner) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.specs)
+}
+
+// specWatchingSpawner records whether a path existed at the instant of the
+// spawn, then delegates. It is the only seam from which the write-then-spawn
+// ORDERING is observable: everything later in CreateVM runs after a guest could
+// already exist.
+type specWatchingSpawner struct {
+	path    string
+	next    *fakeSpawner
+	seen    os.FileInfo
+	spawned bool
+}
+
+func (s *specWatchingSpawner) Spawn(ctx context.Context, spec supervisor.SpawnSpec) (int, error) {
+	if !s.spawned {
+		s.spawned = true
+		s.seen, _ = os.Stat(s.path)
+	}
+	return s.next.Spawn(ctx, spec)
 }
