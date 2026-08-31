@@ -132,12 +132,17 @@ type VMSpec struct {
 // host process — WrapCommand fails closed with ErrVMUsesCreateVM).
 //
 // Availability is a SAFE probe (see Available): +[VZVirtualMachine isSupported]
-// AND a static-code-entitlement check for com.apple.security.virtualization, both
-// wrapped against Obj-C exceptions in the cgo .m shim (vm_darwin.m). It NEVER
+// AND the presence of a validly-signed, virtualization-entitled k3sm-vmhost helper,
+// both wrapped against Obj-C exceptions in the cgo .m shim (vm_darwin.m). It NEVER
 // constructs or boots a VM — instantiating a VZVirtualMachine without the
 // entitlement raises an uncaught NSException → SIGABRT, which would take down the
 // daemon on a non-entitled host. On such a host Available returns false and
 // SelectBackend fails a vm-requested pod CLOSED rather than downgrading it.
+//
+// THE DAEMON NEVER BOOTS A VM ITSELF. The guest is built and run by the per-pod
+// k3sm-vmhost helper (VMHostName), the only k3sm binary carrying
+// com.apple.security.virtualization, so this process holds no virtualization
+// authority at all.
 //
 // Virtualization.framework is a PUBLIC framework, so the vm backend is NOT a
 // libsandbox/memorystatus SPI symbol-canary case — internal/spicanary is
@@ -163,10 +168,14 @@ type VMBackend struct {
 	// supportedFn reports +[VZVirtualMachine isSupported] (the cgo safe probe on
 	// darwin+cgo; a false stub otherwise). Injectable for tests.
 	supportedFn func() bool
-	// entitledFn reports whether this process carries the
-	// com.apple.security.virtualization entitlement (the cgo Security.framework
-	// probe on darwin+cgo; a false stub otherwise). Injectable for tests.
-	entitledFn func() bool
+	// vmHostFn locates the k3sm-vmhost helper at its installed path. Defaults to
+	// FindVMHost; injectable for tests.
+	vmHostFn func() (string, error)
+	// helperEntitledFn reports whether the helper at the given path is validly
+	// signed AND carries com.apple.security.virtualization (the cgo
+	// Security.framework probe on darwin+cgo; a false stub otherwise). Injectable
+	// for tests.
+	helperEntitledFn func(path string) bool
 }
 
 // Ensure VMBackend satisfies the swappable Backend seam.
@@ -179,34 +188,58 @@ var _ Backend = (*VMBackend)(nil)
 // stays unbroken.
 func NewVMBackend() *VMBackend {
 	return &VMBackend{
-		minMajor:    vmMinMacOSMajor,
-		osMajorFn:   darwinMajorVersion,
-		supportedFn: vzSupported,
-		entitledFn:  vzEntitled,
+		minMajor:         vmMinMacOSMajor,
+		osMajorFn:        darwinMajorVersion,
+		supportedFn:      vzSupported,
+		vmHostFn:         FindVMHost,
+		helperEntitledFn: vzStaticCodeEntitled,
 	}
 }
 
 // Name returns the backend identifier ("vm").
 func (b *VMBackend) Name() string { return VMBackendName }
 
-// Available reports whether the vm backend can run a guest on this host: darwin at
-// or above the gated macOS major version, Virtualization.framework reports support
-// (+[VZVirtualMachine isSupported]), AND this process carries the
-// com.apple.security.virtualization entitlement. It is a SAFE probe — it never
-// constructs or boots a VM (see the type doc). A false return makes a vm-requested
-// pod fail closed in SelectBackend.
+// Available reports whether the vm backend can run a guest on this host. It is the
+// CONJUNCTION of five terms, every one of which must hold (B227):
+//
+//	darwin
+//	  AND macOS major >= vmMinMacOSMajor
+//	  AND +[VZVirtualMachine isSupported]
+//	  AND the k3sm-vmhost helper resolves at its installed path
+//	  AND that helper's static signature is VALID and carries
+//	      com.apple.security.virtualization
+//
+// The last two terms replaced an earlier "this process is entitled" term, and the
+// replacement is the architecture rather than a relaxation: the daemon never
+// creates a VZVirtualMachine — it spawns the helper, which does — so the daemon
+// gating on ITS OWN entitlement asked the wrong binary and would report false on a
+// perfectly capable node. The helper's SIGNATURE VALIDITY is checked, not merely
+// its entitlements plist, because a plist stays readable on a binary edited after
+// signing that macOS will then refuse to launch (see k3sm_vz_static_code_entitled).
+//
+// It remains a SAFE probe — it never constructs or boots a VM (see the type doc) —
+// and it is the ONE probe both consumers read: SelectBackend, which fails a
+// vm-requested pod CLOSED when it is false, and pkg/runtime's
+// VMBackendAvailable RuntimeCondition, which is what labels the node.
 func (b *VMBackend) Available() bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	if b.osMajorFn == nil || b.supportedFn == nil || b.entitledFn == nil {
+	if b.osMajorFn == nil || b.supportedFn == nil || b.vmHostFn == nil || b.helperEntitledFn == nil {
 		return false
 	}
 	major, err := b.osMajorFn()
 	if err != nil || major < b.minMajor {
 		return false
 	}
-	return b.supportedFn() && b.entitledFn()
+	if !b.supportedFn() {
+		return false
+	}
+	helper, err := b.vmHostFn()
+	if err != nil || helper == "" {
+		return false
+	}
+	return b.helperEntitledFn(helper)
 }
 
 // GuestRosettaShareSupported reports whether the k3sm-vmhost helper attaches a

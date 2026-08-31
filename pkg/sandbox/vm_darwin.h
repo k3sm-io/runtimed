@@ -2,13 +2,14 @@
 #define K3SM_VM_DARWIN_H
 
 // Safe Virtualization.framework + entitlement probes for the vm sandbox backend
-// (M5.1, plus k3sm_vz_rosetta_availability from B103). This header is the INVENTORY
-// of that surface: it declares THREE entry points and NONE constructs or boots a VM —
-// instantiating a VZVirtualMachine on a non-entitled host raises an uncaught Obj-C
-// exception (NSInternalInconsistency) → SIGABRT, which would take down the daemon.
-// All three are wrapped in @try/@catch + @autoreleasepool in vm_darwin.m and use only
-// PUBLIC API (Virtualization.framework is public, so this is NOT a libsandbox SPI
-// canary case). Adding a fourth means bumping the count here AND in vm_darwin.m.
+// (M5.1, plus k3sm_vz_rosetta_availability from B103 and k3sm_vz_static_code_entitled
+// from B227). This header is the INVENTORY of that surface: it declares FOUR entry
+// points and NONE constructs or boots a VM — instantiating a VZVirtualMachine on a
+// non-entitled host raises an uncaught Obj-C exception (NSInternalInconsistency) ->
+// SIGABRT, which would take down the daemon. All four are wrapped in @try/@catch +
+// @autoreleasepool in vm_darwin.m and use only PUBLIC API (Virtualization.framework
+// is public, so this is NOT a libsandbox SPI canary case). Adding a fifth means
+// bumping the count here AND in vm_darwin.m.
 
 // k3sm_vz_supported returns 1 if +[VZVirtualMachine isSupported] is YES, else 0.
 // isSupported is a hardware/OS-capability query that does NOT construct a VM.
@@ -46,5 +47,19 @@ enum k3sm_vz_rosetta_state {
 // object. It deliberately never calls +installRosetta...: those PROMPT the user,
 // which is fatal in a GUI-less root daemon.
 int k3sm_vz_rosetta_availability(void);
+
+// k3sm_vz_static_code_entitled returns 1 if the code AT PATH (the k3sm-vmhost
+// helper, not this process) has a signature that passes SecStaticCodeCheckValidity
+// AND carries com.apple.security.virtualization == true, else 0. It never touches
+// Virtualization.framework.
+//
+// The VALIDITY check is not belt-and-braces: an entitlements plist is readable from
+// a binary whose signature is BROKEN (edited after signing, or a bad-architecture
+// slice), and macOS would refuse to launch that helper. Reading only the plist would
+// therefore label the node vm-capable on a host where every vm pod fails at spawn,
+// which is precisely the "a node must not advertise a capability it lacks" rule.
+// A path that does not exist, or is not code, is 0 — never an error the caller has
+// to interpret.
+int k3sm_vz_static_code_entitled(const char *path);
 
 #endif // K3SM_VM_DARWIN_H

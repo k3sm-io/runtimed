@@ -28,6 +28,11 @@ func vzSupported() bool { return false }
 
 func vzEntitled() bool { return false }
 
+// vzStaticCodeEntitled is the OFF-PLATFORM helper-signature probe: without the
+// Security.framework shim there is no way to check another binary's signature, so
+// it reports false and VMBackend.Available() is false with it (fail-closed).
+func vzStaticCodeEntitled(path string) bool { return false }
+
 // vzRosettaAvailability is the OFF-PLATFORM guest-Rosetta probe: on any lane that
 // is NOT darwin+cgo the Virtualization.framework shim is not compiled in, so the
 // probe cannot answer and reports GuestRosettaQueryFailed — which fails closed
