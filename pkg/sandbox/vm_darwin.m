@@ -1,12 +1,13 @@
 //go:build darwin && cgo
 
 // Obj-C shim for the vm sandbox backend's SAFE availability probes (M5.1, plus the
-// guest-Rosetta availability read added by B103). It is isolated here so the only
-// Objective-C / Virtualization.framework surface the rest of runtimed sees is the
-// THREE C entry points in vm_darwin.h. NO entry point constructs or boots a
-// VZVirtualMachine — doing so without the com.apple.security.virtualization
-// entitlement raises an uncaught NSException → SIGABRT, so all three are
-// additionally wrapped in @try/@catch and @autoreleasepool.
+// guest-Rosetta availability read added by B103 and the helper static-signature
+// check added by B227). It is isolated here so the only Objective-C /
+// Virtualization.framework surface the rest of runtimed sees is the FOUR C entry
+// points in vm_darwin.h. NO entry point constructs or boots a VZVirtualMachine —
+// doing so without the com.apple.security.virtualization entitlement raises an
+// uncaught NSException -> SIGABRT, so all four are additionally wrapped in
+// @try/@catch and @autoreleasepool.
 //
 // The COUNT is load-bearing, not prose: this comment and vm_darwin.h are the stated
 // inventory a reviewer audits the Virtualization attack surface against, so adding an
@@ -109,4 +110,67 @@ int k3sm_vz_rosetta_availability(void) {
 #else
 	return K3SM_VZ_ROSETTA_NOT_SUPPORTED;
 #endif
+}
+
+// k3sm_vz_static_code_entitled — reads the STATIC code-signing information of the
+// binary at path (the k3sm-vmhost helper) and reports whether its signature is
+// VALID and carries com.apple.security.virtualization. All public Security.framework
+// API; it never touches Virtualization.framework, so it cannot trigger the
+// VM-construction exception.
+//
+// Two properties are load-bearing and both fail CLOSED:
+//
+//   - SecStaticCodeCheckValidity comes FIRST. A binary edited after signing still
+//     has a readable entitlements dictionary, so an entitlement read alone would
+//     accept a helper macOS will refuse to launch.
+//   - kSecCSDefaultFlags means the default requirement (the code's own designated
+//     requirement). This is a "did this get mangled" check, not a publisher-identity
+//     check: k3sm helpers are ad-hoc signed in a dev tree, so pinning an anchor here
+//     would make the vm backend permanently unavailable outside a notarized install.
+//     The publisher-identity question is a distribution decision tracked separately.
+int k3sm_vz_static_code_entitled(const char *path) {
+	if (path == NULL || path[0] == '\0') {
+		return 0;
+	}
+	@autoreleasepool {
+		@try {
+			NSString *p = [NSString stringWithUTF8String:path];
+			if (p == nil) {
+				return 0;
+			}
+			NSURL *url = [NSURL fileURLWithPath:p isDirectory:NO];
+			if (url == nil) {
+				return 0;
+			}
+			SecStaticCodeRef code = NULL;
+			if (SecStaticCodeCreateWithPath((__bridge CFURLRef)url, kSecCSDefaultFlags, &code) != errSecSuccess ||
+			    code == NULL) {
+				return 0;
+			}
+			if (SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL) != errSecSuccess) {
+				CFRelease(code);
+				return 0;
+			}
+			CFDictionaryRef info = NULL;
+			OSStatus st = SecCodeCopySigningInformation(code, kSecCSRequirementInformation, &info);
+			CFRelease(code);
+			if (st != errSecSuccess || info == NULL) {
+				return 0;
+			}
+			int ok = 0;
+			CFDictionaryRef ents =
+				(CFDictionaryRef)CFDictionaryGetValue(info, kSecCodeInfoEntitlementsDict);
+			if (ents != NULL && CFGetTypeID(ents) == CFDictionaryGetTypeID()) {
+				CFBooleanRef v = (CFBooleanRef)CFDictionaryGetValue(
+					ents, CFSTR("com.apple.security.virtualization"));
+				if (v != NULL && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v)) {
+					ok = 1;
+				}
+			}
+			CFRelease(info);
+			return ok;
+		} @catch (NSException *e) {
+			return 0;
+		}
+	}
 }

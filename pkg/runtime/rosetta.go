@@ -49,6 +49,13 @@ const (
 	// reasonRosettaVMBackendUnavailable is the guest condition's Reason when the
 	// probe was SHORT-CIRCUITED because the vm backend is unavailable.
 	reasonRosettaVMBackendUnavailable = "VMBackendUnavailable"
+	// reasonRosettaGuestShareUnsupported is the guest condition's Reason when the
+	// vm backend IS available but the guests this node builds carry no Rosetta
+	// directory share, so nothing in a guest could translate a linux/amd64 ELF
+	// however capable the host is (B229). It is a DISTINCT token from
+	// reasonRosettaVMBackendUnavailable because the operator situations differ:
+	// one node cannot run guests at all, the other runs them without translation.
+	reasonRosettaGuestShareUnsupported = "VMHostRosettaShareUnsupported"
 )
 
 // rosettaCondition is one probe's IMMUTABLE, eagerly-evaluated outcome: the three
@@ -120,13 +127,28 @@ func evalHostRosetta(ctx context.Context, probe func(context.Context) sandbox.Ho
 }
 
 // evalGuestRosetta turns the guest-Rosetta probe's state into the condition data,
-// SHORT-CIRCUITING the probe entirely when the vm backend is unavailable.
+// SHORT-CIRCUITING the probe entirely on either of TWO host-side facts that make
+// the framework's answer irrelevant.
 //
-// The short-circuit is not an optimisation of convenience: k3sm composes the node's
-// guest-Rosetta capability as VMBackendAvailable AND RosettaGuestAvailable, so with
-// the vm backend down the guest result cannot change any label — and skipping it
-// keeps a Virtualization.framework call off every unentitled Mac. When
-// short-circuited the condition is FALSE naming that cause, never TRUE.
+// FIRST, the vm backend must be available. This is not an optimisation of
+// convenience: k3sm composes the node's guest-Rosetta capability as
+// VMBackendAvailable AND RosettaGuestAvailable, so with the vm backend down the
+// guest result cannot change any label — and skipping it keeps a
+// Virtualization.framework call off every Mac that cannot run guests anyway.
+//
+// SECOND (B229), the guests this node BUILDS must carry a Rosetta directory share.
+// +[VZLinuxRosettaDirectoryShare availability] answers a question about the Mac,
+// not about the VM: it can say Installed while the k3sm-vmhost helper attaches no
+// share at all. Advertising on the framework answer alone would make
+// pkg/image's PlatformPolicy add linux/amd64 to the pull candidate set for every vm
+// pod on this node, and each such image would be pulled — bytes, disk, time — and
+// then fail to execute inside a guest with no interpreter registered. A node must
+// not advertise a capability it lacks, so the gate is the helper's own
+// GuestRosettaShareSupported and the demotion is STRUCTURAL: the capability
+// returns when the helper is changed to attach the share, not when a comment is
+// edited.
+//
+// Either short-circuit yields FALSE naming its own cause, never TRUE.
 //
 // ONLY sandbox.GuestRosettaInstalled maps to TRUE, and — exactly as in
 // evalHostRosetta — that decision has ONE home, sandbox.GuestRosettaState.Available();
@@ -137,6 +159,13 @@ func evalGuestRosetta(vmBackend VMBackend, probe func() sandbox.GuestRosettaStat
 			status:  runtimev1.ConditionStatus_CONDITION_STATUS_FALSE,
 			reason:  reasonRosettaVMBackendUnavailable,
 			message: "the vm backend is unavailable, so no Linux guest can run here and guest Rosetta was not probed (the node capability is VMBackendAvailable AND RosettaGuestAvailable)",
+		}
+	}
+	if !vmBackend.GuestRosettaShareSupported() {
+		return rosettaCondition{
+			status:  runtimev1.ConditionStatus_CONDITION_STATUS_FALSE,
+			reason:  reasonRosettaGuestShareUnsupported,
+			message: "this node's VM host attaches no Rosetta directory share, so a linux/amd64 ELF could not execute in a guest here however capable the host is; guest Rosetta was not probed and linux/amd64 stays out of the vm pull candidate set",
 		}
 	}
 	state := probe()

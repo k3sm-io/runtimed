@@ -32,15 +32,21 @@ limitations under the License.
 //
 //	pseudo-filesystems -> read guest-spec.json -> render /etc -> pod mounts ->
 //	hostname -> Rosetta binfmt registration -> per-container rootfs overlays ->
-//	init containers sequentially -> main containers -> reap loop ->
-//	Stop(grace): TERM -> grace -> KILL -> sync -> poweroff.
+//	init containers sequentially -> main containers -> vsock GuestAgent ->
+//	reap loop -> Stop(grace): TERM -> grace -> KILL -> sync -> poweroff.
+//
+// The GuestAgent comes up AFTER the containers on purpose: its Health is the
+// host's boot-deadline probe, so an agent answering earlier would report a
+// guest that is ready for a pod it has not started.
 //
 // NOT YET IN THIS BINARY, and deliberately so — each is its own slice with its
-// own gate: the eth0 DHCP client (so /etc/hosts carries no leased address
-// yet), the per-container cgroup2 leaves, per-container log capture, pty
-// allocation for a tty container, and the vsock GuestAgent server. A spec
-// requesting an idmapped mount is REFUSED rather than mounted without the
-// idmap.
+// own gate: the eth0 DHCP client (so /etc/hosts carries no leased address yet,
+// and HealthResponse.guest_ip is empty), the per-container cgroup2 leaves (so
+// Stats omits every container rather than reporting zeros), per-container log
+// capture (so Logs reports that the output is on the VM console instead of
+// serving an empty stream), and pty allocation (so a tty exec is refused rather
+// than run without a terminal). A spec requesting an idmapped mount is REFUSED
+// rather than mounted without the idmap.
 package main
 
 import (
@@ -58,6 +64,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	guestv1 "k3sm.io/apis/guest/v1"
+	"k3sm.io/runtimed/pkg/guestagent"
 	"k3sm.io/runtimed/pkg/guestinit"
 )
 
@@ -70,6 +77,11 @@ const defaultStopGrace = 30 * time.Second
 // meminfoPath is where the guest's RAM size is read from, to bound each
 // container's overlay upper.
 const meminfoPath = "/proc/meminfo"
+
+// cmdlinePath is where the guest reads its own kernel command line, which is how
+// it learns the pod id it must assert incoming requests against — guest/v1's
+// GuestSpec carries no pod_id field. See guestagent.PodIDCmdlineKey.
+const cmdlinePath = "/proc/cmdline"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -146,13 +158,32 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
+	// The ContainerEvents fan-out. It is created BEFORE the reaper because the
+	// reaper's exit callback publishes to it, and before the containers because
+	// an exit that happened before the agent was serving still has to reach the
+	// bus — a subscriber that arrives later misses it, but the alternative is a
+	// publish path that does not exist yet when the first container dies.
+	events := guestagent.NewEvents(0)
+	defer events.Close()
+
 	reaper := guestinit.NewReaper(proc, sigchld, guestinit.ReaperOptions{
 		Logger: log,
 		OnExit: func(ev guestinit.ExitEvent) {
-			// The GuestAgent's ContainerEvents stream is this callback's
-			// eventual consumer; until it exists the console is the record.
 			log.Info("container exit observed", "container", ev.Container,
 				"exit_code", ev.Status.ExitCode, "signal", ev.Status.Signal)
+			// OOMKilled is deliberately NOT set here. It is the one fact only
+			// the guest can supply, and this init does not yet read the cgroup2
+			// memory.events that would prove it — so it is left false rather
+			// than guessed, because upstream treats OOMKilled as the pod's own
+			// fault and charges a restart against a Job's backoff.
+			events.Publish(guestagent.ContainerEvent{
+				Container: ev.Container,
+				At:        time.Now(),
+				Exited: &guestagent.ContainerExited{
+					ExitCode: int32(ev.Status.ExitCode),
+					Signal:   int32(ev.Status.Signal),
+				},
+			})
 		},
 	})
 	runCtx, cancelRun := context.WithCancel(ctx)
@@ -163,11 +194,48 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
-	if err := startContainers(ctx, log, reaper, plan.Containers); err != nil {
+	if err := startContainers(ctx, log, reaper, events, plan.Containers); err != nil {
 		// Anything already running has to be torn down; Stop is the only
 		// path that both signals and powers off.
 		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
 	}
+
+	// The agent comes up last, once there is a pod for it to answer about.
+	status := &guestStatus{}
+	names := make([]string, 0, len(plan.Containers))
+	byName := make(map[string]guestinit.ContainerPlan, len(plan.Containers))
+	for _, cp := range plan.Containers {
+		names = append(names, cp.Name)
+		byName[cp.Name] = cp
+	}
+	rawCmdline, err := os.ReadFile(cmdlinePath)
+	if err != nil {
+		return errors.Join(fmt.Errorf("read %s: %w", cmdlinePath, err), reaper.Stop(ctx, defaultStopGrace))
+	}
+	podID, err := guestagent.PodIDFromCmdline(string(rawCmdline))
+	if err != nil {
+		// FATAL, not degraded. An agent that does not know its own pod cannot
+		// perform the rejection guest.proto requires of it, and one that accepted
+		// every pod_id would answer Exec, Logs and Stats for a pod it is not.
+		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
+	}
+	stopAgent, err := serveAgent(podID, spec.GetAgentPort(), guestagent.Deps{
+		Runner:  &reaperRunner{names: names, reaper: reaper},
+		Sampler: &cgroupSampler{root: cgroup2Root},
+		Logs:    &ringLogs{},
+		Execer:  &procExecer{plans: byName, reaper: reaper, log: log},
+		Status:  status,
+		Events:  events,
+		Logger:  log,
+	}, log)
+	if err != nil {
+		// A guest with no agent is a pod the host can never exec into, read logs
+		// from, meter, or stop gracefully — so this fails the boot rather than
+		// running a pod nothing can observe or shut down.
+		return errors.Join(fmt.Errorf("serve the guest agent: %w", err), reaper.Stop(ctx, defaultStopGrace))
+	}
+	defer stopAgent()
+	status.setReady(plan.Binfmt != nil)
 
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, unix.SIGTERM, unix.SIGINT)
@@ -287,7 +355,7 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 
 // startContainers realizes the plan's containers in order: an init container
 // is waited for and must exit 0, a main container is started and left running.
-func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, plans []guestinit.ContainerPlan) error {
+func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, plans []guestinit.ContainerPlan) error {
 	for _, cp := range plans {
 		if err := applyMounts(log, cp.Mounts); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
@@ -297,6 +365,11 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 			return fmt.Errorf("start container %s: %w", cp.Name, err)
 		}
 		reaper.Track(cp.Name, pid)
+		events.Publish(guestagent.ContainerEvent{
+			Container: cp.Name,
+			At:        time.Now(),
+			Started:   &guestagent.ContainerStarted{PID: int32(pid)},
+		})
 		log.Info("started a container", "container", cp.Name, "phase", cp.Phase, "pid", pid)
 
 		if !cp.WaitForExit {

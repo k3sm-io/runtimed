@@ -3,6 +3,7 @@ module k3sm.io/runtimed
 go 1.25.8
 
 require (
+	github.com/Code-Hex/vz/v3 v3.7.1
 	github.com/google/go-containerregistry v0.21.6
 	github.com/klauspost/compress v1.18.6
 	golang.org/x/sys v0.44.0
@@ -14,11 +15,13 @@ require (
 )
 
 require (
+	github.com/Code-Hex/go-infinity-channel v1.0.0 // indirect
 	github.com/docker/cli v29.4.3+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
+	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
