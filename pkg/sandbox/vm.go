@@ -153,6 +153,34 @@ type VMSpec struct {
 	// a zero value networks no guest. A NAT-attached guest gets its network via the
 	// VZNATNetworkDeviceAttachment, NEVER a host lo0 alias.
 	Network GuestNetworkConfig
+	// Hostname is the pod hostname the guest sets and binds into every
+	// container's /etc/hostname (guest/v1 GuestSpec.hostname). Empty leaves the
+	// guest on the kernel default, which the guest init records as a warning.
+	Hostname string
+	// FSGroup is the pod's fsGroup, honoured in the guest by idmapped mounts
+	// rather than a recursive chown (guest/v1 GuestSpec.fs_group). Zero means
+	// unset — the proto has no presence for it, so "unset" and "group 0" are
+	// the same wire value, exactly as pkg/runtime already reads run_as_user.
+	FSGroup int64
+	// Containers are the pod's containers in start order (init containers
+	// first), already resolved host-side: merged argv, resolved environment,
+	// resolved numeric identity. They cross into the guest as guest/v1
+	// GuestContainers.
+	//
+	// PLAIN DATA on the same decoupling seam as Volumes and Network: sandbox
+	// resolves nothing itself. The NAMED MAPPER is pkg/runtime — it holds the
+	// PodBox, the image config and pkg/image.MergeRunSpec, which is where every
+	// value below is produced.
+	//
+	// NOT YET STAMPED BY ANY PRODUCER. createVMPod builds a VMSpec without
+	// them, so a vm pod's boot spec is written with an empty container list
+	// today and the guest init refuses it with its own reason
+	// (guestinit.Plan: "the pod has no containers"). That is the honest
+	// interim state: the contract's producer exists and is gated, and the
+	// container-resolution mapper is the next deliverable. It is a field here
+	// rather than a parameter so the mapper has one place to stamp and the
+	// composer one place to read.
+	Containers []VMContainer
 	// Volumes is the virtiofs share-device plan for the pod's volumes (B106),
 	// stamped as data by createVMPod (pkg/runtime), the named mapper from
 	// pkg/mount's planner — sandbox imports neither. The zero value plans
@@ -183,6 +211,53 @@ type VMSpec struct {
 	// the helper's default; the daemon clamps its own escalation wait to the
 	// same resolved value (clampStopGrace) so the two timers cannot race.
 	StopGrace time.Duration
+}
+
+// VMContainer is one container to run inside the pod's guest, as the host has
+// already resolved it. It maps onto guest/v1 GuestContainer field for field.
+//
+// EVERY KUBERNETES INDIRECTION IS ALREADY GONE by the time a value lands here:
+// the argv is the four-quadrant merge of the pod spec against the image config
+// (pkg/image.MergeRunSpec), the environment is fully expanded "KEY=VALUE"
+// entries, and the identity is numeric. The guest performs no merge and consults
+// no image config of its own, which is what lets it boot with no cluster access.
+type VMContainer struct {
+	// Name is the container name, unique within the pod. It is the selector
+	// Exec / Logs / Stats and the guest's ContainerEvents use.
+	Name string
+	// Init marks an init container: it runs to completion, in list order,
+	// before any main container starts.
+	//
+	// A native sidecar (an init container with restartPolicy: Always) cannot be
+	// expressed — guest/v1 carries this one ordering bit and no other — and the
+	// guest init records that ceiling on its own side (guestinit.StartStep).
+	Init bool
+	// RootfsTag names the virtiofs share carrying this container's read-only
+	// rootfs lower layer; the guest composes writability as an overlay. It must
+	// name a share in VMSpec.Volumes.Shares — no host path ever crosses.
+	RootfsTag string
+	// Argv is the MERGED argument vector, Argv[0] first. It crosses as
+	// GuestContainer.command with args empty; see buildGuestSpec for why the
+	// merged vector is not re-split.
+	Argv []string
+	// Env are fully resolved "KEY=VALUE" entries.
+	Env []string
+	// WorkingDir is the process working directory inside the container rootfs;
+	// empty takes the image config's WorkingDir as already merged host-side.
+	WorkingDir string
+	// TTY and Stdin mirror the pod spec's terminal requests.
+	TTY   bool
+	Stdin bool
+	// UID and GID are the RESOLVED numeric ids the process runs as. A
+	// non-numeric image USER is deliberately NOT resolved host-side (the host
+	// does not read a pod-controlled /etc/passwd to decide a privilege
+	// question); the guest resolves it at exec time against the container
+	// rootfs, so this pair carries the numeric answer only when the host
+	// already had one.
+	UID int64
+	GID int64
+	// SupplementalGIDs are the additional groups, including the pod fsGroup.
+	SupplementalGIDs []int64
 }
 
 // VMBackend is the Virtualization.framework micro-VM isolation backend (M5.1) —

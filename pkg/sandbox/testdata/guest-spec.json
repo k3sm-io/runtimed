@@ -1,0 +1,95 @@
+{
+  "hostname": "web-0",
+  "resolvConf": {
+    "nameservers": [
+      "10.43.0.10"
+    ],
+    "searches": [
+      "default.svc.cluster.local",
+      "svc.cluster.local",
+      "cluster.local"
+    ],
+    "options": [
+      "ndots:5"
+    ]
+  },
+  "containers": [
+    {
+      "name": "init-db",
+      "rootfsTag": "k3sm.rootfs.init-db",
+      "command": [
+        "/bin/sh",
+        "-c",
+        "initdb /pgdata"
+      ],
+      "env": [
+        "PGDATA=/pgdata"
+      ],
+      "workingDir": "/",
+      "uid": "999",
+      "gid": "999",
+      "init": true
+    },
+    {
+      "name": "postgres",
+      "rootfsTag": "k3sm.rootfs.postgres",
+      "command": [
+        "/usr/local/bin/postgres",
+        "-D",
+        "/pgdata"
+      ],
+      "env": [
+        "PGDATA=/pgdata",
+        "POSTGRES_DB=stockkitty"
+      ],
+      "workingDir": "/var/lib/postgresql",
+      "tty": true,
+      "uid": "999",
+      "gid": "999",
+      "supplementalGids": [
+        "999",
+        "2000"
+      ]
+    }
+  ],
+  "mounts": [
+    {
+      "tagOrSource": "k3sm.proj",
+      "target": "/run/k3sm/shares/k3sm.proj",
+      "kind": "GUEST_MOUNT_KIND_VIRTIOFS",
+      "readOnly": true
+    },
+    {
+      "tagOrSource": "k3sm.vols",
+      "target": "/run/k3sm/shares/k3sm.vols",
+      "kind": "GUEST_MOUNT_KIND_VIRTIOFS",
+      "readOnly": true
+    },
+    {
+      "tagOrSource": "/run/k3sm/shares/k3sm.proj/sa-token",
+      "target": "/var/run/secrets/kubernetes.io/serviceaccount",
+      "kind": "GUEST_MOUNT_KIND_BIND",
+      "readOnly": true
+    },
+    {
+      "tagOrSource": "k3sm.pvc0",
+      "target": "/pgdata",
+      "kind": "GUEST_MOUNT_KIND_VIRTIOFS",
+      "idmap": true
+    },
+    {
+      "tagOrSource": "/run/k3sm/shares/k3sm.vols/cache",
+      "target": "/cache",
+      "kind": "GUEST_MOUNT_KIND_BIND",
+      "idmap": true
+    },
+    {
+      "target": "/dev/shm",
+      "kind": "GUEST_MOUNT_KIND_TMPFS",
+      "sizeLimitBytes": "67108864"
+    }
+  ],
+  "fsGroup": "2000",
+  "agentPort": 1024
+}
+
