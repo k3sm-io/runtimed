@@ -52,7 +52,8 @@ var ErrVMBootNotImplemented = errors.New("sandbox: vm backend boot not implement
 var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-process exec-shim path; route the pod via CreateVM")
 
 // GuestNetworkConfig is the runtimed-LOCAL network contract the vm backend applies
-// to a pod's Linux guest (M5.1): the rendered /etc/resolv.conf content plus the
+// to a pod's Linux guest (M5.1): the guest's DNS configuration — carried BOTH
+// structured (Nameservers/Searches/Options) and rendered (ResolvConf) — plus the
 // NAT-attachment advisory fields.
 //
 // It is an INTENTIONAL decoupling DTO. It mirrors darwin-net's podnet.GuestNetwork
@@ -65,17 +66,43 @@ var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-pr
 // data because runtimed cannot import darwin-net" (k3sm/pkg/provider/runtimed.go,
 // RuntimedConfig.DeniedUnixSocketPaths).
 //
-// The zero value networks no guest (no resolver injected, no NAT advisory). In
-// M5.1 it IS zero in production — no producer is wired yet; the end-to-end provider
-// wiring is the separate k3sm successor.
+// The DNS configuration is carried TWICE, deliberately. apis guest/v1's
+// ResolvConf message carries ONLY the structured form (nameservers/searches/
+// options — no rendered-string field), because the guest must render
+// /etc/resolv.conf itself to do it musl-safely: Alpine's musl resolver largely
+// ignores `options ndots`, so a search list that only works under a host-chosen
+// ndots is not portable and the guest has to be free to lay the directives out
+// for its own libc. A rendered-string-only carrier would force the host to
+// re-parse its own output to fill that message — exactly the round-trip the
+// proto shape exists to prevent. So the structured fields are the ones that
+// cross into the guest, and ResolvConf is retained as the host-side rendering
+// for diagnostics and for any consumer that wants the bytes verbatim. When both
+// are set they describe the SAME configuration; the producer (the k3sm provider)
+// is the one authority that fills them, and runtimed never re-derives one from
+// the other.
+//
+// The zero value networks no guest (no resolver injected, no NAT advisory) — the
+// inert value a vm pod gets when no Deps.Network implements the pkg/runtime
+// GuestNetworker seam.
 type GuestNetworkConfig struct {
-	// ResolvConf is the rendered /etc/resolv.conf CONTENT the guest provisioner pins
-	// into the Linux guest (the pkg/dns.GuestResolvConf output): a `nameserver` line
-	// (the cluster DNS VIP), the `search` list, and `options ndots:`. It is the
-	// OPERATIVE Linux-guest DNS artifact — the Darwin getaddrinfo DYLD shim that
-	// serves a host-process pod is meaningless in a Linux guest (no dyld; glibc/musl
-	// NSS instead), so the guest is pointed at the cluster resolver the standard
-	// Linux way. Empty means no resolver is injected.
+	// Nameservers are the guest's resolver addresses in query order — the
+	// STRUCTURED form that crosses into the guest as guest/v1 ResolvConf.nameservers
+	// (in practice the single cluster DNS VIP). Empty means no resolver is injected.
+	Nameservers []string
+	// Searches is the guest's resolv.conf search list, in order (guest/v1
+	// ResolvConf.searches). It must stand on its own: a musl guest may ignore the
+	// Options below, so correctness cannot depend on an ndots value.
+	Searches []string
+	// Options are the guest's resolver options, e.g. "ndots:5" (guest/v1
+	// ResolvConf.options). ADVISORY in effect: a musl guest ignores some of them,
+	// which is why Searches carries the load.
+	Options []string
+	// ResolvConf is the HOST-RENDERED /etc/resolv.conf content (the
+	// pkg/dns.GuestResolvConf output): a `nameserver` line (the cluster DNS VIP),
+	// the `search` list, and `options ndots:`. It is the same configuration the
+	// three structured fields above carry, kept for diagnostics and for a consumer
+	// that wants the bytes verbatim — the guest renders from the structured form
+	// instead (see the type doc). Empty means nothing was rendered host-side.
 	ResolvConf string
 	// PodIP is the pod's cluster identity, allocated from the node podCIDR by
 	// darwin-net's IPAM (mirrors podnet.GuestNetwork.PodIP). ADVISORY: an intended

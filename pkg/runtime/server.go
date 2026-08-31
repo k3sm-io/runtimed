@@ -27,7 +27,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
@@ -52,11 +51,7 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	}
 	r.mu.Unlock()
 
-	// No producer is wired in M5.1, so the guest network config is zero-valued here
-	// (it is inert on the host-process spine and zero on the vm route). The k3sm
-	// provider populates it in the separate successor; runtimed cannot import
-	// darwin-net, so it arrives as data (sandbox.GuestNetworkConfig).
-	p, reason, err := r.createPod(ctx, box, sandbox.GuestNetworkConfig{})
+	p, reason, err := r.createPod(ctx, box)
 	if err != nil {
 		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", err)
 		_ = r.removePodDir(box.GetPodId())

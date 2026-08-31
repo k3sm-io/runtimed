@@ -226,12 +226,13 @@ func (cp *containerProc) sidecar() bool {
 // backend with DYLD_INSERT_LIBRARIES carried through. It returns the started pod
 // or a typed failure.
 //
-// netcfg is the pod's guest network config (rendered resolv.conf + NAT advisory
-// fields). It is INERT on the host-process spine — a host process binds a /32 lo0
-// alias via r.network.Setup and never reads it — and flows ONLY to the vm route
-// (createVMPod), where it lands in VMSpec.Network. In M5.1 it is zero-valued in
-// production (no producer wired yet; the k3sm provider populates it later).
-func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg sandbox.GuestNetworkConfig) (_ *pod, _ runtimev1.FailureReason, retErr error) {
+// The pod's guest network config is NOT a parameter: it is derived on the vm
+// route alone, from the optional GuestNetworker seam a Deps.Network may implement
+// (see guestNetworkConfig). A caller-supplied value alongside that derivation
+// would be a second authority for one field with no stated precedence, and the
+// host-process spine has no use for it in any case — a host process binds a /32
+// lo0 alias via r.network.Setup and never reads a guest config.
+func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod, _ runtimev1.FailureReason, retErr error) {
 	sp := box.GetSandboxProfile()
 	if sp == nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -254,10 +255,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox, netcfg s
 	// Route the vm rung AWAY from the host-process (Mach-O) spine: a Linux guest has
 	// no host binary to resolve, ad-hoc codesign, signature-gate, SBPL-confine, or
 	// attach to lo0 — those steps are meaningless for it. The guest network config
-	// (netcfg) flows ONLY here, into the vm path; the host-process path below is
-	// reached only for the Seatbelt rungs and is byte-unchanged.
+	// is resolved ONLY beyond this branch, inside createVMPod; the host-process
+	// path below is reached only for the Seatbelt rungs and is byte-unchanged.
 	if selected == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
-		return r.createVMPod(ctx, box, sp, netcfg)
+		return r.createVMPod(ctx, box, sp)
 	}
 
 	ip, err := r.network.Setup(ctx, box.GetPodId())
@@ -591,12 +592,15 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // sizing (vm_vcpus / vm_memory_bytes) + rootfs + the virtiofs volume share plan
 // (B106, computed below) to the vm backend's CreateVM.
 //
-// netcfg is threaded INERT into VMSpec.Network: the rendered resolv.conf content
-// plus the NAT advisory fields the vm backend applies to the guest. This path runs
-// NO IPAM, NO supervisor.PodNetwork.Setup, and binds NO lo0 alias — a NAT-attached
-// guest is reached over the VZNATNetworkDeviceAttachment, never a host lo0 alias.
-// The config is plain data because runtimed cannot import darwin-net (see
-// sandbox.GuestNetworkConfig); the k3sm provider is the producer/mapper.
+// VMSpec.Network is resolved HERE, at the one boundary that consumes it, through
+// the optional GuestNetworker seam (guestNetworkConfig): the guest's DNS
+// configuration plus the NAT advisory fields the vm backend applies. This path
+// runs NO IPAM, NO supervisor.PodNetwork.Setup, and binds NO lo0 alias — a
+// NAT-attached guest is reached over the VZNATNetworkDeviceAttachment, never a
+// host lo0 alias. The config is plain data because runtimed cannot import
+// darwin-net (see sandbox.GuestNetworkConfig); the k3sm provider is the
+// producer/mapper. With no producer wired the value is the inert zero value and
+// the miss is logged, never passed on silently.
 //
 // The live VM boot is LAB-GATED: it needs a Virtualization.framework-capable Mac
 // signed with com.apple.security.virtualization, so CreateVM is a documented stub
@@ -605,7 +609,7 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // reached; on a capable host this is where the lab remainder lands — the
 // cmd/k3sm-vmhost helper lifecycle, the OCI-Linux-rootfs→bootable-root builder,
 // and guest-agent VM metering (see pkg/sandbox vm.go).
-func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile, netcfg sandbox.GuestNetworkConfig) (*pod, runtimev1.FailureReason, error) {
+func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile) (*pod, runtimev1.FailureReason, error) {
 	// Compute the virtiofs share-device plan from the box's volumes (B106) —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
@@ -639,7 +643,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
 		RootfsPath:  vmRootfs,
-		Network:     netcfg,
+		Network:     r.guestNetworkConfig(box.GetPodId()),
 		Volumes:     vmVolumePlan(plan),
 	}
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
