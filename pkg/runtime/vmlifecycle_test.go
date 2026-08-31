@@ -42,6 +42,12 @@ import (
 // vmPodBox builds a minimal vm-routed PodBox with a termination grace, which the
 // spine must thread to the helper as its stop budget.
 //
+// Its container names an OCI REFERENCE and carries a command, because both are
+// what a vm pod needs to resolve at all (M11.2-d11): the absolute-path
+// host-binary convention is refused on this path, and the harness's fake image
+// config declares no Entrypoint, so a container with no command of its own would
+// fail the merge rather than reach the backend.
+//
 // It takes the runtime for the same reason hostBinBox does: data_volume_path is
 // accepted only when it is byte-equal to one of this pod's own derived spellings
 // (B142), and the runtime under test is rooted at a t.TempDir().
@@ -60,7 +66,7 @@ func vmPodBox(rt *Runtime, podID string, graceSeconds int64) *runtimev1.PodBox {
 		},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Containers: []*runtimev1.Container{
-			{Name: "main", Image: "docker.io/library/alpine:3"},
+			{Name: "main", Image: "docker.io/library/alpine:3", Command: []string{"/bin/sleep", "3600"}},
 		},
 		TerminationGracePeriodSeconds: graceSeconds,
 	}

@@ -620,9 +620,10 @@ func TestManifestListPlatformSelection(t *testing.T) {
 			{"vm_guest_rosetta", vmPolicyRosetta(), []Platform{platLinuxARM64, platLinuxAMD64}},
 			{"seatbelt_exec_is_native", PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_EXEC}, []Platform{platDarwinARM64}},
 			{"uidjail_is_native", PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_UIDJAIL}, []Platform{platDarwinARM64}},
-			// The vm rows above have no live call site yet (createVMPod never
-			// pulls) — they are a contract test, not evidence that vm image
-			// selection works end to end.
+			// The vm rows above have a live call site (createVMPod pulls each
+			// container for its image config), but the ROSETTA one does not —
+			// both spines still pass GuestRosetta false. A contract test, not
+			// evidence that vm image selection works end to end.
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

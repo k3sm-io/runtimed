@@ -35,7 +35,11 @@ import (
 )
 
 // vmShareBox builds the standard multi-class vm-routed PodBox the share-plan
-// gate drives: every volume class (configMap, secret, projected-with-token,
+// gate drives. Every container names an OCI REFERENCE and carries a command:
+// the vm path refuses the absolute-path host-binary convention (a Mach-O cannot
+// run in a Linux guest) and merges argv against an image config the harness's
+// fake unpacker leaves empty, so both are what it takes to reach the backend.
+// The box carries: every volume class (configMap, secret, projected-with-token,
 // default-medium emptyDir, Memory-medium emptyDir, PVC), an init container
 // mounting the emptyDir, and TWO main containers with ASYMMETRIC mounts (main
 // mounts everything; aux mounts nothing).
@@ -60,13 +64,15 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 		},
 		InitContainers: []*runtimev1.Container{{
 			Name:         "setup",
-			Image:        "/bin/true",
+			Image:        "docker.io/library/busybox:1",
+			Command:      []string{"/bin/true"},
 			VolumeMounts: []*runtimev1.VolumeMount{{Name: "scratch", MountPath: "/work"}},
 		}},
 		Containers: []*runtimev1.Container{
 			{
-				Name:  "main",
-				Image: "/bin/sleep",
+				Name:    "main",
+				Image:   "docker.io/library/busybox:1",
+				Command: []string{"/bin/sleep", "3600"},
 				VolumeMounts: []*runtimev1.VolumeMount{
 					// cfg carries a sub_path so the wiring row pins the MAPPER
 					// carrying SubPath through to the VMBind (a mapping drop
@@ -80,7 +86,7 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 					{Name: "data", MountPath: "/var/lib/pg"},
 				},
 			},
-			{Name: "aux", Image: "/bin/sleep"},
+			{Name: "aux", Image: "docker.io/library/busybox:1", Command: []string{"/bin/sleep", "3600"}},
 		},
 	}
 }
@@ -427,7 +433,8 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		box.InitContainers = nil
 		box.Containers = []*runtimev1.Container{{
 			Name:         "main",
-			Image:        "/bin/sleep",
+			Image:        "docker.io/library/busybox:1",
+			Command:      []string{"/bin/sleep", "3600"},
 			VolumeMounts: []*runtimev1.VolumeMount{{Name: "mem", MountPath: "/cache", ReadOnly: true, SubPath: "warm"}},
 		}}
 		spec := mustPlanVM(t, rt, vmb, box)
@@ -515,8 +522,9 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		}
 		box.InitContainers = nil
 		box.Containers = []*runtimev1.Container{{
-			Name:  "main",
-			Image: "/bin/sleep",
+			Name:    "main",
+			Image:   "docker.io/library/busybox:1",
+			Command: []string{"/bin/sleep", "3600"},
 			VolumeMounts: []*runtimev1.VolumeMount{
 				{Name: "data-a", MountPath: "/a"},
 				{Name: "data-b", MountPath: "/b"},
