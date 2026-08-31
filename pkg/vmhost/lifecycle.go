@@ -134,7 +134,7 @@ type LifecycleOptions struct {
 // Lifecycle drives one virtual machine from creation to poweroff.
 //
 // The shutdown sequence is the whole reason it exists, and its ORDER is
-// load-bearing (m11-plan Resolution 5):
+// load-bearing (the M11 plan's Resolution 5):
 //
 //		SIGTERM (as ctx cancellation) -> agent.Stop(grace) -> wait <= grace for the
 //		machine to leave Running -> hard machine.Stop()
