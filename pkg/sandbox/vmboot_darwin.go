@@ -83,6 +83,18 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	if err != nil {
 		return fail(VMBootSpecWriteFailed, "", err)
 	}
+	// The BOOT CONTRACT, written into the k3sm.spec share root the line above
+	// created, and written BEFORE the spawn below: no guest exists while it is
+	// being composed, and the guest that does exist holds that share read-only
+	// at the VZ device. See writeGuestSpec for why those two facts — not the
+	// file mode — are what make it tamper-evident.
+	gs, err := buildGuestSpec(spec)
+	if err != nil {
+		return fail(VMBootSpecWriteFailed, "", err)
+	}
+	if _, err := writeGuestSpec(spec.PodDir, gs); err != nil {
+		return fail(VMBootSpecWriteFailed, "", err)
+	}
 
 	helper, err := b.vmHostFn()
 	if err != nil {

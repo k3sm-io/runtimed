@@ -35,6 +35,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protojson"
+
+	"k3sm.io/runtimed/pkg/guestinit"
 	"k3sm.io/runtimed/pkg/sandbox"
 
 	guestv1 "k3sm.io/apis/guest/v1"
@@ -328,6 +331,33 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 		if !health.GetReady() {
 			t.Errorf("guest reports ready=false")
 		}
+		// The BOOT CONTRACT actually reached the share the guest mounts. It is
+		// asserted POST-BOOT, on the real share root the helper exported, so it
+		// covers the one thing the unit tier cannot: that the directory
+		// CreateVM writes into is the directory the machine attaches under the
+		// k3sm.spec tag. It decodes with unknown fields rejected, exactly as
+		// the guest init reads it — a spec the guest would refuse must fail
+		// here, on a rig, rather than on the next lab's first real guest.
+		podDir, err := rt.podDir(podID)
+		if err != nil {
+			t.Fatalf("podDir: %v", err)
+		}
+		specPath := filepath.Join(podDir, guestinit.SpecShareTag, sandbox.VMGuestSpecFileName)
+		raw, err := os.ReadFile(specPath)
+		if err != nil {
+			t.Fatalf("the guest spec is missing from the k3sm.spec share root: %v", err)
+		}
+		var gs guestv1.GuestSpec
+		if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(raw, &gs); err != nil {
+			t.Fatalf("the written guest spec does not decode as a guestv1.GuestSpec: %v\n%s", err, raw)
+		}
+		if gs.GetAgentPort() != sandbox.VMAgentVsockPort {
+			t.Errorf("guest spec agent_port = %d, want %d — the guest would listen where the host does not dial",
+				gs.GetAgentPort(), sandbox.VMAgentVsockPort)
+		}
+		t.Logf("SMOKE leg 1 OK: %s decodes strictly (agent_port=%d, %d containers, %d mounts)",
+			specPath, gs.GetAgentPort(), len(gs.GetContainers()), len(gs.GetMounts()))
+
 		t.Logf("SMOKE leg 1 OK: Health via the daemon's GuestDialer ready=%v api=%q",
 			health.GetReady(), health.GetApiVersion())
 	})
