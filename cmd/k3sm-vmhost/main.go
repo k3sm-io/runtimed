@@ -20,6 +20,33 @@ limitations under the License.
 //
 // IT IS THE ONLY k3sm BINARY CARRYING com.apple.security.virtualization
 // (vmhost.entitlements). That is the whole reason it is a separate process: the
+//
+// # The entitlement set, and why it is exactly one key
+//
+// vmhost.entitlements grants com.apple.security.virtualization and nothing else.
+// That file is deliberately COMMENT-FREE, and the rationale lives here instead:
+// codesign parses entitlements with AMFI's XML reader, which is stricter than
+// plutil and REJECTS an XML comment. A commented plist lints clean under
+// `plutil -lint`, then fails at signing with "AMFIUnserializeXML: syntax error"
+// — and `codesign --verify` still reports the binary as validly signed, because
+// the signature is fine; it just carries no entitlements. The failure is silent:
+// VMBackend.Available() would simply report false on a perfectly capable Mac.
+// Keep the plist minimal; document here.
+//
+// Deliberately NOT granted, each for its own reason:
+//
+//   - com.apple.security.cs.allow-jit, allow-unsigned-executable-memory,
+//     disable-executable-page-protection — the code-running trio. The hypervisor
+//     runs the guest; this process does not execute guest code. Granting them
+//     would let the one entitled process map writable-executable memory, the most
+//     useful primitive an attacker can be handed.
+//   - com.apple.vm.networking — restricted (Apple grants it by request) and
+//     unnecessary: the guest is NAT-attached, never bridged. A pod does not need a
+//     LAN-visible address; the cluster reaches it through the node.
+//   - any Rosetta share entitlement — this helper attaches no Rosetta directory
+//     share and the node does not advertise the capability, so the entitlement
+//     would be authority for nothing.
+//
 // daemon parses images, serves a gRPC socket and talks to the provider, and none
 // of that should sit inside a process holding the authority to create virtual
 // machines. The daemon spawns one of these per vm pod and holds no virtualization

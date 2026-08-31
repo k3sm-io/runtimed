@@ -1,37 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  Entitlements for k3sm-vmhost, the per-pod VM host helper.
-
-  THIS IS THE ENTIRE SET, AND IT STAYS THAT WAY. The whole reason this helper is a
-  separate process is that exactly one k3sm binary should hold the authority to
-  create a virtual machine; every entitlement added here is authority that the
-  process parsing a tenant's guest console output also gains.
-
-  Deliberately NOT here, and each for its own reason:
-
-    * com.apple.security.cs.allow-jit
-    * com.apple.security.cs.allow-unsigned-executable-memory
-    * com.apple.security.cs.disable-executable-page-protection
-        The code-running trio. Virtualization.framework does NOT need them — the
-        hypervisor runs the guest, this process does not execute guest code — and
-        granting them would let the one entitled process map writable-executable
-        memory, which is the single most useful primitive an attacker can be given.
-
-    * com.apple.vm.networking
-        Restricted (Apple grants it by request) and unnecessary: the guest is
-        NAT-attached, never bridged. A pod does not need a LAN-visible address —
-        the cluster reaches it through the node.
-
-    * com.apple.security.virtualization.rosetta / any Rosetta share entitlement
-        This helper attaches no Rosetta directory share (see
-        pkg/vmhost.RosettaShareSupported and pkg/sandbox.VMHostRosettaShareSupported),
-        and the node does not advertise the capability. Adding the entitlement
-        without attaching the share would be authority for nothing.
-
-  Dev signing:  codesign -s - --entitlements cmd/k3sm-vmhost/vmhost.entitlements <binary>
-  Release signing is a separate, human decision (publisher identity + notarization).
--->
 <plist version="1.0">
 <dict>
 	<key>com.apple.security.virtualization</key>
