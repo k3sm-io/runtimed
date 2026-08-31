@@ -136,6 +136,22 @@ type pod struct {
 	// cannot cover a sidecar spawned AFTER the claim — RestartContainer re-claims
 	// the live sidecars of a still-terminal pod for exactly that reason.
 	sidecarTeardown bool
+
+	// B237 vm-pod LIVE TRANSPORT address state, guarded by mu. Both are zero for
+	// every host-process pod: a Seatbelt-confined pod has no guest, so nothing
+	// arms the watcher for one (armGuestLeaseWatcher, guestlease.go).
+	//
+	// guestLease is the address the guest agent last reported and this host
+	// accepted, in canonical form — PodStatus.guest_transport_address. It is
+	// non-empty IFF the most recent poll returned a valid lease; see
+	// watchGuestLease for why a failed poll clears it rather than leaving a
+	// stale address standing.
+	guestLease string
+	// guestLeaseStopped is closed when the pod's lease-watcher goroutine
+	// returns. It doubles as the arm latch (non-nil ⇒ armed), so the pod can
+	// never carry two watchers, and it is the observable edge that the watcher
+	// really stopped when the pod-lifetime context was cancelled.
+	guestLeaseStopped chan struct{}
 }
 
 // containerPIDs returns the pod's currently-running container PIDs (the memory
