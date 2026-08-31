@@ -106,6 +106,44 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 
 	grace := resolveGrace(req, p)
+
+	// THE VM ROUTE. A vm pod has no containerProc to signal — its containers are
+	// guest processes — so the two-phase mains/sidecars teardown below has
+	// nothing to iterate and would silently do nothing, leaving the helper (and
+	// its live machine) running for a pod the cluster has deleted. The whole
+	// teardown for one is: stop the helper, which runs the graceful sequence
+	// INSIDE the guest (agent Stop -> wait the budget -> halt the machine) and
+	// then dies.
+	//
+	// ONE GRACE BUDGET. The helper was given this pod's grace at spawn
+	// (-stop-grace) and the backend's escalation wait is never shorter than what
+	// the helper will honour, so the daemon cannot SIGKILL a helper that is still
+	// asking its guest to stop — the two-independently-clocked-timers power cut.
+	if p.isVM() {
+		if err := r.vmBackend.StopVM(ctx, req.GetPodId(), grace); err != nil {
+			// Log and continue, exactly as the host path treats a failed stop: a
+			// pod that will not die must never wedge its own deletion, and the
+			// helper's record is kept for the next startup sweep.
+			r.log.Warn("stop the vm host helper", "pod", req.GetPodId(), "err", err)
+		}
+		// End the pod-lifetime supervision AFTER the helper is stopped, so the
+		// exit watch's ctx arm wins the race against the exit it is about to
+		// see and an expected teardown is not reported as a crash.
+		if p.cancel != nil {
+			p.cancel()
+		}
+		st := r.podStatus(p)
+		st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
+		r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
+		// No network Teardown: the vm route allocated no lo0 alias (a NAT-attached
+		// guest is reached over its VZ attachment), and calling it would ask the
+		// IPAM to release something it never handed out.
+		if err := r.removePodDir(req.GetPodId()); err != nil {
+			r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
+		}
+		return &runtimev1.DeletePodResponse{}, nil
+	}
+
 	// The ONE pod-level grace budget (M10.2): anchor its deadline BEFORE the
 	// mains are stopped so the sidecars that follow get only the REMAINDER.
 	deadline := time.Now().Add(grace)

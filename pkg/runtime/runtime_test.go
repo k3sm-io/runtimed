@@ -91,9 +91,14 @@ func (b *recordingBackend) lastSpec() supervisor.LaunchSpec {
 }
 
 // fakeVMBackend is the runtime.VMBackend seam: its availability is settable and
-// CreateVM records the call + the spec it received. It returns the real
-// sandbox.ErrVMBootNotImplemented by default (the lab-gated stub behavior) so a
-// VM-routed pod surfaces a failure, mirroring production.
+// CreateVM records the call + the spec it received.
+//
+// It FAILS THE BOOT BY DEFAULT (sandbox.ErrVMBootNotImplemented), which is not
+// "the old stub behaviour" but a deliberate test default: most cases here assert
+// ROUTING — that a vm-requested pod reaches this backend and never touches the
+// host-process spine — and a default-succeeding fake would make each of them
+// additionally assemble a running vm pod with supervision goroutines they do not
+// mean to exercise. A case that wants a booted pod sets bootOK.
 type fakeVMBackend struct {
 	available bool
 	// rosettaShare is the B229 seam: whether the guests this node's VM host would
@@ -102,10 +107,24 @@ type fakeVMBackend struct {
 	// exercise the guest-Rosetta advertisement must say so explicitly.
 	rosettaShare bool
 
+	// bootOK makes CreateVM SUCCEED, so the pod assembly and teardown paths can
+	// be driven with no VM anywhere.
+	bootOK bool
+
 	mu          sync.Mutex
 	createCalls int
 	lastSpec    sandbox.VMSpec
 	err         error
+	stopCalls   []fakeVMStop
+	stopAllReq  int
+	reapCalls   int
+	done        map[string]chan struct{}
+}
+
+// fakeVMStop records one StopVM call: which pod, and with what grace.
+type fakeVMStop struct {
+	podID string
+	grace time.Duration
 }
 
 func (b *fakeVMBackend) Available() bool                  { return b.available }
@@ -116,11 +135,115 @@ func (b *fakeVMBackend) CreateVM(_ context.Context, spec sandbox.VMSpec) error {
 	b.createCalls++
 	b.lastSpec = spec
 	err := b.err
+	ok := b.bootOK
+	if ok {
+		if b.done == nil {
+			b.done = map[string]chan struct{}{}
+		}
+		if _, exists := b.done[spec.PodID]; !exists {
+			b.done[spec.PodID] = make(chan struct{})
+		}
+	}
 	b.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	if ok {
+		return nil
+	}
 	return sandbox.ErrVMBootNotImplemented
+}
+
+func (b *fakeVMBackend) StopVM(_ context.Context, podID string, grace time.Duration) error {
+	b.mu.Lock()
+	b.stopCalls = append(b.stopCalls, fakeVMStop{podID: podID, grace: grace})
+	ch := b.done[podID]
+	delete(b.done, podID)
+	b.mu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch) // a stopped helper's exit edge fires, as the real one's does
+		}
+	}
+	return nil
+}
+
+func (b *fakeVMBackend) StopAllVMs(_ context.Context) error {
+	b.mu.Lock()
+	b.stopAllReq++
+	chans := make([]chan struct{}, 0, len(b.done))
+	for _, ch := range b.done {
+		chans = append(chans, ch)
+	}
+	b.done = map[string]chan struct{}{}
+	b.mu.Unlock()
+	for _, ch := range chans {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+	return nil
+}
+
+func (b *fakeVMBackend) ReapOrphanVMs() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reapCalls++
+	return nil
+}
+
+func (b *fakeVMBackend) VMDone(podID string) (<-chan struct{}, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch, ok := b.done[podID]
+	return ch, ok
+}
+
+func (b *fakeVMBackend) VMHelperOutput(string) string { return "(fake helper)" }
+
+// killHelper simulates the helper dying on its own — a hypervisor crash or a
+// guest panic — WITHOUT a StopVM, which is the case the exit watch exists for.
+//
+// It closes the exit edge but does NOT deregister the pod, matching the real
+// backend: a dead helper stays in the handle map until a teardown removes it,
+// which is what lets the exit watch still read VMHelperOutput for the diagnosis.
+// Deregistering here would also make the fake racy — a watch that called VMDone
+// after the delete would see no helper and return silently.
+func (b *fakeVMBackend) killHelper(podID string) {
+	b.mu.Lock()
+	ch := b.done[podID]
+	b.mu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+}
+
+// stops returns the recorded StopVM calls.
+func (b *fakeVMBackend) stops() []fakeVMStop {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]fakeVMStop(nil), b.stopCalls...)
+}
+
+// stopAlls / reaps return the shutdown and startup sweep call counts.
+func (b *fakeVMBackend) stopAlls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stopAllReq
+}
+
+func (b *fakeVMBackend) reaps() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reapCalls
 }
 
 func (b *fakeVMBackend) created() (int, sandbox.VMSpec) {
