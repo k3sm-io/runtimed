@@ -134,10 +134,35 @@ type VMBackend interface {
 	Available() bool
 	// Name identifies the backend for logging/diagnostics.
 	Name() string
-	// CreateVM boots the pod's Linux guest from spec. In M5.1 it is a lab-gated
-	// stub returning sandbox.ErrVMBootNotImplemented (the live boot needs a
-	// VZ-capable, entitled Mac).
+	// CreateVM boots the pod's Linux guest from spec and returns once the guest
+	// agent has answered a Health RPC. An error means no helper and no machine
+	// were left behind (CreateVM is atomic in effect), and its message names the
+	// boot sub-cause and the pod's console log.
 	CreateVM(ctx context.Context, spec sandbox.VMSpec) error
+	// StopVM terminates the pod's vm host helper within grace and releases what
+	// the vm spine recorded for it. Idempotent: a pod with no live helper
+	// succeeds, which is what makes DeletePod idempotent for a vm pod too.
+	StopVM(ctx context.Context, podID string, grace time.Duration) error
+	// StopAllVMs stops every live helper CONCURRENTLY, for daemon shutdown. It
+	// is on the seam rather than open-coded in Close because the fan-out and the
+	// per-helper grace belong with the handles, and because a vm pod's helper
+	// must NOT survive the daemon (the opposite of a host-process pod, which
+	// survives by design — see Close).
+	StopAllVMs(ctx context.Context) error
+	// ReapOrphanVMs kills every helper a previous daemon run left behind, before
+	// this one serves CreatePod. A SETSID helper reparents to launchd when the
+	// daemon is `kill -9`ed, and an orphaned one cannot be adopted — there is no
+	// way to re-establish the readiness handshake with a running guest — so the
+	// sweep always kills.
+	ReapOrphanVMs() error
+	// VMDone returns the edge closed when the pod's helper exits, and whether
+	// the pod has a live helper. It is what lets the runtime notice a post-boot
+	// hypervisor crash instead of leaving the pod at Running forever.
+	VMDone(podID string) (<-chan struct{}, bool)
+	// VMHelperOutput returns the retained tail of a live helper's output — the
+	// diagnosis for a helper that died after readiness, where the boot-time
+	// error path is long gone.
+	VMHelperOutput(podID string) string
 	// GuestRosettaShareSupported reports whether the guests this node builds carry
 	// a Rosetta directory share — i.e. whether a linux/amd64 ELF could actually
 	// execute in one of them. It is a SECOND, INDEPENDENT term of the node's
@@ -567,8 +592,19 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if vmBackend == nil {
 		// Available() is false unless this host has Virtualization.framework + the
 		// com.apple.security.virtualization entitlement, so a vm-requested pod fails
-		// closed off a capable host (and the live boot is the lab-gated remainder).
-		vmBackend = sandbox.NewVMBackend()
+		// closed off a capable host.
+		//
+		// The state root is ALWAYS supplied: it is where the vm orphan store lives
+		// (<Root>/vmreap), and a backend without one cannot record the helpers it
+		// spawns — so a `kill -9`ed daemon would leave guests running that no
+		// later start could find. No guest-artifact locator is wired here: that
+		// feeder is its own deliverable, and until it lands CreateVM fails every
+		// vm pod closed with sandbox.ErrGuestArtifactsUnavailable rather than
+		// booting an unpinned kernel off a guessed path.
+		vmBackend = sandbox.NewVMBackend(
+			sandbox.WithStateRoot(cfg.Root),
+			sandbox.WithLogger(log),
+		)
 	}
 	guestDialer := deps.GuestDialer
 	if guestDialer == nil {

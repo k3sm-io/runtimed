@@ -21,9 +21,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // fakeMachine is the machineRunner seam: it records the order of the calls it
@@ -189,6 +192,45 @@ func TestLifecycleStateMachine(t *testing.T) {
 		}
 		if lc.State() != StateFailed {
 			t.Errorf("state = %v, want Failed", lc.State())
+		}
+	})
+
+	t.Run("a-failed-start-is-still-torn-down", func(t *testing.T) {
+		// THE LEAK THIS CLOSES. The darwin runner races the framework's boot
+		// against ctx, so a Start that reports ctx.Err() can have left a machine
+		// that goes on to finish booting — a VM with no supervisor, outliving the
+		// process that made it. Run is the last holder of the runner, so if it
+		// returns without a Stop nothing can ever halt that machine.
+		rec := &callLog{}
+		m := newFakeMachine(rec)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		m.startErr = ctx.Err()
+		lc := NewLifecycle(m, &fakeAgent{rec: rec}, LifecycleOptions{Logger: quietLogger()})
+		if err := lc.Run(ctx); err == nil {
+			t.Fatal("Run returned nil on a cancelled start")
+		}
+		got := rec.snapshot()
+		if len(got) != 2 || got[0] != "machine.Start" || got[1] != "machine.Stop" {
+			t.Errorf("calls = %v; want [machine.Start machine.Stop] — a cancelled Start must force the teardown, or a half-booted machine outlives the helper", got)
+		}
+		if lc.State() != StateFailed {
+			t.Errorf("state = %v, want Failed", lc.State())
+		}
+	})
+
+	t.Run("a-failed-start-whose-stop-also-fails-still-reports-the-start-error", func(t *testing.T) {
+		// The teardown is best-effort SALVAGE, not a second failure mode: the
+		// caller needs to read WHY the machine could not start, and a stop error
+		// on a machine that never started would bury it.
+		rec := &callLog{}
+		m := newFakeMachine(rec)
+		m.startErr = errors.New("no entitlement")
+		m.stopErr = errors.New("nothing to halt")
+		lc := NewLifecycle(m, &fakeAgent{rec: rec}, LifecycleOptions{Logger: quietLogger()})
+		err := lc.Run(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "no entitlement") {
+			t.Errorf("Run err = %v; want the START error, not the salvage stop's", err)
 		}
 	})
 
@@ -441,5 +483,32 @@ func assertCalls(t *testing.T, got, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("calls = %v, want %v (differ at %d)", got, want, i)
 		}
+	}
+}
+
+// TestStopGraceBoundsAreSingleValued binds this helper's grace bounds to the
+// daemon's mirrored copies, exactly as TestRosettaShareCapabilityIsSingleValued
+// binds the Rosetta capability and for the same import reason: pkg/sandbox is
+// linked into the daemon and this package imports Code-Hex/vz, so neither may
+// import the other, and a test that can import both is where the agreement lives.
+//
+// A DISAGREEMENT IS THE POWER-CUT BUG. The daemon computes the grace the helper
+// will actually honour (sandbox.clampStopGrace, applying these same two bounds)
+// and makes its own SIGTERM->SIGKILL escalation at least that long. If the
+// daemon's ceiling were the LOWER of the two, it would SIGKILL a helper still
+// inside its graceful sequence — the guest asked to stop, mid-sync — which is the
+// hard stop the whole grace protocol exists to avoid. If it were the higher, a
+// deleted pod's teardown would idle for the difference on every vm pod.
+func TestStopGraceBoundsAreSingleValued(t *testing.T) {
+	if DefaultStopGrace != sandbox.VMHostDefaultStopGrace {
+		t.Errorf("vmhost.DefaultStopGrace = %s but sandbox.VMHostDefaultStopGrace = %s; "+
+			"the daemon would time its escalation against a budget this helper never uses",
+			DefaultStopGrace, sandbox.VMHostDefaultStopGrace)
+	}
+	if MaxStopGrace != sandbox.VMHostMaxStopGrace {
+		t.Errorf("vmhost.MaxStopGrace = %s but sandbox.VMHostMaxStopGrace = %s; "+
+			"a lower daemon-side ceiling SIGKILLs a helper mid-graceful-stop (a power cut for the guest); "+
+			"a higher one idles every vm pod's teardown by the difference",
+			MaxStopGrace, sandbox.VMHostMaxStopGrace)
 	}
 }

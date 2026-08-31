@@ -602,13 +602,19 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // producer/mapper. With no producer wired the value is the inert zero value and
 // the miss is logged, never passed on silently.
 //
-// The live VM boot is LAB-GATED: it needs a Virtualization.framework-capable Mac
-// signed with com.apple.security.virtualization, so CreateVM is a documented stub
-// returning sandbox.ErrVMBootNotImplemented. On a non-entitled host SelectBackend
-// already fails closed (vmBackend.Available() == false) before this path is
-// reached; on a capable host this is where the lab remainder lands — the
-// cmd/k3sm-vmhost helper lifecycle, the OCI-Linux-rootfs→bootable-root builder,
-// and guest-agent VM metering (see pkg/sandbox vm.go).
+// The VM IS LIVE by the time this returns: CreateVM writes the machine
+// description, spawns the k3sm-vmhost helper and waits for the guest agent to
+// answer a Health RPC, so a nil error means a booted guest. On a non-entitled
+// host SelectBackend already failed the pod closed (vmBackend.Available() ==
+// false) long before this path was reached.
+//
+// The pod this assembles has NO containerProc, and that is the shape of a vm pod
+// rather than an omission: its containers are guest processes, so their statuses
+// arrive over the agent's ContainerEvents stream (watchGuestContainerEvents) and
+// its metering is on-demand from the agent (vmPodStats). Two host-side
+// supervision goroutines are rooted at the pod-lifetime supCtx: that event fold,
+// and the helper exit watch, which is what keeps a post-boot hypervisor crash
+// from leaving the pod at Running forever.
 func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile) (*pod, runtimev1.FailureReason, error) {
 	// Compute the virtiofs share-device plan from the box's volumes (B106) —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
@@ -638,6 +644,16 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
 	}
+	// The agent socket is derived HERE, by the same function the daemon's own
+	// GuestDialer uses, and stamped onto the spec — so the socket the helper
+	// binds and the socket Exec/GetLogs dial are one string by construction
+	// rather than by two derivations agreeing. It deliberately lives outside the
+	// pod dir; see guestAgentSocket for why that is a layout property.
+	agentSocket, err := guestAgentSocket(r.cfg.Root, box.GetPodId())
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
 	spec := sandbox.VMSpec{
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
@@ -645,16 +661,50 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		RootfsPath:  vmRootfs,
 		Network:     r.guestNetworkConfig(box.GetPodId()),
 		Volumes:     vmVolumePlan(plan),
+		PodDir:      podDir,
+		// ONE grace budget for both ends of the shutdown: the helper is given
+		// the pod's own termination grace, and DeletePod's escalation never
+		// waits less than what the helper will honour. Two independently-clocked
+		// timers across the process boundary is the power-cut bug.
+		AgentSocketPath: agentSocket,
+		StopGrace:       time.Duration(box.GetTerminationGracePeriodSeconds()) * time.Second,
+	}
+	// The pod dir must exist before the helper is pointed at a spec inside it.
+	// The vm path creates it HERE rather than sharing the host-process spine's
+	// MkdirAll, because that spine also provisions a tmp dir, an image
+	// reachability record and a rootfs the guest composes for itself.
+	if err := os.MkdirAll(podDir, 0o750); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("create pod dir %s: %w", podDir, err)
 	}
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
+		// Every sub-cause is SANDBOX_SETUP at the enum level — the runtime/v1
+		// taxonomy has no finer bucket for "the guest did not come up" — and the
+		// error's own message names which one and where the console log is.
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err)
 	}
-	// Unreachable in M5.1 (CreateVM is a lab-gated stub): when the live boot lands,
-	// CreateVM returns nil and this is replaced by the running-VM pod assembly
-	// (phase RUNNING, guest-agent metering wired in place of the M2.5 sampler).
-	return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
-		fmt.Errorf("pod %s: vm backend lifecycle not implemented", box.GetPodId())
+
+	// The guest is up. Assemble the pod and start its two supervision goroutines.
+	//
+	// supCtx is rooted at context.Background(), NOT the CreatePod request ctx,
+	// for the reason the host-process spine gives: the RPC's ctx is cancelled
+	// when the unary call returns, and these goroutines live for the pod.
+	supCtx, cancel := context.WithCancel(context.Background())
+	p := &pod{
+		box:     box,
+		backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_VM,
+		phase:   runtimev1.PodPhase_POD_PHASE_RUNNING,
+		supCtx:  supCtx,
+		cancel:  cancel,
+	}
+	// NO MEMORY SAMPLER, and no armMemorySampler call anywhere on this path. A vm
+	// pod's memory ceiling is the hypervisor's VZ memorySize, and its OOM truth
+	// is the guest cgroup's, reported over ContainerEvents; a host rusage sample
+	// would measure the vmhost helper (B107).
+	go r.watchVMPodEvents(supCtx, p)
+	go r.watchVMHelperExit(supCtx, p)
+	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
 
 // vmVolumePlan maps the pkg/mount share plan onto the sandbox DTO, value for

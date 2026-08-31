@@ -52,6 +52,20 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 			"pod %s not found", req.GetPodId()), nil
 	}
+	// THE VM FORK, AT THE TOP AND BEFORE ANY .proc TOUCH. A vm pod's containers
+	// are guest processes with no host containerProc, so every line below —
+	// findContainer, the process-group GracefulStop, the re-spawn through
+	// startContainer — operates on state a vm pod does not have. Restarting one
+	// container inside a running guest needs a guest-agent verb that guest/v1
+	// does not define, so the honest answer is a typed UNIMPLEMENTED rather than
+	// a silent no-op that would report a bumped restart_count for a container
+	// nothing restarted. The provider reads Unimplemented and does not retry.
+	if p.isVM() {
+		return restartFailure(codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
+			"restart %s/%s: a vm pod's containers run inside its guest, and guest/v1 defines no per-container restart; recreate the pod",
+			req.GetPodId(), req.GetContainer()), nil
+	}
+
 	oldCP := r.findContainer(p, req.GetContainer())
 	if oldCP == nil {
 		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,

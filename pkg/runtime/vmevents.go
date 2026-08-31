@@ -19,7 +19,9 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"time"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -171,4 +173,120 @@ func declaredContainerSpec(box *runtimev1.PodBox, name string) *runtimev1.Contai
 		}
 	}
 	return nil
+}
+
+// watchVMPodEvents keeps a vm pod's guest-container statuses fed for the pod's
+// whole life, restarting the subscription when the stream ends.
+//
+// THE RETRY IS THIS FUNCTION'S JOB, not watchGuestContainerEvents'. That function
+// deliberately returns a stream error rather than retrying, because only the
+// caller knows whether a dead agent means "resubscribe" or "the VM is gone" — and
+// here the answer is knowable: the helper's exit watch owns "the VM is gone", so
+// anything this loop sees while the helper is alive is a stream that should be
+// re-established. Without the retry, one transient agent hiccup would silence a
+// pod's container statuses — including its ONLY source of OOMKilled — for the
+// rest of its life, with nothing to indicate it had stopped listening.
+//
+// The delay between attempts is what keeps a guest whose agent is permanently
+// wedged from spinning the daemon at the speed of a failed dial.
+func (r *Runtime) watchVMPodEvents(ctx context.Context, p *pod) {
+	podID := p.box.GetPodId()
+	for {
+		if err := r.watchGuestContainerEvents(ctx, p); err != nil {
+			if ctx.Err() != nil {
+				return // the pod is being torn down; not a failure
+			}
+			r.log.Warn("the guest container-event stream ended; resubscribing",
+				"pod", podID, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(guestEventResubscribeDelay):
+		}
+	}
+}
+
+// guestEventResubscribeDelay paces the container-event resubscription. It is
+// short enough that a transient agent restart costs at most one interval of
+// missed events, and long enough that a permanently wedged guest costs one dial
+// per second rather than a busy loop.
+const guestEventResubscribeDelay = time.Second
+
+// watchVMHelperExit fails a vm pod when its host helper dies after readiness.
+//
+// WITHOUT IT A POD WEDGES AT RUNNING. Everything that reports a vm pod's health
+// flows through the guest agent, and the agent is reached through the helper — so
+// when the hypervisor dies, the guest panics, or the helper is killed, the pod's
+// containers simply stop being updated and the pod sits Running forever with no
+// host-side event. The kubelet analog is a container runtime noticing its own
+// child exited; here the child IS the machine.
+//
+// It reports the pod FAILED with the helper's retained output, which is the same
+// evidence a pre-ready failure would have carried — read while the handle is
+// still registered, because StopVM drops it. A clean daemon shutdown does not
+// come through here: Close cancels supCtx first, and the ctx arm wins.
+func (r *Runtime) watchVMHelperExit(ctx context.Context, p *pod) {
+	podID := p.box.GetPodId()
+	done, ok := r.vmBackend.VMDone(podID)
+	if !ok {
+		// No live helper is registered for a pod that just booted one: the only
+		// way here is a concurrent teardown, which owns the pod's fate.
+		return
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-done:
+	}
+	// Re-check the teardown edge: a DeletePod stops the helper and cancels
+	// supCtx, and the two are observed in an arbitrary order, so an expected
+	// stop can arrive here as an exit. Reporting that as a crash would make
+	// every vm pod deletion look like a failure.
+	if ctx.Err() != nil {
+		return
+	}
+	output := r.vmBackend.VMHelperOutput(podID)
+	r.log.Error("the vm host helper exited while its pod was running; the guest is gone",
+		"pod", podID, "helper_output", output)
+	r.failVMPod(p, "VMHostExited",
+		fmt.Sprintf("the vm host helper for pod %s exited unexpectedly, so its guest is gone; helper output: %s", podID, output))
+}
+
+// failVMPod transitions a running vm pod to Failed and publishes the change.
+//
+// Every guest container still believed to be Running is terminated with the same
+// reason, because a pod whose machine is gone cannot have a running container in
+// it — and a status that left them Running would be read by the provider as a
+// healthy pod behind a failed one, which is exactly the wedge this path exists to
+// prevent. The publish happens OUTSIDE p.mu (the re-entrancy rule).
+func (r *Runtime) failVMPod(p *pod, reason, message string) {
+	at := nowProto()
+	p.mu.Lock()
+	if p.phase == runtimev1.PodPhase_POD_PHASE_FAILED || p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED {
+		p.mu.Unlock()
+		return // already terminal; do not overwrite the first, more specific reason
+	}
+	p.phase = runtimev1.PodPhase_POD_PHASE_FAILED
+	p.reason = reason
+	p.message = message
+	for _, name := range p.guestContainerOrder {
+		st := p.guestContainers[name]
+		if st == nil || st.GetState().GetRunning() == nil {
+			continue
+		}
+		st.State = &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
+			// Exit code 255 is the "terminated for a reason the runtime could
+			// not observe" convention the host-process path uses for a
+			// container whose status was never collected: the guest is gone, so
+			// no real code exists and inventing 0 would read as success.
+			ExitCode:   255,
+			FinishedAt: at,
+			Reason:     reason,
+			Message:    message,
+		}}
+		st.Ready = false
+	}
+	p.mu.Unlock()
+	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 }

@@ -57,7 +57,9 @@ limitations under the License.
 // This package does not pull, unpack or verify images; does not allocate
 // addresses; does not talk to the apiserver; and does not decide what the pod
 // contains. It also does not START anything on its own: cmd/k3sm-vmhost owns the
-// process lifetime, and the runtime spine that spawns that helper is a separate
-// deliverable — pkg/sandbox's CreateVM still returns ErrVMBootNotImplemented, so
-// nothing in production reaches this package yet.
+// process lifetime, and the daemon-side spine that spawns that helper — writes
+// the VMHostSpec, waits for the guest agent's Health, and stops it again — lives
+// in pkg/sandbox's CreateVM / StopVM (M11.2-d9). Nothing in this package reaches
+// back across that boundary: the daemon builds the spec against guest/v1
+// directly, precisely so it never imports this one.
 package vmhost
