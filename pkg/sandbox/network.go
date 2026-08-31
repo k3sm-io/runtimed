@@ -40,10 +40,15 @@ import (
 //
 // What the grammar DOES support: per-PORT scoping compiles and enforces
 // precisely ((local ip "*:8899") allowed :8899 and denied :8898), and
-// localhost-host filters compile. Whether `localhost` matches lo0-ALIASED
-// per-pod addresses is UNKNOWN without a root-gated lab probe, so
-// port-scoped and localhost-scoped TIGHTENINGS are a named follow-up —
-// not emitted here.
+// localhost-host filters compile. RESOLVED (B215 P3 probe, 2026-08-31,
+// through the real execshim/libsandbox path): a port- or localhost-scoped
+// tightening is foreclosed, not merely deferred. Scoping network-bind ALONE
+// is inert — this stanza's separate, unscoped (allow network-inbound) still
+// authorizes the bind, so any tightening has to scope BOTH operations to
+// change anything. And once both ARE scoped, `localhost` matches every
+// address the host owns — the lo0-aliased per-pod address, the LAN address,
+// and the wildcard alike — so a localhost-scoped filter provides no per-pod
+// isolation even then. Nothing narrower than the stanza below is expressible.
 //
 // Honest consequence: for a networked pod, networking allowed means
 // networking ALLOWED — unfiltered outbound + bind under the profile's
