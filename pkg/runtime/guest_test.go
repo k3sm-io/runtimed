@@ -42,11 +42,22 @@ import (
 
 // --- in-process guest agent ----------------------------------------------
 
-// fakeGuestAgent is a real guest/v1 GuestAgent server, reached over a real gRPC
-// connection on a bufconn listener. Nothing about the route is stubbed: the
+// fakeGuestAgent is a SCRIPTABLE guest/v1 GuestAgent server, reached over a real
+// gRPC connection on a bufconn listener. Nothing about the route is stubbed: the
 // daemon's own client conn, codec, and stream plumbing run end to end — only the
 // SOCKET is replaced, which is the whole point of the GuestDialer seam (there is
 // no VM, no vmhost, and no vsock anywhere in this file).
+//
+// It is scriptable BY DESIGN, and that is now its only job: it can be made to
+// misbehave in ways a correct agent never would — an oversized frame, a stream
+// that ends mid-exec, an undeclared container name — which is what these tests are
+// about, and which the shipped agent cannot be asked to do.
+//
+// The complementary assertion, that the daemon's routes and the SHIPPED
+// k3sm.io/runtimed/pkg/guestagent server agree about the contract, is
+// TestGuestAgentServesTheHostRoutes (guestagent_fullstack_test.go). Until that
+// existed this file's fakes were the only far end anywhere, so the routes were
+// verified only against a double written to satisfy them; they no longer are.
 //
 // bootedPod is the single pod this guest "booted": every request whose pod_id is
 // not that id is REJECTED, exactly as guest.proto requires ("the agent MUST
@@ -166,8 +177,9 @@ func startFakeGuestAgent(t *testing.T, agent guestv1.GuestAgentServer) (GuestDia
 //
 // It builds the pod directly instead of going through CreatePod because the vm
 // pod ASSEMBLY is a different deliverable: createVMPod still fails at the
-// lab-gated CreateVM (M11.2-d2's live boot), so no CreatePod call can produce
-// one yet. What the route keys off — pod.backend == SANDBOX_BACKEND_VM, the
+// lab-gated CreateVM (sandbox.ErrVMBootNotImplemented), so no CreatePod call can
+// produce one yet — the machine builder (pkg/vmhost, cmd/k3sm-vmhost) exists, but
+// the runtime spine that spawns it is a later wave. What the route keys off — pod.backend == SANDBOX_BACKEND_VM, the
 // resolved backend createVMPod records when it assembles a running pod — is set
 // here exactly as that assembly will set it.
 func addVMPod(t *testing.T, rt *Runtime, podID string, containers ...string) *pod {
@@ -734,6 +746,30 @@ func TestGuestAgentSocketIsRuntimedPrivate(t *testing.T) {
 			if got, err := guestAgentSocket(root, id); err == nil {
 				t.Errorf("guestAgentSocket(%q) = %q, want an error: no socket path may be derived from an unvalidated id", id, got)
 			}
+		}
+	})
+
+	t.Run("fits-in-sun_path", func(t *testing.T) {
+		// A darwin sockaddr_un carries 104 bytes of sun_path INCLUDING the
+		// terminator, and bind(2) reports an over-long path as the famously
+		// unhelpful EINVAL — not ENAMETOOLONG. The derived path is
+		// <Root>/run/vm/<podID>/agent.sock, so a long pod id can overflow it on a
+		// real node, and the failure would look like a broken helper rather than a
+		// path-length problem.
+		//
+		// The pod id is a kube UID (36 characters), so the production path has
+		// generous headroom; the assertion is against a future layout change that
+		// spends it — a deeper run tree, a longer socket name, an id scheme with
+		// namespace and name in it.
+		const sunPathMax = 104
+		longestID := strings.Repeat("a", 63) // the longest label ParsePodID accepts
+		sock, err := guestAgentSocket(root, longestID)
+		if err != nil {
+			t.Fatalf("guestAgentSocket(%q): %v", longestID, err)
+		}
+		if len(sock)+1 > sunPathMax {
+			t.Errorf("the derived agent socket is %d bytes (%q); with the NUL terminator that exceeds sun_path's %d, "+
+				"and bind(2) would fail with EINVAL rather than naming the length", len(sock), sock, sunPathMax)
 		}
 	})
 }
