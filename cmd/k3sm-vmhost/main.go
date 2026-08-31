@@ -107,6 +107,7 @@ func run(log *slog.Logger) error {
 		specPath    = flag.String("spec", "", "path to the vmhost.spec.json this VM is built from (required)")
 		agentSocket = flag.String("agent-socket", "", "path of the runtimed-private unix socket proxied to the guest agent (required)")
 		consoleLog  = flag.String("console-log", "", "path of the size-capped guest console log; empty discards the console")
+		stopGrace   = flag.Duration("stop-grace", 0, "graceful-termination budget for the guest on SIGTERM; 0 uses the package default, and anything above the ceiling is clamped")
 	)
 	flag.Parse()
 
@@ -160,7 +161,20 @@ func run(log *slog.Logger) error {
 	proxied := make(chan error, 1)
 	go func() { proxied <- proxy.Serve(ctx) }()
 
-	lc := vmhost.NewLifecycle(runner, vmhost.NewAgentStopper(dial), vmhost.LifecycleOptions{Logger: log})
+	// ONE GRACE BUDGET, ISSUED BY THE DAEMON. The pod's
+	// terminationGracePeriodSeconds is a promise made to the workload, and the
+	// daemon is the only process that knows it — so it is threaded in here rather
+	// than defaulted twice. Without this flag the helper would run its own
+	// 20-second default while the daemon's DeletePod escalated on the pod's grace,
+	// two independently-clocked timers across a process boundary: whenever the
+	// daemon's was the shorter one it SIGKILLed the helper mid-graceful-stop, and
+	// a hard stop with a guest still writing is the power cut the grace period
+	// exists to prevent. NewLifecycle clamps the value to MaxStopGrace, so an
+	// over-long pod grace is bounded here rather than trusted.
+	lc := vmhost.NewLifecycle(runner, vmhost.NewAgentStopper(dial), vmhost.LifecycleOptions{
+		Grace:  *stopGrace,
+		Logger: log,
+	})
 	runErr := lc.Run(ctx)
 
 	// The proxy is drained BEFORE returning: its Serve returns only once every
