@@ -355,6 +355,16 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 			t.Errorf("guest spec agent_port = %d, want %d — the guest would listen where the host does not dial",
 				gs.GetAgentPort(), sandbox.VMAgentVsockPort)
 		}
+		// The CONTAINERS reached the share too (M11.2-d11). The lab guest runs
+		// none of them — it answers Health and nothing else, by design — so this
+		// is deliberately a spec assertion and not a workload one: on a real rig
+		// the file the guest mounts must name the pod's own containers, because
+		// an empty list is the pre-d11 state the guest init refuses outright.
+		if len(gs.GetContainers()) != 1 || gs.GetContainers()[0].GetName() != "main" {
+			t.Errorf("guest spec containers = %v, want exactly the pod's own \"main\"", gs.GetContainers())
+		} else if argv := gs.GetContainers()[0].GetCommand(); len(argv) == 0 {
+			t.Error("the pod's container crossed with an empty argv; the guest would have nothing to exec")
+		}
 		t.Logf("SMOKE leg 1 OK: %s decodes strictly (agent_port=%d, %d containers, %d mounts)",
 			specPath, gs.GetAgentPort(), len(gs.GetContainers()), len(gs.GetMounts()))
 

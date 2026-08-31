@@ -99,9 +99,7 @@ func newGuestNetworkRuntime(t *testing.T, pn supervisor.PodNetwork) (*Runtime, *
 
 // vmBackedBox is a vm-RuntimeClass PodBox for pod id podID.
 func vmBackedBox(rt *Runtime, podID string) *runtimev1.PodBox {
-	box := hostBinBox(rt, podID)
-	box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
-	return box
+	return vmPodBox(rt, podID, 0)
 }
 
 // distinctiveGuestNetwork is a guest network config whose every field is

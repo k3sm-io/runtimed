@@ -816,8 +816,10 @@ func TestCreatePodFailClosed(t *testing.T) {
 // TestCreatePodVMRoutingBypassesHostProcessSteps is the M5.1 routing proof: a pod
 // whose SandboxProfile.backend is SANDBOX_BACKEND_VM, on a host where the vm
 // backend is available, routes to vmBackend.CreateVM and runs NONE of the
-// host-process (Mach-O) steps — no image pull / resolveBinary, no ad-hoc sign /
-// gateSignature, no WrapCommand exec-shim, no posix_spawn. The symmetric control
+// host-process (Mach-O) steps — no resolveBinary, no ad-hoc sign /
+// gateSignature, no WrapCommand exec-shim, no posix_spawn. It DOES pull, since
+// M11.2-d11: the guest merges nothing, so each container's image config is read
+// host-side — but nothing downstream of the pull on the host-process spine runs. The symmetric control
 // case proves an UNSPECIFIED (host-process) pod still drives exactly those steps
 // (byte-unchanged), and a vm-requested pod on a host WITHOUT the vm backend fails
 // closed (never downgrades, never routes to CreateVM).
@@ -833,8 +835,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		cfg, d := vmPodConfig(t, Deps{Signer: signer, Spawner: sp, Backend: backend, VMBackend: vmb})
 		rt := newTestRuntimeCfg(t, cfg, d)
 
-		box := hostBinBox(rt, "pod-vm")
-		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+		box := vmPodBox(rt, "pod-vm", 0)
 		box.SandboxProfile.VmVcpus = 2
 		box.SandboxProfile.VmMemoryBytes = 1 << 30
 
@@ -984,8 +985,7 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Network: net})
 		rt := newTestRuntimeCfg(t, cfg, d)
 
-		box := hostBinBox(rt, "pod-vm-net")
-		box.SandboxProfile.Backend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+		box := vmPodBox(rt, "pod-vm-net", 0)
 
 		// The producer holds the config; createVMPod pulls it through the seam. The
 		// lab-gated boot stub then surfaces an error, which is expected and orthogonal

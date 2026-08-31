@@ -107,9 +107,9 @@ var ErrInvalidGuestSpec = errors.New("sandbox: invalid guest spec")
 // AN EMPTY CONTAINER LIST IS NOT REJECTED HERE. guestinit.Plan refuses a pod with
 // no containers, and it is the right refuser: it is PID 1 of a VM that exists to
 // run exactly this pod, so its refusal names the pod's own boot. Rejecting here
-// as well would only move the same failure one process earlier while making the
-// composer disagree with the producer that has not yet been wired (see the
-// VMSpec.Containers doc).
+// as well would only move the same failure one process earlier, and the producer
+// (pkg/runtime's container mapper) already refuses every pod-shaped reason a
+// container could be missing before it ever composes a spec.
 func buildGuestSpec(spec VMSpec) (*guestv1.GuestSpec, error) {
 	shares, err := shareIndex(spec.Volumes.Shares)
 	if err != nil {
