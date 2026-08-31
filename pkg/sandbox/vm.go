@@ -170,16 +170,14 @@ type VMSpec struct {
 	// PLAIN DATA on the same decoupling seam as Volumes and Network: sandbox
 	// resolves nothing itself. The NAMED MAPPER is pkg/runtime — it holds the
 	// PodBox, the image config and pkg/image.MergeRunSpec, which is where every
-	// value below is produced.
+	// value below is produced (resolveVMContainers).
 	//
-	// NOT YET STAMPED BY ANY PRODUCER. createVMPod builds a VMSpec without
-	// them, so a vm pod's boot spec is written with an empty container list
-	// today and the guest init refuses it with its own reason
-	// (guestinit.Plan: "the pod has no containers"). That is the honest
-	// interim state: the contract's producer exists and is gated, and the
-	// container-resolution mapper is the next deliverable. It is a field here
-	// rather than a parameter so the mapper has one place to stamp and the
-	// composer one place to read.
+	// AN EMPTY LIST IS STILL NOT REJECTED HERE. guestinit.Plan is the right
+	// refuser — it is PID 1 of a VM that exists to run exactly this pod — and
+	// the mapper never produces one for a pod that has containers, so a spec
+	// arriving empty says something about the caller rather than about this
+	// mapping. It is a field rather than a parameter so the mapper has one
+	// place to stamp and the composer one place to read.
 	Containers []VMContainer
 	// Volumes is the virtiofs share-device plan for the pod's volumes (B106),
 	// stamped as data by createVMPod (pkg/runtime), the named mapper from

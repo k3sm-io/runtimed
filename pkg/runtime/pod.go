@@ -601,12 +601,20 @@ func (r *Runtime) armMemorySampler(p *pod) {
 	sampler.Start(sampCtx, r.sampleInterval())
 }
 
-// createVMPod is the M5.1 vm-backend routing target (SKELETON). The vm path is
-// deliberately SEPARATE from the host-process spine (createPod above): it does NOT
+// createVMPod is the vm-backend routing target. The vm path is deliberately
+// SEPARATE from the host-process spine (createPod above): it does NOT
 // resolveBinary, ad-hoc codesign / gateSignature, generate+apply an SBPL profile,
 // or set up lo0 networking — a Linux guest runs none of those. It hands the pod's
 // sizing (vm_vcpus / vm_memory_bytes) + rootfs + the virtiofs volume share plan
-// (B106, computed below) to the vm backend's CreateVM.
+// (B106, computed below) + its RESOLVED CONTAINERS to the vm backend's CreateVM.
+//
+// It DOES pull, and that is not a leak of the host-process spine into this one:
+// the guest runs no merge and reads no image config, so the image's
+// Entrypoint/Cmd/Env/WorkingDir/User have to be merged with the pod spec HERE,
+// and holding a verified config means having pulled it. What the host-process
+// spine does with a pulled image afterwards — materialize it, resolve argv[0]
+// against a host rootfs, sign it, gate it — none of that happens here. See
+// resolveVMContainers.
 //
 // VMSpec.Network is resolved HERE, at the one boundary that consumes it, through
 // the optional GuestNetworker seam (guestNetworkConfig): the guest's DNS
@@ -632,6 +640,13 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // and the helper exit watch, which is what keeps a post-boot hypervisor crash
 // from leaving the pod at Running forever.
 func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *runtimev1.SandboxProfile) (*pod, runtimev1.FailureReason, error) {
+	// The pod's RESOLVED sandbox backend, named ONCE. createPod reaches this
+	// function only when sandbox.SelectBackend returned the vm rung, so this IS
+	// that decision — and naming it here keeps the image-platform policy of the
+	// pulls below and the backend recorded on the assembled pod reading from one
+	// value rather than two spellings of it.
+	const vmPodBackend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+
 	// Compute the virtiofs share-device plan from the box's volumes (B106) —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
@@ -670,12 +685,34 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
+	// The pod dir must exist before anything writes into it. The vm path creates
+	// it HERE rather than sharing the host-process spine's MkdirAll, because
+	// that spine also provisions a tmp dir, an image reachability record and a
+	// rootfs the guest composes for itself — and it is created BEFORE the pulls
+	// below, whose reachability record would otherwise create it first at its
+	// own, wider mode.
+	if err := os.MkdirAll(podDir, 0o750); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("create pod dir %s: %w", podDir, err)
+	}
+	// EVERY CONTAINER, RESOLVED HOST-SIDE (M11.2-d11): the four-quadrant merge of
+	// each container's pod spec against its image config, its expanded
+	// environment, its numeric identity and the share-plan tag its rootfs lower
+	// layer arrives under. The guest performs no merge and reads no image config,
+	// which is what lets it boot with no cluster access — see resolveVMContainers
+	// for what this pulls, what it deliberately does not materialize, and the two
+	// fail-closed refusals (a host-binary image, an unresolvable image USER).
+	containers, reason, err := r.resolveVMContainers(ctx, box, plan, vmPodBackend)
+	if err != nil {
+		return nil, reason, err
+	}
 	spec := sandbox.VMSpec{
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
 		RootfsPath:  vmRootfs,
 		Network:     r.guestNetworkConfig(box.GetPodId()),
+		Containers:  containers,
 		Volumes:     vmVolumePlan(plan),
 		PodDir:      podDir,
 		// ONE grace budget for both ends of the shutdown: the helper is given
@@ -684,14 +721,6 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		// timers across the process boundary is the power-cut bug.
 		AgentSocketPath: agentSocket,
 		StopGrace:       time.Duration(box.GetTerminationGracePeriodSeconds()) * time.Second,
-	}
-	// The pod dir must exist before the helper is pointed at a spec inside it.
-	// The vm path creates it HERE rather than sharing the host-process spine's
-	// MkdirAll, because that spine also provisions a tmp dir, an image
-	// reachability record and a rootfs the guest composes for itself.
-	if err := os.MkdirAll(podDir, 0o750); err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("create pod dir %s: %w", podDir, err)
 	}
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
 		// Every sub-cause is SANDBOX_SETUP at the enum level — the runtime/v1
@@ -709,7 +738,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	supCtx, cancel := context.WithCancel(context.Background())
 	p := &pod{
 		box:     box,
-		backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_VM,
+		backend: vmPodBackend,
 		phase:   runtimev1.PodPhase_POD_PHASE_RUNNING,
 		supCtx:  supCtx,
 		cancel:  cancel,
@@ -1614,11 +1643,12 @@ func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
 // differed would be refused by image.Candidates instead of silently mis-selected
 // through a valid enum value.
 //
-// backend is always a NATIVE rung here — the host-process (Mach-O) spine is the
-// only spine that pulls today (B99). createPod routes a resolved vm backend to
-// createVMPod BEFORE resolveBinary is reached, and createVMPod pulls nothing
-// yet; when the vm path grows a pull (the OCI -> Linux-rootfs builder, a later
-// deliverable) it passes its own resolved backend through this same seam.
+// BOTH SPINES pull through this seam (B99), each passing the backend its own pod
+// resolved: the host-process spine from pod.backend (resolveBinary), and the vm
+// spine from the rung SelectBackend routed it on (resolveVMContainers, which
+// pulls for the image config the guest-side merge needs). So the platform a pull
+// selects always follows the rung the pod is actually confined by, and neither
+// spine can pull a Mach-O image for a Linux guest or the reverse.
 //
 // HostRosetta is false DELIBERATELY, and NOT for want of a probe: the probe exists
 // as of B103 (sandbox.ProbeHostRosetta, advertised on GetRuntimeInfo as the
@@ -1650,10 +1680,11 @@ func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
 // to the native rules, which would apply Mach-O semantics to a Linux image and
 // commit the result under a key claiming otherwise.
 //
-// Every LIVE caller is still native, and the honesty note is worth keeping:
-// createPod routes a resolved vm backend to createVMPod BEFORE resolveBinary is
-// reached, so the Linux branch is exercised by tests until the vm spine
-// materializes its own rootfs.
+// Every LIVE caller is still native, and the honesty note is worth keeping: the
+// vm spine resolves its containers without materializing anything (composing the
+// guest's rootfs lower layer out of the pulled blobs is the rootfs-builder
+// deliverable — see resolveVMContainers), so the Linux dialect is exercised by
+// tests until that lands.
 func unpackPolicy(backend runtimev1.SandboxBackend) (image.UnpackPolicy, error) {
 	return image.UnpackPolicyFor(backend)
 }

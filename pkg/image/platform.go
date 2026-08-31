@@ -197,15 +197,15 @@ var (
 // UNSPECIFIED on its success path, so a policy carrying it means nobody set one,
 // and "no constraint" is precisely the bug this type exists to remove.
 //
-// LIVE CALL SITES (be honest about the green test table): only the NATIVE rows
-// have one today. Runtime.resolveBinary (pkg/runtime/pod.go) threads the backend
-// its pod resolved (pod.backend, recorded by createPod from
-// sandbox.SelectBackend) into this field, and it is reached solely from the
-// host-process spine — createPod routes a resolved vm backend to createVMPod
-// BEFORE resolveBinary, and createVMPod pulls nothing (the OCI -> Linux-rootfs
-// builder and vm exec are separate, later deliverables). The vm candidate rows
-// and GuestRosetta are therefore exercised by tests only until those land; a
-// green table here is NOT evidence that vm image selection works end to end.
+// LIVE CALL SITES (be honest about the green test table): BOTH rungs have one.
+// Runtime.resolveBinary threads the backend its pod resolved (pod.backend) on the
+// host-process spine, and Runtime.resolveVMContainers threads the vm rung when it
+// pulls each container for the image config the guest-side merge needs
+// (pkg/runtime/vmcontainers.go). GuestRosetta is still passed FALSE by both, so
+// the linux/amd64 candidate row remains test-only; and a linux pull today feeds
+// the merge, not a composed guest rootfs (the rootfs builder is a separate
+// deliverable), so a green table here is still NOT evidence that vm image
+// selection works end to end.
 //
 // HostRosetta / GuestRosetta are capability INPUTS, not probes: this file stays
 // GOOS-agnostic and cgo-free. The probes that answer them SHIPPED with B103
