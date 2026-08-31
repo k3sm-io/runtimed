@@ -230,6 +230,26 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	}
 	l.set(StateStarting)
 	if err := l.runner.Start(ctx); err != nil {
+		// A FAILED Start MUST STILL BE TORN DOWN. The darwin runner races the
+		// framework's boot against ctx (vz_darwin.go Start's select), so a
+		// cancelled Start returns while the machine it already created goes on
+		// to finish booting — a VM with no supervisor, outliving the process
+		// that made it, which is exactly the invariant this package exists to
+		// keep ("no VM outlives the binary"). Forcing the hard stop here is the
+		// only place that window can be closed: Run is about to return, and
+		// nothing downstream holds the runner.
+		//
+		// The stop runs on a context DETACHED from ctx — ctx is the thing that
+		// just ended, so passing it would cancel the teardown it is the reason
+		// for — bounded by the same grace budget the shutdown path uses. Stop is
+		// documented safe on a machine that never started, so the ordinary
+		// failure (a bad configuration, no entitlement) pays one no-op call.
+		stopCtx, cancelStop := context.WithTimeout(context.WithoutCancel(ctx), l.grace)
+		defer cancelStop()
+		if serr := l.runner.Stop(stopCtx); serr != nil {
+			l.log.Warn("could not halt the machine after a failed start; it may still be running",
+				"start_err", err, "stop_err", serr)
+		}
 		l.set(StateFailed)
 		return fmt.Errorf("start the virtual machine: %w", err)
 	}
