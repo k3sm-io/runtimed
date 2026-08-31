@@ -58,6 +58,12 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 			st.Conditions = append(st.Conditions, cond)
 		}
 		appendGuestContainerStatusesLocked(st, p)
+		// The LIVE TRANSPORT address (B237) — what the host dials to reach this
+		// guest, as the agent last reported it. It is deliberately NOT folded
+		// into PodIp/PodIps above: those are the pod's published identity, and
+		// this is a node-local NAT address that must never reach EndpointSlice,
+		// DNS or the downward API (runtime.proto, guest_transport_address).
+		st.GuestTransportAddress = p.guestLease
 	}
 	return st
 }

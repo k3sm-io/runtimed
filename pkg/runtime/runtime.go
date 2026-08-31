@@ -307,6 +307,11 @@ type Runtime struct {
 	// observe the shutdown cancel; 0 selects defaultCloseGrace. Same rationale.
 	closeGrace time.Duration
 
+	// guestLeasePoll is the base cadence of a vm pod's guest-lease Health poll
+	// (B237); 0 selects defaultGuestLeasePoll. A field for the same reason
+	// drainGrace is one: tests shrink it, there being no clock seam here.
+	guestLeasePoll time.Duration
+
 	// netReconcileOnce/netReconcileErr make the optional network startup
 	// reconcile (NetworkReconciler) run exactly once per Runtime, BEFORE any
 	// CreatePod is served. Once.Do provides the happens-before for the error
