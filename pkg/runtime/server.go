@@ -120,17 +120,30 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// the helper will honour, so the daemon cannot SIGKILL a helper that is still
 	// asking its guest to stop — the two-independently-clocked-timers power cut.
 	if p.isVM() {
+		// SUPERVISION IS CANCELLED FIRST, and the order is the opposite of the
+		// host-process path's for a reason the live smoke found the hard way.
+		//
+		// The helper's exit is observed by TWO watchers: StopVM's own
+		// GracefulStop, and watchVMHelperExit, which exists to fail a pod whose
+		// machine died under it. They race, and cancelling afterwards lost that
+		// race often enough to be the normal case — a plain `DeletePod` logged
+		// "the vm host helper exited while its pod was running; the guest is
+		// gone" and published a Failed status for a pod the operator had just
+		// asked to delete. Contexts are monotonic, so cancelling BEFORE the stop
+		// makes the watch's ctx check true by the time any exit can arrive: an
+		// expected teardown can no longer be misread as a crash, deterministically
+		// rather than by winning a race.
+		//
+		// Nothing is lost by stopping the event fold early: the pod is going
+		// away, and its status is replaced with SUCCEEDED below.
+		if p.cancel != nil {
+			p.cancel()
+		}
 		if err := r.vmBackend.StopVM(ctx, req.GetPodId(), grace); err != nil {
 			// Log and continue, exactly as the host path treats a failed stop: a
 			// pod that will not die must never wedge its own deletion, and the
 			// helper's record is kept for the next startup sweep.
 			r.log.Warn("stop the vm host helper", "pod", req.GetPodId(), "err", err)
-		}
-		// End the pod-lifetime supervision AFTER the helper is stopped, so the
-		// exit watch's ctx arm wins the race against the exit it is about to
-		// see and an expected teardown is not reported as a crash.
-		if p.cancel != nil {
-			p.cancel()
 		}
 		st := r.podStatus(p)
 		st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED

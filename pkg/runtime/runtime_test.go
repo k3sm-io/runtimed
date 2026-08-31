@@ -111,6 +111,12 @@ type fakeVMBackend struct {
 	// be driven with no VM anywhere.
 	bootOK bool
 
+	// stopHook runs INSIDE StopVM / StopAllVMs, before the exit edge fires. It is
+	// how a test observes the daemon's state AT THE MOMENT it asks a helper to
+	// stop — which is the only way to pin the cancel-before-stop ordering
+	// deterministically rather than by racing a goroutine. Set before CreatePod.
+	stopHook func(podID string)
+
 	mu          sync.Mutex
 	createCalls int
 	lastSpec    sandbox.VMSpec
@@ -158,8 +164,12 @@ func (b *fakeVMBackend) StopVM(_ context.Context, podID string, grace time.Durat
 	b.mu.Lock()
 	b.stopCalls = append(b.stopCalls, fakeVMStop{podID: podID, grace: grace})
 	ch := b.done[podID]
+	hook := b.stopHook
 	delete(b.done, podID)
 	b.mu.Unlock()
+	if hook != nil {
+		hook(podID)
+	}
 	if ch != nil {
 		select {
 		case <-ch:
@@ -174,11 +184,19 @@ func (b *fakeVMBackend) StopAllVMs(_ context.Context) error {
 	b.mu.Lock()
 	b.stopAllReq++
 	chans := make([]chan struct{}, 0, len(b.done))
-	for _, ch := range b.done {
+	pods := make([]string, 0, len(b.done))
+	for podID, ch := range b.done {
 		chans = append(chans, ch)
+		pods = append(pods, podID)
 	}
+	hook := b.stopHook
 	b.done = map[string]chan struct{}{}
 	b.mu.Unlock()
+	if hook != nil {
+		for _, podID := range pods {
+			hook(podID)
+		}
+	}
 	for _, ch := range chans {
 		select {
 		case <-ch:

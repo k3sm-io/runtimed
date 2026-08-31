@@ -78,12 +78,32 @@ func (r *Runtime) Close() error {
 	}
 	r.mu.Unlock()
 
+	if len(pods) > 0 {
+		r.log.Info("stopping pod supervision for daemon shutdown", "pods", len(pods))
+	}
+
+	// Phase 1: fire every cancel BEFORE waiting on any of them. Cancelling is
+	// non-blocking, so this stops the whole node's supervision at once and leaves
+	// the bound below to be shared rather than spent pod by pod (a wedged pod
+	// would otherwise consume a healthy successor's budget).
+	//
+	// It also runs BEFORE the vm stop below, which is load-bearing rather than
+	// incidental: watchVMHelperExit would otherwise observe the shutdown's own
+	// stop as a crash and publish a Failed status for every vm pod on the way
+	// out. Contexts are monotonic, so cancelling first settles that
+	// deterministically instead of by winning a race (see DeletePod's vm branch,
+	// where the live smoke found the same ordering bug).
+	waits := make([]supervisionWait, 0, len(pods))
+	for _, p := range pods {
+		waits = append(waits, r.cancelPodSupervision(p))
+	}
+
 	// THE VM CARVE-OUT, and it is the exact OPPOSITE of the rule above. A host
 	// pod's processes survive the daemon by design; a vm pod's helper must not —
 	// "no VM outlives the binary that booted it" (cmd/k3sm-vmhost) — because an
 	// orphaned helper holds a whole machine that nothing on the node can talk to,
 	// adopt, or stop. So every live helper is stopped here, CONCURRENTLY inside
-	// the backend, before the supervision cancels below.
+	// the backend.
 	//
 	// The concurrency is a requirement, not a tidiness: each helper's graceful
 	// stop can spend up to the vm host's 30-second ceiling, and launchd gives the
@@ -100,19 +120,8 @@ func (r *Runtime) Close() error {
 	if vmErr != nil {
 		r.log.Warn("some vm host helpers did not stop cleanly during shutdown", "err", vmErr)
 	}
-
 	if len(pods) == 0 {
 		return vmErr
-	}
-	r.log.Info("stopping pod supervision for daemon shutdown", "pods", len(pods))
-
-	// Phase 1: fire every cancel BEFORE waiting on any of them. Cancelling is
-	// non-blocking, so this stops the whole node's supervision at once and leaves
-	// the bound below to be shared rather than spent pod by pod (a wedged pod
-	// would otherwise consume a healthy successor's budget).
-	waits := make([]supervisionWait, 0, len(pods))
-	for _, p := range pods {
-		waits = append(waits, r.cancelPodSupervision(p))
 	}
 
 	// Phase 2: confirm the cancels were observed.

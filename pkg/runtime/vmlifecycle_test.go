@@ -322,3 +322,94 @@ func TestRestartContainerRefusesAVMPod(t *testing.T) {
 	}
 	_ = status.New(codes.Unimplemented, "")
 }
+
+// TestVMTeardownCancelsSupervisionBeforeStopping pins the ordering that keeps a
+// DELIBERATE teardown from being reported as a crash.
+//
+// FOUND BY THE LIVE SMOKE, NOT BY REVIEW. A helper's exit is observed by two
+// watchers — the stop's own GracefulStop and watchVMHelperExit, whose whole job
+// is to fail a pod whose machine died under it — and cancelling supervision
+// AFTER the stop left which one won to chance. On the rig the watcher won
+// routinely: an ordinary DeletePod logged "the vm host helper exited while its
+// pod was running; the guest is gone" and published a Failed status for a pod the
+// operator had just asked to delete. A provider consuming that event sees a
+// crash where there was none.
+//
+// The assertion is on the ORDER, not on the outcome, and deliberately so: an
+// outcome test ("the pod was not published Failed") passes on a racy
+// implementation most of the time, which is the worst possible test for a race.
+// Contexts are monotonic, so "supCtx is already cancelled when the backend is
+// asked to stop" is a property that either holds on every run or never does.
+func TestVMTeardownCancelsSupervisionBeforeStopping(t *testing.T) {
+	t.Run("DeletePod", func(t *testing.T) {
+		vmb := &fakeVMBackend{available: true, bootOK: true}
+		rt := newTestRuntime(t, Deps{VMBackend: vmb})
+		box := vmPodBox(rt, "pod-vm-order-1", 5)
+
+		var cancelledAtStop bool
+		var stops int
+		vmb.stopHook = func(podID string) {
+			stops++
+			p, ok := rt.lookupPod(podID)
+			if !ok {
+				// DeletePod deregisters before tearing down, so resolve the pod
+				// the way the teardown itself holds it.
+				cancelledAtStop = deletedPodSupCancelled(t, rt, podID)
+				return
+			}
+			cancelledAtStop = p.supCtx.Err() != nil
+		}
+		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box}); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		p, _ := rt.lookupPod(box.GetPodId())
+		vmb.stopHook = func(string) {
+			stops++
+			cancelledAtStop = p.supCtx.Err() != nil
+		}
+		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: box.GetPodId()}); err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		if stops != 1 {
+			t.Fatalf("stop hook ran %d times, want 1", stops)
+		}
+		if !cancelledAtStop {
+			t.Error("the pod's supervision context was still live when the helper was asked to stop; " +
+				"watchVMHelperExit then races that exit and can publish a Failed status for a deliberately deleted pod")
+		}
+	})
+
+	t.Run("Close", func(t *testing.T) {
+		// Same property on the shutdown path, where the cost is worse: every vm
+		// pod on the node would be published Failed on the way out.
+		vmb := &fakeVMBackend{available: true, bootOK: true}
+		rt := newTestRuntime(t, Deps{VMBackend: vmb})
+		box := vmPodBox(rt, "pod-vm-order-2", 5)
+		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box}); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		p, _ := rt.lookupPod(box.GetPodId())
+		var cancelledAtStop, ran bool
+		vmb.stopHook = func(string) {
+			ran = true
+			cancelledAtStop = p.supCtx.Err() != nil
+		}
+		_ = rt.Close()
+		if !ran {
+			t.Fatal("StopAllVMs never reached the live helper")
+		}
+		if !cancelledAtStop {
+			t.Error("Close asked the helpers to stop while pod supervision was still live; " +
+				"every vm pod would be published Failed during an ordinary daemon shutdown")
+		}
+	})
+}
+
+// deletedPodSupCancelled is the fallback for a pod already removed from the
+// registry: there is nothing left to inspect, so the ordering cannot be observed
+// and the caller must not read a false negative as a pass.
+func deletedPodSupCancelled(t *testing.T, _ *Runtime, podID string) bool {
+	t.Helper()
+	t.Fatalf("pod %s was already deregistered when the stop hook ran, so the ordering could not be observed", podID)
+	return false
+}
