@@ -808,3 +808,124 @@ func TestHTTPFetcherSatisfiesFetcher(t *testing.T) {
 	var _ Fetcher = (*HTTPFetcher)(nil)
 	var _ Fetcher = (*fakeFetcher)(nil)
 }
+
+// ============================================================================
+// HTTPFetcher hardening: the https-only rule and the body cap. Both are
+// provable without a socket — the scheme is refused before one is opened, and
+// the cap lives in a body wrapper that reads from memory just as well as from a
+// response.
+// ============================================================================
+
+func TestHTTPFetcherRejectsNonHTTPSURL(t *testing.T) {
+	// Each of these must be refused BEFORE any connection is attempted, which is
+	// also why this test needs no network: reaching the transport at all would
+	// be the bug.
+	refused := []struct{ name, url string }{
+		{"plaintext is refused, never downgraded to", "http://example.invalid/guest/Image"},
+		{"a local file url is refused", "file:///var/tmp/Image"},
+		{"an ftp url is refused", "ftp://example.invalid/Image"},
+		{"a bare path names no scheme and is refused", "/var/tmp/Image"},
+		{"an empty url is refused", ""},
+	}
+	f := &HTTPFetcher{}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, err := f.Fetch(context.Background(), tc.url)
+			if err == nil {
+				_ = rc.Close()
+				t.Fatalf("Fetch(%q) succeeded, want a refusal", tc.url)
+			}
+			if !errors.Is(err, ErrInsecureArtifactURL) {
+				t.Fatalf("Fetch(%q) error = %v, want errors.Is ErrInsecureArtifactURL", tc.url, err)
+			}
+		})
+	}
+
+	t.Run("an https url with a host is allowed", func(t *testing.T) {
+		// The positive case is asserted on the check rather than on Fetch: a
+		// Fetch that got past the check would open a socket, which is the one
+		// thing no test in this package does.
+		if err := checkArtifactURL(testReleaseURL + "/" + ImageFileName); err != nil {
+			t.Fatalf("checkArtifactURL rejected an https url: %v", err)
+		}
+	})
+
+	t.Run("an https url with no host is refused", func(t *testing.T) {
+		if err := checkArtifactURL("https:///Image"); !errors.Is(err, ErrInsecureArtifactURL) {
+			t.Fatalf("checkArtifactURL error = %v, want errors.Is ErrInsecureArtifactURL", err)
+		}
+	})
+}
+
+// capFetcher serves bytes through the SAME cappedBody wrapper HTTPFetcher.Fetch
+// applies, so an end-to-end ensure exercises the production cap rather than a
+// test-only imitation of it.
+type capFetcher struct {
+	body []byte
+	max  int64
+}
+
+func (c capFetcher) Fetch(_ context.Context, _ string) (io.ReadCloser, error) {
+	return newCappedBody(io.NopCloser(bytes.NewReader(c.body)), c.max), nil
+}
+
+func TestHTTPFetcherBodyCap(t *testing.T) {
+	t.Run("the shipped cap is MaxArtifactBytes", func(t *testing.T) {
+		if maxArtifactBytes != int64(MaxArtifactBytes) {
+			t.Fatalf("maxArtifactBytes = %d, want MaxArtifactBytes (%d)", maxArtifactBytes, int64(MaxArtifactBytes))
+		}
+		if MaxArtifactBytes != 512<<20 {
+			t.Fatalf("MaxArtifactBytes = %d, want 512 MiB", int64(MaxArtifactBytes))
+		}
+	})
+
+	t.Run("a body under the cap reads whole", func(t *testing.T) {
+		body := bytes.Repeat([]byte("a"), 7)
+		got, err := io.ReadAll(newCappedBody(io.NopCloser(bytes.NewReader(body)), 16))
+		if err != nil {
+			t.Fatalf("read a body under the cap: %v", err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("read %d bytes, want %d", len(got), len(body))
+		}
+	})
+
+	t.Run("a body exactly at the cap reads whole", func(t *testing.T) {
+		// The boundary the cap+1 limit exists to get right: at the cap is a
+		// legal artifact, one byte past it is not.
+		body := bytes.Repeat([]byte("b"), 16)
+		got, err := io.ReadAll(newCappedBody(io.NopCloser(bytes.NewReader(body)), 16))
+		if err != nil {
+			t.Fatalf("read a body exactly at the cap: %v", err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("read %d bytes, want %d", len(got), len(body))
+		}
+	})
+
+	t.Run("a body one byte over the cap is an error", func(t *testing.T) {
+		body := bytes.Repeat([]byte("c"), 17)
+		got, err := io.ReadAll(newCappedBody(io.NopCloser(bytes.NewReader(body)), 16))
+		if !errors.Is(err, ErrArtifactTooLarge) {
+			t.Fatalf("error = %v, want errors.Is ErrArtifactTooLarge", err)
+		}
+		if int64(len(got)) > 16 {
+			t.Fatalf("the reader handed back %d bytes, more than the %d-byte cap", len(got), 16)
+		}
+	})
+
+	t.Run("an over-cap body installs nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		_, err := EnsureGuestArtifacts(context.Background(), dir,
+			testPin(), capFetcher{body: bytes.Repeat([]byte("d"), 4096), max: 8})
+		if !errors.Is(err, ErrArtifactTooLarge) {
+			t.Fatalf("EnsureGuestArtifacts error = %v, want errors.Is ErrArtifactTooLarge", err)
+		}
+		if s := setDirs(t, dir); len(s) != 0 {
+			t.Errorf("an over-cap fetch installed a set: %v", s)
+		}
+		if n := tempFiles(t, dir); len(n) != 0 {
+			t.Errorf("an over-cap fetch left temp files behind: %v", n)
+		}
+	})
+}

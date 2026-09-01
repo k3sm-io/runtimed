@@ -86,10 +86,14 @@ func run(socketPath, root, version string, log *slog.Logger) error {
 		if aerr != nil {
 			log.Warn("guest boot artifacts could not be ensured; vm capability off", "err", aerr)
 		} else {
+			// The locator RE-VERIFIES on every boot rather than closing over the
+			// ensure's one-time result: this daemon runs for weeks, and a
+			// constant closure would assert a digest measured at start for the
+			// whole of that uptime. See guestartifacts.Locator.
 			deps.VMBackend = sandbox.NewVMBackend(
 				sandbox.WithStateRoot(artifactRoot),
 				sandbox.WithLogger(log),
-				sandbox.WithGuestArtifacts(func() (sandbox.GuestArtifacts, error) { return art, nil }))
+				sandbox.WithGuestArtifacts(guestartifacts.Locator(pin, art)))
 		}
 	}
 

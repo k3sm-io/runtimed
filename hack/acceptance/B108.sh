@@ -16,6 +16,17 @@
 #   content-addressed node cache: verify-before-rename, re-verify on every start,
 #   re-fetch what does not match, retain the active set plus one previous, and
 #   return the error (never abort) when the publisher is unreachable.
+
+#   FETCH — the production fetcher is https-only with no scheme fallback (a
+#   redirect cannot downgrade it either) and caps one body at MaxArtifactBytes,
+#   so a garbage endpoint cannot fill the node's disk with something that was
+#   never going to hash.
+#
+#   LOCATE — pkg/guestartifacts/locator.go re-hashes both artifacts against the
+#   pin on EVERY guest boot, not once at daemon start. The daemon runs for weeks
+#   and a VZ-booted kernel gets no code-signing check from macOS, so the sha256
+#   is the whole trust chain and is enforced per use; the gate asserts the daemon
+#   wires THAT locator and not a constant closure.
 #
 # THE MUTATION DISCIPLINE. Every assertion below is paired with a state a
 # verification-free implementation would accept. The Go legs carry that pairing
@@ -45,6 +56,9 @@ ENSURE="$PKG_DIR/ensure.go"
 PINS_TEST="$PKG_DIR/pins_test.go"
 ENSURE_TEST="$PKG_DIR/ensure_test.go"
 WALK_TEST="$PKG_DIR/pins_completeness_test.go"
+LOCATOR="$PKG_DIR/locator.go"
+LOCATOR_TEST="$PKG_DIR/locator_test.go"
+MAIN="$REPO_ROOT/cmd/k3sm-runtimed/main.go"
 SELF="$HERE/B108.sh"
 
 GOENV=(env GOARCH=arm64 CGO_ENABLED=1)
@@ -61,10 +75,10 @@ echo "==> runtimed B108 acceptance (guest-artifact pin + ensure)"
 # ---- b108.0 — the gate parses and every source under test exists ------------
 b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
-for f in "$PINS" "$ENSURE" "$PINS_TEST" "$ENSURE_TEST" "$WALK_TEST"; do
+for f in "$PINS" "$ENSURE" "$LOCATOR" "$PINS_TEST" "$ENSURE_TEST" "$WALK_TEST" "$LOCATOR_TEST" "$MAIN"; do
 	[ -f "$f" ] || { echo "missing: $f" >&2; b0=no; }
 done
-ladder "$b0" "b108.0  gate parses (bash -n) + pkg/guestartifacts/{pins,ensure}.go and their tests present"
+ladder "$b0" "b108.0  gate parses (bash -n) + pkg/guestartifacts/{pins,ensure,locator}.go and their tests present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "B108: the gate or a source under test is missing/unparseable — nothing else can run" >&2
@@ -132,11 +146,11 @@ ladder "$order" "b108.5  the download is digest-verified (line $vline) BEFORE it
 # The seam exists so the whole failure matrix is unit-tier. A test that opened a
 # socket would make this gate depend on a publisher being up, which is precisely
 # the outage ensure is designed to survive.
-net="$( { grep -nE 'net/http|httptest|net\.Dial|http\.Get' "$PINS_TEST" "$ENSURE_TEST" "$WALK_TEST" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+net="$( { grep -nE 'net/http|httptest|net\.Dial|http\.Get' "$PINS_TEST" "$ENSURE_TEST" "$WALK_TEST" "$LOCATOR_TEST" 2>/dev/null || true; } | wc -l | tr -d ' ')"
 if [ "$net" = 0 ]; then
 	ladder ok "b108.6  no test in pkg/guestartifacts touches the network (0 http/dial references)"
 else
-	grep -nE 'net/http|httptest|net\.Dial|http\.Get' "$PINS_TEST" "$ENSURE_TEST" "$WALK_TEST" || true
+	grep -nE 'net/http|httptest|net\.Dial|http\.Get' "$PINS_TEST" "$ENSURE_TEST" "$WALK_TEST" "$LOCATOR_TEST" || true
 	ladder no "b108.6  no test in pkg/guestartifacts touches the network (found $net references)"
 fi
 
@@ -189,17 +203,58 @@ run_test "b108.15" 2 TestEnsureGuestArtifactsFetchTimeout
 run_test "b108.16" 3 TestEnsureGuestArtifactsRetention
 run_test "b108.17" 3 TestHTTPFetcherTimeout
 
-# ---- b108.18 — EVERY Mutation* subtest ran and passed -----------------------
+# ---- b108.18 .. b108.20 — the fetcher hardening and the locator -------------
+run_test "b108.18" 7 TestHTTPFetcherRejectsNonHTTPSURL
+run_test "b108.19" 5 TestHTTPFetcherBodyCap
+run_test "b108.20" 5 TestLocator
+
+# ---- b108.21 — the fetcher's two refusals are WIRED into Fetch --------------
+# Both hardening tests are provable without a socket, which is also their limit:
+# they exercise checkArtifactURL and the cap wrapper directly, so a Fetch that
+# stopped CALLING either one would keep them green. This leg asserts the wiring
+# the tests cannot see — the scheme check is the first statement in Fetch (before
+# any client work), the post-redirect re-check exists, and the returned body is
+# the capped one.
+wire=ok
+fline="$(grep -nE '^func \(f \*HTTPFetcher\) Fetch\(' "$ENSURE" | head -1 | cut -d: -f1 || true)"
+cline="$(grep -nE '^\tif err := checkArtifactURL\(url\); err != nil \{' "$ENSURE" | head -1 | cut -d: -f1 || true)"
+dline="$(grep -nE 'client := f\.Client' "$ENSURE" | head -1 | cut -d: -f1 || true)"
+[ -n "$fline" ] && [ -n "$cline" ] && [ -n "$dline" ] && [ "$fline" -lt "$cline" ] && [ "$cline" -lt "$dline" ] || wire=no
+grep -qE 'checkArtifactURL\(resp\.Request\.URL\.String\(\)\)' "$ENSURE" || wire=no
+grep -qE 'newCappedBody\(resp\.Body, maxArtifactBytes\)' "$ENSURE" || wire=no
+grep -qE '^const MaxArtifactBytes = 512 << 20$' "$ENSURE" || wire=no
+ladder "$wire" "b108.21  Fetch refuses a non-https url first (line $cline, before the client at $dline), re-checks after redirects, and caps the body"
+
+# ---- b108.22 — the daemon wires the RE-VERIFYING locator --------------------
+# The TOCTOU fix is only delivered if the daemon uses it. A constant closure
+# returning the ensure's one-time result compiles, boots, and passes every unit
+# test in the package — so the wiring is asserted here, structurally.
+loc=ok
+grep -qE '^func Locator\(pin GuestKernelPin, art sandbox\.GuestArtifacts\) func\(\) \(sandbox\.GuestArtifacts, error\)' "$LOCATOR" || loc=no
+grep -qE 'sandbox\.WithGuestArtifacts\(guestartifacts\.Locator\(pin, art\)\)' "$MAIN" || loc=no
+closures="$( { grep -cE 'WithGuestArtifacts\(func\(\) \(sandbox\.GuestArtifacts, error\)' "$MAIN" || true; } | tr -d ' ')"
+[ "$closures" = 0 ] || loc=no
+ladder "$loc" "b108.22  Locator is declared and cmd/k3sm-runtimed wires it (constant closures: $closures)"
+
+# ---- b108.23 .. b108.25 — EVERY Mutation* subtest ran and passed ------------
 # The count is derived from the SOURCE, not pinned as a literal, so adding a
 # mutation subtest that never runs (a stray t.Skip, a filter typo) reddens this
-# leg instead of silently shrinking the matrix.
-run_test "b108.18" 7 TestMutations
-declared="$(grep -cE 't\.Run\("Mutation' "$ENSURE_TEST" || true)"
-observed="$(grep -cE '^[[:space:]]*--- PASS: TestMutations/Mutation' "$SCRATCH/TestMutations.log" 2>/dev/null || true)"
+# leg instead of silently shrinking the matrix. It spans BOTH mutation ladders —
+# the ensure one and the locator one — so a new ladder in a new file cannot grow
+# unwatched.
+run_test "b108.23" 7 TestMutations
+run_test "b108.24" 3 TestLocatorMutations
+declared=0; observed=0
+for pair in "$ENSURE_TEST:TestMutations" "$LOCATOR_TEST:TestLocatorMutations"; do
+	src="${pair%%:*}"; name="${pair##*:}"
+	d="$(grep -cE 't\.Run\("Mutation' "$src" || true)"
+	o="$(grep -cE "^[[:space:]]*--- PASS: ${name}/Mutation" "$SCRATCH/$name.log" 2>/dev/null || true)"
+	declared=$((declared+d)); observed=$((observed+o))
+done
 if [ "$declared" -gt 0 ] && [ "$declared" = "$observed" ]; then
-	ladder ok "b108.19  every declared Mutation* subtest ran and passed ($observed/$declared)"
+	ladder ok "b108.25  every declared Mutation* subtest ran and passed ($observed/$declared)"
 else
-	ladder no "b108.19  every declared Mutation* subtest ran and passed (declared $declared, passed $observed)"
+	ladder no "b108.25  every declared Mutation* subtest ran and passed (declared $declared, passed $observed)"
 fi
 
 # ============================================================================
@@ -236,34 +291,34 @@ BAD_DIGEST='{ if ($0 ~ /^\t\tImageSHA256:[[:space:]]*"/) { print "\t\tImageSHA25
 
 rc_control="$(probe control "")"
 if [ "$rc_control" = 0 ]; then
-	ladder ok "b108.20  control: the walk PASSES against an unmodified copy of pins.go (the harness is not always-red)"
+	ladder ok "b108.26  control: the walk PASSES against an unmodified copy of pins.go (the harness is not always-red)"
 else
 	tail -20 "$SCRATCH/control/out.log" 2>/dev/null || true
-	ladder no "b108.20  control: the walk PASSES against an unmodified copy of pins.go"
+	ladder no "b108.26  control: the walk PASSES against an unmodified copy of pins.go"
 fi
 
 rc_empty="$(probe emptymap "$EMPTY_MAP")"
 if [ "$rc_empty" != 0 ] && grep -q 'the walk measured nothing' "$SCRATCH/emptymap/out.log"; then
-	ladder ok "b108.21  mutant: an EMPTIED pin table turns the walk RED with its vacuity fatal"
+	ladder ok "b108.27  mutant: an EMPTIED pin table turns the walk RED with its vacuity fatal"
 else
 	tail -20 "$SCRATCH/emptymap/out.log" 2>/dev/null || true
-	ladder no "b108.21  mutant: an EMPTIED pin table turns the walk RED with its vacuity fatal (rc $rc_empty)"
+	ladder no "b108.27  mutant: an EMPTIED pin table turns the walk RED with its vacuity fatal (rc $rc_empty)"
 fi
 
 rc_bad="$(probe baddigest "$BAD_DIGEST")"
 if [ "$rc_bad" != 0 ] && grep -q 'neither empty nor 64 lowercase hex characters' "$SCRATCH/baddigest/out.log"; then
-	ladder ok "b108.22  mutant: a malformed pinned digest turns the walk RED"
+	ladder ok "b108.28  mutant: a malformed pinned digest turns the walk RED"
 else
 	tail -20 "$SCRATCH/baddigest/out.log" 2>/dev/null || true
-	ladder no "b108.22  mutant: a malformed pinned digest turns the walk RED (rc $rc_bad)"
+	ladder no "b108.28  mutant: a malformed pinned digest turns the walk RED (rc $rc_bad)"
 fi
 
 # ---- b108.23 — the Apache header on every file this item adds ---------------
 if (cd "$REPO_ROOT" && ./hack/verify-boilerplate.sh >"$SCRATCH/boilerplate.log" 2>&1); then
-	ladder ok "b108.23  hack/verify-boilerplate.sh is green"
+	ladder ok "b108.29  hack/verify-boilerplate.sh is green"
 else
 	tail -20 "$SCRATCH/boilerplate.log"
-	ladder no "b108.23  hack/verify-boilerplate.sh is green"
+	ladder no "b108.29  hack/verify-boilerplate.sh is green"
 fi
 
 echo "----------------------------------------"

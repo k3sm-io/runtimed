@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -47,6 +48,22 @@ const GuestArtifactsSubdir = "guest-artifacts"
 // stalled fetch that trickles a byte a minute defeats an idle timeout forever
 // while defeating the operator just as thoroughly.
 const DefaultFetchTimeout = 2 * time.Minute
+
+// MaxArtifactBytes bounds ONE fetched artifact. A body that reaches it is an
+// error, never a truncation.
+//
+// The bound exists because the url a fetch is pointed at is derived from a pin's
+// ReleaseURL, and the thing on the other end is whatever the network says it is:
+// a redirect loop, a captive portal, a mis-published multi-gigabyte blob. None of
+// those is distinguishable from a kernel until it has been read, and reading it
+// unbounded fills the node's disk — a failure that outlives the fetch and takes
+// every native pod on the node down with it, which is precisely the blast radius
+// EnsureGuestArtifacts' contract promises a failed fetch does not have.
+//
+// 512 MiB is roughly an order of magnitude above the pinned pair (a compressed
+// arm64 Image plus a busybox-class initramfs is tens of megabytes), so it bounds
+// the pathological case without being a size the honest artifacts can grow into.
+const MaxArtifactBytes = 512 << 20
 
 // tempPrefix marks a partially-fetched artifact. It is dot-prefixed and
 // distinguishable from a 64-hex set directory, so a crash mid-fetch leaves
@@ -83,6 +100,78 @@ type HTTPFetcher struct {
 	Timeout time.Duration
 }
 
+// ErrInsecureArtifactURL reports that a guest artifact was to be fetched over
+// something other than https. Compare with errors.Is.
+var ErrInsecureArtifactURL = errors.New("guestartifacts: the guest artifact url is not https")
+
+// ErrArtifactTooLarge reports that a fetched body reached the size cap. Compare
+// with errors.Is.
+var ErrArtifactTooLarge = errors.New("guestartifacts: the fetched guest artifact exceeds the size cap")
+
+// maxArtifactBytes is the cap Fetch enforces. It is MaxArtifactBytes indirected
+// through a var solely so a test can lower it: a test that had to serve half a
+// gigabyte to prove the bound is a test that gets deleted the first time someone
+// runs the suite on a laptop.
+var maxArtifactBytes int64 = MaxArtifactBytes
+
+// checkArtifactURL rejects any url a guest artifact may not be fetched from.
+//
+// HTTPS ONLY, WITH NO FALLBACK. The digest is the whole trust chain here — a
+// VZ-booted kernel gets no code-signing check from the OS, so the only thing
+// standing between the node and someone else's kernel is a sha256 comparison —
+// and requiring https does not weaken that argument, it strengthens a different
+// one: over plaintext an attacker who can rewrite the body can also rewrite it
+// repeatedly and cheaply, turning a verified failure into an unbounded retry
+// against an endpoint of their choosing. A scheme fallback would be the
+// downgrade an attacker asks for, so there is none: a non-https url is refused
+// before a socket is opened, not fetched and then hashed.
+func checkArtifactURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parse the guest artifact url %q: %w", raw, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("refuse to fetch the guest artifact from %q: its scheme is %q, want https: %w", raw, u.Scheme, ErrInsecureArtifactURL)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("refuse to fetch the guest artifact from %q: it names no host: %w", raw, ErrInsecureArtifactURL)
+	}
+	return nil
+}
+
+// cappedBody bounds one fetch to max bytes and turns an overrun into an error.
+//
+// A bare io.LimitReader would TRUNCATE at the cap, which is worse than no cap at
+// all: a truncated artifact still hashes, merely to the wrong value, so an
+// oversize body would be reported as a digest mismatch and blamed on the
+// publisher. The limit is therefore set one byte PAST the cap — a read that
+// reaches that byte is proof the body is over the bound rather than exactly at
+// it — and the surplus byte is never handed back, so no caller writes past max.
+type cappedBody struct {
+	rc   io.ReadCloser
+	r    io.Reader
+	max  int64
+	read int64
+}
+
+// newCappedBody wraps rc so that reading more than max bytes from it fails with
+// ErrArtifactTooLarge.
+func newCappedBody(rc io.ReadCloser, max int64) *cappedBody {
+	return &cappedBody{rc: rc, r: io.LimitReader(rc, max+1), max: max}
+}
+
+func (c *cappedBody) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	if c.read > c.max {
+		over := c.read - c.max
+		return n - int(over), fmt.Errorf("the guest artifact body is larger than the %d-byte cap: %w", c.max, ErrArtifactTooLarge)
+	}
+	return n, err
+}
+
+func (c *cappedBody) Close() error { return c.rc.Close() }
+
 // fetchTimeout resolves the effective total budget for one fetch.
 func (f *HTTPFetcher) fetchTimeout() time.Duration {
 	if f.Timeout <= 0 {
@@ -99,7 +188,16 @@ func (f *HTTPFetcher) fetchTimeout() time.Duration {
 // it. A non-2xx response is an error with the body closed, never a reader over
 // an error page that would then fail digest verification with a misleading
 // "digest mismatch".
+//
+// Three refusals happen before any byte is trusted: a url that is not https is
+// refused before a socket is opened (checkArtifactURL), the url the client
+// ACTUALLY ended on is re-checked so a redirect cannot downgrade what the first
+// check allowed, and the returned body is capped at MaxArtifactBytes so a
+// redirect loop or a garbage endpoint cannot fill the node's disk.
 func (f *HTTPFetcher) Fetch(ctx context.Context, url string) (io.ReadCloser, error) {
+	if err := checkArtifactURL(url); err != nil {
+		return nil, err
+	}
 	client := f.Client
 	if client == nil {
 		client = http.DefaultClient
@@ -120,7 +218,20 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, url string) (io.ReadCloser, err
 		cancel()
 		return nil, fmt.Errorf("fetch %s: unexpected status %s", url, resp.Status)
 	}
-	return &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}, nil
+	// The client follows redirects, so the check above binds only the url we
+	// ASKED for. resp.Request is the last request the client made, so this is
+	// the url the bytes are actually coming from — the one an https-to-http
+	// redirect would have changed out from under the first check. The client is
+	// the caller's to own, so this is a check on the result rather than a
+	// CheckRedirect hook installed on someone else's http.Client.
+	if resp.Request != nil && resp.Request.URL != nil {
+		if err := checkArtifactURL(resp.Request.URL.String()); err != nil {
+			_ = resp.Body.Close()
+			cancel()
+			return nil, fmt.Errorf("fetch %s was redirected: %w", url, err)
+		}
+	}
+	return &cancelOnClose{ReadCloser: newCappedBody(resp.Body, maxArtifactBytes), cancel: cancel}, nil
 }
 
 // cancelOnClose releases a fetch's derived context when its body is closed, so
