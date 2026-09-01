@@ -113,13 +113,25 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.48",
-		// Minted 2026-08-31 from the v6.18.48-k3sm.1 release: two-run
-		// byte-identical reproducible build (config hash 9c05f8f3b26c… is the
-		// -suffix of ActiveGuestKernel), digests re-derived from the published
-		// assets after upload, not from the local build output.
+		// Minted 2026-09-01 from the v6.18.48-k3sm.2 release. The KERNEL is
+		// byte-identical to k3sm.1 — same unmodified upstream tarball, same
+		// kernel.config, same build.sh, so ImageSHA256 and the config hash
+		// 9c05f8f3b26c… (the -suffix of ActiveGuestKernel) are unchanged. Only
+		// the initramfs moved: it carries the rebuilt k3sm-guest-init with the
+		// vm-path fixes found validating M11 on hardware (per-container log
+		// capture, late-subscriber state replay, chroot-semantics argv[0] and
+		// mount-target resolution, guest network bring-up + DHCP lease, per
+		// container cgroup2 leaves, writable binds out of the read-only stage,
+		// and a fatal reason on the console before poweroff).
+		//
+		// Two clean builds with the module cache cleared between them produced a
+		// byte-identical cpio, and BOTH digests below were re-derived by
+		// unauthenticated download of the published assets — never from the local
+		// build output, so a mismatch between what was built and what was
+		// uploaded cannot hide here.
 		ImageSHA256:     "d50508b08205453e5f5f710978743449dc4fafe957aa8694e6da8e5780d93308",
-		InitramfsSHA256: "0c6e88e94d1d9ff2b178ace58dd94343869e301d1ff9defa5550abc7880bb695",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.1",
+		InitramfsSHA256: "3cbf171c25d699372f1f0b16cbed6046d6ab81f7a0bdf8adbee3a07995919a3d",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.2",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
