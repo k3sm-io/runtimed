@@ -580,7 +580,7 @@ phases:
 
   - id: M11
     title: Linux containers & multi-arch (runtimed slice — platform selection, Linux rootfs, k3sm-vmhost, guest init/agent)
-    status: in-progress  # 2026-08-30 ledger repair: M11.2 has been in-progress with d1/d4/d6/d7 landed (and d0/d5 written back the same day); a todo top-level contradicted its own sub-phase
+    status: done  # 2026-09-01 (M11 validation): every M11.2 deliverable and acceptance is now true — a2/a3 closed once their d3-owned blockers landed, a5 verified on the GOWORK=off module view. The runtimed slice of the vm path is proven on hardware by the k3sm M11-core/M11-lab gates (21/0 and 26/0).
     depends_on: []
     notes: >-
       The XL heart of M11 (docs/m11-plan.md — authoritative). ABSORBS AND SUPERSEDES the
@@ -601,7 +601,7 @@ phases:
     subphases:
       - id: M11.2
         title: platform selection + OCI-layer unpacker + Linux rootfs builder + vmhost + guest init + vsock agent + volumes + metering
-        status: in-progress
+        status: done  # 2026-09-01 (M11 validation): d0-d11 done; a1-a10 all met.
         depends_on: [apis:M11.1]
         deliverables:
           - id: M11.2-d0
