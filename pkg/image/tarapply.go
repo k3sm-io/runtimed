@@ -166,21 +166,6 @@ type ApplyStats struct {
 	DroppedXattrs int `json:"dropped_xattrs,omitempty"`
 }
 
-// add accumulates o into s (per-layer stats summed across a whole tree).
-func (s *ApplyStats) add(o ApplyStats) {
-	s.Files += o.Files
-	s.Dirs += o.Dirs
-	s.Symlinks += o.Symlinks
-	s.Hardlinks += o.Hardlinks
-	s.SkippedSpecial += o.SkippedSpecial
-	s.StrippedSetIDs += o.StrippedSetIDs
-	s.Bytes += o.Bytes
-	s.Whiteouts += o.Whiteouts
-	s.OpaqueDirs += o.OpaqueDirs
-	s.WhiteoutMeta += o.WhiteoutMeta
-	s.DroppedXattrs += o.DroppedXattrs
-}
-
 // LayerApplier applies decompressed OCI layer tar streams, in order, into ONE
 // tree. Later layers overwrite earlier ones (the OCI apply order), which is why
 // the applier is stateful: the limits and the stats are per-TREE, not per-layer.

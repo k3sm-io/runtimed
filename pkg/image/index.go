@@ -419,6 +419,9 @@ func (x *FileIndex) lookupOne(root *os.Root, ref string, p Platform) (*runtimev1
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, false, nil
 		}
+		// LOCAL-ONLY, no boundErr: readAnchored's error names the entry FILE — a
+		// hex hash of the key (entryName) — plus an errno. No record content and
+		// no registry-supplied bytes reach it, which is what boundErr guards.
 		return nil, false, fmt.Errorf("%w: read %q: %v", ErrIndexEntryCorrupt, ref, err)
 	}
 	e, mfst, err := decodeEntry(ref, buf)
@@ -446,7 +449,11 @@ func (x *FileIndex) lookupOne(root *os.Root, ref string, p Platform) (*runtimev1
 func decodeEntry(what string, buf []byte) (indexEntry, *runtimev1.ImageManifest, error) {
 	var e indexEntry
 	if err := json.Unmarshal(buf, &e); err != nil {
-		return e, nil, fmt.Errorf("%w: decode %q: %v", ErrIndexEntryCorrupt, what, err)
+		// Both decoders here are THIRD-PARTY and both echo fragments of the
+		// document they were handed — encoding/json quotes the offending byte,
+		// protojson names the offending field — and that document is a record
+		// whose fields were filled from a registry manifest. Bounded as DATA.
+		return e, nil, fmt.Errorf("%w: decode %q: %v", ErrIndexEntryCorrupt, what, boundErr(err))
 	}
 	if e.Schema != indexSchema {
 		return e, nil, fmt.Errorf("%w: %q was written under schema %d, this daemon speaks %d",
@@ -454,7 +461,7 @@ func decodeEntry(what string, buf []byte) (indexEntry, *runtimev1.ImageManifest,
 	}
 	mfst := &runtimev1.ImageManifest{}
 	if err := protojson.Unmarshal(e.Manifest, mfst); err != nil {
-		return e, nil, fmt.Errorf("%w: decode manifest for %q: %v", ErrIndexEntryCorrupt, what, err)
+		return e, nil, fmt.Errorf("%w: decode manifest for %q: %v", ErrIndexEntryCorrupt, what, boundErr(err))
 	}
 	// The manifest is what the caller will act on, so it must name the reference
 	// the record was written for: RecordPodImage keys a pod's reachability root
@@ -539,6 +546,8 @@ func (x *FileIndex) List(ctx context.Context) ([]IndexEntry, error) {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue // raced with a concurrent replace; the next list sees it
 			}
+			// LOCAL-ONLY, no boundErr: as in lookupOne, this is an fs.PathError over
+			// an entry file name the loop above already restricted to "<hex>.json".
 			return nil, fmt.Errorf("%w: read %q: %v", ErrIndexEntryCorrupt, name, err)
 		}
 		e, mfst, err := decodeEntry(name, buf)
