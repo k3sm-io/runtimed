@@ -62,4 +62,13 @@ limitations under the License.
 // the mount path's tree. A subPath naming a non-existent element fails closed,
 // except for an emptyDir, whose missing subPath directory is created (kubelet
 // parity). subPathExpr (env-var-expanded subPath) is not yet implemented.
+//
+// # vm-RuntimeClass pods
+//
+// A pod that runs in a Linux guest has no rebased host tree: its volumes reach
+// the guest as virtiofs shares. ComputeSharePlan computes that share plan as
+// pure data (no filesystem access), and MaterializeShares is its filesystem
+// half — it creates the pod-dir share roots and renders each pooled proj/vols
+// volume into <shareRoot>/<volume name>, reusing the same per-volume renderers
+// the native spine uses. A bind's subPath is applied guest-side, not here.
 package mount

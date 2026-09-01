@@ -88,6 +88,30 @@ var errVMSidecarUnexpressible = errors.New("a native sidecar cannot be expressed
 // describes a pod no guest can compose. Compare with errors.Is.
 var errVMNoRootfsShare = errors.New("the share plan carries no container rootfs share")
 
+// errVMFsGroupUnsupported reports a vm pod that requests fsGroup.
+//
+// Applying fsGroup to a guest's volumes means presenting host-owned files under
+// the pod's supplemental group without a recursive chown, which is what an
+// idmapped mount is for — and this host cannot provide one: Apple's virtiofs
+// rejects mount_setattr(MOUNT_ATTR_IDMAP) with EINVAL, measured against a tmpfs
+// control on the same guest that accepts it. So the mechanism is unavailable for
+// the shares a vm pod's volumes arrive on, and no substitute is offered: a
+// recursive chmod would be a second, weaker ownership path that behaves
+// differently from the host-process spine's, which is precisely the dual path
+// this project declines to ship.
+//
+// REFUSING is the least-bad of three options. Stamping VMSpec.FSGroup would make
+// sandbox.idmapWanted mark the share binds Idmap, which guest init refuses
+// outright — turning a silent drop into an unexplained boot failure. Dropping it
+// silently, which is what shipped, lets an operator believe group ownership was
+// applied to a pod's volumes when it was not; that is a security-relevant field
+// reported as honoured while being ignored. Compare with errors.Is.
+var errVMFsGroupUnsupported = errors.New(
+	"fsGroup is not supported on the vm RuntimeClass on this platform: applying it requires " +
+		"idmapped mounts, and this host's virtiofs rejects them (mount_setattr with MOUNT_ATTR_IDMAP " +
+		"fails with EINVAL); the pod is refused rather than started with fsGroup silently ignored, " +
+		"so remove fsGroup from the pod's security context to run it on the vm RuntimeClass")
+
 // vmContainer pairs a container with the list it was declared in.
 type vmContainer struct {
 	spec *runtimev1.Container
@@ -156,7 +180,10 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 // none OF the HOST-PROCESS RESOLUTION HAPPENS. argv[0] is not resolved against a
 // host rootfs (resolveImageArgv0's containment check is about a path this daemon
 // is about to exec; the guest execs inside its own chroot, and no host path ever
-// crosses the boundary), nothing is ad-hoc signed or signature-gated (a Linux ELF
+// crosses the boundary) — the guest resolves it execvp-style against its own root
+// and the container's own PATH instead (guestinit.ResolveProgram), which is the
+// only side that can, since the rootfs a bare-name Entrypoint has to be searched
+// in exists only there. Nothing is ad-hoc signed or signature-gated (a Linux ELF
 // is not a Mach-O), and the environment is the MERGE only — containerEnv's TMPDIR
 // and DYLD inserts are macOS host-process facts that would be noise or worse
 // inside a guest.
@@ -164,16 +191,36 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 // backend is the pod's RESOLVED sandbox backend, threaded rather than restated so
 // the image-platform policy of these pulls is the rung the pod is actually
 // confined by (see pullPolicy).
-func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox, plan mount.SharePlan, backend runtimev1.SandboxBackend) ([]sandbox.VMContainer, runtimev1.FailureReason, error) {
+func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox, plan mount.SharePlan, backend runtimev1.SandboxBackend, rootfs string) ([]sandbox.VMContainer, runtimev1.FailureReason, error) {
 	rootfsTag, err := vmRootfsShareTag(plan)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
 	}
 	ordered := vmContainerOrder(box)
+	// The plan carries ONE rootfs share for the whole pod (vmRootfsShareTag's
+	// recorded ceiling), so exactly one image can be materialized into it: the
+	// first container's, in start order. A pod naming a second image is a pod
+	// this layout cannot represent — the second container would run its own
+	// merged argv against the first container's tree. That is logged loudly
+	// rather than overlaid: unpacking image N over image 1 would produce a tree
+	// no manifest describes, which is strictly worse than a legible warning
+	// beside the same broken pod the empty-rootfs build already produced.
+	// Per-container rootfs shares are the layout change that lifts this, and
+	// vmRootfsShareTag is where the selection would then live.
+	if extra, ok := vmExtraRootfsImage(ordered); ok {
+		r.log.Warn("vm pod names more than one image; only the first is materialized into the pod-wide rootfs share",
+			"pod", box.GetPodId(), "rootfs_image", ordered[0].spec.GetImage(), "unmaterialized_image", extra)
+	}
 	out := make([]sandbox.VMContainer, 0, len(ordered))
-	for _, e := range ordered {
-		vc, reason, err := r.resolveVMContainer(ctx, box, e, rootfsTag, backend)
+	for i, e := range ordered {
+		// The pod's single rootfs share is materialized once, from the first
+		// container in start order.
+		dst := ""
+		if i == 0 {
+			dst = rootfs
+		}
+		vc, reason, err := r.resolveVMContainer(ctx, box, e, rootfsTag, backend, dst)
 		if err != nil {
 			return nil, reason, err
 		}
@@ -182,9 +229,36 @@ func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox
 	return out, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
 
+// vmExtraRootfsImage reports the first image in start order that differs from
+// the one the pod's single rootfs share will carry, if any — the observable the
+// multi-image warning above is made from. An empty image is skipped:
+// resolveVMContainer refuses it with its own per-container message.
+func vmExtraRootfsImage(ordered []vmContainer) (string, bool) {
+	first := ""
+	for _, e := range ordered {
+		ref := e.spec.GetImage()
+		if ref == "" {
+			continue
+		}
+		if first == "" {
+			first = ref
+			continue
+		}
+		if ref != first {
+			return ref, true
+		}
+	}
+	return "", false
+}
+
 // resolveVMContainer resolves one container: pull, read the image config, merge
 // it with the pod spec, and map the result onto the guest carrier.
-func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox, e vmContainer, rootfsTag string, backend runtimev1.SandboxBackend) (sandbox.VMContainer, runtimev1.FailureReason, error) {
+//
+// rootfsDest, when non-empty, is the host directory the pod's k3sm.rootfs share
+// exports: this container's image is materialized into it (the guest composes
+// its root as an overlay over that share). It is set for exactly one container
+// per pod — see resolveVMContainers.
+func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox, e vmContainer, rootfsTag string, backend runtimev1.SandboxBackend, rootfsDest string) (sandbox.VMContainer, runtimev1.FailureReason, error) {
 	c := e.spec
 	name := c.GetName()
 	invalid := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
@@ -193,6 +267,10 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	}
 	pullFailed := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
 		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			fmt.Errorf("container %s: %w", name, err)
+	}
+	rootfsFailed := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
+		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("container %s: %w", name, err)
 	}
 
@@ -230,6 +308,35 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		return pullFailed(err)
 	}
 	res.Lease.Release()
+
+	// Materialize the image's layers into the pod's rootfs share (M11.2-d7's
+	// unpacker, on the vm spine). Until this call the vm path pulled and then
+	// left <podDir>/rootfs EMPTY: the guest mounted an empty lower layer, its
+	// first container exec found no /bin/sh, the container exited instantly and
+	// guest init powered the VM off with containers=0. The blobs being in the
+	// store is not the same fact as the pod's rootfs holding runnable files —
+	// MaterializeTree is the one call that turns one into the other.
+	//
+	// It runs after the lease release for the reason the host-process spine
+	// gives (resolveBinary): the reachability root recorded just above is what
+	// protects these blobs for the whole of the unpack, and it is durable where
+	// the lease expires. The dialect comes from the pod's own backend, so a
+	// Linux image is never applied under the native rules.
+	//
+	// A failure is ROOTFS_SETUP, not IMAGE_PULL: the registry did its part.
+	if rootfsDest != "" {
+		policy, perr := unpackPolicy(backend)
+		if perr != nil {
+			return rootfsFailed(perr)
+		}
+		mat, merr := r.unpacker.MaterializeTree(ctx, res.Manifest, policy, rootfsDest)
+		if merr != nil {
+			return rootfsFailed(fmt.Errorf("materialize image %q into %s: %w", ref, rootfsDest, merr))
+		}
+		r.log.Debug("materialized vm pod rootfs",
+			"pod", box.GetPodId(), "container", name, "image", ref, "rootfs", rootfsDest,
+			"tree", mat.Tree.Key, "tree_cache_hit", mat.Tree.CacheHit, "cloned", mat.Cloned)
+	}
 
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
 	if err != nil {

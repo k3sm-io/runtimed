@@ -387,13 +387,27 @@ func (b *argvBackend) calls() int {
 // treeUnpacker is a runtime.Unpacker that WRITES a fixed tree into the pod
 // rootfs, so a resolved argv[0] either names a file that exists or does not.
 // fakeUnpacker cannot serve this gate: it records the destination without
-// populating it, and every path would then be equally absent.
+// populating it, and every path would then be equally absent. It also RECORDS
+// each call's (policy, destination) so a caller can assert the dialect and the
+// directory as well as the files — the vm-rootfs gate needs all three.
 type treeUnpacker struct {
 	files  map[string]string
 	runCfg image.ImageRunConfig
+
+	mu    sync.Mutex
+	calls []unpackCall
+}
+
+// unpackCall is one recorded MaterializeTree invocation.
+type unpackCall struct {
+	policy image.UnpackPolicy
+	dst    string
 }
 
 func (u *treeUnpacker) MaterializeTree(_ context.Context, _ *runtimev1.ImageManifest, policy image.UnpackPolicy, dst string) (*image.MaterializeResult, error) {
+	u.mu.Lock()
+	u.calls = append(u.calls, unpackCall{policy: policy, dst: dst})
+	u.mu.Unlock()
 	for rel, data := range u.files {
 		p := filepath.Join(dst, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -404,6 +418,13 @@ func (u *treeUnpacker) MaterializeTree(_ context.Context, _ *runtimev1.ImageMani
 		}
 	}
 	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:tree", Rootfs: dst, Policy: policy}}, nil
+}
+
+// observed returns the recorded MaterializeTree calls in order.
+func (u *treeUnpacker) observed() []unpackCall {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]unpackCall(nil), u.calls...)
 }
 
 func (u *treeUnpacker) ImageRunConfig(*runtimev1.ImageManifest) (image.ImageRunConfig, error) {

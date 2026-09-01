@@ -147,7 +147,10 @@ func TestVMPodBootContractSatisfiesGuestInit(t *testing.T) {
 		{Name: "pgdata", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
 		{Name: "shm", EmptyDir: &runtimev1.EmptyDirVolumeSource{Medium: "Memory", SizeLimit: "64Mi"}},
 	}
-	box.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 999, RunAsGroup: 999, FsGroup: 2000}
+	// No fsGroup: a vm pod requesting one is refused (errVMFsGroupUnsupported),
+	// because this host's virtiofs cannot supply the idmapped mount that would
+	// apply it to the pod's volumes.
+	box.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 999, RunAsGroup: 999}
 
 	// createVMPod is entered directly rather than through CreatePod, because
 	// SelectBackend gates on VMBackend.Available(), which requires a validly
@@ -245,9 +248,6 @@ func TestVMPodBootContractSatisfiesGuestInit(t *testing.T) {
 		for _, c := range plan.Containers {
 			if c.Ident.UID != 999 || c.Ident.GID != 999 {
 				t.Errorf("%s ident = %d/%d, want the pod's 999/999", c.Name, c.Ident.UID, c.Ident.GID)
-			}
-			if !containsInt64(c.Ident.Groups, 2000) {
-				t.Errorf("%s supplemental groups = %v, want the pod fsGroup 2000 among them", c.Name, c.Ident.Groups)
 			}
 		}
 	})
