@@ -41,10 +41,17 @@ limitations under the License.
 //
 // not yet IN this BINARY, and deliberately so — each is its own slice with its
 // own gate: the eth0 DHCP client (so /etc/hosts carries no leased address yet,
-// and HealthResponse.guest_ip is empty), the per-container cgroup2 leaves (so
-// Stats omits every container rather than reporting zeros), and pty allocation
-// (so a tty exec is refused rather than run without a terminal). A spec
-// requesting an idmapped mount is refused rather than mounted without the idmap.
+// and HealthResponse.guest_ip is empty), and pty allocation (so a tty exec is
+// refused rather than run without a terminal). A spec requesting an idmapped mount
+// is refused rather than mounted without the idmap.
+//
+// Per-container cgroup2 leaves ARE here: the metering controllers are delegated to
+// the hierarchy root's children at boot and each container is placed into
+// <cgroup2Root>/<name> by the kernel at fork, so the Stats verb finds cpu.stat,
+// memory.current and memory.stat where cgroupSampler looks. A container's
+// memory.max is NOT set: guest/v1's GuestContainer carries no resource limit, so
+// the pod's per-container limit does not reach this binary at all, and the only
+// memory ceiling in force is the hypervisor's VZ memorySize for the whole guest.
 //
 // Per-container log capture IS here: each container is spawned on its own
 // stdout/stderr pipes, which are pumped into a bounded per-container ring
@@ -190,6 +197,24 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// an unbounded buffer in a guest whose only storage is RAM is an OOM.
 	capture := guestagent.NewCapture(0, 0, 0)
 	defer capture.CloseAll()
+
+	// Delegate the metering controllers to the hierarchy root's children BEFORE
+	// the first leaf is created: a leaf only gets memory.current / memory.stat if
+	// its parent had the memory controller in cgroup.subtree_control when the leaf
+	// was made. Without this the sampler found no files, Stats omitted every
+	// container, and `kubectl top` reported nothing for a vm pod
+	// (/stats/summary answered {"pods":null}).
+	//
+	// BEST EFFORT, never fatal. A kernel built without a controller costs the pod
+	// its metering; refusing to run the workload over it would cost the pod
+	// everything. That is the same degradation the sampler already documents —
+	// absence rather than zeros — reached one step earlier and said out loud.
+	if enabled, err := guestagent.EnableSubtreeControllers(cgroup2Root, guestagent.StatsControllers); err != nil {
+		log.Warn("some cgroup2 controllers could not be delegated; those metrics will be absent",
+			"root", cgroup2Root, "enabled", enabled, "err", err)
+	} else {
+		log.Info("delegated cgroup2 controllers", "root", cgroup2Root, "controllers", enabled)
+	}
 
 	reaper := guestinit.NewReaper(proc, sigchld, guestinit.ReaperOptions{
 		Logger: log,
@@ -392,7 +417,7 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 		if err := applyMounts(log, cp.Mounts); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
 		}
-		pid, err := spawn(cp, capture)
+		pid, err := spawn(cp, capture, log)
 		if err != nil {
 			return fmt.Errorf("start container %s: %w", cp.Name, err)
 		}
@@ -438,7 +463,16 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 // and giving it a pipe nothing writes to would turn a workload that reads stdin
 // from a process that blocks into one that gets EOF — a different behaviour,
 // chosen by accident.
-func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture) (int, error) {
+//
+// the CGROUP2 LEAF is JOINED BY the KERNEL, at FORK. The child is placed into
+// <cgroup2Root>/<container> by CLONE_INTO_CGROUP (SysProcAttr.UseCgroupFD), so it
+// has never executed a single instruction outside its own cgroup — there is no
+// window in which its CPU time or its pages are charged to PID 1's cgroup, and
+// nothing to race. Go gives no hook between fork and exec, so a post-fork write to
+// cgroup.procs would be the only alternative, and it necessarily has that window.
+// The post-fork JoinLeaf below is a reconcile for the one case this cannot cover
+// (a kernel too old for clone3), not the mechanism.
+func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Logger) (int, error) {
 	groups := make([]uint32, 0, len(cp.Ident.Groups))
 	for _, g := range cp.Ident.Groups {
 		groups = append(groups, uint32(g))
@@ -456,19 +490,39 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture) (int, error)
 		closeAll(stdoutR, stdoutW)
 		return 0, fmt.Errorf("stderr pipe: %w", err)
 	}
+	sys := &syscall.SysProcAttr{
+		Chroot: cp.Root,
+		Credential: &syscall.Credential{
+			Uid:    uint32(cp.Ident.UID),
+			Gid:    uint32(cp.Ident.GID),
+			Groups: groups,
+		},
+		Setsid: true,
+	}
+	// The leaf is opened, not just created: CLONE_INTO_CGROUP takes a DIRECTORY
+	// FD, and holding it across the fork is what makes the placement atomic.
+	// Best effort — a guest that cannot make a leaf still runs its workload, it
+	// just cannot meter it (see EnableSubtreeControllers).
+	leaf, leafDir := "", (*os.File)(nil)
+	if p, cerr := guestagent.CreateLeaf(cgroup2Root, cp.Name); cerr != nil {
+		log.Warn("no cgroup2 leaf for a container; it will not be metered",
+			"container", cp.Name, "err", cerr)
+	} else if fd, oerr := os.Open(p); oerr != nil {
+		log.Warn("could not open the cgroup2 leaf; the container will not be metered",
+			"container", cp.Name, "leaf", p, "err", oerr)
+	} else {
+		leaf, leafDir = p, fd
+		sys.UseCgroupFD = true
+		sys.CgroupFD = int(fd.Fd())
+	}
+	if leafDir != nil {
+		defer func() { _ = leafDir.Close() }()
+	}
 	attr := &syscall.ProcAttr{
 		Dir:   dir,
 		Env:   cp.Env,
 		Files: []uintptr{0, stdoutW.Fd(), stderrW.Fd()},
-		Sys: &syscall.SysProcAttr{
-			Chroot: cp.Root,
-			Credential: &syscall.Credential{
-				Uid:    uint32(cp.Ident.UID),
-				Gid:    uint32(cp.Ident.GID),
-				Groups: groups,
-			},
-			Setsid: true,
-		},
+		Sys:   sys,
 	}
 	pid, err := syscall.ForkExec(cp.Argv[0], cp.Argv, attr)
 	// This process's copies of the child's write ends go immediately after the
@@ -478,6 +532,16 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture) (int, error)
 	if err != nil {
 		closeAll(stdoutR, stderrR)
 		return 0, err
+	}
+	if leaf != "" {
+		// The reconcile. On every kernel this guest ships against the child is
+		// already a member and this write changes nothing; it repairs the
+		// clone3-unavailable case. A failure means the container is unmetered, not
+		// that it is unhealthy, so it is logged and not returned.
+		if jerr := guestagent.JoinLeaf(leaf, pid); jerr != nil {
+			log.Warn("could not confirm the container's cgroup2 membership; it may not be metered",
+				"container", cp.Name, "leaf", leaf, "pid", pid, "err", jerr)
+		}
 	}
 	go pumpOutput(stdoutR, capture.Writer(cp.Name, guestagent.StreamStdout), os.Stdout)
 	go pumpOutput(stderrR, capture.Writer(cp.Name, guestagent.StreamStderr), os.Stderr)

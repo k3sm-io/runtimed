@@ -102,12 +102,14 @@ func (r *reaperRunner) Stop(ctx context.Context, grace time.Duration) error {
 // cgroupSampler is the Sampler seam: one container's cgroup2 files, read on
 // demand.
 //
-// per-CONTAINER cgroup2 leaves are not yet created by this init (see the package
-// doc's "not yet IN this BINARY" list), so on today's guest every Sample reports
-// that no leaf exists and the server omits that container from the response. That
-// is the honest answer — absence rather than zeros, exactly as guest.proto requires
-// — and it is why this type is wired now rather than later: when the leaves land,
-// the reader is already here and already correct.
+// The leaf it reads is created by spawn and joined by the kernel at fork
+// (guestagent.CreateLeaf + SysProcAttr.UseCgroupFD), and the memory files exist
+// because the boot delegated the memory controller to the hierarchy root's
+// children first (guestagent.EnableSubtreeControllers). All three are best effort:
+// a kernel missing a controller leaves the container unmetered rather than
+// unstarted, so a Sample that finds nothing is still a normal outcome and is still
+// reported as ABSENCE rather than as zeros — a zero working set is
+// indistinguishable from an idle container.
 type cgroupSampler struct {
 	root string
 }
