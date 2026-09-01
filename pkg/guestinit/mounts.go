@@ -166,6 +166,19 @@ type MountStep struct {
 	// IDMap, when non-nil, is the idmapped-mount request this mount carries.
 	IDMap *IDMap
 
+	// ResolveRoot, when non-empty, is the container root Target must be resolved
+	// inside with CHROOT semantics before the target is created or mounted.
+	//
+	// It is set on every step whose target lies inside a container's composed
+	// rootfs, because that rootfs is the IMAGE's and the image decides what is a
+	// symlink. Nearly every base image ships /var/run as an ABSOLUTE symlink to
+	// /run, and the kernel resolves an absolute symlink against the mounting
+	// process's root — the guest's — not the container's. Both the MkdirAll and
+	// the mount then SUCCEED against a guest path that exists, and the container
+	// sees nothing at its mountPath: this is why no vm pod could read its
+	// ServiceAccount token. See guestinit.ResolveTarget.
+	ResolveRoot string
+
 	// Why is a one-line rationale for the boot log, so a failed mount is
 	// legible without reading this package.
 	Why string
@@ -241,11 +254,14 @@ func SpecMount() MountStep {
 // so a bind that skipped the remount would expose a credential file writable
 // while looking correct in the plan.
 func readOnlyBind(step MountStep) []MountStep {
+	// The remount targets the SAME path, so it needs the same chroot-semantics
+	// resolution the bind does — otherwise it would remount a guest path.
 	remount := MountStep{
-		Source:  step.Source,
-		Target:  step.Target,
-		Options: []MountOption{OptionBind, OptionRemount, OptionReadOnly},
-		Why:     "remount: MS_BIND|MS_RDONLY in one call does not apply RDONLY on Linux",
+		Source:      step.Source,
+		Target:      step.Target,
+		ResolveRoot: step.ResolveRoot,
+		Options:     []MountOption{OptionBind, OptionRemount, OptionReadOnly},
+		Why:         "remount: MS_BIND|MS_RDONLY in one call does not apply RDONLY on Linux",
 	}
 	return []MountStep{step, remount}
 }
@@ -265,11 +281,14 @@ func readOnlyBind(step MountStep) []MountStep {
 // no-op on a bind that was already writable — which is why this is emitted
 // whenever the source mount is read-only and never conditioned on a tag.
 func writableBind(step MountStep) []MountStep {
+	// The remount targets the SAME path, so it needs the same chroot-semantics
+	// resolution the bind does — otherwise it would remount a guest path.
 	remount := MountStep{
-		Source:  step.Source,
-		Target:  step.Target,
-		Options: []MountOption{OptionBind, OptionRemount},
-		Why:     "remount: a bind inherits its source mount's MS_RDONLY and must be cleared explicitly",
+		Source:      step.Source,
+		Target:      step.Target,
+		ResolveRoot: step.ResolveRoot,
+		Options:     []MountOption{OptionBind, OptionRemount},
+		Why:         "remount: a bind inherits its source mount's MS_RDONLY and must be cleared explicitly",
 	}
 	return []MountStep{step, remount}
 }
@@ -294,11 +313,14 @@ func writableBind(step MountStep) []MountStep {
 // mount keeps SB_RDONLY, which is the stronger posture and the right one for
 // the rootfs lower layer and the spec share.
 func perMountReadOnly(step MountStep) []MountStep {
+	// The remount targets the SAME path, so it needs the same chroot-semantics
+	// resolution the bind does — otherwise it would remount a guest path.
 	remount := MountStep{
-		Source:  step.Source,
-		Target:  step.Target,
-		Options: []MountOption{OptionBind, OptionRemount, OptionReadOnly},
-		Why:     "remount: read-only at the mount, not the superblock, so writable binds out of it stay writable",
+		Source:      step.Source,
+		Target:      step.Target,
+		ResolveRoot: step.ResolveRoot,
+		Options:     []MountOption{OptionBind, OptionRemount, OptionReadOnly},
+		Why:         "remount: read-only at the mount, not the superblock, so writable binds out of it stay writable",
 	}
 	return []MountStep{step, remount}
 }
@@ -564,6 +586,7 @@ func EtcBinds(container string) []MountStep {
 			Options:     []MountOption{OptionBind},
 			TouchTarget: true,
 			MkdirExtra:  []string{path.Join(root, "etc")},
+			ResolveRoot: root,
 			Why:         "the chroot shadows the guest /etc: " + f + " is the kubelet contract",
 		}
 		out = append(out, readOnlyBind(step)...)
@@ -659,6 +682,7 @@ func containerVisibleMounts(name string, pod []MountStep) []MountStep {
 			Target:      path.Join(root, r.target),
 			Options:     []MountOption{OptionRBind},
 			MkdirTarget: true,
+			ResolveRoot: root,
 			Why:         "pod mount " + r.target + " re-exposed inside the container rootfs",
 		}
 		if r.readOnly {

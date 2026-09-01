@@ -74,6 +74,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"strings"
 	"syscall"
 	"time"
 
@@ -370,6 +371,29 @@ func readSpec(path string) (*guestv1.GuestSpec, error) {
 // applyMounts performs a plan's mount steps in order.
 func applyMounts(log *slog.Logger, steps []guestinit.MountStep) error {
 	for _, s := range steps {
+		// A target inside a container's composed rootfs is resolved with CHROOT
+		// semantics first. The image decides what is a symlink there, and nearly
+		// every base image ships /var/run as an ABSOLUTE symlink to /run — which
+		// the kernel resolves against THIS process's root, not the container's. So
+		// both the MkdirAll and the mount below would succeed against a guest path
+		// that exists while the container saw nothing at its mountPath. That is
+		// why no vm pod could read its ServiceAccount token.
+		if s.ResolveRoot != "" {
+			resolved, rerr := guestinit.ResolveTarget(s.ResolveRoot, strings.TrimPrefix(s.Target, s.ResolveRoot))
+			if rerr != nil {
+				return fmt.Errorf("mount %s at %s (%s): %w", s.Source, s.Target, s.Why, rerr)
+			}
+			s.Target = resolved
+			// MkdirExtra names paths inside the same rootfs and is created by the
+			// same MkdirAll, so it takes the same resolution.
+			for i, dir := range s.MkdirExtra {
+				rd, derr := guestinit.ResolveTarget(s.ResolveRoot, strings.TrimPrefix(dir, s.ResolveRoot))
+				if derr != nil {
+					return fmt.Errorf("mkdir %s (%s): %w", dir, s.Why, derr)
+				}
+				s.MkdirExtra[i] = rd
+			}
+		}
 		if s.IDMap != nil {
 			// Refusing beats mounting without the idmap: a PVC written under
 			// the wrong owner is damage that outlives the pod.

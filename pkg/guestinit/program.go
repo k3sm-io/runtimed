@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -190,6 +191,100 @@ func ResolveProgram(root, workingDir, argv0, pathEnv string) (string, error) {
 	return "", fmt.Errorf("%w: %q (searched PATH %q)", ErrProgramNotFound, argv0, pathEnv)
 }
 
+// ResolveTarget resolves a container-absolute path inside the container rooted at
+// root with CHROOT SEMANTICS, and returns the HOST path to operate on. Trailing
+// components that do not exist are not an error — they are precisely the ones a
+// caller is about to create.
+//
+// why a MOUNT TARGET needs this. A container image ships /var/run as an ABSOLUTE
+// symlink to /run (alpine, debian, ubuntu — nearly all of them). The guest
+// prepares a re-exposed pod mount by MkdirAll'ing <containerRoot>/var/run/... and
+// then mounting there, and the kernel resolves that absolute symlink against the
+// GUEST's root rather than the container's. So the directory was created, and the
+// bind landed, at the guest's /run/secrets/... — a path that exists, so both calls
+// SUCCEED — while the container, chrooted, saw nothing at its mountPath. Every vm
+// pod's ServiceAccount token was missing for this reason, and no in-cluster client
+// could authenticate.
+//
+// Resolving here makes the mount land where the container will look: /var/run
+// resolves to the container's own /run, the bind is made at
+// <containerRoot>/run/secrets/..., and the chrooted container reaches it both
+// directly and through its own symlink.
+//
+// A path that escapes the container root is REFUSED, never clamped. A real chroot
+// clamps ".." at its root, so this is stricter than the kernel — deliberately, and
+// consistently with ResolveProgram: a mount target that only makes sense outside
+// the container is a plan this guest should not carry out silently.
+func ResolveTarget(root, guestPath string) (string, error) {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", fmt.Errorf("open the container root %s: %w", root, err)
+	}
+	defer func() { _ = r.Close() }()
+	resolved, _, _, err := walkContainerPath(r, guestPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve mount target %q in %s: %w", guestPath, root, err)
+	}
+	return filepath.Join(root, filepath.FromSlash(resolved)), nil
+}
+
+// walkContainerPath resolves guestPath inside r one component at a time, with
+// chroot semantics, and reports the resolved container-relative path, how many
+// symlinks it followed, and whether the final component exists.
+//
+// COMPONENT BY COMPONENT, not one Lstat of the whole path. os.Root resolves
+// intermediate components itself, but it refuses an ABSOLUTE symlink anywhere in
+// the chain — correctly, by its own contract, since it has no notion of a chroot.
+// This walk exists to do the one thing that contract cannot: treat an absolute
+// target as container-absolute. Everything else — per-component confinement, the
+// refusal of anything reaching outside — is still os.Root's, because the rewritten
+// name is handed straight back to it.
+func walkContainerPath(r *os.Root, guestPath string) (resolved string, hops int, exists bool, err error) {
+	parts := strings.Split(strings.TrimPrefix(path.Clean(guestPath), "/"), "/")
+	var out []string
+	for i := 0; i < len(parts); {
+		p := parts[i]
+		if p == "" || p == "." {
+			i++
+			continue
+		}
+		cand := path.Join(append(append([]string{}, out...), p)...)
+		fi, lerr := r.Lstat(cand)
+		switch {
+		case errors.Is(lerr, os.ErrNotExist):
+			// This component and everything after it is yet to be created. The
+			// tail carries no symlinks precisely because it does not exist.
+			return path.Join(append(out, parts[i:]...)...), hops, false, nil
+		case lerr != nil:
+			// os.Root refusing an escape lands here, which is the answer this
+			// wants: a target reaching outside the container root is not resolved.
+			return "", hops, false, lerr
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			out = append(out, p)
+			i++
+			continue
+		}
+		hops++
+		if hops > maxSymlinkHops {
+			return "", hops, false, errors.New("too many levels of symbolic links")
+		}
+		target, rerr := r.Readlink(cand)
+		if rerr != nil {
+			return "", hops, false, rerr
+		}
+		rest := parts[i+1:]
+		if path.IsAbs(target) {
+			// Container-absolute. This single line is the defect: the kernel
+			// would resolve it against the GUEST root.
+			out = nil
+		}
+		parts = append(strings.Split(strings.TrimPrefix(path.Clean(target), "/"), "/"), rest...)
+		i = 0
+	}
+	return path.Join(out...), hops, true, nil
+}
+
 // maxSymlinkHops bounds the symlink chain one candidate may traverse. It is
 // Linux's own SYMLOOP_MAX: a chain longer than this is a loop in every case that
 // matters, and the bound is what stops "a -> b -> a" from spinning here.
@@ -199,66 +294,46 @@ const maxSymlinkHops = 40
 // and reports whether it exists and is an executable regular file. When it is
 // unusable for a reason worth telling the operator, why says which.
 //
-// The loop is the whole subtlety. r.Lstat does NOT follow the final component,
-// which is what lets this read the link and decide how to interpret its target;
-// every INTERMEDIATE component is resolved and confined by os.Root itself, so
-// nothing here has to re-implement containment. An ABSOLUTE target is rewritten
-// relative to the container root — the one thing os.Root will not do, and exactly
-// what a chroot would — while a relative one is joined onto the link's own
-// directory. A target that escapes the root after that rewrite is refused by the
-// next r.Lstat, which is where the containment guarantee comes from.
+// It shares walkContainerPath with ResolveTarget, so there is ONE home for chroot
+// path semantics in this guest. That sharing also closed a latent instance of the
+// mount-target defect living here: this used to hand the whole path to r.Lstat,
+// which refuses an absolute symlink among the INTERMEDIATE components — so an
+// image shipping /usr/bin as a link to /bin could not resolve argv[0] at all.
 //
 // A path that does not exist, and one whose link chain dangles, are reported
 // apart: "you spelled it wrong" and "this image ships a broken link" are
 // different problems with different fixes.
 func candidate(r *os.Root, guestPath string) (exists, executable bool, why string) {
-	name := strings.TrimPrefix(path.Clean(guestPath), "/")
-	if name == "" || name == "." {
-		return false, false, ""
-	}
-	for hop := 0; hop <= maxSymlinkHops; hop++ {
-		fi, err := r.Lstat(name)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			if hop > 0 {
-				return false, false, "is a symlink whose target does not exist in the container"
-			}
-			return false, false, ""
-		case errors.Is(err, os.ErrPermission):
+	resolved, hops, found, err := walkContainerPath(r, guestPath)
+	switch {
+	case err != nil:
+		if errors.Is(err, os.ErrPermission) {
 			// A directory along the way this process cannot read is the same
 			// "cannot use this element" as absence: a container whose PATH names
 			// an unreadable directory still runs.
 			return false, false, ""
-		case err != nil:
-			// os.Root refuses anything leaving the container root, which is the
-			// case this arm exists for: a symlink out of the image must never
-			// resolve to the guest's own copy of a binary.
-			return false, false, "resolves outside the container root"
 		}
-		if fi.Mode()&os.ModeSymlink == 0 {
-			if !fi.Mode().IsRegular() {
-				// A directory or a device named where a program should be is "not
-				// it", exactly as execvp treats it.
-				return true, false, ""
-			}
-			return true, fi.Mode().Perm()&0o111 != 0, ""
+		if hops > maxSymlinkHops {
+			return false, false, "has too many levels of symbolic links"
 		}
-		target, err := r.Readlink(name)
-		if err != nil {
-			return false, false, "resolves outside the container root"
+		// os.Root refuses anything leaving the container root, which is the case
+		// this arm exists for: a symlink out of the image must never resolve to
+		// the guest's own copy of a binary.
+		return false, false, "resolves outside the container root"
+	case !found:
+		if hops > 0 {
+			return false, false, "is a symlink whose target does not exist in the container"
 		}
-		if path.IsAbs(target) {
-			// Container-absolute, not host-absolute. This is the line the
-			// regression turned on: /bin/sh -> /bin/busybox means the container's
-			// /bin/busybox, and resolving it against the guest's root found
-			// nothing.
-			name = strings.TrimPrefix(path.Clean(target), "/")
-		} else {
-			name = path.Join(path.Dir(name), target)
-		}
-		if name == "" || name == "." {
-			return false, false, "resolves outside the container root"
-		}
+		return false, false, ""
 	}
-	return false, false, "has too many levels of symbolic links"
+	fi, lerr := r.Lstat(resolved)
+	if lerr != nil {
+		return false, false, "resolves outside the container root"
+	}
+	if !fi.Mode().IsRegular() {
+		// A directory or a device named where a program should be is "not it",
+		// exactly as execvp treats it.
+		return true, false, ""
+	}
+	return true, fi.Mode().Perm()&0o111 != 0, ""
 }
