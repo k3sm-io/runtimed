@@ -46,6 +46,16 @@ func containerRoot(t *testing.T, entries ...string) string {
 			}
 			mode = os.FileMode(m)
 		}
+		if link, target, isLink := strings.Cut(spec, "->"); isLink {
+			p := filepath.Join(root, filepath.FromSlash(link))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, p); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
 		p := filepath.Join(root, filepath.FromSlash(spec))
 		if strings.HasSuffix(spec, "/") {
 			if err := os.MkdirAll(p, 0o755); err != nil {
@@ -240,6 +250,89 @@ func TestResolveProgram(t *testing.T) {
 			pathEnv:      "../../../../../../bin",
 			wantErr:      true,
 			errFragments: []string{"sh"},
+		},
+		{
+			// THE SHIPPED ALPINE SHAPE, and the one whose absence let a regression
+			// through: /bin/sh is an absolute symlink to /bin/busybox, meaning
+			// /bin/busybox INSIDE the container. Resolving it against the guest's
+			// own root finds nothing, and `command: ["/bin/sh","-c"]` — the most
+			// common command there is — cannot start.
+			name:    "an-absolute-argv0-that-is-an-absolute-symlink-resolves",
+			entries: []string{"bin/busybox", "bin/sh->/bin/busybox"},
+			argv0:   "/bin/sh",
+			pathEnv: DefaultPath,
+			want:    "/bin/sh",
+		},
+		{
+			// The same shape reached through PATH. Busybox images symlink nearly
+			// every applet this way, so a bare name resolving is no evidence the
+			// PATH branch is safe.
+			name:    "a-bare-name-found-via-path-that-is-an-absolute-symlink-resolves",
+			entries: []string{"bin/busybox", "usr/bin/awk->/bin/busybox"},
+			argv0:   "awk",
+			pathEnv: "/usr/bin:/bin",
+			want:    "/usr/bin/awk",
+		},
+		{
+			name:    "a-relative-symlink-in-the-same-directory-resolves",
+			entries: []string{"bin/busybox", "bin/ash->busybox"},
+			argv0:   "/bin/ash",
+			pathEnv: DefaultPath,
+			want:    "/bin/ash",
+		},
+		{
+			name:    "a-symlink-chain-resolves-to-the-final-target",
+			entries: []string{"bin/busybox", "bin/sh->/bin/ash", "bin/ash->busybox"},
+			argv0:   "/bin/sh",
+			pathEnv: DefaultPath,
+			want:    "/bin/sh",
+		},
+		{
+			name:         "a-dangling-symlink-is-refused-and-says-so",
+			entries:      []string{"bin/sh->/bin/nope"},
+			argv0:        "/bin/sh",
+			pathEnv:      DefaultPath,
+			wantErr:      true,
+			errFragments: []string{"/bin/sh", "target does not exist"},
+		},
+		{
+			// A relative escape. Refusing is the point: following it would let an
+			// image reach the guest init's own filesystem by shipping a symlink.
+			name:         "a-symlink-pointing-out-of-the-container-root-is-refused",
+			entries:      []string{"bin/sh->../../../../etc/passwd"},
+			argv0:        "/bin/sh",
+			pathEnv:      DefaultPath,
+			wantErr:      true,
+			errFragments: []string{"/bin/sh", "outside the container root"},
+		},
+		{
+			// An absolute target that exists on the GUEST but not in the container.
+			// It must NOT silently resolve to the guest's copy — that would run a
+			// different program under the container's name.
+			name:         "an-absolute-symlink-to-a-guest-only-path-is-refused",
+			entries:      []string{"bin/sh->/etc/passwd"},
+			argv0:        "/bin/sh",
+			pathEnv:      DefaultPath,
+			wantErr:      true,
+			errFragments: []string{"/bin/sh", "target does not exist"},
+		},
+		{
+			// A symlink to a non-executable file: the executability verdict is
+			// made on the RESOLVED target, not on the link.
+			name:         "a-symlink-to-a-non-executable-target-is-refused",
+			entries:      []string{"bin/data:644", "bin/sh->/bin/data"},
+			argv0:        "/bin/sh",
+			pathEnv:      DefaultPath,
+			wantErr:      true,
+			errFragments: []string{"/bin/sh", "not executable"},
+		},
+		{
+			name:         "a-symlink-loop-is-refused",
+			entries:      []string{"bin/a->/bin/b", "bin/b->/bin/a"},
+			argv0:        "/bin/a",
+			pathEnv:      DefaultPath,
+			wantErr:      true,
+			errFragments: []string{"/bin/a"},
 		},
 		{
 			name:         "an-empty-argv0-is-refused",

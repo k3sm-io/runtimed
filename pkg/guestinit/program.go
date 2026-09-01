@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 )
 
@@ -85,19 +84,34 @@ func PathFromEnv(env []string) string {
 // The failure names argv[0] AND the PATH that was searched, because with the
 // console fix (Reaper.Fail) that message is now what an operator actually sees.
 //
-// SEARCHED under root, NEVER under the guest's own /. Every candidate is joined
-// onto root before it is stat'd, and one that escapes root after cleaning is
-// skipped — pathEnv is pod-controlled, so a "../../.." element must not be able to
-// address the guest init's own filesystem. A host-side lookup (os/exec.LookPath)
-// would search the wrong filesystem entirely and is the specific mistake this
-// signature is shaped to make impossible: there is no way to call it without
-// naming a root.
+// SEARCHED under root with CHROOT SEMANTICS, never under the guest's own /. Both
+// halves of that are load-bearing and the second was learned the hard way.
 //
-// One residual, stated rather than hidden: an ABSOLUTE symlink inside the
-// container is followed against the filesystem doing the stat, not against the
-// container root, so such a link can be reported resolvable for a target the
-// chrooted child cannot reach. The exec then fails exactly as it does today, so
-// the check is never worse than not checking — it is only not a proof.
+// Confining the PATH JOIN is not enough. The first version did that and still
+// resolved symlinks with os.Stat, which hands the target to the kernel to resolve
+// against the calling process's own root — so alpine's /bin/sh, an ABSOLUTE
+// symlink to /bin/busybox, was looked for at the guest init's /bin/busybox, which
+// does not exist in the initramfs. A file that was present and executable was
+// reported absent, and `command: ["/bin/sh","-c"]` — the most common command
+// there is — could not start. Busybox images symlink nearly every applet this
+// way, so the same failure reaches the PATH branch too; a bare name resolving is
+// no evidence that it is safe.
+//
+// So every candidate is resolved through an os.Root opened on the container root:
+// each component is confined by the standard library, and this walks the symlink
+// chain itself only to do the one thing os.Root deliberately will not — treat an
+// ABSOLUTE target as container-absolute rather than as an escape. A relative
+// target is resolved against the link's own directory, as the kernel would.
+//
+// A link that leaves the container root is REFUSED, never followed: os.Root
+// rejects it, and that is the right answer rather than an inconvenience. Resolving
+// it would let an image reach the guest's own filesystem by shipping a symlink —
+// and would silently run the guest's copy of a binary under the container's name.
+// A dangling link is likewise refused, with a message that says which.
+//
+// A host-side lookup (os/exec.LookPath) would search the wrong filesystem
+// entirely and is the specific mistake this signature is shaped to make
+// impossible: there is no way to call it without naming a root.
 func ResolveProgram(root, workingDir, argv0, pathEnv string) (string, error) {
 	if argv0 == "" {
 		return "", fmt.Errorf("%w: argv[0] is empty", ErrProgramNotFound)
@@ -109,15 +123,24 @@ func ResolveProgram(root, workingDir, argv0, pathEnv string) (string, error) {
 		pathEnv = DefaultPath
 	}
 
+	// One handle for the whole search: os.Root holds a descriptor on the container
+	// root, so every candidate below is resolved against THAT directory even if
+	// something renames or replaces a path component mid-search.
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", fmt.Errorf("%w: open the container root %s: %w", ErrProgramNotFound, root, err)
+	}
+	defer func() { _ = r.Close() }()
+
 	if strings.ContainsRune(argv0, '/') {
 		guest := argv0
 		if !path.IsAbs(guest) {
 			guest = path.Join(workingDir, guest)
 		}
-		ok, exec, err := candidate(root, guest)
+		ok, exec, why := candidate(r, guest)
 		switch {
-		case err != nil:
-			return "", err
+		case !ok && why != "":
+			return "", fmt.Errorf("%w: %q %s", ErrProgramNotFound, argv0, why)
 		case !ok:
 			return "", fmt.Errorf("%w: %q names a path that does not exist in the container", ErrProgramNotFound, argv0)
 		case !exec:
@@ -129,7 +152,7 @@ func ResolveProgram(root, workingDir, argv0, pathEnv string) (string, error) {
 		return argv0, nil
 	}
 
-	var notExecutable string
+	var notExecutable, rejected string
 	for _, dir := range strings.Split(pathEnv, ":") {
 		guestDir := dir
 		if guestDir == "" || !path.IsAbs(guestDir) {
@@ -138,12 +161,16 @@ func ResolveProgram(root, workingDir, argv0, pathEnv string) (string, error) {
 			guestDir = path.Join(workingDir, guestDir)
 		}
 		guest := path.Join(guestDir, argv0)
-		ok, exec, err := candidate(root, guest)
-		if err != nil {
-			return "", err
-		}
+		ok, exec, why := candidate(r, guest)
 		switch {
 		case !ok:
+			// A candidate that was there but unusable — dangling, or pointing out
+			// of the container — does not end the search, exactly as an
+			// unreadable one does not. It is remembered so the failure can name
+			// the specific problem instead of a bare "not found".
+			if why != "" && rejected == "" {
+				rejected = fmt.Sprintf("%s %s", guest, why)
+			}
 			continue
 		case !exec:
 			if notExecutable == "" {
@@ -153,44 +180,85 @@ func ResolveProgram(root, workingDir, argv0, pathEnv string) (string, error) {
 		}
 		return guest, nil
 	}
-	if notExecutable != "" {
+	switch {
+	case notExecutable != "":
 		return "", fmt.Errorf("%w: %q resolved to %s in the container, which is not executable (searched PATH %q)",
 			ErrProgramNotFound, argv0, notExecutable, pathEnv)
+	case rejected != "":
+		return "", fmt.Errorf("%w: %q: %s (searched PATH %q)", ErrProgramNotFound, argv0, rejected, pathEnv)
 	}
 	return "", fmt.Errorf("%w: %q (searched PATH %q)", ErrProgramNotFound, argv0, pathEnv)
 }
 
-// candidate stats one container-absolute path under root, reporting whether it
-// exists and whether it is an executable regular file.
+// maxSymlinkHops bounds the symlink chain one candidate may traverse. It is
+// Linux's own SYMLOOP_MAX: a chain longer than this is a loop in every case that
+// matters, and the bound is what stops "a -> b -> a" from spinning here.
+const maxSymlinkHops = 40
+
+// candidate resolves one container-absolute path inside r with chroot semantics
+// and reports whether it exists and is an executable regular file. When it is
+// unusable for a reason worth telling the operator, why says which.
 //
-// A path that escapes root after cleaning reports "does not exist" rather than an
-// error: pathEnv is pod-controlled, an element like "../../.." is a mistake or an
-// attempt rather than a fatal condition, and skipping it lets the remaining
-// elements resolve normally. The guard is what keeps the search inside the
-// container.
-func candidate(root, guestPath string) (exists, executable bool, err error) {
-	root = filepath.Clean(root)
-	host := filepath.Join(root, filepath.FromSlash(guestPath))
-	if host != root && !strings.HasPrefix(host, root+string(filepath.Separator)) {
-		return false, false, nil
+// The loop is the whole subtlety. r.Lstat does NOT follow the final component,
+// which is what lets this read the link and decide how to interpret its target;
+// every INTERMEDIATE component is resolved and confined by os.Root itself, so
+// nothing here has to re-implement containment. An ABSOLUTE target is rewritten
+// relative to the container root — the one thing os.Root will not do, and exactly
+// what a chroot would — while a relative one is joined onto the link's own
+// directory. A target that escapes the root after that rewrite is refused by the
+// next r.Lstat, which is where the containment guarantee comes from.
+//
+// A path that does not exist, and one whose link chain dangles, are reported
+// apart: "you spelled it wrong" and "this image ships a broken link" are
+// different problems with different fixes.
+func candidate(r *os.Root, guestPath string) (exists, executable bool, why string) {
+	name := strings.TrimPrefix(path.Clean(guestPath), "/")
+	if name == "" || name == "." {
+		return false, false, ""
 	}
-	fi, serr := os.Stat(host)
-	if serr != nil {
-		if errors.Is(serr, os.ErrNotExist) {
-			return false, false, nil
+	for hop := 0; hop <= maxSymlinkHops; hop++ {
+		fi, err := r.Lstat(name)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if hop > 0 {
+				return false, false, "is a symlink whose target does not exist in the container"
+			}
+			return false, false, ""
+		case errors.Is(err, os.ErrPermission):
+			// A directory along the way this process cannot read is the same
+			// "cannot use this element" as absence: a container whose PATH names
+			// an unreadable directory still runs.
+			return false, false, ""
+		case err != nil:
+			// os.Root refuses anything leaving the container root, which is the
+			// case this arm exists for: a symlink out of the image must never
+			// resolve to the guest's own copy of a binary.
+			return false, false, "resolves outside the container root"
 		}
-		// A permission error on a directory along the way is the same "cannot use
-		// this element" as absence, and must not fail the whole resolution: a
-		// container whose PATH names an unreadable directory still runs.
-		if errors.Is(serr, os.ErrPermission) {
-			return false, false, nil
+		if fi.Mode()&os.ModeSymlink == 0 {
+			if !fi.Mode().IsRegular() {
+				// A directory or a device named where a program should be is "not
+				// it", exactly as execvp treats it.
+				return true, false, ""
+			}
+			return true, fi.Mode().Perm()&0o111 != 0, ""
 		}
-		return false, false, fmt.Errorf("stat %s in the container: %w", guestPath, serr)
+		target, err := r.Readlink(name)
+		if err != nil {
+			return false, false, "resolves outside the container root"
+		}
+		if path.IsAbs(target) {
+			// Container-absolute, not host-absolute. This is the line the
+			// regression turned on: /bin/sh -> /bin/busybox means the container's
+			// /bin/busybox, and resolving it against the guest's root found
+			// nothing.
+			name = strings.TrimPrefix(path.Clean(target), "/")
+		} else {
+			name = path.Join(path.Dir(name), target)
+		}
+		if name == "" || name == "." {
+			return false, false, "resolves outside the container root"
+		}
 	}
-	if !fi.Mode().IsRegular() {
-		// A directory or a device named where a program should be is "not it",
-		// exactly as execvp treats it (EACCES/EISDIR both continue the search).
-		return true, false, nil
-	}
-	return true, fi.Mode().Perm()&0o111 != 0, nil
+	return false, false, "has too many levels of symbolic links"
 }
