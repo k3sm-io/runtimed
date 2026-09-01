@@ -285,6 +285,47 @@ INNER
   cat "$work/pinned"
 }
 
+# verify_dev_signature verifies the DEVELOPER signature (.tar.sign, over the
+# UNCOMPRESSED tar) against the stable-release key — the second, independent
+# trust anchor beside the autosigner sums. Runs inside the pinned toolchain so
+# xz+gpg versions are the image's, not the host's. Requires the tarball to be
+# in the cache already (call after fetch_pinned).
+verify_dev_signature() {
+  note "provenance — verifying the developer signature over the uncompressed tar"
+  local sign="$CACHE_DIR/$KERNEL_TARBALL.sign"
+  curl -fsSL -o "$sign" "$KERNEL_SIGN_URL" || die "could not fetch $KERNEL_SIGN_URL"
+
+  local work; work="$(scratch_dir)"
+  # shellcheck disable=SC2064  # $work must expand now, not at trap time
+  trap "rm -rf '$work'" RETURN
+  cp "$sign" "$work/tar.sign"
+  cp "$CACHE_DIR/$KERNEL_TARBALL" "$work/$KERNEL_TARBALL"
+
+  docker run --rm -i --platform linux/arm64 \
+    -v "$work:/work" -w /work \
+    -e KERNEL_DEV_KEY_FPR="$KERNEL_DEV_KEY_FPR" \
+    -e KEYSERVERS="$KEYSERVERS" \
+    -e KERNEL_TARBALL="$KERNEL_TARBALL" \
+    "$TOOLCHAIN_IMAGE" bash -s >/dev/null <<'INNER'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get -qq update >/dev/null
+apt-get -qq install -y --no-install-recommends gnupg dirmngr ca-certificates xz-utils >/dev/null
+export GNUPGHOME=/tmp/gnupg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+got=0
+for ks in $KEYSERVERS; do
+  if gpg --batch --keyserver "$ks" --recv-keys "0x$KERNEL_DEV_KEY_FPR" >/dev/null 2>&1; then got=1; break; fi
+done
+[ "$got" -eq 1 ] || { echo "could not fetch key $KERNEL_DEV_KEY_FPR" >&2; exit 1; }
+gpg --batch --fingerprint --with-colons 2>/dev/null | grep -q "^fpr:::::::::${KERNEL_DEV_KEY_FPR}:$" \
+  || { echo "keyring does not hold a key with fingerprint $KERNEL_DEV_KEY_FPR after import" >&2; exit 1; }
+xz -cd "/work/$KERNEL_TARBALL" | gpg --batch --verify /work/tar.sign - >/dev/null 2>&1 \
+  || { echo "DEVELOPER SIGNATURE VERIFICATION FAILED" >&2; exit 1; }
+INNER
+
+  echo "  verified: $KERNEL_TARBALL developer signature by $KERNEL_DEV_KEY_FPR"
+}
+
 # fetch_pinned fetches once and verifies EVERY time: a cached tarball is not a
 # trusted tarball, and re-hashing it costs a second.
 fetch_pinned() {
@@ -477,6 +518,7 @@ main() {
     docker info >/dev/null 2>&1 || die "PREFLIGHT FAIL: the Docker daemon is not answering"
     verify_provenance
     fetch_pinned
+    verify_dev_signature
     regen_config
     return 0
   fi
@@ -484,6 +526,7 @@ main() {
   preflight
   verify_provenance
   fetch_pinned
+  verify_dev_signature
 
   if [ "$mode" = "repro" ]; then
     repro
