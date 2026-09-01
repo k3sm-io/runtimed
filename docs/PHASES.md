@@ -540,7 +540,7 @@ phases:
             met: true
             check: a pod created through the runtimed path is assigned a DISTINCT per-pod /32 from the podnet adapter (not ≈nodeIP), read back via the pod-status path; two pods on the same node get different IPs. Golden/table test over the adapter seam plus a materialize-then-exec integration test proving the podnet adapter allocates and binds a real /32 end-to-end
             method: unit
-            test: pkg/runtime.TestCreatePodAssignsDistinctPodIP (golden/table) + pkg/supervisor.TestPodNetAdapterMaterializeThenExec (integration)
+            test: "reconciled 2026-08-31 (cited names drifted in the adapter-seam refactor; behavior unchanged): pkg/runtime.TestCreatePodLifecycle (the adapter-assigned /32 read back via pod status) + pkg/runtime.TestCreatePodUnwindReleasesPodNetwork + pkg/runtime.TestDeletePodReleasesPodNetwork (the seam allocates/releases through PodNetwork only) + pkg/runtime.TestIntegrationMaterializeTreeThenExec (integration); per-node DISTINCTNESS itself rides darwin-net's allocator proof (TestAllocatorUniqueNoDoubleAllocation) — runtimed allocates nothing per a2's pass-through"
           - id: M10.1-a2
             met: true
             check: the podnet seam is a pass-through — runtimed allocates no IP itself (darwin-net's podnet.Network is the sole allocator) and the network stanza is unfiltered-but-compilable (per-IP SBPL scoping does not compile on macOS 26 — golden REGENERATED, guarded by TestIntegrationNetworkStanzaCompiles)
@@ -576,7 +576,7 @@ phases:
             met: true
             check: a volumeMount with subPath materializes only the named sub-directory of the source volume at the mount path (inside the pod data volume), and a subPath attempting a "../" escape is rejected
             method: unit
-            test: pkg/mount.TestVolumeSubPathMaterialization + pkg/mount.TestVolumeSubPathRejectsEscape
+            test: "reconciled 2026-08-31 (the subPath tests live at the runtime seam, not pkg/mount): pkg/runtime.TestVolumeSubPathMaterialization — escape rejection is its g_escape_rejected subtest, exercising pkg/mount.materializeSubPath's lexical + symlink-safe checks"
 
   - id: M11
     title: Linux containers & multi-arch (runtimed slice — platform selection, Linux rootfs, k3sm-vmhost, guest init/agent)
