@@ -691,6 +691,20 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create pod dir %s: %w", podDir, err)
 	}
+	// The pod dir's reachability record, at the same point in the sequence the
+	// host-process spine writes it: the moment the dir exists, and BEFORE any
+	// pull. The vm spine only ever called recordPodImage, which runs after a
+	// successful pull, so a vm pod whose first pull failed left a pod dir with no
+	// record at all — and the image GC reads an ABSENT record as "this pod's
+	// references are unknown" and refuses to enumerate roots at all
+	// (image.ErrRootsIncomplete). One failed pull was a node-wide GC outage.
+	//
+	// Writing it here makes absence a genuine anomaly rather than an ordinary
+	// consequence of a bad image reference, which is the property the GC's
+	// fail-closed reading depends on to be useful.
+	if err := r.recordPodReferences(box.GetPodId()); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
+	}
 	// Resolved once, and used three times: the guest's DNS/NAT configuration on
 	// the spec below, the status.podIP a downward-API projection resolves to, and
 	// the pod's PUBLISHED IDENTITY on the assembled pod.
