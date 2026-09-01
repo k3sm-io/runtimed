@@ -158,17 +158,39 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
+	// The pod's roster, derived once from the plan. It is needed before the
+	// reaper because the reaper's exit callback must tell a CONTAINER's exit from
+	// an exec's: procExecer tracks each exec under a private "<container>#exec-N"
+	// key and the reaper reports both, so publishing every tracked exit would
+	// retain a fabricated container per exec on the event bus (which now keeps
+	// state — see guestagent.Events) and make the host log a dropped event for an
+	// undeclared container on every `kubectl exec`.
+	names := make([]string, 0, len(plan.Containers))
+	byName := make(map[string]guestinit.ContainerPlan, len(plan.Containers))
+	for _, cp := range plan.Containers {
+		names = append(names, cp.Name)
+		byName[cp.Name] = cp
+	}
+
 	// The ContainerEvents fan-out. It is created before the reaper because the
 	// reaper's exit callback publishes to it, and before the containers because
 	// an exit that happened before the agent was serving still has to reach the
-	// bus — a subscriber that arrives later misses it, but the alternative is a
-	// publish path that does not exist yet when the first container dies.
+	// bus. It RETAINS each container's last transition, which is what lets the
+	// agent — served last, after the containers are already running — replay the
+	// pod's state to the host instead of streaming only what happens next.
 	events := guestagent.NewEvents(0)
 	defer events.Close()
 
 	reaper := guestinit.NewReaper(proc, sigchld, guestinit.ReaperOptions{
 		Logger: log,
 		OnExit: func(ev guestinit.ExitEvent) {
+			if _, declared := byName[ev.Container]; !declared {
+				// An exec's child, not a container. The exec route waits on it
+				// itself; it is not a pod lifecycle transition.
+				log.Debug("reaped a non-container child", "key", ev.Container,
+					"exit_code", ev.Status.ExitCode, "signal", ev.Status.Signal)
+				return
+			}
 			log.Info("container exit observed", "container", ev.Container,
 				"exit_code", ev.Status.ExitCode, "signal", ev.Status.Signal)
 			// OOMKilled is deliberately not set here. It is the one fact only
@@ -200,14 +222,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
 	}
 
-	// The agent comes up last, once there is a pod for it to answer about.
+	// The agent comes up last, once there is a pod for it to answer about. That
+	// ordering is why the event bus retains state: every container has already
+	// started by the time anything can subscribe.
 	status := &guestStatus{}
-	names := make([]string, 0, len(plan.Containers))
-	byName := make(map[string]guestinit.ContainerPlan, len(plan.Containers))
-	for _, cp := range plan.Containers {
-		names = append(names, cp.Name)
-		byName[cp.Name] = cp
-	}
 	rawCmdline, err := os.ReadFile(cmdlinePath)
 	if err != nil {
 		return errors.Join(fmt.Errorf("read %s: %w", cmdlinePath, err), reaper.Stop(ctx, defaultStopGrace))

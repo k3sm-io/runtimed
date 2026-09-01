@@ -213,6 +213,22 @@ func (s *Server) Health(ctx context.Context, _ *guestv1.HealthRequest) (*guestv1
 // ContainerEvents streams the booted pod's lifecycle transitions until the client
 // goes away or the guest shuts down.
 //
+// LIST then WATCH. The stream opens with a SNAPSHOT — one event per container the
+// guest has seen, replayed verbatim — and only then streams live transitions. That
+// is not an optimization: this guest starts its containers before it serves the
+// agent (the agent's Health is the host's boot probe, so it must not answer before
+// there is a pod to answer about), so a live-only stream delivered every
+// ContainerStarted to nobody. The host's fold then never learned a container was
+// running and a demonstrably running pod reported Pending with no container
+// statuses. The snapshot also closes the same hole on every RESUBSCRIBE: the host
+// re-establishes this stream after a transient drop, and without a replay it would
+// never re-learn state it had already been told once.
+//
+// The snapshot is sent BEFORE the live loop is entered, so a live event cannot
+// overtake the retained state it supersedes. Events makes the boundary exact — no
+// event is both replayed and delivered live, and none falls between the two (see
+// SubscribeWithSnapshot).
+//
 // A lossy subscription ends the stream with a stated reason. The fan-out drops
 // rather than blocks (see Events), because blocking would stall PID 1's reap loop
 // and leave zombies nothing can inherit — but a dropped ContainerEvent can be the
@@ -222,8 +238,13 @@ func (s *Server) ContainerEvents(req *guestv1.ContainerEventsRequest, stream grp
 	if err := s.checkPod("events", req.GetPodId()); err != nil {
 		return err
 	}
-	sub := s.deps.Events.Subscribe()
+	snapshot, sub := s.deps.Events.SubscribeWithSnapshot()
 	defer sub.Close()
+	for _, ev := range snapshot {
+		if err := stream.Send(eventProto(ev)); err != nil {
+			return err
+		}
+	}
 
 	ctx := stream.Context()
 	for {
