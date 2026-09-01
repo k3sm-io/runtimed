@@ -100,11 +100,21 @@ func main() {
 
 	err := run(context.Background(), log)
 	if err != nil {
+		// The BACKSTOP, not the mechanism. This line is unreachable on any path
+		// that reached the reaper: those return through Reaper.Fail, which puts
+		// the reason on the console and then powers the machine off, so run()
+		// never returns to here at all. It still covers the paths that fail
+		// BEFORE the reaper exists (the pseudo-mounts, the spec read, the plan,
+		// /etc, the pod mounts, sethostname, binfmt), which have no shutdown
+		// sequence to hang a reason on and reach the poweroff below instead.
+		//
+		// The contract both layers serve is stated once, on Reaper.Fail: no fatal
+		// guest-init path may power off without having written its reason first.
 		log.Error("guest init failed", "err", err)
 	}
 	// PID 1 must never simply exit — the kernel panics when it does, which
-	// the host would see as an opaque VM death. Every path ends in a
-	// poweroff, so the failure reason above is the last thing on the console.
+	// the host would see as an opaque VM death. Every path ends in a poweroff;
+	// the reason is already on the console by the time this one runs.
 	if perr := (linuxProc{}).Poweroff(); perr != nil {
 		log.Error("poweroff failed", "err", perr)
 		os.Exit(1)
@@ -258,7 +268,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := startContainers(ctx, log, reaper, events, capture, plan.Containers); err != nil {
 		// Anything already running has to be torn down; Stop is the only
 		// path that both signals and powers off.
-		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
+		return reaper.Fail(ctx, defaultStopGrace, err)
 	}
 
 	// The agent comes up last, once there is a pod for it to answer about. That
@@ -267,14 +277,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 	status := &guestStatus{}
 	rawCmdline, err := os.ReadFile(cmdlinePath)
 	if err != nil {
-		return errors.Join(fmt.Errorf("read %s: %w", cmdlinePath, err), reaper.Stop(ctx, defaultStopGrace))
+		return reaper.Fail(ctx, defaultStopGrace, fmt.Errorf("read %s: %w", cmdlinePath, err))
 	}
 	podID, err := guestagent.PodIDFromCmdline(string(rawCmdline))
 	if err != nil {
 		// fatal, not degraded. An agent that does not know its own pod cannot
 		// perform the rejection guest.proto requires of it, and one that accepted
 		// every pod_id would answer Exec, Logs and Stats for a pod it is not.
-		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
+		return reaper.Fail(ctx, defaultStopGrace, err)
 	}
 	stopAgent, err := serveAgent(podID, spec.GetAgentPort(), guestagent.Deps{
 		Runner:  &reaperRunner{names: names, reaper: reaper},
@@ -289,7 +299,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// A guest with no agent is a pod the host can never exec into, read logs
 		// from, meter, or stop gracefully — so this fails the boot rather than
 		// running a pod nothing can observe or shut down.
-		return errors.Join(fmt.Errorf("serve the guest agent: %w", err), reaper.Stop(ctx, defaultStopGrace))
+		return reaper.Fail(ctx, defaultStopGrace, fmt.Errorf("serve the guest agent: %w", err))
 	}
 	defer stopAgent()
 	status.setReady(plan.Binfmt != nil)

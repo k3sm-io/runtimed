@@ -163,6 +163,10 @@ type Reaper struct {
 	stopOnce sync.Once
 	stopErr  error
 	stopped  chan struct{}
+	// failure is the reason the guest is dying, recorded by Fail before the
+	// shutdown runs so stop can put it on the console ahead of the poweroff.
+	// Guarded by mu.
+	failure error
 }
 
 // NewReaper builds a reaper over proc. sigchld is a coalescing notification
@@ -353,6 +357,56 @@ func (r *Reaper) Wait(ctx context.Context, container string) (WaitStatus, error)
 	}
 }
 
+// Fail records why the guest is dying and then stops it.
+//
+// It exists because of a DIAGNOSABILITY CONTRACT this package now owes its
+// operator: NO FATAL GUEST-INIT PATH MAY POWER OFF WITHOUT HAVING WRITTEN ITS
+// REASON TO THE CONSOLE FIRST. The console is the only channel a guest has once
+// the agent is not serving, and the machine going away takes every other one
+// with it — so a reason logged after the shutdown returns is a reason nobody
+// reads.
+//
+// That is not hypothetical. Every fatal path in cmd/k3sm-guest-init's run()
+// returned errors.Join(err, reaper.Stop(...)), and Go evaluates that Join —
+// Stop included — before the caller ever sees the error. Stop's deferred
+// Poweroff had already fired by the time main() logged "guest init failed", so
+// an image that could not start produced a console reading only
+// "stopping the guest containers=0", which says the pod had no containers: the
+// exact wrong diagnosis, and an expensive one.
+//
+// Fail is the whole remedy: it records the reason, and stop logs it as its first
+// act — before signalling, before the grace budget, and therefore strictly before
+// the deferred poweroff. Callers keep whatever backstop logging they have; this
+// makes the console line unconditional rather than dependent on the caller
+// surviving long enough to write it.
+func (r *Reaper) Fail(ctx context.Context, grace time.Duration, reason error) error {
+	if reason != nil {
+		r.mu.Lock()
+		if r.failure == nil {
+			r.failure = reason
+		}
+		r.mu.Unlock()
+	}
+	// The RECORDED reason is joined into the result, not the argument: the first
+	// caller's cause is the one on the console, and a second caller arriving
+	// during the same shutdown must not be handed a different story than the
+	// console tells. Stop is once-only for the same reason — the second poweroff
+	// would race the first.
+	//
+	// Joining it at all is what preserves the callers' previous
+	// errors.Join(err, Stop(...)) result, minus the evaluation order that made
+	// their log unreachable: a caller that outlives the poweroff still has the
+	// cause to report.
+	return errors.Join(r.failureReason(), r.Stop(ctx, grace))
+}
+
+// failureReason returns the recorded fatal reason, if any.
+func (r *Reaper) failureReason() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failure
+}
+
 // Stop runs the guest's shutdown state machine exactly once:
 //
 //	SIGTERM every live container -> wait up to grace for them to exit ->
@@ -384,6 +438,15 @@ func (r *Reaper) Stop(ctx context.Context, grace time.Duration) error {
 func (r *Reaper) stop(ctx context.Context, grace time.Duration) (err error) {
 	close(r.stopped)
 	var errs []error
+
+	// The reason goes out FIRST — before any signalling, before the grace
+	// budget, and so unconditionally before the deferred poweroff below. Ordering
+	// it here rather than in that defer is deliberate: everything between can
+	// block for the whole grace budget, and an operator watching a guest die
+	// should not have to wait it out to learn why.
+	if reason := r.failureReason(); reason != nil {
+		r.log.Error("guest init failed", "err", reason)
+	}
 
 	// The poweroff is deferred so that no return path, and no panic in the
 	// signalling above it, can skip it.
