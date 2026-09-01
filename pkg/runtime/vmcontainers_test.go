@@ -295,9 +295,16 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 			{Name: "postgres", Image: mainRef, Tty: true, Stdin: true},
 			{Name: "aux", Image: auxRef},
 		})
-	// The identity chain: a pod-level runAsUser/fsGroup plus a container-level
-	// runAsUser that must WIN for the container that sets it.
-	box.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 999, RunAsGroup: 999, FsGroup: 2000}
+	// The identity chain: a pod-level runAsUser plus a container-level runAsUser
+	// that must WIN for the container that sets it.
+	//
+	// No fsGroup, and it is not an omission: a vm pod that requests one is now
+	// refused outright (errVMFsGroupUnsupported), because this host's virtiofs
+	// cannot provide the idmapped mount that would apply it to the pod's volumes.
+	// The supplemental-GID half used to work and is what made the drop look
+	// harmless — a container held the group while its volumes were not owned by
+	// it — so that assertion is gone with the behaviour it described.
+	box.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 999, RunAsGroup: 999}
 	box.Containers[0].SecurityContext = &runtimev1.SecurityContext{RunAsUser: 1001} // postgres
 
 	spec := createVMSpec(t, rt, vmb, box)
@@ -378,12 +385,6 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 		// wins. That is the precedence being pinned.
 		if got := byName["aux"]; got.UID != 999 {
 			t.Errorf("aux uid = %d, want the pod's 999 (it outranks the image USER)", got.UID)
-		}
-		// fsGroup rides the supplemental set for every container.
-		for _, c := range spec.Containers {
-			if !containsInt64(c.SupplementalGIDs, 2000) {
-				t.Errorf("%s supplemental gids = %v, want the pod fsGroup 2000 among them", c.Name, c.SupplementalGIDs)
-			}
 		}
 	})
 

@@ -88,6 +88,30 @@ var errVMSidecarUnexpressible = errors.New("a native sidecar cannot be expressed
 // describes a pod no guest can compose. Compare with errors.Is.
 var errVMNoRootfsShare = errors.New("the share plan carries no container rootfs share")
 
+// errVMFsGroupUnsupported reports a vm pod that requests fsGroup.
+//
+// Applying fsGroup to a guest's volumes means presenting host-owned files under
+// the pod's supplemental group without a recursive chown, which is what an
+// idmapped mount is for — and this host cannot provide one: Apple's virtiofs
+// rejects mount_setattr(MOUNT_ATTR_IDMAP) with EINVAL, measured against a tmpfs
+// control on the same guest that accepts it. So the mechanism is unavailable for
+// the shares a vm pod's volumes arrive on, and no substitute is offered: a
+// recursive chmod would be a second, weaker ownership path that behaves
+// differently from the host-process spine's, which is precisely the dual path
+// this project declines to ship.
+//
+// REFUSING is the least-bad of three options. Stamping VMSpec.FSGroup would make
+// sandbox.idmapWanted mark the share binds Idmap, which guest init refuses
+// outright — turning a silent drop into an unexplained boot failure. Dropping it
+// silently, which is what shipped, lets an operator believe group ownership was
+// applied to a pod's volumes when it was not; that is a security-relevant field
+// reported as honoured while being ignored. Compare with errors.Is.
+var errVMFsGroupUnsupported = errors.New(
+	"fsGroup is not supported on the vm RuntimeClass on this platform: applying it requires " +
+		"idmapped mounts, and this host's virtiofs rejects them (mount_setattr with MOUNT_ATTR_IDMAP " +
+		"fails with EINVAL); the pod is refused rather than started with fsGroup silently ignored, " +
+		"so remove fsGroup from the pod's security context to run it on the vm RuntimeClass")
+
 // vmContainer pairs a container with the list it was declared in.
 type vmContainer struct {
 	spec *runtimev1.Container

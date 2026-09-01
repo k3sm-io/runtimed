@@ -644,6 +644,21 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// backend recorded on the assembled pod reading from one value.
 	const vmPodBackend = runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 
+	// fsGroup is refused before anything is derived or created, because it is a
+	// property of the box alone and the answer cannot change later. See
+	// errVMFsGroupUnsupported for why refusing beats the two alternatives.
+	//
+	// ANY non-zero value, not just a positive one. fs_group is pod-scoped in the
+	// proto (runtime.proto is explicit that there is no container-level field), so
+	// "requests fsGroup" has exactly one reading and no ambiguity to resolve; the
+	// != 0 test is nonetheless the conservative one, since the host-process spine
+	// acts only on > 0 and a negative value is a malformed request this path
+	// should not quietly pass over either.
+	if fsGroup := box.GetPodSecurityContext().GetFsGroup(); fsGroup != 0 {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), errVMFsGroupUnsupported)
+	}
+
 	// Compute the virtiofs share-device plan from the box's volumes (B106) —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
@@ -696,7 +711,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// pull. The vm spine only ever called recordPodImage, which runs after a
 	// successful pull, so a vm pod whose first pull failed left a pod dir with no
 	// record at all — and the image GC reads an ABSENT record as "this pod's
-	// references are unknown" and refuses to enumerate roots at all
+	// references are unknown" and refuses to reclaim anything node-wide
 	// (image.ErrRootsIncomplete). One failed pull was a node-wide GC outage.
 	//
 	// Writing it here makes absence a genuine anomaly rather than an ordinary
