@@ -400,8 +400,14 @@ type GuestNetworker interface {
 
 // guestNetworkConfig resolves the pod's guest network config through the optional
 // GuestNetworker seam. A Network that does not implement the seam, or that
-// reports no config for this pod, yields the inert zero value — the guest then
-// boots with no /etc/resolv.conf and no NAT advisory.
+// reports no config for this pod, yields the inert zero value.
+//
+// What the CALLER does with that zero value differs by field, and this function
+// deliberately does not decide it: the DNS and NAT-advisory fields degrade (the
+// guest boots with no /etc/resolv.conf), while an absent PodIP is fatal to a vm
+// pod because it is that pod's only source of a published identity. createVMPod
+// owns that split; the seam stays general, and its comma-ok stays "not an error"
+// as GuestNetworker documents.
 //
 // Both misses are LOGGED, which is the deliberate divergence from
 // reconcileNetworkStartup's silent nil hook: a vm pod with no resolver boots

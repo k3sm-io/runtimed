@@ -77,7 +77,14 @@ func vmPodBox(rt *Runtime, podID string, graceSeconds int64) *runtimev1.PodBox {
 func bootedVMRuntime(t *testing.T, podID string, graceSeconds int64) (*Runtime, *fakeVMBackend, *runtimev1.PodBox) {
 	t.Helper()
 	vmb := &fakeVMBackend{available: true, bootOK: true}
-	rt := newTestRuntime(t, Deps{VMBackend: vmb})
+	// The GuestNetworker producer is wired for the same reason vmPodConfig wires
+	// one: a vm pod's published identity has no other source, and createVMPod
+	// refuses a pod without it.
+	rt := newTestRuntime(t, Deps{
+		VMBackend: vmb,
+		Network:   &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+		Resolver:  fakeResolver{},
+	})
 	box := vmPodBox(rt, podID, graceSeconds)
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
@@ -241,7 +248,11 @@ func TestCloseStopsVMHelpersButNotHostPods(t *testing.T) {
 // the one worth catching.
 func TestCloseStopsVMHelpersWithNoRegisteredPods(t *testing.T) {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
-	rt := newTestRuntime(t, Deps{VMBackend: vmb})
+	rt := newTestRuntime(t, Deps{
+		VMBackend: vmb,
+		Network:   &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+		Resolver:  fakeResolver{},
+	})
 	if err := rt.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -254,7 +265,11 @@ func TestCloseStopsVMHelpersWithNoRegisteredPods(t *testing.T) {
 // before pods are served, on the same hook the host-process reap uses.
 func TestStartupSweepReapsOrphanVMs(t *testing.T) {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
-	rt := newTestRuntime(t, Deps{VMBackend: vmb})
+	rt := newTestRuntime(t, Deps{
+		VMBackend: vmb,
+		Network:   &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+		Resolver:  fakeResolver{},
+	})
 
 	if err := rt.ReapOrphanedPods(); err != nil {
 		t.Fatalf("ReapOrphanedPods: %v", err)
@@ -349,7 +364,11 @@ func TestRestartContainerRefusesAVMPod(t *testing.T) {
 func TestVMTeardownCancelsSupervisionBeforeStopping(t *testing.T) {
 	t.Run("DeletePod", func(t *testing.T) {
 		vmb := &fakeVMBackend{available: true, bootOK: true}
-		rt := newTestRuntime(t, Deps{VMBackend: vmb})
+		rt := newTestRuntime(t, Deps{
+			VMBackend: vmb,
+			Network:   &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+			Resolver:  fakeResolver{},
+		})
 		box := vmPodBox(rt, "pod-vm-order-1", 5)
 
 		var cancelledAtStop bool
@@ -389,7 +408,11 @@ func TestVMTeardownCancelsSupervisionBeforeStopping(t *testing.T) {
 		// Same property on the shutdown path, where the cost is worse: every vm
 		// pod on the node would be published Failed on the way out.
 		vmb := &fakeVMBackend{available: true, bootOK: true}
-		rt := newTestRuntime(t, Deps{VMBackend: vmb})
+		rt := newTestRuntime(t, Deps{
+			VMBackend: vmb,
+			Network:   &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+			Resolver:  fakeResolver{},
+		})
 		box := vmPodBox(rt, "pod-vm-order-2", 5)
 		if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box}); err != nil {
 			t.Fatalf("CreatePod: %v", err)

@@ -164,6 +164,19 @@ func (r *Ring) Append(e LogEntry) {
 // before since_time, which for a container that went quiet returns nothing at all
 // where upstream returns its last N lines since that time.
 func (r *Ring) Snapshot(sel Selector) []LogEntry {
+	entries, _ := r.SnapshotWithDropped(sel)
+	return entries
+}
+
+// SnapshotWithDropped is Snapshot plus the eviction count, read in the SAME
+// critical section.
+//
+// The two must be read together or not at all: a reader that takes the entries
+// and then asks Dropped separately can be told about a gap that did not precede
+// what it was given, or shown a gap it was never told about, because the writer
+// evicts between the two calls. The in-band truncation notice is only honest if
+// the count describes exactly the entries being served.
+func (r *Ring) SnapshotWithDropped(sel Selector) ([]LogEntry, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -177,7 +190,7 @@ func (r *Ring) Snapshot(sel Selector) []LogEntry {
 	if sel.TailLines > 0 && int64(len(out)) > sel.TailLines {
 		out = out[int64(len(out))-sel.TailLines:]
 	}
-	return out
+	return out, r.dropped
 }
 
 // Subscribe registers a follower and returns its channel plus an unsubscribe func.

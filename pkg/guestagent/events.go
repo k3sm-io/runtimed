@@ -75,6 +75,23 @@ type ContainerExited struct {
 // event and marks the subscriber lossy; the subscriber is told, and the reaper
 // keeps reaping.
 //
+// # It also RETAINS state, and must
+//
+// A pure fan-out delivers only to subscribers that already exist, and the guest
+// starts its containers BEFORE it serves the agent (cmd/k3sm-guest-init: the agent
+// answers Health, which is the host's boot probe, so it must not answer before
+// there is a pod to answer about). Every ContainerStarted was therefore published
+// to zero subscribers and lost, the host's fold never learned any container was
+// running, and a demonstrably running vm pod sat Pending with no containerStatuses
+// at all. The same hole re-opened on every resubscribe after a transient stream
+// drop.
+//
+// So Events keeps each container's LAST transition and replays it to a new
+// subscriber — the list-then-watch shape. Last-only is sufficient rather than
+// lossy: a container is started once by this init and exits at most once, so its
+// last event IS its state (a terminal event stands alone, and the host's fold
+// creates the status from it without needing the start it supersedes).
+//
 // The zero value is not usable; construct one with NewEvents.
 type Events struct {
 	queueSize int
@@ -82,6 +99,12 @@ type Events struct {
 	mu     sync.Mutex
 	subs   map[*eventSub]struct{}
 	closed bool
+	// latest is each container's last published transition, and order is the
+	// order containers were first seen — together the replay snapshot. Both are
+	// guarded by mu, the SAME lock Publish and Subscribe take, which is what makes
+	// the snapshot/live boundary exact; see SubscribeWithSnapshot.
+	latest map[string]ContainerEvent
+	order  []string
 }
 
 // eventSub is one subscriber's queue plus its loss flag.
@@ -100,15 +123,31 @@ func NewEvents(queueSize int) *Events {
 	if queueSize <= 0 {
 		queueSize = DefaultEventQueue
 	}
-	return &Events{queueSize: queueSize, subs: map[*eventSub]struct{}{}}
+	return &Events{
+		queueSize: queueSize,
+		subs:      map[*eventSub]struct{}{},
+		latest:    map[string]ContainerEvent{},
+	}
 }
 
-// Publish delivers ev to every live subscriber, never blocking. See the type doc.
+// Publish records ev as the container's current state and delivers it to every
+// live subscriber, never blocking. See the type doc.
+//
+// The record and the fan-out happen in ONE critical section, which is the whole
+// mechanism: a subscriber taking its snapshot under the same lock cannot observe a
+// half-applied publish, so it never both replays an event and receives it live,
+// and never misses one that landed between the two steps.
 func (e *Events) Publish(ev ContainerEvent) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return
+	}
+	if ev.Container != "" {
+		if _, seen := e.latest[ev.Container]; !seen {
+			e.order = append(e.order, ev.Container)
+		}
+		e.latest[ev.Container] = ev
 	}
 	for s := range e.subs {
 		select {
@@ -147,18 +186,57 @@ func (s *Subscription) Close() {
 	})
 }
 
-// Subscribe registers a new subscriber.
+// Subscribe registers a new subscriber for LIVE events only. Prefer
+// SubscribeWithSnapshot for anything that must learn the pod's current state —
+// a live-only subscriber is blind to every transition that happened before it
+// arrived, which for a guest agent served after its containers start is all of
+// them.
 func (e *Events) Subscribe() *Subscription {
+	sub, _ := e.subscribe(false)
+	return sub
+}
+
+// SubscribeWithSnapshot registers a subscriber and returns, atomically with the
+// registration, the current state of every container the fan-out has seen: one
+// event each, in first-seen order, replayed verbatim (so a running container
+// carries its real PID and its real start time, and an exited one carries its
+// recorded exit code, signal and OOMKilled bit).
+//
+// EXACTLY once at the SNAPSHOT/LIVE BOUNDARY. The snapshot is taken in the same
+// mu critical section that registers the subscriber, and Publish records and
+// fans out in one critical section of its own — so for any event E and any
+// subscriber S, either E's publish completed before S's registration (E is in
+// S's snapshot and was fanned out to a subscriber set that did not contain S),
+// or it completed after (E is not in the snapshot and IS fanned out to S). There
+// is no interleaving in which S sees E twice or not at all.
+//
+// The caller must send the snapshot before draining C(), or a live event could
+// overtake the replayed state it supersedes.
+func (e *Events) SubscribeWithSnapshot() ([]ContainerEvent, *Subscription) {
+	sub, replay := e.subscribe(true)
+	return replay, sub
+}
+
+// subscribe is the one registration path; snapshot selects whether the caller
+// also receives the retained per-container state.
+func (e *Events) subscribe(snapshot bool) (*Subscription, []ContainerEvent) {
 	sub := &eventSub{ch: make(chan ContainerEvent, e.queueSize)}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		close(sub.ch)
-		return &Subscription{events: e, sub: sub}
+		return &Subscription{events: e, sub: sub}, nil
 	}
 	e.subs[sub] = struct{}{}
+	var replay []ContainerEvent
+	if snapshot {
+		replay = make([]ContainerEvent, 0, len(e.order))
+		for _, name := range e.order {
+			replay = append(replay, e.latest[name])
+		}
+	}
 	e.mu.Unlock()
-	return &Subscription{events: e, sub: sub}
+	return &Subscription{events: e, sub: sub}, replay
 }
 
 // Close ends every subscription. It is called when the guest is shutting down, so

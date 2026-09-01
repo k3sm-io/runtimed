@@ -179,14 +179,20 @@ func TestCreateVMPodUsesGuestNetworkerWhenPresent(t *testing.T) {
 }
 
 // TestCreateVMPodFallsBackWhenGuestNetworkerAbsent is the M11.2-d8 acceptance
-// (absent half): with no config available the vm backend receives the inert zero
-// value — never a partial or invented one — and the miss is LOGGED.
+// (absent half): with no config available the miss is LOGGED, nothing partial or
+// invented reaches the backend, and — since the pod's PUBLISHED IDENTITY has no
+// other source — the pod is REFUSED before the machine is built.
 //
-// The log is the point of the row, not decoration. A vm pod with no
-// /etc/resolv.conf boots, reports healthy, passes readiness, and fails only at
-// the first in-app DNS lookup, at which point it is indistinguishable from an
-// application bug; the node-side warning is the only thing that names the real
-// cause. The two rows are the two distinct ways the config can be missing.
+// The refusal is the half that changed, and deliberately. The original row let
+// the pod boot on the inert zero value, which is right for the DNS half (a pod
+// with no /etc/resolv.conf still runs, and the log names the cause) and wrong for
+// the identity half: pod_ip is the podCIDR /32 that reaches EndpointSlice, DNS
+// and the downward API, the vm spine runs no IPAM of its own, and a vm pod
+// without one is not degraded but UNROUTABLE — a Service selecting it gets an
+// EndpointSlice with no addresses and traffic blackholes silently. So the log
+// assertions stay exactly as they were and the boot assertion inverts.
+//
+// The two rows remain the two distinct ways the config can be missing.
 func TestCreateVMPodFallsBackWhenGuestNetworkerAbsent(t *testing.T) {
 	cases := []struct {
 		name string
@@ -222,16 +228,21 @@ func TestCreateVMPodFallsBackWhenGuestNetworkerAbsent(t *testing.T) {
 			pn, producer := tc.newNet()
 			rt, vmb, logs := newGuestNetworkRuntime(t, pn)
 
-			if _, _, err := rt.createPod(context.Background(), vmBackedBox(rt, tc.podID)); err == nil {
-				t.Fatal("vm createPod should surface the lab-gated boot error")
+			_, reason, err := rt.createPod(context.Background(), vmBackedBox(rt, tc.podID))
+			if err == nil {
+				t.Fatal("a vm pod with no published identity must be refused, not booted unroutable")
 			}
-
-			n, spec := vmb.created()
-			if n != 1 {
-				t.Fatalf("CreateVM called %d times, want 1", n)
+			if reason != runtimev1.FailureReason_FAILURE_REASON_INTERNAL {
+				t.Errorf("reason = %v, want INTERNAL — the same reason the host-process spine reports when its own network setup fails", reason)
 			}
-			if !reflect.DeepEqual(spec.Network, sandbox.GuestNetworkConfig{}) {
-				t.Errorf("VMSpec.Network = %+v, want the inert zero value", spec.Network)
+			if !strings.Contains(err.Error(), "no pod IP") {
+				t.Errorf("err = %v; the refusal must name the missing pod IP", err)
+			}
+			// Refused STRICTLY before the backend: nothing partial or invented
+			// reaches the machine, which is what the original row asserted by
+			// checking the inert zero value on the spec.
+			if n, _ := vmb.created(); n != 0 {
+				t.Errorf("CreateVM called %d times on a pod with no identity; must be 0", n)
 			}
 
 			out := logs.String()

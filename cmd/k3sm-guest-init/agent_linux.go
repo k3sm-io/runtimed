@@ -75,6 +75,27 @@ func (g *guestStatus) setReady(rosetta bool) {
 	g.mu.Unlock()
 }
 
+// setGuestIP records the address the guest's DHCP client leased.
+//
+// It is a SETTER and not a constructor argument because guest_ip is a LEASE, not
+// an identity: guest.proto calls the field "the single live-address authority"
+// and says the host re-reads it rather than caching it, so the guest must be able
+// to report a NEW address without anything being rebuilt. Status already re-reads
+// under the mutex on every Health call, so a future renewal loop only has to call
+// this again.
+//
+// no RENEWAL LOOP exists yet, and that ceiling is recorded rather than implied:
+// this is called exactly once, at boot. The S5 spike measured the lease stable
+// across restarts given the host's deterministic MAC, so a v0.1 guest that never
+// renews keeps its address for its own lifetime — but a lease whose duration
+// expires mid-life would not be re-acquired, and the host would keep dialing an
+// address the segment has reassigned.
+func (g *guestStatus) setGuestIP(ip string) {
+	g.mu.Lock()
+	g.guestIP = ip
+	g.mu.Unlock()
+}
+
 // reaperRunner is the Runner seam: the pod's declared container roster and the
 // shutdown verb, both delegated to the plan and the reaper that already own them.
 type reaperRunner struct {
@@ -102,12 +123,14 @@ func (r *reaperRunner) Stop(ctx context.Context, grace time.Duration) error {
 // cgroupSampler is the Sampler seam: one container's cgroup2 files, read on
 // demand.
 //
-// per-CONTAINER cgroup2 leaves are not yet created by this init (see the package
-// doc's "not yet IN this BINARY" list), so on today's guest every Sample reports
-// that no leaf exists and the server omits that container from the response. That
-// is the honest answer — absence rather than zeros, exactly as guest.proto requires
-// — and it is why this type is wired now rather than later: when the leaves land,
-// the reader is already here and already correct.
+// The leaf it reads is created by spawn and joined by the kernel at fork
+// (guestagent.CreateLeaf + SysProcAttr.UseCgroupFD), and the memory files exist
+// because the boot delegated the memory controller to the hierarchy root's
+// children first (guestagent.EnableSubtreeControllers). All three are best effort:
+// a kernel missing a controller leaves the container unmetered rather than
+// unstarted, so a Sample that finds nothing is still a normal outcome and is still
+// reported as ABSENCE rather than as zeros — a zero working set is
+// indistinguishable from an idle container.
 type cgroupSampler struct {
 	root string
 }
@@ -144,84 +167,6 @@ func (c *cgroupSampler) Sample(_ context.Context, container string) (guestagent.
 		return guestagent.ContainerSample{}, err
 	}
 	return guestagent.ContainerSample{CPUUsageUsec: usage, MemoryWorkingSetBytes: ws}, nil
-}
-
-// errLogsNotCaptured is what this guest honestly has to say about `kubectl logs`.
-//
-// Containers are spawned inheriting PID 1's stdio (see spawn in main_linux.go), so
-// their output goes to the guest CONSOLE — which the VM host captures to
-// console.log on the host side — and no per-container ring exists to serve from.
-// Returning this beats returning an empty stream: an empty stream says "this
-// container produced no output", which is a lie an operator would act on.
-var errLogsNotCaptured = errors.New(
-	"this guest does not capture per-container output yet: containers inherit the init's stdio, " +
-		"so their output is on the VM console log rather than in a per-container buffer")
-
-// ringLogs is the Logs seam over per-container guestagent.Rings.
-//
-// It is wired with an empty ring set today for the reason above, so every request
-// reports errLogsNotCaptured. The type exists in its final shape because the ring
-// and its selection semantics are the part worth getting right, and they are
-// already unit-tested; what is missing is the capture, not the buffer.
-type ringLogs struct {
-	mu    sync.Mutex
-	rings map[string]*guestagent.Ring
-}
-
-func (l *ringLogs) Stream(ctx context.Context, container string, sel guestagent.Selector) (<-chan guestagent.LogEntry, func(), error) {
-	l.mu.Lock()
-	ring := l.rings[container]
-	l.mu.Unlock()
-	if ring == nil {
-		return nil, nil, errLogsNotCaptured
-	}
-	if sel.Previous {
-		// The previous instance's output is not retained: this init starts a
-		// container once and the host recreates the whole pod on failure, so there
-		// is no earlier instance in this guest to have kept.
-		return nil, nil, errors.New("this guest retains no output from a previous container instance")
-	}
-
-	out := make(chan guestagent.LogEntry, 64)
-	live, unsubscribe := ring.Subscribe(0)
-	done := make(chan struct{})
-	go func() {
-		defer close(out)
-		defer unsubscribe()
-		for _, e := range ring.Snapshot(sel) {
-			select {
-			case out <- e:
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
-			}
-		}
-		if !sel.Follow {
-			return
-		}
-		for {
-			select {
-			case e, ok := <-live:
-				if !ok {
-					return
-				}
-				select {
-				case out <- e:
-				case <-ctx.Done():
-					return
-				case <-done:
-					return
-				}
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
-			}
-		}
-	}()
-	var once sync.Once
-	return out, func() { once.Do(func() { close(done) }) }, nil
 }
 
 // procExecer is the Execer seam: fork/exec one command inside a container's
@@ -261,6 +206,21 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 		return guestagent.ExecResult{}, errors.New("this guest cannot allocate a pseudo-terminal for an exec yet; retry without a tty")
 	}
 
+	// argv[0] is resolved execvp-style inside the TARGET CONTAINER's root, using
+	// that container's own PATH — the same resolution spawn does for a container's
+	// entrypoint, and for the same reason: ForkExec below is execve and does no
+	// PATH search, so `kubectl exec -- sh` failed with ENOENT on every image.
+	//
+	// plan.Root, never the guest's own /: an exec claiming to run in a container
+	// must resolve against that container's filesystem, or it would find the
+	// guest init's binaries and run a different program under the container's
+	// name. plan.Env is that container's environment, so the PATH searched is the
+	// one the container itself would use.
+	prog, err := guestinit.ResolveProgram(plan.Root, plan.WorkingDir, spec.Argv[0], guestinit.PathFromEnv(plan.Env))
+	if err != nil {
+		return guestagent.ExecResult{}, err
+	}
+
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		return guestagent.ExecResult{}, fmt.Errorf("exec stdin pipe: %w", err)
@@ -298,14 +258,14 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 			Setsid: true,
 		},
 	}
-	pid, err := syscall.ForkExec(spec.Argv[0], spec.Argv, attr)
+	pid, err := syscall.ForkExec(prog, spec.Argv, attr)
 	// The child's ends are closed in this process immediately after the fork:
 	// holding stdoutW open here would mean the stdout reader never sees EOF, and
 	// the exec would appear to hang after the command had already exited.
 	closeAll(stdinR, stdoutW, stderrW)
 	if err != nil {
 		closeAll(stdinW, stdoutR, stderrR)
-		return guestagent.ExecResult{}, fmt.Errorf("start %q in %s: %w", spec.Argv[0], spec.Container, err)
+		return guestagent.ExecResult{}, fmt.Errorf("start %q (resolved to %s) in %s: %w", spec.Argv[0], prog, spec.Container, err)
 	}
 
 	name := e.trackName(spec.Container)
