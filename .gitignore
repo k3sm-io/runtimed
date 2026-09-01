@@ -14,6 +14,11 @@ go.work.sum
 # lane rooted in-tree by mistake. `hack/worktree.sh doctor` still reports one.
 /.worktrees/
 
+# Guest-kernel build scratch: the pinned tarball, the extraction/build work dirs,
+# and the Image itself. The artifact is published by digest, never committed.
+/hack/guest-kernel/.cache/
+/hack/guest-kernel/out/
+
 # macOS / editors
 .DS_Store
 .idea/
