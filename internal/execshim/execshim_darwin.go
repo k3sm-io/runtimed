@@ -22,7 +22,7 @@ package execshim
 #cgo LDFLAGS: -lsandbox
 #include <stdlib.h>
 
-// Private, deprecated libsandbox SPI — NOT declared in the public <sandbox.h>.
+// Private, deprecated libsandbox SPI — not declared in the public <sandbox.h>.
 // Modern libsandbox.1.dylib signatures (validated on macOS 26.5.1, arm64):
 //   sandbox_compile_string returns an opaque profile handle (NULL on failure)
 //   and sets *error to a malloc'd message; sandbox_apply confines the calling

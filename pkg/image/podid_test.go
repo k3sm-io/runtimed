@@ -80,7 +80,7 @@ func TestPodRootfsRejectsTraversal(t *testing.T) {
 		t.Errorf("rejected ids mutated the filesystem\nbefore: %v\nafter:  %v", before, got)
 	}
 
-	// POSITIVE CONTROL. Without it this table cannot distinguish "the class is
+	// positive CONTROL. Without it this table cannot distinguish "the class is
 	// correct" from "the class rejects everything" — and a class that rejected a
 	// real pod id would break every pod on the node, a fail-closed regression as
 	// bad operationally as the hole itself.

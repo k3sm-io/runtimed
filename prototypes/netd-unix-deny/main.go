@@ -29,18 +29,18 @@ limitations under the License.
 // _k3sm uid (no per-pod uid isolation), so LOCAL_PEERCRED on the k3sm-netd helper
 // socket cannot tell a pod apart from the legitimate runtime client. The Seatbelt
 // default-deny already blocks the connect(), and sandbox.Generate emits an
-// EXPLICIT (deny network-outbound (remote unix-socket (literal …))) on top of
+// explicit (deny network-outbound (remote unix-socket (literal …))) on top of
 // it as the load-bearing, future-proof barrier. This prototype demonstrates the
 // live denial on macOS 26.
 //
 // It uses /usr/bin/sandbox-exec (deprecated but functional on 26.x, exactly as
-// the sibling seatbelt-hostpath prototype does) to apply the SAME SBPL the
+// the sibling seatbelt-hostpath prototype does) to apply the same SBPL the
 // production libsandbox path applies. Run:
 //
 //	cd runtimed && go run prototypes/netd-unix-deny/main.go
 //
-// Expected: the unsandboxed control connects (CONNECT-OK); the sandboxed run is
-// denied (CONNECT-DENIED errno=1 Operation not permitted).
+// Expected: the unsandboxed control connects (connect-OK); the sandboxed run is
+// denied (connect-denied errno=1 Operation not permitted).
 package main
 
 import (
@@ -56,7 +56,7 @@ import (
 )
 
 // connecterSrc is a tiny C connecter: it connect()s an AF_UNIX socket to argv[1]
-// and reports CONNECT-OK or CONNECT-DENIED with errno. errno semantics are the
+// and reports connect-OK or connect-denied with errno. errno semantics are the
 // clean signal that the Seatbelt deny — not a broken socket — blocked the call.
 const connecterSrc = `#include <stdio.h>
 #include <string.h>
@@ -132,7 +132,7 @@ func run() error {
 		return fmt.Errorf("clang unavailable to build connecter (%v): %s", err, out)
 	}
 
-	// Generate the production SBPL: default-deny + the EXPLICIT helper-socket deny.
+	// Generate the production SBPL: default-deny + the explicit helper-socket deny.
 	profile, err := sandbox.Generate(&runtimev1.SandboxProfile{
 		DataVolumePath:        work,
 		DeniedUnixSocketPaths: []string{sockPath},
@@ -146,7 +146,7 @@ func run() error {
 	}
 	fmt.Printf(";; generated profile (%s):\n%s\n", profPath, profile)
 
-	// Control: the connecter WITHOUT a sandbox must connect (proves the socket is
+	// Control: the connecter without a sandbox must connect (proves the socket is
 	// live and connectable — so a denial under sandbox is the sandbox's doing).
 	fmt.Println("== control: unsandboxed connect ==")
 	ctl, _ := exec.Command(connecter, sockPath).CombinedOutput()
@@ -155,7 +155,7 @@ func run() error {
 		return fmt.Errorf("control did not connect; socket not live? got: %q", got)
 	}
 
-	// Under the sandbox, connect() to the helper socket must be DENIED.
+	// Under the sandbox, connect() to the helper socket must be denied.
 	fmt.Println("== sandboxed connect (expect CONNECT-DENIED) ==")
 	sb, _ := exec.Command("/usr/bin/sandbox-exec", "-f", profPath, connecter, sockPath).CombinedOutput()
 	fmt.Print(string(sb))

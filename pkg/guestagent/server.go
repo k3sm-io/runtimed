@@ -51,16 +51,16 @@ type Status struct {
 	// Ready is true once boot has completed far enough to accept the other RPCs.
 	Ready bool
 	// GuestIP is the address the guest's DHCP client leased on eth0, empty until
-	// the lease is held. THIS IS THE SINGLE LIVE-ADDRESS AUTHORITY for a vm pod:
+	// the lease is held. this IS the single LIVE-ADDRESS AUTHORITY for a vm pod:
 	// the host does not re-derive it from the network attachment, so a lease
 	// change is observable as a change in this field and nowhere else.
 	GuestIP string
 	// RosettaRegistered is true when binfmt_misc registration for the linux/amd64
-	// interpreter succeeded. FALSE IS NOT AN ERROR — a guest booted without the
+	// interpreter succeeded. false IS not AN ERROR — a guest booted without the
 	// Rosetta share is the normal case, which is every guest this build produces.
 	RosettaRegistered bool
 	// Capabilities are optional feature tokens. They exist so an additive change
-	// can be negotiated WITHOUT an APIVersion bump; an unknown token is ignored by
+	// can be negotiated without an APIVersion bump; an unknown token is ignored by
 	// the host.
 	Capabilities []string
 }
@@ -75,7 +75,7 @@ type ContainerSample struct {
 }
 
 // The five consumer seams. Each is the smallest thing the server needs from the
-// running guest, defined HERE at the consumer and implemented once, in the linux
+// running guest, defined here at the consumer and implemented once, in the linux
 // executor (cmd/k3sm-guest-init). Keeping them small and separate is what lets the
 // whole service run under `go test -race` on darwin with no VM: a test supplies
 // five fakes and the real handler code — the pod-id enforcement, the bounds, the
@@ -83,7 +83,7 @@ type ContainerSample struct {
 
 // Runner is the guest's container roster and its shutdown verb.
 type Runner interface {
-	// Containers returns the pod's container names in DECLARED order. The order
+	// Containers returns the pod's container names in declared order. The order
 	// is part of the contract: it is what the host reports back, and a set
 	// reordered per call makes a stats table jump between scrapes.
 	Containers() []string
@@ -95,7 +95,7 @@ type Runner interface {
 // Sampler reads one container's cgroup2 sample.
 type Sampler interface {
 	// Sample returns the container's current sample, or an error if none can be
-	// read. An error means the container is OMITTED from the response — absence
+	// read. An error means the container is omitted from the response — absence
 	// is the only honest encoding of "unknown" (guest.proto), because a zero
 	// sample is indistinguishable from an idle container.
 	Sample(ctx context.Context, container string) (ContainerSample, error)
@@ -135,9 +135,9 @@ type Deps struct {
 	Logger *slog.Logger
 }
 
-// Server implements guest/v1's GuestAgent for the ONE pod this guest booted.
+// Server implements guest/v1's GuestAgent for the one pod this guest booted.
 //
-// SINGLE-POD, ASSERTED NOT ASSUMED. Every RPC that carries pod_id checks it
+// single-POD, ASSERTED not ASSUMED. Every RPC that carries pod_id checks it
 // against the booted pod and rejects any other with InvalidArgument. The id is not
 // a selector — there is nothing to select among — it is the caller's assertion that
 // it reached the guest it meant to reach, and the check is what makes a
@@ -213,7 +213,7 @@ func (s *Server) Health(ctx context.Context, _ *guestv1.HealthRequest) (*guestv1
 // ContainerEvents streams the booted pod's lifecycle transitions until the client
 // goes away or the guest shuts down.
 //
-// A LOSSY SUBSCRIPTION ENDS THE STREAM WITH A STATED REASON. The fan-out drops
+// A lossy subscription ends the stream with a stated reason. The fan-out drops
 // rather than blocks (see Events), because blocking would stall PID 1's reap loop
 // and leave zombies nothing can inherit — but a dropped ContainerEvent can be the
 // pod's only OOMKilled notice, and silently continuing would let a killed container
@@ -267,13 +267,13 @@ func eventProto(ev ContainerEvent) *guestv1.ContainerEvent {
 
 // Stats returns one on-demand cgroup2 sample per container.
 //
-// ON DEMAND, NEVER ON A TICK: the host asks when it needs a sample and runs no
+// ON demand, never ON A TICK: the host asks when it needs a sample and runs no
 // sampling loop against a guest, because the vm path has no OOM race to poll for
 // (the hypervisor memory ceiling is enforced by the VM, and an OOM arrives as a
-// ContainerEvent). The walk is over the pod's DECLARED roster, so the response is
+// ContainerEvent). The walk is over the pod's declared roster, so the response is
 // bounded by the pod's own container count.
 //
-// A container whose sample cannot be read is OMITTED. See Sampler.
+// A container whose sample cannot be read is omitted. See Sampler.
 func (s *Server) Stats(ctx context.Context, req *guestv1.StatsRequest) (*guestv1.StatsResponse, error) {
 	if err := s.checkPod("stats", req.GetPodId()); err != nil {
 		return nil, err
@@ -301,7 +301,7 @@ func (s *Server) Stats(ctx context.Context, req *guestv1.StatsRequest) (*guestv1
 // Logs streams a container's output, applying the SELECTION options only.
 //
 // follow / tail_lines / since_time / previous are answered here because only the
-// guest holds the output. timestamps and limit_bytes are NOT applied: the host
+// guest holds the output. timestamps and limit_bytes are not applied: the host
 // applies them on its own side, precisely so an agent that ignored limit_bytes
 // could not flood a client. The entry's timestamp is carried so the host can
 // render it; the byte budget is the host's to spend.
@@ -360,7 +360,7 @@ func logStreamProto(k LogStreamKind) runtimev1.LogStream {
 // Exec runs a command in a guest container, reusing the runtime/v1 exec stream
 // messages verbatim.
 //
-// THE PARAMETERS COME FROM THE FIRST FRAME ALONE. Later frames are narrowed to
+// the PARAMETERS COME from the FIRST FRAME alone. Later frames are narrowed to
 // stdin bytes and tty resizes, so a frame naming another pod, another container or
 // another command is inert — the stream stays bound to what the first frame
 // selected, and re-targeting is impossible rather than merely rejected. That
@@ -484,7 +484,7 @@ func (w *execWriter) Write(p []byte) (int, error) {
 // Stop begins guest shutdown: SIGTERM to every container, SIGKILL to what remains
 // after grace, then sync and poweroff.
 //
-// It RETURNS BEFORE THE GUEST IS GONE, on purpose. guest.proto says shutdown is
+// It RETURNS before the GUEST IS GONE, on purpose. guest.proto says shutdown is
 // acknowledged by the call returning and the guest powers off immediately after —
 // so the shutdown runs detached and the acknowledgement is sent first. The
 // alternative is a call that can never return successfully, because a poweroff

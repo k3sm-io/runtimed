@@ -35,7 +35,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// --- the guest side: the REAL agent over the REAL five seams ----------------
+// --- the guest side: the real agent over the real five seams ----------------
 
 // stubRunner / stubSampler / stubLogs / stubExecer / stubStatus are the guest's
 // five seams. They stand in for the LINUX EXECUTOR — the cgroup reader, the log
@@ -112,7 +112,7 @@ type stubStatus struct{ st guestagent.Status }
 
 func (s stubStatus) Status(context.Context) guestagent.Status { return s.st }
 
-// startRealGuestAgent serves the SHIPPED guestagent.Server on an in-process
+// startRealGuestAgent serves the shipped guestagent.Server on an in-process
 // bufconn and returns a GuestDialer reaching it.
 //
 // The GuestDialer seam is the only thing replaced: production dials the unix
@@ -147,12 +147,12 @@ func startRealGuestAgent(t *testing.T, podID string, deps guestagent.Deps) Guest
 // every one of those routes was a test double written to satisfy the near end.
 // A contract asserted only against a fake of itself is not asserted.
 //
-// This drives the REAL host routes against the REAL guestagent.Server over a real
+// This drives the real host routes against the real guestagent.Server over a real
 // gRPC connection, through the existing GuestDialer seam. There is no VM, no
 // vmhost and no vsock anywhere — and there does not need to be, because what was
 // unproven was the two halves agreeing, not the transport.
 //
-// EVERY assertion is a t.Run subtest of this ONE function on purpose: the gate runs
+// every assertion is a t.Run subtest of this one function on purpose: the gate runs
 // `go test -run '^TestGuestAgentServesTheHostRoutes$'`, so a sibling top-level
 // Test* would be silently filtered out and never run.
 func TestGuestAgentServesTheHostRoutes(t *testing.T) {
@@ -211,7 +211,7 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 
 	t.Run("the-agent-rejects-a-pod-id-the-host-did-not-resolve", func(t *testing.T) {
 		// The single-pod assertion, end to end. The host re-stamps the pod id it
-		// resolved onto the first frame, so this drives the agent for a DIFFERENT
+		// resolved onto the first frame, so this drives the agent for a different
 		// booted pod and asserts the daemon relays the agent's own refusal —
 		// rather than swallowing it or reporting a generic transport failure.
 		dial := startRealGuestAgent(t, "pod-someone-else", guestagent.Deps{
@@ -300,7 +300,7 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 
 	t.Run("stats-round-trip-with-the-omit-rather-than-zero-rule", func(t *testing.T) {
 		// Both halves independently refuse to fabricate a figure: the agent omits
-		// a container it cannot sample, and the host walks the pod's DECLARED
+		// a container it cannot sample, and the host walks the pod's declared
 		// roster. This asserts they compose — one container reported, the other
 		// absent rather than zeroed.
 		dial := startRealGuestAgent(t, podID, guestagent.Deps{
@@ -337,7 +337,7 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 	})
 
 	t.Run("stats-report-unavailable-when-the-agent-refuses", func(t *testing.T) {
-		// The pod says WHY it has no figures rather than reporting zeros. Driving
+		// The pod says why it has no figures rather than reporting zeros. Driving
 		// it through the real agent proves the host reads the agent's actual
 		// refusal, not a transport error it would have produced anyway.
 		dial := startRealGuestAgent(t, "pod-someone-else", guestagent.Deps{
@@ -364,7 +364,7 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 	})
 
 	t.Run("container-events-round-trip-including-OOMKilled", func(t *testing.T) {
-		// The ONLY source of OOM truth for a vm pod: the kill happens in the guest
+		// The only source of OOM truth for a vm pod: the kill happens in the guest
 		// kernel's cgroup, which the host cannot observe at all. If this fact does
 		// not survive both halves, a vm pod's OOM is invisible — and upstream
 		// treats OOMKilled as the pod's own fault, restarting it and charging a
@@ -397,7 +397,7 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 			st := p.guestContainers["app"]
 			latched := p.oomKilled
 			p.mu.Unlock()
-			// BOTH the container's termination reason and the pod-level latch:
+			// both the container's termination reason and the pod-level latch:
 			// the reason is what an operator reads in `kubectl describe`, and the
 			// latch is what the pod status reports. A half that did not survive
 			// would leave the other telling a different story.

@@ -26,20 +26,20 @@ import (
 // reclaim floors are (see DefaultReclaimHighFreeBytes): a percentage of an APFS
 // container is fiction when every volume reports the same shared free pool.
 //
-// WHY A PULL GATE EXISTS AT ALL, given that reclaim already runs: reclaim frees
+// why a pull gate exists at all, given that reclaim already runs: reclaim frees
 // what nothing references, and on a node whose store is entirely referenced
 // there is nothing to free — yet the puller would happily keep streaming layers
-// into the remaining bytes. /var/lib/k3sm is SHARED WITH KINE'S state.db, so a
+// into the remaining bytes. /var/lib/k3sm is shared with KINE'S state.db, so a
 // volume the image puller exhausts is a control-plane outage, not a node
 // inconvenience. Reclamation and admission are different mechanisms: one gives
 // bytes back, the other stops spending them.
 //
-// WHY 3 GiB — the value is chosen by its ORDERING against the two thresholds
+// why 3 GiB — the value is chosen by its ordering against the two thresholds
 // that already exist, not on its own:
 //
 //	10 GiB  DefaultReclaimTargetFreeBytes  reclaim stops here
 //	 5 GiB  DefaultReclaimHighFreeBytes    reclaim STARTS here
-//	 3 GiB  DefaultPullRefuseFreeBytes     new pulls are REFUSED here
+//	 3 GiB  DefaultPullRefuseFreeBytes     new pulls are refused here
 //	 2 GiB  (the proposed node DiskPressure floor)  the node is tainted here
 //
 // The ordering is the design: the GC gets a 2 GiB window to reclaim before any
@@ -47,7 +47,7 @@ import (
 // the bleeding before the node condition flips and the scheduler is told. Each
 // mechanism therefore fires before the more disruptive one below it, and a
 // single filling volume walks the ladder in that order rather than tripping
-// everything at once. A floor placed ABOVE the reclaim trigger would invert it —
+// everything at once. A floor placed above the reclaim trigger would invert it —
 // pods would be refused images while the GC that would have made room had not
 // even run — which is why TestPullRefusesUnderDiskPressure asserts the ordering
 // against the reclaim constants by symbol rather than trusting the numbers here.
@@ -56,13 +56,13 @@ import (
 // the figure most likely to want lab tuning, alongside the DiskPressure floor.
 const DefaultPullRefuseFreeBytes uint64 = 3 << 30 // 3 GiB
 
-// ErrPullRefusedDiskPressure reports that a pull was refused BEFORE any registry
+// ErrPullRefusedDiskPressure reports that a pull was refused before any registry
 // round trip because the store volume is at or below its free-space floor
 // (DefaultPullRefuseFreeBytes).
 //
 // It is returned only for a pull that would FETCH. A reference already present
 // on this node is still served — presence is answered from the index and the
-// blob store and writes nothing — so disk pressure stops the node acquiring NEW
+// blob store and writes nothing — so disk pressure stops the node acquiring new
 // content without stranding pods whose content it already has.
 //
 // Like ErrImageNotPresent it is a plain sentinel, not a classified pull failure:
@@ -70,14 +70,14 @@ const DefaultPullRefuseFreeBytes uint64 = 3 << 30 // 3 GiB
 // this with errors.Is.
 var ErrPullRefusedDiskPressure = errors.New("image: refusing to start a pull, the store volume is below its free-space floor")
 
-// PullerOption adjusts a Puller at construction. Options exist ONLY for the
+// PullerOption adjusts a Puller at construction. Options exist only for the
 // disk-pressure admission seam; the cache, fetcher and index stay required
-// positional arguments, because each of those chooses WHERE BYTES COME FROM and
+// positional arguments, because each of those chooses where bytes COME from and
 // a silent default there is the class of bug NewPuller's doc comment refuses.
 //
-// The admission seam is different in kind: it is a MEASUREMENT of this machine,
+// The admission seam is different in kind: it is a measurement of this machine,
 // with exactly one correct production implementation (StatfsFreeBytes), and its
-// default fails CLOSED — a real statfs that errors refuses the pull. This is the
+// default fails closed — a real statfs that errors refuses the pull. This is the
 // same treatment ReclaimConfig gives FreeBytes and HighFreeBytes.
 type PullerOption func(*Puller)
 
@@ -88,7 +88,7 @@ func WithPullFloor(floorBytes uint64) PullerOption {
 }
 
 // WithFreeBytes overrides how free space on the store volume is sampled. Nil
-// means StatfsFreeBytes. It is the seam BELOW the decision, so the admission
+// means StatfsFreeBytes. It is the seam below the decision, so the admission
 // rule is testable with no syscall — the same seam ReclaimConfig.FreeBytes uses,
 // deliberately, so the two mechanisms cannot be tested against different notions
 // of "free".
@@ -98,7 +98,7 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 
 // admitFetch decides whether this node may BEGIN acquiring new image content.
 //
-// It is FAIL-CLOSED on both axes:
+// It is fail-closed on both axes:
 //
 //   - below the floor, the pull is refused with the measured and required byte
 //     counts in the message, so an operator can tell a full volume from any
@@ -106,7 +106,7 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 //   - an UNSAMPLABLE volume is also refused. A statfs that fails is the first
 //     symptom of a volume going bad, which is precisely when writing gigabytes
 //     into it on the assumption that it is fine is worst. This mirrors reclaim's
-//     posture (ErrFreeSpaceUnknown), and the returned error matches BOTH
+//     posture (ErrFreeSpaceUnknown), and the returned error matches both
 //     sentinels so a caller can key on the refusal or on its cause.
 //
 // It is called at the one choke point every fetching path traverses — after the
@@ -114,7 +114,7 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 // or Never serve is never affected, and no code path can acquire new content
 // without passing here.
 //
-// RECORDED RESIDUAL, not fixed here: the ingest path (LoadImage and the image-load CLI)
+// RECORDED residual, not fixed here: the ingest path (LoadImage and the image-load CLI)
 // writes the same store without traversing this function, so an operator
 // streaming a tarball can still fill the volume. That path is not a pull and its
 // admission is its own item's business.

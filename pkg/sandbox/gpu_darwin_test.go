@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// TestProbeGPULiveShape runs the REAL probe on whatever darwin host the tests are
+// TestProbeGPULiveShape runs the real probe on whatever darwin host the tests are
 // on. It deliberately asserts only host-independent properties — the probe returns,
 // it names a reason, and its fields are mutually consistent — because the verdict
 // itself is hardware-dependent (a GPU Mac, a VZ guest, and a CGO_ENABLED=0 build

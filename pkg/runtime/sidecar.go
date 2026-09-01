@@ -36,7 +36,7 @@ func sidecarsLocked(p *pod) []*containerProc {
 	return out
 }
 
-// liveSidecarsLocked returns the pod's native sidecars that have NOT terminated,
+// liveSidecarsLocked returns the pod's native sidecars that have not terminated,
 // in START order. It is the re-claim set for a pod found still terminal after a
 // RestartContainer swap: the once-only p.sidecarTeardown latch cannot cover a
 // process spawned after the claim, and a terminal pod must leave no sidecar
@@ -51,9 +51,9 @@ func liveSidecarsLocked(p *pod) []*containerProc {
 	return out
 }
 
-// stopSidecars stops sidecars sequentially in REVERSE start order against ONE
+// stopSidecars stops sidecars sequentially in reverse start order against one
 // pod-level grace budget expiring at deadline: each stop gets the budget's
-// REMAINDER (elapsed time subtracted), and a remainder <= 0 takes the
+// remainder (elapsed time subtracted), and a remainder <= 0 takes the
 // immediate-SIGKILL path (supervisor.GracefulStop with grace 0 sends no
 // SIGTERM) — sidecars never extend the pod's grace. It is shared by DeletePod
 // (the mains are stopped first against the full budget, so the sidecars get

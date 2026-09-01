@@ -18,7 +18,7 @@ limitations under the License.
 
 package sandbox
 
-// probeHostFacts is the OFF-PLATFORM host-facts read: the darwin sysctls do not
+// probeHostFacts is the off-PLATFORM host-facts read: the darwin sysctls do not
 // exist elsewhere, so every fact is absent. The zero value is the honest answer and
 // it never decides availability on its own (see DeriveGPUFacts).
 func probeHostFacts() HostFacts { return HostFacts{} }

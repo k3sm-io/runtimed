@@ -67,7 +67,7 @@ type podLaunchSeam struct {
 // returns nil the process is irreversibly sandboxed.
 func (s *podLaunchSeam) SandboxApply() error { return confine(s.profile) }
 
-// Exec replaces the process image with the pod binary, PRESERVING the inherited
+// Exec replaces the process image with the pod binary, preserving the inherited
 // environment (so DYLD_INSERT_LIBRARIES survives into the pod). It returns only
 // on error.
 //
@@ -93,10 +93,10 @@ func (s *podLaunchSeam) Exec() error {
 // RunPodLaunch becomes a confined, privilege-dropped pod process: it applies
 // spec's decoded rlimit plan, drops to spec.Cred (when Drop), backgrounds itself
 // (when spec.BgQoS), applies the SBPL profile, and execve's argv — in the
-// SECURITY-CRITICAL order supervisor.RunLaunchSequence enforces (setrlimit →
+// SECURITY-critical order supervisor.RunLaunchSequence enforces (setrlimit →
 // setgid→initgroups→setuid → setpriority → sandbox_apply → exec). spec is the
 // launch spec main() decoded from the shim argv (supervisor.ParseCredential /
-// ParseRlimits / ParseQoS — a decode failure is fatal BEFORE this is reached, so
+// ParseRlimits / ParseQoS — a decode failure is fatal before this is reached, so
 // the plan handed here is exactly what the daemon resolved). It returns only on
 // error; a successful exec never returns. The ordering rationale lives at
 // supervisor.RunLaunchSequence (the single source of truth, also unit-tested

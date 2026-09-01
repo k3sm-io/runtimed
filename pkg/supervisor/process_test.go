@@ -163,7 +163,7 @@ func TestProcessLogCapture(t *testing.T) {
 }
 
 // TestProcessLogsDrained checks the drain edge: with a sink, LogsDrained closes only
-// AFTER the pump has flushed every line to the sink (the B11 "logs fully drained"
+// after the pump has flushed every line to the sink (the B11 "logs fully drained"
 // guarantee watchContainerExit relies on); with no sink there is no pump, so it is
 // closed at Start.
 func TestProcessLogsDrained(t *testing.T) {
@@ -293,7 +293,7 @@ func TestNodeNetwork(t *testing.T) {
 
 // logPipeSpawner is a Spawner that plays a scripted byte stream into the
 // Process's combined-log pipe. Unlike fakeSpawner it writes from a goroutine on
-// its OWN dup of the write end — the way a real child does — which is required
+// its own dup of the write end — the way a real child does — which is required
 // for payloads larger than the pipe buffer: a synchronous in-Spawn write would
 // deadlock, because Start only launches the pump after Spawn returns. The dup
 // also keeps the write end alive past Start's close of the parent's copy, so EOF
@@ -319,12 +319,12 @@ func (s *logPipeSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
 }
 
 // TestPumpLogsSurvivesOversizedLine is the B164 gate. A single line longer than
-// the pump's per-line cap must NOT stop the pump: before the fix the pump used a
+// the pump's per-line cap must not stop the pump: before the fix the pump used a
 // bufio.Scanner whose Scan() returns false on an over-cap token and whose Err()
 // was never checked, so one oversized line silently ended log delivery for the
-// rest of the container's life — taking kubectl logs AND the
+// rest of the container's life — taking kubectl logs and the
 // FallbackToLogsOnError termination message with it. The load-bearing assertion
-// is that a line written AFTER the oversized one still reaches the sink.
+// is that a line written after the oversized one still reaches the sink.
 func TestPumpLogsSurvivesOversizedLine(t *testing.T) {
 	const (
 		head   = "HEAD-MARKER"

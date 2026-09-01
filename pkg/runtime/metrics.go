@@ -23,14 +23,14 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// memoryLimitAnnotation carried the pod's memory limit in BYTES before apis:M2.2
+// memoryLimitAnnotation carried the pod's memory limit in bytes before apis:M2.2
 // defined the first-class PodBox.memory_limit_bytes field. It is now the
 // TRANSITIONAL FALLBACK only: podMemoryLimitBytes prefers the typed field and
 // reads this annotation solely when the typed field is unset, so OOM enforcement
 // holds regardless of land order while the k3sm provider switches to writing the
 // typed field (a sibling PR). Once every provider writes the typed field this
 // fallback (and the annotation) can be deleted. The value is in ri_phys_footprint
-// units (NOT RSS); see docs/resources.md.
+// units (not RSS); see docs/resources.md.
 const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 
 // podMemoryLimitBytes returns the pod's memory limit in bytes, or 0 for unlimited
@@ -44,7 +44,7 @@ const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 // qos_class and rlimits also ride apis:M2.2's PodBox resource band. qos_class is
 // informational for runtimed today (CPU is best-effort QoS, not CFS millicores —
 // the taskpolicy/setpriority application is deferred, see docs/resources.md and
-// PodBox.qos_class). rlimits from the EXPLICIT PodBox.rlimits[] are resolved
+// PodBox.qos_class). rlimits from the explicit PodBox.rlimits[] are resolved
 // daemon-side by resolveRlimitPlan into a supervisor.PlannedRlimit plan that
 // RunLaunchSequence applies via setrlimit(2) as StepSetrlimit, ordered before the
 // uid drop. No rlimit is synthesized from memory_limit_bytes or a cpu quota:
@@ -70,7 +70,7 @@ func podMemoryLimitBytes(box *runtimev1.PodBox) uint64 {
 
 // PodMetrics is a point-in-time resource sample for a pod — the source the k3sm
 // provider maps to the kubelet Summary API / kubectl top (Wave 3 wires it to the
-// Summary endpoint). WorkingSetBytes is ri_phys_footprint (NOT RSS — see
+// Summary endpoint). WorkingSetBytes is ri_phys_footprint (not RSS — see
 // docs/resources.md and the supervisor MemorySampler doc). It is a
 // runtimed-internal type until apis defines the Summary message (apis:M2.2), at
 // which point PodMetrics maps onto it.
@@ -86,7 +86,7 @@ type PodMetrics struct {
 
 // PodMetrics returns the latest memory sample for podID. ok is false only when the
 // pod is unknown or its sampler was never armed (the anti-stranding refusal for an
-// unregistered pod). EVERY pod is metered — the memory limit selects OOM
+// unregistered pod). every pod is metered — the memory limit selects OOM
 // enforcement, not metering, so an unlimited pod is reported like any other rather
 // than silently omitted from `kubectl top` (see armMemorySampler).
 func (r *Runtime) PodMetrics(podID string) (PodMetrics, bool) {

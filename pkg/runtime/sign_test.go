@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// orderedSigner records the ORDER of Sign/Check calls so a test can assert the
+// orderedSigner records the order of Sign/Check calls so a test can assert the
 // policy gate runs in the right sequence relative to the ad-hoc-sign step (M2.6).
 type orderedSigner struct {
 	mu    sync.Mutex
@@ -74,7 +74,7 @@ func (s *orderedSigner) seq() []string {
 }
 
 // TestGateSignatureOrdering is the M2.6-d2 proof on a fake signer: the signature
-// policy is enforced BEFORE (and instead of) ad-hoc signing for require-* policies
+// policy is enforced before (and instead of) ad-hoc signing for require-* policies
 // (no silent downgrade), while adhoc-ok signs then checks.
 func TestGateSignatureOrdering(t *testing.T) {
 	cases := []struct {
@@ -87,9 +87,9 @@ func TestGateSignatureOrdering(t *testing.T) {
 		wantErr     bool
 	}{
 		{
-			// CHECK FIRST. A binary that is already validly signed — the ordinary
+			// check FIRST. A binary that is already validly signed — the ordinary
 			// case for a rootfs cloned from a tree signed once at pull time — is
-			// NEVER re-signed: `codesign -f` would rewrite it and de-CoW argv[0] on
+			// never re-signed: `codesign -f` would rewrite it and de-CoW argv[0] on
 			// every start.
 			name:    "adhoc-ok-already-valid-checks-without-signing",
 			policy:  runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
@@ -105,7 +105,7 @@ func TestGateSignatureOrdering(t *testing.T) {
 		},
 		{
 			// A host binary (native pod / host path) is already signed + read-only:
-			// verify only, NEVER ad-hoc re-sign — even under the ADHOC_OK policy.
+			// verify only, never ad-hoc re-sign — even under the ADHOC_OK policy.
 			// This is the fix for `codesign -s - -f /bin/sh` failing on a SIP binary.
 			name:       "adhoc-ok-host-binary-checks-without-signing",
 			policy:     runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
@@ -174,7 +174,7 @@ func (f *fakeCredentialResolver) PullCredential(_ context.Context, ns string, se
 }
 
 // TestCreatePodImagePullSecretConfinedToPuller is the M2.6-d1 proof: the
-// imagePullSecret credential reaches the pull client and is NEVER written into the
+// imagePullSecret credential reaches the pull client and is never written into the
 // pod dir / materialized filesystem.
 func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
 	const secret = "topsecret-REGISTRY-PASSWORD"
@@ -214,7 +214,7 @@ func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
 	// (1b) B99: the host-process spine pulls under a NATIVE platform policy, so a
 	// multi-platform image resolves to darwin/arm64 and never to
 	// go-containerregistry's implicit linux/amd64 default. This runs through the
-	// REAL createPod, so it also proves the wiring the unit test cannot: the
+	// real createPod, so it also proves the wiring the unit test cannot: the
 	// backend sandbox.SelectBackend resolved is what reached the puller (an
 	// unset pod.backend would arrive as UNSPECIFIED, which has no candidates).
 	pol := pull.policy()

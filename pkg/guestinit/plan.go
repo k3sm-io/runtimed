@@ -53,7 +53,7 @@ type ContainerPlan struct {
 
 	// Mounts compose this container's rootfs, in application order: the
 	// rootfs overlay, the pod mounts re-exposed inside it, then the /etc bind
-	// set. The /etc binds come LAST so nothing can be stacked over them.
+	// set. The /etc binds come last so nothing can be stacked over them.
 	Mounts []MountStep
 
 	// Root is the composed rootfs the process is chrooted into.
@@ -63,10 +63,10 @@ type ContainerPlan struct {
 	// config; Argv[0] is the program.
 	Argv []string
 
-	// Env are fully resolved KEY=VALUE entries.
+	// Env are fully resolved KEY=value entries.
 	Env []string
 
-	// WorkingDir is the working directory INSIDE Root; empty means "/".
+	// WorkingDir is the working directory inside Root; empty means "/".
 	WorkingDir string
 
 	// Ident is the identity the process runs as.

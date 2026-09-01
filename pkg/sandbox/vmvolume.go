@@ -21,8 +21,8 @@ package sandbox
 // how each container's declared volumeMounts bind into those shares (Binds),
 // and which mounts are guest-RAM tmpfs instead of a share (Tmpfs).
 //
-// It is PLAIN DATA on the same decoupling seam as GuestNetworkConfig: sandbox
-// does NOT import pkg/mount (the volume/path authority that computes the plan)
+// It is plain DATA on the same decoupling seam as GuestNetworkConfig: sandbox
+// does not import pkg/mount (the volume/path authority that computes the plan)
 // — the named mapper is createVMPod in pkg/runtime, which owns both sides and
 // stamps this struct onto VMSpec.Volumes as data. The zero value plans nothing
 // (no shares, no binds, no tmpfs), which is safe: a guest with no plan gets no
@@ -44,18 +44,18 @@ type VMVolumePlan struct {
 // VMShare is one virtiofs share device: the host directory Root exported into
 // the guest under the mount tag Tag.
 //
-// The field is Writable — NOT ReadOnly — so the ZERO VALUE IS READ-ONLY
+// The field is Writable — not ReadOnly — so the zero value IS READ-only
 // (fail-closed): a share is writable only by affirmative decision. The
-// ENFORCEMENT POINT for Writable is the VZ share-device configuration (the
+// ENFORCEMENT point for Writable is the VZ share-device configuration (the
 // VZSharedDirectory readOnly: flag on the device the lab-gated boot builds);
-// NOTHING in this build enforces it — CreateVM is a stub
+// nothing in this build enforces it — CreateVM is a stub
 // (ErrVMBootNotImplemented), so the plan is carried, not applied. A guest-side
-// `mount -o ro` is NOT a substitute for the device-level flag: guest mount
+// `mount -o ro` is not a substitute for the device-level flag: guest mount
 // options are attacker-controlled in a vm pod (the guest runs the tenant's
 // code as root), while the VZ device flag is applied host-side, outside the
 // guest's reach.
 //
-// R24(d): a PersistentVolumeClaim mounted by two pods yields the SAME host
+// R24(d): a PersistentVolumeClaim mounted by two pods yields the same host
 // directory as a share device in both guests — a bidirectional cross-guest
 // channel, and the one documented exception to the vm boundary's per-pod
 // filesystem isolation ("…except through a deliberately shared RWX claim").
@@ -73,23 +73,23 @@ type VMShare struct {
 
 // VMBind is one container volumeMount realized from a virtiofs share: guest
 // path MountPath is bound to SourceRel under the share tagged ShareTag. Binds
-// are grouped per container name (VMVolumePlan.Binds) and are COMPOSED LATER
+// are grouped per container name (VMVolumePlan.Binds) and are COMPOSED later
 // by the guest init process (B102, the other consumer this build does not
 // enforce for): guest-init mounts each share by tag and bind-mounts
 // <share>/<SourceRel> (optionally narrowed by SubPath) at MountPath inside the
 // container's mount namespace. Nothing in this build performs those mounts.
 //
-// PER-CONTAINER BINDS ARE A PLAN SHAPE, NOT A CONFINEMENT BOUNDARY: the host
-// attaches ONE pooled device per class (k3sm.proj, k3sm.vols — the whole
+// per-CONTAINER BINDS are A PLAN SHAPE, not A CONFINEMENT BOUNDARY: the host
+// attaches one pooled device per class (k3sm.proj, k3sm.vols — the whole
 // share, every volume's subdir) to the guest, and the narrowing to a single
-// container's view is a mount guest-init performs INSIDE the guest, where the
+// container's view is a mount guest-init performs inside the guest, where the
 // tenant's code runs as root. The k8s property "a container that does not
 // mount the secret cannot read it" is therefore GUEST-COOPERATIVE here, not
 // host-enforced; what the host enforces ends at the device set and each
-// device's read-only flag. Guest-init MUST re-validate and containment-check
-// MountPath, SubPath, AND SourceRel against the mounted share before
+// device's read-only flag. Guest-init must re-validate and containment-check
+// MountPath, SubPath, and SourceRel against the mounted share before
 // composing a bind: the planner validates SubPath lexically but carries
-// MountPath and SourceRel (the raw volume name) VERBATIM.
+// MountPath and SourceRel (the raw volume name) verbatim.
 type VMBind struct {
 	// VolumeName is the PodBox volume the bind realizes.
 	VolumeName string
@@ -100,7 +100,7 @@ type VMBind struct {
 	SourceRel string
 	// MountPath is the guest path the container sees the volume at.
 	MountPath string
-	// SubPath is the volumeMount sub_path carried VERBATIM (lexically
+	// SubPath is the volumeMount sub_path carried verbatim (lexically
 	// validated by the planner); guest-init applies it under SourceRel.
 	SubPath string
 	// ReadOnly is the effective per-bind read-only intent (the volumeMount's
@@ -118,11 +118,11 @@ type VMTmpfs struct {
 	VolumeName string
 	// MountPath is the guest path the container sees the tmpfs at.
 	MountPath string
-	// SubPath is the volumeMount sub_path carried VERBATIM (lexically
+	// SubPath is the volumeMount sub_path carried verbatim (lexically
 	// validated by the planner, exactly as VMBind.SubPath); guest-init
 	// applies it inside the tmpfs.
 	SubPath string
-	// SizeLimit is the emptyDir size_limit carried VERBATIM as the proto's
+	// SizeLimit is the emptyDir size_limit carried verbatim as the proto's
 	// resource.Quantity string (e.g. "64Mi"); empty means unset. The planner
 	// does NO quantity parsing — translating it to tmpfs size= bytes is
 	// guest-init's job (B102).

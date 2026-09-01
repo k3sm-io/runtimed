@@ -20,7 +20,7 @@ limitations under the License.
 //
 // # Why this is not k3sm-guest-init
 //
-// The smoke's subject is the HOST-SIDE SPINE: write the machine description,
+// The smoke's subject is the HOST-side SPINE: write the machine description,
 // spawn the entitled helper, attach, boot, and complete the agent handshake over
 // the runtimed-private agent.sock. The real guest init answers a different
 // question (does the guest compose its pod correctly), and it cannot run here
@@ -35,14 +35,14 @@ limitations under the License.
 // was built, the kernel booted, the vsock device attached, the guest agent bound,
 // and the helper's proxy relayed the call. Every one of those is host-side.
 //
-// # It lives in testdata, and is BUILT by the test, never committed as a binary
+// # It lives in testdata, and is built by the test, never committed as a binary
 //
 // The initramfs is composed at test time from this source (cross-compiled
 // GOOS=linux GOARCH=arm64 CGO_ENABLED=0) plus whatever kernel modules the lab
 // declares. Committing a built initramfs would put a ~16 MB opaque blob in the
 // repo that nobody could review and that would silently drift from guest/v1.
 //
-// # What it deliberately does NOT do
+// # What it deliberately does not do
 //
 // It never powers off, and it ignores SIGTERM — it has no workload to terminate
 // and no filesystem to sync. That is a FEATURE of the smoke rather than a
@@ -76,7 +76,7 @@ import (
 const agentPort = 1024
 
 // modulesDir is where the test stages the kernel modules it was told to load.
-// Every .ko found there is insmod'd in LEXICAL ORDER, which is why the test names
+// Every .ko found there is insmod'd in LEXICAL order, which is why the test names
 // them with a numeric prefix: vsock's virtio transport depends on the common
 // layer, which depends on the core, and finit_module does no dependency
 // resolution.
@@ -128,7 +128,7 @@ func main() {
 
 // loadModules insmods every module the test staged, in lexical order.
 //
-// AF_VSOCK IS A MODULE ON THE STOCK LAB KERNELS. Without this the socket(2) call
+// AF_VSOCK IS A MODULE ON the STOCK LAB KERNELS. Without this the socket(2) call
 // below fails with "address family not supported by protocol" and the smoke
 // reports a boot that reached userspace and then could not be reached — a
 // confusing shape for a missing kernel option. A kernel with vsock built in
@@ -173,7 +173,7 @@ func hang() {
 
 // --- AF_VSOCK adapters ------------------------------------------------------
 //
-// net.FileListener and net.FileConn REFUSE AF_VSOCK (they switch on the address
+// net.FileListener and net.FileConn refuse AF_VSOCK (they switch on the address
 // family), so the fds cannot be handed to net directly. What IS reused is
 // os.NewFile, which registers a non-blocking fd with the runtime's network
 // poller — that is what keeps deadlines working, keeps a blocked goroutine parked
@@ -230,7 +230,7 @@ func (c *vsockConn) SetDeadline(t time.Time) error      { return c.f.SetDeadline
 func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.f.SetReadDeadline(t) }
 func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.f.SetWriteDeadline(t) }
 
-// listenVsock binds and listens on port for ANY CID: the only peer that can reach
+// listenVsock binds and listens on port for any CID: the only peer that can reach
 // a guest's vsock is its own hypervisor, so a specific CID would buy no isolation
 // and would break whenever the host CID differed from the guessed one.
 func listenVsock(port uint32) (net.Listener, error) {

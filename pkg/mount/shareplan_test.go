@@ -52,8 +52,8 @@ func planBox(volumes ...*runtimev1.Volume) *runtimev1.PodBox {
 }
 
 // TestIsStrictlyUnder pins the strict, separator-aware containment helper the
-// share-plan guards depend on: equality is FALSE (the difference from isUnder)
-// and a sibling sharing a name prefix is NOT a descendant.
+// share-plan guards depend on: equality is false (the difference from isUnder)
+// and a sibling sharing a name prefix is not a descendant.
 func TestIsStrictlyUnder(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -115,7 +115,7 @@ func TestValidateVMSubPath(t *testing.T) {
 }
 
 // TestClassifyVMVolumeArity pins the arity-checked dispatch over the volume
-// source union (NOT a proto oneof): exactly one known source or reject — a
+// source union (not a proto oneof): exactly one known source or reject — a
 // zero-source volume (how a future unknown field like host_path presents to
 // this build) and a two-source volume both fail closed.
 func TestClassifyVMVolumeArity(t *testing.T) {
@@ -245,7 +245,7 @@ func TestComputeSharePlanRejects(t *testing.T) {
 		// shape. Each name states what the crafted input would have addressed:
 		// a lateral row is a SIBLING NAMESPACE's tree (inside the storage
 		// root, so the escapes-base guard alone never fires), the "."/"/"
-		// rows are the whole namespace tree (an ANCESTOR of every claim root),
+		// rows are the whole namespace tree (an ancestor of every claim root),
 		// and only the multi-".." row actually leaves the storage root.
 		{
 			name: "pvc-claim-lateral-into-sibling-namespace",
@@ -349,14 +349,14 @@ func TestComputeSharePlanRejects(t *testing.T) {
 				Name:                  "v",
 				PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "k"},
 			}),
-			// Storage class mis-rooted INSIDE <workRoot>/run: the R7 guard is
+			// Storage class mis-rooted inside <workRoot>/run: the R7 guard is
 			// the one that refuses (the root is fine by every other rule).
 			class:    storagev1.LocalPathClass{BasePath: root + "/run/storage"}.WithDefaults(),
 			wantFrag: "intersects the runtime socket tree",
 		},
 		{
 			name: "pvc-shares-alias-one-dir-same-claim-twice",
-			// Two volumes on the SAME claim derive the identical root — two
+			// Two volumes on the same claim derive the identical root — two
 			// devices aliasing one host tree — which the pairwise-disjoint
 			// guard refuses. (A nested pair via a multi-component claim like
 			// "c/nested" now rejects earlier, at the single-component check.)

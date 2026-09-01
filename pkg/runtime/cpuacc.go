@@ -22,7 +22,7 @@ import "sync"
 // cumulative CPU that is MONOTONE for the whole life of the pod.
 //
 // Why it has to exist: proc_pid_rusage counts a PROCESS. A restarted container is
-// a NEW pid whose counter starts again near zero, so the raw reading for that
+// a new pid whose counter starts again near zero, so the raw reading for that
 // container jumps BACKWARDS at every restart. The consumer cannot tolerate that —
 // metrics-server derives CPU as a RATE from two cumulative samples and rejects a
 // pair whose later value is smaller than the earlier one (its
@@ -32,7 +32,7 @@ import "sync"
 // container_cpu_usage_seconds_total say the same thing from the wire side.
 //
 // The fix is the usual counter-carry: when the pid behind a container name
-// changes, the LAST reading observed for the retired pid is folded into a
+// changes, the last reading observed for the retired pid is folded into a
 // per-container `retired` total that only ever grows, and the container's
 // cumulative value is reported as retired + the current process's reading.
 //
@@ -63,7 +63,7 @@ type cpuCounter struct {
 	pid int
 	// last is the most recent raw cumulative reading for pid, in nanoseconds.
 	last uint64
-	// retired is the summed final readings of every PREVIOUS pid for this
+	// retired is the summed final readings of every previous pid for this
 	// container. It never decreases.
 	retired uint64
 }
@@ -99,7 +99,7 @@ func (a *cpuAccumulator) observe(name string, pid int, raw uint64) uint64 {
 	return c.retired + c.last
 }
 
-// sum returns the pod-lifetime cumulative CPU of EVERY container this
+// sum returns the pod-lifetime cumulative CPU of every container this
 // accumulator has observed, including ones that have since terminated. ok is
 // false when nothing has been observed at all.
 //
@@ -120,7 +120,7 @@ func (a *cpuAccumulator) sum() (uint64, bool) {
 }
 
 // total returns the container's pod-lifetime cumulative CPU from the readings
-// already observed, WITHOUT taking a new one. ok is false for a container this
+// already observed, without taking a new one. ok is false for a container this
 // accumulator has never seen — the caller must then report no CPU at all rather
 // than a zero, because a zero is indistinguishable from "idle" to the consumer and
 // would publish an incomplete sample instead of withholding one.

@@ -32,7 +32,7 @@ import (
 // hostile rootfs_path through CreatePod. The runtime now refuses such a box at
 // the seam, so that case can no longer reach the planner — which is a tightening
 // upstream, but it left this layer's independence unasserted. The planner sits
-// BELOW that guard, so if it ever started honoring the field, the runtime check
+// below that guard, so if it ever started honoring the field, the runtime check
 // would not catch it for a caller that reaches ComputeSharePlan directly.
 func TestComputeSharePlanIgnoresBoxRootfsPath(t *testing.T) {
 	root := t.TempDir()

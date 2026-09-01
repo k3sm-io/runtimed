@@ -24,7 +24,7 @@ limitations under the License.
 // (filepath.Join(dataVol, mountPath)), and the provider points the workload at
 // that path. Because every materialized volume lives inside the writable data
 // volume, none of them need an SBPL extra-path grant — the data volume is already
-// in the pod's write-scope. Host paths OUTSIDE the data volume are the provider's
+// in the pod's write-scope. Host paths outside the data volume are the provider's
 // SandboxProfile.extra_read_paths/extra_write_paths, which sandbox.Generate
 // validates against the protected deny-set. A mount path that would escape the
 // data volume via "../" is rejected.
@@ -42,14 +42,14 @@ limitations under the License.
 //
 // # subPath
 //
-// A VolumeMount subPath selects a single element WITHIN the volume: the container
+// A VolumeMount subPath selects a single element within the volume: the container
 // mount path exposes only the volume's <subPath> file or subdirectory, never the
-// whole volume. subPath does NOT change the destination level — the destination is
+// whole volume. subPath does not change the destination level — the destination is
 // always the rebased mountPath (filepath.Join(dataVol, mountPath)); the empty-
 // subPath path is unchanged (whole volume materialized at the mount path). For a
 // non-empty subPath the model is: materialize the whole volume into a STAGING dir
-// OUTSIDE the readable data volume → validate + select <staging>/<subPath> → CoW-
-// clone ONLY that element into the rebased mount path → remove the staging dir, so
+// outside the readable data volume → validate + select <staging>/<subPath> → CoW-
+// clone only that element into the rebased mount path → remove the staging dir, so
 // no un-selected sibling (e.g. the volume's other keys) is ever left readable under
 // the pod tree.
 //

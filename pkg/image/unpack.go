@@ -37,18 +37,18 @@ import (
 )
 
 // UnpackedSubdir is the cache-root-relative directory the per-image unpacked
-// trees live in: <root>/unpacked, a SIBLING of blobs/, pods/, index/ and
+// trees live in: <root>/unpacked, a sibling of blobs/, pods/, index/ and
 // ingest/.
 //
 // Being a sibling is deliberate, exactly as it is for IndexSubdir and
 // IngestSubdir: the blob inventory reads blobs/ (Cache.EnumerateBlobs) and the
 // root set reads pods/ (Cache.Roots), so an unpacked tree can neither be
 // mistaken for a content blob of unknown provenance nor become a reachability
-// root. A tree is DERIVED content — every byte in it is reconstructible from
+// root. A tree is derived content — every byte in it is reconstructible from
 // blobs the manifest names — so it must never be able to keep a blob alive, and
 // nothing under here does.
 //
-// Trees ARE swept, by a third enumerator of their own (Cache.EnumerateTrees):
+// Trees are swept, by a third enumerator of their own (Cache.EnumerateTrees):
 // they are counted by the disk-pressure accounting (Cache.StoreBytes) and
 // offered to the prune planner, which decides them under the separate root-set
 // rule stated at planTrees ("which trees may a live pod's clone still depend
@@ -73,20 +73,20 @@ const (
 	TreeRecordName = "tree.json"
 )
 
-// SnapshotsSubdir is the cache-root-relative directory the LINUX dialect's
+// SnapshotsSubdir is the cache-root-relative directory the Linux dialect's
 // ChainID-keyed snapshots live in: <root>/snapshots, a sibling of unpacked/,
 // blobs/, pods/, index/ and ingest/.
 //
-// It is a SEPARATE store from unpacked/, not a second dialect filed in the same
+// It is a separate store from unpacked/, not a second dialect filed in the same
 // one, for two reasons that are both about the key rather than about tidiness:
 //
-//   - the keys are different KINDS. An unpacked tree is keyed by TreeKey, a
+//   - the keys are different kinds. An unpacked tree is keyed by TreeKey, a
 //     digest over the manifest's config + layers + policy; a snapshot is keyed
 //     by the OCI CHAIN ID, a digest over the layer diffIDs alone. Two keys of
 //     different provenance in one namespace can only be told apart by reading a
 //     record inside the directory they name, which is exactly the thing a
 //     content-addressed layout exists to avoid.
-//   - the chain id is the ONLY key that lets two different images sharing a
+//   - the chain id is the only key that lets two different images sharing a
 //     layer prefix share stored bytes, and it is the key the guest's rootfs
 //     shares are named by — so the snapshot store is what moves to the
 //     dedicated case-sensitive APFS volume (by design), while
@@ -101,7 +101,7 @@ const (
 const SnapshotsSubdir = "snapshots"
 
 // SnapshotRecordName is the daemon-authored record beside a committed snapshot,
-// and SnapshotOwnershipName is its ownership sidecar. Both sit BESIDE
+// and SnapshotOwnershipName is its ownership sidecar. Both sit beside
 // TreeRootfsName rather than inside it, so an image containing a file called
 // "meta.json" writes it inside rootfs/ where it is just a file.
 const (
@@ -114,10 +114,10 @@ const (
 // silently reading absent fields as zero.
 const treeRecordVersion = 1
 
-// ErrDiffIDMismatch reports that a layer's DECOMPRESSED bytes contradict the
+// ErrDiffIDMismatch reports that a layer's decompressed bytes contradict the
 // diffID the image config claims for them.
 //
-// It is distinct from ErrDigestMismatch, which is about the COMPRESSED blob
+// It is distinct from ErrDigestMismatch, which is about the compressed blob
 // against its manifest descriptor, and the two are not interchangeable: the
 // compressed check proves the store holds the bytes the manifest named, while
 // this one proves those bytes decompress to the content the image's own config
@@ -129,36 +129,36 @@ var ErrDiffIDMismatch = errors.New("image: layer content does not match the conf
 
 // ErrUnsupportedLayerMediaType reports a layer this unpacker cannot decompress.
 //
-// The compression is chosen from the DECLARED media type against a closed
+// The compression is chosen from the declared media type against a closed
 // allowlist, never sniffed from the bytes: sniffing lets the content decide how
 // it is interpreted, which is the same class of mistake as classifying a blob by
 // reading it (see BlobKind). gzip, zstd and uncompressed tar are admitted; xz,
 // the nondistributable variants, and anything unrecognised land here.
 var ErrUnsupportedLayerMediaType = errors.New("image: unsupported layer media type")
 
-// ErrUnsupportedLayerSemantics reports a layer-application DIALECT this build
+// ErrUnsupportedLayerSemantics reports a layer-application dialect this build
 // does not implement — an unset or unrecognised LayerSemantics, or a sandbox
 // backend with no dialect mapped to it (UnpackPolicyFor).
 //
-// It is distinct from ErrUnsupportedLayerMediaType, which is about COMPRESSION,
+// It is distinct from ErrUnsupportedLayerMediaType, which is about compression,
 // and the two were briefly conflated. They are not the same verdict about the
-// same thing: a media type is a property of a layer BLOB and a dialect is a
-// property of the CALLER's request, so an operator seeing one knows to look at
+// same thing: a media type is a property of a layer blob and a dialect is a
+// property of the caller's request, so an operator seeing one knows to look at
 // the image and seeing the other knows to look at the pod.
 var ErrUnsupportedLayerSemantics = errors.New("image: unsupported layer semantics")
 
-// ErrTreeInconsistent reports that a COMMITTED tree on disk is not usable: its
+// ErrTreeInconsistent reports that a committed tree on disk is not usable: its
 // record is absent, undecodable, or claims a key other than the one the tree is
 // filed under. It is fail-closed — the tree is refused, never repaired in place,
 // because a tree whose record disagrees with its path cannot be reasoned about
 // and repairing it would mean writing content under a key it was not derived for.
 var ErrTreeInconsistent = errors.New("image: unpacked tree is inconsistent with its record")
 
-// UnpackPolicy is the set of decisions that change the BYTES an unpack produces.
+// UnpackPolicy is the set of decisions that change the bytes an unpack produces.
 // It is half of an unpacked tree's key, so a change of policy yields a different
 // tree rather than silently reusing one built under different rules.
 //
-// It is a struct rather than a bare LayerSemantics because it is a KEY INPUT:
+// It is a struct rather than a bare LayerSemantics because it is a key input:
 // every future knob that changes the output (M11.2-d1's xattr allowlist, an
 // ownership-sidecar toggle) must join the key, and a struct makes adding one a
 // compile-visible change to canonical() rather than an invisible one.
@@ -173,12 +173,12 @@ type UnpackPolicy struct {
 // NativeUnpackPolicy is the policy for the darwin-native host-process spine.
 func NativeUnpackPolicy() UnpackPolicy { return UnpackPolicy{Semantics: SemanticsNative} }
 
-// UnpackPolicyFor maps a RESOLVED sandbox backend to the layer-application
-// dialect its rootfs must be built under. It is the ONE producer of that
+// UnpackPolicyFor maps a resolved sandbox backend to the layer-application
+// dialect its rootfs must be built under. It is the one producer of that
 // discriminator, mirroring image.Candidates' backend switch so the two cannot
 // disagree about which spine a backend belongs to.
 //
-// It FAILS CLOSED on the zero value and on any unknown backend, for the reason
+// It fails closed on the zero value and on any unknown backend, for the reason
 // PlatformPolicy gives for the same shape: sandbox.SelectBackend never returns
 // UNSPECIFIED on its success path, so a caller holding one never chose a
 // backend — and defaulting an unchosen backend to the native dialect would
@@ -226,7 +226,7 @@ type Tree struct {
 	// Key is the tree's content-addressed identity, "<algo>:<hex>" — see TreeKey.
 	Key string
 	// Rootfs is the absolute path to the tree's applied payload. It is the
-	// SOURCE of a pod-rootfs materialization and is never handed to a pod.
+	// source of a pod-rootfs materialization and is never handed to a pod.
 	Rootfs string
 	// Policy is the dialect this tree was built under.
 	Policy UnpackPolicy
@@ -237,7 +237,7 @@ type Tree struct {
 	// CacheHit reports that the tree was already committed and no layer was
 	// applied by this call.
 	CacheHit bool
-	// Ownership is the absolute path to the tree's ownership sidecar, or EMPTY
+	// Ownership is the absolute path to the tree's ownership sidecar, or empty
 	// for a dialect that records none (see OwnershipEntry). It is the file the
 	// guest reads to restore the uid/gid/mode the unprivileged host could not
 	// write; nothing on the native spine consumes it, and nothing on either
@@ -251,14 +251,14 @@ type MaterializeResult struct {
 	Tree *Tree
 	// Cloned is how many files were materialized as real APFS clones rather than
 	// byte copies — the same figure MaterializeTree returns. A zero here on
-	// darwin means the tree and the pod rootfs are NOT on one APFS volume, which
+	// darwin means the tree and the pod rootfs are not on one APFS volume, which
 	// is a performance fact worth logging, not an error.
 	Cloned int
 }
 
 // treeRecord is the daemon-authored record written beside a committed tree.
 //
-// It records what the tree WAS BUILT FROM, never what it is for: no pod id, no
+// It records what the tree was built from, never what it is for: no pod id, no
 // reference, no timestamp. A reference would be a lie the moment a second
 // reference resolved to the same content (the key is content-addressed, so the
 // second unpack is a hit that rewrites nothing), and a pod id would make a
@@ -270,12 +270,12 @@ type treeRecord struct {
 	Config  string       `json:"config"`
 	Layers  []string     `json:"layers"`
 	Stats   ApplyStats   `json:"stats"`
-	// DiffIDs and Ownership are the LINUX dialect's additions: the decompressed
+	// DiffIDs and Ownership are the Linux dialect's additions: the decompressed
 	// layer digests the Key (a chain id) is derived from, and the filename of
 	// the ownership sidecar committed beside the payload.
 	//
 	// Both are omitempty, which is not a formatting preference: a native tree's
-	// record must stay BYTE-IDENTICAL to the one it carried before this dialect
+	// record must stay byte-identical to the one it carried before this dialect
 	// existed, so that every tree already on disk keeps decoding under an
 	// unchanged treeRecordVersion. Adding a field that a native unpack writes
 	// as a zero value would have forced a version bump and orphaned every
@@ -312,7 +312,7 @@ func WithApplyLimits(l ApplyLimits) UnpackerOption {
 
 // NewUnpacker returns an Unpacker over cache.
 //
-// The cache is REQUIRED and is the same store the pull path committed the blobs
+// The cache is required and is the same store the pull path committed the blobs
 // to: an unpacker reading a different store could not verify a single byte it
 // applies, because the digests it checks against come from the manifest that
 // store's pull resolved.
@@ -333,25 +333,25 @@ func NewUnpacker(cache *Cache, opts ...UnpackerOption) (*Unpacker, error) {
 }
 
 // UnpackedRoot returns the directory every unpacked tree lives under
-// (<root>/unpacked). Like Cache.PodsRoot it exists so a caller that must BOUND
+// (<root>/unpacked). Like Cache.PodsRoot it exists so a caller that must bound
 // an operation to the tree store asks for the root instead of re-spelling the
 // component.
 func (c *Cache) UnpackedRoot() string { return filepath.Join(c.root, UnpackedSubdir) }
 
-// SnapshotsRoot returns the directory every LINUX-dialect snapshot lives under
-// (<root>/snapshots). Like UnpackedRoot it exists so a caller that must BOUND an
+// SnapshotsRoot returns the directory every Linux-dialect snapshot lives under
+// (<root>/snapshots). Like UnpackedRoot it exists so a caller that must bound an
 // operation to the snapshot store asks for the root instead of re-spelling the
 // component — and, in production, so the caller that must place that store on
 // the dedicated case-sensitive volume has one path to place.
 func (c *Cache) SnapshotsRoot() string { return filepath.Join(c.root, SnapshotsSubdir) }
 
-// snapshotDir maps a PARSED chain id to its directory, on the same terms as
+// snapshotDir maps a parsed chain id to its directory, on the same terms as
 // treeDir: the layout is unreachable without the digest allowlist having run.
 func (c *Cache) snapshotDir(algo, hexBody string) string {
 	return filepath.Join(c.SnapshotsRoot(), algo, hexBody)
 }
 
-// treeDir maps a PARSED tree key to its directory. It takes a parsed hash for
+// treeDir maps a parsed tree key to its directory. It takes a parsed hash for
 // the same reason Cache.pathFor does: the layout is unreachable without the
 // digest allowlist having run.
 func (c *Cache) treeDir(algo, hexBody string) string {
@@ -359,20 +359,20 @@ func (c *Cache) treeDir(algo, hexBody string) string {
 }
 
 // TreeKey is the content-addressed identity of the tree mfst unpacks to under
-// policy: sha256 over a canonical key document naming the image's CONFIG digest,
+// policy: sha256 over a canonical key document naming the image's config digest,
 // its layer digests in apply order, and the policy.
 //
 // # Why not "the manifest digest"
 //
 // Because a manifest digest alone is the wrong key twice over. It does not cover
-// the POLICY, so two dialects of one image would collide on a single tree; and
+// the policy, so two dialects of one image would collide on a single tree; and
 // runtimev1.ImageManifest deliberately carries no field for the manifest's own
 // digest (it carries the config and layer descriptors, which is what the store
 // actually holds — see ImageRoot for the same reasoning about roots). The
 // document below is strictly stronger than a manifest digest for this purpose:
 // it is derived from exactly the inputs the unpack reads, so two manifests that
 // produce byte-identical trees key to the same tree, and any change to a layer,
-// to the layer ORDER, or to the dialect changes the key.
+// to the layer order, or to the dialect changes the key.
 //
 // Every digest is validated through parseBlobDigest before it enters the
 // document, so no registry-supplied string can inject a line separator into it —
@@ -414,23 +414,23 @@ func TreeKey(mfst *runtimev1.ImageManifest, policy UnpackPolicy) (string, error)
 // because this is the one path that reads every blob of an image end to end
 // anyway. Per layer, and for free on the same single read:
 //
-//   - the COMPRESSED bytes are re-hashed against the manifest descriptor's
+//   - the compressed bytes are re-hashed against the manifest descriptor's
 //     digest (ErrDigestMismatch) — so a blob that was corrupted, truncated, or
-//     substituted on disk AFTER it was committed is caught here rather than
+//     substituted on disk after it was committed is caught here rather than
 //     executed;
-//   - the DECOMPRESSED bytes are re-hashed against the image config's diffID for
+//   - the decompressed bytes are re-hashed against the image config's diffID for
 //     that layer (ErrDiffIDMismatch) — so the manifest and the config are proven
 //     to describe the same content.
 //
 // The config blob itself is re-hashed against its own descriptor before it is
-// parsed. None of this authenticates the IMAGE — a hostile source supplies the
+// parsed. None of this authenticates the image — a hostile source supplies the
 // manifest and the config together and can make them agree; that is a signature
 // problem (SignaturePolicy), not a CAS problem, and it is stated the same way on
 // Cache.CommitBlob.
 //
 // # Two stores, one mechanism
 //
-// The DIALECT decides which store the tree is filed in and under what key (see
+// The dialect decides which store the tree is filed in and under what key (see
 // treeLocation): the native dialect goes to unpacked/ keyed by TreeKey, the
 // Linux dialect to snapshots/ keyed by the OCI chain id, with an ownership
 // sidecar committed beside it. Everything else — the staging directory, the
@@ -502,11 +502,11 @@ func (u *Unpacker) Unpack(ctx context.Context, mfst *runtimev1.ImageManifest, po
 	return u.commit(staging, loc, policy, stats)
 }
 
-// treeLocation is where ONE dialect files ONE image: the store directory, the
+// treeLocation is where one dialect files one image: the store directory, the
 // key that directory is named by, and the names of the two documents committed
 // beside the payload.
 //
-// It exists so the dialect discriminator is evaluated EXACTLY ONCE per unpack,
+// It exists so the dialect discriminator is evaluated exactly once per unpack,
 // in locate, rather than at each of the five places that need to know which
 // store it is talking to. Every field is derived together from one switch, so a
 // snapshot can never be written with an unpacked tree's record name, or filed
@@ -519,7 +519,7 @@ type treeLocation struct {
 	key string
 	// recordName is the daemon-authored record's filename inside dir.
 	recordName string
-	// ownershipName is the ownership sidecar's filename inside dir, EMPTY for a
+	// ownershipName is the ownership sidecar's filename inside dir, empty for a
 	// dialect that records no ownership. Emptiness is the discriminator the
 	// commit path reads — there is deliberately no second boolean that could
 	// disagree with it.
@@ -527,10 +527,10 @@ type treeLocation struct {
 	// diffIDs are the image config's layer diffIDs, and configRead reports
 	// whether they were read at all.
 	//
-	// They are carried here ONLY for the Linux dialect, which cannot compute its
+	// They are carried here only for the Linux dialect, which cannot compute its
 	// key without them, so a second read would be pure waste. The native
 	// dialect deliberately leaves them unread: its key comes from the manifest
-	// alone, and reading the config here would cost a native CACHE HIT a blob
+	// alone, and reading the config here would cost a native cache hit a blob
 	// read it has never needed — a hit currently succeeds with the whole blob
 	// store deleted, which is the strongest available proof that it re-applies
 	// nothing, and that property is worth keeping.
@@ -542,7 +542,7 @@ type treeLocation struct {
 // image config on the way (it holds the diffIDs both dialects need).
 //
 // The Linux dialect pays for the config blob's read and re-hash even on a cache
-// HIT, and that is inherent rather than sloppy: a chain id is a function of the
+// hit, and that is inherent rather than sloppy: a chain id is a function of the
 // diffIDs, so there is no cheaper way to learn which snapshot a manifest maps to.
 // The blob is a few KiB and is bounded by maxArchiveMetadataBytes.
 func (u *Unpacker) locate(mfst *runtimev1.ImageManifest, policy UnpackPolicy) (treeLocation, error) {
@@ -575,7 +575,7 @@ func (u *Unpacker) locate(mfst *runtimev1.ImageManifest, policy UnpackPolicy) (t
 	}
 	h, err := parseBlobDigest(loc.key)
 	if err != nil {
-		// Reachable for the Linux dialect only, and only via a SINGLE-layer
+		// Reachable for the Linux dialect only, and only via a single-layer
 		// image, whose chain id IS its diffID — a config claiming an
 		// unsupported digest algorithm for that one layer lands here rather
 		// than becoming a directory name. TreeKey and the multi-layer chain
@@ -593,7 +593,7 @@ func (u *Unpacker) locate(mfst *runtimev1.ImageManifest, policy UnpackPolicy) (t
 // MaterializeTree unpacks mfst under policy (or serves the committed tree) and
 // clones it into dstRootfs, which is created if absent.
 //
-// This is the seam pkg/runtime.createPod consumes: it is the ONE call that turns
+// This is the seam pkg/runtime.createPod consumes: it is the one call that turns
 // "the blobs are in the store" into "the pod's rootfs holds runnable files", so
 // the two halves cannot be wired up out of order or one of them forgotten. The
 // copy goes through the package's MaterializeTree walk, so it is idempotent, it
@@ -662,7 +662,7 @@ func (u *Unpacker) openCommitted(loc treeLocation, policy UnpackPolicy) (*Tree, 
 	if loc.ownershipName != "" {
 		// The sidecar is committed inside the same rename as the payload, so a
 		// dialect that records one and a committed tree that lacks one is a
-		// tree from a DIFFERENT build of this daemon — refused, not
+		// tree from a different build of this daemon — refused, not
 		// regenerated, on the same terms as every other record disagreement:
 		// the ownership the guest would apply is not derivable from the tree,
 		// only from the layers it came from.
@@ -677,9 +677,9 @@ func (u *Unpacker) openCommitted(loc treeLocation, policy UnpackPolicy) (*Tree, 
 }
 
 // applyStaged builds the tree in a disposable staging directory and returns it
-// UNCOMMITTED. The caller renames it into place (commit) or removes it.
+// uncommitted. The caller renames it into place (commit) or removes it.
 func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descriptor, diffIDs []string, policy UnpackPolicy) (_ ApplyStats, _ []OwnershipEntry, _ string, retErr error) {
-	// The staging directory is created under the SAME store the tree commits
+	// The staging directory is created under the same store the tree commits
 	// into, because the commit is an os.Rename and rename(2) cannot cross a
 	// filesystem — and the Linux dialect's store is, by design, a different
 	// APFS volume from the rest of the cache (the case-sensitivity decision). Staging
@@ -724,13 +724,13 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 	return applier.Stats(), applier.Ownership(), staging, nil
 }
 
-// applyLayer streams one layer blob out of the store, verifying BOTH its
+// applyLayer streams one layer blob out of the store, verifying both its
 // compressed digest and its decompressed diffID on the single read, and applies
 // it through applier.
 //
 // The two hashers are wired around the decompressor rather than after it so the
-// bytes are hashed exactly once each; the verdicts are checked AFTER the apply
-// because a hash is only known at EOF. That ordering is safe because the apply
+// bytes are hashed exactly once each; the verdicts are checked after the apply
+// because a hash is only known at eof. That ordering is safe because the apply
 // happens into a disposable staging tree that is discarded on any error — the
 // contract applyStaged is built to provide.
 func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, diffID string) error {
@@ -761,8 +761,8 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 		return err
 	}
 	// Drain whatever the tar reader left (its trailing padding, and any bytes
-	// after the archive's end-of-archive marker) so BOTH hashers see the whole
-	// stream. Without this the digests are computed over a PREFIX and the checks
+	// after the archive's end-of-archive marker) so both hashers see the whole
+	// stream. Without this the digests are computed over a prefix and the checks
 	// below would pass for a blob with arbitrary appended content.
 	if _, err := io.Copy(io.Discard, plain); err != nil {
 		return fmt.Errorf("%w: drain layer: %v", ErrLayerMalformed, boundErr(err))
@@ -791,13 +791,13 @@ func (u *Unpacker) configDiffIDs(mfst *runtimev1.ImageManifest) ([]string, error
 }
 
 // ImageRunConfig reads the image config blob out of the store, re-hashes it
-// against its own descriptor, and returns the PROCESS half of it — the fields
+// against its own descriptor, and returns the process half of it — the fields
 // MergeRunSpec merges with a pod's container spec.
 //
 // It is a separate entry point from configDiffIDs rather than one call
 // returning both because the two have different lifetimes: the diffIDs decide
 // which tree to build and are consumed inside Unpack, while the run config is
-// consumed by the caller AFTER the tree exists, to decide what to execute in it.
+// consumed by the caller after the tree exists, to decide what to execute in it.
 func (u *Unpacker) ImageRunConfig(mfst *runtimev1.ImageManifest) (ImageRunConfig, error) {
 	doc, err := u.imageConfigDoc(mfst)
 	if err != nil {
@@ -813,7 +813,7 @@ func (u *Unpacker) ImageRunConfig(mfst *runtimev1.ImageManifest) (ImageRunConfig
 }
 
 // imageConfigDoc is the decoded subset of an OCI image config this package
-// reads. Every field is registry-supplied and is treated as bounded DATA.
+// reads. Every field is registry-supplied and is treated as bounded data.
 type imageConfigDoc struct {
 	Config struct {
 		Entrypoint []string `json:"Entrypoint"`
@@ -829,9 +829,9 @@ type imageConfigDoc struct {
 
 // imageConfigDoc reads and verifies the image config blob.
 //
-// The config is read WHOLE (bounded by maxArchiveMetadataBytes, the same cap
+// The config is read whole (bounded by maxArchiveMetadataBytes, the same cap
 // load.go applies to any one archive metadata document) because it is a small
-// JSON object; layer CONTENT is never read whole anywhere in this package.
+// JSON object; layer content is never read whole anywhere in this package.
 func (u *Unpacker) imageConfigDoc(mfst *runtimev1.ImageManifest) (imageConfigDoc, error) {
 	digest := mfst.GetConfig().GetDigest()
 	want, err := parseBlobDigest(digest)
@@ -866,7 +866,7 @@ func (u *Unpacker) imageConfigDoc(mfst *runtimev1.ImageManifest) (imageConfigDoc
 
 // commit renames the staging tree into place at dir.
 //
-// A LOSING RACE is not an error. rename(2) of a directory onto a non-empty
+// A losing race is not an error. rename(2) of a directory onto a non-empty
 // directory fails, so the second of two concurrent unpacks of one key finds the
 // winner's tree already there — and since the key is content-addressed, that
 // tree is byte-equivalent to the one being discarded. Adopting it is correct and
@@ -889,7 +889,7 @@ func (u *Unpacker) commit(staging string, loc treeLocation, policy UnpackPolicy,
 	return t, nil
 }
 
-// writeOwnershipSidecar writes the ownership records as NEWLINE-DELIMITED JSON,
+// writeOwnershipSidecar writes the ownership records as newline-delimited JSON,
 // one entry per line, in the order sortOwnership produced.
 //
 // JSONL rather than one JSON array because the file is O(entries) and an
@@ -899,7 +899,7 @@ func (u *Unpacker) commit(staging string, loc treeLocation, policy UnpackPolicy,
 // detectably truncated at a record boundary instead of being undecodable
 // wholesale.
 //
-// It is written INSIDE the staging directory before the commit rename, for
+// It is written inside the staging directory before the commit rename, for
 // exactly the reason writeTreeRecord is: there is no window in which a committed
 // tree exists without the sidecar its record claims.
 func writeOwnershipSidecar(path string, entries []OwnershipEntry) error {
@@ -928,10 +928,10 @@ func writeOwnershipSidecar(path string, entries []OwnershipEntry) error {
 
 // ReadOwnershipSidecar decodes a committed tree's ownership sidecar.
 //
-// It is the READER half of the contract writeOwnershipSidecar writes, kept here
+// It is the reader half of the contract writeOwnershipSidecar writes, kept here
 // beside the writer so the two cannot drift, and it is what the guest-side
 // apply consumes. It bounds each line: the sidecar is daemon-authored, but its
-// CONTENT is derived from registry-supplied tar headers, so a path is bounded
+// content is derived from registry-supplied tar headers, so a path is bounded
 // data exactly as it is everywhere else in this package.
 func ReadOwnershipSidecar(path string) ([]OwnershipEntry, error) {
 	f, err := os.Open(path)
@@ -956,14 +956,14 @@ func ReadOwnershipSidecar(path string) ([]OwnershipEntry, error) {
 	return out, nil
 }
 
-// maxOwnershipLineBytes bounds ONE sidecar line. A path is capped at
+// maxOwnershipLineBytes bounds one sidecar line. A path is capped at
 // maxLayerEntryNameLen by the applier and the numeric fields are fixed width, so
 // 64 KiB is orders of magnitude of headroom — it exists to stop a corrupted or
 // substituted sidecar from making the reader allocate without limit, not to
 // constrain any entry this package writes.
 const maxOwnershipLineBytes = 64 << 10
 
-// writeTreeRecord writes the tree's record. It is written INSIDE the staging
+// writeTreeRecord writes the tree's record. It is written inside the staging
 // directory before the commit rename, so the record and the payload become
 // visible in the same atomic step — there is deliberately no window in which a
 // committed tree exists without its record, because openCommitted reads the
@@ -988,8 +988,8 @@ func writeTreeRecord(path string, rec treeRecord) error {
 	return f.Close()
 }
 
-// Layer media types this unpacker can decompress. The set is CLOSED and is
-// matched against the DECLARED media type — see ErrUnsupportedLayerMediaType for
+// Layer media types this unpacker can decompress. The set is closed and is
+// matched against the declared media type — see ErrUnsupportedLayerMediaType for
 // why the bytes never get to decide.
 const (
 	mediaTypeOCILayerGzip    = "application/vnd.oci.image.layer.v1.tar+gzip"
@@ -998,7 +998,7 @@ const (
 	mediaTypeDockerLayerGzip = "application/vnd.docker.image.rootfs.diff.tar.gzip"
 )
 
-// maxZstdWindow bounds one zstd decoder's window memory. A zstd frame DECLARES
+// maxZstdWindow bounds one zstd decoder's window memory. A zstd frame declares
 // its window size and a decoder honours it, so an unbounded decoder lets a
 // registry-supplied header reserve arbitrary host memory before a single byte of
 // output is produced — a resource guard the gzip path does not need because
@@ -1008,7 +1008,7 @@ const (
 // levels docker/buildkit use is 8 MiB; the format's ceiling is far higher) while
 // keeping the reservation an order of magnitude below the memory a node running
 // pods can spare. It complements, and does not replace, ApplyLimits.MaxBytes:
-// that bounds the OUTPUT, this bounds the decoder's own state.
+// that bounds the output, this bounds the decoder's own state.
 const maxZstdWindow = 128 << 20
 
 // decompressLayer wraps r in the decompressor mediaType declares.
@@ -1016,8 +1016,8 @@ const maxZstdWindow = 128 << 20
 // The returned ReadCloser's Close releases only the decompressor; the underlying
 // reader is the caller's.
 //
-// WHERE A MALFORMED STREAM SURFACES differs by format and neither is a defect:
-// gzip reads its header eagerly, so garbage is refused HERE; zstd does not, so
+// where A malformed stream surfaces differs by format and neither is a defect:
+// gzip reads its header eagerly, so garbage is refused here; zstd does not, so
 // garbage is refused at the first Read. Both end up as ErrLayerMalformed at the
 // caller, because LayerApplier.Apply wraps any read failure that way — the
 // verdict a caller acts on is therefore the same either way.
@@ -1048,11 +1048,11 @@ func decompressLayer(mediaType string, r io.Reader) (io.ReadCloser, error) {
 	}
 }
 
-// openBlob opens the blob for digest for READING, refusing anything that is not
+// openBlob opens the blob for digest for reading, refusing anything that is not
 // the regular file this store committed.
 //
 // It is the sanctioned reader for the CAS, and its containment is two-part:
-// Lstat first (so a SYMLINK at the blob path is judged on ITSELF and refused,
+// Lstat first (so a symlink at the blob path is judged on itself and refused,
 // exactly as Cache.Has does), then os.SameFile against the opened file's own
 // stat (so a link swapped in between the two is caught rather than followed).
 // The residual TOCTOU is additionally closed for the unpack path by the fact

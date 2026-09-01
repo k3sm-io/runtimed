@@ -24,7 +24,7 @@ import (
 
 // Locator returns the sandbox.GuestArtifactLocator a vm backend calls to resolve
 // this node's boot artifacts — one that RE-HASHES both files against pin on
-// EVERY call and returns them only if they still match.
+// every call and returns them only if they still match.
 //
 // # Why the verification repeats
 //
@@ -37,7 +37,7 @@ import (
 // in a log. The gap between "checked at start" and "used at boot" is exactly a
 // time-of-check-to-time-of-use window, and its width is the daemon's uptime.
 //
-// It is worth closing HERE, rather than trusting the cache's permissions,
+// It is worth closing here, rather than trusting the cache's permissions,
 // because the sha256 is the ENTIRE trust chain for a guest kernel. A VZ-booted
 // kernel gets no code-signing check from macOS — the hypervisor loads the bytes
 // at the path it is given — so nothing downstream of this comparison will ever
@@ -50,7 +50,7 @@ import (
 //
 // # The failure
 //
-// A divergence returns an error wrapping ErrDigestMismatch and NAMING THE FILE,
+// A divergence returns an error wrapping ErrDigestMismatch and NAMING the FILE,
 // so the operator learns which artifact moved rather than that "the vm capability
 // is off". CreateVM turns any error from a locator into a closed failure for that
 // pod (sandbox.ErrGuestArtifactsUnavailable), so a rotted artifact fails the pods

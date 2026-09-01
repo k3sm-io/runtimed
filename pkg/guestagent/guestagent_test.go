@@ -140,7 +140,7 @@ throttled_usec 0
 }
 
 // TestLogRingBoundsAndSelection pins the retained-output buffer: its two bounds,
-// its filter ORDER, and the guarantee that a slow follower never blocks the
+// its filter order, and the guarantee that a slow follower never blocks the
 // container that is writing.
 func TestLogRingBoundsAndSelection(t *testing.T) {
 	base := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
@@ -193,7 +193,7 @@ func TestLogRingBoundsAndSelection(t *testing.T) {
 	t.Run("since-time-narrows-before-tail-lines", func(t *testing.T) {
 		// The order is upstream's and is not interchangeable. Tail-then-since
 		// would return the last N overall and then drop the ones before
-		// since_time, which for a container that went quiet returns NOTHING where
+		// since_time, which for a container that went quiet returns nothing where
 		// upstream returns its last N lines since that time.
 		r := NewRing(100, 1<<20)
 		for i := 0; i < 10; i++ {
@@ -373,7 +373,7 @@ func TestExecHelpers(t *testing.T) {
 	})
 
 	t.Run("a-signalled-process-exits-128-plus-n", func(t *testing.T) {
-		// The SAME convention the host-process path uses. A
+		// The same convention the host-process path uses. A
 		// `kubectl exec … ; echo $?` must not report a different number depending
 		// on whether the pod was a host process or a guest.
 		for _, tc := range []struct {

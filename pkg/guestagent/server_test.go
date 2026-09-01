@@ -204,7 +204,7 @@ func testAgent(t *testing.T, podID string, deps Deps) guestv1.GuestAgentClient {
 
 // TestGuestAgentRejectsForeignPodID is B228's single-pod gate.
 //
-// guest.proto is explicit that "the agent MUST reject a pod_id that is not the pod
+// guest.proto is explicit that "the agent must reject a pod_id that is not the pod
 // it booted", and states why: the id is an ASSERTION that the caller reached the
 // guest it meant to reach, not a selector over several pods. One VM hosts one pod,
 // so an agent that ignored the field would happily answer Exec, Logs, Stats and
@@ -212,7 +212,7 @@ func testAgent(t *testing.T, podID string, deps Deps) guestv1.GuestAgentClient {
 // path, a reused pod dir, a mis-routed dial) from a loud error into a silent wrong
 // answer about the wrong workload.
 //
-// EVERY assertion is a t.Run subtest of this ONE function on purpose: the gate runs
+// every assertion is a t.Run subtest of this one function on purpose: the gate runs
 // `go test -run '^TestGuestAgentRejectsForeignPodID$'`, so a sibling top-level
 // Test* would be silently filtered out and never run.
 //
@@ -297,7 +297,7 @@ func TestGuestAgentRejectsForeignPodID(t *testing.T) {
 	})
 
 	t.Run("a-container-the-pod-never-declared-is-NotFound", func(t *testing.T) {
-		// A DIFFERENT refusal from a foreign pod id, and the codes must differ:
+		// A different refusal from a foreign pod id, and the codes must differ:
 		// "wrong guest" and "no such container here" call for different actions.
 		client := testAgent(t, booted, Deps{Runner: &fakeRunner{names: []string{"app"}}})
 		stream, err := client.Logs(context.Background(), &runtimev1.GetLogsRequest{PodId: booted, Container: "ghost"})
@@ -354,7 +354,7 @@ func TestGuestAgentRejectsForeignPodID(t *testing.T) {
 	})
 }
 
-// assertInvalidArgument checks the rejection is InvalidArgument and NAMES both
+// assertInvalidArgument checks the rejection is InvalidArgument and names both
 // ids: an operator debugging a mis-routed dial needs to see which pod was asked
 // for and which guest answered.
 func assertInvalidArgument(t *testing.T, err error, asked, booted string) {
@@ -376,7 +376,7 @@ func TestGuestAgentAnswersItsOwnRPCs(t *testing.T) {
 
 	t.Run("health-carries-the-api-version-constant", func(t *testing.T) {
 		// The handshake guest.proto specifies and which, until this package, had a
-		// value on NEITHER side — making the skew the docs call "unsupported but
+		// value on neither side — making the skew the docs call "unsupported but
 		// legible" in fact illegible.
 		client := testAgent(t, booted, Deps{Status: &fakeStatus{st: Status{
 			Ready: true, GuestIP: "192.0.2.7", RosettaRegistered: false,

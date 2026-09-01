@@ -56,7 +56,7 @@ func shortSocketPath(t *testing.T) string {
 }
 
 // dialClient builds a runtime/v1 client over an arbitrary dialer (a unix socket
-// or a bufconn pipe), so the seam test drives the SAME gRPC surface the daemon
+// or a bufconn pipe), so the seam test drives the same gRPC surface the daemon
 // serves without depending on root or a real network.
 func dialClient(t *testing.T, dial func(context.Context, string) (net.Conn, error)) runtimev1.RuntimeClient {
 	t.Helper()
@@ -239,7 +239,7 @@ func TestServerStopUnblocksServe(t *testing.T) {
 func TestListenRemovesStaleSocket(t *testing.T) {
 	sockPath := shortSocketPath(t)
 
-	// First bind, then close WITHOUT removing the node (simulates a crash that
+	// First bind, then close without removing the node (simulates a crash that
 	// leaves the socket file behind).
 	lis1, err := Listen(sockPath)
 	if err != nil {

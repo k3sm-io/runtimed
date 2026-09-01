@@ -38,7 +38,7 @@ func (CodesignTool) Signed(ctx context.Context, path string) (bool, error) {
 }
 
 // runCodesignVerify runs codesign with a verification argv and maps its exit status
-// to a verdict: exit 0 is "validly signed", ANY non-zero exit is "not validly
+// to a verdict: exit 0 is "validly signed", any non-zero exit is "not validly
 // signed", and only a failure to run the tool at all is an error.
 //
 // It is shared by the per-binary inspector and the tree signer so both read a
@@ -48,7 +48,7 @@ func (CodesignTool) Signed(ctx context.Context, path string) (bool, error) {
 // non-zero verdict leads a caller to sign or to refuse, never to trust. A caller
 // that needs the distinction must name the arch it is asking about (see
 // CodesignTreeSigner.VerifyArch and pickVerifyArch, which is why that choice is
-// made from the file's OWN slice list rather than assumed).
+// made from the file's own slice list rather than assumed).
 func runCodesignVerify(ctx context.Context, args []string) (bool, error) {
 	err := exec.CommandContext(ctx, "codesign", args...).Run()
 	if err == nil {

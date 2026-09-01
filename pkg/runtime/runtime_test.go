@@ -93,7 +93,7 @@ func (b *recordingBackend) lastSpec() supervisor.LaunchSpec {
 // fakeVMBackend is the runtime.VMBackend seam: its availability is settable and
 // CreateVM records the call + the spec it received.
 //
-// It FAILS THE BOOT BY DEFAULT (sandbox.ErrVMBootNotImplemented), which is not
+// It FAILS the BOOT BY DEFAULT (sandbox.ErrVMBootNotImplemented), which is not
 // "the old stub behaviour" but a deliberate test default: most cases here assert
 // ROUTING — that a vm-requested pod reaches this backend and never touches the
 // host-process spine — and a default-succeeding fake would make each of them
@@ -102,17 +102,17 @@ func (b *recordingBackend) lastSpec() supervisor.LaunchSpec {
 type fakeVMBackend struct {
 	available bool
 	// rosettaShare is the B229 seam: whether the guests this node's VM host would
-	// build carry a Rosetta directory share. It defaults to FALSE, matching the
+	// build carry a Rosetta directory share. It defaults to false, matching the
 	// shipped helper (sandbox.VMHostRosettaShareSupported), so a test that means to
 	// exercise the guest-Rosetta advertisement must say so explicitly.
 	rosettaShare bool
 
-	// bootOK makes CreateVM SUCCEED, so the pod assembly and teardown paths can
+	// bootOK makes CreateVM succeed, so the pod assembly and teardown paths can
 	// be driven with no VM anywhere.
 	bootOK bool
 
-	// stopHook runs INSIDE StopVM / StopAllVMs, before the exit edge fires. It is
-	// how a test observes the daemon's state AT THE MOMENT it asks a helper to
+	// stopHook runs inside StopVM / StopAllVMs, before the exit edge fires. It is
+	// how a test observes the daemon's state AT the MOMENT it asks a helper to
 	// stop — which is the only way to pin the cancel-before-stop ordering
 	// deterministically rather than by racing a goroutine. Set before CreatePod.
 	stopHook func(podID string)
@@ -224,9 +224,9 @@ func (b *fakeVMBackend) VMDone(podID string) (<-chan struct{}, bool) {
 func (b *fakeVMBackend) VMHelperOutput(string) string { return "(fake helper)" }
 
 // killHelper simulates the helper dying on its own — a hypervisor crash or a
-// guest panic — WITHOUT a StopVM, which is the case the exit watch exists for.
+// guest panic — without a StopVM, which is the case the exit watch exists for.
 //
-// It closes the exit edge but does NOT deregister the pod, matching the real
+// It closes the exit edge but does not deregister the pod, matching the real
 // backend: a dead helper stays in the handle map until a teardown removes it,
 // which is what lets the exit watch still read VMHelperOutput for the diagnosis.
 // Deregistering here would also make the fake racy — a watch that called VMDone
@@ -272,7 +272,7 @@ func (b *fakeVMBackend) created() (int, sandbox.VMSpec) {
 
 // recordingNetwork is a supervisor.PodNetwork that records each Setup and
 // Teardown call — the /32 lo0-alias allocation/release a host-process pod gets.
-// The vm (guest) route must NEVER call it: a NAT-attached guest is reached over
+// The vm (guest) route must never call it: a NAT-attached guest is reached over
 // the VZNATNetworkDeviceAttachment, not a host lo0 alias. So a test asserts
 // setupCount()==0 on the vm route and a host pod still allocates exactly one
 // alias; the M10.1 tests assert Teardown fires on delete and on create-unwind.
@@ -503,7 +503,7 @@ func (f *fakeUnpacker) MaterializeTree(_ context.Context, mfst *runtimev1.ImageM
 }
 
 // ImageRunConfig serves the fake's configured image run config. The zero value
-// is an image that declares NOTHING — no Entrypoint, no Cmd, no Env — which is
+// is an image that declares nothing — no Entrypoint, no Cmd, no Env — which is
 // the shape every pre-M11.2-d1 test implicitly assumed, so those tests keep
 // asserting on a pod-supplied command alone.
 func (f *fakeUnpacker) ImageRunConfig(_ *runtimev1.ImageManifest) (image.ImageRunConfig, error) {
@@ -569,15 +569,15 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if d.Puller == nil {
 		d.Puller = &fakePuller{}
 	}
-	// Defaulted HERE and not in testDeps for the same reason Puller is:
+	// Defaulted here and not in testDeps for the same reason Puller is:
 	// pull_wiring_test.go's TestDefaultPullerPlatformWiring calls
-	// New(..., testDeps(t, Deps{})) to reach the daemon's REAL image wiring, and
+	// New(..., testDeps(t, Deps{})) to reach the daemon's real image wiring, and
 	// that is the one test that would go green against a New which never builds
 	// an unpacker at all.
 	if d.Unpacker == nil {
 		d.Unpacker = &fakeUnpacker{}
 	}
-	// Default the two Rosetta probe seams to deterministic FAIL-CLOSED fakes. Left
+	// Default the two Rosetta probe seams to deterministic fail-closed fakes. Left
 	// nil they fall through in New to the real sandbox.ProbeHostRosetta, which stats
 	// a SIP path and — on a Rosetta-2-installed host — forks /usr/bin/arch, once per
 	// construction: ~85 real stats and up to ~85 real forks per run of this package,
@@ -585,9 +585,9 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	// seams, no real privilege). Fail-closed states are the deterministic choice for
 	// the same reason fakeVMBackend defaults to unavailable.
 	//
-	// They are defaulted HERE and not in testDeps for exactly the reason Puller is:
+	// They are defaulted here and not in testDeps for exactly the reason Puller is:
 	// rosetta_test.go's default_probe_wiring subtest calls New(…, testDeps(t, Deps{}))
-	// directly to reach the REAL nil-deps wiring, and that is the one test that would
+	// directly to reach the real nil-deps wiring, and that is the one test that would
 	// go green against a New which never wires the real probes at all.
 	if d.HostRosetta == nil {
 		d.HostRosetta = func(context.Context) sandbox.HostRosettaState { return sandbox.HostRosettaAbsent }
@@ -603,7 +603,7 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 		t.Fatal(err)
 	}
 	// Shrink the post-SIGKILL exit-observation bound for the unit tier. Every
-	// escalating stop now WAITS for the reaper to report the exit (B40), and most
+	// escalating stop now waits for the reaper to report the exit (B40), and most
 	// tests here drive a fake waiter they never release for a killed container —
 	// which is the bound's timeout arm, at its production 2s, once per such stop.
 	// The production default is pinned by TestExitObservationGraceDefault and the
@@ -614,15 +614,15 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 }
 
 // testDeps fills the deterministic fake subsystem seams every pkg/runtime unit
-// test shares. It deliberately does NOT default Puller, HostRosetta or GuestRosetta:
+// test shares. It deliberately does not default Puller, HostRosetta or GuestRosetta:
 // newTestRuntimeCfg adds fakes for those three, while the production-wiring tests
 // (pull_wiring_test.go, and rosetta_test.go's default_probe_wiring) call
 // New(…, testDeps(t, Deps{})) directly and leave them nil so New builds the daemon's
 // own image.NewPuller(cache, image.RemoteFetch) / sandbox.Probe*Rosetta.
 //
-// It also does NOT default Cache — New builds one rooted at Config.Root, which is
+// It also does not default Cache — New builds one rooted at Config.Root, which is
 // the PRODUCTION wiring (runtime.go; the daemon and the k3sm provider both pass
-// Deps without a Cache). The old default handed the runtime a cache at a SECOND
+// Deps without a Cache). The old default handed the runtime a cache at a second
 // t.TempDir(), so Config.Root and the pod layout disagreed and every guard bounded
 // to <Config.Root>/pods was unsatisfiable in the unit tier: B136 and B140 each had
 // to hand-build a shared-root harness to reach their sink at all, vmshareplan_test
@@ -668,7 +668,7 @@ func testDeps(t *testing.T, d Deps) Deps {
 	}
 	// Default the GPU probe to a deterministic "no usable GPU" observation, for the
 	// same reason the vm backend defaults unavailable: otherwise every runtime unit
-	// test would run the REAL Metal compile+dispatch probe and its result would
+	// test would run the real Metal compile+dispatch probe and its result would
 	// depend on the test host's hardware. The GPU tests inject their own.
 	if d.GPUProbe == nil {
 		d.GPUProbe = func() sandbox.GPUProbeResult {
@@ -678,12 +678,12 @@ func testDeps(t *testing.T, d Deps) Deps {
 	return d
 }
 
-// derivedRootfs is the ONE way a test spells a pod's on-disk data volume.
+// derivedRootfs is the one way a test spells a pod's on-disk data volume.
 //
-// Since B140 a box's rootfs_path is accepted only when it is BYTE-EQUAL to this
+// Since B140 a box's rootfs_path is accepted only when it is byte-equal to this
 // derivation, so a test that wants an on-disk pod dir asks the runtime for it
 // instead of inventing a t.TempDir(). Callers that set box.rootfs_path must set
-// SandboxProfile.data_volume_path to the SAME value: sandbox.Generate carves the
+// SandboxProfile.data_volume_path to the same value: sandbox.Generate carves the
 // credential read-only sub-scope only out of paths under the data volume, and
 // the pods root is otherwise in the protected deny-set — so moving one field
 // without the other makes credential-path validation fail for reasons that have
@@ -704,11 +704,11 @@ func derivedRootfs(t *testing.T, rt *Runtime, podID string) string {
 // accepted only when it is byte-equal to <Config.Root>/pods/<pod_id>{,/rootfs},
 // and the runtime under test is rooted at a t.TempDir() — the hard-coded
 // /var/lib/k3sm spelling this used to carry named a tree no test ever touched.
-// Deriving it in this ONE helper is what keeps ~60 call sites out of the layout.
+// Deriving it in this one helper is what keeps ~60 call sites out of the layout.
 //
 // An id ParsePodID rejects gets the naive spelling: the hostile-id tests pass one
 // deliberately, and their subject is the id check (which runs first), so the box
-// must stay valid in every OTHER respect for those tests to be about anything.
+// must stay valid in every other respect for those tests to be about anything.
 func hostBinBox(rt *Runtime, podID string) *runtimev1.PodBox {
 	dataVol := filepath.Join(rt.cache.PodsRoot(), podID, "rootfs")
 	if id, err := image.ParsePodID(podID); err == nil {
@@ -796,7 +796,7 @@ func TestCreatePodLifecycle(t *testing.T) {
 	}
 }
 
-// TestCreatePodFailClosed asserts the runtime REFUSES to start a pod when the
+// TestCreatePodFailClosed asserts the runtime refuses to start a pod when the
 // sandbox backend is unavailable (never runs unconfined) — the fail-closed
 // requirement.
 func TestCreatePodFailClosed(t *testing.T) {
@@ -815,13 +815,13 @@ func TestCreatePodFailClosed(t *testing.T) {
 
 // TestCreatePodVMRoutingBypassesHostProcessSteps is the M5.1 routing proof: a pod
 // whose SandboxProfile.backend is SANDBOX_BACKEND_VM, on a host where the vm
-// backend is available, routes to vmBackend.CreateVM and runs NONE of the
+// backend is available, routes to vmBackend.CreateVM and runs none of the
 // host-process (Mach-O) steps — no resolveBinary, no ad-hoc sign /
-// gateSignature, no WrapCommand exec-shim, no posix_spawn. It DOES pull, since
+// gateSignature, no WrapCommand exec-shim, no posix_spawn. It does pull, since
 // M11.2-d11: the guest merges nothing, so each container's image config is read
 // host-side — but nothing downstream of the pull on the host-process spine runs. The symmetric control
 // case proves an UNSPECIFIED (host-process) pod still drives exactly those steps
-// (byte-unchanged), and a vm-requested pod on a host WITHOUT the vm backend fails
+// (byte-unchanged), and a vm-requested pod on a host without the vm backend fails
 // closed (never downgrades, never routes to CreateVM).
 func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 	t.Run("vm-routed-bypasses-host-process-steps", func(t *testing.T) {
@@ -860,7 +860,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 			t.Errorf("VMSpec = %+v, want {PodID:pod-vm Vcpus:2 MemoryBytes:%d}", spec, int64(1<<30))
 		}
 
-		// And it touched NONE of the host-process steps.
+		// And it touched none of the host-process steps.
 		if got := backend.wrapCalls(); got != 0 {
 			t.Errorf("vm path called WrapCommand %d times; must be 0 (no exec-shim)", got)
 		}
@@ -925,7 +925,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		}
 		// The signature was gated (gateSignature ran — CreatePod would have failed
 		// above otherwise), but a HOST binary (hostBinBox runs /bin/sleep) is already
-		// signed and read-only, so it must NEVER be ad-hoc re-signed (`codesign -s -
+		// signed and read-only, so it must never be ad-hoc re-signed (`codesign -s -
 		// -f /bin/sleep` fails on a SIP platform binary — the M2-hardware bug).
 		signer.mu.Lock()
 		nsigned := len(signer.signed)
@@ -951,12 +951,12 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 // advisory fields) reaches the VMSpec the vm backend's CreateVM receives, while the
 // host-process path never sees it and a NAT-attached guest binds NO lo0 alias.
 //
-// It asserts the behavioral FORK, not a tautology: the SAME producer — a
+// It asserts the behavioral FORK, not a tautology: the same producer — a
 // Deps.Network implementing the M11.2-d8 GuestNetworker seam, holding one populated
 // config — serves both a vm pod and a host pod. For the vm pod the config reaches
 // VMSpec.Network (resolv.conf nameserver+search+ndots and the NAT fields intact)
-// AND the route allocates zero lo0 aliases; for the host pod the producer is never
-// even consulted, nothing reaches createVMPod (CreateVM call count 0), AND the route
+// and the route allocates zero lo0 aliases; for the host pod the producer is never
+// even consulted, nothing reaches createVMPod (CreateVM call count 0), and the route
 // allocates its one lo0 alias.
 func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 	// The rendered /etc/resolv.conf the guest provisioner pins (pkg/dns.GuestResolvConf
@@ -1025,7 +1025,7 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{VMBackend: vmb, Network: net, Waiter: w})
 
-		// UNSPECIFIED backend → the host-process route, over the SAME populated producer.
+		// UNSPECIFIED backend → the host-process route, over the same populated producer.
 		box := hostBinBox(rt, "pod-host-net")
 
 		p, _, err := rt.createPod(context.Background(), box)
@@ -1287,7 +1287,7 @@ func TestGetRuntimeInfo(t *testing.T) {
 
 // TestGetRuntimeInfo_VMAvailability asserts GetRuntimeInfo advertises the vm
 // backend's availability as a VMBackendAvailable RuntimeCondition, driven by the
-// injectable VMBackend seam (fakeVMBackend): probe available => TRUE, else FALSE.
+// injectable VMBackend seam (fakeVMBackend): probe available => true, else false.
 // No real VZ hardware (B1 — the node reads this to set k3sm.io/virtualization).
 func TestGetRuntimeInfo_VMAvailability(t *testing.T) {
 	cases := []struct {
@@ -1417,9 +1417,9 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 // resolveRlimitPlan dead-path: a PodBox with explicit rlimits[] and a BestEffort
 // qos_class (1) reaches WrapCommand as a resolved supervisor.LaunchSpec (the
 // resolver runs LIVE in the spawn path), (2) produces a spawned shim argv
-// carrying the encoded rlimit + qos tokens at their fixed positions BEFORE the
+// carrying the encoded rlimit + qos tokens at their fixed positions before the
 // profile path, and (3) the rlimit token decodes — via the same ParseRlimits the
-// shim's main() performs — back to the NON-NIL numeric plan, so the shim hands
+// shim's main() performs — back to the non-nil numeric plan, so the shim hands
 // RunLaunchSequence a non-nil plan (never the historical plan=nil).
 func TestCreatePodThreadsRlimitQoSLaunchSpec(t *testing.T) {
 	sp := &fakeSpawner{}
@@ -1465,7 +1465,7 @@ func TestCreatePodThreadsRlimitQoSLaunchSpec(t *testing.T) {
 		t.Errorf("qos argv token = %q, want %q", argv[5], "q=bg")
 	}
 
-	// (3) the token decodes — the shim-side decode — to the NON-NIL plan.
+	// (3) the token decodes — the shim-side decode — to the non-nil plan.
 	decoded, err := supervisor.ParseRlimits(argv[4])
 	if err != nil {
 		t.Fatalf("ParseRlimits(%q): %v", argv[4], err)
@@ -1477,7 +1477,7 @@ func TestCreatePodThreadsRlimitQoSLaunchSpec(t *testing.T) {
 
 // TestRuntimeConfigThreadsPostureVIPs pins the M10.1 posture: the cluster VIPs
 // set on runtime.Config still thread into sandbox.Posture (pod.go — the DNS
-// env/status plumbing reads them) but are PLUMBING-ONLY and must render NO SBPL
+// env/status plumbing reads them) but are PLUMBING-only and must render NO SBPL
 // rule, because per-IP network filters do not compile on macOS 26 — the
 // pre-M10.1 VIP-scoped stanza failed sandbox_apply and no networked pod could
 // spawn. A networked pod's profile instead carries the unfiltered

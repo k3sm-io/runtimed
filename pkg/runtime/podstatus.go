@@ -59,7 +59,7 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 		}
 		appendGuestContainerStatusesLocked(st, p)
 		// The LIVE TRANSPORT address (B237) — what the host dials to reach this
-		// guest, as the agent last reported it. It is deliberately NOT folded
+		// guest, as the agent last reported it. It is deliberately not folded
 		// into PodIp/PodIps above: those are the pod's published identity, and
 		// this is a node-local NAT address that must never reach EndpointSlice,
 		// DNS or the downward API (runtime.proto, guest_transport_address).
@@ -124,7 +124,7 @@ func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 }
 
 // publish renders the event and fans it out to WatchPodStatus subscribers. Called
-// OUTSIDE any pod/runtime lock.
+// outside any pod/runtime lock.
 func (r *Runtime) publish(t runtimev1.PodStatusEventType, st *runtimev1.PodStatus) {
 	r.broker.publish(&runtimev1.PodStatusEvent{Type: t, Status: st})
 }

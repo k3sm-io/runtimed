@@ -23,7 +23,7 @@ import (
 	"fmt"
 )
 
-// ChainID computes the OCI CHAIN ID of a layer chain from its diffIDs, in apply
+// ChainID computes the OCI chain id of a layer chain from its diffIDs, in apply
 // order, exactly as the OCI image-spec defines it:
 //
 //	ChainID(L0)      = DiffID(L0)
@@ -31,13 +31,13 @@ import (
 //
 // It is the key the LINUX dialect's snapshot store is filed under, and choosing
 // it over TreeKey is a decision about what the tree IS rather than about how it
-// was requested. A chain id names the CONTENT of an applied rootfs: two images
+// was requested. A chain id names the content of an applied rootfs: two images
 // built from one base — a different tag, a different registry, a different
 // manifest entirely — that end in the same diffID sequence have the same rootfs,
 // so they must share one snapshot. TreeKey, which folds in the config digest,
 // would file them separately and unpack the same bytes twice.
 //
-// It is also SELF-AUTHENTICATING in a way a manifest-derived key is not: every
+// It is also self-AUTHENTICATING in a way a manifest-derived key is not: every
 // diffID in the chain is re-verified against the layer's decompressed bytes
 // before the snapshot is committed (Unpacker.applyLayer), so a committed
 // snapshot's path is a claim the unpacker proved rather than one the registry

@@ -40,7 +40,7 @@ var ErrExecInvalid = errors.New("guestagent: invalid exec request")
 
 // ExecSpec is one `kubectl exec` as the guest runs it.
 type ExecSpec struct {
-	// Container is the container name within the pod, ALREADY RESOLVED HOST-SIDE
+	// Container is the container name within the pod, already RESOLVED HOST-side
 	// against what the pod declared. The agent still checks it against its own
 	// container set — the host's resolution and the guest's reality are two
 	// different facts, and a container that has exited is knowable only here.
@@ -53,7 +53,7 @@ type ExecSpec struct {
 	Stdin bool
 }
 
-// ExecIO is the exec's stream plumbing. Stdout and Stderr stay SEPARATE even under
+// ExecIO is the exec's stream plumbing. Stdout and Stderr stay separate even under
 // TTY: merging is the host's presentation choice, and a split that was collapsed
 // here could not be recovered there.
 type ExecIO struct {
@@ -79,7 +79,7 @@ type ExecResult struct {
 
 // ValidateExec rejects an exec the guest will not attempt.
 //
-// An EMPTY ARGV is the one that matters. execve(2) with no program is not a
+// An empty ARGV is the one that matters. execve(2) with no program is not a
 // no-op — depending on how the argv is assembled it is either an error the caller
 // sees late or, worse, a spawn of something unintended — and upstream's own rule
 // is that `kubectl exec` requires a command. Rejecting it here means the failure
@@ -110,7 +110,7 @@ func ValidateExec(spec ExecSpec) error {
 // ExitCodeForSignal maps a signal-terminated process to the 128+n exit code every
 // shell and every Kubernetes consumer expects.
 //
-// It is the SAME convention runtime/v1's host path uses, and it has to be: a
+// It is the same convention runtime/v1's host path uses, and it has to be: a
 // `kubectl exec … ; echo $?` must not report a different number depending on
 // whether the pod happened to be a host process or a guest. 137 for SIGKILL and
 // 143 for SIGTERM are the two an operator reads by sight.

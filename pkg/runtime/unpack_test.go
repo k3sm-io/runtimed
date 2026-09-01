@@ -39,7 +39,7 @@ import (
 )
 
 // TestResolveBinaryMaterializesTheImage pins the M11.2-d7 wiring at the seam:
-// a container whose image is PULLED has that image materialized into THIS pod's
+// a container whose image is pulled has that image materialized into this pod's
 // rootfs, under the native layer dialect, exactly once.
 //
 // Before this deliverable resolveBinary stopped at "the blobs are cached" and
@@ -135,7 +135,7 @@ func TestHostBinaryRoutesNeverMaterialize(t *testing.T) {
 }
 
 // TestDefaultUnpackerWiring exercises the unpacker runtime.New builds when
-// Deps.Unpacker is absent — the DAEMON'S OWN wiring, image.NewUnpacker over the
+// Deps.Unpacker is absent — the DAEMON'S own wiring, image.NewUnpacker over the
 // same cache the puller commits into — end to end against an in-process
 // registry, with a MULTI-LAYER image.
 //
@@ -149,7 +149,7 @@ func TestDefaultUnpackerWiring(t *testing.T) {
 	ref := pushMultiLayerImage(t, host, "multi")
 
 	root := t.TempDir()
-	// testDeps leaves BOTH Puller and Unpacker nil, so New builds the daemon's
+	// testDeps leaves both Puller and Unpacker nil, so New builds the daemon's
 	// own pair over one cache.
 	rt, err := New(Config{Root: root}, testDeps(t, Deps{}))
 	if err != nil {
@@ -170,7 +170,7 @@ func TestDefaultUnpackerWiring(t *testing.T) {
 	if want := filepath.Join(rootfs, "bin/app"); rb.path != want {
 		t.Fatalf("binary = %q, want %q", rb.path, want)
 	}
-	// The LATER layer's bin/app is what landed, and the earlier layer's untouched
+	// The later layer's bin/app is what landed, and the earlier layer's untouched
 	// file survived — the multi-layer ordering the deliverable is about.
 	if got := readFile(t, rb.path); got != "#!/bin/sh\nexit 0\n" {
 		t.Errorf("bin/app = %q, want the second layer's content", got)
@@ -200,7 +200,7 @@ func TestDefaultUnpackerWiring(t *testing.T) {
 
 // --- fixtures ------------------------------------------------------------
 
-// pushMultiLayerImage publishes a TWO-layer darwin/arm64 image whose second
+// pushMultiLayerImage publishes a two-layer darwin/arm64 image whose second
 // layer overwrites the first's bin/app, and returns its reference.
 //
 // Two layers is the point: a single-layer image cannot distinguish an unpacker
@@ -309,7 +309,7 @@ func hexRun(c byte) string {
 }
 
 // TestUnpackPolicyFollowsTheResolvedBackend pins the dialect discriminator at
-// the ONE place that produces it: the pod's RESOLVED sandbox backend, the same
+// the one place that produces it: the pod's RESOLVED sandbox backend, the same
 // value pullPolicy reads. A pod on the vm rung must materialize under the LINUX
 // dialect, and an unset backend must fail closed rather than silently apply
 // Mach-O rules to a Linux image.
@@ -384,7 +384,7 @@ func TestUnpackPolicyFollowsTheResolvedBackend(t *testing.T) {
 // image.MergeRunSpec into the OCI route — the replacement for the M1 placeholder
 // that made argv literally command+args.
 //
-// Two rows are RED AT MAIN in the strongest sense: a container with args and no
+// Two rows are RED AT main in the strongest sense: a container with args and no
 // command PANICKED on cmd[0], and a container with neither was refused outright
 // even though its image declared an Entrypoint.
 func TestResolveBinaryMergesTheImageConfig(t *testing.T) {
@@ -457,7 +457,7 @@ func TestResolveBinaryMergesTheImageConfig(t *testing.T) {
 	}
 
 	// A container that neither the pod nor the image gives a command to is a
-	// legible REFUSAL, not an empty argv handed to a spawn.
+	// legible refusal, not an empty argv handed to a spawn.
 	t.Run("nothing_to_run_is_refused", func(t *testing.T) {
 		rt := newTestRuntime(t, Deps{
 			Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.com/app:v1"}},
@@ -516,7 +516,7 @@ func TestResolveBinaryMergesTheImageConfig(t *testing.T) {
 // $PATH reaches the child, the pod's entries still override it, and the DYLD
 // shim injection is unchanged on top of the merged base.
 //
-// The runtime's OWN injections are excluded from the comparison rather than
+// The runtime's own injections are excluded from the comparison rather than
 // spelled out here: this test is about what the MERGE contributes, and each
 // injection is pinned by the test that owns it (TMPDIR by
 // TestPodLaunchEnvCarriesTmpInDataVolume, the shims by pod_pathshim_test.go).

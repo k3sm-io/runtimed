@@ -90,7 +90,7 @@ func (p *countingGuestProbe) calledTimes() int {
 
 // rosettaDeps builds the Deps for a Rosetta-condition case: the two probe fakes
 // plus a vm backend whose availability decides whether the guest probe runs at all.
-// rosettaShare is set TRUE here because these cases are about the PROBE's states;
+// rosettaShare is set true here because these cases are about the PROBE's states;
 // the share term is B229's own gate and is exercised by
 // TestGuestRosettaWithheldWithoutVMHostShare.
 func rosettaDeps(host *countingHostProbe, guest *countingGuestProbe, vmAvailable bool) Deps {
@@ -107,12 +107,12 @@ func rosettaDeps(host *countingHostProbe, guest *countingGuestProbe, vmAvailable
 // each other, fail-closed on every non-available state, distinct machine Reasons,
 // evaluated eagerly exactly once, and never an RPC error.
 //
-// EVERY assertion is a t.Run SUBTEST of this ONE function on purpose: the gate runs
+// every assertion is a t.Run SUBTEST of this one function on purpose: the gate runs
 // `go test -run '^TestGetRuntimeInfo_RosettaAvailability$'`, so a sibling top-level
 // Test* would be silently filtered out and never run.
 //
 // All subtests are hermetic — no real Rosetta, no real Virtualization.framework, no
-// root, no network. Nothing here asserts a REAL probe's value: a dev Mac has Rosetta
+// root, no network. Nothing here asserts a real probe's value: a dev Mac has Rosetta
 // 2 installed and a clean one does not, so such an assertion would flip per host.
 func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 	const (
@@ -150,7 +150,7 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 		}
 	}
 
-	// --- the availability matrix: the two capabilities are INDEPENDENT ---------
+	// --- the availability matrix: the two capabilities are independent ---------
 
 	t.Run("host_true_guest_true", func(t *testing.T) {
 		resp := info(t, rosettaDeps(
@@ -170,7 +170,7 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 		check(t, resp, ConditionRosettaGuestAvailable, condFalse, "NotInstalled")
 	})
 
-	// The load-bearing one: a host without Rosetta 2 must NOT drag the guest
+	// The load-bearing one: a host without Rosetta 2 must not drag the guest
 	// capability down with it. They are different translation engines.
 	t.Run("host_false_guest_true", func(t *testing.T) {
 		resp := info(t, rosettaDeps(
@@ -194,7 +194,7 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 
 	// arch(1) collapses EBADARCH and every other failure into a generic non-zero
 	// exit, so "the payload is there but translation did not run" is only
-	// distinguishable by the probe's STRUCTURE. That distinction must survive into
+	// distinguishable by the probe's structure. That distinction must survive into
 	// the Reason, or an operator cannot tell a broken Rosetta from an absent one.
 	t.Run("host_translation_failed_is_distinct", func(t *testing.T) {
 		resp := info(t, rosettaDeps(
@@ -253,9 +253,9 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 	// --- the vm-backend short-circuit ----------------------------------------
 
 	// With the vm backend unavailable the guest result cannot change any node label
-	// (k3sm composes VMBackendAvailable AND RosettaGuestAvailable), so the probe must
+	// (k3sm composes VMBackendAvailable and RosettaGuestAvailable), so the probe must
 	// not be called at all — that is what keeps a Virtualization.framework call off
-	// every unentitled Mac. The condition is still emitted, FALSE, naming the cause.
+	// every unentitled Mac. The condition is still emitted, false, naming the cause.
 	t.Run("guest_short_circuited_when_vm_unavailable", func(t *testing.T) {
 		guest := &countingGuestProbe{state: sandbox.GuestRosettaInstalled}
 		resp := info(t, rosettaDeps(&countingHostProbe{state: sandbox.HostRosettaAvailable}, guest, false))
@@ -399,9 +399,9 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 
 	// --- the real production wiring ------------------------------------------
 
-	// With NIL probe deps, New must fall back to sandbox.ProbeHostRosetta /
-	// sandbox.ProbeGuestRosetta and STILL advertise both conditions. It deliberately
-	// asserts NO VALUE: this repo's dev Macs have Rosetta 2 installed and a clean
+	// With nil probe deps, New must fall back to sandbox.ProbeHostRosetta /
+	// sandbox.ProbeGuestRosetta and still advertise both conditions. It deliberately
+	// asserts NO value: this repo's dev Macs have Rosetta 2 installed and a clean
 	// machine does not, so any value assertion would flip per host. What it does
 	// catch is a builder who forgot to wire the real probes at all — the conditions
 	// would then be missing, or would carry no Reason.
@@ -409,7 +409,7 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 	// It constructs through testDeps rather than the info/newTestRuntime helper on
 	// purpose — the same split pull_wiring_test.go uses for Puller. newTestRuntimeCfg
 	// defaults the two probe seams to fakes, so the ~85 constructions that go through
-	// it cost no stat and no fork; testDeps leaves them nil, which is how THIS subtest
+	// it cost no stat and no fork; testDeps leaves them nil, which is how this subtest
 	// still reaches the real sandbox.Probe*Rosetta. (A few other constructions fall
 	// through to the real probes too — pull_wiring_test.go's two and volume_test.go's
 	// hand-rolled Deps literal — but this is the only one that ASSERTS on them.)
@@ -444,17 +444,17 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 // moment the vm backend becomes available on an entitled Mac, evalGuestRosetta
 // would reach the framework probe; +[VZLinuxRosettaDirectoryShare availability]
 // says Installed on any recent Apple-Silicon Mac with the payload present; the
-// node would then report RosettaGuestAvailable=TRUE, k3sm would label it
+// node would then report RosettaGuestAvailable=true, k3sm would label it
 // k3sm.io/rosetta-linux, and pkg/image's PlatformPolicy would add linux/amd64 to
 // the pull candidate set for every vm pod — while the k3sm-vmhost helper attaches
 // no Rosetta share, so each of those images would be pulled and then fail to
 // execute in a guest with no interpreter registered.
 //
-// So the assertions are: with the share unsupported the condition is FALSE with
-// its OWN Reason, the framework probe is never called at all (a capability that
+// So the assertions are: with the share unsupported the condition is false with
+// its own Reason, the framework probe is never called at all (a capability that
 // cannot matter is not queried), and — the term-independence check — the same
-// probe state DOES report TRUE once the share term holds, which is what proves the
-// FALSE above came from the share gate and not from a probe that had been broken.
+// probe state does report true once the share term holds, which is what proves the
+// false above came from the share gate and not from a probe that had been broken.
 func TestGuestRosettaWithheldWithoutVMHostShare(t *testing.T) {
 	const condFalse = runtimev1.ConditionStatus_CONDITION_STATUS_FALSE
 	const condTrue = runtimev1.ConditionStatus_CONDITION_STATUS_TRUE

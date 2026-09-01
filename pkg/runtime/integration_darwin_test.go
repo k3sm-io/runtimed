@@ -180,11 +180,11 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 // the only concession to hermeticity is that the registry is in-process on
 // loopback.
 //
-// Two layers, each carrying a REAL and DIFFERENT Mach-O at bin/app, is the
+// Two layers, each carrying a real and different Mach-O at bin/app, is the
 // load-bearing part of the fixture. A single-layer image cannot distinguish an
 // unpacker that applies layers in order from one that applies only the first (or
 // only the last): both would exec something. Here the first layer's binary
-// prints the WRONG marker and would exit non-zero, so a mis-ordered apply fails
+// prints the wrong marker and would exit non-zero, so a mis-ordered apply fails
 // loudly instead of passing.
 func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 	root := t.TempDir()
@@ -247,7 +247,7 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 		},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Containers: []*runtimev1.Container{
-			// A RELATIVE command: it is resolvable only because the unpacked tree
+			// A relative command: it is resolvable only because the unpacked tree
 			// was materialized into the pod rootfs. Before M11.2-d7 this named a
 			// file that never existed.
 			{Name: "main", Image: ref, Command: []string{"bin/app"}},
@@ -262,7 +262,7 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 		t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
 	}
 
-	// The materialized rootfs must hold BOTH the later layer's binary and the
+	// The materialized rootfs must hold both the later layer's binary and the
 	// earlier layer's untouched file — the multi-layer apply, on disk.
 	if _, serr := os.Stat(filepath.Join(podRootfs, "bin/app")); serr != nil {
 		t.Fatalf("bin/app was not materialized: %v", serr)
@@ -290,7 +290,7 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 		t.Fatalf("pod did not reach SUCCEEDED; phase=%v", phase)
 	}
 
-	// argv[0] came out of the SECOND layer.
+	// argv[0] came out of the second layer.
 	stream := newFakeLogStream(context.Background())
 	if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-a6", Container: "main"}, stream); err != nil {
 		t.Fatalf("GetLogs: %v", err)

@@ -48,7 +48,7 @@ import (
 //     id yields no path at all, rather than a path that is checked afterwards.
 //   - Aliasing: the default macOS APFS volume is case-insensitive, while the
 //     daemon's live pod registry is keyed by the raw byte string. Admitting case
-//     would let "Pod-A" and "pod-a" be two registry entries sharing ONE on-disk
+//     would let "Pod-A" and "pod-a" be two registry entries sharing one on-disk
 //     directory, so deleting either would destroy the other's data volume — a
 //     cross-pod escape that contains no traversal metacharacter and that a
 //     traversal-only test would pass.

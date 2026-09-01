@@ -30,7 +30,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// THE VM POD'S HOST-SIDE LIFECYCLE, with the boot faked at the backend seam.
+// the VM POD'S HOST-side LIFECYCLE, with the boot faked at the backend seam.
 //
 // pkg/sandbox owns the boot state machine and tests it there; what is asserted
 // here is the RUNTIME's half — that a booted guest becomes a registered Running
@@ -193,15 +193,15 @@ func TestDeleteVMPodStopsTheHelper(t *testing.T) {
 		// The pod is already deregistered, so the observable is that nothing
 		// panicked and the watch returned; a Failed publish for a deleted pod is
 		// unobservable by design. What this pins is that the ordering in
-		// DeletePod (stop, THEN cancel) has not been reversed.
+		// DeletePod (stop, then cancel) has not been reversed.
 		time.Sleep(50 * time.Millisecond)
 	})
 }
 
 // TestCloseStopsVMHelpersButNotHostPods pins the two OPPOSITE shutdown contracts
 // in one place, because they are easy to conflate and the conflation is silent
-// either way: a host pod's processes must SURVIVE `launchctl kickstart -k`, and a
-// vm pod's helper must NOT ("no VM outlives the binary that booted it").
+// either way: a host pod's processes must survive `launchctl kickstart -k`, and a
+// vm pod's helper must not ("no VM outlives the binary that booted it").
 func TestCloseStopsVMHelpersButNotHostPods(t *testing.T) {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
 	sp := &fakeSpawner{}
@@ -330,18 +330,18 @@ func TestRestartContainerRefusesAVMPod(t *testing.T) {
 }
 
 // TestVMTeardownCancelsSupervisionBeforeStopping pins the ordering that keeps a
-// DELIBERATE teardown from being reported as a crash.
+// deliberate teardown from being reported as a crash.
 //
-// FOUND BY THE LIVE SMOKE, NOT BY REVIEW. A helper's exit is observed by two
+// FOUND BY the LIVE SMOKE, not BY REVIEW. A helper's exit is observed by two
 // watchers — the stop's own GracefulStop and watchVMHelperExit, whose whole job
 // is to fail a pod whose machine died under it — and cancelling supervision
-// AFTER the stop left which one won to chance. On the rig the watcher won
+// after the stop left which one won to chance. On the rig the watcher won
 // routinely: an ordinary DeletePod logged "the vm host helper exited while its
 // pod was running; the guest is gone" and published a Failed status for a pod the
 // operator had just asked to delete. A provider consuming that event sees a
 // crash where there was none.
 //
-// The assertion is on the ORDER, not on the outcome, and deliberately so: an
+// The assertion is on the order, not on the outcome, and deliberately so: an
 // outcome test ("the pod was not published Failed") passes on a racy
 // implementation most of the time, which is the worst possible test for a race.
 // Contexts are monotonic, so "supCtx is already cancelled when the backend is

@@ -45,38 +45,38 @@ import (
 // running daemon's own pods).
 //
 // TRUST BOUNDARY: the records drive a root-privileged kill, so they must live
-// where a confined pod CANNOT write them. They are stored under
+// where a confined pod cannot write them. They are stored under
 // <root>/podreap/ (sandbox.PodReapSubdir), a daemon-private sibling of
-// <root>/pods/ — NOT under a pod's own dir, which the pod's Seatbelt profile
+// <root>/pods/ — not under a pod's own dir, which the pod's Seatbelt profile
 // re-allows file-write* on. A store inside the pod tree would let a pod forge a
 // record and drive the reap's kill(-pgid) at a process group of its choosing
 // (DESIGN §8 default-deny). The SBPL generator emits a matching (deny ...) for
 // the podreap root (sandbox.Generate) so an ancestor extra_write_path cannot
 // re-open write access to it.
 //
-// The reap NEVER identifies pods by name or path heuristics — only recorded
-// pgids are considered, each guarded by an EXACT-INSTANCE identity check before
+// The reap never identifies pods by name or path heuristics — only recorded
+// pgids are considered, each guarded by an exact-INSTANCE identity check before
 // any signal:
 //   - pgid must be > 1 (a record can never authorize kill(-1), the POSIX
 //     broadcast, nor kill(-0), the caller's own group);
 //   - the live process GROUP is probed (kern.proc.pgrp) for its members; the
 //     kill decision matches the LEADER member (Pid == pgid, which holds only
 //     while the original SETSID leader lives) and kills iff that leader's start
-//     time EXACTLY equals the recorded leader start;
-//   - a pgid the kernel recycled to a NEW leader (Pid == pgid but a different
+//     time exactly equals the recorded leader start;
+//   - a pgid the kernel recycled to a new leader (Pid == pgid but a different
 //     immutable start) is dropped unsignaled.
 //
-// CEILING — keep-and-warn (leader dead, group alive via a grandchild): when the
+// ceiling — keep-and-warn (leader dead, group alive via a grandchild): when the
 // leader (Pid == pgid) is gone but a grandchild keeps the group alive, the reap
 // can no longer PROVE the group is still ours (there is no leader start to match
 // against the record), so it neither kills (a recycled pgid could host an
 // unrelated leader's children — killing would be a wrong-target root SIGKILL)
 // nor drops the record. It KEEPS the record and emits an alerting Warn every
 // Serve. This is a deliberate, observable, bounded-safety trade: a permanent
-// runbooked leak beats an unbounded wrong-kill. A future maintainer must NOT
+// runbooked leak beats an unbounded wrong-kill. A future maintainer must not
 // "recover" this into a heuristic kill.
 //
-// CEILING — setsid escape: a pod that double-fork+setsid's a child leaves the
+// ceiling — setsid escape: a pod that double-fork+setsid's a child leaves the
 // recorded process group entirely; kern.proc.pgrp and kill(-pgid) never see it,
 // so the reap cannot catch it. This is an accepted limit of pgid-based
 // tracking (the vm RuntimeClass is the isolation answer for untrusted tenancy).
@@ -92,14 +92,14 @@ type podProcRecord struct {
 	// pid under POSIX_SPAWN_SETSID).
 	Pgid int `json:"pgid"`
 	// StartUnixNano is the leader's kernel-reported start time. It is the
-	// record's EXACT-INSTANCE identity guard: the reap kills only when the live
-	// group's leader member (Pid == Pgid) reports a start time EQUAL to this. A
+	// record's exact-INSTANCE identity guard: the reap kills only when the live
+	// group's leader member (Pid == Pgid) reports a start time equal to this. A
 	// pgid recycled to a new leader has a strictly different immutable start, so
 	// it never matches and is dropped unsignaled.
 	StartUnixNano int64 `json:"startUnixNano"`
 }
 
-// containerID derives the container's PUBLISHED identity — ContainerStatus.
+// containerID derives the container's published identity — ContainerStatus.
 // container_id — from this record.
 //
 // It is a DERIVATION of the reap record's exact-instance identity, never a
@@ -111,7 +111,7 @@ type podProcRecord struct {
 // disagreement unreachable: a pgid the kernel recycled has a strictly different
 // leader start, so it yields a different id.
 //
-// The derivation is ONE-WAY (sha256, hex) on purpose. A pod's status is readable
+// The derivation is one-way (sha256, hex) on purpose. A pod's status is readable
 // by anyone holding pods/get, so publishing the host pgid verbatim would be host
 // process-table disclosure from a root daemon. The hash is stable for the life of
 // the incarnation, unique per (pod, container, incarnation), and reveals nothing
@@ -140,7 +140,7 @@ func (rec podProcRecord) containerID() string {
 type procStartTime func(pid int) (startUnixNano int64, ok bool)
 
 // procGroupInspector reports the live members (pid + start time) of process
-// group pgid. ok is false ONLY when the group cannot be inspected (a real
+// group pgid. ok is false only when the group cannot be inspected (a real
 // syscall failure — the reap keeps the record and retries next start); an
 // existing but empty group returns an empty slice with ok true (the group is
 // dead — the reap drops the record).
@@ -155,7 +155,7 @@ func (r *Runtime) podReapRoot() string {
 }
 
 // podReapDir returns a pod's reap-record dir. It returns an error for an id that
-// is not a legal path component: this is the SECOND derivation of pod_id into a
+// is not a legal path component: this is the second derivation of pod_id into a
 // path in the daemon, and its RemoveAll had no containment guard at all, so an
 // unvalidated id here was the shortest route from a hostile CreatePod to an
 // arbitrary recursive delete running as root.
@@ -167,13 +167,13 @@ func (r *Runtime) podReapDir(podID string) (string, error) {
 	return filepath.Join(r.podReapRoot(), id.String()), nil
 }
 
-// recordPodProc durably records a just-spawned container's process group BEFORE
+// recordPodProc durably records a just-spawned container's process group before
 // the spawn is acknowledged to the caller (CreatePod's return). Write failure
 // fails the container start: an unrecorded pod process would be invisible to
 // the startup reap, which is exactly the orphan class this file closes.
 //
 // It returns the record it wrote so the caller can derive the container's
-// PUBLISHED identity (podProcRecord.containerID) from the very same
+// published identity (podProcRecord.containerID) from the very same
 // (pgid, leader start) pair the reap will later match on. Returning it — rather
 // than letting the caller re-probe the process table — is what makes a
 // disagreement between the two structurally impossible.
@@ -232,11 +232,11 @@ func (r *Runtime) removePodReapRecords(podID string) {
 }
 
 // listPodProcRecords loads every durable process-group record under
-// <root>/podreap/. It DEGRADES rather than fails the daemon on I/O faults over
+// <root>/podreap/. It degrades rather than fails the daemon on I/O faults over
 // this best-effort orphan store (reaping is not a scheduling precondition):
 //   - the reap ROOT missing is normal (no prior run) → returns empty, nil error;
 //   - the reap ROOT present-but-unreadable returns an error, which the caller
-//     (reapOrphanedPodsOnce) turns into an ALERT + skipped reap, NOT a Serve
+//     (reapOrphanedPodsOnce) turns into an ALERT + skipped reap, not a Serve
 //     failure — so an unreadable store never crash-loops the node;
 //   - a per-pod SUBDIR that cannot be read is quarantine-skipped (warn +
 //     continue), never a whole-enumeration failure;
@@ -274,7 +274,7 @@ func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []st
 			path := filepath.Join(dir, e.Name())
 			data, err := os.ReadFile(path)
 			if err != nil {
-				// Transient read failure: retain (retry next start), do NOT
+				// Transient read failure: retain (retry next start), do not
 				// quarantine — deleting a live pod's record fails open.
 				r.log.Warn("read reap record (retained)", "path", path, "err", err)
 				continue
@@ -301,28 +301,28 @@ func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []st
 //   - a zero-identity record (StartUnixNano == 0: the child died between spawn
 //     and record) can never be matched to a live leader, so it can never
 //     authorize a kill — it is dropped;
-//   - a record whose group cannot be inspected (ok=false) is KEPT for the next
+//   - a record whose group cannot be inspected (ok=false) is kept for the next
 //     start to retry — never dropped, never blindly signalled;
-//   - a record whose group is EMPTY is dropped (nothing to signal);
+//   - a record whose group is empty is dropped (nothing to signal);
 //   - a record whose group's LEADER member (Pid == pgid) reports a start time
-//     EXACTLY equal to the recorded leader start is our orphaned pod group:
+//     exactly equal to the recorded leader start is our orphaned pod group:
 //     selected for kill (its record is removed only after the signal succeeds,
 //     so a failed kill is retried by the next daemon start);
 //   - a record whose group's leader member exists (Pid == pgid) but reports a
-//     DIFFERENT start is a recycled pgid (a new leader took the number): dropped,
-//     NEVER signalled;
+//     different start is a recycled pgid (a new leader took the number): dropped,
+//     never signalled;
 //   - a record whose non-empty group has NO leader member (Pid == pgid absent —
 //     the leader exited, a grandchild keeps the group alive) is keep-and-warn:
-//     kept AND surfaced by the caller as an alerting Warn, never killed (see the
+//     kept and surfaced by the caller as an alerting Warn, never killed (see the
 //     keep-and-warn ceiling in the file header);
 //   - processes with no record are invisible here by construction — a bystander
 //     can never be selected.
 //
-// WHY EXACT EQUALITY IS SAFE (and must NOT be loosened): the leader pid equals
-// the pgid ONLY while the original SETSID leader lives, and XNU's p_starttime is
+// why exact EQUALITY IS safe (and must not be loosened): the leader pid equals
+// the pgid only while the original SETSID leader lives, and XNU's p_starttime is
 // an immutable fork timestamp — an NTP step or clock adjustment never mutates a
 // live process's recorded start. So a pgid the kernel later recycles to an
-// unrelated leader ALWAYS reports a strictly different start. A tolerance window
+// unrelated leader always reports a strictly different start. A tolerance window
 // ("start >= floor", or "within N ms") would re-open the recycled-pgid hole and
 // let the reap SIGKILL an unrelated root process group. Do not soften this.
 //
@@ -361,7 +361,7 @@ func startupPodReapDecision(records []podProcRecord, owned map[int]bool, procGro
 			continue
 		}
 		if leader.StartUnixNano != rec.StartUnixNano {
-			// pgid recycled to a NEW leader (immutable start differs): not ours.
+			// pgid recycled to a new leader (immutable start differs): not ours.
 			drop = append(drop, rec)
 			continue
 		}
@@ -385,11 +385,11 @@ func leaderMember(members []supervisor.ProcMember, pgid int) (supervisor.ProcMem
 }
 
 // groupIsRecordedInstance re-probes rec's group and reports whether its leader
-// member STILL exactly matches the record (Pid == Pgid AND start == recorded
+// member still exactly matches the record (Pid == Pgid and start == recorded
 // start). It runs immediately before signalGroup to shrink the probe→kill TOCTOU
 // window to a single syscall: between the decision and the signal the leader
 // could exit (and the pgid be recycled + repopulated), and an ESRCH observed
-// AFTER the signal cannot distinguish "already gone" from "recycled to an
+// after the signal cannot distinguish "already gone" from "recycled to an
 // unrelated group", so this pre-check is the real narrowing.
 func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 	members, ok := r.procGroup(rec.Pgid)
@@ -401,9 +401,9 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 }
 
 // ReapOrphanedPods reaps pod process groups recorded by a previous daemon run,
-// exactly once per Runtime, BEFORE CreatePod is served (a sibling of the network
-// startup reconcile). Unlike that reconcile it DEGRADES rather than fails
-// closed: reaping a best-effort orphan store is NOT a scheduling precondition,
+// exactly once per Runtime, before CreatePod is served (a sibling of the network
+// startup reconcile). Unlike that reconcile it degrades rather than fails
+// closed: reaping a best-effort orphan store is not a scheduling precondition,
 // so an unreadable store alerts + skips the reap and lets Serve continue rather
 // than propagating an error that would exit main and launchd-crash-loop the
 // node. It always returns nil (the once/sticky wrapper is retained for the
@@ -411,7 +411,7 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 // period: the orphans' supervising reapers died with the previous daemon, so
 // there is no graceful-stop path left to run.
 //
-// It is exported because it has TWO call sites: the standalone daemon's
+// It is exported because it has two call sites: the standalone daemon's
 // Server.Serve (grpcserver.go), and the embedded k3sm node path, which drives
 // this Runtime by direct RPC and never runs Serve — the same reason the network
 // startup reconcile needs an explicit call on the embedded path. The sticky
@@ -425,10 +425,10 @@ func (r *Runtime) ReapOrphanedPods() error {
 }
 
 func (r *Runtime) reapOrphanedPodsOnce() error {
-	// THE VM SWEEP RIDES THE SAME EXACTLY-ONCE-BEFORE-SERVE HOOK, and is
-	// deliberately a SEPARATE store with a SEPARATE decision (pkg/sandbox's
+	// the VM sweep RIDES the same exactly-once-before-SERVE HOOK, and is
+	// deliberately a separate store with a separate decision (pkg/sandbox's
 	// vmReapDecision). The two policies are opposites — a host pod's processes
-	// SURVIVE a daemon restart by design, a vm pod's helper must not — so
+	// survive a daemon restart by design, a vm pod's helper must not — so
 	// folding them into one record path would leave one mode flag between "every
 	// guest survives unowned" and "every host pod on the node is killed by a
 	// restart". It runs FIRST because an orphaned helper holds a whole machine,
@@ -489,7 +489,7 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 		// keep-and-warn: the leader (Pid == pgid) is gone but the group is still
 		// alive via a grandchild. We cannot prove the group is still ours, so we
 		// neither kill (a recycled pgid may host an unrelated leader's children)
-		// nor drop (the leak is real). The record is KEPT and re-warns every
+		// nor drop (the leak is real). The record is kept and re-warns every
 		// Serve — an intentional, alerting, bounded-safety trade (header ceiling).
 		r.log.Warn("orphaned pod process group leaked: leader gone but group still alive via a descendant (kept, not killed; will re-warn each start)",
 			"pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)

@@ -35,12 +35,12 @@ package supervisor
 // Two load-bearing semantic details:
 //
 //   - ri_phys_footprint is the kernel's phys_footprint ledger for the task —
-//     resident + compressed + wired + IOKit-mapped memory — NOT RSS. It is the
+//     resident + compressed + wired + IOKit-mapped memory — not RSS. It is the
 //     same accounting jetsam/memorystatus compares against a task's memory limit,
 //     so it is the correct number to gate an OOM kill on (and to report as the
 //     kubectl-top working set).
 //
-//   - ri_user_time / ri_system_time are in MACH ABSOLUTE TIME UNITS, NOT
+//   - ri_user_time / ri_system_time are in MACH absolute TIME UNITS, not
 //     nanoseconds. XNU's fill_task_rusage copies task_power_info's
 //     total_user/total_system straight out of the task's thread timers, which
 //     accumulate in absolute time units. The two are numerically identical only
@@ -88,11 +88,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// PhysFootprinter is the production Footprinter AND RUsager: it reads
+// PhysFootprinter is the production Footprinter and RUsager: it reads
 // ri_phys_footprint and the ri_user_time/ri_system_time CPU counters via
 // proc_pid_rusage(RUSAGE_INFO_V2). The zero value is usable.
 //
-// ri_phys_footprint is NOT RSS — see the Footprinter and MemorySampler docs and
+// ri_phys_footprint is not RSS — see the Footprinter and MemorySampler docs and
 // docs/resources.md: it is the kernel's phys_footprint ledger (resident +
 // compressed + wired + IOKit-mapped), the figure jetsam compares against a task's
 // memory limit, so the OOM threshold and the kubectl-top working set are both in

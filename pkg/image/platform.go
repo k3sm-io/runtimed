@@ -44,9 +44,9 @@ import (
 var ErrNoPlatformMatch = errors.New("no image manifest matches a runnable platform")
 
 // ErrNestedIndex is the decided verdict for an index whose selected child is
-// itself an index (index-of-index). k3sm REFUSES it rather than recursing: a
+// itself an index (index-of-index). k3sm refuses it rather than recursing: a
 // recursive traversal is an unbounded, registry-controlled fan-out, and no
-// registry in the k3sm target set publishes one. It is deliberately NOT wrapped
+// registry in the k3sm target set publishes one. It is deliberately not wrapped
 // around ErrNoPlatformMatch — the platform may well be present, so reporting "no
 // match" would misdescribe the failure. Callers that mean "this image cannot run
 // here" must test both sentinels, which is what IsTerminalPlatformError is for.
@@ -117,9 +117,9 @@ func (p Platform) String() string {
 // and the one OCI equivalence k3sm honours applied — architecture arm64 with an
 // empty variant IS arm64/v8 (the containerd/OCI convention).
 //
-// Normalisation is TWO-SIDED and matching is then plain equality. k3sm never
+// Normalisation is two-SIDED and matching is then plain equality. k3sm never
 // uses go-containerregistry's Platform.Satisfies / matchesPlatform, which treat
-// an EMPTY required variant as matching ANY variant: that is fail-open in
+// an empty required variant as matching any variant: that is fail-open in
 // exactly the dimension that matters here, because armv9 (arm64/v9) mandates
 // SVE2 and Apple Silicon does not implement it — an "arm64 matches everything"
 // rule would select a manifest whose binaries fault at first use.
@@ -145,7 +145,7 @@ func (p Platform) isUnknown() bool {
 }
 
 // boundTokens returns p with every token capped at maxTokenLen bytes. It is
-// applied when a registry-controlled platform is RETAINED (in an error), never
+// applied when a registry-controlled platform is retained (in an error), never
 // on the matching path: a token longer than any candidate can never match one,
 // so nothing is lost, and the cut is safe because the render boundary
 // (sanitizeToken) escapes whatever byte it lands on.
@@ -158,7 +158,7 @@ func (p Platform) boundTokens() Platform {
 	}
 }
 
-// boundToken caps one token's LENGTH. Charset is not its business — that is the
+// boundToken caps one token's length. Charset is not its business — that is the
 // render boundary's job (sanitizeToken), which still sees an over-long token as
 // over-long because the cut is one byte past the cap.
 func boundToken(s string) string {
@@ -186,32 +186,32 @@ var (
 	platLinuxAMD64  = Platform{OS: "linux", Architecture: "amd64"}
 )
 
-// PlatformPolicy is the PER-PULL image-platform policy. It is an argument, never
+// PlatformPolicy is the per-PULL image-platform policy. It is an argument, never
 // a Puller field or a package variable, because the effective sandbox backend is
 // decided per pod (sandbox.SelectBackend, called from Runtime.createPod) — a
 // daemon-global policy could not express a node running both native and vm pods.
 //
 // Backend is the backend sandbox.SelectBackend RESOLVED for this pod, not the
 // one the PodBox requested. The zero value (SANDBOX_BACKEND_UNSPECIFIED) and any
-// unknown value FAIL CLOSED with ErrNoPlatformMatch: SelectBackend never returns
+// unknown value fail closed with ErrNoPlatformMatch: SelectBackend never returns
 // UNSPECIFIED on its success path, so a policy carrying it means nobody set one,
 // and "no constraint" is precisely the bug this type exists to remove.
 //
-// LIVE CALL SITES (be honest about the green test table): BOTH rungs have one.
+// LIVE call SITES (be honest about the green test table): both rungs have one.
 // Runtime.resolveBinary threads the backend its pod resolved (pod.backend) on the
 // host-process spine, and Runtime.resolveVMContainers threads the vm rung when it
 // pulls each container for the image config the guest-side merge needs
-// (pkg/runtime/vmcontainers.go). GuestRosetta is still passed FALSE by both, so
+// (pkg/runtime/vmcontainers.go). GuestRosetta is still passed false by both, so
 // the linux/amd64 candidate row remains test-only; and a linux pull today feeds
 // the merge, not a composed guest rootfs (the rootfs builder is a separate
-// deliverable), so a green table here is still NOT evidence that vm image
+// deliverable), so a green table here is still not evidence that vm image
 // selection works end to end.
 //
 // HostRosetta / GuestRosetta are capability INPUTS, not probes: this file stays
-// GOOS-agnostic and cgo-free. The probes that answer them SHIPPED with B103
+// GOOS-agnostic and cgo-free. The probes that answer them shipped with B103
 // (sandbox.ProbeHostRosetta / sandbox.ProbeGuestRosetta, advertised as the
 // RosettaHostAvailable / RosettaGuestAvailable RuntimeConditions), but the live pull
-// call site still passes FALSE on purpose — consuming them waits on B105, the
+// call site still passes false on purpose — consuming them waits on B105, the
 // Seatbelt x Rosetta spawn proof (an unsigned x86_64 Mach-O is not AMFI-killed the
 // way an unsigned arm64 one is, so selecting amd64 payloads would quietly weaken the
 // signature policy's kernel backstop). See pkg/runtime/pod.go's pullPolicy. Until
@@ -234,7 +234,7 @@ type PlatformPolicy struct {
 }
 
 // Candidates returns the platforms this policy will accept, in PREFERENCE
-// ORDER — the native architecture first, the Rosetta-translated fallback second.
+// order — the native architecture first, the Rosetta-translated fallback second.
 // Order is load-bearing: selection walks candidates outer, index children inner,
 // so an index that lists amd64 before arm64 still yields arm64.
 //
@@ -307,7 +307,7 @@ func normalizeAll(ps []Platform) []Platform {
 }
 
 // attestationRefType is the annotation buildx stamps on an attestation child of
-// an index. Skipping it is DEFENCE IN DEPTH only — the load-bearing filter is
+// an index. Skipping it is defence in depth only — the load-bearing filter is
 // the positive allowlist in selectableChild, which already excludes attestation
 // manifests because their platform is unknown/unknown (or absent).
 const attestationRefType = "vnd.docker.reference.type"
@@ -315,17 +315,17 @@ const attestationRefType = "vnd.docker.reference.type"
 // SelectManifest picks the child manifest of idx to pull, given the candidate
 // platforms in preference order. It is pure: no registry, no IO.
 //
-// Selection is a POSITIVE EXACT-MATCH ALLOWLIST, never "skip the attestations
-// and take what is left". A child is selectable ONLY if all of:
+// Selection is a positive exact-MATCH ALLOWLIST, never "skip the attestations
+// and take what is left". A child is selectable only if all of:
 //
 //   - its media type is an image manifest type (never an index — see
 //     ErrNestedIndex — and never an unknown type);
 //   - it carries a non-empty digest (see selectableChild: an absent digest key
 //     leaves the zero v1.Hash, which is otherwise selectable);
-//   - it declares a platform. A child with NO platform field is UNKNOWN and is
+//   - it declares a platform. A child with NO platform field is unknown and is
 //     skipped. go-containerregistry does the opposite: index.go substitutes its
 //     package default (linux/amd64) for a nil child platform, which is how a
-//     platform-less buildx attestation manifest gets returned AS THE IMAGE;
+//     platform-less buildx attestation manifest gets returned AS the IMAGE;
 //   - it is not a referrer artifact (see selectableChild) and carries no
 //     attestation annotation;
 //   - its normalised platform EQUALS a candidate.
@@ -374,19 +374,19 @@ func SelectManifest(idx *ggcrv1.IndexManifest, want []Platform) (ggcrv1.Descript
 // selectableChild is the positive allowlist SelectManifest applies to one index
 // child. See SelectManifest for the rationale of each clause.
 //
-// The digest clause closes a first-match-wins shadowing move: an ABSENT digest
+// The digest clause closes a first-match-wins shadowing move: an absent digest
 // key never invokes v1.Hash.UnmarshalJSON (an absent JSON key is not decoded at
-// all), so the child keeps the ZERO v1.Hash — which renders as ":" and is
+// all), so the child keeps the zero v1.Hash — which renders as ":" and is
 // otherwise perfectly selectable. A hostile index could then place a digest-less
 // darwin/arm64 child AHEAD of the real one and deterministically shadow it. The
 // end state was already fail-closed (go-containerregistry refuses the malformed
-// reference downstream), but this allowlist is POSITIVE and the OCI spec makes
-// digest REQUIRED, so the child is rejected here rather than downstream.
+// reference downstream), but this allowlist is positive and the OCI spec makes
+// digest required, so the child is rejected here rather than downstream.
 //
 // The artifactType clause is narrow ON PURPOSE. Per the OCI 1.1 descriptor
 // rules a plain image's artifactType defaults to its CONFIG media type — and
 // go-containerregistry populates exactly that (partial.Descriptor) — so
-// "artifactType is set" does NOT mean "this is a referrer artifact". Only a
+// "artifactType is set" does not mean "this is a referrer artifact". Only a
 // value that is not a known image-config media type (an SBOM, a signature, an
 // attestation) disqualifies the child; treating every non-empty artifactType as
 // disqualifying would reject every real multi-arch image.
@@ -412,7 +412,7 @@ func selectableChild(d ggcrv1.Descriptor) bool {
 // platformFromGGCR converts a go-containerregistry platform to the normalised
 // k3sm form. OSFeatures/Features are deliberately dropped: k3sm never REQUESTS
 // one, and a manifest offering extra features is still ABI-compatible with the
-// exact (os, arch, variant) that was asked for. os.version is NOT dropped — it
+// exact (os, arch, variant) that was asked for. os.version is not dropped — it
 // pins a kernel ABI, so it stays part of the equality key.
 func platformFromGGCR(p ggcrv1.Platform) Platform {
 	return Platform{
@@ -425,7 +425,7 @@ func platformFromGGCR(p ggcrv1.Platform) Platform {
 
 // availablePlatforms lists, de-duplicated and in index order, the platforms idx
 // actually offers — the "image provides ..." half of a mismatch error — plus the
-// number of further platform-bearing children it deliberately did NOT retain.
+// number of further platform-bearing children it deliberately did not retain.
 // Children with no platform contribute nothing (there is no name to report) and
 // the unknown/unknown attestation markers are excluded so the message a human
 // reads names only real platforms.
@@ -441,7 +441,7 @@ func platformFromGGCR(p ggcrv1.Platform) Platform {
 //
 // Beyond the cap the children are no longer de-duplicated (de-duplicating them
 // needs exactly the unbounded map this cap removes), so the returned count is an
-// UPPER BOUND on the platforms not shown, not an exact distinct count.
+// UPPER bound on the platforms not shown, not an exact distinct count.
 func availablePlatforms(idx *ggcrv1.IndexManifest) (out []Platform, omitted int) {
 	seen := make(map[Platform]struct{}, maxCollectedPlatforms)
 	out = make([]Platform, 0, maxCollectedPlatforms)
@@ -466,10 +466,10 @@ func availablePlatforms(idx *ggcrv1.IndexManifest) (out []Platform, omitted int)
 	return out, omitted
 }
 
-// VerifyConfigPlatform checks an image's OWN CONFIG against the candidates and
+// VerifyConfigPlatform checks an image's own CONFIG against the candidates and
 // returns the platform it resolved to. It is pure: cfg is already fetched.
 //
-// This is the single verification used on BOTH pull paths — the child selected
+// This is the single verification used on both pull paths — the child selected
 // out of an index and the single (non-index) manifest — and it is what makes the
 // decision trustworthy. An index descriptor's "platform" field is UNSIGNED
 // parent metadata: it is not covered by the child digest, so an index may
@@ -495,7 +495,7 @@ func VerifyConfigPlatform(cfg *ggcrv1.ConfigFile, want []Platform) (Platform, er
 		OSVersion:    cfg.OSVersion,
 	}.Normalize()
 	// Decided verdict: a config that states no os or no architecture FAILS
-	// CLOSED. "Unstated" must not read as "compatible" — treating an absent
+	// closed. "Unstated" must not read as "compatible" — treating an absent
 	// declaration as a match is the exact shape of the bug being removed.
 	if got.OS == "" || got.Architecture == "" {
 		return Platform{}, fmt.Errorf("image config declares no platform (os=[%s] architecture=[%s]): %w",
@@ -516,7 +516,7 @@ const (
 	// maxRenderedPlatforms bounds how many platforms one list names before it
 	// collapses to a "(+N more)" tail.
 	maxRenderedPlatforms = 8
-	// maxCollectedPlatforms bounds how many platforms a mismatch error RETAINS
+	// maxCollectedPlatforms bounds how many platforms a mismatch error retains
 	// (see availablePlatforms). It matches maxRenderedPlatforms because holding
 	// more than is ever printed only feeds a hostile index.
 	maxCollectedPlatforms = maxRenderedPlatforms
@@ -557,7 +557,7 @@ type PlatformMismatchError struct {
 	Available []Platform
 	// Omitted is how many further platform-bearing children the image offered
 	// beyond Available. Past the cap the children are no longer de-duplicated,
-	// so it is an UPPER BOUND on the platforms not named, not an exact distinct
+	// so it is an UPPER bound on the platforms not named, not an exact distinct
 	// count (see availablePlatforms).
 	Omitted int
 }
@@ -610,7 +610,7 @@ func renderPlatforms(ps []Platform, omitted int) string {
 // literal, which escapes control characters (newline, ANSI ESC) as \n / \x1b and
 // bounds what a hostile registry can inject into a log line or a Pod status.
 //
-// QuoteToASCII, never Quote: Quote escapes only NON-PRINTABLE runes, so a
+// QuoteToASCII, never Quote: Quote escapes only non-PRINTABLE runes, so a
 // printable non-ASCII token (é, あ) survives it as raw multi-byte UTF-8. That
 // would make the whole-message byte cut in PlatformMismatchError.Error able to
 // split a rune, and the resulting invalid UTF-8 makes proto.Marshal reject the
@@ -642,7 +642,7 @@ func conformingToken(s string) bool {
 
 // boundErr wraps a THIRD-PARTY error so embedding it in a k3sm error message
 // cannot echo unbounded registry content. The chain is preserved (Unwrap), so
-// errors.Is/As still see the original cause; only the RENDERING is capped and
+// errors.Is/As still see the original cause; only the rendering is capped and
 // escaped to ASCII.
 //
 // It is needed because go-containerregistry formats registry-supplied bytes into

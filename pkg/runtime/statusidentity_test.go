@@ -29,7 +29,7 @@ import (
 // The three digests a pull resolves, kept distinguishable on purpose: only the
 // CONFIG digest may ever appear in image_id. The index digest is shared by every
 // platform of a multi-platform image and the layer digest names a component, so
-// either one in a per-container identity field resolves the WRONG artifact —
+// either one in a per-container identity field resolves the wrong artifact —
 // which is the defect B132 exists to close, not a stylistic preference.
 const (
 	testConfigDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -38,16 +38,16 @@ const (
 )
 
 // TestContainerStatusIdentityFields is the B132 gate: ContainerStatus.image_id
-// and ContainerStatus.container_id are populated by the REAL status-assembly path
+// and ContainerStatus.container_id are populated by the real status-assembly path
 // (CreatePod → startContainer → containerStatusOf → GetPodStatus), with the
 // substrate faked at the injected seams.
 //
 // The two values are asserted against their SOURCES, not against literals a
 // regression could drift past together with the code:
 //   - image_id must equal the config digest of the manifest the pull resolved —
-//     the same digest recorded as the pod's reachability root — and must NOT be
+//     the same digest recorded as the pod's reachability root — and must not be
 //     the index digest, a layer digest, or the mutable reference;
-//   - container_id must equal the id DERIVED from the pod's own reap record, so
+//   - container_id must equal the id derived from the pod's own reap record, so
 //     the published identity and the (pgid, leader-start) pair the reap is
 //     willing to SIGKILL can never be two different schemes.
 func TestContainerStatusIdentityFields(t *testing.T) {
@@ -97,7 +97,7 @@ func TestContainerStatusIdentityFields(t *testing.T) {
 		if _, err := hex.DecodeString(got); err != nil {
 			t.Errorf("container_id %q is not hex: %v", got, err)
 		}
-		// EXACT-INSTANCE binding: a recycled pgid (same pgid, different leader
+		// exact-INSTANCE binding: a recycled pgid (same pgid, different leader
 		// start) must not reproduce this id, or the published identity would
 		// survive an incarnation it does not describe.
 		recycled := rec
@@ -114,7 +114,7 @@ func TestContainerStatusIdentityFields(t *testing.T) {
 		mustCreatePod(t, rt, hostBinBox(rt, podID))
 
 		st := containerStatusNamed(t, rt, podID, "main")
-		// EMPTY IS THE CORRECT ANSWER HERE: a host binary is run in place with no
+		// empty IS the CORRECT ANSWER here: a host binary is run in place with no
 		// registry round trip and no manifest, so there is no content digest. An
 		// empty image_id degrades visibly; a substitute (the image reference) would
 		// be a lie in a content-addressable field.

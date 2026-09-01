@@ -28,19 +28,19 @@ limitations under the License.
 //
 //   - Generate turns a SandboxProfile (from the apis PodBox) into an SBPL string.
 //     It is pure Go and exhaustively unit-tested against golden files. The
-//     generated profile ALWAYS begins (deny default) and (import "system.sb")
+//     generated profile always begins (deny default) and (import "system.sb")
 //     (the dyld/mach baseline — without it every binary aborts with SIGABRT
 //     during dynamic-linker init) and tightens the prototype: it denies
 //     /private/var/db (except the documented dyld-only read exception), denies
 //     other pods' dirs, and scopes file-write* to the pod data volume only.
 //
 //   - Backend is the swappable application seam. The M1 implementation is a
-//     NON-PLATFORM exec-shim: a tiny ad-hoc-signed helper (cmd/k3sm-execshim)
+//     non-PLATFORM exec-shim: a tiny ad-hoc-signed helper (cmd/k3sm-execshim)
 //     that compiles+applies the profile via libsandbox in-process, then
-//     execve(pod, argv, envp) PRESERVING envp. It deliberately does NOT use
+//     execve(pod, argv, envp) preserving envp. It deliberately does not use
 //     Apple's /usr/bin/sandbox-exec, which is a platform binary that strips
 //     DYLD_* from the environment and would break the DNS shim (Wave-0
-//     confirmed this live). The backend is OS-version-gated and FAILS CLOSED:
+//     confirmed this live). The backend is OS-version-gated and FAILS closed:
 //     if unavailable it refuses to start the pod rather than running unconfined.
 //
 // The cgo libsandbox SPI (sandbox_compile_string / sandbox_apply) is private and

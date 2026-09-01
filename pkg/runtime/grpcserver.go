@@ -35,7 +35,7 @@ import (
 // and its control socket share one tree.
 //
 // SOCKET POSTURE, accurately. The socket is created 0600 inside a 0700 dir, so
-// only the DAEMON'S OWN UID can dial it. That uid is `_k3sm` in the shipped
+// only the DAEMON'S own UID can dial it. That uid is `_k3sm` in the shipped
 // install, not root (the privilege model: k3sm runs unprivileged apart from the
 // minimal netd root helper), so "only root can dial" would be false — the
 // correct statement is that the dialer must be the daemon's uid. The provider
@@ -67,9 +67,9 @@ type Server struct {
 func NewServer(rt *Runtime, opts ...grpc.ServerOption) *Server {
 	gs := grpc.NewServer(opts...)
 	runtimev1.RegisterRuntimeServer(gs, rt)
-	// ONE grpc.Server, therefore ONE listener, therefore ONE socket posture. The
+	// one grpc.Server, therefore one listener, therefore one socket posture. The
 	// Images service (ListImages / ImageFsInfo / RemoveImage / PruneImages) is
-	// registered HERE, on the identical server the Runtime service is registered
+	// registered here, on the identical server the Runtime service is registered
 	// on, so it inherits the 0700-dir / 0600-socket permissions documented on
 	// DefaultSocketPath and cannot acquire a laxer posture of its own. A separate
 	// listener "just for the image commands" is the shape that would silently
@@ -85,7 +85,7 @@ func NewServer(rt *Runtime, opts ...grpc.ServerOption) *Server {
 // clean shutdown (a closed listener / cancelled ctx). The caller owns lis and may
 // close it to force-stop; Serve never closes lis itself.
 func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
-	// Reconcile pod-network startup state BEFORE accepting any CreatePod: the
+	// Reconcile pod-network startup state before accepting any CreatePod: the
 	// real IPAM adapter's in-memory allocator must be re-synced with the durable
 	// lo0 aliases a `kickstart -k` restart left behind, or new allocations
 	// collide with stale aliases and orphans leak the pool. Runs exactly once
@@ -94,12 +94,12 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 		return fmt.Errorf("reconcile pod network startup state: %w", err)
 	}
 
-	// Reap pod process groups a dead daemon left behind, also BEFORE any
+	// Reap pod process groups a dead daemon left behind, also before any
 	// CreatePod: pods are SETSID session leaders that reparent to launchd on a
 	// daemon crash and keep holding ports. Only durably-recorded pgids are
 	// considered, each guarded by an exact-instance start-time identity check
 	// (podreap.go) — never a name/path heuristic. Unlike the network reconcile
-	// this DEGRADES rather than fails closed: reaping a best-effort orphan store
+	// this degrades rather than fails closed: reaping a best-effort orphan store
 	// is not a scheduling precondition, so ReapOrphanedPods always returns nil
 	// (it alerts + skips on an unreadable store) — a store fault must never
 	// crash-loop the node out of serving CreatePod. It is exported because the
@@ -111,7 +111,7 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 
 	// Start the daemon-side image GC. It is bound to a ctx cancelled when Serve
 	// returns (by the defer below), so the goroutine cannot outlive the daemon
-	// loop, and it is started AFTER the startup reconciles above so a pass can
+	// loop, and it is started after the startup reconciles above so a pass can
 	// never race pod-dir reconstruction — a pod dir that has not been rebuilt yet
 	// has no reachability record, which the GC correctly reads as "refuse", but
 	// there is no reason to make it do that work.

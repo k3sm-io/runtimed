@@ -36,14 +36,14 @@ import (
 	guestv1 "k3sm.io/apis/guest/v1"
 )
 
-// THE WHOLE BOOT AND TEARDOWN STATE MACHINE, WITH NO VM ANYWHERE.
+// the whole BOOT and TEARDOWN state MACHINE, with NO VM ANYWHERE.
 //
 // The seams (WithVMProcessSeams) exist so the parts that are hard to get right —
 // the readiness race between "the agent answered" and "the helper died", the
 // deadline kill, the one-grace-budget stop, the orphan sweep's exact-instance
 // identity — are asserted against fakes on any machine, rather than only on an
 // entitled rig where a failure is expensive to reproduce. What the rig proves is
-// the OTHER half: that the real helper, kernel and guest agent actually complete
+// the other half: that the real helper, kernel and guest agent actually complete
 // the handshake these fakes stand in for.
 
 // fakeSpawner records spawns and hands out increasing pids. err makes the spawn
@@ -208,7 +208,7 @@ func labBackend(t *testing.T, root string, health GuestHealthFunc, opts ...VMBac
 
 // TestCreateVMWritesTheMachineDescription is the SPEC GOLDEN: what CreateVM
 // writes must be the proto-JSON a real k3sm-vmhost's ReadSpec accepts with
-// unknown fields REJECTED, and it must carry exactly the fields the daemon owns.
+// unknown fields rejected, and it must carry exactly the fields the daemon owns.
 //
 // The comparison is over the DECODED message, not the bytes: protojson
 // deliberately varies its whitespace, so a byte golden would be flaky in a way
@@ -266,7 +266,7 @@ func TestCreateVMWritesTheMachineDescription(t *testing.T) {
 	})
 
 	t.Run("the k3sm.spec share root exists and is not in the spec", func(t *testing.T) {
-		// The helper APPENDS that share and REFUSES a spec that supplies it, and
+		// The helper APPENDS that share and refuses a spec that supplies it, and
 		// VZ refuses a shared directory that does not exist.
 		if fi, err := os.Stat(filepath.Join(spec.PodDir, "k3sm.spec")); err != nil || !fi.IsDir() {
 			t.Errorf("k3sm.spec share root: stat err=%v", err)
@@ -279,7 +279,7 @@ func TestCreateVMWritesTheMachineDescription(t *testing.T) {
 	})
 
 	t.Run("every pod-contained share root exists before the helper is spawned", func(t *testing.T) {
-		// FOUND BY THE LIVE SMOKE, not by review: VZ refuses a shared directory
+		// FOUND BY the LIVE SMOKE, not by review: VZ refuses a shared directory
 		// that does not exist, and the planner deliberately touches no disk, so
 		// the first real boot died with
 		//   virtiofs share "k3sm.rootfs" (<podDir>/rootfs): no such file or directory
@@ -310,10 +310,10 @@ func TestCreateVMWritesTheMachineDescription(t *testing.T) {
 // TestCreateVMDoesNotFabricateOutOfPodShareRoots is the other half of the
 // share-root rule, and the more important one.
 //
-// A plan legitimately carries roots OUTSIDE the pod dir — a PVC's data dir lives
+// A plan legitimately carries roots outside the pod dir — a PVC's data dir lives
 // under <Root>/storage precisely so it can outlive the pod — and those belong to
 // the persistent-volume binder, with its own class, ownership and reclaim policy.
-// A CreateVM that created them would fabricate an EMPTY volume where a bound
+// A CreateVM that created them would fabricate an empty volume where a bound
 // claim was expected, turning "your PVC is not bound yet" into "your database is
 // empty" with no error anywhere.
 func TestCreateVMDoesNotFabricateOutOfPodShareRoots(t *testing.T) {
@@ -382,7 +382,7 @@ func TestCreateVMFailsClosedWithoutArtifacts(t *testing.T) {
 //
 // A helper that dies after spawn — an unentitled binary, a spec the contract
 // rejects, a kernel VZ will not boot — exits in milliseconds. Polling Health
-// alone would burn the whole 30-second deadline and then report the WRONG cause
+// alone would burn the whole 30-second deadline and then report the wrong cause
 // ("the agent never became ready") while the helper's own one-line explanation
 // sat unread. This asserts both halves: the failure is prompt, and it carries the
 // helper's captured output.
@@ -478,7 +478,7 @@ func TestCreateVMKillsAHelperThatNeverBecomesReady(t *testing.T) {
 	}
 }
 
-// TestStopVMHonoursTheHelpersOwnBudget is the ONE-GRACE-BUDGET gate.
+// TestStopVMHonoursTheHelpersOwnBudget is the one-GRACE-budget gate.
 //
 // The helper answers SIGTERM by asking its guest to stop and waiting out the
 // budget the daemon gave it. A daemon that escalated to SIGKILL on a SHORTER
@@ -521,7 +521,7 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 
 	t.Run("the grace the helper is given is clamped to the ceiling", func(t *testing.T) {
 		// The helper clamps whatever it is handed; the daemon must compute the
-		// SAME clamped number, or its own escalation would be timed against a
+		// same clamped number, or its own escalation would be timed against a
 		// budget the helper will never spend.
 		for _, tc := range []struct{ in, want time.Duration }{
 			{0, VMHostDefaultStopGrace},
@@ -545,7 +545,7 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 	})
 }
 
-// TestStopAllVMsFansOut asserts daemon shutdown stops every helper CONCURRENTLY.
+// TestStopAllVMsFansOut asserts daemon shutdown stops every helper concurrently.
 //
 // Serial stops are not merely slower: each helper's graceful stop can spend up to
 // VMHostMaxStopGrace, launchd allows the daemon 45 seconds total, and its answer
@@ -596,7 +596,7 @@ func TestStopAllVMsFansOut(t *testing.T) {
 	}
 }
 
-// TestVMReapDecision is the ORPHAN SWEEP gate: always kill, never adopt, and
+// TestVMReapDecision is the ORPHAN sweep gate: always kill, never adopt, and
 // never signal a group that cannot be PROVEN to be the recorded instance.
 func TestVMReapDecision(t *testing.T) {
 	member := func(pid int, start int64) supervisor.ProcMember {

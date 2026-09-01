@@ -38,8 +38,8 @@ import (
 const pumpChunkSize = 32 * 1024
 
 // Exec runs a command inside a pod's existing confinement domain (`kubectl
-// exec`). It does NOT open a privileged shell: it re-enters the SAME Seatbelt
-// profile, the SAME securityContext uid/gid drop, and the SAME pod launch spec
+// exec`). It does not open a privileged shell: it re-enters the same Seatbelt
+// profile, the same securityContext uid/gid drop, and the same pod launch spec
 // (rlimits + qos) and data-volume cwd as the pod's containers by spawning the
 // requested argv through the exec-shim backend — sandbox.Backend.WrapCommand
 // produces the k3sm-execshim invocation that runs supervisor.RunLaunchSequence
@@ -85,7 +85,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	// Reuse the pod's confinement: WrapCommand returns the exec-shim invocation
 	// that re-applies the pod's profile + drop + rlimit plan + qos band (the full
 	// supervisor.LaunchSpec — an exec session gets the POD's limits, one code
-	// path). This is the SAME seam the container spawn (startContainer) and the
+	// path). This is the same seam the container spawn (startContainer) and the
 	// M2.3/B7 launch-order tests exercise, so a future profile change
 	// automatically covers exec too.
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, resolveLaunchSpec(p.box, cred))
@@ -98,7 +98,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "exec: %v", err)
 	}
-	// The container's OWN working directory and environment, as
+	// The container's own working directory and environment, as
 	// startContainer resolved them — which for a pulled image includes the
 	// image config's WorkingDir and Env (image.MergeRunSpec). An exec session
 	// that re-derived them from the container spec alone would run with a
@@ -230,7 +230,7 @@ func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tt
 		}
 	}()
 
-	// Drain all output BEFORE reaping (os/exec requires pipe reads to complete
+	// Drain all output before reaping (os/exec requires pipe reads to complete
 	// before Wait; the tty master pump ends on the child's exit), then reap.
 	wg.Wait()
 	waitErr := cmd.Wait()
@@ -252,10 +252,10 @@ func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tt
 	return send(&runtimev1.ExecResponse{Exit: &runtimev1.ExecResult{ExitCode: int32(exitCode)}})
 }
 
-// Attach attaches to an ALREADY-RUNNING container's streams (`kubectl attach`).
+// Attach attaches to an already-running container's streams (`kubectl attach`).
 //
 // M2 limitation: native pod containers are spawned (posix_spawn) with their
-// combined stdout+stderr wired to the log pipe and their stdin NOT retained — so
+// combined stdout+stderr wired to the log pipe and their stdin not retained — so
 // there is no fd to feed new input to a running native process. Interactive
 // attach (stdin, or a tty) is therefore reported Unimplemented rather than
 // silently dropping the operator's keystrokes; `kubectl exec` is the supported

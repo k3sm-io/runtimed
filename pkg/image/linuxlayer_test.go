@@ -32,7 +32,7 @@ import (
 
 // updateFixtures regenerates the committed testdata tars from the specs below.
 //
-// The fixtures are COMMITTED rather than built per run so that a reviewer can
+// The fixtures are committed rather than built per run so that a reviewer can
 // run `tar tvf` over the exact bytes the gate asserts on, and so that a bug in
 // the spec-to-tar builder cannot make a test pass by changing the input it was
 // written against. Regenerate with:
@@ -44,7 +44,7 @@ var updateFixtures = flag.Bool("update-fixtures", false, "regenerate the committ
 const fixtureDir = "testdata/linuxlayer"
 
 // linuxFixtures is the closed set of committed layer tars and the specs they are
-// generated from. Each one is a WHOLE LAYER, so a test names layers by fixture
+// generated from. Each one is a whole LAYER, so a test names layers by fixture
 // rather than assembling entry lists inline.
 var linuxFixtures = map[string][]tarSpec{
 	// base is the lower layer everything else is applied over.
@@ -67,7 +67,7 @@ var linuxFixtures = map[string][]tarSpec{
 		{name: "opt/.wh.tool", mode: 0o644},
 		{name: "etc/new.conf", mode: 0o644, data: "new"},
 	},
-	// opaque makes var/ opaque while contributing a file INSIDE it: the lower
+	// opaque makes var/ opaque while contributing a file inside it: the lower
 	// layer's var/lower.log and var/sub/ must go, var/upper.log must stay.
 	"opaque.tar": {
 		{name: "var/upper.log", mode: 0o644, data: "upper"},
@@ -114,7 +114,7 @@ var linuxFixtures = map[string][]tarSpec{
 		{name: "srv/café.conf", mode: 0o644, data: "nfc"},
 		{name: "srv/café.conf", mode: 0o644, data: "nfd"},
 	},
-	// implicit-case-collision hides the collision in a PARENT no entry names,
+	// implicit-case-collision hides the collision in a parent no entry names,
 	// which is why the ownership map records implicit ancestors.
 	"implicit-case-collision.tar": {
 		{name: "Srv/a", mode: 0o644, data: "a"},
@@ -125,7 +125,7 @@ var linuxFixtures = map[string][]tarSpec{
 		{name: "bin", typ: tar.TypeDir, mode: 0o755},
 		{name: "bin/sh", typ: tar.TypeSymlink, link: "/usr/bin/busybox"},
 	},
-	// relative-escape-symlink resolves ABOVE the tree; it is refused under both
+	// relative-escape-symlink resolves above the tree; it is refused under both
 	// dialects (see symlinkTargetContained).
 	"relative-escape-symlink.tar": {
 		{name: "bin", typ: tar.TypeDir, mode: 0o755},
@@ -225,8 +225,8 @@ func exists(t *testing.T, tree, rel string) bool {
 //
 //   - ".wh.<name>" removes a FILE and, recursively, a DIRECTORY the lower
 //     layers contributed — and is never itself materialized;
-//   - ".wh..wh..opq" removes what the LOWER layers put in its directory while
-//     preserving what THIS layer put there, recursing into a directory this
+//   - ".wh..wh..opq" removes what the lower layers put in its directory while
+//     preserving what this layer put there, recursing into a directory this
 //     layer merely re-moded;
 //   - ".wh..wh.<meta>" is AUFS bookkeeping: skipped, counted, never written.
 //
@@ -283,7 +283,7 @@ func TestLinuxRootfsWhiteoutOpaqueApply(t *testing.T) {
 		}
 	})
 
-	// The native dialect's behaviour on the SAME bytes, unchanged: markers are
+	// The native dialect's behaviour on the same bytes, unchanged: markers are
 	// ordinary files and nothing is deleted. This is the row that would go red
 	// if the Linux rules ever leaked into the dialect that has no chroot.
 	t.Run("native_treats_markers_as_files", func(t *testing.T) {
@@ -361,7 +361,7 @@ func TestLinuxRootfsWhiteoutOpaqueApply(t *testing.T) {
 		}
 	})
 
-	// A whiteout in layer N must NOT delete a path layer N itself created after
+	// A whiteout in layer N must not delete a path layer N itself created after
 	// it; the opaque rule's layerPaths set must not leak into the plain
 	// whiteout, which is defined against the tree as it stands.
 	t.Run("whiteout_then_recreate_in_one_layer", func(t *testing.T) {
@@ -380,10 +380,10 @@ func TestLinuxRootfsWhiteoutOpaqueApply(t *testing.T) {
 }
 
 // TestLinuxRootfsHardlinkContainment pins the hard-link rule under the LINUX
-// dialect: a link may only alias a regular file the tree ALREADY holds, so it
+// dialect: a link may only alias a regular file the tree already holds, so it
 // can neither reach a host path nor alias a node no layer supplied.
 //
-// The Linux dialect relaxes the ABSOLUTE-SYMLINK rule, and this is the test that
+// The Linux dialect relaxes the absolute-SYMLINK rule, and this is the test that
 // proves the relaxation did not leak into hard links — a hard link is resolved
 // by the HOST at apply time, where no chroot exists, so its rule cannot move.
 func TestLinuxRootfsHardlinkContainment(t *testing.T) {
@@ -449,9 +449,9 @@ func TestLinuxRootfsHardlinkContainment(t *testing.T) {
 
 // TestLinuxRootfsCaseCollisionFailsClosed pins the case-collision defense
 // in depth: two paths a case-insensitive or normalization-insensitive volume
-// would merge are a TYPED error and nothing is committed.
+// would merge are a typed error and nothing is committed.
 //
-// The native dialect keeps the OLD behaviour deliberately and that row is
+// The native dialect keeps the old behaviour deliberately and that row is
 // asserted too: a darwin-native image's paths are consumed by a darwin process
 // on the same insensitive volume, so the merge is what the payload expects.
 func TestLinuxRootfsCaseCollisionFailsClosed(t *testing.T) {
@@ -493,7 +493,7 @@ func TestLinuxRootfsCaseCollisionFailsClosed(t *testing.T) {
 		}
 	})
 
-	// Re-writing the SAME path is "later layer wins", never a collision.
+	// Re-writing the same path is "later layer wins", never a collision.
 	t.Run("same_path_rewritten_is_not_a_collision", func(t *testing.T) {
 		tree, _, _, err := applyIntoApplier(t, LinuxUnpackPolicy(), ApplyLimits{},
 			[]tarSpec{{name: "f", mode: 0o644, data: "v1"}},
@@ -507,7 +507,7 @@ func TestLinuxRootfsCaseCollisionFailsClosed(t *testing.T) {
 		}
 	})
 
-	// A path WHITED OUT and then re-created under a different case is NOT a
+	// A path WHITED OUT and then re-created under a different case is not a
 	// collision: the first path is gone from the tree, so nothing merges.
 	t.Run("whiteout_releases_the_folded_key", func(t *testing.T) {
 		tree, _, _, err := applyIntoApplier(t, LinuxUnpackPolicy(), ApplyLimits{},
@@ -549,10 +549,10 @@ func TestLinuxRootfsCaseCollisionFailsClosed(t *testing.T) {
 	})
 }
 
-// TestLinuxRootfsSymlinkDialect pins the ONE per-dialect rule in the applier:
+// TestLinuxRootfsSymlinkDialect pins the one per-dialect rule in the applier:
 // an absolute symlink target is refused natively (no chroot stands between the
 // pod and the host root) and admitted under Linux (the guest chroots into this
-// very tree). A RELATIVE target that resolves above the tree stays refused under
+// very tree). A relative target that resolves above the tree stays refused under
 // both.
 func TestLinuxRootfsSymlinkDialect(t *testing.T) {
 	t.Run("absolute_admitted_under_linux", func(t *testing.T) {
@@ -627,7 +627,7 @@ func ownershipByPath(entries []OwnershipEntry) map[string]OwnershipEntry {
 }
 
 // TestLinuxRootfsOwnershipSidecar pins the sidecar's whole reason for existing:
-// the tar's TRUE uid/gid/mode reach the record while the HOST tree carries
+// the tar's true uid/gid/mode reach the record while the HOST tree carries
 // neither — an unprivileged daemon cannot chown, and a setuid bit must never
 // land in a tree every pod rootfs is cloned from.
 func TestLinuxRootfsOwnershipSidecar(t *testing.T) {
@@ -731,7 +731,7 @@ func TestLinuxRootfsXattrsAreDropped(t *testing.T) {
 	}
 }
 
-// TestLinuxRootfsSkipsDeviceNodes pins the skip-and-COUNT posture for the node
+// TestLinuxRootfsSkipsDeviceNodes pins the skip-and-count posture for the node
 // types an unprivileged daemon cannot create: refusing them would reject a large
 // share of real base images, and silently dropping them would hide it.
 func TestLinuxRootfsSkipsDeviceNodes(t *testing.T) {
@@ -755,7 +755,7 @@ func TestLinuxRootfsSkipsDeviceNodes(t *testing.T) {
 	}
 }
 
-// TestClassifyWhiteout is the marker grammar's own table. The ORDER of the tests
+// TestClassifyWhiteout is the marker grammar's own table. The order of the tests
 // inside classifyWhiteout is load-bearing — ".wh..wh..opq" starts with
 // ".wh..wh." which starts with ".wh." — so every prefix relationship gets a row.
 func TestClassifyWhiteout(t *testing.T) {

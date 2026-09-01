@@ -56,7 +56,7 @@ func guestSpecFixture() VMSpec {
 			Nameservers: []string{"10.43.0.10"},
 			Searches:    []string{"default.svc.cluster.local", "svc.cluster.local", "cluster.local"},
 			Options:     []string{"ndots:5"},
-			// The rendered form is present too, and must NOT appear anywhere in
+			// The rendered form is present too, and must not appear anywhere in
 			// the composed spec: see TestBuildGuestSpecReadsOnlyTheStructuredResolver.
 			ResolvConf: "nameserver 10.43.0.10\nsearch default.svc.cluster.local\noptions ndots:5\n",
 		},
@@ -106,7 +106,7 @@ func guestSpecFixture() VMSpec {
 // TestGuestSpecGolden pins the whole composition against a committed
 // guest-spec.json. Run with -update to regenerate it.
 //
-// THE COMPARISON IS OVER THE DECODED MESSAGE, NOT THE BYTES — the same
+// the COMPARISON IS over the DECODED MESSAGE, not the bytes — the same
 // discipline TestCreateVMWritesTheMachineDescription and apis/guest/v1's own
 // goldens use. protojson deliberately varies its whitespace between runs, so a
 // byte comparison would be flaky in a way that says nothing about the contract.
@@ -125,7 +125,7 @@ func TestGuestSpecGolden(t *testing.T) {
 	}
 	goldenPath := filepath.Join("testdata", VMGuestSpecFileName)
 	if *update {
-		// The COMMITTED bytes are re-indented with encoding/json. protojson
+		// The committed bytes are re-indented with encoding/json. protojson
 		// inserts inconsistent whitespace on purpose (to discourage exactly the
 		// byte comparison this test does not do), and the golden's whole value
 		// is that a human reads it in a review — so it is normalized for the
@@ -145,7 +145,7 @@ func TestGuestSpecGolden(t *testing.T) {
 		t.Fatalf("read golden: %v", err)
 	}
 	var want guestv1.GuestSpec
-	// UNKNOWN FIELDS ARE REJECTED, exactly as the guest init's own reader
+	// unknown FIELDS are rejected, exactly as the guest init's own reader
 	// rejects them: a golden carrying a field guest/v1 no longer has must fail
 	// here rather than be silently ignored into a passing test.
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(raw, &want); err != nil {
@@ -158,7 +158,7 @@ func TestGuestSpecGolden(t *testing.T) {
 }
 
 // TestGuestSpecAgreesWithTheMachineDescription pins the two equalities
-// guest.proto REQUIRES between the pair of specs one host writes together: the
+// guest.proto requires between the pair of specs one host writes together: the
 // agent port and the Rosetta flag. A disagreement makes the guest unreachable
 // (the host would dial a port nothing listens on) or fails the boot outright
 // (the helper refuses a Rosetta share it does not attach).
@@ -188,7 +188,7 @@ func TestGuestSpecAgreesWithTheMachineDescription(t *testing.T) {
 }
 
 // TestGuestSpecFileNameIsTheGuestsOwnFileName pins the one string the host
-// writer and the guest reader share. The guest reads an ABSOLUTE GUEST path
+// writer and the guest reader share. The guest reads an absolute GUEST path
 // (guestinit.SpecPath) and the host writes into a host directory, so the
 // filename is the whole of their overlap — and a drift in it would present as a
 // guest that boots, mounts its share, and finds nothing in it.
@@ -202,7 +202,7 @@ func TestGuestSpecFileNameIsTheGuestsOwnFileName(t *testing.T) {
 	}
 }
 
-// TestBuildGuestSpecReadsOnlyTheStructuredResolver is the NEGATIVE that proves
+// TestBuildGuestSpecReadsOnlyTheStructuredResolver is the negative that proves
 // no string-reparsing path exists.
 //
 // GuestNetworkConfig carries the DNS configuration twice — structured and
@@ -211,7 +211,7 @@ func TestGuestSpecFileNameIsTheGuestsOwnFileName(t *testing.T) {
 // the rendered string would be re-parsing its own output to refill the message
 // the proto shape exists to keep structured, and the bug would be INVISIBLE in
 // the golden (both forms describe the same configuration). So the fixture here
-// carries ONLY the rendered string: the honest answer is an absent resolv_conf.
+// carries only the rendered string: the honest answer is an absent resolv_conf.
 func TestBuildGuestSpecReadsOnlyTheStructuredResolver(t *testing.T) {
 	t.Parallel()
 
@@ -471,8 +471,8 @@ func TestBuildGuestSpecIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestGuestSpecRoundTripsThroughGuestInit is where the TWO ENDS OF THE CONTRACT
-// MEET IN ONE TEST: what this package composes is fed to the REAL
+// TestGuestSpecRoundTripsThroughGuestInit is where the two ENDS OF the contract
+// MEET IN one TEST: what this package composes is fed to the real
 // pkg/guestinit.Plan — the same entry point the initramfs's PID 1 calls — and
 // the plan it produces must mount exactly the tags the share plan declared.
 //
@@ -613,11 +613,11 @@ func TestParseQuantityBytes(t *testing.T) {
 }
 
 // TestCreateVMWritesTheGuestSpec is the WRITER's gate: the boot contract lands
-// in the k3sm.spec share root, BEFORE the helper is spawned, sealed read-only,
-// and decodes as a guestv1.GuestSpec with unknown fields REJECTED — the same
+// in the k3sm.spec share root, before the helper is spawned, sealed read-only,
+// and decodes as a guestv1.GuestSpec with unknown fields rejected — the same
 // strictness the guest init reads it with.
 //
-// The ORDERING assertion is the load-bearing one. The k3sm.spec share is forced
+// The ordering assertion is the load-bearing one. The k3sm.spec share is forced
 // read-only at the VZ device, so the only window in which the file is not yet
 // protected is the one before any guest exists; asserting that the spawner saw
 // the file already committed is what pins that window shut.
@@ -629,7 +629,7 @@ func TestCreateVMWritesTheGuestSpec(t *testing.T) {
 	spec.Network, spec.Containers, spec.Volumes = fixture.Network, fixture.Containers, fixture.Volumes
 
 	specPath := filepath.Join(spec.PodDir, guestinit.SpecShareTag, VMGuestSpecFileName)
-	// The observation is taken INSIDE the spawner, which is the exact instant
+	// The observation is taken inside the spawner, which is the exact instant
 	// the helper is handed its arguments — the earliest moment a guest could
 	// begin to exist. Observing anywhere later (in the health probe, say) would
 	// pass even if the write had been moved after the spawn, which is precisely
@@ -676,7 +676,7 @@ func TestCreateVMWritesTheGuestSpec(t *testing.T) {
 }
 
 // TestCreateVMRefusesAnUncomposableSpec pins the fail-closed hook: a share plan
-// the composer cannot express fails the boot BEFORE a helper is spawned, rather
+// the composer cannot express fails the boot before a helper is spawned, rather
 // than producing a guest that mounts something nobody planned.
 func TestCreateVMRefusesAnUncomposableSpec(t *testing.T) {
 	root := t.TempDir()
@@ -709,7 +709,7 @@ func (f *fakeSpawner) count() int {
 
 // specWatchingSpawner records whether a path existed at the instant of the
 // spawn, then delegates. It is the only seam from which the write-then-spawn
-// ORDERING is observable: everything later in CreateVM runs after a guest could
+// ordering is observable: everything later in CreateVM runs after a guest could
 // already exist.
 type specWatchingSpawner struct {
 	path    string

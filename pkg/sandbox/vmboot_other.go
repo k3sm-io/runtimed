@@ -20,13 +20,13 @@ package sandbox
 
 import "context"
 
-// CreateVM is the OFF-DARWIN typed refusal.
+// CreateVM is the off-DARWIN typed refusal.
 //
 // The live boot is real (vmboot_darwin.go): it spawns the k3sm-vmhost helper and
 // waits for the guest agent to answer. It is darwin-only by construction — the
 // helper is a macOS binary carrying com.apple.security.virtualization, and the
 // readiness handshake crosses a Virtualization.framework vsock device — so on
-// every other lane this REFUSES with a typed error instead of compiling code
+// every other lane this refuses with a typed error instead of compiling code
 // that would fail later at a syscall with a worse message.
 //
 // The refusal is unreachable in practice: SelectBackend consults

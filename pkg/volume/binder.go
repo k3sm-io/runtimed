@@ -35,7 +35,7 @@ import (
 // configured on its StorageClass. It is a consumer-side seam (like
 // mount.Resolver): runtimed never reads the apiserver, so the provider — which
 // holds the StorageClass — wires one, and tests fake it. A nil TemplateResolver,
-// or an ok==false result, means EMPTY-CREATE (the M3 default-class hot path, no
+// or an ok==false result, means empty-CREATE (the M3 default-class hot path, no
 // clonefile). The returned dir is a host path cloned (CoW) into the fresh PVC dir
 // exactly once, on first create.
 type TemplateResolver interface {
@@ -72,7 +72,7 @@ type Binding struct {
 	// ReadOnly is the claim's read-only intent: the dir gets a read-only SBPL scope
 	// (no write allow) rather than read+write.
 	ReadOnly bool
-	// Seeded is true iff THIS call seeded the dir from a template (first create);
+	// Seeded is true iff this call seeded the dir from a template (first create);
 	// false on empty-create and on every reuse (seed-once).
 	Seeded bool
 	// Links are the symlink paths created inside the pod rootfs (one per container
@@ -111,12 +111,12 @@ func NewBinder(class storagev1.LocalPathClass, cloner image.Cloner, template Tem
 func (b *Binder) Class() storagev1.LocalPathClass { return b.class }
 
 // Bind ensures every PVC-backed volume in box has its stable per-claim dir on the
-// APFS storage root — EMPTY-CREATED, or SEEDED-once from a template — and symlinks
+// APFS storage root — empty-created, or SEEDED-once from a template — and symlinks
 // each container mount of it into rootfs so the confined pod reaches the persistent
 // dir at its mount path. The returned bindings' DataDirs are the SBPL read/write
 // scope the caller widens the profile with.
 //
-// Bind NEVER deletes anything: a PV dir is lifecycle-decoupled from the pod
+// Bind never deletes anything: a PV dir is lifecycle-decoupled from the pod
 // (ReclaimPolicy Retain), so a pod restart / delete leaves it intact and the next
 // pod that mounts the same claim reuses it. A box with no PVC volumes returns nil.
 func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string) ([]Binding, error) {
@@ -170,7 +170,7 @@ func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string)
 
 // materialize resolves the stable dir for (namespace, claimName) and ensures it
 // exists: a reuse (dir already present) is returned untouched (seed-once); a fresh
-// claim is SEEDED-once from a template when one is configured, else EMPTY-CREATED
+// claim is SEEDED-once from a template when one is configured, else empty-created
 // (never a clonefile on the empty hot path).
 func (b *Binder) materialize(ctx context.Context, namespace, claimName string) (dataDir string, seeded bool, err error) {
 	dataDir, err = b.class.DataDir(namespace, claimName)
@@ -184,7 +184,7 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName string) (
 	}
 
 	// Fresh claim. Seed-once from a template if one is configured; the clonefile
-	// path is reached ONLY here, never on the empty-PVC hot path.
+	// path is reached only here, never on the empty-PVC hot path.
 	if b.template != nil {
 		src, ok, terr := b.template.Template(ctx, namespace, claimName)
 		if terr != nil {

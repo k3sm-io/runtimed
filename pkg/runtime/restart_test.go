@@ -24,7 +24,7 @@ import (
 )
 
 // TestRestartContainerReExecs is the M2.8 RestartContainer proof: a restart
-// terminates the container's process group and re-spawns it FROM THE SAME SPEC
+// terminates the container's process group and re-spawns it from the same SPEC
 // through the startContainer path (same SBPL profile + exec-shim drop), bumping
 // restart_count; an unknown pod or container is NOT_FOUND.
 func TestRestartContainerReExecs(t *testing.T) {
@@ -62,7 +62,7 @@ func TestRestartContainerReExecs(t *testing.T) {
 		if resp.GetStatus().GetState().GetRunning() == nil {
 			t.Errorf("restarted container should be Running, got %+v", resp.GetStatus().GetState())
 		}
-		// A NEW process was spawned via startContainer (the re-exec).
+		// A new process was spawned via startContainer (the re-exec).
 		sp.mu.Lock()
 		spawnsAfter := len(sp.specs)
 		sp.mu.Unlock()

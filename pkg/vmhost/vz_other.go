@@ -29,13 +29,13 @@ import (
 // build. Compare with errors.Is.
 var ErrVZUnavailable = errors.New("vmhost: Virtualization.framework is not available in this build (needs darwin + cgo)")
 
-// NewVZMachine is the OFF-PLATFORM constructor. It always fails with
+// NewVZMachine is the off-PLATFORM constructor. It always fails with
 // ErrVZUnavailable.
 //
 // The stub is what keeps the rest of this package honest. Everything except
 // realize and vzRunner is pure Go, so with this file in place `go vet`, `go build`
 // and the whole table-driven test suite — FromSpec's validation matrix, the
-// lifecycle state machine, the proxy relay — run on ANY lane, including a Linux CI
+// lifecycle state machine, the proxy relay — run on any lane, including a Linux CI
 // runner and a Mac with no entitlement. Without it, the package's build tag would
 // be the package's test coverage.
 func NewVZMachine(cfg MachineConfig, log *slog.Logger) (machineRunner, vsockDialer, error) {

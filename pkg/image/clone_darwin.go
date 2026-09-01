@@ -25,7 +25,7 @@ import (
 )
 
 // APFSCloner is the production Cloner: it copies via an APFS copy-on-write clone
-// (unix.Clonefile — the x/sys binding, NOT hand cgo) and falls back to a byte
+// (unix.Clonefile — the x/sys binding, not hand cgo) and falls back to a byte
 // copy on EXDEV (src and dst on different volumes) or ENOTSUP/EOPNOTSUPP (the
 // filesystem is not APFS). The cache and pod rootfs must share an APFS volume for
 // the clone to succeed; the fallback keeps materialize working otherwise.

@@ -38,9 +38,9 @@ import (
 // The M8 lab run (the-lab-host, 2026-08-30) measured both halves of the same
 // image: mlx-serve's own ENTRYPOINT /bin/python3.12 failed
 // FAILURE_REASON_SIGNATURE_REJECTED with "no such file or directory", while the
-// byte-identical imported image invoked with a RELATIVE argv[0] ran to
+// byte-identical imported image invoked with a relative argv[0] ran to
 // Succeeded. Only the leading slash differed, so the two arms must be tested
-// together — a table over ONE of them cannot see the discriminator at all.
+// together — a table over one of them cannot see the discriminator at all.
 //
 // # Why this is not vacuous
 //
@@ -68,7 +68,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 	cases := []struct {
 		name string
 		// container builds the container spec under test. hostBin is an absolute
-		// path to a real file OUTSIDE any pod rootfs — the host binary the M0
+		// path to a real file outside any pod rootfs — the host binary the M0
 		// conventions name.
 		container func(hostBin string) *runtimev1.Container
 		// entrypoint is the image config's ENTRYPOINT for the pulled rows (the
@@ -77,14 +77,14 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 		// want is the path the spawn seam must receive as argv[0].
 		want func(rootfs, hostBin string) string
 		// hostBinary records whether the row is a host-binary route, where the
-		// signature gate must CHECK and never ad-hoc sign.
+		// signature gate must check and never ad-hoc sign.
 		hostBinary bool
-		// wantErrContains, when set, makes the row a REFUSAL: CreatePod must fail
+		// wantErrContains, when set, makes the row a refusal: CreatePod must fail
 		// with a message containing it and nothing may be spawned.
 		wantErrContains string
 	}{
 		{
-			// THE BLOCKER. The image's own ENTRYPOINT is absolute, as every
+			// the BLOCKER. The image's own ENTRYPOINT is absolute, as every
 			// python-based image's is; it names a file in the IMAGE.
 			name: "pulled_image_absolute_entrypoint",
 			container: func(string) *runtimev1.Container {
@@ -94,7 +94,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 			want:       func(rootfs, _ string) string { return filepath.Join(rootfs, "bin/python3.12") },
 		},
 		{
-			// The same rule for the OTHER producer of argv: a pod-supplied
+			// The same rule for the other producer of argv: a pod-supplied
 			// absolute command, which overrides the image's entrypoint.
 			name: "pulled_image_absolute_pod_command",
 			container: func(string) *runtimev1.Container {
@@ -104,7 +104,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 			want:       func(rootfs, _ string) string { return filepath.Join(rootfs, "bin/python3.12") },
 		},
 		{
-			// THE COUNTERFACTUAL, pinned unchanged-green: the same image invoked
+			// the COUNTERFACTUAL, pinned unchanged-green: the same image invoked
 			// relatively already worked and must keep working byte-for-byte.
 			name: "pulled_image_relative_entrypoint",
 			container: func(string) *runtimev1.Container {
@@ -133,7 +133,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 		},
 		{
 			// Containment: an image-supplied argv[0] may not name a path above its
-			// own root. The tree carries a decoy "escape" INSIDE the rootfs and the
+			// own root. The tree carries a decoy "escape" inside the rootfs and the
 			// harness plants one in the parent dir, so an unguarded join would
 			// resolve to a real, signable file — the refusal is the only thing
 			// standing between the daemon and spawning it.
@@ -179,7 +179,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 			box := hostBinBox(rt, podID)
 			box.Containers = []*runtimev1.Container{tc.container(hostBin)}
 
-			// The decoy the containment rows aim at: a file in the rootfs's PARENT,
+			// The decoy the containment rows aim at: a file in the rootfs's parent,
 			// so "/../escape" would resolve to something that exists and would pass
 			// the signature gate if the join were not bounded.
 			decoy := filepath.Join(filepath.Dir(rootfs), "escape")
@@ -239,7 +239,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 			if got := signer.paths(); len(got) == 0 || got[0] != want {
 				t.Errorf("signature gate checked %v, want it to start at %q", got, want)
 			}
-			// A host binary is checked and NEVER ad-hoc re-signed (gateSignature).
+			// A host binary is checked and never ad-hoc re-signed (gateSignature).
 			if tc.hostBinary && len(signer.signedPaths()) != 0 {
 				t.Errorf("host binary was ad-hoc signed at %v; a host route must only check", signer.signedPaths())
 			}

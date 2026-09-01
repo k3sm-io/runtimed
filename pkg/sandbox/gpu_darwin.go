@@ -38,7 +38,7 @@ const (
 
 // probeHostFacts reads the host GPU facts from sysctl.
 //
-// Every read DEGRADES rather than fails: a sysctl this kernel does not have leaves
+// Every read degrades rather than fails: a sysctl this kernel does not have leaves
 // its field at the zero value. That is the right posture because these facts are
 // reported alongside an availability verdict the caller has already decided from
 // the functional Metal probe — a missing chip string must not be able to flip a

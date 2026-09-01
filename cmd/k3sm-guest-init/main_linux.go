@@ -33,19 +33,19 @@ limitations under the License.
 //	pseudo-filesystems -> read guest-spec.json -> render /etc -> pod mounts ->
 //	hostname -> Rosetta binfmt registration -> per-container rootfs overlays ->
 //	init containers sequentially -> main containers -> vsock GuestAgent ->
-//	reap loop -> Stop(grace): TERM -> grace -> KILL -> sync -> poweroff.
+//	reap loop -> Stop(grace): term -> grace -> KILL -> sync -> poweroff.
 //
-// The GuestAgent comes up AFTER the containers on purpose: its Health is the
+// The GuestAgent comes up after the containers on purpose: its Health is the
 // host's boot-deadline probe, so an agent answering earlier would report a
 // guest that is ready for a pod it has not started.
 //
-// NOT YET IN THIS BINARY, and deliberately so — each is its own slice with its
+// not yet IN this BINARY, and deliberately so — each is its own slice with its
 // own gate: the eth0 DHCP client (so /etc/hosts carries no leased address yet,
 // and HealthResponse.guest_ip is empty), the per-container cgroup2 leaves (so
 // Stats omits every container rather than reporting zeros), per-container log
 // capture (so Logs reports that the output is on the VM console instead of
 // serving an empty stream), and pty allocation (so a tty exec is refused rather
-// than run without a terminal). A spec requesting an idmapped mount is REFUSED
+// than run without a terminal). A spec requesting an idmapped mount is refused
 // rather than mounted without the idmap.
 package main
 
@@ -144,7 +144,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 
-	// The reaper is started BEFORE the first container, so no exit can happen
+	// The reaper is started before the first container, so no exit can happen
 	// while nothing is reaping.
 	sigchld := make(chan struct{}, 1)
 	chld := make(chan os.Signal, 1)
@@ -158,7 +158,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
-	// The ContainerEvents fan-out. It is created BEFORE the reaper because the
+	// The ContainerEvents fan-out. It is created before the reaper because the
 	// reaper's exit callback publishes to it, and before the containers because
 	// an exit that happened before the agent was serving still has to reach the
 	// bus — a subscriber that arrives later misses it, but the alternative is a
@@ -171,7 +171,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		OnExit: func(ev guestinit.ExitEvent) {
 			log.Info("container exit observed", "container", ev.Container,
 				"exit_code", ev.Status.ExitCode, "signal", ev.Status.Signal)
-			// OOMKilled is deliberately NOT set here. It is the one fact only
+			// OOMKilled is deliberately not set here. It is the one fact only
 			// the guest can supply, and this init does not yet read the cgroup2
 			// memory.events that would prove it — so it is left false rather
 			// than guessed, because upstream treats OOMKilled as the pod's own
@@ -214,7 +214,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 	podID, err := guestagent.PodIDFromCmdline(string(rawCmdline))
 	if err != nil {
-		// FATAL, not degraded. An agent that does not know its own pod cannot
+		// fatal, not degraded. An agent that does not know its own pod cannot
 		// perform the rejection guest.proto requires of it, and one that accepted
 		// every pod_id would answer Exec, Logs and Stats for a pod it is not.
 		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
@@ -246,7 +246,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 // readSpec reads and decodes the host-written GuestSpec.
 //
-// Unknown fields are REJECTED. The file is the proto-JSON encoding of
+// Unknown fields are rejected. The file is the proto-JSON encoding of
 // GuestSpec and nothing else, so a key this binary does not know means the
 // host and the initramfs disagree about the contract — which must fail at boot
 // with a legible reason rather than silently drop whatever the host asked for.
@@ -390,7 +390,7 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 // spawn forks and execs one container's process inside its composed rootfs.
 //
 // The child is chrooted, credentialed and given its own session before the
-// exec; the working directory is applied AFTER the chroot, so it is a path
+// exec; the working directory is applied after the chroot, so it is a path
 // inside the container. Nothing here waits on the child: PID 1's reaper is the
 // only process that may wait(2), and a second waiter would race it for the
 // exit status.

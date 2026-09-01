@@ -115,7 +115,7 @@ func findShare(cfg MachineConfig, tag string) (ShareConfig, bool) {
 	return ShareConfig{}, false
 }
 
-// TestMachineConfigFromSpec is B227's translator gate. FromSpec carries ALL the
+// TestMachineConfigFromSpec is B227's translator gate. FromSpec carries all the
 // validation between an untranslated proto and a machine this helper is willing to
 // boot, so this is the table that says what "willing" means.
 //
@@ -125,7 +125,7 @@ func findShare(cfg MachineConfig, tag string) (ShareConfig, bool) {
 // message, an ancestor pair that undoes a read-only flag through the parent
 // device, a clamp that wraps instead of saturating.
 //
-// EVERY assertion is a t.Run subtest of this ONE function on purpose: the gate runs
+// every assertion is a t.Run subtest of this one function on purpose: the gate runs
 // `go test -run '^TestMachineConfigFromSpec$'`, so a sibling top-level Test* would
 // be silently filtered out and never run.
 //
@@ -151,7 +151,7 @@ func TestMachineConfigFromSpec(t *testing.T) {
 		if cfg.Boot.KernelPath != testKernel || cfg.Boot.InitramfsPath != testInitramfs {
 			t.Errorf("boot = %+v, want the spec's artifacts", cfg.Boot)
 		}
-		// Carried verbatim, PLUS the pod-id parameter FromSpec appends (see the
+		// Carried verbatim, plus the pod-id parameter FromSpec appends (see the
 		// dedicated subtest below for why it has to).
 		if want := "console=hvc0 quiet " + guestagent.PodIDCmdlineKey + "=pod-abc"; cfg.Boot.Cmdline != want {
 			t.Errorf("cmdline = %q, want %q", cfg.Boot.Cmdline, want)
@@ -322,7 +322,7 @@ func TestMachineConfigFromSpec(t *testing.T) {
 
 	t.Run("rejects-ancestor-share-roots", func(t *testing.T) {
 		// The invariant that makes the read-only flags mean anything: with one
-		// root inside another, the guest reaches the inner tree THROUGH the outer
+		// root inside another, the guest reaches the inner tree through the outer
 		// device, under the OUTER device's flag — so a writable parent silently
 		// hands write access to a read-only child.
 		for _, tc := range []struct {
@@ -358,7 +358,7 @@ func TestMachineConfigFromSpec(t *testing.T) {
 	})
 
 	t.Run("sibling-prefix-roots-are-not-ancestors", func(t *testing.T) {
-		// The string-prefix trap: /a/rootfs-old is NOT under /a/rootfs. Rejecting
+		// The string-prefix trap: /a/rootfs-old is not under /a/rootfs. Rejecting
 		// it would break legitimate plans, so the check is on path components.
 		spec := baseSpec()
 		spec.Shares = []*guestv1.VMShare{
@@ -532,7 +532,7 @@ func TestMachineConfigFromSpec(t *testing.T) {
 	})
 
 	t.Run("carries-the-pod-id-on-the-kernel-command-line", func(t *testing.T) {
-		// The guest has NO OTHER WAY to learn its own pod id: guest/v1's GuestSpec
+		// The guest has NO other way to learn its own pod id: guest/v1's GuestSpec
 		// carries no pod_id field, yet guest.proto requires the agent to reject a
 		// pod_id that is not the pod it booted. Without this the agent could not
 		// perform that check at all — it would either accept every id or fail every
@@ -564,7 +564,7 @@ func TestMachineConfigFromSpec(t *testing.T) {
 		})
 
 		t.Run("a-disagreeing-cmdline-is-refused", func(t *testing.T) {
-			// The only case that could make a guest answer for the WRONG pod, so
+			// The only case that could make a guest answer for the wrong pod, so
 			// it is a rejection rather than an overwrite: silently correcting it
 			// would hide a producer bug that is about identity.
 			spec := baseSpec()

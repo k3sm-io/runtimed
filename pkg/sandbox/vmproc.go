@@ -35,18 +35,18 @@ import (
 )
 
 // vmBootDeadline bounds spec-write -> spawn -> VM attach -> guest boot -> agent
-// handshake for ONE pod.
+// handshake for one pod.
 //
 // DERIVATION, not a round number. The M11 S1 spike measured create->guest-token
 // at 165 ms median / 172 ms max on one uncontended VM; a live d9 smoke on the
-// same rig measured the WHOLE chain — helper spawn through a Health round trip
+// same rig measured the whole chain — helper spawn through a Health round trip
 // over agent.sock — at 668-707 ms across five runs. So 30 s is roughly forty
 // times the observed worst case, which is the margin a node under real pod
 // churn needs: several guests booting at once contend for CPU, page cache and
 // the APFS clone the rootfs share was just built from, and none of that shows
 // up in a single-VM measurement.
 //
-// It is a CEILING, never a delay — readiness ends the wait the instant the agent
+// It is a ceiling, never a delay — readiness ends the wait the instant the agent
 // answers, and a helper that dies first ends it sooner still (CreateVM races the
 // poll against Process.Done). The bound exists so a guest that will never boot
 // fails one pod in bounded time instead of holding a CreatePod RPC open forever.
@@ -58,7 +58,7 @@ const vmBootDeadline = 30 * time.Second
 // is per-pod, runs only during boot, and stops at the first success.
 const vmHealthPollInterval = 50 * time.Millisecond
 
-// vmHealthAttemptTimeout bounds ONE readiness attempt. Without it a dial into a
+// vmHealthAttemptTimeout bounds one readiness attempt. Without it a dial into a
 // socket the helper has bound but whose guest is still booting could block past
 // the whole deadline inside a single attempt, and the exit-watch arm below would
 // never be re-evaluated — a helper that died mid-boot would then be reported as
@@ -72,7 +72,7 @@ const vmHealthAttemptTimeout = 2 * time.Second
 // memory per pod.
 const vmHelperLogTailLines = 32
 
-// VMBootCause names WHY a vm pod's guest never reached readiness.
+// VMBootCause names why a vm pod's guest never reached readiness.
 //
 // Every one of them surfaces to the caller as FAILURE_REASON_SANDBOX_SETUP,
 // because at the enum level they are all "the sandbox could not be set up" and
@@ -98,7 +98,7 @@ const (
 	// VMBootSpawnFailed: posix_spawn of the helper failed. The helper never ran,
 	// so there is no stderr and no console.
 	VMBootSpawnFailed VMBootCause = "spawn-failed"
-	// VMBootHelperDied: the helper exited BEFORE the agent answered. Its own
+	// VMBootHelperDied: the helper exited before the agent answered. Its own
 	// stderr tail is the diagnosis and is carried in the error.
 	VMBootHelperDied VMBootCause = "helper-died-pre-ready"
 	// VMBootAgentNeverReady: the helper stayed alive but no Health round trip
@@ -149,13 +149,13 @@ func (e *VMBootError) Unwrap() error { return e.Err }
 // GuestHealthFunc round-trips a guest/v1 Health RPC over a helper's agent socket
 // and reports whether the guest answered.
 //
-// READINESS IS AN RPC, NEVER A SOCKET DIAL. The helper binds and accepts on
-// agent.sock BEFORE the machine is created (cmd/k3sm-vmhost listens, then runs
+// Readiness is an RPC, never a socket dial. The helper binds and accepts on
+// agent.sock before the machine is created (cmd/k3sm-vmhost listens, then runs
 // the lifecycle), so a successful connect proves only that the helper is alive —
 // it says nothing about the guest, and treating it as readiness would report
 // every pod Running the instant its helper started. Only a Health response
 // crosses the whole chain: unix socket -> helper proxy -> vsock -> the guest
-// agent, which guest-init starts as its LAST boot step precisely so answering it
+// agent, which guest-init starts as its last boot step precisely so answering it
 // means the pod is up.
 //
 // It is a seam so the whole readiness state machine — the deadline, the
@@ -253,7 +253,7 @@ func (l *logTail) String() string {
 // StopVM terminates the pod's vm host helper and releases everything the spine
 // recorded for it. It is idempotent: a pod with no live helper succeeds.
 //
-// ONE GRACE BUDGET, TWO PROCESSES. The wait is max(the caller's grace, the budget
+// one GRACE budget, two PROCESSES. The wait is max(the caller's grace, the budget
 // the helper was actually given) — never less than the helper's. The helper
 // answers SIGTERM by asking the guest to stop, waiting out its own budget, and
 // only then halting the machine; a daemon that escalated to SIGKILL first would
@@ -284,7 +284,7 @@ func (b *VMBackend) stopProc(ctx context.Context, vp *vmProc, grace time.Duratio
 		"pod", vp.podID, "pid", vp.pgid, "wait", wait.String(), "escalated", escalated, "exit_observed", observed)
 	if !observed {
 		// The helper did not die within the observation bound. Teardown must not
-		// hang on it, so we continue — but the record is KEPT (below) so the next
+		// hang on it, so we continue — but the record is kept (below) so the next
 		// daemon start's sweep re-evaluates it, which is the only thing that can
 		// still catch a helper holding a live VM.
 		b.logger().Warn("vm host helper exit not observed; its record is kept for the next startup sweep",
@@ -299,7 +299,7 @@ func (b *VMBackend) stopProc(ctx context.Context, vp *vmProc, grace time.Duratio
 // hardStop is the failure-path teardown: SIGKILL the helper's group with no
 // grace, then release its record and run dir.
 //
-// No grace, deliberately. It is reached only when the boot FAILED, so there is no
+// No grace, deliberately. It is reached only when the boot failed, so there is no
 // workload to terminate gracefully and no guest state worth syncing — and the
 // alternative, spending a grace budget on a guest that never came up, delays the
 // pod's failure by exactly that budget for nothing.
@@ -315,16 +315,16 @@ func (b *VMBackend) hardStop(vp *vmProc) {
 	b.cleanupVMRunDir(vp)
 }
 
-// StopAllVMs stops every live helper CONCURRENTLY and returns the joined errors.
+// StopAllVMs stops every live helper concurrently and returns the joined errors.
 //
-// CONCURRENCY IS REQUIRED, NOT AN OPTIMIZATION. This runs on daemon shutdown,
+// CONCURRENCY IS required, not AN OPTIMIZATION. This runs on daemon shutdown,
 // inside launchd's 45-second ExitTimeOut. Each helper's graceful stop can spend
 // up to VMHostMaxStopGrace (30 s), so stopping serially blows the timeout with
 // two vm pods — and launchd's answer to a blown timeout is SIGKILL of the daemon,
 // which strands exactly the helpers this sweep exists to stop. Fanning out makes
 // the whole node's cost one budget rather than one per pod.
 //
-// Each helper is stopped with ITS OWN recorded grace, not a shared one: the
+// Each helper is stopped with ITS own recorded grace, not a shared one: the
 // budget is the pod's promise to its workload and does not become shorter because
 // the pod happens to be shutting down alongside others.
 func (b *VMBackend) StopAllVMs(ctx context.Context) error {
@@ -372,7 +372,7 @@ func (b *VMBackend) VMDone(podID string) (<-chan struct{}, bool) {
 }
 
 // VMHelperOutput returns the retained tail of a live helper's combined output, or
-// a stated absence. It is the diagnosis for a helper that died AFTER readiness,
+// a stated absence. It is the diagnosis for a helper that died after readiness,
 // where the pod is already Running and the boot-time error path is long gone.
 func (b *VMBackend) VMHelperOutput(podID string) string {
 	b.mu.Lock()

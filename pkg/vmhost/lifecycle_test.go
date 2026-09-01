@@ -32,7 +32,7 @@ import (
 // fakeMachine is the machineRunner seam: it records the order of the calls it
 // received and lets a test decide when Wait returns.
 //
-// The ORDER RECORD is the point. Shutdown correctness here is not "did every step
+// The order RECORD is the point. Shutdown correctness here is not "did every step
 // happen" but "did they happen in the order that keeps a graceful stop from
 // becoming a power cut", so every seam appends to one shared log and the
 // assertions read that log.
@@ -147,10 +147,10 @@ func quietLogger() *slog.Logger {
 
 // TestLifecycleStateMachine is B227's lifecycle gate. It drives the New -> Starting
 // -> Running -> Stopping -> Stopped|Failed machine through every transition and
-// pins the shutdown ORDER, which is the property the whole design turns on
+// pins the shutdown order, which is the property the whole design turns on
 // (the M11 plan's Resolution 5).
 //
-// EVERY assertion is a t.Run subtest of this ONE function on purpose: the gate runs
+// every assertion is a t.Run subtest of this one function on purpose: the gate runs
 // `go test -run '^TestLifecycleStateMachine$'`, so a sibling top-level Test* would
 // be silently filtered out and never run.
 //
@@ -196,7 +196,7 @@ func TestLifecycleStateMachine(t *testing.T) {
 	})
 
 	t.Run("a-failed-start-is-still-torn-down", func(t *testing.T) {
-		// THE LEAK THIS CLOSES. The darwin runner races the framework's boot
+		// the LEAK this CLOSES. The darwin runner races the framework's boot
 		// against ctx, so a Start that reports ctx.Err() can have left a machine
 		// that goes on to finish booting — a VM with no supervisor, outliving the
 		// process that made it. Run is the last holder of the runner, so if it
@@ -221,7 +221,7 @@ func TestLifecycleStateMachine(t *testing.T) {
 
 	t.Run("a-failed-start-whose-stop-also-fails-still-reports-the-start-error", func(t *testing.T) {
 		// The teardown is best-effort SALVAGE, not a second failure mode: the
-		// caller needs to read WHY the machine could not start, and a stop error
+		// caller needs to read why the machine could not start, and a stop error
 		// on a machine that never started would bury it.
 		rec := &callLog{}
 		m := newFakeMachine(rec)
@@ -285,7 +285,7 @@ func TestLifecycleStateMachine(t *testing.T) {
 	})
 
 	t.Run("a-guest-that-exits-within-grace-is-never-halted", func(t *testing.T) {
-		// The other half of the same rule: the hard stop must NOT fire when the
+		// The other half of the same rule: the hard stop must not fire when the
 		// graceful path worked. A machine.Stop here would be the power cut the
 		// grace budget existed to avoid.
 		rec := &callLog{}
@@ -310,7 +310,7 @@ func TestLifecycleStateMachine(t *testing.T) {
 	})
 
 	t.Run("an-unreachable-agent-still-halts-the-machine", func(t *testing.T) {
-		// The agent is a DIFFERENT FAILURE DOMAIN — it lives in the guest, over
+		// The agent is a different FAILURE DOMAIN — it lives in the guest, over
 		// vsock — so its failure must not become the helper's. A helper that
 		// returned here would leave a running VM with no pod, reapable only by
 		// timeout.
@@ -492,10 +492,10 @@ func assertCalls(t *testing.T, got, want []string) {
 // linked into the daemon and this package imports Code-Hex/vz, so neither may
 // import the other, and a test that can import both is where the agreement lives.
 //
-// A DISAGREEMENT IS THE POWER-CUT BUG. The daemon computes the grace the helper
+// A DISAGREEMENT IS the POWER-CUT BUG. The daemon computes the grace the helper
 // will actually honour (sandbox.clampStopGrace, applying these same two bounds)
 // and makes its own SIGTERM->SIGKILL escalation at least that long. If the
-// daemon's ceiling were the LOWER of the two, it would SIGKILL a helper still
+// daemon's ceiling were the lower of the two, it would SIGKILL a helper still
 // inside its graceful sequence — the guest asked to stop, mid-sync — which is the
 // hard stop the whole grace protocol exists to avoid. If it were the higher, a
 // deleted pod's teardown would idle for the difference on every vm pod.

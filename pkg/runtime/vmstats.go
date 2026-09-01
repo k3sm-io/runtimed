@@ -27,7 +27,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// guestStatsTimeout bounds ONE on-demand guest-agent Stats call.
+// guestStatsTimeout bounds one on-demand guest-agent Stats call.
 //
 // A stats scrape must not be hostage to a wedged guest: without a deadline a
 // single unresponsive agent would hold ListPodStats — and therefore the node's
@@ -44,7 +44,7 @@ const guestStatsTimeout = 2 * time.Second
 // upstream kubelet owns (Initialized / Ready / ContainersReady / PodScheduled);
 // qualifying it is the form upstream defines for a non-standard pod condition,
 // and it makes a future upstream type of the same short name impossible to
-// collide with. It exists so that "this pod has no figures" is a STATED fact an
+// collide with. It exists so that "this pod has no figures" is a stated fact an
 // operator can read in `kubectl describe pod` — the alternative to omission is
 // reporting zeros, and a zero working set is indistinguishable from an idle
 // workload, which is a lie the metering surface must not tell.
@@ -60,7 +60,7 @@ const (
 	guestStatsReasonUnreachable = "GuestAgentUnreachable"
 )
 
-// guestStatsRecord is the outcome of a vm pod's LAST on-demand guest-agent Stats
+// guestStatsRecord is the outcome of a vm pod's last on-demand guest-agent Stats
 // call. Guarded by pod.mu.
 type guestStatsRecord struct {
 	// observed is false until the first Stats attempt. A pod nothing has asked
@@ -78,18 +78,18 @@ type guestStatsRecord struct {
 }
 
 // vmPodStats builds a vm pod's PodStats from the guest agent's cgroup2 sample,
-// pulled ON DEMAND, or nil when there is nothing honest to report.
+// pulled ON demand, or nil when there is nothing honest to report.
 //
-// ON DEMAND, NOT ON A TICK. The host runs no sampling loop against a guest (see
+// ON demand, not ON A TICK. The host runs no sampling loop against a guest (see
 // armMemorySampler's vm refusal): the 1 Hz host sampler exists solely to win the
 // OOM race on the host spine, and the vm path has no such race — the VZ
 // memorySize IS the hypervisor-enforced ceiling and an OOM arrives as a
 // ContainerEvent. Sampling a guest on a tick would buy nothing and cost N idle
 // vsock wakeups per second for data a consumer reads every 15-60 s.
 //
-// UNTRUSTED DATA. Everything in the response is guest-controlled (guest.proto
+// untrusted DATA. Everything in the response is guest-controlled (guest.proto
 // §TRUST). Three narrowings are applied here, at the boundary:
-//   - only containers THIS POD DECLARED are accepted, in the DECLARED order, so
+//   - only containers this POD declared are accepted, in the declared order, so
 //     a guest can neither inject a container the pod never had nor decide the
 //     order the host reports;
 //   - the sample is HOST-stamped, not guest-stamped: a metrics consumer derives
@@ -101,7 +101,7 @@ func (r *Runtime) vmPodStats(ctx context.Context, p *pod) *runtimev1.PodStats {
 	podID := p.box.GetPodId()
 	resp, err := r.guestStats(ctx, podID)
 	if err != nil {
-		// OMITTED, never zeros. The pod says why in its condition instead.
+		// omitted, never zeros. The pod says why in its condition instead.
 		r.recordGuestStats(p, false, guestStatsReasonUnreachable, boundGuestMessage(err.Error()))
 		r.log.Debug("vm pod stats unavailable", "pod", podID, "err", err)
 		return nil
@@ -135,7 +135,7 @@ func (r *Runtime) vmPodStats(ctx context.Context, p *pod) *runtimev1.PodStats {
 		totalCPU += cpu.GetUsageCoreNanoSeconds()
 	}
 	ps.Memory = &runtimev1.MemoryStats{Timestamp: ts, WorkingSetBytes: totalWS}
-	// The pod-level counter is published only when EVERY reported container
+	// The pod-level counter is published only when every reported container
 	// contributed one — the same completeness rule the host path applies, for the
 	// same reason: a partial sum is not a pod total, and being a counter it would
 	// fall when the missing container reappeared.
@@ -170,12 +170,12 @@ func (r *Runtime) guestStats(ctx context.Context, podID string) (*guestv1.StatsR
 }
 
 // vmContainerStats maps the guest's per-container cgroup2 samples onto the
-// runtime/v1 ContainerStats shape, in the pod's DECLARED container order.
+// runtime/v1 ContainerStats shape, in the pod's declared container order.
 //
 // The declared list drives the walk (not the response), which is what makes an
 // undeclared name unrepresentable rather than merely rejected, and bounds the
 // output at the pod's own container count. A declared container the guest did
-// not report is OMITTED — absence is the only honest encoding of "unknown",
+// not report is omitted — absence is the only honest encoding of "unknown",
 // exactly as guest.proto says of the response itself.
 func vmContainerStats(box *runtimev1.PodBox, resp *guestv1.StatsResponse, ts *timestamppb.Timestamp) []*runtimev1.ContainerStats {
 	samples := make(map[string]*guestv1.GuestContainerStats, len(resp.GetContainers()))
@@ -199,7 +199,7 @@ func vmContainerStats(box *runtimev1.PodBox, resp *guestv1.StatsResponse, ts *ti
 			Memory: &runtimev1.MemoryStats{
 				Timestamp: ts,
 				// cgroup2 memory.current - memory.stat inactive_file, as the
-				// kubelet defines a working set (guest.proto). It is a DIFFERENT
+				// kubelet defines a working set (guest.proto). It is a different
 				// kernel's figure from the host path's ri_phys_footprint; the
 				// provenance is why guest/v1 keeps its own message type.
 				WorkingSetBytes: gcs.GetMemoryWorkingSetBytes(),

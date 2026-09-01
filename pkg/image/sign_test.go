@@ -40,7 +40,7 @@ func (f fakeInspector) Notarized(context.Context, string) (bool, error) {
 	return f.notarized, f.err
 }
 
-// TestCheckSignaturePolicy is the decision table for the gate, INCLUDING the
+// TestCheckSignaturePolicy is the decision table for the gate, including the
 // fail-closed UNSPECIFIED case (acceptance support for M1.1-a3's reject half and
 // the apis fail-closed contract).
 func TestCheckSignaturePolicy(t *testing.T) {
@@ -51,7 +51,7 @@ func TestCheckSignaturePolicy(t *testing.T) {
 		insp    fakeInspector
 		wantErr error
 	}{
-		// FAIL-CLOSED: unspecified policy always refuses.
+		// fail-closed: unspecified policy always refuses.
 		{
 			name:    "unspecified-fails-closed",
 			policy:  runtimev1.SignaturePolicy_SIGNATURE_POLICY_UNSPECIFIED,

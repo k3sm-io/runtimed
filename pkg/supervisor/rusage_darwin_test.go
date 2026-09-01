@@ -27,7 +27,7 @@ import (
 )
 
 // TestPhysFootprinterSelf exercises the real proc_pid_rusage cgo binding against
-// THIS process (root-free, deterministic): a live process has a non-zero
+// this process (root-free, deterministic): a live process has a non-zero
 // ri_phys_footprint. This proves the binding links and reads a sane value — the
 // production memory sampler depends on it (the symbol itself is canaried in
 // internal/spicanary). The OOMKilled-on-a-real-limit path is the m2.sh e2e.
@@ -52,7 +52,7 @@ func TestPhysFootprinterDeadPidErrors(t *testing.T) {
 }
 
 // TestPhysFootprinterRUsageSelf exercises the real proc_pid_rusage CPU path
-// against THIS process (root-free): a live process has both a non-zero
+// against this process (root-free): a live process has both a non-zero
 // ri_phys_footprint and a non-zero cumulative CPU time, and the CPU counter is
 // MONOTONE across samples (the property metrics-server's rate computation
 // requires — it rejects a sample pair whose later cumulative value is smaller).
@@ -111,7 +111,7 @@ func TestPhysFootprinterRUsageSelf(t *testing.T) {
 	}
 	// A busy loop consumes at least a large fraction of a core for the interval.
 	// One tenth of the wall time is far below any plausible scheduling shortfall
-	// and far ABOVE the ~1/41.67 an unscaled mach-tick reading would produce.
+	// and far above the ~1/41.67 an unscaled mach-tick reading would produce.
 	if delta < wall/10 {
 		t.Errorf("CPU delta %v is implausibly small for %v of busy-looping — "+
 			"the mach-absolute-time scaling looks to be missing", delta, wall)

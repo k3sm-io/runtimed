@@ -45,10 +45,10 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// THE M11.2-d9 LIVE VM-BOOT SMOKE: a real k3sm-vmhost, a real Virtualization
+// the M11.2-d9 LIVE VM-BOOT SMOKE: a real k3sm-vmhost, a real Virtualization
 // machine, a real Linux guest, driven by a real in-process runtime.Runtime.
 //
-// WHAT IT IS FOR, given the unit tier already exists. The unit gate (a8) drives
+// what IT IS for, given the unit tier already exists. The unit gate (a8) drives
 // the whole boot state machine against fake spawn/reap/health seams, which proves
 // the LOGIC — the readiness race, the deadline kill, the grace arithmetic, the
 // orphan decision. It cannot prove the two things only hardware can answer:
@@ -58,15 +58,15 @@ import (
 // root nothing created, which every fake-seam test had waved through because its
 // share plan was empty.
 //
-// It is NOT behind the `integration` build tag, deliberately, and for the reason
+// It is not behind the `integration` build tag, deliberately, and for the reason
 // TestIntegrationMetalMatmulUnderProfile gives: a lab-only gate that stops
 // COMPILING is a gate nobody notices is broken until the lab needs it. It stays
-// in the ordinary build and SKIPS, so `go test ./...` on any machine keeps it
+// in the ordinary build and skips, so `go test ./...` on any machine keeps it
 // honest without running it.
 //
 // IT DECLARES ITS INPUTS, it does not discover them. There is no hunting for a
 // kernel on the filesystem and no PATH lookup for the helper: the kernel and
-// modules are named by environment, and the helper is BUILT AND SIGNED FROM THIS
+// modules are named by environment, and the helper is built and SIGNED from this
 // TREE, so the smoke can never accidentally certify a helper someone else left
 // lying around.
 
@@ -76,7 +76,7 @@ const (
 	// uncompressed `Image`, which is what VZLinuxBootLoader takes).
 	envSmokeKernel = "K3SM_VM_SMOKE_KERNEL"
 	// envSmokeModules is an optional colon-separated list of absolute .ko paths
-	// to load, IN THE ORDER GIVEN, before the guest agent binds. Stock distro
+	// to load, IN the order GIVEN, before the guest agent binds. Stock distro
 	// kernels ship AF_VSOCK as a module, so a lab using one names
 	// vsock.ko:vmw_vsock_virtio_transport_common.ko:vmw_vsock_virtio_transport.ko
 	// here. A kernel with vsock built in leaves it unset.
@@ -91,11 +91,11 @@ const smokeBootBudget = 90 * time.Second
 // requireEntitledHelper fails unless the vm backend reports itself usable with
 // the helper this test just built.
 //
-// IT IS A PROBE, NOT AN ASSUMPTION, and it is the SECOND of two gates. The first
+// IT IS A PROBE, not AN ASSUMPTION, and it is the second of two gates. The first
 // (k3smtest.SkipUnless(VZ), called before anything is built) is an operator's
 // CLAIM about the machine; this is the daemon's own five-term conjunction —
 // darwin, macOS >= 26, +[VZVirtualMachine isSupported], the helper resolves, and
-// that helper's signature is VALID and carries
+// that helper's signature is valid and carries
 // com.apple.security.virtualization. A rig where the claim holds and the probe
 // does not is the interesting case (an unsigned or mis-signed helper, or a
 // malformed entitlements plist, which AMFI accepts into a validly signed binary
@@ -112,7 +112,7 @@ func requireEntitledHelper(t *testing.T, helper string) {
 	}
 }
 
-// buildSignedVMHost builds cmd/k3sm-vmhost from THIS TREE and ad-hoc signs it
+// buildSignedVMHost builds cmd/k3sm-vmhost from this TREE and ad-hoc signs it
 // with cmd/k3sm-vmhost/vmhost.entitlements.
 //
 // Building it here rather than taking a path is what makes the smoke a test of
@@ -146,12 +146,12 @@ func buildSignedVMHost(t *testing.T) string {
 // buildSmokeInitramfs composes the lab initramfs from testdata/vmsmokeguest plus
 // whatever modules the lab declared, and returns its path.
 //
-// THE ARCHIVE IS BUILT, NEVER COMMITTED. A checked-in initramfs would be a
+// the ARCHIVE IS built, never committed. A checked-in initramfs would be a
 // multi-megabyte opaque blob nobody could review, and it would drift silently
 // from guest/v1 the first time that contract changed.
 //
 // It shells out to cpio rather than writing newc bytes here, for a scope reason
-// rather than a laziness one: a pure-Go BYTE-DETERMINISTIC newc writer is a named
+// rather than a laziness one: a pure-Go byte-DETERMINISTIC newc writer is a named
 // M11.2-d3 deliverable with its own golden gate, and a second implementation in a
 // test file is exactly the drifting duplicate that gate exists to prevent. This
 // archive only has to be readable by one kernel, once.
@@ -178,7 +178,7 @@ func buildSmokeInitramfs(t *testing.T, modules []string) string {
 	}
 	t.Logf("lab guest /init sha256=%s", sha256File(t, init))
 
-	// Modules are staged with a NUMERIC PREFIX preserving the declared order:
+	// Modules are staged with a numeric PREFIX preserving the declared order:
 	// the guest loads them lexically, and finit_module does no dependency
 	// resolution, so vsock's virtio transport must not sort before the common
 	// layer it needs.
@@ -251,7 +251,7 @@ func smokeArtifacts(t *testing.T) (sandbox.GuestArtifactLocator, string) {
 	}, kernel
 }
 
-// newSmokeRuntime builds a Runtime whose vm backend is the REAL one, wired to the
+// newSmokeRuntime builds a Runtime whose vm backend is the real one, wired to the
 // built helper and the composed artifacts, over the given state root.
 //
 // Only the two seams the smoke cannot supply are faked (image pull/unpack), and
@@ -280,7 +280,7 @@ func newSmokeRuntime(t *testing.T, root, helper string, artifacts sandbox.GuestA
 // TestIntegrationVMBootSmokeLifecycle is legs 1 and 2: a vm pod boots to Running
 // through a real guest handshake, and DeletePod leaves neither helper nor socket.
 func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
-	// The capability gate runs BEFORE anything is built: an ordinary
+	// The capability gate runs before anything is built: an ordinary
 	// `go test ./...` on a non-lab machine must cost a skip, not a helper build.
 	k3smtest.SkipUnless(t, k3smtest.VZ)
 	helper := buildSignedVMHost(t)
@@ -290,7 +290,7 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 	root := smokeRoot(t)
 	rt := newSmokeRuntime(t, root, helper, artifacts)
 	const podID = "smoke-lifecycle"
-	// The safety net for EVERY exit path, registered before anything can boot:
+	// The safety net for every exit path, registered before anything can boot:
 	// a failed assertion mid-test must not leave a virtual machine running.
 	t.Cleanup(func() { killSmokeHelpers(t, root, podID) })
 
@@ -313,7 +313,7 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 		}
 		t.Logf("SMOKE leg 1 OK: create -> guest Health -> Running in %s", elapsed)
 
-		// A SECOND, INDEPENDENT round trip, through the daemon's own GuestDialer
+		// A second, independent round trip, through the daemon's own GuestDialer
 		// rather than the backend's readiness probe. It proves the socket the
 		// helper bound is the socket the Exec/GetLogs route reaches — the two
 		// derivations agree — which the boot alone does not show.
@@ -331,7 +331,7 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 		if !health.GetReady() {
 			t.Errorf("guest reports ready=false")
 		}
-		// The BOOT CONTRACT actually reached the share the guest mounts. It is
+		// The BOOT contract actually reached the share the guest mounts. It is
 		// asserted POST-BOOT, on the real share root the helper exported, so it
 		// covers the one thing the unit tier cannot: that the directory
 		// CreateVM writes into is the directory the machine attaches under the
@@ -403,13 +403,13 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 // smokeDaemonEnv marks the re-executed child that plays the DAEMON in leg 3.
 const smokeDaemonEnv = "K3SM_VM_SMOKE_DAEMON"
 
-// TestIntegrationVMBootSmokeOrphanSweep is leg 3: a daemon killed WITHOUT
+// TestIntegrationVMBootSmokeOrphanSweep is leg 3: a daemon killed without
 // teardown leaves its helper alive, and the next daemon's startup sweep kills it.
 //
-// THE DAEMON IS A REAL SUBPROCESS, and it has to be. The property under test is
+// the DAEMON IS A real SUBPROCESS, and it has to be. The property under test is
 // what survives a `kill -9` of the process that spawned the helper, and a test
 // binary cannot SIGKILL itself and go on asserting. So the test re-executes
-// ITSELF (the standard os/exec helper-process pattern) into
+// itself (the standard os/exec helper-process pattern) into
 // TestVMBootSmokeDaemonHelperProcess, which builds the same Runtime over the same
 // state root, creates the pod, and parks. The parent then SIGKILLs it — no
 // teardown, no Close, no chance to clean up — which is exactly the state the
@@ -487,7 +487,7 @@ func TestIntegrationVMBootSmokeOrphanSweep(t *testing.T) {
 	t.Logf("SMOKE leg 3 OK: the startup sweep killed orphan pid %d and cleared %s", orphan, runDir)
 }
 
-// TestVMBootSmokeDaemonHelperProcess is NOT a test. It is the daemon half of
+// TestVMBootSmokeDaemonHelperProcess is not a test. It is the daemon half of
 // leg 3, run only in the re-executed child, and it exits without ever returning
 // so the parent's SIGKILL is what ends it.
 func TestVMBootSmokeDaemonHelperProcess(t *testing.T) {
@@ -514,7 +514,7 @@ func TestVMBootSmokeDaemonHelperProcess(t *testing.T) {
 
 // --- lab helpers ------------------------------------------------------------
 
-// smokeRoot returns a SHORT state root, not t.TempDir().
+// smokeRoot returns a short state root, not t.TempDir().
 //
 // The length is load-bearing rather than fussy: the agent socket is
 // <root>/run/vm/<pod>/agent.sock and a unix socket path is capped near 104 bytes
@@ -579,7 +579,7 @@ func killSmokeHelpers(t *testing.T, root, podID string) {
 // pidAlive reports whether pid exists (signal 0 is the standard existence probe).
 func pidAlive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
-// waitPIDGone waits up to d for pid to disappear, reporting whether it is STILL
+// waitPIDGone waits up to d for pid to disappear, reporting whether it is still
 // ALIVE at the end (so the caller reads `if alive {`).
 func waitPIDGone(pid int, d time.Duration) bool {
 	deadline := time.Now().Add(d)
@@ -631,7 +631,7 @@ func awaitLine(r io.Reader, want string, d time.Duration) error {
 }
 
 // sha256File returns the hex digest of path, so every artifact a run booted from
-// is identified in the log. A smoke that says "it passed" without saying WHICH
+// is identified in the log. A smoke that says "it passed" without saying which
 // kernel and initramfs it passed against is not a reproducible result.
 func sha256File(t *testing.T, path string) string {
 	t.Helper()

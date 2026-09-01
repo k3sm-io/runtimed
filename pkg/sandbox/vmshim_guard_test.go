@@ -24,22 +24,22 @@ import (
 	"testing"
 )
 
-// THE C-LEVEL COUNTERPART OF pkg/vmhost's IMPORT GUARD.
+// the C-level COUNTERPART OF pkg/vmhost's IMPORT GUARD.
 //
 // TestVZIsNotReachableFromTheDaemon proves no daemon package IMPORTS
 // github.com/Code-Hex/vz. It is blind to this file's subject: vm_darwin.m already
-// links Virtualization.framework INTO THE DAEMON (vm_darwin.go's #cgo LDFLAGS), so
+// links Virtualization.framework INTO the DAEMON (vm_darwin.go's #cgo LDFLAGS), so
 // a VM-construction call added there would put the boot path inside the unentitled
 // daemon while `go list -deps` stayed perfectly clean — and the failure mode is not
 // a compile error but an uncaught NSException → SIGABRT that takes the daemon down
 // on every node that is not entitled, which is every node.
 //
-// So the .m file is guarded by SOURCE SCAN, on two axes:
+// So the .m file is guarded by source SCAN, on two axes:
 //
-//   - the ENTRY-POINT COUNT, which vm_darwin.m's own header comment calls
+//   - the ENTRY-point count, which vm_darwin.m's own header comment calls
 //     "load-bearing, not prose" and asks a reviewer to audit the attack surface
 //     against. A count that is a sentence is a count that goes stale; this test
-//     makes the sentence executable, in BOTH files, against the actual
+//     makes the sentence executable, in both files, against the actual
 //     declarations and definitions.
 //   - the FORBIDDEN SELECTORS, the construction/boot half of
 //     Virtualization.framework. Everything the shim is allowed to do is a class
@@ -54,10 +54,10 @@ import (
 // virtual machine. Each is the entry to a code path that requires
 // com.apple.security.virtualization, which this process deliberately does not
 // carry: sending one raises an uncaught NSException the @try/@catch in the shim
-// does NOT reliably contain (the framework aborts inside its own queue), so the
+// does not reliably contain (the framework aborts inside its own queue), so the
 // daemon dies rather than reporting a capability.
 //
-// The list is the CONSTRUCTION surface, not every VZ symbol: the shim legitimately
+// The list is the construction surface, not every VZ symbol: the shim legitimately
 // names VZVirtualMachine (for +isSupported) and VZLinuxRosettaDirectoryShare (for
 // +availability), and a blanket "no VZ identifier" rule would ban the four probes
 // the file exists for.
@@ -117,7 +117,7 @@ func entryPointNames(src string) []string {
 // scanForbiddenSelectors returns one finding per forbidden selector present in
 // src's CODE, naming the selector and the 1-based line it sits on.
 //
-// COMMENTS ARE BLANKED FIRST, and that is not a convenience. The shim's whole
+// COMMENTS are BLANKED FIRST, and that is not a convenience. The shim's whole
 // value as a reviewed artifact is that it EXPLAINS what it refuses to do — its
 // header names +installRosetta…, -initWithError: and VZVirtualMachineConfiguration
 // precisely to record why each is absent. A scanner that fired on that prose would
@@ -136,7 +136,7 @@ func scanForbiddenSelectors(src string) []string {
 	return out
 }
 
-// stripCComments blanks C/Obj-C comments while PRESERVING LINE STRUCTURE, so a
+// stripCComments blanks C/Obj-C comments while preserving LINE structure, so a
 // finding's reported line number is the line in the real file. Both forms are
 // handled (`//` to end of line, `/* */` across lines); a `//` inside a string
 // literal would over-blank, which fails toward silence on a line that a selector
@@ -192,7 +192,7 @@ func stripCComments(src string) string {
 	return b.String()
 }
 
-// TestVMShimEntryPointInventory asserts the .m and .h agree with each other AND
+// TestVMShimEntryPointInventory asserts the .m and .h agree with each other and
 // with their own stated count. The three-way agreement is the point: a new entry
 // point added to the .m alone is caught by the .h comparison, and one added to
 // both while the prose stays at FOUR is caught by the stated count — which is the
@@ -250,7 +250,7 @@ func TestVMShimHasNoVMConstruction(t *testing.T) {
 	}
 }
 
-// TestVMShimScannersGoRed is the NON-VACUITY proof for both scanners above. The
+// TestVMShimScannersGoRed is the non-VACUITY proof for both scanners above. The
 // real files pass by construction, so a scan that could never fail would be
 // indistinguishable from one that always passes; these planted sources are the
 // evidence that a violation is actually detected.

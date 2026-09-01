@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package guestagent is the in-guest half of the k3sm vm-pod boundary: the
 // guest/v1 GuestAgent service that answers Health, ContainerEvents, Exec, Logs,
-// Stats and Stop for the ONE pod its micro-VM booted.
+// Stats and Stop for the one pod its micro-VM booted.
 //
 // It is the far end of a route that already exists. pkg/runtime has shipped the
 // host side — execGuest, getLogsGuest, vmPodStats, watchGuestContainerEvents —

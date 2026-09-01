@@ -38,7 +38,7 @@ import (
 //     its containing directory opaque. Under the native dialect the same bytes
 //     are ordinary files, which is why the two dialects must never share a tree
 //     (they key differently — see UnpackPolicy).
-//   - an ABSOLUTE SYMLINK is ADMITTED, because it resolves against the guest's
+//   - an absolute SYMLINK is ADMITTED, because it resolves against the guest's
 //     root, which is this tree. The native dialect refuses one for the exactly
 //     opposite reason: no chroot stands between a native pod and the host root,
 //     so "/etc/passwd" there names the HOST's file.
@@ -50,7 +50,7 @@ import (
 //     are refused (ErrPathCollision): they are distinct files to Linux and one
 //     file to a case-insensitive APFS volume.
 //
-// Adding this constant is HALF of adding a dialect; the other half is the case
+// Adding this constant is half of adding a dialect; the other half is the case
 // in LayerApplier.applyEntry and in UnpackPolicy.Validate. Both fail closed on
 // an unknown value, so a dialect can never be half-added.
 const SemanticsLinux LayerSemantics = "linux"
@@ -62,7 +62,7 @@ func LinuxUnpackPolicy() UnpackPolicy { return UnpackPolicy{Semantics: Semantics
 // case-insensitive (or normalization-insensitive) filesystem would merge into
 // one file.
 //
-// It is FAIL-CLOSED and fatal to the whole unpack — never a per-entry skip, and
+// It is fail-closed and fatal to the whole unpack — never a per-entry skip, and
 // never a silent merge — because the two outcomes of a merge are both
 // unacceptable: the later entry's content silently replaces the earlier one's
 // under a name the image never wrote, and the resulting tree is then committed
@@ -76,10 +76,10 @@ var ErrPathCollision = errors.New("image: linux layer paths collide on a case-in
 // Changesets") and as produced by every builder that writes an OCI layer.
 const (
 	// whiteoutPrefix marks a deletion: a ".wh.<name>" entry in directory d
-	// deletes d/<name> as contributed by the LOWER layers.
+	// deletes d/<name> as contributed by the lower layers.
 	whiteoutPrefix = ".wh."
 	// whiteoutOpaqueDir marks its containing directory OPAQUE: everything the
-	// lower layers put in it disappears, and only what THIS layer put there
+	// lower layers put in it disappears, and only what this layer put there
 	// remains.
 	whiteoutOpaqueDir = ".wh..wh..opq"
 	// whiteoutMetaPrefix marks AUFS bookkeeping entries (".wh..wh.plnk",
@@ -106,7 +106,7 @@ const (
 // classifyWhiteout reports what kind of whiteout marker name is, and — for
 // whiteoutFile — the tree-relative path it deletes.
 //
-// name MUST already have passed layerEntryPath, so it is relative, cleaned, and
+// name must already have passed layerEntryPath, so it is relative, cleaned, and
 // free of ".." components; the returned target is therefore inside the tree by
 // construction and never needs a second containment proof.
 //
@@ -144,15 +144,15 @@ func classifyWhiteout(name string) (whiteoutKind, string, error) {
 
 // foldKey renders a tree-relative path in the form a case-insensitive,
 // normalization-insensitive APFS volume compares by, so two paths that would
-// land on ONE file share a key.
+// land on one file share a key.
 //
 // It composes the two independent insensitivities this host actually exhibits
 // (both measured on an APFS boot volume): NFC normalization first, so a
 // decomposed "café" and a precomposed "café" agree, then Unicode simple
 // case folding via strings.ToLower.
 //
-// It is deliberately an OVER-approximation of what APFS merges. A false
-// collision REFUSES a legitimate image, which is visible and fixable; a missed
+// It is deliberately an over-approximation of what APFS merges. A false
+// collision refuses a legitimate image, which is visible and fixable; a missed
 // one silently merges two files, which is neither. The residual gap is that
 // strings.ToLower is SIMPLE case folding, so a pair that full folding equates
 // but simple folding does not (the classic "ß"/"SS") is not detected — APFS does
@@ -188,7 +188,7 @@ const (
 // and a setuid-stripped mode, and the TRUTH travels beside it in this record for
 // the guest — which does have a root and a private mount namespace — to apply.
 //
-// # The apply order the guest MUST use
+// # The apply order the guest must use
 //
 // chown → chmod → setxattr, in that order, and the order is not stylistic:
 // chown(2) CLEARS the setuid and setgid bits on most Linux filesystems, so a
@@ -202,26 +202,26 @@ type OwnershipEntry struct {
 	// Type selects the guest's apply calls (see OwnershipEntryType).
 	Type OwnershipEntryType `json:"type"`
 	// UID and GID are the tar header's numeric owner. Names (Uname/Gname) are
-	// deliberately NOT recorded: resolving a name requires the image's own
+	// deliberately not recorded: resolving a name requires the image's own
 	// /etc/passwd, which is a file inside this very tree, so resolution belongs
 	// in the guest and a host-side guess would be wrong for every image that
 	// ships its own users.
 	UID int64 `json:"uid"`
 	GID int64 `json:"gid"`
-	// Mode is the tar header's permission word masked to 0o7777 — the FULL
+	// Mode is the tar header's permission word masked to 0o7777 — the full
 	// mode, setuid/setgid/sticky INCLUDED. This is the field the host copy
 	// cannot carry (see LayerApplier.entryPerm), and it is why the sidecar
 	// exists at all.
 	Mode uint32 `json:"mode"`
 	// Xattrs are the PAX extended attributes the xattr allowlist admitted,
-	// keyed by attribute name. It is EMPTY in every tree this build produces —
+	// keyed by attribute name. It is empty in every tree this build produces —
 	// see xattrAllowlist for the allowlist, and for the documented consequence
 	// (security.capability file capabilities are dropped).
 	Xattrs map[string][]byte `json:"xattrs,omitempty"`
 }
 
-// xattrAllowlist is the CLOSED set of PAX extended attributes carried from a
-// layer tar into the ownership sidecar. It is EMPTY, and the emptiness is the
+// xattrAllowlist is the closed set of PAX extended attributes carried from a
+// layer tar into the ownership sidecar. It is empty, and the emptiness is the
 // decision, not an omission.
 //
 // The consequence, stated where a reader meets it: an image that relies on

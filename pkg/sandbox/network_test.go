@@ -30,7 +30,7 @@ const egressDataVol = "/var/lib/k3sm/pods/pod-egress1/rootfs"
 
 // TestGenerateEgressGolden is acceptance M8.2-a1's egress half: the profile an
 // allow_internet_egress pod runs under is pinned byte-for-byte against
-// testdata/pod-egress.golden.sb — the DOCUMENTED-CEILING form.
+// testdata/pod-egress.golden.sb — the DOCUMENTED-ceiling form.
 //
 // The golden's job is to make the ceiling visible and hard to move. What a reader
 // must be able to see in it: the grant is unfiltered, it names its own ceiling in
@@ -97,7 +97,7 @@ func TestEgressImpliesNetwork(t *testing.T) {
 	}
 }
 
-// TestEgressRetiredRules pins what the egress branch must NOT emit. The
+// TestEgressRetiredRules pins what the egress branch must not emit. The
 // range-based deny set, the tier-3 re-allows, and the kine-loopback deny were
 // retired from this surface: per-IP filters do not
 // compile on macOS 26, so emitting one would not tighten anything — it would make
@@ -238,7 +238,7 @@ func TestValidateNetworkScope(t *testing.T) {
 }
 
 // TestGenerateSelfChecksNetworkScope proves the generator runs the check on its
-// OWN output: every profile Generate returns satisfies ValidateNetworkScope, in
+// own output: every profile Generate returns satisfies ValidateNetworkScope, in
 // both the requested and unrequested directions.
 func TestGenerateSelfChecksNetworkScope(t *testing.T) {
 	for _, tc := range []struct{ network, egress bool }{

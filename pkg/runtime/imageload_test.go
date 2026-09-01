@@ -189,7 +189,7 @@ func storedBlobs(t *testing.T, rt *Runtime) []image.BlobNode {
 // TestLoadImageIngestsOverTheWire is the daemon-side half of the ingest surface:
 // the archive arrives as a client stream, the store ends up holding exactly the
 // blobs the archive's manifest named, digest-addressed, and the reference is
-// recorded in the SAME on-disk index the pull path answers presence from.
+// recorded in the same on-disk index the pull path answers presence from.
 func TestLoadImageIngestsOverTheWire(t *testing.T) {
 	t.Run("a docker-save archive lands blobs and the reference", func(t *testing.T) {
 		client, rt := imagesTestClient(t)
@@ -282,7 +282,7 @@ func TestLoadImageIngestsOverTheWire(t *testing.T) {
 			t.Fatalf("LoadImage error = %v (code %v); want InvalidArgument", err, status.Code(err))
 		}
 		// Not admitted, not admitted-then-flagged: the store is exactly as empty
-		// as it was, INCLUDING the config that precedes the bad layer.
+		// as it was, including the config that precedes the bad layer.
 		if nodes := storedBlobs(t, rt); len(nodes) != 0 {
 			t.Errorf("a refused ingest left %d node(s) in the store: %+v", len(nodes), nodes)
 		}
@@ -339,7 +339,7 @@ func nativeLoadPolicy() image.PlatformPolicy {
 	return image.PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 }
 
-// assertRecorded requires ref to be resolvable from the daemon's REAL on-disk
+// assertRecorded requires ref to be resolvable from the daemon's real on-disk
 // index — not from a test double — so the ingest and the pull path are proven to
 // share one record.
 func assertRecorded(t *testing.T, rt *Runtime, ref string) {

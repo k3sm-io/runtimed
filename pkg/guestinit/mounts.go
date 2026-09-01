@@ -118,7 +118,7 @@ func LinuxMountFlags(opts []MountOption) (uintptr, error) {
 // share appear inside the guest as ContainerUID/ContainerGID. It is how fsGroup
 // is honoured with zero recursive chown on either side.
 //
-// It is PLAN DATA ONLY. The executor does not apply it (see the package doc's
+// It is PLAN DATA only. The executor does not apply it (see the package doc's
 // ceilings) — it refuses a spec that asks for one.
 type IDMap struct {
 	HostUID      int64
@@ -235,7 +235,7 @@ func SpecMount() MountStep {
 	}
 }
 
-// readOnlyBind expands a read-only bind into the TWO mount(2) calls Linux
+// readOnlyBind expands a read-only bind into the two mount(2) calls Linux
 // actually requires. MS_BIND|MS_RDONLY in a single call is silently ignored
 // for the read-only part — the new mount inherits the source's writability —
 // so a bind that skipped the remount would expose a credential file writable
@@ -399,7 +399,7 @@ const (
 	upperSizeCap   int64 = 1 << 30
 )
 
-// UpperSizeBytes is the size bound for ONE container's overlay upper tmpfs,
+// UpperSizeBytes is the size bound for one container's overlay upper tmpfs,
 // given the guest's total RAM and the number of containers sharing it.
 //
 // An unbounded upper is the failure this exists to prevent. tmpfs defaults to
@@ -428,7 +428,7 @@ func UpperSizeBytes(memTotalBytes int64, containers int) int64 {
 	return per
 }
 
-// EtcBindFiles are the pod-level files bound into EVERY container's /etc.
+// EtcBindFiles are the pod-level files bound into every container's /etc.
 //
 // A container is chrooted into its own composed rootfs, so the guest's /etc is
 // invisible to it and the image's own /etc/resolv.conf (frequently a stale
@@ -502,14 +502,14 @@ func RootfsMounts(name, rootfsTag string, upperSizeBytes int64) ([]MountStep, er
 // container's rootfs so they are visible after the chroot, as recursive binds
 // from the pod-level mount onto the container's path.
 //
-// A pod mount is performed ONCE at the guest level and re-exposed per
+// A pod mount is performed once at the guest level and re-exposed per
 // container, rather than mounted N times: a virtiofs share mounted twice is
 // two independent mounts of one host tree, and a PVC mounted twice would have
 // two page caches over the same files.
 //
 // Targets are ordered shortest-first so a nested mount is never shadowed by
 // the mount that would otherwise be stacked over its parent afterwards, and
-// the read-only expansion happens AFTER that ordering so each bind keeps its
+// the read-only expansion happens after that ordering so each bind keeps its
 // remount immediately behind it. The recursive read-only remount applies to
 // the top mount only; a submount of a read-only pod mount is read-only already
 // because the pod-level mount it propagates from is.

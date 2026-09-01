@@ -28,7 +28,7 @@ import (
 )
 
 // sidecarBox builds a PodBox whose init list declares native sidecars (KEP-753:
-// init containers with restart_policy ALWAYS) named scNames, plus the hostBinBox
+// init containers with restart_policy always) named scNames, plus the hostBinBox
 // main container. The pod grace is 30s so graceful teardown SIGTERMs first.
 func sidecarBox(rt *Runtime, podID string, scNames ...string) *runtimev1.PodBox {
 	box := hostBinBox(rt, podID)
@@ -68,8 +68,8 @@ func podPhase(t *testing.T, rt *Runtime, podID string) runtimev1.PodPhase {
 }
 
 // TestNativeSidecarStaysRunning is the M10.2-a1 sequencing proof (sidecar-not-
-// waited): an init list [sidecar(ALWAYS), plain-init(UNSPECIFIED)] spawns the
-// sidecar, does NOT wait it (spawn-equals-started), runs the plain init to
+// waited): an init list [sidecar(always), plain-init(UNSPECIFIED)] spawns the
+// sidecar, does not wait it (spawn-equals-started), runs the plain init to
 // completion while the sidecar is still up, starts the main, and reaches
 // Running. The sidecar reports under init_container_statuses as running with
 // started=true, and is tracked with the pod's long-lived containers.
@@ -79,12 +79,12 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w})
 
 	box := sidecarBox(rt, "pod-sc", "sc")
-	// Append a PLAIN init container AFTER the sidecar: it must run to completion
+	// Append a plain init container after the sidecar: it must run to completion
 	// (pid 1002, pre-released below) while the sidecar (pid 1001) stays blocked.
 	box.InitContainers = append(box.InitContainers, &runtimev1.Container{Name: "ip", Image: "/bin/true"})
 	w.release(1002) // the plain init exits 0 the moment it is waited
 
-	// CreatePod must NOT block on the (never-released) sidecar: run it with a
+	// CreatePod must not block on the (never-released) sidecar: run it with a
 	// timeout guard so a wait-on-sidecar regression fails fast instead of hanging.
 	type createResult struct {
 		resp *runtimev1.CreatePodResponse
@@ -215,13 +215,13 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 }
 
 // TestSidecarMainsOnlyPhase is the M10.2/B74 phase proof: the pod's terminal
-// phase derives from the MAIN containers only. A main exiting 0 makes the pod
+// phase derives from the main containers only. A main exiting 0 makes the pod
 // Succeeded (and tears the sidecar down); a main exiting non-zero makes it
 // Failed; a sidecar exit alone — even a crash — never flips the phase.
 //
-// The teardown assertion holds for BOTH terminal phases and is the delivered
+// The teardown assertion holds for both terminal phases and is the delivered
 // milestone gate, restored after B26 briefly inverted the Failed case: a pod is
-// terminal on Failed too (restartPolicy Never/OnFailure), and Kubernetes RETAINS
+// terminal on Failed too (restartPolicy Never/OnFailure), and Kubernetes retains
 // failed pods, so withholding the teardown there leaks the sidecar process tree
 // forever. See trulyTerminalLocked.
 func TestSidecarMainsOnlyPhase(t *testing.T) {
@@ -360,7 +360,7 @@ func TestSidecarReverseOrderTeardown(t *testing.T) {
 	})
 }
 
-// TestDeletePodSidecarRemainingGrace proves the ONE-pod-level-budget remainder
+// TestDeletePodSidecarRemainingGrace proves the one-pod-level-budget remainder
 // rule (M10.2, bounded timing): with a 1s grace and a main that ignores SIGTERM,
 // phase 1 consumes the entire budget (SIGTERM → 1s timer → SIGKILL), so the
 // sidecars' remainder is <= 0 and phase 2 takes the immediate-SIGKILL path — no
@@ -373,7 +373,7 @@ func TestDeletePodSidecarRemainingGrace(t *testing.T) {
 	)
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
-	// Only SIGKILL releases a process: the main IGNORES SIGTERM and burns the
+	// Only SIGKILL releases a process: the main ignores SIGTERM and burns the
 	// whole budget; the sidecars then exit on their immediate SIGKILLs.
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
@@ -427,7 +427,7 @@ func (b *profileRecordingBackend) recorded() []string {
 
 // TestSidecarRestartPreservesClass proves a provider-driven RestartContainer on
 // an init-declared sidecar re-spawns it with the IDENTICAL confinement (the
-// pod-scoped SBPL profile through WrapCommand) AND the same lifecycle class:
+// pod-scoped SBPL profile through WrapCommand) and the same lifecycle class:
 // still reported under init_container_statuses, still excluded from the
 // mains-only phase, and still torn down after the mains.
 func TestSidecarRestartPreservesClass(t *testing.T) {
@@ -490,8 +490,8 @@ func TestSidecarRestartPreservesClass(t *testing.T) {
 		t.Fatalf("container_statuses after restart = %+v, want only main (class must not flip)", cs)
 	}
 
-	// (3) Still excluded from the mains-only phase AND still torn down after the
-	// mains: the main's voluntary exit concludes the pod and stops the NEW pid.
+	// (3) Still excluded from the mains-only phase and still torn down after the
+	// mains: the main's voluntary exit concludes the pod and stops the new pid.
 	w.release(pidMain)
 	waitFor(t, 5*time.Second, "pod Succeeded on mains alone", func() bool {
 		return podPhase(t, rt, "pod-rc") == runtimev1.PodPhase_POD_PHASE_SUCCEEDED

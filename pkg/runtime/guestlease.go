@@ -26,32 +26,32 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// The vm pod's LIVE TRANSPORT ADDRESS watcher (B237).
+// The vm pod's live transport address watcher (B237).
 //
-// A vm pod has TWO addresses and they are not interchangeable
+// A vm pod has two addresses and they are not interchangeable
 // (runtime.proto, PodStatus.guest_transport_address). pod_ip is the pod's
-// PUBLISHED IDENTITY — the podCIDR /32 this node allocated, which reaches
+// published IDENTITY — the podCIDR /32 this node allocated, which reaches
 // EndpointSlice, DNS and the downward API. The address in this file is the
 // other one: what the HOST dials to reach the guest, leased by the guest's own
 // DHCP client on the node's NAT segment.
 //
-// THE AGENT IS THE ONLY AUTHORITY FOR IT. guest.proto makes HealthResponse
+// the AGENT IS the only AUTHORITY for IT. guest.proto makes HealthResponse
 // guest_ip "the single live-address authority": the host does not re-derive the
 // address from the network attachment, so a lease change is observable in that
 // field and nowhere else. The advisory GuestNetworkConfig.NATSubnet/PodIP the
 // provider stamps onto VMSpec are INTENDED values ("macOS-assigned; an intended
-// value runtimed reconciles from the live attachment") and are deliberately NOT
+// value runtimed reconciles from the live attachment") and are deliberately not
 // used to validate a lease here — checking a live fact against an advisory one
 // would fail closed on exactly the divergence the advisory admits to.
 //
-// SO IT IS POLLED, not pushed. guest/v1 has no lease-change stream, and adding
+// So it is polled, not pushed. guest/v1 has no lease-change stream, and adding
 // one would put the cadence in the guest's hands: a hostile agent could then
 // drive the host's status-publish rate. A host-driven poll bounds that at one
 // publish per pod per interval no matter what the guest does.
 
 // defaultGuestLeasePoll is the base cadence of one pod's Health poll.
 //
-// SECONDS, NOT MILLISECONDS. A DHCP lease is semi-stable — it changes when a
+// SECONDS, not MILLISECONDS. A DHCP lease is semi-stable — it changes when a
 // guest boots or renews onto a different address, which is a per-pod-lifetime
 // event, not a per-second one — so the value being watched barely moves. The
 // cost of the poll is the opposite shape: one vsock round trip per pod per
@@ -66,13 +66,13 @@ const defaultGuestLeasePoll = 5 * time.Second
 // for good must not cost a wakeup every five seconds for the pod's whole life.
 const guestLeasePollMaxBackoff = time.Minute
 
-// guestLeaseHealthTimeout bounds ONE Health RPC, for the same reason
+// guestLeaseHealthTimeout bounds one Health RPC, for the same reason
 // guestStatsTimeout bounds one Stats call: a wedged agent must not hold the
 // watcher — and with it the pod's transport address — hostage by staying
 // silent. It is well above a vsock round trip that reads one cached string.
 const guestLeaseHealthTimeout = 2 * time.Second
 
-// maxGuestLeaseBytes caps the guest-supplied address string BEFORE it is
+// maxGuestLeaseBytes caps the guest-supplied address string before it is
 // parsed. 45 is the longest textual IPv6 address (an IPv4-mapped form,
 // "::ffff:255.255.255.255", plus a zone) — INET6_ADDRSTRLEN - 1. Anything
 // longer cannot be an address, so refusing it early means no parser ever sees
@@ -80,7 +80,7 @@ const guestLeaseHealthTimeout = 2 * time.Second
 const maxGuestLeaseBytes = 45
 
 // The reasons one Health poll can fail to yield a usable lease. They are
-// distinct because they are DIFFERENT FACTS about the guest, and an operator
+// distinct because they are different FACTS about the guest, and an operator
 // reading the node log acts differently on each: unreachable means the agent or
 // the VM is gone (look at the pod's lifecycle), absent means the guest is up but
 // has no lease yet (look at DHCP), and every other reason means the agent
@@ -99,12 +99,12 @@ const (
 
 // armGuestLeaseWatcher starts p's guest-lease watcher, if p is a vm pod.
 //
-// INERT FOR A HOST-PROCESS POD, and inert by the RESOLVED backend (p.isVM),
+// inert for A HOST-PROCESS POD, and inert by the RESOLVED backend (p.isVM),
 // never by the requested one: a Seatbelt-confined pod has no guest, no agent
 // socket and no lease, so it gets no goroutine, no dial and no field — its
 // PodStatus.guest_transport_address stays empty exactly as the contract says.
 //
-// It is armed AFTER registration, by CreatePod, and it REFUSES an unregistered
+// It is armed after registration, by CreatePod, and it refuses an unregistered
 // pod for the reason armMemorySampler does (B26): a goroutine rooted at a pod
 // the daemon has already forgotten can neither be found nor stopped by any
 // later teardown. It is idempotent — a second call for a pod that already has a
@@ -147,8 +147,8 @@ func (r *Runtime) armGuestLeaseWatcher(p *pod) {
 // watchGuestLease polls p's guest agent for its leased address until ctx ends,
 // keeping p's live transport address current.
 //
-// THE FIELD IS NON-EMPTY IFF THE MOST RECENT POLL RETURNED A VALID ADDRESS. A
-// failed, empty or rejected poll therefore CLEARS it rather than leaving the
+// the field is non-empty iff the most recent poll returned a valid address. A
+// failed, empty or rejected poll therefore clears it rather than leaving the
 // last good value standing. That is the deliberate choice, and the reason is
 // that this is a DHCP lease on a shared NAT segment: an address whose guest we
 // can no longer reach may already have been reassigned, so a stale value is not
@@ -158,7 +158,7 @@ func (r *Runtime) armGuestLeaseWatcher(p *pod) {
 //
 // The cost of that choice is churn: a flapping agent alternates the field
 // between an address and empty. It is bounded — the publish happens only on
-// CHANGE, and a change costs one status event per pod per poll interval no
+// change, and a change costs one status event per pod per poll interval no
 // matter what the guest does — which is the second reason this is a host-driven
 // poll rather than a guest-driven stream.
 func (r *Runtime) watchGuestLease(ctx context.Context, p *pod) {
@@ -176,7 +176,7 @@ func (r *Runtime) watchGuestLease(ctx context.Context, p *pod) {
 			// promptly rather than after a backed-off minute.
 			fails = 0
 		default:
-			// The TYPED reason only — never the guest's bytes. The line rides the
+			// The typed reason only — never the guest's bytes. The line rides the
 			// backed-off cadence below, so an agent that answers with junk forever
 			// costs one log line a minute, not one a tick: the backoff is the log
 			// rate limiter as much as it is the wakeup limiter.
@@ -199,7 +199,7 @@ func (r *Runtime) watchGuestLease(ctx context.Context, p *pod) {
 // guestLeaseWait returns the delay before the next poll after fails consecutive
 // failed ones: the base interval doubling to the cap, jittered.
 //
-// THE JITTER IS NOT DECORATION. Every vm pod on a node arms its watcher at
+// the JITTER IS not DECORATION. Every vm pod on a node arms its watcher at
 // pod-create time and then polls on a fixed period; without jitter a node that
 // creates ten pods together keeps those ten polls phase-locked for the pods'
 // whole lives, so the vsock round trips arrive as one burst per interval
@@ -228,7 +228,7 @@ func (r *Runtime) guestLeasePollInterval() time.Duration {
 	return defaultGuestLeasePoll
 }
 
-// pollGuestLease performs ONE bounded Health RPC against podID's guest agent
+// pollGuestLease performs one bounded Health RPC against podID's guest agent
 // and returns the address to publish (empty unless a lease was both reported
 // and accepted) plus the typed reason for what it found.
 //
@@ -248,13 +248,13 @@ func (r *Runtime) pollGuestLease(ctx context.Context, podID string) (addr, reaso
 
 	resp, err := guestv1.NewGuestAgentClient(conn).Health(cctx, &guestv1.HealthRequest{})
 	if err != nil {
-		// The error is NOT quoted onward. It is the one place a guest could put
+		// The error is not quoted onward. It is the one place a guest could put
 		// arbitrary text in front of an operator via this route, and the fact worth
 		// recording — "the agent did not answer" — is already the reason.
 		r.log.Debug("vm pod guest health poll failed", "pod", podID)
 		return "", guestLeaseReasonUnreachable
 	}
-	// ready is deliberately NOT required. guest.proto orders the boot as
+	// ready is deliberately not required. guest.proto orders the boot as
 	// "filesystems mounted, spec read, network configured" before ready, so a
 	// ready=false answer carrying a lease is the narrow window at the end of boot
 	// — and the address is no less true for arriving in it.
@@ -264,37 +264,37 @@ func (r *Runtime) pollGuestLease(ctx context.Context, podID string) (addr, reaso
 // parseGuestLease validates one guest-reported address and returns the
 // canonical form to publish, or "" plus the reason it was refused.
 //
-// EVERYTHING HERE IS UNTRUSTED (guest.proto §TRUST): the workload runs in that
+// EVERYTHING here IS untrusted (guest.proto §TRUST): the workload runs in that
 // guest as root, so this string is attacker-chosen whenever the workload is.
 // The narrowings, in the order they are applied:
 //
-//   - LENGTH FIRST, before any parse, so no parser is ever handed an
+//   - length FIRST, before any parse, so no parser is ever handed an
 //     arbitrarily long guest-chosen string.
-//   - EXACTLY ONE ADDRESS, via netip.ParseAddr — which rejects a port
+//   - exactly one ADDRESS, via netip.ParseAddr — which rejects a port
 //     ("10.0.0.1:80"), a CIDR ("10.0.0.0/8"), a list, a hostname, and a
 //     leading-zero octet. A zone ("fe80::1%eth0") parses, and is refused
 //     separately: a zone names a HOST interface, and a guest does not get to
 //     name one.
-//   - ONE SPELLING. An IPv4-mapped IPv6 address is refused rather than
+//   - one SPELLING. An IPv4-mapped IPv6 address is refused rather than
 //     unmapped, so the same address has exactly one accepted textual form and
 //     no consumer downstream has to canonicalize before comparing — and
 //     "::ffff:127.0.0.1" cannot smuggle a loopback past a v4-shaped check.
-//   - THE VM/NAT FAMILY ONLY. The address must be a PRIVATE UNICAST address
+//   - the VM/NAT FAMILY only. The address must be a PRIVATE UNICAST address
 //     (RFC1918 / ULA), which is what a guest on the macOS vmnet NAT segment
 //     always leases. That refusal covers the whole public Internet, the
 //     documentation and benchmark ranges, loopback, the unspecified address,
 //     every multicast scope, and link-local — where link-local matters twice
 //     over, because 169.254.0.0/16 is what a guest self-assigns when DHCP
-//     FAILED (so it is the absence of a lease, not one) and it contains the
+//     failed (so it is the absence of a lease, not one) and it contains the
 //     cloud metadata address.
 //
-// RESIDUAL, STATED PLAINLY: private-unicast does not pin the lease to THIS
+// residual, stated PLAINLY: private-unicast does not pin the lease to this
 // node's NAT segment, so a hostile agent can still name some other private
 // address — a Service VIP, a peer pod's address. Nothing in this repo can close
 // that, because the only segment fact runtimed holds (GuestNetworkConfig.
 // NATSubnet) is documented ADVISORY and may legitimately differ from what macOS
 // assigned. What bounds the residual is on the consuming side and is a contract,
-// not a check: this address is HOST-SIDE TRANSPORT ONLY and must never be
+// not a check: this address is HOST-side TRANSPORT only and must never be
 // published into EndpointSlice, DNS or status.podIP.
 func parseGuestLease(raw string) (addr, reason string) {
 	if raw == "" {
@@ -327,14 +327,14 @@ func parseGuestLease(raw string) (addr, reason string) {
 // CHANGED, republishes the pod's status so WatchPodStatus subscribers observe
 // it.
 //
-// It rides the pod's ONE status path — podStatus rendered, r.publish fanned out
+// It rides the pod's one status path — podStatus rendered, r.publish fanned out
 // — exactly as the guest ContainerEvents fold and the restart path do. There is
 // no second channel for this field: a consumer learns the address from the same
 // PodStatus stream it learns everything else from, which is what makes the
 // field's "only as durable as the status stream that delivered it" contract
 // true rather than aspirational.
 //
-// The publish happens OUTSIDE p.mu (the house rule for r.publish), and only on
+// The publish happens outside p.mu (the house rule for r.publish), and only on
 // a real change: a poll that re-reports the same address is silent.
 func (r *Runtime) setGuestLease(p *pod, addr string) {
 	p.mu.Lock()

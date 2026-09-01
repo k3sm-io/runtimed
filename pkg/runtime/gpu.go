@@ -23,7 +23,7 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// The GPU facts (M8.2-d4) are evaluated EAGERLY, EXACTLY ONCE, in New and stored
+// The GPU facts (M8.2-d4) are evaluated eagerly, exactly once, in New and stored
 // immutably on the Runtime — the same discipline as the Rosetta conditions
 // (rosetta.go), for the same two reasons: GetRuntimeInfo is a CONCURRENT gRPC
 // handler, so a lazily-populated field would be shared mutable state needing a lock
@@ -38,14 +38,14 @@ import (
 // gpuFactsProto renders the immutable facts as a fresh proto message for one RPC.
 //
 // It is total — it always returns a message, never nil — and that is a wire-contract
-// decision, not a convenience. The apis contract distinguishes an ABSENT gpu field
-// ("this daemon does not report GPU facts at all", an older daemon) from a PRESENT
+// decision, not a convenience. The apis contract distinguishes an absent gpu field
+// ("this daemon does not report GPU facts at all", an older daemon) from a present
 // one carrying metal_available=false ("known to be absent"). A daemon that can
 // probe must therefore always report, or a host with no GPU would be indistinguish-
 // able from a daemon too old to know — and the consumer is required to treat those
 // two differently.
 //
-// Reason is deliberately NOT carried onto the wire: the message is a facts report,
+// Reason is deliberately not carried onto the wire: the message is a facts report,
 // and the probe's own diagnosis belongs in the daemon's log (logGPUProbe), where the
 // operator asking "why is my node not GPU-labelled" is actually looking.
 func gpuFactsProto(f sandbox.GPUFacts) *runtimev1.GPUFacts {
@@ -60,8 +60,8 @@ func gpuFactsProto(f sandbox.GPUFacts) *runtimev1.GPUFacts {
 	}
 }
 
-// logGPUProbe emits the ONE construction-time log line for the GPU probe. Like the
-// Rosetta probes it logs at Info for BOTH outcomes — an absent GPU is normal, not a
+// logGPUProbe emits the one construction-time log line for the GPU probe. Like the
+// Rosetta probes it logs at Info for both outcomes — an absent GPU is normal, not a
 // fault — and it carries the Reason token the wire message does not, because this
 // line is the only place the "why" survives.
 func logGPUProbe(log *slog.Logger, f sandbox.GPUFacts, deviceName string) {

@@ -18,8 +18,8 @@ limitations under the License.
 //
 // A pod is a process group: the supervisor posix_spawns each container (through
 // the sandbox exec-shim, which applies the Seatbelt profile then becomes the pod
-// binary) into its OWN session/process group, wires a combined stdout+stderr
-// pipe for logs, and reaps exits via kqueue(EVFILT_PROC) — the SOLE reaper.
+// binary) into its own session/process group, wires a combined stdout+stderr
+// pipe for logs, and reaps exits via kqueue(EVFILT_PROC) — the sole reaper.
 // kqueue is used deliberately INSTEAD OF os/exec.Cmd.Wait so there is exactly one
 // place that calls wait4; mixing the two double-reaps and races the exit status.
 //

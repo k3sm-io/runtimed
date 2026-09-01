@@ -24,17 +24,17 @@ import (
 )
 
 // ErrNoIsolation reports that no confining backend rung is available for the
-// host, so the runtime MUST refuse to start the pod. It exists so the fallback
-// selection can FAIL CLOSED: when Seatbelt is unavailable (a tripped
+// host, so the runtime must refuse to start the pod. It exists so the fallback
+// selection can fail closed: when Seatbelt is unavailable (a tripped
 // symbol-canary / missing libsandbox SPI) and no stronger rung can run, the
 // answer is "refuse", never "run the pod unconfined".
 var ErrNoIsolation = errors.New("sandbox: no isolation backend available; refusing to run pod unconfined")
 
-// ErrBackendUnavailable reports that the backend a pod EXPLICITLY requested (via
+// ErrBackendUnavailable reports that the backend a pod explicitly requested (via
 // SandboxProfile.backend) cannot be satisfied on this host. It is the fail-closed
 // outcome for an explicit request: a pod that asked for the vm backend (a Linux
 // image / untrusted tenancy) on a host without Virtualization.framework + the
-// com.apple.security.virtualization entitlement is REFUSED here — never silently
+// com.apple.security.virtualization entitlement is refused here — never silently
 // downgraded to the weaker Seatbelt rung (on which a Linux image cannot even exec,
 // and which is not a hard tenancy boundary). Distinct from ErrNoIsolation, which
 // means "the host can confine nothing at all". Compare with errors.Is.
@@ -42,10 +42,10 @@ var ErrBackendUnavailable = errors.New("sandbox: requested backend unavailable; 
 
 // Ladder returns the ordered pod-isolation fallback ladder for the host. The
 // rungs are the apis SandboxBackend kinds; selection prefers Seatbelt and, when
-// it is unavailable, degrades to the STRONGER vm rung — never to a weaker one
+// it is unavailable, degrades to the stronger vm rung — never to a weaker one
 // and never to "unconfined".
 //
-// uidjail is included ONLY when running as root: a per-pod uid jail must
+// uidjail is included only when running as root: a per-pod uid jail must
 // setuid/chown to an unprivileged identity, which is impossible without root.
 // The unprivileged user-space daemon (the _k3sm posture) therefore drops the
 // uidjail rung entirely, leaving [seatbelt, vm] — both of which confine without
@@ -66,15 +66,15 @@ func Ladder(isRoot bool) []runtimev1.SandboxBackend {
 
 // SelectBackend chooses the pod-isolation backend rung for the host, honoring the
 // REQUESTED backend (the provider stamps SandboxProfile.backend) and failing
-// CLOSED. The cases:
+// closed. The cases:
 //
 //   - UNSPECIFIED — the host-process default the provider stamps for a pod with no
 //     vm RuntimeClass: walk the host-OS-gated ladder (selectLadder). Seatbelt is
 //     the preferred rung; if it is unavailable (tripped symbol-canary / missing
-//     SPI) degrade ONLY to the STRONGER vm rung when present — never to a weaker
+//     SPI) degrade only to the stronger vm rung when present — never to a weaker
 //     rung and never to unconfined; if nothing confines, ErrNoIsolation.
 //   - VM — stamped for a Linux-image / untrusted-tenancy pod: require the vm
-//     backend. If it is unavailable, ErrBackendUnavailable — NEVER fall back to
+//     backend. If it is unavailable, ErrBackendUnavailable — never fall back to
 //     Seatbelt (the cardinal M5.1 safety fix: a Linux ELF cannot exec under
 //     Seatbelt, and an untrusted pod must not silently land on the weaker rung).
 //   - SEATBELT_INPROC / SEATBELT_EXEC — an explicit pin: require Seatbelt, else
@@ -117,7 +117,7 @@ func SelectBackend(requested runtimev1.SandboxBackend, isRoot, seatbeltAvailable
 //
 // Seatbelt available → SEATBELT_INPROC (the default rung). Seatbelt unavailable
 // (tripped canary / missing SPI) → degrade only UP the strength ladder, and only
-// to a rung PRESENT on this host. Ladder(isRoot) drops the uidjail rung when not
+// to a rung present on this host. Ladder(isRoot) drops the uidjail rung when not
 // root; uidjail is weaker than Seatbelt regardless, so it is never a degrade
 // target — vm (stronger) is the only one. Nothing confining → ErrNoIsolation.
 func selectLadder(isRoot, seatbeltAvailable, vmAvailable bool) (runtimev1.SandboxBackend, error) {

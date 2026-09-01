@@ -91,15 +91,15 @@ print("GENERATE_OK", len(out))
 // TestIntegrationMetalMatmulUnderProfile is acceptance M8.2-a4: a real MLX matmul
 // runs on the GPU inside the profile Generate produces for allow_gpu.
 //
-// It is the ONLY check that can falsify the Metal allow-set. The unit goldens pin
+// It is the only check that can falsify the Metal allow-set. The unit goldens pin
 // what the generator emits; they cannot know whether those two IOKit user-client
 // classes are the ones Metal actually opens on a given chip family — SBPL class
 // names are data, with no linker-symbol canary behind them. So this test is where
 // a family whose class names differ, or a macOS release that renames one, is
 // caught.
 //
-// It SKIPS off a GPU lab rig (k3smtest gates it on the apple-gpu capability), which
-// is the expected outcome of an ordinary `go test ./...`. It is deliberately NOT
+// It skips off a GPU lab rig (k3smtest gates it on the apple-gpu capability), which
+// is the expected outcome of an ordinary `go test ./...`. It is deliberately not
 // behind the `integration` build tag so it still COMPILES in that run: a lab-only
 // gate that stops compiling is a gate nobody notices is broken until the lab needs
 // it. Naming apple-gpu in K3SM_CI_REQUIRE turns the skip into a failure, which is
@@ -143,7 +143,7 @@ func TestIntegrationMetalMatmulUnderProfile(t *testing.T) {
 	})
 
 	// The one negative that proves the allow-set is load-bearing rather than
-	// decorative: WITHOUT allow_gpu the same script must fail to reach a device.
+	// decorative: without allow_gpu the same script must fail to reach a device.
 	t.Run("denied without allow_gpu", func(t *testing.T) {
 		denied, err := Generate(&runtimev1.SandboxProfile{
 			DataVolumePath: dataVol,
@@ -208,7 +208,7 @@ func gpuPodEnv(dataVol string) []string {
 }
 
 // buildGPUExecShim builds and ad-hoc signs the k3sm-execshim helper so the script
-// runs through the REAL libsandbox path a pod does, not through sandbox-exec.
+// runs through the real libsandbox path a pod does, not through sandbox-exec.
 func buildGPUExecShim(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

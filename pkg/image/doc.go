@@ -20,9 +20,9 @@ limitations under the License.
 //
 // Pipeline:
 //
-//   - Select: choose WHICH manifest of a multi-platform image to pull, from an
+//   - Select: choose which manifest of a multi-platform image to pull, from an
 //     explicit per-pull PlatformPolicy (platform.go). Fail-closed: a
-//     platform-less index child is UNKNOWN and never a candidate, a single
+//     platform-less index child is unknown and never a candidate, a single
 //     manifest is verified against its own config, and no match yields
 //     ErrNoPlatformMatch naming the platforms the image does offer — there is
 //     no path on which go-containerregistry's implicit linux/amd64 default can
@@ -42,15 +42,15 @@ limitations under the License.
 //     answer presence BY REFERENCE — which the digest-keyed blob store cannot.
 //     That record is what makes imagePullPolicy IfNotPresent serve a warm
 //     reference with zero registry traffic and Never satisfiable at all. Index
-//     entries are EDGES, never reachability roots: they can never protect a blob
+//     entries are edges, never reachability roots: they can never protect a blob
 //     from the GC, whose root set stays daemon-authored (see FileIndex,
 //     ImageRoot).
 //
-//   - Ingest: admit an archive that arrived from OUTSIDE the registry path — a
+//   - Ingest: admit an archive that arrived from outside the registry path — a
 //     `docker save` tar or a tarred OCI layout streamed by `k3sm image
 //     load`/`import` (load.go). It reduces to the same store primitives Pull
-//     uses, in a strict order: EVERY blob is re-hashed against the digest the
-//     archive's own manifest claims for it BEFORE a lease is taken or anything
+//     uses, in a strict order: every blob is re-hashed against the digest the
+//     archive's own manifest claims for it before a lease is taken or anything
 //     is committed, so a mismatch rejects the whole load and leaves the store
 //     untouched — not even the blobs that verified. The reference is recorded
 //     last. The docker-save leg's per-blob check is self-consistency (that
@@ -59,11 +59,11 @@ limitations under the License.
 //     digest is pinned. Loaded images are provenance-free by design: no
 //     SignaturePolicy is evaluated here.
 //
-//   - Unpack: apply the image's layer blobs, in manifest order, into ONE tree
+//   - Unpack: apply the image's layer blobs, in manifest order, into one tree
 //     (unpack.go, tarapply.go), staged and committed by a single os.Rename so a
 //     failed unpack commits nothing. The apply is containment-checked twice over
 //     — an os.Root anchored at the tree, plus a name/link-target sanitizer — and
-//     every layer's compressed digest AND decompressed diffID are re-verified on
+//     every layer's compressed digest and decompressed diffID are re-verified on
 //     the one read before the commit.
 //
 //     The DIALECT (LayerSemantics, part of the key) decides both the rules and
@@ -84,7 +84,7 @@ limitations under the License.
 //
 //   - Materialize: copy the unpacked tree into the per-pod rootfs using APFS
 //     copy-on-write via golang.org/x/sys/unix.Clonefile. The cache and pod
-//     rootfs MUST be on the same APFS volume for the clone to succeed; on EXDEV
+//     rootfs must be on the same APFS volume for the clone to succeed; on EXDEV
 //     (cross-device) or ENOTSUP (non-APFS) the copier falls back to copyfile /
 //     byte-copy. Materialization is idempotent and asserts no
 //     com.apple.quarantine xattr is left on the result.
@@ -101,16 +101,16 @@ limitations under the License.
 //
 // # The CAS verification ceiling
 //
-// Cache.CommitBlob is the ONE place the content-addressed store checks that the
+// Cache.CommitBlob is the one place the content-addressed store checks that the
 // bytes it commits hash to the digest they are named by, and it is deliberately a
 // WRITE-time check only. Three limits follow, and none of them is hidden:
 //
 //   - The cache-hit fast path is an os.Stat of a regular file. A blob already on
 //     disk is trusted on its NAME by every reader that does not itself re-hash it.
-//   - Every blob written BEFORE this check existed was never hashed by this repo
+//   - Every blob written before this check existed was never hashed by this repo
 //     at all, so an existing cache carries unverified content indefinitely.
 //   - The check proves the fetcher did not corrupt or substitute what the network
-//     gave it. It does NOT authenticate the image: a wholly hostile FetchFunc
+//     gave it. It does not authenticate the image: a wholly hostile FetchFunc
 //     supplies the manifest the claimed digests come from, so it can make both
 //     sides agree. Authenticity is a signature problem (SignaturePolicy), not a
 //     CAS problem.
@@ -121,7 +121,7 @@ limitations under the License.
 // blob of an image end to end to build the tree, so it re-hashes each one against
 // its manifest descriptor (ErrDigestMismatch) and each layer's decompressed bytes
 // against the config's diffID (ErrDiffIDMismatch) on that single read. So a blob
-// corrupted or substituted on disk AFTER it was committed is caught before it is
+// corrupted or substituted on disk after it was committed is caught before it is
 // unpacked, and therefore before a pod can execute it. The ceiling that remains is
 // exactly the third bullet above: content-addressing is not authenticity.
 //
@@ -132,7 +132,7 @@ limitations under the License.
 // MEANINGLESS for a linux ELF payload destined for a vm pod — spctl has nothing
 // to assess and would either error or vacuously pass.
 //
-// This must NEVER be resolved by adding a "skip the signature gate for a
+// This must never be resolved by adding a "skip the signature gate for a
 // non-Mach-O payload" branch. Such a branch is a fail-open switch a hostile or
 // merely mislabelled image can flip: the payload's format is attacker-chosen
 // data, so "it isn't Mach-O" would become a way to bypass the gate entirely,

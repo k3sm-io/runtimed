@@ -22,10 +22,10 @@ import (
 	"time"
 )
 
-// TestProbeGuestRosettaDoesNotRaise is a VALUE-FREE smoke test of the real
+// TestProbeGuestRosettaDoesNotRaise is a value-free smoke test of the real
 // guest-Rosetta cgo entry point (mirrors TestVMBackendAvailableFalseWithoutEntitlement):
 // it calls +[VZLinuxRosettaDirectoryShare availability] through the Obj-C shim from an
-// ad-hoc-signed, ZERO-entitlement test binary and asserts only that the call RETURNS —
+// ad-hoc-signed, zero-entitlement test binary and asserts only that the call RETURNS —
 // i.e. it neither raises an uncaught NSException → SIGABRT nor requires an entitlement.
 //
 // It deliberately asserts NO value. The answer is host- and toolchain-dependent (a
@@ -49,7 +49,7 @@ func TestProbeGuestRosettaDoesNotRaise(t *testing.T) {
 	}
 }
 
-// TestProbeHostRosettaDoesNotFail is the VALUE-FREE smoke test of the real
+// TestProbeHostRosettaDoesNotFail is the value-free smoke test of the real
 // host-Rosetta probe: it must return a defined state promptly and without an error
 // channel of any kind (the signature has none — a capability absence can never fail
 // daemon startup). Like its guest sibling it asserts no value: this repo's dev Macs
@@ -83,7 +83,7 @@ func TestProbeHostRosettaDoesNotFail(t *testing.T) {
 // the probe hang or report available: the spawn leg is an exec.CommandContext, so a dead
 // ctx kills it and the verdict degrades to TranslationFailed. On a host with no Rosetta
 // the presence leg short-circuits first and the answer is Absent — either way it is
-// NEVER available, and that is the host-independent invariant worth pinning.
+// never available, and that is the host-independent invariant worth pinning.
 func TestProbeHostRosettaHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

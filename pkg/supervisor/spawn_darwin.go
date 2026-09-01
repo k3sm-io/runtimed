@@ -38,10 +38,10 @@ extern char **environ;
 // reaper and the precise file-action fd control the combined-log pipe needs. So
 // cgo it is, isolated in this file behind the Spawner interface.
 //
-// TWO SPELLINGS, ONE MEANING, chosen by DEPLOYMENT TARGET so the build is
+// two SPELLINGS, one MEANING, chosen by DEPLOYMENT TARGET so the build is
 // warning-free on either:
 //
-//   - posix_spawn_file_actions_addchdir     â the POSIX-standard name, NEW in
+//   - posix_spawn_file_actions_addchdir     â the POSIX-standard name, new in
 //     macOS 26.0. Not declared at all by an older SDK.
 //   - posix_spawn_file_actions_addchdir_np  â the Darwin/BSD extension it
 //     replaced (macOS 10.15+), DEPRECATED as of macOS 26.0.
@@ -59,27 +59,27 @@ extern char **environ;
 #define k3sm_spawn_addchdir posix_spawn_file_actions_addchdir_np
 #endif
 
-// k3sm_posix_spawn spawns argv[0] with argv/envp in its OWN session (and thus
+// k3sm_posix_spawn spawns argv[0] with argv/envp in its own session (and thus
 // its own process group, since the session leader's pgid == its pid), chdir'ing
 // into dir when dir is non-NULL and dup2'ing logFD onto the child's stdout(1)
 // and stderr(2) when logFD >= 0. Returns 0 and writes the pid to *outPid on
 // success, or an errno.
 //
-// A dir that cannot be chdir'd into FAILS THE SPAWN with that chdir's errno
+// A dir that cannot be chdir'd into FAILS the SPAWN with that chdir's errno
 // (ENOENT / ENOTDIR / EACCES) and no child survives it â posix_spawn evaluates
 // file actions in the kernel and reports the first failure to the caller. There
 // is no arm in which the child runs with the caller's cwd instead; the Go side
 // (planSpawn) refuses an unusable dir before it gets here, and this is the
 // TOCTOU backstop behind that refusal.
 //
-// POSIX_SPAWN_SETSID alone is used (NOT also POSIX_SPAWN_SETPGROUP): on macOS the
+// POSIX_SPAWN_SETSID alone is used (not also POSIX_SPAWN_SETPGROUP): on macOS the
 // two together return EPERM, because a freshly-created session leader cannot also
 // be setpgid'd. SETSID already gives the pod a fresh process group led by the
 // child (pgid == child pid), which is what DeletePod signals, and detaches it
 // from the daemon's controlling tty.
 //
-// SETSIGMASK + SETSIGDEF reset the child's signal STATE, which is
-// SECURITY/CORRECTNESS-CRITICAL for graceful termination. The supervisor is a Go
+// SETSIGMASK + SETSIGDEF reset the child's signal state, which is
+// SECURITY/CORRECTNESS-critical for graceful termination. The supervisor is a Go
 // process, and the Go runtime BLOCKS most signals on its worker threads; a raw
 // posix_spawn (unlike os/exec, which resets it) leaves the child with the CALLING
 // THREAD's signal mask, and execve PRESERVES a blocked mask. Without SETSIGMASK a
@@ -189,7 +189,7 @@ func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		envp = envArr.ptr
 	}
 
-	// Resolve (and refuse) the working directory BEFORE any allocation: an
+	// Resolve (and refuse) the working directory before any allocation: an
 	// unusable Dir must fail typed, never fall back to the daemon's cwd.
 	plan, err := planSpawn(spec)
 	if err != nil {

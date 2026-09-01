@@ -23,10 +23,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestRlimitShimArgvRoundTrip is the B7 argv-codec slice: the resolved NUMERIC
-// rlimit plan and the qos flag each encode as ONE fixed-position shim argv token
-// (inserted BEFORE the profile path), decode back to the identical plan, and any
-// malformed/truncated token is a shim-FATAL error (fail-closed under daemon/shim
+// TestRlimitShimArgvRoundTrip is the B7 argv-codec slice: the resolved numeric
+// rlimit plan and the qos flag each encode as one fixed-position shim argv token
+// (inserted before the profile path), decode back to the identical plan, and any
+// malformed/truncated token is a shim-fatal error (fail-closed under daemon/shim
 // binary skew — never skip-with-warning, never exec without the handed limits).
 //
 // The encode expectations are HAND-WRITTEN GOLDEN LITERALS on purpose (never
@@ -45,7 +45,7 @@ func TestRlimitShimArgvRoundTrip(t *testing.T) {
 				want: "-",
 			},
 			{
-				// 8 is darwin RLIMIT_NOFILE — the codec carries the NUMERIC selector;
+				// 8 is darwin RLIMIT_NOFILE — the codec carries the numeric selector;
 				// the RLIMIT_* name table stays daemon-side only.
 				name: "single-entry",
 				plan: []PlannedRlimit{{Resource: 8, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}},
@@ -144,12 +144,12 @@ func TestRlimitShimArgvRoundTrip(t *testing.T) {
 }
 
 // TestNormalizeNOFILE is the pure-arithmetic table for the darwin RLIMIT_NOFILE
-// taxonomy (B7): darwin setrlimit(2) returns EINVAL — NOT a clamp — for
+// taxonomy (B7): darwin setrlimit(2) returns EINVAL — not a clamp — for
 // rlim_cur=RLIM_INFINITY (or beyond OPEN_MAX) on RLIMIT_NOFILE, so an
-// infinite/oversized soft limit is clamped DOWN to min(OPEN_MAX ceiling, hard)
+// infinite/oversized soft limit is clamped down to min(OPEN_MAX ceiling, hard)
 // before the syscall; and a too-tight soft limit is floored UP to minNOFILESoft
 // so sandbox_compile's profile read and the exec'd image's dyld (+ the
-// DYLD-inserted DNS shim) do not starve for descriptors AFTER confinement.
+// DYLD-inserted DNS shim) do not starve for descriptors after confinement.
 func TestNormalizeNOFILE(t *testing.T) {
 	inf := uint64(unix.RLIM_INFINITY)
 	cases := []struct {

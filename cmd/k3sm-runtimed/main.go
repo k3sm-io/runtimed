@@ -19,7 +19,7 @@ limitations under the License.
 // confine → posix_spawn/kqueue supervise) behind a gRPC server on a root unix
 // socket. The k3sm Virtual Kubelet provider dials that socket.
 //
-// The daemon and the provider are the SAME k3sm build, restarted together
+// The daemon and the provider are the same k3sm build, restarted together
 // (same-binary, same-node hard cut), so there is no independent-upgrade skew and
 // no version-negotiation handshake — GetRuntimeInfo reports the daemon's
 // identity/health for diagnostics only.
@@ -124,7 +124,7 @@ func run(socketPath, root, version string, log *slog.Logger) error {
 	// never fatal: the daemon is exiting either way, so it must not mask the
 	// serve error.
 	//
-	// It sits HERE and not in Serve because Serve's contract is a listener loop a
+	// It sits here and not in Serve because Serve's contract is a listener loop a
 	// caller may end (by closing its listener) while keeping the Runtime; daemon
 	// shutdown is this function.
 	if err := rt.Close(); err != nil {

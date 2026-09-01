@@ -23,7 +23,7 @@ import (
 )
 
 // UnixDropper performs the privilege-drop syscalls via golang.org/x/sys/unix
-// (setgid / setgroups / setuid). These are NOT private SPI — they are standard
+// (setgid / setgroups / setuid). These are not private SPI — they are standard
 // POSIX calls — but they are process-wide and irreversible on Darwin, so
 // UnixDropper is only ever used from the single-purpose exec-shim process (never
 // the daemon). It is the production half of the supervisor.LaunchSeam drop steps;
@@ -65,7 +65,7 @@ func (UnixDropper) Setpriority(which, who, prio int) error {
 }
 
 // Setrlimit applies one POSIX resource limit via setrlimit(2). Called from the
-// exec-shim BEFORE the uid drop, while euid is still 0, so a hard-limit raise is
+// exec-shim before the uid drop, while euid is still 0, so a hard-limit raise is
 // permitted. setrlimit(2) is a standard POSIX call (not private SPI) but, like the
 // drop, is process-global, so UnixDropper is only ever used from the exec-shim.
 func (UnixDropper) Setrlimit(resource int, lim unix.Rlimit) error {

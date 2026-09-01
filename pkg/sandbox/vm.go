@@ -45,7 +45,7 @@ const vmMinMacOSMajor = 26
 // guest agent), but it is darwin-only by construction: the helper is a macOS
 // binary carrying com.apple.security.virtualization and the readiness handshake
 // crosses a Virtualization.framework vsock device. On any other lane — the
-// pure-Go CGO_ENABLED=0 build, a linux CI runner — CreateVM is a TYPED REFUSAL
+// pure-Go CGO_ENABLED=0 build, a linux CI runner — CreateVM is a typed refusal
 // returning this, rather than code that compiles and then fails at a syscall.
 //
 // It is retained rather than renamed because it is exactly the same statement it
@@ -57,19 +57,19 @@ var ErrVMBootNotImplemented = errors.New("sandbox: the vm backend cannot boot a 
 // host-process exec-shim seam — which it does not implement. A Linux guest is not
 // a confined host process, so the runtime routes a vm pod to CreateVM. It exists
 // so VMBackend can totally satisfy the swappable sandbox.Backend interface while
-// failing CLOSED if a caller ever mis-routes a vm pod through the host-process
+// failing closed if a caller ever mis-routes a vm pod through the host-process
 // path. Compare with errors.Is.
 var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-process exec-shim path; route the pod via CreateVM")
 
 // GuestNetworkConfig is the runtimed-LOCAL network contract the vm backend applies
-// to a pod's Linux guest (M5.1): the guest's DNS configuration — carried BOTH
+// to a pod's Linux guest (M5.1): the guest's DNS configuration — carried both
 // structured (Nameservers/Searches/Options) and rendered (ResolvConf) — plus the
 // NAT-attachment advisory fields.
 //
 // It is an INTENTIONAL decoupling DTO. It mirrors darwin-net's podnet.GuestNetwork
 // (the NAT-attachment config) folded together with the rendered resolv.conf from
-// darwin-net's pkg/dns.GuestResolvConf — NEITHER of which runtimed may import:
-// darwin-net and runtimed are CO-EQUAL LEAVES of the cross-repo DAG (the shared
+// darwin-net's pkg/dns.GuestResolvConf — neither of which runtimed may import:
+// darwin-net and runtimed are CO-equal leaves of the cross-repo DAG (the shared
 // contract lives in k3sm.io/apis; neither leaf imports the other). The k3sm
 // provider is the named mapper: it owns both darwin-net producers and STAMPS this
 // struct as plain data, exactly as it already threads DeniedUnixSocketPaths "as
@@ -77,7 +77,7 @@ var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-pr
 // RuntimedConfig.DeniedUnixSocketPaths).
 //
 // The DNS configuration is carried TWICE, deliberately. apis guest/v1's
-// ResolvConf message carries ONLY the structured form (nameservers/searches/
+// ResolvConf message carries only the structured form (nameservers/searches/
 // options — no rendered-string field), because the guest must render
 // /etc/resolv.conf itself to do it musl-safely: Alpine's musl resolver largely
 // ignores `options ndots`, so a search list that only works under a host-chosen
@@ -87,7 +87,7 @@ var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-pr
 // proto shape exists to prevent. So the structured fields are the ones that
 // cross into the guest, and ResolvConf is retained as the host-side rendering
 // for diagnostics and for any consumer that wants the bytes verbatim. When both
-// are set they describe the SAME configuration; the producer (the k3sm provider)
+// are set they describe the same configuration; the producer (the k3sm provider)
 // is the one authority that fills them, and runtimed never re-derives one from
 // the other.
 //
@@ -96,7 +96,7 @@ var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-pr
 // GuestNetworker seam.
 type GuestNetworkConfig struct {
 	// Nameservers are the guest's resolver addresses in query order — the
-	// STRUCTURED form that crosses into the guest as guest/v1 ResolvConf.nameservers
+	// structured form that crosses into the guest as guest/v1 ResolvConf.nameservers
 	// (in practice the single cluster DNS VIP). Empty means no resolver is injected.
 	Nameservers []string
 	// Searches is the guest's resolv.conf search list, in order (guest/v1
@@ -151,7 +151,7 @@ type VMSpec struct {
 	// plus the NAT advisory fields the vm backend applies to the guest. The provider
 	// stamps it as data (runtimed cannot import darwin-net — see GuestNetworkConfig);
 	// a zero value networks no guest. A NAT-attached guest gets its network via the
-	// VZNATNetworkDeviceAttachment, NEVER a host lo0 alias.
+	// VZNATNetworkDeviceAttachment, never a host lo0 alias.
 	Network GuestNetworkConfig
 	// Hostname is the pod hostname the guest sets and binds into every
 	// container's /etc/hostname (guest/v1 GuestSpec.hostname). Empty leaves the
@@ -167,12 +167,12 @@ type VMSpec struct {
 	// resolved numeric identity. They cross into the guest as guest/v1
 	// GuestContainers.
 	//
-	// PLAIN DATA on the same decoupling seam as Volumes and Network: sandbox
-	// resolves nothing itself. The NAMED MAPPER is pkg/runtime — it holds the
+	// plain DATA on the same decoupling seam as Volumes and Network: sandbox
+	// resolves nothing itself. The named mapper is pkg/runtime — it holds the
 	// PodBox, the image config and pkg/image.MergeRunSpec, which is where every
 	// value below is produced (resolveVMContainers).
 	//
-	// AN EMPTY LIST IS STILL NOT REJECTED HERE. guestinit.Plan is the right
+	// AN empty list IS still not rejected here. guestinit.Plan is the right
 	// refuser — it is PID 1 of a VM that exists to run exactly this pod — and
 	// the mapper never produces one for a pod that has containers, so a spec
 	// arriving empty says something about the caller rather than about this
@@ -188,7 +188,7 @@ type VMSpec struct {
 	// machine description (VMSpecFileName), the guest console log
 	// (VMConsoleLogName) and the k3sm.spec share root live.
 	//
-	// It is STAMPED by createVMPod rather than derived here. pkg/runtime owns
+	// It is stamped by createVMPod rather than derived here. pkg/runtime owns
 	// every pod-path derivation in this daemon (r.podDir parses the id first),
 	// and a second derivation in this package would be a second answer to
 	// "where does this pod live" that could disagree with the first — which is
@@ -200,12 +200,12 @@ type VMSpec struct {
 	// GuestDialer reaches — so the socket the helper serves and the socket the
 	// Exec/Logs route dials are the same string by construction.
 	//
-	// It is deliberately NOT under PodDir: the pod dir is the one tree a pod's
+	// It is deliberately not under PodDir: the pod dir is the one tree a pod's
 	// own confinement can reach, so an agent socket there would put the pod's
 	// control channel inside the pod's reach.
 	AgentSocketPath string
 	// StopGrace is the pod's termination grace, threaded to the helper's
-	// -stop-grace so ONE budget governs both ends of the shutdown. Zero selects
+	// -stop-grace so one budget governs both ends of the shutdown. Zero selects
 	// the helper's default; the daemon clamps its own escalation wait to the
 	// same resolved value (clampStopGrace) so the two timers cannot race.
 	StopGrace time.Duration
@@ -214,9 +214,9 @@ type VMSpec struct {
 // VMContainer is one container to run inside the pod's guest, as the host has
 // already resolved it. It maps onto guest/v1 GuestContainer field for field.
 //
-// EVERY KUBERNETES INDIRECTION IS ALREADY GONE by the time a value lands here:
+// every Kubernetes indirection is already gone by the time a value lands here:
 // the argv is the four-quadrant merge of the pod spec against the image config
-// (pkg/image.MergeRunSpec), the environment is fully expanded "KEY=VALUE"
+// (pkg/image.MergeRunSpec), the environment is fully expanded "KEY=value"
 // entries, and the identity is numeric. The guest performs no merge and consults
 // no image config of its own, which is what lets it boot with no cluster access.
 type VMContainer struct {
@@ -234,11 +234,11 @@ type VMContainer struct {
 	// rootfs lower layer; the guest composes writability as an overlay. It must
 	// name a share in VMSpec.Volumes.Shares — no host path ever crosses.
 	RootfsTag string
-	// Argv is the MERGED argument vector, Argv[0] first. It crosses as
+	// Argv is the merged argument vector, Argv[0] first. It crosses as
 	// GuestContainer.command with args empty; see buildGuestSpec for why the
 	// merged vector is not re-split.
 	Argv []string
-	// Env are fully resolved "KEY=VALUE" entries.
+	// Env are fully resolved "KEY=value" entries.
 	Env []string
 	// WorkingDir is the process working directory inside the container rootfs;
 	// empty takes the image config's WorkingDir as already merged host-side.
@@ -247,7 +247,7 @@ type VMContainer struct {
 	TTY   bool
 	Stdin bool
 	// UID and GID are the RESOLVED numeric ids the process runs as. A
-	// non-numeric image USER is deliberately NOT resolved host-side (the host
+	// non-numeric image USER is deliberately not resolved host-side (the host
 	// does not read a pod-controlled /etc/passwd to decide a privilege
 	// question); the guest resolves it at exec time against the container
 	// rootfs, so this pair carries the numeric answer only when the host
@@ -266,24 +266,24 @@ type VMContainer struct {
 // routes a vm pod to CreateVM rather than WrapCommand (a guest is not a confined
 // host process — WrapCommand fails closed with ErrVMUsesCreateVM).
 //
-// Availability is a SAFE probe (see Available): +[VZVirtualMachine isSupported]
-// AND the presence of a validly-signed, virtualization-entitled k3sm-vmhost helper,
-// both wrapped against Obj-C exceptions in the cgo .m shim (vm_darwin.m). It NEVER
+// Availability is a safe probe (see Available): +[VZVirtualMachine isSupported]
+// and the presence of a validly-signed, virtualization-entitled k3sm-vmhost helper,
+// both wrapped against Obj-C exceptions in the cgo .m shim (vm_darwin.m). It never
 // constructs or boots a VM — instantiating a VZVirtualMachine without the
 // entitlement raises an uncaught NSException → SIGABRT, which would take down the
 // daemon on a non-entitled host. On such a host Available returns false and
-// SelectBackend fails a vm-requested pod CLOSED rather than downgrading it.
+// SelectBackend fails a vm-requested pod closed rather than downgrading it.
 //
-// THE DAEMON NEVER BOOTS A VM ITSELF. The guest is built and run by the per-pod
+// the DAEMON never BOOTS A VM itself. The guest is built and run by the per-pod
 // k3sm-vmhost helper (VMHostName), the only k3sm binary carrying
 // com.apple.security.virtualization, so this process holds no virtualization
 // authority at all.
 //
-// Virtualization.framework is a PUBLIC framework, so the vm backend is NOT a
+// Virtualization.framework is a PUBLIC framework, so the vm backend is not a
 // libsandbox/memorystatus SPI symbol-canary case — internal/spicanary is
 // deliberately left unchanged by M5 (acceptance M5.1-a2).
 //
-// LAB-GATED REMAINDER (needs a VZ-capable, entitled Mac; tracked off CreateVM):
+// LAB-GATED remainder (needs a VZ-capable, entitled Mac; tracked off CreateVM):
 //   - the live guest boot — a VZVirtualMachineConfiguration driven on a per-VM
 //     SERIAL dispatch queue (VZ's threading rule), behind an opaque handle, with
 //     the VZ-delegate→exit / SIGTERM→ACPI requestStop lifecycle;
@@ -292,7 +292,7 @@ type VMContainer struct {
 //   - the OCI-Linux-rootfs → bootable-root builder (digest-pinned tenant images;
 //     no codesign — the guest payload is a Linux rootfs, not arm64 Mach-O);
 //   - VM metering (the memory limit → memorySize; working set sourced from a guest
-//     agent, NOT proc_pid_rusage, which only sees the vmnet/host task).
+//     agent, not proc_pid_rusage, which only sees the vmnet/host task).
 //
 // Construct it with NewVMBackend. The zero value is not usable.
 type VMBackend struct {
@@ -307,12 +307,12 @@ type VMBackend struct {
 	// FindVMHost; injectable for tests.
 	vmHostFn func() (string, error)
 	// helperEntitledFn reports whether the helper at the given path is validly
-	// signed AND carries com.apple.security.virtualization (the cgo
+	// signed and carries com.apple.security.virtualization (the cgo
 	// Security.framework probe on darwin+cgo; a false stub otherwise). Injectable
 	// for tests.
 	helperEntitledFn func(path string) bool
 
-	// artifacts resolves this node's pinned guest kernel + initramfs. NIL BY
+	// artifacts resolves this node's pinned guest kernel + initramfs. nil BY
 	// DEFAULT, and CreateVM fails closed on nil: the production feeder is its
 	// own deliverable, and a backend that guessed a path would boot whatever
 	// happened to be on disk under a digest pin it never checked.
@@ -322,7 +322,7 @@ type VMBackend struct {
 	// backend constructed without one, which is only ever a test double.
 	stateRoot string
 	// spawner / waiter are pkg/supervisor's spawn and reap seams. The helper is
-	// started and reaped through the SAME primitives every pod process is, so
+	// started and reaped through the same primitives every pod process is, so
 	// the SETSID group, the signal-mask reset, the combined-output pipe and the
 	// single-kqueue-reaper guarantee are inherited rather than re-derived.
 	spawner supervisor.Spawner
@@ -344,7 +344,7 @@ type VMBackend struct {
 	log *slog.Logger
 
 	// mu guards live only. Every helper call — spawn, health, signal — is made
-	// with mu RELEASED, so a blocked boot never blocks a concurrent StopVM or a
+	// with mu released, so a blocked boot never blocks a concurrent StopVM or a
 	// GetRuntimeInfo probe.
 	mu sync.Mutex
 	// live maps pod id to its running helper. A pod is in it only between a
@@ -465,23 +465,23 @@ func (b *VMBackend) Name() string { return VMBackendName }
 // CONJUNCTION of five terms, every one of which must hold (B227):
 //
 //	darwin
-//	  AND macOS major >= vmMinMacOSMajor
-//	  AND +[VZVirtualMachine isSupported]
-//	  AND the k3sm-vmhost helper resolves at its installed path
-//	  AND that helper's static signature is VALID and carries
+//	  and macOS major >= vmMinMacOSMajor
+//	  and +[VZVirtualMachine isSupported]
+//	  and the k3sm-vmhost helper resolves at its installed path
+//	  and that helper's static signature is valid and carries
 //	      com.apple.security.virtualization
 //
 // The last two terms replaced an earlier "this process is entitled" term, and the
 // replacement is the architecture rather than a relaxation: the daemon never
 // creates a VZVirtualMachine — it spawns the helper, which does — so the daemon
-// gating on ITS OWN entitlement asked the wrong binary and would report false on a
+// gating on ITS own entitlement asked the wrong binary and would report false on a
 // perfectly capable node. The helper's SIGNATURE VALIDITY is checked, not merely
 // its entitlements plist, because a plist stays readable on a binary edited after
 // signing that macOS will then refuse to launch (see k3sm_vz_static_code_entitled).
 //
-// It remains a SAFE probe — it never constructs or boots a VM (see the type doc) —
-// and it is the ONE probe both consumers read: SelectBackend, which fails a
-// vm-requested pod CLOSED when it is false, and pkg/runtime's
+// It remains a safe probe — it never constructs or boots a VM (see the type doc) —
+// and it is the one probe both consumers read: SelectBackend, which fails a
+// vm-requested pod closed when it is false, and pkg/runtime's
 // VMBackendAvailable RuntimeCondition, which is what labels the node.
 func (b *VMBackend) Available() bool {
 	if runtime.GOOS != "darwin" {
@@ -508,7 +508,7 @@ func (b *VMBackend) Available() bool {
 // Rosetta directory share to the guests it builds — i.e. whether a linux/amd64 ELF
 // could actually execute in one of this node's guests.
 //
-// It is the SECOND, INDEPENDENT term of the node's guest-Rosetta advertisement
+// It is the second, independent term of the node's guest-Rosetta advertisement
 // (B229): Apple's availability probe answers "can this Mac do Rosetta for Linux",
 // which is a different question from "does the VM this node builds carry it". The
 // answer is the compile-time VMHostRosettaShareSupported; see that constant for why
@@ -519,7 +519,7 @@ func (b *VMBackend) GuestRosettaShareSupported() bool { return VMHostRosettaShar
 // WrapCommand always fails with ErrVMUsesCreateVM: a Linux guest is not a confined
 // host process, so the vm backend does not implement the host-process exec-shim
 // seam. The runtime routes a vm pod to CreateVM; this method exists only so
-// VMBackend totally satisfies sandbox.Backend and fails CLOSED on a mis-route.
+// VMBackend totally satisfies sandbox.Backend and fails closed on a mis-route.
 func (b *VMBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	return "", nil, nil, ErrVMUsesCreateVM
 }

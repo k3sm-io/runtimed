@@ -71,8 +71,8 @@ func (f fakeTemplate) Template(_ context.Context, _, _ string) (string, bool, er
 }
 
 // TestPVCMaterializeStableDir is acceptance runtimed:M3.1-a1 (root-free): a PodBox
-// with a PVC source materializes the dir at storagev1 DataDir, and the SAME
-// (namespace, claim) resolves to the SAME path across calls (stable), with a
+// with a PVC source materializes the dir at storagev1 DataDir, and the same
+// (namespace, claim) resolves to the same path across calls (stable), with a
 // symlink linking it into each pod's rootfs.
 func TestPVCMaterializeStableDir(t *testing.T) {
 	root := t.TempDir()
@@ -116,7 +116,7 @@ func TestPVCMaterializeStableDir(t *testing.T) {
 		t.Errorf("link %s -> %q (err %v), want -> %q", wantLink, dst, err, bd.DataDir)
 	}
 
-	// A SECOND pod for the SAME (namespace, claim) resolves to the SAME dir
+	// A second pod for the same (namespace, claim) resolves to the same dir
 	// (stable) and reuses it (not re-created, not seeded).
 	rootfs2 := filepath.Join(root, "pods", "pod-b", "rootfs")
 	if err := os.MkdirAll(rootfs2, 0o755); err != nil {
@@ -134,14 +134,14 @@ func TestPVCMaterializeStableDir(t *testing.T) {
 		t.Error("reuse must not re-seed")
 	}
 
-	// A DIFFERENT claim resolves to a DIFFERENT dir.
+	// A different claim resolves to a different dir.
 	other, _ := class.DataDir("prod", "redisdata")
 	if other == wantDir {
 		t.Fatal("distinct claims must map to distinct dirs")
 	}
 }
 
-// TestPVCSeedOnce proves clonefile seeding happens ONLY on first create (M3.1-d2):
+// TestPVCSeedOnce proves clonefile seeding happens only on first create (M3.1-d2):
 // a fresh claim with a configured template is seeded; a reuse is not re-seeded
 // (even after the seeded content is removed), and a claim whose class has no
 // template is empty-created with no clone.
@@ -177,8 +177,8 @@ func TestPVCSeedOnce(t *testing.T) {
 		t.Fatalf("seed content = %q (err %v), want the template file", got, err)
 	}
 
-	// Simulate the pod consuming/removing the seeded file, then a SECOND bind for
-	// the same claim. Seeding must NOT recur: the file stays absent (seed-once).
+	// Simulate the pod consuming/removing the seeded file, then a second bind for
+	// the same claim. Seeding must not recur: the file stays absent (seed-once).
 	if err := os.Remove(seedFile); err != nil {
 		t.Fatal(err)
 	}

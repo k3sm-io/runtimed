@@ -52,7 +52,7 @@ var ErrTreeSignRoot = errors.New("image: sign-tree root is not a directory")
 // with no codesign, no Mach-O toolchain, and no privilege.
 type TreeSigner interface {
 	// VerifyArch reports whether path carries a valid signature. arch names the
-	// slice to verify in a UNIVERSAL binary; it is EMPTY for a thin one, where the
+	// slice to verify in a UNIVERSAL binary; it is empty for a thin one, where the
 	// file has exactly one slice and verifying the whole file verifies it.
 	VerifyArch(ctx context.Context, path, arch string) (bool, error)
 	// Sign ad-hoc signs the Mach-O at path.
@@ -100,21 +100,21 @@ type TreeSignStats struct {
 }
 
 // AdHocSignTree walks an unpacked image tree and ad-hoc signs the Mach-O binaries
-// that need it — ONCE, at pull/materialize time, over the content-addressed tree,
+// that need it — once, at pull/materialize time, over the content-addressed tree,
 // rather than per pod.
 //
-// CHECK, THEN SIGN ONLY IF INVALID. An ad-hoc signature is content-addressed, so it
+// check, then SIGN only IF INVALID. An ad-hoc signature is content-addressed, so it
 // survives clonefile verbatim: a pod rootfs cloned from a signed tree execs without
 // any signing step (measured — a 330 MB tree clones in ~1.0 s at ~0 bytes, and the
 // cloned Mach-Os exec unmodified under Seatbelt). An unconditional `codesign -f`
 // would rewrite each file and thereby DE-CoW it, turning a free clone into a full
 // copy, so a file that is already valid is never touched.
 //
-// PER-ARCH VERIFICATION, and this is where a whole-file check goes wrong. A
+// per-ARCH VERIFICATION, and this is where a whole-file check goes wrong. A
 // universal binary whose arm64 slice is validly signed and whose x86_64 slice is
 // unsigned — an ordinary shape for a universal2 wheel; one was found in the
 // reference dependency closure — makes a bare `codesign -v` report "code object is
-// not signed at all" for the WHOLE FILE. Acting on that verdict would re-sign a
+// not signed at all" for the whole FILE. Acting on that verdict would re-sign a
 // file whose executing slice was already fine, de-CoWing it on every arrival. So a
 // universal binary is verified with --arch, naming the slice that will actually
 // execute here, and a thin one is verified whole (it has only the one slice).
@@ -247,12 +247,12 @@ const (
 
 // maxFatArches bounds the fat-header arch count this reader will accept. It is a
 // sanity bound, and it is also the first half of the Java-class-file defence: a
-// .class file starts with the SAME 0xCAFEBABE magic, and its next four bytes are
+// .class file starts with the same 0xCAFEBABE magic, and its next four bytes are
 // version numbers that land far outside this range for every real class file.
 const maxFatArches = 32
 
 // machoCPUTypes maps the Mach-O cpu_type values k3sm can encounter to the arch
-// names codesign uses. The map is a CLOSED allowlist and it is the second half of
+// names codesign uses. The map is a closed allowlist and it is the second half of
 // the Java defence: a fat header whose entries do not name known CPU types is not
 // treated as a Mach-O at all, so a stray .class file is never handed to codesign.
 var machoCPUTypes = map[uint32]string{

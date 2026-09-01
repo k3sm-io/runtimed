@@ -42,14 +42,14 @@ import (
 // share one cache layout.
 const GuestArtifactsSubdir = "guest-artifacts"
 
-// DefaultFetchTimeout bounds ONE artifact fetch end to end — connect, headers
+// DefaultFetchTimeout bounds one artifact fetch end to end — connect, headers
 // and body. It is a total budget rather than a per-read idle timeout because the
 // failure this guards against is a node whose vm capability never resolves: a
 // stalled fetch that trickles a byte a minute defeats an idle timeout forever
 // while defeating the operator just as thoroughly.
 const DefaultFetchTimeout = 2 * time.Minute
 
-// MaxArtifactBytes bounds ONE fetched artifact. A body that reaches it is an
+// MaxArtifactBytes bounds one fetched artifact. A body that reaches it is an
 // error, never a truncation.
 //
 // The bound exists because the url a fetch is pointed at is derived from a pin's
@@ -73,7 +73,7 @@ const tempPrefix = ".ensure-"
 
 // Fetcher retrieves an artifact by url.
 //
-// It is declared HERE, at the consumer, and holds one method, because that is
+// It is declared here, at the consumer, and holds one method, because that is
 // the entire dependency ensure has on the network: everything else — digest
 // verification, atomic install, retention — is this package's own and must stay
 // testable with no socket in the process. A production implementation is
@@ -116,7 +116,7 @@ var maxArtifactBytes int64 = MaxArtifactBytes
 
 // checkArtifactURL rejects any url a guest artifact may not be fetched from.
 //
-// HTTPS ONLY, WITH NO FALLBACK. The digest is the whole trust chain here — a
+// HTTPS only, with NO FALLBACK. The digest is the whole trust chain here — a
 // VZ-booted kernel gets no code-signing check from the OS, so the only thing
 // standing between the node and someone else's kernel is a sha256 comparison —
 // and requiring https does not weaken that argument, it strengthens a different
@@ -182,7 +182,7 @@ func (f *HTTPFetcher) fetchTimeout() time.Duration {
 
 // Fetch performs the GET and returns the response body.
 //
-// The timeout is applied by deriving a context, NOT by http.Client.Timeout, so
+// The timeout is applied by deriving a context, not by http.Client.Timeout, so
 // that it also bounds the body read the caller has not started yet: the derived
 // context's cancel rides on the returned reader and fires when the caller closes
 // it. A non-2xx response is an error with the body closed, never a reader over
@@ -252,8 +252,8 @@ func (c *cancelOnClose) Close() error {
 //
 // # The caller's contract on error
 //
-// AN ERROR FROM THIS FUNCTION MEANS "THE VM CAPABILITY IS OFF ON THIS NODE",
-// NEVER "THE DAEMON IS BROKEN". A node with no network, an unminted pin, or a
+// An error from this function means "the vm capability is off on this node",
+// never "the daemon is broken". A node with no network, an unminted pin, or a
 // publisher outage must still run every native pod it has; the only thing it may
 // not do is boot a guest. Callers therefore degrade — leave the vm backend's
 // artifact locator unset, so CreateVM fails each vm pod closed with
@@ -261,7 +261,7 @@ func (c *cancelOnClose) Close() error {
 //
 // # What it guarantees
 //
-// The returned paths exist and their bytes hash to the pin, verified on THIS
+// The returned paths exist and their bytes hash to the pin, verified on this
 // call. Verification is unconditional and repeated on every start, not cached in
 // a marker file: a marker records what was true when it was written, and the
 // event worth catching is bit rot or tampering after that moment. The cost is
@@ -350,7 +350,7 @@ func ensureArtifact(ctx context.Context, dir, setDir, name, digest, releaseURL s
 	return nil
 }
 
-// fetchVerified downloads url into a temp file in dir, verifies the WHOLE body
+// fetchVerified downloads url into a temp file in dir, verifies the whole body
 // against digest, and only then renames it to final.
 //
 // The order is the point. A file at the final path is a file some other process
@@ -397,7 +397,7 @@ func fetchVerified(ctx context.Context, dir, final, url, digest string, f Fetche
 	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return fmt.Errorf("set the mode of the guest artifact downloaded from %s: %w", url, err)
 	}
-	// The set directory is created HERE, immediately before the rename, and not
+	// The set directory is created here, immediately before the rename, and not
 	// before the fetch: a fetch that fails must leave no trace, and an empty
 	// 64-hex directory is a trace with a meaning — the retention pass reads it
 	// as a cached set, and verifySetDir would then have to distinguish "corrupt"
@@ -417,7 +417,7 @@ func fetchVerified(ctx context.Context, dir, final, url, digest string, f Fetche
 //
 // io.Copy has no context, and the reader it is handed here comes from a Fetcher
 // the caller supplied, which may be anything. Checking between reads is what
-// makes the deadline in EnsureGuestArtifacts' contract true for EVERY fetcher
+// makes the deadline in EnsureGuestArtifacts' contract true for every fetcher
 // rather than only for the http one whose request carries the context.
 type ctxReader struct {
 	ctx context.Context
@@ -455,7 +455,7 @@ func digestFile(path string) (string, error) {
 // re-hashing the two artifacts it holds must reproduce the set digest its own
 // name is.
 //
-// This is the check that makes a RETAINED set verifiable at all. Ensure holds a
+// This is the check that makes a retained set verifiable at all. Ensure holds a
 // pin for the ACTIVE set only — a previous set's per-artifact digests are not in
 // this build's source and cannot be — so the only statement left about it is the
 // one its directory name makes about itself, and SetDigest is constructed so
@@ -500,10 +500,10 @@ func sweepTemps(ctx context.Context, dir string) {
 // pruneSets enforces the retention policy: the active set, plus at most one
 // previous set, and nothing else.
 //
-// ONE PREVIOUS IS KEPT because a digest bump ships in a binary, so rolling that
+// one previous IS kept because a digest bump ships in a binary, so rolling that
 // binary back must not also mean re-downloading the kernel it boots — the
 // rollback would then depend on the network being up at exactly the moment
-// something is already wrong. TWO would be a cache policy; one is a rollback.
+// something is already wrong. two would be a cache policy; one is a rollback.
 //
 // The retained candidate is the NEWEST other set that verifies. A candidate that
 // does not verify is deleted silently rather than reported: it is a convenience,

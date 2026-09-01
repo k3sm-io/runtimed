@@ -41,7 +41,7 @@ func gpuProfile(t *testing.T) string {
 	return got
 }
 
-// TestGenerateGPUGolden is acceptance M8.2-a1's Metal half: the FULL rendered
+// TestGenerateGPUGolden is acceptance M8.2-a1's Metal half: the full rendered
 // allow_gpu profile is pinned byte-for-byte against testdata/pod-gpu.golden.sb.
 //
 // A golden rather than a substring assertion because the thing under test is a
@@ -70,8 +70,8 @@ func TestGenerateGPUGolden(t *testing.T) {
 }
 
 // TestMetalStanzaShape pins the properties of the allow-set that the golden alone
-// would let a future edit satisfy in a wrong way: the two EXACT class names, their
-// presence in ONE iokit-open rule, and — the load-bearing negatives — the absence
+// would let a future edit satisfy in a wrong way: the two exact class names, their
+// presence in one iokit-open rule, and — the load-bearing negatives — the absence
 // of every candidate the S1 ablation dropped.
 func TestMetalStanzaShape(t *testing.T) {
 	profile := gpuProfile(t)
@@ -109,7 +109,7 @@ func TestMetalStanzaShape(t *testing.T) {
 		}
 	})
 
-	// The pod's own data volume stays the ONLY writable tree: allow_gpu must not
+	// The pod's own data volume stays the only writable tree: allow_gpu must not
 	// have widened file-write* anywhere, which is exactly how a shader-cache allow
 	// would have arrived.
 	t.Run("no-new-write-scope", func(t *testing.T) {
@@ -125,7 +125,7 @@ func TestMetalStanzaShape(t *testing.T) {
 		}
 	})
 
-	// Emission tier: the Metal allow must sit in the ALLOWS tier, BEFORE the
+	// Emission tier: the Metal allow must sit in the ALLOWS tier, before the
 	// protected denies, so last-match-wins keeps /Users and the daemon trees denied
 	// for a GPU pod exactly as for any other.
 	t.Run("emitted-before-protected-denies", func(t *testing.T) {
@@ -180,7 +180,7 @@ func (b stubBackend) WrapCommand(_ context.Context, _ string, _ []string, _ supe
 }
 
 // TestSandboxGPUSupported pins the fail-closed advertisement control (Resolution
-// 14): sandbox_gpu_supported is the AND of "the selected backend can express the
+// 14): sandbox_gpu_supported is the and of "the selected backend can express the
 // Metal allow-set" and "the functional probe passed". Every other combination
 // reports false.
 func TestSandboxGPUSupported(t *testing.T) {

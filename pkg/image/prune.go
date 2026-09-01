@@ -30,7 +30,7 @@ import (
 
 // BlobKind classifies one filesystem node under the blobs root for planning.
 //
-// The kinds are derived from the node's PATH and its Lstat mode ONLY. Nothing in
+// The kinds are derived from the node's PATH and its Lstat mode only. Nothing in
 // this package opens a blob to decide what it is: an earlier design sniffed
 // every small blob for manifest-shaped JSON and accepted whatever it found as an
 // authority on reachability, which handed a registry the ability to author the
@@ -52,7 +52,7 @@ const (
 // BlobNode is one entry of the store inventory, as caller-supplied data — the
 // planner itself never touches the filesystem.
 type BlobNode struct {
-	// Path is the node's path RELATIVE to the blobs root ("<algo>/<hex>" or
+	// Path is the node's path relative to the blobs root ("<algo>/<hex>" or
 	// "<algo>/.blob-<n>"). A path outside that grammar is unknown-provenance to
 	// the planner and is refused again by the executor.
 	Path string
@@ -90,7 +90,7 @@ const (
 	// record is missing, unreadable or self-contradictory. Such a tree can no
 	// longer be served (Unpacker.openCommitted refuses it), so it holds space
 	// while satisfying nothing; rebuilding it is the only way back. It is a
-	// TREE-ONLY verdict: no blob is ever deleted for being unreadable.
+	// TREE-only verdict: no blob is ever deleted for being unreadable.
 	ReasonDeleteUnusableTree PruneReason = "delete-unusable-tree"
 )
 
@@ -100,7 +100,7 @@ type PruneDecision struct {
 	Reason PruneReason
 }
 
-// PrunePlan is an EXACT PARTITION of the inventory: every input node appears in
+// PrunePlan is an exact PARTITION of the inventory: every input node appears in
 // exactly one of Delete or Keep, with a reason, in deterministic path order.
 //
 // The partition is asserted, not assumed. A node that fell out of both sets
@@ -123,11 +123,11 @@ type PrunePlan struct {
 }
 
 // DeletedBytes is the summed logical size of everything the plan condemns —
-// blobs AND trees.
+// blobs and trees.
 //
 // It is what a DRY RUN reports as reclaimable, and it is deliberately an
 // over-estimate rather than a prediction: under APFS clonefile a blob or a tree
-// whose extents are still shared with a materialized pod rootfs frees NOTHING
+// whose extents are still shared with a materialized pod rootfs frees nothing
 // when it is removed. Real reclaim is therefore measured with statfs after the
 // fact (see ReclaimUnderPressure), never computed from this number.
 func (p *PrunePlan) DeletedBytes() int64 {
@@ -200,21 +200,21 @@ func validKind(k BlobKind) bool {
 // ingests hold; grace is the minimum age a node must have before it is
 // delete-eligible.
 //
-// Reachability is the whole rule and it is one line: a content blob is KEPT iff
+// Reachability is the whole rule and it is one line: a content blob is kept iff
 // some root names it or some lease pins it. There is no promotion rule, no
 // transitive walk through fetched content, and no way for a blob to make another
 // blob reachable — the only thing that can make a blob survive is a record the
 // DAEMON wrote. Everything else is fail-closed:
 //
-//   - a node outside the blob grammar, or of an unknown kind, is KEPT;
-//   - a node younger than grace is KEPT;
+//   - a node outside the blob grammar, or of an unknown kind, is kept;
+//   - a node younger than grace is kept;
 //   - a structurally invalid input (empty/duplicate path, unknown kind, negative
 //     size, zero now, negative grace) is an ERROR and nothing is planned.
 //
-// Trees are decided from the SAME root and lease sets by planTrees (treeprune.go),
+// Trees are decided from the same root and lease sets by planTrees (treeprune.go),
 // which states their own — deliberately different — root-set rule. The one rule
 // that spans both halves is the one this function enforces by construction: a
-// tree's record contributes NOTHING to blob reachability, so derived content can
+// tree's record contributes nothing to blob reachability, so derived content can
 // never keep a blob alive.
 func PlanPrune(nodes []BlobNode, trees []TreeNode, roots []ImageRoot, leased []string, grace time.Duration, now time.Time) (*PrunePlan, error) {
 	if now.IsZero() {
@@ -272,7 +272,7 @@ func PlanPrune(nodes []BlobNode, trees []TreeNode, roots []ImageRoot, leased []s
 	}
 
 	young := func(n BlobNode) bool { return now.Sub(n.ModTime) < grace }
-	// accountable is the ONLY shape the planner will reason about: a content node
+	// accountable is the only shape the planner will reason about: a content node
 	// whose declared digest agrees with its own path. A node whose two halves
 	// disagree is not a blob whose provenance is merely unclear — it is an
 	// inventory the planner did not produce, so it is kept.
@@ -357,7 +357,7 @@ func PlanPrune(nodes []BlobNode, trees []TreeNode, roots []ImageRoot, leased []s
 // EnumerateBlobs inventories the blobs tree: one BlobNode per filesystem node,
 // classified by PATH GRAMMAR and Lstat mode alone.
 //
-// It NEVER opens a blob. The inventory is a list of names and modes; what a blob
+// It never opens a blob. The inventory is a list of names and modes; what a blob
 // contains is not evidence about whether it may be deleted, because its content
 // is supplied by a registry and reachability roots may only be daemon-authored
 // (see ImageRoot). An absent blobs dir inventories as empty.
@@ -427,7 +427,7 @@ type ExecuteReport struct {
 	// Deleted is the number of nodes unlinked, temp files included.
 	Deleted int
 	// DeletedBytes is the summed logical size of the unlinked nodes. It is what
-	// was UNLINKED, not what the volume got back — see PrunePlan.DeletedBytes.
+	// was unlinked, not what the volume got back — see PrunePlan.DeletedBytes.
 	DeletedBytes int64
 	// Skipped lists plan entries that failed re-verification or whose unlink
 	// failed. A skip is never an error: it leaves the node in place for the next
@@ -440,21 +440,21 @@ type ExecuteReport struct {
 
 // ExecutePrune executes plan's Delete set against this cache.
 //
-// It is BLOBS-ONLY BY CONSTRUCTION: every operation goes through an os.Root
+// It is BLOBS-only BY construction: every operation goes through an os.Root
 // opened at the blobs dir (fd-anchored, symlinks not followed), and only
 // relative paths matching the validated blob grammar are ever removed. It is
 // therefore structurally incapable of reaching server/, run/, storage/ or pods/,
 // and it never recurses or RemoveAlls — an emptied algo dir is left behind,
 // which is harmless.
 //
-// Before each unlink the entry is RE-VERIFIED against the same facts that made
+// Before each unlink the entry is RE-verified against the same facts that made
 // it deletable: the path still matches the grammar, Lstat still reports a
 // regular file (a node swapped for a symlink after planning is skipped, not
-// followed), and the mtime is still older than grace. A verification miss SKIPS
+// followed), and the mtime is still older than grace. A verification miss skips
 // that node rather than failing the run into a partial, ambiguous state.
 //
-// stop, when non-nil, is consulted BEFORE each unlink and ends the run when it
-// returns true. That is how disk-pressure reclaim stops on a MEASURED target
+// stop, when non-nil, is consulted before each unlink and ends the run when it
+// returns true. That is how disk-pressure reclaim stops on a measured target
 // rather than on a precomputed byte budget: under APFS clonefile an unlink whose
 // extents are still shared frees nothing, so the only honest stopping rule is to
 // re-measure.

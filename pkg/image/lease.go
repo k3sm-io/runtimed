@@ -26,7 +26,7 @@ import (
 //
 // A lease is an IN-PROCESS root, not a durable one: a single-writer daemon that
 // dies mid-pull aborts the pull anyway, so there is nothing to reclaim across a
-// restart and no crash-reclaim rule to get wrong. The TTL exists for the OTHER
+// restart and no crash-reclaim rule to get wrong. The TTL exists for the other
 // failure: a caller that takes a lease and never releases it would pin its
 // subtree forever, and the component that would notice is the GC the stale lease
 // has just disabled. Expiry makes that failure self-healing and time-bounded
@@ -36,11 +36,11 @@ const DefaultLeaseTTL = 15 * time.Minute
 // Lease pins a set of blob digests against reclaim while an ingest is in flight.
 //
 // It closes the window the content-addressed store cannot close on its own: a
-// blob is committed (or found already present) BEFORE the reference that makes
+// blob is committed (or found already present) before the reference that makes
 // it reachable is recorded, so between those two moments the blob is on disk and
 // named by nothing. A concurrent prune would compute it unreachable and delete
 // the layer of the pull that is still running. The lease is therefore acquired
-// over the WHOLE manifest digest set BEFORE the presence check — not before the
+// over the whole manifest digest set before the presence check — not before the
 // first write — because a cache HIT writes nothing at all, and the hit path is
 // exactly where the blob is old enough for a grace window to have expired.
 //
@@ -81,7 +81,7 @@ func (l *Lease) Release() {
 // AcquireLease pins digests against reclaim until the returned lease is released
 // or ttl elapses, whichever comes first. A non-positive ttl means DefaultLeaseTTL.
 //
-// Digests are taken VERBATIM and are not validated here: a lease is a pure
+// Digests are taken verbatim and are not validated here: a lease is a pure
 // over-approximation of what must survive, so an unparseable entry can only
 // protect a blob that does not exist. Validating (and thereby possibly dropping)
 // an entry is the one change that could make a lease under-approximate, which is
