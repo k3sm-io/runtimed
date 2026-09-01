@@ -110,20 +110,37 @@ func NewBinder(class storagev1.LocalPathClass, cloner image.Cloner, template Tem
 // Class returns the binder's resolved local-path class (BasePath defaulted).
 func (b *Binder) Class() storagev1.LocalPathClass { return b.class }
 
-// Bind ensures every PVC-backed volume in box has its stable per-claim dir on the
-// APFS storage root — empty-created, or SEEDED-once from a template — and symlinks
-// each container mount of it into rootfs so the confined pod reaches the persistent
-// dir at its mount path. The returned bindings' DataDirs are the SBPL read/write
-// scope the caller widens the profile with.
+// Provision ensures every PVC-backed volume in box has its stable per-claim dir on
+// the APFS storage root — empty-created, or SEEDED-once from a template — and
+// returns one Binding per PVC volume, with no Links. A box with no PVC volumes
+// returns nil.
 //
-// Bind never deletes anything: a PV dir is lifecycle-decoupled from the pod
-// (ReclaimPolicy Retain), so a pod restart / delete leaves it intact and the next
-// pod that mounts the same claim reuses it. A box with no PVC volumes returns nil.
-func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string) ([]Binding, error) {
-	rootfs = filepath.Clean(rootfs)
+// It is the half of Bind that both pod spines need, and it is separate from the
+// linking half because the two spines reach a claim by different mechanisms. The
+// host-process spine has no mount namespace, so a confined process reaches the
+// claim through a SYMLINK planted in its rootfs (Bind, below). A vm pod reaches
+// the same claim through its own virtiofs share device: the share plan already
+// roots a k3sm.pvc<i> device at exactly this DataDir, so the guest mounts it
+// directly. Planting a symlink for a vm pod would be worse than useless — it would
+// land inside <podDir>/rootfs, which is exported to the guest READ-ONLY as the
+// image's lower layer, so it would appear in the container's filesystem pointing at
+// a host path that does not exist in the guest's namespace.
+//
+// So the vm spine calls Provision and the host-process spine calls Bind. Neither
+// re-derives a claim path: DataDir stays the class's, here, in its one home.
+//
+// Provision never deletes and never re-seeds. A PV dir is lifecycle-decoupled from
+// the pod (ReclaimPolicy Retain), so an existing claim dir is returned untouched
+// with its contents intact — which is the whole point of a persistent volume, and
+// is asserted rather than assumed (see materialize's reuse branch).
+func (b *Binder) Provision(ctx context.Context, box *runtimev1.PodBox) ([]Binding, error) {
+	bindings, _, err := b.provision(ctx, box)
+	return bindings, err
+}
 
-	// Index the PVC volumes (name → source) and bind each to its stable dir once,
-	// even if mounted by several containers.
+// provision materializes each PVC volume's dir once, even when several containers
+// mount it, and returns the bindings plus a volume-name index into them.
+func (b *Binder) provision(ctx context.Context, box *runtimev1.PodBox) ([]Binding, map[string]int, error) {
 	bindings := make([]Binding, 0)
 	byName := make(map[string]int) // volume name → index into bindings
 	for _, v := range box.GetVolumes() {
@@ -133,7 +150,7 @@ func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string)
 		}
 		dataDir, seeded, err := b.materialize(ctx, box.GetNamespace(), pvc.GetClaimName())
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		byName[v.GetName()] = len(bindings)
 		bindings = append(bindings, Binding{
@@ -143,6 +160,30 @@ func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string)
 			ReadOnly:   pvc.GetReadOnly(),
 			Seeded:     seeded,
 		})
+	}
+	if len(bindings) == 0 {
+		return nil, nil, nil
+	}
+	return bindings, byName, nil
+}
+
+// Bind is Provision plus the host-process spine's linking half: it symlinks each
+// container mount of a bound volume into rootfs so the confined pod reaches the
+// persistent dir at its mount path. The returned bindings' DataDirs are the SBPL
+// read/write scope the caller widens the profile with.
+//
+// Bind never deletes anything: a PV dir is lifecycle-decoupled from the pod
+// (ReclaimPolicy Retain), so a pod restart / delete leaves it intact and the next
+// pod that mounts the same claim reuses it. A box with no PVC volumes returns nil.
+//
+// The vm spine calls Provision instead; see its doc for why a symlink is the wrong
+// mechanism there.
+func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string) ([]Binding, error) {
+	rootfs = filepath.Clean(rootfs)
+
+	bindings, byName, err := b.provision(ctx, box)
+	if err != nil {
+		return nil, err
 	}
 	if len(bindings) == 0 {
 		return nil, nil

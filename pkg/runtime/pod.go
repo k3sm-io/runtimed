@@ -604,7 +604,10 @@ func (r *Runtime) armMemorySampler(p *pod) {
 //     guest init;
 //   - the pod's image layers into the rootfs share, by the unpacker seam inside
 //     resolveVMContainers. An empty rootfs share boots a guest with no /bin/sh,
-//     whose container exits instantly.
+//     whose container exits instantly;
+//   - each PVC's stable dir on the storage root, by volume.Binder.Provision. VZ
+//     stats every share root when it builds the machine, so a planned PVC share
+//     whose dir was never created refuses the whole VM.
 //
 // It does pull: the guest runs no merge and reads no image config, so the
 // image's Entrypoint/Cmd/Env/WorkingDir/User have to be merged with the pod
@@ -707,6 +710,28 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	if err := mount.MaterializeShares(ctx, box, plan, podIP, r.resolver); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err)
+	}
+	// Provision each PVC's stable dir on the storage root. MaterializeShares
+	// deliberately skips these — pkg/volume owns a claim's lifecycle — and until
+	// this call nothing on the vm spine created them at all, so the share plan
+	// rooted a k3sm.pvc<i> device at a path that did not exist and VZ refused the
+	// share before the machine started ("stat …/storage/default/pgdata: no such
+	// file or directory").
+	//
+	// Provision, not Bind: Bind additionally symlinks each claim into the pod
+	// rootfs, which is how a Seatbelt-confined host process reaches it. A guest
+	// reaches its claim through the share device instead, and that symlink would
+	// land inside <podDir>/rootfs — the read-only image lower layer — pointing at
+	// a host path with no meaning in the guest's namespace. See volume.Provision.
+	//
+	// Nothing here deletes or re-seeds: an existing claim dir is reused untouched
+	// (ReclaimPolicy Retain), which is what makes a PVC durable across the pod
+	// recreations a vm pod's failure path performs.
+	if hasPersistentVolume(box) {
+		if _, berr := r.binder.Provision(ctx, box); berr != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("provision persistent volumes for pod %s: %w", box.GetPodId(), berr)
+		}
 	}
 	// Every container is resolved host-side (M11.2-d11): the four-quadrant merge of
 	// each container's pod spec against its image config, its expanded
