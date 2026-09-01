@@ -34,6 +34,13 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
+// GuestArtifactsSubdir is the directory component, under a runtime root, that
+// holds the sha-keyed guest-artifact sets EnsureGuestArtifacts manages. Both
+// daemons (the in-process k3sm node and the standalone lab twin) derive the
+// ensure dir as <root>/GuestArtifactsSubdir so a lab run and a launchd run
+// share one cache layout.
+const GuestArtifactsSubdir = "guest-artifacts"
+
 // DefaultFetchTimeout bounds ONE artifact fetch end to end — connect, headers
 // and body. It is a total budget rather than a per-read idle timeout because the
 // failure this guards against is a node whose vm capability never resolves: a

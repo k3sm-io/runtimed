@@ -35,10 +35,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/runtimed/pkg/guestartifacts"
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 func main() {
@@ -64,11 +68,36 @@ func run(socketPath, root, version string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), unix.SIGINT, unix.SIGTERM)
 	defer stop()
 
+	// Ensure the pinned guest boot artifacts before the runtime comes up, the
+	// same shape the in-process k3sm node wires: an ensure failure degrades the
+	// vm capability (pods fail closed at CreateVM), it never blocks the daemon.
+	deps := runtime.Deps{}
+	artifactRoot := root
+	if artifactRoot == "" {
+		artifactRoot = image.DefaultRoot
+	}
+	if pin, err := guestartifacts.Lookup(guestartifacts.ActiveGuestKernel); err != nil {
+		log.Info("guest boot artifacts unavailable: no usable pin; vm pods fail closed", "err", err)
+	} else {
+		ectx, cancel := context.WithTimeout(ctx, guestartifacts.DefaultFetchTimeout)
+		art, aerr := guestartifacts.EnsureGuestArtifacts(ectx,
+			filepath.Join(artifactRoot, guestartifacts.GuestArtifactsSubdir), pin, &guestartifacts.HTTPFetcher{})
+		cancel()
+		if aerr != nil {
+			log.Warn("guest boot artifacts could not be ensured; vm capability off", "err", aerr)
+		} else {
+			deps.VMBackend = sandbox.NewVMBackend(
+				sandbox.WithStateRoot(artifactRoot),
+				sandbox.WithLogger(log),
+				sandbox.WithGuestArtifacts(func() (sandbox.GuestArtifacts, error) { return art, nil }))
+		}
+	}
+
 	rt, err := runtime.New(runtime.Config{
 		Root:           root,
 		RuntimeVersion: version,
 		Logger:         log,
-	}, runtime.Deps{})
+	}, deps)
 	if err != nil {
 		return err
 	}
