@@ -55,6 +55,17 @@ readonly KERNEL_SHA256="5ebdadb10a4b5708fc6b1c457764a110bc49f8150cc3502c59b921ea
 # is a fallback chain, not a preference for one operator's honesty: the key is
 # accepted only if it hashes to the fingerprint above, whoever served it.
 readonly KERNEL_KEY_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
+
+# Greg Kroah-Hartman's stable-release key — the SECOND, independent trust
+# anchor. Its fingerprint is published on https://www.kernel.org/signature.html
+# (fetched and matched 2026-08-31), so the two pins here have two distinct
+# provenance chains: the autosigner fingerprint from gpg's issuer report over
+# the signed sums, the developer fingerprint from kernel.org's own page. The
+# developer signature (.tar.sign, over the UNCOMPRESSED tar) is the one
+# kernel.org itself calls the "best assurance" — the autosigner sums are a
+# mirror-integrity check, and this script requires BOTH to pass.
+readonly KERNEL_DEV_KEY_FPR="647F28654894E3BD457199BE38DBBDC86092693E"
+readonly KERNEL_SIGN_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.sign"
 readonly KEYSERVERS="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.openpgp.org"
 
 # debian:trixie-slim, linux/arm64/v8, resolved 2026-08-31. The digest is the
@@ -74,7 +85,7 @@ readonly KBUILD_BUILD_HOST="k3sm.io"
 
 # ------------------------------------------------------------- the config
 
-# CONFIG_* symbols forced on before olddefconfig, from the M11.0/S4 checklist.
+# CONFIG_* symbols forced on before olddefconfig — the guest's required option set.
 # EVERYTHING is built in: the initramfs carries no module tree, so a `=m` here
 # is a boot failure that presents as a missing device.
 readonly KCONFIG_ENABLE="
@@ -103,7 +114,7 @@ RTC_CLASS RTC_HCTOSYS RTC_DRV_PL031
 # guest there is nothing to load a `.ko`, and leaving it on would let a later
 # defconfig refresh quietly demote a driver to `=m`.
 #
-# 9p is off because virtiofs is the share transport (S4 checklist); carrying a
+# 9p is off because virtiofs is the share transport; carrying a
 # second, unused one only widens the guest kernel's attack surface.
 # LOCALVERSION_AUTO is off because it derives a suffix from the source tree's
 # git state, which a tarball does not have and a build must not depend on.
@@ -152,7 +163,7 @@ usage: hack/guest-kernel/build.sh [--repro | --regen-config]
   (no flag)        verify provenance, build once, write out/Image
   --repro          build twice into separate trees and byte-compare them
   --regen-config   regenerate hack/guest-kernel/kernel.config from defconfig
-                   plus the M11.0/S4 option set, inside the pinned toolchain
+                   plus the required option set, inside the pinned toolchain
 USAGE
 }
 
@@ -211,16 +222,28 @@ host_verify_sums() {
   trap "rm -rf '$home'" RETURN
   chmod 700 "$home"
 
-  local got=0 ks
-  for ks in $KEYSERVERS; do
-    if gpg --batch --homedir "$home" --keyserver "$ks" --recv-keys "0x$KERNEL_KEY_FPR" >/dev/null 2>&1; then
-      got=1; break
-    fi
-  done
-  [ "$got" -eq 1 ] || die "could not fetch key $KERNEL_KEY_FPR from any of: $KEYSERVERS"
+  import_key_checked "$home" "$KERNEL_KEY_FPR"
   gpg --batch --homedir "$home" --output "$home/sums.txt" --verify "$signed" >/dev/null 2>&1 \
     || die "PGP VERIFICATION FAILED for $KERNEL_SUMS_URL"
   awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' "$home/sums.txt"
+}
+
+# import_key_checked fetches one key by full fingerprint and then ASSERTS the
+# keyring really holds a key of that fingerprint. Modern gpg is expected to
+# reject a substituted keyserver response itself, but that expectation lives in
+# gpg's internals; this check makes it a property of THIS script, for whatever
+# gpg version the host or the unpinned apt archive supplies.
+import_key_checked() {
+  local home="$1" fpr="$2" got=0 ks
+  for ks in $KEYSERVERS; do
+    if gpg --batch --homedir "$home" --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then
+      got=1; break
+    fi
+  done
+  [ "$got" -eq 1 ] || die "could not fetch key $fpr from any of: $KEYSERVERS"
+  gpg --batch --homedir "$home" --fingerprint --with-colons 2>/dev/null \
+    | grep -q "^fpr:::::::::${fpr}:$" \
+    || die "keyring does not hold a key with fingerprint $fpr after import"
 }
 
 # container_verify_sums does the same inside the digest-pinned toolchain, for a
@@ -244,11 +267,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
 apt-get -qq install -y --no-install-recommends gnupg dirmngr ca-certificates >/dev/null
 export GNUPGHOME=/tmp/gnupg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-got=0
-for ks in $KEYSERVERS; do
-  if gpg --batch --keyserver "$ks" --recv-keys "0x$KERNEL_KEY_FPR" >/dev/null 2>&1; then got=1; break; fi
-done
-[ "$got" -eq 1 ] || { echo "could not fetch key $KERNEL_KEY_FPR" >&2; exit 1; }
+fetch_key() {
+  fpr="$1"; got=0
+  for ks in $KEYSERVERS; do
+    if gpg --batch --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then got=1; break; fi
+  done
+  [ "$got" -eq 1 ] || { echo "could not fetch key $fpr" >&2; exit 1; }
+  gpg --batch --fingerprint --with-colons 2>/dev/null | grep -q "^fpr:::::::::${fpr}:$" \
+    || { echo "keyring does not hold a key with fingerprint $fpr after import" >&2; exit 1; }
+}
+fetch_key "$KERNEL_KEY_FPR"
 gpg --batch --output /tmp/sums.txt --verify /work/sha256sums.asc >/dev/null 2>&1 \
   || { echo "PGP VERIFICATION FAILED" >&2; exit 1; }
 awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' /tmp/sums.txt > /work/pinned
@@ -366,7 +394,7 @@ report() {
 EOF
 }
 
-# regen_config regenerates the committed config from defconfig plus the S4
+# regen_config regenerates the committed config from defconfig plus the required
 # option set. It exists so the config's provenance is a runnable procedure
 # rather than a story about one: build.sh's drift check is only meaningful if
 # the file it checks can be re-derived.
