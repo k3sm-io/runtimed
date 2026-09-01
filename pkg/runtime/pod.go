@@ -594,12 +594,23 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // volume share plan (B106, computed below) + its resolved containers to the vm
 // backend's CreateVM.
 //
+// It DOES materialize, on both halves, and must — a guest reads its whole world
+// out of host directories that have to be populated before it boots:
+//
+//   - the pooled proj/vols share roots and their per-volume content, by
+//     mount.MaterializeShares (the share plan itself is pure data). Essentially
+//     every pod binds an automounted ServiceAccount token out of the proj share,
+//     and a bind of a host directory that does not exist is an ENOENT that kills
+//     guest init;
+//   - the pod's image layers into the rootfs share, by the unpacker seam inside
+//     resolveVMContainers. An empty rootfs share boots a guest with no /bin/sh,
+//     whose container exits instantly.
+//
 // It does pull: the guest runs no merge and reads no image config, so the
 // image's Entrypoint/Cmd/Env/WorkingDir/User have to be merged with the pod
 // spec here, and holding a verified config means having pulled it. What the
-// host-process spine does with a pulled image afterwards — materialize it,
-// resolve argv[0] against a host rootfs, sign it, gate it — none of that
-// happens here. See resolveVMContainers.
+// host-process spine does with a pulled image afterwards — resolve argv[0]
+// against a host rootfs, sign it, gate it — none of that happens here. See resolveVMContainers.
 //
 // VMSpec.Network is resolved here, at the one boundary that consumes it,
 // through the optional GuestNetworker seam (guestNetworkConfig): the guest's
@@ -639,9 +650,10 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// only when it is byte-equal to that derivation (B140).
 	//
 	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
-	// pattern (validate.go), not the ROOTFS_SETUP the native spine folds
-	// mount.Materialize failures into (createPod above): nothing has touched
-	// disk here — the box itself is unplannable.
+	// pattern (validate.go): the plan is computed before this path touches
+	// disk, so a reject means the box itself is unplannable. Rendering that
+	// plan onto disk comes later (mount.MaterializeShares below) and folds into
+	// ROOTFS_SETUP, exactly as the native spine folds mount.Materialize.
 	podDir, err := r.podDir(box.GetPodId())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -676,15 +688,41 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create pod dir %s: %w", podDir, err)
 	}
+	// Resolved once, and used twice: the guest's DNS/NAT configuration on the
+	// spec below, and its PodIP as the status.podIP a downward-API projection
+	// resolves to. The value is advisory (a NAT-attached guest's on-the-wire
+	// address is macOS-assigned) and may be unset, in which case the projection
+	// gets "" rather than an invented address — the same "" the native spine
+	// passes when IPAM produced nothing.
+	netCfg := r.guestNetworkConfig(box.GetPodId())
+	podIP := ""
+	if netCfg.PodIP.IsValid() {
+		podIP = netCfg.PodIP.String()
+	}
+	// Render the plan onto disk: the pod-dir share roots, the projected-class
+	// volumes' content under the proj share, and the emptyDir directories under
+	// the vols share. The guest binds these host directories, so they must exist
+	// and be populated BEFORE CreateVM boots it. PVC shares are skipped (the
+	// binder owns their dirs), and a bind's subPath is applied guest-side.
+	if err := mount.MaterializeShares(ctx, box, plan, podIP, r.resolver); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err)
+	}
 	// Every container is resolved host-side (M11.2-d11): the four-quadrant merge of
 	// each container's pod spec against its image config, its expanded
 	// environment, its numeric identity and the share-plan tag its rootfs lower
 	// layer arrives under. The guest performs no merge and reads no image
 	// config, which is what lets it boot with no cluster access — see
-	// resolveVMContainers for what this pulls, what it does not materialize, and
-	// the two fail-closed refusals (a host-binary image, an unresolvable image
-	// USER).
-	containers, reason, err := r.resolveVMContainers(ctx, box, plan, vmPodBackend)
+	// resolveVMContainers for what this pulls and the fail-closed refusals (a
+	// host-binary image, a native sidecar, an unresolvable image USER, and a pod
+	// whose containers name more than one image, which the single pod-wide
+	// rootfs share cannot represent).
+	//
+	// vmRootfs is handed down because the same pass MATERIALIZES the pod's image
+	// into it: the rootfs share the guest overlays is exported from that
+	// directory, and until it holds the image's files the guest boots with an
+	// empty root.
+	containers, reason, err := r.resolveVMContainers(ctx, box, plan, vmPodBackend, vmRootfs)
 	if err != nil {
 		return nil, reason, err
 	}
@@ -693,7 +731,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
 		RootfsPath:  vmRootfs,
-		Network:     r.guestNetworkConfig(box.GetPodId()),
+		Network:     netCfg,
 		Containers:  containers,
 		Volumes:     vmVolumePlan(plan),
 		PodDir:      podDir,

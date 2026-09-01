@@ -164,16 +164,36 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 // backend is the pod's RESOLVED sandbox backend, threaded rather than restated so
 // the image-platform policy of these pulls is the rung the pod is actually
 // confined by (see pullPolicy).
-func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox, plan mount.SharePlan, backend runtimev1.SandboxBackend) ([]sandbox.VMContainer, runtimev1.FailureReason, error) {
+func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox, plan mount.SharePlan, backend runtimev1.SandboxBackend, rootfs string) ([]sandbox.VMContainer, runtimev1.FailureReason, error) {
 	rootfsTag, err := vmRootfsShareTag(plan)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
 	}
 	ordered := vmContainerOrder(box)
+	// The plan carries ONE rootfs share for the whole pod (vmRootfsShareTag's
+	// recorded ceiling), so exactly one image can be materialized into it: the
+	// first container's, in start order. A pod naming a second image is a pod
+	// this layout cannot represent — the second container would run its own
+	// merged argv against the first container's tree. That is logged loudly
+	// rather than overlaid: unpacking image N over image 1 would produce a tree
+	// no manifest describes, which is strictly worse than a legible warning
+	// beside the same broken pod the empty-rootfs build already produced.
+	// Per-container rootfs shares are the layout change that lifts this, and
+	// vmRootfsShareTag is where the selection would then live.
+	if extra, ok := vmExtraRootfsImage(ordered); ok {
+		r.log.Warn("vm pod names more than one image; only the first is materialized into the pod-wide rootfs share",
+			"pod", box.GetPodId(), "rootfs_image", ordered[0].spec.GetImage(), "unmaterialized_image", extra)
+	}
 	out := make([]sandbox.VMContainer, 0, len(ordered))
-	for _, e := range ordered {
-		vc, reason, err := r.resolveVMContainer(ctx, box, e, rootfsTag, backend)
+	for i, e := range ordered {
+		// The pod's single rootfs share is materialized once, from the first
+		// container in start order.
+		dst := ""
+		if i == 0 {
+			dst = rootfs
+		}
+		vc, reason, err := r.resolveVMContainer(ctx, box, e, rootfsTag, backend, dst)
 		if err != nil {
 			return nil, reason, err
 		}
@@ -182,9 +202,36 @@ func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox
 	return out, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
 
+// vmExtraRootfsImage reports the first image in start order that differs from
+// the one the pod's single rootfs share will carry, if any — the observable the
+// multi-image warning above is made from. An empty image is skipped:
+// resolveVMContainer refuses it with its own per-container message.
+func vmExtraRootfsImage(ordered []vmContainer) (string, bool) {
+	first := ""
+	for _, e := range ordered {
+		ref := e.spec.GetImage()
+		if ref == "" {
+			continue
+		}
+		if first == "" {
+			first = ref
+			continue
+		}
+		if ref != first {
+			return ref, true
+		}
+	}
+	return "", false
+}
+
 // resolveVMContainer resolves one container: pull, read the image config, merge
 // it with the pod spec, and map the result onto the guest carrier.
-func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox, e vmContainer, rootfsTag string, backend runtimev1.SandboxBackend) (sandbox.VMContainer, runtimev1.FailureReason, error) {
+//
+// rootfsDest, when non-empty, is the host directory the pod's k3sm.rootfs share
+// exports: this container's image is materialized into it (the guest composes
+// its root as an overlay over that share). It is set for exactly one container
+// per pod — see resolveVMContainers.
+func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox, e vmContainer, rootfsTag string, backend runtimev1.SandboxBackend, rootfsDest string) (sandbox.VMContainer, runtimev1.FailureReason, error) {
 	c := e.spec
 	name := c.GetName()
 	invalid := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
@@ -193,6 +240,10 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	}
 	pullFailed := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
 		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			fmt.Errorf("container %s: %w", name, err)
+	}
+	rootfsFailed := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
+		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("container %s: %w", name, err)
 	}
 
@@ -230,6 +281,35 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		return pullFailed(err)
 	}
 	res.Lease.Release()
+
+	// Materialize the image's layers into the pod's rootfs share (M11.2-d7's
+	// unpacker, on the vm spine). Until this call the vm path pulled and then
+	// left <podDir>/rootfs EMPTY: the guest mounted an empty lower layer, its
+	// first container exec found no /bin/sh, the container exited instantly and
+	// guest init powered the VM off with containers=0. The blobs being in the
+	// store is not the same fact as the pod's rootfs holding runnable files —
+	// MaterializeTree is the one call that turns one into the other.
+	//
+	// It runs after the lease release for the reason the host-process spine
+	// gives (resolveBinary): the reachability root recorded just above is what
+	// protects these blobs for the whole of the unpack, and it is durable where
+	// the lease expires. The dialect comes from the pod's own backend, so a
+	// Linux image is never applied under the native rules.
+	//
+	// A failure is ROOTFS_SETUP, not IMAGE_PULL: the registry did its part.
+	if rootfsDest != "" {
+		policy, perr := unpackPolicy(backend)
+		if perr != nil {
+			return rootfsFailed(perr)
+		}
+		mat, merr := r.unpacker.MaterializeTree(ctx, res.Manifest, policy, rootfsDest)
+		if merr != nil {
+			return rootfsFailed(fmt.Errorf("materialize image %q into %s: %w", ref, rootfsDest, merr))
+		}
+		r.log.Debug("materialized vm pod rootfs",
+			"pod", box.GetPodId(), "container", name, "image", ref, "rootfs", rootfsDest,
+			"tree", mat.Tree.Key, "tree_cache_hit", mat.Tree.CacheHit, "cloned", mat.Cloned)
+	}
 
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
 	if err != nil {

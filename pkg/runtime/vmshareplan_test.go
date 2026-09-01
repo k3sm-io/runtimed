@@ -109,6 +109,14 @@ func vmPodConfig(t *testing.T, d Deps) (Config, Deps) {
 		t.Fatal(err)
 	}
 	d.Cache = cache
+	// A vm pod's projected-class volumes are rendered onto the proj share
+	// before the guest boots (mount.MaterializeShares), and a configMap /
+	// secret / SA-token source with no Resolver fails the pod exactly as it
+	// does on the host-process spine. Every vm test box carries at least one,
+	// so the seam is defaulted here rather than in each test.
+	if d.Resolver == nil {
+		d.Resolver = fakeResolver{}
+	}
 	return Config{Root: root}, d
 }
 

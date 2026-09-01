@@ -387,7 +387,7 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 		}
 	})
 
-	t.Run("pulls once per container, under the VM platform policy, and materializes nothing", func(t *testing.T) {
+	t.Run("pulls once per container, under the VM platform policy, and materializes exactly one rootfs", func(t *testing.T) {
 		pulled, policies, materialized := w.observed()
 		if want := []string{initRef, mainRef, auxRef}; !reflect.DeepEqual(pulled, want) {
 			t.Errorf("pulled %v, want %v (one pull per container, in start order)", pulled, want)
@@ -397,12 +397,13 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 				t.Errorf("pull %d ran under backend %v, want SANDBOX_BACKEND_VM — a vm pod must not select a Mach-O image", i, p.Backend)
 			}
 		}
-		// The deliberate boundary: composing the guest's rootfs lower layer out
-		// of these blobs is the rootfs-builder deliverable, and the plan carries
-		// one pod-wide rootfs share, so materializing here would have each
-		// container's image overwrite the last.
-		if materialized != 0 {
-			t.Errorf("materialized %d trees; the vm path materializes none (see resolveVMContainers)", materialized)
+		// The recorded ceiling, asserted: the plan carries ONE pod-wide rootfs
+		// share, so exactly one image is materialized into it — the first
+		// container's, in start order. Materializing every container's image
+		// would have each overwrite the last; materializing none is the empty
+		// rootfs the guest cannot exec out of.
+		if materialized != 1 {
+			t.Errorf("materialized %d trees; want exactly 1 (the single pod-wide rootfs share)", materialized)
 		}
 	})
 }
