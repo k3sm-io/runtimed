@@ -26,15 +26,15 @@ import (
 // ri_phys_footprint field of proc_pid_rusage. PhysFootprinter is the production
 // implementation (rusage_darwin.go); unit tests inject a fake.
 //
-// ri_phys_footprint is NOT RSS. It is the kernel's phys_footprint ledger for the
+// ri_phys_footprint is not RSS. It is the kernel's phys_footprint ledger for the
 // task — resident + compressed (swapped-but-accounted) + wired + IOKit-mapped
-// memory — the SAME figure jetsam/memorystatus compares against a task's memory
+// memory — the same figure jetsam/memorystatus compares against a task's memory
 // limit. So the OOM threshold the MemorySampler enforces is in phys-footprint
-// units, and so is the working-set value surfaced to kubectl top. CPU is NOT
+// units, and so is the working-set value surfaced to kubectl top. CPU is not
 // bounded here: k3sm CPU limits are best-effort QoS (taskpolicy/setpriority),
 // never CFS millicores. See docs/resources.md.
 //
-// DO NOT "SIMPLIFY" THIS TO RSS. The choice is load-bearing and it is now measured
+// DO not "SIMPLIFY" this TO RSS. The choice is load-bearing and it is now measured
 // rather than argued: a GPU inference process holding 24 GiB of Metal buffers
 // reports ri_phys_footprint 24 593 MB and ri_resident_size 31 MB — RSS is BLIND to
 // the unified-memory working set, moving not at all across the entire ramp. A
@@ -46,18 +46,18 @@ type Footprinter interface {
 	Footprint(pid int) (bytes uint64, err error)
 }
 
-// RUsage is ONE proc_pid_rusage(RUSAGE_INFO_V2) sample: the memory footprint and
-// the cumulative CPU time, read out of the SAME kernel struct by the SAME call.
+// RUsage is one proc_pid_rusage(RUSAGE_INFO_V2) sample: the memory footprint and
+// the cumulative CPU time, read out of the same kernel struct by the same call.
 // Reading both from one sample is the point — a stats snapshot whose memory and
 // CPU came from two calls would straddle two instants, and the extra call would
 // double the per-container syscall cost of every scrape.
 type RUsage struct {
 	// PhysFootprintBytes is ri_phys_footprint — identical to Footprint's value
-	// (NOT RSS; see the Footprinter doc).
+	// (not RSS; see the Footprinter doc).
 	PhysFootprintBytes uint64
-	// CPUTimeNanos is ri_user_time + ri_system_time CONVERTED TO NANOSECONDS via
+	// CPUTimeNanos is ri_user_time + ri_system_time converted to nanoseconds via
 	// the host mach timebase (see MachTimebase — the raw fields are mach absolute
-	// time units, not nanoseconds). It is the process's CUMULATIVE CPU time since
+	// time units, not nanoseconds). It is the process's cumulative CPU time since
 	// exec, i.e. a counter, and is the source of the kubelet Summary API's
 	// CPUStats.usage_core_nano_seconds.
 	//
@@ -71,7 +71,7 @@ type RUsage struct {
 // cumulative CPU time. PhysFootprinter implements it; test fakes that only need
 // the OOM/memory path may implement Footprinter alone.
 //
-// It is a SEPARATE (optional) interface rather than two methods on Footprinter so
+// It is a separate (optional) interface rather than two methods on Footprinter so
 // the memory sampler — which needs nothing else — keeps its 1-method consumer
 // interface, and so a CPU-blind Footprinter stays a legal injection. A consumer
 // type-asserts for it and reports no CPU when it is absent; the k3sm provider
@@ -83,7 +83,7 @@ type RUsager interface {
 	RUsage(pid int) (RUsage, error)
 }
 
-// DefaultBreachSamples is how many CONSECUTIVE over-limit samples a pod must
+// DefaultBreachSamples is how many consecutive over-limit samples a pod must
 // produce before the sampler declares a breach.
 //
 // It is 3 rather than 1 because a single over-limit sample is not evidence of an
@@ -105,7 +105,7 @@ const DefaultBreachSamples = 3
 
 // MemorySampler polls a pod's physical-memory footprint at a fixed interval and,
 // when the summed footprint of its sampled PIDs exceeds limitBytes for
-// breachSamples CONSECUTIVE samples, invokes onBreach EXACTLY ONCE (the runtime
+// breachSamples consecutive samples, invokes onBreach exactly once (the runtime
 // then SIGKILLs the pod and records OOMKilled). limitBytes == 0 disables the OOM
 // check (meter-only — the kubectl top path).
 //
@@ -121,15 +121,15 @@ const DefaultBreachSamples = 3
 // accident: the engines k3sm's inference image can select were each measured
 // single-process/multi-threaded, and the shipped mlx-serve image PINS a
 // single-process engine, so the leader's footprint IS the pod's. Group sampling
-// becomes REQUIRED the moment a forking engine is adopted; the mechanism for it —
+// becomes required the moment a forking engine is adopted; the mechanism for it —
 // enumerating the pod's process group, which the daemon already places each
 // container in — is understood and deliberately not built while nothing forks.
 // Anything that changes the engine's process model must revisit this comment.
 //
-// Concurrency: mu guards last/breached/overRun. The sampling loop is a SINGLE
+// Concurrency: mu guards last/breached/overRun. The sampling loop is a single
 // goroutine with a clear lifetime — Start launches it; it stops when ctx is
 // cancelled (the runtime cancels it on pod teardown / pod termination) and closes
-// Done, so there is no goroutine leak. onBreach is invoked OUTSIDE mu (the
+// Done, so there is no goroutine leak. onBreach is invoked outside mu (the
 // re-entrancy rule).
 type MemorySampler struct {
 	fp       Footprinter
@@ -141,7 +141,7 @@ type MemorySampler struct {
 
 	mu   sync.Mutex
 	last uint64
-	// overRun counts the CONSECUTIVE over-limit samples seen so far; any sample at
+	// overRun counts the consecutive over-limit samples seen so far; any sample at
 	// or under the limit resets it to 0.
 	overRun  int
 	breached bool
@@ -152,7 +152,7 @@ type MemorySampler struct {
 // MemorySamplerOption adjusts a MemorySampler at construction.
 type MemorySamplerOption func(*MemorySampler)
 
-// WithBreachSamples sets how many CONSECUTIVE over-limit samples declare a breach
+// WithBreachSamples sets how many consecutive over-limit samples declare a breach
 // (see DefaultBreachSamples). n < 1 is clamped to 1 — "kill on the first sample" is
 // a coherent, if aggressive, policy, while "kill on zero samples" is not.
 //
@@ -168,7 +168,7 @@ func WithBreachSamples(n int) MemorySamplerOption {
 }
 
 // NewMemorySampler builds a sampler. fp samples per-PID footprints; pids returns
-// the pod's CURRENT PID set (re-evaluated each tick, so an exited container drops
+// the pod's current PID set (re-evaluated each tick, so an exited container drops
 // out); limitBytes is the OOM threshold (0 = meter only); onBreach fires once after
 // DefaultBreachSamples consecutive over-limit samples (nil for meter-only).
 func NewMemorySampler(fp Footprinter, pids func() []int, limitBytes uint64, onBreach func(footprint uint64), opts ...MemorySamplerOption) *MemorySampler {
@@ -231,7 +231,7 @@ func (s *MemorySampler) sampleOnce() {
 		s.overRun++
 	} else {
 		// A single sample back at or under the limit ends the run: the breach
-		// condition is SUSTAINED over-limit, so an oscillating footprint must start
+		// condition is sustained over-limit, so an oscillating footprint must start
 		// counting again rather than accumulate its peaks.
 		s.overRun = 0
 	}

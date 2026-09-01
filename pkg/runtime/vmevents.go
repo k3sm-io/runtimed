@@ -31,7 +31,7 @@ import (
 // stream and folds every event into that pod's container statuses until the
 // stream ends or ctx is cancelled.
 //
-// THE KILL-REASON FORK (B107). This is the ONLY source of OOMKilled for a vm
+// the KILL-reason FORK (B107). This is the only source of OOMKilled for a vm
 // pod. The kill happens in the guest kernel's cgroup, which the host cannot
 // observe at all: the host's proc_pid_rusage sampler can see the vmhost helper's
 // footprint and nothing inside the guest, so a host-derived OOMKilled for a vm
@@ -75,13 +75,13 @@ func (r *Runtime) watchGuestContainerEvents(ctx context.Context, p *pod) error {
 // applyGuestContainerEvent folds one guest-agent container event into p's
 // guest-container statuses.
 //
-// UNTRUSTED DATA. The event names a container, and the name is resolved against
-// what THIS POD DECLARED — an undeclared name is dropped, not created — so the
+// untrusted DATA. The event names a container, and the name is resolved against
+// what this POD declared — an undeclared name is dropped, not created — so the
 // status map a guest can grow is bounded by the pod's own container count and a
 // guest cannot invent a container the cluster never scheduled. The event's own
 // timestamp is ignored in favour of a host stamp for the same reason vmPodStats
 // host-stamps its sample: a guest-chosen time on a host status is a guest-chosen
-// ordering. The exit code and signal ARE taken verbatim — the guest legitimately
+// ordering. The exit code and signal are taken verbatim — the guest legitimately
 // owns them (it ran the process), exactly as the exec route relays an exit code.
 func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 	name := ev.GetContainer()
@@ -115,7 +115,7 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 	}}
 	st.Ready = false
 	if exited.GetOomKilled() {
-		// The pod-level latch, set from the ONE source that can observe a guest
+		// The pod-level latch, set from the one source that can observe a guest
 		// cgroup OOM. It mirrors the host spine's p.oomKilled, which only the host
 		// sampler sets — and which oomKill refuses to set for a vm pod.
 		p.oomKilled = true
@@ -153,7 +153,7 @@ func (p *pod) guestContainerLocked(name, image string) *runtimev1.ContainerStatu
 }
 
 // declaredContainerSpec returns the pod's declaration of name, or nil when the
-// pod declares no such container. Unlike vmContainerName it does NOT treat an
+// pod declares no such container. Unlike vmContainerName it does not treat an
 // empty name as "the sole container": a verb's selector may be elided by an
 // operator, but an EVENT that does not say which container it is about is
 // malformed, and resolving it to a guess would attribute a guest's exit — an
@@ -178,13 +178,13 @@ func declaredContainerSpec(box *runtimev1.PodBox, name string) *runtimev1.Contai
 // watchVMPodEvents keeps a vm pod's guest-container statuses fed for the pod's
 // whole life, restarting the subscription when the stream ends.
 //
-// THE RETRY IS THIS FUNCTION'S JOB, not watchGuestContainerEvents'. That function
+// the RETRY IS this FUNCTION'S JOB, not watchGuestContainerEvents'. That function
 // deliberately returns a stream error rather than retrying, because only the
 // caller knows whether a dead agent means "resubscribe" or "the VM is gone" — and
 // here the answer is knowable: the helper's exit watch owns "the VM is gone", so
 // anything this loop sees while the helper is alive is a stream that should be
 // re-established. Without the retry, one transient agent hiccup would silence a
-// pod's container statuses — including its ONLY source of OOMKilled — for the
+// pod's container statuses — including its only source of OOMKilled — for the
 // rest of its life, with nothing to indicate it had stopped listening.
 //
 // The delay between attempts is what keeps a guest whose agent is permanently
@@ -215,14 +215,14 @@ const guestEventResubscribeDelay = time.Second
 
 // watchVMHelperExit fails a vm pod when its host helper dies after readiness.
 //
-// WITHOUT IT A POD WEDGES AT RUNNING. Everything that reports a vm pod's health
+// without it a pod wedges at running. Everything that reports a vm pod's health
 // flows through the guest agent, and the agent is reached through the helper — so
 // when the hypervisor dies, the guest panics, or the helper is killed, the pod's
 // containers simply stop being updated and the pod sits Running forever with no
 // host-side event. The kubelet analog is a container runtime noticing its own
 // child exited; here the child IS the machine.
 //
-// It reports the pod FAILED with the helper's retained output, which is the same
+// It reports the pod failed with the helper's retained output, which is the same
 // evidence a pre-ready failure would have carried — read while the handle is
 // still registered, because StopVM drops it. A clean daemon shutdown does not
 // come through here: Close cancels supCtx first, and the ctx arm wins.
@@ -259,7 +259,7 @@ func (r *Runtime) watchVMHelperExit(ctx context.Context, p *pod) {
 // reason, because a pod whose machine is gone cannot have a running container in
 // it — and a status that left them Running would be read by the provider as a
 // healthy pod behind a failed one, which is exactly the wedge this path exists to
-// prevent. The publish happens OUTSIDE p.mu (the re-entrancy rule).
+// prevent. The publish happens outside p.mu (the re-entrancy rule).
 func (r *Runtime) failVMPod(p *pod, reason, message string) {
 	at := nowProto()
 	p.mu.Lock()

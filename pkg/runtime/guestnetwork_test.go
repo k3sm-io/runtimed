@@ -36,7 +36,7 @@ import (
 // optional GuestNetworker seam — the shape the k3sm provider's network adapter
 // takes in production. It returns a caller-supplied config with a caller-supplied
 // comma-ok, and records every podID it was consulted for, so a test can assert
-// BOTH that the vm route consults it and that the host-process route never does.
+// both that the vm route consults it and that the host-process route never does.
 type guestNetworkerNetwork struct {
 	recordingNetwork
 	cfg sandbox.GuestNetworkConfig
@@ -60,7 +60,7 @@ func (n *guestNetworkerNetwork) guestNetworkCalls() []string {
 }
 
 // Compile-time proof the fake really satisfies the seam under test: without it a
-// renamed method would make every assertion below pass through the ABSENT branch,
+// renamed method would make every assertion below pass through the absent branch,
 // which is the one way this file could go quietly vacuous.
 var _ GuestNetworker = (*guestNetworkerNetwork)(nil)
 
@@ -87,7 +87,7 @@ func (b *lockedBuffer) String() string {
 // newGuestNetworkRuntime builds a vm-capable Runtime over pn, with WARN-and-above
 // log output captured. vmPodConfig supplies the Config.Root/image-cache alignment
 // every vm-routed pod needs (see its doc); the logger is layered on top because
-// the absent-producer contract is HALF a log assertion.
+// the absent-producer contract is half a log assertion.
 func newGuestNetworkRuntime(t *testing.T, pn supervisor.PodNetwork) (*Runtime, *fakeVMBackend, *lockedBuffer) {
 	t.Helper()
 	vmb := &fakeVMBackend{available: true}
@@ -103,7 +103,7 @@ func vmBackedBox(rt *Runtime, podID string) *runtimev1.PodBox {
 }
 
 // distinctiveGuestNetwork is a guest network config whose every field is
-// recognizably NOT a zero value and NOT any default the runtime could invent —
+// recognizably not a zero value and not any default the runtime could invent —
 // two nameservers, a three-entry search list, two options, and NAT addresses in
 // ranges no other fixture in this package uses. That is what makes "these exact
 // values reached the backend" a real assertion rather than a coincidence.
@@ -137,7 +137,7 @@ func distinctiveGuestNetwork() sandbox.GuestNetworkConfig {
 // what crossed the seam, never against the producer fake's own input: a test that
 // re-reads its fixture proves only that Go can copy a struct. It also pins the
 // two collateral facts the seam must not break — the producer is consulted for
-// THIS pod id, and the vm route still binds no lo0 alias (a NAT-attached guest
+// this pod id, and the vm route still binds no lo0 alias (a NAT-attached guest
 // gets no host /32).
 func TestCreateVMPodUsesGuestNetworkerWhenPresent(t *testing.T) {
 	want := distinctiveGuestNetwork()
@@ -179,7 +179,7 @@ func TestCreateVMPodUsesGuestNetworkerWhenPresent(t *testing.T) {
 }
 
 // TestCreateVMPodFallsBackWhenGuestNetworkerAbsent is the M11.2-d8 acceptance
-// (absent half): with no config available the vm backend receives the INERT ZERO
+// (absent half): with no config available the vm backend receives the inert zero
 // value — never a partial or invented one — and the miss is LOGGED.
 //
 // The log is the point of the row, not decoration. A vm pod with no

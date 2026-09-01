@@ -34,7 +34,7 @@ type reapResult struct {
 
 // fakeProc is the Proc seam's test double. It models the kernel's side of the
 // contract: children exist or they do not, an exited child is reaped once, and
-// every signal and poweroff is recorded in ONE ordered log so the stop
+// every signal and poweroff is recorded in one ordered log so the stop
 // sequence's ordering can be asserted rather than timed.
 type fakeProc struct {
 	mu          sync.Mutex
@@ -213,7 +213,7 @@ func startReaper(t *testing.T, f *fakeProc, opts ReaperOptions) *Reaper {
 
 // TestPID1ReapAndForward pins the reap half of the PID 1 contract: every
 // tracked child's exit reaches the callback exactly once and with its real
-// status, every orphan is reaped and NOT forwarded, and neither property
+// status, every orphan is reaped and not forwarded, and neither property
 // depends on whether the child was reaped before or after its Track landed.
 func TestPID1ReapAndForward(t *testing.T) {
 	t.Parallel()
@@ -436,7 +436,7 @@ func TestReaperWaitSequencesAnInitContainer(t *testing.T) {
 	})
 }
 
-// TestStopTermGraceKillPoweroff pins the ORDER of the stop state machine.
+// TestStopTermGraceKillPoweroff pins the order of the stop state machine.
 //
 // The assertion is over one ordered log into which the test itself inserts the
 // "grace timer fired" marker, so "SIGKILL never precedes the grace deadline"

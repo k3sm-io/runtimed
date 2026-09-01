@@ -18,7 +18,7 @@ limitations under the License.
 
 package sandbox
 
-// probeMetal is the OFF-PLATFORM functional Metal probe: on any lane that is NOT
+// probeMetal is the off-PLATFORM functional Metal probe: on any lane that is not
 // darwin+cgo the Metal shim is not compiled in, so the probe cannot answer and
 // reports UnsupportedBuild — "this build cannot ask" is a different fact from "this
 // host has no GPU", and the Reason token keeps them apart the way the vm backend's

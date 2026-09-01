@@ -154,7 +154,7 @@ func TestWrapCommand(t *testing.T) {
 			t.Fatalf("WrapCommand: %v", err)
 		}
 		defer cleanup()
-		// The tokens sit at the fixed positions BEFORE the profile path — an OLD
+		// The tokens sit at the fixed positions before the profile path — an old
 		// shim (pre-B7 arity) would read argv[4] as its profile path, fail the
 		// ReadFile, and exit 3: fail-closed under daemon/shim binary skew.
 		if want := supervisor.EncodeRlimits(plan); argv[4] != want {

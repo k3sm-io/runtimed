@@ -38,7 +38,7 @@ var errLogLimitReached = errors.New("log limit_bytes budget spent")
 // caller, because they decide which lines reach the emitter at all.
 //
 // The budget is denominated in the bytes the client receives, which for a
-// line-delimited stream is the rendered line PLUS its newline delimiter — the
+// line-delimited stream is the rendered line plus its newline delimiter — the
 // same unit `kubectl logs --limit-bytes` means and the same unit the buffer's own
 // cap uses. The prefix counts against it too: a caller that asked for timestamps
 // asked for those bytes.
@@ -65,7 +65,7 @@ func newLogEmitter(stream grpc.ServerStreamingServer[runtimev1.LogEntry], req *r
 // so the emitted bytes stay valid UTF-8.
 //
 // The structured LogEntry.timestamp is set on every entry regardless of the
-// timestamps option: the option governs the kubectl RENDERING, while the field is
+// timestamps option: the option governs the kubectl rendering, while the field is
 // the entry's instant, which a non-kubectl consumer of the stream should not have
 // to parse back out of the line.
 func (e *logEmitter) send(ent logLine) error {

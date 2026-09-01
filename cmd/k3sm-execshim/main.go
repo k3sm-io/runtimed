@@ -21,14 +21,14 @@ limitations under the License.
 //
 // The three leading tokens are the pod's securityContext identity
 // (supervisor.Credential, encoded by Credential.ShimArgs); "-1 -1 -" means "no
-// drop" — run at the daemon's OWN uid, confined by Seatbelt (the unprivileged
+// drop" — run at the daemon's own uid, confined by Seatbelt (the unprivileged
 // _k3sm posture, not root). A drop is refused unless the shim is root
 // (RunLaunchSequence → Credential.Validate).
 //
-// The next two tokens are the pod's launch spec (B7), each a SINGLE
-// fixed-position token placed BEFORE the profile path:
+// The next two tokens are the pod's launch spec (B7), each a single
+// fixed-position token placed before the profile path:
 //
-//   - <rlimits>: the resolved NUMERIC setrlimit(2) plan,
+//   - <rlimits>: the resolved numeric setrlimit(2) plan,
 //     "r=RESOURCE:cur:max[,RESOURCE:cur:max...]" or "-" for none
 //     (supervisor.EncodeRlimits/ParseRlimits; the RLIMIT_* name table stays
 //     daemon-side — the shim only ever sees numeric selectors);
@@ -36,35 +36,35 @@ limitations under the License.
 //     (setpriority(2) PRIO_DARWIN_PROCESS/PRIO_DARWIN_BG), or "-" for no call
 //     (supervisor.EncodeQoS/ParseQoS).
 //
-// A malformed/truncated launch-spec token is FATAL (exit 5): the shim never
+// A malformed/truncated launch-spec token is fatal (exit 5): the shim never
 // skips a limit with a warning and never execs the pod without the limits it
 // was handed. The pre-profile position makes daemon/shim binary skew fail
-// closed in both directions: an OLD shim handed this argv reads the rlimit
-// token as its profile path and exits 3 on the ReadFile; a NEW shim handed the
+// closed in both directions: an old shim handed this argv reads the rlimit
+// token as its profile path and exits 3 on the ReadFile; a new shim handed the
 // old (token-less) argv reads a profile path where it expects the rlimit token
 // and exits 5 on the decode.
 //
 // Exit codes: 2 usage/credential, 3 profile read, 4 launch-sequence failure,
 // 5 launch-spec token decode failure.
 //
-// The shim then, in the SECURITY-CRITICAL order supervisor.RunLaunchSequence
+// The shim then, in the SECURITY-critical order supervisor.RunLaunchSequence
 // enforces:
 //
 //	(1) applies the rlimit plan (before the drop — a hard raise needs euid 0);
-//	(2) drops privilege: setgid → initgroups → setuid   (setgid BEFORE setuid;
+//	(2) drops privilege: setgid → initgroups → setuid   (setgid before setuid;
 //	    after setuid to non-root the gid can no longer change);
-//	(3) backgrounds itself when <qos> requests it (BEFORE the sandbox — a
+//	(3) backgrounds itself when <qos> requests it (before the sandbox — a
 //	    default-deny SBPL may deny setpriority; pre-exec so descendants inherit);
-//	(4) applies the SBPL profile to ITSELF via libsandbox (irreversible — a
+//	(4) applies the SBPL profile to itself via libsandbox (irreversible — a
 //	    sandboxed/uid-dropped process can neither setuid nor chown, so the drop
-//	    MUST precede this);
-//	(5) execve's the pod binary, PRESERVING the inherited environment — so
+//	    must precede this);
+//	(5) execve's the pod binary, preserving the inherited environment — so
 //	    DYLD_INSERT_LIBRARIES (the darwin-net DNS-shim enabler) survives into the
-//	    pod. This is deliberately NOT /usr/bin/sandbox-exec: that platform binary
+//	    pod. This is deliberately not /usr/bin/sandbox-exec: that platform binary
 //	    strips DYLD_* (Wave-0 confirmed this live), which would break the shim.
 //
-// The fsGroup chown of the writable volumes happens ROOT-SIDE in the daemon
-// BEFORE this shim is spawned (a dropped process can no longer chown).
+// The fsGroup chown of the writable volumes happens ROOT-side in the daemon
+// before this shim is spawned (a dropped process can no longer chown).
 //
 // Privilege-model note (runtimed): the daemon runs unprivileged as _k3sm and the
 // only root component is a separate k3sm-netd networking helper. A pod with no
@@ -99,7 +99,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "k3sm-execshim: parse credential: %v\n", err)
 		os.Exit(2)
 	}
-	// The launch-spec tokens are FATAL on any decode error (exit 5): the pod must
+	// The launch-spec tokens are fatal on any decode error (exit 5): the pod must
 	// never exec without the limits/qos it was handed (fail-closed, incl. under
 	// daemon/shim binary skew — see the package comment).
 	plan, err := supervisor.ParseRlimits(os.Args[4])

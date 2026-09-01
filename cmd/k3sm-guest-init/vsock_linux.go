@@ -30,17 +30,17 @@ import (
 
 // The AF_VSOCK listener the guest agent is served on.
 //
-// NO NEW DEPENDENCY. golang.org/x/sys/unix is already a dependency of this module
+// NO new DEPENDENCY. golang.org/x/sys/unix is already a dependency of this module
 // and carries the whole AF_VSOCK surface (SockaddrVM, the CID constants,
 // Accept4) — so the transport that makes the guest reachable costs the initramfs
 // nothing it was not already carrying.
 //
-// WHY THE ADAPTERS BELOW EXIST, given the standard library already wraps fds:
-// net.FileListener and net.FileConn REFUSE a socket family they do not recognize
+// why the ADAPTERS below EXIST, given the standard library already wraps fds:
+// net.FileListener and net.FileConn refuse a socket family they do not recognize
 // (they switch on the address family and return "unknown network"), and AF_VSOCK
 // is not among them. So the fds cannot be handed to net directly.
 //
-// What CAN be reused is os.NewFile, which registers a non-blocking fd with the
+// What can be reused is os.NewFile, which registers a non-blocking fd with the
 // runtime's network poller. That is the whole reason to go through os.File rather
 // than raw unix.Read/unix.Write: it keeps deadlines working (SetReadDeadline on an
 // os.File backed by the poller), keeps a blocked goroutine parked instead of
@@ -63,7 +63,7 @@ func (a vsockAddr) String() string  { return fmt.Sprintf("vsock:%d:%d", a.cid, a
 // vsock is its own hypervisor, so binding to a specific CID would buy no isolation
 // and would break when the host CID differs from the one this code guessed.
 //
-// The socket is created NON-BLOCKING with CLOEXEC. Non-blocking is what lets
+// The socket is created non-BLOCKING with CLOEXEC. Non-blocking is what lets
 // os.NewFile attach it to the runtime poller (see the file comment); CLOEXEC keeps
 // the listener out of every container this init forks, which matters because those
 // processes are the tenant's.

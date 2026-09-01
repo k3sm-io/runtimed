@@ -187,7 +187,7 @@ func pushImage(t *testing.T, host, repo string, img ggcrv1.Image) string {
 	return ref.String()
 }
 
-// resolvedPlatform reports the platform of a fetched image, read from its OWN
+// resolvedPlatform reports the platform of a fetched image, read from its own
 // config — the only claim about an image that its digest actually covers.
 func resolvedPlatform(t *testing.T, img ggcrv1.Image) Platform {
 	t.Helper()
@@ -198,7 +198,7 @@ func resolvedPlatform(t *testing.T, img ggcrv1.Image) Platform {
 	return Platform{OS: cf.OS, Architecture: cf.Architecture, Variant: cf.Variant}.Normalize()
 }
 
-// mustDigest is the image digest, used to prove WHICH child was selected.
+// mustDigest is the image digest, used to prove which child was selected.
 func mustDigest(t *testing.T, img ggcrv1.Image) string {
 	t.Helper()
 	d, err := img.Digest()
@@ -254,7 +254,7 @@ func mustPuller(t *testing.T, cache *Cache, fetch FetchFunc) *Puller {
 // mustPullerIndex is mustPuller with an explicit LocalIndex, for the tests that
 // put a reference in the "recorded on this node" state.
 //
-// It pins the disk-pressure sampler to a fixed roomy value, so every OTHER test
+// It pins the disk-pressure sampler to a fixed roomy value, so every other test
 // in this package states a free volume rather than inheriting the developer's
 // actual disk — a machine below DefaultPullRefuseFreeBytes would otherwise red
 // the whole pull suite for a reason none of those tests is about. The admission
@@ -292,7 +292,7 @@ func mustCandidates(t *testing.T, p PlatformPolicy) []Platform {
 // policy, and there is structurally no path left on which
 // go-containerregistry's implicit linux/amd64 default can fire.
 //
-// EVERY assertion the gate makes is a subtest of THIS function — the item is
+// every assertion the gate makes is a subtest of this function — the item is
 // run as `go test -run '^TestManifestListPlatformSelection$'`, so anything in a
 // sibling Test... would not be gate-proving.
 //
@@ -416,7 +416,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	// The production path itself, not a fake: NewPuller(cache, RemoteFetch) is
-	// EXACTLY how runtime.New builds the daemon's puller, so this subtest is the
+	// exactly how runtime.New builds the daemon's puller, so this subtest is the
 	// only thing standing between a green table and a green table that never
 	// executed RemoteFetch (the pre-B99 pull tests all replaced the fetcher).
 	t.Run("e2e/production_puller_fails_closed", func(t *testing.T) {
@@ -494,7 +494,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	// the fail-closed verdicts a conforming registry cannot produce.
 	// -----------------------------------------------------------------
 
-	// A 200 kB digest ALGORITHM. go-containerregistry's v1.Hash parser formats
+	// A 200 kB digest algorithm. go-containerregistry's v1.Hash parser formats
 	// the offending string into its error verbatim (hash.go "unsupported hash:
 	// %q"), and the index body it came from is capped only by ggcr's 100 MiB
 	// manifest limit — so echoing that error with %w hands a registry a
@@ -556,7 +556,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 
 	t.Run("e2e/unsupported_manifest_media_type_refused", func(t *testing.T) {
 		// A legacy Docker schema-1 manifest (no platform information at all).
-		// k3sm REFUSES it rather than guessing; ggcr's own alternative is to
+		// k3sm refuses it rather than guessing; ggcr's own alternative is to
 		// assume "image" and warn. The branch is only reachable from a registry
 		// that serves a non-image, non-index Content-Type.
 		host := rawRegistry(t, map[string]rawResponse{
@@ -631,7 +631,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 				if len(got) != len(tc.want) {
 					t.Fatalf("Candidates = %v, want %v", got, tc.want)
 				}
-				// ORDER is asserted, not set membership: the native arch must
+				// order is asserted, not set membership: the native arch must
 				// precede the Rosetta-translated fallback or a translated
 				// image would be preferred over a native one.
 				for i := range got {
@@ -745,7 +745,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	t.Run("select/unknown_variant_never_matched", func(t *testing.T) {
-		// Decided verdict: arm64/v9 is NOT accepted for an arm64/v8 candidate.
+		// Decided verdict: arm64/v9 is not accepted for an arm64/v8 candidate.
 		// armv9 mandates SVE2, which Apple Silicon does not implement, so a
 		// permissive variant match would select binaries that fault at first
 		// use — the exact fail-open shape ggcr's Satisfies has.
@@ -770,14 +770,14 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	t.Run("select/digest_less_child_never_selected", func(t *testing.T) {
-		// A child that OMITS the digest key never invokes v1.Hash.UnmarshalJSON
-		// (an absent JSON key is not decoded at all), so it keeps the ZERO
+		// A child that omits the digest key never invokes v1.Hash.UnmarshalJSON
+		// (an absent JSON key is not decoded at all), so it keeps the zero
 		// v1.Hash — which renders as ":" and is otherwise a perfectly selectable
 		// image child. Selection is first-match-wins, so a hostile index can
 		// place a digest-less darwin/arm64 child AHEAD of the real one and
 		// deterministically shadow it. The outcome stays fail-closed downstream
-		// (ggcr refuses the malformed reference), but the allowlist is POSITIVE
-		// and the OCI spec makes digest REQUIRED, so it is rejected here.
+		// (ggcr refuses the malformed reference), but the allowlist is positive
+		// and the OCI spec makes digest required, so it is rejected here.
 		t.Run("absent_digest_key_parses_as_a_selectable_zero_hash", func(t *testing.T) {
 			var idx ggcrv1.IndexManifest
 			body := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[` +
@@ -924,7 +924,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	t.Run("select/nested_index_child_is_refused", func(t *testing.T) {
-		// Decided verdict: an index-of-index is REFUSED with its own sentinel,
+		// Decided verdict: an index-of-index is refused with its own sentinel,
 		// not traversed. The platform IS on offer, so reporting "no match"
 		// would misdescribe it; recursion into registry-controlled fan-out is
 		// not worth the blast radius for a shape no target registry publishes.
@@ -946,7 +946,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	// -----------------------------------------------------------------
-	// VerifyConfigPlatform: the child's OWN config is the authority.
+	// VerifyConfigPlatform: the child's own config is the authority.
 	// -----------------------------------------------------------------
 	t.Run("verify/config", func(t *testing.T) {
 		cases := []struct {
@@ -960,7 +960,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 			{"match_explicit_variant", &ggcrv1.ConfigFile{OS: "darwin", Architecture: "arm64", Variant: "v8"}, nativePolicy(), platDarwinARM64, false},
 			{"foreign_os", &ggcrv1.ConfigFile{OS: "linux", Architecture: "arm64"}, nativePolicy(), Platform{}, true},
 			{"foreign_arch", &ggcrv1.ConfigFile{OS: "darwin", Architecture: "amd64"}, nativePolicy(), Platform{}, true},
-			// Decided verdict: an unstated platform FAILS CLOSED. Treating
+			// Decided verdict: an unstated platform FAILS closed. Treating
 			// "not declared" as "compatible" is the bug this item removes.
 			{"empty_os", &ggcrv1.ConfigFile{Architecture: "arm64"}, nativePolicy(), Platform{}, true},
 			{"empty_arch", &ggcrv1.ConfigFile{OS: "darwin"}, nativePolicy(), Platform{}, true},
@@ -1035,7 +1035,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 				}
 			})
 		}
-		// ErrNestedIndex is NOT reachable through ErrNoPlatformMatch, so a
+		// ErrNestedIndex is not reachable through ErrNoPlatformMatch, so a
 		// consumer testing only the documented sentinel would miss it — the
 		// defect the predicate exists to prevent.
 		if errors.Is(ErrNestedIndex, ErrNoPlatformMatch) {
@@ -1079,7 +1079,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	})
 
 	t.Run("error/bounded_third_party_error_keeps_its_chain", func(t *testing.T) {
-		// boundErr caps the RENDERING of a foreign error, not the error: a
+		// boundErr caps the rendering of a foreign error, not the error: a
 		// caller must still be able to classify the cause. (ggcr's transport
 		// errors are the real case — errors.As on a *transport.Error is how a
 		// consumer tells an auth failure from a 404.)
@@ -1165,12 +1165,12 @@ func TestManifestListPlatformSelection(t *testing.T) {
 		// branch: with two hostile children the rendered message stayed under
 		// maxErrorLen, so this case passed for a reason unrelated to the
 		// mechanism it names. Nine children (each carrying a hostile
-		// architecture AND variant) put it comfortably over the cap.
+		// architecture and variant) put it comfortably over the cap.
 		//
-		// The é/あ tokens are PRINTABLE NON-ASCII: strconv.Quote passes them
+		// The é/あ tokens are PRINTABLE non-ASCII: strconv.Quote passes them
 		// through as raw multi-byte UTF-8, so a byte-boundary cut of the message
 		// lands mid-rune and emits an invalid UTF-8 string — which
-		// google.golang.org/protobuf then REFUSES to marshal into the proto3
+		// google.golang.org/protobuf then refuses to marshal into the proto3
 		// string field of the pod's failure status (rpcStatus/google.rpc.Status),
 		// letting a hostile registry choose whether the operator sees the typed
 		// failure at all. strconv.QuoteToASCII is what makes the cut safe.

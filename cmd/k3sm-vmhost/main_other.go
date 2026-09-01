@@ -16,7 +16,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command k3sm-vmhost is the per-pod VM host helper. This is the OFF-PLATFORM
+// Command k3sm-vmhost is the per-pod VM host helper. This is the off-PLATFORM
 // stub: Virtualization.framework exists only on darwin and is reachable only
 // through cgo, so on every other build lane the helper refuses to run rather than
 // failing to compile.

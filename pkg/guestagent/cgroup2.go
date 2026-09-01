@@ -26,10 +26,10 @@ import (
 // ErrCgroupFieldAbsent reports that a cgroup2 file did not carry the field the
 // caller asked for.
 //
-// It is a distinct error rather than a zero value because ABSENCE AND ZERO ARE
-// DIFFERENT FACTS and the metering surface must not confuse them: a zero working
+// It is a distinct error rather than a zero value because ABSENCE and zero are
+// different FACTS and the metering surface must not confuse them: a zero working
 // set is indistinguishable from an idle container, so a container whose sample
-// could not be read is OMITTED from the response (guest.proto says so of the
+// could not be read is omitted from the response (guest.proto says so of the
 // response itself) rather than reported as zeros.
 var ErrCgroupFieldAbsent = errors.New("guestagent: field absent from the cgroup2 file")
 
@@ -42,7 +42,7 @@ var ErrCgroupFieldAbsent = errors.New("guestagent: field absent from the cgroup2
 // wrong number in `kubectl top`, and a parser that only exists in a linux-only
 // file is a parser no darwin test can reach.
 //
-// Unknown lines are SKIPPED, not rejected: the kernel adds counters over time, and
+// Unknown lines are skipped, not rejected: the kernel adds counters over time, and
 // an agent that refused to read cpu.stat because a newer kernel added a field
 // would report nothing at all rather than the field it came for.
 func ParseKeyedUint(content, field string) (uint64, error) {
@@ -91,7 +91,7 @@ func CPUUsageUsec(cpuStat string) (uint64, error) {
 // WorkingSet computes the working set from memory.current and memory.stat, as
 // `current - inactive_file`, saturating at zero.
 //
-// THAT SUBTRACTION IS THE DEFINITION, not an approximation. It is what the kubelet
+// that SUBTRACTION IS the DEFINITION, not an approximation. It is what the kubelet
 // reports as working-set bytes, and memory.current alone is not: page cache is
 // charged to a cgroup, so a container that has merely READ a large file would
 // otherwise appear to be holding all of it live — and would be the one an operator

@@ -18,7 +18,7 @@ limitations under the License.
 // core of the k3sm-execshim helper. It exposes a single Go function, RunPodLaunch,
 // that — in the irreversible order supervisor.RunLaunchSequence enforces — drops
 // to the pod's securityContext identity (setgid→initgroups→setuid), compiles and
-// applies an SBPL profile to the CURRENT process via the private libsandbox SPI,
+// applies an SBPL profile to the current process via the private libsandbox SPI,
 // and then execve's the pod binary, preserving the environment.
 //
 // This is the only place the libsandbox cgo lives (execshim_darwin.go); it is
@@ -35,6 +35,6 @@ limitations under the License.
 //	void  sandbox_free_error(char *error);
 //
 // sandbox_compile_string returns an opaque profile handle (NULL on failure);
-// sandbox_apply confines the calling process to it irreversibly. These are NOT
+// sandbox_apply confines the calling process to it irreversibly. These are not
 // declared in the public <sandbox.h>; we declare them extern and link -lsandbox.
 package execshim

@@ -23,7 +23,7 @@ import (
 
 // DefaultRingEntries and DefaultRingBytes bound one container's retained output.
 //
-// BOTH bounds are needed, and neither implies the other: an entry cap alone lets a
+// both bounds are needed, and neither implies the other: an entry cap alone lets a
 // container hold a gigabyte in a thousand enormous lines, and a byte cap alone lets
 // it hold a million empty ones. The guest has no disk of its own — the ring is in
 // the VM's RAM, which is the pod's hypervisor-enforced memory ceiling — so an
@@ -44,7 +44,7 @@ type LogStreamKind int
 const (
 	// StreamStdout is the container's standard output.
 	StreamStdout LogStreamKind = iota
-	// StreamStderr is the container's standard error. It is kept SEPARATE all the
+	// StreamStderr is the container's standard error. It is kept separate all the
 	// way through: `kubectl logs` presents them together, but a consumer that
 	// asked for the split and got a merge cannot recover it.
 	StreamStderr
@@ -88,7 +88,7 @@ type Selector struct {
 // `kubectl logs -f` reads from.
 //
 // Locking discipline: mu guards every field. Subscriber channels are BUFFERED and
-// SENT TO NON-BLOCKINGLY while mu is held, so a slow or abandoned follower can
+// SENT TO non-BLOCKINGLY while mu is held, so a slow or abandoned follower can
 // never block the container's writer — which, in a guest, is the pod's own process
 // pump. A follower that cannot keep up loses entries; it does not stop the
 // workload.
@@ -158,7 +158,7 @@ func (r *Ring) Append(e LogEntry) {
 
 // Snapshot returns the retained entries matching sel, oldest first.
 //
-// The ORDER of the two filters is the upstream one and it is not interchangeable:
+// The order of the two filters is the upstream one and it is not interchangeable:
 // since_time narrows first, then tail_lines takes the last N of what remains. The
 // other order would return the last N entries overall and then drop the ones
 // before since_time, which for a container that went quiet returns nothing at all

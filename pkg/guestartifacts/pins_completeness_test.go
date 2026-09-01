@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-// TestGuestKernelPinLiteralsCarryValidDigests reads this package's own SOURCE
+// TestGuestKernelPinLiteralsCarryValidDigests reads this package's own source
 // and checks every GuestKernelPin composite literal in it.
 //
 // # Why source and not values
@@ -43,9 +43,9 @@ import (
 //
 // # What it asserts
 //
-// For every pin literal found, each digest field is either EMPTY — the honest
+// For every pin literal found, each digest field is either empty — the honest
 // unminted state, which Complete() reports as false and Lookup refuses — or
-// exactly 64 lowercase hex characters. It also refuses a HALF-minted pair, since
+// exactly 64 lowercase hex characters. It also refuses a half-minted pair, since
 // one digest without the other names an artifact set that cannot be assembled.
 //
 // # Why the count is fatal
@@ -114,7 +114,7 @@ func parsePackageSource(t *testing.T, dir string) map[string]*ast.File {
 	return files
 }
 
-// guestKernelPinLiterals returns the VALUE literals of every
+// guestKernelPinLiterals returns the value literals of every
 // map[string]GuestKernelPin composite literal in file.
 //
 // The walk is deliberately scoped to map values, which is what a pin table is.
@@ -123,7 +123,7 @@ func parsePackageSource(t *testing.T, dir string) map[string]*ast.File {
 // enclosing map's value type — matching the map is therefore the only way to
 // find them at all.
 //
-// A GuestKernelPin literal that is NOT a map value is out of scope, and that is
+// A GuestKernelPin literal that is not a map value is out of scope, and that is
 // a decision rather than an oversight: ensure.go legitimately constructs a
 // transient GuestKernelPin from digests it has just computed
 // (verifySetDir's SetDigest call), whose fields are variables and not literals a
@@ -161,7 +161,7 @@ func guestKernelPinLiterals(file *ast.File) []*ast.CompositeLit {
 
 // pinDigestField extracts one string-literal field from a pin literal.
 //
-// An ABSENT field reads as empty, matching Go's own zero value. A field whose
+// An absent field reads as empty, matching Go's own zero value. A field whose
 // value is not a plain string literal — a constant reference, a concatenation, a
 // function call — is a hard failure rather than a skip: a digest that cannot be
 // read off the page cannot be reviewed on the page either, and this walk exists

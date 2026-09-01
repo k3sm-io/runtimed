@@ -25,7 +25,7 @@ import (
 
 // TestLadderDropsUIDJailWhenNotRoot is deliverable #4 (ladder half): the uidjail
 // rung needs root (it must setuid/chown to a per-pod identity), so the not-root
-// ladder MUST exclude it — leaving only rungs that confine without per-pod root
+// ladder must exclude it — leaving only rungs that confine without per-pod root
 // (seatbelt, vm). The root ladder keeps uidjail as a pinnable rung.
 func TestLadderDropsUIDJailWhenNotRoot(t *testing.T) {
 	notRoot := Ladder(false)
@@ -52,9 +52,9 @@ func TestLadderDropsUIDJailWhenNotRoot(t *testing.T) {
 // TestSelectBackendUnspecifiedUsesLadder is the host-process default path (M5.1):
 // a pod with no explicit backend — UNSPECIFIED, what the provider stamps for a pod
 // without a vm RuntimeClass — walks the host-OS-gated ladder. It degrades to a
-// STRONGER rung, never a weaker one, and NEVER to "unconfined":
+// stronger rung, never a weaker one, and never to "unconfined":
 //   - Seatbelt available => seatbelt (the default rung).
-//   - Seatbelt tripped (missing SPI / canary) + vm available => vm, NOT unconfined.
+//   - Seatbelt tripped (missing SPI / canary) + vm available => vm, not unconfined.
 //   - Seatbelt tripped + no vm => ErrNoIsolation (refuse to run).
 //
 // In every case the result is either a confining rung or an error — the selector
@@ -99,7 +99,7 @@ func TestSelectBackendUnspecifiedUsesLadder(t *testing.T) {
 				if !errors.Is(err, ErrNoIsolation) {
 					t.Fatalf("want ErrNoIsolation, got rung=%v err=%v", got, err)
 				}
-				// A refusal must NOT smuggle a usable-looking rung past the caller.
+				// A refusal must not smuggle a usable-looking rung past the caller.
 				if got != runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED {
 					t.Errorf("refusal returned rung %v, want UNSPECIFIED", got)
 				}
@@ -111,7 +111,7 @@ func TestSelectBackendUnspecifiedUsesLadder(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("rung = %v, want %v", got, tc.want)
 			}
-			// The cardinal rule: a non-error selection is NEVER unconfined.
+			// The cardinal rule: a non-error selection is never unconfined.
 			if got == runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED {
 				t.Error("selected an UNSPECIFIED (unconfined) rung with no error — must never happen")
 			}
@@ -122,10 +122,10 @@ func TestSelectBackendUnspecifiedUsesLadder(t *testing.T) {
 	}
 }
 
-// TestSelectBackendVMRequestedUnavailableFailsClosed is THE M5.1 safety fix: a pod
+// TestSelectBackendVMRequestedUnavailableFailsClosed is the M5.1 safety fix: a pod
 // that requested the vm backend (a Linux image / untrusted tenancy) on a host
-// where the vm backend is UNAVAILABLE must be REFUSED with ErrBackendUnavailable
-// — it must NEVER silently downgrade to Seatbelt (the weaker rung, on which a
+// where the vm backend is UNAVAILABLE must be refused with ErrBackendUnavailable
+// — it must never silently downgrade to Seatbelt (the weaker rung, on which a
 // Linux image cannot even exec). The presence of Seatbelt must not rescue a vm
 // request. Fails-before: the old SelectBackend ignored the request and returned
 // SEATBELT_INPROC. Passes-after: a typed fail-closed error and no usable rung.
@@ -172,7 +172,7 @@ func TestSelectBackendExplicitSeatbeltRequiresIt(t *testing.T) {
 	if err != nil || got != runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC {
 		t.Fatalf("seatbelt available: got rung=%v err=%v, want SEATBELT_INPROC", got, err)
 	}
-	// Seatbelt unavailable but vm available: an explicit seatbelt pin must NOT be
+	// Seatbelt unavailable but vm available: an explicit seatbelt pin must not be
 	// rescued by the vm rung — it fails closed (the ladder degrade is UNSPECIFIED-only).
 	got, err = SelectBackend(runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC, false, false, true)
 	if !errors.Is(err, ErrBackendUnavailable) {

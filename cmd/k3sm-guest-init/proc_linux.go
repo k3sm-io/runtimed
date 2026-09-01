@@ -27,7 +27,7 @@ import (
 	"k3sm.io/runtimed/pkg/guestinit"
 )
 
-// linuxProc implements guestinit.Proc against the Linux kernel. It is the ONLY
+// linuxProc implements guestinit.Proc against the Linux kernel. It is the only
 // implementation, and it is deliberately three thin syscall wrappers: every
 // decision about when to reap, when to signal and when to power off lives in
 // guestinit.Reaper, where a darwin test can reach it.

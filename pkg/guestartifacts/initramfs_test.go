@@ -35,7 +35,7 @@ var fakeInit = []byte("k3sm fake init payload\n")
 //
 // This is the whole point of the package: the artifact is published by digest,
 // so a change in the composed bytes that nobody intended must fail a test
-// rather than quietly re-mint a pin. Regenerate it ONLY together with a
+// rather than quietly re-mint a pin. Regenerate it only together with a
 // deliberate format or layout change, and say which in the commit message.
 const (
 	goldenSHA256 = "78c83c75c66feb572d561de5baa1b38f7147eab56bb3926c54e4100903d4c481"

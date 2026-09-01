@@ -35,7 +35,7 @@ import (
 // ref->digest index decides presence-BY-REFERENCE for this node, and does so
 // without ever becoming a reachability root.
 //
-// EVERY assertion the gate makes is a subtest of THIS function — the item is run
+// every assertion the gate makes is a subtest of this function — the item is run
 // as `go test -run '^TestRefDigestIndexDecidesPresence$'`, so anything asserted
 // in a sibling Test... would not be gate-proving.
 //
@@ -50,11 +50,11 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 	const ref = "example.com/app:latest"
 
 	// -----------------------------------------------------------------
-	// Presence: what the index decides, and what it must NOT decide.
+	// Presence: what the index decides, and what it must not decide.
 	// -----------------------------------------------------------------
 
 	// The whole point of the deliverable: a reference this node pulled is served
-	// locally, proven against a fetcher that CANNOT succeed. A counter alone
+	// locally, proven against a fetcher that cannot succeed. A counter alone
 	// would show only that a pull did not happen to be needed.
 	t.Run("warm_reference_serves_locally_with_zero_registry_traffic", func(t *testing.T) {
 		cache, idx := newIndexedCache(t)
@@ -101,7 +101,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		assertSameManifest(t, got, want)
 	})
 
-	// A reference nobody pulled is absent — and absence is a MISS, not an error,
+	// A reference nobody pulled is absent — and absence is a miss, not an error,
 	// so IfNotPresent still reaches the registry and Never still fails honestly.
 	t.Run("unindexed_reference_is_a_miss", func(t *testing.T) {
 		cache, idx := newIndexedCache(t)
@@ -119,9 +119,9 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		}
 	})
 
-	// Presence-by-reference and the BYTES have independent lifetimes: the GC
+	// Presence-by-reference and the bytes have independent lifetimes: the GC
 	// evicts blobs and never touches this index (see the edge-not-root rows
-	// below). A recorded reference whose blobs are gone must therefore be a MISS
+	// below). A recorded reference whose blobs are gone must therefore be a miss
 	// — the index still holds the entry, and the consumer's blob check is what
 	// turns it into "not present".
 	t.Run("recorded_reference_with_evicted_blobs_is_not_present", func(t *testing.T) {
@@ -152,7 +152,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 
 	// The index is keyed (reference x platform). A node that pulled linux/arm64
 	// for a vm pod holds bytes a native pod cannot execute, so the same reference
-	// under a native policy is a MISS — not a hit that would start a container
+	// under a native policy is a miss — not a hit that would start a container
 	// whose payload is the wrong machine code.
 	t.Run("platform_policy_mismatch_is_a_miss", func(t *testing.T) {
 		cache, idx := newIndexedCache(t)
@@ -187,7 +187,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 
 	// A miss would fail Never for an image that IS on the node and would send an
 	// IfNotPresent pod to the registry at exactly the moment the operator asked
-	// it not to go. So every unbelievable entry degrades LOUDLY, and no row of it
+	// it not to go. So every unbelievable entry degrades loudly, and no row of it
 	// performs registry traffic.
 	t.Run("unbelievable_entry_is_an_error_not_a_miss", func(t *testing.T) {
 		native := mustCandidates(t, nativePolicy())[0]
@@ -233,7 +233,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 				name: "entry_planted_under_another_key",
 				damage: func(t *testing.T, cache *Cache) {
 					// The file name is a hash: it identifies a key, it does not
-					// prove one. An entry for a DIFFERENT reference copied to this
+					// prove one. An entry for a different reference copied to this
 					// key's name must be refused, not served — that copy is exactly
 					// what a writable index would buy an attacker.
 					other := readEntryFile(t, cache, entryName("example.com/other:latest", native))
@@ -244,7 +244,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 			{
 				name: "index_directory_writable_by_others",
 				damage: func(t *testing.T, cache *Cache) {
-					// The substitution door: whoever can write the PARENT can swap
+					// The substitution door: whoever can write the parent can swap
 					// the index tree for one they own. Mode and owner are re-checked
 					// at every open, so a swapped tree is refused rather than read.
 					if err := os.Chmod(cache.IndexRoot(), 0o777); err != nil {
@@ -303,7 +303,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 	})
 
 	// -----------------------------------------------------------------
-	// Entries are EDGES, never roots.
+	// Entries are edges, never roots.
 	// -----------------------------------------------------------------
 
 	// The load-bearing invariant. An index entry records that a reference
@@ -315,7 +315,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		cache, idx := newIndexedCache(t)
 		mfst := primeIndexedPull(t, cache, idx, ref, nativePolicy())
 
-		// A live pod that references NOTHING (a native host-binary pod), so the
+		// A live pod that references nothing (a native host-binary pod), so the
 		// pods tree is walked for real. Without it Roots short-circuits on the
 		// absent pods dir and never reaches the code an index-as-root regression
 		// would live in — the root set would be empty for the wrong reason.
@@ -327,7 +327,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// The GC's two enumerators. NEITHER can reach the index tree: Roots reads
+		// The GC's two enumerators. neither can reach the index tree: Roots reads
 		// pods/, EnumerateBlobs reads blobs/. No pod references this image, so
 		// there is no root — and the index's existence must not change that.
 		roots, err := cache.Roots()
@@ -362,7 +362,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		}
 
 		// And it really is reclaimed: after the prune the entry survives (the
-		// prune is blobs-only) while the reference is no longer PRESENT.
+		// prune is blobs-only) while the reference is no longer present.
 		if _, err := cache.ExecutePrune(plan, 0, time.Now(), nil); err != nil {
 			t.Fatalf("ExecutePrune: %v", err)
 		}
@@ -416,7 +416,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		}
 	})
 
-	// The two legs above pin the PURE layers (Roots, PlanPrune). This leg pins the
+	// The two legs above pin the pure layers (Roots, PlanPrune). This leg pins the
 	// COMPOSED production path: a "helpfully" index-aware ReclaimUnderPressure —
 	// protection injected at the call site rather than in Roots — would pass both
 	// pure legs and still ship the regression. Found by an orchestrator mutation
@@ -488,7 +488,7 @@ func indexTestImage(t *testing.T, os, arch string) ggcrv1.Image {
 	return withPlatform(t, img, os, arch, "")
 }
 
-// primeIndexedPull pulls a fresh native image through the REAL index, leaving
+// primeIndexedPull pulls a fresh native image through the real index, leaving
 // ref in the "this node has it" state by the production path — not by writing an
 // entry the test made up.
 func primeIndexedPull(t *testing.T, cache *Cache, idx *FileIndex, ref string, policy PlatformPolicy) *runtimev1.ImageManifest {
@@ -507,7 +507,7 @@ func primeIndexedPullImage(t *testing.T, cache *Cache, idx *FileIndex, ref strin
 		t.Fatalf("prime pull %q: %v", ref, err)
 	}
 	// The lease is the in-flight pin; this test's pod-root and GC rows measure
-	// the store WITHOUT it, exactly as a caller that has finished recording does.
+	// the store without it, exactly as a caller that has finished recording does.
 	res.Lease.Release()
 	return res.Manifest
 }

@@ -82,7 +82,7 @@ type reaperRunner struct {
 	reaper *guestinit.Reaper
 }
 
-// Containers returns the roster in DECLARED order — inits first, then mains,
+// Containers returns the roster in declared order — inits first, then mains,
 // exactly as guestinit.StartOrder produced it. The order is what the host reports
 // back, so a set reordered per call would make a stats table jump between scrapes.
 func (r *reaperRunner) Containers() []string {
@@ -91,8 +91,8 @@ func (r *reaperRunner) Containers() []string {
 	return out
 }
 
-// Stop delegates to the reaper's shutdown state machine, which is the ONE place
-// the TERM -> grace -> KILL -> sync -> poweroff sequence lives. Reimplementing any
+// Stop delegates to the reaper's shutdown state machine, which is the one place
+// the term -> grace -> KILL -> sync -> poweroff sequence lives. Reimplementing any
 // of it here would give the ordering two homes, and the one that ships would not
 // be the one guestinit's tests pin.
 func (r *reaperRunner) Stop(ctx context.Context, grace time.Duration) error {
@@ -102,9 +102,9 @@ func (r *reaperRunner) Stop(ctx context.Context, grace time.Duration) error {
 // cgroupSampler is the Sampler seam: one container's cgroup2 files, read on
 // demand.
 //
-// PER-CONTAINER cgroup2 LEAVES ARE NOT YET CREATED by this init (see the package
-// doc's "NOT YET IN THIS BINARY" list), so on today's guest every Sample reports
-// that no leaf exists and the server OMITS that container from the response. That
+// per-CONTAINER cgroup2 leaves are not yet created by this init (see the package
+// doc's "not yet IN this BINARY" list), so on today's guest every Sample reports
+// that no leaf exists and the server omits that container from the response. That
 // is the honest answer — absence rather than zeros, exactly as guest.proto requires
 // — and it is why this type is wired now rather than later: when the leaves land,
 // the reader is already here and already correct.
@@ -115,7 +115,7 @@ type cgroupSampler struct {
 // Sample reads the container's cpu.stat and memory files.
 //
 // A container with no leaf is guestagent.ErrNotFound, which the server treats as
-// "omit". A leaf whose files exist but cannot be parsed is a DIFFERENT error and is
+// "omit". A leaf whose files exist but cannot be parsed is a different error and is
 // also omitted — a partially-read sample is not a sample, and reporting the half
 // that parsed would put a CPU counter next to a working set of zero.
 func (c *cgroupSampler) Sample(_ context.Context, container string) (guestagent.ContainerSample, error) {
@@ -159,7 +159,7 @@ var errLogsNotCaptured = errors.New(
 
 // ringLogs is the Logs seam over per-container guestagent.Rings.
 //
-// It is wired with an EMPTY ring set today for the reason above, so every request
+// It is wired with an empty ring set today for the reason above, so every request
 // reports errLogsNotCaptured. The type exists in its final shape because the ring
 // and its selection semantics are the part worth getting right, and they are
 // already unit-tested; what is missing is the capture, not the buffer.
@@ -227,14 +227,14 @@ func (l *ringLogs) Stream(ctx context.Context, container string, sel guestagent.
 // procExecer is the Execer seam: fork/exec one command inside a container's
 // composed rootfs.
 //
-// It reuses the SAME ProcAttr shape the container spawn uses — chroot into the
+// It reuses the same ProcAttr shape the container spawn uses — chroot into the
 // container's root, the container's credential and environment, the working
 // directory applied after the chroot so it is a path inside the container — because
 // an exec that ran under a different identity or a different view of the filesystem
 // from the container it claims to be in is not `kubectl exec`, it is a different
 // program with the same name.
 //
-// PID 1 IS THE ONLY WAITER. This process does not wait(2) on the child: the reaper
+// PID 1 IS the only WAITER. This process does not wait(2) on the child: the reaper
 // owns every exit, so the exec registers the child with it under a private name and
 // waits on the reaper instead. A second waiter would race it for the status and one
 // of the two would get ECHILD.
@@ -299,7 +299,7 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 		},
 	}
 	pid, err := syscall.ForkExec(spec.Argv[0], spec.Argv, attr)
-	// The child's ends are closed in THIS process immediately after the fork:
+	// The child's ends are closed in this process immediately after the fork:
 	// holding stdoutW open here would mean the stdout reader never sees EOF, and
 	// the exec would appear to hang after the command had already exited.
 	closeAll(stdinR, stdoutW, stderrW)
@@ -325,7 +325,7 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 	}
 
 	st, werr := e.reaper.Wait(ctx, name)
-	// The pumps are drained BEFORE the exit is reported: a client that received the
+	// The pumps are drained before the exit is reported: a client that received the
 	// exit frame first and the last of stdout afterwards would see output arrive
 	// after the command it came from had finished, which breaks every consumer that
 	// treats the exit as end-of-stream.
@@ -363,7 +363,7 @@ func closeAll(files ...*os.File) {
 // serveAgent starts the guest/v1 GuestAgent on the pod's vsock port and returns a
 // stop func.
 //
-// It is started AFTER the containers, and that order is deliberate: the agent's
+// It is started after the containers, and that order is deliberate: the agent's
 // Health is the host's boot-deadline probe, so an agent answering before the pod
 // exists would report a guest that is ready for a pod it has not started.
 func serveAgent(podID string, port uint32, deps guestagent.Deps, log *slog.Logger) (func(), error) {

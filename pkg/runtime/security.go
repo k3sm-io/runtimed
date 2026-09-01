@@ -73,17 +73,17 @@ func firstNonZero(vals ...int) int {
 
 // resolveBgQoS maps the pod's declared kube QoS class (the apis QOSClass enum,
 // PodBox.qos_class) to the supervisor-local background flag — the B7 mapping
-// decision lives HERE, in the runtime layer, so the supervisor stays decoupled
+// decision lives here, in the runtime layer, so the supervisor stays decoupled
 // from apis (mirroring resolveRlimitPlan/PlannedRlimit):
 //
 //   - BEST_EFFORT and UNSPECIFIED → true: the launch sequence issues one
 //     setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) — the deliberate
 //     contention policy (a BestEffort pod yields CPU/IO/network to the rest of
 //     the node; darwin's background band couples all three);
-//   - GUARANTEED, BURSTABLE, and ANY unknown/future enum value → false: NO
-//     setpriority call AT ALL. The policy is downward-only — the default band
+//   - GUARANTEED, BURSTABLE, and any unknown/future enum value → false: NO
+//     setpriority call AT all. The policy is downward-only — the default band
 //     is the absence of the call, never an explicit reset-to-0. Backgrounding
-//     is the EXPLICITLY-ENUMERATED branch on purpose: a future additive apis
+//     is the explicitly-ENUMERATED branch on purpose: a future additive apis
 //     QOSClass value must not be silently BG-throttled by a stale runtimed.
 //
 // See docs/resources.md for the honesty notes (the band is cooperative, not
@@ -100,7 +100,7 @@ func resolveBgQoS(box *runtimev1.PodBox) bool {
 // resolveLaunchSpec bundles the pod-scoped launch inputs — the explicit rlimit
 // plan and the qos decision — with the container-scoped credential into the one
 // supervisor.LaunchSpec the sandbox backend threads to the exec-shim. It is used
-// by BOTH spawn callers (startContainer and exec sessions): an exec session
+// by both spawn callers (startContainer and exec sessions): an exec session
 // deliberately re-enters the pod's rlimits and qos band, one code path.
 func resolveLaunchSpec(box *runtimev1.PodBox, cred supervisor.Credential) supervisor.LaunchSpec {
 	return supervisor.LaunchSpec{
@@ -112,7 +112,7 @@ func resolveLaunchSpec(box *runtimev1.PodBox, cred supervisor.Credential) superv
 
 // rlimitResource maps a ResourceLimit.type name to its darwin RLIMIT_* selector.
 // The lookup is comma-ok ON PURPOSE: an unknown name returns ok=false so
-// resolveRlimitPlan SKIPS it (with a warning) rather than defaulting to the
+// resolveRlimitPlan skips it (with a warning) rather than defaulting to the
 // zero-value resource — on darwin RLIMIT_CPU is 0x0, so a zero-value miss would
 // silently install a cumulative-CPU-seconds killer. RLIMIT_CPU is therefore only
 // ever selected when a type explicitly names it.
@@ -127,8 +127,8 @@ var rlimitResource = map[string]int{
 	"RLIMIT_CPU":    unix.RLIMIT_CPU,
 }
 
-// resolveRlimitPlan computes the setrlimit(2) plan from a pod's EXPLICIT
-// PodBox.rlimits[] — and ONLY those. It deliberately synthesizes NO rlimit from
+// resolveRlimitPlan computes the setrlimit(2) plan from a pod's explicit
+// PodBox.rlimits[] — and only those. It deliberately synthesizes NO rlimit from
 // memory_limit_bytes or a cpu quota:
 //   - memory is enforced out-of-band by the proc_pid_rusage→OOMKilled sampler;
 //     RLIMIT_AS caps virtual address space (≠ phys_footprint) and would crash Go
@@ -137,7 +137,7 @@ var rlimitResource = map[string]int{
 //     quota.
 //
 // Each explicit entry maps type→RLIMIT_* via the comma-ok rlimitResource table;
-// an UNKNOWN type is skipped with a warning (never silently applied as the
+// an unknown type is skipped with a warning (never silently applied as the
 // zero-value RLIMIT_CPU). "Unlimited" (^uint64(0) or RLIM_INFINITY's bit pattern)
 // maps to unix.RLIM_INFINITY; soft and hard are otherwise carried verbatim. The
 // supervisor applies the returned plan via RunLaunchSequence, before the uid drop.

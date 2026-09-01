@@ -19,7 +19,7 @@ package vmhost
 // MachineConfig is the fully-validated, pure-Go description of one pod's virtual
 // machine: the value FromSpec produces and realize consumes.
 //
-// It is deliberately PLAIN DATA — no pointers, no funcs, no maps, no interfaces —
+// It is deliberately plain DATA — no pointers, no funcs, no maps, no interfaces —
 // so a test can build one by hand, compare two with reflect.DeepEqual, and read a
 // failure diff without a framework anywhere in the picture. Everything a machine
 // needs is here, and nothing that needs a Mac to evaluate is: by the time a
@@ -61,14 +61,14 @@ type MachineConfig struct {
 	// entropy source, and a fresh micro-VM has almost none of its own.
 	Entropy bool
 
-	// Balloon attaches a traditional memory-balloon device. It is ATTACHED AND
+	// Balloon attaches a traditional memory-balloon device. It is ATTACHED and
 	// UNUSED on purpose: the device cannot be added to a running machine, so a
 	// guest booted without one can never have its memory reclaimed, while a guest
 	// booted with one costs nothing until something drives it.
 	Balloon bool
 
 	// Rosetta attaches the Rosetta directory share so the guest can register the
-	// linux/amd64 binfmt_misc interpreter. It is FALSE in this build and FromSpec
+	// linux/amd64 binfmt_misc interpreter. It is false in this build and FromSpec
 	// refuses a spec that asks for it — see RosettaShareSupported.
 	Rosetta bool
 }
@@ -88,8 +88,8 @@ type BootLoaderConfig struct {
 // ShareConfig is one virtiofs device: the host directory Root exported under the
 // guest-visible mount Tag.
 //
-// ReadOnly is the ENFORCEMENT POINT for a share's writability, and it is enforced
-// HERE, at the VZ device, rather than by any guest-side mount option: the guest
+// ReadOnly is the ENFORCEMENT point for a share's writability, and it is enforced
+// here, at the VZ device, rather than by any guest-side mount option: the guest
 // runs the tenant's code as root, so a `mount -o ro` inside it is
 // attacker-controlled. A guest-side read-only flag mirrors this one; it can never
 // substitute for it.
@@ -105,7 +105,7 @@ type ShareConfig struct {
 
 // NetworkConfig is the machine's single NAT-attached virtio-net device.
 //
-// NAT ONLY, never bridged: a bridged attachment needs com.apple.vm.networking,
+// NAT only, never bridged: a bridged attachment needs com.apple.vm.networking,
 // which is a RESTRICTED entitlement Apple grants by request, and a pod does not
 // need a LAN-visible address — the cluster reaches it through the node.
 type NetworkConfig struct {
@@ -133,7 +133,7 @@ type ConsoleConfig struct {
 // agent listens on.
 type VsockConfig struct {
 	// AgentPort is the vsock port the guest agent serves and the host dials. It
-	// MUST equal GuestSpec.agent_port — the two specs are written by the same
+	// must equal GuestSpec.agent_port — the two specs are written by the same
 	// host and a disagreement makes the guest unreachable.
 	AgentPort uint32
 }

@@ -20,17 +20,17 @@ import "context"
 
 // The two Rosetta capability probes (B103) — the GOOS/cgo-agnostic contract.
 //
-// They are TWO INDEPENDENT capabilities that happen to share a brand name, and
+// They are two independent capabilities that happen to share a brand name, and
 // conflating them is the bug this file exists to prevent:
 //
 //   - HOST Rosetta (Rosetta 2) translates darwin/amd64 MACH-O payloads for the
-//     native host-process (Seatbelt) spine. Probed WITHOUT cgo: an unforgeable
+//     native host-process (Seatbelt) spine. Probed without cgo: an unforgeable
 //     on-disk presence check plus a real translated exec.
-//   - GUEST Rosetta (Rosetta for Linux) translates linux/amd64 ELF payloads INSIDE
+//   - GUEST Rosetta (Rosetta for Linux) translates linux/amd64 ELF payloads inside
 //     a Virtualization.framework Linux guest. Probed through the Obj-C shim's
 //     +[VZLinuxRosettaDirectoryShare availability] class property.
 //
-// Both are advertised as additive RuntimeConditions and NEITHER is wired into the
+// Both are advertised as additive RuntimeConditions and neither is wired into the
 // image-pull platform policy: see pkg/runtime/pod.go's pullPolicy, which documents
 // why selecting an amd64 payload waits on the Seatbelt x Rosetta spawn proof
 // (B105).
@@ -43,7 +43,7 @@ import "context"
 // installed" and "it is installed but a translated exec did not run" are different
 // operator situations, and arch(1) collapses EBADARCH and every other failure into
 // one generic non-zero exit — so the distinction has to be made by the probe's
-// STRUCTURE (presence leg vs spawn leg), not by reading a status code.
+// structure (presence leg vs spawn leg), not by reading a status code.
 type HostRosettaState int
 
 const (
@@ -55,8 +55,8 @@ const (
 	// translated exec did not succeed (non-zero exit, spawn error, or the probe
 	// timeout). Fails closed like HostRosettaAbsent, with a distinct Reason.
 	HostRosettaTranslationFailed
-	// HostRosettaAvailable — the payload is present AND a translated exec
-	// succeeded. The ONLY state that reports available.
+	// HostRosettaAvailable — the payload is present and a translated exec
+	// succeeded. The only state that reports available.
 	HostRosettaAvailable
 )
 
@@ -77,7 +77,7 @@ func (s HostRosettaState) String() string {
 // Available reports whether s is the one genuinely-usable state. Every other
 // state — including an out-of-range one — is unavailable (fail closed).
 //
-// This is the ONE home of the host fail-closed rule, and it SHIPS: pkg/runtime's
+// This is the one home of the host fail-closed rule, and it SHIPS: pkg/runtime's
 // evalHostRosetta calls it to decide the RuntimeCondition status instead of
 // re-deriving the comparison, so the predicate the tests below pin is the same one
 // the daemon advertises.
@@ -100,11 +100,11 @@ const (
 	// Linux is Apple-Silicon-only).
 	GuestRosettaNotSupported GuestRosettaState = 0
 	// GuestRosettaNotInstalled — VZLinuxRosettaAvailabilityNotInstalled: supported,
-	// but the payload is not installed. runtimed NEVER installs it: the SDK's
+	// but the payload is not installed. runtimed never installs it: the SDK's
 	// install entry points prompt the user, which a GUI-less daemon cannot do.
 	GuestRosettaNotInstalled GuestRosettaState = 1
-	// GuestRosettaInstalled — VZLinuxRosettaAvailabilityInstalled: supported AND
-	// installed. The ONLY state that reports available.
+	// GuestRosettaInstalled — VZLinuxRosettaAvailabilityInstalled: supported and
+	// installed. The only state that reports available.
 	GuestRosettaInstalled GuestRosettaState = 2
 )
 
@@ -127,17 +127,17 @@ func (s GuestRosettaState) String() string {
 // Available reports whether s is the one genuinely-usable state. Every other
 // state — including an out-of-range one — is unavailable (fail closed).
 //
-// Like its host sibling it is the ONE home of the guest fail-closed rule and it
+// Like its host sibling it is the one home of the guest fail-closed rule and it
 // SHIPS: pkg/runtime's evalGuestRosetta calls it rather than re-deriving the
 // comparison.
 func (s GuestRosettaState) Available() bool { return s == GuestRosettaInstalled }
 
 // ProbeHostRosetta reports whether this host can translate darwin/amd64 Mach-O
-// payloads (Rosetta 2). It composes two legs with AND — an unforgeable presence
+// payloads (Rosetta 2). It composes two legs with and — an unforgeable presence
 // check, then a real translated exec GATED BEHIND it so a non-Rosetta host forks
 // nothing — and is described in full at hostRosettaProbe (rosetta_host_darwin.go).
 //
-// It NEVER returns an error: the daemon must not fail to start because a host
+// It never returns an error: the daemon must not fail to start because a host
 // capability is absent. Off darwin it is HostRosettaAbsent.
 //
 // ctx bounds the probe; the spawn leg additionally imposes its own short internal
@@ -156,7 +156,7 @@ func ProbeHostRosetta(ctx context.Context) HostRosettaState {
 // parameter would be decoration. (Its sibling ProbeHostRosetta spawns a process and
 // therefore does take one.)
 //
-// It NEVER returns an error, and it never attempts an INSTALL — the SDK's install
+// It never returns an error, and it never attempts an INSTALL — the SDK's install
 // entry points prompt the user.
 func ProbeGuestRosetta() GuestRosettaState {
 	return vzRosettaAvailability()

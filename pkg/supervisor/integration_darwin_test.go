@@ -122,8 +122,8 @@ func TestIntegrationSignalGroupKills(t *testing.T) {
 const neverLivePgid = 0x7FFFFFFE
 
 // TestIntegrationProcGroupMembersEmptyGroupDrops pins the reap's drop contract:
-// an inspectable-but-empty (dead) process group returns an EMPTY slice with
-// ok=true — NOT an error. The startup reap reads ok=true + empty as "the group
+// an inspectable-but-empty (dead) process group returns an empty slice with
+// ok=true — not an error. The startup reap reads ok=true + empty as "the group
 // is gone, drop the record", whereas ok=false would keep the record forever. A
 // never-live pgid must therefore report (empty, true), never (nil, false).
 func TestIntegrationProcGroupMembersEmptyGroupDrops(t *testing.T) {

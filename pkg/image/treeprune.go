@@ -64,7 +64,7 @@ const (
 type TreeNode struct {
 	// Store is which tree store this node lives under.
 	Store TreeStore
-	// Path is the node's path RELATIVE to that store's root ("<algo>/<hex>").
+	// Path is the node's path relative to that store's root ("<algo>/<hex>").
 	Path string
 	// Key is the tree's content-addressed identity ("<algo>:<hex>") for a
 	// TreeKindTree node, empty otherwise. It is derived from the PATH, never
@@ -80,7 +80,7 @@ type TreeNode struct {
 	// grace window.
 	ModTime time.Time
 	// Backing are the blob digests the tree's DAEMON-AUTHORED record says it was
-	// built from (config + layers). They are PROTECTION INPUTS ONLY: a digest
+	// built from (config + layers). They are PROTECTION INPUTS only: a digest
 	// here that a live pod root also names keeps the tree, and nothing here can
 	// ever keep a BLOB alive (see planTrees).
 	Backing []string
@@ -120,7 +120,7 @@ func (c *Cache) treeStoreLayout(store TreeStore) (dir, recordName string, err er
 var treeStores = []TreeStore{TreeStoreUnpacked, TreeStoreSnapshots}
 
 // classifyTreeKey validates a store-root-relative path against the tree key
-// grammar — the SAME "<algo>/<hex>" shape a blob path has, because a tree
+// grammar — the same "<algo>/<hex>" shape a blob path has, because a tree
 // directory is named by a parsed digest through exactly the same allowlist
 // (Cache.treeDir, Cache.snapshotDir, both fed by parseBlobDigest).
 //
@@ -206,7 +206,7 @@ func (c *Cache) enumerateTreeStore(store TreeStore) ([]TreeNode, error) {
 	var out []TreeNode
 	for _, algo := range algoDirs {
 		// A top-level entry that is not an algorithm directory is inventoried as
-		// ONE unknown node and is NOT descended into. That is what makes a
+		// one unknown node and is not descended into. That is what makes a
 		// ".tree-*" staging directory — the residue of an unpack that died
 		// mid-apply — visible to the accounting as a single kept node, instead of
 		// vanishing (it holds no "<algo>/<hex>" children) or being flattened into
@@ -285,7 +285,7 @@ func (r treeRecord) backing() []string {
 // could never have written is not a record this daemon wrote, so it is treated
 // as unusable rather than half-believed.
 //
-// It deliberately reads ONE file per tree and stops there: the Linux dialect's
+// It deliberately reads one file per tree and stops there: the Linux dialect's
 // ownership sidecar is not checked, so a snapshot missing it reads as usable
 // here while Unpacker.openCommitted refuses to serve it. The two predicates are
 // not meant to be identical — such a tree is still protected by its backing
@@ -324,12 +324,12 @@ func validTreeKind(k TreeKind) bool {
 	return false
 }
 
-// planTrees decides every tree node, using the SAME reachable and leased sets
+// planTrees decides every tree node, using the same reachable and leased sets
 // the blob half of the plan is decided from. It is pure: no filesystem, no clock.
 //
 // # The root-set rule
 //
-// A tree is DERIVED content — every byte in it is reconstructible from blobs the
+// A tree is derived content — every byte in it is reconstructible from blobs the
 // image's manifest names — and deleting one cannot kill a running pod: the pod's
 // rootfs was materialized with APFS clonefile and holds its own references to the
 // extents, so what a wrongly-deleted tree breaks is a RESTART or a
@@ -344,7 +344,7 @@ func validTreeKind(k TreeKind) bool {
 // Both halves of B191's condition collapse into that one test on purpose. The
 // root set records an (image) per pod, never an (image x policy) — ImageRoot
 // deliberately carries no dialect — so the strongest honest reading is that a
-// live pod using an image protects EVERY tree built from that image, in either
+// live pod using an image protects every tree built from that image, in either
 // dialect. That is more protection than the (image x policy) rule asks for, and
 // more is the safe direction; the alternative would need a policy recorded in a
 // root, which would make the root set carry content metadata it is designed not
@@ -356,8 +356,8 @@ func validTreeKind(k TreeKind) bool {
 // useful again.
 //
 // Everything else fails closed exactly as the blob planner does: an
-// out-of-grammar or non-directory node is KEPT, and a node younger than grace is
-// KEPT.
+// out-of-grammar or non-directory node is kept, and a node younger than grace is
+// kept.
 func planTrees(plan *PrunePlan, trees []TreeNode, reachable, leased map[string]bool, grace time.Duration, now time.Time) {
 	young := func(n TreeNode) bool { return now.Sub(n.ModTime) < grace }
 	keep := func(n TreeNode, r PruneReason) {
@@ -442,14 +442,14 @@ type TreeExecuteReport struct {
 
 // ExecuteTreePrune executes plan's DeleteTrees set against this cache.
 //
-// It is TREE-STORES-ONLY BY CONSTRUCTION: every operation goes through an
+// It is TREE-STORES-only BY construction: every operation goes through an
 // os.Root opened at the store root the node names (fd-anchored, symlinks not
 // followed), and only relative paths matching the validated "<algo>/<hex>" key
 // grammar are ever removed. It is therefore structurally incapable of reaching
 // blobs/, pods/, server/ or storage/ — a tree prune cannot delete a blob, which
 // is the same containment ExecutePrune has in the other direction.
 //
-// Before each removal the entry is RE-VERIFIED against the facts that made it
+// Before each removal the entry is RE-verified against the facts that made it
 // deletable: the path still matches the grammar, Lstat still reports a DIRECTORY
 // (a tree swapped for a symlink after planning is skipped, not followed), and
 // the mtime is still older than grace.
@@ -459,14 +459,14 @@ type TreeExecuteReport struct {
 // The removal is two steps — unlink the record, then remove the directory — and
 // the order is load-bearing rather than tidy. A plain recursive remove deletes
 // children in filesystem order, so a concurrent Unpack could read a still-valid
-// record and then clone a HALF-DELETED payload into a pod's rootfs: a silently
+// record and then clone a half-DELETED payload into a pod's rootfs: a silently
 // truncated image, which is worse than any failure. Unlinking the record first
-// makes the tree read as ABSENT to openCommitted (its ErrNotExist path) for the
+// makes the tree read as absent to openCommitted (its ErrNotExist path) for the
 // whole of the removal, so a racing unpack rebuilds or fails loudly instead. If
 // the recursive remove then fails partway, the residue is a directory with no
 // record, which the next inventory classifies as RecordUnusable and re-plans.
 //
-// stop, when non-nil, is consulted BEFORE each removal and ends the run when it
+// stop, when non-nil, is consulted before each removal and ends the run when it
 // returns true, on the same measured-target terms as ExecutePrune.
 func (c *Cache) ExecuteTreePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*TreeExecuteReport, error) {
 	if plan == nil {

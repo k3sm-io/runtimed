@@ -32,16 +32,16 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// THE M11.2-d11 GATE: what createVMPod stamps on VMSpec.Containers.
+// the M11.2-d11 GATE: what createVMPod stamps on VMSpec.Containers.
 //
-// Every row drives the REAL wiring — CreatePod → createVMPod →
+// Every row drives the real wiring — CreatePod → createVMPod →
 // resolveVMContainers → pkg/image.MergeRunSpec — and reads the VMSpec the vm
 // backend was handed. Nothing here re-implements the merge or hand-writes an
 // argv: the four-quadrant table, the $(VAR) expansion and the runAsNonRoot rule
-// are asserted THROUGH the shipped merge function, so a divergence between the
+// are asserted through the shipped merge function, so a divergence between the
 // two spines shows up as a failing row rather than as two green tables.
 
-// imageWorld is the pull+unpack seam pair serving a DIFFERENT image config per
+// imageWorld is the pull+unpack seam pair serving a different image config per
 // REFERENCE.
 //
 // The harness's shared fakePuller/fakeUnpacker cannot express this: they serve
@@ -49,7 +49,7 @@ import (
 // would have every container merge against the same image — which is exactly the
 // confusion a per-container mapper has to be proven free of. Serving the config
 // through the manifest's own reference also keeps the two halves of the seam
-// consistent (Unpacker's doc: the tree and the config come from ONE image).
+// consistent (Unpacker's doc: the tree and the config come from one image).
 type imageWorld struct {
 	cfgs map[string]image.ImageRunConfig
 
@@ -149,7 +149,7 @@ func oneVMContainer(t *testing.T, spec sandbox.VMSpec) sandbox.VMContainer {
 
 // TestVMContainerMergeQuadrants drives Kubernetes' four-quadrant command/args
 // table, the $(VAR) expansion and the env/working-dir precedence through the
-// REAL merge, on the REAL vm create path.
+// real merge, on the real vm create path.
 //
 // Row 3 (a pod command DISCARDS the image's Cmd) is the one people get wrong and
 // the reason this is a table rather than a single happy path: the image's Cmd is
@@ -199,7 +199,7 @@ func TestVMContainerMergeQuadrants(t *testing.T) {
 				Args:       []string{"echo $(PORT) $(UNDEFINED) $$HOME"},
 				WorkingDir: "/work",
 			},
-			// PORT expands; an UNDEFINED reference is left VERBATIM (a shell
+			// PORT expands; an UNDEFINED reference is left verbatim (a shell
 			// snippet must never be silently emptied); "$$" is a literal "$".
 			wantArgv:    []string{"/bin/sh", "-c", "echo 8080 $(UNDEFINED) $HOME"},
 			wantEnv:     []string{"PATH=/usr/local/bin", "PORT=8080", "LANG=C"},
@@ -215,7 +215,7 @@ func TestVMContainerMergeQuadrants(t *testing.T) {
 				},
 			},
 			wantArgv: []string{"/app"},
-			// LANG is overridden IN PLACE (image order preserved), EXTRA appended.
+			// LANG is overridden IN place (image order preserved), EXTRA appended.
 			wantEnv:     []string{"PATH=/usr/local/bin", "PORT=8080", "LANG=en_US.UTF-8", "EXTRA=yes"},
 			wantWorkdir: "/srv",
 		},
@@ -239,7 +239,7 @@ func TestVMContainerMergeQuadrants(t *testing.T) {
 	}
 }
 
-// TestVMContainerEnvCarriesNoHostProcessInjections pins the ONE deliberate
+// TestVMContainerEnvCarriesNoHostProcessInjections pins the one deliberate
 // divergence from the host-process spine's environment: the guest gets the merge
 // and nothing else.
 //
@@ -373,7 +373,7 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 		if got := byName["postgres"]; got.UID != 1001 {
 			t.Errorf("postgres uid = %d, want the container's 1001", got.UID)
 		}
-		// The image's NUMERIC user supplies the uid when the pod set none for
+		// The image's numeric user supplies the uid when the pod set none for
 		// that container... except that this pod DID set one pod-wide, which
 		// wins. That is the precedence being pinned.
 		if got := byName["aux"]; got.UID != 999 {
@@ -399,7 +399,7 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 		}
 		// The deliberate boundary: composing the guest's rootfs lower layer out
 		// of these blobs is the rootfs-builder deliverable, and the plan carries
-		// ONE pod-wide rootfs share, so materializing here would have each
+		// one pod-wide rootfs share, so materializing here would have each
 		// container's image overwrite the last.
 		if materialized != 0 {
 			t.Errorf("materialized %d trees; the vm path materializes none (see resolveVMContainers)", materialized)
@@ -408,7 +408,7 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 }
 
 // TestVMContainerImageUserSuppliesTheUID pins the other half of the identity
-// rule: with no runAsUser anywhere, a NUMERIC image USER is the uid.
+// rule: with no runAsUser anywhere, a numeric image USER is the uid.
 func TestVMContainerImageUserSuppliesTheUID(t *testing.T) {
 	const ref = "docker.io/library/app:1"
 	w := newImageWorld(map[string]image.ImageRunConfig{ref: {Entrypoint: []string{"/app"}, User: "65534:65534"}})
@@ -428,7 +428,7 @@ func TestVMContainerImageUserSuppliesTheUID(t *testing.T) {
 }
 
 // TestVMContainerFailsClosed is the refusal table: every shape the vm path must
-// reject BEFORE a guest exists, with the pod's own reason.
+// reject before a guest exists, with the pod's own reason.
 //
 // Each row asserts the backend was never called, because a refusal that still
 // booted a machine would be a leak, not a refusal.
@@ -454,7 +454,7 @@ func TestVMContainerFailsClosed(t *testing.T) {
 		wantMsg string
 	}{
 		{
-			// The M0 absolute-path convention names a Mach-O on THIS Mac. A
+			// The M0 absolute-path convention names a Mach-O on this Mac. A
 			// Linux guest cannot exec one and cannot see the host filesystem, so
 			// the reference is refused where it is read rather than crossing as
 			// an argv[0] that dies as a bare ENOENT.
@@ -503,7 +503,7 @@ func TestVMContainerFailsClosed(t *testing.T) {
 			wantMsg: "neither Entrypoint nor Cmd",
 		},
 		{
-			// guest/v1 carries ONE ordering bit, read as "run to completion
+			// guest/v1 carries one ordering bit, read as "run to completion
 			// first". A sidecar never exits, so mapping it onto that bit is a
 			// boot that never fails and never finishes.
 			name: "native-sidecar-cannot-be-ordered",

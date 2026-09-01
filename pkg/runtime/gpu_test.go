@@ -26,7 +26,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// seatbeltBackend is an available backend that reports the REAL Seatbelt rung's
+// seatbeltBackend is an available backend that reports the real Seatbelt rung's
 // name, because sandbox_gpu_supported is scoped to the selected backend by NAME:
 // the generic fakeBackend ("fake") is correctly not GPU-capable, so a test that
 // wants the capable case must say which rung it is standing in.
@@ -102,7 +102,7 @@ func TestGetRuntimeInfoGPUFacts(t *testing.T) {
 		}
 	})
 
-	// sandbox_gpu_supported is a property of the SELECTED backend, so the same
+	// sandbox_gpu_supported is a property of the selected backend, so the same
 	// hardware answers differently under a rung whose profile cannot carry the
 	// Metal allow-set — while metal_available, a host fact, does not move.
 	t.Run("non-Seatbelt backend still reports the host but grants nothing", func(t *testing.T) {
@@ -119,7 +119,7 @@ func TestGetRuntimeInfoGPUFacts(t *testing.T) {
 		}
 	})
 
-	// A daemon that CAN probe always reports the message, so an absent gpu keeps its
+	// A daemon that can probe always reports the message, so an absent gpu keeps its
 	// distinct meaning on the wire ("this daemon does not report GPU facts").
 	t.Run("no-GPU host still reports a present message", func(t *testing.T) {
 		rt := newTestRuntime(t, Deps{})
@@ -135,7 +135,7 @@ func TestGetRuntimeInfoGPUFacts(t *testing.T) {
 		}
 	})
 
-	// Probed EXACTLY ONCE at construction: the probe is a GPU driver round trip, so
+	// Probed exactly once at construction: the probe is a GPU driver round trip, so
 	// a per-RPC probe would put a compile+dispatch on the handshake path.
 	t.Run("probed once at construction, not per RPC", func(t *testing.T) {
 		var mu sync.Mutex
@@ -159,7 +159,7 @@ func TestGetRuntimeInfoGPUFacts(t *testing.T) {
 		}
 	})
 
-	// Each response carries its OWN message: the daemon holds plain data and stamps
+	// Each response carries its own message: the daemon holds plain data and stamps
 	// a fresh proto, so one caller mutating its copy cannot corrupt another's.
 	t.Run("each response gets a fresh message", func(t *testing.T) {
 		rt := newTestRuntime(t, Deps{

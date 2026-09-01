@@ -38,10 +38,10 @@ import (
 // wait-error branch (which sets term.Message itself).
 var errWaitWedge = errors.New("supervisor wait failed")
 
-// pipeSpawner drives the REAL supervisor.Process log pipe: it writes payload to the
+// pipeSpawner drives the real supervisor.Process log pipe: it writes payload to the
 // child's combined-output fd (spec.LogFD) and closes it, simulating a container that
 // emitted its final output and then exited. It is how the FallbackToLogsOnError tests
-// push bytes THROUGH the pump (not a pre-populated buffer), so the pump-vs-reaper
+// push bytes through the pump (not a pre-populated buffer), so the pump-vs-reaper
 // drain ordering is exercised end-to-end. payload stays well under the OS pipe buffer
 // so the synchronous write in Spawn (before the pump goroutine starts) never blocks.
 type pipeSpawner struct{ payload string }
@@ -147,7 +147,7 @@ func (s *heldWriteEnd) release() {
 	}
 }
 
-// TestTerminationMessageFallbackToLogs is the B11 gate: a FAILED container with no
+// TestTerminationMessageFallbackToLogs is the B11 gate: a failed container with no
 // termination message gets one synthesized from the tail of its combined log
 // (terminationMessagePolicy=FallbackToLogsOnError, which runtimed applies
 // unconditionally — see watchContainerExit). It asserts the conformance-load-bearing
@@ -206,7 +206,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		},
 		{
 			// Signal-kill (OOMKilled, sig 9 / code 137) with an empty message falls back,
-			// AND term.Reason stays "OOMKilled" (the M2.5 OOM test depends on it).
+			// and term.Reason stays "OOMKilled" (the M2.5 OOM test depends on it).
 			name:       "oomkill-signal-empty-falls-back-reason-preserved",
 			payload:    "allocating\nallocating more\n" + lastLine,
 			waiter:     cannedWaiter{code: 137, sig: 9},
@@ -219,8 +219,8 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 			},
 		},
 		{
-			// Cap: a container emitting >80 lines / >2048 bytes is truncated to the LAST
-			// 80 lines AND last 2048 bytes (tail-biased): the LAST line survives, the
+			// Cap: a container emitting >80 lines / >2048 bytes is truncated to the last
+			// 80 lines and last 2048 bytes (tail-biased): the last line survives, the
 			// FIRST does not.
 			name:       "cap-80-lines-2048-bytes-tail-biased",
 			payload:    capPayload(),
@@ -263,9 +263,9 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		})
 	}
 
-	// race-faithful: drive the REAL pipe and make the pump-vs-reaper drain ordering
+	// race-faithful: drive the real pipe and make the pump-vs-reaper drain ordering
 	// load-bearing. The pump's FIRST sink delivery is gated (sleeps) so that when the
-	// reaper unblocks Wait, the final line is provably NOT yet in the buffer — only the
+	// reaper unblocks Wait, the final line is provably not yet in the buffer — only the
 	// drain-wait in watchContainerExit makes it land. A snapshot taken straight after
 	// Wait (the pre-fix behavior) would see an empty buffer. Run under -race, this also
 	// exercises the concurrent pump-write vs. snapshot-read on the logBuffer.
@@ -298,7 +298,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 
 	// held-open pipe → bounded snapshot, NO hang: a forked grandchild holds the
 	// stdout/stderr write-end open after the direct child exits, so the supervisor
-	// pump never reaches EOF and LogsDrained never closes. watchContainerExit MUST
+	// pump never reaches EOF and LogsDrained never closes. watchContainerExit must
 	// still finalize the terminated status within ~drainGrace (snapshotting whatever
 	// tail is buffered), never wedge the pod in Running forever. Run under -race.
 	t.Run("held-open-pipe-bounded-snapshot-no-hang", func(t *testing.T) {
@@ -343,7 +343,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 	})
 
 	// capture despite request-ctx cancel: under the M2 daemon split the CreatePod ctx
-	// is canceled when the unary handler returns. The fallback must STILL capture the
+	// is canceled when the unary handler returns. The fallback must still capture the
 	// log tail, proving watchContainerExit + the reaper run on the detached pod-lifetime
 	// ctx, not the request ctx. Pre-detach this is a silent no-op: canceling makes the
 	// reaper record a bogus context-canceled exit and the drain-wait snapshot nothing.
@@ -384,7 +384,7 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 	t.Run("utf8-tail-cut-rounds-to-rune-boundary", func(t *testing.T) {
 		logs := newLogBuffer(nil)
 		// One line of 3-byte runes longer than the byte cap, so the last-2048-byte cut
-		// lands INSIDE a rune (2048 % 3 != 0): the naive slice would start on a UTF-8
+		// lands inside a rune (2048 % 3 != 0): the naive slice would start on a UTF-8
 		// continuation byte.
 		logs.write([]byte(strings.Repeat("世", 1000))) // 3000 bytes > 2048
 		msg := terminationMessageFromLogs(logs)

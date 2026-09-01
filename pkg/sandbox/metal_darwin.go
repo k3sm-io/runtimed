@@ -24,18 +24,18 @@ package sandbox
 */
 import "C"
 
-// probeMetal runs the FUNCTIONAL Metal probe through the Obj-C shim
+// probeMetal runs the functional Metal probe through the Obj-C shim
 // (metal_darwin.m): compile a kernel, dispatch it, verify the results, and report
 // whether the device is the VZ paravirtual one.
 //
 // Metal.framework is a PUBLIC framework, so — exactly like Virtualization.framework
-// for the vm backend — this is NOT a symbol-canary case; do not add Metal symbols to
+// for the vm backend — this is not a symbol-canary case; do not add Metal symbols to
 // internal/spicanary.
 //
 // The probe is synchronous and unbounded by a timeout of its own, which is safe for
 // its one production caller (Runtime construction, once per daemon lifetime): every
 // leg is a local GPU driver call with no network, no fork, and no lock this process
-// holds. It is deliberately NOT run per pod.
+// holds. It is deliberately not run per pod.
 func probeMetal() MetalStatus {
 	var facts C.k3sm_metal_facts
 	C.k3sm_metal_probe(&facts)

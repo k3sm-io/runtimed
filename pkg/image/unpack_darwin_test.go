@@ -41,7 +41,7 @@ import (
 // It is darwin-only because assertNoQuarantine is a no-op elsewhere: there is no
 // attribute to set, so the same test off darwin would assert nothing and pass.
 func TestUnpackQuarantineDiscipline(t *testing.T) {
-	// A REAL APFSCloner, not ByteCopier: unix.Clonefile carries xattrs across
+	// A real APFSCloner, not ByteCopier: unix.Clonefile carries xattrs across
 	// with the extents, which is precisely why the assertion is needed on the
 	// destination. A byte copy would silently launder the attribute and the
 	// negative case below would be vacuous.
@@ -80,7 +80,7 @@ func TestUnpackQuarantineDiscipline(t *testing.T) {
 	})
 
 	t.Run("a_quarantined_tree_file_refuses_to_materialize", func(t *testing.T) {
-		// Plant the attribute on the committed tree AFTER the unpack, which is
+		// Plant the attribute on the committed tree after the unpack, which is
 		// the only way it can arrive here (the applier creates every file itself
 		// and asserts the attribute's absence as it goes).
 		if err := unix.Setxattr(filepath.Join(tree.Rootfs, "app"), QuarantineXattr,

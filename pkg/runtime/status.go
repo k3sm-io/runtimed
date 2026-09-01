@@ -28,7 +28,7 @@ import (
 // buffered channel and the current snapshot on subscribe.
 //
 // Concurrency: mu guards subs. publish copies the subscriber list under the lock
-// then sends OUTSIDE the lock (a slow/closed subscriber must not block
+// then sends outside the lock (a slow/closed subscriber must not block
 // publishers or other subscribers); sends are non-blocking (drop on full buffer,
 // the subscriber re-reads current state on reconnect).
 type broker struct {
@@ -60,8 +60,8 @@ func (b *broker) subscribe(podID string) (<-chan *runtimev1.PodStatusEvent, func
 	b.subs[id] = sub
 	b.mu.Unlock()
 
-	// cancel only unregisters; it does NOT close ch. publish is the sender and
-	// sends OUTSIDE the lock, so a receiver-side close would race a concurrent
+	// cancel only unregisters; it does not close ch. publish is the sender and
+	// sends outside the lock, so a receiver-side close would race a concurrent
 	// send (send-on-closed-channel) — the "sender closes, never the receiver"
 	// rule. The unreferenced buffered channel is GC'd once the consumer (which is
 	// the sole reader and the caller of cancel) returns on its ctx.

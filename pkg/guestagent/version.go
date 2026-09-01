@@ -19,7 +19,7 @@ package guestagent
 // APIVersion is the guest/v1 contract version this agent speaks, reported in
 // HealthResponse.api_version.
 //
-// IT IS THE CONSTANT THE HANDSHAKE WAS WAITING FOR. guest.proto specifies the
+// It is the constant the handshake was waiting for. guest.proto specifies the
 // field and states the rule — a host that dials an agent speaking a different
 // api_version must fail the pod with that stated reason rather than proceed and
 // discover the mismatch as malformed streams — but neither end defined a value, so
@@ -33,8 +33,8 @@ package guestagent
 // tripwire for the one reachable way to get an unsupported pairing: the dev-lab
 // --guest-artifacts-dir override.
 //
-// BUMP IT ONLY FOR A WIRE-INCOMPATIBLE CHANGE, and never for an additive one:
+// BUMP IT only for A WIRE-INCOMPATIBLE change, and never for an additive one:
 // guest.proto is additive-only forever, and HealthResponse.capabilities exists
-// precisely so a new feature can be negotiated WITHOUT a version bump. A bump that
+// precisely so a new feature can be negotiated without a version bump. A bump that
 // was not needed fails every pod on a correct pairing.
 const APIVersion = "k3sm.guest.v1"

@@ -107,7 +107,7 @@ func (s *recordingSeam) Getrlimit(resource int) (unix.Rlimit, error) {
 }
 
 // TestRunLaunchSequenceOrder is the M2.3-a1 ordering proof: with a securityContext
-// drop requested (as root), the exec-shim sequence is EXACTLY
+// drop requested (as root), the exec-shim sequence is exactly
 // setgid → initgroups → setuid → sandbox_apply → exec, and without a drop it is
 // sandbox_apply → exec — even on a non-root daemon, where NO setuid is attempted
 // (the unprivileged _k3sm posture: the pod runs at the daemon's own uid). setgid
@@ -174,7 +174,7 @@ func TestRunLaunchSequenceOrder(t *testing.T) {
 }
 
 // TestRunLaunchSequenceFailClosed proves that a failure at any step aborts the
-// sequence so the pod is NEVER exec'd with the wrong identity or unconfined: an
+// sequence so the pod is never exec'd with the wrong identity or unconfined: an
 // error at setuid skips sandbox_apply + exec; an error at sandbox_apply skips
 // exec.
 func TestRunLaunchSequenceFailClosed(t *testing.T) {
@@ -220,8 +220,8 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 }
 
 // TestRunLaunchSequenceRefusesDropAsNonRoot proves the credential posture: a
-// drop requested on a non-root daemon (euid != 0) is REFUSED with
-// ErrDropRequiresRoot before ANY step runs — no setgid/setuid is attempted, the
+// drop requested on a non-root daemon (euid != 0) is refused with
+// ErrDropRequiresRoot before any step runs — no setgid/setuid is attempted, the
 // sandbox is not applied, and the pod is not exec'd. This is the unprivileged
 // _k3sm posture: pods run at the daemon's own uid (Drop=false), never root, and
 // a stray Drop=true fails closed rather than silently mis-running the pod.
@@ -237,9 +237,9 @@ func TestRunLaunchSequenceRefusesDropAsNonRoot(t *testing.T) {
 }
 
 // TestRunLaunchSequence_Rlimits proves the rlimit slice of the launch sequence:
-// StepSetrlimit is applied BEFORE the privilege drop, each planned unix.Rlimit
+// StepSetrlimit is applied before the privilege drop, each planned unix.Rlimit
 // reaches the seam verbatim (including unlimited→RLIM_INFINITY), an empty plan
-// adds no step, and a non-root hard-limit RAISE is CLAMPED to the inherited
+// adds no step, and a non-root hard-limit raise is CLAMPED to the inherited
 // ceiling (with a warning) instead of failing the pod. No real syscall runs — the
 // recording seam fakes the kernel's EPERM denial and the inherited ceiling.
 func TestRunLaunchSequence_Rlimits(t *testing.T) {
@@ -311,8 +311,8 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 	})
 
 	// (e) a hard-limit raise above the inherited ceiling is clamped, with a
-	// warning — NOT a fatal EPERM. (Since the unconditional security clamp the
-	// pre-clamp fires BEFORE the kernel would even see the raise; the seam's
+	// warning — not a fatal EPERM. (Since the unconditional security clamp the
+	// pre-clamp fires before the kernel would even see the raise; the seam's
 	// EPERM emulation stays as the defense-in-depth backstop.)
 	t.Run("nonroot-hard-raise-clamped-not-fatal", func(t *testing.T) {
 		var buf bytes.Buffer
@@ -325,7 +325,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 			inherited:  map[int]unix.Rlimit{unix.RLIMIT_NOFILE: {Cur: 1024, Max: inheritedHard}},
 			epermAbove: map[int]uint64{unix.RLIMIT_NOFILE: inheritedHard}, // a raise above 4096 → EPERM (non-root)
 		}
-		// Request hard = 1<<20 (a RAISE above the inherited 4096): the unprivileged
+		// Request hard = 1<<20 (a raise above the inherited 4096): the unprivileged
 		// posture cannot raise it, so it must be clamped to 4096, not fail the pod.
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 8192, Max: 1 << 20}}}
 		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
@@ -354,7 +354,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 
 	// (B7 post-critique, security HIGH) the inherited-ceiling clamp is
 	// UNCONDITIONAL: even in the ROOT posture — where a euid-0 setrlimit hard
-	// raise would SUCCEED (the EPERM clamp never fires for root) — a pod-sourced
+	// raise would succeed (the EPERM clamp never fires for root) — a pod-sourced
 	// plan must not raise limits above the daemon's inherited posture, or a pod
 	// annotation becomes a node-wide escalation lever (e.g. RLIMIT_NPROC on the
 	// shared _k3sm uid). The seam accepts everything (no epermAbove — the root
@@ -398,7 +398,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 	})
 
-	// (B7) darwin NOFILE taxonomy: an infinite soft NOFILE is clamped DOWN before
+	// (B7) darwin NOFILE taxonomy: an infinite soft NOFILE is clamped down before
 	// the syscall (darwin setrlimit(2) returns EINVAL for rlim_cur=RLIM_INFINITY on
 	// RLIMIT_NOFILE — the launch would abort), so the seam receives the OPEN_MAX
 	// ceiling, never RLIM_INFINITY, in Cur.
@@ -422,7 +422,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 	})
 
 	// (B7) shim NOFILE floor: a too-tight soft NOFILE starves sandbox_compile's
-	// profile read and the exec'd image's dyld AFTER confinement, so Cur is raised
+	// profile read and the exec'd image's dyld after confinement, so Cur is raised
 	// to the named floor (256) with a warning before the syscall.
 	t.Run("nofile-tight-soft-floored-up-with-warning", func(t *testing.T) {
 		var buf bytes.Buffer
@@ -449,8 +449,8 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 
 // TestRunLaunchSequence_QoSPriority is the B7 qos slice: a background (BestEffort
 // / unspecified — the mapping from the apis QOSClass enum to the supervisor-local
-// BgQoS bool lives daemon-side in runtime.resolveBgQoS) launch performs EXACTLY
-// one Setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) call, positioned BEFORE
+// BgQoS bool lives daemon-side in runtime.resolveBgQoS) launch performs exactly
+// one Setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) call, positioned before
 // StepSandboxApply (a default-deny SBPL may deny setpriority afterward; pre-exec
 // means the band is inherited by the exec'd image and all descendants,
 // race-free). Guaranteed/Burstable (BgQoS=false) is the ABSENCE of the call —
@@ -503,7 +503,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 		}
 	})
 
-	// Guaranteed/Burstable: the seam's Setpriority is NEVER called — the darwin
+	// Guaranteed/Burstable: the seam's Setpriority is never called — the darwin
 	// default band is the absence of the call, not an explicit reset.
 	t.Run("guaranteed-burstable-no-call-at-all", func(t *testing.T) {
 		seam := &recordingSeam{}
@@ -675,7 +675,7 @@ func TestChownForFSGroupRejectsRootGid(t *testing.T) {
 
 // TestChownForFSGroupRejectsUnboundedRoot is the B140 sink-side half: the
 // recursive group-rwx + setgid grant refuses a root outside the permitted tree
-// REGARDLESS of the caller, and refuses it BEFORE touching the filesystem. The
+// REGARDLESS of the caller, and refuses it before touching the filesystem. The
 // pre-created victim's mode is asserted unchanged, because an error return alone
 // would not distinguish "refused" from "escalated, then failed late".
 func TestChownForFSGroupRejectsUnboundedRoot(t *testing.T) {
@@ -724,7 +724,7 @@ func TestChownForFSGroupRejectsUnboundedRoot(t *testing.T) {
 		})
 	}
 
-	// POSITIVE CONTROL: a root strictly inside the bound is still walked, so the
+	// positive CONTROL: a root strictly inside the bound is still walked, so the
 	// table above cannot pass by refusing everything.
 	pod := filepath.Join(bound, "pod-a", "rootfs")
 	if err := ChownForFSGroup(bound, pod, gid); err != nil {
@@ -756,7 +756,7 @@ func TestStrictlyUnder(t *testing.T) {
 		{"/a/b", "", false},
 		{"/a/b/", "/a", true}, // trailing separator is cleaned away
 	}
-	// The DELIBERATE asymmetry with pkg/mount.IsStrictlyUnder, pinned so the
+	// The deliberate asymmetry with pkg/mount.IsStrictlyUnder, pinned so the
 	// divergence cannot be "reconciled" by loosening this one. mount's variant
 	// answers true for both of these (it does not require absolute operands),
 	// which is harmless where its inputs are absolute by construction but is a

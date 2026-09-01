@@ -28,7 +28,7 @@ import (
 // the refusal with errors.Is rather than matching on a message, and so a bad
 // working directory is never mistaken for a bad executable.
 //
-// A Dir that is SET BUT UNUSABLE FAILS THE SPAWN. There is deliberately no
+// A Dir that is set but unusable fails the spawn. There is deliberately no
 // fallback to the caller's cwd: the caller is a root daemon whose cwd is its own
 // working directory, the pod sandbox profile denies that tree, and a pod that
 // silently landed there would run somewhere nothing in its spec asked for. That
@@ -56,7 +56,7 @@ type spawnPlan struct {
 // planSpawn resolves spec's working directory, refusing a Dir that is set but
 // unusable with ErrWorkingDir.
 //
-// The directory is checked HERE, in Go, rather than left to the kernel.
+// The directory is checked here, in Go, rather than left to the kernel.
 // posix_spawn does surface a failed chdir file-action as its own errno (probed
 // on macOS 26.5: ENOENT for a missing directory, ENOTDIR for a plain file), so
 // the spawn fails either way — but that errno is indistinguishable from the same

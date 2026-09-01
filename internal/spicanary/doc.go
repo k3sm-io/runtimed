@@ -30,7 +30,7 @@ limitations under the License.
 // public <libproc.h> export but is canaried because the whole M2.5 OOMKilled + Summary path
 // depends on it staying linkable, and memorystatus_control has NO public header at all.
 // Note Virtualization.framework (the M5 vm backend) is a PUBLIC framework and is explicitly
-// NOT a canary case — do not add VZ symbols here.
+// not a canary case — do not add VZ symbols here.
 //
 // canary_darwin.go (cgo) takes the address of each symbol so the package fails to LINK if one
 // vanishes; TestSymbolsResolve (libsandbox) and TestResourceSymbolsResolve (M2 resource SPI)

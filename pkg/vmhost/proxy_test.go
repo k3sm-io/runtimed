@@ -65,12 +65,12 @@ func newTestProxy(t *testing.T, dialErr error) (string, <-chan fakeGuestEnd, con
 	served := make(chan error, 1)
 	go func() { served <- p.Serve(ctx) }()
 
-	// Serve sends exactly ONE value, and BOTH the cleanup and a subtest may want
+	// Serve sends exactly one value, and both the cleanup and a subtest may want
 	// it — so the receive happens once and the result is memoised. Handing out two
 	// independent receivers of a one-shot channel deadlocks whichever arrives
 	// second, which reads as a hung package rather than as the harness bug it is.
 	//
-	// The wait is BOUNDED for the same reason: a future regression that genuinely
+	// The wait is bounded for the same reason: a future regression that genuinely
 	// wedges Serve should fail here with a message naming it, not stall until the
 	// package timeout.
 	var once sync.Once
@@ -100,7 +100,7 @@ func newTestProxy(t *testing.T, dialErr error) (string, <-chan fakeGuestEnd, con
 // faithfully and then GOING AWAY COMPLETELY, leaving no goroutine holding a vsock
 // connection into a machine the lifecycle is about to halt.
 //
-// EVERY assertion is a t.Run subtest of this ONE function on purpose: the gate runs
+// every assertion is a t.Run subtest of this one function on purpose: the gate runs
 // `go test -run '^TestProxyRelayShutdown$'`, so a sibling top-level Test* would be
 // silently filtered out and never run.
 //
@@ -313,7 +313,7 @@ func readN(t *testing.T, c net.Conn, n int) string {
 	return string(buf)
 }
 
-// shortSocketPath returns a unix-socket path SHORT ENOUGH TO BIND. A darwin
+// shortSocketPath returns a unix-socket path short ENOUGH TO BIND. A darwin
 // sockaddr_un carries 104 bytes, and t.TempDir() builds its name from the full
 // subtest path — which for a table of long, descriptive subtest names overflows it
 // and reports the confusing "bind: invalid argument". Rooting the socket at /tmp

@@ -113,9 +113,9 @@ func TestGenerateDenySet(t *testing.T) {
 }
 
 // TestGenerateProtectedDeniesAfterExtraAllows is acceptance M2.2-a2 (ordering
-// half): SBPL is last-match-wins, so the protected denies MUST be emitted AFTER
+// half): SBPL is last-match-wins, so the protected denies must be emitted after
 // any extra-path allow (a hostPath-style extra path cannot override them), and
-// the pod's own data-volume re-allow MUST come after the pods-root deny (so the
+// the pod's own data-volume re-allow must come after the pods-root deny (so the
 // pod keeps its own dir).
 func TestGenerateProtectedDeniesAfterExtraAllows(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
@@ -176,10 +176,10 @@ func TestGenerateRejectsProtectedExtraPath(t *testing.T) {
 
 // TestProtectedPathRefusalNamesPodRootRemedy is B179: a protected-path refusal
 // must name its remedy, not just its cause. It goes through Generate (never
-// validateExtraPaths directly) with the SAME trigger as the
+// validateExtraPaths directly) with the same trigger as the
 // "pv-write-under-users" case above — a WritePaths entry under /Users — so this
 // assertion and that table can never diverge on what actually rejects. The
-// error must still satisfy errors.Is(err, ErrProtectedPath) AND its text must
+// error must still satisfy errors.Is(err, ErrProtectedPath) and its text must
 // name --pod-root (the k3sm server flag that relocates the runtimed on-disk
 // root off the protected prefix) — not --work-dir, which does not.
 func TestProtectedPathRefusalNamesPodRootRemedy(t *testing.T) {
@@ -197,8 +197,8 @@ func TestProtectedPathRefusalNamesPodRootRemedy(t *testing.T) {
 }
 
 // TestGenerateSecretReadOnlySubScope is acceptance M2.2-a3 (SBPL half): a
-// credential mount (secret / SA-token) gets file-read* AND an explicit
-// file-write* deny, emitted LAST so the write-deny wins even though the secret
+// credential mount (secret / SA-token) gets file-read* and an explicit
+// file-write* deny, emitted last so the write-deny wins even though the secret
 // lives inside the writable data volume — a pod can read but not overwrite its
 // credentials.
 func TestGenerateSecretReadOnlySubScope(t *testing.T) {
@@ -225,9 +225,9 @@ func TestGenerateSecretReadOnlySubScope(t *testing.T) {
 }
 
 // TestPVCInSBPLWriteScope is acceptance runtimed:M3.1-a1 (SBPL half): a read-write
-// persistent-volume mount root (opts.WritePaths) — which lives OUTSIDE the pod data
-// volume on the APFS storage root — gets BOTH a file-write* and a file-read* allow,
-// a read-only PV root (opts.ReadPaths) gets read but NOT write, and the protected
+// persistent-volume mount root (opts.WritePaths) — which lives outside the pod data
+// volume on the APFS storage root — gets both a file-write* and a file-read* allow,
+// a read-only PV root (opts.ReadPaths) gets read but not write, and the protected
 // denies (e.g. /Users) still win regardless.
 func TestPVCInSBPLWriteScope(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
@@ -240,7 +240,7 @@ func TestPVCInSBPLWriteScope(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	// The PV root (under the /var firmlink) is granted file-write* in BOTH the raw
+	// The PV root (under the /var firmlink) is granted file-write* in both the raw
 	// and /private-resolved form (the write block carries both subpaths).
 	wantWriteBlock := "(allow file-write*\n  (subpath \"" + pvWrite + "\")\n  (subpath \"/private" + pvWrite + "\")\n  (literal \"/dev/null\"))"
 	if !strings.Contains(out, wantWriteBlock) {
@@ -250,12 +250,12 @@ func TestPVCInSBPLWriteScope(t *testing.T) {
 	if !strings.Contains(out, "(subpath \""+pvWrite+"\")\n  (subpath \"/private"+pvWrite+"\")\n  (literal \"/dev/null\") (literal \"/dev/zero\")") {
 		t.Errorf("PV mount root missing file-read* allow (both firmlink forms):\n%s", out)
 	}
-	// The protected denies still win: /Users is denied AFTER the allows.
+	// The protected denies still win: /Users is denied after the allows.
 	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \"/Users\"))") {
 		t.Errorf("protected /Users deny missing — PV write-scope must not weaken it:\n%s", out)
 	}
 
-	// A READ-ONLY PV root gets a read allow but NO write allow (default-deny then
+	// A READ-only PV root gets a read allow but NO write allow (default-deny then
 	// blocks writes): the write block stays the bare /dev/null default.
 	const pvRO = "/var/lib/k3sm/storage/prod/config"
 	ro, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
@@ -273,11 +273,11 @@ func TestPVCInSBPLWriteScope(t *testing.T) {
 }
 
 // TestGeneratePodReapStoreDenied is the podreap trust-boundary contract: the
-// daemon-private startup-reap store (<WorkDir>/podreap) MUST be read+write denied
+// daemon-private startup-reap store (<WorkDir>/podreap) must be read+write denied
 // so a confined pod can never forge a reap record (which drives a root-privileged
-// kill(-pgid) at a group of its choosing). The load-bearing case is an ANCESTOR
+// kill(-pgid) at a group of its choosing). The load-bearing case is an ancestor
 // extra_write_path: even when a caller grants write to the whole work-dir, the
-// emitted podreap deny — placed AFTER the allows (last-match-wins) — must still
+// emitted podreap deny — placed after the allows (last-match-wins) — must still
 // re-deny the store. A validate-set entry alone would not close this; the emitted
 // deny is the barrier.
 func TestGeneratePodReapStoreDenied(t *testing.T) {
@@ -285,7 +285,7 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 	const dataVol = workDir + "/pods/p1/rootfs"
 	const podReapRoot = workDir + "/" + PodReapSubdir
 
-	// Grant write to the work-dir ITSELF — an ancestor of the reap store. This
+	// Grant write to the work-dir itself — an ancestor of the reap store. This
 	// passes validateExtraPaths (an ancestor is not "under" a protected prefix),
 	// so it emits an (allow file-write* (subpath "/var/lib/k3sm")) with no
 	// implicit protection of the podreap child.
@@ -305,7 +305,7 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 		t.Fatalf("expected the ancestor work-dir write allow in the profile:\n%s", out)
 	}
 
-	// The podreap store is denied in BOTH firmlink forms.
+	// The podreap store is denied in both firmlink forms.
 	for _, frag := range []string{
 		"(subpath \"" + podReapRoot + "\")",
 		"(subpath \"/private" + podReapRoot + "\")",
@@ -315,7 +315,7 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 		}
 	}
 
-	// And the deny is emitted AFTER the ancestor allow so last-match-wins keeps
+	// And the deny is emitted after the ancestor allow so last-match-wins keeps
 	// the store denied despite the ancestor write grant.
 	iDeny := strings.Index(out, "(deny file-read* file-write*\n  (subpath \""+workDir+"/pods\")")
 	if iDeny < 0 {
@@ -335,7 +335,7 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 // the work-dir siblings that hold the cluster CA keys + kine datastore
 // (<WorkDir>/server), the node-agent state (<WorkDir>/agent), the daemon control
 // sockets + wireguard mesh private key (<WorkDir>/run) and the content-addressed
-// blob store (<WorkDir>/blobs) MUST be BOTH rejected as caller-supplied paths and
+// blob store (<WorkDir>/blobs) must be both rejected as caller-supplied paths and
 // EMITTED as denies after the allows — a validate-set entry alone would not
 // survive an ancestor grant, and an emitted deny placed before the allows would
 // be worthless (SBPL is last-match-wins).
@@ -349,7 +349,7 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 	posture := Posture{WorkDir: workDir}
 	subdirs := []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir}
 
-	// (0) The mesh private key's ABSOLUTE home is denied even though this posture's
+	// (0) The mesh private key's absolute home is denied even though this posture's
 	// work-dir is elsewhere. Everything else in the deny-set moves with the
 	// work-dir; the key does not, because the installer writes it at a fixed path.
 	// Without this the unprivileged home-rooted posture would guard an empty
@@ -404,9 +404,9 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		}
 	})
 
-	// (2) Emission + ordering: grant write to the work-dir ITSELF (an ancestor,
+	// (2) Emission + ordering: grant write to the work-dir itself (an ancestor,
 	// which validateExtraPaths permits) and require every tree to be re-denied
-	// AFTER that allow, by byte index.
+	// after that allow, by byte index.
 	t.Run("emitted deny follows the ancestor allow", func(t *testing.T) {
 		out, err := Generate(&runtimev1.SandboxProfile{
 			DataVolumePath:  dataVol,
@@ -442,7 +442,7 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		}
 	})
 
-	// (3) POSITIVE CONTROL: a legitimate PV mount root under <WorkDir>/storage is
+	// (3) positive CONTROL: a legitimate PV mount root under <WorkDir>/storage is
 	// still granted and is not covered by any denied root. Without this the table
 	// cannot tell "control-plane trees protected" from "all PV volumes broken".
 	t.Run("legitimate pv path still granted", func(t *testing.T) {
@@ -557,7 +557,7 @@ func TestGenerateInvalid(t *testing.T) {
 	}
 }
 
-// TestValidate covers the fail-closed gate: a profile MUST have (deny default)
+// TestValidate covers the fail-closed gate: a profile must have (deny default)
 // and (import "system.sb"); the generator's output passes, a hand-rolled profile
 // lacking either is rejected (acceptance M1.2-a2).
 func TestValidate(t *testing.T) {
@@ -596,9 +596,9 @@ func TestValidate(t *testing.T) {
 // SandboxProfile.denied_unix_socket_paths the generator emits an explicit
 // (deny network-outbound (remote unix-socket (literal …))) on top of the
 // default-deny. Because pods share the runtime client's uid (no per-pod uid
-// isolation), this Seatbelt deny is the ONLY barrier keeping a pod off the
+// isolation), this Seatbelt deny is the only barrier keeping a pod off the
 // privileged k3sm-netd helper socket, so it must hold whether or not the pod is
-// granted network egress — and, when egress is allowed, come AFTER the outbound
+// granted network egress — and, when egress is allowed, come after the outbound
 // allow (last-match-wins).
 func TestGenerateDeniedUnixSockets(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
@@ -670,7 +670,7 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	// The pods-root deny tracks the work-dir (NOT the legacy /var/lib/k3sm/pods).
+	// The pods-root deny tracks the work-dir (not the legacy /var/lib/k3sm/pods).
 	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \""+podsRoot+"\")") {
 		t.Errorf("pods-root deny does not track the work-dir (%q):\n%s", podsRoot, out)
 	}
@@ -678,12 +678,12 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 		t.Errorf("profile still references the legacy /var/lib/k3sm/pods despite a configured work-dir:\n%s", out)
 	}
 	// The fixed /Users protected deny survives (the daemon home is under /Users,
-	// but only THIS pod's data volume is re-allowed; siblings/other homes stay
+	// but only this pod's data volume is re-allowed; siblings/other homes stay
 	// denied).
 	if !strings.Contains(out, "(deny file-read* file-write*\n  (subpath \"/Users\"))") {
 		t.Errorf("fixed /Users deny missing under a $HOME-style work-dir:\n%s", out)
 	}
-	// The pod's own data volume is re-allowed AFTER the pods-root deny (last-match-wins).
+	// The pod's own data volume is re-allowed after the pods-root deny (last-match-wins).
 	iDeny := strings.Index(out, "(subpath \""+podsRoot+"\")")
 	iReallow := strings.Index(out, "(allow file-read* file-write*\n  (subpath \""+dataVol+"\")")
 	if iDeny < 0 || iReallow < 0 {
@@ -718,7 +718,7 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 // pod gets an UNFILTERED (allow network-bind) — never the pre-M10.1 (local ip
 // "<PodIP>:*") scoping, which the macOS 26 Seatbelt grammar rejects at
 // sandbox_apply ("host must be * or localhost in network address"), making
-// every networked pod fail to spawn. A known PodIP must NOT change the rendered
+// every networked pod fail to spawn. A known PodIP must not change the rendered
 // profile (it is plumbing-only), and without allow_network no bind is granted.
 func TestGenerateNetworkBindUnfiltered(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
@@ -777,7 +777,7 @@ func TestGenerateNetworkBindUnfiltered(t *testing.T) {
 // macOS 26 (the pre-M10.1 VIP-scoped egress failed sandbox_apply and no
 // networked pod could spawn). A networked pod instead gets the unfiltered
 // (allow network-outbound), and the AF_UNIX helper-socket deny stays intact and
-// AFTER it (last-match-wins keeps the socket denied).
+// after it (last-match-wins keeps the socket denied).
 func TestGenerateVIPsDoNotRenderSBPL(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
 	const apiVIP = "10.43.0.1"

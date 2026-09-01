@@ -45,12 +45,12 @@ import (
 // Being a sibling is deliberate, exactly as it is for IndexSubdir: the GC's
 // enumerators read blobs/ (Cache.EnumerateBlobs), pods/ (Cache.Roots) and the
 // tree stores (Cache.EnumerateTrees), so a staged archive can neither be
-// mistaken for a blob of unknown provenance nor become a reachability root. The staged file itself is UNLINKED the instant it
+// mistaken for a blob of unknown provenance nor become a reachability root. The staged file itself is unlinked the instant it
 // is created (see stageArchive), so the directory is normally empty and a
 // crashed ingest leaves nothing behind at all.
 const IngestSubdir = "ingest"
 
-// maxArchiveMetadataBytes caps any ONE archive document this package reads whole
+// maxArchiveMetadataBytes caps any one archive document this package reads whole
 // into memory — index.json, an image manifest, an image config.
 //
 // The archive is operator-supplied but not therefore trusted: without a cap, a
@@ -83,7 +83,7 @@ var ErrArchiveUnsupported = errors.New("image: archive shape is not supported")
 // docker-save tar with several manifest entries, one entry with several
 // RepoTags, or an OCI layout whose index names several manifests.
 //
-// v1 REFUSES rather than choosing one, because a load records exactly one
+// v1 refuses rather than choosing one, because a load records exactly one
 // reference: picking a manifest (or a tag) would silently drop the others, and
 // an operator would discover the loss only when a pod could not find the image.
 // The remedy is one load per image.
@@ -131,7 +131,7 @@ type LoadResult struct {
 	// Manifest is the ingested image manifest in the shared apis form, as
 	// recorded in the index.
 	Manifest *runtimev1.ImageManifest
-	// Descriptor is the manifest's OWN content descriptor — media type, digest
+	// Descriptor is the manifest's own content descriptor — media type, digest
 	// (what a user reads as the image id) and size.
 	Descriptor *runtimev1.Descriptor
 	// Platform is the platform the image's own config declares; it is the second
@@ -153,31 +153,31 @@ type LoadResult struct {
 //  1. VERIFY — every blob the archive's own manifest names is re-hashed and
 //     compared against the digest that manifest claims for it. Nothing is
 //     written to the store, no lease is taken, and no reference is recorded.
-//  2. LEASE + COMMIT — only once EVERY blob has verified, a lease is taken over
+//  2. LEASE + COMMIT — only once every blob has verified, a lease is taken over
 //     the whole digest set (pinning it against a concurrent reclaim, exactly as
 //     Puller.Pull does) and each blob is committed through Cache.CommitBlob,
 //     which independently re-verifies it at write time.
-//  3. RECORD — the reference is recorded LAST, after every blob it names is
+//  3. RECORD — the reference is recorded last, after every blob it names is
 //     committed, and the lease is released only after that.
 //
-// A mismatch anywhere in phase 1 fails the whole load: NOTHING is committed, not
+// A mismatch anywhere in phase 1 fails the whole load: nothing is committed, not
 // even the blobs that verified, no lease was ever taken, and no reference is
 // recorded. That all-or-nothing property is why phase 1 is a separate pass
 // rather than a per-blob check folded into phase 2 — a per-blob loop would leave
 // the blobs before the bad one committed, and an ingest that half-lands is one a
 // later reader cannot distinguish from a completed one.
 //
-// The two passes read the SAME staged file, which is unlinked at creation and
+// The two passes read the same staged file, which is unlinked at creation and
 // held open by fd alone (see stageArchive), so the bytes verified in phase 1 are
 // provably the bytes committed in phase 2: no path exists for anything to
 // substitute them in between.
 //
-// # What this does NOT claim
+// # What this does not claim
 //
-// A loaded image is PROVENANCE-FREE by design (the M12 images plan, §M12.2):
+// A loaded image is PROVENANCE-free by design (the M12 images plan, §M12.2):
 // this path evaluates no signature policy, and the archive's manifest is
 // supplied by the same party as its bytes. On the docker-save leg in particular
-// the per-blob check is SELF-CONSISTENCY, not authenticity —
+// the per-blob check is self-CONSISTENCY, not authenticity —
 // go-containerregistry synthesizes that format's descriptors from the very bytes
 // being checked (see Cache.CommitBlob's "what this defends against, honestly").
 // The OCI-layout leg is the stronger one: its claims come from a manifest whose
@@ -191,7 +191,7 @@ type Loader struct {
 // NewLoader returns a Loader writing into cache and recording references in
 // index.
 //
-// Both arguments are REQUIRED, for the same reason NewPuller's are: an ingest
+// Both arguments are required, for the same reason NewPuller's are: an ingest
 // that silently recorded nothing would produce an image no pod can resolve by
 // reference, and the caller that keeps no record says so by passing
 // NoLocalIndex{}.
@@ -233,14 +233,14 @@ func (l *Loader) Load(ctx context.Context, req LoadRequest, src io.Reader) (*Loa
 		return nil, fmt.Errorf("load image %q: %w", ref, err)
 	}
 
-	// PHASE 1 — verify every blob before the store is touched at all. See the
-	// Loader doc comment: this pass is what makes a mismatch reject the WHOLE
+	// phase 1 — verify every blob before the store is touched at all. See the
+	// Loader doc comment: this pass is what makes a mismatch reject the whole
 	// load instead of leaving the blobs that happened to come first behind.
 	if err := verifyArchiveBlobs(ctx, img); err != nil {
 		return nil, fmt.Errorf("load image %q: %w", ref, err)
 	}
 
-	// PHASE 2 — lease the whole digest set BEFORE the first commit, exactly as
+	// phase 2 — lease the whole digest set before the first commit, exactly as
 	// Puller.Pull does and for the same reason: a blob this ingest depends on can
 	// already be present, already be old, and be named by nothing, which makes it
 	// deletable by a concurrent reclaim during the very ingest that needs it.
@@ -277,7 +277,7 @@ func (l *Loader) Load(ctx context.Context, req LoadRequest, src io.Reader) (*Loa
 		out.Layers = append(out.Layers, descriptorFromGGCR(layer))
 	}
 
-	// PHASE 3 — record the reference LAST. Every blob it names is committed and
+	// phase 3 — record the reference last. Every blob it names is committed and
 	// digest-verified by now, and the manifest recorded is the one this ingest
 	// parsed and verified. The entry is an EDGE, not a reachability root (see
 	// FileIndex): a loaded image whose blobs no pod references is reclaimable
@@ -339,7 +339,7 @@ func (s *stagedArchive) Close() error { return s.f.Close() }
 // stageArchive spools src to a staged file under <root>/ingest and checks the
 // client's advisory claims about it.
 //
-// The file is UNLINKED immediately after creation and held open by fd alone.
+// The file is unlinked immediately after creation and held open by fd alone.
 // Three things follow: no other process can open, replace or symlink-swap the
 // bytes between the verify pass and the commit pass; a crashed daemon leaks no
 // artifact for a later ingest or a GC to reason about; and the space is returned
@@ -347,7 +347,7 @@ func (s *stagedArchive) Close() error { return s.f.Close() }
 //
 // Spooling is unavoidable rather than a shortcut: both archive formats put their
 // manifest at an arbitrary position in the tar, and every per-blob digest claim
-// comes FROM that manifest — so a strictly single-pass ingest would have to
+// comes from that manifest — so a strictly single-pass ingest would have to
 // commit blobs before it knew what they were claimed to be, which is precisely
 // the ordering this package refuses.
 func (l *Loader) stageArchive(ctx context.Context, req LoadRequest, src io.Reader) (*stagedArchive, error) {
@@ -380,7 +380,7 @@ func (l *Loader) stageArchive(ctx context.Context, req LoadRequest, src io.Reade
 		// what keeps the hasher on the path — see Cache.CommitBlob.
 		w = io.MultiWriter(f, hasher)
 	}
-	// A DECLARED size caps the spool at one byte past the claim: the archive is
+	// A declared size caps the spool at one byte past the claim: the archive is
 	// written to the store volume before anything about it is known, so a client
 	// that declares 4 MiB and then streams forever must be stopped at the
 	// declaration rather than at the disk. An UNDECLARED size is not capped here
@@ -441,7 +441,7 @@ type archiveImage struct {
 	manifestSize   int64
 	config         archiveBlob
 	layers         []archiveBlob
-	// platform is what the image's OWN config declares. It is the second half of
+	// platform is what the image's own config declares. It is the second half of
 	// the (reference x platform) index key.
 	platform Platform
 }
@@ -479,7 +479,7 @@ func parseArchive(open tarball.Opener, format runtimev1.LoadImageFormat) (*archi
 
 // parseDetected picks the format from the archive's own entries.
 //
-// A modern `docker save` writes BOTH an OCI layout and a manifest.json for
+// A modern `docker save` writes both an OCI layout and a manifest.json for
 // backwards compatibility, so manifest.json wins: it is the format
 // go-containerregistry's tarball reader is written against, and the OCI files it
 // sits beside describe the same image.
@@ -503,7 +503,7 @@ func parseDetected(open tarball.Opener) (*archiveImage, error) {
 //
 // The per-image work is delegated to go-containerregistry's tarball reader,
 // which is the format's reference implementation in this dependency set and
-// synthesizes a schema-2 manifest for the archive. What is NOT delegated is the
+// synthesizes a schema-2 manifest for the archive. What is not delegated is the
 // admission policy: the multi-image and multi-tag refusals below are k3sm's, and
 // ggcr enforces only the first of them.
 func parseDockerSave(open tarball.Opener) (*archiveImage, error) {
@@ -518,7 +518,7 @@ func parseDockerSave(open tarball.Opener) (*archiveImage, error) {
 		return nil, fmt.Errorf("%w: manifest.json names %d images; load one image per archive",
 			ErrArchiveMultipleImages, len(mf))
 	case len(mf[0].RepoTags) > 1:
-		// A load records exactly ONE reference. Accepting a multi-tag archive
+		// A load records exactly one reference. Accepting a multi-tag archive
 		// would drop every tag but the one the caller named, silently.
 		return nil, fmt.Errorf("%w: the archive's image carries %d tags and a load records one reference; re-export one tag per archive",
 			ErrArchiveMultipleImages, len(mf[0].RepoTags))
@@ -618,9 +618,9 @@ func parseOCILayout(open tarball.Opener) (*archiveImage, error) {
 	if err != nil {
 		return nil, err
 	}
-	// THE ROOT OF THE DIGEST CHAIN. Every per-blob claim below is read out of
+	// the ROOT OF the DIGEST CHAIN. Every per-blob claim below is read out of
 	// these bytes, so they are checked against the digest index.json pins for
-	// them BEFORE they are believed. Without this, an archive could rewrite its
+	// them before they are believed. Without this, an archive could rewrite its
 	// own manifest and the per-blob checks would agree with the rewrite.
 	if err := verifyBytes(rawMfst, desc.Digest, "image manifest"); err != nil {
 		return nil, err
@@ -682,7 +682,7 @@ func finishArchiveImage(a *archiveImage, rawCfg []byte) error {
 	return nil
 }
 
-// verifyArchiveBlobs is PHASE 1: re-hash every blob the manifest names and
+// verifyArchiveBlobs is phase 1: re-hash every blob the manifest names and
 // compare it against the digest that manifest claims. It writes nothing.
 func verifyArchiveBlobs(ctx context.Context, a *archiveImage) error {
 	for _, b := range a.blobs() {
@@ -758,7 +758,7 @@ func bytesOpener(b []byte) func() (io.ReadCloser, error) {
 
 // blobOpener opens the archive entry holding desc's content.
 //
-// The entry NAME is computed from the PARSED digest (blobEntryName), never taken
+// The entry NAME is computed from the parsed digest (blobEntryName), never taken
 // from the archive: an entry's own name is never used to locate anything, so no
 // name in a hostile archive can select a file, escape a directory, or alias
 // another blob.
@@ -783,7 +783,7 @@ func readBlobEntry(open tarball.Opener, desc ggcrv1.Descriptor) ([]byte, error) 
 }
 
 // blobEntryName is the OCI-layout path for a blob: blobs/<algo>/<hex>, built
-// from the PARSED halves of the digest (parseBlobDigest's closed allowlist), so
+// from the parsed halves of the digest (parseBlobDigest's closed allowlist), so
 // neither half can contain a separator or any other path metacharacter.
 func blobEntryName(h ggcrv1.Hash) (string, error) {
 	parsed, err := parseBlobDigest(h.String())
@@ -824,7 +824,7 @@ func entryNames(open tarball.Opener, wanted ...string) (map[string]bool, error) 
 
 // openTarEntry returns a reader over the archive entry named want.
 //
-// Only a REGULAR file entry can hold content. A symlink or hard-link entry at a
+// Only a regular file entry can hold content. A symlink or hard-link entry at a
 // blob's name is refused rather than followed: following one is how an archive
 // aliases a blob it does not contain onto bytes it did not supply, and the
 // aliased entry would then be hashed under the wrong claim.

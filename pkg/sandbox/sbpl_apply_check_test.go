@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestGeneratedProfileAppliesOnDarwin feeds a realistic M2 profile to the SAME
+// TestGeneratedProfileAppliesOnDarwin feeds a realistic M2 profile to the same
 // libsandbox the runtime uses (/usr/bin/sandbox-exec), so an invalid SBPL construct
 // (the `path-equal` class of bug that broke every M2 pod) fails here, not on the
 // live gate. It skips where sandbox-exec is absent (non-darwin CI).
@@ -57,7 +57,7 @@ func TestGeneratedProfileAppliesOnDarwin(t *testing.T) {
 }
 
 // TestGeneratedProfileAllowsRebasedFileRead is the file-read counterpart to the
-// socket guard: it proves a pod CAN read a file under its own data volume via the
+// socket guard: it proves a pod can read a file under its own data volume via the
 // path a macOS firmlink resolves to (/var,/tmp,/etc → /private/…). Before the
 // firmlink fix the profile allowed only the raw /var form, so libsandbox (which
 // matches the RESOLVED path) denied the rebased read with EPERM — every volume
@@ -66,7 +66,7 @@ func TestGeneratedProfileAppliesOnDarwin(t *testing.T) {
 // The data volume is sited at <WorkDir>/pods/<id>/rootfs — the production layout
 // — because Generate now bounds it there (ErrDataVolumeUnbounded). Keeping this
 // test on an arbitrary /tmp dir would mean loosening the bound; this test and the
-// integration one are the ONLY two that exercise real libsandbox, so re-siting
+// integration one are the only two that exercise real libsandbox, so re-siting
 // them is strictly cheaper than letting them rot.
 func TestGeneratedProfileAllowsRebasedFileRead(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {

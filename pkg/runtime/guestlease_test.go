@@ -34,7 +34,7 @@ import (
 
 // --- fakes ----------------------------------------------------------------
 
-// guestLeaseAgent is a real guest/v1 GuestAgent server answering the ONE verb
+// guestLeaseAgent is a real guest/v1 GuestAgent server answering the one verb
 // the lease watcher rides on — Health — over the same bufconn+gRPC round trip
 // startFakeGuestAgent gives every other guest route. There is no VM, no vmhost
 // and no vsock anywhere in this file: only the SOCKET is replaced.
@@ -128,7 +128,7 @@ func TestGuestLeaseValidationRejectsHostileValues(t *testing.T) {
 		{"unspecified-v6", "::", "", guestLeaseReasonOutOfFamily},
 		{"multicast-v4", "224.0.0.1", "", guestLeaseReasonOutOfFamily},
 		{"multicast-v6", "ff02::1", "", guestLeaseReasonOutOfFamily},
-		// 169.254/16 is what a guest self-assigns when DHCP FAILED — the absence
+		// 169.254/16 is what a guest self-assigns when DHCP failed — the absence
 		// of a lease — and it contains the cloud metadata address.
 		{"link-local-apipa", "169.254.10.1", "", guestLeaseReasonOutOfFamily},
 		{"link-local-metadata", "169.254.169.254", "", guestLeaseReasonOutOfFamily},
@@ -154,7 +154,7 @@ func TestGuestLeaseValidationRejectsHostileValues(t *testing.T) {
 		{"junk", "not an address", "", guestLeaseReasonUnparsable},
 		{"newline-injection", "192.168.64.7\nnameserver 1.2.3.4", "", guestLeaseReasonUnparsable},
 
-		// Length is checked BEFORE the parser sees the string.
+		// Length is checked before the parser sees the string.
 		{"overlong", strings.Repeat("9", maxGuestLeaseBytes+1), "", guestLeaseReasonOverlong},
 		{"overlong-address-prefix", "192.168.64.7" + strings.Repeat("0", maxGuestLeaseBytes), "", guestLeaseReasonOverlong},
 	} {
@@ -223,9 +223,9 @@ func TestGuestLeaseBackoffIsBoundedAndJittered(t *testing.T) {
 
 // TestGuestLeaseWatcherPublishesTheLiveTransportAddress is the B237 producer
 // gate. It asserts the properties a consumer depends on, not merely that a poll
-// happened: a first lease reaches PodStatus, a renewal REPLACES it, a lost or
+// happened: a first lease reaches PodStatus, a renewal replaces it, a lost or
 // refused lease EMPTIES it rather than leaving a stale address standing, every
-// transition rides the ONE status stream, the watcher stops when the pod does,
+// transition rides the one status stream, the watcher stops when the pod does,
 // and a host-process pod never gets one at all.
 func TestGuestLeaseWatcherPublishesTheLiveTransportAddress(t *testing.T) {
 	t.Run("first-lease-stamps-the-field", func(t *testing.T) {
@@ -313,7 +313,7 @@ func TestGuestLeaseWatcherPublishesTheLiveTransportAddress(t *testing.T) {
 		}
 	})
 
-	// The field rides the pod's ONE status path: a consumer learns the address
+	// The field rides the pod's one status path: a consumer learns the address
 	// from the same PodStatus stream it learns everything else from.
 	t.Run("a-change-is-published-to-status-subscribers", func(t *testing.T) {
 		agent := &guestLeaseAgent{}
@@ -337,7 +337,7 @@ func TestGuestLeaseWatcherPublishesTheLiveTransportAddress(t *testing.T) {
 					t.Fatalf("published guest_transport_address = %q, want 192.168.64.7", got)
 				}
 				// The published identity is untouched: the transport address is
-				// NOT folded into pod_ip (runtime.proto's two-address model).
+				// not folded into pod_ip (runtime.proto's two-address model).
 				if ip := ev.GetStatus().GetPodIp(); ip == "192.168.64.7" {
 					t.Fatalf("the transport address leaked into pod_ip (%q)", ip)
 				}
@@ -348,7 +348,7 @@ func TestGuestLeaseWatcherPublishesTheLiveTransportAddress(t *testing.T) {
 		}
 	})
 
-	// A steady lease is not republished: the publish is on CHANGE, so a hostile
+	// A steady lease is not republished: the publish is on change, so a hostile
 	// agent restating the same address cannot drive the status stream.
 	t.Run("an-unchanged-lease-is-not-republished", func(t *testing.T) {
 		agent := &guestLeaseAgent{ip: "192.168.64.7"}

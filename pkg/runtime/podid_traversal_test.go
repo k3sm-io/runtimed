@@ -60,13 +60,13 @@ func tree(t *testing.T, root string) []string {
 // Two harness details are load-bearing, both learned from the guard this fix
 // replaces:
 //
-//   - ONE shared root. Config.Root and the image cache must name the same dir, or
+//   - one shared root. Config.Root and the image cache must name the same dir, or
 //     removePodDir's containment check is unsatisfiable and its RemoveAll leg
 //     unreachable — the destructive path would never execute and the test would
 //     pass against unfixed code. This harness builds the pair explicitly because
 //     it also nests them (below); the default one (testDeps) stopped splitting
 //     them under B142, which is the production wiring.
-//   - The root is nested inside an observable parent, so an escape ABOVE it is
+//   - The root is nested inside an observable parent, so an escape above it is
 //     detectable. A test that only watched the root itself could not see the very
 //     traversal it exists to catch.
 func TestCreatePodRejectsTraversingPodID(t *testing.T) {
@@ -100,7 +100,7 @@ func TestCreatePodRejectsTraversingPodID(t *testing.T) {
 	}
 	for _, id := range hostile {
 		t.Run("create/"+id, func(t *testing.T) {
-			// hostBinBox passes validatePodBox, so the ONLY thing that can stop
+			// hostBinBox passes validatePodBox, so the only thing that can stop
 			// this request is the pod id itself. A box that failed validation for
 			// an unrelated reason would make this test pass without ever reaching
 			// the filesystem — the vacuity this whole gate exists to avoid.
@@ -111,13 +111,13 @@ func TestCreatePodRejectsTraversingPodID(t *testing.T) {
 			}
 		})
 		t.Run("delete/"+id, func(t *testing.T) {
-			// WHAT THIS DOES AND DOES NOT COVER: DeletePod returns early
+			// what this does and does not COVER: DeletePod returns early
 			// (idempotently) for a pod that is not in the registry, so for a
 			// hostile id it never reaches removePodDir. It runs here to pin that
-			// idempotent return, but it is NOT the coverage for the delete path.
+			// idempotent return, but it is not the coverage for the delete path.
 			_, _ = rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: id})
 
-			// The reap store is the SECOND derivation of pod_id into a path, and
+			// The reap store is the second derivation of pod_id into a path, and
 			// its RemoveAll had no containment guard at all. No RPC reaches it with
 			// an unregistered id, so the derivations are asserted directly —
 			// otherwise a mutation reverting podreap.go alone would leave this
@@ -135,7 +135,7 @@ func TestCreatePodRejectsTraversingPodID(t *testing.T) {
 		t.Errorf("a hostile pod id mutated the filesystem\nbefore: %v\nafter:  %v", before, got)
 	}
 
-	// POSITIVE CONTROL: a legal id must still create its rootfs under the pods
+	// positive CONTROL: a legal id must still create its rootfs under the pods
 	// tree. Without this the test cannot distinguish "traversal is refused" from
 	// "every pod is refused", and the latter would break every pod on the node.
 	okID := "5f8a1c2d-3e4b-4a6c-8d9e-0f1a2b3c4d5e"

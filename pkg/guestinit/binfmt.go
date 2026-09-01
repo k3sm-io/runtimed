@@ -56,16 +56,16 @@ const (
 
 // RosettaBinfmtFlags is the flag string of the registration: P, O, C, F.
 //
-// EVERY LETTER IS LOAD-BEARING. This is recorded at the site because the
+// every LETTER IS LOAD-BEARING. This is recorded at the site because the
 // string looks like an incantation and each letter has been removed by
 // somebody "simplifying" a binfmt line before:
 //
-//	P — preserve-argv[0]. The interpreter receives the ORIGINAL argv[0] rather
+//	P — preserve-argv[0]. The interpreter receives the original argv[0] rather
 //	    than the interpreter's path. Multi-call binaries (busybox, and every
 //	    image whose entrypoint dispatches on argv[0]) select their behaviour
 //	    from it, so without P an x86-64 busybox becomes a different program.
 //
-//	O — open-binary. The kernel passes the target binary as an ALREADY-OPEN
+//	O — open-binary. The kernel passes the target binary as an already-OPEN
 //	    file descriptor instead of a path for the interpreter to re-open. A
 //	    container is chrooted into its own composed rootfs, so the path the
 //	    kernel would hand over does not resolve from where the interpreter
@@ -76,11 +76,11 @@ const (
 //	    what keeps a non-executable or unreadable file from becoming runnable
 //	    by virtue of being handed to an interpreter that is. C implies O.
 //
-//	F — fix-binary. The interpreter is opened AT REGISTRATION TIME and the
+//	F — fix-binary. The interpreter is opened at registration time and the
 //	    kernel holds that open file for the life of the registration. Two
 //	    consequences, both wanted: the interpreter needs no path inside any
 //	    container's mount view, and — the security one — a guest root that
-//	    later replaces /media/rosetta/rosetta CANNOT swap the interpreter that
+//	    later replaces /media/rosetta/rosetta cannot swap the interpreter that
 //	    every subsequent x86-64 exec in the guest runs through. Without F the
 //	    registration is a path resolved at exec time, i.e. an in-guest
 //	    root-to-every-future-exec hook.
@@ -90,7 +90,7 @@ const RosettaBinfmtFlags = "POCF"
 // the guest: mount the Rosetta share, then write one line to the kernel.
 //
 // The order is not cosmetic. The F flag means the kernel opens the interpreter
-// while it processes the registration write, so the share MUST already be
+// while it processes the registration write, so the share must already be
 // mounted; a registration written first fails with ENOENT.
 type BinfmtRegistration struct {
 	// Name is the registration's name (the control file under
@@ -110,7 +110,7 @@ type BinfmtRegistration struct {
 // RosettaBinfmt returns the registration plan for the Rosetta interpreter.
 //
 // The line's grammar is :name:type:offset:magic:mask:interpreter:flags — type
-// M for a magic match, and an EMPTY offset, which means 0 (an ELF header
+// M for a magic match, and an empty offset, which means 0 (an ELF header
 // starts at byte 0). The empty field is correct, not a missing value.
 func RosettaBinfmt() BinfmtRegistration {
 	return BinfmtRegistration{

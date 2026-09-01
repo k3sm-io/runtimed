@@ -33,7 +33,7 @@ import (
 	"github.com/Code-Hex/vz/v3"
 )
 
-// THIS FILE IS THE ONLY PLACE IN k3sm THAT IMPORTS github.com/Code-Hex/vz.
+// this FILE IS the only place IN k3sm that IMPORTS github.com/Code-Hex/vz.
 //
 // Everything above it in this package is pure Go with no framework in it, and
 // nothing below it exists — realize is one-way, so no framework object ever
@@ -44,13 +44,13 @@ import (
 
 // realize turns a validated MachineConfig into a VZVirtualMachineConfiguration.
 //
-// IT IS A MECHANICAL TRANSLATION AND NOTHING ELSE. Every decision — sizes, paths,
+// IT IS A MECHANICAL TRANSLATION and nothing ELSE. Every decision — sizes, paths,
 // tags, read-only flags, the MAC, whether Rosetta is attached — was made and
 // checked by FromSpec, on a value a test can build anywhere. What is left here is
 // field-for-field construction plus the framework's own Validate, so the code that
 // needs a Mac to run is also the code with no judgement in it.
 //
-// The one thing it does decide is device PRESENCE for the fixed devices (console,
+// The one thing it does decide is device presence for the fixed devices (console,
 // vsock, entropy, balloon), and those are booleans on the config, so even that is
 // upstream.
 func realize(cfg MachineConfig) (*vz.VirtualMachineConfiguration, error) {
@@ -96,7 +96,7 @@ func realize(cfg MachineConfig) (*vz.VirtualMachineConfiguration, error) {
 	nic.SetMACAddress(mac)
 	vmc.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{nic})
 
-	// Shares. The read-only flag is applied HERE, at the device, which is the only
+	// Shares. The read-only flag is applied here, at the device, which is the only
 	// enforcement point a guest cannot reach (see ShareConfig).
 	fsDevices := make([]vz.DirectorySharingDeviceConfiguration, 0, len(cfg.Shares))
 	for _, s := range cfg.Shares {
@@ -148,9 +148,9 @@ func realize(cfg MachineConfig) (*vz.VirtualMachineConfiguration, error) {
 // vzRunner is the darwin machineRunner: a real VZVirtualMachine plus the console
 // plumbing and the run goroutine that owns it.
 //
-// THE RUN GOROUTINE IS LOCKED TO ITS OS THREAD. Virtualization.framework is
+// the run goroutine is locked to its OS thread. Virtualization.framework is
 // Objective-C with its own serial dispatch queue per machine, and Code-Hex/vz
-// already marshals every call onto that queue — so this is a CONSERVATIVE choice,
+// already marshals every call onto that queue — so this is a conservative choice,
 // not a proven requirement. It costs one thread for the machine's lifetime, and it
 // removes a whole class of "did this framework call happen on the thread it
 // expected" question from a code path that can only be exercised on entitled
@@ -173,7 +173,7 @@ type vzRunner struct {
 // into out.w, a pump copies out.r into the size-capped log file, and in.r is the
 // guest's (never written) input side.
 //
-// The INPUT PIPE EXISTS ONLY BECAUSE THE API DEMANDS IT.
+// The input pipe exists only because the API demands it.
 // VZFileHandleSerialPortAttachment takes both handles and dereferences both, so a
 // nil read handle is a panic rather than "no input". Nothing ever writes to in.w;
 // it is held open so the guest's console read side does not see EOF.

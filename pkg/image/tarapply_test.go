@@ -97,7 +97,7 @@ func applyInto(t *testing.T, limits ApplyLimits, layers ...[]tarSpec) (string, A
 	return tree, stats, err
 }
 
-// applyIntoApplier is applyInto under an EXPLICIT dialect, returning the applier
+// applyIntoApplier is applyInto under an explicit dialect, returning the applier
 // as well so a Linux-dialect test can read the ownership records the apply built.
 func applyIntoApplier(t *testing.T, policy UnpackPolicy, limits ApplyLimits, layers ...[]tarSpec) (string, *LayerApplier, ApplyStats, error) {
 	t.Helper()
@@ -172,7 +172,7 @@ func TestLayerEntryPath(t *testing.T) {
 }
 
 // TestSymlinkTargetContained pins the rule that makes the NATIVE dialect safe
-// without a chroot: a link's target must be relative AND must not resolve above
+// without a chroot: a link's target must be relative and must not resolve above
 // the tree, because the tree is cloned verbatim into a pod rootfs that the host
 // root sits directly above.
 func TestSymlinkTargetContained(t *testing.T) {
@@ -212,7 +212,7 @@ func TestSymlinkTargetContained(t *testing.T) {
 	}
 }
 
-// TestApplyLayerRefusesEscape drives the refusals through the WHOLE applier
+// TestApplyLayerRefusesEscape drives the refusals through the whole applier
 // (not just the sanitizer) and proves the refusal is fatal to the layer: the
 // escape target must not exist on disk afterwards.
 //
@@ -380,7 +380,7 @@ func TestApplyLayerOrdering(t *testing.T) {
 		if got := readTree(t, tree, "app"); got != "V2" {
 			t.Errorf("app = %q, want V2", got)
 		}
-		// Writing THROUGH the link would have clobbered the target.
+		// Writing through the link would have clobbered the target.
 		if got := readTree(t, tree, "target.txt"); got != "ORIGINAL" {
 			t.Errorf("target.txt = %q, want ORIGINAL — the layer wrote through the symlink", got)
 		}
@@ -526,7 +526,7 @@ func TestApplyLayerLimits(t *testing.T) {
 
 // TestNewLayerApplierRequiresAValidPolicy pins the fail-closed dialect check: an
 // unset or unknown LayerSemantics never falls through to the native rules.
-// "linux" is a REAL dialect since M11.2-d1, so the unknown-value rows name
+// "linux" is a real dialect since M11.2-d1, so the unknown-value rows name
 // values no dialect will ever claim.
 func TestNewLayerApplierRequiresAValidPolicy(t *testing.T) {
 	root, err := os.OpenRoot(t.TempDir())

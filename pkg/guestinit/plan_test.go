@@ -339,7 +339,7 @@ func TestPlanRejectsUnrealizableSpecs(t *testing.T) {
 }
 
 // TestUpperSizeBytes pins the overlay-upper bound: it is derived from the
-// guest's RAM, shared across the containers, clamped, and NEVER unbounded.
+// guest's RAM, shared across the containers, clamped, and never unbounded.
 func TestUpperSizeBytes(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

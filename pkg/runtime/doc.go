@@ -29,10 +29,10 @@ limitations under the License.
 //	var _ runtimev1.RuntimeServer = (*Runtime)(nil)
 //
 // CreatePod is the spine: validate the PodBox → materialize each container's
-// rootfs (clonefile) → ad-hoc sign → enforce the SignaturePolicy gate BEFORE
+// rootfs (clonefile) → ad-hoc sign → enforce the SignaturePolicy gate before
 // exec → generate+validate the per-pod SBPL → spawn each container through the
 // exec-shim Backend (DYLD_INSERT_LIBRARIES carried through) → track status,
-// streamed to WatchPodStatus subscribers. The runtime FAILS CLOSED if the
+// streamed to WatchPodStatus subscribers. The runtime FAILS closed if the
 // sandbox backend is unavailable (it refuses to start the pod, never runs it
 // unconfined).
 package runtime

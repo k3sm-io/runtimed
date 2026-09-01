@@ -39,11 +39,11 @@ var machOArch = map[string]string{"amd64": "x86_64", "arm64": "arm64"}
 // stdlib-only (it is built as its own throwaway module, so it can import nothing
 // else), and it reports three things on stdout:
 //
-//   - PAYLOAD-RAN — it reached main(), with its own compiled-in GOARCH and its own
+//   - PAYLOAD-ran — it reached main(), with its own compiled-in GOARCH and its own
 //     sysctl.proc_translated verdict, i.e. whether the KERNEL considers this very
 //     process translated. That is the in-sandbox witness that Rosetta engaged; the
 //     out-of-sandbox witness is the Mach-O arch assert on the binary itself.
-//   - PROBE 0 — a read INSIDE the pod's own data volume, which must succeed. This
+//   - PROBE 0 — a read inside the pod's own data volume, which must succeed. This
 //     is the positive control that keeps the deny assert non-vacuous: without it a
 //     payload that could open nothing at all would "pass" the deny leg.
 //   - PROBE 1 — a read of a path the generated profile DENIES, which must fail with
@@ -90,7 +90,7 @@ func main() {
 //
 // This is not paranoia: the toolchain in this workspace is an amd64 build running
 // under Rosetta, so a test binary compiled by it reports runtime.GOARCH == "amd64"
-// AND is handed a masked hw.machine == "x86_64" by the kernel, on a Mac that is
+// and is handed a masked hw.machine == "x86_64" by the kernel, on a Mac that is
 // physically arm64. Trusting either would make this gate decide "there is nothing
 // to translate here" on precisely the hardware it is meant to run on.
 //
@@ -113,7 +113,7 @@ func trueHostArch(t *testing.T) string {
 // buildRosettaPayload builds rosettaPayloadSource for goarch into bin and ad-hoc
 // signs it.
 //
-// GOARCH/GOOS/CGO_ENABLED are set EXPLICITLY rather than inherited, for the reason
+// GOARCH/GOOS/CGO_ENABLED are set explicitly rather than inherited, for the reason
 // trueHostArch documents: the ambient toolchain's arch is not the payload's arch,
 // and a harness that lets one stand in for the other tests the wrong binary while
 // still going green. GOWORK=off keeps the throwaway module out of the workspace's
@@ -146,10 +146,10 @@ func buildRosettaPayload(t *testing.T, goarch, bin string) {
 	}
 }
 
-// assertMachOArch fails the test LOUDLY unless bin is a thin Mach-O of exactly the
+// assertMachOArch fails the test loudly unless bin is a thin Mach-O of exactly the
 // architecture wantGOARCH names.
 //
-// It is the harness's own integrity check, and it must run BEFORE the payload is
+// It is the harness's own integrity check, and it must run before the payload is
 // used: every claim this gate makes about translation rests on the payload really
 // being x86_64 on arm64 hardware. A harness that silently built the native arch
 // would exercise the native spine twice and report green — the exact wrong-reason
@@ -174,13 +174,13 @@ func assertMachOArch(t *testing.T, bin, wantGOARCH string) {
 
 // TestHostRosettaSpawnUnderSeatbelt is the B105 regression pin: the generated
 // default-deny Seatbelt profile admits a darwin/amd64 pod payload translated by
-// host Rosetta 2, on the SAME terms as a native arm64 one.
+// host Rosetta 2, on the same terms as a native arm64 one.
 //
 // This pins a measured fact rather than discovering one. The B103 critique pass
 // measured that a cold-translated, ad-hoc-signed x86_64 Mach-O spawns and runs
 // under the unmodified generated profile, and that every proposed "translation
 // surface" grant (an oahd mach-lookup, /var/db/oah, /usr/libexec/rosetta) is
-// NOT load-bearing — cold translation is driven by the kernel/AMFI exec path on
+// not load-bearing — cold translation is driven by the kernel/AMFI exec path on
 // the daemon side, not by a client-side sandbox-checked lookup. Nothing in the
 // tree held that fact still. This test does, in both directions:
 //
@@ -213,7 +213,7 @@ func TestHostRosettaSpawnUnderSeatbelt(t *testing.T) {
 		// goarch is the payload's architecture, pinned explicitly at build time.
 		goarch string
 		// wantTranslated is the sysctl.proc_translated value the payload must report
-		// about ITSELF from inside the sandbox.
+		// about itself from inside the sandbox.
 		wantTranslated string
 	}{
 		{name: "native-arm64-control", goarch: "arm64", wantTranslated: "0"},

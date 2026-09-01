@@ -32,7 +32,7 @@ import (
 // guestStopper is the production agentStopper: one guest/v1 Stop RPC over the
 // same vsock transport the proxy relays.
 //
-// THIS IS THE ONE PLACE THE HELPER SPEAKS gRPC, and it is deliberately not the
+// this IS the one place the HELPER SPEAKS gRPC, and it is deliberately not the
 // proxy (see Proxy's doc for why the relay stays a byte pump). The asymmetry is
 // the point: the helper ORIGINATES exactly one call, to a message type it
 // controls, and never PARSES anything a guest chose to send it — the Stop response

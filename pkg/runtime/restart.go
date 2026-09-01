@@ -27,17 +27,17 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// RestartContainer restarts a single container of a running pod IN PLACE: it
+// RestartContainer restarts a single container of a running pod IN place: it
 // terminates the container's process group within the grace window, then re-spawns
-// it FROM THE SAME SPEC through the same machinery createPod uses — the pod's
+// it from the same SPEC through the same machinery createPod uses — the pod's
 // already-generated SBPL profile, the M2.3 uid/gid drop via the exec-shim backend,
 // and the same mounts — so the replacement runs in exactly the same confinement
 // domain. The restart_count is incremented and the prior run is recorded in
 // last_termination_state. A failed liveness probe or a CrashLoopBackOff re-exec
-// drives this (the provider's probe/backoff runner invokes it); it is NOT a
+// drives this (the provider's probe/backoff runner invokes it); it is not a
 // pod-level restart — other containers are untouched.
 //
-// A re-exec is also how a pod LEAVES a terminal phase: the swap below feeds
+// A re-exec is also how a pod leaves a terminal phase: the swap below feeds
 // recomputePhaseLocked, which de-escalates the pod back to Running (B26), and
 // re-arms the memory sampler if that terminal transition had cancelled it.
 //
@@ -52,12 +52,12 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 			"pod %s not found", req.GetPodId()), nil
 	}
-	// THE VM FORK, AT THE TOP AND BEFORE ANY .proc TOUCH. A vm pod's containers
+	// the VM FORK, AT the TOP and before any .proc TOUCH. A vm pod's containers
 	// are guest processes with no host containerProc, so every line below —
 	// findContainer, the process-group GracefulStop, the re-spawn through
 	// startContainer — operates on state a vm pod does not have. Restarting one
 	// container inside a running guest needs a guest-agent verb that guest/v1
-	// does not define, so the honest answer is a typed UNIMPLEMENTED rather than
+	// does not define, so the honest answer is a typed unimplemented rather than
 	// a silent no-op that would report a bumped restart_count for a container
 	// nothing restarted. The provider reads Unimplemented and does not retry.
 	if p.isVM() {
@@ -73,7 +73,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	}
 
 	// Snapshot the old process + spec, and flag the container as restarting so the
-	// kqueue reaper's watchContainerExit does NOT conclude the pod terminal (which
+	// kqueue reaper's watchContainerExit does not conclude the pod terminal (which
 	// would flip the phase and cancel the memory sampler) while we re-spawn.
 	p.mu.Lock()
 	oldProc := oldCP.proc
@@ -86,7 +86,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 
 	// Terminate the old process group within the grace window (SIGTERM → grace →
 	// SIGKILL, the M2.4 escalation), then wait for the kqueue reaper to collect it
-	// BEFORE re-spawning so the replacement does not race the old for the pod
+	// before re-spawning so the replacement does not race the old for the pod
 	// IP/ports. SIGKILL is uncatchable, so the wait is bounded; ctx bounds it too.
 	grace := graceDuration(req.GetGracePeriodSeconds(), p)
 	var oldCode, oldSig int
@@ -107,15 +107,15 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 
 	// Re-spawn from the same spec, in the same LIFECYCLE CLASS: initDeclared is
 	// threaded through so an init-declared native sidecar stays a sidecar across a
-	// provider-driven restart (this RPC is the ONLY sidecar restart path — the
+	// provider-driven restart (this RPC is the only sidecar restart path — the
 	// provider owns the restart decision/backoff; runtimed performs no exit-driven
 	// restarts). The flag never alters confinement — the SBPL profile is
 	// pod-scoped (p.profile) and the rootfs resolution (r.rootfsPath) is
 	// pod-scoped, identical for init and main containers — but it derives
 	// sidecar(): dropping it would silently re-classify the restarted sidecar as a
-	// MAIN, so its next exit would wrongly conclude the pod (mains-only phase
+	// main, so its next exit would wrongly conclude the pod (mains-only phase
 	// accounting) and it would miss the reverse-order teardown. The supervision
-	// (reaper + watchContainerExit) must outlive THIS RPC, so detach the spawn
+	// (reaper + watchContainerExit) must outlive this RPC, so detach the spawn
 	// context from the RPC's cancellation (the pull/sign/wrap during a restart are
 	// fast/cache-backed).
 	restartRootfs, err := r.rootfsPath(p.box)
@@ -134,8 +134,8 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	//
 	// ATOMICITY INVARIANT (B26): the count bump, the last_termination_state, the
 	// container swap, the phase recompute and the status snapshot all happen
-	// under ONE hold of p.mu. No observer — GetPodStatus, WatchPodStatus, or this
-	// response — can ever see a bumped restart_count next to the PREVIOUS run's
+	// under one hold of p.mu. No observer — GetPodStatus, WatchPodStatus, or this
+	// response — can ever see a bumped restart_count next to the previous run's
 	// terminated state; the count and the state advance together. The k3sm
 	// provider's terminationKey restart idempotency rests entirely on that, so
 	// never split this block.
@@ -159,8 +159,8 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// A re-exec de-escalates the pod out of a terminal phase (recomputePhaseLocked
 	// is a pure function of the container states, never a latch).
 	deEscalated := wasTerminal && p.phase == runtimev1.PodPhase_POD_PHASE_RUNNING
-	// If it did NOT de-escalate, this swap just spawned a process into a pod that
-	// is STILL terminal, and it is this function's job to notice. Two ways in:
+	// If it did not de-escalate, this swap just spawned a process into a pod that
+	// is still terminal, and it is this function's job to notice. Two ways in:
 	// restarting a SIDECAR held trulyTerminalLocked false via oldCP.restarting and
 	// the swap drops that flag (the mid-restart guard must be a DEFERRAL, never a
 	// permanent skip); or the pod was already torn down and the provider re-execed
@@ -181,7 +181,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		// already cancelled the memory sampler. The replacement main is Running
 		// again, so re-arm it: a resurrected container must not run without the OOM
 		// enforcement its memory limit promises. (Sidecars stopped by that same
-		// transition CANNOT be resurrected — the documented residual in
+		// transition cannot be resurrected — the documented residual in
 		// trulyTerminalLocked.)
 		r.armMemorySampler(p)
 	}
@@ -197,7 +197,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 // resumes normal phase accounting (its old process is gone, so the pod will
 // reflect the failure on the next reap/status).
 //
-// Dropping the flag can RELEASE a teardown that trulyTerminalLocked deferred
+// Dropping the flag can release a teardown that trulyTerminalLocked deferred
 // while the restart was in flight (the pod concluded meanwhile), and no reap will
 // re-evaluate it — this container's exit was already recorded. So the predicate is
 // re-checked here too; without it a failed restart is the second way the

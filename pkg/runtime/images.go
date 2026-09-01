@@ -32,7 +32,7 @@ import (
 )
 
 // imagesService serves the Images RPCs (apis/runtime/v1/images.proto) over the
-// SAME *Runtime — and, critically, the same grpc.Server and therefore the same
+// same *Runtime — and, critically, the same grpc.Server and therefore the same
 // listener — as the Runtime service.
 //
 // That co-registration is the whole socket-posture control. The proto file
@@ -142,7 +142,7 @@ func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInf
 // RemoveImage is not implemented, and the refusal is a design statement rather
 // than a gap to be filled in place.
 //
-// A root on this node is a PER-POD record the daemon authored, not an operator
+// A root on this node is a per-POD record the daemon authored, not an operator
 // untag: dropping one would assert that a pod no longer references content it is
 // still running on, which is the exact liveness violation the image GC exists to
 // make impossible. Root removal needs the reference-to-digest index (a separate
@@ -157,7 +157,7 @@ func (s *imagesService) RemoveImage(context.Context, *runtimev1.RemoveImageReque
 
 // PruneImages deletes unreferenced blobs, honoring the request's dry_run.
 //
-// It runs the SAME code path as the daemon's disk-pressure reclaim, forced past
+// It runs the same code path as the daemon's disk-pressure reclaim, forced past
 // the pressure check — an operator asking for a prune is asking to run the
 // policy now, not to run a different, laxer policy. Every safety rule is
 // therefore identical: the root set is enumerated fail-closed, live ingest
@@ -187,12 +187,12 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 // LoadImage ingests a client-streamed image archive — the `k3sm image load` /
 // `import` path — and records it under the reference the first frame names.
 //
-// THE DAEMON IS THE SOLE STORE WRITER here (the M12 images plan, Resolution 8 as
+// the DAEMON IS the sole STORE WRITER here (the M12 images plan, Resolution 8 as
 // amended): the client opens the operator's archive, which the daemon generally
 // cannot read, and streams the bytes; it never writes the content store itself.
 // Everything that decides whether those bytes are admitted lives below this
 // method, in image.Loader — every blob is re-hashed against the digest the
-// archive's own manifest claims for it, and NOTHING is committed, leased or
+// archive's own manifest claims for it, and nothing is committed, leased or
 // recorded until all of them have.
 //
 // The metadata rides the FIRST frame only. Per the wire contract a later frame's
@@ -239,7 +239,7 @@ func (s *imagesService) LoadImage(stream runtimev1.Images_LoadImageServer) error
 // loadStream adapts the LoadImage frame stream to the io.Reader the ingest reads
 // the archive through.
 //
-// It is a plain sequential adapter and holds at most ONE frame's chunk: the
+// It is a plain sequential adapter and holds at most one frame's chunk: the
 // archive itself is spooled by the ingest, so nothing here needs to buffer more
 // than the frame in hand. Chunk boundaries carry no meaning (the proto says so);
 // a frame with an empty chunk is skipped rather than read as EOF, so a client
@@ -270,9 +270,9 @@ func (l *loadStream) Read(p []byte) (int, error) {
 // Every archive-content fault is INVALID_ARGUMENT: the caller supplied an
 // archive the daemon will not admit, and the remedy is the caller's (re-export
 // it, re-transfer it, split it into one image per archive). That includes
-// ErrArchiveUnsupported, which is deliberately NOT reported as UNIMPLEMENTED —
+// ErrArchiveUnsupported, which is deliberately not reported as unimplemented —
 // the RPC is implemented; it is the archive that is out of scope, and an
-// UNIMPLEMENTED status is the one a client reads as "this daemon has no image
+// unimplemented status is the one a client reads as "this daemon has no image
 // service" (see images.proto's skew note).
 func loadStatusError(err error) error {
 	for _, sentinel := range []error{
@@ -306,7 +306,7 @@ func pruneSkipReason(r image.PruneReason) runtimev1.PruneSkipReason {
 	case image.ReasonKeptLeased:
 		return runtimev1.PruneSkipReason_PRUNE_SKIP_REASON_LEASED
 	case image.ReasonKeptUnknownProvenance:
-		// The planner's fail-closed bucket AND the executor's re-verification
+		// The planner's fail-closed bucket and the executor's re-verification
 		// refusals both land here; the latter is precisely UNLINK_FAILED.
 		return runtimev1.PruneSkipReason_PRUNE_SKIP_REASON_UNLINK_FAILED
 	case image.ReasonKeptYoung:
@@ -351,7 +351,7 @@ const DefaultImageGCInterval = 5 * time.Minute
 // ReclaimUnderPressure pass, which no-ops above the free-space floor, so the
 // steady-state cost is one statfs per interval.
 //
-// It NEVER returns an error and never stops on one: a pass that refuses (an
+// It never returns an error and never stops on one: a pass that refuses (an
 // incomplete root set, an unsamplable volume) is a state to alert on and retry,
 // not a reason to stop defending the volume. A pass that panics would take the
 // daemon down, so the work stays inside the store's own already-tested surface.

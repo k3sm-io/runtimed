@@ -89,7 +89,7 @@ func realPath(t *testing.T, path string) string {
 //   - an unset Dir INHERITS, and says so — the pod-safe default (the pod data
 //     volume) belongs to pkg/runtime, which has the data volume; it is pinned
 //     there by TestPodLaunchDefaultsWorkingDirToDataVolume;
-//   - a set-but-unusable Dir FAILS TYPED (ErrWorkingDir) and spawns NOTHING —
+//   - a set-but-unusable Dir FAILS typed (ErrWorkingDir) and spawns nothing —
 //     never a silent fallback to the inherited cwd.
 func TestSpawnHonorsWorkingDir(t *testing.T) {
 	t.Run("set dir is honored", func(t *testing.T) {

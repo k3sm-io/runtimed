@@ -240,8 +240,8 @@ func TestGetLogsOptions(t *testing.T) {
 		}
 	})
 
-	// previous is NOT served: the terminated instance's buffer is not retained.
-	// It must be REFUSED, not silently answered from the running instance — the
+	// previous is not served: the terminated instance's buffer is not retained.
+	// It must be refused, not silently answered from the running instance — the
 	// one wrong answer `kubectl logs -p` must never get is the current
 	// instance's output presented as the crashed one's.
 	t.Run("previous is refused, never answered from the current instance", func(t *testing.T) {

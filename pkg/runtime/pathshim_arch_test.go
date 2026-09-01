@@ -85,7 +85,7 @@ func machoArches(t *testing.T, path string) []macho.Cpu {
 	return []macho.Cpu{thin.Cpu}
 }
 
-// TestPathShimIsUniversalBinary asserts the BUILT path-rebase shim carries both
+// TestPathShimIsUniversalBinary asserts the built path-rebase shim carries both
 // an arm64 and an x86_64 slice, by reading the Mach-O headers of the artifact
 // hack/build-pathshim.sh actually produces.
 //

@@ -186,7 +186,7 @@ func TestGracefulStopAwaitsReaperObservation(t *testing.T) {
 	const pgid = 4242
 	term, kill := os.Interrupt, os.Kill
 
-	// stillBlocked reports whether done has NOT fired within a short settle
+	// stillBlocked reports whether done has not fired within a short settle
 	// window. The window only has to be long enough for the UNFIXED code — which
 	// returns immediately after signalling — to land; the fixed code stays
 	// blocked for as long as the fake withholds the exit, so a longer window
@@ -323,7 +323,7 @@ func TestGracefulStopAwaitsReaperObservation(t *testing.T) {
 		}
 		<-w.entered // the reaper is in WaitExit, as it is for any live container
 
-		// The group dies a short moment AFTER the SIGKILL lands — the ordinary
+		// The group dies a short moment after the SIGKILL lands — the ordinary
 		// case (signal delivery, then exit, then the reaper's kqueue poll). That
 		// delay is the whole window: the unfixed GracefulStop returns inside it.
 		signal := func(_ int, sig os.Signal) error {

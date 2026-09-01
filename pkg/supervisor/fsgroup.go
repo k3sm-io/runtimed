@@ -35,15 +35,15 @@ var ErrFSGroupRootUnbounded = errors.New("fsGroup chown root is outside the perm
 // volumes (M2.3 securityContext.fsGroup). It mirrors the kubelet fsGroup
 // volume-ownership pass.
 //
-// It MUST run ROOT-SIDE in the daemon, BEFORE the privilege drop in the exec-shim
+// It must run ROOT-side in the daemon, before the privilege drop in the exec-shim
 // (RunLaunchSequence): once a pod process has dropped its uid it can no longer
 // chown, and once it is sandboxed it cannot either. The supervisor performs it
 // synchronously before posix_spawn, which is strictly before the exec-shim drops
 // — so the "before the drop" ordering is guaranteed by the process flow.
 //
 // bound is the tree this walk may touch (the daemon's pods root); root must be a
-// PROPER descendant of it or the call is refused with ErrFSGroupRootUnbounded
-// before a single Lchown runs. This is DEFENCE AT THE SINK, deliberately
+// proper descendant of it or the call is refused with ErrFSGroupRootUnbounded
+// before a single Lchown runs. This is DEFENCE AT the SINK, deliberately
 // independent of whoever computed root: the walk grants the group the owner's
 // full rwx and sets setgid on every directory it reaches, which is a privilege
 // grant, and the runtime's pod-dir delete already carries exactly this bound on
@@ -96,14 +96,14 @@ func ChownForFSGroup(bound, root string, gid int) error {
 	})
 }
 
-// strictlyUnder reports whether path is a PROPER descendant of base (both
-// cleaned). Equality is FALSE — a caller may chown a pod's data volume, never
+// strictlyUnder reports whether path is a proper descendant of base (both
+// cleaned). Equality is false — a caller may chown a pod's data volume, never
 // the shared pods root itself — and the check is separator-aware, so /a/b is
-// under /a while the sibling /a/bc is NOT under /a/b. A relative or empty base
+// under /a while the sibling /a/bc is not under /a/b. A relative or empty base
 // admits nothing: both operands are required absolute.
 //
 // It is a local predicate rather than an import of pkg/mount.IsStrictlyUnder,
-// for the layering reason given on ChownForFSGroup. It is DELIBERATELY STRICTER
+// for the layering reason given on ChownForFSGroup. It is deliberately STRICTER
 // than that one and the asymmetry is the point, not drift: mount's variant
 // admits relative operands (IsStrictlyUnder("a/b", "a") is true), which is
 // harmless for a share-plan check whose inputs are already absolute by
@@ -111,7 +111,7 @@ func ChownForFSGroup(bound, root string, gid int) error {
 // from a wire field — a relative base would make containment depend on the
 // process working directory. Here both operands are required absolute, so a
 // non-absolute operand admits nothing. TestStrictlyUnder pins the asymmetry
-// explicitly; do NOT "reconcile" the two by loosening this one.
+// explicitly; do not "reconcile" the two by loosening this one.
 func strictlyUnder(path, base string) bool {
 	if !filepath.IsAbs(path) || !filepath.IsAbs(base) {
 		return false

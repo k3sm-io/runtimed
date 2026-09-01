@@ -38,20 +38,20 @@ import (
 )
 
 // TestImagesServedOnTheRuntimeListener is the daemon-side half of the Images
-// service's socket posture, and it is the ONLY place that half can be asserted.
+// service's socket posture, and it is the only place that half can be asserted.
 //
 // images.proto records that the service inherits the daemon's single unix socket
 // (0700 dir / 0600 socket, dialable only by the daemon's own uid), but a proto
 // file cannot observe what listener anything is registered on — an apis-scope
 // test would go green while the daemon quietly served Images on a second,
 // world-dialable socket, handing every local uid PruneImages. So this gate
-// asserts the co-registration mechanically: ONE grpc.Server carries both
-// services, and both answer over ONE connection.
+// asserts the co-registration mechanically: one grpc.Server carries both
+// services, and both answer over one connection.
 func TestImagesServedOnTheRuntimeListener(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	srv := NewServer(rt)
 
-	// (a) Both services are registered on the SAME *grpc.Server instance.
+	// (a) Both services are registered on the same *grpc.Server instance.
 	info := srv.grpc.GetServiceInfo()
 	for _, want := range []string{"k3sm.runtime.v1.Runtime", "k3sm.runtime.v1.Images"} {
 		if _, ok := info[want]; !ok {
@@ -59,7 +59,7 @@ func TestImagesServedOnTheRuntimeListener(t *testing.T) {
 		}
 	}
 
-	// (b) And both answer over ONE connection to ONE listener — the property that
+	// (b) And both answer over one connection to one listener — the property that
 	// would still be false if a second grpc.Server had been stood up elsewhere.
 	lis := bufconn.Listen(1 << 20)
 	ctx, cancel, errc := serveTestServer(t, srv, lis)
@@ -257,7 +257,7 @@ func TestPruneImagesRefusesAndReportsTypedReasons(t *testing.T) {
 // measurement of the store volume.
 //
 // The pod root is still recorded here even though the listing no longer reads
-// it (B198): this is the ordinary shape — an image that was pulled AND is in
+// it (B198): this is the ordinary shape — an image that was pulled and is in
 // use — and keeping both records is what makes the row a check that the two
 // sources agree rather than a check that only one of them exists.
 func TestImagesListAndFsInfo(t *testing.T) {

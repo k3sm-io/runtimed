@@ -38,7 +38,7 @@ import (
 )
 
 // recordingIndex is a LocalIndex that records what an ingest recorded and, via
-// onRecord, lets a test observe the STORE STATE at the instant the reference is
+// onRecord, lets a test observe the STORE state at the instant the reference is
 // written — the one moment the load's phase ordering is externally visible.
 type recordingIndex struct {
 	refs     map[string]*runtimev1.ImageManifest
@@ -69,7 +69,7 @@ func (r *recordingIndex) Record(_ context.Context, ref string, p Platform, mfst 
 	return nil
 }
 
-// ociSpec describes an OCI-layout fixture. The archive is HAND-BUILT rather than
+// ociSpec describes an OCI-layout fixture. The archive is HAND-built rather than
 // produced by a library so a test can state a claim the bytes do not satisfy:
 // the whole point of the OCI leg is that a blob's digest is claimed by a
 // manifest one level above the bytes, and no round-tripping writer will ever
@@ -79,7 +79,7 @@ type ociSpec struct {
 	config []byte
 	// layers are the layer blobs whose digests the manifest claims.
 	layers [][]byte
-	// poison replaces the BYTES stored at layer i's claimed blob path, leaving
+	// poison replaces the bytes stored at layer i's claimed blob path, leaving
 	// the manifest's claim about that layer untouched.
 	poison map[int][]byte
 	// manifests, when > 1, makes index.json name that many manifests (the
@@ -233,7 +233,7 @@ func contentBlobs(t *testing.T, c *Cache) []BlobNode {
 
 // TestLoadImageRehashBeforeLeaseCommit is B169's named gate: an ingest must
 // re-hash every blob against the digest its archive's manifest CLAIMS, and it
-// must do so BEFORE any lease is taken and any blob is committed — not as a
+// must do so before any lease is taken and any blob is committed — not as a
 // post-hoc rollback.
 //
 // The fixture is an OCI LAYOUT, deliberately. On the docker-save leg the claimed
@@ -244,7 +244,7 @@ func contentBlobs(t *testing.T, c *Cache) []BlobNode {
 //
 // # Which assertion kills which wrong implementation
 //
-//   - "the poisoned blob is absent" alone would NOT be enough: an implementation
+//   - "the poisoned blob is absent" alone would not be enough: an implementation
 //     that commits first and unlinks on mismatch ends in the same state.
 //   - "the GOOD blobs are absent too" is the discriminator. A verify-after-commit
 //     implementation — and equally a verify-per-blob-then-commit loop — has
@@ -252,14 +252,14 @@ func contentBlobs(t *testing.T, c *Cache) []BlobNode {
 //     reaches the bad one, so the store is non-empty afterwards and this gate
 //     goes red.
 //   - "no lease" and "no reference recorded" pin the other half of the ordering:
-//     the lease is taken only once EVERY blob has verified, and the reference is
+//     the lease is taken only once every blob has verified, and the reference is
 //     written only after every blob is committed.
 func TestLoadImageRehashBeforeLeaseCommit(t *testing.T) {
 	cfg := nativeConfig(t)
 	good := []byte("layer-zero-bytes")
 	claimed := []byte("layer-one-bytes-as-claimed")
 	substituted := []byte("layer-one-bytes-SUBSTITUTE")
-	// SAME LENGTH as the claim on purpose: a longer substitution would trip the
+	// same length as the claim on purpose: a longer substitution would trip the
 	// declared-size resource guard (ErrBlobTooLarge) first, and the verdict under
 	// test here is the DIGEST comparison, not the size cap.
 	if len(substituted) != len(claimed) {
@@ -268,7 +268,7 @@ func TestLoadImageRehashBeforeLeaseCommit(t *testing.T) {
 	archive, _ := buildOCIArchive(t, ociSpec{
 		config: cfg,
 		layers: [][]byte{good, claimed},
-		// Layer 1's stored bytes are NOT what its descriptor claims.
+		// Layer 1's stored bytes are not what its descriptor claims.
 		poison: map[int][]byte{1: substituted},
 	})
 
@@ -290,7 +290,7 @@ func TestLoadImageRehashBeforeLeaseCommit(t *testing.T) {
 		t.Fatalf("load error = %v; want it to wrap ErrDigestMismatch", err)
 	}
 
-	// (1) The poisoned blob is in the store under NEITHER its claimed digest nor
+	// (1) The poisoned blob is in the store under neither its claimed digest nor
 	// the digest its bytes actually hash to.
 	claimedDigest := ggcrHash(t, claimed).String()
 	substitutedDigest := ggcrHash(t, substituted).String()
@@ -301,7 +301,7 @@ func TestLoadImageRehashBeforeLeaseCommit(t *testing.T) {
 		t.Errorf("the poisoned blob was admitted under the digest its bytes hash to (%s)", substitutedDigest)
 	}
 
-	// (2) THE DISCRIMINATOR: nothing at all was committed. The config and the
+	// (2) the DISCRIMINATOR: nothing at all was committed. The config and the
 	// valid layer precede the bad one in manifest order, so any implementation
 	// that verifies per blob AS it commits (or after) leaves them behind.
 	if nodes := contentBlobs(t, cache); len(nodes) != 0 {
@@ -327,7 +327,7 @@ func TestLoadImageRehashBeforeLeaseCommit(t *testing.T) {
 	}
 }
 
-// TestLoadImageOrdersLeaseBlobsThenReference is the POSITIVE half of the
+// TestLoadImageOrdersLeaseBlobsThenReference is the positive half of the
 // ordering contract: on a successful load the reference is recorded only after
 // every blob is committed, and the lease is still held at that instant.
 //

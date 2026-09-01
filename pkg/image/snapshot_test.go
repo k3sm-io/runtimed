@@ -249,7 +249,7 @@ func TestLinuxSnapshotCommitsUnderChainID(t *testing.T) {
 		t.Error("the committed snapshot carries a setuid bit")
 	}
 
-	// A native unpack of the SAME image is a DIFFERENT tree in a DIFFERENT
+	// A native unpack of the same image is a different tree in a different
 	// store — the whole point of keying the two dialects separately.
 	nat, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy())
 	if err != nil {
@@ -271,7 +271,7 @@ func TestLinuxSnapshotCommitsUnderChainID(t *testing.T) {
 }
 
 // TestLinuxSnapshotSharesAChainAcrossImages pins the reason the key is a chain
-// id rather than a manifest-derived digest: two DIFFERENT images whose layers
+// id rather than a manifest-derived digest: two different images whose layers
 // are identical have one rootfs, so they must share one snapshot.
 func TestLinuxSnapshotSharesAChainAcrossImages(t *testing.T) {
 	c, u := newTestUnpacker(t)
@@ -280,7 +280,7 @@ func TestLinuxSnapshotSharesAChainAcrossImages(t *testing.T) {
 	first := linuxImageFrom(t, layer)
 	mfstA := commitImage(t, c, first)
 
-	// The SAME layer under a config that differs in a non-rootfs field: a new
+	// The same layer under a config that differs in a non-rootfs field: a new
 	// config digest, a new manifest, an identical diffID chain.
 	cf, err := first.ConfigFile()
 	if err != nil {
@@ -312,7 +312,7 @@ func TestLinuxSnapshotSharesAChainAcrossImages(t *testing.T) {
 		t.Error("the second image did not hit the first's snapshot")
 	}
 
-	// The same two images under the NATIVE dialect do NOT share a tree: TreeKey
+	// The same two images under the NATIVE dialect do not share a tree: TreeKey
 	// folds in the config digest. This is the row that proves the sharing above
 	// comes from the chain id and not from the store being sloppy.
 	na, err := u.Unpack(context.Background(), mfstA, NativeUnpackPolicy())
@@ -330,8 +330,8 @@ func TestLinuxSnapshotSharesAChainAcrossImages(t *testing.T) {
 
 // TestLinuxSnapshotVerifiesEveryLayerBeforeCommitting pins the self-authenticating
 // property the chain-id key claims: a snapshot's path asserts a diffID chain, so
-// EVERY layer's decompressed bytes are re-verified against it before the commit,
-// and a failure commits NOTHING.
+// every layer's decompressed bytes are re-verified against it before the commit,
+// and a failure commits nothing.
 func TestLinuxSnapshotVerifiesEveryLayerBeforeCommitting(t *testing.T) {
 	t.Run("poisoned_layer_blob", func(t *testing.T) {
 		c, u := newTestUnpacker(t)
@@ -339,7 +339,7 @@ func TestLinuxSnapshotVerifiesEveryLayerBeforeCommitting(t *testing.T) {
 			layerFrom(t, []tarSpec{{name: "a", mode: 0o644, data: "A"}}),
 			layerFrom(t, []tarSpec{{name: "b", mode: 0o644, data: "B"}}),
 		))
-		// Substitute the SECOND layer's blob after it was committed: the CAS
+		// Substitute the second layer's blob after it was committed: the CAS
 		// verifies at write time only, so this is exactly the corruption the
 		// unpack closes.
 		blobPath, err := c.BlobPath(mfst.GetLayers()[1].GetDigest())
@@ -362,7 +362,7 @@ func TestLinuxSnapshotVerifiesEveryLayerBeforeCommitting(t *testing.T) {
 			layerFrom(t, []tarSpec{{name: "a", mode: 0o644, data: "A"}}),
 		))
 		// A config that self-verifies but lies about its layer. The chain id it
-		// yields is well-formed, so the ONLY thing standing between the lie and
+		// yields is well-formed, so the only thing standing between the lie and
 		// a committed snapshot under that id is the per-layer re-verification.
 		rewriteConfigDiffIDs(t, c, mfst, []string{"sha256:" + hexOf('9')})
 		_, err := u.Unpack(context.Background(), mfst, LinuxUnpackPolicy())
@@ -418,7 +418,7 @@ func assertNoCommittedSnapshot(t *testing.T, c *Cache) {
 }
 
 // TestLinuxSnapshotIsIdempotent pins the cache-hit path for the snapshot store,
-// including the one asymmetry it has against the native store: a Linux hit MUST
+// including the one asymmetry it has against the native store: a Linux hit must
 // read the image config (the chain id is a function of the diffIDs), so it needs
 // that one blob and no other.
 func TestLinuxSnapshotIsIdempotent(t *testing.T) {
@@ -463,8 +463,8 @@ func TestLinuxSnapshotIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestDecompressLayerAllowlist pins the CLOSED compression allowlist: the
-// DECLARED media type chooses the decompressor and the bytes never get to
+// TestDecompressLayerAllowlist pins the closed compression allowlist: the
+// declared media type chooses the decompressor and the bytes never get to
 // decide. zstd joined it with the Linux dialect — zstd is what buildkit emits
 // for a Linux image built with `--compression=zstd`, and a layer this daemon
 // cannot decompress is an image it cannot run.
@@ -533,7 +533,7 @@ func TestDecompressLayerAllowlist(t *testing.T) {
 	})
 }
 
-// TestUnpackAppliesAZstdLayer drives a zstd layer through the WHOLE pipeline,
+// TestUnpackAppliesAZstdLayer drives a zstd layer through the whole pipeline,
 // which is the only thing that proves the compressed-digest and diffID checks
 // still wrap the new decompressor correctly.
 func TestUnpackAppliesAZstdLayer(t *testing.T) {

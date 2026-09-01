@@ -76,7 +76,7 @@ func pinFor(kernel, initramfs []byte) GuestKernelPin {
 
 // fakeFetcher serves bytes from memory and counts what was asked for.
 //
-// The call COUNT is as load-bearing as the bytes: "the cache was used" is not
+// The call count is as load-bearing as the bytes: "the cache was used" is not
 // observable from the returned paths — a correct ensure and a cache-ignoring one
 // return the same two paths with the same two digests — so the only witness that
 // a warm cache was honoured is that nothing was fetched.
@@ -636,7 +636,7 @@ func TestEnsureGuestArtifactsRetention(t *testing.T) {
 // Mutation legs. Each one takes a state that a verification-free implementation
 // would happily accept — bytes on disk that are not the bytes that were pinned —
 // and asserts ensure notices. They are named Mutation* so hack/acceptance/B108.sh
-// can assert every one of them RAN, not merely that the package passed.
+// can assert every one of them ran, not merely that the package passed.
 // ============================================================================
 
 func TestMutations(t *testing.T) {
@@ -817,7 +817,7 @@ func TestHTTPFetcherSatisfiesFetcher(t *testing.T) {
 // ============================================================================
 
 func TestHTTPFetcherRejectsNonHTTPSURL(t *testing.T) {
-	// Each of these must be refused BEFORE any connection is attempted, which is
+	// Each of these must be refused before any connection is attempted, which is
 	// also why this test needs no network: reaching the transport at all would
 	// be the bug.
 	refused := []struct{ name, url string }{
@@ -857,7 +857,7 @@ func TestHTTPFetcherRejectsNonHTTPSURL(t *testing.T) {
 	})
 }
 
-// capFetcher serves bytes through the SAME cappedBody wrapper HTTPFetcher.Fetch
+// capFetcher serves bytes through the same cappedBody wrapper HTTPFetcher.Fetch
 // applies, so an end-to-end ensure exercises the production cap rather than a
 // test-only imitation of it.
 type capFetcher struct {

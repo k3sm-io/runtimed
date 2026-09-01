@@ -27,7 +27,7 @@ import (
 //
 // # Why the command line, and not the boot spec
 //
-// guest.proto REQUIRES this agent to "reject a pod_id that is not the pod it
+// guest.proto requires this agent to "reject a pod_id that is not the pod it
 // booted" — but guest/v1's GuestSpec carries no pod_id field, so as the contract
 // stands the guest is asked to assert an identity it is never told. Only
 // VMHostSpec has pod_id, and that message is read by the HOST-side VM helper, not
@@ -46,7 +46,7 @@ import (
 // # Who writes it
 //
 // pkg/vmhost's FromSpec appends it from VMHostSpec.pod_id when the daemon's
-// cmdline does not already carry it, and REFUSES a cmdline that carries a
+// cmdline does not already carry it, and refuses a cmdline that carries a
 // different one — so the value the guest reads is the value the host meant, and a
 // disagreement is a loud rejection rather than a guest that quietly answers for
 // the wrong pod.
@@ -62,7 +62,7 @@ var ErrPodIDAbsent = errors.New("guestagent: the kernel command line carries no 
 // PodIDFromCmdline extracts the pod id from a /proc/cmdline string.
 //
 // The kernel command line is whitespace-separated `key=value` tokens. Parsing is
-// deliberately strict: the LAST occurrence wins (matching the kernel's own
+// deliberately strict: the last occurrence wins (matching the kernel's own
 // last-wins rule for repeated parameters, so a reader here and the kernel never
 // disagree about which value took effect), an empty value is an absence rather
 // than an empty id, and nothing is unquoted or unescaped — the value is a kube UID,

@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// wedgedWaiter is an ExitWaiter whose reap for the named pids IGNORES ctx —
+// wedgedWaiter is an ExitWaiter whose reap for the named pids ignores ctx —
 // modelling a reaper that does not come back when the shutdown cancel fires (on
 // a real node: a kevent/wait4 blocked in the kernel). Every other pid honors
 // ctx, as KqueueReaper does at its poll-loop check. The wedged waits are
@@ -134,7 +134,7 @@ func TestRuntimeCloseSweepsSupervision(t *testing.T) {
 			}
 		}
 
-		// Close stops SUPERVISION, not the workloads: the pod processes outlive
+		// Close stops supervision, not the workloads: the pod processes outlive
 		// the daemon and the startup reap reconciles them, so a shutdown must send
 		// no signal and must not forget the pods it is still supervising.
 		if got := rec.signals(); len(got) != 0 {
@@ -159,7 +159,7 @@ func TestRuntimeCloseSweepsSupervision(t *testing.T) {
 	t.Run("a-wedged-pod-does-not-abort-the-sweep", func(t *testing.T) {
 		// pids 1001/1002 are the first two the fake spawner serves; those reapers
 		// ignore the shutdown cancel, so their waits must time out — without
-		// stranding, or silencing, the pods swept around them. TWO of them is the
+		// stranding, or silencing, the pods swept around them. two of them is the
 		// point: a sweep that stops at the first miss reports one and abandons the
 		// rest, which is how a shutdown leaves goroutines behind unseen.
 		ww := newWedgedWaiter(1001, 1002)

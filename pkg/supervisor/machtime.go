@@ -21,12 +21,12 @@ import (
 	"math/bits"
 )
 
-// MachTimebase is the mach_timebase_info(3) ratio that converts MACH ABSOLUTE
+// MachTimebase is the mach_timebase_info(3) ratio that converts MACH absolute
 // TIME UNITS to nanoseconds: nanos = ticks * Numer / Denom.
 //
 // It is a first-class (pure, injectable) type because getting it wrong is the
 // classic Apple-Silicon CPU-accounting bug, and the bug is INVISIBLE on Intel.
-// proc_pid_rusage's ri_user_time / ri_system_time are NOT nanoseconds: XNU's
+// proc_pid_rusage's ri_user_time / ri_system_time are not nanoseconds: XNU's
 // fill_task_rusage copies task_power_info's total_user / total_system straight
 // out of the task's thread timers, which accumulate in mach absolute time units
 // (bsd/kern/kern_resource.c). On x86_64 the timebase is 1/1, so the raw value

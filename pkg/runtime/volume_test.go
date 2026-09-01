@@ -30,12 +30,12 @@ import (
 )
 
 // TestPVCSurvivesPodTeardown is acceptance runtimed:M3.1-a2 (root-free): data
-// written to a PVC-backed volume survives the pod-teardown path (the PV dir is NOT
+// written to a PVC-backed volume survives the pod-teardown path (the PV dir is not
 // removed with the pod dir — ReclaimPolicy Retain), while the pod rootfs IS removed
 // (the contrast). It also asserts the PV mount root landed in the pod's SBPL
 // write-scope so the confined pod could write to it.
 //
-// The image cache and the runtime root share ONE dir (as they do in production,
+// The image cache and the runtime root share one dir (as they do in production,
 // and as newTestRuntime now arranges too) so the pod rootfs (cache-derived) and
 // the PV storage root (Config.Root/storage) are siblings under one root and
 // removePodDir actually fires.
@@ -60,7 +60,7 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 	}
 	// The SIGKILL hook releases the fake reaper for the signalled pid, so the
 	// fake behaves like a real process group: it dies when killed. DeletePod now
-	// WAITS for the reaper's exit observation before returning (B40), so a fake
+	// waits for the reaper's exit observation before returning (B40), so a fake
 	// that never reports the exit would spend the full observation bound here.
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
@@ -124,7 +124,7 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 		t.Fatalf("DeletePod: %v", err)
 	}
 
-	// The PV dir + its contents SURVIVE teardown (lifecycle-decoupled, Retain).
+	// The PV dir + its contents survive teardown (lifecycle-decoupled, Retain).
 	if got, err := os.ReadFile(persisted); err != nil || string(got) != "durable" {
 		t.Errorf("PV data did not survive teardown: %q (err %v)", got, err)
 	}
@@ -134,7 +134,7 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 		t.Errorf("pod dir not removed on teardown (err=%v); only the PV must persist", err)
 	}
 
-	// A fresh pod for the SAME claim reuses the SAME dir with the prior data intact.
+	// A fresh pod for the same claim reuses the same dir with the prior data intact.
 	box2 := &runtimev1.PodBox{
 		PodId:           "pod-pvc-2",
 		Namespace:       ns,

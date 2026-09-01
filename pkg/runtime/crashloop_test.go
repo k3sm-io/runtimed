@@ -87,7 +87,7 @@ func (f *countingFootprinter) Footprint(int) (uint64, error) {
 // --- Defect 1: the phase is a function of the container states, not a latch ---
 
 // TestRecomputePhaseDeEscalates is the B26 phase proof: recomputePhaseLocked is a
-// pure function of the MAIN containers' current states, so a pod that reached a
+// pure function of the main containers' current states, so a pod that reached a
 // terminal phase DE-ESCALATES back to Running once a main is live again (a
 // RestartContainer re-exec, or a container mid-restart). Without this a
 // restartPolicy:Always pod that crashes once and successfully re-execs reports
@@ -299,7 +299,7 @@ func TestTrulyTerminalPredicate(t *testing.T) {
 
 // TestTerminalTeardownClaimDeferralIsReleased proves the mid-restart guard is a
 // DEFERRAL, not a permanent skip: while a sidecar is mid-restart the claim yields
-// nothing, and the moment the flag clears the SAME pod yields its teardown. A
+// nothing, and the moment the flag clears the same pod yields its teardown. A
 // permanent skip would be the very leak the predicate exists to close.
 func TestTerminalTeardownClaimDeferralIsReleased(t *testing.T) {
 	sc := testCP("sc", nil, true, true) // mid-restart sidecar
@@ -335,9 +335,9 @@ func TestTerminalTeardownClaimDeferralIsReleased(t *testing.T) {
 
 // TestFailedPodIsTrulyTerminal is the corrected B26 leak proof, end to end: a
 // restartPolicy Never/OnFailure pod whose main FAILS is genuinely terminal —
-// nothing will restart it, and Kubernetes RETAINS it (the Job controller keeps it
+// nothing will restart it, and Kubernetes retains it (the Job controller keeps it
 // under backoffLimit, podgc only collects at --terminated-pod-gc-threshold). So
-// BOTH irreversible side effects must fire: the ~1Hz memory sampler (a root
+// both irreversible side effects must fire: the ~1Hz memory sampler (a root
 // goroutine whose breach path SIGKILLs a process group) is cancelled, and the
 // native sidecars are torn down. Leaving them running leaks per failed pod, with
 // no cgroup parent to collect them and no operator-visible signal.
@@ -370,7 +370,7 @@ func TestFailedPodIsTrulyTerminal(t *testing.T) {
 		return podPhase(t, rt, "pod-fail-term") == runtimev1.PodPhase_POD_PHASE_FAILED
 	})
 
-	// (1) The sidecar is torn down — NOT left as an orphan process tree.
+	// (1) The sidecar is torn down — not left as an orphan process tree.
 	waitFor(t, 5*time.Second, "sidecar teardown on a FAILED pod", func() bool {
 		for _, s := range rec.sentSignals() {
 			if s.pid == pidSC && s.sig == termSignal {
@@ -380,14 +380,14 @@ func TestFailedPodIsTrulyTerminal(t *testing.T) {
 		return false
 	})
 
-	// (2) The memory sampler goroutine is cancelled — NOT left sampling forever.
+	// (2) The memory sampler goroutine is cancelled — not left sampling forever.
 	waitFor(t, 5*time.Second, "the memory sampler to stop on a FAILED pod", func() bool {
 		return samplingStopped(ff)
 	})
 }
 
 // TestRestartAfterCrashRearmsMemorySampler closes the other half of the above: a
-// FAILED pod IS torn down, so the CrashLoopBackOff re-exec must RE-ARM the memory
+// failed pod IS torn down, so the CrashLoopBackOff re-exec must RE-ARM the memory
 // sampler. Without it every crash-looping pod would run permanently unenforced
 // after its first crash — the regression the truly-terminal fix would otherwise
 // introduce.
@@ -431,7 +431,7 @@ func TestRestartAfterCrashRearmsMemorySampler(t *testing.T) {
 		return ff.samples.Load() > stopped
 	})
 
-	// Exactly ONE sampler enforces the limit: DeletePod stops it for good.
+	// Exactly one sampler enforces the limit: DeletePod stops it for good.
 	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-clbo-mem"}); err != nil {
 		t.Fatalf("DeletePod: %v", err)
 	}
@@ -441,7 +441,7 @@ func TestRestartAfterCrashRearmsMemorySampler(t *testing.T) {
 }
 
 // TestSidecarRespawnedIntoTerminalPodIsTornDown proves the once-only
-// p.sidecarTeardown latch cannot strand a process spawned AFTER the claim: the
+// p.sidecarTeardown latch cannot strand a process spawned after the claim: the
 // pod fails, its sidecar is torn down, and a provider re-exec of that sidecar into
 // the still-terminal pod is stopped again rather than left running forever.
 func TestSidecarRespawnedIntoTerminalPodIsTornDown(t *testing.T) {
@@ -536,7 +536,7 @@ func TestLiveContainersExcludeTerminated(t *testing.T) {
 // TestSamplerRefusesToArmDeletedPod is the anti-stranding proof (B26): a sampler
 // is a root-daemon goroutine whose breach path SIGKILLs a process group, so
 // arming one for a pod already removed from r.pods — the reachable
-// DeletePod-cancels-then-RestartContainer-arms interleaving — must be REFUSED.
+// DeletePod-cancels-then-RestartContainer-arms interleaving — must be refused.
 // Otherwise nothing can ever cancel it.
 func TestSamplerRefusesToArmDeletedPod(t *testing.T) {
 	w := newBlockingWaiter()
@@ -629,7 +629,7 @@ func TestRestartRearmsMemorySamplerAfterCompletion(t *testing.T) {
 		t.Errorf("phase after the re-exec = %v, want RUNNING", got)
 	}
 
-	// Exactly ONE sampler enforces the limit: DeletePod cancels the live one and
+	// Exactly one sampler enforces the limit: DeletePod cancels the live one and
 	// sampling stops for good (a leaked predecessor would keep counting).
 	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-rearm"}); err != nil {
 		t.Fatalf("DeletePod: %v", err)
@@ -645,10 +645,10 @@ func TestRestartRearmsMemorySamplerAfterCompletion(t *testing.T) {
 
 // TestNoTransientTerminatedPublishWhileRestarting is the B26 publish-suppression
 // proof: the kqueue reaper records the old run's terminated state (the restart
-// reads it back for last_termination_state) but must NOT publish it while the
+// reads it back for last_termination_state) but must not publish it while the
 // container is flagged restarting. Publishing it shows the provider a "new" exit
 // for a restart IT issued, whose terminationKey idempotency would then schedule a
-// SECOND restart for the same death.
+// second restart for the same death.
 func TestNoTransientTerminatedPublishWhileRestarting(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
@@ -675,7 +675,7 @@ func TestNoTransientTerminatedPublishWhileRestarting(t *testing.T) {
 	}
 
 	// Drain the stream for a bounded window: the suppressed publish, had it
-	// fired, would carry the OLD run's terminated state with restart_count 0.
+	// fired, would carry the old run's terminated state with restart_count 0.
 	sawRestartEvent := false
 	deadline := time.After(500 * time.Millisecond)
 drain:
@@ -708,9 +708,9 @@ drain:
 
 // TestStatusNeverPairsBumpedCountWithPreviousTerminatedState pins the invariant
 // the k3sm provider's terminationKey restart idempotency rests on: a status
-// snapshot can NEVER carry a bumped restart_count alongside the PREVIOUS run's
+// snapshot can never carry a bumped restart_count alongside the previous run's
 // terminated state. RestartContainer bumps the count, swaps the container,
-// recomputes the phase and snapshots the status under ONE hold of p.mu; this
+// recomputes the phase and snapshots the status under one hold of p.mu; this
 // test hammers GetPodStatus (and the watch stream) concurrently across a restart
 // so that -race and the assertion below catch any future split of that block.
 func TestStatusNeverPairsBumpedCountWithPreviousTerminatedState(t *testing.T) {

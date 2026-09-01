@@ -20,14 +20,14 @@ package supervisor
 
 // Darwin setpriority(2) selectors for the launch sequence's background-QoS step.
 //
-// golang.org/x/sys/unix exports Setpriority but NOT the darwin-specific
+// golang.org/x/sys/unix exports Setpriority but not the darwin-specific
 // PRIO_DARWIN_* selectors, so their values are pinned here verbatim from the
 // PUBLIC MacOSX SDK header <sys/resource.h>:
 //
 //	#define PRIO_DARWIN_PROCESS 4        /* Second argument is a PID */
 //	#define PRIO_DARWIN_BG      0x1000   /* background throttle mode */
 //
-// This is public, documented API — NOT libsandbox/memorystatus-style private SPI
+// This is public, documented API — not libsandbox/memorystatus-style private SPI
 // — so it deliberately gets NO internal/spicanary symbol-canary. Note the darwin
 // background band is a COUPLED policy: it throttles CPU scheduling, moves I/O to
 // the throttled tier, and marks network traffic background class together (see

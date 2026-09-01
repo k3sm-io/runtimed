@@ -91,7 +91,7 @@ func TestStartupPodReapDecision(t *testing.T) {
 			wantDrop: nil,
 		},
 		{
-			// Leader member (Pid==pgid) with the EXACT recorded start → our
+			// Leader member (Pid==pgid) with the exact recorded start → our
 			// instance → kill.
 			name:     "orphan leader reaped (group alive, identity matches)",
 			records:  []podProcRecord{rec("p1", 100, 5)},
@@ -112,7 +112,7 @@ func TestStartupPodReapDecision(t *testing.T) {
 			wantKeepWarn: []int{100},
 		},
 		{
-			// Recycled to a NEW leader: Pid==pgid exists but with a different
+			// Recycled to a new leader: Pid==pgid exists but with a different
 			// (earlier) immutable start → not ours → drop.
 			name:     "recycled pgid skipped (leader start differs, earlier)",
 			records:  []podProcRecord{rec("p1", 100, 50)},
@@ -122,9 +122,9 @@ func TestStartupPodReapDecision(t *testing.T) {
 		},
 		{
 			// The exact-equality regression guard: a leader member whose start is
-			// LATER than the recorded floor (9 > 5). Under the old `start >= floor`
+			// later than the recorded floor (9 > 5). Under the old `start >= floor`
 			// rule this KILLED (a wrong-target root SIGKILL on a recycled pgid);
-			// under exact equality 9 != 5 → it must DROP. This case is green ONLY
+			// under exact equality 9 != 5 → it must DROP. This case is green only
 			// after the exact-instance fix (the start<floor case dropped under the
 			// old rule too, so it proves nothing).
 			name:     "recycled pgid, leader start LATER than floor (drop)",

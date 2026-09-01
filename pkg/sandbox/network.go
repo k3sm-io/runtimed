@@ -24,28 +24,28 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// networkStanza is the ONE network grant this generator can emit — every
+// networkStanza is the one network grant this generator can emit — every
 // networked pod gets these bytes and no others.
 //
 // ============================================================================
-// macOS 26 SBPL GRAMMAR CEILING — per-IP network scoping DOES NOT COMPILE.
+// macOS 26 SBPL GRAMMAR ceiling — per-IP network scoping does not COMPILE.
 //
-// PROBE-VERIFIED on macOS 26.5.1 through the real k3sm-execshim/libsandbox
-// path: Seatbelt network-address filters accept ONLY `localhost` or `*` as
+// PROBE-verified on macOS 26.5.1 through the real k3sm-execshim/libsandbox
+// path: Seatbelt network-address filters accept only `localhost` or `*` as
 // the host. (remote ip "10.43.0.10:53"), (local ip "<PodIP>:*"), and every
-// tcp4/ip4/tcp dialect variant FAIL to compile with "host must be * or
+// tcp4/ip4/tcp dialect variant fail to compile with "host must be * or
 // localhost in network address" — so the pre-M10.1 VIP-scoped outbound
-// allows and PodIP-scoped bind allow made EVERY AllowNetwork pod fail at
+// allows and PodIP-scoped bind allow made every AllowNetwork pod fail at
 // sandbox_apply (networked pods could not spawn at all).
 //
-// What the grammar DOES support: per-PORT scoping compiles and enforces
+// What the grammar does support: per-PORT scoping compiles and enforces
 // precisely ((local ip "*:8899") allowed :8899 and denied :8898), and
 // localhost-host filters compile. RESOLVED (B215 P3 probe, 2026-08-31,
 // through the real execshim/libsandbox path): a port- or localhost-scoped
-// tightening is foreclosed, not merely deferred. Scoping network-bind ALONE
+// tightening is foreclosed, not merely deferred. Scoping network-bind alone
 // is inert — this stanza's separate, unscoped (allow network-inbound) still
-// authorizes the bind, so any tightening has to scope BOTH operations to
-// change anything. And once both ARE scoped, `localhost` matches every
+// authorizes the bind, so any tightening has to scope both operations to
+// change anything. And once both are scoped, `localhost` matches every
 // address the host owns — the lo0-aliased per-pod address, the LAN address,
 // and the wildcard alike — so a localhost-scoped filter provides no per-pod
 // isolation even then. Nothing narrower than the stanza below is expressible.
@@ -53,15 +53,15 @@ import (
 // Honest consequence: for a networked pod, networking allowed means
 // networking ALLOWED — unfiltered outbound + bind under the profile's
 // (deny default). The isolation story for a networked pod stays fs/exec
-// confinement plus the vm RuntimeClass for untrusted tenancy; NEVER claim
+// confinement plus the vm RuntimeClass for untrusted tenancy; never claim
 // network isolation from Seatbelt. Posture.ResolverVIP/APIServerVIP and
 // GenerateOptions.PodIP are plumbing-only (DNS env/status) — they render
 // no SBPL.
 // ============================================================================
 //
 // network-inbound authorizes listen()/accept(). A bare (allow network-bind)
-// passes bind() but a TCP server's listen() is gated by the SEPARATE
-// network-inbound operation, so without it EVERY listening pod (a Service
+// passes bind() but a TCP server's listen() is gated by the separate
+// network-inbound operation, so without it every listening pod (a Service
 // target, a readiness/liveness HTTP server) fails listen() with EPERM under
 // (deny default). Regression from M10.1 dropping the PodIP-scoped bind (which
 // implied inbound) for a bare bind; probe-verified through the real
@@ -69,7 +69,7 @@ import (
 //
 // It is a const rather than a run of WriteString calls because ValidateNetworkScope
 // compares a rendered profile against it byte-for-byte: the emitted stanza and the
-// checked stanza must be the SAME artifact, or the check would be pinning a copy
+// checked stanza must be the same artifact, or the check would be pinning a copy
 // that can drift from what pods actually run under.
 const networkStanza = ";; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).\n" +
 	";; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;\n" +
@@ -82,7 +82,7 @@ const networkStanza = ";; network: ALLOWED — unfiltered outbound+bind+inbound 
 	"  (global-name \"com.apple.dnssd.service\")\n" +
 	"  (global-name \"com.apple.mDNSResponder\"))\n"
 
-// ErrNetworkRulesUnrequested reports a profile that carries a network ALLOW while
+// ErrNetworkRulesUnrequested reports a profile that carries a network allow while
 // neither allow_network nor allow_internet_egress was requested. It is the
 // "network forms appear only under the booleans" half of the re-scoped check: a
 // pod that never asked for networking must not be handed any, so such a profile is
@@ -93,9 +93,9 @@ var ErrNetworkRulesUnrequested = errors.New("sbpl: profile grants network access
 // stanza this generator emits — a hand-edited, reordered, or per-IP-filtered
 // variant.
 //
-// It is fail-closed against BOTH directions of drift, and the second one is the
+// It is fail-closed against both directions of drift, and the second one is the
 // reason it exists as its own sentinel. A WIDER stanza would grant a networked pod
-// more than the ceiling admits. A NARROWER, "tightened" one — a (remote ip …)
+// more than the ceiling admits. A narrower, "tightened" one — a (remote ip …)
 // filter someone reinstates believing macOS can express it — does not compile at
 // sandbox_apply, so every networked pod on the node would fail to spawn. Naming
 // the mismatch at generation time turns that into one clear error instead of a
@@ -111,14 +111,14 @@ var ErrEgressPairingViolated = errors.New("sbpl: allow_internet_egress did not y
 
 // networkRequested reports whether sp asks for network access by either route.
 //
-// allow_internet_egress IMPLIES allow_network: the implication is honoured HERE,
+// allow_internet_egress IMPLIES allow_network: the implication is honoured here,
 // in translation, rather than by rejecting a profile that sets only the egress
 // flag. That choice is deliberate — the two flags do not describe two enforcement
 // tiers on macOS, they describe an ADMISSION intent ("this workload may reach the
 // internet") that this layer cannot narrow, so a pod carrying only the egress flag
 // is a pod that needs networking and gets exactly the stanza allow_network gets.
 //
-// What the pair is FOR, since Seatbelt cannot enforce the difference: the flag is
+// What the pair is for, since Seatbelt cannot enforce the difference: the flag is
 // the API/admission contract a cluster operator can see and refuse (the annotation
 // + the admission policy that reads it). Network-LAYER enforcement (a packet
 // filter) is future work owned by the networking datapath, and until it exists
@@ -132,7 +132,7 @@ func networkRequested(sp *runtimev1.SandboxProfile) bool {
 // what macOS 26 can actually express, which is the shape of the grant, never a
 // per-IP filter it would reject at compile time:
 //
-//  1. a network ALLOW appears only when allow_network ∨ allow_internet_egress;
+//  1. a network allow appears only when allow_network ∨ allow_internet_egress;
 //  2. the implies-pairing holds — allow_internet_egress yields a network grant;
 //  3. the grant is byte-for-byte the stanza this generator emits.
 //
@@ -140,20 +140,20 @@ func networkRequested(sp *runtimev1.SandboxProfile) bool {
 // reorders the stanza fails at generation rather than at sandbox_apply. It is
 // EXPORTED because it also serves a caller holding a profile it did not generate.
 //
-// It is deliberately SEPARATE from Validate, which takes only a profile string and
+// It is deliberately separate from Validate, which takes only a profile string and
 // is what a Backend runs before applying one: the properties here are relational —
 // they can only be decided against the SandboxProfile that asked for the grant —
 // so folding them into Validate would mean a check that silently cannot see half
 // its own inputs.
 //
-// Detection is LOOSE and acceptance is STRICT, which is what makes it fail closed:
+// Detection is LOOSE and acceptance is strict, which is what makes it fail closed:
 // any (allow …) line mentioning a network operation counts as a network grant
 // (even a whitespace or dialect variant a naive equality test would miss), and
 // only the exact stanza is then accepted.
 func ValidateNetworkScope(sp *runtimev1.SandboxProfile, profile string) error {
 	hasStanza := strings.Contains(profile, networkStanza)
 	hasAnyAllow := hasNetworkAllow(profile)
-	// Read the two booleans DIRECTLY rather than through networkRequested: that
+	// Read the two booleans directly rather than through networkRequested: that
 	// helper is the TRANSLATE-side decision, and a check that shares its predicate
 	// with the code it checks can only ever confirm that code agrees with itself.
 	// Spelling the disjunction here means a translate-side edit that grants network
@@ -175,7 +175,7 @@ func ValidateNetworkScope(sp *runtimev1.SandboxProfile, profile string) error {
 	if !hasStanza {
 		return fmt.Errorf("%w: the network allow is not the generated stanza", ErrNetworkStanzaMismatch)
 	}
-	// The stanza is present; make sure it is the ONLY network allow, so an extra
+	// The stanza is present; make sure it is the only network allow, so an extra
 	// hand-added (allow network-outbound (remote ip …)) beside it is still caught.
 	if extra := countNetworkAllowLines(profile) - countNetworkAllowLines(networkStanza); extra != 0 {
 		return fmt.Errorf("%w: %d network allow line(s) beyond the generated stanza", ErrNetworkStanzaMismatch, extra)
@@ -197,7 +197,7 @@ func hasNetworkAllow(profile string) bool {
 	return countNetworkAllowLines(profile) > 0
 }
 
-// countNetworkAllowLines counts the network-granting ALLOW directive lines in
+// countNetworkAllowLines counts the network-granting allow directive lines in
 // profile, ignoring comment lines.
 func countNetworkAllowLines(profile string) int {
 	n := 0

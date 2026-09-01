@@ -72,8 +72,8 @@ func permTree(t *testing.T, root string) []string {
 }
 
 // TestRootfsPathRejectsUncontained is B140's gate: a PodBox rootfs_path that is
-// not BYTE-EQUAL to the runtime's derived pod data volume is refused, and the
-// refusal happens before ANY of the root daemon's write-side sinks run.
+// not byte-equal to the runtime's derived pod data volume is refused, and the
+// refusal happens before any of the root daemon's write-side sinks run.
 //
 // Why the assertions are shaped this way — two traps this gate is built to
 // avoid, both of which would leave it green against unguarded code:
@@ -82,18 +82,18 @@ func permTree(t *testing.T, root string) []string {
 //     rootfs_path aimed at a tree the test process cannot chown already made
 //     createPod return FAILURE_REASON_ROOTFS_SETUP (ChownForFSGroup's Lchown to
 //     a foreign gid returns EPERM for a non-root process). So the table asserts
-//     the SINK SIDE EFFECTS — the victim tree's existence, mode, setgid and gid
-//     — plus the TYPED reason INVALID_POD_BOX, explicitly NOT ROOTFS_SETUP. It
-//     also chowns to the test process's OWN gid, so on unguarded code the sinks
-//     SUCCEED rather than failing with EPERM: the escape is then unmistakable.
+//     the SINK side EFFECTS — the victim tree's existence, mode, setgid and gid
+//     — plus the typed reason INVALID_POD_BOX, explicitly not ROOTFS_SETUP. It
+//     also chowns to the test process's own gid, so on unguarded code the sinks
+//     succeed rather than failing with EPERM: the escape is then unmistakable.
 //   - A test that only called validatePodBox would exercise no sink at all. Every
 //     hostile row goes through the real CreatePod spine (MkdirAll → Materialize →
-//     ChownForFSGroup), AND calls r.rootfsPath directly, because Exec,
+//     ChownForFSGroup), and calls r.rootfsPath directly, because Exec,
 //     RestartContainer and createVMPod reach it without passing CreatePod.
 //
 // The /private/var vs /var firmlink question is settled here by construction and
 // deliberately not normalized: byte-equality refuses an alias spelling of the
-// derived path. That is fail-CLOSED — a rejected alias costs a caller nothing
+// derived path. That is fail-closed — a rejected alias costs a caller nothing
 // (no producer sets the field), whereas resolving aliases means resolving paths,
 // and a resolver that mis-parses fails OPEN.
 func TestRootfsPathRejectsUncontained(t *testing.T) {
@@ -102,10 +102,10 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 		t.Skip("test process gid <= 0 (running as root?); the fsGroup sink asserts a >0 gid")
 	}
 
-	// Same TempDir topology as TestCreatePodRejectsTraversingPodID: ONE shared
+	// Same TempDir topology as TestCreatePodRejectsTraversingPodID: one shared
 	// root for Config.Root and the image cache (otherwise the pods-root-bounded
 	// guards are unsatisfiable and their sinks unreachable), nested inside an
-	// observable parent so an escape ABOVE the root is visible.
+	// observable parent so an escape above the root is visible.
 	outside := t.TempDir()
 	root := filepath.Join(outside, "a", "b", "k3sm")
 	cache, err := image.NewCache(root)
@@ -134,7 +134,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 	mustWrite(t, filepath.Join(victimRootfs, "var", "run", "secrets", "token"), "VICTIM-SA-TOKEN")
 
 	// The attacker's own data volume, with a symlink planted inside it pointing
-	// at the daemon root. A pod's own rootfs is writable at BOTH the POSIX and
+	// at the daemon root. A pod's own rootfs is writable at both the POSIX and
 	// the SBPL layer (it is re-allowed after the protected denies), so planting
 	// this link is within a confined pod's reach — which is precisely why a
 	// lexical containment check would not be enough.
@@ -166,7 +166,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 		rootfs: filepath.Join(outside, "a", "b", "k3sm-evil", "loot"),
 		absent: filepath.Join(outside, "a", "b", "k3sm-evil", "loot"),
 	}, {
-		// Inside the daemon root but OUTSIDE the pods tree: the exact case a
+		// Inside the daemon root but outside the pods tree: the exact case a
 		// bare root-prefix check admits, and it names the control-plane state.
 		name:   "inside-the-root-outside-the-pods-tree",
 		podID:  "pod-esc-server",
@@ -178,7 +178,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 		podID:  "pod-esc-cross",
 		rootfs: victimRootfs,
 	}, {
-		// The default APFS volume is case-insensitive, so this NAMES the victim's
+		// The default APFS volume is case-insensitive, so this names the victim's
 		// directory while spelling a different id.
 		name:   "uppercase-id-alias-on-case-insensitive-apfs",
 		podID:  "pod-esc-case",
@@ -222,7 +222,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 			if resp.GetError() == nil {
 				t.Fatalf("CreatePod(rootfs_path=%q) succeeded; an uncontained rootfs_path must be refused", tc.rootfs)
 			}
-			// The TYPED reason matters: ROOTFS_SETUP is what unguarded code
+			// The typed reason matters: ROOTFS_SETUP is what unguarded code
 			// already returns when a sink fails late (EPERM on a foreign gid), so
 			// accepting it would make this gate vacuous.
 			if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
@@ -250,7 +250,7 @@ func TestRootfsPathRejectsUncontained(t *testing.T) {
 		t.Errorf("an uncontained rootfs_path mutated the filesystem\nbefore: %v\ndiff:   %v", before, diffTrees(before, got))
 	}
 
-	// POSITIVE CONTROLS. Without these the table cannot distinguish "the guard
+	// positive CONTROLS. Without these the table cannot distinguish "the guard
 	// works" from "pod creation is now broken", which would break every pod on
 	// the node.
 	t.Run("positive/rootfs_path-empty", func(t *testing.T) {

@@ -96,7 +96,7 @@ func TestRenderResolvConfIsMuslSafe(t *testing.T) {
 	t.Run("an over-long search line is truncated to fit", func(t *testing.T) {
 		t.Parallel()
 		// Six domains that are individually legal but together exceed the
-		// 256-byte line a resolver will parse. musl discards the WHOLE line,
+		// 256-byte line a resolver will parse. musl discards the whole line,
 		// so emitting it would take out the pod's DNS entirely.
 		var searches []string
 		for i := range 6 {
@@ -175,7 +175,7 @@ func TestRenderHostsAndHostname(t *testing.T) {
 }
 
 // TestParseMemTotal pins the meminfo parse, including the failure that must
-// NOT become an unbounded overlay upper.
+// not become an unbounded overlay upper.
 func TestParseMemTotal(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -56,7 +56,7 @@ func TestMemorySamplerMetersWorkingSet(t *testing.T) {
 	go s.loop(context.Background(), ticks)
 
 	// Two ticks: when the second send returns the loop has received it, which it
-	// can only do AFTER finishing the first tick's sampleOnce (the loop is serial).
+	// can only do after finishing the first tick's sampleOnce (the loop is serial).
 	ticks <- time.Now()
 	ticks <- time.Now()
 
@@ -65,7 +65,7 @@ func TestMemorySamplerMetersWorkingSet(t *testing.T) {
 	}
 }
 
-// TestMemorySamplerOOMBreachFiresOnce proves the OOM path: a SUSTAINED over-limit
+// TestMemorySamplerOOMBreachFiresOnce proves the OOM path: a sustained over-limit
 // footprint fires onBreach exactly once after DefaultBreachSamples consecutive
 // samples, Last() tracks the sample, and the loop stops (Done closes) on ctx
 // cancel — the no-goroutine-leak signal.
@@ -81,7 +81,7 @@ func TestMemorySamplerOOMBreachFiresOnce(t *testing.T) {
 	ticks := make(chan time.Time)
 	go s.loop(ctx, ticks)
 
-	// The first DefaultBreachSamples-1 over-limit samples must NOT fire: a single
+	// The first DefaultBreachSamples-1 over-limit samples must not fire: a single
 	// spike is allocator churn, not an over-limit pod.
 	for i := 0; i < DefaultBreachSamples-1; i++ {
 		ticks <- time.Now()
@@ -101,7 +101,7 @@ func TestMemorySamplerOOMBreachFiresOnce(t *testing.T) {
 		t.Fatal("onBreach did not fire on a memory-limit breach")
 	}
 
-	// Further ticks must NOT re-fire onBreach (once-only).
+	// Further ticks must not re-fire onBreach (once-only).
 	ticks <- time.Now()
 	ticks <- time.Now()
 	select {
@@ -144,7 +144,7 @@ func TestMemorySamplerUnderLimitNoBreach(t *testing.T) {
 	}
 }
 
-// TestMemorySamplerBreachRequiresConsecutiveSamples pins the SUSTAINED-breach rule
+// TestMemorySamplerBreachRequiresConsecutiveSamples pins the sustained-breach rule
 // and its reset: an oscillating footprint — which is what a GPU inference pod's
 // allocator actually produces, with transient peaks a few percent above a healthy
 // steady state — must not accumulate its spikes into a kill.

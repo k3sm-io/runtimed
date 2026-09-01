@@ -47,7 +47,7 @@ type SignatureInspector interface {
 }
 
 // CheckSignaturePolicy enforces policy against path's signature facts from insp.
-// It is FAIL-CLOSED: SIGNATURE_POLICY_UNSPECIFIED returns ErrPolicyUnspecified
+// It is fail-closed: SIGNATURE_POLICY_UNSPECIFIED returns ErrPolicyUnspecified
 // (never run). The mapping:
 //
 //   - ADHOC_OK         — any valid signature passes (ad-hoc included).

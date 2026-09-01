@@ -32,13 +32,13 @@ import (
 // CreateVM boots the pod's Linux guest and returns once its guest agent has
 // answered a Health RPC.
 //
-// THE DAEMON NEVER TOUCHES Virtualization.framework. What happens here is: write
-// the machine description into the pod dir, spawn ONE k3sm-vmhost helper — the
+// the DAEMON never TOUCHES Virtualization.framework. What happens here is: write
+// the machine description into the pod dir, spawn one k3sm-vmhost helper — the
 // only k3sm binary carrying com.apple.security.virtualization — and wait for the
 // guest it builds to answer. Every framework call is on the other side of that
 // process boundary.
 //
-// The helper is spawned UNCONFINED, and that is a MEASURED choice, not an
+// The helper is spawned UNCONFINED, and that is a measured choice, not an
 // oversight. See spawnVMHost for the two denials that decided it.
 //
 // It is ATOMIC IN EFFECT: every failure path after the spawn kills the helper
@@ -52,7 +52,7 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	consolePath := filepath.Join(spec.PodDir, VMConsoleLogName)
 	fail := func(cause VMBootCause, detail string, err error) error {
 		e := &VMBootError{PodID: spec.PodID, Cause: cause, ConsolePath: consolePath, Detail: detail, Err: err}
-		// ONE log line, at the boundary that handles the failure. The error is
+		// one log line, at the boundary that handles the failure. The error is
 		// returned as well, and the standards forbid log-and-return of the same
 		// error — but this is the boundary: the caller turns it into a pod
 		// FailureReason and a status message, and neither carries the helper's
@@ -83,8 +83,8 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	if err != nil {
 		return fail(VMBootSpecWriteFailed, "", err)
 	}
-	// The BOOT CONTRACT, written into the k3sm.spec share root the line above
-	// created, and written BEFORE the spawn below: no guest exists while it is
+	// The BOOT contract, written into the k3sm.spec share root the line above
+	// created, and written before the spawn below: no guest exists while it is
 	// being composed, and the guest that does exist holds that share read-only
 	// at the VZ device. See writeGuestSpec for why those two facts — not the
 	// file mode — are what make it tamper-evident.
@@ -136,8 +136,8 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 
 // spawnVMHost starts one helper child and records it durably before returning.
 //
-// CONFINEMENT: THE HELPER RUNS UNCONFINED, decided by measurement on an entitled
-// rig (M11 R22 admits either, as a NAMED choice). Spawning it under the pod's own
+// CONFINEMENT: the HELPER RUNS UNCONFINED, decided by measurement on an entitled
+// rig (M11 R22 admits either, as a named choice). Spawning it under the pod's own
 // Generate() profile was built and run; two independent denials killed it, both
 // captured verbatim:
 //
@@ -157,17 +157,17 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 // a shared directory, which is exactly the device surface the S1(5) spike
 // disclaimed when it showed SBPL and VZ coexisting for a share-less guest.
 //
-// RESIDUAL, recorded rather than papered over: the helper is the one k3sm binary
+// residual, recorded rather than papered over: the helper is the one k3sm binary
 // carrying com.apple.security.virtualization and it runs with no Seatbelt profile.
 // Its exposure is bounded by what it is: it reads one host-written spec file,
 // binds one owner-only socket, and relays bytes without parsing them
-// (vmhost.Proxy). Narrowing it needs a profile written FOR the hypervisor's
+// (vmhost.Proxy). Narrowing it needs a profile written for the hypervisor's
 // device surface rather than the pod's, which is its own deliverable.
 //
 // PUBLISHER IDENTITY, also residual (M11 R19(c)): the helper is located by
 // FindVMHost (beside the daemon, then PATH) and gated by Available()'s
 // SecStaticCodeCheckValidity + entitlement read — a "was this mangled after
-// signing" check under the code's own designated requirement, NOT a publisher or
+// signing" check under the code's own designated requirement, not a publisher or
 // CDHash pin. On a notarized install the anchor could be pinned; k3sm helpers are
 // ad-hoc signed in a dev tree, so pinning one here today would make the vm
 // backend permanently unavailable outside an installed build. Tracked separately.
@@ -185,7 +185,7 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 	// SETSID (so the helper leads its own group and a signal reaches whatever it
 	// forked), SETSIGMASK/SETSIGDEF (so the helper does not inherit the Go
 	// runtime's blocked SIGTERM and silently ignore graceful stop), the combined
-	// stdout+stderr pipe, and the SOLE kqueue reaper. Re-deriving any of that
+	// stdout+stderr pipe, and the sole kqueue reaper. Re-deriving any of that
 	// here would be a second, worse answer to problems this package already
 	// solved once.
 	proc := supervisor.NewProcess(b.spawner, b.waiter, supervisor.SpawnSpec{
@@ -222,7 +222,7 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 		consolePath:   consolePath,
 		tail:          tail,
 	}
-	// Record BEFORE readiness. A daemon SIGKILLed during a boot leaves a helper
+	// Record before readiness. A daemon SIGKILLed during a boot leaves a helper
 	// holding a live VM, and the startup sweep can only kill what a record names
 	// — so the window between spawn and record must be as close to zero as the
 	// spawn's own return allows.
@@ -238,7 +238,7 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 // awaitGuestReady polls the guest agent's Health RPC until it answers, the helper
 // dies, the caller cancels, or the deadline expires.
 //
-// THE EXIT RACE IS THE POINT. A helper that fails after spawn — an unentitled
+// the exit race is the point. A helper that fails after spawn — an unentitled
 // binary, a spec the contract rejects, a kernel VZ will not boot — exits in
 // milliseconds. Polling alone would spend the whole 30-second deadline before
 // reporting it, and would then report the wrong cause: "the agent never became
@@ -256,7 +256,7 @@ func (b *VMBackend) awaitGuestReady(ctx context.Context, vp *vmProc) error {
 			Err: errors.New("the vm host helper exited before its guest agent answered")}
 	}
 	for {
-		// The exit and cancellation arms are checked BEFORE each attempt as well
+		// The exit and cancellation arms are checked before each attempt as well
 		// as during the wait: a helper that died while the previous attempt was
 		// in flight must not buy another attempt's timeout.
 		select {

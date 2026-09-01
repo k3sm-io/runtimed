@@ -32,7 +32,7 @@ import (
 // provider serves.
 //
 // pod_id empty returns every metered pod (the Summary shape); pod_id set returns
-// just that pod. EVERY running pod is metered — the memory limit selects OOM
+// just that pod. every running pod is metered — the memory limit selects OOM
 // enforcement, not metering (see armMemorySampler) — so a HOST-PROCESS pod is
 // omitted only when its sampler was never armed, matching PodMetrics' ok==false,
 // and a VM pod only when its guest agent had no readable sample to give
@@ -78,7 +78,7 @@ func (r *Runtime) statsTargets(podID string) []string {
 // podStats builds the wire PodStats for podID, or nil when the pod is unknown or
 // has no sample to report.
 //
-// THE SOURCE FORK (B107). Which KERNEL produced a pod's figures is decided here,
+// the source FORK (B107). Which KERNEL produced a pod's figures is decided here,
 // once, by the pod's RESOLVED backend: a vm pod's working set and CPU come from
 // the guest's own cgroup2 hierarchy over the agent's Stats verb (vmPodStats),
 // and a host-process pod's come from Darwin proc_pid_rusage (hostPodStats). The
@@ -110,10 +110,10 @@ func (r *Runtime) podStats(ctx context.Context, podID string) *runtimev1.PodStat
 // sampler tracks only the pod-wide memory sum, and each host-process container is
 // a single process, so a per-PID rusage IS the container's sample).
 //
-// CPU: ri_user_time + ri_system_time come out of the SAME rusage_info_v2 struct as
+// CPU: ri_user_time + ri_system_time come out of the same rusage_info_v2 struct as
 // the footprint, so a container's CPU and memory are one kernel sample, not two —
 // which matters because the /metrics/resource consumer publishes a pod only when it
-// has BOTH. The value is cumulative and carried across restarts by the pod's
+// has both. The value is cumulative and carried across restarts by the pod's
 // cpuAccumulator so it never goes backwards. It is USAGE accounting only: k3sm
 // enforces no CFS millicore quota (best-effort QoS — see docs/resources.md), so
 // this says what a pod consumed, never what it was entitled to.
@@ -136,7 +136,7 @@ func (r *Runtime) hostPodStats(_ context.Context, p *pod) *runtimev1.PodStats {
 	}
 
 	// Snapshot each live container's name + current pid under p.mu; sample rusage
-	// OUTSIDE the lock (the sampler syscalls).
+	// outside the lock (the sampler syscalls).
 	type ctr struct {
 		name string
 		pid  int
@@ -157,7 +157,7 @@ func (r *Runtime) hostPodStats(_ context.Context, p *pod) *runtimev1.PodStats {
 	ts := timestamppb.New(m.Timestamp)
 	containers := make([]*runtimev1.ContainerStats, 0, len(ctrs))
 	// podCPUComplete tracks whether every LIVE container yielded a CPU sample; the
-	// VALUE reported is the accumulator's sum over EVERY container it has seen (see
+	// value reported is the accumulator's sum over every container it has seen (see
 	// cpuAccumulator.sum), so a container that has since exited keeps contributing.
 	podCPUComplete := len(ctrs) > 0
 	for _, c := range ctrs {
@@ -195,7 +195,7 @@ func (r *Runtime) hostPodStats(_ context.Context, p *pod) *runtimev1.PodStats {
 		Memory:     &runtimev1.MemoryStats{Timestamp: ts, WorkingSetBytes: m.WorkingSetBytes},
 		Containers: containers,
 	}
-	// The pod-level counter is reported only when EVERY live container contributed
+	// The pod-level counter is reported only when every live container contributed
 	// — a partial sum is not a pod total, and publishing one would understate the
 	// pod and (being a counter) could fall when the missing container reappears.
 	if podTotal, seen := p.cpuAcc.sum(); podCPUComplete && seen {

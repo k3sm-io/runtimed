@@ -76,13 +76,13 @@ var (
 // and stop state machine — the vm path's only genuinely concurrent code — run
 // under `go test -race` on darwin against a fake.
 type Proc interface {
-	// Wait4 reaps ONE exited child WITHOUT BLOCKING (wait4 with WNOHANG).
+	// Wait4 reaps one exited child without BLOCKING (wait4 with WNOHANG).
 	// It returns:
 	//   - (pid > 0, status, nil) when a child was reaped;
 	//   - (0, _, nil) when children exist but none has exited;
 	//   - (0, _, ErrNoChildren) when there are no children at all;
 	//   - (0, _, ErrInterrupted) when the wait was interrupted.
-	// Blocking is deliberately NOT part of the seam: the loop blocks on the
+	// Blocking is deliberately not part of the seam: the loop blocks on the
 	// SIGCHLD channel instead, which is the only way it can also be woken by
 	// a context cancellation.
 	Wait4() (pid int, status WaitStatus, err error)
@@ -94,7 +94,7 @@ type Proc interface {
 	Kill(pid int, sig Signal) error
 
 	// Poweroff syncs the filesystems and powers the machine off. An
-	// implementation MUST sync before powering off — the guest's writable
+	// implementation must sync before powering off — the guest's writable
 	// layers and any writable virtiofs share are the pod's data. On success it
 	// does not return.
 	Poweroff() error
@@ -119,14 +119,14 @@ type ReaperOptions struct {
 
 // Reaper is PID 1's child-reaping loop and its shutdown state machine.
 //
-// PID 1 in a pid namespace inherits every orphan, so it reaps EVERY child, not
+// PID 1 in a pid namespace inherits every orphan, so it reaps every child, not
 // only the containers it started; an unreaped child stays a zombie forever
 // because there is no other process to inherit it. Only tracked children are
 // forwarded as ExitEvents — an orphan's exit belongs to nobody's container
 // status.
 //
 // Locking discipline: mu guards live, pending and done. The OnExit callback
-// and every Proc call are made with mu RELEASED, so a callback that starts a
+// and every Proc call are made with mu released, so a callback that starts a
 // container (which Tracks) cannot deadlock against the loop that delivered it.
 type Reaper struct {
 	proc     Proc
@@ -142,7 +142,7 @@ type Reaper struct {
 	mu sync.Mutex
 	// live maps a tracked, not-yet-reaped pid to its container name.
 	live map[int]string
-	// pending holds a status reaped BEFORE its Track call arrived. Starting a
+	// pending holds a status reaped before its Track call arrived. Starting a
 	// container and recording its pid cannot be atomic against the kernel, so
 	// a short-lived process can be reaped first; without this map its exit
 	// would be discarded as an orphan's.
@@ -363,7 +363,7 @@ func (r *Reaper) Wait(ctx context.Context, container string) (WaitStatus, error)
 //   - SIGKILL is never sent before the grace budget has elapsed (or every
 //     container has exited, which ends the wait early). Killing early turns a
 //     graceful shutdown into data loss for anything mid-write.
-//   - The machine is ALWAYS powered off, on every path, including one where
+//   - The machine is always powered off, on every path, including one where
 //     signalling fails and one where a container never exits. A stop that
 //     returns without powering off leaves a VM running with no pod, which the
 //     host can only reap by timeout.

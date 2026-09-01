@@ -155,7 +155,7 @@ func TestAdHocSignTree(t *testing.T) {
 	})
 
 	// The universal-binary case that motivates per-arch verification: verifying the
-	// WHOLE file reports "not signed at all" when a foreign slice is unsigned, which
+	// whole file reports "not signed at all" when a foreign slice is unsigned, which
 	// would re-sign — and de-CoW — a file whose executing slice is fine.
 	t.Run("universal binaries are verified per-arch", func(t *testing.T) {
 		root := t.TempDir()
@@ -309,7 +309,7 @@ func TestAdHocSignTree(t *testing.T) {
 }
 
 // TestMachoSlices pins the magic-based classifier, including the collision it must
-// not fall for: a Java .class file opens with the SAME 0xCAFEBABE magic as a fat
+// not fall for: a Java .class file opens with the same 0xCAFEBABE magic as a fat
 // Mach-O, and handing one to codesign would be a write driven by a misread format.
 func TestMachoSlices(t *testing.T) {
 	dir := t.TempDir()

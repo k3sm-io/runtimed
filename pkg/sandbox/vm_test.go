@@ -24,12 +24,12 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// TestVMBackendAvailableFalseWithoutEntitlement asserts the vm backend's SAFE
+// TestVMBackendAvailableFalseWithoutEntitlement asserts the vm backend's safe
 // availability probe returns false in a test tree — no installed k3sm-vmhost
 // helper, and no validly-signed virtualization-entitled binary to find — and,
-// critically, does NOT crash. Available() must never construct or boot a VM: doing
+// critically, does not crash. Available() must never construct or boot a VM: doing
 // so on a non-entitled host raises an uncaught NSException → SIGABRT, which would
-// take down the daemon. On darwin+cgo this exercises the REAL
+// take down the daemon. On darwin+cgo this exercises the real
 // +[VZVirtualMachine isSupported] and Security.framework probes (vm_darwin.m); off
 // darwin/cgo they are the false stubs (vm_other.go). Either way the answer here is
 // false. The term-by-term composition is TestVMAvailableRequiresEntitledHelper
@@ -46,7 +46,7 @@ func TestVMBackendAvailableFalseWithoutEntitlement(t *testing.T) {
 	}
 }
 
-// TestVMBackendWrapCommandRefuses asserts the vm backend does NOT implement the
+// TestVMBackendWrapCommandRefuses asserts the vm backend does not implement the
 // host-process exec-shim seam: WrapCommand fails closed with ErrVMUsesCreateVM so
 // a mis-routed vm pod can never be run through the Seatbelt host-process path.
 func TestVMBackendWrapCommandRefuses(t *testing.T) {
@@ -58,7 +58,7 @@ func TestVMBackendWrapCommandRefuses(t *testing.T) {
 }
 
 // TestVMBackendCreateVMRejectsAnUnderivedSpec asserts the vm spine refuses a spec
-// whose pod paths were not stamped by the runtime's own derivations, BEFORE it
+// whose pod paths were not stamped by the runtime's own derivations, before it
 // resolves artifacts, writes a file, or spawns anything.
 //
 // The order is the property. PodDir and AgentSocketPath are handed to a child

@@ -38,7 +38,7 @@ import (
 
 // layerFrom renders specs as an uncompressed tar and returns it as a real
 // go-containerregistry layer (gzip-compressed, with a correctly derived diffID),
-// so the unpacker's compressed-digest AND diffID checks are exercised against
+// so the unpacker's compressed-digest and diffID checks are exercised against
 // values it did not compute itself.
 func layerFrom(t *testing.T, specs []tarSpec) ggcrv1.Layer {
 	t.Helper()
@@ -134,7 +134,7 @@ func newTestUnpacker(t *testing.T, opts ...UnpackerOption) (*Cache, *Unpacker) {
 }
 
 // TestTreeKey pins the tree's identity: it is a function of the CONFIG digest,
-// the layer digests IN ORDER, and the policy — and of nothing else. Every one of
+// the layer digests IN order, and the policy — and of nothing else. Every one of
 // these subtests is a way the key must change (or must not).
 func TestTreeKey(t *testing.T) {
 	base := &runtimev1.ImageManifest{
@@ -292,7 +292,7 @@ func TestUnpackMultiLayer(t *testing.T) {
 		t.Errorf("tree rootfs = %q, want %q", tree.Rootfs, wantRootfs)
 	}
 
-	// The record is daemon-authored and describes what was built FROM.
+	// The record is daemon-authored and describes what was built from.
 	var rec treeRecord
 	buf, err := os.ReadFile(filepath.Join(filepath.Dir(wantRootfs), TreeRecordName))
 	if err != nil {
@@ -356,7 +356,7 @@ func TestUnpackIsIdempotent(t *testing.T) {
 // TestUnpackVerifiesContent is the verify-on-read half of the deliverable: the
 // unpacker re-checks every blob it reads against the manifest that named it and
 // every layer's decompressed content against the config's diffID, and commits
-// NOTHING when either check fails.
+// nothing when either check fails.
 func TestUnpackVerifiesContent(t *testing.T) {
 	t.Run("poisoned_layer_blob", func(t *testing.T) {
 		c, u := newTestUnpacker(t)
@@ -441,7 +441,7 @@ func TestUnpackVerifiesContent(t *testing.T) {
 	})
 
 	t.Run("symlink_blob_is_not_a_blob", func(t *testing.T) {
-		// openBlob judges a symlink on ITSELF (Lstat), so a link planted at a blob
+		// openBlob judges a symlink on itself (Lstat), so a link planted at a blob
 		// path is refused rather than followed — the same rule Cache.Has applies.
 		c, u := newTestUnpacker(t)
 		mfst := commitImage(t, c, imageFrom(t, layerFrom(t, []tarSpec{{name: "app", mode: 0o755, data: "V1"}})))
@@ -466,7 +466,7 @@ func TestUnpackVerifiesContent(t *testing.T) {
 }
 
 // TestUnpackRefusesUnsupportedLayerMediaType pins the closed compression
-// allowlist: the DECLARED media type chooses the decompressor, and an
+// allowlist: the declared media type chooses the decompressor, and an
 // unrecognised one is refused rather than sniffed.
 func TestUnpackRefusesUnsupportedLayerMediaType(t *testing.T) {
 	c, u := newTestUnpacker(t)
@@ -638,7 +638,7 @@ func TestUnpackConcurrent(t *testing.T) {
 }
 
 // TestNewUnpackerRequiresACache pins the constructor's one required argument:
-// the unpacker must read the SAME store the pull committed to, or it could not
+// the unpacker must read the same store the pull committed to, or it could not
 // verify a byte it applies.
 func TestNewUnpackerRequiresACache(t *testing.T) {
 	if _, err := NewUnpacker(nil); err == nil {
@@ -658,7 +658,7 @@ func hexOf(c byte) string {
 }
 
 // buildGzipTar renders specs as a gzip-compressed tar (a well-formed layer blob
-// of the WRONG content — used to poison a committed blob).
+// of the wrong content — used to poison a committed blob).
 func buildGzipTar(t *testing.T, specs []tarSpec) []byte {
 	t.Helper()
 	l := layerFrom(t, specs)
@@ -675,7 +675,7 @@ func buildGzipTar(t *testing.T, specs []tarSpec) []byte {
 }
 
 // rewriteConfigDiffIDs replaces the committed config blob's rootfs.diff_ids in
-// place, leaving the manifest still naming the ORIGINAL config digest. It
+// place, leaving the manifest still naming the original config digest. It
 // bypasses CommitBlob deliberately: the point is a store whose bytes no longer
 // match their name, which the commit path exists to prevent.
 func rewriteConfigDiffIDs(t *testing.T, c *Cache, mfst *runtimev1.ImageManifest, diffIDs []string) {

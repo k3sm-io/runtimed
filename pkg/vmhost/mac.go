@@ -25,11 +25,11 @@ import (
 // bytes of sha256(podID), with the first byte forced UNICAST and LOCALLY
 // ADMINISTERED (clear bit 0, set bit 1).
 //
-// DETERMINISM IS THE FEATURE. macOS's NAT attachment leases the guest's address
+// DETERMINISM IS the FEATURE. macOS's NAT attachment leases the guest's address
 // over DHCP keyed on the MAC, so a MAC derived fresh per boot would give the same
 // pod a different address every time it restarted — and the pod's status IP, its
 // endpoint, and any in-flight connection would move with it. Deriving from the pod
-// id makes the lease stable across a VM restart of the SAME pod and different
+// id makes the lease stable across a VM restart of the same pod and different
 // between pods, without the helper holding any state at all.
 //
 // The two bit edits are not cosmetic. Bit 0 set marks a MULTICAST address, which
