@@ -64,7 +64,7 @@ readonly KEYSERVERS="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.
 readonly TOOLCHAIN_IMAGE="debian@sha256:7215f78f35ffe58fe13f244fac9c4f21326d55187271fbb3e1a8aa5cc7e387ab"
 readonly TOOLCHAIN_TAG="debian:trixie-slim"
 
-readonly BUILD_DEPS="gcc make perl flex bison bc libssl-dev libelf-dev xz-utils cpio"
+readonly BUILD_DEPS="gcc make perl python3 flex bison bc libssl-dev libelf-dev xz-utils cpio"
 
 # Reproducibility: the three values the kernel would otherwise take from the
 # clock and the builder's account, each of which alone defeats a byte-compare.
