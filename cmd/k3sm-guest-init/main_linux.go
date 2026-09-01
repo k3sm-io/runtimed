@@ -42,17 +42,21 @@ limitations under the License.
 // not yet IN this BINARY, and deliberately so — each is its own slice with its
 // own gate: the eth0 DHCP client (so /etc/hosts carries no leased address yet,
 // and HealthResponse.guest_ip is empty), the per-container cgroup2 leaves (so
-// Stats omits every container rather than reporting zeros), per-container log
-// capture (so Logs reports that the output is on the VM console instead of
-// serving an empty stream), and pty allocation (so a tty exec is refused rather
-// than run without a terminal). A spec requesting an idmapped mount is refused
-// rather than mounted without the idmap.
+// Stats omits every container rather than reporting zeros), and pty allocation
+// (so a tty exec is refused rather than run without a terminal). A spec
+// requesting an idmapped mount is refused rather than mounted without the idmap.
+//
+// Per-container log capture IS here: each container is spawned on its own
+// stdout/stderr pipes, which are pumped into a bounded per-container ring
+// (guestagent.Capture) and, best effort, tee'd to the console so the console
+// stays the diagnostic of last resort when the agent is down.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -181,6 +185,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	events := guestagent.NewEvents(0)
 	defer events.Close()
 
+	// The per-container output capture, created before the first spawn because
+	// spawn writes into it. Bounded per container; see guestagent.Capture for why
+	// an unbounded buffer in a guest whose only storage is RAM is an OOM.
+	capture := guestagent.NewCapture(0, 0, 0)
+	defer capture.CloseAll()
+
 	reaper := guestinit.NewReaper(proc, sigchld, guestinit.ReaperOptions{
 		Logger: log,
 		OnExit: func(ev guestinit.ExitEvent) {
@@ -193,6 +203,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 			}
 			log.Info("container exit observed", "container", ev.Container,
 				"exit_code", ev.Status.ExitCode, "signal", ev.Status.Signal)
+			// The container's log stream ends here so a `kubectl logs -f` reader
+			// sees end-of-stream rather than hanging on a process that will never
+			// write again. Retained output survives Close and stays readable.
+			capture.Close(ev.Container)
 			// OOMKilled is deliberately not set here. It is the one fact only
 			// the guest can supply, and this init does not yet read the cgroup2
 			// memory.events that would prove it — so it is left false rather
@@ -216,7 +230,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
-	if err := startContainers(ctx, log, reaper, events, plan.Containers); err != nil {
+	if err := startContainers(ctx, log, reaper, events, capture, plan.Containers); err != nil {
 		// Anything already running has to be torn down; Stop is the only
 		// path that both signals and powers off.
 		return errors.Join(err, reaper.Stop(ctx, defaultStopGrace))
@@ -240,7 +254,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	stopAgent, err := serveAgent(podID, spec.GetAgentPort(), guestagent.Deps{
 		Runner:  &reaperRunner{names: names, reaper: reaper},
 		Sampler: &cgroupSampler{root: cgroup2Root},
-		Logs:    &ringLogs{},
+		Logs:    capture,
 		Execer:  &procExecer{plans: byName, reaper: reaper, log: log},
 		Status:  status,
 		Events:  events,
@@ -373,12 +387,12 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 
 // startContainers realizes the plan's containers in order: an init container
 // is waited for and must exit 0, a main container is started and left running.
-func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, plans []guestinit.ContainerPlan) error {
+func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, capture *guestagent.Capture, plans []guestinit.ContainerPlan) error {
 	for _, cp := range plans {
 		if err := applyMounts(log, cp.Mounts); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
 		}
-		pid, err := spawn(cp)
+		pid, err := spawn(cp, capture)
 		if err != nil {
 			return fmt.Errorf("start container %s: %w", cp.Name, err)
 		}
@@ -405,14 +419,26 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 	return nil
 }
 
-// spawn forks and execs one container's process inside its composed rootfs.
+// spawn forks and execs one container's process inside its composed rootfs, on
+// its OWN stdout/stderr pipes.
 //
 // The child is chrooted, credentialed and given its own session before the
 // exec; the working directory is applied after the chroot, so it is a path
 // inside the container. Nothing here waits on the child: PID 1's reaper is the
 // only process that may wait(2), and a second waiter would race it for the
 // exit status.
-func spawn(cp guestinit.ContainerPlan) (int, error) {
+//
+// the PIPES are what MAKE `kubectl logs` POSSIBLE. Containers used to inherit
+// PID 1's stdio, so every container's output went to the one guest console,
+// undemultiplexed and unattributable, and the Logs RPC could only report that
+// there was no per-container buffer to serve. Each stream is now pumped into
+// capture's bounded ring for that container and tee'd to the console.
+//
+// stdin stays the console fd. A container's stdin is not plumbed anywhere yet,
+// and giving it a pipe nothing writes to would turn a workload that reads stdin
+// from a process that blocks into one that gets EOF — a different behaviour,
+// chosen by accident.
+func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture) (int, error) {
 	groups := make([]uint32, 0, len(cp.Ident.Groups))
 	for _, g := range cp.Ident.Groups {
 		groups = append(groups, uint32(g))
@@ -421,10 +447,19 @@ func spawn(cp guestinit.ContainerPlan) (int, error) {
 	if dir == "" {
 		dir = "/"
 	}
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return 0, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		closeAll(stdoutR, stdoutW)
+		return 0, fmt.Errorf("stderr pipe: %w", err)
+	}
 	attr := &syscall.ProcAttr{
 		Dir:   dir,
 		Env:   cp.Env,
-		Files: []uintptr{0, 1, 2},
+		Files: []uintptr{0, stdoutW.Fd(), stderrW.Fd()},
 		Sys: &syscall.SysProcAttr{
 			Chroot: cp.Root,
 			Credential: &syscall.Credential{
@@ -435,5 +470,51 @@ func spawn(cp guestinit.ContainerPlan) (int, error) {
 			Setsid: true,
 		},
 	}
-	return syscall.ForkExec(cp.Argv[0], cp.Argv, attr)
+	pid, err := syscall.ForkExec(cp.Argv[0], cp.Argv, attr)
+	// This process's copies of the child's write ends go immediately after the
+	// fork: holding them open means the readers below never see EOF, so a
+	// container's log stream would never end even after the container did.
+	closeAll(stdoutW, stderrW)
+	if err != nil {
+		closeAll(stdoutR, stderrR)
+		return 0, err
+	}
+	go pumpOutput(stdoutR, capture.Writer(cp.Name, guestagent.StreamStdout), os.Stdout)
+	go pumpOutput(stderrR, capture.Writer(cp.Name, guestagent.StreamStderr), os.Stderr)
+	return pid, nil
+}
+
+// pumpOutput drains one of a container's output pipes into its ring, tee'ing to
+// the console. It closes both ends at EOF, which flushes a final unterminated
+// line into the ring and releases the pipe.
+func pumpOutput(src *os.File, sink io.WriteCloser, console io.Writer) {
+	defer func() {
+		_ = sink.Close()
+		_ = src.Close()
+	}()
+	_, _ = io.Copy(consoleTee{sink: sink, console: console}, src)
+}
+
+// consoleTee writes a container's output to its ring and, best effort, to the
+// guest console.
+//
+// The ORDER and the ERROR HANDLING are both deliberate. The ring is written
+// first and its result is the one returned, so a console that is full, closed or
+// wedged can never stop the capture — an io.MultiWriter would abort the whole
+// write on the console's error and silently cost the pod its logs. The console
+// copy is kept because it is the only diagnostic left when the agent is down, and
+// it costs nothing against the ring's bound: the two sinks are bounded
+// independently (the ring here, the console by pkg/vmhost's CappedWriter on the
+// host side).
+type consoleTee struct {
+	sink    io.Writer
+	console io.Writer
+}
+
+func (t consoleTee) Write(p []byte) (int, error) {
+	n, err := t.sink.Write(p)
+	if t.console != nil {
+		_, _ = t.console.Write(p)
+	}
+	return n, err
 }
