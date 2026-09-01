@@ -72,6 +72,14 @@ func (l *Layout) CredentialPaths() []string {
 	return out
 }
 
+// seenMount is the identity that claimed a rebased destination in the conflict
+// guard: the volume name plus its subPath selection (a destination holds exactly
+// one selection on k3sm's mount-namespace-free shared tree).
+type seenMount struct {
+	name    string
+	subPath string
+}
+
 // Materialize renders every volume referenced by a container VolumeMount in box
 // into the pod's data volume, returning the resulting Layout. dataVol is the pod
 // data volume (its rootfs); podIP is the resolved pod IP (for status.podIP
@@ -83,14 +91,6 @@ func (l *Layout) CredentialPaths() []string {
 // is rejected (fail closed). A persistentVolumeClaim mount is SKIPPED here — it is
 // durable and lifecycle-decoupled, bound by pkg/volume to a stable dir outside the
 // pod tree (M3.1), not materialized into the pod data volume.
-// seenMount is the identity that claimed a rebased destination in the conflict
-// guard: the volume name plus its subPath selection (a destination holds exactly
-// one selection on k3sm's mount-namespace-free shared tree).
-type seenMount struct {
-	name    string
-	subPath string
-}
-
 func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP string, r Resolver) (*Layout, error) {
 	dataVol = filepath.Clean(dataVol)
 	volumes := make(map[string]*runtimev1.Volume, len(box.GetVolumes()))

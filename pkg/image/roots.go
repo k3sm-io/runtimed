@@ -216,6 +216,10 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 		return nil, nil
 	}
 	if err != nil {
+		// LOCAL-ONLY, no boundErr (this one and the OpenRoot below): stdlib os
+		// errors over the daemon's OWN store root. Their rendering is a path this
+		// package composed plus an errno — none of the foreign, unbounded content
+		// boundErr exists to cap can reach them.
 		return nil, fmt.Errorf("%w: read pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
 	}
 	root, err := os.OpenRoot(podsRoot)
@@ -235,6 +239,8 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 		// link named like a pod dir is an unexpected node, not a followed path.
 		fi, err := root.Lstat(name)
 		if err != nil {
+			// LOCAL-ONLY, no boundErr: an fs.PathError naming a pod directory this
+			// daemon created. It reads no record, so no stored content is in it.
 			return nil, fmt.Errorf("%w: stat pod dir %q: %v", ErrRootsIncomplete, name, err)
 		}
 		if !fi.IsDir() {
@@ -243,15 +249,26 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 		}
 		buf, err := readAnchored(root, filepath.Join(name, PodReferencesName))
 		if err != nil {
+			// LOCAL-ONLY, no boundErr: readAnchored fails with an fs.PathError (or
+			// its own not-a-regular-file message) naming a daemon-composed path. The
+			// record's CONTENT reaches a message only at the decode below — which is
+			// bounded, because that is where foreign bytes actually arrive.
 			return nil, fmt.Errorf("%w: pod %q: %v", ErrRootsIncomplete, name, err)
 		}
 		var rec podReferences
 		if err := json.Unmarshal(buf, &rec); err != nil {
-			return nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, err)
+			// encoding/json echoes the offending byte of the document it was handed,
+			// and this document's fields were filled from registry-supplied image
+			// references and digests. Bounded as DATA, never adopted.
+			return nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, boundErr(err))
 		}
 		for _, r := range rec.Images {
 			for _, d := range r.Digests() {
 				if _, perr := parseBlobDigest(d); perr != nil {
+					// ALREADY BOUNDED AT THE SOURCE, so no second boundErr: perr is this
+					// package's own error, and parseBlobDigest caps both halves of it —
+					// quoteBounded on the registry-supplied digest, boundErr on ggcr's
+					// parser message. Wrapping again would only re-quote a quoted string.
 					return nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
 				}
 			}

@@ -75,6 +75,14 @@ func setWinsize(f *os.File, width, height uint16) error {
 }
 
 // ptyVoidIoctl issues a no-argument (_IO) pty ioctl on fd.
+//
+// RAW SYSCALL, per docs/GO-STANDARDS.md §Darwin/cgo: golang.org/x/sys/unix
+// defines the TIOCPTYGRANT and TIOCPTYUNLK request numbers but exposes no
+// wrapper for either, because its Ioctl* helpers are all typed by an argument
+// these two do not have — they are Darwin _IO requests (no data in, no data
+// out), so there is nothing for an IoctlSetInt/IoctlGetInt/IoctlSetWinsize
+// shape to carry. unix.Syscall with a zero third argument IS the call; a cgo
+// shim would add a build dependency and express exactly the same three words.
 func ptyVoidIoctl(fd int, req uint) error {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(req), 0); errno != 0 {
 		return errno
@@ -84,6 +92,18 @@ func ptyVoidIoctl(fd int, req uint) error {
 
 // ptySlaveName resolves the slave device path via TIOCPTYGNAME, which writes a
 // NUL-terminated path into a 128-byte buffer.
+//
+// RAW SYSCALL, per docs/GO-STANDARDS.md §Darwin/cgo: golang.org/x/sys/unix
+// defines TIOCPTYGNAME but wraps only the fixed-shape _IOR requests whose out
+// parameter it can type (a Winsize, a Termios, an int). TIOCPTYGNAME's out
+// parameter is a caller-supplied 128-byte char array that the kernel fills to a
+// VARIABLE length, terminated by a NUL the caller must find, so no typed
+// wrapper can exist for it and the buffer SIZE is the contract: ttycom.h spells
+// it _IOC(IOC_OUT, 't', 83, 128) rather than an _IOR over a Go-typeable struct,
+// so buf must stay exactly 128 bytes. Hence the unsafe.Pointer to buf[0] and the
+// explicit NUL scan below; the array is stack-allocated and its address is used
+// only for the duration of the call, which is unsafe.Pointer rule (4) — a
+// pointer converted to uintptr in a syscall argument — not a stored one.
 func ptySlaveName(fd int) (string, error) {
 	var buf [128]byte
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TIOCPTYGNAME), uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
