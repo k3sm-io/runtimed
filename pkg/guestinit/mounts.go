@@ -250,6 +250,104 @@ func readOnlyBind(step MountStep) []MountStep {
 	return []MountStep{step, remount}
 }
 
+// writableBind is readOnlyBind's mirror: it expands a WRITABLE bind into the
+// bind plus a remount that CLEARS MS_RDONLY.
+//
+// The inheritance runs both ways and only one direction was handled. A bind
+// inherits its source mount's writability, so a bind out of a READ-ONLY mount
+// comes up read-only however the plan describes it — and every default-medium
+// emptyDir is exactly that, a writable bind out of the deliberately read-only
+// pooled staging mount. The symptom was an init container reporting
+// "can't create /shared/from-init.txt: Read-only file system" while the host
+// device, the share plan and the guest spec all said writable.
+//
+// MS_REMOUNT|MS_BIND with no MS_RDONLY is the call that clears it, and it is a
+// no-op on a bind that was already writable — which is why this is emitted
+// whenever the source mount is read-only and never conditioned on a tag.
+func writableBind(step MountStep) []MountStep {
+	remount := MountStep{
+		Source:  step.Source,
+		Target:  step.Target,
+		Options: []MountOption{OptionBind, OptionRemount},
+		Why:     "remount: a bind inherits its source mount's MS_RDONLY and must be cleared explicitly",
+	}
+	return []MountStep{step, remount}
+}
+
+// perMountReadOnly makes a NON-bind mount read-only at the MOUNT rather than at
+// the superblock: it mounts writable and then remounts the mount point
+// read-only.
+//
+// The distinction is invisible in every other respect and load-bearing in one.
+// MS_RDONLY in a fresh mount(2) sets SB_RDONLY on the new SUPERBLOCK, and a
+// bind shares its source's superblock — so a writable bind out of such a mount
+// cannot be made writable at all. Worse, the attempt SUCCEEDS: Linux's
+// change_mount_ro_state clears the per-mount MNT_READONLY and returns 0 while
+// sb_rdonly() keeps every write returning EROFS, so the plan looks applied and
+// the container still cannot write.
+//
+// Mounting the stage writable and then remounting the mount point read-only
+// leaves the stage exactly as read-only as before through its own path — a
+// write to it still fails — while leaving the superblock writable so a bind out
+// of it can carry its own writability. It is applied ONLY to a mount some
+// writable bind sources from (see stagesAWritableBind); every other read-only
+// mount keeps SB_RDONLY, which is the stronger posture and the right one for
+// the rootfs lower layer and the spec share.
+func perMountReadOnly(step MountStep) []MountStep {
+	remount := MountStep{
+		Source:  step.Source,
+		Target:  step.Target,
+		Options: []MountOption{OptionBind, OptionRemount, OptionReadOnly},
+		Why:     "remount: read-only at the mount, not the superblock, so writable binds out of it stay writable",
+	}
+	return []MountStep{step, remount}
+}
+
+// mountPathUnder reports whether a bind source lies at or under a mount target.
+func mountPathUnder(source, target string) bool {
+	if source == target {
+		return true
+	}
+	return strings.HasPrefix(source, strings.TrimSuffix(target, "/")+"/")
+}
+
+// stagesAWritableBind reports whether mounts[i] is a mount some WRITABLE bind in
+// the same list sources from. That is the precise condition perMountReadOnly
+// exists for, and it is derived from the plan rather than from a tag: a pooled
+// share is the case today, and a PVC share staged the same way tomorrow would be
+// caught by the same predicate with no change here.
+func stagesAWritableBind(mounts []*guestv1.GuestMount, i int) bool {
+	target := mounts[i].GetTarget()
+	for j, m := range mounts {
+		if j == i || m == nil {
+			continue
+		}
+		if m.GetKind() != guestv1.GuestMountKind_GUEST_MOUNT_KIND_BIND || m.GetReadOnly() {
+			continue
+		}
+		if mountPathUnder(m.GetTagOrSource(), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// bindInheritsReadOnly reports whether mounts[i] is a bind whose source lies
+// under a READ-ONLY mount in the same list — the condition that makes a
+// writable bind come up read-only unless writableBind's remount clears it.
+func bindInheritsReadOnly(mounts []*guestv1.GuestMount, i int) bool {
+	source := mounts[i].GetTagOrSource()
+	for j, m := range mounts {
+		if j == i || m == nil || !m.GetReadOnly() {
+			continue
+		}
+		if mountPathUnder(source, m.GetTarget()) {
+			return true
+		}
+	}
+	return false
+}
+
 // validTarget rejects a mount target that is not an absolute, lexically clean
 // path. A "../" in a target would place a mount outside the tree the plan
 // believes it is composing.
@@ -325,7 +423,14 @@ func PodMounts(mounts []*guestv1.GuestMount, fsGroup int64) ([]MountStep, error)
 				ErrInvalidSpec, i, m.GetKind())
 		}
 		if m.GetReadOnly() {
-			out = append(out, readOnlyBindOrDirect(step)...)
+			out = append(out, readOnlyBindOrDirect(step, stagesAWritableBind(mounts, i))...)
+			continue
+		}
+		// A writable bind out of a read-only mount inherits read-only and needs an
+		// explicit remount to clear it; a writable bind out of a writable mount
+		// needs nothing, and gets nothing.
+		if step.FSType == "" && bindInheritsReadOnly(mounts, i) {
+			out = append(out, writableBind(step)...)
 			continue
 		}
 		out = append(out, step)
@@ -333,12 +438,20 @@ func PodMounts(mounts []*guestv1.GuestMount, fsGroup int64) ([]MountStep, error)
 	return out, nil
 }
 
-// readOnlyBindOrDirect applies read-only the way the mount kind requires: a
-// bind needs the separate remount call, everything else takes MS_RDONLY in the
-// original call.
-func readOnlyBindOrDirect(step MountStep) []MountStep {
+// readOnlyBindOrDirect applies read-only the way the mount kind requires.
+//
+// A bind needs the separate remount call (readOnlyBind). A fresh mount normally
+// takes MS_RDONLY directly, which is the stronger form — read-only at the
+// superblock — and is what the rootfs lower layer and the spec share want. The
+// exception is a mount that some writable bind sources from: SB_RDONLY there
+// would make that bind unwritable no matter what its own remount says, so it
+// takes the per-mount form instead (perMountReadOnly).
+func readOnlyBindOrDirect(step MountStep, stagesWritableBind bool) []MountStep {
 	if step.FSType == "" {
 		return readOnlyBind(step)
+	}
+	if stagesWritableBind {
+		return perMountReadOnly(step)
 	}
 	step.Options = append(step.Options, OptionReadOnly)
 	return []MountStep{step}
@@ -520,13 +633,22 @@ func containerVisibleMounts(name string, pod []MountStep) []MountStep {
 		readOnly bool
 	}
 	var ordered []rebase
-	seen := map[string]bool{}
+	at := map[string]int{} // target -> index into ordered
 	for _, m := range pod {
-		if seen[m.Target] {
+		ro := hasOption(m.Options, OptionReadOnly)
+		if i, seen := at[m.Target]; seen {
+			// A target contributes SEVERAL steps — a bind and its remount, a
+			// staged mount and the remount that makes it read-only — and the
+			// read-only verdict belongs to the pair, not to whichever step came
+			// first. Reading only the first step missed every bind whose
+			// read-only lives on its remount, and re-exposed a credential bind
+			// into each container with no explicit remount of its own, leaving it
+			// read-only by inheritance alone.
+			ordered[i].readOnly = ordered[i].readOnly || ro
 			continue
 		}
-		seen[m.Target] = true
-		ordered = append(ordered, rebase{target: m.Target, readOnly: hasOption(m.Options, OptionReadOnly)})
+		at[m.Target] = len(ordered)
+		ordered = append(ordered, rebase{target: m.Target, readOnly: ro})
 	}
 	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i].target) < len(ordered[j].target) })
 
