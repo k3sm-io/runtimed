@@ -28,7 +28,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// THE VM ORPHAN SWEEP, AND WHY IT IS NOT pkg/runtime's POD REAP.
+// the VM ORPHAN sweep, and why IT IS not pkg/runtime's POD REAP.
 //
 // A k3sm-vmhost helper is spawned POSIX_SPAWN_SETSID, so a daemon killed without
 // teardown (`kill -9`, a panic) leaves it reparented to launchd, still holding a
@@ -36,14 +36,14 @@ import (
 // shape as the orphaned host-process pod groups pkg/runtime's podreap handles,
 // and it is TEMPTING to reuse that decision function. Doing so would be a bug.
 //
-// THE POLICIES ARE OPPOSITES. podreap exists inside a promise that native pod
-// processes SURVIVE a daemon restart by design — `launchctl kickstart -k` must
+// the POLICIES are OPPOSITES. podreap exists inside a promise that native pod
+// processes survive a daemon restart by design — `launchctl kickstart -k` must
 // not kill the node's workloads — so it reaps only records whose pods are gone.
 // A vm pod's helper carries the opposite contract, stated in cmd/k3sm-vmhost's
-// own doc: "no VM outlives the binary that booted it". An orphaned helper CANNOT
+// own doc: "no VM outlives the binary that booted it". An orphaned helper cannot
 // be adopted — the daemon has no handle on its Process, no log pump, no reaper,
 // and no way to re-establish the readiness handshake — so the only correct action
-// is to kill it. ALWAYS KILL, NEVER ADOPT.
+// is to kill it. always KILL, never ADOPT.
 //
 // Sharing a decision function between two opposite policies would mean one
 // function with a mode flag, and the day someone "simplifies" the flag away, one
@@ -51,11 +51,11 @@ import (
 // survives a daemon restart unowned, or every host pod on the node is killed by a
 // restart. Two stores, two decisions, no shared mode.
 //
-// WHAT IS DELIBERATELY SHARED IS THE IDENTITY DISCIPLINE. A record authorizes a
+// what IS deliberately shared IS the IDENTITY DISCIPLINE. A record authorizes a
 // root SIGKILL of a process group, so it is matched exactly as podreap matches:
 // pgid > 1, the live GROUP is probed, the kill fires only when the LEADER member
 // (Pid == pgid, true only while the original SETSID leader lives) reports a start
-// time EXACTLY equal to the recorded one. XNU's p_starttime is an immutable fork
+// time exactly equal to the recorded one. XNU's p_starttime is an immutable fork
 // timestamp, so a recycled pgid always reports a different start and is dropped
 // unsignaled. Do not loosen that to a tolerance window.
 //
@@ -74,12 +74,12 @@ const VMReapSubdir = "vmreap"
 // under <work-dir>/vmreap/<pgid>.json before the boot is acknowledged and removed
 // once the helper's exit is observed.
 //
-// IT IS KEYED BY PGID, NOT BY POD ID, and the pod id is carried as a field for
-// logging only. A pod-id-derived FILENAME would be a third place in the daemon
+// It is keyed by pgid, not by pod id, and the pod id is carried as a field for
+// logging only. A pod-id-derived filename would be a third place in the daemon
 // that turns wire input into a path, and this one drives a root SIGKILL and a
 // recursive delete; a flat, integer-named store has no traversal question to get
 // wrong. The paths it carries were validated by the caller that created them and
-// are stored VERBATIM, so the sweep re-derives nothing.
+// are stored verbatim, so the sweep re-derives nothing.
 type vmProcRecord struct {
 	PodID string `json:"podId"`
 	// Pgid is the helper's process-group id (== its pid under SETSID).
@@ -115,7 +115,7 @@ func (b *VMBackend) vmReapRoot() string {
 
 // recordVMProc durably records a just-spawned helper.
 //
-// A WRITE FAILURE FAILS THE BOOT. An unrecorded helper is invisible to the
+// A write failure fails the boot. An unrecorded helper is invisible to the
 // startup sweep, which is the whole orphan class this file closes — so a pod that
 // cannot be recorded is a pod whose guest could outlive the daemon unnoticed, and
 // refusing it is the fail-closed answer. (A backend with no state root records
@@ -164,7 +164,7 @@ func (b *VMBackend) removeVMProcRecord(pgid int) {
 	_ = os.Remove(filepath.Join(root, strconv.Itoa(pgid)+".json"))
 }
 
-// retireVMProcRecord drops a record the SWEEP read, by the path it came from.
+// retireVMProcRecord drops a record the sweep read, by the path it came from.
 // See vmProcRecord.path for why the two removals differ.
 func (b *VMBackend) retireVMProcRecord(rec vmProcRecord) {
 	if rec.path != "" {
@@ -176,7 +176,7 @@ func (b *VMBackend) retireVMProcRecord(rec vmProcRecord) {
 
 // listVMProcRecords loads every durable helper record.
 //
-// It DEGRADES rather than fails: an absent store is the normal first-run case, a
+// It degrades rather than fails: an absent store is the normal first-run case, a
 // per-file read error retains the record for a later start to retry, and only a
 // structurally invalid file (bad JSON, pgid <= 1) is quarantined for removal.
 // Same posture as podreap's enumerator, for the same reason — an unreadable
@@ -223,18 +223,18 @@ func (b *VMBackend) listVMProcRecords() (records []vmProcRecord, quarantine []st
 //     kill(-1) (the POSIX broadcast) or kill(-0) (the caller's own group);
 //   - a zero-identity record (the helper died between spawn and probe) can never
 //     be proven ours, so it is dropped, never signalled;
-//   - a group that cannot be INSPECTED is KEPT for the next start to retry —
+//   - a group that cannot be INSPECTED is kept for the next start to retry —
 //     never blindly signalled, never dropped;
-//   - an EMPTY group is dropped: there is nothing left to kill;
+//   - an empty group is dropped: there is nothing left to kill;
 //   - a group whose LEADER member (Pid == pgid) reports the recorded start time
-//     EXACTLY is an orphaned helper of ours: KILLED. Unconditionally — a live
+//     exactly is an orphaned helper of ours: KILLED. Unconditionally — a live
 //     VM cannot be re-handshaked, so there is no adopt branch and must never be
 //     one (see the file header);
-//   - a leader whose start DIFFERS is a recycled pgid: dropped, NEVER signalled;
+//   - a leader whose start DIFFERS is a recycled pgid: dropped, never signalled;
 //   - a non-empty group with NO leader member (the helper exited, a descendant
 //     keeps the group alive) is keep-and-warn — we cannot prove the group is
 //     still ours, so killing risks a wrong-target root SIGKILL. This mirrors
-//     podreap's documented ceiling and, like it, must NOT be "recovered" into a
+//     podreap's documented ceiling and, like it, must not be "recovered" into a
 //     heuristic kill.
 //
 // kill, drop and keepWarn are disjoint; an inspection-failed record is in none.
@@ -284,13 +284,13 @@ func vmLeaderMember(members []supervisor.ProcMember, pgid int) (supervisor.ProcM
 // serves CreatePod.
 //
 // Kills are SIGKILL to the whole group with NO grace, and that is the honest
-// choice rather than a harsh one: the graceful path runs INSIDE the helper (ask
+// choice rather than a harsh one: the graceful path runs inside the helper (ask
 // the guest, wait its budget, halt), and an orphan's daemon-side supervisor is
 // long gone — there is nothing left to conduct a graceful stop, and SIGTERM to a
 // helper nobody is waiting on would just add its grace budget to the node's
 // startup before the kill happened anyway.
 //
-// It DEGRADES like podreap: an unreadable store alerts and skips rather than
+// It degrades like podreap: an unreadable store alerts and skips rather than
 // failing the daemon, because reaping is not a scheduling precondition and a
 // crash-looping node is far worse than a leaked helper. It always returns nil.
 func (b *VMBackend) ReapOrphanVMs() error {
@@ -305,7 +305,7 @@ func (b *VMBackend) ReapOrphanVMs() error {
 	for _, rec := range kill {
 		// Pre-signal re-probe, shrinking the decision->kill TOCTOU window to one
 		// syscall: between the decision and the signal the leader could exit and
-		// the pgid be recycled, and an ESRCH seen AFTER the signal cannot tell
+		// the pgid be recycled, and an ESRCH seen after the signal cannot tell
 		// "already gone" from "recycled to an unrelated group".
 		if !b.groupIsRecordedVMInstance(rec) {
 			b.logger().Warn("vm orphan sweep: skipping kill, the group no longer matches the recorded instance",
@@ -352,7 +352,7 @@ func (b *VMBackend) groupIsRecordedVMInstance(rec vmProcRecord) bool {
 
 // clearOrphanRunDir removes a retired record's private run dir.
 //
-// It is BOUNDED to the store's own state root rather than trusted from the
+// It is bounded to the store's own state root rather than trusted from the
 // record: the file is written by this daemon under a 0700 root, but it drives a
 // recursive delete, and a containment check costs one comparison. A record naming
 // anything outside <state-root>/run is ignored — the leak is preferable to the

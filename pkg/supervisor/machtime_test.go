@@ -70,7 +70,7 @@ func TestMachTimebaseNanos(t *testing.T) {
 			want:  0,
 		},
 		{
-			// Truncation must round DOWN, never up: the value is a monotone
+			// Truncation must round down, never up: the value is a monotone
 			// cumulative counter, and rounding up could make a later sample of an
 			// unchanged counter differ from an earlier one.
 			name:  "truncates toward zero",
@@ -93,7 +93,7 @@ func TestMachTimebaseNanos(t *testing.T) {
 			want:  math.MaxUint64,
 		},
 		{
-			// An unread timebase must NOT silently behave like 1/1 — that is the
+			// An unread timebase must not silently behave like 1/1 — that is the
 			// wrong answer everywhere except x86_64.
 			name:  "invalid timebase converts to zero, not the identity",
 			tb:    MachTimebase{Numer: 0, Denom: 0},

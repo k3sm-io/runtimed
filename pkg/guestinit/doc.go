@@ -20,13 +20,13 @@ limitations under the License.
 //
 // # Plans are data
 //
-// Every function in this package is PURE. It performs no syscall, opens no
+// Every function in this package is pure. It performs no syscall, opens no
 // file, and starts no process: it returns a plan — an ordered slice of steps,
 // a rendered file's content, a resolved identity — that the linux-only
 // executor in cmd/k3sm-guest-init applies. That split is deliberate and is the
 // package's reason to exist. The guest runs linux/arm64 inside a VM that this
 // repo cannot boot in a unit test, so any logic living in the executor is
-// reachable ONLY by a cross-compile check, which proves it compiles and
+// reachable only by a cross-compile check, which proves it compiles and
 // nothing else. Logic living here is exercised by `go test` on darwin, where
 // the repo's CI actually runs.
 //
@@ -42,7 +42,7 @@ limitations under the License.
 // Reaper is GOOS-portable behind a three-method Proc seam (Wait4 / Kill /
 // Poweroff) plus a SIGCHLD notification channel and an injectable timer, so
 // the reap loop, the exit-before-Track race, and the
-// TERM -> grace -> KILL -> sync -> poweroff sequence are all tested under
+// term -> grace -> KILL -> sync -> poweroff sequence are all tested under
 // -race on darwin. This is the most concurrency-sensitive code in the vm path
 // (it races container starts against the reap loop against the grace timer),
 // and it must not live untested inside a linux-only main.
@@ -60,7 +60,7 @@ limitations under the License.
 //   - guest/v1 carries no sidecar marker: GuestContainer has `init` and
 //     nothing else, so a native sidecar (an init container with
 //     restartPolicy: Always) cannot be distinguished from a run-to-completion
-//     init container here. StartOrder therefore plans EVERY init container as
+//     init container here. StartOrder therefore plans every init container as
 //     a blocking step, and a producer that emits a never-exiting sidecar as an
 //     init container would hang the boot. Until guest/v1 grows the marker, the
 //     host-side producer must emit such a container as a main container.
@@ -69,9 +69,9 @@ limitations under the License.
 //     resolved host-side and stamped into uid/gid. ResolveUser implements the
 //     in-guest resolution against a rootfs /etc/passwd and is wired for the
 //     numeric case the spec can express today.
-//   - An idmapped mount (GuestMount.idmap) is planned but NOT applied by the
+//   - An idmapped mount (GuestMount.idmap) is planned but not applied by the
 //     executor: mount_setattr(MOUNT_ATTR_IDMAP) is contingent on the M11.2-d5
-//     lab question. The executor REFUSES such a spec rather than mounting it
+//     lab question. The executor refuses such a spec rather than mounting it
 //     without the idmap, because a silently non-idmapped PVC writes files
 //     under the wrong owner into storage that outlives the pod.
 package guestinit

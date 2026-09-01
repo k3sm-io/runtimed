@@ -70,7 +70,7 @@ func TestMergeRunSpecFourQuadrants(t *testing.T) {
 	}
 
 	// An image with only a Cmd (no Entrypoint) is runnable — the shape most
-	// `FROM scratch`-less base images ship.
+	// `from scratch`-less base images ship.
 	t.Run("cmd_only_image", func(t *testing.T) {
 		got, err := MergeRunSpec(ImageRunConfig{Cmd: []string{"/bin/sh"}},
 			RunSpecRequest{Container: &runtimev1.Container{Name: "app"}})
@@ -82,7 +82,7 @@ func TestMergeRunSpecFourQuadrants(t *testing.T) {
 		}
 	})
 
-	// An image with a Cmd and a pod that supplies ARGS ONLY: the Cmd is
+	// An image with a Cmd and a pod that supplies ARGS only: the Cmd is
 	// discarded because args replace it, and with no Entrypoint the argv is the
 	// args alone.
 	t.Run("args_replace_cmd", func(t *testing.T) {
@@ -96,7 +96,7 @@ func TestMergeRunSpecFourQuadrants(t *testing.T) {
 		}
 	})
 
-	// Nothing on either side is a legible REFUSAL, not an empty argv handed to
+	// Nothing on either side is a legible refusal, not an empty argv handed to
 	// a spawn.
 	t.Run("nothing_to_run_is_refused", func(t *testing.T) {
 		_, err := MergeRunSpec(ImageRunConfig{}, RunSpecRequest{
@@ -139,7 +139,7 @@ func TestMergeRunSpecExpandsVars(t *testing.T) {
 		})
 	}
 
-	// Through the merge: the expansion sees the MERGED environment, so an
+	// Through the merge: the expansion sees the merged environment, so an
 	// image-supplied variable expands a pod-supplied argument.
 	t.Run("through_the_merge", func(t *testing.T) {
 		got, err := MergeRunSpec(
@@ -162,7 +162,7 @@ func TestMergeRunSpecExpandsVars(t *testing.T) {
 }
 
 // TestMergeRunSpecEnvAndWorkingDir pins the other two merged fields: the pod's
-// env overrides the image's BY NAME AND IN PLACE (image order is preserved), and
+// env overrides the image's BY NAME and IN place (image order is preserved), and
 // the pod's workingDir wins over the image's while an unset one falls through.
 func TestMergeRunSpecEnvAndWorkingDir(t *testing.T) {
 	cfg := ImageRunConfig{
@@ -300,8 +300,8 @@ func TestIsHostPathReference(t *testing.T) {
 	}
 }
 
-// TestUnpackPolicyFor pins the ONE producer of the layer dialect: it is derived
-// from the resolved sandbox backend, and it FAILS CLOSED on the zero value and
+// TestUnpackPolicyFor pins the one producer of the layer dialect: it is derived
+// from the resolved sandbox backend, and it FAILS closed on the zero value and
 // on anything unknown rather than defaulting to the native rules.
 func TestUnpackPolicyFor(t *testing.T) {
 	cases := []struct {
@@ -336,7 +336,7 @@ func TestUnpackPolicyFor(t *testing.T) {
 }
 
 // TestImageRunConfigReadsTheVerifiedConfig proves the run config comes from the
-// SAME verified config blob the diffIDs do — an unverified second read would put
+// same verified config blob the diffIDs do — an unverified second read would put
 // a registry-supplied Entrypoint into argv with no digest behind it.
 func TestImageRunConfigReadsTheVerifiedConfig(t *testing.T) {
 	c, u := newTestUnpacker(t)
@@ -366,7 +366,7 @@ func TestImageRunConfigReadsTheVerifiedConfig(t *testing.T) {
 		t.Errorf("ImageRunConfig = %+v, want the image's own declarations", got)
 	}
 
-	// A config blob that no longer hashes to its descriptor is REFUSED, so the
+	// A config blob that no longer hashes to its descriptor is refused, so the
 	// run config can never come from unverified bytes.
 	t.Run("corrupted_config_is_refused", func(t *testing.T) {
 		p, err := c.BlobPath(mfst.GetConfig().GetDigest())

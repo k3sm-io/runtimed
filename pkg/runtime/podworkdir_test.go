@@ -31,7 +31,7 @@ import (
 // is, so the DEFAULT is pinned here.
 //
 // The rule: the pod's working_dir wins, else the image config's
-// (image.MergeRunSpec), else THE POD DATA VOLUME — never "" , which the spawner
+// (image.MergeRunSpec), else the POD DATA VOLUME — never "" , which the spawner
 // reads as "inherit the daemon's cwd" and which the pod's own SBPL profile
 // denies. Red before B202 on every row: Dir reached the spawner unset or
 // unconsumed and every pod ran in the daemon's cwd.
@@ -98,7 +98,7 @@ func TestPodLaunchDefaultsWorkingDirToDataVolume(t *testing.T) {
 
 	// The image config's own WorkingDir reaches the seam when the pod sets none —
 	// the merge (image.MergeRunSpec) already resolved that precedence, and the
-	// point of this row is that the default does NOT overwrite it.
+	// point of this row is that the default does not overwrite it.
 	t.Run("pulled image, image WorkingDir set: honored over the default", func(t *testing.T) {
 		sp := &fakeSpawner{}
 		w := newBlockingWaiter()

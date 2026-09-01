@@ -20,9 +20,9 @@ package sandbox
 
 import "context"
 
-// hostRosettaProbe is the OFF-DARWIN host-Rosetta probe: Rosetta 2 is a macOS
+// hostRosettaProbe is the off-DARWIN host-Rosetta probe: Rosetta 2 is a macOS
 // translation runtime, so on every other OS the answer is definitionally
 // HostRosettaAbsent. The split is by GOOS alone (not cgo) — the darwin
-// implementation is pure Go, so the CGO_ENABLED=0 darwin lane gets the REAL probe
+// implementation is pure Go, so the CGO_ENABLED=0 darwin lane gets the real probe
 // rather than this stub.
 func hostRosettaProbe(_ context.Context) HostRosettaState { return HostRosettaAbsent }

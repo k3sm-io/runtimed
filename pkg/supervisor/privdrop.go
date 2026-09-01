@@ -30,18 +30,18 @@ import (
 // profile is applied and the pod binary is exec'd (M2.3 securityContext).
 //
 // The drop is performed in the exec-shim — a fresh, single-purpose process the
-// supervisor posix_spawns — and NEVER in the multi-threaded daemon: setgid /
+// supervisor posix_spawns — and never in the multi-threaded daemon: setgid /
 // setuid are process-wide and irreversible, so they must run in a process that
 // does nothing afterwards except apply the sandbox and execve the pod.
 //
 // Drop reports whether a drop is requested at all. It is a separate bool because
 // the proto's int64 run_as_* fields cannot distinguish "unset" from 0 (0 == root,
 // which is also a no-op for a root daemon); the provider resolves the effective
-// identity and sets Drop only for a non-root target. A drop REQUIRES root —
+// identity and sets Drop only for a non-root target. A drop requires root —
 // setuid/setgid to another identity is privileged — so on the unprivileged _k3sm
-// daemon Drop MUST be false (Validate enforces this). When Drop is false the pod
-// runs at the daemon's OWN uid confined by Seatbelt: on today's user-space daemon
-// that is _k3sm-in-Seatbelt, NOT root. There is no per-pod uid isolation in this
+// daemon Drop must be false (Validate enforces this). When Drop is false the pod
+// runs at the daemon's own uid confined by Seatbelt: on today's user-space daemon
+// that is _k3sm-in-Seatbelt, not root. There is no per-pod uid isolation in this
 // posture (the documented residual limitation — untrusted tenancy routes to the
 // vm backend).
 type Credential struct {
@@ -62,7 +62,7 @@ type Credential struct {
 
 // ErrDropRequiresRoot reports a requested privilege drop (Credential.Drop) on a
 // non-root process. setuid/setgid to another identity is privileged, so a drop
-// is only possible as root (euid 0). On the unprivileged _k3sm daemon Drop MUST
+// is only possible as root (euid 0). On the unprivileged _k3sm daemon Drop must
 // be false — the supervisor runs pods at its own uid, confined by Seatbelt —
 // rather than silently leaving a pod at the wrong identity or attempting a
 // setuid that can only fail.
@@ -156,7 +156,7 @@ const (
 	StepSetuid
 	// StepSetpriority places the process in the darwin BACKGROUND band
 	// (setpriority(2) with PRIO_DARWIN_PROCESS/PRIO_DARWIN_BG) when the pod's
-	// QoS class maps to background. It runs BEFORE StepSandboxApply — a
+	// QoS class maps to background. It runs before StepSandboxApply — a
 	// default-deny SBPL may deny setpriority afterward — and pre-exec, so the
 	// band is inherited by the exec'd image and all its descendants, race-free.
 	StepSetpriority
@@ -190,7 +190,7 @@ func (s LaunchStep) String() string {
 
 // PlannedRlimit is one resolved POSIX resource limit ready for setrlimit(2): the
 // darwin RLIMIT_* resource selector plus the soft (Cur) / hard (Max) pair as a
-// unix.Rlimit. The daemon resolves a []PlannedRlimit from a pod's EXPLICIT
+// unix.Rlimit. The daemon resolves a []PlannedRlimit from a pod's explicit
 // PodBox.rlimits[] (runtime.resolveRlimitPlan) and RunLaunchSequence applies the
 // slice — before the privilege drop — through the LaunchSeam. It is the resolved,
 // proto-free plan, so the supervisor stays decoupled from apis (mirroring how
@@ -210,7 +210,7 @@ type PlannedRlimit struct {
 // SandboxApply via libsandbox cgo, Exec via execve).
 type LaunchSeam interface {
 	// Setrlimit applies one POSIX resource limit (setrlimit(2)) to the current
-	// process. Called BEFORE the uid drop, while euid is still privileged, so a
+	// process. Called before the uid drop, while euid is still privileged, so a
 	// hard-limit raise is permitted.
 	Setrlimit(resource int, lim unix.Rlimit) error
 	// Getrlimit reads the current/inherited limit for resource (getrlimit(2)) — the
@@ -235,7 +235,7 @@ type LaunchSeam interface {
 	Exec() error
 }
 
-// RunLaunchSequence drives seam through the SECURITY-CRITICAL, irreversible pod
+// RunLaunchSequence drives seam through the SECURITY-critical, irreversible pod
 // launch order (M2.3, B7). spec is the resolved LaunchSpec (identity + rlimit
 // plan + qos); euid is the effective uid the sequence runs under (the
 // exec-shim's, == the daemon's); it gates the drop. The ordering is load-bearing
@@ -256,20 +256,20 @@ type LaunchSeam interface {
 //	    with the non-root EPERM retry-clamp kept as defense-in-depth; the plan
 //	    applies even when Drop is false (the unprivileged posture still gets
 //	    its explicit limits);
-//	  - setgid BEFORE setuid: after setuid drops to a non-root uid the process can
+//	  - setgid before setuid: after setuid drops to a non-root uid the process can
 //	    no longer change its gid, so the gid must be set while still privileged;
 //	  - initgroups (supplemental groups, incl. fsGroup) BETWEEN them — also a
 //	    privileged operation;
-//	  - the whole drop BEFORE SandboxApply: the Seatbelt sandbox is IRREVERSIBLE
+//	  - the whole drop before SandboxApply: the Seatbelt sandbox is IRREVERSIBLE
 //	    and a sandboxed (and uid-dropped) process can neither setuid nor chown, so
 //	    the drop and any root-side setup must complete first;
-//	  - the qos step BEFORE SandboxApply: a default-deny SBPL may deny the
+//	  - the qos step before SandboxApply: a default-deny SBPL may deny the
 //	    setpriority syscall after confinement; and pre-exec, so the background
 //	    band is inherited by the exec'd image and all descendants, race-free
 //	    (lowering one's own priority needs no privilege, so it runs after the
 //	    drop). BgQoS=false means NO call at all (downward-only — the default
 //	    band is the absence of the call, never an explicit reset-to-0);
-//	  - SandboxApply BEFORE Exec: the pod binary must start already confined.
+//	  - SandboxApply before Exec: the pod binary must start already confined.
 //
 // It returns the steps executed (for assertions) and stops at the FIRST error —
 // fail-closed: a refused/failed drop or failed sandbox apply means Exec is never
@@ -326,7 +326,7 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 // nofileOpenMax is the darwin OPEN_MAX-equivalent ceiling (<sys/syslimits.h>
 // OPEN_MAX = 10240) an infinite/oversized soft RLIMIT_NOFILE is clamped down to
 // before setrlimit(2). Darwin's setrlimit(2) man page COMPATIBILITY section is
-// explicit that, unlike other resources, RLIMIT_NOFILE does NOT accept
+// explicit that, unlike other resources, RLIMIT_NOFILE does not accept
 // rlim_cur = RLIM_INFINITY: "setrlimit() now returns with errno set to EINVAL
 // in places that historically succeeded. It no longer accepts
 // 'rlim_cur = RLIM_INFINITY' for RLIM_NOFILE. Use 'rlim_cur = min(OPEN_MAX,
@@ -338,7 +338,7 @@ const nofileOpenMax = 10240
 // (clamping a tighter request UP, with a warning). A too-tight soft NOFILE does
 // not fail the launch cleanly — it starves sandbox_compile's profile read and
 // the exec'd image's dyld (plus the DYLD-inserted darwin-net DNS shim) of
-// descriptors AFTER confinement, producing a misleading in-sandbox error far
+// descriptors after confinement, producing a misleading in-sandbox error far
 // from the cause. 256 is a conservative pick (the historical darwin default
 // soft limit); the B7 lab remainder (the dyld-vs-tight-NOFILE floor
 // measurement) confirms sufficiency on hardware.
@@ -347,7 +347,7 @@ const minNOFILESoft = 256
 // normalizeNOFILE applies the darwin RLIMIT_NOFILE taxonomy to one requested
 // soft/hard pair, pure-arithmetically (unit-tested with exact values):
 //
-//  1. CEILING: an infinite or oversized Cur is clamped DOWN to
+//  1. ceiling: an infinite or oversized Cur is clamped down to
 //     min(nofileOpenMax, Max) — the darwin man-page formula — so the syscall is
 //     not EINVAL-aborted (see nofileOpenMax);
 //  2. FLOOR: Cur (and, if needed, Max) is then raised UP to minNOFILESoft so the
@@ -372,12 +372,12 @@ func normalizeNOFILE(lim unix.Rlimit) unix.Rlimit {
 }
 
 // setrlimitClamped applies one planned rlimit, never letting a POD-SOURCED plan
-// RAISE the process's limits above its inherited posture:
+// raise the process's limits above its inherited posture:
 //
 //  1. RLIMIT_NOFILE first goes through normalizeNOFILE: the darwin EINVAL
-//     ceiling (infinite soft is NOT clamped by the kernel — the launch would
+//     ceiling (infinite soft is not clamped by the kernel — the launch would
 //     abort) and the minNOFILESoft floor;
-//  2. the requested hard (and, transitively, soft) limit is then clamped DOWN
+//  2. the requested hard (and, transitively, soft) limit is then clamped down
 //     to the shim's own inherited hard limit (getrlimit(2)) UNCONDITIONALLY —
 //     regardless of euid. This is a SECURITY clamp, not just EPERM avoidance:
 //     in the root-daemon posture a euid-0 setrlimit may legally raise hard

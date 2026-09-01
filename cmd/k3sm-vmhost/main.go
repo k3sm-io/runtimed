@@ -16,15 +16,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command k3sm-vmhost builds and runs ONE vm-backend pod's Linux micro-VM.
+// Command k3sm-vmhost builds and runs one vm-backend pod's Linux micro-VM.
 //
-// IT IS THE ONLY k3sm BINARY CARRYING com.apple.security.virtualization
+// IT IS the only k3sm BINARY CARRYING com.apple.security.virtualization
 // (vmhost.entitlements). That is the whole reason it is a separate process: the
 //
 // # The entitlement set, and why it is exactly one key
 //
 // vmhost.entitlements grants com.apple.security.virtualization and nothing else.
-// That file is deliberately COMMENT-FREE, and the rationale lives here instead:
+// That file is deliberately COMMENT-free, and the rationale lives here instead:
 // codesign parses entitlements with AMFI's XML reader, which is stricter than
 // plutil and REJECTS an XML comment. A commented plist lints clean under
 // `plutil -lint`, then fails at signing with "AMFIUnserializeXML: syntax error"
@@ -33,7 +33,7 @@ limitations under the License.
 // VMBackend.Available() would simply report false on a perfectly capable Mac.
 // Keep the plist minimal; document here.
 //
-// Deliberately NOT granted, each for its own reason:
+// Deliberately not granted, each for its own reason:
 //
 //   - com.apple.security.cs.allow-jit, allow-unsigned-executable-memory,
 //     disable-executable-page-protection — the code-running trio. The hypervisor
@@ -116,7 +116,7 @@ func run(log *slog.Logger) error {
 		return errors.New("both --spec and --agent-socket are required")
 	}
 
-	// PREFLIGHT, BEFORE ANY FRAMEWORK CALL. Constructing a VZVirtualMachine
+	// PREFLIGHT, before any FRAMEWORK call. Constructing a VZVirtualMachine
 	// without the entitlement raises an uncaught NSException → SIGABRT, so an
 	// unentitled helper would die with a crash report and no explanation. Checking
 	// the signature first turns that into one line an operator can act on.
@@ -161,7 +161,7 @@ func run(log *slog.Logger) error {
 	proxied := make(chan error, 1)
 	go func() { proxied <- proxy.Serve(ctx) }()
 
-	// ONE GRACE BUDGET, ISSUED BY THE DAEMON. The pod's
+	// one GRACE budget, ISSUED BY the DAEMON. The pod's
 	// terminationGracePeriodSeconds is a promise made to the workload, and the
 	// daemon is the only process that knows it — so it is threaded in here rather
 	// than defaulted twice. Without this flag the helper would run its own
@@ -177,7 +177,7 @@ func run(log *slog.Logger) error {
 	})
 	runErr := lc.Run(ctx)
 
-	// The proxy is drained BEFORE returning: its Serve returns only once every
+	// The proxy is drained before returning: its Serve returns only once every
 	// relay goroutine has finished, so waiting here is what makes "this process is
 	// about to exit" also mean "nothing is still holding a connection into the
 	// machine that was just halted".
@@ -214,7 +214,7 @@ func defaultOptions(specPath, consoleLog string) vmhost.Options {
 
 // listenAgentSocket creates the runtimed-private unix socket the daemon dials.
 //
-// A STALE SOCKET IS REMOVED FIRST. The helper dies with the daemon, and a SIGKILL
+// A stale socket is removed first. The helper dies with the daemon, and a SIGKILL
 // leaves the socket file behind; without the unlink the next pod with the same id
 // would fail to bind for a reason that has nothing to do with it.
 func listenAgentSocket(path string) (net.Listener, error) {
@@ -228,7 +228,7 @@ func listenAgentSocket(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on the agent socket %s: %w", path, err)
 	}
-	// Chmod AFTER bind: the socket file does not exist until then, and the umask
+	// Chmod after bind: the socket file does not exist until then, and the umask
 	// that applied at bind is not this process's to assume.
 	if err := os.Chmod(path, agentSocketMode); err != nil {
 		_ = lis.Close()

@@ -36,10 +36,10 @@ const ExecShimName = "k3sm-execshim"
 // ErrShimNotFound reports that the k3sm-execshim helper could not be located.
 var ErrShimNotFound = errors.New("sandbox: k3sm-execshim helper not found")
 
-// ExecShimBackend confines pods with a NON-PLATFORM exec-shim: it spawns the
+// ExecShimBackend confines pods with a non-PLATFORM exec-shim: it spawns the
 // ad-hoc-signed k3sm-execshim helper, which compiles+applies the per-pod SBPL
 // via libsandbox and then execve(pod, argv, envp). Because the shim is an
-// ordinary ad-hoc-signed binary (NOT a platform binary) and the supervisor
+// ordinary ad-hoc-signed binary (not a platform binary) and the supervisor
 // passes envp through, DYLD_INSERT_LIBRARIES survives into the pod — the
 // cross-repo DNS-shim enabler that /usr/bin/sandbox-exec would break.
 //
@@ -86,7 +86,7 @@ func NewExecShimBackend(shimPath, profileDir string) (*ExecShimBackend, error) {
 // ExecShimBackendName identifies the host-process Seatbelt rung in
 // logging/diagnostics. It is an exported const rather than a literal inside Name
 // because a capability decision keys on it: SandboxGPUSupported reports
-// GPUFacts.sandbox_gpu_supported only for THIS rung (it is the only backend whose
+// GPUFacts.sandbox_gpu_supported only for this rung (it is the only backend whose
 // generated profile carries the Metal allow-set), and a drifted second spelling
 // would silently make that advertisement false on a perfectly capable node.
 const ExecShimBackendName = "seatbelt-execshim"
@@ -96,7 +96,7 @@ func (b *ExecShimBackend) Name() string { return ExecShimBackendName }
 
 // Available reports whether the exec-shim backend can confine pods: the host
 // must be darwin at or above the gated minimum macOS major version and the shim
-// helper must exist. A false return means the runtime MUST refuse the pod.
+// helper must exist. A false return means the runtime must refuse the pod.
 func (b *ExecShimBackend) Available() bool {
 	if runtime.GOOS != "darwin" {
 		return false
@@ -123,7 +123,7 @@ func (b *ExecShimBackend) Available() bool {
 // identity to drop to, and the rlimit + qos tokens (supervisor.EncodeRlimits /
 // EncodeQoS, "-" sentinels when empty) carry the resolved numeric setrlimit(2)
 // plan and the darwin background-QoS decision. The two launch-spec tokens sit
-// BEFORE the profile path so binary skew fails closed: an old shim reads the
+// before the profile path so binary skew fails closed: an old shim reads the
 // rlimit token as its profile path and aborts on the ReadFile. The spawned shim
 // applies the limits, drops to the credential, backgrounds itself if requested,
 // applies profile to itself, and execs pod with args — in that irreversible

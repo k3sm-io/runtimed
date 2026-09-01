@@ -47,7 +47,7 @@ func TestCPUAccumulatorMonotone(t *testing.T) {
 		{"main", 101, 300, 1800, "the new process accumulates on top of the carry"},
 		{"main", 102, 0, 1800, "a second restart at zero still cannot go backwards"},
 		{"main", 102, 7, 1807, "and resumes from the carry"},
-		// A raw reading that came back smaller WITHIN one pid is not trusted.
+		// A raw reading that came back smaller within one pid is not trusted.
 		{"main", 102, 3, 1807, "a backwards reading for the same pid is ignored"},
 	}
 	var a cpuAccumulator
@@ -84,7 +84,7 @@ func TestCPUAccumulatorPerContainer(t *testing.T) {
 }
 
 // TestCPUAccumulatorUnseenIsNotZero pins the distinction the metrics builder
-// depends on: a container never observed reports ok=false, NOT a zero. A zero is
+// depends on: a container never observed reports ok=false, not a zero. A zero is
 // indistinguishable from "idle" to the consumer, so returning one would publish an
 // incomplete sample where the contract is to withhold the pod entirely.
 func TestCPUAccumulatorUnseenIsNotZero(t *testing.T) {
@@ -123,7 +123,7 @@ func TestCPUAccumulatorConcurrent(t *testing.T) {
 }
 
 // TestCPUAccumulatorSumIncludesRetiredContainers pins the pod-level counter's
-// monotonicity: the pod total sums EVERY container observed, including one that
+// monotonicity: the pod total sums every container observed, including one that
 // has since terminated and left the live set. Summing only live containers would
 // make the pod's cumulative CPU FALL the moment a container exited, which a
 // counter may not do and the consumer rejects.

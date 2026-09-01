@@ -29,10 +29,10 @@ import (
 const vzModulePrefix = "github.com/Code-Hex/vz"
 
 // TestVZIsNotReachableFromTheDaemon asserts the import boundary the entitlement
-// split rests on: github.com/Code-Hex/vz must be reachable ONLY from pkg/vmhost
+// split rests on: github.com/Code-Hex/vz must be reachable only from pkg/vmhost
 // and cmd/k3sm-vmhost, never from any package the k3sm daemon links.
 //
-// THE SPLIT IS ONLY REAL IF THIS HOLDS. k3sm-vmhost is the one binary carrying
+// the split IS only real IF this HOLDS. k3sm-vmhost is the one binary carrying
 // com.apple.security.virtualization precisely so that the daemon — which parses
 // tenant images, serves a gRPC socket and talks to the provider — holds no
 // virtualization authority. An import that dragged the Virtualization-linking
@@ -40,7 +40,7 @@ const vzModulePrefix = "github.com/Code-Hex/vz"
 // daemon's address space, and the separation would survive only as a claim in a
 // doc comment.
 //
-// It runs here rather than in a shell script so it FIRES IN THE PR THAT ADDS THE
+// It runs here rather than in a shell script so it FIRES IN the PR that ADDS the
 // BAD IMPORT — under `go test ./...`, on the author's machine, before review —
 // rather than one repo downstream when someone notices the daemon linking
 // Virtualization.
@@ -78,7 +78,7 @@ func TestVZIsNotReachableFromTheDaemon(t *testing.T) {
 	}
 
 	// The converse, so a passing suite cannot mean "vz was removed entirely":
-	// the two packages that ARE allowed to reach it must still do so.
+	// the two packages that are allowed to reach it must still do so.
 	t.Run("the-helper-still-reaches-it", func(t *testing.T) {
 		found := false
 		for _, dep := range deps(t, "k3sm.io/runtimed/pkg/vmhost") {
@@ -94,7 +94,7 @@ func TestVZIsNotReachableFromTheDaemon(t *testing.T) {
 	})
 }
 
-// deps returns the transitive import list of pkg, for the CURRENT build lane —
+// deps returns the transitive import list of pkg, for the current build lane —
 // which is what makes the assertion meaningful: the vz import sits behind
 // `darwin && cgo`, so the lane that could pull it in is the lane that must be
 // checked.

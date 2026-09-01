@@ -28,10 +28,10 @@ type SpawnSpec struct {
 	Path string
 	// Argv is the full argument vector (Argv[0] is conventionally Path).
 	Argv []string
-	// Env is the child environment. It MUST already contain any
+	// Env is the child environment. It must already contain any
 	// DYLD_INSERT_LIBRARIES the pod needs; the spawner passes it through verbatim.
 	Env []string
-	// Dir is the child working directory: an ABSOLUTE path the child chdirs
+	// Dir is the child working directory: an absolute path the child chdirs
 	// into before exec (a posix_spawn chdir file action, never a chdir of this
 	// shared daemon process). "" means "inherit the caller's cwd".
 	//
@@ -71,7 +71,7 @@ type PodNetwork interface {
 
 // ExitWaiter blocks until the process pid exits and returns its wait status,
 // reaping it exactly once. The production implementation uses kqueue
-// (reaper_darwin.go); it is the SOLE reaper (never combined with Cmd.Wait).
+// (reaper_darwin.go); it is the sole reaper (never combined with Cmd.Wait).
 type ExitWaiter interface {
 	// WaitExit blocks until pid exits (or ctx is done) and returns the exit
 	// code and terminating signal (signal 0 if none). It reaps pid once.

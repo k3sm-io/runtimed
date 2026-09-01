@@ -41,7 +41,7 @@ import (
 // replaced.
 //
 // bootedPod is the single pod this guest "booted": a request naming any other
-// pod is REJECTED, as guest.proto requires.
+// pod is rejected, as guest.proto requires.
 type guestStatsAgent struct {
 	guestv1.UnimplementedGuestAgentServer
 
@@ -134,7 +134,7 @@ func containerStatusByName(st *runtimev1.PodStatus) map[string]*runtimev1.Contai
 // --- the B107 gate --------------------------------------------------------
 
 // TestVMPodStatsFromGuestAgentNotRusage is the B107 gate: the vm-pod METERING
-// and KILL-REASON fork, asserted in four parts.
+// and KILL-reason fork, asserted in four parts.
 //
 // It lives in pkg/runtime, not pkg/supervisor, because that is where the fork
 // actually is: pkg/supervisor owns the proc_pid_rusage sampler mechanism and has
@@ -142,16 +142,16 @@ func containerStatusByName(st *runtimev1.PodStatus) map[string]*runtimev1.Contai
 // numbers" is taken by pkg/runtime's ListPodStats/podStats over the pod's
 // RESOLVED backend. The BACKLOG-named test name is kept.
 //
-//  1. SOURCE FORK — a vm pod's working set and CPU come from the guest agent's
-//     cgroup2 Stats verb, ON DEMAND at ListPodStats, and the host rusage seam is
+//  1. source FORK — a vm pod's working set and CPU come from the guest agent's
+//     cgroup2 Stats verb, ON demand at ListPodStats, and the host rusage seam is
 //     never consulted for it.
 //  2. NO TICKER — arming a vm pod registers NO host memory sampler at all (the
 //     negative assertion, with a live host pod as the positive control proving
 //     the arming machinery is running in this very test).
-//  3. UNREACHABLE — an agent that cannot be dialled OMITS that pod from the
+//  3. UNREACHABLE — an agent that cannot be dialled omits that pod from the
 //     stats response and says so in a pod condition; it never reports zeros.
-//  4. KILL-REASON FORK — the host sampler's over-limit path can NEVER mark a vm
-//     pod OOMKilled, and an agent ContainerEvents exited{oom} CAN.
+//  4. KILL-reason FORK — the host sampler's over-limit path can never mark a vm
+//     pod OOMKilled, and an agent ContainerEvents exited{oom} can.
 func TestVMPodStatsFromGuestAgentNotRusage(t *testing.T) {
 	t.Run("1-source-fork-guest-cgroup2-not-host-rusage", func(t *testing.T) {
 		agent := &guestStatsAgent{
@@ -181,12 +181,12 @@ func TestVMPodStatsFromGuestAgentNotRusage(t *testing.T) {
 			t.Fatalf("vm pod missing from ListPodStats: %+v", resp.GetPodStats())
 		}
 
-		// The host rusage seam is the WRONG kernel for a vm pod: it would meter the
+		// The host rusage seam is the wrong kernel for a vm pod: it would meter the
 		// vmhost helper, not the workload. It must not have been touched at all.
 		if n := int(fp.samples.Load()); n != 0 {
 			t.Errorf("proc_pid_rusage seam consulted %d times for a vm pod, want 0 (rusage is not guest truth)", n)
 		}
-		// …and the agent's Stats verb must have been asked, on demand, for THIS pod.
+		// …and the agent's Stats verb must have been asked, on demand, for this pod.
 		reqs := agent.statsRequests()
 		if len(reqs) != 1 {
 			t.Fatalf("guest Stats calls = %d, want exactly 1 (on demand at ListPodStats)", len(reqs))
@@ -223,7 +223,7 @@ func TestVMPodStatsFromGuestAgentNotRusage(t *testing.T) {
 		if got := ps.GetCpu().GetUsageCoreNanoSeconds(); got != 4_000_000 {
 			t.Errorf("pod usage_core_nano_seconds = %d, want 4000000", got)
 		}
-		// A reachable agent flips the condition TRUE, so `kubectl describe` can tell
+		// A reachable agent flips the condition true, so `kubectl describe` can tell
 		// "metered" from "never asked".
 		cond := podCondition(rt.podStatus(vm), GuestStatsConditionType)
 		if cond.GetStatus() != runtimev1.ConditionStatus_CONDITION_STATUS_TRUE {
@@ -240,7 +240,7 @@ func TestVMPodStatsFromGuestAgentNotRusage(t *testing.T) {
 		rt.cfg.SampleInterval = 5 * time.Millisecond // ~200 Hz: a tick is immediate
 		rt.signalGroup = (&recordingSignalGroup{}).signal
 
-		// POSITIVE CONTROL: a host-process pod on the SAME runtime, armed by the
+		// positive CONTROL: a host-process pod on the same runtime, armed by the
 		// same call. Without it "no ticks were observed" could just mean the test
 		// never waited long enough for any sampler to run.
 		mustCreatePod(t, rt, hostBinBox(rt, "pod-host"))

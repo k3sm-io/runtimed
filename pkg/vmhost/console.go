@@ -29,7 +29,7 @@ const consoleTruncationNotice = "\n[k3sm-vmhost] console log truncated: the size
 // CappedWriter relays a guest's console output to w until Max bytes have been
 // written, then discards the rest after appending a one-line truncation notice.
 //
-// IT NEVER REPORTS SHORT WRITES OR ERRORS FOR DISCARDED BYTES. Write returns
+// It never reports short writes or errors for discarded bytes. Write returns
 // len(p), nil once capped, because the caller is an io.Copy pump draining the
 // console pipe: a short write there is an error that stops the pump, the pipe then
 // fills, and a guest blocked writing to its console is a guest that has stopped

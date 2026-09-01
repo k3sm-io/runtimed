@@ -51,7 +51,7 @@ type ImageRunConfig struct {
 	Env []string
 	// WorkingDir is the image's declared working directory.
 	WorkingDir string
-	// User is the image's USER directive, VERBATIM and unparsed: "1000",
+	// User is the image's USER directive, verbatim and unparsed: "1000",
 	// "1000:1000", "nobody", "nobody:nogroup", or empty. It is not resolved
 	// here — resolving a NAME requires the image's own /etc/passwd, which is a
 	// file inside the unpacked tree, so resolution belongs to whoever has that
@@ -64,7 +64,7 @@ type ImageRunConfig struct {
 type RunSpec struct {
 	// Argv is the merged argument vector. Argv[0] is the program as the merge
 	// produced it — a bare name, a relative path, or an absolute one — and is
-	// NOT resolved against any rootfs here: which root it is resolved against is
+	// not resolved against any rootfs here: which root it is resolved against is
 	// the spine's decision (a native pod has no root; a guest chroots), and this
 	// package must not pick one.
 	Argv []string
@@ -76,12 +76,12 @@ type RunSpec struct {
 	// empty (meaning "the spine's default").
 	WorkingDir string
 	// User is the image's USER directive verbatim (see ImageRunConfig.User),
-	// carried so a guest that CAN resolve a name has the string to resolve. It
+	// carried so a guest that can resolve a name has the string to resolve. It
 	// is empty when the image declares none.
 	User string
 	// UID is the numeric uid to run as, and HasUID reports whether one was
 	// determined at all. It is the pod's resolved runAsUser when that is set,
-	// else the image's USER when that is NUMERIC, else undetermined — a
+	// else the image's USER when that is numeric, else undetermined — a
 	// non-numeric image USER never becomes a uid here.
 	UID    int64
 	HasUID bool
@@ -99,7 +99,7 @@ type RunSpecRequest struct {
 	// WorkingDir are the pod half of the merge.
 	Container *runtimev1.Container
 	// RunAsUID is the uid the caller resolved from the securityContext chain.
-	// ZERO MEANS UNSPECIFIED: the proto's run_as_user is a plain int64 with no
+	// zero MEANS UNSPECIFIED: the proto's run_as_user is a plain int64 with no
 	// presence, so "unset" and "explicitly root" are the same wire value — the
 	// same reading pkg/runtime.resolveCredential already applies, and the two
 	// readings must agree or a pod would drop to a uid this merge did not
@@ -122,15 +122,15 @@ type RunSpecRequest struct {
 //	set         | set      | pod command + pod args
 //
 // The asymmetry in row 3 is the one people get wrong and it is deliberate
-// upstream: a pod command REPLACES the entrypoint AND discards the image's Cmd,
+// upstream: a pod command replaces the entrypoint and discards the image's Cmd,
 // because the image's Cmd is arguments to the entrypoint the pod just replaced.
 // Carrying it over would silently pass one program's arguments to another.
 //
 // # $(VAR) expansion
 //
-// Every element of the merged argv is expanded against the MERGED environment
+// Every element of the merged argv is expanded against the merged environment
 // using upstream's syntax: "$(NAME)" is replaced, "$$" is a literal "$", and a
-// reference to a name the environment does not define is left EXACTLY AS
+// reference to a name the environment does not define is left exactly AS
 // WRITTEN. The last rule is what makes it safe to run a shell command
 // containing "$(date)" as an argument: an undefined reference is data, never an
 // error and never an empty string.
@@ -142,9 +142,9 @@ type RunSpecRequest struct {
 //   - runAsNonRoot unset/false — no check.
 //   - runAsUser set (non-zero, see RunSpecRequest.RunAsUID) — allowed; a
 //     non-zero uid is by definition not root.
-//   - runAsUser unset, image USER numeric 0 — REFUSED ("the image will run as
+//   - runAsUser unset, image USER numeric 0 — refused ("the image will run as
 //     root").
-//   - runAsUser unset, image USER non-numeric — REFUSED ("cannot verify the
+//   - runAsUser unset, image USER non-numeric — refused ("cannot verify the
 //     user is non-root"). This is the numeric-USER rule: the host will not
 //     resolve a name out of the image's /etc/passwd to decide a privilege
 //     question, because that file is registry-supplied content inside the very
@@ -250,8 +250,8 @@ func c0(user string) string {
 // image order, pod entries overriding by NAME in place, and new pod entries
 // appended in pod order.
 //
-// Overriding IN PLACE rather than appending matters for a consumer that reads
-// the LAST occurrence of a duplicate name (execve leaves duplicates to libc, and
+// Overriding IN place rather than appending matters for a consumer that reads
+// the last occurrence of a duplicate name (execve leaves duplicates to libc, and
 // implementations differ on which wins), and preserving image order matters
 // because an image's own $PATH must keep whatever position it had.
 //
@@ -303,7 +303,7 @@ func envLookup(env []string) map[string]string {
 //
 // The grammar is small and its edge cases are the whole point, so they are
 // enumerated rather than inferred: "$$" is a literal "$"; "$(NAME)" is replaced
-// when NAME is defined and left VERBATIM (including its parentheses) when it is
+// when NAME is defined and left verbatim (including its parentheses) when it is
 // not; a "$" that begins neither is itself, and an unterminated "$(" is itself
 // through to the end of the string.
 //
@@ -347,12 +347,12 @@ func expandVars(s string, lookup map[string]string) string {
 	return b.String()
 }
 
-// IsHostPathReference reports whether an image reference is the M0 ABSOLUTE-HOST-PATH
+// IsHostPathReference reports whether an image reference is the M0 absolute-HOST-PATH
 // convention rather than an OCI reference — the discriminator that decides
 // whether a container is a host binary run in place or an image to pull, unpack
 // and merge (apis runtime/v1 Container.command).
 //
-// The two cases are disjoint BY CONSTRUCTION and that is why the discriminator
+// The two cases are disjoint BY construction and that is why the discriminator
 // is a property of the value rather than a mode a caller must remember to set:
 // an OCI reference cannot begin with '/'. A registry host is a DNS name, a
 // repository path never leads with a separator, and both grammars reject an

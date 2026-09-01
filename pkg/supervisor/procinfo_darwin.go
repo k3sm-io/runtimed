@@ -25,7 +25,7 @@ import (
 // ProcMember is one live member of a process group as reported by
 // ProcGroupMembers: its pid and its kernel-reported start time (unix
 // nanoseconds). It is the kern.proc.pgrp-result owner — the startup pod reap's
-// exact-instance identity check reads BOTH fields (the leader pid == pgid only
+// exact-instance identity check reads both fields (the leader pid == pgid only
 // while the leader lives, and the start time is the immutable fork timestamp).
 type ProcMember struct {
 	// Pid is the member's process id.
@@ -42,7 +42,7 @@ type ProcMember struct {
 //
 // Start time is the identity anchor recorded for a spawned pod's process group
 // leader: it is assigned by the kernel at spawn and survives execve (the
-// sandbox exec-shim execs the pod binary, so the executable path does NOT
+// sandbox exec-shim execs the pod binary, so the executable path does not
 // survive), so it stays valid for the leader's whole life. ProcGroupMembers
 // derives its members' StartUnixNano with the IDENTICAL expression, so the
 // reap's exact-equality identity check is a bit-exact comparison.
@@ -57,7 +57,7 @@ func ProcStartTimeNano(pid int) (startUnixNano int64, ok bool) {
 
 // ProcGroupMembers reports the live members (pid + start time) of process GROUP
 // pgid, via sysctl kern.proc.pgrp. ok is false only when the group cannot be
-// inspected (a real sysctl failure); an existing but EMPTY group (every member
+// inspected (a real sysctl failure); an existing but empty group (every member
 // gone) returns an empty slice with ok true.
 //
 // The startup pod reap inspects the GROUP, not just the leader pid: a pod
@@ -68,7 +68,7 @@ func ProcStartTimeNano(pid int) (startUnixNano int64, ok bool) {
 // leader member (Pid == pgid): the reaper kills only when that member's start
 // time matches the recorded leader start, so a recycled pgid (whose leader has
 // a different start, or whose leader is gone) is never signalled. Each member's
-// StartUnixNano uses the SAME P_starttime.Nano() derivation as
+// StartUnixNano uses the same P_starttime.Nano() derivation as
 // ProcStartTimeNano so the equality check is bit-exact.
 func ProcGroupMembers(pgid int) (members []ProcMember, ok bool) {
 	kps, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)

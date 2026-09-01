@@ -39,7 +39,7 @@ import (
 // --- exec/attach/portforward fakes ---------------------------------------
 
 // recordingExecBackend records every WrapCommand call (so a test can assert exec
-// reuses the pod's confinement seam) and PASSES THROUGH the argv unchanged, so
+// reuses the pod's confinement seam) and PASSES through the argv unchanged, so
 // the test runs the command directly — root-free, no k3sm-execshim binary or
 // libsandbox. Production WrapCommand returns the shim invocation that runs
 // supervisor.RunLaunchSequence (confine → drop → exec); the live Seatbelt-enforced
@@ -137,7 +137,7 @@ func (s *fakeExecStream) collect(t *testing.T) (stdout []byte, exit int32) {
 // TestExecRunsAndReturnsExitCode execs a trivial command through the real spawn/
 // stream path (root-free, non-dropping) and asserts stdout streams back, the exit
 // code is reported, and the exec went through the confinement seam (WrapCommand)
-// with the SAME SBPL profile as the pod's containers.
+// with the same SBPL profile as the pod's containers.
 func TestExecRunsAndReturnsExitCode(t *testing.T) {
 	be := &recordingExecBackend{}
 	w := newBlockingWaiter()
@@ -204,7 +204,7 @@ func TestExecRunsAndReturnsExitCode(t *testing.T) {
 }
 
 // TestExecCarriesPodLaunchSpec pins the B7 one-code-path decision: an exec
-// session re-enters the pod's FULL confinement domain — not just profile + uid
+// session re-enters the pod's full confinement domain — not just profile + uid
 // drop but the pod's explicit rlimits and its qos class too — because Exec goes
 // through the same WrapCommand choke-point as startContainer with the same
 // resolved supervisor.LaunchSpec.

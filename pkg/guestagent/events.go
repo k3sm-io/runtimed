@@ -42,7 +42,7 @@ type ContainerEvent struct {
 
 // ContainerStarted reports that a container's process was spawned in the guest.
 type ContainerStarted struct {
-	// PID is the process id INSIDE the guest. It is useful only for guest-side
+	// PID is the process id inside the guest. It is useful only for guest-side
 	// correlation — it means nothing to the host's process table.
 	PID int32
 }
@@ -56,7 +56,7 @@ type ContainerExited struct {
 	Signal int32
 	// OOMKilled is true when the guest kernel's cgroup OOM killer ended it.
 	//
-	// THIS FIELD IS THE ONLY SOURCE OF OOM TRUTH FOR A VM POD. The kill happens
+	// this field is the only source of OOM truth for a vm pod. The kill happens
 	// in the guest's cgroup, which the host cannot observe at all: its
 	// proc_pid_rusage sampler sees the VM host helper's footprint and nothing
 	// inside. A host-derived OOMKilled for a vm pod would be a guess dressed as a
@@ -68,7 +68,7 @@ type ContainerExited struct {
 // Events is the ContainerEvents fan-out: the guest's reaper publishes transitions,
 // and each ContainerEvents stream subscribes.
 //
-// DROP-AND-MARK, NEVER BLOCK. Publish is called from the guest's reap path — PID
+// DROP-and-MARK, never BLOCK. Publish is called from the guest's reap path — PID
 // 1's only reaping loop — so a subscriber that has stopped reading must not be able
 // to stall it. A stalled reaper means unreaped zombies, and in a pid namespace
 // there is no other process to inherit them. So a full subscriber queue drops the

@@ -41,7 +41,7 @@ func buildExecShim(t *testing.T) string {
 
 // buildExecShimForGOARCH builds and ad-hoc signs the k3sm-execshim helper into a
 // temp dir and returns its path. The ad-hoc signature is plain (flags=0x2):
-// hardened runtime and library validation are NOT applied, so a DYLD insert can
+// hardened runtime and library validation are not applied, so a DYLD insert can
 // load.
 //
 // goarch pins GOARCH for the build; empty means "whatever the toolchain defaults
@@ -112,7 +112,7 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 	// "-1 -1 -" requests no privilege drop (run as the test/daemon identity); the
 	// two launch-spec tokens are the empty sentinels supervisor.EncodeRlimits(nil)
 	// and EncodeQoS(false) both emit — no setrlimit plan, no background QoS. They
-	// sit BEFORE the profile path so binary skew fails closed (execshim.go).
+	// sit before the profile path so binary skew fails closed (execshim.go).
 	full := append([]string{"-1", "-1", "-", "-", "-", pf}, argv...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -126,7 +126,7 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 }
 
 // TestIntegrationConfinement is acceptance M1.2-a1 (live half): a process spawned
-// under a generated profile reads /System but is DENIED /Users.
+// under a generated profile reads /System but is denied /Users.
 func TestIntegrationConfinement(t *testing.T) {
 	shim := buildExecShim(t)
 	posture, dataVol := podVolume(t, "pod-confine")
@@ -165,12 +165,12 @@ func TestIntegrationConfinement(t *testing.T) {
 }
 
 // TestIntegrationNetworkStanzaCompiles is the M10.1 P0 regression gate: a
-// profile generated with the FULL production networked-pod shape —
+// profile generated with the full production networked-pod shape —
 // AllowNetwork=true, a PodIP, and both node VIPs set — must actually COMPILE
 // and APPLY through the real exec-shim/libsandbox path. On macOS 26 Seatbelt
 // network filters accept only localhost/* hosts, so the pre-M10.1 IP-scoped
 // stanza ((remote ip "<VIP>:53"), (local ip "<PodIP>:*")) failed sandbox_apply
-// ("host must be * or localhost in network address") and EVERY networked pod
+// ("host must be * or localhost in network address") and every networked pod
 // died at spawn. This test goes red if such a filter ever returns. User-space
 // only: ad-hoc sign, no root.
 func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
@@ -198,11 +198,11 @@ func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 	})
 
 	t.Run("bind-and-listen-succeeds", func(t *testing.T) {
-		// A tiny server helper that binds AND listen()s proves both (allow
+		// A tiny server helper that binds and listen()s proves both (allow
 		// network-bind) grants bind() and (allow network-inbound) grants listen().
 		// The listen() leg is load-bearing: a bare network-bind passes bind() but a
-		// TCP server's listen() is gated by the SEPARATE network-inbound operation, so
-		// without it EVERY server pod (a Service target, a readiness/liveness HTTP
+		// TCP server's listen() is gated by the separate network-inbound operation, so
+		// without it every server pod (a Service target, a readiness/liveness HTTP
 		// server) fails listen() with EPERM (the M10.1 regression this test now guards).
 		bin := filepath.Join(work, "bindbin")
 		src := filepath.Join(work, "bind.c")

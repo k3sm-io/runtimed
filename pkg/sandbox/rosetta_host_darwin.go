@@ -26,19 +26,19 @@ import (
 	"time"
 )
 
-// The build tag here is `darwin`, NOT `darwin && cgo`: this probe is deliberately
-// PURE GO. Rosetta 2 presence is answerable from the filesystem plus one exec, so
+// The build tag here is `darwin`, not `darwin && cgo`: this probe is deliberately
+// pure GO. Rosetta 2 presence is answerable from the filesystem plus one exec, so
 // there is no reason to drag it behind cgo — and keeping it cgo-free means the
-// CGO_ENABLED=0 lane gets the REAL probe rather than a stub that would lie about a
+// CGO_ENABLED=0 lane gets the real probe rather than a stub that would lie about a
 // capable host.
 
-// rosettaRuntimePath is the ONE on-disk artifact whose presence means Rosetta 2 is
+// rosettaRuntimePath is the one on-disk artifact whose presence means Rosetta 2 is
 // INSTALLED. Verified on macOS 26.5.2 (build 25F84): mode 0755 root:wheel, flagged
 // SIP-`restricted`.
 //
 // Three properties make it the right (and the only acceptable) path:
 //
-//   - Its parent directory /Library/Apple/usr/libexec/oah/ is CREATED AT ROSETTA
+//   - Its parent directory /Library/Apple/usr/libexec/oah/ is created AT ROSETTA
 //     INSTALL TIME, so its existence is evidence of an install rather than of the
 //     OS shipping a file.
 //   - It is SIP-`restricted`, so no non-SIP-exempt process — including anything
@@ -46,14 +46,14 @@ import (
 //   - The platform's own system.sb grants `file-test-existence` on exactly this
 //     path: this IS Apple's presence check, not a heuristic of ours.
 //
-// DO NOT substitute /usr/libexec/rosetta/* — those ship with macOS on the SEALED
+// DO not substitute /usr/libexec/rosetta/* — those ship with macOS on the SEALED
 // SYSTEM VOLUME (dated with the OS build seal, present on hosts with no Rosetta
 // installed), so a stat of them is permanently true and the probe would be
-// FAIL-OPEN: every Mac would advertise host-Rosetta.
+// fail-OPEN: every Mac would advertise host-Rosetta.
 const rosettaRuntimePath = "/Library/Apple/usr/libexec/oah/libRosettaRuntime"
 
 // archTool / trueTool are the translated-exec leg's two binaries, named as LITERAL
-// ABSOLUTE paths. Both are SIP-`restricted` (verified on macOS 26.5.2 / 25F84), so
+// absolute paths. Both are SIP-`restricted` (verified on macOS 26.5.2 / 25F84), so
 // neither can be replaced by a non-SIP-exempt process.
 //
 // exec.LookPath is BANNED here and the reason is a privilege boundary, not style:
@@ -76,25 +76,25 @@ const (
 // capability probe must not be able to cause that, so it is time-boxed.
 const hostRosettaSpawnTimeout = 2 * time.Second
 
-// hostRosettaWaitDelay bounds Wait AFTER cancellation, so even an unkillable child
+// hostRosettaWaitDelay bounds Wait after cancellation, so even an unkillable child
 // cannot hold the constructor. Belt to hostRosettaSpawnTimeout's braces.
 const hostRosettaWaitDelay = 500 * time.Millisecond
 
 // hostRosettaProbe reports whether this host can translate darwin/amd64 Mach-O
-// payloads, composing two legs with AND:
+// payloads, composing two legs with and:
 //
-//  1. PRESENCE — stat rosettaRuntimePath (see its doc for why that exact path).
+//  1. presence — stat rosettaRuntimePath (see its doc for why that exact path).
 //  2. TRANSLATION — run `/usr/bin/arch -x86_64 /usr/bin/true` and take the verdict
 //     from the exit status alone.
 //
-// Leg 2 is GATED BEHIND leg 1: a host without Rosetta forks NOTHING, so the probe
+// Leg 2 is GATED BEHIND leg 1: a host without Rosetta forks nothing, so the probe
 // costs one stat on the overwhelmingly common Apple-Silicon-without-Rosetta node.
 // Leg 1 alone would not do — the payload can be present while translation is
 // unusable — and leg 2 alone would not do either, because `arch(1)` collapses
 // EBADARCH and every other failure into a generic non-zero exit, so a bare spawn
 // failure could not be distinguished from "no Rosetta installed".
 //
-// It NEVER returns an error. Every failure mode — stat error, spawn error, non-zero
+// It never returns an error. Every failure mode — stat error, spawn error, non-zero
 // exit, timeout — maps to a not-available state, because a missing host capability
 // must not be able to fail daemon startup.
 func hostRosettaProbe(ctx context.Context) HostRosettaState {
@@ -111,7 +111,7 @@ func hostRosettaProbe(ctx context.Context) HostRosettaState {
 // hijacked nor leave anything behind:
 //
 //   - literal absolute SIP-restricted argv[0] and payload (never exec.LookPath);
-//   - an EMPTY environment, so no inherited DYLD_*/PATH/locale can steer it;
+//   - an empty environment, so no inherited DYLD_*/PATH/locale can steer it;
 //   - no shell — the argv is passed directly to posix_spawn by os/exec;
 //   - stdout/stderr left nil, which os/exec wires to /dev/null: output is
 //     discarded without any copier goroutine that could outlive the probe;
@@ -138,11 +138,11 @@ func runTranslatedProbe(ctx context.Context) error {
 		}
 		// Kill the DIRECT child through os.Process first. That is not redundant with
 		// the group kill below: os/exec runs Cancel on its watchCtx goroutine, which
-		// can lose the race with Wait and fire AFTER the child was reaped — at which
+		// can lose the race with Wait and fire after the child was reaped — at which
 		// point -pid may name a RECYCLED process group, and since the daemon runs as
 		// _k3sm alongside every pod process the blast radius is not empty. os.Process
 		// tracks the reap under its own lock and answers ErrProcessDone once it has
-		// happened, so this is the only race-FREE way to ask (reading cmd.ProcessState
+		// happened, so this is the only race-free way to ask (reading cmd.ProcessState
 		// instead would be a real data race: exec.go writes it on the Wait goroutine
 		// before it ever synchronises with this one). os/exec makes the same
 		// Process.Kill() move in its own WaitDelay path.

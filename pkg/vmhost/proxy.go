@@ -25,7 +25,7 @@ import (
 	"sync"
 )
 
-// vsockDialer opens ONE connection to the guest agent's vsock port. It is the
+// vsockDialer opens one connection to the guest agent's vsock port. It is the
 // transport seam of the agent proxy: production is the VZ socket device's Connect
 // (vz_darwin.go), and a test injects a dialer backed by an in-process pipe so the
 // whole relay — accept, both copy directions, half-close, shutdown — runs with no
@@ -35,7 +35,7 @@ type vsockDialer func(ctx context.Context) (net.Conn, error)
 // Proxy relays a runtimed-PRIVATE unix socket to the guest agent's vsock port, one
 // vsock connection per accepted unix connection.
 //
-// IT NEVER PARSES A BYTE OF THE PAYLOAD. What crosses is guest/v1 gRPC, and this
+// IT never PARSES A byte OF the PAYLOAD. What crosses is guest/v1 gRPC, and this
 // process is the one holding com.apple.security.virtualization — the single most
 // privileged binary k3sm ships. Teaching it to decode protobuf from a guest would
 // put an attacker-reachable parser inside the entitled process for no benefit
@@ -44,7 +44,7 @@ type vsockDialer func(ctx context.Context) (net.Conn, error)
 // byte pump, deliberately, and that is a security property rather than a
 // simplification.
 //
-// The unix socket is NOT in the pod directory. The pod dir is the one tree a pod's
+// The unix socket is not in the pod directory. The pod dir is the one tree a pod's
 // own confinement can reach, so an agent socket there would put the pod's control
 // channel inside the pod's reach; it lives under the daemon's private run tree
 // instead (see pkg/runtime's guestAgentSocket).
@@ -134,7 +134,7 @@ func (p *Proxy) acceptLoop(ctx context.Context) error {
 // relay bridges one accepted client connection to one fresh guest-agent
 // connection.
 //
-// ONE VSOCK CONNECTION PER CLIENT CONNECTION, never a shared or pooled one: the
+// one VSOCK CONNECTION per CLIENT CONNECTION, never a shared or pooled one: the
 // daemon opens a connection per RPC (see pkg/runtime's dialGuest), streams on it,
 // and closes it, so multiplexing here would add a state machine whose only job
 // would be to undo that.
@@ -177,7 +177,7 @@ func (p *Proxy) relay(ctx context.Context, client net.Conn) {
 // have it; a vsock connection may not.
 type halfCloser interface{ CloseWrite() error }
 
-// copyHalf copies src into dst and PROPAGATES THE HALF-CLOSE: when src reaches EOF
+// copyHalf copies src into dst and PROPAGATES the half-CLOSE: when src reaches EOF
 // it shuts down dst's write side, so the far end sees a clean end-of-stream while
 // its own direction stays open.
 //
@@ -188,7 +188,7 @@ type halfCloser interface{ CloseWrite() error }
 // would truncate the response; one that propagated nothing would leave the server
 // waiting forever for a request that will never come.
 //
-// WHERE dst OFFERS NO CloseWrite it is closed OUTRIGHT instead. A vsock connection
+// where dst OFFERS NO CloseWrite it is closed OUTRIGHT instead. A vsock connection
 // is that case. The alternative — leaving the direction open — is not "degraded but
 // safe": the opposite copy would then stay blocked in Read on a peer that has been
 // told nothing and will never speak again, and the relay goroutine would live until

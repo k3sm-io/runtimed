@@ -262,7 +262,7 @@ func TestPruneSeesUnpackedTrees(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)
 		tf := f.nativeTree(cfg, []string{layer}, 4096, time.Hour)
-		// Rewrite the record to claim another key AND to name a rooted digest: a
+		// Rewrite the record to claim another key and to name a rooted digest: a
 		// record that could rename or re-root the node it describes would be a
 		// registry-reachable way to make a tree immortal.
 		rec := treeRecord{

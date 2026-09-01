@@ -31,7 +31,7 @@ import (
 //
 //	Failed to parse entitlements: AMFIUnserializeXML: syntax error near line N
 //
-// while `codesign --verify --strict` STILL REPORTS THE BINARY AS VALIDLY SIGNED —
+// while `codesign --verify --strict` still reports the BINARY AS VALIDLY SIGNED —
 // because the signature is fine. It simply carries no entitlements. The only
 // downstream symptom is VMBackend.Available() reporting false on a Mac that is
 // perfectly capable, with nothing anywhere saying why.

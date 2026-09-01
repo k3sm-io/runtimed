@@ -87,7 +87,7 @@ func regularFilesUnder(t *testing.T, root string) []string {
 }
 
 // TestVolumeSubPathMaterialization is the B77 gate: subPath materialization exposes
-// ONLY the volume's <subPath> element at the mount path (a file or a subdir), never
+// only the volume's <subPath> element at the mount path (a file or a subdir), never
 // the whole volume, with the escape/fail-closed guards — and leaves the no-subPath
 // path unchanged. It drives mount.Materialize with a fake Resolver + a temp dataVol
 // and asserts the on-disk result.
@@ -126,8 +126,8 @@ func TestVolumeSubPathMaterialization(t *testing.T) {
 		}
 	})
 
-	// (b) SIBLING-ABSENCE (anti-inversion): the OTHER keys are not at the mount path
-	// AND not left readable anywhere under dataVol (staging removed). This is the
+	// (b) SIBLING-ABSENCE (anti-inversion): the other keys are not at the mount path
+	// and not left readable anywhere under dataVol (staging removed). This is the
 	// load-bearing check: it FAILS against the broken whole-volume behavior.
 	t.Run("b_sibling_absence", func(t *testing.T) {
 		dataVol := t.TempDir()
@@ -222,7 +222,7 @@ func TestVolumeSubPathMaterialization(t *testing.T) {
 		}
 	})
 
-	// (h) two containers mounting one volume at the SAME mount path with DIFFERENT
+	// (h) two containers mounting one volume at the same mount path with different
 	// subPaths cannot both be materialized on the shared tree — a hard error, not a
 	// silent first-wins. (An identical (volume, subPath) into two containers is fine.)
 	t.Run("h_conflicting_subpaths_error", func(t *testing.T) {

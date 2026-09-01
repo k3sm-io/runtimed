@@ -84,7 +84,7 @@ type machineRunner interface {
 	// powered itself off, or the hypervisor stopped it — and returns the reason,
 	// or nil for a clean stop. It returns ctx.Err() if ctx ends first.
 	Wait(ctx context.Context) error
-	// Stop halts the machine WITHOUT giving the guest a chance to stop cleanly.
+	// Stop halts the machine without giving the guest a chance to stop cleanly.
 	// It is the last resort after the graceful path has spent its budget, and it
 	// must be safe to call on a machine that has already stopped.
 	Stop(ctx context.Context) error
@@ -94,7 +94,7 @@ type machineRunner interface {
 // call into the guest agent asking the guest to terminate its containers, sync,
 // and power off.
 //
-// It is separate from machineRunner because it is a DIFFERENT FAILURE DOMAIN. The
+// It is separate from machineRunner because it is a different FAILURE DOMAIN. The
 // agent lives in the guest and is reached over vsock, so it can be wedged,
 // compromised, or simply not listening yet, while the hypervisor-level stop cannot.
 // A lifecycle that could not tell the two apart would have to treat an unreachable
@@ -110,7 +110,7 @@ const DefaultStopGrace = 20 * time.Second
 
 // MaxStopGrace is the ceiling this helper will ever wait for a guest.
 //
-// It is BUDGETED INSIDE the daemon's launchd ExitTimeOut (45s), with room left for
+// It is BUDGETED inside the daemon's launchd ExitTimeOut (45s), with room left for
 // the daemon's own teardown: a helper still waiting when launchd's timeout expires
 // is SIGKILLed, which is exactly the ungraceful stop the grace period existed to
 // avoid — so a longer grace does not buy a gentler shutdown, it buys a harder one.
@@ -124,7 +124,7 @@ type LifecycleOptions struct {
 	Grace time.Duration
 	// Logger receives the lifecycle's narration; nil means slog.Default.
 	Logger *slog.Logger
-	// NewTimer is the grace timer, injectable so shutdown ORDERING is asserted
+	// NewTimer is the grace timer, injectable so shutdown ordering is asserted
 	// deterministically rather than by sleeping. nil means time.NewTimer. It
 	// mirrors guestinit.ReaperOptions.NewTimer, which solves the same problem at
 	// the other end of the same shutdown.
@@ -133,7 +133,7 @@ type LifecycleOptions struct {
 
 // Lifecycle drives one virtual machine from creation to poweroff.
 //
-// The shutdown sequence is the whole reason it exists, and its ORDER is
+// The shutdown sequence is the whole reason it exists, and its order is
 // load-bearing (the M11 plan's Resolution 5):
 //
 //		SIGTERM (as ctx cancellation) -> agent.Stop(grace) -> wait <= grace for the
@@ -143,14 +143,14 @@ type LifecycleOptions struct {
 //	    gracefully and sync its filesystems. A hard stop is a power cut: for a pod
 //	    mid-write it is data loss, and for a PVC it is data loss that outlives the
 //	    pod.
-//	  - The hard stop ALWAYS happens if the graceful path did not finish. A helper
+//	  - The hard stop always happens if the graceful path did not finish. A helper
 //	    that returned while its VM was still running would leave a machine with no
 //	    pod, which the daemon can only reap by timeout.
 //	  - Grace is CLAMPED, not trusted, because the budget is not this process's to
 //	    overrun (see MaxStopGrace).
 //
 // Locking discipline: mu guards state only. Every runner and agent call is made
-// with mu RELEASED, so a seam that blocks — which the agent one certainly can —
+// with mu released, so a seam that blocks — which the agent one certainly can —
 // never blocks a State() read from the logging path.
 //
 // The zero value is not usable; construct one with NewLifecycle.
@@ -230,7 +230,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	}
 	l.set(StateStarting)
 	if err := l.runner.Start(ctx); err != nil {
-		// A FAILED Start MUST STILL BE TORN DOWN. The darwin runner races the
+		// A failed Start must still BE TORN down. The darwin runner races the
 		// framework's boot against ctx (vz_darwin.go Start's select), so a
 		// cancelled Start returns while the machine it already created goes on
 		// to finish booting — a VM with no supervisor, outliving the process
@@ -255,8 +255,8 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	}
 	l.set(StateRunning)
 
-	// waitCtx is deliberately NOT ctx: the wait must survive ctx's cancellation so
-	// the shutdown sequence below can use the SAME wait to observe the guest
+	// waitCtx is deliberately not ctx: the wait must survive ctx's cancellation so
+	// the shutdown sequence below can use the same wait to observe the guest
 	// leaving Running. Cancelling it is this function's own job, on the way out.
 	waitCtx, cancelWait := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWait()
@@ -279,14 +279,14 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	}
 }
 
-// shutdown runs the graceful-then-hard stop sequence, using waited — the SAME wait
+// shutdown runs the graceful-then-hard stop sequence, using waited — the same wait
 // goroutine Run already started — as its observation of the machine leaving
 // Running. Reusing it is what makes the "wait <= grace" leg honest: a second wait
 // would be a second observer of a one-shot event, and the two could disagree.
 func (l *Lifecycle) shutdown(waited <-chan error) error {
 	l.set(StateStopping)
 
-	// The graceful leg runs on a context that is NOT the cancelled one: ctx is
+	// The graceful leg runs on a context that is not the cancelled one: ctx is
 	// already done by the time we are here, so passing it would cancel the very
 	// RPC whose whole purpose is to run after the signal. Its bound is the grace
 	// budget, which is the correct bound anyway.
@@ -296,7 +296,7 @@ func (l *Lifecycle) shutdown(waited <-chan error) error {
 	if l.agent == nil {
 		l.log.Warn("no guest agent transport; skipping the graceful stop and halting the machine")
 	} else if err := l.agent.Stop(graceCtx, l.grace); err != nil {
-		// NOT fatal, and not a machine failure: the agent lives in the guest and
+		// not fatal, and not a machine failure: the agent lives in the guest and
 		// is a different failure domain (see agentStopper). The hard stop below is
 		// exactly the fallback this case exists for.
 		l.log.Warn("the guest agent did not accept the stop request; falling back to a hard stop", "err", err)

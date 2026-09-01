@@ -26,7 +26,7 @@ import (
 )
 
 // TestDataVolumePathRejectsProtectedTree is B142's sink-side gate: the data
-// volume must be a PROPER DESCENDANT of <Posture.WorkDir>/pods, so a hostile
+// volume must be a proper descendant of <Posture.WorkDir>/pods, so a hostile
 // SandboxProfile.data_volume_path can no longer clobber the protected deny-set.
 //
 // Why the table is shaped this way — three traps it is built to avoid:
@@ -34,7 +34,7 @@ import (
 //   - A protected-prefix MEMBERSHIP test would pass every row that matters. The
 //     damaging values ("/", "/var/lib", the work-dir itself, the pods root
 //     itself) are ANCESTORS of every protected prefix and are under none of
-//     them, yet each emits one (allow file-read* file-write* (subpath …)) AFTER
+//     them, yet each emits one (allow file-read* file-write* (subpath …)) after
 //     the denies and takes pods/podreap/server/agent/run/blobs with it. So the
 //     assertion is positive containment, and the rows are chosen to be exactly
 //     the ancestors a deny-list cannot express.
@@ -43,8 +43,8 @@ import (
 //   - An error-only gate cannot tell "hostile values rejected" from "every pod
 //     broken" — the failure mode that would take down every pod on the node.
 //     The positive control therefore drives a LEGITIMATE data volume all the way
-//     through and asserts the re-allow is still emitted, in BOTH firmlink forms,
-//     and still lands AFTER the deny block.
+//     through and asserts the re-allow is still emitted, in both firmlink forms,
+//     and still lands after the deny block.
 func TestDataVolumePathRejectsProtectedTree(t *testing.T) {
 	workDir := t.TempDir()
 	posture := Posture{WorkDir: workDir}
@@ -86,7 +86,7 @@ func TestDataVolumePathRejectsProtectedTree(t *testing.T) {
 		}
 	})
 
-	// POSITIVE CONTROL. Without it this gate cannot distinguish "hostile values
+	// positive CONTROL. Without it this gate cannot distinguish "hostile values
 	// rejected" from "every pod broken".
 	t.Run("positive/a legitimate pod data volume still generates", func(t *testing.T) {
 		dataVol := filepath.Join(podsRoot, "pod-abc123", "rootfs")
@@ -95,9 +95,9 @@ func TestDataVolumePathRejectsProtectedTree(t *testing.T) {
 			t.Fatalf("Generate(%q): %v", dataVol, err)
 		}
 
-		// The re-allow survives in BOTH firmlink forms: a t.TempDir() lives under
+		// The re-allow survives in both firmlink forms: a t.TempDir() lives under
 		// /var on macOS, and libsandbox matches the SYMLINK-RESOLVED path, so an
-		// allow written only against the /var spelling fails CLOSED — the pod
+		// allow written only against the /var spelling fails closed — the pod
 		// cannot read its own volume.
 		forms := firmlinkForms(dataVol)
 		if len(forms) < 2 {
@@ -112,7 +112,7 @@ func TestDataVolumePathRejectsProtectedTree(t *testing.T) {
 			t.Fatalf("the pod's own data-volume re-allow is missing (or lost a firmlink form):\nwant:\n%s\ngot:\n%s", reallow, out)
 		}
 
-		// Ordering, house index style: the re-allow must come AFTER the deny
+		// Ordering, house index style: the re-allow must come after the deny
 		// block (it lives under the denied pods root), while NO allow naming the
 		// work-dir or the control-plane state dir may appear after it — that is
 		// the shape a hostile value used to produce.

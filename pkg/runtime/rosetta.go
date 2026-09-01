@@ -25,17 +25,17 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// The Rosetta capability conditions (B103) — evaluated EAGERLY, EXACTLY ONCE, in
+// The Rosetta capability conditions (B103) — evaluated eagerly, exactly once, in
 // New, and stored immutably on the Runtime.
 //
 // Why eager-once and not a sync.Once cache: GetRuntimeInfo is a CONCURRENT gRPC
 // handler, so a lazily-populated field is shared mutable state reachable from
 // several goroutines — a -race finding waiting to happen, and a lock to review
 // forever after. Values computed before the Runtime pointer escapes New are
-// race-free by CONSTRUCTION, need no synchronisation, and additionally bound the
-// host probe to at most ONE fork per daemon lifetime.
+// race-free by construction, need no synchronisation, and additionally bound the
+// host probe to at most one fork per daemon lifetime.
 //
-// The probes are NOT wired into the image-pull platform policy. See pullPolicy in
+// The probes are not wired into the image-pull platform policy. See pullPolicy in
 // pod.go for why that stays false until the Seatbelt x Rosetta spawn is proven
 // (B105).
 
@@ -47,7 +47,7 @@ import (
 // composition fact the sandbox package cannot know about.
 const (
 	// reasonRosettaVMBackendUnavailable is the guest condition's Reason when the
-	// probe was SHORT-CIRCUITED because the vm backend is unavailable.
+	// probe was short-CIRCUITED because the vm backend is unavailable.
 	reasonRosettaVMBackendUnavailable = "VMBackendUnavailable"
 	// reasonRosettaGuestShareUnsupported is the guest condition's Reason when the
 	// vm backend IS available but the guests this node builds carry no Rosetta
@@ -79,8 +79,8 @@ func (c rosettaCondition) condition(condType string) *runtimev1.RuntimeCondition
 	}
 }
 
-// logRosettaProbe emits the ONE construction-time log line for a Rosetta probe,
-// carrying the full condition (type/status/reason/message). It logs at Info for BOTH
+// logRosettaProbe emits the one construction-time log line for a Rosetta probe,
+// carrying the full condition (type/status/reason/message). It logs at Info for both
 // outcomes — not Warn-on-absent — because an absent host capability is normal, not a
 // fault, and the operator question this answers ("why is my node not labelled for
 // Rosetta?") is asked in exactly the unavailable case.
@@ -93,10 +93,10 @@ func logRosettaProbe(log *slog.Logger, condType string, c rosettaCondition) {
 }
 
 // evalHostRosetta turns the host-Rosetta probe's state into the condition data.
-// ONLY sandbox.HostRosettaAvailable maps to TRUE; every other state — including one
-// out of range — is FALSE with its own Reason, so the condition fails closed.
+// only sandbox.HostRosettaAvailable maps to true; every other state — including one
+// out of range — is false with its own Reason, so the condition fails closed.
 //
-// That available/not decision has exactly ONE home: sandbox.HostRosettaState.Available().
+// That available/not decision has exactly one home: sandbox.HostRosettaState.Available().
 // The switch below therefore chooses only the operator MESSAGE (and names an
 // unrecognized state). Re-deriving `state == sandbox.HostRosettaAvailable` here would
 // give the fail-closed rule two homes, and the copy pkg/sandbox's tests pin would not
@@ -127,16 +127,16 @@ func evalHostRosetta(ctx context.Context, probe func(context.Context) sandbox.Ho
 }
 
 // evalGuestRosetta turns the guest-Rosetta probe's state into the condition data,
-// SHORT-CIRCUITING the probe entirely on either of TWO host-side facts that make
+// short-CIRCUITING the probe entirely on either of two host-side facts that make
 // the framework's answer irrelevant.
 //
 // FIRST, the vm backend must be available. This is not an optimisation of
 // convenience: k3sm composes the node's guest-Rosetta capability as
-// VMBackendAvailable AND RosettaGuestAvailable, so with the vm backend down the
+// VMBackendAvailable and RosettaGuestAvailable, so with the vm backend down the
 // guest result cannot change any label — and skipping it keeps a
 // Virtualization.framework call off every Mac that cannot run guests anyway.
 //
-// SECOND (B229), the guests this node BUILDS must carry a Rosetta directory share.
+// second (B229), the guests this node BUILDS must carry a Rosetta directory share.
 // +[VZLinuxRosettaDirectoryShare availability] answers a question about the Mac,
 // not about the VM: it can say Installed while the k3sm-vmhost helper attaches no
 // share at all. Advertising on the framework answer alone would make
@@ -148,10 +148,10 @@ func evalHostRosetta(ctx context.Context, probe func(context.Context) sandbox.Ho
 // returns when the helper is changed to attach the share, not when a comment is
 // edited.
 //
-// Either short-circuit yields FALSE naming its own cause, never TRUE.
+// Either short-circuit yields false naming its own cause, never true.
 //
-// ONLY sandbox.GuestRosettaInstalled maps to TRUE, and — exactly as in
-// evalHostRosetta — that decision has ONE home, sandbox.GuestRosettaState.Available();
+// only sandbox.GuestRosettaInstalled maps to true, and — exactly as in
+// evalHostRosetta — that decision has one home, sandbox.GuestRosettaState.Available();
 // the switch chooses only the operator Message.
 func evalGuestRosetta(vmBackend VMBackend, probe func() sandbox.GuestRosettaState) rosettaCondition {
 	if vmBackend == nil || !vmBackend.Available() {
@@ -183,7 +183,7 @@ func evalGuestRosetta(vmBackend VMBackend, probe func() sandbox.GuestRosettaStat
 	case sandbox.GuestRosettaQueryFailed:
 		c.message = "the guest-Rosetta availability query could not answer (no Virtualization.framework in this build lane, or an unexpected framework result); failing closed"
 	default:
-		// As in evalHostRosetta: name the state; Available() already made it FALSE.
+		// As in evalHostRosetta: name the state; Available() already made it false.
 		c.reason = "Unknown"
 		c.message = fmt.Sprintf("the guest-Rosetta probe returned an unrecognized state (%d); failing closed", int(state))
 	}

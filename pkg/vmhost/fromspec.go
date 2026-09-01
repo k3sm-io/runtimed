@@ -38,7 +38,7 @@ import (
 var ErrInvalidSpec = errors.New("vmhost: invalid VMHostSpec")
 
 // RosettaShareSupported reports whether this helper attaches a Rosetta directory
-// share to the guests it builds. It is FALSE, and FromSpec REFUSES a spec that
+// share to the guests it builds. It is false, and FromSpec refuses a spec that
 // asks for one rather than silently building a guest that cannot honour it.
 //
 // This is the helper's own copy of the fact that
@@ -105,7 +105,7 @@ type Options struct {
 }
 
 // clamp resolves one dimension: a zero request takes the default, and the result
-// is pinned into [min,max]. CLAMPING RATHER THAN REJECTING is deliberate for the
+// is pinned into [min,max]. Clamping rather than rejecting is deliberate for the
 // upper bound — a pod asking for more vCPUs than this Mac has is a scheduling
 // mismatch the node should still run, degraded, rather than a pod that can never
 // start on any node in the cluster.
@@ -138,7 +138,7 @@ func clampUint64(req, def, minimum, maximum uint64) uint64 {
 // FromSpec validates spec against opts and translates it into the pure-Go machine
 // description realize builds a VM from.
 //
-// IT CARRIES ALL THE VALIDATION. Nothing downstream re-checks anything, which is
+// IT CARRIES all the VALIDATION. Nothing downstream re-checks anything, which is
 // the point: a check split between here and a darwin-only translator is a check
 // that half the test suite cannot reach. A spec this function accepts is one the
 // helper is willing to boot.
@@ -146,20 +146,20 @@ func clampUint64(req, def, minimum, maximum uint64) uint64 {
 // The invariants it enforces, and why each is here rather than trusted from the
 // producer:
 //
-//   - The rootfs and projected-credential shares are forced READ-ONLY regardless
+//   - The rootfs and projected-credential shares are forced READ-only regardless
 //     of what the spec says. The producer already marks them read-only, but "the
 //     guest must not be able to write its own lower layer or a mounted Secret" is
 //     a property of the vm boundary, not of one producer's correctness, and the
 //     device flag is the only place it is actually enforced.
-//   - Share roots are PAIRWISE NON-ANCESTOR. Two devices where one root contains
+//   - Share roots are PAIRWISE non-ancestor. Two devices where one root contains
 //     the other let a guest reach a read-only tree through its writable parent,
 //     which quietly undoes the previous rule.
-//   - The k3sm.spec share is APPENDED HERE. pkg/guestinit mounts
+//   - The k3sm.spec share is APPENDED here. pkg/guestinit mounts
 //     guestinit.SpecShareTag as its first act and cannot boot without it, and
 //     pkg/mount's ComputeSharePlan emits only rootfs/proj/vols/pvc — so nothing
 //     else in the tree produces it and a guest built from a plan alone would die
 //     with an opaque "cannot find its spec".
-//   - Kernel and initramfs must be ABSOLUTE, CLEAN and PRESENT. VZ's own error
+//   - Kernel and initramfs must be absolute, CLEAN and present. VZ's own error
 //     for a missing kernel arrives as a framework failure at boot; naming the path
 //     here is the difference between a legible pod event and a crash report.
 func FromSpec(spec *guestv1.VMHostSpec, opts Options) (MachineConfig, error) {
@@ -342,7 +342,7 @@ func resolveMAC(specMAC, podID string) (string, error) {
 	return hw.String(), nil
 }
 
-// forcedReadOnlyTags are the share tags whose read-only flag is NOT the producer's
+// forcedReadOnlyTags are the share tags whose read-only flag is not the producer's
 // to choose. See FromSpec's doc for why the enforcement lives here.
 var forcedReadOnlyTags = map[string]string{
 	mount.ShareTagRootfs:   "the guest composes writability as an overlay; a writable lower layer would let a pod mutate the image tree the node shares between pods",
@@ -437,7 +437,7 @@ func validShareRoot(tag, root string) error {
 }
 
 // shareRootsDisjoint enforces the pairwise non-ancestor invariant across the whole
-// device set, INCLUDING the appended spec share.
+// device set, including the appended spec share.
 //
 // Ancestry, not equality, is the property that matters: two devices are only
 // independent if neither's tree contains the other's. Where one contains the
@@ -476,14 +476,14 @@ func isAtOrUnder(path, ancestor string) bool {
 // withPodIDParam ensures the kernel command line carries the pod id the guest must
 // assert its own identity against.
 //
-// THE GUEST HAS NO OTHER WAY TO LEARN IT. guest.proto requires the agent to reject
+// the guest has no other way to learn it. guest.proto requires the agent to reject
 // a pod_id that is not the pod it booted, but guest/v1's GuestSpec carries no
 // pod_id field — only VMHostSpec does, and that message never crosses into the
 // guest. So the id rides the command line under guestagent.PodIDCmdlineKey (see
 // that constant for the full reasoning and the apis residual).
 //
-// APPEND, DON'T DEMAND. A cmdline that already names the right pod is left alone;
-// one that names none has the parameter appended; one that names a DIFFERENT pod
+// APPEND, DON'T demand. A cmdline that already names the right pod is left alone;
+// one that names none has the parameter appended; one that names a different pod
 // is refused. Appending rather than requiring means the daemon that composes the
 // cmdline needs to know nothing about this convention, while a disagreement — the
 // only case that could make a guest answer for the wrong pod — is a loud rejection.

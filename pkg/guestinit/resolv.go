@@ -60,13 +60,13 @@ type EtcFiles struct {
 //     resolves most names, whereas an over-long line resolves none on musl.
 //
 //  2. The search list is emitted in full, in order, and is never made
-//     conditional on `options ndots`. Musl IGNORES ndots and behaves as if
+//     conditional on `options ndots`. Musl ignores ndots and behaves as if
 //     ndots:1, so on alpine a relative name that already contains a dot
 //     ("kubernetes.default") is tried as-is and never expanded through the
 //     search list, while a single-label name ("kubernetes") is. That is a
 //     property of the resolver, not something a renderer can fix; what the
 //     renderer guarantees is that the search list itself is intact and legal,
-//     so every name musl DOES expand resolves. The ndots option is still
+//     so every name musl does expand resolves. The ndots option is still
 //     emitted because glibc images depend on it.
 //
 // Order within each list is significant and preserved: it is query order.
@@ -141,7 +141,7 @@ func RenderHosts(hostname, guestIP string) string {
 // RenderHostname renders /etc/hostname.
 func RenderHostname(hostname string) string { return hostname + "\n" }
 
-// ParseMemTotal extracts MemTotal, in BYTES, from /proc/meminfo content. It
+// ParseMemTotal extracts MemTotal, in bytes, from /proc/meminfo content. It
 // lives here, as a pure parse over content the executor reads, so the unit
 // conversion is covered by a darwin test rather than only by a cross-compile.
 //

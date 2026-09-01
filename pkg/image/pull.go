@@ -32,8 +32,8 @@ import (
 )
 
 // RegistryCredential is a private-registry pull credential (an imagePullSecret,
-// M2.6). It is consumed ONLY by the pull client (passed to the registry transport
-// as an Authorization header) and is NEVER written to disk / the pod dir — the
+// M2.6). It is consumed only by the pull client (passed to the registry transport
+// as an Authorization header) and is never written to disk / the pod dir — the
 // M2.6 security invariant. The provider resolves it from the referenced
 // docker-config Secret and supplies it via the runtime's CredentialResolver seam;
 // the proto carries only a LocalObjectReference, never the bytes.
@@ -65,7 +65,7 @@ func (c *RegistryCredential) authenticator() authn.Authenticator {
 }
 
 // FetchFunc resolves an image reference to a go-containerregistry image, using
-// cred for private-registry auth (nil = anonymous) and policy to decide WHICH
+// cred for private-registry auth (nil = anonymous) and policy to decide which
 // platform of a multi-platform image to resolve. The production fetcher is
 // RemoteFetch (a registry pull); tests inject an in-memory image so pull/cache
 // logic is exercised with no network.
@@ -88,11 +88,11 @@ type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, p
 //
 //   - remote.WithPlatform is never passed, and remote.Image is never called on a
 //     tag/ambiguous reference — the index is traversed explicitly here;
-//   - Descriptor.Image() is called ONLY after the descriptor's media type is
+//   - Descriptor.Image() is called only after the descriptor's media type is
 //     asserted to be an image type, never on an index (where it would resolve
 //     the child by the defaulted platform);
 //   - ImageIndex.Image(hash) is never called (same defaulting);
-//   - the selected child is re-resolved by EXPLICIT DIGEST
+//   - the selected child is re-resolved by explicit DIGEST
 //     (ref.Context().Digest(...)), which go-containerregistry verifies against
 //     the bytes it received;
 //   - the resolved image's own config is verified last, so a mislabelled index
@@ -156,7 +156,7 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 		}
 		return imageByDigest(r.Context().Digest(selected.Digest.String()), opts)
 	case desc.MediaType.IsImage():
-		// Safe: Descriptor.Image() applies the (defaulted) platform ONLY on the
+		// Safe: Descriptor.Image() applies the (defaulted) platform only on the
 		// index branch, which this is not.
 		img, err := desc.Image()
 		if err != nil {
@@ -164,7 +164,7 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 		}
 		return img, nil
 	default:
-		// Decided verdict: REFUSE anything else rather than guess. This covers
+		// Decided verdict: refuse anything else rather than guess. This covers
 		// the legacy Docker schema-1 types (which carry no platform information
 		// at all) and a registry that serves a manifest with a missing or
 		// unrecognised Content-Type — the OCI distribution spec requires that
@@ -176,7 +176,7 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 	}
 }
 
-// imageByDigest resolves one index child by its EXPLICIT digest.
+// imageByDigest resolves one index child by its explicit digest.
 // go-containerregistry verifies the returned bytes against that digest, and the
 // media type is re-asserted here so an index can never reach Descriptor.Image()
 // (where the linux/amd64 default would resolve a child for us).
@@ -184,10 +184,10 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 // name.Repository.Digest does not itself validate the string. What makes that
 // safe is a two-part invariant on the digest reaching it:
 //
-//   - a PRESENT digest key was validated by v1.Hash.UnmarshalJSON during
+//   - a present digest key was validated by v1.Hash.UnmarshalJSON during
 //     json.Unmarshal of the index (known algorithm, hex body, exact length);
-//   - an ABSENT digest key never invokes UnmarshalJSON at all — it leaves the
-//     ZERO v1.Hash, which renders as ":" — so selectableChild rejects a child
+//   - an absent digest key never invokes UnmarshalJSON at all — it leaves the
+//     zero v1.Hash, which renders as ":" — so selectableChild rejects a child
 //     with an empty algorithm or hex before selection can reach here.
 func imageByDigest(ref name.Digest, opts []remote.Option) (ggcrv1.Image, error) {
 	d, err := remote.Get(ref, opts...)
@@ -232,7 +232,7 @@ type PullResult struct {
 // on this node under a policy that forbids fetching it (IMAGE_PULL_POLICY_NEVER).
 // No registry round trip has been made when it is returned.
 //
-// It is deliberately a PLAIN sentinel and not a classified pull failure: the
+// It is deliberately a plain sentinel and not a classified pull failure: the
 // kubelet waiting-reason taxonomy (ErrImageNeverPull and its siblings) is a
 // separate deliverable that consumes this sentinel with errors.Is — the wrapped
 // chain out of Pull is the contract it builds on.
@@ -248,13 +248,13 @@ var ErrImageNotPresent = errors.New("image not present locally and the pull poli
 // FileIndex is the production implementation; NoLocalIndex is the explicit
 // "this node records nothing".
 //
-// Its entries are EDGES, never reachability roots — see FileIndex — so an
+// Its entries are edges, never reachability roots — see FileIndex — so an
 // implementation may never be consulted by the image GC.
 type LocalIndex interface {
 	// Lookup returns the manifest recorded for ref under policy's platform, and
 	// ok=false when the reference has not been recorded.
 	//
-	// An index that cannot be READ returns an error, which is NOT a miss: a miss
+	// An index that cannot be READ returns an error, which is not a miss: a miss
 	// would fail Never for an image that is present, and would send an
 	// IfNotPresent pod to the registry at exactly the moment the operator asked
 	// it not to go. The caller propagates the error instead.
@@ -262,7 +262,7 @@ type LocalIndex interface {
 
 	// Record records that ref resolved to manifest for platform.
 	//
-	// The Puller calls it ONLY after a pull has fully succeeded, with the
+	// The Puller calls it only after a pull has fully succeeded, with the
 	// manifest IT resolved and verified and after every blob was committed. That
 	// is the contract that keeps a recorded reference honest: an index written
 	// from anything else — bytes re-fetched at lookup time, a manifest recorded
@@ -287,7 +287,7 @@ func (NoLocalIndex) Lookup(context.Context, string, PlatformPolicy) (*runtimev1.
 	return nil, false, nil
 }
 
-// Record discards the record. Under-recording is the SAFE direction — it can
+// Record discards the record. Under-recording is the safe direction — it can
 // only send a pull to the registry that a record would have served locally, and
 // can never make presence lie.
 func (NoLocalIndex) Record(context.Context, string, Platform, *runtimev1.ImageManifest) error {
@@ -310,7 +310,7 @@ type Puller struct {
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
 // presence-by-reference via index.
 //
-// All three arguments are REQUIRED: a nil fetch is an error, never a silent
+// All three arguments are required: a nil fetch is an error, never a silent
 // default to RemoteFetch. Which fetcher runs is the decision that chooses which
 // platform's bytes land in the cache, so it is spelled out at the call site that
 // makes it (runtime.New passes image.RemoteFetch) rather than substituted here.
@@ -346,7 +346,7 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // credential used for the registry fetch; it is confined to the fetch transport
 // and never written to the cache or pod dir.
 //
-// policy selects WHICH platform of a multi-platform image is pulled. It is a
+// policy selects which platform of a multi-platform image is pulled. It is a
 // per-call argument because the sandbox backend is resolved per pod; a zero
 // policy fails closed here, before any round trip (see PlatformPolicy). The
 // fetched image's own config is verified against the policy before a single blob
@@ -355,23 +355,23 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 //
 // pull is the container's stamped imagePullPolicy and is OBEYED AS GIVEN:
 //
-//   - ALWAYS re-resolves the reference on every call, even for a reference this
+//   - always re-resolves the reference on every call, even for a reference this
 //     node already has (cached blobs are still reused; it is the resolution that
 //     must be fresh);
-//   - IF_NOT_PRESENT returns the locally recorded image with ZERO registry
+//   - IF_NOT_PRESENT returns the locally recorded image with zero registry
 //     traffic, and falls through to a pull only on a miss — so a warm node
 //     starts pods through a registry outage;
-//   - NEVER makes no fetch attempt at all: a locally absent reference is
+//   - never makes no fetch attempt at all: a locally absent reference is
 //     ErrImageNotPresent;
 //   - UNSPECIFIED is the legacy pull-through — the pre-M12 behavior, which is
 //     what an old provider that never stamps the field must keep getting. It is
-//     never read as an implicit NEVER.
+//     never read as an implicit never.
 //
 // Under DISK PRESSURE on the store volume, a pull that would FETCH is refused
 // before any round trip with ErrPullRefusedDiskPressure; a warm IfNotPresent or
 // Never serve is unaffected (see admitFetch).
 //
-// This function NEVER derives a policy from the image tag. Defaulting
+// This function never derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
 // it on the pod spec; the provider forwards that value verbatim and it arrives
 // here already decided. A second derivation point would be free to disagree with
@@ -381,10 +381,10 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// The policy is resolved BEFORE any round trip (a zero policy fails closed
-	// with no network at all) AND before the presence decision, so an invalid
+	// The policy is resolved before any round trip (a zero policy fails closed
+	// with no network at all) and before the presence decision, so an invalid
 	// platform policy is refused on every path rather than only the fetching
-	// ones. The image's own config is verified against it HERE — at the choke
+	// ones. The image's own config is verified against it here — at the choke
 	// point every pull traverses — not only inside one FetchFunc. RemoteFetch
 	// verifies it too, because it is exported and independently callable; but a
 	// FetchFunc is a SEAM, and a fetcher that omits the check (or a test fake
@@ -412,17 +412,17 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	}
 
 	// DISK-PRESSURE ADMISSION, at the one choke point every fetching path
-	// traverses and BEFORE the fetch, so a refused pull performs no registry
-	// traffic at all. It sits AFTER the presence decision on purpose: a reference
+	// traverses and before the fetch, so a refused pull performs no registry
+	// traffic at all. It sits after the presence decision on purpose: a reference
 	// already on this node is served under pressure, because answering presence
 	// writes nothing (see admitFetch).
 	//
-	// ALWAYS is refused here even when every blob happens to be cached. That is
-	// deliberate and it is not over-blocking: ALWAYS means re-resolve the
+	// always is refused here even when every blob happens to be cached. That is
+	// deliberate and it is not over-blocking: always means re-resolve the
 	// reference, and whether the resolved digest is one this node already holds
 	// is knowable only by making the very round trip being refused. Serving the
 	// recorded content instead would silently answer IfNotPresent for a pod that
-	// asked for ALWAYS.
+	// asked for always.
 	if err := p.admitFetch(ref); err != nil {
 		return nil, err
 	}
@@ -435,7 +435,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
 	}
-	// The platform the image's OWN config declares, as verified against this
+	// The platform the image's own config declares, as verified against this
 	// pod's candidates — that is the half of the index key the reference does not
 	// carry, and taking it from the verifier means the recorded key can only ever
 	// be a platform this pull proved runnable here.
@@ -448,7 +448,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	// The MANIFEST is resolved before any blob is written, because it — not the
 	// object that hands over the bytes — is where every claimed digest comes from
-	// (B129). img.ConfigName() and layer.Digest() are NOT used as claimed values:
+	// (B129). img.ConfigName() and layer.Digest() are not used as claimed values:
 	// go-containerregistry's partial helpers derive both by hashing the very
 	// content being checked when the implementation carries no descriptor, so
 	// comparing against them would prove self-consistency, not authenticity, and
@@ -460,7 +460,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
 	}
 
-	// LEASE THE WHOLE DIGEST SET before a single blob is even looked at — not
+	// LEASE the whole DIGEST SET before a single blob is even looked at — not
 	// before the first WRITE. CommitBlob returns (false, nil) on a cache hit
 	// without touching the file, so a blob this pull depends on can already be
 	// present, already be old, and be named by nothing: deletable by a concurrent
@@ -525,7 +525,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		out.Layers = append(out.Layers, descriptorFromGGCR(desc))
 	}
 
-	// Record the reference LAST: every blob it names is now committed and
+	// Record the reference last: every blob it names is now committed and
 	// digest-verified, and the manifest recorded is the one this pull resolved —
 	// never bytes re-read at lookup time. Recording earlier would let a lookup
 	// answer "present" for a pull that had not finished writing.
@@ -534,7 +534,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	// reachable, so it neither replaces the lease nor delays its release, and a
 	// blob it names is still reclaimable the moment no pod records it.
 	//
-	// A failed record FAILS THE PULL. The blobs are on disk and re-pulling is
+	// A failed record FAILS the PULL. The blobs are on disk and re-pulling is
 	// idempotent, so nothing is lost; and the two ways this can fail — the index
 	// tree is unwritable, or it is not the tree this daemon owns
 	// (ErrIndexNotOwned) — are exactly the conditions under which a LOOKUP must
@@ -561,13 +561,13 @@ func manifestDescriptorDigests(mfst *ggcrv1.Manifest) []string {
 }
 
 // presentLocally reports whether ref is on this node for policy's platform: the
-// index must have recorded it AND every blob its manifest names must still be in
+// index must have recorded it and every blob its manifest names must still be in
 // the content-addressed store.
 //
 // The second half is not belt-and-braces. Presence-by-reference and the bytes
 // have independent lifetimes (the cache GC evicts blobs), and a stale index entry
 // would otherwise start a container whose layers are gone — so a recorded
-// reference with missing blobs is a MISS, which sends IfNotPresent back to the
+// reference with missing blobs is a miss, which sends IfNotPresent back to the
 // registry and fails Never honestly.
 func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, *Lease, bool, error) {
 	mfst, ok, err := p.index.Lookup(ctx, ref, policy)
@@ -577,7 +577,7 @@ func (p *Puller) presentLocally(ctx context.Context, ref string, policy Platform
 	if !ok || mfst == nil {
 		return nil, nil, false, nil
 	}
-	// LEASE BEFORE THE PRESENCE CHECK, not after it. This path writes nothing at
+	// LEASE before the presence check, not after it. This path writes nothing at
 	// all, so there is no commit to hang a pin on and no mtime change for a grace
 	// window to notice: the blobs are old, present, and — until the caller records
 	// the reference — named by nothing. Checking presence first and leasing second

@@ -55,10 +55,10 @@ const (
 // credential, consumed only by the pull client; nil = anonymous pull.
 //
 // policy (B99) chooses which platform of a multi-platform image is pulled. It
-// rides on the CALL, not on the Puller, because the sandbox backend that decides
+// rides on the call, not on the Puller, because the sandbox backend that decides
 // it is resolved per pod (sandbox.SelectBackend in createPod).
 //
-// pull (M12.1) is the container's STAMPED imagePullPolicy, forwarded from the
+// pull (M12.1) is the container's stamped imagePullPolicy, forwarded from the
 // PodBox exactly as the provider translated it from the apiserver-defaulted pod
 // spec. runtimed never derives it from the image tag, and never reads the
 // UNSPECIFIED zero value as anything but the legacy pull-through.
@@ -66,23 +66,23 @@ type Puller interface {
 	Pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy, pull runtimev1.ImagePullPolicy) (*image.PullResult, error)
 }
 
-// Unpacker turns a PULLED image into files in a pod's rootfs (M11.2-d7): it
+// Unpacker turns a pulled image into files in a pod's rootfs (M11.2-d7): it
 // builds (or serves) the image's content-addressed unpacked tree and clones that
 // tree into the pod rootfs. The concrete *image.Unpacker satisfies it; it is
 // defined at the consumer per the standards so tests can inject a fake that
 // touches no blob store.
 //
-// It is ONE method, not "unpack" plus "materialize", on purpose. Splitting it
+// It is one method, not "unpack" plus "materialize", on purpose. Splitting it
 // would let a caller record an image as materialized when only the tree was
 // built — the exact half-done state the M1 placeholder left behind, where the
 // blobs were cached and the pod rootfs was empty.
 //
-// policy (the layer dialect) rides on the CALL for the same reason the pull's
+// policy (the layer dialect) rides on the call for the same reason the pull's
 // PlatformPolicy does: the dialect follows the pod's resolved sandbox backend,
 // which is decided per pod.
 //
 // ImageRunConfig is the second half of the same seam and is deliberately on the
-// SAME interface: the run config and the tree come from one image, read through
+// same interface: the run config and the tree come from one image, read through
 // one verified config blob, so a fake that serves a tree without a matching
 // config could make the merge green against an image the pod would never run.
 type Unpacker interface {
@@ -93,7 +93,7 @@ type Unpacker interface {
 // Signer ad-hoc signs a pulled binary and gates it against a SignaturePolicy
 // before exec. The image package provides both halves; the Runtime consumes them
 // as one seam (fakeable in tests). gateSignature orders the two correctly per
-// policy (M2.6): ad-hoc sign ONLY for adhoc-ok; check-without-sign for
+// policy (M2.6): ad-hoc sign only for adhoc-ok; check-without-sign for
 // require-signed/require-notarized so a real signature is never silently
 // downgraded.
 type Signer interface {
@@ -111,7 +111,7 @@ type Signer interface {
 // it. A nil resolver, an empty imagePullSecrets list, or an ok==false result means
 // an anonymous pull (public images).
 //
-// The resolved credential is consumed ONLY by the image pull client and is NEVER
+// The resolved credential is consumed only by the image pull client and is never
 // written into the pod dir / materialized filesystem — the M2.6 security invariant.
 type CredentialResolver interface {
 	// PullCredential returns the credential for pulling ref given the pod's
@@ -122,15 +122,15 @@ type CredentialResolver interface {
 // VMBackend is the consumer-side seam for the Virtualization.framework micro-VM
 // isolation backend (M5.1). The Runtime queries Available() during fail-closed
 // backend selection — a pod that requested the vm backend on a host without it is
-// REFUSED, never downgraded to Seatbelt — and, when the vm rung is selected,
+// refused, never downgraded to Seatbelt — and, when the vm rung is selected,
 // routes the pod to CreateVM instead of the host-process exec-shim path. The
 // concrete *sandbox.VMBackend satisfies it; tests inject a fake. It is
-// intentionally NARROWER than sandbox.Backend: the vm path never uses WrapCommand
+// intentionally narrower than sandbox.Backend: the vm path never uses WrapCommand
 // (a Linux guest is not a confined host process).
 type VMBackend interface {
 	// Available reports whether the vm backend can run a guest on this host
 	// (Virtualization.framework supported + the com.apple.security.virtualization
-	// entitlement). It is a SAFE probe — it never constructs or boots a VM.
+	// entitlement). It is a safe probe — it never constructs or boots a VM.
 	Available() bool
 	// Name identifies the backend for logging/diagnostics.
 	Name() string
@@ -143,10 +143,10 @@ type VMBackend interface {
 	// the vm spine recorded for it. Idempotent: a pod with no live helper
 	// succeeds, which is what makes DeletePod idempotent for a vm pod too.
 	StopVM(ctx context.Context, podID string, grace time.Duration) error
-	// StopAllVMs stops every live helper CONCURRENTLY, for daemon shutdown. It
+	// StopAllVMs stops every live helper concurrently, for daemon shutdown. It
 	// is on the seam rather than open-coded in Close because the fan-out and the
 	// per-helper grace belong with the handles, and because a vm pod's helper
-	// must NOT survive the daemon (the opposite of a host-process pod, which
+	// must not survive the daemon (the opposite of a host-process pod, which
 	// survives by design — see Close).
 	StopAllVMs(ctx context.Context) error
 	// ReapOrphanVMs kills every helper a previous daemon run left behind, before
@@ -165,7 +165,7 @@ type VMBackend interface {
 	VMHelperOutput(podID string) string
 	// GuestRosettaShareSupported reports whether the guests this node builds carry
 	// a Rosetta directory share — i.e. whether a linux/amd64 ELF could actually
-	// execute in one of them. It is a SECOND, INDEPENDENT term of the node's
+	// execute in one of them. It is a second, independent term of the node's
 	// guest-Rosetta advertisement (B229), distinct from Deps.GuestRosetta: Apple's
 	// probe answers "can this Mac do Rosetta for Linux", while this answers "does
 	// the VM this node builds carry it". Advertising on the first alone would put
@@ -191,14 +191,14 @@ type Config struct {
 	// 1s (the ~1 Hz the design calls for); tests set it small.
 	SampleInterval time.Duration
 	// ResolverVIP is the cluster DNS Service VIP for this node, threaded into
-	// sandbox.Posture.ResolverVIP. PLUMBING-ONLY since M10.1: it renders NO SBPL
+	// sandbox.Posture.ResolverVIP. PLUMBING-only since M10.1: it renders NO SBPL
 	// rule (per-IP network filters do not compile on macOS 26 — see
 	// sandbox.Generate); it is the node-level DNS configuration the env/status
 	// plumbing reads. The control plane (k3sm) sets it from the service CIDR;
 	// empty falls back to sandbox.DefaultResolverVIP.
 	ResolverVIP string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the `kubernetes`
-	// ClusterIP), threaded into sandbox.Posture.APIServerVIP. PLUMBING-ONLY since
+	// ClusterIP), threaded into sandbox.Posture.APIServerVIP. PLUMBING-only since
 	// M10.1: like ResolverVIP it renders NO SBPL rule — an allow_network pod has
 	// unfiltered egress. The control plane (k3sm) sets it from the service CIDR.
 	APIServerVIP string
@@ -217,7 +217,7 @@ type Config struct {
 //
 // Concurrency: mu guards pods. Subsystem seams (puller, signer, backend,
 // spawner, waiter, network, broker) are set at construction and are themselves
-// concurrency-safe. Status changes are published through broker OUTSIDE mu.
+// concurrency-safe. Status changes are published through broker outside mu.
 type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
@@ -244,7 +244,7 @@ type Runtime struct {
 	loader *image.Loader
 	// index is the node's ref->digest image index — the record of which
 	// references this daemon pulled or ingested, and to which manifest. It is
-	// the SAME instance the puller and the loader write through (New builds
+	// the same instance the puller and the loader write through (New builds
 	// exactly one), which is what makes the Images service's listing agree with
 	// what a warm IfNotPresent pull will find.
 	//
@@ -263,13 +263,13 @@ type Runtime struct {
 	// the unix socket, tests inject an in-process listener. Never nil after New.
 	guestDialer GuestDialer
 	// rosettaHost / rosettaGuest are the two Rosetta capability probes' outcomes
-	// (B103), evaluated EAGERLY EXACTLY ONCE in New and IMMUTABLE thereafter, so the
+	// (B103), evaluated eagerly exactly once in New and IMMUTABLE thereafter, so the
 	// concurrent GetRuntimeInfo handler reads them with no lock and no race (see
 	// rosetta.go for why eager beats a sync.Once cache here). They are advertised as
-	// additive RuntimeConditions ONLY — nothing in the pod spine consumes them.
+	// additive RuntimeConditions only — nothing in the pod spine consumes them.
 	rosettaHost  rosettaCondition
 	rosettaGuest rosettaCondition
-	// gpuFacts is the host's GPU observation (M8.2-d4), probed EAGERLY EXACTLY ONCE
+	// gpuFacts is the host's GPU observation (M8.2-d4), probed eagerly exactly once
 	// in New and IMMUTABLE thereafter — so the concurrent GetRuntimeInfo handler
 	// reads it with no lock and no race, and the Metal driver round trip happens
 	// once per daemon lifetime (see gpu.go). Plain data, never a proto pointer.
@@ -313,7 +313,7 @@ type Runtime struct {
 	guestLeasePoll time.Duration
 
 	// netReconcileOnce/netReconcileErr make the optional network startup
-	// reconcile (NetworkReconciler) run exactly once per Runtime, BEFORE any
+	// reconcile (NetworkReconciler) run exactly once per Runtime, before any
 	// CreatePod is served. Once.Do provides the happens-before for the error
 	// read; a repeated Serve re-reports the sticky first result.
 	netReconcileOnce sync.Once
@@ -332,7 +332,7 @@ type Runtime struct {
 	procGroup procGroupInspector
 
 	// podReapOnce/podReapErr make the startup pod reap run exactly once per
-	// Runtime, BEFORE any CreatePod is served (same shape as the network
+	// Runtime, before any CreatePod is served (same shape as the network
 	// startup reconcile above, and like it sticky/fail-closed).
 	podReapOnce sync.Once
 	podReapErr  error
@@ -380,7 +380,7 @@ func (r *Runtime) reconcileNetworkStartup(ctx context.Context) error {
 // answers the wrong question for it. GuestNetwork answers the right one: the DNS
 // configuration plus the NAT advisory fields the guest is provisioned with.
 //
-// It is the SOLE production source of sandbox.VMSpec.Network. runtimed cannot
+// It is the sole production source of sandbox.VMSpec.Network. runtimed cannot
 // import darwin-net (the two are co-equal leaves of the cross-repo DAG), so the
 // config arrives as plain data from the k3sm provider — which owns both
 // darwin-net producers and is therefore the one mapper. The seam is a type
@@ -400,7 +400,7 @@ type GuestNetworker interface {
 
 // guestNetworkConfig resolves the pod's guest network config through the optional
 // GuestNetworker seam. A Network that does not implement the seam, or that
-// reports no config for this pod, yields the INERT zero value — the guest then
+// reports no config for this pod, yields the inert zero value — the guest then
 // boots with no /etc/resolv.conf and no NAT advisory.
 //
 // Both misses are LOGGED, which is the deliberate divergence from
@@ -433,7 +433,7 @@ type Deps struct {
 	Cache  *image.Cache
 	Puller Puller
 	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
-	// Defaults to image.NewUnpacker(cache) — the SAME cache the puller commits
+	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
 	// not verify a byte it applies, because the digests it checks against come
 	// from the manifest that store's pull resolved. Tests inject a fake.
@@ -453,21 +453,21 @@ type Deps struct {
 	GuestDialer GuestDialer
 	// HostRosetta probes whether this host can translate darwin/amd64 MACH-O
 	// payloads (Rosetta 2 — the NATIVE host-process spine's capability). Defaults to
-	// sandbox.ProbeHostRosetta; tests inject a fake. New calls it EAGERLY EXACTLY
-	// ONCE (see the rosettaHost field), so it forks at most once per daemon lifetime.
+	// sandbox.ProbeHostRosetta; tests inject a fake. New calls it eagerly exactly
+	// once (see the rosettaHost field), so it forks at most once per daemon lifetime.
 	HostRosetta func(ctx context.Context) sandbox.HostRosettaState
 	// GuestRosetta probes whether a Linux GUEST on this host could translate
 	// linux/amd64 ELF payloads (Rosetta for Linux — the vm backend's capability).
 	// Defaults to sandbox.ProbeGuestRosetta; tests inject a fake. It takes no ctx
 	// because the underlying framework-property read has nothing to cancel (its host
-	// sibling spawns a process and therefore does). New calls it EAGERLY EXACTLY
-	// ONCE, and only when VMBackend.Available() — see evalGuestRosetta.
+	// sibling spawns a process and therefore does). New calls it eagerly exactly
+	// once, and only when VMBackend.Available() — see evalGuestRosetta.
 	GuestRosetta func() sandbox.GuestRosettaState
-	// GPUProbe observes this host's GPU: the FUNCTIONAL Metal compile+dispatch probe
+	// GPUProbe observes this host's GPU: the functional Metal compile+dispatch probe
 	// plus the host sysctl facts (M8.2-d4). Defaults to sandbox.ProbeGPU; tests
 	// inject a fake, which is what makes the whole advertisement decision — the
 	// VZ-paravirtual discrimination, the wired-limit sentinel, the backend scoping —
-	// unit-provable on a machine with no GPU. New calls it EAGERLY EXACTLY ONCE (see
+	// unit-provable on a machine with no GPU. New calls it eagerly exactly once (see
 	// the gpuFacts field), so the GPU driver is touched once per daemon lifetime.
 	GPUProbe func() sandbox.GPUProbeResult
 	Spawner  supervisor.Spawner
@@ -514,7 +514,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// Absolute is required, not merely conventional: the fsGroup sink bounds its
 	// recursive chown with a strict-containment check that admits nothing when
 	// either operand is relative (supervisor.ChownForFSGroup). A relative --root
-	// would therefore refuse fsGroup for EVERY pod on the node at create time,
+	// would therefore refuse fsGroup for every pod on the node at create time,
 	// reported as a per-pod rootfs-setup failure. Failing here turns a node-wide
 	// outage with a misleading reason into one clear startup error.
 	if !filepath.IsAbs(cfg.Root) {
@@ -546,12 +546,12 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		cache = c
 	}
 	// The on-disk ref->digest index is the presence-by-reference binding: it
-	// records what THIS daemon pulled or ingested and verified, which is what
+	// records what this daemon pulled or ingested and verified, which is what
 	// makes IfNotPresent serve a warm reference with no registry traffic and
 	// Never satisfiable at all. It is constructed here — not lazily on first use
 	// — so a node whose index tree is missing, substituted, or not owned by this
 	// daemon (image.ErrIndexNotOwned) fails at startup with one clear error
-	// instead of one per pod. It is built OUTSIDE the puller branch because the
+	// instead of one per pod. It is built outside the puller branch because the
 	// ingest path records into the same index: two indexes would let a loaded
 	// reference and a pulled one disagree about what this node has.
 	index, err := image.NewFileIndex(cache)
@@ -560,7 +560,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	puller := deps.Puller
 	if puller == nil {
-		// image.RemoteFetch is named EXPLICITLY: it is the decision that chooses
+		// image.RemoteFetch is named explicitly: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
 		p, err := image.NewPuller(cache, image.RemoteFetch, index)
@@ -599,7 +599,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// com.apple.security.virtualization entitlement, so a vm-requested pod fails
 		// closed off a capable host.
 		//
-		// The state root is ALWAYS supplied: it is where the vm orphan store lives
+		// The state root is always supplied: it is where the vm orphan store lives
 		// (<Root>/vmreap), and a backend without one cannot record the helpers it
 		// spawns — so a `kill -9`ed daemon would leave guests running that no
 		// later start could find. No guest-artifact locator is wired here: that
@@ -654,7 +654,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	binder := deps.Binder
 	if binder == nil {
 		// The PV storage root is a sibling of the pods root under the runtime root
-		// (so it shares the APFS volume but is NOT under the pod dir removePodDir
+		// (so it shares the APFS volume but is not under the pod dir removePodDir
 		// tears down — that is the lifecycle decoupling). With the default
 		// Config.Root this is storagev1.DefaultBasePath (/var/lib/k3sm/storage).
 		class := storagev1.DefaultLocalPathClass()
@@ -662,23 +662,23 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		binder = volume.NewBinder(class, image.APFSCloner{}, nil, log)
 	}
 
-	// Evaluate the two Rosetta capability probes EAGERLY, EXACTLY ONCE, before the
+	// Evaluate the two Rosetta capability probes eagerly, exactly once, before the
 	// Runtime pointer escapes: the results then need no synchronisation in the
 	// concurrent GetRuntimeInfo handler (see the rosettaHost/rosettaGuest fields).
 	//
-	// context.Background() here is a KNOWN RESIDUAL, not a claim that no ctx exists.
-	// New takes none, and BOTH production callers hold a live one they DROP: this
+	// context.Background() here is a KNOWN residual, not a claim that no ctx exists.
+	// New takes none, and both production callers hold a live one they DROP: this
 	// repo's own cmd/k3sm-runtimed/main.go builds a signal.NotifyContext in the very
 	// function that calls New, and in the shipped single binary k3sm's startNode(ctx) →
 	// buildProvider(ctx, …) → provider.NewRuntimed(cfg) drops the ctx at the provider
 	// boundary. So this genuinely IS a background context below a live one, and the
 	// GO-STANDARDS §Context rule against that is not satisfied by call depth.
 	//
-	// What makes it SAFE is the probe's own internal ceiling, chosen as the deliberate
+	// What makes it safe is the probe's own internal ceiling, chosen as the deliberate
 	// substitute for cancellation: sandbox.ProbeHostRosetta time-boxes its spawn leg
 	// (2s) and bounds Wait after cancellation (500ms WaitDelay), so the constructor
 	// cannot wedge even on a never-done ctx. Fixing it properly means New(ctx, …) — a
-	// signature change across this repo's daemon main AND k3sm's provider — for a
+	// signature change across this repo's daemon main and k3sm's provider — for a
 	// probe that must degrade anyway; that cross-repo cut is B103's filed residual and
 	// is deliberately not taken here.
 	rosettaHost := evalHostRosetta(context.Background(), hostRosettaProbe)
@@ -693,7 +693,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	gpuResult := gpuProbe()
 	gpuFacts := sandbox.DeriveGPUFacts(gpuResult, backend)
-	// Log BOTH outcomes, available or not. GetRuntimeInfo's consumer discards Reason
+	// Log both outcomes, available or not. GetRuntimeInfo's consumer discards Reason
 	// and Message today, so this pair of lines is the only place an operator can
 	// answer "why is my node not labelled for Rosetta?".
 	logRosettaProbe(log, ConditionRosettaHostAvailable, rosettaHost)

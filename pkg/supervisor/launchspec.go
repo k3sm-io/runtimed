@@ -27,7 +27,7 @@ import (
 // LaunchSpec bundles the RESOLVED, proto-free inputs of one confined pod-process
 // launch: the POSIX identity to drop to, the explicit setrlimit(2) plan, and the
 // darwin QoS decision. It is the single struct the runtime threads through the
-// sandbox.Backend.WrapCommand choke-point so BOTH spawn callers (container start
+// sandbox.Backend.WrapCommand choke-point so both spawn callers (container start
 // and exec sessions) carry the same launch posture, and the shape
 // RunLaunchSequence consumes in the exec-shim.
 //
@@ -52,14 +52,14 @@ type LaunchSpec struct {
 	BgQoS bool
 }
 
-// Shim argv token vocabulary. The rlimit and qos tokens are SINGLE fixed-position
-// argv tokens inserted BEFORE the profile path in the k3sm-execshim invocation:
+// Shim argv token vocabulary. The rlimit and qos tokens are single fixed-position
+// argv tokens inserted before the profile path in the k3sm-execshim invocation:
 //
 //	<uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]
 //
-// The position is load-bearing for binary skew: an OLD (pre-B7) shim handed the
-// NEW argv reads the rlimit token where it expects its profile path, fails the
-// profile ReadFile, and exits — fail-closed; a NEW shim handed the OLD argv sees
+// The position is load-bearing for binary skew: an old (pre-B7) shim handed the
+// new argv reads the rlimit token where it expects its profile path, fails the
+// profile ReadFile, and exits — fail-closed; a new shim handed the old argv sees
 // a profile path where it expects the rlimit token, fails the decode, and exits —
 // also fail-closed. Neither skew direction can exec a pod without the limits it
 // was handed.
@@ -75,7 +75,7 @@ const (
 
 // EncodeRlimits encodes a resolved rlimit plan as the single shim argv token
 // "r=RESOURCE:cur:max[,RESOURCE:cur:max...]" (or "-" for an empty plan). The
-// RESOURCE selector is the NUMERIC darwin RLIMIT_* value — the RLIMIT_* name
+// RESOURCE selector is the numeric darwin RLIMIT_* value — the RLIMIT_* name
 // table stays daemon-side only (runtime.resolveRlimitPlan); the shim never maps
 // names. ParseRlimits is the inverse.
 func EncodeRlimits(plan []PlannedRlimit) string {
@@ -92,8 +92,8 @@ func EncodeRlimits(plan []PlannedRlimit) string {
 }
 
 // ParseRlimits decodes the shim argv rlimit token produced by EncodeRlimits.
-// "-" decodes to a nil plan. ANY malformed or truncated token is an error the
-// shim treats as FATAL (fail-closed): the shim must never skip-with-warning or
+// "-" decodes to a nil plan. any malformed or truncated token is an error the
+// shim treats as fatal (fail-closed): the shim must never skip-with-warning or
 // exec the pod without the limits it was handed — a decode failure here is the
 // binary-skew / corruption signal, not a degradable condition.
 func ParseRlimits(tok string) ([]PlannedRlimit, error) {
@@ -143,7 +143,7 @@ func EncodeQoS(bg bool) string {
 }
 
 // ParseQoS decodes the shim argv qos token produced by EncodeQoS. Anything other
-// than the two exact tokens is an error the shim treats as FATAL (fail-closed),
+// than the two exact tokens is an error the shim treats as fatal (fail-closed),
 // same contract as ParseRlimits.
 func ParseQoS(tok string) (bool, error) {
 	switch tok {

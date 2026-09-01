@@ -27,8 +27,8 @@ import (
 // pod) that actually builds and boots the Linux guest. The runtime ships it
 // beside its own binary, exactly as it ships ExecShimName.
 //
-// The SPLIT IS THE SECURITY DESIGN, not packaging tidiness: this helper is the
-// ONLY k3sm binary signed with com.apple.security.virtualization, so the daemon
+// The split IS the SECURITY DESIGN, not packaging tidiness: this helper is the
+// only k3sm binary signed with com.apple.security.virtualization, so the daemon
 // — which parses images, talks to the apiserver's provider and serves a gRPC
 // socket — carries no virtualization authority at all. Whatever the daemon can
 // be made to do, it cannot create a VZVirtualMachine.
@@ -38,16 +38,16 @@ const VMHostName = "k3sm-vmhost"
 var ErrVMHostNotFound = errors.New("sandbox: k3sm-vmhost helper not found")
 
 // VMHostRosettaShareSupported reports whether the k3sm-vmhost helper attaches a
-// Rosetta directory share to the guests it builds. It is FALSE in this build,
-// and the falsehood is the POINT (B229).
+// Rosetta directory share to the guests it builds. It is false in this build,
+// and the falsehood is the point (B229).
 //
-// A node advertises guest-Rosetta as VMBackendAvailable AND RosettaGuestAvailable
+// A node advertises guest-Rosetta as VMBackendAvailable and RosettaGuestAvailable
 // (see pkg/runtime's ConditionRosettaGuestAvailable), and the image-pull platform
 // policy turns that capability into "linux/amd64 is a legal pull candidate for a
 // vm pod". Apple's +[VZLinuxRosettaDirectoryShare availability] can perfectly
 // well say Installed on this Mac while the helper attaches no share — and then
 // every amd64 image would be pulled and then fail to execute, because nothing in
-// the guest can translate it. Gating the advertisement on THIS constant makes the
+// the guest can translate it. Gating the advertisement on this constant makes the
 // demotion structural: the capability comes back only when the helper is changed
 // to attach the share and this constant is flipped in the same commit.
 //
@@ -55,7 +55,7 @@ var ErrVMHostNotFound = errors.New("sandbox: k3sm-vmhost helper not found")
 // to observe. What is being reported is what the helper BUILDS, which is decided
 // by this repo's source and nothing else.
 //
-// SINGLE-HOME CAVEAT. The helper's own copy of this fact is
+// single-HOME CAVEAT. The helper's own copy of this fact is
 // k3sm.io/runtimed/pkg/vmhost.RosettaShareSupported, and this package cannot
 // import that one: pkg/vmhost imports github.com/Code-Hex/vz, and pkg/sandbox is
 // imported by pkg/runtime, so the import would drag the Virtualization-linking
@@ -84,14 +84,14 @@ func FindVMHost() (string, error) {
 	return "", ErrVMHostNotFound
 }
 
-// ProcessVirtualizationEntitled reports whether THIS process's static code
+// ProcessVirtualizationEntitled reports whether this process's static code
 // signature carries com.apple.security.virtualization. Off the darwin+cgo lane
 // it is false.
 //
 // It exists for the k3sm-vmhost helper's own startup PREFLIGHT: constructing a
 // VZVirtualMachine without the entitlement raises an uncaught NSException →
 // SIGABRT, so the helper checks first and exits with a legible message instead of
-// dying with a crash report. The daemon does NOT gate on it — the daemon is
+// dying with a crash report. The daemon does not gate on it — the daemon is
 // deliberately unentitled (see VMHostName), and VMBackend.Available() asks about
 // the HELPER's signature instead.
 func ProcessVirtualizationEntitled() bool { return vzEntitled() }

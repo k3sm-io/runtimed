@@ -61,7 +61,7 @@ type Ident struct {
 //
 //   - "" means 0:0. guest/v1 has no way to say "unset" (uid 0 IS root), so an
 //     empty spec is the caller's explicit request for root.
-//   - A NUMERIC id is used as given and is NEVER looked up. An image whose
+//   - A numeric id is used as given and is never looked up. An image whose
 //     passwd file lacks the uid still runs — that is how scratch images with a
 //     numeric USER work.
 //   - A NAME must be present in the database. A missing name is
@@ -136,7 +136,7 @@ func parseID(s string) (int64, error) {
 
 // lookupPasswd finds name in a passwd(5) database and returns its uid and gid.
 //
-// A malformed line is SKIPPED rather than fatal: the database comes from the
+// A malformed line is skipped rather than fatal: the database comes from the
 // pod's own image, and a stray line in some vendor's /etc/passwd must not stop
 // the pod from starting. A malformed line for the name being looked up simply
 // fails to match, which surfaces as ErrNoSuchUser.

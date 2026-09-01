@@ -50,7 +50,7 @@ func (f *freeProbe) sample(string) (uint64, error) {
 
 // blobFileSet is every file currently in the content-addressed store, by
 // store-relative path. Comparing it across a call is how a row proves the pull
-// wrote NOTHING — stronger than CacheHit, which reports what the puller believes
+// wrote nothing — stronger than CacheHit, which reports what the puller believes
 // rather than what landed on disk.
 func blobFileSet(t *testing.T, c *Cache) map[string]struct{} {
 	t.Helper()
@@ -89,7 +89,7 @@ func sameFileSet(a, b map[string]struct{}) bool {
 }
 
 // TestPullRefusesUnderDiskPressure is the disk-pressure gate: past a free-space floor the
-// puller REFUSES TO BEGIN a new fetch, fail-closed, while content already on the
+// puller refuses TO BEGIN a new fetch, fail-closed, while content already on the
 // node is still served.
 //
 // The property it defends is not a node inconvenience. /var/lib/k3sm is shared
@@ -98,22 +98,22 @@ func sameFileSet(a, b map[string]struct{}) bool {
 // prevent that, because reclaim frees only what nothing references and a fully
 // referenced store has nothing to give back.
 //
-// Every refusal row is wired to a fetcher that CANNOT SUCCEED (offlineFetch) and
+// Every refusal row is wired to a fetcher that cannot succeed (offlineFetch) and
 // asserts zero calls on it, so "refused" means no registry traffic happened
 // rather than none happened to be needed. Every serve row additionally asserts
-// the blob store is byte-for-byte unchanged: OVER-blocking is a bug too, and a
+// the blob store is byte-for-byte unchanged: over-blocking is a bug too, and a
 // gate that quietly refused warm IfNotPresent/Never serves would strand pods
 // whose images this node already holds, at exactly the moment it cannot fetch
 // them again.
 //
-// NOTE ON THE SPLIT: TestSnapshotPrune is the name reserved for the other half —
+// NOTE ON the split: TestSnapshotPrune is the name reserved for the other half —
 // pruning extracted snapshot TREES — which stays blocked because the
 // snapshot store does not exist yet. This gate covers the disk-pressure
 // stop-new-pulls condition only.
 func TestPullRefusesUnderDiskPressure(t *testing.T) {
 	const ref = "example.com/app:latest"
 
-	// Rows are stated RELATIVE to the shipped constant, so the table exercises
+	// Rows are stated relative to the shipped constant, so the table exercises
 	// the production floor rather than a number invented for the test.
 	const (
 		atFloor    = DefaultPullRefuseFreeBytes
@@ -188,7 +188,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			wantErr:     ErrPullRefusedDiskPressure,
 		},
 		{
-			// A recorded reference whose blobs were evicted is a MISS, so it is
+			// A recorded reference whose blobs were evicted is a miss, so it is
 			// a fetch and it refuses — presence is about the bytes, not the entry.
 			name:        "below_floor_recorded_but_evicted_refused",
 			pull:        runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
@@ -199,7 +199,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			wantErr:     ErrPullRefusedDiskPressure,
 		},
 		{
-			// THE OVER-BLOCKING ROW. A warm node under pressure still starts pods.
+			// the over-BLOCKING ROW. A warm node under pressure still starts pods.
 			name:         "below_floor_if_not_present_warm_still_served",
 			pull:         runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
 			state:        stateWarm,
@@ -209,7 +209,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			wantCacheHit: true,
 		},
 		{
-			// Never NEVER fetches, so pressure can have no bearing on it at all.
+			// Never never fetches, so pressure can have no bearing on it at all.
 			name:         "below_floor_never_warm_still_served",
 			pull:         runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
 			state:        stateWarm,
@@ -219,7 +219,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			wantCacheHit: true,
 		},
 		{
-			// Never + absent is ErrImageNotPresent, NOT the pressure error: the
+			// Never + absent is ErrImageNotPresent, not the pressure error: the
 			// presence verdict is reached first and is the honest one. Reporting
 			// disk pressure would send an operator to free space for a pull that
 			// was never going to happen.
@@ -232,7 +232,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			wantErr:     ErrImageNotPresent,
 		},
 		{
-			// ALWAYS is refused even on a warm node: honoring it requires the
+			// always is refused even on a warm node: honoring it requires the
 			// re-resolution being refused, and serving the recorded content
 			// instead would silently answer IfNotPresent.
 			name:        "below_floor_always_warm_still_refused",
@@ -244,7 +244,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			wantErr:     ErrPullRefusedDiskPressure,
 		},
 		{
-			// FAIL-CLOSED ON IGNORANCE: an unsamplable volume refuses. It matches
+			// fail-closed ON IGNORANCE: an unsamplable volume refuses. It matches
 			// both sentinels, so a caller can key on the refusal or on its cause.
 			name:        "unsamplable_volume_refuses",
 			pull:        runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
@@ -280,7 +280,7 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 				primeLocalImage(t, cache, idx, ref, img, tc.state == stateEvicted)
 			}
 
-			// Every row expecting ZERO fetches is wired to a fetcher that cannot
+			// Every row expecting zero fetches is wired to a fetcher that cannot
 			// succeed, so a gate that leaked would fail loudly rather than
 			// quietly; the admitting rows get a working one, which is the
 			// positive control that makes the refusals mean "refused" rather
@@ -362,11 +362,11 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 		}
 	})
 
-	// THE COMPOSITION. The floor's value is chosen by its ordering against the
+	// the COMPOSITION. The floor's value is chosen by its ordering against the
 	// thresholds either side of it, so the ordering — not the number — is what
 	// is pinned. Re-ordering it (a floor above the GC trigger) must fail here.
 	t.Run("floor_composes_with_the_reclaim_constants", func(t *testing.T) {
-		// the proposed node DiskPressure floor (an ABSOLUTE
+		// the proposed node DiskPressure floor (an absolute
 		// floor, True below 2 GiB free, clearing at 10 GiB"). It is spelled here
 		// as a literal because it is a PROPOSAL — no shipped symbol carries it
 		// yet — and this assertion is what will red when a value lands that

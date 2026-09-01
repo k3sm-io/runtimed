@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package vmhost builds and runs ONE vm-backend pod's Linux micro-VM. It is the
+// Package vmhost builds and runs one vm-backend pod's Linux micro-VM. It is the
 // library half of cmd/k3sm-vmhost, the per-pod helper process that is the only
 // k3sm binary carrying com.apple.security.virtualization.
 //
@@ -32,12 +32,12 @@ limitations under the License.
 //	guestv1.VMHostSpec --FromSpec--> MachineConfig --realize--> *vz.VirtualMachineConfiguration
 //
 // MachineConfig is a pure Go value with no pointers into Objective-C and no
-// dependency on the Virtualization framework, so ALL the validation — path
+// dependency on the Virtualization framework, so all the validation — path
 // containment, share-tag legality, pairwise-disjoint share roots, vcpu/memory
 // clamping, read-only enforcement — lives in FromSpec and is table-testable on
 // any OS, including a Linux CI lane and a Mac with no entitlement. realize is a
 // mechanical field-for-field construction with no decisions left in it, and is
-// the ONLY thing behind the darwin+cgo build tag.
+// the only thing behind the darwin+cgo build tag.
 //
 // The direction matters: nothing converts a *vz.VirtualMachineConfiguration back
 // into a MachineConfig, so there is no path by which framework state can become
@@ -45,7 +45,7 @@ limitations under the License.
 //
 // # The import boundary
 //
-// github.com/Code-Hex/vz is reachable ONLY from this package (in vz_darwin.go)
+// github.com/Code-Hex/vz is reachable only from this package (in vz_darwin.go)
 // and from cmd/k3sm-vmhost. Nothing in pkg/runtime, pkg/sandbox, pkg/image,
 // pkg/mount or pkg/supervisor may reach it, so the shipped k3sm daemon links no
 // Virtualization framework at all. That boundary is what makes the entitlement

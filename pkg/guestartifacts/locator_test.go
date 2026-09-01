@@ -62,7 +62,7 @@ func TestLocator(t *testing.T) {
 			}
 		}
 		// The witness that the hash is recomputed and not remembered: the file
-		// is removed AFTER three good calls, and the fourth must notice.
+		// is removed after three good calls, and the fourth must notice.
 		if err := os.Remove(art.KernelPath); err != nil {
 			t.Fatalf("remove the kernel: %v", err)
 		}
@@ -118,10 +118,10 @@ func assertNames(t *testing.T, err error, want string) {
 }
 
 // ============================================================================
-// Mutation legs for the locator. Each one is a state a VERIFY-ONCE locator — the
+// Mutation legs for the locator. Each one is a state a VERIFY-once locator — the
 // constant closure this API replaced — would happily boot: the artifacts passed
 // verification at daemon start and changed afterwards. They are named Mutation*
-// so hack/acceptance/B108.sh can assert each RAN, on the same discipline as the
+// so hack/acceptance/B108.sh can assert each ran, on the same discipline as the
 // ensure ladder.
 // ============================================================================
 

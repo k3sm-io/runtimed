@@ -48,7 +48,7 @@ func TestNewRejectsUnusableRoot(t *testing.T) {
 			}
 		})
 	}
-	// POSITIVE CONTROL: an absolute, clean root still constructs (t.TempDir() is
+	// positive CONTROL: an absolute, clean root still constructs (t.TempDir() is
 	// both), or the guards above would refuse every daemon.
 	t.Run("positive/absolute-and-clean", func(t *testing.T) {
 		if rt := newTestRuntimeCfg(t, Config{Root: t.TempDir()}, Deps{}); rt == nil {
@@ -58,23 +58,23 @@ func TestNewRejectsUnusableRoot(t *testing.T) {
 }
 
 // TestDataVolumePathMustBeDerived is B142's primary gate: a
-// sandbox_profile.data_volume_path that is not one of THIS pod's two derived
+// sandbox_profile.data_volume_path that is not one of this pod's two derived
 // spellings is refused at the CreatePod ingress, with the terminal reason.
 //
 // It is a separate gate from the sandbox-side bound, not a duplicate of it,
 // because the two guards fail on different inputs and one test cannot witness
-// both. The headline row here — <PodsRoot>/<OTHER-ID>/rootfs — is a row
+// both. The headline row here — <PodsRoot>/<other-ID>/rootfs — is a row
 // sandbox.Generate ACCEPTS: it is properly under the pods root, which is all the
 // generator can check without a pod id. Only the runtime knows which pod is
 // asking. Conversely the ancestor rows ("/", the work-dir) are the sink's
 // business. A single test over either layer alone would pass while the other
 // half of the class stayed open, which is why both layers carry their own.
 //
-// The reason assertion is load-bearing and is NOT merely "an error came back":
+// The reason assertion is load-bearing and is not merely "an error came back":
 // SANDBOX_SETUP is what the provider's retry logic reads as a transient host
 // fault, so a guard that surfaced this as SANDBOX_SETUP would have the provider
 // re-submit an unchanged, permanently-invalid box forever. A value the caller
-// must CHANGE is terminal: INVALID_POD_BOX.
+// must change is terminal: INVALID_POD_BOX.
 func TestDataVolumePathMustBeDerived(t *testing.T) {
 	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: newBlockingWaiter()})
 	podsRoot := rt.cache.PodsRoot()
@@ -87,7 +87,7 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 		podID   string
 		dataVol string
 	}{{
-		// THE case layer 2 cannot catch: properly under the pods root, so the
+		// the case layer 2 cannot catch: properly under the pods root, so the
 		// SBPL bound accepts it, and it re-allows read+write over another pod's
 		// materialized secrets and projected SA-token.
 		name:    "cross-pod-into-another-pods-rootfs",
@@ -99,7 +99,7 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 		dataVol: filepath.Join(podsRoot, otherID),
 	}, {
 		// Case aliasing: the default APFS volume is case-insensitive, so this
-		// NAMES the victim's directory while spelling a different id.
+		// names the victim's directory while spelling a different id.
 		name:    "uppercase-id-alias-on-case-insensitive-apfs",
 		podID:   "pod-cross-case",
 		dataVol: filepath.Join(podsRoot, strings.ToUpper(otherID), "rootfs"),
@@ -120,7 +120,7 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 		podID:   "pod-abs",
 		dataVol: "/private/var/db",
 	}, {
-		// A deeper path INSIDE the pod's own dir: strictly less privilege than
+		// A deeper path inside the pod's own dir: strictly less privilege than
 		// the derivation, but still refused — the rule is equality with one of
 		// two spellings, not containment, so there is no third accepted shape to
 		// reason about.
@@ -152,7 +152,7 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 			if resp.GetError() == nil {
 				t.Fatalf("CreatePod(data_volume_path=%q) succeeded; an underived data volume must be refused", tc.dataVol)
 			}
-			// NOT SANDBOX_SETUP: that reads as a transient host fault to the
+			// not SANDBOX_SETUP: that reads as a transient host fault to the
 			// provider's retry logic, and this box can never become valid without
 			// the caller changing it.
 			if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
@@ -173,9 +173,9 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 		t.Errorf("stat %s = %v; a refused data volume must not have been created", otherRootfs, err)
 	}
 
-	// POSITIVE CONTROLS for BOTH accepted spellings. Without them this gate
+	// positive CONTROLS for both accepted spellings. Without them this gate
 	// cannot distinguish "underived values refused" from "every pod on the node
-	// refused" — and the PodDir row specifically pins the spelling the ONLY
+	// refused" — and the PodDir row specifically pins the spelling the only
 	// producer (the k3sm provider's podRoot(id)) actually sends, so a future
 	// tightening to rootfs-only cannot land silently.
 	positive := []struct {
@@ -203,7 +203,7 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 				t.Fatalf("dataVolumePath = (%q, %v), want (%q, nil)", got, err, want)
 			}
 			// Whichever accepted spelling arrived, the profile re-allows the
-			// NARROWER one — the rootfs. The accept set is a compatibility surface
+			// narrower one — the rootfs. The accept set is a compatibility surface
 			// (the producer sends the pod dir); the EMITTED value is the privilege
 			// surface, and nothing a Seatbelt pod needs lives above <podDir>/rootfs.
 			// Asserting the emitted tree rather than the accepted one is what keeps
@@ -218,7 +218,7 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 			if !strings.Contains(p.profile, "(allow file-read* file-write*\n  (subpath \""+rootfs+"\")") {
 				t.Fatalf("the profile does not re-allow the narrowed rootfs %q (accepted %q):\n%s", rootfs, want, p.profile)
 			}
-			// And it must NOT re-allow the pod dir, which is one level wider.
+			// And it must not re-allow the pod dir, which is one level wider.
 			if podDir := rt.cache.PodDir(mustPodID(t, tc.podID)); strings.Contains(p.profile, "(subpath \""+podDir+"\")") {
 				t.Errorf("the profile re-allows the pod dir %q; the emitted grant must be the rootfs only", podDir)
 			}

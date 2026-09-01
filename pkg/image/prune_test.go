@@ -40,7 +40,7 @@ func node(seed byte, size int64, age time.Duration) BlobNode {
 	}
 }
 
-// TestPlanPruneReachability pins the planner's ONE rule — a content blob is kept
+// TestPlanPruneReachability pins the planner's one rule — a content blob is kept
 // iff a daemon-authored root names it or a lease pins it — and every fail-closed
 // exit from it. The planner is pure, so each row is exact.
 func TestPlanPruneReachability(t *testing.T) {

@@ -25,9 +25,9 @@ import (
 )
 
 // TestVMAvailableRequiresEntitledHelper is B227's named gate. It proves the vm
-// backend's availability is the FULL five-term conjunction — darwin, the macOS
+// backend's availability is the full five-term conjunction — darwin, the macOS
 // floor, +[VZVirtualMachine isSupported], the k3sm-vmhost helper resolving at its
-// installed path, and that helper's signature being VALID and
+// installed path, and that helper's signature being valid and
 // virtualization-entitled — by driving each term to false on its own and asserting
 // the whole answer collapses.
 //
@@ -38,7 +38,7 @@ import (
 // unavailable, and it is a separate row from "not entitled at all" precisely so a
 // future refactor cannot collapse the two into one plist read.
 //
-// Hermetic: no real Virtualization.framework, no signing, no root. The REAL cgo
+// Hermetic: no real Virtualization.framework, no signing, no root. The real cgo
 // probes are exercised separately by TestVMBackendAvailableFalseWithoutEntitlement.
 func TestVMAvailableRequiresEntitledHelper(t *testing.T) {
 	const macOS26 = 26

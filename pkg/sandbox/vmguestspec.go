@@ -33,16 +33,16 @@ import (
 	guestv1 "k3sm.io/apis/guest/v1"
 )
 
-// THE BOOT CONTRACT'S PRODUCER.
+// the BOOT contract'S PRODUCER.
 //
 // pkg/guestinit has read guest-spec.json since it was written, and until this
-// file nothing produced one: CreateVM created the k3sm.spec share root EMPTY and
+// file nothing produced one: CreateVM created the k3sm.spec share root empty and
 // left the guest to fail in its own init. The composer below is the other end of
 // that contract, and it meets the reader at guest/v1 and nowhere else — exactly
 // as buildVMHostSpec meets the k3sm-vmhost helper there (see vmspec.go's header
 // for why pkg/vmhost is unreachable from the daemon at all).
 //
-// The two specs are written by the SAME host in the SAME breath, which is what
+// The two specs are written by the same host in the same breath, which is what
 // guest.proto's equality requirements between them depend on: GuestSpec.agent_port
 // == VMHostSpec.agent_vsock_port (both VMAgentVsockPort) and GuestSpec.rosetta ==
 // VMHostSpec.rosetta (both VMHostRosettaShareSupported). Neither value is decided
@@ -61,15 +61,15 @@ const VMGuestSpecFileName = "guest-spec.json"
 // guestShareStageRoot is the guest directory a POOLED virtiofs share is mounted
 // at before its per-volume subdirectories are bound onto their mount paths.
 //
-// It is derived from guestinit.GuestRoot so the guest-private tree keeps ONE
+// It is derived from guestinit.GuestRoot so the guest-private tree keeps one
 // root authority; only the subdirectory below it is this composer's convention.
 // A staging mount is emitted only when it is unavoidable: a virtiofs device
-// mounts a WHOLE share at one target, so a volume that lives in a subdirectory
+// mounts a whole share at one target, so a volume that lives in a subdirectory
 // of a pooled share (k3sm.proj/<volume>, k3sm.vols/<volume>) cannot be mounted
 // at its mount path directly — it has to be mounted once and bound out of.
 //
-// RESIDUAL, recorded rather than papered over: guestinit re-exposes EVERY
-// pod-level mount inside EVERY container's rootfs (containerVisibleMounts), so a
+// residual, recorded rather than papered over: guestinit re-exposes every
+// pod-level mount inside every container's rootfs (containerVisibleMounts), so a
 // staged pooled share is visible to every container in the pod, not only to the
 // containers that declared a volumeMount from it. That does not widen the VM's
 // own boundary — the pooled device is attached to the machine regardless, and
@@ -89,11 +89,11 @@ var ErrInvalidGuestSpec = errors.New("sandbox: invalid guest spec")
 // buildGuestSpec composes the pod's boot contract from the VMSpec, its share
 // plan and its guest network config.
 //
-// IT IS PURE AND OS-INDEPENDENT: it touches no disk, so the whole mapping is
+// IT IS pure and OS-independent: it touches no disk, so the whole mapping is
 // table-testable on any lane, and the one thing that writes (writeGuestSpec) does
 // nothing but marshal and rename.
 //
-// THE DNS CONFIGURATION IS TAKEN FROM THE STRUCTURED TRIPLE ONLY. GuestNetworkConfig
+// the DNS configuration is taken from the structured triple only. GuestNetworkConfig
 // carries the same configuration twice — Nameservers/Searches/Options and the
 // host-rendered ResolvConf string — and only the structured form crosses, because
 // the guest renders /etc/resolv.conf musl-safely for its own libc
@@ -104,7 +104,7 @@ var ErrInvalidGuestSpec = errors.New("sandbox: invalid guest spec")
 // at all, and the guest logs a resolver-less boot instead of inheriting a
 // silently half-parsed one.
 //
-// AN EMPTY CONTAINER LIST IS NOT REJECTED HERE. guestinit.Plan refuses a pod with
+// AN empty CONTAINER list IS not rejected here. guestinit.Plan refuses a pod with
 // no containers, and it is the right refuser: it is PID 1 of a VM that exists to
 // run exactly this pod, so its refusal names the pod's own boot. Rejecting here
 // as well would only move the same failure one process earlier, and the producer
@@ -138,7 +138,7 @@ func buildGuestSpec(spec VMSpec) (*guestv1.GuestSpec, error) {
 	}, nil
 }
 
-// guestResolvConf maps the STRUCTURED half of the guest network config onto the
+// guestResolvConf maps the structured half of the guest network config onto the
 // guest/v1 message. It returns nil — not an empty message — when the config
 // carries no structured DNS at all, so "no resolver was injected" and "an empty
 // resolver was injected" stay distinguishable on the wire.
@@ -177,9 +177,9 @@ func shareIndex(shares []VMShare) (map[string]VMShare, error) {
 
 // guestContainers maps the pod's containers onto guest/v1, in the order given.
 //
-// THE MERGED ARGV RIDES IN command, WITH args EMPTY. guest/v1 defines argv as
+// the merged argv rides in command, with args empty. guest/v1 defines argv as
 // command + args and states that the merge against the image config already
-// happened host-side (pkg/image.MergeRunSpec produces ONE merged Argv), so
+// happened host-side (pkg/image.MergeRunSpec produces one merged Argv), so
 // re-splitting it into two halves here would invent a boundary the merge had
 // already dissolved — and any split reassembles to the same argv, which makes
 // the split pure noise a reader has to verify.
@@ -223,9 +223,9 @@ func guestContainers(containers []VMContainer, shares map[string]VMShare) ([]*gu
 // guestMounts expands the share plan into the pod-level mounts the guest
 // performs before any container starts.
 //
-// THE PLAN IS PER-CONTAINER AND guest/v1's MOUNT LIST IS POD-LEVEL, so this is a
+// the PLAN IS per-CONTAINER and guest/v1's MOUNT list IS POD-level, so this is a
 // FLATTENING, and the flattening is checked rather than assumed: two containers
-// asking for DIFFERENT sources at the SAME target cannot both be honoured by a
+// asking for different sources at the same target cannot both be honoured by a
 // pod-level mount list, so that is a fail-closed rejection here instead of a
 // last-writer-wins mount in the guest. Identical requests from several
 // containers collapse to one mount, which is what the guest wants anyway — a
@@ -320,8 +320,8 @@ func guestMounts(plan VMVolumePlan, shares map[string]VMShare, fsGroup int64) ([
 				return nil, fmt.Errorf("%w: container %q volume %q is a Memory emptyDir with sub_path %q; a guest tmpfs is created empty, so there is no subdirectory to mount",
 					ErrInvalidGuestSpec, name, t.VolumeName, t.SubPath)
 			}
-			// NO IDMAP ON A TMPFS, ever. An idmapped mount exists to make
-			// HOST-OWNED files appear under the container's ids without a
+			// No idmap on a tmpfs, ever. An idmapped mount exists to make
+			// host-owned files appear under the container's ids without a
 			// recursive chown; a guest tmpfs is created empty by the guest
 			// itself, so its ownership is set at creation and there is nothing
 			// to remap. The apis golden fixture shows the same shape.
@@ -340,7 +340,7 @@ func guestMounts(plan VMVolumePlan, shares map[string]VMShare, fsGroup int64) ([
 }
 
 // idmapWanted reports whether a HOST-BACKED mount (virtiofs or a bind out of
-// one) should carry an idmapped-mount request: the pod declares an fsGroup AND
+// one) should carry an idmapped-mount request: the pod declares an fsGroup and
 // the mount is writable.
 //
 // fsGroup exists so the pod's processes can WRITE the volume as a group they
@@ -384,15 +384,15 @@ func sortedKeys[V any](m map[string]V) []string {
 	return out
 }
 
-// parseQuantityBytes converts a Kubernetes resource.Quantity string to BYTES.
+// parseQuantityBytes converts a Kubernetes resource.Quantity string to bytes.
 //
 // The size limit crosses the boundary as an int64 (GuestMount.size_limit_bytes)
 // while the pod spec carries it as a quantity STRING, so the translation has to
 // happen somewhere host-side, and here is the only place that holds both ends.
 //
-// IT IS DELIBERATELY NARROW AND FAIL-CLOSED. Accepted: an unsigned integer with
+// IT IS deliberately NARROW and fail-closed. Accepted: an unsigned integer with
 // an optional binary (Ki/Mi/Gi/Ti/Pi/Ei) or decimal (k/M/G/T/P/E) suffix, which
-// is how every emptyDir sizeLimit is written in practice. REFUSED: the
+// is how every emptyDir sizeLimit is written in practice. refused: the
 // fractional ("1.5Gi"), exponent ("2e3") and milli ("100m") forms upstream also
 // admits — refusing them fails the pod with the quantity quoted, whereas
 // rounding one would silently bound a tmpfs somewhere the operator did not ask
@@ -446,11 +446,11 @@ func marshalGuestSpec(gs *guestv1.GuestSpec) ([]byte, error) {
 // and returns its path. The share root itself is created by writeVMHostSpec,
 // which runs first in the same boot.
 //
-// THE FILE IS TAMPER-EVIDENT FROM THE GUEST SIDE, and it is the ORDERING plus
+// the FILE IS TAMPER-EVIDENT from the GUEST side, and it is the ordering plus
 // the DEVICE FLAG that make it so, not the 0444 mode. The k3sm.spec share is
 // forced read-only at the VZ device (vmhost.forcedReadOnlyTags names it: "a
 // guest that could rewrite it could re-describe itself"), and this write
-// completes BEFORE the helper is spawned — so no guest exists while the file is
+// completes before the helper is spawned — so no guest exists while the file is
 // being composed, and once one does it holds a read-only device. The 0444 mode
 // is defence in depth against a HOST-side accident, never the enforcement point.
 //

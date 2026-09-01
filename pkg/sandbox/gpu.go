@@ -24,7 +24,7 @@ import "strings"
 // which is why a host fact belongs in a GPU report at all.
 type HostFacts struct {
 	// ChipBrand is the marketing chip name exactly as the host reports it
-	// ("Apple M1 Ultra"), carried VERBATIM. It is the raw fact and is NOT a valid
+	// ("Apple M1 Ultra"), carried verbatim. It is the raw fact and is not a valid
 	// Kubernetes label value; the node-label slug is the advertising consumer's
 	// derivation, not this layer's.
 	ChipBrand string
@@ -36,7 +36,7 @@ type HostFacts struct {
 	// IOGPUWiredLimitBytes is the configured iogpu wired-memory limit in bytes.
 	//
 	// 0 is a MODELLED SENTINEL: "no explicit limit is configured, the kernel
-	// default applies". It does NOT mean unbounded and it does NOT mean unknown.
+	// default applies". It does not mean unbounded and it does not mean unknown.
 	// The host reports the sysctl as 0 precisely when no override is set, so the
 	// sentinel is the host's own answer rather than a substitute for a missing one
 	// — and a read that FAILS also lands on 0, which is the fail-closed direction:
@@ -55,14 +55,14 @@ type GPUProbeResult struct {
 	Host HostFacts
 }
 
-// GPUFacts is what the daemon REPORTS about this host's GPU — the facts the node
+// GPUFacts is what the daemon reports about this host's GPU — the facts the node
 // advertisement is derived from. It is plain data, not a proto message, for the
 // same reason the Rosetta conditions are: the value is computed once at daemon
 // construction and read by a concurrent RPC handler, and handing every caller the
 // same proto pointer invites a cross-RPC mutation. The RPC layer stamps a fresh
 // message from these values.
 type GPUFacts struct {
-	// MetalAvailable reports a usable Metal device: the functional probe passed AND
+	// MetalAvailable reports a usable Metal device: the functional probe passed and
 	// the device is not paravirtual.
 	MetalAvailable bool
 	// ChipBrand / ChipFamily / MemBytes / IOGPUWiredLimitBytes /
@@ -74,11 +74,11 @@ type GPUFacts struct {
 	MemBytes                      uint64
 	IOGPUWiredLimitBytes          uint64
 	RecommendedMaxWorkingSetBytes uint64
-	// SandboxGPUSupported reports whether the CURRENTLY-SELECTED backend can grant
+	// SandboxGPUSupported reports whether the CURRENTLY-selected backend can grant
 	// a pod GPU access at all (see SandboxGPUSupported). It is scoped to the
 	// backend, never a hardware property.
 	SandboxGPUSupported bool
-	// Reason is the probe's machine token (MetalReason*). It is NOT part of the
+	// Reason is the probe's machine token (MetalReason*). It is not part of the
 	// reported wire message — it exists so the daemon can log, once, why a node is
 	// or is not GPU-capable, which is the question an operator actually asks.
 	Reason string
@@ -88,11 +88,11 @@ type GPUFacts struct {
 // into the facts the daemon reports. It is pure, so the whole advertisement
 // decision is unit-testable over a fake probe seam with no GPU present.
 //
-// The availability verdict is FUNCTIONAL AND NON-PARAVIRTUAL (MetalStatus.Available):
+// The availability verdict is functional and non-PARAVIRTUAL (MetalStatus.Available):
 // a VZ guest hands back a non-nil device that can even complete a compute dispatch,
 // so a node inside a VM would otherwise advertise a GPU that no pod can use.
 //
-// When the verdict is false EVERY node-facing field is CLEARED. That is the
+// When the verdict is false every node-facing field is CLEARED. That is the
 // deliberate choice over reporting "metal_available=false, chip=Apple M4 Max, 64
 // GiB": those numbers exist to size GPU workloads, so a consumer that reads one
 // while ignoring the false — the classic partial-read bug — must find a zero, not a
@@ -115,7 +115,7 @@ func DeriveGPUFacts(p GPUProbeResult, backend Backend) GPUFacts {
 }
 
 // ProbeGPU is the production GPU probe seam: the functional Metal probe plus the
-// host sysctl reads. It is called EAGERLY, EXACTLY ONCE, at daemon construction —
+// host sysctl reads. It is called eagerly, exactly once, at daemon construction —
 // never per pod — so the GPU driver is touched once per daemon lifetime.
 //
 // It takes no context because neither leg has anything to cancel: the sysctl reads

@@ -28,7 +28,7 @@ import "C"
 import "unsafe"
 
 // vzSupported reports +[VZVirtualMachine isSupported] via the Obj-C shim
-// (vm_darwin.m) — a SAFE probe that never constructs a VM. See VMBackend.
+// (vm_darwin.m) — a safe probe that never constructs a VM. See VMBackend.
 func vzSupported() bool {
 	return C.k3sm_vz_supported() != 0
 }
@@ -36,7 +36,7 @@ func vzSupported() bool {
 // vzEntitled reports whether this process's static code-signing information
 // carries com.apple.security.virtualization == true, read via Security.framework
 // in the Obj-C shim. The vm backend gates on it because instantiating a
-// VZVirtualMachine WITHOUT the entitlement raises an uncaught NSException →
+// VZVirtualMachine without the entitlement raises an uncaught NSException →
 // SIGABRT, so the probe must determine entitlement presence without ever touching
 // Virtualization.framework's VM-construction path.
 func vzEntitled() bool {
@@ -44,7 +44,7 @@ func vzEntitled() bool {
 }
 
 // vzStaticCodeEntitled reports whether the binary at path has a signature that
-// passes SecStaticCodeCheckValidity AND carries com.apple.security.virtualization,
+// passes SecStaticCodeCheckValidity and carries com.apple.security.virtualization,
 // read via Security.framework in the Obj-C shim (B227).
 //
 // It answers about ANOTHER binary (the k3sm-vmhost helper), which is why it is a
@@ -61,7 +61,7 @@ func vzStaticCodeEntitled(path string) bool {
 
 // vzRosettaAvailability reports the host's Rosetta-for-Linux (GUEST translation)
 // availability via the Obj-C shim's +[VZLinuxRosettaDirectoryShare availability]
-// class-property read — a SAFE, ENTITLEMENT-FREE probe that constructs no object
+// class-property read — a safe, ENTITLEMENT-free probe that constructs no object
 // and never attempts an install (B103). The raw 3-valued enum is preserved, plus
 // the shim's QUERY_FAILED sentinel; see GuestRosettaState and ProbeGuestRosetta.
 //

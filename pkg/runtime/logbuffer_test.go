@@ -39,11 +39,11 @@ func retained(l *logBuffer) (payload, accounted, lines int) {
 // TestLogBufferIsBounded is the B162 gate. logBuffer's doc comment has always
 // called it "an in-memory ring", but write was a bare append with no cap: a
 // chatty or long-lived pod grew runtimed's own heap without limit, and runtimed
-// supervises EVERY pod on the node, so its OOM is a node-wide outage. The buffer
+// supervises every pod on the node, so its OOM is a node-wide outage. The buffer
 // is memory-only — nothing rotates or pages it — so the cap in write is the only
 // bound that exists.
 //
-// The test asserts BOTH halves, because either alone is passable by a broken
+// The test asserts both halves, because either alone is passable by a broken
 // implementation: (a) memory stops growing under sustained writes, and (b) the
 // surviving lines are the NEWEST ones — a cap that evicted the newest (or that
 // simply stopped accepting writes when full) would satisfy any size assertion
@@ -141,7 +141,7 @@ func TestLogBufferIsBounded(t *testing.T) {
 
 	// Empty lines carry no payload, so a payload-only budget would retain them
 	// without limit — each still costs a slice header plus an allocation. The
-	// per-line overhead is what bounds the line COUNT.
+	// per-line overhead is what bounds the line count.
 	t.Run("empty-line-flood-is-bounded", func(t *testing.T) {
 		l := newLogBuffer(nil)
 		for range 200_000 {
@@ -158,7 +158,7 @@ func TestLogBufferIsBounded(t *testing.T) {
 	})
 
 	// Regression guard for the property eviction must not cost: write fans out to
-	// followers WITHOUT blocking, so a follower that never drains loses lines
+	// followers without blocking, so a follower that never drains loses lines
 	// rather than stalling the supervisor's log pump.
 	t.Run("slow-follower-drops-instead-of-blocking-the-pump", func(t *testing.T) {
 		l := newLogBuffer(nil)

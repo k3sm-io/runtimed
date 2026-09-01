@@ -23,7 +23,7 @@ package spicanary
 #include <stddef.h>
 #include <stdint.h>
 
-// Private/deprecated libsandbox SPI the Seatbelt backend links (NOT in the public
+// Private/deprecated libsandbox SPI the Seatbelt backend links (not in the public
 // <sandbox.h>). Taking the address of each symbol below forces the linker to
 // resolve it; if a macOS update removes one the package fails to LINK, so CI goes
 // red loudly instead of pods failing to confine at runtime (DESIGN §8 risk #1).

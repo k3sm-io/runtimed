@@ -26,7 +26,7 @@ import (
 )
 
 // TestResolveBinaryNativeSentinel proves the "native" HostProcess sentinel runs
-// command[0] as an absolute host binary and NEVER touches the registry — the M2
+// command[0] as an absolute host binary and never touches the registry — the M2
 // conformance model (every nativePod uses Image: "native" + a command). Before the
 // fix a native pod fell through to the pull path and failed on
 // docker.io/library/native (UNAUTHORIZED), so every M2 criterion was RED.
@@ -80,7 +80,7 @@ func TestResolveBinaryNativeSentinel(t *testing.T) {
 //
 // A hardcoded stand-in is exact only while every native rung maps to the same
 // image-platform candidate list. A future native rung that did not would be
-// mis-selected through a VALID enum value, so the fail-closed default in
+// mis-selected through a valid enum value, so the fail-closed default in
 // image.Candidates could never fire — the failure would be silent, which is the
 // class of bug B99 exists to remove.
 func TestResolveBinaryPullPolicyCarriesResolvedBackend(t *testing.T) {

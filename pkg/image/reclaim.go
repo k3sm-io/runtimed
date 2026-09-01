@@ -31,7 +31,7 @@ import (
 // starts reclaiming unreferenced image content, and DefaultReclaimTargetFreeBytes
 // is the free-space level it reclaims back up to.
 //
-// They are ABSOLUTE BYTES, deliberately, where kubelet's image GC is a percentage
+// They are absolute bytes, deliberately, where kubelet's image GC is a percentage
 // of the image filesystem. A percentage of an APFS container is fiction: every
 // volume in a container reports the same shared free pool, so "15% of the volume"
 // moves as sibling volumes grow. An absolute floor states the invariant that
@@ -51,7 +51,7 @@ const (
 // DefaultReclaimGrace is how old a node must be before reclaim will consider it.
 //
 // It is a backstop against the one race a lease cannot cover: content that
-// arrived through a path that took no lease at all. It is NOT the primary
+// arrived through a path that took no lease at all. It is not the primary
 // protection — a grace window is vacuous for exactly the case that matters, a
 // cache HIT, where the blob is old and no write touches its mtime. The lease is
 // what covers that (see Lease).
@@ -68,7 +68,7 @@ var ErrFreeSpaceUnknown = errors.New("image: free space on the store volume is u
 
 // FreeBytesFunc samples the bytes available on the volume holding path. The
 // production implementation is StatfsFreeBytes; tests inject a fake. It is the
-// seam BELOW the decision, so the reclaim loop is testable with no syscall.
+// seam below the decision, so the reclaim loop is testable with no syscall.
 type FreeBytesFunc func(path string) (uint64, error)
 
 // StatfsFreeBytes is the production FreeBytesFunc: f_bavail x f_bsize — the
@@ -84,7 +84,7 @@ func StatfsFreeBytes(path string) (uint64, error) {
 // FilesystemSample is a raw statfs measurement of the volume holding the image
 // store, at one instant.
 //
-// MEASUREMENT-SHAPED ONLY: it carries facts, never a reclaimable estimate, a
+// measurement-SHAPED only: it carries facts, never a reclaimable estimate, a
 // budget, or a threshold. Under APFS clonefile the number of bytes a prune would
 // return to the volume is not a function of anything in here, so any field that
 // claimed to be one would be a lie with a type.
@@ -119,7 +119,7 @@ func StatfsSample(path string) (FilesystemSample, error) {
 }
 
 // StoreBytes is what the image store holds: the summed logical size of the
-// content-addressed blobs PLUS the accounted size of every committed tree in
+// content-addressed blobs plus the accounted size of every committed tree in
 // unpacked/ and snapshots/.
 //
 // Both halves are counted because both are content this daemon wrote and only
@@ -135,7 +135,7 @@ func StatfsSample(path string) (FilesystemSample, error) {
 //     files (see EnumerateTrees for why, and for what that figure over- and
 //     under-counts).
 //
-// It is explicitly NOT an estimate of what a prune could reclaim: blobs and tree
+// It is explicitly not an estimate of what a prune could reclaim: blobs and tree
 // payloads whose extents are cloned into a live pod rootfs contribute their full
 // size here and free nothing when they are removed.
 func (c *Cache) StoreBytes() (int64, error) {
@@ -160,7 +160,7 @@ func (c *Cache) StoreBytes() (int64, error) {
 // ReclaimConfig configures one disk-pressure reclaim pass.
 type ReclaimConfig struct {
 	// HighFreeBytes is the free-space floor: reclaim runs only when the measured
-	// free space is BELOW it. Zero means DefaultReclaimHighFreeBytes.
+	// free space is below it. Zero means DefaultReclaimHighFreeBytes.
 	HighFreeBytes uint64
 	// TargetFreeBytes is the measured free level reclaim stops at. Zero means
 	// DefaultReclaimTargetFreeBytes. It must be >= HighFreeBytes.
@@ -201,7 +201,7 @@ type ReclaimReport struct {
 	Triggered bool
 	// DryRun echoes the request.
 	DryRun bool
-	// FreeBefore and FreeAfter are the MEASURED free bytes on the store volume.
+	// FreeBefore and FreeAfter are the measured free bytes on the store volume.
 	// FreeAfter equals FreeBefore for a dry run.
 	FreeBefore, FreeAfter uint64
 	// Removed are the digests unlinked, or — under DryRun — the ones that would
@@ -216,7 +216,7 @@ type ReclaimReport struct {
 	Kept []KeptBlob
 	// RemovedTrees are the keys of the unpacked/snapshot trees removed, or —
 	// under DryRun — the ones that would have been. They are reported separately
-	// from Removed because a tree key is not a blob digest: it names DERIVED
+	// from Removed because a tree key is not a blob digest: it names derived
 	// content, and a caller that conflated the two would report a blob as gone
 	// while it is still in the store.
 	RemovedTrees []string
@@ -261,8 +261,8 @@ type KeptBlob struct {
 // ReclaimUnderPressure is the daemon-side image GC: free unreferenced image
 // content when the store volume is under disk pressure.
 //
-// It mirrors kubelet freeing images BEFORE evicting pods, and diverges from it
-// in two ways that macOS forces and that are NOT cosmetic:
+// It mirrors kubelet freeing images before evicting pods, and diverges from it
+// in two ways that macOS forces and that are not cosmetic:
 //
 //   - Deleting a blob does not kill a running pod the way it would on overlayfs.
 //     A pod's rootfs is materialized with APFS clonefile, so it holds its own
@@ -273,15 +273,15 @@ type KeptBlob struct {
 //   - Kubelet's byte-budget arithmetic is INVALID here. Unlinking a blob whose
 //     extents are still cloned into a live pod frees zero bytes, so a
 //     precomputed "delete N bytes" budget would under-delete or over-delete
-//     without ever knowing which. This loop re-measures with statfs after EVERY
+//     without ever knowing which. This loop re-measures with statfs after every
 //     unlink and stops on the measured target.
 //
 // The safety property, stated exactly: a blob named by any pod's daemon-authored
 // reachability record, or pinned by any live ingest lease, is never in the delete
-// plan — and if the root set cannot be enumerated in full, NOTHING is deleted
+// plan — and if the root set cannot be enumerated in full, nothing is deleted
 // (ErrRootsIncomplete). Reclaim is not best-effort about liveness; it refuses.
 //
-// The pass sweeps TWO stores: the content-addressed blobs, and the derived trees
+// The pass sweeps two stores: the content-addressed blobs, and the derived trees
 // under unpacked/ and snapshots/. Trees are decided from the same root set under
 // their own rule (planTrees) and removed FIRST, by a separate executor that
 // cannot reach a blob. The one property that spans both: nothing read out of a
@@ -332,12 +332,12 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	}
 	rep.Triggered = true
 
-	// INVENTORY FIRST, ROOTS SECOND, LEASES LAST. The order is the whole race
+	// INVENTORY FIRST, ROOTS second, LEASES last. The order is the whole race
 	// argument, and it is the opposite of the intuitive one.
 	//
 	// The delete set is `inventory minus roots`. Reading the inventory EARLIER can
 	// only shrink it — a blob committed after this read is not a candidate at all.
-	// Reading the roots LATER can only grow the protection — a reference recorded
+	// Reading the roots later can only grow the protection — a reference recorded
 	// while the pass is running is still honored. Both reads therefore err toward
 	// keeping. Reversed, the pass has a real hole: a blob whose root is recorded
 	// between the root read and the inventory read is absent from the roots and
@@ -393,7 +393,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		return rep, nil
 	}
 
-	// The stopping rule is a MEASUREMENT, taken between unlinks — never a
+	// The stopping rule is a measurement, taken between unlinks — never a
 	// precomputed byte budget, because under APFS clonefile an unlink whose
 	// extents are still shared frees nothing and a budget cannot know that. A
 	// sampling error mid-run does not abort the pass: it only means the target
@@ -417,7 +417,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		}
 		return f >= target
 	}
-	// TREES BEFORE BLOBS. A tree is DERIVED content: it is rebuildable from the
+	// TREES before BLOBS. A tree is derived content: it is rebuildable from the
 	// blobs the image names, so removing it costs a re-unpack, while removing the
 	// blobs costs a registry round-trip the node may not be able to make. Running
 	// the tree half first also means a pass that stops on its measured target

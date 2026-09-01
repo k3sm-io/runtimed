@@ -130,7 +130,7 @@ func (f *fakeFree) count() int {
 	return f.calls
 }
 
-// TestDiskPressureReclaim is B130b's NAMED GATE: the daemon-side disk-pressure
+// TestDiskPressureReclaim is B130b's named GATE: the daemon-side disk-pressure
 // image GC.
 //
 // It asserts the four properties that make the trigger a trigger rather than a
@@ -139,7 +139,7 @@ func (f *fakeFree) count() int {
 //	(1) no pressure, no reclaim — above the free-space floor nothing is deleted,
 //	    and no root is even enumerated;
 //	(2) under pressure, unreferenced content IS reclaimed;
-//	(3) the loop stops on a MEASURED target, re-sampling between unlinks rather
+//	(3) the loop stops on a measured target, re-sampling between unlinks rather
 //	    than spending a precomputed byte budget (the APFS-clonefile constraint:
 //	    an unlink whose extents are still shared frees nothing);
 //	(4) a free-space sample that FAILS refuses the whole pass — fail-closed on
@@ -239,7 +239,7 @@ func TestDiskPressureReclaim(t *testing.T) {
 		f := newGCFixture(t)
 		// Three equally-sized orphans. A byte-budget implementation, told it needs
 		// 140 bytes and seeing 8-byte blobs, would delete all three. The measured
-		// loop deletes exactly one, because the sample taken AFTER the first unlink
+		// loop deletes exactly one, because the sample taken after the first unlink
 		// already reports the target met.
 		var orphans []string
 		for _, c := range []string{"orphan-1", "orphan-2", "orphan-3"} {
@@ -342,7 +342,7 @@ func TestDiskPressureReclaim(t *testing.T) {
 			orphans = append(orphans, f.blob(c, time.Hour))
 		}
 		f.pod("pod-a")
-		// Free space is way ABOVE the floor, so the pressure trigger would do
+		// Free space is way above the floor, so the pressure trigger would do
 		// nothing at all. Force is a different request — "delete what nothing
 		// references" — and must answer that one, in full.
 		free := &fakeFree{free: []uint64{1 << 40}}
@@ -459,7 +459,7 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 		f := newGCFixture(t)
 		victim := f.blob("victim layer", 24*time.Hour)
 		f.pod("pod-victim", ImageRoot{Reference: "victim:v1", Config: victim})
-		// A second pod records an EMPTY root set. Reachability is a union, so no
+		// A second pod records an empty root set. Reachability is a union, so no
 		// record can ever subtract from another's — there is no negative fact to
 		// author. If it could, this is the shape that would exploit it.
 		f.pod("pod-attacker")
@@ -495,7 +495,7 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 	t.Run("an in-flight pull's blobs are pinned by its lease", func(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)
-		// The exact race: the blob is COMMITTED (or found already present) but the
+		// The exact race: the blob is committed (or found already present) but the
 		// pod that will reference it has not recorded it yet. It is old, so grace
 		// saves nothing. Only the lease stands between it and the unlink.
 		inflight := f.blob("in-flight layer", 24*time.Hour)
@@ -577,7 +577,7 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 	t.Run("a record arriving during the pass is not deleted out from under the pod", func(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)
-		// The pass reads the inventory FIRST and the roots SECOND, so a reference
+		// The pass reads the inventory FIRST and the roots second, so a reference
 		// recorded while it runs is still honored. The reverse order is a real hole,
 		// not a theoretical one: it plans a deletion for a blob whose root arrived
 		// a microsecond after the root read. afterInventory drives exactly that

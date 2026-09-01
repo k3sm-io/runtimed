@@ -37,7 +37,7 @@ import (
 
 // The runtimed-PRIVATE guest-agent socket layout: <Root>/run/vm/<pod>/agent.sock.
 //
-// It is DELIBERATELY NOT in the pod dir. The pod dir is
+// It is deliberately not in the pod dir. The pod dir is
 // the one tree a pod's own confinement can reach — the SBPL re-allow tier is
 // built from it — so an agent.sock placed there would put the pod's own control
 // channel inside the pod's reach: a workload could then speak GuestAgent for its
@@ -57,13 +57,13 @@ const (
 // Everything the agent sends is GUEST-CONTROLLED DATA (guest.proto §TRUST): the
 // workload runs in that guest, so a compromised one shapes these frames. The
 // bound is applied as the gRPC client's MaxCallRecvMsgSize, which rejects an
-// oversized frame BEFORE its bytes are buffered — the only placement that
+// oversized frame before its bytes are buffered — the only placement that
 // actually bounds the read. Truncating after receipt would not: the allocation
 // has already happened by the time a handler could trim it.
 //
 // 1 MiB is far above any legitimate frame (a guest streams exec output in the
 // same ~32 KiB chunks the host pump uses, and a log entry is one line), and an
-// over-bound frame ends that ONE pod's stream with a legible ResourceExhausted —
+// over-bound frame ends that one pod's stream with a legible ResourceExhausted —
 // it never touches the daemon or another pod.
 const maxGuestFrameBytes = 1 << 20
 
@@ -77,7 +77,7 @@ const maxGuestMessageBytes = 1024
 // GuestDialer dials one vm pod's guest-agent socket. It is the transport seam of
 // the vm Exec/Logs route: production dials the unix socket the per-pod vmhost
 // proxies to the guest's vsock port (dialGuestUnix), and tests inject a dialer
-// backed by an in-process listener so the FULL gRPC round trip — client conn,
+// backed by an in-process listener so the full gRPC round trip — client conn,
 // codec, streams — runs against a fake GuestAgent with no VM anywhere.
 //
 // addr is the socket path guestAgentSocket derived for the pod; a dialer must
@@ -117,7 +117,7 @@ func (r *Runtime) lookupPod(podID string) (*pod, bool) {
 // guestAgentSocket returns the runtimed-private guest-agent socket path for
 // podID under root (see the layout constants above).
 //
-// The id is PARSED, not interpolated: like every other pod-path derivation in
+// The id is parsed, not interpolated: like every other pod-path derivation in
 // this daemon the layout is unreachable without validation having run, so no
 // caller can build an agent-socket path — and then dial it — from an identifier
 // that was never checked.
@@ -152,7 +152,7 @@ func (r *Runtime) dialGuest(podID string) (*grpc.ClientConn, error) {
 	)
 }
 
-// vmContainerName resolves which of the pod's DECLARED containers a vm-pod verb
+// vmContainerName resolves which of the pod's declared containers a vm-pod verb
 // selects, mirroring the host-process rule (findContainer): an empty name picks
 // the sole container, otherwise the name must be one the box declares.
 //
@@ -186,9 +186,9 @@ func vmContainerName(box *runtimev1.PodBox, requested string) (string, error) {
 // demultiplexed byte for byte, and the command's exit code round-trips
 // faithfully (a shell's `kubectl exec … && …` is exactly that code).
 //
-// The PARAMETERS come from the first frame ALONE and are re-stamped with the
+// The PARAMETERS come from the first frame alone and are re-stamped with the
 // pod id this route resolved, which is what the agent's single-pod check
-// (guest.proto: "the agent MUST reject a pod_id that is not the pod it booted")
+// (guest.proto: "the agent must reject a pod_id that is not the pod it booted")
 // is asserting against. Subsequent frames are narrowed to stdin + resize by
 // forwardExecInput, so no later frame can re-aim the stream.
 func (r *Runtime) execGuest(stream runtimev1.Runtime_ExecServer, p *pod, first *runtimev1.ExecRequest) error {
@@ -254,7 +254,7 @@ func (r *Runtime) execGuest(stream runtimev1.Runtime_ExecServer, p *pod, first *
 // forwardExecInput pumps the client's post-parameter frames to the guest agent
 // and propagates the client's half-close as the guest's stdin EOF.
 //
-// It forwards ONLY stdin bytes and tty resizes. pod_id, container and command
+// It forwards only stdin bytes and tty resizes. pod_id, container and command
 // are read once, from the first frame, so a later frame naming another pod or
 // another command is inert — the stream stays bound to the pod the route
 // resolved, and re-targeting is impossible rather than merely rejected.
@@ -287,7 +287,7 @@ func forwardExecInput(stream runtimev1.Runtime_ExecServer, agent guestv1.GuestAg
 // Rebuilding rather than forwarding the received message is the untrusted-data
 // discipline: only the fields this route means to relay cross to the client, so
 // a field a future agent sets — deliberately or not — cannot ride through
-// unexamined. The exit code is relayed VERBATIM (it is the conformance-bearing
+// unexamined. The exit code is relayed verbatim (it is the conformance-bearing
 // value, and the guest legitimately owns it: it ran the process). The agent's
 // structured error is relayed as code + a length-bounded message, dropping its
 // details: the provider reads that error as "the command could not run", which

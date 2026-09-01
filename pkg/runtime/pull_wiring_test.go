@@ -37,7 +37,7 @@ import (
 )
 
 // TestDefaultPullerPlatformWiring exercises the puller runtime.New builds when
-// Deps.Puller is absent — the DAEMON'S OWN wiring, image.NewPuller(cache,
+// Deps.Puller is absent — the DAEMON'S own wiring, image.NewPuller(cache,
 // image.RemoteFetch) — against an in-process registry.
 //
 // Every other pull test in this package injects a fakePuller, so none of them
@@ -78,7 +78,7 @@ func TestDefaultPullerPlatformWiring(t *testing.T) {
 				if rerr != nil {
 					t.Fatalf("resolveBinary: %v", rerr)
 				}
-				// The command is absolute, and on a PULLED image that names a path
+				// The command is absolute, and on a pulled image that names a path
 				// in the IMAGE, not on the host — so it resolves under this pod's
 				// rootfs (B197). The subject here is still the platform wiring;
 				// the argv rule itself is gated by
@@ -137,7 +137,7 @@ func pushPlatformImage(t *testing.T, host, repo, os, arch string) string {
 }
 
 // TestPullPolicyForwardedToPuller pins the runtimed half of the M12.1 skew
-// contract: the container's STAMPED imagePullPolicy reaches the puller exactly
+// contract: the container's stamped imagePullPolicy reaches the puller exactly
 // as the PodBox carried it, and an unset field arrives as UNSPECIFIED (the
 // legacy pull-through) rather than being re-derived from the tag.
 //

@@ -121,7 +121,7 @@ func TestSetDigest(t *testing.T) {
 	if swapped.SetDigest() == got {
 		t.Fatal("SetDigest() collides when the two digests are swapped")
 	}
-	// Fields that do not describe the BYTES must not move the key, or a release
+	// Fields that do not describe the bytes must not move the key, or a release
 	// re-host would orphan a perfectly good cache.
 	rehosted := base
 	rehosted.ReleaseURL = "https://elsewhere.invalid/guest"
@@ -190,7 +190,7 @@ func TestLookup(t *testing.T) {
 		})
 	}
 
-	// The SHIPPED table, through the exported entry point. The assertion is
+	// The shipped table, through the exported entry point. The assertion is
 	// deliberately two-sided so it stays true across the commit that mints the
 	// digests: before, the pin is refused with ErrPinIncomplete; after, it
 	// resolves and every field is usable. What it forbids is the state in

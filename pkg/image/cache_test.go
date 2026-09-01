@@ -39,7 +39,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // deepCache returns a Cache rooted several levels below a temp dir, plus that
-// temp dir. The depth matters: a traversal via the digest's ALGORITHM half
+// temp dir. The depth matters: a traversal via the digest's algorithm half
 // escapes UPWARD out of the blob root, so the assertion "nothing was created
 // outside the blob root" needs somewhere above the root to observe.
 func deepCache(t *testing.T) (c *Cache, outside string) {
@@ -85,7 +85,7 @@ func writeAll(b []byte) func(io.Writer) error {
 }
 
 // blobDirEntries lists the blob directory for digest's algorithm, which must be
-// EMPTY after a rejected commit — the temp file is gone and the destination was
+// empty after a rejected commit — the temp file is gone and the destination was
 // never created.
 func blobDirEntries(t *testing.T, c *Cache, algo string) []string {
 	t.Helper()
@@ -103,12 +103,12 @@ func blobDirEntries(t *testing.T, c *Cache, algo string) []string {
 	return out
 }
 
-// fakeLayer is a layer that is INTERNALLY SELF-CONSISTENT about the wrong bytes:
+// fakeLayer is a layer that is INTERNALLY self-CONSISTENT about the wrong bytes:
 // Compressed(), Digest() and Size() all describe payload. The image's manifest
 // descriptor still names the original layer, so this fixture is exactly the
 // tautology case — a checker that took its "claimed" digest from the layer (as
 // writeBlob's caller did before B129) would compare the payload against a digest
-// derived FROM the payload and always pass.
+// derived from the payload and always pass.
 type fakeLayer struct {
 	ggcrv1.Layer
 	payload []byte
@@ -126,8 +126,8 @@ func (l fakeLayer) Digest() (ggcrv1.Hash, error) {
 func (l fakeLayer) Size() (int64, error) { return int64(len(l.payload)), nil }
 
 // lyingImage serves substituted layer bytes while its Manifest() (inherited)
-// keeps naming the ORIGINAL descriptors. The substituted payload is the same
-// LENGTH as the layer it replaces, so the size resource guard cannot be what
+// keeps naming the original descriptors. The substituted payload is the same
+// length as the layer it replaces, so the size resource guard cannot be what
 // rejects it — the digest comparison must be.
 type lyingImage struct {
 	ggcrv1.Image
@@ -170,14 +170,14 @@ func (i lyingImage) Layers() ([]ggcrv1.Layer, error) {
 // ---------------------------------------------------------------------------
 
 // TestWriteBlobRejectsDigestMismatch is the B129 gate: the content-addressed
-// store verifies every blob against its claimed digest AT THE COMMIT POINT, in
+// store verifies every blob against its claimed digest AT the COMMIT point, in
 // one exported home (Cache.CommitBlob) that Puller.writeBlob merely delegates to.
 //
-// EVERY assertion the gate makes is a subtest of THIS function — the item is run
+// every assertion the gate makes is a subtest of this function — the item is run
 // as `go test -run '^TestWriteBlobRejectsDigestMismatch$'`, so anything parked in
 // a sibling Test... would not be gate-proving.
 //
-// The rows drive Cache.CommitBlob DIRECTLY with a fake fill, not through Pull
+// The rows drive Cache.CommitBlob directly with a fake fill, not through Pull
 // with a fake FetchFunc. A fetcher-driven table structurally cannot reach the
 // config-blob call site: for any ordinary go-containerregistry image
 // ConfigName() IS the sha256 of RawConfigFile(), so the config path cannot be
@@ -188,11 +188,11 @@ func (i lyingImage) Layers() ([]ggcrv1.Layer, error) {
 // Behaviour at main, for each row:
 //
 //	correct bytes commit                      → committed (already green)
-//	digest-mismatched bytes                   → COMMITTED under the claimed name (RED)
-//	short stream                              → COMMITTED under the claimed name (RED)
-//	oversized stream                          → COMMITTED, unbounded bytes first (RED)
+//	digest-mismatched bytes                   → committed under the claimed name (RED)
+//	short stream                              → committed under the claimed name (RED)
+//	oversized stream                          → committed, unbounded bytes first (RED)
 //	"../../etc:passwd"                        → MkdirAll'd <root>/../etc as root (RED)
-//	layer contradicting its manifest descriptor → COMMITTED via Pull (RED)
+//	layer contradicting its manifest descriptor → committed via Pull (RED)
 //	cache hit / regular-file cache hit        → see each row
 func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 	t.Run("commits correct bytes", func(t *testing.T) {
@@ -223,7 +223,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// THE row that transitions. Asserting only "an error was returned" + "the
+	// the row that transitions. Asserting only "an error was returned" + "the
 	// temp file is gone" is satisfied by a compare-then-rename-anyway diff (the
 	// rename consumes the temp, so the removal assertion passes too). The
 	// DESTINATION path is the only observable that distinguishes rejected from
@@ -258,7 +258,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// An input-shape row over the SAME mechanism, not a distinct branch: fewer
+	// An input-shape row over the same mechanism, not a distinct branch: fewer
 	// bytes simply hash differently. It deliberately introduces no second error
 	// class.
 	t.Run("rejects a short stream", func(t *testing.T) {
@@ -368,7 +368,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// The documented CEILING, made executable rather than left as folklore:
+	// The documented ceiling, made executable rather than left as folklore:
 	// verification happens at WRITE time only. A blob already on disk is trusted
 	// on its NAME — including every blob written before B129, which this repo
 	// never hashed. Verify-on-read is deliberately not done here (it is O(image
@@ -405,7 +405,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// A directory (or any non-regular file) at the blob path is NOT a blob.
+	// A directory (or any non-regular file) at the blob path is not a blob.
 	// Accepting one as a cache hit would let a planted directory suppress the
 	// write forever — the fast path used to be a bare os.Stat.
 	t.Run("cache hit requires a regular file", func(t *testing.T) {
@@ -480,7 +480,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// F2: size 0 is a REAL cap (the empty blob), not "no cap" — only the explicit
+	// F2: size 0 is a real cap (the empty blob), not "no cap" — only the explicit
 	// SizeUnknown sentinel opts out. A `size > 0` guard would silently disable the
 	// cap for any descriptor declaring zero.
 	t.Run("size 0 caps rather than disabling the guard", func(t *testing.T) {
@@ -571,7 +571,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// F3: a self-contradictory manifest is NOT a poisoned blob — no blob was
+	// F3: a self-contradictory manifest is not a poisoned blob — no blob was
 	// hashed, so ErrDigestMismatch's message would be false. The two sentinels stay
 	// distinguishable because the remediations differ: reject the source vs
 	// quarantine the blob.

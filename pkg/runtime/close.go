@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// defaultCloseGrace bounds Close's wait for the supervision goroutines of ALL
+// defaultCloseGrace bounds Close's wait for the supervision goroutines of all
 // live pods to observe the shutdown cancel. It is a ceiling on a shutdown, not a
 // delay: the cancels are fired for every pod first, so a healthy node's waits are
 // already satisfied when the wait begins. The size matches the reaper's own
@@ -45,7 +45,7 @@ func (r *Runtime) closeGraceDuration() time.Duration {
 	return defaultCloseGrace
 }
 
-// Close stops the per-pod SUPERVISION this daemon owns: for every live pod it
+// Close stops the per-pod supervision this daemon owns: for every live pod it
 // cancels the memory sampler and then the pod-lifetime supervision context,
 // which is what the per-container kqueue reapers, their watchContainerExit
 // completions, and the ~1 Hz memory samplers are all rooted at. It then waits,
@@ -56,7 +56,7 @@ func (r *Runtime) closeGraceDuration() time.Duration {
 // so a shutdown left every live pod's supervision running until the process
 // happened to exit.
 //
-// Close does NOT signal the pod PROCESSES, and that is the point: they are
+// Close does not signal the pod PROCESSES, and that is the point: they are
 // native Darwin processes in their own session, they survive the daemon by
 // design, and the startup pod reap reconciles them on the next boot (podreap.go).
 // Killing a node's workloads because the runtime restarted is precisely what a
@@ -82,12 +82,12 @@ func (r *Runtime) Close() error {
 		r.log.Info("stopping pod supervision for daemon shutdown", "pods", len(pods))
 	}
 
-	// Phase 1: fire every cancel BEFORE waiting on any of them. Cancelling is
+	// Phase 1: fire every cancel before waiting on any of them. Cancelling is
 	// non-blocking, so this stops the whole node's supervision at once and leaves
 	// the bound below to be shared rather than spent pod by pod (a wedged pod
 	// would otherwise consume a healthy successor's budget).
 	//
-	// It also runs BEFORE the vm stop below, which is load-bearing rather than
+	// It also runs before the vm stop below, which is load-bearing rather than
 	// incidental: watchVMHelperExit would otherwise observe the shutdown's own
 	// stop as a crash and publish a Failed status for every vm pod on the way
 	// out. Contexts are monotonic, so cancelling first settles that
@@ -98,11 +98,11 @@ func (r *Runtime) Close() error {
 		waits = append(waits, r.cancelPodSupervision(p))
 	}
 
-	// THE VM CARVE-OUT, and it is the exact OPPOSITE of the rule above. A host
+	// the VM CARVE-OUT, and it is the exact OPPOSITE of the rule above. A host
 	// pod's processes survive the daemon by design; a vm pod's helper must not —
 	// "no VM outlives the binary that booted it" (cmd/k3sm-vmhost) — because an
 	// orphaned helper holds a whole machine that nothing on the node can talk to,
-	// adopt, or stop. So every live helper is stopped here, CONCURRENTLY inside
+	// adopt, or stop. So every live helper is stopped here, concurrently inside
 	// the backend.
 	//
 	// The concurrency is a requirement, not a tidiness: each helper's graceful
@@ -135,7 +135,7 @@ func (r *Runtime) Close() error {
 
 // vmShutdownBound caps the whole concurrent vm-helper stop at shutdown.
 //
-// It is sized against launchd's 45-second ExitTimeOut, NOT against one helper:
+// It is sized against launchd's 45-second ExitTimeOut, not against one helper:
 // the helpers stop in parallel, so the node's cost is one budget rather than one
 // per pod, and this leaves room for the supervision waits that follow plus the
 // daemon's own teardown. A helper still running when it expires is left to the
@@ -163,7 +163,7 @@ type namedDone struct {
 // cancel, returning the edges that report those goroutines having stopped.
 //
 // The read of p.memCancel/p.memSampler takes p.mu for the same reason DeletePod's
-// does: armMemorySampler REPLACES both at arbitrary runtime (a RestartContainer
+// does: armMemorySampler replaces both at arbitrary runtime (a RestartContainer
 // re-exec re-arms the sampler), so an unsynchronized read can cancel a stale
 // sampler and leave the live one running (B26). p.cancel is immutable after
 // createPod and needs no lock.

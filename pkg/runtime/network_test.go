@@ -35,7 +35,7 @@ import (
 // reconcilingNetwork is a recordingNetwork that additionally implements the
 // optional NetworkReconciler seam, recording every event ("reconcile",
 // "setup:<pod>", "teardown:<pod>") in call order so a test can assert the
-// startup reconcile runs BEFORE any pod networking is touched.
+// startup reconcile runs before any pod networking is touched.
 type reconcilingNetwork struct {
 	recordingNetwork
 	reconcileErr error
@@ -118,7 +118,7 @@ func TestDeletePodReleasesPodNetwork(t *testing.T) {
 }
 
 // TestCreatePodUnwindReleasesPodNetwork is M10.1 acceptance (unwind half): when
-// a create step AFTER a successful network Setup fails (here the spawn), the
+// a create step after a successful network Setup fails (here the spawn), the
 // pod's networking is torn down before CreatePod returns — otherwise the failed
 // create leaks the /32 (DeletePod never runs for a pod that was never created).
 func TestCreatePodUnwindReleasesPodNetwork(t *testing.T) {
@@ -145,7 +145,7 @@ func TestCreatePodUnwindReleasesPodNetwork(t *testing.T) {
 
 // TestNetworkReconcileStartup is M10.1 acceptance (reconcile half): a
 // Deps.Network implementing the optional NetworkReconciler seam is reconciled
-// exactly ONCE, BEFORE the server accepts any CreatePod — the real IPAM
+// exactly once, before the server accepts any CreatePod — the real IPAM
 // adapter's in-memory allocator must re-sync with the durable lo0 aliases a
 // `kickstart -k` restart left behind, or new allocations collide and orphans
 // leak. A reconcile failure fails Serve (never serving over an inconsistent
@@ -170,7 +170,7 @@ func TestNetworkReconcileStartup(t *testing.T) {
 			t.Fatalf("CreatePod over bufconn: %v / %v", err, resp.GetError())
 		}
 
-		// The reconcile ran exactly once and STRICTLY BEFORE the pod's Setup.
+		// The reconcile ran exactly once and strictly before the pod's Setup.
 		events := pn.eventLog()
 		if len(events) < 2 || events[0] != "reconcile" {
 			t.Fatalf("event order = %v, want reconcile first", events)
@@ -192,7 +192,7 @@ func TestNetworkReconcileStartup(t *testing.T) {
 			t.Fatal("Serve did not return after ctx cancel")
 		}
 
-		// A SECOND server over the same Runtime does not re-reconcile (once per
+		// A second server over the same Runtime does not re-reconcile (once per
 		// Runtime, not per Serve).
 		lis2 := bufconn.Listen(1 << 20)
 		srv2 := NewServer(rt)

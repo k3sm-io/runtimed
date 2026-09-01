@@ -31,11 +31,11 @@ import "strings"
 //   - The filter binds the USER CLIENT, not the accelerator IOService. The
 //     designed-first candidate — a single
 //     (iokit-registry-entry-class-prefix "AGXAcceleratorG") prefix rule — MATCHES
-//     NOTHING: on that rig the IOService is AGXAcceleratorG13X but the object MLX
+//     nothing: on that rig the IOService is AGXAcceleratorG13X but the object MLX
 //     opens is AGXDeviceUserClient, so the prefix was derived from the wrong axis.
 //     Do not reinstate it.
-//   - Both names are FAMILY-INDEPENDENT. Neither carries a G13X/G14/G16 suffix, so
-//     two EXACT class names cover every Apple-silicon family by construction. The
+//   - Both names are FAMILY-independent. Neither carries a G13X/G14/G16 suffix, so
+//     two exact class names cover every Apple-silicon family by construction. The
 //     per-chip-family data table the plan carried as a fallback is therefore not
 //     merely unnecessary, it is UNEXPRESSIBLE on this filter axis (a table of
 //     AGXAcceleratorG13X-style IOService names can never match an iokit-open
@@ -54,12 +54,12 @@ import "strings"
 // outside the pod's own data volume — stays intact and there is no cross-pod
 // shader-cache channel to disclose.
 //
-// The ONE residual, recorded rather than hidden: only M1-family hardware (G13X) was
+// The one residual, recorded rather than hidden: only M1-family hardware (G13X) was
 // available to the spike, so "family-independent" rests on the names' form plus
 // Apple's own practice, not on an M3/M4 measurement. What makes that safe is the
-// fail-closed control this rule set deliberately does NOT carry — see
-// SandboxGPUSupported: the SBPL rules are a STATIC CEILING containing no family
-// information whatsoever, and the FUNCTIONAL Metal probe is the sole gate on
+// fail-closed control this rule set deliberately does not carry — see
+// SandboxGPUSupported: the SBPL rules are a STATIC ceiling containing no family
+// information whatsoever, and the functional Metal probe is the sole gate on
 // whether the node advertises GPU at all. On a family where these two names are
 // wrong, the probe fails and no GPU pod is ever scheduled here.
 //
@@ -73,12 +73,12 @@ var metalUserClientClasses = []string{
 
 // metalStanza is the exact text Generate emits for a pod with allow_gpu set. It is
 // a single const-shaped rendering (built once at init from metalUserClientClasses)
-// so the golden fixture pins the SAME bytes the generator emits, and so a reader
+// so the golden fixture pins the same bytes the generator emits, and so a reader
 // auditing "what does allow_gpu actually grant" reads one artifact.
 var metalStanza = buildMetalStanza()
 
 // buildMetalStanza renders the Metal allow-set in the profile's house style: a
-// comment naming the grant and its provenance, then ONE (allow iokit-open …) rule
+// comment naming the grant and its provenance, then one (allow iokit-open …) rule
 // carrying every user-client class filter.
 func buildMetalStanza() string {
 	var b strings.Builder
@@ -127,12 +127,12 @@ const (
 	MetalReasonUnsupportedBuild = "UnsupportedBuild"
 )
 
-// MetalStatus is one FUNCTIONAL Metal probe's verdict about this host's GPU: not
+// MetalStatus is one functional Metal probe's verdict about this host's GPU: not
 // "is there a device pointer", but "did a Metal library compile, a compute
 // pipeline build, and a dispatch return the values it was asked to compute".
 //
 // The distinction is the whole point of the type. MTLCreateSystemDefaultDevice
-// returns a NON-NIL paravirtual device inside a VZ guest (including a GitHub-hosted
+// returns a non-nil paravirtual device inside a VZ guest (including a GitHub-hosted
 // macOS runner), so a nil-check would make every VM node advertise a GPU it cannot
 // give a pod — and the node-level extended resource derived from these facts would
 // then attract MLX workloads onto hosts that cannot run them. Functional plus the
@@ -140,7 +140,7 @@ const (
 //
 // The zero value is the fail-closed one: not functional, no device, no ceiling.
 type MetalStatus struct {
-	// Functional reports that the compile+dispatch round trip completed AND
+	// Functional reports that the compile+dispatch round trip completed and
 	// produced the expected values.
 	Functional bool
 	// Paravirtual reports that the device identifies as a VZ paravirtual GPU.
@@ -160,27 +160,27 @@ type MetalStatus struct {
 	Reason string
 }
 
-// Available reports the ONE availability verdict derived from a probe: the GPU
-// worked AND it is a real GPU. It is the single home of that rule — SandboxGPUSupported
+// Available reports the one availability verdict derived from a probe: the GPU
+// worked and it is a real GPU. It is the single home of that rule — SandboxGPUSupported
 // and DeriveGPUFacts both call it rather than re-deriving the conjunction, so the
 // paravirtual discrimination cannot be honoured in one place and forgotten in the
 // other (the same one-home discipline HostRosettaState.Available() enforces).
 func (m MetalStatus) Available() bool { return m.Functional && !m.Paravirtual }
 
-// SandboxGPUSupported reports GPUFacts.sandbox_gpu_supported: whether THIS daemon,
+// SandboxGPUSupported reports GPUFacts.sandbox_gpu_supported: whether this daemon,
 // as configured, can grant a pod GPU access at all. It is the fail-closed
-// advertisement control (the fail-closed family gate) and it is scoped to the SELECTED
+// advertisement control (the fail-closed family gate) and it is scoped to the selected
 // backend on purpose — the same machine supports GPU pods under the Seatbelt rung
 // and not under the vm rung, so it is not a hardware property.
 //
 // Two independent conditions, both required:
 //
-//   - backend must be the host-process Seatbelt rung AND Available(). It is the
+//   - backend must be the host-process Seatbelt rung and Available(). It is the
 //     only rung whose profile carries metalStanza; a vm pod's Linux guest has no
 //     Metal device to open, so vm reports false rather than a grant that cannot
 //     take effect. An unavailable backend reports false because a pod cannot run
 //     on it at all.
-//   - metal.Available() must be true — the FUNCTIONAL compile+dispatch probe passed
+//   - metal.Available() must be true — the functional compile+dispatch probe passed
 //     and the device is not the VZ paravirtual one, not a device nil-check. This is where the family residual documented on
 //     metalUserClientClasses is discharged: a host whose user-client classes differ
 //     from the two encoded above cannot complete the probe under this profile, so

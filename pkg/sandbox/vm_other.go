@@ -18,8 +18,8 @@ limitations under the License.
 
 package sandbox
 
-// vzSupported / vzEntitled are the OFF-PLATFORM vm-backend probes: on any build
-// lane that is NOT darwin+cgo — notably CGO_ENABLED=0 (which excludes the
+// vzSupported / vzEntitled are the off-PLATFORM vm-backend probes: on any build
+// lane that is not darwin+cgo — notably CGO_ENABLED=0 (which excludes the
 // Virtualization.framework cgo shim, vm_darwin.go) and every non-darwin OS — they
 // report false, so VMBackend.Available() is false and the pure-Go build lane stays
 // unbroken. The vm backend can only run a guest on a Virtualization.framework-
@@ -28,13 +28,13 @@ func vzSupported() bool { return false }
 
 func vzEntitled() bool { return false }
 
-// vzStaticCodeEntitled is the OFF-PLATFORM helper-signature probe: without the
+// vzStaticCodeEntitled is the off-PLATFORM helper-signature probe: without the
 // Security.framework shim there is no way to check another binary's signature, so
 // it reports false and VMBackend.Available() is false with it (fail-closed).
 func vzStaticCodeEntitled(path string) bool { return false }
 
-// vzRosettaAvailability is the OFF-PLATFORM guest-Rosetta probe: on any lane that
-// is NOT darwin+cgo the Virtualization.framework shim is not compiled in, so the
+// vzRosettaAvailability is the off-PLATFORM guest-Rosetta probe: on any lane that
+// is not darwin+cgo the Virtualization.framework shim is not compiled in, so the
 // probe cannot answer and reports GuestRosettaQueryFailed — which fails closed
 // (GuestRosettaState.Available() is false). It is deliberately QueryFailed rather
 // than NotSupported: "this build cannot ask" is a different fact from "Apple says

@@ -41,7 +41,7 @@ import (
 // fake unpacker leaves empty, so both are what it takes to reach the backend.
 // The box carries: every volume class (configMap, secret, projected-with-token,
 // default-medium emptyDir, Memory-medium emptyDir, PVC), an init container
-// mounting the emptyDir, and TWO main containers with ASYMMETRIC mounts (main
+// mounting the emptyDir, and two main containers with ASYMMETRIC mounts (main
 // mounts everything; aux mounts nothing).
 func vmShareBox(podID string) *runtimev1.PodBox {
 	return &runtimev1.PodBox{
@@ -74,7 +74,7 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 				Image:   "docker.io/library/busybox:1",
 				Command: []string{"/bin/sleep", "3600"},
 				VolumeMounts: []*runtimev1.VolumeMount{
-					// cfg carries a sub_path so the wiring row pins the MAPPER
+					// cfg carries a sub_path so the wiring row pins the mapper
 					// carrying SubPath through to the VMBind (a mapping drop
 					// would otherwise survive: field parity checks names, not
 					// values).
@@ -122,12 +122,12 @@ func newVMPlanRuntime(t *testing.T) (*Runtime, *fakeVMBackend) {
 	return rt, vmb
 }
 
-// mustPlanVM drives box through the REAL createPod vm wiring and returns the
+// mustPlanVM drives box through the real createPod vm wiring and returns the
 // recorded VMSpec. The lab-gated CreateVM stub then fails the pod — expected
-// and orthogonal to the plan assertions; what matters is the ONE recorded
+// and orthogonal to the plan assertions; what matters is the one recorded
 // CreateVM call carrying the plan. The recorder returns the VMSpec by value
 // but its slices/maps are shallow, so the recorded plan is treated as
-// READ-ONLY by every caller.
+// READ-only by every caller.
 func mustPlanVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.PodBox) sandbox.VMSpec {
 	t.Helper()
 	if _, _, err := rt.createPod(context.Background(), box); err == nil {
@@ -141,9 +141,9 @@ func mustPlanVM(t *testing.T, rt *Runtime, vmb *fakeVMBackend, box *runtimev1.Po
 }
 
 // mustRejectVM drives box through createPod and asserts the share-plan reject
-// contract: an error wrapping errInvalidPodBox whose wrap NAMES the share
+// contract: an error wrapping errInvalidPodBox whose wrap names the share
 // planner ("share plan" — createVMPod's wrap text), FailureReason
-// INVALID_POD_BOX, and CreateVM NEVER called (reject strictly before the
+// INVALID_POD_BOX, and CreateVM never called (reject strictly before the
 // backend). The fragment check keeps the helper from becoming vacuously
 // satisfiable if another INVALID_POD_BOX exit is later wrapped in the same
 // sentinel.
@@ -202,7 +202,7 @@ func vmShareRoots(spec sandbox.VMSpec) []string {
 	return roots
 }
 
-// underStrict is the test-side separator-aware STRICT containment check:
+// underStrict is the test-side separator-aware strict containment check:
 // equality is false, and /a/bc is not under /a/b.
 func underStrict(path, base string) bool {
 	return path != base && strings.HasPrefix(path, base+string(filepath.Separator))
@@ -210,7 +210,7 @@ func underStrict(path, base string) bool {
 
 // TestCreateVMPodVolumeSharePlan is the B106 gate: a vm-RuntimeClass pod's
 // PodBox volumes are compiled into a virtiofs share-device plan — pure data,
-// threaded through the REAL createPod → createVMPod wiring into the
+// threaded through the real createPod → createVMPod wiring into the
 // sandbox.VMSpec the vm backend receives — with every reject fail-closed
 // (INVALID_POD_BOX, before the backend is ever called).
 func TestCreateVMPodVolumeSharePlan(t *testing.T) {
@@ -262,7 +262,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		// Containment is asserted against the CONFIG-derived pod tree
 		// (<Config.Root>/pods/<podID>) — never against the same rt.podDir(...)
 		// the plan was built from, which the three pod-dir roots satisfy BY
-		// CONSTRUCTION (each is Join(podDir, <literal>)) for any podDir at all.
+		// construction (each is Join(podDir, <literal>)) for any podDir at all.
 		podsRoot := filepath.Join(rt.cfg.Root, "pods")
 		wantPodDir := filepath.Join(podsRoot, "pod-plan-dir")
 
@@ -279,9 +279,9 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 	})
 
 	// B140 INVERTS the second half of this case. It used to assert that a hostile
-	// box.rootfs_path was merely INERT for share roots — the plan ignored it, but
+	// box.rootfs_path was merely inert for share roots — the plan ignored it, but
 	// the pod still reached the vm backend carrying that path as
-	// VMSpec.RootfsPath. It is now REFUSED outright, strictly before the backend,
+	// VMSpec.RootfsPath. It is now refused outright, strictly before the backend,
 	// because rootfs_path must be byte-equal to the runtime's derived pod data
 	// volume. The share-root half is unchanged and still meaningful: it pins that
 	// the planner derives roots locally rather than from the box.
@@ -301,7 +301,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 			t.Errorf("rootfs share root = %q, want the podDir-derived %q", got, want)
 		}
 
-		// The DERIVED spelling is still accepted, so the guard is byte-equality and
+		// The derived spelling is still accepted, so the guard is byte-equality and
 		// not "any rootfs_path is fatal". A failed vm create registers nothing, so
 		// the same pod id re-runs on the same runtime; the recorder count is
 		// cumulative, hence want 2 here.
@@ -321,7 +321,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 			t.Errorf("VMSpec.RootfsPath = %q, want the derived %q", got, want)
 		}
 
-		// Hostile box.rootfs_path (the runtime work root itself): REFUSED before
+		// Hostile box.rootfs_path (the runtime work root itself): refused before
 		// the backend — the vm path must never carry an uncontained host path into
 		// VMSpec.RootfsPath.
 		hostileBox := vmShareBox("pod-plan-hostile")
@@ -350,7 +350,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		}
 
 		// The sibling-prefix regression probe: the proj and vols roots are the
-		// EXACT expected siblings (a proj dir renamed to share the vols name as
+		// exact expected siblings (a proj dir renamed to share the vols name as
 		// a plain prefix, e.g. "k3sm.volsproj", must fail here).
 		if got, want := findVMShare(t, spec, "k3sm.proj").Root, filepath.Join(podDir, "k3sm.proj"); got != want {
 			t.Errorf("proj share root = %q, want %q", got, want)
@@ -397,7 +397,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		if got := spec.Volumes.Tmpfs["aux"]; len(got) != 0 {
 			t.Errorf("aux declares no volumeMounts but got tmpfs %+v (a pod-wide union leak)", got)
 		}
-		// setup mounts ONLY scratch — main's other volumes must not leak in.
+		// setup mounts only scratch — main's other volumes must not leak in.
 		if got := spec.Volumes.Binds["setup"]; len(got) != 1 {
 			t.Errorf("setup binds = %+v, want exactly its one declared mount", got)
 		}
@@ -423,7 +423,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		box := vmShareBox("pod-plan-mem")
 		// Narrow to the Memory emptyDir alone: with no default-medium emptyDir
 		// declared, no vols share may be emitted either. The mount is
-		// read_only + sub_path-narrowed: BOTH must ride the VMTmpfs verbatim
+		// read_only + sub_path-narrowed: both must ride the VMTmpfs verbatim
 		// (the native path honors read_only on a Memory emptyDir and upstream
 		// permits sub_path on one — dropping either would be a silent vm-path
 		// narrowing).
@@ -498,7 +498,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 
 	t.Run("pvc-crafted-claim-rejected-before-backend", func(t *testing.T) {
 		// The fix-round probe case, bound into the gate: a lateral
-		// "../<other-ns>/…" claim stays INSIDE the storage root (so the
+		// "../<other-ns>/…" claim stays inside the storage root (so the
 		// escapes-base guard alone never fires) but addresses a sibling
 		// namespace's tree — the single-path-component rule must reject it
 		// before the backend ever sees a plan.
@@ -514,7 +514,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 	t.Run("pvc-share-root-equality-derived-from-datadir", func(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 		box := vmShareBox("pod-plan-pvc")
-		// Two PVCs declared in REVERSE name order: tags index the SORTED
+		// Two PVCs declared in reverse name order: tags index the SORTED
 		// volume-name order. data-b is a read_only source.
 		box.Volumes = []*runtimev1.Volume{
 			{Name: "data-b", PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "claim-b", ReadOnly: true}},
@@ -563,7 +563,7 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 	})
 
 	t.Run("no-share-root-under-workdir-run", func(t *testing.T) {
-		// A binder class mis-rooted INSIDE <workRoot>/run — the daemon socket
+		// A binder class mis-rooted inside <workRoot>/run — the daemon socket
 		// tree (netd.sock / runtimed.sock / run/keys) — must be refused: no
 		// share root may ever land in that tree (R7), even one that satisfies
 		// every other derivation rule.

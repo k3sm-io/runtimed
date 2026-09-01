@@ -31,11 +31,11 @@ import (
 )
 
 // TestResolveRlimitPlan is the pure daemon-side resolver table: it maps the
-// EXPLICIT PodBox.rlimits[] to a []supervisor.PlannedRlimit and ONLY those —
+// explicit PodBox.rlimits[] to a []supervisor.PlannedRlimit and only those —
 // every recognized type resolves to its darwin RLIMIT_* selector, soft/hard are
 // carried verbatim, "unlimited" sentinels collapse to RLIM_INFINITY, and an
-// unknown type is skipped. The NEGATIVE case is load-bearing: a pod with a memory
-// limit and a cpu quota (Guaranteed QoS) but no explicit rlimits[] yields an EMPTY
+// unknown type is skipped. The negative case is load-bearing: a pod with a memory
+// limit and a cpu quota (Guaranteed QoS) but no explicit rlimits[] yields an empty
 // plan — runtimed never synthesizes RLIMIT_AS/DATA/CPU from those bands.
 func TestResolveRlimitPlan(t *testing.T) {
 	cases := []struct {
@@ -54,7 +54,7 @@ func TestResolveRlimitPlan(t *testing.T) {
 		},
 		{
 			// Every recognized type maps to the correct selector. RLIMIT_CPU is
-			// included ONLY because it is explicitly named here (the zero-value trap).
+			// included only because it is explicitly named here (the zero-value trap).
 			name: "all-recognized-types-map-correctly",
 			box: &runtimev1.PodBox{Rlimits: []*runtimev1.ResourceLimit{
 				{Type: "RLIMIT_NPROC", Soft: 64, Hard: 128},
@@ -85,8 +85,8 @@ func TestResolveRlimitPlan(t *testing.T) {
 			},
 		},
 		{
-			// (c) NEGATIVE: a memory limit + a cpu quota (Guaranteed QoS) but NO
-			// explicit rlimits[] yields an EMPTY plan — nothing is synthesized.
+			// (c) negative: a memory limit + a cpu quota (Guaranteed QoS) but NO
+			// explicit rlimits[] yields an empty plan — nothing is synthesized.
 			name: "memory-and-cpu-quota-without-explicit-rlimits-is-empty",
 			box: &runtimev1.PodBox{
 				MemoryLimitBytes: 512 << 20,
@@ -107,7 +107,7 @@ func TestResolveRlimitPlan(t *testing.T) {
 			},
 		},
 		{
-			// An unknown type ALONE yields an empty plan — proof it was skipped, not
+			// An unknown type alone yields an empty plan — proof it was skipped, not
 			// mapped to resource 0 (RLIMIT_CPU).
 			name: "unknown-type-only-is-empty",
 			box: &runtimev1.PodBox{Rlimits: []*runtimev1.ResourceLimit{
@@ -132,10 +132,10 @@ func TestResolveRlimitPlan(t *testing.T) {
 }
 
 // TestResolveBgQoS pins the B7 QoS mapping decision (apis QOSClass → the
-// supervisor-local background flag), made HERE in the runtime layer so the
+// supervisor-local background flag), made here in the runtime layer so the
 // supervisor stays decoupled from apis: BEST_EFFORT and UNSPECIFIED map to the
 // darwin background band (PRIO_DARWIN_BG via the launch sequence); GUARANTEED,
-// BURSTABLE, and any UNKNOWN/future enum value map to NO setpriority call at all
+// BURSTABLE, and any unknown/future enum value map to NO setpriority call at all
 // (downward-only — the default band is the absence of the call, never an
 // explicit reset-to-0). The unknown-value case is load-bearing: backgrounding
 // must be the explicitly-enumerated branch, so a future additive apis QOSClass
@@ -162,7 +162,7 @@ func TestResolveBgQoS(t *testing.T) {
 }
 
 // TestResolveRlimitPlan_UnknownTypeWarnsAndSkips proves the comma-ok contract:
-// an unrecognized type is SKIPPED with a slog.Warn and is NEVER applied as the
+// an unrecognized type is skipped with a slog.Warn and is never applied as the
 // zero-value resource — which on darwin is RLIMIT_CPU (0x0), a cumulative
 // CPU-seconds killer. The empty plan is the proof it did not fall through to 0.
 func TestResolveRlimitPlan_UnknownTypeWarnsAndSkips(t *testing.T) {

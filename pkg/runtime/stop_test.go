@@ -132,7 +132,7 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		mustCreatePod(t, rt, box)
 
 		// The container exits "voluntarily": release it so the reaper closes
-		// proc.Done(). DeletePod must observe the exit and NOT escalate to SIGKILL.
+		// proc.Done(). DeletePod must observe the exit and not escalate to SIGKILL.
 		w.release(1001)
 		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-gp"}); err != nil {
 			t.Fatalf("DeletePod: %v", err)

@@ -37,14 +37,14 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// WHERE THE TWO DELIVERABLES MEET: the container mapper (M11.2-d11, this
+// where the two DELIVERABLES MEET: the container mapper (M11.2-d11, this
 // package) and the guest-spec writer (M11.2-d10, pkg/sandbox) are joined by the
 // guest's own reader (pkg/guestinit), and the join is asserted end to end.
 //
-// It lives HERE, not in pkg/sandbox's round-trip, because the import direction
+// It lives here, not in pkg/sandbox's round-trip, because the import direction
 // forbids the alternative: pkg/runtime imports pkg/sandbox, so sandbox's tests
 // cannot reach the mapper and their fixture has to hand-write the containers it
-// feeds the composer. Driving the REAL CreateVM from this side is also strictly
+// feeds the composer. Driving the real CreateVM from this side is also strictly
 // stronger than calling the composer would be — what is planned below is the
 // FILE the guest will actually read off its k3sm.spec share, not an in-memory
 // message that resembles it.
@@ -54,7 +54,7 @@ import (
 // macOS binary. Every seam that would need a hypervisor is faked; nothing here
 // needs an entitlement, a VZ machine or a guest.
 
-// vmLabBackend wires a REAL *sandbox.VMBackend over fake spawn/reap/health
+// vmLabBackend wires a real *sandbox.VMBackend over fake spawn/reap/health
 // seams: it writes the machine description and the boot contract exactly as
 // production does, and then "spawns" and "reaches" a helper that does not exist.
 func vmLabBackend(t *testing.T, root string) (*sandbox.VMBackend, *blockingWaiter, int) {
@@ -93,11 +93,11 @@ func vmLabBackend(t *testing.T, root string) (*sandbox.VMBackend, *blockingWaite
 	return b, w, 1001
 }
 
-// TestVMPodBootContractSatisfiesGuestInit composes a REAL multi-container vm pod
+// TestVMPodBootContractSatisfiesGuestInit composes a real multi-container vm pod
 // — mapped from a PodBox against real image configs, written by the real
-// producer — and feeds the file it wrote to the REAL guest reader.
+// producer — and feeds the file it wrote to the real guest reader.
 //
-// NON-VACUITY IS THE POINT. Every value asserted below is one the fixture never
+// non-VACUITY IS the point. Every value asserted below is one the fixture never
 // handed the composer: the argv comes out of the four-quadrant merge of image
 // Entrypoint/Cmd against pod args, the env out of the image's own entries
 // overridden by the pod's, and the rootfs tag out of the share plan. A test that
@@ -149,7 +149,7 @@ func TestVMPodBootContractSatisfiesGuestInit(t *testing.T) {
 	}
 	box.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 999, RunAsGroup: 999, FsGroup: 2000}
 
-	// createVMPod is entered DIRECTLY rather than through CreatePod, because
+	// createVMPod is entered directly rather than through CreatePod, because
 	// SelectBackend gates on VMBackend.Available(), which requires a validly
 	// signed helper carrying com.apple.security.virtualization — a rig property
 	// this test deliberately does not have. The routing decision itself is
@@ -171,7 +171,7 @@ func TestVMPodBootContractSatisfiesGuestInit(t *testing.T) {
 		t.Fatalf("the boot contract is missing from the k3sm.spec share root: %v", err)
 	}
 	var gs guestv1.GuestSpec
-	// Unknown fields REJECTED — the same strictness the guest init reads with,
+	// Unknown fields rejected — the same strictness the guest init reads with,
 	// so a spec the guest would refuse fails here instead of on a rig.
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(raw, &gs); err != nil {
 		t.Fatalf("the written guest spec does not decode as a guestv1.GuestSpec: %v\n%s", err, raw)
@@ -254,7 +254,7 @@ func TestVMPodBootContractSatisfiesGuestInit(t *testing.T) {
 }
 
 // mustVMHostShares returns the virtiofs tags the written machine description
-// attaches — the OTHER file the same boot wrote, so the guest-side tags are
+// attaches — the other file the same boot wrote, so the guest-side tags are
 // checked against what the hypervisor is actually told to attach rather than
 // against the plan the daemon computed.
 func mustVMHostShares(t *testing.T, podDir string) []string {

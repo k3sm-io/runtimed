@@ -27,8 +27,8 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// tmpProbeSpawner is a fakeSpawner that additionally records, AT THE MOMENT OF
-// THE SPAWN, whether the directory a spec's TMPDIR names already exists and what
+// tmpProbeSpawner is a fakeSpawner that additionally records, AT the MOMENT OF
+// the SPAWN, whether the directory a spec's TMPDIR names already exists and what
 // its permissions are. Checking after CreatePod returns would not distinguish
 // "provisioned before the pod ran" from "provisioned too late to be usable",
 // which is the whole ordering B203 is about.

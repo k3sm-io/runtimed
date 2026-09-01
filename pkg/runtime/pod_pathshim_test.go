@@ -47,7 +47,7 @@ func mustEnvValue(t *testing.T, env []string, key string) string {
 }
 
 // mountingBox builds a mounting host-binary box whose rootfs_path is the
-// runtime's OWN derived pod data volume. It was a hard-coded /var/lib/k3sm/...
+// runtime's own derived pod data volume. It was a hard-coded /var/lib/k3sm/...
 // literal, which B140 now refuses: rootfs_path must be byte-equal to the
 // derivation, and a literal cannot match a test runtime's temp-dir cache root.
 func mountingBox(t *testing.T, rt *Runtime, podID string, mountPaths ...string) (*runtimev1.PodBox, *runtimev1.Container) {
@@ -143,7 +143,7 @@ func TestContainerEnvExplicitDyldWins(t *testing.T) {
 
 // TestContainerEnvKeepsEntriesAfterDYLD is the B205 regression gate: an
 // explicit DYLD_INSERT_LIBRARIES entry mid-slice must not truncate the base
-// env at that point — every entry before AND after it must survive, in
+// env at that point — every entry before and after it must survive, in
 // order, and the injected-annotation (non-explicit) DYLD path must still
 // carry the whole base too. Asserts the full resulting slice, not membership.
 func TestContainerEnvKeepsEntriesAfterDYLD(t *testing.T) {

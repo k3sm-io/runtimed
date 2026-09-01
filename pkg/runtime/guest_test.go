@@ -53,14 +53,14 @@ import (
 // that ends mid-exec, an undeclared container name — which is what these tests are
 // about, and which the shipped agent cannot be asked to do.
 //
-// The complementary assertion, that the daemon's routes and the SHIPPED
+// The complementary assertion, that the daemon's routes and the shipped
 // k3sm.io/runtimed/pkg/guestagent server agree about the contract, is
 // TestGuestAgentServesTheHostRoutes (guestagent_fullstack_test.go). Until that
 // existed this file's fakes were the only far end anywhere, so the routes were
 // verified only against a double written to satisfy them; they no longer are.
 //
 // bootedPod is the single pod this guest "booted": every request whose pod_id is
-// not that id is REJECTED, exactly as guest.proto requires ("the agent MUST
+// not that id is rejected, exactly as guest.proto requires ("the agent must
 // reject a pod_id that is not the pod it booted").
 type fakeGuestAgent struct {
 	guestv1.UnimplementedGuestAgentServer
@@ -139,7 +139,7 @@ func (f *fakeGuestAgent) logsRequest() *runtimev1.GetLogsRequest {
 
 // startFakeGuestAgent serves agent on an in-process bufconn listener and returns
 // a GuestDialer reaching it plus an accessor for the addresses the daemon asked
-// to dial. The addresses are what pins the Resolution 7 socket invariant AT THE
+// to dial. The addresses are what pins the Resolution 7 socket invariant AT the
 // ROUTE (guestAgentSocket's own shape is pinned separately, below): the route
 // must ask for the runtimed-private path, never a pod-dir one.
 func startFakeGuestAgent(t *testing.T, agent guestv1.GuestAgentServer) (GuestDialer, func() []string) {
@@ -173,7 +173,7 @@ func startFakeGuestAgent(t *testing.T, agent guestv1.GuestAgentServer) (GuestDia
 	}
 }
 
-// addVMPod registers a RUNNING vm-backend pod in rt's pod table.
+// addVMPod registers a running vm-backend pod in rt's pod table.
 //
 // It builds the pod directly instead of going through CreatePod because the vm
 // pod ASSEMBLY is a different deliverable: createVMPod still fails at the
@@ -218,8 +218,8 @@ type execOutput struct {
 }
 
 // drainExec collects everything already buffered on the fake stream. It is
-// called AFTER the handler returned, so the buffer is complete and the drain is
-// non-blocking — an assertion about what did NOT arrive (an oversized frame, a
+// called after the handler returned, so the buffer is complete and the drain is
+// non-blocking — an assertion about what did not arrive (an oversized frame, a
 // terminal exit after a refusal) needs that determinism.
 func drainExec(st *fakeExecStream) execOutput {
 	var out execOutput
@@ -370,7 +370,7 @@ func TestVMPodExecRoutesToGuestAgent(t *testing.T) {
 	})
 
 	t.Run("pod-id-mismatch-rejected", func(t *testing.T) {
-		// The guest booted a DIFFERENT pod than the one being exec'd — the
+		// The guest booted a different pod than the one being exec'd — the
 		// unsupported-skew case the single-pod contract exists to catch.
 		agent := &fakeGuestAgent{bootedPod: "pod-other"}
 		agent.exec = func(gs guestv1.GuestAgent_ExecServer) error {
@@ -447,7 +447,7 @@ func TestVMPodExecRoutesToGuestAgent(t *testing.T) {
 		be := &recordingExecBackend{}
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{GuestDialer: dial, Backend: be, Waiter: w})
-		// One host-process pod and one vm pod on the SAME daemon: dispatch is
+		// One host-process pod and one vm pod on the same daemon: dispatch is
 		// per pod, so a mis-keyed route shows up as the wrong one being used.
 		mustCreatePod(t, rt, hostBinBox(rt, "pod-host"))
 		defer w.release(1001)
@@ -653,7 +653,7 @@ func TestVMPodLogsRouteToGuestAgent(t *testing.T) {
 	t.Run("limit-bytes-enforced-host-side", func(t *testing.T) {
 		agent := &fakeGuestAgent{bootedPod: "pod-vm"}
 		agent.logs = func(req *runtimev1.GetLogsRequest, gs guestv1.GuestAgent_LogsServer) error {
-			// A guest that IGNORES the budget entirely (it was not even told).
+			// A guest that ignores the budget entirely (it was not even told).
 			for range 100 {
 				if err := gs.Send(&runtimev1.LogEntry{Line: []byte("flood"), Timestamp: timestamppb.New(at)}); err != nil {
 					return err
@@ -750,7 +750,7 @@ func TestGuestAgentSocketIsRuntimedPrivate(t *testing.T) {
 	})
 
 	t.Run("fits-in-sun_path", func(t *testing.T) {
-		// A darwin sockaddr_un carries 104 bytes of sun_path INCLUDING the
+		// A darwin sockaddr_un carries 104 bytes of sun_path including the
 		// terminator, and bind(2) reports an over-long path as the famously
 		// unhelpful EINVAL — not ENAMETOOLONG. The derived path is
 		// <Root>/run/vm/<podID>/agent.sock, so a long pod id can overflow it on a

@@ -28,7 +28,7 @@ import (
 // TestListPodStatsMapsFootprint is the M2.8 ListPodStats proof: a pod's
 // ri_phys_footprint working set maps onto PodStats.containers[].memory.working_set_bytes
 // (the typed wire form of the M2.5 sampler); empty pod_id returns every pod,
-// INCLUDING one with no memory limit (the limit selects OOM enforcement, not
+// including one with no memory limit (the limit selects OOM enforcement, not
 // metering — a `kubectl top` that omitted unlimited pods would lie by omission).
 func TestListPodStatsMapsFootprint(t *testing.T) {
 	w := newBlockingWaiter()
@@ -47,7 +47,7 @@ func TestListPodStatsMapsFootprint(t *testing.T) {
 	mustCreatePod(t, rt, annotated)
 	mustCreatePod(t, rt, hostBinBox(rt, "pod-unlimited"))
 
-	// empty pod_id returns EVERY pod, each with the per-container working set.
+	// empty pod_id returns every pod, each with the per-container working set.
 	// (Container working set is sampled at request time from the Footprinter, so it
 	// is populated immediately.)
 	var resp *runtimev1.ListPodStatsResponse
@@ -117,7 +117,7 @@ func allHaveContainerWorkingSet(stats []*runtimev1.PodStats) bool {
 	return true
 }
 
-// fakeRUsager is the richer supervisor.RUsager seam (memory AND cumulative CPU
+// fakeRUsager is the richer supervisor.RUsager seam (memory and cumulative CPU
 // from one sample), so the joint stats path is exercised with no syscall. cpu is
 // keyed by pid so a "restart" (a different pid) can be simulated.
 type fakeRUsager struct {
@@ -138,7 +138,7 @@ func (f fakeRUsager) RUsage(pid int) (supervisor.RUsage, error) {
 // The joint part is the point. metrics-server has no memory-only path: its resource
 // decoder drops a whole pod when any container's CumulativeCPUUsed or MemoryUsage is
 // zero (pkg/scraper/client/resource/decode.go), so a memory-only PodStats produces an
-// EMPTY `kubectl top` plus scrape-error noise — strictly worse than serving nothing.
+// empty `kubectl top` plus scrape-error noise — strictly worse than serving nothing.
 // A field-presence check would not catch that; this asserts the pair.
 func TestListPodStatsCarriesCPUJointlyWithMemory(t *testing.T) {
 	w := newBlockingWaiter()
@@ -163,7 +163,7 @@ func TestListPodStatsCarriesCPUJointlyWithMemory(t *testing.T) {
 		t.Fatal("pod-cpu never appeared in ListPodStats with a working set")
 	}
 
-	// Pod level: BOTH samples present.
+	// Pod level: both samples present.
 	if got := ps.GetMemory().GetWorkingSetBytes(); got == 0 {
 		t.Error("pod memory working_set_bytes = 0, want the sampler's footprint")
 	}
@@ -171,7 +171,7 @@ func TestListPodStatsCarriesCPUJointlyWithMemory(t *testing.T) {
 		t.Errorf("pod cpu usage_core_nano_seconds = %d, want 7000000000", got)
 	}
 
-	// Container level: BOTH samples present, from the same rusage read.
+	// Container level: both samples present, from the same rusage read.
 	if len(ps.GetContainers()) != 1 {
 		t.Fatalf("containers = %d, want 1", len(ps.GetContainers()))
 	}
@@ -188,7 +188,7 @@ func TestListPodStatsCarriesCPUJointlyWithMemory(t *testing.T) {
 
 // TestListPodStatsWithoutRUsagerLeavesCPUUnset pins the fail-quiet half of the
 // contract: a Footprinter that cannot report CPU (a memory-only injection) leaves
-// every CPU field ABSENT rather than reporting a zero. Absent is what lets the k3sm
+// every CPU field absent rather than reporting a zero. Absent is what lets the k3sm
 // provider withhold the pod from /metrics/resource; a zero would look like an idle
 // pod and be published as an incomplete sample.
 func TestListPodStatsWithoutRUsagerLeavesCPUUnset(t *testing.T) {

@@ -112,7 +112,7 @@ func TestDeriveGPUFacts(t *testing.T) {
 		}
 	})
 
-	// sandbox_gpu_supported is scoped to the SELECTED backend: same host, same
+	// sandbox_gpu_supported is scoped to the selected backend: same host, same
 	// probe, different answer under the vm rung — because a Linux guest has no
 	// Metal device to open, so the grant could not take effect there.
 	t.Run("sandbox_gpu_supported is backend-scoped", func(t *testing.T) {

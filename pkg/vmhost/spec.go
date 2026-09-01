@@ -33,7 +33,7 @@ const maxSpecBytes = 4 << 20
 
 // ReadSpec reads and decodes the host-written VMHostSpec at path.
 //
-// UNKNOWN FIELDS ARE REJECTED (DiscardUnknown: false), mirroring
+// unknown FIELDS are rejected (DiscardUnknown: false), mirroring
 // cmd/k3sm-guest-init's readSpec exactly. The file is the proto-JSON encoding of
 // VMHostSpec and nothing else, so a key this binary does not know means the daemon
 // and this helper were built from different contracts. That skew must fail AT BOOT

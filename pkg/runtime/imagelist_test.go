@@ -43,7 +43,7 @@ var testPlatform = image.Platform{OS: "darwin", Architecture: "arm64"}
 // # Why the second half is here
 //
 // Moving the listing source is only safe if it does not move the GC's. The
-// prune subtest is not decoration: it asserts through the SAME prune seam an
+// prune subtest is not decoration: it asserts through the same prune seam an
 // operator uses that a listed-but-unrooted image is still reclaim-eligible, so
 // a future change that "fixed" the listing by making an index entry a root
 // would go red here rather than silently turning every `image ls` row into
@@ -156,7 +156,7 @@ func TestListImagesEnumeratesTheIndex(t *testing.T) {
 // recordIndex records a ref->manifest index entry the way a pull or an archive
 // ingest does, and returns the manifest.
 //
-// It writes through the daemon's OWN index (rt.index) — the same instance the
+// It writes through the daemon's own index (rt.index) — the same instance the
 // puller and the loader hold — so a test cannot go green against a listing
 // bound to a second, private index.
 func recordIndex(t *testing.T, rt *Runtime, ref, config string, layers ...string) *runtimev1.ImageManifest {

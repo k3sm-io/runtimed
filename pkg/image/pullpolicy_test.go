@@ -29,11 +29,11 @@ import (
 )
 
 // fakeIndex is a LocalIndex whose whole state is an in-memory map, so a test can
-// put a reference in the "recorded locally" state directly. It keeps THIS
+// put a reference in the "recorded locally" state directly. It keeps this
 // table about the puller's policy branching: the on-disk index's own rules
 // (platform keying, corruption, ownership) are gated by
 // TestRefDigestIndexDecidesPresence, which drives the real FileIndex. It can
-// fail, because "the index could not be read" is deliberately NOT a miss.
+// fail, because "the index could not be read" is deliberately not a miss.
 type fakeIndex struct {
 	entries map[string]*runtimev1.ImageManifest
 	err     error
@@ -63,7 +63,7 @@ func (f *fakeIndex) Record(_ context.Context, ref string, _ Platform, mfst *runt
 
 // offlineFetch is a FetchFunc that fails the way a blackholed network fails. Any
 // case that reaches it has performed registry traffic, which is exactly what the
-// IfNotPresent/Never warm-cache rows must NOT do — a counter alone would prove
+// IfNotPresent/Never warm-cache rows must not do — a counter alone would prove
 // only that a pull did not happen to be needed.
 type offlineFetch struct{ calls int }
 
@@ -88,7 +88,7 @@ type cacheState string
 const (
 	// stateAbsent: the reference is in no index and no blob is cached.
 	stateAbsent cacheState = "absent"
-	// stateWarm: the reference is recorded AND every blob it names is in the CAS.
+	// stateWarm: the reference is recorded and every blob it names is in the CAS.
 	stateWarm cacheState = "warm"
 	// stateEvicted: the reference is recorded but its blobs are gone (a stale
 	// index entry — presence-by-reference must not outlive the bytes).
@@ -98,13 +98,13 @@ const (
 // TestPullPolicyHonored is the B120 / M12.1-a1 gate: the policy x cache-state
 // matrix the puller must obey, including the UNSPECIFIED=legacy rows (an old
 // provider never stamps the field, and absent must never be read as Never) and
-// the offline IfNotPresent warm-cache row (proving ZERO registry traffic rather
+// the offline IfNotPresent warm-cache row (proving zero registry traffic rather
 // than "no fetch happened to be needed" — the fetcher it is wired to cannot
 // succeed).
 //
-// runtimed NEVER re-derives a policy from the image tag: every row's reference
+// runtimed never re-derives a policy from the image tag: every row's reference
 // is `:latest`, the tag whose corev1 default is Always, yet each row obeys the
-// STAMPED value it is given. A re-derivation would make the IfNotPresent and
+// stamped value it is given. A re-derivation would make the IfNotPresent and
 // Never rows fetch.
 func TestPullPolicyHonored(t *testing.T) {
 	const ref = "example.com/app:latest"
@@ -175,7 +175,7 @@ func TestPullPolicyHonored(t *testing.T) {
 			wantCacheHit: true,
 		},
 		{
-			// A recorded reference whose bytes are gone is NOT present.
+			// A recorded reference whose bytes are gone is not present.
 			name:        "if_not_present_evicted_blobs_pulls_again",
 			pull:        runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
 			state:       stateEvicted,
@@ -218,7 +218,7 @@ func TestPullPolicyHonored(t *testing.T) {
 				primeLocalImage(t, cache, idx, ref, img, tc.state == stateEvicted)
 			}
 
-			// The subject puller is built AFTER priming so the offline rows are
+			// The subject puller is built after priming so the offline rows are
 			// wired to a fetcher that cannot succeed.
 			ff := &fakeFetch{img: img}
 			off := &offlineFetch{}
