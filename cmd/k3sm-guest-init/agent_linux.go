@@ -75,6 +75,27 @@ func (g *guestStatus) setReady(rosetta bool) {
 	g.mu.Unlock()
 }
 
+// setGuestIP records the address the guest's DHCP client leased.
+//
+// It is a SETTER and not a constructor argument because guest_ip is a LEASE, not
+// an identity: guest.proto calls the field "the single live-address authority"
+// and says the host re-reads it rather than caching it, so the guest must be able
+// to report a NEW address without anything being rebuilt. Status already re-reads
+// under the mutex on every Health call, so a future renewal loop only has to call
+// this again.
+//
+// no RENEWAL LOOP exists yet, and that ceiling is recorded rather than implied:
+// this is called exactly once, at boot. The S5 spike measured the lease stable
+// across restarts given the host's deterministic MAC, so a v0.1 guest that never
+// renews keeps its address for its own lifetime — but a lease whose duration
+// expires mid-life would not be re-acquired, and the host would keep dialing an
+// address the segment has reassigned.
+func (g *guestStatus) setGuestIP(ip string) {
+	g.mu.Lock()
+	g.guestIP = ip
+	g.mu.Unlock()
+}
+
 // reaperRunner is the Runner seam: the pod's declared container roster and the
 // shutdown verb, both delegated to the plan and the reaper that already own them.
 type reaperRunner struct {

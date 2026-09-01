@@ -40,10 +40,16 @@ limitations under the License.
 // guest that is ready for a pod it has not started.
 //
 // not yet IN this BINARY, and deliberately so — each is its own slice with its
-// own gate: the eth0 DHCP client (so /etc/hosts carries no leased address yet,
-// and HealthResponse.guest_ip is empty), and pty allocation (so a tty exec is
-// refused rather than run without a terminal). A spec requesting an idmapped mount
-// is refused rather than mounted without the idmap.
+// own gate: pty allocation (so a tty exec is refused rather than run without a
+// terminal). A spec requesting an idmapped mount is refused rather than mounted
+// without the idmap.
+//
+// The guest network IS here: lo and eth0 are brought up, eth0 is addressed by a
+// minimal in-guest DHCPv4 client against the host's NAT segment, the default
+// route is installed over netlink, and the leased address is what
+// HealthResponse.guest_ip reports. There is no renewal loop yet — see
+// guestStatus.setGuestIP for that ceiling — and /etc/hosts still carries no
+// leased address.
 //
 // Per-container cgroup2 leaves ARE here: the metering controllers are delegated to
 // the hierarchy root's children at boot and each container is placed into
@@ -165,6 +171,33 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}
 
+	// The guest's own network, before anything can need it: lo UP, eth0 UP and
+	// addressed from the segment's DHCP server, and a default route via the
+	// gateway it offered.
+	//
+	// FAIL CLOSED. A lease failure fails the boot rather than leaving the pod
+	// Running-but-unaddressed, and that is the deliberate choice: a Running pod
+	// with no address is the silent mode — a Service selecting it gets an
+	// EndpointSlice with no addresses, traffic blackholes, and nothing anywhere
+	// says why. Kubernetes has no notion of a pod without an address, so a guest
+	// that could not get one has not started a pod; refusing makes the provider
+	// recreate it, and the reason is on the console because the fatal path goes
+	// through the reaper (Reaper.Fail). The DHCP client already absorbs the
+	// ordinary case this could over-react to — a lost broadcast — by retrying
+	// within its own budget before returning at all.
+	//
+	// It runs BEFORE the containers because a container may bind a socket as its
+	// first act, and before the agent because HealthResponse.guest_ip is fed from
+	// what it records.
+	netCfg, err := configureNetwork(log)
+	if err != nil {
+		return err
+	}
+	log.Info("configured the guest network",
+		"link", netCfg.Interface, "address", netCfg.Prefix.String(),
+		"gateway", netCfg.Lease.Gateway.String(), "mtu", netCfg.MTU,
+		"dns_offered", netCfg.Lease.DNS, "lease", netCfg.Lease.Duration.String())
+
 	// The reaper is started before the first container, so no exit can happen
 	// while nothing is reaping.
 	sigchld := make(chan struct{}, 1)
@@ -275,6 +308,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// ordering is why the event bus retains state: every container has already
 	// started by the time anything can subscribe.
 	status := &guestStatus{}
+	// The leased address becomes HealthResponse.guest_ip, which is what the host
+	// polls for a vm pod's live transport address (pkg/runtime's guest-lease
+	// watcher). Until this line it was never set and that field was empty for the
+	// whole life of every vm pod.
+	status.setGuestIP(netCfg.Lease.Address.String())
 	rawCmdline, err := os.ReadFile(cmdlinePath)
 	if err != nil {
 		return reaper.Fail(ctx, defaultStopGrace, fmt.Errorf("read %s: %w", cmdlinePath, err))
