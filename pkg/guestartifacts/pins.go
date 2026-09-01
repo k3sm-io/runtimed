@@ -49,7 +49,7 @@ import (
 // with ErrPinIncomplete, and every vm pod fails closed until the build lands the
 // real identity and the real digests together. A fabricated hash here would buy
 // nothing but a cache key that matches no artifact anyone can fetch.
-const ActiveGuestKernel = "v6.18.48-pending"
+const ActiveGuestKernel = "v6.18.48-9c05f8f3b26c"
 
 // ImageFileName and InitramfsFileName are the basenames the two artifacts of a
 // pinned set are stored under, inside that set's content-addressed directory,
@@ -118,13 +118,13 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.48",
-		// The digests and the release url are minted together by the guest
-		// build. They are EMPTY, not fake: Complete reports false, Lookup
-		// refuses the pin, and the vm capability is off on this build. See the
-		// ActiveGuestKernel comment.
-		ImageSHA256:     "",
-		InitramfsSHA256: "",
-		ReleaseURL:      "",
+		// Minted 2026-08-31 from the v6.18.48-k3sm.1 release: two-run
+		// byte-identical reproducible build (config hash 9c05f8f3b26c… is the
+		// -suffix of ActiveGuestKernel), digests re-derived from the PUBLISHED
+		// assets after upload, not from the local build output.
+		ImageSHA256:     "d50508b08205453e5f5f710978743449dc4fafe957aa8694e6da8e5780d93308",
+		InitramfsSHA256: "0c6e88e94d1d9ff2b178ace58dd94343869e301d1ff9defa5550abc7880bb695",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.1",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
