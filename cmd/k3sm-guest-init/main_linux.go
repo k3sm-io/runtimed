@@ -454,8 +454,8 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 	return nil
 }
 
-// spawn forks and execs one container's process inside its composed rootfs, on
-// its OWN stdout/stderr pipes.
+// spawn resolves one container's program, then forks and execs it inside the
+// container's composed rootfs, on its OWN stdout/stderr pipes.
 //
 // The child is chrooted, credentialed and given its own session before the
 // exec; the working directory is applied after the chroot, so it is a path
@@ -490,6 +490,21 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Lo
 	dir := cp.WorkingDir
 	if dir == "" {
 		dir = "/"
+	}
+	// argv[0] is resolved execvp-style INSIDE the container before the fork.
+	// ForkExec is execve: it does no PATH search, so an image whose Entrypoint is
+	// a bare name — which is most official images — could not start at all. The
+	// resolution has to happen here and not host-side: only the guest has the
+	// container's rootfs to stat, and only this container's own env supplies the
+	// PATH to search. See guestinit.ResolveProgram.
+	//
+	// cp.Argv is passed to ForkExec UNCHANGED. execvp replaces only the path it
+	// execs, never argv[0] itself, and programs that branch on their own name
+	// (busybox, and every `docker-entrypoint.sh` that re-execs) read the argv the
+	// image intended.
+	prog, err := guestinit.ResolveProgram(cp.Root, cp.WorkingDir, cp.Argv[0], guestinit.PathFromEnv(cp.Env))
+	if err != nil {
+		return 0, err
 	}
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
@@ -534,7 +549,7 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Lo
 		Files: []uintptr{0, stdoutW.Fd(), stderrW.Fd()},
 		Sys:   sys,
 	}
-	pid, err := syscall.ForkExec(cp.Argv[0], cp.Argv, attr)
+	pid, err := syscall.ForkExec(prog, cp.Argv, attr)
 	// This process's copies of the child's write ends go immediately after the
 	// fork: holding them open means the readers below never see EOF, so a
 	// container's log stream would never end even after the container did.

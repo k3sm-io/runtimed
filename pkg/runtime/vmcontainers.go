@@ -156,7 +156,10 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 // none OF the HOST-PROCESS RESOLUTION HAPPENS. argv[0] is not resolved against a
 // host rootfs (resolveImageArgv0's containment check is about a path this daemon
 // is about to exec; the guest execs inside its own chroot, and no host path ever
-// crosses the boundary), nothing is ad-hoc signed or signature-gated (a Linux ELF
+// crosses the boundary) — the guest resolves it execvp-style against its own root
+// and the container's own PATH instead (guestinit.ResolveProgram), which is the
+// only side that can, since the rootfs a bare-name Entrypoint has to be searched
+// in exists only there. Nothing is ad-hoc signed or signature-gated (a Linux ELF
 // is not a Mach-O), and the environment is the MERGE only — containerEnv's TMPDIR
 // and DYLD inserts are macOS host-process facts that would be noise or worse
 // inside a guest.
