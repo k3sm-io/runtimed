@@ -14,16 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package guestartifacts owns the Linux guest boot artifacts a vm pod boots
-// from: the in-code digest PIN that names them, and the ENSURE mechanism that
-// materialises them into a node-local content-addressed cache.
-//
-// The two halves are deliberately separate files and deliberately separate
-// concerns. A pin is a CODE FACT — bumping it is a source change, reviewed and
-// released like any other; ensure is a RUNTIME FACT — it fetches, verifies and
-// retains, and it is the only thing that ever writes into the cache. Nothing in
-// this package trusts a byte it has not hashed, which is what lets the cache
-// live in an ordinary directory with ordinary permissions.
+// The pin half of the package: the in-code digest PIN that names the guest
+// boot artifacts. A pin is a CODE FACT — bumping it is a source change,
+// reviewed and released like any other; the ensure half (ensure.go) is the
+// RUNTIME FACT that fetches, verifies and retains against it. Nothing in this
+// package trusts a byte it has not hashed. The package doc lives in doc.go.
 package guestartifacts
 
 import (
