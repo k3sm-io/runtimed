@@ -321,3 +321,75 @@ func TestPathFromEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveProgramIsPerContainerRoot pins the property the EXEC path depends
+// on: resolution is relative to the root and env of the container being targeted,
+// not to the guest's own filesystem and not to some other container's.
+//
+// `kubectl exec -- sh` failed with ENOENT for the same reason a bare-name
+// entrypoint did — syscall.ForkExec is execve — and the fix has a second way to
+// be wrong that the entrypoint path does not: an exec resolving against the guest
+// init's filesystem, or against the wrong container's, would find A program and
+// run it under the target container's name. Two roots holding DIFFERENT programs
+// at the SAME bare name is the case that catches it.
+func TestResolveProgramIsPerContainerRoot(t *testing.T) {
+	appRoot := containerRoot(t, "usr/local/bin/entry", "bin/only-in-app")
+	sidecarRoot := containerRoot(t, "opt/tools/entry", "bin/only-in-sidecar")
+
+	cases := []struct {
+		name    string
+		root    string
+		pathEnv string
+		argv0   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "the-app-resolves-its-own-entry",
+			root:    appRoot,
+			pathEnv: "/usr/local/bin:/bin",
+			argv0:   "entry",
+			want:    "/usr/local/bin/entry",
+		},
+		{
+			// The same bare name, a different container: a different path, found
+			// only because that container's OWN env supplied the PATH.
+			name:    "the-sidecar-resolves-its-own-entry-from-its-own-path",
+			root:    sidecarRoot,
+			pathEnv: "/opt/tools:/bin",
+			argv0:   "entry",
+			want:    "/opt/tools/entry",
+		},
+		{
+			name:    "the-app-cannot-see-the-sidecars-program",
+			root:    appRoot,
+			pathEnv: "/opt/tools:/bin",
+			argv0:   "only-in-sidecar",
+			wantErr: true,
+		},
+		{
+			name:    "the-sidecar-cannot-see-the-apps-program",
+			root:    sidecarRoot,
+			pathEnv: "/usr/local/bin:/bin",
+			argv0:   "only-in-app",
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveProgram(tc.root, "/", tc.argv0, tc.pathEnv)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveProgram = %q; one container must not resolve another's program", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveProgram: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ResolveProgram = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

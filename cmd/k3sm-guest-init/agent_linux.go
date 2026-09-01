@@ -206,6 +206,21 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 		return guestagent.ExecResult{}, errors.New("this guest cannot allocate a pseudo-terminal for an exec yet; retry without a tty")
 	}
 
+	// argv[0] is resolved execvp-style inside the TARGET CONTAINER's root, using
+	// that container's own PATH — the same resolution spawn does for a container's
+	// entrypoint, and for the same reason: ForkExec below is execve and does no
+	// PATH search, so `kubectl exec -- sh` failed with ENOENT on every image.
+	//
+	// plan.Root, never the guest's own /: an exec claiming to run in a container
+	// must resolve against that container's filesystem, or it would find the
+	// guest init's binaries and run a different program under the container's
+	// name. plan.Env is that container's environment, so the PATH searched is the
+	// one the container itself would use.
+	prog, err := guestinit.ResolveProgram(plan.Root, plan.WorkingDir, spec.Argv[0], guestinit.PathFromEnv(plan.Env))
+	if err != nil {
+		return guestagent.ExecResult{}, err
+	}
+
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		return guestagent.ExecResult{}, fmt.Errorf("exec stdin pipe: %w", err)
@@ -243,14 +258,14 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 			Setsid: true,
 		},
 	}
-	pid, err := syscall.ForkExec(spec.Argv[0], spec.Argv, attr)
+	pid, err := syscall.ForkExec(prog, spec.Argv, attr)
 	// The child's ends are closed in this process immediately after the fork:
 	// holding stdoutW open here would mean the stdout reader never sees EOF, and
 	// the exec would appear to hang after the command had already exited.
 	closeAll(stdinR, stdoutW, stderrW)
 	if err != nil {
 		closeAll(stdinW, stdoutR, stderrR)
-		return guestagent.ExecResult{}, fmt.Errorf("start %q in %s: %w", spec.Argv[0], spec.Container, err)
+		return guestagent.ExecResult{}, fmt.Errorf("start %q (resolved to %s) in %s: %w", spec.Argv[0], prog, spec.Container, err)
 	}
 
 	name := e.trackName(spec.Container)
