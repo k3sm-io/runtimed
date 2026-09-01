@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -117,7 +118,22 @@ func vmPodConfig(t *testing.T, d Deps) (Config, Deps) {
 	if d.Resolver == nil {
 		d.Resolver = fakeResolver{}
 	}
+	// A vm pod's published identity comes from the GuestNetworker seam and from
+	// nowhere else, and createVMPod refuses a pod without one — so a vm test
+	// without a producer is testing a configuration production cannot have.
+	// Defaulted here for the same reason the Resolver is: every vm test box needs
+	// it, and stating it once keeps a future harness change from silently
+	// removing it.
+	if d.Network == nil {
+		d.Network = &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true}
+	}
 	return Config{Root: root}, d
+}
+
+// testGuestNetwork is the guest network config a vm test's producer supplies:
+// a podCIDR /32 shaped like the one the k3sm provider allocates on the rig.
+func testGuestNetwork() sandbox.GuestNetworkConfig {
+	return sandbox.GuestNetworkConfig{PodIP: netip.MustParseAddr("100.64.0.8")}
 }
 
 // newVMPlanRuntime builds a Runtime whose vm backend is the available

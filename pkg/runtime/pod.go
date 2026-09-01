@@ -691,17 +691,31 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create pod dir %s: %w", podDir, err)
 	}
-	// Resolved once, and used twice: the guest's DNS/NAT configuration on the
-	// spec below, and its PodIP as the status.podIP a downward-API projection
-	// resolves to. The value is advisory (a NAT-attached guest's on-the-wire
-	// address is macOS-assigned) and may be unset, in which case the projection
-	// gets "" rather than an invented address — the same "" the native spine
-	// passes when IPAM produced nothing.
+	// Resolved once, and used three times: the guest's DNS/NAT configuration on
+	// the spec below, the status.podIP a downward-API projection resolves to, and
+	// the pod's PUBLISHED IDENTITY on the assembled pod.
+	//
+	// The two halves of this config have different failure policies, and the
+	// split is the point. The DNS and NAT-advisory half DEGRADES: a producer that
+	// is not wired, or that has no config for this pod, is logged and the guest
+	// boots without a resolver (guestNetworkConfig documents that, and it is
+	// survivable — a pod that cannot resolve names is still a pod). The IDENTITY
+	// half does NOT. pod_ip is the podCIDR /32 that reaches EndpointSlice, DNS and
+	// the downward API (runtime.proto), the vm spine runs no IPAM of its own, and
+	// this seam is its ONLY source — so an absent PodIP is not a degraded pod, it
+	// is an unroutable one: a Service selecting it gets an EndpointSlice with no
+	// addresses and traffic blackholes with nothing anywhere saying why.
+	//
+	// So it fails closed here, before the machine is built, with INTERNAL — the
+	// same reason the host-process spine reports when its own network setup
+	// fails, because it is the same condition: no address for the pod.
 	netCfg := r.guestNetworkConfig(box.GetPodId())
-	podIP := ""
-	if netCfg.PodIP.IsValid() {
-		podIP = netCfg.PodIP.String()
+	if !netCfg.PodIP.IsValid() {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
+			fmt.Errorf("no pod IP for vm pod %s: the GuestNetworker producer supplied none, "+
+				"and a vm pod has no other source of a published identity", box.GetPodId())
 	}
+	podIP := netCfg.PodIP.String()
 	// Render the plan onto disk: the pod-dir share roots, the projected-class
 	// volumes' content under the proj share, and the emptyDir directories under
 	// the vols share. The guest binds these host directories, so they must exist
@@ -785,8 +799,20 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		box:     box,
 		backend: vmPodBackend,
 		phase:   runtimev1.PodPhase_POD_PHASE_RUNNING,
-		supCtx:  supCtx,
-		cancel:  cancel,
+		// The PUBLISHED IDENTITY, which this spine never set: PodStatus.pod_ips
+		// was empty for every vm pod, so status.podIP was empty, a Service
+		// selecting one got an EndpointSlice with no addresses, and the pod was
+		// unroutable. The value was already in hand — it is the same one the
+		// downward-API projection above resolves — and simply never reached here.
+		//
+		// It is NOT the guest's DHCP lease, and the two must not converge.
+		// p.guestLease carries that separately (the lease watcher fills it) and
+		// surfaces as PodStatus.guest_transport_address, which runtime.proto
+		// forbids publishing into EndpointSlice, DNS or status.podIP. One address
+		// is who the pod IS, the other is where the host dials it.
+		podIP:  podIP,
+		supCtx: supCtx,
+		cancel: cancel,
 	}
 	// No memory sampler, and no armMemorySampler call anywhere on this path. A vm
 	// pod's memory ceiling is the hypervisor's VZ memorySize, and its OOM truth
