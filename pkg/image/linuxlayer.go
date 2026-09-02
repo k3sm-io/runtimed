@@ -19,6 +19,8 @@ package image
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -46,9 +48,12 @@ import (
 //     ownership SIDECAR rather than applied, because an unprivileged daemon
 //     cannot chown and a host-side setuid bit is a live escalation
 //     (docs/privilege-model.md). The guest re-applies it — see OwnershipEntry.
-//   - two entries whose paths differ only by CASE or by Unicode NORMALIZATION
-//     are refused (ErrPathCollision): they are distinct files to Linux and one
-//     file to a case-insensitive APFS volume.
+//   - two entries whose paths differ only by Unicode NORMALIZATION are refused
+//     (ErrPathCollision), and so are two that differ only by CASE when the
+//     DESTINATION was probed case-insensitive: they are distinct files to Linux
+//     and one file to a volume that merges them. On a destination probed
+//     case-sensitive the case pair is two ordinary files and is applied as such
+//     (see probeDestCaseSensitive).
 //
 // Adding this constant is half of adding a dialect; the other half is the case
 // in LayerApplier.applyEntry and in UnpackPolicy.Validate. Both fail closed on
@@ -70,6 +75,13 @@ func LinuxUnpackPolicy() UnpackPolicy { return UnpackPolicy{Semantics: Semantics
 // snapshot store on a dedicated case-sensitive APFS volume so this condition
 // should be unreachable in production; this check is the defense in depth that
 // makes a mis-provisioned volume LOUD instead of silently lossy.
+//
+// It is raised against the DESTINATION as measured, never against an assumption
+// about it: a case pair is a collision only where probeDestCaseSensitive found a
+// case-insensitive filesystem, because on a correctly provisioned node the two
+// paths are exactly what they claim to be — two files. A normalization pair is
+// refused on every destination, since APFS is normalization-insensitive in both
+// its case-sensitive and its case-insensitive form.
 var ErrPathCollision = errors.New("image: linux layer paths collide on a case-insensitive filesystem")
 
 // OCI/AUFS whiteout markers, as specified by the OCI image-spec ("Applying
@@ -159,6 +171,90 @@ func classifyWhiteout(name string) (whiteoutKind, string, error) {
 // not merge that pair either, so the gap is not known to be reachable.
 func foldKey(p string) string {
 	return strings.ToLower(norm.NFC.String(p))
+}
+
+// foldKeyFor renders a tree-relative path in the form the DESTINATION directory
+// compares by, given that destination's measured case sensitivity.
+//
+// The two insensitivities foldKey composes are INDEPENDENT and only one of them
+// varies: APFS is normalization-insensitive in both its case-sensitive and its
+// case-insensitive form, so NFC folding is unconditional, while case folding is
+// applied only where a case-insensitive destination was actually measured.
+// Dropping the case fold on a case-sensitive destination is what lets an image
+// carrying "libip6t_HL.so" beside "libip6t_hl.so" — which every iptables-derived
+// Linux image does — materialize as the two files it names.
+func foldKeyFor(p string, caseSensitive bool) string {
+	if caseSensitive {
+		return norm.NFC.String(p)
+	}
+	return foldKey(p)
+}
+
+// The case-sensitivity probe's two entry names. They differ ONLY in the case of
+// their last byte, which is what makes the pair an experiment about the
+// FILESYSTEM rather than about name availability, and they are dot-prefixed and
+// namespaced so that a human who finds one after a hard kill can tell what wrote
+// it.
+const (
+	caseProbeNameLower = ".k3sm-case-probe-a"
+	caseProbeNameUpper = ".k3sm-case-probe-A"
+)
+
+// probeDestCaseSensitive reports whether the directory anchored at root lives on
+// a case-SENSITIVE filesystem, by creating one entry and then asking for the
+// same name spelled in the other case with O_EXCL: EEXIST means the filesystem
+// resolved the two spellings to one file, and success means it holds two.
+//
+// It probes the DIRECTORY, not the volume, and that is the whole point of doing
+// it this way. getattrlist's VOL_CAP_FMT_CASE_SENSITIVE answers for the volume a
+// path's mount point names, and on macOS a firmlink or a nested mount below the
+// queried path makes that answer describe a different filesystem from the one
+// the write actually lands on — which is precisely the topology k3sm creates by
+// siting the snapshot store on its own APFS volume. A create(2) pair is the only
+// probe whose subject is the exact directory the layers are applied into.
+//
+// Both entries are removed before it returns, and a failed removal is reported
+// as a probe error rather than swallowed: a stray probe file would otherwise be
+// committed inside a rootfs that every pod clones.
+//
+// The caller treats ANY error as case-INSENSITIVE (see NewLayerApplier), because
+// a probe that failed open would drop the collision refusal on a destination it
+// never managed to measure and silently merge two Linux files into one.
+func probeDestCaseSensitive(root *os.Root) (sensitive bool, err error) {
+	f, err := root.OpenFile(caseProbeNameLower, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return false, fmt.Errorf("create case probe: %w", err)
+	}
+	// Nothing is written to it: the NAME is the entire experiment.
+	if cerr := f.Close(); cerr != nil {
+		// Best effort — the verdict is already an error, and the tree this
+		// probe runs in is disposable staging.
+		_ = root.Remove(caseProbeNameLower)
+		return false, fmt.Errorf("close case probe: %w", cerr)
+	}
+	defer func() {
+		if rerr := root.Remove(caseProbeNameLower); rerr != nil && err == nil {
+			sensitive, err = false, fmt.Errorf("remove case probe: %w", rerr)
+		}
+	}()
+
+	g, gerr := root.OpenFile(caseProbeNameUpper, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if gerr != nil {
+		if errors.Is(gerr, fs.ErrExist) {
+			// The upper-case spelling resolved to the entry created above: one
+			// file under two names, so the destination is case-INSENSITIVE.
+			return false, nil
+		}
+		return false, fmt.Errorf("create upper-case case probe: %w", gerr)
+	}
+	if cerr := g.Close(); cerr != nil {
+		_ = root.Remove(caseProbeNameUpper) // best effort; see above
+		return false, fmt.Errorf("close upper-case case probe: %w", cerr)
+	}
+	if rerr := root.Remove(caseProbeNameUpper); rerr != nil {
+		return false, fmt.Errorf("remove upper-case case probe: %w", rerr)
+	}
+	return true, nil
 }
 
 // OwnershipEntryType names the kind of node an OwnershipEntry describes. The

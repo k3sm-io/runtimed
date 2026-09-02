@@ -549,6 +549,257 @@ func TestLinuxRootfsCaseCollisionFailsClosed(t *testing.T) {
 	})
 }
 
+// applyIntoDest applies layers into a fresh tree under the LINUX dialect with
+// the destination case-sensitivity verdict INJECTED rather than probed.
+//
+// It is the seam the case-SENSITIVE rows need: a stock macOS host's temp
+// directories live on the case-INSENSITIVE boot volume, so the sensitive
+// destination is otherwise unreachable in a unit test — and injecting is
+// indistinguishable from probing, because the verdict is read per entry and the
+// tree is still empty when it is set.
+func applyIntoDest(t *testing.T, caseSensitive bool, layers ...[]tarSpec) (string, *LayerApplier, error) {
+	t.Helper()
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "rootfs")
+	if err := os.Mkdir(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	a, err := NewLayerApplier(root, LinuxUnpackPolicy(), ApplyLimits{})
+	if err != nil {
+		t.Fatalf("NewLayerApplier: %v", err)
+	}
+	a.destCaseSensitive = caseSensitive
+	for _, specs := range layers {
+		if err := a.Apply(context.Background(), bytes.NewReader(buildTar(t, specs))); err != nil {
+			return tree, a, err
+		}
+	}
+	return tree, a, nil
+}
+
+// probeInto runs the destination probe against a fresh directory and returns the
+// verdict, the probe error, and the directory.
+func probeInto(t *testing.T, prepare func(t *testing.T, dir string)) (bool, error, string) {
+	t.Helper()
+	dir := t.TempDir()
+	if prepare != nil {
+		prepare(t, dir)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	sensitive, perr := probeDestCaseSensitive(root)
+	return sensitive, perr, dir
+}
+
+// hostTempIsCaseSensitive reports whether this host's t.TempDir lands on a
+// case-sensitive filesystem, measured without the probe under test.
+func hostTempIsCaseSensitive(t *testing.T) bool {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "witness"), []byte("w"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Lstat(filepath.Join(dir, "WITNESS"))
+	if err == nil {
+		return false
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lstat WITNESS: %v", err)
+	}
+	return true
+}
+
+// TestDestCaseSensitivityProbe pins the destination probe itself: the verdict it
+// reaches about a real directory, that it leaves nothing behind, and that it
+// fails CLOSED.
+//
+// The verdict row is checked against an INDEPENDENT measurement rather than
+// against a hard-coded "macOS is case-insensitive", for two reasons: the probe
+// would otherwise be asserting its own mechanism, and a developer or CI host
+// whose temp directory is on a case-sensitive volume must not see a red test for
+// a correct answer.
+func TestDestCaseSensitivityProbe(t *testing.T) {
+	t.Run("the verdict matches an independent measurement", func(t *testing.T) {
+		sensitive, perr, dir := probeInto(t, nil)
+		if perr != nil {
+			t.Fatalf("probeDestCaseSensitive: %v", perr)
+		}
+		// The independent measurement uses a different mechanism — write one
+		// name, stat the other — so agreeing with it is evidence and not a
+		// tautology.
+		if err := os.WriteFile(filepath.Join(dir, "witness"), []byte("w"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := os.Lstat(filepath.Join(dir, "WITNESS"))
+		merged := err == nil
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("lstat WITNESS: %v", err)
+		}
+		if sensitive == merged {
+			t.Errorf("probe says case_sensitive=%v but the filesystem %s the two spellings",
+				sensitive, map[bool]string{true: "merges", false: "keeps apart"}[merged])
+		}
+		t.Logf("this host's temp directory is case-sensitive: %v", sensitive)
+	})
+
+	t.Run("the probe leaves nothing behind", func(t *testing.T) {
+		_, perr, dir := probeInto(t, nil)
+		if perr != nil {
+			t.Fatalf("probeDestCaseSensitive: %v", perr)
+		}
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ents) != 0 {
+			var names []string
+			for _, e := range ents {
+				names = append(names, e.Name())
+			}
+			t.Errorf("the probe left %v behind; a probe entry would be committed inside every pod's rootfs", names)
+		}
+	})
+
+	t.Run("an unmeasurable destination reads as case-insensitive", func(t *testing.T) {
+		// Debris under the probe's own name is the deterministic way to make the
+		// O_EXCL create fail on any host and as any uid — a mode-based refusal
+		// would not hold for a root-run test.
+		sensitive, perr, _ := probeInto(t, func(t *testing.T, dir string) {
+			t.Helper()
+			if err := os.Mkdir(filepath.Join(dir, caseProbeNameLower), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if perr == nil {
+			t.Fatal("probeDestCaseSensitive succeeded over its own debris; the error path is untested")
+		}
+		if sensitive {
+			t.Errorf("a failed probe reported case_sensitive=true; it must fail CLOSED to the refusal")
+		}
+	})
+
+	t.Run("a failed probe leaves the applier refusing collisions", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, caseProbeNameLower), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		a, err := NewLayerApplier(root, LinuxUnpackPolicy(), ApplyLimits{})
+		if err != nil {
+			t.Fatalf("NewLayerApplier: %v", err)
+		}
+		if a.destCaseSensitive {
+			t.Fatal("the applier adopted a case-sensitive verdict from a failed probe")
+		}
+		err = a.Apply(context.Background(), bytes.NewReader(buildTar(t, []tarSpec{
+			{name: "README", mode: 0o644, data: "a"},
+			{name: "readme", mode: 0o644, data: "b"},
+		})))
+		if !errors.Is(err, ErrPathCollision) {
+			t.Fatalf("apply error = %v, want ErrPathCollision", err)
+		}
+	})
+}
+
+// TestLinuxRootfsCaseCollisionFollowsTheDestination is the fix's gate: the case
+// refusal is a statement about the DESTINATION, not about macOS.
+//
+// The fixture is the real one that broke the lab — moby/buildkit carries
+// iptables' "libip6t_HL.so" beside "libip6t_hl.so", which is two files on the
+// case-sensitive APFS volume the snapshot store is provisioned on and was
+// nonetheless refused. The normalization row rides along to prove the fix
+// narrowed exactly one of the two folds: NFC insensitivity holds on every
+// destination, because APFS has it in both its variants.
+func TestLinuxRootfsCaseCollisionFollowsTheDestination(t *testing.T) {
+	const (
+		upperPath = "usr/lib/xtables/libip6t_HL.so"
+		lowerPath = "usr/lib/xtables/libip6t_hl.so"
+	)
+	collide := []tarSpec{
+		{name: upperPath, mode: 0o644, data: "HL"},
+		{name: lowerPath, mode: 0o644, data: "hl"},
+	}
+
+	t.Run("a case-sensitive destination applies both entries", func(t *testing.T) {
+		tree, a, err := applyIntoDest(t, true, collide)
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if got := a.Stats().Files; got != 2 {
+			t.Errorf("applied %d files, want 2 — both entries must reach the tree", got)
+		}
+		// Both must reach the ownership sidecar too: the guest re-applies from
+		// it, so a path missing there is a path the guest never fixes up.
+		own := ownershipByPath(a.Ownership())
+		for _, p := range []string{upperPath, lowerPath} {
+			if _, ok := own[p]; !ok {
+				t.Errorf("ownership sidecar has no entry for %s", p)
+			}
+		}
+
+		// The two-files-on-disk half of the property needs a genuinely
+		// case-sensitive directory, which the injection cannot conjure: this
+		// tree is on whatever volume t.TempDir lands on. Asserting it anyway
+		// would make the test fail on a stock macOS host for the filesystem's
+		// behaviour rather than the applier's, so it is asserted exactly where
+		// it is true and named where it is not.
+		if !hostTempIsCaseSensitive(t) {
+			t.Skip("temp directory is on a case-insensitive volume; the model rows above are the coverage here")
+		}
+		for p, want := range map[string]string{upperPath: "HL", lowerPath: "hl"} {
+			got, rerr := os.ReadFile(filepath.Join(tree, p))
+			if rerr != nil {
+				t.Fatalf("read %s: %v", p, rerr)
+			}
+			if string(got) != want {
+				t.Errorf("%s = %q, want %q — the two entries merged into one file", p, got, want)
+			}
+		}
+	})
+
+	t.Run("a case-insensitive destination still refuses", func(t *testing.T) {
+		_, _, err := applyIntoDest(t, false, collide)
+		if !errors.Is(err, ErrPathCollision) {
+			t.Fatalf("apply error = %v, want ErrPathCollision", err)
+		}
+	})
+
+	t.Run("a case-sensitive destination still refuses a normalization pair", func(t *testing.T) {
+		_, _, err := applyIntoDest(t, true, []tarSpec{
+			{name: "srv/caf\u00e9.conf", mode: 0o644, data: "nfc"},
+			{name: "srv/cafe\u0301.conf", mode: 0o644, data: "nfd"},
+		})
+		if !errors.Is(err, ErrPathCollision) {
+			t.Fatalf("apply error = %v, want ErrPathCollision — APFS is normalization-insensitive in both variants", err)
+		}
+	})
+
+	t.Run("a case-sensitive destination keeps unrelated paths apart", func(t *testing.T) {
+		tree, _, err := applyIntoDest(t, true, []tarSpec{
+			{name: "etc/one", mode: 0o644, data: "1"},
+			{name: "etc/two", mode: 0o644, data: "2"},
+		})
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if !exists(t, tree, "etc/one") || !exists(t, tree, "etc/two") {
+			t.Error("an ordinary two-file layer did not apply")
+		}
+	})
+}
+
 // TestLinuxRootfsSymlinkDialect pins the one per-dialect rule in the applier:
 // an absolute symlink target is refused natively (no chroot stands between the
 // pod and the host root) and admitted under Linux (the guest chroots into this
