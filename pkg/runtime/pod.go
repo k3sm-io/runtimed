@@ -846,7 +846,17 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	p := &pod{
 		box:     box,
 		backend: vmPodBackend,
-		phase:   runtimev1.PodPhase_POD_PHASE_RUNNING,
+		// RUNNING at assembly, not PENDING, and the guest's own ordering is why:
+		// it starts every container BEFORE it serves the agent (the agent's
+		// Health is CreateVM's boot probe, so it must not answer before there is
+		// a pod to answer about). CreateVM having returned therefore means the
+		// containers are already running, and PENDING here would be a claim the
+		// guest has already disproved — one the provider reads as authoritative
+		// ("the pod has not started") and short-circuits on. From here the phase
+		// is state-derived: the ContainerEvents fold re-derives it on every
+		// transition (recomputeVMPhaseLocked), which is what carries the pod to
+		// Succeeded/Failed when its containers finish.
+		phase: runtimev1.PodPhase_POD_PHASE_RUNNING,
 		// The PUBLISHED IDENTITY, which this spine never set: PodStatus.pod_ips
 		// was empty for every vm pod, so status.podIP was empty, a Service
 		// selecting one got an EndpointSlice with no addresses, and the pod was
