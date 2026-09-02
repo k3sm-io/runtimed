@@ -83,7 +83,18 @@ limitations under the License.
 //   - A container's /dev is the OCI default device set and nothing else
 //     (DefaultDevices) plus a private devpts and a bounded /dev/shm. The
 //     allowlist is a security boundary, not a convenience: see ContainerDev for
-//     why /dev/vsock in particular must never appear in it.
+//     why /dev/vsock in particular must never appear in it. Loop devices
+//     (/dev/loop-control, /dev/loop*) are deliberately NOT in the set: a
+//     build-class pod that needs `mount -o loop` mounts its own devtmpfs (the
+//     guest root can) rather than every container carrying loop nodes it must
+//     not have.
+//   - Each container also gets a fresh procfs at /proc and a writable cgroup2
+//     hierarchy at /sys/fs/cgroup (ContainerKernelFS), because a runc-based
+//     build worker and any /proc reader need them and the chroot cuts the
+//     container off from the guest's. With no pid or cgroup namespace (the
+//     chroot-only ceiling below), /proc shows guest-wide pids and the cgroup2
+//     mount is a view of the guest-wide unified hierarchy — a metering/build
+//     aid, not an isolation boundary.
 //   - An idmapped mount (GuestMount.idmap) is planned but not applied by the
 //     executor: mount_setattr(MOUNT_ATTR_IDMAP) is contingent on the M11.2-d5
 //     lab question. The executor refuses such a spec rather than mounting it
