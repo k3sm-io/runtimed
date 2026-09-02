@@ -574,3 +574,93 @@ func readTree(t *testing.T, tree, rel string) string {
 	}
 	return string(buf)
 }
+
+// TestApplyLayerAcceptsTheRootEntry pins the buildkit/docker "./" root entry as
+// a NO-OP rather than a fault, and pins the carve-out's exact width.
+//
+// The bug this replaces was live and total: a `docker build`/buildkit export of
+// any debian-derived base emits a `./` directory entry as its first entry, so
+// every such image failed to materialize with "entry name \"./\" names the tree
+// root itself". Alpine-derived images happen not to carry one, which is why a
+// green test table coexisted with an unrunnable standard image — the fixtures
+// were all alpine-shaped.
+//
+// The second half of the table is the part that keeps the fix honest. A
+// carve-out for "." is only safe if it is a carve-out for "." and nothing
+// adjacent, so the traversal and absolute-name refusals are re-asserted here
+// rather than left to the sanitizer's own table: those are the cases a
+// too-permissive "just clean the name" fix would silently admit.
+func TestApplyLayerAcceptsTheRootEntry(t *testing.T) {
+	// The shape a real buildkit layer has: the root entry first, then content.
+	buildkitLayer := func(root string) []tarSpec {
+		return []tarSpec{
+			{name: root, typ: tar.TypeDir, mode: 0o755},
+			{name: "etc", typ: tar.TypeDir, mode: 0o755},
+			{name: "etc/hostname", mode: 0o644, data: "box"},
+		}
+	}
+
+	for _, spelling := range []string{"./", ".", "./."} {
+		t.Run("root_entry_"+spelling+"_is_skipped", func(t *testing.T) {
+			tree, stats, err := applyInto(t, ApplyLimits{}, buildkitLayer(spelling))
+			if err != nil {
+				t.Fatalf("Apply of a layer whose first entry is %q = %v; a root entry is legal and must be a no-op", spelling, err)
+			}
+			if stats.RootEntries != 1 {
+				t.Errorf("stats.RootEntries = %d, want 1 (the skip must be counted, not silent)", stats.RootEntries)
+			}
+			// Skipped means skipped: the root entry created nothing and was not
+			// counted as a directory the layer made.
+			if stats.Dirs != 1 {
+				t.Errorf("stats.Dirs = %d, want 1 (only etc/); the root entry must not be counted as a created dir", stats.Dirs)
+			}
+			// ...and the rest of the layer landed, which is the whole point.
+			if got := readTree(t, tree, "etc/hostname"); got != "box" {
+				t.Errorf("etc/hostname = %q, want %q", got, "box")
+			}
+		})
+	}
+
+	t.Run("a_root_entry_alone_applies_cleanly", func(t *testing.T) {
+		_, stats, err := applyInto(t, ApplyLimits{}, []tarSpec{{name: "./", typ: tar.TypeDir, mode: 0o755}})
+		if err != nil {
+			t.Fatalf("Apply of a root-entry-only layer = %v, want nil", err)
+		}
+		if stats.RootEntries != 1 || stats.Dirs != 0 || stats.Files != 0 {
+			t.Errorf("stats = %+v, want exactly one skipped root entry and nothing created", stats)
+		}
+	})
+
+	// The carve-out's width, asserted from the outside. Each of these differs
+	// from "./" by one character class, and each must still be refused.
+	t.Run("the_carve_out_admits_nothing_adjacent", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			spec    tarSpec
+			wantErr error
+		}{
+			{"dotdot_dir", tarSpec{name: "../", typ: tar.TypeDir, mode: 0o755}, ErrLayerEscapes},
+			{"dotdot_prefixed_dir", tarSpec{name: "../escape", typ: tar.TypeDir, mode: 0o755}, ErrLayerEscapes},
+			{"absolute_root", tarSpec{name: "/", typ: tar.TypeDir, mode: 0o755}, ErrLayerEscapes},
+			{"absolute_dir", tarSpec{name: "/etc", typ: tar.TypeDir, mode: 0o755}, ErrLayerEscapes},
+			{"interior_dot_component", tarSpec{name: "etc/./passwd", mode: 0o644, data: "no"}, ErrLayerMalformed},
+			{"empty_name", tarSpec{name: "", typ: tar.TypeDir, mode: 0o755}, ErrLayerMalformed},
+			// A hardlink cannot target the tree root: layerEntryPath keeps its
+			// root refusal for the Linkname call site, which the carve-out in
+			// applyEntry deliberately does not reach.
+			{"hardlink_to_the_root", tarSpec{name: "link", typ: tar.TypeLink, link: "./"}, ErrLayerMalformed},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, stats, err := applyInto(t, ApplyLimits{}, []tarSpec{tc.spec})
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("Apply(%q) error = %v, want %v", tc.spec.name, err, tc.wantErr)
+				}
+				if stats.RootEntries != 0 {
+					t.Errorf("stats.RootEntries = %d for %q; only the cleaned-\".\" name is the root entry",
+						stats.RootEntries, tc.spec.name)
+				}
+			})
+		}
+	})
+}

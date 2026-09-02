@@ -168,7 +168,11 @@ func recordIndex(t *testing.T, rt *Runtime, ref, config string, layers ...string
 	for _, l := range layers {
 		mfst.Layers = append(mfst.Layers, &runtimev1.Descriptor{Digest: l})
 	}
-	if err := rt.index.Record(context.Background(), ref, testPlatform, mfst); err != nil {
+	if err := rt.index.Record(context.Background(), image.IndexEntry{
+		Reference: ref,
+		Platform:  testPlatform,
+		Manifest:  mfst,
+	}); err != nil {
 		t.Fatalf("index.Record(%q): %v", ref, err)
 	}
 	return mfst

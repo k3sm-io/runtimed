@@ -215,6 +215,22 @@ type PullResult struct {
 	// blob was newly written) — i.e. a second pull of the same content.
 	CacheHit bool
 
+	// Descriptor is the resolved manifest's OWN content descriptor: media type,
+	// digest (what a user reads as the image id) and size.
+	//
+	// It is reported because nothing downstream can re-derive it: the store
+	// commits config and layer blobs and never the manifest, so a caller that
+	// wanted the image id would have to re-encode the manifest and would get a
+	// different digest. Nil only when the index recorded no manifest (an entry
+	// written before this store retained them).
+	Descriptor *runtimev1.Descriptor
+
+	// Platform is the platform half of the index key this pull resolved to —
+	// the entry the pull recorded, so a caller can read back exactly what was
+	// written. It is not ImageManifest.platform, which is populated only when the
+	// reference came through a multi-platform index.
+	Platform Platform
+
 	// Lease pins this result's blobs against image GC and is returned HELD. The
 	// caller releases it once it has recorded the reference that makes those
 	// blobs reachable (Cache.RecordPodImage) — not before, or the window between
@@ -251,16 +267,17 @@ var ErrImageNotPresent = errors.New("image not present locally and the pull poli
 // Its entries are edges, never reachability roots — see FileIndex — so an
 // implementation may never be consulted by the image GC.
 type LocalIndex interface {
-	// Lookup returns the manifest recorded for ref under policy's platform, and
+	// Lookup returns the ENTRY recorded for ref under policy's platform, and
 	// ok=false when the reference has not been recorded.
 	//
 	// An index that cannot be READ returns an error, which is not a miss: a miss
 	// would fail Never for an image that is present, and would send an
 	// IfNotPresent pod to the registry at exactly the moment the operator asked
 	// it not to go. The caller propagates the error instead.
-	Lookup(ctx context.Context, ref string, policy PlatformPolicy) (manifest *runtimev1.ImageManifest, ok bool, err error)
+	Lookup(ctx context.Context, ref string, policy PlatformPolicy) (entry IndexEntry, ok bool, err error)
 
-	// Record records that ref resolved to manifest for platform.
+	// Record records the entry: that its reference resolved to its manifest for
+	// its platform.
 	//
 	// The Puller calls it only after a pull has fully succeeded, with the
 	// manifest IT resolved and verified and after every blob was committed. That
@@ -268,7 +285,7 @@ type LocalIndex interface {
 	// from anything else — bytes re-fetched at lookup time, a manifest recorded
 	// before its blobs landed — could report an image present that this node
 	// never verified.
-	Record(ctx context.Context, ref string, platform Platform, manifest *runtimev1.ImageManifest) error
+	Record(ctx context.Context, entry IndexEntry) error
 }
 
 // NoLocalIndex is the LocalIndex that records nothing: every reference is absent.
@@ -283,14 +300,14 @@ type LocalIndex interface {
 type NoLocalIndex struct{}
 
 // Lookup reports every reference absent.
-func (NoLocalIndex) Lookup(context.Context, string, PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
-	return nil, false, nil
+func (NoLocalIndex) Lookup(context.Context, string, PlatformPolicy) (IndexEntry, bool, error) {
+	return IndexEntry{}, false, nil
 }
 
 // Record discards the record. Under-recording is the safe direction — it can
 // only send a pull to the registry that a record would have served locally, and
 // can never make presence lie.
-func (NoLocalIndex) Record(context.Context, string, Platform, *runtimev1.ImageManifest) error {
+func (NoLocalIndex) Record(context.Context, IndexEntry) error {
 	return nil
 }
 
@@ -397,14 +414,23 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT ||
 		pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
-		mfst, lease, present, err := p.presentLocally(ctx, ref, policy)
+		entry, lease, present, err := p.presentLocally(ctx, ref, policy)
 		if err != nil {
 			return nil, err
 		}
 		if present {
 			// No blob was written and no registry was contacted. The lease comes
-			// back HELD — see PullResult.Lease.
-			return &PullResult{Manifest: mfst, CacheHit: true, Lease: lease}, nil
+			// back HELD — see PullResult.Lease. The manifest descriptor is the one
+			// the entry recorded, never one re-derived here: the store holds no
+			// manifest blob to hash, so re-deriving it would report a different
+			// image id for a warm serve than the pull that recorded it did.
+			return &PullResult{
+				Manifest:   entry.Manifest,
+				CacheHit:   true,
+				Descriptor: entry.Descriptor,
+				Platform:   entry.Platform,
+				Lease:      lease,
+			}, nil
 		}
 		if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
 			return nil, fmt.Errorf("image %q: %w", ref, ErrImageNotPresent)
@@ -458,6 +484,19 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	mfst, err := img.Manifest()
 	if err != nil {
 		return nil, fmt.Errorf("manifest %q: %w", ref, boundErr(err))
+	}
+	// The manifest's OWN bytes and digest, captured here for the index to retain
+	// (see IndexEntry.ManifestRaw). They are read from the same resolved image
+	// the descriptors above came from, so the retained bytes and the committed
+	// blobs describe one image by construction. The store commits no manifest
+	// blob, so this is the only place they can be captured at all.
+	rawMfst, err := img.RawManifest()
+	if err != nil {
+		return nil, fmt.Errorf("raw manifest %q: %w", ref, boundErr(err))
+	}
+	mfstDigest, err := img.Digest()
+	if err != nil {
+		return nil, fmt.Errorf("manifest digest %q: %w", ref, boundErr(err))
 	}
 
 	// LEASE the whole DIGEST SET before a single blob is even looked at — not
@@ -540,11 +579,28 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	// (ErrIndexNotOwned) — are exactly the conditions under which a LOOKUP must
 	// not be believed either. Continuing would keep serving pods from an index
 	// this daemon has just discovered it cannot maintain.
-	if err := p.index.Record(ctx, ref, resolved, out); err != nil {
+	desc := &runtimev1.Descriptor{
+		MediaType: string(mfst.MediaType),
+		Digest:    mfstDigest.String(),
+		Size:      int64(len(rawMfst)),
+	}
+	if err := p.index.Record(ctx, IndexEntry{
+		Reference:   ref,
+		Platform:    resolved,
+		Manifest:    out,
+		Descriptor:  desc,
+		ManifestRaw: rawMfst,
+	}); err != nil {
 		return nil, fmt.Errorf("pull %q: record image index: %w", ref, err)
 	}
 
-	return &PullResult{Manifest: out, CacheHit: !wroteAny, Lease: lease}, nil
+	return &PullResult{
+		Manifest:   out,
+		CacheHit:   !wroteAny,
+		Descriptor: desc,
+		Platform:   resolved,
+		Lease:      lease,
+	}, nil
 }
 
 // manifestDescriptorDigests is every blob digest a go-containerregistry manifest
@@ -562,20 +618,23 @@ func manifestDescriptorDigests(mfst *ggcrv1.Manifest) []string {
 
 // presentLocally reports whether ref is on this node for policy's platform: the
 // index must have recorded it and every blob its manifest names must still be in
-// the content-addressed store.
+// the content-addressed store. It returns the whole recorded entry, so a warm
+// serve reports the manifest descriptor and key platform the pull recorded
+// rather than a re-derivation of them.
 //
 // The second half is not belt-and-braces. Presence-by-reference and the bytes
 // have independent lifetimes (the cache GC evicts blobs), and a stale index entry
 // would otherwise start a container whose layers are gone — so a recorded
 // reference with missing blobs is a miss, which sends IfNotPresent back to the
 // registry and fails Never honestly.
-func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, *Lease, bool, error) {
-	mfst, ok, err := p.index.Lookup(ctx, ref, policy)
+func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (IndexEntry, *Lease, bool, error) {
+	entry, ok, err := p.index.Lookup(ctx, ref, policy)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("image index lookup %q: %w", ref, err)
+		return IndexEntry{}, nil, false, fmt.Errorf("image index lookup %q: %w", ref, err)
 	}
+	mfst := entry.Manifest
 	if !ok || mfst == nil {
-		return nil, nil, false, nil
+		return IndexEntry{}, nil, false, nil
 	}
 	// LEASE before the presence check, not after it. This path writes nothing at
 	// all, so there is no commit to hang a pin on and no mtime change for a grace
@@ -586,15 +645,15 @@ func (p *Puller) presentLocally(ctx context.Context, ref string, policy Platform
 	lease := p.cache.AcquireLease(manifestDigests(mfst), 0)
 	if !p.cache.Has(mfst.GetConfig().GetDigest()) {
 		lease.Release()
-		return nil, nil, false, nil
+		return IndexEntry{}, nil, false, nil
 	}
 	for _, l := range mfst.GetLayers() {
 		if !p.cache.Has(l.GetDigest()) {
 			lease.Release()
-			return nil, nil, false, nil
+			return IndexEntry{}, nil, false, nil
 		}
 	}
-	return mfst, lease, true, nil
+	return entry, lease, true, nil
 }
 
 // manifestDigests is every blob digest a resolved manifest names — the config

@@ -192,7 +192,15 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 }
 
 // Roots enumerates the COMPLETE reachability root set for this store: every
-// image every pod dir records.
+// image every pod dir records, PLUS every image an operator named (the operator
+// record — see OperatorImageRoot).
+//
+// The two kinds are unioned here and nowhere else, so there is exactly one
+// answer to "what is reachable" and a prune cannot be written against half of
+// it. They stay distinct on disk because they are removed by different parties:
+// a pod's roots go when its dir goes, an operator's go only when the operator
+// untags the name. That asymmetry is the whole reason RemoveImage refuses and
+// UntagImage does not — the M12 images plan, Resolution 13.
 //
 // It fails closed and it fails LOUDLY. The pods tree is walked through an
 // os.Root anchored at the pods dir, so no symlink can redirect the walk out of
@@ -208,12 +216,20 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 //     parse, since a root the store cannot map to a path cannot protect one.
 //
 // An ABSENT pods dir is not incomplete: a node with no pods tree has no pods,
-// so the empty root set is the true answer and reclaim may proceed.
+// so the empty root set is the true answer and reclaim may proceed. The same
+// holds for an absent operator record.
 func (c *Cache) Roots() ([]ImageRoot, error) {
+	// Operator roots FIRST, and their read failure is fatal for the same reason a
+	// pod record's is: a prune deletes what no root names, so a root set that is
+	// silently short does not degrade the answer, it inverts it.
+	operator, err := c.OperatorImageRoots()
+	if err != nil {
+		return nil, err
+	}
 	podsRoot := c.PodsRoot()
 	entries, err := os.ReadDir(podsRoot)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return operatorRootSet(operator), nil
 	}
 	if err != nil {
 		// LOCAL-ONLY, no boundErr (this one and the OpenRoot below): stdlib os
@@ -275,7 +291,22 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 			out = append(out, r)
 		}
 	}
-	return out, nil
+	return append(out, operatorRootSet(operator)...), nil
+}
+
+// operatorRootSet flattens the operator record to the ImageRoot shape the prune
+// planner consumes. The (reference x platform) key is dropped here on purpose:
+// reachability is about which DIGESTS are named, and the planner has no business
+// reasoning about who named them.
+func operatorRootSet(roots []OperatorImageRoot) []ImageRoot {
+	if len(roots) == 0 {
+		return nil
+	}
+	out := make([]ImageRoot, 0, len(roots))
+	for _, r := range roots {
+		out = append(out, r.Root)
+	}
+	return out
 }
 
 // readAnchored reads rel through root, refusing anything that is not a regular

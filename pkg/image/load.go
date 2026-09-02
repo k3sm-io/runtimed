@@ -282,17 +282,24 @@ func (l *Loader) Load(ctx context.Context, req LoadRequest, src io.Reader) (*Loa
 	// parsed and verified. The entry is an EDGE, not a reachability root (see
 	// FileIndex): a loaded image whose blobs no pod references is reclaimable
 	// like any other unreferenced content.
-	if err := l.index.Record(ctx, ref, img.platform, out); err != nil {
+	desc := &runtimev1.Descriptor{
+		MediaType: string(img.manifest.MediaType),
+		Digest:    img.manifestDigest.String(),
+		Size:      img.manifestSize,
+	}
+	if err := l.index.Record(ctx, IndexEntry{
+		Reference:   ref,
+		Platform:    img.platform,
+		Manifest:    out,
+		Descriptor:  desc,
+		ManifestRaw: img.manifestRaw,
+	}); err != nil {
 		return nil, fmt.Errorf("load image %q: record image index: %w", ref, err)
 	}
 
 	return &LoadResult{
-		Manifest: out,
-		Descriptor: &runtimev1.Descriptor{
-			MediaType: string(img.manifest.MediaType),
-			Digest:    img.manifestDigest.String(),
-			Size:      img.manifestSize,
-		},
+		Manifest:      out,
+		Descriptor:    desc,
 		Platform:      img.platform,
 		ReceivedBytes: staged.size,
 	}, nil
@@ -300,16 +307,32 @@ func (l *Loader) Load(ctx context.Context, req LoadRequest, src io.Reader) (*Loa
 
 // loadReference validates the reference an ingest will record.
 func loadReference(ref string) (string, error) {
-	if ref == "" {
-		return "", fmt.Errorf("%w: a reference is required", ErrLoadReferenceInvalid)
-	}
-	// Parsed for VALIDITY only; the string is recorded verbatim, as the pull path
-	// records the reference it was given. Normalizing here would record a
-	// different key from the one the operator (and later, a pod spec) names.
-	if _, err := name.ParseReference(ref); err != nil {
-		return "", fmt.Errorf("%w: %s: %v", ErrLoadReferenceInvalid, quoteBounded(ref, maxDigestLen), boundErr(err))
+	if err := ValidateReference(ref); err != nil {
+		return "", err
 	}
 	return ref, nil
+}
+
+// ValidateReference reports whether ref is a usable pull reference, wrapping
+// ErrLoadReferenceInvalid when it is not.
+//
+// It is exported because every operator-facing verb that RECORDS a name — load,
+// pull, tag — must apply the same test: a reference becomes an index key that a
+// pod later resolves by exact match, so an unparseable one records an entry
+// nothing can ever hit. One implementation, so the three verbs cannot disagree
+// about what a reference is.
+//
+// Parsed for VALIDITY only; the string is recorded verbatim, as the pull path
+// records the reference it was given. Normalizing here would record a different
+// key from the one the operator (and later, a pod spec) names.
+func ValidateReference(ref string) error {
+	if ref == "" {
+		return fmt.Errorf("%w: a reference is required", ErrLoadReferenceInvalid)
+	}
+	if _, err := name.ParseReference(ref); err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrLoadReferenceInvalid, quoteBounded(ref, maxDigestLen), boundErr(err))
+	}
+	return nil
 }
 
 // ingestRoot is the directory a streamed archive is staged in (IngestSubdir).
@@ -436,7 +459,13 @@ type archiveBlob struct {
 // archiveImage is the one image an archive contributes, resolved to the same
 // shape both formats reduce to.
 type archiveImage struct {
-	manifest       *ggcrv1.Manifest
+	manifest *ggcrv1.Manifest
+	// manifestRaw is the manifest's EXACT bytes as the archive carried them.
+	// They are retained (not re-encoded) because the index keeps them verbatim
+	// and an export writes them back verbatim: a re-encoded manifest hashes
+	// differently, which would change the image's id across a load/save
+	// round trip.
+	manifestRaw    []byte
 	manifestDigest ggcrv1.Hash
 	manifestSize   int64
 	config         archiveBlob
@@ -557,6 +586,7 @@ func parseDockerSave(open tarball.Opener) (*archiveImage, error) {
 
 	out := &archiveImage{
 		manifest:       mfst,
+		manifestRaw:    rawMfst,
 		manifestDigest: mfstDigest,
 		manifestSize:   int64(len(rawMfst)),
 		config: archiveBlob{
@@ -632,6 +662,7 @@ func parseOCILayout(open tarball.Opener) (*archiveImage, error) {
 
 	out := &archiveImage{
 		manifest:       &mfst,
+		manifestRaw:    rawMfst,
 		manifestDigest: desc.Digest,
 		manifestSize:   int64(len(rawMfst)),
 		config: archiveBlob{

@@ -414,6 +414,13 @@ type fakePuller struct {
 	// resolved CONFIG digest a status must publish as image_id (B132). Nil keeps
 	// the historical empty manifest.
 	manifest *runtimev1.ImageManifest
+	// descriptor and platform are the manifest's own content descriptor and the
+	// index KEY the pull resolved to, which the real Puller reports and the
+	// operator-facing PullImage RPC reads back. platform must be complete —
+	// recording an operator root under an empty platform is refused — so a zero
+	// value defaults to the native one rather than propagating a hole.
+	descriptor *runtimev1.Descriptor
+	platform   image.Platform
 
 	mu             sync.Mutex
 	lastCred       *image.RegistryCredential
@@ -436,7 +443,16 @@ func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCre
 	if mfst == nil {
 		mfst = &runtimev1.ImageManifest{}
 	}
-	return &image.PullResult{Manifest: mfst, CacheHit: true}, nil
+	plat := f.platform
+	if plat.OS == "" || plat.Architecture == "" {
+		plat = image.Platform{OS: "darwin", Architecture: "arm64"}
+	}
+	return &image.PullResult{
+		Manifest:   mfst,
+		CacheHit:   true,
+		Descriptor: f.descriptor,
+		Platform:   plat.Normalize(),
+	}, nil
 }
 
 // policy returns the last platform policy passed to Pull, so a test can assert

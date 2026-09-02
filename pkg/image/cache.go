@@ -57,6 +57,14 @@ type Cache struct {
 	leases    map[uint64]*Lease
 	nextLease uint64
 
+	// operatorMu serializes the read-modify-write of the OPERATOR reachability
+	// record (operatorroots.go). That record is a single file holding every
+	// operator-owned root, so two concurrent tag/untag/pull calls would otherwise
+	// race lost-update style and drop a root — which, unlike a lost EDGE, makes
+	// live content reclaimable. The per-pod records need no such lock: each pod
+	// writes only its own file.
+	operatorMu sync.Mutex
+
 	// now is the clock every time-dependent decision in this package reads. It
 	// is a field, not a call to time.Now, so the lease TTL and the reclaim grace
 	// window are testable without sleeping.

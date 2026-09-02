@@ -23,8 +23,10 @@ import (
 	"io"
 	"time"
 
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -63,10 +65,15 @@ type imagesService struct {
 // image.FileIndex). That is deliberate, not a gap: a listing that pinned
 // content would turn every `image ls` row into an un-reclaimable root.
 //
-// The listing carries no manifest_descriptor: the store commits config and
-// layer blobs but never the manifest itself, so there is no digest to report
-// for it. Filtering is exact-match on the request's reference and, because the
-// index is keyed (reference x platform), on its platform when one is given.
+// Each row carries the manifest_descriptor the index RETAINED — the image id an
+// operator reads — and nothing re-derived: the store commits config and layer
+// blobs but never the manifest, so a listing that hashed something here would be
+// reporting an id no registry ever served. An entry written before the index
+// retained manifests has no descriptor, and the row then omits it rather than
+// inventing one (see image.IndexEntry.Descriptor).
+//
+// Filtering is exact-match on the request's reference and, because the index is
+// keyed (reference x platform), on its platform when one is given.
 func (s *imagesService) ListImages(ctx context.Context, req *runtimev1.ListImagesRequest) (*runtimev1.ListImagesResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
@@ -84,7 +91,10 @@ func (s *imagesService) ListImages(ctx context.Context, req *runtimev1.ListImage
 		if want != nil && e.Platform != *want {
 			continue
 		}
-		out.Images = append(out.Images, &runtimev1.Image{Manifest: e.Manifest})
+		out.Images = append(out.Images, &runtimev1.Image{
+			ManifestDescriptor: e.Descriptor,
+			Manifest:           e.Manifest,
+		})
 	}
 	return out, nil
 }
@@ -142,13 +152,17 @@ func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInf
 // RemoveImage is not implemented, and the refusal is a design statement rather
 // than a gap to be filled in place.
 //
-// A root on this node is a per-POD record the daemon authored, not an operator
-// untag: dropping one would assert that a pod no longer references content it is
-// still running on, which is the exact liveness violation the image GC exists to
-// make impossible. Root removal needs the reference-to-digest index (a separate
-// deliverable) so an untag can drop an OPERATOR-owned root without touching any
-// pod-owned one. Until that exists, refusing is the honest answer; a caller
-// wanting space back calls PruneImages, which re-derives reachability first.
+// A request shaped as "remove this image" does not say WHICH root the caller
+// owns, and the roots on this node are not all alike: most are per-POD records
+// the daemon authored, and dropping one would assert that a pod no longer
+// references content it is still running on — the exact liveness violation the
+// image GC exists to make impossible.
+//
+// UntagImage is the removal that CAN be granted, and its existence is why this
+// refusal stands rather than being softened: it names exactly one operator-owned
+// (reference x platform) entry, so it removes a root whose owner asked for it
+// and can touch no pod-owned one. A caller wanting bytes back calls PruneImages,
+// which re-derives reachability first.
 func (s *imagesService) RemoveImage(context.Context, *runtimev1.RemoveImageRequest) (*runtimev1.RemoveImageResponse, error) {
 	return nil, status.Error(codes.Unimplemented,
 		"RemoveImage: this node's image roots are per-pod records, not operator untags; "+
@@ -332,6 +346,575 @@ func imageStatusError(err error) error {
 		return status.FromContextError(err).Err()
 	}
 	return status.Error(codes.Internal, fmt.Sprint(err))
+}
+
+// PullImage warms the local store for a reference, through the daemon's OWN
+// puller — the same code path a pod-driven pull takes.
+//
+// Reusing that path is the contract, not an implementation convenience: it is
+// what makes every blob re-hashed against its manifest descriptor before the
+// lease commits, keeps the disk-pressure gate in force, and records the
+// resulting reference in the one image index pods resolve against. A second
+// fetch path here would have forked the daemon's verification story, and the
+// forked half is the one nobody re-reads.
+//
+// It pulls ANONYMOUSLY. PullImageRequest carries no credential field, and that
+// is deliberate on the wire: pod pulls take their imagePullSecret through the
+// provider's credential seam, which resolves a Secret this operator-CLI request
+// has no reference to. A private-registry CLI pull is a credential-source
+// design, not a field this method can invent.
+//
+// PROVENANCE. A successful pull records two things, in this order: the
+// reference -> digest index EDGE (inside Pull), and then an OPERATOR ROOT over
+// that (reference x platform) — the M12 images plan, Resolution 13. The root is
+// why a pulled-but-unused image survives PruneImages: it stays reachable until
+// the operator removes the name with UntagImage. The root is recorded BEFORE the
+// pull's lease is released, never after, for the same reason the pod path
+// records its root first — releasing first reopens the window between "the blob
+// is on disk" and "something names it", which is exactly the window a concurrent
+// reclaim deletes into.
+func (s *imagesService) PullImage(ctx context.Context, req *runtimev1.PullImageRequest) (*runtimev1.PullImageResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	ref := req.GetReference()
+	if err := image.ValidateReference(ref); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	policy, err := operatorPullPolicy(req.GetPlatform())
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.rt.puller.Pull(ctx, ref, nil, policy, req.GetPolicy())
+	if err != nil {
+		return nil, pullStatusError(err)
+	}
+	rootErr := s.rt.recordOperatorImage(ref, res.Platform, res.Manifest)
+	// Release only after the root is recorded (or has failed, in which case
+	// nothing is named and the blobs are correctly reclaimable).
+	res.Lease.Release()
+	if rootErr != nil {
+		return nil, imageStatusError(rootErr)
+	}
+	s.rt.log.Info("pulled image on operator request",
+		"reference", ref, "digest", res.Descriptor.GetDigest(),
+		"platform", res.Platform.String(), "already_present", res.CacheHit)
+	return &runtimev1.PullImageResponse{
+		Image: &runtimev1.Image{
+			ManifestDescriptor: res.Descriptor,
+			Manifest:           res.Manifest,
+		},
+		AlreadyPresent: res.CacheHit,
+	}, nil
+}
+
+// operatorPullPolicy maps the platform an operator named onto the image platform
+// policy the puller takes.
+//
+// UNSET is the daemon's own host platform — the native spine's candidates,
+// which is the same default a pod-driven pull takes and is never "every
+// platform". A NAMED platform is an OVERRIDE: it pins the pull to exactly that
+// manifest with no fallback, which is what an operator warming the store for a
+// specific spine is asking for.
+//
+// A named platform is NOT an execution claim, and the daemon deliberately does
+// not refuse one this host cannot run. Warming linux/arm64 on a Mac is the
+// ordinary vm case; warming an amd64 image is the ordinary Rosetta case. What a
+// node may EXECUTE is decided per pod, at pull time, from the pod's resolved
+// sandbox backend (image.PlatformPolicy) — that decision is untouched here, and
+// the store is keyed (reference x platform) precisely so warmed bytes for one
+// spine can never be served to another.
+func operatorPullPolicy(p *runtimev1.Platform) (image.PlatformPolicy, error) {
+	want := requestedPlatform(p)
+	if want == nil {
+		// The native spine's own candidates — the daemon's host platform.
+		return image.PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}, nil
+	}
+	amd64 := want.Architecture == "amd64"
+	switch want.OS {
+	case "darwin":
+		return image.PlatformPolicy{
+			Backend:     runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC,
+			HostRosetta: amd64,
+			Override:    want,
+		}, nil
+	case "linux":
+		return image.PlatformPolicy{
+			Backend:      runtimev1.SandboxBackend_SANDBOX_BACKEND_VM,
+			GuestRosetta: amd64,
+			Override:     want,
+		}, nil
+	default:
+		return image.PlatformPolicy{}, status.Errorf(codes.InvalidArgument,
+			"PullImage: platform os %q is not one this node stores images for (darwin, linux)", want.OS)
+	}
+}
+
+// TagImage records an ADDITIONAL (reference x platform) entry for content the
+// store already holds.
+//
+// It contacts no registry and writes no blob: everything it does is index work
+// plus one operator root. The target is named by DIGEST and never by another
+// tag, because roots are digest-pinned — resolving a mutable name here would let
+// a concurrent re-pull decide what the new tag ends up meaning.
+//
+// It never RE-POINTS an existing entry. An existing (reference x platform) key
+// that resolves elsewhere is FAILED_PRECONDITION, because re-pointing would drop
+// the old edge, which is a root removal wearing a tag's clothes; the operator
+// asks for that in two explicit steps, UntagImage then TagImage. An existing key
+// that already resolves to this digest is the idempotent OK, and — per the wire
+// contract's "nothing was written" — it writes nothing, not even a root.
+//
+// ORDERING. The edge is written first and the operator root second. The reverse
+// order has an unrecoverable failure mode: a root whose name never landed pins
+// content that no UntagImage can ever name, so it could never be released. This
+// order's failure mode is a name with no root, which is merely the state every
+// `k3sm image load`ed image is already in (listed, and reclaim-eligible), and it
+// is repaired by untagging and re-tagging.
+func (s *imagesService) TagImage(ctx context.Context, req *runtimev1.TagImageRequest) (*runtimev1.TagImageResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	ref := req.GetReference()
+	if err := image.ValidateReference(ref); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	digest := req.GetDigest()
+	src, err := s.rt.index.ResolveDigest(ctx, digest)
+	if err != nil {
+		return nil, indexStatusError(err)
+	}
+	target := src.Platform
+	if p := requestedPlatform(req.GetPlatform()); p != nil {
+		target = *p
+	}
+	existing, ok, err := s.rt.index.Get(ctx, ref, target)
+	if err != nil {
+		return nil, indexStatusError(err)
+	}
+	if ok {
+		if existing.Descriptor.GetDigest() != digest {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"TagImage: %s for %s already resolves to %s; untag it first — this verb never re-points an entry",
+				ref, target, existing.Descriptor.GetDigest())
+		}
+		return &runtimev1.TagImageResponse{
+			Image:          &runtimev1.Image{ManifestDescriptor: existing.Descriptor, Manifest: existing.Manifest},
+			AlreadyPresent: true,
+		}, nil
+	}
+
+	// The manifest is copied, not shared, and only its reference changes: the
+	// bytes and the digest describe content, which a new name cannot alter.
+	mfst, ok := proto.Clone(src.Manifest).(*runtimev1.ImageManifest)
+	if !ok {
+		return nil, status.Error(codes.Internal, "TagImage: cloning the recorded manifest produced the wrong type")
+	}
+	mfst.Reference = ref
+	entry := image.IndexEntry{
+		Reference:   ref,
+		Platform:    target,
+		Manifest:    mfst,
+		Descriptor:  src.Descriptor,
+		ManifestRaw: src.ManifestRaw,
+	}
+	if err := s.rt.index.Record(ctx, entry); err != nil {
+		return nil, indexStatusError(err)
+	}
+	if err := s.rt.recordOperatorImage(ref, target, mfst); err != nil {
+		return nil, imageStatusError(err)
+	}
+	s.rt.log.Info("tagged image", "reference", ref, "platform", target.String(), "digest", digest)
+	return &runtimev1.TagImageResponse{
+		Image: &runtimev1.Image{ManifestDescriptor: entry.Descriptor, Manifest: entry.Manifest},
+	}, nil
+}
+
+// UntagImage removes ONE (reference x platform) index entry and the operator
+// root that entry carried.
+//
+// This is the provenance model's sanctioned EXPLICIT UNTAG (the M12 images plan,
+// Resolution 13): an authorized, local root removal the operator asked for by
+// name — which is exactly what RemoveImage cannot be, since a request shaped as
+// "remove this image" does not say which root the caller owns, and this node's
+// other roots are per-pod records the daemon authored.
+//
+// It removes a NAME, not bytes. No blob is unlinked; content is reclaimed only
+// by PruneImages, which re-derives reachability first. So untagging a name a
+// live pod's own root still pins leaves that content reachable and the pod
+// unharmed.
+//
+// It is deliberately NOT idempotent-by-silence: an absent entry is NOT_FOUND,
+// because the caller asked to remove a specific name. An unset platform on a
+// reference with several entries is FAILED_PRECONDITION and removes nothing — an
+// ambiguous untag is never a guess — as is a digest pin the entry does not
+// satisfy, which is the guard against a concurrent re-pull moving the entry
+// between the caller's read and this write.
+//
+// ORDERING is the mirror of TagImage's and rests on the same argument: the root
+// goes first, the name second. Failing between them leaves a named entry with no
+// root — reclaim-eligible but still nameable, so a repeat untag completes the
+// job. The reverse would strand a root no verb could ever name again.
+func (s *imagesService) UntagImage(ctx context.Context, req *runtimev1.UntagImageRequest) (*runtimev1.UntagImageResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	ref := req.GetReference()
+	if ref == "" {
+		return nil, status.Error(codes.InvalidArgument, "UntagImage: reference is required")
+	}
+	entry, err := s.rt.index.Resolve(ctx, ref, requestedPlatform(req.GetPlatform()))
+	if err != nil {
+		return nil, indexStatusError(err)
+	}
+	if want := req.GetDigest(); want != "" && entry.Descriptor.GetDigest() != want {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"UntagImage: %s for %s resolves to %s, not the pinned %s; nothing was removed",
+			ref, entry.Platform, entry.Descriptor.GetDigest(), want)
+	}
+	if _, err := s.rt.cache.RemoveOperatorImage(ref, entry.Platform); err != nil {
+		return nil, imageStatusError(err)
+	}
+	removed, err := s.rt.index.Remove(ctx, ref, entry.Platform)
+	if err != nil {
+		return nil, indexStatusError(err)
+	}
+	if !removed {
+		// Raced with another removal between the resolve and the write. The
+		// caller's name is gone either way, but it was not this call that removed
+		// it, and NOT_FOUND is what the wire contract says about an entry that is
+		// not there.
+		return nil, status.Errorf(codes.NotFound, "UntagImage: %s for %s is not in the local index", ref, entry.Platform)
+	}
+	s.rt.log.Info("untagged image",
+		"reference", ref, "platform", entry.Platform.String(), "digest", entry.Descriptor.GetDigest())
+	return &runtimev1.UntagImageResponse{
+		Removed: &runtimev1.Image{ManifestDescriptor: entry.Descriptor, Manifest: entry.Manifest},
+	}, nil
+}
+
+// InspectImage reports what the store knows about one image — the `docker
+// inspect` analog and the read side of the tag verbs.
+//
+// STRICTLY LOCAL and strictly read-only: it resolves nothing against a registry,
+// takes no lease, and records no root, so it can never make content reachable.
+// Every fact it returns is read out of the index entry and the config blob.
+//
+// The target is a (reference x platform) key or a manifest digest. Setting both
+// is INVALID_ARGUMENT rather than a precedence rule nobody can remember, and so
+// is setting neither.
+//
+// Absent fields are absent FACTS. A config the store no longer holds — the
+// ordinary state after a prune reclaimed an unrooted image's blobs — is reported
+// by omitting the config, not by synthesizing an empty one, because the wire
+// contract makes every field independently optional for exactly this reason.
+func (s *imagesService) InspectImage(ctx context.Context, req *runtimev1.InspectImageRequest) (*runtimev1.InspectImageResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	entry, err := s.resolveTarget(ctx, "InspectImage", req.GetReference(), req.GetDigest(), req.GetPlatform())
+	if err != nil {
+		return nil, err
+	}
+	out := &runtimev1.InspectImageResponse{
+		Image:          &runtimev1.Image{ManifestDescriptor: entry.Descriptor, Manifest: entry.Manifest},
+		TotalSizeBytes: uint64(max(entry.TotalSize(), 0)),
+	}
+	cfg, ok, err := s.rt.cache.ImageConfig(entry)
+	if err != nil {
+		return nil, imageStatusError(err)
+	}
+	if ok {
+		out.Config = imageConfigProto(cfg)
+	}
+	return out, nil
+}
+
+// imageConfigProto reports a decoded OCI image config on the wire.
+//
+// It is a REPORT of what the image declares and never an input: nothing here is
+// applied by writing it back, and the runtime's own merge of Entrypoint/Cmd with
+// a container's command/args is unchanged by this conversion existing.
+//
+// config.platform is the platform the CONFIG BLOB declares, which is not the
+// same fact as the manifest's resolved platform — they agree on a well-formed
+// image, and the wire keeps them separate so a disagreement is visible.
+func imageConfigProto(cfg *ggcrv1.ConfigFile) *runtimev1.ImageConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := &runtimev1.ImageConfig{
+		Entrypoint: cfg.Config.Entrypoint,
+		Cmd:        cfg.Config.Cmd,
+		Env:        cfg.Config.Env,
+		User:       cfg.Config.User,
+		WorkingDir: cfg.Config.WorkingDir,
+		Labels:     cfg.Config.Labels,
+	}
+	if cfg.OS != "" || cfg.Architecture != "" || cfg.Variant != "" || cfg.OSVersion != "" {
+		out.Platform = &runtimev1.Platform{
+			Os:           cfg.OS,
+			Architecture: cfg.Architecture,
+			Variant:      cfg.Variant,
+			OsVersion:    cfg.OSVersion,
+		}
+	}
+	// A zero Created is "the image declares no creation time", which the wire
+	// says by omitting the field — never by reporting the epoch as if the image
+	// had claimed it.
+	if !cfg.Created.Time.IsZero() {
+		out.Created = timestamppb.New(cfg.Created.Time)
+	}
+	return out
+}
+
+// saveChunkBytes is the archive slice one SaveImage frame carries.
+//
+// Chunk boundaries carry no meaning (the proto says so), so the size is chosen
+// only against the transport: comfortably under gRPC's 4 MiB default receive
+// limit with room for framing, and large enough that a multi-hundred-megabyte
+// image is not thousands of round trips.
+const saveChunkBytes = 256 << 10
+
+// SaveImage streams one image OUT of the store as a tarred OCI image layout —
+// the `docker save` analog and the exact inverse of LoadImage's direction.
+//
+// The framing mirrors LoadImage in reverse: chunk frames carrying bytes and
+// nothing else, then exactly ONE terminal frame that carries no chunk and
+// instead reports the exported manifest digest and the byte count the server
+// sent. A client that reaches the end of the stream without a terminal frame has
+// a truncated archive and must discard it — which is why a mid-transfer failure
+// is reported BOTH as a terminal frame carrying the error and as the RPC's own
+// status: a client must never have to infer failure from a stream that merely
+// stopped.
+//
+// Everything the daemon can know up front is checked up front, before a single
+// chunk goes out: the format, the target's existence, that the entry retains its
+// manifest bytes, and that every blob it names is still in the store. A caller
+// therefore receives bytes only for an export the daemon believes it can finish.
+//
+// Export takes no lease, records no root and unlinks nothing, and the client is
+// the sole writer of the operator's file — the mirror of LoadImage's rule that
+// the daemon is the sole writer of the store (the M12 images plan, Resolution 8,
+// as amended).
+func (s *imagesService) SaveImage(req *runtimev1.SaveImageRequest, stream runtimev1.Images_SaveImageServer) error {
+	ctx := stream.Context()
+	switch req.GetFormat() {
+	case runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_UNSPECIFIED,
+		runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT:
+	case runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE:
+		// Nameable on the wire, and v1 emits it from nowhere: the OCI layout is
+		// the format this store can write verbatim from the manifest it retained,
+		// while a docker-save tar would have to synthesize a manifest.json and a
+		// repositories map the store never recorded.
+		return status.Error(codes.Unimplemented,
+			"SaveImage: this daemon exports LOAD_IMAGE_FORMAT_OCI_LAYOUT only")
+	default:
+		return status.Errorf(codes.InvalidArgument, "SaveImage: unknown archive format %d", int32(req.GetFormat()))
+	}
+	entry, err := s.resolveTarget(ctx, "SaveImage", req.GetReference(), req.GetDigest(), req.GetPlatform())
+	if err != nil {
+		return err
+	}
+
+	out := &saveStream{stream: stream}
+	if err := s.rt.cache.ExportOCILayout(ctx, out, entry); err != nil {
+		return s.failSave(stream, err)
+	}
+	if err := out.flush(); err != nil {
+		return s.failSave(stream, err)
+	}
+	s.rt.log.Info("exported image archive",
+		"reference", entry.Reference, "platform", entry.Platform.String(),
+		"digest", entry.Descriptor.GetDigest(), "bytes", out.sent)
+	return stream.Send(&runtimev1.SaveImageResponse{
+		Digest:    entry.Descriptor.GetDigest(),
+		SentBytes: out.sent,
+	})
+}
+
+// failSave reports an export failure the way the wire contract requires: a
+// terminal frame carrying the status and no chunk, AND the same status as the
+// RPC's own error.
+//
+// Both, not either. The frame is what lets a client that has already received
+// chunks distinguish a truncated archive from a complete one without inspecting
+// its own byte count; the RPC status is what makes the call unambiguously a
+// failure to every ordinary client. If the frame cannot be sent — the usual
+// reason being that the transport is what failed — the status still stands.
+func (s *imagesService) failSave(stream runtimev1.Images_SaveImageServer, err error) error {
+	st := exportStatus(err)
+	if serr := stream.Send(&runtimev1.SaveImageResponse{Error: st.Proto()}); serr != nil {
+		s.rt.log.Warn("could not send the SaveImage terminal error frame", "err", serr)
+	}
+	return st.Err()
+}
+
+// saveStream turns the byte stream an export writes into SaveImage chunk frames.
+//
+// It buffers to saveChunkBytes so the frame count follows the transport's
+// preference rather than the exporter's write sizes (a tar writer emits a header
+// and a body as separate writes, and one frame per write would be pathological
+// for a many-layer image). flush must be called before the terminal frame, or
+// the tail of the archive is never sent.
+type saveStream struct {
+	stream runtimev1.Images_SaveImageServer
+	buf    []byte
+	sent   int64
+}
+
+// Write buffers p, emitting a frame whenever a full chunk is available.
+func (s *saveStream) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		room := saveChunkBytes - len(s.buf)
+		take := min(room, len(p))
+		s.buf = append(s.buf, p[:take]...)
+		p = p[take:]
+		if len(s.buf) == saveChunkBytes {
+			if err := s.flush(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return n, nil
+}
+
+// flush emits whatever is buffered, if anything.
+func (s *saveStream) flush() error {
+	if len(s.buf) == 0 {
+		return nil
+	}
+	if err := s.stream.Send(&runtimev1.SaveImageResponse{Chunk: s.buf}); err != nil {
+		return err
+	}
+	s.sent += int64(len(s.buf))
+	s.buf = s.buf[:0]
+	return nil
+}
+
+// resolveTarget resolves the (reference x platform) or digest one read-only verb
+// names, applying the wire contract's exactly-one rule.
+//
+// It is shared by InspectImage and SaveImage because their targeting clauses are
+// the same clause; two copies would drift on the first divergent edit, and the
+// divergence a caller would notice is precisely the one nobody tests — which of
+// reference and digest wins when both are set.
+func (s *imagesService) resolveTarget(ctx context.Context, verb, ref, digest string, platform *runtimev1.Platform) (image.IndexEntry, error) {
+	switch {
+	case ref != "" && digest != "":
+		return image.IndexEntry{}, status.Errorf(codes.InvalidArgument,
+			"%s: set exactly one of reference and digest, not both", verb)
+	case ref == "" && digest == "":
+		return image.IndexEntry{}, status.Errorf(codes.InvalidArgument,
+			"%s: a reference or a digest is required", verb)
+	case digest != "":
+		// A digest names one manifest, so the request's platform is ignored — the
+		// wire contract says so, and honoring it would let a caller ask for
+		// content that a digest has already fully determined.
+		e, err := s.rt.index.ResolveDigest(ctx, digest)
+		if err != nil {
+			return image.IndexEntry{}, indexStatusError(err)
+		}
+		return e, nil
+	default:
+		e, err := s.rt.index.Resolve(ctx, ref, requestedPlatform(platform))
+		if err != nil {
+			return image.IndexEntry{}, indexStatusError(err)
+		}
+		return e, nil
+	}
+}
+
+// recordOperatorImage records the operator-owned reachability root for
+// (ref x platform), from the manifest the pull or the tag resolved.
+//
+// It is the operator-side twin of recordPodImage and shares its shape
+// deliberately: a root names the CONFIG and LAYER digests only, because those
+// are the only things the content-addressed store holds. What differs is who may
+// remove it — a pod's root goes when the pod dir goes, an operator's only when
+// the operator untags the name (see Cache.RecordOperatorImage).
+func (r *Runtime) recordOperatorImage(ref string, platform image.Platform, mfst *runtimev1.ImageManifest) error {
+	root := image.ImageRoot{Reference: ref, Config: mfst.GetConfig().GetDigest()}
+	for _, l := range mfst.GetLayers() {
+		root.Layers = append(root.Layers, l.GetDigest())
+	}
+	if err := r.cache.RecordOperatorImage(ref, platform, root); err != nil {
+		return fmt.Errorf("record operator image root for %q: %w", ref, err)
+	}
+	return nil
+}
+
+// pullStatusError maps a pull failure onto a gRPC status.
+//
+// It maps the DECIDED verdicts only — the sentinels the pull path returns as
+// conclusions rather than as passed-through faults. Classifying a registry's own
+// failures (unauthorized, rate-limited, transient) is the kubelet pull-failure
+// taxonomy, a separate deliverable that consumes these same sentinels; until it
+// lands, an unclassified fault is Internal rather than a guess dressed as a
+// code, because a wrong code is acted on and an honest Internal is read.
+func pullStatusError(err error) error {
+	switch {
+	case errors.Is(err, image.ErrImageNotPresent):
+		// The reference is absent and the policy forbids fetching it. No registry
+		// round trip was made, so NOT_FOUND is a fact about this node.
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, image.ErrPullRefusedDiskPressure):
+		return status.Error(codes.ResourceExhausted, err.Error())
+	case errors.Is(err, image.ErrLoadReferenceInvalid):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case image.IsTerminalPlatformError(err):
+		// The image has no manifest for the platform asked for. Permanent for
+		// this (reference, platform) pair, and the operator can act on it.
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return imageStatusError(err)
+}
+
+// indexStatusError maps an index-resolution failure onto a gRPC status.
+//
+// The three verdicts are the ones every image verb shares, so they are mapped
+// once: a key that is not there is NOT_FOUND; a reference that names several
+// platform entries with no platform given is FAILED_PRECONDITION (an ambiguous
+// request removed or exported nothing, which is the safe half of the contract);
+// and a record this daemon cannot believe is FAILED_PRECONDITION rather than
+// Internal, because nothing is broken in the daemon and the operator can act on
+// the named entry.
+func indexStatusError(err error) error {
+	switch {
+	case errors.Is(err, image.ErrIndexEntryNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, image.ErrIndexEntryAmbiguous), errors.Is(err, image.ErrIndexDigestMismatch):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, image.ErrInvalidDigest), errors.Is(err, image.ErrUnsupportedDigestAlgorithm),
+		errors.Is(err, image.ErrLoadReferenceInvalid):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, image.ErrIndexEntryCorrupt), errors.Is(err, image.ErrIndexNotOwned):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return imageStatusError(err)
+}
+
+// exportStatus maps an export failure onto the status carried by BOTH the
+// terminal frame and the RPC.
+//
+// An entry that retains no manifest, and an entry whose blobs the store no
+// longer holds, are both FAILED_PRECONDITION: the request is well-formed and the
+// image is named, but the store is not in a state that can satisfy it, and in
+// both cases the operator's remedy is the same one sentence — re-pull or re-load
+// the reference.
+func exportStatus(err error) *status.Status {
+	switch {
+	case errors.Is(err, image.ErrManifestNotRetained), errors.Is(err, image.ErrExportIncomplete),
+		errors.Is(err, image.ErrManifestInconsistent):
+		return status.New(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return status.FromContextError(err)
+	}
+	if st, ok := status.FromError(err); ok {
+		return st
+	}
+	return status.New(codes.Internal, fmt.Sprint(err))
 }
 
 // DefaultImageGCInterval is how often the daemon re-checks the store volume for

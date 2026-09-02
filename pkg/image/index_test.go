@@ -98,7 +98,7 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("Lookup = (%v, %v, %v), want the recorded manifest", got, ok, err)
 		}
-		assertSameManifest(t, got, want)
+		assertSameManifest(t, got.Manifest, want)
 	})
 
 	// A reference nobody pulled is absent — and absence is a miss, not an error,
@@ -292,8 +292,11 @@ func TestRefDigestIndexDecidesPresence(t *testing.T) {
 	// never asked for. Refused at WRITE, so it can never be read back.
 	t.Run("record_refuses_a_manifest_naming_another_reference", func(t *testing.T) {
 		_, idx := newIndexedCache(t)
-		err := idx.Record(context.Background(), ref, mustCandidates(t, nativePolicy())[0],
-			&runtimev1.ImageManifest{Reference: "example.com/other:latest"})
+		err := idx.Record(context.Background(), IndexEntry{
+			Reference: ref,
+			Platform:  mustCandidates(t, nativePolicy())[0],
+			Manifest:  &runtimev1.ImageManifest{Reference: "example.com/other:latest"},
+		})
 		if err == nil {
 			t.Fatal("Record accepted a manifest naming another reference")
 		}
