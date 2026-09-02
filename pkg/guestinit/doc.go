@@ -37,6 +37,17 @@ limitations under the License.
 // executor logic this package exists to avoid. They are stable Linux ABI
 // numbers.
 //
+// # The one exception: pty allocation
+//
+// pty_linux.go (OpenPTY, SetWinsize, ChownTTY) does perform syscalls, and is
+// the only linux-tagged non-test file here. It earns the exception by carrying
+// no decision: WHERE an exec's pty comes from is decided by the pure
+// ExecPTYOrigin, HOW its descriptors are wired, closed and pumped by the pure
+// PlanExecIO, and what is left is a fixed ioctl sequence with no branch a table
+// could cover. Keeping it beside those two is what lets the decisions be tested
+// on darwin at all; the !linux stub fails closed so the package still builds
+// and tests there.
+//
 // # The PID 1 state machine
 //
 // Reaper is GOOS-portable behind a three-method Proc seam (Wait4 / Kill /
@@ -69,6 +80,10 @@ limitations under the License.
 //     resolved host-side and stamped into uid/gid. ResolveUser implements the
 //     in-guest resolution against a rootfs /etc/passwd and is wired for the
 //     numeric case the spec can express today.
+//   - A container's /dev is the OCI default device set and nothing else
+//     (DefaultDevices) plus a private devpts and a bounded /dev/shm. The
+//     allowlist is a security boundary, not a convenience: see ContainerDev for
+//     why /dev/vsock in particular must never appear in it.
 //   - An idmapped mount (GuestMount.idmap) is planned but not applied by the
 //     executor: mount_setattr(MOUNT_ATTR_IDMAP) is contingent on the M11.2-d5
 //     lab question. The executor refuses such a spec rather than mounting it

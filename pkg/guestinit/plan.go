@@ -52,9 +52,24 @@ type ContainerPlan struct {
 	WaitForExit bool
 
 	// Mounts compose this container's rootfs, in application order: the
-	// rootfs overlay, the pod mounts re-exposed inside it, then the /etc bind
-	// set. The /etc binds come last so nothing can be stacked over them.
+	// rootfs overlay, the minimal /dev, the pod mounts re-exposed inside it,
+	// then the /etc bind set. The /etc binds come last so nothing can be
+	// stacked over them.
+	//
+	// /dev comes BEFORE the pod mounts, which is what lets a pod-declared
+	// mount at one of its paths win by being applied over it — see ContainerDev
+	// for the yield rule that also keeps the shadowed mount from being made at
+	// all.
 	Mounts []MountStep
+
+	// Links are the symlinks created inside Root after every step in Mounts.
+	Links []LinkStep
+
+	// DevPtsDir is the guest path of this container's PRIVATE devpts instance,
+	// or empty when a pod mount covers /dev or /dev/pts. It is where an exec's
+	// pty is allocated from; see PTYOrigin for why that must not be the guest's
+	// instance.
+	DevPtsDir string
 
 	// Root is the composed rootfs the process is chrooted into.
 	Root string
@@ -271,7 +286,9 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 	if err != nil {
 		return ContainerPlan{}, err
 	}
+	dev := ContainerDev(c.GetName(), podMounts)
 	mounts := rootfs
+	mounts = append(mounts, dev.Mounts...)
 	mounts = append(mounts, containerVisibleMounts(c.GetName(), podMounts)...)
 	mounts = append(mounts, EtcBinds(c.GetName())...)
 	return ContainerPlan{
@@ -279,6 +296,8 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 		Phase:       step.Phase,
 		WaitForExit: step.WaitForExit,
 		Mounts:      mounts,
+		Links:       dev.Links,
+		DevPtsDir:   dev.PtsDir,
 		Root:        ContainerRootDir(c.GetName()),
 		Argv:        argv,
 		Env:         append([]string{}, c.GetEnv()...),

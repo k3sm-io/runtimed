@@ -20,8 +20,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path"
@@ -183,6 +183,9 @@ func (c *cgroupSampler) Sample(_ context.Context, container string) (guestagent.
 // owns every exit, so the exec registers the child with it under a private name and
 // waits on the reaper instead. A second waiter would race it for the status and one
 // of the two would get ECHILD.
+//
+// A TTY exec is served rather than refused: the pair is allocated from the
+// container's own devpts before the fork. See Exec.
 type procExecer struct {
 	plans  map[string]guestinit.ContainerPlan
 	reaper *guestinit.Reaper
@@ -193,17 +196,26 @@ type procExecer struct {
 }
 
 // Exec runs spec's command in the named container and returns its exit status.
-func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io guestagent.ExecIO) (guestagent.ExecResult, error) {
+//
+// # The terminal, when one is asked for
+//
+// A tty exec allocates its pty pair BEFORE the fork, and from the TARGET
+// CONTAINER's own devpts instance rather than the guest's — guestinit.PTYOrigin
+// states why that distinction is not cosmetic. Allocating first is what makes it
+// survive the chroot: the child inherits DESCRIPTORS, not paths, so by the time
+// its root changes the terminal is already open. Nothing inside the container
+// could have opened it instead, since the exec'd process is the container's and
+// has no privilege to allocate one.
+//
+// Every other choice — which descriptor becomes which of the child's three, the
+// Setsid/Setctty shape, how many pumps run and onto which client stream, what is
+// closed at the fork and what only after the reaper — belongs to
+// guestinit.PlanExecIO, so it is decided in a pure function darwin's `go test
+// -race` actually runs. This file only performs it.
+func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, plumbing guestagent.ExecIO) (guestagent.ExecResult, error) {
 	plan, ok := e.plans[spec.Container]
 	if !ok {
 		return guestagent.ExecResult{}, fmt.Errorf("%w: %s", guestagent.ErrNotFound, spec.Container)
-	}
-	// A TTY needs a pty pair allocated in the guest, which this init does not do
-	// yet. REFUSING beats running the command without one: a client that asked for
-	// a terminal and silently got pipes gets no echo, no job control and no
-	// SIGWINCH, and debugs the wrong thing.
-	if spec.TTY {
-		return guestagent.ExecResult{}, errors.New("this guest cannot allocate a pseudo-terminal for an exec yet; retry without a tty")
 	}
 
 	// argv[0] is resolved execvp-style inside the TARGET CONTAINER's root, using
@@ -221,19 +233,19 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 		return guestagent.ExecResult{}, err
 	}
 
-	stdinR, stdinW, err := os.Pipe()
+	// A client that asked to keep stdin open but supplied no reader gets the
+	// no-stdin wiring, whose plan closes the write end rather than leaving a
+	// command that reads stdin blocked on a pipe nobody will ever write to.
+	wiring := guestinit.PlanExecIO(spec.TTY, spec.Stdin && plumbing.Stdin != nil)
+	fds, err := e.openExecFDs(wiring, plan)
 	if err != nil {
-		return guestagent.ExecResult{}, fmt.Errorf("exec stdin pipe: %w", err)
+		return guestagent.ExecResult{}, err
 	}
-	stdoutR, stdoutW, err := os.Pipe()
-	if err != nil {
-		closeAll(stdinR, stdinW)
-		return guestagent.ExecResult{}, fmt.Errorf("exec stdout pipe: %w", err)
-	}
-	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
-		closeAll(stdinR, stdinW, stdoutR, stdoutW)
-		return guestagent.ExecResult{}, fmt.Errorf("exec stderr pipe: %w", err)
+	for _, id := range wiring.Open {
+		if fds.file(id) == nil {
+			fds.closeAll()
+			return guestagent.ExecResult{}, fmt.Errorf("the exec wiring asks for the %s descriptor, which this executor does not open", id)
+		}
 	}
 
 	groups := make([]uint32, 0, len(plan.Ident.Groups))
@@ -245,9 +257,13 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 		dir = "/"
 	}
 	attr := &syscall.ProcAttr{
-		Dir:   dir,
-		Env:   plan.Env,
-		Files: []uintptr{stdinR.Fd(), stdoutW.Fd(), stderrW.Fd()},
+		Dir: dir,
+		Env: plan.Env,
+		Files: []uintptr{
+			fds.raw(wiring.ChildFiles[0]),
+			fds.raw(wiring.ChildFiles[1]),
+			fds.raw(wiring.ChildFiles[2]),
+		},
 		Sys: &syscall.SysProcAttr{
 			Chroot: plan.Root,
 			Credential: &syscall.Credential{
@@ -255,16 +271,21 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 				Gid:    uint32(plan.Ident.GID),
 				Groups: groups,
 			},
-			Setsid: true,
+			Setsid:  wiring.Setsid,
+			Setctty: wiring.Setctty,
+			// Ctty indexes the CHILD's descriptors: Linux performs the TIOCSCTTY
+			// ioctl after the fork's descriptor dance, not before it.
+			Ctty: wiring.Ctty,
 		},
 	}
 	pid, err := syscall.ForkExec(prog, spec.Argv, attr)
 	// The child's ends are closed in this process immediately after the fork:
-	// holding stdoutW open here would mean the stdout reader never sees EOF, and
-	// the exec would appear to hang after the command had already exited.
-	closeAll(stdinR, stdoutW, stderrW)
+	// holding a pipe's write end open would mean its reader never sees EOF, and
+	// holding the pty slave open would mean the master never sees EIO — either
+	// way the exec appears to hang after the command has already exited.
+	fds.close(wiring.CloseAfterFork...)
 	if err != nil {
-		closeAll(stdinW, stdoutR, stderrR)
+		fds.closeAll()
 		return guestagent.ExecResult{}, fmt.Errorf("start %q (resolved to %s) in %s: %w", spec.Argv[0], prog, spec.Container, err)
 	}
 
@@ -272,16 +293,55 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 	e.reaper.Track(name, pid)
 
 	var pumps sync.WaitGroup
-	pumps.Add(2)
-	go func() { defer pumps.Done(); _ = guestagent.CopyChunked(io.Stdout, stdoutR) }()
-	go func() { defer pumps.Done(); _ = guestagent.CopyChunked(io.Stderr, stderrR) }()
-	if io.Stdin != nil && spec.Stdin {
+	for _, p := range wiring.Outputs {
+		src, sink := fds.file(p.Source), plumbing.Stdout
+		if p.Stream == guestinit.StreamStderr {
+			sink = plumbing.Stderr
+		}
+		var reader io.Reader = src
+		if p.TTYEOF {
+			// A pty master never reports EOF; it reports EIO once the last
+			// descriptor on the slave side is gone. Without this every
+			// successful tty exec would end on a read error.
+			reader = guestinit.TTYReader(src)
+		}
+		pumps.Add(1)
+		go func() { defer pumps.Done(); _ = guestagent.CopyChunked(sink, reader) }()
+	}
+
+	if sink := fds.file(wiring.StdinSink); sink != nil {
+		closeOnEOF := wiring.CloseStdinSinkOnEOF
 		go func() {
-			defer func() { _ = stdinW.Close() }()
-			_ = guestagent.CopyChunked(stdinW, io.Stdin)
+			// A pty master is deliberately NOT closed here: closing it hangs the
+			// child's session up rather than giving it EOF. On a tty, ^D is what
+			// the client sends and the line discipline turns it into the
+			// zero-length read the command is waiting for.
+			if closeOnEOF {
+				defer func() { _ = sink.Close() }()
+			}
+			_ = guestagent.CopyChunked(sink, plumbing.Stdin)
 		}()
-	} else {
-		_ = stdinW.Close()
+	}
+
+	if wiring.Resize && plumbing.Resize != nil {
+		master := fds.file(guestinit.FDPTYMaster)
+		go func() {
+			// The goroutine ends when the server closes the resize channel,
+			// which it does when the client's stream ends.
+			err := guestinit.PumpResize(
+				func() (guestinit.WinSize, bool) {
+					sz, ok := <-plumbing.Resize
+					return guestinit.WinSize{Rows: uint16(sz.Height), Cols: uint16(sz.Width)}, ok
+				},
+				func(sz guestinit.WinSize) error { return guestinit.SetWinsize(master, sz) },
+			)
+			if err != nil {
+				// EBADF once the master has been closed at teardown is this
+				// goroutine's ordinary end, not an operator's problem.
+				e.log.Debug("the exec terminal stopped accepting resizes",
+					"container", spec.Container, "err", err)
+			}
+		}()
 	}
 
 	st, werr := e.reaper.Wait(ctx, name)
@@ -290,7 +350,7 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 	// after the command it came from had finished, which breaks every consumer that
 	// treats the exit as end-of-stream.
 	pumps.Wait()
-	closeAll(stdoutR, stderrR)
+	fds.close(wiring.CloseAfterWait...)
 	if werr != nil {
 		return guestagent.ExecResult{}, fmt.Errorf("wait for the exec in %s: %w", spec.Container, werr)
 	}
@@ -298,6 +358,135 @@ func (e *procExecer) Exec(ctx context.Context, spec guestagent.ExecSpec, io gues
 		return guestagent.ExecResult{ExitCode: guestagent.ExitCodeForSignal(st.Signal)}, nil
 	}
 	return guestagent.ExecResult{ExitCode: int32(st.ExitCode)}, nil
+}
+
+// openExecFDs creates the descriptors one exec's wiring plan names.
+//
+// On any failure it closes whatever it had already opened: a half-built exec
+// that leaked a pipe end would leave PID 1 holding a descriptor no reader will
+// ever drain, for the life of the pod.
+func (e *procExecer) openExecFDs(w guestinit.ExecWiring, plan guestinit.ContainerPlan) (*execFDs, error) {
+	fds := newExecFDs()
+	if !w.TTY {
+		for _, pair := range [][2]guestinit.ExecFD{
+			{guestinit.FDStdinRead, guestinit.FDStdinWrite},
+			{guestinit.FDStdoutRead, guestinit.FDStdoutWrite},
+			{guestinit.FDStderrRead, guestinit.FDStderrWrite},
+		} {
+			r, wr, err := os.Pipe()
+			if err != nil {
+				fds.closeAll()
+				return nil, fmt.Errorf("exec %s pipe: %w", pair[0], err)
+			}
+			fds.put(pair[0], r)
+			fds.put(pair[1], wr)
+		}
+		return fds, nil
+	}
+
+	origin := guestinit.ExecPTYOrigin(plan)
+	ptmx, pts, err := resolvePTYOrigin(origin)
+	if err != nil {
+		return nil, err
+	}
+	if !origin.Container {
+		// Degraded, and said out loud. The exec still gets a working terminal
+		// through its inherited descriptors, but the slave's index belongs to
+		// the guest's devpts instance, so ttyname(3) — and therefore `tty`, ps's
+		// TTY column, and anything that reopens its own terminal by name —
+		// resolves to the wrong node or to none inside the container.
+		e.log.Warn("this container has no private devpts, so its exec terminal is allocated from the guest's instance",
+			"container", plan.Name, "ptmx", ptmx)
+	}
+	master, slave, err := guestinit.OpenPTY(ptmx, pts)
+	if err != nil {
+		return nil, fmt.Errorf("allocate a terminal for an exec in %s: %w", plan.Name, err)
+	}
+	fds.put(guestinit.FDPTYMaster, master)
+	fds.put(guestinit.FDPTYSlave, slave)
+	if err := guestinit.SetWinsize(master, w.InitialSize); err != nil {
+		fds.closeAll()
+		return nil, fmt.Errorf("size the terminal for an exec in %s: %w", plan.Name, err)
+	}
+	if err := guestinit.ChownTTY(slave, int(plan.Ident.UID), int(plan.Ident.GID)); err != nil {
+		// Not fatal: the command runs on the descriptors it inherits either way.
+		// What it loses is the ability to REOPEN its terminal by name, which is
+		// what /dev/tty, `script`, and every prompt that bypasses stdin do.
+		e.log.Warn("could not give the exec terminal to the container identity; reopening /dev/tty inside it will fail",
+			"container", plan.Name, "uid", plan.Ident.UID, "gid", plan.Ident.GID, "err", err)
+	}
+	return fds, nil
+}
+
+// resolvePTYOrigin turns an origin's container-absolute paths into guest paths.
+//
+// The resolution is CHROOT-semantic (guestinit.ResolveTarget) rather than a
+// path join, for the reason every container mount target is: the IMAGE decides
+// what is a symlink, and an image shipping /dev as an absolute symlink would
+// otherwise have it resolved against the GUEST's root — handing this exec the
+// guest's own multiplexer while the plan believed it was using the container's.
+func resolvePTYOrigin(o guestinit.PTYOrigin) (ptmx, pts string, err error) {
+	if o.Root == "" {
+		return o.Ptmx, o.Pts, nil
+	}
+	if ptmx, err = guestinit.ResolveTarget(o.Root, o.Ptmx); err != nil {
+		return "", "", fmt.Errorf("resolve %s inside %s: %w", o.Ptmx, o.Root, err)
+	}
+	if pts, err = guestinit.ResolveTarget(o.Root, o.Pts); err != nil {
+		return "", "", fmt.Errorf("resolve %s inside %s: %w", o.Pts, o.Root, err)
+	}
+	return ptmx, pts, nil
+}
+
+// execFDs holds one exec's open descriptors under the names its wiring plan
+// gives them.
+//
+// It is NOT concurrency-safe and does not need to be: every put, close and
+// lookup happens on the goroutine running the exec, and the pumps that outlive
+// that goroutine capture the *os.File they need before any of them start.
+type execFDs struct {
+	m map[guestinit.ExecFD]*os.File
+}
+
+// newExecFDs returns an empty descriptor set.
+func newExecFDs() *execFDs {
+	return &execFDs{m: make(map[guestinit.ExecFD]*os.File, 6)}
+}
+
+// put records a descriptor under the plan's name for it.
+func (f *execFDs) put(id guestinit.ExecFD, file *os.File) { f.m[id] = file }
+
+// file returns the descriptor, or nil when the plan does not use it.
+func (f *execFDs) file(id guestinit.ExecFD) *os.File { return f.m[id] }
+
+// raw returns the descriptor number for ProcAttr.Files.
+func (f *execFDs) raw(id guestinit.ExecFD) uintptr {
+	if file := f.m[id]; file != nil {
+		return file.Fd()
+	}
+	// Unreachable: Exec checks every descriptor the plan names before forking.
+	// A wrong number here would give the child a descriptor belonging to
+	// something else entirely, so it fails the exec rather than guessing.
+	return ^uintptr(0)
+}
+
+// close closes the named descriptors and forgets them, so a later closeAll
+// cannot close one twice.
+func (f *execFDs) close(ids ...guestinit.ExecFD) {
+	for _, id := range ids {
+		if file := f.m[id]; file != nil {
+			_ = file.Close()
+			delete(f.m, id)
+		}
+	}
+}
+
+// closeAll closes everything still held. It is the failure path: after a
+// successful fork the plan's two close sets own the descriptors instead.
+func (f *execFDs) closeAll() {
+	for id := range f.m {
+		f.close(id)
+	}
 }
 
 // trackName gives one exec a reaper key that cannot collide with the container's
