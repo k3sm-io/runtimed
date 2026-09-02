@@ -73,7 +73,8 @@ func (r *Runtime) watchGuestContainerEvents(ctx context.Context, p *pod) error {
 }
 
 // applyGuestContainerEvent folds one guest-agent container event into p's
-// guest-container statuses.
+// guest-container statuses, re-derives the POD phase from them
+// (recomputeVMPhaseLocked) and publishes the resulting status.
 //
 // untrusted DATA. The event names a container, and the name is resolved against
 // what this POD declared — an undeclared name is dropped, not created — so the
@@ -100,26 +101,130 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 	at := nowProto()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	st := p.guestContainerLocked(name, spec.GetImage())
 	if started != nil {
 		st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: at}}
 		st.Ready = true
+	} else {
+		st.State = &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
+			ExitCode:   exited.GetExitCode(),
+			Signal:     exited.GetSignal(),
+			FinishedAt: at,
+			Reason:     guestTerminationReason(exited),
+		}}
+		st.Ready = false
+		if exited.GetOomKilled() {
+			// The pod-level latch, set from the one source that can observe a guest
+			// cgroup OOM. It mirrors the host spine's p.oomKilled, which only the host
+			// sampler sets — and which oomKill refuses to set for a vm pod.
+			p.oomKilled = true
+		}
+	}
+	// The POD phase follows its containers, exactly as the host spine's
+	// watchContainerExit calls recomputePhaseLocked after recording an exit.
+	// Without this the fold updated container_statuses and nothing else, so a vm
+	// pod whose only container had run to completion reported terminated
+	// containers under a phase that was still whatever createVMPod stamped — and
+	// the provider, which never overrides a non-terminal runtime verdict with a
+	// terminal one, fell through to Pending. `kubectl` then showed STATUS
+	// Completed against phase Pending forever: a Job never finished, a
+	// restartPolicy:Never pod was never collected, and nothing anywhere said why.
+	recomputeVMPhaseLocked(p)
+	p.mu.Unlock()
+
+	// Outside p.mu (the re-entrancy rule; podStatus takes it again). Every folded
+	// event is a real status change — a container started, or terminated with a
+	// code — so each one is published: WatchPodStatus is the provider's only
+	// event-driven notice that a vm pod moved, and a terminal transition it never
+	// hears is a pod that only a resync would ever correct.
+	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+}
+
+// recomputeVMPhaseLocked updates a vm pod's phase from its guest containers'
+// states — the vm spine's counterpart to recomputePhaseLocked, which cannot
+// serve here because it walks p.containers and a vm pod has none (its containers
+// are guest processes, so their statuses arrive over ContainerEvents and live in
+// p.guestContainers). Caller holds p.mu.
+//
+// MAINS ONLY, like the host spine. The accounting walks the pod's DECLARED main
+// containers (box.containers) rather than the folded status map, which is what
+// makes the two absent cases distinguishable: a main with no status yet has not
+// started, while an init container's status must never conclude the pod. Init
+// containers run to completion before any main starts, so counting them would
+// report Succeeded for a pod whose real workload had not begun. A failed init
+// is not lost by the exclusion: the guest tears the machine down when one exits
+// non-zero, and watchVMHelperExit fails the pod. Native sidecars need no
+// exclusion here — resolveVMContainers refuses one outright
+// (errVMSidecarUnexpressible), so every declared main is a main.
+//
+// RESTART POLICY IS NOT READ, deliberately. PodBox carries no pod-level
+// restartPolicy at all (only the container-level KEP-753 field, which the vm
+// path refuses), and runtimed performs no exit-driven restarts on either spine.
+// The policy lives with the provider, whose derivePhase de-escalates a
+// restartable termination back to Running before it ever consults this verdict.
+// So this function states one fact — what the containers did — and reporting
+// Failed for a crash-looping restartPolicy:Always pod is the provider's job to
+// re-read, not this function's to pre-empt.
+//
+// It never lowers a pod to Pending. Pending is the pod's initial value and means
+// "not started"; the provider treats it as authoritative and short-circuits on
+// it, so synthesizing one for a pod whose containers are merely half-reported
+// would make a running pod read as unstarted for the width of a stream fold.
+// When nothing is decidable the phase is left exactly as it was.
+func recomputeVMPhaseLocked(p *pod) {
+	// A pod-level verdict outranks the container accounting. failVMPod is the
+	// only writer of p.reason on this spine, and it records WHY the machine died
+	// — a fact no container status carries. It also synthesizes a terminated
+	// state for every container it found running, so a bare recompute would
+	// agree with it; the guard exists for the event that arrives from the
+	// dying guest AFTER it, which must not de-escalate a failed pod back to
+	// Running. A vm pod has no restart path to de-escalate INTO (RestartContainer
+	// refuses one), so nothing legitimate is lost by refusing.
+	if p.reason != "" && (p.phase == runtimev1.PodPhase_POD_PHASE_FAILED ||
+		p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED) {
 		return
 	}
-	st.State = &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
-		ExitCode:   exited.GetExitCode(),
-		Signal:     exited.GetSignal(),
-		FinishedAt: at,
-		Reason:     guestTerminationReason(exited),
-	}}
-	st.Ready = false
-	if exited.GetOomKilled() {
-		// The pod-level latch, set from the one source that can observe a guest
-		// cgroup OOM. It mirrors the host spine's p.oomKilled, which only the host
-		// sampler sets — and which oomKill refuses to set for a vm pod.
-		p.oomKilled = true
+	mains := p.box.GetContainers()
+	if len(mains) == 0 {
+		return
 	}
+	anyRunning, allTerminated, anyFailed := false, true, false
+	for _, c := range mains {
+		st := p.guestContainers[c.GetName()]
+		if st.GetState().GetRunning() != nil {
+			anyRunning = true
+			allTerminated = false
+			continue
+		}
+		term := st.GetState().GetTerminated()
+		if term == nil {
+			// Either no event for this container has been folded yet, or it is in
+			// a waiting state: not running, and not something that can conclude
+			// the pod.
+			allTerminated = false
+			continue
+		}
+		// A signal is a failure even when the code reads zero — a SIGKILLed
+		// container did not succeed. This matches the provider's own
+		// (ExitCode != 0 || Signal != 0) reading, so the two ends of the seam
+		// cannot disagree about what "completed" means.
+		if term.GetExitCode() != 0 || term.GetSignal() != 0 {
+			anyFailed = true
+		}
+	}
+	switch {
+	case anyRunning:
+		// Upstream never reports a terminal phase while a container runs,
+		// whatever a sibling did.
+		p.phase = runtimev1.PodPhase_POD_PHASE_RUNNING
+	case allTerminated && anyFailed:
+		p.phase = runtimev1.PodPhase_POD_PHASE_FAILED
+	case allTerminated:
+		p.phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
+	}
+	// The remaining shape — no main running, some terminated, some not yet
+	// reported — is deliberately no change. It is a fold in progress, not a
+	// verdict, and the next event resolves it.
 }
 
 // guestTerminationReason maps a guest exit onto the same reason strings the
