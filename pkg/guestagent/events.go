@@ -253,3 +253,22 @@ func (e *Events) Close() {
 		delete(e.subs, s)
 	}
 }
+
+// Latest returns a container's last recorded transition, if the fan-out has
+// seen one.
+//
+// It is the SNAPSHOT WITHOUT A SUBSCRIPTION, and it exists for exactly one
+// caller: the attach handler's terminal frame. An attach that has just watched
+// a container's output stream end needs that container's exit status and
+// nothing else — it is not going to follow anything further — so registering a
+// subscriber only to read one retained event and immediately unregister it
+// would put a queue on the reaper's fan-out for the length of one map lookup.
+//
+// The value is a COPY of the retained event and is read under the same mu
+// Publish writes under, so a caller can never observe a half-applied publish.
+func (e *Events) Latest(container string) (ContainerEvent, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ev, ok := e.latest[container]
+	return ev, ok
+}
