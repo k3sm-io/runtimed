@@ -359,19 +359,32 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 		events := NewEvents(0)
 		hub := NewAttachHub()
 		for _, name := range containers {
-			// Registering the writer is what spawn does, and it is what makes
-			// "no output yet" different from "never wired".
+			// Registering BOTH rings is what the guest's pump does, and it is
+			// what makes "no output yet" different from "never wired".
 			_ = capture.Writer(name, StreamStdout)
+			_ = capture.Raw(name)
 			hub.Register(name, ep)
 		}
 		t.Cleanup(events.Close)
 		client := testAgent(t, booted, Deps{
-			Runner: &fakeRunner{names: containers},
-			Logs:   capture,
-			Events: events,
-			Attach: hub,
+			Runner:    &fakeRunner{names: containers},
+			Logs:      capture,
+			RawOutput: capture,
+			Events:    events,
+			Attach:    hub,
 		})
 		return client, capture, events, hub
+	}
+
+	// write is the guest's output pump: one read tee'd into BOTH rings, which
+	// is what cmd/k3sm-guest-init's consoleTee does. A test that wrote only the
+	// line ring would be testing a guest that does not exist.
+	write := func(t *testing.T, c *Capture, container string, kind LogStreamKind, b string) {
+		t.Helper()
+		if _, err := c.Writer(container, kind).Write([]byte(b)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		c.Raw(container).Append(kind, []byte(b))
 	}
 
 	open := func(t *testing.T, client guestv1.GuestAgentClient, first *runtimev1.AttachRequest) (guestv1.GuestAgent_AttachClient, context.CancelFunc) {
@@ -412,10 +425,7 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 
 	t.Run("output-then-exit-code-ends-the-stream", func(t *testing.T) {
 		client, capture, events, _ := newAttachAgent(t, AttachEndpoints{})
-		w := capture.Writer("app", StreamStdout)
-		if _, err := w.Write([]byte("retained\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		write(t, capture, "app", StreamStdout, "retained\n")
 
 		stream, cancel := open(t, client, &runtimev1.AttachRequest{
 			PodId: booted, Container: "app", Stdout: true, Stderr: true,
@@ -425,9 +435,7 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 		if got := recvStdout(t, stream); got != "retained\n" {
 			t.Errorf("first frame = %q, want %q (the retained buffer is replayed)", got, "retained\n")
 		}
-		if _, err := w.Write([]byte("live\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		write(t, capture, "app", StreamStdout, "live\n")
 		if got := recvStdout(t, stream); got != "live\n" {
 			t.Errorf("second frame = %q, want %q (the stream then follows)", got, "live\n")
 		}
@@ -508,7 +516,6 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 	t.Run("concurrent-attaches-both-see-output-and-both-can-type", func(t *testing.T) {
 		sink := &recordingStdin{}
 		client, capture, _, _ := newAttachAgent(t, AttachEndpoints{Stdin: sink})
-		w := capture.Writer("app", StreamStdout)
 
 		a, cancelA := open(t, client, &runtimev1.AttachRequest{
 			PodId: booted, Container: "app", Stdin: true, Stdout: true})
@@ -517,9 +524,7 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 			PodId: booted, Container: "app", Stdin: true, Stdout: true})
 		defer cancelB()
 
-		if _, err := w.Write([]byte("shared\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		write(t, capture, "app", StreamStdout, "shared\n")
 		if got := recvStdout(t, a); got != "shared\n" {
 			t.Errorf("client A saw %q, want %q", got, "shared\n")
 		}
@@ -566,14 +571,12 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 			return len(sizes) == 1 && sizes[0] == [2]uint16{40, 100}
 		})
 
-		// A tty container's output is CRLF-delimited: the pty's ONLCR produced
-		// the \r the ring's line writer stripped, and a raw-mode client fed bare
-		// \n staircases down the screen.
-		if _, err := capture.Writer("app", StreamStdout).Write([]byte("line\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		// A tty container's output is CRLF-delimited by the pty's own ONLCR, and
+		// it arrives VERBATIM: the raw source neither strips the \r nor invents
+		// one, so what reaches the client's terminal is what the pty emitted.
+		write(t, capture, "app", StreamStdout, "line\r\n")
 		if got := recvStdout(t, stream); got != "line\r\n" {
-			t.Errorf("tty output frame = %q, want %q", got, "line\r\n")
+			t.Errorf("tty output frame = %q, want %q (verbatim, not re-delimited)", got, "line\r\n")
 		}
 	})
 
@@ -588,9 +591,7 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 			t.Fatalf("send resize: %v", err)
 		}
 		// tty is ADVISORY on attach: the stream survives and keeps serving.
-		if _, err := capture.Writer("app", StreamStdout).Write([]byte("still here\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		write(t, capture, "app", StreamStdout, "still here\n")
 		if got := recvStdout(t, stream); got != "still here\n" {
 			t.Errorf("after a dropped resize the stream sent %q, want %q", got, "still here\n")
 		}
@@ -602,9 +603,7 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 			PodId: booted, Container: "app", Stdout: true, Stderr: true})
 		defer cancel()
 
-		if _, err := capture.Writer("app", StreamStderr).Write([]byte("oops\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
+		write(t, capture, "app", StreamStderr, "oops\n")
 		resp, err := stream.Recv()
 		if err != nil {
 			t.Fatalf("recv: %v", err)
@@ -617,10 +616,8 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 		quiet, cancelQ := open(t, client, &runtimev1.AttachRequest{
 			PodId: booted, Container: "app", Stdout: true})
 		defer cancelQ()
-		if _, err := capture.Writer("app", StreamStdout).Write([]byte("wanted\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		// The replayed stderr line is skipped; the stdout line arrives.
+		write(t, capture, "app", StreamStdout, "wanted\n")
+		// The replayed stderr chunk is skipped; the stdout one arrives.
 		if got := recvStdout(t, quiet); got != "wanted\n" {
 			t.Errorf("a stdout-only client saw %q, want %q", got, "wanted\n")
 		}
@@ -655,13 +652,15 @@ func TestAttachServesTheGuestContract(t *testing.T) {
 		events := NewEvents(0)
 		t.Cleanup(events.Close)
 		hub := NewAttachHub()
-		_ = capture.Writer("app", StreamStdout)
-		_ = capture.Writer("other", StreamStdout)
+		for _, n := range []string{"app", "other"} {
+			_ = capture.Writer(n, StreamStdout)
+			_ = capture.Raw(n)
+		}
 		hub.Register("app", AttachEndpoints{Stdin: sink})
 		hub.Register("other", AttachEndpoints{Stdin: other})
 		client := testAgent(t, booted, Deps{
 			Runner: &fakeRunner{names: []string{"app", "other"}},
-			Logs:   capture, Events: events, Attach: hub,
+			Logs:   capture, RawOutput: capture, Events: events, Attach: hub,
 		})
 
 		stream, cancel := open(t, client, &runtimev1.AttachRequest{

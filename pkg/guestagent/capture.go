@@ -78,6 +78,15 @@ type Capture struct {
 
 	mu    sync.Mutex
 	rings map[string]*Ring
+	// raws are the per-container RAW replay buffers `kubectl attach` streams
+	// from, kept alongside the line rings rather than in a registry of their
+	// own because they are the same fact about the same container, ended by the
+	// same Close on the same reap path. What differs is the GRANULARITY, and it
+	// differs because the consumers do: `kubectl logs --tail` needs lines,
+	// while an attached terminal needs the bytes a program actually wrote —
+	// including the newline-less ones (a shell prompt, a pty's keystroke echo)
+	// that a line writer holds until a delimiter arrives that may never come.
+	raws map[string]*ByteRing
 }
 
 // NewCapture builds a capture whose per-container rings take the given bounds;
@@ -92,7 +101,44 @@ func NewCapture(maxEntries, maxBytes, maxLine int) *Capture {
 		maxBytes:   maxBytes,
 		maxLine:    maxLine,
 		rings:      map[string]*Ring{},
+		raws:       map[string]*ByteRing{},
 	}
+}
+
+// Raw returns the container's raw replay buffer, creating it on first use.
+//
+// The guest's output pump TEES each read into this and into the container's
+// line ring (cmd/k3sm-guest-init's consoleTee), so the two hold the same output
+// at the two granularities their consumers need. Calling it registers the
+// container, exactly as Writer does, so an attach to a container that has
+// produced nothing yet streams empty rather than reporting ErrNoCapture —
+// "nothing yet" and "never wired" are different answers.
+func (c *Capture) Raw(container string) *ByteRing {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.raws[container]
+	if !ok {
+		r = NewByteRing(0, 0)
+		c.raws[container] = r
+	}
+	return r
+}
+
+// RawStream implements the RawOutput seam: a subscription over the container's
+// raw output, carrying the bytes retained at registration and the ones written
+// after, with no gap and no duplicate between them (ByteRing.Subscribe).
+//
+// A container with no raw buffer is ErrNoCapture — the same distinction Stream
+// draws, and for the same reason: it asserts the guest was never wired to
+// listen, which is a different fact from a container that has been quiet.
+func (c *Capture) RawStream(container string) (*ByteSubscription, error) {
+	c.mu.Lock()
+	ring := c.raws[container]
+	c.mu.Unlock()
+	if ring == nil {
+		return nil, fmt.Errorf("%w: %s", ErrNoCapture, container)
+	}
+	return ring.Subscribe(0), nil
 }
 
 // ring returns the container's ring, creating it on first use.
@@ -125,24 +171,41 @@ func (c *Capture) Writer(container string, kind LogStreamKind) io.WriteCloser {
 	return &lineWriter{ring: c.ring(container), kind: kind, maxLine: c.maxLine}
 }
 
-// Close ends every follower of a container's stream. It is called when the
-// container exits: a `kubectl logs -f` reader must see end-of-stream rather than
-// hang on a process that will never write again.
+// Close ends every follower of a container's stream, at BOTH granularities. It
+// is called when the container exits: a `kubectl logs -f` reader and an
+// attached terminal must each see end-of-stream rather than hang on a process
+// that will never write again.
+//
+// Retained output survives on both rings, so a reader arriving after the exit
+// still gets what the container said before it.
 func (c *Capture) Close(container string) {
 	if r := c.lookup(container); r != nil {
 		r.Close()
 	}
+	c.mu.Lock()
+	raw := c.raws[container]
+	c.mu.Unlock()
+	if raw != nil {
+		raw.Close()
+	}
 }
 
-// CloseAll closes every container's stream, for guest shutdown.
+// CloseAll closes every container's streams, for guest shutdown.
 func (c *Capture) CloseAll() {
 	c.mu.Lock()
 	rings := make([]*Ring, 0, len(c.rings))
 	for _, r := range c.rings {
 		rings = append(rings, r)
 	}
+	raws := make([]*ByteRing, 0, len(c.raws))
+	for _, r := range c.raws {
+		raws = append(raws, r)
+	}
 	c.mu.Unlock()
 	for _, r := range rings {
+		r.Close()
+	}
+	for _, r := range raws {
 		r.Close()
 	}
 }

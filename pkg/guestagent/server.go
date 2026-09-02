@@ -19,6 +19,7 @@ package guestagent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"time"
@@ -108,6 +109,23 @@ type Logs interface {
 	Stream(ctx context.Context, container string, sel Selector) (<-chan LogEntry, func(), error)
 }
 
+// RawOutput supplies a container's retained and live output as RAW BYTES.
+//
+// It is a SECOND seam onto the same output rather than a method on Logs, and
+// the split is the point: `kubectl logs` wants LINES and `kubectl attach` wants
+// BYTES, and one source cannot honestly serve both. A line source holds a
+// newline-less write — which is every shell prompt, every password query, and
+// every keystroke a pty echoes back — until a delimiter arrives that an
+// interactive session may never send, so attach served from it looks wedged
+// exactly when the user is typing. A byte source, used for logs, would make
+// `--tail=10` mean "the last ten reads the pump happened to make".
+type RawOutput interface {
+	// RawStream returns a subscription over the container's raw output. The
+	// caller MUST send the subscription's snapshot before draining its channel,
+	// and MUST Close it when the stream ends.
+	RawStream(container string) (*ByteSubscription, error)
+}
+
 // Execer runs one command inside a container.
 type Execer interface {
 	// Exec runs spec with the given plumbing and returns its terminal result.
@@ -120,13 +138,18 @@ type Statusr interface {
 	Status(ctx context.Context) Status
 }
 
-// Deps are the server's five seams plus its two concrete registries.
+// Deps are the server's six seams plus its two concrete registries.
 type Deps struct {
 	Runner  Runner
 	Sampler Sampler
 	Logs    Logs
 	Execer  Execer
 	Status  Statusr
+	// RawOutput is the byte-granular half of a container's output, which
+	// `kubectl attach` streams from. It is separate from Logs; see RawOutput.
+	// A nil one makes attach report Unavailable with that stated reason rather
+	// than silently serving nothing.
+	RawOutput RawOutput
 	// Events is the ContainerEvents fan-out the guest's reaper publishes to. It
 	// is CONCRETE rather than an interface because it is not a seam onto the
 	// guest — it is a bounded fan-out this package owns and tests directly.
@@ -591,9 +614,10 @@ func (s *Server) Attach(stream grpc.BidiStreamingServer[runtimev1.AttachRequest,
 		return err
 	}
 
-	// The retained endpoints, read ONCE. Two things come from them: whether the
-	// stdin the client asked for exists at all, and whether the container holds
-	// a terminal (which decides the output delimiter below).
+	// The retained endpoints, read ONCE, for one question: does the stdin this
+	// client asked for exist at all. The container's tty-ness is deliberately
+	// NOT consulted for output — the raw source passes bytes through verbatim,
+	// so a pty's CRLFs are already in them and a pipe's are correctly absent.
 	ep, haveEndpoints := s.deps.Attach.Endpoints(container)
 	if first.GetStdin() && (!haveEndpoints || ep.Stdin == nil) {
 		// FAIL, never DROP. guest.proto: "Stdin is never silently dropped: a
@@ -610,21 +634,23 @@ func (s *Server) Attach(stream grpc.BidiStreamingServer[runtimev1.AttachRequest,
 
 	ctx := stream.Context()
 
-	// SUBSCRIBE-THEN-SNAPSHOT, and the ordering is the seam's, not this
-	// handler's: Capture.Stream registers the live subscriber under the ring's
-	// lock BEFORE it takes the retained snapshot, and Ring.Append records and
-	// fans out in one critical section of its own. So an entry written while
-	// this attach was being set up is in the snapshot, or on the live channel,
-	// or — for the one that lands between them — in both. Nothing is lost,
-	// which is the direction the contract chooses; a duplicated line during
-	// setup is the price and it is the cheaper mistake.
-	entries, unsubscribe, err := s.deps.Logs.Stream(ctx, container, Selector{Follow: true})
+	// The BYTE source, not the line ring. An attached client is a terminal:
+	// its shell prompt, its password query and every keystroke the pty echoes
+	// back arrive with no newline behind them, and a line-granular source holds
+	// exactly those until a delimiter that an interactive session may never
+	// send. `kubectl logs` keeps the line ring, unchanged — see RawOutput for
+	// why one source cannot honestly serve both.
+	if s.deps.RawOutput == nil {
+		return status.Error(codes.Unavailable,
+			"attach: this guest captures no raw container output, so there is nothing to bridge a client to")
+	}
+	sub, err := s.deps.RawOutput.RawStream(container)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "attach: %v", err)
 	}
 	// The ONLY teardown. See the type doc for the three things it deliberately
 	// is not.
-	defer unsubscribe()
+	defer sub.Close()
 
 	if first.GetStdin() {
 		// Detached, exactly as the exec input pump is: a client holding stdin
@@ -633,17 +659,44 @@ func (s *Server) Attach(stream grpc.BidiStreamingServer[runtimev1.AttachRequest,
 		go s.forwardAttachInput(stream, container)
 	}
 
+	// SNAPSHOT FIRST, always. ByteRing.Subscribe registered this client and
+	// read the retained bytes in ONE critical section, so no byte can fall
+	// between the two and none is delivered twice — but the retained bytes
+	// PRECEDE the live ones, and draining the channel first would hand the
+	// client's terminal the session out of order.
+	for _, chunk := range sub.Snapshot() {
+		resp, want := attachFrame(chunk, first.GetStdout(), first.GetStderr())
+		if !want {
+			continue
+		}
+		if serr := stream.Send(resp); serr != nil {
+			return serr
+		}
+	}
+
+	reported := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case e, ok := <-entries:
+		case chunk, ok := <-sub.C():
 			if !ok {
 				// The container's output stream ended, which the guest does when
 				// the container exits (Capture.Close on the reap path).
 				return s.sendAttachExit(stream, container)
 			}
-			resp, want := attachFrame(e, ep.TTY, first.GetStdout(), first.GetStderr())
+			// A client that fell behind lost BYTES, and a gap in a terminal
+			// stream is a half-drawn screen with no way for the reader to know
+			// it. Say so, once per new loss, before the bytes that follow the
+			// gap — the notice is visible noise and it is the cheaper mistake.
+			if now := sub.DroppedBytes(); now > reported {
+				if serr := stream.Send(&runtimev1.AttachResponse{
+					Stdout: attachDropNotice(now - reported)}); serr != nil {
+					return serr
+				}
+				reported = now
+			}
+			resp, want := attachFrame(chunk, first.GetStdout(), first.GetStderr())
 			if !want {
 				continue
 			}
@@ -725,53 +778,54 @@ func (s *Server) sendAttachExit(stream grpc.BidiStreamingServer[runtimev1.Attach
 	return stream.Send(&runtimev1.AttachResponse{Exit: &runtimev1.ExecResult{ExitCode: code}})
 }
 
-// attachFrame renders one retained entry as the client-facing frame, or reports
-// that the client did not ask for that stream.
+// attachFrame renders one raw chunk as the client-facing frame, or reports that
+// the client did not ask for that stream.
 //
-// # The delimiter the ring took off has to go back on
+// The bytes are passed through VERBATIM: nothing is added, nothing is stripped,
+// nothing is re-chunked. That is the whole difference from the logs path, where
+// the line writer strips the delimiter and the host's logEmitter puts one back.
+// An attached client is a terminal, so its escape sequences, its CRLFs and its
+// partial writes have to arrive exactly as the program emitted them — a
+// reconstructed delimiter would be a guess about output that was never
+// line-shaped to begin with.
 //
-// Capture stores LINES: lineWriter splits on \n and strips it, plus a preceding
-// \r. That is what makes `kubectl logs --tail` mean what its name says, and the
-// host's logEmitter re-delimits on the way out. Attach has no such emitter — the
-// bytes go to a client's terminal as they are — so the delimiter is restored
-// here, and \r\n for a tty container because a pty's ONLCR is what produced the
-// \r the writer stripped. A raw-mode client fed bare \n staircases down the
-// screen.
+// # One residual, and it is cosmetic
 //
-// # The residual, stated rather than hidden
-//
-// A container's output reaches an attached client one LINE at a time, because
-// that is the granularity the ring retains. Bytes with no newline behind them
-// are held by the writer until one arrives or its 16 KiB bound is hit, so an
-// interactive PROMPT ("$ ", a password query) does not appear until the program
-// writes something terminated after it. That is a real ceiling on interactive
-// attach and it belongs to the ring's line granularity, not to this function;
-// closing it means giving attach a byte-granular source, which is a change to
-// what the guest retains and not something to paper over with a second buffer
-// here.
-func attachFrame(e LogEntry, tty, wantStdout, wantStderr bool) (*runtimev1.AttachResponse, bool) {
-	if e.Stream == StreamStderr {
+// The retained buffer is bounded and evicted oldest-bytes-first, so a client
+// attaching to a busy full-screen program can begin MID-ESCAPE-SEQUENCE: the
+// first few bytes it receives may be the tail of a cursor-positioning code
+// whose introducer was evicted, which the terminal renders as a stray
+// character or two. There is no honest fix inside a bounded buffer — the
+// alternative is retaining the whole session — and the recovery is the one
+// every terminal user already has: ^L redraws. The same applies after a
+// drop notice.
+func attachFrame(chunk ByteChunk, wantStdout, wantStderr bool) (*runtimev1.AttachResponse, bool) {
+	if len(chunk.Data) == 0 {
+		return nil, false
+	}
+	if chunk.Stream == StreamStderr {
 		if !wantStderr {
 			return nil, false
 		}
-		return &runtimev1.AttachResponse{Stderr: attachLine(e.Line, tty)}, true
+		return &runtimev1.AttachResponse{Stderr: chunk.Data}, true
 	}
 	if !wantStdout {
 		return nil, false
 	}
-	return &runtimev1.AttachResponse{Stdout: attachLine(e.Line, tty)}, true
+	return &runtimev1.AttachResponse{Stdout: chunk.Data}, true
 }
 
-// attachLine restores the delimiter Capture's line writer stripped. See
-// attachFrame for why a tty gets CRLF.
-func attachLine(line []byte, tty bool) []byte {
-	delim := "\n"
-	if tty {
-		delim = "\r\n"
-	}
-	out := make([]byte, 0, len(line)+len(delim))
-	out = append(out, line...)
-	return append(out, delim...)
+// attachDropNotice is the in-band line a client gets when the bounds cost it
+// bytes — the Capture truncationNotice idiom, restated for a terminal.
+//
+// It is CRLF-wrapped and names ^L because its reader is a terminal that has
+// just been handed a discontinuity: without the notice, a half-drawn screen and
+// a program that has genuinely gone quiet look identical, and they call for
+// opposite operator actions.
+func attachDropNotice(dropped int) []byte {
+	return []byte(fmt.Sprintf(
+		"\r\n[k3sm-guest] attach dropped %d bytes: this client fell behind. Redraw with ^L.\r\n",
+		dropped))
 }
 
 // Stop begins guest shutdown: SIGTERM to every container, SIGKILL to what remains
