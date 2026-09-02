@@ -42,6 +42,7 @@ import (
 // written — the one moment the load's phase ordering is externally visible.
 type recordingIndex struct {
 	refs     map[string]*runtimev1.ImageManifest
+	entries  map[string]IndexEntry
 	platform Platform
 	records  int
 	err      error
@@ -49,14 +50,17 @@ type recordingIndex struct {
 }
 
 func newRecordingIndex() *recordingIndex {
-	return &recordingIndex{refs: make(map[string]*runtimev1.ImageManifest)}
+	return &recordingIndex{
+		refs:    make(map[string]*runtimev1.ImageManifest),
+		entries: make(map[string]IndexEntry),
+	}
 }
 
-func (r *recordingIndex) Lookup(context.Context, string, PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
-	return nil, false, nil
+func (r *recordingIndex) Lookup(context.Context, string, PlatformPolicy) (IndexEntry, bool, error) {
+	return IndexEntry{}, false, nil
 }
 
-func (r *recordingIndex) Record(_ context.Context, ref string, p Platform, mfst *runtimev1.ImageManifest) error {
+func (r *recordingIndex) Record(_ context.Context, e IndexEntry) error {
 	if r.onRecord != nil {
 		r.onRecord()
 	}
@@ -64,8 +68,9 @@ func (r *recordingIndex) Record(_ context.Context, ref string, p Platform, mfst 
 		return r.err
 	}
 	r.records++
-	r.platform = p
-	r.refs[ref] = mfst
+	r.platform = e.Platform
+	r.refs[e.Reference] = e.Manifest
+	r.entries[e.Reference] = e
 	return nil
 }
 

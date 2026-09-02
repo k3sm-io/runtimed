@@ -44,22 +44,30 @@ type fakeIndex struct {
 	records int
 }
 
-func (f *fakeIndex) Lookup(_ context.Context, ref string, policy PlatformPolicy) (*runtimev1.ImageManifest, bool, error) {
+func (f *fakeIndex) Lookup(_ context.Context, ref string, policy PlatformPolicy) (IndexEntry, bool, error) {
 	f.lastPolicy = policy
 	if f.err != nil {
-		return nil, false, f.err
+		return IndexEntry{}, false, f.err
 	}
 	m, ok := f.entries[ref]
-	return m, ok, nil
+	if !ok {
+		return IndexEntry{}, false, nil
+	}
+	return IndexEntry{Reference: ref, Platform: nativeTestPlatform, Manifest: m}, true, nil
 }
 
 // Record mirrors Lookup's ref-only keying: the platform half is asserted through
 // the real index, not here.
-func (f *fakeIndex) Record(_ context.Context, ref string, _ Platform, mfst *runtimev1.ImageManifest) error {
+func (f *fakeIndex) Record(_ context.Context, e IndexEntry) error {
 	f.records++
-	f.entries[ref] = mfst
+	f.entries[e.Reference] = e.Manifest
 	return nil
 }
+
+// nativeTestPlatform is the key half fakeIndex reports for a warm hit. The real
+// keying rules are gated against the real FileIndex; this only has to be a
+// complete platform, since Puller.Pull now returns the key it served.
+var nativeTestPlatform = Platform{OS: "darwin", Architecture: "arm64"}.Normalize()
 
 // offlineFetch is a FetchFunc that fails the way a blackholed network fails. Any
 // case that reaches it has performed registry traffic, which is exactly what the

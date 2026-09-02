@@ -78,9 +78,17 @@ func sendArchive(t *testing.T, client runtimev1.ImagesClient, first *runtimev1.L
 // uses this fixture and not a docker save.
 func ociTarball(t *testing.T, layer, poison []byte) (archive []byte, manifestDigest, configDigest, layerDigest string) {
 	t.Helper()
-	cfg, err := json.Marshal(ggcrv1.ConfigFile{
+	return ociTarballConfig(t, ggcrv1.ConfigFile{
 		OS: "darwin", Architecture: "arm64", RootFS: ggcrv1.RootFS{Type: "layers"},
-	})
+	}, layer, poison)
+}
+
+// ociTarballConfig is ociTarball over a caller-supplied image config, for the
+// tests that read the config back out of the store (InspectImage's decoded
+// half). The config is otherwise identical fixture machinery.
+func ociTarballConfig(t *testing.T, config ggcrv1.ConfigFile, layer, poison []byte) (archive []byte, manifestDigest, configDigest, layerDigest string) {
+	t.Helper()
+	cfg, err := json.Marshal(config)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
@@ -348,15 +356,21 @@ func assertRecorded(t *testing.T, rt *Runtime, ref string) {
 	if err != nil {
 		t.Fatalf("open image index: %v", err)
 	}
-	mfst, ok, err := idx.Lookup(context.Background(), ref, nativeLoadPolicy())
+	entry, ok, err := idx.Lookup(context.Background(), ref, nativeLoadPolicy())
 	if err != nil {
 		t.Fatalf("index lookup: %v", err)
 	}
 	if !ok {
 		t.Fatalf("the ingested reference %q was not recorded in the on-disk index", ref)
 	}
-	if mfst.GetReference() != ref {
-		t.Errorf("recorded manifest names %q, want %q", mfst.GetReference(), ref)
+	if entry.Manifest.GetReference() != ref {
+		t.Errorf("recorded manifest names %q, want %q", entry.Manifest.GetReference(), ref)
+	}
+	// The ingest must also retain the manifest's own bytes and digest: they are
+	// the only copy this store keeps, and an export reads them back verbatim.
+	if entry.Descriptor.GetDigest() == "" || len(entry.ManifestRaw) == 0 {
+		t.Errorf("the ingest recorded no manifest descriptor/bytes for %q (descriptor %v, %d raw bytes)",
+			ref, entry.Descriptor, len(entry.ManifestRaw))
 	}
 }
 
