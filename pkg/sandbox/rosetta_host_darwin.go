@@ -33,7 +33,7 @@ import (
 // capable host.
 
 // rosettaRuntimePath is the one on-disk artifact whose presence means Rosetta 2 is
-// INSTALLED. Verified on macOS 26.5.2 (build 25F84): mode 0755 root:wheel, flagged
+// INSTALLED. Verified on macOS 26.5.2: mode 0755 root:wheel, flagged
 // SIP-`restricted`.
 //
 // Three properties make it the right (and the only acceptable) path:
@@ -53,7 +53,7 @@ import (
 const rosettaRuntimePath = "/Library/Apple/usr/libexec/oah/libRosettaRuntime"
 
 // archTool / trueTool are the translated-exec leg's two binaries, named as LITERAL
-// absolute paths. Both are SIP-`restricted` (verified on macOS 26.5.2 / 25F84), so
+// absolute paths. Both are SIP-`restricted` (verified on macOS 26.5.2), so
 // neither can be replaced by a non-SIP-exempt process.
 //
 // exec.LookPath is BANNED here and the reason is a privilege boundary, not style:

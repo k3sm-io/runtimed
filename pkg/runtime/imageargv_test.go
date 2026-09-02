@@ -35,7 +35,7 @@ import (
 //
 // # The counterfactual it pins
 //
-// The M8 lab run (miko-studio, 2026-08-30) measured both halves of the same
+// The M8 lab run (the M8 lab host, 2026-08-30) measured both halves of the same
 // image: mlx-serve's own ENTRYPOINT /bin/python3.12 failed
 // FAILURE_REASON_SIGNATURE_REJECTED with "no such file or directory", while the
 // byte-identical imported image invoked with a relative argv[0] ran to
