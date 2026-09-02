@@ -164,6 +164,12 @@ type ApplyStats struct {
 	// It is the ONE number that makes the documented security.capability loss
 	// visible without re-reading the image (see xattrAllowlist).
 	DroppedXattrs int `json:"dropped_xattrs,omitempty"`
+	// RootEntries counts the layer-ROOT entries skipped — the "./" directory
+	// entry buildkit and docker emit as the first entry of most layers. It
+	// describes the tree root's own mode, not a node to create, so it is skipped
+	// and counted (see LayerApplier.applyEntry). omitempty, so a layer that
+	// carries none records exactly what it always did.
+	RootEntries int `json:"root_entries,omitempty"`
 }
 
 // LayerApplier applies decompressed OCI layer tar streams, in order, into ONE
@@ -341,6 +347,29 @@ func (a *LayerApplier) applyEntry(hdr *tar.Header, content io.Reader) error {
 	// ("pax_global_header").
 	switch hdr.Typeflag {
 	case tar.TypeXHeader, tar.TypeXGlobalHeader:
+		return nil
+	}
+
+	// The layer-ROOT entry ("./", "." or "/"-suffixed spellings of the same) is
+	// a no-op, not a fault. buildkit and docker emit a directory entry for the
+	// tree root as the first entry of most layers — every debian-derived image
+	// carries one; alpine's happen not to — and it is legal: it describes the
+	// root's own mode and mtime, and names no node to create. Refusing it made a
+	// standard `docker build` image unrunnable on this node.
+	//
+	// Skipping is the correct handling and not merely the cheap one. The tree
+	// root already exists (the applier is handed an os.Root anchored at it), and
+	// this applier does not preserve a recorded mode on the native spine anyway
+	// — entryPerm rewrites every mode it writes — so there is nothing the entry
+	// could contribute that would survive.
+	//
+	// The carve-out is EXACTLY the cleaned-"." name. Everything else the
+	// sanitizer refuses is still refused below: an absolute name, a ".."
+	// traversal, an empty or "." component, a NUL. And a hardlink TARGET of "."
+	// is still refused, because layerEntryPath keeps its own root check for the
+	// Linkname call site — nothing can be hardlinked to the tree root.
+	if isLayerRootEntry(hdr.Name) {
+		a.stats.RootEntries++
 		return nil
 	}
 
@@ -869,6 +898,22 @@ func layerEntryPath(name string) (string, error) {
 		}
 	}
 	return trimmed, nil
+}
+
+// isLayerRootEntry reports whether name is the layer's own tree-root entry —
+// "." or "./", with or without a trailing slash.
+//
+// It applies the SAME normalization layerEntryPath does (trim a leading "./",
+// then a trailing "/") so the two agree on what "the root" is by construction
+// rather than by two hand-kept spellings. It answers only that one question: an
+// absolute name, a "..", or any other grammar fault is not this function's
+// business and reaches the sanitizer unchanged.
+func isLayerRootEntry(name string) bool {
+	if name == "" || path.IsAbs(name) || strings.ContainsRune(name, 0) {
+		return false
+	}
+	trimmed := strings.TrimSuffix(strings.TrimPrefix(name, "./"), "/")
+	return trimmed == "" || trimmed == "."
 }
 
 // symlinkTargetContained reports whether a symlink at the (already sanitized)
