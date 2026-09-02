@@ -22,8 +22,8 @@ import "strings"
 // the default-deny profile: the two IOKit USER-CLIENT classes a Metal device open
 // requires. It is lab-derived, not designed — the M8.0 S1 spike ran a full MLX
 // generation and a COLD Metal-kernel JIT compile under the generated profile on an
-// M1 Ultra / macOS 26.5.2 rig and reduced the allow-set to exactly these two names
-// by ablation (k3sm hack/spike/m8 findings-s1.md).
+// Apple M1-family / macOS 26.5.2 rig and reduced the allow-set to exactly these
+// two names by ablation (k3sm hack/spike/m8 findings-s1.md).
 //
 // Three properties of that measurement are load-bearing here, because each one
 // forecloses a rule a reader would otherwise expect to find:
