@@ -757,14 +757,23 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 	}
 	defer plain.Close()
 
-	if err := applier.Apply(ctx, io.TeeReader(plain, diffHash)); err != nil {
+	// ONE tee, shared by the apply and the drain below. The diffID is defined as
+	// the digest of the RAW decompressed layer bytes, so every byte that leaves
+	// the decompressor must pass through diffHash — including the ones the tar
+	// reader never asks for. Draining the decompressor DIRECTLY (which this did)
+	// hashes a prefix: archive/tar stops at the end-of-archive marker and never
+	// reads the 10240-byte block padding GNU tar and buildkit emit, so every
+	// padded layer failed verification against the diffID its own config
+	// correctly claimed.
+	plainTee := io.TeeReader(plain, diffHash)
+	if err := applier.Apply(ctx, plainTee); err != nil {
 		return err
 	}
 	// Drain whatever the tar reader left (its trailing padding, and any bytes
 	// after the archive's end-of-archive marker) so both hashers see the whole
 	// stream. Without this the digests are computed over a prefix and the checks
 	// below would pass for a blob with arbitrary appended content.
-	if _, err := io.Copy(io.Discard, plain); err != nil {
+	if _, err := io.Copy(io.Discard, plainTee); err != nil {
 		return fmt.Errorf("%w: drain layer: %v", ErrLayerMalformed, boundErr(err))
 	}
 	if _, err := io.Copy(io.Discard, compressed); err != nil {
