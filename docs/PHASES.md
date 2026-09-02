@@ -1,8 +1,8 @@
 ---
 repo: runtimed
 schema: phases/v1
-current_phase: M5
-updated: 2026-08-31
+current_phase: M7
+updated: 2026-09-01
 updated_by: orchestrator
 
 phases:
@@ -344,13 +344,15 @@ phases:
 
   - id: M5
     title: vm sandbox backend — Virtualization.framework Linux micro-VM behind sandbox.Backend
-    status: in-progress
+    status: done  # 2026-09-01 — every M5.1 row true; the milestone's lab remainder was delivered under M11.2 and proven by the M11 lab gate
+    completed: 2026-09-01
     depends_on:
       - apis:M5.1
     subphases:
       - id: M5.1
         title: Virtualization.framework Linux micro-VM backend
-        status: in-progress
+        status: done
+        completed: 2026-09-01
         strategy: hard cut
         strategy_rationale: the vm backend is additive behind the existing swappable sandbox.Backend ladder; the host-process Seatbelt path is byte-unchanged (golden SBPL + existing tests stay green); one signed binary. No proto/CRD/datastore change beyond apis:M5.1 (already landed). The live VM boot is lab-gated, not phased.
         deliverables:
@@ -358,14 +360,14 @@ phases:
             done: true
             desc: pkg/sandbox — a vm Backend cgo SCAFFOLD backed by Virtualization.framework, implementing the existing swappable sandbox.Backend interface and gated by a SAFE Backend.Available() probe. Available() = darwin OS-gate AND +[VZVirtualMachine isSupported] AND a com.apple.security.virtualization static-code-entitlement check (read via Security.framework SecCodeCopySigningInformation), both wrapped in @try/@catch + @autoreleasepool in the isolated Obj-C shim (vm_darwin.m / vm_darwin.h); it NEVER constructs/boots a VM (that raises an uncaught NSException → SIGABRT on a non-entitled host). vm_darwin.go (//go:build darwin && cgo) links -framework Virtualization/Foundation/CoreFoundation/Security; vm_other.go (//go:build !(darwin && cgo)) stubs the probes false so the pure-Go (CGO_ENABLED=0) lane is unbroken. CreateVM is a documented LAB-GATED stub (ErrVMBootNotImplemented). Registered as the consumer-side runtime.VMBackend so pod.go/SelectBackend query it. VZ is a PUBLIC framework — internal/spicanary is deliberately UNCHANGED (NOT a libsandbox/memorystatus SPI canary case)
           - id: M5.1-d2
-            done: false
+            done: true  # 2026-09-01 — delivered by M11.2: the live boot spine is M11.2-d9 (CreateVM spawns/supervises/tears down one k3sm-vmhost per vm pod), the helper lifecycle is M11.2-d2, the OCI-Linux-rootfs builder is M11.2-d1 over the d7 unpacker, the digest-pinned guest artifacts are M11.2-d3, VM metering is M11.2-d6 (stats from the guest agent, not proc_pid_rusage); proven live by M11.2-a9 and the M11 lab gate
             desc: pkg/sandbox (or pkg/image) — LAB-GATED remainder (needs a VZ-capable, entitled Mac): the live VM boot (VZVirtualMachineConfiguration driven on a per-VM SERIAL dispatch queue behind an opaque handle, VZ-delegate→exit / SIGTERM→ACPI requestStop); the cmd/k3sm-vmhost helper-process lifecycle; the OCI-Linux-rootfs→bootable-root builder (the OCI payload is a Linux rootfs, not arm64 Mach-O, so codesign/ad-hoc-sign is N/A inside the VM; digest-pin tenant images); and VM metering (the memory limit → VZ memorySize; working set from a guest agent, NOT proc_pid_rusage which only sees the host/vmnet task)
           - id: M5.1-d3
             done: true
             desc: pkg/sandbox + pkg/runtime — FAIL-CLOSED backend dispatch (the verifiable safety fix). sandbox.SelectBackend now takes the REQUESTED backend (SandboxProfile.backend): a requested vm backend that is UNavailable returns the typed ErrBackendUnavailable (FAIL CLOSED — NEVER downgrades to the weaker Seatbelt rung, on which a Linux image cannot even exec); UNSPECIFIED (the host-process default) walks the existing host-OS-gated Seatbelt ladder (degrade-UP-only, unchanged); an explicit Seatbelt pin is honored-or-refused. pkg/runtime.createPod threads sp.GetBackend() and queries the registered vm backend's Available() (was hardcoded vmAvailable=false, discarding the selected rung) and ROUTES a selected vm rung to createVMPod, which bypasses the host-process Mach-O steps (resolveBinary / gateSignature+ad-hoc-codesign / SBPL SandboxApply / lo0 networking) — meaningless for a Linux guest. The host-process path is byte-unchanged
         acceptance:
           - id: M5.1-a1
-            met: false
+            met: true  # 2026-09-01 — a linux/arm64 image boots to Running under the vm backend on the entitled rig: M11.2-a9's committed live smoke plus the k3sm M11 lab gate (M11-lab 26/0/1, 2026-09-01)
             check: a Linux image runs under the vm backend on a capable, entitled host (Backend.Available() reports present only when VZ + the entitlement are available) — the live boot
             method: integration
           - id: M5.1-a2
