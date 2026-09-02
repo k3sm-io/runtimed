@@ -113,7 +113,7 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.48",
-		// Minted 2026-09-02 from the v6.18.48-k3sm.3 release. The KERNEL is
+		// Minted 2026-09-02 from the v6.18.48-k3sm.4 release. The KERNEL is
 		// byte-identical to k3sm.1/k3sm.2 — same unmodified upstream tarball,
 		// same kernel.config, same build.sh, so ImageSHA256 and the config hash
 		// 9c05f8f3b26c… (the -suffix of ActiveGuestKernel) are unchanged. Only
@@ -131,8 +131,8 @@ var guestKernelPins = map[string]GuestKernelPin{
 		// assets — never from the local build output, so a mismatch between what
 		// was built and what was uploaded cannot hide here.
 		ImageSHA256:     "d50508b08205453e5f5f710978743449dc4fafe957aa8694e6da8e5780d93308",
-		InitramfsSHA256: "47c768f446e0ea5b56d7c4c5724c07299000890ae20c532962b7eb9e3143ef17",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.3",
+		InitramfsSHA256: "9368e922f0417942d8c0d4aacca1ec4282e9631e9c28be58c020414ee03d197f",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.4",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
