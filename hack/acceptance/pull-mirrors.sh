@@ -185,6 +185,13 @@ run_test "pm.10" 25 ./pkg/image/  TestMirrorFallbackEligibility
 run_test "pm.11" 12 ./pkg/image/  TestClusterLocalRefGate
 run_test "pm.12" 3 ./pkg/image/   TestRewriteRegistryHost
 run_test "pm.13" 5 ./pkg/image/   TestMirrorReferenceSelectsItsScheme
+# The AUTHORITY substitution, at the seam that reaches the wire, plus the live
+# two-registry proof that the bytes come from the peer's port, and the joined
+# error that names each peer's own failure.
+run_test "pm.18" 6 ./pkg/image/   TestMirrorReferenceSubstitutesTheAuthority
+run_test "pm.19" 0 ./pkg/image/   TestRemoteMirrorFetchDialsThePeer
+run_test "pm.20" 0 ./pkg/image/   TestPullFallsBackOverRealHTTP
+run_test "pm.21" 1 ./pkg/image/   TestMirrorFailuresReachTheError
 # The daemon's OWN wiring, against two loopback registries, with the no-mirrors
 # negative control that gives the positive case its meaning.
 run_test "pm.14" 2 ./pkg/runtime/ TestDefaultPullerConsultsClusterMirrors
@@ -238,6 +245,33 @@ if [ "$mrc" != 0 ]; then
 else
 	tail -20 "$SCRATCH/mutant-ident.log"
 	ladder no "pm.16  mutant: recording the MIRROR reference turns the identity assertions RED (rc $mrc)"
+fi
+
+# ---- pm.22 — mutant: dropping the AUTHORITY substitution must go RED --------
+# The property the whole fallback rests on: the reference the production fetcher
+# dials names the PEER. Every seam-driven leg above is handed an ALREADY-rewritten
+# reference by the puller, so all of them stay green against a fetcher that
+# forwards whatever it is given — which is exactly how a mirror path re-dials the
+# primary that just failed while every log line names a peer. Make Mirror.reference
+# forward its input and the two authority legs must reject it.
+python3 - "$MIRROR" <<'MUTPY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "\trewritten, err := rewriteRegistryHost(ref, m.Host)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n"
+new = "\trewritten := ref // MUTANT\n"
+if s.count(old) != 1:
+    sys.exit("mutation anchor not found exactly once")
+open(p, "w").write(s.replace(old, new))
+MUTPY
+mrc=0
+(cd "$REPO_ROOT" && "${GOENV[@]}" go test -count=1 -run '^(TestMirrorReferenceSubstitutesTheAuthority|TestRemoteMirrorFetchDialsThePeer)$' ./pkg/image/ >"$SCRATCH/mutant-authority.log" 2>&1) || mrc=$?
+restore_mirror
+if [ "$mrc" != 0 ]; then
+	ladder ok "pm.22  mutant: a mirror fetch that keeps the PRIMARY authority turns the peer legs RED"
+else
+	tail -20 "$SCRATCH/mutant-authority.log"
+	ladder no "pm.22  mutant: a mirror fetch that keeps the PRIMARY authority turns the peer legs RED (rc $mrc)"
 fi
 
 # ---- pm.17 — the Apache header on every file this unit adds ----------------
