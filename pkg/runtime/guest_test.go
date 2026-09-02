@@ -66,15 +66,51 @@ type fakeGuestAgent struct {
 	guestv1.UnimplementedGuestAgentServer
 
 	bootedPod string
-	// exec is the scripted body run after the first frame is accepted; logs is
-	// its GetLogs counterpart. A nil body ends the stream immediately.
-	exec func(gs guestv1.GuestAgent_ExecServer) error
-	logs func(req *runtimev1.GetLogsRequest, gs guestv1.GuestAgent_LogsServer) error
+	// exec is the scripted body run after the first frame is accepted; logs and
+	// attach are its GetLogs and Attach counterparts. A nil body ends the stream
+	// immediately.
+	exec   func(gs guestv1.GuestAgent_ExecServer) error
+	logs   func(req *runtimev1.GetLogsRequest, gs guestv1.GuestAgent_LogsServer) error
+	attach func(gs guestv1.GuestAgent_AttachServer) error
 
-	mu          sync.Mutex
-	execFrames  []*runtimev1.ExecRequest
-	logsReq     *runtimev1.GetLogsRequest
-	sawStdinEOF bool
+	mu           sync.Mutex
+	execFrames   []*runtimev1.ExecRequest
+	attachFrames []*runtimev1.AttachRequest
+	logsReq      *runtimev1.GetLogsRequest
+	sawStdinEOF  bool
+}
+
+// recordAttach keeps every attach frame the guest was sent, which is what pins
+// the route's first-frame re-stamp and its refusal to forward anything but
+// stdin bytes and resizes.
+func (f *fakeGuestAgent) recordAttach(req *runtimev1.AttachRequest) {
+	f.mu.Lock()
+	f.attachFrames = append(f.attachFrames, req)
+	f.mu.Unlock()
+}
+
+func (f *fakeGuestAgent) attachSeen() []*runtimev1.AttachRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*runtimev1.AttachRequest(nil), f.attachFrames...)
+}
+
+// Attach mirrors Exec: it enforces the single-pod contract on the first frame,
+// then runs the scripted body.
+func (f *fakeGuestAgent) Attach(gs guestv1.GuestAgent_AttachServer) error {
+	first, err := gs.Recv()
+	if err != nil {
+		return err
+	}
+	f.recordAttach(first)
+	if first.GetPodId() != f.bootedPod {
+		return status.Errorf(codes.InvalidArgument,
+			"attach: pod_id %q is not the pod this guest booted (%q)", first.GetPodId(), f.bootedPod)
+	}
+	if f.attach == nil {
+		return nil
+	}
+	return f.attach(gs)
 }
 
 func (f *fakeGuestAgent) record(req *runtimev1.ExecRequest) {

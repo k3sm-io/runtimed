@@ -254,21 +254,34 @@ func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tt
 
 // Attach attaches to an already-running container's streams (`kubectl attach`).
 //
-// M2 limitation: native pod containers are spawned (posix_spawn) with their
-// combined stdout+stderr wired to the log pipe and their stdin not retained — so
-// there is no fd to feed new input to a running native process. Interactive
-// attach (stdin, or a tty) is therefore reported Unimplemented rather than
-// silently dropping the operator's keystrokes; `kubectl exec` is the supported
-// interactive path. Attach supports the OUTPUT half faithfully: it replays the
-// container's buffered combined output and then follows new output live until the
-// container exits (delivering its exit code) or the client disconnects. Full
-// interactive attach awaits the stdin-pty retention work tracked in PHASES M2.7.
+// Route dispatch, as Exec does it. A vm pod's containers are GUEST processes
+// whose retained stdio lives in the guest's attach hub, so the whole
+// host-process body below is meaningless for one and it proxies to the pod's
+// guest agent instead (attachGuest, guest.go). The pod is resolved BEFORE
+// lookupContainer for that reason: a vm pod has no host containerProc, so the
+// host-process lookup cannot answer for one at all.
+//
+// M2 limitation, NATIVE PODS ONLY: a native container is spawned (posix_spawn)
+// with its combined stdout+stderr wired to the log pipe and its stdin not
+// retained — so there is no fd to feed new input to a running native process.
+// Interactive attach (stdin, or a tty) is therefore reported Unimplemented
+// rather than silently dropping the operator's keystrokes; `kubectl exec` is
+// the supported interactive path there. The native route supports the OUTPUT
+// half faithfully: it replays the container's buffered combined output and then
+// follows new output live until the container exits (delivering its exit code)
+// or the client disconnects. Full interactive attach for a NATIVE pod awaits
+// the stdin-pty retention work tracked in PHASES M2.7; the vm route above has
+// no such limitation, because the guest retains the endpoints at spawn.
 func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 	ctx := stream.Context()
 	first, err := stream.Recv()
 	if err != nil {
 		return err
 	}
+	if p, ok := r.lookupPod(first.GetPodId()); ok && p.isVM() {
+		return r.attachGuest(stream, p, first)
+	}
+
 	_, cp, err := r.lookupContainer(first.GetPodId(), first.GetContainer())
 	if err != nil {
 		return err

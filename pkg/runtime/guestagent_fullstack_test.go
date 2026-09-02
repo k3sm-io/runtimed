@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,6 +207,146 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 					t.Error("the guest never saw the client's stdin; the host's input pump and the agent's are not connected")
 				}
 			})
+		}
+	})
+
+	t.Run("attach-round-trips-through-both-real-halves", func(t *testing.T) {
+		// The strongest form of the attach assertion: the daemon's attachGuest
+		// against the SHIPPED guestagent.Server, over a real gRPC connection,
+		// with a real Capture, a real Events fan-out and a real AttachHub behind
+		// it. Only the endpoint itself is a stand-in for a pty master, because a
+		// test has no Linux guest to allocate one in.
+		capture := guestagent.NewCapture(0, 0, 0)
+		events := guestagent.NewEvents(0)
+		t.Cleanup(events.Close)
+		hub := guestagent.NewAttachHub()
+		sink := &fullstackStdin{typed: make(chan []byte, 4)}
+		_ = capture.Writer("app", guestagent.StreamStdout)
+		hub.Register("app", guestagent.AttachEndpoints{Stdin: sink})
+
+		w := capture.Writer("app", guestagent.StreamStdout)
+		if _, err := w.Write([]byte("already-buffered\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		dial := startRealGuestAgent(t, podID, guestagent.Deps{
+			Runner: stubRunner{names: []string{"app"}},
+			Logs:   capture,
+			Events: events,
+			Attach: hub,
+		})
+		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
+		p := addVMPod(t, rt, podID, "app")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		st := newFakeAttachStream(ctx)
+		st.feed(&runtimev1.AttachRequest{StdinData: []byte("typed")})
+
+		done := make(chan error, 1)
+		go func() {
+			done <- rt.attachGuest(st, p, &runtimev1.AttachRequest{
+				PodId: podID, Container: "app", Stdin: true, Stdout: true, Stderr: true,
+			})
+		}()
+
+		// The retained buffer is replayed first...
+		if got := string(st.recv(t, 5*time.Second).GetStdout()); got != "already-buffered\n" {
+			t.Errorf("first frame = %q, want the replayed buffer", got)
+		}
+		// ...the stream then follows live output...
+		if _, err := w.Write([]byte("live\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if got := string(st.recv(t, 5*time.Second).GetStdout()); got != "live\n" {
+			t.Errorf("second frame = %q, want the live line", got)
+		}
+		// ...and the client's keystrokes reach the container's retained stdin
+		// through both input pumps.
+		select {
+		case got := <-sink.typed:
+			if string(got) != "typed" {
+				t.Errorf("the container's stdin endpoint saw %q, want %q", got, "typed")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the client's stdin never reached the retained endpoint; the host's input pump and the agent's are not connected")
+		}
+
+		// The container exits: the reaper publishes it and closes the ring.
+		events.Publish(guestagent.ContainerEvent{Container: "app", At: time.Now(),
+			Exited: &guestagent.ContainerExited{ExitCode: 7}})
+		capture.Close("app")
+
+		if ex := st.recv(t, 5*time.Second).GetExit(); ex == nil || ex.GetExitCode() != 7 {
+			t.Errorf("terminal frame = %+v, want exit code 7", ex)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("attachGuest: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("attachGuest did not return after the guest ended the stream")
+		}
+		// DETACH IS NOT KILL, end to end: nothing in either half closed the
+		// container's retained endpoint.
+		if sink.isClosed() {
+			t.Error("the attach closed the container's stdin endpoint")
+		}
+	})
+
+	t.Run("attach-refuses-stdin-against-a-container-that-retains-none", func(t *testing.T) {
+		// The agent's FailedPrecondition, with its remedy, crossing the daemon
+		// intact — the one thing that makes a container spawned without stdin
+		// actionable rather than mysterious.
+		capture := guestagent.NewCapture(0, 0, 0)
+		_ = capture.Writer("app", guestagent.StreamStdout)
+		hub := guestagent.NewAttachHub()
+		hub.Register("app", guestagent.AttachEndpoints{})
+
+		dial := startRealGuestAgent(t, podID, guestagent.Deps{
+			Runner: stubRunner{names: []string{"app"}},
+			Logs:   capture,
+			Attach: hub,
+		})
+		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
+		p := addVMPod(t, rt, podID, "app")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		st := newFakeAttachStream(ctx)
+		err := rt.attachGuest(st, p, &runtimev1.AttachRequest{
+			PodId: podID, Container: "app", Stdin: true, Stdout: true,
+		})
+		if code := status.Code(err); code != codes.FailedPrecondition {
+			t.Fatalf("attach = %v (code %s), want FailedPrecondition", err, code)
+		}
+		if !strings.Contains(err.Error(), "stdin: true") {
+			t.Errorf("the agent's remedy did not survive the relay: %v", err)
+		}
+	})
+
+	t.Run("the-agent-advertises-the-capabilities-the-host-negotiates-on", func(t *testing.T) {
+		// The two ends of the negotiation, joined: the shipped agent's Health
+		// answer, read by the daemon's own lease poll, recorded on the pod, and
+		// then accepted by requireGuestCapability. A token renamed on either
+		// side breaks here rather than in a lab.
+		dial := startRealGuestAgent(t, podID, guestagent.Deps{
+			Runner: stubRunner{names: []string{"app"}},
+			Status: stubStatus{st: guestagent.Status{Ready: true, GuestIP: "10.0.0.9"}},
+		})
+		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
+		p := addVMPod(t, rt, podID, "app")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, reason := rt.pollGuestLease(ctx, p); reason != guestLeaseReasonValid {
+			t.Fatalf("lease poll reason = %s, want %s", reason, guestLeaseReasonValid)
+		}
+		for _, tok := range guestagent.Capabilities() {
+			if err := rt.requireGuestCapability("attach", tok, p); err != nil {
+				t.Errorf("the host did not record the agent's %q capability: %v", tok, err)
+			}
 		}
 	})
 
@@ -412,4 +553,38 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 		<-watched
 		t.Fatal("the OOMKilled transition never reached the pod's container status; for a vm pod this stream is the only place that fact exists")
 	})
+}
+
+// fullstackStdin stands in for a container's retained stdin endpoint: a pty
+// master in a guest, and here a channel a test can read.
+//
+// The closed flag is what "detach is not kill" reduces to mechanically —
+// nobody but the guest's exit watcher may ever call Close on this.
+type fullstackStdin struct {
+	typed chan []byte
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *fullstackStdin) Write(p []byte) (int, error) {
+	cp := append([]byte(nil), p...)
+	select {
+	case s.typed <- cp:
+	default:
+	}
+	return len(p), nil
+}
+
+func (s *fullstackStdin) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *fullstackStdin) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }

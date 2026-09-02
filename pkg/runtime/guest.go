@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"k3sm.io/runtimed/pkg/guestagent"
 	"k3sm.io/runtimed/pkg/image"
 
 	guestv1 "k3sm.io/apis/guest/v1"
@@ -200,6 +201,14 @@ func (r *Runtime) execGuest(stream runtimev1.Runtime_ExecServer, p *pod, first *
 	if err != nil {
 		return err
 	}
+	if first.GetTty() {
+		// Only a tty exec needs negotiating: a plain exec has been served by
+		// every initramfs this daemon has ever paired with, and gating it would
+		// refuse working pods for nothing.
+		if err := r.requireGuestCapability("exec", guestagent.CapabilityTTYExec, p); err != nil {
+			return err
+		}
+	}
 
 	// Cancelling on return tears down the guest stream (and with it the guest-side
 	// process) when the client goes away mid-exec.
@@ -294,6 +303,228 @@ func forwardExecInput(stream runtimev1.Runtime_ExecServer, agent guestv1.GuestAg
 // is worth keeping, while an Any-typed detail payload from a guest is not.
 func relayExecResponse(resp *runtimev1.ExecResponse) *runtimev1.ExecResponse {
 	out := &runtimev1.ExecResponse{Stdout: resp.GetStdout(), Stderr: resp.GetStderr()}
+	if ex := resp.GetExit(); ex != nil {
+		out.Exit = &runtimev1.ExecResult{ExitCode: ex.GetExitCode()}
+		if st := ex.GetError(); st != nil {
+			out.Exit.Error = rpcStatus(codes.Code(st.GetCode()), "%s", boundGuestMessage(st.GetMessage()))
+		}
+	}
+	return out
+}
+
+// maxGuestCapabilityTokens bounds how many advertised tokens one Health
+// response is scanned for.
+//
+// The frame bound already caps what arrives, so this is not what stops a flood;
+// it caps the WORK a hostile agent can make the poll do on every tick, forever,
+// on a node running many pods. A real agent advertises a handful.
+const maxGuestCapabilityTokens = 64
+
+// knownGuestCapability reports whether tok is a capability this daemon
+// understands.
+//
+// It is an ALLOWLIST, and the filter is what makes the recorded set safe: only
+// tokens from this package's own vocabulary are retained, so no guest-chosen
+// string is ever stored on a pod, logged, or compared. An unknown token is
+// ignored exactly as guest.proto says it should be.
+func knownGuestCapability(tok string) bool {
+	switch tok {
+	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach:
+		return true
+	}
+	return false
+}
+
+// guestCapVerdict is what the recorded capability state says about one token.
+type guestCapVerdict int
+
+// The three verdicts. They are three and not two because "the guest says it
+// cannot" and "nobody has asked the guest yet" call for opposite behaviour, and
+// collapsing them either refuses working pods or hides an unsupported pairing
+// behind a bare Unimplemented.
+const (
+	// guestCapUnobserved means no Health response has been read for this pod
+	// yet. The request proceeds: refusing on the strength of never having asked
+	// would fail every verb issued before the first poll landed.
+	guestCapUnobserved guestCapVerdict = iota
+	// guestCapPresent means the agent advertised the token.
+	guestCapPresent
+	// guestCapAbsent means the agent answered and did NOT advertise it — a
+	// positive statement, which an older initramfs makes by advertising nothing
+	// at all.
+	guestCapAbsent
+)
+
+// classifyGuestCapability is the verdict function, kept pure so the three-state
+// rule is pinned by a table rather than by reading the two call sites.
+func classifyGuestCapability(observed bool, caps map[string]struct{}, token string) guestCapVerdict {
+	if !observed {
+		return guestCapUnobserved
+	}
+	if _, ok := caps[token]; ok {
+		return guestCapPresent
+	}
+	return guestCapAbsent
+}
+
+// setGuestCapabilities records the tokens an agent advertised, filtered to the
+// ones this daemon knows. See the pod's guestCaps fields for the three states
+// it maintains.
+func (r *Runtime) setGuestCapabilities(p *pod, advertised []string) {
+	caps := map[string]struct{}{}
+	for i, tok := range advertised {
+		if i >= maxGuestCapabilityTokens {
+			break
+		}
+		if knownGuestCapability(tok) {
+			caps[tok] = struct{}{}
+		}
+	}
+	p.mu.Lock()
+	p.guestCaps = caps
+	p.guestCapsObserved = true
+	p.mu.Unlock()
+}
+
+// requireGuestCapability refuses a verb the pod's guest agent has said it
+// cannot serve, with a message that names the fix.
+//
+// the POINT IS the DIAGNOSTIC. Without it, a daemon paired with an older
+// initramfs answers `kubectl attach` with "method Attach not implemented" and
+// `kubectl exec -it` with a terminal refusal from inside the guest — both
+// technically true and both indistinguishable, to the operator reading them,
+// from a bug in this daemon. Compat is lockstep via the in-code initramfs
+// sha256 pin (guest.proto §COMPAT POSTURE), so the only reachable way to be
+// here is the dev-lab --guest-artifacts-dir override, and that is what the
+// message says.
+func (r *Runtime) requireGuestCapability(verb, token string, p *pod) error {
+	p.mu.Lock()
+	observed, caps := p.guestCapsObserved, p.guestCaps
+	p.mu.Unlock()
+	if classifyGuestCapability(observed, caps, token) != guestCapAbsent {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"%s: the guest initramfs booted for pod %s does not advertise the %q capability, so it cannot serve this verb; "+
+			"recreate the pod so it boots the initramfs this daemon pins (a --guest-artifacts-dir override is unsupported skew)",
+		verb, p.box.GetPodId(), token)
+}
+
+// attachGuest is Attach's vm route: it bridges the client's attach stream to
+// the pod's guest agent, which holds the container's RETAINED stdio.
+//
+// It mirrors execGuest — same first-frame re-stamp, same detached input pump,
+// same field-by-field relay — with one difference that is the whole point of
+// the verb: this route STARTS NOTHING and ENDS NOTHING. execGuest's ctx cancel
+// on handler return tears down a guest-side process the client asked to run;
+// the same cancel here tears down only the stream, because the agent's Attach
+// never signals the container, never closes its endpoints, and never forwards a
+// client half-close as stdin EOF (guest.proto: "DETACH IS NOT KILL"). A client
+// that disconnects has unsubscribed, and the workload does not notice.
+//
+// The PARAMETERS come from the first frame alone and are re-stamped with the
+// pod id and container name this route resolved host-side — the same
+// narrowing execGuest applies, so no later frame can re-aim the stream.
+func (r *Runtime) attachGuest(stream runtimev1.Runtime_AttachServer, p *pod, first *runtimev1.AttachRequest) error {
+	podID := p.box.GetPodId()
+	container, err := vmContainerName(p.box, first.GetContainer())
+	if err != nil {
+		return err
+	}
+	if err := r.requireGuestCapability("attach", guestagent.CapabilityAttach, p); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+
+	conn, err := r.dialGuest(podID)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "attach: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	agent, err := guestv1.NewGuestAgentClient(conn).Attach(ctx)
+	if err != nil {
+		return guestStreamError("attach", podID, err)
+	}
+	// A Send that races the agent's rejection returns io.EOF, whose real status
+	// is only readable from Recv — so an EOF here falls through to the relay
+	// loop, which reports the agent's actual code (that is how the
+	// no-retained-stdin FailedPrecondition reaches the client as the agent's own
+	// error rather than as a bare stream failure).
+	if err := agent.Send(&runtimev1.AttachRequest{
+		PodId:     podID,
+		Container: container,
+		Stdin:     first.GetStdin(),
+		Stdout:    first.GetStdout(),
+		Stderr:    first.GetStderr(),
+		Tty:       first.GetTty(),
+	}); err != nil && !errors.Is(err, io.EOF) {
+		return guestStreamError("attach", podID, err)
+	}
+
+	// Detached, exactly as the exec input pump is: a client holding stdin open
+	// must not block teardown, and the handler's return cancels ctx, which
+	// unblocks this goroutine's Recv.
+	go forwardAttachInput(stream, agent)
+
+	for {
+		resp, rerr := agent.Recv()
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return nil // the guest closed the stream after its terminal frame
+			}
+			return guestStreamError("attach", podID, rerr)
+		}
+		if serr := stream.Send(relayAttachResponse(resp)); serr != nil {
+			return serr
+		}
+	}
+}
+
+// forwardAttachInput pumps the client's post-parameter frames to the guest
+// agent, forwarding ONLY stdin bytes and terminal resizes.
+//
+// pod_id and container are read once, from the first frame, so a later frame
+// naming another pod or another container is inert — the stream stays bound to
+// what the route resolved, and re-targeting is impossible rather than merely
+// rejected.
+//
+// The client's half-close ends the send side of the GUEST stream, and that is
+// all it does. It is deliberately NOT the exec path's meaning: there,
+// CloseSend gives the exec'd process stdin EOF so a filter can flush and exit.
+// Here the far end's own input pump simply stops, and the container's stdin
+// endpoint stays open for the next client — because the container is going to
+// outlive this attach.
+func forwardAttachInput(stream runtimev1.Runtime_AttachServer, agent guestv1.GuestAgent_AttachClient) {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			_ = agent.CloseSend()
+			return
+		}
+		data, resize := req.GetStdinData(), req.GetResize()
+		if len(data) == 0 && resize == nil {
+			continue
+		}
+		fwd := &runtimev1.AttachRequest{StdinData: data}
+		if resize != nil {
+			fwd.Resize = &runtimev1.TerminalSize{Width: resize.GetWidth(), Height: resize.GetHeight()}
+		}
+		if err := agent.Send(fwd); err != nil {
+			return
+		}
+	}
+}
+
+// relayAttachResponse rebuilds the client-facing AttachResponse from the
+// guest's, field by named field — the same untrusted-data discipline
+// relayExecResponse applies, and for the same reason: only the fields this
+// route means to relay cross to the client, so a field a future agent sets
+// cannot ride through unexamined.
+func relayAttachResponse(resp *runtimev1.AttachResponse) *runtimev1.AttachResponse {
+	out := &runtimev1.AttachResponse{Stdout: resp.GetStdout(), Stderr: resp.GetStderr()}
 	if ex := resp.GetExit(); ex != nil {
 		out.Exit = &runtimev1.ExecResult{ExitCode: ex.GetExitCode()}
 		if st := ex.GetError(); st != nil {

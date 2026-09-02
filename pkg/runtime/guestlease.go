@@ -165,7 +165,7 @@ func (r *Runtime) watchGuestLease(ctx context.Context, p *pod) {
 	podID := p.box.GetPodId()
 	fails := 0
 	for {
-		addr, reason := r.pollGuestLease(ctx, podID)
+		addr, reason := r.pollGuestLease(ctx, p)
 		if ctx.Err() != nil {
 			return // teardown raced the poll; do not publish on the way out
 		}
@@ -236,7 +236,8 @@ func (r *Runtime) guestLeasePollInterval() time.Duration {
 // every other guest route takes: no reconnect state machine, nothing to
 // invalidate when the pod is deleted, and no way for one pod's dead socket to
 // hold resources against another's.
-func (r *Runtime) pollGuestLease(ctx context.Context, podID string) (addr, reason string) {
+func (r *Runtime) pollGuestLease(ctx context.Context, p *pod) (addr, reason string) {
+	podID := p.box.GetPodId()
 	conn, err := r.dialGuest(podID)
 	if err != nil {
 		return "", guestLeaseReasonUnreachable
@@ -254,6 +255,13 @@ func (r *Runtime) pollGuestLease(ctx context.Context, podID string) (addr, reaso
 		r.log.Debug("vm pod guest health poll failed", "pod", podID)
 		return "", guestLeaseReasonUnreachable
 	}
+	// The capability set rides the SAME response, and is recorded even when the
+	// lease below is rejected: what verbs an agent serves is a fact about the
+	// agent, and an address it could not lease says nothing about it. Recording
+	// it here also means the fact refreshes on every poll rather than being
+	// frozen at boot, which is what a guest restarted onto a different initramfs
+	// requires.
+	r.setGuestCapabilities(p, resp.GetCapabilities())
 	// ready is deliberately not required. guest.proto orders the boot as
 	// "filesystems mounted, spec read, network configured" before ready, so a
 	// ready=false answer carrying a lease is the narrow window at the end of boot

@@ -303,6 +303,7 @@ func (s *fakeAttachStream) Recv() (*runtimev1.AttachRequest, error) {
 	}
 }
 func (s *fakeAttachStream) feed(req *runtimev1.AttachRequest) { s.in <- req }
+func (s *fakeAttachStream) closeSend()                        { s.once.Do(func() { close(s.in) }) }
 func (s *fakeAttachStream) recv(t *testing.T, d time.Duration) *runtimev1.AttachResponse {
 	t.Helper()
 	select {
