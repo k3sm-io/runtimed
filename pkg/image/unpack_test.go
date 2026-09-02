@@ -52,6 +52,41 @@ func layerFrom(t *testing.T, specs []tarSpec) ggcrv1.Layer {
 	return l
 }
 
+// layerFromRaw wraps ALREADY-RENDERED uncompressed tar bytes as a real
+// go-containerregistry layer, so the layer's compressed digest and its diffID
+// are both derived from exactly those bytes by a party other than the code under
+// test.
+//
+// It exists beside layerFrom because a real builder's layer is not merely
+// "whatever archive/tar wrote": the bytes AFTER the end-of-archive marker are
+// part of the layer, and only a raw-bytes fixture can carry them.
+func layerFromRaw(t *testing.T, raw []byte) ggcrv1.Layer {
+	t.Helper()
+	l, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(raw)), nil
+	})
+	if err != nil {
+		t.Fatalf("layer from raw tar: %v", err)
+	}
+	return l
+}
+
+// gnuPadded returns raw padded with zero bytes up to a multiple of 10240 — the
+// 20-block record GNU tar writes and buildkit's writer inherits.
+//
+// This is the shape that broke a real pull. Go's archive/tar Writer pads only to
+// 512, so a fixture built with it carries NO trailing bytes and cannot exercise
+// the difference between hashing the stream and hashing what the tar reader
+// happened to consume.
+func gnuPadded(raw []byte) []byte {
+	const record = 10240
+	out := append([]byte(nil), raw...)
+	if n := len(out) % record; n != 0 {
+		out = append(out, bytes.Repeat([]byte{0}, record-n)...)
+	}
+	return out
+}
+
 // imageFrom builds a multi-layer image whose config declares darwin/arm64.
 func imageFrom(t *testing.T, layers ...ggcrv1.Layer) ggcrv1.Image {
 	t.Helper()
@@ -131,6 +166,147 @@ func newTestUnpacker(t *testing.T, opts ...UnpackerOption) (*Cache, *Unpacker) {
 		t.Fatal(err)
 	}
 	return c, u
+}
+
+// TestUnpackVerifiesTheDiffIDOverThePristineStream is the diffID contract: the
+// diffID is sha256 over the RAW decompressed layer bytes, byte for byte, and
+// nothing the applier does to the stream may change what is hashed.
+//
+// The row that matters is the PADDED one, and it is not synthetic. Go's
+// archive/tar reader stops at the end-of-archive marker; GNU tar and the
+// writers buildkit inherits pad every archive to a 10240-byte record. Those
+// trailing zero bytes are part of the layer and part of its diffID, so hashing
+// only what the tar reader consumed rejected a correctly built image whose
+// config claimed exactly the digest `gunzip | shasum` produces. It cost a real
+// registry pull of an 8-layer buildx image, which failed on layer 1.
+//
+// The layer-ROOT entry ("./") rides along on every row for the same reason it
+// appeared in the live report: it is skipped at APPLY, so a hash taken over the
+// applier's filtered view rather than the pristine stream would be wrong in a
+// second, independent way.
+func TestUnpackVerifiesTheDiffIDOverThePristineStream(t *testing.T) {
+	specs := []tarSpec{
+		// The root entry buildkit and docker emit as a layer's first entry.
+		{name: "./", typ: tar.TypeDir, mode: 0o755},
+		{name: "etc", typ: tar.TypeDir, mode: 0o755},
+		{name: "etc/conf", mode: 0o644, data: "hello"},
+		{name: "etc/link", typ: tar.TypeSymlink, link: "conf"},
+	}
+	raw := buildTar(t, specs)
+
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"no trailing bytes (what Go's tar writer emits)", raw},
+		{"padded to a GNU 10240-byte record (what a real builder emits)", gnuPadded(raw)},
+		{"padded by a single unread block", append(append([]byte(nil), raw...), bytes.Repeat([]byte{0}, 512)...)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, u := newTestUnpacker(t)
+			mfst := commitImage(t, c, imageFrom(t, layerFromRaw(t, tc.body)))
+			tree, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy())
+			if err != nil {
+				t.Fatalf("Unpack: %v — the diffID must be taken over the pristine decompressed stream", err)
+			}
+			// The tree is the one the archive describes, so the fix cannot have
+			// bought verification by dropping content.
+			if got, rerr := os.ReadFile(filepath.Join(tree.Rootfs, "etc/conf")); rerr != nil || string(got) != "hello" {
+				t.Errorf("etc/conf = %q (%v), want hello", got, rerr)
+			}
+			if tree.Stats.RootEntries != 1 {
+				t.Errorf("RootEntries = %d, want the one \"./\" entry skipped and counted", tree.Stats.RootEntries)
+			}
+		})
+	}
+
+	// The other direction, which is what keeps the check a CHECK: bytes appended
+	// AFTER a correctly built layer must still be refused, because the diffID
+	// covers the whole stream and the appended bytes are not in it.
+	t.Run("appended content still fails the diffID", func(t *testing.T) {
+		c, u := newTestUnpacker(t)
+		honest := layerFromRaw(t, raw)
+		mfst := commitImage(t, c, imageFrom(t, honest))
+		// A second layer blob whose bytes differ from the diffID the manifest
+		// carries: same tar, extra non-zero trailing content.
+		tampered := layerFromRaw(t, append(append([]byte(nil), raw...), []byte("appended")...))
+		desc, err := tampered.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		size, err := tampered.Size()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.CommitBlob(desc.String(), size, func(w io.Writer) error {
+			rc, oerr := tampered.Compressed()
+			if oerr != nil {
+				return oerr
+			}
+			defer rc.Close()
+			_, cerr := io.Copy(w, rc)
+			return cerr
+		}); err != nil {
+			t.Fatalf("commit tampered layer: %v", err)
+		}
+		// The manifest now points at the tampered BLOB while the config still
+		// claims the honest layer's diffID — a substituted layer, exactly.
+		mfst.Layers[0].Digest = desc.String()
+		mfst.Layers[0].Size = size
+		if _, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy()); !errors.Is(err, ErrDiffIDMismatch) {
+			t.Fatalf("Unpack = %v, want ErrDiffIDMismatch — trailing content is part of the layer", err)
+		}
+	})
+}
+
+// TestPullThenUnpackAPaddedLayer is the end-to-end rung: a layer with a "./"
+// root entry and a real builder's record padding goes through a live registry,
+// the puller and the unpacker, and comes out as a tree.
+//
+// It is deliberately the WHOLE path rather than the unpacker alone. The diffID
+// the check compares against is read out of the config blob the pull committed,
+// so a fixture that hands the unpacker a hand-built manifest proves the check
+// agrees with the test rather than with what a registry actually served.
+func TestPullThenUnpackAPaddedLayer(t *testing.T) {
+	raw := gnuPadded(buildTar(t, []tarSpec{
+		{name: "./", typ: tar.TypeDir, mode: 0o755},
+		{name: "srv", typ: tar.TypeDir, mode: 0o755},
+		{name: "srv/app", mode: 0o755, data: "#!/bin/sh\n"},
+	}))
+	img := imageFrom(t, layerFromRaw(t, raw))
+	host := testRegistry(t)
+	ref := pushImage(t, host, "team/padded", img)
+
+	cache, index, logs := newFixtureStore(t)
+	p := mirrorPuller(t, cache, index, RemoteFetch, nil, nil, logs)
+	res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if err != nil {
+		t.Fatalf("pull a padded layer: %v", err)
+	}
+	wantLayer, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := wantLayer[0].Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Manifest.GetLayers()) != 1 || res.Manifest.GetLayers()[0].GetDigest() != wantDigest.String() {
+		t.Fatalf("recorded layers = %v, want the pushed layer %s", res.Manifest.GetLayers(), wantDigest)
+	}
+
+	u, err := NewUnpacker(cache, WithCloner(ByteCopier{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := u.Unpack(context.Background(), res.Manifest, NativeUnpackPolicy())
+	if err != nil {
+		t.Fatalf("unpack a pulled padded layer: %v", err)
+	}
+	if got, rerr := os.ReadFile(filepath.Join(tree.Rootfs, "srv/app")); rerr != nil || len(got) == 0 {
+		t.Errorf("srv/app = %q (%v), want the layer's content", got, rerr)
+	}
 }
 
 // TestTreeKey pins the tree's identity: it is a function of the CONFIG digest,

@@ -105,8 +105,15 @@ type MirrorSource interface {
 // deliberately NOT delegated to this seam: doing it at the one choke point means
 // a substituted fetcher can change the transport it uses and can never change
 // the repository, tag or digest that is asked for. mirror is the candidate ref
-// was rewritten to; an implementation reads its PlainHTTP transport decision,
-// and must not re-derive the host from it (ref already carries it).
+// was rewritten to; an implementation reads its PlainHTTP transport decision.
+//
+// An implementation must not derive a DIFFERENT repository, tag or digest from
+// mirror — but it should re-derive the AUTHORITY and refuse a reference that
+// does not carry it, which is what the production fetcher does (Mirror.reference).
+// The two are not in tension: the choke point owns which bytes are asked for,
+// while the fetcher owns which host it is willing to dial, and a fetcher that
+// dials a host other than the candidate it was handed is the one failure mode
+// no log line downstream can detect.
 //
 // It takes NO RegistryCredential, deliberately. A credential reaching this path
 // is an imagePullSecret resolved for the pod's own reference, whose registry the
@@ -118,9 +125,11 @@ type MirrorSource interface {
 type MirrorFetchFunc func(ctx context.Context, ref string, mirror Mirror, policy PlatformPolicy) (ggcrv1.Image, error)
 
 // RemoteMirrorFetch fetches ref from a cluster mirror. It is the production
-// MirrorFetchFunc and is RemoteFetch with exactly one difference: the reference
+// MirrorFetchFunc and is RemoteFetch with exactly two differences: the reference
 // is constructed with name.Insecure when the candidate is PlainHTTP (see
-// Mirror.PlainHTTP for why a mesh peer requires it).
+// Mirror.PlainHTTP for why a mesh peer requires it), and its registry authority
+// is re-derived from the candidate and asserted before a byte is dialled (see
+// Mirror.reference).
 //
 // Every other property of the primary path is retained unchanged, because they
 // are the properties that make a mirror safe to consult at all: no implicit
@@ -135,17 +144,59 @@ func RemoteMirrorFetch(ctx context.Context, ref string, mirror Mirror, policy Pl
 	return remoteFetch(ctx, r, ref, nil, policy)
 }
 
-// reference parses ref for this candidate, selecting the transport its
-// PlainHTTP flag asks for. It is the ONE place name.Insecure is applied, so the
-// scheme decision is assertable without a dial (Registry.Scheme()).
+// reference renders ref as the reference to ask THIS candidate for: the registry
+// authority is m.Host, the repository path and the tag-or-digest are ref's byte
+// for byte, and the transport is the one PlainHTTP asks for. It is the ONE place
+// name.Insecure is applied, so the scheme decision is assertable without a dial
+// (Registry.Scheme()).
+//
+// It re-derives the authority rather than trusting the caller to have done it,
+// and it is idempotent: the puller hands it an already-rewritten reference
+// (pullFromMirrors), for which the splice is a no-op. The re-derivation is what
+// makes the EXPORTED RemoteMirrorFetch correct on its own terms — that function
+// takes a bare string from a consumer this package does not control, and a
+// reference that reached the wire still carrying the primary's authority would
+// re-dial the registry that just failed while every log line named a peer.
+//
+// The result is then ASSERTED against the original, and a mismatch is an error
+// rather than a fetch: the authority must be exactly m.Host, and the repository
+// path and identifier must be unchanged. The assertion is not ceremonial — the
+// splice is a string cut at the first "/", so a reference whose first component
+// is NOT a registry ("library/nginx:1", which go-containerregistry reads as a
+// Docker Hub repository) would have its first path element eaten, and the
+// repository check is what turns that into a refusal instead of a request for an
+// image nobody named.
 func (m Mirror) reference(ref string) (name.Reference, error) {
 	var opts []name.Option
 	if m.PlainHTTP {
 		opts = append(opts, name.Insecure)
 	}
-	r, err := name.ParseReference(ref, opts...)
+	orig, err := name.ParseReference(ref, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("parse mirror reference %q: %w", ref, boundErr(err))
+	}
+	rewritten, err := rewriteRegistryHost(ref, m.Host)
+	if err != nil {
+		return nil, err
+	}
+	r, err := name.ParseReference(rewritten, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("parse mirror reference %q: %w", rewritten, boundErr(err))
+	}
+	if got := r.Context().RegistryStr(); got != m.Host {
+		return nil, fmt.Errorf("mirror reference %s resolves to registry %s, want %s",
+			quoteBounded(rewritten, maxReferenceLen), quoteBounded(got, maxMirrorHostLen),
+			quoteBounded(m.Host, maxMirrorHostLen))
+	}
+	if got, want := r.Context().RepositoryStr(), orig.Context().RepositoryStr(); got != want {
+		return nil, fmt.Errorf("mirror reference %s names repository %s, want %s unchanged",
+			quoteBounded(rewritten, maxReferenceLen), quoteBounded(got, maxReferenceLen),
+			quoteBounded(want, maxReferenceLen))
+	}
+	if got, want := r.Identifier(), orig.Identifier(); got != want {
+		return nil, fmt.Errorf("mirror reference %s names %s, want the original %s",
+			quoteBounded(rewritten, maxReferenceLen), quoteBounded(got, maxReferenceLen),
+			quoteBounded(want, maxReferenceLen))
 	}
 	return r, nil
 }
@@ -450,6 +501,7 @@ func (p *Puller) mirrorCandidates(ref string, primaryErr error) []Mirror {
 func (p *Puller) pullFromMirrors(ctx context.Context, ref string, policy PlatformPolicy, want []Platform, mirrors []Mirror, primaryErr error) (*PullResult, error) {
 	log := p.logger()
 	consulted := 0
+	var failures []string
 	for _, m := range mirrors {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -460,17 +512,20 @@ func (p *Puller) pullFromMirrors(ctx context.Context, ref string, policy Platfor
 			// candidate is a control-plane fault, so it is reported at WARN
 			// rather than folded into the per-miss debug stream.
 			log.Warn("skipping an unusable cluster mirror candidate", "ref", ref, "mirror", m.Host, "error", err)
+			failures = append(failures, mirrorFailure(m.Host, err))
 			continue
 		}
 		consulted++
 		img, err := p.mirrorFetch(ctx, mirrorRef, m, policy)
 		if err != nil {
 			log.Debug("cluster mirror does not have the image", "ref", ref, "mirror", m.Host, "error", err)
+			failures = append(failures, mirrorFailure(m.Host, err))
 			continue
 		}
 		res, err := p.ingest(ctx, ref, img, want)
 		if err != nil {
 			log.Debug("cluster mirror served content this node refused", "ref", ref, "mirror", m.Host, "error", err)
+			failures = append(failures, mirrorFailure(m.Host, err))
 			continue
 		}
 		log.Info("pulled from a cluster mirror", "ref", ref, "mirror", m.Host, "mirrorRef", mirrorRef)
@@ -481,9 +536,36 @@ func (p *Puller) pullFromMirrors(ctx context.Context, ref string, policy Platfor
 	// operator's evidence that the fallback ran and found nothing — as distinct
 	// from a node with no peers advertised at all, which returns the primary
 	// error untouched.
+	//
+	// Each peer's OWN failure rides along after the count, and it has to. The
+	// primary failure alone reads as though the fallback re-dialled the primary:
+	// a node whose own registry refused a connection, whose peers then also
+	// refused one, produced "connection refused ... (1 cluster mirror consulted)"
+	// — one message, one host named in it, and no way to tell from the outside
+	// whether the peer was ever contacted. A per-peer "connection refused" and a
+	// per-peer 404 are completely different operator actions.
 	noun := "mirrors"
 	if consulted == 1 {
 		noun = "mirror"
 	}
-	return nil, fmt.Errorf("%w (%d cluster %s consulted)", primaryErr, consulted, noun)
+	if len(failures) == 0 {
+		return nil, fmt.Errorf("%w (%d cluster %s consulted)", primaryErr, consulted, noun)
+	}
+	return nil, fmt.Errorf("%w (%d cluster %s consulted; %s)", primaryErr, consulted, noun, strings.Join(failures, "; "))
+}
+
+// mirrorFailure renders one peer's failure for the joined error: the candidate
+// host and the FIRST line of its error.
+//
+// Only the first line, and bounded, for the reason every foreign string in this
+// package is bounded: a peer's error carries a registry diagnostic body this
+// node did not author, the joined message reaches slog, a Pod status message and
+// kine, and a multi-line registry error repeated per peer would push the primary
+// cause — the part a reader needs first — off the top of the status.
+func mirrorFailure(host string, err error) string {
+	msg := err.Error()
+	if i := strings.IndexAny(msg, "\r\n"); i >= 0 {
+		msg = msg[:i]
+	}
+	return fmt.Sprintf("%s: %s", quoteBounded(host, maxMirrorHostLen), quoteBounded(msg, maxWrappedErrLen))
 }

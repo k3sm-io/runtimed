@@ -84,8 +84,9 @@ limitations under the License.
 //     dialect (linuxlayer.go) files under <root>/snapshots keyed by the OCI
 //     CHAIN ID: OCI whiteouts are interpreted, absolute symlinks are admitted
 //     (the guest chroots into the tree), the tar's true uid/gid/mode goes to an
-//     ownership sidecar the guest re-applies, and two paths a case-insensitive
-//     volume would merge are refused fail-closed.
+//     ownership sidecar the guest re-applies, and two paths the destination
+//     volume would merge into one file — measured by probing that volume, not
+//     assumed — are refused fail-closed.
 //
 //   - MergeRunSpec: merge the image config's Entrypoint/Cmd/Env/WorkingDir/User
 //     with a container's pod spec per the k8s four-quadrant table, with $(VAR)

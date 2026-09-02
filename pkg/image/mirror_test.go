@@ -714,6 +714,204 @@ func TestMirrorReferenceSelectsItsScheme(t *testing.T) {
 	}
 }
 
+// TestMirrorReferenceSubstitutesTheAuthority pins the property the whole
+// fallback rests on, at the seam that actually reaches the wire: the reference
+// RemoteMirrorFetch dials names the CANDIDATE's registry and the ORIGINAL's
+// repository and identifier.
+//
+// It is asserted on the ORIGINAL reference as input, not on an already-rewritten
+// one, because RemoteMirrorFetch is exported and takes a bare string from a
+// consumer this package does not control. A fetcher that forwarded whatever it
+// was handed would re-dial the primary registry that had just failed, while the
+// INFO line and the mirror count both named a peer — a failure invisible from
+// every log this node writes.
+func TestMirrorReferenceSubstitutesTheAuthority(t *testing.T) {
+	const digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	peer := Mirror{Host: "100.64.1.1:6450", PlainHTTP: true}
+
+	t.Run("the authority moves and nothing else does", func(t *testing.T) {
+		for _, tc := range []struct {
+			name              string
+			ref               string
+			wantRepo, wantIdt string
+		}{
+			{"a tagged reference", "localhost:6450/team/app:v1", "team/app", "v1"},
+			{"a nested repository", "localhost:6450/team/sub/app:v2", "team/sub/app", "v2"},
+			{"a digest reference", "localhost:6450/app@" + digest, "app", digest},
+			{"an already-rewritten reference is idempotent", "100.64.1.1:6450/team/app:v1", "team/app", "v1"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				r, err := peer.reference(tc.ref)
+				if err != nil {
+					t.Fatalf("reference(%q): %v", tc.ref, err)
+				}
+				if got := r.Context().RegistryStr(); got != peer.Host {
+					t.Errorf("registry = %q, want the CANDIDATE %q — a mirror fetch that keeps the primary authority re-dials the registry that just failed",
+						got, peer.Host)
+				}
+				if got := r.Context().RepositoryStr(); got != tc.wantRepo {
+					t.Errorf("repository = %q, want %q unchanged", got, tc.wantRepo)
+				}
+				if got := r.Identifier(); got != tc.wantIdt {
+					t.Errorf("identifier = %q, want %q unchanged", got, tc.wantIdt)
+				}
+			})
+		}
+	})
+
+	t.Run("a reference the splice would damage is refused, never fetched", func(t *testing.T) {
+		for _, tc := range []struct{ name, ref string }{
+			// ggcr reads "library" as a REPOSITORY element, not a registry, so a
+			// splice at the first "/" would eat it and ask the peer for "nginx".
+			{"a Docker Hub repository whose first element is not a registry", "library/nginx:1"},
+			{"a reference naming no registry at all", "app:v1"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if r, err := peer.reference(tc.ref); err == nil {
+					t.Errorf("reference(%q) = %q, want a refusal — a mis-spliced reference must never reach the wire",
+						tc.ref, r.String())
+				}
+			})
+		}
+	})
+}
+
+// TestRemoteMirrorFetchDialsThePeer is the end-to-end proof, over real HTTP,
+// that the mirror path fetches from the PEER's port.
+//
+// Every other test in this file drives a fetcher seam, so all of them would pass
+// against an implementation that forwarded the primary's authority. Here the
+// image exists ONLY on the mirror registry and the primary is a live registry
+// that does not have it: a fetch that dialled the primary gets a 404, and the
+// digest assertion ties the bytes that arrived to the ones pushed to the mirror.
+func TestRemoteMirrorFetchDialsThePeer(t *testing.T) {
+	primary := testRegistry(t)
+	peer := testRegistry(t)
+	img := nativeImage(t)
+
+	// Pushed to the PEER only. The reference the pod would use names the primary.
+	pushImage(t, peer, "team/app", img)
+	ref := primary + "/team/app:v1"
+
+	// The premise: the primary really does not have it.
+	if _, err := RemoteFetch(context.Background(), ref, nil, nativePolicy()); err == nil {
+		t.Fatal("the primary registry served the image; the fixture proves nothing")
+	}
+
+	got, err := RemoteMirrorFetch(context.Background(), ref, Mirror{Host: peer, PlainHTTP: true}, nativePolicy())
+	if err != nil {
+		t.Fatalf("RemoteMirrorFetch: %v", err)
+	}
+	wantDigest, err := img.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotDigest, err := got.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDigest != wantDigest {
+		t.Errorf("fetched manifest digest = %s, want %s — the bytes did not come from the peer", gotDigest, wantDigest)
+	}
+}
+
+// TestPullFallsBackOverRealHTTP drives the whole fallback with both registries
+// live: the pod's reference names this node's own (empty) ingest registry, the
+// peer holds the image, and the pull must succeed AND record the original
+// reference.
+func TestPullFallsBackOverRealHTTP(t *testing.T) {
+	primary := testRegistry(t)
+	peer := testRegistry(t)
+	img := nativeImage(t)
+	pushImage(t, peer, "team/app", img)
+	ref := primary + "/team/app:v1"
+
+	cache, index, logs := newFixtureStore(t)
+	src := &fixedMirrors{list: []Mirror{{Host: peer, PlainHTTP: true}}}
+	p := mirrorPuller(t, cache, index, RemoteFetch, src, RemoteMirrorFetch, logs)
+
+	res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if err != nil {
+		t.Fatalf("pull through a live cluster mirror: %v", err)
+	}
+	// The mirror is TRANSPORT, not identity: the pod asked for the node-relative
+	// reference and that is what must be recorded.
+	if res.Manifest.GetReference() != ref {
+		t.Errorf("manifest reference = %q, want the original %q", res.Manifest.GetReference(), ref)
+	}
+	if _, ok := index.refs[ref]; !ok {
+		t.Errorf("index recorded %v, want an entry under the original reference %q", keysOf(index.refs), ref)
+	}
+	for recorded := range index.refs {
+		if strings.Contains(recorded, peer) {
+			t.Errorf("index recorded the PEER reference %q; the peer must never become the image's identity", recorded)
+		}
+	}
+	if !cache.Has(res.Manifest.GetConfig().GetDigest()) {
+		t.Error("config blob from the live mirror pull is not in the store")
+	}
+	for _, l := range res.Manifest.GetLayers() {
+		if !cache.Has(l.GetDigest()) {
+			t.Errorf("layer blob %s from the live mirror pull is not in the store", l.GetDigest())
+		}
+	}
+}
+
+// TestMirrorFailuresReachTheError pins the triage property: when every peer
+// fails, each peer's OWN failure is in the returned error beside the primary's.
+//
+// Without it a node whose registry refused a connection, and whose peers then
+// also refused one, produced a single "connection refused ... (1 cluster mirror
+// consulted)" naming only the primary host — which reads as though the fallback
+// had re-dialled the primary. That is not a cosmetic loss: a peer answering 404
+// and a peer that cannot be reached are different operator actions, and neither
+// was distinguishable from the outside.
+func TestMirrorFailuresReachTheError(t *testing.T) {
+	cache, index, logs := newFixtureStore(t)
+	primaryErr := registryStatus(http.StatusNotFound)
+	src := &fixedMirrors{list: []Mirror{
+		{Host: "100.64.1.1:6450", PlainHTTP: true},
+		{Host: "100.64.1.2:6450", PlainHTTP: true},
+	}}
+	mf := newMirrorFetcher()
+
+	p := mirrorPuller(t, cache, index, (&stubFetch{err: primaryErr}).fetch, src, mf.fetch, logs)
+	_, err := p.Pull(context.Background(), localRef, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if err == nil {
+		t.Fatal("pull succeeded with no peer holding the image")
+	}
+	if !errors.Is(err, primaryErr) {
+		t.Errorf("pull error = %v; the PRIMARY error must stay the cause", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "2 cluster mirrors consulted") {
+		t.Errorf("pull error %q no longer names how many peers were consulted", msg)
+	}
+	for _, host := range []string{"100.64.1.1:6450", "100.64.1.2:6450"} {
+		if !strings.Contains(msg, host) {
+			t.Errorf("pull error %q does not name peer %s or its failure", msg, host)
+		}
+	}
+	// An unusable candidate never reaches a peer, so it is not counted as
+	// consulted — but its reason still has to be in the error, or a
+	// misconfigured candidate is invisible to everything but a debug log.
+	t.Run("an unusable candidate is named too", func(t *testing.T) {
+		cache, index, logs := newFixtureStore(t)
+		src := &fixedMirrors{list: []Mirror{{Host: "attacker.example/evil", PlainHTTP: true}}}
+		p := mirrorPuller(t, cache, index, (&stubFetch{err: primaryErr}).fetch, src, newMirrorFetcher().fetch, logs)
+		_, err := p.Pull(context.Background(), localRef, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+		if err == nil {
+			t.Fatal("pull succeeded with only an unusable candidate")
+		}
+		if !strings.Contains(err.Error(), "attacker.example/evil") {
+			t.Errorf("pull error %q does not name the unusable candidate", err)
+		}
+		if !strings.Contains(err.Error(), "0 cluster mirrors consulted") {
+			t.Errorf("pull error %q counted an unusable candidate as consulted", err)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers.
 // ---------------------------------------------------------------------------

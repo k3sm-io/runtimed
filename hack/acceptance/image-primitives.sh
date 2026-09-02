@@ -50,6 +50,7 @@ SELF="$HERE/image-primitives.sh"
 SERVICE="$REPO_ROOT/pkg/runtime/images.go"
 INDEX="$REPO_ROOT/pkg/image/index.go"
 EXPORT="$REPO_ROOT/pkg/image/export.go"
+UNPACK="$REPO_ROOT/pkg/image/unpack.go"
 OPROOTS="$REPO_ROOT/pkg/image/operatorroots.go"
 ROOTS="$REPO_ROOT/pkg/image/roots.go"
 VERBS_TEST="$REPO_ROOT/pkg/runtime/imageverbs_test.go"
@@ -221,6 +222,37 @@ if [ "$mrc" != 0 ]; then
 else
 	tail -20 "$SCRATCH/mutant.log"
 	ladder no "ip.22  mutant: a re-encoded manifest turns the load->save->load round trip RED (rc $mrc)"
+fi
+
+# ---- ip.24 — the diffID, and ip.25: hashing a FILTERED stream must go RED ---
+# The diffID is sha256 over the RAW decompressed layer bytes. A layer padded to a
+# GNU 10240-byte record — what a real builder emits — carries bytes the tar
+# reader never asks for, and hashing only what the applier consumed rejected a
+# correctly built buildx image whose config claimed exactly the digest
+# `gunzip | shasum -a 256` produces.
+run_test "ip.24" 4 ./pkg/image/   TestUnpackVerifiesTheDiffIDOverThePristineStream
+run_test "ip.25" 0 ./pkg/image/   TestPullThenUnpackAPaddedLayer
+
+mutant_unpack="$SCRATCH/unpack.go.orig"
+cp "$UNPACK" "$mutant_unpack"
+python3 - "$UNPACK" <<'MUTPY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "if _, err := io.Copy(io.Discard, plainTee); err != nil {"
+new = "if _, err := io.Copy(io.Discard, plain); err != nil {"
+if s.count(old) != 1:
+    sys.exit("mutation anchor not found exactly once")
+open(p, "w").write(s.replace(old, new))
+MUTPY
+mrc=0
+(cd "$REPO_ROOT" && "${GOENV[@]}" go test -count=1 -run '^(TestUnpackVerifiesTheDiffIDOverThePristineStream|TestPullThenUnpackAPaddedLayer)$' ./pkg/image/ >"$SCRATCH/mutant-diffid.log" 2>&1) || mrc=$?
+cp "$mutant_unpack" "$UNPACK"
+if [ "$mrc" != 0 ]; then
+	ladder ok "ip.26  mutant: draining past the diffID hasher turns the padded-layer legs RED"
+else
+	tail -20 "$SCRATCH/mutant-diffid.log"
+	ladder no "ip.26  mutant: draining past the diffID hasher turns the padded-layer legs RED (rc $mrc)"
 fi
 
 # ---- ip.23 — the Apache header on every file this unit adds ----------------

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -203,8 +204,10 @@ type ApplyStats struct {
 //     ordinary files, no ownership is recorded, an absolute symlink is refused.
 //   - SemanticsLinux — OCI whiteouts are interpreted, absolute symlinks are
 //     admitted (the guest chroots), the tar's true ownership is recorded for the
-//     ownership sidecar, and two paths that a case-insensitive volume would
-//     merge are refused (ErrPathCollision).
+//     ownership sidecar, and two paths the DESTINATION would merge into one file
+//     are refused (ErrPathCollision) — where "would merge" is measured against
+//     the destination directory at construction, not assumed (see
+//     probeDestCaseSensitive).
 //
 // It still does not preserve mtimes under either dialect, and it applies no
 // extended attribute under either: the Linux dialect RECORDS the allowlisted
@@ -222,7 +225,17 @@ type LayerApplier struct {
 	// validated policy, so it cannot disagree with the key the tree commits
 	// under.
 	linux bool
-	// nodes is the LINUX dialect's tree model, keyed by foldKey(path) so it
+	// destCaseSensitive is what the DESTINATION directory measured as at
+	// construction: true when it holds two entries whose names differ only in
+	// case, false when it merges them into one file.
+	//
+	// It is resolved once per tree, from a probe of the applier's own root, and
+	// it FAILS CLOSED — an unmeasurable destination reads as case-insensitive,
+	// which is the verdict that keeps the collision refusal in force. It is
+	// meaningless (and unread) under the native dialect, which detects no
+	// collision at all.
+	destCaseSensitive bool
+	// nodes is the LINUX dialect's tree model, keyed by treeKey(path) so it
 	// answers the collision question and the ownership question with one map:
 	// a lookup that hits with a DIFFERENT Path is a case/normalization
 	// collision, and the values in path order ARE the ownership sidecar.
@@ -267,6 +280,19 @@ func NewLayerApplier(root *os.Root, policy UnpackPolicy, limits ApplyLimits) (*L
 	a := &LayerApplier{root: root, policy: policy, limits: lim, linux: policy.Semantics == SemanticsLinux}
 	if a.linux {
 		a.nodes = make(map[string]*treeNode)
+		// The destination is measured ONCE, here, while the tree is still empty
+		// — so the probe's own entries cannot collide with a layer's, and every
+		// entry the tree will ever hold is judged against one verdict. A probe
+		// error is not fatal: it degrades to the case-insensitive reading, which
+		// is exactly the behaviour this check had before it could measure
+		// anything.
+		sensitive, perr := probeDestCaseSensitive(root)
+		if perr != nil {
+			sensitive = false
+		}
+		a.destCaseSensitive = sensitive
+		slog.Debug("image: probed the layer tree destination for case sensitivity",
+			"case_sensitive", sensitive, "err", perr)
 	}
 	return a, nil
 }
@@ -479,14 +505,23 @@ func (a *LayerApplier) noteAncestors(name string) error {
 	return nil
 }
 
-// put inserts or updates one node, refusing a case/normalization collision.
+// treeKey renders name in the form the DESTINATION directory compares by, which
+// is what makes the tree model's single map answer "would these two entries land
+// on one file?" for the filesystem the tree is actually being built on rather
+// than for an assumed one.
+func (a *LayerApplier) treeKey(name string) string {
+	return foldKeyFor(name, a.destCaseSensitive)
+}
+
+// put inserts or updates one node, refusing a collision — two distinct Linux
+// paths that this destination would merge into one file.
 //
 // explicit distinguishes a node the archive NAMED from an implicit parent: an
 // explicit entry overwrites whatever ownership an implicit one guessed (and
 // whatever an earlier layer recorded, which is "later layer wins"), while an
 // implicit parent never overwrites a recorded one.
 func (a *LayerApplier) put(name string, own OwnershipEntry, explicit bool) error {
-	key := foldKey(name)
+	key := a.treeKey(name)
 	if prev, ok := a.nodes[key]; ok {
 		if prev.path != name {
 			return fmt.Errorf("%w: %s and %s are distinct Linux paths that resolve to one file",
@@ -516,7 +551,7 @@ func (a *LayerApplier) forget(name string, dir bool) {
 	if !a.linux {
 		return
 	}
-	delete(a.nodes, foldKey(name))
+	delete(a.nodes, a.treeKey(name))
 	delete(a.layerPaths, name)
 	if dir {
 		a.forgetChildren(name)
