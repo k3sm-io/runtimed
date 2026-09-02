@@ -59,6 +59,26 @@ func TestImagesServedOnTheRuntimeListener(t *testing.T) {
 		}
 	}
 
+	// (a2) And the Images service carries its WHOLE surface. A method missing
+	// from the registration is indistinguishable, to a client, from a daemon that
+	// predates the service — it answers UNIMPLEMENTED, which images.proto's skew
+	// note tells clients to read as "this daemon has no image service". So the
+	// method set is asserted by name rather than inferred from the type
+	// satisfying the generated interface (which the embedded
+	// UnimplementedImagesServer makes true for free).
+	methods := map[string]bool{}
+	for _, m := range info["k3sm.runtime.v1.Images"].Methods {
+		methods[m.Name] = true
+	}
+	for _, want := range []string{
+		"ListImages", "ImageFsInfo", "RemoveImage", "PruneImages", "LoadImage",
+		"PullImage", "TagImage", "UntagImage", "InspectImage", "SaveImage",
+	} {
+		if !methods[want] {
+			t.Errorf("Images.%s is not on the served surface (registered: %v)", want, methods)
+		}
+	}
+
 	// (b) And both answer over one connection to one listener — the property that
 	// would still be false if a second grpc.Server had been stood up elsewhere.
 	lis := bufconn.Listen(1 << 20)
@@ -98,7 +118,14 @@ func keysOf(m map[string]grpc.ServiceInfo) []string {
 // client plus the Runtime whose store it serves.
 func imagesTestClient(t *testing.T) (runtimev1.ImagesClient, *Runtime) {
 	t.Helper()
-	rt := newTestRuntime(t, Deps{})
+	return imagesTestClientDeps(t, Deps{})
+}
+
+// imagesTestClientDeps is imagesTestClient over caller-supplied deps, for the
+// rows that need to control a subsystem seam (the puller, for PullImage).
+func imagesTestClientDeps(t *testing.T, d Deps) (runtimev1.ImagesClient, *Runtime) {
+	t.Helper()
+	rt := newTestRuntime(t, d)
 	srv := NewServer(rt)
 	lis := bufconn.Listen(1 << 20)
 	_, cancel, errc := serveTestServer(t, srv, lis)
