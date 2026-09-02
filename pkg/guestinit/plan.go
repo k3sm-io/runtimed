@@ -289,6 +289,7 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 	dev := ContainerDev(c.GetName(), podMounts)
 	mounts := rootfs
 	mounts = append(mounts, dev.Mounts...)
+	mounts = append(mounts, ContainerKernelFS(c.GetName(), podMounts)...)
 	mounts = append(mounts, containerVisibleMounts(c.GetName(), podMounts)...)
 	mounts = append(mounts, EtcBinds(c.GetName())...)
 	return ContainerPlan{

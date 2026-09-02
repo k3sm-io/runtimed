@@ -634,6 +634,77 @@ func RootfsMounts(name, rootfsTag string, upperSizeBytes int64) ([]MountStep, er
 	}, nil
 }
 
+// ContainerKernelFS plans the kernel filesystems a container needs beyond its
+// rootfs and its /dev: a fresh procfs at /proc and a writable cgroup2 hierarchy
+// at /sys/fs/cgroup.
+//
+// # Why every container needs these
+//
+// A container's rootfs comes out of an OCI image, and the chroot cuts it off
+// from the guest's own /proc and /sys/fs/cgroup — so before this existed a vm
+// container had NEITHER. That is not cosmetic: a runc-based build worker
+// (buildkitd's default) reads /proc/self and mounts its own /proc inside each
+// container it runs, and its cgroup manager writes the cgroup2 hierarchy to
+// create per-build sub-cgroups; both fail outright against an empty chroot. The
+// same is true of any workload that reads /proc/self/status or /proc/meminfo.
+//
+// # A FRESH proc, never the host's
+//
+// The mount is a fresh procfs instance, not a bind of the guest's /proc. There
+// is no pid namespace here (containers are chroot-only — see the package doc's
+// ceilings), so the instance still shows GUEST-WIDE pids: /proc/self and
+// /proc/<pid> resolve, but a container sees every process in the guest. That is
+// the honest state and it does NOT block buildkit's runc, which reads
+// /proc/self and mounts its own private /proc inside the container it builds.
+//
+// # cgroup2 attaches WITHOUT a sysfs parent
+//
+// cgroup2 is an independent filesystem type; it does not need a sysfs mounted at
+// /sys first. Only the mountpoint directory has to exist, which MkdirTarget
+// creates (os.MkdirAll makes <root>/sys and <root>/sys/fs on the way). So no
+// sysfs is mounted by default and the container's /sys is otherwise empty —
+// matching the minimal-surface posture the rest of this plan keeps. Without a
+// cgroup namespace the mount is a view of the guest-wide unified hierarchy, so
+// it is a metering/build aid, not an isolation boundary; a container that can
+// write cgroup.procs there could re-parent itself, exactly the chroot-only
+// ceiling the package doc already records. A pod that needs a full /sys mounts
+// its own sysfs (the guest root can) — the same escape hatch loop devices take.
+//
+// # Yielding to the pod
+//
+// Like ContainerDev, a pod-declared mount that covers /proc or /sys/fs/cgroup
+// wins: the covered step is OMITTED here so the pod's mount is the only one at
+// that path rather than a second mount stacked over a shadowed one. The pod's
+// mount is then re-exposed inside the container by containerVisibleMounts.
+func ContainerKernelFS(name string, podMounts []MountStep) []MountStep {
+	root := ContainerRootDir(name)
+	hardened := []MountOption{OptionNoSuid, OptionNoDev, OptionNoExec}
+	var out []MountStep
+
+	if !shadowedByPodMount(podMounts, "/proc") {
+		out = append(out, MountStep{
+			Source: "proc", Target: path.Join(root, "proc"), FSType: "proc",
+			Options:     hardened,
+			MkdirTarget: true,
+			ResolveRoot: root,
+			Why:         "a fresh procfs: /proc/self and /proc/meminfo the container and its runc worker read",
+		})
+	}
+
+	if !shadowedByPodMount(podMounts, "/sys/fs/cgroup") {
+		out = append(out, MountStep{
+			Source: "cgroup2", Target: path.Join(root, "sys/fs/cgroup"), FSType: "cgroup2",
+			Options:     append(append([]MountOption{}, hardened...), OptionNoAtime),
+			Data:        "nsdelegate",
+			MkdirTarget: true,
+			ResolveRoot: root,
+			Why:         "a writable cgroup2 hierarchy: buildkitd's runc worker creates per-build sub-cgroups here",
+		})
+	}
+
+	return out
+}
+
 // containerVisibleMounts rebases the pod-level mounts that fall inside a
 // container's rootfs so they are visible after the chroot, as recursive binds
 // from the pod-level mount onto the container's path.
