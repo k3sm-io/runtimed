@@ -222,18 +222,27 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 		hub := guestagent.NewAttachHub()
 		sink := &fullstackStdin{typed: make(chan []byte, 4)}
 		_ = capture.Writer("app", guestagent.StreamStdout)
+		_ = capture.Raw("app")
 		hub.Register("app", guestagent.AttachEndpoints{Stdin: sink})
 
-		w := capture.Writer("app", guestagent.StreamStdout)
-		if _, err := w.Write([]byte("already-buffered\n")); err != nil {
-			t.Fatalf("write: %v", err)
+		// write is the guest's output pump: one read tee'd into the LINE ring
+		// that `kubectl logs` reads and the BYTE ring that attach streams from,
+		// exactly as cmd/k3sm-guest-init's consoleTee does.
+		write := func(b string) {
+			t.Helper()
+			if _, err := capture.Writer("app", guestagent.StreamStdout).Write([]byte(b)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			capture.Raw("app").Append(guestagent.StreamStdout, []byte(b))
 		}
+		write("already-buffered\n")
 
 		dial := startRealGuestAgent(t, podID, guestagent.Deps{
-			Runner: stubRunner{names: []string{"app"}},
-			Logs:   capture,
-			Events: events,
-			Attach: hub,
+			Runner:    stubRunner{names: []string{"app"}},
+			Logs:      capture,
+			RawOutput: capture,
+			Events:    events,
+			Attach:    hub,
 		})
 		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
 		p := addVMPod(t, rt, podID, "app")
@@ -254,12 +263,13 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 		if got := string(st.recv(t, 5*time.Second).GetStdout()); got != "already-buffered\n" {
 			t.Errorf("first frame = %q, want the replayed buffer", got)
 		}
-		// ...the stream then follows live output...
-		if _, err := w.Write([]byte("live\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		if got := string(st.recv(t, 5*time.Second).GetStdout()); got != "live\n" {
-			t.Errorf("second frame = %q, want the live line", got)
+		// ...the stream then follows live output, byte-granular: the second
+		// write has NO newline, which is what a prompt and a pty's keystroke
+		// echo look like, and it must arrive anyway.
+		write("prompt$ ")
+		if got := string(st.recv(t, 5*time.Second).GetStdout()); got != "prompt$ " {
+			t.Errorf("second frame = %q, want the newline-less write %q — an attached "+
+				"terminal cannot wait for a delimiter its session never sends", got, "prompt$ ")
 		}
 		// ...and the client's keystrokes reach the container's retained stdin
 		// through both input pumps.
@@ -301,13 +311,15 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 		// actionable rather than mysterious.
 		capture := guestagent.NewCapture(0, 0, 0)
 		_ = capture.Writer("app", guestagent.StreamStdout)
+		_ = capture.Raw("app")
 		hub := guestagent.NewAttachHub()
 		hub.Register("app", guestagent.AttachEndpoints{})
 
 		dial := startRealGuestAgent(t, podID, guestagent.Deps{
-			Runner: stubRunner{names: []string{"app"}},
-			Logs:   capture,
-			Attach: hub,
+			Runner:    stubRunner{names: []string{"app"}},
+			Logs:      capture,
+			RawOutput: capture,
+			Attach:    hub,
 		})
 		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
 		p := addVMPod(t, rt, podID, "app")

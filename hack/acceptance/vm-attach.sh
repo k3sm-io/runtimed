@@ -31,10 +31,20 @@
 #   in arrival order. The agent arbitrates nothing, because the alternative is
 #   dropping a client's keystrokes.
 #
-#   SUBSCRIBE-THEN-SNAPSHOT. Output subscribes to the live stream FIRST and only
-#   then replays the retained buffer, so nothing written while the attach was
-#   being set up is lost. The reversed order loses exactly that entry, which is
-#   why the gate pins the counterfactual too.
+#   BYTE GRANULARITY. Attach streams from a bounded RAW buffer, not from the
+#   line ring `kubectl logs` reads. A line source holds every newline-less
+#   write — a shell prompt, a password query, and every keystroke a pty echoes
+#   back — until a delimiter arrives that an interactive session may never send,
+#   so a full-screen TUI attached to it looks wedged exactly when the user is
+#   typing. The container's output pump tees each read into both rings; logs is
+#   unchanged, and the gate asserts that contrast on ONE write.
+#
+#   SUBSCRIBE-THEN-SNAPSHOT. The raw ring snapshots and registers a subscriber
+#   in ONE critical section, so a chunk is never lost AND never duplicated —
+#   stricter than the line ring's two-step, because a duplicated log line is
+#   harmless while a duplicated escape sequence is a corrupted screen. The gate
+#   pins the counterfactual too: doing the two steps separately drops the chunk
+#   that lands between them.
 #
 #   CAPABILITY NEGOTIATION. Compat is lockstep via the in-code initramfs sha256
 #   pin, so the only reachable way to pair this daemon with an older guest is the
@@ -59,6 +69,8 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 AGENT_DIR="$REPO_ROOT/pkg/guestagent"
 RUNTIME_DIR="$REPO_ROOT/pkg/runtime"
 HUB="$AGENT_DIR/attachhub.go"
+BYTERING="$AGENT_DIR/bytering.go"
+CAPTURE="$AGENT_DIR/capture.go"
 SERVER="$AGENT_DIR/server.go"
 VERSION="$AGENT_DIR/version.go"
 GUEST="$RUNTIME_DIR/guest.go"
@@ -81,10 +93,10 @@ echo "==> runtimed vm-attach acceptance (container tty + retained stdio + kubect
 # ---- va.0 — the gate parses and every source under test exists -------------
 b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
-for f in "$HUB" "$SERVER" "$VERSION" "$GUEST" "$EXEC" "$LEASE" "$MAIN"; do
+for f in "$HUB" "$BYTERING" "$CAPTURE" "$SERVER" "$VERSION" "$GUEST" "$EXEC" "$LEASE" "$MAIN"; do
 	[ -f "$f" ] || { echo "missing: $f" >&2; b0=no; }
 done
-ladder "$b0" "va.0  gate parses (bash -n) + attachhub/server/version and their consumers present"
+ladder "$b0" "va.0  gate parses (bash -n) + attachhub/bytering/capture/server/version and their consumers present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "vm-attach: the gate or a source under test is missing/unparseable — nothing else can run" >&2
@@ -144,9 +156,34 @@ ladder "$spawn" "va.4  spawn allocates the container's pty from its OWN devpts, 
 onepump=ok
 ttypumps="$( { grep -cE 'go pumpOutput\(c\.master' "$MAIN" || true; } | tr -d ' ')"
 [ "$ttypumps" = 1 ] || onepump=no
-grep -qE 'go pumpOutput\(c\.master, guestinit\.TTYReader\(c\.master\),\s*$' "$MAIN" || onepump=no
-grep -qE 'capture\.Writer\(container, guestagent\.StreamStdout\), os\.Stdout\)' "$MAIN" || onepump=no
+grep -qE 'go pumpOutput\(c\.master, guestinit\.TTYReader\(c\.master\),$' "$MAIN" || onepump=no
+grep -qE 'capture\.Writer\(container, guestagent\.StreamStdout\),$' "$MAIN" || onepump=no
+grep -qE 'raw, guestagent\.StreamStdout, os\.Stdout\)' "$MAIN" || onepump=no
 ladder "$onepump" "va.5  a tty container gets exactly ONE output pump ($ttypumps) and it frames the merged stream as stdout"
+
+# ---- va.5b — the pump TEES into both rings, and attach reads the byte one --
+# The defect this rung exists for: `kubectl attach` served from the LINE ring
+# holds every newline-less write — a shell prompt, a password query, and every
+# keystroke a pty echoes back — until a delimiter that an interactive session
+# may never send. A full-screen TUI attached to that source looks wedged exactly
+# when the user is typing. So the pump tees each read into BOTH rings and the
+# handler reads the byte one, while `kubectl logs` keeps the line one.
+tee=ok
+grep -qE '^\traw := capture\.Raw\(container\)$' "$MAIN" || tee=no
+grep -qE '^\t\tt\.raw\.Append\(t\.kind, p\)$' "$MAIN" || tee=no
+grep -qE 'raw     \*guestagent\.ByteRing' "$MAIN" || tee=no
+# the handler's output half is the RAW seam, and the line seam is nowhere in it
+grep -qE 's\.deps\.RawOutput\.RawStream\(container\)' "$SERVER" || tee=no
+attachlogs="$(awk '/^func \(s \*Server\) Attach\(/,/^}$/' "$SERVER" | { grep -c 'deps\.Logs' || true; } | tr -d ' ')"
+[ "$attachlogs" = 0 ] || tee=no
+# ...and Logs still is the line seam
+logsline="$(awk '/^func \(s \*Server\) Logs\(/,/^}$/' "$SERVER" | { grep -c 'deps\.Logs\.Stream' || true; } | tr -d ' ')"
+[ "$logsline" = 1 ] || tee=no
+# the caps are named constants with a doc comment, not magic numbers
+grep -qE '^\tDefaultByteRingBytes  = 64 << 10$' "$BYTERING" || tee=no
+grep -qE '^\tDefaultByteRingChunks = 4096$' "$BYTERING" || tee=no
+grep -qE '^// DefaultByteRingBytes and DefaultByteRingChunks bound' "$BYTERING" || tee=no
+ladder "$tee" "va.5b the pump tees into both rings; Attach reads RawOutput (deps.Logs sites in it: $attachlogs) and Logs still reads the line ring ($logsline)"
 
 # ---- va.6 — DETACH IS NOT KILL, structurally ------------------------------
 # The property no unit test can prove by absence alone: the ONLY caller of
@@ -173,8 +210,10 @@ fi
 # and it is inside the reaper's exit callback, next to the capture close
 grep -qE '^\t\t\tcapture\.Close\(ev\.Container\)$' "$MAIN" || release=no
 grep -qE '^\t\t\tattachHub\.Release\(ev\.Container\)$' "$MAIN" || release=no
-# the attach handler's teardown is the unsubscribe and nothing else
-grep -qE '^\tdefer unsubscribe\(\)$' "$SERVER" || release=no
+# the attach handler's teardown is its own unsubscribe and nothing else:
+# ByteSubscription.Close ends THIS client's subscription, never the ring and
+# never the container's endpoints.
+grep -qE '^\tdefer sub\.Close\(\)$' "$SERVER" || release=no
 if [ "$release" != ok ]; then printf '%s\n' "$releasers"; fi
 ladder "$release" "va.6  AttachHub.Release has exactly ONE shipped caller ($relcount), the reaper's exit callback; attach teardown is the unsubscribe alone"
 
@@ -259,6 +298,12 @@ run_test "va.9"  6 pkg/guestagent TestAttachHubRetainsAndReleasesEndpoints
 run_test "va.10" 3 pkg/guestagent TestAttachOutputSubscribesBeforeSnapshot
 run_test "va.11" 9 pkg/guestagent TestAttachServesTheGuestContract
 run_test "va.12" 2 pkg/guestagent TestAgentAdvertisesItsCapabilities
+# The defect gate. Its first subtest is the CONTRAST — one newline-less write,
+# tee'd into both rings, reaching an attach subscriber while the line ring is
+# still holding it — and its third asserts `kubectl logs --tail` still counts
+# LINES, so the fix cannot have been "make logs byte-granular too".
+run_test "va.12a" 3 pkg/guestagent TestAttachSourceIsByteGranular
+run_test "va.12b" 9 pkg/guestagent TestByteRingBoundsAndOrdering
 run_test "va.13" 6 pkg/runtime    TestVMPodAttachRoutesToGuestAgent
 run_test "va.14" 6 pkg/runtime    TestGuestCapabilityNegotiation
 # The two halves joined: the daemon's attachGuest against the SHIPPED agent over
