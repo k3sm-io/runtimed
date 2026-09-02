@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -98,13 +99,26 @@ type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, p
 //   - the resolved image's own config is verified last, so a mislabelled index
 //     entry cannot smuggle a foreign-platform image through.
 func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
-	want, err := Candidates(policy)
-	if err != nil {
-		return nil, fmt.Errorf("pull %q: %w", ref, err)
-	}
 	r, err := name.ParseReference(ref)
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w", ref, boundErr(err))
+	}
+	return remoteFetch(ctx, r, ref, cred, policy)
+}
+
+// remoteFetch is the registry round trip shared by RemoteFetch and
+// RemoteMirrorFetch. r is the ALREADY-PARSED reference — which is the whole of
+// the difference between the two callers, since a cluster mirror parses with
+// name.Insecure (see Mirror.PlainHTTP) — and ref is the reference as the caller
+// spells it, used only in messages.
+//
+// Sharing it is deliberate: every fail-closed property documented on RemoteFetch
+// is a property of THIS function, so the mirror path cannot drift into a second
+// fetcher with a weaker platform story.
+func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
+	want, err := Candidates(policy)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
 	opts := []remote.Option{remote.WithContext(ctx)}
 	if cred != nil {
@@ -322,6 +336,16 @@ type Puller struct {
 	// Both zero values mean the production defaults, which are fail-closed.
 	floorBytes uint64
 	freeBytes  FreeBytesFunc
+
+	// mirrors and mirrorFetch are the CLUSTER MIRROR fallback (mirror.go), set
+	// together by WithMirrors and both nil by default — a nil pair is a node with
+	// no cluster to fall back to, and restores the pre-mirror behavior exactly.
+	mirrors     MirrorSource
+	mirrorFetch MirrorFetchFunc
+
+	// log reports mirror fallback (WithPullLogger). Nil discards. The primary
+	// path logs nothing, so a puller without a logger is silent as before.
+	log *slog.Logger
 }
 
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
@@ -352,6 +376,13 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 	p := &Puller{cache: cache, fetch: fetch, index: index}
 	for _, o := range opts {
 		o(p)
+	}
+	// A HALF-WIRED mirror fallback is refused rather than ignored: either half
+	// alone silently disables the whole mechanism, and a node that believed it
+	// was mirroring would discover it was not only when a peer's image failed to
+	// start. See WithMirrors.
+	if (p.mirrors == nil) != (p.mirrorFetch == nil) {
+		return nil, errors.New("image puller: WithMirrors needs both a source and a fetcher (the production fetcher is image.RemoteMirrorFetch)")
 	}
 	return p, nil
 }
@@ -388,13 +419,20 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // before any round trip with ErrPullRefusedDiskPressure; a warm IfNotPresent or
 // Never serve is unaffected (see admitFetch).
 //
+// When the node has CLUSTER MIRRORS wired (WithMirrors) and the primary fetch
+// misses a reference into this node's own ingest registry, the peers are
+// consulted in turn and the same digest-verified commit path runs over whichever
+// one has the content — see pullFromMirrors. The reference recorded is always
+// the one asked for. A node with no MirrorSource never enters that path, and its
+// behavior on a failed fetch is unchanged: the primary error, verbatim.
+//
 // This function never derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
 // it on the pod spec; the provider forwards that value verbatim and it arrives
 // here already decided. A second derivation point would be free to disagree with
 // the stamped spec, and `kubectl get pod -o yaml` would stop describing what the
 // node did.
-func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy, pull runtimev1.ImagePullPolicy) (_ *PullResult, retErr error) {
+func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy, pull runtimev1.ImagePullPolicy) (*PullResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -455,8 +493,34 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	img, err := p.fetch(ctx, ref, cred, policy)
 	if err != nil {
+		// CLUSTER MIRROR FALLBACK (mirror.go). It engages only when this node has
+		// peers wired, the reference names this node's OWN ingest registry, and
+		// the primary answer was a miss or an unreachable registry — otherwise
+		// mirrorCandidates returns nothing and the primary error stands verbatim,
+		// which is the whole of the behavior on a node with no MirrorSource.
+		if mirrors := p.mirrorCandidates(ref, err); len(mirrors) > 0 {
+			return p.pullFromMirrors(ctx, ref, policy, want, mirrors, err)
+		}
 		return nil, err
 	}
+	return p.ingest(ctx, ref, img, want)
+}
+
+// ingest commits one fetched image into the store under ref and records it: the
+// platform re-verification, the lease over the whole digest set, every config
+// and layer blob, and the index entry — everything after the bytes are in hand.
+//
+// It is split from Pull because the CLUSTER MIRROR fallback needs it per
+// candidate: a peer that serves content this node refuses (a blob that does not
+// hash to the digest its manifest claims) must be a per-mirror failure the loop
+// walks past, and that verdict is only reachable HERE, at the commit, not at the
+// fetch. Splitting it also makes the all-or-nothing property structural — the
+// deferred release below returns the lease on every failing path, so a rejected
+// candidate leaves the store exactly as it found it.
+//
+// ref is the reference the pull was ASKED for, never the mirror-rewritten one:
+// it is what the manifest reports and what the index records.
+func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want []Platform) (_ *PullResult, retErr error) {
 	cfg, err := img.ConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))

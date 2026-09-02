@@ -70,15 +70,22 @@ const DefaultPullRefuseFreeBytes uint64 = 3 << 30 // 3 GiB
 // this with errors.Is.
 var ErrPullRefusedDiskPressure = errors.New("image: refusing to start a pull, the store volume is below its free-space floor")
 
-// PullerOption adjusts a Puller at construction. Options exist only for the
-// disk-pressure admission seam; the cache, fetcher and index stay required
-// positional arguments, because each of those chooses where bytes COME from and
-// a silent default there is the class of bug NewPuller's doc comment refuses.
+// PullerOption adjusts a Puller at construction. The cache, fetcher and index
+// stay required positional arguments, because each of those chooses where bytes
+// COME from and a silent default there is the class of bug NewPuller's doc
+// comment refuses. An option is admitted only where the ABSENT state is itself a
+// complete, correct configuration:
 //
-// The admission seam is different in kind: it is a measurement of this machine,
-// with exactly one correct production implementation (StatfsFreeBytes), and its
-// default fails closed — a real statfs that errors refuses the pull. This is the
-// same treatment ReclaimConfig gives FreeBytes and HighFreeBytes.
+//   - the disk-pressure admission seam (WithPullFloor, WithFreeBytes) is a
+//     measurement of this machine, with exactly one correct production
+//     implementation (StatfsFreeBytes), and its default fails closed — a real
+//     statfs that errors refuses the pull. This is the same treatment
+//     ReclaimConfig gives FreeBytes and HighFreeBytes;
+//   - the cluster-mirror fallback (WithMirrors) is absent on a single-node
+//     cluster, which is not a degraded pull path but the only one there is. It
+//     is still not a silent default: the option takes BOTH halves and NewPuller
+//     refuses a half-wiring, so a node either states its mirrors or has none;
+//   - the logger (WithPullLogger) selects a sink, never a behavior.
 type PullerOption func(*Puller)
 
 // WithPullFloor overrides the free-space floor under which new fetches are

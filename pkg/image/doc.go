@@ -37,6 +37,16 @@ limitations under the License.
 //     see Cache.CommitBlob, the single home of that invariant, and the ceiling
 //     below.
 //
+//   - Mirror (fallback): when the node's OWN ingest registry misses a
+//     node-relative reference (localhost:<port>/...), consult the peer ingest
+//     registries the embedding control plane advertises over the wireguard mesh
+//     (mirror.go) and pull the same content from whichever peer has it. Only the
+//     registry authority of the reference is rewritten, the index records the
+//     reference the pod asked for, and every blob still passes the same
+//     verification — a mirror is transport, never identity or trust. A peer
+//     serving content that fails verification is walked past, not accepted. A
+//     node with no MirrorSource (every standalone daemon) never enters this path.
+//
 //   - Record: write the (reference x platform) -> manifest entry to the on-disk
 //     index (index.go) once the pull has fully succeeded, so this node can
 //     answer presence BY REFERENCE — which the digest-keyed blob store cannot.

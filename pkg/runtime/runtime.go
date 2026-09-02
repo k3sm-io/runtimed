@@ -438,6 +438,19 @@ func (r *Runtime) guestNetworkConfig(podID string) sandbox.GuestNetworkConfig {
 type Deps struct {
 	Cache  *image.Cache
 	Puller Puller
+	// ImageMirrors supplies the CLUSTER MIRROR candidates the daemon's own puller
+	// falls back to when this node's ingest registry misses a node-relative
+	// reference (image.MirrorSource). Nil — the default, and what the STANDALONE
+	// daemon always has — means no fallback: the pull fails with the primary
+	// registry's own error, exactly as before this seam existed.
+	//
+	// It is a Deps field and not a Config one because it is a behavior this
+	// process cannot derive: runtimed neither reads the apiserver nor speaks the
+	// mesh, so only the EMBEDDING control plane (k3sm), which knows the peers,
+	// can supply one. It is ignored when Deps.Puller is set — a caller that
+	// brings its own puller has already made every pull decision, mirrors
+	// included.
+	ImageMirrors image.MirrorSource
 	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
 	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
@@ -569,7 +582,15 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// image.RemoteFetch is named explicitly: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
-		p, err := image.NewPuller(cache, image.RemoteFetch, index)
+		opts := []image.PullerOption{image.WithPullLogger(log)}
+		if deps.ImageMirrors != nil {
+			// image.RemoteMirrorFetch is named here for the same reason
+			// RemoteFetch is: it is the second place bytes can come from, so the
+			// node states it rather than inheriting it. Both halves go in one
+			// call — NewPuller refuses a half-wiring.
+			opts = append(opts, image.WithMirrors(deps.ImageMirrors, image.RemoteMirrorFetch))
+		}
+		p, err := image.NewPuller(cache, image.RemoteFetch, index, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)
 		}
