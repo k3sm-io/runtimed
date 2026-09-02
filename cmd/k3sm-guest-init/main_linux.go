@@ -65,10 +65,14 @@ limitations under the License.
 // the pod's per-container limit does not reach this binary at all, and the only
 // memory ceiling in force is the hypervisor's VZ memorySize for the whole guest.
 //
-// Per-container log capture IS here: each container is spawned on its own
-// stdout/stderr pipes, which are pumped into a bounded per-container ring
-// (guestagent.Capture) and, best effort, tee'd to the console so the console
-// stays the diagnostic of last resort when the agent is down.
+// Per-container output capture IS here, at TWO granularities. Each container's
+// output pump tees every read into a bounded LINE ring, which is what
+// `kubectl logs --tail` counts in, and a bounded BYTE ring, which is what
+// `kubectl attach` streams from — an attached terminal's prompts and keystroke
+// echoes are newline-less, so a line source would hold exactly the bytes an
+// interactive session is waiting for. Both are guestagent.Capture, and both are
+// tee'd best effort to the console so the console stays the diagnostic of last
+// resort when the agent is down.
 //
 // A container's OWN terminal is here too, and with it `kubectl attach`: a
 // container declaring tty runs on a pty allocated from its own devpts before
@@ -352,14 +356,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return reaper.Fail(ctx, defaultStopGrace, err)
 	}
 	stopAgent, err := serveAgent(podID, spec.GetAgentPort(), guestagent.Deps{
-		Runner:  &reaperRunner{names: names, reaper: reaper},
-		Sampler: &cgroupSampler{root: cgroup2Root},
-		Logs:    capture,
-		Execer:  &procExecer{plans: byName, reaper: reaper, log: log},
-		Status:  status,
-		Events:  events,
-		Attach:  attachHub,
-		Logger:  log,
+		Runner:    &reaperRunner{names: names, reaper: reaper},
+		Sampler:   &cgroupSampler{root: cgroup2Root},
+		Logs:      capture,
+		RawOutput: capture,
+		Execer:    &procExecer{plans: byName, reaper: reaper, log: log},
+		Status:    status,
+		Events:    events,
+		Attach:    attachHub,
+		Logger:    log,
 	}, log)
 	if err != nil {
 		// A guest with no agent is a pod the host can never exec into, read logs
@@ -888,17 +893,29 @@ func (c *containerIO) endpoints() guestagent.AttachEndpoints {
 // stdout only — the two must agree, or the same container's stderr would land
 // on a different stream depending on which verb was used to watch it.
 func (c *containerIO) startPumps(container string, capture *guestagent.Capture) {
+	// One raw buffer per container, shared by both pumps: it is the source
+	// `kubectl attach` streams from, and each chunk carries its own stream
+	// label so a non-tty container's stderr stays distinguishable inside it.
+	// Creating it here — before any pump runs — is what makes an attach to a
+	// container that has not spoken yet stream empty rather than report that
+	// the guest was never wired to listen.
+	raw := capture.Raw(container)
 	if c.tty {
 		// TTYReader is required, not defensive: a pty master never reports EOF.
 		// Once the last slave descriptor is gone — which is when the container's
 		// process exits — every read returns EIO, and a pump that treated that
 		// as a failure would log an error on every clean container exit.
 		go pumpOutput(c.master, guestinit.TTYReader(c.master),
-			capture.Writer(container, guestagent.StreamStdout), os.Stdout)
+			capture.Writer(container, guestagent.StreamStdout),
+			raw, guestagent.StreamStdout, os.Stdout)
 		return
 	}
-	go pumpOutput(c.stdoutR, c.stdoutR, capture.Writer(container, guestagent.StreamStdout), os.Stdout)
-	go pumpOutput(c.stderrR, c.stderrR, capture.Writer(container, guestagent.StreamStderr), os.Stderr)
+	go pumpOutput(c.stdoutR, c.stdoutR,
+		capture.Writer(container, guestagent.StreamStdout),
+		raw, guestagent.StreamStdout, os.Stdout)
+	go pumpOutput(c.stderrR, c.stderrR,
+		capture.Writer(container, guestagent.StreamStderr),
+		raw, guestagent.StreamStderr, os.Stderr)
 }
 
 // pumpOutput drains one of a container's output descriptors into its ring,
@@ -916,32 +933,50 @@ func (c *containerIO) startPumps(container string, capture *guestagent.Capture) 
 // AttachHub.Release then performs (a second Close is ErrClosed, and a write
 // after close is ErrClosed rather than a write to a recycled descriptor) — so
 // neither owner can hand a live fd to the wrong file.
-func pumpOutput(src *os.File, r io.Reader, sink io.WriteCloser, console io.Writer) {
+func pumpOutput(src *os.File, r io.Reader, sink io.WriteCloser, raw *guestagent.ByteRing, kind guestagent.LogStreamKind, console io.Writer) {
 	defer func() {
 		_ = sink.Close()
 		_ = src.Close()
 	}()
-	_, _ = io.Copy(consoleTee{sink: sink, console: console}, r)
+	_, _ = io.Copy(consoleTee{sink: sink, raw: raw, kind: kind, console: console}, r)
 }
 
-// consoleTee writes a container's output to its ring and, best effort, to the
-// guest console.
+// consoleTee writes a container's output to its two rings and, best effort, to
+// the guest console.
 //
-// The ORDER and the ERROR HANDLING are both deliberate. The ring is written
-// first and its result is the one returned, so a console that is full, closed or
-// wedged can never stop the capture — an io.MultiWriter would abort the whole
-// write on the console's error and silently cost the pod its logs. The console
-// copy is kept because it is the only diagnostic left when the agent is down, and
-// it costs nothing against the ring's bound: the two sinks are bounded
-// independently (the ring here, the console by pkg/vmhost's CappedWriter on the
-// host side).
+// # Two rings, because two consumers need two granularities
+//
+// sink is the LINE ring `kubectl logs` reads: the writer splits on newlines, so
+// `--tail=10` means ten lines. raw is the BYTE ring `kubectl attach` reads,
+// which keeps the pump's read verbatim — a shell prompt, a password query and a
+// pty's keystroke echo are all newline-less, and a client served from the line
+// ring would sit waiting for a delimiter that an interactive session never
+// sends. TEEING here is what makes both true at once: one extra copy per read,
+// on the pump that was already running, with no second goroutine and no second
+// descriptor.
+//
+// # The ORDER and the ERROR HANDLING are both deliberate
+//
+// The line ring is written first and its result is the one returned, so nothing
+// downstream can stop the capture — an io.MultiWriter would abort the whole
+// write on any sink's error and silently cost the pod its logs. The raw ring
+// cannot fail (Append copies and returns nothing) and is bounded on its own. The
+// console copy is kept because it is the only diagnostic left when the agent is
+// down, and it costs nothing against either bound: all three sinks are bounded
+// independently (the two rings here, the console by pkg/vmhost's CappedWriter on
+// the host side).
 type consoleTee struct {
 	sink    io.Writer
+	raw     *guestagent.ByteRing
+	kind    guestagent.LogStreamKind
 	console io.Writer
 }
 
 func (t consoleTee) Write(p []byte) (int, error) {
 	n, err := t.sink.Write(p)
+	if t.raw != nil {
+		t.raw.Append(t.kind, p)
+	}
 	if t.console != nil {
 		_, _ = t.console.Write(p)
 	}
