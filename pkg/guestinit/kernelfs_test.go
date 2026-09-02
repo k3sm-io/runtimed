@@ -80,8 +80,25 @@ func TestContainerKernelFSMountsProcAndCgroup2(t *testing.T) {
 		if hasOption(cg.Options, OptionReadOnly) {
 			t.Error("cgroup2 is read-only; buildkitd's runc worker must be able to create per-build sub-cgroups in it")
 		}
-		if !strings.Contains(cg.Data, "nsdelegate") {
-			t.Errorf("cgroup2 data = %q, want nsdelegate", cg.Data)
+		// This is the SECOND mount of the single unified cgroup2 hierarchy
+		// (PseudoMounts mounts the first, guest-root one — that is the mount
+		// that carries "nsdelegate"). A second mount that passes a cgroup-root
+		// flag like "nsdelegate" comes up EMPTY (no cgroup.controllers,
+		// cgroup.procs), and runc then fails "no cgroup mount found in
+		// mountinfo". The per-container mount must carry NO fs data so it roots
+		// at the cgroup-namespace root and shows the populated hierarchy — the
+		// plain `mount -t cgroup2 none` form the mudkitty prototype uses.
+		//
+		// That the mounted hierarchy actually exposes cgroup.controllers is a
+		// LAB-tier assertion (it needs a booted guest): hack/acceptance/
+		// vm-builder-prereqs.sh rung lab.3 probes /sys/fs/cgroup/cgroup.controllers
+		// on the live pod. That rung is owed and takes effect only after the
+		// initramfs is re-pinned.
+		if strings.Contains(cg.Data, "nsdelegate") {
+			t.Errorf("cgroup2 data = %q, must NOT carry nsdelegate: a second cgroup2 mount with a cgroup-root flag comes up empty", cg.Data)
+		}
+		if cg.Data != "" {
+			t.Errorf("cgroup2 data = %q, want empty (a plain second mount with no fs data)", cg.Data)
 		}
 		if !cg.MkdirTarget {
 			t.Error("cgroup2 does not create its mountpoint (os.MkdirAll makes <root>/sys and <root>/sys/fs on the way)")

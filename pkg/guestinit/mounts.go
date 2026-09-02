@@ -663,7 +663,26 @@ func RootfsMounts(name, rootfsTag string, upperSizeBytes int64) ([]MountStep, er
 // /sys first. Only the mountpoint directory has to exist, which MkdirTarget
 // creates (os.MkdirAll makes <root>/sys and <root>/sys/fs on the way). So no
 // sysfs is mounted by default and the container's /sys is otherwise empty —
-// matching the minimal-surface posture the rest of this plan keeps. Without a
+// matching the minimal-surface posture the rest of this plan keeps.
+//
+// # It carries NO fs data — a plain second mount, never "nsdelegate"
+//
+// This is the SECOND mount of cgroup2. There is exactly one unified cgroup2
+// hierarchy per cgroup namespace (a single kernel superblock), and PseudoMounts
+// already mounted it at the guest root /sys/fs/cgroup — the first mount, which
+// is the one that carries "nsdelegate". A second mount that passes a
+// cgroup-root flag ("nsdelegate", "memory_recursiveprot", …) comes up EMPTY:
+// mountinfo lists a cgroup2 at the target, but the directory has no
+// cgroup.controllers and no cgroup.procs, so runc reports "no cgroup mount
+// found in mountinfo" and buildkitd's worker fails. Passing NO fs data roots
+// the mount at the process's cgroup-namespace-root cgroup and exposes the full
+// interface (cgroup.controllers, cgroup.procs, the delegated controller files).
+// This was root-caused live 2026-09-02: a fresh `mount -t cgroup2 none
+// /sys/fs/cgroup` with no data, stacked over the empty #119 mount, immediately
+// showed the populated hierarchy — the same plain form the mudkitty prototype
+// uses. The nsdelegate delegation semantics still apply to this view: they are a
+// property of the single hierarchy, set once by the first (guest-root) mount,
+// not re-declared per mount. Without a
 // cgroup namespace the mount is a view of the guest-wide unified hierarchy, so
 // it is a metering/build aid, not an isolation boundary; a container that can
 // write cgroup.procs there could re-parent itself, exactly the chroot-only
@@ -694,8 +713,15 @@ func ContainerKernelFS(name string, podMounts []MountStep) []MountStep {
 	if !shadowedByPodMount(podMounts, "/sys/fs/cgroup") {
 		out = append(out, MountStep{
 			Source: "cgroup2", Target: path.Join(root, "sys/fs/cgroup"), FSType: "cgroup2",
-			Options:     append(append([]MountOption{}, hardened...), OptionNoAtime),
-			Data:        "nsdelegate",
+			Options: append(append([]MountOption{}, hardened...), OptionNoAtime),
+			// No Data: this is the SECOND mount of the single unified cgroup2
+			// hierarchy (PseudoMounts already mounted it at the guest root). A
+			// second mount that passes a cgroup-root flag like "nsdelegate"
+			// comes up EMPTY — mountinfo shows cgroup2 but the directory has no
+			// cgroup.controllers or cgroup.procs, and runc then fails "no cgroup
+			// mount found in mountinfo". A plain mount with no fs data roots
+			// correctly at the cgroup-namespace root and shows the full
+			// hierarchy. See the doc comment.
 			MkdirTarget: true,
 			ResolveRoot: root,
 			Why:         "a writable cgroup2 hierarchy: buildkitd's runc worker creates per-build sub-cgroups here",
