@@ -113,25 +113,26 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.48",
-		// Minted 2026-09-01 from the v6.18.48-k3sm.2 release. The KERNEL is
-		// byte-identical to k3sm.1 — same unmodified upstream tarball, same
-		// kernel.config, same build.sh, so ImageSHA256 and the config hash
+		// Minted 2026-09-02 from the v6.18.48-k3sm.3 release. The KERNEL is
+		// byte-identical to k3sm.1/k3sm.2 — same unmodified upstream tarball,
+		// same kernel.config, same build.sh, so ImageSHA256 and the config hash
 		// 9c05f8f3b26c… (the -suffix of ActiveGuestKernel) are unchanged. Only
 		// the initramfs moved: it carries the rebuilt k3sm-guest-init with the
-		// vm-path fixes found validating M11 on hardware (per-container log
-		// capture, late-subscriber state replay, chroot-semantics argv[0] and
-		// mount-target resolution, guest network bring-up + DHCP lease, per
-		// container cgroup2 leaves, writable binds out of the read-only stage,
-		// and a fatal reason on the console before poweroff).
+		// interactive-terminal work — exec pty allocation from the container's
+		// own devpts, container tty at spawn with a retained master for attach,
+		// the byte-granular attach output source, capability advertisement
+		// (tty-exec, attach), and the minimal allowlisted per-container /dev
+		// (OCI default device set + private devpts + bounded shm; /dev/vsock is
+		// never exposed to a container).
 		//
-		// Two clean builds with the module cache cleared between them produced a
-		// byte-identical cpio, and BOTH digests below were re-derived by
-		// unauthenticated download of the published assets — never from the local
-		// build output, so a mismatch between what was built and what was
-		// uploaded cannot hide here.
+		// Two clean builds (fresh GOCACHE, -trimpath -buildvcs=false
+		// -ldflags=-buildid=) produced a byte-identical cpio, and BOTH digests
+		// below were re-derived by unauthenticated download of the published
+		// assets — never from the local build output, so a mismatch between what
+		// was built and what was uploaded cannot hide here.
 		ImageSHA256:     "d50508b08205453e5f5f710978743449dc4fafe957aa8694e6da8e5780d93308",
-		InitramfsSHA256: "3cbf171c25d699372f1f0b16cbed6046d6ab81f7a0bdf8adbee3a07995919a3d",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.2",
+		InitramfsSHA256: "47c768f446e0ea5b56d7c4c5724c07299000890ae20c532962b7eb9e3143ef17",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.3",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
