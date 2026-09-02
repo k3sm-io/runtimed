@@ -39,10 +39,16 @@ limitations under the License.
 // host's boot-deadline probe, so an agent answering earlier would report a
 // guest that is ready for a pod it has not started.
 //
-// not yet IN this BINARY, and deliberately so — each is its own slice with its
-// own gate: pty allocation (so a tty exec is refused rather than run without a
-// terminal). A spec requesting an idmapped mount is refused rather than mounted
-// without the idmap.
+// A spec requesting an idmapped mount is refused rather than mounted without the
+// idmap.
+//
+// The per-container /dev IS here, and a tty exec with it: each container gets
+// the OCI default device set bound in, its OWN devpts instance, a /dev/ptmx
+// symlink into it and a bounded /dev/shm — the allowlist in
+// guestinit.ContainerDev, which is a security boundary and not a convenience.
+// A `kubectl exec -it` allocates its pty from THAT instance before the fork, so
+// the terminal survives the chroot and its slave's name means what the container
+// thinks it means.
 //
 // The guest network IS here: lo and eth0 are brought up, eth0 is addressed by a
 // minimal in-guest DHCPv4 client against the host's NAT segment, the default
@@ -430,6 +436,42 @@ func applyMounts(log *slog.Logger, steps []guestinit.MountStep) error {
 	return nil
 }
 
+// applyLinks creates a plan's symlinks inside a container's composed rootfs.
+//
+// Only the PARENT directory is resolved with chroot semantics, never the final
+// component — the one way this differs from applyMounts, and the difference is
+// load-bearing. mount(2) follows a symlink at its target, so resolving the last
+// component is exactly right there; symlink(2) does not, and an image that
+// already ships /dev/ptmx as a link to pts/ptmx would otherwise have that link
+// followed, and this would try to replace the devpts multiplexer itself.
+//
+// An existing name is REMOVED first. The image's own /dev/ptmx — a dangling
+// link, or a device node inherited from the image build — must not win over the
+// container's real instance, and symlink(2) has no replace mode.
+func applyLinks(log *slog.Logger, links []guestinit.LinkStep) error {
+	for _, l := range links {
+		target := l.Target
+		if l.ResolveRoot != "" {
+			dir, err := guestinit.ResolveTarget(l.ResolveRoot, path.Dir(strings.TrimPrefix(l.Target, l.ResolveRoot)))
+			if err != nil {
+				return fmt.Errorf("resolve the directory of %s (%s): %w", l.Target, l.Why, err)
+			}
+			target = path.Join(dir, path.Base(l.Target))
+		}
+		if err := os.MkdirAll(path.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", path.Dir(target), err)
+		}
+		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("replace %s (%s): %w", target, l.Why, err)
+		}
+		if err := os.Symlink(l.LinkTo, target); err != nil {
+			return fmt.Errorf("symlink %s -> %s (%s): %w", target, l.LinkTo, l.Why, err)
+		}
+		log.Debug("symlink", "target", target, "link_to", l.LinkTo, "why", l.Why)
+	}
+	return nil
+}
+
 // touch creates an empty file if it is not there already.
 func touch(name string) error {
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0o644)
@@ -487,6 +529,11 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, capture *guestagent.Capture, plans []guestinit.ContainerPlan) error {
 	for _, cp := range plans {
 		if err := applyMounts(log, cp.Mounts); err != nil {
+			return fmt.Errorf("container %s: %w", cp.Name, err)
+		}
+		// After the mounts, never before: /dev/ptmx points INTO the devpts
+		// instance the previous step mounted.
+		if err := applyLinks(log, cp.Links); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
 		}
 		pid, err := spawn(cp, capture, log)
