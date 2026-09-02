@@ -342,6 +342,126 @@ func TestExecutePruneReVerifiesBeforeUnlink(t *testing.T) {
 	})
 }
 
+// TestRootsSkipsVolumeFurniture pins the ONE carve-out in the fail-closed roots
+// walk: a dot-entry at the top of the pods tree is skipped rather than judged.
+//
+// The pods root is provisioned as its own APFS volume, and macOS plants
+// ".Spotlight-V100", ".fseventsd" and ".Trashes" at a volume root — SIP-owned,
+// refusing an open even to root. A live `k3sm image prune` aborted on exactly
+// that, so the GC was unusable on a correctly provisioned node.
+//
+// Both directions are pinned, because the value of the skip is entirely in how
+// narrow it is: an unreadable or unexpected NON-dot entry must still abort. A
+// skip that generalized to "unreadable" would delete a live pod's layers the
+// first time a pod dir was unreadable for a reason that was not furniture.
+func TestRootsSkipsVolumeFurniture(t *testing.T) {
+	t.Parallel()
+
+	// unreadableDir plants a directory that cannot be opened, restoring its mode
+	// at cleanup so t.TempDir can still remove it.
+	unreadableDir := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Fatalf("chmod %s: %v", path, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o755) })
+	}
+
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, podsRoot string)
+		// rootAsRoot marks a case whose premise (an unopenable directory) does
+		// not hold for uid 0.
+		rootAsRoot bool
+		wantErr    bool
+	}{
+		{
+			name: "a spotlight index directory is furniture",
+			prepare: func(t *testing.T, podsRoot string) {
+				if err := os.Mkdir(filepath.Join(podsRoot, ".Spotlight-V100"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "furniture the daemon cannot even open is furniture",
+			prepare: func(t *testing.T, podsRoot string) {
+				unreadableDir(t, filepath.Join(podsRoot, ".fseventsd"))
+			},
+			rootAsRoot: true,
+		},
+		{
+			name: "a dot FILE is furniture too",
+			prepare: func(t *testing.T, podsRoot string) {
+				if err := os.WriteFile(filepath.Join(podsRoot, ".DS_Store"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "the whole macOS volume-root set at once",
+			prepare: func(t *testing.T, podsRoot string) {
+				for _, n := range []string{".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems"} {
+					if err := os.Mkdir(filepath.Join(podsRoot, n), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
+		{
+			name: "an unreadable NON-dot directory still refuses",
+			prepare: func(t *testing.T, podsRoot string) {
+				unreadableDir(t, filepath.Join(podsRoot, "pod-b"))
+			},
+			rootAsRoot: true,
+			wantErr:    true,
+		},
+		{
+			name: "a NON-dot directory with no record still refuses",
+			prepare: func(t *testing.T, podsRoot string) {
+				if err := os.Mkdir(filepath.Join(podsRoot, "pod-b"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.rootAsRoot && os.Geteuid() == 0 {
+				t.Skip("running as uid 0: an unopenable directory is not a state this case can create")
+			}
+			f := newGCFixture(t)
+			// One REAL pod, so a walk that skipped everything would not pass by
+			// returning nothing: the recorded root must survive the furniture.
+			cfg := "sha256:" + strings.Repeat("a", 64)
+			f.pod("pod-a", ImageRoot{Reference: "app:v1", Config: cfg})
+			tc.prepare(t, f.cache.PodsRoot())
+
+			roots, err := f.cache.Roots()
+			if tc.wantErr {
+				if !errors.Is(err, ErrRootsIncomplete) {
+					t.Fatalf("Roots err = %v; want ErrRootsIncomplete", err)
+				}
+				if roots != nil {
+					t.Errorf("Roots returned %v alongside the refusal; a partial root set must never escape", roots)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Roots: %v", err)
+			}
+			if len(roots) != 1 || roots[0].Config != cfg {
+				t.Fatalf("Roots = %v; want the one real pod's root", roots)
+			}
+		})
+	}
+}
+
 // TestRootsFailClosed pins the fail-closed enumeration: anything that makes the
 // root set less than complete aborts the whole prune, because an incomplete root
 // set does not degrade the answer, it inverts it.

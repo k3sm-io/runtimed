@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // PodReferencesName is the per-pod reachability record the daemon writes inside
@@ -218,6 +219,10 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 // An ABSENT pods dir is not incomplete: a node with no pods tree has no pods,
 // so the empty root set is the true answer and reclaim may proceed. The same
 // holds for an absent operator record.
+//
+// The one carve-out is a DOT-entry at the top of the pods tree, which is skipped
+// rather than judged — see the loop below for why that is total and not a
+// loosening.
 func (c *Cache) Roots() ([]ImageRoot, error) {
 	// Operator roots FIRST, and their read failure is fatal for the same reason a
 	// pod record's is: a prune deletes what no root names, so a root set that is
@@ -251,6 +256,23 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		// Volume FURNITURE, not a pod record. The pods root is a dedicated APFS
+		// volume, and macOS plants ".Spotlight-V100", ".fseventsd" and ".Trashes"
+		// at a volume's root — owned by the indexer, refusing an open even to root
+		// under SIP, and never anything this daemon created. A live prune aborted
+		// on exactly that: openat .Spotlight-V100/images.json returned EPERM and
+		// the whole root set was declared incomplete.
+		//
+		// The skip is on the NAME, before any stat, and that is deliberate on two
+		// counts. It is TOTAL: ParsePodID refuses any id beginning with a dot
+		// (podid.go), so a dot-entry cannot be a pod dir under any spelling and
+		// skipping one can never drop a real root. And it is narrow: an unreadable
+		// or unexpected NON-dot entry stays fatal, because a pod dir the daemon
+		// cannot read is precisely the state that would make a live pod's layers
+		// look unreferenced.
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
 		// Lstat through the anchored root: a symlink is judged on ITSELF, so a
 		// link named like a pod dir is an unexpected node, not a followed path.
 		fi, err := root.Lstat(name)
