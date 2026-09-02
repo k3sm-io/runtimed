@@ -148,6 +148,25 @@ type pod struct {
 	// never carry two watchers, and it is the observable edge that the watcher
 	// really stopped when the pod-lifetime context was cancelled.
 	guestLeaseStopped chan struct{}
+
+	// The guest agent's advertised capability set, recorded by the same Health
+	// poll that reads the lease (guestlease.go) and guarded by mu.
+	//
+	// TWO FIELDS, because there are THREE states and they are not
+	// interchangeable. guestCapsObserved false means no Health response has
+	// been read yet — the pod may have just been created, or the agent may be
+	// unreachable — and a request is let through on that, because refusing a
+	// verb on the strength of never having asked would break every exec issued
+	// before the first poll landed. guestCapsObserved true with the token
+	// ABSENT is a positive statement by a guest that answered: it named its
+	// capabilities and this was not among them, so the request is refused with
+	// a legible reason instead of a bare Unimplemented from the far end.
+	//
+	// guestCaps holds only tokens this daemon KNOWS (knownGuestCapability), so
+	// nothing guest-chosen is ever retained here — the map is bounded by the
+	// host's own vocabulary rather than by what the agent chose to send.
+	guestCapsObserved bool
+	guestCaps         map[string]struct{}
 }
 
 // containerPIDs returns the pod's currently-running container PIDs (the memory
