@@ -69,6 +69,14 @@ limitations under the License.
 // stdout/stderr pipes, which are pumped into a bounded per-container ring
 // (guestagent.Capture) and, best effort, tee'd to the console so the console
 // stays the diagnostic of last resort when the agent is down.
+//
+// A container's OWN terminal is here too, and with it `kubectl attach`: a
+// container declaring tty runs on a pty allocated from its own devpts before
+// the fork (so stdout and stderr arrive merged, as `docker run -t` does), and
+// one declaring stdin keeps the write end of its input. Both endpoints are
+// retained in guestagent.AttachHub for the container's whole life and released
+// by the reaper's exit callback — never by a detaching client, because detach
+// is not kill.
 package main
 
 import (
@@ -248,6 +256,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	capture := guestagent.NewCapture(0, 0, 0)
 	defer capture.CloseAll()
 
+	// The retained-stdio registry, created before the first spawn for the same
+	// reason capture is: spawn registers into it. It is what makes `kubectl
+	// attach` reach a container that started minutes ago — see spawn's stdio
+	// section, and AttachHub for why an attach's teardown must never touch it.
+	attachHub := guestagent.NewAttachHub()
+
 	// Delegate the metering controllers to the hierarchy root's children BEFORE
 	// the first leaf is created: a leaf only gets memory.current / memory.stat if
 	// its parent had the memory controller in cgroup.subtree_control when the leaf
@@ -282,6 +296,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 			// sees end-of-stream rather than hanging on a process that will never
 			// write again. Retained output survives Close and stays readable.
 			capture.Close(ev.Container)
+			// And the retained stdio with it. This is the ONE place a container's
+			// endpoints are released: an attach that released them would take
+			// every concurrently attached client's input with it, and on a tty
+			// would hang the container's session up with SIGHUP — turning a
+			// detach into a kill.
+			attachHub.Release(ev.Container)
 			// OOMKilled is deliberately not set here. It is the one fact only
 			// the guest can supply, and this init does not yet read the cgroup2
 			// memory.events that would prove it — so it is left false rather
@@ -305,7 +325,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
-	if err := startContainers(ctx, log, reaper, events, capture, plan.Containers); err != nil {
+	if err := startContainers(ctx, log, reaper, events, capture, attachHub, plan.Containers); err != nil {
 		// Anything already running has to be torn down; Stop is the only
 		// path that both signals and powers off.
 		return reaper.Fail(ctx, defaultStopGrace, err)
@@ -338,6 +358,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		Execer:  &procExecer{plans: byName, reaper: reaper, log: log},
 		Status:  status,
 		Events:  events,
+		Attach:  attachHub,
 		Logger:  log,
 	}, log)
 	if err != nil {
@@ -526,7 +547,7 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 
 // startContainers realizes the plan's containers in order: an init container
 // is waited for and must exit 0, a main container is started and left running.
-func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, capture *guestagent.Capture, plans []guestinit.ContainerPlan) error {
+func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, capture *guestagent.Capture, hub *guestagent.AttachHub, plans []guestinit.ContainerPlan) error {
 	for _, cp := range plans {
 		if err := applyMounts(log, cp.Mounts); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
@@ -536,7 +557,7 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 		if err := applyLinks(log, cp.Links); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
 		}
-		pid, err := spawn(cp, capture, log)
+		pid, err := spawn(cp, capture, hub, log)
 		if err != nil {
 			return fmt.Errorf("start container %s: %w", cp.Name, err)
 		}
@@ -564,7 +585,7 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 }
 
 // spawn resolves one container's program, then forks and execs it inside the
-// container's composed rootfs, on its OWN stdout/stderr pipes.
+// container's composed rootfs, on the stdio its plan asks for.
 //
 // The child is chrooted, credentialed and given its own session before the
 // exec; the working directory is applied after the chroot, so it is a path
@@ -572,16 +593,38 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 // only process that may wait(2), and a second waiter would race it for the
 // exit status.
 //
+// # Three stdio shapes, chosen by the pod spec's two bits
+//
+// GuestContainer.tty and .stdin are `docker run`'s -t and -i, and they select
+// what this function opens:
+//
+//   - tty — a pty pair from the container's OWN devpts instance, the slave as
+//     all three of the child's descriptors, Setsid+Setctty so it is the
+//     session's controlling terminal. ONE pump reads the master, because the
+//     line discipline has already merged stdout and stderr before either
+//     reaches it: `kubectl logs` on a tty container shows the merged stream,
+//     exactly as `docker run -t` does. The master's end of stream arrives as
+//     EIO, never as a zero-length read (guestinit.TTYReader).
+//   - stdin without tty — a pipe whose WRITE end is retained, which is what
+//     makes `docker run -i` parity possible: a client attaching later writes
+//     into it. Output stays two demultiplexed pipes.
+//   - neither — the pre-existing shape: two output pipes, and stdin left as
+//     PID 1's console fd. It is deliberately not a pipe nothing writes to,
+//     which would turn a workload that blocks on stdin into one that gets EOF.
+//
+// the RETAINED ENDPOINTS ARE what MAKE `kubectl attach` POSSIBLE. Before the
+// hub they were locals that went out of scope at the fork, so the only process
+// that could ever write to a running container was the one that started it.
+// Registration happens AFTER the fork — the endpoints are only real once the
+// child holds the other side, and an entry for a container that failed to start
+// would offer an attach a descriptor nothing reads. Deregistration is the
+// reaper's (AttachHub.Release), never an attach's.
+//
 // the PIPES are what MAKE `kubectl logs` POSSIBLE. Containers used to inherit
 // PID 1's stdio, so every container's output went to the one guest console,
 // undemultiplexed and unattributable, and the Logs RPC could only report that
 // there was no per-container buffer to serve. Each stream is now pumped into
 // capture's bounded ring for that container and tee'd to the console.
-//
-// stdin stays the console fd. A container's stdin is not plumbed anywhere yet,
-// and giving it a pipe nothing writes to would turn a workload that reads stdin
-// from a process that blocks into one that gets EOF — a different behaviour,
-// chosen by accident.
 //
 // the CGROUP2 LEAF is JOINED BY the KERNEL, at FORK. The child is placed into
 // <cgroup2Root>/<container> by CLONE_INTO_CGROUP (SysProcAttr.UseCgroupFD), so it
@@ -591,7 +634,7 @@ func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Re
 // cgroup.procs would be the only alternative, and it necessarily has that window.
 // The post-fork JoinLeaf below is a reconcile for the one case this cannot cover
 // (a kernel too old for clone3), not the mechanism.
-func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Logger) (int, error) {
+func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestagent.AttachHub, log *slog.Logger) (int, error) {
 	groups := make([]uint32, 0, len(cp.Ident.Groups))
 	for _, g := range cp.Ident.Groups {
 		groups = append(groups, uint32(g))
@@ -615,14 +658,9 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Lo
 	if err != nil {
 		return 0, err
 	}
-	stdoutR, stdoutW, err := os.Pipe()
+	cio, err := openContainerIO(cp, log)
 	if err != nil {
-		return 0, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
-		closeAll(stdoutR, stdoutW)
-		return 0, fmt.Errorf("stderr pipe: %w", err)
+		return 0, err
 	}
 	sys := &syscall.SysProcAttr{
 		Chroot: cp.Root,
@@ -632,6 +670,12 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Lo
 			Groups: groups,
 		},
 		Setsid: true,
+		// A terminal is only a terminal once it is the session's CONTROLLING
+		// one: job control, ^C and SIGWINCH all require it. Ctty indexes the
+		// CHILD's descriptors, because Linux performs TIOCSCTTY after the fork's
+		// descriptor dance — the slave is child fd 0, hence 0.
+		Setctty: cio.tty,
+		Ctty:    0,
 	}
 	// The leaf is opened, not just created: CLONE_INTO_CGROUP takes a DIRECTORY
 	// FD, and holding it across the fork is what makes the placement atomic.
@@ -655,16 +699,18 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Lo
 	attr := &syscall.ProcAttr{
 		Dir:   dir,
 		Env:   cp.Env,
-		Files: []uintptr{0, stdoutW.Fd(), stderrW.Fd()},
+		Files: cio.childFiles(),
 		Sys:   sys,
 	}
 	pid, err := syscall.ForkExec(prog, cp.Argv, attr)
-	// This process's copies of the child's write ends go immediately after the
-	// fork: holding them open means the readers below never see EOF, so a
-	// container's log stream would never end even after the container did.
-	closeAll(stdoutW, stderrW)
+	// This process's copies of the child's ends go immediately after the fork:
+	// holding a pipe's write end open means the readers below never see EOF, so
+	// a container's log stream would never end even after the container did —
+	// and holding the pty slave open means the master never sees EIO, which is
+	// the same failure wearing a different errno.
+	cio.closeChildEnds()
 	if err != nil {
-		closeAll(stdoutR, stderrR)
+		cio.closeAll()
 		return 0, err
 	}
 	if leaf != "" {
@@ -677,20 +723,205 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, log *slog.Lo
 				"container", cp.Name, "leaf", leaf, "pid", pid, "err", jerr)
 		}
 	}
-	go pumpOutput(stdoutR, capture.Writer(cp.Name, guestagent.StreamStdout), os.Stdout)
-	go pumpOutput(stderrR, capture.Writer(cp.Name, guestagent.StreamStderr), os.Stderr)
+	hub.Register(cp.Name, cio.endpoints())
+	cio.startPumps(cp.Name, capture)
 	return pid, nil
 }
 
-// pumpOutput drains one of a container's output pipes into its ring, tee'ing to
-// the console. It closes both ends at EOF, which flushes a final unterminated
-// line into the ring and releases the pipe.
-func pumpOutput(src *os.File, sink io.WriteCloser, console io.Writer) {
+// containerIO is one container's parent-side stdio: what was opened, what the
+// child gets, what this process closes at the fork, and what it keeps.
+//
+// It exists so spawn reads as one shape rather than three interleaved ones, and
+// so the ORDER that matters — open, fork, close the child's ends, register,
+// pump — is expressed once instead of per branch.
+type containerIO struct {
+	// tty is set when the container runs on a pseudo-terminal, in which case
+	// master and slave are the pair and the three pipes are nil.
+	tty bool
+	// master is the parent's end of the pty: both the container's merged output
+	// and, when the container retains stdin, the endpoint an attach writes to.
+	master *os.File
+	slave  *os.File
+
+	// stdoutR / stderrR are the parent's read ends of a non-tty container's
+	// output pipes; stdinR / stdinW are its input pipe, and stdinW is nil unless
+	// the container asked to keep stdin open.
+	stdoutR, stdoutW *os.File
+	stderrR, stderrW *os.File
+	stdinR, stdinW   *os.File
+
+	// stdin reports whether the container asked to keep standard input open
+	// (GuestContainer.stdin). It decides whether a retained stdin endpoint is
+	// published, which is the fact an attach's FailedPrecondition turns on.
+	stdin bool
+}
+
+// openContainerIO opens the descriptors cp's stdio shape calls for. On any
+// failure it closes whatever it had already opened: a half-built container that
+// leaked a pipe end would leave PID 1 holding a descriptor no reader will ever
+// drain for the life of the pod.
+func openContainerIO(cp guestinit.ContainerPlan, log *slog.Logger) (*containerIO, error) {
+	c := &containerIO{tty: cp.TTY, stdin: cp.Stdin}
+	if cp.TTY {
+		// The pair comes from the TARGET CONTAINER's own devpts instance, for
+		// the reason guestinit.PTYOrigin states: a slave's index only means
+		// something inside the instance it was allocated in, so a
+		// guest-allocated pty in a container with a private /dev/pts either has
+		// no name there at all or has the name of a DIFFERENT terminal.
+		origin := guestinit.ExecPTYOrigin(cp)
+		ptmx, pts, err := resolvePTYOrigin(origin)
+		if err != nil {
+			return nil, err
+		}
+		if !origin.Container {
+			log.Warn("this container has no private devpts, so its terminal is allocated from the guest's instance",
+				"container", cp.Name, "ptmx", ptmx)
+		}
+		master, slave, err := guestinit.OpenPTY(ptmx, pts)
+		if err != nil {
+			return nil, fmt.Errorf("allocate a terminal for container %s: %w", cp.Name, err)
+		}
+		c.master, c.slave = master, slave
+		// Sized BEFORE the fork. A pty comes up 0x0 and a client's real size
+		// arrives later (if ever, for a container nobody attaches to), so a
+		// shell that ran `stty size` as its first act would otherwise lay itself
+		// out for a terminal with no cells.
+		if err := guestinit.SetWinsize(master, guestinit.DefaultWinSize); err != nil {
+			c.closeAll()
+			return nil, fmt.Errorf("size the terminal for container %s: %w", cp.Name, err)
+		}
+		if err := guestinit.ChownTTY(slave, int(cp.Ident.UID), int(cp.Ident.GID)); err != nil {
+			// Not fatal: the process runs on the descriptors it inherits either
+			// way. What it loses is the ability to REOPEN its terminal by name,
+			// which is what /dev/tty, `script`, and every prompt that bypasses
+			// stdin do.
+			log.Warn("could not give the container terminal to the container identity; reopening /dev/tty inside it will fail",
+				"container", cp.Name, "uid", cp.Ident.UID, "gid", cp.Ident.GID, "err", err)
+		}
+		return c, nil
+	}
+
+	var err error
+	if c.stdoutR, c.stdoutW, err = os.Pipe(); err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	if c.stderrR, c.stderrW, err = os.Pipe(); err != nil {
+		c.closeAll()
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+	if cp.Stdin {
+		if c.stdinR, c.stdinW, err = os.Pipe(); err != nil {
+			c.closeAll()
+			return nil, fmt.Errorf("stdin pipe: %w", err)
+		}
+	}
+	return c, nil
+}
+
+// childFiles returns the child's descriptors 0, 1 and 2.
+//
+// A container with no retained stdin keeps PID 1's console fd as its own fd 0,
+// which is the pre-existing behaviour and the deliberate one: a pipe nothing
+// will ever write to turns a workload that blocks reading stdin into one that
+// gets EOF, which is a different program, chosen by accident.
+func (c *containerIO) childFiles() []uintptr {
+	if c.tty {
+		fd := c.slave.Fd()
+		return []uintptr{fd, fd, fd}
+	}
+	stdin := uintptr(0)
+	if c.stdinR != nil {
+		stdin = c.stdinR.Fd()
+	}
+	return []uintptr{stdin, c.stdoutW.Fd(), c.stderrW.Fd()}
+}
+
+// closeChildEnds closes this process's copies of the descriptors the child now
+// owns. It runs immediately after the fork; see spawn for why the timing is not
+// negotiable.
+func (c *containerIO) closeChildEnds() {
+	closeAll(c.slave, c.stdoutW, c.stderrW, c.stdinR)
+	c.slave, c.stdoutW, c.stderrW, c.stdinR = nil, nil, nil, nil
+}
+
+// closeAll closes everything still held. It is the failure path: after a
+// successful fork the pumps and the hub own what is left.
+func (c *containerIO) closeAll() {
+	closeAll(c.master, c.slave, c.stdoutR, c.stdoutW, c.stderrR, c.stderrW, c.stdinR, c.stdinW)
+	c.master, c.slave = nil, nil
+	c.stdoutR, c.stdoutW, c.stderrR, c.stderrW = nil, nil, nil, nil
+	c.stdinR, c.stdinW = nil, nil
+}
+
+// endpoints is what the attach hub retains for this container.
+//
+// Resize is non-nil for every tty container, whether or not it retains stdin: a
+// window size is a property of the terminal, and a client watching a tty
+// container's output still needs the program inside it laid out for the window
+// it is being watched in.
+func (c *containerIO) endpoints() guestagent.AttachEndpoints {
+	ep := guestagent.AttachEndpoints{TTY: c.tty}
+	if c.tty {
+		master := c.master
+		ep.Resize = func(rows, cols uint16) error {
+			return guestinit.SetWinsize(master, guestinit.WinSize{Rows: rows, Cols: cols})
+		}
+		if c.stdin {
+			// The master IS the stdin endpoint on a tty: writing to it is what
+			// the line discipline turns into the container's input, ^D and all.
+			ep.Stdin = master
+		}
+		return ep
+	}
+	if c.stdinW != nil {
+		ep.Stdin = c.stdinW
+	}
+	return ep
+}
+
+// startPumps runs the parent-side output readers.
+//
+// A tty container gets exactly ONE, and that is not an economy: the line
+// discipline merges stdout and stderr before either reaches the master, so
+// there is no second stream to read and nothing left to demultiplex. It is what
+// `docker run -t` does, and it is what the tty exec path already frames as
+// stdout only — the two must agree, or the same container's stderr would land
+// on a different stream depending on which verb was used to watch it.
+func (c *containerIO) startPumps(container string, capture *guestagent.Capture) {
+	if c.tty {
+		// TTYReader is required, not defensive: a pty master never reports EOF.
+		// Once the last slave descriptor is gone — which is when the container's
+		// process exits — every read returns EIO, and a pump that treated that
+		// as a failure would log an error on every clean container exit.
+		go pumpOutput(c.master, guestinit.TTYReader(c.master),
+			capture.Writer(container, guestagent.StreamStdout), os.Stdout)
+		return
+	}
+	go pumpOutput(c.stdoutR, c.stdoutR, capture.Writer(container, guestagent.StreamStdout), os.Stdout)
+	go pumpOutput(c.stderrR, c.stderrR, capture.Writer(container, guestagent.StreamStderr), os.Stderr)
+}
+
+// pumpOutput drains one of a container's output descriptors into its ring,
+// tee'ing to the console. It closes the sink and the descriptor at end of
+// stream, which flushes a final unterminated line into the ring and releases
+// the descriptor.
+//
+// src and r are separate because a pty master is READ through
+// guestinit.TTYReader (its end of stream is EIO, not a zero-length read) while
+// still being the *os.File that has to be closed. For a pipe the two are the
+// same value.
+//
+// Closing src here is what gives the pty master a SINGLE owner. The attach hub
+// also holds it as a stdin endpoint, and os.File tolerates the double close
+// AttachHub.Release then performs (a second Close is ErrClosed, and a write
+// after close is ErrClosed rather than a write to a recycled descriptor) — so
+// neither owner can hand a live fd to the wrong file.
+func pumpOutput(src *os.File, r io.Reader, sink io.WriteCloser, console io.Writer) {
 	defer func() {
 		_ = sink.Close()
 		_ = src.Close()
 	}()
-	_, _ = io.Copy(consoleTee{sink: sink, console: console}, src)
+	_, _ = io.Copy(consoleTee{sink: sink, console: console}, r)
 }
 
 // consoleTee writes a container's output to its ring and, best effort, to the
