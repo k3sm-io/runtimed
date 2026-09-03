@@ -491,6 +491,29 @@ type Deps struct {
 	// cannot be configured to treat some third-party registry as its own. Like
 	// the two seams above it is ignored when Deps.Puller is set.
 	LocalRegistryHost string
+	// ImageIndexObserver is notified after every committed change to this node's
+	// local image index — a pull, a `k3sm image load`, a tag, an untag
+	// (image.IndexObserver). Nil — the default, and what the STANDALONE daemon
+	// always has — means no notification at all and leaves the index behaving
+	// exactly as it did before this seam existed.
+	//
+	// It exists so an embedder can learn WHEN what this node holds changed
+	// without polling, and it is deliberately the narrowest seam that answers
+	// that: runtimed neither reads nor writes an apiserver, so an observer here
+	// learns nothing about one. Whatever the embedding control plane (k3sm) does
+	// with a change — publishing an inventory, invalidating a cache — is its own
+	// business and is invisible to this package.
+	//
+	// The callback runs SYNCHRONOUSLY on the goroutine that made the change and
+	// must not block: a pull, a load and an untag all sit behind it. Delivery is
+	// therefore best-effort, and an observer recovers from a missed change with
+	// Runtime.ImageIndexSnapshot rather than by assuming it saw every event. See
+	// image.IndexObserver for the full contract.
+	//
+	// Unlike the puller seams above it is NOT ignored when Deps.Puller is set:
+	// the index is the daemon's own and every write path — including a
+	// caller-supplied puller that records into it — goes through it.
+	ImageIndexObserver image.IndexObserver
 	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
 	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
@@ -613,7 +636,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// instead of one per pod. It is built outside the puller branch because the
 	// ingest path records into the same index: two indexes would let a loaded
 	// reference and a pulled one disagree about what this node has.
-	index, err := image.NewFileIndex(cache)
+	index, err := image.NewFileIndex(cache, image.WithIndexObserver(deps.ImageIndexObserver))
 	if err != nil {
 		return nil, fmt.Errorf("init image index: %w", err)
 	}
@@ -807,6 +830,30 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		broker:       newBroker(),
 		pods:         make(map[string]*pod),
 	}, nil
+}
+
+// ImageIndexSnapshot returns every image currently recorded in this node's local
+// index — the full (reference x platform) inventory, sorted by reference.
+//
+// It is the IN-PROCESS companion to Deps.ImageIndexObserver, and the two answer
+// different questions on purpose. The observer says WHEN something changed and
+// is best-effort by construction (see image.IndexObserver); this says WHAT this
+// node holds, authoritatively, at the moment it is called. An embedder that
+// publishes an inventory therefore reconciles from a snapshot and uses the
+// observer only to decide when to take the next one — which is what makes a
+// missed notification a latency bug rather than a correctness one.
+//
+// It is read-only and takes no lease: entries are edges, never reachability
+// roots (see image.FileIndex), so listing them cannot make content survive a
+// prune and a listed image may already have had its blobs reclaimed. It fails
+// CLOSED on a damaged record for the reason List does — the caller asking what
+// is on this node is the one who most needs to hear that the index is broken.
+//
+// It is a method on Runtime rather than an exported *image.FileIndex because
+// the index is the daemon's own single-writer state: handing it out would hand
+// out Record and Remove with it.
+func (r *Runtime) ImageIndexSnapshot(ctx context.Context) ([]image.IndexEntry, error) {
+	return r.index.List(ctx)
 }
 
 // sampleInterval is the memory sampler's polling period (Config.SampleInterval,
