@@ -353,6 +353,11 @@ type Puller struct {
 	clusterRegistries    clusterRegistrySet
 	clusterFetch         FetchFunc
 
+	// localRegistry is this node's own ingest registry authority, consulted
+	// FIRST for a reference that names no registry (WithLocalRegistry). Empty —
+	// the default — switches the whole bare-name behavior off.
+	localRegistry string
+
 	// log reports mirror fallback (WithPullLogger). Nil discards. The primary
 	// path logs nothing, so a puller without a logger is silent as before.
 	log *slog.Logger
@@ -407,6 +412,21 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 		return nil, fmt.Errorf("image puller: %w", err)
 	}
 	p.clusterRegistries = set
+	// The node's own ingest registry must be CLUSTER-LOCAL, and it is checked
+	// after the set above is built because an admitted authority is one of the
+	// two ways it can be. The requirement is what makes the two properties
+	// WithLocalRegistry documents structural rather than advisory: the attempt is
+	// dialled with the transport that authority calls for, and a miss against it
+	// is brokered to the cluster mirrors like any other cluster-local miss.
+	if p.localRegistry != "" {
+		if err := validateRegistryAuthority("local registry host", p.localRegistry); err != nil {
+			return nil, fmt.Errorf("image puller: %w", err)
+		}
+		if !p.clusterLocalAuthority(p.localRegistry) {
+			return nil, fmt.Errorf("image puller: local registry host %s is neither a loopback spelling nor an authority admitted by WithClusterRegistries",
+				quoteBounded(p.localRegistry, maxMirrorHostLen))
+		}
+	}
 	return p, nil
 }
 
@@ -454,6 +474,13 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // name or VIP that names the same registry. A reference carrying an admitted
 // authority is fetched over plain HTTP (see RemoteInsecureFetch) and brokered
 // identically to the loopback spelling of the same pull.
+//
+// When the node has a LOCAL INGEST REGISTRY wired (WithLocalRegistry) and ref
+// names no registry at all, that registry is consulted FIRST and the upstream
+// reference is used only on a miss — so a locally loaded image answers a bare
+// name, the kind/k3d local-image precedent. It is off by default and applies to
+// no reference that names a registry of its own; see WithLocalRegistry for the
+// full statement of the divergence and its bounds.
 //
 // This function never derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
@@ -520,6 +547,21 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		return nil, err
 	}
 
+	// LOCAL INGEST REGISTRY FIRST, and only for a reference that names no
+	// registry at all (localregistry.go). A node with no local registry
+	// configured never enters this path, and its resolution of a bare name is
+	// bit-identical to what it always was.
+	if p.localRegistryApplies(ref) {
+		res, lerr := p.pullFromLocalRegistry(ctx, ref, policy, want)
+		if !errors.Is(lerr, errLocalRegistryMiss) {
+			// A hit, or a definitive refusal from this node's own registry. The
+			// sentinel never escapes: the caller sees the image or that verdict.
+			return res, lerr
+		}
+		p.logger().Debug("the node's ingest registry does not have this reference; continuing upstream",
+			"ref", ref, "localRegistry", p.localRegistry, "error", lerr)
+	}
+
 	img, err := p.primaryFetch(ctx, ref, cred, policy)
 	if err != nil {
 		// CLUSTER MIRROR FALLBACK (mirror.go). It engages only when this node has
@@ -528,7 +570,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		// mirrorCandidates returns nothing and the primary error stands verbatim,
 		// which is the whole of the behavior on a node with no MirrorSource.
 		if mirrors := p.mirrorCandidates(ref, err); len(mirrors) > 0 {
-			return p.pullFromMirrors(ctx, ref, policy, want, mirrors, err)
+			return p.pullFromMirrors(ctx, ref, ref, policy, want, mirrors, err)
 		}
 		return nil, err
 	}

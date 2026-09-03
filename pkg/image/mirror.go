@@ -269,32 +269,43 @@ func validateRegistryAuthority(what, host string) error {
 	return nil
 }
 
-// clusterLocalRef reports whether ref's registry authority is a LOOPBACK
-// spelling — this node's own ingest registry.
+// clusterLocal reports whether ref names THIS CLUSTER's own ingest registry: a
+// LOOPBACK spelling, always, or an authority the consumer admitted with
+// WithClusterRegistries.
 //
-// This is the second half of the fallback precondition, and it is what keeps the
-// mechanism narrow. A pod that asked for docker.io/library/nginx and got a 404
-// wants that answer: no peer of this cluster is a more authoritative source for
-// a public registry's namespace, and consulting one would silently satisfy a
-// public reference from cluster-local content. A pod that asked for
-// localhost:6450/app:v1 is asking for THIS CLUSTER's ingest registry, whose
-// content is replicated across peers by construction — the reference is
-// node-relative, and resolving it against a peer is resolving it correctly.
+// This is the second half of the fallback precondition (mirrorCandidates), and
+// it is what keeps the mechanism narrow. A pod that asked for
+// docker.io/library/nginx and got a 404 wants that answer: no peer of this
+// cluster is a more authoritative source for a public registry's namespace, and
+// consulting one would silently satisfy a public reference from cluster-local
+// content. A pod that asked for localhost:6450/app:v1 is asking for this
+// cluster's ingest registry, whose content is replicated across peers by
+// construction — the reference is node-relative, and resolving it against a peer
+// is resolving it correctly.
 //
-// Accepted: "localhost:<port>", "*.localhost" (with or without a port), any
-// address in 127.0.0.0/8, and the IPv6 loopback "::1" in bracketed form.
+// Accepted unconditionally: "localhost:<port>", "*.localhost" (with or without a
+// port), any address in 127.0.0.0/8, and the IPv6 loopback "::1" in bracketed
+// form. Accepted additionally: exactly the authorities the consumer named — the
+// Service DNS name or VIP the same registry is published under.
 //
 // The authority must additionally be one go-containerregistry itself reads as a
-// registry (registryShaped), and that excludes one shape a reader would expect
-// to be here: a BARE "localhost/team/app". ggcr treats a first component with no
+// registry (authorityOf), and that excludes one shape a reader would expect to
+// be here: a BARE "localhost/team/app". ggcr treats a first component with no
 // '.' and no ':' as part of the repository, so that reference resolves against
 // Docker Hub as the repository "localhost/team/app" — it never names this node
 // at all, and rewriting its first component would ask a peer for something the
 // pod did not. Excluding it keeps this gate in agreement with the parser the
 // pull actually uses.
-func clusterLocalRef(ref string) bool {
+func (p *Puller) clusterLocal(ref string) bool {
 	authority, ok := authorityOf(ref)
-	return ok && loopbackAuthority(authority)
+	return ok && p.clusterLocalAuthority(authority)
+}
+
+// clusterLocalAuthority is clusterLocal over an authority that has already been
+// separated from a reference — the form the node's own ingest-registry host
+// arrives in (WithLocalRegistry), where there is no reference to split.
+func (p *Puller) clusterLocalAuthority(authority string) bool {
+	return loopbackAuthority(authority) || p.clusterRegistries.has(authority)
 }
 
 // authorityOf returns the REGISTRY AUTHORITY ref names, and ok=false when ref
@@ -529,12 +540,18 @@ func (p *Puller) mirrorCandidates(ref string, primaryErr error) []Mirror {
 // pullFromMirrors tries each candidate in preference order and returns the first
 // one whose content ingests cleanly.
 //
-// ref is the ORIGINAL reference throughout, and every candidate is ingested
-// under it: the pod asked for the node-relative reference, and the mirror is
-// TRANSPORT, not identity. So the index records what the pod named, a later
-// IfNotPresent serve finds it under that name, and nothing downstream can tell
-// which peer the bytes came from — which is the property that makes a peer's
-// availability irrelevant to the pod's.
+// fetchRef is the reference whose AUTHORITY each candidate replaces — the one
+// the primary attempt just failed on. recordRef is the reference the result is
+// ingested and indexed under. They are the same string on the ordinary path, and
+// they differ on exactly one: the bare-name attempt against the node's own
+// ingest registry fetches "<localhost>/app:v1" and records "app:v1", because
+// that is what the user wrote (see pullFromLocalRegistry).
+//
+// Neither is ever the MIRROR's spelling: the peer is TRANSPORT, not identity. So
+// the index records what the pod named, a later IfNotPresent serve finds it
+// under that name, and nothing downstream can tell which peer the bytes came
+// from — which is the property that makes a peer's availability irrelevant to
+// the pod's.
 //
 // A candidate that serves content failing verification is a PER-MIRROR failure:
 // the loop moves to the next peer. It never degrades to trusting the content,
@@ -542,7 +559,7 @@ func (p *Puller) mirrorCandidates(ref string, primaryErr error) []Mirror {
 // blobs — each iteration ingests one image whole (config, manifest, every layer)
 // or commits nothing, because Puller.ingest releases its lease and returns on
 // the first failure.
-func (p *Puller) pullFromMirrors(ctx context.Context, ref string, policy PlatformPolicy, want []Platform, mirrors []Mirror, primaryErr error) (*PullResult, error) {
+func (p *Puller) pullFromMirrors(ctx context.Context, fetchRef, recordRef string, policy PlatformPolicy, want []Platform, mirrors []Mirror, primaryErr error) (*PullResult, error) {
 	log := p.logger()
 	consulted := 0
 	var failures []string
@@ -550,29 +567,29 @@ func (p *Puller) pullFromMirrors(ctx context.Context, ref string, policy Platfor
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		mirrorRef, err := rewriteRegistryHost(ref, m.Host)
+		mirrorRef, err := rewriteRegistryHost(fetchRef, m.Host)
 		if err != nil {
 			// Not counted as consulted: nothing was contacted. A malformed
 			// candidate is a control-plane fault, so it is reported at WARN
 			// rather than folded into the per-miss debug stream.
-			log.Warn("skipping an unusable cluster mirror candidate", "ref", ref, "mirror", m.Host, "error", err)
+			log.Warn("skipping an unusable cluster mirror candidate", "ref", recordRef, "mirror", m.Host, "error", err)
 			failures = append(failures, mirrorFailure(m.Host, err))
 			continue
 		}
 		consulted++
 		img, err := p.mirrorFetch(ctx, mirrorRef, m, policy)
 		if err != nil {
-			log.Debug("cluster mirror does not have the image", "ref", ref, "mirror", m.Host, "error", err)
+			log.Debug("cluster mirror does not have the image", "ref", recordRef, "mirror", m.Host, "error", err)
 			failures = append(failures, mirrorFailure(m.Host, err))
 			continue
 		}
-		res, err := p.ingest(ctx, ref, img, want)
+		res, err := p.ingest(ctx, recordRef, img, want)
 		if err != nil {
-			log.Debug("cluster mirror served content this node refused", "ref", ref, "mirror", m.Host, "error", err)
+			log.Debug("cluster mirror served content this node refused", "ref", recordRef, "mirror", m.Host, "error", err)
 			failures = append(failures, mirrorFailure(m.Host, err))
 			continue
 		}
-		log.Info("pulled from a cluster mirror", "ref", ref, "mirror", m.Host, "mirrorRef", mirrorRef)
+		log.Info("pulled from a cluster mirror", "ref", recordRef, "mirror", m.Host, "mirrorRef", mirrorRef)
 		return res, nil
 	}
 	// The PRIMARY error stays the cause: it is what the pod's own registry said,

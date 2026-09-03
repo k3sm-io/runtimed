@@ -470,6 +470,27 @@ type Deps struct {
 	// the EMBEDDING control plane (k3sm) — which knows how its registry is
 	// published — can supply the list. It is ignored when Deps.Puller is set.
 	ClusterRegistries []string
+	// LocalRegistryHost names THIS NODE's own ingest registry (host[:port]).
+	// When set, a pull for an image reference that names no registry at all —
+	// "app:v1", which would otherwise normalise to Docker Hub — consults that
+	// registry FIRST and falls through to the upstream reference on a miss. Empty
+	// — the default, and what the STANDALONE daemon always has — leaves bare-name
+	// resolution bit-identical to stock.
+	//
+	// This is a deliberate divergence and the reason to want it is the local
+	// development loop: an image built or loaded on this node answers the bare
+	// name a manifest already carries, instead of every locally built image
+	// needing a registry prefix nobody's manifests have. It is the precedent kind
+	// and k3d set. The cost — a bare name that exists locally shadows the Docker
+	// Hub image of the same name — is bounded to references that name no registry
+	// and to miss-class failures only; see image.WithLocalRegistry, which states
+	// it in full.
+	//
+	// The host must be cluster-local: a loopback spelling, or one of the
+	// ClusterRegistries above. image.NewPuller refuses anything else, so a node
+	// cannot be configured to treat some third-party registry as its own. Like
+	// the two seams above it is ignored when Deps.Puller is set.
+	LocalRegistryHost string
 	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
 	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
@@ -608,6 +629,9 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 			// authorities, so the node states it rather than inheriting it. Both
 			// halves go in one call — NewPuller refuses a half-wiring.
 			opts = append(opts, image.WithClusterRegistries(deps.ClusterRegistries, image.RemoteInsecureFetch))
+		}
+		if deps.LocalRegistryHost != "" {
+			opts = append(opts, image.WithLocalRegistry(deps.LocalRegistryHost))
 		}
 		if deps.ImageMirrors != nil {
 			// image.RemoteMirrorFetch is named here for the same reason

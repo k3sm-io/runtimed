@@ -152,18 +152,6 @@ func (p *Puller) configuredClusterRegistry(ref string) bool {
 	return ok && p.clusterRegistries.has(authority)
 }
 
-// clusterLocal is the FULL cluster-local test: a loopback spelling, always, or
-// one of the authorities the consumer admitted.
-//
-// It is the mirror fallback's second precondition (mirrorCandidates), and it is
-// deliberately the ONE place the two admissions are joined: a Service-DNS
-// spelling of this cluster's registry is brokered exactly as the loopback
-// spelling of the same pull is, or the uniformity this seam exists for would be
-// only skin deep.
-func (p *Puller) clusterLocal(ref string) bool {
-	return clusterLocalRef(ref) || p.configuredClusterRegistry(ref)
-}
-
 // primaryFetch performs the pull's PRIMARY fetch, choosing the transport the
 // reference's own authority calls for: the plain-HTTP fetcher for an authority
 // WithClusterRegistries admitted, and the ordinary fetcher — with its TLS — for

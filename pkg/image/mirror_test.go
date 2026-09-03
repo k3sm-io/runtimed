@@ -594,6 +594,16 @@ func TestMirrorFallbackEligibility(t *testing.T) {
 // TestClusterLocalRefGate drives the second precondition: only a reference into
 // THIS node's own ingest registry may be answered by a peer.
 func TestClusterLocalRefGate(t *testing.T) {
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No cluster registries admitted: these rows are the UNCONDITIONAL loopback
+	// half of the gate, which no configuration may narrow.
+	p, err := NewPuller(cache, RemoteFetch, NoLocalIndex{})
+	if err != nil {
+		t.Fatalf("NewPuller: %v", err)
+	}
 	for _, tc := range []struct {
 		ref  string
 		want bool
@@ -619,8 +629,8 @@ func TestClusterLocalRefGate(t *testing.T) {
 		{"app:v1", false},
 	} {
 		t.Run(tc.ref, func(t *testing.T) {
-			if got := clusterLocalRef(tc.ref); got != tc.want {
-				t.Errorf("clusterLocalRef(%q) = %v, want %v", tc.ref, got, tc.want)
+			if got := p.clusterLocal(tc.ref); got != tc.want {
+				t.Errorf("clusterLocal(%q) = %v, want %v", tc.ref, got, tc.want)
 			}
 		})
 	}
