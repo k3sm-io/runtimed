@@ -451,6 +451,25 @@ type Deps struct {
 	// brings its own puller has already made every pull decision, mirrors
 	// included.
 	ImageMirrors image.MirrorSource
+	// ClusterRegistries names ADDITIONAL registry authorities that spell THIS
+	// cluster's own ingest registry — a Service DNS name:port or a Service VIP:port
+	// a workload may write into an image reference instead of the loopback
+	// spelling. Empty — the default, and what the STANDALONE daemon always has —
+	// leaves the loopback-only behavior exactly as it was.
+	//
+	// A reference carrying one of these authorities is treated as node-relative:
+	// it is dialled over plain HTTP (go-containerregistry infers http only for
+	// loopback and RFC 1918, so a Service address would otherwise fail a TLS
+	// handshake against a plain-HTTP registry), and the cluster-mirror fallback
+	// brokers it identically to the loopback spelling of the same pull. The
+	// plaintext is scoped to exactly these authorities; every other reference
+	// keeps the primary fetcher and its TLS.
+	//
+	// Like ImageMirrors it is a Deps field and not a Config one, and for the same
+	// reason: runtimed neither reads the apiserver nor resolves Services, so only
+	// the EMBEDDING control plane (k3sm) — which knows how its registry is
+	// published — can supply the list. It is ignored when Deps.Puller is set.
+	ClusterRegistries []string
 	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
 	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
@@ -583,6 +602,13 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
 		opts := []image.PullerOption{image.WithPullLogger(log)}
+		if len(deps.ClusterRegistries) > 0 {
+			// image.RemoteInsecureFetch is named here for the same reason
+			// RemoteFetch is: it is the transport decision for a named set of
+			// authorities, so the node states it rather than inheriting it. Both
+			// halves go in one call — NewPuller refuses a half-wiring.
+			opts = append(opts, image.WithClusterRegistries(deps.ClusterRegistries, image.RemoteInsecureFetch))
+		}
 		if deps.ImageMirrors != nil {
 			// image.RemoteMirrorFetch is named here for the same reason
 			// RemoteFetch is: it is the second place bytes can come from, so the

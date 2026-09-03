@@ -218,33 +218,55 @@ func (m Mirror) reference(ref string) (name.Reference, error) {
 // or one go-containerregistry will not accept as an RFC 3986 authority, is
 // refused here so the candidate is skipped before any round trip.
 func rewriteRegistryHost(ref, host string) (string, error) {
-	if host == "" {
-		return "", errors.New("mirror host is empty")
-	}
-	// Rejected before name.NewRegistry, not instead of it: checkRegistry admits
-	// the empty string and its RFC 3986 authority check is not obviously a
-	// path/scheme check to a reader. These two are the splices that matter.
-	if strings.ContainsAny(host, "/@") || strings.Contains(host, "://") {
-		return "", fmt.Errorf("mirror host %s must be a bare host[:port] authority", quoteBounded(host, maxMirrorHostLen))
-	}
-	// A host go-containerregistry would not RECOGNISE as a registry is refused,
-	// and this one is not cosmetic. Its splitting rule is exactly "the first
-	// component is the registry iff it contains a '.' or a ':'" (name.NewRepository)
-	// — so splicing a dotless, portless host would produce a reference whose
-	// first component is read as part of the REPOSITORY and whose registry
-	// defaults to Docker Hub. A candidate spelled "peer" would silently redirect
-	// a cluster-local pull at a public registry.
-	if !registryShaped(host) {
-		return "", fmt.Errorf("mirror host %s must carry a port or a dotted name, or it is not read as a registry", quoteBounded(host, maxMirrorHostLen))
-	}
-	if _, err := name.NewRegistry(host); err != nil {
-		return "", fmt.Errorf("mirror host %s: %w", quoteBounded(host, maxMirrorHostLen), boundErr(err))
+	if err := validateRegistryAuthority("mirror host", host); err != nil {
+		return "", err
 	}
 	i := strings.Index(ref, "/")
 	if i < 0 {
 		return "", fmt.Errorf("reference %s names no registry", quoteBounded(ref, maxReferenceLen))
 	}
 	return host + ref[i:], nil
+}
+
+// validateRegistryAuthority reports whether host is usable as the registry
+// authority of a reference this package will build. what names the caller's
+// notion of the value ("mirror host", "cluster registry") so one rule can serve
+// every consumer-supplied authority without a reader having to guess which
+// configuration field a refusal came from.
+//
+// It is shared BY DESIGN. A mirror candidate, an admitted cluster-local
+// authority and the node's own ingest-registry host all arrive from the cluster,
+// all end up spliced into a reference, and all have exactly the same three ways
+// of being wrong — so a second copy of this check would be a second, drifting
+// answer to "what may a registry authority be".
+//
+//   - A value carrying a path, a scheme or userinfo would splice into the
+//     REPOSITORY portion of a reference and redirect a pull at a repository
+//     nobody named. These are rejected before name.NewRegistry, not instead of
+//     it: checkRegistry admits the empty string, and its RFC 3986 authority
+//     check is not obviously a path/scheme check to a reader.
+//   - A host go-containerregistry would not RECOGNISE as a registry is refused,
+//     and this one is not cosmetic. Its splitting rule is exactly "the first
+//     component is the registry iff it contains a '.' or a ':'"
+//     (name.NewRepository) — so a dotless, portless host would produce a
+//     reference whose first component is read as part of the REPOSITORY and
+//     whose registry defaults to Docker Hub. An authority spelled "peer" would
+//     silently redirect a cluster-local pull at a public registry.
+//   - Anything else name.NewRegistry rejects.
+func validateRegistryAuthority(what, host string) error {
+	if host == "" {
+		return fmt.Errorf("%s is empty", what)
+	}
+	if strings.ContainsAny(host, "/@") || strings.Contains(host, "://") {
+		return fmt.Errorf("%s %s must be a bare host[:port] authority", what, quoteBounded(host, maxMirrorHostLen))
+	}
+	if !registryShaped(host) {
+		return fmt.Errorf("%s %s must carry a port or a dotted name, or it is not read as a registry", what, quoteBounded(host, maxMirrorHostLen))
+	}
+	if _, err := name.NewRegistry(host); err != nil {
+		return fmt.Errorf("%s %s: %w", what, quoteBounded(host, maxMirrorHostLen), boundErr(err))
+	}
+	return nil
 }
 
 // clusterLocalRef reports whether ref's registry authority is a LOOPBACK
@@ -271,12 +293,30 @@ func rewriteRegistryHost(ref, host string) (string, error) {
 // pod did not. Excluding it keeps this gate in agreement with the parser the
 // pull actually uses.
 func clusterLocalRef(ref string) bool {
+	authority, ok := authorityOf(ref)
+	return ok && loopbackAuthority(authority)
+}
+
+// authorityOf returns the REGISTRY AUTHORITY ref names, and ok=false when ref
+// names none — either because it carries no "/" at all, or because its first
+// component is one go-containerregistry reads as part of a Docker Hub
+// repository rather than as a registry (registryShaped).
+//
+// It is the ONE reading of "the registry portion of a reference" in this
+// package, so every gate built on it — the loopback test, the admitted
+// cluster-registry test, the bare-name test — agrees with the parser the pull
+// actually uses, and none of them can be tricked into treating a repository
+// element as a host.
+func authorityOf(ref string) (string, bool) {
 	i := strings.Index(ref, "/")
 	if i < 0 {
-		return false
+		return "", false
 	}
 	authority := ref[:i]
-	return registryShaped(authority) && loopbackAuthority(authority)
+	if !registryShaped(authority) {
+		return "", false
+	}
+	return authority, true
 }
 
 // registryShaped reports whether go-containerregistry would read authority as a
@@ -469,11 +509,15 @@ func (p *Puller) logger() *slog.Logger {
 // mirrorCandidates returns the peers to consult after primaryErr, or nil when
 // the fallback does not apply. Both preconditions are checked here, at one
 // place, so "when do we fall back" has a single readable answer.
+//
+// The cluster-local half is Puller.clusterLocal, not the bare loopback test: an
+// authority the consumer admitted with WithClusterRegistries is brokered exactly
+// as a loopback spelling of the same registry is.
 func (p *Puller) mirrorCandidates(ref string, primaryErr error) []Mirror {
 	if p.mirrors == nil || p.mirrorFetch == nil {
 		return nil
 	}
-	if !clusterLocalRef(ref) {
+	if !p.clusterLocal(ref) {
 		return nil
 	}
 	if !mirrorFallbackEligible(primaryErr) {

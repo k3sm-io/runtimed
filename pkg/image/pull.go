@@ -343,6 +343,16 @@ type Puller struct {
 	mirrors     MirrorSource
 	mirrorFetch MirrorFetchFunc
 
+	// clusterRegistryHosts is the raw list WithClusterRegistries was given and
+	// clusterRegistries is its validated membership set, built once by NewPuller
+	// so a malformed authority is a construction error rather than a spelling
+	// that silently never matches. clusterFetch is the plain-HTTP fetcher those
+	// authorities are dialled with; all three are set together or not at all
+	// (see WithClusterRegistries, and the half-wiring refusal in NewPuller).
+	clusterRegistryHosts []string
+	clusterRegistries    clusterRegistrySet
+	clusterFetch         FetchFunc
+
 	// log reports mirror fallback (WithPullLogger). Nil discards. The primary
 	// path logs nothing, so a puller without a logger is silent as before.
 	log *slog.Logger
@@ -384,6 +394,19 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 	if (p.mirrors == nil) != (p.mirrorFetch == nil) {
 		return nil, errors.New("image puller: WithMirrors needs both a source and a fetcher (the production fetcher is image.RemoteMirrorFetch)")
 	}
+	// The ADMITTED CLUSTER REGISTRIES, on the same terms: a set with no fetcher
+	// would name authorities nothing can dial with the transport they need, and a
+	// fetcher with no set would be a plain-HTTP path nothing can reach. Both are
+	// silent failures — the first dials HTTPS at a plain-HTTP registry, the
+	// second does nothing at all — so neither is accepted.
+	if (len(p.clusterRegistryHosts) > 0) != (p.clusterFetch != nil) {
+		return nil, errors.New("image puller: WithClusterRegistries needs both a non-empty authority set and a fetcher (the production fetcher is image.RemoteInsecureFetch)")
+	}
+	set, err := newClusterRegistrySet(p.clusterRegistryHosts)
+	if err != nil {
+		return nil, fmt.Errorf("image puller: %w", err)
+	}
+	p.clusterRegistries = set
 	return p, nil
 }
 
@@ -425,6 +448,12 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // one has the content — see pullFromMirrors. The reference recorded is always
 // the one asked for. A node with no MirrorSource never enters that path, and its
 // behavior on a failed fetch is unchanged: the primary error, verbatim.
+//
+// "This node's own ingest registry" means a loopback spelling always, plus any
+// authority the consumer admitted with WithClusterRegistries — a Service DNS
+// name or VIP that names the same registry. A reference carrying an admitted
+// authority is fetched over plain HTTP (see RemoteInsecureFetch) and brokered
+// identically to the loopback spelling of the same pull.
 //
 // This function never derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
@@ -491,7 +520,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		return nil, err
 	}
 
-	img, err := p.fetch(ctx, ref, cred, policy)
+	img, err := p.primaryFetch(ctx, ref, cred, policy)
 	if err != nil {
 		// CLUSTER MIRROR FALLBACK (mirror.go). It engages only when this node has
 		// peers wired, the reference names this node's OWN ingest registry, and
