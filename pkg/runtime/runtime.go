@@ -451,6 +451,69 @@ type Deps struct {
 	// brings its own puller has already made every pull decision, mirrors
 	// included.
 	ImageMirrors image.MirrorSource
+	// ClusterRegistries names ADDITIONAL registry authorities that spell THIS
+	// cluster's own ingest registry — a Service DNS name:port or a Service VIP:port
+	// a workload may write into an image reference instead of the loopback
+	// spelling. Empty — the default, and what the STANDALONE daemon always has —
+	// leaves the loopback-only behavior exactly as it was.
+	//
+	// A reference carrying one of these authorities is treated as node-relative:
+	// it is dialled over plain HTTP (go-containerregistry infers http only for
+	// loopback and RFC 1918, so a Service address would otherwise fail a TLS
+	// handshake against a plain-HTTP registry), and the cluster-mirror fallback
+	// brokers it identically to the loopback spelling of the same pull. The
+	// plaintext is scoped to exactly these authorities; every other reference
+	// keeps the primary fetcher and its TLS.
+	//
+	// Like ImageMirrors it is a Deps field and not a Config one, and for the same
+	// reason: runtimed neither reads the apiserver nor resolves Services, so only
+	// the EMBEDDING control plane (k3sm) — which knows how its registry is
+	// published — can supply the list. It is ignored when Deps.Puller is set.
+	ClusterRegistries []string
+	// LocalRegistryHost names THIS NODE's own ingest registry (host[:port]).
+	// When set, a pull for an image reference that names no registry at all —
+	// "app:v1", which would otherwise normalise to Docker Hub — consults that
+	// registry FIRST and falls through to the upstream reference on a miss. Empty
+	// — the default, and what the STANDALONE daemon always has — leaves bare-name
+	// resolution bit-identical to stock.
+	//
+	// This is a deliberate divergence and the reason to want it is the local
+	// development loop: an image built or loaded on this node answers the bare
+	// name a manifest already carries, instead of every locally built image
+	// needing a registry prefix nobody's manifests have. It is the precedent kind
+	// and k3d set. The cost — a bare name that exists locally shadows the Docker
+	// Hub image of the same name — is bounded to references that name no registry
+	// and to miss-class failures only; see image.WithLocalRegistry, which states
+	// it in full.
+	//
+	// The host must be cluster-local: a loopback spelling, or one of the
+	// ClusterRegistries above. image.NewPuller refuses anything else, so a node
+	// cannot be configured to treat some third-party registry as its own. Like
+	// the two seams above it is ignored when Deps.Puller is set.
+	LocalRegistryHost string
+	// ImageIndexObserver is notified after every committed change to this node's
+	// local image index — a pull, a `k3sm image load`, a tag, an untag
+	// (image.IndexObserver). Nil — the default, and what the STANDALONE daemon
+	// always has — means no notification at all and leaves the index behaving
+	// exactly as it did before this seam existed.
+	//
+	// It exists so an embedder can learn WHEN what this node holds changed
+	// without polling, and it is deliberately the narrowest seam that answers
+	// that: runtimed neither reads nor writes an apiserver, so an observer here
+	// learns nothing about one. Whatever the embedding control plane (k3sm) does
+	// with a change — publishing an inventory, invalidating a cache — is its own
+	// business and is invisible to this package.
+	//
+	// The callback runs SYNCHRONOUSLY on the goroutine that made the change and
+	// must not block: a pull, a load and an untag all sit behind it. Delivery is
+	// therefore best-effort, and an observer recovers from a missed change with
+	// Runtime.ImageIndexSnapshot rather than by assuming it saw every event. See
+	// image.IndexObserver for the full contract.
+	//
+	// Unlike the puller seams above it is NOT ignored when Deps.Puller is set:
+	// the index is the daemon's own and every write path — including a
+	// caller-supplied puller that records into it — goes through it.
+	ImageIndexObserver image.IndexObserver
 	// Unpacker materializes a pulled image into a pod rootfs (M11.2-d7).
 	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
@@ -573,7 +636,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// instead of one per pod. It is built outside the puller branch because the
 	// ingest path records into the same index: two indexes would let a loaded
 	// reference and a pulled one disagree about what this node has.
-	index, err := image.NewFileIndex(cache)
+	index, err := image.NewFileIndex(cache, image.WithIndexObserver(deps.ImageIndexObserver))
 	if err != nil {
 		return nil, fmt.Errorf("init image index: %w", err)
 	}
@@ -583,6 +646,16 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default (B99).
 		opts := []image.PullerOption{image.WithPullLogger(log)}
+		if len(deps.ClusterRegistries) > 0 {
+			// image.RemoteInsecureFetch is named here for the same reason
+			// RemoteFetch is: it is the transport decision for a named set of
+			// authorities, so the node states it rather than inheriting it. Both
+			// halves go in one call — NewPuller refuses a half-wiring.
+			opts = append(opts, image.WithClusterRegistries(deps.ClusterRegistries, image.RemoteInsecureFetch))
+		}
+		if deps.LocalRegistryHost != "" {
+			opts = append(opts, image.WithLocalRegistry(deps.LocalRegistryHost))
+		}
 		if deps.ImageMirrors != nil {
 			// image.RemoteMirrorFetch is named here for the same reason
 			// RemoteFetch is: it is the second place bytes can come from, so the
@@ -757,6 +830,30 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		broker:       newBroker(),
 		pods:         make(map[string]*pod),
 	}, nil
+}
+
+// ImageIndexSnapshot returns every image currently recorded in this node's local
+// index — the full (reference x platform) inventory, sorted by reference.
+//
+// It is the IN-PROCESS companion to Deps.ImageIndexObserver, and the two answer
+// different questions on purpose. The observer says WHEN something changed and
+// is best-effort by construction (see image.IndexObserver); this says WHAT this
+// node holds, authoritatively, at the moment it is called. An embedder that
+// publishes an inventory therefore reconciles from a snapshot and uses the
+// observer only to decide when to take the next one — which is what makes a
+// missed notification a latency bug rather than a correctness one.
+//
+// It is read-only and takes no lease: entries are edges, never reachability
+// roots (see image.FileIndex), so listing them cannot make content survive a
+// prune and a listed image may already have had its blobs reclaimed. It fails
+// CLOSED on a damaged record for the reason List does — the caller asking what
+// is on this node is the one who most needs to hear that the index is broken.
+//
+// It is a method on Runtime rather than an exported *image.FileIndex because
+// the index is the daemon's own single-writer state: handing it out would hand
+// out Record and Remove with it.
+func (r *Runtime) ImageIndexSnapshot(ctx context.Context) ([]image.IndexEntry, error) {
+	return r.index.List(ctx)
 }
 
 // sampleInterval is the memory sampler's polling period (Config.SampleInterval,

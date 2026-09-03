@@ -157,6 +157,11 @@ var ErrIndexDigestMismatch = errors.New("image: the index entry resolves to a di
 // A FileIndex is safe for concurrent use.
 type FileIndex struct {
 	dir string
+	// observer is notified after every committed mutation (WithIndexObserver).
+	// It is set once at construction and never afterwards, which is what lets
+	// notify run without a lock on the write path of every pull. Nil is the
+	// default and means no notification at all.
+	observer IndexObserver
 }
 
 // NewFileIndex returns the on-disk index for cache, creating its directory
@@ -168,11 +173,14 @@ type FileIndex struct {
 // there first. Record re-creates a tree that has since vanished, which is not a
 // relaxation: the ownership check runs on every open, so a substituted
 // directory is refused either way (see open and ErrIndexNotOwned).
-func NewFileIndex(cache *Cache) (*FileIndex, error) {
+func NewFileIndex(cache *Cache, opts ...FileIndexOption) (*FileIndex, error) {
 	if cache == nil {
 		return nil, errors.New("image index: cache is required")
 	}
 	x := &FileIndex{dir: cache.IndexRoot()}
+	for _, o := range opts {
+		o(x)
+	}
 	if err := os.MkdirAll(x.dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create image index %s: %w", x.dir, err)
 	}
@@ -338,34 +346,54 @@ func entryName(ref string, p Platform) string {
 // emit bytes under a digest nothing checked — so the pair is validated here, at
 // the one place entries are written, rather than at each reader.
 func (x *FileIndex) Record(ctx context.Context, e IndexEntry) error {
-	if err := ctx.Err(); err != nil {
+	p, err := x.record(ctx, e)
+	if err != nil {
 		return err
+	}
+	// AFTER the commit and after the write's os.Root is closed: an observer is
+	// told about a change that has already happened, so reading the index back
+	// on receipt can only ever see at least what it was told (see IndexObserver).
+	x.notify(IndexChange{
+		Op:         IndexRecorded,
+		Reference:  e.Reference,
+		Platform:   p,
+		Descriptor: e.Descriptor,
+	})
+	return nil
+}
+
+// record is Record's write, returning the NORMALISED platform the entry was
+// filed under so the notification reports the key that was actually written
+// rather than the caller's un-normalised spelling of it.
+func (x *FileIndex) record(ctx context.Context, e IndexEntry) (Platform, error) {
+	if err := ctx.Err(); err != nil {
+		return Platform{}, err
 	}
 	ref := e.Reference
 	if ref == "" {
-		return errors.New("record image index: reference is required")
+		return Platform{}, errors.New("record image index: reference is required")
 	}
 	if e.Manifest == nil {
-		return fmt.Errorf("record image index %q: manifest is required", ref)
+		return Platform{}, fmt.Errorf("record image index %q: manifest is required", ref)
 	}
 	// The recorded manifest names the reference it was recorded for; a lookup
 	// re-checks it, and RecordPodImage keys the pod's root on it. A disagreement
 	// here is a wiring bug, and admitting it would write an entry that can only
 	// ever be read back as corrupt.
 	if got := e.Manifest.GetReference(); got != ref {
-		return fmt.Errorf("record image index %q: manifest names reference %q", ref, got)
+		return Platform{}, fmt.Errorf("record image index %q: manifest names reference %q", ref, got)
 	}
 	p := e.Platform.Normalize()
 	if p.OS == "" || p.Architecture == "" {
-		return fmt.Errorf("record image index %q: incomplete platform %s", ref, p)
+		return Platform{}, fmt.Errorf("record image index %q: incomplete platform %s", ref, p)
 	}
 	desc, err := recordedManifestDescriptor(ref, e)
 	if err != nil {
-		return err
+		return Platform{}, err
 	}
 	raw, err := protojson.Marshal(e.Manifest)
 	if err != nil {
-		return fmt.Errorf("encode image index %q: %w", ref, err)
+		return Platform{}, fmt.Errorf("encode image index %q: %w", ref, err)
 	}
 	buf, err := json.Marshal(indexEntry{
 		Schema:     indexSchema,
@@ -376,7 +404,7 @@ func (x *FileIndex) Record(ctx context.Context, e IndexEntry) error {
 		Raw:        e.ManifestRaw,
 	})
 	if err != nil {
-		return fmt.Errorf("encode image index %q: %w", ref, err)
+		return Platform{}, fmt.Errorf("encode image index %q: %w", ref, err)
 	}
 	// Re-create the tree if it has gone missing since construction. This is not
 	// a weakening of the eager create: MkdirAll is a no-op on an existing
@@ -385,14 +413,17 @@ func (x *FileIndex) Record(ctx context.Context, e IndexEntry) error {
 	// that an operator who removes the daemon's private state does not break
 	// every pull on the node until a restart (a failed record fails the pull).
 	if err := os.MkdirAll(x.dir, 0o700); err != nil {
-		return fmt.Errorf("create image index %s: %w", x.dir, err)
+		return Platform{}, fmt.Errorf("create image index %s: %w", x.dir, err)
 	}
 	root, err := x.open()
 	if err != nil {
-		return err
+		return Platform{}, err
 	}
 	defer root.Close()
-	return x.commit(root, entryName(ref, p), buf)
+	if err := x.commit(root, entryName(ref, p), buf); err != nil {
+		return Platform{}, err
+	}
+	return p, nil
 }
 
 // commit writes buf to name under root atomically: a temp file in the same
@@ -524,6 +555,19 @@ func (x *FileIndex) Get(ctx context.Context, ref string, p Platform) (IndexEntry
 // layer is where "the caller asked to remove a specific name that does not
 // exist" becomes NOT_FOUND; at this layer the removal simply had nothing to do.
 func (x *FileIndex) Remove(ctx context.Context, ref string, p Platform) (bool, error) {
+	removed, err := x.remove(ctx, ref, p)
+	if err != nil || !removed {
+		// A key that was not there is not a change: see IndexRemoved.
+		return removed, err
+	}
+	x.notify(IndexChange{Op: IndexRemoved, Reference: ref, Platform: p})
+	return true, nil
+}
+
+// remove is Remove's unlink, split out so the notification fires after the
+// index directory handle is closed and only for a removal that removed
+// something.
+func (x *FileIndex) remove(ctx context.Context, ref string, p Platform) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
