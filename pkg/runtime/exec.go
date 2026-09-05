@@ -288,7 +288,7 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 	}
 	if first.GetStdin() {
 		return status.Error(codes.Unimplemented,
-			"interactive attach (stdin/tty) to a running native process is not supported in M2; use `kubectl exec` (see runtimed PHASES M2.7)")
+			"interactive attach (stdin/tty) to a running native process is not supported; use `kubectl exec`")
 	}
 
 	var sendMu sync.Mutex
