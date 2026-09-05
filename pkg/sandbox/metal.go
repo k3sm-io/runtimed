@@ -20,7 +20,7 @@ import "strings"
 
 // metalUserClientClasses is the ENTIRE Metal/GPU delta a confined pod needs over
 // the default-deny profile: the two IOKit USER-CLIENT classes a Metal device open
-// requires. It is lab-derived, not designed — the M8.0 S1 spike ran a full MLX
+// requires. It is lab-derived, not designed — a spike ran a full MLX
 // generation and a COLD Metal-kernel JIT compile under the generated profile on an
 // Apple M1-family / macOS 26.5.2 rig and reduced the allow-set to exactly these
 // two names by ablation (k3sm hack/spike/m8 findings-s1.md).
@@ -65,7 +65,7 @@ import "strings"
 //
 // A drifted class name has no linker-symbol canary to catch it (SBPL strings are
 // data, not symbols), so the tripwires are the golden fixture below and the
-// lab-cadence GPU smoke (acceptance M8.2-a4).
+// lab-cadence GPU smoke test.
 var metalUserClientClasses = []string{
 	"AGXDeviceUserClient",
 	"IOSurfaceRootUserClient",

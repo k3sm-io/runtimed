@@ -22,5 +22,5 @@
 (allow file-write*
   (subpath "@@POD_ROOT@@")
   (literal "/dev/null"))
-;; TODO(M2): tighten /usr and /Library to specific subpaths; inject per-pod network
+;; TODO: tighten /usr and /Library to specific subpaths; inject per-pod network
 ;; rules (network-bind/outbound scoped to the pod IP) supplied by darwin-net.

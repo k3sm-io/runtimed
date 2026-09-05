@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package mount materializes a PodBox's volume sources into the pod's on-disk
-// directory (runtimed M2.2): configMap, secret, emptyDir, downwardAPI, and
+// directory: configMap, secret, emptyDir, downwardAPI, and
 // projected (including the serviceAccountToken projection).
 //
 // k3sm has NO mount namespace and NO chroot — a pod is a native process running

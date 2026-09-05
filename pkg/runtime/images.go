@@ -52,8 +52,8 @@ type imagesService struct {
 // index (image.FileIndex) — the record of what this daemon pulled or ingested
 // and verified.
 //
-// It listed the per-pod REACHABILITY ROOTS until B198, which made the answer
-// wrong in the one direction an operator notices: a freshly `k3sm image
+// It listed the per-pod REACHABILITY ROOTS until that was fixed, which made
+// the answer wrong in the one direction an operator notices: a freshly `k3sm image
 // load`ed archive has no pod behind it, so it had no root, so `image ls`
 // showed nothing while `image df` reported its bytes. "What is on this node"
 // and "what is some pod still using" are different questions, and roots only
@@ -201,8 +201,8 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 // LoadImage ingests a client-streamed image archive — the `k3sm image load` /
 // `import` path — and records it under the reference the first frame names.
 //
-// the DAEMON IS the sole STORE WRITER here (the M12 images plan, Resolution 8 as
-// amended): the client opens the operator's archive, which the daemon generally
+// the DAEMON IS the sole STORE WRITER here: the client opens the operator's
+// archive, which the daemon generally
 // cannot read, and streams the bytes; it never writes the content store itself.
 // Everything that decides whether those bytes are admitted lives below this
 // method, in image.Loader — every blob is re-hashed against the digest the
@@ -366,7 +366,7 @@ func imageStatusError(err error) error {
 //
 // PROVENANCE. A successful pull records two things, in this order: the
 // reference -> digest index EDGE (inside Pull), and then an OPERATOR ROOT over
-// that (reference x platform) — the M12 images plan, Resolution 13. The root is
+// that (reference x platform). The root is
 // why a pulled-but-unused image survives PruneImages: it stays reachable until
 // the operator removes the name with UntagImage. The root is recorded BEFORE the
 // pull's lease is released, never after, for the same reason the pod path
@@ -533,8 +533,8 @@ func (s *imagesService) TagImage(ctx context.Context, req *runtimev1.TagImageReq
 // UntagImage removes ONE (reference x platform) index entry and the operator
 // root that entry carried.
 //
-// This is the provenance model's sanctioned EXPLICIT UNTAG (the M12 images plan,
-// Resolution 13): an authorized, local root removal the operator asked for by
+// This is the provenance model's sanctioned EXPLICIT UNTAG: an authorized,
+// local root removal the operator asked for by
 // name — which is exactly what RemoveImage cannot be, since a request shaped as
 // "remove this image" does not say which root the caller owns, and this node's
 // other roots are per-pod records the daemon authored.
@@ -695,8 +695,7 @@ const saveChunkBytes = 256 << 10
 //
 // Export takes no lease, records no root and unlinks nothing, and the client is
 // the sole writer of the operator's file — the mirror of LoadImage's rule that
-// the daemon is the sole writer of the store (the M12 images plan, Resolution 8,
-// as amended).
+// the daemon is the sole writer of the store.
 func (s *imagesService) SaveImage(req *runtimev1.SaveImageRequest, stream runtimev1.Images_SaveImageServer) error {
 	ctx := stream.Context()
 	switch req.GetFormat() {

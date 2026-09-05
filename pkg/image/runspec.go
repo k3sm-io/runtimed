@@ -347,7 +347,7 @@ func expandVars(s string, lookup map[string]string) string {
 	return b.String()
 }
 
-// IsHostPathReference reports whether an image reference is the M0 absolute-HOST-PATH
+// IsHostPathReference reports whether an image reference is the absolute-HOST-PATH
 // convention rather than an OCI reference — the discriminator that decides
 // whether a container is a host binary run in place or an image to pull, unpack
 // and merge (apis runtime/v1 Container.command).

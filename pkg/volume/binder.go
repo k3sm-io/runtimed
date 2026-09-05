@@ -35,7 +35,7 @@ import (
 // configured on its StorageClass. It is a consumer-side seam (like
 // mount.Resolver): runtimed never reads the apiserver, so the provider — which
 // holds the StorageClass — wires one, and tests fake it. A nil TemplateResolver,
-// or an ok==false result, means empty-CREATE (the M3 default-class hot path, no
+// or an ok==false result, means empty-CREATE (the default-class hot path, no
 // clonefile). The returned dir is a host path cloned (CoW) into the fresh PVC dir
 // exactly once, on first create.
 type TemplateResolver interface {
@@ -90,7 +90,7 @@ var ErrInvalid = errors.New("volume: invalid persistent-volume binding")
 // it is defaulted via WithDefaults so a zero-value BasePath falls back to
 // storagev1.DefaultBasePath. cloner CoW-seeds from a template (image.APFSCloner in
 // production); a nil cloner defaults to image.APFSCloner. template resolves the
-// optional per-claim seed source (nil = empty-create only, the M3 hot path). log
+// optional per-claim seed source (nil = empty-create only, the default hot path). log
 // may be nil (a discard logger is used).
 func NewBinder(class storagev1.LocalPathClass, cloner image.Cloner, template TemplateResolver, log *slog.Logger) *Binder {
 	if cloner == nil {

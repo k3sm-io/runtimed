@@ -35,7 +35,7 @@ import (
 const DefaultExitObservationGrace = 2 * time.Second
 
 // GracefulStop tears down a pod process group with the SIGTERM → grace → SIGKILL
-// escalation Kubernetes terminationGracePeriodSeconds mandates (M2.4), racing the
+// escalation Kubernetes terminationGracePeriodSeconds mandates, racing the
 // grace timer against the supervisor's kqueue reaper:
 //
 //   - grace <= 0: send killSig IMMEDIATELY (no termSig, no timer) — the

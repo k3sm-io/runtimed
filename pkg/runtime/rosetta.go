@@ -25,7 +25,7 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// The Rosetta capability conditions (B103) — evaluated eagerly, exactly once, in
+// The Rosetta capability conditions — evaluated eagerly, exactly once, in
 // New, and stored immutably on the Runtime.
 //
 // Why eager-once and not a sync.Once cache: GetRuntimeInfo is a CONCURRENT gRPC
@@ -36,8 +36,8 @@ import (
 // host probe to at most one fork per daemon lifetime.
 //
 // The probes are not wired into the image-pull platform policy. See pullPolicy in
-// pod.go for why that stays false until the Seatbelt x Rosetta spawn is proven
-// (B105).
+// pod.go for why that stays false until the Seatbelt x Rosetta spawn is
+// proven.
 
 // Rosetta condition Reason tokens. They are MACHINE tokens: an operator greps them
 // and a future k3sm reader may branch on them, so each state gets its own and none
@@ -52,7 +52,7 @@ const (
 	// reasonRosettaGuestShareUnsupported is the guest condition's Reason when the
 	// vm backend IS available but the guests this node builds carry no Rosetta
 	// directory share, so nothing in a guest could translate a linux/amd64 ELF
-	// however capable the host is (B229). It is a DISTINCT token from
+	// however capable the host is. It is a DISTINCT token from
 	// reasonRosettaVMBackendUnavailable because the operator situations differ:
 	// one node cannot run guests at all, the other runs them without translation.
 	reasonRosettaGuestShareUnsupported = "VMHostRosettaShareUnsupported"
@@ -136,7 +136,7 @@ func evalHostRosetta(ctx context.Context, probe func(context.Context) sandbox.Ho
 // guest result cannot change any label — and skipping it keeps a
 // Virtualization.framework call off every Mac that cannot run guests anyway.
 //
-// second (B229), the guests this node BUILDS must carry a Rosetta directory share.
+// second, the guests this node BUILDS must carry a Rosetta directory share.
 // +[VZLinuxRosettaDirectoryShare availability] answers a question about the Mac,
 // not about the VM: it can say Installed while the k3sm-vmhost helper attaches no
 // share at all. Advertising on the framework answer alone would make

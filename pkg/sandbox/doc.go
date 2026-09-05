@@ -34,8 +34,8 @@ limitations under the License.
 //     /private/var/db (except the documented dyld-only read exception), denies
 //     other pods' dirs, and scopes file-write* to the pod data volume only.
 //
-//   - Backend is the swappable application seam. The M1 implementation is a
-//     non-PLATFORM exec-shim: a tiny ad-hoc-signed helper (cmd/k3sm-execshim)
+//   - Backend is the swappable application seam. The host-process implementation
+//     is a non-PLATFORM exec-shim: a tiny ad-hoc-signed helper (cmd/k3sm-execshim)
 //     that compiles+applies the profile via libsandbox in-process, then
 //     execve(pod, argv, envp) preserving envp. It deliberately does not use
 //     Apple's /usr/bin/sandbox-exec, which is a platform binary that strips

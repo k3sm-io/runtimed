@@ -341,7 +341,7 @@ func validTreeKind(k TreeKind) bool {
 //	from, and no in-flight lease pins one either — i.e. iff its backing image
 //	is itself reclaim-eligible.
 //
-// Both halves of B191's condition collapse into that one test on purpose. The
+// Both halves of that condition collapse into that one test on purpose. The
 // root set records an (image) per pod, never an (image x policy) — ImageRoot
 // deliberately carries no dialect — so the strongest honest reading is that a
 // live pod using an image protects every tree built from that image, in either

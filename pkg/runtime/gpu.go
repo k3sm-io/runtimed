@@ -23,7 +23,7 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// The GPU facts (M8.2-d4) are evaluated eagerly, exactly once, in New and stored
+// The GPU facts are evaluated eagerly, exactly once, in New and stored
 // immutably on the Runtime — the same discipline as the Rosetta conditions
 // (rosetta.go), for the same two reasons: GetRuntimeInfo is a CONCURRENT gRPC
 // handler, so a lazily-populated field would be shared mutable state needing a lock

@@ -41,13 +41,13 @@ static uintptr_t k3sm_sandbox_symbols(void) {
 	return s;
 }
 
-// M2 userspace-resource SPI the supervisor's memory subsystem (M2.5) links — both
+// The userspace-resource SPI the supervisor's memory subsystem links — both
 // resolve from libSystem (no extra -l flag). They are canaried here, with the
 // Seatbelt symbols, so an OS update that drops one fails the BUILD rather than
 // surfacing as silent OOM-accounting / jetsam-probe loss at runtime:
 //
 //   - proc_pid_rusage   : PUBLIC (<libproc.h>, since 10.9) — the ri_phys_footprint
-//                         memory sampler reads it; canaried because the whole M2.5
+//                         memory sampler reads it; canaried because the whole
 //                         OOMKilled + Summary path depends on it staying linkable.
 //   - memorystatus_control : PRIVATE/deprecated jetsam SPI — NO public header
 //                         declaration exists (only SYS_memorystatus_control in
@@ -56,7 +56,7 @@ static uintptr_t k3sm_sandbox_symbols(void) {
 extern int proc_pid_rusage(int pid, int flavor, void *buffer);
 extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 
-// k3sm_resource_symbols returns a non-zero value built from the M2 resource-SPI
+// k3sm_resource_symbols returns a non-zero value built from the resource-SPI
 // symbol addresses so the references cannot be optimized away.
 static uintptr_t k3sm_resource_symbols(void) {
 	uintptr_t s = 0;
@@ -74,7 +74,7 @@ func sandboxSymbolsResolve() bool {
 	return uintptr(C.k3sm_sandbox_symbols()) != 0
 }
 
-// resourceSymbolsResolve reports whether the M2 userspace-resource SPI symbols
+// resourceSymbolsResolve reports whether the userspace-resource SPI symbols
 // (proc_pid_rusage, memorystatus_control) linked. As with the sandbox set, the
 // real guard is that this file LINKS at all — a removed export fails the build.
 func resourceSymbolsResolve() bool {

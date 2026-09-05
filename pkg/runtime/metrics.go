@@ -23,7 +23,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// memoryLimitAnnotation carried the pod's memory limit in bytes before apis:M2.2
+// memoryLimitAnnotation carried the pod's memory limit in bytes before apis
 // defined the first-class PodBox.memory_limit_bytes field. It is now the
 // TRANSITIONAL FALLBACK only: podMemoryLimitBytes prefers the typed field and
 // reads this annotation solely when the typed field is unset, so OOM enforcement
@@ -35,13 +35,13 @@ const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 
 // podMemoryLimitBytes returns the pod's memory limit in bytes, or 0 for unlimited
 // (no OOM enforcement, no sampler). It reads the typed PodBox.memory_limit_bytes
-// (apis:M2.2) first; the typed field WINS whenever it is set (> 0). When it is
+// first; the typed field WINS whenever it is set (> 0). When it is
 // unset (0) the legacy memoryLimitAnnotation is consulted as a transitional
 // fallback (see memoryLimitAnnotation) so there is no transition window in either
 // land order. An unparseable annotation is treated as unlimited (the provider is
 // the trusted producer of both carriers).
 //
-// qos_class and rlimits also ride apis:M2.2's PodBox resource band. qos_class is
+// qos_class and rlimits also ride the PodBox resource band. qos_class is
 // informational for runtimed today (CPU is best-effort QoS, not CFS millicores —
 // the taskpolicy/setpriority application is deferred, see docs/resources.md and
 // PodBox.qos_class). rlimits from the explicit PodBox.rlimits[] are resolved
@@ -72,7 +72,7 @@ func podMemoryLimitBytes(box *runtimev1.PodBox) uint64 {
 // provider maps to the kubelet Summary API / kubectl top (Wave 3 wires it to the
 // Summary endpoint). WorkingSetBytes is ri_phys_footprint (not RSS — see
 // docs/resources.md and the supervisor MemorySampler doc). It is a
-// runtimed-internal type until apis defines the Summary message (apis:M2.2), at
+// runtimed-internal type until apis defines the Summary message, at
 // which point PodMetrics maps onto it.
 type PodMetrics struct {
 	// PodID is the pod the sample belongs to.

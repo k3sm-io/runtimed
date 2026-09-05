@@ -26,9 +26,9 @@ import (
 )
 
 // ListPodStats returns point-in-time resource-usage snapshots for pods on the
-// node — the typed wire form of the M2.5 memory sampler, behind `kubectl top` /
+// node — the typed wire form of the memory sampler, behind `kubectl top` /
 // the kubelet Summary API. It replaces the runtimed-internal-only PodMetrics path
-// with the apis:M2.2 PodStats/ContainerStats/MemoryStats contract the k3sm
+// with the PodStats/ContainerStats/MemoryStats contract the k3sm
 // provider serves.
 //
 // pod_id empty returns every metered pod (the Summary shape); pod_id set returns
@@ -78,7 +78,7 @@ func (r *Runtime) statsTargets(podID string) []string {
 // podStats builds the wire PodStats for podID, or nil when the pod is unknown or
 // has no sample to report.
 //
-// the source FORK (B107). Which KERNEL produced a pod's figures is decided here,
+// the source FORK. Which KERNEL produced a pod's figures is decided here,
 // once, by the pod's RESOLVED backend: a vm pod's working set and CPU come from
 // the guest's own cgroup2 hierarchy over the agent's Stats verb (vmPodStats),
 // and a host-process pod's come from Darwin proc_pid_rusage (hostPodStats). The

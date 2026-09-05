@@ -18,9 +18,9 @@ package supervisor
 
 import "context"
 
-// NodeNetwork is the M1 single-node PodNetwork: every pod shares the node IP (no
-// per-pod lo0 alias yet). It is the no-op seam the k3sm-injected adapter over
-// darwin-net's podnet IPAM replaces (M10.1).
+// NodeNetwork is the single-node PodNetwork: every pod shares the node IP (no
+// per-pod lo0 alias). It is the no-op seam the k3sm-injected adapter over
+// darwin-net's podnet IPAM replaces.
 type NodeNetwork struct {
 	// IP is the node IP handed to every pod. Empty yields the loopback default.
 	IP string

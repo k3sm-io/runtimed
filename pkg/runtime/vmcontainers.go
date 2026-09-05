@@ -28,7 +28,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// the VM POD'S CONTAINER mapper (M11.2-d11).
+// the VM POD'S CONTAINER mapper.
 //
 // It is the PRODUCER the guest-spec composer was written without: pkg/sandbox
 // composes guest-spec.json from VMSpec.Containers, and until this file nothing
@@ -44,7 +44,7 @@ import (
 // container's argv, env and working directory do not depend on which rung its
 // pod was routed to.
 
-// errVMHostBinaryImage reports a container whose image is the M0 absolute-path
+// errVMHostBinaryImage reports a container whose image is the absolute-path
 // host-binary convention (or the "native" sentinel) on the vm path.
 //
 // The convention names a Mach-O on this Mac; a vm pod's process runs inside a
@@ -67,8 +67,8 @@ var errVMHostBinaryImage = errors.New("the host-binary image convention has no m
 // someone else — a silent privilege promotion. Refusing names the gap instead.
 //
 // Closing it is an apis change (a user string on GuestContainer, resolved in the
-// guest against the container rootfs at exec time); it is filed as B193 and is
-// deliberately not carved here. Compare with errors.Is.
+// guest against the container rootfs at exec time); it is tracked as future
+// work and deliberately not carved here. Compare with errors.Is.
 var errVMUnresolvableUser = errors.New("the image runs as a named user the host cannot resolve and the guest cannot be told")
 
 // errVMSidecarUnexpressible reports a native sidecar (an init container with
@@ -309,7 +309,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	}
 	res.Lease.Release()
 
-	// Materialize the image's layers into the pod's rootfs share (M11.2-d7's
+	// Materialize the image's layers into the pod's rootfs share (the
 	// unpacker, on the vm spine). Until this call the vm path pulled and then
 	// left <podDir>/rootfs EMPTY: the guest mounted an empty lower layer, its
 	// first container exec found no /bin/sh, the container exited instantly and
@@ -365,7 +365,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	// the pod's fsGroup alongside the primary gid (resolveCredential). The gid
 	// comes from the securityContext chain alone: the group half of an image
 	// USER directive ("1000:1000") is not carried across guest/v1 either, the
-	// same B193 gap the uid half fails closed on — but a lost group half cannot
+	// same gap the uid half fails closed on — but a lost group half cannot
 	// promote a container to root, so it is recorded here rather than refused.
 	gids := make([]int64, 0, len(cred.Groups))
 	for _, g := range cred.Groups {

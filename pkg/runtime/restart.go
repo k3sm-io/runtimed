@@ -30,7 +30,7 @@ import (
 // RestartContainer restarts a single container of a running pod IN place: it
 // terminates the container's process group within the grace window, then re-spawns
 // it from the same SPEC through the same machinery createPod uses — the pod's
-// already-generated SBPL profile, the M2.3 uid/gid drop via the exec-shim backend,
+// already-generated SBPL profile, the uid/gid drop via the exec-shim backend,
 // and the same mounts — so the replacement runs in exactly the same confinement
 // domain. The restart_count is incremented and the prior run is recorded in
 // last_termination_state. A failed liveness probe or a CrashLoopBackOff re-exec
@@ -38,7 +38,7 @@ import (
 // pod-level restart — other containers are untouched.
 //
 // A re-exec is also how a pod leaves a terminal phase: the swap below feeds
-// recomputePhaseLocked, which de-escalates the pod back to Running (B26), and
+// recomputePhaseLocked, which de-escalates the pod back to Running, and
 // re-arms the memory sampler if that terminal transition had cancelled it.
 //
 // Unknown pod / container return a structured NOT_FOUND (RestartContainerResponse
@@ -85,7 +85,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	p.mu.Unlock()
 
 	// Terminate the old process group within the grace window (SIGTERM → grace →
-	// SIGKILL, the M2.4 escalation), then wait for the kqueue reaper to collect it
+	// SIGKILL escalation), then wait for the kqueue reaper to collect it
 	// before re-spawning so the replacement does not race the old for the pod
 	// IP/ports. SIGKILL is uncatchable, so the wait is bounded; ctx bounds it too.
 	grace := graceDuration(req.GetGracePeriodSeconds(), p)
@@ -132,7 +132,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// Swap the new container in for the old (the old is now reaped + detached),
 	// carrying the incremented restart_count and the prior run's termination state.
 	//
-	// ATOMICITY INVARIANT (B26): the count bump, the last_termination_state, the
+	// ATOMICITY INVARIANT: the count bump, the last_termination_state, the
 	// container swap, the phase recompute and the status snapshot all happen
 	// under one hold of p.mu. No observer — GetPodStatus, WatchPodStatus, or this
 	// response — can ever see a bumped restart_count next to the previous run's
@@ -144,7 +144,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// memory sampler cancelled by the truly-terminal teardown (trulyTerminalLocked),
 	// so a re-exec out of EITHER must re-arm it. Failed is the CrashLoopBackOff
 	// case and thus the common one — omitting it would leave every re-execed
-	// crash-looping pod permanently unenforced (B26).
+	// crash-looping pod permanently unenforced.
 	wasTerminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED ||
 		p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
 	newCP.state.RestartCount = oldRestartCount + 1
@@ -201,7 +201,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 // while the restart was in flight (the pod concluded meanwhile), and no reap will
 // re-evaluate it — this container's exit was already recorded. So the predicate is
 // re-checked here too; without it a failed restart is the second way the
-// mid-restart guard could turn a deferral into a permanent skip (B26).
+// mid-restart guard could turn a deferral into a permanent skip.
 func (r *Runtime) clearRestarting(ctx context.Context, p *pod, cp *containerProc) {
 	p.mu.Lock()
 	cp.restarting = false

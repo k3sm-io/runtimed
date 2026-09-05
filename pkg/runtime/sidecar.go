@@ -40,7 +40,7 @@ func sidecarsLocked(p *pod) []*containerProc {
 // in START order. It is the re-claim set for a pod found still terminal after a
 // RestartContainer swap: the once-only p.sidecarTeardown latch cannot cover a
 // process spawned after the claim, and a terminal pod must leave no sidecar
-// running (B26). Caller holds p.mu.
+// running. Caller holds p.mu.
 func liveSidecarsLocked(p *pod) []*containerProc {
 	var out []*containerProc
 	for _, cp := range liveContainersLocked(p) {

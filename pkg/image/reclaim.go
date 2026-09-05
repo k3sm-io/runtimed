@@ -39,7 +39,7 @@ import (
 // this many bytes of headroom.
 //
 // They are the top two rungs of a ladder whose lower rungs are
-// DefaultPullRefuseFreeBytes and B27's node DiskPressure floor; the ordering
+// DefaultPullRefuseFreeBytes and the node's DiskPressure condition floor; the ordering
 // between them is the design, and it is stated once, at
 // DefaultPullRefuseFreeBytes. Changing either value here without reading that
 // comment can invert it.

@@ -98,9 +98,9 @@ func dialGuestUnix(ctx context.Context, addr string) (net.Conn, error) {
 // and that field is immutable after create — so no lock is taken or needed.
 //
 // The vm route is reachable exactly when a pod carries SANDBOX_BACKEND_VM here;
-// createVMPod records it when it assembles a running vm pod (M11.2-d2's live
-// boot — until then it fails before assembling one, so production has no such
-// pod and this predicate is false for every pod that exists).
+// createVMPod records it when it assembles a running vm pod via the live-boot
+// path — until it succeeds it fails before assembling one, so a pod that
+// never booted a guest is false for this predicate.
 func (p *pod) isVM() bool {
 	return p.backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 }

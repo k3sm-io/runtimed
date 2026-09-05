@@ -26,7 +26,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// resolveCredential computes the POSIX identity a container drops to (M2.3),
+// resolveCredential computes the POSIX identity a container drops to,
 // with the kube precedence container.securityContext > pod_security_context >
 // PodBox.uid/gid. The proto's int64 run_as_* fields cannot distinguish "unset"
 // from 0 (documented on apis SecurityContext), so this treats 0 as "inherit from
@@ -36,7 +36,7 @@ import (
 //
 // A drop is requested iff the resolved uid OR gid is non-zero. A fully-zero
 // identity means the pod runs as the daemon (root-in-Seatbelt) — the documented
-// M2.3 fallback until untrusted tenancy routes to the M5 vm backend.
+// fallback until untrusted tenancy routes to the vm backend.
 func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor.Credential {
 	psc := box.GetPodSecurityContext()
 	sc := c.GetSecurityContext()
@@ -72,7 +72,7 @@ func firstNonZero(vals ...int) int {
 }
 
 // resolveBgQoS maps the pod's declared kube QoS class (the apis QOSClass enum,
-// PodBox.qos_class) to the supervisor-local background flag — the B7 mapping
+// PodBox.qos_class) to the supervisor-local background flag — the mapping
 // decision lives here, in the runtime layer, so the supervisor stays decoupled
 // from apis (mirroring resolveRlimitPlan/PlannedRlimit):
 //
@@ -180,8 +180,8 @@ func rlimitValue(v uint64) uint64 {
 }
 
 // volumeMountStatuses builds the ContainerStatus.volume_mounts mirror from a
-// container's declared mounts (the lossless-mirror pairing for the M2.1 spec
-// field VolumeMount).
+// container's declared mounts (the lossless-mirror pairing for the
+// VolumeMount spec field).
 func volumeMountStatuses(c *runtimev1.Container) []*runtimev1.VolumeMountStatus {
 	vms := c.GetVolumeMounts()
 	if len(vms) == 0 {

@@ -40,7 +40,7 @@ const (
 	// is a TRUNCATION bound, not an acceptance bound: a longer line is delivered
 	// truncated and the pump keeps going (readLogLine), so this number chooses
 	// how much of a pathological line survives — it is never a cliff past which
-	// output stops. Left at the 1 MiB the pre-B164 scanner used: raising it would
+	// output stops. Left at the 1 MiB the earlier scanner used: raising it would
 	// only move a cliff that no longer exists, at a per-pod memory cost in the
 	// daemon that supervises every pod on the node.
 	maxLogLineBytes = 1024 * 1024
@@ -185,7 +185,7 @@ func (p *Process) Start(ctx context.Context) error {
 //
 // A line longer than maxLogLineBytes is delivered truncated to its tail and the
 // pump CONTINUES — one pathological line must never end a container's log
-// delivery, which is what the pre-B164 bufio.Scanner did silently (Scan() stops
+// delivery, which is what an earlier bufio.Scanner-based pump did silently (Scan() stops
 // on an over-cap token and its Err() was never checked), taking kubectl logs and
 // the FallbackToLogsOnError termination message with it for the life of the
 // container.
@@ -209,7 +209,7 @@ func (p *Process) pumpLogs() {
 		if err != nil {
 			// io.EOF is the normal end (the child closed its write end). Anything
 			// else ends the pump too — the pipe is unreadable, so there is nothing
-			// left to pump — but unlike the pre-B164 scanner it is REPORTED rather
+			// left to pump — but unlike that earlier scanner it is REPORTED rather
 			// than swallowed, which is the whole point of this loop.
 			if !errors.Is(err, io.EOF) {
 				slog.Warn("container log pump stopped on a read error",
@@ -360,7 +360,7 @@ func (p *Process) PID() int {
 
 // Done returns a channel closed once the process has been reaped (the single
 // kqueue reaper observed its exit and recorded the final status). It is a
-// broadcast signal safe for multiple observers — e.g. Wait and the M2.4
+// broadcast signal safe for multiple observers — e.g. Wait and the
 // graceful-stop timer both select on it — and is never used to wait4: the kqueue
 // reaper stays the sole reaper. The channel exists from NewProcess; it is only
 // closed after Start → reap.

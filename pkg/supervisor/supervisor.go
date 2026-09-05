@@ -54,9 +54,9 @@ type Spawner interface {
 	Spawn(ctx context.Context, spec SpawnSpec) (pid int, err error)
 }
 
-// PodNetwork sets up and tears down pod networking. M1 wires a node-IP/no-op
-// implementation (NodeNetwork); the k3sm-injected adapter over darwin-net's
-// podnet IPAM supplies the real per-pod /32 lo0 aliases (M10.1). Defined here at
+// PodNetwork sets up and tears down pod networking. NodeNetwork is a
+// node-IP/no-op implementation; the k3sm-injected adapter over darwin-net's
+// podnet IPAM supplies the real per-pod /32 lo0 aliases. Defined here at
 // the consumer per the standards (small, 2 methods).
 type PodNetwork interface {
 	// Setup provisions networking for podID and returns the pod's IP.

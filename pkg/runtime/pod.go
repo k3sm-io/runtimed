@@ -73,7 +73,7 @@ type pod struct {
 	podIP      string
 	containers []*containerProc
 
-	// Memory metering/OOM state (M2.5). oomKilled is set by the sampler before it
+	// Memory metering/OOM state. oomKilled is set by the sampler before it
 	// SIGKILLs the pod, so watchContainerExit records the OOMKilled reason.
 	// memSampler/memCancel are nil only if arming was refused (an unregistered
 	// pod); every pod is metered, and the sampler enforces an OOM threshold only
@@ -82,7 +82,7 @@ type pod struct {
 	memSampler *supervisor.MemorySampler
 	memCancel  context.CancelFunc
 
-	// vm-pod metering state (M11.2-d6, B107), guarded by mu. A vm pod is metered
+	// vm-pod metering state, guarded by mu. A vm pod is metered
 	// from the guest — memSampler/memCancel above are always nil for one
 	// (armMemorySampler refuses a vm pod).
 	//
@@ -108,7 +108,7 @@ type pod struct {
 
 	// supCtx / cancel are the pod-lifetime supervision context and its cancel —
 	// the scope of the per-container reapers (supervisor.Process.reap), the
-	// watchContainerExit drain-wait, and the memory sampler (M2.5). Derived from
+	// watchContainerExit drain-wait, and the memory sampler. Derived from
 	// context.Background(), not the CreatePod request ctx (canceled when the
 	// unary RPC returns under the daemon split); fired on pod teardown
 	// (DeletePod).
@@ -120,7 +120,7 @@ type pod struct {
 	// CreatePod returns (RestartContainer re-arming the memory sampler) must be
 	// rooted at it. Without that, a re-armed sampler rooted at
 	// context.Background() could not be stopped by p.cancel, leaving a root
-	// daemon goroutine able to SIGKILL a process group forever (B26). Never pass
+	// daemon goroutine able to SIGKILL a process group forever. Never pass
 	// supCtx to a request-scoped call; it outlives every RPC.
 	supCtx context.Context
 	cancel context.CancelFunc
@@ -133,7 +133,7 @@ type pod struct {
 	// the live sidecars of a still-terminal pod for exactly that reason.
 	sidecarTeardown bool
 
-	// vm-pod live transport address state (B237), guarded by mu. Both are zero for
+	// vm-pod live transport address state, guarded by mu. Both are zero for
 	// every host-process pod: a Seatbelt-confined pod has no guest, so nothing
 	// arms the watcher for one (armGuestLeaseWatcher, guestlease.go).
 	//
@@ -269,7 +269,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			fmt.Errorf("pod %s: sandbox_profile is required", box.GetPodId())
 	}
 
-	// Fail-closed backend selection (M5.1): honor the backend the provider
+	// Fail-closed backend selection: honor the backend the provider
 	// stamped on the SandboxProfile. UNSPECIFIED — the host-process default —
 	// walks the host-OS-gated Seatbelt ladder (not-root drops the uidjail rung;
 	// an unavailable Seatbelt degrades only to the stronger vm rung, else
@@ -318,7 +318,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
 	}
-	// The pod's temp directory, before anything can need it (B203). See
+	// The pod's temp directory, before anything can need it. See
 	// provisionPodTmpDir for why a pod has none otherwise.
 	if err := provisionPodTmpDir(rootfs); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
@@ -334,7 +334,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
-	// projected) into the pod data volume (M2.2). Secrets + the projected
+	// projected) into the pod data volume. Secrets + the projected
 	// SA-token come back as credential paths that get the SBPL read-only
 	// sub-scope below. PVC sources are skipped here and bound by the
 	// volume.Binder below — they are durable, lifecycle-decoupled, and live
@@ -349,7 +349,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		credPaths = layout.CredentialPaths()
 	}
 
-	// Bind APFS-backed persistent volumes (PVCs, M3.1): ensure each claim's
+	// Bind APFS-backed persistent volumes (PVCs): ensure each claim's
 	// stable dir on the storage root (empty-create / seed-once), symlink it into
 	// the pod rootfs, and collect its dir as the SBPL read/write scope. The dir
 	// lives outside the pod tree, so DeletePod's removePodDir never touches it
@@ -371,7 +371,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// The data volume the profile is about to re-allow read+write must be one this
-	// runtime derived for this pod (B142). Checked here, immediately before the
+	// runtime derived for this pod. Checked here, immediately before the
 	// only call that consumes it: sandbox.Generate emits it after the protected
 	// denies, where last-match-wins makes an unchecked value beat every one of
 	// them, and uses it as the carve-out base for every other caller-supplied
@@ -402,7 +402,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			// pod's writable re-allow outside the daemon's data area.
 			WorkDir: r.cfg.Root,
 			Home:    r.home,
-			// The VIPs are plumbing-only (DNS env/status): since M10.1 they render
+			// The VIPs are plumbing-only (DNS env/status): they render
 			// no SBPL rule — per-IP network filters do not compile on macOS 26
 			// (sandbox.Generate's AllowNetwork stanza).
 			ResolverVIP:  r.cfg.ResolverVIP,
@@ -421,12 +421,12 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// fsGroup: chown the writable pod data volume to the supplemental group
 	// root-side, before any container's privilege drop (a uid-dropped, sandboxed
 	// process can no longer chown). The supervisor runs this synchronously here,
-	// strictly before posix_spawn → the exec-shim drop (M2.3).
+	// strictly before posix_spawn → the exec-shim drop.
 	//
 	// The walk's bound is this pod's own dir, not the shared pods root: rootfs is
 	// already the validated derivation (rootfsPath), so this is defence at the
 	// sink — the recursive group-rwx + setgid grant refuses any root outside that
-	// dir regardless of how the caller obtained it (B140), the same shape
+	// dir regardless of how the caller obtained it, the same shape
 	// removePodDir puts on its RemoveAll. A pods-root bound would be one level too
 	// wide to be a real second layer — <PodsRoot>/<victim-id>/rootfs is strictly
 	// under it, so it would wave through the cross-pod case that is hazard #1 for
@@ -444,12 +444,12 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// Pod-lifetime supervision context. The per-container reaper and the
-	// watchContainerExit drain-wait must outlive the CreatePod RPC: under the M2
+	// watchContainerExit drain-wait must outlive the CreatePod RPC: under the
 	// daemon split the request ctx is canceled when the unary handler returns,
 	// which would otherwise make the kqueue reaper record a bogus
 	// context-canceled exit and the drain-wait snapshot an empty tail the instant
 	// CreatePod replies. Derive a fresh cancelable ctx from Background instead —
-	// the same pattern the memory sampler uses (M2.5) — stored on the pod and
+	// the same pattern the memory sampler uses — stored on the pod and
 	// fired on teardown. On a failed create (a later container won't start),
 	// unwind the supervision already launched instead of leaking it.
 	podCtx, podCancel := context.WithCancel(context.Background())
@@ -471,9 +471,9 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 
 	// init_containers run first, sequentially; then the main containers start.
 	// A plain init container (restart_policy UNSPECIFIED — the byte-legacy apis
-	// contract) runs to completion before the next init step, exactly as in M1.
+	// contract) runs to completion before the next init step, as it always has.
 	// An init container with restart_policy always is a native sidecar (KEP-753,
-	// M10.2): spawned in its init-list position through the same startContainer
+	// KEP-753): spawned in its init-list position through the same startContainer
 	// machinery (same confinement class + rootfs resolution) but not waited — the
 	// sequence proceeds once it is started (spawn-equals-started; startup-probe
 	// gating of progression is out of scope per the apis restart_policy
@@ -523,7 +523,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 
 	// The memory sampler is armed by the caller (CreatePod), strictly after
 	// the pod is registered in r.pods. armMemorySampler refuses to arm an
-	// unregistered pod (its anti-stranding guard, B26), so arming here — before
+	// unregistered pod (its anti-stranding guard), so arming here — before
 	// registration — would silently leave every limited pod unenforced.
 
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
@@ -552,7 +552,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // (the sampler's onBreach callback takes p.mu), per the callbacks-outside-locks
 // discipline.
 //
-// Anti-stranding (B26). A sampler is a root-daemon goroutine whose breach path
+// Anti-stranding. A sampler is a root-daemon goroutine whose breach path
 // SIGKILLs a process group, so it must never outlive its pod. Two independent
 // stoppers close that, in the r.mu → p.mu lock order the whole package uses:
 //
@@ -566,7 +566,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 //     above, p.cancel (DeletePod) tears this sampler down too. The two stoppers
 //     are order-independent: whichever side wins, the goroutine dies.
 func (r *Runtime) armMemorySampler(p *pod) {
-	// A vm pod is never host-sampled (B107). Its working set lives in the
+	// A vm pod is never host-sampled. Its working set lives in the
 	// guest's cgroup2 hierarchy (pulled on demand by vmPodStats — a host sample
 	// would meter the vmhost helper, not the workload), and its memory ceiling
 	// is the VZ memorySize the hypervisor itself enforces; an OOM arrives as a
@@ -610,7 +610,7 @@ func (r *Runtime) armMemorySampler(p *pod) {
 // resolveBinary, ad-hoc codesign / gateSignature, generate+apply an SBPL
 // profile, or set up lo0 networking — a Linux guest runs none of those. It
 // hands the pod's sizing (vm_vcpus / vm_memory_bytes) + rootfs + the virtiofs
-// volume share plan (B106, computed below) + its resolved containers to the vm
+// volume share plan (computed below) + its resolved containers to the vm
 // backend's CreateVM.
 //
 // It DOES materialize, on both halves, and must — a guest reads its whole world
@@ -678,13 +678,13 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), errVMFsGroupUnsupported)
 	}
 
-	// Compute the virtiofs share-device plan from the box's volumes (B106) —
+	// Compute the virtiofs share-device plan from the box's volumes —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
-	// B102). The pod dir is derived locally (r.podDir), and the planner ignores
+	// guest-init composes the binds). The pod dir is derived locally (r.podDir), and the planner ignores
 	// box.rootfs_path for share roots; rootfsPath below derives the host-side
 	// VMSpec.RootfsPath the same way, accepting a caller-supplied rootfs_path
-	// only when it is byte-equal to that derivation (B140).
+	// only when it is byte-equal to that derivation.
 	//
 	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
 	// pattern (validate.go): the plan is computed before this path touches
@@ -795,7 +795,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 				fmt.Errorf("provision persistent volumes for pod %s: %w", box.GetPodId(), berr)
 		}
 	}
-	// Every container is resolved host-side (M11.2-d11): the four-quadrant merge of
+	// Every container is resolved host-side: the four-quadrant merge of
 	// each container's pod spec against its image config, its expanded
 	// environment, its numeric identity and the share-plan tag its rootfs lower
 	// layer arrives under. The guest performs no merge and reads no image
@@ -875,7 +875,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// No memory sampler, and no armMemorySampler call anywhere on this path. A vm
 	// pod's memory ceiling is the hypervisor's VZ memorySize, and its OOM truth
 	// is the guest cgroup's, reported over ContainerEvents; a host rusage sample
-	// would measure the vmhost helper (B107).
+	// would measure the vmhost helper.
 	go r.watchVMPodEvents(supCtx, p)
 	go r.watchVMHelperExit(supCtx, p)
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
@@ -929,13 +929,13 @@ func vmVolumePlan(plan mount.SharePlan) sandbox.VMVolumePlan {
 	return out
 }
 
-// oomKill is the memory sampler's onBreach callback (M2.5): it marks the pod
+// oomKill is the memory sampler's onBreach callback: it marks the pod
 // OOMKilled and SIGKILLs every container's process group. The kqueue reaper then
 // collects the exits and watchContainerExit records the OOMKilled termination
 // reason. Called from the sampler goroutine; it takes p.mu only to snapshot state
 // and signals outside the lock (the re-entrancy rule).
 func (r *Runtime) oomKill(p *pod, footprint uint64) {
-	// The kill-reason fork (B107): a vm pod's OOMKilled comes from the guest
+	// The kill-reason fork: a vm pod's OOMKilled comes from the guest
 	// agent's ContainerEvents stream and nowhere else — the kill happens in the
 	// guest kernel's cgroup, so a host rusage figure is not evidence of it, it
 	// measures the vmhost helper. armMemorySampler already refuses to arm a vm
@@ -994,17 +994,17 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	}
 
 	// Enforce the signature policy in the correct order relative to ad-hoc
-	// signing (M2.6), before exec. A host binary is never ad-hoc re-signed
+	// signing, before exec. A host binary is never ad-hoc re-signed
 	// (hostBinary).
 	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rb.path, rb.hostBinary); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
 	// Resolve the container's securityContext identity plus the pod's rlimit plan
-	// and qos decision (one supervisor.LaunchSpec — B7), then wrap the command so
+	// and qos decision (one supervisor.LaunchSpec), then wrap the command so
 	// the spawned exec-shim applies the limits, drops to the identity, backgrounds
 	// itself if BestEffort, confines itself to the profile, and then execs the pod
-	// binary — in that irreversible order (M2.3/B7). env is preserved.
+	// binary — in that irreversible order. env is preserved.
 	cred := resolveCredential(p.box, c)
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, rb.argv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
@@ -1016,19 +1016,19 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
-	// The pod cwd (B202): the merged working directory — the pod's working_dir,
+	// The pod cwd: the merged working directory — the pod's working_dir,
 	// else the image config's (image.MergeRunSpec) — is what the child chdirs
 	// into. When neither is set the default is the pod data volume, never the
 	// inherited cwd: this daemon's cwd is its own working directory, denied by
 	// the pod's SBPL profile (and the user homes above it), so a pod that
-	// inherited it started in a directory it may not even stat (the M8 run-3
-	// failure). The supervisor now refuses an unusable Dir (supervisor.ErrWorkingDir)
+	// inherited it started in a directory it may not even stat (a real
+	// failure mode). The supervisor now refuses an unusable Dir (supervisor.ErrWorkingDir)
 	// rather than falling back to it.
 	//
 	// It is the same default and precedence an exec session already resolves
 	// (exec.go), so `kubectl exec` and the container it enters agree on where
 	// they are. Applies uniformly to the host-binary routes (the native
-	// sentinel and the M0 absolute-path convention).
+	// sentinel and the absolute-path convention).
 	workingDir := rb.workingDir
 	if workingDir == "" {
 		workingDir = rootfs
@@ -1056,8 +1056,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			State: &runtimev1.ContainerState{
 				Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()},
 			},
-			// Lossless status mirrors of the M2.1 spec fields (M2.2 volume_mounts,
-			// M2.3 user) so kubectl Pod state does not degrade across the boundary.
+			// Lossless status mirrors of the container's spec fields (volume_mounts,
+			// user) so kubectl Pod state does not degrade across the boundary.
 			VolumeMounts: volumeMountStatuses(c),
 			User:         containerUser(cred),
 		},
@@ -1160,7 +1160,7 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	}
 	switch {
 	case p.oomKilled && (sig != 0 || code != 0):
-		// The memory sampler SIGKILLed this pod for a limit breach (M2.5): a
+		// The memory sampler SIGKILLed this pod for a limit breach: a
 		// container that exited by signal / non-zero is reported OOMKilled.
 		term.Reason = "OOMKilled"
 	case err != nil:
@@ -1211,7 +1211,7 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	r.runTerminalTeardown(ctx, p, td)
 
 	// Suppress the transient terminated publish of a container the provider is
-	// already restarting (B26). The state write above stands — RestartContainer
+	// already restarting. The state write above stands — RestartContainer
 	// reads it back for last_termination_state — but publishing it would show
 	// the provider a "new" exit for a restart it issued, and its terminationKey
 	// idempotency would schedule a second restart for the same death. The
@@ -1299,7 +1299,7 @@ func terminationMessageFromLogs(logs *logBuffer) string {
 // OnFailure, because PodBox carries no pod-level restartPolicy (only the
 // container-level KEP-753 field, meaningful on init containers). Closing it
 // needs an apis field, out of scope here; the leak above is the strictly worse
-// failure, and this is the delivered M10.2/B74 teardown behaviour unchanged.
+// failure, and this is the delivered native-sidecar teardown behaviour, unchanged.
 func trulyTerminalLocked(p *pod) bool {
 	switch p.phase {
 	case runtimev1.PodPhase_POD_PHASE_SUCCEEDED, runtimev1.PodPhase_POD_PHASE_FAILED:
@@ -1401,7 +1401,7 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 	case allTerminated:
 		p.phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 	default:
-		// De-escalation (B26): at least one main is live again — it never
+		// De-escalation: at least one main is live again — it never
 		// terminated, or RestartContainer swapped in a running replacement, or a
 		// main is mid-restart (skipped above). Falling back to Running is
 		// required, not cosmetic: without this arm the terminal phase is a
@@ -1409,13 +1409,13 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 		// then successfully re-execs reports phase:Failed forever. Upstream
 		// reads that as a dead pod — the ReplicaSet deletes and replaces it,
 		// podgc reaps it, and a Job counts it against backoffLimit — exactly
-		// the CrashLoopBackOff surface B26 exists to make honest.
+		// the CrashLoopBackOff surface this restart accounting exists to make honest.
 		p.phase = runtimev1.PodPhase_POD_PHASE_RUNNING
 	}
 }
 
 // gateSignature enforces the SignaturePolicy in the correct order relative to the
-// ad-hoc-sign step (M2.6-d2), fail-closed, before exec:
+// ad-hoc-sign step, fail-closed, before exec:
 //
 //   - hostBinary (native pod / host-path convention): never ad-hoc sign. A host
 //     binary is an already-signed system or operator binary at a read-only host
@@ -1464,11 +1464,11 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 	return r.signer.Check(ctx, policy, path)
 }
 
-// NativeImage is the k3sm HostProcess sentinel image reference (DESIGN §M0;
-// examples/hello-native.yaml). A container whose image is "native" runs its
+// NativeImage is the k3sm HostProcess sentinel image reference
+// (examples/hello-native.yaml). A container whose image is "native" runs its
 // command[0] as an absolute HOST binary in place — no registry pull, no rootfs
-// materialization — which is how every M2 conformance pod (and hello-native.yaml)
-// executes. It is the with-command analog of the empty-command host-binary
+// materialization — which is how every host-process conformance pod (and
+// hello-native.yaml) executes. It is the with-command analog of the empty-command host-binary
 // convention below (there the image itself is the path; here command[0] is).
 const NativeImage = "native"
 
@@ -1503,7 +1503,7 @@ type resolvedBinary struct {
 	// env is the container's merged environment in "K=V" form — the image
 	// config's Env with the pod's env overriding by name (image.MergeRunSpec).
 	// It is nil on both host-binary routes, where there is no image config to
-	// merge and containerEnv keeps its pre-M11.2-d1 behaviour of building the
+	// merge and containerEnv keeps its behaviour of building the
 	// environment from the container spec alone.
 	env []string
 	// workingDir is the container's effective working directory: the pod's
@@ -1521,11 +1521,11 @@ type resolvedBinary struct {
 //
 //   - the "native" sentinel — command[0] is an absolute host binary, run in
 //     place, no pull;
-//   - an absolute path with no command/args — the M0 host-binary convention:
+//   - an absolute path with no command/args — the host-binary convention:
 //     the reference is the binary, unchanged. It stays the native path's way
 //     to run a host binary with no image at all;
 //   - an OCI reference — pull, materialize, and merge the image config with the
-//     container spec (image.MergeRunSpec). This replaced the M1 placeholder
+//     container spec (image.MergeRunSpec). This replaced an earlier placeholder
 //     that made argv literally command+args and therefore panicked on a
 //     container with args and no command, and refused a container with
 //     neither even though its image declared an Entrypoint.
@@ -1535,7 +1535,7 @@ type resolvedBinary struct {
 // pod's materialized rootfs whether or not it leads with a slash
 // (resolveImageArgv0); on the two host-binary arms it names a host path and is
 // taken verbatim. argv's own shape is never consulted — see resolveImageArgv0
-// for the M8 failure that rule produced.
+// for the failure that rule produced.
 //
 // p supplies both the PodBox (for the imagePullSecret lookup) and the resolved
 // sandbox backend the pull's image-platform policy and the unpack dialect are
@@ -1570,10 +1570,10 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// The discriminator, on the no-command route: the shape of the reference
 	// decides, not the emptiness (apis runtime/v1 Container.command).
 	//
-	// An absolute path is the M0 host-binary convention and is unchanged — the
+	// An absolute path is the host-binary convention and is unchanged — the
 	// reference is the binary, run in place with no pull. An OCI reference falls
 	// through to the pull path below, where the image config's Entrypoint/Cmd
-	// supply the argv. Before M11.2-d1 this branch refused an OCI-referenced
+	// supply the argv. Previously this branch refused an OCI-referenced
 	// container with no command, so a perfectly ordinary `image: nginx` pod
 	// could not run.
 	if len(cmd) == 0 && len(c.GetArgs()) == 0 && image.IsHostPathReference(c.GetImage()) {
@@ -1582,7 +1582,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		return resolvedBinary{path: bin, argv: []string{bin}, hostBinary: true, workingDir: c.GetWorkingDir()}, nil
 	}
 
-	// Resolve the imagePullSecret credential (M2.6) via the consumer-side seam. It
+	// Resolve the imagePullSecret credential via the consumer-side seam. It
 	// is passed only to the pull client below and never written to the pod dir.
 	cred, err := r.pullCredential(ctx, p.box, c.GetImage())
 	if err != nil {
@@ -1591,7 +1591,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 
 	// Pull + materialize the image into the pod rootfs, then run command/args.
 	// The container's imagePullPolicy is forwarded exactly as the provider
-	// stamped it (M12.1): the puller decides Always/IfNotPresent/Never against
+	// stamped it: the puller decides Always/IfNotPresent/Never against
 	// the node's local image store, and an unset value is the legacy
 	// pull-through. Nothing here re-derives a policy from the image tag.
 	res, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy())
@@ -1610,7 +1610,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 	res.Lease.Release()
 
-	// Materialize. Until M11.2-d7 this was the M1 placeholder: the blobs were in
+	// Materialize. This was once a placeholder: the blobs were in
 	// the cache, the pod rootfs was empty, and argv[0] was resolved against a
 	// directory that held nothing, so a container whose command lived in its
 	// image could never start. The unpacker applies the image's layers in order
@@ -1705,7 +1705,8 @@ var ErrImageArgvEscapes = errors.New("image program escapes the pod rootfs")
 // the image's filesystem, where a leading slash means the image root and
 // nothing else.
 //
-// Keying on argv's own shape instead was the M8 blocker (B197): mlx-serve's
+// Keying on argv's own shape instead resolved a pulled image's absolute
+// argv[0] as a HOST path: mlx-serve's
 // Entrypoint is /bin/python3.12, so the previous "absolute means the host
 // supplies it" rule sent the signature gate at the host's /bin/python3.12,
 // which on a stock macOS does not exist — the pod failed
@@ -1722,7 +1723,7 @@ var ErrImageArgvEscapes = errors.New("image program escapes the pod rootfs")
 // image-supplied, and an image that could name a path above its own root would
 // choose which host binary the daemon signs and spawns.
 //
-// It is a containment check, not a sandbox: rootfs is not a chroot (DESIGN §M2
+// It is a containment check, not a sandbox: rootfs is not a chroot (DESIGN §5a
 // — confinement is Seatbelt at host paths), so a symlink inside the tree that
 // points out of it still resolves out of it at exec time. Resolving symlinks
 // here would not close that (the tree is writable by the pod, so any answer is
@@ -1767,7 +1768,7 @@ func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
 // would be refused by image.Candidates instead of silently mis-selected
 // through a valid enum value.
 //
-// Both spines pull through this seam (B99), each passing the backend its own pod
+// Both spines pull through this seam, each passing the backend its own pod
 // resolved: the host-process spine from pod.backend (resolveBinary), and the vm
 // spine from the rung SelectBackend routed it on (resolveVMContainers, which
 // pulls for the image config the guest-side merge needs). So the platform a pull
@@ -1775,9 +1776,9 @@ func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
 // spine can pull a Mach-O image for a Linux guest or the reverse.
 //
 // HostRosetta is false deliberately, not for want of a probe: the probe exists
-// as of B103 (sandbox.ProbeHostRosetta, advertised on GetRuntimeInfo as the
+// (sandbox.ProbeHostRosetta, advertised on GetRuntimeInfo as the
 // RosettaHostAvailable condition). The pull path does not consume it until the
-// Seatbelt x Rosetta spawn is proven (B105), for two reasons:
+// Seatbelt x Rosetta spawn is proven, for two reasons:
 //
 //   - a darwin/amd64 payload's behaviour inside a Seatbelt profile is unverified, so
 //     selecting one would trade a legible pull-time refusal for an unexplained
@@ -1787,7 +1788,7 @@ func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
 //     kernel backstop that stands behind the signature policy.
 //
 // So a darwin/amd64-only image stays refused at pull with a legible
-// image.ErrNoPlatformMatch. Do not flip this to r.rosettaHost without B105.
+// image.ErrNoPlatformMatch. Do not flip this to r.rosettaHost without that proof.
 func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
 	return image.PlatformPolicy{Backend: backend}
 }
@@ -1813,7 +1814,7 @@ func unpackPolicy(backend runtimev1.SandboxBackend) (image.UnpackPolicy, error) 
 }
 
 // pullCredential resolves the registry pull credential for ref from the pod's
-// imagePullSecrets via the consumer-side CredentialResolver seam (M2.6). It
+// imagePullSecrets via the consumer-side CredentialResolver seam. It
 // returns nil (anonymous pull) when there is no resolver, no imagePullSecrets, or
 // no matching credential. The credential never touches disk — it flows straight
 // into the pull client.
@@ -1841,7 +1842,7 @@ const (
 
 // tmpDirEnv is the environment variable every POSIX temp-file API consults, and
 // podTmpDirName is the directory inside the pod data volume runtimed provisions
-// for it (B203).
+// for it.
 const (
 	tmpDirEnv     = "TMPDIR"
 	podTmpDirName = "tmp"
@@ -1859,7 +1860,7 @@ func podTmpDir(dataVol string) string { return filepath.Join(dataVol, podTmpDirN
 // profile does not write-allow /tmp or /var/tmp, and nothing sets TMPDIR, so a
 // workload that asks the platform for one exhausts its whole candidate list and
 // fails — Python's tempfile.gettempdir() raising after /tmp, /var/tmp and
-// $TMPDIR all fail is the M8 lab shape, and it takes the whole process down
+// $TMPDIR all fail is a real failure mode under Seatbelt confinement, and it takes the whole process down
 // before any of its own code runs. The data volume is already the pod's
 // read/write scope in the generated profile, so a directory inside it needs no
 // SBPL change; this is the one place the writable tree a pod already has is
@@ -1892,7 +1893,7 @@ func provisionPodTmpDir(dataVol string) error {
 // env can override it (rare). A container that sets DYLD_INSERT_LIBRARIES itself
 // opts out of both shims.
 //
-// TMPDIR (B203) is injected only when the base does not already carry one, so a
+// TMPDIR is injected only when the base does not already carry one, so a
 // container that names its own temp directory keeps it — the same
 // spec-beats-injection rule DYLD_INSERT_LIBRARIES follows. It is injected here,
 // at the one seam both the container spawn and an Exec session pass through, so
@@ -1902,7 +1903,7 @@ func provisionPodTmpDir(dataVol string) error {
 // image config's Env under the container's, image.MergeRunSpec) — the source of
 // $PATH, $HOME and everything else an image ships. It is nil on the two
 // host-binary routes, and then the base is the container's own EnvVars, the
-// pre-M11.2-d1 behaviour. TMPDIR is injected on every one of those routes: a
+// behaviour unchanged from before image-config env merging existed. TMPDIR is injected on every one of those routes: a
 // host-process pod is confined by the same profile and has the same
 // no-usable-tmp problem.
 func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, base []string) ([]string, error) {
@@ -1929,7 +1930,7 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	}
 	if explicitDyld {
 		// Explicit container DYLD wins; do not inject shims. The full base is
-		// already appended above (B205): an explicit DYLD entry mid-slice must
+		// already appended above: an explicit DYLD entry mid-slice must
 		// not truncate whatever base env follows it.
 		return env, nil
 	}
@@ -2064,7 +2065,8 @@ var errUnderivedDataVolume = errors.New("data_volume_path is not the pod's deriv
 // (allow file-read* file-write* (subpath dataVol)) in the narrow re-allow tier —
 // after the protected denies. SBPL is last-match-wins, so a hostile value
 // overrides the whole deny-set (user homes, the pods root, the podreap store,
-// and the control-plane/daemon trees B141 added) in a single emitted line. It is
+// and the control-plane/daemon trees added to close a storage-path escape) in
+// a single emitted line. It is
 // also the carve-out base in validateExtraPaths (`if isUnder(p, cleanData) {
 // continue }`), so one hostile value additionally disarms the protected-prefix
 // validator for every other path in the same box.
@@ -2076,7 +2078,7 @@ var errUnderivedDataVolume = errors.New("data_volume_path is not the pod's deriv
 // <PodsRoot>/<victim-id>/rootfs. pkg/runtime is where the authoritative value is
 // derived, so this is where cross-pod is refused. The two layers fail on
 // different input classes — the property a second layer must have to be a
-// layer (the B140 lesson): this one catches cross-pod and every absolute path
+// layer: this one catches cross-pod and every absolute path
 // off the pods tree, the sink catches the ancestor/whole-tree class ("/",
 // "/var/lib", the work-dir itself) for any future caller of the exported
 // Generate.
@@ -2164,7 +2166,7 @@ func (r *Runtime) podDir(podID string) (string, error) {
 //
 // It removes only <Root>/pods/<podID>. Persistent-volume dirs live under
 // <Root>/storage (a sibling of the pods root), so a PVC's data is intentionally
-// not removed here — the M3.1 lifecycle decoupling (ReclaimPolicy Retain): the
+// not removed here — lifecycle decoupling (ReclaimPolicy Retain): the
 // PV survives pod stop/restart/delete and the next pod that mounts the same
 // claim reuses it. A PVC's pod-side symlink lives inside the pod dir and is
 // removed, but os.RemoveAll unlinks the symlink without following it, so the

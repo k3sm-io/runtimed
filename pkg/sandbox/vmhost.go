@@ -39,7 +39,7 @@ var ErrVMHostNotFound = errors.New("sandbox: k3sm-vmhost helper not found")
 
 // VMHostRosettaShareSupported reports whether the k3sm-vmhost helper attaches a
 // Rosetta directory share to the guests it builds. It is false in this build,
-// and the falsehood is the point (B229).
+// and the falsehood is the point.
 //
 // A node advertises guest-Rosetta as VMBackendAvailable and RosettaGuestAvailable
 // (see pkg/runtime's ConditionRosettaGuestAvailable), and the image-pull platform

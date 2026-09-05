@@ -30,7 +30,7 @@ package supervisor
 extern char **environ;
 
 // k3sm_spawn_addchdir is the posix_spawn file-action that gives the child its
-// own working directory before exec (B202). DARWIN SPI DISCIPLINE, per
+// own working directory before exec. DARWIN SPI DISCIPLINE, per
 // docs/GO-STANDARDS.md Â§Darwin/cgo: there is NO golang.org/x/sys/unix binding
 // for a posix_spawn file action (unix exposes no posix_spawn at all), and the
 // Go-level alternative — fork+chdir+exec via os/exec — is exactly what this

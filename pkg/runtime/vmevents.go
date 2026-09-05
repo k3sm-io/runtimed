@@ -31,7 +31,7 @@ import (
 // stream and folds every event into that pod's container statuses until the
 // stream ends or ctx is cancelled.
 //
-// the KILL-reason FORK (B107). This is the only source of OOMKilled for a vm
+// the KILL-reason FORK. This is the only source of OOMKilled for a vm
 // pod. The kill happens in the guest kernel's cgroup, which the host cannot
 // observe at all: the host's proc_pid_rusage sampler can see the vmhost helper's
 // footprint and nothing inside the guest, so a host-derived OOMKilled for a vm
@@ -41,8 +41,7 @@ import (
 // what fills the gap.
 //
 // It is the vm pod's own supervision goroutine, started by the vm-pod ASSEMBLY
-// (createVMPod, once M11.2-d2's live boot lands — CreateVM is a lab-gated stub
-// today, so no assembled vm pod exists in production yet) and rooted at the
+// (createVMPod, via the live-boot path) and rooted at the
 // pod-lifetime supCtx like every other per-pod goroutine. A stream error is
 // returned, not retried here: the caller owns the pod's lifecycle and is the
 // only thing that knows whether a dead agent means "restart the watch" or "the

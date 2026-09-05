@@ -62,7 +62,7 @@ var ErrVMBootNotImplemented = errors.New("sandbox: the vm backend cannot boot a 
 var ErrVMUsesCreateVM = errors.New("sandbox: vm backend does not use the host-process exec-shim path; route the pod via CreateVM")
 
 // GuestNetworkConfig is the runtimed-LOCAL network contract the vm backend applies
-// to a pod's Linux guest (M5.1): the guest's DNS configuration — carried both
+// to a pod's Linux guest: the guest's DNS configuration — carried both
 // structured (Nameservers/Searches/Options) and rendered (ResolvConf) — plus the
 // NAT-attachment advisory fields.
 //
@@ -133,7 +133,7 @@ type GuestNetworkConfig struct {
 	DNSVIP netip.Addr
 }
 
-// VMSpec is the sizing + image contract for a pod's Linux guest VM (M5.1). The
+// VMSpec is the sizing + image contract for a pod's Linux guest VM. The
 // provider stamps Vcpus / MemoryBytes onto the SandboxProfile (vm_vcpus /
 // vm_memory_bytes); a zero value means "let the backend choose a default".
 type VMSpec struct {
@@ -147,7 +147,7 @@ type VMSpec struct {
 	// RootfsPath is the on-disk pod data volume the OCI-Linux-rootfs→bootable-root
 	// builder (lab-gated) turns into the guest root.
 	RootfsPath string
-	// Network is the guest's network config (M5.1): the rendered resolv.conf content
+	// Network is the guest's network config: the rendered resolv.conf content
 	// plus the NAT advisory fields the vm backend applies to the guest. The provider
 	// stamps it as data (runtimed cannot import darwin-net — see GuestNetworkConfig);
 	// a zero value networks no guest. A NAT-attached guest gets its network via the
@@ -179,7 +179,7 @@ type VMSpec struct {
 	// mapping. It is a field rather than a parameter so the mapper has one
 	// place to stamp and the composer one place to read.
 	Containers []VMContainer
-	// Volumes is the virtiofs share-device plan for the pod's volumes (B106),
+	// Volumes is the virtiofs share-device plan for the pod's volumes,
 	// stamped as data by createVMPod (pkg/runtime), the named mapper from
 	// pkg/mount's planner — sandbox imports neither. The zero value plans
 	// nothing (safe); see VMVolumePlan.
@@ -258,7 +258,7 @@ type VMContainer struct {
 	SupplementalGIDs []int64
 }
 
-// VMBackend is the Virtualization.framework micro-VM isolation backend (M5.1) —
+// VMBackend is the Virtualization.framework micro-VM isolation backend —
 // the rung for Linux-image / untrusted-tenancy pods the host-process Seatbelt
 // path cannot serve (a Linux ELF cannot exec on macOS, and a Seatbelt profile is
 // not a hard tenancy boundary). It implements the swappable sandbox.Backend
@@ -281,7 +281,7 @@ type VMContainer struct {
 //
 // Virtualization.framework is a PUBLIC framework, so the vm backend is not a
 // libsandbox/memorystatus SPI symbol-canary case — internal/spicanary is
-// deliberately left unchanged by M5 (acceptance M5.1-a2).
+// deliberately left unchanged by the vm backend's addition.
 //
 // LAB-GATED remainder (needs a VZ-capable, entitled Mac; tracked off CreateVM):
 //   - the live guest boot — a VZVirtualMachineConfiguration driven on a per-VM
@@ -462,7 +462,7 @@ func NewVMBackend(opts ...VMBackendOption) *VMBackend {
 func (b *VMBackend) Name() string { return VMBackendName }
 
 // Available reports whether the vm backend can run a guest on this host. It is the
-// CONJUNCTION of five terms, every one of which must hold (B227):
+// CONJUNCTION of five terms, every one of which must hold:
 //
 //	darwin
 //	  and macOS major >= vmMinMacOSMajor
@@ -509,7 +509,7 @@ func (b *VMBackend) Available() bool {
 // could actually execute in one of this node's guests.
 //
 // It is the second, independent term of the node's guest-Rosetta advertisement
-// (B229): Apple's availability probe answers "can this Mac do Rosetta for Linux",
+// Apple's availability probe answers "can this Mac do Rosetta for Linux",
 // which is a different question from "does the VM this node builds carry it". The
 // answer is the compile-time VMHostRosettaShareSupported; see that constant for why
 // the advertisement must be gated on what the helper builds rather than on what the

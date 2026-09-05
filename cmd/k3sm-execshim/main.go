@@ -25,7 +25,7 @@ limitations under the License.
 // _k3sm posture, not root). A drop is refused unless the shim is root
 // (RunLaunchSequence → Credential.Validate).
 //
-// The next two tokens are the pod's launch spec (B7), each a single
+// The next two tokens are the pod's launch spec, each a single
 // fixed-position token placed before the profile path:
 //
 //   - <rlimits>: the resolved numeric setrlimit(2) plan,

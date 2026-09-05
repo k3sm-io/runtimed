@@ -201,7 +201,7 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 // it. They stay distinct on disk because they are removed by different parties:
 // a pod's roots go when its dir goes, an operator's go only when the operator
 // untags the name. That asymmetry is the whole reason RemoveImage refuses and
-// UntagImage does not — the M12 images plan, Resolution 13.
+// UntagImage does not.
 //
 // It fails closed and it fails LOUDLY. The pods tree is walked through an
 // os.Root anchored at the pods dir, so no symlink can redirect the walk out of

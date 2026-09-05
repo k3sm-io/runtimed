@@ -18,7 +18,7 @@ package sandbox
 
 import "context"
 
-// The two Rosetta capability probes (B103) — the GOOS/cgo-agnostic contract.
+// The two Rosetta capability probes — the GOOS/cgo-agnostic contract.
 //
 // They are two independent capabilities that happen to share a brand name, and
 // conflating them is the bug this file exists to prevent:
@@ -32,8 +32,7 @@ import "context"
 //
 // Both are advertised as additive RuntimeConditions and neither is wired into the
 // image-pull platform policy: see pkg/runtime/pod.go's pullPolicy, which documents
-// why selecting an amd64 payload waits on the Seatbelt x Rosetta spawn proof
-// (B105).
+// why selecting an amd64 payload waits on the Seatbelt x Rosetta spawn proof.
 //
 // Both probes DEGRADE: they return a state, never an error, so a capability
 // absence can never fail daemon startup.

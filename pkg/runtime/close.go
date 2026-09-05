@@ -165,7 +165,7 @@ type namedDone struct {
 // The read of p.memCancel/p.memSampler takes p.mu for the same reason DeletePod's
 // does: armMemorySampler replaces both at arbitrary runtime (a RestartContainer
 // re-exec re-arms the sampler), so an unsynchronized read can cancel a stale
-// sampler and leave the live one running (B26). p.cancel is immutable after
+// sampler and leave the live one running. p.cancel is immutable after
 // createPod and needs no lock.
 func (r *Runtime) cancelPodSupervision(p *pod) supervisionWait {
 	p.mu.Lock()

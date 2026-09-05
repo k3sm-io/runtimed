@@ -27,7 +27,7 @@ import (
 )
 
 // Credential is the POSIX identity a pod process drops to before its Seatbelt
-// profile is applied and the pod binary is exec'd (M2.3 securityContext).
+// profile is applied and the pod binary is exec'd (securityContext).
 //
 // The drop is performed in the exec-shim — a fresh, single-purpose process the
 // supervisor posix_spawns — and never in the multi-threaded daemon: setgid /
@@ -236,7 +236,7 @@ type LaunchSeam interface {
 }
 
 // RunLaunchSequence drives seam through the SECURITY-critical, irreversible pod
-// launch order (M2.3, B7). spec is the resolved LaunchSpec (identity + rlimit
+// launch order. spec is the resolved LaunchSpec (identity + rlimit
 // plan + qos); euid is the effective uid the sequence runs under (the
 // exec-shim's, == the daemon's); it gates the drop. The ordering is load-bearing
 // — getting it wrong silently runs the pod with the wrong identity or unconfined:
@@ -340,8 +340,8 @@ const nofileOpenMax = 10240
 // the exec'd image's dyld (plus the DYLD-inserted darwin-net DNS shim) of
 // descriptors after confinement, producing a misleading in-sandbox error far
 // from the cause. 256 is a conservative pick (the historical darwin default
-// soft limit); the B7 lab remainder (the dyld-vs-tight-NOFILE floor
-// measurement) confirms sufficiency on hardware.
+// soft limit); a lab measurement (the dyld-vs-tight-NOFILE floor) confirms
+// sufficiency on hardware.
 const minNOFILESoft = 256
 
 // normalizeNOFILE applies the darwin RLIMIT_NOFILE taxonomy to one requested

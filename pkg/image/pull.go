@@ -32,10 +32,10 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// RegistryCredential is a private-registry pull credential (an imagePullSecret,
-// M2.6). It is consumed only by the pull client (passed to the registry transport
+// RegistryCredential is a private-registry pull credential (an imagePullSecret).
+// It is consumed only by the pull client (passed to the registry transport
 // as an Authorization header) and is never written to disk / the pod dir — the
-// M2.6 security invariant. The provider resolves it from the referenced
+// security invariant. The provider resolves it from the referenced
 // docker-config Secret and supplies it via the runtime's CredentialResolver seam;
 // the proto carries only a LocalObjectReference, never the bytes.
 //
@@ -81,7 +81,7 @@ type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, p
 // platform.go (Candidates / SelectManifest / VerifyConfigPlatform).
 //
 // When cred is non-nil it authenticates with that credential (the
-// imagePullSecret, M2.6); the credential lives only in this transport, never on
+// imagePullSecret); the credential lives only in this transport, never on
 // disk.
 //
 // It closes every re-entry point for go-containerregistry's implicit
@@ -308,8 +308,8 @@ type LocalIndex interface {
 // deliberately keeps no record (an ingest path with no presence question to
 // answer, a test that wants the cold-node behavior). It is named rather than a
 // nil check so such a call site says so. Its consequences are the safe ones:
-// IfNotPresent degrades to the legacy pull-through (identical to the pre-M12
-// behavior), and Never — which by definition never fetches — has no local image
+// IfNotPresent degrades to the legacy pull-through (identical to the behavior
+// before the local image index existed), and Never — which by definition never fetches — has no local image
 // to run and fails with ErrImageNotPresent.
 type NoLocalIndex struct{}
 
@@ -433,7 +433,7 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // Pull fetches ref and stores its config + layer blobs in the content-addressed
 // cache, returning the manifest and whether it was a full cache hit. Blobs
 // already present are not re-written, so the second pull of identical content
-// reports CacheHit == true (acceptance M1.1-a1). cred (M2.6) is the imagePullSecret
+// reports CacheHit == true. cred is the imagePullSecret
 // credential used for the registry fetch; it is confined to the fetch transport
 // and never written to the cache or pod dir.
 //
@@ -454,7 +454,8 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 //     starts pods through a registry outage;
 //   - never makes no fetch attempt at all: a locally absent reference is
 //     ErrImageNotPresent;
-//   - UNSPECIFIED is the legacy pull-through — the pre-M12 behavior, which is
+//   - UNSPECIFIED is the legacy pull-through — the behavior before pull-policy
+//     honoring existed, which is
 //     what an old provider that never stamps the field must keep getting. It is
 //     never read as an implicit never.
 //
@@ -608,8 +609,8 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 	wroteAny := false
 
 	// The MANIFEST is resolved before any blob is written, because it — not the
-	// object that hands over the bytes — is where every claimed digest comes from
-	// (B129). img.ConfigName() and layer.Digest() are not used as claimed values:
+	// object that hands over the bytes — is where every claimed digest comes
+	// from. img.ConfigName() and layer.Digest() are not used as claimed values:
 	// go-containerregistry's partial helpers derive both by hashing the very
 	// content being checked when the implementation carries no descriptor, so
 	// comparing against them would prove self-consistency, not authenticity, and
@@ -813,7 +814,7 @@ func manifestDigests(mfst *runtimev1.ImageManifest) []string {
 //
 // It is a THIN DELEGATION to Cache.CommitBlob, deliberately: the CAS integrity
 // invariant has exactly one home, and that home is on *Cache — reachable by any
-// ingest path (B117's tarball ingest links this package in-process) rather than
+// ingest path (the tarball-ingest path links this package in-process) rather than
 // locked behind a *Puller, whose constructor requires a FetchFunc an ingest path
 // has no business supplying.
 func (p *Puller) writeBlob(digest string, size int64, fill func(io.Writer) error) (wrote bool, err error) {

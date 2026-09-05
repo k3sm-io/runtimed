@@ -45,7 +45,7 @@ func vzEntitled() bool {
 
 // vzStaticCodeEntitled reports whether the binary at path has a signature that
 // passes SecStaticCodeCheckValidity and carries com.apple.security.virtualization,
-// read via Security.framework in the Obj-C shim (B227).
+// read via Security.framework in the Obj-C shim.
 //
 // It answers about ANOTHER binary (the k3sm-vmhost helper), which is why it is a
 // separate entry point from vzEntitled's SecCodeCopySelf read: the daemon is
@@ -62,7 +62,7 @@ func vzStaticCodeEntitled(path string) bool {
 // vzRosettaAvailability reports the host's Rosetta-for-Linux (GUEST translation)
 // availability via the Obj-C shim's +[VZLinuxRosettaDirectoryShare availability]
 // class-property read — a safe, ENTITLEMENT-free probe that constructs no object
-// and never attempts an install (B103). The raw 3-valued enum is preserved, plus
+// and never attempts an install. The raw 3-valued enum is preserved, plus
 // the shim's QUERY_FAILED sentinel; see GuestRosettaState and ProbeGuestRosetta.
 //
 // The shim's own arch guard makes the non-arm64 compile lane return NOT_SUPPORTED,

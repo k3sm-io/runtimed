@@ -32,7 +32,7 @@ var ErrFSGroupRootUnbounded = errors.New("fsGroup chown root is outside the perm
 // ChownForFSGroup recursively sets group ownership of root to gid and makes it
 // group-accessible, so a pod that drops to a non-root uid (with fsGroup in its
 // supplemental groups — see Credential.Groups) can still read and write its
-// volumes (M2.3 securityContext.fsGroup). It mirrors the kubelet fsGroup
+// volumes (securityContext.fsGroup). It mirrors the kubelet fsGroup
 // volume-ownership pass.
 //
 // It must run ROOT-side in the daemon, before the privilege drop in the exec-shim
@@ -47,7 +47,7 @@ var ErrFSGroupRootUnbounded = errors.New("fsGroup chown root is outside the perm
 // independent of whoever computed root: the walk grants the group the owner's
 // full rwx and sets setgid on every directory it reaches, which is a privilege
 // grant, and the runtime's pod-dir delete already carries exactly this bound on
-// its RemoveAll — the asymmetry was the defect (B140). The bound is a PARAMETER
+// its RemoveAll — the asymmetry was the defect this bound closes. The bound is a PARAMETER
 // rather than a package constant because this package deliberately imports
 // nothing from k3sm.io: it is the low-level process layer, and reaching into
 // pkg/image or pkg/mount for the layout (or the containment predicate) would

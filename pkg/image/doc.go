@@ -28,7 +28,7 @@ limitations under the License.
 //     no path on which go-containerregistry's implicit linux/amd64 default can
 //     fire. platform.go is pure, GOOS-agnostic and cgo-free: the Rosetta
 //     capabilities it consumes are INPUTS, and probing for them belongs to
-//     B103, not here.
+//     the Rosetta-probe package, not here.
 //
 //   - Pull: fetch an OCI image by reference into a content-addressed blob cache
 //     under /var/lib/k3sm (default; configurable). Blobs are keyed by digest, so
@@ -127,7 +127,7 @@ limitations under the License.
 //     CAS problem.
 //
 // A general verify-on-read is still deliberately absent — it is O(image bytes) on
-// the hot path and would regress the M1.1-a1 cache-hit acceptance. What M11.2-d7
+// the hot path and would regress the cache-hit acceptance path. What the unpacker
 // closes is the path that MATTERS, for free: Unpacker.Unpack already streams every
 // blob of an image end to end to build the tree, so it re-hashes each one against
 // its manifest descriptor (ErrDigestMismatch) and each layer's decompressed bytes
@@ -153,7 +153,7 @@ limitations under the License.
 // The SUBSTITUTE control for a Linux payload is a different mechanism, not a
 // weakened one: per-layer diffID re-verification when the rootfs is built (so
 // the bytes are self-authenticating against the manifest that was pulled) plus
-// the pinned guest TCB (kernel + init), per B100.
+// the pinned guest TCB (kernel + init).
 // Platform selection (platform.go) is the upstream half of that chain: it is
 // what guarantees the payload being verified is the one this node asked for.
 package image

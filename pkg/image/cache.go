@@ -102,7 +102,7 @@ func (c *Cache) blobsDir() string { return filepath.Join(c.root, "blobs") }
 
 // pathFor is the one place the content-addressed layout is expressed. Every
 // path-producing entry point goes through it, so a future change (a sharded
-// blobs/<algo>/<xx>/<hex>, B128's GC) has exactly one edit site. It takes a
+// blobs/<algo>/<xx>/<hex>, or the GC store) has exactly one edit site. It takes a
 // parsed hash, so it is unreachable without parseBlobDigest having run.
 func (c *Cache) pathFor(h ggcrv1.Hash) string {
 	return filepath.Join(c.blobsDir(), h.Algorithm, h.Hex)
@@ -110,7 +110,7 @@ func (c *Cache) pathFor(h ggcrv1.Hash) string {
 
 // ErrUnsupportedDigestAlgorithm is returned for a digest whose algorithm half is
 // not in the closed allowlist below. It is distinct from ErrInvalidDigest so a
-// caller (B117's tarball ingest) can tell "this store cannot handle that
+// caller (the tarball-ingest path) can tell "this store cannot handle that
 // algorithm at all" from "that string is not a digest", and both from
 // ErrDigestMismatch, which means the bytes were poisoned.
 var ErrUnsupportedDigestAlgorithm = errors.New("image: unsupported digest algorithm")
@@ -133,8 +133,9 @@ var ErrDigestMismatch = errors.New("image: blob content does not match its claim
 // self-contradictory — today, that it disagrees with the fetched image about how
 // many layers it has. No blob was hashed when this is returned, which is exactly
 // why it is not an ErrDigestMismatch: that sentinel's message would be false here,
-// and a consumer (B117's ingest, the M12 pull-failure taxonomy) needs "this source
-// is malformed" to stay distinguishable from "this blob is poisoned".
+// and a consumer (the tarball-ingest path, the pull-failure taxonomy) needs
+// "this source is malformed" to stay distinguishable from "this blob is
+// poisoned".
 var ErrManifestInconsistent = errors.New("image: image contradicts its own manifest")
 
 // ErrBlobTooLarge is returned by CommitBlob when fill streams more bytes than the
@@ -205,7 +206,7 @@ func parseBlobDigest(digest string) (ggcrv1.Hash, error) {
 // when the string has no separator or an empty half. The body is deliberately not
 // returned: it is validated by ggcrv1.NewHash on the whole string, so handing a
 // caller an unvalidated body would invite exactly the "sanitize one half only"
-// bug B129 fixed.
+// bug this function's predecessor once had.
 func cutAlgorithm(digest string) (algo string, ok bool) {
 	algo, body, found := strings.Cut(digest, ":")
 	return algo, found && algo != "" && body != ""
@@ -213,12 +214,12 @@ func cutAlgorithm(digest string) (algo string, ok bool) {
 
 // BlobPath maps a digest ("<algo>:<hex>") to its on-disk path, validating the
 // digest first. It is the only sanctioned way for an out-of-package caller
-// (B117's tarball ingest, B128's GC) to name a blob on disk.
+// (the tarball-ingest path, the GC store) to name a blob on disk.
 //
 // It validates through parseBlobDigest and builds the path from the parsed
 // halves, never the raw string, so no caller can construct a path outside the
 // blob root: an algorithm that is not allowlisted yields no path at all, and an
-// allowlisted one has a fixed hex body. (Before B129 the algorithm half flowed
+// allowlisted one has a fixed hex body. (Previously the algorithm half flowed
 // into filepath.Join unchecked, so "../../etc:passwd" resolved to
 // /var/lib/etc/passwd — which pull.go then MkdirAll'd as the root LaunchDaemon.)
 //
@@ -258,8 +259,8 @@ func (c *Cache) Has(digest string) bool {
 // whether a new blob was written (false == this blob was already cached).
 //
 // This is the single HOME for the content-addressed store's integrity invariant:
-// every path that puts bytes into the cache — Puller.writeBlob today, B117's
-// tarball ingest next — commits through here, so the invariant is stated once.
+// every path that puts bytes into the cache — Puller.writeBlob today, the
+// tarball-ingest path too — commits through here, so the invariant is stated once.
 //
 // # What this defends against, honestly
 //
@@ -271,8 +272,9 @@ func (c *Cache) Has(digest string) bool {
 //
 // That qualifier is load-bearing, not boilerplate. For an image whose manifest is
 // SYNTHESIZED from its content — any go-containerregistry partial/tarball-backed
-// image, a test fake, a future local-layout fetcher, i.e. exactly B117/M12's
-// neighbourhood — mfst.*.Digest is derived from the very bytes being checked, so
+// image, a test fake, a future local-layout fetcher, i.e. exactly the
+// tarball-ingest neighbourhood — mfst.*.Digest is derived from the very bytes
+// being checked, so
 // the comparison is a tautology that cannot fail. It does not authenticate the
 // image either: a wholly hostile FetchFunc supplies the manifest too, and can
 // therefore make its bytes and its claimed digests agree. Image authenticity is a
@@ -282,10 +284,11 @@ func (c *Cache) Has(digest string) bool {
 //
 // Verification happens at WRITE time only. The cache-hit fast path below is an
 // os.Lstat, and every downstream reader (materialize, the unpacker) trusts the
-// on-disk bytes; every blob written before B129 was never hashed by this repo at
-// all. Verify-on-read is deliberately not done here — it is O(image bytes) on the
-// hot path and would regress the M1.1-a1 cache-hit acceptance path. The natural
-// closer is M11.2-d7, the unpacker, which already reads each blob once per rootfs
+// on-disk bytes; every blob written before write-time verification existed was
+// never hashed by this repo at all. Verify-on-read is deliberately not done
+// here — it is O(image bytes) on the hot path and would regress the
+// cache-hit acceptance path. The natural closer is the unpacker, which
+// already reads each blob once per rootfs
 // creation and can hash it there for free.
 //
 // # size is a RESOURCE GUARD, not a second integrity mechanism

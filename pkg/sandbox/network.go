@@ -34,13 +34,13 @@ import (
 // path: Seatbelt network-address filters accept only `localhost` or `*` as
 // the host. (remote ip "10.43.0.10:53"), (local ip "<PodIP>:*"), and every
 // tcp4/ip4/tcp dialect variant fail to compile with "host must be * or
-// localhost in network address" — so the pre-M10.1 VIP-scoped outbound
+// localhost in network address" — so an earlier VIP-scoped outbound
 // allows and PodIP-scoped bind allow made every AllowNetwork pod fail at
 // sandbox_apply (networked pods could not spawn at all).
 //
 // What the grammar does support: per-PORT scoping compiles and enforces
 // precisely ((local ip "*:8899") allowed :8899 and denied :8898), and
-// localhost-host filters compile. RESOLVED (B215 P3 probe, 2026-08-31,
+// localhost-host filters compile. RESOLVED (a lab probe run 2026-08-31,
 // through the real execshim/libsandbox path): a port- or localhost-scoped
 // tightening is foreclosed, not merely deferred. Scoping network-bind alone
 // is inert — this stanza's separate, unscoped (allow network-inbound) still
@@ -63,7 +63,7 @@ import (
 // passes bind() but a TCP server's listen() is gated by the separate
 // network-inbound operation, so without it every listening pod (a Service
 // target, a readiness/liveness HTTP server) fails listen() with EPERM under
-// (deny default). Regression from M10.1 dropping the PodIP-scoped bind (which
+// (deny default). Regression from per-pod-IP dropping the PodIP-scoped bind (which
 // implied inbound) for a bare bind; probe-verified through the real
 // execshim/libsandbox path on macOS 26.5.1 (both :8080 and :8081).
 //
