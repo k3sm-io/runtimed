@@ -1,12 +1,12 @@
 //go:build darwin && cgo
 
-// Obj-C shim for the vm sandbox backend's SAFE availability probes (M5.1, plus the
-// guest-Rosetta availability read added by B103 and the helper static-signature
-// check added by B227). It is isolated here so the only Objective-C /
-// Virtualization.framework surface the rest of runtimed sees is the FOUR C entry
-// points in vm_darwin.h. NO entry point constructs or boots a VZVirtualMachine —
-// doing so without the com.apple.security.virtualization entitlement raises an
-// uncaught NSException -> SIGABRT, so all four are additionally wrapped in
+// Obj-C shim for the vm sandbox backend's SAFE availability probes (Virtualization
+// support, guest-Rosetta availability, and the helper static-signature check).
+// It is isolated here so the only Objective-C / Virtualization.framework surface
+// the rest of runtimed sees is the FOUR C entry points in vm_darwin.h. NO entry
+// point constructs or boots a VZVirtualMachine — doing so without the
+// com.apple.security.virtualization entitlement raises an uncaught NSException
+// -> SIGABRT, so all four are additionally wrapped in
 // @try/@catch and @autoreleasepool.
 //
 // The COUNT is load-bearing, not prose: this comment and vm_darwin.h are the stated
@@ -74,7 +74,7 @@ int k3sm_vz_has_entitlement(void) {
 }
 
 // k3sm_vz_rosetta_availability — SAFE, ENTITLEMENT-FREE guest-Rosetta capability
-// probe (B103). It reads the +[VZLinuxRosettaDirectoryShare availability] CLASS
+// probe. It reads the +[VZLinuxRosettaDirectoryShare availability] CLASS
 // property and nothing else:
 //
 //   - it is NOT -initWithError:, which CONSTRUCTS a directory share;

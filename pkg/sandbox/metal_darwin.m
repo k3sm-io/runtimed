@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-// Obj-C shim for the FUNCTIONAL Metal probe behind runtimed's GPU facts (M8.2-d4).
+// Obj-C shim for the FUNCTIONAL Metal probe behind runtimed's GPU facts.
 // It is isolated here so the only Objective-C / Metal.framework surface the rest of
 // runtimed sees is the ONE C entry point in metal_darwin.h.
 //
