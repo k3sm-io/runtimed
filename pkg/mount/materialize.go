@@ -90,7 +90,7 @@ type seenMount struct {
 // that names no PodBox.volume, or whose mount path would escape the data volume,
 // is rejected (fail closed). A persistentVolumeClaim mount is SKIPPED here — it is
 // durable and lifecycle-decoupled, bound by pkg/volume to a stable dir outside the
-// pod tree (M3.1), not materialized into the pod data volume.
+// pod tree, not materialized into the pod data volume.
 func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP string, r Resolver) (*Layout, error) {
 	dataVol = filepath.Clean(dataVol)
 	volumes := make(map[string]*runtimev1.Volume, len(box.GetVolumes()))
@@ -116,7 +116,7 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 			}
 			// PVC sources are durable and lifecycle-decoupled: pkg/volume binds them
 			// to a stable dir OUTSIDE the pod tree and symlinks them into the rootfs.
-			// They are not materialized (rebased) here. (M3.1)
+			// They are not materialized (rebased) here.
 			if vol.GetPersistentVolumeClaim() != nil {
 				continue
 			}

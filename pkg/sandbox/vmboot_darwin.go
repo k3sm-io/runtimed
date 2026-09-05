@@ -137,7 +137,7 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 // spawnVMHost starts one helper child and records it durably before returning.
 //
 // CONFINEMENT: the HELPER RUNS UNCONFINED, decided by measurement on an entitled
-// rig (M11 R22 admits either, as a named choice). Spawning it under the pod's own
+// rig (a named, deliberate choice). Spawning it under the pod's own
 // Generate() profile was built and run; two independent denials killed it, both
 // captured verbatim:
 //
@@ -164,7 +164,7 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 // (vmhost.Proxy). Narrowing it needs a profile written for the hypervisor's
 // device surface rather than the pod's, which is its own deliverable.
 //
-// PUBLISHER IDENTITY, also residual (M11 R19(c)): the helper is located by
+// PUBLISHER IDENTITY, also residual: the helper is located by
 // FindVMHost (beside the daemon, then PATH) and gated by Available()'s
 // SecStaticCodeCheckValidity + entitlement read — a "was this mangled after
 // signing" check under the code's own designated requirement, not a publisher or

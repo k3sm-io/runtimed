@@ -174,8 +174,8 @@ type LoadResult struct {
 //
 // # What this does not claim
 //
-// A loaded image is PROVENANCE-free by design (the M12 images plan, §M12.2):
-// this path evaluates no signature policy, and the archive's manifest is
+// A loaded image is PROVENANCE-free by design: this path evaluates no
+// signature policy, and the archive's manifest is
 // supplied by the same party as its bytes. On the docker-save leg in particular
 // the per-blob check is self-CONSISTENCY, not authenticity —
 // go-containerregistry synthesizes that format's descriptors from the very bytes

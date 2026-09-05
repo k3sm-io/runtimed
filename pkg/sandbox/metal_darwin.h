@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-// FUNCTIONAL Metal probe for the daemon's GPU facts (M8.2-d4). This header is the
+// FUNCTIONAL Metal probe for the daemon's GPU facts. This header is the
 // INVENTORY of that surface: it declares ONE entry point, it uses only PUBLIC
 // Metal.framework API (so this is NOT a libsandbox SPI canary case), and the
 // implementation in metal_darwin.m wraps everything in @autoreleasepool + @try/@catch

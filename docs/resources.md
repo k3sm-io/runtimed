@@ -1,11 +1,11 @@
-# runtimed resource accounting & limits (M2.5, B7)
+# runtimed resource accounting & limits
 
 How runtimed meters pod memory, enforces a memory limit (OOMKilled), applies
 explicit rlimits and the best-effort QoS band, and what it does — and
-deliberately does **not** — promise for CPU. This is the note the PHASES
-`M2.5-d3` deliverable points to; the code at the call sites (`pkg/supervisor`
-`PhysFootprinter` / `MemorySampler` / `RunLaunchSequence`, `pkg/runtime`
-`PodMetrics` / `resolveRlimitPlan` / `resolveBgQoS`) references it.
+deliberately does **not** — promise for CPU. This is the design note the
+memory-sampler code points back to; the code at the call sites
+(`pkg/supervisor` `PhysFootprinter` / `MemorySampler` / `RunLaunchSequence`,
+`pkg/runtime` `PodMetrics` / `resolveRlimitPlan` / `resolveBgQoS`) references it.
 
 ## Memory: `ri_phys_footprint`, NOT RSS
 
@@ -80,9 +80,9 @@ limit is a residency *hint* (allocation 8× past it succeeded with no eviction) 
 jetsam did not engage even at 24 GiB on a 64 GiB host.
 
 The memory limit is read from the typed **`PodBox.memory_limit_bytes`** field
-(`apis:M2.2`, allocated from the reserved `100..199` band) — the provider converts
-the pod's `resources.limits.memory`. `podMemoryLimitBytes` (`pkg/runtime/metrics.go`,
-M2.8) prefers that typed field and falls back to the legacy
+(allocated from the reserved `100..199` band) — the provider converts
+the pod's `resources.limits.memory`. `podMemoryLimitBytes` (`pkg/runtime/metrics.go`)
+prefers that typed field and falls back to the legacy
 `k3sm.io/memory-limit-bytes` annotation **only** when it is unset, so OOM
 enforcement holds in either land order while the provider switches to writing the
 typed field; the annotation fallback is transitional and removable once every
@@ -124,9 +124,9 @@ Two accounting details that are load-bearing:
   MONOTONE, which the consumer requires (metrics-server derives a rate from two
   cumulative samples and rejects a decreasing pair).
 
-### QoS application (B7): BestEffort → the darwin background band
+### QoS application: BestEffort → the darwin background band
 
-Since B7 the launch sequence *applies* **`PodBox.qos_class`** (the apis enum
+The launch sequence *applies* **`PodBox.qos_class`** (the apis enum
 mirroring corev1 `PodQOSClass`), pre-exec in the exec-shim
 (`supervisor.RunLaunchSequence` `StepSetpriority`, before the sandbox is
 applied so a default-deny SBPL cannot block it and every descendant inherits
@@ -156,16 +156,16 @@ it):
 - **BG'd pods legitimately report LOW CPU** now that usage accounting is live: a
   throttled pod's low usage is the policy working, not an accounting bug. Do
   not "fix" it by unthrottling.
-- **jetsam/memorystatus interaction is B46's lane.** Darwin couples the BG
+- **jetsam/memorystatus interaction is future work.** Darwin couples the BG
   band with jetsam/memorystatus behavior; how the band shifts a pod's
-  memory-pressure treatment (and whether it fights the M2.5 sampler) is
-  explicitly **not** decided here — the B7 lab leg measures the band's effect
-  before/after BG and feeds B46.
+  memory-pressure treatment (and whether it fights the memory sampler) is
+  explicitly **not** decided here — that interaction wants a lab measurement
+  of the band's effect before/after BG.
 
-## Explicit rlimits (B7): applied, with darwin caveats
+## Explicit rlimits: applied, with darwin caveats
 
-**`PodBox.rlimits`** (OCI-style `setrlimit(2)` caps, `apis:M2.2`) are applied
-since B7: the daemon resolves the EXPLICIT entries to a numeric plan
+**`PodBox.rlimits`** (OCI-style `setrlimit(2)` caps) are applied: the daemon
+resolves the EXPLICIT entries to a numeric plan
 (`runtime.resolveRlimitPlan` — nothing is ever synthesized from
 `memory_limit_bytes` or a cpu quota), threads it through the one
 `sandbox.Backend.WrapCommand` choke-point (container starts AND `kubectl exec`
@@ -175,10 +175,10 @@ argv codec and its fail-closed decode contract are documented on
 `cmd/k3sm-execshim` and `supervisor.EncodeRlimits`/`ParseRlimits`.
 
 **Provider↔runtimed gRPC skew window:** `PodBox.rlimits`/`qos_class` are
-additive proto fields, so an OLD (pre-B7) runtimed handed them by a newer
-provider **silently drops them** — annotated pods launch unconstrained (and
-un-backgrounded) during a rolling restart; the deploy order is
-**restart-runtimed-first**, then the provider.
+additive proto fields, so an OLD runtimed that predates this feature, handed
+them by a newer provider, **silently drops them** — annotated pods launch
+unconstrained (and un-backgrounded) during a rolling restart; the deploy order
+is **restart-runtimed-first**, then the provider.
 
 **Darwin-specific behavior at the apply site
 (`supervisor.setrlimitClamped`):**
@@ -204,5 +204,5 @@ un-backgrounded) during a rolling restart; the deploy order is
 - **EPERM hard-raise clamps are logged, not surfaced.** In the unprivileged
   posture a hard-limit raise above the inherited ceiling is clamped down with
   a `slog` warning; surfacing that clamp to `PodStatus`/events is
-  **DEFERRED** (not in the B7 diff) — today the operator sees it only in the
+  **DEFERRED** — today the operator sees it only in the
   daemon log.

@@ -45,7 +45,7 @@ import (
 // socket and no other.
 const DefaultSocketPath = "/var/lib/k3sm/run/runtimed.sock"
 
-// Server hosts a *Runtime behind a gRPC server on a net.Listener. It is the M2
+// Server hosts a *Runtime behind a gRPC server on a net.Listener. It is the
 // daemon boundary: the same in-process *Runtime that k3sm imports as a library
 // is registered here so the split is a relocation, not a redesign. The seam is
 // transport-agnostic (it serves any net.Listener) so it is exercisable over a

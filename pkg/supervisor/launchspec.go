@@ -57,7 +57,8 @@ type LaunchSpec struct {
 //
 //	<uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]
 //
-// The position is load-bearing for binary skew: an old (pre-B7) shim handed the
+// The position is load-bearing for binary skew: an old shim that predates this
+// feature, handed the
 // new argv reads the rlimit token where it expects its profile path, fails the
 // profile ReadFile, and exits — fail-closed; a new shim handed the old argv sees
 // a profile path where it expects the rlimit token, fails the decode, and exits —

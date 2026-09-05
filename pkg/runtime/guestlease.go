@@ -26,7 +26,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// The vm pod's live transport address watcher (B237).
+// The vm pod's live transport address watcher.
 //
 // A vm pod has two addresses and they are not interchangeable
 // (runtime.proto, PodStatus.guest_transport_address). pod_ip is the pod's
@@ -105,7 +105,7 @@ const (
 // PodStatus.guest_transport_address stays empty exactly as the contract says.
 //
 // It is armed after registration, by CreatePod, and it refuses an unregistered
-// pod for the reason armMemorySampler does (B26): a goroutine rooted at a pod
+// pod for the reason armMemorySampler does: a goroutine rooted at a pod
 // the daemon has already forgotten can neither be found nor stopped by any
 // later teardown. It is idempotent — a second call for a pod that already has a
 // watcher is a no-op — because the latch is the stopped channel itself, so

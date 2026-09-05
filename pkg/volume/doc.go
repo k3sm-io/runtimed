@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package volume materializes APFS-backed persistent volumes (PVCs) for a pod
-// (runtimed M3.1). It is the durable counterpart to pkg/mount: where pkg/mount
+// Package volume materializes APFS-backed persistent volumes (PVCs) for a pod.
+// It is the durable counterpart to pkg/mount: where pkg/mount
 // renders pod-ephemeral sources (configMap/secret/emptyDir/downwardAPI/projected)
 // INTO the pod data volume — torn down with the pod — a PVC-backed dir lives at a
 // STABLE per-claim path on the APFS storage root outside the pod tree and SURVIVES

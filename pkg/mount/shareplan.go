@@ -27,15 +27,15 @@ import (
 	storagev1 "k3sm.io/apis/storage/v1"
 )
 
-// Virtiofs mount tags for the pooled shares of a vm-RuntimeClass pod's plan
-// (B106). VZ limits a virtiofs tag to 36 bytes, so tags are short fixed
+// Virtiofs mount tags for the pooled shares of a vm-RuntimeClass pod's plan.
+// VZ limits a virtiofs tag to 36 bytes, so tags are short fixed
 // strings — never derived from user-supplied names (a PVC share is tagged by
 // INDEX, ShareTagPVCPrefix+i, precisely so a claim name can never overflow or
 // collide a tag).
 const (
 	// ShareTagRootfs is the pod rootfs share: read-only, and in this build the
 	// single lower layer of the guest root. The multi-lower extension (one
-	// share per OCI layer) is owned by M11.2-d1, not here.
+	// share per OCI layer) is not built here.
 	ShareTagRootfs = "k3sm.rootfs"
 	// ShareTagProj is the read-only pooled share for the projected-class
 	// volumes (configMap / secret / projected / downwardAPI), one subdir per
@@ -79,7 +79,7 @@ const emptyDirMediumMemory = "Memory"
 // DATA — ComputeSharePlan touches no filesystem and chowns nothing (the d5
 // no-chown rule: the planner plans, ownership is never its job). Enforcement
 // of a share's writability is the VZ device config the lab-gated boot builds,
-// and composition of the binds/tmpfs is guest-init (B102); neither happens in
+// and composition of the binds/tmpfs is guest-init; neither happens in
 // this build (see the sandbox.VMShare / sandbox.VMBind docs the plan is mapped
 // onto).
 type SharePlan struct {
@@ -115,7 +115,7 @@ type Share struct {
 // Bind is one container volumeMount realized from a share: the guest path
 // MountPath binds to SourceRel under the share tagged ShareTag, optionally
 // narrowed by SubPath (carried verbatim after lexical validation). Composed by
-// guest-init (B102).
+// guest-init.
 type Bind struct {
 	// VolumeName is the PodBox volume the bind realizes.
 	VolumeName string
@@ -138,7 +138,7 @@ type Bind struct {
 
 // Tmpfs is one Memory-medium emptyDir mount: guest-RAM tmpfs at MountPath,
 // never a virtiofs share (the contents must live in guest memory, not on the
-// host filesystem). Composed by guest-init (B102). It carries the same
+// host filesystem). Composed by guest-init. It carries the same
 // per-mount SubPath/ReadOnly intent a Bind does — upstream permits both on a
 // Memory emptyDir, so dropping either here would be a silent narrowing the
 // native path (materialize.go) does not have.
@@ -164,7 +164,7 @@ type Tmpfs struct {
 // podDir is the pod's on-disk directory (the runtime-derived
 // <root>/pods/<podID> — never box.rootfs_path, which is caller-supplied; the
 // runtime now also refuses any rootfs_path that is not byte-equal to that same
-// derivation (B140), so the two agree, but the planner still derives its own
+// derivation, so the two agree, but the planner still derives its own
 // rather than trusting the box). workRoot is the runtime work dir (Config.Root),
 // and class is the local-path storage class PVC roots derive from. podDir is ENFORCED to
 // sit strictly inside <workRoot>/pods (guardShareRoots): a caller-derived pod

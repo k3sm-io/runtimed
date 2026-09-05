@@ -33,8 +33,8 @@ limitations under the License.
 //     impl (spawn_darwin.go) uses raw posix_spawn + posix_spawn_file_actions +
 //     POSIX_SPAWN_SETSID|SETPGROUP via cgo; tests inject a fake.
 //   - PodNetwork — Setup(ctx, podID) -> pod IP; Teardown(podID) releases it on
-//     pod delete (and on a failed create after a successful Setup). M1 wires a
-//     node-IP/no-op impl (single node); the k3sm-injected adapter over
+//     pod delete (and on a failed create after a successful Setup). NodeNetwork
+//     is a node-IP/no-op impl (single node); the k3sm-injected adapter over
 //     darwin-net's podnet IPAM supplies the real per-pod /32 lo0 aliases.
 //
 // All cgo (posix_spawn, kqueue) is isolated in *_darwin.go behind these seams.

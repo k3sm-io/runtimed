@@ -96,8 +96,9 @@ limitations under the License.
 //     mount is a view of the guest-wide unified hierarchy — a metering/build
 //     aid, not an isolation boundary.
 //   - An idmapped mount (GuestMount.idmap) is planned but not applied by the
-//     executor: mount_setattr(MOUNT_ATTR_IDMAP) is contingent on the M11.2-d5
-//     lab question. The executor refuses such a spec rather than mounting it
+//     executor: mount_setattr(MOUNT_ATTR_IDMAP) is contingent on whether the
+//     host's virtiofs device supports FUSE idmap. The executor refuses such a
+//     spec rather than mounting it
 //     without the idmap, because a silently non-idmapped PVC writes files
 //     under the wrong owner into storage that outlives the pod.
 package guestinit

@@ -26,7 +26,7 @@ import (
 
 // killSignal is SIGKILL and termSignal is SIGTERM, as the unix.Signal concrete
 // type the supervisor's SignalGroup expects (a plain os.Signal whose dynamic type
-// is unix.Signal). termSignal is the graceful-stop first signal (M2.4); killSignal
+// is unix.Signal). termSignal is the graceful-stop first signal; killSignal
 // the escalation / immediate kill.
 var (
 	killSignal os.Signal = unix.SIGKILL

@@ -37,8 +37,8 @@ import (
 // vmBootDeadline bounds spec-write -> spawn -> VM attach -> guest boot -> agent
 // handshake for one pod.
 //
-// DERIVATION, not a round number. The M11 S1 spike measured create->guest-token
-// at 165 ms median / 172 ms max on one uncontended VM; a live d9 smoke on the
+// DERIVATION, not a round number. A lab spike measured create->guest-token
+// at 165 ms median / 172 ms max on one uncontended VM; a live smoke run on the
 // same rig measured the whole chain — helper spawn through a Health round trip
 // over agent.sock — at 668-707 ms across five runs. So 30 s is roughly forty
 // times the observed worst case, which is the margin a node under real pod

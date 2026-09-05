@@ -58,7 +58,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return err // includes io.EOF if the client gave up before sending params
 	}
-	// Route dispatch (M11.2-d6). A vm pod's containers are guest processes with
+	// Route dispatch. A vm pod's containers are guest processes with
 	// no host containerProc and no host confinement to re-enter, so the whole
 	// host-process body below is meaningless for one: it proxies to the pod's
 	// guest agent instead. A pod that is not a vm pod — or an id no pod has —
@@ -86,7 +86,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	// that re-applies the pod's profile + drop + rlimit plan + qos band (the full
 	// supervisor.LaunchSpec — an exec session gets the POD's limits, one code
 	// path). This is the same seam the container spawn (startContainer) and the
-	// M2.3/B7 launch-order tests exercise, so a future profile change
+	// launch-order tests exercise, so a future profile change
 	// automatically covers exec too.
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
@@ -261,7 +261,7 @@ func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tt
 // lookupContainer for that reason: a vm pod has no host containerProc, so the
 // host-process lookup cannot answer for one at all.
 //
-// M2 limitation, NATIVE PODS ONLY: a native container is spawned (posix_spawn)
+// NATIVE PODS ONLY: a native container is spawned (posix_spawn)
 // with its combined stdout+stderr wired to the log pipe and its stdin not
 // retained — so there is no fd to feed new input to a running native process.
 // Interactive attach (stdin, or a tty) is therefore reported Unimplemented
@@ -270,8 +270,8 @@ func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tt
 // half faithfully: it replays the container's buffered combined output and then
 // follows new output live until the container exits (delivering its exit code)
 // or the client disconnects. Full interactive attach for a NATIVE pod awaits
-// the stdin-pty retention work tracked in PHASES M2.7; the vm route above has
-// no such limitation, because the guest retains the endpoints at spawn.
+// stdin-pty retention work for native pods; the vm route above has no such
+// limitation, because the guest retains the endpoints at spawn.
 func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 	ctx := stream.Context()
 	first, err := stream.Recv()

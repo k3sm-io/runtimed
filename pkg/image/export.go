@@ -85,9 +85,8 @@ var exportModTime = time.Unix(0, 0).UTC()
 // Leasing instead would let any caller pin the store for the length of a
 // transfer it controls.
 //
-// The daemon is not the writer of the operator's file (the M12 images plan,
-// Resolution 8, as amended): w is the caller's stream, never a path this package
-// opens.
+// The daemon is not the writer of the operator's file: w is the caller's
+// stream, never a path this package opens.
 func (c *Cache) ExportOCILayout(ctx context.Context, w io.Writer, e IndexEntry) error {
 	if err := ctx.Err(); err != nil {
 		return err

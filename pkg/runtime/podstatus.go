@@ -58,7 +58,7 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 			st.Conditions = append(st.Conditions, cond)
 		}
 		appendGuestContainerStatusesLocked(st, p)
-		// The LIVE TRANSPORT address (B237) — what the host dials to reach this
+		// The LIVE TRANSPORT address — what the host dials to reach this
 		// guest, as the agent last reported it. It is deliberately not folded
 		// into PodIp/PodIps above: those are the pod's published identity, and
 		// this is a node-local NAT address that must never reach EndpointSlice,
@@ -92,8 +92,8 @@ func appendGuestContainerStatusesLocked(st *runtimev1.PodStatus, p *pod) {
 }
 
 // containerStatusOf clones a container's status so callers can't mutate pod state.
-// The restart_count + last_termination_state (M2.2) and volume_mount + user
-// mirrors (M2.2/M2.3) are carried through losslessly. The caller holds pod.mu.
+// The restart_count + last_termination_state and volume_mount + user
+// mirrors are carried through losslessly. The caller holds pod.mu.
 func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 	st := &runtimev1.ContainerStatus{
 		Name:  cp.state.GetName(),

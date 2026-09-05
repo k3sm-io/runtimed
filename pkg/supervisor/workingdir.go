@@ -32,7 +32,7 @@ import (
 // fallback to the caller's cwd: the caller is a root daemon whose cwd is its own
 // working directory, the pod sandbox profile denies that tree, and a pod that
 // silently landed there would run somewhere nothing in its spec asked for. That
-// is the failure this sentinel exists to make loud — an M8 lab pod declaring
+// is the failure this sentinel exists to make loud — a real lab pod declaring
 // workingDir /usr got EPERM stat'ing "." because it had inherited the daemon's
 // cwd under /Users and the chdir was never performed at all.
 var ErrWorkingDir = errors.New("supervisor: unusable spawn working directory")

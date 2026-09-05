@@ -31,7 +31,7 @@ import (
 // Implementations must preserve the caller's environment when they exec the pod
 // (notably DYLD_INSERT_LIBRARIES, the cross-repo DNS-shim enabler): the
 // supervisor passes envp to posix_spawn, and the backend's exec must not strip
-// it. This is why M1 uses an ad-hoc-signed exec-shim and not Apple's
+// it. This is why the host-process backend uses an ad-hoc-signed exec-shim and not Apple's
 // /usr/bin/sandbox-exec (a platform binary that strips DYLD_*).
 //
 // Backends are OS-version-gated and fail closed: Available reports false when

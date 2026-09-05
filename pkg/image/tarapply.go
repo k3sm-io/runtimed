@@ -83,8 +83,8 @@ type LayerSemantics string
 //     it does under a chroot — it resolves against the HOST root the moment the
 //     tree is cloned into a pod rootfs — so this dialect refuses one outright;
 //   - OCI whiteouts (".wh.*", ".wh..wh..opq") carry no meaning here and are
-//     applied as ordinary files. The Linux dialect that interprets them is
-//     M11.2-d1's, and it arrives as its own LayerSemantics constant precisely so
+//     applied as ordinary files. The Linux rootfs-builder dialect interprets
+//     them, and it arrives as its own LayerSemantics constant precisely so
 //     a tree built under one dialect is never served to the other.
 const SemanticsNative LayerSemantics = "native"
 
@@ -747,7 +747,7 @@ func (a *LayerApplier) applyRegular(name string, hdr *tar.Header, content io.Rea
 	a.stats.Files++
 	// The QUARANTINE INVARIANT, asserted at the TREE rather than only at the pod
 	// copy (clone.go's MaterializeTree asserts it on the destination). The tree
-	// is what M8.2-d3's AdHocSignTree walks and what every pod rootfs is cloned
+	// is what AdHocSignTree walks and what every pod rootfs is cloned
 	// from, so a quarantined file here would be re-discovered once per pod
 	// instead of once per image.
 	return assertNoQuarantine(filepath.Join(a.root.Name(), name))
@@ -870,13 +870,14 @@ func (a *LayerApplier) replace(name string) error {
 //     daemon is root, and it buys nothing when it is not.
 //   - the OWNER bits are always widened by ownerMin (0700 for a directory, 0600
 //     for a file). An unprivileged daemon that cannot read back what it wrote can
-//     neither clone the tree into a pod rootfs, nor sign it (M8.2-d3), nor
+//     neither clone the tree into a pod rootfs, nor sign it, nor
 //     inventory it — and mode 0 entries are common in real layer tars. GROUP and
 //     OTHER bits are never widened.
 //
 // The true recorded mode is therefore LOST on this path. That is acceptable
 // because nothing on the native spine consumes it; the Linux dialect that does
-// need it records it in M11.2-d1's ownership sidecar and re-applies it in-guest.
+// need it records it in the Linux rootfs builder's ownership sidecar and
+// re-applies it in-guest.
 func (a *LayerApplier) entryPerm(hdr *tar.Header, ownerMin fs.FileMode) fs.FileMode {
 	// hdr.Mode is the raw UNIX mode word, so setuid/setgid/sticky are 0o4000 /
 	// 0o2000 / 0o1000 here — NOT Go's fs.ModeSetuid family, which lives in the

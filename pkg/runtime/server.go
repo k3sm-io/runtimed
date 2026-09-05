@@ -62,11 +62,11 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	r.pods[box.GetPodId()] = p
 	r.mu.Unlock()
 
-	// Arm the M2.5 memory sampler only NOW, after registration: armMemorySampler
-	// refuses to arm a pod absent from r.pods (its anti-stranding guard, B26), so
+	// Arm the memory sampler only NOW, after registration: armMemorySampler
+	// refuses to arm a pod absent from r.pods (its anti-stranding guard), so
 	// arming inside createPod would leave every limited pod unenforced.
 	r.armMemorySampler(p)
-	// Same ordering, same reason (B237): the lease watcher refuses a pod absent
+	// Same ordering, same reason: the lease watcher refuses a pod absent
 	// from r.pods, so arming it inside createVMPod would leave every vm pod
 	// without a live transport address. It is a no-op for a host-process pod.
 	r.armGuestLeaseWatcher(p)
@@ -77,9 +77,9 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 }
 
 // DeletePod gracefully stops the pod's containers and forgets it. Each container
-// process group gets the M2.4 SIGTERM → grace timer (raced against the kqueue
+// process group gets a SIGTERM → grace timer (raced against the kqueue
 // reaper) → SIGKILL escalation; grace 0 is an immediate SIGKILL. The teardown is
-// TWO-PHASE (M10.2): the MAIN containers are stopped first (concurrently, as
+// TWO-PHASE: the MAIN containers are stopped first (concurrently, as
 // before), then any native sidecars in REVERSE start order with whatever REMAINS
 // of the one pod-level grace budget (see resolveGrace / stopSidecars).
 // Idempotent: deleting an unknown pod succeeds.
@@ -94,11 +94,11 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		return &runtimev1.DeletePodResponse{}, nil // idempotent
 	}
 
-	// Stop the memory sampler (M2.5): the pod is going away. The read takes p.mu —
+	// Stop the memory sampler: the pod is going away. The read takes p.mu —
 	// memCancel is REPLACED at arbitrary runtime by armMemorySampler (a
 	// RestartContainer re-exec re-arms it), so an unsynchronized read here is a
 	// data race that can cancel a stale sampler and strand the live one on a
-	// deleted pod (B26). armMemorySampler's own guard closes the other side: the
+	// deleted pod. armMemorySampler's own guard closes the other side: the
 	// r.pods delete above already happened, so a concurrent arm is refused, and
 	// p.cancel below tears down any sampler that slipped through (it is rooted at
 	// p.supCtx).
@@ -161,7 +161,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		return &runtimev1.DeletePodResponse{}, nil
 	}
 
-	// The ONE pod-level grace budget (M10.2): anchor its deadline BEFORE the
+	// The ONE pod-level grace budget: anchor its deadline BEFORE the
 	// mains are stopped so the sidecars that follow get only the REMAINDER.
 	deadline := time.Now().Add(grace)
 
@@ -217,7 +217,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 	wg.Wait()
 
-	// Phase 2 (M10.2): stop the native sidecars in REVERSE start order with the
+	// Phase 2: stop the native sidecars in REVERSE start order with the
 	// budget's remainder — mains first, then their support processes, mirroring
 	// the kubelet's KEP-753 termination order. A remainder <= 0 (the mains ran
 	// the budget out) is the immediate-SIGKILL path — which now includes the case
@@ -267,8 +267,8 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 // cannot distinguish "unset" from an explicit 0 at this boundary (and mapping 0→30s
 // would make an explicit immediate-kill unreachable).
 //
-// The resolved value is ONE pod-level budget shared by the whole teardown
-// (M10.2): the MAIN containers are stopped first, concurrently, against the full
+// The resolved value is ONE pod-level budget shared by the whole teardown:
+// the MAIN containers are stopped first, concurrently, against the full
 // budget; then the native sidecars are stopped in REVERSE start order with
 // whatever REMAINS of it (elapsed time subtracted; a remainder <= 0 is the
 // immediate-SIGKILL path). Sidecars never extend the pod's grace. The same rule
@@ -293,8 +293,8 @@ func graceDuration(secs int64, p *pod) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// UpdatePod applies an in-place spec change. M1 supports labels/annotations only;
-// any other field change is NOT_UPDATABLE (requires recreate).
+// UpdatePod applies an in-place spec change. Only labels/annotations are
+// supported; any other field change is NOT_UPDATABLE (requires recreate).
 func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
 	box := req.GetPod()
 	if box.GetPodId() == "" {
@@ -403,7 +403,7 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStrea
 	if !ok {
 		return status.Errorf(codes.NotFound, "pod %s not found", req.GetPodId())
 	}
-	// Route dispatch (M11.2-d6): a vm pod's output lives in the guest, which
+	// Route dispatch: a vm pod's output lives in the guest, which
 	// holds it — there is no host log buffer to serve from (see getLogsGuest).
 	if p.isVM() {
 		return r.getLogsGuest(req, stream, p)
@@ -500,7 +500,7 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStrea
 //
 // These string VALUES are a CROSS-REPO WIRE CONTRACT carried as DATA. The proto's
 // Conditions field is `repeated` and Type is a free string, so adding a capability
-// needs NO proto change (the B1 precedent) — but that also means nothing but these
+// needs NO proto change — but that also means nothing but these
 // constants binds producer to consumer. k3sm's provider IMPORTS them, so a rename on
 // either side becomes a COMPILE error instead of a node label that is silently,
 // permanently absent. Never change a value; only ever add.
@@ -522,15 +522,15 @@ const (
 	ConditionVMBackendAvailable = "VMBackendAvailable"
 	// ConditionRosettaHostAvailable reports whether this host can translate
 	// darwin/amd64 MACH-O payloads via Rosetta 2 (the NATIVE host-process spine's
-	// capability). B103.
+	// capability).
 	ConditionRosettaHostAvailable = "RosettaHostAvailable"
 	// ConditionRosettaGuestAvailable reports whether a Linux GUEST on this host
 	// could translate linux/amd64 ELF payloads via Rosetta for Linux (the vm
-	// backend's capability). B103.
+	// backend's capability).
 	ConditionRosettaGuestAvailable = "RosettaGuestAvailable"
 )
 
-// GetRuntimeInfo reports the daemon version + health for the M2 handshake.
+// GetRuntimeInfo reports the daemon version + health for the provider handshake.
 func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
 	healthy := r.backend.Available()
 	cond := runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
@@ -546,7 +546,7 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 	// entitlement — the SAFE probe on r.vmBackend, which never boots a VM). k3sm
 	// reads it at node bring-up to label the node truthfully (k3sm.io/virtualization),
 	// so a VZ-incapable node is not silently offered as vm-schedulable. Carried as
-	// an additive RuntimeCondition Type — no proto change (B1).
+	// an additive RuntimeCondition Type — no proto change.
 	vmCond := runtimev1.ConditionStatus_CONDITION_STATUS_FALSE
 	vmReason := "Unavailable"
 	vmMsg := "vm backend unavailable (Virtualization.framework unsupported or process unentitled); vm-RuntimeClass pods fail closed"
@@ -574,14 +574,14 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 				Message: vmMsg,
 			},
 			// The two Rosetta capability conditions are ADDITIVE — they are appended
-			// to, never a replacement for, the two above (B103). Their values were
+			// to, never a replacement for, the two above. Their values were
 			// computed once in New and are immutable, so this handler only stamps them
 			// into fresh proto messages; a probe that reported UNAVAILABLE is a
 			// capability absence, NOT a handshake failure, so err stays nil.
 			r.rosettaHost.condition(ConditionRosettaHostAvailable),
 			r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
 		},
-		// GPU facts (M8.2-d4), stamped fresh from the immutable observation New
+		// GPU facts, stamped fresh from the immutable observation New
 		// made. ALWAYS present on a daemon that can probe: the apis contract reads
 		// an absent gpu as "this daemon does not report GPU facts", which is a
 		// different fact from a host with no usable GPU, and collapsing the two

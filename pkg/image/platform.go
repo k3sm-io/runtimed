@@ -208,10 +208,10 @@ var (
 // selection works end to end.
 //
 // HostRosetta / GuestRosetta are capability INPUTS, not probes: this file stays
-// GOOS-agnostic and cgo-free. The probes that answer them shipped with B103
+// GOOS-agnostic and cgo-free. The probes that answer them
 // (sandbox.ProbeHostRosetta / sandbox.ProbeGuestRosetta, advertised as the
-// RosettaHostAvailable / RosettaGuestAvailable RuntimeConditions), but the live pull
-// call site still passes false on purpose — consuming them waits on B105, the
+// RosettaHostAvailable / RosettaGuestAvailable RuntimeConditions) exist, but the live pull
+// call site still passes false on purpose — consuming them waits on the
 // Seatbelt x Rosetta spawn proof (an unsigned x86_64 Mach-O is not AMFI-killed the
 // way an unsigned arm64 one is, so selecting amd64 payloads would quietly weaken the
 // signature policy's kernel backstop). See pkg/runtime/pod.go's pullPolicy. Until

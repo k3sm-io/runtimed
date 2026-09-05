@@ -1,9 +1,9 @@
 #ifndef K3SM_VM_DARWIN_H
 #define K3SM_VM_DARWIN_H
 
-// Safe Virtualization.framework + entitlement probes for the vm sandbox backend
-// (M5.1, plus k3sm_vz_rosetta_availability from B103 and k3sm_vz_static_code_entitled
-// from B227). This header is the INVENTORY of that surface: it declares FOUR entry
+// Safe Virtualization.framework + entitlement probes for the vm sandbox backend,
+// plus k3sm_vz_rosetta_availability and k3sm_vz_static_code_entitled. This
+// header is the INVENTORY of that surface: it declares FOUR entry
 // points and NONE constructs or boots a VM — instantiating a VZVirtualMachine on a
 // non-entitled host raises an uncaught Obj-C exception (NSInternalInconsistency) ->
 // SIGABRT, which would take down the daemon. All four are wrapped in @try/@catch +

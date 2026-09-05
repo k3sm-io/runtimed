@@ -75,7 +75,7 @@ func Ladder(isRoot bool) []runtimev1.SandboxBackend {
 //     rung and never to unconfined; if nothing confines, ErrNoIsolation.
 //   - VM — stamped for a Linux-image / untrusted-tenancy pod: require the vm
 //     backend. If it is unavailable, ErrBackendUnavailable — never fall back to
-//     Seatbelt (the cardinal M5.1 safety fix: a Linux ELF cannot exec under
+//     Seatbelt (the cardinal safety fix: a Linux ELF cannot exec under
 //     Seatbelt, and an untrusted pod must not silently land on the weaker rung).
 //   - SEATBELT_INPROC / SEATBELT_EXEC — an explicit pin: require Seatbelt, else
 //     ErrBackendUnavailable. An explicit pin is honored exactly or refused; only

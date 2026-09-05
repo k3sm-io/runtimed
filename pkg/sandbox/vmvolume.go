@@ -16,8 +16,8 @@ limitations under the License.
 
 package sandbox
 
-// VMVolumePlan is the virtiofs share-device plan for a pod's Linux guest
-// (B106): which host directories become VZ shared-directory devices (Shares),
+// VMVolumePlan is the virtiofs share-device plan for a pod's Linux guest:
+// which host directories become VZ shared-directory devices (Shares),
 // how each container's declared volumeMounts bind into those shares (Binds),
 // and which mounts are guest-RAM tmpfs instead of a share (Tmpfs).
 //
@@ -74,7 +74,7 @@ type VMShare struct {
 // VMBind is one container volumeMount realized from a virtiofs share: guest
 // path MountPath is bound to SourceRel under the share tagged ShareTag. Binds
 // are grouped per container name (VMVolumePlan.Binds) and are COMPOSED later
-// by the guest init process (B102, the other consumer this build does not
+// by the guest init process (the other consumer this build does not
 // enforce for): guest-init mounts each share by tag and bind-mounts
 // <share>/<SourceRel> (optionally narrowed by SubPath) at MountPath inside the
 // container's mount namespace. Nothing in this build performs those mounts.
@@ -125,10 +125,10 @@ type VMTmpfs struct {
 	// SizeLimit is the emptyDir size_limit carried verbatim as the proto's
 	// resource.Quantity string (e.g. "64Mi"); empty means unset. The planner
 	// does NO quantity parsing — translating it to tmpfs size= bytes is
-	// guest-init's job (B102).
+	// guest-init's job.
 	SizeLimit string
 	// ReadOnly is the volumeMount's read_only intent for this container's
 	// mount of the tmpfs; like VMBind.ReadOnly it is composed by guest-init
-	// (B102) — nothing in this build enforces it.
+	// — nothing in this build enforces it.
 	ReadOnly bool
 }

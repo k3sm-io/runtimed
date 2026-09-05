@@ -22,9 +22,9 @@ limitations under the License.
 // k3sm.io/runtimed/pkg/supervisor (posix_spawn + kqueue reaping) — behind the
 // pod-granular gRPC contract.
 //
-// In M1 the Runtime is consumed in-process (k3sm imports it as a library); it is
-// built against the M1 proto so the M2 daemon split is a relocation, not a
-// redesign. It satisfies runtimev1.RuntimeServer:
+// The Runtime is consumed in-process (k3sm imports it as a library); it is
+// built against the same proto the gRPC daemon split later served, so that
+// split was a relocation, not a redesign. It satisfies runtimev1.RuntimeServer:
 //
 //	var _ runtimev1.RuntimeServer = (*Runtime)(nil)
 //

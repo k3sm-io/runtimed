@@ -22,7 +22,7 @@ limitations under the License.
 // and then execve's the pod binary, preserving the environment.
 //
 // This is the only place the libsandbox cgo lives (execshim_darwin.go); it is
-// linked into the cmd/k3sm-execshim helper. The helper is the M1 sandbox.Backend
+// linked into the cmd/k3sm-execshim helper. The helper is the sandbox.Backend
 // implementation: a tiny ad-hoc-signed binary the supervisor posix_spawns. Keeping
 // the apply+exec in a leaf package (not in main) makes the SPI surface a single,
 // canary-able symbol set and keeps cmd/k3sm-execshim's main thin.

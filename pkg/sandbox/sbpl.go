@@ -86,7 +86,7 @@ const (
 )
 
 // DefaultResolverVIP is the cluster DNS Service VIP assumed when a Posture
-// leaves ResolverVIP empty. It is PLUMBING-only: since M10.1 the VIP renders NO
+// leaves ResolverVIP empty. It is PLUMBING-only: the VIP renders NO
 // SBPL rule (the macOS 26 Seatbelt grammar cannot express per-IP network
 // filters — see the AllowNetwork stanza in Generate), but the field and its
 // default are kept as the node-level DNS configuration the env/status plumbing
@@ -177,7 +177,7 @@ var ErrWorkDirEscapesHome = errors.New("sbpl: work-dir escapes home")
 // Generate. The zero value is usable: an empty WorkDir falls back to
 // DefaultWorkDir and an empty ResolverVIP to DefaultResolverVIP.
 //
-// The VIP fields are PLUMBING-only since M10.1: they render NO SBPL rule
+// The VIP fields are PLUMBING-only: they render NO SBPL rule
 // (per-IP network filters do not compile on macOS 26 — see the AllowNetwork
 // stanza in Generate) and are carried for the DNS env/status plumbing.
 type Posture struct {
@@ -195,13 +195,13 @@ type Posture struct {
 	Home string
 	// ResolverVIP is the cluster DNS Service VIP for this node. Empty defaults to
 	// DefaultResolverVIP. PLUMBING-only: it renders NO SBPL rule (the macOS 26
-	// Seatbelt grammar rejects per-IP network filters — the pre-M10.1 VIP-scoped
+	// Seatbelt grammar rejects per-IP network filters — an earlier VIP-scoped
 	// egress allow failed sandbox_apply); it exists for the DNS env/status
 	// plumbing that tells a pod where the resolver lives.
 	ResolverVIP string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the `kubernetes`
 	// ClusterIP, e.g. 10.43.0.1). No default: empty means "not configured".
-	// PLUMBING-only: like ResolverVIP it renders NO SBPL rule since M10.1 — an
+	// PLUMBING-only: like ResolverVIP it renders NO SBPL rule — an
 	// allow_network pod has unfiltered egress (see Generate) — and is carried for
 	// the env/status plumbing. The caller (k3sm) sets it from the service CIDR.
 	APIServerVIP string
@@ -218,8 +218,8 @@ type GenerateOptions struct {
 	// API-server egress derive from. The zero value uses the legacy defaults
 	// (DefaultWorkDir, DefaultResolverVIP) and emits no API-server egress rule.
 	Posture Posture
-	// PodIP is the pod IP the network setup assigned. Plumbing-only since M10.1:
-	// it renders NO SBPL rule. The pre-M10.1 (allow network-bind (local ip
+	// PodIP is the pod IP the network setup assigned. Plumbing-only:
+	// it renders NO SBPL rule. An earlier (allow network-bind (local ip
 	// "<PodIP>:*")) scoping does not compile on macOS 26 (Seatbelt network
 	// filters accept only localhost/* hosts) and failed sandbox_apply for every
 	// networked pod; bind-scoping a pod to its own lo0 /32 is not expressible.
@@ -233,14 +233,14 @@ type GenerateOptions struct {
 	// (secrets + the projected ServiceAccount token) a pod must not overwrite.
 	ReadOnlyPaths []string
 	// WritePaths get a read+write allow: the read-write persistent-volume mount
-	// roots (M3.1). A PVC-backed dir lives outside the pod data volume on the APFS
+	// roots. A PVC-backed dir lives outside the pod data volume on the APFS
 	// storage root (so it survives pod teardown — ReclaimPolicy Retain), so unlike
 	// the pod's own data volume it needs an explicit allow. Validated against the
 	// protected deny-set exactly like the extra paths; a read-only PVC uses
 	// ReadPaths instead.
 	WritePaths []string
 	// ReadPaths get a read-only allow (no write): the read_only persistent-volume
-	// mount roots (M3.1). Default-deny then blocks writes to them.
+	// mount roots. Default-deny then blocks writes to them.
 	ReadPaths []string
 }
 
@@ -484,7 +484,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 // falls back to DefaultWorkDir; a non-empty WorkDir must be absolute and clean
 // (ErrInvalidWorkDir) and — when p.Home is set — must reside under Home
 // (ErrWorkDirEscapesHome). The Posture VIP fields are not consumed here: since
-// M10.1 they render no SBPL (see the AllowNetwork stanza in Generate) and exist
+// they render no SBPL (see the AllowNetwork stanza in Generate) and exist
 // only for the DNS env/status plumbing.
 func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, protectedPrefixes []string, err error) {
 	workDir := p.WorkDir

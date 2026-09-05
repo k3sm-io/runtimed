@@ -53,8 +53,8 @@ const operatorSchema = 1
 // (reference x platform) index entry names, pinned because an OPERATOR asked
 // for that image by name.
 //
-// It is the M12 provenance model's operator root (the images plan, Resolution
-// 13): edges are monotone, roots are digest-pinned, and root removal is
+// It is the provenance model's operator root: edges are monotone, roots are
+// digest-pinned, and root removal is
 // AUTHORIZED and LOCAL. A pull driven by `k3sm image pull` and a tag driven by
 // `k3sm image tag` each record one; UntagImage is the only thing that removes
 // one, because it is the only verb in which an operator names exactly the entry

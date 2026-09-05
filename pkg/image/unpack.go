@@ -65,7 +65,7 @@ const UnpackedSubdir = "unpacked"
 // The payload is one level down rather than being the tree directory itself so
 // that the record can never collide with an image path: an image containing a
 // file literally called "tree.json" writes it inside rootfs/, where it is just a
-// file. It is also the shape M11.2-d1's ChainID-keyed snapshot store uses
+// file. It is also the shape the Linux rootfs builder's ChainID-keyed snapshot store uses
 // (snapshots/<algo>/<chainid>/rootfs + meta.json), so the two do not have to
 // disagree about where a tree's payload lives.
 const (
@@ -159,7 +159,7 @@ var ErrTreeInconsistent = errors.New("image: unpacked tree is inconsistent with 
 // tree rather than silently reusing one built under different rules.
 //
 // It is a struct rather than a bare LayerSemantics because it is a key input:
-// every future knob that changes the output (M11.2-d1's xattr allowlist, an
+// every future knob that changes the output (the Linux rootfs builder's xattr allowlist, an
 // ownership-sidecar toggle) must join the key, and a struct makes adding one a
 // compile-visible change to canonical() rather than an invisible one.
 type UnpackPolicy struct {
