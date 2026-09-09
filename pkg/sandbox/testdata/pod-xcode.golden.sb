@@ -63,6 +63,15 @@
   (literal "/Applications/Xcode.app")
   (literal "/Applications/Xcode.app/Contents")
   )
+;; carve: the helper .xpc/.app bundles inside the trees granted above
+;; are not part of the interdependent dylib set, and some carry private
+;; entitlements. Denied LAST so last-match-wins subtracts them. This is a
+;; READ carve only — process-exec* is allowed profile-wide and is a
+;; separate operation, so this is not an exec boundary.
+(deny file-read*
+  (regex #"^/Applications/Xcode\.app/Contents/Frameworks/.*\.xpc/")
+  (regex #"^/Applications/Xcode\.app/Contents/Developer/Platforms/MacOSX\.platform/Developer/.*\.(app|xpc)/")
+  )
 ;; PROTECTED: deny user homes, the secrets/state store, the shared
 ;; pods root, the daemon-private podreap store AND the control-plane
 ;; and daemon trees (server, agent, run, blobs — sibling dirs under

@@ -42,8 +42,11 @@ package sandbox
 //     developer tree: the SDK (headers, .tbd stubs, module maps) plus the
 //     platform's own usr/lib and Library/Frameworks, which xcodebuild resolves
 //     when it initialises the macOS platform. Scoped to MacOSX.platform, so the
-//     iOS, watchOS, tvOS, visionOS and DriverKit platform trees stay denied —
-//     roughly a third of Platforms by size, and the part a macOS build never reads.
+//     SIBLING platform bundles — iPhoneOS, iPhoneSimulator, WatchOS, AppleTVOS,
+//     XROS, DriverKit and the rest — stay denied, roughly two thirds of Platforms
+//     by size. Say "sibling" and not "iOS" precisely: MacOSX.platform contains its
+//     own iOSSupport/ tree (the Mac Catalyst shape), and that IS inside the grant.
+//     What is excluded is the other .platform bundles, not everything iOS-shaped.
 //   - subpath D/Library/Frameworks/XcodeKit.framework — libxcodebuildLoader links
 //     @rpath/XcodeKit.framework. Named individually rather than granting
 //     D/Library/Frameworks, which holds far more than xcodebuild needs.
@@ -105,8 +108,27 @@ package sandbox
 // line is therefore Mach services and host-user state, NOT "the IDE's frameworks" —
 // those are granted above and xcodebuild loads them.
 //
-//   - Anything writable. This stanza emits file-read* and file-read-metadata and
-//     nothing else; the pod's own data volume remains the only writable tree. The
+// That ceiling rests on TWO invariants, and the second is easy to lose track of
+// because it lives in another file. The first is that /Users stays a protected
+// deny. The second is that no profile carrying this grant ever gains a
+// mach-lookup that resolves to a system service: today the only mach-lookup the
+// generator emits anywhere is network.go's pair of exact (global-name …) rules
+// for mDNSResponder, so even a pod that asks for both AllowNetwork and this
+// field cannot reach tccd, launchservicesd or coreservicesd. The same invariant
+// is what keeps the Apple-private entitlements on some of the granted content
+// inert (see writeXcodeHelperCarve). TestXcodeGrantNoMachLookupWhenCombined
+// pins it at the Generate level, where the composition actually happens, rather
+// than only over this stanza in isolation.
+//
+//   - Anything EXECUTABLE that was not already executable. This is worth stating
+//     because the natural inference is wrong: file-read* and process-exec* are
+//     distinct Seatbelt operations and the base profile allows process-exec*
+//     unconditionally, so a pod could already exec any binary on the box before
+//     this grant existed — measured, not assumed. Widening the READ scope adds
+//     no exec reach, and narrowing it (the carve below) removes none.
+//   - Anything writable. This stanza emits file-read*, file-read-metadata and one
+//     file-read* deny, and nothing else; the pod's own data volume remains the
+//     only writable tree. The
 //     xcrun and DeveloperTools caches under /var/folders stay denied; xcrun and
 //     xcodebuild print a "couldn't create cache file" error and proceed.
 //   - Any subpath on the bundle root, on B/Contents, or on D itself — each would
@@ -126,6 +148,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -304,7 +327,65 @@ func xcodeToolchainStanza(dir string) string {
 	b.WriteString("(allow file-read-metadata\n")
 	writeFirmlinkLiterals(&b, metadata)
 	b.WriteString("  )\n")
+	writeXcodeHelperCarve(&b, dir, bundle, hasBundle)
 	return b.String()
+}
+
+// writeXcodeHelperCarve denies the helper BUNDLES that sit inside the two granted
+// trees — the .xpc services under the bundle's Frameworks and the .app agents
+// under the macOS platform. It is emitted last inside the stanza, so under
+// last-match-wins it subtracts from the subpath allows just above it, and the
+// protected denies that follow still outrank the whole stanza.
+//
+// Why they are worth subtracting: they are not part of the interdependent dylib
+// set the whole-tree grant exists for (removing them changes no observed
+// behaviour — verified by re-running the acceptance pod script under the carved
+// profile), and some carry Apple-private entitlements. `Xcode Helper.app` holds
+// com.apple.private.tcc.allow-prompting = kTCCServiceAll on 26.6. A confined pod
+// could not use that entitlement in any case — exercising it needs a Mach
+// connection to tccd, and no rule in any profile this generator emits grants a
+// mach-lookup that resolves there — but a grant that does not hand out the
+// binary at all needs no such argument, and this one costs nothing.
+//
+// Be precise about what this carve does and does not do, because the obvious
+// reading is wrong: file-read* and process-exec* are DISTINCT Seatbelt
+// operations, and the base profile allows process-exec* unconditionally. So
+// denying the read does NOT make these unexecutable — a pod with no toolchain
+// grant at all can already exec them, which is measurable and was measured. The
+// carve narrows what a pod may READ (the Mach-O contents, the entitlement plist,
+// the Info.plist); it is not, and must not be described as, an exec boundary.
+//
+// A pattern rather than a name list: the members change between Xcode releases,
+// and a deny that silently stops matching is worse than one that occasionally
+// matches something new.
+func writeXcodeHelperCarve(b *strings.Builder, dir, bundle string, hasBundle bool) {
+	var pats []string
+	if hasBundle {
+		for _, form := range firmlinkForms(filepath.Join(bundle, "Contents", "Frameworks")) {
+			pats = append(pats, "^"+regexp.QuoteMeta(form)+"/.*\\.xpc/")
+		}
+	}
+	for _, form := range firmlinkForms(filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer")) {
+		pats = append(pats, "^"+regexp.QuoteMeta(form)+"/.*\\.(app|xpc)/")
+	}
+	if len(pats) == 0 {
+		return
+	}
+	b.WriteString(";; carve: the helper .xpc/.app bundles inside the trees granted above\n")
+	b.WriteString(";; are not part of the interdependent dylib set, and some carry private\n")
+	b.WriteString(";; entitlements. Denied LAST so last-match-wins subtracts them. This is a\n")
+	b.WriteString(";; READ carve only — process-exec* is allowed profile-wide and is a\n")
+	b.WriteString(";; separate operation, so this is not an exec boundary.\n")
+	b.WriteString("(deny file-read*\n")
+	for _, pat := range pats {
+		// NOT %q: the pattern already carries its own regex escapes, and Go's
+		// quoting would double every backslash. SBPL accepts the result either
+		// way — it just silently stops matching, which is the worst possible
+		// failure for a deny. TestXcodeHelperCarveActuallyDenies runs the
+		// rendered profile to prove this one still bites.
+		b.WriteString("  (regex #\"" + pat + "\")\n")
+	}
+	b.WriteString("  )\n")
 }
 
 // writeFirmlinkLiterals is writeFirmlinkSubpaths' literal counterpart: it writes a

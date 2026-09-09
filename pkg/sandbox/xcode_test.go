@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -549,4 +550,202 @@ func TestXcodeToolchainGrantReachesTheToolchain(t *testing.T) {
 			t.Errorf("xcodebuild -list succeeded under the toolchain grant:\n%s\nthe documented ceiling did not hold — the profile is granting more than a toolchain read scope", out)
 		}
 	})
+}
+
+// TestXcodeGrantNoMachLookupWhenCombined pins the second of the two invariants
+// the documented ceiling rests on, at the level where it can actually break.
+//
+// The first invariant — /Users stays denied — is asserted per-member by
+// TestXcodeGrantDoesNotOutrankProtectedDenies. The second is that a profile
+// carrying the toolchain grant never also carries a mach-lookup that reaches a
+// system service: that is what stops a full xcodebuild build, and it is also what
+// keeps the Apple-private entitlements on some of the granted content inert.
+//
+// It is asserted over Generate rather than over the stanza because the stanza
+// cannot break it. The failure mode is COMPOSITIONAL: some other opt-in grows a
+// broader mach-lookup, and a pod that sets both fields silently acquires it. So
+// the case that matters is every combination of the widening opt-ins at once.
+func TestXcodeGrantNoMachLookupWhenCombined(t *testing.T) {
+	// The exact global-names the generator is allowed to reach today. A new one
+	// belongs in this list only alongside an argument about the ceiling above.
+	allowed := map[string]bool{
+		"com.apple.dnssd.service": true,
+		"com.apple.mDNSResponder": true,
+	}
+
+	for _, tc := range []struct {
+		name string
+		sp   *runtimev1.SandboxProfile
+	}{
+		{"toolchain-only", &runtimev1.SandboxProfile{
+			DataVolumePath: "/var/lib/k3sm/pods/pod-xc/rootfs", XcodeToolchainDir: xcodeDevDir}},
+		{"toolchain-and-network", &runtimev1.SandboxProfile{
+			DataVolumePath: "/var/lib/k3sm/pods/pod-xc/rootfs", XcodeToolchainDir: xcodeDevDir,
+			AllowNetwork: true}},
+		{"toolchain-network-gpu-egress", &runtimev1.SandboxProfile{
+			DataVolumePath: "/var/lib/k3sm/pods/pod-xc/rootfs", XcodeToolchainDir: xcodeDevDir,
+			AllowNetwork: true, AllowGpu: true, AllowInternetEgress: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile, err := Generate(tc.sp, GenerateOptions{})
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			rules := ruleLines(profile)
+			if !strings.Contains(rules, "mach-lookup") {
+				return // nothing to check
+			}
+			// Every mach-lookup that IS emitted must be global-name-scoped to a
+			// name on the list. An unscoped `(allow mach-lookup)` has no
+			// global-name at all and therefore cannot satisfy this.
+			for _, line := range strings.Split(rules, "\n") {
+				if !strings.Contains(line, "mach-lookup") && !strings.Contains(line, "global-name") {
+					continue
+				}
+				if strings.Contains(line, "(allow mach-lookup)") {
+					t.Fatalf("profile grants UNSCOPED mach-lookup alongside the toolchain grant: %q", strings.TrimSpace(line))
+				}
+				for _, m := range regexp.MustCompile(`\(global-name "([^"]+)"\)`).FindAllStringSubmatch(line, -1) {
+					if !allowed[m[1]] {
+						t.Errorf("profile grants mach-lookup to %q alongside the toolchain grant; the documented ceiling depends on no such service being reachable", m[1])
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestXcodeHelperCarveSubtractsFromTheGrantedTrees pins the read carve: the
+// helper bundles inside the two granted trees are denied, the deny lands AFTER
+// the allows it subtracts from (last-match-wins, so order is the whole
+// mechanism), and it is a READ carve — it must never be written or described as
+// an exec boundary, because process-exec* is allowed profile-wide.
+func TestXcodeHelperCarveSubtractsFromTheGrantedTrees(t *testing.T) {
+	stanza := xcodeToolchainStanza(xcodeDevDir)
+	rules := ruleLines(stanza)
+
+	denyAt := strings.Index(rules, "(deny file-read*")
+	if denyAt < 0 {
+		t.Fatalf("the toolchain stanza emits no helper carve:\n%s", stanza)
+	}
+	// It must come after BOTH subpath allows it subtracts from.
+	for _, granted := range []string{
+		`(subpath "/Applications/Xcode.app/Contents/Frameworks")`,
+		`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
+	} {
+		at := strings.Index(rules, granted)
+		if at < 0 {
+			t.Fatalf("the grant %s the carve subtracts from is missing", granted)
+		}
+		if at > denyAt {
+			t.Errorf("the carve is emitted at %d, BEFORE the allow at %d — last-match-wins would let the allow win", denyAt, at)
+		}
+	}
+	// Both patterns present, and the carve names only file-read.
+	// Single-escaped, as SBPL reads it. The doubled form is the %q bug
+	// TestXcodeHelperCarveActuallyDenies exists for: it renders, it compiles,
+	// and it matches nothing.
+	for _, want := range []string{`\.xpc/`, `\.(app|xpc)/`} {
+		if !strings.Contains(rules, want) {
+			t.Errorf("the carve is missing the pattern %s:\n%s", want, stanza)
+		}
+	}
+	carve := rules[denyAt:]
+	if strings.Contains(carve, "process-exec") || strings.Contains(carve, "file-write") {
+		t.Errorf("the carve names an operation other than file-read; it is a READ carve only:\n%s", carve)
+	}
+}
+
+// TestXcodeHelperCarveActuallyDenies runs the rendered profile, because a deny is
+// the one rule class a shape test cannot check.
+//
+// This exists for a specific bug it would have caught: the carve was first
+// emitted through Go's %q, which doubled every backslash in the pattern. SBPL
+// accepted the result without complaint and it matched nothing — a deny that
+// silently grants. Every structural assertion in this file passed. Only running
+// it found the problem, so the regression guard has to run it too.
+func TestXcodeHelperCarveActuallyDenies(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not present")
+	}
+	devDir, err := exec.Command("/usr/bin/xcode-select", "-p").Output()
+	if err != nil {
+		t.Skip("xcode-select -p failed; no developer dir to grant")
+	}
+	dir := strings.TrimSpace(string(devDir))
+	if filepath.Base(dir) != xcodeDeveloperDirBase {
+		t.Skipf("xcode-select -p is %q, not a DEVELOPER_DIR this grant covers", dir)
+	}
+	bundle, ok := xcodeBundleRoot(dir)
+	if !ok {
+		t.Skipf("%q has no enclosing bundle, so no carve is rendered", dir)
+	}
+
+	// A carved path and an un-carved sibling in the SAME granted tree. Both must
+	// be found on this host, or the test proves nothing and says so.
+	carved := findOne(t, filepath.Join(bundle, "Contents", "Frameworks"), ".xpc")
+	kept := filepath.Join(bundle, "Contents", "Frameworks", "libxcodebuildLoader.dylib")
+	if _, err := os.Stat(kept); err != nil {
+		t.Skipf("%s absent on this host", kept)
+	}
+
+	work := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(work); err == nil {
+		work = resolved
+	}
+	if strings.HasPrefix(work, "/Users/") {
+		t.Skipf("TMPDIR resolves under /Users (%s), which the pod profile denies", work)
+	}
+	dataVol := filepath.Join(work, "pods", "p1", "rootfs")
+	if err := os.MkdirAll(dataVol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath: dataVol, XcodeToolchainDir: dir,
+	}, GenerateOptions{Posture: Posture{WorkDir: work}})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	profPath := filepath.Join(work, "carve.sb")
+	if err := os.WriteFile(profPath, []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readable := func(path string) bool {
+		cmd := exec.Command("/usr/bin/sandbox-exec", "-f", profPath, "/bin/cat", path)
+		cmd.Dir = dataVol
+		cmd.Stdout, cmd.Stderr = nil, nil
+		return cmd.Run() == nil
+	}
+
+	if readable(carved) {
+		t.Errorf("the carve did not bite: %s is still readable under the rendered profile", carved)
+	}
+	// The other half: the carve must not have swallowed the tree it subtracts
+	// from. A deny that denies everything would pass the assertion above.
+	if !readable(kept) {
+		t.Errorf("the carve over-reached: %s is no longer readable, but it is the dylib the whole-tree grant exists for", kept)
+	}
+}
+
+// findOne returns the first entry under root whose name ends in suffix, failing
+// the test when there is none — the carve cases are only meaningful if the host
+// actually has something for them to match.
+func findOne(t *testing.T, root, suffix string) string {
+	t.Helper()
+	var found string
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || found != "" {
+			return nil //nolint:nilerr // an unreadable subtree is not this test's concern
+		}
+		if info.IsDir() && strings.HasSuffix(p, suffix) {
+			// a file INSIDE the bundle: the carve pattern ends in "/", so it
+			// matches the contents, which is what a reader would actually open.
+			found = filepath.Join(p, "Contents", "Info.plist")
+		}
+		return nil
+	})
+	if found == "" {
+		t.Skipf("no %s bundle under %s on this host", suffix, root)
+	}
+	return found
 }
