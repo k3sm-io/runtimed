@@ -1,0 +1,94 @@
+;; k3sm per-pod Seatbelt profile — GENERATED, do not edit.
+;; Default-deny; runs a native pod process at host paths (no chroot).
+;; Rule order is last-match-wins: OS/extra allows, THEN protected
+;; denies (so extra paths can't override them), THEN narrow re-allows.
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-exec*)
+(allow process-fork)
+;; read: OS + frameworks + validated extra read paths.
+(allow file-read*
+  (subpath "/Library")
+  (subpath "/System")
+  (subpath "/bin")
+  (subpath "/usr")
+  (literal "/dev/null") (literal "/dev/zero")
+  (literal "/dev/random") (literal "/dev/urandom"))
+;; write: validated extra write paths (+ /dev/null); the pod's own
+;; data volume is re-allowed below, after the protected denies.
+(allow file-write*
+  (literal "/dev/null"))
+;; network: default-deny (no allow-network).
+;; gpu: Metal device access (allow_gpu) — the two exact IOKit
+;; user-client classes a Metal device open requires. Family-independent
+;; and lab-derived by ablation; no mach-lookup, no iokit-get-properties,
+;; no CVMS read, and NO shader-cache write are needed or granted.
+(allow iokit-open
+  (iokit-registry-entry-class "AGXDeviceUserClient")
+  (iokit-registry-entry-class "IOSurfaceRootUserClient"))
+;; xcode: developer-toolchain READ access (xcode_toolchain_dir) rooted
+;; at the node's DEVELOPER_DIR. Lab-derived by ablation — every path
+;; below was a real denial; nothing here is writable, and neither the
+;; application bundle nor its Contents is ever granted as a subpath.
+;; The toolchain (compilers, linker, SDK) is covered; xcodebuild, which
+;; also needs the IDE frameworks and the per-user caches, is not.
+(allow file-read*
+  (subpath "/Applications/Xcode.app/Contents/Developer/usr/bin")
+  (subpath "/Applications/Xcode.app/Contents/Developer/usr/lib")
+  (subpath "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain")
+  (subpath "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs")
+  (subpath "/Applications/Xcode.app/Contents/SharedFrameworks")
+  )
+;; the developer-dir chain is OPENED as directories by xcrun (metadata
+;; alone fails: "developer directory isn't accessible"), plus the two
+;; bundle plists the toolchain reads — files, named one by one.
+(allow file-read*
+  (literal "/Applications/Xcode.app/Contents/Developer")
+  (literal "/Applications/Xcode.app/Contents/Developer/Platforms")
+  (literal "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform")
+  (literal "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer")
+  (literal "/Applications/Xcode.app/Contents/Info.plist")
+  (literal "/Applications/Xcode.app/Contents/version.plist")
+  )
+;; existence only: the ancestors the tools stat-walk on the way down.
+(allow file-read-metadata
+  (literal "/Applications")
+  (literal "/Applications/Xcode.app")
+  (literal "/Applications/Xcode.app/Contents")
+  )
+;; PROTECTED: deny user homes, the secrets/state store, the shared
+;; pods root, the daemon-private podreap store AND the control-plane
+;; and daemon trees (server, agent, run, blobs — sibling dirs under
+;; the work-dir) — read+write, AFTER the allows so a caller's extra
+;; path (even an ancestor work-dir grant) can't win.
+(deny file-read* file-write*
+  (subpath "/Users"))
+(deny file-read* file-write*
+  (subpath "/private/var/db"))
+(deny file-read* file-write*
+  (subpath "/var/lib/k3sm/pods")
+  (subpath "/private/var/lib/k3sm/pods")
+  (subpath "/var/lib/k3sm/podreap")
+  (subpath "/private/var/lib/k3sm/podreap")
+  (subpath "/var/lib/k3sm/server")
+  (subpath "/private/var/lib/k3sm/server")
+  (subpath "/var/lib/k3sm/agent")
+  (subpath "/private/var/lib/k3sm/agent")
+  (subpath "/var/lib/k3sm/run")
+  (subpath "/private/var/lib/k3sm/run")
+  (subpath "/var/lib/k3sm/blobs")
+  (subpath "/private/var/lib/k3sm/blobs")
+  )
+;; dyld cryptex: deny WRITE only (read is needed at link time).
+(deny file-write*
+  (subpath "/System/Volumes/Preboot/Cryptexes")
+  (subpath "/System/Cryptexes"))
+;; re-allow the dyld closure cache read the /private/var/db deny clobbers.
+(allow file-read*
+  (subpath "/private/var/db/dyld"))
+;; re-allow THIS pod's own data volume (under the denied pods root).
+(allow file-read* file-write*
+  (subpath "/var/lib/k3sm/pods/pod-gpu123/rootfs")
+  (subpath "/private/var/lib/k3sm/pods/pod-gpu123/rootfs")
+  )
