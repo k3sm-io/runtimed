@@ -20,40 +20,58 @@ package sandbox
 //
 // # What this grants, and why each line is here
 //
-// The rule set below is ABLATION-DERIVED, not guessed: on 2026-09-09 a confined
-// `swiftc` compile-and-link was run on this host against a default-deny profile
-// and every path here is a rule that was added because its absence produced a
-// real Seatbelt denial. Nothing was added "to be safe" — a path that could be
-// removed without a denial was removed.
+// The rule set below is ABLATION-DERIVED, not guessed: every path here was added
+// because its absence produced a real, named failure under the shipped generator's
+// own output, and every path that could be removed without one was removed. The
+// derivation was re-run on 2026-09-09 against Xcode 26.6 (17F113) on macOS 26.6.2,
+// which both widened the grant and narrowed two of its existing rules.
 //
 // Rooted at D, the node's DEVELOPER_DIR (`xcode-select -p`, e.g.
 // /Applications/Xcode.app/Contents/Developer), with B the enclosing application
 // bundle (D/../.., recognised only when D ends in Contents/Developer):
 //
-//   - subpath D/usr/bin — the developer-dir tool shims: xcrun, xcodebuild's
-//     siblings, and the `swift`/`swiftc` front ends that re-exec into the
-//     toolchain.
+//   - subpath D/usr/bin — the developer-dir tool shims: xcrun, xcodebuild, and the
+//     `swift`/`swiftc` front ends that re-exec into the toolchain.
 //   - subpath D/usr/lib — the libraries those shims dlopen (libxcrun and the
 //     developer-dir support dylibs). A shim that cannot map them exits before it
 //     ever reaches the compiler.
 //   - subpath D/Toolchains/XcodeDefault.xctoolchain — the toolchain proper: the
 //     clang and swift drivers, the linker, and their resource dirs. This is the
 //     compiler; without it there is no grant worth making.
-//   - subpath D/Platforms/MacOSX.platform/Developer/SDKs — the macOS SDK: the
-//     headers, the .tbd stubs, and the module maps every compile and link reads.
+//   - subpath D/Platforms/MacOSX.platform/Developer — the macOS platform's
+//     developer tree: the SDK (headers, .tbd stubs, module maps) plus the
+//     platform's own usr/lib and Library/Frameworks, which xcodebuild resolves
+//     when it initialises the macOS platform. Scoped to MacOSX.platform, so the
+//     iOS, watchOS, tvOS, visionOS and DriverKit platform trees stay denied —
+//     roughly a third of Platforms by size, and the part a macOS build never reads.
+//   - subpath D/Library/Frameworks/XcodeKit.framework — libxcodebuildLoader links
+//     @rpath/XcodeKit.framework. Named individually rather than granting
+//     D/Library/Frameworks, which holds far more than xcodebuild needs.
 //   - subpath B/Contents/SharedFrameworks — the Swift driver links
 //     @rpath/llbuild.framework out of the bundle's shared frameworks, so a grant
-//     confined to D alone fails at dyld time with an image-not-found abort. This
-//     is the ONLY bundle-level subtree granted, and it is why the bundle root is
-//     computed rather than assumed.
+//     confined to D alone fails at dyld time with an image-not-found abort.
+//   - subpath B/Contents/Frameworks — xcodebuild dlopens
+//     @rpath/libxcodebuildLoader.dylib from here, and the loader in turn pulls
+//     IDEFoundation, Xcode3Core, DevToolsCore, DVTNFASupport, IDENoticesFoundation,
+//     DevToolsSupport and libclang out of the same directory. It is granted WHOLE
+//     rather than as those seven names because the frameworks register each other's
+//     plug-in extension points: a profile naming the seven loads them and then dies
+//     with "did not find extension point with identifier Xcode.XCSpecProvider".
+//     The set is an interdependent unit, and enumerating it would also be brittle
+//     across Xcode releases. It is the smaller of the two bundle framework trees —
+//     47M against SharedFrameworks' 522M on 26.6 — so this grant does not change
+//     the order of magnitude of what was already reachable.
 //
-//   - literal D, D/Platforms, D/Platforms/MacOSX.platform,
-//     D/Platforms/MacOSX.platform/Developer — the developer-dir chain is OPENED
-//     as directories, not merely stat'd: xcrun opendir()s each level while
-//     resolving a platform, and a metadata-only grant fails with "developer
-//     directory … isn't accessible". They are literals rather than a subpath so
-//     the grant stops at the directory itself and never reaches its other
-//     children (Contents/Developer/Library, the other .platform trees).
+//   - literal D, D/Toolchains, D/Platforms, D/Platforms/MacOSX.platform — these
+//     directories are OPENED, not merely stat'd: xcrun opendir()s the developer-dir
+//     chain while resolving a platform (a metadata-only grant fails with "developer
+//     directory … isn't accessible"), and swift-frontend stats D/Toolchains on its
+//     way into the toolchain — without it a compile fails with the opaque
+//     "unable to execute command: <unknown>". They are literals rather than
+//     subpaths so the grant stops at the directory entry itself and never reaches
+//     the other children (D/Library, the other .xctoolchain and .platform trees).
+//   - literal D/Platforms/MacOSX.platform/Info.plist — the platform manifest
+//     xcodebuild reads to identify the platform it just opened.
 //   - literal B/Contents/Info.plist, B/Contents/version.plist — the two bundle
 //     plists the toolchain reads to identify which Xcode it is running inside.
 //     Files, named individually; Contents itself is never a subpath.
@@ -63,21 +81,39 @@ package sandbox
 //     /Applications/Xcode.app/Contents) — EXISTENCE ONLY. The tools stat-walk
 //     down to the developer dir, and a denied stat on an intermediate directory
 //     aborts the walk. file-read-metadata cannot open, list, or read any of them.
+//     Metadata is enough: an earlier reading that /Applications needed file-read*
+//     did not reproduce, and granting it would hand every pod the list of
+//     applications installed on the node.
 //
-// # What is deliberately NOT granted
+// # What this grant reaches, and where it stops
 //
-//   - B/Contents/Frameworks, B/Contents/SystemFrameworks, B/Contents/PlugIns,
-//     B/Contents/Developer/Library — the IDE's own frameworks and plug-ins.
-//     xcodebuild needs them; the compiler and linker do not, and granting them
-//     would be granting most of the application bundle.
-//   - The per-user temp/cache dirs (DARWIN_USER_TEMP_DIR / DARWIN_USER_CACHE_DIR,
-//     the module cache, DerivedData) and any user-preference read. xcodebuild
-//     needs those too. They are out of scope by the same line the API field
-//     draws: the toolchain is covered, the build tool that drives the IDE is not.
-//   - Any subpath on the bundle root, on B/Contents, or on D itself — each would
-//     collapse the four narrow grants above into "read the whole of Xcode".
+// Covered: the compilers, the linker, the SDK, xcrun, and the xcodebuild
+// subcommands that only interrogate the installation — `-version`, `-showsdks`,
+// `-find-executable`. Verified by ablation on 26.6: a confined swiftc compiles and
+// links a program that then runs, `swift build --disable-sandbox` does the same for
+// a package, and `xcodebuild -showsdks` lists the macOS SDK.
+//
+// NOT covered, and NOT a path-list problem: driving a full `xcodebuild build`.
+// Anything that must evaluate a project or package (`-list`, `-showBuildSettings`,
+// `build`) exits 66 under this profile, and the kernel log says why — such a build
+// needs job-creation (it spawns XCBBuildService through launchd), mach-lookup to
+// coreservicesd, lsd, FSEvents and DiskArbitration, write access to the invoking
+// user's shared /var/folders DeveloperTools cache, and reads of that user's
+// LaunchServices preferences under /Users. /Users is a PROTECTED deny and the Mach
+// services are not file paths at all, so no widening of a read grant reaches this:
+// it is a different isolation posture, which is what the vm backend is for. The
+// line is therefore Mach services and host-user state, NOT "the IDE's frameworks" —
+// those are granted above and xcodebuild loads them.
+//
 //   - Anything writable. This stanza emits file-read* and file-read-metadata and
-//     nothing else; the pod's own data volume remains the only writable tree.
+//     nothing else; the pod's own data volume remains the only writable tree. The
+//     xcrun and DeveloperTools caches under /var/folders stay denied; xcrun and
+//     xcodebuild print a "couldn't create cache file" error and proceed.
+//   - Any subpath on the bundle root, on B/Contents, or on D itself — each would
+//     collapse the narrow grants above into "read the whole of Xcode".
+//   - B/Contents/PlugIns, B/Contents/SystemFrameworks, B/Contents/Resources and
+//     D/Library beyond XcodeKit.framework — reached only by the project-evaluating
+//     path above, which cannot work regardless.
 //
 // # Placement
 //
@@ -198,21 +234,27 @@ func xcodeToolchainStanza(dir string) string {
 		filepath.Join(dir, "usr", "bin"),
 		filepath.Join(dir, "usr", "lib"),
 		filepath.Join(dir, "Toolchains", "XcodeDefault.xctoolchain"),
-		filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer", "SDKs"),
+		filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer"),
+		filepath.Join(dir, "Library", "Frameworks", "XcodeKit.framework"),
 	}
-	// The Swift driver links @rpath/llbuild.framework out of the bundle's shared
-	// frameworks; it is the only bundle-level subtree granted.
+	// The two bundle-level subtrees: the Swift driver links @rpath/llbuild.framework
+	// out of SharedFrameworks, and xcodebuild dlopens libxcodebuildLoader.dylib out
+	// of Frameworks. Neither the bundle root nor Contents is ever a subpath.
 	if hasBundle {
-		subpaths = append(subpaths, filepath.Join(bundle, "Contents", "SharedFrameworks"))
+		subpaths = append(subpaths,
+			filepath.Join(bundle, "Contents", "SharedFrameworks"),
+			filepath.Join(bundle, "Contents", "Frameworks"),
+		)
 	}
 
 	// The developer-dir chain is opened as directories, so each level needs a
 	// literal read — metadata alone fails ("developer directory isn't accessible").
 	literals := []string{
 		dir,
+		filepath.Join(dir, "Toolchains"),
 		filepath.Join(dir, "Platforms"),
 		filepath.Join(dir, "Platforms", "MacOSX.platform"),
-		filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer"),
+		filepath.Join(dir, "Platforms", "MacOSX.platform", "Info.plist"),
 	}
 	if hasBundle {
 		literals = append(literals,
@@ -244,13 +286,16 @@ func xcodeToolchainStanza(dir string) string {
 	b.WriteString(";; at the node's DEVELOPER_DIR. Lab-derived by ablation — every path\n")
 	b.WriteString(";; below was a real denial; nothing here is writable, and neither the\n")
 	b.WriteString(";; application bundle nor its Contents is ever granted as a subpath.\n")
-	b.WriteString(";; The toolchain (compilers, linker, SDK) is covered; xcodebuild, which\n")
-	b.WriteString(";; also needs the IDE frameworks and the per-user caches, is not.\n")
+	b.WriteString(";; Covers the compilers, linker, SDK, xcrun, and the xcodebuild\n")
+	b.WriteString(";; subcommands that only interrogate the install. A full xcodebuild\n")
+	b.WriteString(";; build is out of reach of ANY read grant: it needs job-creation,\n")
+	b.WriteString(";; mach-lookup and host-user state under /Users, which stays denied.\n")
 	b.WriteString("(allow file-read*\n")
 	writeFirmlinkSubpaths(&b, subpaths)
 	b.WriteString("  )\n")
 	b.WriteString(";; the developer-dir chain is OPENED as directories by xcrun (metadata\n")
-	b.WriteString(";; alone fails: \"developer directory isn't accessible\"), plus the two\n")
+	b.WriteString(";; alone fails: \"developer directory isn't accessible\") and Toolchains\n")
+	b.WriteString(";; is stat'd by swift-frontend, plus the platform manifest and the two\n")
 	b.WriteString(";; bundle plists the toolchain reads — files, named one by one.\n")
 	b.WriteString("(allow file-read*\n")
 	writeFirmlinkLiterals(&b, literals)

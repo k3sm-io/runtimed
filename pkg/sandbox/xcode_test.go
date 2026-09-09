@@ -92,12 +92,15 @@ func TestXcodeToolchainStanzaShape(t *testing.T) {
 			`(subpath "` + xcodeDevDir + `/usr/bin")`,
 			`(subpath "` + xcodeDevDir + `/usr/lib")`,
 			`(subpath "` + xcodeDevDir + `/Toolchains/XcodeDefault.xctoolchain")`,
-			`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer/SDKs")`,
+			`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
+			`(subpath "` + xcodeDevDir + `/Library/Frameworks/XcodeKit.framework")`,
 			`(subpath "` + bundle + `/Contents/SharedFrameworks")`,
+			`(subpath "` + bundle + `/Contents/Frameworks")`,
 			`(literal "` + xcodeDevDir + `")`,
+			`(literal "` + xcodeDevDir + `/Toolchains")`,
 			`(literal "` + xcodeDevDir + `/Platforms")`,
 			`(literal "` + xcodeDevDir + `/Platforms/MacOSX.platform")`,
-			`(literal "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
+			`(literal "` + xcodeDevDir + `/Platforms/MacOSX.platform/Info.plist")`,
 			`(literal "` + bundle + `/Contents/Info.plist")`,
 			`(literal "` + bundle + `/Contents/version.plist")`,
 		} {
@@ -145,13 +148,23 @@ func TestXcodeToolchainStanzaShape(t *testing.T) {
 			`(subpath "` + bundle + `")`,
 			`(subpath "` + bundle + `/Contents")`,
 			`(subpath "` + xcodeDevDir + `")`,
-			bundle + `/Contents/Frameworks`,
-			bundle + `/Contents/SystemFrameworks`,
-			bundle + `/Contents/PlugIns`,
-			xcodeDevDir + `/Library`,
+			// The two bundle framework trees are granted; the IDE trees beside
+			// them are not, and neither is D/Library above XcodeKit.framework.
+			`(subpath "` + bundle + `/Contents/SystemFrameworks")`,
+			`(subpath "` + bundle + `/Contents/PlugIns")`,
+			`(subpath "` + bundle + `/Contents/Resources")`,
+			`(subpath "` + xcodeDevDir + `/Library")`,
+			`(subpath "` + xcodeDevDir + `/Library/Frameworks")`,
+			// Sibling platforms: only MacOSX.platform is in scope.
+			xcodeDevDir + `/Platforms/iPhoneOS.platform`,
+			xcodeDevDir + `/Platforms/DriverKit.platform`,
+			// The per-user caches a full xcodebuild build wants. They are not a
+			// path-list gap — see xcode.go on why that build is out of reach.
 			"DARWIN_USER_CACHE_DIR",
 			"DARWIN_USER_TEMP_DIR",
 			"user-preference-read",
+			"job-creation",
+			"mach-lookup",
 		} {
 			if strings.Contains(rules, banned) {
 				t.Errorf("toolchain profile contains out-of-scope grant %q (the ablation excluded it)", banned)
@@ -270,9 +283,10 @@ func TestXcodeToolchainDirValidation(t *testing.T) {
 }
 
 // TestXcodeStanzaWithoutBundle pins the no-bundle case: a DEVELOPER_DIR that is
-// not inside a Contents/Developer bundle renders the four developer-dir grants
-// and NO bundle-level rule — no SharedFrameworks subpath, no plists — rather than
-// guessing a bundle root two levels up.
+// not inside a Contents/Developer bundle renders the developer-dir grants and NO
+// bundle-level rule — neither framework subpath, no plists — rather than guessing
+// a bundle root two levels up. Such a toolchain cannot run xcodebuild (the loader
+// dylib lives in the bundle), which is the honest consequence of not having one.
 func TestXcodeStanzaWithoutBundle(t *testing.T) {
 	const dir = "/opt/toolchains/Developer"
 	stanza := xcodeToolchainStanza(dir)
@@ -286,7 +300,15 @@ func TestXcodeStanzaWithoutBundle(t *testing.T) {
 			t.Errorf("no-bundle stanza is missing %s:\n%s", want, stanza)
 		}
 	}
-	for _, banned := range []string{"SharedFrameworks", "Info.plist", "version.plist"} {
+	// Banned by their BUNDLE-relative shape, not by bare file name: the stanza
+	// legitimately names the macOS platform's own Info.plist, which lives under
+	// the developer dir and has nothing to do with a bundle.
+	for _, banned := range []string{
+		"SharedFrameworks",
+		"Contents/Frameworks",
+		"Contents/Info.plist",
+		"version.plist",
+	} {
 		if strings.Contains(stanza, banned) {
 			t.Errorf("no-bundle stanza emitted a bundle-level rule %q:\n%s", banned, stanza)
 		}
@@ -309,4 +331,222 @@ func TestXcodeProfileAppliesOnDarwin(t *testing.T) {
 	if out, err := exec.Command("/usr/bin/sandbox-exec", "-f", f, "/usr/bin/true").CombinedOutput(); err != nil {
 		t.Fatalf("sandbox-exec rejected the toolchain profile: %v\n--- output ---\n%s\n--- profile ---\n%s", err, out, prof)
 	}
+}
+
+// TestXcodeGrantDoesNotOutrankProtectedDenies is the regression guard the widening
+// of 2026-09-09 earns. The grant grew — it now reaches both of the bundle's
+// framework trees and the macOS platform whole — so the property that matters is
+// no longer "the stanza is small" but "however large it gets, the protected denies
+// still win". SBPL is last-match-wins, so that is a statement about ORDER, and it
+// is asserted per deny-set member rather than once for the block: a future edit
+// that appends a toolchain rule after a single deny would still pass a check that
+// only looked at the first one.
+func TestXcodeGrantDoesNotOutrankProtectedDenies(t *testing.T) {
+	profile := xcodeProfile(t)
+
+	lastGrant := strings.LastIndex(profile, `"`+xcodeDevDir)
+	if lastGrant < 0 {
+		t.Fatalf("no toolchain rule in:\n%s", profile)
+	}
+	// Every protected deny must be emitted AFTER the last toolchain rule.
+	for _, deny := range []string{
+		`(subpath "/Users")`,
+		`(subpath "/private/var/db")`,
+		`(subpath "/var/lib/k3sm/pods")`,
+		`(subpath "/var/lib/k3sm/server")`,
+		`(subpath "/var/lib/k3sm/agent")`,
+	} {
+		at := strings.Index(profile, deny)
+		if at < 0 {
+			t.Errorf("protected deny %s is missing from a toolchain profile", deny)
+			continue
+		}
+		if at < lastGrant {
+			t.Errorf("protected deny %s is emitted at %d, BEFORE the last toolchain grant at %d — last-match-wins would let the grant override it", deny, at, lastGrant)
+		}
+	}
+}
+
+// TestXcodeGrantStaysReadOnlyAndFileScoped pins the two properties that make the
+// widened grant still a READ grant: it names no non-file operation, and the paths
+// a full `xcodebuild build` would additionally need are absent. That build is out
+// of reach by construction (job-creation, Mach services, and host-user state under
+// the /Users deny), so its absence here is the API contract, not an oversight —
+// see the "What this grant reaches, and where it stops" block in xcode.go.
+func TestXcodeGrantStaysReadOnlyAndFileScoped(t *testing.T) {
+	stanza := xcodeToolchainStanza(xcodeDevDir)
+	// Rules only: the stanza's own comment NAMES the operations a full xcodebuild
+	// build would need, in order to say they are not granted. Scanning the comment
+	// would make that explanation trip the check it exists to describe.
+	rules := ruleLines(stanza)
+
+	// Only file-read operations. A future edit that reached for a Mach service or
+	// a process right to "make xcodebuild work" fails here first.
+	for _, banned := range []string{
+		"job-creation",
+		"mach-lookup",
+		"mach-register",
+		"iokit-open",
+		"sysctl-read",
+		"ipc-posix-shm",
+		"process-exec",
+		"network",
+		"file-write",
+	} {
+		if strings.Contains(rules, banned) {
+			t.Errorf("the toolchain stanza names %q; it must emit file-read rules only:\n%s", banned, stanza)
+		}
+	}
+
+	// Exactly the read tiers, and nothing else.
+	for _, want := range []string{"(allow file-read*", "(allow file-read-metadata"} {
+		if !strings.Contains(rules, want) {
+			t.Errorf("the toolchain stanza is missing its %s tier:\n%s", want, stanza)
+		}
+	}
+	if n := strings.Count(rules, "(allow "); n != 3 {
+		t.Errorf("the toolchain stanza emits %d allow rules; want exactly 3 (two read tiers plus the metadata tier)", n)
+	}
+}
+
+// TestXcodeToolchainGrantReachesTheToolchain is the in-tree, generator-driven
+// re-derivation of the ablation: it renders a profile with Generate — the shipped
+// renderer, not a replica — and runs the real toolchain under it via sandbox-exec.
+//
+// It exists because every other test here asserts the SHAPE of the stanza, and a
+// shape can be exactly right and still not work: the 2026-09-09 derivation found
+// that the previously-shipped path set compiled nothing on Xcode 26.6, because
+// swift-frontend stats DEVELOPER_DIR/Toolchains and no golden could have said so.
+// A path list is a hypothesis about another program's behaviour, and only running
+// that program tests it.
+//
+// Skipped, never failed, when the host has no usable Xcode: the assertion is about
+// the profile, and a machine without the toolchain cannot answer it either way.
+func TestXcodeToolchainGrantReachesTheToolchain(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not present")
+	}
+	devDir, err := exec.Command("/usr/bin/xcode-select", "-p").Output()
+	if err != nil {
+		t.Skip("xcode-select -p failed; no developer dir to grant")
+	}
+	dir := strings.TrimSpace(string(devDir))
+	if filepath.Base(dir) != xcodeDeveloperDirBase {
+		t.Skipf("xcode-select -p is %q, not a DEVELOPER_DIR this grant covers", dir)
+	}
+	if err := exec.Command("/usr/bin/xcodebuild", "-version").Run(); err != nil {
+		t.Skipf("the host's own xcodebuild does not run (%v); nothing to confine", err)
+	}
+
+	// The pod's data volume must live under the configured pods root, and the
+	// profile denies /Users outright — so t.TempDir() (under /var/folders on a
+	// normal run) cannot serve. Build the posture around a temp work-dir instead.
+	work := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(work); err == nil {
+		work = resolved
+	}
+	if strings.HasPrefix(work, "/Users/") {
+		t.Skipf("TMPDIR resolves under /Users (%s), which the pod profile denies", work)
+	}
+	dataVol := filepath.Join(work, "pods", "p1", "rootfs")
+	// The toolchain writes temporaries; TMPDIR below points here, and a pod that
+	// cannot create them fails for a reason that is not the grant.
+	if err := os.MkdirAll(filepath.Join(dataVol, "tmp", "mc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	profile, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath:    dataVol,
+		XcodeToolchainDir: dir,
+	}, GenerateOptions{Posture: Posture{WorkDir: work}})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	profPath := filepath.Join(work, "xcode.sb")
+	if err := os.WriteFile(profPath, []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each case runs from INSIDE the data volume with DEVELOPER_DIR set, which is
+	// how a pod reaches the toolchain (the pod's cwd is its data volume, and the
+	// profile denies metadata on that volume's ancestors, so absolute paths and
+	// mkdir -p are the pod's problem, not the grant's).
+	confined := func(t *testing.T, argv ...string) (string, int) {
+		t.Helper()
+		cmd := exec.Command("/usr/bin/sandbox-exec", append([]string{"-f", profPath}, argv...)...)
+		cmd.Dir = dataVol
+		cmd.Env = append(os.Environ(),
+			"DEVELOPER_DIR="+dir,
+			"HOME="+dataVol,
+			"TMPDIR="+filepath.Join(dataVol, "tmp"),
+			// The compiler's module cache defaults to the invoking user's shared
+			// /var/folders tree, which the pod profile denies and this grant
+			// deliberately does not open. Pointing it at the pod's own volume is
+			// the documented workload-side setting, the same one the B264
+			// acceptance pod uses — not a widening of the profile.
+			"CLANG_MODULE_CACHE_PATH="+filepath.Join(dataVol, "tmp", "mc"),
+		)
+		out, err := cmd.CombinedOutput()
+		code := 0
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		} else if err != nil {
+			t.Fatalf("sandbox-exec %v: %v", argv, err)
+		}
+		return string(out), code
+	}
+
+	// REACH: the tools the grant claims to cover.
+	t.Run("xcrun-resolves-into-the-granted-toolchain", func(t *testing.T) {
+		out, code := confined(t, "/usr/bin/xcrun", "--find", "swift")
+		if code != 0 {
+			t.Fatalf("xcrun --find swift exited %d under the grant:\n%s", code, out)
+		}
+		// The point of the grant is that the pod reaches THIS toolchain. A resolve
+		// to /Library/Developer/CommandLineTools is the failure mode that looks
+		// like success: xcrun falls back to it whenever the Xcode lookup breaks.
+		var found string
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			if strings.HasSuffix(strings.TrimSpace(line), "/swift") {
+				found = strings.TrimSpace(line)
+			}
+		}
+		if !strings.HasPrefix(found, dir) {
+			t.Errorf("xcrun --find swift resolved to %q, not under the granted developer dir %q — the pod fell back to the Command Line Tools", found, dir)
+		}
+	})
+
+	t.Run("xcodebuild-can-interrogate-the-install", func(t *testing.T) {
+		for _, arg := range []string{"-version", "-showsdks"} {
+			if out, code := confined(t, "/usr/bin/xcodebuild", arg); code != 0 {
+				t.Errorf("xcodebuild %s exited %d under the grant:\n%s", arg, code, out)
+			}
+		}
+	})
+
+	t.Run("swiftc-compiles-and-the-binary-runs", func(t *testing.T) {
+		src := filepath.Join(dataVol, "main.swift")
+		if err := os.WriteFile(src, []byte(`print("hello from a pod")`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sdk := filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer", "SDKs", "MacOSX.sdk")
+		tc := filepath.Join(dir, "Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "swiftc")
+		if out, code := confined(t, tc, "-sdk", sdk, "-module-cache-path", "tmp/mc", "-o", "one", "main.swift"); code != 0 {
+			t.Fatalf("confined swiftc exited %d:\n%s", code, out)
+		}
+		out, code := confined(t, filepath.Join(dataVol, "one"))
+		if code != 0 || !strings.Contains(out, "hello from a pod") {
+			t.Errorf("the binary swiftc built exited %d and said %q; want 0 and the sentinel", code, out)
+		}
+	})
+
+	// CEILING: a pod must NOT be able to drive a project-evaluating build. This is
+	// the half that would silently rot — a future widening that "fixes xcodebuild"
+	// by granting Mach services or /Users would pass every reach case above.
+	t.Run("project-evaluation-stays-out-of-reach", func(t *testing.T) {
+		if out, code := confined(t, "/usr/bin/xcodebuild", "-list"); code == 0 {
+			t.Errorf("xcodebuild -list succeeded under the toolchain grant:\n%s\nthe documented ceiling did not hold — the profile is granting more than a toolchain read scope", out)
+		}
+	})
 }
