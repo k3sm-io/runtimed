@@ -2,7 +2,7 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M7
-updated: 2026-09-01
+updated: 2026-09-09
 updated_by: orchestrator
 
 phases:
@@ -726,6 +726,58 @@ phases:
             met: false
             check: "policy-gated tree-sign table: ADHOC_OK signs the materialized tree; require-signed/require-notarized never sign and verify as-pulled; the live materialize-then-exec-under-profile leg rides the M8.2 integration gate"
             method: unit
+  - id: M15
+    title: container-vm RuntimeClass (runtimed slice — ContainerVMBackend, k3sm-cvmhost, the ext4 root, the guest pins)
+    status: in-progress
+    strategy: phased (multi-node launchd rolling restart)
+    depends_on:
+      - apis:M15.1
+    note: "Authoritative input: docs/m15-plan.md (workspace) — Phase C encodes ONLY from that doc. M15.0 (the spike, B267 → runtimed#132) is DONE and its answers are binding: the standalone Command Line Tools Swift toolchain builds the helper (no Xcode.app), the framework's guest init has exec/stdio/signals/pty/stats/mounts/DNS but no multi-subscriber attach (the helper implements Attach itself, R5), PID 1 in the container is the workload (the boot rung discriminates on the guest kernel version string, R9), an ext4 root is built from k3sm's own unpacked tree in 49 ms (R3), the framework has no idmapped mounts so ownership is baked at build (R3), an unentitled launch throws a catchable error, the helper idles at 34.9 MiB RSS beside k3sm-vmhost's 25.9 MiB on the same experiment (R8), and the k3sm-built kernel from the framework's config boots it (R12). The helper is a parallel implementation of pkg/vmhost's invariants, not reuse (kept identical by the shared refusal rungs), and a host-side PARSER of guest-influenced bytes where k3sm-vmhost is a relay — named, hardened, and confined (R4/R10)."
+    subphases:
+      - id: M15.0
+        title: spike — a Swift helper boots a Linux container VM on the Containerization package (B267)
+        status: done
+        completed: 2026-09-09
+        strategy: hard cut
+        depends_on: []
+        deliverables:
+          - id: M15.0-d1
+            done: true
+            desc: "hack/spikes/containerhost (Package.swift, Package.resolved, the entitlements file, the k3sm-built kernel recipe from the framework's config) + hack/acceptance/B267.sh with the (a)+(e) pass/fail contract and the (b)–(k) REC table; runtimed#132 (lab-pending: the gate ran on the operator's Studio)."
+        acceptance:
+          - id: M15.0-a1
+            met: true
+            check: "hack/acceptance/B267.sh PASS on the named machine: boots under an ad-hoc-signed single-entitlement helper, uname -sm = Linux aarch64; SIGTERM exit within the 30 s bound, no orphan after kill -9, fresh boot after; the REC table recorded in the workspace run log"
+            method: lab
+      - id: M15.2
+        title: ContainerVMBackend + GuestBackend generalization + the ext4 root cache + k3sm-cvmhost + the guest pins
+        status: todo
+        strategy: phased (multi-node launchd rolling restart)
+        depends_on: []
+        deliverables:
+          - id: M15.2-d1
+            done: false
+            desc: "runtime.GuestBackend (the nine methods with guest-named verbs; VMBackend an alias for one release) + sandbox.ContainerVMBackend spawning k3sm-cvmhost; SelectBackend gains the explicit-only CONTAINER_VM case (never a ladder rung) and createPod a third branch → createContainerVMPod; TestGuestBackendGeneralizationKeepsVMDispatch pins the VM case golden before and after."
+          - id: M15.2-d2
+            done: false
+            desc: "pkg/image: the CONTAINER_VM case added to backendPlatforms AND UnpackPolicyFor (the mirrored pair); the ext4 root cache as a NEW protected-prefix store subdir beside BlobsSubdir (in the SBPL deny-set), images written only from the digest-verified blob pipeline, a stored digest re-checked on every hit; key = (manifest digest, platform, dialect, uid, gid, fsGroup) because ownership is baked at build."
+          - id: M15.2-d3
+            done: false
+            desc: "cmd/k3sm-cvmhost: the Swift package on the Containerization package at a pinned tag (Package.resolved committed with a one-line why), the SwiftPM codegen plugin (protoc-gen-swift/-grpc-swift checksum-pinned, apis's .proto files the only input, a regenerate-and-diff ci stage), the entitlements file (one entitlement, ad-hoc signed), the GuestAgent server on the per-pod socket translating onto the framework's guest init, its OWN Attach implementation (subscribe-then-snapshot replay, detach≠kill, concurrent subscribers) tested against the Go guest agent's fixtures, and the R5 lifetime contract (dies with the daemon, Stop within the grace, orphan sweep, boot deadline)."
+          - id: M15.2-d4
+            done: false
+            desc: "the helper's confinement decision written into docs/privilege-model.md (Seatbelt-confined to its pod's shares, its socket, and the Virtualization mach services — or the residual documented the way m11 S1(4) requires); the binary-level link guard (otool -L + nm over the built k3sm-runtimed asserting no Containerization/Virtualization linkage) beside the existing go-list-deps guard."
+          - id: M15.2-d5
+            done: false
+            desc: "pkg/guestartifacts: the container-vm pins (the k3sm-built kernel from the framework's config, published as a second series; the mirrored vminit image by digest) ensured at daemon start CONCURRENTLY with the vm artifacts under one shared DefaultFetchTimeout (a fake-slow-fetcher test pins the bound); ConditionContainerVMBackendAvailable (darwin ∧ the framework's own @available floor ∧ VZVirtualMachine.isSupported ∧ the helper resolves with a valid static signature carrying the entitlement ∧ the pinned assets verify; never a probe for the container CLI); the two docs/CONTAINER-VM-GUEST.md frontmatter pins filled and the version_sync.py//kernel-delta readers added; hack/mirror-container-vm-guest.sh (operator-run, digest-verified)."
+          - id: M15.2-d6
+            done: false
+            desc: "packaging (m15-plan R7): the Swift build+sign block and a second entitlement grep in hack/release/stage.sh, ContainerVMHostName in pkg/install/artifacts.go RequiredSiblings, the .goreleaser.yaml archive src line, the Swift/CLT build dependency in the formula rendered by hack/sync-formula.sh (never the deleted brews: stub), and a Swift NOTICE step (go-licenses cannot see Swift)."
+        acceptance:
+          - id: M15.2-a1
+            met: false
+            check: "runtimed hack/ci.sh green incl. the new codegen-diff and link-guard stages; TestGuestBackendGeneralizationKeepsVMDispatch green; the ext4-cache tests pin the protected prefix and the hit-time digest check; the concurrent-ensure test pins the shared bound; a container-vm pod boots on a VZ Mac under hack/lab/m15.sh --core rungs 1–2 (label present, uname -sm = Linux aarch64 AND uname -r = the pinned kernel string)"
+            method: integration
 ---
 
 # runtimed — Phase roadmap
