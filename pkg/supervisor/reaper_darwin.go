@@ -100,25 +100,14 @@ func (KqueueReaper) WaitExit(ctx context.Context, pid int) (int, int, error) {
 			return 0, 0, fmt.Errorf("kevent register pid %d: %w", pid, err)
 		}
 	} else {
-		// Block for the exit event, honoring ctx via a short poll timeout so a
-		// cancelled context unblocks the reaper without leaking the goroutine.
-		out := make([]unix.Kevent_t, 1)
-		timeout := unix.Timespec{Sec: 0, Nsec: 250_000_000} // 250ms poll
-		for {
-			if err := ctx.Err(); err != nil {
-				return 0, 0, err
-			}
-			n, err := unix.Kevent(kq, nil, out, &timeout)
-			if err != nil {
-				if errors.Is(err, unix.EINTR) {
-					continue
-				}
-				return 0, 0, fmt.Errorf("kevent wait pid %d: %w", pid, err)
-			}
-			if n > 0 {
-				break // NOTE_EXIT fired
-			}
-			// n == 0: timeout — re-check ctx and loop.
+		// Block for the exit event with NO timeout. Cancellation is delivered
+		// through the same kqueue: an EVFILT_USER event registered here and
+		// NOTE_TRIGGERed by a goroutine the moment ctx is done, so the wait is
+		// fully event-driven — no poll, no wakeups while nothing happens
+		// (this loop used to wake every 250 ms per supervised process to look
+		// at ctx.Err(); runtimed#125).
+		if err := waitExitOrCancel(ctx, kq, pid); err != nil {
+			return 0, 0, err
 		}
 	}
 
@@ -148,6 +137,89 @@ func (KqueueReaper) WaitExit(ctx context.Context, pid int) (int, int, error) {
 		return 128 + int(ws.Signal()), int(ws.Signal()), nil
 	}
 	return ws.ExitStatus(), 0, nil
+}
+
+// cancelIdent is the EVFILT_USER ident WaitExit registers for its cancellation
+// wakeup. Idents are scoped per (kqueue, filter), so any value is free of the
+// EVFILT_PROC registration on the same kqueue, whose ident is the pid.
+const cancelIdent = 1
+
+// waitExitOrCancel blocks on kq until the child's NOTE_EXIT fires (nil) or ctx is
+// done (ctx.Err()). The kqueue carries the EVFILT_PROC registration already;
+// this adds an EVFILT_USER event and a goroutine that NOTE_TRIGGERs it on
+// ctx.Done().
+//
+// LIFETIME of the trigger goroutine: it ends when this function returns, for any
+// reason, and it is JOINED before the return — so it can never fire a trigger
+// into a kqueue the caller has since closed, whose descriptor number the kernel
+// may already have handed to something else.
+//
+// When both events are ready in one kevent return, the exit wins: the child is
+// dead, and the real status it will be reaped with is strictly more information
+// than the cancellation. That is also the old poll loop's behaviour whenever
+// NOTE_EXIT arrived inside a poll window.
+func waitExitOrCancel(ctx context.Context, kq int, pid int) error {
+	user := unix.Kevent_t{
+		Ident:  cancelIdent,
+		Filter: unix.EVFILT_USER,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
+	}
+	if _, err := unix.Kevent(kq, []unix.Kevent_t{user}, nil, nil); err != nil {
+		return fmt.Errorf("kevent register cancel wakeup for pid %d: %w", pid, err)
+	}
+
+	stop := make(chan struct{})
+	gone := make(chan struct{})
+	go func() {
+		defer close(gone)
+		select {
+		case <-ctx.Done():
+		case <-stop:
+			return
+		}
+		trigger := unix.Kevent_t{
+			Ident:  cancelIdent,
+			Filter: unix.EVFILT_USER,
+			Fflags: unix.NOTE_TRIGGER,
+		}
+		// A failure here is not reported: the only consequence would be the
+		// caller not waking on cancellation, and there is nobody to tell — the
+		// caller is the one blocked. It cannot happen on a kqueue that is still
+		// open with the ident registered above, which the join below guarantees.
+		_, _ = unix.Kevent(kq, []unix.Kevent_t{trigger}, nil, nil)
+	}()
+	defer func() {
+		close(stop)
+		<-gone
+	}()
+
+	out := make([]unix.Kevent_t, 2)
+	for {
+		n, err := unix.Kevent(kq, nil, out, nil)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return fmt.Errorf("kevent wait pid %d: %w", pid, err)
+		}
+		cancelled := false
+		for _, ev := range out[:n] {
+			switch ev.Filter {
+			case unix.EVFILT_PROC:
+				return nil // NOTE_EXIT fired; the exit wins over a cancellation
+			case unix.EVFILT_USER:
+				cancelled = true
+			}
+		}
+		if cancelled {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			// A trigger with no cancellation behind it cannot happen (the
+			// goroutine only fires after ctx.Done()); keep waiting rather than
+			// invent a cancellation.
+		}
+	}
 }
 
 // reapDetached polls wait4(WNOHANG) until pid is collected. It is the handoff
