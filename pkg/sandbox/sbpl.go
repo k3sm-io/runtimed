@@ -346,7 +346,11 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// against the same deny-set, so a bad value fails the whole profile before a
 	// line is emitted rather than being silently dropped from it. Empty (the
 	// default) yields "" and grants nothing. See xcode.go for the ablation.
-	xcodeDir, err := validateXcodeToolchainDir(sp.GetXcodeToolchainDir(), dataVol, protectedPrefixes)
+	//
+	// The same call the exported ValidateXcodeToolchainDir makes, over a
+	// protected-prefix set from the same resolvePosture — so a caller that asks
+	// before setting the field gets the answer this line will give.
+	xcodeDir, err := validateXcodeToolchainDir(sp.GetXcodeToolchainDir(), protectedPrefixes)
 	if err != nil {
 		return "", err
 	}

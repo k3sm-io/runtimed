@@ -200,6 +200,21 @@ func TestPodLaunchEnvCarriesModuleCacheInDataVolume(t *testing.T) {
 // directions are asserted, so this stays honest if the default ever changes:
 // with the module cache pointed inside the data volume the compile SUCCEEDS,
 // and with it left at the platform default the compile FAILS.
+//
+// Both directions rest on the confined toolchain resolving AT ALL, and that is
+// a property of the host, not of this test: `swiftc` locates its developer dir
+// through /var/db/xcode_select_link, which the pod profile denies (/private/var/db
+// is a protected tree). On a Mac where `xcode-select -s` has written that link
+// the confined shim resolves nothing and every compile below fails with
+// "missing DEVELOPER_DIR path" — the RED branch then asserts a module-cache
+// substring against an error that has nothing to do with module caches, and the
+// verdict flips between two Macs on identical source. It did, and it turned a
+// release red for the wrong reason.
+//
+// So the host is probed first and the test SKIPS when the answer is not one it
+// can speak about, the idiom its sibling in pkg/sandbox
+// (TestXcodeToolchainGrantReachesTheToolchain) already uses. Where it does run,
+// both directions are still asserted in full.
 func TestConfinedSwiftCompileNeedsTheInjectedModuleCache(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
@@ -235,6 +250,27 @@ func TestConfinedSwiftCompileNeedsTheInjectedModuleCache(t *testing.T) {
 	profPath := filepath.Join(work, "pod.sb")
 	if err := os.WriteFile(profPath, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
+	}
+
+	// The probe: what developer dir does a pod under THIS profile resolve, and
+	// does the compiler run once it has? Both are asked confined, because the
+	// unconfined answer is a different question — on a host with Xcode selected,
+	// unconfined `xcode-select -p` names Xcode.app while the confined one names
+	// the Command Line Tools or fails outright.
+	confined := func(argv ...string) (string, error) {
+		cmd := exec.Command("/usr/bin/sandbox-exec", append([]string{"-f", profPath}, argv...)...)
+		cmd.Dir = dataVol
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + dataVol, tmpDirEnv + "=" + podTmpDir(dataVol)}
+		b, err := cmd.CombinedOutput()
+		return string(b), err
+	}
+	devDir, err := confined("/usr/bin/xcode-select", "-p")
+	if err != nil {
+		t.Skipf("a confined xcode-select resolves no developer dir on this host, so no compile below is about the module cache: %s", strings.TrimSpace(devDir))
+	}
+	if out, err := confined(swiftc, "--version"); err != nil {
+		t.Skipf("a confined swiftc does not run against the developer dir this host resolves (%s), so no compile below is about the module cache: %s",
+			strings.TrimSpace(devDir), strings.TrimSpace(out))
 	}
 
 	compile := func(t *testing.T, moduleCache string, out string) (string, error) {
