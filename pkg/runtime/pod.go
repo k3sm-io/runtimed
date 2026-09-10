@@ -1878,6 +1878,23 @@ const (
 	podModuleCacheName  = "clang-modules"
 )
 
+// developerDirEnv is the environment variable Apple's toolchain shims consult
+// to locate the active developer directory, and the one containerEnv publishes
+// from a pod's validated SandboxProfile.xcode_toolchain_dir.
+//
+// Without it the grant is inert. `man xcrun` and `man xcode-select` both
+// document DEVELOPER_DIR as overriding the active selection, and the shims read
+// it BEFORE they fall back to /var/db/xcode_select_link — a path the pod profile
+// denies (/private/var/db is a protected tree). So an annotated pod on a node
+// with Xcode installed silently resolved to the Command Line Tools instead: the
+// profile carried the toolchain grant, and nothing in the pod ever named the
+// directory it granted.
+//
+// Setting this variable is also why the fix needs no SBPL change: it
+// short-circuits the resolution before the denied link read, rather than
+// opening that read.
+const developerDirEnv = "DEVELOPER_DIR"
+
 // podModuleCacheDir is the pod's own clang module cache, one subdirectory of
 // the pod temp dir. It is derived from the data volume rather than from the
 // container's $TMPDIR, so a container that names its own temp directory still
@@ -1944,6 +1961,20 @@ func provisionPodTmpDir(dataVol string) error {
 // the container spawn and an Exec session pass through, so a `kubectl exec`
 // shell compiles the same way the container does.
 //
+// DEVELOPER_DIR joins them on the same terms, from the box's validated
+// xcode_toolchain_dir (empty — the default — injects nothing). It is what makes
+// the toolchain grant reachable: the profile grants a developer dir, and this
+// is the only place the pod is told which one, since the shims' own fallback
+// reads a path the profile denies (see developerDirEnv).
+//
+// Precedence is spec-beats-injection here too, and deliberately so even though
+// the injected value is the server-validated one: an image that bakes its own
+// DEVELOPER_DIR is naming a toolchain it ships or expects, and a house rule
+// that holds for TMPDIR and the module cache but is reversed for one variable
+// is a rule nobody can predict. The cost is recorded rather than hidden — such
+// an image keeps whatever it baked, so the grant stays inert for it, and the
+// remedy is to unset the variable in the pod spec.
+//
 // The two are independent: the module cache is NOT derived from $TMPDIR, because
 // the toolchain does not derive it from $TMPDIR either (see clangModuleCacheEnv).
 // A container that sets only TMPDIR still gets the injected module cache.
@@ -1976,6 +2007,13 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		if !envHasName(base, clangModuleCacheEnv) {
 			env = append(env, clangModuleCacheEnv+"="+podModuleCacheDir(dataVol))
 		}
+	}
+	// The developer dir the profile granted. The field was validated by
+	// sandbox.Generate earlier in this same createPod (a value that would not
+	// validate failed the pod there, with no profile emitted), so what is
+	// published here is exactly what the SBPL stanza is rooted at.
+	if dir := box.GetSandboxProfile().GetXcodeToolchainDir(); dir != "" && !envHasName(base, developerDirEnv) {
+		env = append(env, developerDirEnv+"="+dir)
 	}
 	explicitDyld := false
 	for _, e := range base {
