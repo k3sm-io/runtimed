@@ -249,7 +249,7 @@ func TestXcodeToolchainDirValidation(t *testing.T) {
 		{"relative", "Applications/Xcode.app/Contents/Developer", false},
 		{"unclean", "/Applications/Xcode.app/Contents/../Contents/Developer", false},
 		{"filesystem-root", "/", false},
-		{"under-users", "/Users/miko/Xcode.app/Contents/Developer", false},
+		{"under-users", "/Users/someone/Xcode.app/Contents/Developer", false},
 		{"under-pods-root", "/var/lib/k3sm/pods/other/Developer", false},
 		{"base-not-developer", "/Applications/Xcode.app/Contents", false},
 		// The Command Line Tools root is a real, common `xcode-select -p` value and
