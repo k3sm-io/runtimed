@@ -26,9 +26,20 @@ package sandbox
 // derivation was re-run on 2026-09-09 against Xcode 26.6 (17F113) on macOS 26.6.2,
 // which both widened the grant and narrowed two of its existing rules.
 //
-// Rooted at D, the node's DEVELOPER_DIR (`xcode-select -p`, e.g.
-// /Applications/Xcode.app/Contents/Developer), with B the enclosing application
-// bundle (D/../.., recognised only when D ends in Contents/Developer):
+// Rooted at D, the developer directory this field NAMES — the value a pod's
+// DEVELOPER_DIR is set to, e.g. /Applications/Xcode.app/Contents/Developer.
+//
+// D is not "whatever `xcode-select -p` prints", and the two must not be
+// conflated: that command reports the node's ACTIVE developer-dir selection,
+// which is very often /Library/Developer/CommandLineTools — a root of an
+// entirely different shape, for which every path derived below would be wrong,
+// and which ValidateXcodeToolchainDir therefore refuses. A node whose selection
+// is the Command Line Tools has no developer dir this stanza can be rooted at;
+// it grants nothing and needs nothing, because the Command Line Tools are
+// already reachable under the base profile's read set.
+//
+// With B the enclosing application bundle (D/../.., recognised only when D ends
+// in Contents/Developer):
 //
 //   - subpath D/usr/bin — the developer-dir tool shims: xcrun, xcodebuild, and the
 //     `swift`/`swiftc` front ends that re-exec into the toolchain.
