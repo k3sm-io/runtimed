@@ -749,3 +749,90 @@ func findOne(t *testing.T, root, suffix string) string {
 	}
 	return found
 }
+
+// TestValidateXcodeToolchainDirIsGenerateSOwnVerdict is the anti-drift gate on
+// the exported predicate: over one table it asserts that
+// ValidateXcodeToolchainDir and Generate reach the SAME verdict for every
+// rejection class, so the answer a caller gets before it sets the field is the
+// answer the field will get.
+//
+// It runs the same six rejection classes TestXcodeToolchainDirValidation pins
+// (relative, unclean, filesystem-root, under-users, under-pods-root,
+// base-not-developer) plus the valid and empty cases, because a predicate that
+// honoured only the base-name rule would look right on the interesting cases
+// and wave through a developer dir under /Users.
+//
+// The pairing is the point. Asserting the predicate alone would pass against a
+// hand-written second copy of the rules — which is exactly the outcome the
+// export exists to prevent.
+func TestValidateXcodeToolchainDirIsGenerateSOwnVerdict(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+		ok   bool
+	}{
+		{"valid-xcode-app", xcodeDevDir, true},
+		{"valid-relocated-bundle", "/Volumes/Build/Xcode.app/Contents/Developer", true},
+		{"empty-grants-nothing", "", true},
+		{"relative", "Applications/Xcode.app/Contents/Developer", false},
+		{"unclean", "/Applications/Xcode.app/Contents/../Contents/Developer", false},
+		{"filesystem-root", "/", false},
+		{"under-users", "/Users/someone/Xcode.app/Contents/Developer", false},
+		{"under-pods-root", "/var/lib/k3sm/pods/other/Developer", false},
+		{"base-not-developer", "/Applications/Xcode.app/Contents", false},
+		// The Command Line Tools root: the value `xcode-select -p` prints on a
+		// node with no Xcode, and the one a caller most needs a verdict on.
+		{"command-line-tools", "/Library/Developer/CommandLineTools", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The zero Posture is the default work-dir posture Generate below
+			// also runs under, so the two see the same deny-set.
+			got, err := ValidateXcodeToolchainDir(tc.dir, Posture{})
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("ValidateXcodeToolchainDir(%q): unexpected error %v", tc.dir, err)
+				}
+				if got != tc.dir {
+					t.Errorf("ValidateXcodeToolchainDir(%q) = %q; the accepted value must come back unchanged", tc.dir, got)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("ValidateXcodeToolchainDir(%q): want ErrXcodeToolchainDir, got %q", tc.dir, got)
+				}
+				if !errors.Is(err, ErrXcodeToolchainDir) {
+					t.Fatalf("ValidateXcodeToolchainDir(%q): want ErrXcodeToolchainDir, got %v", tc.dir, err)
+				}
+				if got != "" {
+					t.Errorf("ValidateXcodeToolchainDir(%q) returned %q alongside the error", tc.dir, got)
+				}
+			}
+
+			// The same question asked the long way round. A disagreement here
+			// is the drift the export exists to make impossible.
+			_, genErr := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath:    "/var/lib/k3sm/pods/pod-xc/rootfs",
+				XcodeToolchainDir: tc.dir,
+			}, GenerateOptions{})
+			if errors.Is(genErr, ErrXcodeToolchainDir) == (err == nil) {
+				t.Fatalf("the predicate and Generate disagree on %q: predicate err = %v, Generate err = %v", tc.dir, err, genErr)
+			}
+		})
+	}
+}
+
+// TestValidateXcodeToolchainDirTracksThePosture pins the one input that is not
+// a property of the dir: the deny-set derived from the node's work-dir. A
+// developer dir sitting inside a node's pods root is refused, and it is refused
+// only when the caller says where that root is — the residual the exported
+// doc comment records, asserted rather than merely described.
+func TestValidateXcodeToolchainDirTracksThePosture(t *testing.T) {
+	const dir = "/opt/k3sm-home/pods/tenant/Developer"
+	if _, err := ValidateXcodeToolchainDir(dir, Posture{}); err != nil {
+		t.Fatalf("under the DEFAULT posture %q is not in any deny-set; got %v", dir, err)
+	}
+	_, err := ValidateXcodeToolchainDir(dir, Posture{WorkDir: "/opt/k3sm-home"})
+	if !errors.Is(err, ErrXcodeToolchainDir) {
+		t.Fatalf("under a work-dir of /opt/k3sm-home, %q is inside the pods root; want ErrXcodeToolchainDir, got %v", dir, err)
+	}
+}

@@ -171,7 +171,48 @@ var ErrXcodeToolchainDir = errors.New("sbpl: invalid xcode toolchain dir")
 // cheap structural check that keeps the grant pointed at a developer dir: every
 // path this stanza derives is relative to D, so a D of, say, /Applications would
 // render five subpath allows over unrelated trees.
+//
+// It rests on Apple's Contents/Developer bundle convention rather than on a
+// published contract, which is worth stating: the rule is a strong structural
+// heuristic, not a guarantee the vendor made.
 const xcodeDeveloperDirBase = "Developer"
+
+// ValidateXcodeToolchainDir reports whether dir is usable as a
+// SandboxProfile.xcode_toolchain_dir under posture, and returns the cleaned
+// DEVELOPER_DIR the grant would be rendered from. An empty dir is not an error:
+// it returns "" and nil, the default that grants nothing. Every rejection is
+// ErrXcodeToolchainDir, with the reason as text.
+//
+// It is EXPORTED for the caller that must decide, BEFORE it sets the field,
+// whether a candidate developer dir will be accepted — the provider in k3sm,
+// which stamps this field from the node's active developer-dir selection and
+// must not stamp a value that will fail the whole profile at CreatePod. The
+// precedent is ValidateNetworkScope in this package: a relational property the
+// generator decides internally, exported so a caller can ask the authoritative
+// question instead of re-deriving the answer.
+//
+// One implementation, so the two answers cannot drift: Generate and this
+// function both call the unexported validateXcodeToolchainDir over a
+// protected-prefix set both derive from resolvePosture. The rule set here is
+// under active revision (the grant was re-derived against Xcode 26.6 on
+// 2026-09-09, which narrowed two of its rules), so a second hand-maintained
+// copy of "what is a valid DEVELOPER_DIR" in another repo would be wrong within
+// one release.
+//
+// Residual, recorded rather than hidden: part of the deny-set is derived from
+// the node's runtimed work-dir, which is a Posture input. A caller passing the
+// zero Posture gets the DefaultWorkDir deny-set, so on a node whose runtimed
+// runs with a different work-dir this function's verdict differs from
+// Generate's for exactly one class of dir — one at or under THAT work-dir's
+// pods/podreap/server/agent/run/blobs trees. A caller that knows the node's
+// pod-root passes it and the class is empty.
+func ValidateXcodeToolchainDir(dir string, posture Posture) (string, error) {
+	_, _, protectedPrefixes, err := resolvePosture(posture)
+	if err != nil {
+		return "", err
+	}
+	return validateXcodeToolchainDir(dir, protectedPrefixes)
+}
 
 // validateXcodeToolchainDir checks a raw xcode_toolchain_dir and returns the
 // cleaned DEVELOPER_DIR the stanza is rendered from. An empty value is not an
@@ -179,11 +220,19 @@ const xcodeDeveloperDirBase = "Developer"
 //
 // It fails closed — a value that cannot be validated returns ErrXcodeToolchainDir
 // and Generate emits no profile at all, rather than emitting one with the
-// toolchain grant silently dropped. protectedPrefixes and dataVol are the same
-// deny-set and carve-out Generate applies to every other caller-supplied path;
-// the check is delegated to validateExtraPaths (with the dir as a one-element
-// group) so this field cannot drift away from the tier that defends the rest.
-func validateXcodeToolchainDir(raw, dataVol string, protectedPrefixes []string) (string, error) {
+// toolchain grant silently dropped. protectedPrefixes is the same deny-set
+// Generate applies to every other caller-supplied path; the check is delegated
+// to validateExtraPaths (with the dir as a one-element group) so this field
+// cannot drift away from the tier that defends the rest.
+//
+// Unlike the extra-path tier it passes NO data volume to that check, so the
+// pod's own volume is not carved out and a "developer dir" inside it is refused
+// like any other protected path. That is deliberate and is what lets the same
+// predicate answer a caller who holds a candidate dir and no pod: the verdict
+// must not depend on which pod happens to be asking. Nothing is lost — a
+// developer dir under the pod's own writable volume is not an installation this
+// ablation-derived path set describes, and the pod already reads that tree.
+func validateXcodeToolchainDir(raw string, protectedPrefixes []string) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
@@ -196,7 +245,7 @@ func validateXcodeToolchainDir(raw, dataVol string, protectedPrefixes []string) 
 	if raw == "/" {
 		return "", fmt.Errorf("%w: %q is the filesystem root", ErrXcodeToolchainDir, raw)
 	}
-	if err := validateExtraPaths(dataVol, protectedPrefixes, []string{raw}); err != nil {
+	if err := validateExtraPaths("", protectedPrefixes, []string{raw}); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrXcodeToolchainDir, err)
 	}
 	if filepath.Base(raw) != xcodeDeveloperDirBase {
