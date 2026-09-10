@@ -307,6 +307,7 @@ type GenerateOptions struct {
 // Generate returns ErrNoDataVolume if sp has no data volume,
 // ErrDataVolumeUnbounded if that volume is not under the posture's pods root,
 // ErrProtectedPath if any extra/credential path is under the protected deny-set,
+// ErrXcodeToolchainDir if xcode_toolchain_dir is not a usable DEVELOPER_DIR,
 // and the work-dir errors above for a bad Posture; otherwise the rendered profile
 // is always well-formed and passes Validate.
 func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
@@ -338,6 +339,15 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// the protected deny-set is rejected outright (fail closed). The pod's own
 	// data volume is carved out (it is re-allowed by design below).
 	if err := validateExtraPaths(dataVol, protectedPrefixes, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths); err != nil {
+		return "", err
+	}
+
+	// The developer-toolchain read grant (xcode_toolchain_dir) is validated here,
+	// against the same deny-set, so a bad value fails the whole profile before a
+	// line is emitted rather than being silently dropped from it. Empty (the
+	// default) yields "" and grants nothing. See xcode.go for the ablation.
+	xcodeDir, err := validateXcodeToolchainDir(sp.GetXcodeToolchainDir(), dataVol, protectedPrefixes)
+	if err != nil {
 		return "", err
 	}
 
@@ -395,6 +405,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// metal.go for what the two class names are and why nothing else is granted.
 	if sp.GetAllowGpu() {
 		b.WriteString(metalStanza)
+	}
+
+	// Developer toolchain (xcode_toolchain_dir): read-only, emitted in the allows
+	// tier right after the GPU stanza so the protected denies below still outrank
+	// it. See xcode.go for what each path is for and what is deliberately not
+	// granted.
+	if xcodeDir != "" {
+		b.WriteString(xcodeToolchainStanza(xcodeDir))
 	}
 
 	// --- AF_UNIX helper-socket denies (higher precedence than network allows) --

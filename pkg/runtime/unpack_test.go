@@ -529,7 +529,8 @@ func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)
 	}
-	if got := withoutName(merged, tmpDirEnv); len(got) != 2 || got[0] != "PATH=/usr/bin" || got[1] != "POD=1" {
+	// Both runtimed injections are dropped: this test is about the merged base.
+	if got := withoutName(withoutName(merged, tmpDirEnv), clangModuleCacheEnv); len(got) != 2 || got[0] != "PATH=/usr/bin" || got[1] != "POD=1" {
 		t.Errorf("env = %v, want the merged base verbatim", merged)
 	}
 
@@ -538,7 +539,7 @@ func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)
 	}
-	if got := withoutName(fallback, tmpDirEnv); len(got) != 1 || got[0] != "POD=1" {
+	if got := withoutName(withoutName(fallback, tmpDirEnv), clangModuleCacheEnv); len(got) != 1 || got[0] != "POD=1" {
 		t.Errorf("fallback env = %v, want [POD=1]", fallback)
 	}
 }

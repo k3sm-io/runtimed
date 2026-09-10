@@ -1848,6 +1848,44 @@ const (
 	podTmpDirName = "tmp"
 )
 
+// clangModuleCacheEnv is the environment variable Apple's clang and swift
+// front ends consult for their module cache, and podModuleCacheName is the
+// directory inside the pod temp dir runtimed provisions for it.
+//
+// This is TMPDIR's problem a second time, in a place TMPDIR cannot reach.
+// The toolchain does NOT derive its module cache from $TMPDIR: it calls
+// confstr(_CS_DARWIN_USER_CACHE_DIR), which ignores the environment entirely
+// and returns the invoking uid's shared /var/folders cache tree. The pod
+// profile does not write-allow that path and should not — it is shared by
+// every pod on the node under the single-uid host-process model, and a module
+// cache holds compiled .pcm files that the next compile LOADS, so a writable
+// shared cache is a build-poisoning channel between pods, not merely a
+// disclosure one.
+//
+// So the fix is a per-pod cache, named through the one variable the toolchain
+// does honour. Measured on macOS 26.6: plain C and plain Objective-C compile
+// and run in a pod today, because they touch no module cache; anything using
+// clang modules (`-fmodules`, and Swift ALWAYS) fails with "unable to open
+// output file … /clang/ModuleCache/…: Operation not permitted". Setting this
+// one variable fixes every one of those cases with no SBPL change at all, for
+// the Command Line Tools and the Xcode toolchain alike.
+//
+// It is deliberately NOT part of the xcode_toolchain_dir grant: the failure
+// reproduces with no toolchain grant at all, on the Command Line Tools, so it
+// is a property of confining a pod rather than of reaching Xcode.
+const (
+	clangModuleCacheEnv = "CLANG_MODULE_CACHE_PATH"
+	podModuleCacheName  = "clang-modules"
+)
+
+// podModuleCacheDir is the pod's own clang module cache, one subdirectory of
+// the pod temp dir. It is derived from the data volume rather than from the
+// container's $TMPDIR, so a container that names its own temp directory still
+// gets a module cache that exists and is writable.
+func podModuleCacheDir(dataVol string) string {
+	return filepath.Join(podTmpDir(dataVol), podModuleCacheName)
+}
+
 // podTmpDir is the pod's own temp directory: one subdirectory of the pod data
 // volume, and the single derivation of that path — provisionPodTmpDir creates it
 // and containerEnv publishes it, so the directory a pod is told about is the
@@ -1882,30 +1920,41 @@ func provisionPodTmpDir(dataVol string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create pod tmp dir %s: %w", dir, err)
 	}
+	// The module cache is provisioned here too, for the same reason and at the
+	// same moment: containerEnv publishes its path, so the directory a pod is
+	// told about is the directory that was made. MkdirAll covers both levels.
+	if err := os.MkdirAll(podModuleCacheDir(dataVol), 0o700); err != nil {
+		return fmt.Errorf("create pod module cache dir %s: %w", podModuleCacheDir(dataVol), err)
+	}
 	return nil
 }
 
-// containerEnv builds the child environment: a base set, plus TMPDIR pointing
-// into the pod data volume, plus the DYLD inserts that make cluster features work
+// containerEnv builds the child environment: a base set, plus TMPDIR and
+// CLANG_MODULE_CACHE_PATH pointing into the pod data volume, plus the DYLD inserts that make cluster features work
 // in-pod — the path-rebase shim (so an absolute volume mount resolves to its
 // materialized copy under the pod data volume, no chroot) and the DNS shim (box
 // annotation). DYLD_INSERT_LIBRARIES is appended last so an explicit container
 // env can override it (rare). A container that sets DYLD_INSERT_LIBRARIES itself
 // opts out of both shims.
 //
-// TMPDIR is injected only when the base does not already carry one, so a
-// container that names its own temp directory keeps it — the same
-// spec-beats-injection rule DYLD_INSERT_LIBRARIES follows. It is injected here,
-// at the one seam both the container spawn and an Exec session pass through, so
-// a `kubectl exec` shell has the same temp directory the container does.
+// TMPDIR and CLANG_MODULE_CACHE_PATH are each injected only when the base does
+// not already carry that name, so a container that names its own temp directory
+// or module cache keeps it — the same spec-beats-injection rule
+// DYLD_INSERT_LIBRARIES follows. They are injected here, at the one seam both
+// the container spawn and an Exec session pass through, so a `kubectl exec`
+// shell compiles the same way the container does.
+//
+// The two are independent: the module cache is NOT derived from $TMPDIR, because
+// the toolchain does not derive it from $TMPDIR either (see clangModuleCacheEnv).
+// A container that sets only TMPDIR still gets the injected module cache.
 //
 // base is the merged environment resolveBinary produced for a pulled image (the
 // image config's Env under the container's, image.MergeRunSpec) — the source of
 // $PATH, $HOME and everything else an image ships. It is nil on the two
 // host-binary routes, and then the base is the container's own EnvVars, the
-// behaviour unchanged from before image-config env merging existed. TMPDIR is injected on every one of those routes: a
+// behaviour unchanged from before image-config env merging existed. Both are injected on every one of those routes: a
 // host-process pod is confined by the same profile and has the same
-// no-usable-tmp problem.
+// no-usable-tmp and no-usable-module-cache problem.
 func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, base []string) ([]string, error) {
 	if base == nil {
 		base = make([]string, 0, len(c.GetEnv()))
@@ -1913,13 +1962,20 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 			base = append(base, e.GetName()+"="+e.GetValue())
 		}
 	}
-	env := make([]string, 0, len(base)+4)
-	if !envHasName(base, tmpDirEnv) {
+	env := make([]string, 0, len(base)+5)
+	if !envHasName(base, tmpDirEnv) || !envHasName(base, clangModuleCacheEnv) {
 		dataVol, err := r.rootfsPath(box)
 		if err != nil {
 			return nil, err
 		}
-		env = append(env, tmpDirEnv+"="+podTmpDir(dataVol))
+		if !envHasName(base, tmpDirEnv) {
+			env = append(env, tmpDirEnv+"="+podTmpDir(dataVol))
+		}
+		// Same spec-beats-injection rule: a container that names its own module
+		// cache keeps it.
+		if !envHasName(base, clangModuleCacheEnv) {
+			env = append(env, clangModuleCacheEnv+"="+podModuleCacheDir(dataVol))
+		}
 	}
 	explicitDyld := false
 	for _, e := range base {
