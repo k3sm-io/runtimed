@@ -53,7 +53,27 @@ import (
 // Unknown pod / container return a structured NOT_FOUND, and a container that
 // already has a process (running or terminated) is refused with
 // FailedPrecondition + NOT_UPDATABLE — matching RestartContainer's shape, so a
-// caller reads one taxonomy across both verbs.
+// caller reads one taxonomy across both verbs. A pod that is being deleted is
+// refused with FailedPrecondition + NOT_FOUND: it is not going to exist.
+//
+// # The trust assumption: the caller owns the backoff
+//
+// This verb applies NO per-call rate floor, and that is a deliberate omission
+// rather than an oversight. Its only caller is the in-process Darwin provider,
+// which owns the retry decision for a waiting container — it holds the
+// ImagePullBackOff clock the kubelet's vocabulary describes, and a second,
+// independent floor inside runtimed would silently stretch that schedule and
+// make the two disagree about when the next attempt is due. CRI has no such
+// floor either (RunPodSandbox/CreateContainer are unthrottled), so adding one
+// here would also be a divergence from the contract this daemon mirrors.
+//
+// The cost of the assumption is bounded by the single-flight claim below rather
+// than by trust: a caller that hammers the verb gets one in-flight start per
+// container and an immediate FailedPrecondition for the rest, so the work is
+// capped even when the schedule is not. What is NOT bounded is pull traffic from
+// a caller that retries in a tight loop, which is the reason this paragraph
+// exists — if runtimed ever gains an untrusted caller for this verb, the floor
+// has to arrive with it.
 func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContainerRequest) (*runtimev1.StartContainerResponse, error) {
 	r.mu.Lock()
 	p, ok := r.pods[req.GetPodId()]
@@ -85,6 +105,10 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	// the first is mid-spawn (see containerProc.starting).
 	p.mu.Lock()
 	switch {
+	case p.stopping:
+		p.mu.Unlock()
+		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
+			"start %s/%s: pod is being deleted", req.GetPodId(), req.GetContainer()), nil
 	case cp.proc != nil:
 		p.mu.Unlock()
 		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
@@ -144,7 +168,24 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	// here visibly wrong.
 	newCP.state.RestartCount = cp.state.GetRestartCount()
 	newCP.state.LastTerminationState = cp.state.GetLastTerminationState()
-	setContainerLocked(p, newCP)
+	// The SECOND stopping check, and the one that matters: the first ran before a
+	// pull that can take seconds, and DeletePod snapshots the containers it will
+	// signal at its own entry. A spawn that installs after that snapshot is
+	// signalled by nobody and its reap record is removed by the same call, so it
+	// would outlive the pod as a root-owned group. installing is refused and the
+	// group this call just created is SIGKILLed synchronously.
+	if p.stopping {
+		p.mu.Unlock()
+		r.killUntrackedSpawn(p.supCtx, p, newCP, "the pod is being deleted")
+		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
+			"start %s/%s: pod is being deleted", req.GetPodId(), cp.name), nil
+	}
+	if err := setContainerLocked(p, newCP); err != nil {
+		p.mu.Unlock()
+		r.killUntrackedSpawn(p.supCtx, p, newCP, err.Error())
+		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			"start %s/%s: %v", req.GetPodId(), cp.name, err), nil
+	}
 	if waitingContainersLocked(p) == 0 && p.phase == runtimev1.PodPhase_POD_PHASE_PENDING {
 		// Nothing waits any more, so the pod leaves Pending. recomputePhaseLocked
 		// is not used here: it is the MAINS-only terminal accounting, and this
