@@ -290,6 +290,13 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 		return status.Error(codes.Unimplemented,
 			"interactive attach (stdin/tty) to a running native process is not supported; use `kubectl exec`")
 	}
+	// Attach follows a PROCESS's output. A container that never started (Waiting
+	// because its start failed before the spawn) has none, and cp.proc is nil —
+	// which the exit select below would dereference.
+	if cp.proc == nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"attach %s/%s: container has not started", first.GetPodId(), first.GetContainer())
+	}
 
 	var sendMu sync.Mutex
 	send := func(resp *runtimev1.AttachResponse) error {

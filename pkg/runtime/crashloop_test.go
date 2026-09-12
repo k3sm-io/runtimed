@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"k3sm.io/runtimed/pkg/supervisor"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -32,8 +34,15 @@ import (
 // recomputePhaseLocked reads only spec/state/restarting/initDeclared, never proc.
 func testCP(name string, term *runtimev1.ContainerStateTerminated, restarting, isSidecar bool) *containerProc {
 	cp := &containerProc{
-		name:         name,
-		spec:         &runtimev1.Container{Name: name},
+		name: name,
+		spec: &runtimev1.Container{Name: name},
+		// A never-STARTED Process, not a nil one: these fixtures stand for
+		// containers that were spawned (running or reaped), and liveContainersLocked
+		// now also drops entries with NO process — the never-started containers the
+		// partial-start contract tracks. A nil here would make every row of this
+		// table drop out for the wrong reason and the terminated filter untested.
+		// PID() is 0 and Done() never closes, so no signal path can act on it.
+		proc:         supervisor.NewProcess(nil, nil, supervisor.SpawnSpec{}, nil),
 		state:        &runtimev1.ContainerStatus{Name: name},
 		restarting:   restarting,
 		initDeclared: isSidecar,

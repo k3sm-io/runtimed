@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -196,6 +197,14 @@ func (p *pod) containerPIDs() []int {
 func liveContainersLocked(p *pod) []*containerProc {
 	out := make([]*containerProc, 0, len(p.containers))
 	for _, cp := range p.containers {
+		// A container that could not be started is tracked (it must report a
+		// Waiting status) but has NO process: it was never spawned, so there is
+		// nothing to sample, signal, or stop. Every consumer of this list
+		// dereferences cp.proc, so the filter is what keeps the partial-start
+		// contract from turning into a nil dereference in a root daemon.
+		if cp.proc == nil {
+			continue
+		}
 		if cp.state.GetState().GetTerminated() != nil {
 			continue
 		}
@@ -220,6 +229,14 @@ type containerProc struct {
 	// transient termination as a pod-terminal event (which would flip the pod to
 	// Succeeded/Failed and cancel the memory sampler). Guarded by pod.mu.
 	restarting bool
+	// starting marks a StartContainer call in flight for this never-started
+	// container (guarded by pod.mu). It is the claim that makes the verb
+	// single-flight: two concurrent starts would each spawn a process and the
+	// second would REPLACE the first's entry in p.containers, leaving a
+	// root-owned process group nothing tracks, reaps, or stops. The claim is
+	// released when the call returns — including after a resumed init sequence,
+	// which runs inside it.
+	starting bool
 	// initDeclared marks a container declared in the pod's INIT list. Combined
 	// with the retained spec's restart_policy it derives sidecar(); deriving the
 	// class from the spec (rather than copying a second flag) means a
@@ -470,6 +487,11 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// init_containers run first, sequentially; then the main containers start.
+	// The order, and what a failure of either class does to it, is startSequence
+	// — one implementation, shared with StartContainer's resume, so the two
+	// cannot drift. What follows is the sidecar half of that contract, which
+	// belongs with the pod being assembled here.
+	//
 	// A plain init container (restart_policy UNSPECIFIED — the byte-legacy apis
 	// contract) runs to completion before the next init step, as it always has.
 	// An init container with restart_policy always is a native sidecar (KEP-753,
@@ -485,40 +507,20 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// RestartContainer. The supervision runs under podCtx (detached from the
 	// request ctx), so an init container's exit is reaped even after CreatePod
 	// returns.
-	for _, c := range box.GetInitContainers() {
-		cp, reason, err := r.startContainer(podCtx, p, rootfs, c, true)
-		if err != nil {
-			return nil, reason, err
-		}
-		if cp.sidecar() {
-			p.mu.Lock()
-			p.containers = append(p.containers, cp)
-			p.mu.Unlock()
-			continue
-		}
-		code, _, werr := cp.proc.Wait(podCtx)
-		if werr != nil {
-			return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
-				fmt.Errorf("init container %s wait: %w", c.GetName(), werr)
-		}
-		if code != 0 {
-			return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
-				fmt.Errorf("init container %s exited %d", c.GetName(), code)
-		}
-	}
-
-	for _, c := range box.GetContainers() {
-		cp, reason, err := r.startContainer(podCtx, p, rootfs, c, false)
-		if err != nil {
-			return nil, reason, err
-		}
-		p.mu.Lock()
-		p.containers = append(p.containers, cp)
-		p.mu.Unlock()
+	if reason, err := r.startSequence(podCtx, p, rootfs, 0); err != nil {
+		return nil, reason, err
 	}
 
 	p.mu.Lock()
 	p.phase = runtimev1.PodPhase_POD_PHASE_RUNNING
+	// A container that could not be started holds the pod at Pending, checked
+	// before Running: upstream getPhase counts a Waiting container with no last
+	// termination first, so a pod with one running and one unresolvable image is
+	// Pending, not Running. CreatePod has just succeeded either way — the pod
+	// exists and the containers that could start are running.
+	if waitingContainersLocked(p) > 0 {
+		p.phase = runtimev1.PodPhase_POD_PHASE_PENDING
+	}
 	p.mu.Unlock()
 
 	// The memory sampler is armed by the caller (CreatePod), strictly after
@@ -973,6 +975,125 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 	}
 }
 
+// startSequence runs a pod's container start sequence: the init list from
+// initFrom onward, sequentially, and then every main container. It is the ONE
+// implementation of that order — createPod runs it from 0, and StartContainer
+// runs the remainder after healing a waiting init container — so the two can
+// never drift on sequencing, on what a failure does, or on which declaration
+// list a status lands in.
+//
+// # The two failure classes
+//
+// A CONTAINER-class failure (containerClassFailure: the image cannot be
+// resolved, pulled, verified, or turned into a run spec) does NOT fail the pod.
+// The container is recorded Waiting with its typed failure_reason and a bounded
+// message, and:
+//
+//   - a MAIN container's failure is local — the loop continues, and the pod ends
+//     up partly running, which is what the kubelet does when one container's
+//     image pull fails and its siblings' succeed;
+//   - an INIT container's failure stops the sequence — every later init
+//     container and every main is recorded Waiting with reason PodInitializing
+//     and no typed failure of its own, because they were never attempted.
+//
+// A POD-class failure (an unrunnable PodBox, the sandbox profile, the rootfs,
+// the spawn itself) is returned and fails CreatePod exactly as it always has:
+// nothing about the pod can run, so there is no partial state worth publishing.
+//
+// ctx is the pod-lifetime supervision context (p.supCtx), never a request ctx:
+// the spawns, kqueue reapers and drain-waits it starts must outlive the RPC that
+// triggered them.
+func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, initFrom int) (runtimev1.FailureReason, error) {
+	inits := p.box.GetInitContainers()
+	for i := initFrom; i < len(inits); i++ {
+		c := inits[i]
+		cp, reason, err := r.startContainer(ctx, p, rootfs, c, true)
+		if err != nil {
+			if !containerClassFailure(reason) {
+				return reason, err
+			}
+			r.log.Warn("init container could not be started; the rest of the pod waits",
+				"pod", p.box.GetPodId(), "container", c.GetName(), "reason", reason.String(), "err", err)
+			p.mu.Lock()
+			setContainerLocked(p, r.waitingContainerProc(p.box.GetPodId(), c, true, reason, "", boundedFailureMessage(err)))
+			r.blockRemainingLocked(p, i+1)
+			p.mu.Unlock()
+			return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+		}
+		p.mu.Lock()
+		setContainerLocked(p, cp)
+		p.mu.Unlock()
+		if reason, err := r.finishInitStep(ctx, p, cp); err != nil {
+			return reason, err
+		}
+	}
+
+	for _, c := range p.box.GetContainers() {
+		cp, reason, err := r.startContainer(ctx, p, rootfs, c, false)
+		if err != nil {
+			if !containerClassFailure(reason) {
+				return reason, err
+			}
+			r.log.Warn("container could not be started; it waits while the pod's other containers run",
+				"pod", p.box.GetPodId(), "container", c.GetName(), "reason", reason.String(), "err", err)
+			p.mu.Lock()
+			setContainerLocked(p, r.waitingContainerProc(p.box.GetPodId(), c, false, reason, "", boundedFailureMessage(err)))
+			p.mu.Unlock()
+			continue
+		}
+		p.mu.Lock()
+		setContainerLocked(p, cp)
+		p.mu.Unlock()
+	}
+	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// finishInitStep completes one init step for an already-spawned container: a
+// native sidecar is not waited (KEP-753 spawn-equals-started, so the sequence
+// proceeds while it runs), and a plain init container is waited to completion
+// and then dropped from the tracked set, which is where a completed init
+// container has always lived — nowhere.
+//
+// A non-zero exit or a failed wait is a POD-class SPAWN failure, unchanged: an
+// init container that ran and failed is not an image problem and has no waiting
+// reason in the kubelet vocabulary, so it stays the pod-level failure it was.
+func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc) (runtimev1.FailureReason, error) {
+	if cp.sidecar() {
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+	}
+	code, _, werr := cp.proc.Wait(ctx)
+	p.mu.Lock()
+	removeContainerLocked(p, cp.name)
+	p.mu.Unlock()
+	if werr != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+			fmt.Errorf("init container %s wait: %w", cp.name, werr)
+	}
+	if code != 0 {
+		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+			fmt.Errorf("init container %s exited %d", cp.name, code)
+	}
+	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// blockRemainingLocked records every init container from index fromInit onward,
+// and every main container, as Waiting with the kubelet's PodInitializing reason
+// and no typed failure: they did not fail, they were never reached, and that
+// distinction is the whole reason ContainerStateWaiting.failure_reason has an
+// UNSPECIFIED value. Caller holds p.mu.
+func (r *Runtime) blockRemainingLocked(p *pod, fromInit int) {
+	podID := p.box.GetPodId()
+	inits := p.box.GetInitContainers()
+	for i := fromInit; i < len(inits); i++ {
+		setContainerLocked(p, r.waitingContainerProc(podID, inits[i], true,
+			runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, waitingPodInitializing, ""))
+	}
+	for _, c := range p.box.GetContainers() {
+		setContainerLocked(p, r.waitingContainerProc(podID, c, false,
+			runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, waitingPodInitializing, ""))
+	}
+}
+
 // startContainer resolves the container's binary (image path convention),
 // ad-hoc signs + gates it, and spawns it under the pod's Seatbelt profile via the
 // exec-shim backend. It returns the running containerProc.
@@ -990,7 +1111,7 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
 	rb, err := r.resolveBinary(ctx, p, rootfs, c)
 	if err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err
+		return nil, resolveFailureReason(err), err
 	}
 
 	// Enforce the signature policy in the correct order relative to ad-hoc
@@ -1369,11 +1490,17 @@ func (r *Runtime) runTerminalTeardown(ctx context.Context, p *pod, td terminalTe
 // state-derived — trulyTerminalLocked depends on it, and specifically on the fact
 // that a main mid-restart holds the phase at Running.
 func (r *Runtime) recomputePhaseLocked(p *pod) {
+	waiting := waitingContainersLocked(p)
 	mains := 0
 	allTerminated := true
 	anyFailed := false
 	for _, cp := range p.containers {
-		if cp.sidecar() {
+		// Init-declared containers are excluded from the mains-only accounting:
+		// native sidecars by the apis restart_policy contract, and the WAITING
+		// entries the partial-start contract records for init containers that
+		// were never reached (a plain init container that ran is untracked the
+		// moment it completes, so it never reaches this loop).
+		if cp.initDeclared {
 			continue
 		}
 		mains++
@@ -1396,6 +1523,14 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 		return
 	}
 	switch {
+	case waiting > 0:
+		// kubelet getPhase order: a container that has not started yet holds the
+		// pod at Pending, ahead of both the running and the all-terminated arms.
+		// It cannot collide with the terminal arms — a Waiting container has no
+		// terminated state, so allTerminated is false whenever this fires — but
+		// the order is written out because it is the upstream one and a later
+		// reader must not "simplify" it into the default arm.
+		p.phase = runtimev1.PodPhase_POD_PHASE_PENDING
 	case allTerminated && anyFailed:
 		p.phase = runtimev1.PodPhase_POD_PHASE_FAILED
 	case allTerminated:
@@ -1471,6 +1606,211 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 // hello-native.yaml) executes. It is the with-command analog of the empty-command host-binary
 // convention below (there the image itself is the path; here command[0] is).
 const NativeImage = "native"
+
+// resolveError is a resolveBinary failure carrying the FailureReason the
+// container's Waiting state must publish. Every failure on that path is
+// classified at the point it is produced, because that is the only place the
+// cause is still known precisely: one bucket further out, "the reference does
+// not parse" and "the registry is down" are the same error value with different
+// text, and a consumer that had to tell them apart would be matching on strings
+// (GO-STANDARDS §Errors).
+//
+// It never REPLACES the cause. Unwrap keeps the chain intact, so every existing
+// caller that tests errors.Is(err, image.ErrRunSpecInvalid) — or any other
+// sentinel this path can produce — keeps working, and the classification is
+// additive information rather than a lossy re-wrap.
+type resolveError struct {
+	reason runtimev1.FailureReason
+	err    error
+}
+
+// Error renders the wrapped cause verbatim: the classification is for machines
+// (the typed reason), the message is for the operator.
+func (e *resolveError) Error() string { return e.err.Error() }
+
+// Unwrap keeps the original cause visible to errors.Is / errors.As.
+func (e *resolveError) Unwrap() error { return e.err }
+
+// resolveFailed classifies err with reason. It is the ONLY constructor of a
+// resolveError, so every classification site is greppable from here.
+func resolveFailed(reason runtimev1.FailureReason, err error) error {
+	return &resolveError{reason: reason, err: err}
+}
+
+// resolveFailureReason reports the typed reason err carries, defaulting to
+// IMAGE_PULL for an unclassified failure.
+//
+// The default is deliberate and matches the apis forward-compat rule stated on
+// ContainerStateWaiting.failure_reason: an unrecognized cause is treated as an
+// ordinary pull failure, which is the RETRYABLE bucket. Failing toward "retry"
+// rather than toward a terminal reason means an unclassified transient error
+// costs a retry, where the reverse would strand a pod that a retry would have
+// healed.
+func resolveFailureReason(err error) runtimev1.FailureReason {
+	var re *resolveError
+	if errors.As(err, &re) {
+		return re.reason
+	}
+	return runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL
+}
+
+// pullFailureReason classifies a Puller.Pull failure by sentinel, never by
+// message text.
+//
+// The pull policy is part of the classification and not an afterthought:
+// image.ErrImageNotPresent is returned both for a Never-policy container whose
+// image is absent (a terminal, operator-facing condition — the kubelet's
+// ErrImageNeverPull, which no retry can fix because no fetch will ever be
+// attempted) and, in principle, for any other path that decided presence. Only
+// the Never case is terminal, so only the Never case is typed as such.
+func pullFailureReason(c *runtimev1.Container, err error) runtimev1.FailureReason {
+	switch {
+	case errors.Is(err, image.ErrInvalidReference):
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME
+	case errors.Is(err, image.ErrImageNotPresent) &&
+		c.GetImagePullPolicy() == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER:
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL
+	case errors.Is(err, image.ErrNoPlatformMatch):
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH
+	default:
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL
+	}
+}
+
+// containerClassFailure reports whether reason describes a failure of ONE
+// CONTAINER rather than of the pod.
+//
+// The split is the whole of the partial-start contract: a container-class
+// failure leaves the pod created with that container Waiting and the others
+// running (the kubelet pulls each container's image independently), while a
+// pod-class failure — the sandbox profile, the rootfs, the spawn itself, an
+// unrunnable PodBox — means nothing about this pod can run and CreatePod fails
+// as it always has.
+//
+// SIGNATURE_REJECTED is container-class (m12-plan R1): containerd's image
+// verifier makes a rejected image an ordinary PullImage failure at the kubelet,
+// so the faithful surface is a Waiting container, not a dead pod.
+func containerClassFailure(reason runtimev1.FailureReason) bool {
+	switch reason {
+	case runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL,
+		runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
+		runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED:
+		return true
+	default:
+		return false
+	}
+}
+
+// waitingPodInitializing is the kubelet-verbatim reason for a container that has
+// not been reached yet because an earlier init container has not completed. It
+// is the ONE waiting reason string runtimed writes: it is not a failure (its
+// failure_reason is UNSPECIFIED) and so has no typed cause the provider could
+// translate from. Every FAILURE's reason string is left empty here and chosen by
+// the provider, which owns the kubelet vocabulary (ErrImagePull,
+// ImagePullBackOff, InvalidImageName, ErrImageNeverPull,
+// CreateContainerConfigError) because only it knows whether a retry is pending.
+const waitingPodInitializing = "PodInitializing"
+
+// maxWaitingMessageBytes bounds the error text published on a container's
+// Waiting state. The message reaches kubectl and the datastore through the
+// provider, and a pull error can carry registry-supplied bytes (see
+// image.boundErr), so it is capped and escaped here rather than adopted whole.
+const maxWaitingMessageBytes = 256
+
+// boundedFailureMessage renders err for ContainerStateWaiting.message: truncated
+// to maxWaitingMessageBytes and quoted to pure ASCII, the same treatment
+// pkg/image gives third-party error text (its quoteBounded is unexported, and
+// this is the runtime's single formatter for the same job — do not add a
+// second). QuoteToASCII escapes any invalid UTF-8 left by the cut, so a
+// mid-rune truncation cannot emit a malformed sequence downstream.
+func boundedFailureMessage(err error) string {
+	s := err.Error()
+	if len(s) > maxWaitingMessageBytes {
+		return strconv.QuoteToASCII(s[:maxWaitingMessageBytes]) + "..."
+	}
+	return strconv.QuoteToASCII(s)
+}
+
+// waitingContainerProc builds the tracked entry for a container that could not
+// be started: no process, no reap record, no supervision — only the status a
+// consumer must see. reason is the kubelet-verbatim reason string (empty for a
+// failure, which the provider names) and failure is the typed cause.
+//
+// It carries a real log buffer, empty, so `kubectl logs` on a waiting container
+// answers "nothing yet" instead of dereferencing a nil buffer.
+func (r *Runtime) waitingContainerProc(podID string, c *runtimev1.Container, isInit bool,
+	failure runtimev1.FailureReason, reason, message string) *containerProc {
+	return &containerProc{
+		name:         c.GetName(),
+		spec:         c,
+		initDeclared: isInit,
+		logs:         newLogBuffer(r.log.With("pod", podID, "container", c.GetName())),
+		state: &runtimev1.ContainerStatus{
+			Name:  c.GetName(),
+			Image: c.GetImage(),
+			State: &runtimev1.ContainerState{
+				Waiting: &runtimev1.ContainerStateWaiting{
+					Reason:        reason,
+					Message:       message,
+					FailureReason: failure,
+				},
+			},
+			VolumeMounts: volumeMountStatuses(c),
+		},
+	}
+}
+
+// setContainerLocked installs cp as the pod's entry for its name, REPLACING an
+// existing entry of that name (a waiting placeholder being started) or appending
+// a new one. Replacing in place preserves p.containers' start order, which
+// sidecarsLocked depends on for the reverse-order teardown. Caller holds p.mu.
+func setContainerLocked(p *pod, cp *containerProc) {
+	for i, existing := range p.containers {
+		if existing.name == cp.name {
+			p.containers[i] = cp
+			return
+		}
+	}
+	p.containers = append(p.containers, cp)
+}
+
+// waitingContainersLocked counts the pod's containers that are Waiting with no
+// last termination — upstream getPhase's "waiting" plus "pendingInitialization"
+// buckets, which both force Pending. Init-declared containers count too: a pod
+// whose init sequence is blocked is Pending exactly as one whose main is.
+//
+// The last-termination filter is what keeps CrashLoopBackOff out of it: a
+// container waiting between restarts carries the previous run's termination and
+// must not drag a Running pod back to Pending. Caller holds p.mu.
+func waitingContainersLocked(p *pod) int {
+	n := 0
+	for _, cp := range p.containers {
+		if cp.state.GetState().GetWaiting() != nil && cp.state.GetLastTerminationState() == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// removeContainerLocked drops the pod's entry for name, if any. It is how a
+// plain init container leaves the tracked set the moment it completes: the
+// long-lived container list holds running/waiting containers, and a completed
+// init container is neither (the model predates this change — an init container
+// that ran was never tracked at all; the WAITING placeholder a blocked sequence
+// leaves for one is what has to be cleared when it finally runs). Caller holds
+// p.mu.
+func removeContainerLocked(p *pod, name string) {
+	for i, cp := range p.containers {
+		if cp.name == name {
+			p.containers = append(p.containers[:i], p.containers[i+1:]...)
+			return
+		}
+	}
+}
 
 // resolvedBinary is what resolveBinary determined for one container: the on-disk
 // executable to confine, its argv, whether it is a host binary, and the image
@@ -1548,11 +1888,13 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// it would otherwise fall through and fail trying to fetch docker.io/library/native.
 	if c.GetImage() == NativeImage {
 		if len(cmd) == 0 {
-			return resolvedBinary{}, fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage)
+			return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("container %s: image %q requires a command (the host binary to run)", c.GetName(), NativeImage))
 		}
 		bin := cmd[0]
 		if !filepath.IsAbs(bin) {
-			return resolvedBinary{}, fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin)
+			return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("container %s: native command %q must be an absolute host path", c.GetName(), bin))
 		}
 		// No manifest exists on this route, so imageID stays empty (see the field).
 		return resolvedBinary{
@@ -1564,7 +1906,8 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 
 	if c.GetImage() == "" {
-		return resolvedBinary{}, fmt.Errorf("container %s: image is required", c.GetName())
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("container %s: image is required", c.GetName()))
 	}
 
 	// The discriminator, on the no-command route: the shape of the reference
@@ -1586,7 +1929,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// is passed only to the pull client below and never written to the pod dir.
 	cred, err := r.pullCredential(ctx, p.box, c.GetImage())
 	if err != nil {
-		return resolvedBinary{}, err
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL, err)
 	}
 
 	// Pull + materialize the image into the pod rootfs, then run command/args.
@@ -1596,7 +1939,8 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// pull-through. Nothing here re-derives a policy from the image tag.
 	res, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy())
 	if err != nil {
-		return resolvedBinary{}, fmt.Errorf("pull image %q: %w", c.GetImage(), err)
+		return resolvedBinary{}, resolveFailed(pullFailureReason(c, err),
+			fmt.Errorf("pull image %q: %w", c.GetImage(), err))
 	}
 	// Record the root, then release the lease — in that order, never reversed.
 	// Pull returns with its blobs pinned by a lease precisely because they are
@@ -1606,7 +1950,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// lease is what covers the instant before it exists.
 	if err := r.recordPodImage(p.box.GetPodId(), res.Manifest); err != nil {
 		res.Lease.Release()
-		return resolvedBinary{}, err
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err)
 	}
 	res.Lease.Release()
 
@@ -1628,11 +1972,13 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// so the only two outcomes are the whole image or an error.
 	policy, err := unpackPolicy(p.backend)
 	if err != nil {
-		return resolvedBinary{}, fmt.Errorf("container %s: %w", c.GetName(), err)
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			fmt.Errorf("container %s: %w", c.GetName(), err))
 	}
 	mat, err := r.unpacker.MaterializeTree(ctx, res.Manifest, policy, rootfs)
 	if err != nil {
-		return resolvedBinary{}, fmt.Errorf("materialize image %q: %w", c.GetImage(), err)
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			fmt.Errorf("materialize image %q: %w", c.GetImage(), err))
 	}
 	r.log.Debug("materialized image tree",
 		"pod", p.box.GetPodId(), "container", c.GetName(), "image", c.GetImage(),
@@ -1649,7 +1995,8 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// not about a second reading of the security context.
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
 	if err != nil {
-		return resolvedBinary{}, fmt.Errorf("read image config for %q: %w", c.GetImage(), err)
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			fmt.Errorf("read image config for %q: %w", c.GetImage(), err))
 	}
 	run, err := image.MergeRunSpec(runCfg, image.RunSpecRequest{
 		Container:    c,
@@ -1657,7 +2004,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		RunAsNonRoot: effectiveRunAsNonRoot(c),
 	})
 	if err != nil {
-		return resolvedBinary{}, err
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
 	}
 
 	// argv[0] is the merged program resolved inside this pod's materialized
@@ -1665,7 +2012,8 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// for why the leading slash carries no meaning on this route.
 	bin, err := resolveImageArgv0(rootfs, run.Argv[0])
 	if err != nil {
-		return resolvedBinary{}, fmt.Errorf("container %s: %w", c.GetName(), err)
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
+			fmt.Errorf("container %s: %w", c.GetName(), err))
 	}
 	argv := append([]string{}, run.Argv...)
 	argv[0] = bin

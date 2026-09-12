@@ -410,6 +410,12 @@ func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return
 // pull client.
 type fakePuller struct {
 	err error
+	// errByRef fails ONE reference, consulted before err, so a single CreatePod
+	// can have one container's image fail while another's succeeds — the seam the
+	// partial-start contract needs (a global err fails every container at once and
+	// can never observe a pod that is partly running). Guarded by mu, because a
+	// test flips an entry between calls to drive a retry from failing to healed.
+	errByRef map[string]error
 	// manifest, when set, is what Pull returns — so a test can control the
 	// resolved CONFIG digest a status must publish as image_id (B132). Nil keeps
 	// the historical empty manifest.
@@ -436,9 +442,13 @@ func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCre
 	f.lastPolicy = policy
 	f.lastPullPolicy = pull
 	mfst := f.manifest
+	err := f.errByRef[ref]
+	if err == nil {
+		err = f.err
+	}
 	f.mu.Unlock()
-	if f.err != nil {
-		return nil, f.err
+	if err != nil {
+		return nil, err
 	}
 	if mfst == nil {
 		mfst = &runtimev1.ImageManifest{}
@@ -453,6 +463,24 @@ func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCre
 		Descriptor: f.descriptor,
 		Platform:   plat.Normalize(),
 	}, nil
+}
+
+// failRef makes ref's next pull fail with err (see fakePuller.errByRef).
+func (f *fakePuller) failRef(ref string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.errByRef == nil {
+		f.errByRef = map[string]error{}
+	}
+	f.errByRef[ref] = err
+}
+
+// healRef drops ref's injected failure, so the next pull of it succeeds — the
+// "the registry came back" half of a retry test.
+func (f *fakePuller) healRef(ref string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.errByRef, ref)
 }
 
 // policy returns the last platform policy passed to Pull, so a test can assert
@@ -1105,17 +1133,37 @@ func TestCreatePodValidation(t *testing.T) {
 
 // TestCreatePodSignatureRejected drives the SignaturePolicy gate to a rejection
 // through the runtime spine (before exec).
+//
+// Since B119 a rejected signature is a CONTAINER-class failure, not a pod-level
+// one (m12-plan R1): containerd's image verifier makes a rejected image an
+// ordinary PullImage failure at the kubelet, so the faithful surface is the
+// container Waiting with the typed reason while the pod exists — not a
+// CreatePod that fails and leaves the operator nothing to look at. The gate the
+// test exists for is unchanged: the policy is enforced BEFORE exec, and the
+// typed reason is SIGNATURE_REJECTED.
 func TestCreatePodSignatureRejected(t *testing.T) {
+	const podID = "pod-sig"
 	signer := &fakeSigner{checkErr: image.ErrSignatureRejected}
-	rt := newTestRuntime(t, Deps{Signer: signer})
-	box := hostBinBox(rt, "pod-sig")
+	sp := &fakeSpawner{}
+	rt := newTestRuntime(t, Deps{Signer: signer, Spawner: sp})
+	box := hostBinBox(rt, podID)
 	box.SignaturePolicy = runtimev1.SignaturePolicy_SIGNATURE_POLICY_REQUIRE_SIGNED
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED {
-		t.Fatalf("reason = %v, want SIGNATURE_REJECTED", resp.GetFailureReason())
+	if resp.GetError() != nil {
+		t.Fatalf("CreatePod failed %v; a rejected signature leaves the pod created", resp.GetError())
+	}
+	w := statusNamed(t, rt, podID, "main").GetState().GetWaiting()
+	if w.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED {
+		t.Fatalf("waiting failure_reason = %v, want SIGNATURE_REJECTED", w.GetFailureReason())
+	}
+	sp.mu.Lock()
+	spawned := len(sp.specs)
+	sp.mu.Unlock()
+	if spawned != 0 {
+		t.Errorf("spawned %d processes past a rejected signature; the gate runs before exec", spawned)
 	}
 }
 

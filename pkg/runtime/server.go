@@ -168,7 +168,12 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	p.mu.Lock()
 	mains := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range p.containers {
-		if cp.sidecar() {
+		// Init-declared containers are not mains: native sidecars are stopped in
+		// phase 2 below, and an init container's tracked entry is either a
+		// never-spawned WAITING placeholder or the one init step currently
+		// running, neither of which belongs in the mains' concurrent stop. A
+		// container with no process has nothing to stop at all.
+		if cp.initDeclared || cp.proc == nil {
 			continue
 		}
 		mains = append(mains, cp.proc)
@@ -608,14 +613,21 @@ func (r *Runtime) findContainer(p *pod, name string) *containerProc {
 
 // createFailure builds a CreatePodResponse carrying a structured failure.
 func createFailure(reason runtimev1.FailureReason, err error) *runtimev1.CreatePodResponse {
-	code := codes.Internal
-	if errors.Is(err, errInvalidPodBox) {
-		code = codes.InvalidArgument
-	}
 	return &runtimev1.CreatePodResponse{
-		Error:         rpcStatus(code, "%s", err.Error()),
+		Error:         rpcStatus(failureCode(err), "%s", err.Error()),
 		FailureReason: reason,
 	}
+}
+
+// failureCode maps a pod/container start failure to its gRPC code: a PodBox the
+// caller wrote wrongly is InvalidArgument, everything else is the daemon's
+// problem. It is shared by CreatePod and StartContainer so one failure does not
+// get two codes depending on which verb hit it.
+func failureCode(err error) codes.Code {
+	if errors.Is(err, errInvalidPodBox) {
+		return codes.InvalidArgument
+	}
+	return codes.Internal
 }
 
 // rpcStatus builds a google.rpc.Status with a gRPC code and formatted message.

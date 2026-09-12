@@ -71,6 +71,18 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 			"container %s not found in pod %s", req.GetContainer(), req.GetPodId()), nil
 	}
+	// A container that NEVER STARTED has no process to terminate and no run to
+	// record: it is Waiting because its start failed before the spawn (the
+	// partial-start contract). This verb's whole contract — terminate, re-spawn,
+	// bump restart_count, record last_termination_state — is meaningless for one,
+	// and every line below dereferences oldCP.proc, which supervisor.Process does
+	// not nil-guard. runtimed is the node's in-process runtime, so that panic
+	// would be node-scoped; refuse instead, and name the verb that does apply.
+	if oldCP.proc == nil {
+		return restartFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			"restart %s/%s: container has not started; use StartContainer",
+			req.GetPodId(), req.GetContainer()), nil
+	}
 
 	// Snapshot the old process + spec, and flag the container as restarting so the
 	// kqueue reaper's watchContainerExit does not conclude the pod terminal (which

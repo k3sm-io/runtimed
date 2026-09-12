@@ -75,6 +75,19 @@ func (c *RegistryCredential) authenticator() authn.Authenticator {
 // backend is decided per pod, so it cannot be fixed at Puller construction.
 type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error)
 
+// ErrInvalidReference is the decided verdict for an image reference that is not
+// a well-formed OCI reference at all. It is terminal: no round trip was made and
+// no retry can help, because parsing the same string again yields the same
+// answer — which is what separates it from every other pull failure.
+//
+// It exists so a consumer can classify the failure with errors.Is instead of
+// matching go-containerregistry's message text (GO-STANDARDS §Errors); the
+// runtime maps it to the kubelet's InvalidImageName waiting reason. The parser's
+// own error stays in the chain, bounded (boundErr), because it names the
+// offending reference and a caller-supplied string is DATA, never a message to
+// adopt.
+var ErrInvalidReference = errors.New("image reference does not parse")
+
 // RemoteFetch fetches ref from a remote registry, resolving a multi-platform
 // image to the one manifest policy allows. It is the production FetchFunc, and
 // it is GLUE: every decision it makes lives in the pure, exported seams of
@@ -101,7 +114,7 @@ type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, p
 func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
 	r, err := name.ParseReference(ref)
 	if err != nil {
-		return nil, fmt.Errorf("parse reference %q: %w", ref, boundErr(err))
+		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
 	return remoteFetch(ctx, r, ref, cred, policy)
 }

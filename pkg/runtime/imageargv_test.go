@@ -79,8 +79,11 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 		// hostBinary records whether the row is a host-binary route, where the
 		// signature gate must check and never ad-hoc sign.
 		hostBinary bool
-		// wantErrContains, when set, makes the row a refusal: CreatePod must fail
-		// with a message containing it and nothing may be spawned.
+		// wantErrContains, when set, makes the row a refusal: the CONTAINER is
+		// refused — CreatePod succeeds, that container is Waiting with
+		// FAILURE_REASON_CONTAINER_CONFIG and a message containing this text,
+		// and nothing may be spawned or signed for it (B119's partial-start
+		// contract; before it, the whole CreatePod call failed).
 		wantErrContains string
 	}{
 		{
@@ -196,11 +199,19 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 			}
 
 			if tc.wantErrContains != "" {
-				if resp.GetError() == nil {
-					t.Fatalf("CreatePod succeeded; want a refusal mentioning %q (argv[0] resolved to %v)",
-						tc.wantErrContains, backend.lastArgv())
+				if resp.GetError() != nil {
+					t.Fatalf("CreatePod failed %v; a container whose argv[0] is refused leaves the POD created",
+						resp.GetError())
 				}
-				if got := resp.GetError().GetMessage(); !strings.Contains(got, tc.wantErrContains) {
+				w := statusNamed(t, rt, podID, "main").GetState().GetWaiting()
+				if w == nil {
+					t.Fatalf("container state = %v, want Waiting (argv[0] resolved to %v)",
+						statusNamed(t, rt, podID, "main").GetState(), backend.lastArgv())
+				}
+				if w.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG {
+					t.Errorf("waiting failure_reason = %v, want CONTAINER_CONFIG", w.GetFailureReason())
+				}
+				if got := w.GetMessage(); !strings.Contains(got, tc.wantErrContains) {
 					t.Errorf("refusal = %q, want it to mention %q", got, tc.wantErrContains)
 				}
 				if n := backend.calls(); n != 0 {
