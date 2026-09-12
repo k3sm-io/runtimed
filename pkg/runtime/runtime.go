@@ -113,6 +113,22 @@ type Signer interface {
 //
 // The resolved credential is consumed only by the image pull client and is never
 // written into the pod dir / materialized filesystem — the security invariant.
+//
+// # The error contract
+//
+// An implementation READS Secret bytes to do its job, so its ERRORS are part of
+// that invariant: a returned error must name only the failure class and the
+// operator's own references (the Secret name, the namespace, the image), and must
+// NEVER quote, echo, or paraphrase Secret content — not the auth blob it could
+// not decode, not the field it could not parse, not a prefix of either. Sentinel
+// errors wrapped with those references are the shape that satisfies this.
+//
+// The runtime does not rely on that contract alone. Whatever it receives is
+// bounded and ASCII-quoted before it reaches any sink (pullCredential), and the
+// caller-facing status message carries a fixed sentence built from the pod's own
+// imagePullSecret names rather than the resolver's text at all — because a
+// waiting message reaches `kubectl describe pod`, and the node log reaches every
+// local account on the machine.
 type CredentialResolver interface {
 	// PullCredential returns the credential for pulling ref given the pod's
 	// namespace-local imagePullSecret references, or ok=false for an anonymous pull.

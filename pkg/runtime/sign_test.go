@@ -159,7 +159,12 @@ func TestGateSignatureOrdering(t *testing.T) {
 // fakeCredentialResolver returns a fixed credential and records what it was asked
 // to resolve (the CredentialResolver seam).
 type fakeCredentialResolver struct {
-	cred       *image.RegistryCredential
+	cred *image.RegistryCredential
+	// err makes the resolution itself fail — an imagePullSecret that is absent,
+	// malformed, or unreadable. It is the only way to reach the
+	// IMAGE_PULL_CREDENTIAL classification, which is a failure BEFORE any
+	// registry round trip and so cannot be produced by failing the puller.
+	err        error
 	gotNS      string
 	gotSecrets []*runtimev1.LocalObjectReference
 }
@@ -167,6 +172,9 @@ type fakeCredentialResolver struct {
 func (f *fakeCredentialResolver) PullCredential(_ context.Context, ns string, secrets []*runtimev1.LocalObjectReference, _ string) (*image.RegistryCredential, bool, error) {
 	f.gotNS = ns
 	f.gotSecrets = secrets
+	if f.err != nil {
+		return nil, false, f.err
+	}
 	if f.cred == nil {
 		return nil, false, nil
 	}

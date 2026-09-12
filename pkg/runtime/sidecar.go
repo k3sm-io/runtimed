@@ -63,6 +63,12 @@ func liveSidecarsLocked(p *pod) []*containerProc {
 func (r *Runtime) stopSidecars(ctx context.Context, podID string, sidecars []*containerProc, deadline time.Time) {
 	for i := len(sidecars) - 1; i >= 0; i-- {
 		cp := sidecars[i]
+		// A sidecar that never spawned (its start failed before the process
+		// existed — the partial-start contract) has no process to stop, and
+		// supervisor.Process does not nil-guard PID.
+		if cp.proc == nil {
+			continue
+		}
 		pid := cp.proc.PID()
 		if pid <= 0 {
 			continue

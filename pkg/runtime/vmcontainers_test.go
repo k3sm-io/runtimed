@@ -24,11 +24,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 
+	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -52,6 +54,18 @@ import (
 // consistent (Unpacker's doc: the tree and the config come from one image).
 type imageWorld struct {
 	cfgs map[string]image.ImageRunConfig
+	// indexHits names the references this world answers WITHOUT a registry
+	// round trip — the PullResult.Fetched=false shape. A reference absent from
+	// the map is fetched, which is the ordinary case and so the default.
+	indexHits map[string]bool
+	// errs makes a named reference's pull fail with a chosen error, which is the
+	// only way to drive the pull-failure classification through the real path:
+	// the sentinel is what pullFailureReason reads, never the message.
+	errs map[string]error
+	// delays holds a reference's pull for a fixed span, so a duration assertion
+	// has a real lower bound to test against instead of a zero it cannot
+	// distinguish from an unstamped field.
+	delays map[string]time.Duration
 
 	mu           sync.Mutex
 	pulled       []string
@@ -63,13 +77,47 @@ func newImageWorld(cfgs map[string]image.ImageRunConfig) *imageWorld {
 	return &imageWorld{cfgs: cfgs}
 }
 
+// servesFromIndex marks ref as answered from the local index (no registry round
+// trip), returning the world so a fixture reads as one expression.
+func (w *imageWorld) servesFromIndex(ref string) *imageWorld {
+	if w.indexHits == nil {
+		w.indexHits = map[string]bool{}
+	}
+	w.indexHits[ref] = true
+	return w
+}
+
+// failsWith makes ref's pull fail with err.
+func (w *imageWorld) failsWith(ref string, err error) *imageWorld {
+	if w.errs == nil {
+		w.errs = map[string]error{}
+	}
+	w.errs[ref] = err
+	return w
+}
+
+// takes makes ref's pull last at least d.
+func (w *imageWorld) takes(ref string, d time.Duration) *imageWorld {
+	if w.delays == nil {
+		w.delays = map[string]time.Duration{}
+	}
+	w.delays[ref] = d
+	return w
+}
+
 func (w *imageWorld) Pull(_ context.Context, ref string, _ *image.RegistryCredential, policy image.PlatformPolicy, _ runtimev1.ImagePullPolicy) (*image.PullResult, error) {
 	w.mu.Lock()
 	w.pulled = append(w.pulled, ref)
 	w.policies = append(w.policies, policy)
 	w.mu.Unlock()
+	if err, ok := w.errs[ref]; ok {
+		return nil, err
+	}
 	if _, ok := w.cfgs[ref]; !ok {
 		return nil, fmt.Errorf("no image %q in this world", ref)
+	}
+	if d := w.delays[ref]; d > 0 {
+		time.Sleep(d)
 	}
 	return &image.PullResult{
 		Manifest: &runtimev1.ImageManifest{
@@ -77,6 +125,10 @@ func (w *imageWorld) Pull(_ context.Context, ref string, _ *image.RegistryCreden
 			Config:    &runtimev1.Descriptor{Digest: "sha256:" + strings.Repeat("a", 64)},
 		},
 		CacheHit: true,
+		// The fact ContainerStatus.image_pull is made of: whether a registry was
+		// contacted. It is not CacheHit inverted (see image.PullResult.Fetched),
+		// which is why this world sets the two independently.
+		Fetched: !w.indexHits[ref],
 	}, nil
 }
 
@@ -106,8 +158,17 @@ func (w *imageWorld) observed() (pulled []string, policies []image.PlatformPolic
 // alignment included — see vmPodConfig).
 func newVMImageRuntime(t *testing.T, w *imageWorld) (*Runtime, *fakeVMBackend) {
 	t.Helper()
+	return newVMImageRuntimeWith(t, w, Deps{})
+}
+
+// newVMImageRuntimeWith is newVMImageRuntime with the caller's own extra seams
+// (the credential resolver, for the one classification that fails before any
+// pull is attempted) filled in around the image world.
+func newVMImageRuntimeWith(t *testing.T, w *imageWorld, d Deps) (*Runtime, *fakeVMBackend) {
+	t.Helper()
 	vmb := &fakeVMBackend{available: true, bootOK: true}
-	cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: w, Unpacker: w})
+	d.VMBackend, d.Puller, d.Unpacker = vmb, w, w
+	cfg, d := vmPodConfig(t, d)
 	return newTestRuntimeCfg(t, cfg, d), vmb
 }
 
@@ -601,4 +662,154 @@ func containsInt64(xs []int64, v int64) bool {
 		}
 	}
 	return false
+}
+
+// TestVMContainerStatusReportsTheImagePullOutcome is the vm half of the
+// image_pull gate: the fact is produced host-side, at plan time, and has to
+// survive into a status folded from a guest event that knows nothing about it.
+//
+// The two shapes are both driven, because the whole point of the field is that a
+// consumer can choose between the kubelet's two Pulled messages without guessing:
+// a container whose image was fetched reports pulled=true with the resolution's
+// wall time, and one served from the node's local index reports pulled=false.
+// The init container carries it too — an init container's image is pulled
+// exactly like a main's, and its status rides a different list.
+func TestVMContainerStatusReportsTheImagePullOutcome(t *testing.T) {
+	const (
+		fetchRef = "docker.io/library/app:1"
+		hitRef   = "docker.io/library/initdb:1"
+		pullTook = 20 * time.Millisecond
+	)
+	w := newImageWorld(map[string]image.ImageRunConfig{
+		fetchRef: {Entrypoint: []string{"/app"}},
+		hitRef:   {Entrypoint: []string{"/initdb"}},
+	}).servesFromIndex(hitRef).takes(fetchRef, pullTook)
+	rt, vmb := newVMImageRuntime(t, w)
+
+	box := vmBoxWith(rt, "pod-vm-pull",
+		[]*runtimev1.Container{{Name: "init", Image: hitRef}},
+		[]*runtimev1.Container{{Name: "app", Image: fetchRef}})
+	// The real assembly, then the real fold: createPod returns the pod
+	// createVMPod built, and the guest event is applied to it exactly as the
+	// ContainerEvents watcher applies one.
+	p, _, err := rt.createPod(context.Background(), box)
+	if err != nil {
+		t.Fatalf("createPod: %v", err)
+	}
+	if n, _ := vmb.created(); n != 1 {
+		t.Fatalf("CreateVM called %d times, want 1", n)
+	}
+	for _, name := range []string{"init", "app"} {
+		rt.applyGuestContainerEvent(p, &guestv1.ContainerEvent{
+			Container: name,
+			Started:   &guestv1.ContainerStarted{Pid: 7},
+		})
+	}
+
+	st := rt.podStatus(p)
+	inits, mains := st.GetInitContainerStatuses(), st.GetContainerStatuses()
+	if len(inits) != 1 || len(mains) != 1 {
+		t.Fatalf("statuses = %d init / %d main, want 1 / 1", len(inits), len(mains))
+	}
+
+	main := mains[0].GetImagePull()
+	if main == nil {
+		t.Fatal("the main container's status carries no image_pull, so a consumer cannot tell a fetch from a local hit")
+	}
+	if !main.GetPulled() {
+		t.Error("pulled = false for an image the puller reported it fetched")
+	}
+	if got := main.GetDuration().AsDuration(); got < pullTook {
+		t.Errorf("duration = %v, want at least the %v the pull took — the field must measure the image step, not report a zero", got, pullTook)
+	}
+
+	init := inits[0].GetImagePull()
+	if init == nil {
+		t.Fatal("the init container's status carries no image_pull; an init image is pulled exactly like a main's")
+	}
+	if init.GetPulled() {
+		t.Error("pulled = true for an image served from the local index — that is the 'already present on machine' shape")
+	}
+	if init.GetDuration() == nil {
+		t.Error("a local hit reports no duration; it is the time spent proving the image was there, not an absence")
+	}
+}
+
+// TestVMImagePullFailureIsTypedLikeTheHostSpine pins the vm path to the SAME
+// classification the host-process spine applies (pullFailureReason), so the
+// provider reads one taxonomy whichever runtime ran the pod. Before this, every
+// vm image failure — an unparseable reference, a Never-policy image that is
+// absent, an image with no matching platform, an unreadable imagePullSecret —
+// arrived as the generic retryable IMAGE_PULL, and the provider retried three
+// terminal conditions forever.
+//
+// A vm image failure still fails the WHOLE pod: createVMPod pulls before it
+// builds the machine, and a vm pod has no per-container partial-start surface to
+// leave a single container Waiting in (the guest starts every container itself).
+// Only the reason is corrected here.
+func TestVMImagePullFailureIsTypedLikeTheHostSpine(t *testing.T) {
+	const ref = "docker.io/library/app:1"
+	cases := []struct {
+		name       string
+		pullErr    error
+		credErr    error
+		pullPolicy runtimev1.ImagePullPolicy
+		want       runtimev1.FailureReason
+	}{{
+		name:    "unparseable-reference-is-INVALID_IMAGE_NAME",
+		pullErr: fmt.Errorf("parse %q: %w", ref, image.ErrInvalidReference),
+		want:    runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME,
+	}, {
+		// Terminal by construction: the policy forbids the fetch that would fix
+		// it, so a retry cannot succeed. This is the kubelet's ErrImageNeverPull.
+		name:       "absent-under-Never-is-IMAGE_NEVER_PULL",
+		pullErr:    fmt.Errorf("%q: %w", ref, image.ErrImageNotPresent),
+		pullPolicy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
+		want:       runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL,
+	}, {
+		name:    "no-platform-match-is-IMAGE_NO_PLATFORM_MATCH",
+		pullErr: fmt.Errorf("%q: %w", ref, image.ErrNoPlatformMatch),
+		want:    runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+	}, {
+		// Fails BEFORE any registry round trip, which is why no pull error can
+		// produce it and the resolver has to be the thing that fails.
+		name:    "unresolvable-imagePullSecret-is-IMAGE_PULL_CREDENTIAL",
+		credErr: errors.New("secret regcred is not a docker config"),
+		want:    runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL,
+	}, {
+		// The default, restated here so the table says what an unclassified
+		// failure is: retryable, never terminal.
+		name:    "an-unclassified-failure-stays-IMAGE_PULL",
+		pullErr: errors.New("registry is down"),
+		want:    runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newImageWorld(map[string]image.ImageRunConfig{ref: {Entrypoint: []string{"/app"}}})
+			if tc.pullErr != nil {
+				w.failsWith(ref, tc.pullErr)
+			}
+			deps := Deps{}
+			if tc.credErr != nil {
+				deps.Credentials = &fakeCredentialResolver{err: tc.credErr}
+			}
+			rt, vmb := newVMImageRuntimeWith(t, w, deps)
+			box := vmBoxWith(rt, "pod-vm-imgfail", nil,
+				[]*runtimev1.Container{{Name: "app", Image: ref, ImagePullPolicy: tc.pullPolicy}})
+			if tc.credErr != nil {
+				box.ImagePullSecrets = []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+			}
+
+			_, reason, err := rt.createPod(context.Background(), box)
+			if err == nil {
+				t.Fatal("a failed image resolution must fail the vm pod")
+			}
+			if reason != tc.want {
+				t.Errorf("reason = %v, want %v — the provider reads this taxonomy to decide whether a retry can help", reason, tc.want)
+			}
+			if n, _ := vmb.created(); n != 0 {
+				t.Errorf("CreateVM called %d times after a failed image resolution; must be 0", n)
+			}
+		})
+	}
 }

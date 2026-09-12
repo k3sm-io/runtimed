@@ -75,6 +75,19 @@ func (c *RegistryCredential) authenticator() authn.Authenticator {
 // backend is decided per pod, so it cannot be fixed at Puller construction.
 type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error)
 
+// ErrInvalidReference is the decided verdict for an image reference that is not
+// a well-formed OCI reference at all. It is terminal: no round trip was made and
+// no retry can help, because parsing the same string again yields the same
+// answer — which is what separates it from every other pull failure.
+//
+// It exists so a consumer can classify the failure with errors.Is instead of
+// matching go-containerregistry's message text (GO-STANDARDS §Errors); the
+// runtime maps it to the kubelet's InvalidImageName waiting reason. The parser's
+// own error stays in the chain, bounded (boundErr), because it names the
+// offending reference and a caller-supplied string is DATA, never a message to
+// adopt.
+var ErrInvalidReference = errors.New("image reference does not parse")
+
 // RemoteFetch fetches ref from a remote registry, resolving a multi-platform
 // image to the one manifest policy allows. It is the production FetchFunc, and
 // it is GLUE: every decision it makes lives in the pure, exported seams of
@@ -101,7 +114,7 @@ type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, p
 func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
 	r, err := name.ParseReference(ref)
 	if err != nil {
-		return nil, fmt.Errorf("parse reference %q: %w", ref, boundErr(err))
+		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
 	return remoteFetch(ctx, r, ref, cred, policy)
 }
@@ -228,6 +241,22 @@ type PullResult struct {
 	// CacheHit is true when the config and all layers were already cached (no
 	// blob was newly written) — i.e. a second pull of the same content.
 	CacheHit bool
+
+	// Fetched reports whether this result required a REGISTRY ROUND TRIP: true
+	// when the reference was resolved against a registry (the upstream one, this
+	// node's own ingest registry, or a cluster mirror), false when it was served
+	// from the local index without contacting anything.
+	//
+	// It is NOT CacheHit inverted, and the two must not be conflated. CacheHit
+	// answers "did this pull write any blob", which is false for an Always pull
+	// of content already on disk — a pull that did contact a registry, re-resolve
+	// the tag and could have found a different digest. Fetched answers the
+	// question a consumer building the kubelet's Pulled event asks instead:
+	// "Successfully pulled image %q in %v" describes a round trip, and "Container
+	// image %q already present on machine" describes its absence. Reporting the
+	// second for an Always pull would tell an operator no registry was consulted
+	// when one was.
+	Fetched bool
 
 	// Descriptor is the resolved manifest's OWN content descriptor: media type,
 	// digest (what a user reads as the image id) and size.
@@ -520,8 +549,12 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 			// manifest blob to hash, so re-deriving it would report a different
 			// image id for a warm serve than the pull that recorded it did.
 			return &PullResult{
-				Manifest:   entry.Manifest,
-				CacheHit:   true,
+				Manifest: entry.Manifest,
+				CacheHit: true,
+				// The one path that answers without a round trip, stated
+				// explicitly rather than left to the zero value: this is the
+				// fact a consumer reports as "already present on machine".
+				Fetched:    false,
 				Descriptor: entry.Descriptor,
 				Platform:   entry.Platform,
 				Lease:      lease,
@@ -731,8 +764,15 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 	}
 
 	return &PullResult{
-		Manifest:   out,
-		CacheHit:   !wroteAny,
+		Manifest: out,
+		CacheHit: !wroteAny,
+		// ingest is reached only with bytes in hand, and it is the ONE
+		// constructor every fetching path funnels through — the upstream fetch,
+		// the node's ingest registry, and each cluster-mirror candidate — so
+		// this is where "a registry was contacted" is true for all three at
+		// once. It stays true when !wroteAny: the round trip happened whether or
+		// not it produced a new blob.
+		Fetched:    true,
 		Descriptor: desc,
 		Platform:   resolved,
 		Lease:      lease,

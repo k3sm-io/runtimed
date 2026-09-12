@@ -103,6 +103,13 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// p.cancel below tears down any sampler that slipped through (it is rooted at
 	// p.supCtx).
 	p.mu.Lock()
+	// Close the pod to new process groups BEFORE anything is snapshotted. Every
+	// spawn path re-checks this flag under p.mu immediately before it installs
+	// its result (see pod.stopping / installSpawned), so from here on a start
+	// that is already in flight kills its own process group instead of adding an
+	// untracked one to a pod whose teardown has already decided what it will
+	// signal.
+	p.stopping = true
 	memCancel := p.memCancel
 	p.mu.Unlock()
 	if memCancel != nil {
@@ -166,14 +173,26 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	deadline := time.Now().Add(grace)
 
 	p.mu.Lock()
+	signalled := make(map[*supervisor.Process]struct{}, len(p.containers))
 	mains := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range p.containers {
-		if cp.sidecar() {
+		// Init-declared containers are not mains: native sidecars are stopped in
+		// phase 2 below, and an init container's tracked entry is either a
+		// never-spawned WAITING placeholder or the one init step currently
+		// running, neither of which belongs in the mains' concurrent stop. A
+		// container with no process has nothing to stop at all.
+		if cp.initDeclared || cp.proc == nil {
 			continue
 		}
 		mains = append(mains, cp.proc)
+		signalled[cp.proc] = struct{}{}
 	}
 	sidecars := sidecarsLocked(p)
+	for _, cp := range sidecars {
+		if cp.proc != nil {
+			signalled[cp.proc] = struct{}{}
+		}
+	}
 	// Claim the sidecar teardown for THIS delete: the main exits phase 1 induces
 	// would otherwise conclude the pod in watchContainerExit and trigger the
 	// voluntary-completion teardown concurrently with phase 2 (a double stop).
@@ -237,6 +256,41 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// refuses to die.
 	if p.cancel != nil {
 		p.cancel()
+	}
+
+	// The snapshot above is a moment in time. Every install path now consults
+	// p.stopping under p.mu — StartContainer, RestartContainer and the start
+	// sequence all reach p.containers through installContainerLocked, which
+	// refuses a stopping pod and leaves its caller to SIGKILL the group it was
+	// holding — so no path in this daemon is expected to land a process here.
+	//
+	// The sweep stays anyway, as defense in depth: it is the backstop for a
+	// FUTURE install path that writes p.containers without going through the
+	// installer, and for a group that landed in the window between the snapshot
+	// and p.stopping being observed. Re-read the list now that supervision is
+	// cancelled and signal anything that appeared since — this is the last point
+	// at which a process group belonging to this pod is still nameable, because
+	// the durable reap records that would otherwise find it are removed at the
+	// end of this call.
+	p.mu.Lock()
+	late := make([]*supervisor.Process, 0, len(p.containers))
+	for _, cp := range liveContainersLocked(p) {
+		if _, ok := signalled[cp.proc]; !ok {
+			late = append(late, cp.proc)
+		}
+	}
+	p.mu.Unlock()
+	for _, proc := range late {
+		pid := proc.PID()
+		if pid <= 0 {
+			continue
+		}
+		r.log.Warn("SIGKILLing a container process that appeared during teardown",
+			"pod", req.GetPodId(), "pid", pid)
+		if _, _, err := supervisor.GracefulStop(context.WithoutCancel(ctx), pid, 0, proc.Done(),
+			termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+			r.log.Warn("sigkill a late pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
+		}
 	}
 
 	st := r.podStatus(p)
@@ -608,14 +662,21 @@ func (r *Runtime) findContainer(p *pod, name string) *containerProc {
 
 // createFailure builds a CreatePodResponse carrying a structured failure.
 func createFailure(reason runtimev1.FailureReason, err error) *runtimev1.CreatePodResponse {
-	code := codes.Internal
-	if errors.Is(err, errInvalidPodBox) {
-		code = codes.InvalidArgument
-	}
 	return &runtimev1.CreatePodResponse{
-		Error:         rpcStatus(code, "%s", err.Error()),
+		Error:         rpcStatus(failureCode(err), "%s", err.Error()),
 		FailureReason: reason,
 	}
+}
+
+// failureCode maps a pod/container start failure to its gRPC code: a PodBox the
+// caller wrote wrongly is InvalidArgument, everything else is the daemon's
+// problem. It is shared by CreatePod and StartContainer so one failure does not
+// get two codes depending on which verb hit it.
+func failureCode(err error) codes.Code {
+	if errors.Is(err, errInvalidPodBox) {
+		return codes.InvalidArgument
+	}
+	return codes.Internal
 }
 
 // rpcStatus builds a google.rpc.Status with a gRPC code and formatted message.

@@ -663,14 +663,25 @@ func (e *boundedError) Error() string { return quoteBounded(e.err.Error(), maxWr
 // Unwrap keeps the original cause visible to errors.Is / errors.As.
 func (e *boundedError) Unwrap() error { return e.err }
 
-// quoteBounded truncates s to max bytes and renders it as a quoted ASCII Go
+// QuoteBounded truncates s to max bytes and renders it as a quoted ASCII Go
 // literal. QuoteToASCII escapes every non-ASCII rune as \u.... and any invalid
 // UTF-8 byte left by the cut as \x.., so the result is pure ASCII: a mid-rune
 // truncation cannot emit a malformed sequence, and no later byte-boundary cut of
 // a message built from it can create one either (see sanitizeToken).
-func quoteBounded(s string, max int) string {
+//
+// It is exported because the same job exists one layer up: pkg/runtime renders
+// foreign error text into ContainerStateWaiting.message, which travels to the
+// provider, into the datastore and out through kubectl. That formatter used to
+// be a byte-for-byte copy of this one, and two copies of a safety rule drift —
+// the copy is the reason this function has a name a consumer can call.
+func QuoteBounded(s string, max int) string {
 	if len(s) > max {
 		return strconv.QuoteToASCII(s[:max]) + "..."
 	}
 	return strconv.QuoteToASCII(s)
 }
+
+// quoteBounded is the package-internal spelling of QuoteBounded, kept so this
+// package's ~150 call sites stay short and unexported-looking. One
+// implementation, two names.
+func quoteBounded(s string, max int) string { return QuoteBounded(s, max) }

@@ -18,7 +18,12 @@ package runtime
 
 import (
 	"context"
+	"os"
+	"sync"
 	"testing"
+	"time"
+
+	"k3sm.io/runtimed/pkg/image"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -105,4 +110,108 @@ func TestRestartContainerReExecs(t *testing.T) {
 
 	// Release the post-restart container so its supervision goroutine ends.
 	w.release(1002)
+}
+
+// TestRestartContainerDuringDeleteKillsTheLateSpawn is the F3 teardown-completeness
+// gate for RestartContainer, the sibling of the StartContainer one
+// (TestDeletePodKillsASpawnThatLandsDuringTeardown).
+//
+// # Why this is not vacuous
+//
+// StartContainer re-checks pod.stopping immediately before it installs its spawn
+// and kills the group when the pod is going away; the start sequence does the
+// same through installSpawned. RestartContainer did neither — it walked
+// p.containers itself and wrote the replacement straight in. So a liveness
+// restart racing a delete installed a root-owned process group into a pod whose
+// teardown had already snapshotted what it would signal and had removed its
+// durable reap records: nothing signals it, nothing reaps it, and it survives a
+// daemon restart. The slowPuller's notify channel puts the re-spawn strictly
+// inside the delete rather than hoping for it, so the window is reproduced and
+// not merely hinted at.
+func TestRestartContainerDuringDeleteKillsTheLateSpawn(t *testing.T) {
+	const (
+		podID = "pod-restartrace"
+		ref   = "example.com/app:v1"
+	)
+	sp := &fakeSpawner{}
+	w := newBlockingWaiter()
+	kills := newKillLog()
+	slow := &slowPuller{inner: &fakePuller{}, delay: 25 * time.Millisecond}
+	rt := newTestRuntime(t, Deps{
+		Puller:   slow,
+		Spawner:  sp,
+		Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}},
+		Waiter:   w,
+	})
+	// The signal seam does double duty: it records every group this daemon
+	// signals (the assertion below) and releases the fake waiter for the pid, so
+	// a killed process is observed to exit and the restart can proceed past its
+	// wait. The release is deduplicated because one pid is legitimately signalled
+	// twice here — the restart kills the old group, and DeletePod's teardown
+	// stops the same entry, which is still what p.containers holds — and
+	// blockingWaiter.release closes a channel.
+	var relMu sync.Mutex
+	released := map[int]bool{}
+	rt.signalGroup = func(pgid int, sig os.Signal) error {
+		_ = kills.signal(pgid, sig)
+		relMu.Lock()
+		first := !released[pgid]
+		released[pgid] = true
+		relMu.Unlock()
+		if first {
+			w.release(pgid)
+		}
+		return nil
+	}
+	mustCreatePod(t, rt, pullBox(rt, podID, raceContainer("main", ref)))
+
+	// Arm AFTER CreatePod: the same reference is pulled there, and a trigger that
+	// fired on it would release the delete before the restart's re-spawn began.
+	notified := slow.arm(ref)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var restartResp *runtimev1.RestartContainerResponse
+	go func() {
+		defer wg.Done()
+		got, err := rt.RestartContainer(context.Background(),
+			&runtimev1.RestartContainerRequest{PodId: podID, Container: "main", Reason: "liveness probe failed"})
+		if err != nil {
+			t.Errorf("RestartContainer: %v", err)
+			return
+		}
+		restartResp = got
+	}()
+
+	// Delete only once the re-spawn is committed to a pull it cannot abandon.
+	<-notified
+	if _, err := rt.DeletePod(context.Background(),
+		&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: 0}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	wg.Wait()
+
+	if restartResp.GetError() == nil {
+		t.Fatalf("RestartContainer succeeded for a pod being deleted: %v", restartResp.GetStatus())
+	}
+	if restartResp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND {
+		t.Errorf("failure_reason = %v, want NOT_FOUND for a pod being deleted", restartResp.GetFailureReason())
+	}
+	// The replacement was spawned (pid 1002 — the fake spawner hands out 1001+i)
+	// and must have been signalled by the daemon that created it. An unsignalled
+	// pid here is the orphan this gate exists for.
+	sp.mu.Lock()
+	spawns := len(sp.specs)
+	sp.mu.Unlock()
+	if spawns != 2 {
+		t.Fatalf("spawns = %d, want 2 (the original and the restart's replacement)", spawns)
+	}
+	if !kills.signalled(1002) {
+		t.Error("the restart's replacement was spawned but never signalled: a root-owned " +
+			"process group belonging to a pod the cluster has deleted")
+	}
+	// And it is tracked by nothing, because the install was refused — the pod is
+	// gone from the runtime, so nothing could report it either.
+	if tracked := trackedPIDs(rt, podID); len(tracked) != 0 {
+		t.Errorf("deleted pod still tracks %v", tracked)
+	}
 }
