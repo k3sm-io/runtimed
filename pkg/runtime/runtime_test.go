@@ -427,6 +427,13 @@ type fakePuller struct {
 	// value defaults to the native one rather than propagating a hole.
 	descriptor *runtimev1.Descriptor
 	platform   image.Platform
+	// fetched is what PullResult.Fetched reports: whether this pull needed a
+	// registry round trip. It defaults FALSE — a fake puller contacts nothing, so
+	// "served from the local index" is the honest default and every existing test
+	// keeps the outcome it already had. A test asserting the pulled-from-a-
+	// registry half sets it. Guarded by mu, because the restart test flips it
+	// between two attempts on one container.
+	fetched bool
 
 	mu             sync.Mutex
 	lastCred       *image.RegistryCredential
@@ -442,6 +449,7 @@ func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCre
 	f.lastPolicy = policy
 	f.lastPullPolicy = pull
 	mfst := f.manifest
+	fetched := f.fetched
 	err := f.errByRef[ref]
 	if err == nil {
 		err = f.err
@@ -460,9 +468,19 @@ func (f *fakePuller) Pull(_ context.Context, ref string, cred *image.RegistryCre
 	return &image.PullResult{
 		Manifest:   mfst,
 		CacheHit:   true,
+		Fetched:    fetched,
 		Descriptor: f.descriptor,
 		Platform:   plat.Normalize(),
 	}, nil
+}
+
+// setFetched makes subsequent pulls report whether a registry was contacted (see
+// fakePuller.fetched), so one container's second start attempt can differ from
+// its first.
+func (f *fakePuller) setFetched(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetched = v
 }
 
 // failRef makes ref's next pull fail with err (see fakePuller.errByRef).

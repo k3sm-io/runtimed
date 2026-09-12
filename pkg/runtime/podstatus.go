@@ -111,6 +111,13 @@ func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 		LastTerminationState: cp.state.GetLastTerminationState(),
 		VolumeMounts:         cp.state.GetVolumeMounts(),
 		User:                 cp.state.GetUser(),
+		// Carried through, never re-derived: it records what the container's
+		// most recent RESOLVED start attempt did (startContainer stamps it), and
+		// it is nil on an entry that has none — a placeholder for a container
+		// still Waiting on an image failure, or one that has not attempted a
+		// start yet. Recomputing it at status time would mean asking the puller
+		// again, which is a second pull.
+		ImagePull: cp.state.GetImagePull(),
 	}
 	if cp.sidecar() {
 		// A native sidecar reports started while running (spawn-equals-started:

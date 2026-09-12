@@ -35,6 +35,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -1149,18 +1150,13 @@ func (r *Runtime) releaseStart(p *pod, claimed *containerProc) {
 // become part of it.
 func (r *Runtime) installSpawned(ctx context.Context, p *pod, cp *containerProc, claimed *containerProc) bool {
 	p.mu.Lock()
-	stopping := p.stopping
-	var err error
-	if !stopping {
-		err = setContainerLocked(p, cp)
-	}
+	// Nothing to replace: this path only ever installs over a waiting
+	// placeholder or appends, and a live entry of the same name is the
+	// double-spawn the claim above exists to prevent.
+	err := installContainerLocked(p, cp, nil)
 	releaseStartClaimLocked(claimed)
 	p.mu.Unlock()
-	switch {
-	case stopping:
-		r.killUntrackedSpawn(ctx, p, cp, "the pod is being deleted")
-		return false
-	case err != nil:
+	if err != nil {
 		r.killUntrackedSpawn(ctx, p, cp, err.Error())
 		return false
 	}
@@ -1173,7 +1169,7 @@ func (r *Runtime) installSpawned(ctx context.Context, p *pod, cp *containerProc,
 // exactly the right outcome — a running container must not be overwritten by a
 // status saying it never started. Caller holds p.mu.
 func (r *Runtime) setContainerOrLogLocked(p *pod, cp *containerProc) {
-	if err := setContainerLocked(p, cp); err != nil {
+	if err := setContainerLocked(p, cp, nil); err != nil {
 		r.log.Warn("not recording a waiting status over a running container",
 			"pod", p.box.GetPodId(), "container", cp.name, "err", err)
 	}
@@ -1270,8 +1266,21 @@ func (r *Runtime) blockRemainingLocked(p *pod, fromInit int) {
 // spawn, the kqueue reaper, and the watchContainerExit drain-wait to the pod's
 // lifetime so they survive the unary RPC's return under the daemon split.
 func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
+	// The image step is timed around resolveBinary as a whole — the pull (or the
+	// local-index hit that stands in for it), the materialization of the layers
+	// into the pod rootfs, and the image-config merge. That is the wall time
+	// between "this container has a reference" and "this container has a
+	// runnable program", which is what an operator reading the Pulled event's
+	// duration is asking about; timing the registry transfer alone would report
+	// a fraction of the wait and would be zero on the host-binary routes.
+	imageStart := time.Now()
 	rb, err := r.resolveBinary(ctx, p, rootfs, c)
+	imageStep := time.Since(imageStart)
 	if err != nil {
+		// No outcome is reported for a failed resolution, and none can be: the
+		// container gets no entry from this call at all (the partial-start
+		// contract leaves a Waiting placeholder that carries no image_pull), so
+		// image_pull is absent exactly while the image question is unanswered.
 		return nil, resolveFailureReason(err), err
 	}
 
@@ -1342,6 +1351,16 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			// user) so kubectl Pod state does not degrade across the boundary.
 			VolumeMounts: volumeMountStatuses(c),
 			User:         containerUser(cred),
+			// How this attempt obtained the image. It is stamped on the NEW
+			// entry, which is what makes "cleared on a new attempt until it
+			// resolves" structural rather than a rule somebody has to remember:
+			// a start that has not resolved its image has produced no entry to
+			// read, and the entry an observer can see always describes the
+			// resolution behind the process it names.
+			ImagePull: &runtimev1.ImagePullOutcome{
+				Pulled:   rb.pulled,
+				Duration: durationpb.New(imageStep),
+			},
 		},
 	}
 	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, logs.write)
@@ -1926,6 +1945,14 @@ func (r *Runtime) waitingContainerProc(podID string, c *runtimev1.Container, isI
 // was asked to replace already holds a LIVE process.
 var errContainerLive = errors.New("container already has a live process")
 
+// errPodStopping is the sentinel installContainerLocked returns when the pod is
+// being deleted. It is a distinct sentinel from errContainerLive because the two
+// refusals mean different things to a caller and map to different failure
+// reasons: a stopping pod is NOT_FOUND (it is not going to exist, so no retry
+// helps), a live entry is NOT_UPDATABLE (the pod is fine, this container is not
+// the caller's to replace).
+var errPodStopping = errors.New("the pod is being deleted")
+
 // setContainerLocked installs cp as the pod's entry for its name, REPLACING an
 // existing entry of that name (a waiting placeholder being started) or appending
 // a new one. Replacing in place preserves p.containers' start order, which
@@ -1941,15 +1968,26 @@ var errContainerLive = errors.New("container already has a live process")
 // (killUntrackedSpawn); a caller installing a placeholder simply keeps the live
 // entry.
 //
+// replacing is the ONE exemption from that refusal, and it is narrow on purpose:
+// it names the entry the caller has ITSELF already terminated and waited to
+// exit — RestartContainer's predecessor, and nothing else. That entry can still
+// read LIVE to containerLiveLocked, because the terminated state is recorded by
+// the reaper goroutine (watchContainerExit) which runs concurrently with the
+// caller's own wait on the process; without the exemption a perfectly ordinary
+// restart would be refused whenever it won that race. The exemption is by
+// POINTER IDENTITY, never by name: it licenses a re-spawn over the corpse this
+// caller made and over no other entry, so a stale or unrelated live process is
+// still protected. Callers with nothing to replace pass nil.
+//
 // The single-flight claim above (containerProc.starting) is what makes the
 // refusal rare rather than routine — this is the backstop that holds when a
 // claim is missed, not the primary mechanism.
-func setContainerLocked(p *pod, cp *containerProc) error {
+func setContainerLocked(p *pod, cp *containerProc, replacing *containerProc) error {
 	for i, existing := range p.containers {
 		if existing.name != cp.name {
 			continue
 		}
-		if existing != cp && containerLiveLocked(existing) {
+		if existing != cp && existing != replacing && containerLiveLocked(existing) {
 			return fmt.Errorf("install container %s: %w", cp.name, errContainerLive)
 		}
 		p.containers[i] = cp
@@ -1957,6 +1995,40 @@ func setContainerLocked(p *pod, cp *containerProc) error {
 	}
 	p.containers = append(p.containers, cp)
 	return nil
+}
+
+// installContainerLocked is the ONE installer every SPAWNING path uses: the
+// pod-deletion precondition plus setContainerLocked's live-entry refusal, in one
+// decision under one hold of p.mu. createPod's start sequence (installSpawned),
+// StartContainer and RestartContainer all route through it, so the three cannot
+// drift — RestartContainer used to open-code the swap and therefore honoured
+// NEITHER check, which is how a restart racing DeletePod installed a process
+// group into a pod whose teardown had already decided what it would signal.
+//
+// The p.stopping check belongs HERE, immediately before the install, and not at
+// the top of an RPC: DeletePod snapshots the containers it will stop and then
+// removes the pod's durable reap records, and every spawning path sits behind an
+// image resolution that can take seconds. Only a check with no pull between it
+// and the install can see the flag in time.
+//
+// A refusal means this daemon is holding a just-spawned, root-owned process
+// group that nothing will track — so every caller MUST tear it down
+// (killUntrackedSpawn) rather than merely reporting the error. Caller holds p.mu.
+func installContainerLocked(p *pod, cp *containerProc, replacing *containerProc) error {
+	if p.stopping {
+		return errPodStopping
+	}
+	return setContainerLocked(p, cp, replacing)
+}
+
+// installFailureReason maps an installContainerLocked refusal to the typed
+// FailureReason the RPCs report, so StartContainer and RestartContainer answer a
+// caller with one taxonomy across both verbs.
+func installFailureReason(err error) runtimev1.FailureReason {
+	if errors.Is(err, errPodStopping) {
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND
+	}
+	return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE
 }
 
 // claimContainerStartLocked claims the single-flight start of the named
@@ -2066,6 +2138,20 @@ type resolvedBinary struct {
 	// working_dir when set, else the image config's, else empty. On a
 	// host-binary route it is the pod's value verbatim.
 	workingDir string
+	// pulled reports that this container's image was obtained by a REGISTRY
+	// ROUND TRIP for this start attempt (image.PullResult.Fetched), as opposed
+	// to being served from the node's local index. It is what
+	// ContainerStatus.image_pull publishes, so a consumer can emit the kubelet's
+	// Pulled event in the right one of its two shapes ("Successfully pulled
+	// image %q in %v" vs "Container image %q already present on machine")
+	// instead of guessing.
+	//
+	// It is false on BOTH host-binary routes, correctly and not by omission: the
+	// native sentinel and the absolute-host-path convention run an executable
+	// that is already on this machine, which is precisely the claim the
+	// already-present shape makes. It is never inferred from elapsed time or
+	// from a log message — the puller reports it.
+	pulled bool
 }
 
 // resolveBinary determines the pod binary path + argv for a container.
@@ -2248,6 +2334,10 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		imageID:    res.Manifest.GetConfig().GetDigest(),
 		env:        run.Env,
 		workingDir: run.WorkingDir,
+		// Reported by the puller, never re-derived here: only it knows whether a
+		// registry was contacted, and CacheHit is a different question (see
+		// image.PullResult.Fetched).
+		pulled: res.Fetched,
 	}, nil
 }
 

@@ -43,7 +43,10 @@ import (
 //
 // Unknown pod / container return a structured NOT_FOUND (RestartContainerResponse
 // carries a google.rpc.Status, matching CreatePod/UpdatePod) rather than a
-// transport error.
+// transport error. A pod that is being deleted refuses the replacement with
+// FailedPrecondition + NOT_FOUND and SIGKILLs the group it had already spawned —
+// the same answer StartContainer gives, through the same installer, because a
+// group installed after DeletePod's snapshot is one nothing would ever signal.
 func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
 	r.mu.Lock()
 	p, ok := r.pods[req.GetPodId()]
@@ -159,13 +162,40 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// crash-looping pod permanently unenforced.
 	wasTerminal := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED ||
 		p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
+	// Written on the not-yet-installed entry, which no observer can reach, so a
+	// refused install below discards them with it.
 	newCP.state.RestartCount = oldRestartCount + 1
 	newCP.state.LastTerminationState = lastTerminationState(oldCP, oldCode, oldSig, oldStarted, req.GetReason())
-	for i, cp := range p.containers {
-		if cp == oldCP {
-			p.containers[i] = newCP
-			break
-		}
+	// THE SWAP, through the installer StartContainer and the start sequence use
+	// (installContainerLocked) rather than an open-coded write into p.containers.
+	// This verb used to walk the slice itself and so honoured neither of the
+	// installer's preconditions: a restart racing DeletePod installed a
+	// root-owned process group into a pod whose teardown had already snapshotted
+	// what it would signal and removed its reap records, leaving a group nothing
+	// tracks, stops or collects — the very leak StartContainer's second stopping
+	// check exists to close.
+	//
+	// oldCP is passed as the replaced entry because this function terminated it
+	// and waited for its exit above, which is exactly the precondition the
+	// exemption states. It is needed and not merely tidy: the terminated state is
+	// recorded by the reaper goroutine, so oldCP can still read live to
+	// containerLiveLocked at this instant and an unexempted install would refuse
+	// an ordinary restart whenever it won that race.
+	if err := installContainerLocked(p, newCP, oldCP); err != nil {
+		p.mu.Unlock()
+		// The replacement is spawned but untracked, so it is torn down here — the
+		// obligation every caller of the installer carries. Detached from ctx for
+		// the reason the re-spawn was: the pod-lifetime context is cancelled by
+		// the very teardown that made this install unwelcome.
+		r.killUntrackedSpawn(context.WithoutCancel(ctx), p, newCP, err.Error())
+		// Only now drop the restarting flag: the old process is gone and no
+		// replacement took its place, so the pod must resume ordinary phase
+		// accounting for a container that is simply dead.
+		r.clearRestarting(ctx, p, oldCP)
+		r.log.Warn("restart: the replacement could not be installed",
+			"pod", req.GetPodId(), "container", oldCP.name, "err", err)
+		return restartFailure(codes.FailedPrecondition, installFailureReason(err),
+			"restart %s/%s: %v", req.GetPodId(), oldCP.name, err), nil
 	}
 	r.recomputePhaseLocked(p)
 	// A re-exec de-escalates the pod out of a terminal phase (recomputePhaseLocked

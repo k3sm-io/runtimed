@@ -172,18 +172,18 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	// pull that can take seconds, and DeletePod snapshots the containers it will
 	// signal at its own entry. A spawn that installs after that snapshot is
 	// signalled by nobody and its reap record is removed by the same call, so it
-	// would outlive the pod as a root-owned group. installing is refused and the
-	// group this call just created is SIGKILLed synchronously.
-	if p.stopping {
-		p.mu.Unlock()
-		r.killUntrackedSpawn(p.supCtx, p, newCP, "the pod is being deleted")
-		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
-			"start %s/%s: pod is being deleted", req.GetPodId(), cp.name), nil
-	}
-	if err := setContainerLocked(p, newCP); err != nil {
+	// would outlive the pod as a root-owned group. It rides inside the shared
+	// installer (installContainerLocked) together with the live-entry refusal, so
+	// this verb and RestartContainer cannot come to disagree about either; on a
+	// refusal the group this call just created is SIGKILLed synchronously.
+	//
+	// Nothing to replace: this verb's contract is a container that never started
+	// (the cp.proc != nil refusal above), so a live entry of this name is another
+	// caller's process and must never be overwritten.
+	if err := installContainerLocked(p, newCP, nil); err != nil {
 		p.mu.Unlock()
 		r.killUntrackedSpawn(p.supCtx, p, newCP, err.Error())
-		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+		return startFailure(codes.FailedPrecondition, installFailureReason(err),
 			"start %s/%s: %v", req.GetPodId(), cp.name, err), nil
 	}
 	if waitingContainersLocked(p) == 0 && p.phase == runtimev1.PodPhase_POD_PHASE_PENDING {
