@@ -100,30 +100,37 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 		return startFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 			"container %s not found in pod %s", req.GetContainer(), req.GetPodId()), nil
 	}
-	// Claim the start under p.mu: the two refusals and the claim are one atomic
-	// decision, so a second caller cannot pass the "has no process" check while
-	// the first is mid-spawn (see containerProc.starting).
+	// Claim the start through the ONE predicate both start paths ask
+	// (claimContainerStartLocked): the three refusals and the claim are a single
+	// atomic decision under p.mu, so a second caller cannot pass the "has no
+	// process" check while the first is mid-spawn (see containerProc.starting),
+	// and this verb cannot come to disagree with startSequence about when a start
+	// is allowed. Only the MAPPING to the RPC taxonomy is this verb's own: a pod
+	// that will not exist is NOT_FOUND, a container that is not this caller's to
+	// start is NOT_UPDATABLE, and both are FailedPrecondition rather than an
+	// Internal a client would retry forever.
+	//
+	// The lookup is by cp.name, not the request's: findContainer resolves the
+	// empty name to the pod's single container, and the claim must be taken on
+	// the entry that resolution picked.
 	p.mu.Lock()
-	switch {
-	case p.stopping:
-		p.mu.Unlock()
+	claimed, verdict := claimContainerStartLocked(p, cp.name)
+	p.mu.Unlock()
+	switch verdict {
+	case startClaimPodStopping:
 		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
-			"start %s/%s: pod is being deleted", req.GetPodId(), req.GetContainer()), nil
-	case cp.proc != nil:
-		p.mu.Unlock()
+			"start %s/%s: pod is being deleted", req.GetPodId(), cp.name), nil
+	case startClaimStarted:
 		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
 			"start %s/%s: container has already started; use RestartContainer",
-			req.GetPodId(), req.GetContainer()), nil
-	case cp.starting:
-		p.mu.Unlock()
+			req.GetPodId(), cp.name), nil
+	case startClaimInFlight:
 		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
-			"start %s/%s: a start is already in flight", req.GetPodId(), req.GetContainer()), nil
+			"start %s/%s: a start is already in flight", req.GetPodId(), cp.name), nil
 	}
-	cp.starting = true
-	p.mu.Unlock()
 	defer func() {
 		p.mu.Lock()
-		cp.starting = false
+		releaseStartClaimLocked(claimed)
 		p.mu.Unlock()
 	}()
 

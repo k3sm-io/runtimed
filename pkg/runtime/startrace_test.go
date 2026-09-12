@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -363,8 +364,69 @@ func TestDeletePodKillsASpawnThatLandsDuringTeardown(t *testing.T) {
 
 // --- F3: the credential resolver's error text is not a status message ----
 
+// logCapture is a slog.Handler that retains each record's message and attrs, so
+// a test can assert on the EXACT value the runtime logged rather than on a
+// handler's rendering of it — an escaped rendering would make "the marker is
+// absent" pass for a line that in fact carries it, spelled differently.
+type logCapture struct {
+	mu      sync.Mutex
+	records []capturedRecord
+}
+
+// capturedRecord is one log record, attrs flattened to their string form.
+type capturedRecord struct {
+	msg   string
+	attrs map[string]string
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	rec := capturedRecord{msg: r.Message, attrs: make(map[string]string, r.NumAttrs())}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	c.mu.Lock()
+	c.records = append(c.records, rec)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+// find returns the first captured record whose message is msg.
+func (c *logCapture) find(msg string) (capturedRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.records {
+		if r.msg == msg {
+			return r, true
+		}
+	}
+	return capturedRecord{}, false
+}
+
+// String renders every captured record, for an absence assertion that must span
+// the whole log rather than one line of it.
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var b strings.Builder
+	for _, r := range c.records {
+		b.WriteString(r.msg)
+		for k, v := range r.attrs {
+			fmt.Fprintf(&b, " %s=%s", k, v)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // TestCredentialResolverErrorNeverReachesTheStatus pins the confinement of the
-// one error text on the start path that is derived from Secret material.
+// one error text on the start path that is derived from Secret material — in
+// BOTH sinks it can reach.
 //
 // # Why this is not vacuous
 //
@@ -374,38 +436,90 @@ func TestDeletePodKillsASpawnThatLandsDuringTeardown(t *testing.T) {
 // to the provider, into kine, and out through `kubectl describe pod` to anyone
 // with pod-read access in the namespace. The typed reason already tells the
 // provider what to do; the text buys nothing that justifies the disclosure.
+//
+// The node log is the second sink and it was left carrying the raw text on the
+// premise that it is root-only. It is not: /var/log/k3sm/server.log is written
+// by the unprivileged _k3sm job in a world-readable directory, so any local
+// account can read it. What the runtime writes there is therefore bounded too —
+// bounded, never widened: a marker inside the bound stays visible (the operator
+// still needs the cause), and the resolver's own contract is that its text does
+// not quote Secret content in the first place (CredentialResolver).
 func TestCredentialResolverErrorNeverReachesTheStatus(t *testing.T) {
 	const (
 		podID  = "pod-credtext"
 		marker = "dockerconfigjson-auth-QUJDOnNlY3JldA"
 	)
-	rt := newTestRuntime(t, Deps{
-		Credentials: &fakeCredentialResolver{
-			err: fmt.Errorf(`parse secret "regcred": bad auth %s`, marker),
+	cases := []struct {
+		name string
+		// errText is what the (misbehaving) resolver returns. A resolver that
+		// honours its contract never quotes Secret bytes at all; these rows are
+		// about what the runtime does when one does anyway.
+		errText string
+		// wantMarkerInLog is whether the bounded copy still contains the marker:
+		// true when it sits inside the bound, false when the bound cuts it off.
+		wantMarkerInLog bool
+	}{
+		{
+			// The marker sits past maxResolverErrBytes, so the bound removes it
+			// from the log entirely.
+			name:            "marker_past_the_bound_is_cut_from_the_log",
+			errText:         `parse secret "regcred": ` + strings.Repeat("x", maxResolverErrBytes) + " " + marker,
+			wantMarkerInLog: false,
 		},
-		Puller:   &fakePuller{},
-		Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}},
-		Waiter:   newBlockingWaiter(),
-	})
-	box := pullBox(rt, podID, pulledContainer("c", pullRef))
-	box.ImagePullSecrets = []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+		{
+			// Inside the bound: the runtime bounds and ASCII-quotes what it was
+			// given, and does not otherwise widen or narrow it.
+			name:            "marker_within_the_bound_is_logged_only_bounded",
+			errText:         `parse secret "regcred": bad auth ` + marker,
+			wantMarkerInLog: true,
+		},
+	}
 
-	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
-	if err != nil {
-		t.Fatalf("CreatePod: %v", err)
-	}
-	if resp.GetError() != nil {
-		t.Fatalf("CreatePod failed %v; an unresolvable pull secret is container-class", resp.GetError())
-	}
-	if s := resp.String(); strings.Contains(s, marker) {
-		t.Errorf("the CreatePod response carries the resolver's text: %s", s)
-	}
-	w := assertWaiting(t, rt, podID, "c", runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL)
-	if strings.Contains(w.GetMessage(), marker) {
-		t.Errorf("waiting message = %q; it carries material the resolver read out of a Secret", w.GetMessage())
-	}
-	if !strings.Contains(w.GetMessage(), "regcred") {
-		t.Errorf("waiting message = %q, want it to name the imagePullSecret that could not be resolved", w.GetMessage())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &logCapture{}
+			rt := newTestRuntimeCfg(t, Config{Logger: slog.New(logs)}, Deps{
+				Credentials: &fakeCredentialResolver{err: errors.New(tc.errText)},
+				Puller:      &fakePuller{},
+				Unpacker:    &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}},
+				Waiter:      newBlockingWaiter(),
+			})
+			box := pullBox(rt, podID, pulledContainer("c", pullRef))
+			box.ImagePullSecrets = []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			if resp.GetError() != nil {
+				t.Fatalf("CreatePod failed %v; an unresolvable pull secret is container-class", resp.GetError())
+			}
+			if s := resp.String(); strings.Contains(s, marker) {
+				t.Errorf("the CreatePod response carries the resolver's text: %s", s)
+			}
+			w := assertWaiting(t, rt, podID, "c", runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL)
+			if strings.Contains(w.GetMessage(), marker) {
+				t.Errorf("waiting message = %q; it carries material the resolver read out of a Secret", w.GetMessage())
+			}
+			if !strings.Contains(w.GetMessage(), "regcred") {
+				t.Errorf("waiting message = %q, want it to name the imagePullSecret that could not be resolved", w.GetMessage())
+			}
+
+			// The log is the second sink, and it is not root-only.
+			rec, ok := logs.find("resolve imagePullSecret")
+			if !ok {
+				t.Fatalf("no resolver-failure log record was written; captured:\n%s", logs)
+			}
+			if got, want := rec.attrs["err"], image.QuoteBounded(tc.errText, maxResolverErrBytes); got != want {
+				t.Errorf("logged err = %s, want the bounded copy %s", got, want)
+			}
+			if got, want := rec.attrs["secrets"], image.QuoteBounded("regcred", maxSecretRefBytes); got != want {
+				t.Errorf("logged secrets = %s, want the bounded copy %s", got, want)
+			}
+			if got := strings.Contains(logs.String(), marker); got != tc.wantMarkerInLog {
+				t.Errorf("marker present in the log = %v, want %v; log:\n%s", got, tc.wantMarkerInLog, logs)
+			}
+		})
 	}
 }
 

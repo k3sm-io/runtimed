@@ -258,13 +258,20 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		p.cancel()
 	}
 
-	// The snapshot above is a moment in time, and p.stopping only closes the
-	// paths that consult it: RestartContainer swaps a freshly spawned process
-	// into p.containers without asking. So re-read the list now that supervision
-	// is cancelled and signal anything that appeared since — this is the last
-	// point at which a process group belonging to this pod is still nameable,
-	// because the durable reap records that would otherwise find it are removed
-	// at the end of this call.
+	// The snapshot above is a moment in time. Every install path now consults
+	// p.stopping under p.mu — StartContainer, RestartContainer and the start
+	// sequence all reach p.containers through installContainerLocked, which
+	// refuses a stopping pod and leaves its caller to SIGKILL the group it was
+	// holding — so no path in this daemon is expected to land a process here.
+	//
+	// The sweep stays anyway, as defense in depth: it is the backstop for a
+	// FUTURE install path that writes p.containers without going through the
+	// installer, and for a group that landed in the window between the snapshot
+	// and p.stopping being observed. Re-read the list now that supervision is
+	// cancelled and signal anything that appeared since — this is the last point
+	// at which a process group belonging to this pod is still nameable, because
+	// the durable reap records that would otherwise find it are removed at the
+	// end of this call.
 	p.mu.Lock()
 	late := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range liveContainersLocked(p) {

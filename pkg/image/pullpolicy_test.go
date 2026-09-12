@@ -364,3 +364,98 @@ func primeLocalImage(t *testing.T, cache *Cache, idx *fakeIndex, ref string, img
 		}
 	}
 }
+
+// TestPullReportsFetchedAndCacheHitIndependently pins the two outcome bits a
+// consumer builds the kubelet's pull event from, over every state they can be
+// observed in together.
+//
+// # Why this is not vacuous
+//
+// Fetched and CacheHit look like one fact spelled twice, and a reader who
+// conflates them writes "already present on machine" for an Always pull that did
+// contact a registry, re-resolved the tag, and could have found a different
+// digest. The pair is asserted here rather than each bit separately because it
+// is their COMBINATION that is the contract: the middle row below —
+// (Fetched=true, CacheHit=true) — is the one a conflation makes unrepresentable,
+// and it is also the common steady-state Always pull.
+//
+// The fourth combination, (Fetched=false, CacheHit=false), is UNREACHABLE by
+// construction and so has no row: Fetched is false on exactly one return path,
+// the presentLocally serve taken only under IfNotPresent/Never, and that path
+// wrote no blob and hard-codes CacheHit=true; every other return comes from
+// ingest, which is reached only with fetched bytes in hand and hard-codes
+// Fetched=true. A row asserting it would be asserting that a return statement
+// this package does not contain behaves a certain way.
+func TestPullReportsFetchedAndCacheHitIndependently(t *testing.T) {
+	const ref = "example.com/app:latest"
+
+	cases := []struct {
+		name         string
+		pull         runtimev1.ImagePullPolicy
+		warm         bool
+		wantFetches  int
+		wantFetched  bool
+		wantCacheHit bool
+	}{
+		{
+			// A round trip that wrote blobs: the "Successfully pulled" event.
+			name:         "cold_always_fetches_and_writes",
+			pull:         runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
+			warm:         false,
+			wantFetches:  1,
+			wantFetched:  true,
+			wantCacheHit: false,
+		},
+		{
+			// The combination that carries the whole distinction: the registry
+			// WAS consulted (the tag was re-resolved) and not one byte had to be
+			// written, because the digest it resolved to was already on disk.
+			name:         "warm_always_fetches_without_writing",
+			pull:         runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
+			warm:         true,
+			wantFetches:  1,
+			wantFetched:  true,
+			wantCacheHit: true,
+		},
+		{
+			// No registry at all: the "already present on machine" event.
+			name:         "warm_if_not_present_serves_locally",
+			pull:         runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
+			warm:         true,
+			wantFetches:  0,
+			wantFetched:  false,
+			wantCacheHit: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, err := NewCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			idx := &fakeIndex{entries: map[string]*runtimev1.ImageManifest{}}
+			img := pullPolicyImage(t)
+			if tc.warm {
+				primeLocalImage(t, cache, idx, ref, img, false)
+			}
+
+			ff := &fakeFetch{img: img}
+			p := mustPullerIndex(t, cache, ff.fetch, idx)
+
+			res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), tc.pull)
+			if err != nil {
+				t.Fatalf("Pull: %v", err)
+			}
+			if ff.calls != tc.wantFetches {
+				t.Errorf("fetch calls = %d, want %d", ff.calls, tc.wantFetches)
+			}
+			if res.Fetched != tc.wantFetched {
+				t.Errorf("Fetched = %v, want %v", res.Fetched, tc.wantFetched)
+			}
+			if res.CacheHit != tc.wantCacheHit {
+				t.Errorf("CacheHit = %v, want %v", res.CacheHit, tc.wantCacheHit)
+			}
+		})
+	}
+}

@@ -1125,19 +1125,20 @@ func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, init
 }
 
 // claimStart takes the single-flight start claim for one container of p and
-// reports whether this goroutine may spawn it. It refuses a pod that is being
-// torn down (pod.stopping) as well as a container somebody else owns: the two
-// are one decision, taken under one hold of p.mu, because a pod that is being
-// deleted must not acquire new process groups at all.
+// reports whether this goroutine may spawn it. The decision itself is
+// claimContainerStartLocked's — the predicate StartContainer asks too; this
+// wrapper only takes p.mu and reduces the typed verdict to the boolean the
+// sequence needs, logging the pod-teardown refusal because it is the one a
+// sequence in flight did not ask for.
 func (r *Runtime) claimStart(p *pod, name string) (claimed *containerProc, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.stopping {
+	claimed, verdict := claimContainerStartLocked(p, name)
+	if verdict == startClaimPodStopping {
 		r.log.Info("not starting a container of a pod that is being deleted",
 			"pod", p.box.GetPodId(), "container", name)
-		return nil, false
 	}
-	return claimContainerStartLocked(p, name)
+	return claimed, verdict == startClaimOK
 }
 
 // releaseStart drops a claim taken by claimStart, for the paths that abandon the
@@ -2048,29 +2049,68 @@ func installFailureReason(err error) runtimev1.FailureReason {
 	return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE
 }
 
+// startClaim is the verdict of the single-flight start predicate
+// (claimContainerStartLocked): may this caller spawn the named container, and if
+// not, why not. The refusals are typed rather than folded into one ok=false
+// because the two start paths answer them differently — startSequence skips the
+// container and moves on, while StartContainer owes its caller a gRPC code and a
+// FailureReason that distinguish "this pod is going away" from "this container is
+// not yours to start".
+type startClaim int
+
+const (
+	// startClaimOK: the caller owns the start and must release the claim it was
+	// handed (releaseStartClaimLocked).
+	startClaimOK startClaim = iota
+	// startClaimPodStopping: the pod is being torn down, so it must acquire no
+	// new process groups at all — DeletePod has already snapshotted what it will
+	// signal, and a group spawned after that snapshot is signalled by nobody.
+	startClaimPodStopping
+	// startClaimStarted: the container already has a process (running or
+	// terminated). Replacing one is RestartContainer's verb, not a start's.
+	startClaimStarted
+	// startClaimInFlight: another caller holds the claim and is mid-spawn.
+	startClaimInFlight
+)
+
 // claimContainerStartLocked claims the single-flight start of the named
 // container for the caller, reporting whether the caller may spawn it.
 //
-// ok=false means somebody else owns this container's start (a claim is held, or
-// it already has a process) and the caller must NOT spawn: a second spawn is the
-// double-spawn this claim exists to prevent. ok=true with a nil entry means the
-// container has no tracked entry at all — createPod's first pass, where no other
-// path can address the container (StartContainer answers NotFound for a name
-// findContainer misses), so there is nothing to claim and nothing to race.
+// It is the ONE predicate both start paths ask — startSequence through
+// claimStart, StartContainer directly — and that is the point of it: a second
+// copy of these three conditions is one edit away from a double spawn (two
+// processes for one container, the second entry replacing the first, the first's
+// root-owned group tracked, reaped and stopped by nothing) or a spawn into a pod
+// mid-teardown.
+//
+// Any verdict but startClaimOK means the caller must NOT spawn. startClaimOK
+// with a nil entry means the container has no tracked entry at all —
+// createPod's first pass, where no other path can address the container
+// (StartContainer answers NotFound for a name findContainer misses), so there is
+// nothing to claim and nothing to race.
 //
 // The returned entry is released with releaseStartClaimLocked. Caller holds p.mu.
-func claimContainerStartLocked(p *pod, name string) (claimed *containerProc, ok bool) {
+func claimContainerStartLocked(p *pod, name string) (claimed *containerProc, verdict startClaim) {
+	// The pod-level refusal is part of the same decision, taken under the same
+	// hold of p.mu: a pod being deleted must not acquire a process group even for
+	// a container nobody else has claimed.
+	if p.stopping {
+		return nil, startClaimPodStopping
+	}
 	for _, cp := range p.containers {
 		if cp.name != name {
 			continue
 		}
-		if cp.proc != nil || cp.starting {
-			return nil, false
+		switch {
+		case cp.proc != nil:
+			return nil, startClaimStarted
+		case cp.starting:
+			return nil, startClaimInFlight
 		}
 		cp.starting = true
-		return cp, true
+		return cp, startClaimOK
 	}
-	return nil, true
+	return nil, startClaimOK
 }
 
 // releaseStartClaimLocked drops a claim taken by claimContainerStartLocked. A nil
@@ -2497,16 +2537,28 @@ func (r *Runtime) pullCredential(ctx context.Context, box *runtimev1.PodBox, ref
 	}
 	cred, ok, err := r.credentials.PullCredential(ctx, box.GetNamespace(), box.GetImagePullSecrets(), ref)
 	if err != nil {
-		// The resolver READ A SECRET to produce this error, so its text may quote
-		// the bytes it could not parse. It goes to the node log, which is
-		// root-readable and local; what the caller gets is a fixed sentence naming
-		// only the secret reference and the failure class, because
+		// The resolver READ A SECRET to produce this error. Its contract
+		// (CredentialResolver) is that the error it returns never quotes Secret
+		// content — but this is the boundary where that contract is trusted, so
+		// nothing crosses it unbounded, and BOTH sinks are treated as published.
+		//
+		// The node log is not the private sink it was once assumed to be:
+		// /var/log/k3sm/server.log is written by the unprivileged _k3sm job into a
+		// world-readable directory, so every local account can read it. It gets a
+		// bounded, ASCII-quoted copy of whatever the resolver said — bounded, not
+		// redacted, because an operator debugging a broken pull secret still needs
+		// the cause, and narrowing what the resolver reports is the resolver's own
+		// job.
+		//
+		// What the CALLER gets is narrower still: a fixed sentence naming only the
+		// secret reference and the failure class, because
 		// ContainerStateWaiting.message travels to the provider, into the
 		// datastore, and out through `kubectl describe pod` to every reader of the
 		// namespace. The typed IMAGE_PULL_CREDENTIAL reason already carries
 		// everything a retry loop needs.
 		r.log.Warn("resolve imagePullSecret", "pod", box.GetPodId(), "namespace", box.GetNamespace(),
-			"secrets", imagePullSecretRefs(box), "image", ref, "err", err)
+			"secrets", image.QuoteBounded(imagePullSecretRefs(box), maxSecretRefBytes),
+			"image", ref, "err", image.QuoteBounded(err.Error(), maxResolverErrBytes))
 		return nil, fmt.Errorf("imagePullSecret %s could not be resolved",
 			image.QuoteBounded(imagePullSecretRefs(box), maxSecretRefBytes))
 	}
@@ -2516,17 +2568,25 @@ func (r *Runtime) pullCredential(ctx context.Context, box *runtimev1.PodBox, ref
 	return cred, nil
 }
 
-// maxSecretRefBytes bounds the imagePullSecret reference list rendered into a
-// waiting message. The names come from the PodBox, so they are caller-supplied
-// text on a path that reaches kubectl, and they are bounded and ASCII-quoted for
-// the same reason registry-supplied text is.
+// maxResolverErrBytes bounds the CredentialResolver's error text rendered into
+// the node log. The resolver's contract (CredentialResolver) is that its errors
+// never quote Secret content, so this is the belt to that contract's braces: the
+// log is written by the unprivileged _k3sm job into a world-readable directory,
+// which makes it a published sink like the waiting message, not a private one.
+const maxResolverErrBytes = 128
+
+// maxSecretRefBytes bounds the imagePullSecret reference list rendered into the
+// waiting message and into the node log. The names come from the PodBox, so they
+// are caller-supplied text on paths that reach kubectl and a world-readable log
+// file, and they are bounded and ASCII-quoted for the same reason
+// registry-supplied text is.
 const maxSecretRefBytes = 128
 
 // imagePullSecretRefs renders the pod's imagePullSecret names as a
 // comma-separated list, for the one message and the one log line that name them.
-// It is the ONLY thing about a pull-secret failure that is published: the names
-// are the operator's own, while everything the resolver read out of the Secret
-// is not.
+// It is the only thing about a pull-secret failure that is published to the
+// CALLER: the names are the operator's own, while everything the resolver read
+// out of the Secret is not. The log line names them too, bounded identically.
 func imagePullSecretRefs(box *runtimev1.PodBox) string {
 	names := make([]string, 0, len(box.GetImagePullSecrets()))
 	for _, s := range box.GetImagePullSecrets() {

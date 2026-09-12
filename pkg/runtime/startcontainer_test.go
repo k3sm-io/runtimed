@@ -597,3 +597,117 @@ func TestRestartContainerRefusesANeverStartedContainer(t *testing.T) {
 	}
 	assertWaiting(t, rt, podID, "bad", runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL)
 }
+
+// TestStartContainerRefusalsComeFromTheSharedClaim pins the three refusals the
+// single-flight start predicate can produce, as StartContainer renders them.
+//
+// # Why this is not vacuous
+//
+// StartContainer used to re-derive the predicate inline — its own p.stopping /
+// has-a-process / start-in-flight switch, next to claimContainerStartLocked's
+// copy of the same three conditions. Two copies of a concurrency predicate is
+// one bug away from a double spawn (a container started twice, the second entry
+// replacing the first, the first's root-owned group tracked by nothing) or a
+// spawn into a pod being torn down. Both paths now ask the ONE predicate, so
+// this table is what holds the mapping from its verdicts to the RPC taxonomy
+// still: a caller reads NOT_FOUND for a pod that will not exist and
+// NOT_UPDATABLE for a container it may not start, and both are
+// FailedPrecondition rather than a retry-forever Internal.
+func TestStartContainerRefusalsComeFromTheSharedClaim(t *testing.T) {
+	const (
+		podID   = "pod-claimrefuse"
+		goodRef = "example.com/good:v1"
+		badRef  = "example.com/bad:v1"
+	)
+
+	cases := []struct {
+		name string
+		// container is the one StartContainer is called on.
+		container string
+		// arrange puts the pod into the state the row is about.
+		arrange    func(t *testing.T, rt *Runtime, p *pod)
+		wantCode   codes.Code
+		wantReason runtimev1.FailureReason
+		wantMsg    string
+	}{
+		{
+			// A pod being deleted must acquire no new process groups at all, and
+			// it is not going to exist — so NOT_FOUND, not NOT_UPDATABLE.
+			name:       "a_pod_being_deleted_is_not_found",
+			container:  "bad",
+			arrange:    func(_ *testing.T, _ *Runtime, p *pod) { p.mu.Lock(); p.stopping = true; p.mu.Unlock() },
+			wantCode:   codes.FailedPrecondition,
+			wantReason: runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
+			wantMsg:    "pod is being deleted",
+		},
+		{
+			// This verb's contract is a container that never started; one that
+			// has a process is RestartContainer's, and the message says so.
+			name:       "a_container_that_has_a_process_is_not_updatable",
+			container:  "good",
+			arrange:    func(*testing.T, *Runtime, *pod) {},
+			wantCode:   codes.FailedPrecondition,
+			wantReason: runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			wantMsg:    "use RestartContainer",
+		},
+		{
+			// The claim itself: another start owns this container and is mid-spawn.
+			name:      "a_start_already_in_flight_is_not_updatable",
+			container: "bad",
+			arrange: func(t *testing.T, rt *Runtime, p *pod) {
+				cp := rt.findContainer(p, "bad")
+				if cp == nil {
+					t.Fatal("fixture: the waiting container has no entry to claim")
+				}
+				p.mu.Lock()
+				cp.starting = true
+				p.mu.Unlock()
+			},
+			wantCode:   codes.FailedPrecondition,
+			wantReason: runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			wantMsg:    "a start is already in flight",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newTestRuntime(t, Deps{
+				Puller: &fakePuller{errByRef: map[string]error{
+					badRef: errors.New("manifest unknown: no such image"),
+				}},
+				Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}},
+				Waiter:   newBlockingWaiter(),
+			})
+			box := pullBox(rt, podID, pulledContainer("good", goodRef), pulledContainer("bad", badRef))
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil || resp.GetError() != nil {
+				t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+			}
+			rt.mu.Lock()
+			p := rt.pods[podID]
+			rt.mu.Unlock()
+			if p == nil {
+				t.Fatal("fixture: the created pod is not tracked")
+			}
+			tc.arrange(t, rt, p)
+
+			got, err := rt.StartContainer(context.Background(),
+				&runtimev1.StartContainerRequest{PodId: podID, Container: tc.container})
+			if err != nil {
+				t.Fatalf("StartContainer: %v", err)
+			}
+			if got.GetError() == nil {
+				t.Fatalf("StartContainer succeeded; want a refusal (status %v)", got.GetStatus())
+			}
+			if got.GetError().GetCode() != int32(tc.wantCode) {
+				t.Errorf("code = %d, want %d (%v)", got.GetError().GetCode(), int32(tc.wantCode), tc.wantCode)
+			}
+			if got.GetFailureReason() != tc.wantReason {
+				t.Errorf("failure_reason = %v, want %v", got.GetFailureReason(), tc.wantReason)
+			}
+			if !strings.Contains(got.GetError().GetMessage(), tc.wantMsg) {
+				t.Errorf("message = %q, want it to contain %q", got.GetError().GetMessage(), tc.wantMsg)
+			}
+		})
+	}
+}
