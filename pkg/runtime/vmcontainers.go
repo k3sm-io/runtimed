@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
@@ -118,6 +119,50 @@ type vmContainer struct {
 	init bool
 }
 
+// vmImagePull records what one vm container's IMAGE STEP did — the fact
+// ContainerStatus.image_pull publishes, held as plain host-side data.
+//
+// It exists because guest/v1 has no field for it and could not have one that
+// meant anything: the image is resolved on the HOST, at plan time, before the
+// machine exists, and the guest that later reports the container started never
+// saw a registry. So the fold has no way to derive it from the event it is
+// folding, and the only honest source is the pull the host itself performed.
+type vmImagePull struct {
+	// pulled reports a REGISTRY ROUND TRIP for this pod's resolution of the
+	// container's image (image.PullResult.Fetched), as opposed to a serve from
+	// the node's local index. It is the puller's answer, never inferred from the
+	// duration below or from a cache-hit flag — see image.PullResult.Fetched for
+	// why CacheHit is a different question.
+	pulled bool
+	// duration is the wall time of the whole image step: the credential
+	// resolution, the pull, the materialization of the layers into the pod's
+	// rootfs share, and the image-config merge. That is the span between "this
+	// container has a reference" and "this container has a runnable program",
+	// which is the span the host-process spine times (startContainer) — timing
+	// the transfer alone would report a fraction of the same wait on the two
+	// spines for the same image.
+	duration time.Duration
+}
+
+// vmContainerPlan is the host-side result of resolving a vm pod's containers:
+// the carriers the guest boot spec is composed from, plus the per-container
+// facts that stay on the host because the guest has no field for them.
+type vmContainerPlan struct {
+	// containers is VMSpec.Containers, in start order.
+	containers []sandbox.VMContainer
+	// imagePulls is what each container's image step did, keyed by container
+	// NAME — the key the ContainerEvents fold resolves an event by, so the two
+	// sides need no second index to agree. A container absent from the map has
+	// no outcome to report and its status carries none.
+	imagePulls map[string]vmImagePull
+}
+
+// resolvedVMContainer is one container's half of that plan.
+type resolvedVMContainer struct {
+	guest     sandbox.VMContainer
+	imagePull vmImagePull
+}
+
 // vmContainerOrder returns the pod's containers in START order: every init
 // container, in declaration order, then every main container.
 //
@@ -164,8 +209,9 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 }
 
 // resolveVMContainers resolves every container of a vm pod into the plain-data
-// carrier the guest boot spec is composed from (sandbox.VMContainer), in start
-// order.
+// carriers the guest boot spec is composed from (sandbox.VMContainer), in start
+// order, plus the per-container image-step record the pod's statuses are later
+// stamped from (vmContainerPlan.imagePulls).
 //
 // what IT does and deliberately does not DO. Each container is pulled — the
 // merge needs the image's own Entrypoint/Cmd/Env/WorkingDir/User, and a pull is
@@ -191,10 +237,10 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 // backend is the pod's RESOLVED sandbox backend, threaded rather than restated so
 // the image-platform policy of these pulls is the rung the pod is actually
 // confined by (see pullPolicy).
-func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox, plan mount.SharePlan, backend runtimev1.SandboxBackend, rootfs string) ([]sandbox.VMContainer, runtimev1.FailureReason, error) {
+func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox, plan mount.SharePlan, backend runtimev1.SandboxBackend, rootfs string) (vmContainerPlan, runtimev1.FailureReason, error) {
 	rootfsTag, err := vmRootfsShareTag(plan)
 	if err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+		return vmContainerPlan{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
 	}
 	ordered := vmContainerOrder(box)
@@ -212,7 +258,10 @@ func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox
 		r.log.Warn("vm pod names more than one image; only the first is materialized into the pod-wide rootfs share",
 			"pod", box.GetPodId(), "rootfs_image", ordered[0].spec.GetImage(), "unmaterialized_image", extra)
 	}
-	out := make([]sandbox.VMContainer, 0, len(ordered))
+	out := vmContainerPlan{
+		containers: make([]sandbox.VMContainer, 0, len(ordered)),
+		imagePulls: make(map[string]vmImagePull, len(ordered)),
+	}
 	for i, e := range ordered {
 		// The pod's single rootfs share is materialized once, from the first
 		// container in start order.
@@ -220,11 +269,12 @@ func (r *Runtime) resolveVMContainers(ctx context.Context, box *runtimev1.PodBox
 		if i == 0 {
 			dst = rootfs
 		}
-		vc, reason, err := r.resolveVMContainer(ctx, box, e, rootfsTag, backend, dst)
+		rc, reason, err := r.resolveVMContainer(ctx, box, e, rootfsTag, backend, dst)
 		if err != nil {
-			return nil, reason, err
+			return vmContainerPlan{}, reason, err
 		}
-		out = append(out, vc)
+		out.containers = append(out.containers, rc.guest)
+		out.imagePulls[rc.guest.Name] = rc.imagePull
 	}
 	return out, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
@@ -252,26 +302,32 @@ func vmExtraRootfsImage(ordered []vmContainer) (string, bool) {
 }
 
 // resolveVMContainer resolves one container: pull, read the image config, merge
-// it with the pod spec, and map the result onto the guest carrier.
+// it with the pod spec, and map the result onto the guest carrier — plus the
+// host-side record of what the image step did (vmImagePull).
 //
 // rootfsDest, when non-empty, is the host directory the pod's k3sm.rootfs share
 // exports: this container's image is materialized into it (the guest composes
 // its root as an overlay over that share). It is set for exactly one container
 // per pod — see resolveVMContainers.
-func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox, e vmContainer, rootfsTag string, backend runtimev1.SandboxBackend, rootfsDest string) (sandbox.VMContainer, runtimev1.FailureReason, error) {
+func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox, e vmContainer, rootfsTag string, backend runtimev1.SandboxBackend, rootfsDest string) (resolvedVMContainer, runtimev1.FailureReason, error) {
 	c := e.spec
 	name := c.GetName()
-	invalid := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
-		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+	invalid := func(err error) (resolvedVMContainer, runtimev1.FailureReason, error) {
+		return resolvedVMContainer{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: container %s: %w", errInvalidPodBox, name, err)
 	}
-	pullFailed := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
-		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
-			fmt.Errorf("container %s: %w", name, err)
+	// The image-failure taxonomy is the HOST SPINE'S, applied by the same
+	// classifier (pullFailureReason / the credential reason resolveBinary
+	// stamps), not a vm-local flattening. The provider reads these reasons to
+	// decide whether a retry can help, and it does not know or care which
+	// runtime ran the pod — so an unparseable reference, an absent image under
+	// Never, and an unmatched platform have to be terminal on both spines or
+	// the same pod spec is retried forever on one of them.
+	failed := func(reason runtimev1.FailureReason, err error) (resolvedVMContainer, runtimev1.FailureReason, error) {
+		return resolvedVMContainer{}, reason, fmt.Errorf("container %s: %w", name, err)
 	}
-	rootfsFailed := func(err error) (sandbox.VMContainer, runtimev1.FailureReason, error) {
-		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("container %s: %w", name, err)
+	rootfsFailed := func(err error) (resolvedVMContainer, runtimev1.FailureReason, error) {
+		return failed(runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err)
 	}
 
 	ref := c.GetImage()
@@ -291,13 +347,22 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	// spine's rule, applied here for the same reason.
 	cred := resolveCredential(box, c)
 
+	// The image step starts HERE and ends at the merge below, so the duration
+	// reported for a vm container covers the same work the host spine's covers
+	// (startContainer times resolveBinary as a whole): credential, pull,
+	// materialization, config read, merge.
+	imageStart := time.Now()
+
 	pullCred, err := r.pullCredential(ctx, box, ref)
 	if err != nil {
-		return pullFailed(err)
+		// Before any registry round trip, which is why it is its own reason and
+		// not a pull failure: no retry against the registry can fix a secret
+		// that will not parse.
+		return failed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL, err)
 	}
 	res, err := r.puller.Pull(ctx, ref, pullCred, pullPolicy(backend), c.GetImagePullPolicy())
 	if err != nil {
-		return pullFailed(fmt.Errorf("pull image %q: %w", ref, err))
+		return failed(pullFailureReason(c, err), fmt.Errorf("pull image %q: %w", ref, err))
 	}
 	// RECORD the ROOT, then release the LEASE — the ordering resolveBinary
 	// documents: the blobs are on disk and named by nothing until the record
@@ -305,7 +370,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	// deletes into.
 	if err := r.recordPodImage(box.GetPodId(), res.Manifest); err != nil {
 		res.Lease.Release()
-		return pullFailed(err)
+		return failed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err)
 	}
 	res.Lease.Release()
 
@@ -340,7 +405,8 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
 	if err != nil {
-		return pullFailed(fmt.Errorf("read image config for %q: %w", ref, err))
+		return failed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			fmt.Errorf("read image config for %q: %w", ref, err))
 	}
 	run, err := image.MergeRunSpec(runCfg, image.RunSpecRequest{
 		Container:    c,
@@ -351,7 +417,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		// A merge refusal is a POD-SPEC verdict (image.ErrRunSpecInvalid: no
 		// command anywhere, or an identity that contradicts runAsNonRoot), not a
 		// registry failure — the operator's remedy is to change the container.
-		return sandbox.VMContainer{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+		return resolvedVMContainer{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
 	// The uid is undetermined exactly when the pod set no runAsUser and the
@@ -371,7 +437,11 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	for _, g := range cred.Groups {
 		gids = append(gids, int64(g))
 	}
-	return sandbox.VMContainer{
+	// The image question is answered: this container has a runnable program.
+	// Everything below is mapping, so the step is stopped here rather than at
+	// the return.
+	imagePull := vmImagePull{pulled: res.Fetched, duration: time.Since(imageStart)}
+	return resolvedVMContainer{guest: sandbox.VMContainer{
 		Name:      name,
 		Init:      e.init,
 		RootfsTag: rootfsTag,
@@ -386,5 +456,5 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		UID:              run.UID,
 		GID:              int64(cred.GID),
 		SupplementalGIDs: gids,
-	}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+	}, imagePull: imagePull}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }

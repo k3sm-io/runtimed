@@ -110,6 +110,19 @@ type pod struct {
 	// they have no containerProc and cannot ride the p.containers list.
 	guestContainers     map[string]*runtimev1.ContainerStatus
 	guestContainerOrder []string
+	// guestImagePulls is what each container's HOST-SIDE image step did, keyed
+	// by container name — the plan createVMPod resolved before the machine
+	// existed (resolveVMContainers), carried here because it is the only source
+	// of ContainerStatus.image_pull for a vm pod. The guest reports that a
+	// container started; it never saw a registry, so the fold cannot derive the
+	// outcome from the event it is folding and reads it from here instead.
+	//
+	// Written once at assembly, before the pod is reachable or either
+	// supervision goroutine starts, and never mutated afterwards — a vm pod has
+	// no re-pull path (RestartContainer refuses one), so the plan's answer stays
+	// true for the pod's whole life. Read under mu with the rest of the status
+	// state.
+	guestImagePulls map[string]vmImagePull
 
 	// cpuAcc carries each container's cumulative CPU across restarts so the value
 	// ListPodStats reports is monotone for the pod's whole life: a restarted
@@ -836,7 +849,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// into it: the rootfs share the guest overlays is exported from that
 	// directory, and until it holds the image's files the guest boots with an
 	// empty root.
-	containers, reason, err := r.resolveVMContainers(ctx, box, plan, vmPodBackend, vmRootfs)
+	cplan, reason, err := r.resolveVMContainers(ctx, box, plan, vmPodBackend, vmRootfs)
 	if err != nil {
 		return nil, reason, err
 	}
@@ -846,7 +859,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		MemoryBytes: sp.GetVmMemoryBytes(),
 		RootfsPath:  vmRootfs,
 		Network:     netCfg,
-		Containers:  containers,
+		Containers:  cplan.containers,
 		Volumes:     vmVolumePlan(plan),
 		PodDir:      podDir,
 		// one grace budget for both ends of the shutdown: the helper is given
@@ -895,9 +908,13 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		// surfaces as PodStatus.guest_transport_address, which runtime.proto
 		// forbids publishing into EndpointSlice, DNS or status.podIP. One address
 		// is who the pod IS, the other is where the host dials it.
-		podIP:  podIP,
-		supCtx: supCtx,
-		cancel: cancel,
+		podIP: podIP,
+		// What the resolution above did, per container: the only source of
+		// ContainerStatus.image_pull on this spine, since the guest events the
+		// statuses are folded from carry no image facts at all.
+		guestImagePulls: cplan.imagePulls,
+		supCtx:          supCtx,
+		cancel:          cancel,
 	}
 	// No memory sampler, and no armMemorySampler call anywhere on this path. A vm
 	// pod's memory ceiling is the hypervisor's VZ memorySize, and its OOM truth

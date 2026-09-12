@@ -23,6 +23,8 @@ import (
 	"io"
 	"time"
 
+	"google.golang.org/protobuf/types/known/durationpb"
+
 	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -250,10 +252,41 @@ func (p *pod) guestContainerLocked(name, image string) *runtimev1.ContainerStatu
 	if st, ok := p.guestContainers[name]; ok {
 		return st
 	}
-	st := &runtimev1.ContainerStatus{Name: name, Image: image}
+	st := &runtimev1.ContainerStatus{Name: name, Image: image, ImagePull: p.imagePullOutcomeLocked(name)}
 	p.guestContainers[name] = st
 	p.guestContainerOrder = append(p.guestContainerOrder, name)
 	return st
+}
+
+// imagePullOutcomeLocked renders what this pod's plan recorded about name's
+// image step, or nil when it recorded nothing. The caller holds p.mu.
+//
+// It is stamped when the status entry is CREATED and never recomputed, which is
+// what makes the field's meaning the same on both spines: on the host spine the
+// outcome describes the resolution behind the process the entry names, and here
+// it describes the resolution behind the guest process the entry names — in both
+// cases the answer that was true when the container came to exist. A vm pod
+// re-pulls nothing during its life, so there is no later answer to overwrite it
+// with.
+//
+// nil is the honest value for an unrecorded container, and it is reachable in
+// exactly one way today: a guest event for a container the pod declared but the
+// plan never resolved. That cannot happen through createVMPod — a vm image that
+// fails to resolve fails the WHOLE pod before the machine is built, so a pod
+// that exists has an outcome for every container it declared — but the fold must
+// not invent a pulled=false for a container nobody pulled, because that is the
+// "already present on machine" claim and it would be a fabrication.
+func (p *pod) imagePullOutcomeLocked(name string) *runtimev1.ImagePullOutcome {
+	rec, ok := p.guestImagePulls[name]
+	if !ok {
+		return nil
+	}
+	// A fresh message per entry: the plan's record is plain data, so nothing
+	// here hands two statuses a pointer to one mutable proto.
+	return &runtimev1.ImagePullOutcome{
+		Pulled:   rec.pulled,
+		Duration: durationpb.New(rec.duration),
+	}
 }
 
 // declaredContainerSpec returns the pod's declaration of name, or nil when the
