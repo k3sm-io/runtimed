@@ -74,6 +74,7 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 		PodId:           podID,
 		Namespace:       ns,
 		Name:            "pg",
+		LogDirectory:    filepath.Join(root, "podlogs", ns+"_pg_"+podID),
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: rootfs},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Volumes: []*runtimev1.Volume{{
@@ -139,6 +140,7 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 		PodId:           "pod-pvc-2",
 		Namespace:       ns,
 		Name:            "pg",
+		LogDirectory:    filepath.Join(root, "podlogs", ns+"_pg_pod-pvc-2"),
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: filepath.Join(root, "pods", "pod-pvc-2", "rootfs")},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Volumes: []*runtimev1.Volume{{

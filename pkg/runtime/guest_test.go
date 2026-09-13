@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/mount"
 
 	guestv1 "k3sm.io/apis/guest/v1"
@@ -611,134 +612,111 @@ func TestVMPodExecRoutesToGuestAgent(t *testing.T) {
 	})
 }
 
-// TestVMPodLogsRouteToGuestAgent pins the GetLogs half of the route: SELECTION
-// options cross to the guest (only it holds the buffer), PRESENTATION options
-// are applied HOST-side over untrusted guest data, the guest's stdout/stderr
-// labelling survives, and a host-process pod is untouched.
-func TestVMPodLogsRouteToGuestAgent(t *testing.T) {
-	at := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+// TestVMGuestLogFollowerResumesBySinceTime is the vm log path's gate.
+//
+// A vm container's output lives in the guest, and the host follower's job is to
+// get it into the SAME CRI log file a native container's pumps write, for the
+// whole life of the pod and across agent disconnects. Two properties carry that,
+// and a failure of either is silent:
+//
+//   - Resumption. Each reconnect asks the guest for entries since the LAST ONE
+//     WRITTEN, so a disconnect loses nothing in between.
+//   - No duplicate at the seam. The guest's since_time filter is INCLUSIVE, so
+//     the boundary entry comes back on every reconnect and must be dropped
+//     host-side. A duplicated line in a log file is indistinguishable from the
+//     container having said it twice.
+func TestVMGuestLogFollowerResumesBySinceTime(t *testing.T) {
+	base := time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC)
+	entries := []*runtimev1.LogEntry{
+		{Line: []byte("one"), Timestamp: timestamppb.New(base), Stream: runtimev1.LogStream_LOG_STREAM_STDOUT},
+		{Line: []byte("two"), Timestamp: timestamppb.New(base.Add(time.Second)), Stream: runtimev1.LogStream_LOG_STREAM_STDERR},
+		{Line: []byte("three"), Timestamp: timestamppb.New(base.Add(2 * time.Second)), Stream: runtimev1.LogStream_LOG_STREAM_STDOUT, Partial: true},
+		{Line: []byte("four"), Timestamp: timestamppb.New(base.Add(3 * time.Second)), Stream: runtimev1.LogStream_LOG_STREAM_STDOUT},
+	}
 
-	t.Run("selection-forwarded-presentation-host-side", func(t *testing.T) {
-		agent := &fakeGuestAgent{bootedPod: "pod-vm"}
-		agent.logs = func(req *runtimev1.GetLogsRequest, gs guestv1.GuestAgent_LogsServer) error {
-			for _, ent := range []*runtimev1.LogEntry{
-				{Line: []byte("one"), Timestamp: timestamppb.New(at), Stream: runtimev1.LogStream_LOG_STREAM_STDOUT},
-				{Line: []byte("two"), Timestamp: timestamppb.New(at), Stream: runtimev1.LogStream_LOG_STREAM_STDERR},
-			} {
-				if err := gs.Send(ent); err != nil {
-					return err
-				}
+	var mu sync.Mutex
+	var connects []*runtimev1.GetLogsRequest
+	agent := &fakeGuestAgent{bootedPod: "pod-vm"}
+	agent.logs = func(req *runtimev1.GetLogsRequest, gs guestv1.GuestAgent_LogsServer) error {
+		mu.Lock()
+		connects = append(connects, req)
+		n := len(connects)
+		mu.Unlock()
+
+		// Serve exactly what a guest would for this since_time: everything at or
+		// after it (INCLUSIVE, as the agent's own Selector is).
+		for _, e := range entries {
+			if ts := req.GetSinceTime(); ts.IsValid() && e.GetTimestamp().AsTime().Before(ts.AsTime()) {
+				continue
 			}
-			return nil
-		}
-		dial, dialed := startFakeGuestAgent(t, agent)
-		rt := newTestRuntime(t, Deps{GuestDialer: dial})
-		addVMPod(t, rt, "pod-vm", "app")
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		st := newFakeLogStream(ctx)
-		err := rt.GetLogs(&runtimev1.GetLogsRequest{
-			PodId:      "pod-vm",
-			TailLines:  5,
-			SinceTime:  timestamppb.New(at.Add(-time.Hour)),
-			Timestamps: true,
-		}, st)
-		if err != nil {
-			t.Fatalf("GetLogs: %v", err)
-		}
-
-		want, derr := guestAgentSocket(rt.cfg.Root, "pod-vm")
-		if derr != nil {
-			t.Fatal(derr)
-		}
-		if got := dialed(); len(got) != 1 || got[0] != want {
-			t.Errorf("dialed = %v, want exactly [%s]", got, want)
-		}
-		fwd := agent.logsRequest()
-		if fwd == nil {
-			t.Fatal("the guest agent received no Logs request")
-		}
-		if fwd.GetPodId() != "pod-vm" || fwd.GetContainer() != "app" {
-			t.Errorf("forwarded (pod_id, container) = (%q, %q), want (%q, %q)", fwd.GetPodId(), fwd.GetContainer(), "pod-vm", "app")
-		}
-		if fwd.GetTailLines() != 5 || !fwd.GetSinceTime().IsValid() {
-			t.Errorf("selection options were not forwarded: tail_lines=%d since_time=%v", fwd.GetTailLines(), fwd.GetSinceTime())
-		}
-		if fwd.GetTimestamps() || fwd.GetLimitBytes() != 0 {
-			t.Errorf("presentation options were forwarded (timestamps=%v limit_bytes=%d); they are applied host-side",
-				fwd.GetTimestamps(), fwd.GetLimitBytes())
-		}
-
-		st.mu.Lock()
-		entries := append([]*runtimev1.LogEntry(nil), st.entries...)
-		st.mu.Unlock()
-		if len(entries) != 2 {
-			t.Fatalf("client got %d entries, want 2", len(entries))
-		}
-		if got := string(entries[0].GetLine()); !strings.HasSuffix(got, " one") {
-			t.Errorf("entry 0 = %q, want the host-rendered RFC3339 prefix + %q", got, "one")
-		}
-		if entries[0].GetStream() != runtimev1.LogStream_LOG_STREAM_STDOUT ||
-			entries[1].GetStream() != runtimev1.LogStream_LOG_STREAM_STDERR {
-			t.Errorf("stream labels = (%v, %v), want (STDOUT, STDERR): the guest's demux must survive the relay",
-				entries[0].GetStream(), entries[1].GetStream())
-		}
-	})
-
-	t.Run("limit-bytes-enforced-host-side", func(t *testing.T) {
-		agent := &fakeGuestAgent{bootedPod: "pod-vm"}
-		agent.logs = func(req *runtimev1.GetLogsRequest, gs guestv1.GuestAgent_LogsServer) error {
-			// A guest that ignores the budget entirely (it was not even told).
-			for range 100 {
-				if err := gs.Send(&runtimev1.LogEntry{Line: []byte("flood"), Timestamp: timestamppb.New(at)}); err != nil {
-					return err
-				}
+			// The first connection dies after delivering the first two entries —
+			// the disconnect this test is about.
+			if n == 1 && string(e.GetLine()) == "three" {
+				return status.Error(codes.Unavailable, "the guest agent went away")
 			}
-			return nil
+			if err := gs.Send(e); err != nil {
+				return err
+			}
 		}
-		dial, _ := startFakeGuestAgent(t, agent)
-		rt := newTestRuntime(t, Deps{GuestDialer: dial})
-		addVMPod(t, rt, "pod-vm", "app")
+		return nil
+	}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		st := newFakeLogStream(ctx)
-		if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-vm", LimitBytes: 12}, st); err != nil {
-			t.Fatalf("GetLogs: %v", err)
-		}
-		st.mu.Lock()
-		var total int
-		for _, e := range st.entries {
-			total += len(e.GetLine()) + 1
-		}
-		st.mu.Unlock()
-		if total > 12 {
-			t.Errorf("client received %d bytes for limit_bytes=12: a guest that ignores the budget must not flood the client", total)
-		}
-		if total == 0 {
-			t.Error("client received nothing; the budget should have carried at least one line")
-		}
-	})
+	dial, _ := startFakeGuestAgent(t, agent)
+	rt := newTestRuntime(t, Deps{GuestDialer: dial})
+	addVMPod(t, rt, "pod-vm", "app")
 
-	t.Run("host-process-pod-never-touches-the-guest-route", func(t *testing.T) {
-		agent := &fakeGuestAgent{bootedPod: "pod-vm"}
-		dial, dialed := startFakeGuestAgent(t, agent)
-		w := newBlockingWaiter()
-		rt := newTestRuntime(t, Deps{GuestDialer: dial, Waiter: w})
-		mustCreatePod(t, rt, hostBinBox(rt, "pod-host"))
-		defer w.release(1001)
+	path := filepath.Join(t.TempDir(), "0.log")
+	w, err := crilog.Open(path)
+	if err != nil {
+		t.Fatalf("open the container log: %v", err)
+	}
+	defer func() { _ = w.Close() }()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		st := newFakeLogStream(ctx)
-		if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-host"}, st); err != nil {
-			t.Fatalf("GetLogs: %v", err)
+	// Drive the two connections explicitly through the one-connection half, so
+	// the assertion is about the resume contract and not about a backoff timer.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var last time.Time
+	if _, serr := rt.streamGuestContainerLog(ctx, "pod-vm", "app", w, &last); serr == nil {
+		t.Fatal("the first connection was expected to fail mid-stream")
+	}
+	if want := base.Add(time.Second); !last.Equal(want) {
+		t.Fatalf("resume point after the disconnect = %v, want the last WRITTEN entry's stamp %v", last, want)
+	}
+	if _, serr := rt.streamGuestContainerLog(ctx, "pod-vm", "app", w, &last); serr != nil {
+		t.Fatalf("the reconnect failed: %v", serr)
+	}
+
+	mu.Lock()
+	got := append([]*runtimev1.GetLogsRequest(nil), connects...)
+	mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("the follower made %d connections, want 2", len(got))
+	}
+	if got[0].GetSinceTime().IsValid() {
+		t.Error("the FIRST connect carried a since_time; it must take everything the guest retained")
+	}
+	if !got[0].GetFollow() || !got[1].GetFollow() {
+		t.Error("the follower must ask the guest to follow")
+	}
+	if ts := got[1].GetSinceTime(); !ts.IsValid() || !ts.AsTime().Equal(base.Add(time.Second)) {
+		t.Errorf("the reconnect asked since %v, want the last written entry's stamp %v", ts, base.Add(time.Second))
+	}
+
+	lines := readCRILog(t, path)
+	var payloads []string
+	for _, l := range lines {
+		payloads = append(payloads, l.stream+"/"+l.tag+"/"+l.payload)
+	}
+	want := []string{"stdout/F/one", "stderr/F/two", "stdout/P/three", "stdout/F/four"}
+	if len(payloads) != len(want) {
+		t.Fatalf("the file holds %v, want %v — an entry was lost or written twice across the reconnect", payloads, want)
+	}
+	for i := range want {
+		if payloads[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, payloads[i], want[i])
 		}
-		if got := dialed(); len(got) != 0 {
-			t.Errorf("host-process GetLogs dialed a guest agent (%v)", got)
-		}
-	})
+	}
 }
 
 // TestGuestAgentSocketIsRuntimedPrivate pins the runtimed-private socket placement as a property

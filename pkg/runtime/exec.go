@@ -29,6 +29,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"k3sm.io/runtimed/pkg/crilog"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -261,17 +263,27 @@ func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tt
 // lookupContainer for that reason: a vm pod has no host containerProc, so the
 // host-process lookup cannot answer for one at all.
 //
-// NATIVE PODS ONLY: a native container is spawned (posix_spawn)
-// with its combined stdout+stderr wired to the log pipe and its stdin not
-// retained — so there is no fd to feed new input to a running native process.
-// Interactive attach (stdin, or a tty) is therefore reported Unimplemented
-// rather than silently dropping the operator's keystrokes; `kubectl exec` is
-// the supported interactive path there. The native route supports the OUTPUT
-// half faithfully: it replays the container's buffered combined output and then
-// follows new output live until the container exits (delivering its exit code)
-// or the client disconnects. Full interactive attach for a NATIVE pod awaits
-// stdin-pty retention work for native pods; the vm route above has no such
-// limitation, because the guest retains the endpoints at spawn.
+// NATIVE PODS ONLY: a native container is spawned (posix_spawn) with its
+// stdout and stderr wired to the log pipes and its stdin not retained — so
+// there is no fd to feed new input to a running native process. Interactive
+// attach (stdin, or a tty) is therefore reported Unimplemented rather than
+// silently dropping the operator's keystrokes; `kubectl exec` is the supported
+// interactive path there. Full interactive attach for a NATIVE pod awaits
+// stdin-pty retention work; the vm route above has no such limitation, because
+// the guest retains the endpoints at spawn.
+//
+// LIVE-ONLY, deliberately. It follows output written from the moment of the
+// attach and REPLAYS NOTHING. That is what CRI attach means upstream — it
+// bridges a client to a running container's stdio, not to a history — and it is
+// now also the only honest answer: runtimed retains no copy of a container's
+// output. Everything the container said before the attach is in its log file,
+// which is what `kubectl logs` reads.
+//
+// The two streams are kept apart (stdout to Stdout, stderr to Stderr) and the
+// CRI partial tag decides the delimiter: a chunk that ENDS a logical line gets
+// its newline back (the chunker stripped it), while a chunk that continues one
+// is forwarded raw, so a 40 KiB line arrives as one line at the terminal rather
+// than as three.
 func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 	ctx := stream.Context()
 	first, err := stream.Recv()
@@ -305,16 +317,11 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 		return stream.Send(resp)
 	}
 
-	// Follow new output from now; replay the existing buffer first so the operator
-	// sees recent context (subscribe before snapshot to avoid missing a line
-	// written in between).
-	follow, cancel := cp.logs.subscribe()
+	// Follow new output from now. There is deliberately no replay; see the doc
+	// comment. A container that never started has no fanout either, which the
+	// nil check above has already refused.
+	follow, cancel := cp.fanout.subscribe()
 	defer cancel()
-	for _, line := range cp.logs.snapshot(0) {
-		if err := send(&runtimev1.AttachResponse{Stdout: appendNewline(line)}); err != nil {
-			return err
-		}
-	}
 
 	for {
 		select {
@@ -324,7 +331,7 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 			code, _, _ := cp.proc.Wait(ctx)
 			return send(&runtimev1.AttachResponse{Exit: &runtimev1.ExecResult{ExitCode: int32(code)}})
 		case ent := <-follow:
-			if err := send(&runtimev1.AttachResponse{Stdout: appendNewline(ent.line)}); err != nil {
+			if err := send(attachChunk(ent)); err != nil {
 				return err
 			}
 		}
@@ -474,11 +481,22 @@ func pumpReader(r io.Reader, emit func([]byte) error) {
 	}
 }
 
-// appendNewline returns line with a trailing newline (the combined-log buffer
-// stores newline-stripped lines; attach re-adds it so the operator sees discrete
-// lines).
-func appendNewline(line []byte) []byte {
-	out := make([]byte, 0, len(line)+1)
-	out = append(out, line...)
-	return append(out, '\n')
+// attachChunk renders one live output chunk as an AttachResponse, on the field
+// matching its stream.
+//
+// A FULL chunk (the CRI F tag) gets its line terminator back: the chunker
+// stripped it so the log file could supply its own, and an attached terminal
+// that received the bytes without it would run every line together. A PARTIAL
+// chunk is forwarded raw — it is the middle of a line that has not ended yet,
+// and inserting a newline there would fabricate a line break the container
+// never wrote.
+func attachChunk(ent logChunk) *runtimev1.AttachResponse {
+	out := ent.chunk
+	if !ent.partial {
+		out = append(append(make([]byte, 0, len(ent.chunk)+1), ent.chunk...), '\n')
+	}
+	if ent.stream == crilog.StreamStderr {
+		return &runtimev1.AttachResponse{Stderr: out}
+	}
+	return &runtimev1.AttachResponse{Stdout: out}
 }

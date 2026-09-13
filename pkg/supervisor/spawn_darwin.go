@@ -35,7 +35,7 @@ extern char **environ;
 // for a posix_spawn file action (unix exposes no posix_spawn at all), and the
 // Go-level alternative — fork+chdir+exec via os/exec — is exactly what this
 // supervisor rejected for pod spawns, because it gives up the single-kqueue
-// reaper and the precise file-action fd control the combined-log pipe needs. So
+// reaper and the precise file-action fd control the two output pipes need. So
 // cgo it is, isolated in this file behind the Spawner interface.
 //
 // two SPELLINGS, one MEANING, chosen by DEPLOYMENT TARGET so the build is
@@ -61,9 +61,13 @@ extern char **environ;
 
 // k3sm_posix_spawn spawns argv[0] with argv/envp in its own session (and thus
 // its own process group, since the session leader's pgid == its pid), chdir'ing
-// into dir when dir is non-NULL and dup2'ing logFD onto the child's stdout(1)
-// and stderr(2) when logFD >= 0. Returns 0 and writes the pid to *outPid on
-// success, or an errno.
+// into dir when dir is non-NULL and dup2'ing outFD onto the child's stdout(1)
+// and errFD onto its stderr(2), each when the respective fd is >= 0. Returns 0
+// and writes the pid to *outPid on success, or an errno.
+//
+// TWO fds, not one: the CRI log format labels every line stdout or stderr, and
+// that label has to be established at the descriptor, because nothing
+// downstream can recover it from a merged pipe.
 //
 // A dir that cannot be chdir'd into FAILS the SPAWN with that chdir's errno
 // (ENOENT / ENOTDIR / EACCES) and no child survives it â posix_spawn evaluates
@@ -92,8 +96,8 @@ extern char **environ;
 //
 // Raw posix_spawn (not os/exec) is deliberate: the supervisor owns a single
 // reaper (kqueue), and posix_spawn_file_actions gives precise fd control for the
-// combined-log pipe without a fork+exec dance in Go.
-static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int logFD, pid_t *outPid) {
+// output pipes without a fork+exec dance in Go.
+static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int outFD, int errFD, pid_t *outPid) {
 	posix_spawnattr_t attr;
 	posix_spawn_file_actions_t fa;
 	int rc;
@@ -123,12 +127,25 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 		if ((rc = k3sm_spawn_addchdir(&fa, dir)) != 0) goto done;
 	}
 
-	if (logFD >= 0) {
-		// Combined log: child's fd 1 and fd 2 both go to logFD.
-		if ((rc = posix_spawn_file_actions_adddup2(&fa, logFD, 1)) != 0) goto done;
-		if ((rc = posix_spawn_file_actions_adddup2(&fa, logFD, 2)) != 0) goto done;
-		// Close the original logFD in the child after the dups.
-		if ((rc = posix_spawn_file_actions_addclose(&fa, logFD)) != 0) goto done;
+	// Each stream onto its own pipe, and the raw descriptor closed in the child
+	// after its dup. The close is not housekeeping: without it the pod holds a
+	// second, un-dup'd fd onto the pipe, so the parent's read never sees EOF
+	// when the pod closes fd 1/2 — the log pump would hang for the life of the
+	// process group instead of draining.
+	if (outFD >= 0) {
+		if ((rc = posix_spawn_file_actions_adddup2(&fa, outFD, 1)) != 0) goto done;
+	}
+	if (errFD >= 0) {
+		if ((rc = posix_spawn_file_actions_adddup2(&fa, errFD, 2)) != 0) goto done;
+	}
+	if (outFD >= 0) {
+		if ((rc = posix_spawn_file_actions_addclose(&fa, outFD)) != 0) goto done;
+	}
+	// Guard the aliased case: when both streams were handed the same fd (a
+	// caller that wants them merged), the close above already retired it and a
+	// second addclose would fail the spawn with EBADF.
+	if (errFD >= 0 && errFD != outFD) {
+		if ((rc = posix_spawn_file_actions_addclose(&fa, errFD)) != 0) goto done;
 	}
 
 	rc = posix_spawn(outPid, path, &fa, &attr, argv, envp ? envp : environ);
@@ -155,14 +172,14 @@ func syscallErrno(rc C.int) error {
 }
 
 // PosixSpawner is the production Spawner: raw posix_spawn into a new session +
-// process group, with the combined-log fd dup2'd onto the child's stdout/stderr.
+// process group, with one pipe dup2'd onto each of the child's stdout/stderr.
 // The zero value is usable.
 type PosixSpawner struct{}
 
 // Spawn posix_spawns spec into its own process group and returns the child pid.
 // It passes spec.Env verbatim (so DYLD_INSERT_LIBRARIES flows through to the
-// pod), gives the child spec.Dir as its working directory, and wires spec.LogFD
-// as the child's combined stdout+stderr.
+// pod), gives the child spec.Dir as its working directory, and wires
+// spec.StdoutFD and spec.StderrFD as the child's fd 1 and fd 2.
 //
 // spec.Dir is honored through a posix_spawn chdir file action, never by chdir'ing
 // the daemon: this process is shared by every pod, so a parent-side chdir would
@@ -201,13 +218,16 @@ func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		defer C.free(unsafe.Pointer(cDir))
 	}
 
-	logFD := C.int(-1)
-	if spec.LogFD != 0 {
-		logFD = C.int(spec.LogFD)
+	outFD, errFD := C.int(-1), C.int(-1)
+	if spec.StdoutFD != 0 {
+		outFD = C.int(spec.StdoutFD)
+	}
+	if spec.StderrFD != 0 {
+		errFD = C.int(spec.StderrFD)
 	}
 
 	var pid C.pid_t
-	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, logFD, &pid)
+	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, outFD, errFD, &pid)
 	if rc != 0 {
 		return 0, fmt.Errorf("posix_spawn %s: %w", spec.Path, syscallErrno(rc))
 	}

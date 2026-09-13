@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -315,13 +316,36 @@ func (s *fakeAttachStream) recv(t *testing.T, d time.Duration) *runtimev1.Attach
 	}
 }
 
-// TestAttachStreamsContainerOutput attaches to a running container (no stdin) and
-// asserts it follows the container's live combined output.
-func TestAttachStreamsContainerOutput(t *testing.T) {
+// TestAttachIsLiveOnly pins the attach contract after the move to on-disk logs:
+// attach follows output written from the moment of the attach and REPLAYS
+// NOTHING.
+//
+// Both halves matter and the first is the one that changed. runtimed used to
+// retain a 256 KiB ring per container and replay it on attach; the ring is gone,
+// the output is in the container's CRI log file, and `kubectl logs` is what
+// reads a history. An attach that still replayed would be replaying from a
+// buffer that no longer exists — so the negative assertion here is what keeps a
+// future reader from reintroducing one.
+func TestAttachIsLiveOnly(t *testing.T) {
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Waiter: w})
 	mustCreatePod(t, rt, hostBinBox(rt, "pod-attach"))
 	defer w.release(1001)
+
+	rt.mu.Lock()
+	p := rt.pods["pod-attach"]
+	rt.mu.Unlock()
+	p.mu.Lock()
+	cp := p.containers[0]
+	p.mu.Unlock()
+
+	// Output written BEFORE the attach. It reaches the file (and would have
+	// reached the old replay buffer); the attach must not see it.
+	const before = "said-before-the-attach"
+	if err := cp.logw.Write(crilog.StreamStdout, []byte(before), false); err != nil {
+		t.Fatalf("seed the log file: %v", err)
+	}
+	cp.fanout.publish(crilog.StreamStdout, []byte(before), false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -331,19 +355,30 @@ func TestAttachStreamsContainerOutput(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- rt.Attach(st) }()
 
-	// Simulate container output landing in the combined-log buffer.
-	rt.mu.Lock()
-	p := rt.pods["pod-attach"]
-	rt.mu.Unlock()
-	// Give Attach a moment to subscribe, then write a line.
+	// Give Attach a moment to subscribe, then publish live output.
 	time.Sleep(50 * time.Millisecond)
-	p.mu.Lock()
-	p.containers[0].logs.write([]byte("hello-from-container"))
-	p.mu.Unlock()
+	cp.fanout.publish(crilog.StreamStdout, []byte("hello-from-container"), false)
+	cp.fanout.publish(crilog.StreamStderr, []byte("a-diagnostic"), false)
 
 	resp := st.recv(t, 3*time.Second)
-	if !strings.Contains(string(resp.GetStdout()), "hello-from-container") {
-		t.Errorf("attach stdout = %q, want it to contain %q", resp.GetStdout(), "hello-from-container")
+	if got := string(resp.GetStdout()); !strings.Contains(got, "hello-from-container") {
+		t.Errorf("attach stdout = %q, want it to contain %q", got, "hello-from-container")
+	}
+	if strings.Contains(string(resp.GetStdout()), before) {
+		t.Errorf("attach replayed pre-attach output %q; attach is live-only", before)
+	}
+	// A FULL chunk gets its newline back so a terminal shows discrete lines.
+	if got := string(resp.GetStdout()); !strings.HasSuffix(got, "\n") {
+		t.Errorf("attach stdout = %q, want a trailing newline on a full chunk", got)
+	}
+
+	// The stderr chunk arrives on the stderr field, not merged into stdout.
+	errResp := st.recv(t, 3*time.Second)
+	if got := string(errResp.GetStderr()); !strings.Contains(got, "a-diagnostic") {
+		t.Errorf("attach stderr = %q, want it to contain %q", got, "a-diagnostic")
+	}
+	if len(errResp.GetStdout()) != 0 {
+		t.Errorf("a stderr chunk arrived on the stdout field (%q); the streams must stay apart", errResp.GetStdout())
 	}
 
 	cancel()

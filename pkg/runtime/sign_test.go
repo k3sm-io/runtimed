@@ -197,6 +197,7 @@ func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
 		Namespace:       "team-a",
 		Name:            "p",
 		RootfsPath:      dataVol,
+		LogDirectory:    testPodLogDir(rt, "pod-pull"),
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		ImagePullSecrets: []*runtimev1.LocalObjectReference{

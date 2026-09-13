@@ -17,18 +17,16 @@ limitations under the License.
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -123,6 +121,14 @@ type pod struct {
 	// true for the pod's whole life. Read under mu with the rest of the status
 	// state.
 	guestImagePulls map[string]vmImagePull
+	// guestLogs holds one CRI log Writer per vm container, keyed by container
+	// name — the same kind of file a native container's pumps write, filled
+	// instead by the per-container guest log follower
+	// (followGuestContainerLog). A vm pod's containers have no containerProc to
+	// hang a writer off, so the pod holds them; they are closed with the rest
+	// of the pod's log handles at teardown. Written once at assembly, before
+	// the pod is reachable, and read under mu with the rest of the status state.
+	guestLogs map[string]*crilog.Writer
 
 	// cpuAcc carries each container's cumulative CPU across restarts so the value
 	// ListPodStats reports is monotone for the pod's whole life: a restarted
@@ -253,7 +259,14 @@ type containerProc struct {
 	// re-enter the same confinement domain and re-spawn from the same spec.
 	spec *runtimev1.Container
 	proc *supervisor.Process
-	logs *logBuffer
+	// logw is the container's CRI log file writer — the ONE place this
+	// instance's output is retained, and on disk rather than in the daemon.
+	// nil for a container that never started (waitingContainerProc): there is
+	// no instance, so there is no file and log_path is empty.
+	logw *crilog.Writer
+	// fanout delivers the same chunks to live Attach subscribers. It retains
+	// nothing; see logFanout.
+	fanout *logFanout
 	// state is updated as the container runs/terminates.
 	state *runtimev1.ContainerStatus
 	// restarting marks the container as mid-RestartContainer: its old process is
@@ -462,6 +475,11 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			// (sandbox.Generate's AllowNetwork stanza).
 			ResolverVIP:  r.cfg.ResolverVIP,
 			APIServerVIP: r.cfg.APIServerVIP,
+			// NOT plumbing: this one renders a deny. Every pod's output on the
+			// node lands under this tree, so a pod that could reach it could
+			// read the whole node's logs and rewrite its neighbours'. New
+			// refuses an empty value at construction, so it is always set here.
+			PodLogsDir: r.cfg.PodLogsDir,
 		},
 		PodIP:         ip,
 		ReadOnlyPaths: credPaths,
@@ -920,6 +938,30 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// pod's memory ceiling is the hypervisor's VZ memorySize, and its OOM truth
 	// is the guest cgroup's, reported over ContainerEvents; a host rusage sample
 	// would measure the vmhost helper.
+	// One CRI log file per container, and one follower goroutine pulling that
+	// container's output out of the guest into it. The guest has already
+	// started every container by the time CreateVM returns (its agent does not
+	// answer Health before there is a pod to answer about), so "on container
+	// start" is here — and the follower's since_time resumption means anything
+	// the guest buffered before this dial is collected on the first connect
+	// rather than lost.
+	//
+	// A file that cannot be opened fails the CONTAINER's logging, not the pod:
+	// the guest is already running and refusing the pod now would leave a live
+	// machine to tear down over a log path. It is logged once, loudly.
+	p.guestLogs = make(map[string]*crilog.Writer, len(cplan.containers))
+	for _, gc := range cplan.containers {
+		name := gc.Name
+		logPath := filepath.Join(containerLogDir(box.GetLogDirectory(), name), containerLogFile(0))
+		w, lerr := crilog.Open(logPath)
+		if lerr != nil {
+			r.log.Error("vm container output will not be recorded: its log file could not be opened",
+				"pod", box.GetPodId(), "container", name, "path", logPath, "err", lerr)
+			continue
+		}
+		p.guestLogs[name] = w
+		go r.followGuestContainerLog(supCtx, box.GetPodId(), name, w)
+	}
 	go r.watchVMPodEvents(supCtx, p)
 	go r.watchVMHelperExit(supCtx, p)
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
@@ -1070,7 +1112,7 @@ func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, init
 				"pod", p.box.GetPodId(), "container", c.GetName())
 			return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 		}
-		cp, reason, err := r.startContainer(ctx, p, rootfs, c, true)
+		cp, reason, err := r.startContainer(ctx, p, rootfs, c, true, 0)
 		if err != nil {
 			if !containerClassFailure(reason) {
 				r.releaseStart(p, claimed)
@@ -1105,7 +1147,7 @@ func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, init
 				"pod", p.box.GetPodId(), "container", c.GetName())
 			continue
 		}
-		cp, reason, err := r.startContainer(ctx, p, rootfs, c, false)
+		cp, reason, err := r.startContainer(ctx, p, rootfs, c, false, 0)
 		if err != nil {
 			if !containerClassFailure(reason) {
 				r.releaseStart(p, claimed)
@@ -1221,6 +1263,11 @@ func (r *Runtime) killUntrackedSpawn(ctx context.Context, p *pod, cp *containerP
 			"pod", p.box.GetPodId(), "container", cp.name, "pid", pid, "err", err)
 	}
 	r.removePodProcRecord(p.box.GetPodId(), pid)
+	// The spawn was never installed, so nothing will ever reach this entry to
+	// close its log writer — not the pod teardown (it walks p.containers) and
+	// not a restart. Release it here, on the same drained-or-bounded terms the
+	// replaced-instance release uses, or a refused install leaks a descriptor.
+	r.releaseReplacedContainerLog(cp)
 }
 
 // finishInitStep completes one init step for an already-spawned container: a
@@ -1279,11 +1326,18 @@ func (r *Runtime) blockRemainingLocked(p *pod, fromInit int) {
 // resolution is pod-scoped too (the caller passes r.rootfsPath), identical for
 // init, sidecar, and main containers.
 //
+// wantRestart is the restart_count this instance is being started AS (0 for a
+// first start, oldCount+1 for a RestartContainer re-spawn). It is a FLOOR on
+// the log file's instance number, never the number itself: the number is
+// max(wantRestart, one past the highest file already in the container's log
+// dir), so a daemon restart cannot re-open the file a previous run already
+// wrote — see restartCountFromLogDir.
+//
 // ctx is the pod-lifetime supervision context (createPod's podCtx; restart
 // passes a context.WithoutCancel), not the CreatePod request ctx. It scopes the
 // spawn, the kqueue reaper, and the watchContainerExit drain-wait to the pod's
 // lifetime so they survive the unary RPC's return under the daemon split.
-func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool) (*containerProc, runtimev1.FailureReason, error) {
+func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *runtimev1.Container, isInit bool, wantRestart int32) (*containerProc, runtimev1.FailureReason, error) {
 	// The image step is timed around resolveBinary as a whole — the pull (or the
 	// local-index hit that stands in for it), the materialization of the layers
 	// into the pod rootfs, and the image-config merge. That is the wall time
@@ -1342,7 +1396,30 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if workingDir == "" {
 		workingDir = rootfs
 	}
-	logs := newLogBuffer(r.log.With("pod", p.box.GetPodId(), "container", c.GetName()))
+	// This instance's CRI log file, opened before the spawn so a container is
+	// never running with nowhere to write. The instance number is chosen
+	// against what is on disk as well as against the requested restart count
+	// (see wantRestart), and it becomes BOTH the file name and the status's
+	// restart_count, so the two can never disagree.
+	logDir := containerLogDir(p.box.GetLogDirectory(), c.GetName())
+	instance := wantRestart
+	onDisk, derr := restartCountFromLogDir(logDir)
+	if derr != nil {
+		// A directory that cannot be listed is a node-side problem, not this
+		// container's: log it and keep the requested number rather than refuse
+		// to start the pod over a file name.
+		r.log.Warn("could not read the container log dir; using the requested instance number",
+			"pod", p.box.GetPodId(), "container", c.GetName(), "dir", logDir, "err", derr)
+	} else if onDisk > instance {
+		instance = onDisk
+	}
+	logPath := filepath.Join(logDir, containerLogFile(instance))
+	logw, err := crilog.Open(logPath)
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("open container log for %s: %w", c.GetName(), err)
+	}
+	fanout := &logFanout{}
 	spec := supervisor.SpawnSpec{
 		Path: shimPath,
 		Argv: shimArgv,
@@ -1353,12 +1430,23 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		name:         c.GetName(),
 		spec:         c,
 		initDeclared: isInit,
-		logs:         logs,
+		logw:         logw,
+		fanout:       fanout,
 		env:          env,
 		workingDir:   workingDir,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
+			// Where this instance's output is. The node reads `kubectl logs`
+			// from exactly this path and rotates exactly this file, so it is
+			// published from the writer rather than re-derived.
+			LogPath: logw.Path(),
+			// The instance number and the restart count are ONE number: the
+			// file is named for the count, and a cold start recovers the count
+			// from the files (upstream's calcRestartCountByLogDir). A caller
+			// that owns the count — RestartContainer — overwrites this with the
+			// same value under its own lock.
+			RestartCount: instance,
 			// The image's content identity (config digest), empty on the two
 			// host-binary routes — see resolvedBinary.imageID.
 			ImageId: rb.imageID,
@@ -1381,11 +1469,12 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			},
 		},
 	}
-	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, logs.write)
+	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, containerLogSink(logw, fanout))
 	cp.proc = proc
 
 	if err := proc.Start(ctx); err != nil {
 		_ = cleanup()
+		_ = logw.Close()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("spawn container %s: %w", c.GetName(), err)
 	}
@@ -1445,7 +1534,7 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	// independently of the kqueue reaper that just unblocked Wait; snapshotting
 	// straight away races the pump and intermittently loses those last lines.
 	// This drain-wait sits outside pod.mu so the lock order stays leaf-ward
-	// (pod.mu → logBuffer.mu, never inverted).
+	// (pod.mu → the log writer's mu, never inverted).
 	//
 	// The wait is bounded by drainGrace, independent of ctx: a pod process
 	// commonly forks a grandchild (shell → daemon) that inherits and holds the
@@ -1476,6 +1565,10 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 		// it: a successor's id published as the predecessor's is exactly the
 		// confusion CRI container ids exist to prevent.
 		ContainerId: cp.state.GetContainerId(),
+		// This instance's log file. It travels with the terminated state into
+		// last_termination_state on a restart, which is how `kubectl logs
+		// --previous` finds the crashed run's output.
+		LogPath: cp.state.GetLogPath(),
 	}
 	switch {
 	case p.oomKilled && (sig != 0 || code != 0):
@@ -1491,23 +1584,18 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 		term.Reason = "Error"
 	}
 
-	// terminationMessagePolicy=FallbackToLogsOnError: when a container fails
-	// (non-zero exit or a signal-kill, including OOMKilled) and nothing above
-	// set a message, fill term.Message from the tail of its combined log.
-	// runtimed applies this policy unconditionally — there is no per-container
-	// terminationMessagePolicy in apis, and the default `File` policy is
-	// unimplementable on darwin (no /dev/termination-log bind mount), so every
-	// container is treated as FallbackToLogsOnError; a documented
-	// divergent-by-design choice, strictly more diagnostic than the unavoidable
-	// File-empty message. Only term.Message is touched: term.Reason keeps the
-	// tested OOMKilled/Completed/Error strings, an already-set wait-error
-	// message (above) is never clobbered, and a successful (exit-0) container
-	// keeps an empty message (upstream NodeConformance asserts that).
-	if (code != 0 || sig != 0) && term.Message == "" {
-		if msg := terminationMessageFromLogs(cp.logs); msg != "" {
-			term.Message = msg
-		}
-	}
+	// terminationMessagePolicy=FallbackToLogsOnError is NOT applied here, and
+	// that is the split this daemon keeps: the message is the tail of the
+	// container's LOG FILE, and runtimed does not read log files — it writes
+	// them. The node computes it from ContainerStatus.log_path, exactly as the
+	// kubelet computes it from the file containerd wrote. term.Message stays
+	// empty unless a source above set one (the wait error), which is also what
+	// upstream [NodeConformance] asserts for a successful container.
+	//
+	// The drain-wait above is what makes that computable at all: it holds the
+	// terminated publish until both pumps have flushed the dying child's final
+	// output into the file, so the node reading the tail sees the panic, not
+	// the line before it.
 
 	cp.state.State = &runtimev1.ContainerState{Terminated: term}
 	// Snapshot the restart flag under the same lock that guards the state write,
@@ -1542,36 +1630,6 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 		return
 	}
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
-}
-
-// Upstream kubelet caps for a FallbackToLogsOnError termination message sourced from
-// the container LOG (kubernetes/pkg/kubelet/container/helpers.go):
-// MaxContainerTerminationMessageLogLines (80) and
-// MaxContainerTerminationMessageLogLength (2048). These are the LOG-fallback caps;
-// the larger 4096 cap is the /dev/termination-log File-read cap, which does not apply
-// here — the File policy is unimplementable on darwin (see watchContainerExit).
-const (
-	maxTerminationMessageLogLines = 80
-	maxTerminationMessageLogBytes = 2048
-)
-
-// terminationMessageFromLogs renders a FallbackToLogsOnError termination message from
-// the tail of a container's combined (stdout+stderr) log: the last
-// maxTerminationMessageLogLines lines joined with "\n", then truncated tail-biased to
-// the last maxTerminationMessageLogBytes bytes (the most recent output is the most
-// diagnostic). It returns "" when the log is empty.
-func terminationMessageFromLogs(logs *logBuffer) string {
-	lines := logs.snapshot(maxTerminationMessageLogLines)
-	if len(lines) == 0 {
-		return ""
-	}
-	// The byte-count tail cut can land inside a multi-byte UTF-8 rune, leaving
-	// orphan continuation bytes at the front, so it goes through utf8TailBytes
-	// (shared with logBuffer.write's oversized-line admission): term.Message stays
-	// valid UTF-8, and because the rounding only ever trims, the <=2048-byte cap
-	// still holds (the tail end, the most diagnostic bytes, is untouched).
-	msg := utf8TailBytes(bytes.Join(lines, []byte("\n")), maxTerminationMessageLogBytes)
-	return string(msg)
 }
 
 // trulyTerminalLocked reports whether the pod has reached a state it can never
@@ -1935,15 +1993,16 @@ func boundedFailureMessage(err error) string {
 // consumer must see. reason is the kubelet-verbatim reason string (empty for a
 // failure, which the provider names) and failure is the typed cause.
 //
-// It carries a real log buffer, empty, so `kubectl logs` on a waiting container
-// answers "nothing yet" instead of dereferencing a nil buffer.
-func (r *Runtime) waitingContainerProc(podID string, c *runtimev1.Container, isInit bool,
+// It carries NO log writer and NO log_path: the container was never spawned, so
+// no instance of it exists and no file was opened for one. An empty log_path is
+// the node's signal that there is nothing on disk to read — distinct from a path
+// that exists and holds nothing.
+func (r *Runtime) waitingContainerProc(_ string, c *runtimev1.Container, isInit bool,
 	failure runtimev1.FailureReason, reason, message string) *containerProc {
 	return &containerProc{
 		name:         c.GetName(),
 		spec:         c,
 		initDeclared: isInit,
-		logs:         newLogBuffer(r.log.With("pod", podID, "container", c.GetName())),
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
@@ -3058,217 +3117,4 @@ func hasPersistentVolume(box *runtimev1.PodBox) bool {
 		}
 	}
 	return false
-}
-
-// logBuffer is an in-memory ring of a container's combined output for GetLogs,
-// plus a set of live followers (Attach) that receive lines as they are written.
-//
-// Bounded by bytes, not by line count (logBufferMaxBytes): the retention budget
-// has to be denominated in the resource it protects. A line-count cap is not a
-// memory bound at all — the supervisor's pump admits a single token up to 1 MiB
-// (supervisor.pumpLogs' bufio.Scanner max), so "keep the last 5000 lines" is
-// "keep up to 5 GiB" in the worst case. The byte cap bounds both shapes with one
-// number, and is the unit the read side already speaks
-// (GetLogsRequest.limit_bytes in k3sm.io/apis).
-//
-// Eviction is true ring behaviour: the oldest lines go first, so the newest
-// output — what `kubectl logs` and the FallbackToLogsOnError termination
-// message actually ask for — always survives. A reader is not told that
-// eviction happened: LogEntry carries no truncation marker (an apis change),
-// and synthesizing a "N lines dropped" line into the stream would be
-// indistinguishable from container output, worse than silence. The signal
-// instead goes to the operator: the first eviction on a buffer logs one warning
-// naming the pod/container (once per buffer — the pump calls write per line and
-// a chatty pod would otherwise flood the daemon log).
-//
-// Concurrency: mu guards lines, bytes, the drop counters and subs; write (the
-// supervisor.LogSink, called from the supervisor's pump goroutine) appends under
-// mu, evicts under mu, and fans out to each follower under the same lock; a
-// follower's cancel removes it under mu. So a follower never receives after
-// cancel and the log pump never blocks (a slow follower drops lines rather than
-// stalling the pump; the one-shot eviction warning is emitted after the unlock,
-// so logging never widens the critical section).
-type logBuffer struct {
-	log *slog.Logger
-
-	mu    sync.Mutex
-	lines []logLine
-	// bytes is the accounted retention cost of lines (payload + per-line
-	// overhead), kept incrementally so write stays O(evicted) rather than
-	// O(retained).
-	bytes        int
-	droppedLines int
-	droppedBytes int
-	warned       bool
-	subs         map[int]chan logLine
-	nextSub      int
-}
-
-// logLine is one retained line together with the wall-clock instant runtimed
-// received it. The timestamp is what GetLogs evaluates since_time against and
-// what it renders for the timestamps option, so it has to be captured at write
-// time: the supervisor's LogSink hands over bytes only, and nothing downstream
-// can reconstruct when a line was produced once it is sitting in the ring.
-type logLine struct {
-	at   time.Time
-	line []byte
-}
-
-const (
-	// logBufferMaxBytes is the accounted retention budget for one container's
-	// buffer. 256 KiB is chosen against both ends of the trade: a chatty pod
-	// emitting ~100-byte lines still keeps ~2.5k lines of tail — far more than
-	// the 80-line termination message or a typical `kubectl logs --tail` window
-	// — while the node-wide worst case stays affordable: runtimed holds one
-	// buffer per container of every pod on the node, so at the upstream default
-	// of 110 pods with two containers each the ceiling is ~55 MiB of daemon
-	// heap. A 1 MiB cap would make that same ceiling ~220 MiB of unpageable heap
-	// in the daemon whose death takes every pod's supervision with it, to buy
-	// tail nobody reads.
-	logBufferMaxBytes = 256 << 10
-
-	// logLineOverheadBytes is charged per retained line on top of its payload,
-	// so a flood of empty lines is bounded too: without it, "0 bytes of
-	// payload" would retain unbounded lines, each still costing a logLine entry
-	// in the lines slice plus a heap allocation. 72 ≈ the 48-byte logLine entry
-	// (a 24-byte slice header plus the 24-byte time.Time stamp GetLogs filters
-	// and renders on) plus a minimum-size allocation, which also caps the
-	// retained line count at logBufferMaxBytes/72. A retention budget, not an
-	// exact heap measure — but it must never understate the entry, or the cap
-	// above stops being the ceiling it is documented to be.
-	logLineOverheadBytes = 72
-)
-
-// newLogBuffer returns an empty bounded buffer. log receives the one-shot
-// warning emitted when the buffer first evicts (nil = no warning; the caller
-// should pass a logger already tagged with the pod and container).
-func newLogBuffer(log *slog.Logger) *logBuffer {
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
-	}
-	return &logBuffer{log: log}
-}
-
-// logLineCost is a retained line's charge against logBufferMaxBytes.
-func logLineCost(line []byte) int { return len(line) + logLineOverheadBytes }
-
-// write appends a line (the supervisor.LogSink), evicts the oldest lines until
-// the buffer is back within logBufferMaxBytes, and fans the new line out to live
-// followers.
-func (l *logBuffer) write(line []byte) {
-	// A single line can exceed the whole budget (the pump admits up to 1 MiB).
-	// Evicting everything else would still leave the buffer over cap, so an
-	// oversized line is stored truncated to its tail — the same bias
-	// terminationMessageFromLogs applies, for the same reason (the most recent
-	// bytes are the most diagnostic), and with the same rune-boundary rounding
-	// so the retained bytes stay valid UTF-8.
-	if maxLine := logBufferMaxBytes - logLineOverheadBytes; len(line) > maxLine {
-		line = utf8TailBytes(line, maxLine)
-	}
-	ent := logLine{at: time.Now(), line: make([]byte, len(line))}
-	copy(ent.line, line)
-
-	l.mu.Lock()
-	l.lines = append(l.lines, ent)
-	l.bytes += logLineCost(ent.line)
-	// Evict oldest-first. The newest line is never evicted (len > 1): it is
-	// admitted pre-truncated to fit, so the loop always terminates within cap.
-	for l.bytes > logBufferMaxBytes && len(l.lines) > 1 {
-		evicted := l.lines[0]
-		l.bytes -= logLineCost(evicted.line)
-		l.droppedLines++
-		l.droppedBytes += len(evicted.line)
-		// Drop the reference before reslicing so the evicted payload is
-		// collectable immediately rather than pinned by the backing array.
-		l.lines[0] = logLine{}
-		l.lines = l.lines[1:]
-	}
-	warn := l.droppedLines > 0 && !l.warned
-	var droppedLines, droppedBytes int
-	if warn {
-		l.warned = true
-		droppedLines, droppedBytes = l.droppedLines, l.droppedBytes
-	}
-	for _, ch := range l.subs {
-		select {
-		case ch <- ent: // ent.line is never mutated after this, so sharing it is safe
-		default: // slow follower: drop rather than block the supervisor's log pump
-		}
-	}
-	l.mu.Unlock()
-
-	if warn {
-		l.log.Warn("container log buffer full; oldest output evicted",
-			"cap_bytes", logBufferMaxBytes,
-			"dropped_lines", droppedLines, "dropped_bytes", droppedBytes)
-	}
-}
-
-// utf8TailBytes returns the last n bytes of b, advanced to the next UTF-8 rune
-// start so the result never begins with orphan continuation bytes (this only
-// ever trims, so the n-byte bound still holds).
-func utf8TailBytes(b []byte, n int) []byte {
-	if len(b) <= n {
-		return b
-	}
-	b = b[len(b)-n:]
-	for len(b) > 0 && !utf8.RuneStart(b[0]) {
-		b = b[1:]
-	}
-	return b
-}
-
-// subscribe registers a follower that receives lines written after the call,
-// returning the channel and a cancel that deregisters it. The channel is buffered
-// and is not closed by cancel (the consumer — Attach — exits on its own ctx /
-// the container's Done, never on a channel close), so there is no sender/receiver
-// close race.
-func (l *logBuffer) subscribe() (<-chan logLine, func()) {
-	ch := make(chan logLine, 256)
-	l.mu.Lock()
-	if l.subs == nil {
-		l.subs = make(map[int]chan logLine)
-	}
-	id := l.nextSub
-	l.nextSub++
-	l.subs[id] = ch
-	l.mu.Unlock()
-	return ch, func() {
-		l.mu.Lock()
-		delete(l.subs, id)
-		l.mu.Unlock()
-	}
-}
-
-// snapshotEntries returns a copy of the buffered lines with their timestamps,
-// optionally only the last n (the tail_lines selection, which is POSITIONAL and
-// therefore applied before any since_time filtering — the same order the kubelet
-// uses when it seeks back n lines in a log file and then drops the ones older
-// than --since).
-func (l *logBuffer) snapshotEntries(tail int) []logLine {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	start := 0
-	if tail > 0 && tail < len(l.lines) {
-		start = len(l.lines) - tail
-	}
-	out := make([]logLine, 0, len(l.lines)-start)
-	for _, ln := range l.lines[start:] {
-		c := make([]byte, len(ln.line))
-		copy(c, ln.line)
-		out = append(out, logLine{at: ln.at, line: c})
-	}
-	return out
-}
-
-// snapshot returns a copy of the buffered lines, optionally only the last n, for
-// the callers that need the bytes alone (the attach replay and the termination
-// message).
-func (l *logBuffer) snapshot(tail int) [][]byte {
-	ents := l.snapshotEntries(tail)
-	out := make([][]byte, len(ents))
-	for i, e := range ents {
-		out[i] = e.line
-	}
-	return out
 }

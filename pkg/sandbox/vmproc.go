@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	guestv1 "k3sm.io/apis/guest/v1"
@@ -229,13 +230,20 @@ type logTail struct {
 
 func newLogTail(max int) *logTail { return &logTail{max: max} }
 
-func (l *logTail) add(line []byte) {
+// add is the supervisor.LogSink over the helper's output. It ignores the stream
+// label and the CRI partial tag: this ring is a diagnostic tail for one line in
+// a daemon log, not a container log file, so a split line simply appears as two
+// entries. It never fails — dropping a helper's diagnostic must not close the
+// helper's pipe and kill the VM host mid-boot, which is what returning an error
+// from a LogSink means.
+func (l *logTail) add(_ crilog.Stream, chunk []byte, _ bool) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.lines = append(l.lines, string(line))
+	l.lines = append(l.lines, string(chunk))
 	if len(l.lines) > l.max {
 		l.lines = l.lines[len(l.lines)-l.max:]
 	}
+	return nil
 }
 
 // String renders the retained lines newline-joined, or a stated absence. The

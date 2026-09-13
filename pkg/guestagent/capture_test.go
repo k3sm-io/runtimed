@@ -225,10 +225,16 @@ func TestCaptureSelectorAndBounds(t *testing.T) {
 		}
 	})
 
-	t.Run("exceeding-the-bound-truncates-visibly-rather-than-growing", func(t *testing.T) {
+	t.Run("exceeding-the-bound-drops-oldest-and-says-nothing-in-band", func(t *testing.T) {
 		// A four-entry ring driven well past its bound. The retention must hold,
-		// and the reader must be TOLD — a truncated log and a container that went
-		// quiet look identical otherwise, and they call for opposite actions.
+		// oldest-first — and the stream must carry NO synthesized notice.
+		//
+		// It used to carry one, and that was right while this stream WAS
+		// `kubectl logs`. It is wrong now: the host appends every entry to the
+		// pod's CRI log file, where a "N earlier entries were dropped" line is
+		// indistinguishable from something the container said, permanently, to
+		// every future reader of that file. The drop count stays observable
+		// (Ring.Dropped) for node-side diagnostics.
 		const cap = 4
 		c := NewCapture(cap, 0, 0)
 		var b strings.Builder
@@ -238,20 +244,71 @@ func TestCaptureSelectorAndBounds(t *testing.T) {
 		writeTo(t, c, "app", StreamStdout, b.String())
 
 		entries := collect(t, c, "app", Selector{})
-		if len(entries) != cap+1 {
-			t.Fatalf("got %d entries, want %d retained plus one truncation notice: %v", len(entries), cap, lines(entries))
+		if len(entries) != cap {
+			t.Fatalf("got %d entries, want exactly %d retained and no in-band notice: %v", len(entries), cap, lines(entries))
 		}
-		notice := entries[0]
-		if !bytes.Contains(notice.Line, []byte("log truncated")) {
-			t.Errorf("first entry = %q, want the in-band truncation notice at the head of the gap", notice.Line)
+		for _, e := range entries {
+			if bytes.Contains(e.Line, []byte("k3sm-guest")) {
+				t.Errorf("entry %q is a synthesized runtime notice; it would land in the pod's log file as container output", e.Line)
+			}
 		}
-		if !bytes.Contains(notice.Line, []byte("96")) {
-			t.Errorf("notice = %q, want it to name the 96 dropped entries", notice.Line)
-		}
-		got := lines(entries[1:])
+		got := lines(entries)
 		want := []string{"out:line-96", "out:line-97", "out:line-98", "out:line-99"}
 		if !equalStrings(got, want) {
 			t.Errorf("retained = %v, want the newest %d (%v) — the ring drops OLDEST first", got, cap, want)
+		}
+	})
+
+	t.Run("a-split-line-carries-the-cri-partial-tag", func(t *testing.T) {
+		// The split the host writes into the log file as ONE logical line. Every
+		// piece before the newline is PARTIAL (the CRI P tag) and the piece that
+		// reaches it is FULL — without that, a 40 KiB line lands on disk as three
+		// complete lines and `kubectl logs` shows three.
+		const maxLine = 16
+		c := NewCapture(0, 0, maxLine)
+		w := c.Writer("app", StreamStdout)
+		if _, err := w.Write([]byte(strings.Repeat("x", 3*maxLine) + "TAIL\n")); err != nil {
+			t.Fatal(err)
+		}
+		entries := collect(t, c, "app", Selector{})
+		if len(entries) < 2 {
+			t.Fatalf("got %d entries, want the line split across several: %v", len(entries), lines(entries))
+		}
+		for i, e := range entries[:len(entries)-1] {
+			if !e.Partial {
+				t.Errorf("entry %d is not marked partial; a reader would present it as a whole line", i)
+			}
+		}
+		if last := entries[len(entries)-1]; last.Partial {
+			t.Error("the entry that reached the newline is marked partial; it ENDS the logical line")
+		}
+		var rejoined strings.Builder
+		for _, e := range entries {
+			rejoined.Write(e.Line)
+		}
+		if want := strings.Repeat("x", 3*maxLine) + "TAIL"; rejoined.String() != want {
+			t.Errorf("the rejoined line is %q, want %q — the split lost bytes", rejoined.String(), want)
+		}
+		_ = w.Close()
+	})
+
+	t.Run("a-final-line-with-no-newline-is-partial", func(t *testing.T) {
+		// EOF without a newline: the line never ended, so the tag must say so —
+		// the same answer containerd's writer gives.
+		c := NewCapture(0, 0, 0)
+		w := c.Writer("app", StreamStdout)
+		if _, err := w.Write([]byte("unterminated")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		entries := collect(t, c, "app", Selector{})
+		if len(entries) != 1 {
+			t.Fatalf("got %v, want one entry", lines(entries))
+		}
+		if !entries[0].Partial {
+			t.Error("the final unterminated line is not marked partial")
 		}
 	})
 

@@ -60,6 +60,17 @@ type LogEntry struct {
 	Line []byte
 	// Stream is which of the container's two outputs produced it.
 	Stream LogStreamKind
+	// Partial is the CRI P/F tag: true while this chunk CONTINUES a logical
+	// line, false on the chunk that ENDS one.
+	//
+	// It exists because the host writes every entry straight into the pod's CRI
+	// log file, where the tag is the only thing that tells a reader whether to
+	// join this chunk to the next. Without it a 40 KiB line would land on disk
+	// as three complete lines and `kubectl logs` would show three, which is not
+	// what the container wrote. The zero value is the F tag, so an entry nobody
+	// tagged is a complete line — which is what an OLD guest, whose wire
+	// message has no such field, is correctly read as.
+	Partial bool
 }
 
 // size is the entry's charge against the ring's byte budget.

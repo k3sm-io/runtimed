@@ -865,3 +865,81 @@ func TestFirmlinkForms(t *testing.T) {
 		}
 	}
 }
+
+// TestPodLogsRootDenied is the container-log deny gate.
+//
+// Every pod's output on the node lands under ONE tree, so a pod that could read
+// it reads the whole node's logs across every namespace, and one that could write
+// it could forge or erase a neighbour's. The emitted deny IS the entire
+// enforcement — there is no uid boundary between pods in the unprivileged posture
+// — so it is pinned as an emitted string, in both firmlink forms (a deny written
+// only against the /var alias fails OPEN, because libsandbox matches the
+// symlink-resolved /private/var path).
+//
+// The posture uses a NON-DEFAULT pod-logs dir deliberately: a hard-coded literal
+// in systemProtectedPrefixes would pass a test written against /var/log/pods
+// while protecting nothing on a node whose logs live elsewhere (`k3sm dev`), and
+// that is exactly the failure this test exists to catch.
+func TestPodLogsRootDenied(t *testing.T) {
+	const logsDir = "/tmp/x/logs/pods"
+	posture := Posture{WorkDir: "/var/lib/k3sm", PodLogsDir: logsDir}
+	sp := &runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/pod-abc123/rootfs"}
+
+	out, err := Generate(sp, GenerateOptions{Posture: posture})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, want := range []string{
+		`(subpath "/tmp/x/logs/pods")`,
+		`(subpath "/private/tmp/x/logs/pods")`,
+		`(subpath "/var/log/containers")`,
+		`(subpath "/private/var/log/containers")`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the profile does not deny %s:\n%s", want, out)
+		}
+	}
+	// The CONFIGURED dir is denied and upstream's default is not — which is the
+	// difference between a deny that tracks the node and a literal that does not.
+	if strings.Contains(out, `(subpath "/var/log/pods")`) {
+		t.Error(`the profile denies the DEFAULT /var/log/pods on a node configured elsewhere; the deny is not tracking PodLogsDir`)
+	}
+	// The denies sit in the protected tier: after the allows, so a caller's extra
+	// path cannot override them (SBPL is last-match-wins).
+	iAllow := strings.Index(out, "(allow file-read*")
+	iDeny := strings.Index(out, `(subpath "/tmp/x/logs/pods")`)
+	if iAllow < 0 || iDeny < 0 || iDeny < iAllow {
+		t.Errorf("the pod-logs deny (%d) must follow the allow tier (%d)", iDeny, iAllow)
+	}
+
+	t.Run("extra-paths-under-either-tree-are-refused", func(t *testing.T) {
+		for _, p := range []string{
+			logsDir,
+			logsDir + "/default_app_uid/main",
+			ContainerLogSymlinkDir,
+			ContainerLogSymlinkDir + "/app_default_main-abc.log",
+		} {
+			for name, opts := range map[string]GenerateOptions{
+				"read":  {Posture: posture, ReadPaths: []string{p}},
+				"write": {Posture: posture, WritePaths: []string{p}},
+			} {
+				if _, err := Generate(sp, opts); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("Generate with an extra %s path %q: err = %v, want ErrProtectedPath", name, p, err)
+				}
+			}
+		}
+	})
+
+	t.Run("a-malformed-pod-logs-dir-fails-closed", func(t *testing.T) {
+		for name, dir := range map[string]string{
+			"relative":        "var/log/pods",
+			"filesystem-root": "/",
+			"unclean":         "/var/log//pods",
+		} {
+			_, err := Generate(sp, GenerateOptions{Posture: Posture{PodLogsDir: dir}})
+			if !errors.Is(err, ErrInvalidPodLogsDir) {
+				t.Errorf("%s pod-logs dir %q: err = %v, want ErrInvalidPodLogsDir", name, dir, err)
+			}
+		}
+	})
+}

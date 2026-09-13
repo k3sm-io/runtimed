@@ -248,7 +248,7 @@ func TestContainerStartFailureIsTypedByCause(t *testing.T) {
 			p := &pod{box: box, backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 
 			_, reason, err := rt.startContainer(context.Background(), p,
-				derivedRootfs(t, rt, podID), tc.container, false)
+				derivedRootfs(t, rt, podID), tc.container, false, 0)
 			if err == nil {
 				t.Fatalf("startContainer succeeded; want a failure classified %v", tc.want)
 			}

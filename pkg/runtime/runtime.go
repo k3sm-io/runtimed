@@ -218,6 +218,20 @@ type Config struct {
 	// like ResolverVIP it renders NO SBPL rule — an allow_network pod has
 	// unfiltered egress. The control plane (k3sm) sets it from the service CIDR.
 	APIServerVIP string
+	// PodLogsDir is the node's container-log root — the directory the node
+	// creates each pod's <ns>_<pod>_<uid>/<container>/ tree under, and the
+	// kubelet's --pod-logs-dir by name. It is threaded into
+	// sandbox.Posture.PodLogsDir, where it renders a read+write DENY for every
+	// confined pod.
+	//
+	// It is REQUIRED: New fails when it is empty. Unlike ResolverVIP it cannot
+	// take a default, because the value is the enforcement — a deny emitted for
+	// /var/log/pods on a node whose logs are actually under a `k3sm dev`
+	// instance dir protects an empty directory while reading like protection.
+	// The pod-logs tree itself is created by the node, and each PodBox names
+	// its own subtree in log_directory; this is the ROOT the deny is written
+	// against, never a path runtimed derives a log file from.
+	PodLogsDir string
 	// PathShimPath is the on-disk path of the path-rebase DYLD interpose shim
 	// (shim/pathrebase_shim.c). When set, containerEnv injects it into a mounting
 	// container's DYLD_INSERT_LIBRARIES with K3SM_ROOTFS + K3SM_MOUNT_PATHS so an
@@ -629,6 +643,16 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// beats a node-wide outage reported one pod at a time.
 	if filepath.Clean(cfg.Root) != cfg.Root {
 		return nil, fmt.Errorf("runtime root %q must be a clean path (no trailing or doubled separator, no \"..\")", cfg.Root)
+	}
+	// The container-log root is required and validated here, once, rather than
+	// per pod: it renders the SBPL deny that keeps every pod off every other
+	// pod's output, so a node that came up without one would serve pods with
+	// that deny missing and nothing would say so until someone went looking.
+	// sandbox.resolvePosture re-checks it as the sink-side guard; this is the
+	// startup-side one, which turns a node-wide misconfiguration into a single
+	// clear error instead of one sandbox-setup failure per pod.
+	if _, err := sandbox.ValidatePodLogsDir(cfg.PodLogsDir); err != nil {
+		return nil, err
 	}
 	log := cfg.Logger
 	if log == nil {
