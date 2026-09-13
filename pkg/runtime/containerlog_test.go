@@ -361,3 +361,36 @@ func TestReopenContainerLogRefusesANonRunningContainer(t *testing.T) {
 		t.Errorf("message = %v, want containerd's wording", err)
 	}
 }
+
+// TestVMContainerStatusCarriesLogPath pins that a vm container's status names
+// the CRI log file the host-side guest follower writes (the guest fold itself
+// carries no host path), so `kubectl logs` on a vm pod resolves the same
+// log_path field a host container does.
+func TestVMContainerStatusCarriesLogPath(t *testing.T) {
+	dir := t.TempDir()
+	w, err := crilog.Open(filepath.Join(dir, "app", "0.log"))
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer w.Close()
+	p := &pod{
+		box:                 &runtimev1.PodBox{PodId: "pod-vmlp", Containers: []*runtimev1.Container{{Name: "app"}}},
+		guestContainerOrder: []string{"app", "ghost"},
+		guestContainers: map[string]*runtimev1.ContainerStatus{
+			"app":   {Name: "app", State: &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{}}},
+			"ghost": {Name: "ghost"},
+		},
+		guestLogs: map[string]*crilog.Writer{"app": w},
+	}
+	st := &runtimev1.PodStatus{}
+	appendGuestContainerStatusesLocked(st, p)
+	if len(st.ContainerStatuses) != 2 {
+		t.Fatalf("got %d container statuses, want 2", len(st.ContainerStatuses))
+	}
+	if got, want := st.ContainerStatuses[0].GetLogPath(), w.Path(); got != want {
+		t.Fatalf("app log_path = %q, want %q", got, want)
+	}
+	if got := st.ContainerStatuses[1].GetLogPath(); got != "" {
+		t.Fatalf("a container with no writer must report no log_path, got %q", got)
+	}
+}
