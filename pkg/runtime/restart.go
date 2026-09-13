@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -137,7 +138,11 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	if err != nil {
 		return restartFailure(codes.InvalidArgument, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, "restart %s: %v", req.GetPodId(), err), nil
 	}
-	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, restartRootfs, spec, initDeclared)
+	// The replacement is started AS restart_count oldRestartCount+1, which is
+	// also the floor on its log file's instance number — so the new instance
+	// writes <n+1>.log and the run being replaced keeps its own file for
+	// `kubectl logs --previous` to read.
+	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, restartRootfs, spec, initDeclared, oldRestartCount+1)
 	if err != nil {
 		r.clearRestarting(ctx, p, oldCP)
 		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", err)
@@ -164,7 +169,15 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		p.phase == runtimev1.PodPhase_POD_PHASE_FAILED
 	// Written on the not-yet-installed entry, which no observer can reach, so a
 	// refused install below discards them with it.
-	newCP.state.RestartCount = oldRestartCount + 1
+	// startContainer already stamped this instance's number (it names the log
+	// file too, and the two must not disagree); assert the agreement rather
+	// than overwrite it, since a divergence would mean the file a client reads
+	// for --previous is not the one last_termination_state names.
+	if newCP.state.GetRestartCount() != oldRestartCount+1 {
+		r.log.Warn("the container log dir carried a higher instance number than the restart count",
+			"pod", req.GetPodId(), "container", oldCP.name,
+			"restart_count", newCP.state.GetRestartCount(), "expected", oldRestartCount+1)
+	}
 	newCP.state.LastTerminationState = lastTerminationState(oldCP, oldCode, oldSig, oldStarted, req.GetReason())
 	// THE SWAP, through the installer StartContainer and the start sequence use
 	// (installContainerLocked) rather than an open-coded write into p.containers.
@@ -218,6 +231,14 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	status := containerStatusOf(newCP)
 	p.mu.Unlock()
 
+	// Release the REPLACED instance's log file handle. It is not released at the
+	// container's exit — a forked grandchild can outlive its parent holding the
+	// pipe, and closing the writer under it would fail its writes and, by the
+	// write-failure policy, hand it an EPIPE — so the restart, which has already
+	// terminated and reaped that process group, is where the handle goes. The
+	// FILE stays: `kubectl logs --previous` reads it, and only the node deletes it.
+	r.releaseReplacedContainerLog(oldCP)
+
 	if deEscalated {
 		// The pod had reached Succeeded or Failed, so the truly-terminal transition
 		// already cancelled the memory sampler. The replacement main is Running
@@ -233,6 +254,32 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 	return &runtimev1.RestartContainerResponse{Status: status}, nil
+}
+
+// releaseReplacedContainerLog closes a replaced instance's log writer once its
+// pumps have drained, bounded by the same grace the terminated-status path uses.
+//
+// It runs in its own goroutine because the bound is a wait: a grandchild holding
+// the pipe keeps LogsDrained open, and a restart must not block on one. Without
+// the release each restart of a crash-looping container would leak a descriptor
+// for the life of the pod, which is precisely the container that restarts most.
+func (r *Runtime) releaseReplacedContainerLog(oldCP *containerProc) {
+	if oldCP == nil || oldCP.logw == nil {
+		return
+	}
+	go func() {
+		if oldCP.proc != nil {
+			timer := time.NewTimer(r.drainGraceDuration())
+			defer timer.Stop()
+			select {
+			case <-oldCP.proc.LogsDrained():
+			case <-timer.C:
+			}
+		}
+		if err := oldCP.logw.Close(); err != nil {
+			r.log.Warn("close the replaced container log", "container", oldCP.name, "path", oldCP.logw.Path(), "err", err)
+		}
+	}()
 }
 
 // clearRestarting resets the restarting flag on a failed restart so the container
@@ -274,6 +321,10 @@ func lastTerminationState(oldCP *containerProc, code, sig int, startedAt *timest
 		Message:    reqReason,
 		StartedAt:  startedAt,
 		FinishedAt: nowProto(),
+		// The REPLACED instance's log file, which is what `kubectl logs
+		// --previous` resolves through. runtimed does not delete it — the node
+		// prunes instances — so the path stays readable until it does.
+		LogPath: oldCP.state.GetLogPath(),
 		// The PREDECESSOR's id: this state describes the run being replaced, so
 		// it carries oldCP's identity — never the replacement's.
 		ContainerId: oldCP.state.GetContainerId(),

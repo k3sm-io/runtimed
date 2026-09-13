@@ -21,14 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -38,19 +38,28 @@ import (
 // wait-error branch (which sets term.Message itself).
 var errWaitWedge = errors.New("supervisor wait failed")
 
-// pipeSpawner drives the real supervisor.Process log pipe: it writes payload to the
-// child's combined-output fd (spec.LogFD) and closes it, simulating a container that
-// emitted its final output and then exited. It is how the FallbackToLogsOnError tests
-// push bytes through the pump (not a pre-populated buffer), so the pump-vs-reaper
-// drain ordering is exercised end-to-end. payload stays well under the OS pipe buffer
-// so the synchronous write in Spawn (before the pump goroutine starts) never blocks.
+// pipeSpawner drives the real supervisor.Process log pipes: it writes payload to
+// the child's stdout fd and closes both write ends, simulating a container that
+// emitted its final output and then exited. It is how these tests push bytes
+// through the pumps (not a pre-populated buffer), so the pump-vs-reaper drain
+// ordering is exercised end-to-end. payload stays well under the OS pipe buffer
+// so the synchronous write in Spawn (before the pump goroutines start) never
+// blocks.
+//
+// Both writes go through a DUP of the handed fd rather than the fd itself: the
+// Process still owns those descriptors, and closing one here would free its
+// number for the very next dup, aliasing the two streams. (The same reason the
+// supervisor's own fakes dup; see writeAndClose there.)
 type pipeSpawner struct{ payload string }
 
 func (s pipeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
-	if spec.LogFD != 0 && s.payload != "" {
-		w := os.NewFile(spec.LogFD, "logfd")
-		_, _ = w.WriteString(s.payload)
-		_ = w.Close()
+	if s.payload != "" {
+		// Written VERBATIM: the payloads here deliberately end without a newline
+		// (a crashing container's last write), and that is what makes the final
+		// chunk carry the CRI partial tag.
+		if err := writeRawToStreamDup(spec.StdoutFD, s.payload); err != nil {
+			return 0, err
+		}
 	}
 	return 4242, nil
 }
@@ -64,24 +73,35 @@ type cannedWaiter struct {
 
 func (w cannedWaiter) WaitExit(context.Context, int) (int, int, error) { return w.code, w.sig, w.err }
 
-// startTermProc builds and Starts a real supervisor.Process whose pipe is fed by a
-// pipeSpawner(payload) and reaped by w, returning the containerProc that wraps it.
-// decorate (optional) wraps the log sink so a test can gate the pump's delivery
-// timing; nil writes straight into the container's logBuffer.
-func startTermProc(t *testing.T, name, payload string, w supervisor.ExitWaiter, decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
+// startTermProc builds and Starts a real supervisor.Process whose pipes are fed
+// by a pipeSpawner(payload), reaped by w, and whose output is written to a real
+// CRI log file under dir — returning the containerProc that wraps it.
+//
+// decorate (optional) wraps the log sink so a test can gate the pumps' delivery
+// timing; nil writes straight through to the file.
+func startTermProc(t *testing.T, dir, name, payload string, w supervisor.ExitWaiter,
+	decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
 	t.Helper()
-	return startTermProcSpawner(t, name, pipeSpawner{payload: payload}, w, decorate)
+	return startTermProcSpawner(t, dir, name, pipeSpawner{payload: payload}, w, decorate)
 }
 
 // startTermProcSpawner is startTermProc over an arbitrary supervisor.Spawner, so a
 // test can drive a pipe whose write-end is held open past the child's exit (the
 // leaked-grandchild case) instead of the EOF-on-exit pipeSpawner.
-func startTermProcSpawner(t *testing.T, name string, spawner supervisor.Spawner, w supervisor.ExitWaiter, decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
+func startTermProcSpawner(t *testing.T, dir, name string, spawner supervisor.Spawner,
+	w supervisor.ExitWaiter, decorate func(supervisor.LogSink) supervisor.LogSink) *containerProc {
 	t.Helper()
-	logs := newLogBuffer(nil)
-	var sink supervisor.LogSink = logs.write
+	path := filepath.Join(dir, name, "0.log")
+	logw, err := crilog.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = logw.Close() })
+	fan := &logFanout{}
+
+	var sink supervisor.LogSink = containerLogSink(logw, fan)
 	if decorate != nil {
-		sink = decorate(logs.write)
+		sink = decorate(sink)
 	}
 	proc := supervisor.NewProcess(spawner, w,
 		supervisor.SpawnSpec{Path: "/term-test", Argv: []string{"/term-test"}}, sink)
@@ -89,24 +109,26 @@ func startTermProcSpawner(t *testing.T, name string, spawner supervisor.Spawner,
 		t.Fatalf("start %s process: %v", name, err)
 	}
 	return &containerProc{
-		name: name,
-		logs: logs,
-		proc: proc,
+		name:   name,
+		logw:   logw,
+		fanout: fan,
+		proc:   proc,
 		state: &runtimev1.ContainerStatus{
-			Name:  name,
-			Image: "/term-test",
-			State: &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()}},
+			Name:    name,
+			Image:   "/term-test",
+			LogPath: path,
+			State:   &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()}},
 		},
 	}
 }
 
-// heldWriteEnd is a supervisor.Spawner that writes payload to the child's combined
-// stdout+stderr fd and then DUPS that write-end into an independent descriptor it
-// holds open — modeling a forked grandchild that inherits and retains the pipe after
-// the direct child exits. Because a write-end stays open, the supervisor pump never
-// reaches EOF and LogsDrained never closes, so watchContainerExit can only finalize
-// via its bounded drainGrace timeout. release() closes the held fd (test cleanup) so
-// the pump goroutine can finally drain and exit.
+// heldWriteEnd is a supervisor.Spawner that writes payload to the child's stdout
+// fd and then DUPS the STDERR write-end into an independent descriptor it holds
+// open — modeling a forked grandchild that inherits and retains a pipe after the
+// direct child exits. Because a write-end stays open, one supervisor pump never
+// reaches EOF and LogsDrained never closes, so watchContainerExit can only
+// finalize via its bounded drainGrace timeout. release() closes the held fd (test
+// cleanup) so the pump goroutine can finally drain and exit.
 type heldWriteEnd struct {
 	payload string
 
@@ -115,24 +137,22 @@ type heldWriteEnd struct {
 }
 
 func (s *heldWriteEnd) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
-	if spec.LogFD == 0 {
+	if spec.StdoutFD == 0 || spec.StderrFD == 0 {
 		return 4242, nil
 	}
-	// Dup the inherited write-end into a fd of our own (independent of the parent's
-	// logW, which Start closes right after Spawn returns) and keep it open.
-	dupFD, err := unix.Dup(int(spec.LogFD))
-	if err != nil {
-		return 0, fmt.Errorf("dup logfd: %w", err)
-	}
-	held := os.NewFile(uintptr(dupFD), "held-logfd")
 	if s.payload != "" {
-		if _, err := held.WriteString(s.payload); err != nil {
-			_ = held.Close()
-			return 0, fmt.Errorf("write held logfd: %w", err)
+		if err := writeRawToStreamDup(spec.StdoutFD, s.payload); err != nil {
+			return 0, err
 		}
 	}
+	// Keep a dup of the stderr write-end open (independent of the parent's copy,
+	// which Start closes right after Spawn returns).
+	dupFD, err := unix.Dup(int(spec.StderrFD))
+	if err != nil {
+		return 0, fmt.Errorf("dup stderr fd: %w", err)
+	}
 	s.mu.Lock()
-	s.held = held
+	s.held = os.NewFile(uintptr(dupFD), "held-stderr")
 	s.mu.Unlock()
 	return 4242, nil
 }
@@ -147,16 +167,23 @@ func (s *heldWriteEnd) release() {
 	}
 }
 
-// TestTerminationMessageFallbackToLogs is the B11 gate: a failed container with no
-// termination message gets one synthesized from the tail of its combined log
-// (terminationMessagePolicy=FallbackToLogsOnError, which runtimed applies
-// unconditionally — see watchContainerExit). It asserts the conformance-load-bearing
-// negatives too: exit-0 stays empty, an already-set wait-error message is never
-// clobbered, and term.Reason is preserved (OOMKilled). The byte/line caps and the
-// real pump-vs-reaper drain ordering are exercised in dedicated subtests.
-func TestTerminationMessageFallbackToLogs(t *testing.T) {
+// TestContainerExitFinalizesTerminatedState is the B11 gate, re-targeted onto
+// the on-disk split.
+//
+// runtimed NO LONGER synthesizes a FallbackToLogsOnError termination message:
+// that message is the tail of the container's LOG FILE, and runtimed does not
+// read log files — the node computes it from ContainerStatus.log_path exactly as
+// the kubelet computes it from the file containerd wrote. What runtimed still
+// owns, and what is asserted here, is everything that makes the node's
+// computation possible and correct: the terminated reason taxonomy, an
+// already-set wait-error message that must not be clobbered, the log_path the
+// node resolves, and — load-bearing — the DRAIN-WAIT that holds the terminated
+// publish until both pumps have flushed the dying child's final output into the
+// file. Without that wait the node reads the tail and finds the line BEFORE the
+// panic.
+func TestContainerExitFinalizesTerminatedState(t *testing.T) {
 	const lastLine = "panic: runtime error: index out of range [9] with length 3"
-	failLog := "booting service\nhandling request\n" + lastLine // last token returned at EOF (no trailing \n)
+	failLog := "booting service\nhandling request\n" + lastLine // last token at EOF (no trailing \n)
 
 	cases := []struct {
 		name       string
@@ -167,78 +194,58 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		check      func(t *testing.T, term *runtimev1.ContainerStateTerminated)
 	}{
 		{
-			// Happy path: a non-zero exit with an empty message falls back to the log tail.
-			name:       "failure-empty-falls-back-to-log-tail",
+			// A non-zero exit gets NO message from runtimed. The output is in
+			// the file the terminated state names, which is the node's input.
+			name:       "failure-leaves-the-message-to-the-node",
 			payload:    failLog,
 			waiter:     cannedWaiter{code: 1},
 			wantReason: "Error",
 			check: func(t *testing.T, term *runtimev1.ContainerStateTerminated) {
-				if !strings.Contains(term.GetMessage(), lastLine) {
-					t.Errorf("message = %q, want it to contain the final log line %q", term.GetMessage(), lastLine)
+				if term.GetMessage() != "" {
+					t.Errorf("message = %q, want empty: the log-tail fallback is the node's, computed from log_path",
+						term.GetMessage())
+				}
+				if term.GetLogPath() == "" {
+					t.Error("terminated state carries no log_path; the node has nothing to read the tail from")
 				}
 			},
 		},
 		{
-			// Negative (conformance-load-bearing): exit-0 (Completed) gets NO fallback —
-			// upstream [NodeConformance] asserts a successful container has an empty
-			// termination message, even though the log here is non-empty.
-			name:       "success-exit-0-no-fallback",
+			// Negative (conformance-load-bearing): exit-0 (Completed) has an
+			// empty message — upstream [NodeConformance] asserts that.
+			name:       "success-exit-0-has-no-message",
 			payload:    "all good\nstill good\ndone",
 			waiter:     cannedWaiter{code: 0},
 			wantReason: "Completed",
 			check: func(t *testing.T, term *runtimev1.ContainerStateTerminated) {
 				if term.GetMessage() != "" {
-					t.Errorf("exit-0 message = %q, want empty (success has no termination message)", term.GetMessage())
+					t.Errorf("exit-0 message = %q, want empty", term.GetMessage())
 				}
 			},
 		},
 		{
-			// Negative: a message already set on the wait-error path is not clobbered.
-			name:       "wait-error-message-not-clobbered",
+			// Negative: a message set on the wait-error path is not clobbered.
+			name:       "wait-error-message-preserved",
 			payload:    "noise\nmore noise\neven more noise",
 			waiter:     cannedWaiter{code: 1, err: errWaitWedge},
 			wantReason: "Error",
 			check: func(t *testing.T, term *runtimev1.ContainerStateTerminated) {
 				if term.GetMessage() != errWaitWedge.Error() {
-					t.Errorf("message = %q, want the preserved wait error %q (must not clobber)", term.GetMessage(), errWaitWedge.Error())
+					t.Errorf("message = %q, want the preserved wait error %q", term.GetMessage(), errWaitWedge.Error())
 				}
 			},
 		},
 		{
-			// Signal-kill (OOMKilled, sig 9 / code 137) with an empty message falls back,
-			// and term.Reason stays "OOMKilled" (the M2.5 OOM test depends on it).
-			name:       "oomkill-signal-empty-falls-back-reason-preserved",
+			// Signal-kill (OOMKilled, sig 9 / code 137): term.Reason stays
+			// "OOMKilled" (the M2.5 OOM test depends on it).
+			name:       "oomkill-signal-reason-preserved",
 			payload:    "allocating\nallocating more\n" + lastLine,
 			waiter:     cannedWaiter{code: 137, sig: 9},
 			oomKilled:  true,
 			wantReason: "OOMKilled",
 			check: func(t *testing.T, term *runtimev1.ContainerStateTerminated) {
-				if !strings.Contains(term.GetMessage(), lastLine) {
-					t.Errorf("OOMKilled message = %q, want it to contain the final log line %q", term.GetMessage(), lastLine)
-				}
-			},
-		},
-		{
-			// Cap: a container emitting >80 lines / >2048 bytes is truncated to the last
-			// 80 lines and last 2048 bytes (tail-biased): the last line survives, the
-			// FIRST does not.
-			name:       "cap-80-lines-2048-bytes-tail-biased",
-			payload:    capPayload(),
-			waiter:     cannedWaiter{code: 2},
-			wantReason: "Error",
-			check: func(t *testing.T, term *runtimev1.ContainerStateTerminated) {
-				msg := term.GetMessage()
-				if len(msg) > maxTerminationMessageLogBytes {
-					t.Errorf("message is %d bytes, want <= %d", len(msg), maxTerminationMessageLogBytes)
-				}
-				if lines := strings.Count(msg, "\n") + 1; lines > maxTerminationMessageLogLines {
-					t.Errorf("message has %d lines, want <= %d", lines, maxTerminationMessageLogLines)
-				}
-				if !strings.Contains(msg, capLastLine) {
-					t.Errorf("message must contain the LAST log line %q (tail-biased):\n%s", capLastLine, msg)
-				}
-				if strings.Contains(msg, capFirstLine) {
-					t.Errorf("message must NOT contain the FIRST log line %q (tail-biased)", capFirstLine)
+				if term.GetMessage() != "" {
+					t.Errorf("OOMKilled message = %q, want empty", term.GetMessage())
 				}
 			},
 		},
@@ -247,8 +254,9 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := newTestRuntime(t, Deps{})
-			cp := startTermProc(t, "main", tc.payload, tc.waiter, nil)
-			p := &pod{box: hostBinBox(rt, "pod-term"), oomKilled: tc.oomKilled, containers: []*containerProc{cp}}
+			box := hostBinBox(rt, "pod-term")
+			cp := startTermProc(t, box.GetLogDirectory(), "main", tc.payload, tc.waiter, nil)
+			p := &pod{box: box, oomKilled: tc.oomKilled, containers: []*containerProc{cp}}
 
 			rt.watchContainerExit(context.Background(), p, cp, nil)
 
@@ -263,57 +271,61 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		})
 	}
 
-	// race-faithful: drive the real pipe and make the pump-vs-reaper drain ordering
-	// load-bearing. The pump's FIRST sink delivery is gated (sleeps) so that when the
-	// reaper unblocks Wait, the final line is provably not yet in the buffer — only the
-	// drain-wait in watchContainerExit makes it land. A snapshot taken straight after
-	// Wait (the pre-fix behavior) would see an empty buffer. Run under -race, this also
-	// exercises the concurrent pump-write vs. snapshot-read on the logBuffer.
-	t.Run("race-faithful-real-pipe-drains-before-snapshot", func(t *testing.T) {
+	// race-faithful: drive the real pipes and make the pump-vs-reaper drain
+	// ordering load-bearing. The pumps' FIRST sink delivery is gated (sleeps) so
+	// that when the reaper unblocks Wait, the final line is provably not yet in
+	// the FILE — only the drain-wait in watchContainerExit makes it land. Run
+	// under -race, this also exercises the concurrent pump writes against the
+	// same crilog.Writer.
+	t.Run("race-faithful-real-pipe-drains-into-the-file-before-finalizing", func(t *testing.T) {
 		rt := newTestRuntime(t, Deps{})
 		const last = "fatal error: concurrent map writes"
 		payload := "starting\nworking\n" + last
 
 		gate := func(orig supervisor.LogSink) supervisor.LogSink {
 			var once sync.Once
-			return func(line []byte) {
+			return func(stream crilog.Stream, chunk []byte, partial bool) error {
 				once.Do(func() { time.Sleep(50 * time.Millisecond) })
-				orig(line)
+				return orig(stream, chunk, partial)
 			}
 		}
-		cp := startTermProc(t, "main", payload, cannedWaiter{code: 2}, gate)
-		p := &pod{box: hostBinBox(rt, "pod-term-race"), containers: []*containerProc{cp}}
+		box := hostBinBox(rt, "pod-term-race")
+		cp := startTermProc(t, box.GetLogDirectory(), "main", payload, cannedWaiter{code: 2}, gate)
+		p := &pod{box: box, containers: []*containerProc{cp}}
 
 		rt.watchContainerExit(context.Background(), p, cp, nil)
 
-		term := cp.state.GetState().GetTerminated()
-		if term == nil {
-			t.Fatal("container has no terminated state")
+		lines := readCRILog(t, cp.state.GetLogPath())
+		if len(lines) == 0 {
+			t.Fatal("the container log file is empty after the drain-wait")
 		}
-		if !strings.Contains(term.GetMessage(), last) {
-			t.Fatalf("final log line lost to the pump/reaper race.\n got: %q\nwant contains: %q\n"+
-				"(the drain-wait before snapshot is what makes the last line land)", term.GetMessage(), last)
+		if got := lines[len(lines)-1].payload; got != last {
+			t.Fatalf("the final log line is %q, want %q — it was lost to the pump/reaper race\n"+
+				"(the drain-wait before finalizing is what makes it land)", got, last)
+		}
+		// EOF without a trailing newline: the CRI tag must say the line is
+		// incomplete, so a reader does not present it as a whole one.
+		if got := lines[len(lines)-1].tag; got != "P" {
+			t.Errorf("the unterminated final line carries tag %q, want P", got)
 		}
 	})
 
-	// held-open pipe → bounded snapshot, NO hang: a forked grandchild holds the
-	// stdout/stderr write-end open after the direct child exits, so the supervisor
-	// pump never reaches EOF and LogsDrained never closes. watchContainerExit must
-	// still finalize the terminated status within ~drainGrace (snapshotting whatever
-	// tail is buffered), never wedge the pod in Running forever. Run under -race.
-	t.Run("held-open-pipe-bounded-snapshot-no-hang", func(t *testing.T) {
+	// held-open pipe → bounded finalize, NO hang: a forked grandchild holds a
+	// write-end open after the direct child exits, so one supervisor pump never
+	// reaches EOF and LogsDrained never closes. watchContainerExit must still
+	// finalize the terminated status within ~drainGrace, never wedge the pod in
+	// Running forever. Run under -race.
+	t.Run("held-open-pipe-bounded-finalize-no-hang", func(t *testing.T) {
 		rt := newTestRuntime(t, Deps{})
 		rt.drainGrace = 60 * time.Millisecond // small + real so the timeout arm is fast
 
 		const lastLine = "panic: held-pipe diagnostic"
-		// Every line (incl. the diagnostic) is newline-terminated so the pump delivers
-		// it to the buffer before blocking on the never-closing pipe — the missing EOF
-		// is what keeps LogsDrained from closing, not a missing final line.
-		held := &heldWriteEnd{payload: "starting\nworking\n" + lastLine + "\n"}
+		held := &heldWriteEnd{payload: "starting\nworking\n" + lastLine}
 		t.Cleanup(held.release) // let the pipe finally EOF so the pump goroutine exits
 
-		cp := startTermProcSpawner(t, "main", held, cannedWaiter{code: 2}, nil)
-		p := &pod{box: hostBinBox(rt, "pod-held"), containers: []*containerProc{cp}}
+		box := hostBinBox(rt, "pod-held")
+		cp := startTermProcSpawner(t, box.GetLogDirectory(), "main", held, cannedWaiter{code: 2}, nil)
+		p := &pod{box: box, containers: []*containerProc{cp}}
 
 		done := make(chan struct{})
 		go func() {
@@ -333,31 +345,27 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		default:
 		}
 
-		term := cp.state.GetState().GetTerminated()
-		if term == nil {
+		if cp.state.GetState().GetTerminated() == nil {
 			t.Fatal("container has no terminated state after the bounded drain")
-		}
-		if !strings.Contains(term.GetMessage(), lastLine) {
-			t.Errorf("message = %q, want the buffered tail %q (partial snapshot on the drain timeout)", term.GetMessage(), lastLine)
 		}
 	})
 
-	// capture despite request-ctx cancel: under the M2 daemon split the CreatePod ctx
-	// is canceled when the unary handler returns. The fallback must still capture the
-	// log tail, proving watchContainerExit + the reaper run on the detached pod-lifetime
-	// ctx, not the request ctx. Pre-detach this is a silent no-op: canceling makes the
-	// reaper record a bogus context-canceled exit and the drain-wait snapshot nothing.
+	// capture despite request-ctx cancel: under the M2 daemon split the CreatePod
+	// ctx is canceled when the unary handler returns. The output must still reach
+	// the log file, proving watchContainerExit + the reaper run on the detached
+	// pod-lifetime ctx, not the request ctx.
 	t.Run("capture-despite-request-ctx-cancel", func(t *testing.T) {
 		const lastLine = "fatal: detached-supervision diagnostic"
 		w := newBlockingWaiter()
-		w.code = 1 // a failing container → the fallback fires
+		w.code = 1
 		rt := newTestRuntime(t, Deps{
 			Spawner: pipeSpawner{payload: "boot\nserve\n" + lastLine},
 			Waiter:  w,
 		})
+		box := hostBinBox(rt, "pod-detach")
 
 		ctx, cancel := context.WithCancel(context.Background())
-		resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-detach")})
+		resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 		if err != nil {
 			t.Fatalf("CreatePod: %v", err)
 		}
@@ -371,47 +379,10 @@ func TestTerminationMessageFallbackToLogs(t *testing.T) {
 		if reason := waitTerminatedReason(t, rt, "pod-detach", 3*time.Second); reason != "Error" {
 			t.Fatalf("terminated reason = %q, want Error (a canceled request ctx must not corrupt the exit)", reason)
 		}
-		gs, _ := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: "pod-detach"})
-		msg := gs.GetStatus().GetContainerStatuses()[0].GetState().GetTerminated().GetMessage()
-		if !strings.Contains(msg, lastLine) {
-			t.Errorf("message = %q, want the captured tail %q despite request-ctx cancel (detach failed)", msg, lastLine)
+		lines := readCRILog(t, filepath.Join(box.GetLogDirectory(), "main", "0.log"))
+		if len(lines) == 0 || lines[len(lines)-1].payload != lastLine {
+			t.Errorf("the log file holds %v, want it to end with %q despite request-ctx cancel (detach failed)",
+				lines, lastLine)
 		}
 	})
-
-	// UTF-8 boundary: the 2048-byte tail cut must round UP to a rune boundary so
-	// term.Message is valid UTF-8 (a sliced multi-byte rune would corrupt it), while
-	// still honoring the byte cap.
-	t.Run("utf8-tail-cut-rounds-to-rune-boundary", func(t *testing.T) {
-		logs := newLogBuffer(nil)
-		// One line of 3-byte runes longer than the byte cap, so the last-2048-byte cut
-		// lands inside a rune (2048 % 3 != 0): the naive slice would start on a UTF-8
-		// continuation byte.
-		logs.write([]byte(strings.Repeat("世", 1000))) // 3000 bytes > 2048
-		msg := terminationMessageFromLogs(logs)
-		if len(msg) > maxTerminationMessageLogBytes {
-			t.Errorf("len(msg) = %d, want <= %d (byte cap must hold)", len(msg), maxTerminationMessageLogBytes)
-		}
-		if !utf8.ValidString(msg) {
-			t.Errorf("message is not valid UTF-8 after the tail cut (rune sliced)")
-		}
-		if !strings.HasSuffix(msg, "世") {
-			t.Error("message lost its tail end (the cut should trim only the leading partial rune)")
-		}
-	})
-}
-
-// capPayload renders 120 distinct log lines (> the 80-line cap, and > 2048 bytes once
-// joined) so both the line cap and the byte cap engage; capFirstLine / capLastLine are
-// the first and last lines, for the tail-biased truncation assertions.
-const (
-	capFirstLine = "L000-padding-padding-padding"
-	capLastLine  = "L119-padding-padding-padding"
-)
-
-func capPayload() string {
-	var b strings.Builder
-	for i := 0; i < 120; i++ {
-		fmt.Fprintf(&b, "L%03d-padding-padding-padding\n", i)
-	}
-	return b.String()
 }

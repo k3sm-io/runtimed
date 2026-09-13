@@ -22,7 +22,7 @@ import (
 
 // SpawnSpec is everything needed to posix_spawn one pod process: the executable
 // path, full argv (argv[0] is conventionally the path), the environment, the
-// working directory, and the fd the child's combined stdout+stderr is wired to.
+// working directory, and the two fds the child's stdout and stderr are wired to.
 type SpawnSpec struct {
 	// Path is the executable to spawn (the exec-shim helper).
 	Path string
@@ -41,9 +41,18 @@ type SpawnSpec struct {
 	// default (pkg/runtime defaults it to the pod data volume) must apply it
 	// before they build the spec: this package cannot.
 	Dir string
-	// LogFD is the write end of the combined stdout+stderr pipe; the child's
-	// fd 1 and fd 2 are dup2'd onto it. If 0, the child inherits the parent's.
-	LogFD uintptr
+	// StdoutFD is the write end of the pipe the child's fd 1 is dup2'd onto.
+	// If 0, the child inherits the parent's stdout.
+	//
+	// It is a SEPARATE pipe from StderrFD, and that separation is the CRI log
+	// contract rather than a preference: every line written to disk carries a
+	// stdout/stderr label, and a merge cannot be undone downstream. The two fds
+	// are closed in the child after the dups, so a pod never holds a raw
+	// descriptor onto either pipe.
+	StdoutFD uintptr
+	// StderrFD is the write end of the pipe the child's fd 2 is dup2'd onto.
+	// If 0, the child inherits the parent's stderr.
+	StderrFD uintptr
 }
 
 // Spawner posix_spawns a pod process in its own session/process group and

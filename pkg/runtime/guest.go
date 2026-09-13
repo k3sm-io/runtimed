@@ -22,6 +22,8 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -29,6 +31,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/guestagent"
 	"k3sm.io/runtimed/pkg/image"
 
@@ -329,7 +332,7 @@ const maxGuestCapabilityTokens = 64
 // ignored exactly as guest.proto says it should be.
 func knownGuestCapability(tok string) bool {
 	switch tok {
-	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach:
+	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial:
 		return true
 	}
 	return false
@@ -534,81 +537,133 @@ func relayAttachResponse(resp *runtimev1.AttachResponse) *runtimev1.AttachRespon
 	return out
 }
 
-// getLogsGuest is GetLogs's vm route: the guest agent holds the pod's output, so
-// the SELECTION options (follow, tail_lines, since_time, previous) are forwarded
-// to it — only the guest can apply them — while the PRESENTATION options
-// (timestamps, limit_bytes) are applied HOST-side by the same logEmitter the
-// host-process path uses.
+// vmLogFollowBaseBackoff / vmLogFollowMaxBackoff bound the reconnect cadence of
+// a guest log follower. The first retry is fast because the common cause is the
+// agent still coming up; the ceiling is what keeps a guest that will never
+// answer again from being dialled once a second for the life of the pod.
+const (
+	vmLogFollowBaseBackoff = time.Second
+	vmLogFollowMaxBackoff  = 30 * time.Second
+)
+
+// followGuestContainerLog appends one vm container's output to its CRI log file
+// for as long as the pod lives.
 //
-// That split is the bounded-read posture, not a tidiness preference: an agent
-// that ignores limit_bytes and streams forever must not be able to flood the
-// client, so the byte budget is spent and enforced here, on this side of the
-// boundary. Timestamps are rendered here for the same reason the budget is
-// counted here — the two are one option set, and rendering guest-side would
-// double-prefix every line.
-func (r *Runtime) getLogsGuest(req *runtimev1.GetLogsRequest, stream grpc.ServerStreamingServer[runtimev1.LogEntry], p *pod) error {
-	podID := p.box.GetPodId()
-	container, err := vmContainerName(p.box, req.GetContainer())
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithCancel(stream.Context())
-	defer cancel()
-
-	conn, err := r.dialGuest(podID)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "logs: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	fwd := &runtimev1.GetLogsRequest{
-		PodId:     podID,
-		Container: container,
-		Follow:    req.GetFollow(),
-		TailLines: req.GetTailLines(),
-		// previous is FORWARDED rather than refused as it is on the host-process
-		// path: there the answer is knowably "not retained" (runtimed buffers only
-		// the live container), whereas the guest owns whatever it retained, so the
-		// honest reply is the agent's.
-		Previous: req.GetPrevious(),
-	}
-	if ts := req.GetSinceTime(); ts.IsValid() {
-		fwd.SinceTime = timestamppb.New(ts.AsTime())
-	}
-	agent, err := guestv1.NewGuestAgentClient(conn).Logs(ctx, fwd)
-	if err != nil {
-		return guestStreamError("logs", podID, err)
-	}
-
-	em := newLogEmitter(stream, req)
+// It is the vm path's answer to the same question the host path answers with a
+// pipe and a pump: a container's output must end up in the file the node reads.
+// A guest process writes into the guest's own capture, so the host pulls it
+// across the agent's Logs stream (follow) and writes every entry into the same
+// crilog.Writer a native container's pumps would have written — same file, same
+// format, same stream labels, same P/F tags. That is what makes `kubectl logs`
+// on a vm pod and on a native pod the same operation, served from disk, instead
+// of two code paths with two retention stories.
+//
+// RESUMPTION is by since_time, carrying the timestamp of the LAST ENTRY WRITTEN.
+// On the first connect it is unset (take everything the guest retained); after a
+// disconnect it is the last write's own stamp, and entries at or before it are
+// dropped host-side. The guest's Selector applies since_time inclusively
+// ("entries at or after it"), so without that host-side drop the boundary entry
+// would be written twice on every reconnect — a duplicate line in a log file is
+// indistinguishable from the container having said it twice.
+//
+// An old guest that never sets LogEntry.partial is handled by construction: the
+// field defaults false, which is the F tag, so its lines are simply complete
+// lines. Nothing here needs to know which guest it is talking to.
+func (r *Runtime) followGuestContainerLog(ctx context.Context, podID, container string, w *crilog.Writer) {
+	var (
+		last    time.Time
+		backoff = vmLogFollowBaseBackoff
+	)
 	for {
-		ent, rerr := agent.Recv()
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return nil
-			}
-			return guestStreamError("logs", podID, rerr)
+		if ctx.Err() != nil {
+			return
 		}
-		if serr := em.sendEntry(logLine{at: ent.GetTimestamp().AsTime(), line: ent.GetLine()}, relayLogStream(ent.GetStream())); serr != nil {
-			if errors.Is(serr, errLogLimitReached) {
-				return nil // the client's byte budget is spent: a normal end of stream
-			}
-			return serr
+		wrote, err := r.streamGuestContainerLog(ctx, podID, container, w, &last)
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, crilog.ErrWriterFailed) {
+			// The file is gone for this container: reconnecting would pull the
+			// guest's output across the boundary only to drop it. Stop, having
+			// said why once.
+			r.log.Warn("stopping the guest log follower: the container log file is unwritable",
+				"pod", podID, "container", container, "err", err)
+			return
+		}
+		if err != nil {
+			r.log.Warn("guest log stream ended; reconnecting",
+				"pod", podID, "container", container, "backoff", backoff, "err", err)
+		}
+		if wrote {
+			// Progress was made, so the far end is healthy and a fresh
+			// disconnect deserves a fresh fast retry rather than the ceiling a
+			// long-running stream would otherwise inherit.
+			backoff = vmLogFollowBaseBackoff
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > vmLogFollowMaxBackoff {
+			backoff = vmLogFollowMaxBackoff
 		}
 	}
 }
 
-// relayLogStream narrows a guest-reported stream label to the two values the
-// runtime/v1 contract defines, defaulting anything else to stdout — the same
-// label the host-process path emits for its combined buffer. A guest is free to
-// send an enum value this build does not know; it is not free to have that value
-// reach a client as an unmapped number.
-func relayLogStream(s runtimev1.LogStream) runtimev1.LogStream {
-	if s == runtimev1.LogStream_LOG_STREAM_STDERR {
-		return runtimev1.LogStream_LOG_STREAM_STDERR
+// streamGuestContainerLog runs one connection of the follower: it dials the
+// agent, opens a following Logs stream from *last, and writes every entry into
+// w, advancing *last as it goes. It returns whether anything was written and the
+// error that ended the stream (nil when the guest closed it cleanly).
+func (r *Runtime) streamGuestContainerLog(ctx context.Context, podID, container string, w *crilog.Writer, last *time.Time) (bool, error) {
+	conn, err := r.dialGuest(podID)
+	if err != nil {
+		return false, err
 	}
-	return runtimev1.LogStream_LOG_STREAM_STDOUT
+	defer func() { _ = conn.Close() }()
+
+	req := &runtimev1.GetLogsRequest{PodId: podID, Container: container, Follow: true}
+	if !last.IsZero() {
+		req.SinceTime = timestamppb.New(*last)
+	}
+	stream, err := guestv1.NewGuestAgentClient(conn).Logs(ctx, req)
+	if err != nil {
+		return false, guestStreamError("logs", podID, err)
+	}
+
+	wrote := false
+	for {
+		ent, rerr := stream.Recv()
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return wrote, nil
+			}
+			return wrote, guestStreamError("logs", podID, rerr)
+		}
+		at := ent.GetTimestamp().AsTime()
+		if !last.IsZero() && !at.After(*last) {
+			// The resume boundary: the guest's since_time filter is inclusive,
+			// so the entry we resumed FROM comes back. Dropping it here is what
+			// makes a reconnect lossless in both directions.
+			continue
+		}
+		if werr := w.Write(guestLogStream(ent.GetStream()), ent.GetLine(), ent.GetPartial()); werr != nil {
+			return wrote, werr
+		}
+		wrote = true
+		*last = at
+	}
+}
+
+// guestLogStream narrows a guest-reported stream label to the two the CRI log
+// format defines, defaulting anything else to stdout. A guest is free to send an
+// enum value this build does not know; it is not free to have that value reach a
+// log file as an unmapped number, which no reader could parse.
+func guestLogStream(s runtimev1.LogStream) crilog.Stream {
+	if s == runtimev1.LogStream_LOG_STREAM_STDERR {
+		return crilog.StreamStderr
+	}
+	return crilog.StreamStdout
 }
 
 // guestStreamError maps a guest-agent stream failure onto the status the client
@@ -630,6 +685,25 @@ func guestStreamError(verb, podID string, err error) error {
 			verb, podID, maxGuestFrameBytes, boundGuestMessage(st.Message()))
 	}
 	return status.Errorf(st.Code(), "%s: guest agent for pod %s: %s", verb, podID, boundGuestMessage(st.Message()))
+}
+
+// utf8HeadBytes returns the first n bytes of b, trimmed back so the result never
+// ends in a partial rune. It only ever trims, so the n-byte bound still holds.
+func utf8HeadBytes(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	b = b[:n]
+	for i := len(b) - 1; i >= 0 && len(b)-i < utf8.UTFMax; i-- {
+		if !utf8.RuneStart(b[i]) {
+			continue
+		}
+		if r, size := utf8.DecodeRune(b[i:]); r == utf8.RuneError && size <= 1 {
+			return b[:i] // an incomplete rune at the cut
+		}
+		break
+	}
+	return b
 }
 
 // boundGuestMessage trims guest-authored text to maxGuestMessageBytes on a rune

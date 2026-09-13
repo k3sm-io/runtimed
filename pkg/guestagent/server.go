@@ -422,6 +422,11 @@ func (s *Server) Logs(req *runtimev1.GetLogsRequest, stream grpc.ServerStreaming
 				Line:      e.Line,
 				Timestamp: timestamppb.New(e.At),
 				Stream:    logStreamProto(e.Stream),
+				// The CRI P/F tag, carried so the host can write this entry
+				// into the pod's log file with the tag the container's output
+				// actually had. See CapabilityLogPartial for why this is an
+				// additive capability rather than an api_version bump.
+				Partial: e.Partial,
 			}); err != nil {
 				return err
 			}
@@ -783,7 +788,7 @@ func (s *Server) sendAttachExit(stream grpc.BidiStreamingServer[runtimev1.Attach
 //
 // The bytes are passed through VERBATIM: nothing is added, nothing is stripped,
 // nothing is re-chunked. That is the whole difference from the logs path, where
-// the line writer strips the delimiter and the host's logEmitter puts one back.
+// the line writer strips the delimiter and the host's CRI log line supplies one.
 // An attached client is a terminal, so its escape sequences, its CRLFs and its
 // partial writes have to arrive exactly as the program emitted them — a
 // reconstructed delimiter would be a guess about output that was never

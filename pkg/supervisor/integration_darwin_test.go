@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/runtimed/pkg/crilog"
 )
 
 // unixSIGKILL returns SIGKILL as the os.Signal type SignalGroup expects.
@@ -39,7 +41,12 @@ func unixSIGKILL() os.Signal { return unix.SIGKILL }
 func TestIntegrationSpawnReapRealProcess(t *testing.T) {
 	var mu sync.Mutex
 	var lines []string
-	sink := func(b []byte) { mu.Lock(); lines = append(lines, string(b)); mu.Unlock() }
+	sink := func(_ crilog.Stream, b []byte, _ bool) error {
+		mu.Lock()
+		lines = append(lines, string(b))
+		mu.Unlock()
+		return nil
+	}
 
 	spec := SpawnSpec{
 		Path: "/bin/sh",

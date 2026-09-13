@@ -17,30 +17,29 @@ limitations under the License.
 package supervisor
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/runtimed/pkg/crilog"
 )
 
 // fakeSpawner records the spec and returns a canned pid/err. If it has a logLine
-// and the spec carries a LogFD, it writes the line to that fd so the Process log
-// pump can be exercised without a real child.
+// it writes the line to the spec's stdout fd (and errLine to the stderr fd) so
+// the Process log pumps can be exercised without a real child. Both fds are
+// closed afterwards, which is what gives each pump its EOF.
 type fakeSpawner struct {
 	pid     int
 	err     error
 	logLine string
+	errLine string
 
 	mu      sync.Mutex
 	gotSpec SpawnSpec
@@ -53,12 +52,71 @@ func (f *fakeSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
 	if f.err != nil {
 		return 0, f.err
 	}
-	if f.logLine != "" && spec.LogFD != 0 {
-		w := os.NewFile(spec.LogFD, "logfd")
-		_, _ = w.WriteString(f.logLine + "\n")
-		_ = w.Close()
+	if err := writeAndClose(spec.StdoutFD, f.logLine); err != nil {
+		return 0, err
+	}
+	if err := writeAndClose(spec.StderrFD, f.errLine); err != nil {
+		return 0, err
 	}
 	return f.pid, nil
+}
+
+// writeAndClose writes payload (plus a newline, when non-empty) to a DUP of fd
+// and closes the dup — the child's half of one stream, played synchronously
+// because the payloads here are far under the pipe buffer.
+//
+// The dup is not a flourish. Closing the fd the Process still holds frees that
+// NUMBER, and the next unix.Dup in the same spawner takes the lowest free one —
+// so Start's own closeWriteEnds then closes a descriptor that now belongs to the
+// other stream, and both pipes EOF at once. Writing through a dup leaves every
+// descriptor's ownership exactly where Start put it.
+func writeAndClose(fd uintptr, payload string) error {
+	if fd == 0 {
+		return nil
+	}
+	d, err := unix.Dup(int(fd))
+	if err != nil {
+		return err
+	}
+	w := os.NewFile(uintptr(d), "streamfd")
+	if payload != "" {
+		if _, werr := w.WriteString(payload + "\n"); werr != nil {
+			_ = w.Close()
+			return werr
+		}
+	}
+	return w.Close()
+}
+
+// chunkSink collects what the pumps delivered, tagged by stream.
+type chunkSink struct {
+	mu   sync.Mutex
+	got  []string
+	errs []error
+}
+
+// sink is the LogSink; it renders each chunk as "<stream>:<payload>" (a P chunk
+// gets a trailing "…") so a test can assert the label and the tag together.
+func (c *chunkSink) sink(stream crilog.Stream, chunk []byte, partial bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rendered := string(stream) + ":" + string(chunk)
+	if partial {
+		rendered += "…"
+	}
+	c.got = append(c.got, rendered)
+	if len(c.errs) > 0 {
+		err := c.errs[0]
+		c.errs = c.errs[1:]
+		return err
+	}
+	return nil
+}
+
+func (c *chunkSink) lines() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.got...)
 }
 
 // fakeWaiter returns a canned exit after an optional delay, honoring ctx.
@@ -126,17 +184,10 @@ func TestProcessLifecycle(t *testing.T) {
 // to the sink (via a real pipe wired by the fake spawner).
 func TestProcessLogCapture(t *testing.T) {
 	sp := &fakeSpawner{pid: 1, logLine: "hello-pod"}
-
-	var mu sync.Mutex
-	var got []string
-	sink := func(line []byte) {
-		mu.Lock()
-		got = append(got, string(line))
-		mu.Unlock()
-	}
+	sk := &chunkSink{}
 
 	p := NewProcess(sp, fakeWaiter{code: 0, delay: 50 * time.Millisecond},
-		SpawnSpec{Path: "/bin/echo", Argv: []string{"/bin/echo"}}, sink)
+		SpawnSpec{Path: "/bin/echo", Argv: []string{"/bin/echo"}}, sk.sink)
 	ctx := context.Background()
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -144,21 +195,14 @@ func TestProcessLogCapture(t *testing.T) {
 	if _, _, err := p.Wait(ctx); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	// Give the pump goroutine a moment to flush after EOF.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		n := len(got)
-		mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-p.LogsDrained():
+	case <-time.After(2 * time.Second):
+		t.Fatal("LogsDrained did not close")
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(got) != 1 || got[0] != "hello-pod" {
-		t.Fatalf("captured logs = %v, want [hello-pod]", got)
+	got := sk.lines()
+	if len(got) != 1 || got[0] != "stdout:hello-pod" {
+		t.Fatalf("captured logs = %v, want [stdout:hello-pod]", got)
 	}
 }
 
@@ -169,15 +213,9 @@ func TestProcessLogCapture(t *testing.T) {
 func TestProcessLogsDrained(t *testing.T) {
 	t.Run("closes-after-all-lines-flushed", func(t *testing.T) {
 		sp := &fakeSpawner{pid: 1, logLine: "final-diagnostic-line"}
-		var mu sync.Mutex
-		var got []string
-		sink := func(line []byte) {
-			mu.Lock()
-			got = append(got, string(line))
-			mu.Unlock()
-		}
+		sk := &chunkSink{}
 		p := NewProcess(sp, fakeWaiter{code: 1, delay: 20 * time.Millisecond},
-			SpawnSpec{Path: "/bin/echo", Argv: []string{"/bin/echo"}}, sink)
+			SpawnSpec{Path: "/bin/echo", Argv: []string{"/bin/echo"}}, sk.sink)
 		if err := p.Start(context.Background()); err != nil {
 			t.Fatalf("Start: %v", err)
 		}
@@ -186,11 +224,9 @@ func TestProcessLogsDrained(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("LogsDrained did not close")
 		}
-		// Once drained, every emitted line is already in the sink.
-		mu.Lock()
-		defer mu.Unlock()
-		if len(got) != 1 || got[0] != "final-diagnostic-line" {
-			t.Fatalf("after drain, sink = %v, want [final-diagnostic-line]", got)
+		// Once drained, every emitted chunk is already in the sink.
+		if got := sk.lines(); len(got) != 1 || got[0] != "stdout:final-diagnostic-line" {
+			t.Fatalf("after drain, sink = %v, want [stdout:final-diagnostic-line]", got)
 		}
 	})
 
@@ -229,7 +265,7 @@ func TestStartErrorClosesDrained(t *testing.T) {
 	boom := errors.New("posix_spawn boom")
 	// A non-nil sink forces the pipe path, so the spawn-error return is the one
 	// that must close drained (the pipe was created, the pump never launched).
-	sink := func([]byte) {}
+	sink := func(crilog.Stream, []byte, bool) error { return nil }
 	p := NewProcess(&fakeSpawner{err: boom}, fakeWaiter{},
 		SpawnSpec{Path: "/x", Argv: []string{"/x"}}, sink)
 	if err := p.Start(context.Background()); !errors.Is(err, boom) {
@@ -305,7 +341,7 @@ type logPipeSpawner struct {
 }
 
 func (s *logPipeSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
-	fd, err := unix.Dup(int(spec.LogFD))
+	fd, err := unix.Dup(int(spec.StdoutFD))
 	if err != nil {
 		return 0, err
 	}
@@ -315,217 +351,226 @@ func (s *logPipeSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
 		defer func() { _ = w.Close() }()
 		s.write(w)
 	}()
+	// The stderr pipe gets no writer at all: closing the parent's copy in Start
+	// is enough for that pump to see EOF immediately, which is exactly the
+	// "one stream is silent" shape a real container commonly has.
 	return s.pid, nil
 }
 
-// TestPumpLogsSurvivesOversizedLine is the B164 gate. A single line longer than
-// the pump's per-line cap must not stop the pump: before the fix the pump used a
-// bufio.Scanner whose Scan() returns false on an over-cap token and whose Err()
-// was never checked, so one oversized line silently ended log delivery for the
-// rest of the container's life — taking kubectl logs and the
-// FallbackToLogsOnError termination message with it. The load-bearing assertion
-// is that a line written after the oversized one still reaches the sink.
-func TestPumpLogsSurvivesOversizedLine(t *testing.T) {
+// TestPumpLogsChunksOversizedLine is the B164 successor. The predecessor
+// asserted that an oversized line was TRUNCATED to its tail and that the pump
+// kept going; the truncation is gone — crilog splits instead — so what is
+// asserted now is stronger: a 2 MiB line arrives COMPLETE, as P chunks followed
+// by an F, and output after it still flows. Nothing a container writes is
+// dropped by the pump any more.
+func TestPumpLogsChunksOversizedLine(t *testing.T) {
 	const (
 		head   = "HEAD-MARKER"
 		marker = "TAIL-MARKER"
 	)
-	cases := []struct {
-		name string
-		fill string // repeated to pad the oversized line past the cap
-	}{
-		{"ascii", "x"},
-		{"multibyte", "é"}, // the tail cut lands mid-rune; output must stay valid UTF-8
+	pad := strings.Repeat("x", 2<<20)
+	huge := head + pad + marker
+
+	sk := &chunkSink{}
+	sp := &logPipeSpawner{pid: 4242, wrote: make(chan struct{}), write: func(w *os.File) {
+		_, _ = io.WriteString(w, "before\n"+huge+"\nafter\n")
+	}}
+	p := NewProcess(sp, fakeWaiter{code: 0},
+		SpawnSpec{Path: "/x", Argv: []string{"/x"}}, sk.sink)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			pad := strings.Repeat(tc.fill, 2*maxLogLineBytes/len(tc.fill))
-			huge := head + pad + marker
-			if len(huge) <= maxLogLineBytes {
-				t.Fatalf("test payload %d bytes is not oversized (cap %d)", len(huge), maxLogLineBytes)
-			}
-			if tc.fill == "é" && utf8.Valid([]byte(huge)[len(huge)-maxLogLineBytes:]) {
-				t.Fatalf("naive tail is already valid UTF-8; this case no longer exercises rune rounding")
-			}
-
-			var buf bytes.Buffer
-			old := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-			defer slog.SetDefault(old)
-
-			var mu sync.Mutex
-			var got []string
-			sink := func(line []byte) {
-				mu.Lock()
-				got = append(got, string(line))
-				mu.Unlock()
-			}
-
-			sp := &logPipeSpawner{pid: 4242, wrote: make(chan struct{}), write: func(w *os.File) {
-				// Two oversized lines, so the operator warning can be asserted
-				// to fire once per process rather than once per line.
-				_, _ = io.WriteString(w, "before\n"+huge+"\n"+huge+"\nafter\n")
-			}}
-			p := NewProcess(sp, fakeWaiter{code: 0},
-				SpawnSpec{Path: "/x", Argv: []string{"/x"}}, sink)
-			if err := p.Start(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case <-p.LogsDrained():
-			case <-time.After(30 * time.Second):
-				t.Fatal("log pump never drained")
-			}
-			<-sp.wrote
-			_, _, _ = p.Wait(context.Background())
-
-			mu.Lock()
-			defer mu.Unlock()
-			if len(got) != 4 {
-				t.Fatalf("sink got %d lines %s, want 4 (before, 2 truncated, after): "+
-					"the pump stopped at the oversized line", len(got), summarize(got))
-			}
-			if got[0] != "before" {
-				t.Errorf("first line = %q, want %q", got[0], "before")
-			}
-			// The load-bearing assertion: pumping CONTINUED past the oversized line.
-			if got[3] != "after" {
-				t.Errorf("last line = %q, want %q (output after an oversized line must still be pumped)", got[3], "after")
-			}
-			for i, ln := range got[1:3] {
-				if len(ln) > maxLogLineBytes {
-					t.Errorf("oversized line %d delivered as %d bytes, want <= %d", i, len(ln), maxLogLineBytes)
-				}
-				if !strings.HasSuffix(ln, marker) {
-					t.Errorf("oversized line %d does not end with %q; the retained tail is not the line's tail", i, marker)
-				}
-				if strings.Contains(ln, head) {
-					t.Errorf("oversized line %d still carries the head marker; it was not truncated", i)
-				}
-				if !utf8.ValidString(ln) {
-					t.Errorf("oversized line %d is not valid UTF-8 after tail truncation", i)
-				}
-			}
-			if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
-				t.Errorf("got %d WARN records, want exactly 1 (once per process): %s", n, buf.String())
-			}
-			if w := buf.String(); w != "" && !strings.Contains(w, "truncated") {
-				t.Errorf("warning does not name the truncation: %s", w)
-			}
-		})
+	select {
+	case <-p.LogsDrained():
+	case <-time.After(30 * time.Second):
+		t.Fatal("log pump never drained")
 	}
-}
+	<-sp.wrote
+	_, _, _ = p.Wait(context.Background())
 
-// summarize renders received log lines compactly (they can be ~1 MiB each).
-func summarize(lines []string) string {
-	out := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		if len(ln) > 32 {
-			out = append(out, fmt.Sprintf("%q...(%d bytes)", ln[:32], len(ln)))
-			continue
+	got := sk.lines()
+	if len(got) < 3 {
+		t.Fatalf("sink got %d chunks, want the oversized line split across several", len(got))
+	}
+	if got[0] != "stdout:before" {
+		t.Errorf("first chunk = %q, want %q", got[0], "stdout:before")
+	}
+	// The load-bearing assertion: pumping CONTINUED past the oversized line.
+	if last := got[len(got)-1]; last != "stdout:after" {
+		t.Errorf("last chunk = %q, want %q (output after an oversized line must still be pumped)", last, "stdout:after")
+	}
+
+	// Reassemble the middle: every P chunk plus the F that ends the run must
+	// reproduce the line exactly — nothing dropped, nothing duplicated.
+	var rejoined strings.Builder
+	for _, c := range got[1 : len(got)-1] {
+		payload := strings.TrimPrefix(c, "stdout:")
+		payload = strings.TrimSuffix(payload, "…")
+		rejoined.WriteString(payload)
+	}
+	if rejoined.String() != huge {
+		t.Errorf("the reassembled line is %d bytes, want %d — the pump lost or duplicated content",
+			rejoined.Len(), len(huge))
+	}
+	for i, c := range got[1 : len(got)-2] {
+		if !strings.HasSuffix(c, "…") {
+			t.Errorf("middle chunk %d is not tagged partial: %.32q", i, c)
 		}
-		out = append(out, fmt.Sprintf("%q", ln))
 	}
-	return "[" + strings.Join(out, " ") + "]"
-}
-
-// TestReadLogLineMatchesScanner pins the line semantics B164 inherited: within
-// the truncation bound, the replacement reader must split exactly as the
-// bufio.Scanner it replaced did — including the final unterminated line, empty
-// lines, and CR-stripping — so the fix changes only the oversized case.
-func TestReadLogLineMatchesScanner(t *testing.T) {
-	inputs := []struct {
-		name string
-		in   string
-	}{
-		{"empty", ""},
-		{"one-line", "a\n"},
-		{"unterminated", "a"},
-		{"blank-lines", "\n\n\n"},
-		{"crlf", "a\r\nb\r\n"},
-		{"trailing-cr-at-eof", "a\r"},
-		{"two-lines-unterminated-last", "a\nb"},
-		{"longer-than-read-buffer", strings.Repeat("z", 100) + "\n"},
-		{"long-unterminated", strings.Repeat("z", 100)},
-		{"mixed", "a\n" + strings.Repeat("q", 40) + "\n\nb\n"},
-	}
-	for _, tc := range inputs {
-		t.Run(tc.name, func(t *testing.T) {
-			var want []string
-			sc := bufio.NewScanner(strings.NewReader(tc.in))
-			for sc.Scan() {
-				want = append(want, sc.Text())
-			}
-			if err := sc.Err(); err != nil {
-				t.Fatalf("scanner: %v", err)
-			}
-
-			var got []string
-			// A 16-byte read buffer (bufio's minimum) forces the multi-fragment
-			// slow path on the longer inputs.
-			br := bufio.NewReaderSize(strings.NewReader(tc.in), 16)
-			for {
-				line, dropped, ok, err := readLogLine(br, maxLogLineBytes)
-				if ok {
-					got = append(got, string(line))
-				}
-				if dropped != 0 {
-					t.Errorf("dropped = %d, want 0 (no input here exceeds the bound)", dropped)
-				}
-				if err != nil {
-					if !errors.Is(err, io.EOF) {
-						t.Fatalf("read: %v", err)
-					}
-					break
-				}
-			}
-			if len(got) != len(want) {
-				t.Fatalf("got %d lines %q, want %d %q", len(got), got, len(want), want)
-			}
-			for i := range want {
-				if got[i] != want[i] {
-					t.Errorf("line %d = %q, want %q", i, got[i], want[i])
-				}
-			}
-		})
+	if c := got[len(got)-2]; strings.HasSuffix(c, "…") {
+		t.Error("the chunk ending the oversized line is tagged partial; it must be full")
 	}
 }
 
-// TestReadLogLineTruncatesToTail covers the truncation arithmetic directly at a
-// small bound: the retained bytes are the line's tail, within the bound, and the
-// dropped count accounts for every byte not delivered.
-func TestReadLogLineTruncatesToTail(t *testing.T) {
-	cases := []struct {
-		name    string
-		in      string
-		max     int
-		want    string
-		dropped int
-	}{
-		{"exactly-at-bound", "0123456789\n", 10, "0123456789", 0},
-		{"one-over", "0123456789a\n", 10, "123456789a", 1},
-		{"far-over", strings.Repeat("h", 90) + "TAIL012345", 10, "TAIL012345", 90},
-		{"rune-boundary", strings.Repeat("é", 20) + "\n", 9, "éééé", 32},
+// TestTwoStreamCaptureLabelsStderr pins the split the CRI log format needs: the
+// child's fd 1 and fd 2 arrive on separate pipes and reach the sink with
+// separate labels. A merged pipe cannot be un-merged downstream, so this is the
+// only place the distinction can be established.
+func TestTwoStreamCaptureLabelsStderr(t *testing.T) {
+	sp := &fakeSpawner{pid: 1, logLine: "to-stdout", errLine: "to-stderr"}
+	sk := &chunkSink{}
+	p := NewProcess(sp, fakeWaiter{code: 0},
+		SpawnSpec{Path: "/x", Argv: []string{"/x"}}, sk.sink)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			br := bufio.NewReaderSize(strings.NewReader(tc.in), 16)
-			line, dropped, ok, _ := readLogLine(br, tc.max)
-			if !ok {
-				t.Fatal("no line produced")
-			}
-			if string(line) != tc.want {
-				t.Errorf("line = %q, want %q", line, tc.want)
-			}
-			if len(line) > tc.max {
-				t.Errorf("line is %d bytes, want <= %d", len(line), tc.max)
-			}
-			if dropped != tc.dropped {
-				t.Errorf("dropped = %d, want %d", dropped, tc.dropped)
-			}
-			if !utf8.Valid(line) {
-				t.Errorf("line %q is not valid UTF-8", line)
-			}
-		})
+	select {
+	case <-p.LogsDrained():
+	case <-time.After(5 * time.Second):
+		t.Fatal("LogsDrained did not close")
 	}
+
+	got := sk.lines()
+	want := map[string]bool{"stdout:to-stdout": true, "stderr:to-stderr": true}
+	if len(got) != 2 {
+		t.Fatalf("sink got %v, want one chunk per stream", got)
+	}
+	for _, c := range got {
+		if !want[c] {
+			t.Errorf("unexpected chunk %q; want exactly %v", c, want)
+		}
+		delete(want, c)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing chunks: %v — the two streams are not separately labelled", want)
+	}
+
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.gotSpec.StdoutFD == 0 || sp.gotSpec.StderrFD == 0 {
+		t.Errorf("spec carried StdoutFD=%d StderrFD=%d, want both set", sp.gotSpec.StdoutFD, sp.gotSpec.StderrFD)
+	}
+	if sp.gotSpec.StdoutFD == sp.gotSpec.StderrFD {
+		t.Error("both streams were handed the SAME fd; the labels would be a fiction")
+	}
+}
+
+// TestLogsDrainedWaitsForBothPumps is the two-pump drain gate. With one stream
+// finished and the other still open, LogsDrained must stay OPEN: a sync.Once
+// closed on the first pump's EOF would report "drained" while the dying child's
+// stderr — the panic, the stack trace — was still in flight, which is exactly
+// what the drain edge exists to prevent.
+func TestLogsDrainedWaitsForBothPumps(t *testing.T) {
+	held := make(chan struct{})
+	sp := &spawnerHoldingStderr{pid: 7, release: held}
+	sk := &chunkSink{}
+	p := NewProcess(sp, fakeWaiter{code: 0},
+		SpawnSpec{Path: "/x", Argv: []string{"/x"}}, sk.sink)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// stdout has already reached EOF (the spawner closed it). Give the pump
+	// time to finish and assert the edge has NOT fired.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(sk.lines()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-p.LogsDrained():
+		t.Fatal("LogsDrained closed on the FIRST pump's EOF; the other stream was still open")
+	default:
+	}
+
+	close(held) // the stderr writer goes away
+	select {
+	case <-p.LogsDrained():
+	case <-time.After(5 * time.Second):
+		t.Fatal("LogsDrained never closed after both pumps finished")
+	}
+	if got := sk.lines(); len(got) != 2 {
+		t.Fatalf("sink got %v, want one chunk from each stream", got)
+	}
+}
+
+// spawnerHoldingStderr writes one line to each stream, closes stdout, and keeps
+// its dup of the stderr write end open until release is closed — the two-pump
+// analogue of a forked grandchild holding a pipe.
+type spawnerHoldingStderr struct {
+	pid     int
+	release chan struct{}
+}
+
+func (s *spawnerHoldingStderr) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
+	if err := writeAndClose(spec.StdoutFD, "out-line"); err != nil {
+		return 0, err
+	}
+	fd, err := unix.Dup(int(spec.StderrFD))
+	if err != nil {
+		return 0, err
+	}
+	w := os.NewFile(uintptr(fd), "stderr-dup")
+	if _, err := w.WriteString("err-line\n"); err != nil {
+		_ = w.Close()
+		return 0, err
+	}
+	go func() {
+		<-s.release
+		_ = w.Close()
+	}()
+	return s.pid, nil
+}
+
+// TestStartUnwindsBothPipesOnFailure pins the partial-failure unwind: a spawn
+// that fails after both pipes exist must leave NO descriptor open. A daemon that
+// leaked two fds per failed start — and a failed start is the ordinary outcome
+// of a bad image on a node running every pod — would run out of descriptors.
+func TestStartUnwindsBothPipesOnFailure(t *testing.T) {
+	boom := errors.New("posix_spawn boom")
+	rec := &fdRecordingSpawner{err: boom}
+	p := NewProcess(rec, fakeWaiter{},
+		SpawnSpec{Path: "/x", Argv: []string{"/x"}}, (&chunkSink{}).sink)
+	if err := p.Start(context.Background()); !errors.Is(err, boom) {
+		t.Fatalf("want wrapped spawn error, got %v", err)
+	}
+
+	if p.outR != nil || p.outW != nil || p.errR != nil || p.errW != nil {
+		t.Error("a pipe end is still held on the Process after a failed Start")
+	}
+	// The write ends the spawner saw must be closed. (A descriptor number can in
+	// principle be reused by another goroutine in this binary between the close
+	// and this check; nothing here opens files, so the residual is accepted for
+	// the directness of the assertion.)
+	for name, fd := range map[string]uintptr{"stdout": rec.outFD, "stderr": rec.errFD} {
+		if fd == 0 {
+			t.Fatalf("%s fd was never stamped on the spec", name)
+		}
+		if _, err := unix.FcntlInt(fd, unix.F_GETFD, 0); err == nil {
+			t.Errorf("%s write end (fd %d) is still open after a failed Start", name, fd)
+		}
+	}
+}
+
+// fdRecordingSpawner records the two write-end fds it was handed and fails.
+type fdRecordingSpawner struct {
+	err          error
+	outFD, errFD uintptr
+}
+
+func (s *fdRecordingSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
+	s.outFD, s.errFD = spec.StdoutFD, spec.StderrFD
+	return 0, s.err
 }

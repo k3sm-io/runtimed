@@ -63,6 +63,23 @@ const (
 	// An agent without it has no such endpoints to bridge to, so the verb is
 	// missing rather than merely unimplemented.
 	CapabilityAttach = "attach"
+
+	// CapabilityLogPartial reports that the agent sets LogEntry.partial — the
+	// CRI P/F tag — on every log entry it streams.
+	//
+	// It is a CAPABILITY rather than an APIVersion bump precisely because the
+	// change is additive and the old behaviour remains correct: an agent that
+	// never sets the field reports every entry as `partial=false`, which is the
+	// F tag, which is "this is a complete line". For a guest that split a long
+	// line that under-reports the split — the host's log file then holds two
+	// complete lines where the container wrote one — and that is the whole of
+	// the degradation. It is a cosmetic loss on an over-16-KiB line, not a
+	// malformed stream, so refusing the pairing (which is what a bump would do)
+	// would be a far worse answer than serving it.
+	//
+	// A host reads this token to know whether an unsplit-looking log file is a
+	// fact about the container or an artifact of an old initramfs.
+	CapabilityLogPartial = "log-partial"
 )
 
 // Capabilities is the token set this build advertises, in a STABLE order so a
@@ -72,5 +89,5 @@ const (
 // It is a function rather than a package var so no caller can append to the
 // shipped slice and change what every future Health call reports.
 func Capabilities() []string {
-	return []string{CapabilityTTYExec, CapabilityAttach}
+	return []string{CapabilityTTYExec, CapabilityAttach, CapabilityLogPartial}
 }

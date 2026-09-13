@@ -19,6 +19,7 @@ package runtime
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
@@ -85,6 +86,27 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 	if _, err := r.dataVolumePath(box); err != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	// log_directory is REQUIRED, because it is the only thing that says where a
+	// container's output goes. The node creates the tree
+	// (<pod-logs-dir>/<ns>_<pod>_<uid>/<container>) and names it here; runtimed
+	// derives the per-container subdirectory and the <n>.log file inside it, and
+	// writes nothing anywhere else.
+	//
+	// It fails CLOSED rather than defaulting. A default would have to invent a
+	// path — which the node then would not read, since it resolves `kubectl
+	// logs` through ContainerStatus.log_path and prunes the tree it created — so
+	// every container on a mis-wired node would run with its output going
+	// somewhere nobody looks, and the symptom would be empty logs rather than a
+	// stated error. An absolute path is required for the same reason
+	// Config.Root is: the daemon's own working directory is not a location a pod
+	// author chose.
+	if dir := box.GetLogDirectory(); dir == "" {
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: log_directory is required (the node owns the container log tree and must name it)", errInvalidPodBox)
+	} else if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: log_directory %q must be an absolute, clean path", errInvalidPodBox, dir)
 	}
 	if len(box.GetContainers()) == 0 && len(box.GetInitContainers()) == 0 {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,

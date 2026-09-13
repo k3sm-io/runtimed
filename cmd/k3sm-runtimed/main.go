@@ -50,12 +50,14 @@ func main() {
 		socketPath = flag.String("socket", runtime.DefaultSocketPath, "unix socket path to listen on")
 		root       = flag.String("root", "", "on-disk runtime root (image cache + pod dirs); empty uses the runtimed default")
 		version    = flag.String("runtime-version", "dev", "daemon version reported by GetRuntimeInfo")
+		podLogsDir = flag.String("pod-logs-dir", sandbox.DefaultPodLogsDir,
+			"root of the node's container-log tree (the kubelet's --pod-logs-dir); denied to every confined pod")
 	)
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	if err := run(*socketPath, *root, *version, log); err != nil {
+	if err := run(*socketPath, *root, *version, *podLogsDir, log); err != nil {
 		log.Error("k3sm-runtimed exited", "err", err)
 		os.Exit(1)
 	}
@@ -64,7 +66,7 @@ func main() {
 // run builds the runtime, opens the root unix socket, and serves until SIGINT/
 // SIGTERM. It returns the first fatal error (or nil on a clean signal-driven
 // shutdown). Kept separate from main so the wiring is exercisable.
-func run(socketPath, root, version string, log *slog.Logger) error {
+func run(socketPath, root, version, podLogsDir string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), unix.SIGINT, unix.SIGTERM)
 	defer stop()
 
@@ -100,6 +102,7 @@ func run(socketPath, root, version string, log *slog.Logger) error {
 	rt, err := runtime.New(runtime.Config{
 		Root:           root,
 		RuntimeVersion: version,
+		PodLogsDir:     podLogsDir,
 		Logger:         log,
 	}, deps)
 	if err != nil {

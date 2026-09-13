@@ -138,10 +138,12 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 		t.Fatalf("container_statuses = %+v, want only main", cs)
 	}
 
-	// The sidecar is tracked long-lived: findable by name (GetLogs resolves it).
-	stream := newFakeLogStream(context.Background())
-	if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-sc", Container: "sc"}, stream); err != nil {
-		t.Errorf("GetLogs(sidecar) = %v, want found (sidecar must be tracked by name)", err)
+	// The sidecar is tracked long-lived: findable BY NAME. ReopenContainerLog
+	// resolves through the same lookup every per-container verb uses, so an
+	// untracked sidecar answers NotFound; a tracked, running one succeeds.
+	if _, err := rt.ReopenContainerLog(context.Background(),
+		&runtimev1.ReopenContainerLogRequest{PodId: "pod-sc", Container: "sc"}); err != nil {
+		t.Errorf("ReopenContainerLog(sidecar) = %v, want found (sidecar must be tracked by name)", err)
 	}
 
 	w.release(1001)

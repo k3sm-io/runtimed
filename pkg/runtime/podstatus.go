@@ -118,6 +118,12 @@ func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 		// start yet. Recomputing it at status time would mean asking the puller
 		// again, which is a second pull.
 		ImagePull: cp.state.GetImagePull(),
+		// Where this instance's output is on disk. It is the node's ONLY route
+		// to a container's logs — `kubectl logs`, the rotation manager and the
+		// FallbackToLogsOnError tail all resolve through it — so it is carried
+		// through verbatim, and it is empty exactly when there is no instance
+		// (a container that never started opened no file).
+		LogPath: cp.state.GetLogPath(),
 	}
 	if cp.sidecar() {
 		// A native sidecar reports started while running (spawn-equals-started:

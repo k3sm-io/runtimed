@@ -41,19 +41,6 @@ const DefaultMaxLineBytes = 16 << 10
 // this asserts the guest was never wired to listen.
 var ErrNoCapture = errors.New("guestagent: no output is captured for this container")
 
-// truncationNotice is the one-line, in-band notice a reader gets when retention
-// has dropped output — the pkg/vmhost CappedWriter idiom (consoleTruncationNotice)
-// applied to a ring rather than to a cap: a truncated log and a container that
-// simply went quiet look identical without it, and they call for opposite operator
-// actions. The direction differs because the mechanism does — the console stops
-// writing at its cap, the ring evicts OLDEST-first — so this names earlier output,
-// not later.
-func truncationNotice(dropped int) []byte {
-	return []byte(fmt.Sprintf(
-		"[k3sm-guest] log truncated: %d earlier entries were dropped to stay inside this container's retention bound",
-		dropped))
-}
-
 // Capture is the guest's per-container output capture and the Logs seam over it.
 //
 // It exists because a vm pod's containers used to inherit PID 1's stdio: their
@@ -67,8 +54,16 @@ func truncationNotice(dropped int) []byte {
 // buffer is a way for a chatty workload to OOM its own guest and have the kill
 // attributed to the workload's real memory use. Every container's retention is
 // therefore capped twice over (entries and bytes, see Ring) with oldest dropped,
-// each entry is capped once more (DefaultMaxLineBytes), and what the bounds
-// discard is reported in band rather than left as a silent gap.
+// and each entry is capped once more (DefaultMaxLineBytes) — as a SPLIT carrying
+// the CRI partial tag, so nothing is lost and a reader rejoins the pieces.
+//
+// The bounds' drops are counted (Ring.Dropped) and no longer announced IN BAND.
+// They used to be, and that was right while this stream was `kubectl logs`
+// itself; it is wrong now that the host appends every entry to the pod's CRI log
+// FILE, where a synthesized "N earlier entries were dropped" line is
+// indistinguishable from something the container said — permanently, to every
+// future reader of that file. Retention pressure in a guest is a node-side fact
+// and belongs in the node's own diagnostics, not in the workload's output.
 //
 // The zero value is not usable; construct one with NewCapture.
 type Capture struct {
@@ -236,11 +231,7 @@ func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<
 		defer close(out)
 		defer unsubscribe()
 
-		// The snapshot and the drop count are read together, under the ring's
-		// own lock, so the notice describes exactly the gap that precedes the
-		// entries being sent — not a count that moved between two reads.
-		retained, dropped := ring.SnapshotWithDropped(sel)
-		reported := dropped
+		retained := ring.Snapshot(sel)
 		send := func(e LogEntry) bool {
 			select {
 			case out <- e:
@@ -249,11 +240,6 @@ func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<
 				return false
 			case <-done:
 				return false
-			}
-		}
-		if dropped > 0 {
-			if !send(noticeEntry(dropped)) {
-				return
 			}
 		}
 		for _, e := range retained {
@@ -270,16 +256,6 @@ func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<
 				if !ok {
 					return
 				}
-				// Retention can keep evicting while a follower reads, so the
-				// notice is re-issued when the count grows. Same notice, same
-				// idiom — a follower must not be shown a gap it was never told
-				// about just because it arrived before the drop.
-				if now := ring.Dropped(); now > reported {
-					if !send(noticeEntry(now)) {
-						return
-					}
-					reported = now
-				}
 				if !send(e) {
 					return
 				}
@@ -294,14 +270,6 @@ func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<
 	return out, func() { once.Do(func() { close(done) }) }, nil
 }
 
-// noticeEntry wraps the truncation notice as an entry. It is labelled stderr
-// because it is the runtime speaking, not the container: `kubectl logs` merges
-// the two, and a consumer that split them would otherwise read a k3sm diagnostic
-// as the workload's own output.
-func noticeEntry(dropped int) LogEntry {
-	return LogEntry{At: time.Now(), Line: truncationNotice(dropped), Stream: StreamStderr}
-}
-
 // lineWriter turns a container's raw pipe bytes into one ring entry per LINE.
 //
 // Line granularity is what makes Selector.TailLines mean what its name says and
@@ -309,13 +277,17 @@ func noticeEntry(dropped int) LogEntry {
 // last 10 entries" depend on how the workload happened to flush, which is not
 // something a user can reason about.
 //
-// The delimiter is STRIPPED (and a preceding CR with it): pkg/runtime's
-// logEmitter budgets "the rendered line plus its newline delimiter", so an entry
-// that carried its own newline would be double-delimited on the way out.
+// The delimiter is STRIPPED (and a preceding CR with it): a CRI log line supplies
+// its own newline when the host writes this entry to the pod's log file, so an
+// entry that carried one would be double-delimited and would split into two
+// lines on the way back out.
 //
 // A line longer than maxLine is emitted in maxLine-sized pieces rather than
 // buffered whole — see DefaultMaxLineBytes for why the unbounded alternative is an
-// OOM in a guest whose only storage is RAM.
+// OOM in a guest whose only storage is RAM. Each such piece carries the CRI
+// PARTIAL tag and the piece that finally reaches the newline carries FULL, which
+// is what lets the host write them into the pod's log file as one logical line
+// rather than as several.
 type lineWriter struct {
 	ring    *Ring
 	kind    LogStreamKind
@@ -338,13 +310,13 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		w.emitLocked(w.buf[:i])
+		w.emitLineLocked(w.buf[:i])
 		w.buf = w.buf[i+1:]
 	}
 	// No newline in sight and the partial is over the bound: emit what is held
 	// rather than keep growing it.
 	for len(w.buf) > w.maxLine {
-		w.emitLocked(w.buf[:w.maxLine])
+		w.emitLocked(w.buf[:w.maxLine], true)
 		w.buf = w.buf[w.maxLine:]
 	}
 	// Re-slice onto a fresh array once the retained partial is small relative to
@@ -357,21 +329,48 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 
 // Close flushes a final line that arrived with no trailing newline — the common
 // shape of a container's last write before it exits.
+//
+// It is flushed PARTIAL, because that is what the tag means: the line never
+// ended. It is the same answer containerd's writer gives at EOF-without-newline,
+// and it keeps a reader from presenting a half-written final line as a whole one.
 func (w *lineWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.buf) > 0 {
-		w.emitLocked(w.buf)
+		w.emitLocked(w.buf, true)
 		w.buf = nil
 	}
 	return nil
 }
 
-// emitLocked appends one line to the ring, stripping a trailing CR so a workload
-// writing CRLF does not leave a stray carriage return at the end of every entry.
-// The caller holds w.mu; Ring.Append copies the bytes, so the slice may alias the
-// writer's buffer.
-func (w *lineWriter) emitLocked(line []byte) {
+// emitLineLocked appends one COMPLETE line, split at maxLine into CRI chunks:
+// every piece but the last carries the PARTIAL tag and the last carries FULL, so
+// a reader — and the host writing this into the pod's log file — rejoins them
+// into the single line the container wrote.
+//
+// The split applies to a newline-terminated line too, not only to an unbounded
+// partial. Emitting a 40 KiB line whole would put a 40 KiB entry on the wire and
+// a 40 KiB line in the log file, which is exactly the bound this package exists
+// to hold; and the tag makes the split lossless rather than a truncation.
+//
+// A trailing CR is stripped HERE, once, before the split: it is half of a CRLF
+// terminator, and a workload writing CRLF must not leave a stray carriage return
+// at the end of every entry. It is deliberately not stripped from a partial
+// piece, which is mid-line content rather than a terminator.
+//
+// The caller holds w.mu; Ring.Append copies the bytes, so the slices may alias
+// the writer's buffer.
+func (w *lineWriter) emitLineLocked(line []byte) {
 	line = bytes.TrimSuffix(line, []byte("\r"))
-	w.ring.Append(LogEntry{At: time.Now(), Line: line, Stream: w.kind})
+	for len(line) > w.maxLine {
+		w.emitLocked(line[:w.maxLine], true)
+		line = line[w.maxLine:]
+	}
+	w.emitLocked(line, false)
+}
+
+// emitLocked appends one chunk to the ring with the given CRI tag. The caller
+// holds w.mu.
+func (w *lineWriter) emitLocked(chunk []byte, partial bool) {
+	w.ring.Append(LogEntry{At: time.Now(), Line: chunk, Stream: w.kind, Partial: partial})
 }

@@ -554,7 +554,7 @@ func TestUnrunnableContainerSpecIsInvalidArgument(t *testing.T) {
 				backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC,
 			}
 			_, reason, err := rt.startContainer(context.Background(), p,
-				derivedRootfs(t, rt, podID), tc.container, false)
+				derivedRootfs(t, rt, podID), tc.container, false, 0)
 			if err == nil {
 				t.Fatal("startContainer succeeded on an unrunnable container spec")
 			}

@@ -158,6 +158,7 @@ func pulledImageBox(t *testing.T, rt *Runtime, podID string) *runtimev1.PodBox {
 		Namespace:       "default",
 		Name:            "p",
 		RootfsPath:      dataVol,
+		LogDirectory:    testPodLogDir(rt, podID),
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Containers: []*runtimev1.Container{{

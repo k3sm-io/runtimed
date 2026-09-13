@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
@@ -162,6 +163,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		// No network Teardown: the vm route allocated no lo0 alias (a NAT-attached
 		// guest is reached over its VZ attachment), and calling it would ask the
 		// IPAM to release something it never handed out.
+		r.closeContainerLogs(p)
 		if err := r.removePodDir(req.GetPodId()); err != nil {
 			r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 		}
@@ -303,6 +305,12 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	if err := r.network.Teardown(req.GetPodId()); err != nil {
 		r.log.Warn("network teardown", "pod", req.GetPodId(), "err", err)
 	}
+	// Release the container log files, AFTER the stop above: the pumps have had
+	// the pod's whole grace budget to flush the dying children's final output,
+	// and a Writer closed earlier would take that output with it. The FILES stay
+	// — runtimed never deletes one — so the node can still read a deleted pod's
+	// logs until its own GC removes the tree.
+	r.closeContainerLogs(p)
 	if err := r.removePodDir(req.GetPodId()); err != nil {
 		r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 	}
@@ -311,6 +319,34 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// not touch them) have served their purpose.
 	r.removePodReapRecords(req.GetPodId())
 	return &runtimev1.DeletePodResponse{}, nil
+}
+
+// closeContainerLogs closes every container's CRI log file handle. It is called
+// once, at the end of a pod's teardown, and never at a container's exit: a
+// forked grandchild can outlive its parent holding the pipe, and closing the
+// file at the parent's exit would make that output fail its write — which, by
+// the write-failure policy, would close the pipe on a process that is still
+// legitimately writing.
+//
+// It closes the HANDLE, not the FILE: the log stays on disk for the node to read
+// and to delete. runtimed deletes no log file, ever.
+func (r *Runtime) closeContainerLogs(p *pod) {
+	p.mu.Lock()
+	writers := make([]*crilog.Writer, 0, len(p.containers)+len(p.guestLogs))
+	for _, cp := range p.containers {
+		if cp.logw != nil {
+			writers = append(writers, cp.logw)
+		}
+	}
+	for _, w := range p.guestLogs {
+		writers = append(writers, w)
+	}
+	p.mu.Unlock()
+	for _, w := range writers {
+		if err := w.Close(); err != nil {
+			r.log.Warn("close container log", "pod", p.box.GetPodId(), "path", w.Path(), "err", err)
+		}
+	}
 }
 
 // resolveGrace computes the SIGTERM→SIGKILL window for a DeletePod: the request's
@@ -429,121 +465,77 @@ func (r *Runtime) WatchPodStatus(req *runtimev1.WatchPodStatusRequest, stream gr
 	}
 }
 
-// GetLogs streams a container's combined output under the full GetLogsRequest
-// option set, in the order the kubelet applies them:
+// GetLogs is UNIMPLEMENTED, on every route, by design.
 //
-//  1. tail_lines selects positionally from the end of the buffer;
-//  2. since_time then drops entries older than the cutoff (so tail+since compose
-//     to FEWER than tail lines, never to "the newest N recent ones");
-//  3. timestamps renders the RFC3339 prefix and limit_bytes caps the result
-//     (logEmitter, logs.go).
+// A container's output is on DISK, in the CRI log file named by
+// ContainerStatus.log_path, and the node reads it from there — the same split
+// the kubelet and containerd have upstream, where the kubelet opens the file
+// containerd wrote and no log ever crosses the CRI socket. runtimed is the
+// writer: it opens the file, appends to it, and reopens it when the node
+// rotates it (ReopenContainerLog). It reads no log file and retains no copy of
+// one, so it has nothing to stream.
 //
-// follow keeps the stream open and delivers lines as the supervisor's pump writes
-// them, applying the same since/presentation options, until the container exits
-// (a clean end — `kubectl logs -f` returns) or the client goes away. The follower
-// is registered BEFORE the buffer snapshot so no line is lost in between; the
-// cost of that ordering is that a line written in the gap can be delivered twice,
-// which is the same trade Attach makes and the right way round (a duplicate line
-// is recoverable, a dropped one is not).
+// The RPC stays on the wire for contract stability, and answers with the one
+// thing a caller can act on: where the bytes actually are. Returning an empty
+// stream instead would look like a container that produced nothing, which is
+// the one answer a log reader must never be given wrongly.
 //
-// previous is REFUSED. runtimed keeps one in-memory buffer per LIVE container and
-// a restart replaces it, so the previous instance's output does not exist to
-// serve; answering from the running instance would hand `kubectl logs -p` the
-// wrong output labelled as the crashed run's, which is worse than an error.
-func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, stream grpc.ServerStreamingServer[runtimev1.LogEntry]) error {
-	r.mu.Lock()
-	p, ok := r.pods[req.GetPodId()]
-	r.mu.Unlock()
-	if !ok {
-		return status.Errorf(codes.NotFound, "pod %s not found", req.GetPodId())
-	}
-	// Route dispatch: a vm pod's output lives in the guest, which
-	// holds it — there is no host log buffer to serve from (see getLogsGuest).
-	if p.isVM() {
-		return r.getLogsGuest(req, stream, p)
-	}
+// The vm route is refused too, and for the same reason rather than a weaker
+// one: a vm pod's containers write into the SAME file, appended by the
+// per-container guest log follower this daemon runs against the guest agent's
+// own Logs stream (guest.go). So the file is authoritative for a vm pod as
+// well, and a second, divergent answer served live out of the guest would be a
+// different story about the same container.
+func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, _ grpc.ServerStreamingServer[runtimev1.LogEntry]) error {
+	return status.Errorf(codes.Unimplemented,
+		"container logs are on disk at ContainerStatus.log_path; the node reads them (pod %s, container %s)",
+		req.GetPodId(), req.GetContainer())
+}
 
-	cp := r.findContainer(p, req.GetContainer())
-	if cp == nil {
-		return status.Errorf(codes.NotFound, "container %s not found in pod %s", req.GetContainer(), req.GetPodId())
-	}
-	if req.GetPrevious() {
-		return status.Errorf(codes.Unimplemented,
-			"logs of the previous instance of %s/%s are not retained: runtimed buffers only the live container",
+// ReopenContainerLog closes and reopens a container's CRI log file at the same
+// path — the runtime half of log rotation.
+//
+// The node renames the live file aside and then calls this. Until it lands the
+// open descriptor keeps appending into the RENAMED inode, so nothing is lost in
+// the window; afterwards a fresh file exists at the original path. runtimed
+// performs no rotation of its own and decides nothing about when one happens:
+// the sizes, the file counts, the compression and the deletions are all the
+// node's, and this verb is the only thing it needs from the writer.
+//
+// A container that is not running is refused with FailedPrecondition, matching
+// containerd: its file is closed and complete, and reopening it would create an
+// empty file at a path the node is about to prune.
+func (r *Runtime) ReopenContainerLog(_ context.Context, req *runtimev1.ReopenContainerLogRequest) (*runtimev1.ReopenContainerLogResponse, error) {
+	// The vm fork FIRST, before any containerProc lookup — the same shape
+	// StartContainer and RestartContainer take, and for the same reason: a vm
+	// pod's containers are guest processes with no host containerProc, so the
+	// lookup below cannot answer for one at all and would report NotFound for a
+	// container that exists. Its log file IS written (by the guest log
+	// follower), but the follower holds the writer rather than a containerProc,
+	// so per-container reopen is not wired for it; the honest answer names that
+	// rather than silently succeeding while the node believes it rotated.
+	if p, ok := r.lookupPod(req.GetPodId()); ok && p.isVM() {
+		return nil, status.Errorf(codes.Unimplemented,
+			"reopen %s/%s: a vm pod's container log is written by the guest log follower and cannot be reopened per container",
 			req.GetPodId(), req.GetContainer())
 	}
-
-	var since time.Time
-	if ts := req.GetSinceTime(); ts.IsValid() {
-		since = ts.AsTime()
-	}
-	// Register the follower before snapshotting (see the doc comment's ordering
-	// note); a non-follow request never subscribes.
-	var live <-chan logLine
-	if req.GetFollow() {
-		ch, cancel := cp.logs.subscribe()
-		defer cancel()
-		live = ch
+	p, cp, err := r.lookupContainer(req.GetPodId(), req.GetContainer())
+	if err != nil {
+		return nil, err
 	}
 
-	em := newLogEmitter(stream, req)
-	send := func(ent logLine) error {
-		if ent.at.Before(since) {
-			return nil
-		}
-		return em.send(ent)
+	p.mu.Lock()
+	running := cp.state.GetState().GetRunning() != nil
+	w := cp.logw
+	p.mu.Unlock()
+	if w == nil || !running {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"reopen %s/%s: container is not running", req.GetPodId(), req.GetContainer())
 	}
-	for _, ent := range cp.logs.snapshotEntries(int(req.GetTailLines())) {
-		if err := send(ent); err != nil {
-			if errors.Is(err, errLogLimitReached) {
-				return nil
-			}
-			return err
-		}
+	if rerr := w.Reopen(); rerr != nil {
+		return nil, status.Errorf(codes.Internal, "reopen %s/%s: %v", req.GetPodId(), req.GetContainer(), rerr)
 	}
-	if !req.GetFollow() {
-		return nil
-	}
-
-	ctx := stream.Context()
-	// A nil Done channel (a container with no process, which only a test builds)
-	// blocks forever, leaving ctx as the sole exit — the right degradation.
-	var exited <-chan struct{}
-	if cp.proc != nil {
-		exited = cp.proc.Done()
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case ent := <-live:
-			if err := send(ent); err != nil {
-				if errors.Is(err, errLogLimitReached) {
-					return nil
-				}
-				return err
-			}
-		case <-exited:
-			// Flush whatever the pump had already handed the buffer before the
-			// exit was observed, then end the stream cleanly. A line still in
-			// flight inside the pump goroutine can still be missed — the same
-			// unavoidable race Attach has — but everything already written is
-			// delivered rather than cut off.
-			for {
-				select {
-				case ent := <-live:
-					if err := send(ent); err != nil {
-						if errors.Is(err, errLogLimitReached) {
-							return nil
-						}
-						return err
-					}
-				default:
-					return nil
-				}
-			}
-		}
-	}
+	return &runtimev1.ReopenContainerLogResponse{}, nil
 }
 
 // Exec, Attach, and PortForward (the bidi streaming RPCs) are implemented in

@@ -27,6 +27,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"k3sm.io/runtimed/pkg/crilog"
 )
 
 // spawnedCwd runs /bin/pwd through the PRODUCTION PosixSpawner + KqueueReaper
@@ -43,7 +45,12 @@ func spawnedCwd(t *testing.T, dir string) string {
 
 	var mu sync.Mutex
 	var out []string
-	sink := func(b []byte) { mu.Lock(); out = append(out, string(b)); mu.Unlock() }
+	sink := func(_ crilog.Stream, b []byte, _ bool) error {
+		mu.Lock()
+		out = append(out, string(b))
+		mu.Unlock()
+		return nil
+	}
 
 	p := NewProcess(PosixSpawner{}, KqueueReaper{},
 		SpawnSpec{Path: "/bin/pwd", Argv: []string{"/bin/pwd"}, Env: []string{}, Dir: dir}, sink)

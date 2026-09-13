@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/guestagent"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -392,7 +394,13 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("logs-round-trip-with-the-selection-presentation-split", func(t *testing.T) {
+	t.Run("logs-from-the-guest-land-in-the-pods-cri-file", func(t *testing.T) {
+		// The whole vm log path, against the SHIPPED agent: the host follower
+		// pulls the guest's entries across and appends them to the same CRI log
+		// file a native container's pumps would have written — same format, same
+		// stream labels, same P/F tags. That file is what `kubectl logs` reads
+		// for a vm pod, so this is the assertion that the two runtime classes
+		// are one operation for a user.
 		base := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 		dial := startRealGuestAgent(t, podID, guestagent.Deps{
 			Runner: stubRunner{names: []string{"app"}},
@@ -402,52 +410,34 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 			}}},
 		})
 		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
-		p := addVMPod(t, rt, podID, "app")
+		addVMPod(t, rt, podID, "app")
+
+		path := filepath.Join(t.TempDir(), "0.log")
+		w, err := crilog.Open(path)
+		if err != nil {
+			t.Fatalf("open the container log: %v", err)
+		}
+		defer func() { _ = w.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		ls := newFakeLogStream(ctx)
-		if err := rt.getLogsGuest(&runtimev1.GetLogsRequest{
-			PodId: podID, Container: "app", TailLines: 10,
-		}, ls, p); err != nil {
-			t.Fatalf("getLogsGuest: %v", err)
+		var last time.Time
+		if _, serr := rt.streamGuestContainerLog(ctx, podID, "app", w, &last); serr != nil {
+			t.Fatalf("streamGuestContainerLog: %v", serr)
 		}
-		if got := sentLines(ls); len(got) != 2 || got[0] != "first" || got[1] != "second" {
-			t.Errorf("lines = %v, want [first second]", got)
-		}
-	})
 
-	t.Run("logs-timestamps-are-rendered-host-side", func(t *testing.T) {
-		// The PRESENTATION half of the split. The guest supplies the entry's time;
-		// the host renders the prefix, because rendering guest-side would
-		// double-prefix every line once the host applied its own option.
-		base := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
-		dial := startRealGuestAgent(t, podID, guestagent.Deps{
-			Runner: stubRunner{names: []string{"app"}},
-			Logs: stubLogs{entries: map[string][]guestagent.LogEntry{"app": {
-				{At: base, Line: []byte("hello"), Stream: guestagent.StreamStdout},
-			}}},
-		})
-		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
-		p := addVMPod(t, rt, podID, "app")
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		ls := newFakeLogStream(ctx)
-		if err := rt.getLogsGuest(&runtimev1.GetLogsRequest{
-			PodId: podID, Container: "app", Timestamps: true,
-		}, ls, p); err != nil {
-			t.Fatalf("getLogsGuest: %v", err)
+		lines := readCRILog(t, path)
+		if len(lines) != 2 {
+			t.Fatalf("the log file holds %d lines, want 2: %v", len(lines), lines)
 		}
-		got := sentLines(ls)
-		if len(got) != 1 {
-			t.Fatalf("lines = %v, want one", got)
+		if lines[0].stream != "stdout" || lines[0].payload != "first" || lines[0].tag != "F" {
+			t.Errorf("line 0 = %+v, want stdout/F/first", lines[0])
 		}
-		if !strings.Contains(got[0], "2026-08-31T12:00:00") {
-			t.Errorf("line = %q; the host must render the guest-supplied timestamp", got[0])
+		if lines[1].stream != "stderr" || lines[1].payload != "second" {
+			t.Errorf("line 1 = %+v, want stderr/second — the guest's demux must survive into the file", lines[1])
 		}
-		if !strings.Contains(got[0], "hello") {
-			t.Errorf("line = %q; the payload was lost", got[0])
+		if want := base.Add(time.Second); !last.Equal(want) {
+			t.Errorf("resume point = %v, want the last entry's own stamp %v", last, want)
 		}
 	})
 

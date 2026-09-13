@@ -318,12 +318,16 @@ func (n *recordingNetwork) teardownCalls() []string {
 	return append([]string{}, n.teardowns...)
 }
 
-// fakeSpawner returns sequential pids and records argv/env.
+// fakeSpawner returns sequential pids and records argv/env. With logLine set it
+// also plays that line into the child's stdout pipe and closes both write ends,
+// so the supervisor's pumps see real bytes and then a real EOF — which is what
+// makes the container's log FILE observable in a unit test.
 type fakeSpawner struct {
-	mu    sync.Mutex
-	next  int
-	specs []supervisor.SpawnSpec
-	err   error
+	mu      sync.Mutex
+	next    int
+	specs   []supervisor.SpawnSpec
+	err     error
+	logLine string
 }
 
 func (f *fakeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
@@ -332,9 +336,45 @@ func (f *fakeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, 
 	if f.err != nil {
 		return 0, f.err
 	}
+	if f.logLine != "" {
+		// Through a DUP, never the descriptor the Process still owns: closing
+		// that one frees its number for the next dup and the two streams end up
+		// aliased. See the supervisor's own writeAndClose for the full account.
+		if werr := writeToStreamDup(spec.StdoutFD, f.logLine); werr != nil {
+			return 0, werr
+		}
+	}
 	f.specs = append(f.specs, spec)
 	f.next++
 	return 1000 + f.next, nil
+}
+
+// writeToStreamDup writes one newline-terminated line to a dup of fd and closes
+// the dup.
+func writeToStreamDup(fd uintptr, line string) error {
+	return writeRawToStreamDup(fd, line+"\n")
+}
+
+// writeRawToStreamDup writes payload verbatim to a DUP of fd and closes the dup.
+//
+// The dup is load-bearing: fd still belongs to the supervisor.Process, and
+// closing it here would free its NUMBER for the next dup in the same spawner, so
+// Start's own close of the other write end would land on this stream. Writing
+// through a dup leaves every descriptor's ownership where Start put it.
+func writeRawToStreamDup(fd uintptr, payload string) error {
+	if fd == 0 {
+		return nil
+	}
+	d, err := unix.Dup(int(fd))
+	if err != nil {
+		return err
+	}
+	w := os.NewFile(uintptr(d), "streamfd")
+	if _, werr := w.WriteString(payload); werr != nil {
+		_ = w.Close()
+		return werr
+	}
+	return w.Close()
 }
 
 // lastSpec returns the whole SpawnSpec of the most recent spawn, so a test can
@@ -660,6 +700,15 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	if cfg.Root == "" {
 		cfg.Root = t.TempDir()
 	}
+	// The container-log root is REQUIRED by New (it renders the SBPL deny that
+	// keeps a pod off every other pod's output), so every test runtime gets one
+	// under its own temp root. It is deliberately NOT the production
+	// /var/log/pods: a unit test must never write into the node's real log tree,
+	// and the non-default value is also what keeps the deny honest (a hard-coded
+	// literal would pass a test that a configured path fails).
+	if cfg.PodLogsDir == "" {
+		cfg.PodLogsDir = filepath.Join(cfg.Root, "podlogs")
+	}
 	rt, err := New(cfg, d)
 	if err != nil {
 		t.Fatal(err)
@@ -783,11 +832,22 @@ func hostBinBox(rt *Runtime, podID string) *runtimev1.PodBox {
 		SandboxProfile: &runtimev1.SandboxProfile{
 			DataVolumePath: dataVol,
 		},
+		// The node names the pod's container-log tree and CreatePod requires it;
+		// the helper supplies the same shape the provider does
+		// (<pod-logs-dir>/<ns>_<pod>_<uid>), rooted under this runtime's temp
+		// dir so no test writes into a real log tree.
+		LogDirectory:    testPodLogDir(rt, podID),
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Containers: []*runtimev1.Container{
 			{Name: "main", Image: "/bin/sleep", Args: nil, Command: nil},
 		},
 	}
+}
+
+// testPodLogDir is the log_directory a test PodBox carries: the runtime's own
+// pod-logs root plus the upstream <ns>_<pod>_<uid> directory name.
+func testPodLogDir(rt *Runtime, podID string) string {
+	return filepath.Join(rt.cfg.PodLogsDir, "default_p_"+podID)
 }
 
 // --- contract assertion --------------------------------------------------
@@ -1269,27 +1329,34 @@ func TestWatchPodStatus(t *testing.T) {
 	}
 }
 
-// TestGetLogs returns buffered container output.
-func TestGetLogs(t *testing.T) {
+// TestContainerOutputReachesTheLogFile asserts the end of the write path the
+// node depends on: what a container emits lands in the CRI log file the status
+// names, in the CRI format. It replaces the old TestGetLogs, which read the
+// same output back out of the in-memory ring that no longer exists.
+func TestContainerOutputReachesTheLogFile(t *testing.T) {
 	w := newBlockingWaiter()
-	rt := newTestRuntime(t, Deps{Waiter: w})
-	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, "pod-l")}); err != nil {
-		t.Fatal(err)
-	}
-	// Inject a log line directly into the container buffer.
+	sp := &fakeSpawner{logLine: "log-line-1"}
+	rt := newTestRuntime(t, Deps{Waiter: w, Spawner: sp})
+	box := hostBinBox(rt, "pod-l")
+	mustCreatePod(t, rt, box)
+	defer w.release(1001)
+
 	rt.mu.Lock()
 	p := rt.pods["pod-l"]
 	rt.mu.Unlock()
-	p.mu.Lock()
-	p.containers[0].logs.write([]byte("log-line-1"))
-	p.mu.Unlock()
-
-	stream := newFakeLogStream(context.Background())
-	if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-l", Container: "main"}, stream); err != nil {
-		t.Fatalf("GetLogs: %v", err)
+	select {
+	case <-p.containers[0].proc.LogsDrained():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the container's log pumps never drained")
 	}
-	if len(stream.entries) != 1 || string(stream.entries[0].GetLine()) != "log-line-1" {
-		t.Fatalf("logs = %v", stream.entries)
+
+	path := filepath.Join(box.GetLogDirectory(), "main", "0.log")
+	lines := readCRILog(t, path)
+	if len(lines) != 1 {
+		t.Fatalf("%s holds %v, want one line", path, lines)
+	}
+	if lines[0].payload != "log-line-1" || lines[0].stream != "stdout" || lines[0].tag != "F" {
+		t.Errorf("line = %+v, want stdout/F/log-line-1", lines[0])
 	}
 }
 
@@ -1424,10 +1491,11 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	dataVol := derivedRootfs(t, rt, "pod-vol")
 
 	box := &runtimev1.PodBox{
-		PodId:      "pod-vol",
-		Namespace:  "default",
-		Name:       "demo",
-		RootfsPath: dataVol,
+		PodId:        "pod-vol",
+		Namespace:    "default",
+		Name:         "demo",
+		RootfsPath:   dataVol,
+		LogDirectory: testPodLogDir(rt, "pod-vol"),
 		// SBPL data volume == on-disk rootfs so the credential paths validate.
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,

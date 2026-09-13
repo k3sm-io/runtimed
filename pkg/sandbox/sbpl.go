@@ -111,6 +111,22 @@ var systemProtectedPrefixes = []string{
 	"/System/Cryptexes",
 }
 
+// DefaultPodLogsDir is the container-log root a Posture assumes when it names
+// none: upstream's /var/log/pods, unchanged, because the whole point of the
+// path is that a Kubernetes operator already knows it.
+const DefaultPodLogsDir = "/var/log/pods"
+
+// ContainerLogSymlinkDir is the node's container-log SYMLINK tree — upstream's
+// /var/log/containers, one link per container pointing into the pod-logs tree.
+//
+// It is denied alongside PodLogsDir and separately from it, because it is a
+// separate hazard: unlink(2) is a write on the PARENT directory, so a pod able
+// to write here could delete another container's symlink (breaking every
+// host-level log shipper that reads the tree) without ever touching a file the
+// pod-logs deny covers. It is a fixed absolute literal rather than a configured
+// value because the path is upstream's and the node does not make it settable.
+const ContainerLogSymlinkDir = "/var/log/containers"
+
 // ErrMissingDenyDefault reports an SBPL profile that does not start its rule set
 // with (deny default) — a profile without it is fail-open and is rejected.
 var ErrMissingDenyDefault = errors.New("sbpl: profile missing (deny default)")
@@ -162,6 +178,14 @@ var ErrDataVolumeUnbounded = errors.New("sbpl: data volume is not under the pods
 // at an unintended location, so it is rejected (fail closed).
 var ErrInvalidWorkDir = errors.New("sbpl: invalid work-dir")
 
+// ErrInvalidPodLogsDir reports a Posture.PodLogsDir that is not a usable
+// container-log root: it must be an absolute, clean path other than the
+// filesystem root, and it must be SET. It is the sibling of ErrInvalidWorkDir
+// and fails closed for a sharper reason: the emitted deny IS the entire
+// enforcement, so a malformed or empty value would leave every pod on the node
+// able to read — and rewrite — every other pod's log file, silently.
+var ErrInvalidPodLogsDir = errors.New("sbpl: invalid pod-logs dir")
+
 // ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
 // not reside under the configured Posture.Home. In the unprivileged user-space
 // posture the daemon's data area lives under its home; a work-dir outside it
@@ -205,6 +229,20 @@ type Posture struct {
 	// allow_network pod has unfiltered egress (see Generate) — and is carried for
 	// the env/status plumbing. The caller (k3sm) sets it from the service CIDR.
 	APIServerVIP string
+	// PodLogsDir is the node's container-log root (the kubelet's
+	// --pod-logs-dir, /var/log/pods by default), threaded from the runtime
+	// Config. Unlike the VIP fields it is NOT plumbing: Generate emits a
+	// read+write deny for it in the protected tier, and validateExtraPaths
+	// refuses any caller-supplied path under it.
+	//
+	// It has no default and is REQUIRED (ErrInvalidPodLogsDir). A hard-coded
+	// literal in systemProtectedPrefixes could not do this job: the value is
+	// configurable per node — `k3sm dev` puts it under an instance work dir —
+	// and a deny on a path nobody writes protects nothing while looking like it
+	// does. Every pod's output, from every namespace, lands under this one
+	// tree; a pod that could read it reads the whole node's logs, and one that
+	// could write it could forge or erase another pod's.
+	PodLogsDir string
 }
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are not part of
@@ -440,10 +478,11 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// --- protected denies (higher precedence than the extra-path allows) --
 	// Emitted after the allows so a caller's extra path can never override them.
 	b.WriteString(";; PROTECTED: deny user homes, the secrets/state store, the shared\n")
-	b.WriteString(";; pods root, the daemon-private podreap store AND the control-plane\n")
+	b.WriteString(";; pods root, the daemon-private podreap store, the control-plane\n")
 	b.WriteString(";; and daemon trees (server, agent, run, blobs — sibling dirs under\n")
-	b.WriteString(";; the work-dir) — read+write, AFTER the allows so a caller's extra\n")
-	b.WriteString(";; path (even an ancestor work-dir grant) can't win.\n")
+	b.WriteString(";; the work-dir) AND the node's container-log tree (every pod's output\n")
+	b.WriteString(";; plus the symlink dir) — read+write, AFTER the allows so a caller's\n")
+	b.WriteString(";; extra path (even an ancestor work-dir grant) can't win.\n")
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
@@ -494,7 +533,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	return out, nil
 }
 
-// resolvePosture validates p.WorkDir and returns the pods root (<WorkDir>/pods —
+// resolvePosture validates p.WorkDir and p.PodLogsDir and returns the pods root (<WorkDir>/pods —
 // the bound Generate holds the data volume to), the work-dir-derived denied
 // roots (that pods-root, the daemon-private podreap store, and the
 // control-plane/daemon trees <WorkDir>/{server,agent,run,blobs} — all read+write
@@ -569,11 +608,51 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	if absRun := DefaultWorkDir + "/" + RunSubdir; filepath.Join(workDir, RunSubdir) != absRun {
 		workDirDenyRoots = append(workDirDenyRoots, absRun)
 	}
+	// The container-log tree, both halves. They join this slice rather than
+	// systemProtectedPrefixes for the reason the paragraph above gives: only
+	// this slice is RENDERED by iteration, so a member here gets its emitted
+	// deny (in both firmlink forms — /var/log/pods resolves to
+	// /private/var/log/pods, and a deny written only against the firmlink fails
+	// OPEN) as well as its validation. PodLogsDir additionally could not live in
+	// the fixed list at all: it is configured per node.
+	podLogsDir, err := resolvePodLogsDir(p.PodLogsDir)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	workDirDenyRoots = append(workDirDenyRoots, podLogsDir, ContainerLogSymlinkDir)
 	// Pin every work-dir root into the protected deny-set so a caller's extra
 	// path can never reach a sibling pod, the reap store, or a control-plane
 	// tree, then keep the fixed system subtrees.
 	protectedPrefixes = append(append([]string{}, workDirDenyRoots...), systemProtectedPrefixes...)
 	return podsRoot, workDirDenyRoots, protectedPrefixes, nil
+}
+
+// ValidatePodLogsDir reports whether dir is a usable container-log root,
+// returning it unchanged when it is. It is exported so the daemon can refuse a
+// bad value ONCE at startup rather than once per pod at profile generation: the
+// check is the same one Generate applies, asked early.
+func ValidatePodLogsDir(dir string) (string, error) { return resolvePodLogsDir(dir) }
+
+// resolvePodLogsDir validates the node's container-log root, defaulting an empty
+// value to DefaultPodLogsDir exactly as the work-dir defaults — so the zero
+// Posture stays usable, which is what its own doc promises and what every
+// generator test relies on. The REQUIREMENT lives one tier up, in the daemon's
+// own Config (runtime.New refuses an empty value), where refusing is meaningful:
+// there the node knows where its logs are, and inheriting upstream's literal
+// would emit a deny for a directory it does not use.
+func resolvePodLogsDir(dir string) (string, error) {
+	if dir == "" {
+		return DefaultPodLogsDir, nil
+	}
+	switch {
+	case !filepath.IsAbs(dir):
+		return "", fmt.Errorf("%w: %q is not absolute", ErrInvalidPodLogsDir, dir)
+	case dir == "/":
+		return "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidPodLogsDir, dir)
+	case filepath.Clean(dir) != dir:
+		return "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidPodLogsDir, dir)
+	}
+	return dir, nil
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected

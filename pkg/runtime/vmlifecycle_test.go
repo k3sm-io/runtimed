@@ -57,9 +57,10 @@ func vmPodBox(rt *Runtime, podID string, graceSeconds int64) *runtimev1.PodBox {
 		dataVol = rt.cache.PodDir(id)
 	}
 	return &runtimev1.PodBox{
-		PodId:     podID,
-		Namespace: "default",
-		Name:      "p",
+		PodId:        podID,
+		Namespace:    "default",
+		Name:         "p",
+		LogDirectory: testPodLogDir(rt, podID),
 		SandboxProfile: &runtimev1.SandboxProfile{
 			Backend:        runtimev1.SandboxBackend_SANDBOX_BACKEND_VM,
 			DataVolumePath: dataVol,

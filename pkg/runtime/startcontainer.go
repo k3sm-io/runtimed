@@ -143,7 +143,10 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	// The spawn and its supervision must outlive this unary RPC (the request ctx
 	// is cancelled the moment the handler returns), so they run under the
 	// pod-lifetime context — the same one createPod's sequence uses.
-	newCP, reason, err := r.startContainer(p.supCtx, p, rootfs, cp.spec, cp.initDeclared)
+	// restart_count 0: this verb starts a container that NEVER ran (see the doc
+	// comment), so the instance it starts is the first one, and its log file is
+	// 0.log unless a previous daemon run already wrote one.
+	newCP, reason, err := r.startContainer(p.supCtx, p, rootfs, cp.spec, cp.initDeclared, 0)
 	if err != nil {
 		r.log.Warn("start container failed; it stays waiting",
 			"pod", req.GetPodId(), "container", cp.name, "reason", reason.String(), "err", err)

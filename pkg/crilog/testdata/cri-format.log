@@ -1,0 +1,6 @@
+2026-09-13T10:30:00.123456789Z stdout F hello from the pod
+2026-09-13T10:30:00.124456789Z stderr F a diagnostic
+2026-09-13T10:30:00.125456789Z stdout P a long line that was
+2026-09-13T10:30:00.126456789Z stdout F  split in two
+2026-09-13T10:30:00.127456789Z stdout F 
+2026-09-13T10:30:00.128456789Z stderr P trailing unterminated output

@@ -105,10 +105,11 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 	intRootfs := derivedRootfs(t, rt, "pod-int")
 
 	box := &runtimev1.PodBox{
-		PodId:      "pod-int",
-		Namespace:  "default",
-		Name:       "int",
-		RootfsPath: intRootfs,
+		PodId:        "pod-int",
+		Namespace:    "default",
+		Name:         "int",
+		RootfsPath:   intRootfs,
+		LogDirectory: testPodLogDir(rt, "pod-int"),
 		SandboxProfile: &runtimev1.SandboxProfile{
 			DataVolumePath: intRootfs,
 			// Allow reading the pod binary's dir and the OS.
@@ -237,10 +238,11 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 
 	podRootfs := derivedRootfs(t, rt, "pod-a6")
 	box := &runtimev1.PodBox{
-		PodId:      "pod-a6",
-		Namespace:  "default",
-		Name:       "a6",
-		RootfsPath: podRootfs,
+		PodId:        "pod-a6",
+		Namespace:    "default",
+		Name:         "a6",
+		RootfsPath:   podRootfs,
+		LogDirectory: testPodLogDir(rt, "pod-a6"),
 		SandboxProfile: &runtimev1.SandboxProfile{
 			DataVolumePath: podRootfs,
 			ExtraReadPaths: []string{"/private/tmp", "/private/var/folders", root},

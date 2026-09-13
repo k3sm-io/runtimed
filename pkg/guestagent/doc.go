@@ -19,7 +19,7 @@ limitations under the License.
 // Stats and Stop for the one pod its micro-VM booted.
 //
 // It is the far end of a route that already exists. pkg/runtime has shipped the
-// host side — execGuest, getLogsGuest, vmPodStats, watchGuestContainerEvents —
+// host side — execGuest, followGuestContainerLog, vmPodStats, watchGuestContainerEvents —
 // and until this package existed those routes could only be
 // exercised against in-process fakes: nothing anywhere answered the RPCs, and
 // guest.proto's api_version handshake had a constant on neither side. This is that
