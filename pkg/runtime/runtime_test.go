@@ -1213,7 +1213,7 @@ func TestCreatePodValidation(t *testing.T) {
 // through the runtime spine (before exec).
 //
 // Since B119 a rejected signature is a CONTAINER-class failure, not a pod-level
-// one (m12-plan R1): containerd's image verifier makes a rejected image an
+// one (the images plan, resolution 1): containerd's image verifier makes a rejected image an
 // ordinary PullImage failure at the kubelet, so the faithful surface is the
 // container Waiting with the typed reason while the pod exists — not a
 // CreatePod that fails and leaves the operator nothing to look at. The gate the

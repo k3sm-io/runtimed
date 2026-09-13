@@ -1943,7 +1943,7 @@ func pullFailureReason(c *runtimev1.Container, err error) runtimev1.FailureReaso
 // unrunnable PodBox — means nothing about this pod can run and CreatePod fails
 // as it always has.
 //
-// SIGNATURE_REJECTED is container-class (m12-plan R1): containerd's image
+// SIGNATURE_REJECTED is container-class (the images plan, resolution 1): containerd's image
 // verifier makes a rejected image an ordinary PullImage failure at the kubelet,
 // so the faithful surface is a Waiting container, not a dead pod.
 func containerClassFailure(reason runtimev1.FailureReason) bool {
