@@ -83,6 +83,13 @@ func appendGuestContainerStatusesLocked(st *runtimev1.PodStatus, p *pod) {
 			continue
 		}
 		cs, _ := proto.Clone(src).(*runtimev1.ContainerStatus)
+		// The guest fold knows nothing about host files; the CRI log file the
+		// host-side follower writes for this container is named here, exactly
+		// as containerStatusOf names a host container's, so the node can read
+		// a vm container's logs from the same path field.
+		if w := p.guestLogs[name]; w != nil {
+			cs.LogPath = w.Path()
+		}
 		if inits[name] {
 			st.InitContainerStatuses = append(st.InitContainerStatuses, cs)
 		} else {
