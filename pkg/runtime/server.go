@@ -385,6 +385,11 @@ func graceDuration(secs int64, p *pod) time.Duration {
 
 // UpdatePod applies an in-place spec change. Only labels/annotations are
 // supported; any other field change is NOT_UPDATABLE (requires recreate).
+//
+// The contract is labels and annotations only: volumes are materialized once, at
+// create, so an update never re-resolves ConfigMap/Secret/ServiceAccount-token
+// data for a running pod (the updatable field set itself is updatableOnly's; the
+// contract is pinned by TestUpdatePodNeverMaterializes).
 func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
 	box := req.GetPod()
 	if box.GetPodId() == "" {
