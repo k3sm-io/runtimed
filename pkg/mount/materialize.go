@@ -192,6 +192,10 @@ func materializeVolume(ctx context.Context, ns, podIP string, vol *runtimev1.Vol
 	case vol.GetSecret() != nil:
 		return true, renderSecret(ctx, ns, vol.GetSecret(), target, r)
 	case vol.GetEmptyDir() != nil:
+		// Medium is deliberately not read here: this path is disk-backed
+		// unconditionally, and a non-empty medium (e.g. Memory) is refused
+		// earlier, at pkg/runtime's createPod (keyed on the resolved sandbox
+		// backend), before materialization runs.
 		return false, nil // an empty writable dir is the whole job
 	case vol.GetDownwardApi() != nil:
 		return false, renderDownwardAPI(vol.GetDownwardApi(), target, box, podIP)
