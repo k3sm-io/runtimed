@@ -147,3 +147,25 @@ func updatableOnly(oldBox, newBox *runtimev1.PodBox) (runtimev1.FailureReason, e
 	}
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
+
+// nonEmptyEmptyDirMedium reports the first volume (by declaration order) whose
+// emptyDir carries a non-empty medium (Memory, HugePages*), or ok=false if none
+// does. It is a pure predicate over the box, factored out so createPod's refusal
+// and its tests share one definition of "this box asks for a medium" rather than
+// each restating the emptyDir-source-union walk.
+//
+// It is deliberately NOT part of validatePodBox: whether a non-empty medium is
+// refusable depends on the RESOLVED sandbox backend (sandbox.SelectBackend's
+// output), not the box's requested one — an UNSPECIFIED request that the
+// host-capability ladder degrades to the vm rung (Seatbelt unavailable, vm
+// available) legitimately honours Memory, and validatePodBox runs before any
+// backend is selected. The caller (createPod) is what has the resolved backend
+// in hand, and is what pairs this predicate with that fact.
+func nonEmptyEmptyDirMedium(box *runtimev1.PodBox) (volume, medium string, ok bool) {
+	for _, v := range box.GetVolumes() {
+		if ed := v.GetEmptyDir(); ed != nil && ed.GetMedium() != "" {
+			return v.GetName(), ed.GetMedium(), true
+		}
+	}
+	return "", "", false
+}

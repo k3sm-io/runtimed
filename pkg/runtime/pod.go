@@ -360,6 +360,30 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		return r.createVMPod(ctx, box, sp)
 	}
 
+	// An emptyDir with a non-empty medium (Memory, HugePages*) is a request the
+	// native (host-process) materializer cannot honour: materializeVolume treats
+	// every emptyDir as "an empty writable dir is the whole job" and never reads
+	// Medium, so the request would be silently disk-backed rather than refused.
+	// The vm backend's own planner (classifyVMVolume) already refuses anything
+	// outside the closed set {"", "Memory"}, so this is defence in depth for the
+	// native route specifically — the k3sm provider already refuses such pods
+	// before the RPC, and this is the runtime's own backstop for a caller that
+	// skips that preflight.
+	//
+	// It is keyed on `selected` (the RESOLVED backend, reached above only once
+	// the vm rung has already been routed away) rather than the box's requested
+	// backend: an UNSPECIFIED request the ladder degraded to vm legitimately
+	// honours Memory, and refusing it here would reject a pod that runs fine.
+	// It must run before the rootfs MkdirAll below (and provisionPodTmpDir /
+	// recordPodReferences), the same reasoning the pod_id/rootfs_path checks in
+	// validatePodBox already use for their own sinks — a refused pod must leave
+	// no trace on disk.
+	if vol, medium, ok := nonEmptyEmptyDirMedium(box); ok {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("%w: volume %q: emptyDir medium %q is not served by the native backend (only the empty medium is; the vm backend honours Memory)",
+				errInvalidPodBox, vol, medium)
+	}
+
 	ip, err := r.network.Setup(ctx, box.GetPodId())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
