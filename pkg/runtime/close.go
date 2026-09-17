@@ -135,12 +135,21 @@ func (r *Runtime) Close() error {
 
 // vmShutdownBound caps the whole concurrent vm-helper stop at shutdown.
 //
-// It is sized against launchd's 45-second ExitTimeOut, not against one helper:
-// the helpers stop in parallel, so the node's cost is one budget rather than one
-// per pod, and this leaves room for the supervision waits that follow plus the
-// daemon's own teardown. A helper still running when it expires is left to the
-// next start's orphan sweep, which is the backstop that makes this a bound rather
-// than a promise.
+// It is sized per NODE, not per helper: the helpers stop in parallel, so a
+// shutdown's cost is one budget rather than one per pod. A helper still running
+// when it expires is left to the next start's orphan sweep, which is the backstop
+// that makes this a bound rather than a promise.
+//
+// It is ONE STAGE of the embedding daemon's launchd ExitTimeOut, never the whole
+// budget. Close also runs the supervision waits after this, and the daemon that
+// calls Close runs its own teardown around it — on k3sm's embedded path (the
+// server and agent daemons, which build this runtime in-process and defer Close
+// from their node exit) that is the control socket, the control-plane stop and the
+// mesh teardown, all serial, all inside one ExitTimeOut. That number is DERIVED
+// from these bounds by the embedder (k3sm pkg/install sums the named stages and
+// renders the plists), so this constant is an input to it: raising it lengthens
+// the daemon's required ExitTimeOut, and the embedder's own test and acceptance
+// gate are what notice. Do not re-size it against a remembered plist value.
 const vmShutdownBound = 35 * time.Second
 
 // supervisionWait is one pod's set of "the cancel was observed" edges: the
