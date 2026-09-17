@@ -21,11 +21,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 
+	"golang.org/x/sys/unix"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
@@ -414,18 +418,51 @@ const vmOwnerMarkerName = ".k3sm-vm-owner"
 // runDir must be absolute — it is derived from an AgentSocketPath validateVMSpec
 // already proved absolute and clean, and a relative one would stamp a directory
 // resolved against whatever the daemon's cwd happens to be.
-func writeVMOwnerMarker(runDir, podID string) error {
+//
+// THE WRITE SIDE IS AN ATTACK SURFACE OF ITS OWN, and it is the worse half.
+// os.MkdirAll only STATS each component, so a symlink pre-planted at the leaf or
+// at any ancestor between root and it is followed in silence and the marker is
+// written through it; os.WriteFile follows a symlink named .k3sm-vm-owner the
+// same way. The stamp would then be GENUINE — this daemon really did write it,
+// for this pod id — at a directory somebody else chose, and a later sweep would
+// honestly prove ownership of that directory and RemoveAll it as root. So the
+// walk below runs BEFORE the MkdirAll, and the marker is opened O_NOFOLLOW.
+//
+// root is the containment base of that walk: the daemon's state root, whose own
+// ancestors are configuration and are not re-derived (see pathsafe.RefuseSymlinkedPath).
+// An EMPTY root — a backend constructed without one, i.e. a test double that
+// spawns nothing and sweeps nothing — skips the walk: what the walk protects is
+// the orphan sweep's root-privileged delete, and that sweep is disabled without
+// a state root (vmReapRoot). The marker's own O_NOFOLLOW open still applies.
+func writeVMOwnerMarker(root, runDir, podID string) error {
 	if podID == "" {
 		return fmt.Errorf("refusing to stamp the vm run dir %q for an empty pod id", runDir)
 	}
 	if !filepath.IsAbs(runDir) {
 		return fmt.Errorf("refusing to stamp the vm run dir %q for pod %s: not an absolute path", runDir, podID)
 	}
+	if root != "" {
+		if err := pathsafe.RefuseSymlinkedPath(root, runDir); err != nil {
+			return fmt.Errorf("refusing to stamp the vm run dir %s for pod %s: %w", runDir, podID, err)
+		}
+	}
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return fmt.Errorf("create the vm run dir %s for pod %s: %w", runDir, podID, err)
 	}
 	marker := filepath.Join(runDir, vmOwnerMarkerName)
-	if err := os.WriteFile(marker, []byte(podID), 0o600); err != nil {
+	// O_NOFOLLOW is the leaf's half of the walk: a marker that already exists as
+	// a symlink is refused here rather than written through. O_TRUNC keeps the
+	// re-stamp of a live dir idempotent, which is the case a re-created pod at
+	// the same path exercises.
+	f, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("stamp the vm run dir %s for pod %s: %w", runDir, podID, err)
+	}
+	if _, err := f.WriteString(podID); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("stamp the vm run dir %s for pod %s: %w", runDir, podID, err)
+	}
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("stamp the vm run dir %s for pod %s: %w", runDir, podID, err)
 	}
 	return nil
@@ -441,7 +478,17 @@ func vmRunDirIsOwnedBy(runDir, podID string) bool {
 	if podID == "" {
 		return false
 	}
-	data, err := os.ReadFile(filepath.Join(runDir, vmOwnerMarkerName))
+	// O_NOFOLLOW: a marker that is a SYMLINK proves nothing about this
+	// directory, whatever its target says. Reading through it would let a link
+	// planted beside a dir this daemon never stamped borrow a real marker's
+	// bytes and buy that dir a root RemoveAll. The open fails, the verdict is
+	// negative, and the caller leaves the directory alone.
+	f, err := os.OpenFile(filepath.Join(runDir, vmOwnerMarkerName), os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return false
 	}
@@ -473,6 +520,29 @@ func vmRunDirIsOwnedBy(runDir, podID string) bool {
 // at all is the store's write boundary (see VMReapSubdir), not this function's
 // question.
 //
+// THREE gates now, and the new one sits between them: containment proves the
+// NAME is in the right tree, the walk proves the PLACE is (no component from
+// <state-root>/run down to the leaf is a symlink or a non-directory), and the
+// marker proves the PROVENANCE. Without the walk the first gate is a string
+// comparison a pre-planted link steps straight over: `<run>/vm/p1` is textually
+// contained however `vm` resolves, and Stat, the marker read and RemoveAll all
+// follow it to the target.
+//
+// RESIDUAL, stated rather than implied: the walk is an os.Lstat PRE-CHECK, not
+// an openat/O_NOFOLLOW descent holding a directory fd at each level, so a
+// component can still be swapped between the walk and the RemoveAll. That race
+// is accepted here for two reasons — os.RemoveAll has no fd-relative form to
+// descend with, and the only thing that can win it is an UNCONFINED process at
+// this daemon's own euid (the run tree is inside the SBPL deny set, so no pod
+// can plant a link there at all). What the walk removes is the pre-planted link,
+// which is the reachable attack.
+//
+// What was exposed was the TOP-LEVEL path and its ancestors, precisely: once
+// RemoveAll is walking a real directory it does not follow a symlink it meets as
+// an ENTRY — it unlinks the link itself and leaves the target alone. So a
+// symlink INSIDE a proven run dir was never the hole; a symlinked run dir, or a
+// symlinked ancestor of one, was.
+//
 // MIGRATION COST, plainly: run dirs created before this change carry no marker.
 // An orphan record pointing at one is kept, its directory is left in place, and
 // the warning repeats on every daemon start until an operator confirms the
@@ -488,6 +558,14 @@ func (b *VMBackend) clearOrphanRunDir(rec vmProcRecord) (retire bool) {
 	if clean != runRoot && !isAtOrUnderDir(clean, runRoot) {
 		b.logger().Warn("vm reap record names a run dir outside this node's run tree: left in place, record kept (re-warns each start)",
 			"pod", rec.PodID, "dir", rec.RunDir, "run_root", runRoot)
+		return false
+	}
+	if err := pathsafe.RefuseSymlinkedPath(runRoot, clean); err != nil {
+		// Treated exactly like an unproven dir: nothing is removed, the record
+		// is kept so the leak keeps a pointer, and the warning names the
+		// component that failed so an operator can look at the right path.
+		b.logger().Warn("vm reap record names a run dir reached through a symlinked or non-directory component: left in place, record kept (re-warns each start)",
+			"pod", rec.PodID, "dir", clean, "run_root", runRoot, "err", err)
 		return false
 	}
 	if _, err := os.Stat(clean); errors.Is(err, fs.ErrNotExist) {

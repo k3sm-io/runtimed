@@ -228,7 +228,7 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 	// The reverse order would admit a crash window whose record named a dir no
 	// later sweep could ever prove, i.e. could ever clean up. A stamp failure
 	// fails the boot for the same reason a record failure does.
-	if err := writeVMOwnerMarker(vp.runDir, vp.podID); err != nil {
+	if err := writeVMOwnerMarker(b.stateRoot, vp.runDir, vp.podID); err != nil {
 		b.hardStop(vp)
 		return nil, err
 	}

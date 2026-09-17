@@ -26,6 +26,8 @@ import (
 	"strings"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 // Host directory modes for the pod-dir share roots. The proj root pools every
@@ -48,9 +50,25 @@ const (
 // disk: it creates each pod-dir share root (rootfs / proj / vols), materializes
 // every proj-share bind's volume into <projRoot>/<volume name>, and creates
 // every vols-share bind's writable <volsRoot>/<volume name> directory. box is
-// the pod being created, plan its ComputeSharePlan output, podIP the pod's
-// cluster address for status.podIP downward-API projections ("" when the vm
-// path has none), and r supplies ConfigMap/Secret data and SA tokens.
+// the pod being created, podDir the pod's own directory (the containment root
+// every path below is created under), plan its ComputeSharePlan output, podIP
+// the pod's cluster address for status.podIP downward-API projections ("" when
+// the vm path has none), and r supplies ConfigMap/Secret data and SA tokens.
+//
+// EVERY DIRECTORY IT CREATES IS WALKED FIRST (pathsafe.RefuseSymlinkedPath), and
+// this is the EARLIEST of the vm path's creating sites, not a duplicate of a
+// later one: this function runs before CreateVM, so it is what actually writes
+// the pod's Secret, ConfigMap and ServiceAccount-token bytes to disk. A symlink
+// pre-planted at a share root — the names are fixed and need no guess — would
+// otherwise be followed by MkdirAll, chmod'd 0700 to look right, and then filled
+// with those credentials in a directory somebody else chose. A refusal fails the
+// create, so the pod never boots.
+//
+// The walk bounds the DIRECTORIES. The files materializeVolume then writes
+// inside a volume's own directory are not opened O_NOFOLLOW, so a link planted
+// at a projected file name inside an already-created volume dir is out of its
+// reach; what it removes is the pre-planted directory, which is what relocates a
+// whole share.
 //
 // This is the filesystem half ComputeSharePlan deliberately does not do (that
 // function is pure data — see its doc). Without it a vm pod's proj share root
@@ -71,9 +89,12 @@ const (
 // repeat is not an error, and two different volumes claiming one share
 // directory is (mirroring Materialize's conflict guard, keyed on the
 // per-volume share directory rather than a rebased mount path).
-func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, plan SharePlan, podIP string, r Resolver) error {
+func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string, plan SharePlan, podIP string, r Resolver) error {
 	if box == nil {
 		return errors.New("nil pod box")
+	}
+	if podDir == "" {
+		return errors.New("empty pod dir: the share roots have no containment root to be checked against")
 	}
 	volumes := make(map[string]*runtimev1.Volume, len(box.GetVolumes()))
 	for _, v := range box.GetVolumes() {
@@ -94,6 +115,12 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, plan SharePla
 		mode := shareRootMode
 		if s.Tag == ShareTagProj {
 			mode = projShareRootMode
+		}
+		// Fail closed, including on a root that is not under the pod dir at
+		// all: the planner already guarantees the pooled roots are, so a path
+		// that is not is a derivation this function cannot vouch for.
+		if err := pathsafe.RefuseSymlinkedPath(podDir, s.Root); err != nil {
+			return fmt.Errorf("refusing share dir %s (%s): %w", s.Root, s.Tag, err)
 		}
 		if err := os.MkdirAll(s.Root, mode); err != nil {
 			return fmt.Errorf("create share dir %s (%s): %w", s.Root, s.Tag, err)
@@ -139,6 +166,13 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, plan SharePla
 				return fmt.Errorf("volumes %q and %q both claim share dir %q", prev, b.VolumeName, dir)
 			}
 			seen[dir] = b.VolumeName
+
+			// The per-volume directory is walked for the same reason its share
+			// root is: the vols branch MkdirAlls it and the proj branch writes
+			// this volume's rendered content into it.
+			if err := pathsafe.RefuseSymlinkedPath(podDir, dir); err != nil {
+				return fmt.Errorf("refusing share dir %s for volume %s: %w", dir, b.VolumeName, err)
+			}
 
 			switch b.ShareTag {
 			case ShareTagVols:
