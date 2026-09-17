@@ -287,23 +287,6 @@ func xcodeBundleRoot(dir string) (string, bool) {
 	return bundle, true
 }
 
-// xcodeAncestors returns the strict ancestors of p, root-first, excluding "/" and
-// p itself: for /Applications/Xcode.app/Contents/Developer it is /Applications,
-// /Applications/Xcode.app, /Applications/Xcode.app/Contents. These are the
-// directories a stat-walk traverses on the way down, and the metadata-only tier
-// is the whole grant they get.
-func xcodeAncestors(p string) []string {
-	var out []string
-	for cur := filepath.Dir(p); cur != "/" && cur != "." && cur != p; cur = filepath.Dir(cur) {
-		out = append(out, cur)
-	}
-	// reverse into root-first order, which is how the stat-walk reads.
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
-	return out
-}
-
 // xcodeToolchainStanza renders the toolchain grant for a validated DEVELOPER_DIR
 // in the profile's house style: a comment naming the grant and its provenance,
 // then one rule per grant class. dir must already have passed
@@ -355,7 +338,7 @@ func xcodeToolchainStanza(dir string) string {
 		metaSources = append(metaSources, bundle)
 	}
 	for _, src := range metaSources {
-		for _, anc := range xcodeAncestors(src) {
+		for _, anc := range strictAncestors(src) {
 			if metaSeen[anc] {
 				continue
 			}
