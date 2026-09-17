@@ -36,6 +36,33 @@ const ExecShimName = "k3sm-execshim"
 // ErrShimNotFound reports that the k3sm-execshim helper could not be located.
 var ErrShimNotFound = errors.New("sandbox: k3sm-execshim helper not found")
 
+// ProfileSubdir is the daemon-private per-pod SBPL staging dir name
+// (<root>/sbpl), a sibling of PodReapSubdir and VMReapSubdir under the runtime
+// work-dir. It is an exported const for the same reason those two are: three
+// consumers must name the same directory — WrapCommand stages into it,
+// resolvePosture pins it into the protected deny-set (so Generate emits a
+// matching (deny ...) and validateExtraPaths refuses a caller-supplied path
+// under it), and SweepStaleProfiles empties it at startup. A drifted second
+// literal would leave the deny guarding an empty sibling while the real staging
+// dir stayed writable.
+//
+// The staging dir is created 0700 and its files 0600. Those modes are hygiene
+// against other local users and daemons on the host — they are NOT a boundary
+// between pods: every pod runs as the daemon's uid, so a pod that obtained a
+// path grant reaching here could read and rewrite a sibling's profile. The
+// boundary is the emitted Seatbelt deny, and it is load-bearing: the shim reads
+// the profile BEFORE it applies the sandbox, so a writable staging dir would be
+// a sandbox-substitution primitive.
+const ProfileSubdir = "sbpl"
+
+// ProfileTempPattern is the os.CreateTemp pattern for a staged per-pod profile.
+// It is exported and shared with SweepStaleProfiles for the reason above in the
+// small: the sweep deletes exactly the shape WrapCommand creates, so the two
+// cannot drift into a staging dir that fills forever. The pattern is also what
+// the legacy top-level (pre-ProfileSubdir) files were named, which is why the
+// sweep can still find them.
+const ProfileTempPattern = "k3sm-sbpl-*.sb"
+
 // ExecShimBackend confines pods with a non-PLATFORM exec-shim: it spawns the
 // ad-hoc-signed k3sm-execshim helper, which compiles+applies the per-pod SBPL
 // via libsandbox and then execve(pod, argv, envp). Because the shim is an
@@ -50,8 +77,9 @@ var ErrShimNotFound = errors.New("sandbox: k3sm-execshim helper not found")
 type ExecShimBackend struct {
 	// shimPath is the resolved absolute path to the k3sm-execshim helper.
 	shimPath string
-	// profileDir is where per-pod compiled profiles are written before spawn.
-	profileDir string
+	// root is the runtime work-dir; per-pod profiles are staged under its
+	// ProfileSubdir child (see profileDir).
+	root string
 	// minMajor is the minimum macOS major version the libsandbox SPI is known to
 	// support; below it Available returns false.
 	minMajor int
@@ -61,10 +89,15 @@ type ExecShimBackend struct {
 
 // NewExecShimBackend constructs an ExecShimBackend. shimPath is the path to the
 // k3sm-execshim helper (if empty, FindExecShim is used to locate it next to the
-// current executable or on PATH). profileDir is where per-pod profiles are
-// staged (if empty, os.TempDir is used). It returns an error only if the shim
-// cannot be located.
-func NewExecShimBackend(shimPath, profileDir string) (*ExecShimBackend, error) {
+// current executable or on PATH). root is the runtime work-dir, under whose
+// ProfileSubdir child per-pod profiles are staged (if empty, os.TempDir is
+// used). It returns an error only if the shim cannot be located.
+//
+// The staging dir is NOT created here: the backend creates it on demand (the
+// PodReapSubdir/VMReapSubdir store-root idiom), so a caller that never spawns a
+// pod leaves no directory behind and a dir removed under a running daemon is
+// re-created at the next spawn rather than failing it.
+func NewExecShimBackend(shimPath, root string) (*ExecShimBackend, error) {
 	if shimPath == "" {
 		p, err := FindExecShim()
 		if err != nil {
@@ -72,15 +105,22 @@ func NewExecShimBackend(shimPath, profileDir string) (*ExecShimBackend, error) {
 		}
 		shimPath = p
 	}
-	if profileDir == "" {
-		profileDir = os.TempDir()
+	if root == "" {
+		root = os.TempDir()
 	}
 	return &ExecShimBackend{
-		shimPath:   shimPath,
-		profileDir: profileDir,
-		minMajor:   26, // k3sm targets macOS 26+ (Seatbelt SPI validated there).
-		osMajorFn:  darwinMajorVersion,
+		shimPath:  shimPath,
+		root:      root,
+		minMajor:  26, // k3sm targets macOS 26+ (Seatbelt SPI validated there).
+		osMajorFn: darwinMajorVersion,
 	}, nil
+}
+
+// profileDir is the per-pod SBPL staging directory, <root>/sbpl. It is derived
+// rather than stored so the leaf name has one spelling (ProfileSubdir) shared
+// with the SBPL deny-set and the startup sweep.
+func (b *ExecShimBackend) profileDir() string {
+	return filepath.Join(b.root, ProfileSubdir)
 }
 
 // ExecShimBackendName identifies the host-process Seatbelt rung in
@@ -115,7 +155,8 @@ func (b *ExecShimBackend) Available() bool {
 }
 
 // WrapCommand validates profile (fail-closed), writes it to a per-pod temp file
-// under the backend's profile dir, and returns the shim path plus argv:
+// under the backend's staging dir (<root>/sbpl, created on demand), and returns
+// the shim path plus argv:
 //
 //	[shimPath, <uid>, <gid>, <groups-csv>, <rlimits>, <qos>, profilePath, pod, args...]
 //
@@ -142,7 +183,11 @@ func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv 
 		return "", nil, nil, fmt.Errorf("sandbox: %s backend unavailable on this host", b.Name())
 	}
 
-	f, err := os.CreateTemp(b.profileDir, "k3sm-sbpl-*.sb")
+	dir := b.profileDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, nil, fmt.Errorf("create the sbpl staging dir %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ProfileTempPattern)
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("stage sbpl profile: %w", err)
 	}
@@ -166,6 +211,51 @@ func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv 
 	args = append(args, profilePath)
 	args = append(args, argv...)
 	return b.shimPath, args, cleanup, nil
+}
+
+// SweepStaleProfiles removes every staged profile left behind by a previous
+// daemon incarnation and returns how many it removed. It sweeps both
+// <root>/sbpl/ and — as a one-time migration for hosts that ran the pre-sbpl
+// layout — the legacy top-level <root>/k3sm-sbpl-*.sb files, matching only
+// ProfileTempPattern so an unrelated file at either level is never touched. A
+// missing staging dir is not an error (nothing has been staged yet). It logs
+// nothing: the caller owns the log line, because only the caller knows which
+// startup this was.
+//
+// Why everything present is stale, with no mtime or age heuristic: the decision
+// is made by WHERE this is called, not by how old a file looks. The one call
+// site is the runtime's exactly-once startup reap, after the pod-process reap
+// has run — so every process group a previous daemon spawned has been SIGKILLed
+// or (the keep-and-warn ceiling) recorded as leaked. A leaked shim cannot need
+// its profile: the shim reads the file exactly once, at the top of its main,
+// before it applies the sandbox and execs the pod binary, so any shim still
+// alive at this point read its profile long ago. Nothing this daemon staged can
+// be in the directory yet, because the reap runs before CreatePod is served.
+// An age heuristic would only add a window in which a genuinely stale file is
+// kept, and would still be wrong the moment a host clock moved.
+func (b *ExecShimBackend) SweepStaleProfiles() (removed int, err error) {
+	var errs []error
+	for _, dir := range []string{b.profileDir(), b.root} {
+		matches, gerr := filepath.Glob(filepath.Join(dir, ProfileTempPattern))
+		if gerr != nil {
+			// The only Glob error is ErrBadPattern, which a const pattern cannot
+			// produce; keep it rather than discard it so a future pattern edit is
+			// not silent.
+			errs = append(errs, fmt.Errorf("scan staged profiles in %s: %w", dir, gerr))
+			continue
+		}
+		for _, p := range matches {
+			if rerr := os.Remove(p); rerr != nil {
+				if errors.Is(rerr, os.ErrNotExist) {
+					continue
+				}
+				errs = append(errs, fmt.Errorf("remove stale profile %s: %w", p, rerr))
+				continue
+			}
+			removed++
+		}
+	}
+	return removed, errors.Join(errs...)
 }
 
 // FindExecShim locates the k3sm-execshim helper: first beside the current
