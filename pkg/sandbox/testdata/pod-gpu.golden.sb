@@ -28,11 +28,14 @@
   (iokit-registry-entry-class "AGXDeviceUserClient")
   (iokit-registry-entry-class "IOSurfaceRootUserClient"))
 ;; PROTECTED: deny user homes, the secrets/state store, the shared
-;; pods root, the daemon-private podreap store, the control-plane
-;; and daemon trees (server, agent, run, blobs — sibling dirs under
-;; the work-dir) AND the node's container-log tree (every pod's output
-;; plus the symlink dir) — read+write, AFTER the allows so a caller's
+;; pods root, the daemon-private reap stores and the control-plane
+;; and daemon-private trees (sibling dirs under the work-dir, named
+;; below) AND the node's container-log tree (every pod's output plus
+;; the symlink dir) — read+write, AFTER the allows so a caller's
 ;; extra path (even an ancestor work-dir grant) can't win.
+;;   reap stores: podreap, vmreap
+;;   daemon trees: server, agent, run, blobs, sbpl, index, operator,
+;;     unpacked, snapshots, ingest, guest-artifacts
 (deny file-read* file-write*
   (subpath "/Users"))
 (deny file-read* file-write*
@@ -42,6 +45,8 @@
   (subpath "/private/var/lib/k3sm/pods")
   (subpath "/var/lib/k3sm/podreap")
   (subpath "/private/var/lib/k3sm/podreap")
+  (subpath "/var/lib/k3sm/vmreap")
+  (subpath "/private/var/lib/k3sm/vmreap")
   (subpath "/var/lib/k3sm/server")
   (subpath "/private/var/lib/k3sm/server")
   (subpath "/var/lib/k3sm/agent")
@@ -52,6 +57,18 @@
   (subpath "/private/var/lib/k3sm/blobs")
   (subpath "/var/lib/k3sm/sbpl")
   (subpath "/private/var/lib/k3sm/sbpl")
+  (subpath "/var/lib/k3sm/index")
+  (subpath "/private/var/lib/k3sm/index")
+  (subpath "/var/lib/k3sm/operator")
+  (subpath "/private/var/lib/k3sm/operator")
+  (subpath "/var/lib/k3sm/unpacked")
+  (subpath "/private/var/lib/k3sm/unpacked")
+  (subpath "/var/lib/k3sm/snapshots")
+  (subpath "/private/var/lib/k3sm/snapshots")
+  (subpath "/var/lib/k3sm/ingest")
+  (subpath "/private/var/lib/k3sm/ingest")
+  (subpath "/var/lib/k3sm/guest-artifacts")
+  (subpath "/private/var/lib/k3sm/guest-artifacts")
   (subpath "/var/log/pods")
   (subpath "/private/var/log/pods")
   (subpath "/var/log/containers")

@@ -45,7 +45,12 @@ const DefaultWorkDir = "/var/lib/k3sm"
 const PodReapSubdir = "podreap"
 
 // The control-plane and daemon-private work-dir subtrees a confined pod may
-// never read or write. Like PodReapSubdir they are exported consts so the leaf
+// never read or write. They are the first members of DaemonTreeSubdirs, which is
+// the one place the whole set is stated — the image-store and guest-artifact
+// siblings, whose names are mirrored from their owning packages, live beside it
+// in workdirtrees.go.
+//
+// Like PodReapSubdir they are exported consts so the leaf
 // name has exactly one spelling: resolvePosture joins each onto the work-dir,
 // pins the result into the protected deny-set, and Generate emits a matching
 // (deny ...) for it. A second, drifted literal would leave the deny guarding a
@@ -98,8 +103,8 @@ const DefaultResolverVIP = "10.96.0.10"
 // system secrets/state store, and the dyld cryptex (the system read-only content
 // volume). They are absolute literals by definition — anything work-dir-relative
 // belongs in resolvePosture instead, which appends the pods-root (sibling pods),
-// the daemon-private podreap store, and the control-plane/daemon trees
-// (<WorkDir>/{server,agent,run,blobs,sbpl}) to this set.
+// the daemon-private reap stores (ReapStoreSubdirs) and the control-plane and
+// daemon-private trees (DaemonTreeSubdirs) to this set.
 // validateExtraPaths rejects any extra read/write path at or under one of these
 // (the pod's own data volume is carved out), and Generate emits a matching
 // (deny ...) for each after the extra-path allows so an unvalidated path cannot
@@ -487,11 +492,17 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// --- protected denies (higher precedence than the extra-path allows) --
 	// Emitted after the allows so a caller's extra path can never override them.
 	b.WriteString(";; PROTECTED: deny user homes, the secrets/state store, the shared\n")
-	b.WriteString(";; pods root, the daemon-private podreap store, the control-plane\n")
-	b.WriteString(";; and daemon trees (server, agent, run, blobs — sibling dirs under\n")
-	b.WriteString(";; the work-dir) AND the node's container-log tree (every pod's output\n")
-	b.WriteString(";; plus the symlink dir) — read+write, AFTER the allows so a caller's\n")
+	b.WriteString(";; pods root, the daemon-private reap stores and the control-plane\n")
+	b.WriteString(";; and daemon-private trees (sibling dirs under the work-dir, named\n")
+	b.WriteString(";; below) AND the node's container-log tree (every pod's output plus\n")
+	b.WriteString(";; the symlink dir) — read+write, AFTER the allows so a caller's\n")
 	b.WriteString(";; extra path (even an ancestor work-dir grant) can't win.\n")
+	// Both name lists are RENDERED from the same slices resolvePosture denies
+	// (ReapStoreSubdirs/DaemonTreeSubdirs) rather than written out here: a
+	// hand-typed header is a second enumeration, and the day it drifts the
+	// profile documents a protection it does not carry.
+	writeCommentNameList(&b, "reap stores", ReapStoreSubdirs())
+	writeCommentNameList(&b, "daemon trees", DaemonTreeSubdirs())
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
@@ -586,9 +597,10 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 // resolvePosture validates p.WorkDir and p.PodLogsDir and returns the pods root (<WorkDir>/pods —
 // the bound Generate holds the data volume to), the work-dir-derived denied
-// roots (that pods-root, the daemon-private podreap store, and the
-// control-plane/daemon trees <WorkDir>/{server,agent,run,blobs,sbpl} — all read+write
-// denied with firmlink forms by Generate) and the ordered protected-prefix
+// roots (that pods-root, the daemon-private reap stores named by
+// ReapStoreSubdirs, and the control-plane and daemon-private trees named by
+// DaemonTreeSubdirs — all read+write denied with firmlink forms by
+// Generate) and the ordered protected-prefix
 // deny-set (those roots plus the fixed system subtrees). The pods root is
 // returned explicitly rather than read back out of the deny-root slice by index,
 // so the data-volume bound and the deny it is carved out of cannot drift. An
@@ -620,11 +632,15 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 		}
 	}
 	podsRoot = filepath.Join(workDir, "pods")
-	// The daemon-private startup-reap store: records here drive a root-privileged
-	// kill(-pgid), so a confined pod must never be able to write (or read) them.
-	// Single-sourced with pkg/runtime via PodReapSubdir.
-	podReapRoot := filepath.Join(workDir, PodReapSubdir)
-	workDirDenyRoots = []string{podsRoot, podReapRoot}
+	// The daemon-private reap stores: a record here drives a root-privileged kill
+	// (podreap's kill(-pgid), vmreap's helper SIGKILL + the RemoveAll of the
+	// record's run dir), so a confined pod must never be able to write — or read
+	// — them. Single-sourced with pkg/runtime and the vm backend via
+	// ReapStoreSubdirs.
+	workDirDenyRoots = []string{podsRoot}
+	for _, sub := range ReapStoreSubdirs() {
+		workDirDenyRoots = append(workDirDenyRoots, filepath.Join(workDir, sub))
+	}
 	// The control-plane and daemon-private siblings. They go in
 	// workDirDenyRoots — not in systemProtectedPrefixes — because the fixed list
 	// holds absolute literals, so a /var/lib/k3sm entry there would guard nothing
@@ -651,7 +667,12 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	// primitive — a pod able to rewrite a staged profile chooses the confinement
 	// the next pod runs under. Single-sourced with the staging code and the
 	// startup sweep via sandbox.ProfileSubdir.
-	for _, sub := range []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir, ProfileSubdir} {
+	//
+	// The membership of the set is DaemonTreeSubdirs' to state, not this
+	// function's: the same list renders the ";; PROTECTED:" header comment in
+	// Generate, so a tree can never be denied without being named or named
+	// without being denied.
+	for _, sub := range DaemonTreeSubdirs() {
 		workDirDenyRoots = append(workDirDenyRoots, filepath.Join(workDir, sub))
 	}
 	// The socket + key dir also in its absolute form, when the work-dir is not the
@@ -878,6 +899,44 @@ func writeFirmlinkSubpaths(b *strings.Builder, paths []string) {
 			b.WriteString(fmt.Sprintf("  (subpath %q)\n", form))
 		}
 	}
+}
+
+// commentWrapCols is the column the generated comment lists wrap at. It is the
+// conventional 72 rather than a terminal width: a rendered profile is read in
+// diffs and in `sandbox_apply` error output, both of which are line-oriented.
+const commentWrapCols = 72
+
+// writeCommentNameList writes names as an SBPL comment block — `;;   <label>:
+// a, b, c` — wrapping at commentWrapCols with a continuation indent, so the
+// rendered profile carries the deny-set's membership in readable form.
+//
+// It takes the names as a slice rather than a pre-joined string because its
+// whole purpose is that the header is GENERATED from the same lists
+// resolvePosture iterates (ReapStoreSubdirs, DaemonTreeSubdirs): a caller that
+// had to spell the names to call it would reintroduce the second enumeration
+// this exists to remove. An empty list writes nothing rather than an empty
+// label, so a future list that legitimately becomes empty leaves no dangling
+// line in the golden.
+func writeCommentNameList(b *strings.Builder, label string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	const prefix = ";;   "
+	const contPrefix = ";;     "
+	line := prefix + label + ":"
+	for i, n := range names {
+		frag := " " + n
+		if i < len(names)-1 {
+			frag += ","
+		}
+		if len(line)+len(frag) > commentWrapCols {
+			b.WriteString(line + "\n")
+			line = contPrefix + strings.TrimPrefix(frag, " ")
+			continue
+		}
+		line += frag
+	}
+	b.WriteString(line + "\n")
 }
 
 // Validate checks that a rendered SBPL profile is fail-closed: it must contain

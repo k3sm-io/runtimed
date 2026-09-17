@@ -331,15 +331,80 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 	}
 }
 
-// TestWorkDirDenyRootsCoverControlPlaneTrees is the control-plane-tree contract:
-// the work-dir siblings that hold the cluster CA keys + kine datastore
-// (<WorkDir>/server), the node-agent state (<WorkDir>/agent), the daemon control
-// sockets + wireguard mesh private key (<WorkDir>/run), the content-addressed
-// blob store (<WorkDir>/blobs) and the per-pod SBPL staging dir (<WorkDir>/sbpl)
-// must be both rejected as caller-supplied paths and
-// EMITTED as denies after the allows — a validate-set entry alone would not
+// TestGenerateVMReapStoreDenied is TestGeneratePodReapStoreDenied's sibling for
+// the OTHER root-privileged store: the vm-helper orphan-record store
+// (<WorkDir>/vmreap). Its records drive two root actions, not one — a SIGKILL at
+// the recorded process group and an os.RemoveAll of the run dir the record
+// carries — so a pod that could forge one gets a kill primitive and a recursive
+// delete inside the daemon's own run tree.
+//
+// It is a separate test rather than a case in the tree table below because the
+// load-bearing shape is the same one podreap's test pins and the table does not:
+// an ANCESTOR extra_write_path that validateExtraPaths legitimately admits, with
+// the deny emitted after it so last-match-wins still closes the store.
+func TestGenerateVMReapStoreDenied(t *testing.T) {
+	const workDir = "/var/lib/k3sm"
+	const dataVol = workDir + "/pods/p1/rootfs"
+	const vmReapRoot = workDir + "/" + VMReapSubdir
+
+	out, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath:  dataVol,
+		ExtraWritePaths: []string{workDir},
+	}, GenerateOptions{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	// The ancestor allow is present, so this is the dangerous shape rather than a
+	// validation rejection.
+	ancestorAllow := "(allow file-write*\n  (subpath \"" + workDir + "\")"
+	iAllow := strings.Index(out, ancestorAllow)
+	if iAllow < 0 {
+		t.Fatalf("expected the ancestor work-dir write allow in the profile:\n%s", out)
+	}
+
+	// Both firmlink forms: a deny written only against the firmlink spelling
+	// fails OPEN.
+	for _, frag := range []string{
+		"(subpath \"" + vmReapRoot + "\")",
+		"(subpath \"/private" + vmReapRoot + "\")",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("vmreap store not denied (missing %q):\n%s", frag, out)
+		}
+	}
+
+	iDeny := strings.Index(out, "(subpath \""+vmReapRoot+"\")")
+	if iDeny >= 0 && iDeny <= iAllow {
+		t.Errorf("vmreap deny (%d) must come AFTER the ancestor work-dir allow (%d) to win (last-match-wins)", iDeny, iAllow)
+	}
+
+	// The store dir name is single-sourced with the backend that writes it
+	// (VMBackend.vmReapRoot).
+	if VMReapSubdir != "vmreap" {
+		t.Errorf("VMReapSubdir = %q, want \"vmreap\" (single-sourced with the vm backend's store)", VMReapSubdir)
+	}
+}
+
+// TestWorkDirDenyRootsCoverControlPlaneTrees is the daemon-private-tree
+// contract, over EVERY tree the daemon owns under its work-dir: the cluster CA
+// keys + kine datastore (server), the node-agent state (agent), the daemon
+// control sockets + wireguard mesh private key (run), the content-addressed blob
+// store (blobs), the per-pod SBPL staging dir (sbpl), the two root-privileged
+// reap stores (podreap, vmreap), the five image-store siblings (index, operator,
+// unpacked, snapshots, ingest) and the pinned guest-artifact cache
+// (guest-artifacts). Each must be both rejected as a caller-supplied path and
+// EMITTED as a deny after the allows — a validate-set entry alone would not
 // survive an ancestor grant, and an emitted deny placed before the allows would
 // be worthless (SBPL is last-match-wins).
+//
+// The table is written as LITERALS, not as ReapStoreSubdirs()/DaemonTreeSubdirs():
+// a test that reads its expectations out of the code under test cannot fail when
+// a name is dropped from that code, which is the single regression this gate
+// exists to catch. The cross-package half — that each literal still equals the
+// const its owning package (pkg/image, pkg/guestartifacts) exports, and that no
+// exported *Subdir is missing from the deny lists — is asserted in pkg/runtime,
+// the one package that imports all three (TestEveryDaemonPrivateSubdirIsDenied).
 //
 // The work-dir is a t.TempDir(), so a hard-coded /var/lib/k3sm literal cannot
 // pass, and the positive control keeps the table honest: a legitimate PV path
@@ -348,7 +413,24 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 	workDir := t.TempDir()
 	dataVol := filepath.Join(workDir, "pods", "p1", "rootfs")
 	posture := Posture{WorkDir: workDir}
-	subdirs := []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir, ProfileSubdir}
+	subdirs := []string{
+		// The control-plane and daemon trees.
+		"server", "agent", "run", "blobs", "sbpl",
+		// The reap stores. A record here is a root-privileged kill (and, for
+		// vmreap, a root RemoveAll of the run dir it names), so they are denied
+		// on the same terms as everything else and additionally pinned by
+		// TestGeneratePodReapStoreDenied / TestGenerateVMReapStoreDenied.
+		"podreap", "vmreap",
+		// The image store's siblings of blobs/. index and operator decide what a
+		// reference resolves to and what the GC reclaims; unpacked and snapshots
+		// hold the trees a pod rootfs is cloned from, verified at commit and
+		// never re-verified at clone; ingest is where an archive is read before
+		// its blobs are verified at all.
+		"index", "operator", "unpacked", "snapshots", "ingest",
+		// The pinned kernel + initramfs every vm pod boots. Corrupting the set
+		// fails the node's vm capability closed until an operator clears it.
+		"guest-artifacts",
+	}
 
 	// (0) The mesh private key's absolute home is denied even though this posture's
 	// work-dir is elsewhere. Everything else in the deny-set moves with the
@@ -395,13 +477,21 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 			}
 			// The same verdict at the validation seam Generate calls, so a future
 			// refactor that stops routing through it still fails here.
-			_, _, protected, err := resolvePosture(posture)
-			if err != nil {
-				t.Fatalf("resolvePosture: %v", err)
-			}
-			if err := validateExtraPaths(dataVol, protected, []string{root}); !errors.Is(err, ErrProtectedPath) {
-				t.Fatalf("validateExtraPaths(%q) = %v, want ErrProtectedPath", root, err)
-			}
+			//
+			// A subtest with t.Errorf rather than a bare t.Fatalf in the loop:
+			// the table's job is to name EVERY tree that lost its protection, and
+			// a fatal here would stop at the first one and leave the rest
+			// unreported — which is exactly how a partial regression gets read as
+			// a single-tree regression.
+			t.Run(sub+"/validate-seam", func(t *testing.T) {
+				_, _, protected, err := resolvePosture(posture)
+				if err != nil {
+					t.Fatalf("resolvePosture: %v", err)
+				}
+				if err := validateExtraPaths(dataVol, protected, []string{root}); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("validateExtraPaths(%q) = %v, want ErrProtectedPath", root, err)
+				}
+			})
 		}
 	})
 
@@ -420,15 +510,17 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		if iAllow < 0 {
 			t.Fatalf("expected the ancestor work-dir write allow in the profile:\n%s", out)
 		}
+		if !strings.Contains(out, "(deny file-read* file-write*\n") {
+			t.Fatalf("protected deny stanza missing:\n%s", out)
+		}
 		for _, sub := range subdirs {
 			root := filepath.Join(workDir, sub)
-			iDeny := strings.Index(out, "(deny file-read* file-write*\n")
-			if iDeny < 0 {
-				t.Fatalf("protected deny stanza missing:\n%s", out)
-			}
 			iRoot := strings.Index(out, "(subpath \""+root+"\")")
 			if iRoot < 0 {
-				t.Fatalf("%s tree %q is not denied:\n%s", sub, root, out)
+				// Errorf, not Fatalf, for the reason stated in the rejection
+				// subtest: every undefended tree must be named in one run.
+				t.Errorf("%s tree %q is not denied", sub, root)
+				continue
 			}
 			if iRoot <= iAllow {
 				t.Errorf("%s deny (%d) must come AFTER the ancestor work-dir allow (%d) to win (last-match-wins)", sub, iRoot, iAllow)

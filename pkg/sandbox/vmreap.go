@@ -67,7 +67,18 @@ import (
 // sibling of PodReapSubdir under the runtime work-dir. It is an exported const
 // for the same reason PodReapSubdir is: the SBPL generator's protected-prefix
 // deny-set must name the same directory the store actually uses, and a drift
-// would deny a non-existent sibling while the real store stayed writable.
+// would deny a non-existent sibling while the real store stayed writable. Both
+// stores are named by ReapStoreSubdirs, which resolvePosture iterates, so the
+// deny cannot exist for one and not the other.
+//
+// Be concrete about the harm a writable store does, because it is not the kill
+// alone: a record the sweep resolves to `drop` also RemoveAlls the RunDir the
+// record CARRIES, as root, and that path is stored verbatim with no identity
+// proof of its own (clearOrphanRunDir bounds it to <stateRoot>/run and nothing
+// further). So a forged record is a root recursive delete inside the daemon's
+// own socket tree, on top of the root SIGKILL at a process group of the
+// forger's choosing. Denying the write is the boundary; hardening the drop path
+// against a record that should never have existed is a separate change.
 const VMReapSubdir = "vmreap"
 
 // vmProcRecord is the durable record of one spawned vm host helper, written
@@ -102,6 +113,18 @@ type vmProcRecord struct {
 	// Deleting exactly what was read cannot drift.
 	path string
 }
+
+// StateRoot returns the runtime work-dir this backend records its orphan store
+// under (WithStateRoot), or "" when the store is disabled.
+//
+// It exists for one caller: the cross-package wiring pin in pkg/runtime, which
+// asserts that the root the daemon hands this backend is the SAME path it hands
+// the SBPL generator as Posture.WorkDir. Those two are wired in different
+// statements of runtime.New, and if they ever diverged the emitted deny would
+// protect a vmreap store at a directory the backend does not use — the exact
+// drift the exported subdir consts exist to prevent, one level up. Reading the
+// field is the only way to observe it from another package.
+func (b *VMBackend) StateRoot() string { return b.stateRoot }
 
 // vmReapRoot is the orphan store's directory. An empty StateRoot disables the
 // store entirely (returning ""), which is the posture for a backend constructed
