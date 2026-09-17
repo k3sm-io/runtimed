@@ -19,13 +19,16 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"k3sm.io/runtimed/pkg/guestinit"
+	"k3sm.io/runtimed/pkg/pathsafe"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 )
@@ -234,20 +237,65 @@ func marshalVMHostSpec(hs *guestv1.VMHostSpec) ([]byte, error) {
 // The write is atomic (temp + rename) for the ordinary reason: the helper reads
 // this file as its first act, and a half-written spec would be a parse error
 // blamed on the contract instead of on the crash that truncated it.
+//
+// BOTH NAMES IT USES ARE FIXED, and that is what makes them worth guarding: an
+// attacker needs no guess to pre-plant a link at <podDir>/k3sm.spec, at
+// vmhost.spec.json, or at the derived vmhost.spec.json.tmp. MkdirAll would
+// follow the first and hand VZ somebody else's directory as the share the guest
+// reads its whole contract from; os.WriteFile would follow the third and deliver
+// the spec — a map of this pod's credential mounts — into a file of the
+// attacker's choosing.
+//
+// The two halves are guarded differently because the exposures differ. The share
+// dir gets the walk. The temp file gets O_EXCL|O_NOFOLLOW, which cannot follow a
+// link by construction, over an Lstat that refuses a pre-planted symlink by name
+// and clears only a stale regular file (anything else is left for the O_EXCL to
+// fail on). The FINAL name needs neither: rename(2) acts on the name, so a
+// symlink sitting at vmhost.spec.json is REPLACED rather than followed.
 func writeVMHostSpec(podDir string, hs *guestv1.VMHostSpec) (string, error) {
 	data, err := marshalVMHostSpec(hs)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Join(podDir, guestinit.SpecShareTag), 0o700); err != nil {
+	specRoot := filepath.Join(podDir, guestinit.SpecShareTag)
+	if err := pathsafe.RefuseSymlinkedPath(podDir, specRoot); err != nil {
+		return "", fmt.Errorf("refusing the %s share root for pod %s: %w", guestinit.SpecShareTag, hs.GetPodId(), err)
+	}
+	if err := os.MkdirAll(specRoot, 0o700); err != nil {
 		return "", fmt.Errorf("create the %s share root for pod %s: %w", guestinit.SpecShareTag, hs.GetPodId(), err)
 	}
 	final := filepath.Join(podDir, VMSpecFileName)
 	tmp := final + ".tmp"
+	if fi, lerr := os.Lstat(tmp); lerr == nil {
+		switch {
+		case fi.Mode()&fs.ModeSymlink != 0:
+			return "", fmt.Errorf("refusing to write the vm host spec for pod %s: %w: %s is a symlink",
+				hs.GetPodId(), pathsafe.ErrSymlinkedPath, tmp)
+		case fi.Mode().IsRegular():
+			// A leftover from a crashed boot. Removing it is what keeps the
+			// O_EXCL below from turning an ordinary retry into a stuck pod.
+			if rerr := os.Remove(tmp); rerr != nil {
+				return "", fmt.Errorf("clear a stale vm host spec temp file for pod %s: %w", hs.GetPodId(), rerr)
+			}
+		}
+		// Anything else — a directory, a socket, a device — is deliberately left
+		// in place for the O_EXCL open to fail on: this function has no business
+		// deleting a node type it did not create.
+	} else if !errors.Is(lerr, fs.ErrNotExist) {
+		return "", fmt.Errorf("inspect the vm host spec temp file for pod %s: %w", hs.GetPodId(), lerr)
+	}
 	// 0600: the spec names every share root the guest is given, which is a map of
 	// this pod's credential mounts even though it carries none of their contents.
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
 		return "", fmt.Errorf("write the vm host spec for pod %s: %w", hs.GetPodId(), err)
+	}
+	if _, werr := f.Write(data); werr != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("write the vm host spec for pod %s: %w", hs.GetPodId(), werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		return "", fmt.Errorf("write the vm host spec for pod %s: %w", hs.GetPodId(), cerr)
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		return "", fmt.Errorf("commit the vm host spec for pod %s: %w", hs.GetPodId(), err)
@@ -273,11 +321,22 @@ func writeVMHostSpec(podDir string, hs *guestv1.VMHostSpec) (string, error) {
 // was expected, turning "your PVC is not bound yet" into "your database is
 // empty". So an out-of-pod root that is missing stays the helper's legible
 // refusal, naming the tag and the path.
+//
+// The bound is a STRING comparison, so it is paired with a walk for the same
+// reason the vm run dir's is (pathsafe.RefuseSymlinkedPath): a share root is textually
+// inside the pod dir however its components resolve, and MkdirAll follows a
+// pre-planted symlink at any of them without a word. The daemon would then
+// create the tree, hand the path to VZ, and export somebody else's directory
+// into the guest as that pod's share. Refusing costs one Lstat per component and
+// fails the boot the way any share-root creation failure does.
 func ensurePodShareRoots(spec VMSpec) error {
 	for _, sh := range spec.Volumes.Shares {
 		root := filepath.Clean(sh.Root)
 		if root != spec.PodDir && !isAtOrUnderDir(root, spec.PodDir) {
 			continue
+		}
+		if err := pathsafe.RefuseSymlinkedPath(spec.PodDir, root); err != nil {
+			return fmt.Errorf("refusing the %s share root for pod %s: %w", sh.Tag, spec.PodID, err)
 		}
 		if err := os.MkdirAll(root, 0o750); err != nil {
 			return fmt.Errorf("create the %s share root for pod %s: %w", sh.Tag, spec.PodID, err)

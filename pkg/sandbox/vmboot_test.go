@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -33,6 +34,8 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"k3sm.io/runtimed/pkg/guestinit"
+	"k3sm.io/runtimed/pkg/pathsafe"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	guestv1 "k3sm.io/apis/guest/v1"
@@ -332,6 +335,172 @@ func TestCreateVMDoesNotFabricateOutOfPodShareRoots(t *testing.T) {
 	if _, err := os.Stat(claimRoot); !os.IsNotExist(err) {
 		t.Errorf("CreateVM created a claim root outside the pod dir (%s, stat err %v); an unbound claim must surface as the helper's refusal, not as an empty volume", claimRoot, err)
 	}
+}
+
+// TestEnsurePodShareRootsRefusesASymlinkedRoot pins the walk's wiring at the
+// share-root creator, and the two neighbouring behaviours it must not disturb.
+//
+// A share root's name is derived, not guessed at: k3sm.proj / k3sm.vols sit
+// beside the rootfs at a path any same-euid process can name in advance. MkdirAll
+// follows a link planted at one without a word, and the daemon would then hand VZ
+// that link's target as the pod's share — exporting somebody else's directory into
+// the guest under a tag the pod believes is its own.
+func TestEnsurePodShareRootsRefusesASymlinkedRoot(t *testing.T) {
+	root := t.TempDir()
+	podDir := filepath.Join(root, "pods", "p1")
+	mkdirAll(t, podDir)
+	attacker := filepath.Join(root, "attacker")
+	mkdirAll(t, attacker)
+	symlink(t, attacker, filepath.Join(podDir, "k3sm.vols"))
+
+	spec := VMSpec{PodID: "p1", PodDir: podDir, Volumes: VMVolumePlan{Shares: []VMShare{
+		{Tag: "k3sm.vols", Root: filepath.Join(podDir, "k3sm.vols"), Writable: true},
+	}}}
+	if err := ensurePodShareRoots(spec); !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+		t.Fatalf("ensurePodShareRoots err = %v, want pathsafe.ErrSymlinkedPath", err)
+	}
+	if entries, rerr := os.ReadDir(attacker); rerr != nil || len(entries) != 0 {
+		t.Errorf("the link target was written through (%d entries, read err %v)", len(entries), rerr)
+	}
+
+	t.Run("a real root under the pod dir is still created", func(t *testing.T) {
+		// Non-vacuity: the walk must not have turned the ordinary case into a
+		// permanent refusal, since a missing share root is a boot failure.
+		real := filepath.Join(podDir, "k3sm.proj")
+		spec := VMSpec{PodID: "p1", PodDir: podDir, Volumes: VMVolumePlan{Shares: []VMShare{{Tag: "k3sm.proj", Root: real}}}}
+		if err := ensurePodShareRoots(spec); err != nil {
+			t.Fatalf("ensurePodShareRoots: %v", err)
+		}
+		if fi, err := os.Stat(real); err != nil || !fi.IsDir() {
+			t.Errorf("the share root was not created (stat err %v)", err)
+		}
+	})
+
+	t.Run("a claim root outside the pod dir is still skipped, not refused", func(t *testing.T) {
+		// The out-of-pod root belongs to the persistent-volume binder. It must
+		// neither be created here nor turned into a refusal by the new walk —
+		// an unbound claim has to stay the helper's legible error.
+		claim := filepath.Join(root, "storage", "default", "pgdata")
+		spec := VMSpec{PodID: "p1", PodDir: podDir, Volumes: VMVolumePlan{Shares: []VMShare{
+			{Tag: "k3sm.pvc.default.pgdata", Root: claim, Writable: true},
+		}}}
+		if err := ensurePodShareRoots(spec); err != nil {
+			t.Fatalf("an out-of-pod claim root became an error: %v", err)
+		}
+		if _, err := os.Stat(claim); !os.IsNotExist(err) {
+			t.Errorf("the claim root was created here (stat err %v); the binder owns it", err)
+		}
+	})
+}
+
+// TestWriteVMHostSpecRefusesASymlinkedSpecDir is the same gate on the one share
+// root whose name is FIXED for every pod on the node: <podDir>/k3sm.spec, the
+// share the guest reads its entire boot contract out of.
+func TestWriteVMHostSpecRefusesASymlinkedSpecDir(t *testing.T) {
+	root := t.TempDir()
+	podDir := filepath.Join(root, "pods", "p1")
+	mkdirAll(t, podDir)
+	attacker := filepath.Join(root, "attacker")
+	mkdirAll(t, attacker)
+	symlink(t, attacker, filepath.Join(podDir, guestinit.SpecShareTag))
+
+	path, err := writeVMHostSpec(podDir, &guestv1.VMHostSpec{PodId: "p1", Vcpus: 2, MemoryBytes: 1 << 30})
+	if !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+		t.Fatalf("writeVMHostSpec err = %v (path %q), want pathsafe.ErrSymlinkedPath", err, path)
+	}
+	if entries, rerr := os.ReadDir(attacker); rerr != nil || len(entries) != 0 {
+		t.Errorf("the link target was written through (%d entries, read err %v)", len(entries), rerr)
+	}
+	if _, serr := os.Stat(filepath.Join(podDir, VMSpecFileName)); !os.IsNotExist(serr) {
+		t.Errorf("the spec was written despite the refusal (stat err %v)", serr)
+	}
+}
+
+// TestWriteVMHostSpecRefusesASymlinkedTempFile guards the PAYLOAD, not the
+// scaffolding: the spec itself, which names every share root the guest is given
+// and is therefore a map of this pod's credential mounts.
+//
+// Both names are derived, so both are known in advance. vmhost.spec.json.tmp is
+// the dangerous one — os.WriteFile would follow a link planted there and deliver
+// the spec into the target — so it is opened O_EXCL|O_NOFOLLOW, which cannot
+// follow a link at all. vmhost.spec.json is not, and the second row says why:
+// rename(2) acts on the NAME, so a link sitting at the final path is replaced
+// rather than written through, and the boot goes on correctly.
+func TestWriteVMHostSpecRefusesASymlinkedTempFile(t *testing.T) {
+	spec := func() *guestv1.VMHostSpec {
+		return &guestv1.VMHostSpec{PodId: "p1", Vcpus: 2, MemoryBytes: 1 << 30}
+	}
+
+	t.Run("a link at the temp name is refused and its target is untouched", func(t *testing.T) {
+		root := t.TempDir()
+		podDir := filepath.Join(root, "pods", "p1")
+		mkdirAll(t, podDir)
+		victim := filepath.Join(root, "keep-me")
+		writeFile(t, victim, "untouched")
+		symlink(t, victim, filepath.Join(podDir, VMSpecFileName+".tmp"))
+
+		if _, err := writeVMHostSpec(podDir, spec()); !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+			t.Fatalf("writeVMHostSpec err = %v, want pathsafe.ErrSymlinkedPath", err)
+		}
+		data, rerr := os.ReadFile(victim)
+		if rerr != nil {
+			t.Fatalf("read the link target: %v", rerr)
+		}
+		if string(data) != "untouched" {
+			t.Errorf("the link target holds %q; the pod's spec was written through the link", data)
+		}
+		if _, serr := os.Stat(filepath.Join(podDir, VMSpecFileName)); !os.IsNotExist(serr) {
+			t.Errorf("the spec was committed despite the refusal (stat err %v)", serr)
+		}
+	})
+
+	t.Run("a link at the final name is REPLACED, not followed", func(t *testing.T) {
+		root := t.TempDir()
+		podDir := filepath.Join(root, "pods", "p1")
+		mkdirAll(t, podDir)
+		victim := filepath.Join(root, "keep-me")
+		writeFile(t, victim, "untouched")
+		final := filepath.Join(podDir, VMSpecFileName)
+		symlink(t, victim, final)
+
+		got, err := writeVMHostSpec(podDir, spec())
+		if err != nil {
+			t.Fatalf("writeVMHostSpec: %v", err)
+		}
+		if got != final {
+			t.Errorf("returned %q, want %q", got, final)
+		}
+		fi, lerr := os.Lstat(final)
+		if lerr != nil {
+			t.Fatalf("lstat the committed spec: %v", lerr)
+		}
+		if !fi.Mode().IsRegular() {
+			t.Errorf("the committed spec is %v, want a regular file: the rename must replace the link, not write through it", fi.Mode())
+		}
+		data, rerr := os.ReadFile(victim)
+		if rerr != nil {
+			t.Fatalf("read the link target: %v", rerr)
+		}
+		if string(data) != "untouched" {
+			t.Errorf("the link target holds %q; the commit followed the link", data)
+		}
+	})
+
+	t.Run("a stale temp file from a crashed boot does not wedge the next one", func(t *testing.T) {
+		// The cost of O_EXCL, paid here: a leftover regular temp file is cleared
+		// rather than turned into a pod that can never boot again.
+		root := t.TempDir()
+		podDir := filepath.Join(root, "pods", "p1")
+		mkdirAll(t, podDir)
+		writeFile(t, filepath.Join(podDir, VMSpecFileName+".tmp"), "half a spec")
+
+		if _, err := writeVMHostSpec(podDir, spec()); err != nil {
+			t.Fatalf("writeVMHostSpec over a stale temp file: %v", err)
+		}
+		if _, serr := os.Stat(filepath.Join(podDir, VMSpecFileName)); serr != nil {
+			t.Errorf("the spec was not committed: %v", serr)
+		}
+	})
 }
 
 // TestCreateVMFailsClosedWithoutArtifacts asserts a node with no pinned guest
@@ -692,7 +861,7 @@ func TestReapOrphanVMsKillsARecordedInstance(t *testing.T) {
 		// marker the sweep requires before any RemoveAll — exactly what
 		// spawnVMHost stamps before the record exists. (The unstamped case is
 		// TestVMReapDropNeverRemovesAnUnprovenRunDir's.)
-		if err := writeVMOwnerMarker(runDir(rec.PodID), rec.PodID); err != nil {
+		if err := writeVMOwnerMarker(root, runDir(rec.PodID), rec.PodID); err != nil {
 			t.Fatalf("run dir: %v", err)
 		}
 		data, _ := json.Marshal(rec)
@@ -757,7 +926,7 @@ func TestClearOrphanRunDirIsBounded(t *testing.T) {
 	}
 
 	inside := filepath.Join(root, "run", "vm", "p")
-	if err := writeVMOwnerMarker(inside, "p"); err != nil {
+	if err := writeVMOwnerMarker(root, inside, "p"); err != nil {
 		t.Fatalf("inside: %v", err)
 	}
 	if retire := b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: inside}); !retire {
@@ -769,7 +938,7 @@ func TestClearOrphanRunDirIsBounded(t *testing.T) {
 
 	t.Run("a sibling whose name merely starts the same is not admitted", func(t *testing.T) {
 		sibling := filepath.Join(root, "run-evil")
-		if err := writeVMOwnerMarker(sibling, "p"); err != nil {
+		if err := writeVMOwnerMarker(root, sibling, "p"); err != nil {
 			t.Fatalf("sibling: %v", err)
 		}
 		// Marked AND same-prefix: the containment gate runs first, so the
@@ -785,6 +954,194 @@ func TestClearOrphanRunDirIsBounded(t *testing.T) {
 	t.Run("a run dir that is already gone retires its record", func(t *testing.T) {
 		if retire := b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: filepath.Join(root, "run", "vm", "vanished")}); !retire {
 			t.Error("a record whose run dir does not exist was kept; it would re-warn forever over nothing")
+		}
+	})
+}
+
+// TestClearOrphanRunDirRefusesASymlinkedRunDir is the PLACE gate on the same
+// root-privileged delete the provenance gate guards.
+//
+// Containment compares STRINGS: `<state-root>/run/vm/p1` is textually inside the
+// run tree whether `vm` and `p1` are directories or symlinks to somewhere else,
+// and os.Stat, the marker read and os.RemoveAll all follow them to the target.
+// So a pre-planted link — which only an unconfined process at this daemon's own
+// euid can create, the run tree being inside the SBPL deny set — could aim the
+// sweep's recursive delete at a tree of its choosing while every existing gate
+// still said yes, marker included: the link's target can carry a perfectly
+// genuine marker, and in rows 1 and 2 below it does.
+//
+// The fourth row is the marker itself: a `.k3sm-vm-owner` SYMLINK pointing at a
+// real marker's bytes would borrow another directory's proof, so the read is
+// O_NOFOLLOW and the borrowed proof reads as no proof at all.
+func TestClearOrphanRunDirRefusesASymlinkedRunDir(t *testing.T) {
+	// refused is the phrase the walk's own warning carries; unprovenPlace is the
+	// provenance warning row 4 lands on instead.
+	const refused = "symlinked or non-directory component"
+	sweep := func(t *testing.T, root string, rec vmProcRecord) (bool, string) {
+		t.Helper()
+		var log bytes.Buffer
+		b := NewVMBackend(WithStateRoot(root), WithLogger(slog.New(slog.NewTextHandler(&log, nil))))
+		return b.clearOrphanRunDir(rec), log.String()
+	}
+
+	t.Run("a symlinked run dir is not followed, however good its target's marker", func(t *testing.T) {
+		root := t.TempDir()
+		victim := filepath.Join(root, "outside", "victim")
+		if err := writeVMOwnerMarker(root, victim, "p"); err != nil {
+			t.Fatalf("victim marker: %v", err)
+		}
+		mkdirAll(t, filepath.Join(root, "run", "vm"))
+		leaf := filepath.Join(root, "run", "vm", "p")
+		symlink(t, victim, leaf)
+
+		retire, log := sweep(t, root, vmProcRecord{PodID: "p", RunDir: leaf})
+		if retire {
+			t.Error("a symlinked run dir reported retire-ok; its record would be dropped and the dir never mentioned again")
+		}
+		if _, err := os.Stat(filepath.Join(victim, vmOwnerMarkerName)); err != nil {
+			t.Errorf("the symlink's target was deleted through the link: %v", err)
+		}
+		if fi, err := os.Lstat(leaf); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			t.Errorf("the planted link is gone (lstat err %v); nothing should have been removed", err)
+		}
+		if n := strings.Count(log, refused); n != 1 {
+			t.Errorf("%d refusal warnings, want exactly 1; log: %s", n, log)
+		}
+		if !strings.Contains(log, leaf) {
+			t.Errorf("the warning does not name the offending component %s; log: %s", leaf, log)
+		}
+	})
+
+	t.Run("a symlinked ANCESTOR is not followed either", func(t *testing.T) {
+		root := t.TempDir()
+		elsewhere := filepath.Join(root, "elsewhere")
+		target := filepath.Join(elsewhere, "p")
+		if err := writeVMOwnerMarker(root, target, "p"); err != nil {
+			t.Fatalf("target marker: %v", err)
+		}
+		mkdirAll(t, filepath.Join(root, "run"))
+		symlink(t, elsewhere, filepath.Join(root, "run", "vm"))
+
+		// Textually contained, reachable only through the link: the record names
+		// a path whose every gate but the walk says yes.
+		retire, log := sweep(t, root, vmProcRecord{PodID: "p", RunDir: filepath.Join(root, "run", "vm", "p")})
+		if retire {
+			t.Error("a run dir reached through a symlinked ancestor reported retire-ok")
+		}
+		if _, err := os.Stat(filepath.Join(target, vmOwnerMarkerName)); err != nil {
+			t.Errorf("the tree behind the symlinked ancestor was deleted: %v", err)
+		}
+		if n := strings.Count(log, refused); n != 1 {
+			t.Errorf("%d refusal warnings, want exactly 1; log: %s", n, log)
+		}
+	})
+
+	t.Run("a real, marked run dir is still cleared and retired", func(t *testing.T) {
+		// The non-vacuity row: the walk must not have turned the ordinary case
+		// into a permanent refusal.
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "p")
+		if err := writeVMOwnerMarker(root, dir, "p"); err != nil {
+			t.Fatalf("marker: %v", err)
+		}
+		retire, log := sweep(t, root, vmProcRecord{PodID: "p", RunDir: dir})
+		if !retire {
+			t.Errorf("a real, marked run dir did not report retire-ok; log: %s", log)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("a proven run dir survived the sweep (stat err %v)", err)
+		}
+		if strings.Contains(log, refused) {
+			t.Errorf("a plain directory tree was refused as symlinked: %s", log)
+		}
+	})
+
+	t.Run("a symlinked marker cannot borrow another file's proof", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "p")
+		mkdirAll(t, dir)
+		elsewhere := filepath.Join(root, "elsewhere")
+		mkdirAll(t, elsewhere)
+		borrowed := filepath.Join(elsewhere, "marker")
+		writeFile(t, borrowed, "p")
+		symlink(t, borrowed, filepath.Join(dir, vmOwnerMarkerName))
+
+		retire, log := sweep(t, root, vmProcRecord{PodID: "p", RunDir: dir})
+		if retire {
+			t.Error("a dir whose marker is a symlink to matching bytes reported retire-ok")
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the run dir was removed on a borrowed marker: %v", err)
+		}
+		if !strings.Contains(log, "unproven provenance") {
+			t.Errorf("a symlinked marker did not read as unproven provenance; log: %s", log)
+		}
+	})
+}
+
+// TestWriteVMOwnerMarkerRefusesSymlinks is the WRITE side of the same hole, and
+// the more dangerous half.
+//
+// os.MkdirAll only STATS each component and os.WriteFile follows a symlink at
+// the leaf, so a link pre-planted at the run dir, at an ancestor of it, or at
+// `.k3sm-vm-owner` itself would have this daemon write a GENUINE marker — real
+// pod id, real provenance — into a directory somebody else chose. A later sweep
+// would then honestly prove ownership of that directory and RemoveAll it as
+// root. The refusal has to happen here, at the stamp, because by the time the
+// sweep reads the marker there is nothing left to disbelieve.
+func TestWriteVMOwnerMarkerRefusesSymlinks(t *testing.T) {
+	t.Run("a pre-planted leaf symlink is refused and nothing is written at its target", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "elsewhere", "target")
+		mkdirAll(t, target)
+		mkdirAll(t, filepath.Join(root, "run", "vm"))
+		leaf := filepath.Join(root, "run", "vm", "p1")
+		symlink(t, target, leaf)
+
+		err := writeVMOwnerMarker(root, leaf, "p1")
+		if !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+			t.Fatalf("writeVMOwnerMarker err = %v, want pathsafe.ErrSymlinkedPath", err)
+		}
+		if _, serr := os.Stat(filepath.Join(target, vmOwnerMarkerName)); !os.IsNotExist(serr) {
+			t.Errorf("a marker was stamped through the link into %s (stat err %v); the sweep would later prove that dir ours and delete it", target, serr)
+		}
+	})
+
+	t.Run("a pre-planted marker symlink is refused and its target is untouched", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "p1")
+		mkdirAll(t, dir)
+		elsewhere := filepath.Join(root, "elsewhere")
+		mkdirAll(t, elsewhere)
+		victim := filepath.Join(elsewhere, "keep-me")
+		writeFile(t, victim, "untouched")
+		symlink(t, victim, filepath.Join(dir, vmOwnerMarkerName))
+
+		if err := writeVMOwnerMarker(root, dir, "p1"); err == nil {
+			t.Fatal("stamped through a symlinked marker; the O_NOFOLLOW open must refuse it")
+		}
+		data, rerr := os.ReadFile(victim)
+		if rerr != nil {
+			t.Fatalf("read the link target: %v", rerr)
+		}
+		if string(data) != "untouched" {
+			t.Errorf("the link target was overwritten with %q; a stamp must never write outside the run dir", data)
+		}
+	})
+
+	t.Run("a pre-planted ancestor symlink is refused", func(t *testing.T) {
+		root := t.TempDir()
+		elsewhere := filepath.Join(root, "elsewhere")
+		mkdirAll(t, elsewhere)
+		mkdirAll(t, filepath.Join(root, "run"))
+		symlink(t, elsewhere, filepath.Join(root, "run", "vm"))
+
+		err := writeVMOwnerMarker(root, filepath.Join(root, "run", "vm", "p1"), "p1")
+		if !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+			t.Fatalf("writeVMOwnerMarker err = %v, want pathsafe.ErrSymlinkedPath", err)
+		}
+		if _, serr := os.Stat(filepath.Join(elsewhere, "p1")); !os.IsNotExist(serr) {
+			t.Errorf("the stamp created a run dir behind the symlinked ancestor (stat err %v)", serr)
 		}
 	})
 }
@@ -856,7 +1213,7 @@ func TestVMReapDropNeverRemovesAnUnprovenRunDir(t *testing.T) {
 	t.Run("a marker naming a different pod proves nothing", func(t *testing.T) {
 		root := t.TempDir()
 		dir := filepath.Join(root, "run", "vm", "victim")
-		if err := writeVMOwnerMarker(dir, "victim"); err != nil {
+		if err := writeVMOwnerMarker(root, dir, "victim"); err != nil {
 			t.Fatalf("marker: %v", err)
 		}
 		recPath := writeRecord(t, root, "attacker", dir)
@@ -876,7 +1233,7 @@ func TestVMReapDropNeverRemovesAnUnprovenRunDir(t *testing.T) {
 	t.Run("a matching marker clears the dir and retires the record", func(t *testing.T) {
 		root := t.TempDir()
 		dir := filepath.Join(root, "run", "vm", "ours")
-		if err := writeVMOwnerMarker(dir, "ours"); err != nil {
+		if err := writeVMOwnerMarker(root, dir, "ours"); err != nil {
 			t.Fatalf("marker: %v", err)
 		}
 		recPath := writeRecord(t, root, "ours", dir)
@@ -960,7 +1317,7 @@ func TestVMReapDropNeverRemovesAnUnprovenRunDir(t *testing.T) {
 func TestWriteVMOwnerMarker(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "run", "vm", "p1")
-	if err := writeVMOwnerMarker(dir, "p1"); err != nil {
+	if err := writeVMOwnerMarker(root, dir, "p1"); err != nil {
 		t.Fatalf("writeVMOwnerMarker: %v", err)
 	}
 	marker := filepath.Join(dir, vmOwnerMarkerName)
@@ -985,7 +1342,7 @@ func TestWriteVMOwnerMarker(t *testing.T) {
 		t.Error("a dir stamped for p1 proved ownership for p2")
 	}
 
-	if err := writeVMOwnerMarker(dir, "p1"); err != nil {
+	if err := writeVMOwnerMarker(root, dir, "p1"); err != nil {
 		t.Fatalf("re-stamp: %v", err)
 	}
 	data, err = os.ReadFile(marker)
@@ -1012,14 +1369,39 @@ func TestWriteVMOwnerMarker(t *testing.T) {
 	})
 
 	t.Run("an empty pod id and a relative dir are refused", func(t *testing.T) {
-		if err := writeVMOwnerMarker(filepath.Join(root, "run", "vm", "p2"), ""); err == nil {
+		if err := writeVMOwnerMarker(root, filepath.Join(root, "run", "vm", "p2"), ""); err == nil {
 			t.Error("stamped a dir with an empty pod id, which proves nothing to any later sweep")
 		}
-		if err := writeVMOwnerMarker("relative/run", "p2"); err == nil {
+		if err := writeVMOwnerMarker(root, "relative/run", "p2"); err == nil {
 			t.Error("stamped a relative path; it would resolve against the daemon's cwd")
 		}
 		if vmRunDirIsOwnedBy(t.TempDir(), "") {
 			t.Error("an empty pod id matched a dir with no marker at all")
 		}
 	})
+}
+
+// mkdirAll, symlink and writeFile are the layout helpers the path-refusal tests
+// in this file build their fixtures with. They live here rather than travelling
+// with the primitive's own test (pkg/pathsafe) because a test helper is not part
+// of the contract either package exports.
+func mkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink %s -> %s: %v", link, target, err)
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }

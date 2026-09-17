@@ -851,7 +851,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// the vols share. The guest binds these host directories, so they must exist
 	// and be populated BEFORE CreateVM boots it. PVC shares are skipped (the
 	// binder owns their dirs), and a bind's subPath is applied guest-side.
-	if err := mount.MaterializeShares(ctx, box, plan, podIP, r.resolver); err != nil {
+	if err := mount.MaterializeShares(ctx, box, podDir, plan, podIP, r.resolver); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err)
 	}

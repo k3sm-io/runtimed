@@ -24,6 +24,8 @@ import (
 	"testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 // saTokenVolume is the projected volume every pod gets by default when its
@@ -178,7 +180,7 @@ func TestMaterializeShares(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ComputeSharePlan: %v", err)
 			}
-			if err := MaterializeShares(context.Background(), box, plan, tc.podIP, res); err != nil {
+			if err := MaterializeShares(context.Background(), box, podDir, plan, tc.podIP, res); err != nil {
 				t.Fatalf("MaterializeShares: %v", err)
 			}
 
@@ -237,7 +239,7 @@ func TestMaterializeSharesSkipsPVCShares(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeSharePlan: %v", err)
 	}
-	if err := MaterializeShares(context.Background(), box, plan, "", nil); err != nil {
+	if err := MaterializeShares(context.Background(), box, podDir, plan, "", nil); err != nil {
 		t.Fatalf("MaterializeShares: %v", err)
 	}
 	pvcRoot, err := class.DataDir("default", "pvc-1")
@@ -264,10 +266,91 @@ func TestMaterializeSharesRejectsTraversingVolumeName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeSharePlan: %v", err)
 	}
-	if err := MaterializeShares(context.Background(), box, plan, "", nil); err == nil {
+	if err := MaterializeShares(context.Background(), box, podDir, plan, "", nil); err == nil {
 		t.Fatal("a traversing volume name must be rejected")
 	}
 	if _, err := os.Stat(filepath.Join(workRoot, "pods", "escape")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the traversing name must not have been materialized")
+	}
+}
+
+// TestMaterializeSharesRefusesASymlinkedRoot is the PLACE gate on the earliest
+// vm-path site that writes a pod's credentials to disk.
+//
+// This function runs before CreateVM, so it — not the sandbox package — is what
+// creates the pooled share roots and fills the proj root with Secret, ConfigMap
+// and ServiceAccount-token bytes. The roots' names are FIXED (k3sm.proj beside
+// the pod's rootfs), so nothing has to be guessed to pre-plant a link at one:
+// MkdirAll would follow it, the chmod would make the target look correctly
+// private, and the pod's credentials would be rendered into a directory
+// somebody else chose. A refusal fails the create and the pod never boots.
+func TestMaterializeSharesRefusesASymlinkedRoot(t *testing.T) {
+	res := fakeResolver{secrets: map[string]map[string][]byte{"registry": {"dockerconfigjson": []byte("{}")}}}
+	workRoot := t.TempDir()
+	podDir := filepath.Join(workRoot, "pods", "pod-1")
+	if err := os.MkdirAll(podDir, 0o750); err != nil {
+		t.Fatalf("pod dir: %v", err)
+	}
+	attacker := filepath.Join(workRoot, "attacker")
+	if err := os.MkdirAll(attacker, 0o700); err != nil {
+		t.Fatalf("attacker dir: %v", err)
+	}
+	if err := os.Symlink(attacker, filepath.Join(podDir, ShareTagProj)); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	box := shareBox(
+		[]*runtimev1.Volume{{Name: "reg", Secret: &runtimev1.SecretVolumeSource{SecretName: "registry"}}},
+		map[string][]*runtimev1.VolumeMount{"main": {{Name: "reg", MountPath: "/etc/reg"}}},
+		"main",
+	)
+	plan, err := ComputeSharePlan(box, podDir, workRoot, planClass(workRoot))
+	if err != nil {
+		t.Fatalf("ComputeSharePlan: %v", err)
+	}
+	if err := MaterializeShares(context.Background(), box, podDir, plan, "", res); !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+		t.Fatalf("MaterializeShares err = %v, want pathsafe.ErrSymlinkedPath", err)
+	}
+	entries, rerr := os.ReadDir(attacker)
+	if rerr != nil {
+		t.Fatalf("read the link target: %v", rerr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("%d entries were written through the link into %s; the pod's secret bytes must never land outside the pod dir", len(entries), attacker)
+	}
+}
+
+// TestMaterializeSharesRefusesASymlinkedVolumeDir is the same gate one level
+// down: the share root is real, the per-volume directory inside it is the link.
+// It matters separately because that is the directory a Secret's own files are
+// written into.
+func TestMaterializeSharesRefusesASymlinkedVolumeDir(t *testing.T) {
+	res := fakeResolver{secrets: map[string]map[string][]byte{"registry": {"dockerconfigjson": []byte("{}")}}}
+	workRoot := t.TempDir()
+	podDir := filepath.Join(workRoot, "pods", "pod-1")
+	projRoot := filepath.Join(podDir, ShareTagProj)
+	if err := os.MkdirAll(projRoot, 0o700); err != nil {
+		t.Fatalf("proj root: %v", err)
+	}
+	attacker := filepath.Join(workRoot, "attacker")
+	if err := os.MkdirAll(attacker, 0o700); err != nil {
+		t.Fatalf("attacker dir: %v", err)
+	}
+	if err := os.Symlink(attacker, filepath.Join(projRoot, "reg")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	box := shareBox(
+		[]*runtimev1.Volume{{Name: "reg", Secret: &runtimev1.SecretVolumeSource{SecretName: "registry"}}},
+		map[string][]*runtimev1.VolumeMount{"main": {{Name: "reg", MountPath: "/etc/reg"}}},
+		"main",
+	)
+	plan, err := ComputeSharePlan(box, podDir, workRoot, planClass(workRoot))
+	if err != nil {
+		t.Fatalf("ComputeSharePlan: %v", err)
+	}
+	if err := MaterializeShares(context.Background(), box, podDir, plan, "", res); !errors.Is(err, pathsafe.ErrSymlinkedPath) {
+		t.Fatalf("MaterializeShares err = %v, want pathsafe.ErrSymlinkedPath", err)
+	}
+	if _, serr := os.Stat(filepath.Join(attacker, "dockerconfigjson")); !errors.Is(serr, os.ErrNotExist) {
+		t.Errorf("the secret was rendered through the link (stat err %v)", serr)
 	}
 }
