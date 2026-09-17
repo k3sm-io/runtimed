@@ -17,6 +17,7 @@ limitations under the License.
 package sandbox
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,12 +74,16 @@ import (
 //
 // Be concrete about the harm a writable store does, because it is not the kill
 // alone: a record the sweep resolves to `drop` also RemoveAlls the RunDir the
-// record CARRIES, as root, and that path is stored verbatim with no identity
-// proof of its own (clearOrphanRunDir bounds it to <stateRoot>/run and nothing
-// further). So a forged record is a root recursive delete inside the daemon's
-// own socket tree, on top of the root SIGKILL at a process group of the
-// forger's choosing. Denying the write is the boundary; hardening the drop path
-// against a record that should never have existed is a separate change.
+// record CARRIES, as root, and that path is stored verbatim. So a forged record
+// would be a root recursive delete inside the daemon's own socket tree, on top
+// of the root SIGKILL at a process group of the forger's choosing.
+//
+// Denying the write is the boundary. The delete is hardened SEPARATELY, and
+// does not rely on it: containment to <stateRoot>/run is only defence in depth,
+// so the directory must additionally carry a daemon-written owner marker naming
+// the record's own pod id before anything is removed (see clearOrphanRunDir and
+// vmOwnerMarkerName). A forged record can NAME a run dir; it cannot make that
+// dir prove it is ours.
 const VMReapSubdir = "vmreap"
 
 // vmProcRecord is the durable record of one spawned vm host helper, written
@@ -316,6 +321,12 @@ func vmLeaderMember(members []supervisor.ProcMember, pgid int) (supervisor.ProcM
 // It degrades like podreap: an unreadable store alerts and skips rather than
 // failing the daemon, because reaping is not a scheduling precondition and a
 // crash-looping node is far worse than a leaked helper. It always returns nil.
+//
+// A record is retired only once its run dir has been cleared or proven absent.
+// A dir the sweep cannot prove is ours is left in place WITH its record (see
+// clearOrphanRunDir), which costs a repeated warning and keeps the leak visible;
+// a killed helper whose dir is unproven is still killed, and only its record
+// survives.
 func (b *VMBackend) ReapOrphanVMs() error {
 	records, quarantine, err := b.listVMProcRecords()
 	if err != nil {
@@ -344,16 +355,21 @@ func (b *VMBackend) ReapOrphanVMs() error {
 				"pod", rec.PodID, "pgid", rec.Pgid, "err", serr)
 			continue
 		}
-		b.retireVMProcRecord(rec)
-		b.clearOrphanRunDir(rec)
+		// Clear FIRST and retire only on the clear's verdict: the record is the
+		// only pointer to the run dir, so one retired beside a dir the sweep
+		// refused to delete would leak that dir with nothing left to name it.
+		if b.clearOrphanRunDir(rec) {
+			b.retireVMProcRecord(rec)
+		}
 	}
 	for _, rec := range keepWarn {
 		b.logger().Warn("orphaned vm host helper leaked: its leader is gone but the group is alive via a descendant (kept, not killed; re-warns each start)",
 			"pod", rec.PodID, "pgid", rec.Pgid)
 	}
 	for _, rec := range drop {
-		b.retireVMProcRecord(rec)
-		b.clearOrphanRunDir(rec)
+		if b.clearOrphanRunDir(rec) {
+			b.retireVMProcRecord(rec)
+		}
 	}
 	for _, f := range quarantine {
 		b.logger().Warn("removing a malformed vm reap record", "path", f)
@@ -373,25 +389,121 @@ func (b *VMBackend) groupIsRecordedVMInstance(rec vmProcRecord) bool {
 	return found && leader.StartUnixNano == rec.StartUnixNano
 }
 
-// clearOrphanRunDir removes a retired record's private run dir.
+// vmOwnerMarkerName is the provenance marker this daemon writes inside a vm
+// pod's private run dir at spawn, holding exactly the pod id the record for that
+// helper will carry.
 //
-// It is bounded to the store's own state root rather than trusted from the
-// record: the file is written by this daemon under a 0700 root, but it drives a
-// recursive delete, and a containment check costs one comparison. A record naming
-// anything outside <state-root>/run is ignored — the leak is preferable to the
-// delete.
-func (b *VMBackend) clearOrphanRunDir(rec vmProcRecord) {
+// It exists because a record is DATA, and the classes that reach the delete —
+// pgid <= 1, a zero start time, an empty process group — are the cheapest
+// possible things for a forged record to satisfy. Containment says a path is in
+// the right tree; only the marker says this daemon put it there.
+const vmOwnerMarkerName = ".k3sm-vm-owner"
+
+// writeVMOwnerMarker creates runDir and stamps it as podID's.
+//
+// It runs at spawn, BEFORE the record is written, so the implication the sweep
+// depends on — a record exists ⇒ its run dir was stamped — holds at every
+// instant, including a daemon killed between the two writes (which leaves a
+// stamped dir and no record: a leak, never an unprovable delete).
+//
+// Pre-creating the directory does not get in the helper's way: the helper is
+// posix_spawned with no id-resetting attribute and no credential drop, so it
+// runs at exactly this daemon's euid/egid, and its own MkdirAll of the same path
+// is a no-op on a directory that already exists.
+//
+// runDir must be absolute — it is derived from an AgentSocketPath validateVMSpec
+// already proved absolute and clean, and a relative one would stamp a directory
+// resolved against whatever the daemon's cwd happens to be.
+func writeVMOwnerMarker(runDir, podID string) error {
+	if podID == "" {
+		return fmt.Errorf("refusing to stamp the vm run dir %q for an empty pod id", runDir)
+	}
+	if !filepath.IsAbs(runDir) {
+		return fmt.Errorf("refusing to stamp the vm run dir %q for pod %s: not an absolute path", runDir, podID)
+	}
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return fmt.Errorf("create the vm run dir %s for pod %s: %w", runDir, podID, err)
+	}
+	marker := filepath.Join(runDir, vmOwnerMarkerName)
+	if err := os.WriteFile(marker, []byte(podID), 0o600); err != nil {
+		return fmt.Errorf("stamp the vm run dir %s for pod %s: %w", runDir, podID, err)
+	}
+	return nil
+}
+
+// vmRunDirIsOwnedBy reports whether runDir carries a marker naming podID.
+//
+// A missing, unreadable or mismatched marker is not an error to report upward —
+// it IS the negative verdict, and the caller's whole response to it is to leave
+// the directory alone. An empty podID can prove nothing and is refused outright,
+// so a record with no pod id never gains a delete by matching an empty marker.
+func vmRunDirIsOwnedBy(runDir, podID string) bool {
+	if podID == "" {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(runDir, vmOwnerMarkerName))
+	if err != nil {
+		return false
+	}
+	// Exactly one trailing newline is tolerated, because re-stamping a dir by
+	// hand is an `echo` away and an operator should not lose a cluster's run
+	// tree to a byte they cannot see. Nothing else is trimmed: padding, a second
+	// line, or a different pod id does not match.
+	return string(bytes.TrimSuffix(data, []byte("\n"))) == podID
+}
+
+// clearOrphanRunDir removes a retired record's private run dir and reports
+// whether the record may now be retired.
+//
+// TWO gates, and the second is the one that matters. Containment bounds the
+// delete to <state-root>/run — defence in depth, and it only ever proves the
+// path is in the right tree. The directory must ALSO carry vmOwnerMarkerName
+// naming this record's own pod id. Without that, "in-tree" would be the entire
+// proof standing between a forged record and a root recursive delete at a path
+// of the forger's choosing inside the daemon's socket tree.
+//
+// The verdict is RETURNED rather than assumed because the record is the only
+// pointer to that directory. Retiring a record whose dir we refused to delete
+// would leak the dir SILENTLY — nothing would name it again. Keeping it makes
+// the next sweep re-warn, the keepWarn idiom vmReapDecision already uses for a
+// group it cannot prove is ours.
+//
+// What the marker PROVES: this daemon created this directory for this pod id. It
+// says nothing about the record that names it — whether a record could be forged
+// at all is the store's write boundary (see VMReapSubdir), not this function's
+// question.
+//
+// MIGRATION COST, plainly: run dirs created before this change carry no marker.
+// An orphan record pointing at one is kept, its directory is left in place, and
+// the warning repeats on every daemon start until an operator confirms the
+// helper is dead and removes the directory by hand. That is bounded — only
+// orphans predating this change can be in that state, because every run dir
+// created from here on is stamped before its record exists.
+func (b *VMBackend) clearOrphanRunDir(rec vmProcRecord) (retire bool) {
 	if rec.RunDir == "" || b.stateRoot == "" {
-		return
+		return true // nothing to clear, so nothing holds the record back
 	}
 	runRoot := filepath.Join(b.stateRoot, "run")
 	clean := filepath.Clean(rec.RunDir)
 	if clean != runRoot && !isAtOrUnderDir(clean, runRoot) {
-		b.logger().Warn("ignoring a vm reap record whose run dir is outside this node's run tree",
+		b.logger().Warn("vm reap record names a run dir outside this node's run tree: left in place, record kept (re-warns each start)",
 			"pod", rec.PodID, "dir", rec.RunDir, "run_root", runRoot)
-		return
+		return false
+	}
+	if _, err := os.Stat(clean); errors.Is(err, fs.ErrNotExist) {
+		return true // already gone: nothing to prove, nothing to delete
+	}
+	if !vmRunDirIsOwnedBy(clean, rec.PodID) {
+		b.logger().Warn("orphaned vm pod run dir has unproven provenance, left in place, record kept (re-warns each start)",
+			"pod", rec.PodID, "dir", clean, "marker", vmOwnerMarkerName)
+		return false
 	}
 	if err := os.RemoveAll(clean); err != nil {
-		b.logger().Warn("could not remove an orphaned vm pod's run dir", "pod", rec.PodID, "dir", clean, "err", err)
+		// Proven ours and still undeletable: keep the record so the next start
+		// retries rather than losing the only pointer to a dir we mean to clear.
+		b.logger().Warn("could not remove an orphaned vm pod's run dir (record kept for the next start)",
+			"pod", rec.PodID, "dir", clean, "err", err)
+		return false
 	}
+	return true
 }
