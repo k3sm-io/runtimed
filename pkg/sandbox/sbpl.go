@@ -322,10 +322,19 @@ type GenerateOptions struct {
 // work-dir trees, the dyld cryptex) so a
 // caller's extra path can never override them; then the narrow re-allows the
 // protected denies would
-// otherwise clobber (the dyld closure-cache read and this pod's own data volume,
-// which lives under the denied pods root); and last the read-only credential
-// sub-scope, whose file-write* deny therefore wins even inside the writable data
-// volume.
+// otherwise clobber (the dyld closure-cache read, this pod's own data volume,
+// which lives under the denied pods root, and the file-read-metadata grant on
+// that volume's — and every PV root's — strict ancestors); and last the read-only
+// credential sub-scope, whose file-write* deny therefore wins even inside the
+// writable data volume.
+//
+// The ancestor grant belongs to that narrow re-allow tier for the same reason the
+// data volume does, and it would be inert anywhere earlier: the nodes it names
+// are <podsRoot> and <podsRoot>/<id>, both inside the protected
+// (deny file-read* file-write* (subpath <podsRoot>)), so an allow emitted before
+// that deny loses to it. It grants file-read-metadata and nothing more — a
+// process may stat those directories, which is what a chdir/realpath walk down to
+// the data volume needs, and may neither list them nor read anything in them.
 //
 // The data volume itself IS bounded (see ErrDataVolumeUnbounded): it must be a
 // proper descendant of <Posture.WorkDir>/pods. That bound is positive
@@ -505,6 +514,48 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("(allow file-read* file-write*\n")
 	writeFirmlinkSubpaths(&b, []string{dataVol})
 	b.WriteString("  )\n")
+
+	// The stat-walk grant for every subtree re-allowed above. A tool that
+	// canonicalizes its working directory — swift-driver and swift-frontend do,
+	// via chdir+realpath — stats each ancestor of the cwd in turn, and under the
+	// protected denies those ancestors are <podsRoot> and <podsRoot>/<id>, which
+	// sit INSIDE (deny file-read* file-write* (subpath <podsRoot>)). Without this
+	// the pod's own volume is readable while nothing can descend to it: a confined
+	// swiftc (Swift 6.3.x / Command Line Tools 27.0) aborted with "unable to set
+	// working directory: <dataVol>" after a `deny file-read-metadata /private`,
+	// and hand-patching exactly these literals into the rendered profile made the
+	// same compile succeed (B277).
+	//
+	// Two things separate it from the xcode stanza's otherwise identical ancestor
+	// grant, and both are why it cannot simply be emitted there:
+	//
+	//   - TIER. The xcode grant sits in the allows, because nothing denies
+	//     /Applications. These ancestors are under the protected denies, so the
+	//     grant must be emitted AFTER them or last-match-wins erases it.
+	//   - FIRMLINK DUAL-FORMING. A developer dir is never under /var,/tmp,/etc, so
+	//     the xcode walk has one form per path. A pods root under /var/lib/k3sm has
+	//     two, and only the /private one is what libsandbox matches — it is the
+	//     form that yields the bare /private literal the denial named.
+	//
+	// Narrow by construction: file-read-metadata only (stat, never open or
+	// readdir), and one (literal …) per node — never a (subpath …), which on
+	// <podsRoot> would hand this pod every sibling pod's tree. The guard keeps an
+	// empty set from rendering a filterless (allow file-read-metadata), which
+	// would grant metadata on the whole filesystem.
+	reallowed := append([]string{dataVol}, opts.WritePaths...)
+	reallowed = append(reallowed, opts.ReadPaths...)
+	if ancestors := ancestorMetadataPaths(reallowed); len(ancestors) > 0 {
+		b.WriteString(";; existence only: the strict ancestors of every re-allowed subtree, so a\n")
+		b.WriteString(";; stat-walk (chdir/realpath canonicalization — swift-driver, swift-frontend)\n")
+		b.WriteString(";; can descend to it. Metadata on directories, one literal per node: never a\n")
+		b.WriteString(";; subpath (a subpath on the pods root would reach every sibling pod), never\n")
+		b.WriteString(";; file-read-data (no listing).\n")
+		b.WriteString("(allow file-read-metadata\n")
+		for _, a := range ancestors {
+			b.WriteString(fmt.Sprintf("  (literal %q)\n", a))
+		}
+		b.WriteString("  )\n")
+	}
 
 	// --- credential read-only sub-scope (highest precedence) --------------
 	// last, so this file-write* deny wins even though the credential lives inside
@@ -726,6 +777,62 @@ func strictlyUnder(path, prefix string) bool {
 		return path != prefix && filepath.IsAbs(path)
 	}
 	return path != prefix && isUnder(path, prefix)
+}
+
+// strictAncestors returns the strict ancestors of p, root-first, excluding "/"
+// and p itself: for /Applications/Xcode.app/Contents/Developer it is
+// /Applications, /Applications/Xcode.app, /Applications/Xcode.app/Contents; for
+// /private/var/lib/k3sm/pods/p1/rootfs it is /private, /private/var, and so on
+// down to /private/var/lib/k3sm/pods/p1. These are the directories a stat-walk
+// traverses on the way to p, and the metadata-only tier is the whole grant they
+// get — a directory a process may stat but neither list nor open.
+//
+// It lives here rather than beside its first caller (the xcode toolchain stanza)
+// because the ancestor walk is not an Xcode fact: Generate uses the same helper
+// for every re-allowed subtree, and two copies of a path walk that a grant is
+// derived from would be one copy too many.
+func strictAncestors(p string) []string {
+	var out []string
+	for cur := filepath.Dir(p); cur != "/" && cur != "." && cur != p; cur = filepath.Dir(cur) {
+		out = append(out, cur)
+	}
+	// reverse into root-first order, which is how the stat-walk reads.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// ancestorMetadataPaths returns every directory a process must be able to stat to
+// reach one of roots: for each root, for each of its firmlink forms, that form's
+// strict ancestors — deduped, first-seen order (root-first within a form), so the
+// rendered stanza is deterministic and carries no duplicate line.
+//
+// Both forms matter and neither is redundant. libsandbox matches the
+// symlink-resolved path, so the /private form is the one a stat of
+// /var/lib/k3sm/pods/<id>/rootfs actually tests; the raw form is what a rule
+// written against a path the kernel does not rebase (a work-dir already under
+// /private, or off the firmlinked trees entirely) needs. Emitting both is how the
+// bare /private grant — the first node of the resolved walk, and the denial B277
+// observed — comes to exist at all.
+func ancestorMetadataPaths(roots []string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		for _, form := range firmlinkForms(r) {
+			for _, anc := range strictAncestors(form) {
+				if _, ok := seen[anc]; ok {
+					continue
+				}
+				seen[anc] = struct{}{}
+				out = append(out, anc)
+			}
+		}
+	}
+	return out
 }
 
 // macOSFirmlinks are the synthetic APFS firmlinks the macOS boot volume presents:

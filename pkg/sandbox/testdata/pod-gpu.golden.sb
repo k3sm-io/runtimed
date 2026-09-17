@@ -67,3 +67,21 @@
   (subpath "/var/lib/k3sm/pods/pod-gpu123/rootfs")
   (subpath "/private/var/lib/k3sm/pods/pod-gpu123/rootfs")
   )
+;; existence only: the strict ancestors of every re-allowed subtree, so a
+;; stat-walk (chdir/realpath canonicalization — swift-driver, swift-frontend)
+;; can descend to it. Metadata on directories, one literal per node: never a
+;; subpath (a subpath on the pods root would reach every sibling pod), never
+;; file-read-data (no listing).
+(allow file-read-metadata
+  (literal "/var")
+  (literal "/var/lib")
+  (literal "/var/lib/k3sm")
+  (literal "/var/lib/k3sm/pods")
+  (literal "/var/lib/k3sm/pods/pod-gpu123")
+  (literal "/private")
+  (literal "/private/var")
+  (literal "/private/var/lib")
+  (literal "/private/var/lib/k3sm")
+  (literal "/private/var/lib/k3sm/pods")
+  (literal "/private/var/lib/k3sm/pods/pod-gpu123")
+  )

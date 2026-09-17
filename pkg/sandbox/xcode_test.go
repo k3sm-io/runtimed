@@ -229,7 +229,12 @@ func TestXcodeToolchainAbsentWhenEmpty(t *testing.T) {
 	if got != string(want) {
 		t.Errorf("an empty xcode_toolchain_dir changed the default profile.\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
-	if strings.Contains(got, "Xcode") || strings.Contains(got, "file-read-metadata") {
+	// The sentinel is the stanza's own comment marker, not the bare operation
+	// name: since B277 the base profile always carries a file-read-metadata
+	// stanza of its own (the ancestor stat-walk grant), so "no file-read-metadata"
+	// would now assert something false about every profile rather than something
+	// true about this one.
+	if strings.Contains(got, "Xcode") || strings.Contains(got, ";; xcode:") {
 		t.Errorf("a profile without xcode_toolchain_dir carries a toolchain rule:\n%s", got)
 	}
 }
