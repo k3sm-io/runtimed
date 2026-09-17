@@ -78,6 +78,11 @@ func (c *countingResolver) counts() resolverCounts {
 // at create — there is no re-resolution of ConfigMap/Secret/ServiceAccount-token
 // data on update.
 //
+// This is a CHARACTERIZATION of today's behaviour, not a design requirement: a
+// projected-volume refresh (the k3sm-side follow-up tracked as B234) must invert
+// this test deliberately rather than trip over it. Its k3sm sibling is
+// TestUpdatePodDoesNotRematerializeVolumes in pkg/provider.
+//
 // The contract matters outside this package: the k3sm provider decides whether an
 // apiserver-side pod change can be served in place or needs a recreate, and a
 // provider comment that assumes an update re-projects volume data would promise
