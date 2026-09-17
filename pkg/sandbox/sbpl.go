@@ -198,6 +198,17 @@ var ErrInvalidPodLogsDir = errors.New("sbpl: invalid pod-logs dir")
 // tree, so it is rejected.
 var ErrWorkDirEscapesHome = errors.New("sbpl: work-dir escapes home")
 
+// ErrInvalidDeniedPort reports a SandboxProfile.denied_local_ports entry outside
+// the TCP port range 1..65535. The field is a repeated uint32 on the wire, so a 0
+// or a 70000 arrives as a well-formed message; only this check can catch it.
+//
+// It fails closed — the profile is refused rather than generated with the bad
+// entry dropped — because a silently-dropped entry is a silently-missing deny:
+// the caller believes a loopback listener is unreachable from the pod while the
+// emitted profile says nothing about it. A refused profile is one loud error at
+// pod creation; a dropped entry is an unnoticed hole.
+var ErrInvalidDeniedPort = errors.New("sbpl: denied_local_ports entry is not a TCP port")
+
 // Posture is the NODE-level SBPL configuration: the runtimed work-dir the
 // per-pod pods-root and protected-prefix denies are derived from, plus the
 // cluster DNS resolver VIP and in-cluster API-server VIP the node advertises.
@@ -320,6 +331,24 @@ type GenerateOptions struct {
 // (The path filter is `literal`, an exact-path match — macOS 26 libsandbox
 // rejects the non-existent `path-equal` filter with "unbound variable".)
 //
+// sp.DeniedLocalPorts is that deny's AF_INET sibling, and is threaded as data for
+// the same reason: the generator must not know what listens on a given port, only
+// that the caller wants it unreachable. For a pod that requested network, each
+// entry renders one
+// (deny network-outbound (remote ip "localhost:<port>")) after the network
+// stanza, so last-match-wins keeps the dial denied while the rest of the grant
+// stands; for a pod that did not, nothing is emitted because (deny default)
+// already covers it. Entries are deduped, sorted, and range-checked
+// (ErrInvalidDeniedPort).
+//
+// The narrowing is PORT-ONLY, and the ceiling is the grammar's, not a design
+// choice: macOS 26 Seatbelt accepts only `localhost` or `*` as the host in a
+// network filter (see network.go), so `localhost:<port>` matches that port on
+// every address the host owns — loopback, the lo0-aliased pod addresses, the LAN
+// address alike. A Service VIP that happens to listen on the same port number is
+// therefore ALSO unreachable from a confined pod. This is a same-host
+// defence-in-depth layer over a shared-uid process, not per-pod isolation.
+//
 // Rule order is security-critical because SBPL is last-match-wins. Generate emits
 // (in increasing precedence): the OS/extra-path allows + the network allows; then
 // the AF_UNIX helper-socket denies and the protected file denies (/Users,
@@ -422,6 +451,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	writePaths := dedupeSorted(append(append([]string{}, sp.GetExtraWritePaths()...), opts.WritePaths...))
 	credPaths := dedupeSorted(opts.ReadOnlyPaths)
 	deniedSockets := dedupeSorted(sp.GetDeniedUnixSocketPaths())
+	// Range-checked before anything is written, and unconditionally — a malformed
+	// entry is the caller's bug whether or not this pod asked for network, and
+	// reporting it only for networked pods would hide it until the first pod that
+	// happens to set the flag.
+	deniedPorts, err := dedupeSortedPorts(sp.GetDeniedLocalPorts())
+	if err != nil {
+		return "", err
+	}
 
 	var b strings.Builder
 	b.WriteString(";; k3sm per-pod Seatbelt profile — GENERATED, do not edit.\n")
@@ -487,6 +524,22 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 			}
 		}
 		b.WriteString("  )\n")
+	}
+
+	// --- loopback port denies (higher precedence than the network allows) -----
+	// Only meaningful for a pod that was granted network: without the stanza above
+	// (deny default) already refuses every dial, and emitting a redundant deny
+	// would put a rule in the profile that nothing in it can be read against.
+	// Emitted AFTER the stanza so last-match-wins keeps these ports denied while
+	// the rest of the grant stands. Port-only by grammar, not by choice — see the
+	// ceiling note on Generate and in network.go.
+	if networkRequested(sp) && len(deniedPorts) > 0 {
+		b.WriteString(";; loopback: deny outbound dials to the local listener port(s)\n")
+		b.WriteString(";; the caller named — same-uid pods can't be kept off them\n")
+		b.WriteString(";; any other way. `localhost` matches every host-owned address.\n")
+		for _, port := range deniedPorts {
+			b.WriteString(fmt.Sprintf("(deny network-outbound (remote ip \"localhost:%d\"))\n", port))
+		}
 	}
 
 	// --- protected denies (higher precedence than the extra-path allows) --
@@ -987,4 +1040,29 @@ func dedupeSorted(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// dedupeSortedPorts returns the unique, ascending TCP ports in in, so the
+// generated profile is deterministic regardless of input order (golden-test
+// stable), and rejects any entry outside 1..65535 with ErrInvalidDeniedPort.
+//
+// Unlike dedupeSorted, which drops the empty string, this drops nothing: there is
+// no "absent" value in the uint32 range that a caller could have meant, so 0 is an
+// error rather than a skip. See ErrInvalidDeniedPort for why the whole profile is
+// refused instead.
+func dedupeSortedPorts(in []uint32) ([]uint32, error) {
+	seen := make(map[uint32]struct{}, len(in))
+	out := make([]uint32, 0, len(in))
+	for _, p := range in {
+		if p == 0 || p > 65535 {
+			return nil, fmt.Errorf("%w: %d is outside 1..65535", ErrInvalidDeniedPort, p)
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
