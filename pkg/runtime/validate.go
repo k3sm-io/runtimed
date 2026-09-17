@@ -123,6 +123,11 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 
 // updatableOnly verifies that newBox changes only in-place-updatable fields
 // (labels, annotations) relative to oldBox. Any other difference is NOT_UPDATABLE.
+//
+// It is the one place that names the in-place-updatable field set, so a caller
+// deciding between an update and a recreate can cite it: labels and annotations
+// only; volumes are materialized once, at create, and an update re-resolves no
+// ConfigMap/Secret/ServiceAccount-token data.
 func updatableOnly(oldBox, newBox *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 	if newBox.GetName() != oldBox.GetName() || newBox.GetNamespace() != oldBox.GetNamespace() {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
