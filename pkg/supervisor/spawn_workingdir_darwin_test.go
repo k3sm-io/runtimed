@@ -67,7 +67,16 @@ func spawnedCwd(t *testing.T, dir string) string {
 	if code != 0 {
 		t.Fatalf("/bin/pwd exited %d with Dir=%q", code, dir)
 	}
-	p.LogsDrained()
+	// Wait returning proves the reap, not the drain: the pumps copy the child's
+	// bytes to the sink independently of the kqueue reaper that unblocks Wait, so
+	// the sink is read only once both pumps have reached EOF. A dedicated timer,
+	// like every other LogsDrained wait in this package, gives a named failure
+	// instead of a bare context deadline.
+	select {
+	case <-p.LogsDrained():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("LogsDrained did not close within 5s for /bin/pwd with Dir=%q", dir)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
