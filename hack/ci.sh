@@ -52,6 +52,8 @@ if [ -n "$go_pkgs" ]; then
 		GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./cmd/k3sm-guest-init
 		rm -rf "$guestout"
 	fi
+
+	echo "==> [runtimed] execshim linux cross-build (off-platform stub)"; GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./cmd/k3sm-execshim
 else
 	echo "==> [runtimed] (no Go packages yet — skipping vet/build/test)"
 fi
