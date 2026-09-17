@@ -30,6 +30,6 @@ var ErrUnsupported = errors.New("execshim: libsandbox confinement requires darwi
 
 // RunPodLaunch is unsupported off darwin/cgo; it returns ErrUnsupported so the
 // helper fails closed rather than execing a pod unconfined.
-func RunPodLaunch(profile string, argv []string, cred supervisor.Credential) error {
+func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec) error {
 	return ErrUnsupported
 }

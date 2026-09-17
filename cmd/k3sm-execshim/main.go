@@ -1,3 +1,5 @@
+//go:build darwin && cgo
+
 /*
 Copyright The k3sm Authors.
 
