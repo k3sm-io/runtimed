@@ -99,7 +99,7 @@ const DefaultResolverVIP = "10.96.0.10"
 // volume). They are absolute literals by definition — anything work-dir-relative
 // belongs in resolvePosture instead, which appends the pods-root (sibling pods),
 // the daemon-private podreap store, and the control-plane/daemon trees
-// (<WorkDir>/{server,agent,run,blobs}) to this set.
+// (<WorkDir>/{server,agent,run,blobs,sbpl}) to this set.
 // validateExtraPaths rejects any extra read/write path at or under one of these
 // (the pod's own data volume is carved out), and Generate emits a matching
 // (deny ...) for each after the extra-path allows so an unvalidated path cannot
@@ -587,7 +587,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 // resolvePosture validates p.WorkDir and p.PodLogsDir and returns the pods root (<WorkDir>/pods —
 // the bound Generate holds the data volume to), the work-dir-derived denied
 // roots (that pods-root, the daemon-private podreap store, and the
-// control-plane/daemon trees <WorkDir>/{server,agent,run,blobs} — all read+write
+// control-plane/daemon trees <WorkDir>/{server,agent,run,blobs,sbpl} — all read+write
 // denied with firmlink forms by Generate) and the ordered protected-prefix
 // deny-set (those roots plus the fixed system subtrees). The pods root is
 // returned explicitly rather than read back out of the deny-root slice by index,
@@ -644,7 +644,14 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	// denying it would clobber every legitimate opts.WritePaths grant. The cost is
 	// explicit — a caller-supplied extra path AT <WorkDir>/storage stays reachable,
 	// which an emitted deny-list structurally cannot express.
-	for _, sub := range []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir} {
+	//
+	// ProfileSubdir (<WorkDir>/sbpl) is in the same tier and is the sharpest of
+	// them: it holds the per-pod Seatbelt profiles the exec-shim reads BEFORE it
+	// applies the sandbox, so write access there is a sandbox-substitution
+	// primitive — a pod able to rewrite a staged profile chooses the confinement
+	// the next pod runs under. Single-sourced with the staging code and the
+	// startup sweep via sandbox.ProfileSubdir.
+	for _, sub := range []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir, ProfileSubdir} {
 		workDirDenyRoots = append(workDirDenyRoots, filepath.Join(workDir, sub))
 	}
 	// The socket + key dir also in its absolute form, when the work-dir is not the

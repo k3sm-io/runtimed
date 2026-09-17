@@ -501,5 +501,58 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 		r.log.Warn("removing malformed reap record", "path", f)
 		_ = os.Remove(f)
 	}
+	r.sweepStaleSandboxProfiles()
 	return nil
+}
+
+// ProfileSweeper is the optional seam a sandbox backend implements when it
+// stages per-pod profiles on disk and can clear the ones a previous daemon
+// incarnation left behind. *sandbox.ExecShimBackend satisfies it.
+//
+// It is deliberately NOT part of sandbox.Backend: staging is one backend's
+// implementation detail (the vm rung stages nothing of the kind), and widening
+// the spawn interface would force every test fake to grow a method that has
+// nothing to do with what it fakes. The startup hook type-asserts and skips a
+// backend that does not implement it.
+type ProfileSweeper interface {
+	// SweepStaleProfiles removes every staged profile left by a previous daemon
+	// run and reports how many it removed. It logs nothing; the caller does.
+	SweepStaleProfiles() (int, error)
+}
+
+// Ensure the staging backend satisfies the optional seam, so a signature change
+// in pkg/sandbox is a compile error here rather than a silently skipped sweep.
+var _ ProfileSweeper = (*sandbox.ExecShimBackend)(nil)
+
+// sweepStaleSandboxProfiles clears the per-pod Seatbelt profiles a previous
+// daemon incarnation staged and never removed. WrapCommand's cleanup closure
+// removes a profile when the pod process exits, so a daemon killed without
+// teardown (`launchctl kickstart -k`, `bootout`, a crash) leaks exactly one file
+// per live pod, forever — nothing else on the node ever removes them.
+//
+// Everything present is stale BY CONSTRUCTION, which is why there is no mtime or
+// age heuristic: this runs inside the exactly-once startup reap, AFTER the pod
+// process reap above, so every process group a previous daemon spawned has been
+// SIGKILLed or recorded as leaked (the keep-and-warn ceiling) — and a leaked
+// shim cannot still need its profile, because the shim reads the file exactly
+// once at the top of its main, before it applies the sandbox and execs. Nothing
+// this daemon staged can be present either: the reap completes before CreatePod
+// is served. Moving this call after that point would break the argument, not
+// merely weaken it.
+//
+// It degrades rather than fails, exactly as the reap around it does: a sweep
+// failure leaks disk, and taking the node down over it would be the larger
+// outage.
+func (r *Runtime) sweepStaleSandboxProfiles() {
+	sweeper, ok := r.backend.(ProfileSweeper)
+	if !ok {
+		return
+	}
+	removed, err := sweeper.SweepStaleProfiles()
+	if err != nil {
+		r.log.Warn("startup sandbox-profile sweep incomplete; stale per-pod profiles may remain", "removed", removed, "err", err)
+	}
+	if removed > 0 {
+		r.log.Info("swept stale per-pod sandbox profiles left by a previous daemon run", "removed", removed)
+	}
 }

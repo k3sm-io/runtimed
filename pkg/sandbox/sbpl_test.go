@@ -334,8 +334,9 @@ func TestGeneratePodReapStoreDenied(t *testing.T) {
 // TestWorkDirDenyRootsCoverControlPlaneTrees is the control-plane-tree contract:
 // the work-dir siblings that hold the cluster CA keys + kine datastore
 // (<WorkDir>/server), the node-agent state (<WorkDir>/agent), the daemon control
-// sockets + wireguard mesh private key (<WorkDir>/run) and the content-addressed
-// blob store (<WorkDir>/blobs) must be both rejected as caller-supplied paths and
+// sockets + wireguard mesh private key (<WorkDir>/run), the content-addressed
+// blob store (<WorkDir>/blobs) and the per-pod SBPL staging dir (<WorkDir>/sbpl)
+// must be both rejected as caller-supplied paths and
 // EMITTED as denies after the allows — a validate-set entry alone would not
 // survive an ancestor grant, and an emitted deny placed before the allows would
 // be worthless (SBPL is last-match-wins).
@@ -347,7 +348,7 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 	workDir := t.TempDir()
 	dataVol := filepath.Join(workDir, "pods", "p1", "rootfs")
 	posture := Posture{WorkDir: workDir}
-	subdirs := []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir}
+	subdirs := []string{ServerSubdir, AgentSubdir, RunSubdir, BlobsSubdir, ProfileSubdir}
 
 	// (0) The mesh private key's absolute home is denied even though this posture's
 	// work-dir is elsewhere. Everything else in the deny-set moves with the
@@ -483,6 +484,46 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		}
 		if want := filepath.Join(root, BlobsSubdir); !isUnder(blob, want) {
 			t.Errorf("image blob %q is not under %q — BlobsSubdir has drifted from pkg/image", blob, want)
+		}
+	})
+
+	// (5) The SBPL staging dir, stated on its own because it is the sharpest
+	// member of the set: the exec-shim READS the staged profile before it applies
+	// the sandbox, so a pod that could write there would choose the confinement
+	// the next pod runs under — a sandbox-substitution primitive, not merely a
+	// disclosure. The deny root must therefore be the same directory
+	// WrapCommand actually stages into (single-sourced via ProfileSubdir), and a
+	// caller-supplied path UNDER it must be refused at the validation seam.
+	t.Run("the sbpl staging dir is protected and matches where profiles are staged", func(t *testing.T) {
+		if ProfileSubdir != "sbpl" {
+			t.Errorf("ProfileSubdir = %q, want \"sbpl\" (single-sourced with the staging code and the startup sweep)", ProfileSubdir)
+		}
+		shim := filepath.Join(workDir, ExecShimName)
+		if err := os.WriteFile(shim, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		b, err := NewExecShimBackend(shim, workDir)
+		if err != nil {
+			t.Fatalf("NewExecShimBackend: %v", err)
+		}
+		staging := b.profileDir()
+		_, denyRoots, protected, err := resolvePosture(posture)
+		if err != nil {
+			t.Fatalf("resolvePosture: %v", err)
+		}
+		var covered bool
+		for _, root := range denyRoots {
+			if isUnder(staging, root) {
+				covered = true
+			}
+		}
+		if !covered {
+			t.Errorf("the staging dir %q is not under any denied root %v — the deny has drifted from where profiles are staged", staging, denyRoots)
+		}
+		// A PV/extra path UNDER the staging dir is refused, not merely the root.
+		under := filepath.Join(staging, "x")
+		if err := validateExtraPaths(dataVol, protected, []string{under}); !errors.Is(err, ErrProtectedPath) {
+			t.Errorf("validateExtraPaths(%q) = %v, want ErrProtectedPath", under, err)
 		}
 	})
 }

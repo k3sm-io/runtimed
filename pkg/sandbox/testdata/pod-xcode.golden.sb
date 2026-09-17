@@ -95,6 +95,8 @@
   (subpath "/private/var/lib/k3sm/run")
   (subpath "/var/lib/k3sm/blobs")
   (subpath "/private/var/lib/k3sm/blobs")
+  (subpath "/var/lib/k3sm/sbpl")
+  (subpath "/private/var/lib/k3sm/sbpl")
   (subpath "/var/log/pods")
   (subpath "/private/var/log/pods")
   (subpath "/var/log/containers")
