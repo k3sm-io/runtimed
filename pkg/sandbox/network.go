@@ -48,15 +48,29 @@ import (
 // change anything. And once both are scoped, `localhost` matches every
 // address the host owns — the lo0-aliased per-pod address, the LAN address,
 // and the wildcard alike — so a localhost-scoped filter provides no per-pod
-// isolation even then. Nothing narrower than the stanza below is expressible.
+// isolation even then. Nothing narrower than the stanza below is expressible
+// as an ALLOW.
+//
+// The ONE sanctioned narrowing, and it is a DENY: a
+// (deny network-outbound (remote ip "localhost:<port>")) compiles and enforces
+// — proven 2026-09-17 by the sandbox-exec connect test in
+// sbpl_apply_check_test.go, which under one profile is refused on the denied
+// port and connects on an undenied one. It is carried by
+// SandboxProfile.denied_local_ports, threaded as data (the generator does not
+// know what listens there), emitted after this stanza so last-match-wins keeps
+// it denied. Its reach is exactly the grammar's: PORT-only, and `localhost`
+// matches every address the host owns, so a Service that reused the port number
+// is unreachable from a confined pod too. It is a same-host defence-in-depth
+// layer over a shared-uid pod process — NOT per-pod isolation, and it narrows
+// nothing about where else a networked pod may dial.
 //
 // Honest consequence: for a networked pod, networking allowed means
 // networking ALLOWED — unfiltered outbound + bind under the profile's
-// (deny default). The isolation story for a networked pod stays fs/exec
-// confinement plus the vm RuntimeClass for untrusted tenancy; never claim
-// network isolation from Seatbelt. Posture.ResolverVIP/APIServerVIP and
-// GenerateOptions.PodIP are plumbing-only (DNS env/status) — they render
-// no SBPL.
+// (deny default), minus whatever ports the caller named. The isolation story
+// for a networked pod stays fs/exec confinement plus the vm RuntimeClass for
+// untrusted tenancy; never claim network isolation from Seatbelt.
+// Posture.ResolverVIP/APIServerVIP and GenerateOptions.PodIP are plumbing-only
+// (DNS env/status) — they render no SBPL.
 // ============================================================================
 //
 // network-inbound authorizes listen()/accept(). A bare (allow network-bind)
@@ -150,6 +164,17 @@ func networkRequested(sp *runtimev1.SandboxProfile) bool {
 // any (allow …) line mentioning a network operation counts as a network grant
 // (even a whitespace or dialect variant a naive equality test would miss), and
 // only the exact stanza is then accepted.
+//
+// DENY lines are outside the check by construction, and deliberately so. Only
+// (allow …) directives are counted, so the denied_local_ports lines — and the
+// AF_UNIX helper-socket block before them — are neither a grant nor a mismatch,
+// whether or not the pod requested network. That is the fail-closed reading, not
+// a gap in it: this check exists to catch a pod being handed network it did not
+// ask for, or a per-IP ALLOW that libsandbox would refuse to compile at
+// sandbox_apply. A deny can do neither. A deny emitted without a network request
+// is inert under (deny default) rather than wrong, and refusing it would make
+// the one profile shape that only ever subtracts authority harder to write than
+// the shapes that add it.
 func ValidateNetworkScope(sp *runtimev1.SandboxProfile, profile string) error {
 	hasStanza := strings.Contains(profile, networkStanza)
 	hasAnyAllow := hasNetworkAllow(profile)
