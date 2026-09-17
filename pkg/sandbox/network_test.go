@@ -20,6 +20,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -97,31 +99,223 @@ func TestEgressImpliesNetwork(t *testing.T) {
 	}
 }
 
-// TestEgressRetiredRules pins what the egress branch must not emit. The
-// range-based deny set, the tier-3 re-allows, and the kine-loopback deny were
-// retired from this surface: per-IP filters do not
-// compile on macOS 26, so emitting one would not tighten anything — it would make
-// every networked pod fail at sandbox_apply while LOOKING like enforcement.
+// TestEgressRetiredRules pins what the egress branch must not emit. What stays
+// retired and banned is the PER-IP shape: a network filter naming an address.
+// Those do not compile on macOS 26, so emitting one would not tighten anything —
+// it would make every networked pod fail at sandbox_apply while LOOKING like
+// enforcement. The range-based deny set and the tier-3 re-allows went with them.
 // Network-layer enforcement is the networking datapath's future work.
+//
+// The one sanctioned narrowing is the host-less, PORT-only
+// (deny network-outbound (remote ip "localhost:<port>")) the caller asks for by
+// data through denied_local_ports — never a hard-coded address or port number in
+// this package. So the ban here is on `remote ip "` followed by a digit (an
+// address literal) and on the specific address fragments that were retired; the
+// `localhost:` form is asserted PRESENT in the ports sub-test, and only there.
 func TestEgressRetiredRules(t *testing.T) {
-	out, err := Generate(&runtimev1.SandboxProfile{
-		DataVolumePath:      egressDataVol,
-		AllowInternetEgress: true,
-	}, GenerateOptions{})
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
-	}
-	rules := ruleLines(out)
-	for _, banned := range []string{
-		"remote ip",  // any per-IP filter, the form that does not compile
-		"127.0.0.1",  // the retired kine-loopback deny
+	// perIPFilter matches a network filter whose host is an address literal
+	// rather than `localhost`/`*` — the shape that does not compile.
+	perIPFilter := regexp.MustCompile(`remote ip "[0-9]`)
+	bannedFragments := []string{
+		"127.0.0.1",  // the retired loopback-address deny
 		"100.64.0.0", // the retired sibling-pod range deny
-		"2379",       // the retired datastore-port deny
-	} {
-		if strings.Contains(rules, banned) {
-			t.Errorf("egress profile carries retired rule fragment %q", banned)
-		}
 	}
+
+	t.Run("no ports", func(t *testing.T) {
+		out, err := Generate(&runtimev1.SandboxProfile{
+			DataVolumePath:      egressDataVol,
+			AllowInternetEgress: true,
+		}, GenerateOptions{})
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		rules := ruleLines(out)
+		if perIPFilter.MatchString(rules) {
+			t.Errorf("egress profile carries a per-IP network filter (does not compile on macOS 26):\n%s", rules)
+		}
+		for _, banned := range bannedFragments {
+			if strings.Contains(rules, banned) {
+				t.Errorf("egress profile carries retired rule fragment %q", banned)
+			}
+		}
+		// Nothing asked for a port deny, so none may appear.
+		if strings.Contains(rules, `remote ip "localhost:`) {
+			t.Errorf("egress profile carries a port deny nobody requested:\n%s", rules)
+		}
+	})
+
+	t.Run("with denied ports", func(t *testing.T) {
+		out, err := Generate(&runtimev1.SandboxProfile{
+			DataVolumePath:      egressDataVol,
+			AllowInternetEgress: true,
+			DeniedLocalPorts:    []uint32{12379},
+		}, GenerateOptions{})
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		rules := ruleLines(out)
+		if !strings.Contains(rules, `(deny network-outbound (remote ip "localhost:12379"))`) {
+			t.Errorf("the sanctioned localhost port deny is missing:\n%s", rules)
+		}
+		if perIPFilter.MatchString(rules) {
+			t.Errorf("the port deny rendered as a per-IP filter (does not compile on macOS 26):\n%s", rules)
+		}
+		for _, banned := range bannedFragments {
+			if strings.Contains(rules, banned) {
+				t.Errorf("egress profile carries retired rule fragment %q", banned)
+			}
+		}
+	})
+}
+
+// TestGenerateDeniesKinePort pins the denied_local_ports translation: which
+// profiles carry a loopback port deny, where it sits, and what an invalid entry
+// does.
+//
+// Every port here is a test datum. The generator does not know — and must never
+// encode — what listens on a given port: the caller names the ports, so a
+// non-default 12379 exercises the same path a control plane's real listener
+// would, and nothing in this package may hard-code either number.
+func TestGenerateDeniesKinePort(t *testing.T) {
+	gen := func(t *testing.T, sp *runtimev1.SandboxProfile) string {
+		t.Helper()
+		sp.DataVolumePath = egressDataVol
+		out, err := Generate(sp, GenerateOptions{})
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		return out
+	}
+	denyLine := func(port int) string {
+		return `(deny network-outbound (remote ip "localhost:` + strconv.Itoa(port) + `"))`
+	}
+
+	t.Run("allow_network emits the deny after the network stanza", func(t *testing.T) {
+		out := gen(t, &runtimev1.SandboxProfile{
+			AllowNetwork:     true,
+			DeniedLocalPorts: []uint32{12379, 10257},
+		})
+		for _, port := range []int{12379, 10257} {
+			line := denyLine(port)
+			at := strings.Index(out, line)
+			if at < 0 {
+				t.Fatalf("missing deny for port %d:\n%s", port, out)
+			}
+			stanzaAt := strings.Index(out, networkStanza)
+			if stanzaAt < 0 {
+				t.Fatalf("network stanza missing from a networked profile:\n%s", out)
+			}
+			// SBPL is last-match-wins: a deny emitted BEFORE the unfiltered
+			// (allow network-outbound) would be overridden by it and enforce
+			// nothing, which is the whole failure mode this asserts against.
+			if at < stanzaAt+len(networkStanza) {
+				t.Errorf("deny for port %d is emitted before/inside the network stanza (last-match-wins would clobber it)", port)
+			}
+		}
+		// Deduped+sorted: ascending, regardless of input order.
+		if a, b := strings.Index(out, denyLine(10257)), strings.Index(out, denyLine(12379)); a > b {
+			t.Errorf("port denies are not in ascending order (%d > %d)", a, b)
+		}
+	})
+
+	t.Run("allow_internet_egress emits the same deny", func(t *testing.T) {
+		out := gen(t, &runtimev1.SandboxProfile{
+			AllowInternetEgress: true,
+			DeniedLocalPorts:    []uint32{12379},
+		})
+		if !strings.Contains(out, denyLine(12379)) {
+			t.Errorf("an egress-only pod carries no port deny:\n%s", out)
+		}
+	})
+
+	t.Run("no network request emits nothing", func(t *testing.T) {
+		withPorts := gen(t, &runtimev1.SandboxProfile{DeniedLocalPorts: []uint32{12379}})
+		without := gen(t, &runtimev1.SandboxProfile{})
+		if strings.Contains(withPorts, `remote ip "localhost:`) {
+			t.Errorf("a pod that requested no network carries a port deny:\n%s", withPorts)
+		}
+		// (deny default) already covers the dial, so the field must not perturb
+		// a single byte of the profile.
+		if withPorts != without {
+			t.Errorf("denied_local_ports changed an unnetworked profile:\n--- with ---\n%s\n--- without ---\n%s", withPorts, without)
+		}
+	})
+
+	t.Run("empty list is byte-identical", func(t *testing.T) {
+		for _, tc := range []struct{ network, egress bool }{
+			{false, false}, {true, false}, {false, true}, {true, true},
+		} {
+			withEmpty := gen(t, &runtimev1.SandboxProfile{
+				AllowNetwork:        tc.network,
+				AllowInternetEgress: tc.egress,
+				DeniedLocalPorts:    []uint32{},
+			})
+			without := gen(t, &runtimev1.SandboxProfile{
+				AllowNetwork:        tc.network,
+				AllowInternetEgress: tc.egress,
+			})
+			if withEmpty != without {
+				t.Errorf("an empty denied_local_ports changed the profile (network=%v egress=%v):\n--- with ---\n%s\n--- without ---\n%s", tc.network, tc.egress, withEmpty, without)
+			}
+		}
+	})
+
+	t.Run("a duplicate port emits once", func(t *testing.T) {
+		out := gen(t, &runtimev1.SandboxProfile{
+			AllowNetwork:     true,
+			DeniedLocalPorts: []uint32{12379, 12379},
+		})
+		if n := strings.Count(out, denyLine(12379)); n != 1 {
+			t.Errorf("duplicate port rendered %d deny lines, want 1:\n%s", n, out)
+		}
+	})
+
+	t.Run("out-of-range ports are refused", func(t *testing.T) {
+		for _, ports := range [][]uint32{{0}, {70000}, {12379, 0}, {65536}} {
+			_, err := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath:   egressDataVol,
+				AllowNetwork:     true,
+				DeniedLocalPorts: ports,
+			}, GenerateOptions{})
+			if !errors.Is(err, ErrInvalidDeniedPort) {
+				t.Errorf("Generate(ports=%v) = %v, want ErrInvalidDeniedPort", ports, err)
+			}
+		}
+		// Refused even for a pod that would emit nothing: a malformed entry is
+		// the caller's bug regardless of the network flags.
+		_, err := Generate(&runtimev1.SandboxProfile{
+			DataVolumePath:   egressDataVol,
+			DeniedLocalPorts: []uint32{0},
+		}, GenerateOptions{})
+		if !errors.Is(err, ErrInvalidDeniedPort) {
+			t.Errorf("Generate(no network, ports=[0]) = %v, want ErrInvalidDeniedPort", err)
+		}
+		// The boundaries themselves are valid.
+		for _, port := range []uint32{1, 65535} {
+			if _, err := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath:   egressDataVol,
+				AllowNetwork:     true,
+				DeniedLocalPorts: []uint32{port},
+			}, GenerateOptions{}); err != nil {
+				t.Errorf("Generate(ports=[%d]) = %v, want nil", port, err)
+			}
+		}
+	})
+
+	t.Run("the generated profile still passes both checks", func(t *testing.T) {
+		sp := &runtimev1.SandboxProfile{
+			DataVolumePath:   egressDataVol,
+			AllowNetwork:     true,
+			DeniedLocalPorts: []uint32{12379},
+		}
+		out := gen(t, sp)
+		if err := ValidateNetworkScope(sp, out); err != nil {
+			t.Errorf("a profile with port denies failed its own scope check: %v", err)
+		}
+		if err := Validate(out); err != nil {
+			t.Errorf("a profile with port denies failed Validate: %v", err)
+		}
+	})
 }
 
 // TestValidateNetworkScope is acceptance M8.2-a1's adversarial half: the re-scoped
@@ -218,6 +412,39 @@ func TestValidateNetworkScope(t *testing.T) {
 			name:    "af_unix deny block is not a grant",
 			sp:      sp(false, false),
 			profile: head + "(deny network-outbound\n  (remote unix-socket (literal \"/var/lib/k3sm/run/netd.sock\"))\n  )\n",
+		},
+		{
+			// The sanctioned narrowing: denied_local_ports lines sit AFTER the
+			// stanza for a pod that asked for network. They are denies, so they are
+			// neither a second grant nor a mismatch — the profile is accepted, and
+			// the pod keeps the network it requested minus those ports.
+			name:    "stanza plus the localhost port denies",
+			sp:      sp(true, false),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"localhost:12379\"))\n",
+		},
+		{
+			// Same lines WITHOUT a network request: inert, not a violation. Only
+			// (allow …) directives can hand a pod authority it did not ask for, and
+			// under (deny default) this denies what is already denied. Accepting it
+			// is the reading consistent with the af_unix case above — a check that
+			// refused profiles for subtracting authority would be fail-closed in
+			// name only.
+			name:    "port denies without a network request are inert",
+			sp:      sp(false, false),
+			profile: head + "(deny network-outbound (remote ip \"localhost:12379\"))\n",
+		},
+		{
+			// Documented LIMIT, pinned so nobody reads more assurance into this
+			// check than it gives: detection counts (allow …) directives only, so a
+			// per-IP shape spelled as a DENY passes here — even though libsandbox
+			// refuses to compile it just as it refuses the allow form (probed
+			// 2026-09-17: "host must be * or localhost in network address"). The
+			// backstop for that shape is TestGeneratedProfileAppliesOnDarwin, which
+			// feeds the generated profile to real libsandbox; this validator's job
+			// is unrequested or uncompilable GRANTS.
+			name:    "per-IP deny beside the stanza is not caught here",
+			sp:      sp(true, false),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"127.0.0.1:2379\"))\n",
 		},
 	}
 
