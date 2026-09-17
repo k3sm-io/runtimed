@@ -48,9 +48,11 @@ import (
 // authorizes the bind, so any tightening has to scope both operations to
 // change anything. And once both are scoped, `localhost` matches every
 // address the host owns — the lo0-aliased per-pod address, the LAN address,
-// and the wildcard alike — so a localhost-scoped filter provides no per-pod
-// isolation even then. Nothing narrower than the stanza below is expressible
-// as an ALLOW.
+// and the wildcard alike (the LAN half measured 2026-09-17 by
+// TestLocalPortDenyBlocksLANConnect, which dials the host's own non-loopback
+// IPv4 address and is refused with EPERM) — so a localhost-scoped filter
+// provides no per-pod isolation even then. Nothing narrower than the stanza
+// below is expressible as an ALLOW.
 //
 // The ONE sanctioned narrowing, and it is a DENY: a
 // (deny network-outbound (remote ip "localhost:<port>")) compiles and enforces
@@ -60,8 +62,11 @@ import (
 // SandboxProfile.denied_local_ports, threaded as data (the generator does not
 // know what listens there), emitted after this stanza so last-match-wins keeps
 // it denied. Its reach is exactly the grammar's: PORT-only, and `localhost`
-// matches every address the host owns, so a Service that reused the port number
-// is unreachable from a confined pod too. It is a same-host defence-in-depth
+// matches every address the host owns — measured, not inferred: the loopback
+// test covers 127.0.0.1 and ::1, and TestLocalPortDenyBlocksLANConnect
+// (integration-tagged) covers the host's LAN address, where the same deny is
+// enforced with EPERM. So a Service that reused the port number is unreachable
+// from a confined pod too. It is a same-host defence-in-depth
 // layer over a shared-uid pod process — NOT per-pod isolation, and it narrows
 // nothing about where else a networked pod may dial.
 //

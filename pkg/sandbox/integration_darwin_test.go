@@ -21,6 +21,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -280,4 +281,113 @@ func TestIntegrationDYLDPreserved(t *testing.T) {
 	if !strings.Contains(out, "MARKER-CONSTRUCTOR-RAN") {
 		t.Errorf("DYLD insert dylib constructor did not run under the shim.\noutput:\n%s", out)
 	}
+}
+
+// firstLANIPv4 returns the first non-loopback IPv4 address on an up interface, or
+// "" when the host has none (an unplugged, wifi-off Mac is a legitimate state, not
+// a failure). Point-to-point and link-local addresses are skipped: a utun tunnel
+// or a 169.254 self-assigned address is not the LAN address the claim is about.
+func firstLANIPv4(t *testing.T) string {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("net.Interfaces: %v", err)
+	}
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 || ifi.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipn.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			t.Logf("LAN address: %s on %s", ip, ifi.Name)
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+// TestLocalPortDenyBlocksLANConnect discharges the reach half of the
+// denied_local_ports claim. network.go and sbpl.go both state that because macOS
+// Seatbelt admits only `localhost` or `*` as a filter host, a
+// (deny network-outbound (remote ip "localhost:<port>")) denies that port on EVERY
+// address the host owns — loopback, the lo0-aliased pod addresses, and the LAN
+// address alike. Until this test the claim was proven only at 127.0.0.1 and ::1
+// (TestLocalPortDenyBlocksLoopbackConnect), and "localhost matches the LAN
+// address" is the surprising half: it is what makes the deny a real same-host
+// defence rather than a loopback-only one, and it is also what makes it overreach
+// (a Service that reused the port number is unreachable from a confined pod too).
+// A comment asserting a Seatbelt matching rule that nothing exercises is a comment
+// that can quietly become false under an OS update.
+//
+// It lives behind the integration tag, the package's convention for tests that
+// depend on real OS surface, because it dials a real address on the real network
+// and its outcome can be decided by host state no unit test should be subject to —
+// an interface that went down, or the macOS application firewall. Those states are
+// SKIPS with a named cause, never passes: a test that "passes" because nothing
+// answered would be asserting the claim from silence. The only failure is the one
+// that matters — a CONNECT to the denied port, which would mean the claim is false
+// and both comments must be corrected rather than the code.
+func TestLocalPortDenyBlocksLANConnect(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not present")
+	}
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available for the connecter")
+	}
+	host := firstLANIPv4(t)
+	if host == "" {
+		t.Skip("no non-loopback IPv4 interface address on this host")
+	}
+
+	portA, portB, closeAll := listenTCPPair(t, "tcp4", host)
+	defer closeAll()
+	sb, prof := portDenyProfile(t, portA)
+
+	// The denied port at the LAN address. EPERM is the claim holding: the filter
+	// named `localhost` and the sandbox applied it to an address that is not
+	// loopback at all.
+	outA, errA := dialUnderProfile(t, sb, py, host, portA)
+	switch {
+	case outA == "CONNECTED":
+		t.Fatalf("the localhost port deny did NOT reach the LAN address %s:%d — "+
+			"the deny is loopback-only and the reach claim in network.go/sbpl.go is FALSE "+
+			"(correct the comments, not this test)\n--- profile ---\n%s", host, portA, prof)
+	case outA == "TIMEOUT":
+		t.Skipf("dial to %s:%d timed out rather than being answered — inconclusive; "+
+			"the macOS application firewall blocking inbound connections to the test "+
+			"process is the usual cause", host, portA)
+	case strings.HasPrefix(outA, "DENIED:EPERM"):
+		// The verdict this test exists to record.
+	default:
+		t.Fatalf("dial to the denied LAN port %s:%d gave no usable verdict: %q (%v)\n--- profile ---\n%s",
+			host, portA, outA, errA, prof)
+	}
+
+	// A second, UNDENIED port on the same LAN address, under the same profile:
+	// without this, a profile that simply broke all outbound would "prove" the
+	// claim.
+	outB, errB := dialUnderProfile(t, sb, py, host, portB)
+	switch {
+	case outB == "CONNECTED":
+	case outB == "TIMEOUT":
+		t.Skipf("the control dial to the undenied port %s:%d timed out — inconclusive "+
+			"(application firewall?); the deny verdict above is unusable without it", host, portB)
+	default:
+		t.Fatalf("the UNDENIED port %s:%d did not connect: %q (%v) — the profile broke "+
+			"outbound networking wholesale, so the deny verdict proves nothing\n--- profile ---\n%s",
+			host, portB, outB, errB, prof)
+	}
+	t.Logf("LAN %s: denied port %d %s, undenied port %d %s", host, portA, outA, portB, outB)
 }

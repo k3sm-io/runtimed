@@ -172,6 +172,109 @@ except Exception as e: print("ERR:%s"%e); sys.exit(4)
 	}
 }
 
+// tcpConnecterPy is the AF_INET/AF_INET6 connecter the port-deny tests run
+// INSIDE the sandbox. It distinguishes the three outcomes that matter. A timeout
+// is NOT a denial — it is the answer of a host that never replied — so it gets its
+// own exit code and never reads as success; a python-level error gets a fourth, so
+// a test can tell "the deny bit" from "the experiment did not run".
+//
+// It is shared between the loopback test below and the LAN test in
+// integration_darwin_test.go, which must exercise the SAME connecter against the
+// SAME generated profile shape: the whole point of the LAN test is that only the
+// dialled address differs, so a second copy of this script could drift into
+// proving something slightly else.
+const tcpConnecterPy = `import socket,sys
+host=sys.argv[1]; port=int(sys.argv[2])
+fam=socket.AF_INET6 if ":" in host else socket.AF_INET
+s=socket.socket(fam,socket.SOCK_STREAM); s.settimeout(5)
+try:
+    s.connect((host,port)); print("CONNECTED"); sys.exit(0)
+except PermissionError: print("DENIED:EPERM"); sys.exit(3)
+except ConnectionRefusedError: print("DENIED:ECONNREFUSED"); sys.exit(3)
+except socket.timeout: print("TIMEOUT"); sys.exit(5)
+except Exception as e: print("ERR:%r"%(e,)); sys.exit(4)
+`
+
+// listenTCPPair returns two live listeners on host and their ports; the returned
+// func closes them. Ephemeral ports (":0") keep the tests from colliding with
+// anything on the developer's machine and keep every port here a datum. It SKIPS
+// rather than fails when it cannot listen: on a LAN address that is a host
+// condition, not a defect in the code under test.
+func listenTCPPair(t *testing.T, network, host string) (int, int, func()) {
+	t.Helper()
+	var lns []net.Listener
+	var ports []int
+	for i := 0; i < 2; i++ {
+		ln, err := net.Listen(network, net.JoinHostPort(host, "0"))
+		if err != nil {
+			for _, l := range lns {
+				_ = l.Close()
+			}
+			t.Skipf("cannot listen on %s %s: %v", network, host, err)
+		}
+		lns = append(lns, ln)
+		_, p, err := net.SplitHostPort(ln.Addr().String())
+		if err != nil {
+			t.Fatalf("SplitHostPort(%s): %v", ln.Addr(), err)
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			t.Fatalf("port %q: %v", p, err)
+		}
+		ports = append(ports, n)
+		go func(l net.Listener) {
+			for {
+				c, e := l.Accept()
+				if e != nil {
+					return
+				}
+				_ = c.Close()
+			}
+		}(ln)
+	}
+	return ports[0], ports[1], func() {
+		for _, l := range lns {
+			_ = l.Close()
+		}
+	}
+}
+
+// portDenyProfile renders the real generated profile for a networked pod whose
+// only narrowing is a deny on port, writes it to a temp .sb, and returns both the
+// file path and the profile text.
+//
+// The real generated profile, not a minimal hand-written stand-in: what has to
+// hold is that the deny survives its position after the network stanza in the
+// artifact pods actually run under (SBPL is last-match-wins).
+func portDenyProfile(t *testing.T, port int) (string, string) {
+	t.Helper()
+	prof, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath:   "/var/lib/k3sm/pods/pod-portdeny/rootfs",
+		AllowNetwork:     true,
+		DeniedLocalPorts: []uint32{uint32(port)},
+	}, GenerateOptions{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	want := fmt.Sprintf("(deny network-outbound (remote ip \"localhost:%d\"))", port)
+	if !strings.Contains(prof, want) {
+		t.Fatalf("generated profile does not carry %s:\n%s", want, prof)
+	}
+	sb := filepath.Join(t.TempDir(), "portdeny.sb")
+	if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return sb, prof
+}
+
+// dialUnderProfile runs tcpConnecterPy under sandbox-exec with the profile at sb,
+// returning the connecter's trimmed verdict line and the process exit error.
+func dialUnderProfile(t *testing.T, sb, py, host string, port int) (string, error) {
+	t.Helper()
+	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, py, "-c", tcpConnecterPy, host, strconv.Itoa(port)).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
 // TestLocalPortDenyBlocksLoopbackConnect is the AF_INET counterpart of
 // TestSocketDenyBlocksFirmlinkConnect, and it carries the whole evidential weight
 // of denied_local_ports: it proves through real libsandbox that the emitted
@@ -185,9 +288,10 @@ except Exception as e: print("ERR:%s"%e); sys.exit(4)
 // test while making every networked pod useless — so the same profile, in the
 // same run, must refuse portA and allow portB.
 //
-// The profile is the real generated one, not a minimal hand-written stand-in:
-// what has to hold is that the deny survives its position after the network
-// stanza in the artifact pods actually run under (SBPL is last-match-wins).
+// It proves the deny at the LOOPBACK addresses only. The claim that `localhost`
+// in an SBPL filter reaches every address the host owns — including the LAN
+// address — is the separate, integration-tagged
+// TestLocalPortDenyBlocksLANConnect.
 func TestLocalPortDenyBlocksLoopbackConnect(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
@@ -197,93 +301,17 @@ func TestLocalPortDenyBlocksLoopbackConnect(t *testing.T) {
 		t.Skip("python3 not available for the connecter")
 	}
 
-	// The connecter distinguishes the three outcomes that matter. A timeout is
-	// NOT a denial — it is the answer of a host that never replied — so it gets
-	// its own exit code and fails the test rather than reading as success.
-	const connecter = `import socket,sys
-host=sys.argv[1]; port=int(sys.argv[2])
-fam=socket.AF_INET6 if ":" in host else socket.AF_INET
-s=socket.socket(fam,socket.SOCK_STREAM); s.settimeout(5)
-try:
-    s.connect((host,port)); print("CONNECTED"); sys.exit(0)
-except PermissionError: print("DENIED:EPERM"); sys.exit(3)
-except ConnectionRefusedError: print("DENIED:ECONNREFUSED"); sys.exit(3)
-except socket.timeout: print("TIMEOUT"); sys.exit(5)
-except Exception as e: print("ERR:%r"%(e,)); sys.exit(4)
-`
-
-	// listenPair returns two live listeners on host and their ports; the caller
-	// closes them. Ephemeral ports (":0") keep the test from colliding with
-	// anything on the developer's machine and keep every port here a datum.
-	listenPair := func(t *testing.T, network, host string) (int, int, func()) {
-		t.Helper()
-		var lns []net.Listener
-		var ports []int
-		for i := 0; i < 2; i++ {
-			ln, err := net.Listen(network, net.JoinHostPort(host, "0"))
-			if err != nil {
-				for _, l := range lns {
-					_ = l.Close()
-				}
-				t.Skipf("cannot listen on %s %s: %v", network, host, err)
-			}
-			lns = append(lns, ln)
-			_, p, err := net.SplitHostPort(ln.Addr().String())
-			if err != nil {
-				t.Fatalf("SplitHostPort(%s): %v", ln.Addr(), err)
-			}
-			n, err := strconv.Atoi(p)
-			if err != nil {
-				t.Fatalf("port %q: %v", p, err)
-			}
-			ports = append(ports, n)
-			go func(l net.Listener) {
-				for {
-					c, e := l.Accept()
-					if e != nil {
-						return
-					}
-					_ = c.Close()
-				}
-			}(ln)
-		}
-		return ports[0], ports[1], func() {
-			for _, l := range lns {
-				_ = l.Close()
-			}
-		}
-	}
-
 	run := func(t *testing.T, network, host string) {
 		t.Helper()
-		portA, portB, closeAll := listenPair(t, network, host)
+		portA, portB, closeAll := listenTCPPair(t, network, host)
 		defer closeAll()
 
-		prof, err := Generate(&runtimev1.SandboxProfile{
-			DataVolumePath:   "/var/lib/k3sm/pods/pod-portdeny/rootfs",
-			AllowNetwork:     true,
-			DeniedLocalPorts: []uint32{uint32(portA)},
-		}, GenerateOptions{})
-		if err != nil {
-			t.Fatalf("Generate: %v", err)
-		}
-		want := fmt.Sprintf("(deny network-outbound (remote ip \"localhost:%d\"))", portA)
-		if !strings.Contains(prof, want) {
-			t.Fatalf("generated profile does not carry %s:\n%s", want, prof)
-		}
-		sb := filepath.Join(t.TempDir(), "portdeny.sb")
-		if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		dial := func(port int) (string, error) {
-			out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, py, "-c", connecter, host, strconv.Itoa(port)).CombinedOutput()
-			return strings.TrimSpace(string(out)), err
-		}
+		sb, prof := portDenyProfile(t, portA)
 
 		// The denied port: must be refused, and refused by the SANDBOX. A
 		// TIMEOUT or a python-level ERR would mean the test proved nothing about
 		// the deny, so only an explicit DENIED verdict counts.
-		outA, errA := dial(portA)
+		outA, errA := dialUnderProfile(t, sb, py, host, portA)
 		if errA == nil {
 			t.Fatalf("connect to the DENIED port %d succeeded (FAIL-OPEN): %s\n--- profile ---\n%s", portA, outA, prof)
 		}
@@ -293,7 +321,7 @@ except Exception as e: print("ERR:%r"%(e,)); sys.exit(4)
 
 		// The undenied port, under the SAME profile: must still connect, or the
 		// deny is not port-precise and the network grant has been broken.
-		outB, errB := dial(portB)
+		outB, errB := dialUnderProfile(t, sb, py, host, portB)
 		if errB != nil || outB != "CONNECTED" {
 			t.Fatalf("connect to the UNDENIED port %d did not succeed: %q (%v)\n--- profile ---\n%s", portB, outB, errB, prof)
 		}
@@ -301,7 +329,7 @@ except Exception as e: print("ERR:%r"%(e,)); sys.exit(4)
 	}
 
 	t.Run("ipv4", func(t *testing.T) { run(t, "tcp4", "127.0.0.1") })
-	// IPv6 loopback is not guaranteed to be configured; listenPair skips if it
+	// IPv6 loopback is not guaranteed to be configured; listenTCPPair skips if it
 	// cannot listen. `localhost` in an SBPL filter is a host-family-blind name, so
 	// this asserts the same deny covers the v6 loopback where one exists.
 	t.Run("ipv6", func(t *testing.T) { run(t, "tcp6", "::1") })
