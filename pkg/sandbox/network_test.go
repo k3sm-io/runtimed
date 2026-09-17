@@ -434,17 +434,16 @@ func TestValidateNetworkScope(t *testing.T) {
 			profile: head + "(deny network-outbound (remote ip \"localhost:12379\"))\n",
 		},
 		{
-			// Documented LIMIT, pinned so nobody reads more assurance into this
-			// check than it gives: detection counts (allow …) directives only, so a
-			// per-IP shape spelled as a DENY passes here — even though libsandbox
-			// refuses to compile it just as it refuses the allow form (probed
-			// 2026-09-17: "host must be * or localhost in network address"). The
-			// backstop for that shape is TestGeneratedProfileAppliesOnDarwin, which
-			// feeds the generated profile to real libsandbox; this validator's job
-			// is unrequested or uncompilable GRANTS.
-			name:    "per-IP deny beside the stanza is not caught here",
+			// A per-IP shape spelled as a DENY is refused too, by the host-token
+			// rule: libsandbox refuses to compile it exactly as it refuses the allow
+			// form (probed 2026-09-17: "host must be * or localhost in network
+			// address"), so the profile would kill every pod carrying it at
+			// sandbox_apply. This case previously pinned the opposite — the gap that
+			// let the shape through — see TestValidateNetworkScopeRejectsPerIPDeny.
+			name:    "per-IP deny beside the stanza",
 			sp:      sp(true, false),
 			profile: head + networkStanza + "(deny network-outbound (remote ip \"127.0.0.1:2379\"))\n",
+			want:    ErrNetworkStanzaMismatch,
 		},
 	}
 
@@ -486,5 +485,128 @@ func TestGenerateSelfChecksNetworkScope(t *testing.T) {
 		if err := Validate(out); err != nil {
 			t.Fatalf("generated profile (network=%v egress=%v) failed Validate: %v", tc.network, tc.egress, err)
 		}
+	}
+}
+
+// TestValidateNetworkScopeRejectsPerIPDeny is the gate for the host-token rule:
+// a network filter naming an address literal is refused wherever it appears, on a
+// deny as readily as on an allow, and whether or not the pod asked for network.
+//
+// The rule closes a real gap rather than tightening a theoretical one. The check
+// used to count (allow …) directives only, so
+// (deny network-outbound (remote ip "127.0.0.1:2379")) — written by someone
+// believing they were subtracting authority — passed validation and then failed to
+// COMPILE at sandbox_apply, taking every pod that carried the profile with it. A
+// deny that cannot compile is not a narrowing; it is an outage.
+//
+// The acceptance cases are as load-bearing as the rejections: the port-only and
+// `localhost:<port>` forms are the sanctioned narrowing, and a rule that refused
+// them would have removed the only network tightening macOS 26 can express.
+func TestValidateNetworkScopeRejectsPerIPDeny(t *testing.T) {
+	const head = "(version 1)\n(deny default)\n(import \"system.sb\")\n"
+	sp := func(network bool) *runtimev1.SandboxProfile {
+		return &runtimev1.SandboxProfile{
+			DataVolumePath: egressDataVol,
+			AllowNetwork:   network,
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		sp      *runtimev1.SandboxProfile
+		profile string
+		want    error
+	}{
+		{
+			name:    "per-IP deny beside a valid stanza",
+			sp:      sp(true),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"127.0.0.1:2379\"))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			// The allow form was already refused (as an extra grant beside the
+			// stanza); pinned here so the new path cannot regress it by taking
+			// over the verdict and reporting something else.
+			name:    "per-IP allow beside a valid stanza",
+			sp:      sp(true),
+			profile: head + networkStanza + "(allow network-outbound (remote ip \"10.43.0.10:53\"))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			// An IPv6 literal is the same defect with a different spelling, and
+			// the one a "starts with a digit" heuristic would wave through.
+			name:    "IPv6-literal deny",
+			sp:      sp(true),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"::1:2379\"))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			name:    "link-local IPv6-literal deny",
+			sp:      sp(true),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"fe80::1:2379\"))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			// A hostname is refused for the same reason an address is: the
+			// grammar admits the two literal tokens and nothing else.
+			name:    "hostname deny",
+			sp:      sp(true),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"etcd.local:2379\"))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			// UNCONDITIONAL: no network was requested, so rules 1-3 never look at
+			// this profile at all — and it still must not carry a filter that
+			// cannot compile.
+			name:    "per-IP deny with no network request",
+			sp:      sp(false),
+			profile: head + "(deny network-outbound (remote ip \"127.0.0.1:2379\"))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			// Attributed to the directive that opened it: a filter indented under
+			// a multi-line deny block is checked, not skipped.
+			name:    "per-IP filter on a continuation line",
+			sp:      sp(false),
+			profile: head + "(deny network-outbound\n  (remote ip \"127.0.0.1:2379\")\n  )\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
+		{
+			// Port-only: the form the probe proved compiles and enforces.
+			name:    "port-only local filter",
+			sp:      sp(true),
+			profile: head + networkStanza + "(deny network-bind (local ip \"*:8899\"))\n",
+		},
+		{
+			name:    "the sanctioned localhost port deny",
+			sp:      sp(true),
+			profile: head + networkStanza + "(deny network-outbound (remote ip \"localhost:12379\"))\n",
+		},
+		{
+			// The AF_UNIX helper-socket block is a network directive carrying a
+			// non-address filter; the host rule must not read it as one.
+			name:    "af_unix deny block carries no address filter",
+			sp:      sp(false),
+			profile: head + "(deny network-outbound\n  (remote unix-socket (literal \"/var/lib/k3sm/run/netd.sock\"))\n  )\n",
+		},
+		{
+			// Rules, not prose: a commented-out per-IP filter is not a filter.
+			name:    "per-IP filter only inside a comment",
+			sp:      sp(false),
+			profile: head + ";; (deny network-outbound (remote ip \"127.0.0.1:2379\"))\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateNetworkScope(tc.sp, tc.profile)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("ValidateNetworkScope = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("ValidateNetworkScope = %v, want %v", err, tc.want)
+			}
+		})
 	}
 }
