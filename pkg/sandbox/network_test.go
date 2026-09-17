@@ -595,6 +595,17 @@ func TestValidateNetworkScopeRejectsPerIPDeny(t *testing.T) {
 			sp:      sp(false),
 			profile: head + ";; (deny network-outbound (remote ip \"127.0.0.1:2379\"))\n",
 		},
+		{
+			// A per-IP filter buried in a require-all, through the PUBLIC entry
+			// point and with no network request — so the host rule is the only
+			// thing that can produce this verdict. Without it the profile's bare
+			// allow would report ErrNetworkRulesUnrequested instead, which is a
+			// different sentinel and fails this row.
+			name:    "require-all wrapping a per-IP filter, no network request",
+			sp:      sp(false),
+			profile: head + "(allow network-outbound (require-all (local ip \"localhost:*\") (remote ip \"10.0.0.5:443\")))\n",
+			want:    ErrNetworkStanzaMismatch,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidateNetworkScope(tc.sp, tc.profile)
@@ -609,4 +620,78 @@ func TestValidateNetworkScopeRejectsPerIPDeny(t *testing.T) {
 			}
 		})
 	}
+
+	// The rows above judge whole profiles. These judge the host rule ALONE, and
+	// they have to: the shapes that must be ACCEPTED here are (allow …) forms
+	// that are not the generated stanza, so ValidateNetworkScope would refuse
+	// them under rules 1-3 no matter what the host rule decided — the very
+	// verdict this sub-table needs to see would be masked. Reading a green row
+	// here as "this profile is valid" would therefore be wrong: it says only
+	// "the host rule found nothing to object to".
+	//
+	// What they pin is the rule's PARSER, which has two jobs a whole-profile
+	// test cannot separate. It must find an address filter wherever it sits —
+	// nested inside require-all/require-not, and on a continuation line rather
+	// than the directive's own — because a filter that is simply not seen is
+	// indistinguishable from one that passed. And it must match ONLY the
+	// (remote ip "…") / (local ip "…") forms, because every other filter a
+	// network directive can carry, and every path a NEIGHBOURING directive on
+	// the same physical line can carry, may legitimately contain something that
+	// looks like an address.
+	t.Run("filter shapes", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			profile string
+			reject  bool
+		}{
+			{
+				// Nested one level down, beside a perfectly valid sibling filter.
+				name:    "require-all wrapping a per-IP filter",
+				profile: "(allow network-outbound (require-all (local ip \"localhost:*\") (remote ip \"10.0.0.5:443\")))\n",
+				reject:  true,
+			},
+			{
+				// The same wrapping with hosts the grammar admits — a real rule
+				// shape, and the one a blunt "this line mentions require-all"
+				// heuristic would have broken.
+				name:    "require-all with require-not and localhost hosts",
+				profile: "(allow network-outbound (require-all (local ip \"localhost:*\") (require-not (remote ip \"*:*\"))))\n",
+			},
+			{
+				// Wrapped AND split: the filter is on neither the directive's
+				// line nor the wrapper's.
+				name:    "wrapped per-IP filter across continuation lines",
+				profile: "(allow network-outbound\n  (require-all\n    (local ip \"localhost:*\")\n    (remote ip \"10.0.0.5:443\")))\n",
+				reject:  true,
+			},
+			{
+				// Two directives on one physical line, and the address-looking
+				// text belongs to the NON-network one. A subpath is not an
+				// address filter; a substring search for "10.0.0.5" would fail
+				// this row and a legitimate profile with it.
+				name:    "address-like literal in a neighbouring subpath",
+				profile: "(allow network-outbound) (allow file-read* (subpath \"/tmp/10.0.0.5\"))\n",
+			},
+			{
+				// The mirror: same one-line packing, but this time the network
+				// directive is the one carrying the bad filter, and it is second.
+				name:    "network directive sharing a line with a per-IP filter",
+				profile: "(allow file-read* (subpath \"/tmp\")) (allow network-outbound (remote ip \"10.0.0.5:443\"))\n",
+				reject:  true,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := validateNetworkFilterHosts(tc.profile)
+				if tc.reject {
+					if !errors.Is(err, ErrNetworkStanzaMismatch) {
+						t.Fatalf("validateNetworkFilterHosts = %v, want ErrNetworkStanzaMismatch\n--- profile ---\n%s", err, tc.profile)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("validateNetworkFilterHosts = %v, want nil\n--- profile ---\n%s", err, tc.profile)
+				}
+			})
+		}
+	})
 }
