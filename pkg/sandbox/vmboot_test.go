@@ -17,9 +17,11 @@ limitations under the License.
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -686,7 +688,11 @@ func TestReapOrphanVMsKillsARecordedInstance(t *testing.T) {
 	}
 	runDir := func(pod string) string { return filepath.Join(root, "run", "vm", pod) }
 	write := func(rec vmProcRecord) {
-		if err := os.MkdirAll(runDir(rec.PodID), 0o700); err != nil {
+		// Both fixtures are meant to be CLEARED, so both dirs carry the owner
+		// marker the sweep requires before any RemoveAll — exactly what
+		// spawnVMHost stamps before the record exists. (The unstamped case is
+		// TestVMReapDropNeverRemovesAnUnprovenRunDir's.)
+		if err := writeVMOwnerMarker(runDir(rec.PodID), rec.PodID); err != nil {
 			t.Fatalf("run dir: %v", err)
 		}
 		data, _ := json.Marshal(rec)
@@ -743,28 +749,277 @@ func TestClearOrphanRunDirIsBounded(t *testing.T) {
 		t.Fatalf("victim: %v", err)
 	}
 	b := NewVMBackend(WithStateRoot(root))
-	b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: outside})
+	if retire := b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: outside}); retire {
+		t.Error("an out-of-tree run dir reported retire-ok; its record would be dropped and the path never mentioned again")
+	}
 	if _, err := os.Stat(outside); err != nil {
 		t.Errorf("a run dir outside <root>/run was deleted: %v", err)
 	}
 
 	inside := filepath.Join(root, "run", "vm", "p")
-	if err := os.MkdirAll(inside, 0o700); err != nil {
+	if err := writeVMOwnerMarker(inside, "p"); err != nil {
 		t.Fatalf("inside: %v", err)
 	}
-	b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: inside})
+	if retire := b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: inside}); !retire {
+		t.Error("a contained, marked run dir did not report retire-ok")
+	}
 	if _, err := os.Stat(inside); !os.IsNotExist(err) {
 		t.Errorf("a run dir inside <root>/run survived: %v", err)
 	}
 
 	t.Run("a sibling whose name merely starts the same is not admitted", func(t *testing.T) {
 		sibling := filepath.Join(root, "run-evil")
-		if err := os.MkdirAll(sibling, 0o700); err != nil {
+		if err := writeVMOwnerMarker(sibling, "p"); err != nil {
 			t.Fatalf("sibling: %v", err)
 		}
-		b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: sibling})
+		// Marked AND same-prefix: the containment gate runs first, so the
+		// marker cannot buy a delete outside the run tree.
+		if retire := b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: sibling}); retire {
+			t.Error("a same-prefix sibling reported retire-ok")
+		}
 		if _, err := os.Stat(sibling); err != nil {
 			t.Errorf("the separator-aware bound admitted a same-prefix sibling: %v", err)
+		}
+	})
+
+	t.Run("a run dir that is already gone retires its record", func(t *testing.T) {
+		if retire := b.clearOrphanRunDir(vmProcRecord{PodID: "p", RunDir: filepath.Join(root, "run", "vm", "vanished")}); !retire {
+			t.Error("a record whose run dir does not exist was kept; it would re-warn forever over nothing")
+		}
+	})
+}
+
+// TestVMReapDropNeverRemovesAnUnprovenRunDir is the PROVENANCE gate on the
+// sweep's root-privileged recursive delete.
+//
+// A record is data. The drop classes that reach the delete need only a zero
+// start time or an empty process group, so containment to <state-root>/run is
+// the only thing a forged record has to satisfy to aim an os.RemoveAll — run as
+// root — at any path inside the daemon's own socket tree. The marker
+// spawnVMHost stamps is what the directory itself has to say; without it the
+// dir stays, and so does its record, because the record is the only pointer the
+// leak has left.
+func TestVMReapDropNeverRemovesAnUnprovenRunDir(t *testing.T) {
+	mkdir := func(t *testing.T, dir string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	// writeRecord lays down one record in root's store and returns its path.
+	// StartUnixNano is 0, the zero-identity class: it is dropped before any
+	// process probe, so these cases exercise the delete with no live-process
+	// seam at all.
+	writeRecord := func(t *testing.T, root, pod, runDir string) string {
+		t.Helper()
+		store := filepath.Join(root, VMReapSubdir)
+		mkdir(t, store)
+		data, err := json.Marshal(vmProcRecord{PodID: pod, Pgid: 900, StartUnixNano: 0, RunDir: runDir})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		path := filepath.Join(store, "900.json")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+		return path
+	}
+	sweep := func(t *testing.T, root string) string {
+		t.Helper()
+		var log bytes.Buffer
+		b := NewVMBackend(WithStateRoot(root), WithLogger(slog.New(slog.NewTextHandler(&log, nil))))
+		if err := b.ReapOrphanVMs(); err != nil {
+			t.Fatalf("ReapOrphanVMs: %v", err)
+		}
+		return log.String()
+	}
+	const unproven = "unproven provenance"
+
+	t.Run("an unmarked run dir is left in place and keeps its record", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "bare")
+		mkdir(t, dir)
+		recPath := writeRecord(t, root, "bare", dir)
+
+		log := sweep(t, root)
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("a run dir with no owner marker was removed as root on a record's say-so: %v", err)
+		}
+		if _, err := os.Stat(recPath); err != nil {
+			t.Errorf("the record was retired beside a dir the sweep refused to delete; the leak now has no pointer: %v", err)
+		}
+		if n := strings.Count(log, unproven); n != 1 {
+			t.Errorf("%d unproven-provenance warnings, want exactly 1; log: %s", n, log)
+		}
+	})
+
+	t.Run("a marker naming a different pod proves nothing", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "victim")
+		if err := writeVMOwnerMarker(dir, "victim"); err != nil {
+			t.Fatalf("marker: %v", err)
+		}
+		recPath := writeRecord(t, root, "attacker", dir)
+
+		log := sweep(t, root)
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("a record deleted a run dir stamped for a different pod: %v", err)
+		}
+		if _, err := os.Stat(recPath); err != nil {
+			t.Errorf("record retired on a mismatched marker: %v", err)
+		}
+		if n := strings.Count(log, unproven); n != 1 {
+			t.Errorf("%d unproven-provenance warnings, want exactly 1; log: %s", n, log)
+		}
+	})
+
+	t.Run("a matching marker clears the dir and retires the record", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "ours")
+		if err := writeVMOwnerMarker(dir, "ours"); err != nil {
+			t.Fatalf("marker: %v", err)
+		}
+		recPath := writeRecord(t, root, "ours", dir)
+
+		log := sweep(t, root)
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("a proven run dir survived the sweep (stat err %v); the next pod with that id would bind inside it", err)
+		}
+		if _, err := os.Stat(recPath); !os.IsNotExist(err) {
+			t.Errorf("a cleared record survived: %v", err)
+		}
+		if strings.Contains(log, unproven) {
+			t.Errorf("a proven dir warned about provenance: %s", log)
+		}
+	})
+
+	t.Run("a record whose run dir is already gone is retired", func(t *testing.T) {
+		root := t.TempDir()
+		recPath := writeRecord(t, root, "gone", filepath.Join(root, "run", "vm", "gone"))
+
+		log := sweep(t, root)
+		if _, err := os.Stat(recPath); !os.IsNotExist(err) {
+			t.Errorf("a record naming a nonexistent dir was kept; it would re-warn forever over nothing: %v", err)
+		}
+		if strings.Contains(log, unproven) {
+			t.Errorf("an absent dir warned about provenance: %s", log)
+		}
+	})
+
+	t.Run("a killed helper's unproven run dir survives and its record is kept", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, "run", "vm", "live")
+		mkdir(t, dir)
+		store := filepath.Join(root, VMReapSubdir)
+		mkdir(t, store)
+		data, err := json.Marshal(vmProcRecord{PodID: "live", Pgid: 900, StartUnixNano: 111, RunDir: dir})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		recPath := filepath.Join(store, "900.json")
+		if err := os.WriteFile(recPath, data, 0o600); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+		sig := &signalRecorder{}
+		var log bytes.Buffer
+		b := NewVMBackend(
+			WithStateRoot(root),
+			WithLogger(slog.New(slog.NewTextHandler(&log, nil))),
+			WithVMProcessSeams(nil, nil, nil, sig.send, nil,
+				func(int) ([]supervisor.ProcMember, bool) {
+					return []supervisor.ProcMember{{Pid: 900, StartUnixNano: 111}}, true
+				}),
+		)
+		if err := b.ReapOrphanVMs(); err != nil {
+			t.Fatalf("ReapOrphanVMs: %v", err)
+		}
+
+		// The KILL is unconditional — an orphaned helper holding a live VM is
+		// killed whatever its directory can prove. Only the delete is gated.
+		sig.mu.Lock()
+		sent := append([]int(nil), sig.sent...)
+		sig.mu.Unlock()
+		if len(sent) != 1 || sent[0] != 900 {
+			t.Errorf("signalled %v, want [900]: the provenance gate must not stop the kill", sent)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("a killed helper's unproven run dir was removed: %v", err)
+		}
+		if _, err := os.Stat(recPath); err != nil {
+			t.Errorf("the record was retired beside an unproven dir: %v", err)
+		}
+		if n := strings.Count(log.String(), unproven); n != 1 {
+			t.Errorf("%d unproven-provenance warnings, want exactly 1; log: %s", n, log.String())
+		}
+	})
+}
+
+// TestWriteVMOwnerMarker pins the stamp itself: it creates the dir, writes the
+// pod id 0600, and is idempotent — a re-stamp of a live dir (a re-created pod at
+// the same path) must not fail or leave a second identity behind.
+func TestWriteVMOwnerMarker(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "run", "vm", "p1")
+	if err := writeVMOwnerMarker(dir, "p1"); err != nil {
+		t.Fatalf("writeVMOwnerMarker: %v", err)
+	}
+	marker := filepath.Join(dir, vmOwnerMarkerName)
+	info, err := os.Stat(marker)
+	if err != nil {
+		t.Fatalf("the marker was not created: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("marker mode %o, want 600: it names a pod inside a daemon-private tree", got)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read the marker: %v", err)
+	}
+	if string(data) != "p1" {
+		t.Errorf("marker content %q, want the bare pod id %q", data, "p1")
+	}
+	if !vmRunDirIsOwnedBy(dir, "p1") {
+		t.Error("a freshly stamped dir did not prove its own ownership")
+	}
+	if vmRunDirIsOwnedBy(dir, "p2") {
+		t.Error("a dir stamped for p1 proved ownership for p2")
+	}
+
+	if err := writeVMOwnerMarker(dir, "p1"); err != nil {
+		t.Fatalf("re-stamp: %v", err)
+	}
+	data, err = os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read after re-stamp: %v", err)
+	}
+	if string(data) != "p1" {
+		t.Errorf("after a re-stamp the marker is %q, want %q", data, "p1")
+	}
+
+	t.Run("a trailing newline is tolerated, other padding is not", func(t *testing.T) {
+		if err := os.WriteFile(marker, []byte("p1\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if !vmRunDirIsOwnedBy(dir, "p1") {
+			t.Error("a hand-echoed marker did not match")
+		}
+		if err := os.WriteFile(marker, []byte(" p1"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if vmRunDirIsOwnedBy(dir, "p1") {
+			t.Error("a padded marker matched; the comparison must be exact")
+		}
+	})
+
+	t.Run("an empty pod id and a relative dir are refused", func(t *testing.T) {
+		if err := writeVMOwnerMarker(filepath.Join(root, "run", "vm", "p2"), ""); err == nil {
+			t.Error("stamped a dir with an empty pod id, which proves nothing to any later sweep")
+		}
+		if err := writeVMOwnerMarker("relative/run", "p2"); err == nil {
+			t.Error("stamped a relative path; it would resolve against the daemon's cwd")
+		}
+		if vmRunDirIsOwnedBy(t.TempDir(), "") {
+			t.Error("an empty pod id matched a dir with no marker at all")
 		}
 	})
 }

@@ -222,10 +222,21 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 		consolePath:   consolePath,
 		tail:          tail,
 	}
+	// Stamp the run dir BEFORE the record, so "a record exists" implies "its run
+	// dir carries our marker" at every instant — the implication the startup
+	// sweep's refusal to RemoveAll an unproven dir rests on (clearOrphanRunDir).
+	// The reverse order would admit a crash window whose record named a dir no
+	// later sweep could ever prove, i.e. could ever clean up. A stamp failure
+	// fails the boot for the same reason a record failure does.
+	if err := writeVMOwnerMarker(vp.runDir, vp.podID); err != nil {
+		b.hardStop(vp)
+		return nil, err
+	}
 	// Record before readiness. A daemon SIGKILLed during a boot leaves a helper
 	// holding a live VM, and the startup sweep can only kill what a record names
 	// — so the window between spawn and record must be as close to zero as the
-	// spawn's own return allows.
+	// spawn's own return allows (the stamp above is two syscalls of it, and buys
+	// the sweep the only provenance proof it has).
 	if err := b.recordVMProc(vp); err != nil {
 		b.hardStop(vp)
 		return nil, err
