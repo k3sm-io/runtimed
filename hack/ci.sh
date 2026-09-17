@@ -32,6 +32,12 @@ if [ -n "$go_pkgs" ]; then
 	echo "==> [runtimed] go build"; CGO_ENABLED=$CGO go build ./...
 	echo "==> [runtimed] go test";  CGO_ENABLED=$CGO go test ./...
 
+	# The deny-set completeness verifier parses the packages above; it sits
+	# inside the package guard so a tree with no packages skips it like the rest.
+	echo "==> [runtimed] work-dir deny-set completeness"
+	hack/verify-workdir-subdirs.sh
+	hack/verify-workdir-subdirs.sh --self-test
+
 	# The guest init (cmd/k3sm-guest-init) is PID 1 of a vm-pod's micro-VM and
 	# is GOOS=linux only, so the darwin build above never compiles it. This
 	# cross-lane is the only thing standing between an unrelated change and a
