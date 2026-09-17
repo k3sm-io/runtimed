@@ -345,9 +345,14 @@ type GenerateOptions struct {
 // choice: macOS 26 Seatbelt accepts only `localhost` or `*` as the host in a
 // network filter (see network.go), so `localhost:<port>` matches that port on
 // every address the host owns — loopback, the lo0-aliased pod addresses, the LAN
-// address alike. A Service VIP that happens to listen on the same port number is
-// therefore ALSO unreachable from a confined pod. This is a same-host
-// defence-in-depth layer over a shared-uid process, not per-pod isolation.
+// address alike. The reach is measured rather than assumed:
+// TestLocalPortDenyBlocksLoopbackConnect proves it at 127.0.0.1 and ::1, and the
+// integration-tagged TestLocalPortDenyBlocksLANConnect proves it at the host's own
+// non-loopback IPv4 address, where a dial to the denied port is refused with
+// EPERM while an undenied port on the same address still connects. A Service VIP
+// that happens to listen on the same port number is therefore ALSO unreachable
+// from a confined pod. This is a same-host defence-in-depth layer over a
+// shared-uid process, not per-pod isolation.
 //
 // Rule order is security-critical because SBPL is last-match-wins. Generate emits
 // (in increasing precedence): the OS/extra-path allows + the network allows; then
