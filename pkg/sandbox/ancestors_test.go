@@ -342,6 +342,15 @@ func TestAncestorMetadataGrantsStatNotList(t *testing.T) {
 		t.Fatalf("the listing failed, but not on the sandbox deny (want EPERM): %v\n%s", err, out)
 	}
 
+	// A sibling pod's directory: not even stat-able. The grant is one literal
+	// per ancestor node, so the pods root itself is visible and nothing beside
+	// the pod's own path under it is — the cross-pod existence oracle a
+	// (subpath <podsRoot>) grant would open, checked under the real engine.
+	sibling := filepath.Join(podsRoot, "pod-sibling")
+	if out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, "/bin/test", "-e", sibling).CombinedOutput(); err == nil {
+		t.Fatalf("stat of a sibling pod's directory %s SUCCEEDED under the generated profile — the ancestor grant must be literal, never subpath:\n%s\n--- profile ---\n%s", sibling, out, prof)
+	}
+
 	// Ablation: the stanza IS the reason the stat succeeds. Cut it from the
 	// rendered profile (it is emitted last for a profile with no credential
 	// sub-scope) and the same stat is denied — without this the assertion above
