@@ -42,14 +42,16 @@ const (
 
 // The DHCP exchange's budget. A DHCP solicitation is a UDP broadcast and is
 // entitled to be lost, so a single timeout is not a failure — RFC 2131 says
-// retransmit. dhcpAttempts bounded by dhcpAttemptTimeout is the whole budget
-// before the boot is failed; it is short because the pod is not up until it
-// finishes and the host has its own boot deadline waiting on Health.
+// retransmit, and guestinit.DHCPRetransmitSchedule says when.
+//
+// dhcpTotalBudget is the WHOLE budget before the boot is failed: every
+// retransmission, every OFFER wait and the ACK wait together, not a per-attempt
+// timeout. It is short because the pod is not up until the exchange finishes
+// and the host has its own boot deadline waiting on Health.
 const (
-	dhcpAttempts       = 4
-	dhcpAttemptTimeout = 3 * time.Second
-	dhcpClientPort     = 68
-	dhcpServerPort     = 67
+	dhcpTotalBudget = 12 * time.Second
+	dhcpClientPort  = 68
+	dhcpServerPort  = 67
 )
 
 // GuestNetwork is the configuration this guest applied to itself.
@@ -352,23 +354,35 @@ func dhcpLease(log *slog.Logger, link string, mac []byte) (guestinit.Lease, erro
 	}
 	bcast := &unix.SockaddrInet4{Port: dhcpServerPort, Addr: [4]byte{255, 255, 255, 255}}
 
+	// ONE xid for every DISCOVER below, not one per round. RFC 2131 §4.4.1: a
+	// retransmission carries the transaction id of the message it retransmits.
+	// So an OFFER answering the FIRST DISCOVER is still ours when it arrives
+	// during the second round's wait — with a fresh xid per send it would be
+	// parsed, found not to match, and discarded as somebody else's, throwing
+	// away the exchange that actually worked.
+	xid := rand.Uint32()
+	deadline := time.Now().Add(dhcpTotalBudget)
+	schedule := guestinit.DHCPRetransmitSchedule(dhcpTotalBudget)
+
 	var lastErr error
-	for attempt := 1; attempt <= dhcpAttempts; attempt++ {
-		xid := rand.Uint32()
-		lease, err := dhcpRound(fd, bcast, xid, mac)
+	for i, wait := range schedule {
+		lease, err := dhcpRound(fd, bcast, xid, mac, wait, deadline)
 		if err == nil {
 			return lease, nil
 		}
 		lastErr = err
-		log.Warn("dhcp attempt did not produce a lease; retrying",
-			"link", link, "attempt", attempt, "of", dhcpAttempts, "err", err)
+		log.Warn("dhcp round did not produce a lease; retransmitting DHCPDISCOVER",
+			"link", link, "round", i+1, "of", len(schedule), "wait", wait, "err", err)
 	}
-	return guestinit.Lease{}, fmt.Errorf("%w: no lease on %s after %d attempts: %w",
-		guestinit.ErrDHCP, link, dhcpAttempts, lastErr)
+	return guestinit.Lease{}, fmt.Errorf("%w: no lease on %s after %d rounds within %s: %w",
+		guestinit.ErrDHCP, link, len(schedule), dhcpTotalBudget, lastErr)
 }
 
-// dhcpRound is one DISCOVER→OFFER→REQUEST→ACK cycle within the attempt budget.
-func dhcpRound(fd int, to *unix.SockaddrInet4, xid uint32, mac []byte) (guestinit.Lease, error) {
+// dhcpRound is one DISCOVER→OFFER→REQUEST→ACK cycle. wait bounds the
+// DISCOVER→OFFER leg — it is this round's step of the retransmission schedule —
+// and deadline bounds the whole exchange, so neither leg can push the guest past
+// the budget the schedule sums to.
+func dhcpRound(fd int, to *unix.SockaddrInet4, xid uint32, mac []byte, wait time.Duration, deadline time.Time) (guestinit.Lease, error) {
 	discover, err := guestinit.BuildDiscover(xid, mac)
 	if err != nil {
 		return guestinit.Lease{}, err
@@ -376,7 +390,7 @@ func dhcpRound(fd int, to *unix.SockaddrInet4, xid uint32, mac []byte) (guestini
 	if err := unix.Sendto(fd, discover, 0, to); err != nil {
 		return guestinit.Lease{}, fmt.Errorf("send DHCPDISCOVER: %w", err)
 	}
-	offer, err := awaitReply(fd, xid, mac, guestinit.IsOffer)
+	offer, err := awaitReply(fd, xid, mac, guestinit.IsOffer, capToDeadline(wait, deadline))
 	if err != nil {
 		return guestinit.Lease{}, err
 	}
@@ -388,7 +402,13 @@ func dhcpRound(fd int, to *unix.SockaddrInet4, xid uint32, mac []byte) (guestini
 	if err := unix.Sendto(fd, request, 0, to); err != nil {
 		return guestinit.Lease{}, fmt.Errorf("send DHCPREQUEST: %w", err)
 	}
-	ack, err := awaitReply(fd, xid, mac, guestinit.IsAck)
+	// The REQUEST→ACK leg is not part of the retransmission schedule — the
+	// schedule governs the broadcast solicitation, and a server that has
+	// already offered is talking. It still gets a BOUND, taken from whatever of
+	// the total budget the OFFER waits left: an unbounded wait here would sit
+	// on a server that offered and then went quiet until the host's own boot
+	// deadline killed the VM, which reports as a dead pod rather than a slow one.
+	ack, err := awaitReply(fd, xid, mac, guestinit.IsAck, time.Until(deadline))
 	if err != nil {
 		return guestinit.Lease{}, err
 	}
@@ -409,16 +429,30 @@ func dhcpRound(fd int, to *unix.SockaddrInet4, xid uint32, mac []byte) (guestini
 	return ack, nil
 }
 
-// awaitReply reads datagrams until one matches want, or the attempt's budget is
-// spent. A NAK ends the round immediately: the server has refused, and waiting
-// out the timeout would only delay the retry.
-func awaitReply(fd int, xid uint32, mac []byte, want func(byte) bool) (guestinit.Lease, error) {
-	deadline := time.Now().Add(dhcpAttemptTimeout)
+// capToDeadline clamps a scheduled wait to what is left of the whole exchange's
+// budget. The schedule's waits sum to that budget, so this only ever matters
+// when an earlier leg overran its own step — but without it a round could spend
+// past the deadline the host is timing.
+func capToDeadline(wait time.Duration, deadline time.Time) time.Duration {
+	if left := time.Until(deadline); left < wait {
+		return left
+	}
+	return wait
+}
+
+// awaitReply reads datagrams until one matches want, or budget is spent. A NAK
+// ends the round immediately: the server has refused, and waiting out the
+// timeout would only delay the retransmission.
+func awaitReply(fd int, xid uint32, mac []byte, want func(byte) bool, budget time.Duration) (guestinit.Lease, error) {
+	if budget <= 0 {
+		return guestinit.Lease{}, fmt.Errorf("%w: the exchange's budget is spent", guestinit.ErrDHCP)
+	}
+	deadline := time.Now().Add(budget)
 	buf := make([]byte, 1500)
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return guestinit.Lease{}, fmt.Errorf("%w: no reply within %s", guestinit.ErrDHCP, dhcpAttemptTimeout)
+			return guestinit.Lease{}, fmt.Errorf("%w: no reply within %s", guestinit.ErrDHCP, budget)
 		}
 		tv := unix.NsecToTimeval(int64(remaining))
 		if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
