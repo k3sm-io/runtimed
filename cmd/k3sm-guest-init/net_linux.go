@@ -20,6 +20,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -489,6 +490,12 @@ func awaitReply(fd int, xid uint32, mac []byte, want func(byte) bool, budget tim
 			return guestinit.Lease{}, fmt.Errorf("set the dhcp receive timeout: %w", err)
 		}
 		n, _, err := unix.Recvfrom(fd, buf, 0)
+		if errors.Is(err, unix.EINTR) {
+			// A signal interrupted the read (PID 1 gets SIGCHLD from its reaper);
+			// the datagram, if any, is still queued. Read again within the same
+			// budget rather than counting the round as unanswered.
+			continue
+		}
 		if err != nil {
 			return guestinit.Lease{}, fmt.Errorf("%w: receive: %w", guestinit.ErrDHCP, err)
 		}
