@@ -20,11 +20,14 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"os"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -85,6 +88,18 @@ func configureNetwork(log *slog.Logger) (GuestNetwork, error) {
 	if err := linkUp(guestNICName); err != nil {
 		return GuestNetwork{}, fmt.Errorf("bring %s up: %w", guestNICName, err)
 	}
+	// The host attaches the virtio port a moment after IFF_UP, and a frame sent
+	// before carrier is dropped in the guest; see guestinit.AwaitCarrier for the
+	// wait and its bound. Running out of bound is not fatal: the retransmission
+	// schedule in dhcpLease covers a link that never reports carrier.
+	start := time.Now()
+	err := guestinit.AwaitCarrier(func() (bool, error) { return linkCarrier(guestNICName) },
+		guestinit.CarrierBound, guestinit.CarrierPoll, time.Sleep)
+	if err != nil {
+		log.Warn("proceeding without carrier on the guest link", "link", guestNICName, "waited", time.Since(start), "err", err)
+	} else {
+		log.Info("guest link has carrier", "link", guestNICName, "waited", time.Since(start))
+	}
 	mac, err := linkHardwareAddr(guestNICName)
 	if err != nil {
 		return GuestNetwork{}, err
@@ -141,11 +156,27 @@ func linkUp(name string) error {
 	if flags&unix.IFF_UP != 0 {
 		return nil
 	}
-	ifr.SetUint16(flags | unix.IFF_UP | unix.IFF_RUNNING)
+	// Only IFF_UP is asked for. IFF_RUNNING mirrors the link's operational
+	// state and is the kernel's to set; a value written here is ignored.
+	ifr.SetUint16(flags | unix.IFF_UP)
 	if err := unix.IoctlIfreq(fd, unix.SIOCSIFFLAGS, ifr); err != nil {
 		return fmt.Errorf("set %s up: %w", name, err)
 	}
 	return nil
+}
+
+// linkCarrier reports whether a link has carrier, read from sysfs, which is
+// the driver's own carrier bit. It is deliberately not IFF_RUNNING: that flag
+// follows the operational state the kernel's link watch derives from carrier
+// some tens of milliseconds later, and a wait keyed on it paid that lag on a
+// third of boots while the link was already forwarding. The file is readable
+// only once the link is up, which linkUp has ensured by the time this runs.
+func linkCarrier(name string) (bool, error) {
+	b, err := os.ReadFile("/sys/class/net/" + name + "/carrier")
+	if err != nil {
+		return false, fmt.Errorf("read carrier of %s: %w", name, err)
+	}
+	return strings.TrimSpace(string(b)) == "1", nil
 }
 
 // linkHardwareAddr reads a link's MAC, which the DHCP client sends as chaddr and
@@ -459,6 +490,12 @@ func awaitReply(fd int, xid uint32, mac []byte, want func(byte) bool, budget tim
 			return guestinit.Lease{}, fmt.Errorf("set the dhcp receive timeout: %w", err)
 		}
 		n, _, err := unix.Recvfrom(fd, buf, 0)
+		if errors.Is(err, unix.EINTR) {
+			// A signal interrupted the read (PID 1 gets SIGCHLD from its reaper);
+			// the datagram, if any, is still queued. Read again within the same
+			// budget rather than counting the round as unanswered.
+			continue
+		}
 		if err != nil {
 			return guestinit.Lease{}, fmt.Errorf("%w: receive: %w", guestinit.ErrDHCP, err)
 		}
