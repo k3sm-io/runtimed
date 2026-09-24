@@ -65,6 +65,8 @@ limitations under the License.
 // than spec fields. They are exported here (SpecShareTag, RosettaShareTag and
 // friends) so the host-side VM builder imports them instead of respelling the
 // literals — a disagreement then fails to compile rather than failing to boot.
+// The ownership sidecar's name in the spec share (OwnershipSidecarName) is the
+// same kind of convention.
 //
 // # Known ceilings (stated, not worked around)
 //

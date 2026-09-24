@@ -256,6 +256,13 @@ type VMContainer struct {
 	GID int64
 	// SupplementalGIDs are the additional groups, including the pod fsGroup.
 	SupplementalGIDs []int64
+	// OwnershipPath is the HOST path of the ownership sidecar for the tree
+	// materialized into this container's rootfs share, or empty when this
+	// container materialized none. CreateVM stages it into the k3sm.spec share
+	// as guestinit.OwnershipSidecarName(RootfsTag) — see stageOwnershipSidecars.
+	// It never crosses as a path: the guest reads the staged copy by its
+	// derived name.
+	OwnershipPath string
 }
 
 // VMBackend is the Virtualization.framework micro-VM isolation backend —
