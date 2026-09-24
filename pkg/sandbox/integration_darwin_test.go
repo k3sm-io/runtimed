@@ -342,10 +342,7 @@ func TestLocalPortDenyBlocksLANConnect(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
 	}
-	py, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available for the connecter")
-	}
+	bin := buildTCPConnecter(t)
 	host := firstLANIPv4(t)
 	if host == "" {
 		t.Skip("no non-loopback IPv4 interface address on this host")
@@ -353,12 +350,12 @@ func TestLocalPortDenyBlocksLANConnect(t *testing.T) {
 
 	portA, portB, closeAll := listenTCPPair(t, "tcp4", host)
 	defer closeAll()
-	sb, prof := portDenyProfile(t, portA)
+	sb, prof := portDenyProfile(t, portA, filepath.Dir(bin))
 
 	// The denied port at the LAN address. EPERM is the claim holding: the filter
 	// named `localhost` and the sandbox applied it to an address that is not
 	// loopback at all.
-	outA, errA := dialUnderProfile(t, sb, py, host, portA)
+	outA, errA := dialUnderProfile(t, sb, bin, host, portA)
 	switch {
 	case outA == "CONNECTED":
 		t.Fatalf("the localhost port deny did NOT reach the LAN address %s:%d — "+
@@ -378,7 +375,7 @@ func TestLocalPortDenyBlocksLANConnect(t *testing.T) {
 	// A second, UNDENIED port on the same LAN address, under the same profile:
 	// without this, a profile that simply broke all outbound would "prove" the
 	// claim.
-	outB, errB := dialUnderProfile(t, sb, py, host, portB)
+	outB, errB := dialUnderProfile(t, sb, bin, host, portB)
 	switch {
 	case outB == "CONNECTED":
 	case outB == "TIMEOUT":
