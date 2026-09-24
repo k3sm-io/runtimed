@@ -33,8 +33,9 @@ type recordingObserver struct {
 	mu      sync.Mutex
 	changes []IndexChange
 	// reenter, when set, calls back into the index from inside the callback.
-	// FileIndex takes no lock, so this must not deadlock — which is the property
-	// IndexObserver documents and this proves.
+	// Readers take no lock (only writers hold a stripe across the callback), so
+	// a read from here must not deadlock — which is the property IndexObserver
+	// documents and this proves.
 	reenter func()
 }
 

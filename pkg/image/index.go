@@ -23,12 +23,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -151,17 +153,50 @@ var ErrIndexDigestMismatch = errors.New("image: the index entry resolves to a di
 // image's own config was checked against the platform policy and every blob was
 // committed digest-verified). Nothing derived from registry bytes at LOOKUP time
 // ever enters the decision. Entries are written atomically (temp + rename), so a
-// crashed write cannot leave a truncated record; concurrent writers of the same
-// key race on the rename and are harmless (identical content).
+// crashed write cannot leave a truncated record.
 //
-// A FileIndex is safe for concurrent use.
+// # Concurrent writers of one key
+//
+// Concurrent writers of the SAME (reference x platform) key are serialized: each
+// Record and Remove holds that key's stripe lock across its whole
+// commit-then-notify pair (see stripeFor). Two things depend on it. The commit
+// goes through a temp name derived from the key, so two unserialized writers
+// would share one temp and the second rename would fail with ENOENT, failing a
+// pull that had succeeded. And the last writer to release the stripe is also
+// the last to notify, so the final notification an observer receives for a key
+// describes what that key holds on disk.
+//
+// Serialization is not agreement. Two pulls of a MUTABLE tag whose resolution
+// moved between them record possibly different manifests, and the outcome is
+// last-write-wins: the entry is whichever commit ran last, not whichever pull
+// resolved last. ErrIndexDigestMismatch remains the guard for a caller that
+// reads an entry and then acts on it — it re-checks the digest it read rather
+// than trusting the key to have held still.
+//
+// A FileIndex is safe for concurrent use. It must not be copied after first use.
 type FileIndex struct {
 	dir string
 	// observer is notified after every committed mutation (WithIndexObserver).
-	// It is set once at construction and never afterwards, which is what lets
-	// notify run without a lock on the write path of every pull. Nil is the
-	// default and means no notification at all.
+	// It is set once at construction and never afterwards, so reading it needs
+	// no lock. Nil is the default and means no notification at all.
 	observer IndexObserver
+	// stripes serialize same-key writers (see stripeFor). A fixed array rather
+	// than a per-key map: it never grows, needs no eviction, and two keys that
+	// share a bucket merely serialize with each other, which costs a little
+	// parallelism and no correctness.
+	stripes [indexStripes]sync.Mutex
+}
+
+// indexStripes is the number of writer lock buckets. Index writes are a handful
+// per pull, so 32 buckets make cross-key contention negligible.
+const indexStripes = 32
+
+// stripeFor returns the writer lock for the entry file name (entryName), so
+// every writer of one key contends on one mutex.
+func (x *FileIndex) stripeFor(name string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name)) // hash.Hash.Write never returns an error
+	return &x.stripes[h.Sum32()%indexStripes]
 }
 
 // NewFileIndex returns the on-disk index for cache, creating its directory
@@ -345,7 +380,17 @@ func entryName(ref string, p Platform) string {
 // supplied digest. A half-recorded manifest is worse than none — an export would
 // emit bytes under a digest nothing checked — so the pair is validated here, at
 // the one place entries are written, rather than at each reader.
+//
+// Concurrent Records (and Removes) of one key are serialized, each holding the
+// key's stripe across both its commit and its notification; see FileIndex
+// §Concurrent writers of one key for what that does and does not promise.
 func (x *FileIndex) Record(ctx context.Context, e IndexEntry) error {
+	// The stripe is keyed by the same normalised name record commits to
+	// (entryName normalises the platform), so every spelling of one key takes
+	// one lock.
+	mu := x.stripeFor(entryName(e.Reference, e.Platform))
+	mu.Lock()
+	defer mu.Unlock()
 	p, err := x.record(ctx, e)
 	if err != nil {
 		return err
@@ -353,6 +398,9 @@ func (x *FileIndex) Record(ctx context.Context, e IndexEntry) error {
 	// AFTER the commit and after the write's os.Root is closed: an observer is
 	// told about a change that has already happened, so reading the index back
 	// on receipt can only ever see at least what it was told (see IndexObserver).
+	// STILL under the stripe: a same-key writer cannot commit between this
+	// commit and this notification, so notifications for a key arrive in commit
+	// order and the last one describes the entry on disk.
 	x.notify(IndexChange{
 		Op:         IndexRecorded,
 		Reference:  e.Reference,
@@ -431,9 +479,19 @@ func (x *FileIndex) record(ctx context.Context, e IndexEntry) (Platform, error) 
 // previous entry or none — never a truncated one, which would read back as
 // corrupt and take out the reference it describes.
 //
+// The temp name is DERIVED from the entry name, so it is shared by every writer
+// of the key. The caller must hold the key's stripe (stripeFor); that is what
+// makes the temp exclusively this write's between create and rename, and what
+// makes the deferred Remove below safe (it cannot unlink another writer's temp).
+// The stripe is an in-process lock, which suffices because only the daemon
+// writes here (FileIndex §Single-writer daemon authority).
+//
 // A crash between create and rename leaves a ".index-" temp behind. It is inert
 // — no lookup can name it, since entry names are hashes — and the next write for
 // the same key reuses and replaces it, so it is bounded by the number of keys.
+// That reuse is why the open is O_TRUNC and not O_EXCL: under the stripe O_EXCL
+// would add no exclusion, and it would turn a crash leftover into a permanent
+// refusal to write that key.
 func (x *FileIndex) commit(root *os.Root, name string, buf []byte) error {
 	tmp := ".index-" + name
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -555,6 +613,12 @@ func (x *FileIndex) Get(ctx context.Context, ref string, p Platform) (IndexEntry
 // layer is where "the caller asked to remove a specific name that does not
 // exist" becomes NOT_FOUND; at this layer the removal simply had nothing to do.
 func (x *FileIndex) Remove(ctx context.Context, ref string, p Platform) (bool, error) {
+	// Same stripe as Record for this key, held across the unlink AND its
+	// notification, so a racing Record and Remove notify in the order they hit
+	// the disk (see FileIndex §Concurrent writers of one key).
+	mu := x.stripeFor(entryName(ref, p))
+	mu.Lock()
+	defer mu.Unlock()
 	removed, err := x.remove(ctx, ref, p)
 	if err != nil || !removed {
 		// A key that was not there is not a change: see IndexRemoved.
