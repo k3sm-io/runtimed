@@ -94,9 +94,14 @@ type IndexChange struct {
 //
 // ImageIndexChanged is called SYNCHRONOUSLY, on the goroutine that performed the
 // mutation, after the mutation is committed and after every file handle the
-// mutation used is closed. It holds no lock of this package's — FileIndex takes
-// none, its writes being atomic temp+rename — so an implementation may call back
-// into the index (List, Lookup) without deadlocking.
+// mutation used is closed. It runs holding the mutated key's WRITER stripe (see
+// FileIndex §Concurrent writers of one key), which is what orders a key's
+// notifications by commit: the last one an observer receives for a key
+// describes the entry on disk. Readers take no lock, so an implementation may
+// call back into the index's read methods (List, Lookup, Get, Resolve) without
+// deadlocking. It must NOT call Record or Remove: a same-key call would
+// self-deadlock, and a different-key call can deadlock against another writer
+// holding the stripes the other way round.
 //
 // It must NOT BLOCK. A pull, a load and an untag all sit behind it, so an
 // observer that does slow work inline stalls the RPC that caused the change. An
@@ -119,9 +124,8 @@ type FileIndexOption func(*FileIndex)
 // WithIndexObserver notifies obs after every committed index mutation.
 //
 // It is a CONSTRUCTION-time option and there is deliberately no setter: the
-// observer is then immutable for the index's lifetime, which is what makes the
-// notification path lock-free and race-free without a mutex on the hot path of
-// every pull. A daemon has exactly one embedder, wired once at startup, so the
+// observer is then immutable for the index's lifetime, so reading it needs no
+// synchronization on the hot path of every pull. A daemon has exactly one embedder, wired once at startup, so the
 // flexibility a setter would buy is flexibility nothing needs.
 //
 // A nil obs is the default and disables notification entirely.
@@ -135,7 +139,8 @@ func WithIndexObserver(obs IndexObserver) FileIndexOption {
 // its os.Root has been closed, which is the whole reason those mutators are thin
 // wrappers around unexported bodies: a notification fired from inside the write
 // would run with the index directory still open and, more importantly, would run
-// before the mutation was structurally complete.
+// before the mutation was structurally complete. The mutators call it while
+// still holding the key's writer stripe (see IndexObserver).
 func (x *FileIndex) notify(c IndexChange) {
 	if x.observer == nil {
 		return
