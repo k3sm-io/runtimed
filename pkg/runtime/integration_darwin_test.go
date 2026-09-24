@@ -87,7 +87,7 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := New(Config{Root: root, RuntimeVersion: "test"}, Deps{
+	rt, err := New(Config{Root: root, RuntimeVersion: "test", PodLogsDir: filepath.Join(root, "podlogs")}, Deps{
 		Cache:   cache,
 		Backend: backend,
 		Spawner: supervisor.PosixSpawner{},
@@ -225,7 +225,7 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 	}
 	// Deps carries NO Puller and NO Unpacker: New builds the daemon's own pair
 	// over one cache, which is the wiring this acceptance is about.
-	rt, err := New(Config{Root: root, RuntimeVersion: "test"}, Deps{
+	rt, err := New(Config{Root: root, RuntimeVersion: "test", PodLogsDir: filepath.Join(root, "podlogs")}, Deps{
 		Cache:   cache,
 		Backend: backend,
 		Spawner: supervisor.PosixSpawner{},
