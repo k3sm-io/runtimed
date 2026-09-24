@@ -172,28 +172,72 @@ except Exception as e: print("ERR:%s"%e); sys.exit(4)
 	}
 }
 
-// tcpConnecterPy is the AF_INET/AF_INET6 connecter the port-deny tests run
-// INSIDE the sandbox. It distinguishes the three outcomes that matter. A timeout
-// is NOT a denial — it is the answer of a host that never replied — so it gets its
-// own exit code and never reads as success; a python-level error gets a fourth, so
-// a test can tell "the deny bit" from "the experiment did not run".
-//
-// It is shared between the loopback test below and the LAN test in
-// integration_darwin_test.go, which must exercise the SAME connecter against the
-// SAME generated profile shape: the whole point of the LAN test is that only the
-// dialled address differs, so a second copy of this script could drift into
-// proving something slightly else.
-const tcpConnecterPy = `import socket,sys
-host=sys.argv[1]; port=int(sys.argv[2])
-fam=socket.AF_INET6 if ":" in host else socket.AF_INET
-s=socket.socket(fam,socket.SOCK_STREAM); s.settimeout(5)
-try:
-    s.connect((host,port)); print("CONNECTED"); sys.exit(0)
-except PermissionError: print("DENIED:EPERM"); sys.exit(3)
-except ConnectionRefusedError: print("DENIED:ECONNREFUSED"); sys.exit(3)
-except socket.timeout: print("TIMEOUT"); sys.exit(5)
-except Exception as e: print("ERR:%r"%(e,)); sys.exit(4)
+// tcpConnecterGo is the same connecter as a compilable program. The port-deny
+// tests run it instead of a host python3: they confine the dial under the REAL
+// default-deny pod profile, and a package-manager interpreter (for example
+// /opt/homebrew's python, whose Cellar tree the profile cannot read) fails at
+// execvp before any socket is opened, proving nothing about the deny. A binary
+// compiled into a test directory that rides SandboxProfile.extra_read_paths —
+// the same production surface a workload widens — is readable by construction.
+const tcpConnecterGo = `package main
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"syscall"
+	"time"
+)
+
+func main() {
+	host, port := os.Args[1], os.Args[2]
+	d := net.Dialer{Timeout: 5 * time.Second}
+	c, err := d.Dial("tcp", net.JoinHostPort(host, port))
+	if err == nil {
+		c.Close()
+		fmt.Println("CONNECTED")
+		os.Exit(0)
+	}
+	switch {
+	case errors.Is(err, syscall.EPERM):
+		fmt.Println("DENIED:EPERM")
+		os.Exit(3)
+	case errors.Is(err, syscall.ECONNREFUSED):
+		fmt.Println("DENIED:ECONNREFUSED")
+		os.Exit(3)
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		fmt.Println("TIMEOUT")
+		os.Exit(5)
+	default:
+		fmt.Printf("ERR:%v\n", err)
+		os.Exit(4)
+	}
+}
 `
+
+// buildTCPConnecter compiles tcpConnecterGo into a test directory and returns
+// the binary path. CGO is off so the result needs only libSystem, which the pod
+// profile's OS read set already covers.
+func buildTCPConnecter(t *testing.T) string {
+	t.Helper()
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go tool not available to build the connecter")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(src, []byte(tcpConnecterGo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "connecter")
+	cmd := exec.Command(goTool, "build", "-o", bin, src)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build connecter: %v\n%s", err, out)
+	}
+	return bin
+}
 
 // listenTCPPair returns two live listeners on host and their ports; the returned
 // func closes them. Ephemeral ports (":0") keep the tests from colliding with
@@ -246,12 +290,13 @@ func listenTCPPair(t *testing.T, network, host string) (int, int, func()) {
 // The real generated profile, not a minimal hand-written stand-in: what has to
 // hold is that the deny survives its position after the network stanza in the
 // artifact pods actually run under (SBPL is last-match-wins).
-func portDenyProfile(t *testing.T, port int) (string, string) {
+func portDenyProfile(t *testing.T, port int, connecterDir string) (string, string) {
 	t.Helper()
 	prof, err := Generate(&runtimev1.SandboxProfile{
 		DataVolumePath:   "/var/lib/k3sm/pods/pod-portdeny/rootfs",
 		AllowNetwork:     true,
 		DeniedLocalPorts: []uint32{uint32(port)},
+		ExtraReadPaths:   []string{connecterDir},
 	}, GenerateOptions{})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -267,11 +312,11 @@ func portDenyProfile(t *testing.T, port int) (string, string) {
 	return sb, prof
 }
 
-// dialUnderProfile runs tcpConnecterPy under sandbox-exec with the profile at sb,
-// returning the connecter's trimmed verdict line and the process exit error.
-func dialUnderProfile(t *testing.T, sb, py, host string, port int) (string, error) {
+// dialUnderProfile runs the compiled connecter under sandbox-exec with the
+// profile at sb, returning the trimmed verdict line and the process exit error.
+func dialUnderProfile(t *testing.T, sb, bin, host string, port int) (string, error) {
 	t.Helper()
-	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, py, "-c", tcpConnecterPy, host, strconv.Itoa(port)).CombinedOutput()
+	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, bin, host, strconv.Itoa(port)).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -296,22 +341,19 @@ func TestLocalPortDenyBlocksLoopbackConnect(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
 	}
-	py, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available for the connecter")
-	}
+	bin := buildTCPConnecter(t)
 
 	run := func(t *testing.T, network, host string) {
 		t.Helper()
 		portA, portB, closeAll := listenTCPPair(t, network, host)
 		defer closeAll()
 
-		sb, prof := portDenyProfile(t, portA)
+		sb, prof := portDenyProfile(t, portA, filepath.Dir(bin))
 
 		// The denied port: must be refused, and refused by the SANDBOX. A
 		// TIMEOUT or a python-level ERR would mean the test proved nothing about
 		// the deny, so only an explicit DENIED verdict counts.
-		outA, errA := dialUnderProfile(t, sb, py, host, portA)
+		outA, errA := dialUnderProfile(t, sb, bin, host, portA)
 		if errA == nil {
 			t.Fatalf("connect to the DENIED port %d succeeded (FAIL-OPEN): %s\n--- profile ---\n%s", portA, outA, prof)
 		}
@@ -321,7 +363,7 @@ func TestLocalPortDenyBlocksLoopbackConnect(t *testing.T) {
 
 		// The undenied port, under the SAME profile: must still connect, or the
 		// deny is not port-precise and the network grant has been broken.
-		outB, errB := dialUnderProfile(t, sb, py, host, portB)
+		outB, errB := dialUnderProfile(t, sb, bin, host, portB)
 		if errB != nil || outB != "CONNECTED" {
 			t.Fatalf("connect to the UNDENIED port %d did not succeed: %q (%v)\n--- profile ---\n%s", portB, outB, errB, prof)
 		}
