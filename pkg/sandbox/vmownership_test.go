@@ -140,3 +140,68 @@ func TestCreateVMStagesTheOwnershipSidecarBeforeTheSpawn(t *testing.T) {
 		t.Errorf("a sidecar was staged for init-db, whose container carries none (stat err %v)", err)
 	}
 }
+
+// TestStageOwnershipSidecarsRefusesPlantedSymlinks pins copySealed's no-follow
+// claim: a symlink pre-planted at the fixed temp name makes the write fail
+// rather than land in the link's target, and one planted at the final name is
+// REPLACED by the rename rather than written through.
+func TestStageOwnershipSidecarsRefusesPlantedSymlinks(t *testing.T) {
+	t.Parallel()
+	const body = `{"path":"tmp","type":"dir","uid":0,"gid":0,"mode":1023}` + "\n"
+	setup := func(t *testing.T) (podDir, dst, victim string, containers []VMContainer) {
+		t.Helper()
+		podDir = t.TempDir()
+		specRoot := filepath.Join(podDir, guestinit.SpecShareTag)
+		if err := os.MkdirAll(specRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		src := filepath.Join(t.TempDir(), "ownership.jsonl")
+		if err := os.WriteFile(src, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		victim = filepath.Join(t.TempDir(), "victim")
+		if err := os.WriteFile(victim, []byte("untouched"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dst = filepath.Join(specRoot, guestinit.OwnershipSidecarName("k3sm.rootfs"))
+		return podDir, dst, victim, []VMContainer{{Name: "a", RootfsTag: "k3sm.rootfs", OwnershipPath: src}}
+	}
+	assertVictim := func(t *testing.T, victim string) {
+		t.Helper()
+		if got, err := os.ReadFile(victim); err != nil || string(got) != "untouched" {
+			t.Errorf("the link target was written through: %q (err %v)", got, err)
+		}
+	}
+
+	t.Run("a symlink at the temp name is refused, not followed", func(t *testing.T) {
+		podDir, dst, victim, containers := setup(t)
+		if err := os.Symlink(victim, dst+".tmp"); err != nil {
+			t.Fatal(err)
+		}
+		if err := stageOwnershipSidecars(podDir, containers); err == nil {
+			t.Error("staging succeeded through a planted temp-name symlink; want a refusal")
+		}
+		assertVictim(t, victim)
+		if _, err := os.Lstat(dst); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("a sidecar was committed despite the refusal (lstat err %v)", err)
+		}
+	})
+
+	t.Run("a symlink at the final name is replaced by the real file", func(t *testing.T) {
+		podDir, dst, victim, containers := setup(t)
+		if err := os.Symlink(victim, dst); err != nil {
+			t.Fatal(err)
+		}
+		if err := stageOwnershipSidecars(podDir, containers); err != nil {
+			t.Fatalf("stageOwnershipSidecars: %v", err)
+		}
+		assertVictim(t, victim)
+		fi, err := os.Lstat(dst)
+		if err != nil || !fi.Mode().IsRegular() {
+			t.Fatalf("final name is %v (err %v), want a regular file replacing the link", fi.Mode(), err)
+		}
+		if got, _ := os.ReadFile(dst); string(got) != body {
+			t.Errorf("staged sidecar = %q, want %q", got, body)
+		}
+	})
+}

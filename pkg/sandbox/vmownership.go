@@ -40,9 +40,13 @@ import (
 // staged in the SPEC share and never in the rootfs share, whose namespace is the
 // image's — an image could ship a file at any name chosen there.
 //
-// One sidecar per TAG, first container in start order wins: several containers
-// can name one rootfs share, and only one of them materialized a tree into it
-// (pkg/runtime resolveVMContainers). A tag with no sidecar has any stale copy
+// One sidecar per TAG: several containers can name one rootfs share. The loop
+// keeps the first non-empty path it meets in slice order, and that is correct
+// only because of the single-rootfs ceiling — exactly one container
+// materializes a tree into a share (pkg/runtime resolveVMContainers), so at
+// most one path per tag is non-empty and there is nothing to choose between.
+// Per-container rootfs shares keep that true by giving each tree its own tag.
+// A tag with no sidecar has any stale copy
 // from an earlier boot of this pod dir removed, so a guest never applies a
 // sidecar describing a tree it is no longer given.
 //

@@ -34,6 +34,10 @@ import (
 // sidecar into the overlay at st.Root through guestinit.ApplyOwnership, whose
 // per-entry order and error tolerance are tested on darwin.
 //
+// A setuid/setgid bit it restores is INERT at exec today: ContainerRootDir is
+// mounted nosuid (guestinit.RootfsMounts), a second barrier independent of the
+// chown-before-chmod ordering.
+//
 // It NEVER fails the boot. A missing sidecar is a clean no-op (a host that
 // staged none); an unreadable one, or entries that fail, are logged with a
 // bounded summary and the container starts on the host-written ownership —
