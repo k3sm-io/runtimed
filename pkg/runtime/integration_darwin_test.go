@@ -47,6 +47,42 @@ import (
 // running a host-binary pod (a generated arm64 binary) to completion under
 // Seatbelt. This is the integration proof that the RuntimeServer wiring spawns a
 // confined native pod process and reaps it.
+
+// containerLogLines reads the container's on-disk CRI log (ContainerStatus.
+// log_path — GetLogs is retired) and returns each entry's content field.
+func containerLogLines(t *testing.T, rt *Runtime, podID string) []string {
+	t.Helper()
+	gs, err := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: podID})
+	if err != nil {
+		t.Fatalf("GetPodStatus for logs: %v", err)
+	}
+	var logPath string
+	for _, c := range gs.GetStatus().GetContainerStatuses() {
+		if c.GetLogPath() != "" {
+			logPath = c.GetLogPath()
+		}
+	}
+	if logPath == "" {
+		t.Fatal("no container status carries a log_path")
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read container log %s: %v", logPath, err)
+	}
+	var out []string
+	for _, raw := range strings.Split(string(data), "\n") {
+		if raw == "" {
+			continue
+		}
+		// CRI line: <time> <stream> <P|F> <content>
+		parts := strings.SplitN(raw, " ", 4)
+		if len(parts) == 4 {
+			out = append(out, parts[3])
+		}
+	}
+	return out
+}
+
 func TestIntegrationFullStackCreatePod(t *testing.T) {
 	root := t.TempDir()
 
@@ -87,7 +123,7 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := New(Config{Root: root, RuntimeVersion: "test"}, Deps{
+	rt, err := New(Config{Root: root, RuntimeVersion: "test", PodLogsDir: filepath.Join(root, "podlogs")}, Deps{
 		Cache:   cache,
 		Backend: backend,
 		Spawner: supervisor.PosixSpawner{},
@@ -150,19 +186,17 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 		t.Fatalf("pod did not reach SUCCEEDED; phase=%v", phase)
 	}
 
-	// Logs must have captured the marker the confined pod printed.
-	stream := newFakeLogStream(context.Background())
-	if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-int", Container: "main"}, stream); err != nil {
-		t.Fatalf("GetLogs: %v", err)
-	}
+	// Logs must have captured the marker the confined pod printed. They are
+	// on disk in the CRI format now; GetLogs is retired.
 	found := false
-	for _, e := range stream.entries {
-		if string(e.GetLine()) == "pod-ran" {
+	logLines := containerLogLines(t, rt, "pod-int")
+	for _, l := range logLines {
+		if l == "pod-ran" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("pod log marker not captured; entries=%v", stream.entries)
+		t.Errorf("pod log marker not captured; entries=%v", logLines)
 	}
 
 	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-int"}); err != nil {
@@ -225,7 +259,7 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 	}
 	// Deps carries NO Puller and NO Unpacker: New builds the daemon's own pair
 	// over one cache, which is the wiring this acceptance is about.
-	rt, err := New(Config{Root: root, RuntimeVersion: "test"}, Deps{
+	rt, err := New(Config{Root: root, RuntimeVersion: "test", PodLogsDir: filepath.Join(root, "podlogs")}, Deps{
 		Cache:   cache,
 		Backend: backend,
 		Spawner: supervisor.PosixSpawner{},
@@ -292,15 +326,9 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 		t.Fatalf("pod did not reach SUCCEEDED; phase=%v", phase)
 	}
 
-	// argv[0] came out of the second layer.
-	stream := newFakeLogStream(context.Background())
-	if err := rt.GetLogs(&runtimev1.GetLogsRequest{PodId: "pod-a6", Container: "main"}, stream); err != nil {
-		t.Fatalf("GetLogs: %v", err)
-	}
-	var lines []string
-	for _, e := range stream.entries {
-		lines = append(lines, string(e.GetLine()))
-	}
+	// argv[0] came out of the second layer. Logs are read from the on-disk
+	// CRI file; GetLogs is retired.
+	lines := containerLogLines(t, rt, "pod-a6")
 	found := false
 	for _, l := range lines {
 		if l == "pod-ran-from-layer-2" {
