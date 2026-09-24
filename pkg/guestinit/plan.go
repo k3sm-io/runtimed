@@ -90,6 +90,12 @@ type ContainerPlan struct {
 	// TTY and Stdin mirror the pod spec's terminal requests.
 	TTY   bool
 	Stdin bool
+
+	// Ownership restores the image's uid/gid/mode inside Root, or is nil when
+	// the spec share carries no sidecar for this container's rootfs. The
+	// executor applies it after Mounts[:Ownership.AfterMount] and before the
+	// rest of Mounts; see OwnershipStep for why that split point.
+	Ownership *OwnershipStep
 }
 
 // BootPlan is the whole boot, as data. The executor walks it top to bottom and
@@ -127,6 +133,12 @@ type Options struct {
 	// overlay upper. Zero means unknown, which takes the default bound rather
 	// than an unbounded upper (see UpperSizeBytes).
 	MemTotalBytes int64
+
+	// SpecShareFiles are the basenames present in the k3sm.spec share root.
+	// The plan reads it for exactly one fact — whether a container's
+	// ownership sidecar was staged there (OwnershipSidecarName) — so the plan
+	// itself stays free of any filesystem read.
+	SpecShareFiles []string
 }
 
 // Plan turns a GuestSpec into the boot plan. It is pure: it touches no
@@ -177,8 +189,12 @@ func Plan(spec *guestv1.GuestSpec, opts Options) (*BootPlan, error) {
 		return nil, err
 	}
 	upperSize := UpperSizeBytes(opts.MemTotalBytes, len(ordered))
+	staged := make(map[string]bool, len(opts.SpecShareFiles))
+	for _, f := range opts.SpecShareFiles {
+		staged[f] = true
+	}
 	for _, step := range ordered {
-		cp, err := containerPlan(step, spec.GetFsGroup(), podMounts, upperSize)
+		cp, err := containerPlan(step, spec.GetFsGroup(), podMounts, upperSize, staged)
 		if err != nil {
 			return nil, err
 		}
@@ -260,8 +276,9 @@ func validContainerName(name string) error {
 	return nil
 }
 
-// containerPlan builds one container's plan.
-func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSize int64) (ContainerPlan, error) {
+// containerPlan builds one container's plan. staged is the set of basenames in
+// the spec share, read for the container's ownership sidecar.
+func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSize int64, staged map[string]bool) (ContainerPlan, error) {
 	c := step.Container
 	argv := append(append([]string{}, c.GetCommand()...), c.GetArgs()...)
 	if len(argv) == 0 {
@@ -306,5 +323,8 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 		Ident:       ident,
 		TTY:         c.GetTty(),
 		Stdin:       c.GetStdin(),
+		// Split in after the rootfs composition and before the first mount
+		// inside it (OwnershipStep.AfterMount).
+		Ownership: ownershipStep(c.GetName(), c.GetRootfsTag(), staged, len(rootfs)),
 	}, nil
 }

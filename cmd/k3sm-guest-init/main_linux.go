@@ -32,7 +32,7 @@ limitations under the License.
 //
 //	pseudo-filesystems -> read guest-spec.json -> render /etc -> pod mounts ->
 //	hostname -> Rosetta binfmt registration -> per-container rootfs overlays ->
-//	init containers sequentially -> main containers -> vsock GuestAgent ->
+//	ownership sidecar apply -> init containers sequentially -> main containers -> vsock GuestAgent ->
 //	reap loop -> Stop(grace): term -> grace -> KILL -> sync -> poweroff.
 //
 // The GuestAgent comes up after the containers on purpose: its Health is the
@@ -165,7 +165,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		log.Warn("could not read meminfo; the overlay upper takes its default bound", "err", err)
 	}
-	plan, err := guestinit.Plan(spec, guestinit.Options{MemTotalBytes: guestinit.ParseMemTotal(string(meminfo))})
+	plan, err := guestinit.Plan(spec, guestinit.Options{
+		MemTotalBytes:  guestinit.ParseMemTotal(string(meminfo)),
+		SpecShareFiles: specShareFiles(log),
+	})
 	if err != nil {
 		return err
 	}
@@ -400,6 +403,22 @@ func readSpec(path string) (*guestv1.GuestSpec, error) {
 	return spec, nil
 }
 
+// specShareFiles lists the basenames in the spec share root, the one filesystem
+// fact guestinit.Plan needs (whether an ownership sidecar was staged). A listing
+// failure plans no sidecar apply, which is the pre-sidecar boot, not a failure.
+func specShareFiles(log *slog.Logger) []string {
+	entries, err := os.ReadDir(guestinit.SpecMountPoint)
+	if err != nil {
+		log.Warn("could not list the spec share; no ownership sidecar will be applied", "err", err)
+		return nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
 // applyMounts performs a plan's mount steps in order.
 func applyMounts(log *slog.Logger, steps []guestinit.MountStep) error {
 	for _, s := range steps {
@@ -554,7 +573,19 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 // is waited for and must exit 0, a main container is started and left running.
 func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, capture *guestagent.Capture, hub *guestagent.AttachHub, plans []guestinit.ContainerPlan) error {
 	for _, cp := range plans {
-		if err := applyMounts(log, cp.Mounts); err != nil {
+		// The ownership sidecar is applied between the rootfs composition and
+		// the first mount inside it (guestinit.OwnershipStep.AfterMount), so an
+		// entry naming /dev, /proc or a volume path reaches the image's own node
+		// rather than whatever is later mounted over it.
+		mounts := cp.Mounts
+		if cp.Ownership != nil {
+			if err := applyMounts(log, mounts[:cp.Ownership.AfterMount]); err != nil {
+				return fmt.Errorf("container %s: %w", cp.Name, err)
+			}
+			applyOwnership(ctx, log, cp.Name, cp.Ownership)
+			mounts = mounts[cp.Ownership.AfterMount:]
+		}
+		if err := applyMounts(log, mounts); err != nil {
 			return fmt.Errorf("container %s: %w", cp.Name, err)
 		}
 		// After the mounts, never before: /dev/ptmx points INTO the devpts
