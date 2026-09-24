@@ -389,6 +389,19 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	// Linux image is never applied under the native rules.
 	//
 	// A failure is ROOTFS_SETUP, not IMAGE_PULL: the registry did its part.
+	//
+	// The tree's OWNERSHIP SIDECAR is kept rather than discarded: the host wrote
+	// the tree as the daemon's uid with setuid stripped, and the sidecar is the
+	// tar's true uid/gid/mode, which the guest restores onto the container's
+	// overlay before the container starts (guestinit.OwnershipStep). It rides
+	// the container as a host path only; pkg/sandbox stages it beside
+	// guest-spec.json in the k3sm.spec share, and no apis field carries it.
+	//
+	// It inherits the single-rootfs ceiling deliberately (vmRootfsShareTag,
+	// vmcontainers.go:186-202): only the first image's tree is materialized, so
+	// only its ownership exists to apply — to every container naming that share,
+	// which is correct for the tree each of them actually sees.
+	ownership := ""
 	if rootfsDest != "" {
 		policy, perr := unpackPolicy(backend)
 		if perr != nil {
@@ -400,7 +413,9 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		}
 		r.log.Debug("materialized vm pod rootfs",
 			"pod", box.GetPodId(), "container", name, "image", ref, "rootfs", rootfsDest,
-			"tree", mat.Tree.Key, "tree_cache_hit", mat.Tree.CacheHit, "cloned", mat.Cloned)
+			"tree", mat.Tree.Key, "tree_cache_hit", mat.Tree.CacheHit, "cloned", mat.Cloned,
+			"ownership", mat.Tree.Ownership)
+		ownership = mat.Tree.Ownership
 	}
 
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
@@ -456,5 +471,6 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		UID:              run.UID,
 		GID:              int64(cred.GID),
 		SupplementalGIDs: gids,
+		OwnershipPath:    ownership,
 	}, imagePull: imagePull}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }

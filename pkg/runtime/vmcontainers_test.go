@@ -67,6 +67,10 @@ type imageWorld struct {
 	// distinguish from an unstamped field.
 	delays map[string]time.Duration
 
+	// ownership is the sidecar path the fake materializer reports on the tree
+	// it returns (image.Tree.Ownership); empty reports none.
+	ownership string
+
 	mu           sync.Mutex
 	pulled       []string
 	policies     []image.PlatformPolicy
@@ -136,7 +140,7 @@ func (w *imageWorld) MaterializeTree(_ context.Context, _ *runtimev1.ImageManife
 	w.mu.Lock()
 	w.materialized++
 	w.mu.Unlock()
-	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:fake", Rootfs: dst, Policy: policy}}, nil
+	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:fake", Rootfs: dst, Policy: policy, Ownership: w.ownership}}, nil
 }
 
 func (w *imageWorld) ImageRunConfig(mfst *runtimev1.ImageManifest) (image.ImageRunConfig, error) {
@@ -468,6 +472,37 @@ func TestVMContainersMapTheWholePodInStartOrder(t *testing.T) {
 			t.Errorf("materialized %d trees; want exactly 1 (the single pod-wide rootfs share)", materialized)
 		}
 	})
+}
+
+// TestVMContainerCarriesTheMaterializedTreesOwnershipSidecar pins the host
+// half of the ownership handoff at the runtime seam: the sidecar path of the ONE
+// tree materialized into the pod-wide rootfs share rides the container that
+// materialized it, and no other container claims a tree it did not build.
+// (pkg/sandbox stages it beside guest-spec.json by the rootfs tag; see
+// TestStageOwnershipSidecarsLandsBesideTheGuestSpec.)
+func TestVMContainerCarriesTheMaterializedTreesOwnershipSidecar(t *testing.T) {
+	const (
+		initRef = "docker.io/library/initdb:1"
+		mainRef = "docker.io/library/postgres:16"
+		sidecar = "/var/lib/k3sm/images/trees/sha256-fake/ownership.jsonl"
+	)
+	w := newImageWorld(map[string]image.ImageRunConfig{
+		initRef: {Entrypoint: []string{"/usr/bin/initdb"}},
+		mainRef: {Entrypoint: []string{"/usr/local/bin/postgres"}},
+	})
+	w.ownership = sidecar
+	rt, vmb := newVMImageRuntime(t, w)
+	box := vmBoxWith(rt, "pod-own",
+		[]*runtimev1.Container{{Name: "init-db", Image: initRef}},
+		[]*runtimev1.Container{{Name: "postgres", Image: mainRef}})
+	spec := createVMSpec(t, rt, vmb, box)
+
+	if got := spec.Containers[0].OwnershipPath; got != sidecar {
+		t.Errorf("init-db (the materializing container) OwnershipPath = %q, want the tree's %q", got, sidecar)
+	}
+	if got := spec.Containers[1].OwnershipPath; got != "" {
+		t.Errorf("postgres OwnershipPath = %q, want empty: it materialized no tree", got)
+	}
 }
 
 // TestVMContainerImageUserSuppliesTheUID pins the other half of the identity

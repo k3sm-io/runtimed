@@ -95,6 +95,12 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	if _, err := writeGuestSpec(spec.PodDir, gs); err != nil {
 		return fail(VMBootSpecWriteFailed, "", err)
 	}
+	// Beside the boot contract, in the same read-only share and under the same
+	// before-the-spawn ordering: the image's true ownership, which the guest
+	// applies to each container's overlay before it starts.
+	if err := stageOwnershipSidecars(spec.PodDir, spec.Containers); err != nil {
+		return fail(VMBootSpecWriteFailed, "", err)
+	}
 
 	helper, err := b.vmHostFn()
 	if err != nil {
