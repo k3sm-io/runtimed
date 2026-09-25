@@ -58,6 +58,12 @@ readonly CACHE_DIR="$HERE/.cache"
 readonly CONFIG_FILE="$HERE/kernel.config"
 readonly KEYS_DIR="$HERE/keys"
 
+# The key-trust primitives (key_file, new_gnupg_home, gnupg_home_rm,
+# assert_sole_key, import_key_checked, stage_key_file) are shared with the
+# container-vm spike recipe; this file keeps only --refresh-keys.
+# shellcheck source=SCRIPTDIR/keys/lib.sh
+source "$KEYS_DIR/lib.sh"
+
 # ---------------------------------------------------------------- the pins
 
 readonly KERNEL_VERSION="6.18.53"
@@ -395,6 +401,7 @@ safe_name() {
 # guest_sums POD DIR FILE... prints sha256sum lines for the files in-guest.
 guest_sums() {
   local pod="$1" dir="$2"; shift 2
+  # shellcheck disable=SC2016  # $1 and $@ are the in-guest sh's arguments
   kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- \
     sh -c 'cd "$1" && shift && sha256sum -- "$@"' sh "$dir" "$@" \
     || die "could not hash $pod:$dir in-guest"
@@ -517,57 +524,6 @@ host_verify_sums_in() {
   awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' "$home/sums.txt"
 }
 
-# key_file FPR prints the in-tree path of the public key pinned as FPR.
-key_file() { printf '%s/%s.asc\n' "$KEYS_DIR" "$1"; }
-
-# new_gnupg_home makes a throwaway GNUPGHOME under $TMPDIR, deliberately not
-# under the repo's cache: gpg's daemons put their sockets in the home, and a
-# socket path longer than the 104-byte sun_path limit makes every gpg call that
-# needs a daemon fail ("File name too long") in a deeply nested checkout.
-new_gnupg_home() {
-  local home
-  home="$(mktemp -d)" || return 1
-  chmod 700 "$home"
-  printf '%s\n' "$home"
-}
-
-# gnupg_home_rm HOME stops every daemon HOME started, THEN removes HOME. The
-# order is load-bearing: dirmngr (and gpg-agent, keyboxd) outlive the gpg that
-# spawned them, and they are reached only through the sockets inside HOME, so a
-# remove-first cleanup leaves them running with nothing able to stop them.
-gnupg_home_rm() {
-  local home="$1"
-  [ -n "$home" ] || return 0
-  gpgconf --homedir "$home" --kill all >/dev/null 2>&1 || true
-  rm -rf "$home"
-}
-
-# assert_sole_key HOME FPR dies unless HOME's keyring holds exactly one primary
-# key and it is FPR. "Exactly one" matters as much as "FPR": a key file that
-# carried the pinned key AND a second one would let a signature by the second
-# verify as good, and gpg's exit status would not tell the two apart.
-assert_sole_key() {
-  local home="$1" fpr="$2" held
-  held="$(gpg --batch --homedir "$home" --with-colons --list-keys 2>/dev/null \
-    | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { printf "%s ", $10; p = 0 }')" || held=""
-  [ "$held" = "$fpr " ] \
-    || die "KEY FINGERPRINT MISMATCH: expected exactly $fpr, keyring holds: ${held:-nothing}"
-}
-
-# import_key_checked HOME FPR [FILE] imports the in-tree key file for FPR (or
-# FILE) and ASSERTS the keyring now holds exactly that key. The file is a cache,
-# not an anchor: whatever bytes it holds, only the fingerprint decides. There is
-# no network fallback; a file that fails here fails the run, and re-minting it
-# is the explicit --refresh-keys.
-import_key_checked() {
-  local home="$1" fpr="$2" file="${3:-}"
-  [ -n "$file" ] || file="$(key_file "$fpr")"
-  [ -f "$file" ] || die "missing pinned key file $file (mint it with --refresh-keys and review)"
-  gpg --batch --homedir "$home" --import "$file" >/dev/null 2>&1 \
-    || die "could not import key file $file"
-  assert_sole_key "$home" "$fpr"
-}
-
 # check_key_file FPR [FILE] runs the import assertion in its own throwaway
 # home and cleans it up on every path, exiting with the assertion's status.
 check_key_file() {
@@ -576,16 +532,6 @@ check_key_file() {
   (import_key_checked "$home" "$fpr" "$file") || status=$?
   gnupg_home_rm "$home"
   [ "$status" -eq 0 ] || exit "$status"
-}
-
-# stage_key_file FPR WORK copies the in-tree key for FPR into WORK as
-# signer.asc, so run_in_toolchain's stream_in carries it into the pod with the
-# rest of /work, hashed on both ends. The pod then asserts the fingerprint.
-stage_key_file() {
-  local fpr="$1" work="$2" file
-  file="$(key_file "$fpr")"
-  [ -f "$file" ] || die "missing pinned key file $file (mint it with --refresh-keys and review)"
-  cp "$file" "$work/signer.asc" || die "could not stage $file"
 }
 
 # container_verify_sums does the same inside the digest-pinned toolchain, for a

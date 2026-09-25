@@ -25,9 +25,17 @@
 #
 # The build runs entirely inside Docker: nothing but curl, shasum and (for the
 # provenance check) gpg is asked of the host.
+#
+# The two signing keys are imported OFFLINE from the guest-kernel recipe's
+# in-tree cache (hack/guest-kernel/keys/<fingerprint>.asc) through the shared
+# helpers in hack/guest-kernel/keys/lib.sh, on the host and inside the
+# toolchain container alike, and every import asserts the keyring then holds
+# exactly the pinned key. This recipe has no network path for keys at all:
+# re-minting the shared files is the guest-kernel recipe's job alone (see
+# hack/guest-kernel/keys/README.md).
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly HERE
 readonly OUT_DIR="$HERE/out"
 readonly CACHE_DIR="$HERE/.cache"
@@ -50,10 +58,11 @@ readonly KERNEL_SHA256="5ebdadb10a4b5708fc6b1c457764a110bc49f8150cc3502c59b921ea
 # 2013-01-24. This is the PRIMARY key fingerprint; its long id 632D3A06589DA6B1
 # is what gpg reports as the issuer of sha256sums.asc.
 #
-# keys.openpgp.org does NOT carry this key (verified 2026-08-31: HTTP 404 for
-# op=get on the fingerprint), so keyserver.ubuntu.com leads the list. The order
-# is a fallback chain, not a preference for one operator's honesty: the key is
-# accepted only if it hashes to the fingerprint above, whoever served it.
+# This literal and KERNEL_DEV_KEY_FPR below are this recipe's own trust
+# statement and must equal hack/guest-kernel/build.sh's constants: a rotation
+# changes both scripts in one reviewed commit (hack/guest-kernel/keys/README.md;
+# hack/acceptance/B394.sh asserts the equality). The key bytes come from the
+# shared in-tree file and are accepted only if they ARE this fingerprint.
 readonly KERNEL_KEY_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
 
 # Greg Kroah-Hartman's stable-release key — the SECOND, independent trust
@@ -66,7 +75,6 @@ readonly KERNEL_KEY_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
 # mirror-integrity check, and this script requires BOTH to pass.
 readonly KERNEL_DEV_KEY_FPR="647F28654894E3BD457199BE38DBBDC86092693E"
 readonly KERNEL_SIGN_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.sign"
-readonly KEYSERVERS="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.openpgp.org"
 
 # debian:trixie-slim, linux/arm64/v8, resolved 2026-08-31. The digest is the
 # reproducibility anchor; the apt package versions inside it deliberately are
@@ -139,6 +147,11 @@ VSOCKETS
 die() { printf 'guest-kernel: %s\n' "$*" >&2; exit 1; }
 note() { printf '\n==> %s\n' "$*"; }
 
+# The shared key-trust primitives: key_file, new_gnupg_home, gnupg_home_rm,
+# assert_sole_key, import_key_checked, stage_key_file.
+# shellcheck source=SCRIPTDIR/../../../guest-kernel/keys/lib.sh
+source "$HERE/../../../guest-kernel/keys/lib.sh"
+
 # scratch_dir makes a work directory UNDER the repo rather than in $TMPDIR.
 # Docker Desktop shares an explicit list of host paths, and macOS's per-user
 # /var/folders TMPDIR is not on the default list: a bind mount of a mktemp -d
@@ -208,36 +221,24 @@ verify_provenance() {
 }
 
 # host_verify_sums verifies with the host's gpg into a throwaway GNUPGHOME, so
-# the operator's own keyring is neither read nor written.
+# the operator's own keyring is neither read nor written. The work runs in a
+# subshell so that a die inside it still reaches the cleanup below: a RETURN
+# trap does not fire on exit, and every exit path must stop the home's daemons.
 host_verify_sums() {
-  local signed="$1"
-  local home; home="$(mktemp -d)"
-  # shellcheck disable=SC2064  # $home must expand now, not at trap time
-  trap "rm -rf '$home'" RETURN
-  chmod 700 "$home"
+  local signed="$1" home out status=0
+  home="$(new_gnupg_home)" || die "could not create a throwaway GNUPGHOME"
+  out="$(host_verify_sums_in "$home" "$signed")" || status=$?
+  gnupg_home_rm "$home"
+  [ "$status" -eq 0 ] || exit "$status"
+  printf '%s\n' "$out"
+}
 
+host_verify_sums_in() {
+  local home="$1" signed="$2"
   import_key_checked "$home" "$KERNEL_KEY_FPR"
   gpg --batch --homedir "$home" --output "$home/sums.txt" --verify "$signed" >/dev/null 2>&1 \
     || die "PGP VERIFICATION FAILED for $KERNEL_SUMS_URL"
   awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' "$home/sums.txt"
-}
-
-# import_key_checked fetches one key by full fingerprint and then ASSERTS the
-# keyring really holds a key of that fingerprint. Modern gpg is expected to
-# reject a substituted keyserver response itself, but that expectation lives in
-# gpg's internals; this check makes it a property of THIS script, for whatever
-# gpg version the host or the unpinned apt archive supplies.
-import_key_checked() {
-  local home="$1" fpr="$2" got=0 ks
-  for ks in $KEYSERVERS; do
-    if gpg --batch --homedir "$home" --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then
-      got=1; break
-    fi
-  done
-  [ "$got" -eq 1 ] || die "could not fetch key $fpr from any of: $KEYSERVERS"
-  gpg --batch --homedir "$home" --fingerprint --with-colons 2>/dev/null \
-    | grep -q "^fpr:::::::::${fpr}:$" \
-    || die "keyring does not hold a key with fingerprint $fpr after import"
 }
 
 # container_verify_sums does the same inside the digest-pinned toolchain, for a
@@ -249,28 +250,30 @@ container_verify_sums() {
   # shellcheck disable=SC2064  # $work must expand now, not at trap time
   trap "rm -rf '$work'" RETURN
   cp "$signed" "$work/sha256sums.asc"
+  stage_key_file "$KERNEL_KEY_FPR" "$work"
 
   docker run --rm -i --platform linux/arm64 \
     -v "$work:/work" -w /work \
-    -e KERNEL_KEY_FPR="$KERNEL_KEY_FPR" \
-    -e KEYSERVERS="$KEYSERVERS" \
+    -e PINNED_FPR="$KERNEL_KEY_FPR" \
     -e KERNEL_TARBALL="$KERNEL_TARBALL" \
     "$TOOLCHAIN_IMAGE" bash -s >/dev/null <<'INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
-apt-get -qq install -y --no-install-recommends gnupg dirmngr ca-certificates >/dev/null
+apt-get -qq install -y --no-install-recommends gnupg >/dev/null
 export GNUPGHOME=/tmp/gnupg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-fetch_key() {
-  fpr="$1"; got=0
-  for ks in $KEYSERVERS; do
-    if gpg --batch --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then got=1; break; fi
-  done
-  [ "$got" -eq 1 ] || { echo "could not fetch key $fpr" >&2; exit 1; }
-  gpg --batch --fingerprint --with-colons 2>/dev/null | grep -q "^fpr:::::::::${fpr}:$" \
-    || { echo "keyring does not hold a key with fingerprint $fpr after import" >&2; exit 1; }
+# ---- in-container key import (hack/acceptance/B394.sh runs this block on the host)
+# The key arrived as /work/signer.asc on the bind mount; the fingerprint, not
+# the transport, is what makes it the pinned key.
+gpg --batch --import /work/signer.asc >/dev/null 2>&1 \
+  || { echo "could not import the staged key file" >&2; exit 1; }
+held="$(gpg --batch --with-colons --list-keys 2>/dev/null \
+  | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { printf "%s ", $10; p = 0 }')" || held=""
+[ "$held" = "$PINNED_FPR " ] || {
+  echo "KEY FINGERPRINT MISMATCH: expected exactly $PINNED_FPR, keyring holds: ${held:-nothing}" >&2
+  exit 1
 }
-fetch_key "$KERNEL_KEY_FPR"
+# ---- end in-container key import
 gpg --batch --output /tmp/sums.txt --verify /work/sha256sums.asc >/dev/null 2>&1 \
   || { echo "PGP VERIFICATION FAILED" >&2; exit 1; }
 awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' /tmp/sums.txt > /work/pinned
@@ -294,25 +297,30 @@ verify_dev_signature() {
   trap "rm -rf '$work'" RETURN
   cp "$sign" "$work/tar.sign"
   cp "$CACHE_DIR/$KERNEL_TARBALL" "$work/$KERNEL_TARBALL"
+  stage_key_file "$KERNEL_DEV_KEY_FPR" "$work"
 
   docker run --rm -i --platform linux/arm64 \
     -v "$work:/work" -w /work \
-    -e KERNEL_DEV_KEY_FPR="$KERNEL_DEV_KEY_FPR" \
-    -e KEYSERVERS="$KEYSERVERS" \
+    -e PINNED_FPR="$KERNEL_DEV_KEY_FPR" \
     -e KERNEL_TARBALL="$KERNEL_TARBALL" \
     "$TOOLCHAIN_IMAGE" bash -s >/dev/null <<'INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
-apt-get -qq install -y --no-install-recommends gnupg dirmngr ca-certificates xz-utils >/dev/null
+apt-get -qq install -y --no-install-recommends gnupg xz-utils >/dev/null
 export GNUPGHOME=/tmp/gnupg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-got=0
-for ks in $KEYSERVERS; do
-  if gpg --batch --keyserver "$ks" --recv-keys "0x$KERNEL_DEV_KEY_FPR" >/dev/null 2>&1; then got=1; break; fi
-done
-[ "$got" -eq 1 ] || { echo "could not fetch key $KERNEL_DEV_KEY_FPR" >&2; exit 1; }
-gpg --batch --fingerprint --with-colons 2>/dev/null | grep -q "^fpr:::::::::${KERNEL_DEV_KEY_FPR}:$" \
-  || { echo "keyring does not hold a key with fingerprint $KERNEL_DEV_KEY_FPR after import" >&2; exit 1; }
+# ---- in-container key import (hack/acceptance/B394.sh runs this block on the host)
+# The key arrived as /work/signer.asc on the bind mount; the fingerprint, not
+# the transport, is what makes it the pinned key.
+gpg --batch --import /work/signer.asc >/dev/null 2>&1 \
+  || { echo "could not import the staged key file" >&2; exit 1; }
+held="$(gpg --batch --with-colons --list-keys 2>/dev/null \
+  | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { printf "%s ", $10; p = 0 }')" || held=""
+[ "$held" = "$PINNED_FPR " ] || {
+  echo "KEY FINGERPRINT MISMATCH: expected exactly $PINNED_FPR, keyring holds: ${held:-nothing}" >&2
+  exit 1
+}
+# ---- end in-container key import
 xz -cd "/work/$KERNEL_TARBALL" | gpg --batch --verify /work/tar.sign - >/dev/null 2>&1 \
   || { echo "DEVELOPER SIGNATURE VERIFICATION FAILED" >&2; exit 1; }
 INNER
@@ -560,4 +568,8 @@ main() {
   report "$OUT_DIR/Image"
 }
 
-main "$@"
+# Run main only when executed. hack/acceptance/B394.sh sources this file to
+# drive the key path offline, without Docker.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
