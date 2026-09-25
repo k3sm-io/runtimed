@@ -28,6 +28,10 @@
 # (for the provenance check) gpg is asked of the host, and no container daemon
 # is involved at all. The toolchain image still comes from the library registry
 # by digest, pulled by k3sm's own vm path.
+#
+# The recipe therefore depends on a working vm RuntimeClass. If a shipped guest
+# kernel is bad enough to break vm pods, recover by the standing rollback: revert
+# the guestartifacts pin, reinstall, then rebuild here on the healthy runtime.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -272,7 +276,10 @@ run_in_toolchain() {
   # a correct /tmp, so this RESTORES that environment rather than departing
   # from it; every stage of a build and of --repro gets it alike.
   # REMOVE once the shipped guest artifacts are >= v6.18.53-k3sm.1, the first
-  # release whose initramfs carries the in-guest ownership apply.
+  # release whose initramfs carries the in-guest ownership apply. "Shipped"
+  # means the locally installed, running daemon boots guests from those
+  # artifacts, not merely that the committed pin names them: until your own
+  # machine boots the fixed initramfs, this shim is still load-bearing there.
   kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- chmod 1777 /tmp /var/tmp \
     || die "bootstrap shim: could not restore /tmp and /var/tmp to 1777 in $pod"
 
@@ -410,7 +417,15 @@ stream_in() {
   (cd "$dir" && COPYFILE_DISABLE=1 tar --format ustar -cf - -- "${files[@]}") \
     | kube -n "$RUN_NAMESPACE" exec -i "$pod" -c toolchain -- tar -C "$dest" --no-same-owner -xf - \
     || die "streaming $dir into $pod:$dest failed"
-  compare_sums "in $dest" "$(host_sums "$dir" "${files[@]}")" "$(guest_sums "$pod" "$dest" "${files[@]}")"
+  # Both listings are taken into locals, each with its own `|| die`, BEFORE the
+  # compare: a failing command substitution passed inline as an argument does
+  # not trip errexit, so two failed hashes would compare empty to empty and
+  # pass. The explicit die is needed as well as the pre-assignment because
+  # toolchain_run calls this under `|| status=$?`, where errexit is off.
+  local host guest
+  host="$(host_sums "$dir" "${files[@]}")" || die "could not hash $dir on the host"
+  guest="$(guest_sums "$pod" "$dest" "${files[@]}")" || die "could not hash $pod:$dest in-guest"
+  compare_sums "in $dest" "$host" "$guest"
 }
 
 # stream_out POD GUESTDIR HOSTDIR copies GUESTDIR's top-level files out of the
@@ -424,11 +439,15 @@ stream_out() {
     safe_name "$f"; files+=("$f")
   done <<<"$(printf '%s\n' "$listing" | LC_ALL=C sort)"
   [ "${#files[@]}" -gt 0 ] || return 0
-  local guest; guest="$(guest_sums "$pod" "$src" "${files[@]}")"
+  # Pre-assigned with an explicit die on each side, for the reason stream_in
+  # gives: an inline substitution would let an empty listing reach the compare.
+  local host guest
+  guest="$(guest_sums "$pod" "$src" "${files[@]}")" || die "could not hash $pod:$src in-guest"
   kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- tar -C "$src" --format ustar -cf - -- "${files[@]}" \
     | tar -C "$dir" -xf - \
     || die "streaming $pod:$src out to $dir failed"
-  compare_sums "out $src" "$(host_sums "$dir" "${files[@]}")" "$guest"
+  host="$(host_sums "$dir" "${files[@]}")" || die "could not hash $dir on the host"
+  compare_sums "out $src" "$host" "$guest"
 }
 
 # gpg_cmd echoes how to run gpg. The host's own gpg is preferred; when it is
