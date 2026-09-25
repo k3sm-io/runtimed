@@ -7,6 +7,7 @@ with, one file per key, named by its full fingerprint:
 |---|---|---|
 | `B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1.asc` | Kernel.org checksum autosigner (signs `sha256sums.asc`) | `KERNEL_KEY_FPR` |
 | `647F28654894E3BD457199BE38DBBDC86092693E.asc` | Greg Kroah-Hartman, stable-release key (signs `linux-*.tar.sign`) | `KERNEL_DEV_KEY_FPR` |
+| `lib.sh` | The shared import-and-assert helpers, sourced by `../build.sh` and by `hack/spikes/containerhost/kernel/build-framework-config.sh` | n/a |
 
 ## What these files are
 
@@ -41,6 +42,10 @@ Do this when kernel.org replaces a signing key.
    `sha256sums.asc`.
 2. Change the constant in `build.sh`. **The reviewed act is that change**; the
    key file follows from it.
+   The container-vm spike recipe
+   (`hack/spikes/containerhost/kernel/build-framework-config.sh`) is a second
+   consumer with its own copy of both constants: change it in the same reviewed
+   commit, and run `hack/acceptance/B394.sh` too.
 3. Run `hack/guest-kernel/build.sh --refresh-keys` to mint the new file, delete
    the file named by the old fingerprint, and commit all three changes
    together.
