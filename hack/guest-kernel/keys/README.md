@@ -45,3 +45,10 @@ Do this when kernel.org replaces a signing key.
    the file named by the old fingerprint, and commit all three changes
    together.
 4. Run `hack/acceptance/B392.sh`.
+
+Two limits of the automation, on purpose: the import check asserts identity
+(exactly one primary key, the pinned fingerprint), never continued validity —
+an expired or revoked key with the right fingerprint still imports, and the
+human rotation runbook above is the control for that. And a `--refresh-keys`
+diff is trust material: a human reads the re-minted key bytes before commit;
+it is never routine automation.
