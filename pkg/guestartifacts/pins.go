@@ -44,7 +44,7 @@ import (
 // with ErrPinIncomplete, and every vm pod fails closed until the build lands the
 // real identity and the real digests together. A fabricated hash here would buy
 // nothing but a cache key that matches no artifact anyone can fetch.
-const ActiveGuestKernel = "v6.18.48-9c05f8f3b26c"
+const ActiveGuestKernel = "v6.18.53-b5d9e2733a91"
 
 // ImageFileName and InitramfsFileName are the basenames the two artifacts of a
 // pinned set are stored under, inside that set's content-addressed directory,
@@ -94,7 +94,7 @@ type GuestKernelPin struct {
 // The digests are produced by the guest kernel build itself, so bumping a pin
 // never means fetching anything by hand:
 //
-//  1. Run the guest build (hack/guest/build.sh). It prints the kernel version,
+//  1. Run the guest build (hack/guest-kernel/build.sh). It prints the kernel version,
 //     the config hash, and the sha256 of each artifact it produced.
 //  2. Set ActiveGuestKernel to "<kernel version>-<config hash>" as printed.
 //  3. Replace the one entry below: its key becomes ActiveGuestKernel, its
@@ -112,27 +112,23 @@ type GuestKernelPin struct {
 // exactly why ensure retains the previous one.
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
-		KernelVersion: "v6.18.48",
-		// Minted 2026-09-02 from the v6.18.48-k3sm.5 release. The KERNEL is
-		// byte-identical to k3sm.1/k3sm.2 — same unmodified upstream tarball,
-		// same kernel.config, same build.sh, so ImageSHA256 and the config hash
-		// 9c05f8f3b26c… (the -suffix of ActiveGuestKernel) are unchanged. Only
-		// the initramfs moved: it carries the rebuilt k3sm-guest-init with the
-		// interactive-terminal work — exec pty allocation from the container's
-		// own devpts, container tty at spawn with a retained master for attach,
-		// the byte-granular attach output source, capability advertisement
-		// (tty-exec, attach), and the minimal allowlisted per-container /dev
-		// (OCI default device set + private devpts + bounded shm; /dev/vsock is
-		// never exposed to a container).
+		KernelVersion: "v6.18.53",
+		// Minted 2026-09-25 from the v6.18.53-k3sm.1 release. Both artifacts
+		// moved. The KERNEL is upstream 6.18.53 built from a kernel.config
+		// regenerated for it (config hash b5d9e2733a91…, the -suffix of
+		// ActiveGuestKernel); build.sh --repro produced a byte-identical Image
+		// across two clean builds. The INITRAMFS carries k3sm-guest-init built
+		// from runtimed 966496b, the first to apply the image's ownership and
+		// mode sidecar in the guest before container start.
 		//
 		// Two clean builds (fresh GOCACHE, -trimpath -buildvcs=false
 		// -ldflags=-buildid=) produced a byte-identical cpio, and BOTH digests
 		// below were re-derived by unauthenticated download of the published
 		// assets — never from the local build output, so a mismatch between what
 		// was built and what was uploaded cannot hide here.
-		ImageSHA256:     "d50508b08205453e5f5f710978743449dc4fafe957aa8694e6da8e5780d93308",
-		InitramfsSHA256: "652e77dea2be3525c4802c22efce8cfa2171a899719e3c1bc766b53487b3fee1",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.48-k3sm.5",
+		ImageSHA256:     "1dd105bcfbd9737a0c6e057b2d5ed81015af905bff36bf2448aed0cbe07ddec8",
+		InitramfsSHA256: "be7fa5f0afd794846db5a28c6275daf382b4be642d3899a793e80049a469dcc7",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.53-k3sm.1",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
