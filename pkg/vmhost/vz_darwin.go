@@ -98,6 +98,12 @@ func realize(cfg MachineConfig) (*vz.VirtualMachineConfiguration, error) {
 
 	// Shares. The read-only flag is applied here, at the device, which is the only
 	// enforcement point a guest cannot reach (see ShareConfig).
+	//
+	// The server behind each share is the framework's own in-process virtiofs
+	// server, running unprivileged in this process; k3sm has no code in the
+	// guest's create path. Known limitation: a guest create with mode 0000 on a
+	// writable share fails with EPERM and leaves an entry behind (rm -f clears
+	// it). See docs/vm-shares.md.
 	fsDevices := make([]vz.DirectorySharingDeviceConfiguration, 0, len(cfg.Shares))
 	for _, s := range cfg.Shares {
 		dev, err := vz.NewVirtioFileSystemDeviceConfiguration(s.Tag)
