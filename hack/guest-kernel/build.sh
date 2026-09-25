@@ -22,6 +22,14 @@
 #   hack/guest-kernel/build.sh                 build once into out/
 #   hack/guest-kernel/build.sh --repro         build twice, byte-compare
 #   hack/guest-kernel/build.sh --regen-config  regenerate the committed config
+#   hack/guest-kernel/build.sh --refresh-keys  re-mint keys/*.asc for review
+#
+# The two signing keys are imported from keys/, never fetched: the fingerprint
+# constants below are the trust anchors, and the key files are machine-minted
+# caches of the bytes those fingerprints name (see keys/README.md). Every import
+# asserts the keyring then holds exactly the pinned key and dies otherwise.
+# --refresh-keys is the ONLY path that talks to a keyserver, and nothing ever
+# falls back to it: a key file that fails its assertion fails the build.
 #
 # Every toolchain stage runs inside a vm-RuntimeClass pod on the local k3sm
 # cluster (see run_in_toolchain): nothing but curl, shasum, tar, kubectl and
@@ -32,13 +40,23 @@
 # The recipe therefore depends on a working vm RuntimeClass. If a shipped guest
 # kernel is bad enough to break vm pods, recover by the standing rollback: revert
 # the guestartifacts pin, reinstall, then rebuild here on the healthy runtime.
+#
+# Interrupt latency: the INT/TERM traps are bash traps, and bash runs a trap
+# only after the foreground command it is waiting on returns. A TERM sent to
+# this script's pid during a stage is therefore acted on when that stage's
+# `kubectl exec` ends, which for a build stage can be the whole compile. The
+# bound is the running stage's own duration; nothing shorter is promised. To
+# stop promptly, signal the process group (`kill -TERM -<pgid>`, which is what
+# Ctrl-C does) so kubectl exits too, or delete the run's namespace
+# (guest-kernel-build-<pid>), which ends the stage pod and with it the exec.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly HERE
 readonly OUT_DIR="$HERE/out"
 readonly CACHE_DIR="$HERE/.cache"
 readonly CONFIG_FILE="$HERE/kernel.config"
+readonly KEYS_DIR="$HERE/keys"
 
 # ---------------------------------------------------------------- the pins
 
@@ -55,12 +73,8 @@ readonly KERNEL_SHA256="4d6fba95c2244b08a7b4144a4d38b9be4fb31abb5e7682ae40bb5cb1
 
 # "Kernel.org checksum autosigner <autosigner@kernel.org>", rsa4096, created
 # 2013-01-24. This is the PRIMARY key fingerprint; its long id 632D3A06589DA6B1
-# is what gpg reports as the issuer of sha256sums.asc.
-#
-# keys.openpgp.org does NOT carry this key (verified 2026-08-31: HTTP 404 for
-# op=get on the fingerprint), so keyserver.ubuntu.com leads the list. The order
-# is a fallback chain, not a preference for one operator's honesty: the key is
-# accepted only if it hashes to the fingerprint above, whoever served it.
+# is what gpg reports as the issuer of sha256sums.asc. Its public key is read
+# from keys/<fingerprint>.asc and accepted only if it IS this fingerprint.
 readonly KERNEL_KEY_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
 
 # Greg Kroah-Hartman's stable-release key — the SECOND, independent trust
@@ -73,7 +87,6 @@ readonly KERNEL_KEY_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
 # mirror-integrity check, and this script requires BOTH to pass.
 readonly KERNEL_DEV_KEY_FPR="647F28654894E3BD457199BE38DBBDC86092693E"
 readonly KERNEL_SIGN_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.sign"
-readonly KEYSERVERS="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.openpgp.org"
 
 # debian:trixie-slim, linux/arm64/v8, resolved 2026-08-31. The digest is the
 # reproducibility anchor; the apt package versions inside it deliberately are
@@ -194,12 +207,14 @@ scratch_dir() {
 
 usage() {
   cat <<'USAGE'
-usage: hack/guest-kernel/build.sh [--repro | --regen-config]
+usage: hack/guest-kernel/build.sh [--repro | --regen-config | --refresh-keys]
 
   (no flag)        verify provenance, build once, write out/Image
   --repro          build twice into separate trees and byte-compare them
   --regen-config   regenerate hack/guest-kernel/kernel.config from defconfig
                    plus the required option set, inside the pinned toolchain
+  --refresh-keys   fetch both signing keys from a keyserver, assert their
+                   fingerprints, and overwrite keys/*.asc for review (host gpg)
 USAGE
 }
 
@@ -482,36 +497,95 @@ verify_provenance() {
 }
 
 # host_verify_sums verifies with the host's gpg into a throwaway GNUPGHOME, so
-# the operator's own keyring is neither read nor written.
+# the operator's own keyring is neither read nor written. The work runs in a
+# subshell so that a die inside it still reaches the cleanup below: a RETURN
+# trap does not fire on exit, and every exit path must stop the home's daemons.
 host_verify_sums() {
-  local signed="$1"
-  local home; home="$(mktemp -d)"
-  # shellcheck disable=SC2064  # $home must expand now, not at trap time
-  trap "rm -rf '$home'" RETURN
-  chmod 700 "$home"
+  local signed="$1" home out status=0
+  home="$(new_gnupg_home)" || die "could not create a throwaway GNUPGHOME"
+  out="$(host_verify_sums_in "$home" "$signed")" || status=$?
+  gnupg_home_rm "$home"
+  [ "$status" -eq 0 ] || exit "$status"
+  printf '%s\n' "$out"
+}
 
+host_verify_sums_in() {
+  local home="$1" signed="$2"
   import_key_checked "$home" "$KERNEL_KEY_FPR"
   gpg --batch --homedir "$home" --output "$home/sums.txt" --verify "$signed" >/dev/null 2>&1 \
     || die "PGP VERIFICATION FAILED for $KERNEL_SUMS_URL"
   awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' "$home/sums.txt"
 }
 
-# import_key_checked fetches one key by full fingerprint and then ASSERTS the
-# keyring really holds a key of that fingerprint. Modern gpg is expected to
-# reject a substituted keyserver response itself, but that expectation lives in
-# gpg's internals; this check makes it a property of THIS script, for whatever
-# gpg version the host or the unpinned apt archive supplies.
+# key_file FPR prints the in-tree path of the public key pinned as FPR.
+key_file() { printf '%s/%s.asc\n' "$KEYS_DIR" "$1"; }
+
+# new_gnupg_home makes a throwaway GNUPGHOME under $TMPDIR, deliberately not
+# under the repo's cache: gpg's daemons put their sockets in the home, and a
+# socket path longer than the 104-byte sun_path limit makes every gpg call that
+# needs a daemon fail ("File name too long") in a deeply nested checkout.
+new_gnupg_home() {
+  local home
+  home="$(mktemp -d)" || return 1
+  chmod 700 "$home"
+  printf '%s\n' "$home"
+}
+
+# gnupg_home_rm HOME stops every daemon HOME started, THEN removes HOME. The
+# order is load-bearing: dirmngr (and gpg-agent, keyboxd) outlive the gpg that
+# spawned them, and they are reached only through the sockets inside HOME, so a
+# remove-first cleanup leaves them running with nothing able to stop them.
+gnupg_home_rm() {
+  local home="$1"
+  [ -n "$home" ] || return 0
+  gpgconf --homedir "$home" --kill all >/dev/null 2>&1 || true
+  rm -rf "$home"
+}
+
+# assert_sole_key HOME FPR dies unless HOME's keyring holds exactly one primary
+# key and it is FPR. "Exactly one" matters as much as "FPR": a key file that
+# carried the pinned key AND a second one would let a signature by the second
+# verify as good, and gpg's exit status would not tell the two apart.
+assert_sole_key() {
+  local home="$1" fpr="$2" held
+  held="$(gpg --batch --homedir "$home" --with-colons --list-keys 2>/dev/null \
+    | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { printf "%s ", $10; p = 0 }')" || held=""
+  [ "$held" = "$fpr " ] \
+    || die "KEY FINGERPRINT MISMATCH: expected exactly $fpr, keyring holds: ${held:-nothing}"
+}
+
+# import_key_checked HOME FPR [FILE] imports the in-tree key file for FPR (or
+# FILE) and ASSERTS the keyring now holds exactly that key. The file is a cache,
+# not an anchor: whatever bytes it holds, only the fingerprint decides. There is
+# no network fallback; a file that fails here fails the run, and re-minting it
+# is the explicit --refresh-keys.
 import_key_checked() {
-  local home="$1" fpr="$2" got=0 ks
-  for ks in $KEYSERVERS; do
-    if gpg --batch --homedir "$home" --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then
-      got=1; break
-    fi
-  done
-  [ "$got" -eq 1 ] || die "could not fetch key $fpr from any of: $KEYSERVERS"
-  gpg --batch --homedir "$home" --fingerprint --with-colons 2>/dev/null \
-    | grep -q "^fpr:::::::::${fpr}:$" \
-    || die "keyring does not hold a key with fingerprint $fpr after import"
+  local home="$1" fpr="$2" file="${3:-}"
+  [ -n "$file" ] || file="$(key_file "$fpr")"
+  [ -f "$file" ] || die "missing pinned key file $file (mint it with --refresh-keys and review)"
+  gpg --batch --homedir "$home" --import "$file" >/dev/null 2>&1 \
+    || die "could not import key file $file"
+  assert_sole_key "$home" "$fpr"
+}
+
+# check_key_file FPR [FILE] runs the import assertion in its own throwaway
+# home and cleans it up on every path, exiting with the assertion's status.
+check_key_file() {
+  local fpr="$1" file="${2:-}" home status=0
+  home="$(new_gnupg_home)" || die "could not create a throwaway GNUPGHOME"
+  (import_key_checked "$home" "$fpr" "$file") || status=$?
+  gnupg_home_rm "$home"
+  [ "$status" -eq 0 ] || exit "$status"
+}
+
+# stage_key_file FPR WORK copies the in-tree key for FPR into WORK as
+# signer.asc, so run_in_toolchain's stream_in carries it into the pod with the
+# rest of /work, hashed on both ends. The pod then asserts the fingerprint.
+stage_key_file() {
+  local fpr="$1" work="$2" file
+  file="$(key_file "$fpr")"
+  [ -f "$file" ] || die "missing pinned key file $file (mint it with --refresh-keys and review)"
+  cp "$file" "$work/signer.asc" || die "could not stage $file"
 }
 
 # container_verify_sums does the same inside the digest-pinned toolchain, for a
@@ -523,27 +597,27 @@ container_verify_sums() {
   # shellcheck disable=SC2064  # $work must expand now, not at trap time
   trap "rm -rf '$work'" RETURN
   cp "$signed" "$work/sha256sums.asc"
+  stage_key_file "$KERNEL_KEY_FPR" "$work"
 
   run_in_toolchain "$work" "" \
     KERNEL_KEY_FPR="$KERNEL_KEY_FPR" \
-    KEYSERVERS="$KEYSERVERS" \
     KERNEL_TARBALL="$KERNEL_TARBALL" \
     >/dev/null <<'INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
-apt-get -qq install -y --no-install-recommends gnupg dirmngr ca-certificates >/dev/null
+apt-get -qq install -y --no-install-recommends gnupg >/dev/null
 export GNUPGHOME=/tmp/gnupg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-fetch_key() {
-  fpr="$1"; got=0
-  for ks in $KEYSERVERS; do
-    if gpg --batch --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then got=1; break; fi
-  done
-  [ "$got" -eq 1 ] || { echo "could not fetch key $fpr" >&2; exit 1; }
-  gpg --batch --fingerprint --with-colons 2>/dev/null | grep -q "^fpr:::::::::${fpr}:$" \
-    || { echo "keyring does not hold a key with fingerprint $fpr after import" >&2; exit 1; }
+# The key arrived as /work/signer.asc over the sha256-verified stream; the
+# fingerprint, not the transport, is what makes it the pinned key.
+gpg --batch --import /work/signer.asc >/dev/null 2>&1 \
+  || { echo "could not import the streamed key file" >&2; exit 1; }
+held="$(gpg --batch --with-colons --list-keys 2>/dev/null \
+  | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { printf "%s ", $10; p = 0 }')" || held=""
+[ "$held" = "$KERNEL_KEY_FPR " ] || {
+  echo "KEY FINGERPRINT MISMATCH: expected exactly $KERNEL_KEY_FPR, keyring holds: ${held:-nothing}" >&2
+  exit 1
 }
-fetch_key "$KERNEL_KEY_FPR"
 gpg --batch --output /tmp/sums.txt --verify /work/sha256sums.asc >/dev/null 2>&1 \
   || { echo "PGP VERIFICATION FAILED" >&2; exit 1; }
 awk -v f="$KERNEL_TARBALL" '$2 == f { print $1; exit }' /tmp/sums.txt > /work/pinned
@@ -567,24 +641,26 @@ verify_dev_signature() {
   trap "rm -rf '$work'" RETURN
   cp "$sign" "$work/tar.sign"
   cp "$CACHE_DIR/$KERNEL_TARBALL" "$work/$KERNEL_TARBALL"
+  stage_key_file "$KERNEL_DEV_KEY_FPR" "$work"
 
   run_in_toolchain "$work" "" \
     KERNEL_DEV_KEY_FPR="$KERNEL_DEV_KEY_FPR" \
-    KEYSERVERS="$KEYSERVERS" \
     KERNEL_TARBALL="$KERNEL_TARBALL" \
     >/dev/null <<'INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
-apt-get -qq install -y --no-install-recommends gnupg dirmngr ca-certificates xz-utils >/dev/null
+apt-get -qq install -y --no-install-recommends gnupg xz-utils >/dev/null
 export GNUPGHOME=/tmp/gnupg; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-got=0
-for ks in $KEYSERVERS; do
-  if gpg --batch --keyserver "$ks" --recv-keys "0x$KERNEL_DEV_KEY_FPR" >/dev/null 2>&1; then got=1; break; fi
-done
-[ "$got" -eq 1 ] || { echo "could not fetch key $KERNEL_DEV_KEY_FPR" >&2; exit 1; }
-gpg --batch --fingerprint --with-colons 2>/dev/null | grep -q "^fpr:::::::::${KERNEL_DEV_KEY_FPR}:$" \
-  || { echo "keyring does not hold a key with fingerprint $KERNEL_DEV_KEY_FPR after import" >&2; exit 1; }
+# As in container_verify_sums: streamed in, then accepted only by fingerprint.
+gpg --batch --import /work/signer.asc >/dev/null 2>&1 \
+  || { echo "could not import the streamed key file" >&2; exit 1; }
+held="$(gpg --batch --with-colons --list-keys 2>/dev/null \
+  | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { printf "%s ", $10; p = 0 }')" || held=""
+[ "$held" = "$KERNEL_DEV_KEY_FPR " ] || {
+  echo "KEY FINGERPRINT MISMATCH: expected exactly $KERNEL_DEV_KEY_FPR, keyring holds: ${held:-nothing}" >&2
+  exit 1
+}
 xz -cd "/work/$KERNEL_TARBALL" | gpg --batch --verify /work/tar.sign - >/dev/null 2>&1 \
   || { echo "DEVELOPER SIGNATURE VERIFICATION FAILED" >&2; exit 1; }
 INNER
@@ -783,15 +859,70 @@ repro() {
   die "reproducible: DIFFER — the two builds are not byte-identical"
 }
 
+# ---- refresh-keys: the ONLY keyserver path (hack/acceptance/B392.sh checks this)
+
+# refresh_keys re-mints keys/<fpr>.asc for both pinned fingerprints from a
+# keyserver. It is never called by a build: a key file that fails its assertion
+# fails the build, and the operator decides whether to run this. The output is a
+# working-tree change for review, not a new trust decision; that decision is the
+# fingerprint constant, which this does not touch.
+#
+# keys.openpgp.org does NOT carry the autosigner key (verified 2026-08-31: HTTP
+# 404 for op=get on the fingerprint), so keyserver.ubuntu.com leads the list.
+# The order is a fallback chain, not a preference for one operator's honesty:
+# a key is kept only if it IS the pinned fingerprint, whoever served it.
+# dirmngr is told disable-ipv6 because a host that routes no IPv6 otherwise
+# fails on the keyserver's AAAA record with no-route-to-host.
+refresh_keys() {
+  command -v gpg >/dev/null || die "--refresh-keys needs host gpg (brew install gnupg)"
+  local keyservers="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.openpgp.org"
+  local fpr home status
+  mkdir -p "$KEYS_DIR"
+  for fpr in "$KERNEL_KEY_FPR" "$KERNEL_DEV_KEY_FPR"; do
+    home="$(new_gnupg_home)" || die "could not create a throwaway GNUPGHOME"
+    status=0
+    (refresh_one "$home" "$fpr" "$keyservers") || status=$?
+    gnupg_home_rm "$home"
+    [ "$status" -eq 0 ] || exit "$status"
+    check_key_file "$fpr"
+    echo "  refreshed: $(key_file "$fpr") (fingerprint asserted; review the diff)"
+  done
+}
+
+refresh_one() {
+  local home="$1" fpr="$2" keyservers="$3" ks got=0 file tmp
+  echo "disable-ipv6" > "$home/dirmngr.conf"
+  for ks in $keyservers; do
+    if gpg --batch --homedir "$home" --keyserver "$ks" --recv-keys "0x$fpr" >/dev/null 2>&1; then
+      got=1; break
+    fi
+  done
+  [ "$got" -eq 1 ] || die "could not fetch key $fpr from any of: $keyservers"
+  assert_sole_key "$home" "$fpr"
+  file="$(key_file "$fpr")"
+  tmp="$file.tmp.$$"
+  gpg --batch --homedir "$home" --armor --export-options export-clean --export "$fpr" > "$tmp" \
+    || { rm -f "$tmp"; die "could not export key $fpr"; }
+  mv -f "$tmp" "$file"
+}
+
+# ---- end refresh-keys
+
 main() {
   local mode="build"
   case "${1-}" in
     "")             mode="build" ;;
     --repro)        mode="repro" ;;
     --regen-config) mode="regen" ;;
+    --refresh-keys) mode="refresh" ;;
     -h|--help)      usage; exit 0 ;;
     *)              usage >&2; die "unknown argument: $1" ;;
   esac
+
+  if [ "$mode" = "refresh" ]; then
+    refresh_keys
+    return 0
+  fi
 
   if [ "$mode" = "regen" ]; then
     # The config file is regen's OUTPUT, so preflight's check for it would be a
@@ -823,4 +954,8 @@ main() {
   report "$OUT_DIR/Image"
 }
 
-main "$@"
+# Run main only when executed. hack/acceptance/B392.sh sources this file to
+# drive the key helpers offline, without a cluster.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
