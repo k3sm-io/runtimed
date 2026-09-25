@@ -23,8 +23,11 @@
 #   hack/guest-kernel/build.sh --repro         build twice, byte-compare
 #   hack/guest-kernel/build.sh --regen-config  regenerate the committed config
 #
-# The build runs entirely inside Docker: nothing but curl, shasum and (for the
-# provenance check) gpg is asked of the host.
+# Every toolchain stage runs inside a vm-RuntimeClass pod on the local k3sm
+# cluster (see run_in_toolchain): nothing but curl, shasum, tar, kubectl and
+# (for the provenance check) gpg is asked of the host, and no container daemon
+# is involved at all. The toolchain image still comes from the library registry
+# by digest, pulled by k3sm's own vm path.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -75,7 +78,39 @@ readonly KEYSERVERS="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.
 readonly TOOLCHAIN_IMAGE="debian@sha256:7215f78f35ffe58fe13f244fac9c4f21326d55187271fbb3e1a8aa5cc7e387ab"
 readonly TOOLCHAIN_TAG="debian:trixie-slim"
 
-readonly BUILD_DEPS="gcc make perl python3 flex bison bc libssl-dev libelf-dev xz-utils cpio"
+# libarchive-tools supplies bsdtar for the source extraction; see the
+# extraction line in build_one for why GNU tar cannot do it here.
+readonly BUILD_DEPS="gcc make perl python3 flex bison bc libssl-dev libelf-dev xz-utils cpio libarchive-tools"
+
+# ------------------------------------------------------------- the runner
+
+# The kube context of the local k3sm cluster the toolchain pods run on. The
+# cluster is this machine's own: `sudo k3sm install` makes one.
+readonly KUBE_CONTEXT="k3sm"
+
+# The pod's image is TOOLCHAIN_IMAGE fully qualified, so the digest above stays
+# the one constant both the pin and the pull are made from.
+readonly TOOLCHAIN_POD_IMAGE="docker.io/library/${TOOLCHAIN_IMAGE}"
+
+# Guest sizing. On a vm pod the memory limit IS the guest's RAM and the CPU
+# limit its vCPU count. 4Gi is chosen against the smallest supported host, an
+# 8 GiB Mac whose node advertises 6Gi allocatable: it leaves the node ~2Gi and
+# comfortably covers `make -j4` of this config (gcc peaks well under 1 GiB per
+# job). The work tree does NOT live in this RAM: /work and /src are
+# default-medium emptyDirs, which the vm backend serves from host disk.
+readonly TOOLCHAIN_POD_CPU="4"
+readonly TOOLCHAIN_POD_MEMORY="4Gi"
+
+# The work emptyDir's ceiling. It holds the extracted tree and the objects of
+# one build (the tarball arrives separately, on /src), and it lives on the
+# host's disk, so the bound is what keeps a runaway stage from filling the
+# disk under the cluster that is running it.
+readonly TOOLCHAIN_WORK_LIMIT="5Gi"
+
+# One namespace per invocation, torn down with everything in it on exit. A
+# dedicated namespace means the teardown can never reach a pod this script did
+# not create.
+readonly RUN_NAMESPACE="guest-kernel-build-$$"
 
 # Reproducibility: the three values the kernel would otherwise take from the
 # clock and the builder's account, each of which alone defeats a byte-compare.
@@ -145,15 +180,12 @@ SERIAL_AMBA_PL011_CONSOLE RTC_CLASS
 die() { printf 'guest-kernel: %s\n' "$*" >&2; exit 1; }
 note() { printf '\n==> %s\n' "$*"; }
 
-# scratch_dir makes a work directory UNDER the repo rather than in $TMPDIR.
-# Docker Desktop shares an explicit list of host paths, and macOS's per-user
-# /var/folders TMPDIR is not on the default list: a bind mount of a mktemp -d
-# silently presents as an EMPTY directory in the container, which reads as a
-# missing file rather than as a sharing problem. A path under the checkout is
-# reachable because the checkout is what the operator is working in.
+# scratch_dir makes a work directory UNDER the repo's gitignored cache rather
+# than in $TMPDIR, so everything a build leaves on the host sits in one place
+# that `rm -rf hack/guest-kernel/.cache` clears.
 scratch_dir() {
   mkdir -p "$CACHE_DIR"
-  mktemp -d "$CACHE_DIR/work.XXXXXXXX"
+  mktemp -d "$CACHE_DIR/work.$$.XXXXXXXX"
 }
 
 usage() {
@@ -172,14 +204,231 @@ USAGE
 # worse failure than the same tool missing in the first second.
 preflight() {
   local missing=0
-  command -v docker >/dev/null || { echo "PREFLIGHT FAIL: docker not found (install Docker Desktop)"; missing=1; }
-  command -v curl   >/dev/null || { echo "PREFLIGHT FAIL: curl not found"; missing=1; }
-  command -v shasum >/dev/null || { echo "PREFLIGHT FAIL: shasum not found"; missing=1; }
+  command -v kubectl >/dev/null || { echo "PREFLIGHT FAIL: kubectl not found"; missing=1; }
+  command -v curl    >/dev/null || { echo "PREFLIGHT FAIL: curl not found"; missing=1; }
+  command -v shasum  >/dev/null || { echo "PREFLIGHT FAIL: shasum not found"; missing=1; }
+  command -v tar     >/dev/null || { echo "PREFLIGHT FAIL: tar not found"; missing=1; }
   [ "$missing" -eq 0 ] || exit 1
-  docker info >/dev/null 2>&1 \
-    || die "PREFLIGHT FAIL: the Docker daemon is not answering (start Docker Desktop and retry)"
+  cluster_preflight
   [ -f "$CONFIG_FILE" ] || die "PREFLIGHT FAIL: $CONFIG_FILE is missing (run --regen-config)"
-  echo "preflight ok: docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), toolchain $TOOLCHAIN_IMAGE"
+  echo "preflight ok: k3sm context $KUBE_CONTEXT, node $(cluster_node), toolchain $TOOLCHAIN_IMAGE"
+}
+
+# cluster_preflight asserts the three facts run_in_toolchain depends on: the
+# context answers, it serves the vm RuntimeClass, and a node is Ready. Each
+# failure names the remedy, because the likeliest cause on a fresh Mac is that
+# no local cluster was ever installed.
+cluster_preflight() {
+  local remedy="(install the local cluster with 'sudo k3sm install' and retry)"
+  kube get --raw /readyz >/dev/null 2>&1 \
+    || die "PREFLIGHT FAIL: kube context '$KUBE_CONTEXT' is not reachable $remedy"
+  kube get runtimeclass vm >/dev/null 2>&1 \
+    || die "PREFLIGHT FAIL: the cluster serves no 'vm' RuntimeClass $remedy"
+  [ -n "$(cluster_node)" ] \
+    || die "PREFLIGHT FAIL: the cluster has no Ready node $remedy"
+}
+
+# cluster_node prints the name of the first Ready node, or nothing.
+cluster_node() {
+  kube get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' 2>/dev/null \
+    | awk '$2 == "True" { print $1; exit }'
+}
+
+kube() { kubectl --context "$KUBE_CONTEXT" "$@"; }
+
+# ------------------------------------------------------ run_in_toolchain
+
+# run_in_toolchain WORK SRC [NAME=VALUE ...] < SCRIPT
+#
+# Runs SCRIPT with bash in the digest-pinned toolchain, inside a fresh
+# vm-RuntimeClass pod on the local k3sm cluster, with:
+#   - /work holding WORK's top-level regular files (the working directory),
+#   - /src holding SRC's top-level regular files (omitted when SRC is ""),
+#   - each NAME=VALUE in the environment,
+# and on success copies /work's top-level regular files back into WORK. A
+# directory the stage builds under /work (the extracted kernel tree) stays in
+# the guest and dies with the pod: the only outputs are the files a stage
+# deliberately leaves at the top of /work.
+#
+# The guest cannot see the host filesystem (hostPath is sealed for vm guests
+# by design), so every input and output crosses as a tar stream over kubectl
+# exec — and every file of every stream is sha256-hashed on BOTH ends and
+# compared, so the transport is not a party the build has to trust. One pod per
+# stage, as one container per stage: no stage inherits another's state.
+run_in_toolchain() {
+  local work="$1" src="$2"; shift 2
+  local script; script="$(cat)"
+  # BASH_SUBSHELL keeps a stage started from a command substitution (whose
+  # counter is a copy) from reusing a name the parent will use later.
+  local pod="stage-$((++POD_SEQ))-${BASH_SUBSHELL}"
+
+  toolchain_pod_up "$pod"
+
+  # BOOTSTRAP SHIM for the guest-artifact lag. Guests booted from artifacts
+  # older than v6.18.53-k3sm.1 do not apply the image's ownership and mode
+  # sidecar, so the Debian rootfs arrives with /tmp and /var/tmp at 0755 rather
+  # than the image's 1777, and apt (which drops to _apt to check signatures)
+  # cannot create its temp files. The Docker toolchain this runner replaced had
+  # a correct /tmp, so this RESTORES that environment rather than departing
+  # from it; every stage of a build and of --repro gets it alike.
+  # REMOVE once the shipped guest artifacts are >= v6.18.53-k3sm.1, the first
+  # release whose initramfs carries the in-guest ownership apply.
+  kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- chmod 1777 /tmp /var/tmp \
+    || die "bootstrap shim: could not restore /tmp and /var/tmp to 1777 in $pod"
+
+  stream_in "$pod" "$work" /work
+  [ -z "$src" ] || stream_in "$pod" "$src" /src
+
+  local status=0
+  kube -n "$RUN_NAMESPACE" exec -i "$pod" -c toolchain -- \
+    env "$@" bash -c 'cd /work && exec bash -s' <<<"$script" || status=$?
+
+  [ "$status" -ne 0 ] || stream_out "$pod" /work "$work"
+  kube -n "$RUN_NAMESPACE" delete pod "$pod" --wait=true --timeout=180s >/dev/null 2>&1 || true
+  return "$status"
+}
+
+POD_SEQ=0
+
+# teardown deletes this run's namespace, and with it every pod and emptyDir
+# the run created, plus this run's host scratch directories (a stage that dies
+# skips its own cleanup). It is the top-level shell's EXIT trap, so a failed or
+# interrupted stage leaves no guest behind; a stage that dies inside a command
+# substitution takes the whole script down with it (set -e), which fires this.
+teardown() {
+  rm -rf "$CACHE_DIR"/work.$$.*
+  kube delete namespace "$RUN_NAMESPACE" --wait=false >/dev/null 2>&1 || true
+}
+
+# open_namespace creates the run's namespace and arms its teardown. Called once,
+# from the top-level shell, before the first stage: a subshell must not own the
+# namespace, or its exit would delete it from under the parent's later stages.
+open_namespace() {
+  kube create namespace "$RUN_NAMESPACE" >/dev/null \
+    || die "could not create namespace $RUN_NAMESPACE"
+  trap teardown EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  echo "  runner: namespace $RUN_NAMESPACE on context $KUBE_CONTEXT"
+}
+
+# toolchain_pod_up creates one stage pod and waits for it to run. The pod is
+# nothing but the pinned image sleeping: every stage command arrives by exec.
+toolchain_pod_up() {
+  local pod="$1"
+  echo "  runner: pod $RUN_NAMESPACE/$pod (vm, ${TOOLCHAIN_POD_CPU} vCPU, ${TOOLCHAIN_POD_MEMORY})" >&2
+  kube -n "$RUN_NAMESPACE" create -f - >/dev/null <<EOF || die "could not create pod $pod"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  labels:
+    app.kubernetes.io/name: k3sm-guest-kernel-build
+spec:
+  runtimeClassName: vm
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 1
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: toolchain
+      image: $TOOLCHAIN_POD_IMAGE
+      command: ["sleep", "infinity"]
+      workingDir: /work
+      resources:
+        requests: {cpu: "$TOOLCHAIN_POD_CPU", memory: "$TOOLCHAIN_POD_MEMORY"}
+        limits:   {cpu: "$TOOLCHAIN_POD_CPU", memory: "$TOOLCHAIN_POD_MEMORY"}
+      volumeMounts:
+        - {name: work, mountPath: /work}
+        - {name: src, mountPath: /src}
+  volumes:
+    - {name: work, emptyDir: {sizeLimit: $TOOLCHAIN_WORK_LIMIT}}
+    - {name: src, emptyDir: {}}
+EOF
+  if ! kube -n "$RUN_NAMESPACE" wait --for=condition=Ready "pod/$pod" --timeout=600s >/dev/null 2>&1; then
+    kube -n "$RUN_NAMESPACE" get pod "$pod" -o wide >&2 || true
+    kube -n "$RUN_NAMESPACE" get events --field-selector "involvedObject.name=$pod" >&2 || true
+    die "toolchain pod $pod did not become Ready"
+  fi
+}
+
+# top_files DIR prints DIR's top-level regular file names, one per line, sorted.
+top_files() {
+  (cd "$1" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)
+}
+
+# safe_name dies on a name the tar/hash plumbing would have to quote. Called
+# from the consuming loop (never inside a pipeline, where die would only end a
+# subshell).
+safe_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._+-]+$ ]] || die "refusing to stream a file with an unsafe name: $1"
+}
+
+# guest_sums POD DIR FILE... prints sha256sum lines for the files in-guest.
+guest_sums() {
+  local pod="$1" dir="$2"; shift 2
+  kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- \
+    sh -c 'cd "$1" && shift && sha256sum -- "$@"' sh "$dir" "$@" \
+    || die "could not hash $pod:$dir in-guest"
+}
+
+# host_sums DIR FILE... prints the same line shape for the files on the host.
+host_sums() {
+  local dir="$1"; shift
+  (cd "$dir" && shasum -a 256 -- "$@") || die "could not hash $dir on the host"
+}
+
+# compare_sums DIRECTION HOST GUEST dies unless the two hash listings agree
+# line for line, and prints each verified file as evidence.
+compare_sums() {
+  local what="$1" host="$2" guest="$3"
+  if [ "$host" != "$guest" ]; then
+    printf '  STREAM HASH MISMATCH (%s)\n  host:\n%s\n  guest:\n%s\n' "$what" "$host" "$guest" >&2
+    die "a streamed file hashed differently on the two ends ($what)"
+  fi
+  printf '%s\n' "$host" | while read -r sum name; do
+    echo "  stream $what: $name sha256=$sum (host == guest)" >&2
+  done
+}
+
+# stream_in POD HOSTDIR GUESTDIR copies HOSTDIR's top-level files into the
+# guest and verifies them there.
+stream_in() {
+  local pod="$1" dir="$2" dest="$3" files=() listing f
+  listing="$(top_files "$dir")" || die "could not list $dir"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    safe_name "$f"; files+=("$f")
+  done <<<"$listing"
+  [ "${#files[@]}" -gt 0 ] || return 0
+  (cd "$dir" && COPYFILE_DISABLE=1 tar --format ustar -cf - -- "${files[@]}") \
+    | kube -n "$RUN_NAMESPACE" exec -i "$pod" -c toolchain -- tar -C "$dest" --no-same-owner -xf - \
+    || die "streaming $dir into $pod:$dest failed"
+  compare_sums "in $dest" "$(host_sums "$dir" "${files[@]}")" "$(guest_sums "$pod" "$dest" "${files[@]}")"
+}
+
+# stream_out POD GUESTDIR HOSTDIR copies GUESTDIR's top-level files out of the
+# guest and verifies them on the host.
+stream_out() {
+  local pod="$1" src="$2" dir="$3" files=() listing f
+  listing="$(kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- find "$src" -maxdepth 1 -type f -printf '%f\n')" \
+    || die "could not list $pod:$src"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    safe_name "$f"; files+=("$f")
+  done <<<"$(printf '%s\n' "$listing" | LC_ALL=C sort)"
+  [ "${#files[@]}" -gt 0 ] || return 0
+  local guest; guest="$(guest_sums "$pod" "$src" "${files[@]}")"
+  kube -n "$RUN_NAMESPACE" exec "$pod" -c toolchain -- tar -C "$src" --format ustar -cf - -- "${files[@]}" \
+    | tar -C "$dir" -xf - \
+    || die "streaming $pod:$src out to $dir failed"
+  compare_sums "out $src" "$(host_sums "$dir" "${files[@]}")" "$guest"
 }
 
 # gpg_cmd echoes how to run gpg. The host's own gpg is preferred; when it is
@@ -203,7 +452,7 @@ verify_provenance() {
     extracted="$(host_verify_sums "$signed")"
   else
     echo "  host gpg not found; verifying inside the pinned toolchain image instead"
-    echo "  (install one with 'brew install gnupg' to verify without Docker)"
+    echo "  (install one with 'brew install gnupg' to verify without a toolchain pod)"
     extracted="$(container_verify_sums "$signed")"
   fi
 
@@ -256,12 +505,11 @@ container_verify_sums() {
   trap "rm -rf '$work'" RETURN
   cp "$signed" "$work/sha256sums.asc"
 
-  docker run --rm -i --platform linux/arm64 \
-    -v "$work:/work" -w /work \
-    -e KERNEL_KEY_FPR="$KERNEL_KEY_FPR" \
-    -e KEYSERVERS="$KEYSERVERS" \
-    -e KERNEL_TARBALL="$KERNEL_TARBALL" \
-    "$TOOLCHAIN_IMAGE" bash -s >/dev/null <<'INNER'
+  run_in_toolchain "$work" "" \
+    KERNEL_KEY_FPR="$KERNEL_KEY_FPR" \
+    KEYSERVERS="$KEYSERVERS" \
+    KERNEL_TARBALL="$KERNEL_TARBALL" \
+    >/dev/null <<'INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
@@ -301,12 +549,11 @@ verify_dev_signature() {
   cp "$sign" "$work/tar.sign"
   cp "$CACHE_DIR/$KERNEL_TARBALL" "$work/$KERNEL_TARBALL"
 
-  docker run --rm -i --platform linux/arm64 \
-    -v "$work:/work" -w /work \
-    -e KERNEL_DEV_KEY_FPR="$KERNEL_DEV_KEY_FPR" \
-    -e KEYSERVERS="$KEYSERVERS" \
-    -e KERNEL_TARBALL="$KERNEL_TARBALL" \
-    "$TOOLCHAIN_IMAGE" bash -s >/dev/null <<'INNER'
+  run_in_toolchain "$work" "" \
+    KERNEL_DEV_KEY_FPR="$KERNEL_DEV_KEY_FPR" \
+    KEYSERVERS="$KEYSERVERS" \
+    KERNEL_TARBALL="$KERNEL_TARBALL" \
+    >/dev/null <<'INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update >/dev/null
@@ -341,22 +588,28 @@ fetch_pinned() {
   echo "  tarball ok: $dest sha256=$got"
 }
 
-# toolchain_run pipes a script into the pinned image with the kernel source and
-# a work directory bind-mounted at /work.
+# toolchain_run pipes a script into the pinned toolchain with the verified
+# kernel tarball at /src and a work directory at /work. Only the tarball is
+# staged, not the whole cache: the cache also holds this run's other scratch
+# directories, which the guest has no business receiving.
 toolchain_run() {
   local work="$1"
-  docker run --rm -i --platform linux/arm64 \
-    -v "$work:/work" -v "$CACHE_DIR:/src:ro" -w /work \
-    -e KERNEL_VERSION="$KERNEL_VERSION" \
-    -e KERNEL_TARBALL="$KERNEL_TARBALL" \
-    -e BUILD_DEPS="$BUILD_DEPS" \
-    -e KCONFIG_ENABLE="$KCONFIG_ENABLE" \
-    -e KCONFIG_DISABLE="$KCONFIG_DISABLE" \
-    -e KCONFIG_REQUIRED="$KCONFIG_REQUIRED" \
-    -e KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" \
-    -e KBUILD_BUILD_USER="$KBUILD_BUILD_USER" \
-    -e KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST" \
-    "$TOOLCHAIN_IMAGE" bash -s
+  local src; src="$(scratch_dir)"
+  ln "$CACHE_DIR/$KERNEL_TARBALL" "$src/$KERNEL_TARBALL" 2>/dev/null \
+    || cp "$CACHE_DIR/$KERNEL_TARBALL" "$src/$KERNEL_TARBALL"
+  local status=0
+  run_in_toolchain "$work" "$src" \
+    KERNEL_VERSION="$KERNEL_VERSION" \
+    KERNEL_TARBALL="$KERNEL_TARBALL" \
+    BUILD_DEPS="$BUILD_DEPS" \
+    KCONFIG_ENABLE="$KCONFIG_ENABLE" \
+    KCONFIG_DISABLE="$KCONFIG_DISABLE" \
+    KCONFIG_REQUIRED="$KCONFIG_REQUIRED" \
+    KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" \
+    KBUILD_BUILD_USER="$KBUILD_BUILD_USER" \
+    KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST" || status=$?
+  rm -rf "$src"
+  return "$status"
 }
 
 # build_one builds the Image into "$1"/Image. The caller owns the directory;
@@ -375,7 +628,12 @@ apt-get -qq update >/dev/null
 apt-get -qq install -y --no-install-recommends $BUILD_DEPS >/dev/null
 echo "  toolchain: $(gcc --version | head -1)"
 
-tar -xf "/src/$KERNEL_TARBALL" -C /work
+# WORKAROUND, not a preference: bsdtar, not GNU tar. /work is a vm-RuntimeClass
+# emptyDir, a virtiofs share that refuses to create a file with mode 0000 even
+# for root (the filed vm-share mode-0000 create refusal). GNU tar extracts
+# every absolute or ".." symlink via exactly such a placeholder file, so it
+# fails on this tree's 61 such links; bsdtar creates the symlinks directly.
+bsdtar -xf "/src/$KERNEL_TARBALL" -C /work
 cd "/work/linux-$KERNEL_VERSION"
 
 # Config is identity. The committed file must survive olddefconfig unchanged;
@@ -450,7 +708,12 @@ apt-get -qq update >/dev/null
 # shellcheck disable=SC2086  # BUILD_DEPS is a deliberate word-split list
 apt-get -qq install -y --no-install-recommends $BUILD_DEPS >/dev/null
 
-tar -xf "/src/$KERNEL_TARBALL" -C /work
+# WORKAROUND, not a preference: bsdtar, not GNU tar. /work is a vm-RuntimeClass
+# emptyDir, a virtiofs share that refuses to create a file with mode 0000 even
+# for root (the filed vm-share mode-0000 create refusal). GNU tar extracts
+# every absolute or ".." symlink via exactly such a placeholder file, so it
+# fails on this tree's 61 such links; bsdtar creates the symlinks directly.
+bsdtar -xf "/src/$KERNEL_TARBALL" -C /work
 cd "/work/linux-$KERNEL_VERSION"
 
 make ARCH=arm64 defconfig >/dev/null
@@ -514,8 +777,9 @@ main() {
   if [ "$mode" = "regen" ]; then
     # The config file is regen's OUTPUT, so preflight's check for it would be a
     # chicken-and-egg refusal; everything else preflight asserts still applies.
-    command -v docker >/dev/null || die "PREFLIGHT FAIL: docker not found"
-    docker info >/dev/null 2>&1 || die "PREFLIGHT FAIL: the Docker daemon is not answering"
+    command -v kubectl >/dev/null || die "PREFLIGHT FAIL: kubectl not found"
+    cluster_preflight
+    open_namespace
     verify_provenance
     fetch_pinned
     verify_dev_signature
@@ -524,6 +788,7 @@ main() {
   fi
 
   preflight
+  open_namespace
   verify_provenance
   fetch_pinned
   verify_dev_signature

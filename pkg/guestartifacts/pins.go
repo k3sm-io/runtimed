@@ -94,7 +94,7 @@ type GuestKernelPin struct {
 // The digests are produced by the guest kernel build itself, so bumping a pin
 // never means fetching anything by hand:
 //
-//  1. Run the guest build (hack/guest/build.sh). It prints the kernel version,
+//  1. Run the guest build (hack/guest-kernel/build.sh). It prints the kernel version,
 //     the config hash, and the sha256 of each artifact it produced.
 //  2. Set ActiveGuestKernel to "<kernel version>-<config hash>" as printed.
 //  3. Replace the one entry below: its key becomes ActiveGuestKernel, its
