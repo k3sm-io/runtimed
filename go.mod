@@ -1,6 +1,6 @@
 module k3sm.io/runtimed
 
-go 1.25.8
+go 1.26.0
 
 require (
 	github.com/Code-Hex/vz/v3 v3.7.1
