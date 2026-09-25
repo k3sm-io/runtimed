@@ -13,7 +13,10 @@
 # which lives in that recipe alone.
 #
 # Callers are expected to define die (print and exit non-zero); a fallback is
-# defined here only when none exists, so the primitives never fail open.
+# defined here only when none exists, so the primitives never fail open. Bash
+# resolves function calls at CALL time, so a caller that defines (or redefines)
+# die after sourcing this file still wins for every later call; a caller whose
+# die does cleanup should define it before first use, not rely on this ordering.
 
 KEYS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
