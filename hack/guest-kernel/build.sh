@@ -38,16 +38,16 @@ readonly CONFIG_FILE="$HERE/kernel.config"
 
 # ---------------------------------------------------------------- the pins
 
-readonly KERNEL_VERSION="6.18.48"
+readonly KERNEL_VERSION="6.18.53"
 readonly KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 readonly KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TARBALL}"
 readonly KERNEL_SUMS_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc"
 
-# FIRST MINT: 2026-08-31, PGP-VERIFIED. sha256sums.asc was fetched and verified
+# MINTED 2026-09-24, PGP-VERIFIED. sha256sums.asc was fetched and verified
 # against the key below (GOODSIG + VALIDSIG B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1,
-# signature made 2026-08-28), and this value is the linux-6.18.48.tar.xz line of
+# signature made 2026-09-21), and this value is the linux-6.18.53.tar.xz line of
 # the VERIFIED cleartext. It was NOT taken from an unverified sums file.
-readonly KERNEL_SHA256="5ebdadb10a4b5708fc6b1c457764a110bc49f8150cc3502c59b921ead8c6fc8c"
+readonly KERNEL_SHA256="4d6fba95c2244b08a7b4144a4d38b9be4fb31abb5e7682ae40bb5cb11374cfe0"
 
 # "Kernel.org checksum autosigner <autosigner@kernel.org>", rsa4096, created
 # 2013-01-24. This is the PRIMARY key fingerprint; its long id 632D3A06589DA6B1
