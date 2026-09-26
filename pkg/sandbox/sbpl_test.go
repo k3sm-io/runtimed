@@ -671,6 +671,57 @@ func TestGenerateExtraPaths(t *testing.T) {
 	}
 }
 
+// TestGenerateShadowBinDirRead pins the explicit read grant for the node's
+// re-signed shell copies, and beside it the /bin/sh dispatcher's metadata read
+// of /private/var/select/sh: both rendered when Posture.ShadowBinDir is set, in the
+// allows tier (before the protected denies, so they still outrank it), absent
+// when unset (the golden is the unset case), and refused for a path that is
+// not absolute and clean.
+func TestGenerateShadowBinDirRead(t *testing.T) {
+	sp := &runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"}
+	const grant = `(allow file-read* (subpath "/Library/k3sm/shadow"))`
+	// Metadata only, one literal: what the /bin/sh dispatcher's readlink needs.
+	const selectGrant = `(allow file-read-metadata (literal "/private/var/select/sh"))`
+	cases := []struct {
+		name    string
+		dir     string
+		want    bool
+		wantErr bool
+	}{
+		{"set", "/Library/k3sm/shadow", true, false},
+		{"unset", "", false, false},
+		{"relative", "Library/k3sm/shadow", false, true},
+		{"unclean", "/Library/k3sm/../k3sm/shadow", false, true},
+		{"root", "/", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(sp, GenerateOptions{Posture: Posture{ShadowBinDir: tc.dir}})
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidShadowBinDir) {
+					t.Fatalf("Generate = %v, want ErrInvalidShadowBinDir", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(out, grant); got != tc.want {
+				t.Fatalf("grant present = %v, want %v:\n%s", got, tc.want, out)
+			}
+			if got := strings.Contains(out, selectGrant); got != tc.want {
+				t.Fatalf("dispatcher readlink grant present = %v, want %v:\n%s", got, tc.want, out)
+			}
+			if tc.want && strings.Index(out, selectGrant) > strings.Index(out, ";; PROTECTED") {
+				t.Errorf("the dispatcher grant is after the protected denies:\n%s", out)
+			}
+			if tc.want && strings.Index(out, grant) > strings.Index(out, ";; PROTECTED") {
+				t.Errorf("the shadow grant is after the protected denies (they must outrank it):\n%s", out)
+			}
+		})
+	}
+}
+
 // TestGenerateInvalid checks rejection of profiles with no writable data volume.
 func TestGenerateInvalid(t *testing.T) {
 	cases := []struct {

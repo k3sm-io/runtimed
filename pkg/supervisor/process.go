@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"k3sm.io/runtimed/pkg/crilog"
 )
@@ -104,6 +106,11 @@ type Process struct {
 	// zero, never on the first pump to finish — see LogsDrained.
 	pumps sync.WaitGroup
 
+	// execObserver and execTimeout are set by ObserveExec before Start and
+	// read only by Start (single-use), so they need no lock.
+	execObserver func(pid int)
+	execTimeout  time.Duration
+
 	done      chan struct{} // closed once the process is reaped
 	drained   chan struct{} // closed once BOTH log pumps have copied output to EOF
 	drainOnce sync.Once     // guards the single close of drained (idempotent, panic-safe)
@@ -120,6 +127,82 @@ func NewProcess(spawner Spawner, waiter ExitWaiter, spec SpawnSpec, sink LogSink
 		state:   StateInit,
 		done:    make(chan struct{}),
 		drained: make(chan struct{}),
+	}
+}
+
+// ObserveExec asks the Process to call fn with the child's pid once the
+// spawned exec-shim has exec'd the pod binary (or exited). It must be called
+// before Start. fn runs on the reaper goroutine, BEFORE that goroutine starts
+// its exit wait, so it runs concurrently with the caller of Start: fn must do
+// its own locking.
+//
+// Why the wait exists: the spawned process is the exec-shim, which drops
+// privilege and applies the sandbox before it execs the pod binary, so a
+// question about the POD's image (its code-signing flags, say) asked straight
+// after posix_spawn is answered by the shim. The exec-sync pipe (SpawnSpec.
+// ExecSyncFD) turns "the shim has exec'd" into an EOF. Why on the reaper
+// goroutine: until that goroutine reaps the exit, the pid is at worst a zombie
+// and cannot be reused, so fn can never be answered by an unrelated process;
+// and Start does not wait, so a container start costs nothing extra.
+//
+// fn is not called when the pipe cannot be made or EOF does not arrive within
+// timeout (a shim that predates the exec-sync protocol holds the descriptor
+// open into the pod): a Debug line, and the observation is simply absent. A
+// process that has already exited when fn asks about it is a zombie, for which
+// csops reports ESRCH, the same fail-open path.
+func (p *Process) ObserveExec(fn func(pid int), timeout time.Duration) {
+	p.execObserver = fn
+	p.execTimeout = timeout
+}
+
+// openExecSync creates the exec-sync pipe and returns the spawn spec carrying
+// its write end plus the read end, or (spec, nil) when there is no observer or
+// the pipe cannot be made.
+func (p *Process) openExecSync() (SpawnSpec, *os.File, *os.File) {
+	spec := p.spec
+	if p.execObserver == nil {
+		return spec, nil, nil
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		slog.Debug("exec-sync pipe unavailable; the exec observation is skipped", "path", spec.Path, "err", err)
+		return spec, nil, nil
+	}
+	spec.ExecSyncFD = w.Fd()
+	// A nil Env means "inherit this process's environment" to the spawner, so
+	// the variable is appended to that, never to an empty list.
+	base := spec.Env
+	if base == nil {
+		base = os.Environ()
+	}
+	spec.Env = append(append([]string{}, base...), fmt.Sprintf("%s=%d", ExecSyncFDEnv, ExecSyncChildFD))
+	return spec, r, w
+}
+
+// awaitExec blocks until r reaches EOF (the child exec'd or exited) or the
+// timeout passes, then calls the observer on EOF only. It closes r.
+func (p *Process) awaitExec(r *os.File, pid int) {
+	defer func() { _ = r.Close() }()
+	if err := r.SetReadDeadline(time.Now().Add(p.execTimeout)); err != nil {
+		slog.Debug("exec-sync pipe has no deadline; the exec observation is skipped", "pid", pid, "err", err)
+		return
+	}
+	var b [1]byte
+	for {
+		_, err := r.Read(b[:])
+		if errors.Is(err, io.EOF) {
+			p.execObserver(pid)
+			return
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			slog.Debug("exec-sync wait hit its bound; the exec observation is skipped",
+				"pid", pid, "timeout", p.execTimeout)
+			return
+		}
+		if err != nil {
+			slog.Debug("exec-sync wait ended without an exec; the observation is skipped", "pid", pid, "err", err)
+			return
+		}
 	}
 }
 
@@ -145,8 +228,17 @@ func (p *Process) Start(ctx context.Context) error {
 		}
 	}
 
-	pid, err := p.spawner.Spawn(ctx, p.spec)
+	spec, syncR, syncW := p.openExecSync()
+	pid, err := p.spawner.Spawn(ctx, spec)
+	if syncW != nil {
+		// The child holds its own dup; the parent's write end must go or the
+		// read end never reaches EOF.
+		_ = syncW.Close()
+	}
 	if err != nil {
+		if syncR != nil {
+			_ = syncR.Close()
+		}
 		p.closePipes()
 		// Spawn failed: no pump and no reaper start, so nothing else will ever
 		// close drained. Close it here (idempotent) so LogsDrained() never blocks.
@@ -178,7 +270,16 @@ func (p *Process) Start(ctx context.Context) error {
 		// observable so LogsDrained() never blocks a waiter on a sink-less process.
 		p.closeDrained()
 	}
-	go p.reap(ctx, pid)
+	// The exec observation runs at the START of the reaper goroutine, before
+	// its exit wait: Start returns at once (a pod start is never serialized
+	// behind it), and the pid cannot be reused until this same goroutine
+	// reaps it. See ObserveExec.
+	go func() {
+		if syncR != nil {
+			p.awaitExec(syncR, pid)
+		}
+		p.reap(ctx, pid)
+	}()
 	return nil
 }
 

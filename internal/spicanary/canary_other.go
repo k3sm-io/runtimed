@@ -26,3 +26,7 @@ func sandboxSymbolsResolve() bool { return true }
 // resourceSymbolsResolve mirrors sandboxSymbolsResolve for the userspace-resource SPI:
 // only meaningful on darwin+cgo, vacuously satisfied elsewhere.
 func resourceSymbolsResolve() bool { return true }
+
+// codesignSymbolsResolve mirrors sandboxSymbolsResolve for the code-signing SPI:
+// only meaningful on darwin+cgo, vacuously satisfied elsewhere.
+func codesignSymbolsResolve() bool { return true }

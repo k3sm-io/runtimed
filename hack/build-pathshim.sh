@@ -20,14 +20,21 @@ OUT="${OUT_DIR}/libk3sm_pathrebase_shim.dylib"
 
 mkdir -p "$OUT_DIR"
 
-# arm64 + x86_64 universal (fat) dylib so it loads regardless of the pod binary's
-# arch: dyld HARD-TERMINATES a process whose DYLD_INSERT_LIBRARIES library lacks a
-# slice for that process's architecture, so an arm64-only shim would kill a
+# arm64 + arm64e + x86_64 universal (fat) dylib so it loads regardless of the pod
+# binary's arch: dyld HARD-TERMINATES a process whose DYLD_INSERT_LIBRARIES library
+# lacks a slice for that process's architecture, so an arm64-only shim would kill a
 # darwin/amd64 pod payload running under Rosetta rather than merely skip path
-# rebasing. Asserted on the built Mach-O by pkg/runtime TestPathShimIsUniversalBinary
-# -- assert the ARTIFACT, never these flags, since flags drift from comments.
+# rebasing. The arm64e slice is for the node's re-signed shell copies: Apple ships
+# /bin/bash, /bin/zsh, /bin/dash and /usr/bin/env as arm64e, an arm64e process
+# refuses a plain arm64 inserted library ("missing compatible architecture (have
+# 'x86_64,arm64', need 'arm64e')"), and it is precisely those processes this shim's
+# exec rewrite exists to keep it loaded in. Apple does not promise a stable arm64e
+# ABI for third-party code, so the slice is proven by a LIVE load, not by headers:
+# pkg/runtime TestPathShimLoadsIntoArm64e. TestPathShimIsUniversalBinary asserts
+# the other two slices -- assert the ARTIFACT, never these flags.
 clang \
   -arch arm64 \
+  -arch arm64e \
   -arch x86_64 \
   -dynamiclib \
   -fPIC \

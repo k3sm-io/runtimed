@@ -24,6 +24,7 @@ limitations under the License.
 //   - libsandbox:  sandbox_compile_string / sandbox_apply / sandbox_free_error   (Seatbelt)
 //   - libSystem:   proc_pid_rusage                                               (ri_phys_footprint sampler), PUBLIC but load-bearing
 //   - libSystem:   memorystatus_control                                          (jetsam probe), PRIVATE/deprecated SPI
+//   - libSystem:   csops                                                         (restricted-process detection), PRIVATE SPI
 //   - libc:        clonefile / clonefileat                                       (APFS CoW)      — covered via golang.org/x/sys/unix.Clonefile
 //
 // The two resource symbols resolve from libSystem (no extra -l flag); proc_pid_rusage is a
@@ -33,8 +34,8 @@ limitations under the License.
 // not a canary case — do not add VZ symbols here.
 //
 // canary_darwin.go (cgo) takes the address of each symbol so the package fails to LINK if one
-// vanishes; TestSymbolsResolve (libsandbox) and TestResourceSymbolsResolve (the resource SPI)
-// run from the standard go-test gate, the workspace hack/ci.sh, and the macOS CI on every OS
-// beta. The canary sits beside the swappable sandbox.Backend so the "engine is replaceable"
-// mitigation stays concrete.
+// vanishes; TestSymbolsResolve (libsandbox), TestResourceSymbolsResolve (the resource SPI) and
+// TestCodeSignSymbolsResolve (csops) run from the standard go-test gate, the workspace
+// hack/ci.sh, and the macOS CI on every OS beta. The canary sits beside the swappable
+// sandbox.Backend so the "engine is replaceable" mitigation stays concrete.
 package spicanary

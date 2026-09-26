@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 
@@ -60,7 +61,10 @@ import (
 type podLaunchSeam struct {
 	supervisor.UnixDropper
 	profile string
-	argv    []string
+	// path is the file execve'd; argv is what the pod sees. They differ only
+	// when the daemon handed an argv[0] override (supervisor.ExecArgv0Env).
+	path string
+	argv []string
 }
 
 // SandboxApply confines the current process to the per-pod SBPL profile. After it
@@ -84,8 +88,8 @@ func (s *podLaunchSeam) Exec() error {
 		// Diagnostic: confirms the inherited-blocked-SIGTERM mechanism on hardware.
 		fmt.Fprintln(os.Stderr, "k3sm-execshim: cleared a blocked signal mask before exec (SIGTERM was blocked)")
 	}
-	if err := unix.Exec(s.argv[0], s.argv, os.Environ()); err != nil {
-		return fmt.Errorf("execve %s: %w", s.argv[0], err)
+	if err := unix.Exec(s.path, s.argv, os.Environ()); err != nil {
+		return fmt.Errorf("execve %s: %w", s.path, err)
 	}
 	return nil // unreachable on success
 }
@@ -105,10 +109,40 @@ func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec) err
 	if len(argv) == 0 {
 		return errors.New("execshim: empty argv")
 	}
-	seam := &podLaunchSeam{profile: profile, argv: argv}
+	path, execArgv := takeExecHandoff(argv)
+	seam := &podLaunchSeam{profile: profile, path: path, argv: execArgv}
 	// euid is the shim's own effective uid (== the daemon's). RunLaunchSequence
 	// refuses a drop when it is non-root, so an unprivileged _k3sm daemon fails
 	// closed rather than attempting a doomed setuid.
 	_, err := supervisor.RunLaunchSequence(seam, spec, os.Geteuid())
 	return err
+}
+
+// takeExecHandoff consumes the two daemon-to-shim environment hand-offs and
+// removes both variables, so the pod's environment never carries them. It
+// returns the file to exec (always argv[0], as the daemon resolved it) and the
+// argv the pod sees.
+//
+//   - supervisor.ExecSyncFDEnv names the inherited exec-sync descriptor; it is
+//     marked close-on-exec so the daemon's read end sees EOF exactly when the
+//     pod binary replaces this process (supervisor.Process.ObserveExec). Only
+//     the agreed descriptor number is honoured: a mismatched value is ignored
+//     rather than closing some other inherited descriptor.
+//   - supervisor.ExecArgv0Env replaces argv[0] (a re-signed shell copy run as
+//     "sh"). An empty value is ignored.
+func takeExecHandoff(argv []string) (string, []string) {
+	if v, ok := os.LookupEnv(supervisor.ExecSyncFDEnv); ok {
+		_ = os.Unsetenv(supervisor.ExecSyncFDEnv)
+		if fd, err := strconv.Atoi(v); err == nil && fd == supervisor.ExecSyncChildFD {
+			unix.CloseOnExec(fd)
+		}
+	}
+	execArgv := argv
+	if v, ok := os.LookupEnv(supervisor.ExecArgv0Env); ok {
+		_ = os.Unsetenv(supervisor.ExecArgv0Env)
+		if v != "" {
+			execArgv = append([]string{v}, argv[1:]...)
+		}
+	}
+	return argv[0], execArgv
 }

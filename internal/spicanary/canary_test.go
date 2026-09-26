@@ -42,3 +42,14 @@ func TestResourceSymbolsResolve(t *testing.T) {
 		t.Fatal("M2 resource SPI symbols (proc_pid_rusage / memorystatus_control) did not resolve (an OS update may have removed them)")
 	}
 }
+
+// TestCodeSignSymbolsResolve is the code-signing half of the symbol-canary: it
+// asserts csops (private, no public header) still resolves, which the runtime's
+// restricted-main-process detection calls on every shimmed container spawn. A
+// dropped export fails the build here rather than leaving the detection
+// silently fail-open.
+func TestCodeSignSymbolsResolve(t *testing.T) {
+	if !codesignSymbolsResolve() {
+		t.Fatal("code-signing SPI symbol (csops) did not resolve (an OS update may have removed it)")
+	}
+}

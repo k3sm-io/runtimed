@@ -116,6 +116,11 @@ var systemProtectedPrefixes = []string{
 	"/System/Cryptexes",
 }
 
+// ErrInvalidShadowBinDir reports a Posture.ShadowBinDir that is not an
+// absolute, clean, non-root path. It fails the profile rather than rendering a
+// read grant for a path nobody meant.
+var ErrInvalidShadowBinDir = errors.New("sandbox: shadow bin dir must be an absolute clean path")
+
 // DefaultPodLogsDir is the container-log root a Posture assumes when it names
 // none: upstream's /var/log/pods, unchanged, because the whole point of the
 // path is that a Kubernetes operator already knows it.
@@ -259,6 +264,13 @@ type Posture struct {
 	// tree; a pod that could read it reads the whole node's logs, and one that
 	// could write it could forge or erase another pod's.
 	PodLogsDir string
+	// ShadowBinDir is the node's directory of re-signed shell copies (the
+	// runtime's Config.ShadowBinDir, <InstallDir>/shadow). When set, Generate
+	// emits an explicit (allow file-read* (subpath "<ShadowBinDir>")) beside
+	// the /Library baseline read, so the copies stay readable and exec'able if
+	// that baseline is ever narrowed. It must be absolute and clean
+	// (ErrInvalidShadowBinDir). Empty emits nothing.
+	ShadowBinDir string
 }
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are not part of
@@ -446,6 +458,10 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	readExtra := append([]string{}, sp.GetExtraReadPaths()...)
 	readExtra = append(readExtra, opts.ReadPaths...)
 	readExtra = append(readExtra, opts.WritePaths...)
+	// "/Library" is also what lets a pod read and exec the node's re-signed
+	// shell copies (<InstallDir>/shadow, runtime Config.ShadowBinDir). That
+	// dependency is made explicit by the Posture.ShadowBinDir allow below, so
+	// narrowing this baseline cannot silently break every shell-wrapped pod.
 	readPaths := dedupeSorted(append([]string{
 		"/System",
 		"/usr",
@@ -454,6 +470,10 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	}, readExtra...))
 	// Write scope: extra write paths + the read-write PV mount roots.
 	writePaths := dedupeSorted(append(append([]string{}, sp.GetExtraWritePaths()...), opts.WritePaths...))
+	shadowDir := opts.Posture.ShadowBinDir
+	if shadowDir != "" && (!filepath.IsAbs(shadowDir) || filepath.Clean(shadowDir) != shadowDir || shadowDir == "/") {
+		return "", fmt.Errorf("%w: %q", ErrInvalidShadowBinDir, shadowDir)
+	}
 	credPaths := dedupeSorted(opts.ReadOnlyPaths)
 	deniedSockets := dedupeSorted(sp.GetDeniedUnixSocketPaths())
 	// Range-checked before anything is written, and unconditionally — a malformed
@@ -485,6 +505,22 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	writeFirmlinkSubpaths(&b, readPaths)
 	b.WriteString("  (literal \"/dev/null\") (literal \"/dev/zero\")\n")
 	b.WriteString("  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n")
+	if shadowDir != "" {
+		b.WriteString(";; read: the node's re-signed shell copies (also under the /Library\n")
+		b.WriteString(";; baseline above; explicit so narrowing that cannot break them).\n")
+		b.WriteString(fmt.Sprintf("(allow file-read* (subpath %q))\n", shadowDir))
+		// Apple's /bin/sh dispatcher readlinks /private/var/select/sh at
+		// startup to choose the shell it re-execs, and prints "Error opening
+		// /private/var/select/sh: Operation not permitted" into the pod's log
+		// when the profile denies it (it then falls back and runs). With a
+		// shadow set, every shell pod reaches the dispatcher somewhere (a
+		// platform child, or an exec the interposer did not rewrite), so the
+		// one metadata read readlink needs is granted, for that one literal
+		// and nothing else under /private/var. Measured with sandbox-exec on
+		// macOS 26: file-read-metadata on the link alone silences it.
+		b.WriteString(";; metadata: the /bin/sh dispatcher's readlink of its selection link.\n")
+		b.WriteString("(allow file-read-metadata (literal \"/private/var/select/sh\"))\n")
+	}
 
 	b.WriteString(";; write: validated extra write paths (+ /dev/null); the pod's own\n")
 	b.WriteString(";; data volume is re-allowed below, after the protected denies.\n")

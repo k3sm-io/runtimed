@@ -53,7 +53,29 @@ type SpawnSpec struct {
 	// StderrFD is the write end of the pipe the child's fd 2 is dup2'd onto.
 	// If 0, the child inherits the parent's stderr.
 	StderrFD uintptr
+	// ExecSyncFD is the write end of the exec-sync pipe, dup2'd onto the
+	// child's fd ExecSyncChildFD (0 = none). The exec-shim marks that
+	// descriptor close-on-exec (ExecSyncFDEnv), so the parent's read end sees
+	// EOF at the moment the shim execs the pod binary, or when it exits. It is
+	// set by Process.ObserveExec, never by a caller.
+	ExecSyncFD uintptr
 }
+
+// ExecSyncChildFD is the descriptor number the exec-sync pipe occupies in the
+// spawned exec-shim (see SpawnSpec.ExecSyncFD).
+const ExecSyncChildFD = 3
+
+// ExecSyncFDEnv names the environment variable telling the exec-shim which
+// inherited descriptor is the exec-sync pipe. The shim marks it close-on-exec
+// and removes the variable before it execs the pod, so neither reaches the pod.
+const ExecSyncFDEnv = "K3SM_EXEC_SYNC_FD"
+
+// ExecArgv0Env names the environment variable carrying the argv[0] the pod
+// binary must see when it differs from the path the shim execs (a re-signed
+// shell copy exec'd as "sh" so bash enters POSIX mode). The shim substitutes it
+// and removes the variable before exec. A shim that predates it ignores it and
+// runs the copy under its own path, which is a working shell minus POSIX mode.
+const ExecArgv0Env = "K3SM_EXEC_ARGV0"
 
 // Spawner posix_spawns a pod process in its own session/process group and
 // returns the child pid. It is the supervisor's spawn seam; the production
