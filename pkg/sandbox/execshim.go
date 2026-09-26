@@ -259,13 +259,10 @@ func (b *ExecShimBackend) SweepStaleProfiles() (removed int, err error) {
 }
 
 // FindExecShim locates the k3sm-execshim helper: first beside the current
-// executable, then on PATH. It returns ErrShimNotFound if neither resolves.
+// executable with symlinks resolved (see executableSibling), then on PATH. It returns ErrShimNotFound if neither resolves.
 func FindExecShim() (string, error) {
-	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), ExecShimName)
-		if _, err := os.Stat(cand); err == nil {
-			return cand, nil
-		}
+	if cand, ok := executableSibling(ExecShimName); ok {
+		return cand, nil
 	}
 	if p, err := exec.LookPath(ExecShimName); err == nil {
 		return p, nil

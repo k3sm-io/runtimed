@@ -18,9 +18,7 @@ package sandbox
 
 import (
 	"errors"
-	"os"
 	"os/exec"
-	"path/filepath"
 )
 
 // VMHostName is the basename of the per-pod VM host helper (one process per vm
@@ -65,18 +63,15 @@ var ErrVMHostNotFound = errors.New("sandbox: k3sm-vmhost helper not found")
 const VMHostRosettaShareSupported = false
 
 // FindVMHost locates the k3sm-vmhost helper: first beside the current
-// executable, then on PATH. It returns ErrVMHostNotFound if neither resolves.
+// executable with symlinks resolved (see executableSibling), then on PATH. It returns ErrVMHostNotFound if neither resolves.
 //
 // It is a STRUCTURAL MIRROR of FindExecShim — same two candidates, same order,
 // same sentinel shape — because the two helpers have the same deployment story
 // (installed next to the daemon, resolvable on PATH in a dev tree) and a reader
 // who has understood one should not have to re-derive the other.
 func FindVMHost() (string, error) {
-	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), VMHostName)
-		if _, err := os.Stat(cand); err == nil {
-			return cand, nil
-		}
+	if cand, ok := executableSibling(VMHostName); ok {
+		return cand, nil
 	}
 	if p, err := exec.LookPath(VMHostName); err == nil {
 		return p, nil
