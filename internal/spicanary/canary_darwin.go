@@ -64,6 +64,18 @@ static uintptr_t k3sm_resource_symbols(void) {
 	s ^= (uintptr_t)&memorystatus_control;
 	return s;
 }
+
+// The code-signing SPI the runtime's restricted-process detection calls
+// (pkg/supervisor CodeSignStatus). csops has NO public header declaration
+// (the kernel's <sys/codesign.h> is not in the SDK), exactly like
+// memorystatus_control, so it is declared here and its address is the
+// load-bearing link check: an OS update that drops the export fails the BUILD
+// instead of silently turning the detection into a permanent fail-open.
+extern int csops(int pid, unsigned int ops, void *useraddr, size_t usersize);
+
+static uintptr_t k3sm_codesign_symbols(void) {
+	return (uintptr_t)&csops;
+}
 */
 import "C"
 
@@ -79,4 +91,10 @@ func sandboxSymbolsResolve() bool {
 // real guard is that this file LINKS at all — a removed export fails the build.
 func resourceSymbolsResolve() bool {
 	return uintptr(C.k3sm_resource_symbols()) != 0
+}
+
+// codesignSymbolsResolve reports whether the code-signing SPI (csops) linked.
+// As with the other sets, the real guard is that this file LINKS at all.
+func codesignSymbolsResolve() bool {
+	return uintptr(C.k3sm_codesign_symbols()) != 0
 }

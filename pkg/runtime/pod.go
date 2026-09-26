@@ -304,6 +304,10 @@ type containerProc struct {
 	// not carry, and re-deriving it in Exec would mean a second pull.
 	env        []string
 	workingDir string
+	// shim is this instance's restricted-main-process verdict (shiminactive.go),
+	// written by the exec observer and read under pod.mu. The zero value means
+	// "not observed restricted".
+	shim shimInactive
 }
 
 // sidecar reports whether cp is a native sidecar (KEP-753): an init-declared
@@ -504,6 +508,9 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			// read the whole node's logs and rewrite its neighbours'. New
 			// refuses an empty value at construction, so it is always set here.
 			PodLogsDir: r.cfg.PodLogsDir,
+			// The re-signed shell copies: an explicit read grant beside the
+			// /Library baseline (Config.ShadowBinDir).
+			ShadowBinDir: r.cfg.ShadowBinDir,
 		},
 		PodIP:         ip,
 		ReadOnlyPaths: credPaths,
@@ -1380,10 +1387,23 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		return nil, resolveFailureReason(err), err
 	}
 
+	// What actually runs, and what the signature gate answers for. Pulled
+	// images are untouched: their argv[0] is a file in the image. On a
+	// host-binary route (hostExecPlan) a host shell runs as the node's
+	// re-signed copy (Config.ShadowBinDir) so dyld keeps the shims loaded, but
+	// the gate answers for the host shell the pod named (the copy is node
+	// infrastructure, never pod code), and a SCRIPT is gated on the
+	// interpreter its shebang names: a script cannot carry a signature, and on
+	// Linux the kernel gates the interpreter, not the script.
+	execArgv, argv0, gatePath := rb.argv, "", rb.path
+	if rb.hostBinary {
+		execArgv, argv0, gatePath = r.hostExecPlan(p.box.GetPodId(), c, rootfs, rb)
+	}
+
 	// Enforce the signature policy in the correct order relative to ad-hoc
 	// signing, before exec. A host binary is never ad-hoc re-signed
 	// (hostBinary).
-	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rb.path, rb.hostBinary); err != nil {
+	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), gatePath, rb.hostBinary); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
@@ -1393,7 +1413,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// itself if BestEffort, confines itself to the profile, and then execs the pod
 	// binary — in that irreversible order. env is preserved.
 	cred := resolveCredential(p.box, c)
-	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, rb.argv, resolveLaunchSpec(p.box, cred))
+	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, execArgv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
@@ -1444,10 +1464,16 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("open container log for %s: %w", c.GetName(), err)
 	}
 	fanout := &logFanout{}
+	spawnEnv := env
+	if argv0 != "" {
+		// The exec-shim substitutes it and strips it, so the container's
+		// environment (cp.env, what an Exec session enters) never carries it.
+		spawnEnv = append(append([]string{}, env...), supervisor.ExecArgv0Env+"="+argv0)
+	}
 	spec := supervisor.SpawnSpec{
 		Path: shimPath,
 		Argv: shimArgv,
-		Env:  env,
+		Env:  spawnEnv,
 		Dir:  workingDir,
 	}
 	cp := &containerProc{
@@ -1495,6 +1521,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	}
 	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, containerLogSink(logw, fanout))
 	cp.proc = proc
+	// The observer runs on the reaper goroutine and locks pod.mu itself.
+	if obs := r.observeShim(p, cp, execArgv[0], env); obs != nil {
+		proc.ObserveExec(obs, execObserveTimeout)
+	}
 
 	if err := proc.Start(ctx); err != nil {
 		_ = cleanup()
@@ -2863,6 +2893,11 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	}
 	explicitDyld := false
 	for _, e := range base {
+		// K3SM_SHADOW_DIR is runtime-owned: only Config.ShadowBinDir may set
+		// it (appended below), so a spec cannot aim the interposer anywhere.
+		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv {
+			continue
+		}
 		env = append(env, e)
 		if name, _, _ := strings.Cut(e, "="); name == dyldInsertEnv {
 			explicitDyld = true
@@ -2888,6 +2923,15 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		env = append(env,
 			pathShimRootfsEnv+"="+rootfs,
 			pathShimMountsEnv+"="+strings.Join(paths, ":"))
+	}
+	// Shadow-shell exec rewrite: the same shim carries it, so it is inserted
+	// for every container once the node has a shadow set, mounts or not
+	// (without mounts its rebase stays off: K3SM_MOUNT_PATHS is unset).
+	if r.cfg.PathShimPath != "" && r.cfg.ShadowBinDir != "" {
+		if len(inserts) == 0 {
+			inserts = append(inserts, r.cfg.PathShimPath)
+		}
+		env = append(env, shadowDirEnv+"="+r.cfg.ShadowBinDir)
 	}
 	if ins := box.GetAnnotations()[dyldInsertAnnotation]; ins != "" {
 		inserts = append(inserts, ins)

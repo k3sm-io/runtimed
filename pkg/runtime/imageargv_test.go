@@ -159,8 +159,11 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// A Mach-O-shaped file, not a script: a host-route script is gated
+			// and exec'd through its interpreter (hostExecPlan), which is not
+			// what this test is about.
 			hostBin := filepath.Join(t.TempDir(), "hostprog")
-			if err := os.WriteFile(hostBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			if err := os.WriteFile(hostBin, []byte{0xcf, 0xfa, 0xed, 0xfe}, 0o755); err != nil {
 				t.Fatalf("write host binary: %v", err)
 			}
 

@@ -239,8 +239,41 @@ type Config struct {
 	// volume (no chroot — see pod.go containerEnv). Empty disables the rebase (a
 	// pod's absolute mount path then reaches the host, the pre-shim behavior). The
 	// shim cannot load into a SIP platform binary (/bin/sh) — only custom Go/C
-	// workloads — a documented ceiling.
+	// workloads — a documented ceiling, narrowed by ShadowBinDir for the host
+	// shells, which this same shim then also rewrites at every exec.
 	PathShimPath string
+	// ShadowBinDir is the node's directory of ad-hoc re-signed copies of the
+	// host shells (bash, zsh, dash, env; bash also serves /bin/sh), made by the
+	// installer, root-owned and never writable by the daemon user. When set, a
+	// host-binary container whose argv[0] is /bin/sh, /bin/bash, /bin/zsh,
+	// /bin/dash or /usr/bin/env, or a script whose shebang names one of them,
+	// runs the copy instead (shadowRewrite), and the path-rebase shim is
+	// injected with K3SM_SHADOW_DIR so the pod's own execs of those binaries are
+	// rewritten the same way. The copies are not platform binaries, so dyld
+	// keeps DYLD_INSERT_LIBRARIES (the DNS and path shims) across them. Empty
+	// disables both (today's behaviour).
+	//
+	// Trust: a copy is used only when the directory and the file are
+	// root-owned, a directory / a regular file (never a symlink), and free of
+	// group and other write bits, checked at every use on both sides (runtimed
+	// before the spawn, the interposer before each exec); anything else runs
+	// the host binary. The per-pod profile grants a read of this directory
+	// explicitly (sandbox.Posture.ShadowBinDir) as well as through the /Library
+	// baseline.
+	//
+	// Invariant that keeps K3SM_SHADOW_DIR safe although it is not scrubbed
+	// from the pod's environment: runtimed never reads it back from a pod.
+	// containerEnv writes it from this field only and drops a spec-supplied
+	// K3SM_SHADOW_DIR, and an Exec session (kubectl exec, exec probes) enters
+	// the stored containerProc.env or re-derives it through containerEnv,
+	// never a live process environment. A pod can change the variable inside
+	// its own processes, but only for itself, and the trust check still bounds
+	// what it can point at.
+	//
+	// vm RuntimeClass pods are unaffected by construction: their containers
+	// are guest processes that never enter startContainer, so neither the
+	// rewrite nor the exec observation runs for them.
+	ShadowBinDir string
 }
 
 // Runtime is the in-process node runtime implementing runtimev1.RuntimeServer.
@@ -360,6 +393,15 @@ type Runtime struct {
 	// (podreap.go). Production wires supervisor.ProcGroupMembers; tests inject a
 	// fake group table.
 	procGroup procGroupInspector
+
+	// codeSignStatus reads a process's code-signing flags for the
+	// restricted-main-process detection; nil disables it (Deps.CodeSignStatus).
+	codeSignStatus func(pid int) (uint32, error)
+
+	// shadowLstat is the trust check's lstat (shadow.go verifyShadow); nil
+	// means the production lstatShadow. Unit tests set it, because they cannot
+	// create root-owned files.
+	shadowLstat func(string) (shadowStat, error)
 
 	// podReapOnce/podReapErr make the startup pod reap run exactly once per
 	// Runtime, before any CreatePod is served (same shape as the network
@@ -614,6 +656,13 @@ type Deps struct {
 	// startup reap's group probe). Defaults to supervisor.ProcGroupMembers; tests
 	// inject a fake group table.
 	ProcGroup func(pgid int) (members []supervisor.ProcMember, ok bool)
+	// CodeSignStatus reads a live process's kernel code-signing flags, the
+	// restricted-main-process detection's one input (shiminactive.go). It
+	// defaults to supervisor.CodeSignStatus ONLY when Spawner is also the
+	// production default: a fake spawner's pids name no process it started, so
+	// asking the kernel about them would describe some unrelated process. With
+	// an injected Spawner and no CodeSignStatus the detection is off.
+	CodeSignStatus func(pid int) (uint32, error)
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -764,8 +813,12 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		guestRosettaProbe = sandbox.ProbeGuestRosetta
 	}
 	spawner := deps.Spawner
+	codeSignStatus := deps.CodeSignStatus
 	if spawner == nil {
 		spawner = supervisor.PosixSpawner{}
+		if codeSignStatus == nil {
+			codeSignStatus = supervisor.CodeSignStatus
+		}
 	}
 	waiter := deps.Waiter
 	if waiter == nil {
@@ -841,34 +894,35 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	logGPUProbe(log, gpuFacts, gpuResult.Metal.DeviceName)
 
 	return &Runtime{
-		cfg:          cfg,
-		home:         daemonHome(cfg.Root),
-		log:          log,
-		cache:        cache,
-		puller:       puller,
-		unpacker:     unpacker,
-		loader:       loader,
-		index:        index,
-		signer:       signer,
-		credentials:  deps.Credentials,
-		backend:      backend,
-		vmBackend:    vmBackend,
-		guestDialer:  guestDialer,
-		rosettaHost:  rosettaHost,
-		rosettaGuest: rosettaGuest,
-		gpuFacts:     gpuFacts,
-		gpuDevice:    gpuResult.Metal.DeviceName,
-		spawner:      spawner,
-		waiter:       waiter,
-		network:      network,
-		resolver:     deps.Resolver,
-		binder:       binder,
-		footprinter:  footprinter,
-		signalGroup:  signalGroup,
-		procStart:    procStart,
-		procGroup:    procGroup,
-		broker:       newBroker(),
-		pods:         make(map[string]*pod),
+		cfg:            cfg,
+		home:           daemonHome(cfg.Root),
+		log:            log,
+		cache:          cache,
+		puller:         puller,
+		unpacker:       unpacker,
+		loader:         loader,
+		index:          index,
+		signer:         signer,
+		credentials:    deps.Credentials,
+		backend:        backend,
+		vmBackend:      vmBackend,
+		guestDialer:    guestDialer,
+		rosettaHost:    rosettaHost,
+		rosettaGuest:   rosettaGuest,
+		gpuFacts:       gpuFacts,
+		gpuDevice:      gpuResult.Metal.DeviceName,
+		spawner:        spawner,
+		waiter:         waiter,
+		network:        network,
+		resolver:       deps.Resolver,
+		binder:         binder,
+		footprinter:    footprinter,
+		signalGroup:    signalGroup,
+		procStart:      procStart,
+		procGroup:      procGroup,
+		broker:         newBroker(),
+		pods:           make(map[string]*pod),
+		codeSignStatus: codeSignStatus,
 	}, nil
 }
 

@@ -97,7 +97,14 @@ extern char **environ;
 // Raw posix_spawn (not os/exec) is deliberate: the supervisor owns a single
 // reaper (kqueue), and posix_spawn_file_actions gives precise fd control for the
 // output pipes without a fork+exec dance in Go.
-static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int outFD, int errFD, pid_t *outPid) {
+//
+// syncFD, when >= 0, is the exec-sync pipe's write end: it lands on the child's
+// fd 3 (ExecSyncChildFD) AFTER the stdout/stderr dups and closes, so a stream fd
+// that happened to be 3 has already been retired. When syncFD already IS 3 a
+// dup2(3, 3) would be a no-op that leaves close-on-exec set (Go opens every
+// descriptor O_CLOEXEC), so posix_spawn_file_actions_addinherit_np, the
+// published Darwin extension that clears it for the child, is used instead.
+static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int outFD, int errFD, int syncFD, pid_t *outPid) {
 	posix_spawnattr_t attr;
 	posix_spawn_file_actions_t fa;
 	int rc;
@@ -146,6 +153,13 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 	// second addclose would fail the spawn with EBADF.
 	if (errFD >= 0 && errFD != outFD) {
 		if ((rc = posix_spawn_file_actions_addclose(&fa, errFD)) != 0) goto done;
+	}
+
+	if (syncFD == 3) {
+		if ((rc = posix_spawn_file_actions_addinherit_np(&fa, 3)) != 0) goto done;
+	} else if (syncFD >= 0) {
+		if ((rc = posix_spawn_file_actions_adddup2(&fa, syncFD, 3)) != 0) goto done;
+		if ((rc = posix_spawn_file_actions_addclose(&fa, syncFD)) != 0) goto done;
 	}
 
 	rc = posix_spawn(outPid, path, &fa, &attr, argv, envp ? envp : environ);
@@ -226,8 +240,13 @@ func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		errFD = C.int(spec.StderrFD)
 	}
 
+	syncFD := C.int(-1)
+	if spec.ExecSyncFD != 0 {
+		syncFD = C.int(spec.ExecSyncFD)
+	}
+
 	var pid C.pid_t
-	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, outFD, errFD, &pid)
+	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, outFD, errFD, syncFD, &pid)
 	if rc != 0 {
 		return 0, fmt.Errorf("posix_spawn %s: %w", spec.Path, syscallErrno(rc))
 	}
