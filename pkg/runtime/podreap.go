@@ -108,6 +108,14 @@ type PodReapRecord struct {
 	// differ. A record without it (written before the field existed) is a
 	// mismatch. It plays no part in the reap's kill decision.
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	// ProfileSHA256 is the hex sha256 of the SBPL profile the container was
+	// spawned under (profileDigest). AttachPod recompiles the pod's profile from
+	// its spec and this daemon's posture and adopts the pod only when every
+	// adopted record carries exactly that digest, so a re-attached pod's
+	// containers are re-spawned under the profile their siblings still run
+	// under, never a drifted one. A record without it (written before the field
+	// existed) never attaches. It plays no part in the reap's kill decision.
+	ProfileSHA256 string `json:"profileSha256,omitempty"`
 }
 
 // podProcRecord is the package's historical name for PodReapRecord.
@@ -186,12 +194,15 @@ func (r *Runtime) podReapDir(podID string) (string, error) {
 // fails the container start: an unrecorded pod process would be invisible to
 // the startup reap, which is exactly the orphan class this file closes.
 //
+// profileSHA is the digest of the profile the group was spawned under
+// (profileDigest), recorded for AttachPod's identity check.
+//
 // It returns the record it wrote so the caller can derive the container's
 // published identity (podProcRecord.containerID) from the very same
 // (pgid, leader start) pair the reap will later match on. Returning it — rather
 // than letting the caller re-probe the process table — is what makes a
 // disagreement between the two structurally impossible.
-func (r *Runtime) recordPodProc(podID, container string, pgid int) (podProcRecord, error) {
+func (r *Runtime) recordPodProc(podID, container string, pgid int, profileSHA string) (podProcRecord, error) {
 	if pgid <= 1 {
 		return podProcRecord{}, fmt.Errorf("refusing to record pod %s process group with pgid %d (must be > 1)", podID, pgid)
 	}
@@ -201,7 +212,7 @@ func (r *Runtime) recordPodProc(podID, container string, pgid int) (podProcRecor
 		// it. Record with zero identity so the reap drops the file unsignaled.
 		start = 0
 	}
-	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start, RuntimeVersion: r.fingerprint}
+	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start, RuntimeVersion: r.fingerprint, ProfileSHA256: profileSHA}
 	dir, err := r.podReapDir(podID)
 	if err != nil {
 		return podProcRecord{}, fmt.Errorf("reap record dir for pod %s: %w", podID, err)

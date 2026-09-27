@@ -18,10 +18,13 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -54,7 +57,7 @@ import (
 // snapshot is one nothing would ever signal.
 func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
 	// The shared eligibility chain (refuseIneligible): unknown pod, vm pod
-	// (UNSUPPORTED), adopted pod, a pod being deleted, unknown container, and a
+	// (UNSUPPORTED), a pod being deleted, unknown container, and a
 	// container that never started are all refused here, before the old process
 	// is touched — stopping it and then failing the re-spawn would turn a
 	// running container into a dead one.
@@ -94,7 +97,6 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 		return restartFailure(codes.Canceled, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
 			"restart %s/%s: %v", req.GetPodId(), oldCP.name, err), nil
 	}
-	oldCode, oldSig := oldExit.code, oldExit.sig
 	if reaped {
 		// The replacement tails the SAME capture files from the persisted
 		// offset, so the old instance's final drain must finish first or both
@@ -163,7 +165,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 			"pod", req.GetPodId(), "container", oldCP.name,
 			"restart_count", newCP.state.GetRestartCount(), "expected", oldRestartCount+1)
 	}
-	newCP.state.LastTerminationState = lastTerminationState(oldCP, oldCode, oldSig, oldStarted, req.GetReason())
+	newCP.state.LastTerminationState = lastTerminationState(p, oldCP, oldExit, oldStarted, req.GetReason())
 	// THE SWAP, through the installer StartContainer and the start sequence use
 	// (installContainerLocked) rather than an open-coded write into p.containers.
 	// This verb used to walk the slice itself and so honoured neither of the
@@ -290,11 +292,22 @@ func (r *Runtime) clearRestarting(ctx context.Context, p *pod, cp *containerProc
 // lastTerminationState builds the ContainerStatus.last_termination_state for the
 // run being replaced: it prefers a terminated state the reaper already recorded
 // (the container exited on its own before the restart), else synthesizes one from
-// the reaped exit code/signal with the restart reason. The caller holds pod.mu.
-func lastTerminationState(oldCP *containerProc, code, sig int, startedAt *timestamppb.Timestamp, reqReason string) *runtimev1.ContainerState {
+// the reaped exit with the restart reason. The caller holds pod.mu.
+//
+// An exit whose status could not be read (supervisor.ErrExitUnknown: a
+// re-attached instance, not this daemon's child) is derived by terminatedLocked,
+// the reaper's own derivation, so it reads ExitStatusUnknown / exitCodeUnknown
+// whichever of the reaper's write and this read comes first. Synthesizing from
+// the zero code the waiter returns with that error would report a live instance
+// the restart killed as Completed / 0 — a success nobody observed.
+func lastTerminationState(p *pod, oldCP *containerProc, exit containerExit, startedAt *timestamppb.Timestamp, reqReason string) *runtimev1.ContainerState {
 	if t := oldCP.state.GetState().GetTerminated(); t != nil {
 		return &runtimev1.ContainerState{Terminated: t}
 	}
+	if errors.Is(exit.err, supervisor.ErrExitUnknown) {
+		return &runtimev1.ContainerState{Terminated: terminatedLocked(p, oldCP, exit.code, exit.sig, exit.err)}
+	}
+	code, sig := exit.code, exit.sig
 	reason := "Completed"
 	if code != 0 || sig != 0 {
 		reason = "Killed" // terminated by RestartContainer (e.g. a liveness restart)

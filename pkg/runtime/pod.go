@@ -18,6 +18,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -211,9 +213,10 @@ type pod struct {
 	projRefresh []mount.VolumeRefresh
 
 	// adopted marks a pod AttachPod re-attached after a daemon restart rather
-	// than one this daemon created (attach.go). It carries no sandbox profile
-	// and no resolved launch environment, so Exec and RestartContainer refuse
-	// it. logStreamLost is set when a container's output could not be resumed
+	// than one this daemon created (attach.go). Its profile is recompiled and
+	// hash-verified at attach, so its containers restart and stop like any
+	// other; the latch refuses Exec only, because the running instances'
+	// resolved launch environment belongs to the previous daemon. logStreamLost is set when a container's output could not be resumed
 	// (it was spawned with pipes); the status then carries
 	// LogStreamLostConditionType from attachedAt. All three are immutable after
 	// AttachPod.
@@ -497,60 +500,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 	}
 
-	// The data volume the profile is about to re-allow read+write must be one this
-	// runtime derived for this pod. Checked here, immediately before the
-	// only call that consumes it: sandbox.Generate emits it after the protected
-	// denies, where last-match-wins makes an unchecked value beat every one of
-	// them, and uses it as the carve-out base for every other caller-supplied
-	// path. validatePodBox asks the same question earlier for the CreatePod
-	// ingress; a caller that reached this spine another way is refused here.
-	if _, err := r.dataVolumePath(box); err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: %w", errInvalidPodBox, err)
-	}
-	// Having accepted either derived spelling, emit the narrower one: the accept
-	// set is a compatibility surface (the producer sends the pod dir), but nothing
-	// a Seatbelt pod needs lives above <podDir>/rootfs — materialization, PV
-	// binds, the resolved binary and the fsGroup walk are all rootfs-scoped.
-	// Narrowing here closes "a future artifact under <podDir> becomes
-	// pod-writable silently" with no cross-repo change. sp is the caller's
-	// message, so copy before mutating it.
-	sp = proto.Clone(sp).(*runtimev1.SandboxProfile)
-	sp.DataVolumePath = rootfs
-
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
-	// The generator validates every extra/PV path against the protected deny-set and
-	// emits the protected denies last (last-match-wins).
-	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{
-		Posture: sandbox.Posture{
-			// Pin the pods-root and protected denies under the runtime work-dir;
-			// home (when set) bounds it so a misconfigured work-dir can't point a
-			// pod's writable re-allow outside the daemon's data area.
-			WorkDir: r.cfg.Root,
-			Home:    r.home,
-			// The VIPs are plumbing-only (DNS env/status): they render
-			// no SBPL rule — per-IP network filters do not compile on macOS 26
-			// (sandbox.Generate's AllowNetwork stanza).
-			ResolverVIP:  r.cfg.ResolverVIP,
-			APIServerVIP: r.cfg.APIServerVIP,
-			// NOT plumbing: this one renders a deny. Every pod's output on the
-			// node lands under this tree, so a pod that could reach it could
-			// read the whole node's logs and rewrite its neighbours'. New
-			// refuses an empty value at construction, so it is always set here.
-			PodLogsDir: r.cfg.PodLogsDir,
-			// The re-signed shell copies: an explicit read grant beside the
-			// /Library baseline (Config.ShadowBinDir).
-			ShadowBinDir: r.cfg.ShadowBinDir,
-		},
-		PodIP:         ip,
-		ReadOnlyPaths: credPaths,
-		WritePaths:    pvWritePaths,
-		ReadPaths:     pvReadPaths,
-	})
+	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths)
 	if err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-			fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
+		if errors.Is(err, errInvalidPodBox) {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
+		}
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
 	}
 
 	// fsGroup: chown the writable pod data volume to the supplemental group
@@ -649,6 +606,80 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// registration — would silently leave every limited pod unenforced.
 
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// compileProfile compiles a host-process pod's SBPL profile from its spec and
+// this daemon's node posture: the one derivation createPod and AttachPod share,
+// so a pod re-attached after a daemon restart runs its restarted containers
+// under the profile the create compiled (AttachPod verifies that by hash;
+// profileDigest). rootfs is the pod's derived rootfs; ip is the pod IP; credPaths
+// are the credential mounts (the read-only sub-scope, mount.CredentialPaths);
+// pvWrite and pvRead are the bound PV dirs (volume.Binder.Plan).
+//
+// An underived data volume is errInvalidPodBox (wrapped); any other failure is
+// the generator's.
+func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credPaths, pvWrite, pvRead []string) (string, error) {
+	// The data volume the profile is about to re-allow read+write must be one this
+	// runtime derived for this pod. Checked here, immediately before the
+	// only call that consumes it: sandbox.Generate emits it after the protected
+	// denies, where last-match-wins makes an unchecked value beat every one of
+	// them, and uses it as the carve-out base for every other caller-supplied
+	// path. validatePodBox asks the same question earlier for the CreatePod
+	// ingress; a caller that reached this spine another way is refused here.
+	if _, err := r.dataVolumePath(box); err != nil {
+		return "", fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	// Having accepted either derived spelling, emit the narrower one: the accept
+	// set is a compatibility surface (the producer sends the pod dir), but nothing
+	// a Seatbelt pod needs lives above <podDir>/rootfs — materialization, PV
+	// binds, the resolved binary and the fsGroup walk are all rootfs-scoped.
+	// Narrowing here closes "a future artifact under <podDir> becomes
+	// pod-writable silently" with no cross-repo change. sp is the caller's
+	// message, so copy before mutating it.
+	sp := proto.Clone(box.GetSandboxProfile()).(*runtimev1.SandboxProfile)
+	sp.DataVolumePath = rootfs
+
+	// The generator validates every extra/PV path against the protected deny-set
+	// and emits the protected denies last (last-match-wins).
+	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{
+		Posture: sandbox.Posture{
+			// Pin the pods-root and protected denies under the runtime work-dir;
+			// home (when set) bounds it so a misconfigured work-dir can't point a
+			// pod's writable re-allow outside the daemon's data area.
+			WorkDir: r.cfg.Root,
+			Home:    r.home,
+			// The VIPs are plumbing-only (DNS env/status): they render
+			// no SBPL rule — per-IP network filters do not compile on macOS 26
+			// (sandbox.Generate's AllowNetwork stanza).
+			ResolverVIP:  r.cfg.ResolverVIP,
+			APIServerVIP: r.cfg.APIServerVIP,
+			// NOT plumbing: this one renders a deny. Every pod's output on the
+			// node lands under this tree, so a pod that could reach it could
+			// read the whole node's logs and rewrite its neighbours'. New
+			// refuses an empty value at construction, so it is always set here.
+			PodLogsDir: r.cfg.PodLogsDir,
+			// The re-signed shell copies: an explicit read grant beside the
+			// /Library baseline (Config.ShadowBinDir).
+			ShadowBinDir: r.cfg.ShadowBinDir,
+		},
+		PodIP:         ip,
+		ReadOnlyPaths: credPaths,
+		WritePaths:    pvWrite,
+		ReadPaths:     pvRead,
+	})
+	if err != nil {
+		return "", fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
+	}
+	return profile, nil
+}
+
+// profileDigest is the hex sha256 of a compiled SBPL profile: the identity
+// createPod records per container (PodReapRecord.ProfileSHA256) and AttachPod
+// compares against its own recompilation before it lets a re-attached pod's
+// containers be re-spawned under the profile it compiled.
+func profileDigest(profile string) string {
+	sum := sha256.Sum256([]byte(profile))
+	return hex.EncodeToString(sum[:])
 }
 
 // armMemorySampler starts the pod's resource sampler: it samples
@@ -1583,7 +1614,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// across a daemon death. The just-spawned group is torn down through the
 	// injected seam (not a direct supervisor call) so the failure path is
 	// unit-observable.
-	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID())
+	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID(), profileDigest(p.profile))
 	if err != nil {
 		_ = r.signalGroup(proc.PID(), killSignal)
 		_ = cleanup()

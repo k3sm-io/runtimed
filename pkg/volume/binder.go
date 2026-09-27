@@ -138,31 +138,55 @@ func (b *Binder) Provision(ctx context.Context, box *runtimev1.PodBox) ([]Bindin
 	return bindings, err
 }
 
-// provision materializes each PVC volume's dir once, even when several containers
-// mount it, and returns the bindings plus a volume-name index into them.
-func (b *Binder) provision(ctx context.Context, box *runtimev1.PodBox) ([]Binding, map[string]int, error) {
-	bindings := make([]Binding, 0)
-	byName := make(map[string]int) // volume name → index into bindings
+// Plan returns one Binding per PVC-backed volume in box — VolumeName,
+// ClaimName, DataDir and ReadOnly — without touching the filesystem: no dir is
+// created, stat'ed or seeded, and Seeded and Links are always zero. A box with
+// no PVC volumes returns nil.
+//
+// It is the pure half of Provision and Bind, which call it and then do the I/O,
+// so the DataDir a caller derives from the spec alone (a daemon re-deriving a
+// pod's SBPL read/write scope after a restart) is the one the bind produced, by
+// construction. A claim name the class cannot map to a dir is ErrInvalid.
+func (b *Binder) Plan(box *runtimev1.PodBox) ([]Binding, error) {
+	var bindings []Binding
 	for _, v := range box.GetVolumes() {
 		pvc := v.GetPersistentVolumeClaim()
 		if pvc == nil {
 			continue
 		}
-		dataDir, seeded, err := b.materialize(ctx, box.GetNamespace(), pvc.GetClaimName())
+		dataDir, err := b.class.DataDir(box.GetNamespace(), pvc.GetClaimName())
 		if err != nil {
-			return nil, nil, err
+			return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
 		}
-		byName[v.GetName()] = len(bindings)
 		bindings = append(bindings, Binding{
 			VolumeName: v.GetName(),
 			ClaimName:  pvc.GetClaimName(),
 			DataDir:    dataDir,
 			ReadOnly:   pvc.GetReadOnly(),
-			Seeded:     seeded,
 		})
+	}
+	return bindings, nil
+}
+
+// provision materializes each PVC volume's dir once, even when several containers
+// mount it, and returns the bindings plus a volume-name index into them. The
+// bindings are Plan's; this adds only the I/O.
+func (b *Binder) provision(ctx context.Context, box *runtimev1.PodBox) ([]Binding, map[string]int, error) {
+	bindings, err := b.Plan(box)
+	if err != nil {
+		return nil, nil, err
 	}
 	if len(bindings) == 0 {
 		return nil, nil, nil
+	}
+	byName := make(map[string]int, len(bindings)) // volume name → index into bindings
+	for i := range bindings {
+		seeded, err := b.materialize(ctx, box.GetNamespace(), bindings[i].ClaimName, bindings[i].DataDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		bindings[i].Seeded = seeded
+		byName[bindings[i].VolumeName] = i
 	}
 	return bindings, byName, nil
 }
@@ -209,19 +233,15 @@ func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string)
 	return bindings, nil
 }
 
-// materialize resolves the stable dir for (namespace, claimName) and ensures it
-// exists: a reuse (dir already present) is returned untouched (seed-once); a fresh
-// claim is SEEDED-once from a template when one is configured, else empty-created
-// (never a clonefile on the empty hot path).
-func (b *Binder) materialize(ctx context.Context, namespace, claimName string) (dataDir string, seeded bool, err error) {
-	dataDir, err = b.class.DataDir(namespace, claimName)
-	if err != nil {
-		return "", false, fmt.Errorf("%w: %w", ErrInvalid, err)
-	}
+// materialize ensures the stable dir Plan resolved for (namespace, claimName)
+// exists: a reuse (dir already present) is left untouched (seed-once); a fresh
+// claim is SEEDED-once from a template when one is configured, else
+// empty-created (never a clonefile on the empty hot path).
+func (b *Binder) materialize(ctx context.Context, namespace, claimName, dataDir string) (seeded bool, err error) {
 	if _, statErr := os.Stat(dataDir); statErr == nil {
-		return dataDir, false, nil // reuse: NEVER re-seed (durable, lifecycle-decoupled)
+		return false, nil // reuse: NEVER re-seed (durable, lifecycle-decoupled)
 	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return "", false, fmt.Errorf("stat pv dir %s: %w", dataDir, statErr)
+		return false, fmt.Errorf("stat pv dir %s: %w", dataDir, statErr)
 	}
 
 	// Fresh claim. Seed-once from a template if one is configured; the clonefile
@@ -229,26 +249,26 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName string) (
 	if b.template != nil {
 		src, ok, terr := b.template.Template(ctx, namespace, claimName)
 		if terr != nil {
-			return "", false, fmt.Errorf("resolve seed template for %s/%s: %w", namespace, claimName, terr)
+			return false, fmt.Errorf("resolve seed template for %s/%s: %w", namespace, claimName, terr)
 		}
 		if ok {
 			if err := os.MkdirAll(dataDir, 0o755); err != nil {
-				return "", false, fmt.Errorf("create pv dir %s: %w", dataDir, err)
+				return false, fmt.Errorf("create pv dir %s: %w", dataDir, err)
 			}
 			if _, err := image.MaterializeTree(b.cloner, src, dataDir); err != nil {
-				return "", false, fmt.Errorf("seed pv %s/%s from %s: %w", namespace, claimName, src, err)
+				return false, fmt.Errorf("seed pv %s/%s from %s: %w", namespace, claimName, src, err)
 			}
 			b.log.Info("seeded persistent volume from template",
 				"namespace", namespace, "claim", claimName, "template", src, "dir", dataDir)
-			return dataDir, true, nil
+			return true, nil
 		}
 	}
 
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return "", false, fmt.Errorf("create pv dir %s: %w", dataDir, err)
+		return false, fmt.Errorf("create pv dir %s: %w", dataDir, err)
 	}
 	b.log.Info("created empty persistent volume", "namespace", namespace, "claim", claimName, "dir", dataDir)
-	return dataDir, false, nil
+	return false, nil
 }
 
 // linkInto creates a symlink at the pod's (rebased) mount path that points to

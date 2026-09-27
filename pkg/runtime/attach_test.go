@@ -27,8 +27,6 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc/codes"
-
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -169,8 +167,8 @@ func TestAttachPopulatesOwnedBeforeTheStartupReap(t *testing.T) {
 				return nil
 			},
 		})
-		seedPodProcRecord(t, rt, podProcRecord{PodID: "p1", Container: "main", Pgid: 100, StartUnixNano: 5000})
-		seedPodProcRecord(t, rt, podProcRecord{PodID: "p2", Container: "main", Pgid: 200, StartUnixNano: 7000})
+		seedPodProcRecord(t, rt, attachableRecord(t, rt, podProcRecord{PodID: "p1", Container: "main", Pgid: 100, StartUnixNano: 5000}))
+		seedPodProcRecord(t, rt, attachableRecord(t, rt, podProcRecord{PodID: "p2", Container: "main", Pgid: 200, StartUnixNano: 7000}))
 
 		records, _, err := rt.listPodProcRecords()
 		if err != nil {
@@ -224,6 +222,19 @@ func TestAttachPopulatesOwnedBeforeTheStartupReap(t *testing.T) {
 	})
 }
 
+// attachableRecord stamps rec with the profile digest AttachPod will compile
+// for hostBinBox(rt, rec.PodID) — what createPod records at spawn — so a seeded
+// record passes the attach's profile-identity check.
+func attachableRecord(t *testing.T, rt *Runtime, rec podProcRecord) podProcRecord {
+	t.Helper()
+	profile, err := rt.boxProfile(hostBinBox(rt, rec.PodID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.ProfileSHA256 = profileDigest(profile)
+	return rec
+}
+
 func pgidsOf(recs []podProcRecord) []int {
 	out := make([]int, 0, len(recs))
 	for _, r := range recs {
@@ -236,9 +247,8 @@ func pgidsOf(recs []podProcRecord) []int {
 // container spawned before file capture (no raw or offset files: its output went
 // to pipes that died with the old daemon): the container keeps its published
 // identity, the pod carries the log-stream-lost condition and the CPU note, the
-// CRI log gets the gap marker, there is no shim-inactive verdict, Exec and
-// RestartContainer refuse, and an exit is reported as ExitStatusUnknown with a
-// non-zero code.
+// CRI log gets the gap marker, there is no shim-inactive verdict, and an exit
+// is reported as ExitStatusUnknown with a non-zero code.
 func TestAttachPodReportsWhatItCannotRebuild(t *testing.T) {
 	waiter := unknownExitWaiter{newBlockingWaiter()}
 	groups := fakeGroups{members: map[int][]supervisor.ProcMember{100: {mem(100, 5000)}}}
@@ -247,7 +257,7 @@ func TestAttachPodReportsWhatItCannotRebuild(t *testing.T) {
 		ProcStartTime: func(int) (int64, bool) { return 5000, true },
 		AdoptedWaiter: waiter,
 	})
-	want := podProcRecord{PodID: "p1", Container: "main", Pgid: 100, StartUnixNano: 5000}
+	want := attachableRecord(t, rt, podProcRecord{PodID: "p1", Container: "main", Pgid: 100, StartUnixNano: 5000})
 	seedPodProcRecord(t, rt, want)
 
 	st, err := rt.AttachPod(context.Background(), hostBinBox(rt, "p1"))
@@ -285,14 +295,6 @@ func TestAttachPodReportsWhatItCannotRebuild(t *testing.T) {
 	}
 	if !strings.Contains(string(logBytes), logStreamLostMarker) {
 		t.Fatalf("log = %q, want the gap marker", logBytes)
-	}
-
-	resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{PodId: "p1", Container: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if codes.Code(resp.GetError().GetCode()) != codes.FailedPrecondition {
-		t.Fatalf("restart error = %v, want FailedPrecondition", resp.GetError())
 	}
 
 	waiter.release(100)
@@ -377,7 +379,7 @@ func TestAttachPodReprobesBeforeAdopt(t *testing.T) {
 				// Never reach the real process table with the fake pgid.
 				SignalGroup: func(int, os.Signal) error { return nil },
 			})
-			seedPodProcRecord(t, rt, podProcRecord{PodID: "p1", Container: "main", Pgid: pgid, StartUnixNano: start})
+			seedPodProcRecord(t, rt, attachableRecord(t, rt, podProcRecord{PodID: "p1", Container: "main", Pgid: pgid, StartUnixNano: start}))
 
 			st, err := rt.AttachPod(context.Background(), hostBinBox(rt, "p1"))
 			_, registered := rt.lookupPod("p1")

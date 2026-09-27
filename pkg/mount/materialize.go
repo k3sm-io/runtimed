@@ -77,6 +77,49 @@ func (l *Layout) CredentialPaths() []string {
 	return out
 }
 
+// CredentialPaths returns, without rendering anything, the paths Materialize
+// would report as credentials for box under dataVol — exactly what
+// Materialize(ctx, box, dataVol, ...).CredentialPaths() returns on success, and
+// sorted the same way. It is the pure half of the credential verdict: the same
+// walk (planMounts) and the same predicate (credentialSource) the render path
+// uses, so a caller that must re-derive a pod's SBPL read-only sub-scope from
+// its spec alone (a daemon re-attaching to a pod another run created) gets the
+// verdict the create-time render reached, by construction rather than by a
+// parallel copy.
+func CredentialPaths(box *runtimev1.PodBox, dataVol string) ([]string, error) {
+	plans, err := planMounts(box, filepath.Clean(dataVol))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, pm := range plans {
+		if credentialSource(pm.vol) {
+			out = append(out, pm.dest)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// credentialSource reports whether vol's source is a credential that gets the
+// SBPL read-only sub-scope: a secret, or a projected volume carrying a secret
+// or a ServiceAccount token. It is the ONE credential predicate: the render
+// (render.volume) reports it and CredentialPaths reads it, so the two cannot
+// disagree about which mounts a pod may not overwrite.
+func credentialSource(vol *runtimev1.Volume) bool {
+	switch {
+	case vol.GetSecret() != nil:
+		return true
+	case vol.GetProjected() != nil:
+		for _, p := range vol.GetProjected().GetSources() {
+			if p.GetSecret() != nil || p.GetServiceAccountToken() != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // seenMount is the identity that claimed a rebased destination in the conflict
 // guard: the volume name plus its subPath selection (a destination holds exactly
 // one selection on k3sm's mount-namespace-free shared tree).
@@ -328,27 +371,28 @@ func (rd *render) generation(ctx context.Context, pm plannedMount) (credential, 
 }
 
 // volume writes vol's single source into target, returning whether the volume
-// is a credential (secret / projected-with-secret-or-token).
+// is a credential (credentialSource: secret / projected-with-secret-or-token).
 func (rd *render) volume(ctx context.Context, vol *runtimev1.Volume, target string) (credential bool, err error) {
+	credential = credentialSource(vol)
 	if err := os.MkdirAll(target, 0o755); err != nil {
-		return false, fmt.Errorf("create mount dir %s: %w", target, err)
+		return credential, fmt.Errorf("create mount dir %s: %w", target, err)
 	}
 	switch {
 	case vol.GetConfigMap() != nil:
-		return false, rd.configMap(ctx, vol.GetConfigMap(), target)
+		return credential, rd.configMap(ctx, vol.GetConfigMap(), target)
 	case vol.GetSecret() != nil:
-		return true, rd.secret(ctx, vol.GetSecret(), target)
+		return credential, rd.secret(ctx, vol.GetSecret(), target)
 	case vol.GetEmptyDir() != nil:
 		// Medium is deliberately not read here: this path is disk-backed
 		// unconditionally, and a non-empty medium (e.g. Memory) is refused
 		// earlier, at pkg/runtime's createPod (keyed on the resolved sandbox
 		// backend), before materialization runs.
-		return false, nil // an empty writable dir is the whole job
+		return credential, nil // an empty writable dir is the whole job
 	case vol.GetDownwardApi() != nil:
 		rd.volatile = true
-		return false, renderDownwardAPI(vol.GetDownwardApi(), target, rd.box, rd.podIP)
+		return credential, renderDownwardAPI(vol.GetDownwardApi(), target, rd.box, rd.podIP)
 	case vol.GetProjected() != nil:
-		return rd.projected(ctx, vol.GetProjected(), target)
+		return credential, rd.projected(ctx, vol.GetProjected(), target)
 	default:
 		return false, fmt.Errorf("volume %s has no recognized source", vol.GetName())
 	}
@@ -504,55 +548,52 @@ func renderDownwardAPI(src *runtimev1.DownwardAPIVolumeSource, target string, bo
 	return nil
 }
 
-// projected layers each projection source into the same target dir, returning
-// whether any source is a credential (secret / SA-token).
-func (rd *render) projected(ctx context.Context, src *runtimev1.ProjectedVolumeSource, target string) (bool, error) {
+// projected layers each projection source into the same target dir. Whether
+// the volume is a credential is credentialSource's verdict, not this walk's.
+func (rd *render) projected(ctx context.Context, src *runtimev1.ProjectedVolumeSource, target string) error {
 	dflt := modeOr(src.GetDefaultMode())
-	credential := false
 	for _, p := range src.GetSources() {
 		switch {
 		case p.GetConfigMap() != nil:
 			cm := p.GetConfigMap()
 			data, err := rd.fetchConfigMap(ctx, cm.GetName(), cm.GetOptional())
 			if err != nil {
-				return credential, err
+				return err
 			}
 			if err := writeKeyed(target, data, cm.GetItems(), dflt, cm.GetOptional()); err != nil {
-				return credential, err
+				return err
 			}
 		case p.GetSecret() != nil:
-			credential = true
 			sec := p.GetSecret()
 			data, err := rd.fetchSecret(ctx, sec.GetName(), sec.GetOptional())
 			if err != nil {
-				return credential, err
+				return err
 			}
 			if err := writeKeyed(target, data, sec.GetItems(), dflt, sec.GetOptional()); err != nil {
-				return credential, err
+				return err
 			}
 		case p.GetDownwardApi() != nil:
 			rd.volatile = true
 			for _, item := range p.GetDownwardApi().GetItems() {
 				val, err := resolveDownwardField(rd.box, rd.podIP, item.GetFieldRef().GetFieldPath())
 				if err != nil {
-					return credential, err
+					return err
 				}
 				mode := dflt
 				if m := item.GetMode(); m != 0 {
 					mode = os.FileMode(m)
 				}
 				if err := writeFile(target, item.GetPath(), []byte(val), mode); err != nil {
-					return credential, err
+					return err
 				}
 			}
 		case p.GetServiceAccountToken() != nil:
-			credential = true
 			if err := rd.token(ctx, p.GetServiceAccountToken(), dflt, target); err != nil {
-				return credential, err
+				return err
 			}
 		}
 	}
-	return credential, nil
+	return nil
 }
 
 // token writes a ServiceAccount token projection. A token whose issuance

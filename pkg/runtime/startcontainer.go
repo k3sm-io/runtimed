@@ -30,6 +30,13 @@ import (
 // into a run spec (the partial-start contract, see startSequence). It re-runs
 // image resolution and the spawn for that one container.
 //
+// It is also the recovery for the one entry that RAN but has no process: a
+// container of a re-attached pod (AttachPod) that died while the daemon was
+// down, reported Terminated with ExitStatusUnknown. That start keeps the
+// log-dir-derived restart_count (one past the dead instance) and records the
+// dead run as last_termination_state, as a restart would; the never-started
+// rules below describe every other entry.
+//
 // # Why this is not RestartContainer
 //
 // RestartContainer's contract is to replace a container that RAN: it terminates
@@ -172,12 +179,23 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	}
 
 	p.mu.Lock()
-	// Carried, never bumped: this path is defined by what it does NOT change.
-	// Both values are the waiting entry's own (zero and nil), and copying them
-	// explicitly is what makes a future edit that starts writing a restart count
-	// here visibly wrong.
-	newCP.state.RestartCount = cp.state.GetRestartCount()
-	newCP.state.LastTerminationState = cp.state.GetLastTerminationState()
+	if prev := cp.state.GetState().GetTerminated(); prev != nil {
+		// The entry is not a never-started container but one that RAN and died
+		// while no daemon was watching (AttachPod's entry for a container with
+		// no live record). Starting it again is a restart in all but the verb:
+		// the count startContainer derived from the log dir (one past the
+		// instance that died) stands, so the new instance writes the next file
+		// and never re-opens the dead one's, and the dead run becomes the
+		// last_termination_state `kubectl logs --previous` reads.
+		newCP.state.LastTerminationState = &runtimev1.ContainerState{Terminated: prev}
+	} else {
+		// Carried, never bumped: a never-started container is defined by what
+		// this path does NOT change. Both values are the waiting entry's own
+		// (zero and nil), and copying them explicitly is what makes a future
+		// edit that starts writing a restart count here visibly wrong.
+		newCP.state.RestartCount = cp.state.GetRestartCount()
+		newCP.state.LastTerminationState = cp.state.GetLastTerminationState()
+	}
 	// The SECOND stopping check, and the one that matters: the first ran before a
 	// pull that can take seconds, and DeletePod snapshots the containers it will
 	// signal at its own entry. A spawn that installs after that snapshot is

@@ -47,8 +47,8 @@ import (
 //
 // Refusals are structured responses, never transport errors: unknown pod or
 // container → NOT_FOUND; vm pod → UNSUPPORTED with an embedded
-// codes.Unimplemented (guest/v1 has no per-container stop); adopted pod →
-// NOT_UPDATABLE; a pod being deleted → FailedPrecondition; a container that
+// codes.Unimplemented (guest/v1 has no per-container stop); a pod being
+// deleted → FailedPrecondition; a container that
 // never started, or one a restart or another stop is already acting on →
 // FailedPrecondition + NOT_UPDATABLE. A container that has already exited is
 // stopped: the verb returns its recorded terminated state and signals nothing.
