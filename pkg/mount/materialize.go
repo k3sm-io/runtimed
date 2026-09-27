@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"k3sm.io/runtimed/pkg/image"
 
@@ -42,6 +43,10 @@ const defaultFileMode os.FileMode = 0o644
 type Layout struct {
 	// Mounts is one entry per unique materialized mount path.
 	Mounts []Mount
+	// State is the refresh state the create-time render leaves behind: which
+	// volumes are wholly immutable and when each ServiceAccount token was
+	// issued. The caller hands it to the first Refresh.
+	State RefreshState
 }
 
 // Mount is one materialized volume mount root.
@@ -80,25 +85,61 @@ type seenMount struct {
 	subPath string
 }
 
-// Materialize renders every volume referenced by a container VolumeMount in box
-// into the pod's data volume, returning the resulting Layout. dataVol is the pod
-// data volume (its rootfs); podIP is the resolved pod IP (for status.podIP
-// downward-API projections); r supplies ConfigMap/Secret data and SA tokens.
-//
-// A mount that needs data (configMap / secret / projected-with-data) requires a
-// non-nil Resolver; emptyDir and pure-downwardAPI volumes do not. A volume_mount
-// that names no PodBox.volume, or whose mount path would escape the data volume,
-// is rejected (fail closed). A persistentVolumeClaim mount is SKIPPED here — it is
-// durable and lifecycle-decoupled, bound by pkg/volume to a stable dir outside the
-// pod tree, not materialized into the pod data volume.
-func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP string, r Resolver) (*Layout, error) {
-	dataVol = filepath.Clean(dataVol)
+// mountClass is how a volume mount is materialized, and therefore whether
+// Refresh may touch it. It is decided in one place (classify) and read by both
+// Materialize and Refresh, so the two cannot disagree about which mounts are
+// generation-backed.
+type mountClass int
+
+const (
+	// classGeneration is a non-subPath configMap / secret / downwardAPI /
+	// projected mount: rendered as kubelet atomic-writer generations, and
+	// refreshable.
+	classGeneration mountClass = iota
+	// classSubPath is any mount with a subPath: cloned once at create, never
+	// refreshed (kubelet parity: a subPath mount does not receive updates).
+	classSubPath
+	// classEmptyDir is an emptyDir: a writable directory with nothing to render.
+	classEmptyDir
+	// classOther is any other source (hostPath, or none this materializer
+	// knows). Materialize renders it flat, which refuses it; Refresh skips it.
+	classOther
+)
+
+// classify returns vol's mountClass for a mount selecting subPath.
+func classify(vol *runtimev1.Volume, subPath string) mountClass {
+	switch {
+	case subPath != "":
+		return classSubPath
+	case vol.GetEmptyDir() != nil:
+		return classEmptyDir
+	case vol.GetConfigMap() != nil, vol.GetSecret() != nil, vol.GetDownwardApi() != nil, vol.GetProjected() != nil:
+		return classGeneration
+	default:
+		return classOther
+	}
+}
+
+// plannedMount is one de-duplicated volume mount of a pod: the mount, its
+// volume, the rebased destination, and its class.
+type plannedMount struct {
+	mount *runtimev1.VolumeMount
+	vol   *runtimev1.Volume
+	dest  string
+	class mountClass
+}
+
+// planMounts walks every container VolumeMount of box (init containers first)
+// and returns the mounts to materialize under dataVol, applying the undefined-
+// volume check, the escape check, and the destination conflict guard. PVC
+// mounts are omitted: pkg/volume binds them. It is the one walk Materialize and
+// Refresh share.
+func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 	volumes := make(map[string]*runtimev1.Volume, len(box.GetVolumes()))
 	for _, v := range box.GetVolumes() {
 		volumes[v.GetName()] = v
 	}
 
-	layout := &Layout{}
 	// conflict guard: rebased destination -> the (volume, subPath) that claimed it.
 	// The subPath is part of the identity because k3sm has no mount namespace, so a
 	// single on-disk destination can hold exactly one selection.
@@ -108,6 +149,7 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 	containers = append(containers, box.GetInitContainers()...)
 	containers = append(containers, box.GetContainers()...)
 
+	var plans []plannedMount
 	for _, c := range containers {
 		for _, vm := range c.GetVolumeMounts() {
 			vol, ok := volumes[vm.GetName()]
@@ -121,7 +163,8 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 				continue
 			}
 			// The destination is the rebased mount path ONLY — subPath selects a
-			// source element (applied below), it is NOT folded into the destination.
+			// source element (applied at materialization), it is NOT folded into
+			// the destination.
 			dest, err := resolveTarget(dataVol, vm.GetMountPath())
 			if err != nil {
 				return nil, fmt.Errorf("volume %s: %w", vm.GetName(), err)
@@ -142,23 +185,63 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 					prev.name, prev.subPath, vm.GetName(), vm.GetSubPath(), dest)
 			}
 			seen[dest] = seenMount{name: vm.GetName(), subPath: vm.GetSubPath()}
-
-			var credential bool
-			if sub := vm.GetSubPath(); sub != "" {
-				credential, err = materializeSubPath(ctx, box.GetNamespace(), podIP, vol, dataVol, dest, sub, box, r)
-			} else {
-				credential, err = materializeVolume(ctx, box.GetNamespace(), podIP, vol, dest, box, r)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("materialize volume %s: %w", vm.GetName(), err)
-			}
-			layout.Mounts = append(layout.Mounts, Mount{
-				Name:       vm.GetName(),
-				Path:       dest,
-				ReadOnly:   vm.GetReadOnly() || credential || vol.GetProjected() != nil,
-				Credential: credential,
-			})
+			plans = append(plans, plannedMount{mount: vm, vol: vol, dest: dest, class: classify(vol, vm.GetSubPath())})
 		}
+	}
+	return plans, nil
+}
+
+// Materialize renders every volume referenced by a container VolumeMount in box
+// into the pod's data volume, returning the resulting Layout. dataVol is the pod
+// data volume (its rootfs); podIP is the resolved pod IP (for status.podIP
+// downward-API projections); r supplies ConfigMap/Secret data and SA tokens.
+//
+// A non-subPath configMap / secret / downwardAPI / projected mount is written
+// in the kubelet atomic-writer layout (see writeGeneration) — the same code path
+// Refresh later uses to replace it. A subPath mount is cloned once and never
+// refreshed; an emptyDir is an empty directory.
+//
+// A mount that needs data (configMap / secret / projected-with-data) requires a
+// non-nil Resolver; emptyDir and pure-downwardAPI volumes do not. A volume_mount
+// that names no PodBox.volume, or whose mount path would escape the data volume,
+// is rejected (fail closed). A persistentVolumeClaim mount is SKIPPED here — it is
+// durable and lifecycle-decoupled, bound by pkg/volume to a stable dir outside the
+// pod tree, not materialized into the pod data volume.
+func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP string, r Resolver) (*Layout, error) {
+	dataVol = filepath.Clean(dataVol)
+	plans, err := planMounts(box, dataVol)
+	if err != nil {
+		return nil, err
+	}
+
+	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}}}
+	for _, pm := range plans {
+		var credential bool
+		switch pm.class {
+		case classSubPath:
+			credential, err = materializeSubPath(ctx, podIP, pm.vol, dataVol, pm.dest, pm.mount.GetSubPath(), box, r)
+		case classGeneration:
+			if err = os.MkdirAll(pm.dest, 0o755); err != nil {
+				err = fmt.Errorf("create mount dir %s: %w", pm.dest, err)
+				break
+			}
+			rd := newRender(box, podIP, r, time.Now, pm.dest, nil)
+			credential, _, err = rd.generation(ctx, pm)
+			if err == nil {
+				layout.State.record(pm, rd)
+			}
+		default:
+			credential, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, pm.vol, pm.dest)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("materialize volume %s: %w", pm.mount.GetName(), err)
+		}
+		layout.Mounts = append(layout.Mounts, Mount{
+			Name:       pm.mount.GetName(),
+			Path:       pm.dest,
+			ReadOnly:   pm.mount.GetReadOnly() || credential || pm.vol.GetProjected() != nil,
+			Credential: credential,
+		})
 	}
 	return layout, nil
 }
@@ -180,17 +263,81 @@ func resolveTarget(dataVol, mountPath string) (string, error) {
 	return target, nil
 }
 
-// materializeVolume writes vol's single source into target, returning whether the
-// volume is a credential (secret / projected-with-secret-or-token).
-func materializeVolume(ctx context.Context, ns, podIP string, vol *runtimev1.Volume, target string, box *runtimev1.PodBox, r Resolver) (credential bool, err error) {
+// render carries what rendering one volume needs, and collects what the render
+// learned: whether every fetched source was immutable, and the ServiceAccount
+// tokens it minted or reused. One render renders one volume once.
+type render struct {
+	ns    string
+	podIP string
+	box   *runtimev1.PodBox
+	r     Resolver
+	now   func() time.Time
+
+	// tokenBase is the mount dir token records are keyed under ("" for a flat
+	// render, which records nothing). prev is the previous records; liveDir the
+	// volume's current generation dir, set by generation() ("" when there is
+	// none). A token whose record is still fresh is re-read from liveDir instead
+	// of re-minted.
+	tokenBase string
+	prev      map[string]TokenIssue
+	liveDir   string
+
+	// fetched / allImmutable: at least one ConfigMap/Secret was fetched, and
+	// every one fetched reported Immutable. volatile: the volume has a token or
+	// downward-API source, whose content can change regardless.
+	fetched      bool
+	allImmutable bool
+	volatile     bool
+	tokens       map[string]TokenIssue
+}
+
+// newRender returns a render for one volume of box.
+func newRender(box *runtimev1.PodBox, podIP string, r Resolver, now func() time.Time, tokenBase string, prev map[string]TokenIssue) *render {
+	return &render{
+		ns:           box.GetNamespace(),
+		podIP:        podIP,
+		box:          box,
+		r:            r,
+		now:          now,
+		tokenBase:    tokenBase,
+		prev:         prev,
+		allImmutable: true,
+		tokens:       map[string]TokenIssue{},
+	}
+}
+
+// immutable reports whether the rendered volume may be skipped by later
+// refreshes: it fetched ConfigMap/Secret data, all of it immutable, and has no
+// token or downward-API source.
+func (rd *render) immutable() bool {
+	return rd.fetched && rd.allImmutable && !rd.volatile
+}
+
+// generation renders pm's volume as a new atomic-writer generation under
+// pm.dest and flips to it (writeGeneration), returning whether the volume is a
+// credential and whether the flip happened (false: the content equalled the
+// live generation, which is kept).
+func (rd *render) generation(ctx context.Context, pm plannedMount) (credential, flipped bool, err error) {
+	flipped, err = writeGeneration(pm.dest, func(gen, live string) error {
+		rd.liveDir = live
+		var rerr error
+		credential, rerr = rd.volume(ctx, pm.vol, gen)
+		return rerr
+	})
+	return credential, flipped, err
+}
+
+// volume writes vol's single source into target, returning whether the volume
+// is a credential (secret / projected-with-secret-or-token).
+func (rd *render) volume(ctx context.Context, vol *runtimev1.Volume, target string) (credential bool, err error) {
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return false, fmt.Errorf("create mount dir %s: %w", target, err)
 	}
 	switch {
 	case vol.GetConfigMap() != nil:
-		return false, renderConfigMap(ctx, ns, vol.GetConfigMap(), target, r)
+		return false, rd.configMap(ctx, vol.GetConfigMap(), target)
 	case vol.GetSecret() != nil:
-		return true, renderSecret(ctx, ns, vol.GetSecret(), target, r)
+		return true, rd.secret(ctx, vol.GetSecret(), target)
 	case vol.GetEmptyDir() != nil:
 		// Medium is deliberately not read here: this path is disk-backed
 		// unconditionally, and a non-empty medium (e.g. Memory) is refused
@@ -198,9 +345,10 @@ func materializeVolume(ctx context.Context, ns, podIP string, vol *runtimev1.Vol
 		// backend), before materialization runs.
 		return false, nil // an empty writable dir is the whole job
 	case vol.GetDownwardApi() != nil:
-		return false, renderDownwardAPI(vol.GetDownwardApi(), target, box, podIP)
+		rd.volatile = true
+		return false, renderDownwardAPI(vol.GetDownwardApi(), target, rd.box, rd.podIP)
 	case vol.GetProjected() != nil:
-		return renderProjected(ctx, ns, vol.GetProjected(), target, box, podIP, r)
+		return rd.projected(ctx, vol.GetProjected(), target)
 	default:
 		return false, fmt.Errorf("volume %s has no recognized source", vol.GetName())
 	}
@@ -214,6 +362,8 @@ func materializeVolume(ctx context.Context, ns, podIP string, vol *runtimev1.Vol
 // mount path), then removes the staging dir — so no un-selected sibling (e.g. the
 // other ConfigMap/Secret keys) is ever left readable under dataVol. Returns whether
 // the source is a credential (so dest still gets the SBPL read-only sub-scope).
+// The staging render is flat (no atomic-writer generations): a subPath mount is
+// cloned once and never refreshed.
 //
 // subPath is CVE-2021-25741 class, so the selection is guarded twice: a lexical
 // isUnder check (rejects a ".."-heavy subPath after Clean) and a symlink-safe
@@ -223,7 +373,7 @@ func materializeVolume(ctx context.Context, ns, podIP string, vol *runtimev1.Vol
 // writable ephemeral volume). The file-vs-dir branch below is load-bearing: a
 // blanket MkdirAll(dest) for a file element would make the workload's open(2) hit
 // EISDIR.
-func materializeSubPath(ctx context.Context, ns, podIP string, vol *runtimev1.Volume, dataVol, dest, subPath string, box *runtimev1.PodBox, r Resolver) (credential bool, err error) {
+func materializeSubPath(ctx context.Context, podIP string, vol *runtimev1.Volume, dataVol, dest, subPath string, box *runtimev1.PodBox, r Resolver) (credential bool, err error) {
 	// Stage OUTSIDE dataVol (a sibling of the pod data volume) so no un-selected
 	// sibling element is ever readable under the pod tree, and on the same volume so
 	// the clone into dest is CoW. Removed unconditionally afterwards.
@@ -237,7 +387,7 @@ func materializeSubPath(ctx context.Context, ns, podIP string, vol *runtimev1.Vo
 		}
 	}()
 
-	credential, err = materializeVolume(ctx, ns, podIP, vol, staging, box, r)
+	credential, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, staging)
 	if err != nil {
 		return credential, err
 	}
@@ -314,29 +464,19 @@ func materializeSubPath(ctx context.Context, ns, podIP string, vol *runtimev1.Vo
 	return credential, nil
 }
 
-// renderConfigMap writes a ConfigMap's keys as files under target.
-func renderConfigMap(ctx context.Context, ns string, src *runtimev1.ConfigMapVolumeSource, target string, r Resolver) error {
-	data, err := resolveData(ctx, r, "configMap", ns, src.GetName(), src.GetOptional(), func() (map[string][]byte, error) {
-		if r == nil {
-			return nil, errNoResolver
-		}
-		return r.ConfigMap(ctx, ns, src.GetName())
-	})
+// configMap writes a ConfigMap's keys as files under target.
+func (rd *render) configMap(ctx context.Context, src *runtimev1.ConfigMapVolumeSource, target string) error {
+	data, err := rd.fetchConfigMap(ctx, src.GetName(), src.GetOptional())
 	if err != nil {
 		return err
 	}
 	return writeKeyed(target, data, src.GetItems(), modeOr(src.GetDefaultMode()), src.GetOptional())
 }
 
-// renderSecret writes a Secret's keys as files under target (read-only sub-scope
+// secret writes a Secret's keys as files under target (read-only sub-scope
 // applied SBPL-side by the caller).
-func renderSecret(ctx context.Context, ns string, src *runtimev1.SecretVolumeSource, target string, r Resolver) error {
-	data, err := resolveData(ctx, r, "secret", ns, src.GetSecretName(), src.GetOptional(), func() (map[string][]byte, error) {
-		if r == nil {
-			return nil, errNoResolver
-		}
-		return r.Secret(ctx, ns, src.GetSecretName())
-	})
+func (rd *render) secret(ctx context.Context, src *runtimev1.SecretVolumeSource, target string) error {
+	data, err := rd.fetchSecret(ctx, src.GetSecretName(), src.GetOptional())
 	if err != nil {
 		return err
 	}
@@ -364,21 +504,16 @@ func renderDownwardAPI(src *runtimev1.DownwardAPIVolumeSource, target string, bo
 	return nil
 }
 
-// renderProjected layers each projection source into the same target dir,
-// returning whether any source is a credential (secret / SA-token).
-func renderProjected(ctx context.Context, ns string, src *runtimev1.ProjectedVolumeSource, target string, box *runtimev1.PodBox, podIP string, r Resolver) (bool, error) {
+// projected layers each projection source into the same target dir, returning
+// whether any source is a credential (secret / SA-token).
+func (rd *render) projected(ctx context.Context, src *runtimev1.ProjectedVolumeSource, target string) (bool, error) {
 	dflt := modeOr(src.GetDefaultMode())
 	credential := false
 	for _, p := range src.GetSources() {
 		switch {
 		case p.GetConfigMap() != nil:
 			cm := p.GetConfigMap()
-			data, err := resolveData(ctx, r, "configMap", ns, cm.GetName(), cm.GetOptional(), func() (map[string][]byte, error) {
-				if r == nil {
-					return nil, errNoResolver
-				}
-				return r.ConfigMap(ctx, ns, cm.GetName())
-			})
+			data, err := rd.fetchConfigMap(ctx, cm.GetName(), cm.GetOptional())
 			if err != nil {
 				return credential, err
 			}
@@ -388,12 +523,7 @@ func renderProjected(ctx context.Context, ns string, src *runtimev1.ProjectedVol
 		case p.GetSecret() != nil:
 			credential = true
 			sec := p.GetSecret()
-			data, err := resolveData(ctx, r, "secret", ns, sec.GetName(), sec.GetOptional(), func() (map[string][]byte, error) {
-				if r == nil {
-					return nil, errNoResolver
-				}
-				return r.Secret(ctx, ns, sec.GetName())
-			})
+			data, err := rd.fetchSecret(ctx, sec.GetName(), sec.GetOptional())
 			if err != nil {
 				return credential, err
 			}
@@ -401,8 +531,9 @@ func renderProjected(ctx context.Context, ns string, src *runtimev1.ProjectedVol
 				return credential, err
 			}
 		case p.GetDownwardApi() != nil:
+			rd.volatile = true
 			for _, item := range p.GetDownwardApi().GetItems() {
-				val, err := resolveDownwardField(box, podIP, item.GetFieldRef().GetFieldPath())
+				val, err := resolveDownwardField(rd.box, rd.podIP, item.GetFieldRef().GetFieldPath())
 				if err != nil {
 					return credential, err
 				}
@@ -416,15 +547,7 @@ func renderProjected(ctx context.Context, ns string, src *runtimev1.ProjectedVol
 			}
 		case p.GetServiceAccountToken() != nil:
 			credential = true
-			sat := p.GetServiceAccountToken()
-			if r == nil {
-				return credential, errNoResolver
-			}
-			token, err := r.ServiceAccountToken(ctx, ns, sat.GetAudience(), sat.GetExpirationSeconds())
-			if err != nil {
-				return credential, fmt.Errorf("mint SA token (audience %q): %w", sat.GetAudience(), err)
-			}
-			if err := writeFile(target, sat.GetPath(), []byte(token), dflt); err != nil {
+			if err := rd.token(ctx, p.GetServiceAccountToken(), dflt, target); err != nil {
 				return credential, err
 			}
 		}
@@ -432,21 +555,103 @@ func renderProjected(ctx context.Context, ns string, src *runtimev1.ProjectedVol
 	return credential, nil
 }
 
+// token writes a ServiceAccount token projection. A token whose issuance
+// record (rd.prev) still has at least 20% of its lifetime left is re-read from
+// the live generation rather than re-minted (the kubelet token manager's rule);
+// any other — no record, a record past 80% of its lifetime, or a live file that
+// cannot be read — is minted fresh and recorded.
+func (rd *render) token(ctx context.Context, sat *runtimev1.ServiceAccountTokenProjection, mode os.FileMode, target string) error {
+	rd.volatile = true
+	if rd.r == nil {
+		return errNoResolver
+	}
+	var key string
+	if rd.tokenBase != "" {
+		key = filepath.Join(rd.tokenBase, sat.GetPath())
+	}
+	now := rd.now()
+	if key != "" && rd.liveDir != "" {
+		if iss, ok := rd.prev[key]; ok && !iss.due(now) {
+			if b, err := readContained(rd.liveDir, sat.GetPath()); err == nil {
+				rd.tokens[key] = iss
+				return writeFile(target, sat.GetPath(), b, mode)
+			}
+		}
+	}
+	token, err := rd.r.ServiceAccountToken(ctx, rd.ns, sat.GetAudience(), sat.GetExpirationSeconds())
+	if err != nil {
+		return fmt.Errorf("mint SA token (audience %q): %w", sat.GetAudience(), err)
+	}
+	if key != "" {
+		rd.tokens[key] = TokenIssue{IssuedAt: now, ExpirationSeconds: sat.GetExpirationSeconds()}
+	}
+	return writeFile(target, sat.GetPath(), []byte(token), mode)
+}
+
+// fetchConfigMap resolves a ConfigMap through the Resolver, recording its
+// immutability.
+func (rd *render) fetchConfigMap(ctx context.Context, name string, optional bool) (map[string][]byte, error) {
+	return rd.fetch("configMap", name, optional, func() (SourceData, error) {
+		return rd.r.ConfigMap(ctx, rd.ns, name)
+	})
+}
+
+// fetchSecret resolves a Secret through the Resolver, recording its
+// immutability.
+func (rd *render) fetchSecret(ctx context.Context, name string, optional bool) (map[string][]byte, error) {
+	return rd.fetch("secret", name, optional, func() (SourceData, error) {
+		return rd.r.Secret(ctx, rd.ns, name)
+	})
+}
+
+// fetch runs one ConfigMap/Secret fetch through resolveData and folds its
+// immutability into the render. An optional source that is absent counts as
+// mutable: it may appear later.
+func (rd *render) fetch(kind, name string, optional bool, get func() (SourceData, error)) (map[string][]byte, error) {
+	if rd.r == nil {
+		return nil, errNoResolver
+	}
+	src, err := resolveData(kind, rd.ns, name, optional, get)
+	if err != nil {
+		return nil, err
+	}
+	rd.fetched = true
+	rd.allImmutable = rd.allImmutable && src.Immutable
+	return src.Data, nil
+}
+
 // errNoResolver reports a data-backed volume source with no Resolver wired.
 var errNoResolver = errors.New("no volume Resolver configured (configMap/secret/SA-token require one)")
 
 // resolveData fetches a ConfigMap/Secret's data, honoring optional: a source that
-// reports os.ErrNotExist while optional yields empty data (skip), otherwise the
-// error propagates.
-func resolveData(ctx context.Context, r Resolver, kind, ns, name string, optional bool, fetch func() (map[string][]byte, error)) (map[string][]byte, error) {
-	data, err := fetch()
+// reports os.ErrNotExist while optional yields empty, mutable data (skip),
+// otherwise the error propagates.
+func resolveData(kind, ns, name string, optional bool, fetch func() (SourceData, error)) (SourceData, error) {
+	src, err := fetch()
 	if err != nil {
 		if optional && errors.Is(err, os.ErrNotExist) {
-			return map[string][]byte{}, nil
+			return SourceData{Data: map[string][]byte{}}, nil
 		}
-		return nil, fmt.Errorf("%s %s/%s: %w", kind, ns, name, err)
+		return SourceData{}, fmt.Errorf("%s %s/%s: %w", kind, ns, name, err)
 	}
-	return data, nil
+	return src, nil
+}
+
+// readContained reads the regular file rel under base, refusing a path that
+// escapes base or names anything but a regular file.
+func readContained(base, rel string) ([]byte, error) {
+	p := filepath.Join(base, rel)
+	if rel == "" || !isUnder(p, base) {
+		return nil, fmt.Errorf("path %q escapes %s", rel, base)
+	}
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", p)
+	}
+	return os.ReadFile(p)
 }
 
 // writeKeyed writes data into target. With items set, only the named keys are

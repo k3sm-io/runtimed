@@ -22,6 +22,8 @@ import (
 	"testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/mount"
 )
 
 // countingResolver is fakeResolver with a per-method call counter. It wraps the
@@ -38,14 +40,14 @@ type countingResolver struct {
 	token     int
 }
 
-func (c *countingResolver) ConfigMap(ctx context.Context, ns, name string) (map[string][]byte, error) {
+func (c *countingResolver) ConfigMap(ctx context.Context, ns, name string) (mount.SourceData, error) {
 	c.mu.Lock()
 	c.configMap++
 	c.mu.Unlock()
 	return c.inner.ConfigMap(ctx, ns, name)
 }
 
-func (c *countingResolver) Secret(ctx context.Context, ns, name string) (map[string][]byte, error) {
+func (c *countingResolver) Secret(ctx context.Context, ns, name string) (mount.SourceData, error) {
 	c.mu.Lock()
 	c.secret++
 	c.mu.Unlock()
@@ -74,19 +76,17 @@ func (c *countingResolver) counts() resolverCounts {
 }
 
 // TestUpdatePodNeverMaterializes pins the in-place-update contract: UpdatePod
-// applies labels and annotations ONLY, and volumes are materialized exactly once,
-// at create — there is no re-resolution of ConfigMap/Secret/ServiceAccount-token
-// data on update.
-//
-// This is a CHARACTERIZATION of today's behaviour, not a design requirement: a
-// projected-volume refresh (the k3sm-side follow-up tracked as B234) must invert
-// this test deliberately rather than trip over it. Its k3sm sibling is
+// applies labels and annotations ONLY and never materializes — there is no
+// re-resolution of ConfigMap/Secret/ServiceAccount-token data on update.
+// RefreshProjectedVolumes does re-resolve, on its own path (pinned by
+// TestRefreshProjectedVolumesIsItsOwnPath); UpdatePod must not grow that
+// behaviour as a side effect. Its k3sm sibling is
 // TestUpdatePodDoesNotRematerializeVolumes in pkg/provider.
 //
 // The contract matters outside this package: the k3sm provider decides whether an
 // apiserver-side pod change can be served in place or needs a recreate, and a
 // provider comment that assumes an update re-projects volume data would promise
-// callers a refresh runtimed never performs (a rotated Secret or an edited
+// callers a refresh UpdatePod never performs (a rotated Secret or an edited
 // ConfigMap does NOT reach a running pod through UpdatePod). Pinning it here means
 // a future UpdatePod that grows a materialize call fails this test rather than
 // silently changing what the provider may claim.

@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
@@ -42,7 +43,7 @@ const (
 	projShareRootMode os.FileMode = 0o700
 	shareRootMode     os.FileMode = 0o750
 	// volShareDirMode is the per-volume directory mode inside a pooled share,
-	// matching the mount-dir mode materializeVolume uses on the native spine.
+	// matching the mount-dir mode render.volume uses on the native spine.
 	volShareDirMode os.FileMode = 0o755
 )
 
@@ -64,7 +65,7 @@ const (
 // with those credentials in a directory somebody else chose. A refusal fails the
 // create, so the pod never boots.
 //
-// The walk bounds the DIRECTORIES. The files materializeVolume then writes
+// The walk bounds the DIRECTORIES. The files render.volume then writes
 // inside a volume's own directory are not opened O_NOFOLLOW, so a link planted
 // at a projected file name inside an already-created volume dir is out of its
 // reach; what it removes is the pre-planted directory, which is what relocates a
@@ -186,7 +187,7 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string
 				if !ok {
 					return fmt.Errorf("container %s: bind references undefined volume %q", cname, b.VolumeName)
 				}
-				if _, err := materializeVolume(ctx, box.GetNamespace(), podIP, vol, dir, box, r); err != nil {
+				if _, err := newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, dir); err != nil {
 					return fmt.Errorf("materialize volume %s: %w", b.VolumeName, err)
 				}
 			default:

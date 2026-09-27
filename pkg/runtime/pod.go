@@ -199,6 +199,16 @@ type pod struct {
 	// host's own vocabulary rather than by what the agent chose to send.
 	guestCapsObserved bool
 	guestCaps         map[string]struct{}
+
+	// Projected-volume refresh state (RefreshProjectedVolumes, refresh.go).
+	// refreshMu serializes refreshes of this pod and guards projState, the
+	// in-memory mount.RefreshState (immutable volumes, token issue times) each
+	// refresh hands the next; it is seeded by createPod from the create-time
+	// render and persisted nowhere. projRefresh is the per-volume outcome of the
+	// last refresh, guarded by mu with the rest of the status state.
+	refreshMu   sync.Mutex
+	projState   mount.RefreshState
+	projRefresh []mount.VolumeRefresh
 }
 
 // containerPIDs returns the pod's currently-running container PIDs (the memory
@@ -365,7 +375,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// An emptyDir with a non-empty medium (Memory, HugePages*) is a request the
-	// native (host-process) materializer cannot honour: materializeVolume treats
+	// native (host-process) materializer cannot honour: mount.render.volume treats
 	// every emptyDir as "an empty writable dir is the whole job" and never reads
 	// Medium, so the request would be silently disk-backed rather than refused.
 	// The vm backend's own planner (classifyVMVolume) already refuses anything
@@ -436,6 +446,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// volume.Binder below — they are durable, lifecycle-decoupled, and live
 	// outside the pod data volume.
 	var credPaths []string
+	var projState mount.RefreshState
 	if len(box.GetVolumes()) > 0 {
 		layout, merr := mount.Materialize(ctx, box, rootfs, ip, r.resolver)
 		if merr != nil {
@@ -443,6 +454,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 				fmt.Errorf("materialize volumes for pod %s: %w", box.GetPodId(), merr)
 		}
 		credPaths = layout.CredentialPaths()
+		projState = layout.State
 	}
 
 	// Bind APFS-backed persistent volumes (PVCs): ensure each claim's
@@ -571,6 +583,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		podIP:   ip,
 		supCtx:  podCtx,
 		cancel:  podCancel,
+
+		projState: projState,
 	}
 
 	// init_containers run first, sequentially; then the main containers start.

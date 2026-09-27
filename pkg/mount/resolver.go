@@ -30,13 +30,26 @@ import "context"
 // os.ErrNotExist so the materializer can honor an `optional: true` source by
 // skipping it (any other error fails the pod).
 type Resolver interface {
-	// ConfigMap returns the key→bytes data of a ConfigMap.
-	ConfigMap(ctx context.Context, namespace, name string) (map[string][]byte, error)
-	// Secret returns the key→bytes data of a Secret.
-	Secret(ctx context.Context, namespace, name string) (map[string][]byte, error)
+	// ConfigMap returns a ConfigMap's key→bytes data and its immutability.
+	ConfigMap(ctx context.Context, namespace, name string) (SourceData, error)
+	// Secret returns a Secret's key→bytes data and its immutability.
+	Secret(ctx context.Context, namespace, name string) (SourceData, error)
 	// ServiceAccountToken mints a bound token for the pod's ServiceAccount with
 	// the requested audience and TTL (the in-pod-kubectl path). The provider's
 	// implementation knows which ServiceAccount the pod uses; audience "" defaults
 	// to the apiserver.
 	ServiceAccountToken(ctx context.Context, namespace, audience string, expirationSeconds int64) (string, error)
+}
+
+// SourceData is what a Resolver returns for a ConfigMap or Secret: the object's
+// key→bytes data, and whether the object is marked immutable (corev1
+// ConfigMap.immutable / Secret.immutable). Refresh never re-fetches a volume whose
+// every source reported Immutable at its last fetch, the kubelet's rule for
+// immutable objects: their data cannot change, so re-reading them is load on the
+// apiserver with no possible effect.
+type SourceData struct {
+	// Data is the object's key→bytes content.
+	Data map[string][]byte
+	// Immutable reports the object's immutable flag.
+	Immutable bool
 }

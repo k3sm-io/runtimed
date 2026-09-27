@@ -38,18 +38,18 @@ type fakeResolver struct {
 	tokenErr error
 }
 
-func (f fakeResolver) ConfigMap(_ context.Context, _, name string) (map[string][]byte, error) {
+func (f fakeResolver) ConfigMap(_ context.Context, _, name string) (SourceData, error) {
 	if d, ok := f.cms[name]; ok {
-		return d, nil
+		return SourceData{Data: d}, nil
 	}
-	return nil, fmt.Errorf("configMap %q: %w", name, os.ErrNotExist)
+	return SourceData{}, fmt.Errorf("configMap %q: %w", name, os.ErrNotExist)
 }
 
-func (f fakeResolver) Secret(_ context.Context, _, name string) (map[string][]byte, error) {
+func (f fakeResolver) Secret(_ context.Context, _, name string) (SourceData, error) {
 	if d, ok := f.secrets[name]; ok {
-		return d, nil
+		return SourceData{Data: d}, nil
 	}
-	return nil, fmt.Errorf("secret %q: %w", name, os.ErrNotExist)
+	return SourceData{}, fmt.Errorf("secret %q: %w", name, os.ErrNotExist)
 }
 
 func (f fakeResolver) ServiceAccountToken(_ context.Context, _, _ string, _ int64) (string, error) {

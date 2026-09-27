@@ -36,18 +36,18 @@ type subPathResolver struct {
 	secrets map[string]map[string][]byte
 }
 
-func (s subPathResolver) ConfigMap(_ context.Context, _, name string) (map[string][]byte, error) {
+func (s subPathResolver) ConfigMap(_ context.Context, _, name string) (mount.SourceData, error) {
 	if d, ok := s.cms[name]; ok {
-		return d, nil
+		return mount.SourceData{Data: d}, nil
 	}
-	return nil, fmt.Errorf("configMap %q: %w", name, os.ErrNotExist)
+	return mount.SourceData{}, fmt.Errorf("configMap %q: %w", name, os.ErrNotExist)
 }
 
-func (s subPathResolver) Secret(_ context.Context, _, name string) (map[string][]byte, error) {
+func (s subPathResolver) Secret(_ context.Context, _, name string) (mount.SourceData, error) {
 	if d, ok := s.secrets[name]; ok {
-		return d, nil
+		return mount.SourceData{Data: d}, nil
 	}
-	return nil, fmt.Errorf("secret %q: %w", name, os.ErrNotExist)
+	return mount.SourceData{}, fmt.Errorf("secret %q: %w", name, os.ErrNotExist)
 }
 
 func (s subPathResolver) ServiceAccountToken(_ context.Context, _, _ string, _ int64) (string, error) {

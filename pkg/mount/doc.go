@@ -40,6 +40,20 @@ limitations under the License.
 // read-only sub-scope (file-read* + an explicit file-write* deny) — a pod can
 // read its credentials but never overwrite them.
 //
+// # Refresh: the atomic-writer layout
+//
+// A non-subPath configMap / secret / downwardAPI / projected mount is written in
+// the kubelet atomic-writer layout, at create and on every Refresh through the
+// same code (writeGeneration): each render goes into a fresh
+// <mountdir>/..<timestamp>/ generation, <mountdir>/..data is flipped to it by
+// renaming a new symlink over the old one, and each top-level key is a relative
+// symlink <key> -> ..data/<key>. A reader sees the whole old set or the whole
+// new set. Refresh re-renders these mounts for a running pod; it skips subPath
+// mounts (cloned once, never refreshed, as in the kubelet), emptyDirs, volumes
+// whose sources were all immutable, and re-mints a ServiceAccount token only
+// when under 20% of its lifetime remains. A failed resolve or render leaves the
+// live generation in place.
+//
 // # subPath
 //
 // A VolumeMount subPath selects a single element within the volume: the container
@@ -59,7 +73,8 @@ limitations under the License.
 // in-volume symlink pointing outside the volume root. The placed element is then
 // branched on kind: a FILE element IS the mount path (clone the file only — never
 // MkdirAll it, which would give the workload's open(2) an EISDIR), a DIR element is
-// the mount path's tree. A subPath naming a non-existent element fails closed,
+// the mount path's tree. The staging render is flat, not a generation. A
+// subPath naming a non-existent element fails closed,
 // except for an emptyDir, whose missing subPath directory is created (kubelet
 // parity). subPathExpr (env-var-expanded subPath) is not yet implemented.
 //
