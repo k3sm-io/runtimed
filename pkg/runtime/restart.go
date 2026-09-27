@@ -23,8 +23,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"k3sm.io/runtimed/pkg/supervisor"
-
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -42,64 +40,41 @@ import (
 // recomputePhaseLocked, which de-escalates the pod back to Running, and
 // re-arms the memory sampler if that terminal transition had cancelled it.
 //
-// Unknown pod / container return a structured NOT_FOUND (RestartContainerResponse
-// carries a google.rpc.Status, matching CreatePod/UpdatePod) rather than a
-// transport error. A pod that is being deleted refuses the replacement with
-// FailedPrecondition + NOT_FOUND and SIGKILLs the group it had already spawned —
-// the same answer StartContainer gives, through the same installer, because a
-// group installed after DeletePod's snapshot is one nothing would ever signal.
+// RestartContainer is the shared terminate (terminateContainer, the one kill
+// sequence StopContainer also uses) followed by a re-spawn; StopContainer is the
+// terminate alone. Both verbs refuse through the same eligibility chain
+// (refuseIneligible), so unknown pod / container return a structured NOT_FOUND
+// (RestartContainerResponse carries a google.rpc.Status, matching
+// CreatePod/UpdatePod) rather than a transport error, and a vm pod answers
+// UNSUPPORTED with an embedded codes.Unimplemented. A pod that is being deleted
+// is refused up front with FailedPrecondition + NOT_FOUND; one whose delete
+// begins during the re-spawn refuses the replacement with the same answer and
+// SIGKILLs the group it had already spawned — the answer StartContainer gives,
+// through the same installer, because a group installed after DeletePod's
+// snapshot is one nothing would ever signal.
 func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
-	r.mu.Lock()
-	p, ok := r.pods[req.GetPodId()]
-	r.mu.Unlock()
-	if !ok {
-		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
-			"pod %s not found", req.GetPodId()), nil
-	}
-	// the VM FORK, AT the TOP and before any .proc TOUCH. A vm pod's containers
-	// are guest processes with no host containerProc, so every line below —
-	// findContainer, the process-group GracefulStop, the re-spawn through
-	// startContainer — operates on state a vm pod does not have. Restarting one
-	// container inside a running guest needs a guest-agent verb that guest/v1
-	// does not define, so the honest answer is a typed unimplemented rather than
-	// a silent no-op that would report a bumped restart_count for a container
-	// nothing restarted. The provider reads Unimplemented and does not retry.
-	if p.isVM() {
-		return restartFailure(codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
-			"restart %s/%s: a vm pod's containers run inside its guest, and guest/v1 defines no per-container restart; recreate the pod",
-			req.GetPodId(), req.GetContainer()), nil
-	}
-
-	// An adopted pod (AttachPod) has no sandbox profile to re-spawn under.
-	// Refuse BEFORE the old process is stopped: stopping it and then failing
-	// the spawn would turn a running container into a dead one.
-	if p.adopted {
-		return restartFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
-			"restart %s/%s: %v", req.GetPodId(), req.GetContainer(), errAdoptedPod), nil
-	}
-
-	oldCP := r.findContainer(p, req.GetContainer())
-	if oldCP == nil {
-		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
-			"container %s not found in pod %s", req.GetContainer(), req.GetPodId()), nil
-	}
-	// A container that NEVER STARTED has no process to terminate and no run to
-	// record: it is Waiting because its start failed before the spawn (the
-	// partial-start contract). This verb's whole contract — terminate, re-spawn,
-	// bump restart_count, record last_termination_state — is meaningless for one,
-	// and every line below dereferences oldCP.proc, which supervisor.Process does
-	// not nil-guard. runtimed is the node's in-process runtime, so that panic
-	// would be node-scoped; refuse instead, and name the verb that does apply.
-	if oldCP.proc == nil {
-		return restartFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
-			"restart %s/%s: container has not started; use StartContainer",
-			req.GetPodId(), req.GetContainer()), nil
+	// The shared eligibility chain (refuseIneligible): unknown pod, vm pod
+	// (UNSUPPORTED), adopted pod, a pod being deleted, unknown container, and a
+	// container that never started are all refused here, before the old process
+	// is touched — stopping it and then failing the re-spawn would turn a
+	// running container into a dead one.
+	p, oldCP, refused := r.refuseIneligible("restart", req.GetPodId(), req.GetContainer())
+	if refused != nil {
+		return restartFailure(refused.code, refused.reason, "%s", refused.msg), nil
 	}
 
 	// Snapshot the old process + spec, and flag the container as restarting so the
 	// kqueue reaper's watchContainerExit does not conclude the pod terminal (which
 	// would flip the phase and cancel the memory sampler) while we re-spawn.
 	p.mu.Lock()
+	// The shared claim discipline (verbInFlightLocked): a stop that has claimed
+	// this container and not yet recorded its exit is concluding it, and a
+	// re-spawn now would install a replacement the stop then reports dead.
+	if verbInFlightLocked(oldCP) == "stop" {
+		p.mu.Unlock()
+		refused := r.refuseInFlight("restart", req.GetPodId(), oldCP.name, "stop")
+		return restartFailure(refused.code, refused.reason, "%s", refused.msg), nil
+	}
 	oldProc := oldCP.proc
 	oldRestartCount := oldCP.state.GetRestartCount()
 	oldStarted := oldCP.state.GetState().GetRunning().GetStartedAt()
@@ -113,33 +88,22 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// before re-spawning so the replacement does not race the old for the pod
 	// IP/ports. SIGKILL is uncatchable, so the wait is bounded; ctx bounds it too.
 	grace := graceDuration(req.GetGracePeriodSeconds(), p)
-	var oldCode, oldSig int
-	if oldPID := oldProc.PID(); oldPID > 0 {
-		if _, _, err := supervisor.GracefulStop(ctx, oldPID, grace, oldProc.Done(),
-			termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
-			r.log.Warn("restart: graceful stop", "pod", req.GetPodId(), "container", oldCP.name, "pid", oldPID, "err", err)
-		}
-		select {
-		case <-oldProc.Done():
-		case <-ctx.Done():
-			r.clearRestarting(ctx, p, oldCP)
-			return restartFailure(codes.Canceled, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
-				"restart %s/%s: %v", req.GetPodId(), oldCP.name, ctx.Err()), nil
-		}
-		oldCode, oldSig, _ = oldProc.Wait(ctx) // already reaped: returns recorded status
+	oldExit, reaped, err := r.terminateContainer(ctx, p, oldCP, grace)
+	if err != nil {
+		r.clearRestarting(ctx, p, oldCP)
+		return restartFailure(codes.Canceled, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
+			"restart %s/%s: %v", req.GetPodId(), oldCP.name, err), nil
+	}
+	oldCode, oldSig := oldExit.code, oldExit.sig
+	if reaped {
 		// The replacement tails the SAME capture files from the persisted
 		// offset, so the old instance's final drain must finish first or both
 		// tails read the same bytes. It follows the reap promptly (a file tail
 		// has no inherited-pipe EOF to wait for); the bound is the backstop.
-		grace := r.drainGraceDuration()
-		drain := time.NewTimer(grace)
-		select {
-		case <-oldProc.LogsDrained():
-		case <-drain.C:
+		if !r.awaitLogsDrained(oldProc) {
 			r.log.Warn("old instance's log tail still running at restart; its last output may be lost or duplicated",
-				"pod", req.GetPodId(), "container", oldCP.name, "grace", grace)
+				"pod", req.GetPodId(), "container", oldCP.name, "grace", r.drainGraceDuration())
 		}
-		drain.Stop()
 	}
 
 	// Re-spawn from the same spec, in the same LIFECYCLE CLASS: initDeclared is
