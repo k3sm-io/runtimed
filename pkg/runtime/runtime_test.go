@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -1469,11 +1470,11 @@ func TestGetRuntimeInfo_VMAvailability(t *testing.T) {
 // materializer (the provider's apiserver-backed Resolver stands in here).
 type fakeResolver struct{}
 
-func (fakeResolver) ConfigMap(_ context.Context, _, name string) (map[string][]byte, error) {
-	return map[string][]byte{"app.conf": []byte("k=v")}, nil
+func (fakeResolver) ConfigMap(_ context.Context, _, name string) (mount.SourceData, error) {
+	return mount.SourceData{Data: map[string][]byte{"app.conf": []byte("k=v")}}, nil
 }
-func (fakeResolver) Secret(_ context.Context, _, name string) (map[string][]byte, error) {
-	return map[string][]byte{"id_rsa": []byte("PRIVATE")}, nil
+func (fakeResolver) Secret(_ context.Context, _, name string) (mount.SourceData, error) {
+	return mount.SourceData{Data: map[string][]byte{"id_rsa": []byte("PRIVATE")}}, nil
 }
 func (fakeResolver) ServiceAccountToken(_ context.Context, _, _ string, _ int64) (string, error) {
 	return "TOKEN", nil

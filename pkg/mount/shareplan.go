@@ -437,7 +437,7 @@ func classifyVMVolume(v *runtimev1.Volume) (vmVolume, error) {
 	return info, nil
 }
 
-// projectedCredential mirrors renderProjected's credential classification
+// projectedCredential mirrors render.projected's credential classification
 // without rendering anything: a projected volume is a credential iff any of
 // its sources is a secret or a serviceAccountToken.
 func projectedCredential(src *runtimev1.ProjectedVolumeSource) bool {
