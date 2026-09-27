@@ -3,7 +3,7 @@ repo: runtimed
 schema: phases/v1
 current_phase: M7
 updated: 2026-09-26
-updated_by: B171 write-back (StopContainer, the terminal kill of one container)
+updated_by: B409 write-back (restart one container of a re-attached pod in place)
 
 phases:
   - id: M0
@@ -1029,6 +1029,17 @@ fields and serve the two RPCs `apis:M2.2` appended.
   reaper, write the terminated state (one `FinishedAt`, via the shared `terminatedStateLocked`) and publish
   the one MODIFIED; `restart_count`, the log file and `last_termination_state` are untouched —
   `pkg/runtime.TestStopContainerTerminatesWithoutRespawn`.
+- ✅ B409 write-back (2026-09-26) `pkg/runtime/attach.go`: a pod re-attached after a daemon restart
+  **recompiles its sandbox profile** from the spec and this daemon's posture (`compileProfile`, extracted
+  from createPod, fed by the pure halves `mount.CredentialPaths` and `volume.Binder.Plan` that Materialize
+  and Bind now call) and adopts only when it hashes to the `ProfileSHA256` each container recorded at
+  spawn (an additive podreap field; a drifted posture or an older record refuses with
+  `ErrNothingToAttach`, so the pod is created afresh). RestartContainer and StopContainer then act on
+  ONE container of the attached pod (`refuseIneligible` loses its adopted arm; Exec stays refused, B408);
+  a killed adopted instance's `last_termination_state` is `ExitStatusUnknown`/-1 in either reaper
+  ordering, and StartContainer on a container that died while the daemon was down keeps the log-dir
+  restart count and records the dead run as `last_termination_state` —
+  `pkg/runtime.TestRestartContainerOnAttachedPodRebuildsItsSandbox`.
 - ✅ `M2.8-d3` `pkg/runtime/stats.go`: serve **`ListPodStats`** — map the M2.5 sampler's `ri_phys_footprint`
   onto the apis `PodStats`/`ContainerStats`/`MemoryStats` (pod-level from `PodMetrics`, per-container from the
   `Footprinter` at request time). Empty `pod_id` = all **metered** pods (the Summary shape); unmetered/unknown

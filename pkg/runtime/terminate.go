@@ -60,9 +60,6 @@ type verbRefusal struct {
 //     running guest needs a guest-agent verb guest/v1 does not define, so the
 //     honest answer is a typed "the backend does not implement this" rather than
 //     a silent no-op. The provider reads Unimplemented and does not retry.
-//   - adopted pod (AttachPod): FailedPrecondition + NOT_UPDATABLE. It has no
-//     sandbox profile to re-spawn under, and its processes are not this daemon's
-//     children, so neither verb can report an exit it can read.
 //   - pod being deleted (p.stopping): FailedPrecondition + NOT_FOUND, the answer
 //     the installer gives a spawn that lands during a delete — the pod is not
 //     going to exist, so no retry helps. DeletePod's teardown owns every process
@@ -86,10 +83,6 @@ func (r *Runtime) refuseIneligible(verb, podID, name string) (*pod, *containerPr
 		return nil, nil, refusal(codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
 			"%s %s/%s: a vm pod's containers run inside its guest, and guest/v1 defines no per-container %s; recreate the pod",
 			verb, podID, name, verb)
-	}
-	if p.adopted {
-		return nil, nil, refusal(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
-			"%s %s/%s: %v", verb, podID, name, errAdoptedPod)
 	}
 	p.mu.Lock()
 	stopping := p.stopping

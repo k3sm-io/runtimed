@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k3sm.io/runtimed/pkg/crilog"
+	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -70,10 +71,20 @@ import (
 //     over, and the pod message says so;
 //   - the shim-inactive verdict: the exec observation happened in the previous
 //     daemon, so the condition is absent rather than guessed;
-//   - the confinement profile and the resolved launch environment: they were
-//     derived from volume materialization the previous daemon performed, so an
-//     adopted pod refuses Exec and RestartContainer (recreate the pod instead)
-//     rather than run a process under a profile it cannot reproduce.
+//   - the resolved launch environment of a running instance (its image-config
+//     env and working directory): an exec session must enter exactly that, so
+//     an adopted pod refuses Exec (B408's resident shim is the answer). A
+//     container RE-SPAWNED by RestartContainer or StartContainer resolves its
+//     own, as on a created pod.
+//
+// The confinement profile IS rebuilt: it is recompiled from the spec and this
+// daemon's posture, through the pure halves of the create-time volume work
+// (mount.CredentialPaths, volume.Binder.Plan), and the pod is adopted only when
+// that compilation hashes to the digest every adopted container recorded at
+// spawn (PodReapRecord.ProfileSHA256). A pod whose profile drifted — a changed
+// posture flag, a record from before the digest — is refused and created
+// afresh, so a restarted container never runs under a profile its siblings do
+// not.
 
 // ErrNothingToAttach reports that AttachPod found no live process group it may
 // adopt for the pod. The caller falls back to CreatePod. Every refusal wraps it,
@@ -109,9 +120,10 @@ const (
 	attachedLostSuffix = "; container output written while the daemon was down was not captured"
 )
 
-// errAdoptedPod is the refusal for a verb that must re-derive the pod's
-// confinement, which an adopted pod does not carry (see the header).
-var errAdoptedPod = errors.New("the pod was re-attached after a runtime daemon restart and its sandbox profile was not rebuilt; recreate the pod")
+// errAdoptedPod is Exec's refusal on an adopted pod: a session must enter the
+// running instance's resolved launch environment, which this daemon did not
+// resolve (see the header).
+var errAdoptedPod = errors.New("exec is not supported in a pod re-attached after a runtime daemon restart: the running containers' launch environment was resolved by the previous daemon")
 
 // runtimeFingerprint names the build of this daemon for the podreap records: the
 // hex code-directory hash of the running binary (csops CS_OPS_CDHASH), prefixed
@@ -201,6 +213,30 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 		}
 	}
 
+	// The profile the pod's containers run under, recompiled from the spec with
+	// THIS daemon's posture, and verified against the digest each adopted
+	// container recorded at spawn. On a match the pod carries it, so
+	// RestartContainer and StartContainer re-spawn a container under exactly the
+	// profile its siblings run under — the CRI sandbox config surviving a
+	// kubelet restart. On any mismatch (a posture flag changed, the spec's
+	// volumes changed, a record predates the digest) the whole pod is refused:
+	// one container restarting under a profile its siblings do not run under is
+	// a confinement split nothing would ever report.
+	profile, err := r.boxProfile(box)
+	if err != nil {
+		return nil, fmt.Errorf("attach pod %s: compile the sandbox profile: %w: %w", podID, ErrNothingToAttach, err)
+	}
+	digest := profileDigest(profile)
+	for _, c := range attachableContainers(box) {
+		rec, ok := byName[c.GetName()]
+		if !ok || rec.ProfileSHA256 == digest {
+			continue
+		}
+		r.log.Warn("attach: sandbox profile drift; the pod will be created afresh",
+			"pod", podID, "container", c.GetName(), "recorded", rec.ProfileSHA256, "compiled", digest)
+		return nil, fmt.Errorf("attach pod %s container %s: sandbox profile drift: %w", podID, c.GetName(), ErrNothingToAttach)
+	}
+
 	type slot struct {
 		cp      *containerProc
 		rec     podProcRecord
@@ -249,6 +285,7 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	podCtx, podCancel := context.WithCancel(context.Background())
 	p := &pod{
 		box:           box,
+		profile:       profile,
 		backend:       selected,
 		phase:         runtimev1.PodPhase_POD_PHASE_RUNNING,
 		message:       msg,
@@ -330,6 +367,50 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_ADDED, st)
 	return st, nil
+}
+
+// attachableContainers lists the spec containers AttachPod builds entries for:
+// the native sidecars of the init list, then the mains — the order the pod's
+// containers take in p.containers.
+func attachableContainers(box *runtimev1.PodBox) []*runtimev1.Container {
+	var out []*runtimev1.Container
+	for _, c := range box.GetInitContainers() {
+		if isSidecarSpec(c) {
+			out = append(out, c)
+		}
+	}
+	return append(out, box.GetContainers()...)
+}
+
+// boxProfile compiles a host-process pod's SBPL profile from its spec alone,
+// through the pure halves of the create-time volume work: mount.CredentialPaths
+// for the credential read-only sub-scope and volume.Binder.Plan for the PV
+// read/write scope, then compileProfile — the derivation createPod feeds from
+// Materialize and Bind. Nothing is rendered, bound or created.
+func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
+	rootfs, err := r.rootfsPath(box)
+	if err != nil {
+		return "", err
+	}
+	var credPaths []string
+	if len(box.GetVolumes()) > 0 {
+		if credPaths, err = mount.CredentialPaths(box, rootfs); err != nil {
+			return "", err
+		}
+	}
+	var pvWrite, pvRead []string
+	bindings, err := r.binder.Plan(box)
+	if err != nil {
+		return "", err
+	}
+	for _, bd := range bindings {
+		if bd.ReadOnly {
+			pvRead = append(pvRead, bd.DataDir)
+		} else {
+			pvWrite = append(pvWrite, bd.DataDir)
+		}
+	}
+	return r.compileProfile(box, rootfs, box.GetPodIp(), credPaths, pvWrite, pvRead)
 }
 
 // isSidecarSpec reports whether an init-list container is a native sidecar

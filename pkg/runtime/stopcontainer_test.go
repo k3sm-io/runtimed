@@ -26,8 +26,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 
-	"k3sm.io/runtimed/pkg/supervisor"
-
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -57,26 +55,6 @@ func TestStopContainerTerminatesWithoutRespawn(t *testing.T) {
 		wantReason runtimev1.FailureReason
 		wantText   string
 	}{
-		{
-			name: "adopted",
-			setup: func(t *testing.T) (*Runtime, *runtimev1.StopContainerRequest, func()) {
-				waiter := unknownExitWaiter{newBlockingWaiter()}
-				groups := fakeGroups{members: map[int][]supervisor.ProcMember{100: {mem(100, 5000)}}}
-				rt := newTestRuntime(t, Deps{
-					ProcGroup:     groups.inspect,
-					ProcStartTime: func(int) (int64, bool) { return 5000, true },
-					AdoptedWaiter: waiter,
-				})
-				seedPodProcRecord(t, rt, podProcRecord{PodID: "p1", Container: "main", Pgid: 100, StartUnixNano: 5000})
-				if _, err := rt.AttachPod(context.Background(), hostBinBox(rt, "p1")); err != nil {
-					t.Fatalf("AttachPod: %v", err)
-				}
-				return rt, &runtimev1.StopContainerRequest{PodId: "p1", Container: "main"}, func() { waiter.release(100) }
-			},
-			wantCode:   codes.FailedPrecondition,
-			wantReason: runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
-			wantText:   errAdoptedPod.Error(),
-		},
 		{
 			name: "vm",
 			setup: func(t *testing.T) (*Runtime, *runtimev1.StopContainerRequest, func()) {
