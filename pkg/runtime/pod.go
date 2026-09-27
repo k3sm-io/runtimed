@@ -209,6 +209,17 @@ type pod struct {
 	refreshMu   sync.Mutex
 	projState   mount.RefreshState
 	projRefresh []mount.VolumeRefresh
+
+	// adopted marks a pod AttachPod re-attached after a daemon restart rather
+	// than one this daemon created (attach.go). It carries no sandbox profile
+	// and no resolved launch environment, so Exec and RestartContainer refuse
+	// it. logStreamLost is set when a container's output could not be resumed
+	// (it was spawned with pipes); the status then carries
+	// LogStreamLostConditionType from attachedAt. All three are immutable after
+	// AttachPod.
+	adopted       bool
+	attachedAt    time.Time
+	logStreamLost bool
 }
 
 // containerPIDs returns the pod's currently-running container PIDs (the memory
@@ -1534,6 +1545,17 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		},
 	}
 	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, containerLogSink(logw, fanout))
+	// The container's stdio goes to files the daemon tails, not pipes, so its
+	// output — and the container — survive a daemon restart (see
+	// supervisor.CaptureToFiles and AttachPod).
+	capture, err := r.containerCapture(p.box.GetPodId(), c.GetName())
+	if err != nil {
+		_ = cleanup()
+		_ = logw.Close()
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("capture files for %s: %w", c.GetName(), err)
+	}
+	proc.CaptureToFiles(capture)
 	cp.proc = proc
 	// The observer runs on the reaper goroutine and locks pod.mu itself.
 	if obs := r.observeShim(p, cp, execArgv[0], env); obs != nil {
@@ -1638,7 +1660,19 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 		// --previous` finds the crashed run's output.
 		LogPath: cp.state.GetLogPath(),
 	}
+	exitUnknown := errors.Is(err, supervisor.ErrExitUnknown)
 	switch {
+	case exitUnknown:
+		// A re-attached container (AttachPod) is not this daemon's child: its
+		// exit was observed but the status belongs to launchd. Report exactly
+		// that, with an exit code that cannot read as success. An OOM kill the
+		// sampler issued keeps its reason, which is known.
+		term.ExitCode = exitCodeUnknown
+		term.Reason = ExitStatusUnknownReason
+		term.Message = "the container was re-attached after a runtime daemon restart and is not a child of this daemon; its exit status cannot be read"
+		if p.oomKilled {
+			term.Reason = "OOMKilled"
+		}
 	case p.oomKilled && (sig != 0 || code != 0):
 		// The memory sampler SIGKILLed this pod for a limit breach: a
 		// container that exited by signal / non-zero is reported OOMKilled.

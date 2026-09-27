@@ -73,6 +73,9 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return err
 	}
+	if p.adopted {
+		return status.Errorf(codes.FailedPrecondition, "exec: %v", errAdoptedPod)
+	}
 	cmdv := first.GetCommand()
 	if len(cmdv) == 0 {
 		return status.Error(codes.InvalidArgument, "exec: command is required")

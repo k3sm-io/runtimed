@@ -22,6 +22,19 @@ limitations under the License.
 // its stdout and stderr (the CRI log format labels every line with the stream it
 // came from, and a merge cannot be undone downstream), and reaps exits via
 // kqueue(EVFILT_PROC) — the sole reaper.
+//
+// A pod container's two streams are FILES, not pipes (Process.CaptureToFiles):
+// the child appends to <stream>.raw files the daemon opened for it, and the
+// daemon tails them into the CRI log from an offset persisted beside each file.
+// A pipe's read end dies with the daemon and the child's next write takes
+// EPIPE/SIGPIPE, which made every logging pod fatal to a daemon restart; a file
+// has no reader to lose, so capture survives the daemon and a restarted daemon
+// resumes the tail (AdoptProcess). The disk bound truncates a raw file past
+// RawCaptureMaxBytes once it is consumed to the end, losing whatever is appended
+// between the size check and the truncate. That window is the accepted cost
+// until a resident per-container shim (the containerd-shim shape) owns the
+// stdio. Other callers (exec sessions) keep the pipe path.
+//
 // kqueue is used deliberately INSTEAD OF os/exec.Cmd.Wait so there is exactly one
 // place that calls wait4; mixing the two double-reaps and races the exit status.
 //

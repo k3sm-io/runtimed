@@ -40,5 +40,13 @@ type KqueueReaper struct{}
 // WaitExit is unsupported off darwin/cgo.
 func (KqueueReaper) WaitExit(context.Context, int) (int, int, error) { return 0, 0, errUnsupported }
 
+// AdoptedExitWaiter off darwin/cgo is a non-functional stub.
+type AdoptedExitWaiter struct{}
+
+// WaitExit is unsupported off darwin/cgo.
+func (AdoptedExitWaiter) WaitExit(context.Context, int) (int, int, error) {
+	return 0, 0, errUnsupported
+}
+
 // SignalGroup is unsupported off darwin/cgo.
 func SignalGroup(int, os.Signal) error { return errUnsupported }

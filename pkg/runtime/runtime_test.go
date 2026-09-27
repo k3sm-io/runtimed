@@ -722,6 +722,11 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	// waiting behaviour itself is gated in pkg/supervisor, so shrinking it here
 	// hides nothing; a test that needs the real value sets the field back.
 	rt.exitObsGrace = 50 * time.Millisecond
+	// Stop every pod's supervision — reapers AND capture-file tails — before
+	// the temp root is removed (cleanups run last-in first-out, and the root's
+	// was registered above): a tail still persisting its offset into a pod dir
+	// the cleanup is deleting fails the RemoveAll.
+	t.Cleanup(func() { _ = rt.Close() })
 	return rt
 }
 
@@ -782,12 +787,80 @@ func testDeps(t *testing.T, d Deps) Deps {
 	// same reason the vm backend defaults unavailable: otherwise every runtime unit
 	// test would run the real Metal compile+dispatch probe and its result would
 	// depend on the test host's hardware. The GPU tests inject their own.
+	// The re-adoption seams (attach.go): a blocking non-child waiter, and a
+	// fixed build fingerprint so records written by recordPodProc and the attach
+	// decision agree without asking the kernel for this test binary's cdhash.
+	if d.AdoptedWaiter == nil {
+		d.AdoptedWaiter = newBlockingWaiter()
+	}
+	if d.RuntimeFingerprint == "" {
+		d.RuntimeFingerprint = "test-build"
+	}
 	if d.GPUProbe == nil {
 		d.GPUProbe = func() sandbox.GPUProbeResult {
 			return sandbox.GPUProbeResult{Metal: sandbox.MetalStatus{Reason: sandbox.MetalReasonNoDevice}}
 		}
 	}
+	// Default the process-group signal seam to a recording no-op. Left nil, New
+	// falls through to the real supervisor.SignalGroup, and every pgid a unit
+	// test holds is fake (the fake spawner's 1001, a seeded record's 100): a
+	// DeletePod, OOM kill or startup reap would then send a real kill(-pgid) to
+	// whatever process group owns that number on the test host, which is fatal
+	// to it when the tests run as root. Unit tests never signal real process
+	// groups; a test that wants a specific recorder (or, in an integration test,
+	// the real thing) injects its own.
+	if d.SignalGroup == nil {
+		rec := &recordingSignalGroup{}
+		defaultSignalRecorders.Store(t, rec)
+		t.Cleanup(func() { defaultSignalRecorders.Delete(t) })
+		d.SignalGroup = rec.signal
+	}
 	return d
+}
+
+// defaultSignalRecorders maps a *testing.T to the recorder testDeps installed
+// as its default SignalGroup, so a test can assert what a runtime built with no
+// SignalGroup of its own would have signalled. The last testDeps call in a test
+// wins.
+var defaultSignalRecorders sync.Map
+
+// defaultSignalRecorder returns the recorder testDeps installed for t, failing
+// the test when testDeps installed none.
+func defaultSignalRecorder(t *testing.T) *recordingSignalGroup {
+	t.Helper()
+	v, ok := defaultSignalRecorders.Load(t)
+	if !ok {
+		t.Fatal("testDeps installed no default SignalGroup recorder: a runtime built from Deps{} would signal real process groups")
+	}
+	return v.(*recordingSignalGroup)
+}
+
+// TestDepsDefaultSignalGroupNeverSignalsRealGroups pins the testDeps default: a
+// runtime built without a SignalGroup of its own sends DeletePod's stop signal
+// for its (fake) pgid to the recording fake, never through the real
+// supervisor.SignalGroup. Dropping the default turns this red.
+func TestDepsDefaultSignalGroupNeverSignalsRealGroups(t *testing.T) {
+	w := newBlockingWaiter()
+	rt := newTestRuntime(t, Deps{Waiter: w})
+	rec := defaultSignalRecorder(t)
+	rec.mu.Lock()
+	rec.onTerm = w.release
+	rec.onKill = w.release
+	rec.mu.Unlock()
+
+	mustCreatePod(t, rt, hostBinBox(rt, "p1"))
+	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "p1"}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	var got bool
+	for _, s := range rec.sentSignals() {
+		if s.pid == 1001 {
+			got = true
+		}
+	}
+	if !got {
+		t.Fatalf("default recorder saw %+v, want a stop signal for the fake spawner's pgid 1001", rec.sentSignals())
+	}
 }
 
 // derivedRootfs is the one way a test spells a pod's on-disk data volume.
@@ -1342,16 +1415,20 @@ func TestContainerOutputReachesTheLogFile(t *testing.T) {
 	mustCreatePod(t, rt, box)
 	defer w.release(1001)
 
-	rt.mu.Lock()
-	p := rt.pods["pod-l"]
-	rt.mu.Unlock()
-	select {
-	case <-p.containers[0].proc.LogsDrained():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the container's log pumps never drained")
-	}
-
+	// The output is tailed from the container's capture file while it runs
+	// (supervisor.CaptureToFiles), so wait for the line rather than for a drain
+	// edge that now closes only once the process has exited.
 	path := filepath.Join(box.GetLogDirectory(), "main", "0.log")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the container's output never reached its log file")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	lines := readCRILog(t, path)
 	if len(lines) != 1 {
 		t.Fatalf("%s holds %v, want one line", path, lines)

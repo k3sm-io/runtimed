@@ -20,3 +20,6 @@ package supervisor
 
 // CodeSignStatus is unsupported off darwin/cgo.
 func CodeSignStatus(int) (uint32, error) { return 0, errUnsupported }
+
+// CodeDirectoryHash is unsupported off darwin/cgo.
+func CodeDirectoryHash(int) (string, error) { return "", errUnsupported }

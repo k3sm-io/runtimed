@@ -310,6 +310,13 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// and a Writer closed earlier would take that output with it. The FILES stay
 	// — runtimed never deletes one — so the node can still read a deleted pod's
 	// logs until its own GC removes the tree.
+	//
+	// The log tails read the containers' capture files under the pod dir and
+	// persist their offsets there, and they finish with a final drain after
+	// the reap — so wait for them (bounded) before the writers close and the
+	// dir goes, or a last batch is lost and a late offset write races the
+	// RemoveAll.
+	r.awaitLogTails(p)
 	r.closeContainerLogs(p)
 	if err := r.removePodDir(req.GetPodId()); err != nil {
 		r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
@@ -682,5 +689,25 @@ func rpcStatus(code codes.Code, format string, args ...any) *rpcstatus.Status {
 	return &rpcstatus.Status{
 		Code:    int32(code),
 		Message: fmt.Sprintf(format, args...),
+	}
+}
+
+// awaitLogTails waits, up to one shared drain-grace bound, for every container
+// process's log tails to finish their final drain. Called with no lock held.
+func (r *Runtime) awaitLogTails(p *pod) {
+	p.mu.Lock()
+	edges := make([]<-chan struct{}, 0, len(p.containers))
+	for _, cp := range p.containers {
+		if cp.proc != nil {
+			edges = append(edges, cp.proc.LogsDrained())
+		}
+	}
+	p.mu.Unlock()
+	deadline := time.Now().Add(r.drainGraceDuration())
+	for _, ch := range edges {
+		if !waitClosed(ch, deadline) {
+			r.log.Warn("container log tail still running at pod teardown; its last output may be lost", "pod", p.box.GetPodId())
+			return
+		}
 	}
 }

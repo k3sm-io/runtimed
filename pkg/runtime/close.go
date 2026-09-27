@@ -165,6 +165,7 @@ type supervisionWait struct {
 // namedDone is a container's supervision-stopped edge, named for the error.
 type namedDone struct {
 	container string
+	what      string
 	done      <-chan struct{}
 }
 
@@ -185,7 +186,11 @@ func (r *Runtime) cancelPodSupervision(p *pod) supervisionWait {
 		if cp.proc == nil {
 			continue
 		}
-		procs = append(procs, namedDone{container: cp.name, done: cp.proc.Done()})
+		procs = append(procs, namedDone{container: cp.name, what: "reaper", done: cp.proc.Done()})
+		// The log tails end with the reaper and then persist their final
+		// offset, which is what the next daemon resumes from (AttachPod); a
+		// shutdown that returned before that write would replay the batch.
+		procs = append(procs, namedDone{container: cp.name, what: "log tail", done: cp.proc.LogsDrained()})
 	}
 	p.mu.Unlock()
 
@@ -212,7 +217,7 @@ func (w supervisionWait) await(deadline time.Time) []error {
 	var errs []error
 	for _, nd := range w.procs {
 		if !waitClosed(nd.done, deadline) {
-			errs = append(errs, fmt.Errorf("pod %s container %s reaper: %w", w.podID, nd.container, ErrSupervisionNotStopped))
+			errs = append(errs, fmt.Errorf("pod %s container %s %s: %w", w.podID, nd.container, nd.what, ErrSupervisionNotStopped))
 		}
 	}
 	if w.sampler != nil && !waitClosed(w.sampler, deadline) {

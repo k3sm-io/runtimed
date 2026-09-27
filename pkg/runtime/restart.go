@@ -70,6 +70,14 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 			req.GetPodId(), req.GetContainer()), nil
 	}
 
+	// An adopted pod (AttachPod) has no sandbox profile to re-spawn under.
+	// Refuse BEFORE the old process is stopped: stopping it and then failing
+	// the spawn would turn a running container into a dead one.
+	if p.adopted {
+		return restartFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			"restart %s/%s: %v", req.GetPodId(), req.GetContainer(), errAdoptedPod), nil
+	}
+
 	oldCP := r.findContainer(p, req.GetContainer())
 	if oldCP == nil {
 		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
@@ -119,6 +127,19 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 				"restart %s/%s: %v", req.GetPodId(), oldCP.name, ctx.Err()), nil
 		}
 		oldCode, oldSig, _ = oldProc.Wait(ctx) // already reaped: returns recorded status
+		// The replacement tails the SAME capture files from the persisted
+		// offset, so the old instance's final drain must finish first or both
+		// tails read the same bytes. It follows the reap promptly (a file tail
+		// has no inherited-pipe EOF to wait for); the bound is the backstop.
+		grace := r.drainGraceDuration()
+		drain := time.NewTimer(grace)
+		select {
+		case <-oldProc.LogsDrained():
+		case <-drain.C:
+			r.log.Warn("old instance's log tail still running at restart; its last output may be lost or duplicated",
+				"pod", req.GetPodId(), "container", oldCP.name, "grace", grace)
+		}
+		drain.Stop()
 	}
 
 	// Re-spawn from the same spec, in the same LIFECYCLE CLASS: initDeclared is

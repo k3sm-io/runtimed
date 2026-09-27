@@ -111,6 +111,11 @@ type Process struct {
 	execObserver func(pid int)
 	execTimeout  time.Duration
 
+	// capture, when set by CaptureToFiles before Start, routes the child's
+	// stdout/stderr into append-only files the pumps tail, instead of pipes.
+	// Read only by Start (single-use), so it needs no lock.
+	capture *FileCapture
+
 	done      chan struct{} // closed once the process is reaped
 	drained   chan struct{} // closed once BOTH log pumps have copied output to EOF
 	drainOnce sync.Once     // guards the single close of drained (idempotent, panic-safe)
@@ -153,6 +158,62 @@ func NewProcess(spawner Spawner, waiter ExitWaiter, spec SpawnSpec, sink LogSink
 func (p *Process) ObserveExec(fn func(pid int), timeout time.Duration) {
 	p.execObserver = fn
 	p.execTimeout = timeout
+}
+
+// CaptureToFiles routes the child's stdout and stderr into the two append-only
+// files c names instead of pipes, and makes the log pumps TAIL them into the
+// sink from the offset persisted beside each file (see rawTail). It must be
+// called before Start, and only matters with a sink.
+//
+// Why files: a pipe's read end lives in this daemon, so when the daemon dies the
+// child's next write takes EPIPE and — SIGPIPE's default action — the child dies
+// with it. A file descriptor has no reader to lose: the child keeps writing, and
+// the next daemon resumes the tail where the last one stopped (AdoptProcess).
+func (p *Process) CaptureToFiles(c FileCapture) {
+	p.capture = &c
+}
+
+// openCaptureFiles opens both capture files for the child and stamps them on
+// the spec, unwinding the first if the second fails (openPipes' shape).
+func (p *Process) openCaptureFiles() error {
+	outW, err := openCaptureFile(p.capture.Stdout)
+	if err != nil {
+		return err
+	}
+	errW, err := openCaptureFile(p.capture.Stderr)
+	if err != nil {
+		_ = outW.Close()
+		return err
+	}
+	p.outW, p.errW = outW, errW
+	p.spec.StdoutFD = outW.Fd()
+	p.spec.StderrFD = errW.Fd()
+	return nil
+}
+
+// startTails launches the two capture tails, and the join that closes drained.
+func (p *Process) startTails() {
+	p.pumps.Add(2)
+	go p.tailLogs(p.capture.Stdout, crilog.StreamStdout)
+	go p.tailLogs(p.capture.Stderr, crilog.StreamStderr)
+	go func() {
+		p.pumps.Wait()
+		p.closeDrained()
+	}()
+}
+
+// tailLogs is pumpLogs for a capture file: it tails path into the sink until the
+// process is reaped, then drains to the end of the file and returns.
+func (p *Process) tailLogs(path string, stream crilog.Stream) {
+	defer p.pumps.Done()
+	t := &rawTail{path: path, stream: stream, sink: p.sink, maxBytes: RawCaptureMaxBytes, poll: rawTailPoll}
+	if err := t.run(context.Background(), p.done); err != nil {
+		// Nothing reads the capture file from here on, so nothing truncates it
+		// at the size bound either: the child's output accumulates on disk until
+		// the pod is deleted. Say so, so the growth has a visible cause.
+		slog.Warn("container log tail stopped (the log sink refused a chunk or the capture file is unreadable); the capture file will now grow without bound until the pod is deleted",
+			"pid", p.PID(), "path", path, "stream", string(stream), "err", err)
+	}
 }
 
 // openExecSync creates the exec-sync pipe and returns the spawn spec carrying
@@ -220,7 +281,11 @@ func (p *Process) Start(ctx context.Context) error {
 	// One pipe per stream: the child writes fd 1 into outW and fd 2 into errW;
 	// the parent reads each R end and pumps it to the sink under its own label.
 	if p.sink != nil {
-		if err := p.openPipes(); err != nil {
+		open := p.openPipes
+		if p.capture != nil {
+			open = p.openCaptureFiles
+		}
+		if err := open(); err != nil {
 			// No pump will ever run on this Process — close the drain edge so a
 			// LogsDrained() waiter is not wedged forever by a failed Start.
 			p.closeDrained()
@@ -256,7 +321,9 @@ func (p *Process) Start(ctx context.Context) error {
 	// the pipe never reaches EOF even after the child exits.
 	p.closeWriteEnds()
 
-	if p.sink != nil {
+	if p.sink != nil && p.capture != nil {
+		p.startTails()
+	} else if p.sink != nil {
 		outR, errR := p.outR, p.errR
 		p.pumps.Add(2)
 		go p.pumpLogs(outR, crilog.StreamStdout)
