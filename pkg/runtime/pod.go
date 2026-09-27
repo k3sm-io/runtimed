@@ -295,6 +295,14 @@ type containerProc struct {
 	// transient termination as a pod-terminal event (which would flip the pod to
 	// Succeeded/Failed and cancel the memory sampler). Guarded by pod.mu.
 	restarting bool
+	// stopped marks the container as claimed by StopContainer (guarded by
+	// pod.mu): the verb kills this instance and writes its terminated state
+	// itself, so the kqueue reaper's watchContainerExit must neither write a
+	// second state (a second FinishedAt) nor publish a second MODIFIED for the
+	// same death. It is the `restarting` precedent for a kill with no re-spawn,
+	// and it is per-instance: a later RestartContainer installs a fresh
+	// containerProc, so the latch never outlives the process it describes.
+	stopped bool
 	// starting marks a start in flight for this never-started container (guarded
 	// by pod.mu). It is the claim that makes STARTING single-flight: two
 	// concurrent starts would each spawn a process and the second would REPLACE
@@ -1645,6 +1653,63 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	}
 
 	p.mu.Lock()
+	// A container StopContainer claimed is concluded by that verb: it waited
+	// for this same exit and writes the terminated state and the one publish
+	// itself. Writing here too would stamp a second FinishedAt over the one the
+	// verb returned, and publishing would report the same death twice.
+	if cp.stopped {
+		p.mu.Unlock()
+		return
+	}
+	terminatedStateLocked(p, cp, code, sig, err)
+	// Snapshot the restart flag under the same lock that guards the state write,
+	// so the publish decision at the bottom cannot straddle a concurrent
+	// RestartContainer claiming this container.
+	restarting := cp.restarting
+	r.recomputePhaseLocked(p)
+
+	// The mains just concluded the pod (mains-only accounting above). If that
+	// conclusion is truly terminal, claim the irreversible teardown — stop the
+	// memory sampler and stop the native sidecars in reverse start order — before
+	// the terminal publish below. See trulyTerminalLocked for the predicate and
+	// claimTerminalTeardownLocked for the exactly-once claim.
+	td := claimTerminalTeardownLocked(p)
+	p.mu.Unlock()
+
+	// One pod-level grace budget, anchored NOW: the mains exited on their own
+	// (voluntary completion) and consumed none of it, so the sidecars share the
+	// whole configured budget in reverse start order (see stopSidecars).
+	r.runTerminalTeardown(ctx, p, td)
+
+	// Suppress the transient terminated publish of a container the provider is
+	// already restarting. The state write above stands — RestartContainer
+	// reads it back for last_termination_state — but publishing it would show
+	// the provider a "new" exit for a restart it issued, and its terminationKey
+	// idempotency would schedule a second restart for the same death. The
+	// authoritative event for this exit is the one RestartContainer publishes
+	// after the swap, carrying the bumped restart_count. On a failed restart
+	// clearRestarting drops the flag, so the exit is published by the next
+	// status transition and normal accounting resumes.
+	if restarting {
+		return
+	}
+	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+}
+
+// terminatedStateLocked records a reaped container's terminated state from its
+// (code, sig, wait error): the ONE place a container's exit becomes a
+// ContainerStateTerminated, shared by the kqueue reaper's watchContainerExit and
+// by StopContainer, so both derive the same reason taxonomy and each exit gets
+// exactly one FinishedAt. Caller holds p.mu (p.oomKilled is read under it).
+func terminatedStateLocked(p *pod, cp *containerProc, code, sig int, err error) {
+	cp.state.State = &runtimev1.ContainerState{Terminated: terminatedLocked(p, cp, code, sig, err)}
+}
+
+// terminatedLocked derives the ContainerStateTerminated for a reaped exit
+// without recording it: terminatedStateLocked's derivation, also used by a
+// StopContainer that concludes during its pod's delete and so reports the exit
+// it observed but must not write it. Caller holds p.mu.
+func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runtimev1.ContainerStateTerminated {
 	term := &runtimev1.ContainerStateTerminated{
 		ExitCode:   int32(code),
 		Signal:     int32(sig),
@@ -1694,44 +1759,12 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	// empty unless a source above set one (the wait error), which is also what
 	// upstream [NodeConformance] asserts for a successful container.
 	//
-	// The drain-wait above is what makes that computable at all: it holds the
-	// terminated publish until both pumps have flushed the dying child's final
-	// output into the file, so the node reading the tail sees the panic, not
-	// the line before it.
+	// Both callers' drain-wait (before this runs) is what makes that
+	// computable at all: it holds the terminated publish until both pumps have
+	// flushed the dying child's final output into the file, so the node
+	// reading the tail sees the panic, not the line before it.
 
-	cp.state.State = &runtimev1.ContainerState{Terminated: term}
-	// Snapshot the restart flag under the same lock that guards the state write,
-	// so the publish decision at the bottom cannot straddle a concurrent
-	// RestartContainer claiming this container.
-	restarting := cp.restarting
-	r.recomputePhaseLocked(p)
-
-	// The mains just concluded the pod (mains-only accounting above). If that
-	// conclusion is truly terminal, claim the irreversible teardown — stop the
-	// memory sampler and stop the native sidecars in reverse start order — before
-	// the terminal publish below. See trulyTerminalLocked for the predicate and
-	// claimTerminalTeardownLocked for the exactly-once claim.
-	td := claimTerminalTeardownLocked(p)
-	p.mu.Unlock()
-
-	// One pod-level grace budget, anchored NOW: the mains exited on their own
-	// (voluntary completion) and consumed none of it, so the sidecars share the
-	// whole configured budget in reverse start order (see stopSidecars).
-	r.runTerminalTeardown(ctx, p, td)
-
-	// Suppress the transient terminated publish of a container the provider is
-	// already restarting. The state write above stands — RestartContainer
-	// reads it back for last_termination_state — but publishing it would show
-	// the provider a "new" exit for a restart it issued, and its terminationKey
-	// idempotency would schedule a second restart for the same death. The
-	// authoritative event for this exit is the one RestartContainer publishes
-	// after the swap, carrying the bumped restart_count. On a failed restart
-	// clearRestarting drops the flag, so the exit is published by the next
-	// status transition and normal accounting resumes.
-	if restarting {
-		return
-	}
-	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+	return term
 }
 
 // trulyTerminalLocked reports whether the pod has reached a state it can never

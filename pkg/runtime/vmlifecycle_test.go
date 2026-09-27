@@ -339,6 +339,11 @@ func TestRestartContainerRefusesAVMPod(t *testing.T) {
 	if got := codes.Code(resp.GetError().GetCode()); got != codes.Unimplemented {
 		t.Errorf("code = %v, want %v", got, codes.Unimplemented)
 	}
+	// UNSUPPORTED, not INTERNAL: a verb the backend does not implement is not
+	// an unexpected runtime error (the reason StopContainer's vm branch shares).
+	if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED {
+		t.Errorf("failure_reason = %v, want UNSUPPORTED", got)
+	}
 	if resp.GetError().GetMessage() == "" {
 		t.Error("the refusal carries no message")
 	}

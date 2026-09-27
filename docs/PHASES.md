@@ -2,8 +2,8 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M7
-updated: 2026-09-13
-updated_by: B282 write-back (on-disk CRI log writer; Attach live-only; vm guest log follower)
+updated: 2026-09-26
+updated_by: B171 write-back (StopContainer, the terminal kill of one container)
 
 phases:
   - id: M0
@@ -1019,6 +1019,16 @@ fields and serve the two RPCs `apis:M2.2` appended.
   the sampler; the re-spawn supervision is detached from the RPC ctx so it outlives the call. Unknown
   pod/container → structured `NOT_FOUND`. `restart_count` + `last_termination_state` join the
   `ContainerStatus` mirror.
+- ✅ B171 write-back (2026-09-26) `pkg/runtime/stopcontainer.go`: serve **`StopContainer`**, the CRI
+  terminal kill of ONE container (what the kubelet issues when a postStart hook fails). It shares
+  RestartContainer's eligibility chain (`refuseIneligible`: unknown pod/container → `NOT_FOUND`, vm pod →
+  `UNSUPPORTED` with an embedded `Unimplemented` (RestartContainer's vm branch moved from `INTERNAL` to the
+  same reason), adopted → `NOT_UPDATABLE`, a pod being deleted → `FailedPrecondition`, never-started →
+  `FailedPrecondition`) and its kill sequence (`terminateContainer`); RestartContainer is that terminate plus
+  the re-spawn, StopContainer is the terminate alone. A per-container `stopped` latch makes the verb, not the
+  reaper, write the terminated state (one `FinishedAt`, via the shared `terminatedStateLocked`) and publish
+  the one MODIFIED; `restart_count`, the log file and `last_termination_state` are untouched —
+  `pkg/runtime.TestStopContainerTerminatesWithoutRespawn`.
 - ✅ `M2.8-d3` `pkg/runtime/stats.go`: serve **`ListPodStats`** — map the M2.5 sampler's `ri_phys_footprint`
   onto the apis `PodStats`/`ContainerStats`/`MemoryStats` (pod-level from `PodMetrics`, per-container from the
   `Footprinter` at request time). Empty `pod_id` = all **metered** pods (the Summary shape); unmetered/unknown

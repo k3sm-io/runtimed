@@ -186,8 +186,16 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		if cp.initDeclared || cp.proc == nil {
 			continue
 		}
-		mains = append(mains, cp.proc)
 		signalled[cp.proc] = struct{}{}
+		// A container a StopContainer claimed whose process has already exited
+		// is being concluded by that verb: there is no group left to signal,
+		// and a second stop sequence against its pid would signal whatever
+		// reuses it. It stays in `signalled` so the late sweep below skips it
+		// too. A claimed container still alive is stopped here as any other.
+		if cp.stopped && procDone(cp.proc) {
+			continue
+		}
+		mains = append(mains, cp.proc)
 	}
 	sidecars := sidecarsLocked(p)
 	for _, cp := range sidecars {
