@@ -367,3 +367,42 @@ func seedPodProcRecord(t *testing.T, rt *Runtime, rec podProcRecord) {
 	}
 	rt.procStart = saved
 }
+
+// TestReadPodReapRecords pins the exported reader an uninstaller uses: it reads
+// exactly the records the daemon wrote (fingerprint included), skips a
+// malformed file without deleting it, and answers a missing store with nothing
+// and no error.
+func TestReadPodReapRecords(t *testing.T) {
+	rt := newTestRuntime(t, Deps{ProcStartTime: func(int) (int64, bool) { return 77, true }})
+	if _, err := rt.recordPodProc("pod-a", "main", 4242); err != nil {
+		t.Fatal(err)
+	}
+	badDir, err := rt.podReapDir("pod-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(badDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(badDir, "9.json")
+	if err := os.WriteFile(bad, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadPodReapRecords(rt.cfg.Root)
+	if err != nil {
+		t.Fatalf("ReadPodReapRecords: %v", err)
+	}
+	want := PodReapRecord{PodID: "pod-a", Container: "main", Pgid: 4242, StartUnixNano: 77, RuntimeVersion: "test-build"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("records = %+v, want [%+v]", got, want)
+	}
+	if _, err := os.Stat(bad); err != nil {
+		t.Fatalf("the reader must not remove a malformed record: %v", err)
+	}
+
+	empty, err := ReadPodReapRecords(t.TempDir())
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("missing store: records %+v err %v, want none and nil", empty, err)
+	}
+}

@@ -52,6 +52,9 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 	if cond := shimInactiveConditionLocked(p); cond != nil {
 		st.Conditions = append(st.Conditions, cond)
 	}
+	if cond := logStreamLostConditionLocked(p); cond != nil {
+		st.Conditions = append(st.Conditions, cond)
+	}
 	// A vm pod's containers are GUEST processes with no host containerProc, so
 	// their statuses come from the agent's ContainerEvents fold instead of the
 	// loop above (which is empty for one), and its metering availability rides as

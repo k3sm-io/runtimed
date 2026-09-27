@@ -70,6 +70,40 @@ type KqueueReaper struct{}
 // trustworthy" — reads exactly as documented. Collecting the corpse and
 // reporting the death are different jobs; only the first one is now unconditional.
 func (KqueueReaper) WaitExit(ctx context.Context, pid int) (int, int, error) {
+	return waitExit(ctx, pid, false)
+}
+
+// AdoptedExitWaiter is the ExitWaiter for a pod process this daemon did NOT
+// spawn: a process-group leader a previous daemon incarnation started, which
+// reparented to launchd when that daemon died and which the runtime re-attached
+// after a restart. It observes the exit through the same EVFILT_PROC/NOTE_EXIT
+// registration KqueueReaper uses (the filter works on any process the caller may
+// signal, not only on children), but it cannot COLLECT a status: wait4 answers
+// ECHILD for a non-child, and XNU delivers NOTE_EXITSTATUS only to the parent.
+//
+// So where KqueueReaper's ECHILD branch reports (0, 0, nil) — a should-never-
+// happen for a child this daemon spawned — this waiter reports ErrExitUnknown.
+// An exit code of 0 for an adopted process would be a fabricated success: a
+// crashed container would read as Completed and a restartPolicy OnFailure pod
+// would never be restarted.
+//
+// A process that is still this daemon's child (never the case for an adopted
+// pid, but the kernel is the authority, not the caller's label) is reaped with
+// its real status exactly as KqueueReaper would.
+//
+// The zero value is usable.
+type AdoptedExitWaiter struct{}
+
+// WaitExit blocks until the adopted pid exits (or ctx is cancelled). It returns
+// ErrExitUnknown once the exit is observed and the status cannot be collected,
+// including when the process was already gone at registration.
+func (AdoptedExitWaiter) WaitExit(ctx context.Context, pid int) (int, int, error) {
+	return waitExit(ctx, pid, true)
+}
+
+// waitExit is the shared body of both waiters. adopted selects only the ECHILD
+// verdict (see AdoptedExitWaiter); every other path is identical.
+func waitExit(ctx context.Context, pid int, adopted bool) (int, int, error) {
 	// reaped is set only where this call has PROVED the child is collected: a
 	// successful wait4, or an ECHILD saying there is nothing left to collect.
 	// Every other exit — including a panic — hands off.
@@ -120,9 +154,15 @@ func (KqueueReaper) WaitExit(ctx context.Context, pid int) (int, int, error) {
 				continue
 			}
 			if errors.Is(err, unix.ECHILD) {
+				reaped = true
+				if adopted {
+					// Not our child: the exit is real (NOTE_EXIT fired, or the
+					// pid was already gone at registration) but its status
+					// belongs to launchd. Say so; never report a success.
+					return 0, 0, ErrExitUnknown
+				}
 				// Already reaped elsewhere (should not happen — kqueue is the sole
 				// reaper); report unknown status rather than failing the pod op.
-				reaped = true
 				return 0, 0, nil
 			}
 			return 0, 0, fmt.Errorf("wait4 pid %d: %w", pid, err)

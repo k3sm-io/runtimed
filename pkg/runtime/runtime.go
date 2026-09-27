@@ -409,8 +409,23 @@ type Runtime struct {
 	podReapOnce sync.Once
 	podReapErr  error
 
+	// fingerprint identifies the build of this daemon (runtimeFingerprint). It
+	// is written into every podreap record and AttachPod adopts only records
+	// carrying the same value. Immutable after New.
+	fingerprint string
+
+	// adoptWaiter observes the exit of a re-attached (non-child) pod process;
+	// see AttachPod. Never nil after New.
+	adoptWaiter supervisor.ExitWaiter
+
 	mu   sync.Mutex
 	pods map[string]*pod
+
+	// podReapStarted is set, under mu, at the moment the startup pod reap
+	// snapshots the pods it must not touch. AttachPod registers an adopted pod
+	// under the same lock and refuses once it is set: an attach that lost that
+	// race would install a pod whose process group the reap is about to kill.
+	podReapStarted bool
 }
 
 // NetworkReconciler is the OPTIONAL startup-reconcile seam a Deps.Network may
@@ -663,6 +678,15 @@ type Deps struct {
 	// asking the kernel about them would describe some unrelated process. With
 	// an injected Spawner and no CodeSignStatus the detection is off.
 	CodeSignStatus func(pid int) (uint32, error)
+	// AdoptedWaiter observes the exit of a pod process AttachPod re-attached —
+	// a process a previous daemon spawned, which is not this daemon's child.
+	// Defaults to supervisor.AdoptedExitWaiter; tests inject a fake.
+	AdoptedWaiter supervisor.ExitWaiter
+	// RuntimeFingerprint overrides the build fingerprint every podreap record
+	// carries and AttachPod requires to match (see runtimeFingerprint). Empty —
+	// the production default — derives it from this binary's own code-directory
+	// hash. Tests set it so records and the decision agree deterministically.
+	RuntimeFingerprint string
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -844,6 +868,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if procGroup == nil {
 		procGroup = supervisor.ProcGroupMembers
 	}
+	adoptWaiter := deps.AdoptedWaiter
+	if adoptWaiter == nil {
+		adoptWaiter = supervisor.AdoptedExitWaiter{}
+	}
+	fingerprint := deps.RuntimeFingerprint
+	if fingerprint == "" {
+		fingerprint = runtimeFingerprint(log)
+	}
 	binder := deps.Binder
 	if binder == nil {
 		// The PV storage root is a sibling of the pods root under the runtime root
@@ -923,6 +955,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		broker:         newBroker(),
 		pods:           make(map[string]*pod),
 		codeSignStatus: codeSignStatus,
+		fingerprint:    fingerprint,
+		adoptWaiter:    adoptWaiter,
 	}, nil
 }
 

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,11 +82,13 @@ import (
 // so the reap cannot catch it. This is an accepted limit of pgid-based
 // tracking (the vm RuntimeClass is the isolation answer for untrusted tenancy).
 
-// podProcRecord is the durable record of one spawned container process group,
+// PodReapRecord is the durable record of one spawned container process group,
 // written at spawn under <root>/podreap/<podID>/<pgid>.json and removed when
 // the group is observed empty. Records that survive a daemon death are the
-// startup reap's input.
-type podProcRecord struct {
+// startup reap's input, AttachPod's, and — through ReadPodReapRecords — an
+// uninstaller's, which must tear down every recorded group. It is exported so
+// that last consumer reads this shape instead of copying its JSON.
+type PodReapRecord struct {
 	PodID     string `json:"podId"`
 	Container string `json:"container"`
 	// Pgid is the container's process-group id (== the session-leading child's
@@ -97,7 +100,18 @@ type podProcRecord struct {
 	// pgid recycled to a new leader has a strictly different immutable start, so
 	// it never matches and is dropped unsignaled.
 	StartUnixNano int64 `json:"startUnixNano"`
+	// RuntimeVersion is the build fingerprint of the daemon that spawned the
+	// group (runtimeFingerprint: the spawning binary's code-directory hash).
+	// AttachPod adopts a record only when it equals the running daemon's own:
+	// a pod spawned by another binary runs under that binary's sandbox profile,
+	// limits and launch sequence, and must not be supervised by a model that may
+	// differ. A record without it (written before the field existed) is a
+	// mismatch. It plays no part in the reap's kill decision.
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
 }
+
+// podProcRecord is the package's historical name for PodReapRecord.
+type podProcRecord = PodReapRecord
 
 // containerID derives the container's published identity — ContainerStatus.
 // container_id — from this record.
@@ -187,7 +201,7 @@ func (r *Runtime) recordPodProc(podID, container string, pgid int) (podProcRecor
 		// it. Record with zero identity so the reap drops the file unsignaled.
 		start = 0
 	}
-	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start}
+	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start, RuntimeVersion: r.fingerprint}
 	dir, err := r.podReapDir(podID)
 	if err != nil {
 		return podProcRecord{}, fmt.Errorf("reap record dir for pod %s: %w", podID, err)
@@ -232,20 +246,42 @@ func (r *Runtime) removePodReapRecords(podID string) {
 }
 
 // listPodProcRecords loads every durable process-group record under
-// <root>/podreap/. It degrades rather than fails the daemon on I/O faults over
+// <root>/podreap/ (see readPodReapStore for the degradation rules).
+func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []string, err error) {
+	return readPodReapStore(r.podReapRoot(), r.log)
+}
+
+// ReadPodReapRecords returns every well-formed pod process-group record under
+// the runtime data root dataRoot (Config.Root; "" means image.DefaultRoot, as it
+// does for the daemon) — the same files the startup reap reads. A missing store
+// is an empty result with a nil error (no pod was ever spawned there). A file
+// that cannot be read or does not parse is skipped, never deleted: this reader
+// is for a caller that tears groups down (an uninstaller), and it must not
+// mutate the store the daemon owns. Each record's (Pgid, StartUnixNano) is the
+// exact-instance pair the reap matches before signalling; a caller that signals
+// a group must re-check it against the live process table first.
+func ReadPodReapRecords(dataRoot string) ([]PodReapRecord, error) {
+	if dataRoot == "" {
+		dataRoot = image.DefaultRoot
+	}
+	records, _, err := readPodReapStore(filepath.Join(dataRoot, sandbox.PodReapSubdir), slog.New(slog.DiscardHandler))
+	return records, err
+}
+
+// readPodReapStore is the one reader of the podreap store, shared by the reap
+// and ReadPodReapRecords. It degrades rather than fails on I/O faults over
 // this best-effort orphan store (reaping is not a scheduling precondition):
-//   - the reap ROOT missing is normal (no prior run) → returns empty, nil error;
-//   - the reap ROOT present-but-unreadable returns an error, which the caller
+//   - the store ROOT missing is normal (no prior run) → returns empty, nil error;
+//   - the store ROOT present-but-unreadable returns an error, which the reap
 //     (reapOrphanedPodsOnce) turns into an ALERT + skipped reap, not a Serve
 //     failure — so an unreadable store never crash-loops the node;
-//   - a per-pod SUBDIR that cannot be read is quarantine-skipped (warn +
-//     continue), never a whole-enumeration failure;
+//   - a per-pod SUBDIR that cannot be read is skipped with a warning, never a
+//     whole-enumeration failure;
 //   - a record file that cannot be READ is retained (returned in neither slice)
 //     so a transient I/O error never destroys a live pod's record;
-//   - only a structurally-INVALID file (bad JSON / pgid <= 1) is returned to
-//     quarantine for removal.
-func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []string, err error) {
-	root := r.podReapRoot()
+//   - only a structurally-INVALID file (bad JSON / pgid <= 1) is returned in
+//     quarantine, for the reap to remove.
+func readPodReapStore(root string, log *slog.Logger) (records []podProcRecord, quarantine []string, err error) {
 	podDirs, err := os.ReadDir(root)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -264,7 +300,7 @@ func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []st
 			// whole enumeration (and thus the daemon): skip it with an alert and
 			// keep reaping the rest. The skipped subdir's records survive on disk
 			// for a later start to retry once the fault clears.
-			r.log.Warn("startup pod reap: skipping unreadable reap subdir", "dir", dir, "err", err)
+			log.Warn("startup pod reap: skipping unreadable reap subdir", "dir", dir, "err", err)
 			continue
 		}
 		for _, e := range entries {
@@ -276,7 +312,7 @@ func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []st
 			if err != nil {
 				// Transient read failure: retain (retry next start), do not
 				// quarantine — deleting a live pod's record fails open.
-				r.log.Warn("read reap record (retained)", "path", path, "err", err)
+				log.Warn("read reap record (retained)", "path", path, "err", err)
 				continue
 			}
 			var rec podProcRecord
@@ -400,6 +436,47 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 	return found && leader.StartUnixNano == rec.StartUnixNano
 }
 
+// attachDecision splits the durable records into the ones AttachPod may adopt
+// and the rest, which stay for ReapOrphanedPods. It is pure (the unit gate,
+// TestAttachPopulatesOwnedBeforeTheStartupReap, drives it over a fake process
+// table).
+//
+// A record is adoptable iff ALL of:
+//   - startupPodReapDecision, run with nothing owned, puts it in the KILL bucket:
+//     its leader (Pid == Pgid) is alive with EXACTLY the recorded StartUnixNano.
+//     This is the reap's own predicate, reused rather than restated, so adoption
+//     can never be looser than the kill it replaces — no window, no tolerance
+//     (see the "do not soften" note on startupPodReapDecision). A keep-and-warn
+//     group (leader gone), a recycled pgid, a dead group, a zero-identity record
+//     and an uninspectable group are therefore never adopted;
+//   - startTime(pgid), the per-pid probe recordPodProc used at spawn, reports
+//     the same exact start: the two sysctl derivations are bit-identical, so a
+//     disagreement means the leader changed between the probes;
+//   - the record's RuntimeVersion equals fingerprint, and fingerprint is not
+//     empty (a daemon that cannot name its own build adopts nothing).
+//
+// adopt and remaining partition records; nothing is dropped. The caller keys
+// ownership by the record's Pgid, which is the adopted leader's pid — the same
+// key space the reap's owned set is built in (containerPIDs of the registered
+// pods), so an adopted group is excluded from the reap by construction.
+func attachDecision(records []podProcRecord, procGroup procGroupInspector, startTime procStartTime, fingerprint string) (adopt, remaining []podProcRecord) {
+	kill, _, _ := startupPodReapDecision(records, nil, procGroup)
+	live := make(map[podProcRecord]bool, len(kill))
+	for _, rec := range kill {
+		live[rec] = true
+	}
+	for _, rec := range records {
+		if fingerprint != "" && rec.RuntimeVersion == fingerprint && live[rec] {
+			if start, ok := startTime(rec.Pgid); ok && start == rec.StartUnixNano {
+				adopt = append(adopt, rec)
+				continue
+			}
+		}
+		remaining = append(remaining, rec)
+	}
+	return adopt, remaining
+}
+
 // ReapOrphanedPods reaps pod process groups recorded by a previous daemon run,
 // exactly once per Runtime, before CreatePod is served (a sibling of the network
 // startup reconcile). Unlike that reconcile it degrades rather than fails
@@ -417,6 +494,13 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 // startup reconcile needs an explicit call on the embedded path. The sticky
 // exactly-once semantics make the two call sites safe to combine: whichever runs
 // first performs the reap, the other observes the cached result.
+//
+// ORDERING INVARIANT (pod re-adoption): on the embedded path the provider calls
+// AttachPod for every pod bound to this node BEFORE it calls this. A group a pod
+// was attached to is owned — its pgid is in the owned set this reap skips — so it
+// survives; every record nothing attached is reaped exactly as before. An
+// AttachPod that arrives after this reap has begun is refused (podReapStarted),
+// never raced against the kill.
 func (r *Runtime) ReapOrphanedPods() error {
 	r.podReapOnce.Do(func() {
 		r.podReapErr = r.reapOrphanedPodsOnce()
@@ -449,6 +533,9 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 		return nil
 	}
 	r.mu.Lock()
+	// From here on AttachPod refuses (see podReapStarted): the owned snapshot
+	// below is the last moment an adopted pod can still be excluded.
+	r.podReapStarted = true
 	owned := make(map[int]bool)
 	for _, p := range r.pods {
 		for _, pid := range p.containerPIDs() {
