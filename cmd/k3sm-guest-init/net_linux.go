@@ -47,10 +47,13 @@ const (
 // entitled to be lost, so a single timeout is not a failure — RFC 2131 says
 // retransmit, and guestinit.DHCPRetransmitSchedule says when.
 //
-// dhcpTotalBudget is the WHOLE budget before the boot is failed: every
-// retransmission, every OFFER wait and the ACK wait together, not a per-attempt
-// timeout. It is short because the pod is not up until the exchange finishes
-// and the host has its own boot deadline waiting on Health.
+// dhcpTotalBudget is the whole DHCP exchange's budget before the boot is
+// failed: every retransmission, every OFFER wait and the ACK wait together, not
+// a per-attempt timeout. The carrier wait before the first send
+// (guestinit.CarrierBound) runs ahead of it and is not part of it, so a boot's
+// worst case is that bound plus this budget. It is short because the pod is
+// not up until the exchange finishes and the host has its own boot deadline
+// waiting on Health.
 const (
 	dhcpTotalBudget = 12 * time.Second
 	dhcpClientPort  = 68
@@ -90,15 +93,25 @@ func configureNetwork(log *slog.Logger) (GuestNetwork, error) {
 	}
 	// The host attaches the virtio port a moment after IFF_UP, and a frame sent
 	// before carrier is dropped in the guest; see guestinit.AwaitCarrier for the
-	// wait and its bound. Running out of bound is not fatal: the retransmission
-	// schedule in dhcpLease covers a link that never reports carrier.
+	// wait and its bound. The order cannot be fixed from the host side: vmhost
+	// starts the VM with the network device already configured, and
+	// Virtualization.framework attaches the vmnet port on its own schedule after
+	// the start with no attach-completed signal to wait on, so the guest is the
+	// only place that can observe the link come up (1–2 ms after IFF_UP as
+	// measured for runtimed #157). Running out of bound is not fatal: the
+	// retransmission schedule in dhcpLease covers a link that never reports
+	// carrier. The two failure lines are kept apart so a device that cannot be
+	// read is not filed as ordinary boot jitter.
 	start := time.Now()
 	err := guestinit.AwaitCarrier(func() (bool, error) { return linkCarrier(guestNICName) },
 		guestinit.CarrierBound, guestinit.CarrierPoll, time.Sleep)
-	if err != nil {
-		log.Warn("proceeding without carrier on the guest link", "link", guestNICName, "waited", time.Since(start), "err", err)
-	} else {
+	switch {
+	case err == nil:
 		log.Info("guest link has carrier", "link", guestNICName, "waited", time.Since(start))
+	case errors.Is(err, guestinit.ErrNoCarrier):
+		log.Warn("proceeding without carrier on the guest link: the bound expired", "link", guestNICName, "waited", time.Since(start), "bound", guestinit.CarrierBound)
+	default:
+		log.Warn("proceeding without carrier on the guest link: the carrier read failed", "link", guestNICName, "waited", time.Since(start), "err", err)
 	}
 	mac, err := linkHardwareAddr(guestNICName)
 	if err != nil {
@@ -471,43 +484,17 @@ func capToDeadline(wait time.Duration, deadline time.Time) time.Duration {
 	return wait
 }
 
-// awaitReply reads datagrams until one matches want, or budget is spent. A NAK
-// ends the round immediately: the server has refused, and waiting out the
-// timeout would only delay the retransmission.
+// awaitReply is guestinit.AwaitReply over the DHCP socket: each read sets the
+// socket's receive timeout to what the round has left, so a silent segment
+// returns within the budget rather than blocking PID 1.
 func awaitReply(fd int, xid uint32, mac []byte, want func(byte) bool, budget time.Duration) (guestinit.Lease, error) {
-	if budget <= 0 {
-		return guestinit.Lease{}, fmt.Errorf("%w: the exchange's budget is spent", guestinit.ErrDHCP)
-	}
-	deadline := time.Now().Add(budget)
-	buf := make([]byte, 1500)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return guestinit.Lease{}, fmt.Errorf("%w: no reply within %s", guestinit.ErrDHCP, budget)
-		}
+	recv := func(buf []byte, remaining time.Duration) (int, error) {
 		tv := unix.NsecToTimeval(int64(remaining))
 		if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
-			return guestinit.Lease{}, fmt.Errorf("set the dhcp receive timeout: %w", err)
+			return 0, fmt.Errorf("set the dhcp receive timeout: %w", err)
 		}
 		n, _, err := unix.Recvfrom(fd, buf, 0)
-		if errors.Is(err, unix.EINTR) {
-			// A signal interrupted the read (PID 1 gets SIGCHLD from its reaper);
-			// the datagram, if any, is still queued. Read again within the same
-			// budget rather than counting the round as unanswered.
-			continue
-		}
-		if err != nil {
-			return guestinit.Lease{}, fmt.Errorf("%w: receive: %w", guestinit.ErrDHCP, err)
-		}
-		msgType, lease, ok, perr := guestinit.ParseReply(buf[:n], xid, mac)
-		if perr != nil || !ok {
-			continue // not ours, or malformed: keep waiting for the real one
-		}
-		if guestinit.IsNak(msgType) {
-			return guestinit.Lease{}, fmt.Errorf("%w: the server sent DHCPNAK", guestinit.ErrDHCP)
-		}
-		if want(msgType) {
-			return lease, nil
-		}
+		return n, err
 	}
+	return guestinit.AwaitReply(recv, xid, mac, want, budget, time.Now)
 }
