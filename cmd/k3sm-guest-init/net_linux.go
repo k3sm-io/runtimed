@@ -20,6 +20,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -46,10 +47,13 @@ const (
 // entitled to be lost, so a single timeout is not a failure — RFC 2131 says
 // retransmit, and guestinit.DHCPRetransmitSchedule says when.
 //
-// dhcpTotalBudget is the WHOLE budget before the boot is failed: every
-// retransmission, every OFFER wait and the ACK wait together, not a per-attempt
-// timeout. It is short because the pod is not up until the exchange finishes
-// and the host has its own boot deadline waiting on Health.
+// dhcpTotalBudget is the whole DHCP exchange's budget before the boot is
+// failed: every retransmission, every OFFER wait and the ACK wait together, not
+// a per-attempt timeout. The carrier wait before the first send
+// (guestinit.CarrierBound) runs ahead of it and is not part of it, so a boot's
+// worst case is that bound plus this budget. It is short because the pod is
+// not up until the exchange finishes and the host has its own boot deadline
+// waiting on Health.
 const (
 	dhcpTotalBudget = 12 * time.Second
 	dhcpClientPort  = 68
@@ -89,15 +93,25 @@ func configureNetwork(log *slog.Logger) (GuestNetwork, error) {
 	}
 	// The host attaches the virtio port a moment after IFF_UP, and a frame sent
 	// before carrier is dropped in the guest; see guestinit.AwaitCarrier for the
-	// wait and its bound. Running out of bound is not fatal: the retransmission
-	// schedule in dhcpLease covers a link that never reports carrier.
+	// wait and its bound. The order cannot be fixed from the host side: vmhost
+	// starts the VM with the network device already configured, and
+	// Virtualization.framework attaches the vmnet port on its own schedule after
+	// the start with no attach-completed signal to wait on, so the guest is the
+	// only place that can observe the link come up (1–2 ms after IFF_UP as
+	// measured for runtimed #157). Running out of bound is not fatal: the
+	// retransmission schedule in dhcpLease covers a link that never reports
+	// carrier. The two failure lines are kept apart so a device that cannot be
+	// read is not filed as ordinary boot jitter.
 	start := time.Now()
 	err := guestinit.AwaitCarrier(func() (bool, error) { return linkCarrier(guestNICName) },
 		guestinit.CarrierBound, guestinit.CarrierPoll, time.Sleep)
-	if err != nil {
-		log.Warn("proceeding without carrier on the guest link", "link", guestNICName, "waited", time.Since(start), "err", err)
-	} else {
+	switch {
+	case err == nil:
 		log.Info("guest link has carrier", "link", guestNICName, "waited", time.Since(start))
+	case errors.Is(err, guestinit.ErrNoCarrier):
+		log.Warn("proceeding without carrier on the guest link: the bound expired", "link", guestNICName, "waited", time.Since(start), "bound", guestinit.CarrierBound)
+	default:
+		log.Warn("proceeding without carrier on the guest link: the carrier read failed", "link", guestNICName, "waited", time.Since(start), "err", err)
 	}
 	mac, err := linkHardwareAddr(guestNICName)
 	if err != nil {
