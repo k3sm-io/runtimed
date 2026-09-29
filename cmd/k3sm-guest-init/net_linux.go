@@ -20,7 +20,6 @@ package main
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -471,43 +470,17 @@ func capToDeadline(wait time.Duration, deadline time.Time) time.Duration {
 	return wait
 }
 
-// awaitReply reads datagrams until one matches want, or budget is spent. A NAK
-// ends the round immediately: the server has refused, and waiting out the
-// timeout would only delay the retransmission.
+// awaitReply is guestinit.AwaitReply over the DHCP socket: each read sets the
+// socket's receive timeout to what the round has left, so a silent segment
+// returns within the budget rather than blocking PID 1.
 func awaitReply(fd int, xid uint32, mac []byte, want func(byte) bool, budget time.Duration) (guestinit.Lease, error) {
-	if budget <= 0 {
-		return guestinit.Lease{}, fmt.Errorf("%w: the exchange's budget is spent", guestinit.ErrDHCP)
-	}
-	deadline := time.Now().Add(budget)
-	buf := make([]byte, 1500)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return guestinit.Lease{}, fmt.Errorf("%w: no reply within %s", guestinit.ErrDHCP, budget)
-		}
+	recv := func(buf []byte, remaining time.Duration) (int, error) {
 		tv := unix.NsecToTimeval(int64(remaining))
 		if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
-			return guestinit.Lease{}, fmt.Errorf("set the dhcp receive timeout: %w", err)
+			return 0, fmt.Errorf("set the dhcp receive timeout: %w", err)
 		}
 		n, _, err := unix.Recvfrom(fd, buf, 0)
-		if errors.Is(err, unix.EINTR) {
-			// A signal interrupted the read (PID 1 gets SIGCHLD from its reaper);
-			// the datagram, if any, is still queued. Read again within the same
-			// budget rather than counting the round as unanswered.
-			continue
-		}
-		if err != nil {
-			return guestinit.Lease{}, fmt.Errorf("%w: receive: %w", guestinit.ErrDHCP, err)
-		}
-		msgType, lease, ok, perr := guestinit.ParseReply(buf[:n], xid, mac)
-		if perr != nil || !ok {
-			continue // not ours, or malformed: keep waiting for the real one
-		}
-		if guestinit.IsNak(msgType) {
-			return guestinit.Lease{}, fmt.Errorf("%w: the server sent DHCPNAK", guestinit.ErrDHCP)
-		}
-		if want(msgType) {
-			return lease, nil
-		}
+		return n, err
 	}
+	return guestinit.AwaitReply(recv, xid, mac, want, budget, time.Now)
 }
