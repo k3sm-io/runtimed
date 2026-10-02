@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
 CGO=1   # runtimed needs cgo (darwin syscall shims: libsandbox, memorystatus, clonefile)
+STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 
 echo "==> [runtimed] gofmt"
 fmt=$(gofmt -l .) || true
@@ -54,6 +55,34 @@ if [ -n "$go_pkgs" ]; then
 	fi
 
 	echo "==> [runtimed] execshim linux cross-build (off-platform stub)"; GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./cmd/k3sm-execshim
+
+	# staticcheck, pinned to an exact version: a different release reports
+	# different findings, so an unpinned tool would make the verdict depend on
+	# the host. Bump it together with the Go toolchain and with
+	# docs/GO-STANDARDS.md (keep in step with the other k3sm repos).
+	# -tests=false: test code is out of scope until a separate sweep; the gate
+	# covers non-test code only. Suppress a finding with a
+	# `//lint:ignore <Check> <reason>` comment on the preceding line
+	# (`//nolint` is golangci-lint's spelling and is inert here).
+	# Runs after vet/build/test so a mismatched host tool never stops those.
+	sc=""; sc_seen=""
+	for c in "$(command -v staticcheck 2>/dev/null || true)" "$(go env GOPATH)/bin/staticcheck"; do
+		[ -n "$c" ] && [ -x "$c" ] || continue
+		v="$("$c" -version 2>/dev/null | awk '{print $2}')" || v=""
+		sc_seen="$sc_seen
+  $c reports '${v:-unknown}'"
+		if [ "$v" = "$STATICCHECK_VERSION" ]; then sc="$c"; break; fi
+	done
+	if [ -z "$sc" ]; then
+		if [ -z "$sc_seen" ]; then
+			echo "==> [runtimed] staticcheck: not installed; the gate needs ${STATICCHECK_VERSION} (go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION})" >&2
+		else
+			echo "==> [runtimed] staticcheck: the gate needs ${STATICCHECK_VERSION}, found:${sc_seen}" >&2
+			echo "    install it with: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" >&2
+		fi
+		exit 1
+	fi
+	echo "==> [runtimed] staticcheck ${STATICCHECK_VERSION} (non-test)"; CGO_ENABLED=$CGO "$sc" -tests=false ./...
 else
 	echo "==> [runtimed] (no Go packages yet — skipping vet/build/test)"
 fi
