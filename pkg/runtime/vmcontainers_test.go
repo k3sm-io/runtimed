@@ -550,6 +550,8 @@ func TestVMContainerFailsClosed(t *testing.T) {
 		mutate  func(*runtimev1.PodBox)
 		wantErr error
 		wantMsg string
+		// wantReason defaults to INVALID_POD_BOX.
+		wantReason runtimev1.FailureReason
 	}{
 		{
 			// The M0 absolute-path convention names a Mach-O on this Mac. A
@@ -591,8 +593,10 @@ func TestVMContainerFailsClosed(t *testing.T) {
 				Name: "c", Image: rootRef,
 				SecurityContext: &runtimev1.SecurityContext{RunAsNonRoot: true},
 			}},
-			wantErr: image.ErrRunSpecInvalid,
+			wantErr: image.ErrRunAsNonRoot,
 			wantMsg: "runAsNonRoot",
+			// A container configuration error, as the kubelet reports it.
+			wantReason: runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
 		},
 		{
 			name:    "no-command-anywhere",
@@ -631,8 +635,12 @@ func TestVMContainerFailsClosed(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.wantMsg) {
 				t.Errorf("error %q does not name %q, so an operator cannot act on it", err, tc.wantMsg)
 			}
-			if reason != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
-				t.Errorf("reason = %v, want INVALID_POD_BOX (the box is unrunnable; nothing was attempted)", reason)
+			want := tc.wantReason
+			if want == runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED {
+				want = runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX
+			}
+			if reason != want {
+				t.Errorf("reason = %v, want %v", reason, want)
 			}
 			if n, _ := vmb.created(); n != 0 {
 				t.Errorf("CreateVM called %d times on a refused pod; must be 0", n)

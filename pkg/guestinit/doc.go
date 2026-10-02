@@ -70,18 +70,19 @@ limitations under the License.
 //
 // # Known ceilings (stated, not worked around)
 //
-//   - guest/v1 carries no sidecar marker: GuestContainer has `init` and
-//     nothing else, so a native sidecar (an init container with
-//     restartPolicy: Always) cannot be distinguished from a run-to-completion
-//     init container here. StartOrder therefore plans every init container as
-//     a blocking step, and a producer that emits a never-exiting sidecar as an
-//     init container would hang the boot. Until guest/v1 grows the marker, the
-//     host-side producer must emit such a container as a main container.
-//     StartStep.WaitForExit is the single place that changes when it does.
-//   - guest/v1 carries no image USER string: a non-numeric USER must be
-//     resolved host-side and stamped into uid/gid. ResolveUser implements the
-//     in-guest resolution against a rootfs /etc/passwd and is wired for the
-//     numeric case the spec can express today.
+//   - A native sidecar (GuestContainer.sidecar) starts in its init-list
+//     position and the next container starts as soon as its process is
+//     spawned. Its startupProbe does NOT gate the next init container: probes
+//     run host-side, and the guest has no way to hear one. An exited sidecar
+//     is not restarted on vm, because vm has no per-container restart.
+//   - Same-pod trust: RunStart composes EVERY container's root before the
+//     first init container runs, so an init container running as root (or
+//     with CAP_SYS_CHROOT) can reach a later container's composed root. One
+//     pod is one tenant; the boundary between tenants is the vm Pod, never a
+//     container inside it.
+//   - Because the roots are composed first, a mount an init container makes
+//     inside a shared volume no longer reaches a later container's recursive
+//     bind of that volume. Files it writes there still do.
 //   - A container's /dev is the OCI default device set and nothing else
 //     (DefaultDevices) plus a private devpts and a bounded /dev/shm. The
 //     allowlist is a security boundary, not a convenience: see ContainerDev for

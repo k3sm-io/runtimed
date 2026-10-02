@@ -299,6 +299,10 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	for _, s := range slots {
 		p.containers = append(p.containers, s.cp)
 	}
+	// An ephemeral container is never adopted (it is never restarted, and the
+	// reap that follows collects any process group it left): it is recorded as
+	// not started, as a re-created pod records it.
+	recordEphemeralNotStartedLocked(p)
 
 	// Register and start the exit watches under r.mu, in one step with the
 	// podReapStarted check: the reap sets that flag under the same lock at the

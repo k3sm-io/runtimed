@@ -192,6 +192,12 @@ func colonFields(line string, min int) ([]string, bool) {
 // ContainerIdent is the identity a container starts with, taken from the ids
 // the host already resolved and stamped into the spec.
 //
+// A container carrying image_user is the exception: its uid and gid are NOT
+// taken from the spec (guest/v1 says they are ignored), and the returned Ident
+// holds only the supplementary groups. The plan records that the identity is
+// pending (ContainerPlan.PendingImageUser) and the executor resolves it against
+// the composed rootfs (ResolvePlanIdent). Only the grammar is checked here.
+//
 // Supplementary groups are the spec's list UNIONED with the pod's fsGroup,
 // deduplicated and sorted so the plan is deterministic. fsGroup is included
 // here rather than only in the idmapped mounts because a process must be IN
@@ -201,11 +207,18 @@ func ContainerIdent(c *guestv1.GuestContainer, fsGroup int64) (Ident, error) {
 	if c == nil {
 		return Ident{}, fmt.Errorf("%w: nil container", ErrInvalidSpec)
 	}
-	if err := checkID("uid", c.GetUid()); err != nil {
-		return Ident{}, fmt.Errorf("container %q: %w", c.GetName(), err)
-	}
-	if err := checkID("gid", c.GetGid()); err != nil {
-		return Ident{}, fmt.Errorf("container %q: %w", c.GetName(), err)
+	pending := c.GetImageUser() != ""
+	if pending {
+		if _, _, err := splitImageUser(c.GetImageUser()); err != nil {
+			return Ident{}, fmt.Errorf("container %q: %w", c.GetName(), err)
+		}
+	} else {
+		if err := checkID("uid", c.GetUid()); err != nil {
+			return Ident{}, fmt.Errorf("container %q: %w", c.GetName(), err)
+		}
+		if err := checkID("gid", c.GetGid()); err != nil {
+			return Ident{}, fmt.Errorf("container %q: %w", c.GetName(), err)
+		}
 	}
 	if err := checkID("fsGroup", fsGroup); err != nil {
 		return Ident{}, fmt.Errorf("container %q: %w", c.GetName(), err)
@@ -233,6 +246,9 @@ func ContainerIdent(c *guestv1.GuestContainer, fsGroup int64) (Ident, error) {
 		}
 	}
 	sort.Slice(groups, func(i, j int) bool { return groups[i] < groups[j] })
+	if pending {
+		return Ident{Groups: groups}, nil
+	}
 	return Ident{UID: c.GetUid(), GID: c.GetGid(), Groups: groups}, nil
 }
 

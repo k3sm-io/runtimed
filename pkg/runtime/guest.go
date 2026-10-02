@@ -332,7 +332,8 @@ const maxGuestCapabilityTokens = 64
 // ignored exactly as guest.proto says it should be.
 func knownGuestCapability(tok string) bool {
 	switch tok {
-	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial:
+	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial,
+		guestagent.CapabilityGuestPrivateMounts, guestagent.CapabilitySidecarInit, guestagent.CapabilityImageUser:
 		return true
 	}
 	return false

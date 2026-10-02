@@ -59,6 +59,12 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		return createFailure(reason, err), nil
 	}
 
+	// Ephemeral containers the box already lists are recorded, not started:
+	// this is a re-creation, and they are never restarted.
+	p.mu.Lock()
+	recordEphemeralNotStartedLocked(p)
+	p.mu.Unlock()
+
 	r.mu.Lock()
 	r.pods[box.GetPodId()] = p
 	r.mu.Unlock()
@@ -398,14 +404,29 @@ func graceDuration(secs int64, p *pod) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// UpdatePod applies an in-place spec change. Only labels/annotations are
-// supported; any other field change is NOT_UPDATABLE (requires recreate).
+// UpdatePod applies an in-place spec change: labels, annotations, and an
+// append to ephemeral_containers. Any other field change is NOT_UPDATABLE
+// (requires recreate), and so is removing or changing an ephemeral container.
 //
-// The contract is labels and annotations only: UpdatePod never materializes, so
-// an update never re-resolves ConfigMap/Secret/ServiceAccount-token data for a
-// running pod. RefreshProjectedVolumes does, on its own path (the updatable
-// field set itself is updatableOnly's; the contract is pinned by
-// TestUpdatePodNeverMaterializes and TestRefreshProjectedVolumesIsItsOwnPath).
+// The contract for labels and annotations is unchanged: UpdatePod never
+// materializes, so an update never re-resolves ConfigMap/Secret/
+// ServiceAccount-token data for a running pod. RefreshProjectedVolumes does, on
+// its own path (the updatable field set itself is updatableOnly's; the contract
+// is pinned by TestUpdatePodNeverMaterializes and
+// TestRefreshProjectedVolumesIsItsOwnPath).
+//
+// # The request box is never adopted
+//
+// Only labels, annotations and the appended ephemeral containers are copied
+// into the stored box. Everything an ephemeral container runs under — the
+// signature policy, the pod security context, the volumes, the compiled
+// profile — is the pod's create-time value, whatever the request carries, so
+// an append cannot weaken the pod it joins. See ephemeral.go.
+//
+// The compare, the refusals (vm, stopping, terminated, bad or taken names) and
+// the reservation all happen under one hold of p.mu; the image work happens
+// after it is released, and each new container is installed through the same
+// stopping-checked installer every spawn uses.
 func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
 	box := req.GetPod()
 	if box.GetPodId() == "" {
@@ -418,23 +439,41 @@ func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) 
 	p, ok := r.pods[box.GetPodId()]
 	r.mu.Unlock()
 	if !ok {
+		// A pod still being created is not registered yet, so it lands here
+		// too: nothing can be appended to a pod that does not exist yet.
 		return &runtimev1.UpdatePodResponse{
 			Error:         rpcStatus(codes.NotFound, "pod %s not found", box.GetPodId()),
 			FailureReason: runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 		}, nil
 	}
 
+	p.mu.Lock()
 	if reason, err := updatableOnly(p.box, box); err != nil {
+		p.mu.Unlock()
 		return &runtimev1.UpdatePodResponse{
 			Error:         rpcStatus(codes.FailedPrecondition, "%s", err.Error()),
 			FailureReason: reason,
 		}, nil
 	}
-
-	p.mu.Lock()
+	appends, _ := ephemeralAppends(p.box, box)
+	var starts []*containerProc
+	if len(appends) > 0 {
+		var refused *ephemeralRefusal
+		if starts, refused = reserveEphemeralLocked(p, appends); refused != nil {
+			p.mu.Unlock()
+			return &runtimev1.UpdatePodResponse{
+				Error:         rpcStatus(refused.code, "update %s: %v", box.GetPodId(), refused.err),
+				FailureReason: refused.reason,
+			}, nil
+		}
+	}
 	p.box.Labels = box.GetLabels()
 	p.box.Annotations = box.GetAnnotations()
 	p.mu.Unlock()
+
+	for _, cp := range starts {
+		r.startEphemeral(p, cp)
+	}
 
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, st)

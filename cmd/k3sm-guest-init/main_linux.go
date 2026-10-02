@@ -31,9 +31,11 @@ limitations under the License.
 // Boot sequence:
 //
 //	pseudo-filesystems -> read guest-spec.json -> render /etc -> pod mounts ->
-//	hostname -> Rosetta binfmt registration -> per-container rootfs overlays ->
-//	ownership sidecar apply -> init containers sequentially -> main containers -> vsock GuestAgent ->
-//	reap loop -> Stop(grace): term -> grace -> KILL -> sync -> poweroff.
+//	hostname -> Rosetta binfmt registration -> EVERY container's root composed
+//	(rootfs overlay, ownership sidecar, mounts, links, image_user) ->
+//	guest-private mounts detached -> init containers in order (sidecars not
+//	waited) -> main containers -> vsock GuestAgent -> reap loop ->
+//	Stop(grace): term mains -> term sidecars in reverse -> KILL -> sync -> poweroff.
 //
 // The GuestAgent comes up after the containers on purpose: its Health is the
 // host's boot-deadline probe, so an agent answering earlier would report a
@@ -97,7 +99,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	"google.golang.org/protobuf/encoding/protojson"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 	"k3sm.io/runtimed/pkg/guestagent"
@@ -241,11 +242,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// retain a fabricated container per exec on the event bus (which now keeps
 	// state — see guestagent.Events) and make the host log a dropped event for an
 	// undeclared container on every `kubectl exec`.
+	//
+	// It is a set of NAMES only. The per-container plans an exec reuses are
+	// taken after the start passes (below), because composing a container's
+	// root is what settles an image_user identity; a copy taken here would
+	// hand every exec into such a container the provisional identity.
 	names := make([]string, 0, len(plan.Containers))
-	byName := make(map[string]guestinit.ContainerPlan, len(plan.Containers))
+	declared := make(map[string]bool, len(plan.Containers))
 	for _, cp := range plan.Containers {
 		names = append(names, cp.Name)
-		byName[cp.Name] = cp
+		declared[cp.Name] = true
 	}
 
 	// The ContainerEvents fan-out. It is created before the reaper because the
@@ -289,8 +295,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 	reaper := guestinit.NewReaper(proc, sigchld, guestinit.ReaperOptions{
 		Logger: log,
+		// Mains stop first, then the native sidecars in reverse start order.
+		Sidecars: guestinit.ShutdownOrder(plan.Containers).Sidecars,
+		// A sidecar's exit is published like any other and ends nothing: the
+		// start passes never wait on a sidecar (WaitForExit is false), and
+		// nothing here powers the guest off on a container exit.
 		OnExit: func(ev guestinit.ExitEvent) {
-			if _, declared := byName[ev.Container]; !declared {
+			if !declared[ev.Container] {
 				// An exec's child, not a container. The exec route waits on it
 				// itself; it is not a pod lifecycle transition.
 				log.Debug("reaped a non-container child", "key", ev.Container,
@@ -332,10 +343,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 		}
 	}()
 
-	if err := startContainers(ctx, log, reaper, events, capture, attachHub, plan.Containers); err != nil {
+	if err := guestinit.RunStart(plan, &starter{
+		ctx: ctx, log: log, reaper: reaper, events: events, capture: capture, hub: attachHub,
+	}); err != nil {
 		// Anything already running has to be torn down; Stop is the only
-		// path that both signals and powers off.
+		// path that both signals and powers off. A compose or detach failure
+		// reaches here before any container was started.
 		return reaper.Fail(ctx, defaultStopGrace, err)
+	}
+	// The plans as RunStart left them: identities settled, so an exec enters
+	// a container as the user the container itself runs as.
+	byName := make(map[string]guestinit.ContainerPlan, len(plan.Containers))
+	for _, cp := range plan.Containers {
+		byName[cp.Name] = cp
 	}
 
 	// The agent comes up last, once there is a pod for it to answer about. That
@@ -387,8 +407,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 // readSpec reads and decodes the host-written GuestSpec.
 //
-// Unknown fields are rejected. The file is the proto-JSON encoding of
-// GuestSpec and nothing else, so a key this binary does not know means the
+// Unknown fields are rejected (decodeSpec). The file is the proto-JSON encoding
+// of GuestSpec and nothing else, so a key this binary does not know means the
 // host and the initramfs disagree about the contract — which must fail at boot
 // with a legible reason rather than silently drop whatever the host asked for.
 func readSpec(path string) (*guestv1.GuestSpec, error) {
@@ -396,11 +416,7 @@ func readSpec(path string) (*guestv1.GuestSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read guest spec: %w", err)
 	}
-	spec := &guestv1.GuestSpec{}
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(raw, spec); err != nil {
-		return nil, fmt.Errorf("decode guest spec: %w", err)
-	}
-	return spec, nil
+	return decodeSpec(raw)
 }
 
 // specShareFiles lists the basenames in the spec share root, the one filesystem
@@ -569,53 +585,101 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 	return nil
 }
 
-// startContainers realizes the plan's containers in order: an init container
-// is waited for and must exit 0, a main container is started and left running.
-func startContainers(ctx context.Context, log *slog.Logger, reaper *guestinit.Reaper, events *guestagent.Events, capture *guestagent.Capture, hub *guestagent.AttachHub, plans []guestinit.ContainerPlan) error {
-	for _, cp := range plans {
-		// The ownership sidecar is applied between the rootfs composition and
-		// the first mount inside it (guestinit.OwnershipStep.AfterMount), so an
-		// entry naming /dev, /proc or a volume path reaches the image's own node
-		// rather than whatever is later mounted over it.
-		mounts := cp.Mounts
-		if cp.Ownership != nil {
-			if err := applyMounts(log, mounts[:cp.Ownership.AfterMount]); err != nil {
-				return fmt.Errorf("container %s: %w", cp.Name, err)
-			}
-			applyOwnership(ctx, log, cp.Name, cp.Ownership)
-			mounts = mounts[cp.Ownership.AfterMount:]
-		}
-		if err := applyMounts(log, mounts); err != nil {
-			return fmt.Errorf("container %s: %w", cp.Name, err)
-		}
-		// After the mounts, never before: /dev/ptmx points INTO the devpts
-		// instance the previous step mounted.
-		if err := applyLinks(log, cp.Links); err != nil {
-			return fmt.Errorf("container %s: %w", cp.Name, err)
-		}
-		pid, err := spawn(cp, capture, hub, log)
-		if err != nil {
-			return fmt.Errorf("start container %s: %w", cp.Name, err)
-		}
-		reaper.Track(cp.Name, pid)
-		events.Publish(guestagent.ContainerEvent{
-			Container: cp.Name,
-			At:        time.Now(),
-			Started:   &guestagent.ContainerStarted{PID: int32(pid)},
-		})
-		log.Info("started a container", "container", cp.Name, "phase", cp.Phase, "pid", pid)
+// starter is the executor's half of guestinit.RunStart: the mount, detach and
+// spawn effects. RunStart owns the ORDER (compose every root, detach, then
+// start); nothing here decides it.
+//
+// ctx is the boot's context, held for the length of one RunStart call and
+// passed down to the ownership apply and the init-container wait; the struct
+// does not outlive that call.
+type starter struct {
+	ctx     context.Context
+	log     *slog.Logger
+	reaper  *guestinit.Reaper
+	events  *guestagent.Events
+	capture *guestagent.Capture
+	hub     *guestagent.AttachHub
+}
 
-		if !cp.WaitForExit {
-			continue
+// Compose builds one container's root: the rootfs composition, the ownership
+// sidecar at its split point (guestinit.OwnershipStep.AfterMount, so an entry
+// naming /dev, /proc or a volume path reaches the image's own node rather than
+// whatever is later mounted over it), every other mount, the links, and last
+// the image_user identity, which needs the composed root's /etc/passwd.
+func (s *starter) Compose(cp *guestinit.ContainerPlan) error {
+	mounts := cp.Mounts
+	if cp.Ownership != nil {
+		if err := applyMounts(s.log, mounts[:cp.Ownership.AfterMount]); err != nil {
+			return err
 		}
-		status, err := reaper.Wait(ctx, cp.Name)
-		if err != nil {
-			return fmt.Errorf("wait for init container %s: %w", cp.Name, err)
+		applyOwnership(s.ctx, s.log, cp.Name, cp.Ownership)
+		mounts = mounts[cp.Ownership.AfterMount:]
+	}
+	if err := applyMounts(s.log, mounts); err != nil {
+		return err
+	}
+	// After the mounts, never before: /dev/ptmx points INTO the devpts
+	// instance the previous step mounted.
+	if err := applyLinks(s.log, cp.Links); err != nil {
+		return err
+	}
+	if pending := cp.PendingImageUser; pending != "" {
+		// cp points into the plan, so the resolved identity is the one the
+		// TTY chown, the spawn and every later exec read.
+		if err := guestinit.ResolvePlanIdent(cp); err != nil {
+			return err
 		}
-		if status.ExitCode != 0 || status.Signal != 0 {
-			return fmt.Errorf("init container %s failed: exit code %d, signal %d",
-				cp.Name, status.ExitCode, status.Signal)
-		}
+		s.log.Info("resolved the container's image user", "container", cp.Name,
+			"image_user", pending, "uid", cp.Ident.UID, "gid", cp.Ident.GID)
+	}
+	return nil
+}
+
+// Detach takes a guest-private mount out of the guest's mount table: private
+// propagation first, so the unmount cannot travel through a peer group, then a
+// lazy detach. The per-container binds made out of it are separate mounts and
+// stay.
+func (s *starter) Detach(step guestinit.MountStep) error {
+	propagation, umountFlags, err := guestinit.LinuxDetach(step)
+	if err != nil {
+		return err
+	}
+	if err := unix.Mount("", step.Target, "", propagation, ""); err != nil {
+		return fmt.Errorf("make %s private (%s): %w", step.Target, step.Why, err)
+	}
+	if err := unix.Unmount(step.Target, umountFlags); err != nil {
+		return fmt.Errorf("detach %s (%s): %w", step.Target, step.Why, err)
+	}
+	s.log.Info("detached a guest-private mount", "target", step.Target)
+	return nil
+}
+
+// Start spawns one container; a plain init container is then waited for and
+// must exit 0. A sidecar is not waited for: the next container starts once its
+// process exists.
+func (s *starter) Start(cp guestinit.ContainerPlan) error {
+	pid, err := spawn(cp, s.capture, s.hub, s.log)
+	if err != nil {
+		return fmt.Errorf("start container %s: %w", cp.Name, err)
+	}
+	s.reaper.Track(cp.Name, pid)
+	s.events.Publish(guestagent.ContainerEvent{
+		Container: cp.Name,
+		At:        time.Now(),
+		Started:   &guestagent.ContainerStarted{PID: int32(pid)},
+	})
+	s.log.Info("started a container", "container", cp.Name, "phase", cp.Phase, "sidecar", cp.Sidecar, "pid", pid)
+
+	if !cp.WaitForExit {
+		return nil
+	}
+	status, err := s.reaper.Wait(s.ctx, cp.Name)
+	if err != nil {
+		return fmt.Errorf("wait for init container %s: %w", cp.Name, err)
+	}
+	if status.ExitCode != 0 || status.Signal != 0 {
+		return fmt.Errorf("init container %s failed: exit code %d, signal %d",
+			cp.Name, status.ExitCode, status.Signal)
 	}
 	return nil
 }

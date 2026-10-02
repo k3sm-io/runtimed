@@ -340,6 +340,13 @@ type containerProc struct {
 	// written by the exec observer and read under pod.mu. The zero value means
 	// "not observed restricted".
 	shim shimInactive
+	// ephemeral marks an entry of the pod's ephemeral (debug) container list
+	// (PodBox.ephemeral_containers). It reports under
+	// ephemeral_container_statuses, is excluded from the pod's phase
+	// accounting, is never restarted, and is torn down with the pod like a
+	// main. Set before the entry is installed in p.containers and never
+	// changed afterwards; read under pod.mu.
+	ephemeral bool
 }
 
 // sidecar reports whether cp is a native sidecar (KEP-753): an init-declared
@@ -1483,7 +1490,13 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
 	}
 
-	env, err := r.containerEnv(p.box, c, rb.env)
+	// The environment reads the box's annotations, which UpdatePod replaces
+	// under p.mu while a spawn (an ephemeral append, a restart) can be in
+	// flight, so it is built from a snapshot taken under the same lock.
+	p.mu.Lock()
+	envBox, _ := proto.Clone(p.box).(*runtimev1.PodBox)
+	p.mu.Unlock()
+	env, err := r.containerEnv(envBox, c, rb.env)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
@@ -1922,7 +1935,9 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 		// entries the partial-start contract records for init containers that
 		// were never reached (a plain init container that ran is untracked the
 		// moment it completes, so it never reaches this loop).
-		if cp.initDeclared {
+		if cp.initDeclared || cp.ephemeral {
+			// Ephemeral containers never decide the pod's phase either,
+			// exactly as upstream's getPhase reads only spec.containers.
 			continue
 		}
 		mains++
@@ -2352,6 +2367,7 @@ func releaseStartClaimLocked(claimed *containerProc) {
 // last termination — upstream getPhase's "waiting" plus "pendingInitialization"
 // buckets, which both force Pending. Init-declared containers count too: a pod
 // whose init sequence is blocked is Pending exactly as one whose main is.
+// Ephemeral containers do not.
 //
 // The last-termination filter is what keeps CrashLoopBackOff out of it: a
 // container waiting between restarts carries the previous run's termination and
@@ -2359,6 +2375,11 @@ func releaseStartClaimLocked(claimed *containerProc) {
 func waitingContainersLocked(p *pod) int {
 	n := 0
 	for _, cp := range p.containers {
+		if cp.ephemeral {
+			// A debug container that could not start does not hold the pod at
+			// Pending: upstream's getPhase never reads the ephemeral list.
+			continue
+		}
 		if cp.state.GetState().GetWaiting() != nil && cp.state.GetLastTerminationState() == nil {
 			n++
 		}
@@ -2584,11 +2605,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
 			fmt.Errorf("read image config for %q: %w", c.GetImage(), err))
 	}
-	run, err := image.MergeRunSpec(runCfg, image.RunSpecRequest{
-		Container:    c,
-		RunAsUID:     int64(resolveCredential(p.box, c).UID),
-		RunAsNonRoot: effectiveRunAsNonRoot(c),
-	})
+	run, err := image.MergeRunSpec(runCfg, runSpecRequest(p.box, c, int64(resolveCredential(p.box, c).UID)))
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
 	}
@@ -2679,23 +2696,35 @@ func resolveImageArgv0(rootfs, argv0 string) (string, error) {
 	return bin, nil
 }
 
-// effectiveRunAsNonRoot resolves runAsNonRoot for a container.
+// effectiveRunAsNonRoot resolves runAsNonRoot for a container of the pod box:
+// the container's own value OR the pod's (PodSecurityContext.run_as_non_root).
 //
-// It reads the container's securityContext only, a faithful reading of the
-// contract available to it: apis PodSecurityContext carries fs_group,
-// run_as_user and run_as_group but no run_as_non_root, so a pod-scoped
-// `securityContext.runAsNonRoot: true` has nowhere to land on the wire.
-// resolveCredential has the same shape for the same reason.
+// OR, not "container overrides pod": a proto3 bool has no presence, so a
+// container-level false is indistinguishable from unset and must never weaken a
+// pod-level assertion. The apis contract closes the opt-out case on the
+// producer's side (it stamps each container's effective value and sends the pod
+// field false when any container opts out), so OR here reproduces the kubelet's
+// per-container verdict exactly.
 //
-// Known contract gap, not closed here: a pod-level runAsNonRoot is therefore
-// not enforced on a container that does not repeat it. Closing it is an apis
-// change (an additive PodSecurityContext.run_as_non_root plus the k3sm
-// provider stamping it), not a runtimed merge function. Composition, when the
-// field arrives, is a logical OR: the proto's bool has no presence, so a
-// container-level false cannot be distinguished from unset and must never
-// weaken a pod-level assertion.
-func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
-	return c.GetSecurityContext().GetRunAsNonRoot()
+// box is always the pod's STORED create-time box, never an UpdatePod request:
+// an update cannot disarm a requirement the pod was created under.
+func effectiveRunAsNonRoot(box *runtimev1.PodBox, c *runtimev1.Container) bool {
+	return c.GetSecurityContext().GetRunAsNonRoot() || box.GetPodSecurityContext().GetRunAsNonRoot()
+}
+
+// runSpecRequest builds the pod-side half of the image merge for container c of
+// box: the uid the spawn will drop to, the effective runAsNonRoot, and the pod
+// identity the kubelet-worded refusal names. One builder for both spines, so
+// the native and vm merges cannot come to disagree on any of them.
+func runSpecRequest(box *runtimev1.PodBox, c *runtimev1.Container, runAsUID int64) image.RunSpecRequest {
+	return image.RunSpecRequest{
+		Container:    c,
+		RunAsUID:     runAsUID,
+		RunAsNonRoot: effectiveRunAsNonRoot(box, c),
+		PodName:      box.GetName(),
+		PodNamespace: box.GetNamespace(),
+		PodUID:       box.GetPodId(),
+	}
 }
 
 // pullPolicy is the image-platform policy for a pull, built from the pod's

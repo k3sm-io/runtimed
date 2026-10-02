@@ -115,6 +115,13 @@ type ReaperOptions struct {
 	// is asserted deterministically rather than by sleeping. nil means
 	// time.NewTimer.
 	NewTimer func(d time.Duration) (<-chan time.Time, func() bool)
+
+	// Sidecars are the native sidecars' container names in STOP order
+	// (ShutdownOrder's Sidecars: reverse start order). Stop terminates every
+	// other container first and waits for them, then each sidecar in turn,
+	// all inside the one grace budget. Empty means every container is stopped
+	// together, as before sidecars existed.
+	Sidecars []string
 }
 
 // Reaper is PID 1's child-reaping loop and its shutdown state machine.
@@ -134,6 +141,8 @@ type Reaper struct {
 	onExit   func(ExitEvent)
 	log      *slog.Logger
 	newTimer func(d time.Duration) (<-chan time.Time, func() bool)
+	// sidecars is ReaperOptions.Sidecars, immutable after NewReaper.
+	sidecars []string
 
 	// exited is a coalescing notification that a tracked child was reaped; the
 	// stop sequence waits on it instead of polling.
@@ -180,6 +189,7 @@ func NewReaper(proc Proc, sigchld <-chan struct{}, opts ReaperOptions) *Reaper {
 		onExit:   opts.OnExit,
 		log:      opts.Logger,
 		newTimer: opts.NewTimer,
+		sidecars: append([]string{}, opts.Sidecars...),
 		exited:   make(chan struct{}, 1),
 		live:     map[int]string{},
 		pending:  map[int]WaitStatus{},
@@ -409,8 +419,14 @@ func (r *Reaper) failureReason() error {
 
 // Stop runs the guest's shutdown state machine exactly once:
 //
-//	SIGTERM every live container -> wait up to grace for them to exit ->
+//	SIGTERM every live non-sidecar container -> wait for them ->
+//	SIGTERM each live sidecar in stop order, waiting for each ->
 //	SIGKILL whatever is left -> sync + poweroff.
+//
+// Every wait draws on ONE grace budget, so sidecars never extend the pod's
+// grace: once it is spent the remaining sidecars are still sent SIGTERM (in
+// order, with no wait) and then SIGKILL. With no sidecars this is the original
+// sequence: SIGTERM everything, wait, SIGKILL the rest.
 //
 // Three properties are load-bearing and each is pinned by a test:
 //
@@ -460,14 +476,29 @@ func (r *Reaper) stop(ctx context.Context, grace time.Duration) (err error) {
 
 	pids := r.livePIDs()
 	r.log.Info("stopping the guest", "containers", len(pids), "grace", grace)
-	for _, pid := range pids {
-		if err := r.proc.Kill(pid, SignalTerm); err != nil {
-			errs = append(errs, fmt.Errorf("term pid %d: %w", pid, err))
+
+	// One timer for the whole stop: sidecars share the pod's budget.
+	expired := grace <= 0 || len(pids) == 0
+	var timer <-chan time.Time
+	if !expired {
+		t, stopTimer := r.newTimer(grace)
+		defer stopTimer()
+		timer = t
+	}
+	term := func(group []int) {
+		for _, pid := range group {
+			if err := r.proc.Kill(pid, SignalTerm); err != nil {
+				errs = append(errs, fmt.Errorf("term pid %d: %w", pid, err))
+			}
+		}
+		if !expired && len(group) > 0 {
+			expired = !r.awaitGone(ctx, timer, group)
 		}
 	}
-
-	if grace > 0 && len(pids) > 0 {
-		r.awaitDrain(ctx, grace)
+	mains, sidecars := r.stopGroups()
+	term(mains)
+	for _, pid := range sidecars {
+		term([]int{pid})
 	}
 
 	for _, pid := range r.livePIDs() {
@@ -480,23 +511,61 @@ func (r *Reaper) stop(ctx context.Context, grace time.Duration) (err error) {
 	return nil
 }
 
-// awaitDrain blocks until every tracked container has been reaped, the grace
-// budget expires, or ctx is cancelled.
-func (r *Reaper) awaitDrain(ctx context.Context, grace time.Duration) {
-	timer, stopTimer := r.newTimer(grace)
-	defer stopTimer()
+// awaitGone blocks until none of pids is still tracked and live, and reports
+// true; or until the grace timer fires or ctx is cancelled, and reports false.
+// A false return means the budget is spent: the caller must not wait again.
+func (r *Reaper) awaitGone(ctx context.Context, timer <-chan time.Time, pids []int) bool {
 	for {
-		if len(r.livePIDs()) == 0 {
-			return
+		if !r.anyLive(pids) {
+			return true
 		}
 		select {
 		case <-r.exited:
 		case <-timer:
-			return
+			return false
 		case <-ctx.Done():
-			return
+			return false
 		}
 	}
+}
+
+// anyLive reports whether any of pids is tracked and not yet reaped.
+func (r *Reaper) anyLive(pids []int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, pid := range pids {
+		if _, ok := r.live[pid]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// stopGroups splits the live pids into the ones stopped first (every container
+// not named a sidecar, sorted by pid so the order is deterministic) and the
+// sidecars' pids in their configured stop order.
+func (r *Reaper) stopGroups() (mains, sidecars []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	isSidecar := make(map[string]bool, len(r.sidecars))
+	for _, name := range r.sidecars {
+		isSidecar[name] = true
+	}
+	byName := map[string][]int{}
+	for pid, name := range r.live {
+		if isSidecar[name] {
+			byName[name] = append(byName[name], pid)
+			continue
+		}
+		mains = append(mains, pid)
+	}
+	sort.Ints(mains)
+	for _, name := range r.sidecars {
+		group := byName[name]
+		sort.Ints(group)
+		sidecars = append(sidecars, group...)
+	}
+	return mains, sidecars
 }
 
 // livePIDs is the sorted set of tracked, not-yet-reaped pids. Sorted so the
