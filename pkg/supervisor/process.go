@@ -108,7 +108,7 @@ type Process struct {
 
 	// execObserver and execTimeout are set by ObserveExec before Start and
 	// read only by Start (single-use), so they need no lock.
-	execObserver func(pid int)
+	execObserver func(pid int, observed bool)
 	execTimeout  time.Duration
 
 	// capture, when set by CaptureToFiles before Start, routes the child's
@@ -135,8 +135,9 @@ func NewProcess(spawner Spawner, waiter ExitWaiter, spec SpawnSpec, sink LogSink
 	}
 }
 
-// ObserveExec asks the Process to call fn with the child's pid once the
-// spawned exec-shim has exec'd the pod binary (or exited). It must be called
+// ObserveExec asks the Process to call fn exactly once with the child's pid
+// and whether the exec was observed: observed is true once the spawned
+// exec-shim has exec'd the pod binary (or exited). It must be called
 // before Start. fn runs on the reaper goroutine, BEFORE that goroutine starts
 // its exit wait, so it runs concurrently with the caller of Start: fn must do
 // its own locking.
@@ -150,12 +151,13 @@ func NewProcess(spawner Spawner, waiter ExitWaiter, spec SpawnSpec, sink LogSink
 // and cannot be reused, so fn can never be answered by an unrelated process;
 // and Start does not wait, so a container start costs nothing extra.
 //
-// fn is not called when the pipe cannot be made or EOF does not arrive within
-// timeout (a shim that predates the exec-sync protocol holds the descriptor
-// open into the pod): a Debug line, and the observation is simply absent. A
-// process that has already exited when fn asks about it is a zombie, for which
-// csops reports ESRCH, the same fail-open path.
-func (p *Process) ObserveExec(fn func(pid int), timeout time.Duration) {
+// fn is called with observed false when the pipe cannot be made, has no
+// deadline, or EOF does not arrive within timeout (a shim that predates the
+// exec-sync protocol holds the descriptor open into the pod), so the caller
+// can report an unanswerable question instead of staying silent. A process
+// that has already exited when fn asks about it is a zombie, for which csops
+// reports ESRCH; that too is the caller's to classify.
+func (p *Process) ObserveExec(fn func(pid int, observed bool), timeout time.Duration) {
 	p.execObserver = fn
 	p.execTimeout = timeout
 }
@@ -226,7 +228,7 @@ func (p *Process) openExecSync() (SpawnSpec, *os.File, *os.File) {
 	}
 	r, w, err := os.Pipe()
 	if err != nil {
-		slog.Debug("exec-sync pipe unavailable; the exec observation is skipped", "path", spec.Path, "err", err)
+		slog.Debug("exec-sync pipe unavailable; the exec will not be observed", "path", spec.Path, "err", err)
 		return spec, nil, nil
 	}
 	spec.ExecSyncFD = w.Fd()
@@ -241,27 +243,31 @@ func (p *Process) openExecSync() (SpawnSpec, *os.File, *os.File) {
 }
 
 // awaitExec blocks until r reaches EOF (the child exec'd or exited) or the
-// timeout passes, then calls the observer on EOF only. It closes r.
+// timeout passes, then calls the observer with observed true on EOF and false
+// otherwise. It closes r.
 func (p *Process) awaitExec(r *os.File, pid int) {
 	defer func() { _ = r.Close() }()
 	if err := r.SetReadDeadline(time.Now().Add(p.execTimeout)); err != nil {
-		slog.Debug("exec-sync pipe has no deadline; the exec observation is skipped", "pid", pid, "err", err)
+		slog.Debug("exec-sync pipe has no deadline; the exec is not observed", "pid", pid, "err", err)
+		p.execObserver(pid, false)
 		return
 	}
 	var b [1]byte
 	for {
 		_, err := r.Read(b[:])
 		if errors.Is(err, io.EOF) {
-			p.execObserver(pid)
+			p.execObserver(pid, true)
 			return
 		}
 		if errors.Is(err, os.ErrDeadlineExceeded) {
-			slog.Debug("exec-sync wait hit its bound; the exec observation is skipped",
+			slog.Debug("exec-sync wait hit its bound; the exec is not observed",
 				"pid", pid, "timeout", p.execTimeout)
+			p.execObserver(pid, false)
 			return
 		}
 		if err != nil {
-			slog.Debug("exec-sync wait ended without an exec; the observation is skipped", "pid", pid, "err", err)
+			slog.Debug("exec-sync wait ended without an exec; the exec is not observed", "pid", pid, "err", err)
+			p.execObserver(pid, false)
 			return
 		}
 	}
@@ -344,6 +350,9 @@ func (p *Process) Start(ctx context.Context) error {
 	go func() {
 		if syncR != nil {
 			p.awaitExec(syncR, pid)
+		} else if p.execObserver != nil {
+			// The exec-sync pipe could not be made: the exec goes unobserved.
+			p.execObserver(pid, false)
 		}
 		p.reap(ctx, pid)
 	}()
