@@ -68,7 +68,12 @@ const (
 	msNOATIME uintptr = 0x400
 	msBIND    uintptr = 0x1000
 	msREC     uintptr = 0x4000
+	msPRIVATE uintptr = 1 << 18
 )
+
+// mntDETACH is umount2(2)'s MNT_DETACH, restated for the same reason as the
+// MS_* values above.
+const mntDETACH = 0x2
 
 // MountOption is a symbolic mount option. The plan carries symbols rather than
 // a flag word so a plan stays readable, comparable in a test, and free of any
@@ -85,6 +90,12 @@ const (
 	OptionBind     MountOption = "bind"
 	OptionRBind    MountOption = "rbind"
 	OptionRemount  MountOption = "remount"
+
+	// OptionDetach marks a BootPlan.Detach step: make the mount at Target
+	// private, then umount2(MNT_DETACH) it. It is not a mount(2) flag, so
+	// LinuxMountFlags refuses it: a detach step handed to the mount path by
+	// mistake fails instead of silently mounting.
+	OptionDetach MountOption = "detach"
 )
 
 // linuxMountFlag is the MS_* value each symbolic option translates to.
@@ -731,9 +742,123 @@ func ContainerKernelFS(name string, podMounts []MountStep) []MountStep {
 	return out
 }
 
+// DetachSteps plans BootPlan.Detach: one OptionDetach step per distinct
+// guest-private mount target, in spec order.
+//
+// It reads GuestMount.guest_private from the spec itself, never from a
+// MountStep: a target expands into several steps (a mount and its remount),
+// and a privacy bit OR-merged across them is exactly the shape of bug the
+// read-only merge in containerVisibleMounts had to be fixed for.
+func DetachSteps(mounts []*guestv1.GuestMount) []MountStep {
+	var out []MountStep
+	seen := map[string]bool{}
+	for _, m := range mounts {
+		if !m.GetGuestPrivate() || seen[m.GetTarget()] {
+			continue
+		}
+		seen[m.GetTarget()] = true
+		out = append(out, MountStep{
+			Target:  m.GetTarget(),
+			Options: []MountOption{OptionDetach},
+			Why:     "guest-private mount: no container may reach it once every root is composed",
+		})
+	}
+	return out
+}
+
+// checkGuestPrivateIsolated refuses a spec in which a container-visible mount
+// target is a guest-private target or an ancestor of one.
+//
+// Either shape would carry the private mount into every container: the same
+// target is ambiguous (which of the two is private?), and an ancestor is
+// re-exposed with a RECURSIVE bind (containerVisibleMounts), which copies the
+// private mount beneath it along with everything else. Refusing is the only
+// answer that keeps guest_private's promise without a per-submount carve-out
+// the kernel's rbind does not offer.
+//
+// A guest-private target nested under another is refused too: BootPlan.Detach
+// runs in spec order, and detaching the parent first takes the child with it,
+// so the child's own MS_PRIVATE then fails and the boot depends on the order.
+func checkGuestPrivateIsolated(mounts []*guestv1.GuestMount) error {
+	private := guestPrivateTargets(mounts)
+	if len(private) == 0 {
+		return nil
+	}
+	for _, m := range mounts {
+		for target := range private {
+			if !mountPathUnder(target, m.GetTarget()) {
+				continue
+			}
+			if !m.GetGuestPrivate() {
+				return fmt.Errorf("%w: container-visible mount %q covers guest-private mount %q",
+					ErrInvalidSpec, m.GetTarget(), target)
+			}
+			if target != m.GetTarget() {
+				return fmt.Errorf("%w: guest-private mount %q is nested under guest-private mount %q",
+					ErrInvalidSpec, target, m.GetTarget())
+			}
+		}
+	}
+	return nil
+}
+
+// guestPrivateTargets is the set of targets the spec marks guest_private.
+func guestPrivateTargets(mounts []*guestv1.GuestMount) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range mounts {
+		if m.GetGuestPrivate() {
+			out[m.GetTarget()] = true
+		}
+	}
+	return out
+}
+
+// ContainerPodMounts is the subset of the pod-level mount steps a container may
+// see: every step except those whose target the spec marks guest_private.
+//
+// The lookup is BY TARGET against the original GuestMount list, so every step a
+// private target expands into (the mount and any remount) is dropped together.
+// The result feeds ContainerDev, ContainerKernelFS and containerVisibleMounts
+// alike, so a private mount is never re-exposed inside a container rootfs and
+// never counts as covering one of the container's own /dev or /proc paths.
+func ContainerPodMounts(podMounts []MountStep, mounts []*guestv1.GuestMount) []MountStep {
+	private := guestPrivateTargets(mounts)
+	if len(private) == 0 {
+		return podMounts
+	}
+	out := make([]MountStep, 0, len(podMounts))
+	for _, s := range podMounts {
+		if private[s.Target] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// LinuxDetach translates a BootPlan.Detach step into its two syscalls'
+// arguments: the propagation flag for mount(2) (MS_PRIVATE, so the unmount
+// cannot propagate into or out of a peer group) and the umount2(2) flags
+// (MNT_DETACH). A step carrying anything but exactly OptionDetach is refused:
+// it is not a detach, and guessing would either unmount a mount nobody asked to
+// remove or leave one in place that the plan promised was gone.
+func LinuxDetach(step MountStep) (propagation uintptr, umountFlags int, err error) {
+	if len(step.Options) != 1 || step.Options[0] != OptionDetach {
+		return 0, 0, fmt.Errorf("%w: detach step for %q has options %v, want exactly %q",
+			ErrInvalidSpec, step.Target, step.Options, OptionDetach)
+	}
+	if err := validTarget(step.Target); err != nil {
+		return 0, 0, err
+	}
+	return msPRIVATE, mntDETACH, nil
+}
+
 // containerVisibleMounts rebases the pod-level mounts that fall inside a
 // container's rootfs so they are visible after the chroot, as recursive binds
 // from the pod-level mount onto the container's path.
+//
+// pod is the CONTAINER-VISIBLE list (ContainerPodMounts), so a guest-private
+// mount never reaches here.
 //
 // A pod mount is performed once at the guest level and re-exposed per
 // container, rather than mounted N times: a virtiofs share mounted twice is

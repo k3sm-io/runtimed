@@ -27,11 +27,11 @@ import (
 // Phase is when in the boot a container starts.
 type Phase string
 
-// The two start phases. guest/v1 expresses exactly this distinction and no
-// other (see the package doc's sidecar ceiling).
+// The two start phases guest/v1 expresses. A native sidecar is not a third
+// phase: it is an init container that is not waited for (StartStep.Sidecar).
 const (
-	// PhaseInit is an init container: it runs to completion, in list order,
-	// before any main container starts.
+	// PhaseInit is an init container: it starts in list order before any main
+	// container. A plain one runs to completion first; a sidecar does not.
 	PhaseInit Phase = "init"
 
 	// PhaseMain is a main container: it starts after every init container has
@@ -46,10 +46,16 @@ type ContainerPlan struct {
 	// Name is the container name, unique within the pod.
 	Name string
 
-	// Phase and WaitForExit are the ordering contract: an init container is
-	// waited for, a main container is not.
+	// Phase and WaitForExit are the ordering contract: a plain init container
+	// is waited for, a sidecar or a main container is not.
 	Phase       Phase
 	WaitForExit bool
+
+	// Sidecar marks a native sidecar (GuestContainer.sidecar): started in its
+	// init-list position, not waited for, and stopped after every main
+	// container at shutdown (ShutdownOrder). Its exit ends neither the pod nor
+	// its initialization.
+	Sidecar bool
 
 	// Mounts compose this container's rootfs, in application order: the
 	// rootfs overlay, the minimal /dev, the pod mounts re-exposed inside it,
@@ -85,7 +91,20 @@ type ContainerPlan struct {
 	WorkingDir string
 
 	// Ident is the identity the process runs as.
+	//
+	// It is PROVISIONAL while PendingImageUser is non-empty: the uid and gid
+	// are then unknown (the zero value is NOT a decision to run as root), and
+	// only the supplementary groups are final. ResolvePlanIdent settles it.
 	Ident Ident
+
+	// PendingImageUser is the container's GuestContainer.image_user while it
+	// is still unresolved. The plan cannot resolve it: the name lives in the
+	// container's own /etc/passwd, and that file only exists once the
+	// executor has composed the rootfs. ResolvePlanIdent resolves it against
+	// the composed root and clears this field; RunStart refuses to start any
+	// container that still carries it, so an unresolved identity can never
+	// reach a spawn as uid 0.
+	PendingImageUser string
 
 	// TTY and Stdin mirror the pod spec's terminal requests.
 	TTY   bool
@@ -113,6 +132,16 @@ type BootPlan struct {
 
 	// PodMounts are the pod-level mounts, applied once before any container.
 	PodMounts []MountStep
+
+	// Detach are the guest-private mounts (GuestMount.guest_private) to take
+	// out of the guest's mount table once every container root is composed
+	// and before any container process starts (RunStart's second pass). Each
+	// step carries OptionDetach and nothing else.
+	//
+	// The per-container binds made out of such a mount are independent mounts
+	// of the same superblock, so they survive the detach; what goes is the
+	// path through which the WHOLE share was reachable.
+	Detach []MountStep
 
 	// Binfmt is the Rosetta registration, or nil when the pod was booted
 	// without the Rosetta share.
@@ -177,7 +206,16 @@ func Plan(spec *guestv1.GuestSpec, opts Options) (*BootPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkGuestPrivateIsolated(spec.GetMounts()); err != nil {
+		return nil, err
+	}
 	plan.PodMounts = podMounts
+	plan.Detach = DetachSteps(spec.GetMounts())
+	// What a container may see of the pod's mounts: every pod mount except
+	// the guest-private ones. ContainerDev, ContainerKernelFS and
+	// containerVisibleMounts all read THIS list, so a skipped mount can
+	// neither be re-exposed nor shadow a container's /dev/shm or /proc.
+	visible := ContainerPodMounts(podMounts, spec.GetMounts())
 
 	if spec.GetRosetta() {
 		reg := RosettaBinfmt()
@@ -194,7 +232,7 @@ func Plan(spec *guestv1.GuestSpec, opts Options) (*BootPlan, error) {
 		staged[f] = true
 	}
 	for _, step := range ordered {
-		cp, err := containerPlan(step, spec.GetFsGroup(), podMounts, upperSize, staged)
+		cp, err := containerPlan(step, spec.GetFsGroup(), visible, upperSize, staged)
 		if err != nil {
 			return nil, err
 		}
@@ -208,19 +246,29 @@ type StartStep struct {
 	Container *guestv1.GuestContainer
 	Phase     Phase
 
-	// WaitForExit is true for an init container: the next container does not
-	// start until this one has exited 0.
+	// WaitForExit is true for a plain init container: the next container does
+	// not start until this one has exited 0. It is false for a sidecar and for
+	// a main container.
 	//
-	// It is derived from GuestContainer.init and nothing else, because that is
-	// the only ordering bit guest/v1 carries. A native sidecar — an init
-	// container with restartPolicy: Always, which by definition never exits —
-	// cannot be told apart here and would hang the boot; the package doc
-	// records that ceiling and this field is the one place it is decided.
+	// This is the one place it is decided, from GuestContainer.init and
+	// GuestContainer.sidecar. A sidecar (an init container with restartPolicy
+	// Always) never exits by definition, so waiting for one would hang the
+	// boot; the next container starts once the sidecar's process is spawned,
+	// which is the kubelet's "started" for a restartable init container with
+	// no startupProbe.
 	WaitForExit bool
+
+	// Sidecar marks a native sidecar: Phase is PhaseInit, WaitForExit false.
+	Sidecar bool
 }
 
-// StartOrder applies the pod's start ordering: every init container, in list
-// order, then every main container, in list order.
+// StartOrder applies the pod's start ordering: every init container (plain or
+// sidecar), in list order, then every main container, in list order.
+//
+// sidecar without init is refused: guest/v1 defines the marker as a refinement
+// of init, and a guest that guessed which one the producer meant would either
+// hang the boot (treat it as a plain init) or start a workload before its
+// initialization (treat it as a main).
 //
 // The spec documents its containers as already being in start order, but the
 // ordering is APPLIED here rather than assumed. A producer bug that emitted a
@@ -244,7 +292,14 @@ func StartOrder(containers []*guestv1.GuestContainer) ([]StartStep, error) {
 			return nil, fmt.Errorf("%w: duplicate container name %q", ErrInvalidSpec, c.GetName())
 		}
 		seen[c.GetName()] = true
-		if c.GetInit() {
+		switch {
+		case c.GetSidecar() && !c.GetInit():
+			return nil, fmt.Errorf("%w: container %q is marked sidecar but not init; sidecar refines init",
+				ErrInvalidSpec, c.GetName())
+		case c.GetInit() && c.GetSidecar():
+			inits = append(inits, StartStep{Container: c, Phase: PhaseInit, Sidecar: true})
+			continue
+		case c.GetInit():
 			inits = append(inits, StartStep{Container: c, Phase: PhaseInit, WaitForExit: true})
 			continue
 		}
@@ -276,8 +331,10 @@ func validContainerName(name string) error {
 	return nil
 }
 
-// containerPlan builds one container's plan. staged is the set of basenames in
-// the spec share, read for the container's ownership sidecar.
+// containerPlan builds one container's plan. podMounts is the CONTAINER-VISIBLE
+// pod mount list (ContainerPodMounts: guest-private mounts already removed), and
+// staged is the set of basenames in the spec share, read for the container's
+// ownership sidecar.
 func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSize int64, staged map[string]bool) (ContainerPlan, error) {
 	c := step.Container
 	argv := append(append([]string{}, c.GetCommand()...), c.GetArgs()...)
@@ -310,19 +367,21 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 	mounts = append(mounts, containerVisibleMounts(c.GetName(), podMounts)...)
 	mounts = append(mounts, EtcBinds(c.GetName())...)
 	return ContainerPlan{
-		Name:        c.GetName(),
-		Phase:       step.Phase,
-		WaitForExit: step.WaitForExit,
-		Mounts:      mounts,
-		Links:       dev.Links,
-		DevPtsDir:   dev.PtsDir,
-		Root:        ContainerRootDir(c.GetName()),
-		Argv:        argv,
-		Env:         append([]string{}, c.GetEnv()...),
-		WorkingDir:  c.GetWorkingDir(),
-		Ident:       ident,
-		TTY:         c.GetTty(),
-		Stdin:       c.GetStdin(),
+		Name:             c.GetName(),
+		Phase:            step.Phase,
+		WaitForExit:      step.WaitForExit,
+		Sidecar:          step.Sidecar,
+		PendingImageUser: c.GetImageUser(),
+		Mounts:           mounts,
+		Links:            dev.Links,
+		DevPtsDir:        dev.PtsDir,
+		Root:             ContainerRootDir(c.GetName()),
+		Argv:             argv,
+		Env:              append([]string{}, c.GetEnv()...),
+		WorkingDir:       c.GetWorkingDir(),
+		Ident:            ident,
+		TTY:              c.GetTty(),
+		Stdin:            c.GetStdin(),
 		// Split in after the rootfs composition and before the first mount
 		// inside it (OwnershipStep.AfterMount).
 		Ownership: ownershipStep(c.GetName(), c.GetRootfsTag(), staged, len(rootfs)),
