@@ -84,6 +84,7 @@ func setWinsize(f *os.File, width, height uint16) error {
 // shape to carry. unix.Syscall with a zero third argument IS the call; a cgo
 // shim would add a build dependency and express exactly the same three words.
 func ptyVoidIoctl(fd int, req uint) error {
+	//lint:ignore SA1019 raw ioctl by design: x/sys has no wrapper for this request shape (see above)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(req), 0); errno != 0 {
 		return errno
 	}
@@ -106,6 +107,7 @@ func ptyVoidIoctl(fd int, req uint) error {
 // pointer converted to uintptr in a syscall argument — not a stored one.
 func ptySlaveName(fd int) (string, error) {
 	var buf [128]byte
+	//lint:ignore SA1019 raw ioctl by design: x/sys has no wrapper for this request shape (see above)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TIOCPTYGNAME), uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
 		return "", fmt.Errorf("resolve pty slave name: %w", errno)
 	}
