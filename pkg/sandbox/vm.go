@@ -144,9 +144,6 @@ type VMSpec struct {
 	// MemoryBytes is the guest's RAM ceiling in bytes — the VZ memorySize, the VM
 	// analog of the host-process memory limit; 0 = backend default.
 	MemoryBytes int64
-	// RootfsPath is the on-disk pod data volume the OCI-Linux-rootfs→bootable-root
-	// builder (lab-gated) turns into the guest root.
-	RootfsPath string
 	// Network is the guest's network config: the rendered resolv.conf content
 	// plus the NAT advisory fields the vm backend applies to the guest. The provider
 	// stamps it as data (runtimed cannot import darwin-net — see GuestNetworkConfig);

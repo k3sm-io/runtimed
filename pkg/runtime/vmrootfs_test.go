@@ -52,9 +52,6 @@ func TestCreateVMPodMaterializesTheRootfsShare(t *testing.T) {
 	// Derived from Config.Root + the documented layout literals, never from the
 	// same helper the production path used to derive it.
 	rootfs := filepath.Join(rt.cfg.Root, "pods", "pod-rootfs", "rootfs")
-	if spec.RootfsPath != rootfs {
-		t.Fatalf("VMSpec.RootfsPath = %q, want %q", spec.RootfsPath, rootfs)
-	}
 	if got := findVMShare(t, spec, mount.ShareTagRootfs).Root; got != rootfs {
 		t.Fatalf("%s share root = %q, want %q", mount.ShareTagRootfs, got, rootfs)
 	}

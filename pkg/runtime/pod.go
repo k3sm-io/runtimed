@@ -843,7 +843,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// device config enforces writability, guest-init composes the binds —
 	// guest-init composes the binds). The pod dir is derived locally (r.podDir), and the planner ignores
 	// box.rootfs_path for share roots; rootfsPath below derives the host-side
-	// VMSpec.RootfsPath the same way, accepting a caller-supplied rootfs_path
+	// guest rootfs dir the same way, accepting a caller-supplied rootfs_path
 	// only when it is byte-equal to that derivation.
 	//
 	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
@@ -977,7 +977,6 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
-		RootfsPath:  vmRootfs,
 		Network:     netCfg,
 		Containers:  cplan.containers,
 		Volumes:     vmVolumePlan(plan),
@@ -3127,7 +3126,7 @@ var errUncontainedRootfs = errors.New("rootfs_path is not the pod's derived data
 // os.MkdirAll, mount.Materialize, volume.Binder.Bind, supervisor.ChownForFSGroup
 // (a recursive Lchown + Chmod that grants the group the owner's rwx and sets
 // setgid on every directory), the resolved binary path, the K3SM_ROOTFS shim env,
-// the Exec cwd and sandbox.VMSpec.RootfsPath. Unvalidated, that is
+// the Exec cwd and the vm guest's rootfs share. Unvalidated, that is
 // privilege-escalation-from-a-confined-pod, not merely a control-plane-compromise
 // amplifier.
 //

@@ -304,11 +304,11 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 
 	// B140 INVERTS the second half of this case. It used to assert that a hostile
 	// box.rootfs_path was merely inert for share roots — the plan ignored it, but
-	// the pod still reached the vm backend carrying that path as
-	// VMSpec.RootfsPath. It is now refused outright, strictly before the backend,
-	// because rootfs_path must be byte-equal to the runtime's derived pod data
-	// volume. The share-root half is unchanged and still meaningful: it pins that
-	// the planner derives roots locally rather than from the box.
+	// the pod still reached the vm backend. It is now refused outright, strictly
+	// before the backend, because rootfs_path must be byte-equal to the runtime's
+	// derived pod data volume. The share-root half is unchanged and still
+	// meaningful: it pins that the planner derives roots locally rather than from
+	// the box.
 	t.Run("box-supplied-rootfs-path-never-moves-a-share-root", func(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 
@@ -341,13 +341,10 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		if got := vmShareRoots(derived); !reflect.DeepEqual(got, cleanRoots) {
 			t.Errorf("derived rootfs_path moved share roots:\n  derived: %v\n  clean:   %v", got, cleanRoots)
 		}
-		if got, want := derived.RootfsPath, filepath.Join(podDir, "rootfs"); got != want {
-			t.Errorf("VMSpec.RootfsPath = %q, want the derived %q", got, want)
-		}
 
 		// Hostile box.rootfs_path (the runtime work root itself): refused before
-		// the backend — the vm path must never carry an uncontained host path into
-		// VMSpec.RootfsPath.
+		// the backend — the vm path must never carry an uncontained host path to
+		// the guest.
 		hostileBox := vmShareBox("pod-plan-hostile")
 		hostileBox.RootfsPath = rt.cfg.Root
 		_, reason, err := rt.createPod(context.Background(), hostileBox)
