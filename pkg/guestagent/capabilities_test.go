@@ -21,12 +21,12 @@ import (
 	"testing"
 )
 
-// TestCapabilitiesAdvertiseWaveATokens is the same-build pin for the three
+// TestCapabilitiesAdvertiseGuestFieldTokens is the same-build pin for the three
 // tokens guest/v1 names beside its newest fields: the agent built with the
 // guest code that honours them advertises them, under their wire spellings.
 // The host's side of the vocabulary (it must KNOW each token, or it discards
 // it) is pinned in pkg/runtime by TestKnownGuestCapabilityCoversAgentTokens.
-func TestCapabilitiesAdvertiseWaveATokens(t *testing.T) {
+func TestCapabilitiesAdvertiseGuestFieldTokens(t *testing.T) {
 	want := map[string]string{
 		"guest-private-mounts": CapabilityGuestPrivateMounts,
 		"sidecar-init":         CapabilitySidecarInit,
