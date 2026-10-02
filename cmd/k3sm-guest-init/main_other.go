@@ -31,6 +31,10 @@ import (
 	"runtime"
 )
 
+// decodeSpec is called only by the linux main; this reference keeps the
+// portable decoder (and its untagged test) part of every platform's build.
+var _ = decodeSpec
+
 func main() {
 	fmt.Fprintf(os.Stderr,
 		"k3sm-guest-init is the PID 1 of a Linux micro-VM guest and cannot run on %s/%s\n",

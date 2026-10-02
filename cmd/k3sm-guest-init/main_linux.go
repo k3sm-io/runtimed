@@ -97,7 +97,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	"google.golang.org/protobuf/encoding/protojson"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 	"k3sm.io/runtimed/pkg/guestagent"
@@ -387,8 +386,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 
 // readSpec reads and decodes the host-written GuestSpec.
 //
-// Unknown fields are rejected. The file is the proto-JSON encoding of
-// GuestSpec and nothing else, so a key this binary does not know means the
+// Unknown fields are rejected (decodeSpec). The file is the proto-JSON encoding
+// of GuestSpec and nothing else, so a key this binary does not know means the
 // host and the initramfs disagree about the contract — which must fail at boot
 // with a legible reason rather than silently drop whatever the host asked for.
 func readSpec(path string) (*guestv1.GuestSpec, error) {
@@ -396,11 +395,7 @@ func readSpec(path string) (*guestv1.GuestSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read guest spec: %w", err)
 	}
-	spec := &guestv1.GuestSpec{}
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(raw, spec); err != nil {
-		return nil, fmt.Errorf("decode guest spec: %w", err)
-	}
-	return spec, nil
+	return decodeSpec(raw)
 }
 
 // specShareFiles lists the basenames in the spec share root, the one filesystem
