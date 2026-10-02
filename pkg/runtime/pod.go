@@ -340,6 +340,13 @@ type containerProc struct {
 	// written by the exec observer and read under pod.mu. The zero value means
 	// "not observed restricted".
 	shim shimInactive
+	// ephemeral marks an entry of the pod's ephemeral (debug) container list
+	// (PodBox.ephemeral_containers). It reports under
+	// ephemeral_container_statuses, is excluded from the pod's phase
+	// accounting, is never restarted, and is torn down with the pod like a
+	// main. Set before the entry is installed in p.containers and never
+	// changed afterwards; read under pod.mu.
+	ephemeral bool
 }
 
 // sidecar reports whether cp is a native sidecar (KEP-753): an init-declared
@@ -1483,7 +1490,13 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
 	}
 
-	env, err := r.containerEnv(p.box, c, rb.env)
+	// The environment reads the box's annotations, which UpdatePod replaces
+	// under p.mu while a spawn (an ephemeral append, a restart) can be in
+	// flight, so it is built from a snapshot taken under the same lock.
+	p.mu.Lock()
+	envBox, _ := proto.Clone(p.box).(*runtimev1.PodBox)
+	p.mu.Unlock()
+	env, err := r.containerEnv(envBox, c, rb.env)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
@@ -1922,7 +1935,9 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 		// entries the partial-start contract records for init containers that
 		// were never reached (a plain init container that ran is untracked the
 		// moment it completes, so it never reaches this loop).
-		if cp.initDeclared {
+		if cp.initDeclared || cp.ephemeral {
+			// Ephemeral containers never decide the pod's phase either,
+			// exactly as upstream's getPhase reads only spec.containers.
 			continue
 		}
 		mains++
@@ -2352,6 +2367,7 @@ func releaseStartClaimLocked(claimed *containerProc) {
 // last termination — upstream getPhase's "waiting" plus "pendingInitialization"
 // buckets, which both force Pending. Init-declared containers count too: a pod
 // whose init sequence is blocked is Pending exactly as one whose main is.
+// Ephemeral containers do not.
 //
 // The last-termination filter is what keeps CrashLoopBackOff out of it: a
 // container waiting between restarts carries the previous run's termination and
@@ -2359,6 +2375,11 @@ func releaseStartClaimLocked(claimed *containerProc) {
 func waitingContainersLocked(p *pod) int {
 	n := 0
 	for _, cp := range p.containers {
+		if cp.ephemeral {
+			// A debug container that could not start does not hold the pod at
+			// Pending: upstream's getPhase never reads the ephemeral list.
+			continue
+		}
 		if cp.state.GetState().GetWaiting() != nil && cp.state.GetLastTerminationState() == nil {
 			n++
 		}

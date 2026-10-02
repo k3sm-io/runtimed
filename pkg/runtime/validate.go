@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"google.golang.org/protobuf/proto"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
 )
@@ -122,12 +124,14 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 }
 
 // updatableOnly verifies that newBox changes only in-place-updatable fields
-// (labels, annotations) relative to oldBox. Any other difference is NOT_UPDATABLE.
+// (labels, annotations, and an APPEND to ephemeral_containers) relative to
+// oldBox. Any other difference is NOT_UPDATABLE.
 //
 // It is the one place that names the in-place-updatable field set, so a caller
-// deciding between an update and a recreate can cite it: labels and annotations
-// only; volumes are materialized once, at create, and an update re-resolves no
-// ConfigMap/Secret/ServiceAccount-token data.
+// deciding between an update and a recreate can cite it: labels, annotations
+// and appended ephemeral containers only; volumes are materialized once, at
+// create, and an update re-resolves no ConfigMap/Secret/ServiceAccount-token
+// data.
 func updatableOnly(oldBox, newBox *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 	if newBox.GetName() != oldBox.GetName() || newBox.GetNamespace() != oldBox.GetNamespace() {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
@@ -145,7 +149,27 @@ func updatableOnly(oldBox, newBox *runtimev1.PodBox) (runtimev1.FailureReason, e
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
 			errors.New("container set is not updatable in place")
 	}
+	if _, err := ephemeralAppends(oldBox, newBox); err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE, err
+	}
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// ephemeralAppends returns the ephemeral containers newBox APPENDS to oldBox's
+// list. The list is append-only, as the apiserver keeps it: every entry oldBox
+// already has must be present in newBox, at the same position, and
+// proto-identical; removing or changing one is an error.
+func ephemeralAppends(oldBox, newBox *runtimev1.PodBox) ([]*runtimev1.Container, error) {
+	have, want := oldBox.GetEphemeralContainers(), newBox.GetEphemeralContainers()
+	if len(want) < len(have) {
+		return nil, errors.New("ephemeral containers cannot be removed")
+	}
+	for i, c := range have {
+		if !proto.Equal(c, want[i]) {
+			return nil, fmt.Errorf("ephemeral container %q cannot be changed once added", c.GetName())
+		}
+	}
+	return want[len(have):], nil
 }
 
 // nonEmptyEmptyDirMedium reports the first volume (by declaration order) whose
