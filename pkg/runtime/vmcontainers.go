@@ -423,15 +423,19 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		return failed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
 			fmt.Errorf("read image config for %q: %w", ref, err))
 	}
-	run, err := image.MergeRunSpec(runCfg, image.RunSpecRequest{
-		Container:    c,
-		RunAsUID:     int64(cred.UID),
-		RunAsNonRoot: effectiveRunAsNonRoot(c),
-	})
-	if err != nil {
-		// A merge refusal is a POD-SPEC verdict (image.ErrRunSpecInvalid: no
-		// command anywhere, or an identity that contradicts runAsNonRoot), not a
-		// registry failure — the operator's remedy is to change the container.
+	run, err := image.MergeRunSpec(runCfg, runSpecRequest(box, c, int64(cred.UID)))
+	switch {
+	case errors.Is(err, image.ErrRunAsNonRoot):
+		// The kubelet's surface for this refusal is the CONTAINER waiting with
+		// CreateContainerConfigError and the pod Pending, not a dead pod.
+		// CONTAINER_CONFIG is container-class, which is what the provider
+		// parks as a waiting container on the vm spine (one guest per pod, so
+		// there is no partly started pod to hold the state). The message
+		// starts with "container <name>:" so the provider can attribute it.
+		return failed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
+	case err != nil:
+		// Any other merge refusal (no command anywhere) is a POD-SPEC verdict
+		// with nothing to retry, as before.
 		return resolvedVMContainer{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
