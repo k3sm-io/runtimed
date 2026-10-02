@@ -336,7 +336,8 @@ func TestShadowRewriteReachesTheSpawn(t *testing.T) {
 // TestShimInactiveConditionFromCodeSignFlags proves the detection's wiring:
 // the flags read for the spawned pid after the exec become a
 // k3sm.io/shim-inactive condition on the pod status, naming both losses; a
-// clean process, a csops error and a pod with no shim requested produce none.
+// csops error is reported as an unknown load (as loud as an unloaded one); a
+// clean process and a pod with no shim requested produce none.
 func TestShimInactiveConditionFromCodeSignFlags(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -347,13 +348,14 @@ func TestShimInactiveConditionFromCodeSignFlags(t *testing.T) {
 		wantReason string
 		wantText   string
 	}{
-		{"platform binary", csPlatformBinary, nil, true, true, ShimInactiveReason, "CS_PLATFORM_BINARY"},
-		{"restricted", csRestrict, nil, true, true, ShimInactiveReason, "CS_RESTRICT"},
+		{"platform binary", supervisor.CSPlatformBinary, nil, true, true, ShimInactiveReason, "CS_PLATFORM_BINARY"},
+		{"restricted", supervisor.CSRestrict, nil, true, true, ShimInactiveReason, "CS_RESTRICT"},
 		{"platform binary that is also hardened keeps the restricted reason", 0x26010b01, nil, true, true, ShimInactiveReason, "CS_PLATFORM_BINARY|CS_RESTRICT"},
-		{"hardened runtime", csRuntime, nil, true, true, ShimInactiveHardenedReason, "com.apple.security.cs.allow-dyld-environment-variables"},
+		{"hardened runtime", supervisor.CSRuntime, nil, true, true, ShimInactiveHardenedReason, "com.apple.security.cs.allow-dyld-environment-variables"},
+		{"library validation", supervisor.CSRequireLV, nil, true, true, ShimInactiveLibraryValidationReason, "CS_REQUIRE_LV"},
 		{"re-signed copy", 0x22000201, nil, true, false, "", ""},
-		{"csops error is fail-open", 0, errors.New("ESRCH"), true, false, "", ""},
-		{"no shim requested: nothing to lose", csPlatformBinary, nil, false, false, "", ""},
+		{"csops error is an unknown load, reported", 0, errors.New("ESRCH"), true, true, ShimInactiveUnknownReason, "may be unavailable"},
+		{"no shim requested: nothing to lose", supervisor.CSPlatformBinary, nil, false, false, "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

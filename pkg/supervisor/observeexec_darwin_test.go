@@ -62,15 +62,18 @@ int main(int argc, char **argv) {
 		t.Fatalf("build launcher: %v\n%s", err, out)
 	}
 
-	const csPlatformBinary = 0x04000000
 	var observed []uint32
 	var observedPid int
 	p := NewProcess(PosixSpawner{}, KqueueReaper{}, SpawnSpec{
 		Path: launcher,
 		Argv: []string{launcher, "/bin/sleep", "0.3"},
 	}, nil)
-	p.ObserveExec(func(pid int) {
+	p.ObserveExec(func(pid int, seen bool) {
 		observedPid = pid
+		if !seen {
+			t.Errorf("observer told the exec of pid %d was not observed", pid)
+			return
+		}
 		flags, err := CodeSignStatus(pid)
 		if err != nil {
 			t.Errorf("csops(%d) in the observer: %v", pid, err)
@@ -101,22 +104,23 @@ int main(int argc, char **argv) {
 	if observedPid != p.PID() {
 		t.Errorf("observer saw pid %d, want the spawned pid %d", observedPid, p.PID())
 	}
-	if observed[0]&csPlatformBinary == 0 {
+	if observed[0]&CSPlatformBinary == 0 {
 		t.Errorf("observed csflags %#x lack CS_PLATFORM_BINARY: the observer read the launcher, not the exec'd /bin/sleep", observed[0])
 	}
 }
 
-// TestObserveExecSkipsOnTimeout proves the fail-open arm: a child that never
-// execs (it holds the sync descriptor open) gets no observation once the bound
-// passes, Start never waits for it, and the child is still reaped.
+// TestObserveExecSkipsOnTimeout proves the timeout arm: a child that never
+// execs (it holds the sync descriptor open) is reported NOT observed once the
+// bound passes, so the caller cannot mistake it for silence; Start never waits
+// for it, and the child is still reaped.
 func TestObserveExecSkipsOnTimeout(t *testing.T) {
 	var mu sync.Mutex
-	called := false
+	calls, observedFlag := 0, true
 	p := NewProcess(PosixSpawner{}, KqueueReaper{}, SpawnSpec{
 		Path: "/bin/sleep",
 		Argv: []string{"/bin/sleep", "1"},
 	}, nil)
-	p.ObserveExec(func(int) { mu.Lock(); called = true; mu.Unlock() }, 200*time.Millisecond)
+	p.ObserveExec(func(_ int, seen bool) { mu.Lock(); calls++; observedFlag = seen; mu.Unlock() }, 200*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -131,7 +135,7 @@ func TestObserveExecSkipsOnTimeout(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if called {
-		t.Error("observer ran although the child never exec'd past the sync descriptor")
+	if calls != 1 || observedFlag {
+		t.Errorf("observer ran %d times with observed=%v, want once with observed=false: the child never exec'd past the sync descriptor", calls, observedFlag)
 	}
 }
