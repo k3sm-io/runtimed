@@ -189,7 +189,7 @@ type VMSpec struct {
 	// every pod-path derivation in this daemon (r.podDir parses the id first),
 	// and a second derivation in this package would be a second answer to
 	// "where does this pod live" that could disagree with the first — which is
-	// the class of bug rootfsPath's byte-equality rule exists to foreclose.
+	// the class of bug rootfsPath's derive-only rule exists to foreclose.
 	PodDir string
 	// AgentSocketPath is the runtimed-PRIVATE unix socket the helper binds and
 	// relays to the guest agent's vsock port. Stamped by createVMPod from

@@ -865,14 +865,13 @@ func TestDepsDefaultSignalGroupNeverSignalsRealGroups(t *testing.T) {
 
 // derivedRootfs is the one way a test spells a pod's on-disk data volume.
 //
-// Since B140 a box's rootfs_path is accepted only when it is byte-equal to this
-// derivation, so a test that wants an on-disk pod dir asks the runtime for it
-// instead of inventing a t.TempDir(). Callers that set box.rootfs_path must set
-// SandboxProfile.data_volume_path to the same value: sandbox.Generate carves the
-// credential read-only sub-scope only out of paths under the data volume, and
-// the pods root is otherwise in the protected deny-set — so moving one field
-// without the other makes credential-path validation fail for reasons that have
-// nothing to do with the test's subject.
+// The runtime derives every pod's rootfs from the pod id, so a test that wants
+// an on-disk pod dir asks the runtime for it instead of inventing a
+// t.TempDir(). Callers set SandboxProfile.data_volume_path to this value:
+// sandbox.Generate carves the credential read-only sub-scope only out of paths
+// under the data volume, and the pods root is otherwise in the protected
+// deny-set — so a data volume elsewhere makes credential-path validation fail
+// for reasons that have nothing to do with the test's subject.
 func derivedRootfs(t *testing.T, rt *Runtime, podID string) string {
 	t.Helper()
 	id, err := image.ParsePodID(podID)
@@ -1572,7 +1571,6 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 		PodId:        "pod-vol",
 		Namespace:    "default",
 		Name:         "demo",
-		RootfsPath:   dataVol,
 		LogDirectory: testPodLogDir(rt, "pod-vol"),
 		// SBPL data volume == on-disk rootfs so the credential paths validate.
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},

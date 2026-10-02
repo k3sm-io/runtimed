@@ -107,7 +107,6 @@ func TestUpdatePodNeverMaterializes(t *testing.T) {
 			PodId:        podID,
 			Namespace:    "default",
 			Name:         "p",
-			RootfsPath:   dataVol,
 			LogDirectory: testPodLogDir(rt, podID),
 			// SBPL data volume == on-disk rootfs so the credential paths validate.
 			SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},

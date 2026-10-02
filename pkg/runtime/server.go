@@ -435,6 +435,7 @@ func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) 
 			FailureReason: runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 		}, nil
 	}
+	r.warnRetiredRootfsField(box)
 	r.mu.Lock()
 	p, ok := r.pods[box.GetPodId()]
 	r.mu.Unlock()

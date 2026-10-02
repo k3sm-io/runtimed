@@ -136,15 +136,14 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 	}
 
 	// Ask the runtime for the derived pod data volume rather than re-spelling the
-	// layout: B140 accepts rootfs_path only when it is byte-equal to it, and the
-	// SBPL data volume moves with it.
+	// layout: the runtime derives the pod rootfs from the pod id, and the SBPL
+	// data volume must name the same directory.
 	intRootfs := derivedRootfs(t, rt, "pod-int")
 
 	box := &runtimev1.PodBox{
 		PodId:        "pod-int",
 		Namespace:    "default",
 		Name:         "int",
-		RootfsPath:   intRootfs,
 		LogDirectory: testPodLogDir(rt, "pod-int"),
 		SandboxProfile: &runtimev1.SandboxProfile{
 			DataVolumePath: intRootfs,
@@ -275,7 +274,6 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 		PodId:        "pod-a6",
 		Namespace:    "default",
 		Name:         "a6",
-		RootfsPath:   podRootfs,
 		LogDirectory: testPodLogDir(rt, "pod-a6"),
 		SandboxProfile: &runtimev1.SandboxProfile{
 			DataVolumePath: podRootfs,

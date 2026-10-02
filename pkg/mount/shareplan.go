@@ -162,10 +162,8 @@ type Tmpfs struct {
 // ComputeSharePlan computes the virtiofs share-device plan for a
 // vm-RuntimeClass pod from the PodBox's declared volumes and volumeMounts.
 // podDir is the pod's on-disk directory (the runtime-derived
-// <root>/pods/<podID> — never box.rootfs_path, which is caller-supplied; the
-// runtime now also refuses any rootfs_path that is not byte-equal to that same
-// derivation, so the two agree, but the planner still derives its own
-// rather than trusting the box). workRoot is the runtime work dir (Config.Root),
+// <root>/pods/<podID>; the box carries no path the planner reads for it, and
+// the runtime derives the pod rootfs the same way, so the two agree). workRoot is the runtime work dir (Config.Root),
 // and class is the local-path storage class PVC roots derive from. podDir is ENFORCED to
 // sit strictly inside <workRoot>/pods (guardShareRoots): a caller-derived pod
 // dir relocated wholesale — e.g. by a traversing pod_id surviving a future
@@ -509,7 +507,7 @@ func validateVMPathComponent(field, v string) error {
 // config, the PVC roots from class.BasePath) joined with fixed literals and
 // PodBox NAME COMPONENTS, and no caller-supplied absolute PATH survives to the
 // comparison (a hostPath source is outside the arity check's closed set and
-// rejects; box.rootfs_path is ignored by the planner). Operands of one
+// rejects; the planner reads no path field of the box). Operands of one
 // derivation cannot disagree about firmlink/symlink spellings (/var vs
 // /private/var), which is the case lexical comparison cannot judge. Keep that
 // precondition true when extending the planner.
