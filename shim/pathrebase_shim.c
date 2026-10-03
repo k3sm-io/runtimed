@@ -275,6 +275,14 @@ DIR *k3sm_opendir(const char *path) {
 static char g_shadow_dir[K3SM_MAXPATH];
 static size_t g_shadow_dir_len;
 
+/*
+ * K3SM_REPORT_MAX_BYTES caps the report file: once it holds this many bytes
+ * nothing more is appended, so an exec loop cannot grow it without bound. It
+ * equals the Go reader's per-poll byte cap (pkg/supervisor childReportReadCap),
+ * pinned by pkg/supervisor TestReportCapMatchesShim: keep this line's shape.
+ */
+#define K3SM_REPORT_MAX_BYTES 65536
+
 /* The restricted-child report file (K3SM_SHIM_REPORT), or "" when off. */
 static char g_report_path[K3SM_MAXPATH];
 static size_t g_report_len;
@@ -442,7 +450,8 @@ static int k3sm_restricted(const char *path) {
  * k3sm_report appends "<target>\n" to the report file with one write(2).
  * Async-signal-safe; never fails the caller: every error is ignored and errno
  * is restored. O_NOFOLLOW refuses a symlink at the path and O_NONBLOCK keeps
- * a FIFO from blocking the exec; anything but a regular file is not written.
+ * a FIFO from blocking the exec; anything but a regular file is not written,
+ * and neither is a file already K3SM_REPORT_MAX_BYTES long.
  */
 static void k3sm_report(const char *target) {
     int saved = errno;
@@ -454,7 +463,7 @@ static void k3sm_report(const char *target) {
         int fd = open(g_report_path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
         if (fd >= 0) {
             struct stat st;
-            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size < K3SM_REPORT_MAX_BYTES) {
                 ssize_t w = write(fd, line, l + 1);
                 (void)w; /* best effort: a short or failed write is dropped */
             }
@@ -500,9 +509,12 @@ typedef struct {
  * the plan is marked report when the rebase is enabled and the file the kernel
  * will actually run (the target, or a read shebang's rebased interpreter) is
  * SF_RESTRICTED: that exec is not covered, and the child runs without the shim.
+ * A relative file is only stat'ed when cwd_known (the kernel resolves it
+ * against this process's cwd), so a posix_spawn whose file actions may chdir
+ * the child never judges the wrong file.
  */
 static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_script,
-                           int too_many_args, k3sm_exec_plan_t *pl) {
+                           int cwd_known, int too_many_args, k3sm_exec_plan_t *pl) {
     pl->kind = K3SM_EXEC_ASIS;
     pl->report = 0;
     pl->report_target = NULL;
@@ -547,7 +559,8 @@ static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_sc
         pl->exec_path = target;
     }
     /* The single no-shadow-rewrite outcome: is this exec uncovered? */
-    if (g_cfg.enabled && g_report_len != 0 && k3sm_restricted(runs)) {
+    if (g_cfg.enabled && g_report_len != 0 && runs != NULL && (runs[0] == '/' || cwd_known) &&
+        k3sm_restricted(runs)) {
         pl->report = 1;
         pl->report_target = runs;
     }
@@ -601,7 +614,7 @@ int k3sm_execve(const char *path, char *const argv[], char *const envp[]) {
     k3sm_exec_plan_t pl;
     /* execve resolves a relative path against the caller's own cwd, which is
      * also where the shebang read resolves it. */
-    k3sm_plan_exec(path, argv, 1, argc > K3SM_MAX_REWRITE_ARGC, &pl);
+    k3sm_plan_exec(path, argv, 1, 1, argc > K3SM_MAX_REWRITE_ARGC, &pl);
     if (pl.report) {
         /* Before the exec: a successful execve does not return, so this
          * records an ATTEMPTED exec (a failing one is reported too). */
@@ -631,7 +644,7 @@ int k3sm_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_action
     /* A file action may chdir the child before the kernel resolves a relative
      * path, and the actions are opaque here, so a relative script is not read. */
     int may_read = path != NULL && (path[0] == '/' || fa == NULL);
-    k3sm_plan_exec(path, argv, may_read, argc > K3SM_MAX_REWRITE_ARGC, &pl);
+    k3sm_plan_exec(path, argv, may_read, fa == NULL, argc > K3SM_MAX_REWRITE_ARGC, &pl);
     int rc;
     switch (pl.kind) {
     case K3SM_EXEC_PATH:

@@ -17,6 +17,7 @@ limitations under the License.
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -94,6 +95,20 @@ func (r *Runtime) readChildReport(p *pod, cp *containerProc) bool {
 	cp.childShim.names = append(cp.childShim.names, names...)
 	p.mu.Unlock()
 	return true
+}
+
+// childReportPoller runs pollChildReports once per kick until ctx is
+// cancelled. It is the memory sampler's tick consumer (armMemorySampler),
+// kept off the sampling goroutine so report IO never delays the OOM check.
+func (r *Runtime) childReportPoller(ctx context.Context, p *pod, kick <-chan struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-kick:
+			r.pollChildReports(p)
+		}
+	}
 }
 
 // pollChildReports reads every container's report (the sampler-tick caller)

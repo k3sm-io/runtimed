@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -373,6 +375,23 @@ func TestRestrictedPlatformFileRejectsLookalike(t *testing.T) {
 	}
 	if RestrictedPlatformFile(filepath.Join(t.TempDir(), "missing")) {
 		t.Fatalf("a missing file reads as SF_RESTRICTED")
+	}
+}
+
+// TestReportCapMatchesShim pins the shim's K3SM_REPORT_MAX_BYTES to the
+// reader's per-poll cap by reading the source, so the writer never grows the
+// file past what one poll reads.
+func TestReportCapMatchesShim(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "shim", "pathrebase_shim.c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^#define K3SM_REPORT_MAX_BYTES (\d+)$`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("K3SM_REPORT_MAX_BYTES not found in shim/pathrebase_shim.c")
+	}
+	if got, err := strconv.Atoi(string(m[1])); err != nil || got != childReportReadCap {
+		t.Fatalf("K3SM_REPORT_MAX_BYTES = %s, want childReportReadCap %d", m[1], childReportReadCap)
 	}
 }
 

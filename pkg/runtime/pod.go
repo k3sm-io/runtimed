@@ -815,9 +815,20 @@ func (r *Runtime) armMemorySampler(p *pod) {
 		return
 	}
 	sampCtx, cancel := context.WithCancel(p.supCtx)
+	// The restricted-child poll rides the sampler's tick but never runs on
+	// its goroutine: the tick only hands off, without blocking, to a poller
+	// whose file IO and publish cannot delay a sample (the OOM path). Both
+	// die with sampCtx.
+	kick := make(chan struct{}, 1)
+	go r.childReportPoller(sampCtx, p, kick)
 	sampler := supervisor.NewMemorySampler(r.footprinter, p.containerPIDs, limit, func(footprint uint64) {
 		r.oomKill(p, footprint)
-	}, supervisor.WithTick(func() { r.pollChildReports(p) }))
+	}, supervisor.WithTick(func() {
+		select {
+		case kick <- struct{}{}:
+		default: // a poll is already pending
+		}
+	}))
 	p.mu.Lock()
 	prev := p.memCancel
 	p.memSampler = sampler

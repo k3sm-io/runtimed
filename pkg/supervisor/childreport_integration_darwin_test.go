@@ -173,6 +173,33 @@ func TestUnloadedShimChildIsDetected(t *testing.T) {
 		}
 	})
 
+	t.Run("a full report file is not grown", func(t *testing.T) {
+		const full = 64 << 10 // the shim's K3SM_REPORT_MAX_BYTES
+		fill := func() {
+			if err := os.WriteFile(reportPath, bytes.Repeat([]byte("x"), full), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		argv := shimArgv(execShim, profile, spawner, "/bin/cat", "/mnt/sec/key")
+		fill()
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = []string{
+			"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+			"DYLD_INSERT_LIBRARIES=" + dylib,
+			"K3SM_ROOTFS=" + dataVol,
+			"K3SM_MOUNT_PATHS=/mnt/sec",
+			supervisor.ChildReportEnv + "=" + reportPath,
+		}
+		_ = cmd.Run() // cat fails on the host path; only the file size matters
+		st, err := os.Stat(reportPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Size() != full {
+			t.Fatalf("report grew past the cap: %d bytes, want %d", st.Size(), full)
+		}
+	})
+
 	t.Run("no mounts reports nothing", func(t *testing.T) {
 		_, names := run(t, "/bin/cat", false)
 		if len(names) != 0 {

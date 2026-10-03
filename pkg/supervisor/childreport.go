@@ -71,7 +71,9 @@ const childReportPrefix = ".k3sm-shim-report-"
 // to tell an operator what failed, too few for a pod to grow the message.
 const ChildReportMaxNames = 8
 
-// childReportReadCap bounds one poll's read of the pod-controlled file.
+// childReportReadCap bounds one poll's read of the pod-controlled file. The
+// shim stops appending once the file is this long (K3SM_REPORT_MAX_BYTES,
+// pinned by TestReportCapMatchesShim).
 const childReportReadCap = 64 << 10
 
 // childReportMaxNameLen bounds one reported name.

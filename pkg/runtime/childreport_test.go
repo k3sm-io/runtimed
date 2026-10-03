@@ -169,3 +169,48 @@ func TestChildReportReachesPodStatus(t *testing.T) {
 		t.Fatalf("message = %q, want %q", got.GetMessage(), want)
 	}
 }
+
+// TestChildReportPollerLifetime pins the off-sampler poller: a kick polls,
+// and cancelling its context ends the goroutine.
+func TestChildReportPollerLifetime(t *testing.T) {
+	rt := newTestRuntimeCfg(t, Config{}, Deps{})
+	rt.childRestricted = func(p string) bool { return p == "/bin/cat" }
+	dir := t.TempDir()
+	name, err := supervisor.ChildReportName("app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("/bin/cat\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cp := &containerProc{name: "app", childReport: supervisor.NewChildReport(dir, name, rt.childRestricted)}
+	p := &pod{box: &runtimev1.PodBox{PodId: "pod-poller"}, containers: []*containerProc{cp}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	kick := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		rt.childReportPoller(ctx, p, kick)
+		close(done)
+	}()
+	kick <- struct{}{}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.mu.Lock()
+		n := len(cp.childShim.names)
+		p.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the kick never polled the report")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poller outlived its context")
+	}
+}
