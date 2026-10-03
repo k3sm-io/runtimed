@@ -114,8 +114,8 @@ func TestUnloadedShimChildIsDetected(t *testing.T) {
 
 	// run launches the spawner, under the pod profile, spawning child on
 	// /mnt/sec/key, and returns its combined output and what a fresh reader
-	// returns from the report afterwards.
-	run := func(t *testing.T, child string, mounts bool) (string, []string) {
+	// returns from the report afterwards. extra is appended to the env.
+	run := func(t *testing.T, child string, mounts bool, extra ...string) (string, []string) {
 		t.Helper()
 		if err := os.Remove(reportPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
@@ -131,6 +131,7 @@ func TestUnloadedShimChildIsDetected(t *testing.T) {
 		if mounts {
 			cmd.Env = append(cmd.Env, "K3SM_MOUNT_PATHS=/mnt/sec")
 		}
+		cmd.Env = append(cmd.Env, extra...)
 		var buf bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &buf, &buf
 		err := cmd.Run()
@@ -197,6 +198,45 @@ func TestUnloadedShimChildIsDetected(t *testing.T) {
 		}
 		if st.Size() != full {
 			t.Fatalf("report grew past the cap: %d bytes, want %d", st.Size(), full)
+		}
+	})
+
+	// /bin/cat is on the shadow list, but a copy the interposer will not use
+	// (absent, or failing its ownership/mode check) means cat really runs as
+	// the platform binary: it must be reported exactly as if it were unlisted.
+	t.Run("listed binary with no usable copy is still reported", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			setup func(dir string)
+		}{
+			{"missing copy", func(string) {}},
+			{"group-writable copy", func(dir string) {
+				cat := filepath.Join(dir, "cat")
+				if b, err := exec.Command("cp", "-c", "/bin/cat", cat).CombinedOutput(); err != nil {
+					t.Fatalf("cp -c: %v\n%s", err, b)
+				}
+				if b, err := exec.Command("codesign", "-f", "-s", "-", cat).CombinedOutput(); err != nil {
+					t.Fatalf("codesign: %v\n%s", err, b)
+				}
+				if err := os.Chmod(cat, 0o775); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dir := filepath.Join(dataVol, "shadow-"+strings.ReplaceAll(tc.name, " ", "-"))
+				if err := os.Mkdir(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				tc.setup(dir)
+				out, names := run(t, "/bin/cat", true, "K3SM_SHADOW_DIR="+dir)
+				if strings.Contains(out, secret) {
+					t.Fatalf("cat read the mounted key: a copy that must not be used was used (output %q)", out)
+				}
+				if !slices.Contains(names, "/bin/cat") {
+					t.Fatalf("SILENT: /bin/cat ran unshimmed with an unusable copy and was not reported (report %q)", names)
+				}
+			})
 		}
 	})
 

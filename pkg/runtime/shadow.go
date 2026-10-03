@@ -28,28 +28,13 @@ import (
 	"golang.org/x/sys/unix"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/shadowset"
 )
 
 // shadowDirEnv is the environment variable that hands Config.ShadowBinDir to
 // the path-rebase interposer (shim/pathrebase_shim.c), which applies the same
 // rewrite as shadowRewrite to every execve and posix_spawn inside the pod.
 const shadowDirEnv = "K3SM_SHADOW_DIR"
-
-// shadowCopies maps each host binary the node keeps a re-signed copy of to the
-// copy's file name under Config.ShadowBinDir. It must agree with the
-// interposer's k3sm_shadow_map.
-//
-// /bin/sh maps to bash: /bin/sh is Apple's dispatcher, which re-execs
-// /private/var/select/sh, so a copy of it would only hand off to the platform
-// shell again. bash run under the basename "sh" enters POSIX mode, which is
-// what /bin/sh resolves to by default.
-var shadowCopies = map[string]string{
-	"/bin/sh":      "bash",
-	"/bin/bash":    "bash",
-	"/bin/zsh":     "zsh",
-	"/bin/dash":    "dash",
-	"/usr/bin/env": "env",
-}
 
 // shebangMax is how much of a script the kernel reads for its "#!" line
 // (XNU's IMG_SHSIZE); a first line longer than that is not one the kernel
@@ -89,21 +74,26 @@ type execRewrite struct {
 //
 // dyld scrubs DYLD_* from the environment of a restricted process (a platform
 // binary, or one carrying CS_RESTRICT), so a pod that starts through /bin/sh
-// loses the DNS and path-rebase shims, and with them the per-namespace DNS
-// precedence and the bind/connect source discipline, for the shell and every
-// descendant. An ad-hoc re-signed copy of the same binary is neither, so the
-// variables survive. The copies are made by the node installer, root-owned.
+// (or tar, cat, awk, ...) loses the DNS and path-rebase shims, and with them
+// the per-namespace DNS precedence, the bind/connect source discipline and its
+// mounted paths, for that process and every descendant. An ad-hoc re-signed
+// copy of the same binary is neither, so the variables survive. The copies are
+// made by the node installer, root-owned; which binaries have one is the
+// shadowset list, the same one the interposer's generated table holds.
 //
 // # The rules
 //
 //  1. The target is rebased (rw.rebase): a path under a mount prefix becomes
 //     its materialized copy, as an open() of it would.
-//  2. The rebased target is one of the five (shadowCopies) and the copy is
+//  2. The rebased target has a copy (shadowset.CopyFor) and the copy is
 //     admitted: exec the copy with argv unchanged, except that the /bin/sh
 //     copy gets argv[0] "sh" unless argv[0] already ends in "sh" as a path
-//     component ("/bin/sh" stays "/bin/sh").
+//     component ("/bin/sh" stays "/bin/sh"). Keeping argv[0] is what lets a
+//     binary that dispatches on it (egrep, zcat, [) behave as its host name.
 //  3. The rebased target is a script (its first two bytes are "#!"): when its
-//     interpreter is one of the five and the copy is admitted, exec the copy;
+//     interpreter has a copy (a shell, or e.g. #!/usr/bin/awk -f: the
+//     interposer applies the same table, so the two agree) and the copy is
+//     admitted, exec the copy;
 //     else, when the interpreter itself lies under a mount, exec its rebased
 //     copy. Either way with the argv the kernel would have built,
 //     [interp, arg?, script, argv[1:]...], where arg is everything after the
@@ -132,7 +122,7 @@ func shadowRewrite(path string, argv []string, rw execRewrite) (shadowExec, bool
 	admit := func(copyPath string) bool { return rw.admit == nil || rw.admit(copyPath) }
 	target := rebase(path)
 
-	if copyName, ok := shadowCopies[target]; ok && rw.dir != "" {
+	if copyName, ok := shadowset.CopyFor(target); ok && rw.dir != "" {
 		if cp := filepath.Join(rw.dir, copyName); admit(cp) {
 			out := append([]string{}, argv...)
 			if target == "/bin/sh" {
@@ -152,7 +142,7 @@ func shadowRewrite(path string, argv []string, rw execRewrite) (shadowExec, bool
 				out = append(out, argv[1:]...)
 				return shadowExec{path: file, argv: out, script: true}, true
 			}
-			if copyName, ok := shadowCopies[interp]; ok && rw.dir != "" {
+			if copyName, ok := shadowset.CopyFor(interp); ok && rw.dir != "" {
 				if cp := filepath.Join(rw.dir, copyName); admit(cp) {
 					name := interp
 					if interp == "/bin/sh" {
@@ -361,7 +351,7 @@ func (r *Runtime) shadowExecFor(podID, container string, rb resolvedBinary, reba
 		rebase:   rebase,
 		admit: func(copyPath string) bool {
 			if err := verifyShadow(r.cfg.ShadowBinDir, copyPath, lstat); err != nil {
-				r.log.Warn("shadow shell copy not used; running the host binary (run sudo k3sm install)",
+				r.log.Warn("shadow copy not used; running the host binary (run sudo k3sm install)",
 					"pod", podID, "container", container, "path", rb.path, "copy", copyPath, "err", err)
 				return false
 			}
@@ -379,16 +369,16 @@ func (r *Runtime) shadowExecFor(podID, container string, rb resolvedBinary, reba
 //     (the copy is node infrastructure, never pod code, the same rule as a
 //     direct host shell), or an interpreter under a mount, gated as itself.
 //   - A script left alone by the rewrite (no shadow set, the copy refused, or
-//     an interpreter that is not a host shell, e.g. #!/usr/bin/python3) is
-//     gated on its interpreter as the shebang names it; a host-shell
-//     interpreter is also exec'd directly with the kernel's argv
+//     an interpreter with no copy, e.g. #!/usr/bin/python3) is gated on its
+//     interpreter as the shebang names it; a host-shell interpreter
+//     (shadowset.IsShell) is also exec'd directly with the kernel's argv
 //     [interp, arg?, script, args...]. A script is not a Mach-O and cannot
 //     carry a signature, so gating the script itself rejected every script
 //     entrypoint with "unsigned"; the interpreter is what runs. A
 //     non-shell-interpreted script keeps being exec'd as itself (the kernel
 //     follows its shebang) and gets the shim-inactive condition when its
 //     interpreter is restricted, instead of failing the pod.
-//   - A direct host shell rewritten to its copy keeps gating the binary the
+//   - A direct host binary rewritten to its copy keeps gating the binary the
 //     pod named (the copy is node infrastructure, admitted by verifyShadow);
 //     any other host binary gates what is exec'd, which is the path the pod
 //     named unless a mount rebase moved it.
@@ -411,9 +401,9 @@ func (r *Runtime) hostExecPlan(podID string, c *runtimev1.Container, rootfs stri
 		switch {
 		case sx.script && isCopy:
 			// The interpreter as the shebang names it (argv[0] of a script
-			// rewrite, one of the shadowCopies keys): the copy is node
+			// rewrite, a shadowset exec path): the copy is node
 			// infrastructure, never pod code, so the policy answers for the
-			// host shell exactly as it does for a direct /bin/sh pod.
+			// host binary exactly as it does for a direct /bin/sh pod.
 			return execArgv, argv0, sx.argv[0]
 		case sx.script:
 			// An interpreter under a mount: the rebased file is what runs.
@@ -433,7 +423,7 @@ func (r *Runtime) hostExecPlan(podID string, c *runtimev1.Container, rootfs stri
 	if !ok {
 		return execArgv, argv0, gatePath
 	}
-	if _, shell := shadowCopies[interp]; shell {
+	if shadowset.IsShell(interp) {
 		out := []string{interp}
 		if arg != "" {
 			out = append(out, arg)
