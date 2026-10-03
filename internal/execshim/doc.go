@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package execshim is the in-process privilege-drop + Seatbelt apply + execve
-// core of the k3sm-execshim helper. It exposes a single Go function, RunPodLaunch,
-// that — in the irreversible order supervisor.RunLaunchSequence enforces — drops
+// Package execshim is the core of the k3sm-execshim helper's three modes:
+// RunPodLaunch (a container's launch sequence), Serve (the resident per-container
+// shim, see its doc for the confinement order) and RunExecSession (an exec
+// session inside a shim's confinement).
+//
+// RunPodLaunch, in the irreversible order supervisor.RunLaunchSequence enforces, drops
 // to the pod's securityContext identity (setgid→initgroups→setuid), compiles and
 // applies an SBPL profile to the current process via the private libsandbox SPI,
 // and then execve's the pod binary, preserving the environment.

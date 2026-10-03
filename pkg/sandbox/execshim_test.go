@@ -103,20 +103,23 @@ func TestWrapCommand(t *testing.T) {
 			t.Fatalf("WrapCommand: %v", err)
 		}
 		defer cleanup()
+		if argv[1] != supervisor.ShimModeLaunch {
+			t.Errorf("mode token = %q, want %q", argv[1], supervisor.ShimModeLaunch)
+		}
 		if path != b.shimPath {
 			t.Errorf("path=%q, want shim %q", path, b.shimPath)
 		}
-		// argv = [shim, <uid>, <gid>, <groups>, <rlimits>, <qos>, profilePath, /bin/echo, hi]
-		if len(argv) != 9 || argv[0] != b.shimPath || argv[7] != "/bin/echo" || argv[8] != "hi" {
+		// argv = [shim, launch, <uid>, <gid>, <groups>, <rlimits>, <qos>, profilePath, /bin/echo, hi]
+		if len(argv) != 10 || argv[0] != b.shimPath || argv[8] != "/bin/echo" || argv[9] != "hi" {
 			t.Fatalf("unexpected argv: %v", argv)
 		}
-		if argv[1] != "-1" || argv[2] != "-1" || argv[3] != "-" {
-			t.Errorf("no-drop credential tokens = %q, want [-1 -1 -]", argv[1:4])
+		if argv[2] != "-1" || argv[3] != "-1" || argv[4] != "-" {
+			t.Errorf("no-drop credential tokens = %q, want [-1 -1 -]", argv[2:5])
 		}
-		if argv[4] != "-" || argv[5] != "-" {
-			t.Errorf("empty rlimit/qos tokens = %q, want [- -]", argv[4:6])
+		if argv[5] != "-" || argv[6] != "-" {
+			t.Errorf("empty rlimit/qos tokens = %q, want [- -]", argv[5:7])
 		}
-		profilePath := argv[6]
+		profilePath := argv[7]
 		data, rerr := os.ReadFile(profilePath)
 		if rerr != nil {
 			t.Fatalf("staged profile unreadable: %v", rerr)
@@ -139,8 +142,8 @@ func TestWrapCommand(t *testing.T) {
 			t.Fatalf("WrapCommand: %v", err)
 		}
 		defer cleanup()
-		if argv[1] != "501" || argv[2] != "20" || argv[3] != "20,999" {
-			t.Errorf("drop credential tokens = %q, want [501 20 20,999]", argv[1:4])
+		if argv[2] != "501" || argv[3] != "20" || argv[4] != "20,999" {
+			t.Errorf("drop credential tokens = %q, want [501 20 20,999]", argv[2:5])
 		}
 	})
 
@@ -155,24 +158,24 @@ func TestWrapCommand(t *testing.T) {
 		}
 		defer cleanup()
 		// The tokens sit at the fixed positions before the profile path — an old
-		// shim (pre-B7 arity) would read argv[4] as its profile path, fail the
+		// shim (pre-B7 arity) would read the rlimit token as its profile path, fail the
 		// ReadFile, and exit 3: fail-closed under daemon/shim binary skew.
-		if want := supervisor.EncodeRlimits(plan); argv[4] != want {
-			t.Errorf("rlimit token = %q, want %q", argv[4], want)
+		if want := supervisor.EncodeRlimits(plan); argv[5] != want {
+			t.Errorf("rlimit token = %q, want %q", argv[5], want)
 		}
-		if argv[5] != "q=bg" {
-			t.Errorf("qos token = %q, want %q", argv[5], "q=bg")
+		if argv[6] != "q=bg" {
+			t.Errorf("qos token = %q, want %q", argv[6], "q=bg")
 		}
 		// Round-trip through the shim-side decoders: the plan survives, non-nil.
-		decoded, derr := supervisor.ParseRlimits(argv[4])
+		decoded, derr := supervisor.ParseRlimits(argv[5])
 		if derr != nil || !reflect.DeepEqual(decoded, plan) {
-			t.Errorf("ParseRlimits(%q) = (%+v, %v), want (%+v, nil)", argv[4], decoded, derr, plan)
+			t.Errorf("ParseRlimits(%q) = (%+v, %v), want (%+v, nil)", argv[5], decoded, derr, plan)
 		}
-		if bg, qerr := supervisor.ParseQoS(argv[5]); qerr != nil || !bg {
-			t.Errorf("ParseQoS(%q) = (%v, %v), want (true, nil)", argv[5], bg, qerr)
+		if bg, qerr := supervisor.ParseQoS(argv[6]); qerr != nil || !bg {
+			t.Errorf("ParseQoS(%q) = (%v, %v), want (true, nil)", argv[6], bg, qerr)
 		}
-		if _, rerr := os.ReadFile(argv[6]); rerr != nil {
-			t.Errorf("profile path shifted off position 6: %v", rerr)
+		if _, rerr := os.ReadFile(argv[7]); rerr != nil {
+			t.Errorf("profile path shifted off position 7: %v", rerr)
 		}
 	})
 

@@ -75,9 +75,10 @@ func podProfile(t *testing.T, podID string) (string, string) {
 	return pf, dataVol
 }
 
-// shimArgv is the exec-shim argv for a no-drop, no-limit, default-QoS pod.
+// shimArgv is the launch-mode exec-shim argv for a no-drop, no-limit,
+// default-QoS pod.
 func shimArgv(shim, profile string, pod ...string) []string {
-	return append([]string{shim, "-1", "-1", "-", "-", "-", profile}, pod...)
+	return append([]string{shim, supervisor.ShimModeLaunch, "-1", "-1", "-", "-", "-", profile}, pod...)
 }
 
 // comm returns pid's kernel command name, or "" when it cannot be read.

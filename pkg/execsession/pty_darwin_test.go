@@ -16,7 +16,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package runtime
+package execsession
 
 import (
 	"testing"
@@ -25,12 +25,12 @@ import (
 )
 
 // TestOpenPTYAllocatesTTY exercises the darwin pty allocation + resize path
-// directly (the tty-exec plumbing): openPTY returns a usable master/slave pair,
-// the slave is a real terminal, and setWinsize round-trips through the master.
+// directly (the tty-exec plumbing): OpenPTY returns a usable master/slave pair,
+// the slave is a real terminal, and SetWinsize round-trips through the master.
 func TestOpenPTYAllocatesTTY(t *testing.T) {
-	master, slave, err := openPTY()
+	master, slave, err := OpenPTY()
 	if err != nil {
-		t.Fatalf("openPTY: %v", err)
+		t.Fatalf("OpenPTY: %v", err)
 	}
 	defer master.Close()
 	defer slave.Close()
@@ -40,8 +40,8 @@ func TestOpenPTYAllocatesTTY(t *testing.T) {
 		t.Errorf("slave is not a tty: %v", err)
 	}
 
-	if err := setWinsize(master, 120, 40); err != nil {
-		t.Fatalf("setWinsize: %v", err)
+	if err := SetWinsize(master, 120, 40); err != nil {
+		t.Fatalf("SetWinsize: %v", err)
 	}
 	ws, err := unix.IoctlGetWinsize(int(master.Fd()), unix.TIOCGWINSZ)
 	if err != nil {
