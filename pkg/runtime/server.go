@@ -229,7 +229,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		go func(proc *supervisor.Process, pid int) {
 			defer wg.Done()
 			escalated, observed, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
-				termSignal, killSignal, r.signalGroup, r.exitObservationGrace())
+				termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace())
 			if err != nil {
 				r.log.Warn("graceful stop pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
 			}
@@ -304,7 +304,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		r.log.Warn("SIGKILLing a container process that appeared during teardown",
 			"pod", req.GetPodId(), "pid", pid)
 		if _, _, err := supervisor.GracefulStop(context.WithoutCancel(ctx), pid, 0, proc.Done(),
-			termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+			termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
 			r.log.Warn("sigkill a late pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
 		}
 	}
@@ -339,6 +339,10 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// so the durable records (stored outside the pod dir, so removePodDir does
 	// not touch them) have served their purpose.
 	r.removePodReapRecords(req.GetPodId())
+	p.mu.Lock()
+	shimDirs := p.shimDirs
+	p.mu.Unlock()
+	removeShimDirs(shimDirs)
 	return &runtimev1.DeletePodResponse{}, nil
 }
 
@@ -566,7 +570,7 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, _ grpc.ServerStreamingS
 // A container that is not running is refused with FailedPrecondition, matching
 // containerd: its file is closed and complete, and reopening it would create an
 // empty file at a path the node is about to prune.
-func (r *Runtime) ReopenContainerLog(_ context.Context, req *runtimev1.ReopenContainerLogRequest) (*runtimev1.ReopenContainerLogResponse, error) {
+func (r *Runtime) ReopenContainerLog(ctx context.Context, req *runtimev1.ReopenContainerLogRequest) (*runtimev1.ReopenContainerLogResponse, error) {
 	// The vm fork FIRST, before any containerProc lookup — the same shape
 	// StartContainer and RestartContainer take, and for the same reason: a vm
 	// pod's containers are guest processes with no host containerProc, so the
@@ -588,7 +592,18 @@ func (r *Runtime) ReopenContainerLog(_ context.Context, req *runtimev1.ReopenCon
 	p.mu.Lock()
 	running := cp.state.GetState().GetRunning() != nil
 	w := cp.logw
+	logPath := cp.state.GetLogPath()
+	var conn *supervisor.ShimConn
+	if cp.proc != nil {
+		conn = cp.proc.Shim()
+	}
 	p.mu.Unlock()
+	if conn != nil && running {
+		if rerr := reopenViaShim(ctx, conn, logPath); rerr != nil {
+			return nil, status.Errorf(codes.Internal, "reopen %s/%s: %v", req.GetPodId(), req.GetContainer(), rerr)
+		}
+		return &runtimev1.ReopenContainerLogResponse{}, nil
+	}
 	if w == nil || !running {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"reopen %s/%s: container is not running", req.GetPodId(), req.GetContainer())

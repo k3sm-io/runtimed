@@ -63,7 +63,7 @@ func startOrphan(t *testing.T) int {
 func TestNonChildExitIsReportedUnknown(t *testing.T) {
 	t.Run("adopted non-child exit is unknown", func(t *testing.T) {
 		pid := startOrphan(t)
-		p, err := AdoptProcess(context.Background(), AdoptedExitWaiter{}, pid, nil, nil)
+		p, err := AdoptProcess(context.Background(), AdoptedExitWaiter{}, pid)
 		if err != nil {
 			t.Fatalf("AdoptProcess: %v", err)
 		}
@@ -143,7 +143,7 @@ func TestNonChildExitIsReportedUnknown(t *testing.T) {
 
 	t.Run("adopt refuses a wildcard or launchd pid", func(t *testing.T) {
 		for _, pid := range []int{-1, 0, 1} {
-			if _, err := AdoptProcess(context.Background(), AdoptedExitWaiter{}, pid, nil, nil); err == nil {
+			if _, err := AdoptProcess(context.Background(), AdoptedExitWaiter{}, pid); err == nil {
 				t.Fatalf("AdoptProcess(%d) accepted", pid)
 			}
 		}

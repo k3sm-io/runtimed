@@ -33,6 +33,7 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
+	"k3sm.io/runtimed/pkg/execsession"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
@@ -169,11 +170,59 @@ func execEcho(t *testing.T, conn *supervisor.ShimConn) (string, int32) {
 	}
 }
 
+// execTTY runs a tty session through the shim the way the daemon does: the pty
+// is allocated here, the slave handed over, the master read here. It returns
+// what the master carried once the session's exit arrived.
+func execTTY(t *testing.T, conn *supervisor.ShimConn) string {
+	t.Helper()
+	master, slave, err := execsession.OpenPTY()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	st, err := conn.ExecTTY(ctx, slave)
+	_ = slave.Close()
+	if err != nil {
+		t.Fatalf("ExecTTY: %v", err)
+	}
+	// stty reads the terminal through ioctls: it fails unless the session's
+	// stdin is the handed-off terminal and the grant admits the ioctls.
+	if err := st.Send(&runtimev1.ExecRequest{Container: "c", Tty: true, Command: []string{"/bin/sh", "-c", "/bin/stty size && echo tty-hello"}}); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		execsession.PumpReader(master, func(b []byte) error { out.Write(b); return nil })
+	}()
+	for {
+		resp, err := st.Recv()
+		if err != nil {
+			t.Fatalf("tty exec: %v", err)
+		}
+		if e := resp.GetExit(); e != nil {
+			if e.GetExitCode() != 0 {
+				t.Fatalf("tty exec exited %d", e.GetExitCode())
+			}
+			break
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+	return out.String()
+}
+
 // TestResidentShimSurvivesTheDaemon is the resident shim's end-to-end gate: a
 // ticking container under the real shim, the daemon-side Process dropped (its
 // connection closed, its watch cancelled) and a second ConnectShim; the CRI log
 // stays continuous with no marker; an exec through the shim answers; the stats
-// sample names the container, not the shim; a TERM through the shim ends the
+// sample names the container, not the shim; a tty session on a handed-off
+// terminal owns it; a TERM through the shim ends the
 // container, and the exit the reconnected Process reports is the real one,
 // equal to the shim's own Status and to its exit record. It also pins the
 // pressure-kill mark on both the shim and the container, and logs the shim's
@@ -218,6 +267,10 @@ func TestResidentShimSurvivesTheDaemon(t *testing.T) {
 
 	if out, code := execEcho(t, conn); code != 0 || strings.TrimSpace(out) != "hello" {
 		t.Fatalf("exec /bin/echo through the shim: exit %d output %q", code, out)
+	}
+
+	if out := execTTY(t, conn); !strings.Contains(out, "tty-hello") {
+		t.Fatalf("tty exec through the shim printed %q, want tty-hello", out)
 	}
 
 	sample, err := supervisor.PhysFootprinter{}.RUsage(proc.ChildPID())

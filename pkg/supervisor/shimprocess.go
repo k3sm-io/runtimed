@@ -95,6 +95,31 @@ func AdoptShim(ctx context.Context, waiter ExitWaiter, conn *ShimConn, st *shimv
 	return p, nil
 }
 
+// AdoptShimByRecord returns a running Process for a live resident shim that
+// did not answer (ErrShimUnresponsive): there is no connection, so nothing is
+// proxied to it, but its exit is still watched on the recorded shim pid and its
+// status still comes from the exit record once it exits. id is the recorded
+// identity and child the recorded container pid (0 when unknown).
+func AdoptShimByRecord(ctx context.Context, waiter ExitWaiter, id ShimIdentity, child int) (*Process, error) {
+	if id.Pid <= 1 || id.Dir == "" {
+		return nil, fmt.Errorf("supervisor: refusing to adopt shim pid %d dir %q", id.Pid, id.Dir)
+	}
+	if waiter == nil {
+		return nil, errors.New("supervisor: adopt needs an exit waiter")
+	}
+	p := &Process{
+		waiter:   waiter,
+		state:    StateRunning,
+		pid:      id.Pid,
+		shimDir:  id.Dir,
+		childPID: child,
+		done:     make(chan struct{}),
+		drained:  make(chan struct{}),
+	}
+	go p.reap(ctx, id.Pid)
+	return p, nil
+}
+
 // AdoptChild returns a running Process for the container child of a shim that
 // died: the degraded path. pgid is the pod group (the dead shim's pid, which
 // still names the group while the child lives) and child the container's own
@@ -198,11 +223,6 @@ func (p *Process) StopSignal(group func(pgid int, sig os.Signal) error) func(int
 // with what the shim said.
 func (p *Process) startShim(ctx context.Context) error {
 	l := p.launch
-	payload, err := EncodeShimSpec(l.Spec)
-	if err != nil {
-		p.closeDrained()
-		return err
-	}
 	specR, specW, err := os.Pipe()
 	if err != nil {
 		p.closeDrained()
@@ -223,6 +243,16 @@ func (p *Process) startShim(ctx context.Context) error {
 		} else {
 			slog.Debug("exec-sync pipe unavailable; the exec will not be observed", "path", spec.Path, "err", err)
 		}
+	}
+	l.Spec.ExecSync = syncW != nil
+	payload, err := EncodeShimSpec(l.Spec)
+	if err != nil {
+		_, _, _, _ = specR.Close(), specW.Close(), diagR.Close(), diagW.Close()
+		if syncW != nil {
+			_, _ = syncR.Close(), syncW.Close()
+		}
+		p.closeDrained()
+		return err
 	}
 	pid, err := p.spawner.Spawn(ctx, spec)
 	// The shim holds its own copies; the parent's must go, or EOF never comes.

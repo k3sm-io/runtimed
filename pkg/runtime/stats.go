@@ -146,7 +146,8 @@ func (r *Runtime) hostPodStats(_ context.Context, p *pod) *runtimev1.PodStats {
 	live := liveContainersLocked(p)
 	ctrs := make([]ctr, 0, len(live))
 	for _, cp := range live {
-		ctrs = append(ctrs, ctr{name: cp.name, pid: cp.proc.PID()})
+		// The container itself, never its resident shim (ChildPID).
+		ctrs = append(ctrs, ctr{name: cp.name, pid: cp.proc.ChildPID()})
 	}
 	p.mu.Unlock()
 

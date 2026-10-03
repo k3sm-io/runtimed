@@ -72,12 +72,21 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return err
 	}
-	if p.adopted {
-		return status.Errorf(codes.FailedPrecondition, "exec: %v", errAdoptedPod)
+	// Per container, keyed on how the running instance was started: a
+	// shim-backed instance is served by its shim (the only holder of its
+	// launch environment, and the one that survives a daemon restart); an
+	// instance with a refusal recorded cannot be entered faithfully.
+	if cp.execRefusal != nil {
+		return status.Errorf(codes.FailedPrecondition, "exec: %v", cp.execRefusal)
 	}
 	cmdv := first.GetCommand()
 	if len(cmdv) == 0 {
 		return status.Error(codes.InvalidArgument, "exec: command is required")
+	}
+	if cp.proc != nil {
+		if conn := cp.proc.Shim(); conn != nil {
+			return r.execViaShim(stream, conn, cp, first)
+		}
 	}
 
 	c := cp.spec
@@ -186,6 +195,14 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 	if cp.proc == nil {
 		return status.Errorf(codes.FailedPrecondition,
 			"attach %s/%s: container has not started", first.GetPodId(), first.GetContainer())
+	}
+	// A shim-backed container's output lives in its shim: follow it there.
+	if conn := cp.proc.Shim(); conn != nil {
+		return r.attachViaShim(stream, conn)
+	}
+	if cp.fanout == nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"attach %s/%s: the container's output is not followed by this daemon", first.GetPodId(), first.GetContainer())
 	}
 
 	var sendMu sync.Mutex
