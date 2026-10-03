@@ -36,7 +36,10 @@ func (sessionSeam) SandboxApply() error { return nil }
 
 // RunExecSession is exec mode (supervisor.ShimModeExec): it applies the pod's
 // rlimit plan and QoS band (the two launch-spec tokens) and execs argv marked
-// pcontrol-KILL, preserving the environment. It never drops privilege — the
+// pcontrol-KILL, preserving the environment. A bare command name is resolved
+// on the session's own PATH (supervisor.ResolveExecPath) — the container's
+// environment, which is also what an adopted shim holds — while argv[0] stays
+// the name the caller sent, as execvp does. It never drops privilege — the
 // resident shim already runs as the pod's credential — and applies no profile.
 // Unlike the container's launch child, it sets the band from INSIDE the
 // confinement, so the shim profile's self-only system-sched grant
@@ -59,6 +62,12 @@ func RunExecSession(rlimits, qos string, argv []string) error {
 		return err
 	}
 	path, execArgv := takeExecHandoff(argv)
+	// A bare name (`kubectl cp` sends `tar`) is searched on the session's own
+	// PATH; argv is untouched, so the program still sees the name it was given.
+	path, err = supervisor.ResolveExecPath(path, os.Getenv("PATH"), os.Stat)
+	if err != nil {
+		return err
+	}
 	seam := sessionSeam{&podLaunchSeam{path: path, argv: execArgv}}
 	_, err = supervisor.RunLaunchSequence(seam, supervisor.LaunchSpec{Rlimits: plan, BgQoS: bg}, os.Geteuid())
 	return err

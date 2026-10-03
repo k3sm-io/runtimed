@@ -88,7 +88,8 @@ limitations under the License.
 // pod's rlimit plan and QoS band and execs the command marked pcontrol-KILL. It
 // drops nothing and applies no profile: it was forked by the confined shim and
 // inherits its confinement (a second sandbox_apply fails on macOS), and the
-// shim already runs as the pod's credential.
+// shim already runs as the pod's credential. A bare command name is searched on
+// the session's PATH; a name found nowhere exits 127 with the message alone.
 //
 // The fsGroup chown of the writable volumes happens ROOT-side in the daemon
 // before this shim is spawned (a dropped process can no longer chown).
@@ -108,6 +109,7 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -130,6 +132,12 @@ func main() {
 			os.Exit(2)
 		}
 		if err := execshim.RunExecSession(rest[0], rest[1], rest[2:]); err != nil {
+			if errors.Is(err, supervisor.ErrExecNotFound) {
+				// The shell/runc not-found convention: the message is the
+				// user's, so it carries no helper prefix.
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(127)
+			}
 			fmt.Fprintf(os.Stderr, "k3sm-execshim: %v\n", err)
 			os.Exit(4)
 		}
