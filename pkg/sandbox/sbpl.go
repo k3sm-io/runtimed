@@ -555,6 +555,16 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// privileged k3sm-netd helper socket — the Seatbelt deny is the only barrier.
 	// Make it explicit: deny connect() to each helper socket path, after any
 	// network allow so last-match-wins keeps it denied even for a networked pod.
+	// Every container's resident shim socket lives under one static root
+	// (ShimSubdir). A file deny does not stop connect(2), so the root gets its
+	// own socket deny, a subpath in both firmlink forms: a pod reaches neither
+	// its own shim nor a sibling pod's (cross-pod Exec/Signal).
+	b.WriteString(";; AF_UNIX: deny connect() to every container's resident shim.\n")
+	b.WriteString("(deny network-outbound\n")
+	for _, form := range firmlinkForms(ShimRoot(filepath.Dir(podsRoot))) {
+		b.WriteString(fmt.Sprintf("  (remote unix-socket (subpath %q))\n", form))
+	}
+	b.WriteString("  )\n")
 	if len(deniedSockets) > 0 {
 		b.WriteString(";; AF_UNIX: explicitly deny connect() to the privileged helper\n")
 		b.WriteString(";; socket(s) — same-uid pods can't be kept off them any other way.\n")

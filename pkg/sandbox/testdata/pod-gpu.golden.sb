@@ -27,6 +27,11 @@
 (allow iokit-open
   (iokit-registry-entry-class "AGXDeviceUserClient")
   (iokit-registry-entry-class "IOSurfaceRootUserClient"))
+;; AF_UNIX: deny connect() to every container's resident shim.
+(deny network-outbound
+  (remote unix-socket (subpath "/var/lib/k3sm/run/shim"))
+  (remote unix-socket (subpath "/private/var/lib/k3sm/run/shim"))
+  )
 ;; PROTECTED: deny user homes, the secrets/state store, the shared
 ;; pods root, the daemon-private reap stores and the control-plane
 ;; and daemon-private trees (sibling dirs under the work-dir, named
