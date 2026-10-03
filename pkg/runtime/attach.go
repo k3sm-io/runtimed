@@ -611,6 +611,10 @@ func (r *Runtime) attachedContainer(box *runtimev1.PodBox, c *runtimev1.Containe
 	}
 	rec := sl.rec
 	cp.state.ContainerId = rec.containerID()
+	// A running adopted instance keeps its report: re-read it from the start.
+	if rootfs, err := r.rootfsPath(box); err == nil {
+		r.armChildReport(box.GetPodId(), rootfs, cp, false)
+	}
 	started := rec.StartUnixNano
 	if rec.ChildStartUnixNano != 0 {
 		started = rec.ChildStartUnixNano
