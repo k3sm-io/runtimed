@@ -332,6 +332,10 @@ type Runtime struct {
 	// additive RuntimeConditions only — nothing in the pod spine consumes them.
 	rosettaHost  rosettaCondition
 	rosettaGuest rosettaCondition
+	// pressureKill is why the default spawner runs pods WITHOUT the
+	// pressure-kill mark (its startup self-check failed), or nil. Set once in
+	// New and immutable, so GetRuntimeInfo reads it with no lock.
+	pressureKill error
 	// gpuFacts is the host's GPU observation, probed eagerly exactly once
 	// in New and IMMUTABLE thereafter — so the concurrent GetRuntimeInfo handler
 	// reads it with no lock and no race, and the Metal driver round trip happens
@@ -640,8 +644,14 @@ type Deps struct {
 	// the gpuFacts field), so the GPU driver is touched once per daemon lifetime.
 	GPUProbe func() sandbox.GPUProbeResult
 	Spawner  supervisor.Spawner
-	Waiter   supervisor.ExitWaiter
-	Network  supervisor.PodNetwork
+	// PressureKillProbe proves the default spawner's pressure-kill mark on
+	// this host. It runs once in New, and only when Spawner is unset (the
+	// default spawner is the one it vouches for). Defaults to
+	// supervisor.VerifyPressureKill, which spawns and kills one /bin/sleep;
+	// tests inject a fake.
+	PressureKillProbe func(ctx context.Context) error
+	Waiter            supervisor.ExitWaiter
+	Network           supervisor.PodNetwork
 	// Resolver supplies ConfigMap/Secret data and SA tokens for volume
 	// materialization. It has NO production default: runtimed never talks
 	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
@@ -838,8 +848,12 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	spawner := deps.Spawner
 	codeSignStatus := deps.CodeSignStatus
+	// pressureKillErr is the default spawner's startup self-check verdict; nil
+	// when the mark is proven or the spawner was injected (an injected spawner
+	// is not this daemon's mark to verify).
+	var pressureKillErr error
 	if spawner == nil {
-		spawner = supervisor.PosixSpawner{}
+		spawner, pressureKillErr = defaultPodSpawner(log, deps.PressureKillProbe)
 		if codeSignStatus == nil {
 			codeSignStatus = supervisor.CodeSignStatus
 		}
@@ -941,6 +955,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		guestDialer:    guestDialer,
 		rosettaHost:    rosettaHost,
 		rosettaGuest:   rosettaGuest,
+		pressureKill:   pressureKillErr,
 		gpuFacts:       gpuFacts,
 		gpuDevice:      gpuResult.Metal.DeviceName,
 		spawner:        spawner,

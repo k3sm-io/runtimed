@@ -448,7 +448,7 @@ func NewVMBackend(opts ...VMBackendOption) *VMBackend {
 		supportedFn:      vzSupported,
 		vmHostFn:         FindVMHost,
 		helperEntitledFn: vzStaticCodeEntitled,
-		spawner:          supervisor.PosixSpawner{},
+		spawner:          supervisor.PosixSpawner{PressureKill: true},
 		waiter:           supervisor.KqueueReaper{},
 		health:           dialGuestHealth,
 		signal:           supervisor.SignalGroup,
