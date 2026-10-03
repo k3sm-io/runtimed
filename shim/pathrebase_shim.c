@@ -23,16 +23,20 @@
  * If either is unset/empty the shim transparently defers to the real function for
  * every call, so a non-pod process loading it is unaffected.
  *
- * Shadow-shell exec rewrite (a second, independent job, configured by
- *   K3SM_SHADOW_DIR   - the node's directory of ad-hoc re-signed shell copies
+ * Shadow-copy exec rewrite (a second, independent job, configured by
+ *   K3SM_SHADOW_DIR   - the node's directory of ad-hoc re-signed copies
  * and read ONCE, by a load-time constructor). dyld scrubs DYLD_* from the
  * environment of a restricted (platform / CS_RESTRICT) process, so a pod whose
- * process tree execs /bin/sh, /bin/bash, /bin/zsh, /bin/dash or /usr/bin/env
- * loses this shim and the DNS shim for that process and every descendant. The
- * node installer makes re-signed copies of those binaries (never of the /bin/sh
- * dispatcher, which re-execs /private/var/select/sh; bash serves as sh, entering
- * POSIX mode because argv[0]'s basename is "sh"), and this shim interposes
- * execve and posix_spawn to exec the copy instead. Those two public symbols are
+ * process tree execs a shell (/bin/sh, /bin/bash, /bin/zsh, /bin/dash,
+ * /usr/bin/env), tar, or one of the common coreutils loses this shim and the
+ * DNS shim for that process and every descendant. The node installer makes
+ * re-signed copies of those binaries (never of the /bin/sh dispatcher, which
+ * re-execs /private/var/select/sh; bash serves as sh, entering POSIX mode
+ * because argv[0]'s basename is "sh"), and this shim interposes execve and
+ * posix_spawn to exec the copy instead. argv[0] is kept (bar that "sh"
+ * rule), so a binary that dispatches on it (egrep, zcat, [) still does. The
+ * list is declared once, in pkg/shadowset, and reaches this file as the
+ * generated shadow_table.h. Those two public symbols are
  * the whole surface: posix_spawnp, the execvp/execl/execv/execvP family,
  * system(3) and popen(3) all reach them through a cross-image call on this
  * macOS (verified 2026-09-26, macOS 26: an interposer on just these two logged
@@ -42,7 +46,7 @@
  * It also parses shebangs itself: the kernel's own "#!" follow (imgact_shell)
  * happens inside execve, where no interposer can see it, so a direct exec of
  * ./entrypoint.sh would otherwise land on the platform interpreter. The target's
- * first line is read here and, when its interpreter is one of the five, the
+ * first line is read here and, when its interpreter has a copy, the
  * kernel's argv shape is rebuilt (interp [one arg] script args...) and the copy
  * is exec'd. Recursion is bounded to that one level (the copy is a Mach-O, never
  * a script). TOCTOU: the file can change between this read and the exec; the
@@ -257,6 +261,16 @@ DIR *k3sm_opendir(const char *path) {
     return opendir(k3sm_rebase(path, buf));
 }
 
+/*
+ * chdir is rebased like stat: `tar -C <dir>` (what kubectl cp sends) is a
+ * chdir(2) followed by relative opens, so without it a re-signed tar keeps the
+ * shim and still lands in the host directory. A relative path passes through.
+ */
+int k3sm_chdir(const char *path) {
+    char buf[K3SM_MAXPATH];
+    return chdir(k3sm_rebase(path, buf));
+}
+
 /* -------- exec: mount rebase + shadow-shell rewrite -------- */
 
 #define K3SM_SHEBANG_MAX 512 /* the kernel's IMG_SHSIZE: what it reads of "#!" */
@@ -287,19 +301,11 @@ static size_t g_shadow_dir_len;
 static char g_report_path[K3SM_MAXPATH];
 static size_t g_report_len;
 
-/* The five host paths the copies stand in for, and the copy each maps to.
- * Pinned against the Go shadowCopies map by pkg/runtime
- * TestShadowMapMatchesInterposer: keep one entry per line in this shape. */
-static const struct {
-    const char *host;
-    const char *copy;
-} k3sm_shadow_map[] = {
-    {"/bin/sh", "bash"},
-    {"/bin/bash", "bash"},
-    {"/bin/zsh", "zsh"},
-    {"/bin/dash", "dash"},
-    {"/usr/bin/env", "env"},
-};
+/* The host exec paths the copies stand in for, and the copy each maps to
+ * (k3sm_shadow_map) plus the longest copy name (K3SM_SHADOW_COPY_MAX):
+ * GENERATED from pkg/shadowset, the list the runtime reads too, and pinned by
+ * pkg/shadowset/gen TestShadowTableIsCurrent. */
+#include "shadow_table.h"
 
 __attribute__((constructor)) static void k3sm_shadow_init(void) {
     /* Settle the rebase config at load too, so an exec in a forked child
@@ -321,7 +327,7 @@ __attribute__((constructor)) static void k3sm_shadow_init(void) {
     while (l > 1 && d[l - 1] == '/') {
         l--;
     }
-    if (l + 16 >= sizeof(g_shadow_dir)) {
+    if (l + 1 + K3SM_SHADOW_COPY_MAX >= sizeof(g_shadow_dir)) {
         return; /* too long to hold "<dir>/<copy>": leave the feature off */
     }
     memcpy(g_shadow_dir, d, l);
@@ -348,7 +354,7 @@ static int k3sm_trusted(const char *path, int want_dir) {
 }
 
 /*
- * k3sm_shadow_copy writes "<dir>/<copy>" into buf when host is one of the five
+ * k3sm_shadow_copy writes "<dir>/<copy>" into buf when host has a copy
  * and both the directory and the copy pass k3sm_trusted, returning 1 and
  * setting *is_sh when host is /bin/sh; else returns 0 (the caller then runs
  * the real function on the original path).
@@ -496,9 +502,9 @@ typedef struct {
  * argv. Order, identical to pkg/runtime shadowRewrite:
  *   1. the target is rebased exactly as k3sm_open rebases (a path under a
  *      mount prefix becomes "<rootfs><path>");
- *   2. the rebased target is one of the five and the copy is trusted: DIRECT;
+ *   2. the rebased target has a copy and the copy is trusted: DIRECT;
  *   3. may_read_script and the rebased target is a script: its interpreter is
- *      rebased too; if the (unrebased) interpreter is one of the five and the
+ *      rebased too; if the (unrebased) interpreter has a copy and the
  *      copy is trusted, exec the copy; else if the rebase moved the
  *      interpreter, exec the rebased interpreter; either as SCRIPT, with the
  *      kernel's argv shape and the rebased script path;
@@ -678,6 +684,7 @@ __attribute__((used)) static const interpose_t k3sm_path_interposers[]
         {(const void *)k3sm_access, (const void *)access},
         {(const void *)k3sm_faccessat, (const void *)faccessat},
         {(const void *)k3sm_opendir, (const void *)opendir},
+        {(const void *)k3sm_chdir, (const void *)chdir},
         {(const void *)k3sm_execve, (const void *)execve},
         {(const void *)k3sm_posix_spawn, (const void *)posix_spawn},
 };

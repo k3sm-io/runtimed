@@ -240,18 +240,22 @@ type Config struct {
 	// pod's absolute mount path then reaches the host, the pre-shim behavior). The
 	// shim cannot load into a SIP platform binary (/bin/sh) — only custom Go/C
 	// workloads — a documented ceiling, narrowed by ShadowBinDir for the host
-	// shells, which this same shim then also rewrites at every exec.
+	// shells, tar and the common coreutils, which this same shim then also
+	// rewrites at every exec.
 	PathShimPath string
 	// ShadowBinDir is the node's directory of ad-hoc re-signed copies of the
-	// host shells (bash, zsh, dash, env; bash also serves /bin/sh), made by the
-	// installer, root-owned and never writable by the daemon user. When set, a
-	// host-binary container whose argv[0] is /bin/sh, /bin/bash, /bin/zsh,
-	// /bin/dash or /usr/bin/env, or a script whose shebang names one of them,
-	// runs the copy instead (shadowRewrite), and the path-rebase shim is
-	// injected with K3SM_SHADOW_DIR so the pod's own execs of those binaries are
-	// rewritten the same way. The copies are not platform binaries, so dyld
-	// keeps DYLD_INSERT_LIBRARIES (the DNS and path shims) across them. Empty
-	// disables both (today's behaviour).
+	// host binaries in the shadowset list (the shells bash, zsh, dash and env,
+	// bash also serving /bin/sh; tar; the common coreutils such as cat, cp,
+	// sed, awk and grep), made by the installer, root-owned and never writable
+	// by the daemon user. When set, a host-binary container whose argv[0] is
+	// one of the list's exec paths, or a script whose shebang names one, runs
+	// the copy instead (shadowRewrite), and the path-rebase shim is injected
+	// with K3SM_SHADOW_DIR so the pod's own execs of those binaries (kubectl
+	// cp's tar among them) are rewritten the same way, from the shim's table
+	// generated from the same list. The copies are not platform binaries, so
+	// dyld keeps DYLD_INSERT_LIBRARIES (the DNS and path shims) across them. A
+	// copy missing from the directory (a node installed before the list grew)
+	// is not used: the host binary runs, as before. Empty disables both.
 	//
 	// Trust: a copy is used only when the directory and the file are
 	// root-owned, a directory / a regular file (never a symlink), and free of
