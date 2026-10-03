@@ -59,13 +59,46 @@
  * is not root-owned, of the right type (no symlink) and free of group/other
  * write bits, no shadow rewrite happens (the rebase still does).
  *
+ * Restricted-child report (a third job, configured by
+ *   K3SM_SHIM_REPORT  - an absolute file in the pod data volume
+ * and read ONCE, by the same load-time constructor). An exec this shim does
+ * NOT redirect to a shadow copy, and whose final target (the rebased path, or
+ * for a script the interpreter its shebang names) carries the SIP
+ * SF_RESTRICTED file flag, runs WITHOUT this shim: dyld scrubs DYLD_* from a
+ * platform binary, so the child reads host paths where the pod's mounts
+ * should be, and it fails (ENOENT, or a stranger's file) with nothing saying
+ * why. The runtime cannot catch that from outside: such a child commonly
+ * lives for about a millisecond, less than a fork notification plus a
+ * code-signing read takes. So the decision is made here, before the exec,
+ * by the same k3sm_plan_exec that decides the rewrite, and "<target>\n" is
+ * appended to the report file with ONE write(2) for runtimed to read.
+ *
+ * It is only reported when the rebase is enabled (mounts are configured):
+ * with no mount there is no host-path divergence for the child to suffer.
+ *
+ * SF_RESTRICTED is a deliberately conservative proxy for "dyld scrubs DYLD_*":
+ * it is nearly every binary under /bin, /sbin, /usr/bin and /usr/sbin, but it
+ * misses third-party binaries the hardened runtime or library validation keep
+ * the shim out of, and it cannot see the descendants of a platform binary,
+ * which have no shim left to report from. The report is ADVISORY and
+ * forgeable: the pod owns the file and may write anything into it (or delete
+ * it), so it only ever produces a warning, never a decision.
+ *
+ * execve reports BEFORE the real execve, because a successful exec does not
+ * return: the record is "an exec was attempted", and a failed one is
+ * reported too. posix_spawn reports only after it returned 0, in the parent.
+ * The report never changes the exec's outcome, its argv or its envp, and
+ * every failure (EMFILE, EACCES, ENOSPC, a FIFO or a symlink at the path, a
+ * target too long for the buffer) is ignored with errno restored.
+ *
  * Everything on the exec path is async-signal-safe (stack buffers,
- * open/fstat/read/close/lstat, no malloc; the rebase config is parsed at load),
- * because execve is routinely called in a forked child of a multithreaded
- * process.
+ * open/fstat/read/write/close/stat/lstat, no malloc; the rebase config is
+ * parsed at load), because execve is routinely called in a forked child of a
+ * multithreaded process.
  */
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
@@ -242,6 +275,10 @@ DIR *k3sm_opendir(const char *path) {
 static char g_shadow_dir[K3SM_MAXPATH];
 static size_t g_shadow_dir_len;
 
+/* The restricted-child report file (K3SM_SHIM_REPORT), or "" when off. */
+static char g_report_path[K3SM_MAXPATH];
+static size_t g_report_len;
+
 /* The five host paths the copies stand in for, and the copy each maps to.
  * Pinned against the Go shadowCopies map by pkg/runtime
  * TestShadowMapMatchesInterposer: keep one entry per line in this shape. */
@@ -260,6 +297,14 @@ __attribute__((constructor)) static void k3sm_shadow_init(void) {
     /* Settle the rebase config at load too, so an exec in a forked child
      * never runs the (non-async-signal-safe) parse. */
     pthread_once(&g_once, k3sm_pathcfg_init);
+    const char *r = getenv("K3SM_SHIM_REPORT");
+    if (r != NULL && r[0] == '/') {
+        size_t rl = strlen(r);
+        if (rl < sizeof(g_report_path)) { /* else too long: the report stays off */
+            memcpy(g_report_path, r, rl + 1);
+            g_report_len = rl;
+        }
+    }
     const char *d = getenv("K3SM_SHADOW_DIR");
     if (d == NULL || d[0] != '/') {
         return;
@@ -383,6 +428,42 @@ static int k3sm_shebang(const char *path, char *interp, char *arg) {
     return 1;
 }
 
+/*
+ * k3sm_restricted reports whether path names a file carrying the SIP
+ * SF_RESTRICTED flag (the proxy for "dyld will scrub DYLD_* from it"). stat
+ * follows a symlink such as /bin/sh's, which is what the kernel execs too.
+ */
+static int k3sm_restricted(const char *path) {
+    struct stat st;
+    return path != NULL && stat(path, &st) == 0 && (st.st_flags & SF_RESTRICTED) != 0;
+}
+
+/*
+ * k3sm_report appends "<target>\n" to the report file with one write(2).
+ * Async-signal-safe; never fails the caller: every error is ignored and errno
+ * is restored. O_NOFOLLOW refuses a symlink at the path and O_NONBLOCK keeps
+ * a FIFO from blocking the exec; anything but a regular file is not written.
+ */
+static void k3sm_report(const char *target) {
+    int saved = errno;
+    char line[K3SM_MAXPATH + 1];
+    size_t l = target != NULL ? strlen(target) : 0;
+    if (g_report_len != 0 && l != 0 && l < K3SM_MAXPATH && memchr(target, '\n', l) == NULL) {
+        memcpy(line, target, l);
+        line[l] = '\n';
+        int fd = open(g_report_path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+                ssize_t w = write(fd, line, l + 1);
+                (void)w; /* best effort: a short or failed write is dropped */
+            }
+            close(fd);
+        }
+    }
+    errno = saved;
+}
+
 /* What an exec becomes. */
 enum { K3SM_EXEC_ASIS, K3SM_EXEC_PATH, K3SM_EXEC_DIRECT, K3SM_EXEC_SCRIPT };
 
@@ -392,6 +473,8 @@ typedef struct {
     const char *argv0;      /* DIRECT: the new argv[0], or NULL to keep it */
     const char *interp_name; /* SCRIPT: argv[0] (the interpreter as written) */
     const char *script;     /* SCRIPT: the (rebased) script path */
+    int report;              /* the exec runs a restricted binary, unshimmed */
+    const char *report_target; /* report: the file the kernel will run */
     char path_buf[K3SM_MAXPATH];
     char copy_buf[K3SM_MAXPATH];
     char interp[K3SM_MAXPATH];
@@ -412,14 +495,22 @@ typedef struct {
  *      kernel's argv shape and the rebased script path;
  *   4. otherwise the rebased target, if the rebase moved it (PATH), else ASIS.
  * too_many_args (argc > K3SM_MAX_REWRITE_ARGC) limits the plan to PATH.
+ *
+ * Every outcome but the two shadow-copy ones falls through to one exit, where
+ * the plan is marked report when the rebase is enabled and the file the kernel
+ * will actually run (the target, or a read shebang's rebased interpreter) is
+ * SF_RESTRICTED: that exec is not covered, and the child runs without the shim.
  */
 static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_script,
                            int too_many_args, k3sm_exec_plan_t *pl) {
     pl->kind = K3SM_EXEC_ASIS;
+    pl->report = 0;
+    pl->report_target = NULL;
     if (path == NULL) {
         return;
     }
     const char *target = k3sm_rebase(path, pl->path_buf);
+    const char *runs = target; /* what the kernel will execute */
     int moved = target != path;
     int is_sh = 0;
     if (!too_many_args && argv != NULL) {
@@ -442,18 +533,23 @@ static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_sc
                 pl->script = target;
                 return;
             }
+            runs = ri;
             if (ri != pl->interp) {
                 pl->kind = K3SM_EXEC_SCRIPT;
                 pl->exec_path = ri;
                 pl->interp_name = pl->interp;
                 pl->script = target;
-                return;
             }
         }
     }
-    if (moved) {
+    if (pl->kind == K3SM_EXEC_ASIS && moved) {
         pl->kind = K3SM_EXEC_PATH;
         pl->exec_path = target;
+    }
+    /* The single no-shadow-rewrite outcome: is this exec uncovered? */
+    if (g_cfg.enabled && g_report_len != 0 && k3sm_restricted(runs)) {
+        pl->report = 1;
+        pl->report_target = runs;
     }
 }
 
@@ -506,6 +602,11 @@ int k3sm_execve(const char *path, char *const argv[], char *const envp[]) {
     /* execve resolves a relative path against the caller's own cwd, which is
      * also where the shebang read resolves it. */
     k3sm_plan_exec(path, argv, 1, argc > K3SM_MAX_REWRITE_ARGC, &pl);
+    if (pl.report) {
+        /* Before the exec: a successful execve does not return, so this
+         * records an ATTEMPTED exec (a failing one is reported too). */
+        k3sm_report(pl.report_target);
+    }
     switch (pl.kind) {
     case K3SM_EXEC_PATH:
         return execve(pl.exec_path, argv, envp);
@@ -531,18 +632,27 @@ int k3sm_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_action
      * path, and the actions are opaque here, so a relative script is not read. */
     int may_read = path != NULL && (path[0] == '/' || fa == NULL);
     k3sm_plan_exec(path, argv, may_read, argc > K3SM_MAX_REWRITE_ARGC, &pl);
+    int rc;
     switch (pl.kind) {
     case K3SM_EXEC_PATH:
-        return posix_spawn(pid, pl.exec_path, fa, attr, argv, envp);
+        rc = posix_spawn(pid, pl.exec_path, fa, attr, argv, envp);
+        break;
     case K3SM_EXEC_DIRECT:
     case K3SM_EXEC_SCRIPT: {
         char *nargv[argc + 3]; /* sized only now, argc <= K3SM_MAX_REWRITE_ARGC */
         k3sm_fill_argv(&pl, argv, argc, nargv);
-        return posix_spawn(pid, pl.exec_path, fa, attr, nargv, envp);
+        rc = posix_spawn(pid, pl.exec_path, fa, attr, nargv, envp);
+        break;
     }
     default:
-        return posix_spawn(pid, path, fa, attr, argv, envp);
+        rc = posix_spawn(pid, path, fa, attr, argv, envp);
+        break;
     }
+    if (rc == 0 && pl.report) {
+        /* Only a spawn that happened is reported, from the parent. */
+        k3sm_report(pl.report_target);
+    }
+    return rc;
 }
 
 __attribute__((used)) static const interpose_t k3sm_path_interposers[]
