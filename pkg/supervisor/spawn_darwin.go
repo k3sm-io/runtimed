@@ -117,7 +117,14 @@ extern int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *, const int);
 // called). A non-zero *setRC leaves the attribute unset and the spawn proceeds
 // unmarked: this function executes the plan it is handed and decides nothing,
 // the Go side owns the fail-soft policy (pcontrolRetry).
-static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int outFD, int errFD, int syncFD, int pcKill, int *setRC, pid_t *outPid) {
+//
+// keepGroup, when non-zero, drops POSIX_SPAWN_SETSID: the child stays in the
+// caller's session and process group (SpawnSpec.KeepGroup). inFD, when >= 0, is
+// dup2'd onto the child's stdin (0) FIRST and then closed, before any other
+// descriptor moves: every descriptor this process opens is >= 3, so the dup
+// can never clobber a stream fd, and a later dup onto 1, 2 or 3 cannot clobber
+// the stdin it already placed.
+static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int inFD, int outFD, int errFD, int syncFD, int pcKill, int keepGroup, int *setRC, pid_t *outPid) {
 	posix_spawnattr_t attr;
 	posix_spawn_file_actions_t fa;
 	int rc;
@@ -137,7 +144,8 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 	posix_spawnattr_setsigmask(&attr, &emptyMask);
 	posix_spawnattr_setsigdefault(&attr, &allSignals);
 
-	short flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+	short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+	if (!keepGroup) flags |= POSIX_SPAWN_SETSID;
 	posix_spawnattr_setflags(&attr, flags);
 
 	// The pressure-kill mark. Private SPI (see the declaration above), canaried
@@ -163,6 +171,10 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 		if ((rc = k3sm_spawn_addchdir(&fa, dir)) != 0) goto done;
 	}
 
+	if (inFD >= 0) {
+		if ((rc = posix_spawn_file_actions_adddup2(&fa, inFD, 0)) != 0) goto done;
+		if ((rc = posix_spawn_file_actions_addclose(&fa, inFD)) != 0) goto done;
+	}
 	// Each stream onto its own pipe, and the raw descriptor closed in the child
 	// after its dup. The close is not housekeeping: without it the pod holds a
 	// second, un-dup'd fd onto the pipe, so the parent's read never sees EOF
@@ -233,7 +245,8 @@ type PosixSpawner struct {
 	PressureKill bool
 }
 
-// Spawn posix_spawns spec into its own process group and returns the child pid.
+// Spawn posix_spawns spec into its own process group (or, with
+// spec.KeepGroup, into the caller's) and returns the child pid.
 // It passes spec.Env verbatim (so DYLD_INSERT_LIBRARIES flows through to the
 // pod), gives the child spec.Dir as its working directory, and wires
 // spec.StdoutFD and spec.StderrFD as the child's fd 1 and fd 2.
@@ -279,7 +292,10 @@ func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		defer C.free(unsafe.Pointer(cDir))
 	}
 
-	outFD, errFD := C.int(-1), C.int(-1)
+	inFD, outFD, errFD := C.int(-1), C.int(-1), C.int(-1)
+	if spec.StdinFD != 0 {
+		inFD = C.int(spec.StdinFD)
+	}
 	if spec.StdoutFD != 0 {
 		outFD = C.int(spec.StdoutFD)
 	}
@@ -297,9 +313,13 @@ func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		if p.PControl == pcontrolKill {
 			pcKill = 1
 		}
+		keepGroup := C.int(0)
+		if spec.KeepGroup {
+			keepGroup = 1
+		}
 		var pid C.pid_t
 		var setRC C.int
-		rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, outFD, errFD, syncFD, pcKill, &setRC, &pid)
+		rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, inFD, outFD, errFD, syncFD, pcKill, keepGroup, &setRC, &pid)
 		if rc != 0 {
 			return 0, int(setRC), syscallErrno(rc)
 		}
