@@ -15,6 +15,12 @@
   (subpath "/usr")
   (literal "/dev/null") (literal "/dev/zero")
   (literal "/dev/random") (literal "/dev/urandom"))
+;; read: the system TLS configuration (openssl.cnf, the CA bundle,
+;; certs/) — public, world-readable; read-only.
+(allow file-read*
+  (subpath "/etc/ssl")
+  (subpath "/private/etc/ssl")
+  )
 ;; write: validated extra write paths (+ /dev/null); the pod's own
 ;; data volume is re-allowed below, after the protected denies.
 (allow file-write*
@@ -45,6 +51,11 @@
   (subpath "/Users"))
 (deny file-read* file-write*
   (subpath "/private/var/db"))
+;; TLS private-key dir: never readable, whatever the allows name.
+(deny file-read* file-write*
+  (subpath "/etc/ssl/private")
+  (subpath "/private/etc/ssl/private")
+  )
 (deny file-read* file-write*
   (subpath "/var/lib/k3sm/pods")
   (subpath "/private/var/lib/k3sm/pods")
