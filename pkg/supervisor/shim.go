@@ -26,6 +26,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -76,6 +78,11 @@ const (
 	// ShimLogTokenKey is the gRPC metadata key a ReopenLog call names its
 	// handed-off log descriptor by (SendHandoff).
 	ShimLogTokenKey = "k3sm-log-token"
+	// ShimSessionPidKey and ShimSessionStartKey are the response-header keys an
+	// Exec stream reports its session's pid and start time under, once the
+	// session has started (see EndExecSession).
+	ShimSessionPidKey   = "k3sm-session-pid"
+	ShimSessionStartKey = "k3sm-session-start"
 
 	// maxSunPath is the longest unix socket path bind(2) accepts on darwin:
 	// sockaddr_un.sun_path is 104 bytes including the terminating NUL.
@@ -560,4 +567,53 @@ func RecvHandoff(conn *net.UnixConn, accept func(kind byte, token string, f *os.
 		return fmt.Errorf("acknowledge descriptor: %w", err)
 	}
 	return nil
+}
+
+// SessionIdentity reads an exec session's (pid, start time) from its stream's
+// response header, which the shim sends once the session has started; it
+// blocks until then. ok is false when the header carries none (the session
+// never started).
+func SessionIdentity(sc shimv1.ContainerShim_ExecClient) (pid int, start int64, ok bool) {
+	md, err := sc.Header()
+	if err != nil {
+		return 0, 0, false
+	}
+	pids, starts := md.Get(ShimSessionPidKey), md.Get(ShimSessionStartKey)
+	if len(pids) != 1 || len(starts) != 1 {
+		return 0, 0, false
+	}
+	p, perr := strconv.Atoi(pids[0])
+	st, serr := strconv.ParseInt(starts[0], 10, 64)
+	if perr != nil || serr != nil || p <= 1 || st == 0 {
+		return 0, 0, false
+	}
+	return p, st, true
+}
+
+// EndExecSession enforces the exec-session invariant from the daemon's side: a
+// session ends with its stream. Exec sessions lead their own session or group,
+// outside the pod group, so a group kill that takes the shim down (a delete, an
+// OOM kill, a grace expiry) leaves them running with nobody to stop them. When a
+// proxied stream ends for any reason the daemon calls this: while pid is still
+// EXACTLY the reported instance (procStart equals start; a recycled pid is never
+// signalled), its group gets SIGTERM, then SIGKILL once grace has passed.
+func EndExecSession(pid int, start int64, procStart func(int) (int64, bool), signal func(pgid int, sig os.Signal) error, grace time.Duration) {
+	same := func() bool {
+		got, ok := procStart(pid)
+		return ok && got == start
+	}
+	if pid <= 1 || !same() {
+		return
+	}
+	_ = signal(pid, syscall.SIGTERM)
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if !same() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if same() {
+		_ = signal(pid, syscall.SIGKILL)
+	}
 }

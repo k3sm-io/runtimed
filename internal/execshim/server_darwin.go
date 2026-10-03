@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +81,11 @@ type shimServer struct {
 	// may name another process, so neither the signal forwarder nor the Signal
 	// RPC signals it.
 	reaped atomic.Bool
+
+	// sessions holds the pids of live exec sessions (each its own group
+	// leader), guarded by sessMu, so the shim's exit can stop them.
+	sessMu   sync.Mutex
+	sessions map[int]struct{}
 
 	mu     sync.Mutex
 	exit   *supervisor.ExitRecord
@@ -240,8 +246,26 @@ func (s *shimServer) Exec(stream shimv1.ContainerShim_ExecServer) error {
 	cmd := exec.CommandContext(stream.Context(), s.self, args...)
 	cmd.Env = s.spec.ExecEnv
 	cmd.Dir = s.spec.ExecDir
+	onStart := func(pid int) {
+		s.sessMu.Lock()
+		s.sessions[pid] = struct{}{}
+		s.sessMu.Unlock()
+		// The session's identity, so the daemon can tear it down with the
+		// stream even when this shim is gone (supervisor.EndExecSession).
+		start, _ := supervisor.ProcStartTimeNano(pid)
+		_ = stream.SendHeader(metadata.Pairs(
+			supervisor.ShimSessionPidKey, strconv.Itoa(pid),
+			supervisor.ShimSessionStartKey, strconv.FormatInt(start, 10)))
+	}
+	defer func() {
+		if cmd.Process != nil {
+			s.sessMu.Lock()
+			delete(s.sessions, cmd.Process.Pid)
+			s.sessMu.Unlock()
+		}
+	}()
 	if !first.GetTty() {
-		return execsession.Run(stream, cmd, false, first.GetStdin())
+		return execsession.Run(stream, cmd, false, first.GetStdin(), onStart)
 	}
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	tokens := md.Get(supervisor.ShimPtyTokenKey)
@@ -252,7 +276,7 @@ func (s *shimServer) Exec(stream shimv1.ContainerShim_ExecServer) error {
 	if slave == nil {
 		return status.Error(codes.FailedPrecondition, "exec: no handed-off terminal for this session")
 	}
-	return execsession.RunOnSlave(stream, cmd, slave)
+	return execsession.RunOnSlave(stream, cmd, slave, onStart)
 }
 
 // writeLog drains r into the CRI log and the followers. A dropped-bytes count
@@ -273,6 +297,15 @@ func (s *shimServer) writeLog(r *ring, stream crilog.Stream) {
 		return nil
 	})
 	report()
+}
+
+// killSessions SIGKILLs the group of every exec session still running.
+func (s *shimServer) killSessions() {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	for pid := range s.sessions {
+		_ = unix.Kill(-pid, unix.SIGKILL)
+	}
 }
 
 // acceptHandoffs receives handed-off descriptors until the listener closes.

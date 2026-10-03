@@ -342,6 +342,58 @@ func TestResidentShimSurvivesTheDaemon(t *testing.T) {
 	t.Logf("log continuous over %s ticks", strconv.Itoa(ticks(t, rs.logPath)))
 }
 
+// TestExecSessionDiesWithItsStream pins the exec-session invariant against a
+// group kill: an exec session leads its own group outside the pod's, so the
+// SIGKILL that takes the shim down leaves it running (asserted first: the
+// hazard is real), and the daemon's side of the stream, EndExecSession with the
+// identity the shim reported, is what ends it.
+func TestExecSessionDiesWithItsStream(t *testing.T) {
+	rs := startResidentShim(t)
+	conn := rs.proc.Shim()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc, err := conn.Exec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Send(&runtimev1.ExecRequest{Container: "c", Command: []string{"/bin/sleep", "30"}}); err != nil {
+		t.Fatal(err)
+	}
+	pid, start, ok := supervisor.SessionIdentity(sc)
+	if !ok {
+		t.Fatal("the shim reported no session identity")
+	}
+	t.Cleanup(func() { _ = supervisor.SignalGroup(pid, syscall.SIGKILL) })
+	if got, alive := supervisor.ProcStartTimeNano(pid); !alive || got != start {
+		t.Fatalf("session %d is not the reported instance (start %d, reported %d)", pid, got, start)
+	}
+
+	if err := supervisor.SignalGroup(rs.proc.PID(), syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer wcancel()
+	if _, _, err := rs.proc.Wait(waitCtx); err != nil && waitCtx.Err() != nil {
+		t.Fatal("the shim survived its group SIGKILL")
+	}
+	if _, err := sc.Recv(); err == nil {
+		t.Fatal("the exec stream outlived its shim")
+	}
+	if _, alive := supervisor.ProcStartTimeNano(pid); !alive {
+		t.Fatal("the session died with the shim: the hazard this test guards is not reproduced")
+	}
+
+	supervisor.EndExecSession(pid, start, supervisor.ProcStartTimeNano, supervisor.SignalGroup, 2*time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, alive := supervisor.ProcStartTimeNano(pid); !alive || got != start {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("exec session %d outlived its stream", pid)
+}
+
 // TestShimReopensTheLogFromAHandedDescriptor pins log rotation without a path
 // grant: the log is renamed away, the new file is created and opened HERE (as
 // the daemon does) and handed over, and the confined shim's output continues in

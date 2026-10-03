@@ -233,6 +233,7 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 		exited:     make(chan struct{}),
 		exitFile:   exitFile,
 		handoffs:   newHandoffStore(),
+		sessions:   map[int]struct{}{},
 	}
 	s.pumps.Add(2)
 	go s.pump(outR, s.out, crilog.StreamStdout)
@@ -314,6 +315,9 @@ func (s *shimServer) run(sigs chan os.Signal) int {
 		time.Sleep(20 * time.Millisecond)
 	}
 	s.grpc.Stop()
+	// The shim's orderly exit takes its exec sessions with it: each leads its
+	// own group outside the pod's, so nothing else would stop them.
+	s.killSessions()
 	_ = s.logw.Close()
 	if werr != nil {
 		return supervisor.ShimExitSetup

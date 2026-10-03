@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,9 @@ type fakeShim struct {
 	mu            sync.Mutex
 	execs         []*runtimev1.ExecRequest
 	handed        map[string]*os.File // log descriptors handed over, by token
+	// session, when set, is reported as the exec session's identity.
+	sessionPid   int
+	sessionStart int64
 }
 
 // keep is the fake's hand-off store.
@@ -80,7 +84,14 @@ func (f *fakeShim) Exec(stream shimv1.ContainerShim_ExecServer) error {
 	}
 	f.mu.Lock()
 	f.execs = append(f.execs, first)
+	pid, start := f.sessionPid, f.sessionStart
 	f.mu.Unlock()
+	if pid != 0 {
+		if err := stream.SendHeader(metadata.Pairs(supervisor.ShimSessionPidKey, strconv.Itoa(pid),
+			supervisor.ShimSessionStartKey, strconv.FormatInt(start, 10))); err != nil {
+			return err
+		}
+	}
 	if err := stream.Send(&runtimev1.ExecResponse{Stdout: []byte("from-shim\n")}); err != nil {
 		return err
 	}
@@ -277,6 +288,41 @@ func TestAttachReconnectsToTheShim(t *testing.T) {
 		if len(w.shim.execs) != 1 || w.shim.execs[0].GetContainer() != "main" || w.shim.execs[0].GetCommand()[0] != "/bin/echo" {
 			t.Fatalf("the shim saw %+v, want one exec of /bin/echo naming container main", w.shim.execs)
 		}
+	})
+
+	t.Run("the daemon ends an exec session with its stream", func(t *testing.T) {
+		const sessPid, sessStart = 4321, int64(99)
+		g, s := live()
+		s[sessPid] = sessStart
+		shim := healthy()
+		shim.sessionPid, shim.sessionStart = sessPid, sessStart
+		w := setup(t, g, s, shim)
+		var mu sync.Mutex
+		var sigs []string
+		w.rt.signalGroup = func(pgid int, sig os.Signal) error {
+			mu.Lock()
+			defer mu.Unlock()
+			sigs = append(sigs, strconv.Itoa(pgid)+":"+sig.String())
+			return nil
+		}
+		attach(t, w)
+		if _, _, err := execOnce(t, w); err != nil {
+			t.Fatal(err)
+		}
+		// The fake session never dies, so the teardown escalates.
+		deadline := time.Now().Add(execSessionGrace + 3*time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			got := strings.Join(sigs, ",")
+			mu.Unlock()
+			if got == "4321:terminated,4321:killed" {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("signals = %v, want TERM then KILL to the session's group 4321", sigs)
 	})
 
 	t.Run("reopen log creates the new file then asks the shim", func(t *testing.T) {

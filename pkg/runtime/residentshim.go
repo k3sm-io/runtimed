@@ -37,6 +37,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	shimv1 "k3sm.io/apis/shim/v1"
 )
 
 // Resident shims: every host-process container runs beside its own resident
@@ -285,6 +286,25 @@ func (r *Runtime) shimCrashed(ctx context.Context, p *pod, cp *containerProc) bo
 	return true
 }
 
+// execSessionGrace is how long an exec session whose stream ended has between
+// SIGTERM and SIGKILL (supervisor.EndExecSession).
+const execSessionGrace = 2 * time.Second
+
+// endSessionWithStream arranges, once the shim reported the session's identity,
+// for the session to be torn down when the proxy returns, for any reason: exec
+// sessions run outside the pod group, so a group kill that took the shim down
+// would otherwise leave them running. The teardown re-verifies the exact
+// instance before every signal.
+func (r *Runtime) endSessionWithStream(sc shimv1.ContainerShim_ExecClient) func() {
+	pid, start, ok := supervisor.SessionIdentity(sc)
+	if !ok {
+		return func() {}
+	}
+	return func() {
+		go supervisor.EndExecSession(pid, start, r.procStart, r.signalGroup, execSessionGrace)
+	}
+}
+
 // execViaShim proxies an Exec on a shim-backed container to the shim's
 // ContainerShim.Exec. A non-tty session is a frame-for-frame proxy. A tty
 // session gets a pty this daemon allocates (a confined shim cannot): the slave
@@ -303,6 +323,7 @@ func (r *Runtime) execViaShim(stream runtimev1.Runtime_ExecServer, conn *supervi
 		if err := sc.Send(req); err != nil {
 			return status.Errorf(codes.Unavailable, "exec: %v", err)
 		}
+		defer r.endSessionWithStream(sc)()
 		go func() {
 			for {
 				in, err := stream.Recv()
@@ -342,6 +363,7 @@ func (r *Runtime) execViaShim(stream runtimev1.Runtime_ExecServer, conn *supervi
 	if err := sc.Send(req); err != nil {
 		return status.Errorf(codes.Unavailable, "exec: %v", err)
 	}
+	defer r.endSessionWithStream(sc)()
 	var sendMu sync.Mutex
 	send := func(resp *runtimev1.ExecResponse) error {
 		sendMu.Lock()

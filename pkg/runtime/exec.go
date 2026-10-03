@@ -138,7 +138,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	}
 	cmd.Env = cmdEnv
 	cmd.Dir = dir
-	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin())
+	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin(), nil)
 }
 
 // Attach attaches to an already-running container's streams (`kubectl attach`).

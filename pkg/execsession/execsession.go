@@ -54,8 +54,10 @@ type Stream interface {
 //
 // With tty the command gets a fresh pty and its own session with the pty as
 // controlling terminal (Setsid+Setctty); without, its own process group
-// (Setpgid), so a client ^C never reaches the server.
-func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool) error {
+// (Setpgid), so a client ^C never reaches the server. Either way the session's
+// pid is its group id. onStart, when non-nil, is called with that pid once the
+// command has started.
+func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool, onStart func(pid int)) error {
 	send := serializedSend(stream)
 
 	var (
@@ -78,6 +80,7 @@ func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool) error {
 			_ = master.Close()
 			return status.Errorf(codes.Internal, "exec: start: %v", err)
 		}
+		started(cmd, onStart)
 		_ = slave.Close() // the child holds its dup; the parent keeps only the master
 		if wantStdin {
 			stdinW = master
@@ -109,6 +112,7 @@ func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool) error {
 		if err := cmd.Start(); err != nil {
 			return status.Errorf(codes.Internal, "exec: start: %v", err)
 		}
+		started(cmd, onStart)
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -160,8 +164,8 @@ func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool) error {
 // and resizes move through the master. Client frames that still arrive are
 // drained and ignored. It is a resident shim's tty session: the daemon
 // allocated the pty (a confined shim cannot) and handed the slave over. Run
-// closes slave once the command holds it.
-func RunOnSlave(stream Stream, cmd *exec.Cmd, slave *os.File) error {
+// closes slave once the command holds it. onStart is as for Run.
+func RunOnSlave(stream Stream, cmd *exec.Cmd, slave *os.File, onStart func(pid int)) error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
 	err := cmd.Start()
@@ -169,6 +173,7 @@ func RunOnSlave(stream Stream, cmd *exec.Cmd, slave *os.File) error {
 	if err != nil {
 		return status.Errorf(codes.Internal, "exec: start: %v", err)
 	}
+	started(cmd, onStart)
 	go func() {
 		for {
 			if _, err := stream.Recv(); err != nil {
@@ -177,6 +182,13 @@ func RunOnSlave(stream Stream, cmd *exec.Cmd, slave *os.File) error {
 		}
 	}()
 	return sendExit(serializedSend(stream), cmd.Wait())
+}
+
+// started reports a started command's pid to onStart, if any.
+func started(cmd *exec.Cmd, onStart func(pid int)) {
+	if onStart != nil && cmd.Process != nil {
+		onStart(cmd.Process.Pid)
+	}
 }
 
 // serializedSend wraps stream.Send in a mutex.
