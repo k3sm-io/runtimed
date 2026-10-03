@@ -47,6 +47,23 @@ func TestExitRecordRoundTrip(t *testing.T) {
 	if _, err := os.Stat(dir + "/" + ShimExitFile + ".tmp"); !os.IsNotExist(err) {
 		t.Fatalf("the tmp file survived the rename: %v", err)
 	}
+	// A record mid-write or never written (the shim opens the file at bring-up)
+	// reads as "no record yet", never as an error or a status.
+	for _, torn := range []string{"", `{"exitCode":1`} {
+		if err := os.WriteFile(dir+"/"+ShimExitFile, []byte(torn), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := ReadExitRecord(dir); ok || err != nil {
+			t.Fatalf("record %q: ok=%v err=%v, want no record and no error", torn, ok, err)
+		}
+	}
+	// Rewritten in place over a longer previous content, the record is exact.
+	if err := WriteExitRecord(dir, ExitRecord{ExitCode: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, _ := ReadExitRecord(dir); !ok || got != (ExitRecord{ExitCode: 1}) {
+		t.Fatalf("rewritten record = %+v ok=%v", got, ok)
+	}
 	if err := RemoveExitRecord(dir); err != nil {
 		t.Fatal(err)
 	}

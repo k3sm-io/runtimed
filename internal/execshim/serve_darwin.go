@@ -66,7 +66,9 @@ const stopGrace = 2 * time.Second
 //     once and never written anywhere) and its shim profile text;
 //  2. checks both socket paths fit sun_path (a typed exit,
 //     supervisor.ShimExitSunPath, on overflow), then binds and listens;
-//  3. opens the container's CRI log for append;
+//  3. opens the container's CRI log for append and its exit record for
+//     writing, and keeps both descriptors: after confinement the shim opens no
+//     writable path at all (a rotated log arrives as a handed-over descriptor);
 //  4. posix_spawns the container: itself in launch mode, marked
 //     pcontrol-KILL, in the shim's own process group and session
 //     (SpawnSpec.KeepGroup), with a pipe per output stream and the daemon's
@@ -77,9 +79,8 @@ const stopGrace = 2 * time.Second
 //     log to the pod credential and drops to it (no drop ever happens in the
 //     shipped unprivileged posture);
 //  6. sandbox_applies its SHIM profile: the pod profile plus the shim grant
-//     (sandbox.ShimProfile), which adds only this container's own artifacts —
-//     reading its shim dir, writing its exit record, appending to its log, and
-//     ioctls on a tty it was handed;
+//     (sandbox.ShimProfile), which writes nothing: reading its shim dir,
+//     ioctls on a tty it was handed, and signals to its own children and group;
 //  7. serves, and redirects its stdout and stderr to /dev/null: the daemon's
 //     diagnostics pipe reaching EOF is the readiness signal.
 //
@@ -88,14 +89,18 @@ const stopGrace = 2 * time.Second
 // that the shim could not confine.
 //
 // What an exec session inherits: the shim forks it, so it runs under the shim
-// profile — the pod profile plus that grant, every widened item being this
-// container's own artifact. A shim-served Exec therefore reaches the pod's
+// profile — the pod profile plus that grant. Because the grant writes nothing, a
+// session can neither forge the exit record nor rewrite the log. A shim-served Exec therefore reaches the pod's
 // confinement without the apiserver's pods/exec RBAC or audit only for a caller
 // that can already reach the shim's socket, which every pod profile denies.
 //
 // The shim exits after the container has, once both output streams drained (or
 // drainGrace passed) and the exit record is persisted.
 func Serve() int {
+	// Before anything else: a SIGTERM delivered during bring-up must be held for
+	// the container (run forwards it), never kill the shim by default action.
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	spec, err := supervisor.DecodeShimSpec(os.Stdin)
 	if err != nil {
 		return failf(supervisor.ShimExitSpec, "read launch spec: %v", err)
@@ -107,7 +112,7 @@ func Serve() int {
 	if err != nil {
 		return failf(code, "%v", err)
 	}
-	return s.run()
+	return s.run(sigs)
 }
 
 // failf reports a bring-up failure on stderr, which the daemon reads, and
@@ -171,6 +176,10 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 	if err != nil {
 		return nil, supervisor.ShimExitSetup, err
 	}
+	exitFile, err := supervisor.OpenExitRecord(spec.Dir)
+	if err != nil {
+		return nil, supervisor.ShimExitSetup, err
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return nil, supervisor.ShimExitSetup, fmt.Errorf("locate self: %w", err)
@@ -222,7 +231,8 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 		out:        newRing(ringBytes),
 		errs:       newRing(ringBytes),
 		exited:     make(chan struct{}),
-		ptys:       newPtyStore(),
+		exitFile:   exitFile,
+		handoffs:   newHandoffStore(),
 	}
 	s.pumps.Add(2)
 	go s.pump(outR, s.out, crilog.StreamStdout)
@@ -243,7 +253,7 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 	s.grpc = grpc.NewServer(grpc.KeepaliveEnforcementPolicy(supervisor.ShimKeepaliveEnforcement))
 	shimv1.RegisterContainerShimServer(s.grpc, s)
 	go func() { _ = s.grpc.Serve(ln) }()
-	go s.acceptPtys(ptyLn)
+	go s.acceptHandoffs(ptyLn)
 	for _, fd := range []int{1, 2} {
 		if err := redirectNull(fd); err != nil {
 			return abort(supervisor.ShimExitSetup, fmt.Errorf("release the diagnostics pipe: %w", err))
@@ -253,24 +263,21 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 }
 
 // run reaps the container, persists its exit, and shuts the shim down. A
-// SIGTERM, SIGINT or SIGHUP the shim receives is forwarded to the container
-// while it runs: the daemon's graceful stop targets the container, and a shim
-// that died of the signal would take the container's status with it.
-func (s *shimServer) run() int {
-	sigs := make(chan os.Signal, 4)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+// SIGTERM, SIGINT or SIGHUP the shim receives (sigs, installed at the top of
+// Serve) is forwarded to the container until it is reaped — never after, when
+// its pid may already name another process.
+func (s *shimServer) run(sigs chan os.Signal) int {
 	go func() {
 		for sig := range sigs {
-			select {
-			case <-s.exited:
-				return
-			default:
+			if s.reaped.Load() {
+				continue
 			}
 			_ = unix.Kill(s.child, sig.(syscall.Signal))
 		}
 	}()
 
 	code, sig, err := supervisor.KqueueReaper{}.WaitExit(context.Background(), s.child)
+	s.reaped.Store(true)
 	if err != nil {
 		// Unreachable for a child of this process; report it as a kill so the
 		// record never reads as success.
@@ -286,7 +293,8 @@ func (s *shimServer) run() int {
 	case <-time.After(drainGrace):
 	}
 	rec := supervisor.ExitRecord{ExitCode: code, Signal: sig, FinishedAtUnixNano: time.Now().UnixNano()}
-	werr := supervisor.WriteExitRecord(s.spec.Dir, rec)
+	werr := supervisor.WriteExitRecordTo(s.exitFile, rec)
+	_ = s.exitFile.Close()
 	s.mu.Lock()
 	if werr == nil {
 		s.exit = &rec
@@ -298,8 +306,10 @@ func (s *shimServer) run() int {
 
 	// Exec sessions still open when the container exited keep the shim
 	// serving, Status included, until they end or stopGrace passes; with none
-	// open it stops at once, so a container's exit is never reported late.
-	// (GracefulStop would refuse every new RPC while it waited.)
+	// open it stops at once. (GracefulStop would refuse every new RPC while it
+	// waited.) The exit can still be reported up to drainGrace late: a forked
+	// descendant that keeps the container's output pipes open holds the record
+	// back until the drain bound above passes.
 	for deadline := time.Now().Add(stopGrace); s.execs.Load() > 0 && time.Now().Before(deadline); {
 		time.Sleep(20 * time.Millisecond)
 	}

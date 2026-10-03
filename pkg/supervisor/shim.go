@@ -52,13 +52,14 @@ import (
 const (
 	// ShimSockName is the gRPC socket in a container's shim dir.
 	ShimSockName = "shim.sock"
-	// ShimPtySockName is the pty hand-off socket in a container's shim dir (see
-	// SendPtyHandoff).
+	// ShimPtySockName is the descriptor hand-off socket in a container's shim
+	// dir: pty slaves and rotated log files (see SendHandoff).
 	ShimPtySockName = "pty.sock"
 	// ShimExitFile is the persisted exit record in a container's shim dir. It is
 	// the AUTHORITY for the container's exit status on every path: the shim
-	// writes it (tmp + rename) after it reaped the container and before it
-	// exits, and the daemon reads it when it observes the shim's exit.
+	// writes it (in place, through a descriptor it opened before confinement;
+	// see OpenExitRecord) after it reaped the container and before it exits,
+	// and the daemon reads it when it observes the shim's exit.
 	ShimExitFile = "exit.json"
 
 	// ShimModeServe, ShimModeLaunch and ShimModeExec are the exec-shim's first
@@ -70,8 +71,11 @@ const (
 	ShimModeExec   = "exec"
 
 	// ShimPtyTokenKey is the gRPC metadata key an Exec stream names its handed-off
-	// pty slave by (SendPtyHandoff). Present only on a tty session.
+	// pty slave by (SendHandoff). Present only on a tty session.
 	ShimPtyTokenKey = "k3sm-pty-token"
+	// ShimLogTokenKey is the gRPC metadata key a ReopenLog call names its
+	// handed-off log descriptor by (SendHandoff).
+	ShimLogTokenKey = "k3sm-log-token"
 
 	// maxSunPath is the longest unix socket path bind(2) accepts on darwin:
 	// sockaddr_un.sun_path is 104 bytes including the terminating NUL.
@@ -121,7 +125,7 @@ var (
 // ShimSockPath is the gRPC socket in shim dir dir.
 func ShimSockPath(dir string) string { return filepath.Join(dir, ShimSockName) }
 
-// ShimPtySockPath is the pty hand-off socket in shim dir dir.
+// ShimPtySockPath is the descriptor hand-off socket in shim dir dir.
 func ShimPtySockPath(dir string) string { return filepath.Join(dir, ShimPtySockName) }
 
 // CheckSunPath returns ErrSunPathTooLong when path cannot be bound as a unix
@@ -143,26 +147,59 @@ type ExitRecord struct {
 	FinishedAtUnixNano int64 `json:"finishedAtUnixNano"`
 }
 
-// WriteExitRecord persists rec in dir as ShimExitFile, through a tmp file and a
-// rename (the podreap record idiom), so a reader sees the whole record or none.
-func WriteExitRecord(dir string, rec ExitRecord) error {
+// OpenExitRecord opens (creating) dir's exit record for the shim to write at
+// exit. The shim opens it BEFORE it confines itself and keeps the descriptor
+// (close-on-exec), so its profile grants no write on any path in its dir: an
+// exec session, which inherits that profile, can neither forge the record nor
+// replace it.
+//
+// The plan wrote the record through a tmp file and a rename. That needs a
+// create-and-rename grant on two paths in the shim dir, which every exec
+// session would inherit; writing in place through the held descriptor needs
+// none. The cost is atomicity: a reader can see an empty or torn file, and
+// ReadExitRecord reads either as "no record yet" (with the shim alive its
+// Status answers; with it dead, the daemon's recorded kill intent or an
+// unknown status stands, as for a missing record).
+func OpenExitRecord(dir string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(dir, ShimExitFile), os.O_RDWR|os.O_CREATE|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open exit record: %w", err)
+	}
+	return f, nil
+}
+
+// WriteExitRecordTo writes rec into f in place: pwrite at offset 0, truncate to
+// the record's length, fsync.
+func WriteExitRecordTo(f *os.File, rec ExitRecord) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshal exit record: %w", err)
 	}
-	final := filepath.Join(dir, ShimExitFile)
-	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if _, err := f.WriteAt(data, 0); err != nil {
 		return fmt.Errorf("write exit record: %w", err)
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		return fmt.Errorf("commit exit record: %w", err)
+	if err := f.Truncate(int64(len(data))); err != nil {
+		return fmt.Errorf("truncate exit record: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync exit record: %w", err)
 	}
 	return nil
 }
 
+// WriteExitRecord persists rec in dir (OpenExitRecord + WriteExitRecordTo).
+func WriteExitRecord(dir string, rec ExitRecord) error {
+	f, err := OpenExitRecord(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	return WriteExitRecordTo(f, rec)
+}
+
 // ReadExitRecord reads dir's exit record. ok is false, with a nil error, when
-// there is none yet.
+// there is none yet — including an empty or unparseable file, which is what a
+// record mid-write (or never written) looks like (see OpenExitRecord).
 func ReadExitRecord(dir string) (rec ExitRecord, ok bool, err error) {
 	data, err := os.ReadFile(filepath.Join(dir, ShimExitFile))
 	if errors.Is(err, os.ErrNotExist) {
@@ -171,8 +208,8 @@ func ReadExitRecord(dir string) (rec ExitRecord, ok bool, err error) {
 	if err != nil {
 		return ExitRecord{}, false, fmt.Errorf("read exit record: %w", err)
 	}
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return ExitRecord{}, false, fmt.Errorf("decode exit record: %w", err)
+	if len(data) == 0 || json.Unmarshal(data, &rec) != nil {
+		return ExitRecord{}, false, nil
 	}
 	return rec, true, nil
 }
@@ -393,14 +430,29 @@ func (c *ShimConn) Signal(ctx context.Context, sig int, group bool) error {
 	return err
 }
 
-// ReopenLog asks the shim to reopen the container's log at its path, bounded by
-// ShimReopenTimeout. The daemon has already created the new, empty file there:
-// the shim only opens it.
-func (c *ShimConn) ReopenLog(ctx context.Context) error {
+// ReopenLog hands the shim f, the container's new log file the daemon created
+// and opened, and asks it to write there from now on, bounded by
+// ShimReopenTimeout. The shim never opens a log path after it confined itself,
+// so no path grant lets an exec session reach the log.
+func (c *ShimConn) ReopenLog(ctx context.Context, f *os.File) error {
 	ctx, cancel := context.WithTimeout(ctx, ShimReopenTimeout)
 	defer cancel()
-	_, err := c.client.ReopenLog(ctx, &shimv1.ReopenLogRequest{Container: c.id.Container})
+	token, err := c.handoff(ctx, HandoffLog, f)
+	if err != nil {
+		return err
+	}
+	_, err = c.client.ReopenLog(metadata.AppendToOutgoingContext(ctx, ShimLogTokenKey, token), &shimv1.ReopenLogRequest{Container: c.id.Container})
 	return err
+}
+
+// handoff passes f to the shim over its hand-off socket and returns the token.
+func (c *ShimConn) handoff(ctx context.Context, kind byte, f *os.File) (string, error) {
+	conn, err := dialVerified(ctx, c.dialer, ShimPtySockPath(c.id.Dir), c.id.Pid)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }()
+	return SendHandoff(conn, kind, f)
 }
 
 // Exec opens an exec stream; the caller sends the first ExecRequest.
@@ -413,12 +465,7 @@ func (c *ShimConn) Exec(ctx context.Context) (shimv1.ContainerShim_ExecClient, e
 // the caller and the master directly, and the shim stream carries only the
 // session's exit.
 func (c *ShimConn) ExecTTY(ctx context.Context, slave *os.File) (shimv1.ContainerShim_ExecClient, error) {
-	conn, err := dialVerified(ctx, c.dialer, ShimPtySockPath(c.id.Dir), c.id.Pid)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = conn.Close() }()
-	token, err := SendPtyHandoff(conn, slave)
+	token, err := c.handoff(ctx, HandoffPty, slave)
 	if err != nil {
 		return nil, err
 	}
@@ -433,67 +480,84 @@ func (c *ShimConn) Follow(ctx context.Context) (shimv1.ContainerShim_FollowClien
 // Close closes the connection. The shim keeps running.
 func (c *ShimConn) Close() error { return c.cc.Close() }
 
-// ptyTokenBytes is the hand-off token's length.
-const ptyTokenBytes = 16
+// handoffTokenBytes is the hand-off token's length.
+const handoffTokenBytes = 16
 
-// SendPtyHandoff passes slave to the shim over conn (SCM_RIGHTS) with a fresh
-// random token, waits for the shim's one-byte acknowledgement, and returns the
-// token hex-encoded for the Exec stream's ShimPtyTokenKey metadata.
+// The hand-off kinds: the first byte of a hand-off message names what the
+// descriptor is for, so a pty slave can never be claimed as a log or the reverse.
+const (
+	HandoffPty byte = 'p'
+	HandoffLog byte = 'l'
+)
+
+// SendHandoff passes f to the shim over conn (SCM_RIGHTS) with its kind and a
+// fresh random token, waits for the shim's one-byte acknowledgement, and returns
+// the token hex-encoded for the RPC that claims it (ShimPtyTokenKey on an Exec,
+// ShimLogTokenKey on a ReopenLog).
 //
-// Why the slave crosses a socket at all: the shim is confined by the pod's
-// profile plus its grant, and a confined process cannot open /dev/ptmx or a
-// tty node. The daemon allocates the pty unconfined, keeps the master, and
-// hands only the slave over, so a confined exec session gets a terminal without
-// the shim ever holding a grant that would reach another session's tty.
-func SendPtyHandoff(conn net.Conn, slave *os.File) (string, error) {
+// Why descriptors cross a socket at all: the shim is confined, and its profile
+// grants no open of a terminal and no write on any path. The daemon opens the
+// pty (keeping the master) or the rotated log, unconfined, and hands over only
+// the descriptor, so the shim — and every exec session inheriting its profile —
+// reaches nothing by path.
+func SendHandoff(conn net.Conn, kind byte, f *os.File) (string, error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
-		return "", errors.New("pty hand-off needs a unix socket")
+		return "", errors.New("descriptor hand-off needs a unix socket")
 	}
-	token := make([]byte, ptyTokenBytes)
-	if _, err := rand.Read(token); err != nil {
-		return "", fmt.Errorf("pty hand-off token: %w", err)
+	msg := make([]byte, 1+handoffTokenBytes)
+	msg[0] = kind
+	if _, err := rand.Read(msg[1:]); err != nil {
+		return "", fmt.Errorf("hand-off token: %w", err)
 	}
-	if _, _, err := uc.WriteMsgUnix(token, unix.UnixRights(int(slave.Fd())), nil); err != nil {
-		return "", fmt.Errorf("send pty slave: %w", err)
+	if _, _, err := uc.WriteMsgUnix(msg, unix.UnixRights(int(f.Fd())), nil); err != nil {
+		return "", fmt.Errorf("send descriptor: %w", err)
 	}
 	var ack [1]byte
 	_ = uc.SetReadDeadline(time.Now().Add(ShimSignalTimeout))
 	if _, err := io.ReadFull(uc, ack[:]); err != nil {
-		return "", fmt.Errorf("pty hand-off acknowledgement: %w", err)
+		return "", fmt.Errorf("descriptor hand-off acknowledgement: %w", err)
 	}
-	return fmt.Sprintf("%x", token), nil
+	if ack[0] != 1 {
+		return "", errors.New("the shim refused the descriptor")
+	}
+	return fmt.Sprintf("%x", msg[1:]), nil
 }
 
-// RecvPtyHandoff is the shim's half of SendPtyHandoff: it reads the token and the
-// descriptor from conn, acknowledges, and returns them.
-func RecvPtyHandoff(conn *net.UnixConn) (string, *os.File, error) {
-	buf := make([]byte, ptyTokenBytes)
+// RecvHandoff is the shim's half of SendHandoff: it reads the kind, token and
+// descriptor from conn. accept decides whether the shim keeps it (a full store
+// refuses); the answer is sent back as the acknowledgement, and a refused
+// descriptor is closed here.
+func RecvHandoff(conn *net.UnixConn, accept func(kind byte, token string, f *os.File) bool) error {
+	buf := make([]byte, 1+handoffTokenBytes)
 	oob := make([]byte, unix.CmsgSpace(4))
 	_ = conn.SetReadDeadline(time.Now().Add(ShimSignalTimeout))
 	n, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
 	if err != nil {
-		return "", nil, fmt.Errorf("receive pty slave: %w", err)
+		return fmt.Errorf("receive descriptor: %w", err)
 	}
 	msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
 	if err != nil || len(msgs) != 1 {
-		return "", nil, fmt.Errorf("receive pty slave: no descriptor (%v)", err)
+		return fmt.Errorf("receive descriptor: none attached (%v)", err)
 	}
 	fds, err := unix.ParseUnixRights(&msgs[0])
 	if err != nil || len(fds) != 1 {
 		for _, fd := range fds {
 			_ = unix.Close(fd)
 		}
-		return "", nil, fmt.Errorf("receive pty slave: want one descriptor (%v)", err)
+		return fmt.Errorf("receive descriptor: want one (%v)", err)
 	}
-	f := os.NewFile(uintptr(fds[0]), "pty-slave")
-	if n != ptyTokenBytes {
+	f := os.NewFile(uintptr(fds[0]), "handoff")
+	kept := n == len(buf) && (buf[0] == HandoffPty || buf[0] == HandoffLog) &&
+		accept(buf[0], fmt.Sprintf("%x", buf[1:]), f)
+	ack := byte(0)
+	if kept {
+		ack = 1
+	} else {
 		_ = f.Close()
-		return "", nil, fmt.Errorf("receive pty slave: token of %d bytes", n)
 	}
-	if _, err := conn.Write([]byte{1}); err != nil {
-		_ = f.Close()
-		return "", nil, fmt.Errorf("acknowledge pty slave: %w", err)
+	if _, err := conn.Write([]byte{ack}); err != nil {
+		return fmt.Errorf("acknowledge descriptor: %w", err)
 	}
-	return fmt.Sprintf("%x", buf), f, nil
+	return nil
 }

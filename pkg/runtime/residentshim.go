@@ -191,7 +191,7 @@ func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, clean
 		return nil, cleanup, fmt.Errorf("create container log %s: %w", plan.logPath, err)
 	}
 	_ = w.Close()
-	shimText, err := sandbox.ShimProfile(p.profile, sandbox.ShimGrant{Dir: dir, LogPath: plan.logPath})
+	shimText, err := sandbox.ShimProfile(p.profile, sandbox.ShimGrant{Dir: dir})
 	if err != nil {
 		return nil, cleanup, err
 	}
@@ -427,15 +427,14 @@ func (r *Runtime) attachViaShim(stream runtimev1.Runtime_AttachServer, conn *sup
 }
 
 // reopenViaShim is the rotation half for a shim-backed container: the node has
-// renamed the file, this daemon creates the new empty one at the path (owned as
-// every log file is), and the shim reopens it — it may append to that one file
-// and create nothing.
+// renamed the file, this daemon creates and opens the new one at the path
+// (owned as every log file is) and hands the shim the descriptor. The shim opens
+// no path itself: its profile grants no write anywhere.
 func reopenViaShim(ctx context.Context, conn *supervisor.ShimConn, logPath string) error {
-	// crilog.Open is the one place a log file's flags and mode live.
-	w, err := crilog.Open(logPath)
+	f, err := crilog.OpenAppend(logPath)
 	if err != nil {
 		return fmt.Errorf("create the rotated log: %w", err)
 	}
-	_ = w.Close()
-	return conn.ReopenLog(ctx)
+	defer func() { _ = f.Close() }() // the shim holds its own copy once handed over
+	return conn.ReopenLog(ctx, f)
 }

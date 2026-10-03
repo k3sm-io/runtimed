@@ -44,9 +44,13 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// ptyTTL bounds how long a handed-off pty slave waits for the Exec stream that
-// names it before the shim closes it.
-const ptyTTL = 30 * time.Second
+// handoffTTL bounds how long a handed-off descriptor waits for the RPC that
+// claims it before the shim closes it.
+const handoffTTL = 30 * time.Second
+
+// maxHandoffs caps the descriptors waiting to be claimed; past it a hand-off is
+// refused rather than held.
+const maxHandoffs = 16
 
 // shimServer serves shimv1.ContainerShim for one container.
 //
@@ -67,9 +71,15 @@ type shimServer struct {
 	out, errs *ring
 	pumps     sync.WaitGroup
 	fan       fanout
-	ptys      *ptyStore
+	handoffs  *handoffStore
 	grpc      *grpc.Server
 	execs     atomic.Int32 // exec sessions in flight
+	exitFile  *os.File     // the exit record, opened before confinement
+
+	// reaped is set the moment the container is reaped: from then on its pid
+	// may name another process, so neither the signal forwarder nor the Signal
+	// RPC signals it.
+	reaped atomic.Bool
 
 	mu     sync.Mutex
 	exit   *supervisor.ExitRecord
@@ -128,7 +138,7 @@ func (s *shimServer) Signal(_ context.Context, req *shimv1.SignalRequest) (*shim
 	if err := s.assert(req.GetContainer()); err != nil {
 		return nil, err
 	}
-	if s.isExited() {
+	if s.isExited() || s.reaped.Load() {
 		return nil, status.Error(codes.FailedPrecondition, "the container has exited")
 	}
 	sig := unix.Signal(req.GetSignal())
@@ -153,14 +163,24 @@ func (s *shimServer) Signal(_ context.Context, req *shimv1.SignalRequest) (*shim
 	return &shimv1.SignalResponse{}, nil
 }
 
-// ReopenLog reopens the container's log at its path. The daemon has already
-// renamed the old file and created the new one; the shim only opens it (its
-// grant appends to that one literal and creates nothing).
-func (s *shimServer) ReopenLog(_ context.Context, req *shimv1.ReopenLogRequest) (*shimv1.ReopenLogResponse, error) {
+// ReopenLog switches the container's log to the descriptor the daemon handed
+// over (supervisor.ShimLogTokenKey names it): the daemon renamed the old file,
+// created and opened the new one, and passed the descriptor. The shim opens no
+// log path after confinement, and its profile grants none.
+func (s *shimServer) ReopenLog(ctx context.Context, req *shimv1.ReopenLogRequest) (*shimv1.ReopenLogResponse, error) {
 	if err := s.assert(req.GetContainer()); err != nil {
 		return nil, err
 	}
-	if err := s.logw.Reopen(); err != nil {
+	md, _ := metadata.FromIncomingContext(ctx)
+	tokens := md.Get(supervisor.ShimLogTokenKey)
+	if len(tokens) != 1 {
+		return nil, status.Error(codes.FailedPrecondition, "reopen: no handed-off log descriptor named")
+	}
+	f := s.handoffs.take(supervisor.HandoffLog, tokens[0])
+	if f == nil {
+		return nil, status.Error(codes.FailedPrecondition, "reopen: no handed-off log descriptor for this call")
+	}
+	if err := s.logw.ReopenFrom(f); err != nil {
 		return nil, status.Errorf(codes.Internal, "reopen the container log: %v", err)
 	}
 	return &shimv1.ReopenLogResponse{}, nil
@@ -228,7 +248,7 @@ func (s *shimServer) Exec(stream shimv1.ContainerShim_ExecServer) error {
 	if len(tokens) != 1 {
 		return status.Error(codes.FailedPrecondition, "exec: a tty session needs a handed-off terminal")
 	}
-	slave := s.ptys.take(tokens[0])
+	slave := s.handoffs.take(supervisor.HandoffPty, tokens[0])
 	if slave == nil {
 		return status.Error(codes.FailedPrecondition, "exec: no handed-off terminal for this session")
 	}
@@ -255,8 +275,15 @@ func (s *shimServer) writeLog(r *ring, stream crilog.Stream) {
 	report()
 }
 
-// acceptPtys receives handed-off pty slaves until the listener closes.
-func (s *shimServer) acceptPtys(ln *net.UnixListener) {
+// acceptHandoffs receives handed-off descriptors until the listener closes.
+//
+// No server-side peer check: the daemon that hands a descriptor over may be a
+// later incarnation than the one that spawned this shim, so its pid is not
+// known here, and every pod shares the daemon's uid, so a uid check would admit
+// exactly the processes it is meant to keep out. The barrier is the pod
+// profile's deny on connect(2) to every shim socket; the daemon's side checks
+// the peer (LOCAL_PEERPID) before it hands anything over.
+func (s *shimServer) acceptHandoffs(ln *net.UnixListener) {
 	for {
 		c, err := ln.AcceptUnix()
 		if err != nil {
@@ -264,39 +291,50 @@ func (s *shimServer) acceptPtys(ln *net.UnixListener) {
 		}
 		go func() {
 			defer func() { _ = c.Close() }()
-			token, f, err := supervisor.RecvPtyHandoff(c)
-			if err != nil {
-				return
-			}
-			s.ptys.put(token, f)
+			_ = supervisor.RecvHandoff(c, s.handoffs.put)
 		}()
 	}
 }
 
-// ptyStore holds handed-off slaves until their Exec stream claims them, closing
-// any that is not claimed within ptyTTL.
-type ptyStore struct {
-	mu sync.Mutex
-	m  map[string]*os.File
+// handoffKey names a waiting descriptor.
+type handoffKey struct {
+	kind  byte
+	token string
 }
 
-func newPtyStore() *ptyStore { return &ptyStore{m: make(map[string]*os.File)} }
+// handoffStore holds handed-off descriptors until the RPC that names them
+// claims them, closing any not claimed within handoffTTL, and holding at most
+// maxHandoffs at once.
+type handoffStore struct {
+	mu sync.Mutex
+	m  map[handoffKey]*os.File
+}
 
-func (p *ptyStore) put(token string, f *os.File) {
-	p.mu.Lock()
-	p.m[token] = f
-	p.mu.Unlock()
-	time.AfterFunc(ptyTTL, func() {
-		if f := p.take(token); f != nil {
+func newHandoffStore() *handoffStore { return &handoffStore{m: make(map[handoffKey]*os.File)} }
+
+// put keeps f under (kind, token), or refuses when the store is full.
+func (h *handoffStore) put(kind byte, token string, f *os.File) bool {
+	h.mu.Lock()
+	if len(h.m) >= maxHandoffs {
+		h.mu.Unlock()
+		return false
+	}
+	h.m[handoffKey{kind, token}] = f
+	h.mu.Unlock()
+	time.AfterFunc(handoffTTL, func() {
+		if f := h.take(kind, token); f != nil {
 			_ = f.Close()
 		}
 	})
+	return true
 }
 
-func (p *ptyStore) take(token string) *os.File {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	f := p.m[token]
-	delete(p.m, token)
+// take claims the descriptor of kind under token, or nil.
+func (h *handoffStore) take(kind byte, token string) *os.File {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	k := handoffKey{kind, token}
+	f := h.m[k]
+	delete(h.m, k)
 	return f
 }

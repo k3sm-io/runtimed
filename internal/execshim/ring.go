@@ -28,16 +28,21 @@ import (
 // write(2). Read blocks until there is data, and returns io.EOF once the ring is
 // closed and drained.
 //
+// It is circular: the bytes live in buf[start:start+n] modulo len(buf), so a
+// write once the ring is full costs the bytes written, not the limit. buf grows
+// geometrically up to limit and is then fixed, so an idle stream holds little.
+//
 // Concurrency: mu guards every field; cond signals data or close to a blocked
 // Read. One writer (the pipe reader) and one reader (the log writer) per ring.
 type ring struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	buf     []byte
-	limit   int
-	closed  bool
-	dropped uint64 // total bytes dropped
-	pending uint64 // bytes dropped since the last takeDropped
+	mu       sync.Mutex
+	cond     *sync.Cond
+	buf      []byte
+	start, n int
+	limit    int
+	closed   bool
+	dropped  uint64 // total bytes dropped
+	pending  uint64 // bytes dropped since the last takeDropped
 }
 
 // newRing returns a ring holding at most limit bytes.
@@ -55,29 +60,64 @@ func (r *ring) Write(p []byte) (int, error) {
 	if r.closed {
 		return 0, io.ErrClosedPipe
 	}
-	r.buf = append(r.buf, p...)
-	if over := len(r.buf) - r.limit; over > 0 {
-		r.buf = append(r.buf[:0:0], r.buf[over:]...)
-		r.dropped += uint64(over)
-		r.pending += uint64(over)
+	written := len(p)
+	if len(p) >= r.limit {
+		// p alone fills the ring: everything buffered and p's head are dropped.
+		r.drop(r.n + len(p) - r.limit)
+		p = p[len(p)-r.limit:]
+		r.grow(r.limit)
+		r.start, r.n = 0, 0
+	} else if over := r.n + len(p) - r.limit; over > 0 {
+		r.drop(over)
+		r.start = (r.start + over) % len(r.buf)
+		r.n -= over
 	}
+	r.grow(r.n + len(p))
+	at := (r.start + r.n) % len(r.buf)
+	k := copy(r.buf[at:], p)
+	copy(r.buf, p[k:])
+	r.n += len(p)
 	r.cond.Signal()
-	return len(p), nil
+	return written, nil
+}
+
+// drop counts k dropped bytes.
+func (r *ring) drop(k int) {
+	r.dropped += uint64(k)
+	r.pending += uint64(k)
+}
+
+// grow makes buf hold at least need bytes (need <= limit), linearizing the
+// contents; it only ever runs before buf reaches limit.
+func (r *ring) grow(need int) {
+	if need <= len(r.buf) {
+		return
+	}
+	size := max(need, 2*len(r.buf), 4<<10)
+	size = min(size, r.limit)
+	nb := make([]byte, size)
+	if r.n > 0 {
+		k := copy(nb, r.buf[r.start:min(r.start+r.n, len(r.buf))])
+		copy(nb[k:], r.buf[:r.n-k])
+	}
+	r.buf, r.start = nb, 0
 }
 
 // Read copies buffered bytes into p, blocking while the ring is empty and open.
 func (r *ring) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for len(r.buf) == 0 && !r.closed {
+	for r.n == 0 && !r.closed {
 		r.cond.Wait()
 	}
-	if len(r.buf) == 0 {
+	if r.n == 0 {
 		return 0, io.EOF
 	}
-	n := copy(p, r.buf)
-	r.buf = r.buf[n:]
-	return n, nil
+	end := min(r.start+r.n, len(r.buf))
+	k := copy(p, r.buf[r.start:end])
+	r.start = (r.start + k) % len(r.buf)
+	r.n -= k
+	return k, nil
 }
 
 // Close ends the stream: Read drains what is buffered and then reports io.EOF.

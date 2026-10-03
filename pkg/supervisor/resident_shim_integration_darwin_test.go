@@ -33,6 +33,7 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/execsession"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -69,7 +70,7 @@ func startResidentShim(t *testing.T) residentShim {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shimText, err := sandbox.ShimProfile(string(podText), sandbox.ShimGrant{Dir: dir, LogPath: logPath})
+	shimText, err := sandbox.ShimProfile(string(podText), sandbox.ShimGrant{Dir: dir})
 	if err != nil {
 		t.Fatalf("ShimProfile: %v", err)
 	}
@@ -339,6 +340,34 @@ func TestResidentShimSurvivesTheDaemon(t *testing.T) {
 		t.Fatalf("no output was logged after the reconnect (%d <= %d)", n, before)
 	}
 	t.Logf("log continuous over %s ticks", strconv.Itoa(ticks(t, rs.logPath)))
+}
+
+// TestShimReopensTheLogFromAHandedDescriptor pins log rotation without a path
+// grant: the log is renamed away, the new file is created and opened HERE (as
+// the daemon does) and handed over, and the confined shim's output continues in
+// it.
+func TestShimReopensTheLogFromAHandedDescriptor(t *testing.T) {
+	rs := startResidentShim(t)
+	awaitTicks(t, rs.logPath, 2)
+	if err := os.Rename(rs.logPath, rs.logPath+".1"); err != nil {
+		t.Fatal(err)
+	}
+	f, err := crilog.OpenAppend(rs.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.proc.Shim().ReopenLog(context.Background(), f); err != nil {
+		t.Fatalf("ReopenLog: %v", err)
+	}
+	_ = f.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(rs.logPath); err == nil && strings.Contains(string(b), "stdout F tick ") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("no output reached the rotated-in log file")
 }
 
 // shimFootprintCeiling is the resident shim's footprint ceiling documented in

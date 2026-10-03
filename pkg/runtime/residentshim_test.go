@@ -29,6 +29,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -49,6 +50,18 @@ type fakeShim struct {
 	reopens       atomic.Int32
 	mu            sync.Mutex
 	execs         []*runtimev1.ExecRequest
+	handed        map[string]*os.File // log descriptors handed over, by token
+}
+
+// keep is the fake's hand-off store.
+func (f *fakeShim) keep(kind byte, token string, file *os.File) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.handed == nil {
+		f.handed = map[string]*os.File{}
+	}
+	f.handed[string(kind)+token] = file
+	return true
 }
 
 func (f *fakeShim) Status(_ context.Context, req *shimv1.StatusRequest) (*shimv1.StatusResponse, error) {
@@ -81,7 +94,14 @@ func (f *fakeShim) Follow(_ *shimv1.FollowRequest, stream shimv1.ContainerShim_F
 	return stream.Send(&runtimev1.AttachResponse{Exit: &runtimev1.ExecResult{ExitCode: 0}})
 }
 
-func (f *fakeShim) ReopenLog(context.Context, *shimv1.ReopenLogRequest) (*shimv1.ReopenLogResponse, error) {
+func (f *fakeShim) ReopenLog(ctx context.Context, _ *shimv1.ReopenLogRequest) (*shimv1.ReopenLogResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	tokens := md.Get(supervisor.ShimLogTokenKey)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(tokens) != 1 || f.handed[string(supervisor.HandoffLog)+tokens[0]] == nil {
+		return nil, status.Error(codes.FailedPrecondition, "no handed-off log")
+	}
 	f.reopens.Add(1)
 	return &shimv1.ReopenLogResponse{}, nil
 }
@@ -100,7 +120,8 @@ func (d *claimDialer) DialShim(ctx context.Context, path string) (net.Conn, int,
 	return c, d.pid, err
 }
 
-// serveShim serves srv in a fresh short shim dir and returns the dir.
+// serveShim serves srv in a fresh short shim dir — and, for a *fakeShim, the
+// descriptor hand-off socket — and returns the dir.
 func serveShim(t *testing.T, srv shimv1.ContainerShimServer) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "rshim")
@@ -116,6 +137,23 @@ func serveShim(t *testing.T, srv shimv1.ContainerShimServer) string {
 	shimv1.RegisterContainerShimServer(g, srv)
 	go func() { _ = g.Serve(ln) }()
 	t.Cleanup(g.Stop)
+	if f, ok := srv.(*fakeShim); ok {
+		hl, err := net.ListenUnix("unix", &net.UnixAddr{Name: supervisor.ShimPtySockPath(dir), Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = hl.Close() })
+		go func() {
+			for {
+				c, err := hl.AcceptUnix()
+				if err != nil {
+					return
+				}
+				_ = supervisor.RecvHandoff(c, f.keep)
+				_ = c.Close()
+			}
+		}()
+	}
 	return dir
 }
 
@@ -251,7 +289,7 @@ func TestAttachReconnectsToTheShim(t *testing.T) {
 			t.Fatalf("ReopenContainerLog: %v", err)
 		}
 		if _, err := os.Stat(path); err != nil || w.shim.reopens.Load() != 1 {
-			t.Fatalf("new file %v, shim reopens %d; want the file created and one ReopenLog", err, w.shim.reopens.Load())
+			t.Fatalf("new file %v, shim reopens %d; want the file created, handed over and one ReopenLog", err, w.shim.reopens.Load())
 		}
 	})
 

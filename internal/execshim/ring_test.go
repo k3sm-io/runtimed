@@ -75,3 +75,36 @@ func TestRingReadWaitsForData(t *testing.T) {
 		t.Fatal("Read never returned")
 	}
 }
+
+// TestRingWrapsAndKeepsTheNewest drives the ring across many wraps with odd-sized
+// writes and reads, checking the reader always sees the newest bytes in order.
+func TestRingWrapsAndKeepsTheNewest(t *testing.T) {
+	r := newRing(10)
+	var want []byte
+	next := byte(0)
+	for i := 0; i < 200; i++ {
+		chunk := make([]byte, i%7+1)
+		for j := range chunk {
+			chunk[j] = next
+			next++
+		}
+		_, _ = r.Write(chunk)
+		want = append(want, chunk...)
+		if len(want) > 10 {
+			want = want[len(want)-10:]
+		}
+		if i%3 == 0 {
+			b := make([]byte, 3)
+			n, _ := r.Read(b)
+			if string(b[:n]) != string(want[:n]) {
+				t.Fatalf("step %d: read %v, want %v", i, b[:n], want[:n])
+			}
+			want = want[n:]
+		}
+	}
+	r.Close()
+	rest, _ := io.ReadAll(r)
+	if string(rest) != string(want) {
+		t.Fatalf("drained %v, want %v", rest, want)
+	}
+}
