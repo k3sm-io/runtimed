@@ -221,12 +221,14 @@ type VMContainer struct {
 	// Exec / Logs / Stats and the guest's ContainerEvents use.
 	Name string
 	// Init marks an init container: it runs to completion, in list order,
-	// before any main container starts.
-	//
-	// A native sidecar (an init container with restartPolicy: Always) cannot be
-	// expressed — guest/v1 carries this one ordering bit and no other — and the
-	// guest init records that ceiling on its own side (guestinit.StartStep).
+	// before any main container starts — unless Sidecar is also set.
 	Init bool
+	// Sidecar marks a native sidecar (an init container with restartPolicy:
+	// Always). It refines Init and is meaningful only with it: the guest starts
+	// the container in its init slot, does not wait for it to exit, and stops
+	// it after the main containers. It crosses as GuestContainer.sidecar, which
+	// only an initramfs advertising guestagent.CapabilitySidecarInit knows.
+	Sidecar bool
 	// RootfsTag names the virtiofs share carrying this container's read-only
 	// rootfs lower layer; the guest composes writability as an overlay. It must
 	// name a share in VMSpec.Volumes.Shares — no host path ever crosses.
@@ -246,11 +248,16 @@ type VMContainer struct {
 	// UID and GID are the RESOLVED numeric ids the process runs as. A
 	// non-numeric image USER is deliberately not resolved host-side (the host
 	// does not read a pod-controlled /etc/passwd to decide a privilege
-	// question); the guest resolves it at exec time against the container
-	// rootfs, so this pair carries the numeric answer only when the host
-	// already had one.
+	// question); it crosses as ImageUser instead, so this pair carries the
+	// numeric answer only when the host already had one.
 	UID int64
 	GID int64
+	// ImageUser is the image USER the guest resolves against the container's
+	// own rootfs ("name" or "name:group"), set only when the host could not
+	// determine a numeric uid. When set it replaces UID/GID in the guest;
+	// SupplementalGIDs are kept. It crosses as GuestContainer.image_user, which
+	// only an initramfs advertising guestagent.CapabilityImageUser knows.
+	ImageUser string
 	// SupplementalGIDs are the additional groups, including the pod fsGroup.
 	SupplementalGIDs []int64
 	// OwnershipPath is the HOST path of the ownership sidecar for the tree

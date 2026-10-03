@@ -205,6 +205,17 @@ type pod struct {
 	// host's own vocabulary rather than by what the agent chose to send.
 	guestCapsObserved bool
 	guestCaps         map[string]struct{}
+	// guestRequiredCaps is the set of capability tokens this vm pod's guest
+	// spec relies on (vmRequiredGuestCapabilities): every new guest/v1 field the
+	// spec sets maps to the token an initramfs advertises when it knows that
+	// field. Written once at assembly, before the pod is reachable, and never
+	// mutated, so it is read without mu. Nil for a spec that relies on none.
+	guestRequiredCaps []string
+	// guestCapRefused latches the capability gate (enforceGuestCapabilities,
+	// guarded by mu): set the first time a Health answer lacked a required
+	// token, so the pod is failed and its VM stopped exactly once however many
+	// later polls repeat the same answer.
+	guestCapRefused bool
 
 	// Projected-volume refresh state (RefreshProjectedVolumes, refresh.go).
 	// refreshMu serializes refreshes of this pod and guards projState, the
@@ -1013,13 +1024,13 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	}
 	// Every container is resolved host-side: the four-quadrant merge of
 	// each container's pod spec against its image config, its expanded
-	// environment, its numeric identity and the share-plan tag its rootfs lower
+	// environment, its identity (numeric, or a named image USER handed to the
+	// guest to resolve) and the share-plan tag its rootfs lower
 	// layer arrives under. The guest performs no merge and reads no image
 	// config, which is what lets it boot with no cluster access — see
 	// resolveVMContainers for what this pulls and the fail-closed refusals (a
-	// host-binary image, a native sidecar, an unresolvable image USER, and a pod
-	// whose containers name more than one image, which the single pod-wide
-	// rootfs share cannot represent).
+	// host-binary image, and a pod whose containers name more than one image,
+	// which the single pod-wide rootfs share cannot represent).
 	//
 	// vmRootfs is handed down because the same pass MATERIALIZES the pod's image
 	// into it: the rootfs share the guest overlays is exported from that
@@ -1088,8 +1099,11 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		// ContainerStatus.image_pull on this spine, since the guest events the
 		// statuses are folded from carry no image facts at all.
 		guestImagePulls: cplan.imagePulls,
-		supCtx:          supCtx,
-		cancel:          cancel,
+		// The tokens the spec just handed to CreateVM relies on. The lease
+		// watcher checks every Health answer against them.
+		guestRequiredCaps: vmRequiredGuestCapabilities(spec),
+		supCtx:            supCtx,
+		cancel:            cancel,
 	}
 	// No memory sampler, and no armMemorySampler call anywhere on this path. A vm
 	// pod's memory ceiling is the hypervisor's VZ memorySize, and its OOM truth

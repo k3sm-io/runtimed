@@ -19,14 +19,15 @@ package runtime
 import (
 	"context"
 	"errors"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 
+	"k3sm.io/runtimed/pkg/guestagent"
 	"k3sm.io/runtimed/pkg/image"
-	"k3sm.io/runtimed/pkg/sandbox"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -120,56 +121,106 @@ func TestVMRunAsNonRootSurfacesCreateContainerConfigError(t *testing.T) {
 	})
 }
 
-// TestVMSidecarAndNamedUserHandedToGuest is the host-inert half.
+// TestVMSidecarAndNamedUserHandedToGuest is the emit half of the native
+// sidecar and named image USER hand-off.
 //
-// The emit and token-check halves land with the initramfs re-pin: this build ships the guest code
-// that honours GuestContainer.sidecar and image_user, but a host may not set
-// either until the pinned initramfs knows them (an older guest refuses a spec
-// that sets a field it does not know, so setting one early fails every vm pod
-// that uses it). Until then this test pins that the host is INERT: it still
-// refuses a native sidecar and a named image USER, and its carrier to the
-// guest-spec composer has no field that could set either. The composer's own
-// output is pinned by pkg/sandbox's TestGuestSpecSetsNoUnpinnedGuestFields.
+// The host no longer refuses either: a native sidecar crosses as an init
+// container marked sidecar, and an image whose USER is a name crosses as
+// image_user for the guest to resolve against the container's own rootfs. Both
+// rely on an initramfs that knows the fields, so a guest whose Health answer
+// lacks the matching token fails the pod with a reason that names the fix.
 //
-// The runAsNonRoot leg is the one that does NOT change with the re-pin: a named USER
-// under runAsNonRoot is refused host-side, before any hand-off, with the
-// kubelet's non-numeric-user text, so in-guest resolution never decides a
-// privilege question.
+// The runAsNonRoot leg does NOT move: a named USER under runAsNonRoot is
+// refused host-side, before any hand-off, with the kubelet's non-numeric-user
+// text, so in-guest resolution never decides a privilege question.
 //
-// Not here: a guest start-failure for an unresolvable image_user mapping to
-// CONTAINER_CONFIG. guest/v1's ContainerEvent carries only started and exited,
-// so the guest has no start-failure event to send; it fails the boot with the
-// reason on the console instead.
+// A known gap, kept rather than faked: a guest that cannot resolve image_user
+// fails that container's start, but guest/v1's ContainerEvent carries only
+// started and exited, so there is no start-failure event the host could map to
+// CONTAINER_CONFIG. The guest fails the boot with the reason on its console, and
+// the host reports SANDBOX_SETUP. The console text is never parsed to fake the
+// finer reason.
 func TestVMSidecarAndNamedUserHandedToGuest(t *testing.T) {
-	t.Run("a native sidecar is still refused host-side", func(t *testing.T) {
-		rt, vmb := newVMImageRuntime(t, runAsNonRootWorld())
+	const (
+		groupedRef = "docker.io/library/grouped:1"
+		numericRef = "docker.io/library/numeric:1"
+	)
+	world := func() *imageWorld {
+		w := runAsNonRootWorld()
+		w.cfgs[groupedRef] = image.ImageRunConfig{Entrypoint: []string{"/app"}, User: "app:staff"}
+		w.cfgs[numericRef] = image.ImageRunConfig{Entrypoint: []string{"/app"}, User: "1000:1000"}
+		return w
+	}
+
+	t.Run("a native sidecar is emitted as an init container marked sidecar", func(t *testing.T) {
+		rt, vmb := newVMImageRuntime(t, world())
 		box := vmBoxWith(rt, "pod-side",
-			[]*runtimev1.Container{{Name: "side", Image: vmPlainRef,
-				RestartPolicy: runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS}},
+			[]*runtimev1.Container{
+				{Name: "setup", Image: vmPlainRef},
+				{Name: "side", Image: vmPlainRef,
+					RestartPolicy: runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS},
+			},
 			[]*runtimev1.Container{{Name: "c", Image: vmPlainRef}})
-		_, reason, err := rt.createPod(context.Background(), box)
-		if !errors.Is(err, errVMSidecarUnexpressible) || reason != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
-			t.Fatalf("err = %v reason = %v, want errVMSidecarUnexpressible / INVALID_POD_BOX", err, reason)
+		spec := createVMSpec(t, rt, vmb, box)
+		want := map[string][2]bool{"setup": {true, false}, "side": {true, true}, "c": {false, false}}
+		if len(spec.Containers) != len(want) {
+			t.Fatalf("VMSpec carries %d containers, want %d", len(spec.Containers), len(want))
 		}
-		if n, _ := vmb.created(); n != 0 {
-			t.Errorf("CreateVM called %d times", n)
+		for _, c := range spec.Containers {
+			w := want[c.Name]
+			if c.Init != w[0] || c.Sidecar != w[1] {
+				t.Errorf("container %q: init=%v sidecar=%v, want init=%v sidecar=%v", c.Name, c.Init, c.Sidecar, w[0], w[1])
+			}
+		}
+		p, _ := rt.lookupPod(box.GetPodId())
+		if got := p.guestRequiredCaps; len(got) != 1 || got[0] != guestagent.CapabilitySidecarInit {
+			t.Errorf("required tokens = %v, want exactly [%s]", got, guestagent.CapabilitySidecarInit)
 		}
 	})
 
-	t.Run("a named image USER with no runAsUser is still refused host-side", func(t *testing.T) {
-		rt, vmb := newVMImageRuntime(t, runAsNonRootWorld())
-		box := vmBoxWith(rt, "pod-named", nil, []*runtimev1.Container{{Name: "c", Image: vmNamedRef}})
-		_, reason, err := rt.createPod(context.Background(), box)
-		if !errors.Is(err, errVMUnresolvableUser) || reason != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
-			t.Fatalf("err = %v reason = %v, want errVMUnresolvableUser / INVALID_POD_BOX", err, reason)
-		}
-		if n, _ := vmb.created(); n != 0 {
-			t.Errorf("CreateVM called %d times", n)
+	t.Run("a named image USER is handed to the guest as image_user", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			ref      string
+			podSC    *runtimev1.PodSecurityContext
+			sc       *runtimev1.SecurityContext
+			wantUser string
+		}{
+			{name: "name alone", ref: vmNamedRef, wantUser: "nobody"},
+			{name: "name with a pod runAsGroup", ref: vmNamedRef,
+				podSC: &runtimev1.PodSecurityContext{RunAsGroup: 3000}, wantUser: "nobody:3000"},
+			{name: "name with a container runAsGroup", ref: vmNamedRef,
+				sc: &runtimev1.SecurityContext{RunAsGroup: 4000}, wantUser: "nobody:4000"},
+			{name: "name:group is kept verbatim", ref: groupedRef, wantUser: "app:staff"},
+			{name: "runAsGroup replaces the image's group", ref: groupedRef,
+				podSC: &runtimev1.PodSecurityContext{RunAsGroup: 3000}, wantUser: "app:3000"},
+			{name: "a runAsUser decides the uid host-side", ref: vmNamedRef,
+				podSC: &runtimev1.PodSecurityContext{RunAsUser: 1234}, wantUser: ""},
+			{name: "a numeric USER is decided host-side", ref: numericRef, wantUser: ""},
+			{name: "no USER at all", ref: vmPlainRef, wantUser: ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rt, vmb := newVMImageRuntime(t, world())
+				box := vmBoxWith(rt, "pod-user", nil, []*runtimev1.Container{{Name: "c", Image: tc.ref, SecurityContext: tc.sc}})
+				box.PodSecurityContext = tc.podSC
+				got := oneVMContainer(t, createVMSpec(t, rt, vmb, box))
+				if got.ImageUser != tc.wantUser {
+					t.Errorf("ImageUser = %q, want %q", got.ImageUser, tc.wantUser)
+				}
+				p, _ := rt.lookupPod(box.GetPodId())
+				var want []string
+				if tc.wantUser != "" {
+					want = []string{guestagent.CapabilityImageUser}
+				}
+				if !slices.Equal(p.guestRequiredCaps, want) {
+					t.Errorf("required tokens = %v, want %v for image_user %q", p.guestRequiredCaps, want, tc.wantUser)
+				}
+			})
 		}
 	})
 
 	t.Run("a named image USER under runAsNonRoot is a container config error", func(t *testing.T) {
-		rt, vmb := newVMImageRuntime(t, runAsNonRootWorld())
+		rt, vmb := newVMImageRuntime(t, world())
 		box := vmBoxWith(rt, "pod-named-nonroot", nil, []*runtimev1.Container{{
 			Name: "c", Image: vmNamedRef,
 			SecurityContext: &runtimev1.SecurityContext{RunAsNonRoot: true},
@@ -187,14 +238,23 @@ func TestVMSidecarAndNamedUserHandedToGuest(t *testing.T) {
 		}
 	})
 
-	t.Run("the host's guest carrier cannot express either field", func(t *testing.T) {
-		typ := reflect.TypeOf(sandbox.VMContainer{})
-		for i := 0; i < typ.NumField(); i++ {
-			name := strings.ToLower(typ.Field(i).Name)
-			if strings.Contains(name, "sidecar") || strings.Contains(name, "imageuser") {
-				t.Errorf("sandbox.VMContainer.%s exists: a host producer for a guest field the pinned initramfs may not know",
-					typ.Field(i).Name)
-			}
-		}
+	t.Run("a guest without the sidecar token fails the pod", func(t *testing.T) {
+		agent := &capsAgent{caps: capsWithout(guestagent.CapabilitySidecarInit)}
+		rt, vmb := newVMCapsRuntime(t, world(), agent)
+		box := vmBoxWith(rt, "pod-side-old",
+			[]*runtimev1.Container{{Name: "side", Image: vmPlainRef,
+				RestartPolicy: runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS}},
+			[]*runtimev1.Container{{Name: "c", Image: vmPlainRef}})
+		createRunningVMPod(t, rt, box)
+		assertGuestCapFailure(t, rt, vmb, box.GetPodId(), guestagent.CapabilitySidecarInit, 0)
+	})
+
+	t.Run("a guest without the image-user token fails the pod", func(t *testing.T) {
+		agent := &capsAgent{caps: capsWithout(guestagent.CapabilityImageUser)}
+		rt, vmb := newVMCapsRuntime(t, world(), agent)
+		box := vmBoxWith(rt, "pod-user-old", nil, []*runtimev1.Container{{Name: "c", Image: vmNamedRef}})
+		box.TerminationGracePeriodSeconds = 3
+		createRunningVMPod(t, rt, box)
+		assertGuestCapFailure(t, rt, vmb, box.GetPodId(), guestagent.CapabilityImageUser, 3*time.Second)
 	})
 }

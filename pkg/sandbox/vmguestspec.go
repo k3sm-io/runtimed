@@ -68,15 +68,27 @@ const VMGuestSpecFileName = "guest-spec.json"
 // of a pooled share (k3sm.proj/<volume>, k3sm.vols/<volume>) cannot be mounted
 // at its mount path directly — it has to be mounted once and bound out of.
 //
-// residual, recorded rather than papered over: guestinit re-exposes every
-// pod-level mount inside every container's rootfs (containerVisibleMounts), so a
-// staged pooled share is visible to every container in the pod, not only to the
-// containers that declared a volumeMount from it. That does not widen the VM's
-// own boundary — the pooled device is attached to the machine regardless, and
-// sandbox.VMBind already records that per-container narrowing is
-// GUEST-COOPERATIVE rather than host-enforced — but it does move the pooled
-// share from "readable by the guest init" to "readable by the workload".
-// Closing it needs a guest-private mount class guest/v1 does not have today.
+// THE STAGING ROOT IS GUEST-PRIVATE. Every staging mount is emitted with
+// GuestMount.guest_private, so the guest binds each volume out of it onto that
+// volume's mount path and then detaches the staging mount before any container
+// starts: it is never re-exposed inside a container rootfs, and nothing is left
+// mounted under this root once the workload runs. A volume that no container
+// declares is therefore unreachable from every container, through the staging
+// path and through the guest root alike. Only an initramfs that advertises
+// guestagent.CapabilityGuestPrivateMounts knows the field (an older one refuses
+// the spec at boot), and the runtime fails a pod whose guest does not
+// advertise it.
+//
+// two CEILINGS remain, stated rather than implied closed. The guest's mount
+// list is POD-level (guestMounts flattens every container's binds into one
+// list, and the guest exposes that list in every container), so every container
+// sees every volume that ANY container in the pod mounts, at that container's
+// mount path — narrowing it per container needs a wire field naming the
+// containers. And a container running as uid 0 in the guest holds
+// CAP_SYS_ADMIN, so it can mount the pooled share's device itself, which stays
+// attached to the machine; sandbox.VMBind already records that per-container
+// narrowing is GUEST-COOPERATIVE rather than host-enforced. Separate pods are
+// the boundary for credentials that must not be shared.
 var guestShareStageRoot = path.Join(guestinit.GuestRoot, "shares")
 
 // guestShareStageDir is where the share tagged tag is staged.
@@ -215,6 +227,11 @@ func guestContainers(containers []VMContainer, shares map[string]VMShare) ([]*gu
 			Gid:              c.GID,
 			SupplementalGids: append([]int64(nil), c.SupplementalGIDs...),
 			Init:             c.Init,
+			// Both are zero unless the container needs them, and a zero proto3
+			// field is absent from guest-spec.json — which is what lets a pod
+			// that uses neither boot against an initramfs that knows neither.
+			Sidecar:   c.Sidecar,
+			ImageUser: c.ImageUser,
 		})
 	}
 	return out, nil
@@ -251,6 +268,9 @@ func guestMounts(plan VMVolumePlan, shares map[string]VMShare, fsGroup int64) ([
 				// volume's own writability. A writable staging mount would hand
 				// every container the whole pooled share writable.
 				ReadOnly: true,
+				// Guest-private: bound out of, then detached before any
+				// container starts (see guestShareStageRoot).
+				GuestPrivate: true,
 			})
 		}
 		return guestShareStageDir(tag)
@@ -285,19 +305,18 @@ func guestMounts(plan VMVolumePlan, shares map[string]VMShare, fsGroup int64) ([
 			// whatever the volumeMount asked for. The guest-side flag mirrors
 			// the device flag; it never substitutes for it.
 			readOnly := b.ReadOnly || !sh.Writable
-			rel := path.Join(b.SourceRel, b.SubPath)
 			m := &guestv1.GuestMount{
 				Target:   b.MountPath,
 				ReadOnly: readOnly,
 				Idmap:    idmapWanted(fsGroup, readOnly),
 			}
-			if rel == "" || rel == "." {
+			if rel, staged := bindSource(b); staged {
+				m.TagOrSource, m.Kind = path.Join(stage(b.ShareTag), rel), guestv1.GuestMountKind_GUEST_MOUNT_KIND_BIND
+			} else {
 				// The whole share IS the volume (the PVC case): mount the
 				// device straight at the mount path, with no staging mount and
 				// so no extra exposure.
 				m.TagOrSource, m.Kind = b.ShareTag, guestv1.GuestMountKind_GUEST_MOUNT_KIND_VIRTIOFS
-			} else {
-				m.TagOrSource, m.Kind = path.Join(stage(b.ShareTag), rel), guestv1.GuestMountKind_GUEST_MOUNT_KIND_BIND
 			}
 			if err := claim(m); err != nil {
 				return nil, err
@@ -337,6 +356,39 @@ func guestMounts(plan VMVolumePlan, shares map[string]VMShare, fsGroup int64) ([
 		}
 	}
 	return append(staged, mounts...), nil
+}
+
+// bindSource returns the path of bind b's volume inside its share, and whether
+// that path is a SUBDIRECTORY of the share — in which case the share has to be
+// staged (mounted once, guest-privately) and the volume bound out of it. A path
+// that is empty or "." means the whole share is the volume, which mounts
+// straight at the mount path with no staging.
+//
+// It is the single statement of that decision: guestMounts emits the staging
+// mount from it, and HasGuestPrivateMounts reports from it, so the two cannot
+// come to disagree about whether a spec relies on a guest-private mount.
+func bindSource(b VMBind) (rel string, staged bool) {
+	rel = path.Join(b.SourceRel, b.SubPath)
+	return rel, rel != "" && rel != "."
+}
+
+// HasGuestPrivateMounts reports whether the guest spec composed from p carries
+// a guest-private mount: whether any container binds a volume out of a
+// subdirectory of a pooled share, which is exactly when guestMounts emits a
+// staging mount.
+//
+// A pod whose spec carries one relies on a guest that honours
+// GuestMount.guest_private, and the runtime checks the guest's advertised
+// capabilities against it.
+func (p VMVolumePlan) HasGuestPrivateMounts() bool {
+	for _, binds := range p.Binds {
+		for _, b := range binds {
+			if _, staged := bindSource(b); staged {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // idmapWanted reports whether a HOST-BACKED mount (virtiofs or a bind out of

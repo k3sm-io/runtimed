@@ -155,12 +155,15 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 // report Succeeded for a pod whose real workload had not begun. A failed init
 // is not lost by the exclusion: the guest tears the machine down when one exits
 // non-zero, and watchVMHelperExit fails the pod. Native sidecars need no
-// exclusion here — resolveVMContainers refuses one outright
-// (errVMSidecarUnexpressible), so every declared main is a main.
+// exclusion either: a sidecar is an init container with restartPolicy Always,
+// declared in box.init_containers and never in box.containers, so walking the
+// declared mains already leaves it out — and a sidecar that is still running
+// (as it is meant to be) can never hold a finished pod at Running.
 //
 // RESTART POLICY IS NOT READ, deliberately. PodBox carries no pod-level
-// restartPolicy at all (only the container-level KEP-753 field, which the vm
-// path refuses), and runtimed performs no exit-driven restarts on either spine.
+// restartPolicy at all (only the container-level KEP-753 field, which on the
+// vm path marks an init container as a sidecar and nothing more), and runtimed
+// performs no exit-driven restarts on either spine.
 // The policy lives with the provider, whose derivePhase de-escalates a
 // restartable termination back to Running before it ever consults this verdict.
 // So this function states one fact — what the containers did — and reporting
@@ -381,6 +384,14 @@ func (r *Runtime) watchVMHelperExit(ctx context.Context, p *pod) {
 	// stop can arrive here as an exit. Reporting that as a crash would make
 	// every vm pod deletion look like a failure.
 	if ctx.Err() != nil {
+		return
+	}
+	// The capability gate stops the helper on purpose and has already failed
+	// the pod with the reason that matters; this exit is the stop it asked for.
+	p.mu.Lock()
+	refused := p.guestCapRefused
+	p.mu.Unlock()
+	if refused {
 		return
 	}
 	output := r.vmBackend.VMHelperOutput(podID)

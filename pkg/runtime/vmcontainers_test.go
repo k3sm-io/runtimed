@@ -517,11 +517,15 @@ func TestVMContainerImageUserSuppliesTheUID(t *testing.T) {
 	if got.UID != 65534 {
 		t.Errorf("uid = %d, want the image USER's 65534", got.UID)
 	}
-	// The GROUP half does not cross (guest/v1 carries no user string, B193), and
-	// that is recorded rather than silently rounded: the gid comes from the
-	// securityContext chain alone, which is unset here.
+	// The GROUP half of a NUMERIC USER does not cross, and that is recorded
+	// rather than silently rounded: the gid comes from the securityContext chain
+	// alone, which is unset here. A numeric USER never becomes image_user, so the
+	// guest is not asked to resolve it either.
 	if got.GID != 0 {
 		t.Errorf("gid = %d, want 0 — the image USER's group half is not carried today", got.GID)
+	}
+	if got.ImageUser != "" {
+		t.Errorf("ImageUser = %q, want empty: a numeric USER is decided host-side", got.ImageUser)
 	}
 }
 
@@ -534,13 +538,11 @@ func TestVMContainerFailsClosed(t *testing.T) {
 	const (
 		plainRef = "docker.io/library/app:1"
 		rootRef  = "docker.io/library/root:1"
-		namedRef = "docker.io/library/named:1"
 		bareRef  = "docker.io/library/bare:1"
 	)
 	world := map[string]image.ImageRunConfig{
 		plainRef: {Entrypoint: []string{"/app"}},
 		rootRef:  {Entrypoint: []string{"/app"}, User: "0"},
-		namedRef: {Entrypoint: []string{"/app"}, User: "nobody"},
 		bareRef:  {},
 	}
 	cases := []struct {
@@ -576,17 +578,6 @@ func TestVMContainerFailsClosed(t *testing.T) {
 			wantMsg: "image is required",
 		},
 		{
-			// The B193 gap, failed closed: the host will not read a
-			// pod-controlled /etc/passwd to answer a privilege question, and
-			// guest/v1 has no field to hand the guest the name — so the only
-			// remaining behaviour would be to run as root a container that asked
-			// to be someone else.
-			name:    "non-numeric-image-user-with-no-runAsUser",
-			mains:   []*runtimev1.Container{{Name: "c", Image: namedRef}},
-			wantErr: errVMUnresolvableUser,
-			wantMsg: `"nobody"`,
-		},
-		{
 			// Upstream's verifyRunAsNonRoot, reached through the real merge.
 			name: "runAsNonRoot-with-a-root-image",
 			mains: []*runtimev1.Container{{
@@ -603,19 +594,6 @@ func TestVMContainerFailsClosed(t *testing.T) {
 			mains:   []*runtimev1.Container{{Name: "c", Image: bareRef}},
 			wantErr: image.ErrRunSpecInvalid,
 			wantMsg: "neither Entrypoint nor Cmd",
-		},
-		{
-			// guest/v1 carries one ordering bit, read as "run to completion
-			// first". A sidecar never exits, so mapping it onto that bit is a
-			// boot that never fails and never finishes.
-			name: "native-sidecar-cannot-be-ordered",
-			inits: []*runtimev1.Container{{
-				Name: "side", Image: plainRef,
-				RestartPolicy: runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS,
-			}},
-			mains:   []*runtimev1.Container{{Name: "c", Image: plainRef}},
-			wantErr: errVMSidecarUnexpressible,
-			wantMsg: "sidecar",
 		},
 	}
 	for _, tc := range cases {

@@ -113,22 +113,24 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.53",
-		// Minted 2026-09-25 from the v6.18.53-k3sm.1 release. Both artifacts
-		// moved. The KERNEL is upstream 6.18.53 built from a kernel.config
-		// regenerated for it (config hash b5d9e2733a91…, the -suffix of
-		// ActiveGuestKernel); build.sh --repro produced a byte-identical Image
-		// across two clean builds. The INITRAMFS carries k3sm-guest-init built
-		// from runtimed 966496b, the first to apply the image's ownership and
-		// mode sidecar in the guest before container start.
+		// Re-pinned for release v6.18.53-k3sm.2. The KERNEL is unchanged from
+		// v6.18.53-k3sm.1: upstream 6.18.53 built from the kernel.config whose
+		// hash (b5d9e2733a91…) is the -suffix of ActiveGuestKernel, so
+		// ImageSHA256 is that release's digest, carried over. The INITRAMFS
+		// carries k3sm-guest-init built from runtimed 718d5a8, the guest-side
+		// change that keeps a volume no container mounts out of every
+		// container, honours native sidecars, and resolves a named image user
+		// in the guest — the three guest/v1 fields this host now emits.
 		//
-		// Two clean builds (fresh GOCACHE, -trimpath -buildvcs=false
-		// -ldflags=-buildid=) produced a byte-identical cpio, and BOTH digests
-		// below were re-derived by unauthenticated download of the published
-		// assets — never from the local build output, so a mismatch between what
-		// was built and what was uploaded cannot hide here.
+		// Both digests are re-derived by unauthenticated download of the
+		// published assets, never from local build output, so a mismatch
+		// between what was built and what was uploaded cannot hide here. The two
+		// TODO-PUBLISH lines are filled only after v6.18.53-k3sm.2 is
+		// published; until then TestGuestArtifactPinsAreFilled is red, and
+		// Lookup refuses the pin, so this source cannot ship by accident.
 		ImageSHA256:     "1dd105bcfbd9737a0c6e057b2d5ed81015af905bff36bf2448aed0cbe07ddec8",
-		InitramfsSHA256: "be7fa5f0afd794846db5a28c6275daf382b4be642d3899a793e80049a469dcc7",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.53-k3sm.1",
+		InitramfsSHA256: "TODO-PUBLISH",
+		ReleaseURL:      "TODO-PUBLISH",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }

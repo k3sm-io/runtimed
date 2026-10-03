@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -34,6 +35,7 @@ import (
 	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/guestagent"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/sandbox"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -388,6 +390,92 @@ func (r *Runtime) setGuestCapabilities(p *pod, advertised []string) {
 	p.guestCaps = caps
 	p.guestCapsObserved = true
 	p.mu.Unlock()
+}
+
+// vmReasonGuestCapabilityMissing is the pod reason enforceGuestCapabilities
+// fails a vm pod with: its guest answered Health without a token the pod's
+// spec relies on.
+const vmReasonGuestCapabilityMissing = "GuestCapabilityMissing"
+
+// vmRequiredGuestCapabilities returns the guest capability tokens spec relies
+// on, in a stable order: one per new guest/v1 field the composed guest spec
+// sets. Each field is absent from guest-spec.json when unset, so a spec that
+// sets none of them relies on no token and boots against any initramfs.
+//
+//   - guestagent.CapabilityGuestPrivateMounts when the spec stages a pooled
+//     share (sandbox.VMVolumePlan.HasGuestPrivateMounts — the composer's own
+//     decision, not a second copy of it);
+//   - guestagent.CapabilitySidecarInit when any container is a native sidecar;
+//   - guestagent.CapabilityImageUser when any container hands the guest an
+//     image user to resolve.
+func vmRequiredGuestCapabilities(spec sandbox.VMSpec) []string {
+	var sidecar, imageUser bool
+	for _, c := range spec.Containers {
+		sidecar = sidecar || c.Sidecar
+		imageUser = imageUser || c.ImageUser != ""
+	}
+	var out []string
+	if spec.Volumes.HasGuestPrivateMounts() {
+		out = append(out, guestagent.CapabilityGuestPrivateMounts)
+	}
+	if sidecar {
+		out = append(out, guestagent.CapabilitySidecarInit)
+	}
+	if imageUser {
+		out = append(out, guestagent.CapabilityImageUser)
+	}
+	return out
+}
+
+// enforceGuestCapabilities fails a vm pod whose guest has answered Health
+// without a token the pod's spec relies on, and stops its VM.
+//
+// It runs on every Health answer (pollGuestLease), after the answer's tokens
+// are recorded. Only guestCapAbsent is a verdict: a pod whose agent has not
+// answered yet has said nothing, and a guest that never answers is decided by
+// CreateVM's boot deadline (its readiness IS a Health round trip), so no timer
+// of its own is needed here.
+//
+// what THIS ADDS, and what it does not. An initramfs that predates a guest/v1
+// field refuses a spec that sets it, at boot, before any container runs — that
+// refusal is what fails closed. This check is the legible half: it names the
+// missing token and the fix instead of leaving a decode failure on a guest
+// console, and it still holds if a guest's decoder ever stops refusing unknown
+// fields. The only reachable way here is unsupported skew (a
+// --guest-artifacts-dir override), since the initramfs is pinned in code.
+//
+// The verdict is latched (guestCapRefused), so the pod is failed and its VM
+// stopped once. StopVM runs outside p.mu with the pod's own grace, the budget
+// every other stop of this helper uses.
+func (r *Runtime) enforceGuestCapabilities(ctx context.Context, p *pod) {
+	if len(p.guestRequiredCaps) == 0 {
+		return
+	}
+	p.mu.Lock()
+	missing := ""
+	for _, tok := range p.guestRequiredCaps {
+		if classifyGuestCapability(p.guestCapsObserved, p.guestCaps, tok) == guestCapAbsent {
+			missing = tok
+			break
+		}
+	}
+	if missing == "" || p.guestCapRefused {
+		p.mu.Unlock()
+		return
+	}
+	p.guestCapRefused = true
+	p.mu.Unlock()
+
+	podID := p.box.GetPodId()
+	r.log.Error("vm pod guest lacks a capability its spec relies on; failing the pod and stopping its VM",
+		"pod", podID, "capability", missing)
+	r.failVMPod(p, vmReasonGuestCapabilityMissing,
+		fmt.Sprintf("pod %s: guest initramfs predates %s; the daemon's pinned initramfs is required", podID, missing))
+	if err := r.vmBackend.StopVM(ctx, podID, graceDuration(0, p)); err != nil {
+		// A helper that will not stop is kept on record for the next startup
+		// sweep by the backend; the pod is already Failed either way.
+		r.log.Warn("stop the vm host helper after a capability refusal", "pod", podID, "err", err)
+	}
 }
 
 // requireGuestCapability refuses a verb the pod's guest agent has said it
