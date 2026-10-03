@@ -64,6 +64,8 @@ limitations under the License.
 //	    DYLD_INSERT_LIBRARIES (the darwin-net DNS-shim enabler) survives into the
 //	    pod. This is deliberately not /usr/bin/sandbox-exec: that platform binary
 //	    strips DYLD_* (Wave-0 confirmed this live), which would break the shim.
+//	    The exec is posix_spawn(POSIX_SPAWN_SETEXEC) carrying the pcontrol-KILL
+//	    attribute (a plain execve clears that mark), falling back to execve.
 //
 // The fsGroup chown of the writable volumes happens ROOT-side in the daemon
 // before this shim is spawned (a dropped process can no longer chown).
