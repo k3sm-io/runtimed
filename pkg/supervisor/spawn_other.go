@@ -29,7 +29,11 @@ var errUnsupported = errors.New("supervisor: native posix_spawn/kqueue requires 
 
 // PosixSpawner off darwin/cgo is a non-functional stub so the package builds for
 // linux CI; production runs on darwin.
-type PosixSpawner struct{}
+type PosixSpawner struct {
+	// PressureKill mirrors the darwin field (marks the child pcontrol-KILL) so
+	// callers compile on every platform; it has no effect here.
+	PressureKill bool
+}
 
 // Spawn is unsupported off darwin/cgo.
 func (PosixSpawner) Spawn(context.Context, SpawnSpec) (int, error) { return 0, errUnsupported }
@@ -47,6 +51,9 @@ type AdoptedExitWaiter struct{}
 func (AdoptedExitWaiter) WaitExit(context.Context, int) (int, int, error) {
 	return 0, 0, errUnsupported
 }
+
+// VerifyPressureKill is unsupported off darwin/cgo.
+func VerifyPressureKill(context.Context) error { return ErrPressureKillUnsupported }
 
 // SignalGroup is unsupported off darwin/cgo.
 func SignalGroup(int, os.Signal) error { return errUnsupported }

@@ -29,6 +29,13 @@ package supervisor
 
 extern char **environ;
 
+// posix_spawnattr_setpcontrol_np records the child's resource-starvation
+// policy. PRIVATE SPI (XNU libsyscall spawn_private.h; no SDK prototype), per
+// docs/GO-STANDARDS.md §Darwin/cgo, so only the function is declared here; its
+// POSIX_SPAWN_PCONTROL_KILL argument comes from the public SDK <sys/spawn.h>.
+// The symbol is canaried in internal/spicanary.
+extern int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *, const int);
+
 // k3sm_spawn_addchdir is the posix_spawn file-action that gives the child its
 // own working directory before exec. DARWIN SPI DISCIPLINE, per
 // docs/GO-STANDARDS.md Â§Darwin/cgo: there is NO golang.org/x/sys/unix binding
@@ -104,7 +111,13 @@ extern char **environ;
 // dup2(3, 3) would be a no-op that leaves close-on-exec set (Go opens every
 // descriptor O_CLOEXEC), so posix_spawn_file_actions_addinherit_np, the
 // published Darwin extension that clears it for the child, is used instead.
-static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int outFD, int errFD, int syncFD, pid_t *outPid) {
+//
+// pcKill, when non-zero, marks the child POSIX_SPAWN_PCONTROL_KILL; what
+// posix_spawnattr_setpcontrol_np returned is written to *setRC (0 when not
+// called). A non-zero *setRC leaves the attribute unset and the spawn proceeds
+// unmarked: this function executes the plan it is handed and decides nothing,
+// the Go side owns the fail-soft policy (pcontrolRetry).
+static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int outFD, int errFD, int syncFD, int pcKill, int *setRC, pid_t *outPid) {
 	posix_spawnattr_t attr;
 	posix_spawn_file_actions_t fa;
 	int rc;
@@ -126,6 +139,22 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 
 	short flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
 	posix_spawnattr_setflags(&attr, flags);
+
+	// The pressure-kill mark. Private SPI (see the declaration above), canaried
+	// in internal/spicanary. Why this lever and not the jetsam band:
+	//   - memorystatus_control is EPERM for the unprivileged daemon user;
+	//   - macOS (no CONFIG_JETSAM) never picks a victim by jetsam band 30-210;
+	//   - the no-paging-space path picks the process with the most compressed
+	//     pages among pcontrol-marked processes, and this attribute needs no
+	//     root and no entitlement.
+	// fork zeroes the mark (a pod's own children are unmarked), and so does a
+	// plain execve (measured on macOS 26): the exec-shim therefore re-applies
+	// it when it execs the pod binary (posix_spawn POSIX_SPAWN_SETEXEC with
+	// this same attribute), and a process that execs further drops it.
+	*setRC = 0;
+	if (pcKill) {
+		*setRC = posix_spawnattr_setpcontrol_np(&attr, POSIX_SPAWN_PCONTROL_KILL);
+	}
 
 	// The child's working directory. File actions run in order, and this one
 	// touches no descriptor, so it is independent of the dup2s below; it is added
@@ -174,6 +203,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -188,7 +218,20 @@ func syscallErrno(rc C.int) error {
 // PosixSpawner is the production Spawner: raw posix_spawn into a new session +
 // process group, with one pipe dup2'd onto each of the child's stdout/stderr.
 // The zero value is usable.
-type PosixSpawner struct{}
+type PosixSpawner struct {
+	// PressureKill marks every child pcontrol-KILL (POSIX_SPAWN_PCONTROL_KILL):
+	// when the system runs out of paging space the kernel kills the largest
+	// marked process before it considers an unmarked one. Pod spawners set it
+	// so a pod, not a control-plane process, is the memory-exhaustion victim.
+	// The mark is fail-soft: a spawn that cannot carry it runs unmarked (one
+	// Warn, UnmarkedSpawns increments) rather than failing the pod.
+	// It orders victims under paging-space exhaustion; it is NOT an isolation
+	// control — a pod can clear its own mark, re-exec, or fork unmarked
+	// children. VerifyPressureKill proves this spawn attribute only; a child
+	// that execs (the exec-shim) keeps the mark only because the shim re-applies
+	// it at its exec, which the startup self-check does not cover.
+	PressureKill bool
+}
 
 // Spawn posix_spawns spec into its own process group and returns the child pid.
 // It passes spec.Env verbatim (so DYLD_INSERT_LIBRARIES flows through to the
@@ -199,7 +242,11 @@ type PosixSpawner struct{}
 // the daemon: this process is shared by every pod, so a parent-side chdir would
 // be a data race with every other spawn in flight. An unusable Dir fails the
 // spawn with ErrWorkingDir (planSpawn) and starts nothing.
-func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
+//
+// With PressureKill the child is marked pcontrol-KILL. A kernel that rejects the
+// attribute fails the spawn with EINVAL; that spawn is retried once unmarked
+// (pcontrolRetry), and when the retry fails too the first error is returned.
+func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -222,7 +269,7 @@ func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 
 	// Resolve (and refuse) the working directory before any allocation: an
 	// unusable Dir must fail typed, never fall back to the daemon's cwd.
-	plan, err := planSpawn(spec)
+	plan, err := planSpawn(spec, s.PressureKill)
 	if err != nil {
 		return 0, err
 	}
@@ -245,12 +292,41 @@ func (PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		syncFD = C.int(spec.ExecSyncFD)
 	}
 
-	var pid C.pid_t
-	rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, outFD, errFD, syncFD, &pid)
-	if rc != 0 {
-		return 0, fmt.Errorf("posix_spawn %s: %w", spec.Path, syscallErrno(rc))
+	spawn := func(p spawnPlan) (int, int, error) {
+		pcKill := C.int(0)
+		if p.PControl == pcontrolKill {
+			pcKill = 1
+		}
+		var pid C.pid_t
+		var setRC C.int
+		rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, outFD, errFD, syncFD, pcKill, &setRC, &pid)
+		if rc != 0 {
+			return 0, int(setRC), syscallErrno(rc)
+		}
+		return int(pid), int(setRC), nil
 	}
-	return int(pid), nil
+
+	pid, setRC, spawnErr := spawn(plan)
+	if spawnErr != nil {
+		retry, ok := pcontrolRetry(plan, setRC, spawnErr)
+		if !ok {
+			return 0, fmt.Errorf("posix_spawn %s: %w", spec.Path, spawnErr)
+		}
+		pid, _, retryErr := spawn(retry)
+		if retryErr != nil {
+			// The first error is the one that names why the marked spawn failed;
+			// the retry only proves the mark was not the whole story.
+			return 0, fmt.Errorf("posix_spawn %s: %w", spec.Path, spawnErr)
+		}
+		var errno unix.Errno
+		_ = errors.As(spawnErr, &errno)
+		noteUnmarkedSpawn(spec.Path, "posix_spawn rejected the pcontrol attribute; retried unmarked", int(errno))
+		return pid, nil
+	}
+	if plan.PControl == pcontrolKill && setRC != 0 {
+		noteUnmarkedSpawn(spec.Path, "posix_spawnattr_setpcontrol_np failed", setRC)
+	}
+	return pid, nil
 }
 
 // cStringArray is a NULL-terminated C string vector (char **) plus the element

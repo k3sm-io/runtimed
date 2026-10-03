@@ -78,3 +78,17 @@ func TestVMBackendCreateVMRejectsAnUnderivedSpec(t *testing.T) {
 		t.Errorf("CreateVM err = %v, want ErrInvalidVMSpec", err)
 	}
 }
+
+// TestVMHostSpawnerMarkedPressureKill pins that the vmhost helper is spawned
+// pcontrol-KILL: a vm pod's host process holds the guest's memory, so it must be
+// preferred over an unmarked control-plane process as the memory-exhaustion
+// victim exactly like a native pod.
+func TestVMHostSpawnerMarkedPressureKill(t *testing.T) {
+	got, ok := NewVMBackend().spawner.(supervisor.PosixSpawner)
+	if !ok {
+		t.Fatalf("default vm spawner = %T, want supervisor.PosixSpawner", NewVMBackend().spawner)
+	}
+	if !got.PressureKill {
+		t.Errorf("default vm spawner = %+v, want PressureKill set", got)
+	}
+}

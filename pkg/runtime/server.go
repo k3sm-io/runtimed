@@ -662,32 +662,39 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 		vmReason = "Available"
 		vmMsg = fmt.Sprintf("vm backend %q available", r.vmBackend.Name())
 	}
+	conditions := []*runtimev1.RuntimeCondition{
+		{
+			Type:    ConditionSandboxBackend,
+			Status:  cond,
+			Reason:  reason,
+			Message: msg,
+		},
+		{
+			Type:    ConditionVMBackendAvailable,
+			Status:  vmCond,
+			Reason:  vmReason,
+			Message: vmMsg,
+		},
+		// The two Rosetta capability conditions are ADDITIVE — they are appended
+		// to, never a replacement for, the two above. Their values were
+		// computed once in New and are immutable, so this handler only stamps them
+		// into fresh proto messages; a probe that reported UNAVAILABLE is a
+		// capability absence, NOT a handshake failure, so err stays nil.
+		r.rosettaHost.condition(ConditionRosettaHostAvailable),
+		r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
+	}
+	// The pressure-kill condition is appended only in its degraded state (New's
+	// self-check failed). It does not touch Healthy: an unmarked pod is still a
+	// confined pod; what is lost is the victim preference under memory exhaustion.
+	if c := pressureKillCondition(r.pressureKill); c != nil {
+		conditions = append(conditions, c)
+	}
 	return &runtimev1.GetRuntimeInfoResponse{
 		RuntimeName:    RuntimeName,
 		RuntimeVersion: r.cfg.RuntimeVersion,
 		ApiVersion:     apiVersion,
 		Healthy:        healthy,
-		Conditions: []*runtimev1.RuntimeCondition{
-			{
-				Type:    ConditionSandboxBackend,
-				Status:  cond,
-				Reason:  reason,
-				Message: msg,
-			},
-			{
-				Type:    ConditionVMBackendAvailable,
-				Status:  vmCond,
-				Reason:  vmReason,
-				Message: vmMsg,
-			},
-			// The two Rosetta capability conditions are ADDITIVE — they are appended
-			// to, never a replacement for, the two above. Their values were
-			// computed once in New and are immutable, so this handler only stamps them
-			// into fresh proto messages; a probe that reported UNAVAILABLE is a
-			// capability absence, NOT a handshake failure, so err stays nil.
-			r.rosettaHost.condition(ConditionRosettaHostAvailable),
-			r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
-		},
+		Conditions:     conditions,
 		// GPU facts, stamped fresh from the immutable observation New
 		// made. ALWAYS present on a daemon that can probe: the apis contract reads
 		// an absent gpu as "this daemon does not report GPU facts", which is a
