@@ -422,6 +422,10 @@ type Runtime struct {
 	// see AttachPod. Never nil after New.
 	adoptWaiter supervisor.ExitWaiter
 
+	// shimDialer reaches a container's resident shim (residentshim.go). Never nil after
+	// New.
+	shimDialer supervisor.ShimDialer
+
 	mu   sync.Mutex
 	pods map[string]*pod
 
@@ -692,6 +696,10 @@ type Deps struct {
 	// a process a previous daemon spawned, which is not this daemon's child.
 	// Defaults to supervisor.AdoptedExitWaiter; tests inject a fake.
 	AdoptedWaiter supervisor.ExitWaiter
+	// ShimDialer dials a container's resident shim and reports the socket's
+	// peer pid. Defaults to supervisor.UnixShimDialer; tests inject a fake
+	// shim behind it.
+	ShimDialer supervisor.ShimDialer
 	// RuntimeFingerprint overrides the build fingerprint every podreap record
 	// carries and AttachPod requires to match (see runtimeFingerprint). Empty —
 	// the production default — derives it from this binary's own code-directory
@@ -886,6 +894,10 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if adoptWaiter == nil {
 		adoptWaiter = supervisor.AdoptedExitWaiter{}
 	}
+	shimDialer := deps.ShimDialer
+	if shimDialer == nil {
+		shimDialer = supervisor.UnixShimDialer{}
+	}
 	fingerprint := deps.RuntimeFingerprint
 	if fingerprint == "" {
 		fingerprint = runtimeFingerprint(log)
@@ -972,6 +984,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,
+		shimDialer:     shimDialer,
 	}, nil
 }
 

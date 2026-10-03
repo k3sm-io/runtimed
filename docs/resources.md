@@ -206,3 +206,24 @@ is **restart-runtimed-first**, then the provider.
   a `slog` warning; surfacing that clamp to `PodStatus`/events is
   **DEFERRED** — today the operator sees it only in the
   daemon log.
+
+## The resident shim's footprint
+
+Every host-process container runs beside its own resident shim: the
+`k3sm-execshim` helper in serve mode, the pod group's leader and the
+container's parent, which holds its stdio, writes its CRI log, reaps it and
+serves its exec (so all of that survives a restart of the node daemon). It is
+one extra process per container, and it is **not** part of the pod's
+metering: the sampler, the OOM threshold and the CPU counters read the
+container itself (`supervisor.Process.ChildPID`), never the shim.
+
+- **Measured:** about **9.4 MiB** `ri_phys_footprint` per shim on macOS 26
+  arm64, idle with a container logging every 100 ms (the integration test
+  `TestResidentShimSurvivesTheDaemon` logs the figure on every run).
+- **Ceiling: 32 MiB per shim**, asserted by that test. Beyond its baseline a
+  shim holds at most 1 MiB of unwritten output per stream (two streams) when
+  the log writer falls behind; past that it drops the oldest bytes and says
+  so in the log, rather than block the container's writes.
+- **Per node:** a node running N host-process containers carries N shims, so
+  budget roughly 10 MiB per container of node overhead (32 MiB at the
+  ceiling) outside every pod's limit.

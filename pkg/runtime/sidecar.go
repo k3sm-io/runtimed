@@ -83,7 +83,7 @@ func (r *Runtime) stopSidecars(ctx context.Context, podID string, sidecars []*co
 			remaining = 0
 		}
 		if _, _, err := supervisor.GracefulStop(ctx, pid, remaining, cp.proc.Done(),
-			termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+			termSignal, killSignal, cp.proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
 			r.log.Warn("graceful stop sidecar", "pod", podID, "container", cp.name, "pid", pid, "err", err)
 		}
 	}

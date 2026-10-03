@@ -532,6 +532,21 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 			t.Errorf("sandbox_apply/exec must NOT run after a Setpriority failure; calls=%v", seam.calls)
 		}
 	})
+
+	// An exec session's shape (no drop, no rlimits, an already-confined
+	// process whose SandboxApply is a no-op): a refused band is the session's
+	// error, surfaced as the kernel's EPERM and never swallowed, and the
+	// command is never exec'd outside the band the pod asked for.
+	t.Run("exec-session-eperm-surfaces", func(t *testing.T) {
+		seam := &recordingSeam{hasFail: true, failAt: StepSetpriority, failErr: unix.EPERM}
+		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		if !errors.Is(err, unix.EPERM) {
+			t.Fatalf("want a wrapped EPERM, got %v", err)
+		}
+		if len(done) != 0 || idx(seam.calls, StepExec) != -1 {
+			t.Errorf("the session must not exec after a refused band; done=%v calls=%v", done, seam.calls)
+		}
+	})
 }
 
 // TestCredentialValidate is the unit table for the euid guard: a drop needs root,

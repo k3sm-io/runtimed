@@ -826,13 +826,17 @@ func TestGenerateDeniedUnixSockets(t *testing.T) {
 		})
 	}
 
-	// No configured sockets => no unix-socket rule at all.
+	// No configured sockets => no helper-socket rule; the one unix-socket rule
+	// left is the static resident-shim root deny every profile carries.
 	out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "unix-socket") {
-		t.Errorf("no denied sockets configured, but profile emits a unix-socket rule:\n%s", out)
+	if strings.Contains(out, "(remote unix-socket (literal") {
+		t.Errorf("no denied sockets configured, but profile emits a helper-socket rule:\n%s", out)
+	}
+	if n := strings.Count(out, "(remote unix-socket"); n != 2 {
+		t.Errorf("want exactly the two firmlink forms of the shim-root deny, got %d unix-socket rules:\n%s", n, out)
 	}
 }
 

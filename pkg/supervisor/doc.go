@@ -23,17 +23,14 @@ limitations under the License.
 // came from, and a merge cannot be undone downstream), and reaps exits via
 // kqueue(EVFILT_PROC) — the sole reaper.
 //
-// A pod container's two streams are FILES, not pipes (Process.CaptureToFiles):
-// the child appends to <stream>.raw files the daemon opened for it, and the
-// daemon tails them into the CRI log from an offset persisted beside each file.
-// A pipe's read end dies with the daemon and the child's next write takes
-// EPIPE/SIGPIPE, which made every logging pod fatal to a daemon restart; a file
-// has no reader to lose, so capture survives the daemon and a restarted daemon
-// resumes the tail (AdoptProcess). The disk bound truncates a raw file past
-// RawCaptureMaxBytes once it is consumed to the end, losing whatever is appended
-// between the size check and the truncate. That window is the accepted cost
-// until a resident per-container shim (the containerd-shim shape) owns the
-// stdio. Other callers (exec sessions) keep the pipe path.
+// A container's output must outlive this daemon, and a pipe whose read end is
+// here cannot: when the daemon dies the child's next write takes EPIPE. So a
+// pod container runs beside a RESIDENT SHIM (NewShimProcess, shim.go): the
+// exec-shim helper stays alive as the pod group's leader and the container's
+// parent, holds the pipes, writes the CRI log, reaps the container and persists
+// its exit status, and serves shimv1.ContainerShim on a socket. A restarted
+// daemon reconnects (ConnectShim, AdoptShim), so output, the real exit status
+// and exec all survive it. Exec sessions and the vm helper keep the pipe path.
 //
 // kqueue is used deliberately INSTEAD OF os/exec.Cmd.Wait so there is exactly one
 // place that calls wait4; mixing the two double-reaps and races the exit status.
@@ -46,7 +43,9 @@ limitations under the License.
 //
 //   - Spawner   — posix_spawn a SpawnSpec, return the child pid. The production
 //     impl (spawn_darwin.go) uses raw posix_spawn + posix_spawn_file_actions +
-//     POSIX_SPAWN_SETSID|SETPGROUP via cgo; tests inject a fake.
+//     POSIX_SPAWN_SETSID via cgo; tests inject a fake.
+//   - ShimDialer — dial a resident shim's socket and name its peer pid; the
+//     production UnixShimDialer reads LOCAL_PEERPID, tests inject a fake.
 //   - PodNetwork — Setup(ctx, podID) -> pod IP; Teardown(podID) releases it on
 //     pod delete (and on a failed create after a successful Setup). NodeNetwork
 //     is a node-IP/no-op impl (single node); the k3sm-injected adapter over

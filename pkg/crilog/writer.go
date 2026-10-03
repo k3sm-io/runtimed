@@ -145,12 +145,20 @@ func Open(path string) (*Writer, error) {
 // openFile opens the writer's path fresh. It is the one place the flags and
 // modes live, so Open and Reopen cannot come to disagree about them.
 func (w *Writer) openFile() (sink, error) {
-	if err := os.MkdirAll(filepath.Dir(w.path), 0o700); err != nil {
-		return nil, fmt.Errorf("create container log dir for %s: %w", w.path, err)
+	return OpenAppend(w.path)
+}
+
+// OpenAppend opens (creating, appending to) the CRI log file at path with the
+// flags and mode every log file gets, creating its directory 0700. It is the one
+// place they live: the Writer's own opens use it, and so does a caller that
+// opens the file for a Writer in another process (ReopenFrom).
+func OpenAppend(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create container log dir for %s: %w", path, err)
 	}
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open container log %s: %w", w.path, err)
+		return nil, fmt.Errorf("open container log %s: %w", path, err)
 	}
 	return f, nil
 }
@@ -228,6 +236,26 @@ func (w *Writer) Reopen() error {
 	w.f = f
 	if old != nil {
 		_ = old.Close() // the new handle is already installed; a close error changes nothing
+	}
+	return nil
+}
+
+// ReopenFrom is Reopen with the new handle supplied by the caller: a process
+// that may not open the log path itself (a confined container shim) is handed
+// the descriptor of the file the rotation created and swaps to it, under the
+// same lock Write holds. A failed Writer is not resurrected (see Reopen); f is
+// then closed and the error returned.
+func (w *Writer) ReopenFrom(f *os.File) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		_ = f.Close()
+		return w.err
+	}
+	old := w.f
+	w.f = f
+	if old != nil {
+		_ = old.Close()
 	}
 	return nil
 }

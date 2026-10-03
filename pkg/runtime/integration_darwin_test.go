@@ -84,7 +84,7 @@ func containerLogLines(t *testing.T, rt *Runtime, podID string) []string {
 }
 
 func TestIntegrationFullStackCreatePod(t *testing.T) {
-	root := t.TempDir()
+	root := shortRoot(t)
 
 	// Build + ad-hoc sign the exec-shim helper.
 	shim := filepath.Join(root, sandbox.ExecShimName)
@@ -221,7 +221,7 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 // prints the wrong marker and would exit non-zero, so a mis-ordered apply fails
 // loudly instead of passing.
 func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
-	root := t.TempDir()
+	root := shortRoot(t)
 
 	// Build + ad-hoc sign the exec-shim helper (the confinement backend).
 	shim := filepath.Join(root, sandbox.ExecShimName)
@@ -408,4 +408,16 @@ func pushExecutableImage(t *testing.T, host, repo, layer1Bin, layer2Bin string) 
 		t.Fatalf("write image %s: %v", ref, err)
 	}
 	return ref.String()
+}
+
+// shortRoot is a runtime root short enough for the resident shims' sockets
+// (<root>/run/shim/<id>/shim.sock must fit sun_path); t.TempDir is not.
+func shortRoot(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", "rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
 }

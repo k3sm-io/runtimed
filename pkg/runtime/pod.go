@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -218,28 +219,56 @@ type pod struct {
 	// adopted marks a pod AttachPod re-attached after a daemon restart rather
 	// than one this daemon created (attach.go). Its profile is recompiled and
 	// hash-verified at attach, so its containers restart and stop like any
-	// other; the latch refuses Exec only, because the running instances'
-	// resolved launch environment belongs to the previous daemon. logStreamLost is set when a container's output could not be resumed
-	// (it was spawned with pipes); the status then carries
-	// LogStreamLostConditionType from attachedAt. All three are immutable after
+	// other. Whether a running instance takes Exec is per container
+	// (containerProc.execRefusal), keyed on its record: a shim-backed instance
+	// is served by its shim. adopted and attachedAt are immutable after
 	// AttachPod.
-	adopted       bool
-	attachedAt    time.Time
-	logStreamLost bool
+	adopted    bool
+	attachedAt time.Time
+
+	// logStreamLostReason and logStreamLostAt, guarded by mu, carry the pod's
+	// LogStreamLostConditionType: the first reason a container's output stopped
+	// being followed (residentshim.go), and when. Empty means never.
+	logStreamLostReason string
+	logStreamLostAt     time.Time
+
+	// shimDirs maps each container name to its resident-shim dir, allocated at
+	// create (or attach, from the records) and re-used for every instance of
+	// the container; guarded by mu. Removed with the pod. Nil for a pod whose
+	// backend hosts no shim.
+	shimDirs map[string]string
 }
 
-// containerPIDs returns the pod's currently-running container PIDs (the memory
+// containerPIDs returns the pod's currently-running CONTAINER pids (the memory
 // sampler's PID set; re-evaluated each tick so an exited container drops out).
+// A container beside a resident shim is metered as the container itself
+// (ChildPID), never the shim: the shim's footprint is node overhead, not the
+// pod's.
 func (p *pod) containerPIDs() []int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pids := make([]int, 0, len(p.containers))
 	for _, cp := range liveContainersLocked(p) {
-		if pid := cp.proc.PID(); pid > 0 {
+		if pid := cp.proc.ChildPID(); pid > 0 {
 			pids = append(pids, pid)
 		}
 	}
 	return pids
+}
+
+// containerPgids returns the process GROUPS of the pod's running containers —
+// the key the reap's owned set and its records use (the group leader is the
+// resident shim when there is one).
+func (p *pod) containerPgids() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pgids := make([]int, 0, len(p.containers))
+	for _, cp := range liveContainersLocked(p) {
+		if pgid := cp.proc.PID(); pgid > 0 {
+			pgids = append(pgids, pgid)
+		}
+	}
+	return pgids
 }
 
 // liveContainersLocked returns the pod's containers that have not terminated.
@@ -343,6 +372,12 @@ type containerProc struct {
 	// written by the exec observer and read under pod.mu. The zero value means
 	// "not observed restricted".
 	shim shimInactive
+	// execRefusal, when set, is why Exec cannot enter this instance: it was
+	// re-attached without a shim (its launch environment belonged to the previous
+	// daemon), or its shim died or does not answer (errShimLost). Nil means Exec
+	// is served — through the shim for a shim-backed instance, by this daemon
+	// otherwise. Set before the entry is installed and never changed after.
+	execRefusal error
 	// ephemeral marks an entry of the pod's ephemeral (debug) container list
 	// (PodBox.ephemeral_containers). It reports under
 	// ephemeral_container_statuses, is excluded from the pod's phase
@@ -511,6 +546,23 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 	}
 
+	// Every container's resident-shim dir, before the profile is compiled: a
+	// container keeps its dir for the pod's life (RestartContainer and
+	// StartContainer re-use it). The pod profile does not name the dirs — it
+	// denies the whole shim root (sandbox.ShimSubdir) — so its digest stays a
+	// function of the spec and the posture; only each shim's own profile does.
+	var shimDirs map[string]string
+	if hostsResidentShim(r.backend) {
+		if shimDirs, err = r.allocShimDirs(box); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
+		}
+		defer func() {
+			if retErr != nil {
+				removeShimDirs(shimDirs)
+			}
+		}()
+	}
+
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
 	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths)
@@ -572,6 +624,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		cancel:  podCancel,
 
 		projState: projState,
+		shimDirs:  shimDirs,
 	}
 
 	// init_containers run first, sequentially; then the main containers start.
@@ -1156,6 +1209,7 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 		"pod", p.box.GetPodId(), "footprint_bytes", footprint)
 	for _, proc := range procs {
 		if pid := proc.PID(); pid > 0 {
+			proc.NoteKill(syscall.SIGKILL)
 			if err := r.signalGroup(pid, killSignal); err != nil {
 				r.log.Warn("oom sigkill pod group", "pod", p.box.GetPodId(), "pid", pid, "err", err)
 			}
@@ -1362,7 +1416,7 @@ func (r *Runtime) killUntrackedSpawn(ctx context.Context, p *pod, cp *containerP
 	// teardown that makes this spawn unwelcome, and a kill that skips itself
 	// because its context is gone is the leak this function exists to close.
 	if _, _, err := supervisor.GracefulStop(context.WithoutCancel(ctx), pid, 0, cp.proc.Done(),
-		termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+		termSignal, killSignal, cp.proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
 		r.log.Warn("sigkill an untracked container spawn",
 			"pod", p.box.GetPodId(), "container", cp.name, "pid", pid, "err", err)
 	}
@@ -1537,23 +1591,54 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		instance = onDisk
 	}
 	logPath := filepath.Join(logDir, containerLogFile(instance))
-	logw, err := crilog.Open(logPath)
-	if err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("open container log for %s: %w", c.GetName(), err)
-	}
-	fanout := &logFanout{}
 	spawnEnv := env
 	if argv0 != "" {
 		// The exec-shim substitutes it and strips it, so the container's
 		// environment (cp.env, what an Exec session enters) never carries it.
 		spawnEnv = append(append([]string{}, env...), supervisor.ExecArgv0Env+"="+argv0)
 	}
-	spec := supervisor.SpawnSpec{
-		Path: shimPath,
-		Argv: shimArgv,
-		Env:  spawnEnv,
-		Dir:  workingDir,
+	// A container's output goes either to its resident shim, which writes the
+	// CRI log itself and outlives this daemon, or — for a backend whose helper
+	// cannot stay resident — through pipes into a log writer held here.
+	var (
+		logw    *crilog.Writer
+		fanout  *logFanout
+		proc    *supervisor.Process
+		shimDir string
+	)
+	if hostsResidentShim(r.backend) {
+		if shimDir, err = r.containerShimDir(p, c.GetName()); err != nil {
+			_ = cleanup()
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
+		}
+		proc, cleanup, err = r.spawnBesideShim(p, shimLaunchPlan{
+			podID: p.box.GetPodId(), container: c.GetName(),
+			shimPath: shimPath, shimArgv: shimArgv,
+			env: spawnEnv, execEnv: env, workingDir: workingDir, logPath: logPath,
+		}, shimDir, cleanup)
+		if err != nil {
+			_ = cleanup()
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+				fmt.Errorf("prepare the resident shim for %s: %w", c.GetName(), err)
+		}
+	} else {
+		if logw, err = crilog.Open(logPath); err != nil {
+			_ = cleanup()
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("open container log for %s: %w", c.GetName(), err)
+		}
+		fanout = &logFanout{}
+		proc = supervisor.NewProcess(r.spawner, r.waiter, supervisor.SpawnSpec{
+			Path: shimPath,
+			Argv: shimArgv,
+			Env:  spawnEnv,
+			Dir:  workingDir,
+		}, containerLogSink(logw, fanout))
+	}
+	closeLog := func() {
+		if logw != nil {
+			_ = logw.Close()
+		}
 	}
 	cp := &containerProc{
 		name:         c.GetName(),
@@ -1563,13 +1648,13 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		fanout:       fanout,
 		env:          env,
 		workingDir:   workingDir,
+		proc:         proc,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
 			// Where this instance's output is. The node reads `kubectl logs`
-			// from exactly this path and rotates exactly this file, so it is
-			// published from the writer rather than re-derived.
-			LogPath: logw.Path(),
+			// from exactly this path and rotates exactly this file.
+			LogPath: logPath,
 			// The instance number and the restart count are ONE number: the
 			// file is named for the count, and a cold start recovers the count
 			// from the files (upstream's calcRestartCountByLogDir). A caller
@@ -1598,19 +1683,6 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			},
 		},
 	}
-	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, containerLogSink(logw, fanout))
-	// The container's stdio goes to files the daemon tails, not pipes, so its
-	// output — and the container — survive a daemon restart (see
-	// supervisor.CaptureToFiles and AttachPod).
-	capture, err := r.containerCapture(p.box.GetPodId(), c.GetName())
-	if err != nil {
-		_ = cleanup()
-		_ = logw.Close()
-		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("capture files for %s: %w", c.GetName(), err)
-	}
-	proc.CaptureToFiles(capture)
-	cp.proc = proc
 	// The observer runs on the reaper goroutine and locks pod.mu itself.
 	if obs := r.observeShim(p, cp, execArgv[0], env); obs != nil {
 		proc.ObserveExec(obs, execObserveTimeout)
@@ -1618,7 +1690,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 
 	if err := proc.Start(ctx); err != nil {
 		_ = cleanup()
-		_ = logw.Close()
+		closeLog()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("spawn container %s: %w", c.GetName(), err)
 	}
@@ -1629,12 +1701,21 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// across a daemon death. The just-spawned group is torn down through the
 	// injected seam (not a direct supervisor call) so the failure path is
 	// unit-observable.
-	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID(), profileDigest(p.profile))
+	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID(), profileDigest(p.profile), shimDir)
 	if err != nil {
+		proc.NoteKill(syscall.SIGKILL)
 		_ = r.signalGroup(proc.PID(), killSignal)
 		_ = cleanup()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("record container %s process group: %w", c.GetName(), err)
+	}
+	if shimDir != "" {
+		// Best-effort: the container's own identity, the one a group whose shim
+		// later dies can still be proven ours by. A daemon that dies before this
+		// write leaves a group a later daemon kills rather than adopts.
+		if _, err := r.recordChild(rec, proc.ChildPID(), proc.ChildStartUnixNano()); err != nil {
+			r.log.Warn("record the container's identity beside its shim", "pod", p.box.GetPodId(), "container", c.GetName(), "err", err)
+		}
 	}
 
 	// Publish this incarnation's identity, derived from the reap record just
@@ -1658,6 +1739,12 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	code, sig, err := cp.proc.Wait(ctx)
 	if cleanup != nil {
 		_ = cleanup()
+	}
+	// The container's shim died without its exit record while this daemon
+	// watched: the container may live on. Taken over, it is watched again by
+	// its own identity and nothing below runs for this exit.
+	if errors.Is(err, supervisor.ErrShimCrashed) && r.shimCrashed(ctx, p, cp) {
+		return
 	}
 
 	// Drop the durable reap record only once the process group is empty. The
@@ -1771,7 +1858,7 @@ func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runt
 		// --previous` finds the crashed run's output.
 		LogPath: cp.state.GetLogPath(),
 	}
-	exitUnknown := errors.Is(err, supervisor.ErrExitUnknown)
+	exitUnknown := errors.Is(err, supervisor.ErrExitUnknown) || errors.Is(err, supervisor.ErrShimCrashed)
 	switch {
 	case exitUnknown:
 		// A re-attached container (AttachPod) is not this daemon's child: its
@@ -1781,6 +1868,9 @@ func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runt
 		term.ExitCode = exitCodeUnknown
 		term.Reason = ExitStatusUnknownReason
 		term.Message = "the container was re-attached after a runtime daemon restart and is not a child of this daemon; its exit status cannot be read"
+		if errors.Is(err, supervisor.ErrShimCrashed) {
+			term.Message = "the container's resident shim exited without recording the container's exit status"
+		}
 		if p.oomKilled {
 			term.Reason = "OOMKilled"
 		}

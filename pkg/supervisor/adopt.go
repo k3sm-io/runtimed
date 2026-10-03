@@ -35,18 +35,17 @@ var ErrExitUnknown = errors.New("supervisor: exit status unknown: the process is
 // child, must be an AdoptedExitWaiter so the exit is reported as ErrExitUnknown
 // rather than as a fabricated status.
 //
-// With a sink and a capture, the previous daemon spawned pid with file-captured
-// stdio (CaptureToFiles), and the tails resume from the persisted offsets: the
-// output written while no daemon ran is delivered, stamped when it is read.
-// Without either, the process's output went to pipes that died with the old
-// daemon; there is nothing to tail and LogsDrained is closed from the start.
+// The process's output went to pipes that died with the old daemon, so there
+// is nothing to drain and LogsDrained is closed from the start. (A container
+// whose output must survive the daemon runs beside a resident shim, and is
+// re-attached through AdoptShim instead.)
 //
 // Done, Wait, PID and State behave as for a spawned Process, which is what lets
 // a graceful stop, the memory sampler and the status path treat the two alike.
 //
 // pid must be > 1: pid 1 is launchd and a pid <= 0 is a wait/kill wildcard, and
 // an adopted pid is later signalled as a process GROUP.
-func AdoptProcess(ctx context.Context, waiter ExitWaiter, pid int, sink LogSink, capture *FileCapture) (*Process, error) {
+func AdoptProcess(ctx context.Context, waiter ExitWaiter, pid int) (*Process, error) {
 	if pid <= 1 {
 		return nil, fmt.Errorf("supervisor: refusing to adopt pid %d (must be > 1)", pid)
 	}
@@ -55,18 +54,12 @@ func AdoptProcess(ctx context.Context, waiter ExitWaiter, pid int, sink LogSink,
 	}
 	p := &Process{
 		waiter:  waiter,
-		sink:    sink,
-		capture: capture,
 		state:   StateRunning,
 		pid:     pid,
 		done:    make(chan struct{}),
 		drained: make(chan struct{}),
 	}
-	if sink != nil && capture != nil {
-		p.startTails()
-	} else {
-		p.closeDrained()
-	}
+	p.closeDrained()
 	go p.reap(ctx, pid)
 	return p, nil
 }

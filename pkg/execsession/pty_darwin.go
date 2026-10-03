@@ -16,7 +16,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package runtime
+package execsession
 
 import (
 	"fmt"
@@ -26,7 +26,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// openPTY allocates a pseudoterminal master/slave pair on macOS for a tty exec.
+// OpenPTY allocates a pseudoterminal master/slave pair on macOS for a tty exec.
+// It must run unconfined: a process under a pod profile cannot open /dev/ptmx
+// or a tty node, which is why the daemon allocates a resident shim's ptys and
+// hands the slave over (supervisor.SendPtyHandoff).
 // golang.org/x/sys/unix has no posix_openpt(3) binding, so it uses the BSD path:
 // open the /dev/ptmx clone device, grant + unlock the slave (TIOCPTYGRANT /
 // TIOCPTYUNLK), resolve the slave node name (TIOCPTYGNAME), then open it
@@ -37,7 +40,7 @@ import (
 // The caller wires the returned slave to the exec'd command's stdin/stdout/stderr
 // (with Setsid+Setctty so the slave becomes its controlling tty) and reads/writes
 // the master. The caller owns closing both files.
-func openPTY() (master, slave *os.File, err error) {
+func OpenPTY() (master, slave *os.File, err error) {
 	m, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open /dev/ptmx: %w", err)
@@ -64,9 +67,9 @@ func openPTY() (master, slave *os.File, err error) {
 	return m, s, nil
 }
 
-// setWinsize applies a kubectl terminal-resize (TIOCSWINSZ) to the pty so a tty
+// SetWinsize applies a kubectl terminal-resize (TIOCSWINSZ) to the pty so a tty
 // exec's window size tracks the client. width/height are columns/rows.
-func setWinsize(f *os.File, width, height uint16) error {
+func SetWinsize(f *os.File, width, height uint16) error {
 	ws := &unix.Winsize{Row: height, Col: width}
 	if err := unix.IoctlSetWinsize(int(f.Fd()), unix.TIOCSWINSZ, ws); err != nil {
 		return fmt.Errorf("set winsize: %w", err)

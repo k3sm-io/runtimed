@@ -1414,9 +1414,8 @@ func TestContainerOutputReachesTheLogFile(t *testing.T) {
 	mustCreatePod(t, rt, box)
 	defer w.release(1001)
 
-	// The output is tailed from the container's capture file while it runs
-	// (supervisor.CaptureToFiles), so wait for the line rather than for a drain
-	// edge that now closes only once the process has exited.
+	// The output reaches the log while the container runs, so wait for the
+	// line rather than for a drain edge.
 	path := filepath.Join(box.GetLogDirectory(), "main", "0.log")
 	deadline := time.Now().Add(5 * time.Second)
 	for {

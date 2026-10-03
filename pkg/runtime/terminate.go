@@ -179,7 +179,7 @@ func (r *Runtime) terminateContainer(ctx context.Context, p *pod, cp *containerP
 		return containerExit{}, false, nil
 	}
 	if _, _, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
-		termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+		termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
 		r.log.Warn("terminate container: graceful stop", "pod", p.box.GetPodId(), "container", cp.name, "pid", pid, "err", err)
 	}
 	select {

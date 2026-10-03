@@ -254,8 +254,8 @@ func execGPUScript(t *testing.T, shim, profile string, env []string, dataVol, py
 	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Shim contract: <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <binary>...
-	argv := []string{"-1", "-1", "-", "-", "-", pf, python, path}
+	// Shim contract: launch <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <binary>...
+	argv := []string{"launch", "-1", "-1", "-", "-", "-", pf, python, path}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shim, argv...)

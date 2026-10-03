@@ -16,7 +16,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package runtime
+package execsession
 
 import (
 	"errors"
@@ -24,10 +24,11 @@ import (
 )
 
 // errPTYUnsupported reports that a tty exec (pty allocation) is darwin-only. The
-// runtime targets macOS; this stub lets the package build and run its non-tty
-// exec tests on linux CI. A tty exec off darwin fails closed with this error.
-var errPTYUnsupported = errors.New("runtime: tty exec (pty) requires darwin")
+// runtime targets macOS; this stub lets the package build on linux CI. A tty exec off darwin fails closed with this error.
+var errPTYUnsupported = errors.New("execsession: tty exec (pty) requires darwin")
 
-func openPTY() (*os.File, *os.File, error) { return nil, nil, errPTYUnsupported }
+// OpenPTY is unsupported off darwin.
+func OpenPTY() (*os.File, *os.File, error) { return nil, nil, errPTYUnsupported }
 
-func setWinsize(*os.File, uint16, uint16) error { return errPTYUnsupported }
+// SetWinsize is unsupported off darwin.
+func SetWinsize(*os.File, uint16, uint16) error { return errPTYUnsupported }

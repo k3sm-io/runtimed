@@ -20,16 +20,15 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"os/exec"
 	"strconv"
 	"sync"
-	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"k3sm.io/runtimed/pkg/crilog"
+	"k3sm.io/runtimed/pkg/execsession"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -73,12 +72,21 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if err != nil {
 		return err
 	}
-	if p.adopted {
-		return status.Errorf(codes.FailedPrecondition, "exec: %v", errAdoptedPod)
+	// Per container, keyed on how the running instance was started: a
+	// shim-backed instance is served by its shim (the only holder of its
+	// launch environment, and the one that survives a daemon restart); an
+	// instance with a refusal recorded cannot be entered faithfully.
+	if cp.execRefusal != nil {
+		return status.Errorf(codes.FailedPrecondition, "exec: %v", cp.execRefusal)
 	}
 	cmdv := first.GetCommand()
 	if len(cmdv) == 0 {
 		return status.Error(codes.InvalidArgument, "exec: command is required")
+	}
+	if cp.proc != nil {
+		if conn := cp.proc.Shim(); conn != nil {
+			return r.execViaShim(stream, conn, cp, first)
+		}
 	}
 
 	c := cp.spec
@@ -130,131 +138,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	}
 	cmd.Env = cmdEnv
 	cmd.Dir = dir
-	return r.runExec(stream, cmd, first.GetTty(), first.GetStdin())
-}
-
-// runExec wires the spawned command's stdio to the bidi stream, runs it to
-// completion, and delivers the exit code. stdout/stderr stream back to the
-// client; client stdin frames and tty resizes stream to the command. The
-// goroutines have bounded lifetimes: the output pumps end when the command's
-// output closes (process exit), and the stdin pump ends when the client
-// half-closes the stream (io.EOF) or the stream's context is cancelled (handler
-// return). gRPC stream.Send is serialized through send (it is not safe to call
-// concurrently from the stdout and stderr pumps).
-func (r *Runtime) runExec(stream runtimev1.Runtime_ExecServer, cmd *exec.Cmd, tty, wantStdin bool) error {
-	var sendMu sync.Mutex
-	send := func(resp *runtimev1.ExecResponse) error {
-		sendMu.Lock()
-		defer sendMu.Unlock()
-		return stream.Send(resp)
-	}
-
-	var (
-		wg          sync.WaitGroup
-		stdinW      io.Writer // where client stdin bytes are written (pipe or pty master)
-		stdinCloser io.Closer // closed on client EOF to signal command stdin EOF (non-tty only)
-		ttyMaster   *os.File  // pty master for resize + the closer below (tty only)
-	)
-
-	if tty {
-		master, slave, err := openPTY()
-		if err != nil {
-			return status.Errorf(codes.Internal, "exec: allocate tty: %v", err)
-		}
-		ttyMaster = master
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
-		if err := cmd.Start(); err != nil {
-			_ = slave.Close()
-			_ = master.Close()
-			return status.Errorf(codes.Internal, "exec: start: %v", err)
-		}
-		_ = slave.Close() // the child holds its dup; the parent keeps only the master
-		if wantStdin {
-			stdinW = master
-		}
-		// On a tty stdout and stderr are merged onto the line discipline; the master
-		// read ends with EIO once the child exits and the kernel closes the slave.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			pumpReader(master, func(b []byte) error { return send(&runtimev1.ExecResponse{Stdout: b}) })
-		}()
-	} else {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own pgrp; a client ^C never reaches the daemon
-		if wantStdin {
-			w, err := cmd.StdinPipe()
-			if err != nil {
-				return status.Errorf(codes.Internal, "exec: stdin pipe: %v", err)
-			}
-			stdinW, stdinCloser = w, w
-		}
-		stdoutR, err := cmd.StdoutPipe()
-		if err != nil {
-			return status.Errorf(codes.Internal, "exec: stdout pipe: %v", err)
-		}
-		stderrR, err := cmd.StderrPipe()
-		if err != nil {
-			return status.Errorf(codes.Internal, "exec: stderr pipe: %v", err)
-		}
-		if err := cmd.Start(); err != nil {
-			return status.Errorf(codes.Internal, "exec: start: %v", err)
-		}
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			pumpReader(stdoutR, func(b []byte) error { return send(&runtimev1.ExecResponse{Stdout: b}) })
-		}()
-		go func() {
-			defer wg.Done()
-			pumpReader(stderrR, func(b []byte) error { return send(&runtimev1.ExecResponse{Stderr: b}) })
-		}()
-	}
-
-	// Stdin + resize pump (bounded: ends on the client half-close or stream
-	// cancellation). Detached — we never wait on it before returning, since a
-	// client that keeps stdin open would otherwise block teardown; gRPC cancels the
-	// stream on handler return, which unblocks the Recv and ends this goroutine.
-	go func() {
-		for {
-			req, err := stream.Recv()
-			if err != nil {
-				if stdinCloser != nil {
-					_ = stdinCloser.Close() // EOF to the command's stdin
-				}
-				return
-			}
-			if d := req.GetStdinData(); len(d) > 0 && stdinW != nil {
-				if _, werr := stdinW.Write(d); werr != nil {
-					return
-				}
-			}
-			if rs := req.GetResize(); rs != nil && ttyMaster != nil {
-				_ = setWinsize(ttyMaster, uint16(rs.GetWidth()), uint16(rs.GetHeight()))
-			}
-		}
-	}()
-
-	// Drain all output before reaping (os/exec requires pipe reads to complete
-	// before Wait; the tty master pump ends on the child's exit), then reap.
-	wg.Wait()
-	waitErr := cmd.Wait()
-	if ttyMaster != nil {
-		_ = ttyMaster.Close()
-	}
-
-	exitCode := 0
-	if waitErr != nil {
-		var ee *exec.ExitError
-		if !errors.As(waitErr, &ee) {
-			return status.Errorf(codes.Internal, "exec: %v", waitErr)
-		}
-		exitCode = ee.ExitCode()
-		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			exitCode = 128 + int(ws.Signal())
-		}
-	}
-	return send(&runtimev1.ExecResponse{Exit: &runtimev1.ExecResult{ExitCode: int32(exitCode)}})
+	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin(), nil)
 }
 
 // Attach attaches to an already-running container's streams (`kubectl attach`).
@@ -311,6 +195,14 @@ func (r *Runtime) Attach(stream runtimev1.Runtime_AttachServer) error {
 	if cp.proc == nil {
 		return status.Errorf(codes.FailedPrecondition,
 			"attach %s/%s: container has not started", first.GetPodId(), first.GetContainer())
+	}
+	// A shim-backed container's output lives in its shim: follow it there.
+	if conn := cp.proc.Shim(); conn != nil {
+		return r.attachViaShim(stream, conn)
+	}
+	if cp.fanout == nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"attach %s/%s: the container's output is not followed by this daemon", first.GetPodId(), first.GetContainer())
 	}
 
 	var sendMu sync.Mutex
@@ -465,23 +357,6 @@ func (r *Runtime) lookupContainer(podID, container string) (*pod, *containerProc
 		return nil, nil, status.Errorf(codes.NotFound, "container %s not found in pod %s", container, podID)
 	}
 	return p, cp, nil
-}
-
-// pumpReader copies r in chunks to emit until r returns EOF or an error, or emit
-// fails (a dead stream). It is the streaming primitive for exec output.
-func pumpReader(r io.Reader, emit func([]byte) error) {
-	buf := make([]byte, pumpChunkSize)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			if e := emit(append([]byte(nil), buf[:n]...)); e != nil {
-				return
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
 }
 
 // attachChunk renders one live output chunk as an AttachResponse, on the field

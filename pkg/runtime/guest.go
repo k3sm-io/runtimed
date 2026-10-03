@@ -244,7 +244,7 @@ func (r *Runtime) execGuest(stream runtimev1.Runtime_ExecServer, p *pod, first *
 		return guestStreamError("exec", podID, err)
 	}
 
-	// Detached, exactly as the host-process runExec stdin pump is: a client that
+	// Detached, exactly as the host-process exec session stdin pump (execsession.Run) is: a client that
 	// holds stdin open must not block teardown, and the handler's return cancels
 	// ctx, which unblocks this goroutine's Recv.
 	go forwardExecInput(stream, agent)
