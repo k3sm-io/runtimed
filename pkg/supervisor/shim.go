@@ -48,7 +48,7 @@ import (
 // exit code and exec all survive the daemon.
 //
 // Everything both ends must agree on is defined once, here: the file names in
-// the shim dir, the exit record and its tmp+rename write, the launch spec that
+// the shim dir, the exit record and its in-place write, the launch spec that
 // crosses the shim's stdin, and the pty hand-off.
 
 const (

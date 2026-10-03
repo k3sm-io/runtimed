@@ -31,7 +31,7 @@ type dropSeam interface {
 
 // dropShim moves a resident shim to the pod's credential after it spawned the
 // container and before it confines itself: chown of paths (its shim dir and the
-// container's log, so it can still write its exit record and reopen the log as
+// container's log, so the descriptors it already holds for them stay usable as
 // the pod user), then setgid → initgroups → setuid. A credential without a drop
 // — every pod of the shipped unprivileged daemon — changes nothing; a drop is
 // refused unless euid is 0 (supervisor.Credential.Validate), exactly as the
