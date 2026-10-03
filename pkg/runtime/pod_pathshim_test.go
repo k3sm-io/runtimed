@@ -46,14 +46,11 @@ func mustEnvValue(t *testing.T, env []string, key string) string {
 	return v
 }
 
-// mountingBox builds a mounting host-binary box whose rootfs_path is the
-// runtime's own derived pod data volume. It was a hard-coded /var/lib/k3sm/...
-// literal, which B140 now refuses: rootfs_path must be byte-equal to the
-// derivation, and a literal cannot match a test runtime's temp-dir cache root.
+// mountingBox builds a mounting host-binary box on the runtime's own derived
+// pod data volume.
 func mountingBox(t *testing.T, rt *Runtime, podID string, mountPaths ...string) (*runtimev1.PodBox, *runtimev1.Container) {
 	t.Helper()
 	box := hostBinBox(rt, podID)
-	box.RootfsPath = derivedRootfs(t, rt, podID)
 	c := box.GetContainers()[0]
 	for _, mp := range mountPaths {
 		c.VolumeMounts = append(c.VolumeMounts, &runtimev1.VolumeMount{Name: "v", MountPath: mp})

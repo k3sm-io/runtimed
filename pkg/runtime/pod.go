@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/image"
@@ -34,7 +35,9 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -374,6 +377,7 @@ func (cp *containerProc) sidecar() bool {
 // host-process spine has no use for it in any case — a host process binds a /32
 // lo0 alias via r.network.Setup and never reads a guest config.
 func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod, _ runtimev1.FailureReason, retErr error) {
+	r.warnRetiredRootfsField(box)
 	sp := box.GetSandboxProfile()
 	if sp == nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -418,8 +422,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// backend: an UNSPECIFIED request the ladder degraded to vm legitimately
 	// honours Memory, and refusing it here would reject a pod that runs fine.
 	// It must run before the rootfs MkdirAll below (and provisionPodTmpDir /
-	// recordPodReferences), the same reasoning the pod_id/rootfs_path checks in
-	// validatePodBox already use for their own sinks — a refused pod must leave
+	// recordPodReferences), the same reasoning the pod_id check in
+	// validatePodBox already uses for its own sinks — a refused pod must leave
 	// no trace on disk.
 	if vol, medium, ok := nonEmptyEmptyDirMedium(box); ok {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -523,7 +527,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// strictly before posix_spawn → the exec-shim drop.
 	//
 	// The walk's bound is this pod's own dir, not the shared pods root: rootfs is
-	// already the validated derivation (rootfsPath), so this is defence at the
+	// already the derivation (rootfsPath), so this is defence at the
 	// sink — the recursive group-rwx + setgid grant refuses any root outside that
 	// dir regardless of how the caller obtained it, the same shape
 	// removePodDir puts on its RemoveAll. A pods-root bound would be one level too
@@ -841,10 +845,9 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// Compute the virtiofs share-device plan from the box's volumes —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
-	// guest-init composes the binds). The pod dir is derived locally (r.podDir), and the planner ignores
-	// box.rootfs_path for share roots; rootfsPath below derives the host-side
-	// VMSpec.RootfsPath the same way, accepting a caller-supplied rootfs_path
-	// only when it is byte-equal to that derivation.
+	// guest-init composes the binds). The pod dir is derived locally (r.podDir),
+	// and rootfsPath below derives the host-side guest rootfs dir the same way;
+	// no caller-supplied path feeds either.
 	//
 	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
 	// pattern (validate.go): the plan is computed before this path touches
@@ -977,7 +980,6 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
-		RootfsPath:  vmRootfs,
 		Network:     netCfg,
 		Containers:  cplan.containers,
 		Volumes:     vmVolumePlan(plan),
@@ -3106,75 +3108,126 @@ func containerMountPaths(c *runtimev1.Container) []string {
 	return paths
 }
 
-// errUncontainedRootfs is the sentinel for a box whose rootfs_path is not this
-// pod's own derived data volume. Callers surface it as an invalid-argument
-// failure (FAILURE_REASON_INVALID_POD_BOX); it is never retried, since the value
-// cannot become acceptable without the caller changing it.
-var errUncontainedRootfs = errors.New("rootfs_path is not the pod's derived data volume")
-
 // rootfsPath returns the on-disk pod data volume for box: always the
-// cache-derived <Root>/pods/<pod_id>/rootfs. A non-empty box.rootfs_path is
-// accepted only when it is byte-equal to that derived path; anything else is
-// refused with errUncontainedRootfs and no path at all, so no caller can act on
-// a value that was never checked. createPod, createVMPod, containerEnv, Exec and
-// RestartContainer share it, so the pod cwd / SBPL scope / VM rootfs is resolved
-// one way.
+// cache-derived <Root>/pods/<pod_id>/rootfs, and never anything the caller sent.
+// Its only error is an invalid pod id. createPod, createVMPod, containerEnv, Exec
+// and RestartContainer share it, so the pod cwd / SBPL scope / vm rootfs share
+// is resolved one way.
 //
-// Why this is a root-daemon hole: rootfs_path arrives over the runtimed gRPC
-// seam, and the daemon's socket is not denied by the default pod sandbox
-// profile (only the netd helper socket is) while pods run at the daemon's own
-// uid — so a confined pod can issue CreatePod itself. The value then flows into
-// os.MkdirAll, mount.Materialize, volume.Binder.Bind, supervisor.ChownForFSGroup
-// (a recursive Lchown + Chmod that grants the group the owner's rwx and sets
-// setgid on every directory), the resolved binary path, the K3SM_ROOTFS shim env,
-// the Exec cwd and sandbox.VMSpec.RootfsPath. Unvalidated, that is
-// privilege-escalation-from-a-confined-pod, not merely a control-plane-compromise
-// amplifier.
+// Why the path is derived and never accepted: PodBox once carried a
+// caller-supplied rootfs path (field 4, now retired), and the daemon no longer
+// reads it. That input was a root-daemon hole: it arrived over the runtimed gRPC
+// seam, whose socket the default pod sandbox profile does not deny (only the
+// netd helper socket is) while pods run at the daemon's own uid, so a confined
+// pod could issue CreatePod itself. The value flowed into os.MkdirAll,
+// mount.Materialize, volume.Binder.Bind, supervisor.ChownForFSGroup (a
+// recursive Lchown + Chmod that grants the group the owner's rwx and sets setgid
+// on every directory), the resolved binary path, the K3SM_ROOTFS shim env, the
+// Exec cwd and the vm guest's rootfs share. Validating a caller's spelling had
+// to reason about cross-pod ids, symlinks under the pod's own writable volume,
+// case aliasing on case-insensitive APFS and firmlink spellings; deriving the
+// path leaves nothing to compare. A box that still carries the retired field is
+// logged by createPod and UpdatePod (see retiredRootfsField) and is otherwise
+// ignored.
 //
-// Why byte-equality and not "strictly under the pods root": a containment
-// predicate is weaker in three distinct ways, each of which byte-equality makes
-// structurally impossible without resolving anything on disk:
-//
-//   - Cross-pod. <PodsRoot>/<victim-id>/rootfs passes any prefix test, handing
-//     the caller another pod's materialized secrets and projected SA-token — and
-//     removePodDir derives its target from the attacker's id, so the damage is
-//     never cleaned up.
-//   - Symlink-blind. A lexical check cannot see that <PodsRoot>/<own-id>/rootfs/
-//     link is a symlink to /var/lib/k3sm/server: the pod's own data volume is
-//     writable at both the POSIX and the SBPL layer (it is re-allowed after the
-//     protected denies), and MkdirAll / Materialize follow the link.
-//   - Case aliasing. The default APFS volume is case-insensitive, so an
-//     uppercase spelling of another pod's id names that pod's directory — the
-//     same class podIDRe's lowercase-only rule closed for pod_id itself.
-//
-// Firmlink spellings (/var vs /private/var) are likewise refused, because the
-// derived path is the only accepted spelling — fail-closed: normalizing aliases
-// would mean resolving the path, and a resolver that mis-parses fails open.
-// Every producer today leaves the field empty (no caller in k3sm sets it), so
-// the guard is behaviour-neutral: the accept branch can only ever return the
-// value the derivation already computes.
-//
-// Scope, honestly: this closes the rootfs_path daemon-input hole only. It does
-// not make same-node pods mutually isolated — pods still share the daemon's uid,
-// so untrusted multi-tenancy still routes to the vm RuntimeClass. The sibling
-// wire path SandboxProfile.data_volume_path is validated separately, by
-// dataVolumePath below (which accepts only this pod's own two derived
-// spellings); do not read either check as "wire paths are validated" in general.
+// Scope, honestly: this closes the caller-supplied-rootfs daemon-input hole
+// only. It does not make same-node pods mutually isolated — pods still share the
+// daemon's uid, so untrusted multi-tenancy still routes to the vm RuntimeClass.
+// The sibling wire path SandboxProfile.data_volume_path is validated
+// separately, by dataVolumePath below (which accepts only this pod's own two
+// derived spellings); do not read either as "wire paths are validated" in
+// general.
 func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
 	id, err := image.ParsePodID(box.GetPodId())
 	if err != nil {
 		return "", err
 	}
-	derived := r.cache.PodRootfs(id)
-	if rootfs := box.GetRootfsPath(); rootfs != "" && rootfs != derived {
-		return "", fmt.Errorf("%w: %q is not %q", errUncontainedRootfs, rootfs, derived)
+	return r.cache.PodRootfs(id), nil
+}
+
+// retiredFieldLogCap bounds the retired field's value in the Warn line, so a
+// crafted multi-megabyte value cannot flood the daemon log.
+const retiredFieldLogCap = 256
+
+// retiredRootfsField reports the value of PodBox field 4 — rootfs_path in older
+// apis releases, retired because the daemon derives the pod rootfs itself — and
+// ok=false when the box does not carry it. It never names the generated Go
+// accessor, so it compiles unchanged once the field is removed from the
+// schema: it reads field number 4 through the message descriptor while the
+// descriptor still declares it, and otherwise scans the unknown-field bytes for
+// tag 4 with the length-delimited wire type (any other wire type under tag 4 is
+// not this field and is skipped). The last occurrence wins, matching proto
+// merge semantics; a malformed tail stops the scan and keeps what was found
+// before it.
+//
+// The value is the attack signal only: no current producer sets the field, so
+// a box carrying it is an old producer or a confined pod probing the daemon
+// socket. It is logged (see warnRetiredRootfsField) and reaches no other sink.
+func retiredRootfsField(box *runtimev1.PodBox) (string, bool) {
+	if box == nil {
+		return "", false
 	}
-	return derived, nil
+	m := box.ProtoReflect()
+	if fd := m.Descriptor().Fields().ByNumber(4); fd != nil && fd.Kind() == protoreflect.StringKind && m.Has(fd) {
+		return m.Get(fd).String(), true
+	}
+	var (
+		val   string
+		found bool
+	)
+	b := m.GetUnknown()
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+		if num == 4 && typ == protowire.BytesType {
+			v, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				break
+			}
+			val, found = string(v), true
+			b = b[n:]
+			continue
+		}
+		n = protowire.ConsumeFieldValue(num, typ, b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+	}
+	return val, found
+}
+
+// warnRetiredRootfsField logs, once per call and at Warn, that box carries the
+// retired field 4, with the pod id and the value each truncated to
+// retiredFieldLogCap bytes: UpdatePod reaches here before the pod id is
+// validated, so both are caller-controlled. The value is ignored otherwise.
+func (r *Runtime) warnRetiredRootfsField(box *runtimev1.PodBox) {
+	v, ok := retiredRootfsField(box)
+	if !ok {
+		return
+	}
+	r.log.Warn("PodBox carries retired field 4; ignored",
+		"pod_id", capLogValue(box.GetPodId()), "value", capLogValue(v))
+}
+
+// capLogValue truncates s to retiredFieldLogCap bytes on a rune boundary.
+func capLogValue(s string) string {
+	if len(s) <= retiredFieldLogCap {
+		return s
+	}
+	cut := retiredFieldLogCap
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…(truncated)"
 }
 
 // errUnderivedDataVolume is the sentinel for a box whose
 // sandbox_profile.data_volume_path is not one of this pod's own derived data
-// volumes. Like errUncontainedRootfs it surfaces as FAILURE_REASON_INVALID_POD_BOX
+// volumes. It surfaces as FAILURE_REASON_INVALID_POD_BOX
 // and is never retried: the value cannot become acceptable without the caller
 // changing it.
 var errUnderivedDataVolume = errors.New("data_volume_path is not the pod's derived data volume")

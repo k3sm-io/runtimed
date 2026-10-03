@@ -157,7 +157,6 @@ func labSpec(t *testing.T, root string) VMSpec {
 		PodID:           "p1",
 		Vcpus:           2,
 		MemoryBytes:     1 << 30,
-		RootfsPath:      filepath.Join(podDir, "rootfs"),
 		PodDir:          podDir,
 		AgentSocketPath: filepath.Join(root, "run", "vm", "p1", "agent.sock"),
 		StopGrace:       7 * time.Second,

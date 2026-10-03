@@ -47,7 +47,6 @@ func TestRefreshProjectedVolumesIsItsOwnPath(t *testing.T) {
 		PodId:           podID,
 		Namespace:       "default",
 		Name:            "p",
-		RootfsPath:      dataVol,
 		LogDirectory:    testPodLogDir(rt, podID),
 		SandboxProfile:  &runtimev1.SandboxProfile{DataVolumePath: dataVol},
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,

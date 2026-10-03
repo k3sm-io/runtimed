@@ -128,9 +128,9 @@ func TestDataVolumePathMustBeDerived(t *testing.T) {
 		podID:   "pod-deeper",
 		dataVol: filepath.Join(podsRoot, "pod-deeper", "rootfs", "volumes"),
 	}, {
-		// The firmlink alias of the derived path: refused, fail-closed, for the
-		// same reason rootfs_path refuses it (normalizing means resolving, and a
-		// resolver that mis-parses fails OPEN).
+		// The firmlink alias of the derived path: refused, fail-closed
+		// (normalizing means resolving, and a resolver that mis-parses fails
+		// OPEN).
 		name:    "firmlink-alias-spelling-of-the-derivation",
 		podID:   "pod-firm",
 		dataVol: "/private" + rt.cache.PodRootfs(mustPodID(t, "pod-firm")),
