@@ -47,7 +47,7 @@ static int k3smExecMarked(const char *path, char *const argv[], char *const envp
 	if ((rc = posix_spawnattr_init(&attr)) != 0) return rc;
 	sigset_t empty;
 	sigemptyset(&empty);
-	posix_spawnattr_setsigmask(&attr, &empty);
+	if ((rc = posix_spawnattr_setsigmask(&attr, &empty)) != 0) goto out;
 	if ((rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_SETSIGMASK)) != 0) goto out;
 	if ((*setRC = posix_spawnattr_setpcontrol_np(&attr, POSIX_SPAWN_PCONTROL_KILL)) != 0) {
 		rc = *setRC;
@@ -131,11 +131,19 @@ func (s *podLaunchSeam) SandboxApply() error { return confine(s.profile) }
 // marked, and the mark would not survive execve) and an exec session (the shim
 // was started by fork+exec, which clears it anyway).
 //
-// The mark is a preference, never a gate: when the marked exec fails, the plain
-// execve below runs and the pod starts unmarked, or fails with the error execve
-// reports. Nothing is printed for that fallback — the shim's stderr is the pod's
-// log, and the daemon's startup self-check is where a host that cannot carry the
-// mark is reported.
+// The mark orders victims under paging-space exhaustion; it is NOT an isolation
+// control — a pod can clear its own mark, re-exec, or fork unmarked children.
+//
+// It is a preference, never a gate: when the marked exec fails, the plain execve
+// below runs and the pod starts unmarked, or fails with the error execve
+// reports. That fallback is not reported per pod (the shim's stderr is the
+// pod's log, so nothing is printed). The daemon's startup self-check proves only
+// the spawn-attribute path, not this exec-time mark; the exec-time mark is
+// proven by the integration test of the real shim chain.
+//
+// A path, argv or env element holding a NUL byte skips the marked exec: C
+// strings would silently truncate it, while unix.Exec refuses it with EINVAL
+// exactly as before.
 func (s *podLaunchSeam) Exec() error {
 	runtime.LockOSThread()
 	if wasBlocked := C.k3smUnblockSignals(); wasBlocked != 0 {
@@ -143,7 +151,9 @@ func (s *podLaunchSeam) Exec() error {
 		fmt.Fprintln(os.Stderr, "k3sm-execshim: cleared a blocked signal mask before exec (SIGTERM was blocked)")
 	}
 	env := os.Environ()
-	_ = execMarked(s.path, s.argv, env) // returns only on failure; fall back below
+	if !hasNUL(s.path, s.argv, env) {
+		_ = execMarked(s.path, s.argv, env) // returns only on failure; fall back below
+	}
 	if err := unix.Exec(s.path, s.argv, env); err != nil {
 		return fmt.Errorf("execve %s: %w", s.path, err)
 	}

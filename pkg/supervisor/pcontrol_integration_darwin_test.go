@@ -233,14 +233,13 @@ func TestIntegrationPodSpawnPcontrolReadback(t *testing.T) {
 	})
 }
 
-// TestIntegrationConfinedPodCannotClearPcontrol PINS what a confined pod can do
+// TestIntegrationConfinedPodCanClearPcontrolToday PINS what a confined pod can do
 // to its own mark today. A helper running under the real pod profile reads its
 // mark, calls proc_setpcontrol(PROC_SETPC_NONE) on itself and reads it again.
 // The observed behaviour (see the assertion) is recorded, not endorsed: today
-// the pod starts marked and CAN clear its own mark (the name states the
-// property one would want, the assertion states the one that holds). The test
-// fails when the observation changes, so a profile or OS change is noticed.
-func TestIntegrationConfinedPodCannotClearPcontrol(t *testing.T) {
+// the pod starts marked and CAN clear its own mark. The test fails when the
+// observation changes, so a profile or OS change is noticed.
+func TestIntegrationConfinedPodCanClearPcontrolToday(t *testing.T) {
 	shim := buildShim(t)
 	profile, dataVol := podProfile(t, "pod-pcontrol-clear")
 

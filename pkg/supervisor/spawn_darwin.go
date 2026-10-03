@@ -225,6 +225,11 @@ type PosixSpawner struct {
 	// so a pod, not a control-plane process, is the memory-exhaustion victim.
 	// The mark is fail-soft: a spawn that cannot carry it runs unmarked (one
 	// Warn, UnmarkedSpawns increments) rather than failing the pod.
+	// It orders victims under paging-space exhaustion; it is NOT an isolation
+	// control — a pod can clear its own mark, re-exec, or fork unmarked
+	// children. VerifyPressureKill proves this spawn attribute only; a child
+	// that execs (the exec-shim) keeps the mark only because the shim re-applies
+	// it at its exec, which the startup self-check does not cover.
 	PressureKill bool
 }
 
