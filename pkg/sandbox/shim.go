@@ -77,7 +77,17 @@ type ShimGrant struct {
 //     leads, and kills an exec session whose stream ended. The container runs
 //     under another sandbox instance, and without this a confined process may
 //     signal nothing but itself (measured: EPERM). Neither target reaches a
-//     process outside this pod's group or the shim's own children.
+//     process outside this pod's group or the shim's own children;
+//   - system-sched on itself only: a BestEffort pod's exec session places
+//     itself in the darwin background band (setpriority(PRIO_DARWIN_PROCESS,
+//     0, PRIO_DARWIN_BG)) after the shim confined itself, and the pod profile
+//     denies that call (measured: EPERM, the call admitted by system-sched and
+//     by no process-info* operation). The container needs no such grant: its
+//     launch child sets the band BEFORE it applies the pod profile. The
+//     (target self) filter is enforced (measured: the same call on another
+//     pid, and a renice of another pid, stay EPERM), so a session can change
+//     only its own scheduling, which an unprivileged process may only lower
+//     or toggle in and out of the background band (TestShimProfileReach).
 //
 // It grants NO write of any kind. Everything the shim writes it opened before it
 // confined itself (the exit record, the CRI log) or was handed as a descriptor
@@ -105,6 +115,7 @@ func ShimProfile(podProfile string, g ShimGrant) (string, error) {
 	b.WriteString("  )\n")
 	b.WriteString(shimTTYIoctl)
 	b.WriteString(shimSignal)
+	b.WriteString(shimSched)
 	return b.String(), nil
 }
 
@@ -113,3 +124,6 @@ const shimTTYIoctl = "(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n"
 
 // shimSignal is the grant's signal tier (see ShimProfile).
 const shimSignal = "(allow signal (target children))\n(allow signal (target pgrp))\n"
+
+// shimSched is the grant's scheduling tier (see ShimProfile).
+const shimSched = "(allow system-sched (target self))\n"

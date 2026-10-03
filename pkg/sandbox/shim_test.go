@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -199,6 +200,7 @@ func TestShimProfileIsThePodProfilePlusTheGrant(t *testing.T) {
 		`allow file-read* (subpath "/var/lib/k3sm/run/shim/0a1b2c3d")`,
 		`allow signal (target children)`,
 		`allow signal (target pgrp)`,
+		`allow system-sched (target self)`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("the grant:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -224,8 +226,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"syscall"
 )
+
+// PRIO_DARWIN_PROCESS and PRIO_DARWIN_BG, <sys/resource.h>.
+const prioDarwinProcess, prioDarwinBG = 4, 0x1000
 
 func main() {
 	op, path := os.Args[1], os.Args[2]
@@ -253,6 +259,11 @@ func main() {
 		}
 	case "unlink":
 		err = os.Remove(path)
+	case "bg":
+		var pid int
+		if pid, err = strconv.Atoi(path); err == nil {
+			err = syscall.Setpriority(prioDarwinProcess, pid, prioDarwinBG)
+		}
 	}
 	switch {
 	case err == nil:
@@ -268,8 +279,9 @@ func main() {
 // TestShimProfileReach is the exec-session-reach regression: a process under the
 // shim profile — what every exec session runs under — cannot open the exit
 // record or the CRI log for writing, cannot connect to or unlink either shim
-// socket, and cannot open a terminal node it did not inherit, so the tty ioctl
-// grant adds no reach. The read of the exit record succeeding is the control:
+// socket, cannot open a terminal node it did not inherit, so the tty ioctl
+// grant adds no reach, and cannot change another process's scheduling, so the
+// scheduling grant reaches only the caller. The read of the exit record succeeding is the control:
 // the probe runs, and the grant it does carry is live.
 func TestShimProfileReach(t *testing.T) {
 	if runtime.GOOS != "darwin" {
@@ -334,13 +346,36 @@ func TestShimProfileReach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sb := filepath.Join(t.TempDir(), "shim.sb")
+	sb, podSB := filepath.Join(t.TempDir(), "shim.sb"), filepath.Join(t.TempDir(), "pod.sb")
 	if err := os.WriteFile(sb, []byte(shim), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run := func(op, path string) string {
-		out, _ := exec.Command("/usr/bin/sandbox-exec", "-f", sb, bin, op, path).CombinedOutput()
+	if err := os.WriteFile(podSB, []byte(pod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runUnder := func(profile, op, path string) string {
+		out, _ := exec.Command("/usr/bin/sandbox-exec", "-f", profile, bin, op, path).CombinedOutput()
 		return strings.TrimSpace(string(out))
+	}
+	run := func(op, path string) string { return runUnder(sb, op, path) }
+
+	// The scheduling grant: a session may place ITSELF in the darwin
+	// background band (a BestEffort exec session does, after the shim
+	// confined itself), which the pod profile alone refuses, and may not
+	// place another process there.
+	if got := runUnder(podSB, "bg", "0"); got != "DENIED:EPERM" {
+		t.Fatalf("control: the pod profile alone admitted setpriority(PRIO_DARWIN_BG) on self: %q, want DENIED:EPERM", got)
+	}
+	if got := run("bg", "0"); got != "OK" {
+		t.Fatalf("a process under the shim profile could not place itself in the background band: %q, want OK", got)
+	}
+	other := exec.Command("/bin/sleep", "30")
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.Process.Kill(); _ = other.Wait() }()
+	if got := run("bg", strconv.Itoa(other.Process.Pid)); got != "DENIED:EPERM" {
+		t.Errorf("a process under the shim profile could place another process in the background band: %q, want DENIED:EPERM", got)
 	}
 	if got := run("openr", exitRec); got != "OK" {
 		t.Fatalf("control: reading the exit record under the shim profile = %q, want OK\n--- profile ---\n%s", got, shim)

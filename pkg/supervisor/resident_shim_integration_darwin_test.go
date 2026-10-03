@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -50,6 +51,14 @@ type residentShim struct {
 // startResidentShim builds the shim, renders the pod profile and the shim
 // profile, and starts a container whose script prints "tick <n>" every 100ms.
 func startResidentShim(t *testing.T) residentShim {
+	t.Helper()
+	return startResidentShimQoS(t, false)
+}
+
+// startResidentShimQoS is startResidentShim with the pod's background-QoS
+// decision: bg is a BestEffort pod, whose container and exec sessions run in
+// the darwin background band.
+func startResidentShimQoS(t *testing.T, bg bool) residentShim {
 	t.Helper()
 	shim := buildShim(t)
 	profile, dataVol := podProfile(t, "pod-resident")
@@ -82,7 +91,7 @@ func startResidentShim(t *testing.T) residentShim {
 	script := "i=0; while :; do echo tick $i; i=$((i+1)); /bin/sleep 0.1; done"
 	// /bin/bash, not /bin/sh: the sh dispatcher re-execs bash with a plain
 	// execve, which clears the pressure-kill mark this test pins.
-	launch := []string{"-1", "-1", "-", "-", "-", profile, "/bin/bash", "-c", script}
+	launch := []string{"-1", "-1", "-", "-", supervisor.EncodeQoS(bg), profile, "/bin/bash", "-c", script}
 	ctx, cancel := context.WithCancel(context.Background())
 	proc := supervisor.NewShimProcess(supervisor.PosixSpawner{PressureKill: true}, supervisor.KqueueReaper{},
 		supervisor.SpawnSpec{Path: shim, Argv: []string{shim, supervisor.ShimModeServe}, Env: []string{}, Dir: dataVol},
@@ -340,6 +349,73 @@ func TestResidentShimSurvivesTheDaemon(t *testing.T) {
 		t.Fatalf("no output was logged after the reconnect (%d <= %d)", n, before)
 	}
 	t.Logf("log continuous over %s ticks", strconv.Itoa(ticks(t, rs.logPath)))
+}
+
+// TestBestEffortExecThroughTheShim is the background-band exec gate: a
+// BestEffort container (BgQoS set) under the real shim answers an exec, and
+// both the container and the exec session run in the darwin background band.
+// The session places itself in the band after the shim confined itself, so it
+// is the shim profile, not the pod profile, that must admit the call.
+func TestBestEffortExecThroughTheShim(t *testing.T) {
+	rs := startResidentShimQoS(t, true)
+	child := rs.proc.ChildPID()
+	awaitComm(t, child, "bash")
+	awaitTicks(t, rs.logPath, 1)
+	if !darwinBG(t, child) {
+		t.Fatal("the BestEffort container does not run in the darwin background band")
+	}
+	conn := rs.proc.Shim()
+	if out, code := execEcho(t, conn); code != 0 || strings.TrimSpace(out) != "hello" {
+		t.Fatalf("exec /bin/echo into a BestEffort container through the shim: exit %d output %q", code, out)
+	}
+	// A held session's band, read from outside: the session is the shim's
+	// child running /bin/sleep.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hold, err := conn.Exec(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hold.Send(&runtimev1.ExecRequest{Container: "c", Command: []string{"/bin/sleep", "30"}}); err != nil {
+		t.Fatal(err)
+	}
+	session := awaitShimChild(t, rs.proc.PID(), "sleep")
+	if !darwinBG(t, session) {
+		t.Fatal("the BestEffort exec session does not run in the darwin background band")
+	}
+}
+
+// awaitShimChild returns the pid of the shim's child whose command is comm.
+func awaitShimChild(t *testing.T, shimPid int, comm string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		out, _ := exec.Command("/usr/bin/pgrep", "-P", strconv.Itoa(shimPid), "-x", comm).Output()
+		if f := strings.Fields(string(out)); len(f) == 1 {
+			pid, err := strconv.Atoi(f[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			return pid
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("the shim %d never had a %q child", shimPid, comm)
+	return 0
+}
+
+// darwinBG reports whether pid runs in the darwin background band: its
+// scheduling priority, as ps(1) reads it, is MAXPRI_THROTTLE (4) there and 31
+// at the default band (measured). getpriority(PRIO_DARWIN_PROCESS) cannot
+// answer this for another process: it reports 0 for any pid but the caller's
+// own (measured on a taskpolicy -b process).
+func darwinBG(t *testing.T, pid int) bool {
+	t.Helper()
+	out, err := exec.Command("/bin/ps", "-o", "pri=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		t.Fatalf("ps -o pri= -p %d: %v", pid, err)
+	}
+	return strings.TrimSpace(string(out)) == "4"
 }
 
 // TestExecSessionDiesWithItsStream pins the exec-session invariant against a

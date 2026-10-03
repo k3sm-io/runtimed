@@ -38,7 +38,10 @@ func (sessionSeam) SandboxApply() error { return nil }
 // rlimit plan and QoS band (the two launch-spec tokens) and execs argv marked
 // pcontrol-KILL, preserving the environment. It never drops privilege — the
 // resident shim already runs as the pod's credential — and applies no profile.
-// It returns only on error.
+// Unlike the container's launch child, it sets the band from INSIDE the
+// confinement, so the shim profile's self-only system-sched grant
+// (sandbox.ShimProfile) is what admits the call; a refusal is the session's
+// error. It returns only on error.
 //
 // It is reachable as a confined exec session only through a resident shim; a
 // caller that runs it directly gets an unconfined process, which that caller
