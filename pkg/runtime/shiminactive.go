@@ -67,13 +67,21 @@ const ShimInactiveLibraryValidationReason = "LibraryValidationMainProcess"
 // known not to have loaded (see supervisor.ClassifyShimLoad).
 const ShimInactiveUnknownReason = "ShimLoadUnknown"
 
+// ShimInactiveRestrictedChildReason is the condition's reason when the only
+// cause is that a container's processes ran platform binaries the pod shim
+// cannot load into (dyld scrubs DYLD_* from them), as reported by the path
+// shim from inside the pod (childreport.go). It is advisory: the pod can
+// forge or suppress the report. It ranks below every main-process reason.
+const ShimInactiveRestrictedChildReason = "RestrictedChildProcess"
+
 // shimReasonRank orders the condition reasons for a pod whose containers have
 // different ones: the highest-ranked reason any container has is the pod's.
 var shimReasonRank = map[string]int{
-	ShimInactiveUnknownReason:           1,
-	ShimInactiveLibraryValidationReason: 2,
-	ShimInactiveHardenedReason:          3,
-	ShimInactiveReason:                  4,
+	ShimInactiveRestrictedChildReason:   1,
+	ShimInactiveUnknownReason:           2,
+	ShimInactiveLibraryValidationReason: 3,
+	ShimInactiveHardenedReason:          4,
+	ShimInactiveReason:                  5,
 }
 
 // execObserveTimeout bounds how long a container start waits for the
@@ -171,21 +179,33 @@ func (r *Runtime) observeShim(p *pod, cp *containerProc, path string, env []stri
 // shimInactiveConditionLocked renders the pod's shim-inactive verdicts as one
 // condition, or nil when no container has one. Its reason is the
 // highest-precedence reason any container has: Restricted > Hardened >
-// LibraryValidation > Unknown. The caller holds p.mu.
+// LibraryValidation > Unknown > RestrictedChild. A container with both a
+// main-process verdict and reported children keeps its main-process reason
+// and message, with the children's clause appended. The caller holds p.mu.
 func shimInactiveConditionLocked(p *pod) *runtimev1.PodCondition {
 	var msgs []string
 	var first time.Time
 	reason := ""
+	note := func(r string, at time.Time) {
+		if shimReasonRank[r] > shimReasonRank[reason] {
+			reason = r
+		}
+		if first.IsZero() || at.Before(first) {
+			first = at
+		}
+	}
 	for _, cp := range p.containers {
-		if !cp.shim.inactive {
-			continue
-		}
-		msgs = append(msgs, cp.shim.message)
-		if shimReasonRank[cp.shim.reason] > shimReasonRank[reason] {
-			reason = cp.shim.reason
-		}
-		if first.IsZero() || cp.shim.at.Before(first) {
-			first = cp.shim.at
+		child := len(cp.childShim.names) > 0
+		switch {
+		case cp.shim.inactive && child:
+			msgs = append(msgs, cp.shim.message+"; "+childShimMessage(cp.name, cp.childShim.names))
+			note(cp.shim.reason, cp.shim.at)
+		case cp.shim.inactive:
+			msgs = append(msgs, cp.shim.message)
+			note(cp.shim.reason, cp.shim.at)
+		case child:
+			msgs = append(msgs, childShimMessage(cp.name, cp.childShim.names))
+			note(ShimInactiveRestrictedChildReason, cp.childShim.at)
 		}
 	}
 	if len(msgs) == 0 {

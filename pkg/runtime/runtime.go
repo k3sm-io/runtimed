@@ -402,6 +402,11 @@ type Runtime struct {
 	// restricted-main-process detection; nil disables it (Deps.CodeSignStatus).
 	codeSignStatus func(pid int) (uint32, error)
 
+	// childRestricted decides whether a path a pod reported as an unshimmed
+	// child is a restricted platform file (childreport.go); nil means the
+	// production supervisor.RestrictedPlatformFile. Unit tests set it.
+	childRestricted func(path string) bool
+
 	// shadowLstat is the trust check's lstat (shadow.go verifyShadow); nil
 	// means the production lstatShadow. Unit tests set it, because they cannot
 	// create root-owned files.

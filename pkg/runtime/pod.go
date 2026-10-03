@@ -372,6 +372,13 @@ type containerProc struct {
 	// written by the exec observer and read under pod.mu. The zero value means
 	// "not observed restricted".
 	shim shimInactive
+	// childReport reads this instance's restricted-child report file
+	// (childreport.go); nil when none is armed. Set before the entry is
+	// installed and never changed after; Poll is safe for concurrent callers.
+	childReport *supervisor.ChildReport
+	// childShim is the platform binaries this instance reported running
+	// without the pod shim, written and read under pod.mu.
+	childShim shimChildLoss
 	// execRefusal, when set, is why Exec cannot enter this instance: it was
 	// re-attached without a shim (its launch environment belonged to the previous
 	// daemon), or its shim died or does not answer (errShimLost). Nil means Exec
@@ -808,9 +815,20 @@ func (r *Runtime) armMemorySampler(p *pod) {
 		return
 	}
 	sampCtx, cancel := context.WithCancel(p.supCtx)
+	// The restricted-child poll rides the sampler's tick but never runs on
+	// its goroutine: the tick only hands off, without blocking, to a poller
+	// whose file IO and publish cannot delay a sample (the OOM path). Both
+	// die with sampCtx.
+	kick := make(chan struct{}, 1)
+	go r.childReportPoller(sampCtx, p, kick)
 	sampler := supervisor.NewMemorySampler(r.footprinter, p.containerPIDs, limit, func(footprint uint64) {
 		r.oomKill(p, footprint)
-	})
+	}, supervisor.WithTick(func() {
+		select {
+		case kick <- struct{}{}:
+		default: // a poll is already pending
+		}
+	}))
 	p.mu.Lock()
 	prev := p.memCancel
 	p.memSampler = sampler
@@ -1683,6 +1701,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			},
 		},
 	}
+	// A fresh instance: drop any report its predecessor left, then read its own.
+	r.armChildReport(p.box.GetPodId(), rootfs, cp, true)
 	// The observer runs on the reaper goroutine and locks pod.mu itself.
 	if obs := r.observeShim(p, cp, execArgv[0], env); obs != nil {
 		proc.ObserveExec(obs, execObserveTimeout)
@@ -1784,6 +1804,11 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	case <-drainTimer.C:
 	case <-ctx.Done():
 	}
+
+	// One last read of the restricted-child report, so a container that lived
+	// for less than a sampler tick still has its report in the terminated
+	// status published below.
+	r.readChildReport(p, cp)
 
 	p.mu.Lock()
 	// A container StopContainer claimed is concluded by that verb: it waited
@@ -3128,7 +3153,8 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	for _, e := range base {
 		// K3SM_SHADOW_DIR is runtime-owned: only Config.ShadowBinDir may set
 		// it (appended below), so a spec cannot aim the interposer anywhere.
-		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv {
+		// K3SM_SHIM_REPORT likewise: only the runtime names the report file.
+		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv {
 			continue
 		}
 		env = append(env, e)
@@ -3156,6 +3182,12 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		env = append(env,
 			pathShimRootfsEnv+"="+rootfs,
 			pathShimMountsEnv+"="+strings.Join(paths, ":"))
+		// The restricted-child report: only with the rebase enabled, where a
+		// platform-binary child that loses the shim reads host paths. The
+		// reader derives the same file from the container name itself.
+		if name, err := supervisor.ChildReportName(c.GetName()); err == nil {
+			env = append(env, supervisor.ChildReportEnv+"="+filepath.Join(rootfs, name))
+		}
 	}
 	// Shadow-shell exec rewrite: the same shim carries it, so it is inserted
 	// for every container once the node has a shadow set, mounts or not

@@ -138,6 +138,8 @@ type MemorySampler struct {
 	onBreach func(footprint uint64)
 	// breachSamples is how many consecutive over-limit samples fire onBreach.
 	breachSamples int
+	// onTick, when set, runs after every sample (WithTick), outside mu.
+	onTick func()
 
 	mu   sync.Mutex
 	last uint64
@@ -165,6 +167,14 @@ func WithBreachSamples(n int) MemorySamplerOption {
 		}
 		s.breachSamples = n
 	}
+}
+
+// WithTick runs f after every sample, on the sampling goroutine and outside
+// the sampler's lock. It lets other per-pod periodic work ride the one ~1 Hz
+// loop a pod already has instead of starting a goroutine of its own; f must
+// not block for long, because the next sample waits for it.
+func WithTick(f func()) MemorySamplerOption {
+	return func(s *MemorySampler) { s.onTick = f }
 }
 
 // NewMemorySampler builds a sampler. fp samples per-PID footprints; pids returns
@@ -242,6 +252,9 @@ func (s *MemorySampler) sampleOnce() {
 	s.mu.Unlock()
 	if breach && s.onBreach != nil {
 		s.onBreach(total)
+	}
+	if s.onTick != nil {
+		s.onTick()
 	}
 }
 
