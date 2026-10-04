@@ -20,22 +20,34 @@
  *   K3SM_ROOTFS       - the pod data volume the mounts are rebased under
  *   K3SM_MOUNT_PATHS  - ':'-separated absolute mount prefixes to rebase
  *
- * If either is unset/empty the shim transparently defers to the real function for
- * every call, so a non-pod process loading it is unaffected.
+ * If either is unset/empty, or K3SM_ROOTFS is "/" (not a valid rootfs: the
+ * already-under-the-rootfs guard below would then cover every path), the shim
+ * transparently defers to the real function for every call, so a non-pod
+ * process loading it is unaffected.
  *
- * The rebased entry points: open, openat, stat, lstat, fstatat, access,
- * faccessat, opendir, chdir; the directory/metadata family mkdir, mkdirat,
- * rmdir, unlink, unlinkat, rename, chmod, fchmodat, linkat, symlink,
- * symlinkat, readlink, utimensat, clonefileat; fopen and freopen; and the exec
- * targets of execve and posix_spawn (below). A *at form rebases only an
+ * The rebased entry points: open, openat, libc's own open$NOCANCEL and
+ * openat$NOCANCEL (the opens fts(3), opendir and stdio make), stat, lstat,
+ * fstatat, access, faccessat, opendir, chdir; the directory/metadata family
+ * mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmodat, linkat,
+ * symlink, symlinkat, readlink, utimensat, clonefileat; fopen and freopen;
+ * and the exec targets of execve and posix_spawn (below). fts(3) walks
+ * (rm -r, ls, chmod -R, find, cp -R, du) are covered through the $NOCANCEL
+ * opens, with fts_path left in the mount namespace. A *at form rebases only an
  * absolute path. symlink/symlinkat rebase the link path, never the target
  * (content); readlink returns the stored bytes unmodified. A path that climbs
- * out of its mount with ".." is not rebased. A mutating call refuses a
- * mounted path too long to rebase (ENAMETOOLONG); a read falls through.
+ * out of its mount with ".." is not rebased, and neither is a path already
+ * at or under the rootfs (an outer interposer rebased it before re-entering
+ * open$NOCANCEL). A mutating call, including an open for write, create or
+ * truncate, refuses a mounted path too long to rebase (ENAMETOOLONG); a read
+ * falls through.
  *
  * The shim is a path-translation convenience for a cooperative pod, not a
  * security boundary: the Seatbelt profile, judging the real path the kernel
- * sees, is the boundary.
+ * sees, is the boundary. Because the $NOCANCEL opens are libc's own, a pod
+ * that mounts at a prefix libc itself reads (/etc, /usr/share) has libc's
+ * reads inside the pod rebased to the pod's mounted content too; that is the
+ * pod's own view, Seatbelt on the real path is unchanged, and untrusted
+ * tenancy belongs on the vm RuntimeClass.
  *
  * Documented ceilings of the rebase (the call reaches the HOST path).
  * "measured" = observed on macOS 26; "by reading" = from the imports and the
@@ -46,21 +58,24 @@
  *     directory itself is materialized).
  *   - realpath(3), and so readlink -f (measured: readlink -f of a mounted
  *     symlink fails): libc resolves the components with its own calls.
- *   - fts(3) walks: rm -r and ls of a mounted directory (measured, pinned as
- *     ceiling rows in pkg/runtime's directory/metadata gate), chmod -R, find
- *     (by reading). fts opens directories through libc's internal
- *     open$NOCANCEL/openat$NOCANCEL, which no entry point here interposes;
- *     fopen/freopen are interposed at the public symbol for the same reason.
- *   - copyfile(3)'s path form and removefile(3) (by reading): same internal
- *     opens.
+ *   - chown -R (and chgrp, the same binary) (measured, pinned as a ceiling
+ *     row in pkg/runtime's fts gate): the walk's opens are rebased, but
+ *     chown(8) changes each entry with fchownat on the absolute fts path, and
+ *     chown/lchown/fchownat stay uninterposed, so the call reaches the host
+ *     path. chown is also outside the shadow set (next item).
+ *   - a platform utility outside the shadow set (du, chown) loses this shim
+ *     at exec in a pod (dyld scrubs DYLD_* from it), so it reads host paths
+ *     whatever the rebase covers (measured for du in the fts gate).
+ *   - copyfile(3)'s path form and removefile(3) (by reading): their opens
+ *     now go through open$NOCANCEL, but neither is exercised by a gate row.
  *   - absolute-target symlinks followed by the kernel (by reading): an open
  *     or stat THROUGH a stored link to "/<mount>/..." resolves the target on
  *     the host; only an explicit readlink sees the bytes, unrebased.
  *   - public path-taking symbols deliberately left uninterposed, because no
  *     shadow utility's gate row needed them (by reading): link, renameat,
- *     renameatx_np, renamex_np, readlinkat, truncate, chown, lchown, chflags,
- *     lchflags, utimes, lutimes, mkfifo, mknod, and the xattr family
- *     (getxattr, setxattr, listxattr, removexattr).
+ *     renameatx_np, renamex_np, readlinkat, truncate, chown, lchown,
+ *     fchownat, chflags, lchflags, utimes, lutimes, mkfifo, mknod, and the
+ *     xattr family (getxattr, setxattr, listxattr, removexattr).
  *   - any other public path-taking symbol not named in the rebased list
  *     above, and a static or non-dyld payload (no DYLD_INSERT_LIBRARIES).
  *
@@ -192,6 +207,13 @@ static void k3sm_pathcfg_init(void) {
     while (g_cfg.rootfs_len > 1 && g_cfg.rootfs[g_cfg.rootfs_len - 1] == '/') {
         g_cfg.rootfs[--g_cfg.rootfs_len] = '\0';
     }
+    /* A rootfs of "/" is not a valid configuration: rebasing under it is the
+     * identity, and the already-under-the-rootfs guard would cover every
+     * path. The shim stays disabled (every call passes through). */
+    if (g_cfg.rootfs_len == 1) {
+        g_cfg.enabled = 0;
+        return;
+    }
 
     char buf[K3SM_MAX_MOUNTS * K3SM_MAXPATH];
     snprintf(buf, sizeof(buf), "%s", mounts);
@@ -251,11 +273,20 @@ static int k3sm_escapes(const char *rest) {
  * long to rebase is returned unchanged when strict is 0 and refused (NULL,
  * errno ENAMETOOLONG) when strict is 1. A path that leaves one mount with ".."
  * and re-enters another is not rebased (the kernel resolves it on the host).
- * buf must be at least K3SM_MAXPATH bytes.
+ * A path already at or under the rootfs is returned unchanged (no double
+ * rebase). buf must be at least K3SM_MAXPATH bytes.
  */
 static const char *k3sm_rebase_mode(const char *path, char *buf, int strict) {
     pthread_once(&g_once, k3sm_pathcfg_init);
     if (!g_cfg.enabled || path == NULL || path[0] != '/') {
+        return path;
+    }
+    /* Already under the rootfs (a '/'-bounded descendant): a path an outer
+     * interposer rebased (opendir, fopen, freopen re-enter open$NOCANCEL with
+     * it) is left alone, so a mount whose prefix covers the rootfs never
+     * rebases it twice. */
+    if (strncmp(path, g_cfg.rootfs, g_cfg.rootfs_len) == 0 &&
+        (path[g_cfg.rootfs_len] == '\0' || path[g_cfg.rootfs_len] == '/')) {
         return path;
     }
     for (int i = 0; i < g_cfg.nmounts; i++) {
@@ -283,6 +314,14 @@ static const char *k3sm_rebase_mode(const char *path, char *buf, int strict) {
     return path;
 }
 
+/*
+ * K3SM_REFUSED reports a strict rebase's refusal: the rebase returned NULL for
+ * a non-NULL input (errno already ENAMETOOLONG). A NULL input comes back NULL
+ * too, and is NOT a refusal: it passes straight to the real call, so the
+ * kernel answers EFAULT exactly as without the shim.
+ */
+#define K3SM_REFUSED(p, in) ((p) == NULL && (in) != NULL)
+
 /* The read-class rebase: an over-long mounted path is left unrewritten. */
 static const char *k3sm_rebase(const char *path, char *buf) {
     return k3sm_rebase_mode(path, buf, 0);
@@ -290,31 +329,123 @@ static const char *k3sm_rebase(const char *path, char *buf) {
 
 /* -------- interposed path entry points -------- */
 
-int k3sm_open(const char *path, int flags, ...) {
+/*
+ * The four open entry points: the public open and openat, and libc's own
+ * open$NOCANCEL and openat$NOCANCEL. Each reads mode only when O_CREAT is set
+ * and hands off to k3sm_open_common, so the four share one rebase rule.
+ *
+ * Why the $NOCANCEL pair. Measured on macOS 26.6 (25G83): libsystem_c's
+ * fts_open/fts_read/fts_close, opendir (__opendir2) and fopen/freopen all
+ * open through open$NOCANCEL/openat$NOCANCEL, a cross-image call into
+ * libsystem_kernel that the public open/openat interposers never see, so an
+ * fts(3) walk of a mounted directory read the host path. Evidence:
+ *
+ *   $ dyld_info -exports /usr/lib/system/libsystem_kernel.dylib | grep NOCANCEL
+ *     (open lines only)
+ *   [x86_64]  0x000112AC  _open$NOCANCEL    0x00011541  _openat$NOCANCEL
+ *   [arm64]   0x000143D4  _open$NOCANCEL    0x000145BC  _openat$NOCANCEL
+ *   [arm64e]  0x00015C24  _open$NOCANCEL    0x00015CEC  _openat$NOCANCEL
+ *   $ dyld_info -imports /usr/lib/system/libsystem_c.dylib
+ *   _open$NOCANCEL  (from libsystem_kernel)
+ *   _openat$NOCANCEL  (from libsystem_kernel)
+ *
+ * and `nm -u` shows /bin/rm, /bin/ls, /bin/chmod, /usr/bin/find, /bin/cp and
+ * /usr/bin/du all import _fts_open (the x86_64 slices _fts_open$INODE64).
+ *
+ * fts_open itself is deliberately NOT interposed: rebasing its argv roots
+ * would put "<rootfs>/..." into fts_path, so find(1) output, ls -R headers
+ * and find -exec arguments would leak the host path, and the x86_64 slice
+ * binds fts_open$INODE64, a second name to keep in step. Rebasing the opens
+ * underneath keeps fts_path in the pod's own (mount) namespace.
+ *
+ * open$NOCANCEL is a NON-PUBLIC symbol NAME: the function is the
+ * cancellation-point-free twin of open(2), no SDK header declares it, so it
+ * is declared below through __asm. A macOS that drops or renames either
+ * export does not fail open: the two-level-namespace extern binding makes
+ * the shim fail to load, and every process it is injected into dies at exec
+ * (an availability failure that fails closed for the pod). The symbol canary
+ * in internal/spicanary (both names must resolve) turns that into a red unit
+ * test first; the behavioural gate pkg/runtime TestShadowCopiesRebaseFtsWalks
+ * covers the other drift, a libc that stops routing fts, opendir and stdio
+ * through these names (the walk would read the host path again).
+ *
+ * The stdio, opendir and freopen interposers rebase first and then re-enter
+ * open$NOCANCEL with the already-rebased path; k3sm_rebase_mode's rootfs
+ * guard makes that second pass a no-op, so a mount whose prefix covers the
+ * rootfs is never rebased twice.
+ */
+extern int k3sm_real_open_nocancel(const char *path, int flags, ...) __asm("_open$NOCANCEL");
+extern int k3sm_real_openat_nocancel(int fd, const char *path, int flags, ...) __asm("_openat$NOCANCEL");
+
+enum { K3SM_OPEN, K3SM_OPENAT, K3SM_OPEN_NOCANCEL, K3SM_OPENAT_NOCANCEL };
+
+/* an open that can create or modify the file */
+static int k3sm_open_writes(int flags) {
+    return (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0;
+}
+
+/*
+ * k3sm_open_common is the one open body. Only an ABSOLUTE path is rebased
+ * (k3sm_rebase_mode leaves a relative one, or a dirfd-relative name, as is);
+ * a mutating open of a mounted path too long to rebase is refused with
+ * ENAMETOOLONG, a read falls through, as for every other mutating wrapper.
+ */
+static int k3sm_open_common(int which, int fd, const char *path, int flags, int has_mode, mode_t mode) {
     char buf[K3SM_MAXPATH];
-    const char *p = k3sm_rebase(path, buf);
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-        return open(p, flags, mode);
+    const char *p = k3sm_rebase_mode(path, buf, k3sm_open_writes(flags));
+    if (K3SM_REFUSED(p, path)) {
+        return -1;
     }
-    return open(p, flags);
+    switch (which) {
+    case K3SM_OPENAT:
+        return has_mode ? openat(fd, p, flags, mode) : openat(fd, p, flags);
+    case K3SM_OPEN_NOCANCEL:
+        return has_mode ? k3sm_real_open_nocancel(p, flags, mode) : k3sm_real_open_nocancel(p, flags);
+    case K3SM_OPENAT_NOCANCEL:
+        return has_mode ? k3sm_real_openat_nocancel(fd, p, flags, mode) : k3sm_real_openat_nocancel(fd, p, flags);
+    default:
+        return has_mode ? open(p, flags, mode) : open(p, flags);
+    }
+}
+
+/* K3SM_OPEN_MODE reads the variadic mode only when O_CREAT is set. */
+#define K3SM_OPEN_MODE(last, flags, mode, has_mode) \
+    do {                                             \
+        if ((flags) & O_CREAT) {                     \
+            va_list ap;                              \
+            va_start(ap, last);                      \
+            (mode) = (mode_t)va_arg(ap, int);        \
+            va_end(ap);                              \
+            (has_mode) = 1;                          \
+        }                                            \
+    } while (0)
+
+int k3sm_open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    int has_mode = 0;
+    K3SM_OPEN_MODE(flags, flags, mode, has_mode);
+    return k3sm_open_common(K3SM_OPEN, AT_FDCWD, path, flags, has_mode, mode);
 }
 
 int k3sm_openat(int fd, const char *path, int flags, ...) {
-    char buf[K3SM_MAXPATH];
-    /* Only an ABSOLUTE path is rebased; a relative openat resolves against fd. */
-    const char *p = (path != NULL && path[0] == '/') ? k3sm_rebase(path, buf) : path;
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-        return openat(fd, p, flags, mode);
-    }
-    return openat(fd, p, flags);
+    mode_t mode = 0;
+    int has_mode = 0;
+    K3SM_OPEN_MODE(flags, flags, mode, has_mode);
+    return k3sm_open_common(K3SM_OPENAT, fd, path, flags, has_mode, mode);
+}
+
+int k3sm_open_nocancel(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    int has_mode = 0;
+    K3SM_OPEN_MODE(flags, flags, mode, has_mode);
+    return k3sm_open_common(K3SM_OPEN_NOCANCEL, AT_FDCWD, path, flags, has_mode, mode);
+}
+
+int k3sm_openat_nocancel(int fd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    int has_mode = 0;
+    K3SM_OPEN_MODE(flags, flags, mode, has_mode);
+    return k3sm_open_common(K3SM_OPENAT_NOCANCEL, fd, path, flags, has_mode, mode);
 }
 
 int k3sm_stat(const char *path, struct stat *st) {
@@ -390,35 +521,35 @@ static const char *k3sm_rebase_strict(const char *path, char *buf) {
 int k3sm_mkdir(const char *path, mode_t mode) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : mkdir(p, mode);
+    return K3SM_REFUSED(p, path) ? -1 : mkdir(p, mode);
 }
 
 /* /bin/cp: _mkdirat */
 int k3sm_mkdirat(int fd, const char *path, mode_t mode) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : mkdirat(fd, p, mode);
+    return K3SM_REFUSED(p, path) ? -1 : mkdirat(fd, p, mode);
 }
 
 /* /bin/rm, /bin/mv, /bin/ln, /bin/cp, /bin/rmdir: _rmdir */
 int k3sm_rmdir(const char *path) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : rmdir(p);
+    return K3SM_REFUSED(p, path) ? -1 : rmdir(p);
 }
 
 /* /bin/rm, /bin/mv, /bin/ln, /usr/bin/sed: _unlink */
 int k3sm_unlink(const char *path) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : unlink(p);
+    return K3SM_REFUSED(p, path) ? -1 : unlink(p);
 }
 
 /* /bin/rm, /bin/cp: _unlinkat */
 int k3sm_unlinkat(int fd, const char *path, int flag) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : unlinkat(fd, p, flag);
+    return K3SM_REFUSED(p, path) ? -1 : unlinkat(fd, p, flag);
 }
 
 /*
@@ -431,7 +562,7 @@ int k3sm_rename(const char *from, const char *to) {
     char fbuf[K3SM_MAXPATH], tbuf[K3SM_MAXPATH];
     const char *f = k3sm_rebase_strict(from, fbuf);
     const char *t = k3sm_rebase_strict(to, tbuf);
-    if (f == NULL || t == NULL) {
+    if (K3SM_REFUSED(f, from) || K3SM_REFUSED(t, to)) {
         return -1;
     }
     return rename(f, t);
@@ -441,14 +572,14 @@ int k3sm_rename(const char *from, const char *to) {
 int k3sm_chmod(const char *path, mode_t mode) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : chmod(p, mode);
+    return K3SM_REFUSED(p, path) ? -1 : chmod(p, mode);
 }
 
 /* /bin/chmod, /bin/cp: _fchmodat */
 int k3sm_fchmodat(int fd, const char *path, mode_t mode, int flag) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : fchmodat(fd, p, mode, flag);
+    return K3SM_REFUSED(p, path) ? -1 : fchmodat(fd, p, mode, flag);
 }
 
 /* /bin/ln, /bin/cp: _linkat (each path rebased on its own, as rename) */
@@ -456,7 +587,7 @@ int k3sm_linkat(int fd1, const char *path1, int fd2, const char *path2, int flag
     char buf1[K3SM_MAXPATH], buf2[K3SM_MAXPATH];
     const char *p1 = k3sm_rebase_strict(path1, buf1);
     const char *p2 = k3sm_rebase_strict(path2, buf2);
-    if (p1 == NULL || p2 == NULL) {
+    if (K3SM_REFUSED(p1, path1) || K3SM_REFUSED(p2, path2)) {
         return -1;
     }
     return linkat(fd1, p1, fd2, p2, flag);
@@ -472,14 +603,14 @@ int k3sm_linkat(int fd1, const char *path1, int fd2, const char *path2, int flag
 int k3sm_symlink(const char *target, const char *linkpath) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(linkpath, buf);
-    return p == NULL ? -1 : symlink(target, p);
+    return K3SM_REFUSED(p, linkpath) ? -1 : symlink(target, p);
 }
 
 /* /bin/cp: _symlinkat (link path only, as symlink) */
 int k3sm_symlinkat(const char *target, int fd, const char *linkpath) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(linkpath, buf);
-    return p == NULL ? -1 : symlinkat(target, fd, p);
+    return K3SM_REFUSED(p, linkpath) ? -1 : symlinkat(target, fd, p);
 }
 
 /*
@@ -495,7 +626,7 @@ ssize_t k3sm_readlink(const char *restrict path, char *restrict out, size_t size
 int k3sm_utimensat(int fd, const char *path, const struct timespec times[2], int flag) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_rebase_strict(path, buf);
-    return p == NULL ? -1 : utimensat(fd, p, times, flag);
+    return K3SM_REFUSED(p, path) ? -1 : utimensat(fd, p, times, flag);
 }
 
 /*
@@ -507,7 +638,7 @@ int k3sm_clonefileat(int fd1, const char *src, int fd2, const char *dst, uint32_
     char sbuf[K3SM_MAXPATH], dbuf[K3SM_MAXPATH];
     const char *s = k3sm_rebase_strict(src, sbuf);
     const char *d = k3sm_rebase_strict(dst, dbuf);
-    if (s == NULL || d == NULL) {
+    if (K3SM_REFUSED(s, src) || K3SM_REFUSED(d, dst)) {
         return -1;
     }
     return clonefileat(fd1, s, fd2, d, flags);
@@ -520,16 +651,16 @@ static int k3sm_mode_writes(const char *mode) {
 
 /*
  * /usr/bin/awk, /usr/bin/sed: _fopen; /usr/bin/awk: _freopen. Added on the
- * gate's probe: libc's stdio opens through open$NOCANCEL, which the open()
- * interposer above never sees, so awk given a mounted file NAME read the host
- * path. Interposed at the public symbol, never at open$NOCANCEL. A writing
- * mode fails closed like the other mutations; a read keeps open()'s
- * fall-through.
+ * gate's probe: libc's stdio opens through open$NOCANCEL, which the public
+ * open() interposer never sees, so awk given a mounted file NAME read the host
+ * path. These public interposers rebase first (a writing mode fails closed
+ * like the other mutations; a read keeps open()'s fall-through), and the
+ * open$NOCANCEL interposer they then reach leaves the rebased path alone.
  */
 FILE *k3sm_fopen(const char *restrict path, const char *restrict mode) {
     char buf[K3SM_MAXPATH];
     const char *p = k3sm_mode_writes(mode) ? k3sm_rebase_strict(path, buf) : k3sm_rebase(path, buf);
-    return p == NULL ? NULL : fopen(p, mode);
+    return K3SM_REFUSED(p, path) ? NULL : fopen(p, mode);
 }
 
 FILE *k3sm_freopen(const char *restrict path, const char *restrict mode, FILE *restrict stream) {
@@ -952,6 +1083,8 @@ __attribute__((used)) static const interpose_t k3sm_path_interposers[]
     __attribute__((section("__DATA,__interpose"))) = {
         {(const void *)k3sm_open, (const void *)open},
         {(const void *)k3sm_openat, (const void *)openat},
+        {(const void *)k3sm_open_nocancel, (const void *)k3sm_real_open_nocancel},
+        {(const void *)k3sm_openat_nocancel, (const void *)k3sm_real_openat_nocancel},
         {(const void *)k3sm_stat, (const void *)stat},
         {(const void *)k3sm_lstat, (const void *)lstat},
         {(const void *)k3sm_fstatat, (const void *)fstatat},
