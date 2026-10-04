@@ -94,6 +94,22 @@ int main(int argc, char **argv) {
 		return utimensat(AT_FDCWD, a, ts, 0) ? fail(op) : 0;
 	}
 	if (!strcmp(op, "clonefileat")) return clonefileat(AT_FDCWD, a, AT_FDCWD, b, 0) ? fail(op) : 0;
+	if (!strcmp(op, "open-w")) {
+		int fd = open(a, O_WRONLY | O_CREAT, 0644);
+		return fd < 0 ? fail(op) : close(fd);
+	}
+	if (!strcmp(op, "openat-w")) {
+		int fd = openat(AT_FDCWD, a, O_WRONLY | O_CREAT, 0644);
+		return fd < 0 ? fail(op) : close(fd);
+	}
+	if (!strcmp(op, "open-null")) {
+		/* a NULL path (volatile, so the compiler cannot see it) */
+		const char *volatile np = NULL;
+		errno = 0;
+		int fd = open(np, O_RDONLY);
+		if (fd >= 0) { close(fd); return 3; }
+		return fail(op);
+	}
 	if (!strcmp(op, "fopen-w")) {
 		FILE *f = fopen(a, "w");
 		if (f == NULL) return fail(op);
@@ -145,7 +161,9 @@ func buildDirMetaHelper(t *testing.T) string {
 // dirMetaRow is one interposed call (or one utility whose imports reach it).
 type dirMetaRow struct {
 	name string
-	// tool is a cloned utility name, or "" for the C helper.
+	// tool is a cloned utility name, an absolute path to run as is (a
+	// platform binary, which dyld strips of DYLD_INSERT_LIBRARIES), or ""
+	// for the C helper.
 	tool string
 	// args are passed after the tool (or are the helper's op and paths).
 	args []string
@@ -169,6 +187,12 @@ type dirMetaRow struct {
 	boundary bool
 	// needsClone marks a row that needs clonefile(2) on the test temp dir.
 	needsClone bool
+	// argsFor, when set, replaces args with arguments built from the row's
+	// rootfs (a row that passes a path already under the rootfs).
+	argsFor func(rootfs string) []string
+	// coverRootfs adds the rootfs's parent directory to the mount prefixes,
+	// so the rootfs itself sits under a mount (the double-rebase hazard).
+	coverRootfs bool
 }
 
 // TestShadowCopiesRebaseDirectoryAndMetadataCalls is the B425 gate: the path
@@ -203,12 +227,7 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 	}
 
 	const M = dirMetaMount
-	file := func(rel, body string) func(*testing.T, string) {
-		return func(t *testing.T, rootfs string) {
-			t.Helper()
-			writeUnder(t, rootfs, rel, body)
-		}
-	}
+	file := rowFile
 	isDir := func(rel string) func(string, string) error {
 		return func(rootfs, _ string) error {
 			fi, err := os.Stat(filepath.Join(rootfs, rel))
@@ -221,38 +240,7 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 			return nil
 		}
 	}
-	gone := func(rel string) func(string, string) error {
-		return func(rootfs, _ string) error {
-			if _, err := os.Lstat(filepath.Join(rootfs, rel)); !errors.Is(err, fs.ErrNotExist) {
-				return fmt.Errorf("%s still present (err=%v)", rel, err)
-			}
-			return nil
-		}
-	}
-	hasBody := func(rel, body string) func(string, string) error {
-		return func(rootfs, _ string) error {
-			b, err := os.ReadFile(filepath.Join(rootfs, rel))
-			if err != nil {
-				return err
-			}
-			if string(b) != body {
-				return fmt.Errorf("%s = %q, want %q", rel, b, body)
-			}
-			return nil
-		}
-	}
-	modeIs := func(rel string, want fs.FileMode) func(string, string) error {
-		return func(rootfs, _ string) error {
-			fi, err := os.Stat(filepath.Join(rootfs, rel))
-			if err != nil {
-				return err
-			}
-			if fi.Mode().Perm() != want {
-				return fmt.Errorf("%s mode %v, want %v", rel, fi.Mode().Perm(), want)
-			}
-			return nil
-		}
-	}
+	gone, hasBody, modeIs := rowGone, rowHasBody, rowModeIs
 	sameFile := func(a, b string) func(string, string) error {
 		return func(rootfs, _ string) error {
 			fa, err := os.Stat(filepath.Join(rootfs, a))
@@ -291,14 +279,7 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 			return nil
 		}
 	}
-	outHas := func(want string) func(string, string) error {
-		return func(_, out string) error {
-			if !strings.Contains(out, want) {
-				return fmt.Errorf("output %q lacks %q", out, want)
-			}
-			return nil
-		}
-	}
+	outHas := rowOutHas
 	mtimeIs := func(rel string, want time.Time, tol time.Duration) func(string, string) error {
 		return func(rootfs, _ string) error {
 			fi, err := os.Stat(filepath.Join(rootfs, rel))
@@ -318,14 +299,7 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 			b(t, rootfs)
 		}
 	}
-	both := func(a, b func(string, string) error) func(string, string) error {
-		return func(rootfs, out string) error {
-			if err := a(rootfs, out); err != nil {
-				return err
-			}
-			return b(rootfs, out)
-		}
-	}
+	both := rowBoth
 	stale := func(rel string) func(*testing.T, string) {
 		return func(t *testing.T, rootfs string) {
 			t.Helper()
@@ -336,14 +310,7 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 			}
 		}
 	}
-	dir := func(rel string) func(*testing.T, string) {
-		return func(t *testing.T, rootfs string) {
-			t.Helper()
-			if err := os.MkdirAll(filepath.Join(rootfs, rel), 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
+	dir := rowDir
 	symlinkAt := func(rel, target string) func(*testing.T, string) {
 		return func(t *testing.T, rootfs string) {
 			t.Helper()
@@ -365,10 +332,6 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 		{name: "readlink", tool: "readlink", args: []string{M + "/s"}, setup: symlinkAt(M+"/s", M+"/a"), check: outIs(M + "/a")},
 		{name: "chmod fchmodat", tool: "chmod", args: []string{"600", M + "/f"}, setup: file(M+"/f", "x"), check: modeIs(M+"/f", 0o600)},
 		{name: "rm", tool: "rm", args: []string{M + "/f"}, setup: file(M+"/f", "x"), check: gone(M + "/f")},
-		// rm -r and ls walk a directory with fts(3), whose directory opens are
-		// libc-internal open$NOCANCEL calls no interposer here sees.
-		{name: "ceiling rm -r (fts)", tool: "rm", args: []string{"-r", M + "/t"}, setup: file(M+"/t/u/f", "x"), check: gone(M + "/t"), ceilingErr: "rm: " + M + "/t: No such file or directory"},
-		{name: "ceiling ls of a mounted directory (fts)", tool: "ls", args: []string{M}, setup: file(M+"/listed", "x"), check: outHas("listed"), ceilingErr: "ls: " + M + ": No such file or directory"},
 		{name: "cp", tool: "cp", args: []string{M + "/a", M + "/c"}, setup: file(M+"/a", "copied"), check: hasBody(M+"/c", "copied")},
 		{name: "cp -c clonefileat", tool: "cp", args: []string{"-c", M + "/a", M + "/c"}, setup: file(M+"/a", "cloned"), check: hasBody(M+"/c", "cloned"), needsClone: true},
 		{name: "awk fopen", tool: "awk", args: []string{"{print}", M + "/f"}, setup: file(M+"/f", "via-awk\n"), check: outIs("via-awk")},
@@ -398,6 +361,11 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 		{name: "helper rename overflow is ENAMETOOLONG", args: []string{"rename", M + "/a", M + "/" + longRel()}, setup: file(M+"/a", "x"), refused: true, check: both(outHas("File name too long"), hasBody(M+"/a", "x"))},
 		{name: "helper linkat overflow is ENAMETOOLONG", args: []string{"linkat", M + "/a", M + "/" + longRel()}, setup: file(M+"/a", "x"), refused: true, check: both(outHas("File name too long"), hasBody(M+"/a", "x"))},
 		{name: "helper clonefileat overflow is ENAMETOOLONG", args: []string{"clonefileat", M + "/a", M + "/" + longRel()}, setup: file(M+"/a", "x"), refused: true, check: both(outHas("File name too long"), hasBody(M+"/a", "x"))},
+		{name: "helper open overflow is ENAMETOOLONG", args: []string{"open-w", M + "/" + longRel()}, setup: dir(M), refused: true, check: outHas("File name too long")},
+		{name: "helper openat overflow is ENAMETOOLONG", args: []string{"openat-w", M + "/" + longRel()}, setup: dir(M), refused: true, check: outHas("File name too long")},
+		// A NULL path is not a refusal: it reaches the kernel, which answers
+		// EFAULT exactly as without the shim (never a stale errno).
+		{name: "boundary open of a NULL path is EFAULT", args: []string{"open-null", "-"}, boundary: true, refused: true, check: outHas("open-null: Bad address")},
 		{name: "helper unlink overflow is ENAMETOOLONG", args: []string{"unlink", M + "/" + longRel()}, setup: dir(M), refused: true, check: outHas("File name too long")},
 		// Boundaries: a path that climbs out of the mount with ".." and a
 		// sibling prefix are host paths, never rebased. Each setup plants the
@@ -406,71 +374,11 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 		{name: "boundary sibling prefix is not rebased", args: []string{"mkdir", M + "2/x"}, setup: dir(M + "2"), boundary: true, refused: true, check: both(outHas("No such file or directory"), gone(M+"2/x"))},
 		{name: "helper opendir", args: []string{"opendir", M}, setup: file(M+"/listed", "x"), check: outHas("listed")},
 	}
-	run := func(t *testing.T, row dirMetaRow, withShim bool) (rootfs, out string, err error) {
-		t.Helper()
-		rootfs = t.TempDir()
-		if row.setup != nil {
-			row.setup(t, rootfs)
-		}
-		path, argv := helper, append([]string{"dirmeta-helper"}, row.args...)
-		if row.tool != "" {
-			path, argv = filepath.Join(bin, row.tool), append([]string{row.tool}, row.args...)
-		}
-		cmd := &exec.Cmd{Path: path, Args: argv, Dir: rootfs}
-		cmd.Env = []string{
-			"PATH=/usr/bin:/bin",
-			pathShimRootfsEnv + "=" + rootfs,
-			pathShimMountsEnv + "=" + dirMetaMount + ":" + dirMetaDeepMount,
-		}
-		if withShim {
-			cmd.Env = append(cmd.Env, dyldInsertEnv+"="+shim)
-		}
-		b, err := cmd.CombinedOutput()
-		return rootfs, string(b), err
-	}
-	hostUntouched := func(t *testing.T) {
-		t.Helper()
-		for _, p := range []string{dirMetaMount, dirMetaDeepMount, dirMetaMount + "2", "/" + dirMetaEscapeName} {
-			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
-				t.Errorf("host path %s exists (err=%v): a call reached the host instead of the rootfs", p, err)
-			}
-		}
-	}
-
-	for _, row := range rows {
-		t.Run(row.name, func(t *testing.T) {
-			if row.needsClone && !canClone {
-				t.Skip("SKIP: the test temp dir does not support clonefile (needs APFS)")
-			}
-			rootfs, out, err := run(t, row, true)
-			if row.ceilingErr != "" {
-				if err == nil || row.check(rootfs, out) == nil {
-					t.Errorf("documented ceiling now passes with the shim: flip this row to a regular one and drop the ceiling from the shim header\n%s", out)
-				}
-				if !strings.Contains(out, row.ceilingErr) {
-					t.Errorf("ceiling row failed for another reason: want %q in the output\n%s", row.ceilingErr, out)
-				}
-				hostUntouched(t)
-				return
-			}
-			if (err != nil) != row.refused {
-				t.Errorf("with the shim: err=%v, want failure=%v\n%s", err, row.refused, out)
-			}
-			if cerr := row.check(rootfs, out); cerr != nil {
-				t.Errorf("with the shim the effect did not land under the rootfs: %v\n%s", cerr, out)
-			}
-			hostUntouched(t)
-			if row.boundary {
-				return
-			}
-
-			rootfs, out, _ = run(t, row, false)
-			if row.check(rootfs, out) == nil {
-				t.Errorf("contrast: without the shim the effect landed anyway, the row proves nothing:\n%s", out)
-			}
-			hostUntouched(t)
-		})
-	}
+	pathShimRowHarness{
+		shim: shim, helper: helper, bin: bin, canClone: canClone,
+		mounts:    []string{dirMetaMount, dirMetaDeepMount},
+		hostPaths: []string{dirMetaMount, dirMetaDeepMount, dirMetaMount + "2", "/" + dirMetaEscapeName},
+	}.run(t, rows)
 
 	// Loaded but not configured, every interposer passes the caller's path
 	// through: the ops act on a real (test-owned) directory, exactly as if the
@@ -524,6 +432,179 @@ func TestShadowCopiesRebaseDirectoryAndMetadataCalls(t *testing.T) {
 			}
 		}
 	})
+}
+
+// pathShimRowHarness runs dirMetaRow tables against the built path shim. It
+// is shared by the directory/metadata gate and the fts gate, so both pin the
+// same row semantics (effect under the rootfs, host untouched, no-shim
+// contrast, ceiling and boundary rows).
+type pathShimRowHarness struct {
+	shim   string // the built path-rebase dylib
+	helper string // the C helper (dirMetaHelperSrc), for rows with no tool
+	bin    string // the directory of cloned, re-signed utilities
+	// mounts are the configured K3SM_MOUNT_PATHS for every row.
+	mounts []string
+	// hostPaths must never exist on the host, before or after any row.
+	hostPaths []string
+	canClone  bool
+}
+
+// run runs every row as a subtest, first with the shim and then, unless the
+// row is a boundary or a ceiling, without it as the contrast.
+func (h pathShimRowHarness) run(t *testing.T, rows []dirMetaRow) {
+	t.Helper()
+	exe := func(t *testing.T, row dirMetaRow, withShim bool) (rootfs, out string, err error) {
+		t.Helper()
+		rootfs = t.TempDir()
+		if row.setup != nil {
+			row.setup(t, rootfs)
+		}
+		args := row.args
+		if row.argsFor != nil {
+			args = row.argsFor(rootfs)
+		}
+		path, argv := h.helper, append([]string{"dirmeta-helper"}, args...)
+		switch {
+		case filepath.IsAbs(row.tool):
+			path, argv = row.tool, append([]string{filepath.Base(row.tool)}, args...)
+		case row.tool != "":
+			path, argv = filepath.Join(h.bin, row.tool), append([]string{row.tool}, args...)
+		}
+		mounts := append([]string(nil), h.mounts...)
+		if row.coverRootfs {
+			mounts = append(mounts, filepath.Dir(rootfs))
+		}
+		cmd := &exec.Cmd{Path: path, Args: argv, Dir: rootfs}
+		cmd.Env = []string{
+			"PATH=/usr/bin:/bin",
+			pathShimRootfsEnv + "=" + rootfs,
+			pathShimMountsEnv + "=" + strings.Join(mounts, ":"),
+		}
+		if withShim {
+			cmd.Env = append(cmd.Env, dyldInsertEnv+"="+h.shim)
+		}
+		b, err := cmd.CombinedOutput()
+		return rootfs, string(b), err
+	}
+	hostUntouched := func(t *testing.T) {
+		t.Helper()
+		for _, p := range h.hostPaths {
+			if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("host path %s exists (err=%v): a call reached the host instead of the rootfs", p, err)
+			}
+		}
+	}
+
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			if row.needsClone && !h.canClone {
+				t.Skip("SKIP: the test temp dir does not support clonefile (needs APFS)")
+			}
+			rootfs, out, err := exe(t, row, true)
+			if row.ceilingErr != "" {
+				if err == nil || row.check(rootfs, out) == nil {
+					t.Errorf("documented ceiling now passes with the shim: flip this row to a regular one and drop the ceiling from the shim header\n%s", out)
+				}
+				if !strings.Contains(out, row.ceilingErr) {
+					t.Errorf("ceiling row failed for another reason: want %q in the output\n%s", row.ceilingErr, out)
+				}
+				hostUntouched(t)
+				return
+			}
+			if (err != nil) != row.refused {
+				t.Errorf("with the shim: err=%v, want failure=%v\n%s", err, row.refused, out)
+			}
+			if cerr := row.check(rootfs, out); cerr != nil {
+				t.Errorf("with the shim the effect did not land under the rootfs: %v\n%s", cerr, out)
+			}
+			hostUntouched(t)
+			if row.boundary {
+				return
+			}
+
+			rootfs, out, _ = exe(t, row, false)
+			if row.check(rootfs, out) == nil {
+				t.Errorf("contrast: without the shim the effect landed anyway, the row proves nothing:\n%s", out)
+			}
+			hostUntouched(t)
+		})
+	}
+}
+
+// rowFile is a row setup writing body to <rootfs>/rel.
+func rowFile(rel, body string) func(*testing.T, string) {
+	return func(t *testing.T, rootfs string) {
+		t.Helper()
+		writeUnder(t, rootfs, rel, body)
+	}
+}
+
+// rowDir is a row setup creating the directory <rootfs>/rel.
+func rowDir(rel string) func(*testing.T, string) {
+	return func(t *testing.T, rootfs string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(rootfs, rel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// rowGone checks <rootfs>/rel does not exist.
+func rowGone(rel string) func(string, string) error {
+	return func(rootfs, _ string) error {
+		if _, err := os.Lstat(filepath.Join(rootfs, rel)); !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%s still present (err=%v)", rel, err)
+		}
+		return nil
+	}
+}
+
+// rowHasBody checks <rootfs>/rel holds exactly body.
+func rowHasBody(rel, body string) func(string, string) error {
+	return func(rootfs, _ string) error {
+		b, err := os.ReadFile(filepath.Join(rootfs, rel))
+		if err != nil {
+			return err
+		}
+		if string(b) != body {
+			return fmt.Errorf("%s = %q, want %q", rel, b, body)
+		}
+		return nil
+	}
+}
+
+// rowModeIs checks the permission bits of <rootfs>/rel.
+func rowModeIs(rel string, want fs.FileMode) func(string, string) error {
+	return func(rootfs, _ string) error {
+		fi, err := os.Stat(filepath.Join(rootfs, rel))
+		if err != nil {
+			return err
+		}
+		if fi.Mode().Perm() != want {
+			return fmt.Errorf("%s mode %v, want %v", rel, fi.Mode().Perm(), want)
+		}
+		return nil
+	}
+}
+
+// rowOutHas checks the child's output contains want.
+func rowOutHas(want string) func(string, string) error {
+	return func(_, out string) error {
+		if !strings.Contains(out, want) {
+			return fmt.Errorf("output %q lacks %q", out, want)
+		}
+		return nil
+	}
+}
+
+// rowBoth checks a, then b.
+func rowBoth(a, b func(string, string) error) func(string, string) error {
+	return func(rootfs, out string) error {
+		if err := a(rootfs, out); err != nil {
+			return err
+		}
+		return b(rootfs, out)
+	}
 }
 
 // requireSealedMountParents refuses to run, BEFORE any child call, when a

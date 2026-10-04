@@ -39,9 +39,36 @@ func TestResourceSymbolsWantList(t *testing.T) {
 			}
 		})
 	}
-	t.Run("absent-symbol-does-not-resolve", func(t *testing.T) {
-		if symbolResolves("k3sm_spicanary_no_such_symbol") {
-			t.Fatal("dlsym resolved a symbol that does not exist; the want-list proves nothing")
-		}
-	})
+	t.Run("absent-symbol-does-not-resolve", absentSymbolDoesNotResolve)
+}
+
+// absentSymbolDoesNotResolve proves the lookup can say no, so a want-list's
+// green run is not a lookup that answers yes to everything.
+func absentSymbolDoesNotResolve(t *testing.T) {
+	if symbolResolves("k3sm_spicanary_no_such_symbol") {
+		t.Fatal("dlsym resolved a symbol that does not exist; the want-list proves nothing")
+	}
+}
+
+// TestPathShimNocancelSymbolsWantList is the symbol canary for the path
+// shim's two non-public interposer targets (runtimed shim/pathrebase_shim.c):
+// open$NOCANCEL and openat$NOCANCEL, the cancellation-point-free twins of
+// open/openat that libsystem_kernel exports and libsystem_c's fts(3),
+// opendir and stdio open through. The shim binds them by NAME through __asm,
+// and a macOS that drops or renames either export does not fail open: with
+// two-level-namespace extern binding the shim fails to load, and every
+// process it is injected into dies at exec (an availability failure that
+// fails closed for the pod). This list turns that into a red unit test before
+// a node ships it. The behavioural half, pkg/runtime
+// TestShadowCopiesRebaseFtsWalks, covers the other drift: a libc that stops
+// routing fts, opendir and stdio through these names.
+func TestPathShimNocancelSymbolsWantList(t *testing.T) {
+	for _, name := range []string{"open$NOCANCEL", "openat$NOCANCEL"} {
+		t.Run(name, func(t *testing.T) {
+			if !symbolResolves(name) {
+				t.Fatalf("%s does not resolve (an OS update may have renamed it; the path shim binds it and would no longer load)", name)
+			}
+		})
+	}
+	t.Run("absent-symbol-does-not-resolve", absentSymbolDoesNotResolve)
 }
