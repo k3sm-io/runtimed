@@ -40,7 +40,7 @@
       ],
       "env": [
         "PGDATA=/pgdata",
-        "POSTGRES_DB=stockkitty"
+        "POSTGRES_DB=demo"
       ],
       "workingDir": "/var/lib/postgresql",
       "tty": true,
