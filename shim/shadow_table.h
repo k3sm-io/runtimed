@@ -44,6 +44,7 @@ static const struct {
     {"/bin/mv", "mv"},
     {"/bin/ls", "ls"},
     {"/bin/mkdir", "mkdir"},
+    {"/bin/rmdir", "rmdir"},
     {"/bin/rm", "rm"},
     {"/bin/chmod", "chmod"},
     {"/bin/ln", "ln"},

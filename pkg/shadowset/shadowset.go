@@ -52,6 +52,7 @@ var entries = []Entry{
 	{Copy: "mv", Source: "/bin/mv", Hosts: []string{"/bin/mv"}},
 	{Copy: "ls", Source: "/bin/ls", Hosts: []string{"/bin/ls"}},
 	{Copy: "mkdir", Source: "/bin/mkdir", Hosts: []string{"/bin/mkdir"}},
+	{Copy: "rmdir", Source: "/bin/rmdir", Hosts: []string{"/bin/rmdir"}},
 	{Copy: "rm", Source: "/bin/rm", Hosts: []string{"/bin/rm"}},
 	{Copy: "chmod", Source: "/bin/chmod", Hosts: []string{"/bin/chmod"}},
 	{Copy: "ln", Source: "/bin/ln", Hosts: []string{"/bin/ln"}},
