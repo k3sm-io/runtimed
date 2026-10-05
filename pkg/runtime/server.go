@@ -166,9 +166,9 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		st := r.podStatus(p)
 		st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 		r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
-		// No network Teardown: the vm route allocated no lo0 alias (a NAT-attached
-		// guest is reached over its VZ attachment), and calling it would ask the
-		// IPAM to release something it never handed out.
+		// No network Teardown: podnet teardown is the provider's, because it owns
+		// the guest's published lo0 alias and relay; runtimed never allocated
+		// them, so calling it here would release something it never handed out.
 		r.closeContainerLogs(p)
 		if err := r.removePodDir(req.GetPodId()); err != nil {
 			r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
