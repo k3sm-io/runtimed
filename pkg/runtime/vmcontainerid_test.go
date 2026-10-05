@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -129,5 +130,65 @@ func TestVMContainerStatesCarryTheContainerID(t *testing.T) {
 				t.Errorf("terminated log_path = %q, want the status log_path %q", got, want)
 			}
 		})
+	}
+}
+
+// TestVMContainerExitWithoutStartedCarriesTheContainerID is the defect gate for
+// the late-subscribe fold: the host subscribes to the guest's event stream only
+// after the guest is ready, so a container that ran and exited inside that
+// window arrives as a bare Exited event with no Started before it. It still ran,
+// so its terminated state must carry an id and the log file (the logs handler,
+// like the upstream kubelet, refuses a terminated container without an id),
+// while its start time stays unknown rather than invented.
+func TestVMContainerExitWithoutStartedCarriesTheContainerID(t *testing.T) {
+	rt := newTestRuntime(t, Deps{VMBackend: &fakeVMBackend{available: true}})
+	p := addVMPod(t, rt, "pod-vm-late", "app", "side")
+	writers := map[string]*crilog.Writer{}
+	for _, c := range []string{"app", "side"} {
+		w, err := crilog.Open(filepath.Join(t.TempDir(), c, "0.log"))
+		if err != nil {
+			t.Fatalf("open writer: %v", err)
+		}
+		t.Cleanup(func() { _ = w.Close() })
+		writers[c] = w
+	}
+	p.guestLogs = writers
+
+	ids := map[string]string{}
+	for _, c := range []string{"app", "side"} {
+		rt.applyGuestContainerEvent(p, &guestv1.ContainerEvent{
+			Container: c, Exited: &guestv1.ContainerExited{ExitCode: 0},
+		})
+		p.mu.Lock()
+		st := proto.Clone(p.guestContainers[c]).(*runtimev1.ContainerStatus)
+		p.mu.Unlock()
+
+		term := st.GetState().GetTerminated()
+		if term == nil {
+			t.Fatalf("%s: after a bare Exited the state is %v, want Terminated", c, st.GetState())
+		}
+		id := term.GetContainerId()
+		if len(id) != 64 || strings.Trim(id, "0123456789abcdef") != "" {
+			t.Fatalf("%s: terminated container_id = %q, want a 64-hex id — the logs handler refuses a terminated container with no id", c, id)
+		}
+		if st.GetContainerId() != id {
+			t.Errorf("%s: status container id %q != terminated container_id %q", c, st.GetContainerId(), id)
+		}
+		if got, want := term.GetLogPath(), writers[c].Path(); got != want {
+			t.Errorf("%s: terminated log_path = %q, want %q", c, got, want)
+		}
+		if got, want := st.GetLogPath(), writers[c].Path(); got != want {
+			t.Errorf("%s: status log_path = %q, want %q", c, got, want)
+		}
+		if term.GetStartedAt() != nil {
+			t.Errorf("%s: terminated started_at = %v, want nil — no start was observed", c, term.GetStartedAt().AsTime())
+		}
+		if term.GetReason() != "Completed" {
+			t.Errorf("%s: reason = %q, want Completed", c, term.GetReason())
+		}
+		ids[c] = id
+	}
+	if ids["app"] == ids["side"] {
+		t.Errorf("two containers got the same id %q, want two distinct ids", ids["app"])
 	}
 }
