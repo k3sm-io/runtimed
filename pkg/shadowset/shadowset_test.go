@@ -116,3 +116,50 @@ func TestEntriesReturnsACopy(t *testing.T) {
 		t.Fatalf("CopyFor(/bin/sh) = %q after editing a returned slice", got)
 	}
 }
+
+// TestEntriesCoverTheDocumentedFamily is a regression pin over a hand-copied
+// list: the utilities the k3sm user docs (limitations.md) name as rebased from
+// the shadow set. The test does not read those docs; the table below must be
+// updated together with limitations.md whenever that list changes. Each row
+// must have a copy, looked up by its host exec path the way the runtime's exec
+// swap looks it up. A utility missing here starts without the path shim and
+// walks the host path, so a call on an absolute mount path misses the mount.
+// The pin is non-vacuous: rmdir was absent before it was added to the set.
+func TestEntriesCoverTheDocumentedFamily(t *testing.T) {
+	cases := []struct {
+		host string
+		copy string
+	}{
+		{"/bin/mkdir", "mkdir"},
+		{"/bin/rmdir", "rmdir"},
+		{"/bin/rm", "rm"},
+		{"/bin/mv", "mv"},
+		{"/bin/chmod", "chmod"},
+		{"/bin/ln", "ln"},
+		{"/usr/bin/readlink", "readlink"},
+		{"/usr/bin/touch", "touch"},
+		{"/bin/cp", "cp"},
+		{"/bin/ls", "ls"},
+		{"/usr/bin/find", "find"},
+		{"/bin/cat", "cat"},
+		{"/usr/bin/sed", "sed"},
+		{"/usr/bin/awk", "awk"},
+		{"/usr/bin/grep", "grep"},
+		{"/usr/bin/head", "head"},
+		{"/usr/bin/tail", "tail"},
+		{"/usr/bin/xargs", "xargs"},
+		{"/usr/bin/sort", "sort"},
+		{"/usr/bin/tar", "tar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.copy, func(t *testing.T) {
+			got, ok := CopyFor(tc.host)
+			if !ok {
+				t.Fatalf("%s has no shadow copy, but %s is on the pinned list of rebased utilities", tc.host, tc.copy)
+			}
+			if got != tc.copy {
+				t.Errorf("CopyFor(%q) = %q, want %q", tc.host, got, tc.copy)
+			}
+		})
+	}
+}
