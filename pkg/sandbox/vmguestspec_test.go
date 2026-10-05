@@ -70,7 +70,7 @@ func guestSpecFixture() VMSpec {
 			{
 				Name: "postgres", RootfsTag: "k3sm.rootfs.postgres",
 				Argv:       []string{"/usr/local/bin/postgres", "-D", "/pgdata"},
-				Env:        []string{"PGDATA=/pgdata", "POSTGRES_DB=stockkitty"},
+				Env:        []string{"PGDATA=/pgdata", "POSTGRES_DB=demo"},
 				WorkingDir: "/var/lib/postgresql", TTY: true,
 				UID: 999, GID: 999, SupplementalGIDs: []int64{999, 2000},
 			},

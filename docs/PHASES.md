@@ -1102,7 +1102,7 @@ macOS-arm64 CI for the cgo build; node-conformance-subset hooks.
 ## M5 — `vm` sandbox backend (Virtualization.framework Linux micro-VM) 🟡
 **Cross-repo dep:** `apis:M5.1` (the `runtime.k3sm.io` handler-config mapping `runtimeClassName: vm` →
 `SANDBOX_BACKEND_VM`, **landed** — the provider stamps `SandboxProfile.backend` + the `vm_vcpus` /
-`vm_memory_bytes` sizing fields). The committed direction for the Linux-only components stockkitty needs
+`vm_memory_bytes` sizing fields). The committed direction for the Linux-only components a reference workload needs
 (Postgres/pgvector and the amd64 images): a Virtualization.framework Linux micro-VM behind the
 **existing swappable `sandbox.Backend` interface**.
 

@@ -18,9 +18,13 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -104,15 +108,42 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 	p.mu.Lock()
 	st := p.guestContainerLocked(name, spec.GetImage())
 	if started != nil {
+		// The container id is minted once, on the first start, and then only
+		// carried: a container that never started has none (as upstream), and a
+		// re-read of the status must never see it change.
+		if st.GetContainerId() == "" {
+			st.ContainerId = guestContainerID(p.box.GetPodId(), name, started.GetPid(), at.AsTime().UnixNano())
+		}
+		if w := p.guestLogs[name]; w != nil {
+			st.LogPath = w.Path()
+		}
 		st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: at}}
 		st.Ready = true
 	} else {
-		st.State = &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
+		term := &runtimev1.ContainerStateTerminated{
 			ExitCode:   exited.GetExitCode(),
 			Signal:     exited.GetSignal(),
 			FinishedAt: at,
 			Reason:     guestTerminationReason(exited),
-		}}
+		}
+		// An exit can be the first event the host ever folds for a container:
+		// the host subscribes to the guest's event stream only after the guest
+		// is ready, so a container that ran and exited inside that window
+		// arrives as a bare Exited (the late-subscribe fold). It still RAN, and
+		// upstream a container that ran always has an id — the logs handler
+		// refuses a terminated container without one — so the id is minted here
+		// when the start never minted it. ContainerExited carries no pid, so the
+		// pid input is 0; the host-stamped exit time keeps the id unique per
+		// incarnation. StartedAt stays nil: no start was observed, and an
+		// invented start time would be a lie the status could not take back.
+		if st.GetContainerId() == "" {
+			st.ContainerId = guestContainerID(p.box.GetPodId(), name, 0, at.AsTime().UnixNano())
+			if w := p.guestLogs[name]; w != nil {
+				st.LogPath = w.Path()
+			}
+		}
+		carryGuestIdentityLocked(st, term)
+		st.State = &runtimev1.ContainerState{Terminated: term}
 		st.Ready = false
 		if exited.GetOomKilled() {
 			// The pod-level latch, set from the one source that can observe a guest
@@ -226,6 +257,46 @@ func recomputeVMPhaseLocked(p *pod) {
 	// The remaining shape — no main running, some terminated, some not yet
 	// reported — is deliberately no change. It is a fold in progress, not a
 	// verdict, and the next event resolves it.
+}
+
+// guestContainerID derives a vm container's opaque container id, the vm
+// spine's counterpart to podProcRecord.containerID and in the same shape (hex
+// sha256 over NUL-separated fields), so a consumer reads one id format whichever
+// kernel ran the container.
+//
+// The inputs are the pod id, the container name, the guest-reported pid and the
+// HOST-stamped start time of the Started event (or, for a container whose exit
+// is the first event the host folds, pid 0 and the host-stamped exit time). None
+// of them is re-derived on a status read: the id is computed once when the start
+// (or that first exit) is folded and then stored
+// on the status, so every later read (and the terminated state that copies it)
+// sees the same value. The pid and start time make it unique per incarnation;
+// the guest pid is a guest-side number that means nothing on the host, and the
+// hash keeps it opaque all the same — nothing may parse the id back.
+//
+// Why the id matters at all: the embedder's kubelet-faithful logs handler, like
+// upstream, refuses logs for a terminated container that carries no id, so
+// without one `kubectl logs` on a finished vm Pod fails.
+func guestContainerID(podID, container string, pid int32, startUnixNano int64) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		podID,
+		container,
+		strconv.FormatInt(int64(pid), 10),
+		strconv.FormatInt(startUnixNano, 10),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+// carryGuestIdentityLocked copies a vm container's identity onto the terminated
+// state that is about to replace its current one: the container id, the start
+// time of the run being concluded, and the log file — exactly what
+// terminatedLocked carries for a native container, since the terminated state is
+// read as the identity of the run it reports. The caller holds p.mu and calls it
+// BEFORE overwriting st.State, because the start time lives in the Running state.
+func carryGuestIdentityLocked(st *runtimev1.ContainerStatus, term *runtimev1.ContainerStateTerminated) {
+	term.ContainerId = st.GetContainerId()
+	term.LogPath = st.GetLogPath()
+	term.StartedAt = st.GetState().GetRunning().GetStartedAt()
 }
 
 // guestTerminationReason maps a guest exit onto the same reason strings the
@@ -409,10 +480,14 @@ func (r *Runtime) failVMPod(p *pod, reason, message string) {
 	p.message = message
 	for _, name := range p.guestContainerOrder {
 		st := p.guestContainers[name]
+		// Only a container folded as Running is terminated here, and its id was
+		// minted by that Started fold, so no container reaches carry below
+		// without one. A container never seen Running never ran as far as the
+		// host knows, keeps no id (as upstream), and is left as it is.
 		if st == nil || st.GetState().GetRunning() == nil {
 			continue
 		}
-		st.State = &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
+		term := &runtimev1.ContainerStateTerminated{
 			// Exit code 255 is the "terminated for a reason the runtime could
 			// not observe" convention the host-process path uses for a
 			// container whose status was never collected: the guest is gone, so
@@ -421,7 +496,9 @@ func (r *Runtime) failVMPod(p *pod, reason, message string) {
 			FinishedAt: at,
 			Reason:     reason,
 			Message:    message,
-		}}
+		}
+		carryGuestIdentityLocked(st, term)
+		st.State = &runtimev1.ContainerState{Terminated: term}
 		st.Ready = false
 	}
 	p.mu.Unlock()
