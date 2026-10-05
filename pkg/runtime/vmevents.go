@@ -126,6 +126,22 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 			FinishedAt: at,
 			Reason:     guestTerminationReason(exited),
 		}
+		// An exit can be the first event the host ever folds for a container:
+		// the host subscribes to the guest's event stream only after the guest
+		// is ready, so a container that ran and exited inside that window
+		// arrives as a bare Exited (the late-subscribe fold). It still RAN, and
+		// upstream a container that ran always has an id — the logs handler
+		// refuses a terminated container without one — so the id is minted here
+		// when the start never minted it. ContainerExited carries no pid, so the
+		// pid input is 0; the host-stamped exit time keeps the id unique per
+		// incarnation. StartedAt stays nil: no start was observed, and an
+		// invented start time would be a lie the status could not take back.
+		if st.GetContainerId() == "" {
+			st.ContainerId = guestContainerID(p.box.GetPodId(), name, 0, at.AsTime().UnixNano())
+			if w := p.guestLogs[name]; w != nil {
+				st.LogPath = w.Path()
+			}
+		}
 		carryGuestIdentityLocked(st, term)
 		st.State = &runtimev1.ContainerState{Terminated: term}
 		st.Ready = false
@@ -249,8 +265,10 @@ func recomputeVMPhaseLocked(p *pod) {
 // kernel ran the container.
 //
 // The inputs are the pod id, the container name, the guest-reported pid and the
-// HOST-stamped start time of the Started event. None of them is re-derived on a
-// status read: the id is computed once when the start is folded and then stored
+// HOST-stamped start time of the Started event (or, for a container whose exit
+// is the first event the host folds, pid 0 and the host-stamped exit time). None
+// of them is re-derived on a status read: the id is computed once when the start
+// (or that first exit) is folded and then stored
 // on the status, so every later read (and the terminated state that copies it)
 // sees the same value. The pid and start time make it unique per incarnation;
 // the guest pid is a guest-side number that means nothing on the host, and the
@@ -462,6 +480,10 @@ func (r *Runtime) failVMPod(p *pod, reason, message string) {
 	p.message = message
 	for _, name := range p.guestContainerOrder {
 		st := p.guestContainers[name]
+		// Only a container folded as Running is terminated here, and its id was
+		// minted by that Started fold, so no container reaches carry below
+		// without one. A container never seen Running never ran as far as the
+		// host knows, keeps no id (as upstream), and is left as it is.
 		if st == nil || st.GetState().GetRunning() == nil {
 			continue
 		}
