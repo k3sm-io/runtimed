@@ -18,6 +18,7 @@ package guestinit
 
 import (
 	"errors"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -48,6 +49,8 @@ func TestAwaitReply(t *testing.T) {
 		want      func(byte) bool
 		wantCalls int
 		wantErr   error
+		alsoErr   error  // a second error the result must also wrap
+		wantMsg   string // a substring the error message must carry
 		wantAddr  string
 	}{
 		{
@@ -60,7 +63,7 @@ func TestAwaitReply(t *testing.T) {
 			name:  "interrupted reads stop when the budget is spent",
 			reads: []read{{err: syscall.EINTR}},
 			tick:  100 * ms, budget: 250 * ms, want: IsOffer,
-			wantCalls: 3, wantErr: ErrDHCP,
+			wantCalls: 3, wantErr: ErrDHCP, wantMsg: "no reply within",
 		},
 		{
 			name:  "another exchange's reply is skipped, not failed",
@@ -84,7 +87,13 @@ func TestAwaitReply(t *testing.T) {
 			name:  "a receive error other than EINTR fails the round",
 			reads: []read{{err: eio}, {msg: offer}},
 			tick:  ms, budget: 250 * ms, want: IsOffer,
-			wantCalls: 1, wantErr: eio,
+			wantCalls: 1, wantErr: eio, alsoErr: ErrDHCP,
+		},
+		{
+			name:  "a receive timeout (EAGAIN, a silent segment) fails the round as ErrDHCP",
+			reads: []read{{err: syscall.EAGAIN}, {msg: offer}},
+			tick:  ms, budget: 250 * ms, want: IsOffer,
+			wantCalls: 1, wantErr: syscall.EAGAIN, alsoErr: ErrDHCP,
 		},
 		{
 			name:  "a spent budget is refused before any read",
@@ -116,6 +125,12 @@ func TestAwaitReply(t *testing.T) {
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+				if tc.alsoErr != nil && !errors.Is(err, tc.alsoErr) {
+					t.Errorf("err = %v, want it to wrap %v too", err, tc.alsoErr)
+				}
+				if tc.wantMsg != "" && !strings.Contains(err.Error(), tc.wantMsg) {
+					t.Errorf("err = %v, want it to say %q", err, tc.wantMsg)
 				}
 				return
 			}

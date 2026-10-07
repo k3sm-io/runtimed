@@ -96,9 +96,9 @@ func configureNetwork(log *slog.Logger) (GuestNetwork, error) {
 	// wait and its bound. The order cannot be fixed from the host side: vmhost
 	// starts the VM with the network device already configured, and
 	// Virtualization.framework attaches the vmnet port on its own schedule after
-	// the start with no attach-completed signal to wait on, so the guest is the
-	// only place that can observe the link come up (1–2 ms after IFF_UP as
-	// measured for runtimed #157). Running out of bound is not fatal: the
+	// the start, and it exposes no public API we know of that signals the attach,
+	// so the guest is the only place that can observe the link come up (1–2 ms
+	// after IFF_UP as measured for runtimed #157). Running out of bound is not fatal: the
 	// retransmission schedule in dhcpLease covers a link that never reports
 	// carrier. The two failure lines are kept apart so a device that cannot be
 	// read is not filed as ordinary boot jitter.

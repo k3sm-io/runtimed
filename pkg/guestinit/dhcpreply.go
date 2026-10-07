@@ -33,9 +33,9 @@ import (
 // round still has, so a socket-backed recv can set its receive timeout to it.
 // An EINTR from recv is read again within the same budget: SO_RCVTIMEO makes a
 // read return EINTR for any handled signal regardless of SA_RESTART (signal(7)),
-// and the Go runtime handles signals of its own — its preemption signal, SIGURG,
-// arrives on the runtime's schedule — so the interruption happens with nothing
-// spawned and no SIGCHLD in flight. The datagram, if one arrived, is still
+// and the Go runtime handles signals of its own. The interruption happens with
+// nothing spawned and no SIGCHLD in flight, so it is some signal the runtime
+// handles; the specific one was not captured. The datagram, if one arrived, is still
 // queued, and counting the round as unanswered would retransmit a DISCOVER whose
 // OFFER is already waiting.
 //
