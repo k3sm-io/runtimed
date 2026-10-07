@@ -244,7 +244,7 @@ func (r *Runtime) execGuest(stream runtimev1.Runtime_ExecServer, p *pod, first *
 		return guestStreamError("exec", podID, err)
 	}
 
-	// Detached, exactly as the host-process runExec stdin pump is: a client that
+	// Detached, exactly as the host-process exec session stdin pump (execsession.Run) is: a client that
 	// holds stdin open must not block teardown, and the handler's return cancels
 	// ctx, which unblocks this goroutine's Recv.
 	go forwardExecInput(stream, agent)
@@ -332,7 +332,8 @@ const maxGuestCapabilityTokens = 64
 // ignored exactly as guest.proto says it should be.
 func knownGuestCapability(tok string) bool {
 	switch tok {
-	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial:
+	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial,
+		guestagent.CapabilityGuestPrivateMounts, guestagent.CapabilitySidecarInit, guestagent.CapabilityImageUser:
 		return true
 	}
 	return false

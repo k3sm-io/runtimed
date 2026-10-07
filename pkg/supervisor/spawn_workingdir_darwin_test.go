@@ -126,7 +126,7 @@ func TestSpawnHonorsWorkingDir(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Getwd: %v", err)
 		}
-		plan, err := planSpawn(SpawnSpec{Path: "/bin/pwd"})
+		plan, err := planSpawn(SpawnSpec{Path: "/bin/pwd"}, false)
 		if err != nil {
 			t.Fatalf("planSpawn with no Dir: %v", err)
 		}
@@ -157,7 +157,7 @@ func TestSpawnHonorsWorkingDir(t *testing.T) {
 				// must carry it. Both are asserted, so a spawner that dropped the
 				// refusal (mutant: ignore planSpawn's error and spawn anyway)
 				// cannot pass on planSpawn's verdict alone.
-				if _, err := planSpawn(SpawnSpec{Path: "/bin/pwd", Dir: tc.dir}); !errors.Is(err, ErrWorkingDir) {
+				if _, err := planSpawn(SpawnSpec{Path: "/bin/pwd", Dir: tc.dir}, false); !errors.Is(err, ErrWorkingDir) {
 					t.Errorf("planSpawn error = %v, want ErrWorkingDir", err)
 				}
 				pid, err := PosixSpawner{}.Spawn(context.Background(),

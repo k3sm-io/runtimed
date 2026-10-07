@@ -144,9 +144,6 @@ type VMSpec struct {
 	// MemoryBytes is the guest's RAM ceiling in bytes — the VZ memorySize, the VM
 	// analog of the host-process memory limit; 0 = backend default.
 	MemoryBytes int64
-	// RootfsPath is the on-disk pod data volume the OCI-Linux-rootfs→bootable-root
-	// builder (lab-gated) turns into the guest root.
-	RootfsPath string
 	// Network is the guest's network config: the rendered resolv.conf content
 	// plus the NAT advisory fields the vm backend applies to the guest. The provider
 	// stamps it as data (runtimed cannot import darwin-net — see GuestNetworkConfig);
@@ -192,7 +189,7 @@ type VMSpec struct {
 	// every pod-path derivation in this daemon (r.podDir parses the id first),
 	// and a second derivation in this package would be a second answer to
 	// "where does this pod live" that could disagree with the first — which is
-	// the class of bug rootfsPath's byte-equality rule exists to foreclose.
+	// the class of bug rootfsPath's derive-only rule exists to foreclose.
 	PodDir string
 	// AgentSocketPath is the runtimed-PRIVATE unix socket the helper binds and
 	// relays to the guest agent's vsock port. Stamped by createVMPod from
@@ -451,7 +448,7 @@ func NewVMBackend(opts ...VMBackendOption) *VMBackend {
 		supportedFn:      vzSupported,
 		vmHostFn:         FindVMHost,
 		helperEntitledFn: vzStaticCodeEntitled,
-		spawner:          supervisor.PosixSpawner{},
+		spawner:          supervisor.PosixSpawner{PressureKill: true},
 		waiter:           supervisor.KqueueReaper{},
 		health:           dialGuestHealth,
 		signal:           supervisor.SignalGroup,

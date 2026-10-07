@@ -121,6 +121,13 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	// empty name to the pod's single container, and the claim must be taken on
 	// the entry that resolution picked.
 	p.mu.Lock()
+	if cp.ephemeral && cp.state.GetState().GetTerminated() != nil {
+		// An ephemeral container that ran (or was recorded not started when
+		// the pod was re-created) is never started again.
+		p.mu.Unlock()
+		return startFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			"start %s/%s: ephemeral containers are never restarted", req.GetPodId(), cp.name), nil
+	}
 	claimed, verdict := claimContainerStartLocked(p, cp.name)
 	p.mu.Unlock()
 	switch verdict {
@@ -179,6 +186,9 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	}
 
 	p.mu.Lock()
+	// The entry keeps its declaration class: a debug container that failed to
+	// start and is started now is still an ephemeral one.
+	newCP.ephemeral = cp.ephemeral
 	if prev := cp.state.GetState().GetTerminated(); prev != nil {
 		// The entry is not a never-started container but one that RAN and died
 		// while no daemon was watching (AttachPod's entry for a container with

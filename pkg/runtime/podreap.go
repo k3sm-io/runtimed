@@ -116,6 +116,20 @@ type PodReapRecord struct {
 	// under, never a drifted one. A record without it (written before the field
 	// existed) never attaches. It plays no part in the reap's kill decision.
 	ProfileSHA256 string `json:"profileSha256,omitempty"`
+	// ShimDir is the container's resident-shim dir (<Root>/run/shim/<id>): its
+	// socket and exit record. Empty for a container spawned without a shim. When
+	// set, Pgid and StartUnixNano name the SHIM, the pod group's leader, and the
+	// two fields below name the container it hosts.
+	ShimDir string `json:"shimDir,omitempty"`
+	// ChildPid and ChildStartUnixNano are the container's own identity under a
+	// resident shim, recorded best-effort once the shim's Status has answered
+	// (recordChild) — after the leader's record, which stays the synchronous,
+	// pre-acknowledgement one. They are what a group whose shim died can still be
+	// proven ours by (the leader is gone, the container is not). A daemon that
+	// dies between the two writes leaves them empty, and such a group falls back
+	// to the leader-only rules: a group kill rather than a graceful adopt.
+	ChildPid           int   `json:"childPid,omitempty"`
+	ChildStartUnixNano int64 `json:"childStartUnixNano,omitempty"`
 }
 
 // podProcRecord is the package's historical name for PodReapRecord.
@@ -202,7 +216,7 @@ func (r *Runtime) podReapDir(podID string) (string, error) {
 // (pgid, leader start) pair the reap will later match on. Returning it — rather
 // than letting the caller re-probe the process table — is what makes a
 // disagreement between the two structurally impossible.
-func (r *Runtime) recordPodProc(podID, container string, pgid int, profileSHA string) (podProcRecord, error) {
+func (r *Runtime) recordPodProc(podID, container string, pgid int, profileSHA, shimDir string) (podProcRecord, error) {
 	if pgid <= 1 {
 		return podProcRecord{}, fmt.Errorf("refusing to record pod %s process group with pgid %d (must be > 1)", podID, pgid)
 	}
@@ -212,27 +226,42 @@ func (r *Runtime) recordPodProc(podID, container string, pgid int, profileSHA st
 		// it. Record with zero identity so the reap drops the file unsignaled.
 		start = 0
 	}
-	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start, RuntimeVersion: r.fingerprint, ProfileSHA256: profileSHA}
+	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid, StartUnixNano: start, RuntimeVersion: r.fingerprint, ProfileSHA256: profileSHA, ShimDir: shimDir}
+	return rec, r.writePodProcRecord(rec)
+}
+
+// recordChild adds a resident shim's container identity to rec's file (the
+// best-effort second write; see PodReapRecord.ChildPid) and returns the record.
+// It goes through the same write as recordPodProc, so the file has one writer.
+func (r *Runtime) recordChild(rec podProcRecord, child int, childStart int64) (podProcRecord, error) {
+	rec.ChildPid, rec.ChildStartUnixNano = child, childStart
+	return rec, r.writePodProcRecord(rec)
+}
+
+// writePodProcRecord writes rec to <podreap>/<podID>/<pgid>.json through a tmp
+// file and a rename, so a reader sees the old record or the new one.
+func (r *Runtime) writePodProcRecord(rec podProcRecord) error {
+	podID, pgid := rec.PodID, rec.Pgid
 	dir, err := r.podReapDir(podID)
 	if err != nil {
-		return podProcRecord{}, fmt.Errorf("reap record dir for pod %s: %w", podID, err)
+		return fmt.Errorf("reap record dir for pod %s: %w", podID, err)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return podProcRecord{}, fmt.Errorf("create reap record dir for pod %s: %w", podID, err)
+		return fmt.Errorf("create reap record dir for pod %s: %w", podID, err)
 	}
 	data, err := json.Marshal(rec)
 	if err != nil {
-		return podProcRecord{}, fmt.Errorf("marshal reap record for pod %s: %w", podID, err)
+		return fmt.Errorf("marshal reap record for pod %s: %w", podID, err)
 	}
 	final := filepath.Join(dir, strconv.Itoa(pgid)+".json")
 	tmp := final + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return podProcRecord{}, fmt.Errorf("write reap record for pod %s: %w", podID, err)
+		return fmt.Errorf("write reap record for pod %s: %w", podID, err)
 	}
 	if err := os.Rename(tmp, final); err != nil {
-		return podProcRecord{}, fmt.Errorf("commit reap record for pod %s: %w", podID, err)
+		return fmt.Errorf("commit reap record for pod %s: %w", podID, err)
 	}
-	return rec, nil
+	return nil
 }
 
 // removePodProcRecord drops a container's process-group record once its group
@@ -358,6 +387,10 @@ func readPodReapStore(root string, log *slog.Logger) (records []podProcRecord, q
 //   - a record whose group's leader member exists (Pid == pgid) but reports a
 //     different start is a recycled pgid (a new leader took the number): dropped,
 //     never signalled;
+//   - a resident shim's record whose leader is gone but whose container member
+//     is alive under EXACTLY the recorded ChildPid/ChildStartUnixNano is ours
+//     by the container's identity: selected for kill (the shim crashed and
+//     nothing re-attached the pod);
 //   - a record whose non-empty group has NO leader member (Pid == pgid absent —
 //     the leader exited, a grandchild keeps the group alive) is keep-and-warn:
 //     kept and surfaced by the caller as an alerting Warn, never killed (see the
@@ -401,6 +434,13 @@ func startupPodReapDecision(records []podProcRecord, owned map[int]bool, procGro
 		}
 		leader, found := leaderMember(members, rec.Pgid)
 		if !found {
+			// A resident shim's group whose shim died: the container's own
+			// recorded identity, matched exactly, proves the group is still ours
+			// without its leader.
+			if childIsRecordedInstance(rec, members) {
+				kill = append(kill, rec)
+				continue
+			}
 			// Leader (Pid == pgid) gone, group alive via a grandchild: we cannot
 			// prove the group is still ours. Keep-and-warn — never kill, never
 			// drop (see the header ceiling).
@@ -444,7 +484,27 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 		return false
 	}
 	leader, found := leaderMember(members, rec.Pgid)
-	return found && leader.StartUnixNano == rec.StartUnixNano
+	if !found {
+		return childIsRecordedInstance(rec, members)
+	}
+	return leader.StartUnixNano == rec.StartUnixNano
+}
+
+// childIsRecordedInstance reports whether members include a resident shim's
+// container under EXACTLY its recorded identity (ChildPid and
+// ChildStartUnixNano, both recorded). It is the leader rule's exact-equality
+// predicate applied to the container: the "do not soften" note on
+// startupPodReapDecision holds for it unchanged.
+func childIsRecordedInstance(rec podProcRecord, members []supervisor.ProcMember) bool {
+	if rec.ShimDir == "" || rec.ChildPid <= 1 || rec.ChildStartUnixNano == 0 {
+		return false
+	}
+	for _, m := range members {
+		if m.Pid == rec.ChildPid {
+			return m.StartUnixNano == rec.ChildStartUnixNano
+		}
+	}
+	return false
 }
 
 // attachDecision splits the durable records into the ones AttachPod may adopt
@@ -466,11 +526,18 @@ func (r *Runtime) groupIsRecordedInstance(rec podProcRecord) bool {
 //   - the record's RuntimeVersion equals fingerprint, and fingerprint is not
 //     empty (a daemon that cannot name its own build adopts nothing).
 //
-// adopt and remaining partition records; nothing is dropped. The caller keys
-// ownership by the record's Pgid, which is the adopted leader's pid — the same
-// key space the reap's owned set is built in (containerPIDs of the registered
-// pods), so an adopted group is excluded from the reap by construction.
-func attachDecision(records []podProcRecord, procGroup procGroupInspector, startTime procStartTime, fingerprint string) (adopt, remaining []podProcRecord) {
+// A resident shim's record whose shim died but whose container lives is not
+// adoptable but DEGRADED: the reap's kill bucket admits it by the container's
+// exact recorded identity (its leader is gone), the per-pid probe of ChildPid
+// reports exactly ChildStartUnixNano, and the fingerprint matches. AttachPod
+// watches such a container by that identity with no shim behind it.
+//
+// adopt, degraded and remaining partition records; nothing is dropped. The
+// caller keys ownership by the record's Pgid, which is the adopted leader's pid —
+// the same key space the reap's owned set is built in (containerPgids of the
+// registered pods), so an attached group is excluded from the reap by
+// construction.
+func attachDecision(records []podProcRecord, procGroup procGroupInspector, startTime procStartTime, fingerprint string) (adopt, degraded, remaining []podProcRecord) {
 	kill, _, _ := startupPodReapDecision(records, nil, procGroup)
 	live := make(map[podProcRecord]bool, len(kill))
 	for _, rec := range kill {
@@ -482,10 +549,27 @@ func attachDecision(records []podProcRecord, procGroup procGroupInspector, start
 				adopt = append(adopt, rec)
 				continue
 			}
+			if leaderGone(rec, procGroup) {
+				if start, ok := startTime(rec.ChildPid); ok && start == rec.ChildStartUnixNano && rec.ChildPid > 1 {
+					degraded = append(degraded, rec)
+					continue
+				}
+			}
 		}
 		remaining = append(remaining, rec)
 	}
-	return adopt, remaining
+	return adopt, degraded, remaining
+}
+
+// leaderGone reports whether rec's group is inspectable and has no leader
+// member: the shape in which only the container's identity can vouch for it.
+func leaderGone(rec podProcRecord, procGroup procGroupInspector) bool {
+	members, ok := procGroup(rec.Pgid)
+	if !ok || len(members) == 0 {
+		return false
+	}
+	_, found := leaderMember(members, rec.Pgid)
+	return !found
 }
 
 // ReapOrphanedPods reaps pod process groups recorded by a previous daemon run,
@@ -549,8 +633,8 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	r.podReapStarted = true
 	owned := make(map[int]bool)
 	for _, p := range r.pods {
-		for _, pid := range p.containerPIDs() {
-			owned[pid] = true
+		for _, pgid := range p.containerPgids() {
+			owned[pgid] = true
 		}
 	}
 	r.mu.Unlock()
@@ -600,7 +684,40 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 		_ = os.Remove(f)
 	}
 	r.sweepStaleSandboxProfiles()
+	r.sweepStaleShimDirs()
 	return nil
+}
+
+// sweepStaleShimDirs removes every resident-shim dir no registered pod owns. It
+// runs where sweepStaleSandboxProfiles runs and for the same reason: after the
+// reap, every shim a previous daemon started is either attached (its dir is in
+// its pod's shimDirs) or killed or leaked, and a dir nothing owns is the
+// leftover of a pod deleted while no daemon ran. Best-effort.
+func (r *Runtime) sweepStaleShimDirs() {
+	entries, err := os.ReadDir(r.shimRoot())
+	if err != nil {
+		return
+	}
+	owned := map[string]bool{}
+	r.mu.Lock()
+	pods := make([]*pod, 0, len(r.pods))
+	for _, p := range r.pods {
+		pods = append(pods, p)
+	}
+	r.mu.Unlock()
+	for _, p := range pods {
+		p.mu.Lock()
+		for _, dir := range p.shimDirs {
+			owned[dir] = true
+		}
+		p.mu.Unlock()
+	}
+	for _, e := range entries {
+		dir := filepath.Join(r.shimRoot(), e.Name())
+		if e.IsDir() && !owned[dir] {
+			_ = os.RemoveAll(dir)
+		}
+	}
 }
 
 // ProfileSweeper is the optional seam a sandbox backend implements when it

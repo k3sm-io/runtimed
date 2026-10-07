@@ -35,6 +35,23 @@ import (
 // missing half came from the image.
 var ErrRunSpecInvalid = errors.New("image: container run spec is not runnable")
 
+// ErrRunAsNonRoot reports the runAsNonRoot refusal specifically: the effective
+// runAsNonRoot is true and the image would run as root, or names a user that
+// cannot be verified non-root. Every such error also matches ErrRunSpecInvalid;
+// this sentinel exists so a caller can tell this cause from "no command
+// anywhere" without reading the message (a vm pod surfaces it as a container
+// configuration error, the other as an invalid pod).
+var ErrRunAsNonRoot = errors.New("image: container violates runAsNonRoot")
+
+// runAsNonRootError is a runAsNonRoot refusal. Its message is the kubelet's,
+// verbatim, and it matches both ErrRunSpecInvalid and ErrRunAsNonRoot.
+type runAsNonRootError struct{ msg string }
+
+func (e *runAsNonRootError) Error() string { return e.msg }
+
+// Unwrap reports both sentinels, so errors.Is matches either.
+func (e *runAsNonRootError) Unwrap() []error { return []error{ErrRunSpecInvalid, ErrRunAsNonRoot} }
+
 // ImageRunConfig is the PROCESS half of an OCI image config: what the image says
 // it runs when a pod spec says nothing.
 //
@@ -107,6 +124,11 @@ type RunSpecRequest struct {
 	RunAsUID int64
 	// RunAsNonRoot is the effective runAsNonRoot for this container.
 	RunAsNonRoot bool
+	// PodName, PodNamespace and PodUID identify the pod in the runAsNonRoot
+	// refusal, which names it the way the kubelet does: "<name>_<ns>(<uid>)".
+	PodName      string
+	PodNamespace string
+	PodUID       string
 }
 
 // MergeRunSpec merges an image's run config with a container's pod spec, per
@@ -206,6 +228,13 @@ func MergeRunSpec(cfg ImageRunConfig, req RunSpecRequest) (RunSpec, error) {
 // comment enumerates. It takes the image USER string rather than the resolved
 // uid because the two REFUSING branches are distinguished by whether the string
 // parsed at all, which the resolved uid can no longer tell you.
+//
+// The refusal text is the kubelet's (verifyRunAsNonRoot in
+// pkg/kubelet/kuberuntime/security_context_others.go at the pinned Kubernetes
+// version), so `kubectl describe` reads the same on k3sm as anywhere else. The
+// one deviation is defensive: a pod identity, container name or image user that
+// is not short printable text is rendered quoted and truncated (QuoteBounded),
+// because the image user is registry-supplied.
 func verifyRunAsNonRoot(imageUser string, req RunSpecRequest) error {
 	if !req.RunAsNonRoot || req.RunAsUID != 0 {
 		return nil
@@ -214,15 +243,48 @@ func verifyRunAsNonRoot(imageUser string, req RunSpecRequest) error {
 	if name == "" {
 		return nil
 	}
+	pod := runAsNonRootPod(req)
+	container := plainBounded(req.Container.GetName())
 	if uid, ok := numericImageUser(imageUser); ok {
 		if uid == 0 {
-			return fmt.Errorf("%w: container %s sets runAsNonRoot and the image runs as uid 0",
-				ErrRunSpecInvalid, quoteBounded(req.Container.GetName(), maxTokenLen))
+			return &runAsNonRootError{msg: fmt.Sprintf(
+				"container has runAsNonRoot and image will run as root (pod: %s, container: %s)", pod, container)}
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: container %s sets runAsNonRoot and the image user %s is not numeric, so it cannot be verified non-root",
-		ErrRunSpecInvalid, quoteBounded(req.Container.GetName(), maxTokenLen), quoteBounded(name, maxTokenLen))
+	return &runAsNonRootError{msg: fmt.Sprintf(
+		"container has runAsNonRoot and image has non-numeric user (%s), cannot verify user is non-root (pod: %s, container: %s)",
+		plainBounded(name), pod, container)}
+}
+
+// The bounds of the refusal's identity fields. They are wide enough for every
+// valid Kubernetes value (a 253-byte DNS subdomain; a pod reference of name,
+// namespace and UID), so only a malformed or hostile value is ever truncated.
+const (
+	runAsNonRootNameLen = 253
+	runAsNonRootPodLen  = 253 + 63 + 36 + 3
+)
+
+// runAsNonRootPod renders the pod the way the kubelet's refusal does: the
+// %q-quoted format.Pod form, "<name>_<namespace>(<uid>)".
+func runAsNonRootPod(req RunSpecRequest) string {
+	return quoteBounded(req.PodName+"_"+req.PodNamespace+"("+req.PodUID+")", runAsNonRootPodLen)
+}
+
+// plainBounded returns s unchanged when it is short, printable ASCII with no
+// space (what a Kubernetes name or an image user is in practice), and the
+// quoted, truncated form otherwise, so a hostile value cannot inject text or
+// length into an operator-facing message.
+func plainBounded(s string) string {
+	if s == "" || len(s) > runAsNonRootNameLen {
+		return quoteBounded(s, runAsNonRootNameLen)
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c <= ' ' || c > '~' || c == '"' || c == '\\' {
+			return quoteBounded(s, runAsNonRootNameLen)
+		}
+	}
+	return s
 }
 
 // numericImageUser parses the UID half of an image USER directive

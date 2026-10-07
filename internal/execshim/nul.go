@@ -1,5 +1,3 @@
-//go:build !darwin
-
 /*
 Copyright The k3sm Authors.
 
@@ -16,18 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package runtime
+package execshim
 
-import (
-	"errors"
-	"os"
-)
+import "strings"
 
-// errPTYUnsupported reports that a tty exec (pty allocation) is darwin-only. The
-// runtime targets macOS; this stub lets the package build and run its non-tty
-// exec tests on linux CI. A tty exec off darwin fails closed with this error.
-var errPTYUnsupported = errors.New("runtime: tty exec (pty) requires darwin")
-
-func openPTY() (*os.File, *os.File, error) { return nil, nil, errPTYUnsupported }
-
-func setWinsize(*os.File, uint16, uint16) error { return errPTYUnsupported }
+// hasNUL reports whether path or any argv/env element contains a NUL byte. Such
+// a string cannot cross into C intact (it would be truncated at the NUL), so the
+// marked exec is skipped and unix.Exec refuses it with EINVAL.
+func hasNUL(path string, argv, env []string) bool {
+	if strings.IndexByte(path, 0) >= 0 {
+		return true
+	}
+	for _, list := range [][]string{argv, env} {
+		for _, s := range list {
+			if strings.IndexByte(s, 0) >= 0 {
+				return true
+			}
+		}
+	}
+	return false
+}

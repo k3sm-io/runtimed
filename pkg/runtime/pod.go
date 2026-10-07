@@ -26,7 +26,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/image"
@@ -34,7 +36,9 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -215,28 +219,56 @@ type pod struct {
 	// adopted marks a pod AttachPod re-attached after a daemon restart rather
 	// than one this daemon created (attach.go). Its profile is recompiled and
 	// hash-verified at attach, so its containers restart and stop like any
-	// other; the latch refuses Exec only, because the running instances'
-	// resolved launch environment belongs to the previous daemon. logStreamLost is set when a container's output could not be resumed
-	// (it was spawned with pipes); the status then carries
-	// LogStreamLostConditionType from attachedAt. All three are immutable after
+	// other. Whether a running instance takes Exec is per container
+	// (containerProc.execRefusal), keyed on its record: a shim-backed instance
+	// is served by its shim. adopted and attachedAt are immutable after
 	// AttachPod.
-	adopted       bool
-	attachedAt    time.Time
-	logStreamLost bool
+	adopted    bool
+	attachedAt time.Time
+
+	// logStreamLostReason and logStreamLostAt, guarded by mu, carry the pod's
+	// LogStreamLostConditionType: the first reason a container's output stopped
+	// being followed (residentshim.go), and when. Empty means never.
+	logStreamLostReason string
+	logStreamLostAt     time.Time
+
+	// shimDirs maps each container name to its resident-shim dir, allocated at
+	// create (or attach, from the records) and re-used for every instance of
+	// the container; guarded by mu. Removed with the pod. Nil for a pod whose
+	// backend hosts no shim.
+	shimDirs map[string]string
 }
 
-// containerPIDs returns the pod's currently-running container PIDs (the memory
+// containerPIDs returns the pod's currently-running CONTAINER pids (the memory
 // sampler's PID set; re-evaluated each tick so an exited container drops out).
+// A container beside a resident shim is metered as the container itself
+// (ChildPID), never the shim: the shim's footprint is node overhead, not the
+// pod's.
 func (p *pod) containerPIDs() []int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pids := make([]int, 0, len(p.containers))
 	for _, cp := range liveContainersLocked(p) {
-		if pid := cp.proc.PID(); pid > 0 {
+		if pid := cp.proc.ChildPID(); pid > 0 {
 			pids = append(pids, pid)
 		}
 	}
 	return pids
+}
+
+// containerPgids returns the process GROUPS of the pod's running containers —
+// the key the reap's owned set and its records use (the group leader is the
+// resident shim when there is one).
+func (p *pod) containerPgids() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pgids := make([]int, 0, len(p.containers))
+	for _, cp := range liveContainersLocked(p) {
+		if pgid := cp.proc.PID(); pgid > 0 {
+			pgids = append(pgids, pgid)
+		}
+	}
+	return pgids
 }
 
 // liveContainersLocked returns the pod's containers that have not terminated.
@@ -340,6 +372,26 @@ type containerProc struct {
 	// written by the exec observer and read under pod.mu. The zero value means
 	// "not observed restricted".
 	shim shimInactive
+	// childReport reads this instance's restricted-child report file
+	// (childreport.go); nil when none is armed. Set before the entry is
+	// installed and never changed after; Poll is safe for concurrent callers.
+	childReport *supervisor.ChildReport
+	// childShim is the platform binaries this instance reported running
+	// without the pod shim, written and read under pod.mu.
+	childShim shimChildLoss
+	// execRefusal, when set, is why Exec cannot enter this instance: it was
+	// re-attached without a shim (its launch environment belonged to the previous
+	// daemon), or its shim died or does not answer (errShimLost). Nil means Exec
+	// is served — through the shim for a shim-backed instance, by this daemon
+	// otherwise. Set before the entry is installed and never changed after.
+	execRefusal error
+	// ephemeral marks an entry of the pod's ephemeral (debug) container list
+	// (PodBox.ephemeral_containers). It reports under
+	// ephemeral_container_statuses, is excluded from the pod's phase
+	// accounting, is never restarted, and is torn down with the pod like a
+	// main. Set before the entry is installed in p.containers and never
+	// changed afterwards; read under pod.mu.
+	ephemeral bool
 }
 
 // sidecar reports whether cp is a native sidecar (KEP-753): an init-declared
@@ -367,6 +419,7 @@ func (cp *containerProc) sidecar() bool {
 // host-process spine has no use for it in any case — a host process binds a /32
 // lo0 alias via r.network.Setup and never reads a guest config.
 func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod, _ runtimev1.FailureReason, retErr error) {
+	r.warnRetiredRootfsField(box)
 	sp := box.GetSandboxProfile()
 	if sp == nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -411,8 +464,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// backend: an UNSPECIFIED request the ladder degraded to vm legitimately
 	// honours Memory, and refusing it here would reject a pod that runs fine.
 	// It must run before the rootfs MkdirAll below (and provisionPodTmpDir /
-	// recordPodReferences), the same reasoning the pod_id/rootfs_path checks in
-	// validatePodBox already use for their own sinks — a refused pod must leave
+	// recordPodReferences), the same reasoning the pod_id check in
+	// validatePodBox already uses for its own sinks — a refused pod must leave
 	// no trace on disk.
 	if vol, medium, ok := nonEmptyEmptyDirMedium(box); ok {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -500,6 +553,23 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 	}
 
+	// Every container's resident-shim dir, before the profile is compiled: a
+	// container keeps its dir for the pod's life (RestartContainer and
+	// StartContainer re-use it). The pod profile does not name the dirs — it
+	// denies the whole shim root (sandbox.ShimSubdir) — so its digest stays a
+	// function of the spec and the posture; only each shim's own profile does.
+	var shimDirs map[string]string
+	if hostsResidentShim(r.backend) {
+		if shimDirs, err = r.allocShimDirs(box); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
+		}
+		defer func() {
+			if retErr != nil {
+				removeShimDirs(shimDirs)
+			}
+		}()
+	}
+
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
 	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths)
@@ -516,7 +586,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// strictly before posix_spawn → the exec-shim drop.
 	//
 	// The walk's bound is this pod's own dir, not the shared pods root: rootfs is
-	// already the validated derivation (rootfsPath), so this is defence at the
+	// already the derivation (rootfsPath), so this is defence at the
 	// sink — the recursive group-rwx + setgid grant refuses any root outside that
 	// dir regardless of how the caller obtained it, the same shape
 	// removePodDir puts on its RemoveAll. A pods-root bound would be one level too
@@ -561,6 +631,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		cancel:  podCancel,
 
 		projState: projState,
+		shimDirs:  shimDirs,
 	}
 
 	// init_containers run first, sequentially; then the main containers start.
@@ -744,9 +815,20 @@ func (r *Runtime) armMemorySampler(p *pod) {
 		return
 	}
 	sampCtx, cancel := context.WithCancel(p.supCtx)
+	// The restricted-child poll rides the sampler's tick but never runs on
+	// its goroutine: the tick only hands off, without blocking, to a poller
+	// whose file IO and publish cannot delay a sample (the OOM path). Both
+	// die with sampCtx.
+	kick := make(chan struct{}, 1)
+	go r.childReportPoller(sampCtx, p, kick)
 	sampler := supervisor.NewMemorySampler(r.footprinter, p.containerPIDs, limit, func(footprint uint64) {
 		r.oomKill(p, footprint)
-	})
+	}, supervisor.WithTick(func() {
+		select {
+		case kick <- struct{}{}:
+		default: // a poll is already pending
+		}
+	}))
 	p.mu.Lock()
 	prev := p.memCancel
 	p.memSampler = sampler
@@ -834,10 +916,9 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// Compute the virtiofs share-device plan from the box's volumes —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
-	// guest-init composes the binds). The pod dir is derived locally (r.podDir), and the planner ignores
-	// box.rootfs_path for share roots; rootfsPath below derives the host-side
-	// VMSpec.RootfsPath the same way, accepting a caller-supplied rootfs_path
-	// only when it is byte-equal to that derivation.
+	// guest-init composes the binds). The pod dir is derived locally (r.podDir),
+	// and rootfsPath below derives the host-side guest rootfs dir the same way;
+	// no caller-supplied path feeds either.
 	//
 	// A planner reject maps to INVALID_POD_BOX via the errInvalidPodBox house
 	// pattern (validate.go): the plan is computed before this path touches
@@ -970,7 +1051,6 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		PodID:       box.GetPodId(),
 		Vcpus:       sp.GetVmVcpus(),
 		MemoryBytes: sp.GetVmMemoryBytes(),
-		RootfsPath:  vmRootfs,
 		Network:     netCfg,
 		Containers:  cplan.containers,
 		Volumes:     vmVolumePlan(plan),
@@ -1147,6 +1227,7 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 		"pod", p.box.GetPodId(), "footprint_bytes", footprint)
 	for _, proc := range procs {
 		if pid := proc.PID(); pid > 0 {
+			proc.NoteKill(syscall.SIGKILL)
 			if err := r.signalGroup(pid, killSignal); err != nil {
 				r.log.Warn("oom sigkill pod group", "pod", p.box.GetPodId(), "pid", pid, "err", err)
 			}
@@ -1353,7 +1434,7 @@ func (r *Runtime) killUntrackedSpawn(ctx context.Context, p *pod, cp *containerP
 	// teardown that makes this spawn unwelcome, and a kill that skips itself
 	// because its context is gone is the leak this function exists to close.
 	if _, _, err := supervisor.GracefulStop(context.WithoutCancel(ctx), pid, 0, cp.proc.Done(),
-		termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+		termSignal, killSignal, cp.proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
 		r.log.Warn("sigkill an untracked container spawn",
 			"pod", p.box.GetPodId(), "container", cp.name, "pid", pid, "err", err)
 	}
@@ -1483,7 +1564,13 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
 	}
 
-	env, err := r.containerEnv(p.box, c, rb.env)
+	// The environment reads the box's annotations, which UpdatePod replaces
+	// under p.mu while a spawn (an ephemeral append, a restart) can be in
+	// flight, so it is built from a snapshot taken under the same lock.
+	p.mu.Lock()
+	envBox, _ := proto.Clone(p.box).(*runtimev1.PodBox)
+	p.mu.Unlock()
+	env, err := r.containerEnv(envBox, c, rb.env)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
@@ -1522,23 +1609,54 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		instance = onDisk
 	}
 	logPath := filepath.Join(logDir, containerLogFile(instance))
-	logw, err := crilog.Open(logPath)
-	if err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("open container log for %s: %w", c.GetName(), err)
-	}
-	fanout := &logFanout{}
 	spawnEnv := env
 	if argv0 != "" {
 		// The exec-shim substitutes it and strips it, so the container's
 		// environment (cp.env, what an Exec session enters) never carries it.
 		spawnEnv = append(append([]string{}, env...), supervisor.ExecArgv0Env+"="+argv0)
 	}
-	spec := supervisor.SpawnSpec{
-		Path: shimPath,
-		Argv: shimArgv,
-		Env:  spawnEnv,
-		Dir:  workingDir,
+	// A container's output goes either to its resident shim, which writes the
+	// CRI log itself and outlives this daemon, or — for a backend whose helper
+	// cannot stay resident — through pipes into a log writer held here.
+	var (
+		logw    *crilog.Writer
+		fanout  *logFanout
+		proc    *supervisor.Process
+		shimDir string
+	)
+	if hostsResidentShim(r.backend) {
+		if shimDir, err = r.containerShimDir(p, c.GetName()); err != nil {
+			_ = cleanup()
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
+		}
+		proc, cleanup, err = r.spawnBesideShim(p, shimLaunchPlan{
+			podID: p.box.GetPodId(), container: c.GetName(),
+			shimPath: shimPath, shimArgv: shimArgv,
+			env: spawnEnv, execEnv: env, workingDir: workingDir, logPath: logPath,
+		}, shimDir, cleanup)
+		if err != nil {
+			_ = cleanup()
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+				fmt.Errorf("prepare the resident shim for %s: %w", c.GetName(), err)
+		}
+	} else {
+		if logw, err = crilog.Open(logPath); err != nil {
+			_ = cleanup()
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("open container log for %s: %w", c.GetName(), err)
+		}
+		fanout = &logFanout{}
+		proc = supervisor.NewProcess(r.spawner, r.waiter, supervisor.SpawnSpec{
+			Path: shimPath,
+			Argv: shimArgv,
+			Env:  spawnEnv,
+			Dir:  workingDir,
+		}, containerLogSink(logw, fanout))
+	}
+	closeLog := func() {
+		if logw != nil {
+			_ = logw.Close()
+		}
 	}
 	cp := &containerProc{
 		name:         c.GetName(),
@@ -1548,13 +1666,13 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		fanout:       fanout,
 		env:          env,
 		workingDir:   workingDir,
+		proc:         proc,
 		state: &runtimev1.ContainerStatus{
 			Name:  c.GetName(),
 			Image: c.GetImage(),
 			// Where this instance's output is. The node reads `kubectl logs`
-			// from exactly this path and rotates exactly this file, so it is
-			// published from the writer rather than re-derived.
-			LogPath: logw.Path(),
+			// from exactly this path and rotates exactly this file.
+			LogPath: logPath,
 			// The instance number and the restart count are ONE number: the
 			// file is named for the count, and a cold start recovers the count
 			// from the files (upstream's calcRestartCountByLogDir). A caller
@@ -1583,19 +1701,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			},
 		},
 	}
-	proc := supervisor.NewProcess(r.spawner, r.waiter, spec, containerLogSink(logw, fanout))
-	// The container's stdio goes to files the daemon tails, not pipes, so its
-	// output — and the container — survive a daemon restart (see
-	// supervisor.CaptureToFiles and AttachPod).
-	capture, err := r.containerCapture(p.box.GetPodId(), c.GetName())
-	if err != nil {
-		_ = cleanup()
-		_ = logw.Close()
-		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("capture files for %s: %w", c.GetName(), err)
-	}
-	proc.CaptureToFiles(capture)
-	cp.proc = proc
+	// A fresh instance: drop any report its predecessor left, then read its own.
+	r.armChildReport(p.box.GetPodId(), rootfs, cp, true)
 	// The observer runs on the reaper goroutine and locks pod.mu itself.
 	if obs := r.observeShim(p, cp, execArgv[0], env); obs != nil {
 		proc.ObserveExec(obs, execObserveTimeout)
@@ -1603,7 +1710,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 
 	if err := proc.Start(ctx); err != nil {
 		_ = cleanup()
-		_ = logw.Close()
+		closeLog()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("spawn container %s: %w", c.GetName(), err)
 	}
@@ -1614,12 +1721,21 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// across a daemon death. The just-spawned group is torn down through the
 	// injected seam (not a direct supervisor call) so the failure path is
 	// unit-observable.
-	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID(), profileDigest(p.profile))
+	rec, err := r.recordPodProc(p.box.GetPodId(), c.GetName(), proc.PID(), profileDigest(p.profile), shimDir)
 	if err != nil {
+		proc.NoteKill(syscall.SIGKILL)
 		_ = r.signalGroup(proc.PID(), killSignal)
 		_ = cleanup()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("record container %s process group: %w", c.GetName(), err)
+	}
+	if shimDir != "" {
+		// Best-effort: the container's own identity, the one a group whose shim
+		// later dies can still be proven ours by. A daemon that dies before this
+		// write leaves a group a later daemon kills rather than adopts.
+		if _, err := r.recordChild(rec, proc.ChildPID(), proc.ChildStartUnixNano()); err != nil {
+			r.log.Warn("record the container's identity beside its shim", "pod", p.box.GetPodId(), "container", c.GetName(), "err", err)
+		}
 	}
 
 	// Publish this incarnation's identity, derived from the reap record just
@@ -1643,6 +1759,12 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	code, sig, err := cp.proc.Wait(ctx)
 	if cleanup != nil {
 		_ = cleanup()
+	}
+	// The container's shim died without its exit record while this daemon
+	// watched: the container may live on. Taken over, it is watched again by
+	// its own identity and nothing below runs for this exit.
+	if errors.Is(err, supervisor.ErrShimCrashed) && r.shimCrashed(ctx, p, cp) {
+		return
 	}
 
 	// Drop the durable reap record only once the process group is empty. The
@@ -1682,6 +1804,11 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	case <-drainTimer.C:
 	case <-ctx.Done():
 	}
+
+	// One last read of the restricted-child report, so a container that lived
+	// for less than a sampler tick still has its report in the terminated
+	// status published below.
+	r.readChildReport(p, cp)
 
 	p.mu.Lock()
 	// A container StopContainer claimed is concluded by that verb: it waited
@@ -1756,7 +1883,7 @@ func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runt
 		// --previous` finds the crashed run's output.
 		LogPath: cp.state.GetLogPath(),
 	}
-	exitUnknown := errors.Is(err, supervisor.ErrExitUnknown)
+	exitUnknown := errors.Is(err, supervisor.ErrExitUnknown) || errors.Is(err, supervisor.ErrShimCrashed)
 	switch {
 	case exitUnknown:
 		// A re-attached container (AttachPod) is not this daemon's child: its
@@ -1766,6 +1893,9 @@ func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runt
 		term.ExitCode = exitCodeUnknown
 		term.Reason = ExitStatusUnknownReason
 		term.Message = "the container was re-attached after a runtime daemon restart and is not a child of this daemon; its exit status cannot be read"
+		if errors.Is(err, supervisor.ErrShimCrashed) {
+			term.Message = "the container's resident shim exited without recording the container's exit status"
+		}
 		if p.oomKilled {
 			term.Reason = "OOMKilled"
 		}
@@ -1922,7 +2052,9 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 		// entries the partial-start contract records for init containers that
 		// were never reached (a plain init container that ran is untracked the
 		// moment it completes, so it never reaches this loop).
-		if cp.initDeclared {
+		if cp.initDeclared || cp.ephemeral {
+			// Ephemeral containers never decide the pod's phase either,
+			// exactly as upstream's getPhase reads only spec.containers.
 			continue
 		}
 		mains++
@@ -2352,6 +2484,7 @@ func releaseStartClaimLocked(claimed *containerProc) {
 // last termination — upstream getPhase's "waiting" plus "pendingInitialization"
 // buckets, which both force Pending. Init-declared containers count too: a pod
 // whose init sequence is blocked is Pending exactly as one whose main is.
+// Ephemeral containers do not.
 //
 // The last-termination filter is what keeps CrashLoopBackOff out of it: a
 // container waiting between restarts carries the previous run's termination and
@@ -2359,6 +2492,11 @@ func releaseStartClaimLocked(claimed *containerProc) {
 func waitingContainersLocked(p *pod) int {
 	n := 0
 	for _, cp := range p.containers {
+		if cp.ephemeral {
+			// A debug container that could not start does not hold the pod at
+			// Pending: upstream's getPhase never reads the ephemeral list.
+			continue
+		}
 		if cp.state.GetState().GetWaiting() != nil && cp.state.GetLastTerminationState() == nil {
 			n++
 		}
@@ -2584,11 +2722,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
 			fmt.Errorf("read image config for %q: %w", c.GetImage(), err))
 	}
-	run, err := image.MergeRunSpec(runCfg, image.RunSpecRequest{
-		Container:    c,
-		RunAsUID:     int64(resolveCredential(p.box, c).UID),
-		RunAsNonRoot: effectiveRunAsNonRoot(c),
-	})
+	run, err := image.MergeRunSpec(runCfg, runSpecRequest(p.box, c, int64(resolveCredential(p.box, c).UID)))
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
 	}
@@ -2679,23 +2813,35 @@ func resolveImageArgv0(rootfs, argv0 string) (string, error) {
 	return bin, nil
 }
 
-// effectiveRunAsNonRoot resolves runAsNonRoot for a container.
+// effectiveRunAsNonRoot resolves runAsNonRoot for a container of the pod box:
+// the container's own value OR the pod's (PodSecurityContext.run_as_non_root).
 //
-// It reads the container's securityContext only, a faithful reading of the
-// contract available to it: apis PodSecurityContext carries fs_group,
-// run_as_user and run_as_group but no run_as_non_root, so a pod-scoped
-// `securityContext.runAsNonRoot: true` has nowhere to land on the wire.
-// resolveCredential has the same shape for the same reason.
+// OR, not "container overrides pod": a proto3 bool has no presence, so a
+// container-level false is indistinguishable from unset and must never weaken a
+// pod-level assertion. The apis contract closes the opt-out case on the
+// producer's side (it stamps each container's effective value and sends the pod
+// field false when any container opts out), so OR here reproduces the kubelet's
+// per-container verdict exactly.
 //
-// Known contract gap, not closed here: a pod-level runAsNonRoot is therefore
-// not enforced on a container that does not repeat it. Closing it is an apis
-// change (an additive PodSecurityContext.run_as_non_root plus the k3sm
-// provider stamping it), not a runtimed merge function. Composition, when the
-// field arrives, is a logical OR: the proto's bool has no presence, so a
-// container-level false cannot be distinguished from unset and must never
-// weaken a pod-level assertion.
-func effectiveRunAsNonRoot(c *runtimev1.Container) bool {
-	return c.GetSecurityContext().GetRunAsNonRoot()
+// box is always the pod's STORED create-time box, never an UpdatePod request:
+// an update cannot disarm a requirement the pod was created under.
+func effectiveRunAsNonRoot(box *runtimev1.PodBox, c *runtimev1.Container) bool {
+	return c.GetSecurityContext().GetRunAsNonRoot() || box.GetPodSecurityContext().GetRunAsNonRoot()
+}
+
+// runSpecRequest builds the pod-side half of the image merge for container c of
+// box: the uid the spawn will drop to, the effective runAsNonRoot, and the pod
+// identity the kubelet-worded refusal names. One builder for both spines, so
+// the native and vm merges cannot come to disagree on any of them.
+func runSpecRequest(box *runtimev1.PodBox, c *runtimev1.Container, runAsUID int64) image.RunSpecRequest {
+	return image.RunSpecRequest{
+		Container:    c,
+		RunAsUID:     runAsUID,
+		RunAsNonRoot: effectiveRunAsNonRoot(box, c),
+		PodName:      box.GetName(),
+		PodNamespace: box.GetNamespace(),
+		PodUID:       box.GetPodId(),
+	}
 }
 
 // pullPolicy is the image-platform policy for a pull, built from the pod's
@@ -3007,7 +3153,8 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	for _, e := range base {
 		// K3SM_SHADOW_DIR is runtime-owned: only Config.ShadowBinDir may set
 		// it (appended below), so a spec cannot aim the interposer anywhere.
-		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv {
+		// K3SM_SHIM_REPORT likewise: only the runtime names the report file.
+		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv {
 			continue
 		}
 		env = append(env, e)
@@ -3035,6 +3182,12 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		env = append(env,
 			pathShimRootfsEnv+"="+rootfs,
 			pathShimMountsEnv+"="+strings.Join(paths, ":"))
+		// The restricted-child report: only with the rebase enabled, where a
+		// platform-binary child that loses the shim reads host paths. The
+		// reader derives the same file from the container name itself.
+		if name, err := supervisor.ChildReportName(c.GetName()); err == nil {
+			env = append(env, supervisor.ChildReportEnv+"="+filepath.Join(rootfs, name))
+		}
 	}
 	// Shadow-shell exec rewrite: the same shim carries it, so it is inserted
 	// for every container once the node has a shadow set, mounts or not
@@ -3077,75 +3230,126 @@ func containerMountPaths(c *runtimev1.Container) []string {
 	return paths
 }
 
-// errUncontainedRootfs is the sentinel for a box whose rootfs_path is not this
-// pod's own derived data volume. Callers surface it as an invalid-argument
-// failure (FAILURE_REASON_INVALID_POD_BOX); it is never retried, since the value
-// cannot become acceptable without the caller changing it.
-var errUncontainedRootfs = errors.New("rootfs_path is not the pod's derived data volume")
-
 // rootfsPath returns the on-disk pod data volume for box: always the
-// cache-derived <Root>/pods/<pod_id>/rootfs. A non-empty box.rootfs_path is
-// accepted only when it is byte-equal to that derived path; anything else is
-// refused with errUncontainedRootfs and no path at all, so no caller can act on
-// a value that was never checked. createPod, createVMPod, containerEnv, Exec and
-// RestartContainer share it, so the pod cwd / SBPL scope / VM rootfs is resolved
-// one way.
+// cache-derived <Root>/pods/<pod_id>/rootfs, and never anything the caller sent.
+// Its only error is an invalid pod id. createPod, createVMPod, containerEnv, Exec
+// and RestartContainer share it, so the pod cwd / SBPL scope / vm rootfs share
+// is resolved one way.
 //
-// Why this is a root-daemon hole: rootfs_path arrives over the runtimed gRPC
-// seam, and the daemon's socket is not denied by the default pod sandbox
-// profile (only the netd helper socket is) while pods run at the daemon's own
-// uid — so a confined pod can issue CreatePod itself. The value then flows into
-// os.MkdirAll, mount.Materialize, volume.Binder.Bind, supervisor.ChownForFSGroup
-// (a recursive Lchown + Chmod that grants the group the owner's rwx and sets
-// setgid on every directory), the resolved binary path, the K3SM_ROOTFS shim env,
-// the Exec cwd and sandbox.VMSpec.RootfsPath. Unvalidated, that is
-// privilege-escalation-from-a-confined-pod, not merely a control-plane-compromise
-// amplifier.
+// Why the path is derived and never accepted: PodBox once carried a
+// caller-supplied rootfs path (field 4, now retired), and the daemon no longer
+// reads it. That input was a root-daemon hole: it arrived over the runtimed gRPC
+// seam, whose socket the default pod sandbox profile does not deny (only the
+// netd helper socket is) while pods run at the daemon's own uid, so a confined
+// pod could issue CreatePod itself. The value flowed into os.MkdirAll,
+// mount.Materialize, volume.Binder.Bind, supervisor.ChownForFSGroup (a
+// recursive Lchown + Chmod that grants the group the owner's rwx and sets setgid
+// on every directory), the resolved binary path, the K3SM_ROOTFS shim env, the
+// Exec cwd and the vm guest's rootfs share. Validating a caller's spelling had
+// to reason about cross-pod ids, symlinks under the pod's own writable volume,
+// case aliasing on case-insensitive APFS and firmlink spellings; deriving the
+// path leaves nothing to compare. A box that still carries the retired field is
+// logged by createPod and UpdatePod (see retiredRootfsField) and is otherwise
+// ignored.
 //
-// Why byte-equality and not "strictly under the pods root": a containment
-// predicate is weaker in three distinct ways, each of which byte-equality makes
-// structurally impossible without resolving anything on disk:
-//
-//   - Cross-pod. <PodsRoot>/<victim-id>/rootfs passes any prefix test, handing
-//     the caller another pod's materialized secrets and projected SA-token — and
-//     removePodDir derives its target from the attacker's id, so the damage is
-//     never cleaned up.
-//   - Symlink-blind. A lexical check cannot see that <PodsRoot>/<own-id>/rootfs/
-//     link is a symlink to /var/lib/k3sm/server: the pod's own data volume is
-//     writable at both the POSIX and the SBPL layer (it is re-allowed after the
-//     protected denies), and MkdirAll / Materialize follow the link.
-//   - Case aliasing. The default APFS volume is case-insensitive, so an
-//     uppercase spelling of another pod's id names that pod's directory — the
-//     same class podIDRe's lowercase-only rule closed for pod_id itself.
-//
-// Firmlink spellings (/var vs /private/var) are likewise refused, because the
-// derived path is the only accepted spelling — fail-closed: normalizing aliases
-// would mean resolving the path, and a resolver that mis-parses fails open.
-// Every producer today leaves the field empty (no caller in k3sm sets it), so
-// the guard is behaviour-neutral: the accept branch can only ever return the
-// value the derivation already computes.
-//
-// Scope, honestly: this closes the rootfs_path daemon-input hole only. It does
-// not make same-node pods mutually isolated — pods still share the daemon's uid,
-// so untrusted multi-tenancy still routes to the vm RuntimeClass. The sibling
-// wire path SandboxProfile.data_volume_path is validated separately, by
-// dataVolumePath below (which accepts only this pod's own two derived
-// spellings); do not read either check as "wire paths are validated" in general.
+// Scope, honestly: this closes the caller-supplied-rootfs daemon-input hole
+// only. It does not make same-node pods mutually isolated — pods still share the
+// daemon's uid, so untrusted multi-tenancy still routes to the vm RuntimeClass.
+// The sibling wire path SandboxProfile.data_volume_path is validated
+// separately, by dataVolumePath below (which accepts only this pod's own two
+// derived spellings); do not read either as "wire paths are validated" in
+// general.
 func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
 	id, err := image.ParsePodID(box.GetPodId())
 	if err != nil {
 		return "", err
 	}
-	derived := r.cache.PodRootfs(id)
-	if rootfs := box.GetRootfsPath(); rootfs != "" && rootfs != derived {
-		return "", fmt.Errorf("%w: %q is not %q", errUncontainedRootfs, rootfs, derived)
+	return r.cache.PodRootfs(id), nil
+}
+
+// retiredFieldLogCap bounds the retired field's value in the Warn line, so a
+// crafted multi-megabyte value cannot flood the daemon log.
+const retiredFieldLogCap = 256
+
+// retiredRootfsField reports the value of PodBox field 4 — rootfs_path in older
+// apis releases, retired because the daemon derives the pod rootfs itself — and
+// ok=false when the box does not carry it. It never names the generated Go
+// accessor, so it compiles unchanged once the field is removed from the
+// schema: it reads field number 4 through the message descriptor while the
+// descriptor still declares it, and otherwise scans the unknown-field bytes for
+// tag 4 with the length-delimited wire type (any other wire type under tag 4 is
+// not this field and is skipped). The last occurrence wins, matching proto
+// merge semantics; a malformed tail stops the scan and keeps what was found
+// before it.
+//
+// The value is the attack signal only: no current producer sets the field, so
+// a box carrying it is an old producer or a confined pod probing the daemon
+// socket. It is logged (see warnRetiredRootfsField) and reaches no other sink.
+func retiredRootfsField(box *runtimev1.PodBox) (string, bool) {
+	if box == nil {
+		return "", false
 	}
-	return derived, nil
+	m := box.ProtoReflect()
+	if fd := m.Descriptor().Fields().ByNumber(4); fd != nil && fd.Kind() == protoreflect.StringKind && m.Has(fd) {
+		return m.Get(fd).String(), true
+	}
+	var (
+		val   string
+		found bool
+	)
+	b := m.GetUnknown()
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+		if num == 4 && typ == protowire.BytesType {
+			v, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				break
+			}
+			val, found = string(v), true
+			b = b[n:]
+			continue
+		}
+		n = protowire.ConsumeFieldValue(num, typ, b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+	}
+	return val, found
+}
+
+// warnRetiredRootfsField logs, once per call and at Warn, that box carries the
+// retired field 4, with the pod id and the value each truncated to
+// retiredFieldLogCap bytes: UpdatePod reaches here before the pod id is
+// validated, so both are caller-controlled. The value is ignored otherwise.
+func (r *Runtime) warnRetiredRootfsField(box *runtimev1.PodBox) {
+	v, ok := retiredRootfsField(box)
+	if !ok {
+		return
+	}
+	r.log.Warn("PodBox carries retired field 4; ignored",
+		"pod_id", capLogValue(box.GetPodId()), "value", capLogValue(v))
+}
+
+// capLogValue truncates s to retiredFieldLogCap bytes on a rune boundary.
+func capLogValue(s string) string {
+	if len(s) <= retiredFieldLogCap {
+		return s
+	}
+	cut := retiredFieldLogCap
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…(truncated)"
 }
 
 // errUnderivedDataVolume is the sentinel for a box whose
 // sandbox_profile.data_volume_path is not one of this pod's own derived data
-// volumes. Like errUncontainedRootfs it surfaces as FAILURE_REASON_INVALID_POD_BOX
+// volumes. It surfaces as FAILURE_REASON_INVALID_POD_BOX
 // and is never retried: the value cannot become acceptable without the caller
 // changing it.
 var errUnderivedDataVolume = errors.New("data_volume_path is not the pod's derived data volume")

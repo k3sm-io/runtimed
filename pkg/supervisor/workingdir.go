@@ -51,10 +51,14 @@ type spawnPlan struct {
 	// that). This package has no notion of a pod data volume, so inheriting is
 	// the only honest meaning an unset Dir can carry at this layer.
 	ChangeDir string
+
+	// PControl is the resource-starvation policy the child is spawned with
+	// (pcontrolKill when the spawner's PressureKill is set).
+	PControl pcontrolPolicy
 }
 
 // planSpawn resolves spec's working directory, refusing a Dir that is set but
-// unusable with ErrWorkingDir.
+// unusable with ErrWorkingDir, and records the spawner's pressure-kill policy.
 //
 // The directory is checked here, in Go, rather than left to the kernel.
 // posix_spawn does surface a failed chdir file-action as its own errno (probed
@@ -65,10 +69,14 @@ type spawnPlan struct {
 // refusal still stands behind this one as the TOCTOU backstop for a directory
 // removed between this check and the exec; nothing downgrades either refusal to
 // a fallback.
-func planSpawn(spec SpawnSpec) (spawnPlan, error) {
+func planSpawn(spec SpawnSpec, pressureKill bool) (spawnPlan, error) {
+	pc := pcontrolNone
+	if pressureKill {
+		pc = pcontrolKill
+	}
 	dir := spec.Dir
 	if dir == "" {
-		return spawnPlan{}, nil
+		return spawnPlan{PControl: pc}, nil
 	}
 	// A relative Dir is refused rather than resolved: resolving it would resolve
 	// it against the DAEMON's cwd, which is precisely the inheritance this whole
@@ -83,5 +91,5 @@ func planSpawn(spec SpawnSpec) (spawnPlan, error) {
 	if !fi.IsDir() {
 		return spawnPlan{}, fmt.Errorf("%w: %q is not a directory", ErrWorkingDir, dir)
 	}
-	return spawnPlan{ChangeDir: dir}, nil
+	return spawnPlan{ChangeDir: dir, PControl: pc}, nil
 }

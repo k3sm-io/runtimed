@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -131,7 +129,7 @@ func TestAttachPopulatesOwnedBeforeTheStartupReap(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			adopt, remaining := attachDecision([]podProcRecord{tc.record}, tc.groups.inspect, exactStart(tc.starts), fp)
+			adopt, _, remaining := attachDecision([]podProcRecord{tc.record}, tc.groups.inspect, exactStart(tc.starts), fp)
 			if got := len(adopt) == 1; got != tc.wantAdopt {
 				t.Fatalf("adopted = %v (%+v), want %v", got, adopt, tc.wantAdopt)
 			}
@@ -144,7 +142,7 @@ func TestAttachPopulatesOwnedBeforeTheStartupReap(t *testing.T) {
 	t.Run("an empty daemon fingerprint adopts nothing", func(t *testing.T) {
 		r := podProcRecord{PodID: "p1", Container: "main", Pgid: 100, StartUnixNano: 5000}
 		groups := fakeGroups{members: map[int][]supervisor.ProcMember{100: {mem(100, 5000)}}}
-		adopt, _ := attachDecision([]podProcRecord{r}, groups.inspect, exactStart(map[int]int64{100: 5000}), "")
+		adopt, _, _ := attachDecision([]podProcRecord{r}, groups.inspect, exactStart(map[int]int64{100: 5000}), "")
 		if len(adopt) != 0 {
 			t.Fatalf("adopt = %+v, want none", adopt)
 		}
@@ -244,8 +242,8 @@ func pgidsOf(recs []podProcRecord) []int {
 }
 
 // TestAttachPodReportsWhatItCannotRebuild pins the attached pod's status for a
-// container spawned before file capture (no raw or offset files: its output went
-// to pipes that died with the old daemon): the container keeps its published
+// container spawned without a resident shim (its output went to pipes that died
+// with the old daemon): the container keeps its published
 // identity, the pod carries the log-stream-lost condition and the CPU note, the
 // CRI log gets the gap marker, there is no shim-inactive verdict, and an exit
 // is reported as ExitStatusUnknown with a non-zero code.
@@ -396,101 +394,5 @@ func TestAttachPodReprobesBeforeAdopt(t *testing.T) {
 				t.Fatal("a refused attach must register nothing")
 			}
 		})
-	}
-}
-
-// crilogPayloads returns the payload of every CRI line in path.
-func crilogPayloads(t *testing.T, path string) []string {
-	t.Helper()
-	var out []string
-	for _, l := range readCRILog(t, path) {
-		out = append(out, l.payload)
-	}
-	return out
-}
-
-// TestAttachPodResumesTheCaptureTail is the file-capture half of re-adoption:
-// a container spawned by one daemon keeps writing across that daemon's death,
-// and the next daemon's AttachPod resumes its capture tail from the persisted
-// offset — every line reaches the CRI log exactly once, the gap is named in one
-// info line, and the pod carries NO log-stream-lost condition.
-func TestAttachPodResumesTheCaptureTail(t *testing.T) {
-	// pgid 1001 is the fake spawner's first pid and 1 the default leader start,
-	// so the group stays "alive" across the restart and the record is kept.
-	alive := fakeGroups{members: map[int][]supervisor.ProcMember{1001: {mem(1001, 1)}}}
-	sp := &fakeSpawner{logLine: "before"}
-	rt1 := newTestRuntime(t, Deps{Spawner: sp, ProcGroup: alive.inspect})
-	box := hostBinBox(rt1, "p1")
-	mustCreatePod(t, rt1, box)
-	logPath := filepath.Join(box.GetLogDirectory(), "main", "0.log")
-	capture, err := rt1.containerCapture("p1", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitFor := func(what string, cond func() bool) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for !cond() {
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for %s", what)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	offsetAtEnd := func() bool {
-		b, err := os.ReadFile(supervisor.OffsetPath(capture.Stdout))
-		st, serr := os.Stat(capture.Stdout)
-		return err == nil && serr == nil && string(b) == strconv.FormatInt(st.Size(), 10) && st.Size() > 0
-	}
-	waitFor("the first daemon to capture the line", offsetAtEnd)
-
-	// The daemon stops. The container lives on and keeps writing into its
-	// capture file (appended here as the child would).
-	if err := rt1.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	appendFile(t, capture.Stdout, "during-1\nduring-2\n")
-
-	rt2 := newTestRuntimeCfg(t, Config{Root: rt1.cfg.Root, PodLogsDir: rt1.cfg.PodLogsDir}, Deps{ProcGroup: alive.inspect})
-	st, err := rt2.AttachPod(context.Background(), hostBinBox(rt2, "p1"))
-	if err != nil {
-		t.Fatalf("AttachPod: %v", err)
-	}
-	for _, c := range st.GetConditions() {
-		if c.GetType() == LogStreamLostConditionType {
-			t.Fatalf("a file-captured pod must not carry %s: %+v", LogStreamLostConditionType, c)
-		}
-	}
-	if strings.Contains(st.GetMessage(), "was not captured") {
-		t.Fatalf("message = %q claims lost output for a file-captured pod", st.GetMessage())
-	}
-	appendFile(t, capture.Stdout, "after\n")
-	waitFor("the resumed tail to reach the live write", offsetAtEnd)
-	waitFor("the live write in the CRI log", func() bool {
-		got := crilogPayloads(t, logPath)
-		return len(got) > 0 && got[len(got)-1] == "after"
-	})
-
-	got := crilogPayloads(t, logPath)
-	if len(got) != 5 || got[0] != "before" || !strings.HasPrefix(got[1], "k3sm: daemon restarted at ") ||
-		got[2] != "during-1" || got[3] != "during-2" || got[4] != "after" {
-		t.Fatalf("CRI log payloads = %q, want before, the restart info line, during-1, during-2, after — each once", got)
-	}
-	if strings.Contains(strings.Join(got, "\n"), logStreamLostMarker) {
-		t.Fatal("a file-captured pod's log must not carry the lost-stream marker")
-	}
-}
-
-func appendFile(t *testing.T, path, s string) {
-	t.Helper()
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(s); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
 	}
 }

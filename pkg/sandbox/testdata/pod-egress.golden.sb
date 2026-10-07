@@ -15,6 +15,12 @@
   (subpath "/usr")
   (literal "/dev/null") (literal "/dev/zero")
   (literal "/dev/random") (literal "/dev/urandom"))
+;; read: the system TLS configuration (openssl.cnf, the CA bundle,
+;; certs/) — public, world-readable; read-only.
+(allow file-read*
+  (subpath "/etc/ssl")
+  (subpath "/private/etc/ssl")
+  )
 ;; write: validated extra write paths (+ /dev/null); the pod's own
 ;; data volume is re-allowed below, after the protected denies.
 (allow file-write*
@@ -29,6 +35,11 @@
 (allow mach-lookup
   (global-name "com.apple.dnssd.service")
   (global-name "com.apple.mDNSResponder"))
+;; AF_UNIX: deny connect() to every container's resident shim.
+(deny network-outbound
+  (remote unix-socket (subpath "/var/lib/k3sm/run/shim"))
+  (remote unix-socket (subpath "/private/var/lib/k3sm/run/shim"))
+  )
 ;; PROTECTED: deny user homes, the secrets/state store, the shared
 ;; pods root, the daemon-private reap stores and the control-plane
 ;; and daemon-private trees (sibling dirs under the work-dir, named
@@ -42,6 +53,11 @@
   (subpath "/Users"))
 (deny file-read* file-write*
   (subpath "/private/var/db"))
+;; TLS private-key dir: never readable, whatever the allows name.
+(deny file-read* file-write*
+  (subpath "/etc/ssl/private")
+  (subpath "/private/etc/ssl/private")
+  )
 (deny file-read* file-write*
   (subpath "/var/lib/k3sm/pods")
   (subpath "/private/var/lib/k3sm/pods")

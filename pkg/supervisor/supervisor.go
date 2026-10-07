@@ -53,6 +53,19 @@ type SpawnSpec struct {
 	// StderrFD is the write end of the pipe the child's fd 2 is dup2'd onto.
 	// If 0, the child inherits the parent's stderr.
 	StderrFD uintptr
+	// StdinFD is the read end the child's fd 0 is dup2'd onto (0 = inherit).
+	// The resident shim reads its launch spec from it (ShimSpec): the pod
+	// environment crosses to the shim over this descriptor, read once before
+	// the shim confines itself, and never through the shim's own environ or a
+	// file on disk.
+	StdinFD uintptr
+	// KeepGroup spawns the child into the CALLER's session and process group
+	// instead of a fresh one (no POSIX_SPAWN_SETSID). The resident shim uses it
+	// for the container it launches, so the shim is the pod group's leader and
+	// the container is a member: one group kill still stops both, and the
+	// recorded (pgid, leader start) identity is the shim's. Every other spawn
+	// leaves it false and gets its own session, as before.
+	KeepGroup bool
 	// ExecSyncFD is the write end of the exec-sync pipe, dup2'd onto the
 	// child's fd ExecSyncChildFD (0 = none). The exec-shim marks that
 	// descriptor close-on-exec (ExecSyncFDEnv), so the parent's read end sees

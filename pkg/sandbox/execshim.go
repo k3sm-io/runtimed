@@ -158,9 +158,11 @@ func (b *ExecShimBackend) Available() bool {
 // under the backend's staging dir (<root>/sbpl, created on demand), and returns
 // the shim path plus argv:
 //
-//	[shimPath, <uid>, <gid>, <groups-csv>, <rlimits>, <qos>, profilePath, pod, args...]
+//	[shimPath, launch, <uid>, <gid>, <groups-csv>, <rlimits>, <qos>, profilePath, pod, args...]
 //
-// where the three credential tokens (spec.Cred.ShimArgs) tell the shim which
+// where launch (supervisor.ShimModeLaunch) selects the shim's launch mode (a
+// shim handed an argv without a mode token refuses it, exit 2), the three
+// credential tokens (spec.Cred.ShimArgs) tell the shim which
 // identity to drop to, and the rlimit + qos tokens (supervisor.EncodeRlimits /
 // EncodeQoS, "-" sentinels when empty) carry the resolved numeric setrlimit(2)
 // plan and the darwin background-QoS decision. The two launch-spec tokens sit
@@ -204,8 +206,8 @@ func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv 
 	}
 
 	credArgs := spec.Cred.ShimArgs() // [uid, gid, groups]
-	args := make([]string, 0, len(argv)+len(credArgs)+4)
-	args = append(args, b.shimPath)
+	args := make([]string, 0, len(argv)+len(credArgs)+5)
+	args = append(args, b.shimPath, supervisor.ShimModeLaunch)
 	args = append(args, credArgs...)
 	args = append(args, supervisor.EncodeRlimits(spec.Rlimits), supervisor.EncodeQoS(spec.BgQoS))
 	args = append(args, profilePath)

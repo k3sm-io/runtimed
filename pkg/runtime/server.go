@@ -59,6 +59,12 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		return createFailure(reason, err), nil
 	}
 
+	// Ephemeral containers the box already lists are recorded, not started:
+	// this is a re-creation, and they are never restarted.
+	p.mu.Lock()
+	recordEphemeralNotStartedLocked(p)
+	p.mu.Unlock()
+
 	r.mu.Lock()
 	r.pods[box.GetPodId()] = p
 	r.mu.Unlock()
@@ -160,9 +166,9 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		st := r.podStatus(p)
 		st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 		r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
-		// No network Teardown: the vm route allocated no lo0 alias (a NAT-attached
-		// guest is reached over its VZ attachment), and calling it would ask the
-		// IPAM to release something it never handed out.
+		// No network Teardown: podnet teardown is the provider's, because it owns
+		// the guest's published lo0 alias and relay; runtimed never allocated
+		// them, so calling it here would release something it never handed out.
 		r.closeContainerLogs(p)
 		if err := r.removePodDir(req.GetPodId()); err != nil {
 			r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
@@ -223,7 +229,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		go func(proc *supervisor.Process, pid int) {
 			defer wg.Done()
 			escalated, observed, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
-				termSignal, killSignal, r.signalGroup, r.exitObservationGrace())
+				termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace())
 			if err != nil {
 				r.log.Warn("graceful stop pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
 			}
@@ -298,7 +304,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		r.log.Warn("SIGKILLing a container process that appeared during teardown",
 			"pod", req.GetPodId(), "pid", pid)
 		if _, _, err := supervisor.GracefulStop(context.WithoutCancel(ctx), pid, 0, proc.Done(),
-			termSignal, killSignal, r.signalGroup, r.exitObservationGrace()); err != nil {
+			termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
 			r.log.Warn("sigkill a late pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
 		}
 	}
@@ -333,6 +339,10 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// so the durable records (stored outside the pod dir, so removePodDir does
 	// not touch them) have served their purpose.
 	r.removePodReapRecords(req.GetPodId())
+	p.mu.Lock()
+	shimDirs := p.shimDirs
+	p.mu.Unlock()
+	removeShimDirs(shimDirs)
 	return &runtimev1.DeletePodResponse{}, nil
 }
 
@@ -398,14 +408,29 @@ func graceDuration(secs int64, p *pod) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// UpdatePod applies an in-place spec change. Only labels/annotations are
-// supported; any other field change is NOT_UPDATABLE (requires recreate).
+// UpdatePod applies an in-place spec change: labels, annotations, and an
+// append to ephemeral_containers. Any other field change is NOT_UPDATABLE
+// (requires recreate), and so is removing or changing an ephemeral container.
 //
-// The contract is labels and annotations only: UpdatePod never materializes, so
-// an update never re-resolves ConfigMap/Secret/ServiceAccount-token data for a
-// running pod. RefreshProjectedVolumes does, on its own path (the updatable
-// field set itself is updatableOnly's; the contract is pinned by
-// TestUpdatePodNeverMaterializes and TestRefreshProjectedVolumesIsItsOwnPath).
+// The contract for labels and annotations is unchanged: UpdatePod never
+// materializes, so an update never re-resolves ConfigMap/Secret/
+// ServiceAccount-token data for a running pod. RefreshProjectedVolumes does, on
+// its own path (the updatable field set itself is updatableOnly's; the contract
+// is pinned by TestUpdatePodNeverMaterializes and
+// TestRefreshProjectedVolumesIsItsOwnPath).
+//
+// # The request box is never adopted
+//
+// Only labels, annotations and the appended ephemeral containers are copied
+// into the stored box. Everything an ephemeral container runs under — the
+// signature policy, the pod security context, the volumes, the compiled
+// profile — is the pod's create-time value, whatever the request carries, so
+// an append cannot weaken the pod it joins. See ephemeral.go.
+//
+// The compare, the refusals (vm, stopping, terminated, bad or taken names) and
+// the reservation all happen under one hold of p.mu; the image work happens
+// after it is released, and each new container is installed through the same
+// stopping-checked installer every spawn uses.
 func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
 	box := req.GetPod()
 	if box.GetPodId() == "" {
@@ -414,27 +439,46 @@ func (r *Runtime) UpdatePod(_ context.Context, req *runtimev1.UpdatePodRequest) 
 			FailureReason: runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 		}, nil
 	}
+	r.warnRetiredRootfsField(box)
 	r.mu.Lock()
 	p, ok := r.pods[box.GetPodId()]
 	r.mu.Unlock()
 	if !ok {
+		// A pod still being created is not registered yet, so it lands here
+		// too: nothing can be appended to a pod that does not exist yet.
 		return &runtimev1.UpdatePodResponse{
 			Error:         rpcStatus(codes.NotFound, "pod %s not found", box.GetPodId()),
 			FailureReason: runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 		}, nil
 	}
 
+	p.mu.Lock()
 	if reason, err := updatableOnly(p.box, box); err != nil {
+		p.mu.Unlock()
 		return &runtimev1.UpdatePodResponse{
 			Error:         rpcStatus(codes.FailedPrecondition, "%s", err.Error()),
 			FailureReason: reason,
 		}, nil
 	}
-
-	p.mu.Lock()
+	appends, _ := ephemeralAppends(p.box, box)
+	var starts []*containerProc
+	if len(appends) > 0 {
+		var refused *ephemeralRefusal
+		if starts, refused = reserveEphemeralLocked(p, appends); refused != nil {
+			p.mu.Unlock()
+			return &runtimev1.UpdatePodResponse{
+				Error:         rpcStatus(refused.code, "update %s: %v", box.GetPodId(), refused.err),
+				FailureReason: refused.reason,
+			}, nil
+		}
+	}
 	p.box.Labels = box.GetLabels()
 	p.box.Annotations = box.GetAnnotations()
 	p.mu.Unlock()
+
+	for _, cp := range starts {
+		r.startEphemeral(p, cp)
+	}
 
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, st)
@@ -526,7 +570,7 @@ func (r *Runtime) GetLogs(req *runtimev1.GetLogsRequest, _ grpc.ServerStreamingS
 // A container that is not running is refused with FailedPrecondition, matching
 // containerd: its file is closed and complete, and reopening it would create an
 // empty file at a path the node is about to prune.
-func (r *Runtime) ReopenContainerLog(_ context.Context, req *runtimev1.ReopenContainerLogRequest) (*runtimev1.ReopenContainerLogResponse, error) {
+func (r *Runtime) ReopenContainerLog(ctx context.Context, req *runtimev1.ReopenContainerLogRequest) (*runtimev1.ReopenContainerLogResponse, error) {
 	// The vm fork FIRST, before any containerProc lookup — the same shape
 	// StartContainer and RestartContainer take, and for the same reason: a vm
 	// pod's containers are guest processes with no host containerProc, so the
@@ -548,7 +592,18 @@ func (r *Runtime) ReopenContainerLog(_ context.Context, req *runtimev1.ReopenCon
 	p.mu.Lock()
 	running := cp.state.GetState().GetRunning() != nil
 	w := cp.logw
+	logPath := cp.state.GetLogPath()
+	var conn *supervisor.ShimConn
+	if cp.proc != nil {
+		conn = cp.proc.Shim()
+	}
 	p.mu.Unlock()
+	if conn != nil && running {
+		if rerr := reopenViaShim(ctx, conn, logPath); rerr != nil {
+			return nil, status.Errorf(codes.Internal, "reopen %s/%s: %v", req.GetPodId(), req.GetContainer(), rerr)
+		}
+		return &runtimev1.ReopenContainerLogResponse{}, nil
+	}
 	if w == nil || !running {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"reopen %s/%s: container is not running", req.GetPodId(), req.GetContainer())
@@ -622,32 +677,39 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 		vmReason = "Available"
 		vmMsg = fmt.Sprintf("vm backend %q available", r.vmBackend.Name())
 	}
+	conditions := []*runtimev1.RuntimeCondition{
+		{
+			Type:    ConditionSandboxBackend,
+			Status:  cond,
+			Reason:  reason,
+			Message: msg,
+		},
+		{
+			Type:    ConditionVMBackendAvailable,
+			Status:  vmCond,
+			Reason:  vmReason,
+			Message: vmMsg,
+		},
+		// The two Rosetta capability conditions are ADDITIVE — they are appended
+		// to, never a replacement for, the two above. Their values were
+		// computed once in New and are immutable, so this handler only stamps them
+		// into fresh proto messages; a probe that reported UNAVAILABLE is a
+		// capability absence, NOT a handshake failure, so err stays nil.
+		r.rosettaHost.condition(ConditionRosettaHostAvailable),
+		r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
+	}
+	// The pressure-kill condition is appended only in its degraded state (New's
+	// self-check failed). It does not touch Healthy: an unmarked pod is still a
+	// confined pod; what is lost is the victim preference under memory exhaustion.
+	if c := pressureKillCondition(r.pressureKill); c != nil {
+		conditions = append(conditions, c)
+	}
 	return &runtimev1.GetRuntimeInfoResponse{
 		RuntimeName:    RuntimeName,
 		RuntimeVersion: r.cfg.RuntimeVersion,
 		ApiVersion:     apiVersion,
 		Healthy:        healthy,
-		Conditions: []*runtimev1.RuntimeCondition{
-			{
-				Type:    ConditionSandboxBackend,
-				Status:  cond,
-				Reason:  reason,
-				Message: msg,
-			},
-			{
-				Type:    ConditionVMBackendAvailable,
-				Status:  vmCond,
-				Reason:  vmReason,
-				Message: vmMsg,
-			},
-			// The two Rosetta capability conditions are ADDITIVE — they are appended
-			// to, never a replacement for, the two above. Their values were
-			// computed once in New and are immutable, so this handler only stamps them
-			// into fresh proto messages; a probe that reported UNAVAILABLE is a
-			// capability absence, NOT a handshake failure, so err stays nil.
-			r.rosettaHost.condition(ConditionRosettaHostAvailable),
-			r.rosettaGuest.condition(ConditionRosettaGuestAvailable),
-		},
+		Conditions:     conditions,
 		// GPU facts, stamped fresh from the immutable observation New
 		// made. ALWAYS present on a daemon that can probe: the apis contract reads
 		// an absent gpu as "this daemon does not report GPU facts", which is a

@@ -36,10 +36,11 @@ limitations under the License.
 // # Why newc, and why uncompressed
 //
 // newc (SVR4, magic "070701", no CRC) is the format the Linux initramfs
-// unpacker reads. The archive is handed to the VM uncompressed: the guest
-// kernel is built without any of the initrd decompressors it does not need,
-// and the artifact is small enough that compressing it would trade a boot-time
-// decompression for a saving nobody measures.
+// unpacker reads. The archive is handed to the VM uncompressed: the best
+// realistic codec saves about 8 MB fetched once per node but costs at least
+// 10 ms of host-side decompression per pod cold start (measured 2026-10 on the
+// pinned pair), so the archive stays uncompressed: a recurring per-pod cost is
+// not worth a one-time saving.
 //
 // # What is in the archive
 //

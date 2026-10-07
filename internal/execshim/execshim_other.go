@@ -33,3 +33,9 @@ var ErrUnsupported = errors.New("execshim: libsandbox confinement requires darwi
 func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec) error {
 	return ErrUnsupported
 }
+
+// Serve is unsupported off darwin/cgo; it fails closed with the setup exit code.
+func Serve() int { return supervisor.ShimExitSetup }
+
+// RunExecSession is unsupported off darwin/cgo.
+func RunExecSession(string, string, []string) error { return ErrUnsupported }

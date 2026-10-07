@@ -33,6 +33,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	shimv1 "k3sm.io/apis/shim/v1"
 )
 
 // Pod re-adoption after a daemon restart.
@@ -43,8 +44,8 @@ import (
 // kubelet's: on start the node lists the pods bound to it from the apiserver (the
 // spec source of truth — runtimed persists none) and, for each, asks the runtime
 // to ATTACH to the live processes rather than create new ones. containerd does
-// the same for its shims across a restart; k3sm has no shim to reconnect to, so
-// the runtime re-attaches to the process group directly.
+// the same for its shims across a restart, and the runtime re-attaches to a
+// container's resident shim the same way (residentshim.go).
 //
 // What is rebuilt, and from what:
 //   - the pod and container records, from the spec the caller passes plus the
@@ -52,30 +53,31 @@ import (
 //   - each container's published identity (container_id), from the same record
 //     derivation the spawn used, so it is unchanged across the restart;
 //   - the memory sampler, from the spec's limits only;
-//   - the exit watch, through EVFILT_PROC/NOTE_EXIT on a process that is no
+//   - the exit watch, through EVFILT_PROC/NOTE_EXIT on the shim, which is no
 //     longer this daemon's child (supervisor.AdoptedExitWaiter);
-//   - the log capture: a container's stdout/stderr are files the daemon tails
-//     (supervisor.CaptureToFiles), so the tail resumes from the persisted
-//     offset and nothing written during the gap is lost. Those lines carry the
-//     time they were READ; one info line in the CRI log says where the gap was.
+//   - the container's output, exit status and exec surface: they live in the
+//     shim, which kept writing the CRI log while no daemon ran, and ConnectShim
+//     reaches it again after proving it is the recorded instance. The exit
+//     reported later is the shim's persisted record, so it is real; a container
+//     that exited while the daemon was down reports its recorded status.
 //
 // What cannot be rebuilt, and is said rather than invented:
-//   - the exit STATUS: a non-child's wait status belongs to launchd, so a
-//     re-attached container that exits is reported terminated with reason
-//     ExitStatusUnknownReason and exit code exitCodeUnknown — never 0;
-//   - the log stream of a pod spawned before file capture: its pipes belonged
-//     to the dead daemon. A marker line goes into the container's CRI log and
-//     the pod carries the LogStreamLostConditionType condition. A pod whose raw
-//     files and offsets exist never gets either;
+//   - a container whose shim died: it is watched by its own recorded identity,
+//     reported terminated with ExitStatusUnknownReason when it exits, its later
+//     output is not captured, Exec is refused, and the pod carries
+//     LogStreamLostConditionType with reason ShimCrashed. A live shim that does
+//     not answer two Status calls gets the same treatment with reason
+//     ShimUnresponsive, except that its exit status is still read from its
+//     record;
+//   - a container spawned without a shim (a backend whose helper cannot stay
+//     resident): its pipes belonged to the dead daemon, so a marker line goes
+//     into its CRI log, the pod carries LogStreamLostConditionType with reason
+//     RuntimeRestarted, its exit is ExitStatusUnknownReason, and it refuses Exec
+//     because its resolved launch environment was the previous daemon's;
 //   - CPU accounting: the carry of earlier instances' CPU is gone, so it starts
 //     over, and the pod message says so;
 //   - the shim-inactive verdict: the exec observation happened in the previous
-//     daemon, so the condition is absent rather than guessed;
-//   - the resolved launch environment of a running instance (its image-config
-//     env and working directory): an exec session must enter exactly that, so
-//     an adopted pod refuses Exec (B408's resident shim is the answer). A
-//     container RE-SPAWNED by RestartContainer or StartContainer resolves its
-//     own, as on a created pod.
+//     daemon, so the condition is absent rather than guessed.
 //
 // The confinement profile IS rebuilt: it is recompiled from the spec and this
 // daemon's posture, through the pure halves of the create-time volume work
@@ -92,13 +94,11 @@ import (
 // startup reap began, so the fallback is one errors.Is check.
 var ErrNothingToAttach = errors.New("runtime: no live process group to attach")
 
-// LogStreamLostConditionType is the pod condition an attached pod carries when a
-// container's output could not be resumed: it was spawned with pipes (before
-// file capture), so its output after the daemon's death was not captured.
+// LogStreamLostConditionType is the pod condition a pod carries once a
+// container's output stopped being followed: it was spawned without a shim and
+// the daemon restarted (RuntimeRestarted), or its shim died (ShimCrashed) or
+// does not answer (ShimUnresponsive). See residentshim.go.
 const LogStreamLostConditionType = "k3sm.io/log-stream-lost"
-
-// logStreamLostReason is the reason on LogStreamLostConditionType.
-const logStreamLostReason = "RuntimeRestarted"
 
 // logStreamLostMarker is the line AttachPod appends to each attached container's
 // CRI log, so a reader of `kubectl logs` sees the gap where it happened.
@@ -120,10 +120,10 @@ const (
 	attachedLostSuffix = "; container output written while the daemon was down was not captured"
 )
 
-// errAdoptedPod is Exec's refusal on an adopted pod: a session must enter the
-// running instance's resolved launch environment, which this daemon did not
-// resolve (see the header).
-var errAdoptedPod = errors.New("exec is not supported in a pod re-attached after a runtime daemon restart: the running containers' launch environment was resolved by the previous daemon")
+// errAdoptedPod is Exec's refusal on a container re-attached without a shim: a
+// session must enter the running instance's resolved launch environment, which
+// this daemon did not resolve (see the header).
+var errAdoptedPod = errors.New("exec is not supported in a container re-attached after a runtime daemon restart without a resident shim: its launch environment was resolved by the previous daemon")
 
 // runtimeFingerprint names the build of this daemon for the podreap records: the
 // hex code-directory hash of the running binary (csops CS_OPS_CDHASH), prefixed
@@ -193,16 +193,16 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 			mine = append(mine, rec)
 		}
 	}
-	adopt, _ := attachDecision(mine, r.procGroup, r.procStart, r.fingerprint)
+	adopt, degraded, _ := attachDecision(mine, r.procGroup, r.procStart, r.fingerprint)
 
-	// One instance per container: the newest adoptable record wins. Any other
+	// One instance per container: the newest adoptable record wins, then the
+	// newest degraded one (a shim that died under a live container). Any other
 	// record — an older instance, a container the spec no longer names — stays
 	// unowned, and the reap that follows kills it exactly as it would have.
-	byName := make(map[string]podProcRecord, len(adopt))
-	for _, rec := range adopt {
-		if cur, ok := byName[rec.Container]; !ok || rec.StartUnixNano > cur.StartUnixNano {
-			byName[rec.Container] = rec
-		}
+	byName := newestByContainer(adopt, nil)
+	degradedByName := newestByContainer(degraded, byName)
+	for name, rec := range degradedByName {
+		byName[name] = rec
 	}
 	for _, c := range box.GetInitContainers() {
 		if _, ok := byName[c.GetName()]; ok && !isSidecarSpec(c) {
@@ -237,20 +237,67 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 		return nil, fmt.Errorf("attach pod %s container %s: sandbox profile drift: %w", podID, c.GetName(), ErrNothingToAttach)
 	}
 
+	// Reconnect to every adopted container's shim BEFORE anything is
+	// registered, and before r.mu (each is a socket round-trip). The digest loop
+	// above ran first: a drifted posture is refused before any shim is asked
+	// anything. A shim that is not the recorded instance or speaks another
+	// contract version refuses the whole pod (it is created afresh); one that
+	// does not answer is watched by its record, without output or exec.
+	conns := map[string]shimReconnect{}
+	closeConns := func() {
+		for _, sr := range conns {
+			if sr.conn != nil {
+				_ = sr.conn.Close()
+			}
+		}
+	}
+	for name, rec := range byName {
+		if rec.ShimDir == "" || degradedByName[name] == rec {
+			continue
+		}
+		id := supervisor.ShimIdentity{Container: name, Dir: rec.ShimDir, Pid: rec.Pgid, StartUnixNano: rec.StartUnixNano}
+		conn, st, err := supervisor.ConnectShim(ctx, r.shimDialer, id, r.procStart)
+		switch {
+		case err == nil:
+			conns[name] = shimReconnect{conn: conn, st: st}
+		case errors.Is(err, supervisor.ErrShimUnresponsive):
+			r.log.Warn("attach: a container's resident shim does not answer; its output and exec are lost until it exits",
+				"pod", podID, "container", name, "shim", rec.Pgid, "err", err)
+			conns[name] = shimReconnect{unresponsive: true}
+		default:
+			closeConns()
+			return nil, fmt.Errorf("attach pod %s container %s: %w: %w", podID, name, ErrNothingToAttach, err)
+		}
+	}
+
 	type slot struct {
-		cp      *containerProc
-		rec     podProcRecord
-		ok      bool
-		capture *supervisor.FileCapture
+		cp       *containerProc
+		rec      podProcRecord
+		ok       bool
+		degraded bool
+		shim     shimReconnect
 	}
 	attachedAt := time.Now()
 	var slots []slot
-	lost := false
+	lostReason := ""
+	noteLost := func(reason string) {
+		if lostReason == "" {
+			lostReason = reason
+		}
+	}
 	add := func(c *runtimev1.Container, isInit bool) {
 		rec, ok := byName[c.GetName()]
-		cp, capture, cLost := r.attachedContainer(box, c, isInit, rec, ok, attachedAt)
-		lost = lost || cLost
-		slots = append(slots, slot{cp: cp, rec: rec, ok: ok, capture: capture})
+		sl := slot{rec: rec, ok: ok, degraded: ok && degradedByName[c.GetName()] == rec, shim: conns[c.GetName()]}
+		var exited *recordedExit
+		if !ok {
+			exited = exitedWhileDown(mine, c.GetName())
+		}
+		cp, reason := r.attachedContainer(box, c, isInit, attachedSlot{rec: rec, ok: ok, degraded: sl.degraded, shim: sl.shim, exited: exited})
+		if reason != "" {
+			noteLost(reason)
+		}
+		sl.cp = cp
+		slots = append(slots, sl)
 	}
 	for _, c := range box.GetInitContainers() {
 		if isSidecarSpec(c) {
@@ -272,6 +319,7 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 				_ = s.cp.logw.Close()
 			}
 		}
+		closeConns()
 	}
 	if adopted == 0 {
 		closeLogs()
@@ -279,33 +327,48 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	}
 
 	msg := attachedPodMessage
-	if lost {
+	if lostReason != "" {
 		msg += attachedLostSuffix
+	}
+	shimDirs := map[string]string{}
+	for _, rec := range mine {
+		if rec.ShimDir != "" {
+			if _, seen := shimDirs[rec.Container]; !seen || byName[rec.Container] == rec {
+				shimDirs[rec.Container] = rec.ShimDir
+			}
+		}
 	}
 	podCtx, podCancel := context.WithCancel(context.Background())
 	p := &pod{
-		box:           box,
-		profile:       profile,
-		backend:       selected,
-		phase:         runtimev1.PodPhase_POD_PHASE_RUNNING,
-		message:       msg,
-		podIP:         box.GetPodIp(),
-		supCtx:        podCtx,
-		cancel:        podCancel,
-		adopted:       true,
-		attachedAt:    attachedAt,
-		logStreamLost: lost,
+		box:        box,
+		profile:    profile,
+		backend:    selected,
+		phase:      runtimev1.PodPhase_POD_PHASE_RUNNING,
+		message:    msg,
+		podIP:      box.GetPodIp(),
+		supCtx:     podCtx,
+		cancel:     podCancel,
+		adopted:    true,
+		attachedAt: attachedAt,
+		shimDirs:   shimDirs,
+	}
+	if lostReason != "" {
+		noteLogStreamLostLocked(p, lostReason, attachedAt)
 	}
 	for _, s := range slots {
 		p.containers = append(p.containers, s.cp)
 	}
+	// An ephemeral container is never adopted (it is never restarted, and the
+	// reap that follows collects any process group it left): it is recorded as
+	// not started, as a re-created pod records it.
+	recordEphemeralNotStartedLocked(p)
 
 	// Register and start the exit watches under r.mu, in one step with the
 	// podReapStarted check: the reap sets that flag under the same lock at the
 	// moment it snapshots the owned pgids, so either this pod is in that
-	// snapshot or it is never installed. AdoptProcess only launches a goroutine,
-	// and the identity re-probe is one process-table read, so nothing blocks
-	// under the lock.
+	// snapshot or it is never installed. The Adopt constructors only launch a
+	// goroutine, and the identity re-probe is one process-table read, so
+	// nothing blocks under the lock.
 	r.mu.Lock()
 	if r.podReapStarted {
 		r.mu.Unlock()
@@ -323,22 +386,18 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 		if !s.ok {
 			continue
 		}
-		var sink supervisor.LogSink
-		if s.capture != nil {
-			sink = containerLogSink(s.cp.logw, s.cp.fanout)
-		}
-		// attachDecision ran before the per-container file I/O above; the
-		// leader may have exited (and its pgid been recycled) since. Re-probe
-		// the exact recorded identity — the check the reap's kill path runs
-		// before signalGroup — so a group that is no longer the recorded
-		// instance is refused, never adopted.
+		// attachDecision ran before the per-container I/O above; the leader
+		// (or, for a degraded slot, the container) may have exited and its pid
+		// been recycled since. Re-probe the exact recorded identity — the check
+		// the reap's kill path runs before signalGroup — so a group that is no
+		// longer the recorded instance is refused, never adopted.
 		if !r.groupIsRecordedInstance(s.rec) {
 			r.mu.Unlock()
 			podCancel()
 			closeLogs()
 			return nil, fmt.Errorf("attach pod %s container %s: the leader no longer matches its record: %w", podID, s.cp.name, ErrNothingToAttach)
 		}
-		proc, err := supervisor.AdoptProcess(podCtx, r.adoptWaiter, s.rec.Pgid, sink, s.capture)
+		proc, err := r.adoptSlot(podCtx, s.rec, s.degraded, s.shim)
 		if err != nil {
 			// Unreachable for a record listPodProcRecords returned (it
 			// quarantines pgid <= 1), but a half-adopted pod must not be
@@ -367,6 +426,72 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_ADDED, st)
 	return st, nil
+}
+
+// shimReconnect is a container's resident shim as AttachPod found it: a verified
+// connection and its first Status, or unresponsive.
+type shimReconnect struct {
+	conn         *supervisor.ShimConn
+	st           *shimv1.StatusResponse
+	unresponsive bool
+}
+
+// adoptSlot builds the running Process of one adopted record: through its shim,
+// by its shim's record (unresponsive), by the container's own identity (its
+// shim died), or by its group leader (no shim).
+func (r *Runtime) adoptSlot(ctx context.Context, rec podProcRecord, degraded bool, sr shimReconnect) (*supervisor.Process, error) {
+	switch {
+	case degraded:
+		return supervisor.AdoptChild(ctx, r.adoptWaiter, rec.Pgid, rec.ChildPid)
+	case sr.conn != nil:
+		return supervisor.AdoptShim(ctx, r.adoptWaiter, sr.conn, sr.st)
+	case sr.unresponsive:
+		return supervisor.AdoptShimByRecord(ctx, r.adoptWaiter,
+			supervisor.ShimIdentity{Container: rec.Container, Dir: rec.ShimDir, Pid: rec.Pgid, StartUnixNano: rec.StartUnixNano}, rec.ChildPid)
+	default:
+		return supervisor.AdoptProcess(ctx, r.adoptWaiter, rec.Pgid)
+	}
+}
+
+// newestByContainer keeps, per container name, the record with the newest
+// leader start, skipping names already in skip.
+func newestByContainer(recs []podProcRecord, skip map[string]podProcRecord) map[string]podProcRecord {
+	out := make(map[string]podProcRecord, len(recs))
+	for _, rec := range recs {
+		if _, taken := skip[rec.Container]; taken {
+			continue
+		}
+		if cur, ok := out[rec.Container]; !ok || rec.StartUnixNano > cur.StartUnixNano {
+			out[rec.Container] = rec
+		}
+	}
+	return out
+}
+
+// recordedExit is the persisted exit of a shim-backed instance that ended while
+// no daemon ran, with the record that names it.
+type recordedExit struct {
+	rec  podProcRecord
+	exit supervisor.ExitRecord
+}
+
+// exitedWhileDown returns the newest instance of container whose shim persisted
+// an exit record, or nil: a container that exited while the daemon was down still
+// has its real status in its shim dir.
+func exitedWhileDown(records []podProcRecord, container string) *recordedExit {
+	var best *recordedExit
+	for _, rec := range records {
+		if rec.Container != container || rec.ShimDir == "" {
+			continue
+		}
+		if best != nil && rec.StartUnixNano <= best.rec.StartUnixNano {
+			continue
+		}
+		if ex, ok, err := supervisor.ReadExitRecord(rec.ShimDir); err == nil && ok {
+			best = &recordedExit{rec: rec, exit: ex}
+		}
+	}
+	return best
 }
 
 // attachableContainers lists the spec containers AttachPod builds entries for:
@@ -419,18 +544,23 @@ func isSidecarSpec(c *runtimev1.Container) bool {
 	return c.GetRestartPolicy() == runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS
 }
 
+// attachedSlot is what AttachPod knows about one spec container.
+type attachedSlot struct {
+	rec      podProcRecord
+	ok       bool // a live, adoptable instance
+	degraded bool // its shim died; the container lives
+	shim     shimReconnect
+	exited   *recordedExit // no live instance, but a persisted exit
+}
+
 // attachedContainer builds the containerProc for one spec container of a pod
-// being attached. With a record (ok) it is the running instance: the CRI log of
-// its instance is re-opened, and its identity and start come from the record.
-// Without one the container died while no daemon was watching, so it is
-// reported terminated with an unknown status. The process is installed by the
-// caller.
-//
-// It returns the capture to resume when the container's output was
-// file-captured (captureResumable) — the CRI log then gets one info line naming
-// the gap — and lost when it was not: a pipe-era container, whose log gets the
-// gap marker and whose pod gets LogStreamLostConditionType.
-func (r *Runtime) attachedContainer(box *runtimev1.PodBox, c *runtimev1.Container, isInit bool, rec podProcRecord, ok bool, attachedAt time.Time) (cp *containerProc, capture *supervisor.FileCapture, lost bool) {
+// being attached, and returns the log-stream-lost reason it contributes ("" for
+// none). With a live instance it is Running, with the identity and start its
+// record and shim report; a shim-backed instance's log is written by its shim
+// and gets nothing from here. Without one, the container ended while no daemon
+// watched: reported with its persisted exit when its shim recorded one, else as
+// ExitStatusUnknown. The process is installed by the caller.
+func (r *Runtime) attachedContainer(box *runtimev1.PodBox, c *runtimev1.Container, isInit bool, sl attachedSlot) (*containerProc, string) {
 	cred := resolveCredential(box, c)
 	logDir := containerLogDir(box.GetLogDirectory(), c.GetName())
 	// The instance the previous daemon was writing is the highest on disk: one
@@ -439,7 +569,8 @@ func (r *Runtime) attachedContainer(box *runtimev1.PodBox, c *runtimev1.Containe
 	if next, err := restartCountFromLogDir(logDir); err == nil && next > 0 {
 		instance = next - 1
 	}
-	cp = &containerProc{
+	path := filepath.Join(logDir, containerLogFile(instance))
+	cp := &containerProc{
 		name:         c.GetName(),
 		spec:         c,
 		initDeclared: isInit,
@@ -452,84 +583,92 @@ func (r *Runtime) attachedContainer(box *runtimev1.PodBox, c *runtimev1.Containe
 			User:         containerUser(cred),
 		},
 	}
-	if !ok {
+	if !sl.ok {
+		if ex := sl.exited; ex != nil {
+			cp.state.ContainerId = ex.rec.containerID()
+			cp.state.LogPath = path
+			term := &runtimev1.ContainerStateTerminated{
+				ExitCode:    int32(ex.exit.ExitCode),
+				Signal:      int32(ex.exit.Signal),
+				FinishedAt:  timestamppb.New(time.Unix(0, ex.exit.FinishedAtUnixNano)),
+				ContainerId: ex.rec.containerID(),
+				LogPath:     path,
+				Reason:      "Error",
+			}
+			if ex.exit.ExitCode == 0 && ex.exit.Signal == 0 {
+				term.Reason = "Completed"
+			}
+			cp.state.State = &runtimev1.ContainerState{Terminated: term}
+			return cp, ""
+		}
 		cp.state.State = &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{
 			ExitCode:   exitCodeUnknown,
 			Reason:     ExitStatusUnknownReason,
 			Message:    "the container exited while the runtime daemon was down; its exit status is unknown",
 			FinishedAt: nowProto(),
 		}}
-		return cp, nil, false
+		return cp, ""
 	}
+	rec := sl.rec
 	cp.state.ContainerId = rec.containerID()
+	// A running adopted instance keeps its report: re-read it from the start.
+	if rootfs, err := r.rootfsPath(box); err == nil {
+		r.armChildReport(box.GetPodId(), rootfs, cp, false)
+	}
+	started := rec.StartUnixNano
+	if rec.ChildStartUnixNano != 0 {
+		started = rec.ChildStartUnixNano
+	}
+	if st := sl.shim.st; st != nil && st.GetChildStartUnixNano() != 0 {
+		started = st.GetChildStartUnixNano()
+	}
 	cp.state.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{
-		StartedAt: timestamppb.New(time.Unix(0, rec.StartUnixNano)),
+		StartedAt: timestamppb.New(time.Unix(0, started)),
 	}}
 
-	fc, err := r.containerCapture(box.GetPodId(), c.GetName())
-	resumable := err == nil && captureResumable(fc)
-	lost = !resumable
+	switch {
+	case sl.degraded:
+		cp.state.LogPath = path
+		cp.execRefusal = errShimLost
+		return cp, logStreamLostShimCrashed
+	case sl.shim.unresponsive:
+		cp.state.LogPath = path
+		cp.execRefusal = errShimLost
+		return cp, logStreamLostShimUnresponsive
+	case sl.shim.conn != nil:
+		cp.state.LogPath = path
+		return cp, ""
+	}
 
-	path := filepath.Join(logDir, containerLogFile(instance))
+	// No shim: the pipes died with the previous daemon.
+	cp.execRefusal = errAdoptedPod
 	w, err := crilog.Open(path)
 	if err != nil {
-		// The container runs either way; its log_path and the tail are lost.
+		// The container runs either way; its log_path is lost.
 		r.log.Warn("attach: cannot re-open the container log", "pod", box.GetPodId(), "container", c.GetName(), "path", path, "err", err)
-		return cp, nil, true
+		return cp, logStreamLostRuntimeRestarted
 	}
-	line := logStreamLostMarker
-	if resumable {
-		line = resumedLogLine(attachedAt, lastOffsetWrite(fc))
-	}
-	if err := w.Write(crilog.StreamStderr, []byte(line), false); err != nil {
+	if err := w.Write(crilog.StreamStderr, []byte(logStreamLostMarker), false); err != nil {
 		r.log.Warn("attach: cannot write the log-gap line", "pod", box.GetPodId(), "container", c.GetName(), "path", path, "err", err)
 	}
 	cp.logw = w
 	cp.state.LogPath = w.Path()
-	if resumable {
-		capture = &fc
-	}
-	return cp, capture, lost
-}
-
-// lastOffsetWrite is the latest time the previous daemon persisted either of a
-// container's tail offsets — the last moment its output is known to have been
-// captured. Zero when neither can be stat'ed.
-func lastOffsetWrite(fc supervisor.FileCapture) time.Time {
-	var last time.Time
-	for _, raw := range []string{fc.Stdout, fc.Stderr} {
-		if st, err := os.Stat(supervisor.OffsetPath(raw)); err == nil && st.ModTime().After(last) {
-			last = st.ModTime()
-		}
-	}
-	return last
-}
-
-// resumedLogLine is the one info line an attach writes into a resumed
-// container's CRI log: where the daemon restart was, and that what follows was
-// captured late and carries read-time timestamps.
-func resumedLogLine(attachedAt, lastCaptured time.Time) string {
-	gap := "an unknown gap"
-	if !lastCaptured.IsZero() && attachedAt.After(lastCaptured) {
-		gap = "a gap of up to " + attachedAt.Sub(lastCaptured).Round(time.Millisecond).String()
-	}
-	return fmt.Sprintf("k3sm: daemon restarted at %s; the following lines were captured after %s and are stamped when read, not when written",
-		attachedAt.UTC().Format(time.RFC3339Nano), gap)
+	return cp, logStreamLostRuntimeRestarted
 }
 
 // logStreamLostConditionLocked renders LogStreamLostConditionType for an attached
 // pod, or nil. The caller holds p.mu.
 func logStreamLostConditionLocked(p *pod) *runtimev1.PodCondition {
-	if !p.logStreamLost {
+	if p.logStreamLostReason == "" {
 		return nil
 	}
-	at := timestamppb.New(p.attachedAt)
+	at := timestamppb.New(p.logStreamLostAt)
 	return &runtimev1.PodCondition{
 		Type:               LogStreamLostConditionType,
 		Status:             runtimev1.ConditionStatus_CONDITION_STATUS_TRUE,
 		LastProbeTime:      at,
 		LastTransitionTime: at,
-		Reason:             logStreamLostReason,
-		Message:            logStreamLostMarker,
+		Reason:             p.logStreamLostReason,
+		Message:            logStreamLostMessages[p.logStreamLostReason],
 	}
 }

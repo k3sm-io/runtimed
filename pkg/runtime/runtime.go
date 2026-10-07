@@ -240,18 +240,22 @@ type Config struct {
 	// pod's absolute mount path then reaches the host, the pre-shim behavior). The
 	// shim cannot load into a SIP platform binary (/bin/sh) — only custom Go/C
 	// workloads — a documented ceiling, narrowed by ShadowBinDir for the host
-	// shells, which this same shim then also rewrites at every exec.
+	// shells, tar and the common coreutils, which this same shim then also
+	// rewrites at every exec.
 	PathShimPath string
 	// ShadowBinDir is the node's directory of ad-hoc re-signed copies of the
-	// host shells (bash, zsh, dash, env; bash also serves /bin/sh), made by the
-	// installer, root-owned and never writable by the daemon user. When set, a
-	// host-binary container whose argv[0] is /bin/sh, /bin/bash, /bin/zsh,
-	// /bin/dash or /usr/bin/env, or a script whose shebang names one of them,
-	// runs the copy instead (shadowRewrite), and the path-rebase shim is
-	// injected with K3SM_SHADOW_DIR so the pod's own execs of those binaries are
-	// rewritten the same way. The copies are not platform binaries, so dyld
-	// keeps DYLD_INSERT_LIBRARIES (the DNS and path shims) across them. Empty
-	// disables both (today's behaviour).
+	// host binaries in the shadowset list (the shells bash, zsh, dash and env,
+	// bash also serving /bin/sh; tar; the common coreutils such as cat, cp,
+	// sed, awk and grep), made by the installer, root-owned and never writable
+	// by the daemon user. When set, a host-binary container whose argv[0] is
+	// one of the list's exec paths, or a script whose shebang names one, runs
+	// the copy instead (shadowRewrite), and the path-rebase shim is injected
+	// with K3SM_SHADOW_DIR so the pod's own execs of those binaries (kubectl
+	// cp's tar among them) are rewritten the same way, from the shim's table
+	// generated from the same list. The copies are not platform binaries, so
+	// dyld keeps DYLD_INSERT_LIBRARIES (the DNS and path shims) across them. A
+	// copy missing from the directory (a node installed before the list grew)
+	// is not used: the host binary runs, as before. Empty disables both.
 	//
 	// Trust: a copy is used only when the directory and the file are
 	// root-owned, a directory / a regular file (never a symlink), and free of
@@ -332,6 +336,10 @@ type Runtime struct {
 	// additive RuntimeConditions only — nothing in the pod spine consumes them.
 	rosettaHost  rosettaCondition
 	rosettaGuest rosettaCondition
+	// pressureKill is why the default spawner runs pods WITHOUT the
+	// pressure-kill mark (its startup self-check failed), or nil. Set once in
+	// New and immutable, so GetRuntimeInfo reads it with no lock.
+	pressureKill error
 	// gpuFacts is the host's GPU observation, probed eagerly exactly once
 	// in New and IMMUTABLE thereafter — so the concurrent GetRuntimeInfo handler
 	// reads it with no lock and no race, and the Metal driver round trip happens
@@ -398,6 +406,11 @@ type Runtime struct {
 	// restricted-main-process detection; nil disables it (Deps.CodeSignStatus).
 	codeSignStatus func(pid int) (uint32, error)
 
+	// childRestricted decides whether a path a pod reported as an unshimmed
+	// child is a restricted platform file (childreport.go); nil means the
+	// production supervisor.RestrictedPlatformFile. Unit tests set it.
+	childRestricted func(path string) bool
+
 	// shadowLstat is the trust check's lstat (shadow.go verifyShadow); nil
 	// means the production lstatShadow. Unit tests set it, because they cannot
 	// create root-owned files.
@@ -417,6 +430,10 @@ type Runtime struct {
 	// adoptWaiter observes the exit of a re-attached (non-child) pod process;
 	// see AttachPod. Never nil after New.
 	adoptWaiter supervisor.ExitWaiter
+
+	// shimDialer reaches a container's resident shim (residentshim.go). Never nil after
+	// New.
+	shimDialer supervisor.ShimDialer
 
 	mu   sync.Mutex
 	pods map[string]*pod
@@ -640,8 +657,14 @@ type Deps struct {
 	// the gpuFacts field), so the GPU driver is touched once per daemon lifetime.
 	GPUProbe func() sandbox.GPUProbeResult
 	Spawner  supervisor.Spawner
-	Waiter   supervisor.ExitWaiter
-	Network  supervisor.PodNetwork
+	// PressureKillProbe proves the default spawner's pressure-kill mark on
+	// this host. It runs once in New, and only when Spawner is unset (the
+	// default spawner is the one it vouches for). Defaults to
+	// supervisor.VerifyPressureKill, which spawns and kills one /bin/sleep;
+	// tests inject a fake.
+	PressureKillProbe func(ctx context.Context) error
+	Waiter            supervisor.ExitWaiter
+	Network           supervisor.PodNetwork
 	// Resolver supplies ConfigMap/Secret data and SA tokens for volume
 	// materialization. It has NO production default: runtimed never talks
 	// to the apiserver, so the provider (k3sm) wires one backed by its apiserver
@@ -682,6 +705,10 @@ type Deps struct {
 	// a process a previous daemon spawned, which is not this daemon's child.
 	// Defaults to supervisor.AdoptedExitWaiter; tests inject a fake.
 	AdoptedWaiter supervisor.ExitWaiter
+	// ShimDialer dials a container's resident shim and reports the socket's
+	// peer pid. Defaults to supervisor.UnixShimDialer; tests inject a fake
+	// shim behind it.
+	ShimDialer supervisor.ShimDialer
 	// RuntimeFingerprint overrides the build fingerprint every podreap record
 	// carries and AttachPod requires to match (see runtimeFingerprint). Empty —
 	// the production default — derives it from this binary's own code-directory
@@ -838,8 +865,12 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	spawner := deps.Spawner
 	codeSignStatus := deps.CodeSignStatus
+	// pressureKillErr is the default spawner's startup self-check verdict; nil
+	// when the mark is proven or the spawner was injected (an injected spawner
+	// is not this daemon's mark to verify).
+	var pressureKillErr error
 	if spawner == nil {
-		spawner = supervisor.PosixSpawner{}
+		spawner, pressureKillErr = defaultPodSpawner(log, deps.PressureKillProbe)
 		if codeSignStatus == nil {
 			codeSignStatus = supervisor.CodeSignStatus
 		}
@@ -871,6 +902,10 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	adoptWaiter := deps.AdoptedWaiter
 	if adoptWaiter == nil {
 		adoptWaiter = supervisor.AdoptedExitWaiter{}
+	}
+	shimDialer := deps.ShimDialer
+	if shimDialer == nil {
+		shimDialer = supervisor.UnixShimDialer{}
 	}
 	fingerprint := deps.RuntimeFingerprint
 	if fingerprint == "" {
@@ -941,6 +976,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		guestDialer:    guestDialer,
 		rosettaHost:    rosettaHost,
 		rosettaGuest:   rosettaGuest,
+		pressureKill:   pressureKillErr,
 		gpuFacts:       gpuFacts,
 		gpuDevice:      gpuResult.Metal.DeviceName,
 		spawner:        spawner,
@@ -957,6 +993,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,
+		shimDialer:     shimDialer,
 	}, nil
 }
 

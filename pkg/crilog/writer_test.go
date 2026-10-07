@@ -312,3 +312,37 @@ func TestWriterStopsOnPersistentWriteError(t *testing.T) {
 		t.Errorf("Reopen on a failed writer = %v, want the sticky failure", e)
 	}
 }
+
+// TestWriterReopenFromSwapsToTheHandedFile pins ReopenFrom: after the swap every
+// line lands in the handed-over file and none in the old one.
+func TestWriterReopenFromSwapsToTheHandedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "0.log")
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.Write(StreamStdout, []byte("before"), false); err != nil {
+		t.Fatal(err)
+	}
+	rotated := path + ".1"
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatal(err)
+	}
+	f, err := OpenAppend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.ReopenFrom(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(StreamStdout, []byte("after"), false); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := os.ReadFile(rotated)
+	cur, _ := os.ReadFile(path)
+	if !strings.Contains(string(old), "before") || strings.Contains(string(old), "after") || !strings.Contains(string(cur), "after") {
+		t.Fatalf("rotated %q, current %q", old, cur)
+	}
+}

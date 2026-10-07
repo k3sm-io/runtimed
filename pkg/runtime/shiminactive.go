@@ -24,6 +24,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // ShimInactiveConditionType is the pod-condition type runtimed publishes when
@@ -53,14 +55,34 @@ const ShimInactiveReason = "RestrictedMainProcess"
 // carries ShimInactiveReason and each container's message names its own cause.
 const ShimInactiveHardenedReason = "HardenedRuntimeMainProcess"
 
-// The two csflags bits under which dyld scrubs DYLD_* from a process
-// (<sys/codesign.h>, not in the public SDK): a platform binary, and a process
-// the kernel marked restricted.
-const (
-	csPlatformBinary uint32 = 0x04000000
-	csRestrict       uint32 = 0x00000800
-	csRuntime        uint32 = 0x00010000
-)
+// ShimInactiveLibraryValidationReason is the condition's reason when the only
+// cause is library validation (CS_REQUIRE_LV or CS_FORCED_LV): dyld keeps
+// DYLD_INSERT_LIBRARIES but refuses to map the shim dylib, which is ad-hoc
+// signed and carries no Team ID.
+const ShimInactiveLibraryValidationReason = "LibraryValidationMainProcess"
+
+// ShimInactiveUnknownReason is the condition's reason when whether the shim
+// loaded could not be determined: the exec was not observed, or the
+// code-signing flags could not be read. It is reported as loudly as a shim
+// known not to have loaded (see supervisor.ClassifyShimLoad).
+const ShimInactiveUnknownReason = "ShimLoadUnknown"
+
+// ShimInactiveRestrictedChildReason is the condition's reason when the only
+// cause is that a container's processes ran platform binaries the pod shim
+// cannot load into (dyld scrubs DYLD_* from them), as reported by the path
+// shim from inside the pod (childreport.go). It is advisory: the pod can
+// forge or suppress the report. It ranks below every main-process reason.
+const ShimInactiveRestrictedChildReason = "RestrictedChildProcess"
+
+// shimReasonRank orders the condition reasons for a pod whose containers have
+// different ones: the highest-ranked reason any container has is the pod's.
+var shimReasonRank = map[string]int{
+	ShimInactiveRestrictedChildReason:   1,
+	ShimInactiveUnknownReason:           2,
+	ShimInactiveLibraryValidationReason: 3,
+	ShimInactiveHardenedReason:          4,
+	ShimInactiveReason:                  5,
+}
 
 // execObserveTimeout bounds how long a container start waits for the
 // exec-shim to exec the pod binary before it gives up on the detection
@@ -72,7 +94,7 @@ const execObserveTimeout = 2 * time.Second
 // by the exec observer (observeShim) and read, like it is written, under pod.mu.
 type shimInactive struct {
 	inactive bool
-	reason   string // the condition reason (ShimInactiveReason or ShimInactiveHardenedReason)
+	reason   string // the condition reason (one of the ShimInactive*Reason constants)
 	message  string
 	at       time.Time
 }
@@ -80,14 +102,7 @@ type shimInactive struct {
 // restrictedFlags names the csflags bits in flags that make dyld scrub DYLD_*,
 // or "" when there are none.
 func restrictedFlags(flags uint32) string {
-	var bits []string
-	if flags&csPlatformBinary != 0 {
-		bits = append(bits, "CS_PLATFORM_BINARY")
-	}
-	if flags&csRestrict != 0 {
-		bits = append(bits, "CS_RESTRICT")
-	}
-	return strings.Join(bits, "|")
+	return supervisor.CSFlagNames(flags & (supervisor.CSPlatformBinary | supervisor.CSRestrict))
 }
 
 // shimInactiveMessage is the condition message for one container: it names
@@ -99,40 +114,57 @@ func shimInactiveMessage(container, path, bits string) string {
 		"FQDN and name.ns.svc resolve through the node resolver", container, path, bits)
 }
 
+// shimUnknownMessage is the condition message for a container whose shim load
+// could not be determined: it names both possible losses.
+func shimUnknownMessage(container, path, cause string) string {
+	return fmt.Sprintf("container %s: whether the pod shim loaded into the main process (%s) is unknown (%s): "+
+		"per-namespace DNS precedence and bind/connect source discipline may be unavailable; "+
+		"FQDN and name.ns.svc may resolve through the node resolver", container, path, cause)
+}
+
+// shimCondition maps a Loud shim-load verdict to its condition reason and
+// message.
+func shimCondition(container, path string, ld supervisor.ShimLoad) (string, string) {
+	if ld.Verdict == supervisor.ShimUnknown {
+		return ShimInactiveUnknownReason, shimUnknownMessage(container, path, ld.Cause)
+	}
+	if bits := restrictedFlags(ld.Flags); bits != "" {
+		return ShimInactiveReason, shimInactiveMessage(container, path, bits)
+	}
+	if ld.Flags&supervisor.CSRuntime != 0 {
+		return ShimInactiveHardenedReason, shimInactiveMessage(container, path, "CS_RUNTIME: hardened runtime; the shim loads only if "+
+			"the binary carries com.apple.security.cs.allow-dyld-environment-variables")
+	}
+	return ShimInactiveLibraryValidationReason, shimInactiveMessage(container, path,
+		supervisor.CSFlagNames(ld.Flags)+": library validation rejects the ad-hoc-signed shim dylib")
+}
+
 // observeShim returns the exec observer for a container whose environment
 // asks dyld to insert a shim, or nil when there is nothing to observe (no
 // shim requested, or detection disabled). The observer runs on the
 // container's reaper goroutine (supervisor.Process.ObserveExec), after the
-// exec-shim has exec'd the pod binary and before the reaper can collect it, so
-// the pid cannot have been reused. It records its verdict in cp.shim under
-// p.mu and, once the pod is registered, publishes a MODIFIED status so the
-// condition reaches the node without waiting for the next transition. Any
-// csops error, ESRCH for a process that has already exited included, is
-// fail-open: a Debug line and no verdict.
-func (r *Runtime) observeShim(p *pod, cp *containerProc, path string, env []string) func(pid int) {
+// exec-shim has exec'd the pod binary (or the exec-sync wait gave up) and
+// before the reaper can collect it, so the pid cannot have been reused. It
+// classifies the load with supervisor.ClassifyShimLoad; no handshake producer
+// exists yet, so the classification is by the code-signing hint alone
+// (HandshakeUnsupported). A Loud verdict (unloaded, or unknown: the exec was
+// not observed or csops failed, ESRCH included) is logged at Warn, recorded in
+// cp.shim under p.mu and, once the pod is registered, published as a MODIFIED
+// status so the condition reaches the node without waiting for the next
+// transition.
+func (r *Runtime) observeShim(p *pod, cp *containerProc, path string, env []string) func(pid int, observed bool) {
 	if r.codeSignStatus == nil || !envHasName(env, dyldInsertEnv) {
 		return nil
 	}
 	podID, container := p.box.GetPodId(), cp.name
-	return func(pid int) {
-		flags, err := r.codeSignStatus(pid)
-		if err != nil {
-			r.log.Debug("code-signing status unavailable; the shim-inactive detection is skipped",
-				"pod", podID, "container", container, "pid", pid, "err", err)
+	ins := supervisor.CodeSignFunc(r.codeSignStatus)
+	return func(pid int, observed bool) {
+		ld := supervisor.ClassifyShimLoad(ins, pid, observed, supervisor.HandshakeUnsupported)
+		ld.Log(r.log, podID, container, path)
+		if !ld.Loud() {
 			return
 		}
-		reason, msg := ShimInactiveReason, ""
-		if bits := restrictedFlags(flags); bits != "" {
-			msg = shimInactiveMessage(container, path, bits)
-		} else if flags&csRuntime != 0 {
-			reason = ShimInactiveHardenedReason
-			msg = shimInactiveMessage(container, path, "CS_RUNTIME: hardened runtime; the shim loads only if "+
-				"the binary carries com.apple.security.cs.allow-dyld-environment-variables")
-		} else {
-			return
-		}
-		r.log.Warn("pod shim inactive: the main process is restricted, so dyld dropped DYLD_INSERT_LIBRARIES",
-			"pod", podID, "container", container, "path", path, "csflags", fmt.Sprintf("%#x", flags))
+		reason, msg := shimCondition(container, path, ld)
 		p.mu.Lock()
 		cp.shim = shimInactive{inactive: true, reason: reason, message: msg, at: time.Now()}
 		p.mu.Unlock()
@@ -145,21 +177,35 @@ func (r *Runtime) observeShim(p *pod, cp *containerProc, path string, env []stri
 }
 
 // shimInactiveConditionLocked renders the pod's shim-inactive verdicts as one
-// condition, or nil when no container has one. The caller holds p.mu.
+// condition, or nil when no container has one. Its reason is the
+// highest-precedence reason any container has: Restricted > Hardened >
+// LibraryValidation > Unknown > RestrictedChild. A container with both a
+// main-process verdict and reported children keeps its main-process reason
+// and message, with the children's clause appended. The caller holds p.mu.
 func shimInactiveConditionLocked(p *pod) *runtimev1.PodCondition {
 	var msgs []string
 	var first time.Time
-	reason := ShimInactiveHardenedReason
+	reason := ""
+	note := func(r string, at time.Time) {
+		if shimReasonRank[r] > shimReasonRank[reason] {
+			reason = r
+		}
+		if first.IsZero() || at.Before(first) {
+			first = at
+		}
+	}
 	for _, cp := range p.containers {
-		if !cp.shim.inactive {
-			continue
-		}
-		msgs = append(msgs, cp.shim.message)
-		if cp.shim.reason == ShimInactiveReason {
-			reason = ShimInactiveReason
-		}
-		if first.IsZero() || cp.shim.at.Before(first) {
-			first = cp.shim.at
+		child := len(cp.childShim.names) > 0
+		switch {
+		case cp.shim.inactive && child:
+			msgs = append(msgs, cp.shim.message+"; "+childShimMessage(cp.name, cp.childShim.names))
+			note(cp.shim.reason, cp.shim.at)
+		case cp.shim.inactive:
+			msgs = append(msgs, cp.shim.message)
+			note(cp.shim.reason, cp.shim.at)
+		case child:
+			msgs = append(msgs, childShimMessage(cp.name, cp.childShim.names))
+			note(ShimInactiveRestrictedChildReason, cp.childShim.at)
 		}
 	}
 	if len(msgs) == 0 {

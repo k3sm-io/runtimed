@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 
+	"k3sm.io/runtimed/internal/testwire"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -302,14 +303,11 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 		}
 	})
 
-	// B140 INVERTS the second half of this case. It used to assert that a hostile
-	// box.rootfs_path was merely inert for share roots — the plan ignored it, but
-	// the pod still reached the vm backend carrying that path as
-	// VMSpec.RootfsPath. It is now refused outright, strictly before the backend,
-	// because rootfs_path must be byte-equal to the runtime's derived pod data
-	// volume. The share-root half is unchanged and still meaningful: it pins that
-	// the planner derives roots locally rather than from the box.
-	t.Run("box-supplied-rootfs-path-never-moves-a-share-root", func(t *testing.T) {
+	// A box carrying the retired PodBox field 4 is ignored on the vm path: the
+	// planner derives roots locally, and createVMPod derives the guest rootfs
+	// from the pod id, so neither the derived spelling nor a hostile one (the
+	// runtime work root itself) changes what reaches the backend.
+	t.Run("box-supplied-field-4-never-moves-a-share-root", func(t *testing.T) {
 		rt, vmb := newVMPlanRuntime(t)
 
 		clean := mustPlanVM(t, rt, vmb, vmShareBox("pod-plan-hostile"))
@@ -325,43 +323,20 @@ func TestCreateVMPodVolumeSharePlan(t *testing.T) {
 			t.Errorf("rootfs share root = %q, want the podDir-derived %q", got, want)
 		}
 
-		// The derived spelling is still accepted, so the guard is byte-equality and
-		// not "any rootfs_path is fatal". A failed vm create registers nothing, so
-		// the same pod id re-runs on the same runtime; the recorder count is
-		// cumulative, hence want 2 here.
-		derivedBox := vmShareBox("pod-plan-hostile")
-		derivedBox.RootfsPath = filepath.Join(podDir, "rootfs")
-		if _, _, err := rt.createPod(context.Background(), derivedBox); err == nil {
-			t.Fatal("vm createPod should surface the lab-gated boot error")
-		}
-		n, derived := vmb.created()
-		if n != 2 {
-			t.Fatalf("CreateVM called %d times, want 2 (the derived-spelling run must still reach the backend)", n)
-		}
-		if got := vmShareRoots(derived); !reflect.DeepEqual(got, cleanRoots) {
-			t.Errorf("derived rootfs_path moved share roots:\n  derived: %v\n  clean:   %v", got, cleanRoots)
-		}
-		if got, want := derived.RootfsPath, filepath.Join(podDir, "rootfs"); got != want {
-			t.Errorf("VMSpec.RootfsPath = %q, want the derived %q", got, want)
-		}
-
-		// Hostile box.rootfs_path (the runtime work root itself): refused before
-		// the backend — the vm path must never carry an uncontained host path into
-		// VMSpec.RootfsPath.
-		hostileBox := vmShareBox("pod-plan-hostile")
-		hostileBox.RootfsPath = rt.cfg.Root
-		_, reason, err := rt.createPod(context.Background(), hostileBox)
-		if err == nil {
-			t.Fatal("a hostile rootfs_path must be refused, got nil error")
-		}
-		if !errors.Is(err, errUncontainedRootfs) {
-			t.Errorf("reject error = %v, want errUncontainedRootfs in the chain", err)
-		}
-		if reason != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
-			t.Errorf("reason = %v, want INVALID_POD_BOX", reason)
-		}
-		if n2, _ := vmb.created(); n2 != 2 {
-			t.Errorf("CreateVM called %d times, want a still-2 count (the hostile run must NOT reach the backend)", n2)
+		// A failed vm create registers nothing, so the same pod id re-runs on
+		// the same runtime; the recorder count is cumulative.
+		for i, v := range []string{filepath.Join(podDir, "rootfs"), rt.cfg.Root} {
+			box := testwire.WithWireField4(t, vmShareBox("pod-plan-hostile"), v)
+			if _, _, err := rt.createPod(context.Background(), box); err == nil {
+				t.Fatal("vm createPod should surface the lab-gated boot error")
+			}
+			n, got := vmb.created()
+			if want := 2 + i; n != want {
+				t.Fatalf("field 4 = %q: CreateVM called %d times, want %d (a box carrying field 4 must still reach the backend)", v, n, want)
+			}
+			if roots := vmShareRoots(got); !reflect.DeepEqual(roots, cleanRoots) {
+				t.Errorf("field 4 = %q moved share roots:\n  got:   %v\n  clean: %v", v, roots, cleanRoots)
+			}
 		}
 	})
 

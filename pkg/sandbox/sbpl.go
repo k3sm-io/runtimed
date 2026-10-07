@@ -116,6 +116,16 @@ var systemProtectedPrefixes = []string{
 	"/System/Cryptexes",
 }
 
+// systemTLSConfigDir is the system TLS configuration directory (LibreSSL's
+// openssl.cnf, the CA bundle cert.pem, certs/) a pod may read. Generate grants
+// it read-only in both firmlink forms.
+const systemTLSConfigDir = "/etc/ssl"
+
+// systemTLSPrivateDir is the conventional private-key subdirectory of
+// systemTLSConfigDir. Generate denies it in the protected tier, after every
+// allow, so neither the TLS grant nor a caller's extra read path reaches it.
+const systemTLSPrivateDir = systemTLSConfigDir + "/private"
+
 // ErrInvalidShadowBinDir reports a Posture.ShadowBinDir that is not an
 // absolute, clean, non-root path. It fails the profile rather than rendering a
 // read grant for a path nobody meant.
@@ -314,7 +324,9 @@ type GenerateOptions struct {
 //
 // The output always begins (version 1) / (deny default) / (import "system.sb"),
 // then grants the minimal allow-list: read the OS (/System, /usr, /bin,
-// /Library) plus validated extra read paths, read+write the pod's own data
+// /Library) and the system TLS configuration (/etc/ssl, read-only; its
+// private/ subdirectory is denied in the protected tier) plus validated extra
+// read paths, read+write the pod's own data
 // volume and any read-write persistent-volume mount roots (opts.WritePaths, which
 // live outside the data volume on the APFS storage root), read-only
 // persistent-volume roots (opts.ReadPaths), and — when sp.AllowNetwork is set —
@@ -369,7 +381,7 @@ type GenerateOptions struct {
 // Rule order is security-critical because SBPL is last-match-wins. Generate emits
 // (in increasing precedence): the OS/extra-path allows + the network allows; then
 // the AF_UNIX helper-socket denies and the protected file denies (/Users,
-// /private/var/db, the pods root, the podreap store, the control-plane/daemon
+// /private/var/db, /etc/ssl/private, the pods root, the podreap store, the control-plane/daemon
 // work-dir trees, the dyld cryptex) so a
 // caller's extra path can never override them; then the narrow re-allows the
 // protected denies would
@@ -522,6 +534,23 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("(allow file-read-metadata (literal \"/private/var/select/sh\"))\n")
 	}
 
+	// System TLS configuration, read-only. LibreSSL (/usr/bin/curl and every
+	// other client linked against the system libssl) opens its compiled-in
+	// openssl.cnf at init and aborts the process ("Auto configuration failed")
+	// when the profile denies it; the CA bundle (cert.pem) and certs/ sit beside
+	// it. This is public system configuration that a Linux container image
+	// carries in /etc/ssl anyway, and the files are world-readable, so the grant
+	// adds no reach beyond the uid's Unix permissions. The paths are LibreSSL's
+	// per-build compiled-in defaults on macOS 26, not an ABI —
+	// TestPodProfileAllowsTheSystemTLSConfig is the canary. Both firmlink forms
+	// are emitted because libsandbox matches the resolved /private/etc form.
+	// The private-key subdirectory is denied in the protected tier below.
+	b.WriteString(";; read: the system TLS configuration (openssl.cnf, the CA bundle,\n")
+	b.WriteString(";; certs/) — public, world-readable; read-only.\n")
+	b.WriteString("(allow file-read*\n")
+	writeFirmlinkSubpaths(&b, []string{systemTLSConfigDir})
+	b.WriteString("  )\n")
+
 	b.WriteString(";; write: validated extra write paths (+ /dev/null); the pod's own\n")
 	b.WriteString(";; data volume is re-allowed below, after the protected denies.\n")
 	b.WriteString("(allow file-write*\n")
@@ -555,6 +584,16 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// privileged k3sm-netd helper socket — the Seatbelt deny is the only barrier.
 	// Make it explicit: deny connect() to each helper socket path, after any
 	// network allow so last-match-wins keeps it denied even for a networked pod.
+	// Every container's resident shim socket lives under one static root
+	// (ShimSubdir). A file deny does not stop connect(2), so the root gets its
+	// own socket deny, a subpath in both firmlink forms: a pod reaches neither
+	// its own shim nor a sibling pod's (cross-pod Exec/Signal).
+	b.WriteString(";; AF_UNIX: deny connect() to every container's resident shim.\n")
+	b.WriteString("(deny network-outbound\n")
+	for _, form := range firmlinkForms(ShimRoot(filepath.Dir(podsRoot))) {
+		b.WriteString(fmt.Sprintf("  (remote unix-socket (subpath %q))\n", form))
+	}
+	b.WriteString("  )\n")
 	if len(deniedSockets) > 0 {
 		b.WriteString(";; AF_UNIX: explicitly deny connect() to the privileged helper\n")
 		b.WriteString(";; socket(s) — same-uid pods can't be kept off them any other way.\n")
@@ -601,6 +640,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/private/var/db\"))\n")
+	// The conventional private-key location under the TLS configuration dir on
+	// other systems; absent on stock macOS. Denied here, after every allow
+	// (the TLS read grant and any caller ExtraReadPaths), so last-match-wins
+	// keeps it unreachable whatever the allows tier names.
+	b.WriteString(";; TLS private-key dir: never readable, whatever the allows name.\n")
+	b.WriteString("(deny file-read* file-write*\n")
+	writeFirmlinkSubpaths(&b, []string{systemTLSPrivateDir})
+	b.WriteString("  )\n")
 	b.WriteString("(deny file-read* file-write*\n")
 	writeFirmlinkSubpaths(&b, workDirDenyRoots)
 	b.WriteString("  )\n")

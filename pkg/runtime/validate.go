@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"google.golang.org/protobuf/proto"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
 )
@@ -32,9 +34,9 @@ var errInvalidPodBox = errors.New("invalid pod box")
 // validatePodBox checks the minimum a PodBox needs to be instantiable. It returns
 // a typed FailureReason and an errInvalidPodBox-wrapped error on failure.
 //
-// It is a method because the rootfs_path check below is decided against the
-// runtime's own cache-derived pod layout — the seam cannot restate that layout
-// without the guard and the deriver drifting apart.
+// It is a method because the data_volume_path check below is decided against
+// the runtime's own cache-derived pod layout — the seam cannot restate that
+// layout without the guard and the deriver drifting apart.
 func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 	if box == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
@@ -48,23 +50,8 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
-	// rootfs_path is the same shape of hazard one level up: the directory the
-	// ROOT daemon MkdirAll's, materializes secrets into and recursively chowns
-	// for fsGroup. Reject it here, at the seam, for the same reason pod_id is
-	// rejected here — the seam check makes the rule total across every ingress,
-	// not just the ones that happen to call rootfsPath.
-	//
-	// It is asked of rootfsPath rather than restated, so there is one predicate
-	// (byte-equality with the cache derivation; see rootfsPath for why not
-	// containment). Note that UpdatePod does not run validatePodBox — it runs
-	// updatableOnly, whose rootfs_path comparison below is an IMMUTABILITY check,
-	// not a validation. The structural guard inside rootfsPath is what covers
-	// that ingress, which is precisely why the load-bearing check lives there and
-	// this one is defence in depth.
-	if _, err := r.rootfsPath(box); err != nil {
-		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: %w", errInvalidPodBox, err)
-	}
+	// The pod rootfs needs no check here: the daemon derives it from pod_id
+	// (rootfsPath) and reads no caller-supplied path for it.
 	if box.GetSandboxProfile() == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: sandbox_profile is required", errInvalidPodBox)
@@ -73,10 +60,10 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 	// over: it is not a directory the daemon writes but the tree the emitted SBPL
 	// re-allows read+write after the protected denies (last-match-wins), and the
 	// carve-out base every other caller-supplied path is validated against. It is
-	// asked of dataVolumePath rather than restated, for the same single-predicate
-	// reason rootfs_path is asked of rootfsPath — see that method for why equality
-	// with the derivation, why both derived spellings, and how it divides labour
-	// with the sink-side bound in sandbox.Generate. It sits after the nil-profile
+	// asked of dataVolumePath rather than restated, so there is one predicate —
+	// see that method for why equality with the derivation, why both derived
+	// spellings, and how it divides labour with the sink-side bound in
+	// sandbox.Generate. It sits after the nil-profile
 	// check above so a missing profile keeps its own clear reason.
 	//
 	// UpdatePod does not run validatePodBox (it runs updatableOnly, which does not
@@ -122,20 +109,18 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 }
 
 // updatableOnly verifies that newBox changes only in-place-updatable fields
-// (labels, annotations) relative to oldBox. Any other difference is NOT_UPDATABLE.
+// (labels, annotations, and an APPEND to ephemeral_containers) relative to
+// oldBox. Any other difference is NOT_UPDATABLE.
 //
 // It is the one place that names the in-place-updatable field set, so a caller
-// deciding between an update and a recreate can cite it: labels and annotations
-// only; volumes are materialized once, at create, and an update re-resolves no
-// ConfigMap/Secret/ServiceAccount-token data.
+// deciding between an update and a recreate can cite it: labels, annotations
+// and appended ephemeral containers only; volumes are materialized once, at
+// create, and an update re-resolves no ConfigMap/Secret/ServiceAccount-token
+// data.
 func updatableOnly(oldBox, newBox *runtimev1.PodBox) (runtimev1.FailureReason, error) {
 	if newBox.GetName() != oldBox.GetName() || newBox.GetNamespace() != oldBox.GetNamespace() {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
 			errors.New("name/namespace are not updatable in place")
-	}
-	if newBox.GetRootfsPath() != oldBox.GetRootfsPath() {
-		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
-			errors.New("rootfs_path is not updatable in place")
 	}
 	if newBox.GetUid() != oldBox.GetUid() || newBox.GetGid() != oldBox.GetGid() {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
@@ -145,7 +130,27 @@ func updatableOnly(oldBox, newBox *runtimev1.PodBox) (runtimev1.FailureReason, e
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
 			errors.New("container set is not updatable in place")
 	}
+	if _, err := ephemeralAppends(oldBox, newBox); err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE, err
+	}
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// ephemeralAppends returns the ephemeral containers newBox APPENDS to oldBox's
+// list. The list is append-only, as the apiserver keeps it: every entry oldBox
+// already has must be present in newBox, at the same position, and
+// proto-identical; removing or changing one is an error.
+func ephemeralAppends(oldBox, newBox *runtimev1.PodBox) ([]*runtimev1.Container, error) {
+	have, want := oldBox.GetEphemeralContainers(), newBox.GetEphemeralContainers()
+	if len(want) < len(have) {
+		return nil, errors.New("ephemeral containers cannot be removed")
+	}
+	for i, c := range have {
+		if !proto.Equal(c, want[i]) {
+			return nil, fmt.Errorf("ephemeral container %q cannot be changed once added", c.GetName())
+		}
+	}
+	return want[len(have):], nil
 }
 
 // nonEmptyEmptyDirMedium reports the first volume (by declaration order) whose

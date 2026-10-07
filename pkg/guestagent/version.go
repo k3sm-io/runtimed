@@ -80,6 +80,28 @@ const (
 	// A host reads this token to know whether an unsplit-looking log file is a
 	// fact about the container or an artifact of an old initramfs.
 	CapabilityLogPartial = "log-partial"
+
+	// CapabilityGuestPrivateMounts reports that the guest honours
+	// GuestMount.guest_private: such a mount is never re-exposed inside a
+	// container rootfs and is detached before any container starts. guest/v1
+	// requires a host not to emit guest_private to a guest without it.
+	CapabilityGuestPrivateMounts = "guest-private-mounts"
+
+	// CapabilitySidecarInit reports that the guest honours
+	// GuestContainer.sidecar (an init container started without waiting for
+	// its exit, stopped after the mains).
+	//
+	// It is DIAGNOSTIC: what keeps an older guest safe is that it refuses a
+	// spec setting a field it does not know. The token lets a host name the
+	// fix ("this initramfs predates the field") instead of reporting a decode
+	// failure.
+	CapabilitySidecarInit = "sidecar-init"
+
+	// CapabilityImageUser reports that the guest resolves
+	// GuestContainer.image_user against the container's own rootfs. Like
+	// CapabilitySidecarInit it is diagnostic: the older guest's unknown-field
+	// refusal is what fails closed.
+	CapabilityImageUser = "image-user"
 )
 
 // Capabilities is the token set this build advertises, in a STABLE order so a
@@ -89,5 +111,8 @@ const (
 // It is a function rather than a package var so no caller can append to the
 // shipped slice and change what every future Health call reports.
 func Capabilities() []string {
-	return []string{CapabilityTTYExec, CapabilityAttach, CapabilityLogPartial}
+	return []string{
+		CapabilityTTYExec, CapabilityAttach, CapabilityLogPartial,
+		CapabilityGuestPrivateMounts, CapabilitySidecarInit, CapabilityImageUser,
+	}
 }

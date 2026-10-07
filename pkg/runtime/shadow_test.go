@@ -22,10 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -36,6 +34,7 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/shadowset"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
@@ -55,6 +54,7 @@ func TestExecRewriteFollowsShebangs(t *testing.T) {
 		"/opt/app/python.py":   "#!/usr/bin/python3\nprint(1)\n",
 		"/opt/app/unfinished":  "#!/bin/sh",
 		"/opt/app/crlf.sh":     "#!/bin/sh\r\necho hi\n",
+		"/opt/app/report.awk":  "#!/usr/bin/awk -f\n{ print }\n",
 		// Materialized under the pod rootfs (a volume mounted at /etc/tool).
 		rootfs + "/etc/tool/run.sh":  "#!/bin/sh\necho hi\n",
 		rootfs + "/etc/tool/py.sh":   "#!/usr/bin/python3\n",
@@ -89,6 +89,14 @@ func TestExecRewriteFollowsShebangs(t *testing.T) {
 			[]string{"/bin/dash", "-c", "x"}, dir + "/dash", []string{"/bin/dash", "-c", "x"}},
 		{"direct env", dir, nil, "/usr/bin/env",
 			[]string{"/usr/bin/env", "FOO=1", "app"}, dir + "/env", []string{"/usr/bin/env", "FOO=1", "app"}},
+		{"direct tar (bare argv0 kept)", dir, nil, "/usr/bin/tar",
+			[]string{"tar", "xmf", "-", "-C", "/data"}, dir + "/tar", []string{"tar", "xmf", "-", "-C", "/data"}},
+		{"argv0-dispatch alias keeps its name", dir, nil, "/usr/bin/zcat",
+			[]string{"zcat", "f.gz"}, dir + "/gunzip", []string{"zcat", "f.gz"}},
+		{"#!/usr/bin/awk -f script: the awk copy, kernel argv shape", dir, nil, "/opt/app/report.awk",
+			[]string{"/opt/app/report.awk", "in.txt"}, dir + "/awk", []string{"/usr/bin/awk", "-f", "/opt/app/report.awk", "in.txt"}},
+		{"ShadowBinDir empty: awk script untouched", "", nil, "/opt/app/report.awk",
+			[]string{"/opt/app/report.awk"}, "", nil},
 		{"#!/bin/sh script", dir, nil, "/opt/app/entry.sh",
 			[]string{"/opt/app/entry.sh", "a", "b"}, dir + "/bash", []string{"/bin/sh", "/opt/app/entry.sh", "a", "b"}},
 		{"#!/usr/bin/env bash script", dir, nil, "/opt/app/envbash.sh",
@@ -225,28 +233,31 @@ func rootOwnedLstat(p string) (shadowStat, error) {
 	return st, err
 }
 
-// TestShadowMapMatchesInterposer pins the C interposer's k3sm_shadow_map to
-// the Go shadowCopies map by reading the source, so the spawn-time rewrite and
-// the in-pod rewrite cannot drift apart.
-func TestShadowMapMatchesInterposer(t *testing.T) {
-	// go test runs in the package directory: pkg/runtime -> the repo root.
-	src, err := os.ReadFile(filepath.Join("..", "..", "shim", "pathrebase_shim.c"))
-	if err != nil {
-		t.Fatal(err)
+// TestShadowRewriteCoversTheSet pins the runtime's rewrite to the shadowset
+// list, the same list the interposer's generated table is pinned to (pkg/
+// shadowset/gen TestShadowTableIsCurrent): every exec path of every entry is
+// rewritten to <dir>/<Copy> with argv unchanged (bar /bin/sh's argv[0]), and
+// an exec path the list does not name is left alone.
+func TestShadowRewriteCoversTheSet(t *testing.T) {
+	const dir = "/Library/k3sm/shadow"
+	notScript := func(string) ([]byte, error) { return machoMagic, nil }
+	for _, e := range shadowset.Entries() {
+		for _, h := range e.Hosts {
+			argv := []string{h, "-x", "y"}
+			got, ok := shadowRewrite(h, argv, execRewrite{dir: dir, readHead: notScript})
+			if !ok || got.path != filepath.Join(dir, e.Copy) {
+				t.Errorf("shadowRewrite(%s) = %q, %v; want %s", h, got.path, ok, filepath.Join(dir, e.Copy))
+				continue
+			}
+			if !slices.Equal(got.argv, argv) {
+				t.Errorf("shadowRewrite(%s) argv = %q, want it unchanged %q", h, got.argv, argv)
+			}
+		}
 	}
-	body := string(src)
-	start := strings.Index(body, "k3sm_shadow_map[] = {")
-	if start < 0 {
-		t.Fatal("k3sm_shadow_map not found in shim/pathrebase_shim.c")
-	}
-	end := strings.Index(body[start:], "};")
-	entry := regexp.MustCompile(`\{"([^"]+)", "([^"]+)"\}`)
-	got := map[string]string{}
-	for _, m := range entry.FindAllStringSubmatch(body[start:start+end], -1) {
-		got[m[1]] = m[2]
-	}
-	if !maps.Equal(got, shadowCopies) {
-		t.Errorf("interposer map %v != Go shadowCopies %v", got, shadowCopies)
+	for _, h := range []string{"/usr/bin/python3", "/usr/bin/true", "/bin/ps", "/usr/bin/curl", "/usr/local/bin/tar", "/bin//cat", "/usr/bin/../bin/tar"} {
+		if got, ok := shadowRewrite(h, []string{h}, execRewrite{dir: dir, readHead: notScript}); ok {
+			t.Errorf("shadowRewrite(%s) = %q, want untouched (not in the list)", h, got.path)
+		}
 	}
 }
 
@@ -336,7 +347,8 @@ func TestShadowRewriteReachesTheSpawn(t *testing.T) {
 // TestShimInactiveConditionFromCodeSignFlags proves the detection's wiring:
 // the flags read for the spawned pid after the exec become a
 // k3sm.io/shim-inactive condition on the pod status, naming both losses; a
-// clean process, a csops error and a pod with no shim requested produce none.
+// csops error is reported as an unknown load (as loud as an unloaded one); a
+// clean process and a pod with no shim requested produce none.
 func TestShimInactiveConditionFromCodeSignFlags(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -347,13 +359,14 @@ func TestShimInactiveConditionFromCodeSignFlags(t *testing.T) {
 		wantReason string
 		wantText   string
 	}{
-		{"platform binary", csPlatformBinary, nil, true, true, ShimInactiveReason, "CS_PLATFORM_BINARY"},
-		{"restricted", csRestrict, nil, true, true, ShimInactiveReason, "CS_RESTRICT"},
+		{"platform binary", supervisor.CSPlatformBinary, nil, true, true, ShimInactiveReason, "CS_PLATFORM_BINARY"},
+		{"restricted", supervisor.CSRestrict, nil, true, true, ShimInactiveReason, "CS_RESTRICT"},
 		{"platform binary that is also hardened keeps the restricted reason", 0x26010b01, nil, true, true, ShimInactiveReason, "CS_PLATFORM_BINARY|CS_RESTRICT"},
-		{"hardened runtime", csRuntime, nil, true, true, ShimInactiveHardenedReason, "com.apple.security.cs.allow-dyld-environment-variables"},
+		{"hardened runtime", supervisor.CSRuntime, nil, true, true, ShimInactiveHardenedReason, "com.apple.security.cs.allow-dyld-environment-variables"},
+		{"library validation", supervisor.CSRequireLV, nil, true, true, ShimInactiveLibraryValidationReason, "CS_REQUIRE_LV"},
 		{"re-signed copy", 0x22000201, nil, true, false, "", ""},
-		{"csops error is fail-open", 0, errors.New("ESRCH"), true, false, "", ""},
-		{"no shim requested: nothing to lose", csPlatformBinary, nil, false, false, "", ""},
+		{"csops error is an unknown load, reported", 0, errors.New("ESRCH"), true, true, ShimInactiveUnknownReason, "may be unavailable"},
+		{"no shim requested: nothing to lose", supervisor.CSPlatformBinary, nil, false, false, "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -520,10 +533,11 @@ func TestScriptEntrypointIsGatedOnItsInterpreter(t *testing.T) {
 		return p
 	}
 	shScript := write("entry.sh", "#!/bin/sh\necho hi\n", 0o755)
+	awkScript := write("report.awk", "#!/usr/bin/awk -f\n{ print }\n", 0o755)
 	pyScript := write("entry.py", "#!/usr/bin/python3\nprint(1)\n", 0o755)
 	bare := write("bare.sh", "echo no shebang\n", 0o755)
 	shadow := t.TempDir()
-	for _, n := range []string{"bash", "zsh", "dash", "env"} {
+	for _, n := range []string{"bash", "zsh", "dash", "env", "awk"} {
 		if err := os.WriteFile(filepath.Join(shadow, n), machoMagic, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -544,6 +558,14 @@ func TestScriptEntrypointIsGatedOnItsInterpreter(t *testing.T) {
 			"/bin/sh", []string{"/bin/sh", shScript, "a"}, "", false},
 		{"#!/usr/bin/python3: gated on python3, the script still exec'd", shadow, pyScript,
 			"/usr/bin/python3", []string{pyScript, "a"}, "", false},
+		// awk has a copy but is not a shell: with the set, rule 3 swaps in
+		// the copy (as the interposer does), gated on /usr/bin/awk; without
+		// it, the shell-only direct exec does NOT apply: the script is
+		// exec'd as itself, gated on awk, exactly as before awk had a copy.
+		{"#!/usr/bin/awk -f with a shadow set: the awk copy, gated on awk", shadow, awkScript,
+			"/usr/bin/awk", []string{filepath.Join(shadow, "awk"), "-f", awkScript, "a"}, "/usr/bin/awk", false},
+		{"#!/usr/bin/awk -f without a shadow set: the script exec'd, gated on awk", "", awkScript,
+			"/usr/bin/awk", []string{awkScript, "a"}, "", false},
 		{"no shebang: gated on the file itself, still rejected", shadow, bare,
 			bare, nil, "", true},
 	}

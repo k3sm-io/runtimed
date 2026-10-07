@@ -42,10 +42,14 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 	// Long-lived containers split by declaration list: an init-declared container
 	// (today only native sidecars are tracked long-lived from the init list)
 	// reports under init_container_statuses, mains under container_statuses.
+	// An ephemeral (debug) container reports under ephemeral_container_statuses.
 	for _, cp := range p.containers {
-		if cp.initDeclared {
+		switch {
+		case cp.ephemeral:
+			st.EphemeralContainerStatuses = append(st.EphemeralContainerStatuses, containerStatusOf(cp))
+		case cp.initDeclared:
 			st.InitContainerStatuses = append(st.InitContainerStatuses, containerStatusOf(cp))
-		} else {
+		default:
 			st.ContainerStatuses = append(st.ContainerStatuses, containerStatusOf(cp))
 		}
 	}

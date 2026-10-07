@@ -18,6 +18,7 @@ package sandbox
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -826,13 +827,17 @@ func TestGenerateDeniedUnixSockets(t *testing.T) {
 		})
 	}
 
-	// No configured sockets => no unix-socket rule at all.
+	// No configured sockets => no helper-socket rule; the one unix-socket rule
+	// left is the static resident-shim root deny every profile carries.
 	out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "unix-socket") {
-		t.Errorf("no denied sockets configured, but profile emits a unix-socket rule:\n%s", out)
+	if strings.Contains(out, "(remote unix-socket (literal") {
+		t.Errorf("no denied sockets configured, but profile emits a helper-socket rule:\n%s", out)
+	}
+	if n := strings.Count(out, "(remote unix-socket"); n != 2 {
+		t.Errorf("want exactly the two firmlink forms of the shim-root deny, got %d unix-socket rules:\n%s", n, out)
 	}
 }
 
@@ -1126,4 +1131,84 @@ func TestPodLogsRootDenied(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestGenerateSystemTLSConfigRead pins the system TLS configuration grant: a
+// read-only allow on /etc/ssl in both firmlink forms (libsandbox matches the
+// resolved /private/etc form), a read+write deny on its private-key subdir in
+// both forms emitted after every allow — including a caller's ExtraReadPaths
+// naming that very subdir — and no write allow anywhere under /etc/ssl.
+func TestGenerateSystemTLSConfigRead(t *testing.T) {
+	const allow = "(allow file-read*\n  (subpath \"/etc/ssl\")\n  (subpath \"/private/etc/ssl\")\n  )"
+	const deny = "(deny file-read* file-write*\n  (subpath \"/etc/ssl/private\")\n  (subpath \"/private/etc/ssl/private\")\n  )"
+	cases := []struct {
+		name      string
+		extraRead []string
+	}{
+		{"default", nil},
+		{"extra-read-names-private", []string{"/etc/ssl/private"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(&runtimev1.SandboxProfile{
+				DataVolumePath: "/var/lib/k3sm/pods/p/rootfs",
+				AllowNetwork:   true,
+				ExtraReadPaths: tc.extraRead,
+			}, GenerateOptions{})
+			if err != nil {
+				// validateExtraPaths does not protect /etc/ssl/private; the
+				// last-match-wins deny is what keeps it unreachable.
+				t.Fatalf("Generate: %v", err)
+			}
+			iAllow := strings.Index(out, allow)
+			iDeny := strings.Index(out, deny)
+			if iAllow < 0 || iDeny < 0 {
+				t.Fatalf("allow found=%v, private deny found=%v:\n%s", iAllow >= 0, iDeny >= 0, out)
+			}
+			if iDeny <= iAllow {
+				t.Errorf("private deny (%d) must follow the TLS read allow (%d)", iDeny, iAllow)
+			}
+			if iDeny < strings.LastIndex(out, ";; PROTECTED") {
+				t.Errorf("private deny (%d) must sit in the protected tier", iDeny)
+			}
+			for _, p := range tc.extraRead {
+				for _, form := range firmlinkForms(p) {
+					iExtra := strings.Index(out, fmt.Sprintf("  (subpath %q)\n", form))
+					if iExtra < 0 || iExtra >= iDeny {
+						t.Errorf("extra read allow %q at %d must precede the private deny at %d", form, iExtra, iDeny)
+					}
+				}
+			}
+			for _, form := range sbplForms(out) {
+				if strings.HasPrefix(form, "(allow") && strings.Contains(form, "file-write") && strings.Contains(form, "/etc/ssl") {
+					t.Errorf("a write allow names /etc/ssl:\n%s", form)
+				}
+			}
+		})
+	}
+}
+
+// sbplForms splits a rendered profile into its top-level forms: each starts at a
+// line beginning with "(" and runs until the next such line or comment line.
+func sbplForms(profile string) []string {
+	var forms []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			forms = append(forms, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, line := range strings.Split(profile, "\n") {
+		if strings.HasPrefix(line, "(") || strings.HasPrefix(line, ";;") {
+			flush()
+		}
+		if strings.HasPrefix(line, ";;") {
+			continue
+		}
+		cur.WriteString(line)
+		cur.WriteString("\n")
+	}
+	flush()
+	return forms
 }

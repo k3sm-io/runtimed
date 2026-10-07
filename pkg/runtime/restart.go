@@ -73,6 +73,12 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// The shared claim discipline (verbInFlightLocked): a stop that has claimed
 	// this container and not yet recorded its exit is concluding it, and a
 	// re-spawn now would install a replacement the stop then reports dead.
+	if oldCP.ephemeral {
+		// Ephemeral containers are never restarted (PodBox.ephemeral_containers).
+		p.mu.Unlock()
+		return restartFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			"restart %s/%s: ephemeral containers are never restarted", req.GetPodId(), oldCP.name), nil
+	}
 	if verbInFlightLocked(oldCP) == "stop" {
 		p.mu.Unlock()
 		refused := r.refuseInFlight("restart", req.GetPodId(), oldCP.name, "stop")

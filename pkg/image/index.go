@@ -334,11 +334,11 @@ type indexPlatform struct {
 
 func toIndexPlatform(p Platform) indexPlatform {
 	n := p.Normalize()
-	return indexPlatform{OS: n.OS, Architecture: n.Architecture, Variant: n.Variant, OSVersion: n.OSVersion}
+	return indexPlatform(n)
 }
 
 func (p indexPlatform) platform() Platform {
-	return Platform{OS: p.OS, Architecture: p.Architecture, Variant: p.Variant, OSVersion: p.OSVersion}.Normalize()
+	return Platform(p).Normalize()
 }
 
 // entryName is the file name for one (reference x platform) key: the hex sha256
