@@ -24,9 +24,10 @@ type Entry struct {
 	// symlink (/usr/bin/tar is one, so tar's Source is /usr/bin/bsdtar).
 	Source string
 	// Hosts are the exec paths swapped for the copy. A binary that
-	// dispatches on argv[0] (grep/egrep/zgrep, gunzip/zcat, test/[) lists
-	// every name that reaches the same file; the swap keeps argv[0], so the
-	// copy dispatches exactly as the host binary would.
+	// dispatches on argv[0] (grep/zgrep, gunzip/zcat) lists every name that
+	// reaches the same file; the swap keeps argv[0], so the copy dispatches
+	// exactly as the host binary would. macOS 27 split test/[ and grep/egrep
+	// into separate files, so each of those names has its own entry.
 	Hosts []string
 	// Shell marks the shell entries. The runtime keys its shell-only rules on
 	// it (a direct exec of a host-shell script interpreter, and its policy
@@ -57,11 +58,13 @@ var entries = []Entry{
 	{Copy: "chmod", Source: "/bin/chmod", Hosts: []string{"/bin/chmod"}},
 	{Copy: "ln", Source: "/bin/ln", Hosts: []string{"/bin/ln"}},
 	{Copy: "echo", Source: "/bin/echo", Hosts: []string{"/bin/echo"}},
-	{Copy: "test", Source: "/bin/test", Hosts: []string{"/bin/test", "/bin/["}},
+	{Copy: "test", Source: "/bin/test", Hosts: []string{"/bin/test"}},
+	{Copy: "[", Source: "/bin/[", Hosts: []string{"/bin/["}},
 	{Copy: "sleep", Source: "/bin/sleep", Hosts: []string{"/bin/sleep"}},
 	{Copy: "date", Source: "/bin/date", Hosts: []string{"/bin/date"}},
 	{Copy: "sed", Source: "/usr/bin/sed", Hosts: []string{"/usr/bin/sed"}},
-	{Copy: "grep", Source: "/usr/bin/grep", Hosts: []string{"/usr/bin/grep", "/usr/bin/egrep", "/usr/bin/zgrep"}},
+	{Copy: "grep", Source: "/usr/bin/grep", Hosts: []string{"/usr/bin/grep", "/usr/bin/zgrep"}},
+	{Copy: "egrep", Source: "/usr/bin/egrep", Hosts: []string{"/usr/bin/egrep"}},
 	{Copy: "fgrep", Source: "/usr/bin/fgrep", Hosts: []string{"/usr/bin/fgrep"}},
 	{Copy: "awk", Source: "/usr/bin/awk", Hosts: []string{"/usr/bin/awk"}},
 	{Copy: "tee", Source: "/usr/bin/tee", Hosts: []string{"/usr/bin/tee"}},
