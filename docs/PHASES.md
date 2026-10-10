@@ -778,6 +778,28 @@ phases:
             met: false
             check: "runtimed hack/ci.sh green incl. the new codegen-diff and link-guard stages; TestGuestBackendGeneralizationKeepsVMDispatch green; the ext4-cache tests pin the protected prefix and the hit-time digest check; the concurrent-ensure test pins the shared bound; a container-vm pod boots on a VZ Mac under hack/lab/m15.sh --core rungs 1–2 (label present, uname -sm = Linux aarch64 AND uname -r = the pinned kernel string)"
             method: integration
+  - id: M18
+    title: k3sm.app — the runtime side of the macOS app milestone (the exec shim under the hardened runtime)
+    status: todo
+    strategy: hard cut
+    depends_on: []
+    note: "Authoritative input: docs/m18-plan.md (workspace), adopting docs/menubar-plan.md Amendment A A13. runtimed owns one M18 deliverable; the milestone is tracked in k3sm."
+    subphases:
+      - id: M18.2
+        title: the exec shim's launch mode takes the pod environment over the stdin launch spec
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "A13. Serve mode already receives the pod environment over stdin (supervisor.ShimSpec) and spawns with an empty environ; launch mode (pkg/sandbox/execshim.go) still preserves envp, so a pod-supplied DYLD_INSERT_LIBRARIES may load into the shim before the credential drop and sandbox_apply. Moving launch mode to the same channel closes that and makes the shim hardened-runtime-safe with no allow-dyld-environment-variables entitlement. Runtimed-internal protocol, daemon and shim swapped together by an in-place install."
+        deliverables:
+          - id: M18.2-d1
+            done: false
+            desc: "B476 — launch mode spawns the shim with no DYLD_* in its environ and the pod still receives the k3sm-computed insert; a pod-set DYLD_INSERT_LIBRARIES naming a pod-rootfs dylib does not load into the shim (red before, green after)."
+        acceptance:
+          - id: M18.2-a1
+            met: false
+            check: "go test ./pkg/sandbox -run TestLaunchModeCarriesPodEnvInSpec passes, and the rig negative case shows the dylib's constructor marker absent from the shim."
+            method: integration
 ---
 
 # runtimed — Phase roadmap
@@ -1348,3 +1370,11 @@ run live on an entitled rig. That live run is now a COMMITTED, RE-RUNNABLE artif
 report — `a9`, `pkg/runtime.TestIntegrationVMBootSmoke*`, which skips unless `K3SM_CAP_VZ=1` and the
 helper it builds probes `Available()`:
 `K3SM_CAP_VZ=1 K3SM_VM_SMOKE_KERNEL=<Image> [K3SM_VM_SMOKE_MODULES=<a.ko:b.ko>] go test ./pkg/runtime/ -run TestIntegrationVMBootSmoke -v`.
+
+## M18 — k3sm.app: the runtime side ⬜
+`docs/m18-plan.md` is authoritative; the milestone is tracked in k3sm. runtimed's one deliverable
+is the exec shim's launch mode taking the pod environment over the stdin launch spec, as serve mode
+already does, so no `DYLD_*` reaches the shim's own environ and the shim runs under the hardened
+runtime without a dyld entitlement.
+
+### M18.2 — the exec shim's launch mode over the stdin spec ⬜
