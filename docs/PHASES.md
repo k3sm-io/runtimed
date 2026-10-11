@@ -3,7 +3,7 @@ repo: runtimed
 schema: phases/v1
 current_phase: M7
 updated: 2026-10-10
-updated_by: M19 encode (docs/m19-plan.md — the wasm RuntimeClass, runtimed slice)
+updated_by: M19 Amendment A (docs/m19-plan.md R3 — the opt-in module signature check; runtimed slice)
 
 phases:
   - id: M0
@@ -805,7 +805,7 @@ phases:
     status: todo
     strategy: "phased (named exception: multi-node launchd rolling restart)"
     depends_on: []
-    note: "Authoritative input: docs/m19-plan.md (workspace); the M19.0 spike's answers supersede the R-series where they conflict. A wasm pod is a native pod whose process is the k3sm-wasmhost sibling (R2). The engine is wasmtime via wasmtime-go (cgo) in a pinned fork under a documented replace (R6). runtimed owns the spike and M19.2."
+    note: "Authoritative input: docs/m19-plan.md (workspace); the M19.0 spike's answers supersede the R-series where they conflict. A wasm pod is a native pod whose process is the k3sm-wasmhost sibling (R2). The engine is wasmtime via wasmtime-go (cgo) in a pinned fork under a documented replace (R6). runtimed owns the spike and M19.2. Amendment A (2026-10-10): the module signature check is opt-in per pod under adhoc-ok (B503, M19.2-d4); require-signed and require-notarized stay refused."
     subphases:
       - id: M19.0
         title: spike — wasmtime-go v49 under the exec-shim chain (B494)
@@ -828,7 +828,7 @@ phases:
         strategy: hard cut
         depends_on:
           - apis:M19.1
-        note: "The native spine is reused verbatim (R2); the argv rewrite is built by one builder/parser pair in pkg/wasmhost shared with cmd/k3sm-wasmhost, and the wasmtime implementation is cgo-only behind that seam, imported by the helper alone (R5, R6). Wasm pods run only under SIGNATURE_POLICY_ADHOC_OK and are refused at translate under REQUIRE_SIGNED and REQUIRE_NOTARIZED (R3). The footprint sampler is the sole OOMKilled authority and StoreLimits is a runaway backstop above the pod limit (R8). Platform rows wasi/wasm32 plus aliases with UnpackPolicyFor(WASM) = SemanticsNative (R4); the backend requires Seatbelt AND the helper and refuses on loss (R1, R7). exec, interactive attach, ephemeral containers, exec probes and hooks are refused with FailedPrecondition + FAILURE_REASON_UNSUPPORTED (R9)."
+        note: "The native spine is reused verbatim (R2); the argv rewrite is built by one builder/parser pair in pkg/wasmhost shared with cmd/k3sm-wasmhost, and the wasmtime implementation is cgo-only behind that seam, imported by the helper alone (R5, R6). Wasm pods run only under SIGNATURE_POLICY_ADHOC_OK and are refused under REQUIRE_SIGNED and REQUIRE_NOTARIZED (R3); under adhoc-ok a pod that sets PodBox.wasm_signature gets a cosign key-based module check in resolveBinary on every start, bound to the digest that is materialized, and is refused with FAILURE_REASON_SIGNATURE_REJECTED when it fails (R3, Amendment A, B503). The footprint sampler is the sole OOMKilled authority and StoreLimits is a runaway backstop above the pod limit (R8). Platform rows wasi/wasm32 plus aliases with UnpackPolicyFor(WASM) = SemanticsNative (R4); the backend requires Seatbelt AND the helper and refuses on loss (R1, R7). exec, interactive attach, ephemeral containers, exec probes and hooks are refused with FailedPrecondition + FAILURE_REASON_UNSUPPORTED (R9)."
         deliverables:
           - id: M19.2-d1
             done: false
@@ -838,7 +838,10 @@ phases:
             desc: "B497 — cmd/k3sm-wasmhost and pkg/wasmhost/wasmtime (cgo, *_darwin.go) via the pinned fork github.com/k3sm-io/wasmtime-go/v49 under a documented replace; WASI p1 for core modules, WASI 0.2 (+ wasi:http incoming) for components; real-engine tests run through the spawned binary under a build tag."
           - id: M19.2-d3
             done: false
-            desc: "B498 — sandbox.FindWasmHost + WasmHostName; the SelectBackend case (WASM requires Seatbelt AND the helper, refuse on loss); the backendPlatforms rows (wasi/wasm32 + aliases) and UnpackPolicyFor(WASM) = SemanticsNative; the argv rewrite in startContainer; ConditionWasmBackendAvailable; the R3 policy refusal and the R9 exec/attach refusals; the StoreLimits backstop above the pod limit; a golden SBPL equality test."
+            desc: "B498 — sandbox.FindWasmHost + WasmHostName; the SelectBackend case (WASM requires Seatbelt AND the helper, refuse on loss); the backendPlatforms rows (wasi/wasm32 + aliases) and UnpackPolicyFor(WASM) = SemanticsNative; the argv rewrite in startContainer; ConditionWasmBackendAvailable; the R3 fail-closed rows that need no verifier (a wasm pod under REQUIRE_SIGNED or REQUIRE_NOTARIZED is refused before the argv rewrite) and the R9 exec/attach refusals; the StoreLimits backstop above the pod limit; a golden SBPL equality test."
+          - id: M19.2-d4
+            done: false
+            desc: "B503 — the opt-in cosign key-based module check (Amendment A): pkg/image.FetchSignature (a raw fetch of the signature artifact for the resolved digest, bypassing ingest and the platform policy; mirrors and cluster registries are transport, never identity; no-signature / unreachable / mismatched as distinct outcomes), the stdlib-only pkg/image/cosign verifier (every layer a candidate, payload digest-checked, strict base64 DER ECDSA P-256 over SHA-256 of the exact payload, critical.type and critical.image.docker-manifest-digest checked, RSA/Ed25519 rejected, 8 layers / 64 KiB / 4 KiB bounds), consumed through a consumer-defined ModuleVerifier in resolveBinary between Puller.Pull and MaterializeTree on every container start regardless of Fetched or the pull policy; the reap record carries wasm_signature; a positive (digest, key fingerprint) verification record for restarts with the registry unreachable; FAILURE_REASON_SIGNATURE_REJECTED with a pinned message per cause; a guard test that pkg/wasmhost imports neither pkg/image nor go-containerregistry."
         acceptance:
           - id: M19.2-a1
             met: false
@@ -848,6 +851,10 @@ phases:
             met: false
             check: "go test -tags wasmtime ./pkg/wasmhost -run TestSpawnedHostRunsHelloAndHTTPComponent passes on a dev Mac"
             method: integration
+          - id: M19.2-a3
+            met: false
+            check: "go test ./pkg/image -run 'TestWasmModuleSignatureVerify|TestFetchSignatureOutcomesAreDistinct' and go test ./pkg/runtime -run 'TestWasmModuleVerifiedOnCacheHit|TestWasmSignatureSurvivesRuntimedRestart' and go test ./pkg/wasmhost -run TestWasmhostImportsNoRegistryClient pass at CGO_ENABLED=1 (a cosign sign --key fixture verifies; tampered payload, wrong key, malformed key, non-P-256 key and another digest's signature each fail with a distinct error)"
+            method: unit
 ---
 
 # runtimed — Phase roadmap
@@ -1433,7 +1440,8 @@ A wasm pod is a native pod whose process is the `k3sm-wasmhost` sibling: the nat
 exec-shim chain, the sampler, `crilog`, the reap record) is reused verbatim, and the one wasm-specific
 step is an argv rewrite built by a `LaunchSpec` builder/parser pair in `pkg/wasmhost`. The engine is
 wasmtime via wasmtime-go (cgo) in a pinned fork under a documented `replace`, reachable only from the
-helper. Wasm runs only under `SIGNATURE_POLICY_ADHOC_OK`, the sampler alone decides `OOMKilled`, and
+helper. Wasm runs only under `SIGNATURE_POLICY_ADHOC_OK`, where a pod may opt into a cosign key-based check of
+its module image that refuses when it fails (Amendment A); the sampler alone decides `OOMKilled`, and
 exec/attach are refused. Strategy: phased (multi-node launchd rolling restart).
 
 ### M19.0 — spike ⬜
@@ -1443,3 +1451,4 @@ exec/attach are refused. Strategy: phased (multi-node launchd rolling restart).
 - ⬜ `M19.2-d1` B496 — `pkg/wasmhost`: `Engine`, the `LaunchSpec` pair, a fake engine, the import guard, the canary.
 - ⬜ `M19.2-d2` B497 — `cmd/k3sm-wasmhost` and `pkg/wasmhost/wasmtime` via the pinned fork.
 - ⬜ `M19.2-d3` B498 — `FindWasmHost`, the `SelectBackend` case, platform rows, argv rewrite, condition, refusals, golden SBPL.
+- ⬜ `M19.2-d4` B503 — the opt-in cosign module check: `FetchSignature`, `pkg/image/cosign`, the check in `resolveBinary` on every start, the reap-record field, the verification record (Amendment A).
