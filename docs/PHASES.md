@@ -808,7 +808,7 @@ phases:
     note: "Authoritative input: docs/m19-plan.md (workspace); the M19.0 spike's answers supersede the R-series where they conflict. A wasm pod is a native pod whose process is the k3sm-wasmhost sibling (R2). The engine is wasmtime via wasmtime-go (cgo) in a pinned fork under a documented replace (R6). runtimed owns the spike and M19.2."
     subphases:
       - id: M19.0
-        title: spike — wasmtime-go v49 under the exec-shim chain (B493)
+        title: spike — wasmtime-go v49 under the exec-shim chain (B494)
         status: todo
         strategy: hard cut
         depends_on: []
@@ -816,11 +816,11 @@ phases:
         deliverables:
           - id: M19.0-d1
             done: false
-            desc: "B493 — the spike: conf.h features and the libwasmtime.a sha256 against the upstream c-api asset (a), a WASI p1 hello under crilog (b), a wasi:http component on a post-sandbox pod-IP listener (c), Cranelift under Seatbelt for both signing variants (d), peak footprint/cold start/size (e), the sampler fires before StoreLimits (f), a wasi/wasm32 pull (g), SIGTERM and trap delivery (h), the p1 sock_accept preopen (i), -race viability (j); hack/acceptance/B493.sh --check parses the committed results table and ships red/green fixtures."
+            desc: "B494 — the spike: conf.h features and the libwasmtime.a sha256 against the upstream c-api asset (a), a WASI p1 hello under crilog (b), a wasi:http component on a post-sandbox pod-IP listener (c), Cranelift under Seatbelt for both signing variants (d), peak footprint/cold start/size (e), the sampler fires before StoreLimits (f), a wasi/wasm32 pull (g), SIGTERM and trap delivery (h), the p1 sock_accept preopen (i), -race viability (j); hack/acceptance/B494.sh --check parses the committed results table and ships red/green fixtures."
         acceptance:
           - id: M19.0-a1
             met: false
-            check: "runtimed/hack/acceptance/B493.sh --check exits 0 against the committed results table in docs/m19-plan.md with every row (a)..(j) carrying a verdict and an evidence sha256"
+            check: "runtimed/hack/acceptance/B494.sh --check exits 0 against the committed results table in docs/m19-plan.md with every row (a)..(j) carrying a verdict and an evidence sha256"
             method: integration
       - id: M19.2
         title: the wasm backend on the native spine — pkg/wasmhost, cmd/k3sm-wasmhost, SelectBackend, platform rows, refusals
@@ -832,13 +832,13 @@ phases:
         deliverables:
           - id: M19.2-d1
             done: false
-            desc: "B495 — pkg/wasmhost: the Engine interface, the LaunchSpec builder/parser pair shared with cmd/k3sm-wasmhost, a fake engine for unit tests, the import guard TestWasmtimeIsNotReachableFromTheDaemon with its converse leg at CGO_ENABLED=1, and the build-time canary (nm symbols, conf.h features, LC_BUILD_VERSION)."
+            desc: "B496 — pkg/wasmhost: the Engine interface, the LaunchSpec builder/parser pair shared with cmd/k3sm-wasmhost, a fake engine for unit tests, the import guard TestWasmtimeIsNotReachableFromTheDaemon with its converse leg at CGO_ENABLED=1, and the build-time canary (nm symbols, conf.h features, LC_BUILD_VERSION)."
           - id: M19.2-d2
             done: false
-            desc: "B496 — cmd/k3sm-wasmhost and pkg/wasmhost/wasmtime (cgo, *_darwin.go) via the pinned fork github.com/k3sm-io/wasmtime-go/v49 under a documented replace; WASI p1 for core modules, WASI 0.2 (+ wasi:http incoming) for components; real-engine tests run through the spawned binary under a build tag."
+            desc: "B497 — cmd/k3sm-wasmhost and pkg/wasmhost/wasmtime (cgo, *_darwin.go) via the pinned fork github.com/k3sm-io/wasmtime-go/v49 under a documented replace; WASI p1 for core modules, WASI 0.2 (+ wasi:http incoming) for components; real-engine tests run through the spawned binary under a build tag."
           - id: M19.2-d3
             done: false
-            desc: "B497 — sandbox.FindWasmHost + WasmHostName; the SelectBackend case (WASM requires Seatbelt AND the helper, refuse on loss); the backendPlatforms rows (wasi/wasm32 + aliases) and UnpackPolicyFor(WASM) = SemanticsNative; the argv rewrite in startContainer; ConditionWasmBackendAvailable; the R3 policy refusal and the R9 exec/attach refusals; the StoreLimits backstop above the pod limit; a golden SBPL equality test."
+            desc: "B498 — sandbox.FindWasmHost + WasmHostName; the SelectBackend case (WASM requires Seatbelt AND the helper, refuse on loss); the backendPlatforms rows (wasi/wasm32 + aliases) and UnpackPolicyFor(WASM) = SemanticsNative; the argv rewrite in startContainer; ConditionWasmBackendAvailable; the R3 policy refusal and the R9 exec/attach refusals; the StoreLimits backstop above the pod limit; a golden SBPL equality test."
         acceptance:
           - id: M19.2-a1
             met: false
@@ -1437,9 +1437,9 @@ helper. Wasm runs only under `SIGNATURE_POLICY_ADHOC_OK`, the sampler alone deci
 exec/attach are refused. Strategy: phased (multi-node launchd rolling restart).
 
 ### M19.0 — spike ⬜
-- ⬜ `M19.0-d1` B493 — the ten-question wasmtime-go v49 spike (a)..(j) and the `B493.sh --check` gate.
+- ⬜ `M19.0-d1` B494 — the ten-question wasmtime-go v49 spike (a)..(j) and the `B494.sh --check` gate.
 
 ### M19.2 — the wasm backend on the native spine ⬜
-- ⬜ `M19.2-d1` B495 — `pkg/wasmhost`: `Engine`, the `LaunchSpec` pair, a fake engine, the import guard, the canary.
-- ⬜ `M19.2-d2` B496 — `cmd/k3sm-wasmhost` and `pkg/wasmhost/wasmtime` via the pinned fork.
-- ⬜ `M19.2-d3` B497 — `FindWasmHost`, the `SelectBackend` case, platform rows, argv rewrite, condition, refusals, golden SBPL.
+- ⬜ `M19.2-d1` B496 — `pkg/wasmhost`: `Engine`, the `LaunchSpec` pair, a fake engine, the import guard, the canary.
+- ⬜ `M19.2-d2` B497 — `cmd/k3sm-wasmhost` and `pkg/wasmhost/wasmtime` via the pinned fork.
+- ⬜ `M19.2-d3` B498 — `FindWasmHost`, the `SelectBackend` case, platform rows, argv rewrite, condition, refusals, golden SBPL.
