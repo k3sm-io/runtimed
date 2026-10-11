@@ -2,8 +2,8 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M7
-updated: 2026-09-26
-updated_by: B409 write-back (restart one container of a re-attached pod in place)
+updated: 2026-10-10
+updated_by: M19 encode (docs/m19-plan.md — the wasm RuntimeClass, runtimed slice)
 
 phases:
   - id: M0
@@ -732,7 +732,7 @@ phases:
     strategy: phased (multi-node launchd rolling restart)
     depends_on:
       - apis:M15.1
-    note: "Authoritative input: docs/m15-plan.md (workspace) — Phase C encodes ONLY from that doc. M15.0 (the spike, B267 → runtimed#132) is DONE and its answers are binding: the standalone Command Line Tools Swift toolchain builds the helper (no Xcode.app), the framework's guest init has exec/stdio/signals/pty/stats/mounts/DNS but no multi-subscriber attach (the helper implements Attach itself, R5), PID 1 in the container is the workload (the boot rung discriminates on the guest kernel version string, R9), an ext4 root is built from k3sm's own unpacked tree in 49 ms (R3), the framework has no idmapped mounts so ownership is baked at build (R3), an unentitled launch throws a catchable error, the helper idles at 34.9 MiB RSS beside k3sm-vmhost's 25.9 MiB on the same experiment (R8), and the k3sm-built kernel from the framework's config boots it (R12). The helper is a parallel implementation of pkg/vmhost's invariants, not reuse (kept identical by the shared refusal rungs), and a host-side PARSER of guest-influenced bytes where k3sm-vmhost is a relay — named, hardened, and confined (R4/R10). 2026-09-24: the d4 phrase 'sidecar apply' covered only the write side when this row flipped done; the guest-side ownership apply landed separately with the B-item that found the gap."
+    note: "Authoritative input: docs/m15-plan.md (workspace) — Phase C encodes ONLY from that doc. M15.0 (the spike, B267 → runtimed#132) is DONE and its answers are binding: the standalone Command Line Tools Swift toolchain builds the helper (no Xcode.app), the framework's guest init has exec/stdio/signals/pty/stats/mounts/DNS but no multi-subscriber attach (the helper implements Attach itself, R5), PID 1 in the container is the workload (the boot rung discriminates on the guest kernel version string, R9), an ext4 root is built from k3sm's own unpacked tree in 49 ms (R3), the framework has no idmapped mounts so ownership is baked at build (R3), an unentitled launch throws a catchable error, the helper idles at 34.9 MiB RSS beside k3sm-vmhost's 25.9 MiB on the same experiment (R8), and the k3sm-built kernel from the framework's config boots it (R12). The helper is a parallel implementation of pkg/vmhost's invariants, not reuse (kept identical by the shared refusal rungs), and a host-side PARSER of guest-influenced bytes where k3sm-vmhost is a relay — named, hardened, and confined (R4/R10). 2026-09-24: the d4 phrase 'sidecar apply' covered only the write side when this row flipped done; the guest-side ownership apply landed separately with the B-item that found the gap. Amended 2026-10-10: SANDBOX_BACKEND_CONTAINER_VM is 6; M19 (the wasm RuntimeClass) took 5 first (docs/m19-plan.md R1)."
     subphases:
       - id: M15.0
         title: spike — a Swift helper boots a Linux container VM on the Containerization package (B267)
@@ -799,6 +799,54 @@ phases:
           - id: M18.2-a1
             met: false
             check: "go test ./pkg/sandbox -run TestLaunchModeCarriesPodEnvInSpec passes, and the rig negative case shows the dylib's constructor marker absent from the shim."
+            method: integration
+  - id: M19
+    title: wasm RuntimeClass — the runtime side (k3sm-wasmhost, the wasmtime engine seam, the native-spine wasm pod)
+    status: todo
+    strategy: "phased (named exception: multi-node launchd rolling restart)"
+    depends_on: []
+    note: "Authoritative input: docs/m19-plan.md (workspace); the M19.0 spike's answers supersede the R-series where they conflict. A wasm pod is a native pod whose process is the k3sm-wasmhost sibling (R2). The engine is wasmtime via wasmtime-go (cgo) in a pinned fork under a documented replace (R6). runtimed owns the spike and M19.2."
+    subphases:
+      - id: M19.0
+        title: spike — wasmtime-go v49 under the exec-shim chain (B493)
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "The ten questions (a)..(j) of m19-plan §Spike questions, run on a lab Mac as _k3sm; results are folded into the plan by the orchestrator."
+        deliverables:
+          - id: M19.0-d1
+            done: false
+            desc: "B493 — the spike: conf.h features and the libwasmtime.a sha256 against the upstream c-api asset (a), a WASI p1 hello under crilog (b), a wasi:http component on a post-sandbox pod-IP listener (c), Cranelift under Seatbelt for both signing variants (d), peak footprint/cold start/size (e), the sampler fires before StoreLimits (f), a wasi/wasm32 pull (g), SIGTERM and trap delivery (h), the p1 sock_accept preopen (i), -race viability (j); hack/acceptance/B493.sh --check parses the committed results table and ships red/green fixtures."
+        acceptance:
+          - id: M19.0-a1
+            met: false
+            check: "runtimed/hack/acceptance/B493.sh --check exits 0 against the committed results table in docs/m19-plan.md with every row (a)..(j) carrying a verdict and an evidence sha256"
+            method: integration
+      - id: M19.2
+        title: the wasm backend on the native spine — pkg/wasmhost, cmd/k3sm-wasmhost, SelectBackend, platform rows, refusals
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M19.1
+        note: "The native spine is reused verbatim (R2); the argv rewrite is built by one builder/parser pair in pkg/wasmhost shared with cmd/k3sm-wasmhost, and the wasmtime implementation is cgo-only behind that seam, imported by the helper alone (R5, R6). Wasm pods run only under SIGNATURE_POLICY_ADHOC_OK and are refused at translate under REQUIRE_SIGNED and REQUIRE_NOTARIZED (R3). The footprint sampler is the sole OOMKilled authority and StoreLimits is a runaway backstop above the pod limit (R8). Platform rows wasi/wasm32 plus aliases with UnpackPolicyFor(WASM) = SemanticsNative (R4); the backend requires Seatbelt AND the helper and refuses on loss (R1, R7). exec, interactive attach, ephemeral containers, exec probes and hooks are refused with FailedPrecondition + FAILURE_REASON_UNSUPPORTED (R9)."
+        deliverables:
+          - id: M19.2-d1
+            done: false
+            desc: "B495 — pkg/wasmhost: the Engine interface, the LaunchSpec builder/parser pair shared with cmd/k3sm-wasmhost, a fake engine for unit tests, the import guard TestWasmtimeIsNotReachableFromTheDaemon with its converse leg at CGO_ENABLED=1, and the build-time canary (nm symbols, conf.h features, LC_BUILD_VERSION)."
+          - id: M19.2-d2
+            done: false
+            desc: "B496 — cmd/k3sm-wasmhost and pkg/wasmhost/wasmtime (cgo, *_darwin.go) via the pinned fork github.com/k3sm-io/wasmtime-go/v49 under a documented replace; WASI p1 for core modules, WASI 0.2 (+ wasi:http incoming) for components; real-engine tests run through the spawned binary under a build tag."
+          - id: M19.2-d3
+            done: false
+            desc: "B497 — sandbox.FindWasmHost + WasmHostName; the SelectBackend case (WASM requires Seatbelt AND the helper, refuse on loss); the backendPlatforms rows (wasi/wasm32 + aliases) and UnpackPolicyFor(WASM) = SemanticsNative; the argv rewrite in startContainer; ConditionWasmBackendAvailable; the R3 policy refusal and the R9 exec/attach refusals; the StoreLimits backstop above the pod limit; a golden SBPL equality test."
+        acceptance:
+          - id: M19.2-a1
+            met: false
+            check: "go test ./pkg/wasmhost -run TestWasmtimeIsNotReachableFromTheDaemon and go test ./pkg/runtime -run TestCreateWasmPod_NativeSpineWithHostArgv pass at CGO_ENABLED=1"
+            method: unit
+          - id: M19.2-a2
+            met: false
+            check: "go test -tags wasmtime ./pkg/wasmhost -run TestSpawnedHostRunsHelloAndHTTPComponent passes on a dev Mac"
             method: integration
 ---
 
@@ -1378,3 +1426,20 @@ already does, so no `DYLD_*` reaches the shim's own environ and the shim runs un
 runtime without a dyld entitlement.
 
 ### M18.2 — the exec shim's launch mode over the stdin spec ⬜
+
+## M19 — wasm RuntimeClass: the runtime side ⬜
+`docs/m19-plan.md` is authoritative; the spike's answers supersede its R-series where they conflict.
+A wasm pod is a native pod whose process is the `k3sm-wasmhost` sibling: the native spine (SBPL, the
+exec-shim chain, the sampler, `crilog`, the reap record) is reused verbatim, and the one wasm-specific
+step is an argv rewrite built by a `LaunchSpec` builder/parser pair in `pkg/wasmhost`. The engine is
+wasmtime via wasmtime-go (cgo) in a pinned fork under a documented `replace`, reachable only from the
+helper. Wasm runs only under `SIGNATURE_POLICY_ADHOC_OK`, the sampler alone decides `OOMKilled`, and
+exec/attach are refused. Strategy: phased (multi-node launchd rolling restart).
+
+### M19.0 — spike ⬜
+- ⬜ `M19.0-d1` B493 — the ten-question wasmtime-go v49 spike (a)..(j) and the `B493.sh --check` gate.
+
+### M19.2 — the wasm backend on the native spine ⬜
+- ⬜ `M19.2-d1` B495 — `pkg/wasmhost`: `Engine`, the `LaunchSpec` pair, a fake engine, the import guard, the canary.
+- ⬜ `M19.2-d2` B496 — `cmd/k3sm-wasmhost` and `pkg/wasmhost/wasmtime` via the pinned fork.
+- ⬜ `M19.2-d3` B497 — `FindWasmHost`, the `SelectBackend` case, platform rows, argv rewrite, condition, refusals, golden SBPL.
