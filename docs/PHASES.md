@@ -790,7 +790,7 @@ phases:
         status: todo
         strategy: hard cut
         depends_on: []
-        note: "A13. Serve mode already receives the pod environment over stdin (supervisor.ShimSpec) and spawns with an empty environ; launch mode (pkg/sandbox/execshim.go) still preserves envp, so a pod-supplied DYLD_INSERT_LIBRARIES may load into the shim before the credential drop and sandbox_apply. Moving launch mode to the same channel closes that and makes the shim hardened-runtime-safe with no allow-dyld-environment-variables entitlement. Runtimed-internal protocol, daemon and shim swapped together by an in-place install."
+        note: "A13. Serve mode already receives the pod environment over stdin (supervisor.ShimSpec) and spawns with an empty environ; launch mode (pkg/sandbox/execshim.go) still preserves envp, so a pod-supplied DYLD_INSERT_LIBRARIES may load into the shim before the credential drop and sandbox_apply. Moving launch mode (and the serve shim's own hop into it) to an empty environ with the env on a dedicated spec fd closes that, so no pod-chosen library loads before confinement. Exec sessions forked by a resident shim keep the container env in their environ, because the path interposer must rewrite the session's own exec of tar for kubectl cp; that process is already confined, so it is not a pre-confinement load, but it means the shim is not yet hardened-runtime-safe without the allow-dyld-environment-variables entitlement for exec sessions. Runtimed-internal protocol, daemon and shim swapped together by an in-place install."
         deliverables:
           - id: M18.2-d1
             done: false
