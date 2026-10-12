@@ -20,6 +20,7 @@ package execshim
 
 import (
 	"errors"
+	"fmt"
 	"os"
 
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -46,10 +47,14 @@ func (sessionSeam) SandboxApply() error { return nil }
 // (sandbox.ShimProfile) is what admits the call; a refusal is the session's
 // error. It returns only on error.
 //
-// It is reachable as a confined exec session only through a resident shim; a
-// caller that runs it directly gets an unconfined process, which that caller
-// could have started without it.
+// It is reachable only as a confined exec session: it refuses to run unless
+// this process is already sandboxed (requireConfined), because it keeps the
+// environment it was started with, and outside a resident shim's confinement
+// a library that environment names would load unconfined.
 func RunExecSession(rlimits, qos string, argv []string) error {
+	if err := requireConfined(selfSandboxed); err != nil {
+		return err
+	}
 	if len(argv) == 0 {
 		return errors.New("execshim: empty argv")
 	}
@@ -74,4 +79,23 @@ func RunExecSession(rlimits, qos string, argv []string) error {
 	seam := sessionSeam{&podLaunchSeam{path: path, argv: execArgv, env: env}}
 	_, err = supervisor.RunLaunchSequence(seam, supervisor.LaunchSpec{Rlimits: plan, BgQoS: bg}, os.Geteuid())
 	return err
+}
+
+// errExecUnconfined refuses an exec session in a process no sandbox confines.
+var errExecUnconfined = errors.New("execshim: exec mode runs only inside a resident shim's sandbox; this process is not sandboxed")
+
+// requireConfined fails closed unless sandboxed reports this process already
+// sandboxed: exec mode is forked by a resident shim after its sandbox_apply,
+// and that is the only state in which its inherited environment is safe. A
+// non-root uid is not accepted instead: in the shipped unprivileged posture
+// the daemon itself is non-root, so the uid says nothing about confinement.
+func requireConfined(sandboxed func() (bool, error)) error {
+	ok, err := sandboxed()
+	if err != nil {
+		return fmt.Errorf("execshim: check the exec session's confinement: %w", err)
+	}
+	if !ok {
+		return errExecUnconfined
+	}
+	return nil
 }

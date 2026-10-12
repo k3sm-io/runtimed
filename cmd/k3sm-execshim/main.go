@@ -40,7 +40,9 @@ limitations under the License.
 //
 // exec keeps the container's environment in its environ: it is only ever
 // forked by a resident shim that has already dropped and confined itself, so
-// nothing the environment loads runs ahead of the session's confinement.
+// nothing the environment loads runs ahead of the session's confinement. It
+// checks that (sandbox_check on itself) before anything else and refuses to
+// run unsandboxed (exit 4).
 //
 // # serve: the resident shim
 //
