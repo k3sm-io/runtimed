@@ -313,8 +313,11 @@ func TestIntegrationLaunchShimNeverLoadsPodDylib(t *testing.T) {
 	if err := os.WriteFile(dySrc, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A missing clang FAILS this test rather than skipping it: it is the
+	// real-shim negative case of the empty-environ launch, and an integration
+	// run that silently skipped it would report that property green.
 	if out, err := exec.Command("clang", "-dynamiclib", "-o", dylib, dySrc).CombinedOutput(); err != nil {
-		t.Skipf("clang unavailable to build dylib (%v): %s", err, out)
+		t.Fatalf("build the marker dylib (clang is required): %v: %s", err, out)
 	}
 	pod := filepath.Join(work, "podbin")
 	podSrc := filepath.Join(work, "pod.c")
@@ -322,7 +325,7 @@ func TestIntegrationLaunchShimNeverLoadsPodDylib(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("clang", "-o", pod, podSrc).CombinedOutput(); err != nil {
-		t.Skipf("clang unavailable to build pod (%v): %s", err, out)
+		t.Fatalf("build the pod binary (clang is required): %v: %s", err, out)
 	}
 	if out, err := exec.Command("codesign", "-s", "-", "-f", pod).CombinedOutput(); err != nil {
 		t.Fatalf("codesign pod: %v\n%s", err, out)
