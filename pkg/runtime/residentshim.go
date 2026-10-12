@@ -171,8 +171,9 @@ func removeShimDirs(dirs map[string]string) {
 type shimLaunchPlan struct {
 	podID, container string
 	shimPath         string
-	shimArgv         []string // WrapCommand's argv: [shim, launch, <tokens>...]
-	env, execEnv     []string
+	shimArgv         []string // WrapCommand's argv: [shim, launch, spec=4, <tokens>...]
+	env              []string
+	argv0            string
 	workingDir       string
 	logPath          string
 }
@@ -185,7 +186,9 @@ type shimLaunchPlan struct {
 // the cleanup extended to the shim profile.
 //
 // The shim is spawned with an EMPTY environment: the pod environment, DYLD
-// interposes included, reaches only the container, over the shim's stdin.
+// interposes included, crosses over the shim's stdin, and the shim spawns the
+// container's launch-mode shim with an empty environment too, handing it on as
+// the launch payload (supervisor.ShimSpec.ContainerSpawn).
 func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, cleanup func() error) (*supervisor.Process, func() error, error) {
 	w, err := crilog.Open(plan.logPath)
 	if err != nil {
@@ -196,10 +199,12 @@ func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, clean
 	if err != nil {
 		return nil, cleanup, err
 	}
-	if len(plan.shimArgv) < 3 {
+	if len(plan.shimArgv) < 4 || plan.shimArgv[1] != supervisor.ShimModeLaunch || plan.shimArgv[2] != supervisor.LaunchSpecToken {
 		return nil, cleanup, fmt.Errorf("unexpected exec-shim argv %q", plan.shimArgv)
 	}
-	launch := plan.shimArgv[2:]
+	// ShimSpec.Launch is the argv after the mode and spec tokens; the shim
+	// adds both back when it spawns the container.
+	launch := plan.shimArgv[3:]
 	podProfile := launch[5]
 	shimProfile := podProfile + ".shim.sb"
 	if err := os.WriteFile(shimProfile, []byte(shimText), 0o600); err != nil {
@@ -222,7 +227,7 @@ func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, clean
 				ShimProfile: shimProfile,
 				Launch:      launch,
 				Env:         plan.env,
-				ExecEnv:     plan.execEnv,
+				Argv0:       plan.argv0,
 				ExecDir:     plan.workingDir,
 			},
 			Dialer:    r.shimDialer,

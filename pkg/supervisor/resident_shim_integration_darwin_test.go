@@ -97,7 +97,7 @@ func startResidentShimQoS(t *testing.T, bg bool) residentShim {
 		supervisor.SpawnSpec{Path: shim, Argv: []string{shim, supervisor.ShimModeServe}, Env: []string{}, Dir: dataVol},
 		supervisor.ShimLaunch{
 			Spec: supervisor.ShimSpec{Container: "c", Dir: dir, LogPath: logPath, ShimProfile: shimProfile,
-				Launch: launch, Env: env, ExecEnv: env, ExecDir: dataVol},
+				Launch: launch, Env: env, ExecDir: dataVol},
 			Dialer:    supervisor.UnixShimDialer{},
 			ProcStart: supervisor.ProcStartTimeNano,
 			Kill:      supervisor.SignalGroup,

@@ -37,7 +37,10 @@ limitations under the License.
 //   - Backend is the swappable application seam. The host-process implementation
 //     is a non-PLATFORM exec-shim: a tiny ad-hoc-signed helper (cmd/k3sm-execshim)
 //     that compiles+applies the profile via libsandbox in-process, then
-//     execve(pod, argv, envp) preserving envp. It deliberately does not use
+//     execve(pod, argv, envp) with envp built from the launch payload it read
+//     on an inherited descriptor (the shim's own environ is empty, so a
+//     pod-set DYLD_INSERT_LIBRARIES reaches the pod, never the unconfined
+//     shim). It deliberately does not use
 //     Apple's /usr/bin/sandbox-exec, which is a platform binary that strips
 //     DYLD_* from the environment and would break the DNS shim (Wave-0
 //     confirmed this live). The backend is OS-version-gated and FAILS closed:

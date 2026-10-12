@@ -22,7 +22,9 @@ limitations under the License.
 // RunPodLaunch, in the irreversible order supervisor.RunLaunchSequence enforces, drops
 // to the pod's securityContext identity (setgid→initgroups→setuid), compiles and
 // applies an SBPL profile to the current process via the private libsandbox SPI,
-// and then execve's the pod binary, preserving the environment.
+// and then execve's the pod binary with the pod's environment, which it received
+// as a supervisor.LaunchPayload on an inherited descriptor (its own environ is
+// empty, so nothing the pod's environment names loads before confinement).
 //
 // This is the only place the libsandbox cgo lives (execshim_darwin.go); it is
 // linked into the cmd/k3sm-execshim helper. The helper is the sandbox.Backend

@@ -21,6 +21,7 @@ package execshim
 /*
 #cgo LDFLAGS: -lsandbox
 #include <stdlib.h>
+#include <unistd.h>
 
 // Private, deprecated libsandbox SPI — not declared in the public <sandbox.h>.
 // Modern libsandbox.1.dylib signatures (validated on macOS 26.5.1, arm64):
@@ -31,6 +32,18 @@ package execshim
 extern void *sandbox_compile_string(const char *data, void *params, char **error);
 extern int   sandbox_apply(void *profile);
 extern void  sandbox_free_error(char *error);
+
+// sandbox_check is private libsandbox SPI too (variadic, not in the public
+// <sandbox.h>). Called with a NULL operation and SANDBOX_FILTER_NONE (0) it
+// reports whether pid runs under a sandbox: 1 when it does, 0 when it does
+// not (measured on macOS 27: 0 before sandbox_apply, 1 after), -1 on
+// error. Canaried with the others in internal/spicanary.
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+
+// k3sm_self_sandboxed wraps the variadic call, which cgo cannot make.
+static int k3sm_self_sandboxed(void) {
+	return sandbox_check(getpid(), NULL, 0);
+}
 
 // k3sm_apply_sbpl compiles `profile` and applies it to the current process.
 // Returns 0 on success. On failure returns non-zero and sets *errmsg to a
@@ -82,4 +95,17 @@ func confine(profile string) error {
 		return fmt.Errorf("libsandbox apply failed (rc=%d)", int(rc))
 	}
 	return fmt.Errorf("libsandbox apply failed (rc=%d): %s", int(rc), msg)
+}
+
+// selfSandboxed reports whether this process already runs under a Seatbelt
+// sandbox (sandbox_check on itself).
+func selfSandboxed() (bool, error) {
+	switch rc := C.k3sm_self_sandboxed(); rc {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, fmt.Errorf("sandbox_check on self returned %d", int(rc))
+	}
 }

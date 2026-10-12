@@ -1556,7 +1556,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// and qos decision (one supervisor.LaunchSpec), then wrap the command so
 	// the spawned exec-shim applies the limits, drops to the identity, backgrounds
 	// itself if BestEffort, confines itself to the profile, and then execs the pod
-	// binary — in that irreversible order. env is preserved.
+	// binary — in that irreversible order. The shim starts with an empty
+	// environment; env reaches the pod binary as the launch payload.
 	cred := resolveCredential(p.box, c)
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, execArgv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
@@ -1609,12 +1610,6 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		instance = onDisk
 	}
 	logPath := filepath.Join(logDir, containerLogFile(instance))
-	spawnEnv := env
-	if argv0 != "" {
-		// The exec-shim substitutes it and strips it, so the container's
-		// environment (cp.env, what an Exec session enters) never carries it.
-		spawnEnv = append(append([]string{}, env...), supervisor.ExecArgv0Env+"="+argv0)
-	}
 	// A container's output goes either to its resident shim, which writes the
 	// CRI log itself and outlives this daemon, or — for a backend whose helper
 	// cannot stay resident — through pipes into a log writer held here.
@@ -1632,7 +1627,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		proc, cleanup, err = r.spawnBesideShim(p, shimLaunchPlan{
 			podID: p.box.GetPodId(), container: c.GetName(),
 			shimPath: shimPath, shimArgv: shimArgv,
-			env: spawnEnv, execEnv: env, workingDir: workingDir, logPath: logPath,
+			env: env, argv0: argv0, workingDir: workingDir, logPath: logPath,
 		}, shimDir, cleanup)
 		if err != nil {
 			_ = cleanup()
@@ -1646,11 +1641,14 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 				fmt.Errorf("open container log for %s: %w", c.GetName(), err)
 		}
 		fanout = &logFanout{}
+		// An EMPTY environment: env and the argv[0] override reach the
+		// exec-shim as its launch payload, never through its own environ.
 		proc = supervisor.NewProcess(r.spawner, r.waiter, supervisor.SpawnSpec{
-			Path: shimPath,
-			Argv: shimArgv,
-			Env:  spawnEnv,
-			Dir:  workingDir,
+			Path:   shimPath,
+			Argv:   shimArgv,
+			Env:    []string{},
+			Launch: &supervisor.LaunchPayload{Env: env, Argv0: argv0},
+			Dir:    workingDir,
 		}, containerLogSink(logw, fanout))
 	}
 	closeLog := func() {

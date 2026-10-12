@@ -21,15 +21,20 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // buildExecShim builds and ad-hoc signs the k3sm-execshim helper for the ambient
@@ -109,20 +114,26 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Shim contract: launch <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary>...
-	// "-1 -1 -" requests no privilege drop (run as the test/daemon identity); the
-	// two launch-spec tokens are the empty sentinels supervisor.EncodeRlimits(nil)
-	// and EncodeQoS(false) both emit — no setrlimit plan, no background QoS. They
-	// sit before the profile path so binary skew fails closed (execshim.go).
-	full := append([]string{"launch", "-1", "-1", "-", "-", "-", pf}, argv...)
+	// Shim contract: launch spec=4 <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary>...
+	// spec=4 names the launch payload (env reaches the pod through it, never the
+	// shim's own environ). "-1 -1 -" requests no privilege drop (run as the
+	// test/daemon identity); the two launch-spec tokens are the empty sentinels
+	// supervisor.EncodeRlimits(nil) and EncodeQoS(false) both emit — no setrlimit
+	// plan, no background QoS. They sit before the profile path so binary skew
+	// fails closed (execshim.go).
+	full := append([]string{"launch", supervisor.LaunchSpecToken, "-1", "-1", "-", "-", "-", pf}, argv...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shim, full...)
-	cmd.Env = env
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{Env: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	err := cmd.Run()
+	err = cmd.Run()
 	return buf.String(), err
 }
 
@@ -280,6 +291,130 @@ func TestIntegrationDYLDPreserved(t *testing.T) {
 	}
 	if !strings.Contains(out, "MARKER-CONSTRUCTOR-RAN") {
 		t.Errorf("DYLD insert dylib constructor did not run under the shim.\noutput:\n%s", out)
+	}
+}
+
+// TestIntegrationLaunchShimNeverLoadsPodDylib is the rig negative case of the
+// empty-environ launch, runnable without root: a DYLD_INSERT_LIBRARIES the pod
+// sets names a library whose constructor appends getprogname() to a marker
+// file. Through the real exec-shim, the pod binary must load it (the env still
+// reaches the pod) and the shim — unconfined and not yet dropped when dyld
+// runs — must not. Before the payload channel the shim held the pod's
+// environment in its own environ and the marker named k3sm-execshim.
+func TestIntegrationLaunchShimNeverLoadsPodDylib(t *testing.T) {
+	shim := buildExecShim(t)
+	posture, work := podVolume(t, "pod-dyld-neg")
+	marker := filepath.Join(work, "marker.txt")
+
+	dylib := filepath.Join(work, "libpodmarker.dylib")
+	dySrc := filepath.Join(work, "podmarker.c")
+	src := "#include <fcntl.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n" +
+		"__attribute__((constructor)) static void mark(void){" +
+		"int fd=open(\"" + marker + "\",O_WRONLY|O_APPEND|O_CREAT,0644);" +
+		"if(fd<0)return;const char*n=getprogname();write(fd,n,strlen(n));write(fd,\"\\n\",1);close(fd);}\n"
+	if err := os.WriteFile(dySrc, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A missing clang FAILS this test rather than skipping it: it is the
+	// real-shim negative case of the empty-environ launch, and an integration
+	// run that silently skipped it would report that property green.
+	if out, err := exec.Command("clang", "-dynamiclib", "-o", dylib, dySrc).CombinedOutput(); err != nil {
+		t.Fatalf("build the marker dylib (clang is required): %v: %s", err, out)
+	}
+	pod := filepath.Join(work, "podbin")
+	podSrc := filepath.Join(work, "pod.c")
+	if err := os.WriteFile(podSrc, []byte("int main(void){return 0;}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("clang", "-o", pod, podSrc).CombinedOutput(); err != nil {
+		t.Fatalf("build the pod binary (clang is required): %v: %s", err, out)
+	}
+	if out, err := exec.Command("codesign", "-s", "-", "-f", pod).CombinedOutput(); err != nil {
+		t.Fatalf("codesign pod: %v\n%s", err, out)
+	}
+
+	profile := genProfile(t, posture, work, "/private/tmp", "/private/var/folders", work)
+	env := []string{"PATH=/usr/bin:/bin", "DYLD_INSERT_LIBRARIES=" + dylib}
+	if out, err := runUnderShim(t, shim, profile, env, pod); err != nil {
+		t.Fatalf("pod under shim failed: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("no marker: the pod never loaded its own DYLD insert (%v)", err)
+	}
+	loaders := strings.Fields(string(data))
+	if !slices.Contains(loaders, "podbin") {
+		t.Errorf("marker = %q: the pod binary did not load its DYLD insert", loaders)
+	}
+	if slices.Contains(loaders, ExecShimName) {
+		t.Errorf("marker = %q: the pod's DYLD insert loaded into the exec-shim before its confinement", loaders)
+	}
+}
+
+// TestIntegrationLaunchHandOffsDoNotReachThePod runs a pod through the real
+// exec-shim in launch mode with every hand-off in use (the exec-sync pipe on
+// fd 3, an argv[0] override, the payload on fd 4) and checks what the pod
+// process sees: neither fd 3 nor fd 4 open, no K3SM_EXEC_* variable, its
+// own environment intact, and the override as its $0. The daemon's read end
+// of the exec-sync pipe reaches EOF at the exec.
+func TestIntegrationLaunchHandOffsDoNotReachThePod(t *testing.T) {
+	shim := buildExecShim(t)
+	posture, work := podVolume(t, "pod-handoffs")
+	profile := genProfile(t, posture, work, "/private/tmp", "/private/var/folders", work)
+	pf := filepath.Join(t.TempDir(), "profile.sb")
+	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The probe dups each descriptor (a redirection, no file access), so the
+	// pod profile cannot hide an open one; fd 1 is the positive control.
+	const script = `for fd in 1 3 4; do ( : >&$fd ) 2>/dev/null && echo FD$fd-OPEN; done; ` +
+		`env | grep '^K3SM_EXEC' ; echo "ZERO=$0 POD=$POD_VAR"`
+	argv := []string{"launch", supervisor.LaunchSpecToken, "-1", "-1", "-", "-", "-", pf, "/bin/sh", "-c", script}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shim, argv...)
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{
+		Env:      []string{"PATH=/usr/bin:/bin", "POD_VAR=kept"},
+		Argv0:    "podsh",
+		ExecSync: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	syncR, syncW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syncR.Close() }()
+	cmd.ExtraFiles[supervisor.ExecSyncChildFD-3] = syncW
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	_ = syncW.Close()
+	if err := syncR.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := syncR.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("exec-sync read = (%d, %v), want EOF at the pod's exec", n, err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("pod under shim: %v\n%s", err, buf.String())
+	}
+	out := buf.String()
+	for _, leak := range []string{"FD3-OPEN", "FD4-OPEN", "K3SM_EXEC"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("the pod sees a launch hand-off (%s):\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, "FD1-OPEN") {
+		t.Fatalf("the descriptor probe does not see the pod's own stdout; it proves nothing:\n%s", out)
+	}
+	if !strings.Contains(out, "ZERO=podsh POD=kept") {
+		t.Errorf("the pod's argv[0] override or environment did not arrive:\n%s", out)
 	}
 }
 

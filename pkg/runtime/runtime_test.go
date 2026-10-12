@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -319,10 +320,31 @@ func (n *recordingNetwork) teardownCalls() []string {
 	return append([]string{}, n.teardowns...)
 }
 
+// podEnvSpawn is how every recording spawner in these tests takes a spawn. It
+// enforces the empty-environ rule: a launch-spec spawn (SpawnSpec.Launch) whose
+// own Env is not empty, and a launch-mode exec-shim spawn without a payload,
+// both fail the spawn. For a launch-spec spawn the returned spec's Env is the
+// payload's environment, the one the pod binary receives, so assertions about
+// the pod's environment read spec.Env unchanged.
+func podEnvSpawn(spec supervisor.SpawnSpec) (supervisor.SpawnSpec, error) {
+	if len(spec.Argv) > 1 && spec.Argv[1] == supervisor.ShimModeLaunch && spec.Launch == nil {
+		return spec, fmt.Errorf("a launch-mode spawn without a launch payload: %q", spec.Argv)
+	}
+	if spec.Launch != nil {
+		if len(spec.Env) != 0 {
+			return spec, fmt.Errorf("%w: %q", supervisor.ErrLaunchEnviron, spec.Env)
+		}
+		spec.Env = spec.Launch.Env
+	}
+	return spec, nil
+}
+
 // fakeSpawner returns sequential pids and records argv/env. With logLine set it
 // also plays that line into the child's stdout pipe and closes both write ends,
 // so the supervisor's pumps see real bytes and then a real EOF — which is what
 // makes the container's log FILE observable in a unit test.
+//
+// It records every spawn through podEnvSpawn (the empty-environ rule).
 type fakeSpawner struct {
 	mu      sync.Mutex
 	next    int
@@ -344,6 +366,10 @@ func (f *fakeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, 
 		if werr := writeToStreamDup(spec.StdoutFD, f.logLine); werr != nil {
 			return 0, werr
 		}
+	}
+	spec, err := podEnvSpawn(spec)
+	if err != nil {
+		return 0, err
 	}
 	f.specs = append(f.specs, spec)
 	f.next++

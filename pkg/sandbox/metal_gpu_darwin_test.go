@@ -30,6 +30,8 @@ import (
 
 	"k3sm.io/apis/k3smtest"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // Environment knobs the LAB HARNESS sets to run this gate. They are declared
@@ -254,18 +256,22 @@ func execGPUScript(t *testing.T, shim, profile string, env []string, dataVol, py
 	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Shim contract: launch <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <binary>...
-	argv := []string{"launch", "-1", "-1", "-", "-", "-", pf, python, path}
+	// Shim contract: launch spec=4 <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <binary>...
+	argv := []string{"launch", supervisor.LaunchSpecToken, "-1", "-1", "-", "-", "-", pf, python, path}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shim, argv...)
-	cmd.Env = env
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{Env: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 	// CWD inside the pod's own writable volume — a denied cwd kills the interpreter
 	// during import, with an error that points nowhere near the sandbox.
 	cmd.Dir = dataVol
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	err := cmd.Run()
+	err = cmd.Run()
 	return buf.String(), err
 }

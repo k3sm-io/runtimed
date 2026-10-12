@@ -21,9 +21,28 @@ limitations under the License.
 // (supervisor.ShimModeLaunch, ShimModeServe, ShimModeExec); a missing or unknown
 // token is a usage error (exit 2), so an argv of the pre-mode shape fails closed.
 //
-//	k3sm-execshim launch <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]
+//	k3sm-execshim launch spec=4 <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]
 //	k3sm-execshim serve            (launch spec on stdin; see supervisor.ShimSpec)
 //	k3sm-execshim exec <rlimits> <qos> <command> [args...]
+//
+// # The empty environment
+//
+// launch starts with an EMPTY environment. The pod's environment, its argv[0]
+// override and the exec-sync flag arrive as a supervisor.LaunchPayload on fd 4
+// (supervisor.LaunchSpecChildFD), named by the required spec=4 token
+// (supervisor.LaunchSpecToken), read to EOF under a size bound and closed
+// before anything else happens. The shim never holds the pod's environment in
+// its own environ, so a DYLD_INSERT_LIBRARIES the pod sets cannot load into this
+// unconfined, not-yet-dropped process; the pod's envp is built from the payload
+// only at the exec, after the drop and the sandbox. A missing token is a usage
+// error (exit 2); a missing or non-pipe fd 4, or a truncated, oversized,
+// malformed or other-version payload, is exit 5.
+//
+// exec keeps the container's environment in its environ: it is only ever
+// forked by a resident shim that has already dropped and confined itself, so
+// nothing the environment loads runs ahead of the session's confinement. It
+// checks that (sandbox_check on itself) before anything else and refuses to
+// run unsandboxed (exit 4).
 //
 // # serve: the resident shim
 //
@@ -61,7 +80,7 @@ limitations under the License.
 // was handed.
 //
 // Exit codes: 2 usage/credential, 3 profile read, 4 launch-sequence failure,
-// 5 launch-spec token decode failure; serve adds supervisor.ShimExitSpec,
+// 5 launch-spec token or launch payload decode failure; serve adds supervisor.ShimExitSpec,
 // ShimExitSunPath and ShimExitSetup for a failure before it serves.
 //
 // The launch mode then, in the SECURITY-critical order
@@ -75,17 +94,19 @@ limitations under the License.
 //	(4) applies the SBPL profile to itself via libsandbox (irreversible — a
 //	    sandboxed/uid-dropped process can neither setuid nor chown, so the drop
 //	    must precede this);
-//	(5) execve's the pod binary, preserving the inherited environment — so
-//	    DYLD_INSERT_LIBRARIES (the darwin-net DNS-shim enabler) survives into the
-//	    pod. This is deliberately not /usr/bin/sandbox-exec: that platform binary
-//	    strips DYLD_* (Wave-0 confirmed this live), which would break the shim.
+//	(5) execve's the pod binary with the pod's environment from the launch
+//	    payload — so DYLD_INSERT_LIBRARIES (the darwin-net DNS-shim enabler)
+//	    reaches the pod. This is deliberately not /usr/bin/sandbox-exec: that
+//	    platform binary strips DYLD_* (Wave-0 confirmed this live), which would
+//	    break the shim.
 //	    The exec is posix_spawn(POSIX_SPAWN_SETEXEC) carrying the pcontrol-KILL
 //	    attribute (a plain execve clears that mark), falling back to execve.
 //
 // # exec: a session inside the shim's confinement
 //
 // An exec session a resident shim serves runs as exec mode: it applies the
-// pod's rlimit plan and QoS band and execs the command marked pcontrol-KILL. It
+// pod's rlimit plan and QoS band and execs the command marked pcontrol-KILL,
+// with the environment it was started with. It
 // drops nothing and applies no profile: it was forked by the confined shim and
 // inherits its confinement (a second sandbox_apply fails on macOS), and the
 // shim already runs as the pod's credential. A bare command name is searched on
@@ -103,7 +124,7 @@ limitations under the License.
 //
 // The shim must be ad-hoc signed with hardened-runtime and library-validation
 // STRIPPED (codesign -s - -f, no -o runtime/library) so a later DYLD insert can
-// load. It fails closed: any error dropping privilege, compiling/applying the
+// load into the pod binary it execs. It fails closed: any error dropping privilege, compiling/applying the
 // profile, or before exec aborts — the pod never runs unconfined or with the
 // wrong identity.
 package main
@@ -149,11 +170,19 @@ func main() {
 // launch is the container launch sequence (launch mode); it returns only on
 // failure, with the exit code.
 func launch(args []string) int {
-	// args: <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]
-	if len(args) < 7 {
-		fmt.Fprintf(os.Stderr, "usage: %s launch <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]\n", os.Args[0])
+	// args: spec=4 <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]
+	if len(args) < 8 || args[0] != supervisor.LaunchSpecToken {
+		fmt.Fprintf(os.Stderr, "usage: %s launch %s <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...]\n", os.Args[0], supervisor.LaunchSpecToken)
 		return 2
 	}
+	// The payload first, before any other work: the descriptor is read to EOF
+	// and closed, and a bad payload execs nothing.
+	payload, err := supervisor.ReadLaunchPayload(supervisor.LaunchSpecChildFD)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "k3sm-execshim: read launch payload: %v\n", err)
+		return 5
+	}
+	args = args[1:]
 	cred, err := supervisor.ParseCredential(args[0], args[1], args[2])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "k3sm-execshim: parse credential: %v\n", err)
@@ -184,7 +213,7 @@ func launch(args []string) int {
 	// profile, and execs argv (in that irreversible order); it returns only on
 	// error.
 	spec := supervisor.LaunchSpec{Cred: cred, Rlimits: plan, BgQoS: bgQoS}
-	if err := execshim.RunPodLaunch(string(profile), argv, spec); err != nil {
+	if err := execshim.RunPodLaunch(string(profile), argv, spec, payload); err != nil {
 		fmt.Fprintf(os.Stderr, "k3sm-execshim: %v\n", err)
 		return 4
 	}

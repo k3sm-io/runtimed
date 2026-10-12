@@ -29,8 +29,9 @@ import (
 )
 
 // ExecShimName is the basename of the ad-hoc-signed helper that applies a pod's
-// Seatbelt profile in-process (via libsandbox) and then execs the pod binary,
-// preserving the environment. The runtime ships this beside its own binary.
+// Seatbelt profile in-process (via libsandbox) and then execs the pod binary
+// with the pod's environment, which it receives as a launch payload rather
+// than in its own environ. The runtime ships this beside its own binary.
 const ExecShimName = "k3sm-execshim"
 
 // ErrShimNotFound reports that the k3sm-execshim helper could not be located.
@@ -65,10 +66,11 @@ const ProfileTempPattern = "k3sm-sbpl-*.sb"
 
 // ExecShimBackend confines pods with a non-PLATFORM exec-shim: it spawns the
 // ad-hoc-signed k3sm-execshim helper, which compiles+applies the per-pod SBPL
-// via libsandbox and then execve(pod, argv, envp). Because the shim is an
-// ordinary ad-hoc-signed binary (not a platform binary) and the supervisor
-// passes envp through, DYLD_INSERT_LIBRARIES survives into the pod — the
-// cross-repo DNS-shim enabler that /usr/bin/sandbox-exec would break.
+// via libsandbox and then execve(pod, argv, envp). The shim itself starts with
+// an empty environment; envp is the pod's environment from the launch payload
+// (supervisor.LaunchPayload), so DYLD_INSERT_LIBRARIES reaches the pod — the
+// cross-repo DNS-shim enabler that /usr/bin/sandbox-exec would break — and
+// never loads into the unconfined shim.
 //
 // The backend is OS-version-gated via Available; the supervisor must refuse to
 // start a pod when Available is false (fail closed, never run unconfined).
@@ -158,19 +160,26 @@ func (b *ExecShimBackend) Available() bool {
 // under the backend's staging dir (<root>/sbpl, created on demand), and returns
 // the shim path plus argv:
 //
-//	[shimPath, launch, <uid>, <gid>, <groups-csv>, <rlimits>, <qos>, profilePath, pod, args...]
+//	[shimPath, launch, spec=4, <uid>, <gid>, <groups-csv>, <rlimits>, <qos>, profilePath, pod, args...]
 //
 // where launch (supervisor.ShimModeLaunch) selects the shim's launch mode (a
-// shim handed an argv without a mode token refuses it, exit 2), the three
-// credential tokens (spec.Cred.ShimArgs) tell the shim which
-// identity to drop to, and the rlimit + qos tokens (supervisor.EncodeRlimits /
-// EncodeQoS, "-" sentinels when empty) carry the resolved numeric setrlimit(2)
-// plan and the darwin background-QoS decision. The two launch-spec tokens sit
-// before the profile path so binary skew fails closed: an old shim reads the
-// rlimit token as its profile path and aborts on the ReadFile. The spawned shim
-// applies the limits, drops to the credential, backgrounds itself if requested,
-// applies profile to itself, and execs pod with args — in that irreversible
-// order — preserving envp. cleanup removes the staged profile file.
+// shim handed an argv without a mode token refuses it, exit 2), spec=4
+// (supervisor.LaunchSpecToken) says the pod's environment is the launch
+// payload on supervisor.LaunchSpecChildFD, the three credential tokens
+// (spec.Cred.ShimArgs) tell the shim which identity to drop to, and the
+// rlimit + qos tokens (supervisor.EncodeRlimits / EncodeQoS, "-" sentinels when
+// empty) carry the resolved numeric setrlimit(2) plan and the darwin
+// background-QoS decision. The two launch-spec tokens sit before the profile
+// path so binary skew fails closed: an old shim reads the rlimit token as its
+// profile path and aborts on the ReadFile. The spec token sits directly after
+// the mode for the same reason (see supervisor.LaunchSpecToken).
+//
+// The caller spawns the result with an EMPTY environment and the pod's
+// environment as the payload: SpawnSpec.Launch for a posix_spawn, or
+// supervisor.AttachLaunchPayload for an exec.Cmd. The spawned shim applies the
+// limits, drops to the credential, backgrounds itself if requested, applies
+// profile to itself, and execs pod with args and the payload's environment —
+// in that irreversible order. cleanup removes the staged profile file.
 func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, nil, err
@@ -206,8 +215,8 @@ func (b *ExecShimBackend) WrapCommand(ctx context.Context, profile string, argv 
 	}
 
 	credArgs := spec.Cred.ShimArgs() // [uid, gid, groups]
-	args := make([]string, 0, len(argv)+len(credArgs)+5)
-	args = append(args, b.shimPath, supervisor.ShimModeLaunch)
+	args := make([]string, 0, len(argv)+len(credArgs)+6)
+	args = append(args, b.shimPath, supervisor.ShimModeLaunch, supervisor.LaunchSpecToken)
 	args = append(args, credArgs...)
 	args = append(args, supervisor.EncodeRlimits(spec.Rlimits), supervisor.EncodeQoS(spec.BgQoS))
 	args = append(args, profilePath)

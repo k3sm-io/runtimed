@@ -33,6 +33,7 @@ package spicanary
 extern void *sandbox_compile_string(const char *data, void *params, char **error);
 extern int   sandbox_apply(void *profile);
 extern void  sandbox_free_error(char *error);
+extern int   sandbox_check(pid_t pid, const char *operation, int type, ...);
 
 // k3sm_sandbox_symbols returns a non-zero value built from the symbol addresses,
 // so the references cannot be optimized away.
@@ -41,6 +42,7 @@ static uintptr_t k3sm_sandbox_symbols(void) {
 	s ^= (uintptr_t)&sandbox_compile_string;
 	s ^= (uintptr_t)&sandbox_apply;
 	s ^= (uintptr_t)&sandbox_free_error;
+	s ^= (uintptr_t)&sandbox_check;
 	return s;
 }
 

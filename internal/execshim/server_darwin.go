@@ -244,7 +244,14 @@ func (s *shimServer) Exec(stream shimv1.ContainerShim_ExecServer) error {
 	}
 	args := append([]string{supervisor.ShimModeExec, s.spec.Launch[3], s.spec.Launch[4]}, cmdv...)
 	cmd := exec.CommandContext(stream.Context(), s.self, args...)
-	cmd.Env = s.spec.ExecEnv
+	// Exec mode keeps the container's environment in its environ, unlike
+	// launch mode: it is forked by this shim after the drop and the sandbox,
+	// so a library its environment names loads under exactly the credential
+	// and confinement the session's own code runs under, with no window
+	// before them. The pod's path interposer loading here is also what
+	// rewrites a session's exec of a host tool (kubectl cp's tar) to its
+	// re-signed copy and rebases mount paths in exec targets.
+	cmd.Env = s.spec.Env
 	cmd.Dir = s.spec.ExecDir
 	onStart := func(pid int) {
 		s.sessMu.Lock()

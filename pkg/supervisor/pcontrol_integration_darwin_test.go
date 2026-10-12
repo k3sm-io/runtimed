@@ -78,7 +78,36 @@ func podProfile(t *testing.T, podID string) (string, string) {
 // shimArgv is the launch-mode exec-shim argv for a no-drop, no-limit,
 // default-QoS pod.
 func shimArgv(shim, profile string, pod ...string) []string {
-	return append([]string{shim, supervisor.ShimModeLaunch, "-1", "-1", "-", "-", "-", profile}, pod...)
+	return append([]string{shim, supervisor.ShimModeLaunch, supervisor.LaunchSpecToken, "-1", "-1", "-", "-", "-", profile}, pod...)
+}
+
+// isShimLaunch reports whether argv runs the exec-shim's launch mode, which
+// takes its environment as a launch payload, never as its own environ.
+func isShimLaunch(argv []string) bool {
+	return len(argv) > 1 && argv[1] == supervisor.ShimModeLaunch
+}
+
+// shimCommand builds an os/exec command for a launch-mode shim argv with env
+// as its launch payload; the shim itself starts with an empty environment.
+func shimCommand(t *testing.T, argv, env []string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{Env: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(release)
+	return cmd
+}
+
+// command builds an os/exec command for argv, attaching this process's
+// environment as the launch payload when argv is a launch-mode shim.
+func command(t *testing.T, argv []string) *exec.Cmd {
+	t.Helper()
+	if !isShimLaunch(argv) {
+		return exec.Command(argv[0], argv[1:]...)
+	}
+	return shimCommand(t, argv, os.Environ())
 }
 
 // comm returns pid's kernel command name, or "" when it cannot be read.
@@ -114,8 +143,11 @@ func awaitComm(t *testing.T, pid int, want string) {
 // a group SIGKILL plus a reap.
 func spawnMarked(t *testing.T, argv []string) int {
 	t.Helper()
-	pid, err := supervisor.PosixSpawner{PressureKill: true}.Spawn(context.Background(),
-		supervisor.SpawnSpec{Path: argv[0], Argv: argv, Env: os.Environ()})
+	spec := supervisor.SpawnSpec{Path: argv[0], Argv: argv, Env: os.Environ()}
+	if isShimLaunch(argv) {
+		spec.Env, spec.Launch = []string{}, &supervisor.LaunchPayload{Env: os.Environ()}
+	}
+	pid, err := supervisor.PosixSpawner{PressureKill: true}.Spawn(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("Spawn %v: %v", argv, err)
 	}
@@ -132,7 +164,7 @@ func spawnMarked(t *testing.T, argv []string) int {
 // and registers a kill plus a wait.
 func startUnderOSExec(t *testing.T, argv []string) int {
 	t.Helper()
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := command(t, argv)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %v: %v", argv, err)
 	}
@@ -275,8 +307,7 @@ int main(void) {
 		t.Skipf("clang unavailable to build the helper (%v): %s", err, out)
 	}
 
-	argv := shimArgv(shim, profile, helper)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := command(t, shimArgv(shim, profile, helper))
 	var buf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf
 	if err := cmd.Run(); err != nil {

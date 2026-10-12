@@ -83,7 +83,6 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"strconv"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -94,25 +93,29 @@ import (
 // podLaunchSeam is the production supervisor.LaunchSeam. It embeds the supervisor
 // UnixDropper for the three drop steps (setgid / initgroups / setuid via
 // golang.org/x/sys/unix) and adds the two exec-shim-local steps: SandboxApply
-// (apply the SBPL via libsandbox, irreversible) and Exec (execve the pod binary,
-// preserving the environment). supervisor.RunLaunchSequence drives them in the
+// (apply the SBPL via libsandbox, irreversible) and Exec (exec the pod binary
+// with the pod's envp). supervisor.RunLaunchSequence drives them in the
 // mandated order.
 type podLaunchSeam struct {
 	supervisor.UnixDropper
 	profile string
-	// path is the file execve'd; argv is what the pod sees. They differ only
-	// when the daemon handed an argv[0] override (supervisor.ExecArgv0Env).
+	// path is the file exec'd; argv is what the pod sees. They differ only
+	// when the daemon handed an argv[0] override (LaunchPayload.Argv0).
 	path string
 	argv []string
+	// env is the pod's environment from the launch payload. It is held as Go
+	// strings and turned into the C envp only inside Exec, after the drop and
+	// the sandbox; it is never set in this process's own environ.
+	env []string
 }
 
 // SandboxApply confines the current process to the per-pod SBPL profile. After it
 // returns nil the process is irreversibly sandboxed.
 func (s *podLaunchSeam) SandboxApply() error { return confine(s.profile) }
 
-// Exec replaces the process image with the pod binary, preserving the inherited
-// environment (so DYLD_INSERT_LIBRARIES survives into the pod). It returns only
-// on error.
+// Exec replaces the process image with the pod binary, handing it the pod's
+// environment from the launch payload (so DYLD_INSERT_LIBRARIES reaches the
+// pod, and never this shim). It returns only on error.
 //
 // It first clears the thread's signal mask so the pod does not inherit a BLOCKED
 // signal (esp. SIGTERM): execve preserves the calling thread's mask, and by this
@@ -150,11 +153,10 @@ func (s *podLaunchSeam) Exec() error {
 		// Diagnostic: confirms the inherited-blocked-SIGTERM mechanism on hardware.
 		fmt.Fprintln(os.Stderr, "k3sm-execshim: cleared a blocked signal mask before exec (SIGTERM was blocked)")
 	}
-	env := os.Environ()
-	if !hasNUL(s.path, s.argv, env) {
-		_ = execMarked(s.path, s.argv, env) // returns only on failure; fall back below
+	if !hasNUL(s.path, s.argv, s.env) {
+		_ = execMarked(s.path, s.argv, s.env) // returns only on failure; fall back below
 	}
-	if err := unix.Exec(s.path, s.argv, env); err != nil {
+	if err := unix.Exec(s.path, s.argv, s.env); err != nil {
 		return fmt.Errorf("execve %s: %w", s.path, err)
 	}
 	return nil // unreachable on success
@@ -198,22 +200,23 @@ func freeCStrings(v []*C.char) {
 
 // RunPodLaunch becomes a confined, privilege-dropped pod process: it applies
 // spec's decoded rlimit plan, drops to spec.Cred (when Drop), backgrounds itself
-// (when spec.BgQoS), applies the SBPL profile, and execve's argv — in the
-// SECURITY-critical order supervisor.RunLaunchSequence enforces (setrlimit →
-// setgid→initgroups→setuid → setpriority → sandbox_apply → exec). The exec
-// marks the pod pcontrol-KILL (see podLaunchSeam.Exec). spec is the
-// launch spec main() decoded from the shim argv (supervisor.ParseCredential /
-// ParseRlimits / ParseQoS — a decode failure is fatal before this is reached, so
-// the plan handed here is exactly what the daemon resolved). It returns only on
-// error; a successful exec never returns. The ordering rationale lives at
-// supervisor.RunLaunchSequence (the single source of truth, also unit-tested
-// there with a recording seam).
-func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec) error {
+// (when spec.BgQoS), applies the SBPL profile, and execs argv with the pod's
+// environment from payload — in the SECURITY-critical order
+// supervisor.RunLaunchSequence enforces (setrlimit → setgid→initgroups→setuid →
+// setpriority → sandbox_apply → exec). The exec marks the pod pcontrol-KILL
+// (see podLaunchSeam.Exec). spec is the launch spec main() decoded from the
+// shim argv (supervisor.ParseCredential / ParseRlimits / ParseQoS) and payload
+// the one it read from supervisor.LaunchSpecChildFD — a decode failure of
+// either is fatal before this is reached, so the plan handed here is exactly
+// what the daemon resolved. It returns only on error; a successful exec never
+// returns. The ordering rationale lives at supervisor.RunLaunchSequence (the
+// single source of truth, also unit-tested there with a recording seam).
+func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec, payload supervisor.LaunchPayload) error {
 	if len(argv) == 0 {
 		return errors.New("execshim: empty argv")
 	}
-	path, execArgv := takeExecHandoff(argv)
-	seam := &podLaunchSeam{profile: profile, path: path, argv: execArgv}
+	path, execArgv, env := takeExecHandoff(argv, payload)
+	seam := &podLaunchSeam{profile: profile, path: path, argv: execArgv, env: env}
 	// euid is the shim's own effective uid (== the daemon's). RunLaunchSequence
 	// refuses a drop when it is non-root, so an unprivileged _k3sm daemon fails
 	// closed rather than attempting a doomed setuid.
@@ -221,31 +224,17 @@ func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec) err
 	return err
 }
 
-// takeExecHandoff consumes the two daemon-to-shim environment hand-offs and
-// removes both variables, so the pod's environment never carries them. It
-// returns the file to exec (always argv[0], as the daemon resolved it) and the
-// argv the pod sees.
+// takeExecHandoff applies the daemon's two typed hand-offs from payload and
+// returns the file to exec (always argv[0], as the daemon resolved it), the
+// argv the pod sees, and the pod's environment.
 //
-//   - supervisor.ExecSyncFDEnv names the inherited exec-sync descriptor; it is
+//   - ExecSync: the exec-sync descriptor (supervisor.ExecSyncChildFD) is
 //     marked close-on-exec so the daemon's read end sees EOF exactly when the
-//     pod binary replaces this process (supervisor.Process.ObserveExec). Only
-//     the agreed descriptor number is honoured: a mismatched value is ignored
-//     rather than closing some other inherited descriptor.
-//   - supervisor.ExecArgv0Env replaces argv[0] (a re-signed shell copy run as
-//     "sh"). An empty value is ignored.
-func takeExecHandoff(argv []string) (string, []string) {
-	if v, ok := os.LookupEnv(supervisor.ExecSyncFDEnv); ok {
-		_ = os.Unsetenv(supervisor.ExecSyncFDEnv)
-		if fd, err := strconv.Atoi(v); err == nil && fd == supervisor.ExecSyncChildFD {
-			unix.CloseOnExec(fd)
-		}
+//     pod binary replaces this process (supervisor.Process.ObserveExec).
+//   - Argv0 replaces argv[0] (a re-signed shell copy run as "sh").
+func takeExecHandoff(argv []string, payload supervisor.LaunchPayload) (string, []string, []string) {
+	if payload.ExecSync {
+		unix.CloseOnExec(supervisor.ExecSyncChildFD)
 	}
-	execArgv := argv
-	if v, ok := os.LookupEnv(supervisor.ExecArgv0Env); ok {
-		_ = os.Unsetenv(supervisor.ExecArgv0Env)
-		if v != "" {
-			execArgv = append([]string{v}, argv[1:]...)
-		}
-	}
-	return argv[0], execArgv
+	return payload.PodExec(argv)
 }
