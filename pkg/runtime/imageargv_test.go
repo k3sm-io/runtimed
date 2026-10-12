@@ -328,7 +328,7 @@ type statSigner struct {
 	signed  []string
 }
 
-func (s *statSigner) Sign(_ context.Context, path string) error {
+func (s *statSigner) Sign(_ context.Context, _, path string) error {
 	s.mu.Lock()
 	s.signed = append(s.signed, path)
 	s.mu.Unlock()

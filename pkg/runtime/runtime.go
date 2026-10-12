@@ -97,9 +97,13 @@ type Unpacker interface {
 // require-signed/require-notarized so a real signature is never silently
 // downgraded.
 type Signer interface {
-	// Sign ad-hoc signs the Mach-O at path (codesign -s - -f, no hardened
-	// runtime) so a later DYLD insert can load.
-	Sign(ctx context.Context, path string) error
+	// Sign ad-hoc signs the Mach-O at path, which lies inside the pod rootfs
+	// rootfs (codesign -s - -f, no hardened runtime) so a later DYLD insert can
+	// load. A symlinked path is resolved inside rootfs and the file it names is
+	// signed. It must never write an existing inode in place: a running process
+	// may have it mapped, and re-signing a mapped Mach-O in place gets every
+	// later exec of it killed.
+	Sign(ctx context.Context, rootfs, path string) error
 	// Check enforces policy against path's signature, fail-closed on UNSPECIFIED.
 	Check(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error
 }
@@ -823,7 +827,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	signer := deps.Signer
 	if signer == nil {
-		signer = defaultSigner{}
+		signer = defaultSigner{staging: cache.SignStagingDir()}
 	}
 	backend := deps.Backend
 	if backend == nil {
@@ -1060,11 +1064,17 @@ func (r *Runtime) exitObservationGrace() time.Duration {
 }
 
 // defaultSigner is the production Signer backed by the image package's codesign
-// tooling and the SignaturePolicy gate.
-type defaultSigner struct{}
+// tooling and the SignaturePolicy gate. staging is the daemon-private directory
+// the signed copy is made in (image.Cache.SignStagingDir).
+type defaultSigner struct {
+	staging string
+}
 
-func (defaultSigner) Sign(ctx context.Context, path string) error {
-	return image.AdHocSign(ctx, path)
+// Sign signs a copy in the staging dir and renames it over the file path
+// resolves to inside rootfs (image.AdHocSignByReplace), so the inode a
+// still-running container instance maps is never rewritten.
+func (s defaultSigner) Sign(ctx context.Context, rootfs, path string) error {
+	return image.AdHocSignByReplace(ctx, s.staging, rootfs, path)
 }
 
 func (defaultSigner) Check(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error {

@@ -74,7 +74,7 @@ type policySigner struct {
 	deny     bool
 }
 
-func (s *policySigner) Sign(context.Context, string) error { return nil }
+func (s *policySigner) Sign(context.Context, string, string) error { return nil }
 
 func (s *policySigner) Check(_ context.Context, policy runtimev1.SignaturePolicy, path string) error {
 	s.mu.Lock()

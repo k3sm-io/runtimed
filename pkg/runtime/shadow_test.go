@@ -489,7 +489,7 @@ type gateRecorder struct {
 	asked []string
 }
 
-func (g *gateRecorder) Sign(context.Context, string) error { return nil }
+func (g *gateRecorder) Sign(context.Context, string, string) error { return nil }
 
 func (g *gateRecorder) Check(_ context.Context, _ runtimev1.SignaturePolicy, path string) error {
 	g.mu.Lock()

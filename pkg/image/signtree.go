@@ -76,6 +76,14 @@ func (CodesignTreeSigner) VerifyArch(ctx context.Context, path, arch string) (bo
 
 // Sign ad-hoc signs path (AdHocSign: no hardened runtime, no library validation, so
 // a later DYLD insert can load).
+//
+// INVARIANT: only on a pre-commit tree that no process has mapped. AdHocSign
+// rewrites the file IN PLACE, and re-signing a Mach-O in place while any process
+// maps it leaves the kernel's old signature binding on the vnode, so every later
+// exec of it is killed (Code Signature Invalid). That is safe here only because
+// AdHocSignTree runs on a freshly unpacked tree before it is committed and
+// cloned; pods exec clones, which are separate inodes. A binary that may already
+// be mapped is signed with AdHocSignByReplace instead.
 func (CodesignTreeSigner) Sign(ctx context.Context, path string) error {
 	return AdHocSign(ctx, path)
 }

@@ -42,7 +42,7 @@ type orderedSigner struct {
 	checkErrSeq []error
 }
 
-func (s *orderedSigner) Sign(context.Context, string) error {
+func (s *orderedSigner) Sign(context.Context, string, string) error {
 	s.mu.Lock()
 	s.calls = append(s.calls, "sign")
 	s.mu.Unlock()
@@ -135,7 +135,7 @@ func TestGateSignatureOrdering(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			signer := &orderedSigner{checkErr: tc.checkErr, checkErrSeq: tc.checkErrSeq}
 			rt := newTestRuntime(t, Deps{Signer: signer})
-			err := rt.gateSignature(context.Background(), tc.policy, "/fake/bin", tc.hostBinary)
+			err := rt.gateSignature(context.Background(), tc.policy, "/fake", "/fake/bin", tc.hostBinary)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("gateSignature err = %v, wantErr = %v", err, tc.wantErr)
 			}

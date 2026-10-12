@@ -23,6 +23,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 // DefaultPath is the PATH used when a container's environment carries none. It
@@ -221,80 +223,18 @@ func ResolveTarget(root, guestPath string) (string, error) {
 		return "", fmt.Errorf("open the container root %s: %w", root, err)
 	}
 	defer func() { _ = r.Close() }()
-	resolved, _, _, err := walkContainerPath(r, guestPath)
+	resolved, _, _, err := pathsafe.WalkInRoot(r, guestPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve mount target %q in %s: %w", guestPath, root, err)
 	}
 	return filepath.Join(root, filepath.FromSlash(resolved)), nil
 }
 
-// walkContainerPath resolves guestPath inside r one component at a time, with
-// chroot semantics, and reports the resolved container-relative path, how many
-// symlinks it followed, and whether the final component exists.
-//
-// COMPONENT BY COMPONENT, not one Lstat of the whole path. os.Root resolves
-// intermediate components itself, but it refuses an ABSOLUTE symlink anywhere in
-// the chain — correctly, by its own contract, since it has no notion of a chroot.
-// This walk exists to do the one thing that contract cannot: treat an absolute
-// target as container-absolute. Everything else — per-component confinement, the
-// refusal of anything reaching outside — is still os.Root's, because the rewritten
-// name is handed straight back to it.
-func walkContainerPath(r *os.Root, guestPath string) (resolved string, hops int, exists bool, err error) {
-	parts := strings.Split(strings.TrimPrefix(path.Clean(guestPath), "/"), "/")
-	var out []string
-	for i := 0; i < len(parts); {
-		p := parts[i]
-		if p == "" || p == "." {
-			i++
-			continue
-		}
-		cand := path.Join(append(append([]string{}, out...), p)...)
-		fi, lerr := r.Lstat(cand)
-		switch {
-		case errors.Is(lerr, os.ErrNotExist):
-			// This component and everything after it is yet to be created. The
-			// tail carries no symlinks precisely because it does not exist.
-			return path.Join(append(out, parts[i:]...)...), hops, false, nil
-		case lerr != nil:
-			// os.Root refusing an escape lands here, which is the answer this
-			// wants: a target reaching outside the container root is not resolved.
-			return "", hops, false, lerr
-		}
-		if fi.Mode()&os.ModeSymlink == 0 {
-			out = append(out, p)
-			i++
-			continue
-		}
-		hops++
-		if hops > maxSymlinkHops {
-			return "", hops, false, errors.New("too many levels of symbolic links")
-		}
-		target, rerr := r.Readlink(cand)
-		if rerr != nil {
-			return "", hops, false, rerr
-		}
-		rest := parts[i+1:]
-		if path.IsAbs(target) {
-			// Container-absolute. This single line is the defect: the kernel
-			// would resolve it against the GUEST root.
-			out = nil
-		}
-		parts = append(strings.Split(strings.TrimPrefix(path.Clean(target), "/"), "/"), rest...)
-		i = 0
-	}
-	return path.Join(out...), hops, true, nil
-}
-
-// maxSymlinkHops bounds the symlink chain one candidate may traverse. It is
-// Linux's own SYMLOOP_MAX: a chain longer than this is a loop in every case that
-// matters, and the bound is what stops "a -> b -> a" from spinning here.
-const maxSymlinkHops = 40
-
 // candidate resolves one container-absolute path inside r with chroot semantics
 // and reports whether it exists and is an executable regular file. When it is
 // unusable for a reason worth telling the operator, why says which.
 //
-// It shares walkContainerPath with ResolveTarget, so there is ONE home for chroot
+// It shares pathsafe.WalkInRoot with ResolveTarget, so there is ONE home for chroot
 // path semantics in this guest. That sharing also closed a latent instance of the
 // mount-target defect living here: this used to hand the whole path to r.Lstat,
 // which refuses an absolute symlink among the INTERMEDIATE components — so an
@@ -304,7 +244,7 @@ const maxSymlinkHops = 40
 // apart: "you spelled it wrong" and "this image ships a broken link" are
 // different problems with different fixes.
 func candidate(r *os.Root, guestPath string) (exists, executable bool, why string) {
-	resolved, hops, found, err := walkContainerPath(r, guestPath)
+	resolved, hops, found, err := pathsafe.WalkInRoot(r, guestPath)
 	switch {
 	case err != nil:
 		if errors.Is(err, os.ErrPermission) {
@@ -313,7 +253,7 @@ func candidate(r *os.Root, guestPath string) (exists, executable bool, why strin
 			// an unreadable directory still runs.
 			return false, false, ""
 		}
-		if hops > maxSymlinkHops {
+		if hops > pathsafe.MaxSymlinkHops {
 			return false, false, "has too many levels of symbolic links"
 		}
 		// os.Root refuses anything leaving the container root, which is the case

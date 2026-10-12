@@ -23,6 +23,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 // ErrUserDatabase reports that a container's /etc/passwd or /etc/group could
@@ -190,7 +192,7 @@ func readUserDatabase(rootfs, guestPath string) (string, error) {
 	}
 	defer func() { _ = r.Close() }()
 
-	resolved, hops, exists, err := walkContainerPath(r, guestPath)
+	resolved, hops, exists, err := pathsafe.WalkInRoot(r, guestPath)
 	switch {
 	case err != nil:
 		return "", fmt.Errorf("%w: %s: %w", ErrUserDatabase, guestPath, err)
