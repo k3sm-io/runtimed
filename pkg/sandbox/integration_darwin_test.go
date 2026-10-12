@@ -21,6 +21,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -346,6 +348,73 @@ func TestIntegrationLaunchShimNeverLoadsPodDylib(t *testing.T) {
 	}
 	if slices.Contains(loaders, ExecShimName) {
 		t.Errorf("marker = %q: the pod's DYLD insert loaded into the exec-shim before its confinement", loaders)
+	}
+}
+
+// TestIntegrationLaunchHandOffsDoNotReachThePod runs a pod through the real
+// exec-shim in launch mode with every hand-off in use (the exec-sync pipe on
+// fd 3, an argv[0] override, the payload on fd 4) and checks what the pod
+// process sees: neither fd 3 nor fd 4 open, no K3SM_EXEC_* variable, its
+// own environment intact, and the override as its $0. The daemon's read end
+// of the exec-sync pipe reaches EOF at the exec.
+func TestIntegrationLaunchHandOffsDoNotReachThePod(t *testing.T) {
+	shim := buildExecShim(t)
+	posture, work := podVolume(t, "pod-handoffs")
+	profile := genProfile(t, posture, work, "/private/tmp", "/private/var/folders", work)
+	pf := filepath.Join(t.TempDir(), "profile.sb")
+	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The probe dups each descriptor (a redirection, no file access), so the
+	// pod profile cannot hide an open one; fd 1 is the positive control.
+	const script = `for fd in 1 3 4; do ( : >&$fd ) 2>/dev/null && echo FD$fd-OPEN; done; ` +
+		`env | grep '^K3SM_EXEC' ; echo "ZERO=$0 POD=$POD_VAR"`
+	argv := []string{"launch", supervisor.LaunchSpecToken, "-1", "-1", "-", "-", "-", pf, "/bin/sh", "-c", script}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shim, argv...)
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{
+		Env:      []string{"PATH=/usr/bin:/bin", "POD_VAR=kept"},
+		Argv0:    "podsh",
+		ExecSync: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	syncR, syncW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syncR.Close() }()
+	cmd.ExtraFiles[supervisor.ExecSyncChildFD-3] = syncW
+	var buf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	_ = syncW.Close()
+	if err := syncR.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := syncR.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+		t.Errorf("exec-sync read = (%d, %v), want EOF at the pod's exec", n, err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("pod under shim: %v\n%s", err, buf.String())
+	}
+	out := buf.String()
+	for _, leak := range []string{"FD3-OPEN", "FD4-OPEN", "K3SM_EXEC"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("the pod sees a launch hand-off (%s):\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, "FD1-OPEN") {
+		t.Fatalf("the descriptor probe does not see the pod's own stdout; it proves nothing:\n%s", out)
+	}
+	if !strings.Contains(out, "ZERO=podsh POD=kept") {
+		t.Errorf("the pod's argv[0] override or environment did not arrive:\n%s", out)
 	}
 }
 
