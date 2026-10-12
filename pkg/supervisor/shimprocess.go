@@ -204,7 +204,15 @@ func (p *Process) StopSignal(group func(pgid int, sig os.Signal) error) func(int
 			if err == nil {
 				return nil
 			}
-			slog.Warn("the container's shim did not forward the termination signal; signalling the group",
+			// A container already killed from outside has no shim left to ask;
+			// that death is explained (once, at Warn) by shimExit, and this
+			// follow-up is not its cause.
+			lvl := slog.LevelWarn
+			if p.externalKill.Load() {
+				lvl = slog.LevelDebug
+			}
+			slog.Log(context.Background(), lvl,
+				"could not ask the container's shim to forward the termination signal (the container may already be gone); signalling the group",
 				"pid", pgid, "err", err)
 		}
 		return group(pgid, sig)
@@ -348,12 +356,35 @@ func readShimDiag(r *os.File, timeout time.Duration) (string, error) {
 	}
 }
 
+// DiagnosticReportsDir is where macOS writes the crash report of a process the
+// kernel killed (code-signing violations, memory pressure).
+const DiagnosticReportsDir = "/Library/Logs/DiagnosticReports"
+
 // shimExit resolves a shim-backed process's exit once its shim has exited. The
 // exit record is the authority; without one, a kill this daemon delivered
 // (NoteKill) is the account of the death; without either the shim crashed,
 // and the container's status went with it (ErrShimCrashed — the container may
 // still be running).
 func (p *Process) shimExit(ctx context.Context, code, sig int, err error) (int, int, error) {
+	code, sig, err = p.shimExitStatus(ctx, code, sig, err)
+	if err == nil && sig == int(syscall.SIGKILL) && p.killSig.Load() == 0 {
+		p.externalKill.Store(true)
+		slog.Warn("the container was killed by a SIGKILL this daemon did not send; "+
+			"something outside killed it (code signing, memory pressure): see "+DiagnosticReportsDir,
+			"shimDir", p.shimDir, "pid", p.PID())
+	}
+	return code, sig, err
+}
+
+// ExternalKill reports whether the process ended by a SIGKILL that this daemon
+// did not send (no NoteKill), whether or not its exec was observed. The
+// kernel's code-signing check (which kills inside dyld, after the exec) and the
+// memory-pressure killer end a process this way, and they leave their account in DiagnosticReportsDir rather than in any
+// exit status. Valid once the process has exited.
+func (p *Process) ExternalKill() bool { return p.externalKill.Load() }
+
+// shimExitStatus is the status resolution shimExit classifies.
+func (p *Process) shimExitStatus(ctx context.Context, code, sig int, err error) (int, int, error) {
 	rec, ok, rerr := ReadExitRecord(p.shimDir)
 	if ok {
 		return rec.ExitCode, rec.Signal, nil

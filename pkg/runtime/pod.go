@@ -1901,6 +1901,10 @@ func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runt
 		// The memory sampler SIGKILLed this pod for a limit breach: a
 		// container that exited by signal / non-zero is reported OOMKilled.
 		term.Reason = "OOMKilled"
+	case cp.proc != nil && cp.proc.ExternalKill():
+		term.Reason = KilledExternallyReason
+		term.Message = "the container was killed by a SIGKILL this daemon did not send " +
+			"(code-signing check, memory pressure); see " + supervisor.DiagnosticReportsDir
 	case err != nil:
 		term.Reason = "Error"
 		term.Message = err.Error()

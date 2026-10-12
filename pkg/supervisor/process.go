@@ -124,6 +124,10 @@ type Process struct {
 	childStart int64
 	killSig    atomic.Int32
 
+	// externalKill is set once, by shimExit, for a SIGKILL this daemon did not
+	// send (see ExternalKill).
+	externalKill atomic.Bool
+
 	done      chan struct{} // closed once the process is reaped
 	drained   chan struct{} // closed once BOTH log pumps have copied output to EOF
 	drainOnce sync.Once     // guards the single close of drained (idempotent, panic-safe)

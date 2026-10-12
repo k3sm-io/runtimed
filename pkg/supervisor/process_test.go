@@ -17,12 +17,17 @@ limitations under the License.
 package supervisor
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -573,4 +578,54 @@ type fdRecordingSpawner struct {
 func (s *fdRecordingSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
 	s.outFD, s.errFD = spec.StdoutFD, spec.StderrFD
 	return 0, s.err
+}
+
+// TestUnexplainedKillBeforeExecHasReason pins the exit classifier: a SIGKILL
+// this daemon did not send is flagged as an external kill and logged once at Warn; every other exit is not.
+func TestUnexplainedKillBeforeExecHasReason(t *testing.T) {
+	cases := []struct {
+		name     string
+		sig      int
+		noteKill bool
+		wantExt  bool
+		wantCode int
+	}{
+		{"sigkill-unsent", 9, false, true, 137},
+		{"sigkill-runtimed-sent", 9, true, false, 137},
+		{"sigterm", 15, false, false, 143},
+		{"clean-exit", 0, false, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			rec, _ := json.Marshal(ExitRecord{ExitCode: tc.wantCode, Signal: tc.sig})
+			if err := os.WriteFile(filepath.Join(dir, ShimExitFile), rec, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			defer slog.SetDefault(old)
+
+			p := &Process{shimDir: dir}
+			if tc.noteKill {
+				p.NoteKill(syscall.SIGKILL)
+			}
+			code, sig, err := p.shimExit(context.Background(), 0, 0, nil)
+			if err != nil || code != tc.wantCode || sig != tc.sig {
+				t.Fatalf("status = (%d, %d, %v), want (%d, %d, nil)", code, sig, err, tc.wantCode, tc.sig)
+			}
+			if got := p.ExternalKill(); got != tc.wantExt {
+				t.Fatalf("ExternalKill = %v, want %v", got, tc.wantExt)
+			}
+			warns := strings.Count(buf.String(), "level=WARN")
+			wantWarns := 0
+			if tc.wantExt {
+				wantWarns = 1
+			}
+			if warns != wantWarns || (tc.wantExt && !strings.Contains(buf.String(), DiagnosticReportsDir)) {
+				t.Fatalf("warn count = %d, want %d; log: %s", warns, wantWarns, buf.String())
+			}
+		})
+	}
 }
