@@ -581,22 +581,19 @@ func (s *fdRecordingSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, erro
 }
 
 // TestUnexplainedKillBeforeExecHasReason pins the exit classifier: a SIGKILL
-// this daemon did not send, before the exec was observed, is flagged as an
-// external kill and logged once at Warn; every other exit is not.
+// this daemon did not send is flagged as an external kill and logged once at Warn; every other exit is not.
 func TestUnexplainedKillBeforeExecHasReason(t *testing.T) {
 	cases := []struct {
 		name     string
 		sig      int
 		noteKill bool
-		execSeen bool
 		wantExt  bool
 		wantCode int
 	}{
-		{"sigkill-before-exec-unsent", 9, false, false, true, 137},
-		{"sigkill-before-exec-runtimed-sent", 9, true, false, false, 137},
-		{"sigkill-after-exec", 9, false, true, false, 137},
-		{"sigterm-before-exec", 15, false, false, false, 143},
-		{"clean-exit", 0, false, false, false, 0},
+		{"sigkill-unsent", 9, false, true, 137},
+		{"sigkill-runtimed-sent", 9, true, false, 137},
+		{"sigterm", 15, false, false, 143},
+		{"clean-exit", 0, false, false, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -614,7 +611,6 @@ func TestUnexplainedKillBeforeExecHasReason(t *testing.T) {
 			if tc.noteKill {
 				p.NoteKill(syscall.SIGKILL)
 			}
-			p.execSeen.Store(tc.execSeen)
 			code, sig, err := p.shimExit(context.Background(), 0, 0, nil)
 			if err != nil || code != tc.wantCode || sig != tc.sig {
 				t.Fatalf("status = (%d, %d, %v), want (%d, %d, nil)", code, sig, err, tc.wantCode, tc.sig)

@@ -1903,8 +1903,8 @@ func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runt
 		term.Reason = "OOMKilled"
 	case cp.proc != nil && cp.proc.ExternalKill():
 		term.Reason = KilledExternallyReason
-		term.Message = "the container was killed by SIGKILL before it started running, and this daemon did not send it; " +
-			"the kernel killed it (code-signing check, memory pressure): see " + supervisor.DiagnosticReportsDir
+		term.Message = "the container was killed by a SIGKILL this daemon did not send " +
+			"(code-signing check, memory pressure); see " + supervisor.DiagnosticReportsDir
 	case err != nil:
 		term.Reason = "Error"
 		term.Message = err.Error()

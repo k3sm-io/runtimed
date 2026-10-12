@@ -367,9 +367,9 @@ const DiagnosticReportsDir = "/Library/Logs/DiagnosticReports"
 // still be running).
 func (p *Process) shimExit(ctx context.Context, code, sig int, err error) (int, int, error) {
 	code, sig, err = p.shimExitStatus(ctx, code, sig, err)
-	if err == nil && sig == int(syscall.SIGKILL) && p.killSig.Load() == 0 && !p.execSeen.Load() {
+	if err == nil && sig == int(syscall.SIGKILL) && p.killSig.Load() == 0 {
 		p.externalKill.Store(true)
-		slog.Warn("the container was killed by SIGKILL before its exec was observed and this daemon did not send it; "+
+		slog.Warn("the container was killed by a SIGKILL this daemon did not send; "+
 			"something outside killed it (code signing, memory pressure): see "+DiagnosticReportsDir,
 			"shimDir", p.shimDir, "pid", p.PID())
 	}
@@ -377,9 +377,9 @@ func (p *Process) shimExit(ctx context.Context, code, sig int, err error) (int, 
 }
 
 // ExternalKill reports whether the process ended by a SIGKILL that this daemon
-// did not send (no NoteKill) before the container's exec was observed. The
-// kernel's code-signing check and the memory-pressure killer end a process this
-// way, and they leave their account in DiagnosticReportsDir rather than in any
+// did not send (no NoteKill), whether or not its exec was observed. The
+// kernel's code-signing check (which kills inside dyld, after the exec) and the
+// memory-pressure killer end a process this way, and they leave their account in DiagnosticReportsDir rather than in any
 // exit status. Valid once the process has exited.
 func (p *Process) ExternalKill() bool { return p.externalKill.Load() }
 

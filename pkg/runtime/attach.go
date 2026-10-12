@@ -109,7 +109,7 @@ const logStreamLostMarker = "k3sm: log stream re-attached after a daemon restart
 const ExitStatusUnknownReason = "ExitStatusUnknown"
 
 // KilledExternallyReason is the terminated reason of a container that died by a
-// SIGKILL before its exec was observed which this daemon did not send.
+// SIGKILL this daemon did not send.
 const KilledExternallyReason = "KilledExternally"
 
 // exitCodeUnknown is the exit code reported with ExitStatusUnknownReason. A real
