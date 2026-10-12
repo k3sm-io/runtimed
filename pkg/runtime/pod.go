@@ -2121,7 +2121,11 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //     unconditional `codesign -s - -f` would rewrite argv[0] on every start and
 //     de-CoW it, turning a free clone into a full copy each time the pod restarts.
 //     When the first check fails the binary is signed and re-checked, so the
-//     signature is still confirmed before exec.
+//     signature is still confirmed before exec. The signing never rewrites the
+//     binary's inode: the signer signs a copy and renames it over path
+//     (image.AdHocSignByReplace), because re-signing a Mach-O in place while a
+//     still-running instance has it mapped gets every later exec killed with
+//     Code Signature Invalid.
 //   - REQUIRE_SIGNED / REQUIRE_NOTARIZED: enforce the policy on the as-pulled
 //     binary and never ad-hoc sign it — `codesign -s - -f` would strip an existing
 //     notarization / replace a real authority with an ad-hoc signature, silently

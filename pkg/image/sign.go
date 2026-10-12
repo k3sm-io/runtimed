@@ -20,7 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"syscall"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -116,4 +120,116 @@ func AdHocSign(ctx context.Context, path string) error {
 		return fmt.Errorf("ad-hoc sign %s: %w: %s", path, err, string(out))
 	}
 	return nil
+}
+
+// AdHocSignByReplace ad-hoc signs the Mach-O at path WITHOUT writing path's
+// inode: it signs a copy in the same directory and rename(2)s it over path.
+//
+// Re-signing a Mach-O in place (codesign -f on the same inode) while any process
+// has it mapped leaves the kernel's old signature binding on the vnode, and every
+// new process that maps it is killed (SIGKILL, Code Signature Invalid). A pod
+// binary can be mapped by a still-running instance of the container when the gate
+// runs again, so the signed bytes always land on a NEW inode; a process holding
+// the old one keeps it, unmodified, until it exits.
+//
+// The copy keeps path's permission bits and, when running as root, its owner and
+// group. It is signed with an explicit identifier equal to path's base name,
+// because codesign otherwise derives the identifier from the temp file's name.
+// The copy is fsynced before the rename and the directory after it. On any error
+// the temp file is removed and path is left exactly as it was.
+//
+// path must be a regular file: a symlink is refused rather than followed or
+// replaced, the same containment rule AdHocSignTree applies.
+func AdHocSignByReplace(ctx context.Context, path string) error {
+	return signByReplace(ctx, path, codesignAs)
+}
+
+// codesignAs ad-hoc signs path in place under the code identifier ident, with the
+// same flags as AdHocSign. It is only ever pointed at a private temp copy.
+func codesignAs(ctx context.Context, path, ident string) error {
+	cmd := exec.CommandContext(ctx, "codesign", "-s", "-", "-f", "-i", ident, path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ad-hoc sign %s: %w: %s", path, err, string(out))
+	}
+	return nil
+}
+
+// signByReplace is AdHocSignByReplace with the signing step injected (tests).
+func signByReplace(ctx context.Context, path string, sign func(ctx context.Context, path, ident string) error) (err error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("sign by replace: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("sign by replace %s: not a regular file (%s)", path, fi.Mode().Type())
+	}
+	dir, base := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+
+	src, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("sign by replace: %w", err)
+	}
+	defer func() { _ = src.Close() }() // read-only; a close error loses nothing
+
+	tmp, err := os.CreateTemp(dir, "."+base+".k3sm-sign-*")
+	if err != nil {
+		return fmt.Errorf("sign by replace %s: create temp: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = tmp.Close() // already failing; the temp is removed next
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err = io.Copy(tmp, src); err != nil {
+		return fmt.Errorf("sign by replace %s: copy: %w", path, err)
+	}
+	if os.Geteuid() == 0 {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if err = tmp.Chown(int(st.Uid), int(st.Gid)); err != nil {
+				return fmt.Errorf("sign by replace %s: chown temp: %w", path, err)
+			}
+		}
+	}
+	// After chown, which clears set-id bits.
+	if err = tmp.Chmod(fi.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)); err != nil {
+		return fmt.Errorf("sign by replace %s: chmod temp: %w", path, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("sign by replace %s: close temp: %w", path, err)
+	}
+
+	if err = sign(ctx, tmpPath, base); err != nil {
+		return err
+	}
+
+	if err = fsyncPath(tmpPath); err != nil {
+		return fmt.Errorf("sign by replace %s: fsync temp: %w", path, err)
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("sign by replace %s: rename: %w", path, err)
+	}
+	// The rename is done: path now names the signed inode, so a directory fsync
+	// failure is reported but the temp (now path) must not be removed.
+	if derr := fsyncPath(dir); derr != nil {
+		return fmt.Errorf("sign by replace %s: fsync dir: %w", path, derr)
+	}
+	return nil
+}
+
+func fsyncPath(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close() // the sync error is the one that matters
+		return err
+	}
+	return f.Close()
 }

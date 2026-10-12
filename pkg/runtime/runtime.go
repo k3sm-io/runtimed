@@ -98,7 +98,9 @@ type Unpacker interface {
 // downgraded.
 type Signer interface {
 	// Sign ad-hoc signs the Mach-O at path (codesign -s - -f, no hardened
-	// runtime) so a later DYLD insert can load.
+	// runtime) so a later DYLD insert can load. It must never write path's
+	// inode in place: a running process may have it mapped, and re-signing a
+	// mapped Mach-O in place gets every later exec of it killed.
 	Sign(ctx context.Context, path string) error
 	// Check enforces policy against path's signature, fail-closed on UNSPECIFIED.
 	Check(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error
@@ -1063,8 +1065,10 @@ func (r *Runtime) exitObservationGrace() time.Duration {
 // tooling and the SignaturePolicy gate.
 type defaultSigner struct{}
 
+// Sign signs a copy and renames it over path (image.AdHocSignByReplace), so the
+// inode a still-running container instance maps is never rewritten.
 func (defaultSigner) Sign(ctx context.Context, path string) error {
-	return image.AdHocSign(ctx, path)
+	return image.AdHocSignByReplace(ctx, path)
 }
 
 func (defaultSigner) Check(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error {
