@@ -685,7 +685,24 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	}
 	r.sweepStaleSandboxProfiles()
 	r.sweepStaleShimDirs()
+	r.sweepStaleSignStaging()
 	return nil
+}
+
+// sweepStaleSignStaging removes the signed-copy temp files a previous daemon run
+// left in the sign staging dir (a crash between the copy and the rename into the
+// pod rootfs). Everything there is stale by construction for the reason
+// sweepStaleSandboxProfiles gives: this runs in the exactly-once startup reap,
+// before CreatePod is served, so this daemon has signed nothing yet.
+// Best-effort, like the sweeps around it.
+func (r *Runtime) sweepStaleSignStaging() {
+	removed, err := image.SweepSignStaging(r.cache.SignStagingDir())
+	if err != nil {
+		r.log.Warn("startup sign-staging sweep incomplete; stale signed copies may remain", "removed", removed, "err", err)
+	}
+	if removed > 0 {
+		r.log.Info("swept stale signed copies left by a previous daemon run", "removed", removed)
+	}
 }
 
 // sweepStaleShimDirs removes every resident-shim dir no registered pod owns. It

@@ -642,7 +642,7 @@ type fakeSigner struct {
 	signError error
 }
 
-func (f *fakeSigner) Sign(_ context.Context, path string) error {
+func (f *fakeSigner) Sign(_ context.Context, _, path string) error {
 	f.mu.Lock()
 	f.signed = append(f.signed, path)
 	f.mu.Unlock()

@@ -1548,7 +1548,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// Enforce the signature policy in the correct order relative to ad-hoc
 	// signing, before exec. A host binary is never ad-hoc re-signed
 	// (hostBinary).
-	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), gatePath, rb.hostBinary); err != nil {
+	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rootfs, gatePath, rb.hostBinary); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
 	}
 
@@ -2122,10 +2122,11 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //     de-CoW it, turning a free clone into a full copy each time the pod restarts.
 //     When the first check fails the binary is signed and re-checked, so the
 //     signature is still confirmed before exec. The signing never rewrites the
-//     binary's inode: the signer signs a copy and renames it over path
-//     (image.AdHocSignByReplace), because re-signing a Mach-O in place while a
-//     still-running instance has it mapped gets every later exec killed with
-//     Code Signature Invalid.
+//     binary's inode: the signer resolves path inside rootfs (argv[0] is often
+//     an image symlink), signs a copy in a daemon-private staging dir, and
+//     renames it over the resolved file (image.AdHocSignByReplace), because
+//     re-signing a Mach-O in place while a still-running instance has it mapped
+//     gets every later exec killed with Code Signature Invalid.
 //   - REQUIRE_SIGNED / REQUIRE_NOTARIZED: enforce the policy on the as-pulled
 //     binary and never ad-hoc sign it — `codesign -s - -f` would strip an existing
 //     notarization / replace a real authority with an ad-hoc signature, silently
@@ -2134,7 +2135,7 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //
 // Both Sign and Check errors are returned wrapped (ErrSignatureRejected /
 // ErrPolicyUnspecified), which the caller maps to SIGNATURE_REJECTED.
-func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignaturePolicy, path string, hostBinary bool) error {
+func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignaturePolicy, rootfs, path string, hostBinary bool) error {
 	if hostBinary {
 		// Already signed + read-only: verify the existing signature, never re-sign.
 		return r.signer.Check(ctx, policy, path)
@@ -2147,7 +2148,7 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 		if err := r.signer.Check(ctx, policy, path); err == nil {
 			return nil
 		}
-		if err := r.signer.Sign(ctx, path); err != nil {
+		if err := r.signer.Sign(ctx, rootfs, path); err != nil {
 			return fmt.Errorf("ad-hoc sign %s: %w", path, err)
 		}
 		return r.signer.Check(ctx, policy, path)

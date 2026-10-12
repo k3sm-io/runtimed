@@ -22,6 +22,8 @@ limitations under the License.
 // syscall it then makes on such a string resolves each component, so a check
 // that the string is in the right tree says nothing about where the syscall
 // lands. RefuseSymlinkedPath is what bounds the place rather than the name.
+// WalkInRoot is its in-root counterpart: it resolves a path INSIDE a container
+// or pod root with chroot semantics and refuses any resolution that leaves it.
 //
 // It is a package of its own, and deliberately a small one, because its callers
 // sit in two others that must not depend on each other: pkg/mount writes a vm
