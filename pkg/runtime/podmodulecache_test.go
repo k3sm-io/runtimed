@@ -46,6 +46,10 @@ type mcProbeSpawner struct {
 func (f *mcProbeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	spec, err := podEnvSpawn(spec)
+	if err != nil {
+		return 0, err
+	}
 	f.specs = append(f.specs, spec)
 	ok, mode := false, os.FileMode(0)
 	if dir, has := envValue(spec.Env, clangModuleCacheEnv); has {

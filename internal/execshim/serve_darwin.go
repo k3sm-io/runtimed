@@ -71,8 +71,9 @@ const stopGrace = 2 * time.Second
 //     writable path at all (a rotated log arrives as a handed-over descriptor);
 //  4. posix_spawns the container: itself in launch mode, marked
 //     pcontrol-KILL, in the shim's own process group and session
-//     (SpawnSpec.KeepGroup), with a pipe per output stream and the daemon's
-//     exec-sync pipe relayed as fd 3. The launch child runs the launch sequence
+//     (SpawnSpec.KeepGroup), with an EMPTY environment and the container's
+//     environment as the launch payload on fd 4 (ShimSpec.ContainerSpawn),
+//     a pipe per output stream and the daemon's exec-sync pipe relayed as fd 3. The launch child runs the launch sequence
 //     verbatim — rlimits, drop, qos, sandbox_apply of the POD profile, marked
 //     exec — so the container runs under exactly the pod profile;
 //  5. on a root daemon whose spec carries a drop, chowns its shim dir and the
@@ -193,21 +194,12 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 	if err != nil {
 		return nil, supervisor.ShimExitSetup, fmt.Errorf("stderr pipe: %w", err)
 	}
-	env := spec.Env
-	var syncFD uintptr
-	if spec.ExecSync {
-		env = append(append([]string{}, env...), fmt.Sprintf("%s=%d", supervisor.ExecSyncFDEnv, supervisor.ExecSyncChildFD))
-		syncFD = supervisor.ExecSyncChildFD
-	}
-	child, err := supervisor.PosixSpawner{PressureKill: true}.Spawn(context.Background(), supervisor.SpawnSpec{
-		Path:       self,
-		Argv:       append([]string{self, supervisor.ShimModeLaunch}, spec.Launch...),
-		Env:        env,
-		StdoutFD:   outW.Fd(),
-		StderrFD:   errW.Fd(),
-		ExecSyncFD: syncFD,
-		KeepGroup:  true,
-	})
+	// The container's launch-mode shim starts with an EMPTY environment; the
+	// container's environment reaches it on supervisor.LaunchSpecChildFD
+	// (ShimSpec.ContainerSpawn), never through its environ.
+	launch := spec.ContainerSpawn(self)
+	launch.StdoutFD, launch.StderrFD = outW.Fd(), errW.Fd()
+	child, err := supervisor.PosixSpawner{PressureKill: true}.Spawn(context.Background(), launch)
 	_, _ = outW.Close(), errW.Close()
 	if spec.ExecSync {
 		// The container holds the exec-sync pipe now; this copy must go so the

@@ -28,10 +28,13 @@ import (
 // supervisor consumes this interface and is otherwise backend-agnostic — it
 // posix_spawns whatever path/argv WrapCommand returns.
 //
-// Implementations must preserve the caller's environment when they exec the pod
-// (notably DYLD_INSERT_LIBRARIES, the cross-repo DNS-shim enabler): the
-// supervisor passes envp to posix_spawn, and the backend's exec must not strip
-// it. This is why the host-process backend uses an ad-hoc-signed exec-shim and not Apple's
+// Implementations must deliver the pod's environment to the pod binary intact
+// (notably DYLD_INSERT_LIBRARIES, the cross-repo DNS-shim enabler). The caller
+// hands it as a supervisor.LaunchPayload (SpawnSpec.Launch, or
+// supervisor.AttachLaunchPayload for an exec.Cmd), never as the wrapper's own
+// environ: the wrapper runs before the pod's confinement, and a DYLD variable
+// in its environ would load pod-chosen code into it. This is why the
+// host-process backend uses an ad-hoc-signed exec-shim and not Apple's
 // /usr/bin/sandbox-exec (a platform binary that strips DYLD_*).
 //
 // Backends are OS-version-gated and fail closed: Available reports false when

@@ -43,6 +43,10 @@ type tmpProbeSpawner struct {
 func (f *tmpProbeSpawner) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	spec, err := podEnvSpawn(spec)
+	if err != nil {
+		return 0, err
+	}
 	f.specs = append(f.specs, spec)
 	found, mode := false, os.FileMode(0)
 	if dir, ok := envValue(spec.Env, tmpDirEnv); ok {

@@ -29,6 +29,7 @@ import (
 
 	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/execsession"
+	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -136,9 +137,15 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 			return status.Errorf(codes.InvalidArgument, "exec: %v", err)
 		}
 	}
-	cmd.Env = cmdEnv
 	cmd.Dir = dir
-	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin(), nil)
+	// The exec-shim starts with an EMPTY environment: the container's
+	// environment reaches it as the launch payload, never its own environ.
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{Env: cmdEnv})
+	if err != nil {
+		return status.Errorf(codes.Internal, "exec: %v", err)
+	}
+	defer release()
+	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin(), func(int) { release() })
 }
 
 // Attach attaches to an already-running container's streams (`kubectl attach`).

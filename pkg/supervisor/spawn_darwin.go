@@ -118,13 +118,19 @@ extern int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *, const int);
 // unmarked: this function executes the plan it is handed and decides nothing,
 // the Go side owns the fail-soft policy (pcontrolRetry).
 //
+// specFD, when >= 0, is the launch payload pipe's read end (SpawnSpec.Launch):
+// it lands on the child's fd 4 (LaunchSpecChildFD) after the exec-sync dup,
+// then is closed. The Go side keeps it above 4, so it is never one of the
+// descriptors moved before it and the dup2 is never a no-op that would leave
+// close-on-exec set.
+//
 // keepGroup, when non-zero, drops POSIX_SPAWN_SETSID: the child stays in the
 // caller's session and process group (SpawnSpec.KeepGroup). inFD, when >= 0, is
 // dup2'd onto the child's stdin (0) FIRST and then closed, before any other
 // descriptor moves: every descriptor this process opens is >= 3, so the dup
 // can never clobber a stream fd, and a later dup onto 1, 2 or 3 cannot clobber
 // the stdin it already placed.
-static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int inFD, int outFD, int errFD, int syncFD, int pcKill, int keepGroup, int *setRC, pid_t *outPid) {
+static int k3sm_posix_spawn(const char *path, char *const argv[], char *const envp[], const char *dir, int inFD, int outFD, int errFD, int syncFD, int specFD, int pcKill, int keepGroup, int *setRC, pid_t *outPid) {
 	posix_spawnattr_t attr;
 	posix_spawn_file_actions_t fa;
 	int rc;
@@ -202,6 +208,10 @@ static int k3sm_posix_spawn(const char *path, char *const argv[], char *const en
 		if ((rc = posix_spawn_file_actions_adddup2(&fa, syncFD, 3)) != 0) goto done;
 		if ((rc = posix_spawn_file_actions_addclose(&fa, syncFD)) != 0) goto done;
 	}
+	if (specFD >= 0) {
+		if ((rc = posix_spawn_file_actions_adddup2(&fa, specFD, 4)) != 0) goto done;
+		if ((rc = posix_spawn_file_actions_addclose(&fa, specFD)) != 0) goto done;
+	}
 
 	rc = posix_spawn(outPid, path, &fa, &attr, argv, envp ? envp : environ);
 
@@ -247,9 +257,11 @@ type PosixSpawner struct {
 
 // Spawn posix_spawns spec into its own process group (or, with
 // spec.KeepGroup, into the caller's) and returns the child pid.
-// It passes spec.Env verbatim (so DYLD_INSERT_LIBRARIES flows through to the
-// pod), gives the child spec.Dir as its working directory, and wires
-// spec.StdoutFD and spec.StderrFD as the child's fd 1 and fd 2.
+// It passes spec.Env verbatim, gives the child spec.Dir as its working
+// directory, and wires spec.StdoutFD and spec.StderrFD as the child's fd 1 and
+// fd 2. With spec.Launch the child starts with an EMPTY environment and the
+// payload on a pipe at LaunchSpecChildFD, written in the background after the
+// spawn so a payload larger than the pipe buffer never blocks it.
 //
 // spec.Dir is honored through a posix_spawn chdir file action, never by chdir'ing
 // the daemon: this process is shared by every pod, so a parent-side chdir would
@@ -273,9 +285,13 @@ func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 	argvArr := newCStringArray(spec.Argv)
 	defer argvArr.free()
 
+	env, err := spec.childEnv()
+	if err != nil {
+		return 0, err
+	}
 	var envp **C.char
-	if spec.Env != nil {
-		envArr := newCStringArray(spec.Env)
+	if env != nil {
+		envArr := newCStringArray(env)
 		defer envArr.free()
 		envp = envArr.ptr
 	}
@@ -308,6 +324,29 @@ func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		syncFD = C.int(spec.ExecSyncFD)
 	}
 
+	specFD := C.int(-1)
+	var payload *launchPipe
+	if spec.Launch != nil {
+		if payload, err = openLaunchPipe(*spec.Launch); err != nil {
+			return 0, err
+		}
+		specFD = C.int(payload.r.Fd())
+	}
+	// The child holds its own copy of the read end; the parent's goes once the
+	// spawn is decided. A failed spawn abandons the pipe unwritten.
+	spawned := false
+	defer func() {
+		if payload == nil {
+			return
+		}
+		if !spawned {
+			payload.abandon()
+			return
+		}
+		_ = payload.r.Close()
+		payload.start()
+	}()
+
 	spawn := func(p spawnPlan) (int, int, error) {
 		pcKill := C.int(0)
 		if p.PControl == pcontrolKill {
@@ -319,7 +358,7 @@ func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		}
 		var pid C.pid_t
 		var setRC C.int
-		rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, inFD, outFD, errFD, syncFD, pcKill, keepGroup, &setRC, &pid)
+		rc := C.k3sm_posix_spawn(cPath, argvArr.ptr, envp, cDir, inFD, outFD, errFD, syncFD, specFD, pcKill, keepGroup, &setRC, &pid)
 		if rc != 0 {
 			return 0, int(setRC), syscallErrno(rc)
 		}
@@ -341,11 +380,13 @@ func (s PosixSpawner) Spawn(ctx context.Context, spec SpawnSpec) (int, error) {
 		var errno unix.Errno
 		_ = errors.As(spawnErr, &errno)
 		noteUnmarkedSpawn(spec.Path, "posix_spawn rejected the pcontrol attribute; retried unmarked", int(errno))
+		spawned = true
 		return pid, nil
 	}
 	if plan.PControl == pcontrolKill && setRC != 0 {
 		noteUnmarkedSpawn(spec.Path, "posix_spawnattr_setpcontrol_np failed", setRC)
 	}
+	spawned = true
 	return pid, nil
 }
 

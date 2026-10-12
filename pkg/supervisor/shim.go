@@ -88,7 +88,9 @@ const (
 	// sockaddr_un.sun_path is 104 bytes including the terminating NUL.
 	maxSunPath = 103
 
-	// maxShimSpecBytes bounds the launch spec the shim reads from its stdin.
+	// maxShimSpecBytes bounds each spec the shim reads from an inherited
+	// descriptor: the ShimSpec on its stdin and the LaunchPayload on
+	// LaunchSpecChildFD.
 	maxShimSpecBytes = 4 << 20
 )
 
@@ -249,16 +251,21 @@ type ShimSpec struct {
 	// ShimProfile is the path of the shim's own Seatbelt profile (the pod
 	// profile plus the shim grant), applied after the container is spawned.
 	ShimProfile string `json:"shimProfile"`
-	// Launch is the launch-mode argv after the mode token: <uid> <gid>
-	// <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...].
+	// Launch is the launch-mode argv after the mode and spec tokens: <uid>
+	// <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary> [args...].
+	// The shim adds both tokens itself when it spawns the container
+	// (ContainerSpawn).
 	Launch []string `json:"launch"`
-	// Env is the container's spawn environment (exec hand-offs included).
+	// Env is the container's resolved environment: exactly what its binary
+	// receives, and what every exec session runs with. It carries no
+	// daemon-to-shim hand-off; those are typed fields (Argv0, ExecSync).
 	Env []string `json:"env"`
-	// ExecEnv and ExecDir are what an exec session runs with: the container's
-	// resolved environment (no daemon-to-shim hand-off variables) and working
-	// directory.
-	ExecEnv []string `json:"execEnv"`
-	ExecDir string   `json:"execDir"`
+	// Argv0 is the argv[0] the container's binary sees when it differs from
+	// the path exec'd (a re-signed shell copy run as "sh"); empty means none.
+	Argv0 string `json:"argv0,omitempty"`
+	// ExecDir is the container's working directory, which an exec session
+	// also runs in.
+	ExecDir string `json:"execDir"`
 	// ExecSync is true when the shim inherited the exec-sync pipe on fd 3; the
 	// shim relays it to the container as fd 3 and closes its own copy.
 	ExecSync bool `json:"execSync,omitempty"`
@@ -266,39 +273,84 @@ type ShimSpec struct {
 
 // EncodeShimSpec renders s for the shim's stdin.
 func EncodeShimSpec(s ShimSpec) ([]byte, error) {
-	b, err := json.Marshal(s)
-	if err != nil {
-		return nil, fmt.Errorf("encode shim spec: %w", err)
-	}
-	if len(b) > maxShimSpecBytes {
-		return nil, fmt.Errorf("encode shim spec: %d bytes exceeds %d", len(b), maxShimSpecBytes)
-	}
-	return b, nil
+	return encodeBounded("shim spec", s)
 }
 
 // DecodeShimSpec reads one spec from r to EOF, bounded, and checks it is
 // complete enough to launch from.
 func DecodeShimSpec(r io.Reader) (ShimSpec, error) {
-	b, err := io.ReadAll(io.LimitReader(r, maxShimSpecBytes+1))
-	if err != nil {
-		return ShimSpec{}, fmt.Errorf("read shim spec: %w", err)
-	}
-	if len(b) > maxShimSpecBytes {
-		return ShimSpec{}, fmt.Errorf("shim spec exceeds %d bytes", maxShimSpecBytes)
-	}
 	var s ShimSpec
-	if err := json.Unmarshal(b, &s); err != nil {
-		return ShimSpec{}, fmt.Errorf("decode shim spec: %w", err)
+	if err := decodeBounded("shim spec", r, &s); err != nil {
+		return ShimSpec{}, err
+	}
+	if err := checkShimAPIVersion(s.APIVersion); err != nil {
+		return ShimSpec{}, err
 	}
 	switch {
-	case s.APIVersion != shimv1.APIVersion:
-		return ShimSpec{}, fmt.Errorf("%w: spec %q, shim %q", ErrShimVersion, s.APIVersion, shimv1.APIVersion)
 	case s.Container == "" || s.Dir == "" || s.LogPath == "" || s.ShimProfile == "":
 		return ShimSpec{}, errors.New("shim spec is missing the container, dir, log path or shim profile")
 	case len(s.Launch) < 7:
 		return ShimSpec{}, fmt.Errorf("shim spec launch argv has %d tokens, want at least 7", len(s.Launch))
 	}
 	return s, nil
+}
+
+// ContainerSpawn is the spawn of the container a serve-mode shim hosts: the
+// shim itself (self) in launch mode, in the shim's own process group, with an
+// EMPTY environment. The container's environment, its argv[0] override and
+// the exec-sync flag cross as the LaunchPayload on LaunchSpecChildFD, so no
+// pod-chosen variable (DYLD_INSERT_LIBRARIES above all) is in the launch-mode
+// shim's environ while it is still unconfined. The caller sets the output
+// descriptors.
+func (s ShimSpec) ContainerSpawn(self string) SpawnSpec {
+	spec := SpawnSpec{
+		Path:      self,
+		Argv:      append([]string{self, ShimModeLaunch, LaunchSpecToken}, s.Launch...),
+		Env:       []string{},
+		Launch:    &LaunchPayload{Env: s.Env, Argv0: s.Argv0, ExecSync: s.ExecSync},
+		KeepGroup: true,
+	}
+	if s.ExecSync {
+		spec.ExecSyncFD = ExecSyncChildFD
+	}
+	return spec
+}
+
+// encodeBounded renders v as JSON for one of the shim's inherited-descriptor
+// specs (ShimSpec, LaunchPayload), refusing one longer than the reader accepts.
+func encodeBounded(what string, v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s: %w", what, err)
+	}
+	if len(b) > maxShimSpecBytes {
+		return nil, fmt.Errorf("encode %s: %d bytes exceeds %d", what, len(b), maxShimSpecBytes)
+	}
+	return b, nil
+}
+
+// decodeBounded reads r to EOF, refusing more than maxShimSpecBytes, and
+// decodes the JSON into v. Truncated or malformed input is an error.
+func decodeBounded(what string, r io.Reader, v any) error {
+	b, err := io.ReadAll(io.LimitReader(r, maxShimSpecBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", what, err)
+	}
+	if len(b) > maxShimSpecBytes {
+		return fmt.Errorf("%s exceeds %d bytes", what, maxShimSpecBytes)
+	}
+	if err := json.Unmarshal(b, v); err != nil {
+		return fmt.Errorf("decode %s: %w", what, err)
+	}
+	return nil
+}
+
+// checkShimAPIVersion refuses a spec written by a daemon of another contract.
+func checkShimAPIVersion(v string) error {
+	if v != shimv1.APIVersion {
+		return fmt.Errorf("%w: spec %q, shim %q", ErrShimVersion, v, shimv1.APIVersion)
+	}
+	return nil
 }
 
 // ShimIdentity is the recorded identity of a resident shim: the pid and kernel

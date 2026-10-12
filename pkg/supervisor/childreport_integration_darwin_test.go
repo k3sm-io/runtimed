@@ -121,17 +121,16 @@ func TestUnloadedShimChildIsDetected(t *testing.T) {
 			t.Fatal(err)
 		}
 		argv := shimArgv(execShim, profile, spawner, child, "/mnt/sec/key")
-		cmd := exec.Command(argv[0], argv[1:]...)
-		cmd.Env = []string{
+		env := []string{
 			"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
 			"DYLD_INSERT_LIBRARIES=" + dylib,
 			"K3SM_ROOTFS=" + dataVol,
 			supervisor.ChildReportEnv + "=" + reportPath,
 		}
 		if mounts {
-			cmd.Env = append(cmd.Env, "K3SM_MOUNT_PATHS=/mnt/sec")
+			env = append(env, "K3SM_MOUNT_PATHS=/mnt/sec")
 		}
-		cmd.Env = append(cmd.Env, extra...)
+		cmd := shimCommand(t, argv, append(env, extra...))
 		var buf bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &buf, &buf
 		err := cmd.Run()
@@ -183,14 +182,13 @@ func TestUnloadedShimChildIsDetected(t *testing.T) {
 		}
 		argv := shimArgv(execShim, profile, spawner, "/bin/cat", "/mnt/sec/key")
 		fill()
-		cmd := exec.Command(argv[0], argv[1:]...)
-		cmd.Env = []string{
+		cmd := shimCommand(t, argv, []string{
 			"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
 			"DYLD_INSERT_LIBRARIES=" + dylib,
 			"K3SM_ROOTFS=" + dataVol,
 			"K3SM_MOUNT_PATHS=/mnt/sec",
 			supervisor.ChildReportEnv + "=" + reportPath,
-		}
+		})
 		_ = cmd.Run() // cat fails on the host path; only the file size matters
 		st, err := os.Stat(reportPath)
 		if err != nil {

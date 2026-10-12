@@ -28,9 +28,17 @@ type SpawnSpec struct {
 	Path string
 	// Argv is the full argument vector (Argv[0] is conventionally Path).
 	Argv []string
-	// Env is the child environment. It must already contain any
-	// DYLD_INSERT_LIBRARIES the pod needs; the spawner passes it through verbatim.
+	// Env is the child environment, passed through verbatim (nil = this
+	// process's own). It must be empty when Launch is set: a launch-mode
+	// exec-shim never starts with the pod's environment in its own environ
+	// (see LaunchPayload).
 	Env []string
+	// Launch, when set, is the payload a launch-mode exec-shim reads from
+	// LaunchSpecChildFD: the pod's environment and the daemon's hand-offs.
+	// The spawner writes it on a pipe dup2'd onto that descriptor and starts
+	// the child with an EMPTY environment; a non-empty Env is refused
+	// (ErrLaunchEnviron).
+	Launch *LaunchPayload
 	// Dir is the child working directory: an absolute path the child chdirs
 	// into before exec (a posix_spawn chdir file action, never a chdir of this
 	// shared daemon process). "" means "inherit the caller's cwd".
@@ -68,7 +76,7 @@ type SpawnSpec struct {
 	KeepGroup bool
 	// ExecSyncFD is the write end of the exec-sync pipe, dup2'd onto the
 	// child's fd ExecSyncChildFD (0 = none). The exec-shim marks that
-	// descriptor close-on-exec (ExecSyncFDEnv), so the parent's read end sees
+	// descriptor close-on-exec (LaunchPayload.ExecSync), so the parent's read end sees
 	// EOF at the moment the shim execs the pod binary, or when it exits. It is
 	// set by Process.ObserveExec, never by a caller.
 	ExecSyncFD uintptr
@@ -78,17 +86,18 @@ type SpawnSpec struct {
 // spawned exec-shim (see SpawnSpec.ExecSyncFD).
 const ExecSyncChildFD = 3
 
-// ExecSyncFDEnv names the environment variable telling the exec-shim which
-// inherited descriptor is the exec-sync pipe. The shim marks it close-on-exec
-// and removes the variable before it execs the pod, so neither reaches the pod.
-const ExecSyncFDEnv = "K3SM_EXEC_SYNC_FD"
-
-// ExecArgv0Env names the environment variable carrying the argv[0] the pod
-// binary must see when it differs from the path the shim execs (a re-signed
-// shell copy exec'd as "sh" so bash enters POSIX mode). The shim substitutes it
-// and removes the variable before exec. A shim that predates it ignores it and
-// runs the copy under its own path, which is a working shell minus POSIX mode.
-const ExecArgv0Env = "K3SM_EXEC_ARGV0"
+// childEnv is the environment the spawned child receives: none at all for a
+// launch-spec spawn, else Env (nil = this process's own). It refuses a
+// launch-spec spawn that also carries an environ.
+func (s SpawnSpec) childEnv() ([]string, error) {
+	if s.Launch == nil {
+		return s.Env, nil
+	}
+	if len(s.Env) != 0 {
+		return nil, ErrLaunchEnviron
+	}
+	return []string{}, nil
+}
 
 // Spawner posix_spawns a pod process in its own session/process group and
 // returns the child pid. It is the supervisor's spawn seam; the production

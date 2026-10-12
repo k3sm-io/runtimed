@@ -61,14 +61,17 @@ func RunExecSession(rlimits, qos string, argv []string) error {
 	if err != nil {
 		return err
 	}
-	path, execArgv := takeExecHandoff(argv)
+	// No daemon hand-off reaches an exec session: the session runs its
+	// command as sent, with this process's environment (see the resident
+	// shim's Exec for why exec mode, unlike launch mode, keeps one).
+	path, execArgv, env := argv[0], argv, os.Environ()
 	// A bare name (`kubectl cp` sends `tar`) is searched on the session's own
 	// PATH; argv is untouched, so the program still sees the name it was given.
 	path, err = supervisor.ResolveExecPath(path, os.Getenv("PATH"), os.Stat)
 	if err != nil {
 		return err
 	}
-	seam := sessionSeam{&podLaunchSeam{path: path, argv: execArgv}}
+	seam := sessionSeam{&podLaunchSeam{path: path, argv: execArgv, env: env}}
 	_, err = supervisor.RunLaunchSequence(seam, supervisor.LaunchSpec{Rlimits: plan, BgQoS: bg}, os.Geteuid())
 	return err
 }

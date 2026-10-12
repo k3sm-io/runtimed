@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -282,8 +283,8 @@ func nativeShellBox(rt *Runtime, podID string) *runtimev1.PodBox {
 }
 
 // TestShadowRewriteReachesTheSpawn proves the rewrite is what the exec-shim is
-// handed: the copy as the file, the original argv[0] through ExecArgv0Env
-// (and only in the spawn env, never in the container's own), and
+// handed: the copy as the file, the original argv[0] as the launch payload's
+// Argv0 (never a variable in the container's environment), and
 // K3SM_SHADOW_DIR plus the interposer in the container env.
 func TestShadowRewriteReachesTheSpawn(t *testing.T) {
 	sp := &fakeSpawner{}
@@ -298,8 +299,8 @@ func TestShadowRewriteReachesTheSpawn(t *testing.T) {
 	if got, want := spec.Argv[len(spec.Argv)-3:], []string{filepath.Join(dir, "bash"), "-c", "exec app"}; !slices.Equal(got, want) {
 		t.Errorf("shim exec argv tail = %q, want %q", got, want)
 	}
-	if got := mustEnvValue(t, spec.Env, supervisor.ExecArgv0Env); got != "/bin/sh" {
-		t.Errorf("%s = %q, want /bin/sh", supervisor.ExecArgv0Env, got)
+	if spec.Launch == nil || spec.Launch.Argv0 != "/bin/sh" {
+		t.Errorf("launch payload Argv0 = %+v, want /bin/sh", spec.Launch)
 	}
 	if got := mustEnvValue(t, spec.Env, shadowDirEnv); got != dir {
 		t.Errorf("%s = %q, want %q", shadowDirEnv, got, dir)
@@ -313,8 +314,8 @@ func TestShadowRewriteReachesTheSpawn(t *testing.T) {
 	p.mu.Lock()
 	cpEnv := p.containers[0].env
 	p.mu.Unlock()
-	if _, ok := envValue(cpEnv, supervisor.ExecArgv0Env); ok {
-		t.Errorf("the container env (what Exec enters) carries %s", supervisor.ExecArgv0Env)
+	if _, ok := envValue(cpEnv, "K3SM_EXEC_ARGV0"); ok {
+		t.Errorf("the container env (what Exec enters) carries the retired K3SM_EXEC_ARGV0 hand-off")
 	}
 
 	t.Run("a missing copy keeps the host binary", func(t *testing.T) {
@@ -336,10 +337,13 @@ func TestShadowRewriteReachesTheSpawn(t *testing.T) {
 		if got := spec.Argv[len(spec.Argv)-3]; got != "/bin/sh" {
 			t.Errorf("exec file = %q, want /bin/sh", got)
 		}
-		for _, k := range []string{supervisor.ExecArgv0Env, shadowDirEnv, dyldInsertEnv} {
+		for _, k := range []string{shadowDirEnv, dyldInsertEnv} {
 			if _, ok := envValue(spec.Env, k); ok {
 				t.Errorf("%s set with the feature off", k)
 			}
+		}
+		if spec.Launch == nil || spec.Launch.Argv0 != "" {
+			t.Errorf("launch payload Argv0 = %+v, want none with the feature off", spec.Launch)
 		}
 	})
 }
@@ -459,9 +463,11 @@ func TestExecEnvCarriesConfiguredShadowDir(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	st := newFakeExecStream(ctx)
-	// /usr/bin/env is a platform binary: dyld ignores the (nonexistent) test
-	// shim in DYLD_INSERT_LIBRARIES and it prints the environment it was given.
-	st.feed(&runtimev1.ExecRequest{PodId: "pod-exec-shadow", Command: []string{"/usr/bin/env"}})
+	// The recording backend runs the command unwrapped, and the session's
+	// environment is not in its environ but in the launch payload on
+	// supervisor.LaunchSpecChildFD, which the shim turns into the session's
+	// envp verbatim. cat (a platform binary) prints that payload.
+	st.feed(&runtimev1.ExecRequest{PodId: "pod-exec-shadow", Command: []string{"/bin/cat", "/dev/fd/" + strconv.Itoa(supervisor.LaunchSpecChildFD)}})
 	st.closeSend()
 	if err := rt.Exec(st); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -470,9 +476,13 @@ func TestExecEnvCarriesConfiguredShadowDir(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exec exit = %d; output:\n%s", code, out)
 	}
+	payload, err := supervisor.DecodeLaunchPayload(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode the session's launch payload: %v\n%s", err, out)
+	}
 	var got []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if v, ok := strings.CutPrefix(line, shadowDirEnv+"="); ok {
+	for _, e := range payload.Env {
+		if v, ok := strings.CutPrefix(e, shadowDirEnv+"="); ok {
 			got = append(got, v)
 		}
 	}
@@ -549,7 +559,7 @@ func TestScriptEntrypointIsGatedOnItsInterpreter(t *testing.T) {
 		script     string
 		wantGate   string
 		wantExec   []string // the exec argv tail handed to the shim
-		wantArgv0  string   // ExecArgv0Env, "" = unset
+		wantArgv0  string   // LaunchPayload.Argv0, "" = unset
 		wantReject bool
 	}{
 		{"#!/bin/sh with a shadow set: the copy runs, gated on /bin/sh", shadow, shScript,
@@ -616,9 +626,11 @@ func TestScriptEntrypointIsGatedOnItsInterpreter(t *testing.T) {
 			if got := spec.Argv[len(spec.Argv)-len(tc.wantExec):]; !slices.Equal(got, tc.wantExec) {
 				t.Errorf("exec argv tail = %q, want %q", got, tc.wantExec)
 			}
-			got, _ := envValue(spec.Env, supervisor.ExecArgv0Env)
-			if got != tc.wantArgv0 {
-				t.Errorf("%s = %q, want %q", supervisor.ExecArgv0Env, got, tc.wantArgv0)
+			if spec.Launch == nil {
+				t.Fatal("the spawn carries no launch payload")
+			}
+			if got := spec.Launch.Argv0; got != tc.wantArgv0 {
+				t.Errorf("launch payload Argv0 = %q, want %q", got, tc.wantArgv0)
 			}
 		})
 	}

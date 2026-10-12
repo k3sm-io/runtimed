@@ -184,13 +184,12 @@ func (p *Process) openExecSync() (SpawnSpec, *os.File, *os.File) {
 		return spec, nil, nil
 	}
 	spec.ExecSyncFD = w.Fd()
-	// A nil Env means "inherit this process's environment" to the spawner, so
-	// the variable is appended to that, never to an empty list.
-	base := spec.Env
-	if base == nil {
-		base = os.Environ()
+	if spec.Launch != nil {
+		// A copy, so the caller's payload is never mutated.
+		l := *spec.Launch
+		l.ExecSync = true
+		spec.Launch = &l
 	}
-	spec.Env = append(append([]string{}, base...), fmt.Sprintf("%s=%d", ExecSyncFDEnv, ExecSyncChildFD))
 	return spec, r, w
 }
 

@@ -25,11 +25,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // buildExecShim builds and ad-hoc signs the k3sm-execshim helper for the ambient
@@ -109,20 +112,26 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 	if err := os.WriteFile(pf, []byte(profile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Shim contract: launch <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary>...
-	// "-1 -1 -" requests no privilege drop (run as the test/daemon identity); the
-	// two launch-spec tokens are the empty sentinels supervisor.EncodeRlimits(nil)
-	// and EncodeQoS(false) both emit — no setrlimit plan, no background QoS. They
-	// sit before the profile path so binary skew fails closed (execshim.go).
-	full := append([]string{"launch", "-1", "-1", "-", "-", "-", pf}, argv...)
+	// Shim contract: launch spec=4 <uid> <gid> <groups-csv> <rlimits> <qos> <profile.sb> <pod-binary>...
+	// spec=4 names the launch payload (env reaches the pod through it, never the
+	// shim's own environ). "-1 -1 -" requests no privilege drop (run as the
+	// test/daemon identity); the two launch-spec tokens are the empty sentinels
+	// supervisor.EncodeRlimits(nil) and EncodeQoS(false) both emit — no setrlimit
+	// plan, no background QoS. They sit before the profile path so binary skew
+	// fails closed (execshim.go).
+	full := append([]string{"launch", supervisor.LaunchSpecToken, "-1", "-1", "-", "-", "-", pf}, argv...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shim, full...)
-	cmd.Env = env
+	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{Env: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	err := cmd.Run()
+	err = cmd.Run()
 	return buf.String(), err
 }
 
@@ -280,6 +289,60 @@ func TestIntegrationDYLDPreserved(t *testing.T) {
 	}
 	if !strings.Contains(out, "MARKER-CONSTRUCTOR-RAN") {
 		t.Errorf("DYLD insert dylib constructor did not run under the shim.\noutput:\n%s", out)
+	}
+}
+
+// TestIntegrationLaunchShimNeverLoadsPodDylib is the rig negative case of the
+// empty-environ launch, runnable without root: a DYLD_INSERT_LIBRARIES the pod
+// sets names a library whose constructor appends getprogname() to a marker
+// file. Through the real exec-shim, the pod binary must load it (the env still
+// reaches the pod) and the shim — unconfined and not yet dropped when dyld
+// runs — must not. Before the payload channel the shim held the pod's
+// environment in its own environ and the marker named k3sm-execshim.
+func TestIntegrationLaunchShimNeverLoadsPodDylib(t *testing.T) {
+	shim := buildExecShim(t)
+	posture, work := podVolume(t, "pod-dyld-neg")
+	marker := filepath.Join(work, "marker.txt")
+
+	dylib := filepath.Join(work, "libpodmarker.dylib")
+	dySrc := filepath.Join(work, "podmarker.c")
+	src := "#include <fcntl.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n" +
+		"__attribute__((constructor)) static void mark(void){" +
+		"int fd=open(\"" + marker + "\",O_WRONLY|O_APPEND|O_CREAT,0644);" +
+		"if(fd<0)return;const char*n=getprogname();write(fd,n,strlen(n));write(fd,\"\\n\",1);close(fd);}\n"
+	if err := os.WriteFile(dySrc, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("clang", "-dynamiclib", "-o", dylib, dySrc).CombinedOutput(); err != nil {
+		t.Skipf("clang unavailable to build dylib (%v): %s", err, out)
+	}
+	pod := filepath.Join(work, "podbin")
+	podSrc := filepath.Join(work, "pod.c")
+	if err := os.WriteFile(podSrc, []byte("int main(void){return 0;}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("clang", "-o", pod, podSrc).CombinedOutput(); err != nil {
+		t.Skipf("clang unavailable to build pod (%v): %s", err, out)
+	}
+	if out, err := exec.Command("codesign", "-s", "-", "-f", pod).CombinedOutput(); err != nil {
+		t.Fatalf("codesign pod: %v\n%s", err, out)
+	}
+
+	profile := genProfile(t, posture, work, "/private/tmp", "/private/var/folders", work)
+	env := []string{"PATH=/usr/bin:/bin", "DYLD_INSERT_LIBRARIES=" + dylib}
+	if out, err := runUnderShim(t, shim, profile, env, pod); err != nil {
+		t.Fatalf("pod under shim failed: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("no marker: the pod never loaded its own DYLD insert (%v)", err)
+	}
+	loaders := strings.Fields(string(data))
+	if !slices.Contains(loaders, "podbin") {
+		t.Errorf("marker = %q: the pod binary did not load its DYLD insert", loaders)
+	}
+	if slices.Contains(loaders, ExecShimName) {
+		t.Errorf("marker = %q: the pod's DYLD insert loaded into the exec-shim before its confinement", loaders)
 	}
 }
 
