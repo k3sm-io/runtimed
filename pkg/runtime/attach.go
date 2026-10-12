@@ -108,6 +108,10 @@ const logStreamLostMarker = "k3sm: log stream re-attached after a daemon restart
 // observed but whose status could not be collected (supervisor.ErrExitUnknown).
 const ExitStatusUnknownReason = "ExitStatusUnknown"
 
+// KilledExternallyReason is the terminated reason of a container that died by a
+// SIGKILL before its exec was observed which this daemon did not send.
+const KilledExternallyReason = "KilledExternally"
+
 // exitCodeUnknown is the exit code reported with ExitStatusUnknownReason. A real
 // wait status is 0-255 (or 128+signal), so -1 cannot be mistaken for one, and it
 // is non-zero so the phase accounting never reads the container as Succeeded.

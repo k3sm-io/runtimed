@@ -124,6 +124,12 @@ type Process struct {
 	childStart int64
 	killSig    atomic.Int32
 
+	// execSeen is set when the exec-sync pipe reached EOF (see awaitExec);
+	// externalKill is set once, by shimExit, for an unexplained SIGKILL before
+	// that (see ExternalKill).
+	execSeen     atomic.Bool
+	externalKill atomic.Bool
+
 	done      chan struct{} // closed once the process is reaped
 	drained   chan struct{} // closed once BOTH log pumps have copied output to EOF
 	drainOnce sync.Once     // guards the single close of drained (idempotent, panic-safe)
@@ -207,6 +213,7 @@ func (p *Process) awaitExec(r *os.File, pid int) {
 	for {
 		_, err := r.Read(b[:])
 		if errors.Is(err, io.EOF) {
+			p.execSeen.Store(true)
 			p.execObserver(pid, true)
 			return
 		}
