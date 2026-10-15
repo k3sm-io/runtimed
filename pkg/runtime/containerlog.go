@@ -100,6 +100,31 @@ func restartCountFromLogDir(dir string) (int32, error) {
 	return highest + 1, nil
 }
 
+// containerLogInstance picks the instance number a NEW container instance runs
+// as, and the CRI log file it writes, on either spine. want is the restart count
+// the instance is being started AS (0 for a first start, the previous count + 1
+// for a restart), and it is a FLOOR: the number is max(want, one past the
+// highest file already in the container's log dir), so a daemon restart cannot
+// re-open a file an earlier run wrote. The number is BOTH the file name and the
+// status's restart_count, so the two can never disagree, and `kubectl logs
+// --previous` reads the replaced instance's own file.
+//
+// A directory that cannot be listed is a node-side problem, not this
+// container's: it is logged and the requested number is kept rather than
+// refusing to start a container over a file name.
+func (r *Runtime) containerLogInstance(podID, logDirectory, container string, want int32) (int32, string) {
+	logDir := containerLogDir(logDirectory, container)
+	instance := want
+	onDisk, err := restartCountFromLogDir(logDir)
+	if err != nil {
+		r.log.Warn("could not read the container log dir; using the requested instance number",
+			"pod", podID, "container", container, "dir", logDir, "err", err)
+	} else if onDisk > instance {
+		instance = onDisk
+	}
+	return instance, filepath.Join(logDir, containerLogFile(instance))
+}
+
 // logChunk is one chunk of a container's output as the live fan-out carries it:
 // exactly what was written to the file, with its stream label and CRI partial
 // tag intact.

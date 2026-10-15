@@ -56,10 +56,11 @@ type verbRefusal struct {
 //   - vm pod: codes.Unimplemented + UNSUPPORTED. A vm pod's containers are guest
 //     processes with no host containerProc, so every step after this one
 //     (findContainer, the process-group GracefulStop, a re-spawn) operates on
-//     state a vm pod does not have. Killing or restarting one container inside a
-//     running guest needs a guest-agent verb guest/v1 does not define, so the
-//     honest answer is a typed "the backend does not implement this" rather than
-//     a silent no-op. The provider reads Unimplemented and does not retry.
+//     state a vm pod does not have. Stopping one container inside a running
+//     guest needs a guest-agent verb guest/v1 does not define, so the honest
+//     answer is a typed "the backend does not implement this" rather than a
+//     silent no-op. The provider reads Unimplemented and does not retry.
+//     RestartContainer never reaches this arm: it forks to restartGuest first.
 //   - pod being deleted (p.stopping): FailedPrecondition + NOT_FOUND, the answer
 //     the installer gives a spawn that lands during a delete — the pod is not
 //     going to exist, so no retry helps. DeletePod's teardown owns every process

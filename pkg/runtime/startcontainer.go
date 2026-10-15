@@ -89,8 +89,8 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 		return startFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
 			"pod %s not found", req.GetPodId()), nil
 	}
-	// The vm fork, at the top and before any .proc touch — the same one
-	// RestartContainer takes, for the same reason: a vm pod's containers are
+	// The vm fork, at the top and before any .proc touch — where
+	// RestartContainer forks too, for the same reason: a vm pod's containers are
 	// guest processes with no host containerProc, so nothing below applies to
 	// one. A guest container that failed to start is the guest agent's to
 	// re-attempt, and guest/v1 defines no per-container start verb, so the

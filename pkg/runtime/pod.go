@@ -123,7 +123,7 @@ type pod struct {
 	//
 	// Written once at assembly, before the pod is reachable or either
 	// supervision goroutine starts, and never mutated afterwards — a vm pod has
-	// no re-pull path (RestartContainer refuses one), so the plan's answer stays
+	// no re-pull path (an in-guest restart reuses the booted root), so the plan's answer stays
 	// true for the pod's whole life. Read under mu with the rest of the status
 	// state.
 	guestImagePulls map[string]vmImagePull
@@ -132,9 +132,23 @@ type pod struct {
 	// instead by the per-container guest log follower
 	// (followGuestContainerLog). A vm pod's containers have no containerProc to
 	// hang a writer off, so the pod holds them; they are closed with the rest
-	// of the pod's log handles at teardown. Written once at assembly, before
-	// the pod is reachable, and read under mu with the rest of the status state.
+	// of the pod's log handles at teardown. Written at assembly, before the pod
+	// is reachable, and replaced per container by an in-guest restart (each
+	// instance writes its own file); read and written under mu.
 	guestLogs map[string]*crilog.Writer
+	// guestLogFollow holds the running follower for each vm container, keyed
+	// by name: present while the follower goroutine runs, and carrying the
+	// writer it is currently writing into. It is what lets a restart replace a
+	// container's writer without closing one under a follower still draining
+	// the previous instance's tail. Guarded by mu.
+	guestLogFollow map[string]*guestLogFollower
+	// guestRestarts holds the in-guest restart in flight for each vm container,
+	// keyed by name. Its presence is the restart's claim, and the ContainerEvents
+	// fold consumes it on the replacement's start. Guarded by mu.
+	guestRestarts map[string]*guestRestart
+	// guestPIDs is the guest pid of each vm container's last folded start: how
+	// the fold tells a replacement's start from a replayed one. Guarded by mu.
+	guestPIDs map[string]int32
 
 	// cpuAcc carries each container's cumulative CPU across restarts so the value
 	// ListPodStats reports is monotone for the pod's whole life: a restarted
@@ -1164,7 +1178,13 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 			continue
 		}
 		p.guestLogs[name] = w
-		go r.followGuestContainerLog(supCtx, box.GetPodId(), name, w)
+	}
+	// The followers start only once the map is whole: each one reads it under
+	// p.mu, and the fill above writes it unlocked while the pod is unreachable.
+	for _, gc := range cplan.containers {
+		if p.guestLogs[gc.Name] != nil {
+			r.startGuestLogFollower(p, gc.Name)
+		}
 	}
 	go r.watchVMPodEvents(supCtx, p)
 	go r.watchVMHelperExit(supCtx, p)
@@ -1626,19 +1646,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// against what is on disk as well as against the requested restart count
 	// (see wantRestart), and it becomes BOTH the file name and the status's
 	// restart_count, so the two can never disagree.
-	logDir := containerLogDir(p.box.GetLogDirectory(), c.GetName())
-	instance := wantRestart
-	onDisk, derr := restartCountFromLogDir(logDir)
-	if derr != nil {
-		// A directory that cannot be listed is a node-side problem, not this
-		// container's: log it and keep the requested number rather than refuse
-		// to start the pod over a file name.
-		r.log.Warn("could not read the container log dir; using the requested instance number",
-			"pod", p.box.GetPodId(), "container", c.GetName(), "dir", logDir, "err", derr)
-	} else if onDisk > instance {
-		instance = onDisk
-	}
-	logPath := filepath.Join(logDir, containerLogFile(instance))
+	instance, logPath := r.containerLogInstance(p.box.GetPodId(), p.box.GetLogDirectory(), c.GetName(), wantRestart)
 	// A container's output goes either to its resident shim, which writes the
 	// CRI log itself and outlives this daemon, or — for a backend whose helper
 	// cannot stay resident — through pipes into a log writer held here.

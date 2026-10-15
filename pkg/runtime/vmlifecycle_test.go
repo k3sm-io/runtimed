@@ -18,15 +18,24 @@ package runtime
 
 import (
 	"context"
+	"net"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 
+	"k3sm.io/runtimed/pkg/crilog"
+	"k3sm.io/runtimed/pkg/guestagent"
 	"k3sm.io/runtimed/pkg/image"
 
+	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -316,38 +325,236 @@ func TestVMHelperExitFailsTheRunningPod(t *testing.T) {
 	t.Fatalf("the pod stayed at %v after its helper exited; a dead machine must not leave a pod Running", phase)
 }
 
-// TestRestartContainerRefusesAVMPod asserts the vm fork is at the TOP of
-// RestartContainer, before any containerProc is touched.
-//
-// A vm pod's containers are guest processes, so every line of the host path
-// operates on state it does not have. Restarting one inside a running guest needs
-// a guest/v1 verb that does not exist, so the honest answer is a typed
-// Unimplemented — never a silent no-op that would report a bumped restart_count
-// for a container nothing restarted.
-func TestRestartContainerRefusesAVMPod(t *testing.T) {
-	rt, _, box := bootedVMRuntime(t, "pod-vm-5", 5)
+// guestExecutor stands in for the guest's container executor behind the real
+// agent: a restart publishes the old instance's exit and the new instance's start
+// on the agent's own event bus, exactly the two events the shipped executor's
+// stop and start steps publish, and records what it was asked.
+type guestExecutor struct {
+	events  *guestagent.Events
+	nextPID int32
+
+	mu    sync.Mutex
+	calls []string
+	grace time.Duration
+}
+
+func (g *guestExecutor) RestartContainer(_ context.Context, container string, grace time.Duration) error {
+	g.mu.Lock()
+	g.calls = append(g.calls, container)
+	g.grace = grace
+	g.nextPID++
+	pid := g.nextPID
+	g.mu.Unlock()
+	g.events.Publish(guestagent.ContainerEvent{Container: container, At: time.Now(),
+		Exited: &guestagent.ContainerExited{Signal: 15}})
+	g.events.Publish(guestagent.ContainerEvent{Container: container, At: time.Now(),
+		Started: &guestagent.ContainerStarted{PID: pid}})
+	return nil
+}
+
+func (g *guestExecutor) snapshot() ([]string, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.calls...), g.grace
+}
+
+// bootedVMRuntimeWithAgent is bootedVMRuntime with the pod's guest agent served
+// in-process (the shipped guestagent.Server over the GuestDialer seam), its
+// "main" container already started, and that start folded into the pod's status.
+func bootedVMRuntimeWithAgent(t *testing.T, podID string, graceSeconds int64) (*Runtime, *pod, *guestExecutor) {
+	t.Helper()
+	events := guestagent.NewEvents(16)
+	events.Publish(guestagent.ContainerEvent{Container: "main", At: time.Now(),
+		Started: &guestagent.ContainerStarted{PID: 100}})
+	exec := &guestExecutor{events: events, nextPID: 100}
+	dial := startRealGuestAgent(t, podID, guestagent.Deps{
+		Runner:    stubRunner{names: []string{"main"}},
+		Logs:      stubLogs{},
+		Status:    stubStatus{st: guestagent.Status{Ready: true, GuestIP: "10.0.0.9"}},
+		Events:    events,
+		Restarter: exec,
+	})
+	vmb := &fakeVMBackend{available: true, bootOK: true}
+	rt := newTestRuntime(t, Deps{
+		VMBackend:   vmb,
+		Network:     &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+		Resolver:    fakeResolver{},
+		GuestDialer: dial,
+	})
+	box := vmPodBox(rt, podID, graceSeconds)
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+	}
+	p, ok := rt.lookupPod(podID)
+	if !ok {
+		t.Fatal("the created vm pod is not registered")
+	}
+	waitGuestContainer(t, p, "main", func(st *runtimev1.ContainerStatus) bool {
+		return st.GetState().GetRunning() != nil
+	})
+	return rt, p, exec
+}
+
+// waitGuestContainer polls the pod's folded status for name until ok holds.
+func waitGuestContainer(t *testing.T, p *pod, name string, ok func(*runtimev1.ContainerStatus) bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		st, _ := proto.Clone(p.guestContainers[name]).(*runtimev1.ContainerStatus)
+		p.mu.Unlock()
+		if st != nil && ok(st) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("container %s never reached the expected status", name)
+}
+
+// TestRestartContainerRestartsAVMPodContainer asserts the vm fork at the top of
+// RestartContainer routes a vm pod's restart to its guest, and that the host
+// keeps what CRI says the runtime keeps: the count, the previous run as
+// last_termination_state, and a new log file per instance, so `kubectl logs
+// --previous` reads the replaced run's own file. Without the fork the host path
+// answers Unimplemented, which is the refusal this verb used to give.
+func TestRestartContainerRestartsAVMPodContainer(t *testing.T) {
+	const podID = "pod-vm-6"
+	rt, p, exec := bootedVMRuntimeWithAgent(t, podID, 5)
+	rt.setGuestCapabilities(p, guestagent.Capabilities())
+	p.mu.Lock()
+	oldID := p.guestContainers["main"].GetContainerId()
+	p.mu.Unlock()
 
 	resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
-		PodId: box.GetPodId(), Container: "main",
+		PodId: podID, Container: "main", Reason: "liveness probe failed",
 	})
 	if err != nil {
 		t.Fatalf("RestartContainer: %v", err)
 	}
-	if resp.GetStatus() != nil {
-		t.Error("a refused restart returned a container status; a caller could read that as a completed restart")
+	if resp.GetError() != nil {
+		t.Fatalf("RestartContainer refused: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
 	}
-	if got := codes.Code(resp.GetError().GetCode()); got != codes.Unimplemented {
-		t.Errorf("code = %v, want %v", got, codes.Unimplemented)
+	calls, grace := exec.snapshot()
+	if len(calls) != 1 || calls[0] != "main" {
+		t.Fatalf("guest restarts = %v, want exactly [main]", calls)
 	}
-	// UNSUPPORTED, not INTERNAL: a verb the backend does not implement is not
-	// an unexpected runtime error (the reason StopContainer's vm branch shares).
-	if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED {
-		t.Errorf("failure_reason = %v, want UNSUPPORTED", got)
+	if grace != 5*time.Second {
+		t.Errorf("guest grace = %v, want the pod's 5s", grace)
 	}
-	if resp.GetError().GetMessage() == "" {
-		t.Error("the refusal carries no message")
+
+	st := resp.GetStatus()
+	if st.GetRestartCount() != 1 {
+		t.Errorf("restart_count = %d, want 1", st.GetRestartCount())
 	}
-	_ = status.New(codes.Unimplemented, "")
+	if st.GetState().GetRunning() == nil {
+		t.Errorf("state = %v, want running", st.GetState())
+	}
+	if st.GetContainerId() == "" || st.GetContainerId() == oldID {
+		t.Errorf("container id = %q, want a new id for the new instance (old %q)", st.GetContainerId(), oldID)
+	}
+	last := st.GetLastTerminationState().GetTerminated()
+	if last == nil {
+		t.Fatal("no last_termination_state: the replaced run is lost")
+	}
+	if last.GetContainerId() != oldID {
+		t.Errorf("last state id = %q, want the replaced run's %q", last.GetContainerId(), oldID)
+	}
+	if last.GetReason() != "Killed" || last.GetMessage() != "liveness probe failed" {
+		t.Errorf("last state = %s/%q, want Killed with the request's reason", last.GetReason(), last.GetMessage())
+	}
+	logDir := containerLogDir(testPodLogDir(rt, podID), "main")
+	if want := filepath.Join(logDir, "1.log"); st.GetLogPath() != want {
+		t.Errorf("log path = %q, want the new instance's %q", st.GetLogPath(), want)
+	}
+	if want := filepath.Join(logDir, "0.log"); last.GetLogPath() != want {
+		t.Errorf("last state log path = %q, want the replaced run's %q", last.GetLogPath(), want)
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "1.log")); err != nil {
+		t.Errorf("the new instance's log file was not created: %v", err)
+	}
+	ps := rt.podStatus(p)
+	if got := ps.GetContainerStatuses()[0].GetRestartCount(); got != 1 {
+		t.Errorf("pod status restart_count = %d, want 1: the status and the response disagree", got)
+	}
+}
+
+// TestRestartContainerRefusesAGuestWithoutTheCapability asserts a vm pod whose
+// guest cannot restart a container in place gets a typed refusal that names
+// the fix, and that nothing is touched: FailedPrecondition + UNSUPPORTED,
+// because the booted initramfs will not change and a recreated pod is the
+// remedy. It covers both ways to be such a guest: one whose Health did not
+// advertise the token, and one that was asked before its Health was read and
+// answered Unimplemented.
+func TestRestartContainerRefusesAGuestWithoutTheCapability(t *testing.T) {
+	assertRefusal := func(t *testing.T, resp *runtimev1.RestartContainerResponse) {
+		t.Helper()
+		if resp.GetStatus() != nil {
+			t.Error("a refused restart returned a container status; a caller could read that as a completed restart")
+		}
+		if got := codes.Code(resp.GetError().GetCode()); got != codes.FailedPrecondition {
+			t.Errorf("code = %v, want %v", got, codes.FailedPrecondition)
+		}
+		if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED {
+			t.Errorf("failure_reason = %v, want UNSUPPORTED", got)
+		}
+		msg := resp.GetError().GetMessage()
+		if !strings.Contains(msg, "predates") || !strings.Contains(msg, guestagent.CapabilityRestartContainer) {
+			t.Errorf("message = %q; it must say the booted initramfs predates the verb and name the capability", msg)
+		}
+	}
+
+	t.Run("health-did-not-advertise-it", func(t *testing.T) {
+		rt, _, box := bootedVMRuntime(t, "pod-vm-5", 5)
+		p, _ := rt.lookupPod(box.GetPodId())
+		rt.setGuestCapabilities(p, nil)
+		resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
+			PodId: box.GetPodId(), Container: "main",
+		})
+		if err != nil {
+			t.Fatalf("RestartContainer: %v", err)
+		}
+		assertRefusal(t, resp)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if len(p.guestRestarts) != 0 {
+			t.Error("a refused restart left a claim behind")
+		}
+	})
+
+	t.Run("an-older-agent-answers-unimplemented", func(t *testing.T) {
+		const podID = "pod-vm-7"
+		lis := bufconn.Listen(1 << 20)
+		srv := grpc.NewServer()
+		guestv1.RegisterGuestAgentServer(srv, olderGuestAgent{})
+		served := make(chan struct{})
+		go func() { defer close(served); _ = srv.Serve(lis) }()
+		t.Cleanup(func() { srv.Stop(); <-served; _ = lis.Close() })
+		rt := newTestRuntime(t, Deps{
+			VMBackend: &fakeVMBackend{available: true},
+			GuestDialer: func(ctx context.Context, _ string) (net.Conn, error) {
+				return lis.DialContext(ctx)
+			},
+		})
+		p := addVMPod(t, rt, podID, "app")
+		p.mu.Lock()
+		p.guestContainerLocked("app", "").State = &runtimev1.ContainerState{
+			Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()}}
+		p.mu.Unlock()
+		resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
+			PodId: podID, Container: "app",
+		})
+		if err != nil {
+			t.Fatalf("RestartContainer: %v", err)
+		}
+		assertRefusal(t, resp)
+	})
+}
+
+// olderGuestAgent is an agent built before RestartContainer existed: every RPC
+// it does not implement answers Unimplemented, as the generated stub does.
+type olderGuestAgent struct {
+	guestv1.UnimplementedGuestAgentServer
 }
 
 // TestVMTeardownCancelsSupervisionBeforeStopping pins the ordering that keeps a
@@ -447,4 +654,87 @@ func deletedPodSupCancelled(t *testing.T, _ *Runtime, podID string) bool {
 	t.Helper()
 	t.Fatalf("pod %s was already deregistered when the stop hook ran, so the ordering could not be observed", podID)
 	return false
+}
+
+// sequencedLogs serves one scripted batch of entries per Logs connection, then
+// ends that stream, the way a guest ends a container's stream when the instance
+// exits. Connections past the script get an empty stream.
+type sequencedLogs struct {
+	mu      sync.Mutex
+	batches [][]guestagent.LogEntry
+}
+
+func (l *sequencedLogs) Stream(_ context.Context, _ string, sel guestagent.Selector) (<-chan guestagent.LogEntry, func(), error) {
+	l.mu.Lock()
+	var batch []guestagent.LogEntry
+	if len(l.batches) > 0 {
+		batch, l.batches = l.batches[0], l.batches[1:]
+	}
+	l.mu.Unlock()
+	ch := make(chan guestagent.LogEntry, len(batch))
+	for _, e := range batch {
+		if sel.SinceTime.IsZero() || !e.At.Before(sel.SinceTime) {
+			ch <- e
+		}
+	}
+	close(ch)
+	return ch, func() {}, nil
+}
+
+// TestGuestLogFollowerMovesToTheRestartedInstancesFile pins the log half of
+// the in-guest restart: the follower drains the old instance's output into the
+// old file, and once the pod's writer is replaced its next connection writes
+// the new instance into the new file. `kubectl logs --previous` reads the old
+// file, so a follower that kept writing into it would hand the previous view
+// the current run.
+func TestGuestLogFollowerMovesToTheRestartedInstancesFile(t *testing.T) {
+	const podID = "pod-vm-8"
+	base := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	logs := &sequencedLogs{batches: [][]guestagent.LogEntry{
+		{{At: base, Line: []byte("old"), Stream: guestagent.StreamStdout}},
+		{{At: base.Add(time.Second), Line: []byte("new"), Stream: guestagent.StreamStdout}},
+	}}
+	dial := startRealGuestAgent(t, podID, guestagent.Deps{Runner: stubRunner{names: []string{"app"}}, Logs: logs})
+	rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
+	p := addVMPod(t, rt, podID, "app")
+
+	dir := t.TempDir()
+	w0, err := crilog.Open(filepath.Join(dir, "0.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	p.guestLogs = map[string]*crilog.Writer{"app": w0}
+	p.mu.Unlock()
+	rt.startGuestLogFollower(p, "app")
+	waitLogLines(t, filepath.Join(dir, "0.log"), 1)
+
+	w1, err := crilog.Open(filepath.Join(dir, "1.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	p.guestLogs["app"] = w1
+	p.mu.Unlock()
+	waitLogLines(t, filepath.Join(dir, "1.log"), 1)
+
+	if got := readCRILog(t, filepath.Join(dir, "0.log")); len(got) != 1 || got[0].payload != "old" {
+		t.Errorf("0.log = %+v, want only the old instance's line", got)
+	}
+	if got := readCRILog(t, filepath.Join(dir, "1.log")); len(got) != 1 || got[0].payload != "new" {
+		t.Errorf("1.log = %+v, want only the new instance's line", got)
+	}
+}
+
+// waitLogLines polls a CRI log file until it holds n lines.
+func waitLogLines(t *testing.T, path string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Count(string(b), "\n") >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s never held %d lines", path, n)
 }

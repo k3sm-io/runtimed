@@ -364,6 +364,62 @@ func TestGuestAgentServesTheHostRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("restart-reaches-the-guest-and-restarts-the-container", func(t *testing.T) {
+		// The in-guest restart, end to end: the capability is read off the
+		// shipped agent's Health by the daemon's own lease poll, the daemon's
+		// RestartContainer reaches the agent's handler, the executor behind it
+		// publishes the old exit and the new start on the agent's event bus,
+		// and the daemon's fold of that stream is what advances the count.
+		events := guestagent.NewEvents(16)
+		events.Publish(guestagent.ContainerEvent{Container: "app", At: time.Now(),
+			Started: &guestagent.ContainerStarted{PID: 41}})
+		exec := &guestExecutor{events: events, nextPID: 41}
+		dial := startRealGuestAgent(t, podID, guestagent.Deps{
+			Runner:    stubRunner{names: []string{"app"}},
+			Logs:      stubLogs{},
+			Status:    stubStatus{st: guestagent.Status{Ready: true, GuestIP: "10.0.0.9"}},
+			Events:    events,
+			Restarter: exec,
+		})
+		rt := newTestRuntime(t, Deps{GuestDialer: dial, VMBackend: &fakeVMBackend{available: true}})
+		p := addVMPod(t, rt, podID, "app")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, reason := rt.pollGuestLease(ctx, p); reason != guestLeaseReasonValid {
+			t.Fatalf("lease poll reason = %s, want %s", reason, guestLeaseReasonValid)
+		}
+		if err := rt.requireGuestCapability("restart", guestagent.CapabilityRestartContainer, p); err != nil {
+			t.Fatalf("the host did not record the agent's restart capability: %v", err)
+		}
+		watched := make(chan error, 1)
+		go func() { watched <- rt.watchGuestContainerEvents(ctx, p) }()
+		defer func() { events.Close(); <-watched }()
+		waitGuestContainer(t, p, "app", func(st *runtimev1.ContainerStatus) bool {
+			return st.GetState().GetRunning() != nil
+		})
+
+		resp, err := rt.RestartContainer(ctx, &runtimev1.RestartContainerRequest{PodId: podID, Container: "app"})
+		if err != nil || resp.GetError() != nil {
+			t.Fatalf("RestartContainer: %v / %v", err, resp.GetError())
+		}
+		if calls, _ := exec.snapshot(); len(calls) != 1 || calls[0] != "app" {
+			t.Fatalf("guest restarts = %v, want exactly [app]", calls)
+		}
+		st := resp.GetStatus()
+		if st.GetRestartCount() != 1 {
+			t.Errorf("restart_count = %d, want 1", st.GetRestartCount())
+		}
+		// Both events crossed: the exit became the previous run, the start
+		// the running replacement.
+		if last := st.GetLastTerminationState().GetTerminated(); last == nil || last.GetSignal() != 15 {
+			t.Errorf("last_termination_state = %v, want the guest's SIGTERM exit", st.GetLastTerminationState())
+		}
+		if st.GetState().GetRunning() == nil {
+			t.Errorf("state = %v, want running", st.GetState())
+		}
+	})
+
 	t.Run("the-agent-rejects-a-pod-id-the-host-did-not-resolve", func(t *testing.T) {
 		// The single-pod assertion, end to end. The host re-stamps the pod id it
 		// resolved onto the first frame, so this drives the agent for a different
