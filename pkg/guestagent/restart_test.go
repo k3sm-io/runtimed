@@ -166,6 +166,43 @@ func TestGuestAgentRestartContainer(t *testing.T) {
 	})
 }
 
+// stuckRestarter never finishes on its own: it returns only when its context
+// ends, the way a hung stop or start would.
+type stuckRestarter struct{ calls chan struct{} }
+
+func (r stuckRestarter) RestartContainer(ctx context.Context, _ string, _ time.Duration) error {
+	r.calls <- struct{}{}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestGuestAgentRestartIsBoundedByItsDeadline pins the bound on the detached
+// restart: a stuck executor is ended at the clamped grace plus the start budget
+// with DeadlineExceeded, and the container's restart claim is released with it,
+// so the next restart is not refused as in flight.
+func TestGuestAgentRestartIsBoundedByItsDeadline(t *testing.T) {
+	const podID = "pod-booted"
+	saved := restartStartBudget
+	restartStartBudget = 100 * time.Millisecond
+	t.Cleanup(func() { restartStartBudget = saved })
+
+	rs := stuckRestarter{calls: make(chan struct{}, 2)}
+	client := testAgent(t, podID, Deps{Restarter: rs})
+	for i := range 2 {
+		start := time.Now()
+		_, err := client.RestartContainer(context.Background(), &guestv1.RestartContainerRequest{PodId: podID, Container: "app"})
+		if got := status.Code(err); got != codes.DeadlineExceeded {
+			t.Fatalf("attempt %d: code = %v (%v), want DeadlineExceeded; a second attempt refused as in flight means the claim leaked", i, got, err)
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("attempt %d took %v; the deadline did not bound it", i, took)
+		}
+	}
+	if n := len(rs.calls); n != 2 {
+		t.Errorf("the executor ran %d times, want 2", n)
+	}
+}
+
 // TestCaptureResetStartsAFreshInstance pins the capture half of a restart: the
 // old instance's rings were closed by its exit, and a closed ring drops what is
 // appended to it, so without Reset the new instance's output is lost.

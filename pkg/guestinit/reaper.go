@@ -67,6 +67,10 @@ var (
 	// ErrStopped is returned by Wait when the reaper stopped before the
 	// container's exit was observed.
 	ErrStopped = errors.New("reaper stopped")
+
+	// ErrUntracked is returned by StopContainer for a name the reaper has never
+	// tracked: there is no instance whose exit could ever be waited for.
+	ErrUntracked = errors.New("container was never tracked")
 )
 
 // Proc is the three-method process seam PID 1 needs from the kernel.
@@ -106,6 +110,11 @@ type ReaperOptions struct {
 	// be called concurrently from Run and from Track (a child that exits
 	// before its Track lands is delivered by Track), so it must be safe for
 	// concurrent use.
+	//
+	// It MUST NOT block on Wait or StopContainer, for any container. It runs
+	// before the exit it reports wakes a waiter (see finish), so a callback that
+	// waited on its own container would deadlock, and one that waited on
+	// another would stall the reap loop that container's exit needs.
 	OnExit func(ExitEvent)
 
 	// Logger receives the reaper's own narration; nil means slog.Default.
@@ -168,6 +177,10 @@ type Reaper struct {
 	// waiters are the per-container Wait channels, closed on that container's
 	// exit.
 	waiters map[string]chan struct{}
+	// tracked is every container name Track has ever seen, which is what lets
+	// StopContainer tell a name with no instance from one whose exit is still
+	// being delivered.
+	tracked map[string]bool
 
 	stopOnce sync.Once
 	stopErr  error
@@ -195,6 +208,7 @@ func NewReaper(proc Proc, sigchld <-chan struct{}, opts ReaperOptions) *Reaper {
 		pending:  map[int]WaitStatus{},
 		done:     map[string]WaitStatus{},
 		waiters:  map[string]chan struct{}{},
+		tracked:  map[string]bool{},
 		stopped:  make(chan struct{}),
 	}
 	if r.log == nil {
@@ -220,6 +234,7 @@ func (r *Reaper) Track(container string, pid int) {
 	// a Wait for a restarted container would return the status of the run it
 	// replaced. At boot nothing is recorded yet, so this changes nothing there.
 	delete(r.done, container)
+	r.tracked[container] = true
 	status, alreadyExited := r.unstashLocked(pid)
 	if !alreadyExited {
 		r.live[pid] = container
@@ -295,6 +310,10 @@ func (r *Reaper) reaped(pid int, status WaitStatus) {
 // StopContainer depends on it: a restart that spawned the replacement while the
 // old instance's callback was still running would have its fresh stdio
 // registration released by the callback meant for its predecessor.
+//
+// The price is the rule on ReaperOptions.OnExit: the callback must never block
+// on Wait or StopContainer, because the waiter it would block on is woken only
+// after it returns.
 func (r *Reaper) finish(container string, pid int, status WaitStatus) {
 	r.log.Info("container exited", "container", container, "pid", pid,
 		"exit_code", status.ExitCode, "signal", status.Signal)
@@ -562,14 +581,19 @@ func (r *Reaper) killLive(pids []int) []error {
 // It returns only after the exit callback for the instance has run (finish runs
 // the callback before it wakes a waiter), so a caller that starts a replacement
 // next cannot race the predecessor's exit side effects. A container that has
-// already exited is returned for at once. After Stop has begun it reports
-// ErrStopped: the machine is going away, and a container stopped now could not
-// be started again.
+// already exited is returned for at once, and a name the reaper never tracked
+// is ErrUntracked at once rather than a wait for an exit that cannot come. After
+// Stop has begun it reports ErrStopped: the machine is going away, and a
+// container stopped now could not be started again.
 func (r *Reaper) StopContainer(ctx context.Context, container string, grace time.Duration) error {
-	select {
-	case <-r.stopped:
+	if r.Stopping() {
 		return fmt.Errorf("%w: stopping container %q", ErrStopped, container)
-	default:
+	}
+	r.mu.Lock()
+	known := r.tracked[container]
+	r.mu.Unlock()
+	if !known {
+		return fmt.Errorf("%w: %q", ErrUntracked, container)
 	}
 	group := r.containerPIDs(container)
 	if len(group) > 0 {
@@ -591,6 +615,18 @@ func (r *Reaper) StopContainer(ctx context.Context, container string, grace time
 		return fmt.Errorf("stop container %q: %w", container, err)
 	}
 	return nil
+}
+
+// Stopping reports whether the guest shutdown (Stop or Fail) has begun. A
+// restart checks it immediately before spawning, so it does not start a
+// container into a machine that is powering off.
+func (r *Reaper) Stopping() bool {
+	select {
+	case <-r.stopped:
+		return true
+	default:
+		return false
+	}
 }
 
 // containerPIDs is the sorted set of container's tracked, not-yet-reaped pids.

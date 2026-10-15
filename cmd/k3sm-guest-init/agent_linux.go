@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -147,6 +148,9 @@ func (r *planRestarter) RestartContainer(ctx context.Context, container string, 
 		return fmt.Errorf("%w: %s", guestagent.ErrNotFound, container)
 	}
 	if err := r.reaper.StopContainer(ctx, container, grace); err != nil {
+		if errors.Is(err, guestinit.ErrUntracked) {
+			return fmt.Errorf("%w: %v", guestagent.ErrNotFound, err)
+		}
 		return err
 	}
 	// The old instance's rings were closed by its exit callback, and a closed
@@ -155,6 +159,12 @@ func (r *planRestarter) RestartContainer(ctx context.Context, container string, 
 	// A restart returns once the new instance runs. It never waits on it, even
 	// for an init container, whose run-to-completion gate belonged to the boot.
 	cp.WaitForExit = false
+	// Re-checked at the last moment before the spawn: a shutdown that began
+	// during the stop above owns every process, and a container started now
+	// would run into the poweroff with nothing to stop it.
+	if r.reaper.Stopping() {
+		return fmt.Errorf("restart container %s: %w", container, guestinit.ErrStopped)
+	}
 	st := &starter{ctx: ctx, log: r.log, reaper: r.reaper, events: r.events, capture: r.capture, hub: r.hub}
 	return st.Start(cp)
 }

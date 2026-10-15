@@ -34,6 +34,12 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
+// restartStartBudget bounds a RestartContainer beyond its clamped grace: the
+// start of the replacement, after the stop has spent the grace. The restart runs
+// detached from the caller, so this deadline is the only thing ending an
+// executor that never returns. A var so a test can shorten it.
+var restartStartBudget = 30 * time.Second
+
 // maxStopGraceSeconds clamps the grace the host asks for.
 //
 // guest.proto says the host clamps before sending "so the guest can treat it as
@@ -888,7 +894,9 @@ func (s *Server) Stop(ctx context.Context, req *guestv1.StopRequest) (*guestv1.S
 //
 // The restart runs detached from the RPC's cancellation. A client that goes away
 // mid-restart would otherwise leave a container that was stopped and never
-// started again; the work is bounded anyway, by the clamped grace and the start.
+// started again. It is bounded instead by its own deadline, the clamped grace
+// plus restartStartBudget, and the per-container claim is released on every
+// way out, so a stuck executor cannot refuse the container's next restart.
 //
 // One restart per container at a time. A second request for a container a
 // restart is already acting on is FailedPrecondition, because the two would stop
@@ -922,9 +930,15 @@ func (s *Server) RestartContainer(ctx context.Context, req *guestv1.RestartConta
 
 	grace := clampGrace(req.GetGraceSeconds())
 	s.log.Info("the host asked the guest to restart a container", "container", name, "grace", grace)
-	if err := s.deps.Restarter.RestartContainer(context.WithoutCancel(ctx), name, grace); err != nil {
-		if errors.Is(err, ErrNotFound) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace+restartStartBudget)
+	defer cancel()
+	if err := s.deps.Restarter.RestartContainer(rctx, name, grace); err != nil {
+		switch {
+		case errors.Is(err, ErrNotFound):
 			return nil, status.Errorf(codes.NotFound, "restart: container %q is not running in pod %s", name, s.podID)
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, status.Errorf(codes.DeadlineExceeded,
+				"restart: container %q in pod %s did not restart within %v: %v", name, s.podID, grace+restartStartBudget, err)
 		}
 		return nil, status.Errorf(codes.Internal, "restart: container %q in pod %s: %v", name, s.podID, err)
 	}
