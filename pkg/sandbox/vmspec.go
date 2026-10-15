@@ -183,42 +183,87 @@ const MaxVMHostnameLabelBytes = 63
 // second call, in validateVMSpec inside this backend, is deliberate defence in
 // depth for a direct caller of the backend that skips the first.
 //
-// Today it covers Hostname, against the runtime/v1 PodBox.hostname contract:
-// empty, or a DNS-1123 subdomain of at most MaxVMHostnameBytes bytes, i.e.
+// It covers Hostname and FQDN. Hostname is checked against the runtime/v1
+// PodBox.hostname contract: empty, or a DNS-1123 subdomain of at most MaxVMHostnameBytes bytes, i.e.
 // [a-z0-9.-] only, no empty label, no label longer than MaxVMHostnameLabelBytes,
 // and no label that starts or ends with '-'. A value outside that would
 // otherwise reach sethostname inside the guest and surface as an opaque boot
 // failure, or set a hostname no resolver can answer for. The hostname is
-// derived by the provider; this check refuses, it never rewrites.
+// derived by the provider; this check refuses, it never rewrites. FQDN is
+// checked by validateFQDN.
 func (s VMSpec) Validate() error {
+	if err := s.validateHostname(); err != nil {
+		return err
+	}
+	return s.validateFQDN()
+}
+
+// MaxVMFQDNBytes is the longest pod FQDN a guest accepts: the DNS-1123
+// subdomain limit.
+const MaxVMFQDNBytes = 253
+
+// validateFQDN checks FQDN against the PodBox.pod_fqdn contract: empty, or a
+// DNS-1123 subdomain of at most MaxVMFQDNBytes bytes whose first label equals
+// Hostname's first label. The FQDN is rendered by the provider; this check
+// refuses, it never rewrites.
+func (s VMSpec) validateFQDN() error {
+	f := s.FQDN
+	if f == "" {
+		return nil
+	}
+	if len(f) > MaxVMFQDNBytes {
+		return fmt.Errorf("%w: FQDN is %d bytes for pod %q, the limit is %d",
+			ErrInvalidVMSpec, len(f), s.PodID, MaxVMFQDNBytes)
+	}
+	if err := checkDNSSubdomain("FQDN", s.PodID, f); err != nil {
+		return err
+	}
+	short, _, _ := strings.Cut(f, ".")
+	host, _, _ := strings.Cut(s.Hostname, ".")
+	if short != host {
+		return fmt.Errorf("%w: FQDN %q for pod %q does not start with the hostname's first label %q",
+			ErrInvalidVMSpec, f, s.PodID, host)
+	}
+	return nil
+}
+
+// validateHostname checks Hostname; see Validate.
+func (s VMSpec) validateHostname() error {
 	h := s.Hostname
 	if len(h) > MaxVMHostnameBytes {
 		return fmt.Errorf("%w: Hostname is %d bytes for pod %q, the limit is %d",
 			ErrInvalidVMSpec, len(h), s.PodID, MaxVMHostnameBytes)
 	}
-	for i := 0; i < len(h); i++ {
-		c := h[i]
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' {
-			continue
-		}
-		return fmt.Errorf("%w: Hostname for pod %q has byte 0x%02x at offset %d, want [a-z0-9.-]",
-			ErrInvalidVMSpec, s.PodID, c, i)
-	}
 	if h == "" {
 		return nil
 	}
+	return checkDNSSubdomain("Hostname", s.PodID, h)
+}
+
+// checkDNSSubdomain checks v is [a-z0-9.-] only, with no empty label, no label
+// longer than MaxVMHostnameLabelBytes and no label that starts or ends with
+// '-'. field names the VMSpec field in the error.
+func checkDNSSubdomain(field, podID, v string) error {
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' {
+			continue
+		}
+		return fmt.Errorf("%w: %s for pod %q has byte 0x%02x at offset %d, want [a-z0-9.-]",
+			ErrInvalidVMSpec, field, podID, c, i)
+	}
 	start := 0
-	for _, label := range strings.Split(h, ".") {
+	for _, label := range strings.Split(v, ".") {
 		switch {
 		case label == "":
-			return fmt.Errorf("%w: Hostname for pod %q has an empty label at offset %d",
-				ErrInvalidVMSpec, s.PodID, start)
+			return fmt.Errorf("%w: %s for pod %q has an empty label at offset %d",
+				ErrInvalidVMSpec, field, podID, start)
 		case len(label) > MaxVMHostnameLabelBytes:
-			return fmt.Errorf("%w: Hostname for pod %q has a %d-byte label at offset %d, the limit is %d",
-				ErrInvalidVMSpec, s.PodID, len(label), start, MaxVMHostnameLabelBytes)
+			return fmt.Errorf("%w: %s for pod %q has a %d-byte label at offset %d, the limit is %d",
+				ErrInvalidVMSpec, field, podID, len(label), start, MaxVMHostnameLabelBytes)
 		case label[0] == '-' || label[len(label)-1] == '-':
-			return fmt.Errorf("%w: Hostname for pod %q has a label starting or ending with '-' at offset %d",
-				ErrInvalidVMSpec, s.PodID, start)
+			return fmt.Errorf("%w: %s for pod %q has a label starting or ending with '-' at offset %d",
+				ErrInvalidVMSpec, field, podID, start)
 		}
 		start += len(label) + 1
 	}

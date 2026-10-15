@@ -56,8 +56,9 @@ limitations under the License.
 // minimal in-guest DHCPv4 client against the host's NAT segment, the default
 // route is installed over netlink, and the leased address is what
 // HealthResponse.guest_ip reports. There is no renewal loop yet — see
-// guestStatus.setGuestIP for that ceiling — and /etc/hosts still carries no
-// leased address.
+// guestStatus.setGuestIP for that ceiling. /etc/hosts is re-rendered with the
+// leased address once, before any container binds it; a later lease change
+// leaves that line stale.
 //
 // Per-container cgroup2 leaves ARE here: the metering controllers are delegated to
 // the hierarchy root's children at boot and each container is placed into
@@ -220,6 +221,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 		"link", netCfg.Interface, "address", netCfg.Prefix.String(),
 		"gateway", netCfg.Lease.Gateway.String(), "mtu", netCfg.MTU,
 		"dns_offered", netCfg.Lease.DNS, "lease", netCfg.Lease.Duration.String())
+
+	// The pod line of /etc/hosts needs the lease, so the plan-time file carries
+	// none; it is re-rendered here, after the lease and BEFORE any container
+	// exists, by temp file plus rename. Every container's bind is made later,
+	// so each one binds this final inode. A lease that changes afterwards
+	// leaves the line stale: there is no renewal loop to re-render it.
+	hosts := guestinit.RenderHosts(plan.Hostname, plan.FQDN, netCfg.Lease.Address.String())
+	if err := guestinit.ReplaceEtcFile(guestinit.EtcDir, "hosts", hosts); err != nil {
+		return fmt.Errorf("re-render /etc/hosts with the lease: %w", err)
+	}
 
 	// The reaper is started before the first container, so no exit can happen
 	// while nothing is reaping.

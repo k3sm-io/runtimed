@@ -147,7 +147,7 @@ func TestRenderHostsAndHostname(t *testing.T) {
 
 	t.Run("loopback entries are always present", func(t *testing.T) {
 		t.Parallel()
-		got := RenderHosts("web-0", "")
+		got := RenderHosts("web-0", "", "")
 		for _, want := range []string{"127.0.0.1\tlocalhost\n", "::1\tlocalhost"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("hosts is missing %q:\n%s", want, got)
@@ -160,7 +160,7 @@ func TestRenderHostsAndHostname(t *testing.T) {
 
 	t.Run("the leased address maps the pod hostname", func(t *testing.T) {
 		t.Parallel()
-		got := RenderHosts("web-0", "192.168.64.7")
+		got := RenderHosts("web-0", "", "192.168.64.7")
 		if !strings.Contains(got, "192.168.64.7\tweb-0\n") {
 			t.Errorf("hosts is missing the pod entry:\n%s", got)
 		}

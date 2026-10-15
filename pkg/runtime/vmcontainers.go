@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"k3sm.io/runtimed/pkg/image"
@@ -439,6 +440,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		return resolvedVMContainer{}, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
+	run.Env = withHostnameEnv(run.Env, box.GetHostname())
 	// The uid is undetermined exactly when the pod set no runAsUser and the
 	// image's USER did not parse as a number — the RunSpec contract, read rather
 	// than re-derived by parsing the directive a second time here.
@@ -477,4 +479,28 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		SupplementalGIDs: gids,
 		OwnershipPath:    ownership,
 	}, imagePull: imagePull}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// hostnameEnv is the variable a container runtime sets to the sandbox hostname.
+const hostnameEnv = "HOSTNAME"
+
+// withHostnameEnv gives a vm container HOSTNAME=<hostname> as the LOWEST env
+// layer: it is prepended only when the merged env (the image config env under
+// the pod spec env) names no HOSTNAME, so an image ENV HOSTNAME wins over it and
+// a spec env wins over both. That is containerd's layering: the CRI runtime
+// sets HOSTNAME to the sandbox hostname beneath the image env, and the kubelet
+// sets none. An empty hostname (a hostNetwork pod) injects nothing.
+//
+// It is vm only. A native container shares the node's UTS namespace, so the
+// host-process spine sets no HOSTNAME of its own.
+func withHostnameEnv(env []string, hostname string) []string {
+	if hostname == "" {
+		return env
+	}
+	for _, e := range env {
+		if name, _, _ := strings.Cut(e, "="); name == hostnameEnv {
+			return env
+		}
+	}
+	return append([]string{hostnameEnv + "=" + hostname}, env...)
 }
