@@ -154,6 +154,12 @@ type VMSpec struct {
 	// container's /etc/hostname (guest/v1 GuestSpec.hostname). Empty leaves the
 	// guest on the kernel default, which the guest init records as a warning.
 	Hostname string
+	// FQDN is the pod's fully qualified name for the guest /etc/hosts pod line
+	// (runtime/v1 PodBox.pod_fqdn, guest/v1 GuestSpec.pod_fqdn): empty, or a
+	// DNS-1123 subdomain whose first label is Hostname's first label. Validate
+	// checks it; it is not yet forwarded into the GuestSpec, because the pinned
+	// guest init decodes the spec strictly and predates the field.
+	FQDN string
 	// FSGroup is the pod's fsGroup, honoured in the guest by idmapped mounts
 	// rather than a recursive chown (guest/v1 GuestSpec.fs_group). Zero means
 	// unset — the proto has no presence for it, so "unset" and "group 0" are

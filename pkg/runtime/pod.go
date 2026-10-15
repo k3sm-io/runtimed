@@ -928,7 +928,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// or pod dir exists, so a malformed value costs nothing. The check itself is
 	// sandbox.VMSpec.Validate, the same one the spec below passes before
 	// CreateVM; this is only the fail-fast call.
-	if err := (sandbox.VMSpec{PodID: box.GetPodId(), Hostname: box.GetHostname()}).Validate(); err != nil {
+	if err := (sandbox.VMSpec{PodID: box.GetPodId(), Hostname: box.GetHostname(), FQDN: box.GetPodFqdn()}).Validate(); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err)
 	}
@@ -1075,6 +1075,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		Containers:  cplan.containers,
 		Volumes:     vmVolumePlan(plan),
 		Hostname:    box.GetHostname(),
+		FQDN:        box.GetPodFqdn(),
 		PodDir:      podDir,
 		// one grace budget for both ends of the shutdown: the helper is given
 		// the pod's own termination grace, and DeletePod's escalation never

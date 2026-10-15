@@ -126,6 +126,11 @@ type BootPlan struct {
 	// Hostname is the guest hostname.
 	Hostname string
 
+	// FQDN is the pod's fully qualified name for the /etc/hosts pod line
+	// (GuestSpec.pod_fqdn), or empty when the pod has none. Its first label is
+	// Hostname's first label; Plan refuses a spec where it is not.
+	FQDN string
+
 	// Etc is the pod-level /etc content written under EtcDir and bound into
 	// every container.
 	Etc EtcFiles
@@ -189,13 +194,17 @@ func Plan(spec *guestv1.GuestSpec, opts Options) (*BootPlan, error) {
 		return nil, err
 	}
 
-	plan := &BootPlan{Pseudo: PseudoMounts(), Hostname: spec.GetHostname()}
+	if err := checkPodFQDN(spec.GetHostname(), spec.GetPodFqdn()); err != nil {
+		return nil, err
+	}
+
+	plan := &BootPlan{Pseudo: PseudoMounts(), Hostname: spec.GetHostname(), FQDN: spec.GetPodFqdn()}
 
 	resolv, warnings := RenderResolvConf(spec.GetResolvConf())
 	plan.Warnings = append(plan.Warnings, warnings...)
 	plan.Etc = EtcFiles{
 		ResolvConf: resolv,
-		Hosts:      RenderHosts(spec.GetHostname(), ""),
+		Hosts:      RenderHosts(spec.GetHostname(), spec.GetPodFqdn(), ""),
 		Hostname:   RenderHostname(spec.GetHostname()),
 	}
 	if spec.GetHostname() == "" {

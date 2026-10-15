@@ -89,3 +89,40 @@ func TestValidateVMSpecRefusesABadHostname(t *testing.T) {
 		t.Fatalf("validateVMSpec(bad hostname) = %v, want an ErrInvalidVMSpec naming Hostname", err)
 	}
 }
+
+// TestVMSpecValidateFQDN pins the FQDN half of the trust-boundary check: empty,
+// or a DNS-1123 subdomain of at most MaxVMFQDNBytes bytes whose first label is
+// the hostname's first label.
+func TestVMSpecValidateFQDN(t *testing.T) {
+	long := "web-0" + strings.Repeat("."+strings.Repeat("a", 60), 5) // 310 bytes
+	cases := []struct {
+		name     string
+		hostname string
+		fqdn     string
+		wantErr  string // substring; empty means the spec is accepted
+	}{
+		{name: "empty", hostname: "web-0"},
+		{name: "empty-with-no-hostname", hostname: ""},
+		{name: "subdomain", hostname: "web-0", fqdn: "web-0.web.ns.svc.cluster.local"},
+		{name: "set-hostname-as-fqdn", hostname: "web-0.web.ns.svc.cluster.local", fqdn: "web-0.web.ns.svc.cluster.local"},
+		{name: "first-label-differs", hostname: "a", fqdn: "b.web.ns.svc.cluster.local", wantErr: "does not start with the hostname's first label"},
+		{name: "no-hostname", hostname: "", fqdn: "web-0.web.ns.svc.cluster.local", wantErr: "does not start with the hostname's first label"},
+		{name: "uppercase", hostname: "web-0", fqdn: "web-0.Web.ns", wantErr: "FQDN for pod \"p\" has byte 0x57"},
+		{name: "trailing-dot", hostname: "web-0", fqdn: "web-0.web.", wantErr: "empty label"},
+		{name: "too-long", hostname: "web-0", fqdn: long, wantErr: "the limit is 253"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VMSpec{PodID: "p", Hostname: tc.hostname, FQDN: tc.fqdn}.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalidVMSpec) || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %v, want an ErrInvalidVMSpec containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
