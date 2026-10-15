@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -107,7 +108,12 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 
 	p.mu.Lock()
 	st := p.guestContainerLocked(name, spec.GetImage())
-	if started != nil {
+	if started != nil && guestReplacementStartLocked(p, name, st, started.GetPid()) {
+		// The in-guest restart's replacement: the previous run becomes
+		// last_termination_state and the count advances, in this one hold of
+		// p.mu, so no observer sees one without the other.
+		foldGuestRestartLocked(p, st, name, started.GetPid(), at)
+	} else if started != nil {
 		// The container id is minted once, on the first start, and then only
 		// carried: a container that never started has none (as upstream), and a
 		// re-read of the status must never see it change.
@@ -152,6 +158,12 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 			p.oomKilled = true
 		}
 	}
+	if started != nil {
+		if p.guestPIDs == nil {
+			p.guestPIDs = map[string]int32{}
+		}
+		p.guestPIDs[name] = started.GetPid()
+	}
 	// The POD phase follows its containers, exactly as the host spine's
 	// watchContainerExit calls recomputePhaseLocked after recording an exit.
 	// Without this the fold updated container_statuses and nothing else, so a vm
@@ -170,6 +182,84 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 	// event-driven notice that a vm pod moved, and a terminal transition it never
 	// hears is a pod that only a resync would ever correct.
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+}
+
+// guestRestart is one in-guest RestartContainer in flight for a vm container:
+// the claim restartGuest takes, and what the ContainerEvents fold needs to turn
+// the replacement's start into a restart. Its fields are written under pod.mu
+// before the guest is asked, and read under pod.mu by the fold.
+type guestRestart struct {
+	// instance is the restart count the replacement runs as, chosen by
+	// containerLogInstance, so the count and the log file name agree.
+	instance int32
+	// wasRunning is whether the container was running when the restart was
+	// asked for: its exit was then this restart's kill, which the previous run's
+	// terminated state records as such, as the host spine does.
+	wasRunning bool
+	// reason is the request's restart reason, recorded on that state.
+	reason string
+	// done is closed when the fold consumes the restart.
+	done chan struct{}
+}
+
+// guestReplacementStartLocked reports whether a started event for name is the
+// replacement an in-guest restart is waiting for. It is when a restart is in
+// flight and the event names a new instance: the container is not folded as
+// running (its old instance's exit was folded first), or it is but under another
+// pid (the old exit was lost to a stream gap). A started event repeating the
+// running instance's pid is a resubscribe replaying what the fold already knows,
+// and must not count as a restart. Caller holds p.mu.
+func guestReplacementStartLocked(p *pod, name string, st *runtimev1.ContainerStatus, pid int32) bool {
+	if p.guestRestarts[name] == nil {
+		return false
+	}
+	if st.GetState().GetRunning() == nil {
+		return true
+	}
+	prev, seen := p.guestPIDs[name]
+	return !seen || prev != pid
+}
+
+// foldGuestRestartLocked records the replacement of a restarted vm container:
+// the run being replaced becomes last_termination_state, the restart count
+// becomes the instance the restart chose, and the replacement is running under
+// a new container id and its own log file. It concludes the restart's claim.
+// Caller holds p.mu.
+//
+// The previous run's terminated state is the one the guest's exit event already
+// folded, with the identity carryGuestIdentityLocked put on it. When the restart
+// killed a running instance, its reason is the host spine's "Killed" (or
+// "Completed" for a clean exit) with the request's reason as the message, which
+// is what lastTerminationState records for a native container; an OOMKilled the
+// guest reported stands. An exit the fold never saw is recorded as unknown, never
+// as a success nobody observed.
+func foldGuestRestartLocked(p *pod, st *runtimev1.ContainerStatus, name string, pid int32, at *timestamppb.Timestamp) {
+	rs := p.guestRestarts[name]
+	prev := st.GetState().GetTerminated()
+	if prev == nil {
+		prev = &runtimev1.ContainerStateTerminated{
+			ExitCode:   exitCodeUnknown,
+			Reason:     ExitStatusUnknownReason,
+			FinishedAt: at,
+		}
+		carryGuestIdentityLocked(st, prev)
+	} else if rs.wasRunning && prev.GetReason() != "OOMKilled" {
+		prev.Reason = "Completed"
+		if prev.GetExitCode() != 0 || prev.GetSignal() != 0 {
+			prev.Reason = "Killed"
+		}
+		prev.Message = rs.reason
+	}
+	st.LastTerminationState = &runtimev1.ContainerState{Terminated: prev}
+	st.RestartCount = rs.instance
+	st.ContainerId = guestContainerID(p.box.GetPodId(), name, pid, at.AsTime().UnixNano())
+	if w := p.guestLogs[name]; w != nil {
+		st.LogPath = w.Path()
+	}
+	st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: at}}
+	st.Ready = true
+	delete(p.guestRestarts, name)
+	close(rs.done)
 }
 
 // recomputeVMPhaseLocked updates a vm pod's phase from its guest containers'
@@ -210,8 +300,9 @@ func recomputeVMPhaseLocked(p *pod) {
 	// state for every container it found running, so a bare recompute would
 	// agree with it; the guard exists for the event that arrives from the
 	// dying guest AFTER it, which must not de-escalate a failed pod back to
-	// Running. A vm pod has no restart path to de-escalate INTO (RestartContainer
-	// refuses one), so nothing legitimate is lost by refusing.
+	// Running. An in-guest restart cannot legitimately land after it either: the
+	// pod-level verdict means the machine is gone, so there is no guest left to
+	// start a replacement in.
 	if p.reason != "" && (p.phase == runtimev1.PodPhase_POD_PHASE_FAILED ||
 		p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED) {
 		return

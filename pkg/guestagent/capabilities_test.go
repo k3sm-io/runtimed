@@ -21,9 +21,9 @@ import (
 	"testing"
 )
 
-// TestCapabilitiesAdvertiseGuestFieldTokens is the same-build pin for the three
-// tokens guest/v1 names beside its newest fields: the agent built with the
-// guest code that honours them advertises them, under their wire spellings.
+// TestCapabilitiesAdvertiseGuestFieldTokens is the same-build pin for the
+// tokens guest/v1 names beside its newest fields and RPCs: the agent built with
+// the guest code that honours them advertises them, under their wire spellings.
 // The host's side of the vocabulary (it must KNOW each token, or it discards
 // it) is pinned in pkg/runtime by TestKnownGuestCapabilityCoversAgentTokens.
 func TestCapabilitiesAdvertiseGuestFieldTokens(t *testing.T) {
@@ -31,6 +31,7 @@ func TestCapabilitiesAdvertiseGuestFieldTokens(t *testing.T) {
 		"guest-private-mounts": CapabilityGuestPrivateMounts,
 		"sidecar-init":         CapabilitySidecarInit,
 		"image-user":           CapabilityImageUser,
+		"restart-container":    CapabilityRestartContainer,
 	}
 	got := Capabilities()
 	for wire, constant := range want {

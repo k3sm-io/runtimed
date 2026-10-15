@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net"
+	"os"
 	"path/filepath"
 	"time"
 	"unicode/utf8"
@@ -29,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k3sm.io/runtimed/pkg/crilog"
@@ -333,7 +336,8 @@ const maxGuestCapabilityTokens = 64
 func knownGuestCapability(tok string) bool {
 	switch tok {
 	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial,
-		guestagent.CapabilityGuestPrivateMounts, guestagent.CapabilitySidecarInit, guestagent.CapabilityImageUser:
+		guestagent.CapabilityGuestPrivateMounts, guestagent.CapabilitySidecarInit, guestagent.CapabilityImageUser,
+		guestagent.CapabilityRestartContainer:
 		return true
 	}
 	return false
@@ -538,6 +542,306 @@ func relayAttachResponse(resp *runtimev1.AttachResponse) *runtimev1.AttachRespon
 	return out
 }
 
+// guestRestartStartBudget bounds the guest's start of a restarted container,
+// on top of the stop's grace: the RPC returns once the replacement runs, and a
+// guest that never answers must not hold the verb open forever.
+const guestRestartStartBudget = time.Minute
+
+// guestRestartFoldWait bounds how long restartGuest waits, after the guest
+// acknowledged the restart, for the replacement's started event to be folded
+// into the pod's status. The guest publishes that event before it answers, so
+// the wait is the event stream's delivery and nothing more; the bound is for a
+// stream that is down, which the fold catches up on when it resubscribes.
+//
+// A var so a test can shorten it.
+var guestRestartFoldWait = 10 * time.Second
+
+// guestRestartUnsupported is the refusal a vm pod gets when its guest cannot
+// restart a container in place: FailedPrecondition + UNSUPPORTED, because the
+// condition is a fact about the booted initramfs that no retry changes, and the
+// remedy is a new pod.
+func guestRestartUnsupported(podID, container string) *runtimev1.RestartContainerResponse {
+	return restartFailure(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
+		"restart %s/%s: the guest initramfs this pod booted predates the in-guest container restart "+
+			"(it does not advertise the %q capability); a recreated pod boots an initramfs that has it",
+		podID, container, guestagent.CapabilityRestartContainer)
+}
+
+// restartGuest is RestartContainer's vm route: the CRI container restart inside
+// the pod's live guest. The guest stops the container and starts a new instance
+// of it from the spec it booted with; the host keeps what CRI says the runtime
+// keeps, the restart count and the previous instance's log.
+//
+// The order is what keeps the count, the state and the log in step:
+//
+//  1. Claim the container (guestRestarts) and choose the replacement's instance
+//     through containerLogInstance, the helper the host spine's restart uses, so
+//     the count and the file name are chosen one way on both spines.
+//  2. Give the replacement its own log file before the guest is asked. The guest
+//     ends the old instance's log stream when it exits, and the follower's next
+//     connection then writes into the new file, while the old file keeps the old
+//     run for `kubectl logs --previous`.
+//  3. Ask the guest, detached from the caller's cancellation (a stop without its
+//     start is a dead container) and bounded by the grace plus a start budget.
+//  4. Wait for the ContainerEvents fold to consume the claim on the
+//     replacement's started event, which is where last_termination_state and the
+//     count advance together (foldGuestRestartLocked).
+//
+// A guest that does not advertise the capability is refused before anything is
+// touched; one whose capabilities were not yet read is asked, and an older agent
+// answering Unimplemented gets the same refusal.
+//
+// The claim is bounded by guestRestartFoldWait: a guest that acknowledges and
+// never reports the replacement's start does not leave the container refused as
+// in flight. A restart that fails leaves no new log file behind unless output
+// reached it (settleGuestRestartLog), so refusals do not advance the numbering.
+//
+// The initramfs pin is unchanged; until the next guest publish the capability gate answers UNSUPPORTED.
+func (r *Runtime) restartGuest(ctx context.Context, p *pod, req *runtimev1.RestartContainerRequest) *runtimev1.RestartContainerResponse {
+	podID := p.box.GetPodId()
+	name, err := vmContainerName(p.box, req.GetContainer())
+	if err != nil {
+		return restartFailure(codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND,
+			"container %s not found in pod %s", req.GetContainer(), podID)
+	}
+	if err := r.requireGuestCapability("restart", guestagent.CapabilityRestartContainer, p); err != nil {
+		return guestRestartUnsupported(podID, name)
+	}
+	rs, refused := r.claimGuestRestart(p, name, req.GetReason())
+	if refused != nil {
+		return restartFailure(refused.code, refused.reason, "%s", refused.msg)
+	}
+
+	// The replacement's instance and file. A file that cannot be opened costs
+	// the replacement its log, not its restart, the policy the assembly applies.
+	p.mu.Lock()
+	oldCount := p.guestContainers[name].GetRestartCount()
+	p.mu.Unlock()
+	instance, logPath := r.containerLogInstance(podID, p.box.GetLogDirectory(), name, oldCount+1)
+	w, lerr := crilog.Open(logPath)
+	if lerr != nil {
+		r.log.Error("the restarted vm container's output will not be recorded: its log file could not be opened",
+			"pod", podID, "container", name, "path", logPath, "err", lerr)
+		w = nil
+	}
+	p.mu.Lock()
+	rs.instance = instance
+	prev := p.guestLogs[name]
+	if w != nil {
+		if p.guestLogs == nil {
+			p.guestLogs = map[string]*crilog.Writer{}
+		}
+		p.guestLogs[name] = w
+	}
+	p.mu.Unlock()
+
+	grace := graceDuration(req.GetGracePeriodSeconds(), p)
+	err = r.callGuestRestart(ctx, podID, name, grace)
+	if err != nil && !r.concludeFailedGuestRestart(p, name, rs) {
+		r.settleGuestRestartLog(p, name, prev, w, false)
+		if status.Code(err) == codes.Unimplemented {
+			return guestRestartUnsupported(podID, name)
+		}
+		st := status.Convert(guestStreamError("restart", podID, err))
+		return restartFailure(st.Code(), guestRestartFailureReason(st.Code()), "%s", st.Message())
+	}
+	r.settleGuestRestartLog(p, name, prev, w, true)
+	r.startGuestLogFollower(p, name)
+
+	wait := time.NewTimer(guestRestartFoldWait)
+	select {
+	case <-rs.done:
+		wait.Stop()
+	case <-wait.C:
+		r.expireGuestRestart(p, name, rs)
+	case <-ctx.Done():
+		// The caller left; the claim still expires on the same bound.
+		go func() {
+			defer wait.Stop()
+			select {
+			case <-rs.done:
+			case <-wait.C:
+				r.expireGuestRestart(p, name, rs)
+			}
+		}()
+	}
+
+	p.mu.Lock()
+	var out *runtimev1.ContainerStatus
+	if src := p.guestContainers[name]; src != nil {
+		out, _ = proto.Clone(src).(*runtimev1.ContainerStatus)
+		if cur := p.guestLogs[name]; cur != nil {
+			out.LogPath = cur.Path()
+		}
+	}
+	p.mu.Unlock()
+	return &runtimev1.RestartContainerResponse{Status: out}
+}
+
+// claimGuestRestart takes the container's in-guest restart claim, or explains
+// why the verb cannot act: the pod is being deleted, a restart is already in
+// flight, or the container has never been seen to start. The refusals are the
+// host spine's (refuseIneligible, refuseInFlight), so a caller reads one
+// taxonomy for both spines.
+func (r *Runtime) claimGuestRestart(p *pod, name, reason string) (*guestRestart, *verbRefusal) {
+	podID := p.box.GetPodId()
+	p.mu.Lock()
+	if p.stopping {
+		p.mu.Unlock()
+		return nil, refusal(codes.FailedPrecondition, installFailureReason(errPodStopping),
+			"restart %s/%s: %v", podID, name, errPodStopping)
+	}
+	if p.guestRestarts[name] != nil {
+		p.mu.Unlock()
+		return nil, r.refuseInFlight("restart", podID, name, "restart")
+	}
+	state := p.guestContainers[name].GetState()
+	if state.GetRunning() == nil && state.GetTerminated() == nil {
+		p.mu.Unlock()
+		return nil, refusal(codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			"restart %s/%s: container has not started", podID, name)
+	}
+	rs := &guestRestart{wasRunning: state.GetRunning() != nil, reason: reason, done: make(chan struct{})}
+	if p.guestRestarts == nil {
+		p.guestRestarts = map[string]*guestRestart{}
+	}
+	p.guestRestarts[name] = rs
+	p.mu.Unlock()
+	return rs, nil
+}
+
+// expireGuestRestart drops a restart's claim when the replacement's start has
+// not been folded within guestRestartFoldWait, so a guest that acknowledged and
+// then stayed silent cannot leave the container refused as in flight. The
+// status is left as it stands: a start event arriving later is folded as an
+// ordinary start, without the count advancing for a restart nobody saw.
+func (r *Runtime) expireGuestRestart(p *pod, name string, rs *guestRestart) {
+	p.mu.Lock()
+	expired := p.guestRestarts[name] == rs
+	if expired {
+		select {
+		case <-rs.done:
+			expired = false
+		default:
+			delete(p.guestRestarts, name)
+		}
+	}
+	p.mu.Unlock()
+	if expired {
+		r.log.Warn("the guest acknowledged a container restart but its start never reached the pod status; releasing the restart claim",
+			"pod", p.box.GetPodId(), "container", name, "waited", guestRestartFoldWait)
+	}
+}
+
+// callGuestRestart asks the pod's guest to restart one container.
+func (r *Runtime) callGuestRestart(ctx context.Context, podID, name string, grace time.Duration) error {
+	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace+guestRestartStartBudget)
+	defer cancel()
+	conn, err := r.dialGuest(podID)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, err = guestv1.NewGuestAgentClient(conn).RestartContainer(callCtx, &guestv1.RestartContainerRequest{
+		PodId:        podID,
+		Container:    name,
+		GraceSeconds: guestGraceSeconds(grace),
+	})
+	return err
+}
+
+// guestGraceSeconds converts a grace to guest/v1's int32 seconds, saturating:
+// a wrapped negative would read to the guest as "kill immediately".
+func guestGraceSeconds(d time.Duration) int32 {
+	secs := int64(d / time.Second)
+	switch {
+	case secs <= 0:
+		return 0
+	case secs > math.MaxInt32:
+		return math.MaxInt32
+	}
+	return int32(secs)
+}
+
+// concludeFailedGuestRestart drops a failed restart's claim, unless the fold has
+// already consumed it: a replacement whose start reached the status did restart,
+// whatever the RPC's own fate, and it reports whether that happened.
+func (r *Runtime) concludeFailedGuestRestart(p *pod, name string, rs *guestRestart) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-rs.done:
+		return true
+	default:
+	}
+	if p.guestRestarts[name] == rs {
+		delete(p.guestRestarts, name)
+	}
+	return false
+}
+
+// settleGuestRestartLog decides which of a restart's two log writers stays the
+// container's current one, and closes the other unless the follower holds it
+// (the follower closes a writer it moves off itself). On success the new one
+// stays. On failure the previous one is restored, unless the follower already
+// began writing into the new one, in which case that is where output now goes.
+//
+// A new file a failed restart drops is also UNLINKED when nothing was written to
+// it. The next instance number is one past the highest file on disk, so an
+// empty file left by each refused attempt would advance the numbering with no
+// run behind it and leave `kubectl logs --previous` pointing at nothing. A file
+// any byte reached is kept: it is a run's output, and runtimed deletes none.
+func (r *Runtime) settleGuestRestartLog(p *pod, name string, prev, w *crilog.Writer, succeeded bool) {
+	if w == nil {
+		return
+	}
+	p.mu.Lock()
+	var bound *crilog.Writer
+	if f := p.guestLogFollow[name]; f != nil {
+		bound = f.bound
+	}
+	var drop *crilog.Writer
+	switch {
+	case p.guestLogs[name] != w:
+		// Nothing of this restart's is current; nothing to settle.
+	case !succeeded && bound != w:
+		if prev != nil {
+			p.guestLogs[name] = prev
+		} else {
+			delete(p.guestLogs, name)
+		}
+		drop = w
+	case prev != nil && bound != prev:
+		drop = prev
+	}
+	p.mu.Unlock()
+	if drop == nil {
+		return
+	}
+	r.closeGuestLog(p, name, drop)
+	if drop != w {
+		return
+	}
+	if fi, err := os.Stat(w.Path()); err == nil && fi.Size() == 0 {
+		if err := os.Remove(w.Path()); err != nil {
+			r.log.Warn("could not remove the unused log file of a failed restart",
+				"pod", p.box.GetPodId(), "container", name, "path", w.Path(), "err", err)
+		}
+	}
+}
+
+// guestRestartFailureReason maps a guest's refusal code onto the typed reason,
+// with the meaning the host spine gives the same answers.
+func guestRestartFailureReason(code codes.Code) runtimev1.FailureReason {
+	switch code {
+	case codes.NotFound:
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND
+	case codes.FailedPrecondition:
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE
+	}
+	return runtimev1.FailureReason_FAILURE_REASON_INTERNAL
+}
+
 // vmLogFollowBaseBackoff / vmLogFollowMaxBackoff bound the reconnect cadence of
 // a guest log follower. The first retry is fast because the common cause is the
 // agent still coming up; the ceiling is what keeps a guest that will never
@@ -567,10 +871,21 @@ const (
 // would be written twice on every reconnect — a duplicate line in a log file is
 // indistinguishable from the container having said it twice.
 //
+// THE WRITER IS RESOLVED PER CONNECTION (bindGuestLog). An in-guest restart
+// gives the new instance its own file and swaps the pod's writer; the guest ends
+// the old instance's stream when it exits, so the connection that drained the old
+// tail into the old file is followed by one that writes the new instance into the
+// new file, and the old writer is closed only once this follower has moved off it.
+//
 // An old guest that never sets LogEntry.partial is handled by construction: the
 // field defaults false, which is the F tag, so its lines are simply complete
 // lines. Nothing here needs to know which guest it is talking to.
-func (r *Runtime) followGuestContainerLog(ctx context.Context, podID, container string, w *crilog.Writer) {
+//
+// Start it with startGuestLogFollower, never with a bare go statement: the
+// registration is what keeps a container to one follower.
+func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container string) {
+	podID := p.box.GetPodId()
+	defer r.endGuestLogFollow(p, container)
 	var (
 		last    time.Time
 		backoff = vmLogFollowBaseBackoff
@@ -579,14 +894,19 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, podID, container 
 		if ctx.Err() != nil {
 			return
 		}
+		w := r.bindGuestLog(p, container)
+		if w == nil {
+			return // no file to write into for this container
+		}
 		wrote, err := r.streamGuestContainerLog(ctx, podID, container, w, &last)
 		if ctx.Err() != nil {
 			return
 		}
-		if errors.Is(err, crilog.ErrWriterFailed) {
+		if errors.Is(err, crilog.ErrWriterFailed) && r.guestLogCurrent(p, container, w) {
 			// The file is gone for this container: reconnecting would pull the
 			// guest's output across the boundary only to drop it. Stop, having
-			// said why once.
+			// said why once. A writer that a restart already replaced is not
+			// that case: the next connection binds the new one.
 			r.log.Warn("stopping the guest log follower: the container log file is unwritable",
 				"pod", podID, "container", container, "err", err)
 			return
@@ -609,6 +929,81 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, podID, container 
 		if backoff *= 2; backoff > vmLogFollowMaxBackoff {
 			backoff = vmLogFollowMaxBackoff
 		}
+	}
+}
+
+// guestLogFollower is one running vm-container log follower's registration:
+// the writer it is currently writing into. Guarded by pod.mu.
+type guestLogFollower struct {
+	bound *crilog.Writer
+}
+
+// startGuestLogFollower starts the container's log follower, unless one is
+// already running. The registration is taken under p.mu before the goroutine
+// starts, so two callers can never start two followers that would each write
+// every entry into the same file.
+func (r *Runtime) startGuestLogFollower(p *pod, container string) {
+	p.mu.Lock()
+	if p.guestLogFollow == nil {
+		p.guestLogFollow = map[string]*guestLogFollower{}
+	}
+	if _, running := p.guestLogFollow[container]; running {
+		p.mu.Unlock()
+		return
+	}
+	p.guestLogFollow[container] = &guestLogFollower{}
+	p.mu.Unlock()
+	go r.followGuestContainerLog(p.supCtx, p, container)
+}
+
+// bindGuestLog returns the container's current writer and records it as the
+// one the follower is writing into. A writer the follower is moving off (a
+// restart replaced it) is closed here, by the one goroutine that wrote into it,
+// after its last write.
+func (r *Runtime) bindGuestLog(p *pod, container string) *crilog.Writer {
+	p.mu.Lock()
+	cur := p.guestLogs[container]
+	var prev *crilog.Writer
+	if f := p.guestLogFollow[container]; f != nil {
+		prev, f.bound = f.bound, cur
+	}
+	p.mu.Unlock()
+	if prev != nil && prev != cur {
+		r.closeGuestLog(p, container, prev)
+	}
+	return cur
+}
+
+// endGuestLogFollow drops the follower's registration as it exits, closing the
+// writer it held when a restart had already replaced it. The current writer is
+// teardown's to close (closeContainerLogs), never this goroutine's.
+func (r *Runtime) endGuestLogFollow(p *pod, container string) {
+	p.mu.Lock()
+	var bound *crilog.Writer
+	if f := p.guestLogFollow[container]; f != nil {
+		bound = f.bound
+		delete(p.guestLogFollow, container)
+	}
+	cur := p.guestLogs[container]
+	p.mu.Unlock()
+	if bound != nil && bound != cur {
+		r.closeGuestLog(p, container, bound)
+	}
+}
+
+// guestLogCurrent reports whether w is still the container's current writer.
+func (r *Runtime) guestLogCurrent(p *pod, container string, w *crilog.Writer) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.guestLogs[container] == w
+}
+
+// closeGuestLog closes a replaced vm-container log writer. It closes the HANDLE;
+// the file stays for `kubectl logs --previous` and for the node to delete.
+func (r *Runtime) closeGuestLog(p *pod, container string, w *crilog.Writer) {
+	if err := w.Close(); err != nil {
+		r.log.Warn("close the replaced container log", "pod", p.box.GetPodId(),
+			"container", container, "path", w.Path(), "err", err)
 	}
 }
 

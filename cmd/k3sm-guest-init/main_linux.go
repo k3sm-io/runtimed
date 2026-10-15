@@ -395,10 +395,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		Logs:      capture,
 		RawOutput: capture,
 		Execer:    &procExecer{plans: byName, reaper: reaper, log: log},
-		Status:    status,
-		Events:    events,
-		Attach:    attachHub,
-		Logger:    log,
+		Restarter: &planRestarter{
+			plans: byName, reaper: reaper, events: events, capture: capture, hub: attachHub, log: log,
+		},
+		Status: status,
+		Events: events,
+		Attach: attachHub,
+		Logger: log,
 	}, log)
 	if err != nil {
 		// A guest with no agent is a pod the host can never exec into, read logs
@@ -602,7 +605,8 @@ func registerBinfmt(log *slog.Logger, reg guestinit.BinfmtRegistration) error {
 //
 // ctx is the boot's context, held for the length of one RunStart call and
 // passed down to the ownership apply and the init-container wait; the struct
-// does not outlive that call.
+// does not outlive that call. A container restart (planRestarter) builds its own
+// for the length of one Start.
 type starter struct {
 	ctx     context.Context
 	log     *slog.Logger

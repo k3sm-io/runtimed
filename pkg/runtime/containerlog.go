@@ -33,7 +33,9 @@ import (
 // runtimed is the WRITER and nothing else. It opens the file the node named
 // (PodBox.log_directory), appends CRI-format lines to it, and reopens it when
 // the node rotates it. It never reads one back, never rotates one, never
-// deletes one, and keeps no in-memory copy of a container's output — the
+// deletes one that holds output (the one unlink is a vm restart's own empty
+// file when the restart failed: settleGuestRestartLog), and keeps no in-memory
+// copy of a container's output — the
 // 256 KiB ring that used to serve GetLogs is gone, along with the truncation
 // and the eviction it forced. The node owns the directory tree, the reader
 // `kubectl logs` is served from, rotation, and every deletion, which is the
@@ -98,6 +100,31 @@ func restartCountFromLogDir(dir string) (int32, error) {
 		}
 	}
 	return highest + 1, nil
+}
+
+// containerLogInstance picks the instance number a NEW container instance runs
+// as, and the CRI log file it writes, on either spine. want is the restart count
+// the instance is being started AS (0 for a first start, the previous count + 1
+// for a restart), and it is a FLOOR: the number is max(want, one past the
+// highest file already in the container's log dir), so a daemon restart cannot
+// re-open a file an earlier run wrote. The number is BOTH the file name and the
+// status's restart_count, so the two can never disagree, and `kubectl logs
+// --previous` reads the replaced instance's own file.
+//
+// A directory that cannot be listed is a node-side problem, not this
+// container's: it is logged and the requested number is kept rather than
+// refusing to start a container over a file name.
+func (r *Runtime) containerLogInstance(podID, logDirectory, container string, want int32) (int32, string) {
+	logDir := containerLogDir(logDirectory, container)
+	instance := want
+	onDisk, err := restartCountFromLogDir(logDir)
+	if err != nil {
+		r.log.Warn("could not read the container log dir; using the requested instance number",
+			"pod", podID, "container", container, "dir", logDir, "err", err)
+	} else if onDisk > instance {
+		instance = onDisk
+	}
+	return instance, filepath.Join(logDir, containerLogFile(instance))
 }
 
 // logChunk is one chunk of a container's output as the live fan-out carries it:
