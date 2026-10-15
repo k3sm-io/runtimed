@@ -913,6 +913,15 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), errVMFsGroupUnsupported)
 	}
 
+	// The hostname is checked here too, before any pull, share materialization
+	// or pod dir exists, so a malformed value costs nothing. The check itself is
+	// sandbox.VMSpec.Validate, the same one the spec below passes before
+	// CreateVM; this is only the fail-fast call.
+	if err := (sandbox.VMSpec{PodID: box.GetPodId(), Hostname: box.GetHostname()}).Validate(); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err)
+	}
+
 	// Compute the virtiofs share-device plan from the box's volumes —
 	// pure data: no filesystem access and no chown (the planner plans; the VZ
 	// device config enforces writability, guest-init composes the binds —
@@ -1054,6 +1063,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		Network:     netCfg,
 		Containers:  cplan.containers,
 		Volumes:     vmVolumePlan(plan),
+		Hostname:    box.GetHostname(),
 		PodDir:      podDir,
 		// one grace budget for both ends of the shutdown: the helper is given
 		// the pod's own termination grace, and DeletePod's escalation never
@@ -1061,6 +1071,13 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		// timers across the process boundary is the power-cut bug.
 		AgentSocketPath: agentSocket,
 		StopGrace:       time.Duration(box.GetTerminationGracePeriodSeconds()) * time.Second,
+	}
+	// The sandbox.VMSpec trust-boundary check runs here, before any backend
+	// sees the spec, so every vm backend inherits it rather than re-implementing
+	// it. A refusal is SANDBOX_SETUP, the reason CreateVM itself would report.
+	if err := spec.Validate(); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err)
 	}
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
 		// Every sub-cause is SANDBOX_SETUP at the enum level — the runtime/v1

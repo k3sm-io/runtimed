@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -164,6 +165,62 @@ func validateVMSpec(spec VMSpec) error {
 		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
 			return fmt.Errorf("%w: %s %q is not an absolute, clean path", ErrInvalidVMSpec, p.field, p.path)
 		}
+	}
+	return spec.Validate()
+}
+
+// MaxVMHostnameBytes is the longest pod hostname a guest accepts: the Linux
+// __NEW_UTS_LEN that sethostname(2) enforces.
+const MaxVMHostnameBytes = 64
+
+// MaxVMHostnameLabelBytes is the longest single label of a pod hostname: the
+// DNS-1123 label limit.
+const MaxVMHostnameLabelBytes = 63
+
+// Validate is the backend-independent trust-boundary check on a VMSpec. The
+// PodBox it is built from arrives over a unix socket from a process runtimed
+// does not control, so every vm backend's caller runs it before CreateVM. The
+// second call, in validateVMSpec inside this backend, is deliberate defence in
+// depth for a direct caller of the backend that skips the first.
+//
+// Today it covers Hostname, against the runtime/v1 PodBox.hostname contract:
+// empty, or a DNS-1123 subdomain of at most MaxVMHostnameBytes bytes, i.e.
+// [a-z0-9.-] only, no empty label, no label longer than MaxVMHostnameLabelBytes,
+// and no label that starts or ends with '-'. A value outside that would
+// otherwise reach sethostname inside the guest and surface as an opaque boot
+// failure, or set a hostname no resolver can answer for. The hostname is
+// derived by the provider; this check refuses, it never rewrites.
+func (s VMSpec) Validate() error {
+	h := s.Hostname
+	if len(h) > MaxVMHostnameBytes {
+		return fmt.Errorf("%w: Hostname is %d bytes for pod %q, the limit is %d",
+			ErrInvalidVMSpec, len(h), s.PodID, MaxVMHostnameBytes)
+	}
+	for i := 0; i < len(h); i++ {
+		c := h[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' {
+			continue
+		}
+		return fmt.Errorf("%w: Hostname for pod %q has byte 0x%02x at offset %d, want [a-z0-9.-]",
+			ErrInvalidVMSpec, s.PodID, c, i)
+	}
+	if h == "" {
+		return nil
+	}
+	start := 0
+	for _, label := range strings.Split(h, ".") {
+		switch {
+		case label == "":
+			return fmt.Errorf("%w: Hostname for pod %q has an empty label at offset %d",
+				ErrInvalidVMSpec, s.PodID, start)
+		case len(label) > MaxVMHostnameLabelBytes:
+			return fmt.Errorf("%w: Hostname for pod %q has a %d-byte label at offset %d, the limit is %d",
+				ErrInvalidVMSpec, s.PodID, len(label), start, MaxVMHostnameLabelBytes)
+		case label[0] == '-' || label[len(label)-1] == '-':
+			return fmt.Errorf("%w: Hostname for pod %q has a label starting or ending with '-' at offset %d",
+				ErrInvalidVMSpec, s.PodID, start)
+		}
+		start += len(label) + 1
 	}
 	return nil
 }
