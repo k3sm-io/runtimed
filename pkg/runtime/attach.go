@@ -256,7 +256,7 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 		}
 	}
 	for name, rec := range byName {
-		if rec.ShimDir == "" || degradedByName[name] == rec {
+		if rec.ShimDir == "" || keyOf(degradedByName[name]) == keyOf(rec) {
 			continue
 		}
 		id := supervisor.ShimIdentity{Container: name, Dir: rec.ShimDir, Pid: rec.Pgid, StartUnixNano: rec.StartUnixNano}
@@ -291,7 +291,7 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	}
 	add := func(c *runtimev1.Container, isInit bool) {
 		rec, ok := byName[c.GetName()]
-		sl := slot{rec: rec, ok: ok, degraded: ok && degradedByName[c.GetName()] == rec, shim: conns[c.GetName()]}
+		sl := slot{rec: rec, ok: ok, degraded: ok && keyOf(degradedByName[c.GetName()]) == keyOf(rec), shim: conns[c.GetName()]}
 		var exited *recordedExit
 		if !ok {
 			exited = exitedWhileDown(mine, c.GetName())
@@ -337,7 +337,7 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	shimDirs := map[string]string{}
 	for _, rec := range mine {
 		if rec.ShimDir != "" {
-			if _, seen := shimDirs[rec.Container]; !seen || byName[rec.Container] == rec {
+			if _, seen := shimDirs[rec.Container]; !seen || keyOf(byName[rec.Container]) == keyOf(rec) {
 				shimDirs[rec.Container] = rec.ShimDir
 			}
 		}
@@ -411,6 +411,7 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 			closeLogs()
 			return nil, fmt.Errorf("attach pod %s container %s: %w: %w", podID, s.cp.name, ErrNothingToAttach, err)
 		}
+		r.trackTree(podCtx, proc)
 		s.cp.proc = proc
 	}
 	r.pods[podID] = p

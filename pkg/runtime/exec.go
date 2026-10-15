@@ -86,7 +86,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	}
 	if cp.proc != nil {
 		if conn := cp.proc.Shim(); conn != nil {
-			return r.execViaShim(stream, conn, cp, first)
+			return r.execViaShim(stream, p, conn, cp, first)
 		}
 	}
 

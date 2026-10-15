@@ -271,6 +271,7 @@ func (r *Runtime) shimCrashed(ctx context.Context, p *pod, cp *containerProc) bo
 	if err != nil {
 		return false
 	}
+	r.trackTree(p.supCtx, proc)
 	p.mu.Lock()
 	next := *cp
 	next.proc = proc
@@ -300,14 +301,49 @@ const execSessionGrace = 2 * time.Second
 // sessions run outside the pod group, so a group kill that took the shim down
 // would otherwise leave them running. The teardown re-verifies the exact
 // instance before every signal.
-func (r *Runtime) endSessionWithStream(sc shimv1.ContainerShim_ExecClient) func() {
+//
+// The session is listed on its pod while it runs, so a DeletePod that arrives
+// first ends it too (endExecSessions).
+func (r *Runtime) endSessionWithStream(p *pod, sc shimv1.ContainerShim_ExecClient) func() {
 	pid, start, ok := supervisor.SessionIdentity(sc)
 	if !ok {
 		return func() {}
 	}
+	s := execSession{pid: pid, start: start}
+	p.mu.Lock()
+	if p.execSessions == nil {
+		p.execSessions = map[execSession]struct{}{}
+	}
+	p.execSessions[s] = struct{}{}
+	p.mu.Unlock()
 	return func() {
+		p.mu.Lock()
+		delete(p.execSessions, s)
+		p.mu.Unlock()
 		go supervisor.EndExecSession(pid, start, r.procStart, r.signalGroup, execSessionGrace)
 	}
+}
+
+// endExecSessions ends every exec session still listed on p (DeletePod), each
+// through EndExecSession's exact-instance SIGTERM, grace, SIGKILL, and waits for
+// them. Sessions lead their own groups by design, so no group signal of the
+// pod reaches them.
+func (r *Runtime) endExecSessions(p *pod) {
+	p.mu.Lock()
+	sessions := make([]execSession, 0, len(p.execSessions))
+	for s := range p.execSessions {
+		sessions = append(sessions, s)
+	}
+	p.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, s := range sessions {
+		wg.Add(1)
+		go func(s execSession) {
+			defer wg.Done()
+			supervisor.EndExecSession(s.pid, s.start, r.procStart, r.signalGroup, execSessionGrace)
+		}(s)
+	}
+	wg.Wait()
 }
 
 // execViaShim proxies an Exec on a shim-backed container to the shim's
@@ -316,7 +352,7 @@ func (r *Runtime) endSessionWithStream(sc shimv1.ContainerShim_ExecClient) func(
 // is handed to the shim, the master stays here, and the session's bytes and
 // resizes move between the client and the master directly while the shim stream
 // carries the exit.
-func (r *Runtime) execViaShim(stream runtimev1.Runtime_ExecServer, conn *supervisor.ShimConn, cp *containerProc, first *runtimev1.ExecRequest) error {
+func (r *Runtime) execViaShim(stream runtimev1.Runtime_ExecServer, p *pod, conn *supervisor.ShimConn, cp *containerProc, first *runtimev1.ExecRequest) error {
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	req := cloneExecRequest(first, cp.name)
@@ -328,7 +364,7 @@ func (r *Runtime) execViaShim(stream runtimev1.Runtime_ExecServer, conn *supervi
 		if err := sc.Send(req); err != nil {
 			return status.Errorf(codes.Unavailable, "exec: %v", err)
 		}
-		defer r.endSessionWithStream(sc)()
+		defer r.endSessionWithStream(p, sc)()
 		go func() {
 			for {
 				in, err := stream.Recv()
@@ -368,7 +404,7 @@ func (r *Runtime) execViaShim(stream runtimev1.Runtime_ExecServer, conn *supervi
 	if err := sc.Send(req); err != nil {
 		return status.Errorf(codes.Unavailable, "exec: %v", err)
 	}
-	defer r.endSessionWithStream(sc)()
+	defer r.endSessionWithStream(p, sc)()
 	var sendMu sync.Mutex
 	send := func(resp *runtimev1.ExecResponse) error {
 		sendMu.Lock()

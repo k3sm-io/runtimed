@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -406,6 +407,16 @@ type Runtime struct {
 	// fake group table.
 	procGroup procGroupInspector
 
+	// procTable and killProcess back each container's process-tree tracking
+	// (treeConfig); a nil procTable turns tracking off (Deps.ProcTable).
+	procTable   supervisor.ProcTable
+	killProcess func(pid int, sig syscall.Signal) error
+	// procCache is the one process-table snapshot every container's tracker
+	// shares (supervisor.TreeConfig.Cache); nil when tracking is off.
+	procCache *supervisor.ProcTableCache
+	// procSession reads a process's session id (Deps.ProcSession).
+	procSession func(pid int) (int, bool)
+
 	// codeSignStatus reads a process's code-signing flags for the
 	// restricted-main-process detection; nil disables it (Deps.CodeSignStatus).
 	codeSignStatus func(pid int) (uint32, error)
@@ -718,6 +729,22 @@ type Deps struct {
 	// the production default — derives it from this binary's own code-directory
 	// hash. Tests set it so records and the decision agree deterministically.
 	RuntimeFingerprint string
+	// ProcTable reads the host process table for each container's process-tree
+	// tracking (supervisor.TrackTree): the members SIGKILLed when the
+	// container's leader exits and at DeletePod. It defaults to
+	// supervisor.ReadProcTable ONLY when Spawner is also the default, for the
+	// same reason CodeSignStatus does: an injected Spawner hands out pids no
+	// real process tree stands behind, and tracking one would aim real kills
+	// at whatever unrelated process holds that pid. With an injected Spawner
+	// and no ProcTable, tracking is off.
+	ProcTable supervisor.ProcTable
+	// ProcSession reports a live process's session id (getsid), which the
+	// startup reap checks before signalling a recorded survivor. Defaults to
+	// supervisor.ProcSessionID.
+	ProcSession func(pid int) (sid int, ok bool)
+	// KillProcess signals one process by pid (a tree member, or a survivor a
+	// reap record names). Defaults to supervisor.KillPID.
+	KillProcess func(pid int, sig syscall.Signal) error
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -903,6 +930,18 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if procGroup == nil {
 		procGroup = supervisor.ProcGroupMembers
 	}
+	procTable := deps.ProcTable
+	if procTable == nil && deps.Spawner == nil {
+		procTable = supervisor.ReadProcTable
+	}
+	procSession := deps.ProcSession
+	if procSession == nil {
+		procSession = supervisor.ProcSessionID
+	}
+	killProcess := deps.KillProcess
+	if killProcess == nil {
+		killProcess = supervisor.KillPID
+	}
 	adoptWaiter := deps.AdoptedWaiter
 	if adoptWaiter == nil {
 		adoptWaiter = supervisor.AdoptedExitWaiter{}
@@ -997,6 +1036,10 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,
+		procTable:      procTable,
+		procCache:      newProcCache(procTable),
+		procSession:    procSession,
+		killProcess:    killProcess,
 		shimDialer:     shimDialer,
 	}, nil
 }
@@ -1102,4 +1145,39 @@ func daemonHome(workDir string) string {
 		return h
 	}
 	return ""
+}
+
+// treeConfig is the process-tree tracking every container process gets
+// (supervisor.TrackTree), and false when tracking is off. The sweep's budget is
+// the exit-observation bound, read now so a test that shrinks it is honoured.
+func (r *Runtime) treeConfig() (supervisor.TreeConfig, bool) {
+	if r.procTable == nil {
+		return supervisor.TreeConfig{}, false
+	}
+	return supervisor.TreeConfig{
+		Table:     r.procTable,
+		Kill:      r.killProcess,
+		KillGroup: r.signalGroup,
+		ProcStart: r.procStart,
+		Budget:    r.exitObservationGrace(),
+		Logger:    r.log,
+		Cache:     r.procCache,
+	}, true
+}
+
+// newProcCache is the shared process-table snapshot over read, or nil when
+// tracking is off.
+func newProcCache(read supervisor.ProcTable) *supervisor.ProcTableCache {
+	if read == nil {
+		return nil
+	}
+	return supervisor.NewProcTableCache(read)
+}
+
+// trackTree starts proc's process-tree tracking under ctx (the pod-lifetime
+// supervision context), when tracking is on.
+func (r *Runtime) trackTree(ctx context.Context, proc *supervisor.Process) {
+	if cfg, ok := r.treeConfig(); ok {
+		proc.TrackTree(ctx, cfg)
+	}
 }

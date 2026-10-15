@@ -32,6 +32,45 @@ limitations under the License.
 // daemon reconnects (ConnectShim, AdoptShim), so output, the real exit status
 // and exec all survive it. Exec sessions and the vm helper keep the pipe path.
 //
+// The process TREE, not the group, is the macOS analog of the pid namespace.
+// macOS has none, so nothing ends a container's processes when its init dies:
+// a container's SIGTERM goes to its init alone (the runc shape), and a child
+// the init did not reap is reparented to launchd and lives on with the pod's
+// authority, or leaves the group altogether through setsid(2). So each
+// container's tree is tracked (TrackTree, tree.go): every process descended
+// from the leader by parent pid, plus the members of the pod's process group
+// and session, each known by its exact instance (pid and kernel start time),
+// re-enumerated on a tick and once more before every termination signal,
+// because a child's ancestry is readable only while its parent lives. When the
+// leader's exit is observed, and again at DeletePod, every member still the
+// recorded instance is SIGKILLed by pid and each group a verified member is in
+// is SIGKILLed too; there is no SIGTERM for stragglers (runc's KILL to all
+// after init). Members still alive after the bounded wait are reported, and
+// the runtime keeps them in the container's reap record for the next sweep.
+//
+// The tree is read on a tick (DefaultTreeTick), from one process-table snapshot
+// the whole daemon shares (ProcTableCache), and fresh before every termination
+// signal; a sweep re-reads it every 50 ms.
+//
+// Ceilings, each a process the tree never knew and so cannot kill:
+//
+//   - The tick-sized residual: a child that forks, calls setsid(2) and loses
+//     its parent, all inside one tick and before any refresh has seen it, has
+//     no remaining link to the pod (no ancestry, not in the pod's group or
+//     session) and is not found. It was never a member, so no reap record
+//     names it, and the stop and uninstall sweeps of recorded survivors do not
+//     see it either.
+//   - More generally, a process that re-executes into a new session before the
+//     snapshot taken just before the termination signal, and is not reachable
+//     by ancestry from a known member at that moment, can survive the pod.
+//   - The launchd-mediated case: a job a pod submits through launchctl or XPC
+//     is started by launchd, not forked by the pod, so it is no pod
+//     descendant and is not killed. Whether that path is open at all is
+//     decided by the Seatbelt profile's mach-lookup posture, not here.
+//
+// The uninstall sweep over the reap records is the backstop for what the
+// records name, and only for that.
+//
 // kqueue is used deliberately INSTEAD OF os/exec.Cmd.Wait so there is exactly one
 // place that calls wait4; mixing the two double-reaps and races the exit status.
 //
