@@ -1,0 +1,68 @@
+# B494 row (h): SIGTERM mid-guest, and guest traps with the Go runtime's signal handlers installed
+confined: yes (pods below; uid 250, sandboxed=1 self-reported in the b494-hello/jit runs of the same image); profile file not readable without sudo.
+Timing sources: 'delete issued' and 'gone' are host UTC stamps from the driver (gone = first failing 'ps -p <pid>' poll, 50 ms);
+SIGNAL lines are the process's own stamps (crilog via kubectl logs -f); 'graceful-stop outcome' is the node agent's log line (local time, UTC-4).
+The pod object is force-deleted by the provider after teardown, so status/exit code is not readable afterwards; the agent line's
+escalated=false|true is the record of whether SIGKILL was needed.
+
+## 1. epoch interruption on SIGTERM (the design), terminationGracePeriodSeconds=30
+pod b494-spin-epoch2 uid=30e014e4-6fe0-4cca-aa84-b78f0541c688 terminationGracePeriodSeconds=30 command=["/bin/wasmspike","spin","@wasm/spin.wasm"]
+image=<lan-ip>:5494/b494/spike@sha256:bc345c6a4ef765b09745d0bb552ac70c67481633272d60d70bd07e4e1de4bb6c
+  PID  PPID USER  COMMAND
+77930 77929 _k3sm /var/lib/k3sm/pods/30e014e4-6fe0-4cca-aa84-b78f0541c688/rootfs/bin/wasmspike spin @wasm/spin.wasm
+delete issued 2026-10-15T04:35:04.936749+00:00
+pod "b494-spin-epoch2" deleted from b494 namespace
+host pid 77930 gone (ps -p) at 2026-10-15T04:35:06.667737+00:00
+agent.log:
+time=2026-10-15T00:34:58.483-04:00 level=INFO msg=CreatePod namespace=b494 name=b494-spin-epoch2
+time=2026-10-15T00:35:06.648-04:00 level=INFO msg="pod container graceful-stop outcome" pod=30e014e4-6fe0-4cca-aa84-b78f0541c688 pid=77929 grace=30s escalated=false
+time=2026-10-15T00:35:06.716-04:00 level=WARN msg="forgetting \"b494/b494-spin-epoch2/30e014e4-6fe0-4cca-aa84-b78f0541c688\" as told to forget while in progress" node=<worker-node> component=virtual-kubelet queue=deletePodsFromKubernetes workerId=1
+stream:
+2026-10-15T04:34:59.612697000Z B494 2026-10-15T04:34:59.612545Z +7ms guest spin entered (epoch=true)
+2026-10-15T04:35:05.134890000Z B494 2026-10-15T04:35:05.134385Z +5529ms SIGNAL terminated received; engine.IncrementEpoch()
+container "spike" in pod "b494-spin-epoch2" is not available=> SIGTERM reached the process 0.198 s after the delete; the process left 1.533 s after SIGTERM (the 1.5 s is the deliberate
+   log-drain pause after the trap); escalated=false: no SIGKILL. Exit well inside the 30 s grace.
+
+## 2. contrast: SIGTERM caught but the guest NOT interrupted, terminationGracePeriodSeconds=8
+pod b494-spin-ignore2 uid=997aa36b-1667-4925-98c8-1d194c8eea05 terminationGracePeriodSeconds=8 command=["/bin/wasmspike","spin","--ignore-term","@wasm/spin.wasm"]
+image=<lan-ip>:5494/b494/spike@sha256:bc345c6a4ef765b09745d0bb552ac70c67481633272d60d70bd07e4e1de4bb6c
+  PID  PPID USER  COMMAND
+78543 78542 _k3sm /var/lib/k3sm/pods/997aa36b-1667-4925-98c8-1d194c8eea05/rootfs/bin/wasmspike spin --ignore-term @wasm/spin.wasm
+delete issued 2026-10-15T04:35:27.223701+00:00
+pod "b494-spin-ignore2" deleted from b494 namespace
+host pid 78543 gone (ps -p) at 2026-10-15T04:35:35.433395+00:00
+agent.log:
+time=2026-10-15T00:35:20.639-04:00 level=INFO msg=CreatePod namespace=b494 name=b494-spin-ignore2
+time=2026-10-15T00:35:35.362-04:00 level=INFO msg="pod container graceful-stop outcome" pod=997aa36b-1667-4925-98c8-1d194c8eea05 pid=78542 grace=8s escalated=true
+time=2026-10-15T00:35:35.511-04:00 level=WARN msg="forgetting \"b494/b494-spin-ignore2/997aa36b-1667-4925-98c8-1d194c8eea05\" as told to forget while in progress" node=<worker-node> component=virtual-kubelet workerId=0 queue=deletePodsFromKubernetes
+stream:
+2026-10-15T04:35:21.592145000Z B494 2026-10-15T04:35:21.591877Z +13ms guest spin entered (epoch=true)
+2026-10-15T04:35:27.357903000Z B494 2026-10-15T04:35:27.357450Z +5779ms SIGNAL terminated received; NOT interrupting the guest (contrast run)
+container "spike" in pod "b494-spin-ignore2" is not available=> without epoch interruption a spinning guest ignores SIGTERM; the node escalated to SIGKILL at the grace end (8.08 s after SIGTERM,
+   escalated=true). Epoch interruption is what turns SIGTERM into a guest stop; the grace bound holds either way.
+
+## 3. the trap the SIGTERM path produces (same binary, host process, kill -TERM; the in-pod stream closes on deletion before this line)
+B494 2026-10-15T04:35:44.451077Z +5ms guest spin entered (epoch=true)
+B494 2026-10-15T04:35:45.475130Z +1029ms SIGNAL terminated received; engine.IncrementEpoch()
+B494 2026-10-15T04:35:45.475730Z +1029ms RESULT guest stopped: trap code=10(Interrupt) last="wasm trap: interrupt"; exiting 143 in 1.5s (the pause only lets the log stream drain)
+
+## 4. guest traps inside a confined pod with the Go runtime's handlers installed
+### b494-traps command=["/bin/wasmspike","traps","@wasm/traps.wasm"]
+2026-10-15T04:30:29.730746000Z B494 2026-10-15T04:30:29.730280Z +14ms go SIGSEGV handler live (nil deref recovered as panic): true; macOSUseMachPorts=true
+2026-10-15T04:30:29.732292000Z B494 2026-10-15T04:30:29.732118Z +15ms TRAP unreachable: code=9(UnreachableCodeReached) last="wasm trap: wasm `unreachable` instruction executed"
+2026-10-15T04:30:29.732541000Z B494 2026-10-15T04:30:29.732474Z +16ms TRAP divzero: code=7(IntegerDivisionByZero) last="wasm trap: integer divide by zero"
+2026-10-15T04:30:29.732861000Z B494 2026-10-15T04:30:29.732813Z +16ms TRAP oob: code=1(MemoryOutOfBounds) last="1: wasm trap: out of bounds memory access"
+2026-10-15T04:30:29.733027000Z B494 2026-10-15T04:30:29.732959Z +16ms go SIGSEGV handler still live after the guest traps: true
+2026-10-15T04:30:29.733169000Z B494 2026-10-15T04:30:29.732974Z +16ms RESULT traps done
+terminated: {"containerID":"k3sm-runtimed://7d0084810b6fa8a3482e1c68aac943cfae573fad39b72ed27bf295537176e031","exitCode":0,"finishedAt":"2026-10-15T04:30:29Z","reason":"Completed","startedAt":null}
+### b494-traps-unix command=["/bin/wasmspike","traps","--no-mach-ports","@wasm/traps.wasm"]
+2026-10-15T04:30:29.981406000Z B494 2026-10-15T04:30:29.981106Z +14ms go SIGSEGV handler live (nil deref recovered as panic): true; macOSUseMachPorts=false
+2026-10-15T04:30:29.982678000Z B494 2026-10-15T04:30:29.982577Z +15ms TRAP unreachable: code=9(UnreachableCodeReached) last="wasm trap: wasm `unreachable` instruction executed"
+2026-10-15T04:30:29.982886000Z B494 2026-10-15T04:30:29.982835Z +16ms TRAP divzero: code=7(IntegerDivisionByZero) last="wasm trap: integer divide by zero"
+2026-10-15T04:30:29.983061000Z B494 2026-10-15T04:30:29.982975Z +16ms TRAP oob: code=1(MemoryOutOfBounds) last="1: wasm trap: out of bounds memory access"
+2026-10-15T04:30:29.983242000Z B494 2026-10-15T04:30:29.983180Z +16ms go SIGSEGV handler still live after the guest traps: true
+2026-10-15T04:30:29.983464000Z B494 2026-10-15T04:30:29.983197Z +16ms RESULT traps done
+terminated: {"containerID":"k3sm-runtimed://7146b20e76892e3346f9a540711449d84663b8822fc7ea40ea15ac8b3a6c609a","exitCode":0,"finishedAt":"2026-10-15T04:30:29Z","reason":"Completed","startedAt":null}
+=> unreachable, integer divide by zero and an out-of-bounds load each come back as a *wasmtime.Trap with its code, under both
+   wasmtime's default macOS Mach-port exception handling and Config.SetMacOSUseMachPorts(false) (Unix signal handlers).
+   Go's own SIGSEGV handling works before and after (a Go nil dereference is recovered as a runtime panic). No crash, exit 0.

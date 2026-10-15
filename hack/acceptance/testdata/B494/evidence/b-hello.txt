@@ -1,0 +1,106 @@
+# B494 row (b): a WASI p1 hello module, exit code and stdout through the pod
+image route (the first evidence item): k3sm image load/import was not usable without sudo (the node's runtime socket is
+readable only by the daemon's own account) and the cluster registry refuses a push without its per-boot credential (401, the
+credential file is _k3sm-only on the server). So the spike binaries travel as a native darwin/arm64 OCI image built in scratch
+(go-containerregistry v0.22.1, one layer: /bin/wasmspike, /bin/wasmspike-rt, /wasm/*), pushed to a scratch registry on this
+Mac (read-write on loopback, read-only GET/HEAD on the LAN address, plain HTTP), and pulled by the node's own Puller like any
+registry image. image: <lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0
+confined: yes. pod b494-hello, uid 250 (_k3sm), sandbox_check(getpid())=1 reported by the process itself. The generated profile
+file sits under the _k3sm-only runtime state dir; it was not readable without sudo (excluded), so its sha256 is NOT recorded.
+First attempt: evicted by the node's NoExecute taint (TaintManagerEviction) until the pod tolerated that one taint by key+value;
+then refused once by the node's disk-pressure pull gate (host volume below 3 GiB free, not caused by this run); then pulled.
+
+## pod b494-hello uid=863b9bee-75c6-4809-a26f-cd856472dcc7 collected 2026-10-15T04:27:57Z
+## spec
+{
+ "nodeName": "<worker-node>",
+ "nodeSelector": {
+  "kubernetes.io/os": "darwin"
+ },
+ "tolerations": [
+  {
+   "effect": "NoSchedule",
+   "key": "k3sm.io/provider",
+   "operator": "Exists"
+  },
+  {
+   "effect": "NoExecute",
+   "key": "<workload>.io/estate-off",
+   "operator": "Equal",
+   "value": "<server-cluster>"
+  },
+  {
+   "effect": "NoExecute",
+   "key": "node.kubernetes.io/not-ready",
+   "operator": "Exists",
+   "tolerationSeconds": 300
+  },
+  {
+   "effect": "NoExecute",
+   "key": "node.kubernetes.io/unreachable",
+   "operator": "Exists",
+   "tolerationSeconds": 300
+  }
+ ],
+ "terminationGracePeriodSeconds": 30,
+ "image": "<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0",
+ "command": [
+  "/bin/wasmspike",
+  "hello",
+  "@wasm/hello.wasm"
+ ],
+ "resources": {}
+}
+## status
+{
+ "phase": "Failed",
+ "podIP": "<pod-mesh-ip>",
+ "containerStatuses": [
+  {
+   "containerID": "k3sm-runtimed://12a77dcd50083061701e5385e2a64b3bfd79a9c1116e3896fefb64da2677f386",
+   "image": "<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0",
+   "imageID": "sha256:1739afe663740b479def30d4939a4cf5988b151724cb2f8b1da0944fd74e4cb1",
+   "lastState": {},
+   "name": "spike",
+   "ready": false,
+   "restartCount": 0,
+   "started": false,
+   "state": {
+    "terminated": {
+     "containerID": "k3sm-runtimed://12a77dcd50083061701e5385e2a64b3bfd79a9c1116e3896fefb64da2677f386",
+     "exitCode": 7,
+     "finishedAt": "2026-10-15T04:26:12Z",
+     "reason": "Error",
+     "startedAt": null
+    }
+   },
+   "volumeMounts": [
+    {
+     "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+     "name": "kube-api-access-2ckvm",
+     "readOnly": true
+    }
+   ]
+  }
+ ]
+}
+## log (kubectl logs --timestamps)
+2026-10-15T04:26:12.087990000Z B494 hello-pre exe=/var/lib/k3sm/pods/863b9bee-75c6-4809-a26f-cd856472dcc7/rootfs/bin/wasmspike csops_status=0x22000201(CS_RUNTIME=false) dyld_insert="/Library/k3sm/libk3sm_pathrebase_shim.dylib:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib"
+2026-10-15T04:26:12.089633000Z B494 hello-pre pid=45838 uid=250 euid=250 sandboxed=1 dyncodegen_denied=0 read_etc_master_passwd_denied=0 footprint=3900112 peak=3900112
+2026-10-15T04:26:12.106140000Z hello from a wasi p1 module under k3sm
+2026-10-15T04:26:12.106284000Z B494 2026-10-15T04:26:12.106237Z +18ms guest proc_exit(7)
+## events (involvedObject.uid=863b9bee-75c6-4809-a26f-cd856472dcc7)
+2026-10-15T04:20:59Z Normal ProviderCreateSuccess Create pod in provider successfully
+2026-10-15T04:23:29Z Warning Failed Failed to pull image "<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0": "pull image \"<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0\": pull \"<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0\": image: refusing to start a pul"...
+2026-10-15T04:23:29Z Normal BackOff Back-off pulling image "<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0"
+2026-10-15T04:26:09Z Normal Pulling Pulling image "<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0"
+2026-10-15T04:26:11Z Normal Pulled Successfully pulled image "<lan-ip>:5494/b494/spike@sha256:7b6d3cc7db928002aef8b8fbf2c108cf6f536fdf12c764d1cdaa6f0d853e1af0" in 1.099s (1.421s including waiting)
+
+## crilog
+The container log file itself (under /var/log/pods, mode 0700 _k3sm) was not readable without sudo. The bytes above under
+'## log' are served from it by the node's log endpoint (kubectl logs --timestamps): the guest's fd_write(1) line
+'hello from a wasi p1 module under k3sm' is there between the host's stderr lines.
+
+## verdict
+PASS. proc_exit(7) in the guest -> the host process exits 7 -> containerStatuses[0].state.terminated.exitCode 7, reason Error.
+Side observations: startedAt is null in the terminated state; no Created/Started events were emitted for this pod.

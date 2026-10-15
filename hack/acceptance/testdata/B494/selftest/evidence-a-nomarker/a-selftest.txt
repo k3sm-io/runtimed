@@ -1,0 +1,2 @@
+self-test evidence for row (a)
+WASMTIME_FEATURE_WASI: present

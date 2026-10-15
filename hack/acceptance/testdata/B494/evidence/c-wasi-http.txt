@@ -1,0 +1,86 @@
+# B494 row (c): a wasi:http incoming-handler component on a post-sandbox pod-IP listener
+confined: yes. pod b494-http (uid 250, sandboxed=1 self-reported), node <worker-node>; profile file not readable without sudo (sha256 not recorded).
+
+## what was needed to reach wasip2 + wasi:http (no fork, no patch)
+wasmtime-go v49.0.0 wraps neither wasmtime_component_linker_add_wasip2 nor _add_wasi_http and hides the linker pointer,
+and it has NO component function call API at all (no ComponentFunc/Call in component_*_feat_component_model.go).
+The spike reached them with its OWN cgo in package main (CFLAGS -I <module>/build/include), calling the C symbols the
+module's libwasmtime.a exports; the archive is linked by the module's ffi.go LDFLAGS. It builds its own engine/store/linker
+in C; no wasmtime-go type is touched. Exported C API surface for http (nm -gU libwasmtime.a, wasmtime_/wasi_ symbols:      774):
+  _wasmtime_component_linker_add_wasi_http
+  _wasmtime_component_linker_add_wasi_http_async
+  _wasmtime_component_resource_host_new
+  _wasmtime_component_resource_type_new_host
+  _wasmtime_context_set_wasi_http
+There is no incoming-handler server entry point and no constructor for wasi:http/types incoming-request or response-outparam.
+build/include/wasmtime/component/linker.h on add_wasi_http:
+  #ifdef WASMTIME_FEATURE_WASI_HTTP
+  
+  /**
+   * \brief Add WASI HTTP interfaces into the \p linker provided.
+   *
+   * This adds `wasi:http/types` and `wasi:http/outgoing-handler` to the linker.
+   * Requires WASI to be added first via #wasmtime_component_linker_add_wasip2.
+   */
+  WASM_API_EXTERN wasmtime_error_t *
+  wasmtime_component_linker_add_wasi_http(wasmtime_component_linker_t *linker);
+  #endif // WASMTIME_FEATURE_WASI_HTTP
+  
+  /// Type of the callback used in
+  /// #wasmtime_component_linker_instance_add_resource
+
+## the component (proxy.wat, compiled at run time by wasmtime_wat2wasm)
+  (component
+    (import "wasi:http/types@0.2.0" (instance $types
+      (export "incoming-request" (type (sub resource)))
+      (export "response-outparam" (type (sub resource)))))
+    (alias export $types "incoming-request" (type $req))
+    (alias export $types "response-outparam" (type $out))
+    (core module $m (func (export "handle") (param i32 i32)))
+    (core instance $i (instantiate $m))
+    (func $handle (param "request" (own $req)) (param "response-out" (own $out))
+      (canon lift (core func $i "handle")))
+    (instance $h (export "handle" (func $handle)))
+    (export "wasi:http/incoming-handler@0.2.0" (instance $h)))
+## pod log (kubectl logs --timestamps)
+  2026-10-15T04:29:46.919122000Z B494 http-pre exe=/var/lib/k3sm/pods/de32ad9b-0350-4f09-a5e9-336a8ee97bbc/rootfs/bin/wasmspike csops_status=0x22000201(CS_RUNTIME=false) dyld_insert="/Library/k3sm/libk3sm_pathrebase_shim.dylib:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib"
+  2026-10-15T04:29:46.921139000Z B494 http-pre pid=60169 uid=250 euid=250 sandboxed=1 dyncodegen_denied=0 read_etc_master_passwd_denied=0 footprint=4014776 peak=4014776
+  2026-10-15T04:29:46.956253000Z B494 2026-10-15T04:29:46.956171Z +37ms C-API wat2wasm ok (369 bytes)
+  2026-10-15T04:29:46.957586000Z B494 2026-10-15T04:29:46.956303Z +37ms C-API component_new ok
+  2026-10-15T04:29:46.961326000Z B494 2026-10-15T04:29:46.956338Z +37ms C-API wasmtime_component_linker_add_wasip2 ok
+  2026-10-15T04:29:46.961400000Z B494 2026-10-15T04:29:46.956341Z +37ms C-API wasmtime_component_linker_add_wasi_http ok
+  2026-10-15T04:29:46.961534000Z B494 2026-10-15T04:29:46.956343Z +37ms C-API wasmtime_context_set_wasi + set_wasi_http ok
+  2026-10-15T04:29:46.973854000Z B494 2026-10-15T04:29:46.956345Z +37ms C-API instantiate ok (the wasi:http/types imports were satisfied by add_wasi_http)
+  2026-10-15T04:29:46.976397000Z B494 2026-10-15T04:29:46.956347Z +37ms C-API resolved wasi:http/incoming-handler@0.2.0#handle
+  2026-10-15T04:29:46.999524000Z B494 2026-10-15T04:29:46.957768Z +39ms listening on <pod-mesh-ip>:8080 (sandboxed=1: a confined process binds after its profile is applied)
+  2026-10-15T04:30:02.057893000Z B494 2026-10-15T04:30:02.057773Z +15139ms REQUEST GET /hello from <bcast>:63150
+  2026-10-15T04:30:02.058214000Z B494 2026-10-15T04:30:02.058134Z +15139ms HANDLE rc=2 func_call(handle): mismatched resource types
+
+## the request, from the server node over the mesh
+$ ssh <server-node> 'zsh -lc "hostname; date -u; curl -sS -i -m 10 -H X-B494:from-the-server-node http://<pod-ip>:8080/hello"'
+  <server-host>
+  2026-10-15T04:30:01Z
+  HTTP/1.1 502 Bad Gateway
+  Date: Thu, 15 Oct 2026 04:30:02 GMT
+  Content-Length: 445
+  Content-Type: text/plain; charset=utf-8
+  
+  b494: listener on the pod IP works; the guest handler cannot be invoked through the C API.
+  setup:
+  wat2wasm ok (369 bytes)
+  component_new ok
+  wasmtime_component_linker_add_wasip2 ok
+  wasmtime_component_linker_add_wasi_http ok
+  wasmtime_context_set_wasi + set_wasi_http ok
+  instantiate ok (the wasi:http/types imports were satisfied by add_wasi_http)
+  resolved wasi:http/incoming-handler@0.2.0#handle
+  
+  call: func_call(handle): mismatched resource types
+
+## verdict
+FAIL. The listener half works: the confined host bound the pod IP after its profile applied and answered a request from the
+other node over the mesh. The handler half does not: add_wasip2 + add_wasi_http + set_wasi_http + instantiate all succeed and
+incoming-handler#handle resolves, but the C API can only mint host-defined resources (resource_host_new with a u32 type tag),
+and handle() rejects them: 'mismatched resource types'. The wasi:http/types resources belong to the Rust wasmtime-wasi-http
+crate (its ProxyPre / hyper serve path), which v49's C API does not expose. A fork that only adds AddWasip2()/AddWasiHTTP()
+(R6 as written) therefore cannot serve wasi:http incoming; outgoing (add_wasi_http = types + outgoing-handler) is all it buys.

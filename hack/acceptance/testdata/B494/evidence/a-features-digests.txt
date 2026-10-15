@@ -1,0 +1,56 @@
+# B494 row (a): libwasmtime feature list and three-way provenance digest
+host: Mac14,2 27.0.1 (26A434); recorded 2026-10-15T04:07:09Z
+
+## conf.h feature list (module github.com/bytecodealliance/wasmtime-go/v49@v49.0.0, build/include/wasmtime/conf.h)
+#define WASMTIME_FEATURE_PROFILING
+#define WASMTIME_FEATURE_WAT
+#define WASMTIME_FEATURE_CACHE
+#define WASMTIME_FEATURE_PARALLEL_COMPILATION
+#define WASMTIME_FEATURE_WASI
+#define WASMTIME_FEATURE_WASI_HTTP
+#define WASMTIME_FEATURE_LOGGING
+/* #undef WASMTIME_FEATURE_DISABLE_LOGGING */
+#define WASMTIME_FEATURE_COREDUMP
+#define WASMTIME_FEATURE_ADDR2LINE
+#define WASMTIME_FEATURE_DEMANGLE
+#define WASMTIME_FEATURE_THREADS
+#define WASMTIME_FEATURE_GC
+#define WASMTIME_FEATURE_GC_DRC
+#define WASMTIME_FEATURE_GC_NULL
+#define WASMTIME_FEATURE_ASYNC
+#define WASMTIME_FEATURE_CRANELIFT
+#define WASMTIME_FEATURE_WINCH
+#define WASMTIME_FEATURE_DEBUG_BUILTINS
+#define WASMTIME_FEATURE_POOLING_ALLOCATOR
+#define WASMTIME_FEATURE_COMPONENT_MODEL
+#define WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
+#define WASMTIME_FEATURE_PULLEY
+/* #undef WASMTIME_FEATURE_ALL_ARCH */
+#define WASMTIME_FEATURE_COMPILER
+
+WASMTIME_FEATURE_WASI: present
+WASMTIME_FEATURE_WASI_HTTP: present
+conf.h identical to the upstream asset's include/wasmtime/conf.h: yes
+symbols in the module archive (nm -gU): 2 of 2 (_wasmtime_component_linker_add_wasip2, _wasmtime_component_linker_add_wasi_http)
+LC_BUILD_VERSION minos of the archive objects: 11.0 (first member, otool -l)
+
+## three-way digest
+1 module (sumdb-verified go.sum h1:kH3XJMvXKuKmFgRhhHqeYi5p/ztgJd/Trr3gU06u1fY=): build/macos-aarch64/libwasmtime.a
+  size 41751312 sha256 f61690619840fbfbce15ce954d7189ba080ebe305f8be7af9ab3312947e5f15b
+2 upstream release asset: https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.0/wasmtime-v49.0.0-aarch64-macos-c-api.tar.xz
+  fetched 2026-10-15T04:06:38Z; asset size 13125008 sha256 515cf4d09e7af24df1ffc09bc680ffc4bf249b326bd1ed3fb0c1d6874e9c2a21
+  extracted lib/libwasmtime.a size 41751312 sha256 f61690619840fbfbce15ce954d7189ba080ebe305f8be7af9ab3312947e5f15b
+3 upstream published checksum file: NONE. The v49.0.0 release (published 2026-09-21T15:33:20Z, 39 assets) carries no SHA256SUMS/checksum/signature asset.
+  The only third value is GitHub's server-computed asset digest (gh release view --json assets .digest):
+  sha256:515cf4d09e7af24df1ffc09bc680ffc4bf249b326bd1ed3fb0c1d6874e9c2a21
+  It matches the downloaded tarball. GitHub computes it on upload; it is not a maintainer-published file.
+  Upstream DOES publish a signed build attestation for this asset (2 attestations on the digest via
+  gh api repos/bytecodealliance/wasmtime/attestations/sha256:515cf4d0...). Verified:
+  `gh attestation verify asset.tar.xz -R bytecodealliance/wasmtime` exit 0 (gh version 2.102.0 (2026-09-30))
+  predicateType https://slsa.dev/provenance/v1
+  signer workflow https://github.com/bytecodealliance/wasmtime/.github/workflows/publish-artifacts.yml@refs/tags/v49.0.0
+  source ref refs/tags/v49.0.0 at 17830bd3c0331d920a8aa38846eebc4d46d98c23
+  So the digest is NOT trust-on-first-use: the tarball carries Sigstore-signed SLSA provenance from the upstream
+  release workflow, and the module's libwasmtime.a is byte-identical to the attested tarball's lib/libwasmtime.a.
+
+verdict: module libwasmtime.a == upstream lib/libwasmtime.a: MATCH

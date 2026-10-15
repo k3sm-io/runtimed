@@ -1,0 +1,1 @@
+{"critical":{"identity":{"docker-reference":"127.0.0.1:5494/b494/hello-wasX"},"image":{"docker-manifest-digest":"sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec"},"type":"cosign container image signature"},"optional":null}
