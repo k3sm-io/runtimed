@@ -333,7 +333,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// Release the container log files, AFTER the stop above: the pumps have had
 	// the pod's whole grace budget to flush the dying children's final output,
 	// and a Writer closed earlier would take that output with it. The FILES stay
-	// — runtimed never deletes one — so the node can still read a deleted pod's
+	// — runtimed never deletes one that holds output — so the node can still read a deleted pod's
 	// logs until its own GC removes the tree.
 	//
 	// The log tails read the containers' capture files under the pod dir and
@@ -401,7 +401,7 @@ func (r *Runtime) sweepPodTrees(podID string, p *pod) map[int]keptSurvivors {
 // legitimately writing.
 //
 // It closes the HANDLE, not the FILE: the log stays on disk for the node to read
-// and to delete. runtimed deletes no log file, ever.
+// and to delete. runtimed deletes no log file that holds output.
 func (r *Runtime) closeContainerLogs(p *pod) {
 	p.mu.Lock()
 	writers := make([]*crilog.Writer, 0, len(p.containers)+len(p.guestLogs))

@@ -22,6 +22,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"path/filepath"
 	"time"
 	"unicode/utf8"
@@ -551,7 +552,9 @@ const guestRestartStartBudget = time.Minute
 // into the pod's status. The guest publishes that event before it answers, so
 // the wait is the event stream's delivery and nothing more; the bound is for a
 // stream that is down, which the fold catches up on when it resubscribes.
-const guestRestartFoldWait = 10 * time.Second
+//
+// A var so a test can shorten it.
+var guestRestartFoldWait = 10 * time.Second
 
 // guestRestartUnsupported is the refusal a vm pod gets when its guest cannot
 // restart a container in place: FailedPrecondition + UNSUPPORTED, because the
@@ -587,6 +590,13 @@ func guestRestartUnsupported(podID, container string) *runtimev1.RestartContaine
 // A guest that does not advertise the capability is refused before anything is
 // touched; one whose capabilities were not yet read is asked, and an older agent
 // answering Unimplemented gets the same refusal.
+//
+// The claim is bounded by guestRestartFoldWait: a guest that acknowledges and
+// never reports the replacement's start does not leave the container refused as
+// in flight. A restart that fails leaves no new log file behind unless output
+// reached it (settleGuestRestartLog), so refusals do not advance the numbering.
+//
+// The initramfs pin is unchanged; until the next guest publish the capability gate answers UNSUPPORTED.
 func (r *Runtime) restartGuest(ctx context.Context, p *pod, req *runtimev1.RestartContainerRequest) *runtimev1.RestartContainerResponse {
 	podID := p.box.GetPodId()
 	name, err := vmContainerName(p.box, req.GetContainer())
@@ -639,13 +649,21 @@ func (r *Runtime) restartGuest(ctx context.Context, p *pod, req *runtimev1.Resta
 	r.startGuestLogFollower(p, name)
 
 	wait := time.NewTimer(guestRestartFoldWait)
-	defer wait.Stop()
 	select {
 	case <-rs.done:
+		wait.Stop()
 	case <-wait.C:
-		r.log.Warn("the guest restarted the container but its start has not reached the pod status yet",
-			"pod", podID, "container", name, "waited", guestRestartFoldWait)
+		r.expireGuestRestart(p, name, rs)
 	case <-ctx.Done():
+		// The caller left; the claim still expires on the same bound.
+		go func() {
+			defer wait.Stop()
+			select {
+			case <-rs.done:
+			case <-wait.C:
+				r.expireGuestRestart(p, name, rs)
+			}
+		}()
 	}
 
 	p.mu.Lock()
@@ -690,6 +708,29 @@ func (r *Runtime) claimGuestRestart(p *pod, name, reason string) (*guestRestart,
 	p.guestRestarts[name] = rs
 	p.mu.Unlock()
 	return rs, nil
+}
+
+// expireGuestRestart drops a restart's claim when the replacement's start has
+// not been folded within guestRestartFoldWait, so a guest that acknowledged and
+// then stayed silent cannot leave the container refused as in flight. The
+// status is left as it stands: a start event arriving later is folded as an
+// ordinary start, without the count advancing for a restart nobody saw.
+func (r *Runtime) expireGuestRestart(p *pod, name string, rs *guestRestart) {
+	p.mu.Lock()
+	expired := p.guestRestarts[name] == rs
+	if expired {
+		select {
+		case <-rs.done:
+			expired = false
+		default:
+			delete(p.guestRestarts, name)
+		}
+	}
+	p.mu.Unlock()
+	if expired {
+		r.log.Warn("the guest acknowledged a container restart but its start never reached the pod status; releasing the restart claim",
+			"pod", p.box.GetPodId(), "container", name, "waited", guestRestartFoldWait)
+	}
 }
 
 // callGuestRestart asks the pod's guest to restart one container.
@@ -744,6 +785,12 @@ func (r *Runtime) concludeFailedGuestRestart(p *pod, name string, rs *guestResta
 // (the follower closes a writer it moves off itself). On success the new one
 // stays. On failure the previous one is restored, unless the follower already
 // began writing into the new one, in which case that is where output now goes.
+//
+// A new file a failed restart drops is also UNLINKED when nothing was written to
+// it. The next instance number is one past the highest file on disk, so an
+// empty file left by each refused attempt would advance the numbering with no
+// run behind it and leave `kubectl logs --previous` pointing at nothing. A file
+// any byte reached is kept: it is a run's output, and runtimed deletes none.
 func (r *Runtime) settleGuestRestartLog(p *pod, name string, prev, w *crilog.Writer, succeeded bool) {
 	if w == nil {
 		return
@@ -768,8 +815,18 @@ func (r *Runtime) settleGuestRestartLog(p *pod, name string, prev, w *crilog.Wri
 		drop = prev
 	}
 	p.mu.Unlock()
-	if drop != nil {
-		r.closeGuestLog(p, name, drop)
+	if drop == nil {
+		return
+	}
+	r.closeGuestLog(p, name, drop)
+	if drop != w {
+		return
+	}
+	if fi, err := os.Stat(w.Path()); err == nil && fi.Size() == 0 {
+		if err := os.Remove(w.Path()); err != nil {
+			r.log.Warn("could not remove the unused log file of a failed restart",
+				"pod", p.box.GetPodId(), "container", name, "path", w.Path(), "err", err)
+		}
 	}
 }
 

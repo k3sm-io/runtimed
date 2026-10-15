@@ -45,24 +45,24 @@ import (
 //
 // RestartContainer is the shared terminate (terminateContainer, the one kill
 // sequence StopContainer also uses) followed by a re-spawn; StopContainer is the
-// terminate alone. Both verbs refuse through the same eligibility chain
-// (refuseIneligible), so unknown pod / container return a structured NOT_FOUND
-// (RestartContainerResponse carries a google.rpc.Status, matching
-// CreatePod/UpdatePod) rather than a transport error. A vm pod forks first, to
-// restartGuest, which restarts the container inside its guest. A pod that is being deleted
-// is refused up front with FailedPrecondition + NOT_FOUND; one whose delete
+// terminate alone. A vm pod never reaches either: RestartContainer forks it to
+// restartGuest first, which restarts the container inside its guest, and
+// StopContainer refuses it. For a host-process pod both verbs refuse through
+// the same eligibility chain (refuseIneligible), so unknown pod / container
+// return a structured NOT_FOUND (RestartContainerResponse carries a
+// google.rpc.Status, matching CreatePod/UpdatePod) rather than a transport
+// error. A pod that is being deleted is refused up front with FailedPrecondition + NOT_FOUND; one whose delete
 // begins during the re-spawn refuses the replacement with the same answer and
 // SIGKILLs the group it had already spawned — the answer StartContainer gives,
 // through the same installer, because a group installed after DeletePod's
 // snapshot is one nothing would ever signal.
 func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
 	// The vm fork (restartGuest), before any containerProc is touched.
-	// Pin unchanged: until the next guest publish, the capability gate answers UNSUPPORTED rather than hang.
 	if p, ok := r.lookupPod(req.GetPodId()); ok && p.isVM() {
 		return r.restartGuest(ctx, p, req), nil
 	}
-	// The shared eligibility chain (refuseIneligible): unknown pod, vm pod
-	// (UNSUPPORTED), a pod being deleted, unknown container, and a
+	// The shared eligibility chain (refuseIneligible): unknown pod, a pod
+	// being deleted, unknown container, and a
 	// container that never started are all refused here, before the old process
 	// is touched — stopping it and then failing the re-spawn would turn a
 	// running container into a dead one.

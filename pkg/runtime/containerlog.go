@@ -33,7 +33,9 @@ import (
 // runtimed is the WRITER and nothing else. It opens the file the node named
 // (PodBox.log_directory), appends CRI-format lines to it, and reopens it when
 // the node rotates it. It never reads one back, never rotates one, never
-// deletes one, and keeps no in-memory copy of a container's output — the
+// deletes one that holds output (the one unlink is a vm restart's own empty
+// file when the restart failed: settleGuestRestartLog), and keeps no in-memory
+// copy of a container's output — the
 // 256 KiB ring that used to serve GetLogs is gone, along with the truncation
 // and the eviction it forced. The node owns the directory tree, the reader
 // `kubectl logs` is served from, rotation, and every deletion, which is the

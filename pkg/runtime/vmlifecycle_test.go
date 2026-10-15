@@ -332,6 +332,9 @@ func TestVMHelperExitFailsTheRunningPod(t *testing.T) {
 type guestExecutor struct {
 	events  *guestagent.Events
 	nextPID int32
+	// silent is how many restarts to acknowledge without publishing anything,
+	// the way a guest that acked and then lost its event would.
+	silent int
 
 	mu    sync.Mutex
 	calls []string
@@ -342,6 +345,11 @@ func (g *guestExecutor) RestartContainer(_ context.Context, container string, gr
 	g.mu.Lock()
 	g.calls = append(g.calls, container)
 	g.grace = grace
+	if g.silent > 0 {
+		g.silent--
+		g.mu.Unlock()
+		return nil
+	}
 	g.nextPID++
 	pid := g.nextPID
 	g.mu.Unlock()
@@ -549,6 +557,126 @@ func TestRestartContainerRefusesAGuestWithoutTheCapability(t *testing.T) {
 		}
 		assertRefusal(t, resp)
 	})
+}
+
+// TestRestartContainerReleasesAClaimTheGuestNeverConfirmed asserts the restart
+// claim cannot outlive a guest that acknowledged the restart and never reported
+// the replacement's start: the wait lapses, the stale status comes back, and the
+// next restart is served rather than refused as in flight.
+func TestRestartContainerReleasesAClaimTheGuestNeverConfirmed(t *testing.T) {
+	saved := guestRestartFoldWait
+	guestRestartFoldWait = 100 * time.Millisecond
+	t.Cleanup(func() { guestRestartFoldWait = saved })
+
+	const podID = "pod-vm-9"
+	rt, p, exec := bootedVMRuntimeWithAgent(t, podID, 1)
+	rt.setGuestCapabilities(p, guestagent.Capabilities())
+	exec.mu.Lock()
+	exec.silent = 1
+	exec.mu.Unlock()
+
+	first, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{PodId: podID, Container: "main"})
+	if err != nil || first.GetError() != nil {
+		t.Fatalf("first RestartContainer: %v / %v", err, first.GetError())
+	}
+	if got := first.GetStatus().GetRestartCount(); got != 0 {
+		t.Errorf("first restart_count = %d, want the stale 0: no start was ever reported", got)
+	}
+	p.mu.Lock()
+	leaked := p.guestRestarts["main"] != nil
+	p.mu.Unlock()
+	if leaked {
+		t.Fatal("the restart claim outlived the fold wait")
+	}
+
+	second, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{PodId: podID, Container: "main"})
+	if err != nil {
+		t.Fatalf("second RestartContainer: %v", err)
+	}
+	if second.GetError() != nil {
+		t.Fatalf("second restart refused: %v (reason %v)", second.GetError(), second.GetFailureReason())
+	}
+	st := second.GetStatus()
+	if st.GetState().GetRunning() == nil || st.GetLastTerminationState().GetTerminated() == nil {
+		t.Errorf("second restart status = %v, want a running replacement with the previous run recorded", st)
+	}
+	// The first attempt's file is kept (the guest did acknowledge it), so the
+	// second instance takes the number after it, and count and file agree.
+	if st.GetRestartCount() != 2 || filepath.Base(st.GetLogPath()) != "2.log" {
+		t.Errorf("second restart = count %d, file %s; want 2 and 2.log", st.GetRestartCount(), filepath.Base(st.GetLogPath()))
+	}
+	if calls, _ := exec.snapshot(); len(calls) != 2 {
+		t.Errorf("guest restarts = %v, want 2", calls)
+	}
+}
+
+// TestRefusedGuestRestartsLeaveTheLogDirAsItWas asserts a restart the guest
+// refused leaves no empty instance file behind: the next instance number is one
+// past the highest file on disk, so each leftover would advance the count with
+// no run behind it.
+func TestRefusedGuestRestartsLeaveTheLogDirAsItWas(t *testing.T) {
+	const podID = "pod-vm-10"
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	guestv1.RegisterGuestAgentServer(srv, olderGuestAgent{})
+	served := make(chan struct{})
+	go func() { defer close(served); _ = srv.Serve(lis) }()
+	t.Cleanup(func() { srv.Stop(); <-served; _ = lis.Close() })
+	rt := newTestRuntime(t, Deps{
+		VMBackend: &fakeVMBackend{available: true},
+		GuestDialer: func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		},
+	})
+	p := addVMPod(t, rt, podID, "app")
+	logDir := containerLogDir(p.box.GetLogDirectory(), "app")
+	w0, err := crilog.Open(filepath.Join(logDir, "0.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w0.Write(crilog.StreamStdout, []byte("first run"), false); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	p.guestLogs = map[string]*crilog.Writer{"app": w0}
+	p.guestContainerLocked("app", "").State = &runtimev1.ContainerState{
+		Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()}}
+	p.mu.Unlock()
+
+	for i := range 2 {
+		resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{PodId: podID, Container: "app"})
+		if err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+		if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED {
+			t.Fatalf("attempt %d: reason %v, want the UNSUPPORTED refusal", i, resp.GetFailureReason())
+		}
+	}
+
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != "0.log" {
+		t.Errorf("log dir = %v, want only 0.log: a refused restart left a file behind", names)
+	}
+	if next, _ := restartCountFromLogDir(logDir); next != 1 {
+		t.Errorf("next instance number = %d, want 1", next)
+	}
+	p.mu.Lock()
+	count := p.guestContainers["app"].GetRestartCount()
+	current := p.guestLogs["app"]
+	p.mu.Unlock()
+	if count != 0 {
+		t.Errorf("restart_count = %d, want 0", count)
+	}
+	if current != w0 {
+		t.Error("the container's writer was not restored to the first run's")
+	}
 }
 
 // olderGuestAgent is an agent built before RestartContainer existed: every RPC
