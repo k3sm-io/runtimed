@@ -216,6 +216,10 @@ func NewReaper(proc Proc, sigchld <-chan struct{}, opts ReaperOptions) *Reaper {
 // is delivered here instead of being lost.
 func (r *Reaper) Track(container string, pid int) {
 	r.mu.Lock()
+	// A new instance supersedes the previous one's recorded exit: without this,
+	// a Wait for a restarted container would return the status of the run it
+	// replaced. At boot nothing is recorded yet, so this changes nothing there.
+	delete(r.done, container)
 	status, alreadyExited := r.unstashLocked(pid)
 	if !alreadyExited {
 		r.live[pid] = container
@@ -281,10 +285,23 @@ func (r *Reaper) reaped(pid int, status WaitStatus) {
 	r.finish(container, pid, status)
 }
 
-// finish records a container's terminal status, wakes its waiters and the stop
-// sequence, and delivers the exit event. Every one of those happens exactly
-// once per container exit, and the callback runs with no lock held.
+// finish delivers the exit event, then records a container's terminal status
+// and wakes its waiters and the stop sequence. Every one of those happens
+// exactly once per container exit, and the callback runs with no lock held.
+//
+// The callback runs FIRST, and that order is what makes Wait a barrier: a
+// waiter is woken only once the exit's side effects (the executor ends the
+// container's log stream and releases its retained stdio there) are done.
+// StopContainer depends on it: a restart that spawned the replacement while the
+// old instance's callback was still running would have its fresh stdio
+// registration released by the callback meant for its predecessor.
 func (r *Reaper) finish(container string, pid int, status WaitStatus) {
+	r.log.Info("container exited", "container", container, "pid", pid,
+		"exit_code", status.ExitCode, "signal", status.Signal)
+	if r.onExit != nil {
+		r.onExit(ExitEvent{Container: container, PID: pid, Status: status})
+	}
+
 	r.mu.Lock()
 	r.done[container] = status
 	if ch, ok := r.waiters[container]; ok {
@@ -296,12 +313,6 @@ func (r *Reaper) finish(container string, pid int, status WaitStatus) {
 	select {
 	case r.exited <- struct{}{}:
 	default:
-	}
-
-	r.log.Info("container exited", "container", container, "pid", pid,
-		"exit_code", status.ExitCode, "signal", status.Signal)
-	if r.onExit != nil {
-		r.onExit(ExitEvent{Container: container, PID: pid, Status: status})
 	}
 }
 
@@ -477,38 +488,123 @@ func (r *Reaper) stop(ctx context.Context, grace time.Duration) (err error) {
 	pids := r.livePIDs()
 	r.log.Info("stopping the guest", "containers", len(pids), "grace", grace)
 
-	// One timer for the whole stop: sidecars share the pod's budget.
-	expired := grace <= 0 || len(pids) == 0
-	var timer <-chan time.Time
-	if !expired {
-		t, stopTimer := r.newTimer(grace)
-		defer stopTimer()
-		timer = t
-	}
-	term := func(group []int) {
-		for _, pid := range group {
-			if err := r.proc.Kill(pid, SignalTerm); err != nil {
-				errs = append(errs, fmt.Errorf("term pid %d: %w", pid, err))
-			}
-		}
-		if !expired && len(group) > 0 {
-			expired = !r.awaitGone(ctx, timer, group)
-		}
-	}
+	// One budget for the whole stop: sidecars share the pod's grace.
+	b, stopTimer := r.newBudget(grace, len(pids) == 0)
+	defer stopTimer()
 	mains, sidecars := r.stopGroups()
-	term(mains)
+	errs = append(errs, r.terminate(ctx, b, mains)...)
 	for _, pid := range sidecars {
-		term([]int{pid})
+		errs = append(errs, r.terminate(ctx, b, []int{pid})...)
 	}
+	errs = append(errs, r.killLive(r.livePIDs())...)
 
-	for _, pid := range r.livePIDs() {
+	return nil
+}
+
+// stopBudget is one grace budget, shared by every group a stop sequence
+// terminates: the timer that ends it, and whether it is already spent.
+type stopBudget struct {
+	timer   <-chan time.Time
+	expired bool
+}
+
+// newBudget starts a grace budget. A non-positive grace, or nothing to wait for,
+// is an already-spent budget: the sequence goes straight to SIGKILL. The
+// returned func stops the timer.
+func (r *Reaper) newBudget(grace time.Duration, nothingToWaitFor bool) (*stopBudget, func() bool) {
+	b := &stopBudget{expired: grace <= 0 || nothingToWaitFor}
+	if b.expired {
+		return b, func() bool { return false }
+	}
+	t, stopTimer := r.newTimer(grace)
+	b.timer = t
+	return b, stopTimer
+}
+
+// terminate sends SIGTERM to every pid in group and, while the budget lasts,
+// waits for all of them to be reaped. A wait that the timer or ctx ends marks
+// the budget spent, so no later group waits again. It returns the signalling
+// errors, which are non-fatal (see Proc.Kill).
+func (r *Reaper) terminate(ctx context.Context, b *stopBudget, group []int) []error {
+	var errs []error
+	for _, pid := range group {
+		if err := r.proc.Kill(pid, SignalTerm); err != nil {
+			errs = append(errs, fmt.Errorf("term pid %d: %w", pid, err))
+		}
+	}
+	if !b.expired && len(group) > 0 {
+		b.expired = !r.awaitGone(ctx, b.timer, group)
+	}
+	return errs
+}
+
+// killLive sends SIGKILL to every pid in pids that is still tracked and live,
+// returning the signalling errors.
+func (r *Reaper) killLive(pids []int) []error {
+	var errs []error
+	for _, pid := range pids {
+		if !r.anyLive([]int{pid}) {
+			continue
+		}
 		r.log.Warn("container did not exit within the grace budget; killing", "pid", pid)
 		if err := r.proc.Kill(pid, SignalKill); err != nil {
 			errs = append(errs, fmt.Errorf("kill pid %d: %w", pid, err))
 		}
 	}
+	return errs
+}
 
+// StopContainer terminates ONE container and returns once its exit has been
+// delivered: SIGTERM, a wait bounded by grace, SIGKILL for whatever is left,
+// then a wait for the reap. It is the per-container half of Stop, built from the
+// same terminate and kill steps, and it never powers the machine off.
+//
+// It returns only after the exit callback for the instance has run (finish runs
+// the callback before it wakes a waiter), so a caller that starts a replacement
+// next cannot race the predecessor's exit side effects. A container that has
+// already exited is returned for at once. After Stop has begun it reports
+// ErrStopped: the machine is going away, and a container stopped now could not
+// be started again.
+func (r *Reaper) StopContainer(ctx context.Context, container string, grace time.Duration) error {
+	select {
+	case <-r.stopped:
+		return fmt.Errorf("%w: stopping container %q", ErrStopped, container)
+	default:
+	}
+	group := r.containerPIDs(container)
+	if len(group) > 0 {
+		b, stopTimer := r.newBudget(grace, false)
+		errs := r.terminate(ctx, b, group)
+		stopTimer()
+		errs = append(errs, r.killLive(group)...)
+		if len(errs) > 0 {
+			r.log.Warn("signalling the container while stopping it failed", "container", container,
+				"err", errors.Join(errs...))
+		}
+		// SIGKILL is uncatchable, so this wait ends with the reap; ctx is the
+		// only other way out of it.
+		if !r.awaitGone(ctx, nil, group) {
+			return fmt.Errorf("stop container %q: %w", container, ctx.Err())
+		}
+	}
+	if _, err := r.Wait(ctx, container); err != nil {
+		return fmt.Errorf("stop container %q: %w", container, err)
+	}
 	return nil
+}
+
+// containerPIDs is the sorted set of container's tracked, not-yet-reaped pids.
+func (r *Reaper) containerPIDs(container string) []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var pids []int
+	for pid, name := range r.live {
+		if name == container {
+			pids = append(pids, pid)
+		}
+	}
+	sort.Ints(pids)
+	return pids
 }
 
 // awaitGone blocks until none of pids is still tracked and live, and reports

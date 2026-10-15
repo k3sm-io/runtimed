@@ -102,6 +102,14 @@ const (
 	// CapabilitySidecarInit it is diagnostic: the older guest's unknown-field
 	// refusal is what fails closed.
 	CapabilityImageUser = "image-user"
+
+	// CapabilityRestartContainer reports that the agent serves the
+	// RestartContainer RPC: the CRI restart of one container inside the live
+	// guest. guest/v1 forbids a host from calling the RPC on an agent that does
+	// not advertise it, and an older initramfs advertises nothing, so its
+	// absence is what lets the host refuse the verb with a stated reason rather
+	// than send it into an agent that would answer Unimplemented.
+	CapabilityRestartContainer = "restart-container"
 )
 
 // Capabilities is the token set this build advertises, in a STABLE order so a
@@ -114,5 +122,6 @@ func Capabilities() []string {
 	return []string{
 		CapabilityTTYExec, CapabilityAttach, CapabilityLogPartial,
 		CapabilityGuestPrivateMounts, CapabilitySidecarInit, CapabilityImageUser,
+		CapabilityRestartContainer,
 	}
 }

@@ -185,6 +185,24 @@ func (c *Capture) Close(container string) {
 	}
 }
 
+// Reset discards a container's rings, closing them first, so the next Writer
+// and Raw calls start the container's output afresh. It is the restart path's
+// step between the old instance's exit and the new instance's spawn: Close left
+// the old rings ended, and a closed ring drops every later append, so without
+// it a restarted container's output would be captured nowhere.
+//
+// The retained output of the replaced instance goes with its rings. That is
+// the CRI split: the host already holds that instance's output in its own log
+// file, which is what `kubectl logs --previous` reads, and this guest serves no
+// previous instance (see Stream).
+func (c *Capture) Reset(container string) {
+	c.Close(container)
+	c.mu.Lock()
+	delete(c.rings, container)
+	delete(c.raws, container)
+	c.mu.Unlock()
+}
+
 // CloseAll closes every container's streams, for guest shutdown.
 func (c *Capture) CloseAll() {
 	c.mu.Lock()

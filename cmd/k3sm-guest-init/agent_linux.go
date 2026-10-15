@@ -120,6 +120,45 @@ func (r *reaperRunner) Stop(ctx context.Context, grace time.Duration) error {
 	return r.reaper.Stop(ctx, grace)
 }
 
+// planRestarter is the Restarter seam: one container stopped through the
+// reaper's per-container stop and started again through the boot's own start
+// step, so a restart has no stop or spawn code of its own.
+//
+// The container's root is NOT recomposed. Its mounts, its overlay and its
+// ownership step were applied once, at boot, and the new instance runs in that
+// same root: an emptyDir keeps its contents, as upstream, and so does the
+// container's writable layer, which upstream would discard with the old
+// container. Recomposing it would mean unmounting the overlay under any exec
+// still running in it.
+type planRestarter struct {
+	plans   map[string]guestinit.ContainerPlan
+	reaper  *guestinit.Reaper
+	events  *guestagent.Events
+	capture *guestagent.Capture
+	hub     *guestagent.AttachHub
+	log     *slog.Logger
+}
+
+// RestartContainer stops the container, waits for its exit to be delivered,
+// gives it fresh output rings, and starts it again. See guestagent.Restarter.
+func (r *planRestarter) RestartContainer(ctx context.Context, container string, grace time.Duration) error {
+	cp, ok := r.plans[container]
+	if !ok {
+		return fmt.Errorf("%w: %s", guestagent.ErrNotFound, container)
+	}
+	if err := r.reaper.StopContainer(ctx, container, grace); err != nil {
+		return err
+	}
+	// The old instance's rings were closed by its exit callback, and a closed
+	// ring drops every later append; the new instance needs its own.
+	r.capture.Reset(container)
+	// A restart returns once the new instance runs. It never waits on it, even
+	// for an init container, whose run-to-completion gate belonged to the boot.
+	cp.WaitForExit = false
+	st := &starter{ctx: ctx, log: r.log, reaper: r.reaper, events: r.events, capture: r.capture, hub: r.hub}
+	return st.Start(cp)
+}
+
 // cgroupSampler is the Sampler seam: one container's cgroup2 files, read on
 // demand.
 //

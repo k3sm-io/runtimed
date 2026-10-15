@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -75,11 +76,11 @@ type ContainerSample struct {
 	MemoryWorkingSetBytes uint64
 }
 
-// The five consumer seams. Each is the smallest thing the server needs from the
+// The consumer seams. Each is the smallest thing the server needs from the
 // running guest, defined here at the consumer and implemented once, in the linux
 // executor (cmd/k3sm-guest-init). Keeping them small and separate is what lets the
 // whole service run under `go test -race` on darwin with no VM: a test supplies
-// five fakes and the real handler code — the pod-id enforcement, the bounds, the
+// fakes and the real handler code — the pod-id enforcement, the bounds, the
 // stream shapes — is what runs.
 
 // Runner is the guest's container roster and its shutdown verb.
@@ -132,6 +133,17 @@ type Execer interface {
 	Exec(ctx context.Context, spec ExecSpec, io ExecIO) (ExecResult, error)
 }
 
+// Restarter replaces one running or exited container with a new instance of
+// itself, inside the live guest.
+type Restarter interface {
+	// RestartContainer stops the named container if it is still running
+	// (SIGTERM, then SIGKILL once grace is spent), waits until its exit has been
+	// delivered, then starts a new instance from the same plan with the same
+	// retained stdio shape. It returns once the new instance is running, or with
+	// the start error. A name the pod never declared is ErrNotFound.
+	RestartContainer(ctx context.Context, container string, grace time.Duration) error
+}
+
 // Statusr reports the guest's readiness and identity.
 type Statusr interface {
 	// Status returns the guest's current status.
@@ -161,6 +173,9 @@ type Deps struct {
 	// A nil one is replaced with an empty hub, which makes every attach that
 	// asks for stdin fail with the stated FailedPrecondition rather than panic.
 	Attach *AttachHub
+	// Restarter serves RestartContainer. A nil one makes the RPC answer
+	// Unimplemented with that stated reason.
+	Restarter Restarter
 	// Logger receives the agent's narration; nil means slog.Default.
 	Logger *slog.Logger
 }
@@ -183,6 +198,11 @@ type Server struct {
 	podID string
 	deps  Deps
 	log   *slog.Logger
+
+	// restartMu guards restarting, the containers a RestartContainer is
+	// currently acting on.
+	restartMu  sync.Mutex
+	restarting map[string]bool
 }
 
 // Ensure the server satisfies the generated service interface.
@@ -200,7 +220,7 @@ func NewServer(podID string, deps Deps) *Server {
 	if deps.Attach == nil {
 		deps.Attach = NewAttachHub()
 	}
-	return &Server{podID: podID, deps: deps, log: log}
+	return &Server{podID: podID, deps: deps, log: log, restarting: map[string]bool{}}
 }
 
 // Register attaches the agent to a gRPC server.
@@ -853,6 +873,62 @@ func (s *Server) Stop(ctx context.Context, req *guestv1.StopRequest) (*guestv1.S
 		}
 	}()
 	return &guestv1.StopResponse{}, nil
+}
+
+// RestartContainer is the CRI container restart inside the live guest: the
+// machine keeps running and only the named container is replaced.
+//
+// It stops the container if it is still running, with the request's grace as the
+// SIGTERM budget before SIGKILL, then starts a new instance from the plan the
+// guest booted with, and returns once that instance is running. The executor's
+// own stop and start steps do the work (the Restarter seam), so the old
+// instance's exit and the new instance's start reach ContainerEvents exactly as a
+// first start and an ordinary exit do. The guest keeps no restart count: the host
+// owns it, along with the previous instance's log.
+//
+// The restart runs detached from the RPC's cancellation. A client that goes away
+// mid-restart would otherwise leave a container that was stopped and never
+// started again; the work is bounded anyway, by the clamped grace and the start.
+//
+// One restart per container at a time. A second request for a container a
+// restart is already acting on is FailedPrecondition, because the two would stop
+// and start the same instance concurrently.
+func (s *Server) RestartContainer(ctx context.Context, req *guestv1.RestartContainerRequest) (*guestv1.RestartContainerResponse, error) {
+	if err := s.checkPod("restart", req.GetPodId()); err != nil {
+		return nil, err
+	}
+	name := req.GetContainer()
+	if err := s.checkContainer("restart", name); err != nil {
+		return nil, err
+	}
+	if s.deps.Restarter == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"restart: this guest was built without a container restart executor")
+	}
+
+	s.restartMu.Lock()
+	if s.restarting[name] {
+		s.restartMu.Unlock()
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"restart: a restart of container %q in pod %s is already in flight", name, s.podID)
+	}
+	s.restarting[name] = true
+	s.restartMu.Unlock()
+	defer func() {
+		s.restartMu.Lock()
+		delete(s.restarting, name)
+		s.restartMu.Unlock()
+	}()
+
+	grace := clampGrace(req.GetGraceSeconds())
+	s.log.Info("the host asked the guest to restart a container", "container", name, "grace", grace)
+	if err := s.deps.Restarter.RestartContainer(context.WithoutCancel(ctx), name, grace); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "restart: container %q is not running in pod %s", name, s.podID)
+		}
+		return nil, status.Errorf(codes.Internal, "restart: container %q in pod %s: %v", name, s.podID, err)
+	}
+	return &guestv1.RestartContainerResponse{}, nil
 }
 
 // clampGrace turns the host's requested grace into a duration the guest will
