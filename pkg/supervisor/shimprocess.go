@@ -195,6 +195,9 @@ func (p *Process) NoteKill(sig syscall.Signal) { p.killSig.Store(int32(sig)) }
 // container.
 func (p *Process) StopSignal(group func(pgid int, sig os.Signal) error) func(int, os.Signal) error {
 	return func(pgid int, sig os.Signal) error {
+		// Learn the tree before the signal can end its root: a child's
+		// ancestry is readable only while its parent lives.
+		p.RefreshTree()
 		s, _ := sig.(syscall.Signal)
 		if s == syscall.SIGKILL {
 			p.NoteKill(s)

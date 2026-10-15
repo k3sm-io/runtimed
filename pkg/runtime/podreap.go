@@ -28,6 +28,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -79,8 +81,13 @@ import (
 //
 // ceiling — setsid escape: a pod that double-fork+setsid's a child leaves the
 // recorded process group entirely; kern.proc.pgrp and kill(-pgid) never see it,
-// so the reap cannot catch it. This is an accepted limit of pgid-based
-// tracking (the vm RuntimeClass is the isolation answer for untrusted tenancy).
+// so this group-based reap cannot catch it. While the daemon runs, the
+// container's process-tree tracking (supervisor.TrackTree) does: it kills such
+// a child when the container's leader exits and at DeletePod, and names any it
+// could not kill in the record's Survivors, which this reap then finishes
+// (reapRecordedSurvivors). An escape this daemon never saw (spawned and
+// detached while no daemon ran) remains out of reach; the vm RuntimeClass is the
+// isolation answer for untrusted tenancy.
 
 // PodReapRecord is the durable record of one spawned container process group,
 // written at spawn under <root>/podreap/<podID>/<pgid>.json and removed when
@@ -130,6 +137,36 @@ type PodReapRecord struct {
 	// to the leader-only rules: a group kill rather than a graceful adopt.
 	ChildPid           int   `json:"childPid,omitempty"`
 	ChildStartUnixNano int64 `json:"childStartUnixNano,omitempty"`
+	// Survivors are processes of the container's tree that were still alive
+	// after the sweep at its exit or at DeletePod SIGKILLed them and waited
+	// (supervisor.TreeSweep). A record that names any is kept, however empty
+	// its group, so a later sweep can finish the job: the next startup reap
+	// kills each one still alive under exactly its recorded start, and drops
+	// the record only once none is. Absent from every record written before the
+	// field existed, which decodes as none.
+	Survivors []ReapSurvivor `json:"survivors,omitempty"`
+}
+
+// ReapSurvivor is one process of a container's tree that outlived the sweep at
+// the container's exit, named by its exact instance: a reader signals it only
+// while its pid reports exactly StartUnixNano. Sid is the session it was in,
+// which tells a setsid escapee (its own session) from the pod's own.
+type ReapSurvivor struct {
+	Pid           int   `json:"pid"`
+	StartUnixNano int64 `json:"startUnixNano"`
+	Sid           int   `json:"sid,omitempty"`
+}
+
+// reapSurvivors converts a sweep's survivors to their record form.
+func reapSurvivors(ms []supervisor.TreeMember) []ReapSurvivor {
+	if len(ms) == 0 {
+		return nil
+	}
+	out := make([]ReapSurvivor, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, ReapSurvivor{Pid: m.Pid, StartUnixNano: m.StartUnixNano, Sid: m.Sid})
+	}
+	return out
 }
 
 // podProcRecord is the package's historical name for PodReapRecord.
@@ -273,6 +310,64 @@ func (r *Runtime) removePodProcRecord(podID string, pgid int) {
 		return // an unvalidated id never produced a record
 	}
 	_ = os.Remove(filepath.Join(dir, strconv.Itoa(pgid)+".json"))
+}
+
+// keptSurvivors is one container's survivors of a tree sweep, by the pgid its
+// record is filed under.
+type keptSurvivors struct {
+	container string
+	survivors []ReapSurvivor
+}
+
+// retainPodProcRecord keeps a container's record (<podreap>/<podID>/<pgid>.json)
+// with survivors in it, writing a minimal record when there is none, so the
+// next sweep has their exact instances.
+func (r *Runtime) retainPodProcRecord(podID, container string, pgid int, survivors []ReapSurvivor) error {
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return err
+	}
+	rec := podProcRecord{PodID: podID, Container: container, Pgid: pgid}
+	data, err := os.ReadFile(filepath.Join(dir, strconv.Itoa(pgid)+".json"))
+	switch {
+	case err == nil:
+		if jerr := json.Unmarshal(data, &rec); jerr != nil {
+			rec = podProcRecord{PodID: podID, Container: container, Pgid: pgid}
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("read reap record for pod %s: %w", podID, err)
+	}
+	rec.Survivors = survivors
+	return r.writePodProcRecord(rec)
+}
+
+// retirePodReapRecords is DeletePod's record teardown: every record of the pod
+// goes, except one whose container's tree left survivors, which is kept naming
+// them (retainPodProcRecord). Best-effort.
+func (r *Runtime) retirePodReapRecords(podID string, keep map[int]keptSurvivors) {
+	if len(keep) == 0 {
+		r.removePodReapRecords(podID)
+		return
+	}
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		pgid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), ".json"))
+		if err == nil && filepath.Ext(e.Name()) == ".json" {
+			if _, kept := keep[pgid]; kept {
+				continue
+			}
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
+	for pgid, k := range keep {
+		if err := r.retainPodProcRecord(podID, k.container, pgid, k.survivors); err != nil {
+			r.log.Warn("record the survivors of a deleted pod's process tree", "pod", podID, "container", k.container, "err", err)
+		}
+	}
 }
 
 // removePodReapRecords drops every process-group record for a pod, on teardown
@@ -539,12 +634,12 @@ func childIsRecordedInstance(rec podProcRecord, members []supervisor.ProcMember)
 // construction.
 func attachDecision(records []podProcRecord, procGroup procGroupInspector, startTime procStartTime, fingerprint string) (adopt, degraded, remaining []podProcRecord) {
 	kill, _, _ := startupPodReapDecision(records, nil, procGroup)
-	live := make(map[podProcRecord]bool, len(kill))
+	live := make(map[recordKey]bool, len(kill))
 	for _, rec := range kill {
-		live[rec] = true
+		live[keyOf(rec)] = true
 	}
 	for _, rec := range records {
-		if fingerprint != "" && rec.RuntimeVersion == fingerprint && live[rec] {
+		if fingerprint != "" && rec.RuntimeVersion == fingerprint && live[keyOf(rec)] {
 			if start, ok := startTime(rec.Pgid); ok && start == rec.StartUnixNano {
 				adopt = append(adopt, rec)
 				continue
@@ -559,6 +654,18 @@ func attachDecision(records []podProcRecord, procGroup procGroupInspector, start
 		remaining = append(remaining, rec)
 	}
 	return adopt, degraded, remaining
+}
+
+// recordKey names one record file: a pod's group by its exact leader
+// instance. A record itself is not comparable (it carries Survivors).
+type recordKey struct {
+	podID string
+	pgid  int
+	start int64
+}
+
+func keyOf(rec podProcRecord) recordKey {
+	return recordKey{podID: rec.PodID, pgid: rec.Pgid, start: rec.StartUnixNano}
 }
 
 // leaderGone reports whether rec's group is inspectable and has no leader
@@ -639,6 +746,7 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	}
 	r.mu.Unlock()
 
+	records, pinned := r.reapRecordedSurvivors(records)
 	kill, drop, keepWarn := startupPodReapDecision(records, owned, r.procGroup)
 	for _, rec := range kill {
 		// Pre-signal re-probe (shrink TOCTOU): re-verify the exact
@@ -665,7 +773,9 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 				"pod", rec.PodID, "pgid", rec.Pgid, "err", err)
 			continue
 		}
-		r.removePodProcRecord(rec.PodID, rec.Pgid)
+		if !pinned[keyOf(rec)] {
+			r.removePodProcRecord(rec.PodID, rec.Pgid)
+		}
 	}
 	for _, rec := range keepWarn {
 		// keep-and-warn: the leader (Pid == pgid) is gone but the group is still
@@ -677,7 +787,9 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 			"pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
 	}
 	for _, rec := range drop {
-		r.removePodProcRecord(rec.PodID, rec.Pgid)
+		if !pinned[keyOf(rec)] {
+			r.removePodProcRecord(rec.PodID, rec.Pgid)
+		}
 	}
 	for _, f := range quarantine {
 		r.log.Warn("removing malformed reap record", "path", f)
@@ -687,6 +799,95 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	r.sweepStaleShimDirs()
 	r.sweepStaleSignStaging()
 	return nil
+}
+
+// survivorPoll is how often reapRecordedSurvivors re-checks the survivors it
+// killed.
+const survivorPoll = 50 * time.Millisecond
+
+// reapRecordedSurvivors finishes what a container's tree sweep could not: each
+// survivor a record names (PodReapRecord.Survivors) is SIGKILLed by pid while it
+// is still exactly the recorded instance (its start time equals the recorded
+// one; a recycled pid is never signalled) AND its session is still the
+// recorded one and is not this daemon's own, and the reap waits, bounded by the
+// exit-observation grace, for them to be gone. A record whose survivors are all
+// gone is rewritten without them and returned for the ordinary decision; one
+// with a survivor still alive is rewritten naming only those and returned
+// pinned, which the caller never removes. Records without survivors pass
+// through untouched.
+//
+// The record drives a root kill, so every survivor is re-checked against the
+// live process before a signal: never the daemon itself or pid <= 1, the
+// start time exactly the recorded one, and the session (getsid) exactly the
+// recorded Sid and not the daemon's own session. A survivor failing any of
+// these is not the recorded instance: it is skipped (logged once at Debug),
+// never signalled, and not kept.
+func (r *Runtime) reapRecordedSurvivors(records []podProcRecord) ([]podProcRecord, map[recordKey]bool) {
+	pinned := map[recordKey]bool{}
+	self := os.Getpid()
+	selfSid, selfSidOK := r.procSession(self)
+	why := func(s ReapSurvivor) string {
+		if s.Pid <= 1 || s.Pid == self {
+			return "the pid is the daemon's own or <= 1"
+		}
+		start, ok := r.procStart(s.Pid)
+		if !ok || start != s.StartUnixNano {
+			return "gone, or the pid now names another process"
+		}
+		sid, ok := r.procSession(s.Pid)
+		switch {
+		case !ok || s.Sid <= 0 || sid != s.Sid:
+			return "its session is not the recorded one"
+		case !selfSidOK || sid == selfSid:
+			return "it is in the daemon's own session"
+		}
+		return ""
+	}
+	alive := func(s ReapSurvivor) bool { return why(s) == "" }
+	var pending []int
+	for i, rec := range records {
+		if len(rec.Survivors) == 0 {
+			continue
+		}
+		for _, s := range rec.Survivors {
+			if reason := why(s); reason != "" {
+				r.log.Debug("not signalling a recorded survivor: not the recorded instance",
+					"pod", rec.PodID, "container", rec.Container, "pid", s.Pid, "why", reason)
+				continue
+			}
+			r.log.Info("reaping a recorded survivor of a stopped container's process tree",
+				"pod", rec.PodID, "container", rec.Container, "pid", s.Pid)
+			if err := r.killProcess(s.Pid, syscall.SIGKILL); err != nil {
+				r.log.Warn("kill a recorded survivor", "pod", rec.PodID, "pid", s.Pid, "err", err)
+			}
+		}
+		pending = append(pending, i)
+	}
+	deadline := time.Now().Add(r.exitObservationGrace())
+	for _, i := range pending {
+		rec := records[i]
+		var left []ReapSurvivor
+		for _, s := range rec.Survivors {
+			for alive(s) && time.Now().Before(deadline) {
+				time.Sleep(survivorPoll)
+			}
+			if alive(s) {
+				left = append(left, s)
+			}
+		}
+		rec.Survivors = left
+		if len(left) > 0 {
+			pinned[keyOf(rec)] = true
+			r.log.Warn("recorded survivors of a stopped container's process tree are still alive (kept, will retry each start)",
+				"pod", rec.PodID, "container", rec.Container, "survivors", len(left))
+		}
+		if err := r.writePodProcRecord(rec); err != nil {
+			r.log.Warn("rewrite a reap record's survivors", "pod", rec.PodID, "err", err)
+			pinned[keyOf(rec)] = true
+		}
+		records[i] = rec
+	}
+	return records, pinned
 }
 
 // sweepStaleSignStaging removes the signed-copy temp files a previous daemon run

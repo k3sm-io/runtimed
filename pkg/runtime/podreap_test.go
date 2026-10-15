@@ -19,6 +19,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -394,7 +395,7 @@ func TestReadPodReapRecords(t *testing.T) {
 		t.Fatalf("ReadPodReapRecords: %v", err)
 	}
 	want := PodReapRecord{PodID: "pod-a", Container: "main", Pgid: 4242, StartUnixNano: 77, RuntimeVersion: "test-build"}
-	if len(got) != 1 || got[0] != want {
+	if len(got) != 1 || !reflect.DeepEqual(got[0], want) {
 		t.Fatalf("records = %+v, want [%+v]", got, want)
 	}
 	if _, err := os.Stat(bad); err != nil {

@@ -309,6 +309,17 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		}
 	}
 
+	// The pod's process trees must be empty when the pod is. macOS has no pid
+	// namespace whose end kills everything a container started: a container's
+	// SIGTERM goes to its init alone, and a child the init did not reap is
+	// reparented to launchd and lives on. Each container's tree was swept when
+	// its leader exited; sweep again unconditionally here (the exit sweep does
+	// not run on a wait the cancel above cut short), after ending the exec
+	// sessions, which lead their own groups. The memory sampler was cancelled
+	// at the top, so no kill here can be read as an OOM.
+	r.endExecSessions(p)
+	survivors := r.sweepPodTrees(req.GetPodId(), p)
+
 	st := r.podStatus(p)
 	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
@@ -337,13 +348,49 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 	// Drop the pod's reap records: its groups were just SIGKILL-escalated above,
 	// so the durable records (stored outside the pod dir, so removePodDir does
-	// not touch them) have served their purpose.
-	r.removePodReapRecords(req.GetPodId())
+	// not touch them) have served their purpose, except a record whose
+	// container's tree left survivors, which is kept naming them.
+	r.retirePodReapRecords(req.GetPodId(), survivors)
 	p.mu.Lock()
 	shimDirs := p.shimDirs
 	p.mu.Unlock()
 	removeShimDirs(shimDirs)
 	return &runtimev1.DeletePodResponse{}, nil
+}
+
+// sweepPodTrees sweeps the process tree of every container process p holds
+// (supervisor.Process.KillTree), concurrently, and returns the survivors by the
+// pgid their reap record is filed under.
+func (r *Runtime) sweepPodTrees(podID string, p *pod) map[int]keptSurvivors {
+	p.mu.Lock()
+	cps := make([]*containerProc, 0, len(p.containers))
+	for _, cp := range p.containers {
+		if cp.proc != nil {
+			cps = append(cps, cp)
+		}
+	}
+	p.mu.Unlock()
+	var mu sync.Mutex
+	keep := map[int]keptSurvivors{}
+	var wg sync.WaitGroup
+	for _, cp := range cps {
+		wg.Add(1)
+		go func(cp *containerProc) {
+			defer wg.Done()
+			res := cp.proc.KillTree()
+			if len(res.Survivors) == 0 {
+				return
+			}
+			mu.Lock()
+			keep[cp.proc.PID()] = keptSurvivors{container: cp.name, survivors: reapSurvivors(res.Survivors)}
+			mu.Unlock()
+		}(cp)
+	}
+	wg.Wait()
+	if len(keep) > 0 {
+		r.log.Warn("a deleted pod's process tree has survivors; their reap records are kept for the next sweep", "pod", podID, "containers", len(keep))
+	}
+	return keep
 }
 
 // closeContainerLogs closes every container's CRI log file handle. It is called

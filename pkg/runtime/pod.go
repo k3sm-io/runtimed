@@ -237,6 +237,17 @@ type pod struct {
 	// the container; guarded by mu. Removed with the pod. Nil for a pod whose
 	// backend hosts no shim.
 	shimDirs map[string]string
+
+	// execSessions are the live shim-hosted exec sessions of the pod's
+	// containers, by exact instance (endSessionWithStream registers and
+	// retires each); guarded by mu. DeletePod ends every one still listed.
+	execSessions map[execSession]struct{}
+}
+
+// execSession names one live exec session by its exact instance.
+type execSession struct {
+	pid   int
+	start int64
 }
 
 // containerPIDs returns the pod's currently-running CONTAINER pids (the memory
@@ -1729,6 +1740,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("spawn container %s: %w", c.GetName(), err)
 	}
+	// Track the container's whole process tree from now on: on macOS there is
+	// no pid namespace whose end kills everything the container started, so
+	// the tree is swept when its leader exits and at DeletePod.
+	r.trackTree(treeCtx(p, ctx), proc)
 
 	// Durably record the spawned process group before the spawn is acknowledged
 	// (the startup pod reap's input, podreap.go). Failure fails the container:
@@ -1789,7 +1804,16 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	// removing the record here unconditionally would erase a live process's
 	// record. A record left behind is harmless (identity-guarded) and is
 	// retired by DeletePod's teardown or the next startup reap's group probe.
-	if members, ok := r.procGroup(cp.proc.PID()); ok && len(members) == 0 {
+	//
+	// A record whose container left survivors of the tree sweep at its exit
+	// (supervisor.TreeSweep) is kept with them instead, however empty its
+	// group: an escapee is in no group of the pod's, and the record is the
+	// only thing left that names it for the next sweep.
+	if survivors := cp.proc.TreeSurvivors(); len(survivors) > 0 {
+		if err := r.retainPodProcRecord(p.box.GetPodId(), cp.name, cp.proc.PID(), reapSurvivors(survivors)); err != nil {
+			r.log.Warn("record the survivors of a container's process tree", "pod", p.box.GetPodId(), "container", cp.name, "err", err)
+		}
+	} else if members, ok := r.procGroup(cp.proc.PID()); ok && len(members) == 0 {
 		r.removePodProcRecord(p.box.GetPodId(), cp.proc.PID())
 	}
 
@@ -3525,4 +3549,13 @@ func hasPersistentVolume(box *runtimev1.PodBox) bool {
 		}
 	}
 	return false
+}
+
+// treeCtx is the context a container's tree tracking runs under: the
+// pod-lifetime supervision context when the pod has one, else ctx.
+func treeCtx(p *pod, ctx context.Context) context.Context {
+	if p.supCtx != nil {
+		return p.supCtx
+	}
+	return ctx
 }

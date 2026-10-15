@@ -128,6 +128,10 @@ type Process struct {
 	// send (see ExternalKill).
 	externalKill atomic.Bool
 
+	// tree is the process's tracked process tree (TrackTree), written once
+	// under mu; nil when untracked.
+	tree *procTree
+
 	done      chan struct{} // closed once the process is reaped
 	drained   chan struct{} // closed once BOTH log pumps have copied output to EOF
 	drainOnce sync.Once     // guards the single close of drained (idempotent, panic-safe)
@@ -373,7 +377,13 @@ func (p *Process) reap(ctx context.Context, pid int) {
 		return
 	}
 	code, sig, err := p.waiter.WaitExit(ctx, pid)
+	waitErr := err
 	code, sig, err = p.shimExit(ctx, code, sig, err)
+	// A shim that crashed leaves its container possibly alive, for the runtime
+	// to take over: that is not the container's exit, so nothing is swept.
+	if !errors.Is(err, ErrShimCrashed) {
+		p.sweepOnExit(waitErr)
+	}
 	if conn := p.Shim(); conn != nil {
 		_ = conn.Close()
 	}
@@ -384,6 +394,7 @@ func (p *Process) reap(ctx context.Context, pid int) {
 // reapPID is reap for a process whose own wait status is its exit.
 func (p *Process) reapPID(ctx context.Context, pid int) {
 	code, sig, err := p.waiter.WaitExit(ctx, pid)
+	p.sweepOnExit(err)
 	p.finish(code, sig, err)
 }
 
