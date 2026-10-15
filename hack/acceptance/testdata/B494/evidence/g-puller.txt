@@ -1,0 +1,61 @@
+# B494 row (g): a wasi/wasm32 OCI image through the existing Puller
+confined: n/a (the pull refuses before any process starts); native pods on <worker-node>, node k3sm v0.1.8-0.20261011011637-4e7886f94b60
+artifacts (scratch registry, plain HTTP, pulled by the node's own Puller):
+  single-platform: b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec (config os=wasi arch=wasm32, one layer /module.wasm)
+  index:           b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a (one child, platform wasi/wasm32)
+
+## b494-wasm-single (uid 619817a5-37eb-4dfd-be7e-3d2fe953ad66)
+state: {"waiting":{"message":"Back-off pulling image \"<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec\"","reason":"ImagePullBackOff"}}
+events:
+  Pulling: Pulling image "<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec"
+  ProviderCreateSuccess: Create pod in provider successfully
+  Failed: Failed to pull image "<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec": "pull image \"<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec\": pull \"<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec\": no image manifest ma"...
+  BackOff: Back-off pulling image "<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec"
+agent.log (the untruncated error):
+time=2026-10-15T00:39:14.449-04:00 level=WARN msg="container could not be started; it waits while the pod's other containers run" pod=619817a5-37eb-4dfd-be7e-3d2fe953ad66 container=spike reason=FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH err="pull image \"<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec\": pull \"<lan-ip>:5494/b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec\": no image manifest matches a runnable platform: want [darwin/arm64/v8], image provides [wasi/wasm32]"
+
+## b494-wasm-index (uid 7fa7f5ee-f4d0-4670-ba3b-5ea1685dff1f)
+state: {"waiting":{"message":"Back-off pulling image \"<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a\"","reason":"ImagePullBackOff"}}
+events:
+  Pulling: Pulling image "<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a"
+  ProviderCreateSuccess: Create pod in provider successfully
+  Failed: Failed to pull image "<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a": "pull image \"<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a\": pull \"<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a\": no image"...
+  BackOff: Back-off pulling image "<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a"
+agent.log (the untruncated error):
+time=2026-10-15T00:39:14.656-04:00 level=WARN msg="container could not be started; it waits while the pod's other containers run" pod=7fa7f5ee-f4d0-4670-ba3b-5ea1685dff1f container=spike reason=FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH err="pull image \"<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a\": pull \"<lan-ip>:5494/b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a\": no image manifest matches a runnable platform: want [darwin/arm64/v8], image provides [wasi/wasm32]"
+
+## why (source)
+pkg/image/platform.go backendPlatforms: the native backends return [darwin/arm64/v8] (+darwin/amd64 iff HostRosetta), VM returns linux/*,
+every other backend value returns ErrNoPlatformMatch; PlatformPolicy.Override is checked against that same runnable set, so no
+per-pod override can reach wasi/wasm32 today:
+  266:func backendPlatforms(p PlatformPolicy) ([]Platform, error) {
+  267-	switch p.Backend {
+  268-	case runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC,
+  269-		runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_EXEC,
+  270-		runtimev1.SandboxBackend_SANDBOX_BACKEND_UIDJAIL:
+  271-		out := []Platform{platDarwinARM64}
+  272-		if p.HostRosetta {
+  273-			out = append(out, platDarwinAMD64)
+  274-		}
+  275-		return out, nil
+  276-	case runtimev1.SandboxBackend_SANDBOX_BACKEND_VM:
+  277-		out := []Platform{platLinuxARM64}
+  278-		if p.GuestRosetta {
+  279-			out = append(out, platLinuxAMD64)
+  280-		}
+  281-		return out, nil
+  282-	default:
+  283-		return nil, fmt.Errorf("sandbox backend %v has no image platform candidates: %w", p.Backend, ErrNoPlatformMatch)
+  284-	}
+  285-}
+  286-
+  287-// containsPlatform reports whether want (already normalised) is in set (already
+  288-// normalised).
+
+## verdict
+N/A: the precondition 'once the platform row exists' does not hold on this tree. What the Puller returns now, for both the
+single-platform image and the index: 'no image manifest matches a runnable platform: want [darwin/arm64/v8], image provides
+[wasi/wasm32]' (FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH; kubectl shows ImagePullBackOff and an Event message truncated before the
+platform list). The fetch and the index walk succeed and the refusal names the image's own platform: the pull stops at platform selection.
+What R4 needs: a SANDBOX_BACKEND_WASM case in backendPlatforms returning wasi/wasm32 plus the explicit alias rows (wasi/wasm,
+wasip1/wasm32, wasip2/wasm32), and UnpackPolicyFor(WASM) = SemanticsNative. Unmeasured here: whether unpack/materialize of a wasm layer then succeeds.

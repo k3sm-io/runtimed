@@ -1,0 +1,134 @@
+# B494 row (k): raw cosign signature fetch per transport, the digest cosign names, the format, and the Puller's index binding
+confined: no (host process; the fetch is a plain net/http client, no ingest, no platform policy).
+cosign: v3.1.3 (GitCommit 11926fa5bbbbde47e88fc006b625a17769b743b2), binary cosign-darwin-arm64 sha256
+  5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7dc70e92a76, equal to the release's cosign_checksums.txt line.
+keys: throwaway (cosign generate-key-pair in scratch), signer SPKI sha256 0a7bf17a7496e5ebdacba15b71f247a78808edf977872622a3567ae7e7fe2b23.
+
+## signing commands and the format each produced
+legacy:  cosign sign --key cosign.key --tlog-upload=false --new-bundle-format=false --use-signing-config=false --allow-http-registry -y <ref>@<digest>
+  -> a tag sha256-<hex>.sig in the image's repository; one OCI manifest layer, mediaType application/vnd.dev.cosign.simplesigning.v1+json,
+     signature in the layer annotation dev.cosignproject.cosign/signature (base64 DER ECDSA over the payload bytes).
+  cosign prints: 'Flag --new-bundle-format has been deprecated, this will be the only supported format in future versions'
+default: cosign sign --key cosign.key --tlog-upload=false --use-signing-config=false --allow-http-registry -y <ref>@<digest>
+  -> NO .sig tag; an OCI 1.1 referrer (artifactType application/vnd.dev.sigstore.bundle.v0.3+json) whose layer is a sigstore
+     bundle v0.3: a DSSE envelope, payloadType application/vnd.in-toto+json, predicateType https://sigstore.dev/cosign/sign/v1,
+     subject = the manifest digest. cosign prints: 'Flag --tlog-upload has been deprecated, prefer using a --signing-config file'.
+  (--tlog-upload, --new-bundle-format are hidden flags in v3.1.3's --help.)
+So the lab's cosign defaults to the bundle/referrers form; the legacy .sig form needs deprecated flags.
+
+## which digest the payload names
+single-platform artifact b494/hello-wasm@sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec:
+  critical.image.docker-manifest-digest = sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec (the manifest itself)
+index b494/hello-wasm-index@sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a (one child sha256:4ed9ca42...):
+  critical.image.docker-manifest-digest = sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a (the INDEX);
+  the child carries no signature of its own (cell 'primary/index child' below: no .sig tag, empty referrers). cosign signs
+  children only with --recursive.
+
+## does the Puller keep the parent index digest for the resolved child? NO
+apis ImageManifest declares index_digest = 101 ('the digest of the multi-platform INDEX the reference resolved through'):
+  1175:  string index_digest = 101;
+but nothing in runtimed or k3sm ever sets it (grep IndexDigest over pkg/ internal/ cmd/ and k3sm/pkg, non-test, non-pb):
+  (no assignment; the only IndexDigest hits are the unrelated ErrIndexDigestMismatch sentinel)
+PullResult.Descriptor is 'the resolved manifest's OWN content descriptor' (the child), and the FetchFunc seam returns a
+ggcrv1.Image (the child) so the index is gone before ingest builds the result:
+  76:type FetchFunc func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error)
+  77-
+  78-// ErrInvalidReference is the decided verdict for an image reference that is not
+  261:	// Descriptor is the resolved manifest's OWN content descriptor: media type,
+Consequence: an index-signed image cannot be verified against PullResult today; a verifier needs the Puller to populate
+index_digest (bound to the child) first, or must accept only a signature over the child digest.
+
+## transports
+primary   = a registry the node pulls from directly; here the scratch registry on this Mac (plain HTTP, LAN address).
+mirror    = the peer-ingest mirror path (pkg/image/mirror.go): the server node's ingest registry at its advertised meshHost.
+cluster   = the cluster-registry spelling (pkg/image/clusterregistry.go): the in-cluster Service DNS name, plain HTTP.
+The mirror and cluster transports both reach the server node's ingest registry, which refuses a push without its per-boot
+credential (401 below; the credential file is _k3sm-only and was not read, no sudo). So no artifact of this run can be placed
+there and its 'mismatched digest' cell is N/A; its 'no signature' cells use an image already in that registry (repo 'probe').
+
+## the table (outcome / raw status)
+| transport | unreachable | no signature | mismatched digest |
+|---|---|---|---|
+| primary | 503 on /v2/ (a listener answering 5xx); and dial: connection refused | GET .../manifests/sha256-<hex>.sig 404 MANIFEST_UNKNOWN + referrers 200 with no sigstore entry | .sig 200, layer blob 200 and digest-verified, payload docker-manifest-digest sha256:4ed9ca42... != resolved sha256:8709190d... |
+| mirror (peer ingest, mesh) | dial: connection refused (wrong port; an unrouted mesh address also refused) | .sig 404 MANIFEST_UNKNOWN + referrers 200 empty | N/A: push 401 without the server's per-boot credential |
+| cluster registry (svc DNS) | dial: connection refused (wrong port) | .sig 404 MANIFEST_UNKNOWN + referrers 200 empty | N/A: push 401 without the server's per-boot credential |
+Positive controls (primary): legacy .sig over the single-platform digest -> present, digest matches; bundle referrer -> present,
+DSSE subject matches; index .sig -> present, names the index digest.
+The three outcomes are distinct on every transport where they could be produced: a transport error or 5xx; a 404/MANIFEST_UNKNOWN
+with an empty referrers list; a fetched, digest-verified payload naming another digest.
+
+## raw cells
+# B494 row (k) raw cells, 2026-10-15T04:27:16Z, sigfetch (stdlib net/http, no ingest, no platform policy)
+CELL primary/positive-control legacy
+  outcome: signature present (digest matches)
+  detail: legacy .sig tag; layer 0: mediaType=application/vnd.dev.cosign.simplesigning.v1+json type="cosign container image signature" docker-reference="127.0.0.1:5494/b494/hello-wasm" docker-manifest-digest=sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec signature-annotation-b64-ok=true
+  raw: GET http://<lan-ip>:5494/v2/ -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm/manifests/sha256-4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec.sig -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm/blobs/sha256:5293c800b001e57be8d0c3fec821ce67c66012f27a1231883401f3d96372ca33 -> 200
+CELL primary/no-signature
+  outcome: no signature
+  detail: no sha256-<hex>.sig tag and no sigstore referrer
+  raw: GET http://<lan-ip>:5494/v2/ -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-unsigned/manifests/sha256-5b16da4e121d03511043e6a5446cef0ab2cd41951dd334a99b19b1adf1682821.sig -> 404 body={"errors":[{"code":"MANIFEST_UNKNOWN","message":"Unknown manifest"}]}
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-unsigned/referrers/sha256:5b16da4e121d03511043e6a5446cef0ab2cd41951dd334a99b19b1adf1682821 -> 200
+CELL primary/mismatched-digest
+  outcome: mismatched digest
+  detail: legacy .sig tag fetched; no layer names sha256:8709190dd48444285623a463fcb806d363e6bb0bbfad78fc63bb9a58301f5eb1; layer 0: mediaType=application/vnd.dev.cosign.simplesigning.v1+json type="cosign container image signature" docker-reference="127.0.0.1:5494/b494/hello-wasm" docker-manifest-digest=sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec signature-annotation-b64-ok=true
+  raw: GET http://<lan-ip>:5494/v2/ -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-swapped/manifests/sha256-8709190dd48444285623a463fcb806d363e6bb0bbfad78fc63bb9a58301f5eb1.sig -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-swapped/blobs/sha256:5293c800b001e57be8d0c3fec821ce67c66012f27a1231883401f3d96372ca33 -> 200
+CELL primary/unreachable 5xx
+  outcome: unreachable
+  detail: HTTP 503
+  raw: GET http://<lan-ip>:5495/v2/ -> 503 body=upstream unavailable
+CELL primary/unreachable refused
+  outcome: unreachable
+  detail: Get "http://<lan-ip>:5496/v2/": dial tcp <lan-ip>:5496: connect: connection refused
+  raw: GET http://<lan-ip>:5496/v2/ -> transport error: Get "http://<lan-ip>:5496/v2/": dial tcp <lan-ip>:5496: connect: connection refused
+CELL primary/bundle-format (cosign v3 default)
+  outcome: signature present (digest matches)
+  detail: OCI 1.1 referrer; bundle mediaType=application/vnd.dev.sigstore.bundle.v0.3+json artifactType=application/vnd.dev.sigstore.bundle.v0.3+json layer=application/vnd.dev.sigstore.bundle.v0.3+json payloadType=application/vnd.in-toto+json predicateType=https://sigstore.dev/cosign/sign/v1 subject=sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec
+  raw: GET http://<lan-ip>:5494/v2/ -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-bundle/manifests/sha256-4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec.sig -> 404 body={"errors":[{"code":"MANIFEST_UNKNOWN","message":"Unknown manifest"}]}
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-bundle/referrers/sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-bundle/manifests/sha256:7ee4faef5b9d541162cb7ad0e193907506918a4e6506f41b6e24cabc400cda42 -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-bundle/blobs/sha256:1fe5d67781b2f89550ec42d71326a581b0ea0272d23af8e9962849ec046cdf53 -> 200
+CELL primary/index signed (payload digest = index)
+  outcome: signature present (digest matches)
+  detail: legacy .sig tag; layer 0: mediaType=application/vnd.dev.cosign.simplesigning.v1+json type="cosign container image signature" docker-reference="127.0.0.1:5494/b494/hello-wasm-index" docker-manifest-digest=sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a signature-annotation-b64-ok=true
+  raw: GET http://<lan-ip>:5494/v2/ -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-index/manifests/sha256-976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a.sig -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-index/blobs/sha256:fcd1167ee66ba231f13587b4eedaedf0d29c88c082236af107bc90ff20a05e4e -> 200
+CELL primary/index child (resolved child digest)
+  outcome: no signature
+  detail: no sha256-<hex>.sig tag and no sigstore referrer
+  raw: GET http://<lan-ip>:5494/v2/ -> 200
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-index/manifests/sha256-4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec.sig -> 404 body={"errors":[{"code":"MANIFEST_UNKNOWN","message":"Unknown manifest"}]}
+  raw: GET http://<lan-ip>:5494/v2/b494/hello-wasm-index/referrers/sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec -> 200
+CELL mirror (peer ingest, mesh host)/no-signature
+  outcome: no signature
+  detail: no sha256-<hex>.sig tag and no sigstore referrer
+  raw: GET http://<server-mesh-ip>:6450/v2/ -> 200
+  raw: GET http://<server-mesh-ip>:6450/v2/probe/manifests/sha256-9ebed001832c5605a8669d24602239567347acd7b54b1343335fa260be7239c9.sig -> 404 body={"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"description":"This error is returned when the manifest, identified by name a
+  raw: GET http://<server-mesh-ip>:6450/v2/probe/referrers/sha256:9ebed001832c5605a8669d24602239567347acd7b54b1343335fa260be7239c9 -> 200
+CELL mirror (peer ingest, mesh host)/unreachable refused
+  outcome: unreachable
+  detail: Get "http://<server-mesh-ip>:6451/v2/": dial tcp <server-mesh-ip>:6451: connect: connection refused
+  raw: GET http://<server-mesh-ip>:6451/v2/ -> transport error: Get "http://<server-mesh-ip>:6451/v2/": dial tcp <server-mesh-ip>:6451: connect: connection refused
+CELL mirror (peer ingest, mesh host)/unreachable (unrouted mesh address)
+  outcome: unreachable
+  detail: Get "http://<pod-mesh-ip>:6450/v2/": dial tcp <pod-mesh-ip>:6450: connect: connection refused
+  raw: GET http://<pod-mesh-ip>:6450/v2/ -> transport error: Get "http://<pod-mesh-ip>:6450/v2/": dial tcp <pod-mesh-ip>:6450: connect: connection refused
+CELL cluster-registry (svc DNS)/no-signature
+  outcome: no signature
+  detail: no sha256-<hex>.sig tag and no sigstore referrer
+  raw: GET http://registry-<server-node>.k3sm-registry.svc.cluster.local:6450/v2/ -> 200
+  raw: GET http://registry-<server-node>.k3sm-registry.svc.cluster.local:6450/v2/probe/manifests/sha256-9ebed001832c5605a8669d24602239567347acd7b54b1343335fa260be7239c9.sig -> 404 body={"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown","detail":{"description":"This error is returned when the manifest, identified by name a
+  raw: GET http://registry-<server-node>.k3sm-registry.svc.cluster.local:6450/v2/probe/referrers/sha256:9ebed001832c5605a8669d24602239567347acd7b54b1343335fa260be7239c9 -> 200
+CELL cluster-registry (svc DNS)/unreachable refused-or-timeout
+  outcome: unreachable
+  detail: Get "http://registry-<server-node>.k3sm-registry.svc.cluster.local:6459/v2/": dial tcp <cluster-ip>:6459: connect: connection refused
+  raw: GET http://registry-<server-node>.k3sm-registry.svc.cluster.local:6459/v2/ -> transport error: Get "http://registry-<server-node>.k3sm-registry.svc.cluster.local:6459/v2/": dial tcp <cluster-ip>:6459: connect: connection refused
+# push attempt to the <server-host> registry without its per-boot credential (why the mismatched cell is N/A there):
+  raw: POST http://<server-mesh-ip>:6450/v2/b494/x/blobs/uploads/ -> 401
+  raw: POST http://registry-<server-node>.k3sm-registry.svc.cluster.local:6450/v2/b494/x/blobs/uploads/ -> 401

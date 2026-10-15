@@ -1,0 +1,76 @@
+# B494 row (f): StoreLimits above the pod memory limit; who fires first
+confined: yes (native pods, uid 250); profile file not readable without sudo.
+The node's sampler (runtimed pkg/supervisor/sampler.go) polls ri_phys_footprint at 1 Hz and fires after DefaultBreachSamples=3
+consecutive over-limit samples, so it acts ~2-3 s after a breach. The guest grows 16 MiB every 250 ms (64 MiB/s), touching every
+16 KiB page so the growth is resident footprint.
+
+## b494-oom2
+(the row: limit 128Mi, StoreLimits 1024 MiB; expected: sampler first, OOMKilled)
+command: ["/bin/wasmspike","grow","--store-limit-mib","1024","--target-mib","900","--step-mib","16","--sleep-ms","250","@wasm/grow.wasm"] resources: {"limits":{"memory":"128Mi"},"requests":{"memory":"128Mi"}}
+status: {"phase": "Failed", "reason": null, "state": {"terminated": {"containerID": "k3sm-runtimed://337f920f53f9e2b07dcc28394e8bf47aec5b081ac70e5d6e2f07970cb9ed1442", "exitCode": 137, "finishedAt": "2026-10-15T04:37:17Z", "reason": "OOMKilled", "signal": 9, "startedAt": null}}}
+2026-10-15T04:37:13.421628000Z B494 2026-10-15T04:37:13.421394Z +11ms grow start storeLimitMiB=1024 targetMiB=900 stepMiB=16
+2026-10-15T04:37:13.426047000Z B494 2026-10-15T04:37:13.425721Z +16ms guest memory 16MiB footprint=22856424 peak=22856424
+2026-10-15T04:37:13.679097000Z B494 2026-10-15T04:37:13.679000Z +269ms guest memory 32MiB footprint=39682792 peak=39682792
+2026-10-15T04:37:13.931204000Z B494 2026-10-15T04:37:13.931148Z +521ms guest memory 48MiB footprint=56509184 peak=56509184
+2026-10-15T04:37:14.186133000Z B494 2026-10-15T04:37:14.185840Z +776ms guest memory 64MiB footprint=73302784 peak=73302784
+2026-10-15T04:37:14.439756000Z B494 2026-10-15T04:37:14.439334Z +1029ms guest memory 80MiB footprint=90096408 peak=90096408
+2026-10-15T04:37:14.692039000Z B494 2026-10-15T04:37:14.691885Z +1282ms guest memory 96MiB footprint=106873624 peak=106873624
+2026-10-15T04:37:14.944609000Z B494 2026-10-15T04:37:14.944534Z +1534ms guest memory 112MiB footprint=123667248 peak=123667248
+2026-10-15T04:37:15.197765000Z B494 2026-10-15T04:37:15.197682Z +1787ms guest memory 128MiB footprint=140444464 peak=140444464
+2026-10-15T04:37:15.451302000Z B494 2026-10-15T04:37:15.451099Z +2041ms guest memory 144MiB footprint=157238088 peak=157238088
+2026-10-15T04:37:15.706325000Z B494 2026-10-15T04:37:15.706195Z +2296ms guest memory 160MiB footprint=174015304 peak=174015304
+2026-10-15T04:37:15.964545000Z B494 2026-10-15T04:37:15.964176Z +2554ms guest memory 176MiB footprint=190808928 peak=190808928
+2026-10-15T04:37:16.219915000Z B494 2026-10-15T04:37:16.219821Z +2810ms guest memory 192MiB footprint=207586144 peak=207586144
+2026-10-15T04:37:16.475075000Z B494 2026-10-15T04:37:16.474990Z +3065ms guest memory 208MiB footprint=224379768 peak=224379768
+2026-10-15T04:37:16.732602000Z B494 2026-10-15T04:37:16.732447Z +3322ms guest memory 224MiB footprint=241156984 peak=241156984
+2026-10-15T04:37:16.989742000Z B494 2026-10-15T04:37:16.989531Z +3579ms guest memory 240MiB footprint=257950608 peak=257950608
+2026-10-15T04:37:17.244646000Z B494 2026-10-15T04:37:17.244345Z +3834ms guest memory 256MiB footprint=274727824 peak=274727824
+2026-10-15T04:37:17.499139000Z B494 2026-10-15T04:37:17.499075Z +4089ms guest memory 272MiB footprint=291521448 peak=291521448
+agent.log:
+time=2026-10-15T00:37:17.703-04:00 level=WARN msg="pod exceeded memory limit; OOMKilling" pod=df03142a-5d35-4803-8012-c04a9a46e69f footprint_bytes=291521448
+
+## b494-nooom
+(contrast: limit 512Mi, StoreLimits 640 MiB, guest held at 160 MiB for 30 s; expected: no kill)
+command: ["/bin/wasmspike","grow","--store-limit-mib","640","--target-mib","160","--step-mib","16","--sleep-ms","250","@wasm/grow.wasm"] resources: {"limits":{"memory":"512Mi"},"requests":{"memory":"512Mi"}}
+status: {"phase": "Succeeded", "reason": null, "state": {"terminated": {"containerID": "k3sm-runtimed://340aac083822dfb490b8a289f06d4805eabc33c1275676c2af0f9de6b600a41a", "exitCode": 0, "finishedAt": "2026-10-15T04:36:54Z", "reason": "Completed", "startedAt": null}}}
+2026-10-15T04:36:22.174960000Z B494 2026-10-15T04:36:22.174766Z +6ms grow start storeLimitMiB=640 targetMiB=160 stepMiB=16
+2026-10-15T04:36:22.177058000Z B494 2026-10-15T04:36:22.177002Z +8ms guest memory 16MiB footprint=22708968 peak=22708968
+2026-10-15T04:36:22.432154000Z B494 2026-10-15T04:36:22.431992Z +263ms guest memory 32MiB footprint=39535336 peak=39535336
+2026-10-15T04:36:22.686678000Z B494 2026-10-15T04:36:22.686517Z +518ms guest memory 48MiB footprint=56361728 peak=56361728
+2026-10-15T04:36:22.941362000Z B494 2026-10-15T04:36:22.941250Z +773ms guest memory 64MiB footprint=73155328 peak=73155328
+2026-10-15T04:36:23.195251000Z B494 2026-10-15T04:36:23.195190Z +1027ms guest memory 80MiB footprint=89965336 peak=89965336
+2026-10-15T04:36:23.452082000Z B494 2026-10-15T04:36:23.451952Z +1283ms guest memory 96MiB footprint=106742552 peak=106742552
+2026-10-15T04:36:23.707228000Z B494 2026-10-15T04:36:23.707129Z +1539ms guest memory 112MiB footprint=123536176 peak=123536176
+2026-10-15T04:36:23.963604000Z B494 2026-10-15T04:36:23.963477Z +1795ms guest memory 128MiB footprint=140313392 peak=140313392
+2026-10-15T04:36:24.219656000Z B494 2026-10-15T04:36:24.219499Z +2051ms guest memory 144MiB footprint=157107016 peak=157107016
+2026-10-15T04:36:24.474862000Z B494 2026-10-15T04:36:24.474754Z +2306ms guest memory 160MiB footprint=173884232 peak=173884232
+2026-10-15T04:36:24.726889000Z B494 2026-10-15T04:36:24.726818Z +2558ms RESULT reached target 160MiB without a kill; holding
+agent.log:
+
+## b494-oom
+(second contrast, a FINDING: limit 128Mi, StoreLimits only 192 MiB = 1.5x; StoreLimits fires before the sampler's 3-sample window)
+command: ["/bin/wasmspike","grow","--store-limit-mib","192","--target-mib","320","--step-mib","16","--sleep-ms","250","@wasm/grow.wasm"] resources: {"limits":{"memory":"128Mi"},"requests":{"memory":"128Mi"}}
+status: {"phase": "Failed", "reason": null, "state": {"terminated": {"containerID": "k3sm-runtimed://e7f48c1197593d9ec6669a4c2f856041b45e831c46d536220430c9b4e8ab21e0", "exitCode": 5, "finishedAt": "2026-10-15T04:36:25Z", "reason": "Error", "startedAt": null}}}
+2026-10-15T04:36:22.041745000Z B494 2026-10-15T04:36:22.040780Z +8ms grow start storeLimitMiB=192 targetMiB=320 stepMiB=16
+2026-10-15T04:36:22.043322000Z B494 2026-10-15T04:36:22.043239Z +10ms guest memory 16MiB footprint=22577896 peak=22577896
+2026-10-15T04:36:22.300424000Z B494 2026-10-15T04:36:22.300282Z +267ms guest memory 32MiB footprint=39437032 peak=39437032
+2026-10-15T04:36:22.552946000Z B494 2026-10-15T04:36:22.552859Z +520ms guest memory 48MiB footprint=56263424 peak=56263424
+2026-10-15T04:36:22.806833000Z B494 2026-10-15T04:36:22.806774Z +774ms guest memory 64MiB footprint=73057024 peak=73057024
+2026-10-15T04:36:23.061658000Z B494 2026-10-15T04:36:23.061540Z +1029ms guest memory 80MiB footprint=89867032 peak=89867032
+2026-10-15T04:36:23.317034000Z B494 2026-10-15T04:36:23.316878Z +1284ms guest memory 96MiB footprint=106644248 peak=106644248
+2026-10-15T04:36:23.572868000Z B494 2026-10-15T04:36:23.572731Z +1540ms guest memory 112MiB footprint=123437872 peak=123437872
+2026-10-15T04:36:23.830132000Z B494 2026-10-15T04:36:23.829970Z +1797ms guest memory 128MiB footprint=140215088 peak=140215088
+2026-10-15T04:36:24.085918000Z B494 2026-10-15T04:36:24.085850Z +2053ms guest memory 144MiB footprint=157008712 peak=157008712
+2026-10-15T04:36:24.341515000Z B494 2026-10-15T04:36:24.341352Z +2308ms guest memory 160MiB footprint=173785928 peak=173785928
+2026-10-15T04:36:24.596653000Z B494 2026-10-15T04:36:24.596540Z +2564ms guest memory 176MiB footprint=190579552 peak=190579552
+2026-10-15T04:36:24.850746000Z B494 2026-10-15T04:36:24.850657Z +2818ms guest memory 192MiB footprint=207356768 peak=207356768
+2026-10-15T04:36:25.102423000Z B494 2026-10-15T04:36:25.101956Z +3069ms RESULT memory.grow refused (-1) at 208MiB: StoreLimits fired first
+agent.log:
+
+## verdict
+PASS with a margin condition. With StoreLimits well above the limit (1024 MiB vs 128Mi) the footprint sampler fired first:
+'pod exceeded memory limit; OOMKilling' at footprint 291521448 B (2.17x the limit, ~2.6 s after the breach) and the container
+reports reason OOMKilled, exitCode 137, signal 9. The 512Mi contrast held 160 MiB of guest memory for 30 s and completed (exit 0).
+But at 1.5x (192 MiB) the guest's memory.grow was refused by StoreLimits first (exit 5, no OOMKilled): the sampler's ~3 s
+detection window lets a 64 MiB/s guest overshoot the limit by ~2x before the kill, so 'StoreLimits above the limit' must leave
+headroom of at least growth-rate x 3 s (or be pinned far above, e.g. node memory) to stay a backstop rather than the first to fire.

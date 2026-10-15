@@ -1,0 +1,217 @@
+# B494 row (l): offline verification of a cosign sign --key signature with the Go standard library only
+confined: no (host test). toolchain: go version go1.27.2 darwin/arm64. imports: bytes, crypto/ecdsa, crypto/elliptic,
+crypto/sha256, crypto/x509, encoding/base64, encoding/json, encoding/pem, errors, fmt. No sigstore or registry client.
+signer: cosign v3.1.3 'cosign sign --key ... --tlog-upload=false --new-bundle-format=false --use-signing-config=false' (row (k)).
+keys: throwaway, generated in scratch with 'cosign generate-key-pair'; private halves destroyed (rm -P) after the fixtures were made.
+  signer pub SPKI-DER sha256: 0a7bf17a7496e5ebdacba15b71f247a78808edf977872622a3567ae7e7fe2b23
+  other pub SPKI-DER sha256: f09aaa488d95e61b6480b7259babaf705f015fefe6af22e95869fb2686e5f89c
+  private halves destroyed (rm -P) at 2026-10-15T04:40:55Z
+
+## fixtures (public key, payload and signature bytes only; committed beside this file under fixtures-l/)
+  615c2298e35fb09c36714b133a0d48d4c87860b0a0a0eb84cbcd61a4eed67998  signer.pub
+  07eb6e6e4e54dcde09f0ff44870480f538314a196e7d27d3c4ece815b6fc6045  other.pub
+  7395394decde980fcb13ccbb9b2e3a480ac957258b8b6de4417d104b0a32632f  malformed.pub
+  d03caa37a8247710cc7d660e43d30addcb680e8f70f941f6c30d6da0e8718a21  p384.pub
+  888fe39a4815583886c79e251fe61c8ba958d7e7d89404b03acc2284a4c9308b  ed25519.pub
+  5293c800b001e57be8d0c3fec821ce67c66012f27a1231883401f3d96372ca33  single.payload.json
+  ba4287b67ea38d64b88c81a78e5a98f493df2a8af4f5202a6b26c80c7ceb75be  single.sig.b64
+  fcd1167ee66ba231f13587b4eedaedf0d29c88c082236af107bc90ff20a05e4e  index.payload.json
+  d3ced0a0244dbc8aaf15c0165d2fcd109b601480536c0c383384bcbb7602ab1a  index.sig.b64
+  8691ce7d8401eed735383707de095544046d8dd913a895a9a80a949de0ffce12  tampered.payload.json
+  a3ca001bf9e840628b914b31537ab1750bd01622f162cf6ab181ab11cb658e63  wrongtype.payload.json
+  b88582dceece407d36ff5096f4a26af2115b7908c57e26e0246fd73009cebe13  wrongtype.sig.b64
+  c8ea9ae389b4cd555519d13c73acf76a9fed82eee77fd8cff6d20603236ba890  nonstrict.sig.b64
+  single.* : the signature cosign pushed for b494/hello-wasm@sha256:4ed9ca42... (a wasi/wasm32 single-platform manifest)
+  index.*  : the signature cosign pushed for b494/hello-wasm-index@sha256:976f8b3e... (its payload names the INDEX digest)
+  tampered : single.payload.json with one byte changed in identity.docker-reference
+  wrongtype: a payload with critical.type 'cosign container image attestation', signed with the same key by cosign sign-blob
+  nonstrict: single.sig.b64 with a newline inserted after byte 20
+
+## fixed check order
+  1 key: one PEM 'PUBLIC KEY' block, no trailing data, <= 4 KiB, PKIX, *ecdsa.PublicKey on P-256   -> ErrMalformedKey | ErrUnsupportedKey
+  2 signature: every byte in the base64 alphabet, then StdEncoding.Strict()                         -> ErrMalformedSignature
+  3 ecdsa.VerifyASN1(key, SHA-256(exact payload bytes), DER sig), payload <= 64 KiB                -> ErrBadSignature
+  4 only now parse the payload JSON                                                                -> ErrMalformedPayload
+  5 critical.type == 'cosign container image signature'                                            -> ErrWrongPayloadType
+  6 critical.image.docker-manifest-digest == the resolved digest                                    -> ErrDigestMismatch
+  identity.docker-reference is returned, never checked (cosign payloads are not repository-bound).
+
+## go test -v (errors asserted with errors.Is, and each failure asserted NOT to match any other class)
+=== RUN   TestVerify
+=== RUN   TestVerify/genuine_cosign_signature_verifies
+    verify_test.go:52: ok, identity.docker-reference="127.0.0.1:5494/b494/hello-wasm" (informational)
+=== RUN   TestVerify/genuine_index_signature_verifies_against_the_index_digest
+    verify_test.go:52: ok, identity.docker-reference="127.0.0.1:5494/b494/hello-wasm-index" (informational)
+=== RUN   TestVerify/tampered_payload
+    verify_test.go:63: refused: signature does not verify over the payload
+=== RUN   TestVerify/wrong_key
+    verify_test.go:63: refused: signature does not verify over the payload
+=== RUN   TestVerify/malformed_key
+    verify_test.go:63: refused: malformed public key: no PEM PUBLIC KEY block
+=== RUN   TestVerify/non-P-256_key_(P-384)
+    verify_test.go:63: refused: unsupported public key: want ECDSA P-256: curve P-384
+=== RUN   TestVerify/non-P-256_key_(Ed25519)
+    verify_test.go:63: refused: unsupported public key: want ECDSA P-256: got ed25519.PublicKey
+=== RUN   TestVerify/valid_signature_over_another_digest_(the_index's,_checked_against_the_child)
+    verify_test.go:63: refused: payload signs a different manifest digest: payload names sha256:976f8b3ed85d5605193a93a118f81c60501e8d65f6316e781c6d7f9d2ebbc95a, resolved sha256:4ed9ca42c7836b43d31be30a34160541cadcd84eddba2978f605d4869b63dfec
+=== RUN   TestVerify/valid_signature,_wrong_critical.type
+    verify_test.go:63: refused: payload is not a cosign container image signature: "cosign container image attestation"
+=== RUN   TestVerify/signature_with_an_embedded_newline_(Go's_Strict()_alone_would_accept_it)
+    verify_test.go:63: refused: malformed signature encoding: byte 0x0a at 20 is outside the base64 alphabet
+--- PASS: TestVerify (0.00s)
+    --- PASS: TestVerify/genuine_cosign_signature_verifies (0.00s)
+    --- PASS: TestVerify/genuine_index_signature_verifies_against_the_index_digest (0.00s)
+    --- PASS: TestVerify/tampered_payload (0.00s)
+    --- PASS: TestVerify/wrong_key (0.00s)
+    --- PASS: TestVerify/malformed_key (0.00s)
+    --- PASS: TestVerify/non-P-256_key_(P-384) (0.00s)
+    --- PASS: TestVerify/non-P-256_key_(Ed25519) (0.00s)
+    --- PASS: TestVerify/valid_signature_over_another_digest_(the_index's,_checked_against_the_child) (0.00s)
+    --- PASS: TestVerify/valid_signature,_wrong_critical.type (0.00s)
+    --- PASS: TestVerify/signature_with_an_embedded_newline_(Go's_Strict()_alone_would_accept_it) (0.00s)
+=== RUN   TestDigestMismatchIsNotInvalidSignature
+--- PASS: TestDigestMismatchIsNotInvalidSignature (0.00s)
+=== RUN   TestStdlibStrictStillSkipsNewlines
+    verify_test.go:83: encoding/base64 StdEncoding.Strict() accepts a signature with an embedded \n; the alphabet pre-check is what refuses it
+--- PASS: TestStdlibStrictStillSkipsNewlines (0.00s)
+PASS
+ok  	local/b494kl/verify	0.125s
+
+## decisions
+- wrong key vs tampered payload: the SAME class (ErrBadSignature), distinct only as fixtures. ECDSA verification yields one bit;
+  a wrong key and a modified payload are indistinguishable to the verifier, and a message that claimed to tell them apart would
+  be guessing. The product can still say which key it tried (the SPKI fingerprint) so an operator can tell the cases apart.
+- a valid signature over another digest is ErrDigestMismatch, never ErrBadSignature (TestDigestMismatchIsNotInvalidSignature).
+- malformed key and non-P-256 key are distinct classes (ErrMalformedKey vs ErrUnsupportedKey); P-384 and Ed25519 both refuse.
+- a valid signature over a payload of the wrong type is its own class (ErrWrongPayloadType), checked after authentication.
+- encoding/base64's Strict() still skips 
+ and 
+ (TestStdlibStrictStillSkipsNewlines); 'strict base64' needs the explicit
+  alphabet pre-check, or a signature annotation with line breaks would verify.
+
+## the verifier (scratch; verify.go)
+// Package verify is the B494 row (l) offline cosign verifier: stdlib only
+// (crypto/ecdsa, crypto/sha256, crypto/x509, encoding/pem, encoding/base64,
+// encoding/json). Scratch code that answers the spike question; it is not the
+// product verifier.
+package verify
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+)
+
+// The error classes. Each failure wraps exactly one of these; callers compare
+// with errors.Is.
+var (
+	ErrMalformedKey       = errors.New("malformed public key")
+	ErrUnsupportedKey     = errors.New("unsupported public key: want ECDSA P-256")
+	ErrMalformedSignature = errors.New("malformed signature encoding")
+	ErrBadSignature       = errors.New("signature does not verify over the payload")
+	ErrMalformedPayload   = errors.New("malformed simple-signing payload")
+	ErrWrongPayloadType   = errors.New("payload is not a cosign container image signature")
+	ErrDigestMismatch     = errors.New("payload signs a different manifest digest")
+)
+
+const (
+	maxKey     = 4 << 10
+	maxPayload = 64 << 10
+	cosignType = "cosign container image signature"
+)
+
+// ParseKey accepts exactly one PEM "PUBLIC KEY" block holding a PKIX ECDSA
+// P-256 key, and nothing after it.
+func ParseKey(pemBytes []byte) (*ecdsa.PublicKey, error) {
+	if len(pemBytes) > maxKey {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", ErrMalformedKey, len(pemBytes), maxKey)
+	}
+	blk, rest := pem.Decode(pemBytes)
+	if blk == nil || blk.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("%w: no PEM PUBLIC KEY block", ErrMalformedKey)
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		return nil, fmt.Errorf("%w: trailing data after the PEM block", ErrMalformedKey)
+	}
+	k, err := x509.ParsePKIXPublicKey(blk.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedKey, err)
+	}
+	ec, ok := k.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("%w: got %T", ErrUnsupportedKey, k)
+	}
+	if ec.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("%w: curve %s", ErrUnsupportedKey, ec.Curve.Params().Name)
+	}
+	return ec, nil
+}
+
+// decodeSig is strict base64 with no whitespace at all: Go's
+// base64.StdEncoding.Strict() still skips \r and \n, so they are refused first.
+func decodeSig(b64 string) ([]byte, error) {
+	for i := 0; i < len(b64); i++ {
+		c := b64[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '/' || c == '=') {
+			return nil, fmt.Errorf("%w: byte 0x%02x at %d is outside the base64 alphabet", ErrMalformedSignature, c, i)
+		}
+	}
+	sig, err := base64.StdEncoding.Strict().DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedSignature, err)
+	}
+	return sig, nil
+}
+
+// Verify checks, in this fixed order: (1) the key parses as PKIX P-256,
+// (2) the signature is strict base64, (3) the DER ECDSA signature verifies
+// over SHA-256 of the exact payload bytes, (4) only then is the payload
+// parsed, (5) critical.type is the cosign image type, (6)
+// critical.image.docker-manifest-digest equals want. The payload is never
+// parsed before it is authenticated. identity.docker-reference is returned
+// but not checked (cosign payloads are not repository-bound).
+func Verify(keyPEM, payload []byte, sigB64, want string) (ref string, err error) {
+	key, err := ParseKey(keyPEM)
+	if err != nil {
+		return "", err
+	}
+	sig, err := decodeSig(sigB64)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) > maxPayload {
+		return "", fmt.Errorf("%w: %d bytes exceeds %d", ErrMalformedPayload, len(payload), maxPayload)
+	}
+	sum := sha256.Sum256(payload)
+	if !ecdsa.VerifyASN1(key, sum[:], sig) {
+		return "", ErrBadSignature
+	}
+	var p struct {
+		Critical struct {
+			Identity struct {
+				DockerReference string `json:"docker-reference"`
+			} `json:"identity"`
+			Image struct {
+				DockerManifestDigest string `json:"docker-manifest-digest"`
+			} `json:"image"`
+			Type string `json:"type"`
+		} `json:"critical"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrMalformedPayload, err)
+	}
+	if p.Critical.Type != cosignType {
+		return "", fmt.Errorf("%w: %q", ErrWrongPayloadType, p.Critical.Type)
+	}
+	if p.Critical.Image.DockerManifestDigest != want {
+		return "", fmt.Errorf("%w: payload names %s, resolved %s", ErrDigestMismatch, p.Critical.Image.DockerManifestDigest, want)
+	}
+	return p.Critical.Identity.DockerReference, nil
+}

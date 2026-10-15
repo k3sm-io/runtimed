@@ -1,0 +1,182 @@
+# B494 row (j): the engine in-process under go test -race on darwin/arm64
+confined: no (host). Run alone: the runner waited until no 'go test|hack/ci.sh|go build|go vet' process was seen for 3 polls, 10 s apart.
+host: Mac14,2 macOS 27.0.1 (26A434), 8 GiB
+## pre-run check 2026-10-15T04:52:31Z: pgrep -fl 'go test|hack/ci.sh|go build|go vet' ->
+  (none: running alone)
+## memory_pressure: System-wide memory free percentage: 60%
+## toolchain
+go version go1.27.2 darwin/arm64
+darwin
+arm64
+1
+cc
+Apple clang version 21.0.0 (clang-2100.3.34.2)
+macOS SDK 27.0
+## module: github.com/bytecodealliance/wasmtime-go/v49 v49.0.0 (static libwasmtime.a)
+## $ go test -race -count=1 -v ./...   (in the scratch spike module, GOWORK=off)
+=== RUN   TestRaceWasiExit
+--- PASS: TestRaceWasiExit (0.01s)
+=== RUN   TestRaceConcurrentStores
+--- PASS: TestRaceConcurrentStores (0.00s)
+=== RUN   TestRaceTraps
+--- PASS: TestRaceTraps (0.00s)
+=== RUN   TestRaceEpochInterruptFromAnotherGoroutine
+--- PASS: TestRaceEpochInterruptFromAnotherGoroutine (0.10s)
+=== RUN   TestRaceHostCallback
+--- PASS: TestRaceHostCallback (0.00s)
+PASS
+ok  	local/b494spike	1.503s
+        5.67 real         9.03 user         5.43 sys
+           193216512  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1056373  page reclaims
+               54797  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                1102  signals received
+               10775  voluntary context switches
+               83969  involuntary context switches
+          3721963314  instructions retired
+          1775052723  cycles elapsed
+            22053536  peak memory footprint
+exit=0
+
+## verdict
+PASS: 5 tests, cgo engine in the test process, -race on, no race report, no crash. Covered: WASI p1 proc_exit status, 8 goroutines x
+20 stores sharing one Engine and Module, traps (unreachable, div-by-zero, OOB) with the race runtime's signal handling, epoch
+interruption driven from another goroutine (Interrupt trap), and a Go host callback called from the guest. The race detector does
+not instrument the C/Rust side; this proves the Go side and the signal coexistence, not engine-internal thread safety.
+
+## the test file (race_test.go)
+package main
+
+import (
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	wasmtime "github.com/bytecodealliance/wasmtime-go/v49"
+)
+
+func compile(t *testing.T, e *wasmtime.Engine, wat string) *wasmtime.Module {
+	t.Helper()
+	bin, err := wasmtime.Wat2Wasm(wat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := wasmtime.NewModule(e, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestRaceWasiExit(t *testing.T) {
+	e := wasmtime.NewEngine()
+	m := compile(t, e, watHello(7))
+	l := wasmtime.NewLinker(e)
+	if err := l.DefineWasi(); err != nil {
+		t.Fatal(err)
+	}
+	s := wasmtime.NewStore(e)
+	s.SetWasi(wasmtime.NewWasiConfig())
+	inst, err := l.Instantiate(s, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = inst.GetFunc(s, "_start").Call(s)
+	var we *wasmtime.Error
+	if !errors.As(err, &we) {
+		t.Fatalf("want *wasmtime.Error, got %v", err)
+	}
+	if code, ok := we.ExitStatus(); !ok || code != 7 {
+		t.Fatalf("exit status = %d,%v; want 7", code, ok)
+	}
+}
+
+func TestRaceConcurrentStores(t *testing.T) {
+	e := wasmtime.NewEngine()
+	m := compile(t, e, watCompute)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				s := wasmtime.NewStore(e)
+				inst, err := wasmtime.NewInstance(s, m, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				v, err := inst.GetFunc(s, "fib").Call(s, 20)
+				if err != nil || v.(int32) != 6765 {
+					t.Errorf("fib(20) = %v, %v", v, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRaceTraps(t *testing.T) {
+	e := wasmtime.NewEngine()
+	m := compile(t, e, watTraps)
+	want := map[string]wasmtime.TrapCode{"unreachable": 9, "divzero": 7, "oob": 1}
+	for name, code := range want {
+		s := wasmtime.NewStore(e)
+		inst, err := wasmtime.NewInstance(s, m, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = inst.GetFunc(s, name).Call(s)
+		var tr *wasmtime.Trap
+		if !errors.As(err, &tr) || tr.Code() == nil || *tr.Code() != code {
+			t.Fatalf("%s: got %v", name, err)
+		}
+	}
+}
+
+func TestRaceEpochInterruptFromAnotherGoroutine(t *testing.T) {
+	cfg := wasmtime.NewConfig()
+	cfg.SetEpochInterruption(true)
+	e := wasmtime.NewEngineWithConfig(cfg)
+	m := compile(t, e, watSpin)
+	s := wasmtime.NewStore(e)
+	s.SetEpochDeadline(1)
+	inst, err := wasmtime.NewInstance(s, m, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { time.Sleep(100 * time.Millisecond); e.IncrementEpoch() }()
+	_, err = inst.GetFunc(s, "spin").Call(s)
+	var tr *wasmtime.Trap
+	if !errors.As(err, &tr) || tr.Code() == nil || *tr.Code() != 10 {
+		t.Fatalf("want an Interrupt trap, got %v", err)
+	}
+}
+
+func TestRaceHostCallback(t *testing.T) {
+	e := wasmtime.NewEngine()
+	s := wasmtime.NewStore(e)
+	var mu sync.Mutex
+	n := 0
+	f := wasmtime.WrapFunc(s, func(x int32) int32 { mu.Lock(); n++; mu.Unlock(); return x * 2 })
+	m := compile(t, e, `(module (import "" "f" (func $f (param i32) (result i32)))
+	  (func (export "go") (result i32) (call $f (i32.const 21))))`)
+	inst, err := wasmtime.NewInstance(s, m, []wasmtime.AsExtern{f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := inst.GetFunc(s, "go").Call(s)
+	if err != nil || v.(int32) != 42 || n != 1 {
+		t.Fatalf("got %v %v n=%d", v, err, n)
+	}
+}

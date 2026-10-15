@@ -1,0 +1,53 @@
+# B494 row (i): does wasmtime-go's WasiConfig expose a WASI p1 sock_accept listener preopen?
+confined: no (source reading at the pinned version)
+module: github.com/bytecodealliance/wasmtime-go/v49 v49.0.0 (go.sum h1:kH3XJMvXKuKmFgRhhHqeYi5p/ztgJd/Trr3gU06u1fY=)
+
+## every WasiConfig method (wasi.go)
+  25:func (c *WasiConfig) ptr() *C.wasi_config_t {
+  37:func (c *WasiConfig) Close() {
+  49:func (c *WasiConfig) SetArgv(argv []string) {
+  65:func (c *WasiConfig) InheritArgv() {
+  73:func (c *WasiConfig) SetEnv(keys, values []string) {
+  98:func (c *WasiConfig) InheritEnv() {
+  103:func (c *WasiConfig) SetStdinFile(path string) error {
+  115:func (c *WasiConfig) InheritStdin() {
+  120:func (c *WasiConfig) SetStdoutFile(path string) error {
+  132:func (c *WasiConfig) InheritStdout() {
+  137:func (c *WasiConfig) SetStderrFile(path string) error {
+  149:func (c *WasiConfig) InheritStderr() {
+  157:func (c *WasiConfig) PreopenDir(path, guestPath string, fsMutable bool) error {
+
+## every wasi_config_* entry point of the C API the module links (build/include/wasi.h)
+  wasi_config_allow_ip_name_lookup(
+  wasi_config_delete(
+  wasi_config_inherit_argv(
+  wasi_config_inherit_env(
+  wasi_config_inherit_network(
+  wasi_config_inherit_stderr(
+  wasi_config_inherit_stdin(
+  wasi_config_inherit_stdout(
+  wasi_config_new(
+  wasi_config_preopen_dir(
+  wasi_config_set_argv(
+  wasi_config_set_env(
+  wasi_config_set_stderr_custom(
+  wasi_config_set_stderr_file(
+  wasi_config_set_stdin_bytes(
+  wasi_config_set_stdin_file(
+  wasi_config_set_stdout_custom(
+  wasi_config_set_stdout_file(
+
+## socket mentions in wasi.h
+  54: * \brief Allow all network addresses accessible to the host.
+  56: * This method will inherit all network addresses meaning that any address
+  60:WASI_API_EXTERN void wasi_config_inherit_network(wasi_config_t *config);
+  63: * \brief Allow usage of `wasi:sockets/ip-name-lookup`
+
+## symbol check in libwasmtime.a
+  preopen_socket symbols: 0 (wasi_config_preopen_socket is absent)
+
+## verdict
+FAIL. Neither the Go WasiConfig nor the v49 C API offers a socket/listener preopen: the only preopen is PreopenDir
+(wasi_config_preopen_dir). The C API has wasi_config_inherit_network and wasi_config_allow_ip_name_lookup, which govern which
+addresses wasi:sockets may reach; neither hands the guest a pre-bound descriptor (and the Go module wraps neither). So a WASI p1 core module cannot be handed a
+pre-bound listener for sock_accept: per R7, p1 inbound is out of scope and the docs must say so; inbound is components-only.

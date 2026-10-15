@@ -1,0 +1,3 @@
+self-test evidence for row (a)
+WASMTIME_FEATURE_WASI: present
+WASMTIME_FEATURE_WASI_HTTP: present
