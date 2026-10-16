@@ -74,6 +74,13 @@ func (r *Runtime) watchGuestContainerEvents(ctx context.Context, p *pod) error {
 			}
 			return guestStreamError("events", podID, rerr)
 		}
+		if ev.GetExited() != nil && !r.awaitGuestLogDrain(ctx, p, ev.GetContainer()) && ctx.Err() == nil {
+			// The exit is folded anyway: holding a terminated container's
+			// state on a guest that cannot serve its logs would hide the exit
+			// itself. What was not drained may still arrive, late.
+			r.log.Warn("folding a vm container's exit before its output reached the log file",
+				"pod", podID, "container", boundGuestMessage(ev.GetContainer()), "waited", vmExitLogDrainWait)
+		}
 		r.applyGuestContainerEvent(p, ev)
 	}
 }
