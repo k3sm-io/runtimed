@@ -1150,6 +1150,58 @@ func (r *Runtime) closeGuestLog(p *pod, container string, w *crilog.Writer) {
 	}
 }
 
+// reopenGuestLog is ReopenContainerLog's vm route: it closes the vm container's
+// current CRI log handle and opens the same path again, the runtime half of the
+// node's rotation.
+//
+// The file is the host's, not the guest's: the guest's output crosses the agent's
+// Logs stream and the container's follower appends it here, through the
+// container's crilog.Writer. So the reopen is the native one, run on that
+// Writer. Writer.Reopen swaps the handle under the lock every Write holds, which
+// puts the switch BETWEEN two entries: an entry written before it lands whole in
+// the renamed file, every later one in the fresh file, and the follower's resume
+// point (the stamp of the last entry it wrote) is untouched, so nothing is lost
+// or written twice across the switch. The call returns once the fresh file
+// exists, which is what the node's rotation checks next.
+//
+// A container that is not running is refused with FailedPrecondition, the
+// native route's (and containerd's) rule: the node rotates running containers
+// only, and reopening a finished one would create an empty file at a path the
+// node is about to prune. A running container with no live follower still has
+// its Writer reopened, so the follower a restart or a reconnect starts next
+// writes into the fresh file, not into the renamed one. A container whose output
+// is not recorded at all (its file could not be opened) has nothing to reopen.
+func (r *Runtime) reopenGuestLog(p *pod, container string) error {
+	podID := p.box.GetPodId()
+	name, err := vmContainerName(p.box, container)
+	if err != nil {
+		return err
+	}
+	// Two passes at most: a restart may replace the writer between the read and
+	// the reopen, closing the one read, and the second pass reopens its
+	// replacement instead.
+	for pass := 0; ; pass++ {
+		p.mu.Lock()
+		running := p.guestContainers[name].GetState().GetRunning() != nil
+		w := p.guestLogs[name]
+		p.mu.Unlock()
+		if !running {
+			return status.Errorf(codes.FailedPrecondition, "reopen %s/%s: container is not running", podID, name)
+		}
+		if w == nil {
+			return nil
+		}
+		rerr := w.Reopen()
+		if rerr == nil {
+			return nil
+		}
+		if pass == 0 && !r.guestLogCurrent(p, name, w) {
+			continue
+		}
+		return status.Errorf(codes.Internal, "reopen %s/%s: %v", podID, name, rerr)
+	}
+}
+
 // streamGuestContainerLog runs one connection of the follower: it dials the
 // agent, opens a following Logs stream from *last, and writes every entry into
 // w, advancing *last as it goes. It returns whether anything was written and the
