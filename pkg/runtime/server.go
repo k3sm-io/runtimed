@@ -622,14 +622,14 @@ func (r *Runtime) ReopenContainerLog(ctx context.Context, req *runtimev1.ReopenC
 	// StartContainer and RestartContainer take, and for the same reason: a vm
 	// pod's containers are guest processes with no host containerProc, so the
 	// lookup below cannot answer for one at all and would report NotFound for a
-	// container that exists. Its log file IS written (by the guest log
-	// follower), but the follower holds the writer rather than a containerProc,
-	// so per-container reopen is not wired for it; the honest answer names that
-	// rather than silently succeeding while the node believes it rotated.
+	// container that exists. Its log file is written on THIS host, by the
+	// container's guest log follower, so the reopen is a host operation too
+	// (reopenGuestLog).
 	if p, ok := r.lookupPod(req.GetPodId()); ok && p.isVM() {
-		return nil, status.Errorf(codes.Unimplemented,
-			"reopen %s/%s: a vm pod's container log is written by the guest log follower and cannot be reopened per container",
-			req.GetPodId(), req.GetContainer())
+		if err := r.reopenGuestLog(p, req.GetContainer()); err != nil {
+			return nil, err
+		}
+		return &runtimev1.ReopenContainerLogResponse{}, nil
 	}
 	p, cp, err := r.lookupContainer(req.GetPodId(), req.GetContainer())
 	if err != nil {
