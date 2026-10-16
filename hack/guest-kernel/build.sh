@@ -66,16 +66,17 @@ source "$KEYS_DIR/lib.sh"
 
 # ---------------------------------------------------------------- the pins
 
-readonly KERNEL_VERSION="6.18.53"
+readonly KERNEL_VERSION="6.18.57"
 readonly KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 readonly KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TARBALL}"
 readonly KERNEL_SUMS_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc"
 
-# MINTED 2026-09-24, PGP-VERIFIED. sha256sums.asc was fetched and verified
-# against the key below (GOODSIG + VALIDSIG B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1,
-# signature made 2026-09-21), and this value is the linux-6.18.53.tar.xz line of
-# the VERIFIED cleartext. It was NOT taken from an unverified sums file.
-readonly KERNEL_SHA256="4d6fba95c2244b08a7b4144a4d38b9be4fb31abb5e7682ae40bb5cb11374cfe0"
+# MINTED 2026-10-16, PGP-VERIFIED. sha256sums.asc was fetched and verified
+# inside the pinned toolchain against the key below, imported as the keyring's
+# sole key (issuer B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1, signature made
+# 2026-10-15), and this value is the linux-6.18.57.tar.xz line of the VERIFIED
+# cleartext. It was NOT taken from an unverified sums file.
+readonly KERNEL_SHA256="5bd9acdc82ec5efc3790ae840e5aaa40dfde7efff261cf6dde902dc570acf98c"
 
 # "Kernel.org checksum autosigner <autosigner@kernel.org>", rsa4096, created
 # 2013-01-24. This is the PRIMARY key fingerprint; its long id 632D3A06589DA6B1
@@ -176,10 +177,14 @@ RTC_CLASS RTC_HCTOSYS RTC_DRV_PL031
 # second, unused one only widens the guest kernel's attack surface.
 # LOCALVERSION_AUTO is off because it derives a suffix from the source tree's
 # git state, which a tarball does not have and a build must not depend on.
+# The RD_* initrd decompressors are off because the initramfs ships as an
+# uncompressed newc cpio (pkg/guestartifacts doc.go says why), so a codec the
+# guest never uses is only parser surface fed by the boot path.
 readonly KCONFIG_DISABLE="
 MODULES
 NET_9P NET_9P_VIRTIO 9P_FS
 LOCALVERSION_AUTO
+RD_GZIP RD_BZIP2 RD_LZMA RD_XZ RD_LZO RD_LZ4 RD_ZSTD
 "
 
 # The subset asserted `=y` after olddefconfig. A dependency that silently drops

@@ -40,7 +40,10 @@ limitations under the License.
 // realistic codec saves about 8 MB fetched once per node but costs at least
 // 10 ms of host-side decompression per pod cold start (measured 2026-10 on the
 // pinned pair), so the archive stays uncompressed: a recurring per-pod cost is
-// not worth a one-time saving.
+// not worth a one-time saving. The guest kernel is built without any initrd
+// decompressor (every CONFIG_RD_* is off in hack/guest-kernel/kernel.config),
+// so the boot path carries no codec it never uses, and a compressed archive
+// would not unpack at all.
 //
 // # What is in the archive
 //
