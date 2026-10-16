@@ -29,8 +29,8 @@ func normalizeDoc(s string) string {
 }
 
 // TestInitramfsDocMatchesKernelConfig pins the "why uncompressed" paragraph in
-// doc.go to the guest kernel config: the kernel accepts every initrd
-// decompressor, so the doc must not claim otherwise.
+// doc.go to the guest kernel config: the initramfs ships uncompressed, the
+// kernel is built with every initrd decompressor off, and the doc must say so.
 func TestInitramfsDocMatchesKernelConfig(t *testing.T) {
 	cfgBytes, err := os.ReadFile("../../hack/guest-kernel/kernel.config")
 	if err != nil {
@@ -48,18 +48,21 @@ func TestInitramfsDocMatchesKernelConfig(t *testing.T) {
 	doc := normalizeDoc(string(docBytes))
 
 	for _, c := range []string{"GZIP", "BZIP2", "LZMA", "XZ", "LZO", "LZ4", "ZSTD"} {
-		want := "CONFIG_RD_" + c + "=y"
-		t.Run("kernel enables "+want, func(t *testing.T) {
-			if !lines[want] {
+		sym := "CONFIG_RD_" + c
+		t.Run("kernel disables "+sym, func(t *testing.T) {
+			if want := "# " + sym + " is not set"; !lines[want] {
 				t.Errorf("kernel.config has no exact line %q", want)
+			}
+			if lines[sym+"=y"] {
+				t.Errorf("kernel.config still enables %s", sym)
 			}
 		})
 	}
 
-	t.Run("doc drops the false decompressor claim", func(t *testing.T) {
-		const stale = "without any of the initrd decompressors"
-		if strings.Contains(doc, normalizeDoc(stale)) {
-			t.Errorf("doc.go still claims %q, contradicting kernel.config", stale)
+	t.Run("doc states the decompressors are absent", func(t *testing.T) {
+		const want = "built without any initrd decompressor"
+		if !strings.Contains(doc, normalizeDoc(want)) {
+			t.Errorf("doc.go does not contain %q", want)
 		}
 	})
 
