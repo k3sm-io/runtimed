@@ -324,6 +324,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 			// The container's log stream ends here so a `kubectl logs -f` reader
 			// sees end-of-stream rather than hanging on a process that will never
 			// write again. Retained output survives Close and stays readable.
+			//
+			// The pumps drain FIRST. The process is gone but what it wrote last
+			// may still be in its pipe, and a closed ring drops every later
+			// append: closing at the reap lost the one line a container that
+			// prints and exits at once ever wrote. And the exit is published
+			// only after both, so the host, which writes the pod's log file
+			// from this stream, can hold the exit until the file has it.
+			if !capture.Drain(ev.Container, exitDrainBound) {
+				log.Warn("a container's output pumps did not finish within the bound after its exit; "+
+					"later output is not captured (a child it left behind may still hold its stdout)",
+					"container", ev.Container, "bound", exitDrainBound)
+			}
 			capture.Close(ev.Container)
 			// And the retained stdio with it. This is the ONE place a container's
 			// endpoints are released: an attach that released them would take
@@ -699,6 +711,13 @@ func (s *starter) Start(cp guestinit.ContainerPlan) error {
 	return nil
 }
 
+// exitDrainBound bounds how long a container's exit waits for its output pumps
+// to reach end of stream (guestagent.Capture.Drain). A pump ends when the last
+// holder of the pipe's write end goes; that is the container's process, unless
+// it left a child holding its stdout, and the exit callback runs on the reap
+// loop every container shares, so the wait cannot be open-ended.
+const exitDrainBound = 2 * time.Second
+
 // spawn resolves one container's program, then forks and execs it inside the
 // container's composed rootfs, on the stdio its plan asks for.
 //
@@ -777,6 +796,11 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestag
 	if err != nil {
 		return 0, err
 	}
+	// Held from before the fork until the pumps hold their sinks: a container
+	// that writes and exits at once can be reaped before startPumps runs, and
+	// the exit's Drain must wait for the pumps it has not seen yet.
+	pumpsPending := capture.Hold(cp.Name)
+	defer pumpsPending()
 	sys := &syscall.SysProcAttr{
 		Chroot: cp.Root,
 		Credential: &syscall.Credential{
