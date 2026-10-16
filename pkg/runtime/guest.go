@@ -877,6 +877,12 @@ const (
 // tail into the old file is followed by one that writes the new instance into the
 // new file, and the old writer is closed only once this follower has moved off it.
 //
+// THE EXIT WAITS FOR THE FILE. The event watch folds a container's exit only
+// after awaitGuestLogDrain has had a connection begun after the exit end cleanly
+// into the current file, and a restart wakes the follower onto the new file at
+// once, so a container that prints one line and exits has that line on disk
+// before anyone can act on its exit, and before its restart can discard it.
+//
 // An old guest that never sets LogEntry.partial is handled by construction: the
 // field defaults false, which is the F tag, so its lines are simply complete
 // lines. Nothing here needs to know which guest it is talking to.
@@ -894,13 +900,19 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 		if ctx.Err() != nil {
 			return
 		}
-		w := r.bindGuestLog(p, container)
+		w, asked := r.bindGuestLog(p, container)
 		if w == nil {
 			return // no file to write into for this container
 		}
 		wrote, err := r.streamGuestContainerLog(ctx, podID, container, w, &last)
 		if ctx.Err() != nil {
 			return
+		}
+		if err == nil {
+			// The guest ended the stream: the container exited and every entry
+			// it retained after *last is now in w. That answers every drain
+			// asked for before this connection began (awaitGuestLogDrain).
+			r.noteGuestLogDrained(p, container, w, asked)
 		}
 		if errors.Is(err, crilog.ErrWriterFailed) && r.guestLogCurrent(p, container, w) {
 			// The file is gone for this container: reconnecting would pull the
@@ -921,10 +933,19 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 			// long-running stream would otherwise inherit.
 			backoff = vmLogFollowBaseBackoff
 		}
+		wait := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			wait.Stop()
 			return
-		case <-time.After(backoff):
+		case <-r.guestLogWake(p, container):
+			// A drain was asked for, or a restart gave the container a new
+			// file: reconnect now. The backoff paces a guest that keeps
+			// failing; it must not delay output a caller is waiting for.
+			wait.Stop()
+			backoff = vmLogFollowBaseBackoff
+			continue
+		case <-wait.C:
 		}
 		if backoff *= 2; backoff > vmLogFollowMaxBackoff {
 			backoff = vmLogFollowMaxBackoff
@@ -932,10 +953,119 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 	}
 }
 
+// vmExitLogDrainWait bounds how long the fold of a vm container's exit waits
+// for the container's output to reach its log file (awaitGuestLogDrain). The
+// drain is one Logs round trip to the guest; the bound only matters when the
+// guest cannot answer one, and then the exit is folded without it rather than
+// held.
+const vmExitLogDrainWait = 5 * time.Second
+
+// awaitGuestLogDrain blocks until every byte the container wrote before its exit
+// is in its CRI log file, or until vmExitLogDrainWait passes or ctx ends, and
+// reports whether it drained. The exit fold calls it before it records the
+// terminated state, which is the ORDER `kubectl logs --previous` depends on: the
+// kubelet restarts a container as soon as it sees the exit, the restart opens
+// the next instance's file, and the guest's restart discards the old instance's
+// retained output, so a line still on its way when the exit was recorded could
+// be lost for good. Without this the file of a container that printed one line
+// and exited at once was routinely empty.
+//
+// It asks the follower for a CONNECTION BEGUN AFTER THE ASK that ends cleanly
+// into the container's current file. The guest publishes an exit only after the
+// container's pumps drained and its stream was closed, so such a connection
+// serves every retained entry past the follower's resume point and then ends:
+// when it ends, the file holds them. A connection already open at the ask is
+// not enough on its own (it may have ended before the exit and be about to be
+// read as this one's end), so the ask wakes the follower to make a new one.
+//
+// A container with no follower (its file could not be opened, or the follower
+// stopped) has nothing to wait for.
+func (r *Runtime) awaitGuestLogDrain(ctx context.Context, p *pod, container string) bool {
+	p.mu.Lock()
+	f := p.guestLogFollow[container]
+	if f == nil {
+		p.mu.Unlock()
+		return true
+	}
+	f.asked++
+	want := f.asked
+	select {
+	case f.wake <- struct{}{}:
+	default:
+	}
+	p.mu.Unlock()
+
+	timer := time.NewTimer(vmExitLogDrainWait)
+	defer timer.Stop()
+	for {
+		p.mu.Lock()
+		if p.guestLogFollow[container] != f || f.drained >= want {
+			p.mu.Unlock()
+			return true
+		}
+		changed := f.changed
+		p.mu.Unlock()
+		select {
+		case <-changed:
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// noteGuestLogDrained records that a connection begun at drain generation asked
+// ended cleanly into w. It answers the drains up to that generation, and only
+// when w is still the container's current file: a connection that drained the
+// writer a restart replaced has not drained the new instance.
+func (r *Runtime) noteGuestLogDrained(p *pod, container string, w *crilog.Writer, asked uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f := p.guestLogFollow[container]
+	if f == nil || asked <= f.drained || p.guestLogs[container] != w {
+		return
+	}
+	f.drained = asked
+	f.signalLocked()
+}
+
+// guestLogWake returns the channel that wakes the container's follower from its
+// reconnect backoff, or nil (which never fires) when no follower is registered.
+func (r *Runtime) guestLogWake(p *pod, container string) <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if f := p.guestLogFollow[container]; f != nil {
+		return f.wake
+	}
+	return nil
+}
+
 // guestLogFollower is one running vm-container log follower's registration:
-// the writer it is currently writing into. Guarded by pod.mu.
+// the writer it is currently writing into, and the drain handshake the exit
+// fold waits on (awaitGuestLogDrain). Guarded by pod.mu.
 type guestLogFollower struct {
 	bound *crilog.Writer
+	// wake (capacity 1) cuts the follower's reconnect backoff short.
+	wake chan struct{}
+	// asked is the newest drain generation requested; drained the newest a
+	// clean end of stream has answered. A connection carries the asked value
+	// it began at, and answers only drains requested before it began.
+	asked, drained uint64
+	// changed is closed, and replaced, whenever drained advances or the
+	// follower ends, so a waiter re-checks.
+	changed chan struct{}
+}
+
+// newGuestLogFollower builds an idle registration.
+func newGuestLogFollower() *guestLogFollower {
+	return &guestLogFollower{wake: make(chan struct{}, 1), changed: make(chan struct{})}
+}
+
+// signalLocked wakes every drain waiter to re-check. The caller holds pod.mu.
+func (f *guestLogFollower) signalLocked() {
+	close(f.changed)
+	f.changed = make(chan struct{})
 }
 
 // startGuestLogFollower starts the container's log follower, unless one is
@@ -947,31 +1077,41 @@ func (r *Runtime) startGuestLogFollower(p *pod, container string) {
 	if p.guestLogFollow == nil {
 		p.guestLogFollow = map[string]*guestLogFollower{}
 	}
-	if _, running := p.guestLogFollow[container]; running {
+	if f, running := p.guestLogFollow[container]; running {
+		// A restart calls this after giving the container a new file. The
+		// running follower must move onto it now, not after whatever backoff
+		// it is sleeping out: the new instance may print and exit at once.
+		select {
+		case f.wake <- struct{}{}:
+		default:
+		}
 		p.mu.Unlock()
 		return
 	}
-	p.guestLogFollow[container] = &guestLogFollower{}
+	p.guestLogFollow[container] = newGuestLogFollower()
 	p.mu.Unlock()
 	go r.followGuestContainerLog(p.supCtx, p, container)
 }
 
 // bindGuestLog returns the container's current writer and records it as the
-// one the follower is writing into. A writer the follower is moving off (a
-// restart replaced it) is closed here, by the one goroutine that wrote into it,
-// after its last write.
-func (r *Runtime) bindGuestLog(p *pod, container string) *crilog.Writer {
+// one the follower is writing into, with the drain generation the connection
+// about to begin answers. A writer the follower is moving off (a restart
+// replaced it) is closed here, by the one goroutine that wrote into it, after
+// its last write.
+func (r *Runtime) bindGuestLog(p *pod, container string) (*crilog.Writer, uint64) {
 	p.mu.Lock()
 	cur := p.guestLogs[container]
 	var prev *crilog.Writer
+	var asked uint64
 	if f := p.guestLogFollow[container]; f != nil {
 		prev, f.bound = f.bound, cur
+		asked = f.asked
 	}
 	p.mu.Unlock()
 	if prev != nil && prev != cur {
 		r.closeGuestLog(p, container, prev)
 	}
-	return cur
+	return cur, asked
 }
 
 // endGuestLogFollow drops the follower's registration as it exits, closing the
@@ -983,6 +1123,9 @@ func (r *Runtime) endGuestLogFollow(p *pod, container string) {
 	if f := p.guestLogFollow[container]; f != nil {
 		bound = f.bound
 		delete(p.guestLogFollow, container)
+		// A drain waiter re-checks, finds no follower, and stops waiting:
+		// nothing will write this container's output any more.
+		f.signalLocked()
 	}
 	cur := p.guestLogs[container]
 	p.mu.Unlock()
@@ -1027,6 +1170,13 @@ func (r *Runtime) streamGuestContainerLog(ctx context.Context, podID, container 
 		return false, guestStreamError("logs", podID, err)
 	}
 
+	// resume is this connection's since_time. Entries at or before IT are
+	// dropped, and entries strictly OLDER than the last write (a guest's
+	// duplicate of an entry it already sent), but never an entry that ties the
+	// last write: two lines can carry the same stamp (a guest older than the
+	// one that makes its stamps strictly increasing), and dropping ties dropped
+	// the second of every such pair from a live stream.
+	resume := *last
 	wrote := false
 	for {
 		ent, rerr := stream.Recv()
@@ -1037,7 +1187,7 @@ func (r *Runtime) streamGuestContainerLog(ctx context.Context, podID, container 
 			return wrote, guestStreamError("logs", podID, rerr)
 		}
 		at := ent.GetTimestamp().AsTime()
-		if !last.IsZero() && !at.After(*last) {
+		if (!resume.IsZero() && !at.After(resume)) || at.Before(*last) {
 			// The resume boundary: the guest's since_time filter is inclusive,
 			// so the entry we resumed FROM comes back. Dropping it here is what
 			// makes a reconnect lossless in both directions.

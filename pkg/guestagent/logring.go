@@ -71,6 +71,11 @@ type LogEntry struct {
 	// tagged is a complete line — which is what an OLD guest, whose wire
 	// message has no such field, is correctly read as.
 	Partial bool
+
+	// seq is the entry's position in everything the ring was ever given, set
+	// by Append. It is what lets a follower notice an entry its channel
+	// dropped and fetch it from the retained ones (Capture.Stream).
+	seq uint64
 }
 
 // size is the entry's charge against the ring's byte budget.
@@ -117,6 +122,12 @@ type Ring struct {
 	dropped int
 	subs    map[chan LogEntry]struct{}
 	closed  bool
+	// next is the seq the next appended entry takes; entries[0].seq is
+	// next-len(entries).
+	next uint64
+	// lastAt is the newest entry's At. Append keeps At strictly increasing
+	// (see Append), so a since_time resume can tell every entry apart.
+	lastAt time.Time
 }
 
 // NewRing builds a bounded ring. Non-positive bounds take the defaults.
@@ -140,6 +151,13 @@ func NewRing(maxEntries, maxBytes int) *Ring {
 // The entry's bytes are COPIED. The caller is a read pump reusing one buffer, so
 // retaining the slice would make every stored entry alias whatever that buffer
 // last held — the classic form of this bug, where old log lines mutate.
+//
+// At is made STRICTLY INCREASING: an entry stamped at or before the previous one
+// is moved one nanosecond past it. Two lines a pump emits from one read can read
+// the same clock value (a guest's counter ticks coarser than a loop iteration),
+// and the host resumes a broken follow stream by since_time, dropping every entry
+// at or before the last one it wrote. With a tie, the second line of the pair
+// would be taken for the first and never reach the pod's log file.
 func (r *Ring) Append(e LogEntry) {
 	cp := make([]byte, len(e.Line))
 	copy(cp, e.Line)
@@ -150,6 +168,16 @@ func (r *Ring) Append(e LogEntry) {
 	if r.closed {
 		return
 	}
+	// Compared on the WALL clock (Round(0) drops the monotonic reading): the
+	// wall clock is what crosses the wire, and two stamps whose monotonic
+	// readings differ can still carry the same wall time.
+	e.At = e.At.Round(0)
+	if !r.lastAt.IsZero() && !e.At.After(r.lastAt) {
+		e.At = r.lastAt.Add(time.Nanosecond)
+	}
+	r.lastAt = e.At
+	e.seq = r.next
+	r.next++
 	r.entries = append(r.entries, e)
 	r.bytes += e.size()
 	for len(r.entries) > r.maxEntries || (r.bytes > r.maxBytes && len(r.entries) > 1) {
@@ -190,7 +218,36 @@ func (r *Ring) Snapshot(sel Selector) []LogEntry {
 func (r *Ring) SnapshotWithDropped(sel Selector) ([]LogEntry, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.snapshotLocked(sel), r.dropped
+}
 
+// snapshotCursor is Snapshot plus the seq the NEXT append will take, read in
+// the same critical section: a follower that sent the snapshot has seen every
+// entry before that seq, selected or not.
+func (r *Ring) snapshotCursor(sel Selector) ([]LogEntry, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotLocked(sel), r.next
+}
+
+// from returns the retained entries whose seq is at or after seq, oldest
+// first. Entries the bounds evicted are not returned; they are gone.
+func (r *Ring) from(seq uint64) []LogEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	first := r.next - uint64(len(r.entries))
+	if seq < first {
+		seq = first
+	}
+	if seq >= r.next {
+		return nil
+	}
+	return append([]LogEntry(nil), r.entries[seq-first:]...)
+}
+
+// snapshotLocked selects the retained entries matching sel. The caller holds
+// r.mu.
+func (r *Ring) snapshotLocked(sel Selector) []LogEntry {
 	out := make([]LogEntry, 0, len(r.entries))
 	for _, e := range r.entries {
 		if !sel.SinceTime.IsZero() && e.At.Before(sel.SinceTime) {
@@ -201,7 +258,7 @@ func (r *Ring) SnapshotWithDropped(sel Selector) ([]LogEntry, int) {
 	if sel.TailLines > 0 && int64(len(out)) > sel.TailLines {
 		out = out[int64(len(out))-sel.TailLines:]
 	}
-	return out, r.dropped
+	return out
 }
 
 // Subscribe registers a follower and returns its channel plus an unsubscribe func.

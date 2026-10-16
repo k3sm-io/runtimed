@@ -82,6 +82,18 @@ type Capture struct {
 	// including the newline-less ones (a shell prompt, a pty's keystroke echo)
 	// that a line writer holds until a delimiter arrives that may never come.
 	raws map[string]*ByteRing
+	// open counts each container's sinks that may still append: the Writers
+	// not yet closed and the Holds not yet released. Drain waits on it, which
+	// is what lets the exit path end a container's stream only after its pumps
+	// have put every byte the process wrote into the ring.
+	open map[string]*openSinks
+}
+
+// openSinks is one container's count of live sinks, plus a channel closed each
+// time the count falls to zero. Guarded by Capture.mu.
+type openSinks struct {
+	n    int
+	idle chan struct{}
 }
 
 // NewCapture builds a capture whose per-container rings take the given bounds;
@@ -97,6 +109,7 @@ func NewCapture(maxEntries, maxBytes, maxLine int) *Capture {
 		maxLine:    maxLine,
 		rings:      map[string]*Ring{},
 		raws:       map[string]*ByteRing{},
+		open:       map[string]*openSinks{},
 	}
 }
 
@@ -163,7 +176,75 @@ func (c *Capture) lookup(container string) *Ring {
 // output yet streams empty rather than reporting ErrNoCapture — "nothing yet" and
 // "never wired" are different answers and an operator acts differently on each.
 func (c *Capture) Writer(container string, kind LogStreamKind) io.WriteCloser {
-	return &lineWriter{ring: c.ring(container), kind: kind, maxLine: c.maxLine}
+	return &lineWriter{ring: c.ring(container), kind: kind, maxLine: c.maxLine, done: c.Hold(container)}
+}
+
+// Hold registers a sink that has not been created yet and returns its release.
+// Drain waits for every Hold to be released, as it waits for every Writer to
+// be closed.
+//
+// It exists for the window between a container's fork and its pumps' start:
+// a process that writes one line and exits can be reaped before the pumps call
+// Writer, and a Drain that counted only Writers would then see nothing open,
+// end the stream, and leave the line in the pipe for a pump that appends into a
+// closed ring. The spawn takes a Hold before the fork and releases it once the
+// pumps hold their Writers. The release is idempotent.
+func (c *Capture) Hold(container string) func() {
+	c.mu.Lock()
+	set := c.open[container]
+	if set == nil {
+		set = &openSinks{}
+		c.open[container] = set
+	}
+	if set.n == 0 {
+		set.idle = make(chan struct{})
+	}
+	set.n++
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			set.n--
+			if set.n == 0 {
+				close(set.idle)
+			}
+			c.mu.Unlock()
+		})
+	}
+}
+
+// Drain waits until every sink of the container is closed (each Writer closed,
+// each Hold released), or until bound passes, and reports whether it drained.
+//
+// It is the exit path's step before Close. A container's process exits the
+// moment its last write returns, but the bytes it wrote are still in the pipe
+// until the pump reads them, and Close ends the ring: an append after it is
+// dropped. So the exit callback drains first, which is what makes "the stream
+// ended" mean "every byte the container wrote is in the ring". A pump reaches
+// end of stream when the last holder of the pipe's write end goes, which is the
+// container's process unless it left a child holding its stdout; bound is what
+// keeps that child from holding the exit, and every other container's, forever.
+func (c *Capture) Drain(container string, bound time.Duration) bool {
+	c.mu.Lock()
+	set := c.open[container]
+	var idle chan struct{}
+	if set != nil && set.n > 0 {
+		idle = set.idle
+	}
+	c.mu.Unlock()
+	if idle == nil {
+		return true
+	}
+	t := time.NewTimer(bound)
+	defer t.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // Close ends every follower of a container's stream, at BOTH granularities. It
@@ -200,6 +281,10 @@ func (c *Capture) Reset(container string) {
 	c.mu.Lock()
 	delete(c.rings, container)
 	delete(c.raws, container)
+	// A sink of the replaced instance still open (a pump whose pipe a leftover
+	// child holds) keeps its own count; the new instance's Drain must not wait
+	// on it.
+	delete(c.open, container)
 	c.mu.Unlock()
 }
 
@@ -249,7 +334,10 @@ func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<
 		defer close(out)
 		defer unsubscribe()
 
-		retained := ring.Snapshot(sel)
+		// next is the seq of the first entry this stream has not yet passed:
+		// everything before it was sent, or was before the snapshot and not
+		// selected.
+		retained, next := ring.snapshotCursor(sel)
 		send := func(e LogEntry) bool {
 			select {
 			case out <- e:
@@ -268,15 +356,41 @@ func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<
 		if !sel.Follow {
 			return
 		}
+		// catchUp sends every retained entry from next on. It is how the
+		// stream recovers what the live channel dropped: Ring.Append never
+		// blocks on a follower, so a follower behind a fast writer loses
+		// entries from its channel, and the seq gap names them.
+		catchUp := func() bool {
+			for _, m := range ring.from(next) {
+				if !send(m) {
+					return false
+				}
+				next = m.seq + 1
+			}
+			return true
+		}
 		for {
 			select {
 			case e, ok := <-live:
 				if !ok {
+					// The container ended. Its pumps drained before the ring
+					// closed (Drain), so what is retained past next is the
+					// rest of its output: send it, then end.
+					catchUp()
 					return
+				}
+				if e.seq > next && !catchUp() {
+					return
+				}
+				if e.seq < next {
+					// Already sent: by the snapshot (it landed between the
+					// subscribe and the snapshot) or by a catch-up.
+					continue
 				}
 				if !send(e) {
 					return
 				}
+				next = e.seq + 1
 			case <-ctx.Done():
 				return
 			case <-done:
@@ -310,6 +424,8 @@ type lineWriter struct {
 	ring    *Ring
 	kind    LogStreamKind
 	maxLine int
+	// done releases this writer's count in the capture's open sinks (Hold).
+	done func()
 
 	mu  sync.Mutex
 	buf []byte
@@ -351,12 +467,18 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 // It is flushed PARTIAL, because that is what the tag means: the line never
 // ended. It is the same answer containerd's writer gives at EOF-without-newline,
 // and it keeps a reader from presenting a half-written final line as a whole one.
+//
+// Close also releases the writer's count, after the flush, so a Drain that
+// returns has every byte this writer was given in the ring.
 func (w *lineWriter) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if len(w.buf) > 0 {
 		w.emitLocked(w.buf, true)
 		w.buf = nil
+	}
+	w.mu.Unlock()
+	if w.done != nil {
+		w.done()
 	}
 	return nil
 }
