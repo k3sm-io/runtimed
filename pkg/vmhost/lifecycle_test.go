@@ -382,7 +382,7 @@ func TestLifecycleStateMachine(t *testing.T) {
 
 	// --- the grace clamp -----------------------------------------------------
 
-	t.Run("grace-is-clamped-into-the-launchd-exit-budget", func(t *testing.T) {
+	t.Run("grace-is-clamped-to-the-guest-agent-ceiling", func(t *testing.T) {
 		for _, tc := range []struct {
 			name string
 			ask  time.Duration
@@ -391,9 +391,8 @@ func TestLifecycleStateMachine(t *testing.T) {
 			{"zero-takes-the-default", 0, DefaultStopGrace},
 			{"negative-takes-the-default", -5 * time.Second, DefaultStopGrace},
 			{"in-range-is-carried", 5 * time.Second, 5 * time.Second},
-			// A grace beyond the daemon's launchd ExitTimeOut does not buy a
-			// gentler shutdown — it buys a SIGKILL, which is the ungraceful stop
-			// the budget existed to avoid.
+			// The guest agent clamps to its own ceiling, so a longer host
+			// budget would be one the guest never spends.
 			{"over-the-max-is-clamped", 10 * time.Minute, MaxStopGrace},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
@@ -408,8 +407,12 @@ func TestLifecycleStateMachine(t *testing.T) {
 					mu.Unlock()
 					m.exit <- nil
 				}}
+				// A frozen clock keeps the case independent of scheduling; the
+				// grace sent is the configured one in whole seconds either way.
+				frozen := time.Unix(0, 0)
 				lc := NewLifecycle(m, agent, LifecycleOptions{
 					Grace: tc.ask, Logger: quietLogger(), NewTimer: timer.new,
+					Now: func() time.Time { return frozen },
 				})
 				ctx, cancel := context.WithCancel(context.Background())
 				done := make(chan error, 1)
@@ -510,5 +513,21 @@ func TestStopGraceBoundsAreSingleValued(t *testing.T) {
 			"a lower daemon-side ceiling SIGKILLs a helper mid-graceful-stop (a power cut for the guest); "+
 			"a higher one idles every vm pod's teardown by the difference",
 			MaxStopGrace, sandbox.VMHostMaxStopGrace)
+	}
+	// The ceiling is the guest agent's (pkg/guestagent maxStopGraceSeconds); a
+	// pod's 90 s grace must reach the guest whole.
+	if MaxStopGrace != 300*time.Second {
+		t.Errorf("vmhost.MaxStopGrace = %s, want the guest agent's 300s ceiling", MaxStopGrace)
+	}
+	// The daemon waits the helper's grace plus VMHelperStopMargin. Everything
+	// the helper does after its grace runs out (the hard stop, then exit) must
+	// fit inside that margin, or a guest that used its whole grace ends with the
+	// daemon killing the helper: escalated=true for a guest that was merely slow.
+	// The one second is guestGrace's rounding: a grace can reach the guest up
+	// to a second longer than the daemon's record of it.
+	if need := GuestStopReserve + HardStopBound + time.Second; need >= sandbox.VMHelperStopMargin {
+		t.Errorf("GuestStopReserve %s + HardStopBound %s + 1s of rounding = %s is not below sandbox.VMHelperStopMargin = %s; "+
+			"the daemon would SIGKILL a helper still halting its machine",
+			GuestStopReserve, HardStopBound, need, sandbox.VMHelperStopMargin)
 	}
 }

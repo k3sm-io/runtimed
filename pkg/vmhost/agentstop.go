@@ -48,9 +48,11 @@ func NewAgentStopper(dial vsockDialer) agentStopper { return &guestStopper{dial:
 // Stop asks the guest to terminate its containers within grace, then sync and
 // power off.
 //
-// The grace it SENDS is the grace it was given, already clamped by the lifecycle
-// (MaxStopGrace) — guest.proto says the host clamps before sending "so the guest
-// can treat it as already-budgeted", and this is that promise being kept. The
+// The grace it SENDS is the grace it was given: the lifecycle's clamped budget
+// (MaxStopGrace), already rounded to whole seconds with a floor of one
+// (guestGrace), and the lifecycle leaves GuestStopReserve past it before the hard
+// stop. guest.proto says the host clamps before sending "so the guest can treat
+// it as already-budgeted", and this is that promise being kept. The
 // int32 conversion is saturated rather than truncated: a wrapped negative grace
 // would read to the guest as "kill immediately", turning a clamping bug into data
 // loss.
