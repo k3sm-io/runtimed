@@ -113,23 +113,25 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.57",
-		// Minted 2026-10-16 from the v6.18.57-k3sm.1 release. Both artifacts
-		// moved. The KERNEL is upstream 6.18.57 built from a kernel.config
-		// regenerated for it with every initrd decompressor off (config hash
-		// bc162009c43b…, the -suffix of ActiveGuestKernel); build.sh --repro
-		// produced a byte-identical Image across two clean builds. The
-		// INITRAMFS carries k3sm-guest-init built from runtimed ba6f945, the
-		// first to serve the in-guest RestartContainer.
+		// Minted 2026-10-16 from the v6.18.57-k3sm.2 release, an
+		// initramfs-only rebuild. The KERNEL is unchanged from k3sm.1:
+		// upstream 6.18.57 built from a kernel.config regenerated for it with
+		// every initrd decompressor off (config hash bc162009c43b…, the
+		// -suffix of ActiveGuestKernel); build.sh --repro produced a
+		// byte-identical Image across two clean builds. The INITRAMFS carries
+		// k3sm-guest-init built from runtimed a51a3e5, the first whose guest
+		// init drains a container's output before publishing its exit and
+		// whose guest agent follows a fast writer without dropping lines.
 		//
 		// Two clean builds (fresh GOCACHE, GOWORK=off, -trimpath
 		// -buildvcs=false -ldflags=-buildid=) produced a byte-identical cpio,
 		// and BOTH digests below were re-derived by unauthenticated download of
-		// the published assets — never from the local build output, so a
+		// the published assets, never from the local build output, so a
 		// mismatch between what was built and what was uploaded cannot hide
 		// here.
 		ImageSHA256:     "579d70e047faa7ece419d585f00fc569a37d16b3285c453b4501c9845f30851b",
-		InitramfsSHA256: "a1e6312f938626efba17a0a3e52ee7f7625da4db5693f0fd3385d4ae8e86d1e4",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.57-k3sm.1",
+		InitramfsSHA256: "13bf303b193fac0ccda46bf159b0cd43c3ec7e666a451f1bc175afa65ee0cc09",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.57-k3sm.2",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
