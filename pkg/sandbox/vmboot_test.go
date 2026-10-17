@@ -304,9 +304,27 @@ func TestCreateVMWritesTheMachineDescription(t *testing.T) {
 			"-agent-socket", spec.AgentSocketPath,
 			"-console-log", filepath.Join(spec.PodDir, VMConsoleLogName),
 			"-stop-grace", (7 * time.Second).String(),
+			"-log-file", filepath.Join(filepath.Dir(spec.AgentSocketPath), VMHostLogName),
 		}
 		if !reflect.DeepEqual(argv, want) {
 			t.Errorf("helper argv =\n %v\nwant\n %v", argv, want)
+		}
+	})
+
+	t.Run("the helper's output is a file it inherits, not a daemon pipe", func(t *testing.T) {
+		// A pipe would die with the daemon and take the helper with it (EPIPE,
+		// SIGPIPE, or a write blocked on a full pipe nobody drains). The spawn
+		// hands the helper ONE descriptor for both streams, opened on the file
+		// in its run dir, and the file exists owner-only for the daemon to read.
+		sp.mu.Lock()
+		got := sp.specs[len(sp.specs)-1]
+		sp.mu.Unlock()
+		if got.StdoutFD == 0 || got.StdoutFD != got.StderrFD {
+			t.Errorf("helper stdout/stderr fds = %d/%d, want one shared, non-inherited descriptor", got.StdoutFD, got.StderrFD)
+		}
+		fi, err := os.Lstat(filepath.Join(filepath.Dir(spec.AgentSocketPath), VMHostLogName))
+		if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+			t.Errorf("helper output file = %v (%v), want a regular 0600 file", fi, err)
 		}
 	})
 }
@@ -736,7 +754,7 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("a daemon exit divides its bound explicitly", func(t *testing.T) {
+	t.Run("a stop of every helper divides its bound explicitly", func(t *testing.T) {
 		for _, tc := range []struct {
 			name           string
 			helper, budget time.Duration
@@ -757,6 +775,35 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 					t.Errorf("exitStopWait(%s, %s) = (%s, %v), want (%s, %v)", tc.helper, tc.budget, wait, cut, tc.wait, tc.cut)
 				}
 			})
+		}
+	})
+
+	t.Run("the stop-all bound honours the default pod grace", func(t *testing.T) {
+		// At most VMStopAllBound - VMHelperStopMargin of a pod's grace fits uncut
+		// with the whole margin behind it. With 35 s and 8 s that is 27 s: the
+		// helper's own default must fit, and the bound stays below the deletion
+		// ceiling so a stop of every helper stays a bounded operation.
+		const neverCut = 27 * time.Second
+		if got := VMStopAllBound - VMHelperStopMargin; got != neverCut {
+			t.Errorf("a stop-all gives a vm helper %s of grace uncut, want the documented %s; update the VMStopAllBound comment", got, neverCut)
+		}
+		if got := VMStopAllBound - VMHelperStopMargin; got < VMHostDefaultStopGrace {
+			t.Errorf("a stop-all gives a vm helper %s of grace, less than the helper default %s", got, VMHostDefaultStopGrace)
+		}
+		if VMStopAllBound >= VMHostMaxStopGrace {
+			t.Errorf("VMStopAllBound = %s reaches the deletion ceiling %s", VMStopAllBound, VMHostMaxStopGrace)
+		}
+	})
+
+	t.Run("an outside stopper waits the recorded grace plus the margin", func(t *testing.T) {
+		for _, tc := range []struct{ in, want time.Duration }{
+			{0, VMHostDefaultStopGrace + VMHelperStopMargin},
+			{5 * time.Second, 5*time.Second + VMHelperStopMargin},
+			{time.Hour, VMHostMaxStopGrace + VMHelperStopMargin},
+		} {
+			if got := VMHelperStopWait(tc.in); got != tc.want {
+				t.Errorf("VMHelperStopWait(%s) = %s, want %s", tc.in, got, tc.want)
+			}
 		}
 	})
 
@@ -789,14 +836,12 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 	})
 }
 
-// TestStopAllVMsFansOut asserts daemon shutdown stops every helper concurrently.
+// TestStopAllVMsFansOut asserts a stop of every helper runs concurrently.
 //
 // Serial stops are not merely slower: each helper's graceful stop can spend most
-// of the runtime's exit bound, which is one stage of the daemon's launchd
-// ExitTimeOut, and launchd's answer to a blown ExitTimeOut is SIGKILL of the
-// daemon — stranding exactly the helpers the sweep exists to stop. The assertion is on WALL TIME against a stop that is
-// deliberately made slow, which is the only thing that can tell fan-out from a
-// loop.
+// of VMStopAllBound, so a serial loop would cut every helper after the first.
+// The assertion is on WALL TIME against a stop that is deliberately made slow,
+// which is the only thing that can tell fan-out from a loop.
 func TestStopAllVMsFansOut(t *testing.T) {
 	root := t.TempDir()
 	b, _, w, _ := labBackend(t, root, func(context.Context, string) error { return nil })
@@ -830,7 +875,7 @@ func TestStopAllVMsFansOut(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	if elapsed > perHelper*time.Duration(pods)/2 {
-		t.Errorf("StopAllVMs took %s for %d helpers each taking %s; that is serial, and serial blows launchd's ExitTimeOut", elapsed, pods, perHelper)
+		t.Errorf("StopAllVMs took %s for %d helpers each taking %s; that is serial, and serial cuts every helper after the first at the bound", elapsed, pods, perHelper)
 	}
 	b.mu.Lock()
 	live := len(b.live)

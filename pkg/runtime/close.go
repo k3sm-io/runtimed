@@ -17,7 +17,6 @@ limitations under the License.
 package runtime
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -58,9 +57,18 @@ func (r *Runtime) closeGraceDuration() time.Duration {
 //
 // Close does not signal the pod PROCESSES, and that is the point: they are
 // native Darwin processes in their own session, they survive the daemon by
-// design, and the startup pod reap reconciles them on the next boot (podreap.go).
-// Killing a node's workloads because the runtime restarted is precisely what a
-// `launchctl kickstart -k` must not do.
+// design, and the next daemon re-attaches them (AttachPod) or its startup pod
+// reap reconciles them (podreap.go). Killing a node's workloads because the
+// runtime restarted is precisely what a `launchctl kickstart -k` must not do —
+// a kubelet restart stops no container either.
+//
+// That holds for VM PODS too. A vm pod's k3sm-vmhost helper leads its own
+// session and writes its output to a file in its run dir, so it keeps its guest
+// running through a daemon exit; Close only lets go of it (DetachVMs: the
+// record locks are released, nothing is signalled), and the next daemon adopts
+// it through AttachPod or its startup sweep kills it (pkg/sandbox AdoptVM,
+// ReapOrphanVMs). A vm pod stops on the paths every pod stops on: its deletion,
+// and the node teardown of a full stop or an uninstall.
 //
 // The registry is left intact — the pods are still running, so forgetting them
 // would be a lie — which also makes Close idempotent: every cancel is, and a
@@ -85,85 +93,34 @@ func (r *Runtime) Close() error {
 	// Phase 1: fire every cancel before waiting on any of them. Cancelling is
 	// non-blocking, so this stops the whole node's supervision at once and leaves
 	// the bound below to be shared rather than spent pod by pod (a wedged pod
-	// would otherwise consume a healthy successor's budget).
-	//
-	// It also runs before the vm stop below, which is load-bearing rather than
-	// incidental: watchVMHelperExit would otherwise observe the shutdown's own
-	// stop as a crash and publish a Failed status for every vm pod on the way
-	// out. Contexts are monotonic, so cancelling first settles that
-	// deterministically instead of by winning a race (see DeletePod's vm branch,
-	// where the live smoke found the same ordering bug).
+	// would otherwise consume a healthy successor's budget). For a vm pod the
+	// cancel ends its event fold, log followers, lease watcher and helper exit
+	// watch, so nothing here reads the daemon's own departure as a dead guest.
 	waits := make([]supervisionWait, 0, len(pods))
 	for _, p := range pods {
 		waits = append(waits, r.cancelPodSupervision(p))
 	}
 
-	// the VM CARVE-OUT, and it is the exact OPPOSITE of the rule above. A host
-	// pod's processes survive the daemon by design; a vm pod's helper must not —
-	// "no VM outlives the binary that booted it" (cmd/k3sm-vmhost) — because an
-	// orphaned helper holds a whole machine that nothing on the node can talk to,
-	// adopt, or stop. So every live helper is stopped here, concurrently inside
-	// the backend.
-	//
-	// The concurrency is a requirement, not a tidiness: each helper's graceful
-	// stop can spend most of vmShutdownBound, so a serial sweep blows it with two
-	// vm pods, and the launchd ExitTimeOut around it answers with SIGKILL of the
-	// daemon, stranding exactly the helpers this sweep exists to stop.
-	//
-	// The deadline below IS the exit budget the backend divides: each helper gets
-	// min(its pod's grace, vmShutdownBound - VMHelperStopMargin) plus the margin,
-	// so a pod grace up to vmShutdownBound - VMHelperStopMargin (27 s) is honoured
-	// with the whole margin behind it, and a longer one is reported cut, with a
-	// log line naming the pod, and killed at the bound if its helper is still
-	// alive. A 30 s (k8s default) pod is on the cut side of that line: its guest
-	// still gets the whole 30 s and its 2 s sync reserve inside the 35 s, but the
-	// helper's worst-case hard stop has no slack left before the kill. A pod
-	// DELETION is not bounded by this: it honours the pod's grace up to the guest
-	// agent's ceiling.
-	//
-	// It runs even with no registered pods: the pod registry and the backend's
-	// handle map are different records, and a helper whose CreatePod failed to
-	// register is precisely the one worth catching.
-	stopCtx, cancelStop := context.WithTimeout(context.Background(), vmShutdownBound)
-	defer cancelStop()
-	vmErr := r.vmBackend.StopAllVMs(stopCtx)
-	if vmErr != nil {
-		r.log.Warn("some vm host helpers did not stop cleanly during shutdown", "err", vmErr)
-	}
+	// Let go of every vm helper without signalling one. It runs even with no
+	// registered pods: the pod registry and the backend's handle map are
+	// different records, and a helper this daemon holds must be released either
+	// way so the next daemon can lock and adopt it.
+	r.vmBackend.DetachVMs()
 	if len(pods) == 0 {
-		return vmErr
+		return nil
 	}
 
-	// Phase 2: confirm the cancels were observed.
+	// Phase 2: confirm the cancels were observed. This bound
+	// (closeGraceDuration, defaultCloseGrace) is the whole of what Close
+	// spends: an embedder's launchd ExitTimeOut owes the runtime's close this
+	// one stage and no vm stop.
 	deadline := time.Now().Add(r.closeGraceDuration())
-	errs := []error{vmErr}
+	var errs []error
 	for _, w := range waits {
 		errs = append(errs, w.await(deadline)...)
 	}
 	return errors.Join(errs...)
 }
-
-// vmShutdownBound caps the whole concurrent vm-helper stop at shutdown.
-//
-// It is sized per NODE, not per helper: the helpers stop in parallel, so a
-// shutdown's cost is one budget rather than one per pod. The backend divides it
-// explicitly (pkg/sandbox exitStopWait): a helper is given at most
-// vmShutdownBound - sandbox.VMHelperStopMargin of its pod's grace, and the margin
-// covers its own hard stop and exit. A helper still running
-// when it expires is left to the next start's orphan sweep, which is the backstop
-// that makes this a bound rather than a promise.
-//
-// It is ONE STAGE of the embedding daemon's launchd ExitTimeOut, never the whole
-// budget. Close also runs the supervision waits after this, and the daemon that
-// calls Close runs its own teardown around it — on k3sm's embedded path (the
-// server and agent daemons, which build this runtime in-process and defer Close
-// from their node exit) that is the control socket, the control-plane stop and the
-// mesh teardown, all serial, all inside one ExitTimeOut. That number is DERIVED
-// from these bounds by the embedder (k3sm pkg/install sums the named stages and
-// renders the plists), so this constant is an input to it: raising it lengthens
-// the daemon's required ExitTimeOut, and the embedder's own test and acceptance
-// gate are what notice. Do not re-size it against a remembered plist value.
-const vmShutdownBound = 35 * time.Second
 
 // supervisionWait is one pod's set of "the cancel was observed" edges: the
 // per-container reaper completions (Process.Done, closed when the reaper returns

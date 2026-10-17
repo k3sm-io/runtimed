@@ -23,30 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"k3sm.io/runtimed/pkg/sandbox"
 )
-
-// TestVMShutdownBoundHonoursTheDefaultPodGrace pins the exit path's arithmetic
-// (B712): at a daemon exit each vm helper is given at most vmShutdownBound -
-// sandbox.VMHelperStopMargin of its pod's grace with the whole margin behind it.
-// With the 35 s bound and the 8 s margin that is 27 s; a longer grace (the k8s
-// default 30 s included) is reported cut, though its guest still gets the whole
-// grace plus its 2 s sync reserve inside the bound. The helper's own default
-// grace must fit, and the exit path stays bounded: the bound is not stretched to
-// the deletion ceiling.
-func TestVMShutdownBoundHonoursTheDefaultPodGrace(t *testing.T) {
-	const neverCut = 27 * time.Second
-	if got := vmShutdownBound - sandbox.VMHelperStopMargin; got != neverCut {
-		t.Errorf("a daemon exit gives a vm helper %s of grace uncut, want the documented %s; update the close.go comment with the numbers", got, neverCut)
-	}
-	if got := vmShutdownBound - sandbox.VMHelperStopMargin; got < sandbox.VMHostDefaultStopGrace {
-		t.Errorf("a daemon exit gives a vm helper %s of grace, less than the helper default %s", got, sandbox.VMHostDefaultStopGrace)
-	}
-	if vmShutdownBound >= sandbox.VMHostMaxStopGrace {
-		t.Errorf("vmShutdownBound = %s reaches the deletion ceiling %s; the exit path must stay bounded by the launchd ExitTimeOut",
-			vmShutdownBound, sandbox.VMHostMaxStopGrace)
-	}
-}
 
 // wedgedWaiter is an ExitWaiter whose reap for the named pids ignores ctx —
 // modelling a reaper that does not come back when the shutdown cancel fires (on

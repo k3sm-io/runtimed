@@ -115,7 +115,9 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	if err := b.awaitGuestReady(ctx, vp); err != nil {
 		// Every non-ready outcome kills the helper before reporting: a helper
 		// left running would hold a VM for a pod the caller is about to be told
-		// does not exist.
+		// does not exist. The helper's output is read first: the stop removes
+		// the run dir the output file lives in.
+		output := vp.helperOutput()
 		b.hardStop(vp)
 		var bootErr *VMBootError
 		if errors.As(err, &bootErr) {
@@ -125,7 +127,7 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 				"err", bootErr.Err, "helper_output", bootErr.Detail)
 			return bootErr
 		}
-		return fail(VMBootAgentNeverReady, vp.tail.String(), err)
+		return fail(VMBootAgentNeverReady, output, err)
 	}
 
 	b.mu.Lock()
@@ -179,33 +181,61 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 // backend permanently unavailable outside an installed build. Tracked separately.
 func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPath, consolePath string) (*vmProc, error) {
 	grace := clampStopGrace(spec.StopGrace)
-	tail := newLogTail(vmHelperLogTailLines)
+	runDir := filepath.Dir(spec.AgentSocketPath)
+	logPath := filepath.Join(runDir, VMHostLogName)
+	// Stamp the run dir BEFORE anything is written into it or recorded about
+	// it: it is where the helper's output file is opened below, and "a record
+	// exists" must imply "its run dir carries our marker" at every instant — the
+	// implication the startup sweep's refusal to RemoveAll an unproven dir
+	// rests on (clearOrphanRunDir). A stamp failure fails the boot before any
+	// helper exists.
+	if err := writeVMOwnerMarker(b.stateRoot, runDir, spec.PodID); err != nil {
+		return nil, err
+	}
+	// The helper's stdout and stderr are a FILE in its run dir, not a pipe this
+	// daemon reads. A pipe would tie the helper's life to the daemon's: once
+	// the daemon exits, the helper's next write gets EPIPE (and SIGPIPE) or
+	// blocks on a full pipe nobody drains, and a vm pod must outlive its daemon.
+	// The helper inherits the descriptor and bounds the file itself
+	// (-log-file, VMHostLogMaxBytes); the daemon reads its tail.
+	logf, err := openVMHostLog(logPath)
+	if err != nil {
+		_ = os.RemoveAll(runDir)
+		return nil, err
+	}
 	argv := []string{
 		helper,
 		"-spec", specPath,
 		"-agent-socket", spec.AgentSocketPath,
 		"-console-log", consolePath,
 		"-stop-grace", grace.String(),
+		"-log-file", logPath,
 	}
 	// pkg/supervisor's primitives, not a hand-rolled spawn: posix_spawn with
 	// SETSID (so the helper leads its own group and a signal reaches whatever it
 	// forked), SETSIGMASK/SETSIGDEF (so the helper does not inherit the Go
-	// runtime's blocked SIGTERM and silently ignore graceful stop), the combined
-	// stdout+stderr pipe, and the sole kqueue reaper. Re-deriving any of that
-	// here would be a second, worse answer to problems this package already
-	// solved once.
+	// runtime's blocked SIGTERM and silently ignore graceful stop), the output
+	// descriptors, and the sole kqueue reaper. Re-deriving any of that here
+	// would be a second, worse answer to problems this package already solved
+	// once.
 	proc := supervisor.NewProcess(b.spawner, b.waiter, supervisor.SpawnSpec{
 		Path: helper,
 		Argv: argv,
 		// The helper's environment is the daemon's, deliberately: it carries no
 		// pod-supplied value, and the helper reads none.
-		Env: os.Environ(),
-	}, tail.add)
-	// The supervision context is DETACHED from ctx: the reaper and the log pump
-	// must outlive the CreatePod RPC that started them — the helper runs for the
-	// pod's whole life, not the request's.
-	if err := proc.Start(context.WithoutCancel(ctx)); err != nil {
-		return nil, err
+		Env:      os.Environ(),
+		StdoutFD: logf.Fd(),
+		StderrFD: logf.Fd(),
+	}, nil)
+	// The supervision context is DETACHED from ctx: the reaper must outlive the
+	// CreatePod RPC that started it — the helper runs for the pod's whole life,
+	// not the request's.
+	startErr := proc.Start(context.WithoutCancel(ctx))
+	// The child holds its own dups of the descriptor; the daemon's copy goes.
+	_ = logf.Close()
+	if startErr != nil {
+		_ = os.RemoveAll(runDir)
+		return nil, startErr
 	}
 
 	pgid := proc.PID()
@@ -219,33 +249,34 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 	}
 	vp := &vmProc{
 		podID:         spec.PodID,
-		proc:          proc,
+		exit:          proc,
 		pgid:          pgid,
 		startUnixNano: start,
 		helperGrace:   grace,
 		agentSocket:   spec.AgentSocketPath,
-		runDir:        filepath.Dir(spec.AgentSocketPath),
+		runDir:        runDir,
 		consolePath:   consolePath,
-		tail:          tail,
-	}
-	// Stamp the run dir BEFORE the record, so "a record exists" implies "its run
-	// dir carries our marker" at every instant — the implication the startup
-	// sweep's refusal to RemoveAll an unproven dir rests on (clearOrphanRunDir).
-	// The reverse order would admit a crash window whose record named a dir no
-	// later sweep could ever prove, i.e. could ever clean up. A stamp failure
-	// fails the boot for the same reason a record failure does.
-	if err := writeVMOwnerMarker(b.stateRoot, vp.runDir, vp.podID); err != nil {
-		b.hardStop(vp)
-		return nil, err
+		logPath:       logPath,
 	}
 	// Record before readiness. A daemon SIGKILLed during a boot leaves a helper
 	// holding a live VM, and the startup sweep can only kill what a record names
 	// — so the window between spawn and record must be as close to zero as the
-	// spawn's own return allows (the stamp above is two syscalls of it, and buys
-	// the sweep the only provenance proof it has).
-	if err := b.recordVMProc(vp); err != nil {
+	// spawn's own return allows (the record carries the helper's code-directory
+	// hash, one more syscall of it, and what adoption checks).
+	recPath, err := b.recordVMProc(vp)
+	if err != nil {
 		b.hardStop(vp)
 		return nil, err
+	}
+	// Hold the record's lock for as long as this daemon owns the helper, so a
+	// second runtime over the same store can neither adopt it nor sweep it.
+	if recPath != "" {
+		lock, lerr := lockVMRecord(recPath)
+		if lerr != nil {
+			b.hardStop(vp)
+			return nil, fmt.Errorf("lock the vm reap record for pod %s: %w", spec.PodID, lerr)
+		}
+		vp.lock = lock
 	}
 	b.logger().Info("spawned the vm host helper",
 		"pod", spec.PodID, "helper", helper, "pid", pgid, "stop_grace", grace.String())
@@ -269,7 +300,7 @@ func (b *VMBackend) awaitGuestReady(ctx context.Context, vp *vmProc) error {
 	defer poll.Stop()
 
 	died := func() error {
-		return &VMBootError{PodID: vp.podID, Cause: VMBootHelperDied, Detail: vp.tail.String(),
+		return &VMBootError{PodID: vp.podID, Cause: VMBootHelperDied, Detail: vp.helperOutput(),
 			Err: errors.New("the vm host helper exited before its guest agent answered")}
 	}
 	for {
@@ -277,7 +308,7 @@ func (b *VMBackend) awaitGuestReady(ctx context.Context, vp *vmProc) error {
 		// as during the wait: a helper that died while the previous attempt was
 		// in flight must not buy another attempt's timeout.
 		select {
-		case <-vp.proc.Done():
+		case <-vp.exit.Done():
 			return died()
 		case <-ctx.Done():
 			return &VMBootError{PodID: vp.podID, Cause: VMBootCanceled, Err: ctx.Err()}
@@ -292,12 +323,12 @@ func (b *VMBackend) awaitGuestReady(ctx context.Context, vp *vmProc) error {
 		}
 
 		select {
-		case <-vp.proc.Done():
+		case <-vp.exit.Done():
 			return died()
 		case <-ctx.Done():
 			return &VMBootError{PodID: vp.podID, Cause: VMBootCanceled, Err: ctx.Err()}
 		case <-deadline.C:
-			return &VMBootError{PodID: vp.podID, Cause: VMBootAgentNeverReady, Detail: vp.tail.String(),
+			return &VMBootError{PodID: vp.podID, Cause: VMBootAgentNeverReady, Detail: vp.helperOutput(),
 				Err: fmt.Errorf("no Health response within %s; last attempt: %w", vmBootDeadline, err)}
 		case <-poll.C:
 		}

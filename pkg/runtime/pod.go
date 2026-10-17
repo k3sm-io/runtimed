@@ -149,6 +149,12 @@ type pod struct {
 	// guestPIDs is the guest pid of each vm container's last folded start: how
 	// the fold tells a replacement's start from a replayed one. Guarded by mu.
 	guestPIDs map[string]int32
+	// guestLogResume is, per container of a vm pod AttachPod adopted, the stamp
+	// of the last line the previous daemon wrote into the container's current
+	// log file: where the container's follower resumes, so output the guest
+	// still retains is not written twice. The follower takes it (and deletes
+	// it) as it starts. Guarded by mu.
+	guestLogResume map[string]time.Time
 
 	// cpuAcc carries each container's cumulative CPU across restarts so the value
 	// ListPodStats reports is monotone for the pod's whole life: a restarted

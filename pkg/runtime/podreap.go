@@ -713,11 +713,11 @@ func (r *Runtime) ReapOrphanedPods() error {
 func (r *Runtime) reapOrphanedPodsOnce() error {
 	// the VM sweep RIDES the same exactly-once-before-SERVE HOOK, and is
 	// deliberately a separate store with a separate decision (pkg/sandbox's
-	// vmReapDecision). The two policies are opposites — a host pod's processes
-	// survive a daemon restart by design, a vm pod's helper must not — so
-	// folding them into one record path would leave one mode flag between "every
-	// guest survives unowned" and "every host pod on the node is killed by a
-	// restart". It runs FIRST because an orphaned helper holds a whole machine,
+	// vmReapDecision). The policy is the same — a pod survives a daemon restart
+	// when the node re-attached it, and is killed when nothing did — and so is
+	// the ordering: AttachPod's vm branch adopts a helper (sandbox AdoptVM)
+	// before this runs, and the sweep kills every recorded helper no attach
+	// claimed. It runs FIRST because an unclaimed helper holds a whole machine,
 	// and it never fails the daemon (it degrades exactly as this reap does).
 	if err := r.vmBackend.ReapOrphanVMs(); err != nil {
 		r.log.Error("startup vm orphan sweep failed; a previous run's guests may still be running", "err", err)

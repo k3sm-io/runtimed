@@ -89,7 +89,12 @@ func appendGuestContainerStatusesLocked(st *runtimev1.PodStatus, p *pod) {
 	}
 	for _, name := range p.guestContainerOrder {
 		src := p.guestContainers[name]
-		if src == nil {
+		if src == nil || src.GetState() == nil {
+			// Not reported by the guest yet. The fold sets a state in the same
+			// hold that creates a status, so only an adopted pod's pre-seeded
+			// entries (vmattach.go: restart count and log path, before the
+			// guest's replay) are ever stateless, and they are not published
+			// until the guest says what they are.
 			continue
 		}
 		cs, _ := proto.Clone(src).(*runtimev1.ContainerStatus)

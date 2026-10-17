@@ -29,7 +29,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	guestv1 "k3sm.io/apis/guest/v1"
@@ -66,11 +65,11 @@ const vmHealthPollInterval = 50 * time.Millisecond
 // "agent never ready" instead of by its own stderr.
 const vmHealthAttemptTimeout = 2 * time.Second
 
-// vmHelperLogTailLines is how many of the helper's most recent combined-output
-// lines are retained for a boot failure's message. The helper is terse — a
-// handful of lifecycle transitions and one error — so this holds its whole
-// narrative, while bounding what a screaming helper can accumulate in daemon
-// memory per pod.
+// vmHelperLogTailLines is how many of the helper's most recent output lines a
+// boot failure's message, and a post-readiness death's, carry. The helper is
+// terse — a handful of lifecycle transitions and one error — so this holds its
+// whole narrative, while bounding what a screaming helper can put into one
+// daemon log line.
 const vmHelperLogTailLines = 32
 
 // VMBootCause names why a vm pod's guest never reached readiness.
@@ -188,14 +187,18 @@ func dialGuestHealth(ctx context.Context, agentSocket string) error {
 	return nil
 }
 
-// vmProc is one live k3sm-vmhost child: the handle the daemon stops it, watches
-// it, and reaps its record through.
+// vmProc is one live k3sm-vmhost helper: the handle the daemon stops it,
+// watches it, and retires its record through. It is the same handle whether
+// this daemon spawned the helper or adopted it after a restart (AdoptVM); only
+// the exit edge differs underneath.
 //
-// Immutable after CreateVM registers it. The one mutable thing it references is
-// the log tail, which has its own lock.
+// Immutable after CreateVM or AdoptVM registers it, except for release, which
+// runs once.
 type vmProc struct {
 	podID string
-	proc  *supervisor.Process
+	// exit is the helper's exit edge: the supervisor Process for a spawned
+	// helper (its sole kqueue reaper), adoptedExit for an adopted one.
+	exit helperExit
 	// pgid is the helper's process GROUP, which equals its pid: the supervisor
 	// spawns with POSIX_SPAWN_SETSID, so the child is a session leader. Signals
 	// go to the GROUP so a helper that forked is torn down whole.
@@ -205,7 +208,7 @@ type vmProc struct {
 	startUnixNano int64
 	// helperGrace is the budget the helper will actually honour, already clamped
 	// by the same rule the helper applies. The daemon's escalation waits this
-	// plus VMHelperStopMargin, cut only by a daemon exit's bound (exitStopWait).
+	// plus VMHelperStopMargin, cut only by StopAllVMs' bound (exitStopWait).
 	helperGrace time.Duration
 	// agentSocket / runDir / consolePath are recorded verbatim rather than
 	// re-derived at teardown: the derivations live in pkg/runtime, and a second
@@ -213,49 +216,42 @@ type vmProc struct {
 	agentSocket string
 	runDir      string
 	consolePath string
-	tail        *logTail
+	// logPath is the helper's output file (VMHostLogName in runDir).
+	logPath string
+	// lock is the exclusive flock on the helper's record (lockVMRecord), held
+	// for as long as this daemon owns the helper; nil when the record store is
+	// disabled.
+	lock *os.File
+	// stopWatch ends an adopted helper's exit watch; nil for a spawned helper.
+	stopWatch context.CancelFunc
+	// released guards release.
+	released sync.Once
 }
 
-// logTail is a bounded ring of a child's most recent output lines.
-//
-// It exists so a helper that dies before readiness can explain itself. The
-// alternative — reading the console log — answers a different question: the
-// console is the GUEST's narrative, and a helper that failed before creating the
-// machine has an empty one.
-type logTail struct {
-	mu    sync.Mutex
-	lines []string
-	max   int
+// release lets go of the helper without signalling it: the adopted exit watch
+// stops and the record lock is dropped. Idempotent.
+func (vp *vmProc) release() {
+	vp.released.Do(func() {
+		if vp.stopWatch != nil {
+			vp.stopWatch()
+		}
+		if vp.lock != nil {
+			_ = vp.lock.Close()
+		}
+	})
 }
 
-func newLogTail(max int) *logTail { return &logTail{max: max} }
-
-// add is the supervisor.LogSink over the helper's output. It ignores the stream
-// label and the CRI partial tag: this ring is a diagnostic tail for one line in
-// a daemon log, not a container log file, so a split line simply appears as two
-// entries. It never fails — dropping a helper's diagnostic must not close the
-// helper's pipe and kill the VM host mid-boot, which is what returning an error
-// from a LogSink means.
-func (l *logTail) add(_ crilog.Stream, chunk []byte, _ bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.lines = append(l.lines, string(chunk))
-	if len(l.lines) > l.max {
-		l.lines = l.lines[len(l.lines)-l.max:]
+// helperOutput renders the tail of the helper's output file, or a stated
+// absence. The absence is spelled out rather than left empty because "the
+// helper printed nothing" and "we captured nothing" look identical in a log
+// line otherwise. It exists so a helper that dies can explain itself; the
+// console log answers a different question (it is the GUEST's narrative, and a
+// helper that failed before creating the machine has an empty one).
+func (vp *vmProc) helperOutput() string {
+	if vp.logPath == "" {
+		return "(the helper's output is not recorded)"
 	}
-	return nil
-}
-
-// String renders the retained lines newline-joined, or a stated absence. The
-// absence is spelled out rather than left empty because "the helper printed
-// nothing" and "we captured nothing" look identical in a log line otherwise.
-func (l *logTail) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if len(l.lines) == 0 {
-		return "(the helper produced no output)"
-	}
-	return strings.Join(l.lines, " | ")
+	return readVMHostLogTail(vp.logPath, vmHelperLogTailLines)
 }
 
 // StopVM terminates the pod's vm host helper and releases everything the spine
@@ -290,8 +286,18 @@ func deletionStopWait(callerGrace, helperGrace time.Duration) time.Duration {
 	return max(callerGrace, helperGrace+VMHelperStopMargin)
 }
 
-// exitStopWait is the daemon's wait for one helper during a daemon exit, inside
-// exitBudget (what is left of the caller's exit bound).
+// VMHelperStopWait is how long a stopper that SIGTERMs a helper's group must
+// wait before it SIGKILLs it: the grace the helper was spawned with (the
+// record's stopGraceNanos), clamped exactly as the helper clamps it, plus
+// VMHelperStopMargin. A stopper outside this daemon — the node teardown of a
+// full stop or an uninstall, which runs once the daemon is gone — uses it so it
+// never kills a helper that is still inside its guest's graceful stop.
+func VMHelperStopWait(recordedGrace time.Duration) time.Duration {
+	return clampStopGrace(recordedGrace) + VMHelperStopMargin
+}
+
+// exitStopWait is the daemon's wait for one helper inside a bounded stop of
+// every helper (StopAllVMs), out of exitBudget (what is left of that bound).
 //
 // The helper keeps the grace it was spawned with: a SIGTERM carries no number,
 // so a pod with a long grace cannot be told to hurry. What the daemon can do is
@@ -314,7 +320,8 @@ func exitStopWait(helperGrace, exitBudget time.Duration) (wait time.Duration, cu
 // stopProc runs the SIGTERM -> wait -> SIGKILL escalation for one helper and
 // cleans up after it.
 func (b *VMBackend) stopProc(ctx context.Context, vp *vmProc, wait time.Duration) error {
-	escalated, observed, err := supervisor.GracefulStop(ctx, vp.pgid, wait, vp.proc.Done(),
+	defer vp.release()
+	escalated, observed, err := supervisor.GracefulStop(ctx, vp.pgid, wait, vp.exit.Done(),
 		vmTermSignal, vmKillSignal, b.signal, 0)
 	b.logger().Info("vm host helper stop outcome",
 		"pod", vp.podID, "pid", vp.pgid, "grace", vp.helperGrace.String(), "wait", wait.String(),
@@ -341,9 +348,10 @@ func (b *VMBackend) stopProc(ctx context.Context, vp *vmProc, wait time.Duration
 // alternative, spending a grace budget on a guest that never came up, delays the
 // pod's failure by exactly that budget for nothing.
 func (b *VMBackend) hardStop(vp *vmProc) {
+	defer vp.release()
 	ctx, cancel := context.WithTimeout(context.Background(), supervisor.DefaultExitObservationGrace)
 	defer cancel()
-	if _, _, err := supervisor.GracefulStop(ctx, vp.pgid, 0, vp.proc.Done(),
+	if _, _, err := supervisor.GracefulStop(ctx, vp.pgid, 0, vp.exit.Done(),
 		vmTermSignal, vmKillSignal, b.signal, 0); err != nil {
 		b.logger().Warn("could not kill the vm host helper after a failed boot",
 			"pod", vp.podID, "pid", vp.pgid, "err", err)
@@ -352,12 +360,29 @@ func (b *VMBackend) hardStop(vp *vmProc) {
 	b.cleanupVMRunDir(vp)
 }
 
-// StopAllVMs stops every live helper concurrently and returns the joined errors.
+// VMStopAllBound caps StopAllVMs: the whole concurrent stop of every live
+// helper. It is sized per NODE, not per helper — the helpers stop in parallel —
+// and a caller's earlier deadline wins.
 //
-// ctx's deadline IS the exit budget. The caller (pkg/runtime's Close) bounds it
-// with vmShutdownBound, one stage of the embedding daemon's launchd ExitTimeOut,
-// and each helper's wait is divided out of what is left of it (exitStopWait). A
-// ctx with no deadline stops each helper as a deletion would.
+// A DAEMON EXIT DOES NOT SPEND IT. Since vm helpers outlive the daemon (the
+// runtime's Close detaches them, AdoptVM re-attaches them), no launchd
+// ExitTimeOut has to fit a vm stop; this bound is for an explicit caller that
+// means to end every guest on the node, and it keeps such a caller bounded. A
+// helper still running when it expires keeps its record, and the next start's
+// sweep (or adoption) decides it.
+//
+// 35 s = the helper's default grace (VMHostDefaultStopGrace, 20 s) plus
+// VMHelperStopMargin (8 s), with room: a pod grace up to
+// VMStopAllBound - VMHelperStopMargin (27 s) is honoured uncut, and a longer one
+// is cut with a log line naming the pod.
+const VMStopAllBound = 35 * time.Second
+
+// StopAllVMs stops every live helper concurrently and returns the joined errors.
+// It is for an explicit caller that means to end every guest the node runs; a
+// daemon exit does not call it (see VMStopAllBound).
+//
+// The budget is VMStopAllBound, or ctx's deadline if that is earlier, and each
+// helper's wait is divided out of what is left of it (exitStopWait).
 //
 // CONCURRENCY IS required, not AN OPTIMIZATION. Each helper's graceful stop can
 // spend most of that budget, so stopping serially blows it with two vm pods —
@@ -370,6 +395,8 @@ func (b *VMBackend) hardStop(vp *vmProc) {
 // the pod happens to be shutting down alongside others. Only the exit bound cuts
 // it, and a cut is logged per pod.
 func (b *VMBackend) StopAllVMs(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, VMStopAllBound)
+	defer cancel()
 	b.mu.Lock()
 	procs := make([]*vmProc, 0, len(b.live))
 	for _, vp := range b.live {
@@ -380,20 +407,16 @@ func (b *VMBackend) StopAllVMs(ctx context.Context) error {
 	if len(procs) == 0 {
 		return nil
 	}
-	deadline, bounded := ctx.Deadline()
-	b.logger().Info("stopping every vm host helper for daemon shutdown", "helpers", len(procs))
+	deadline, _ := ctx.Deadline()
+	b.logger().Info("stopping every vm host helper", "helpers", len(procs))
 
 	errs := make([]error, len(procs))
 	var wg sync.WaitGroup
 	for i, vp := range procs {
-		wait := deletionStopWait(vp.helperGrace, vp.helperGrace)
-		if bounded {
-			var cut bool
-			wait, cut = exitStopWait(vp.helperGrace, time.Until(deadline))
-			if cut {
-				b.logger().Warn("the daemon's exit bound is shorter than this vm pod's grace; its helper will be killed at the bound",
-					"pod", vp.podID, "grace", vp.helperGrace.String(), "wait", wait.String())
-			}
+		wait, cut := exitStopWait(vp.helperGrace, time.Until(deadline))
+		if cut {
+			b.logger().Warn("the stop-all bound is shorter than this vm pod's grace; its helper will be killed at the bound",
+				"pod", vp.podID, "grace", vp.helperGrace.String(), "wait", wait.String())
 		}
 		wg.Add(1)
 		go func(i int, vp *vmProc, wait time.Duration) {
@@ -411,8 +434,9 @@ func (b *VMBackend) StopAllVMs(ctx context.Context) error {
 // It is what lets the runtime WATCH a booted guest: a hypervisor crash or a guest
 // kernel panic ends the helper, and without this edge the pod would sit at
 // Running forever with nothing on the host able to notice. The channel is the
-// supervisor's, closed by the sole kqueue reaper, so it is broadcast-safe for
-// several observers and never a second wait4.
+// helper's exit edge — the supervisor's for a spawned helper, closed by the sole
+// kqueue reaper, or the adopted watch's — so it is broadcast-safe for several
+// observers and never a second wait4.
 func (b *VMBackend) VMDone(podID string) (<-chan struct{}, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -420,12 +444,13 @@ func (b *VMBackend) VMDone(podID string) (<-chan struct{}, bool) {
 	if !ok {
 		return nil, false
 	}
-	return vp.proc.Done(), true
+	return vp.exit.Done(), true
 }
 
-// VMHelperOutput returns the retained tail of a live helper's combined output, or
-// a stated absence. It is the diagnosis for a helper that died after readiness,
-// where the pod is already Running and the boot-time error path is long gone.
+// VMHelperOutput returns the tail of a live helper's output file, or a stated
+// absence. It is the diagnosis for a helper that died after readiness, where
+// the pod is already Running and the boot-time error path is long gone, and it
+// reads the same file for a helper this daemon adopted.
 func (b *VMBackend) VMHelperOutput(podID string) string {
 	b.mu.Lock()
 	vp, ok := b.live[podID]
@@ -433,7 +458,7 @@ func (b *VMBackend) VMHelperOutput(podID string) string {
 	if !ok {
 		return "(no live vm host helper for this pod)"
 	}
-	return vp.tail.String()
+	return vp.helperOutput()
 }
 
 // cleanupVMRunDir removes the helper's runtimed-private run directory.

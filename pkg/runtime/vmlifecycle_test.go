@@ -215,11 +215,11 @@ func TestDeleteVMPodStopsTheHelper(t *testing.T) {
 	})
 }
 
-// TestCloseStopsVMHelpersButNotHostPods pins the two OPPOSITE shutdown contracts
-// in one place, because they are easy to conflate and the conflation is silent
-// either way: a host pod's processes must survive `launchctl kickstart -k`, and a
-// vm pod's helper must not ("no VM outlives the binary that booted it").
-func TestCloseStopsVMHelpersButNotHostPods(t *testing.T) {
+// TestCloseLeavesVMHelpersAndHostPodsRunning pins the one shutdown contract
+// both kinds of pod now share: a `launchctl kickstart -k` stops no workload. A
+// host pod's processes are left running, and a vm pod's helper is detached
+// (DetachVMs), never stopped, so the next daemon can adopt it.
+func TestCloseLeavesVMHelpersAndHostPodsRunning(t *testing.T) {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
 	sp := &fakeSpawner{}
 	w := newBlockingWaiter()
@@ -238,8 +238,14 @@ func TestCloseStopsVMHelpersButNotHostPods(t *testing.T) {
 
 	_ = rt.Close()
 
-	if got := vmb.stopAlls(); got != 1 {
-		t.Errorf("StopAllVMs called %d times on Close, want 1; a helper left running holds a machine nothing on the node can reach", got)
+	if got := vmb.stopAlls(); got != 0 {
+		t.Errorf("StopAllVMs called %d times on Close, want 0: a daemon exit must not stop a vm pod", got)
+	}
+	if got := len(vmb.stops()); got != 0 {
+		t.Errorf("StopVM called %d times on Close, want 0", got)
+	}
+	if got := vmb.detaches(); got != 1 {
+		t.Errorf("DetachVMs called %d times on Close, want 1: the record locks must be released for the next daemon", got)
 	}
 	sp.mu.Lock()
 	spawnedAfter := len(sp.specs)
@@ -252,11 +258,10 @@ func TestCloseStopsVMHelpersButNotHostPods(t *testing.T) {
 	}
 }
 
-// TestCloseStopsVMHelpersWithNoRegisteredPods asserts the shutdown sweep runs even
+// TestCloseDetachesVMHelpersWithNoRegisteredPods asserts the detach runs even
 // when the pod registry is empty. The registry and the backend's handle map are
-// different records, and a helper whose CreatePod failed to register is exactly
-// the one worth catching.
-func TestCloseStopsVMHelpersWithNoRegisteredPods(t *testing.T) {
+// different records, and a helper this daemon holds must be released either way.
+func TestCloseDetachesVMHelpersWithNoRegisteredPods(t *testing.T) {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
 	rt := newTestRuntime(t, Deps{
 		VMBackend: vmb,
@@ -266,8 +271,11 @@ func TestCloseStopsVMHelpersWithNoRegisteredPods(t *testing.T) {
 	if err := rt.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if got := vmb.stopAlls(); got != 1 {
-		t.Errorf("StopAllVMs called %d times with no registered pods, want 1", got)
+	if got := vmb.detaches(); got != 1 {
+		t.Errorf("DetachVMs called %d times with no registered pods, want 1", got)
+	}
+	if got := vmb.stopAlls(); got != 0 {
+		t.Errorf("StopAllVMs called %d times with no registered pods, want 0", got)
 	}
 }
 
@@ -746,8 +754,9 @@ func TestVMTeardownCancelsSupervisionBeforeStopping(t *testing.T) {
 	})
 
 	t.Run("Close", func(t *testing.T) {
-		// Same property on the shutdown path, where the cost is worse: every vm
-		// pod on the node would be published Failed on the way out.
+		// The shutdown path stops no helper at all now; what must hold is that
+		// supervision is cancelled and nothing is asked to stop, so no vm pod is
+		// published Failed on the way out and every guest keeps running.
 		vmb := &fakeVMBackend{available: true, bootOK: true}
 		rt := newTestRuntime(t, Deps{
 			VMBackend: vmb,
@@ -765,12 +774,11 @@ func TestVMTeardownCancelsSupervisionBeforeStopping(t *testing.T) {
 			cancelledAtStop = p.supCtx.Err() != nil
 		}
 		_ = rt.Close()
-		if !ran {
-			t.Fatal("StopAllVMs never reached the live helper")
+		if ran {
+			t.Fatalf("Close asked a vm helper to stop (supervision cancelled first: %v); a daemon exit must leave the guest running", cancelledAtStop)
 		}
-		if !cancelledAtStop {
-			t.Error("Close asked the helpers to stop while pod supervision was still live; " +
-				"every vm pod would be published Failed during an ordinary daemon shutdown")
+		if p.supCtx.Err() == nil {
+			t.Error("Close left the vm pod's supervision running")
 		}
 	})
 }
