@@ -1,0 +1,9 @@
+
+libwasmtime.a(wasmtime-a.o):
+0000000000001a20 T _wasmtime_component_linker_add_wasi_http
+0000000000001c40 T _wasmtime_component_linker_add_wasip2
+0000000000002000 T _wasmtime_engine_new
+0000000000003000 S _wasmtime_some_data
+
+libwasmtime.a(old.o):
+0000000000000100 T _wasm_engine_delete
