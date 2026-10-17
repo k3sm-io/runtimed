@@ -52,6 +52,15 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	}
 	r.mu.Unlock()
 
+	// A vm pod whose previous helper still runs, unowned, is not created
+	// again: that would boot a second guest for one pod and remove the pod dir
+	// the live guest shares. It is an RPC error rather than a create failure,
+	// so nothing about the pod is torn down; the next daemon start decides the
+	// helper (see ErrVMHelperUnadoptable).
+	if err := r.refuseBesideUnadoptedHelper(box); err != nil {
+		return nil, err
+	}
+
 	p, reason, err := r.createPod(ctx, box)
 	if err != nil {
 		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", err)

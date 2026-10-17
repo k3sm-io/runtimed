@@ -165,6 +165,7 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 			p.oomKilled = true
 		}
 	}
+	delete(p.guestAwaitingReplay, name)
 	if started != nil {
 		if p.guestPIDs == nil {
 			p.guestPIDs = map[string]int32{}

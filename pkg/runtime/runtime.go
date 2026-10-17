@@ -164,17 +164,21 @@ type VMBackend interface {
 	// the vm spine recorded for it. Idempotent: a pod with no live helper
 	// succeeds, which is what makes DeletePod idempotent for a vm pod too.
 	StopVM(ctx context.Context, podID string, grace time.Duration) error
-	// StopAllVMs stops every live helper concurrently, for daemon shutdown. It
-	// is on the seam rather than open-coded in Close because the fan-out and the
-	// per-helper grace belong with the handles, and because a vm pod's helper
-	// must not survive the daemon (the opposite of a host-process pod, which
-	// survives by design — see Close).
+	// StopAllVMs stops every live helper concurrently, inside its own bound
+	// (sandbox.VMStopAllBound), for an explicit caller that means to end every
+	// guest on the node. A daemon exit does not call it: vm helpers survive the
+	// daemon, as host-process pods do (see Close).
 	StopAllVMs(ctx context.Context) error
-	// ReapOrphanVMs kills every helper a previous daemon run left behind, before
-	// this one serves CreatePod. A SETSID helper reparents to launchd when the
-	// daemon is `kill -9`ed, and an orphaned one cannot be adopted — there is no
-	// way to re-establish the readiness handshake with a running guest — so the
-	// sweep always kills.
+	// AdoptVM takes ownership of the pod's helper a previous daemon run left
+	// running, when it is provably that exact, compatible helper; any refusal
+	// wraps sandbox.ErrVMNotAdopted and leaves the helper to ReapOrphanVMs.
+	// AttachPod's vm branch calls it.
+	AdoptVM(ctx context.Context, podID string) error
+	// DetachVMs lets go of every live helper without signalling one, for a
+	// daemon exit: the helpers keep running for the next daemon to adopt.
+	DetachVMs()
+	// ReapOrphanVMs kills every helper a previous daemon run left behind that
+	// no AdoptVM claimed, before this one serves CreatePod.
 	ReapOrphanVMs() error
 	// VMDone returns the edge closed when the pod's helper exits, and whether
 	// the pod has a live helper. It is what lets the runtime notice a post-boot
@@ -458,6 +462,10 @@ type Runtime struct {
 	// under the same lock and refuses once it is set: an attach that lost that
 	// race would install a pod whose process group the reap is about to kill.
 	podReapStarted bool
+	// vmSweepDeferred and vmSweepDeferReason are set, under mu, by DeferVMSweep:
+	// the startup reap then leaves vm host helpers running.
+	vmSweepDeferred    bool
+	vmSweepDeferReason string
 }
 
 // NetworkReconciler is the OPTIONAL startup-reconcile seam a Deps.Network may

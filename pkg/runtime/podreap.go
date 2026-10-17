@@ -679,6 +679,19 @@ func leaderGone(rec podProcRecord, procGroup procGroupInspector) bool {
 	return !found
 }
 
+// DeferVMSweep tells the next ReapOrphanedPods to leave the vm host helpers a
+// previous daemon run left behind running instead of killing the ones no
+// attach claimed. The node calls it when it could not read which pods are
+// bound to it (the apiserver did not answer the startup list): an unclaimed
+// helper may then be a running pod's, and killing it would be a hard stop of a
+// pod nothing decided to stop. Native pods are unaffected, as is every later
+// start. It must be called before ReapOrphanedPods to have any effect.
+func (r *Runtime) DeferVMSweep(reason string) {
+	r.mu.Lock()
+	r.vmSweepDeferred, r.vmSweepDeferReason = true, reason
+	r.mu.Unlock()
+}
+
 // ReapOrphanedPods reaps pod process groups recorded by a previous daemon run,
 // exactly once per Runtime, before CreatePod is served (a sibling of the network
 // startup reconcile). Unlike that reconcile it degrades rather than fails
@@ -713,13 +726,24 @@ func (r *Runtime) ReapOrphanedPods() error {
 func (r *Runtime) reapOrphanedPodsOnce() error {
 	// the VM sweep RIDES the same exactly-once-before-SERVE HOOK, and is
 	// deliberately a separate store with a separate decision (pkg/sandbox's
-	// vmReapDecision). The two policies are opposites — a host pod's processes
-	// survive a daemon restart by design, a vm pod's helper must not — so
-	// folding them into one record path would leave one mode flag between "every
-	// guest survives unowned" and "every host pod on the node is killed by a
-	// restart". It runs FIRST because an orphaned helper holds a whole machine,
+	// vmReapDecision). The policy is the same — a pod survives a daemon restart
+	// when the node re-attached it, and is killed when nothing did — and so is
+	// the ordering: AttachPod's vm branch adopts a helper (sandbox AdoptVM)
+	// before this runs, and the sweep kills every recorded helper no attach
+	// claimed. It runs FIRST because an unclaimed helper holds a whole machine,
 	// and it never fails the daemon (it degrades exactly as this reap does).
-	if err := r.vmBackend.ReapOrphanVMs(); err != nil {
+	r.mu.Lock()
+	deferVM, deferReason := r.vmSweepDeferred, r.vmSweepDeferReason
+	r.mu.Unlock()
+	if deferVM {
+		// The caller could not tell which vm pods still exist (DeferVMSweep), so
+		// a helper nothing attached may be a running pod's. None is killed: the
+		// helpers stay detached for the next start, and CreatePod refuses a pod
+		// whose helper still runs (ErrVMHelperUnadoptable) rather than boot a
+		// second guest beside it.
+		r.log.Warn("startup vm orphan sweep deferred: vm host helpers left by the previous run are kept running for the next start",
+			"reason", deferReason)
+	} else if err := r.vmBackend.ReapOrphanVMs(); err != nil {
 		r.log.Error("startup vm orphan sweep failed; a previous run's guests may still be running", "err", err)
 	}
 

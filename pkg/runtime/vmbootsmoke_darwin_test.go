@@ -512,6 +512,128 @@ func TestVMBootSmokeDaemonHelperProcess(t *testing.T) {
 	os.Exit(2)
 }
 
+// smokeRestartEnv marks the re-executed child that plays the daemon in leg 4.
+// Its value is the mode: the child closes its runtime cleanly and exits, as a
+// `launchctl kickstart -k` of the daemon does.
+const smokeRestartEnv = "K3SM_VM_SMOKE_RESTART_DAEMON"
+
+// TestIntegrationVMBootSmokeDaemonRestart is leg 4: a daemon that exits through
+// Close leaves its vm pod's helper running, and the next daemon re-attaches it
+// (AttachPod adopts the same helper pid, the guest still answers Health over
+// the new daemon's dialer, and the startup sweep spares it); the pod then
+// deletes as any pod does.
+//
+// The first daemon is a subprocess for the same reason leg 3's is: what is
+// under test is what outlives the process that spawned the helper. Unlike leg
+// 3, that process exits through the runtime's own Close, which is the path a
+// daemon restart takes, and the adoption it sets up is checked against the real
+// helper: its code-directory hash, its control socket and its boot session.
+func TestIntegrationVMBootSmokeDaemonRestart(t *testing.T) {
+	k3smtest.SkipUnless(t, k3smtest.VZ)
+	helper := buildSignedVMHost(t)
+	requireEntitledHelper(t, helper)
+	artifacts, kernel := smokeArtifacts(t)
+
+	root := smokeRoot(t)
+	const podID = "smoke-restart"
+	t.Cleanup(func() { killSmokeHelpers(t, root, podID) })
+
+	child := exec.Command(os.Args[0], "-test.run", "^TestVMBootSmokeRestartDaemonProcess$", "-test.v")
+	child.Env = append(os.Environ(),
+		smokeRestartEnv+"=1",
+		"K3SM_VM_SMOKE_ROOT="+root,
+		"K3SM_VM_SMOKE_POD="+podID,
+		"K3SM_VM_SMOKE_HELPER="+helper,
+		envSmokeKernel+"="+kernel,
+	)
+	out, err := child.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "SMOKE_RESTART_CLOSED") {
+		t.Fatalf("the first daemon did not boot its pod and close cleanly: %v\n%s", err, out)
+	}
+	podIP := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		if _, after, ok := strings.Cut(line, "SMOKE_RESTART_CLOSED ip="); ok {
+			podIP = strings.TrimSpace(after)
+		}
+	}
+	if podIP == "" {
+		t.Fatalf("the first daemon reported no pod IP:\n%s", out)
+	}
+	pids := smokeHelperPIDs(t, root, podID)
+	if len(pids) != 1 {
+		t.Fatalf("found %d live helpers for %s after the first daemon closed, want exactly 1 (Close must not stop a vm helper)", len(pids), podID)
+	}
+	kept := pids[0]
+	t.Logf("SMOKE leg 4: the first daemon closed; helper pid %d kept running", kept)
+
+	ctx, cancel := context.WithTimeout(context.Background(), smokeBootBudget)
+	defer cancel()
+	fresh := newSmokeRuntime(t, root, helper, artifacts)
+	box := vmPodBox(fresh, podID, 5)
+	box.PodIp = podIP
+	st, err := fresh.AttachPod(ctx, box)
+	if err != nil {
+		t.Fatalf("AttachPod did not adopt the running helper: %v", err)
+	}
+	if st.GetPhase() != runtimev1.PodPhase_POD_PHASE_RUNNING {
+		t.Fatalf("attached phase = %v, want RUNNING", st.GetPhase())
+	}
+	if err := fresh.ReapOrphanedPods(); err != nil {
+		t.Fatalf("ReapOrphanedPods: %v", err)
+	}
+	if got := smokeHelperPIDs(t, root, podID); len(got) != 1 || got[0] != kept {
+		t.Fatalf("helpers after attach and sweep = %v, want exactly the adopted pid %d", got, kept)
+	}
+
+	conn, err := fresh.dialGuest(podID)
+	if err != nil {
+		t.Fatalf("dialGuest after the restart: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	hctx, hcancel := context.WithTimeout(ctx, 10*time.Second)
+	defer hcancel()
+	health, err := guestv1.NewGuestAgentClient(conn).Health(hctx, &guestv1.HealthRequest{})
+	if err != nil || !health.GetReady() {
+		t.Fatalf("the adopted guest does not answer Health ready: ready=%v err=%v", health.GetReady(), err)
+	}
+	t.Logf("SMOKE leg 4: helper pid %d adopted, survived the sweep, guest ready", kept)
+
+	if _, err := fresh.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: podID}); err != nil {
+		t.Fatalf("DeletePod of the adopted pod: %v", err)
+	}
+	if alive := waitPIDGone(kept, 30*time.Second); alive {
+		t.Errorf("adopted helper pid %d is still alive after DeletePod", kept)
+	}
+	t.Logf("SMOKE leg 4 OK: the adopted helper stopped on deletion")
+}
+
+// TestVMBootSmokeRestartDaemonProcess is not a test. It is the first daemon of
+// leg 4, run only in the re-executed child: it boots the pod, closes the
+// runtime the way a daemon exit does, reports the pod IP, and exits.
+func TestVMBootSmokeRestartDaemonProcess(t *testing.T) {
+	if os.Getenv(smokeRestartEnv) != "1" {
+		t.Skip("not the restart daemon subprocess")
+	}
+	root, podID, helper := os.Getenv("K3SM_VM_SMOKE_ROOT"), os.Getenv("K3SM_VM_SMOKE_POD"), os.Getenv("K3SM_VM_SMOKE_HELPER")
+	artifacts, _ := smokeArtifacts(t)
+	rt := newSmokeRuntime(t, root, helper, artifacts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), smokeBootBudget)
+	defer cancel()
+	resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: vmPodBox(rt, podID, 5)})
+	if err != nil || resp.GetError() != nil {
+		fmt.Printf("SMOKE_RESTART_FAILED err=%v resp=%v\n", err, resp.GetError())
+		os.Exit(1)
+	}
+	if err := rt.Close(); err != nil {
+		fmt.Printf("SMOKE_RESTART_FAILED close=%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("SMOKE_RESTART_CLOSED ip=%s\n", resp.GetStatus().GetPodIp())
+	_ = os.Stdout.Sync()
+	os.Exit(0)
+}
+
 // --- lab helpers ------------------------------------------------------------
 
 // smokeRoot returns a short state root, not t.TempDir().

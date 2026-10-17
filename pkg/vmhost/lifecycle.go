@@ -120,12 +120,13 @@ const DefaultStopGrace = 20 * time.Second
 //     to this ceiling, and the daemon waits that grace plus a fixed margin
 //     (pkg/sandbox VMHelperStopMargin) before it SIGKILLs the helper, so the
 //     helper's own hard stop and clean exit always come first.
-//   - A daemon exit (runtime Close -> StopAllVMs) is bounded by the runtime's
-//     vmShutdownBound, which is one stage of the embedding daemon's launchd
-//     ExitTimeOut. The daemon divides that bound itself and SIGKILLs a helper
-//     whose pod grace does not fit, logging the cut; the helper cannot be told a
-//     shorter budget after it was spawned, so it never reasons about the exit
-//     path.
+//   - A bounded stop of every helper (StopAllVMs, for a caller that means to
+//     end every guest on the node) is capped by pkg/sandbox VMStopAllBound. The
+//     daemon divides that bound itself and SIGKILLs a helper whose pod grace
+//     does not fit, logging the cut; the helper cannot be told a shorter budget
+//     after it was spawned, so it never reasons about that path. A daemon exit
+//     is NOT a caller: the helper outlives the daemon and the next one adopts
+//     it (pkg/sandbox AdoptVM) or kills it.
 //
 // A caller asking for more than this is clamped and told.
 const MaxStopGrace = 300 * time.Second

@@ -25,7 +25,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -41,20 +44,17 @@ import (
 // shape as the orphaned host-process pod groups pkg/runtime's podreap handles,
 // and it is TEMPTING to reuse that decision function. Doing so would be a bug.
 //
-// the POLICIES are OPPOSITES. podreap exists inside a promise that native pod
-// processes survive a daemon restart by design — `launchctl kickstart -k` must
-// not kill the node's workloads — so it reaps only records whose pods are gone.
-// A vm pod's helper carries the opposite contract, stated in cmd/k3sm-vmhost's
-// own doc: "no VM outlives the binary that booted it". An orphaned helper cannot
-// be adopted — the daemon has no handle on its Process, no log pump, no reaper,
-// and no way to re-establish the readiness handshake — so the only correct action
-// is to kill it. always KILL, never ADOPT.
-//
-// Sharing a decision function between two opposite policies would mean one
-// function with a mode flag, and the day someone "simplifies" the flag away, one
-// of the two policies silently becomes the other: either every vm pod's guest
-// survives a daemon restart unowned, or every host pod on the node is killed by a
-// restart. Two stores, two decisions, no shared mode.
+// the POLICY is now the same as podreap's — a vm pod's helper survives a daemon
+// restart, as a native pod's processes do — but the DECISION stays separate.
+// Ownership is split the way pkg/runtime splits it for native pods: the node
+// asks the runtime to attach each pod it still has (AdoptVM, behind the
+// runtime's AttachPod) BEFORE this sweep runs, adoption is decided by its own
+// fail-closed predicate (vmAdoptDecision), and this sweep only classifies the
+// records and kills every helper no attach claimed. A helper is therefore
+// adopted or killed, never left running unowned. Keeping the kill decision free
+// of any adopt mode is deliberate: one function with a mode flag is one
+// "simplification" away from a sweep that keeps every helper, or one that kills
+// the adopted ones.
 //
 // what IS deliberately shared IS the IDENTITY DISCIPLINE. A record authorizes a
 // root SIGKILL of a process group, so it is matched exactly as podreap matches:
@@ -100,8 +100,16 @@ const VMReapSubdir = "vmreap"
 // recursive delete; a flat, integer-named store has no traversal question to get
 // wrong. The paths it carries were validated by the caller that created them and
 // are stored verbatim, so the sweep re-derives nothing.
+//
+// The identity fields (podId, pgid, startUnixNano) are read by every schema
+// and by the node's teardown outside this daemon; the rest arrived with
+// schema 1 and are what adoption checks (vmAdoptDecision). A record without a
+// schema is one an earlier build wrote: still swept, never adopted.
 type vmProcRecord struct {
-	PodID string `json:"podId"`
+	// Schema is vmRecordSchema for a record this build wrote; 0 for an
+	// earlier build's.
+	Schema int    `json:"schema,omitempty"`
+	PodID  string `json:"podId"`
 	// Pgid is the helper's process-group id (== its pid under SETSID).
 	Pgid int `json:"pgid"`
 	// StartUnixNano is the leader's kernel start time: the exact-instance
@@ -113,6 +121,23 @@ type vmProcRecord struct {
 	// layout that belongs to another package.
 	AgentSocket string `json:"agentSocket"`
 	RunDir      string `json:"runDir"`
+	// ConsolePath is the guest console log the helper writes.
+	ConsolePath string `json:"consolePath,omitempty"`
+	// StopGraceNanos is the grace the helper was spawned with, already
+	// clamped: what an adopting daemon's stop, and the node teardown's, must
+	// honour (VMHelperStopWait).
+	StopGraceNanos int64 `json:"stopGraceNanos,omitempty"`
+	// HelperCDHash is the running helper's code-directory hash, read from the
+	// kernel just after the spawn; empty when it could not be read, which makes
+	// the helper unadoptable.
+	HelperCDHash string `json:"helperCdhash,omitempty"`
+	// HelperProtocol is the VMHostProtocolVersion the spawning daemon spoke.
+	HelperProtocol int `json:"helperProtocol,omitempty"`
+	// RuntimeVersion names the daemon build that spawned the helper
+	// ("cdhash:<hex>", as podreap records it).
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	// BootSession is kern.bootsessionuuid at the spawn.
+	BootSession string `json:"bootSession,omitempty"`
 
 	// path is the file this record was READ from, filled by the enumerator and
 	// never serialized. The sweep retires a record by that path rather than by
@@ -145,43 +170,51 @@ func (b *VMBackend) vmReapRoot() string {
 	return filepath.Join(b.stateRoot, VMReapSubdir)
 }
 
-// recordVMProc durably records a just-spawned helper.
+// recordVMProc durably records a just-spawned helper and returns the record's
+// path ("" when the store is disabled).
 //
 // A write failure fails the boot. An unrecorded helper is invisible to the
 // startup sweep, which is the whole orphan class this file closes — so a pod that
 // cannot be recorded is a pod whose guest could outlive the daemon unnoticed, and
 // refusing it is the fail-closed answer. (A backend with no state root records
 // nothing and says so once at construction; see WithStateRoot.)
-func (b *VMBackend) recordVMProc(vp *vmProc) error {
+func (b *VMBackend) recordVMProc(vp *vmProc) (string, error) {
 	root := b.vmReapRoot()
 	if root == "" {
-		return nil
+		return "", nil
 	}
 	if vp.pgid <= 1 {
-		return fmt.Errorf("refusing to record vm helper for pod %s with pgid %d (must be > 1)", vp.podID, vp.pgid)
+		return "", fmt.Errorf("refusing to record vm helper for pod %s with pgid %d (must be > 1)", vp.podID, vp.pgid)
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return fmt.Errorf("create the vm reap store %s: %w", root, err)
+		return "", fmt.Errorf("create the vm reap store %s: %w", root, err)
 	}
 	data, err := json.Marshal(vmProcRecord{
-		PodID:         vp.podID,
-		Pgid:          vp.pgid,
-		StartUnixNano: vp.startUnixNano,
-		AgentSocket:   vp.agentSocket,
-		RunDir:        vp.runDir,
+		Schema:         vmRecordSchema,
+		PodID:          vp.podID,
+		Pgid:           vp.pgid,
+		StartUnixNano:  vp.startUnixNano,
+		AgentSocket:    vp.agentSocket,
+		RunDir:         vp.runDir,
+		ConsolePath:    vp.consolePath,
+		StopGraceNanos: int64(vp.helperGrace),
+		HelperCDHash:   b.helperCDHash(vp.pgid),
+		HelperProtocol: VMHostProtocolVersion,
+		RuntimeVersion: b.runtimeVersion(),
+		BootSession:    b.currentBootSession(),
 	})
 	if err != nil {
-		return fmt.Errorf("marshal the vm reap record for pod %s: %w", vp.podID, err)
+		return "", fmt.Errorf("marshal the vm reap record for pod %s: %w", vp.podID, err)
 	}
 	final := filepath.Join(root, strconv.Itoa(vp.pgid)+".json")
 	tmp := final + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write the vm reap record for pod %s: %w", vp.podID, err)
+		return "", fmt.Errorf("write the vm reap record for pod %s: %w", vp.podID, err)
 	}
 	if err := os.Rename(tmp, final); err != nil {
-		return fmt.Errorf("commit the vm reap record for pod %s: %w", vp.podID, err)
+		return "", fmt.Errorf("commit the vm reap record for pod %s: %w", vp.podID, err)
 	}
-	return nil
+	return final, nil
 }
 
 // removeVMProcRecord drops a LIVE helper's record once its exit has been
@@ -259,9 +292,9 @@ func (b *VMBackend) listVMProcRecords() (records []vmProcRecord, quarantine []st
 //     never blindly signalled, never dropped;
 //   - an empty group is dropped: there is nothing left to kill;
 //   - a group whose LEADER member (Pid == pgid) reports the recorded start time
-//     exactly is an orphaned helper of ours: KILLED. Unconditionally — a live
-//     VM cannot be re-handshaked, so there is no adopt branch and must never be
-//     one (see the file header);
+//     exactly is a helper of ours: KILLED, unless an attach adopted it before
+//     the sweep began (ReapOrphanVMs skips those; the decision itself has no
+//     adopt branch, see the file header);
 //   - a leader whose start DIFFERS is a recycled pgid: dropped, never signalled;
 //   - a non-empty group with NO leader member (the helper exited, a descendant
 //     keeps the group alive) is keep-and-warn — we cannot prove the group is
@@ -311,9 +344,14 @@ func vmLeaderMember(members []supervisor.ProcMember, pgid int) (supervisor.ProcM
 	return supervisor.ProcMember{}, false
 }
 
-// ReapOrphanVMs kills every vm host helper recorded by a previous daemon run and
-// clears the run dirs they left behind. It is called once, before the runtime
-// serves CreatePod.
+// ReapOrphanVMs kills every vm host helper recorded by a previous daemon run
+// that no attach adopted (AdoptVM), and clears the run dirs they left behind.
+// It is called once, before the runtime serves CreatePod, and after the node
+// has attached the pods it still has. From the moment it begins, AdoptVM
+// refuses. A helper adopted before that is skipped, and so is its run dir.
+//
+// Each kill is logged with the helper's pid, its start time and why it was
+// not adopted: the refusal AdoptVM recorded, or that no attach claimed it.
 //
 // Kills are SIGKILL to the whole group with NO grace, and that is the honest
 // choice rather than a harsh one: the graceful path runs inside the helper (ask
@@ -332,6 +370,18 @@ func vmLeaderMember(members []supervisor.ProcMember, pgid int) (supervisor.ProcM
 // a killed helper whose dir is unproven is still killed, and only its record
 // survives.
 func (b *VMBackend) ReapOrphanVMs() error {
+	b.mu.Lock()
+	b.sweepStarted = true
+	claimed := make(map[int]bool, len(b.live))
+	for _, vp := range b.live {
+		claimed[vp.pgid] = true
+	}
+	refusals := make(map[int]string, len(b.refusals))
+	for pgid, reason := range b.refusals {
+		refusals[pgid] = reason
+	}
+	b.mu.Unlock()
+
 	records, quarantine, err := b.listVMProcRecords()
 	if err != nil {
 		b.logger().Error("vm orphan sweep skipped: the reap store is unreadable, so a previous run's guests may still be running",
@@ -340,37 +390,33 @@ func (b *VMBackend) ReapOrphanVMs() error {
 	}
 	kill, drop, keepWarn := vmReapDecision(records, b.procGroup)
 
+	killed, held := 0, 0
+	reasons := map[string]int{}
 	for _, rec := range kill {
-		// Pre-signal re-probe, shrinking the decision->kill TOCTOU window to one
-		// syscall: between the decision and the signal the leader could exit and
-		// the pgid be recycled, and an ESRCH seen after the signal cannot tell
-		// "already gone" from "recycled to an unrelated group".
-		if !b.groupIsRecordedVMInstance(rec) {
-			b.logger().Warn("vm orphan sweep: skipping kill, the group no longer matches the recorded instance",
-				"pod", rec.PodID, "pgid", rec.Pgid)
-			continue
+		if claimed[rec.Pgid] {
+			continue // adopted: the helper is live and owned, and so is its record
 		}
-		b.logger().Info("killing an orphaned vm host helper left by a previous daemon run",
-			"pod", rec.PodID, "pgid", rec.Pgid)
-		if serr := b.signal(rec.Pgid, vmKillSignal); serr != nil {
-			// Fail-OPEN: an un-killable orphan (EPERM under a changed posture)
-			// must not brick the daemon. Keep the record and retry next start.
-			b.logger().Warn("could not kill an orphaned vm host helper",
-				"pod", rec.PodID, "pgid", rec.Pgid, "err", serr)
-			continue
+		reason := refusals[rec.Pgid]
+		if reason == "" {
+			reason = "no attach claimed it"
 		}
-		// Clear FIRST and retire only on the clear's verdict: the record is the
-		// only pointer to the run dir, so one retired beside a dir the sweep
-		// refused to delete would leak that dir with nothing left to name it.
-		if b.clearOrphanRunDir(rec) {
-			b.retireVMProcRecord(rec)
+		switch b.killUnclaimed(rec, reason) {
+		case sweepKilled:
+			killed++
+			reasons[reason]++
+		case sweepHeld:
+			held++
 		}
 	}
+	b.logger().Info(vmAdoptionSummary(len(claimed), killed, held, reasons))
 	for _, rec := range keepWarn {
 		b.logger().Warn("orphaned vm host helper leaked: its leader is gone but the group is alive via a descendant (kept, not killed; re-warns each start)",
 			"pod", rec.PodID, "pgid", rec.Pgid)
 	}
 	for _, rec := range drop {
+		if claimed[rec.Pgid] {
+			continue
+		}
 		if b.clearOrphanRunDir(rec) {
 			b.retireVMProcRecord(rec)
 		}
@@ -382,8 +428,94 @@ func (b *VMBackend) ReapOrphanVMs() error {
 	return nil
 }
 
+// sweepOutcome is what killUnclaimed did with one helper.
+type sweepOutcome int
+
+const (
+	// sweepKilled: the helper was sent SIGKILL.
+	sweepKilled sweepOutcome = iota
+	// sweepHeld: another holder kept the record lock past vmRecordLockRetry;
+	// the helper was left running and its record kept.
+	sweepHeld
+	// sweepSkipped: the group no longer matched, or the signal failed.
+	sweepSkipped
+)
+
+// vmAdoptionSummary renders the one startup line that accounts for every
+// helper a previous daemon left: how many were adopted, how many killed and
+// why, and how many were left running because another holder had them.
+func vmAdoptionSummary(adopted, killed, held int, reasons map[string]int) string {
+	parts := make([]string, 0, len(reasons))
+	for r, n := range reasons {
+		parts = append(parts, fmt.Sprintf("%d: %s", n, r))
+	}
+	slices.Sort(parts)
+	msg := fmt.Sprintf("vm adoption: adopted %d, killed %d", adopted, killed)
+	if len(parts) > 0 {
+		msg += " (reasons " + strings.Join(parts, "; ") + ")"
+	}
+	if held > 0 {
+		msg += fmt.Sprintf(", left %d held by another runtime", held)
+	}
+	return msg
+}
+
+// killUnclaimed SIGKILLs one recorded helper no attach adopted, clears its run
+// dir and retires its record, and says what it did. reason is AdoptVM's
+// refusal, or that no attach claimed it.
+func (b *VMBackend) killUnclaimed(rec vmProcRecord, reason string) sweepOutcome {
+	// The record lock is the cross-runtime claim: a helper whose record another
+	// holder has locked is not this sweep's to kill. The holder may be letting
+	// go (a runtime closing), so the lock is retried for vmRecordLockRetry.
+	// Past that the sweep STANDS DOWN, loudly: the helper keeps running, the
+	// record stays, and CreateVM refuses the pod while it runs
+	// (UnadoptedHelper), so the pod is never booted twice. Any other lock
+	// failure is not a claim and does not stop the kill (fail-open, as before
+	// the lock existed).
+	lock, lerr := lockVMRecord(rec.path)
+	for deadline := time.Now().Add(vmRecordLockRetry); errors.Is(lerr, unix.EWOULDBLOCK) && time.Now().Before(deadline); {
+		time.Sleep(vmRecordLockRetryStep)
+		lock, lerr = lockVMRecord(rec.path)
+	}
+	if errors.Is(lerr, unix.EWOULDBLOCK) {
+		b.logger().Warn("vm orphan sweep: a live vm host helper's record is held by another runtime; it is neither adopted nor killed here, its record is kept, and its pod will not be created beside it",
+			"pod", rec.PodID, "pid", rec.Pgid, "waited", vmRecordLockRetry)
+		return sweepHeld
+	}
+	if lock != nil {
+		defer func() { _ = lock.Close() }()
+	}
+	// Pre-signal re-probe, shrinking the decision->kill TOCTOU window to one
+	// syscall: between the decision and the signal the leader could exit and
+	// the pgid be recycled, and an ESRCH seen after the signal cannot tell
+	// "already gone" from "recycled to an unrelated group".
+	if !b.groupIsRecordedVMInstance(rec) {
+		b.logger().Warn("vm orphan sweep: skipping kill, the group no longer matches the recorded instance",
+			"pod", rec.PodID, "pgid", rec.Pgid)
+		return sweepSkipped
+	}
+	b.logger().Info("killing a vm host helper left by a previous daemon run (not adopted)",
+		"pod", rec.PodID, "pid", rec.Pgid, "start_unix_nano", rec.StartUnixNano, "reason", reason)
+	if serr := b.signal(rec.Pgid, vmKillSignal); serr != nil {
+		// Fail-OPEN: an un-killable orphan (EPERM under a changed posture)
+		// must not brick the daemon. Keep the record and retry next start.
+		b.logger().Warn("could not kill an orphaned vm host helper",
+			"pod", rec.PodID, "pgid", rec.Pgid, "err", serr)
+		return sweepSkipped
+	}
+	// Clear FIRST and retire only on the clear's verdict: the record is the
+	// only pointer to the run dir, so one retired beside a dir the sweep
+	// refused to delete would leak that dir with nothing left to name it.
+	if b.clearOrphanRunDir(rec) {
+		b.retireVMProcRecord(rec)
+	}
+	return sweepKilled
+}
+
 // groupIsRecordedVMInstance re-probes rec's group immediately before the signal
-// and reports whether its leader still matches the record exactly.
+// and reports whether its leader still matches the record exactly. It is also
+// adoption's identity element (vmAdoptDecision) and the check an adopted
+// helper's exit watch runs once armed: one predicate for every use.
 func (b *VMBackend) groupIsRecordedVMInstance(rec vmProcRecord) bool {
 	members, ok := b.procGroup(rec.Pgid)
 	if !ok || len(members) == 0 {
@@ -570,6 +702,12 @@ func (b *VMBackend) clearOrphanRunDir(rec vmProcRecord) (retire bool) {
 	}
 	if _, err := os.Stat(clean); errors.Is(err, fs.ErrNotExist) {
 		return true // already gone: nothing to prove, nothing to delete
+	}
+	if b.runDirInUse(clean) {
+		// A live helper this daemon owns (spawned, or adopted from the same
+		// pod's newer record) runs out of this dir. The record being retired is
+		// an older instance's; the dir is not its to take.
+		return true
 	}
 	if !vmRunDirIsOwnedBy(clean, rec.PodID) {
 		b.logger().Warn("orphaned vm pod run dir has unproven provenance, left in place, record kept (re-warns each start)",
