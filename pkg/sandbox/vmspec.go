@@ -92,13 +92,34 @@ const VMAgentVsockPort uint32 = 1024
 // -stop-grace flag exists to remove. Computing the clamp host-side is what makes
 // the daemon's wait provably >= the helper's.
 //
+// The ceiling is the guest agent's own (300 s), so a pod's
+// terminationGracePeriodSeconds reaches the guest intact on a deletion. A daemon
+// exit does not get that long: StopAllVMs divides the exit bound it is handed and
+// cuts, with a log line, any helper whose grace does not fit.
+//
 // The pairing is pinned by a TEST that may import both
 // (pkg/vmhost.TestStopGraceBoundsAreSingleValued), exactly as the Rosetta
 // constant's is.
 const (
 	VMHostDefaultStopGrace = 20 * time.Second
-	VMHostMaxStopGrace     = 30 * time.Second
+	VMHostMaxStopGrace     = 300 * time.Second
 )
+
+// VMHelperStopMargin is how long past the helper's own grace the daemon waits
+// before it SIGKILLs the helper's process group.
+//
+// The helper's clock and the daemon's wait both start at the same SIGTERM, and
+// when the guest uses its whole grace the helper still has work to do after it
+// runs out: leave the guest its sync-and-poweroff reserve (pkg/vmhost
+// GuestStopReserve, 2 s), halt the machine (HardStopBound, 3 s), drain its proxy
+// and exit. The grace it sends the guest is also rounded to whole seconds (up to
+// half a second more, or up to one when a sub-second grace is floored to one).
+// 8 s covers 2 + 3 + 1 with room for the exit, and
+// pkg/vmhost.TestStopGraceBoundsAreSingleValued pins that sum below it. A daemon
+// that waited exactly the grace killed the helper in the middle of that every
+// time, so a slow guest read as escalated=true; with the margin, escalation means
+// a helper that is stuck, which is the case the SIGKILL exists for.
+const VMHelperStopMargin = 8 * time.Second
 
 // GuestArtifacts are the pinned Linux guest boot artifacts a vm pod boots from:
 // the kernel, the initramfs carrying the guest init, and the kernel command line

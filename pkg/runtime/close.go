@@ -106,10 +106,20 @@ func (r *Runtime) Close() error {
 	// the backend.
 	//
 	// The concurrency is a requirement, not a tidiness: each helper's graceful
-	// stop can spend up to the vm host's 30-second ceiling, and launchd gives the
-	// daemon 45 seconds total, so a serial sweep blows the ExitTimeOut with two vm
-	// pods — and launchd's answer to a blown timeout is SIGKILL of the daemon,
-	// stranding exactly the helpers this sweep exists to stop.
+	// stop can spend most of vmShutdownBound, so a serial sweep blows it with two
+	// vm pods, and the launchd ExitTimeOut around it answers with SIGKILL of the
+	// daemon, stranding exactly the helpers this sweep exists to stop.
+	//
+	// The deadline below IS the exit budget the backend divides: each helper gets
+	// min(its pod's grace, vmShutdownBound - VMHelperStopMargin) plus the margin,
+	// so a pod grace up to vmShutdownBound - VMHelperStopMargin (27 s) is honoured
+	// with the whole margin behind it, and a longer one is reported cut, with a
+	// log line naming the pod, and killed at the bound if its helper is still
+	// alive. A 30 s (k8s default) pod is on the cut side of that line: its guest
+	// still gets the whole 30 s and its 2 s sync reserve inside the 35 s, but the
+	// helper's worst-case hard stop has no slack left before the kill. A pod
+	// DELETION is not bounded by this: it honours the pod's grace up to the guest
+	// agent's ceiling.
 	//
 	// It runs even with no registered pods: the pod registry and the backend's
 	// handle map are different records, and a helper whose CreatePod failed to
@@ -136,7 +146,10 @@ func (r *Runtime) Close() error {
 // vmShutdownBound caps the whole concurrent vm-helper stop at shutdown.
 //
 // It is sized per NODE, not per helper: the helpers stop in parallel, so a
-// shutdown's cost is one budget rather than one per pod. A helper still running
+// shutdown's cost is one budget rather than one per pod. The backend divides it
+// explicitly (pkg/sandbox exitStopWait): a helper is given at most
+// vmShutdownBound - sandbox.VMHelperStopMargin of its pod's grace, and the margin
+// covers its own hard stop and exit. A helper still running
 // when it expires is left to the next start's orphan sweep, which is the backstop
 // that makes this a bound rather than a promise.
 //

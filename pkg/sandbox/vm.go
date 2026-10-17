@@ -209,8 +209,9 @@ type VMSpec struct {
 	AgentSocketPath string
 	// StopGrace is the pod's termination grace, threaded to the helper's
 	// -stop-grace so one budget governs both ends of the shutdown. Zero selects
-	// the helper's default; the daemon clamps its own escalation wait to the
-	// same resolved value (clampStopGrace) so the two timers cannot race.
+	// the helper's default; the daemon resolves the same clamped value
+	// (clampStopGrace) and waits it plus VMHelperStopMargin, so the two timers
+	// cannot race.
 	StopGrace time.Duration
 }
 

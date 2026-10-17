@@ -204,8 +204,8 @@ type vmProc struct {
 	// exact-instance identity the orphan sweep matches on. See vmProcRecord.
 	startUnixNano int64
 	// helperGrace is the budget the helper will actually honour, already clamped
-	// by the same rule the helper applies. The daemon's escalation never waits
-	// less than this.
+	// by the same rule the helper applies. The daemon's escalation waits this
+	// plus VMHelperStopMargin, cut only by a daemon exit's bound (exitStopWait).
 	helperGrace time.Duration
 	// agentSocket / runDir / consolePath are recorded verbatim rather than
 	// re-derived at teardown: the derivations live in pkg/runtime, and a second
@@ -262,12 +262,13 @@ func (l *logTail) String() string {
 // recorded for it. It is idempotent: a pod with no live helper succeeds.
 //
 // one GRACE budget, two PROCESSES. The wait is max(the caller's grace, the budget
-// the helper was actually given) — never less than the helper's. The helper
-// answers SIGTERM by asking the guest to stop, waiting out its own budget, and
-// only then halting the machine; a daemon that escalated to SIGKILL first would
-// cut that short, and a hard stop with a guest mid-write is the power cut the
-// grace period exists to prevent. A caller-requested grace of 0 is honoured as
-// the apis immediate-kill contract, because that request is explicit.
+// the helper was actually given plus VMHelperStopMargin) — never less than the
+// helper needs. The helper answers SIGTERM by asking the guest to stop, waiting
+// out its own budget from that same signal, and only then halting the machine
+// and exiting; a daemon that escalated to SIGKILL first would cut that short, and
+// a hard stop with a guest mid-write is the power cut the grace period exists to
+// prevent. A caller-requested grace of 0 is honoured as the apis immediate-kill
+// contract, because that request is explicit.
 func (b *VMBackend) StopVM(ctx context.Context, podID string, grace time.Duration) error {
 	b.mu.Lock()
 	vp, ok := b.live[podID]
@@ -276,20 +277,48 @@ func (b *VMBackend) StopVM(ctx context.Context, podID string, grace time.Duratio
 	if !ok {
 		return nil
 	}
-	return b.stopProc(ctx, vp, grace)
+	return b.stopProc(ctx, vp, deletionStopWait(grace, vp.helperGrace))
+}
+
+// deletionStopWait is the daemon's SIGTERM->SIGKILL wait for a pod deletion:
+// the helper's grace plus VMHelperStopMargin, or the caller's grace if that is
+// longer, or 0 (an immediate kill) when the caller asked for exactly that.
+func deletionStopWait(callerGrace, helperGrace time.Duration) time.Duration {
+	if callerGrace <= 0 {
+		return 0
+	}
+	return max(callerGrace, helperGrace+VMHelperStopMargin)
+}
+
+// exitStopWait is the daemon's wait for one helper during a daemon exit, inside
+// exitBudget (what is left of the caller's exit bound).
+//
+// The helper keeps the grace it was spawned with: a SIGTERM carries no number,
+// so a pod with a long grace cannot be told to hurry. What the daemon can do is
+// be explicit about the arithmetic: the helper gets min(its grace, exitBudget -
+// VMHelperStopMargin) and the margin on top, so a pod whose grace fits is never
+// escalated, and one whose grace does not fit is cut at the exit bound with cut
+// reported, rather than discovered later as an unexplained SIGKILL. A budget too
+// small for the margin is spent whole.
+func exitStopWait(helperGrace, exitBudget time.Duration) (wait time.Duration, cut bool) {
+	allowed := exitBudget - VMHelperStopMargin
+	if allowed <= 0 {
+		return max(exitBudget, 0), true
+	}
+	if helperGrace > allowed {
+		return allowed + VMHelperStopMargin, true
+	}
+	return helperGrace + VMHelperStopMargin, false
 }
 
 // stopProc runs the SIGTERM -> wait -> SIGKILL escalation for one helper and
 // cleans up after it.
-func (b *VMBackend) stopProc(ctx context.Context, vp *vmProc, grace time.Duration) error {
-	wait := grace
-	if wait > 0 && wait < vp.helperGrace {
-		wait = vp.helperGrace
-	}
+func (b *VMBackend) stopProc(ctx context.Context, vp *vmProc, wait time.Duration) error {
 	escalated, observed, err := supervisor.GracefulStop(ctx, vp.pgid, wait, vp.proc.Done(),
 		vmTermSignal, vmKillSignal, b.signal, 0)
 	b.logger().Info("vm host helper stop outcome",
-		"pod", vp.podID, "pid", vp.pgid, "wait", wait.String(), "escalated", escalated, "exit_observed", observed)
+		"pod", vp.podID, "pid", vp.pgid, "grace", vp.helperGrace.String(), "wait", wait.String(),
+		"escalated", escalated, "exit_observed", observed)
 	if !observed {
 		// The helper did not die within the observation bound. Teardown must not
 		// hang on it, so we continue — but the record is kept (below) so the next
@@ -325,16 +354,21 @@ func (b *VMBackend) hardStop(vp *vmProc) {
 
 // StopAllVMs stops every live helper concurrently and returns the joined errors.
 //
-// CONCURRENCY IS required, not AN OPTIMIZATION. This runs on daemon shutdown,
-// inside launchd's 45-second ExitTimeOut. Each helper's graceful stop can spend
-// up to VMHostMaxStopGrace (30 s), so stopping serially blows the timeout with
-// two vm pods — and launchd's answer to a blown timeout is SIGKILL of the daemon,
-// which strands exactly the helpers this sweep exists to stop. Fanning out makes
-// the whole node's cost one budget rather than one per pod.
+// ctx's deadline IS the exit budget. The caller (pkg/runtime's Close) bounds it
+// with vmShutdownBound, one stage of the embedding daemon's launchd ExitTimeOut,
+// and each helper's wait is divided out of what is left of it (exitStopWait). A
+// ctx with no deadline stops each helper as a deletion would.
+//
+// CONCURRENCY IS required, not AN OPTIMIZATION. Each helper's graceful stop can
+// spend most of that budget, so stopping serially blows it with two vm pods —
+// and launchd's answer to a blown timeout is SIGKILL of the daemon, which strands
+// exactly the helpers this sweep exists to stop. Fanning out makes the whole
+// node's cost one budget rather than one per pod.
 //
 // Each helper is stopped with ITS own recorded grace, not a shared one: the
 // budget is the pod's promise to its workload and does not become shorter because
-// the pod happens to be shutting down alongside others.
+// the pod happens to be shutting down alongside others. Only the exit bound cuts
+// it, and a cut is logged per pod.
 func (b *VMBackend) StopAllVMs(ctx context.Context) error {
 	b.mu.Lock()
 	procs := make([]*vmProc, 0, len(b.live))
@@ -346,16 +380,26 @@ func (b *VMBackend) StopAllVMs(ctx context.Context) error {
 	if len(procs) == 0 {
 		return nil
 	}
+	deadline, bounded := ctx.Deadline()
 	b.logger().Info("stopping every vm host helper for daemon shutdown", "helpers", len(procs))
 
 	errs := make([]error, len(procs))
 	var wg sync.WaitGroup
 	for i, vp := range procs {
+		wait := deletionStopWait(vp.helperGrace, vp.helperGrace)
+		if bounded {
+			var cut bool
+			wait, cut = exitStopWait(vp.helperGrace, time.Until(deadline))
+			if cut {
+				b.logger().Warn("the daemon's exit bound is shorter than this vm pod's grace; its helper will be killed at the bound",
+					"pod", vp.podID, "grace", vp.helperGrace.String(), "wait", wait.String())
+			}
+		}
 		wg.Add(1)
-		go func(i int, vp *vmProc) {
+		go func(i int, vp *vmProc, wait time.Duration) {
 			defer wg.Done()
-			errs[i] = b.stopProc(ctx, vp, vp.helperGrace)
-		}(i, vp)
+			errs[i] = b.stopProc(ctx, vp, wait)
+		}(i, vp, wait)
 	}
 	wg.Wait()
 	return errors.Join(errs...)

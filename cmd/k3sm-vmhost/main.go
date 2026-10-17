@@ -59,7 +59,8 @@ limitations under the License.
 //
 // Lifetime: it dies with the daemon that spawned it — no VM outlives the binary
 // that booted it — and SIGTERM runs the graceful sequence (guest agent Stop, then
-// a hard halt if the grace budget is spent).
+// a hard halt if the grace budget, measured from the SIGTERM, is spent), with the
+// agent proxy still serving until the machine is off.
 package main
 
 import (
@@ -157,10 +158,6 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	proxy := vmhost.NewProxy(lis, dial, log)
-	proxied := make(chan error, 1)
-	go func() { proxied <- proxy.Serve(ctx) }()
-
 	// one GRACE budget, ISSUED BY the DAEMON. The pod's
 	// terminationGracePeriodSeconds is a promise made to the workload, and the
 	// daemon is the only process that knows it — so it is threaded in here rather
@@ -169,23 +166,20 @@ func run(log *slog.Logger) error {
 	// two independently-clocked timers across a process boundary: whenever the
 	// daemon's was the shorter one it SIGKILLed the helper mid-graceful-stop, and
 	// a hard stop with a guest still writing is the power cut the grace period
-	// exists to prevent. NewLifecycle clamps the value to MaxStopGrace, so an
-	// over-long pod grace is bounded here rather than trusted.
+	// exists to prevent. The lifecycle measures the budget from the SIGTERM, the
+	// same instant the daemon starts its own wait, and the daemon waits a fixed
+	// margin longer, so the helper's hard stop always comes first. NewLifecycle
+	// clamps the value to MaxStopGrace, so an over-long pod grace is bounded here
+	// rather than trusted.
 	lc := vmhost.NewLifecycle(runner, vmhost.NewAgentStopper(dial), vmhost.LifecycleOptions{
 		Grace:  *stopGrace,
 		Logger: log,
 	})
-	runErr := lc.Run(ctx)
 
-	// The proxy is drained before returning: its Serve returns only once every
-	// relay goroutine has finished, so waiting here is what makes "this process is
-	// about to exit" also mean "nothing is still holding a connection into the
-	// machine that was just halted".
-	_ = lis.Close()
-	if perr := <-proxied; perr != nil {
-		log.Warn("the guest agent proxy ended with an error", "err", perr)
-	}
-	return runErr
+	// The proxy outlives the signal: it keeps relaying while the guest stops and
+	// is drained only once the machine is off (see RunWithProxy), so the daemon's
+	// execs and log follows reach a guest that is still shutting down.
+	return vmhost.RunWithProxy(ctx, lc, vmhost.NewProxy(lis, dial, log))
 }
 
 // defaultOptions fills the host-derived bounds FromSpec resolves the spec against.

@@ -689,6 +689,77 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 		}
 	})
 
+	t.Run("a guest that takes its full grace does not escalate", func(t *testing.T) {
+		// B712. The helper's grace clock and the daemon's wait start at the same
+		// SIGTERM, and a guest that uses its whole grace still leaves the helper
+		// its hard stop and its exit to do. A daemon that waited exactly the
+		// grace SIGKILLed the helper in the middle of that every time, so a slow
+		// guest read as escalated=true. The helper here exits a little AFTER its
+		// grace, as a real one does, and must be left to do so.
+		root := t.TempDir()
+		spec := labSpec(t, root)
+		const helperGrace = 500 * time.Millisecond
+		spec.StopGrace = helperGrace
+		b, _, w, sig := labBackend(t, root, func(context.Context, string) error { return nil })
+		if err := b.CreateVM(context.Background(), spec); err != nil {
+			t.Fatalf("CreateVM: %v", err)
+		}
+		b.mu.Lock()
+		vp := b.live[spec.PodID]
+		b.mu.Unlock()
+		before := sig.count()
+		go func() { time.Sleep(helperGrace + 200*time.Millisecond); w.release(vp.pgid) }()
+		if err := b.StopVM(context.Background(), spec.PodID, helperGrace); err != nil {
+			t.Fatalf("StopVM: %v", err)
+		}
+		if got := sig.count() - before; got != 1 {
+			t.Errorf("the helper was sent %d signals, want 1 (SIGTERM only): the daemon escalated on a guest that was merely slow", got)
+		}
+	})
+
+	t.Run("the daemon's wait is the helper's grace plus the margin", func(t *testing.T) {
+		for _, tc := range []struct {
+			name                string
+			caller, helper, out time.Duration
+		}{
+			{"an immediate kill stays immediate", 0, 30 * time.Second, 0},
+			{"a negative caller grace is an immediate kill", -time.Second, 30 * time.Second, 0},
+			{"the helper's grace plus the margin", 30 * time.Second, 30 * time.Second, 30*time.Second + VMHelperStopMargin},
+			{"a shorter caller grace is raised", time.Second, 90 * time.Second, 90*time.Second + VMHelperStopMargin},
+			{"a longer caller grace is kept", time.Hour, 30 * time.Second, time.Hour},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := deletionStopWait(tc.caller, tc.helper); got != tc.out {
+					t.Errorf("deletionStopWait(%s, %s) = %s, want %s", tc.caller, tc.helper, got, tc.out)
+				}
+			})
+		}
+	})
+
+	t.Run("a daemon exit divides its bound explicitly", func(t *testing.T) {
+		for _, tc := range []struct {
+			name           string
+			helper, budget time.Duration
+			wait           time.Duration
+			cut            bool
+		}{
+			// 35 s bound - 8 s margin: 27 s is the longest grace that is never cut.
+			{"the longest grace that fits is whole, plus the margin", 27 * time.Second, 35 * time.Second, 35 * time.Second, false},
+			{"a short grace is whole, plus the margin", 7 * time.Second, 35 * time.Second, 15 * time.Second, false},
+			{"the k8s default 30 s is cut at the bound", 30 * time.Second, 35 * time.Second, 35 * time.Second, true},
+			{"a long grace is cut at the bound", 90 * time.Second, 35 * time.Second, 35 * time.Second, true},
+			{"a budget smaller than the margin is spent whole", 30 * time.Second, 3 * time.Second, 3 * time.Second, true},
+			{"an expired budget is an immediate kill", 30 * time.Second, -time.Second, 0, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				wait, cut := exitStopWait(tc.helper, tc.budget)
+				if wait != tc.wait || cut != tc.cut {
+					t.Errorf("exitStopWait(%s, %s) = (%s, %v), want (%s, %v)", tc.helper, tc.budget, wait, cut, tc.wait, tc.cut)
+				}
+			})
+		}
+	})
+
 	t.Run("the grace the helper is given is clamped to the ceiling", func(t *testing.T) {
 		// The helper clamps whatever it is handed; the daemon must compute the
 		// same clamped number, or its own escalation would be timed against a
@@ -696,6 +767,9 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 		for _, tc := range []struct{ in, want time.Duration }{
 			{0, VMHostDefaultStopGrace},
 			{5 * time.Second, 5 * time.Second},
+			// A pod's 90 s grace reaches the helper intact (B712); it used to be
+			// clamped to 30 s here.
+			{90 * time.Second, 90 * time.Second},
 			{VMHostMaxStopGrace, VMHostMaxStopGrace},
 			{time.Hour, VMHostMaxStopGrace},
 			{-time.Second, VMHostDefaultStopGrace},
@@ -717,10 +791,10 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 
 // TestStopAllVMsFansOut asserts daemon shutdown stops every helper concurrently.
 //
-// Serial stops are not merely slower: each helper's graceful stop can spend up to
-// VMHostMaxStopGrace, launchd allows the daemon 45 seconds total, and its answer
-// to a blown ExitTimeOut is SIGKILL of the daemon — stranding exactly the helpers
-// the sweep exists to stop. The assertion is on WALL TIME against a stop that is
+// Serial stops are not merely slower: each helper's graceful stop can spend most
+// of the runtime's exit bound, which is one stage of the daemon's launchd
+// ExitTimeOut, and launchd's answer to a blown ExitTimeOut is SIGKILL of the
+// daemon — stranding exactly the helpers the sweep exists to stop. The assertion is on WALL TIME against a stop that is
 // deliberately made slow, which is the only thing that can tell fan-out from a
 // loop.
 func TestStopAllVMsFansOut(t *testing.T) {

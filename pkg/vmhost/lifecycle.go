@@ -108,19 +108,61 @@ type agentStopper interface {
 // DefaultStopGrace is the graceful-termination budget used when none is supplied.
 const DefaultStopGrace = 20 * time.Second
 
-// MaxStopGrace is the ceiling this helper will ever wait for a guest.
+// MaxStopGrace is the ceiling this helper will ever wait for a guest. It is the
+// guest agent's own ceiling (pkg/guestagent maxStopGraceSeconds, 300 s): the
+// agent clamps whatever it is sent to that value, so a longer host-side budget
+// would be one the guest never spends, and a shorter one would cut a pod's
+// terminationGracePeriodSeconds the guest is prepared to honour.
 //
-// It is BUDGETED inside the daemon's launchd ExitTimeOut (45s), with room left for
-// the daemon's own teardown: a helper still waiting when launchd's timeout expires
-// is SIGKILLed, which is exactly the ungraceful stop the grace period existed to
-// avoid — so a longer grace does not buy a gentler shutdown, it buys a harder one.
-// A caller asking for more is clamped and told.
-const MaxStopGrace = 30 * time.Second
+// The helper serves TWO callers, and each owns its own budget; neither lives here.
+//
+//   - A pod deletion (DeletePod -> StopVM) gives the helper the pod's grace, up
+//     to this ceiling, and the daemon waits that grace plus a fixed margin
+//     (pkg/sandbox VMHelperStopMargin) before it SIGKILLs the helper, so the
+//     helper's own hard stop and clean exit always come first.
+//   - A daemon exit (runtime Close -> StopAllVMs) is bounded by the runtime's
+//     vmShutdownBound, which is one stage of the embedding daemon's launchd
+//     ExitTimeOut. The daemon divides that bound itself and SIGKILLs a helper
+//     whose pod grace does not fit, logging the cut; the helper cannot be told a
+//     shorter budget after it was spawned, so it never reasons about the exit
+//     path.
+//
+// A caller asking for more than this is clamped and told.
+const MaxStopGrace = 300 * time.Second
+
+// AgentUnreachableWait bounds the wait for the machine to leave Running on its
+// own once the graceful leg has failed: the guest agent refused or never
+// answered the Stop RPC, or there is no agent transport at all.
+//
+// Without a request delivered, nothing in the guest is shutting the workload
+// down, so spending the rest of the pod's grace idle would only delay the hard
+// stop that is coming anyway. The short wait remains for a guest that was
+// already on its way down (a poweroff in flight is exactly what makes the agent
+// stop answering). A host-side power-button request (VZ RequestStop) would be a
+// second graceful path; it is not wired here, so this bound is the whole
+// fallback.
+const AgentUnreachableWait = 5 * time.Second
+
+// GuestStopReserve is the time past the guest's own grace the helper leaves the
+// guest before the hard stop: the guest init SIGKILLs whatever ignored SIGTERM
+// when the grace runs out, and only then syncs its filesystems and powers off.
+// A helper whose hard stop landed exactly at the grace would cut that sync on
+// every pod that used its whole grace, which is the data loss the graceful path
+// exists to prevent.
+const GuestStopReserve = 2 * time.Second
+
+// HardStopBound bounds the hard stop itself (the hypervisor halting the
+// machine). Together with GuestStopReserve it must fit inside the margin the
+// daemon allows past the grace (pkg/sandbox VMHelperStopMargin), so a helper
+// whose guest spent the whole budget still halts its machine and exits before the
+// daemon would kill it; TestStopGraceBoundsAreSingleValued pins the ordering.
+const HardStopBound = 3 * time.Second
 
 // LifecycleOptions are the lifecycle's tunables and test seams.
 type LifecycleOptions struct {
-	// Grace is the graceful-termination budget. Zero means DefaultStopGrace;
-	// anything above MaxStopGrace is clamped (with a Warn) — see MaxStopGrace.
+	// Grace is the graceful-termination budget, measured from the moment shutdown
+	// begins (the SIGTERM). Zero means DefaultStopGrace; anything above
+	// MaxStopGrace is clamped (with a Warn) — see MaxStopGrace.
 	Grace time.Duration
 	// Logger receives the lifecycle's narration; nil means slog.Default.
 	Logger *slog.Logger
@@ -129,6 +171,9 @@ type LifecycleOptions struct {
 	// mirrors guestinit.ReaperOptions.NewTimer, which solves the same problem at
 	// the other end of the same shutdown.
 	NewTimer func(d time.Duration) (<-chan time.Time, func() bool)
+	// Now is the clock the shutdown measures the elapsed time it logs at each
+	// step on. nil means time.Now.
+	Now func() time.Time
 }
 
 // Lifecycle drives one virtual machine from creation to poweroff.
@@ -136,18 +181,28 @@ type LifecycleOptions struct {
 // The shutdown sequence is the whole reason it exists, and its order is
 // load-bearing:
 //
-//		SIGTERM (as ctx cancellation) -> agent.Stop(grace) -> wait <= grace for the
-//		machine to leave Running -> hard machine.Stop()
+//		SIGTERM (as ctx cancellation) -> start ONE clock of grace +
+//		GuestStopReserve -> agent.Stop(grace) -> wait, until the clock runs out, for
+//		the machine to leave Running -> hard machine.Stop()
 //
 //	  - The AGENT goes first because only the guest can terminate the workload
 //	    gracefully and sync its filesystems. A hard stop is a power cut: for a pod
 //	    mid-write it is data loss, and for a PVC it is data loss that outlives the
 //	    pod.
+//	  - The guest is sent the grace in whole seconds, rounded to the nearest and
+//	    never below one (see guestGrace), and it gets GuestStopReserve past it
+//	    for the sync and poweroff that follow its own SIGKILL.
+//	  - There is ONE clock, started when the signal arrives. The daemon times its
+//	    own SIGKILL from the moment it sent SIGTERM, so a helper whose budget
+//	    started later (when the Stop RPC returned, say) would always be the second
+//	    to expire, and a guest that used its whole grace would always end with the
+//	    daemon killing the helper instead of the helper halting the machine.
 //	  - The hard stop always happens if the graceful path did not finish. A helper
 //	    that returned while its VM was still running would leave a machine with no
 //	    pod, which the daemon can only reap by timeout.
-//	  - Grace is CLAMPED, not trusted, because the budget is not this process's to
-//	    overrun (see MaxStopGrace).
+//	  - An agent that cannot be reached shortens the wait to AgentUnreachableWait:
+//	    no request got through, so nothing in the guest is spending the budget.
+//	  - Grace is CLAMPED, not trusted (see MaxStopGrace).
 //
 // Locking discipline: mu guards state only. Every runner and agent call is made
 // with mu released, so a seam that blocks — which the agent one certainly can —
@@ -160,6 +215,7 @@ type Lifecycle struct {
 	grace    time.Duration
 	log      *slog.Logger
 	newTimer func(d time.Duration) (<-chan time.Time, func() bool)
+	now      func() time.Time
 
 	mu    sync.Mutex
 	state State
@@ -176,6 +232,7 @@ func NewLifecycle(runner machineRunner, agent agentStopper, opts LifecycleOption
 		grace:    opts.Grace,
 		log:      opts.Logger,
 		newTimer: opts.NewTimer,
+		now:      opts.Now,
 		state:    StateNew,
 	}
 	if l.log == nil {
@@ -187,11 +244,14 @@ func NewLifecycle(runner machineRunner, agent agentStopper, opts LifecycleOption
 			return t.C, t.Stop
 		}
 	}
+	if l.now == nil {
+		l.now = time.Now
+	}
 	if l.grace <= 0 {
 		l.grace = DefaultStopGrace
 	}
 	if l.grace > MaxStopGrace {
-		l.log.Warn("clamping the guest stop grace to fit inside the daemon's launchd exit timeout",
+		l.log.Warn("clamping the guest stop grace to the guest agent's ceiling",
 			"requested", l.grace, "clamped_to", MaxStopGrace)
 		l.grace = MaxStopGrace
 	}
@@ -283,50 +343,98 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 // goroutine Run already started — as its observation of the machine leaving
 // Running. Reusing it is what makes the "wait <= grace" leg honest: a second wait
 // would be a second observer of a one-shot event, and the two could disagree.
+//
+// The grace clock starts here, before the agent is asked anything, and the agent
+// call runs beside it rather than in front of it: a wedged RPC spends the same
+// budget the guest would have, never extra.
 func (l *Lifecycle) shutdown(waited <-chan error) error {
+	start := l.now()
+	elapsed := func() time.Duration { return l.now().Sub(start) }
 	l.set(StateStopping)
+
+	// The deadline covers the grace the guest is sent AND the reserve for its
+	// sync and poweroff, measured from the signal: the guest's own SIGKILL comes
+	// at sent, and the helper's hard stop never before sent + GuestStopReserve.
+	sent := guestGrace(l.grace)
+	deadline, stopDeadline := l.newTimer(sent + GuestStopReserve)
+	defer stopDeadline()
+	l.log.Info("asking the guest to stop", "grace", sent, "reserve", GuestStopReserve)
 
 	// The graceful leg runs on a context that is not the cancelled one: ctx is
 	// already done by the time we are here, so passing it would cancel the very
-	// RPC whose whole purpose is to run after the signal. Its bound is the grace
-	// budget, which is the correct bound anyway.
-	graceCtx, cancelGrace := context.WithTimeout(context.Background(), l.grace)
-	defer cancelGrace()
+	// RPC whose whole purpose is to run after the signal. It is cancelled when
+	// this function returns, which bounds it by the grace clock above.
+	rpcCtx, cancelRPC := context.WithCancel(context.Background())
+	defer cancelRPC()
 
+	agentDone := make(chan error, 1)
 	if l.agent == nil {
-		l.log.Warn("no guest agent transport; skipping the graceful stop and halting the machine")
-	} else if err := l.agent.Stop(graceCtx, l.grace); err != nil {
-		// not fatal, and not a machine failure: the agent lives in the guest and
-		// is a different failure domain (see agentStopper). The hard stop below is
-		// exactly the fallback this case exists for.
-		l.log.Warn("the guest agent did not accept the stop request; falling back to a hard stop", "err", err)
+		agentDone <- errors.New("no guest agent transport")
+	} else {
+		go func() { agentDone <- l.agent.Stop(rpcCtx, sent) }()
 	}
 
-	timer, stopTimer := l.newTimer(l.grace)
-	defer stopTimer()
-
-	select {
-	case err := <-waited:
-		stopTimer()
-		if err != nil {
-			l.set(StateFailed)
-			return fmt.Errorf("the virtual machine stopped abnormally during shutdown: %w", err)
+	var fallback <-chan time.Time
+	stopFallback := func() bool { return false }
+	defer func() { stopFallback() }()
+	for {
+		select {
+		case err := <-waited:
+			if err != nil {
+				l.set(StateFailed)
+				return fmt.Errorf("the virtual machine stopped abnormally during shutdown: %w", err)
+			}
+			l.log.Info("the guest powered itself off within the grace budget",
+				"grace", sent, "elapsed", elapsed())
+			l.set(StateStopped)
+			return nil
+		case err := <-agentDone:
+			agentDone = nil
+			if err == nil {
+				l.log.Info("the guest agent accepted the stop request", "elapsed", elapsed())
+				continue
+			}
+			// not fatal, and not a machine failure: the agent lives in the guest
+			// and is a different failure domain (see agentStopper). Nothing reached
+			// the guest, so the rest of the budget would be spent idle; wait only
+			// a short bound for a guest already on its way down.
+			l.log.Warn("no graceful path reached the guest; halting the machine unless it powers off first",
+				"err", err, "elapsed", elapsed(), "wait", AgentUnreachableWait)
+			fallback, stopFallback = l.newTimer(AgentUnreachableWait)
+			continue
+		case <-fallback:
+			l.log.Warn("the guest did not power off after the failed stop request; halting the machine",
+				"elapsed", elapsed())
+		case <-deadline:
+			l.log.Warn("the guest did not power off within the grace budget; halting the machine",
+				"grace", sent, "reserve", GuestStopReserve, "elapsed", elapsed())
 		}
-		l.log.Info("the guest powered itself off within the grace budget")
-		l.set(StateStopped)
-		return nil
-	case <-timer:
-		l.log.Warn("the guest did not power off within the grace budget; halting the machine", "grace", l.grace)
+		break
 	}
 
-	// The hard stop. It is reached only after the budget was spent, which is the
-	// property that keeps a graceful shutdown from becoming a power cut.
-	hardCtx, cancelHard := context.WithTimeout(context.Background(), l.grace)
+	// The hard stop. It is reached only after the budget was spent or no
+	// graceful path exists, which is the property that keeps a graceful shutdown
+	// from becoming a power cut. Its own bound fits inside the margin the daemon
+	// allows past the grace (see HardStopBound).
+	hardCtx, cancelHard := context.WithTimeout(context.Background(), HardStopBound)
 	defer cancelHard()
 	if err := l.runner.Stop(hardCtx); err != nil {
 		l.set(StateFailed)
 		return fmt.Errorf("halt the virtual machine: %w", err)
 	}
+	l.log.Info("the machine was halted", "elapsed", elapsed())
 	l.set(StateStopped)
 	return nil
+}
+
+// guestGrace is the grace the guest is sent: the configured grace rounded to
+// the nearest whole second (the proto carries seconds), never below one.
+//
+// It is computed from the configured grace, not from what is left of it when the
+// RPC goes out: that remainder is always a little under the integer, so flooring
+// it sent a 1 s pod grace as 0 (an immediate SIGKILL in the guest) and a 30 s
+// grace as 29 s. The floor of one second keeps a SIGTERM in front of every
+// SIGKILL, as the k8s contract does for any non-zero grace.
+func guestGrace(d time.Duration) time.Duration {
+	return max(d.Round(time.Second), time.Second)
 }
