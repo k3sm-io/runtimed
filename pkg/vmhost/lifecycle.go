@@ -122,10 +122,10 @@ const DefaultStopGrace = 20 * time.Second
 //     helper's own hard stop and clean exit always come first.
 //   - A bounded stop of every helper (StopAllVMs, for a caller that means to
 //     end every guest on the node) is capped by pkg/sandbox VMStopAllBound. The
-//     daemon divides that bound itself and SIGKILLs a helper whose pod grace
-//     does not fit, logging the cut; the helper cannot be told a shorter budget
-//     after it was spawned, so it never reasons about that path. A daemon exit
-//     is NOT a caller: the helper outlives the daemon and the next one adopts
+//     daemon divides that bound itself; for a helper whose pod grace does not
+//     fit it first asks the helper, on its control socket, to start its stop
+//     with a grace that does (ShortenGrace, pkg/sandbox ShortenVMHostStop), and
+//     SIGKILLs it at the bound, logging the cut. A daemon exit is NOT a caller: the helper outlives the daemon and the next one adopts
 //     it (pkg/sandbox AdoptVM) or kills it.
 //
 // A caller asking for more than this is clamped and told.
@@ -204,10 +204,19 @@ type LifecycleOptions struct {
 //	  - An agent that cannot be reached shortens the wait to AgentUnreachableWait:
 //	    no request got through, so nothing in the guest is spending the budget.
 //	  - Grace is CLAMPED, not trusted (see MaxStopGrace).
+//	  - A stopper that must end the guest inside a bound shorter than the grace
+//	    can ask, before it signals, for a shorter one (ShortenGrace). The request
+//	    STARTS the stop through this same sequence with the shortened grace, so
+//	    the guest is told the time it actually has rather than being power-cut
+//	    partway through a grace it believed it had.
 //
-// Locking discipline: mu guards state only. Every runner and agent call is made
-// with mu released, so a seam that blocks — which the agent one certainly can —
-// never blocks a State() read from the logging path.
+// Locking discipline: mu guards state, grace, cancelRun and stopRequested.
+// grace may change only before the stop begins (ShortenGrace), and the stop
+// reads it under mu in the same critical section that enters Stopping, so a
+// shortening either lands before the stop reads the grace or is told the stop
+// has begun. Every runner and agent call is made with mu released, so a seam
+// that blocks — which the agent one certainly can — never blocks a State() read
+// from the logging path.
 //
 // The zero value is not usable; construct one with NewLifecycle.
 type Lifecycle struct {
@@ -220,6 +229,12 @@ type Lifecycle struct {
 
 	mu    sync.Mutex
 	state State
+	// cancelRun ends Run's context: the one shutdown path, which SIGTERM also
+	// takes. Set by Run; nil before it.
+	cancelRun context.CancelFunc
+	// stopRequested records a ShortenGrace that arrived before Run, so Run
+	// begins already stopping.
+	stopRequested bool
 }
 
 // NewLifecycle builds a lifecycle over runner and agent. agent may be nil, in
@@ -266,6 +281,51 @@ func (l *Lifecycle) State() State {
 	return l.state
 }
 
+// currentGrace returns the grace the stop will use.
+func (l *Lifecycle) currentGrace() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.grace
+}
+
+// ShortenGrace starts the stop with a grace no longer than the one shorten
+// returns for the current grace, and reports the grace before and after.
+//
+// It is how a stopper with a bound shorter than the pod's grace (a stop of
+// every guest on the node) tells the guest the time it really has: the stop
+// begins here, on the same path SIGTERM takes, so the clock and the grace the
+// guest is sent both start now. It never extends the grace: a shorten result
+// at or above the current grace leaves it as it is, and the stop still begins.
+//
+// When the stop has already begun (or the machine is already off) it changes
+// nothing and reports alreadyStopping: the guest was sent its grace when the
+// stop began, and a later number could reach neither it nor the clock. An
+// error from shorten (a bound below the floor) is returned and starts nothing.
+func (l *Lifecycle) ShortenGrace(shorten func(current time.Duration) (time.Duration, error)) (from, to time.Duration, alreadyStopping bool, err error) {
+	l.mu.Lock()
+	from = l.grace
+	if l.state >= StateStopping {
+		l.mu.Unlock()
+		return from, from, true, nil
+	}
+	next, err := shorten(from)
+	if err != nil {
+		l.mu.Unlock()
+		return from, from, false, err
+	}
+	if next < l.grace {
+		l.grace = next
+	}
+	to = l.grace
+	l.stopRequested = true
+	cancel := l.cancelRun
+	l.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return from, to, false, nil
+}
+
 // set records a transition and narrates it.
 func (l *Lifecycle) set(s State) {
 	l.mu.Lock()
@@ -289,6 +349,17 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 	if l.State() != StateNew {
 		return errors.New("vmhost: lifecycle already run; a Lifecycle drives exactly one machine")
 	}
+	// The run's own cancel is the second way into the one shutdown path: a
+	// ShortenGrace takes it after it has set the grace, so the stop it asks for
+	// is the very sequence a SIGTERM runs.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	l.mu.Lock()
+	l.cancelRun = cancel
+	if l.stopRequested {
+		cancel()
+	}
+	l.mu.Unlock()
 	l.set(StateStarting)
 	if err := l.runner.Start(ctx); err != nil {
 		// A failed Start must still BE TORN down. The darwin runner races the
@@ -305,7 +376,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		// for — bounded by the same grace budget the shutdown path uses. Stop is
 		// documented safe on a machine that never started, so the ordinary
 		// failure (a bad configuration, no entitlement) pays one no-op call.
-		stopCtx, cancelStop := context.WithTimeout(context.WithoutCancel(ctx), l.grace)
+		stopCtx, cancelStop := context.WithTimeout(context.WithoutCancel(ctx), l.currentGrace())
 		defer cancelStop()
 		if serr := l.runner.Stop(stopCtx); serr != nil {
 			l.log.Warn("could not halt the machine after a failed start; it may still be running",
@@ -335,7 +406,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 		l.set(StateStopped)
 		return nil
 	case <-ctx.Done():
-		l.log.Info("shutting the guest down", "cause", ctx.Err(), "grace", l.grace)
+		l.log.Info("shutting the guest down", "cause", ctx.Err())
 		return l.shutdown(waited)
 	}
 }
@@ -351,12 +422,20 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 func (l *Lifecycle) shutdown(waited <-chan error) error {
 	start := l.now()
 	elapsed := func() time.Duration { return l.now().Sub(start) }
-	l.set(StateStopping)
+	// Entering Stopping and reading the grace are one critical section: from
+	// here on ShortenGrace reports the stop as begun, so the grace read now is
+	// the grace the stop runs with.
+	l.mu.Lock()
+	prev := l.state
+	l.state = StateStopping
+	grace := l.grace
+	l.mu.Unlock()
+	l.log.Info("vm lifecycle transition", "from", prev.String(), "to", StateStopping.String())
 
 	// The deadline covers the grace the guest is sent AND the reserve for its
 	// sync and poweroff, measured from the signal: the guest's own SIGKILL comes
 	// at sent, and the helper's hard stop never before sent + GuestStopReserve.
-	sent := guestGrace(l.grace)
+	sent := guestGrace(grace)
 	deadline, stopDeadline := l.newTimer(sent + GuestStopReserve)
 	defer stopDeadline()
 	l.log.Info("asking the guest to stop", "grace", sent, "reserve", GuestStopReserve)

@@ -195,27 +195,61 @@ func dialVMHostVersion(ctx context.Context, socket string) (vmHostAnswer, error)
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(vmAdoptProbeTimeout))
 	}
-	uc, ok := conn.(*net.UnixConn)
-	if !ok {
-		return vmHostAnswer{}, fmt.Errorf("dial %s: not a unix socket connection", socket)
-	}
-	raw, err := uc.SyscallConn()
+	peer, err := controlPeerPid(conn)
 	if err != nil {
 		return vmHostAnswer{}, fmt.Errorf("peer of %s: %w", socket, err)
-	}
-	peer := 0
-	var perr error
-	if cerr := raw.Control(func(fd uintptr) {
-		peer, perr = unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
-	}); cerr != nil {
-		return vmHostAnswer{}, fmt.Errorf("peer of %s: %w", socket, cerr)
-	}
-	if perr != nil {
-		return vmHostAnswer{}, fmt.Errorf("peer pid of %s: %w", socket, perr)
 	}
 	v, err := decodeVMHostVersion(conn)
 	if err != nil {
 		return vmHostAnswer{}, err
 	}
 	return vmHostAnswer{VMHostVersion: v, PeerPid: peer}, nil
+}
+
+// controlPeerPid reads, from the kernel, the pid of the process serving the
+// other end of a unix socket connection (LOCAL_PEERPID).
+func controlPeerPid(conn net.Conn) (int, error) {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, errors.New("not a unix socket connection")
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	peer := 0
+	var perr error
+	if cerr := raw.Control(func(fd uintptr) {
+		peer, perr = unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
+	}); cerr != nil {
+		return 0, cerr
+	}
+	if perr != nil {
+		return 0, fmt.Errorf("LOCAL_PEERPID: %w", perr)
+	}
+	return peer, nil
+}
+
+// controlPeerUID reads, from the kernel, the effective uid of the process at
+// the other end of a unix socket connection (LOCAL_PEERCRED).
+func controlPeerUID(conn net.Conn) (uint32, error) {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, errors.New("not a unix socket connection")
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var cred *unix.Xucred
+	var perr error
+	if cerr := raw.Control(func(fd uintptr) {
+		cred, perr = unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
+	}); cerr != nil {
+		return 0, cerr
+	}
+	if perr != nil {
+		return 0, fmt.Errorf("LOCAL_PEERCRED: %w", perr)
+	}
+	return cred.Uid, nil
 }

@@ -86,9 +86,10 @@ const vmRecordSchema = 1
 const VMHostProtocolVersion = 1
 
 // VMHostControlSocketName is the basename of the helper's control socket, in
-// its run dir beside the agent socket. It answers one JSON line
-// (VMHostVersion) per connection and nothing else; the agent socket stays a
-// byte relay that never speaks for the helper.
+// its run dir beside the agent socket. It writes one JSON line (VMHostVersion)
+// to every connection, then answers at most one request line, the shorten
+// request (ShortenVMHostStop, vmshorten.go); the agent socket stays a byte
+// relay that never speaks for the helper.
 const VMHostControlSocketName = "vmhost.ctl"
 
 // VMHostLogName is the basename of the helper's own output file in its run
@@ -160,8 +161,10 @@ type vmHostAnswer struct {
 // ServeVMHostControl answers every connection accepted on lis with v as one
 // JSON line, then closes the connection. It returns nil once lis is closed.
 //
-// It is exported for k3sm-vmhost, which serves it for its whole life, and for
-// the tests that stand a real process in for a helper.
+// It is the banner-only control socket: what a helper that predates the
+// shorten request serves, and what the tests that stand a real process in for
+// a helper serve. k3sm-vmhost serves ServeVMHostControlStop, which writes the
+// same banner first.
 func ServeVMHostControl(lis net.Listener, v VMHostVersion) error {
 	line, err := json.Marshal(v)
 	if err != nil {
