@@ -89,7 +89,10 @@ func appendGuestContainerStatusesLocked(st *runtimev1.PodStatus, p *pod) {
 	}
 	for _, name := range p.guestContainerOrder {
 		src := p.guestContainers[name]
-		if src == nil {
+		if src == nil || p.guestAwaitingReplay[name] {
+			// Not reported by the guest yet: an adopted pod's pre-seeded entry
+			// (vmattach.go: restart count and log path, before the guest's
+			// replay) is not published until the guest says what it is.
 			continue
 		}
 		cs, _ := proto.Clone(src).(*runtimev1.ContainerStatus)

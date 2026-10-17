@@ -125,6 +125,9 @@ type fakeVMBackend struct {
 	err         error
 	stopCalls   []fakeVMStop
 	stopAllReq  int
+	detachReq   int
+	adoptCalls  []string
+	adoptErr    error
 	reapCalls   int
 	done        map[string]chan struct{}
 }
@@ -207,6 +210,38 @@ func (b *fakeVMBackend) StopAllVMs(_ context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (b *fakeVMBackend) AdoptVM(_ context.Context, podID string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.adoptCalls = append(b.adoptCalls, podID)
+	if b.adoptErr != nil {
+		return b.adoptErr
+	}
+	if b.done == nil {
+		b.done = map[string]chan struct{}{}
+	}
+	if _, ok := b.done[podID]; !ok {
+		b.done[podID] = make(chan struct{})
+	}
+	return nil
+}
+
+// DetachVMs lets go of every helper without signalling one: the exit edges
+// stay open, as the real helpers keep running.
+func (b *fakeVMBackend) DetachVMs() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.detachReq++
+	b.done = map[string]chan struct{}{}
+}
+
+// detaches returns the DetachVMs call count.
+func (b *fakeVMBackend) detaches() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.detachReq
 }
 
 func (b *fakeVMBackend) ReapOrphanVMs() error {

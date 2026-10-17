@@ -893,7 +893,7 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 	podID := p.box.GetPodId()
 	defer r.endGuestLogFollow(p, container)
 	var (
-		last    time.Time
+		last    = r.takeGuestLogResume(p, container)
 		backoff = vmLogFollowBaseBackoff
 	)
 	for {
@@ -951,6 +951,18 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 			backoff = vmLogFollowMaxBackoff
 		}
 	}
+}
+
+// takeGuestLogResume returns, and forgets, the point the container's first
+// log connection resumes from: zero for a pod this daemon created (take
+// everything the guest retained), the last written line's stamp for one it
+// adopted (vmattach.go).
+func (r *Runtime) takeGuestLogResume(p *pod, container string) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	at := p.guestLogResume[container]
+	delete(p.guestLogResume, container)
+	return at
 }
 
 // vmExitLogDrainWait bounds how long the fold of a vm container's exit waits

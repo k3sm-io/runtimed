@@ -57,10 +57,14 @@ limitations under the License.
 // validation), boots the machine, proxies one socket, and stops. It decides
 // nothing, and it never parses a byte of the guest/v1 gRPC it relays.
 //
-// Lifetime: it dies with the daemon that spawned it — no VM outlives the binary
-// that booted it — and SIGTERM runs the graceful sequence (guest agent Stop, then
-// a hard halt if the grace budget, measured from the SIGTERM, is spent), with the
-// agent proxy still serving until the machine is off.
+// Lifetime: it OUTLIVES the daemon that spawned it, as a container outlives a
+// kubelet restart. It leads its own session, writes its output to a file in its
+// run dir (-log-file) rather than to a daemon pipe, and ignores SIGPIPE, so a
+// daemon exit takes nothing from it; the next daemon adopts it after checking
+// it is this exact helper (its control socket answers VMHostProtocolVersion
+// from the recorded pid), or kills it. SIGTERM runs the graceful sequence (guest
+// agent Stop, then a hard halt if the grace budget, measured from the SIGTERM,
+// is spent), with the agent proxy still serving until the machine is off.
 package main
 
 import (
@@ -68,12 +72,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/vmhost"
@@ -93,26 +99,38 @@ const (
 )
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(log)
+	// Defence in depth for the daemon's going away. The output is a file, so
+	// no write of the helper's own should ever meet a closed pipe; but a write
+	// that did would, under the Go runtime's default, raise SIGPIPE on fd 1 or
+	// 2 and kill the helper with its guest. Ignored, such a write returns EPIPE
+	// and the helper keeps its machine.
+	signal.Ignore(syscall.SIGPIPE)
 
-	if err := run(log); err != nil {
-		log.Error("vm host failed", "err", err)
-		os.Exit(1)
-	}
-}
-
-// run parses the flags, builds the machine, and drives it until it stops.
-func run(log *slog.Logger) error {
 	var (
 		specPath    = flag.String("spec", "", "path to the vmhost.spec.json this VM is built from (required)")
 		agentSocket = flag.String("agent-socket", "", "path of the runtimed-private unix socket proxied to the guest agent (required)")
 		consoleLog  = flag.String("console-log", "", "path of the size-capped guest console log; empty discards the console")
 		stopGrace   = flag.Duration("stop-grace", 0, "graceful-termination budget for the guest on SIGTERM; 0 uses the package default, and anything above the ceiling is clamped")
+		logFile     = flag.String("log-file", "", "path of the file the daemon opened as this helper's stdout and stderr; when set the helper rotates it at the size cap")
 	)
 	flag.Parse()
 
-	if *specPath == "" || *agentSocket == "" {
+	var out io.Writer = os.Stderr
+	if *logFile != "" {
+		out = newHelperLog(*logFile, sandbox.VMHostLogMaxBytes, os.Stderr, []int{1, 2})
+	}
+	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(log)
+
+	if err := run(log, *specPath, *agentSocket, *consoleLog, *stopGrace); err != nil {
+		log.Error("vm host failed", "err", err)
+		os.Exit(1)
+	}
+}
+
+// run builds the machine and drives it until it stops.
+func run(log *slog.Logger, specPath, agentSocket, consoleLog string, stopGrace time.Duration) error {
+	if specPath == "" || agentSocket == "" {
 		flag.Usage()
 		return errors.New("both --spec and --agent-socket are required")
 	}
@@ -127,11 +145,11 @@ func run(log *slog.Logger) error {
 			"before it can create a virtual machine", sandbox.VMHostName)
 	}
 
-	spec, err := vmhost.ReadSpec(*specPath)
+	spec, err := vmhost.ReadSpec(specPath)
 	if err != nil {
 		return err
 	}
-	cfg, err := vmhost.FromSpec(spec, defaultOptions(*specPath, *consoleLog))
+	cfg, err := vmhost.FromSpec(spec, defaultOptions(specPath, consoleLog))
 	if err != nil {
 		return err
 	}
@@ -144,13 +162,32 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	lis, err := listenAgentSocket(*agentSocket)
+	lis, err := listenAgentSocket(agentSocket)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = lis.Close()
-		_ = os.Remove(*agentSocket)
+		_ = os.Remove(agentSocket)
+	}()
+
+	// The control socket, beside the agent socket and as private: one JSON
+	// line naming this helper's protocol version and pid per connection. It is
+	// how a restarted daemon tells this helper from anything else before it
+	// adopts it, and it never relays a byte to the guest.
+	ctlPath := filepath.Join(filepath.Dir(agentSocket), sandbox.VMHostControlSocketName)
+	ctl, err := listenAgentSocket(ctlPath)
+	if err != nil {
+		return fmt.Errorf("control socket: %w", err)
+	}
+	defer func() {
+		_ = ctl.Close()
+		_ = os.Remove(ctlPath)
+	}()
+	go func() {
+		if err := sandbox.ServeVMHostControl(ctl, sandbox.VMHostVersion{Protocol: sandbox.VMHostProtocolVersion, Pid: os.Getpid()}); err != nil {
+			log.Warn("the control socket stopped serving; a restarted daemon will not adopt this helper", "err", err)
+		}
 	}()
 
 	// SIGTERM arrives as a context cancellation, so the lifecycle needs no signal
@@ -172,7 +209,7 @@ func run(log *slog.Logger) error {
 	// clamps the value to MaxStopGrace, so an over-long pod grace is bounded here
 	// rather than trusted.
 	lc := vmhost.NewLifecycle(runner, vmhost.NewAgentStopper(dial), vmhost.LifecycleOptions{
-		Grace:  *stopGrace,
+		Grace:  stopGrace,
 		Logger: log,
 	})
 
@@ -206,11 +243,12 @@ func defaultOptions(specPath, consoleLog string) vmhost.Options {
 	}
 }
 
-// listenAgentSocket creates the runtimed-private unix socket the daemon dials.
+// listenAgentSocket creates a runtimed-private unix socket the daemon dials:
+// the agent socket, and the control socket beside it.
 //
-// A stale socket is removed first. The helper dies with the daemon, and a SIGKILL
-// leaves the socket file behind; without the unlink the next pod with the same id
-// would fail to bind for a reason that has nothing to do with it.
+// A stale socket is removed first. A SIGKILLed helper leaves its socket files
+// behind; without the unlink the next pod with the same id would fail to bind
+// for a reason that has nothing to do with it.
 func listenAgentSocket(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), agentSocketDirMode); err != nil {
 		return nil, fmt.Errorf("agent socket dir: %w", err)

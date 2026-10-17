@@ -152,10 +152,13 @@ func runtimeFingerprint(log *slog.Logger) string {
 // leader alive under the recorded pgid with exactly the recorded start, spawned
 // by this very build. See the file header for what is and is not rebuilt.
 //
+// A vm pod takes its own branch (attachVMPod, vmattach.go): its one process is
+// the k3sm-vmhost helper, adopted through the vm record store.
+//
 // It returns ErrNothingToAttach (wrapped) when there is nothing it may adopt —
-// no adoptable record, a vm pod (the vm sweep never keeps one), a pod that was
-// still running a plain init container, or a call after the startup reap began —
-// and the caller then creates the pod. A pod already known to the runtime is
+// no adoptable record, a vm helper that fails adoption, a pod that was still
+// running a plain init container, or a call after the startup reap began — and
+// the caller then creates the pod. A pod already known to the runtime is
 // returned as it is, as CreatePod does.
 //
 // ORDERING INVARIANT: the caller attaches every pod bound to the node BEFORE it
@@ -182,9 +185,16 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 		return nil, fmt.Errorf("attach pod %s: the startup reap has already run: %w", podID, ErrNothingToAttach)
 	}
 
-	selected, err := sandbox.SelectBackend(box.GetSandboxProfile().GetBackend(), os.Geteuid() == 0, r.backend.Available(), r.vmBackend.Available())
-	if err != nil || selected == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
-		return nil, fmt.Errorf("attach pod %s: not a host-process pod: %w", podID, ErrNothingToAttach)
+	requested := box.GetSandboxProfile().GetBackend()
+	selected, err := sandbox.SelectBackend(requested, os.Geteuid() == 0, r.backend.Available(), r.vmBackend.Available())
+	// A pod that asked for the vm backend is a vm pod whether or not this host
+	// could boot a NEW guest right now: Available() answers the create question,
+	// and the running helper is judged by its own adoption predicate instead.
+	if requested == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM || (err == nil && selected == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM) {
+		return r.attachVMPod(ctx, box)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("attach pod %s: no sandbox backend: %w: %w", podID, ErrNothingToAttach, err)
 	}
 
 	records, _, err := r.listPodProcRecords()

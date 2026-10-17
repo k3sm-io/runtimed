@@ -354,14 +354,32 @@ type VMBackend struct {
 	// activity rides the daemon's configured handler.
 	log *slog.Logger
 
-	// mu guards live only. Every helper call — spawn, health, signal — is made
-	// with mu released, so a blocked boot never blocks a concurrent StopVM or a
-	// GetRuntimeInfo probe.
+	// adopt holds the probes adoption is decided over (vmadopt.go): this
+	// daemon's own build, the boot session, a helper's code-directory hash, its
+	// control-socket version answer, and the exit watch an adopted helper is
+	// followed by. Production values are set by NewVMBackend; a test replaces
+	// them through WithVMAdoptionProbes.
+	adopt vmAdoptSeams
+	// selfVersionOnce/selfVersion cache this daemon's build fingerprint, read
+	// once through adopt.selfVersion.
+	selfVersionOnce sync.Once
+	selfVersion     string
+
+	// mu guards live, sweepStarted and refusals. Every helper call — spawn,
+	// health, signal — is made with mu released, so a blocked boot never blocks
+	// a concurrent StopVM or a GetRuntimeInfo probe.
 	mu sync.Mutex
-	// live maps pod id to its running helper. A pod is in it only between a
-	// SUCCESSFUL CreateVM and its stop, so membership means "this node holds a
-	// booted guest for this pod".
+	// live maps pod id to its running helper. A pod is in it between a
+	// SUCCESSFUL CreateVM (or AdoptVM) and its stop, so membership means "this
+	// node holds a booted guest for this pod".
 	live map[string]*vmProc
+	// sweepStarted is set when ReapOrphanVMs begins. From then on AdoptVM
+	// refuses: the sweep has classified the records, and a helper adopted after
+	// it would be one the sweep may already be killing.
+	sweepStarted bool
+	// refusals names, per recorded pgid, why AdoptVM refused it, so the sweep's
+	// kill line carries the reason.
+	refusals map[int]string
 }
 
 // VMBackendOption configures a VMBackend at construction.
@@ -461,6 +479,7 @@ func NewVMBackend(opts ...VMBackendOption) *VMBackend {
 		signal:           supervisor.SignalGroup,
 		procStart:        supervisor.ProcStartTimeNano,
 		procGroup:        supervisor.ProcGroupMembers,
+		adopt:            defaultVMAdoptSeams(),
 		live:             make(map[string]*vmProc),
 	}
 	for _, opt := range opts {
