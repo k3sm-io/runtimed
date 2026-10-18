@@ -77,7 +77,15 @@ type ShimGrant struct {
 //     leads, and kills an exec session whose stream ended. The container runs
 //     under another sandbox instance, and without this a confined process may
 //     signal nothing but itself (measured: EPERM). Neither target reaches a
-//     process outside this pod's group or the shim's own children;
+//     process outside this pod's group or the shim's own children. The pod
+//     profile carries the same pair since a native pod needs it too (Generate),
+//     so this tier restates it. (target same-sandbox) is not used: measured on
+//     macOS 27, it does distinguish two applications of identical profile text
+//     (a process cannot signal another that applied the same text separately),
+//     so it would not reach across pods, but it would also not reach between
+//     the shim and its container, which apply different profiles, and it
+//     scopes by sandbox instance rather than by the process tree the pod's
+//     teardown already owns;
 //   - system-sched on itself only: a BestEffort pod's exec session places
 //     itself in the darwin background band (setpriority(PRIO_DARWIN_PROCESS,
 //     0, PRIO_DARWIN_BG)) after the shim confined itself, and the pod profile
