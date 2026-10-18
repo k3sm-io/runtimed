@@ -47,7 +47,8 @@ import (
 // there is no 1 Hz guest ticker (see vmPodStats).
 //
 // Each reported pod's process count (PodStats.process) comes from the pod-reap
-// ledger through PodProcessCounts, read once per call rather than once per pod.
+// ledger (a vm pod's, from its helper's record in the vm orphan store) through
+// PodProcessCounts, read once per call rather than once per pod.
 // A pod the ledger has no answer for keeps process nil, which the wire contract
 // reads as "not reported"; a present 0 is a real count.
 func (r *Runtime) ListPodStats(ctx context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
