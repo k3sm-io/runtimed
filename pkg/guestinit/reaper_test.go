@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"sync"
 	"testing"
@@ -754,4 +755,115 @@ func (r *Reaper) pendingLen() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.pending)
+}
+
+// signalLine is one stop-time signalling line the guest wrote: the container,
+// the pid and the signal it names.
+type signalLine struct {
+	container string
+	pid       int64
+	signal    string
+}
+
+// signalCapture is a slog handler that keeps every record carrying a string
+// "signal" attribute, which is the shape of the stop path's signalling lines
+// (the exit line's "signal" is the numeric wait status, so it is not kept).
+type signalCapture struct {
+	mu    sync.Mutex
+	lines []signalLine
+}
+
+func (h *signalCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *signalCapture) Handle(_ context.Context, rec slog.Record) error {
+	var l signalLine
+	isSignal := false
+	rec.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "container":
+			l.container = a.Value.String()
+		case "pid":
+			l.pid = a.Value.Int64()
+		case "signal":
+			if a.Value.Kind() == slog.KindString {
+				l.signal = a.Value.String()
+				isSignal = true
+			}
+		}
+		return true
+	})
+	if isSignal {
+		h.mu.Lock()
+		h.lines = append(h.lines, l)
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *signalCapture) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *signalCapture) WithGroup(string) slog.Handler      { return h }
+
+func (h *signalCapture) snapshot() []signalLine {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]signalLine{}, h.lines...)
+}
+
+// TestStopLogsEachSignalledContainer pins the stop path's console narration: for
+// every container the guest signals at stop it writes one line naming the
+// container, its pid and the signal. A container that exits on SIGTERM gets one
+// SIGTERM line and no SIGKILL line; one that ignores SIGTERM until the grace
+// budget is spent gets a SIGTERM line and then a SIGKILL line. Those lines are
+// what tells an operator whether a workload ignored the TERM it was sent.
+func TestStopLogsEachSignalledContainer(t *testing.T) {
+	t.Parallel()
+	f := newFakeProc()
+	capture := &signalCapture{}
+	timerCh := make(chan time.Time, 1)
+	r := startReaper(t, f, ReaperOptions{
+		Logger:   slog.New(capture),
+		NewTimer: func(time.Duration) (<-chan time.Time, func() bool) { return timerCh, func() bool { return true } },
+	})
+	f.spawn(10)
+	r.Track("web", 10)
+	f.spawn(11)
+	r.Track("db", 11)
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- r.Stop(context.Background(), 30*time.Second) }()
+
+	for range 2 {
+		select {
+		case pid := <-f.termed:
+			if pid == 10 {
+				f.exit(10, WaitStatus{Signal: int(SignalTerm)})
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for SIGTERM")
+		}
+	}
+	// web is reaped; db ignores SIGTERM, so only the grace budget ends the wait.
+	waitFor(t, func() bool { return !r.anyLive([]int{10}) })
+	timerCh <- time.Now()
+
+	select {
+	case pid := <-f.killed:
+		if pid != 11 {
+			t.Fatalf("SIGKILL went to pid %d, want 11", pid)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SIGKILL")
+	}
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	want := []signalLine{
+		{container: "web", pid: 10, signal: "SIGTERM"},
+		{container: "db", pid: 11, signal: "SIGTERM"},
+		{container: "db", pid: 11, signal: "SIGKILL"},
+	}
+	if got := capture.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stop signalling lines =\n  %+v\nwant\n  %+v", got, want)
+	}
 }

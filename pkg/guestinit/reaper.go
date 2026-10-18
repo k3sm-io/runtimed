@@ -548,6 +548,12 @@ func (r *Reaper) newBudget(grace time.Duration, nothingToWaitFor bool) (*stopBud
 func (r *Reaper) terminate(ctx context.Context, b *stopBudget, group []int) []error {
 	var errs []error
 	for _, pid := range group {
+		// One console line per container signalled, BEFORE the signal: it is
+		// what tells a workload that ignored TERM from one that was never asked.
+		// It goes to the same logger as every other stop line, so it adds no
+		// sink a stop could block on that the stop did not already write to.
+		name, _ := r.liveName(pid)
+		r.log.Info("sending the container SIGTERM", "container", name, "pid", pid, "signal", "SIGTERM")
 		if err := r.proc.Kill(pid, SignalTerm); err != nil {
 			errs = append(errs, fmt.Errorf("term pid %d: %w", pid, err))
 		}
@@ -563,10 +569,12 @@ func (r *Reaper) terminate(ctx context.Context, b *stopBudget, group []int) []er
 func (r *Reaper) killLive(pids []int) []error {
 	var errs []error
 	for _, pid := range pids {
-		if !r.anyLive([]int{pid}) {
+		name, live := r.liveName(pid)
+		if !live {
 			continue
 		}
-		r.log.Warn("container did not exit within the grace budget; killing", "pid", pid)
+		r.log.Warn("container did not exit within the grace budget; killing", "container", name, "pid", pid,
+			"signal", "SIGKILL")
 		if err := r.proc.Kill(pid, SignalKill); err != nil {
 			errs = append(errs, fmt.Errorf("kill pid %d: %w", pid, err))
 		}
@@ -660,6 +668,15 @@ func (r *Reaper) awaitGone(ctx context.Context, timer <-chan time.Time, pids []i
 			return false
 		}
 	}
+}
+
+// liveName returns the container name of pid and whether pid is still tracked
+// and not yet reaped.
+func (r *Reaper) liveName(pid int) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name, ok := r.live[pid]
+	return name, ok
 }
 
 // anyLive reports whether any of pids is tracked and not yet reaped.
