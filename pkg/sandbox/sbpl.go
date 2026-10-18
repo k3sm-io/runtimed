@@ -116,6 +116,11 @@ var systemProtectedPrefixes = []string{
 	"/System/Cryptexes",
 }
 
+// podSignal is the native pod profile's signal tier (see Generate): its own
+// children and its own process group, the pair the resident shim's grant
+// carries (shimSignal).
+const podSignal = "(allow signal (target children))\n(allow signal (target pgrp))\n"
+
 // systemTLSConfigDir is the system TLS configuration directory (LibreSSL's
 // openssl.cnf, the CA bundle cert.pem, certs/) a pod may read. Generate grants
 // it read-only in both firmlink forms.
@@ -534,6 +539,20 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 	b.WriteString("(allow process-exec*)\n")
 	b.WriteString("(allow process-fork)\n")
+	// Signals within the pod: a process may signal its own children and its own
+	// process group, so a shell kills its job, a Python Pool terminates its
+	// workers, and an in-pod supervisor stops what it started. Without these a
+	// confined process can signal nothing but itself (measured: EPERM). Each pod
+	// is its own session and process group (the supervisor spawns it with
+	// POSIX_SPAWN_SETSID), so neither filter reaches another pod, the daemon or
+	// a host process. The ceiling (measured on macOS 27): a direct child stays
+	// reachable after it calls setsid or setpgid, and so does an orphan still in
+	// the group, but a grandchild that left the group, including one orphaned
+	// to launchd, is out of reach (EPERM). Pod teardown signals the group from
+	// outside the sandbox and is unaffected. Never (target same-sandbox) and
+	// never an unfiltered (allow signal): see shimSignal in shim.go and
+	// TestNativeProfileAllowsSignalsWithinPod.
+	b.WriteString(podSignal)
 
 	// --- allows (lowest precedence) ---------------------------------------
 	b.WriteString(";; read: OS + frameworks + validated extra read paths.\n")

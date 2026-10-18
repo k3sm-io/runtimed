@@ -7,6 +7,8 @@
 (import "system.sb")
 (allow process-exec*)
 (allow process-fork)
+(allow signal (target children))
+(allow signal (target pgrp))
 ;; read: OS + frameworks + validated extra read paths.
 (allow file-read*
   (subpath "/Library")
