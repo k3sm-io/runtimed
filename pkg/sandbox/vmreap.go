@@ -217,8 +217,9 @@ func (b *VMBackend) recordVMProc(vp *vmProc) (string, error) {
 	return final, nil
 }
 
-// removeVMProcRecord drops a LIVE helper's record once its exit has been
-// observed, by the same name recordVMProc wrote. Best-effort: a leftover record
+// removeVMProcRecord drops a LIVE helper's record, and its container-start
+// file (vmstarts.go), once its exit has been observed, by the same name
+// recordVMProc wrote. Best-effort: a leftover record
 // is harmless, because the sweep's identity check drops an unmatchable one
 // unsignaled.
 func (b *VMBackend) removeVMProcRecord(pgid int) {
@@ -226,13 +227,16 @@ func (b *VMBackend) removeVMProcRecord(pgid int) {
 	if root == "" {
 		return
 	}
+	b.removeVMStarts(pgid)
 	_ = os.Remove(filepath.Join(root, strconv.Itoa(pgid)+".json"))
 }
 
-// retireVMProcRecord drops a record the sweep read, by the path it came from.
+// retireVMProcRecord drops a record the sweep read, by the path it came from,
+// with its helper's container-start file.
 // See vmProcRecord.path for why the two removals differ.
 func (b *VMBackend) retireVMProcRecord(rec vmProcRecord) {
 	if rec.path != "" {
+		b.removeVMStarts(rec.Pgid)
 		_ = os.Remove(rec.path)
 		return
 	}
@@ -425,6 +429,7 @@ func (b *VMBackend) ReapOrphanVMs() error {
 		b.logger().Warn("removing a malformed vm reap record", "path", f)
 		_ = os.Remove(f)
 	}
+	b.sweepStrayVMStarts()
 	return nil
 }
 

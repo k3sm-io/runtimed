@@ -58,6 +58,16 @@ import (
 // per container (no pull happened in this daemon's life, so the field is
 // absent), and the container ids, which the replayed starts mint afresh because
 // the fold stamps them with host time.
+//
+// The container START is rebuilt, from the vm backend's persisted starts
+// (vmContainerStartStore): each container's entry is seeded with the start and
+// guest pid of the run its predecessor folded, and the replay of that same run
+// keeps the seeded start, so a re-attached container does not read as
+// restarted. COMPATIBILITY WINDOW: a helper whose starts were never persisted
+// (spawned by a daemon from before they were, or a backend without the store)
+// has nothing to seed, and its containers report the time the replay was
+// folded, which is what every re-attach reported before; that start is
+// persisted then, so the next restart keeps it.
 
 // ErrVMHelperUnadoptable reports a vm pod whose helper is still running its
 // guest but that this runtime may neither adopt nor stop: another runtime
@@ -77,6 +87,22 @@ var ErrVMHelperUnadoptable = errors.New("runtime: a live vm host helper for the 
 type unadoptedHelperProber interface {
 	UnadoptedHelper(podID string) (pid int, ok bool)
 }
+
+// vmContainerStartStore is the optional vm backend capability that persists
+// each guest container's start beside the helper's record (sandbox
+// vmstarts.go), so a daemon that adopts the helper reports the container's real
+// start. *sandbox.VMBackend has it; a backend without it persists nothing, and
+// its re-attached containers report the time the guest's replay was folded.
+// It is optional, not part of VMBackend, so consumers' own VMBackend fakes keep
+// compiling.
+type vmContainerStartStore interface {
+	RecordVMContainerStart(podID, container string, start sandbox.VMContainerStart) error
+	VMContainerStarts(podID string) map[string]sandbox.VMContainerStart
+}
+
+// The shipped backend must persist the starts, or every re-attach reports a
+// moved start again.
+var _ vmContainerStartStore = (*sandbox.VMBackend)(nil)
 
 // refuseBesideUnadoptedHelper returns ErrVMHelperUnadoptable (wrapped) for a vm
 // pod whose recorded helper is alive and unowned, and nil otherwise.
@@ -123,6 +149,11 @@ func (r *Runtime) attachVMPod(ctx context.Context, box *runtimev1.PodBox) (*runt
 		return nil, fmt.Errorf("attach pod %s: %w: %w", podID, ErrNothingToAttach, err)
 	}
 
+	var starts map[string]sandbox.VMContainerStart
+	if store, ok := r.vmBackend.(vmContainerStartStore); ok {
+		starts = store.VMContainerStarts(podID)
+	}
+
 	attachedAt := time.Now()
 	podCtx, podCancel := context.WithCancel(context.Background())
 	p := &pod{
@@ -154,6 +185,15 @@ func (r *Runtime) attachVMPod(ctx context.Context, box *runtimev1.PodBox) (*runt
 		st := p.guestContainerLocked(name, c.spec.GetImage())
 		st.RestartCount = instance
 		p.guestAwaitingReplay[name] = true
+		if s, ok := starts[name]; ok && s.StartUnixNano != 0 {
+			// The run the previous daemon folded. It is held beside the entry,
+			// not written into its state: until the guest's replay says what
+			// the container is, the entry stays stateless, as it was.
+			if p.guestSeededStarts == nil {
+				p.guestSeededStarts = map[string]sandbox.VMContainerStart{}
+			}
+			p.guestSeededStarts[name] = s
+		}
 		w, err := crilog.Open(path)
 		if err != nil {
 			r.log.Error("vm container output will not be recorded: its log file could not be re-opened",

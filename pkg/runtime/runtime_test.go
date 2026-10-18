@@ -130,6 +130,31 @@ type fakeVMBackend struct {
 	adoptErr    error
 	reapCalls   int
 	done        map[string]chan struct{}
+	// starts is the persisted container-start store, by pod then container.
+	starts map[string]map[string]sandbox.VMContainerStart
+}
+
+func (b *fakeVMBackend) RecordVMContainerStart(podID, container string, start sandbox.VMContainerStart) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.starts == nil {
+		b.starts = map[string]map[string]sandbox.VMContainerStart{}
+	}
+	if b.starts[podID] == nil {
+		b.starts[podID] = map[string]sandbox.VMContainerStart{}
+	}
+	b.starts[podID][container] = start
+	return nil
+}
+
+func (b *fakeVMBackend) VMContainerStarts(podID string) map[string]sandbox.VMContainerStart {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[string]sandbox.VMContainerStart{}
+	for k, v := range b.starts[podID] {
+		out[k] = v
+	}
+	return out
 }
 
 // fakeVMStop records one StopVM call: which pod, and with what grace.
