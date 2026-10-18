@@ -21,7 +21,9 @@ limitations under the License.
 // The libsandbox half landed with the Seatbelt exec-shim; the canary later grew to cover
 // the userspace-resource SPI the memory subsystem links. The covered set:
 //
-//   - libsandbox:  sandbox_compile_string / sandbox_apply / sandbox_free_error   (Seatbelt)
+//   - libsandbox:  sandbox_compile_string / sandbox_apply / sandbox_free_error /
+//     sandbox_free_profile                                                       (Seatbelt)
+//   - SBPL grammar: the per-pod POSIX semaphore grant (sandbox.PosixSemStanza)    must compile
 //   - libSystem:   proc_pid_rusage                                               (ri_phys_footprint sampler), PUBLIC but load-bearing
 //   - libSystem:   memorystatus_control                                          (jetsam probe), PRIVATE/deprecated SPI
 //   - libSystem:   posix_spawnattr_setpcontrol_np                                (pod pressure-kill mark), PRIVATE SPI
@@ -33,6 +35,11 @@ limitations under the License.
 // depends on it staying linkable, and memorystatus_control has NO public header at all.
 // Note Virtualization.framework (the vm sandbox backend) is a PUBLIC framework and is explicitly
 // not a canary case — do not add VZ symbols here.
+//
+// The grammar case differs from the symbol cases in what a failure costs: the runtime
+// compiles the semaphore stanza itself before emitting it, so a macOS that rejects the
+// spelling leaves pods with their semaphores denied rather than failing every pod.
+// TestPosixSemStanzaCompiles makes that silent downgrade loud in CI.
 //
 // canary_darwin.go (cgo) takes the address of each symbol so the package fails to LINK if one
 // vanishes; TestSymbolsResolve (libsandbox), TestResourceSymbolsResolve (the resource SPI) and
