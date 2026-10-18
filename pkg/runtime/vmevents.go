@@ -30,6 +30,8 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"k3sm.io/runtimed/pkg/sandbox"
+
 	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -112,6 +114,9 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 		return
 	}
 	at := nowProto()
+	// persist is the start of a run this fold observed first, recorded beside
+	// the helper once p.mu is released (vmContainerStartStore).
+	var persist *sandbox.VMContainerStart
 
 	p.mu.Lock()
 	st := p.guestContainerLocked(name, spec.GetImage())
@@ -120,6 +125,7 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 		// last_termination_state and the count advances, in this one hold of
 		// p.mu, so no observer sees one without the other.
 		foldGuestRestartLocked(p, st, name, started.GetPid(), at)
+		persist = &sandbox.VMContainerStart{Pid: started.GetPid(), StartUnixNano: at.AsTime().UnixNano()}
 	} else if started != nil {
 		// The container id is minted once, on the first start, and then only
 		// carried: a container that never started has none (as upstream), and a
@@ -130,7 +136,34 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 		if w := p.guestLogs[name]; w != nil {
 			st.LogPath = w.Path()
 		}
-		st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: at}}
+		// A start of a run the host already knows is a replay, and keeps that
+		// run's start, or the container would read as restarted at every
+		// replay: a resubscribe repeating the running instance (same guest
+		// pid), or the snapshot an adopting daemon's first subscription
+		// receives for the run its predecessor folded and persisted (the
+		// seed). Any other start is a new run, stamped now and persisted.
+		prevPid, seen := p.guestPIDs[name]
+		seed, seeded := p.guestSeededStarts[name]
+		switch {
+		case st.GetState().GetRunning().GetStartedAt() != nil && seen && prevPid == started.GetPid():
+		case seeded && seed.Pid == started.GetPid():
+			// The guest pid is a weak run identity: a restart that reused the
+			// pid while no daemon watched keeps the old start (cosmetic only).
+			if seed.StartUnixNano > at.AsTime().UnixNano() {
+				// The host clock stepped back since the seed was recorded: a
+				// future startedAt is never published. The clamp is persisted,
+				// so the next restart keeps it.
+				st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: at}}
+				persist = &sandbox.VMContainerStart{Pid: started.GetPid(), StartUnixNano: at.AsTime().UnixNano()}
+				break
+			}
+			st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{
+				StartedAt: timestamppb.New(time.Unix(0, seed.StartUnixNano)),
+			}}
+		default:
+			st.State = &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: at}}
+			persist = &sandbox.VMContainerStart{Pid: started.GetPid(), StartUnixNano: at.AsTime().UnixNano()}
+		}
 		st.Ready = true
 	} else {
 		term := &runtimev1.ContainerStateTerminated{
@@ -166,6 +199,7 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 		}
 	}
 	delete(p.guestAwaitingReplay, name)
+	delete(p.guestSeededStarts, name)
 	if started != nil {
 		if p.guestPIDs == nil {
 			p.guestPIDs = map[string]int32{}
@@ -190,6 +224,15 @@ func (r *Runtime) applyGuestContainerEvent(p *pod, ev *guestv1.ContainerEvent) {
 	// event-driven notice that a vm pod moved, and a terminal transition it never
 	// hears is a pod that only a resync would ever correct.
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+
+	if persist != nil {
+		if store, ok := r.vmBackend.(vmContainerStartStore); ok {
+			if err := store.RecordVMContainerStart(p.box.GetPodId(), name, *persist); err != nil {
+				r.log.Warn("cannot persist a vm container's start; after a daemon restart it will report the restart's replay time",
+					"pod", p.box.GetPodId(), "container", name, "err", err)
+			}
+		}
+	}
 }
 
 // guestRestart is one in-guest RestartContainer in flight for a vm container:

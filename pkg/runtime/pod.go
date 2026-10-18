@@ -161,6 +161,12 @@ type pod struct {
 	// not published until the guest's replay folds one (the fold clears the
 	// mark). Guarded by mu.
 	guestAwaitingReplay map[string]bool
+	// guestSeededStarts is, per container of a vm pod AttachPod adopted, the
+	// start of the run the previous daemon folded, as the vm backend persisted
+	// it. The container's first folded event after the attach consumes it, and
+	// a replayed start of that same run (same guest pid) carries it as the
+	// run's start. Guarded by mu.
+	guestSeededStarts map[string]sandbox.VMContainerStart
 
 	// cpuAcc carries each container's cumulative CPU across restarts so the value
 	// ListPodStats reports is monotone for the pod's whole life: a restarted

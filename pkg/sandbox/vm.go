@@ -384,6 +384,9 @@ type VMBackend struct {
 	// refusals names, per recorded pgid, why AdoptVM refused it, so the sweep's
 	// kill line carries the reason.
 	refusals map[int]string
+	// startsMu serializes the read-modify-write of the container-start files
+	// (vmstarts.go). It is separate from mu because it is held across disk I/O.
+	startsMu sync.Mutex
 }
 
 // VMBackendOption configures a VMBackend at construction.
