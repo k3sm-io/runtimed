@@ -180,10 +180,57 @@ func bootSessionID() (string, error) {
 	return s, nil
 }
 
+// vmAdoptPeerAttempts bounds how many times dialVMHostVersion dials a helper
+// that closed the connection before the kernel could name it. Each attempt is
+// a fresh connect and costs well under a millisecond; under -race a
+// banner-and-close helper beat the peer read on about 1 to 4 dials in 100, so
+// five attempts leave a chance far below one in a million of refusing a
+// healthy one.
+const vmAdoptPeerAttempts = 5
+
+// errVMHostPeerGone marks the one dial failure dialVMHostVersion retries: the
+// helper closed the connection before LOCAL_PEERPID was read (ENOTCONN).
+var errVMHostPeerGone = errors.New("the helper closed the connection before its peer could be read")
+
 // dialVMHostVersion asks the helper behind socket for its version and reads,
-// from the kernel, which process answered (LOCAL_PEERPID). ctx bounds the dial
-// and the read.
+// from the kernel, which process answered (LOCAL_PEERPID). ctx bounds every
+// attempt together; without a deadline the bound is vmAdoptProbeTimeout.
+//
+// A helper that serves its banner and closes at once (ServeVMHostControl,
+// what a helper that predates the shorten request serves) can be gone before
+// the kernel is asked: the peer read then fails with ENOTCONN, and nothing
+// says who answered. That attempt is discarded and the socket dialled again,
+// at most vmAdoptPeerAttempts times. The identity rule is untouched: an answer
+// is returned only with a pid the kernel named on that same connection, and
+// the caller still requires it to be the recorded helper (vmAdoptDecision).
+// A helper that is gone fails the dial itself and is not retried; one that
+// closes first on every attempt is refused.
 func dialVMHostVersion(ctx context.Context, socket string) (vmHostAnswer, error) {
+	return dialVMHostVersionWith(ctx, socket, controlPeerPid)
+}
+
+// dialVMHostVersionWith is dialVMHostVersion with the peer-pid read as a
+// parameter, so a test can order the read after the helper's close.
+func dialVMHostVersionWith(ctx context.Context, socket string, peerPid func(net.Conn) (int, error)) (vmHostAnswer, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, vmAdoptProbeTimeout)
+		defer cancel()
+	}
+	var err error
+	for range vmAdoptPeerAttempts {
+		var ans vmHostAnswer
+		ans, err = dialVMHostVersionOnce(ctx, socket, peerPid)
+		if !errors.Is(err, errVMHostPeerGone) || ctx.Err() != nil {
+			return ans, err
+		}
+	}
+	return vmHostAnswer{}, fmt.Errorf("%w (%d attempts)", err, vmAdoptPeerAttempts)
+}
+
+// dialVMHostVersionOnce is one connection: the kernel's peer pid, then the
+// version line. A peer read that fails with ENOTCONN wraps errVMHostPeerGone.
+func dialVMHostVersionOnce(ctx context.Context, socket string, peerPid func(net.Conn) (int, error)) (vmHostAnswer, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", socket)
 	if err != nil {
@@ -192,10 +239,11 @@ func dialVMHostVersion(ctx context.Context, socket string) (vmHostAnswer, error)
 	defer func() { _ = conn.Close() }()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(vmAdoptProbeTimeout))
 	}
-	peer, err := controlPeerPid(conn)
+	peer, err := peerPid(conn)
+	if errors.Is(err, unix.ENOTCONN) {
+		return vmHostAnswer{}, fmt.Errorf("peer of %s: %w: %w", socket, errVMHostPeerGone, err)
+	}
 	if err != nil {
 		return vmHostAnswer{}, fmt.Errorf("peer of %s: %w", socket, err)
 	}
