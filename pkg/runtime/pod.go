@@ -791,6 +791,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 		ReadOnlyPaths: credPaths,
 		WritePaths:    pvWrite,
 		ReadPaths:     pvRead,
+		// The pod's own POSIX semaphore prefix is derived from this and nothing
+		// else; containerEnv publishes the same derivation to the shim.
+		PodUID: box.GetPodId(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
@@ -3063,6 +3066,14 @@ const (
 	pathShimMountsEnv = "K3SM_MOUNT_PATHS"
 )
 
+// semPrefixEnv names the pod's POSIX semaphore prefix (sandbox.PosixSemPrefix)
+// for the path-rebase shim, which moves a workload's sem_open/sem_unlink names
+// under it. It is runtime-owned like K3SM_SHADOW_DIR: a spec value is dropped.
+// It is a compatibility aid only; the profile's prefix filter is the
+// enforcement, so a wrong or missing value means EPERM, never another pod's
+// semaphore.
+const semPrefixEnv = "K3SM_SEM_PREFIX"
+
 // tmpDirEnv is the environment variable every POSIX temp-file API consults, and
 // podTmpDirName is the directory inside the pod data volume runtimed provisions
 // for it.
@@ -3243,7 +3254,8 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		// K3SM_SHADOW_DIR is runtime-owned: only Config.ShadowBinDir may set
 		// it (appended below), so a spec cannot aim the interposer anywhere.
 		// K3SM_SHIM_REPORT likewise: only the runtime names the report file.
-		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv {
+		// K3SM_SEM_PREFIX likewise: only the pod UID derives it.
+		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv || name == semPrefixEnv {
 			continue
 		}
 		env = append(env, e)
@@ -3286,6 +3298,17 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 			inserts = append(inserts, r.cfg.PathShimPath)
 		}
 		env = append(env, shadowDirEnv+"="+r.cfg.ShadowBinDir)
+	}
+	// The semaphore-name rewrite rides whichever of the two above loaded the
+	// shim: the pod's prefix, derived from the pod UID exactly as the profile's
+	// grant is (compileProfile), so the names the shim writes are the names the
+	// kernel allows.
+	if len(inserts) > 0 {
+		prefix, err := sandbox.PosixSemPrefix(box.GetPodId())
+		if err != nil {
+			return nil, fmt.Errorf("semaphore prefix for pod %s: %w", box.GetPodId(), err)
+		}
+		env = append(env, semPrefixEnv+"="+prefix)
 	}
 	if ins := box.GetAnnotations()[dyldInsertAnnotation]; ins != "" {
 		inserts = append(inserts, ins)

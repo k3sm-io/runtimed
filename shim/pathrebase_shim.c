@@ -151,6 +151,28 @@
  * every failure (EMFILE, EACCES, ENOSPC, a FIFO or a symlink at the path, a
  * target too long for the buffer) is ignored with errno restored.
  *
+ * POSIX semaphore names (a fourth job, configured by
+ *   K3SM_SEM_PREFIX   - the pod's semaphore prefix, "/k3sm.<8 hex>."
+ * and read ONCE, by the same load-time constructor). macOS has one host-wide
+ * POSIX semaphore namespace, so the pod profile grants semaphores only under
+ * the pod's own name prefix and the kernel refuses every other name with
+ * EPERM. sem_open and sem_unlink are interposed to move a name that lacks the
+ * prefix under it: one leading '/' is dropped and the rest appended to the
+ * prefix ("/mp-abc" becomes "/k3sm.0123abcd.mp-abc"), so a workload that picks
+ * its own names (Python multiprocessing, anything on POSIX semaphores) works
+ * unchanged. The rewrite is a pure function of the name, so a child that
+ * re-opens a semaphore by its original name reaches the same one. A name
+ * already under the prefix passes through. sem_open refuses a name of 31 bytes
+ * or more (PSEMNAMLEN), leaving 15 for the workload's part; a longer part is
+ * replaced by 15 hex digits of a 64-bit FNV-1a hash of that part (after the
+ * same leading '/' is dropped, so "/x" and "x" agree on both paths). sem_close takes a handle, not a name, so it needs no rewrite. A value
+ * that is not exactly the prefix shape leaves the rewrite off.
+ *
+ * This is a compatibility aid, not the isolation: the profile's prefix filter
+ * is. A process that loses the shim (a platform binary, an explicit
+ * DYLD_INSERT_LIBRARIES) keeps its own names and gets EPERM, and no rewrite
+ * can reach another pod's prefix, because this one only ever writes its own.
+ *
  * Everything on the exec path is async-signal-safe (stack buffers,
  * open/fstat/read/write/close/stat/lstat, no malloc; the rebase config is
  * parsed at load), because execve is routinely called in a forked child of a
@@ -162,8 +184,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -712,6 +736,84 @@ static size_t g_report_len;
  * pkg/shadowset/gen TestShadowTableIsCurrent. */
 #include "shadow_table.h"
 
+/* -------- POSIX semaphore names -------- */
+
+#define K3SM_SEM_PREFIX_LEN 15 /* "/k3sm." + 8 hex + "." */
+#define K3SM_SEM_NAME_MAX 30   /* sem_open refuses strlen >= PSEMNAMLEN (31) */
+
+static char g_sem_prefix[K3SM_SEM_PREFIX_LEN + 1];
+static size_t g_sem_prefix_len; /* 0: the rewrite is off */
+
+/* k3sm_sem_init accepts K3SM_SEM_PREFIX only in the exact prefix shape. */
+static void k3sm_sem_init(void) {
+    const char *p = getenv("K3SM_SEM_PREFIX");
+    if (p == NULL || strlen(p) != K3SM_SEM_PREFIX_LEN || strncmp(p, "/k3sm.", 6) != 0 ||
+        p[K3SM_SEM_PREFIX_LEN - 1] != '.') {
+        return;
+    }
+    for (int i = 6; i < K3SM_SEM_PREFIX_LEN - 1; i++) {
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f'))) {
+            return;
+        }
+    }
+    memcpy(g_sem_prefix, p, K3SM_SEM_PREFIX_LEN + 1);
+    g_sem_prefix_len = K3SM_SEM_PREFIX_LEN;
+}
+
+/*
+ * k3sm_sem_name returns name moved under the pod prefix (written into buf, at
+ * least K3SM_SEM_NAME_MAX + 1 bytes), or name itself when the rewrite is off or
+ * name already carries the prefix.
+ */
+static const char *k3sm_sem_name(const char *name, char *buf) {
+    if (g_sem_prefix_len == 0 || name == NULL ||
+        strncmp(name, g_sem_prefix, g_sem_prefix_len) == 0) {
+        return name;
+    }
+    const char *rest = name[0] == '/' ? name + 1 : name;
+    size_t rl = strlen(rest);
+    memcpy(buf, g_sem_prefix, g_sem_prefix_len);
+    if (g_sem_prefix_len + rl <= K3SM_SEM_NAME_MAX) {
+        memcpy(buf + g_sem_prefix_len, rest, rl + 1);
+        return buf;
+    }
+    /* Too long: 15 hex digits (the top 60 bits) of FNV-1a over the same part
+     * the short path keeps (one leading '/' dropped), so "/x..." and "x..."
+     * reach the same semaphore on both paths. */
+    uint64_t h = 14695981039346656037ULL;
+    for (const unsigned char *c = (const unsigned char *)rest; *c != '\0'; c++) {
+        h ^= *c;
+        h *= 1099511628211ULL;
+    }
+    static const char hexd[] = "0123456789abcdef";
+    size_t n = K3SM_SEM_NAME_MAX - g_sem_prefix_len;
+    for (size_t i = 0; i < n; i++) {
+        buf[g_sem_prefix_len + i] = hexd[(h >> (60 - 4 * i)) & 0xf];
+    }
+    buf[K3SM_SEM_NAME_MAX] = '\0';
+    return buf;
+}
+
+/* sem_open is variadic: mode and value are read only with O_CREAT. */
+sem_t *k3sm_sem_open(const char *name, int oflag, ...) {
+    char buf[K3SM_SEM_NAME_MAX + 1];
+    const char *n = k3sm_sem_name(name, buf);
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        unsigned int value = va_arg(ap, unsigned int);
+        va_end(ap);
+        return sem_open(n, oflag, mode, value);
+    }
+    return sem_open(n, oflag);
+}
+
+int k3sm_sem_unlink(const char *name) {
+    char buf[K3SM_SEM_NAME_MAX + 1];
+    return sem_unlink(k3sm_sem_name(name, buf));
+}
+
 __attribute__((constructor)) static void k3sm_shadow_init(void) {
     /* Settle the rebase config at load too, so an exec in a forked child
      * never runs the (non-async-signal-safe) parse. */
@@ -724,6 +826,7 @@ __attribute__((constructor)) static void k3sm_shadow_init(void) {
             g_report_len = rl;
         }
     }
+    k3sm_sem_init();
     const char *d = getenv("K3SM_SHADOW_DIR");
     if (d == NULL || d[0] != '/') {
         return;
@@ -1110,4 +1213,6 @@ __attribute__((used)) static const interpose_t k3sm_path_interposers[]
         {(const void *)k3sm_freopen, (const void *)freopen},
         {(const void *)k3sm_execve, (const void *)execve},
         {(const void *)k3sm_posix_spawn, (const void *)posix_spawn},
+        {(const void *)k3sm_sem_open, (const void *)sem_open},
+        {(const void *)k3sm_sem_unlink, (const void *)sem_unlink},
 };

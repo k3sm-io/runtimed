@@ -33,6 +33,7 @@ package spicanary
 extern void *sandbox_compile_string(const char *data, void *params, char **error);
 extern int   sandbox_apply(void *profile);
 extern void  sandbox_free_error(char *error);
+extern void  sandbox_free_profile(void *profile);
 extern int   sandbox_check(pid_t pid, const char *operation, int type, ...);
 
 // k3sm_sandbox_symbols returns a non-zero value built from the symbol addresses,
@@ -42,8 +43,25 @@ static uintptr_t k3sm_sandbox_symbols(void) {
 	s ^= (uintptr_t)&sandbox_compile_string;
 	s ^= (uintptr_t)&sandbox_apply;
 	s ^= (uintptr_t)&sandbox_free_error;
+	s ^= (uintptr_t)&sandbox_free_profile;
 	s ^= (uintptr_t)&sandbox_check;
 	return s;
+}
+
+// k3sm_sbpl_compiles compiles profile (nothing is applied) and reports whether
+// libsandbox accepted it: the grammar half of the canary, for SBPL spellings the
+// runtime only emits after its own compile probe accepts them.
+static int k3sm_sbpl_compiles(const char *profile) {
+	char *err = NULL;
+	void *p = sandbox_compile_string(profile, NULL, &err);
+	if (err != NULL) {
+		sandbox_free_error(err);
+	}
+	if (p == NULL) {
+		return 0;
+	}
+	sandbox_free_profile(p);
+	return 1;
 }
 
 // The userspace-resource SPI the supervisor's memory subsystem links — all
@@ -124,6 +142,13 @@ func symbolResolves(name string) bool {
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 	return C.k3sm_dlsym_resolves(cName) != 0
+}
+
+// sbplCompiles reports whether this macOS's libsandbox compiles profile.
+func sbplCompiles(profile string) bool {
+	cs := C.CString(profile)
+	defer C.free(unsafe.Pointer(cs))
+	return C.k3sm_sbpl_compiles(cs) == 1
 }
 
 // codesignSymbolsResolve reports whether the code-signing SPI (csops) linked.

@@ -318,6 +318,11 @@ type GenerateOptions struct {
 	// ReadPaths get a read-only allow (no write): the read_only persistent-volume
 	// mount roots. Default-deny then blocks writes to them.
 	ReadPaths []string
+	// PodUID is the kube Pod UID (PodBox.pod_id). When set, Generate grants the
+	// pod its own POSIX named semaphores, filtered to the prefix PosixSemPrefix
+	// derives from it (posixsem.go); empty grants none. Not in the proto: the
+	// pod id already is, and the prefix is derived from it here, never sent.
+	PodUID string
 }
 
 // Generate renders a default-deny SBPL profile for one pod from sp and opts.
@@ -339,6 +344,11 @@ type GenerateOptions struct {
 // claim: a host with no usable Metal device honours the flag by granting access
 // that then finds no device, and GetRuntimeInfo's GPUFacts is where a caller
 // learns what the host actually has.
+//
+// When opts.PodUID is set the allow tier also carries the pod's POSIX named
+// semaphores, filtered to the per-pod name prefix PosixSemPrefix derives from
+// the UID (posixsem.go). Never a bare (allow ipc-posix-sem): macOS has one
+// host-wide semaphore namespace, and the prefix filter is the whole isolation.
 //
 // The pods-root and the protected-prefix deny-set are derived from opts.Posture
 // (the node-level work-dir), so a user-space daemon whose work-dir lives under
@@ -488,6 +498,20 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	}
 	credPaths := dedupeSorted(opts.ReadOnlyPaths)
 	deniedSockets := dedupeSorted(sp.GetDeniedUnixSocketPaths())
+	// The semaphore prefix is derived and shape-checked before anything is
+	// written, so a pod UID that yields no valid prefix fails the profile.
+	semStanza := ""
+	if opts.PodUID != "" {
+		prefix, err := PosixSemPrefix(opts.PodUID)
+		if err != nil {
+			return "", err
+		}
+		if posixSemGrammarAccepted() {
+			if semStanza, err = PosixSemStanza(prefix); err != nil {
+				return "", err
+			}
+		}
+	}
 	// Range-checked before anything is written, and unconditionally — a malformed
 	// entry is the caller's bug whether or not this pod asked for network, and
 	// reporting it only for networked pods would hide it until the first pod that
@@ -577,6 +601,12 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	if xcodeDir != "" {
 		b.WriteString(xcodeToolchainStanza(xcodeDir))
 	}
+
+	// POSIX named semaphores (opts.PodUID): this pod's own prefix only. Emitted
+	// in the allows tier; nothing later in the profile names ipc operations, so
+	// tier order does not change its reach. Left out when the host's libsandbox
+	// does not compile it, which leaves semaphores denied. See posixsem.go.
+	b.WriteString(semStanza)
 
 	// --- AF_UNIX helper-socket denies (higher precedence than network allows) --
 	// Pods share the runtime client's uid (the unprivileged _k3sm posture has no
