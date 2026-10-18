@@ -309,7 +309,19 @@ type VMHostShortenOutcome struct {
 // bound, a malformed exchange or a timeout after the request was sent are
 // errors. Either way the caller's SIGTERM is still what follows: on a
 // shortened stop it is redundant, and on anything else it is the stop.
+//
+// A helper that predates the request writes its banner and closes at once, so
+// it can be gone before the kernel is asked for the peer: LOCAL_PEERPID then
+// fails with ENOTCONN. That is the banner-only helper, not a failure, and it
+// is VMHostShortenUnsupported; the identity rule still holds, because nothing
+// is ever sent to a peer the kernel did not name.
 func ShortenVMHostStop(ctx context.Context, socket string, pid int, bound time.Duration) (VMHostShortenOutcome, error) {
+	return shortenVMHostStop(ctx, socket, pid, bound, controlPeerPid)
+}
+
+// shortenVMHostStop is ShortenVMHostStop with the peer-pid read as a parameter,
+// so a test can order the read after the helper has closed the connection.
+func shortenVMHostStop(ctx context.Context, socket string, pid int, bound time.Duration, peerPid func(net.Conn) (int, error)) (VMHostShortenOutcome, error) {
 	if pid <= 1 {
 		return VMHostShortenOutcome{}, fmt.Errorf("shorten the vm host stop: no helper pid (%d)", pid)
 	}
@@ -327,7 +339,10 @@ func ShortenVMHostStop(ctx context.Context, socket string, pid int, bound time.D
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
-	peer, err := controlPeerPid(conn)
+	peer, err := peerPid(conn)
+	if errors.Is(err, syscall.ENOTCONN) {
+		return VMHostShortenOutcome{Reason: "the helper closed the connection before its peer could be read, as one that predates the request does"}, nil
+	}
 	if err != nil {
 		return VMHostShortenOutcome{}, fmt.Errorf("peer of %s: %w", socket, err)
 	}
