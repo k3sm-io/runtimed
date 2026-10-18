@@ -45,6 +45,11 @@ import (
 // bounded twice — by guestStatsTimeout per pod and by the caller's own ctx
 // overall — and because a node runs few vm pods; it is also the whole reason
 // there is no 1 Hz guest ticker (see vmPodStats).
+//
+// Each reported pod's process count (PodStats.process) comes from the pod-reap
+// ledger through PodProcessCounts, read once per call rather than once per pod.
+// A pod the ledger has no answer for keeps process nil, which the wire contract
+// reads as "not reported"; a present 0 is a real count.
 func (r *Runtime) ListPodStats(ctx context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
 	ids := r.statsTargets(req.GetPodId())
 	out := make([]*runtimev1.PodStats, 0, len(ids))
@@ -53,7 +58,27 @@ func (r *Runtime) ListPodStats(ctx context.Context, req *runtimev1.ListPodStatsR
 			out = append(out, st)
 		}
 	}
+	if len(out) > 0 {
+		r.attachProcessCounts(out)
+	}
 	return &runtimev1.ListPodStatsResponse{PodStats: out}, nil
+}
+
+// attachProcessCounts fills PodStats.process for every pod in stats the ledger
+// reports. A ledger that cannot be read leaves every process nil: the rest of
+// the snapshot is still true, and an absent count is the honest encoding of an
+// unknown one.
+func (r *Runtime) attachProcessCounts(stats []*runtimev1.PodStats) {
+	counts, err := r.PodProcessCounts()
+	if err != nil {
+		r.log.Debug("pod process counts unavailable", "err", err)
+		return
+	}
+	for _, ps := range stats {
+		if n, ok := counts[ps.GetPodId()]; ok {
+			ps.Process = &runtimev1.ProcessStats{ProcessCount: n}
+		}
+	}
 }
 
 // statsTargets returns the pod ids ListPodStats should sample: the single id when

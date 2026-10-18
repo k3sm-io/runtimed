@@ -386,6 +386,86 @@ func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []st
 	return readPodReapStore(r.podReapRoot(), r.log)
 }
 
+// PodProcessCounts reports, per pod, how many live processes are members of the
+// process groups the pod-reap ledger records for it: pod id -> count. It is the
+// source of PodStats.process (ListPodStats), and the only one: the count is read
+// from the ledger this daemon writes at spawn and probed through the same
+// procGroup seam the reap uses (supervisor.ProcGroupMembers in production), never
+// by enumerating the process table for something that looks like a pod's.
+//
+// The count is a LOWER BOUND on the pod's processes. A process that left its
+// group (setsid) is in no recorded group, so it is not counted; that is the
+// setsid-escape ceiling in this file's header, seen from the counting side.
+//
+// A group is counted only when the record still proves it is the pod's, by the
+// same exact-instance identity the reap and AttachPod match on:
+//   - the leader member (Pid == Pgid) reports exactly the recorded start: every
+//     member counts;
+//   - the leader is gone but the recorded container (ChildPid at exactly
+//     ChildStartUnixNano, a resident shim's child) is still a member: every
+//     member counts;
+//   - otherwise (a recycled pgid, a zero-identity record, a leaderless group
+//     nothing proves) the group contributes 0 rather than a stranger's processes.
+//
+// Absence and zero are distinct answers:
+//   - a pod with at least one record whose groups were all inspected is present,
+//     with 0 when no group has a live member;
+//   - a pod with no record is absent (the daemon does not report it);
+//   - a pod any of whose groups cannot be inspected is absent too: a partial sum
+//     is not the pod's count, and reporting one would understate it.
+//
+// Quarantined (structurally invalid) records are skipped and left for the reap
+// to remove; this reader never mutates the ledger. It takes no runtime lock: the
+// ledger's writers commit each record with a rename (writePodProcRecord), so a
+// reader sees a whole record or none, and a record removed mid-read is a group
+// that just emptied. The error is the ledger root being unreadable.
+func (r *Runtime) PodProcessCounts() (map[string]uint64, error) {
+	records, _, err := r.listPodProcRecords()
+	if err != nil {
+		return nil, fmt.Errorf("read the pod process ledger: %w", err)
+	}
+	counts := make(map[string]uint64)
+	unknown := make(map[string]bool)
+	for _, rec := range records {
+		if unknown[rec.PodID] {
+			continue
+		}
+		members, ok := r.procGroup(rec.Pgid)
+		if !ok {
+			unknown[rec.PodID] = true
+			delete(counts, rec.PodID)
+			continue
+		}
+		counts[rec.PodID] += provenGroupMembers(rec, members)
+	}
+	return counts, nil
+}
+
+// provenGroupMembers returns how many of members (the live members of
+// rec.Pgid) count toward rec's pod: all of them when the record proves the
+// group is still the one it recorded, else 0 (see PodProcessCounts).
+func provenGroupMembers(rec podProcRecord, members []supervisor.ProcMember) uint64 {
+	if rec.Pgid <= 1 || rec.StartUnixNano == 0 {
+		return 0
+	}
+	proven := false
+	for _, m := range members {
+		if m.Pid == rec.Pgid {
+			// The leader decides alone: a leader with a different start is a
+			// recycled pgid, whatever else is in the group.
+			proven = m.StartUnixNano == rec.StartUnixNano
+			break
+		}
+		if rec.ChildPid > 0 && m.Pid == rec.ChildPid && m.StartUnixNano == rec.ChildStartUnixNano {
+			proven = true
+		}
+	}
+	if !proven {
+		return 0
+	}
+	return uint64(len(members))
+}
+
 // ReadPodReapRecords returns every well-formed pod process-group record under
 // the runtime data root dataRoot (Config.Root; "" means image.DefaultRoot, as it
 // does for the daemon) — the same files the startup reap reads. A missing store
