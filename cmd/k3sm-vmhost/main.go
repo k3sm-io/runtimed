@@ -171,30 +171,6 @@ func run(log *slog.Logger, specPath, agentSocket, consoleLog string, stopGrace t
 		_ = os.Remove(agentSocket)
 	}()
 
-	// The control socket, beside the agent socket and as private: one JSON
-	// line naming this helper's protocol version and pid per connection. It is
-	// how a restarted daemon tells this helper from anything else before it
-	// adopts it, and it never relays a byte to the guest.
-	ctlPath := filepath.Join(filepath.Dir(agentSocket), sandbox.VMHostControlSocketName)
-	ctl, err := listenAgentSocket(ctlPath)
-	if err != nil {
-		return fmt.Errorf("control socket: %w", err)
-	}
-	defer func() {
-		_ = ctl.Close()
-		_ = os.Remove(ctlPath)
-	}()
-	go func() {
-		if err := sandbox.ServeVMHostControl(ctl, sandbox.VMHostVersion{Protocol: sandbox.VMHostProtocolVersion, Pid: os.Getpid()}); err != nil {
-			log.Warn("the control socket stopped serving; a restarted daemon will not adopt this helper", "err", err)
-		}
-	}()
-
-	// SIGTERM arrives as a context cancellation, so the lifecycle needs no signal
-	// handling of its own and there is exactly one shutdown path.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-
 	// one GRACE budget, ISSUED BY the DAEMON. The pod's
 	// terminationGracePeriodSeconds is a promise made to the workload, and the
 	// daemon is the only process that knows it — so it is threaded in here rather
@@ -212,6 +188,41 @@ func run(log *slog.Logger, specPath, agentSocket, consoleLog string, stopGrace t
 		Grace:  stopGrace,
 		Logger: log,
 	})
+
+	// The control socket, beside the agent socket and as private: one JSON
+	// line naming this helper's protocol version and pid per connection. It is
+	// how a restarted daemon tells this helper from anything else before it
+	// adopts it, and it never relays a byte to the guest. After that line it
+	// takes one request, the shorten request: a stopper whose bound is shorter
+	// than the pod's grace asks, before its SIGTERM, for the stop to begin with
+	// a grace that fits (sandbox.ShortenedStopGrace), and the lifecycle starts
+	// it on the same path the SIGTERM takes (Lifecycle.ShortenGrace).
+	ctlPath := filepath.Join(filepath.Dir(agentSocket), sandbox.VMHostControlSocketName)
+	ctl, err := listenAgentSocket(ctlPath)
+	if err != nil {
+		return fmt.Errorf("control socket: %w", err)
+	}
+	defer func() {
+		_ = ctl.Close()
+		_ = os.Remove(ctlPath)
+	}()
+	go func() {
+		if err := sandbox.ServeVMHostControlStop(ctl, sandbox.VMHostControl{
+			Version: sandbox.VMHostVersion{Protocol: sandbox.VMHostProtocolVersion, Pid: os.Getpid()},
+			Stop:    lc,
+			PodID:   cfg.PodID,
+			Logger:  log,
+		}); err != nil {
+			log.Warn("the control socket stopped serving; a restarted daemon will not adopt this helper", "err", err)
+		}
+	}()
+
+	// SIGTERM arrives as a context cancellation, so the lifecycle needs no signal
+	// handling of its own and there is exactly one shutdown path. A shorten
+	// request on the control socket takes the same path, through the
+	// lifecycle's own cancel.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	// The proxy outlives the signal: it keeps relaying while the guest stops and
 	// is drained only once the machine is off (see RunWithProxy), so the daemon's

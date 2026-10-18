@@ -471,8 +471,9 @@ func (r *Reaper) failureReason() error {
 //     because the second poweroff would race the first.
 //
 // grace is clamped at zero; a negative or zero grace goes straight to SIGKILL
-// (the caller has already spent the budget). The host clamps grace to fit
-// inside the daemon's launchd exit timeout before it ever reaches here.
+// (the caller has already spent the budget). The host clamps grace to the
+// guest agent's 300 s ceiling (pkg/vmhost MaxStopGrace) and rounds it to whole
+// seconds, never below one, before it ever reaches here.
 func (r *Reaper) Stop(ctx context.Context, grace time.Duration) error {
 	r.stopOnce.Do(func() { r.stopErr = r.stop(ctx, grace) })
 	return r.stopErr

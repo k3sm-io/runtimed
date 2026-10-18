@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 )
 
 // errAdoptUnsupported reports that this build lane cannot adopt a vm host
@@ -38,3 +39,7 @@ func bootSessionID() (string, error) { return "", errAdoptUnsupported }
 func dialVMHostVersion(context.Context, string) (vmHostAnswer, error) {
 	return vmHostAnswer{}, errAdoptUnsupported
 }
+
+func controlPeerPid(net.Conn) (int, error) { return 0, errAdoptUnsupported }
+
+func controlPeerUID(net.Conn) (uint32, error) { return 0, errAdoptUnsupported }

@@ -360,6 +360,10 @@ type VMBackend struct {
 	// followed by. Production values are set by NewVMBackend; a test replaces
 	// them through WithVMAdoptionProbes.
 	adopt vmAdoptSeams
+	// shorten asks a helper to start its stop with a shorter grace before
+	// StopAllVMs signals it (ShortenVMHostStop); a field so the stop-all policy
+	// is testable against a fake helper.
+	shorten func(ctx context.Context, socket string, pid int, bound time.Duration) (VMHostShortenOutcome, error)
 	// selfVersionOnce/selfVersion cache this daemon's build fingerprint, read
 	// once through adopt.selfVersion.
 	selfVersionOnce sync.Once
@@ -480,6 +484,7 @@ func NewVMBackend(opts ...VMBackendOption) *VMBackend {
 		procStart:        supervisor.ProcStartTimeNano,
 		procGroup:        supervisor.ProcGroupMembers,
 		adopt:            defaultVMAdoptSeams(),
+		shorten:          ShortenVMHostStop,
 		live:             make(map[string]*vmProc),
 	}
 	for _, opt := range opts {

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -299,9 +300,10 @@ func VMHelperStopWait(recordedGrace time.Duration) time.Duration {
 // exitStopWait is the daemon's wait for one helper inside a bounded stop of
 // every helper (StopAllVMs), out of exitBudget (what is left of that bound).
 //
-// The helper keeps the grace it was spawned with: a SIGTERM carries no number,
-// so a pod with a long grace cannot be told to hurry. What the daemon can do is
-// be explicit about the arithmetic: the helper gets min(its grace, exitBudget -
+// A SIGTERM carries no number, so a cut helper is first asked to start its
+// stop with a grace that fits (shortenBeforeStop); a helper that predates the
+// request keeps the grace it was spawned with. Either way the daemon is
+// explicit about the arithmetic: the helper gets min(its grace, exitBudget -
 // VMHelperStopMargin) and the margin on top, so a pod whose grace fits is never
 // escalated, and one whose grace does not fit is cut at the exit bound with cut
 // reported, rather than discovered later as an unexplained SIGKILL. A budget too
@@ -448,18 +450,70 @@ func (b *VMBackend) StopAllVMs(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i, vp := range procs {
 		wait, cut := exitStopWait(vp.helperGrace, time.Until(deadline))
-		if cut {
-			b.logger().Warn("the stop-all bound is shorter than this vm pod's grace; its helper will be killed at the bound",
-				"pod", vp.podID, "grace", vp.helperGrace.String(), "wait", wait.String())
-		}
 		wg.Add(1)
-		go func(i int, vp *vmProc, wait time.Duration) {
+		go func(i int, vp *vmProc, wait time.Duration, cut bool) {
 			defer wg.Done()
+			if cut {
+				if w, ok := b.shortenBeforeStop(ctx, vp, deadline); ok {
+					wait = w
+				}
+			}
 			errs[i] = b.stopProc(ctx, vp, wait)
-		}(i, vp, wait)
+		}(i, vp, wait, cut)
 	}
 	wg.Wait()
 	return errors.Join(errs...)
+}
+
+// shortenBeforeStop asks vp's helper, before its SIGTERM, to start its stop
+// with the grace the time left until deadline allows (ShortenVMHostStop), so
+// the guest is told the time it has instead of being cut at the bound. It
+// reports the wait the SIGTERM should then use, which is all the time left:
+// the helper's clock started at the request, and the shortened grace leaves
+// VMHelperStopMargin of it behind. ok is false on anything but a shortened
+// stop, and the caller's plain SIGTERM-and-wait decides, as before: a helper
+// that predates the request, one already stopping, or any error.
+//
+// It is called only for a helper whose grace the bound cuts, and it logs that
+// cut exactly once, after the attempt, naming what the attempt came to: a
+// line never claims a request that was not sent.
+func (b *VMBackend) shortenBeforeStop(ctx context.Context, vp *vmProc, deadline time.Time) (time.Duration, bool) {
+	bound := time.Until(deadline)
+	killedAtBound := func(why string, args ...any) {
+		b.logger().Warn("the stop-all bound is shorter than this vm pod's grace and its helper was not told; it will be killed at the bound",
+			append([]any{"pod", vp.podID, "pid", vp.pgid, "grace", vp.helperGrace.String(), "bound", bound.String(), "reason", why}, args...)...)
+	}
+	switch {
+	case vp.runDir == "":
+		killedAtBound("no request sent: the helper's run dir is not recorded")
+		return 0, false
+	case bound < VMHostMinShortenBound:
+		killedAtBound(fmt.Sprintf("no request sent: the time left is below the %s minimum", VMHostMinShortenBound))
+		return 0, false
+	case b.shorten == nil:
+		killedAtBound("no request sent: this backend has no shorten client")
+		return 0, false
+	}
+	out, err := b.shorten(ctx, filepath.Join(vp.runDir, VMHostControlSocketName), vp.pgid, bound)
+	switch {
+	case err != nil:
+		killedAtBound("the shorten request failed", "err", err)
+		return 0, false
+	case out.Result == VMHostShortened:
+		b.logger().Warn("the stop-all bound is shorter than this vm pod's grace; its helper started the stop with a grace that fits",
+			"pod", vp.podID, "pid", vp.pgid, "original_grace", out.From.String(), "new_grace", out.To.String(), "bound", bound.String())
+		return max(time.Until(deadline), 0), true
+	case out.Result == VMHostAlreadyStopping && out.From > bound-VMHelperStopMargin:
+		killedAtBound("the helper was already stopping with a grace longer than the bound allows", "helper_grace", out.From.String())
+		return 0, false
+	case out.Result == VMHostAlreadyStopping:
+		b.logger().Info("the vm helper was already stopping with a grace that fits the bound",
+			"pod", vp.podID, "pid", vp.pgid, "grace", out.From.String(), "bound", bound.String())
+		return 0, false
+	default:
+		killedAtBound("the helper does not take a shorten request: " + out.Reason)
+		return 0, false
+	}
 }
 
 // VMDone returns the edge closed when the pod's helper has exited, and whether
