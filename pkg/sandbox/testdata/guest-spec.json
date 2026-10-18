@@ -57,13 +57,15 @@
       "tagOrSource": "k3sm.proj",
       "target": "/run/k3sm/shares/k3sm.proj",
       "kind": "GUEST_MOUNT_KIND_VIRTIOFS",
-      "readOnly": true
+      "readOnly": true,
+      "guestPrivate": true
     },
     {
       "tagOrSource": "k3sm.vols",
       "target": "/run/k3sm/shares/k3sm.vols",
       "kind": "GUEST_MOUNT_KIND_VIRTIOFS",
-      "readOnly": true
+      "readOnly": true,
+      "guestPrivate": true
     },
     {
       "tagOrSource": "/run/k3sm/shares/k3sm.proj/sa-token",

@@ -262,6 +262,11 @@ func (r *Runtime) pollGuestLease(ctx context.Context, p *pod) (addr, reason stri
 	// frozen at boot, which is what a guest restarted onto a different initramfs
 	// requires.
 	r.setGuestCapabilities(p, resp.GetCapabilities())
+	// And the set is checked against what this pod's spec relies on, on every
+	// answer: a guest that has said it lacks a field the spec sets is failed and
+	// torn down here (enforceGuestCapabilities). An unanswered poll never
+	// reaches this line, so "not asked yet" is never mistaken for "absent".
+	r.enforceGuestCapabilities(ctx, p)
 	// ready is deliberately not required. guest.proto orders the boot as
 	// "filesystems mounted, spec read, network configured" before ready, so a
 	// ready=false answer carrying a lease is the narrow window at the end of boot

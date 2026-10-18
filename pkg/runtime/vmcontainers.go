@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,7 +42,9 @@ import (
 // every Kubernetes indirection is resolved here, on the host, because the guest
 // has no cluster access: the argv is the four-quadrant merge of the pod spec
 // against the image config, the environment is fully expanded "KEY=value"
-// entries, and the identity is numeric. The merge is pkg/image.MergeRunSpec —
+// entries, and the identity is numeric — except for an image USER that is a
+// name, which the guest resolves against the container's own rootfs (see
+// vmImageUser). The merge is pkg/image.MergeRunSpec —
 // the same function the host-process spine merges with (resolveBinary) — so a
 // container's argv, env and working directory do not depend on which rung its
 // pod was routed to.
@@ -55,35 +58,6 @@ import (
 // crossing into a guest as an argv[0] that would fail as a bare ENOENT with no
 // account of why. Compare with errors.Is.
 var errVMHostBinaryImage = errors.New("the host-binary image convention has no meaning in a Linux guest")
-
-// errVMUnresolvableUser reports an image whose USER directive is a NAME while
-// the pod supplies no numeric runAsUser.
-//
-// It is a fail-closed refusal, and it is about a privilege question rather than
-// an expressiveness one. The host will not resolve a name out of the image's own
-// /etc/passwd (that file is registry-supplied content inside the very tree being
-// run — the rule pkg/image.MergeRunSpec states for runAsNonRoot), and guest/v1's
-// GuestContainer carries uid/gid as NUMBERS with no field for the name, so the
-// guest cannot be told which user to resolve either. The remaining alternative
-// would be to stamp uid 0 and run as root a container whose image asked to be
-// someone else — a silent privilege promotion. Refusing names the gap instead.
-//
-// Closing it is an apis change (a user string on GuestContainer, resolved in the
-// guest against the container rootfs at exec time); it is tracked as future
-// work and deliberately not carved here. Compare with errors.Is.
-var errVMUnresolvableUser = errors.New("the image runs as a named user the host cannot resolve and the guest cannot be told")
-
-// errVMSidecarUnexpressible reports a native sidecar (an init container with
-// restartPolicy: Always) on the vm path.
-//
-// guest/v1 carries one ordering bit per container (GuestContainer.init), which
-// the guest reads as "run to completion before the next container starts". A
-// sidecar by definition never exits, so mapping one onto that bit would hang the
-// pod's start sequence forever — a boot that never fails and never finishes,
-// which is strictly worse to operate than a refusal. The ceiling is recorded on
-// the guest's own side too (guestinit.StartStep); this is the host declining to
-// walk into it. Compare with errors.Is.
-var errVMSidecarUnexpressible = errors.New("a native sidecar cannot be expressed in the guest's start ordering")
 
 // errVMNoRootfsShare reports a share plan carrying no container-rootfs share.
 // Every container mounts its rootfs lower layer BY TAG, so a plan without one
@@ -169,8 +143,9 @@ type resolvedVMContainer struct {
 //
 // The order is produced here and carried as a list, because that is the only
 // ordering guest/v1 can express — GuestSpec.containers is documented as being in
-// start order and GuestContainer.init is the single bit that says which phase a
-// container belongs to. It matches the order mount.ComputeSharePlan walks its
+// start order and GuestContainer.init is the bit that says which phase a
+// container belongs to (GuestContainer.sidecar only refines an init container's
+// wait). It matches the order mount.ComputeSharePlan walks its
 // own container lists in, so the two host-side derivations of "the pod's
 // containers" cannot disagree about membership.
 func vmContainerOrder(box *runtimev1.PodBox) []vmContainer {
@@ -338,10 +313,6 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	case ref == NativeImage || image.IsHostPathReference(ref):
 		return invalid(fmt.Errorf("%w: image %q names a host binary, and this pod runs in a Linux guest", errVMHostBinaryImage, ref))
 	}
-	if e.init && c.GetRestartPolicy() == runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS {
-		return invalid(errVMSidecarUnexpressible)
-	}
-
 	// The identity the merge reasons about is the same one the container will
 	// run as (the container > pod > box precedence chain), so the runAsNonRoot
 	// verdict is made about the identity that actually runs — the host-process
@@ -441,18 +412,13 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
 	run.Env = withHostnameEnv(run.Env, box.GetHostname())
-	// The uid is undetermined exactly when the pod set no runAsUser and the
-	// image's USER did not parse as a number — the RunSpec contract, read rather
-	// than re-derived by parsing the directive a second time here.
-	if !run.HasUID && run.User != "" {
-		return invalid(fmt.Errorf("%w: image user %q, and no runAsUser was set", errVMUnresolvableUser, run.User))
-	}
+	imageUser := vmImageUser(run, cred.GID)
 
 	// The supplemental set is the resolved credential's, which already carries
-	// the pod's fsGroup alongside the primary gid (resolveCredential). The gid
-	// comes from the securityContext chain alone: the group half of an image
-	// USER directive ("1000:1000") is not carried across guest/v1 either, the
-	// same gap the uid half fails closed on — but a lost group half cannot
+	// the pod's fsGroup alongside the primary gid (resolveCredential), and it is
+	// kept even when the guest resolves an image user. For a NUMERIC image USER
+	// the gid comes from the securityContext chain alone: the group half of
+	// "1000:1000" is not carried across guest/v1, and a lost group half cannot
 	// promote a container to root, so it is recorded here rather than refused.
 	gids := make([]int64, 0, len(cred.Groups))
 	for _, g := range cred.Groups {
@@ -463,8 +429,12 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	// the return.
 	imagePull := vmImagePull{pulled: res.Fetched, duration: time.Since(imageStart)}
 	return resolvedVMContainer{guest: sandbox.VMContainer{
-		Name:      name,
-		Init:      e.init,
+		Name: name,
+		Init: e.init,
+		// A native sidecar is an init container with restartPolicy Always.
+		// The guest starts it in its init slot without waiting for it to
+		// exit, and stops it after the mains (GuestContainer.sidecar).
+		Sidecar:   e.init && c.GetRestartPolicy() == runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS,
 		RootfsTag: rootfsTag,
 		// The merged vector, unsplit: guest/v1 defines argv as command + args
 		// and states the merge already happened host-side, so the composer
@@ -476,6 +446,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		Stdin:            c.GetStdin(),
 		UID:              run.UID,
 		GID:              int64(cred.GID),
+		ImageUser:        imageUser,
 		SupplementalGIDs: gids,
 		OwnershipPath:    ownership,
 	}, imagePull: imagePull}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
@@ -503,4 +474,41 @@ func withHostnameEnv(env []string, hostname string) []string {
 		}
 	}
 	return append([]string{hostnameEnv + "=" + hostname}, env...)
+}
+
+// vmImageUser returns the image user the guest must resolve for a container,
+// or "" when the host already determined the numeric uid.
+//
+// The uid is undetermined exactly when the pod set no runAsUser and the image's
+// USER did not parse as a number — the RunSpec contract, read rather than
+// re-derived by parsing the directive a second time here. Then the name crosses
+// as GuestContainer.image_user and the guest resolves it against the
+// container's own rootfs, after that rootfs is mounted and before the container
+// starts. The host never reads the image's /etc/passwd itself: that file is
+// registry-supplied content inside the tree being run. A name that does not
+// resolve fails the container's start in the guest; it never becomes uid 0.
+//
+// runAsNonRoot is decided BEFORE this hand-off, by the merge (MergeRunSpec
+// refuses a non-numeric USER under runAsNonRoot with no runAsUser), so the
+// guest's resolution never answers a privilege question.
+//
+// THE GROUP HALF. gid is the primary group the securityContext chain resolved
+// (resolveCredential: container runAsGroup, then pod runAsGroup, then the
+// PodBox gid). When it is set, it is the group the container runs as, whatever
+// the image says: "name" becomes "name:<gid>", and the group half of a
+// "name:group" directive is REPLACED by it — a pod's runAsGroup overrides the
+// image on every Kubernetes node, and keeping the image's group would leave a
+// set securityContext field silently unapplied, because the guest's image_user
+// resolution replaces the stamped uid/gid. When the chain sets no group, the
+// directive crosses verbatim: "name" takes the name's primary group from the
+// image's /etc/passwd, and "name:group" takes the image's own group.
+func vmImageUser(run image.RunSpec, gid int) string {
+	if run.HasUID || run.User == "" {
+		return ""
+	}
+	if gid == 0 {
+		return run.User
+	}
+	name, _, _ := strings.Cut(run.User, ":")
+	return name + ":" + strconv.Itoa(gid)
 }
