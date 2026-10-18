@@ -171,15 +171,20 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 
 		// While the init container has not exited, the create must be parked on it:
 		// exactly one spawn (the init), no main, no return.
-		time.Sleep(50 * time.Millisecond)
+		spawns := func() int {
+			sp.mu.Lock()
+			defer sp.mu.Unlock()
+			return len(sp.specs)
+		}
+		waitFor(t, 5*time.Second, "the init container spawn", func() bool { return spawns() >= 1 })
+		// Settle window: a main that wrongly started would spawn within it.
+		time.Sleep(100 * time.Millisecond)
 		select {
 		case <-done:
 			t.Fatal("CreatePod returned before the UNSPECIFIED init container exited (legacy wait lost)")
 		default:
 		}
-		sp.mu.Lock()
-		n := len(sp.specs)
-		sp.mu.Unlock()
+		n := spawns()
 		if n != 1 {
 			t.Fatalf("spawns while init running = %d, want 1 (main must not start)", n)
 		}
