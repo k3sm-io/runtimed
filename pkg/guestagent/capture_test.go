@@ -181,6 +181,10 @@ func TestCaptureSelectorAndBounds(t *testing.T) {
 	t.Run("since-time-narrows-before-tail", func(t *testing.T) {
 		c := NewCapture(0, 0, 0)
 		writeTo(t, c, "app", StreamStdout, "old\n")
+		// The ring stamps on the wall clock (Append drops the monotonic reading)
+		// and SinceTime is inclusive, so a cut taken in the same microsecond as
+		// "old" would keep it. Leave a gap on both sides of the cut.
+		time.Sleep(5 * time.Millisecond)
 		cut := time.Now()
 		time.Sleep(5 * time.Millisecond)
 		writeTo(t, c, "app", StreamStdout, "new\n")
