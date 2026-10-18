@@ -20,6 +20,8 @@ package sandbox
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -69,6 +71,128 @@ func TestVMHostControlRoundTrip(t *testing.T) {
 	if _, err := dialVMHostVersion(ctx, socket); err == nil {
 		t.Error("a closed control socket still answered")
 	}
+}
+
+// TestDialVMHostVersionSurvivesAnEarlyClose pins adoption's version call
+// against a helper that writes its version line and closes at once: the
+// kernel's peer pid can then be gone before it is read (ENOTCONN), and that
+// must not refuse a healthy helper. The retry never weakens the identity rule:
+// every answer carries a pid the kernel named, a helper that closes first on
+// every attempt is still refused, and a gone one is refused without a retry.
+func TestDialVMHostVersionSurvivesAnEarlyClose(t *testing.T) {
+	listen := func(t *testing.T) (net.Listener, string) {
+		t.Helper()
+		// A short directory: a unix socket path is capped near 104 bytes.
+		dir, err := os.MkdirTemp("", "ctl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		socket := filepath.Join(dir, VMHostControlSocketName)
+		lis, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = lis.Close() })
+		return lis, socket
+	}
+	banner := []byte(`{"protocol":7,"pid":4242}` + "\n")
+	// serve answers each connection with the banner; the first earlyCloses
+	// connections are closed at once and reported on closed, every later one
+	// is held until the client closes it, as k3sm-vmhost does.
+	serve := func(lis net.Listener, earlyCloses int, closed chan<- struct{}, accepted *atomic.Int32) {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			n := int(accepted.Add(1))
+			_, _ = conn.Write(banner)
+			if n <= earlyCloses {
+				_ = conn.Close()
+				closed <- struct{}{}
+				continue
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, conn)
+				_ = conn.Close()
+			}()
+		}
+	}
+	// afterClose reads the peer only once the helper has closed the
+	// connection, for as many connections as the helper closes early.
+	afterClose := func(closed <-chan struct{}, early int) func(net.Conn) (int, error) {
+		var reads atomic.Int32
+		return func(conn net.Conn) (int, error) {
+			if int(reads.Add(1)) <= early {
+				<-closed
+			}
+			return controlPeerPid(conn)
+		}
+	}
+	probeCtx := func(t *testing.T) context.Context {
+		ctx, cancel := context.WithTimeout(context.Background(), vmAdoptProbeTimeout)
+		t.Cleanup(cancel)
+		return ctx
+	}
+
+	t.Run("a banner-and-close helper answers every call with the kernel's peer", func(t *testing.T) {
+		lis, socket := listen(t)
+		go func() { _ = ServeVMHostControl(lis, VMHostVersion{Protocol: 7, Pid: 4242}) }()
+		for i := range 50 {
+			ans, err := dialVMHostVersion(probeCtx(t), socket)
+			if err != nil {
+				t.Fatalf("call %d: %v", i, err)
+			}
+			if ans.PeerPid != os.Getpid() || ans.Pid != 4242 {
+				t.Fatalf("call %d: answer %+v, want peer %d (LOCAL_PEERPID) saying pid 4242", i, ans, os.Getpid())
+			}
+		}
+	})
+	t.Run("an early close is dialled again and the answer names the kernel's peer", func(t *testing.T) {
+		lis, socket := listen(t)
+		const early = vmAdoptPeerAttempts - 1
+		closed := make(chan struct{}, vmAdoptPeerAttempts)
+		var accepted atomic.Int32
+		go serve(lis, early, closed, &accepted)
+		ans, err := dialVMHostVersionWith(probeCtx(t), socket, afterClose(closed, early))
+		if err != nil {
+			t.Fatalf("a helper that closed first %d times was refused: %v", early, err)
+		}
+		if ans.PeerPid != os.Getpid() || ans.Pid != 4242 || ans.Protocol != 7 {
+			t.Errorf("answer = %+v, want peer %d saying protocol 7, pid 4242", ans, os.Getpid())
+		}
+		if got := accepted.Load(); got != vmAdoptPeerAttempts {
+			t.Errorf("connections = %d, want %d", got, vmAdoptPeerAttempts)
+		}
+	})
+	t.Run("a helper that closes first on every attempt is refused", func(t *testing.T) {
+		lis, socket := listen(t)
+		closed := make(chan struct{}, vmAdoptPeerAttempts+1)
+		var accepted atomic.Int32
+		go serve(lis, vmAdoptPeerAttempts+1, closed, &accepted)
+		ans, err := dialVMHostVersionWith(probeCtx(t), socket, afterClose(closed, vmAdoptPeerAttempts+1))
+		if err == nil {
+			t.Fatalf("answer %+v accepted from a peer the kernel never named", ans)
+		}
+		if !errors.Is(err, errVMHostPeerGone) || !errors.Is(err, unix.ENOTCONN) {
+			t.Errorf("err = %v, want the peer-gone ENOTCONN", err)
+		}
+		if got := accepted.Load(); got != vmAdoptPeerAttempts {
+			t.Errorf("connections = %d, want the bound %d", got, vmAdoptPeerAttempts)
+		}
+	})
+	t.Run("a gone helper is refused without a retry", func(t *testing.T) {
+		lis, socket := listen(t)
+		_ = lis.Close()
+		_, err := dialVMHostVersion(probeCtx(t), socket)
+		if err == nil {
+			t.Fatal("a socket with no helper behind it answered")
+		}
+		if errors.Is(err, errVMHostPeerGone) {
+			t.Errorf("err = %v, a dial failure is not a peer that closed first", err)
+		}
+	})
 }
 
 // TestWatchAdoptedHelperExit pins the adopted exit edge: it closes when the
