@@ -113,15 +113,14 @@ type GuestKernelPin struct {
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
 		KernelVersion: "v6.18.57",
-		// Minted 2026-10-16 from the v6.18.57-k3sm.2 release, an
+		// Minted 2026-10-18 from the v6.18.57-k3sm.3 release, an
 		// initramfs-only rebuild. The KERNEL is unchanged from k3sm.1:
 		// upstream 6.18.57 built from a kernel.config regenerated for it with
 		// every initrd decompressor off (config hash bc162009c43b…, the
 		// -suffix of ActiveGuestKernel); build.sh --repro produced a
 		// byte-identical Image across two clean builds. The INITRAMFS carries
-		// k3sm-guest-init built from runtimed a51a3e5, the first whose guest
-		// init drains a container's output before publishing its exit and
-		// whose guest agent follows a fast writer without dropping lines.
+		// k3sm-guest-init built from runtimed 0e05269, the first whose guest
+		// init logs each container's pid and signal as the guest stops.
 		//
 		// Two clean builds (fresh GOCACHE, GOWORK=off, -trimpath
 		// -buildvcs=false -ldflags=-buildid=) produced a byte-identical cpio,
@@ -130,8 +129,8 @@ var guestKernelPins = map[string]GuestKernelPin{
 		// mismatch between what was built and what was uploaded cannot hide
 		// here.
 		ImageSHA256:     "579d70e047faa7ece419d585f00fc569a37d16b3285c453b4501c9845f30851b",
-		InitramfsSHA256: "13bf303b193fac0ccda46bf159b0cd43c3ec7e666a451f1bc175afa65ee0cc09",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.57-k3sm.2",
+		InitramfsSHA256: "0283e1e7ee1e63ceea052857f97562223a6274e36f0d644f4fdea4bd5617232e",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.57-k3sm.3",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }
