@@ -414,6 +414,9 @@ func (r *Runtime) listPodProcRecords() (records []podProcRecord, quarantine []st
 //   - a pod any of whose groups cannot be inspected is absent too: a partial sum
 //     is not the pod's count, and reporting one would understate it.
 //
+// A vm pod is counted the same way over its k3sm-vmhost helper's group, which
+// the vm orphan store records instead of this ledger (countVMHelperGroups).
+//
 // Quarantined (structurally invalid) records are skipped and left for the reap
 // to remove; this reader never mutates the ledger. It takes no runtime lock: the
 // ledger's writers commit each record with a rename (writePodProcRecord), so a
@@ -438,7 +441,58 @@ func (r *Runtime) PodProcessCounts() (map[string]uint64, error) {
 		}
 		counts[rec.PodID] += provenGroupMembers(rec, members)
 	}
+	r.countVMHelperGroups(counts, unknown)
 	return counts, nil
+}
+
+// vmHelperGroupLister is the optional vm backend capability that lists the
+// helper groups the vm orphan store records (sandbox.VMBackend.VMHelperGroups),
+// read-only. It is optional, not part of VMBackend, so consumers' own VMBackend
+// fakes keep compiling; a backend without it leaves every vm pod's count absent,
+// the encoding of an unknown count.
+type vmHelperGroupLister interface {
+	VMHelperGroups() ([]sandbox.VMHelperGroup, error)
+}
+
+// The shipped backend must list its helpers, or every vm pod's count is absent.
+var _ vmHelperGroupLister = (*sandbox.VMBackend)(nil)
+
+// countVMHelperGroups adds, into counts, the live members of every vm pod's
+// recorded k3sm-vmhost helper group. A vm pod's host processes are its helper's
+// process group (the helper is spawned SETSID, so the group is the helper and
+// whatever it forks), and that group is recorded in the vm orphan store rather
+// than this ledger; it is read through the vm backend (vmHelperGroupLister) and
+// probed through the same procGroup seam as a native pod's groups.
+//
+// The answers mirror PodProcessCounts: a group counts all its members only
+// when the helper leader reports exactly the recorded start
+// (sandbox.VMHelperGroupMembers, the predicate the orphan sweep kills on), so a
+// dead helper and a recycled pgid are a present 0; a group that cannot be
+// inspected leaves the pod absent. An unreadable vm store leaves every vm pod
+// absent and the native counts untouched: the two stores are independent, and
+// an unknown count is encoded as an absent one.
+func (r *Runtime) countVMHelperGroups(counts map[string]uint64, unknown map[string]bool) {
+	lister, ok := r.vmBackend.(vmHelperGroupLister)
+	if !ok {
+		return
+	}
+	groups, err := lister.VMHelperGroups()
+	if err != nil {
+		r.log.Debug("vm pod process counts unavailable", "err", err)
+		return
+	}
+	for _, g := range groups {
+		if unknown[g.PodID] {
+			continue
+		}
+		members, ok := r.procGroup(g.Pgid)
+		if !ok {
+			unknown[g.PodID] = true
+			delete(counts, g.PodID)
+			continue
+		}
+		counts[g.PodID] += sandbox.VMHelperGroupMembers(g, members)
+	}
 }
 
 // provenGroupMembers returns how many of members (the live members of

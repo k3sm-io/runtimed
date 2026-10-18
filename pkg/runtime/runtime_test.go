@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -132,6 +133,10 @@ type fakeVMBackend struct {
 	done        map[string]chan struct{}
 	// starts is the persisted container-start store, by pod then container.
 	starts map[string]map[string]sandbox.VMContainerStart
+	// helperGroups / helperGroupsErr are what VMHelperGroups reports: the vm
+	// orphan store's recorded helper identities.
+	helperGroups    []sandbox.VMHelperGroup
+	helperGroupsErr error
 }
 
 func (b *fakeVMBackend) RecordVMContainerStart(podID, container string, start sandbox.VMContainerStart) error {
@@ -166,6 +171,13 @@ type fakeVMStop struct {
 func (b *fakeVMBackend) Available() bool                  { return b.available }
 func (b *fakeVMBackend) Name() string                     { return "fake-vm" }
 func (b *fakeVMBackend) GuestRosettaShareSupported() bool { return b.rosettaShare }
+
+// VMHelperGroups is the optional vmHelperGroupLister capability.
+func (b *fakeVMBackend) VMHelperGroups() ([]sandbox.VMHelperGroup, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.helperGroups), b.helperGroupsErr
+}
 func (b *fakeVMBackend) CreateVM(_ context.Context, spec sandbox.VMSpec) error {
 	b.mu.Lock()
 	b.createCalls++

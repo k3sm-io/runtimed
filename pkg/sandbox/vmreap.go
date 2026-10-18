@@ -520,14 +520,24 @@ func (b *VMBackend) killUnclaimed(rec vmProcRecord, reason string) sweepOutcome 
 // groupIsRecordedVMInstance re-probes rec's group immediately before the signal
 // and reports whether its leader still matches the record exactly. It is also
 // adoption's identity element (vmAdoptDecision) and the check an adopted
-// helper's exit watch runs once armed: one predicate for every use.
+// helper's exit watch runs once armed; its predicate (vmGroupIsInstance) is
+// also what the per-pod process count proves a group with.
 func (b *VMBackend) groupIsRecordedVMInstance(rec vmProcRecord) bool {
 	members, ok := b.procGroup(rec.Pgid)
 	if !ok || len(members) == 0 {
 		return false
 	}
-	leader, found := vmLeaderMember(members, rec.Pgid)
-	return found && leader.StartUnixNano == rec.StartUnixNano
+	return vmGroupIsInstance(members, rec.Pgid, rec.StartUnixNano)
+}
+
+// vmGroupIsInstance reports whether members (a live process group's members)
+// are the exact helper instance recorded as (pgid, startUnixNano): the leader
+// is present and reports exactly that start. It is the identity element shared
+// by the kill re-probe, adoption and the per-pod process count
+// (VMHelperGroupMembers).
+func vmGroupIsInstance(members []supervisor.ProcMember, pgid int, startUnixNano int64) bool {
+	leader, found := vmLeaderMember(members, pgid)
+	return found && leader.StartUnixNano == startUnixNano
 }
 
 // vmOwnerMarkerName is the provenance marker this daemon writes inside a vm
