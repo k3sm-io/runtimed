@@ -21,6 +21,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
@@ -119,6 +121,46 @@ func serveHelperControl(t *testing.T, dir string, stop VMHostStopShortener) {
 	}()
 }
 
+// serveBannerAndClose serves socket as a helper that predates the shorten
+// request: each connection gets the banner and is closed at once. The returned
+// channel receives once per connection, after its close.
+func serveBannerAndClose(t *testing.T, socket string) <-chan struct{} {
+	t.Helper()
+	lis, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lis.Close() })
+	banner, err := json.Marshal(VMHostVersion{Protocol: VMHostProtocolVersion, Pid: os.Getpid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{}, 8)
+	go func() {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Write(append(banner, '\n'))
+			_ = conn.Close()
+			closed <- struct{}{}
+		}
+	}()
+	return closed
+}
+
+// mustDialUnix connects to socket, closing the connection at cleanup.
+func mustDialUnix(t *testing.T, socket string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
 // stopAllBackend returns a backend holding one live helper for pod p1 with the
 // given grace, served (as far as the control socket goes) by this process. Its
 // signal seam never signals anything: it records the signal in order and, on
@@ -212,6 +254,45 @@ func TestStopAllVMsShortensACutGrace(t *testing.T) {
 		}
 		if !strings.Contains(logs.String(), "does not take a shorten request") {
 			t.Errorf("the fallback was not logged:\n%s", logs.String())
+		}
+	})
+
+	t.Run("an old helper gone before its peer is read is unsupported and falls back to SIGTERM", func(t *testing.T) {
+		// A helper that predates the request writes its banner and closes at
+		// once. The peer-pid read below waits until it has, so the kernel's
+		// LOCAL_PEERPID meets a disconnected socket every time (ENOTCONN).
+		order := &orderLog{}
+		dir := controlDir(t)
+		socket := filepath.Join(dir, VMHostControlSocketName)
+		closed := serveBannerAndClose(t, socket)
+		afterClose := func(conn net.Conn) (int, error) {
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Error("the helper never closed the connection")
+			}
+			return controlPeerPid(conn)
+		}
+		if _, err := afterClose(mustDialUnix(t, socket)); !errors.Is(err, syscall.ENOTCONN) {
+			t.Fatalf("LOCAL_PEERPID after the helper closed = %v, want ENOTCONN (the case this pins)", err)
+		}
+		out, err := shortenVMHostStop(context.Background(), socket, os.Getpid(), VMStopAllBound, afterClose)
+		if err != nil || out.Result != VMHostShortenUnsupported || out.Reason == "" {
+			t.Fatalf("shortenVMHostStop on a helper gone before its peer is read = (%+v, %v), want unsupported with a reason", out, err)
+		}
+
+		b, logs := stopAllBackend(t, dir, 90*time.Second, order)
+		b.shorten = func(ctx context.Context, socket string, pid int, bound time.Duration) (VMHostShortenOutcome, error) {
+			return shortenVMHostStop(ctx, socket, pid, bound, afterClose)
+		}
+		if err := b.StopAllVMs(context.Background()); err != nil {
+			t.Fatalf("StopAllVMs: %v", err)
+		}
+		if seq := order.snapshot(); len(seq) != 1 || seq[0] != "signal:terminated" {
+			t.Errorf("order = %q, want the plain SIGTERM", seq)
+		}
+		if !strings.Contains(logs.String(), "does not take a shorten request") || strings.Contains(logs.String(), "the shorten request failed") {
+			t.Errorf("the fallback was not logged as an old helper:\n%s", logs.String())
 		}
 	})
 
