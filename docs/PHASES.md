@@ -2,8 +2,8 @@
 repo: runtimed
 schema: phases/v1
 current_phase: M7
-updated: 2026-10-10
-updated_by: M19 Amendment A (docs/m19-plan.md R3 — the opt-in module signature check; runtimed slice)
+updated: 2026-10-18
+updated_by: M21 encode (docs/m21-plan.md, the cooperative node budget; runtimed slice)
 
 phases:
   - id: M0
@@ -855,6 +855,63 @@ phases:
             met: false
             check: "go test ./pkg/image -run 'TestWasmModuleSignatureVerify|TestFetchSignatureOutcomesAreDistinct' and go test ./pkg/runtime -run 'TestWasmModuleVerifiedOnCacheHit|TestWasmSignatureSurvivesRuntimedRestart' and go test ./pkg/wasmhost -run TestWasmhostImportsNoRegistryClient pass at CGO_ENABLED=1 (a cosign sign --key fixture verifies; tampered payload, wrong key, malformed key, non-P-256 key and another digest's signature each fail with a distinct error)"
             method: unit
+  - id: M21
+    title: the cooperative node budget (runtime side: the page read allow, the vm guest path, the kill mark by band)
+    status: todo
+    strategy: hard cut
+    depends_on:
+      - apis:M21
+    note: "Authoritative input: docs/m21-plan.md (workspace); its BINDING block governs. The Seatbelt read allow is a sandbox widening reviewed by the sandbox-security persona; the page sits outside every protected work-dir tree so a pod that did not opt in keeps a byte-identical profile. The runtime daemon, not the provider, pushes the budget into vm guests, so the provider to runtime contract does not change. Hard cut; ships as the last item of the next release after v0.1.7."
+    subphases:
+      - id: M21.5
+        title: the budget page read allow
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M21.4
+        deliverables:
+          - id: M21.5-d1
+            done: false
+            desc: "A literal-scoped file-read allow on /var/lib/k3sm/budget/budget.v1.page (and the optional doorbell) only for pods annotated budget.k3sm.io/page: \"true\"; budget is in neither the daemon trees nor the reap stores, so the existing extra-path validator admits it and no protected tree is widened; no write, no lock, no access to the writer lock, history or arming state."
+        acceptance:
+          - id: M21.5-a1
+            met: false
+            check: "go test ./pkg/sandbox -run TestBudgetPageReadAllowOnlyForOptedInPods passes and the profile of a pod that did not opt in is byte-identical to the golden"
+            method: unit
+      - id: M21.9
+        title: the vm guest path: memory limits, OOM reporting and the guest page
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M21.8
+        deliverables:
+          - id: M21.9-d1
+            done: false
+            desc: "k3sm-guest-init sets memory.max and memory.high per container, reads memory.events and reports oom_killed on ContainerExited; memory.oom.group gives a whole-pod kill unit."
+          - id: M21.9-d2
+            done: false
+            desc: "The daemon maps the host page read-only and calls PublishBudget on each opted-in guest on a notifyEpoch change plus a 10 s heartbeat when the guest reports the capability; the guest init writes the same layout with the Linux sub-struct (memory, MemAvailable, PSI) into a tmpfs page bind-mounted read-only at /run/k3sm/budget/."
+        acceptance:
+          - id: M21.9-a1
+            met: false
+            check: "go test ./cmd/k3sm-guest-init -run TestGuestInitSetsMemoryMaxAndHigh and go test ./pkg/vmhost -run TestPublishBudgetOnLevelChangeAndHeartbeat pass"
+            method: unit
+      - id: M21.11
+        title: the kernel kill mark follows the band
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M21.2
+        note: "A characterization test pins today's mark-every-pod behaviour first."
+        deliverables:
+          - id: M21.11-d1
+            done: false
+            desc: "POSIX_SPAWN_PCONTROL_KILL is set at spawn only on batch-band pods; critical and standard pods are unmarked."
+        acceptance:
+          - id: M21.11-a1
+            met: false
+            check: "go test ./pkg/supervisor -run TestPcontrolMarkOnlyOnBatchBand passes; the kernel still finds a victim under compressor exhaustion on the rig"
+            method: integration
 ---
 
 # runtimed — Phase roadmap
@@ -1452,3 +1509,19 @@ exec/attach are refused. Strategy: phased (multi-node launchd rolling restart).
 - ⬜ `M19.2-d2` B497 — `cmd/k3sm-wasmhost` and `pkg/wasmhost/wasmtime` via the pinned fork.
 - ⬜ `M19.2-d3` B498 — `FindWasmHost`, the `SelectBackend` case, platform rows, argv rewrite, condition, refusals, golden SBPL.
 - ⬜ `M19.2-d4` B503 — the opt-in cosign module check: `FetchSignature`, `pkg/image/cosign`, the check in `resolveBinary` on every start, the reap-record field, the verification record (Amendment A).
+
+## M21: the cooperative node budget, the runtime side ⬜
+`docs/m21-plan.md` (workspace) is authoritative. The runtime grants opted-in native pods a read of
+the node budget page, carries the budget and real memory limits into vm guests, and marks only
+batch-band pods for the kernel's own kill. **Hard cut.**
+
+### M21.5 the budget page read allow ⬜
+A literal-scoped read of the page for pods that opt in by annotation; every other profile is
+unchanged.
+
+### M21.9 the vm guest path ⬜
+`memory.max` and `memory.high` in the guest, OOM kills reported, and the guest budget page fed from
+the host page.
+
+### M21.11 the kernel kill mark follows the band ⬜
+Only batch-band pods carry the kernel's PCONTROL kill mark.
