@@ -79,7 +79,7 @@ func (r *Runtime) StopContainer(ctx context.Context, req *runtimev1.StopContaine
 	cp.stopped = true
 	p.mu.Unlock()
 
-	grace := graceDuration(req.GetGracePeriodSeconds(), p)
+	grace := podDefaultGrace(req.GetGracePeriodSeconds(), p)
 	exit, reaped, err := r.terminateContainer(ctx, p, cp, grace)
 	if err != nil || !reaped {
 		// Release the claim so the reaper records the exit whenever it comes.

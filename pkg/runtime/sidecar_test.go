@@ -347,7 +347,7 @@ func TestSidecarReverseOrderTeardown(t *testing.T) {
 
 		mustCreatePod(t, rt, sidecarBox(rt, "pod-del", "sc-a", "sc-b"))
 
-		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-del"}); err != nil {
+		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-del", GracePeriodSeconds: 30}); err != nil {
 			t.Fatalf("DeletePod: %v", err)
 		}
 
@@ -389,7 +389,7 @@ func TestDeletePodSidecarRemainingGrace(t *testing.T) {
 	box.TerminationGracePeriodSeconds = 1 // the smallest non-zero budget
 	mustCreatePod(t, rt, box)
 
-	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-rem"}); err != nil {
+	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-rem", GracePeriodSeconds: 1}); err != nil {
 		t.Fatalf("DeletePod: %v", err)
 	}
 

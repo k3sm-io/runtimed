@@ -132,7 +132,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		memCancel()
 	}
 
-	grace := resolveGrace(req, p)
+	grace := resolveGrace(req)
 
 	// THE VM ROUTE. A vm pod has no containerProc to signal — its containers are
 	// guest processes — so the two-phase mains/sidecars teardown below has
@@ -430,13 +430,16 @@ func (r *Runtime) closeContainerLogs(p *pod) {
 	}
 }
 
-// resolveGrace computes the SIGTERM→SIGKILL window for a DeletePod: the request's
-// grace_period_seconds if non-zero, else the pod's
-// PodBox.termination_grace_period_seconds. A resolved value of 0 means IMMEDIATE
-// kill (no SIGTERM) — the apis contract. runtimed honors the value literally; the
-// Kubernetes 30s default for an UNSET grace is applied provider-side, since proto3
-// cannot distinguish "unset" from an explicit 0 at this boundary (and mapping 0→30s
-// would make an explicit immediate-kill unreachable).
+// resolveGrace computes the SIGTERM→SIGKILL window for a DeletePod. It takes the
+// request's grace_period_seconds LITERALLY, as the apis contract defines it: a
+// value of 0 (or less) is an IMMEDIATE kill (SIGKILL, no SIGTERM), and any
+// positive value is the window. There is no fallback to the pod's
+// PodBox.termination_grace_period_seconds: the caller resolves the pod's grace
+// (the kubelet's own division of labour, where the CRI runtime takes the stop
+// timeout literally), and proto3 cannot tell an unset field from an explicit 0,
+// so a fallback here would make the contract's immediate kill unreachable. The
+// pod-default meaning of 0 belongs only to RPCs whose own contract promises it
+// (see podDefaultGrace).
 //
 // The resolved value is ONE pod-level budget shared by the whole teardown:
 // the MAIN containers are stopped first, concurrently, against the full
@@ -444,17 +447,22 @@ func (r *Runtime) closeContainerLogs(p *pod) {
 // whatever REMAINS of it (elapsed time subtracted; a remainder <= 0 is the
 // immediate-SIGKILL path). Sidecars never extend the pod's grace. The same rule
 // governs voluntary completion (watchContainerExit), where the mains exited on
-// their own and the sidecars start with the whole budget.
-func resolveGrace(req *runtimev1.DeletePodRequest, p *pod) time.Duration {
-	return graceDuration(req.GetGracePeriodSeconds(), p)
+// their own and the sidecars start with the pod's configured grace.
+func resolveGrace(req *runtimev1.DeletePodRequest) time.Duration {
+	secs := req.GetGracePeriodSeconds()
+	if secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
-// graceDuration resolves the SIGTERM→SIGKILL window for a stop: secs if non-zero,
-// else the pod's PodBox.termination_grace_period_seconds; a resolved 0 means an
-// IMMEDIATE kill (no SIGTERM). Shared by DeletePod (resolveGrace) and
-// RestartContainer, both of which honor an explicit per-request grace and
-// otherwise fall back to the pod's configured grace.
-func graceDuration(secs int64, p *pod) time.Duration {
+// podDefaultGrace resolves the SIGTERM→SIGKILL window for a stop whose contract
+// defines 0 as "use the pod's grace": secs if non-zero, else the pod's
+// PodBox.termination_grace_period_seconds; a resolved 0 means an IMMEDIATE kill
+// (no SIGTERM). Used by RestartContainer and StopContainer, whose proto docs
+// define that meaning, and by runtimed's internal teardowns that want the pod
+// default. DeletePod does NOT use it: its 0 is literal (see resolveGrace).
+func podDefaultGrace(secs int64, p *pod) time.Duration {
 	if secs == 0 {
 		secs = p.box.GetTerminationGracePeriodSeconds()
 	}

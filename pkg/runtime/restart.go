@@ -105,7 +105,7 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// SIGKILL escalation), then wait for the kqueue reaper to collect it
 	// before re-spawning so the replacement does not race the old for the pod
 	// IP/ports. SIGKILL is uncatchable, so the wait is bounded; ctx bounds it too.
-	grace := graceDuration(req.GetGracePeriodSeconds(), p)
+	grace := podDefaultGrace(req.GetGracePeriodSeconds(), p)
 	oldExit, reaped, err := r.terminateContainer(ctx, p, oldCP, grace)
 	if err != nil {
 		r.clearRestarting(ctx, p, oldCP)

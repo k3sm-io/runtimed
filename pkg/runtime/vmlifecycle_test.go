@@ -175,7 +175,9 @@ func TestCreateVMPodAssemblesARunningPod(t *testing.T) {
 func TestDeleteVMPodStopsTheHelper(t *testing.T) {
 	rt, vmb, box := bootedVMRuntime(t, "pod-vm-2", 9)
 
-	resp, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: box.GetPodId()})
+	// The caller resolves the pod's grace (DeletePod takes it literally), so the
+	// delete carries the pod's own 9s.
+	resp, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: box.GetPodId(), GracePeriodSeconds: 9})
 	if err != nil {
 		t.Fatalf("DeletePod: %v", err)
 	}
@@ -187,7 +189,7 @@ func TestDeleteVMPodStopsTheHelper(t *testing.T) {
 		t.Fatalf("StopVM calls = %v, want exactly one for %s", stops, box.GetPodId())
 	}
 	if stops[0].grace != 9*time.Second {
-		t.Errorf("StopVM grace = %s, want the pod's own 9s (the ONE budget both ends share)", stops[0].grace)
+		t.Errorf("StopVM grace = %s, want the requested 9s (the ONE budget both ends share)", stops[0].grace)
 	}
 	if _, ok := rt.lookupPod(box.GetPodId()); ok {
 		t.Error("the pod is still registered after DeletePod")
@@ -213,6 +215,26 @@ func TestDeleteVMPodStopsTheHelper(t *testing.T) {
 		// DeletePod (stop, then cancel) has not been reversed.
 		time.Sleep(50 * time.Millisecond)
 	})
+}
+
+// TestDeleteVMPodGraceZeroStopsImmediately pins the vm route of the apis
+// contract: a DeletePod with grace 0 asks the helper for an immediate stop (a
+// StopVM grace of 0) even though the pod's own grace is 9s. DeletePod never falls
+// back to the pod's grace; the caller resolves it.
+func TestDeleteVMPodGraceZeroStopsImmediately(t *testing.T) {
+	rt, vmb, box := bootedVMRuntime(t, "pod-vm-g0", 9)
+
+	if _, err := rt.DeletePod(context.Background(),
+		&runtimev1.DeletePodRequest{PodId: box.GetPodId(), GracePeriodSeconds: 0}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	stops := vmb.stops()
+	if len(stops) != 1 || stops[0].podID != box.GetPodId() {
+		t.Fatalf("StopVM calls = %v, want exactly one for %s", stops, box.GetPodId())
+	}
+	if stops[0].grace != 0 {
+		t.Errorf("StopVM grace = %s, want 0 (immediate; no fallback to the pod's 9s)", stops[0].grace)
+	}
 }
 
 // TestCloseLeavesVMHelpersAndHostPodsRunning pins the one shutdown contract

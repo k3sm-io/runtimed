@@ -20,6 +20,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -420,4 +422,118 @@ func shortRoot(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	return root
+}
+
+// TestIntegrationDeletePodGraceZeroKillsSigtermIgnoringChild is the real-process
+// proof of the DeletePodRequest.grace_period_seconds contract: 0 is an immediate
+// kill. The container is a shell that ignores SIGTERM, in a pod whose own grace
+// is 30s; a DeletePod with grace 0 must leave that shell gone within 2s. A
+// runtime that fell back to the pod's grace would SIGTERM it, which it ignores,
+// and wait out the full 30s before the SIGKILL.
+func TestIntegrationDeletePodGraceZeroKillsSigtermIgnoringChild(t *testing.T) {
+	root := shortRoot(t)
+
+	shim := filepath.Join(root, sandbox.ExecShimName)
+	build := exec.Command("go", "build", "-o", shim, "k3sm.io/runtimed/cmd/k3sm-execshim")
+	build.Env = append(os.Environ(), "CGO_ENABLED=1")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build shim: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("codesign", "-s", "-", "-f", shim).CombinedOutput(); err != nil {
+		t.Fatalf("sign shim: %v\n%s", err, out)
+	}
+	backend, err := sandbox.NewExecShimBackend(shim, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !backend.Available() {
+		t.Skip("exec-shim backend unavailable on this host")
+	}
+	cache, err := image.NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := New(Config{Root: root, RuntimeVersion: "test", PodLogsDir: filepath.Join(root, "podlogs")}, Deps{
+		Cache:   cache,
+		Backend: backend,
+		Spawner: supervisor.PosixSpawner{},
+		Waiter:  supervisor.KqueueReaper{},
+		Network: supervisor.NodeNetwork{IP: "127.0.0.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const podID = "pod-g0-trap"
+	rootfs := derivedRootfs(t, rt, podID)
+	pidFile := filepath.Join(rootfs, "shell.pid")
+	// The shell records its own pid, then ignores SIGTERM for good. The pid file
+	// is written only after the trap is installed, so a SIGTERM that arrives once
+	// the pid is readable is certainly ignored.
+	script := `trap "" TERM; echo $$ > ` + pidFile + `.tmp && mv ` + pidFile + `.tmp ` + pidFile +
+		`; while :; do sleep 1; done`
+	box := &runtimev1.PodBox{
+		PodId:                         podID,
+		Namespace:                     "default",
+		Name:                          "trap",
+		LogDirectory:                  testPodLogDir(rt, podID),
+		TerminationGracePeriodSeconds: 30,
+		SandboxProfile: &runtimev1.SandboxProfile{
+			DataVolumePath: rootfs,
+		},
+		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
+		Containers: []*runtimev1.Container{
+			{Name: "main", Image: NativeImage, Command: []string{"/bin/sh", "-c", script}},
+		},
+	}
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil {
+		t.Fatalf("CreatePod transport: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
+	}
+
+	var pid int
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && n > 0 {
+				pid = n
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			_, _ = rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: podID})
+			t.Fatal("the container shell never wrote its pid")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Cleanup(func() { _ = unix.Kill(pid, unix.SIGKILL) })
+
+	const bound = 2 * time.Second
+	start := time.Now()
+	if _, err := rt.DeletePod(context.Background(),
+		&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: 0}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	for {
+		err := unix.Kill(pid, 0)
+		if errors.Is(err, unix.ESRCH) {
+			break
+		}
+		if time.Since(start) > bound {
+			t.Fatalf("the SIGTERM-ignoring shell (pid %d) is still alive %s after a grace-0 DeletePod "+
+				"(kill(pid, 0) = %v), want gone within %s", pid, time.Since(start), err, bound)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// DeletePod blocks until its teardown is done, so a runtime that waited out
+	// the pod's grace returns with the shell already dead: the elapsed time, not
+	// only the pid probe, is what tells an immediate kill from a 30s one.
+	if elapsed := time.Since(start); elapsed > bound {
+		t.Fatalf("the SIGTERM-ignoring shell (pid %d) was gone only %s after a grace-0 DeletePod, want within %s",
+			pid, elapsed, bound)
+	}
+	t.Logf("grace-0 DeletePod: the shell was gone %s after the request", time.Since(start))
 }

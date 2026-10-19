@@ -134,7 +134,8 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		// The container exits "voluntarily": release it so the reaper closes
 		// proc.Done(). DeletePod must observe the exit and not escalate to SIGKILL.
 		w.release(1001)
-		if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: "pod-gp"}); err != nil {
+		if _, err := rt.DeletePod(context.Background(),
+			&runtimev1.DeletePodRequest{PodId: "pod-gp", GracePeriodSeconds: 30}); err != nil {
 			t.Fatalf("DeletePod: %v", err)
 		}
 		if rec.sawKill() {
@@ -145,9 +146,9 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		}
 	})
 
-	t.Run("request-grace-overrides-podbox", func(t *testing.T) {
-		// req.grace_period_seconds=0 falls back to the PodBox value (30s here), so
-		// a delete with no request grace still SIGTERMs first.
+	t.Run("explicit-request-grace-sigterms-first", func(t *testing.T) {
+		// A positive request grace is the window, taken literally: the delete
+		// SIGTERMs first. The caller resolves the pod's grace and sends it.
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{Waiter: w})
 		rec := &recordingSignalGroup{}
@@ -157,13 +158,42 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		mustCreatePod(t, rt, box)
 		w.release(1001)
 		if _, err := rt.DeletePod(context.Background(),
-			&runtimev1.DeletePodRequest{PodId: "pod-gr", GracePeriodSeconds: 0}); err != nil {
+			&runtimev1.DeletePodRequest{PodId: "pod-gr", GracePeriodSeconds: 30}); err != nil {
 			t.Fatalf("DeletePod: %v", err)
 		}
 		if got := rec.signals(); len(got) == 0 || got[0] != termSignal {
-			t.Errorf("signals = %v, want SIGTERM first (PodBox grace honored)", got)
+			t.Errorf("signals = %v, want SIGTERM first (request grace honoured)", got)
 		}
 	})
+}
+
+// TestDeletePodGraceZeroIsImmediateDespitePodBoxGrace pins the apis contract for
+// DeletePodRequest.grace_period_seconds: 0 is an immediate kill. A pod whose
+// PodBox carries a 30s grace must still get exactly one SIGKILL and no SIGTERM,
+// because DeletePod never falls back to the pod's grace (the caller resolves it).
+// Hard eviction depends on this: a fallback would make it wait out the pod's
+// grace for a process that ignores SIGTERM.
+func TestDeletePodGraceZeroIsImmediateDespitePodBoxGrace(t *testing.T) {
+	w := newBlockingWaiter()
+	rt := newTestRuntime(t, Deps{Waiter: w})
+	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
+	rt.signalGroup = rec.signal
+
+	box := hostBinBox(rt, "pod-g0-box30")
+	box.TerminationGracePeriodSeconds = 30
+	mustCreatePod(t, rt, box)
+
+	start := time.Now()
+	if _, err := rt.DeletePod(context.Background(),
+		&runtimev1.DeletePodRequest{PodId: "pod-g0-box30", GracePeriodSeconds: 0}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	if got := rec.signals(); len(got) != 1 || got[0] != killSignal {
+		t.Errorf("grace-0 DeletePod signals = %v, want exactly [SIGKILL] (no PodBox fallback)", got)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("grace-0 DeletePod took %s, want an immediate kill", elapsed)
+	}
 }
 
 // TestExitObservationGraceDefault pins the post-SIGKILL observation bound's
