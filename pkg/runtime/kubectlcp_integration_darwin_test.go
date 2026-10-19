@@ -129,9 +129,12 @@ func tarOf(t *testing.T, name string, body []byte) []byte {
 //   - `tar cf - -C <mount> hello.txt` exits 0 with a tar holding the file;
 //   - awk and sed each run as their copies, under the profile, on the
 //     mounted file (and awk keeps DYLD_INSERT_LIBRARIES);
-//   - a `-C` that climbs out of the data volume with ".." is refused by the
-//     pod profile (non-zero, nothing written): the shim only rebases, the
-//     profile is the boundary.
+//   - a `-C` that climbs out of the mount with ".." is not rebased: it names
+//     a host path, so it never reaches the rootfs's neighbours (non-zero, no
+//     such directory, nothing written);
+//   - a `-C` naming a host directory outside the data volume is refused by
+//     the pod profile (the chdir succeeds, the write is EPERM, nothing
+//     written): the shim only rebases, the profile is the boundary.
 func TestKubectlCpReachesARebasedPath(t *testing.T) {
 	if _, err := exec.LookPath("clang"); err != nil {
 		t.Skipf("SKIP: clang not on PATH, the path shim cannot be built: %v", err)
@@ -375,11 +378,16 @@ func TestKubectlCpReachesARebasedPath(t *testing.T) {
 		}
 	})
 
-	t.Run("dotdot-out-of-the-data-volume-is-refused", func(t *testing.T) {
-		outside := filepath.Join(root, "outside")
-		if err := os.Mkdir(outside, 0o755); err != nil {
-			t.Fatal(err)
-		}
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A ".." that climbs out of the mount is left unrebased by the path shim
+	// (a mount escape names a host path, never a rootfs neighbour), so the
+	// relative climb from the rebased volume to outside does not reach it:
+	// the kernel resolves the literal path on the host, where the mount
+	// prefix does not exist.
+	t.Run("dotdot-out-of-the-mount-is-not-rebased", func(t *testing.T) {
 		from, err := filepath.EvalSymlinks(volDir)
 		if err != nil {
 			t.Fatal(err)
@@ -395,11 +403,25 @@ func TestKubectlCpReachesARebasedPath(t *testing.T) {
 		escape := mount + "/" + rel
 		_, errOut, code := run(t, tarOf(t, "escaped.txt", body), "tar", "xmf", "-", "-C", escape)
 		if code == 0 {
-			t.Errorf("tar xmf - -C %s exit = 0, want the profile to refuse the write (stderr %q)", escape, errOut)
+			t.Errorf("tar xmf - -C %s exit = 0, want the escape to name no directory (stderr %q)", escape, errOut)
 		}
-		// The chdir itself must have succeeded (the outside directory is
-		// readable): the refusal is the profile's write deny (EPERM), not a
-		// path the shim failed to reach.
+		if !strings.Contains(errOut, "could not chdir") {
+			t.Errorf("tar failed for another reason than the unrebased escape: stderr %q", errOut)
+		}
+		if _, err := os.Lstat(filepath.Join(outside, "escaped.txt")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("a file was written outside the data volume (%v); stderr %q", err, errOut)
+		}
+		t.Logf("not rebased: exit %d, stderr %q", code, errOut)
+	})
+
+	// A host directory outside the data volume is reachable for reading
+	// (ExtraReadPaths covers root), so the chdir succeeds and the profile's
+	// write deny is what refuses the extraction.
+	t.Run("host-path-outside-the-data-volume-is-refused", func(t *testing.T) {
+		_, errOut, code := run(t, tarOf(t, "escaped.txt", body), "tar", "xmf", "-", "-C", outside)
+		if code == 0 {
+			t.Errorf("tar xmf - -C %s exit = 0, want the profile to refuse the write (stderr %q)", outside, errOut)
+		}
 		if !strings.Contains(errOut, "Operation not permitted") {
 			t.Errorf("tar failed for another reason than the profile's write deny: stderr %q", errOut)
 		}
