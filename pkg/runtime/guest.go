@@ -475,7 +475,7 @@ func (r *Runtime) enforceGuestCapabilities(ctx context.Context, p *pod) {
 		"pod", podID, "capability", missing)
 	r.failVMPod(p, vmReasonGuestCapabilityMissing,
 		fmt.Sprintf("pod %s: guest initramfs predates %s; the daemon's pinned initramfs is required", podID, missing))
-	if err := r.vmBackend.StopVM(ctx, podID, graceDuration(0, p)); err != nil {
+	if err := r.vmBackend.StopVM(ctx, podID, podDefaultGrace(0, p)); err != nil {
 		// A helper that will not stop is kept on record for the next startup
 		// sweep by the backend; the pod is already Failed either way.
 		r.log.Warn("stop the vm host helper after a capability refusal", "pod", podID, "err", err)
@@ -723,7 +723,7 @@ func (r *Runtime) restartGuest(ctx context.Context, p *pod, req *runtimev1.Resta
 	}
 	p.mu.Unlock()
 
-	grace := graceDuration(req.GetGracePeriodSeconds(), p)
+	grace := podDefaultGrace(req.GetGracePeriodSeconds(), p)
 	err = r.callGuestRestart(ctx, podID, name, grace)
 	if err != nil && !r.concludeFailedGuestRestart(p, name, rs) {
 		r.settleGuestRestartLog(p, name, prev, w, false)

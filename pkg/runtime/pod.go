@@ -2117,7 +2117,7 @@ func (r *Runtime) runTerminalTeardown(ctx context.Context, p *pod, td terminalTe
 		td.cancel()
 	}
 	if len(td.sidecars) > 0 {
-		r.stopSidecars(ctx, p.box.GetPodId(), td.sidecars, time.Now().Add(graceDuration(0, p)))
+		r.stopSidecars(ctx, p.box.GetPodId(), td.sidecars, time.Now().Add(podDefaultGrace(0, p)))
 	}
 }
 
