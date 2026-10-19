@@ -1952,8 +1952,13 @@ func terminatedStateLocked(p *pod, cp *containerProc, code, sig int, err error) 
 // it observed but must not write it. Caller holds p.mu.
 func terminatedLocked(p *pod, cp *containerProc, code, sig int, err error) *runtimev1.ContainerStateTerminated {
 	term := &runtimev1.ContainerStateTerminated{
-		ExitCode:   int32(code),
-		Signal:     int32(sig),
+		ExitCode: int32(code),
+		Signal:   int32(sig),
+		// When the instance that exited started. Read before the caller
+		// overwrites the Running state, so the start travels with the exit
+		// into last_termination_state on the next restart; upstream's
+		// ContainerStateTerminated carries both ends of the run.
+		StartedAt:  lastStartedAt(cp.state),
 		FinishedAt: nowProto(),
 		// This container's own id — the incarnation that just died. The
 		// terminated mirror is read as the identity of the run being reported,
