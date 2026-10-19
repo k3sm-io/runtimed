@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -91,7 +92,10 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	}
 	oldProc := oldCP.proc
 	oldRestartCount := oldCP.state.GetRestartCount()
-	oldStarted := oldCP.state.GetState().GetRunning().GetStartedAt()
+	// The replaced instance's last recorded start, whichever state it is in now:
+	// a container that crashed before this restart, or whose exit the reaper
+	// recorded first, is already Terminated and no longer has a Running state.
+	oldStarted := lastStartedAt(oldCP.state)
 	spec := oldCP.spec
 	initDeclared := oldCP.initDeclared
 	oldCP.restarting = true
@@ -313,6 +317,15 @@ func (r *Runtime) clearRestarting(ctx context.Context, p *pod, cp *containerProc
 // the restart killed as Completed / 0 — a success nobody observed.
 func lastTerminationState(p *pod, oldCP *containerProc, exit containerExit, startedAt *timestamppb.Timestamp, reqReason string) *runtimev1.ContainerState {
 	if t := oldCP.state.GetState().GetTerminated(); t != nil {
+		if t.GetStartedAt() == nil && startedAt != nil {
+			// A terminated state recorded without its start takes the one the
+			// caller snapshotted while the instance still ran (the reaper can
+			// record the exit between that snapshot and here). Cloned so the
+			// record the reaper wrote is not mutated under a reader of the old
+			// entry.
+			t = proto.Clone(t).(*runtimev1.ContainerStateTerminated)
+			t.StartedAt = startedAt
+		}
 		return &runtimev1.ContainerState{Terminated: t}
 	}
 	if errors.Is(exit.err, supervisor.ErrExitUnknown) {
@@ -346,4 +359,14 @@ func restartFailure(code codes.Code, reason runtimev1.FailureReason, format stri
 		Error:         rpcStatus(code, format, args...),
 		FailureReason: reason,
 	}
+}
+
+// lastStartedAt is the instance's last recorded start: the Running state's
+// started_at while it runs, else the started_at its Terminated state carried
+// forward when it exited. Nil when no start was ever recorded.
+func lastStartedAt(st *runtimev1.ContainerStatus) *timestamppb.Timestamp {
+	if at := st.GetState().GetRunning().GetStartedAt(); at != nil {
+		return at
+	}
+	return st.GetState().GetTerminated().GetStartedAt()
 }
