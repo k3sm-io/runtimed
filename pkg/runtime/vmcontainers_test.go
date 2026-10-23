@@ -34,7 +34,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// the M11.2-d11 GATE: what createVMPod stamps on VMSpec.Containers.
+// the GATE: what createVMPod stamps on VMSpec.Containers.
 //
 // Every row drives the real wiring — CreatePod → createVMPod →
 // resolveVMContainers → pkg/image.MergeRunSpec — and reads the VMSpec the vm

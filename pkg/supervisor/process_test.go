@@ -212,7 +212,7 @@ func TestProcessLogCapture(t *testing.T) {
 }
 
 // TestProcessLogsDrained checks the drain edge: with a sink, LogsDrained closes only
-// after the pump has flushed every line to the sink (the B11 "logs fully drained"
+// after the pump has flushed every line to the sink (the "logs fully drained"
 // guarantee watchContainerExit relies on); with no sink there is no pump, so it is
 // closed at Start.
 func TestProcessLogsDrained(t *testing.T) {
@@ -362,7 +362,7 @@ func (s *logPipeSpawner) Spawn(_ context.Context, spec SpawnSpec) (int, error) {
 	return s.pid, nil
 }
 
-// TestPumpLogsChunksOversizedLine is the B164 successor. The predecessor
+// TestPumpLogsChunksOversizedLine is the successor. The predecessor
 // asserted that an oversized line was TRUNCATED to its tail and that the pump
 // kept going; the truncation is gone — crilog splits instead — so what is
 // asserted now is stronger: a 2 MiB line arrives COMPLETE, as P chunks followed

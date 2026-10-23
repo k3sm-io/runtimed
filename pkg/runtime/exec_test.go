@@ -204,7 +204,7 @@ func TestExecRunsAndReturnsExitCode(t *testing.T) {
 	})
 }
 
-// TestExecCarriesPodLaunchSpec pins the B7 one-code-path decision: an exec
+// TestExecCarriesPodLaunchSpec pins the one-code-path decision: an exec
 // session re-enters the pod's full confinement domain — not just profile + uid
 // drop but the pod's explicit rlimits and its qos class too — because Exec goes
 // through the same WrapCommand choke-point as startContainer with the same

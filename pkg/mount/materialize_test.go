@@ -73,7 +73,7 @@ func boxWith(volumes ...*runtimev1.Volume) *runtimev1.PodBox {
 	}
 }
 
-// TestMaterializeAllSources is acceptance M2.2-a1 (materialization half, root-
+// TestMaterializeAllSources is an acceptance test (materialization half, root-
 // free): each of the five volume sources materializes at its mount path inside
 // the pod data volume with the resolved content; secrets + the projected SA-token
 // are reported as credentials for the SBPL read-only sub-scope.

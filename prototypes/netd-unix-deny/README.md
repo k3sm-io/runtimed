@@ -1,14 +1,16 @@
 # Prototype: Seatbelt AF_UNIX helper-socket deny
 
-Integration-tier proof of the runtimed **AF_UNIX barrier** (the `k3sm-netd-helper`
-change, deliverable #1): a pod confined by a generated SBPL profile **cannot
+A manual proof, not built or run by the test suite, kept so the barrier can be re-checked on a
+new macOS release.
+
+Integration-tier proof of the runtimed **AF_UNIX barrier**: a pod confined by a generated SBPL profile **cannot
 `connect()`** to a denied AF_UNIX socket path — the explicit
 `(deny network-outbound (remote unix-socket (literal "…")))` that
 `sandbox.Generate` emits for each `SandboxProfile.denied_unix_socket_paths`.
 
 ## Why it exists
 
-k3sm is going user-space: `runtimed` runs as the unprivileged `_k3sm` daemon and
+`runtimed` runs as the unprivileged `_k3sm` daemon and
 **pods run at the same `_k3sm` uid** (no per-pod uid isolation — the documented
 residual limitation; untrusted tenancy → the `vm` RuntimeClass). The only root
 component is a separate `k3sm-netd` networking helper reached over a unix socket.
@@ -16,8 +18,8 @@ component is a separate `k3sm-netd` networking helper reached over a unix socket
 Because a pod shares the `_k3sm` uid with the legitimate runtime client,
 `LOCAL_PEERCRED` on the helper socket **cannot tell them apart** — so it is not a
 barrier. The Seatbelt **default-deny already blocks** the `connect()`, and the
-generator adds an **explicit** per-path deny on top of it as the load-bearing,
-future-proof barrier (it survives even if a later profile broadens egress). The
+generator adds an **explicit** per-path deny on top of it as the barrier that
+matters and that holds (it survives even if a later profile broadens egress). The
 matching **unit** test (`pkg/sandbox: TestGenerateDeniedUnixSockets`) asserts the
 SBPL text; this prototype is the **live** proof, kept out of unit tests because
 the standards forbid real sandboxing/privilege there.
@@ -39,7 +41,7 @@ deny, is what stops it.
 
 > `sandbox-exec` is deprecated (still functional on 26.x); production applies the
 > same SBPL in-process via the `libsandbox` `sandbox_compile/apply` exec-shim. See
-> the sibling `seatbelt-hostpath/` prototype and DESIGN §5a.
+> the sibling `seatbelt-hostpath/` prototype and [DESIGN.md §5a](https://github.com/k3sm-io/k3sm/blob/main/docs/DESIGN.md).
 
 The file carries `//go:build ignore`, so it is excluded from `go build ./...` /
 `go test ./...` and only runs via `go run`.

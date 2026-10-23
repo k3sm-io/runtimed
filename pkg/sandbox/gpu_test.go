@@ -37,7 +37,7 @@ func realGPU() GPUProbeResult {
 	}
 }
 
-// TestDeriveGPUFacts is acceptance M8.2-a3: the whole advertisement decision,
+// TestDeriveGPUFacts is an acceptance test: the whole advertisement decision,
 // proven over a FAKE probe seam on a machine that need not have a GPU at all.
 func TestDeriveGPUFacts(t *testing.T) {
 	seatbelt := stubBackend{ExecShimBackendName, true}

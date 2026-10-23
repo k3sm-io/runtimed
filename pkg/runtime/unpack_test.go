@@ -38,7 +38,7 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 )
 
-// TestResolveBinaryMaterializesTheImage pins the M11.2-d7 wiring at the seam:
+// TestResolveBinaryMaterializesTheImage pins the wiring at the seam:
 // a container whose image is pulled has that image materialized into this pod's
 // rootfs, under the native layer dialect, exactly once.
 //
@@ -142,7 +142,7 @@ func TestHostBinaryRoutesNeverMaterialize(t *testing.T) {
 // Every other test in this file injects a fakeUnpacker, so none of them can tell
 // the production wiring from a mis-wiring: an unpacker built over a second cache
 // would leave them all green and would fail on the first real pod. This is the
-// unit-tier companion to the M11.2-a6 integration acceptance — it proves the
+// unit-tier companion to the integration acceptance — it proves the
 // bytes land, where a6 additionally proves argv[0] execs.
 func TestDefaultUnpackerWiring(t *testing.T) {
 	host := testRegistryHost(t)
@@ -205,7 +205,7 @@ func TestDefaultUnpackerWiring(t *testing.T) {
 //
 // Two layers is the point: a single-layer image cannot distinguish an unpacker
 // that applies layers in order from one that applies only the last (or only the
-// first), which is the mistake the M11.2-a6 acceptance names explicitly.
+// first), which is the mistake the acceptance names explicitly.
 func pushMultiLayerImage(t *testing.T, host, repo string) string {
 	t.Helper()
 	img := multiLayerImage(t)
@@ -380,7 +380,7 @@ func TestUnpackPolicyFollowsTheResolvedBackend(t *testing.T) {
 	})
 }
 
-// TestResolveBinaryMergesTheImageConfig pins the M11.2-d1 wiring of
+// TestResolveBinaryMergesTheImageConfig pins the wiring of
 // image.MergeRunSpec into the OCI route — the replacement for the M1 placeholder
 // that made argv literally command+args.
 //
@@ -534,7 +534,7 @@ func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 		t.Errorf("env = %v, want the merged base verbatim", merged)
 	}
 
-	// nil base keeps the pre-M11.2-d1 behaviour byte for byte.
+	// nil base keeps the earlier behaviour byte for byte.
 	fallback, err := rt.containerEnv(box, c, nil)
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)

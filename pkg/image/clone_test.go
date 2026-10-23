@@ -25,7 +25,7 @@ import (
 // TestMaterializeTree checks the recursive materializer: it reproduces the tree
 // (dirs, regular files, symlinks), is idempotent on a second run, and reports the
 // clone count. Uses ByteCopier so the unit test is portable; real APFS CoW is in
-// the integration test (M1.1-a2).
+// the integration test.
 func TestMaterializeTree(t *testing.T) {
 	src := t.TempDir()
 	// build: bin/app (regular), lib/data.txt, link -> bin/app

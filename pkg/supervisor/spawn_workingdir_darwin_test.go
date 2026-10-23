@@ -34,9 +34,9 @@ import (
 // spawnedCwd runs /bin/pwd through the PRODUCTION PosixSpawner + KqueueReaper
 // with dir as SpawnSpec.Dir and returns the cwd the child actually reported.
 //
-// It is a real spawn, in the unit tier, deliberately: the whole subject of B202
+// It is a real spawn, in the unit tier, deliberately: the whole subject of this test
 // is a posix_spawn FILE ACTION, and a spawner that quietly dropped the action
-// (the pre-B202 behaviour, and the first mutant this gate must kill) is
+// (the earlier behaviour, and the first mutant this gate must kill) is
 // indistinguishable from a correct one at every seam short of the child's own
 // getcwd. /bin/pwd is a stock platform binary, takes no privilege, needs no
 // network, and exits immediately.
@@ -95,11 +95,11 @@ func realPath(t *testing.T, path string) string {
 	return resolved
 }
 
-// TestSpawnHonorsWorkingDir is the B202 gate. It pins the three halves of the
+// TestSpawnHonorsWorkingDir is the gate. It pins the three halves of the
 // SpawnSpec.Dir contract at the spawn seam:
 //
 //   - a set Dir is HONORED — the child's own getcwd is that directory, not the
-//     daemon's inherited cwd (red before B202: Dir was documented on SpawnSpec
+//     daemon's inherited cwd (red before the fix: Dir was documented on SpawnSpec
 //     and set by pkg/runtime, but spawn_darwin.go referenced it nowhere, so every
 //     pod on every node ran in the daemon's cwd);
 //   - an unset Dir INHERITS, and says so — the pod-safe default (the pod data

@@ -161,7 +161,7 @@ func TestWrapCommand(t *testing.T) {
 		}
 		defer cleanup()
 		// The tokens sit at the fixed positions before the profile path — an old
-		// shim (pre-B7 arity) would read the rlimit token as its profile path, fail the
+		// shim (earlier arity) would read the rlimit token as its profile path, fail the
 		// ReadFile, and exit 3: fail-closed under daemon/shim binary skew.
 		if want := supervisor.EncodeRlimits(plan); argv[6] != want {
 			t.Errorf("rlimit token = %q, want %q", argv[6], want)

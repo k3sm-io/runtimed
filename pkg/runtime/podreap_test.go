@@ -51,7 +51,7 @@ func mem(pid int, startUnixNano int64) supervisor.ProcMember {
 	return supervisor.ProcMember{Pid: pid, StartUnixNano: startUnixNano}
 }
 
-// TestStartupPodReapDecision is the B115 gate: a table over a fake process
+// TestStartupPodReapDecision is the gate: a table over a fake process
 // GROUP table + recorded-pgid set → kill set. It pins the decision's safety
 // contract — only recorded pgids are considered, each guarded by a group probe
 // and a member start-time identity.

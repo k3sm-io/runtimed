@@ -103,7 +103,7 @@ const (
 	stateEvicted cacheState = "recorded-blobs-evicted"
 )
 
-// TestPullPolicyHonored is the B120 / M12.1-a1 gate: the policy x cache-state
+// TestPullPolicyHonored is the gate: the policy x cache-state
 // matrix the puller must obey, including the UNSPECIFIED=legacy rows (an old
 // provider never stamps the field, and absent must never be read as Never) and
 // the offline IfNotPresent warm-cache row (proving zero registry traffic rather
@@ -173,7 +173,7 @@ func TestPullPolicyHonored(t *testing.T) {
 			wantCacheHit: true,
 		},
 		{
-			// The M12.1-d4 posture: a registry outage must not strand a pod whose
+			// The posture: a registry outage must not strand a pod whose
 			// image is already on the node.
 			name:         "if_not_present_warm_offline_still_starts",
 			pull:         runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,

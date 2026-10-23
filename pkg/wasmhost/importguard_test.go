@@ -39,7 +39,7 @@ var wasmtimeModulePrefixes = []string{
 const wasmtimeEnginePkg = "k3sm.io/runtimed/pkg/wasmhost/wasmtime"
 
 // helperPkg is the one binary allowed to link the engine. It does not exist
-// until B497.
+// until the k3sm-wasmhost helper is added.
 const helperPkg = "k3sm.io/runtimed/cmd/k3sm-wasmhost"
 
 // daemonPkgs is every package the daemon links, named explicitly: the
@@ -102,7 +102,7 @@ type converseMode int
 
 const (
 	// converseResolves: the helper does not exist yet, so the converse proves
-	// only that the guard's package list resolves, then skips naming B497.
+	// only that the guard's package list resolves, then skips naming the missing helper.
 	converseResolves converseMode = iota
 	// converseHelperReaches: the helper exists and MUST reach the engine.
 	converseHelperReaches
@@ -188,14 +188,14 @@ func TestWasmtimeIsNotReachableFromTheDaemon(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			t.Skipf("%s does not exist yet (B497 adds it); the guard's %d packages resolve, "+
+			t.Skipf("%s does not exist yet (the helper is not added yet); the guard's %d packages resolve, "+
 				"and the converse becomes a hard requirement the moment the helper exists", helperPkg, len(daemonPkgs))
 		}
 	})
 }
 
 // TestImportGuardConverseSelection pins the converse's branch choice and both
-// of its checks, so the B497 branch is tested before the helper exists.
+// of its checks, so the helper branch is tested before the helper exists.
 func TestImportGuardConverseSelection(t *testing.T) {
 	if selectConverse(true) != converseHelperReaches {
 		t.Error("an existing helper must make the converse a hard requirement")

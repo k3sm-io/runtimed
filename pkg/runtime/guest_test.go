@@ -229,7 +229,7 @@ func addVMPod(t *testing.T, rt *Runtime, podID string, containers ...string) *po
 	// The pod-lifetime supervision context is set exactly as createPod sets it:
 	// it is what every per-pod goroutine (and, on the host spine, the memory
 	// sampler) is rooted at, so a stand-in without one would make an arm attempt
-	// panic instead of being refused — which would hide the very refusal B107's
+	// panic instead of being refused — which would hide the very refusal the
 	// no-ticker assertion is about.
 	podCtx, podCancel := context.WithCancel(context.Background())
 	t.Cleanup(podCancel)
@@ -275,7 +275,7 @@ func drainExec(st *fakeExecStream) execOutput {
 	}
 }
 
-// TestVMPodExecRoutesToGuestAgent is the B101 gate. It asserts the
+// TestVMPodExecRoutesToGuestAgent is the gate. It asserts the
 // CONFORMANCE-BEARING properties of the vm exec route, not merely that a dial
 // happened: exit-code fidelity in both directions of the `kubectl exec … && …`
 // decision, byte-exact stdout/stderr demultiplexing, EOF propagation both ways,

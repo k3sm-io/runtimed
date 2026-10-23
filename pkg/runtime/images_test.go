@@ -284,7 +284,7 @@ func TestPruneImagesRefusesAndReportsTypedReasons(t *testing.T) {
 // measurement of the store volume.
 //
 // The pod root is still recorded here even though the listing no longer reads
-// it (B198): this is the ordinary shape — an image that was pulled and is in
+// it: this is the ordinary shape — an image that was pulled and is in
 // use — and keeping both records is what makes the row a check that the two
 // sources agree rather than a check that only one of them exists.
 func TestImagesListAndFsInfo(t *testing.T) {

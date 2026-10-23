@@ -100,7 +100,7 @@ func leaseOf(t *testing.T, rt *Runtime, podID string) string {
 // --- the validator --------------------------------------------------------
 
 // TestGuestLeaseValidationRejectsHostileValues is the untrusted-input half of
-// B237. The guest agent's guest_ip is attacker-chosen whenever the workload is
+// the lease work. The guest agent's guest_ip is attacker-chosen whenever the workload is
 // (guest.proto §TRUST), so the table below is the full statement of what the
 // host will and will not stamp onto PodStatus.guest_transport_address.
 func TestGuestLeaseValidationRejectsHostileValues(t *testing.T) {
@@ -221,7 +221,7 @@ func TestGuestLeaseBackoffIsBoundedAndJittered(t *testing.T) {
 
 // --- the watcher ----------------------------------------------------------
 
-// TestGuestLeaseWatcherPublishesTheLiveTransportAddress is the B237 producer
+// TestGuestLeaseWatcherPublishesTheLiveTransportAddress is the producer
 // gate. It asserts the properties a consumer depends on, not merely that a poll
 // happened: a first lease reaches PodStatus, a renewal replaces it, a lost or
 // refused lease EMPTIES it rather than leaving a stale address standing, every

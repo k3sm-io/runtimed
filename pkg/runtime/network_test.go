@@ -71,7 +71,7 @@ func (n *reconcilingNetwork) eventLog() []string {
 	return append([]string{}, n.events...)
 }
 
-// TestDeletePodReleasesPodNetwork is M10.1 acceptance (teardown half): DeletePod
+// TestDeletePodReleasesPodNetwork is the acceptance (teardown half): DeletePod
 // releases the pod's networking through PodNetwork.Teardown — with real IPAM
 // behind the seam that is the pod's /32 lo0 alias, without which every pod churn
 // leaks one address of the 253/node pool — and a Teardown ERROR never blocks the
@@ -117,7 +117,7 @@ func TestDeletePodReleasesPodNetwork(t *testing.T) {
 	})
 }
 
-// TestCreatePodUnwindReleasesPodNetwork is M10.1 acceptance (unwind half): when
+// TestCreatePodUnwindReleasesPodNetwork is the acceptance (unwind half): when
 // a create step after a successful network Setup fails (here the spawn), the
 // pod's networking is torn down before CreatePod returns — otherwise the failed
 // create leaks the /32 (DeletePod never runs for a pod that was never created).
@@ -143,7 +143,7 @@ func TestCreatePodUnwindReleasesPodNetwork(t *testing.T) {
 	}
 }
 
-// TestNetworkReconcileStartup is M10.1 acceptance (reconcile half): a
+// TestNetworkReconcileStartup is the acceptance (reconcile half): a
 // Deps.Network implementing the optional NetworkReconciler seam is reconciled
 // exactly once, before the server accepts any CreatePod — the real IPAM
 // adapter's in-memory allocator must re-sync with the durable lo0 aliases a

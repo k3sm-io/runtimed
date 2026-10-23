@@ -104,7 +104,7 @@ func (b *recordingBackend) lastSpec() supervisor.LaunchSpec {
 // mean to exercise. A case that wants a booted pod sets bootOK.
 type fakeVMBackend struct {
 	available bool
-	// rosettaShare is the B229 seam: whether the guests this node's VM host would
+	// rosettaShare is the seam: whether the guests this node's VM host would
 	// build carry a Rosetta directory share. It defaults to false, matching the
 	// shipped helper (sandbox.VMHostRosettaShareSupported), so a test that means to
 	// exercise the guest-Rosetta advertisement must say so explicitly.
@@ -349,7 +349,7 @@ func (b *fakeVMBackend) created() (int, sandbox.VMSpec) {
 // The vm (guest) route must never call it: a NAT-attached guest is reached over
 // the VZNATNetworkDeviceAttachment, not a host lo0 alias. So a test asserts
 // setupCount()==0 on the vm route and a host pod still allocates exactly one
-// alias; the M10.1 tests assert Teardown fires on delete and on create-unwind.
+// alias; the tests assert Teardown fires on delete and on create-unwind.
 type recordingNetwork struct {
 	ip          string
 	setupErr    error
@@ -545,7 +545,7 @@ type instantWaiter struct{ code int }
 func (w instantWaiter) WaitExit(context.Context, int) (int, int, error) { return w.code, 0, nil }
 
 // fakePuller never touches a registry. It records the last credential it received
-// (M2.6) and the last platform policy (B99) so a test can assert both reach the
+// and the last platform policy so a test can assert both reach the
 // pull client.
 type fakePuller struct {
 	err error
@@ -556,7 +556,7 @@ type fakePuller struct {
 	// test flips an entry between calls to drive a retry from failing to healed.
 	errByRef map[string]error
 	// manifest, when set, is what Pull returns — so a test can control the
-	// resolved CONFIG digest a status must publish as image_id (B132). Nil keeps
+	// resolved CONFIG digest a status must publish as image_id. Nil keeps
 	// the historical empty manifest.
 	manifest *runtimev1.ImageManifest
 	// descriptor and platform are the manifest's own content descriptor and the
@@ -705,7 +705,7 @@ func (f *fakeUnpacker) MaterializeTree(_ context.Context, mfst *runtimev1.ImageM
 
 // ImageRunConfig serves the fake's configured image run config. The zero value
 // is an image that declares nothing — no Entrypoint, no Cmd, no Env — which is
-// the shape every pre-M11.2-d1 test implicitly assumed, so those tests keep
+// the shape every earlier test implicitly assumed, so those tests keep
 // asserting on a pod-supplied command alone.
 func (f *fakeUnpacker) ImageRunConfig(_ *runtimev1.ImageManifest) (image.ImageRunConfig, error) {
 	f.mu.Lock()
@@ -813,7 +813,7 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 		t.Fatal(err)
 	}
 	// Shrink the post-SIGKILL exit-observation bound for the unit tier. Every
-	// escalating stop now waits for the reaper to report the exit (B40), and most
+	// escalating stop now waits for the reaper to report the exit, and most
 	// tests here drive a fake waiter they never release for a killed container —
 	// which is the bound's timeout arm, at its production 2s, once per such stop.
 	// The production default is pinned by TestExitObservationGraceDefault and the
@@ -839,9 +839,9 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 // the PRODUCTION wiring (runtime.go; the daemon and the k3sm provider both pass
 // Deps without a Cache). The old default handed the runtime a cache at a second
 // t.TempDir(), so Config.Root and the pod layout disagreed and every guard bounded
-// to <Config.Root>/pods was unsatisfiable in the unit tier: B136 and B140 each had
+// to <Config.Root>/pods was unsatisfiable in the unit tier: the pod-id and fsGroup bounds each had
 // to hand-build a shared-root harness to reach their sink at all, vmshareplan_test
-// states the alignment locally for the share planner, and B142's data-volume bound
+// states the alignment locally for the share planner, and the data-volume bound
 // (Posture.WorkDir is Config.Root, the data volume is cache-derived) would have
 // refused every pod.
 // A test that wants the two split still injects its own Cache.
@@ -982,7 +982,7 @@ func derivedRootfs(t *testing.T, rt *Runtime, podID string) string {
 // hostBinBox builds a minimal valid PodBox running a host-binary container,
 // against rt's own derived pod layout.
 //
-// It takes the runtime because since B142 sandbox_profile.data_volume_path is
+// It takes the runtime because sandbox_profile.data_volume_path is
 // accepted only when it is byte-equal to <Config.Root>/pods/<pod_id>{,/rootfs},
 // and the runtime under test is rooted at a t.TempDir() — the hard-coded
 // /var/lib/k3sm spelling this used to carry named a tree no test ever touched.
@@ -1106,12 +1106,12 @@ func TestCreatePodFailClosed(t *testing.T) {
 	}
 }
 
-// TestCreatePodVMRoutingBypassesHostProcessSteps is the M5.1 routing proof: a pod
+// TestCreatePodVMRoutingBypassesHostProcessSteps is the routing proof: a pod
 // whose SandboxProfile.backend is SANDBOX_BACKEND_VM, on a host where the vm
 // backend is available, routes to vmBackend.CreateVM and runs none of the
 // host-process (Mach-O) steps — no resolveBinary, no ad-hoc sign /
 // gateSignature, no WrapCommand exec-shim, no posix_spawn. It does pull, since
-// M11.2-d11: the guest merges nothing, so each container's image config is read
+// the guest merges nothing, so each container's image config is read
 // host-side — but nothing downstream of the pull on the host-process spine runs. The symmetric control
 // case proves an UNSPECIFIED (host-process) pod still drives exactly those steps
 // (byte-unchanged), and a vm-requested pod on a host without the vm backend fails
@@ -1240,12 +1240,12 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 }
 
 // TestCreateVMPod_GuestNetworkPlumbing proves the runtimed-side guest-network seam
-// (B2): a vm-RuntimeClass pod's GuestNetworkConfig (the DNS configuration + the NAT
+// : a vm-RuntimeClass pod's GuestNetworkConfig (the DNS configuration + the NAT
 // advisory fields) reaches the VMSpec the vm backend's CreateVM receives, while the
 // host-process path never sees it and a NAT-attached guest binds NO lo0 alias.
 //
 // It asserts the behavioral FORK, not a tautology: the same producer — a
-// Deps.Network implementing the M11.2-d8 GuestNetworker seam, holding one populated
+// Deps.Network implementing the GuestNetworker seam, holding one populated
 // config — serves both a vm pod and a host pod. For the vm pod the config reaches
 // VMSpec.Network (resolv.conf nameserver+search+ndots and the NAT fields intact)
 // and the route allocates zero lo0 aliases; for the host pod the producer is never
@@ -1383,8 +1383,8 @@ func TestCreatePodValidation(t *testing.T) {
 // TestCreatePodSignatureRejected drives the SignaturePolicy gate to a rejection
 // through the runtime spine (before exec).
 //
-// Since B119 a rejected signature is a CONTAINER-class failure, not a pod-level
-// one (the images plan, resolution 1): containerd's image verifier makes a rejected image an
+// A rejected signature is a CONTAINER-class failure, not a pod-level
+// one (containerd's image verifier makes a rejected image an
 // ordinary PullImage failure at the kubelet, so the faithful surface is the
 // container Waiting with the typed reason while the pod exists — not a
 // CreatePod that fails and leaves the operator nothing to look at. The gate the
@@ -1611,7 +1611,7 @@ func TestGetRuntimeInfo(t *testing.T) {
 // TestGetRuntimeInfo_VMAvailability asserts GetRuntimeInfo advertises the vm
 // backend's availability as a VMBackendAvailable RuntimeCondition, driven by the
 // injectable VMBackend seam (fakeVMBackend): probe available => true, else false.
-// No real VZ hardware (B1 — the node reads this to set k3sm.io/virtualization).
+// No real VZ hardware (the node reads this to set k3sm.io/virtualization).
 func TestGetRuntimeInfo_VMAvailability(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -1653,7 +1653,7 @@ func (fakeResolver) ServiceAccountToken(_ context.Context, _, _ string, _ int64)
 	return "TOKEN", nil
 }
 
-// TestCreatePodMaterializesVolumesAndDrops ties M2.2 + M2.3 together through the
+// TestCreatePodMaterializesVolumesAndDrops ties the volume steps together through the
 // CreatePod spine: a pod with a configMap + secret volume and a securityContext
 // drop (1) materializes the volume files into the pod data volume, (2) gets the
 // secret's read-only sub-scope into the generated SBPL, and (3) carries the
@@ -1736,7 +1736,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	w.release(1001)
 }
 
-// TestCreatePodThreadsRlimitQoSLaunchSpec is the B7 WIRING proof that kills the
+// TestCreatePodThreadsRlimitQoSLaunchSpec is the WIRING proof that kills the
 // resolveRlimitPlan dead-path: a PodBox with explicit rlimits[] and a BestEffort
 // qos_class (1) reaches WrapCommand as a resolved supervisor.LaunchSpec (the
 // resolver runs LIVE in the spawn path), (2) produces a spawned shim argv
@@ -1798,11 +1798,11 @@ func TestCreatePodThreadsRlimitQoSLaunchSpec(t *testing.T) {
 	}
 }
 
-// TestRuntimeConfigThreadsPostureVIPs pins the M10.1 posture: the cluster VIPs
+// TestRuntimeConfigThreadsPostureVIPs pins the posture: the cluster VIPs
 // set on runtime.Config still thread into sandbox.Posture (pod.go — the DNS
 // env/status plumbing reads them) but are PLUMBING-only and must render NO SBPL
 // rule, because per-IP network filters do not compile on macOS 26 — the
-// pre-M10.1 VIP-scoped stanza failed sandbox_apply and no networked pod could
+// earlier VIP-scoped stanza failed sandbox_apply and no networked pod could
 // spawn. A networked pod's profile instead carries the unfiltered
 // (allow network-outbound) / (allow network-bind), VIPs set or not.
 func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {

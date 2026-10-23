@@ -28,7 +28,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestStartupSweepsStaleSandboxProfiles is the B275 leak contract: a daemon
+// TestStartupSweepsStaleSandboxProfiles is the leak contract: a daemon
 // killed without teardown leaves one staged per-pod SBPL file per live pod, and
 // nothing on the node ever removed them. The startup reap now sweeps them.
 //

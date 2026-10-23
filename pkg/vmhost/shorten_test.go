@@ -30,7 +30,7 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// TestShortenGraceSignalReachesTheGuest is B718's gate: a stopper whose bound
+// TestShortenGraceSignalReachesTheGuest is the gate: a stopper whose bound
 // is shorter than a pod's grace asks the helper, on its real control socket and
 // before any SIGTERM, to start the stop with the grace that fits, and that
 // grace is what the guest agent is sent and what the helper's clock runs on.

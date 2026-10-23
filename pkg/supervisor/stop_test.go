@@ -46,7 +46,7 @@ func (r *recordingSignaller) signals() []os.Signal {
 	return out
 }
 
-// TestGracefulStop covers the M2.4 SIGTERM → grace → SIGKILL escalation raced
+// TestGracefulStop covers the SIGTERM → grace → SIGKILL escalation raced
 // against the reaper. The two signal values are arbitrary os.Signal sentinels
 // (GracefulStop forwards them verbatim); os.Interrupt/os.Kill keep it portable.
 func TestGracefulStop(t *testing.T) {
@@ -172,13 +172,13 @@ func (w *gatedWaiter) WaitExit(ctx context.Context, _ int) (int, int, error) {
 // signal hook and again in cleanup).
 func (w *gatedWaiter) release() { w.once.Do(func() { close(w.released) }) }
 
-// TestGracefulStopAwaitsReaperObservation pins B40's teardown race: every path
+// TestGracefulStopAwaitsReaperObservation pins the teardown race: every path
 // that sends SIGKILL must WAIT for the reaper's exit observation (bounded)
 // before returning, because the caller cancels the pod-lifetime supervision
 // context the instant it returns.
 //
 // The interleaving is CONSTRUCTED, never raced for: the exit is withheld by a
-// controllable fake past the point the pre-B40 code returned. A gate that
+// controllable fake past the point the earlier code returned. A gate that
 // SIGKILLs a real process cannot bite here — the window between "kill sent" and
 // "reaper observed" is microseconds, so a real process almost never occupies it
 // and the test would pass by luck against the unfixed code.

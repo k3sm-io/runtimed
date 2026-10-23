@@ -26,14 +26,14 @@ import (
 )
 
 // TestPodLaunchDefaultsWorkingDirToDataVolume is the pkg/runtime half of the
-// B202 gate: the spawn seam's Dir. pkg/supervisor owns HONORING it
+// working-directory gate: the spawn seam's Dir. pkg/supervisor owns HONORING it
 // (TestSpawnHonorsWorkingDir); only this package knows what a pod data volume
 // is, so the DEFAULT is pinned here.
 //
 // The rule: the pod's working_dir wins, else the image config's
 // (image.MergeRunSpec), else the POD DATA VOLUME — never "" , which the spawner
 // reads as "inherit the daemon's cwd" and which the pod's own SBPL profile
-// denies. Red before B202 on every row: Dir reached the spawner unset or
+// denies. Red before the fix on every row: Dir reached the spawner unset or
 // unconsumed and every pod ran in the daemon's cwd.
 func TestPodLaunchDefaultsWorkingDirToDataVolume(t *testing.T) {
 	cases := []struct {

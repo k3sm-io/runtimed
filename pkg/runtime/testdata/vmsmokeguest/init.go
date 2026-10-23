@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command vmsmokeguest is the LAB GUEST for the M11.2-d9 vm-boot smoke: a
+// Command vmsmokeguest is the LAB GUEST for the vm-boot smoke: a
 // minimal linux/arm64 PID 1 that brings up AF_VSOCK and serves exactly one
 // guest/v1 RPC — Health.
 //
@@ -27,7 +27,7 @@ limitations under the License.
 // yet for a concrete reason: its first act is to mount the k3sm.spec virtiofs
 // share, and neither pinned lab kernel has virtiofs built in — it ships as
 // virtiofs.ko, which a PID 1 that has not yet read its spec cannot know to load.
-// Pointing the smoke at it would test the guest artifacts (M11.2-d3), not the
+// Pointing the smoke at it would test the guest artifacts, not the
 // spine, and would fail for a reason the spine did not cause.
 //
 // So this guest is deliberately the SMALLEST thing that can prove the host end:

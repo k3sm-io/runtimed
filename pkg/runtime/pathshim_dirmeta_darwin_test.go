@@ -195,7 +195,7 @@ type dirMetaRow struct {
 	coverRootfs bool
 }
 
-// TestShadowCopiesRebaseDirectoryAndMetadataCalls is the B425 gate: the path
+// TestShadowCopiesRebaseDirectoryAndMetadataCalls is the gate: the path
 // shim rebases the directory and metadata family (mkdir, rmdir, unlink, rename,
 // chmod, link, symlink, readlink, utimensat, clonefileat, their *at forms, and
 // fopen/freopen) for a mounted absolute path, the way it already rebases open.

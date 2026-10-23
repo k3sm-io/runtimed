@@ -30,7 +30,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// TestPulledImageAbsoluteArgvResolvesInRootfs is B197's gate: argv[0] is
+// TestPulledImageAbsoluteArgvResolvesInRootfs is the gate: argv[0] is
 // resolved by the IMAGE-REFERENCE discriminator and never by argv's own shape.
 //
 // # The counterfactual it pins
@@ -82,7 +82,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 		// wantErrContains, when set, makes the row a refusal: the CONTAINER is
 		// refused — CreatePod succeeds, that container is Waiting with
 		// FAILURE_REASON_CONTAINER_CONFIG and a message containing this text,
-		// and nothing may be spawned or signed for it (B119's partial-start
+		// and nothing may be spawned or signed for it (the partial-start
 		// contract; before it, the whole CreatePod call failed).
 		wantErrContains string
 	}{

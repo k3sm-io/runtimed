@@ -17,19 +17,21 @@ limitations under the License.
 // Package wasmhost is the seam between the runtime daemon and the WebAssembly
 // host process that runs a pod of the "wasm" RuntimeClass.
 //
-// A wasm pod is a native pod whose process is the k3sm-wasmhost helper: the
-// daemon's start path builds a LaunchSpec against its own Bounds, writes it to
-// a daemon-owned file, and rewrites the container argv to the helper plus
-// exactly --spec=<path> and --pod-dir=<dir> (HostArgs). The helper
-// (cmd/k3sm-wasmhost, not yet built) calls ParseArgs and ReadLaunchSpec, then
-// hands the Validated result to an Engine, which takes its directories and its
-// module through OpenPreopens. The builder and the parser live in this one
+// The contract: a wasm pod is a native pod whose process is the k3sm-wasmhost
+// helper. A caller builds a LaunchSpec against its own Bounds, writes it to a
+// daemon-owned file, and gives the helper exactly --spec=<path> and
+// --pod-dir=<dir> (HostArgs). The helper calls ParseArgs and ReadLaunchSpec,
+// then hands the Validated result to an Engine, which takes its directories
+// and its module through OpenPreopens. Neither the helper (cmd/k3sm-wasmhost)
+// nor the daemon start-path wiring that rewrites the container argv is built
+// yet; this package is the seam they will share. The builder and the parser live in this one
 // package so the two ends cannot drift: there is no second encoding of the
 // flags or the file anywhere else.
 //
-// This package is pure Go and must stay so. The wasmtime engine is cgo and lives
-// in a subpackage that only the helper binary imports; the daemon links this
-// package (the spec builder) and nothing of the engine. The import guard
+// This package is pure Go and must stay so. The wasmtime engine is cgo and is
+// to live in a subpackage (not yet present) that only the helper binary
+// imports; the daemon links this package (the spec builder) and nothing of the
+// engine. The import guard
 // TestWasmtimeIsNotReachableFromTheDaemon pins that split.
 // wasmhosttest.FakeEngine lets other packages' unit tests drive the seam
 // without linking cgo.

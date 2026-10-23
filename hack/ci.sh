@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."   # repo root
 
 CGO=1   # runtimed needs cgo (darwin syscall shims: libsandbox, memorystatus, clonefile)
 STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
-GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and hack/etcd-wrapper.sh
+GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and k3sm/hack/etcd-wrapper.sh
 
 echo "==> [runtimed] gofmt"
 fmt=$(gofmt -l .) || true
@@ -20,7 +20,7 @@ hack/verify-boilerplate.sh
 # for. A NON-ZERO exit (broken go.mod, unresolvable dependency, bad GOWORK, absent
 # toolchain) is a HARD ERROR: the old `[ -n "$(go list ./... 2>/dev/null)" ]` could
 # not tell the two apart, so it silently skipped vet/build/test and still reported
-# green — a gate that cannot even enumerate its packages must go RED (B168).
+# green — a gate that cannot even enumerate its packages must go RED.
 golist_err="$(mktemp)"
 trap 'rm -f "$golist_err"' EXIT
 if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then

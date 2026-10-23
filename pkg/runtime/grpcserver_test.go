@@ -71,7 +71,7 @@ func dialClient(t *testing.T, dial func(context.Context, string) (net.Conn, erro
 	return runtimev1.NewRuntimeClient(cc)
 }
 
-// TestServerServesRuntimeSurfaceOverUnixSocket maps to acceptance M2.1-a1: the
+// TestServerServesRuntimeSurfaceOverUnixSocket maps to an acceptance check: the
 // daemon registers the existing *runtime.Runtime with a gRPC server over a unix
 // socket and serves the full runtime/v1 surface end-to-end across the IPC
 // boundary. It uses a unix socket under t.TempDir() (owned by the test user — NO
@@ -149,7 +149,7 @@ func TestServerServesRuntimeSurfaceOverUnixSocket(t *testing.T) {
 		}
 	}
 
-	// The M2.2 ListPodStats RPC must answer over the wire too. pod-grpc carries no
+	// The ListPodStats RPC must answer over the wire too. pod-grpc carries no
 	// memory limit, which now selects OOM enforcement only, not metering — so it is
 	// sampled like any other pod and appears in the snapshot.
 	stats, err := client.ListPodStats(ctx, &runtimev1.ListPodStatsRequest{})
@@ -172,7 +172,7 @@ func TestServerServesRuntimeSurfaceOverUnixSocket(t *testing.T) {
 	}
 }
 
-// TestServerServesOverBufconn maps to acceptance M2.1-a1 via a pure in-process
+// TestServerServesOverBufconn maps to an acceptance check via a pure in-process
 // transport (no socket, no fd): it confirms the seam is transport-agnostic and
 // the registered surface answers over an in-memory pipe.
 func TestServerServesOverBufconn(t *testing.T) {
@@ -200,7 +200,7 @@ func TestServerServesOverBufconn(t *testing.T) {
 	}
 }
 
-// TestServerStopUnblocksServe maps to acceptance M2.1-a1's lifecycle half: an
+// TestServerStopUnblocksServe maps to the acceptance check for the lifecycle half: an
 // explicit Stop() drains and unblocks a Serve that was started without a
 // cancelled context, proving the daemon has a clean non-ctx shutdown path too.
 func TestServerStopUnblocksServe(t *testing.T) {
@@ -233,7 +233,7 @@ func TestServerStopUnblocksServe(t *testing.T) {
 	}
 }
 
-// TestListenRemovesStaleSocket maps to acceptance M2.1-a1's robustness: a stale
+// TestListenRemovesStaleSocket maps to the acceptance check for robustness: a stale
 // socket node from an unclean prior shutdown must not wedge the daemon — Listen
 // removes it and binds cleanly.
 func TestListenRemovesStaleSocket(t *testing.T) {

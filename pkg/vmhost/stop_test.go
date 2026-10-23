@@ -121,7 +121,7 @@ func (a *gateAgent) sentGrace() time.Duration {
 	return a.grace
 }
 
-// TestStopDeliversTheGraceFromSigterm is B712's gate. The daemon times its
+// TestStopDeliversTheGraceFromSigterm is the gate. The daemon times its
 // SIGKILL of the helper from the SIGTERM it sent, so the helper must spend the
 // guest's grace on that same clock: a deadline that started when the Stop RPC
 // returned always expired after the daemon's, and a guest that used its whole

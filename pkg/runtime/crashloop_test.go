@@ -28,7 +28,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// --- B26 fixtures ---------------------------------------------------------
+// --- fixtures ---------------------------------------------------------
 
 // testCP builds a bare containerProc for the phase-accounting unit tests:
 // recomputePhaseLocked reads only spec/state/restarting/initDeclared, never proc.
@@ -95,7 +95,7 @@ func (f *countingFootprinter) Footprint(int) (uint64, error) {
 
 // --- Defect 1: the phase is a function of the container states, not a latch ---
 
-// TestRecomputePhaseDeEscalates is the B26 phase proof: recomputePhaseLocked is a
+// TestRecomputePhaseDeEscalates is the phase proof: recomputePhaseLocked is a
 // pure function of the main containers' current states, so a pod that reached a
 // terminal phase DE-ESCALATES back to Running once a main is live again (a
 // RestartContainer re-exec, or a container mid-restart). Without this a
@@ -175,7 +175,7 @@ func TestRecomputePhaseDeEscalates(t *testing.T) {
 	}
 }
 
-// TestRestartAfterCrashClearsTerminalPhase is the end-to-end B26 proof: a pod
+// TestRestartAfterCrashClearsTerminalPhase is the end-to-end proof: a pod
 // whose main CRASHES goes Failed, and the provider-issued RestartContainer
 // re-exec puts it back to Running with restart_count bumped and the crash
 // preserved in last_termination_state — the CrashLoopBackOff surface.
@@ -231,7 +231,7 @@ func samplingStopped(ff *countingFootprinter) bool {
 	return ff.samples.Load() == a
 }
 
-// TestTrulyTerminalPredicate is the B26 unit proof of trulyTerminalLocked — the
+// TestTrulyTerminalPredicate is the unit proof of trulyTerminalLocked — the
 // gate on the two IRREVERSIBLE pod-teardown side effects. Both terminal phases
 // qualify (a restartPolicy Never/OnFailure pod that FAILS is genuinely finished
 // and Kubernetes retains it, so withholding the teardown leaks the sampler
@@ -342,7 +342,7 @@ func TestTerminalTeardownClaimDeferralIsReleased(t *testing.T) {
 	}
 }
 
-// TestFailedPodIsTrulyTerminal is the corrected B26 leak proof, end to end: a
+// TestFailedPodIsTrulyTerminal is the corrected leak proof, end to end: a
 // restartPolicy Never/OnFailure pod whose main FAILS is genuinely terminal —
 // nothing will restart it, and Kubernetes retains it (the Job controller keeps it
 // under backoffLimit, podgc only collects at --terminated-pod-gc-threshold). So
@@ -542,7 +542,7 @@ func TestLiveContainersExcludeTerminated(t *testing.T) {
 	}
 }
 
-// TestSamplerRefusesToArmDeletedPod is the anti-stranding proof (B26): a sampler
+// TestSamplerRefusesToArmDeletedPod is the anti-stranding proof: a sampler
 // is a root-daemon goroutine whose breach path SIGKILLs a process group, so
 // arming one for a pod already removed from r.pods — the reachable
 // DeletePod-cancels-then-RestartContainer-arms interleaving — must be refused.
@@ -590,7 +590,7 @@ func TestSamplerRefusesToArmDeletedPod(t *testing.T) {
 	}
 }
 
-// TestRestartRearmsMemorySamplerAfterCompletion is the B26 residual-closure
+// TestRestartRearmsMemorySamplerAfterCompletion is the residual-closure
 // proof: a pod that reaches Succeeded IS torn down (voluntary completion), so
 // when a provider re-execs it anyway (restartPolicy:Always semantics runtimed
 // cannot see — PodBox carries no pod-level restartPolicy), RestartContainer must
@@ -652,7 +652,7 @@ func TestRestartRearmsMemorySamplerAfterCompletion(t *testing.T) {
 
 // --- Defect 3: no transient terminated publish while a restart is in flight ---
 
-// TestNoTransientTerminatedPublishWhileRestarting is the B26 publish-suppression
+// TestNoTransientTerminatedPublishWhileRestarting is the publish-suppression
 // proof: the kqueue reaper records the old run's terminated state (the restart
 // reads it back for last_termination_state) but must not publish it while the
 // container is flagged restarting. Publishing it shows the provider a "new" exit

@@ -100,7 +100,7 @@ func vmShareBox(podID string) *runtimev1.PodBox {
 // <Config.Root>/pods (mount.ComputeSharePlan via guardShareRoots), so a cache
 // rooted anywhere else rejects every vm pod before CreateVM.
 //
-// Since B142 testDeps no longer splits the two, so this states the requirement
+// testDeps no longer splits the two, so this states the requirement
 // locally rather than repairing a harness default — a test that names the
 // alignment it depends on does not silently lose it to a future harness change.
 func vmPodConfig(t *testing.T, d Deps) (Config, Deps) {
@@ -132,7 +132,7 @@ func vmPodConfig(t *testing.T, d Deps) (Config, Deps) {
 }
 
 // testGuestNetwork is the guest network config a vm test's producer supplies:
-// a podCIDR /32 shaped like the one the k3sm provider allocates on the rig.
+// a podCIDR /32 shaped like the one the k3sm provider allocates on a real node.
 func testGuestNetwork() sandbox.GuestNetworkConfig {
 	return sandbox.GuestNetworkConfig{PodIP: netip.MustParseAddr("100.64.0.8")}
 }
@@ -233,7 +233,7 @@ func underStrict(path, base string) bool {
 	return path != base && strings.HasPrefix(path, base+string(filepath.Separator))
 }
 
-// TestCreateVMPodVolumeSharePlan is the B106 gate: a vm-RuntimeClass pod's
+// TestCreateVMPodVolumeSharePlan is the gate: a vm-RuntimeClass pod's
 // PodBox volumes are compiled into a virtiofs share-device plan — pure data,
 // threaded through the real createPod → createVMPod wiring into the
 // sandbox.VMSpec the vm backend receives — with every reject fail-closed

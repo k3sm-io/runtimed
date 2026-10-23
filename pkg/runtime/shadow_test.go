@@ -39,7 +39,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// TestExecRewriteFollowsShebangs is the B243 gate for the spawn-time rewrite:
+// TestExecRewriteFollowsShebangs is the gate for the spawn-time rewrite:
 // a host shell, or a script whose shebang names one, runs the node's re-signed
 // copy with the argv the kernel would have built; a target (or interpreter)
 // under a mount prefix is rebased first, as the interposer rebases it; and
@@ -525,7 +525,7 @@ var (
 	fatMagic   = []byte{0xca, 0xfe, 0xba, 0xbe}
 )
 
-// TestScriptEntrypointIsGatedOnItsInterpreter is the rig finding's gate: a
+// TestScriptEntrypointIsGatedOnItsInterpreter is a hardware finding's gate: a
 // native pod whose command is a script used to fail the signature gate with
 // "unsigned" (FAILURE_REASON_SIGNATURE_REJECTED, surfaced as an image-pull
 // failure) because the gate was asked about the script. A script cannot
@@ -603,9 +603,9 @@ func TestScriptEntrypointIsGatedOnItsInterpreter(t *testing.T) {
 			if resp.GetError() != nil {
 				t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
 			}
-			// A rejected signature is container-class (B119): the container
+			// A rejected signature is container-class: the container
 			// waits with the typed reason, which the node reports as the
-			// image failure the rig saw.
+			// image failure a test machine saw.
 			reason := statusNamed(t, rt, "pod-script", "main").GetState().GetWaiting().GetFailureReason()
 			if tc.wantReject {
 				if reason != runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED {

@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestStopContainerTerminatesWithoutRespawn is the B171 runtimed gate: the
+// TestStopContainerTerminatesWithoutRespawn is the runtimed gate: the
 // CRI StopContainer shape. A stop kills ONE container's process group within
 // the grace window and leaves it Terminated — no re-spawn, no restart_count
 // bump, the same log file — publishing exactly one MODIFIED for the exit, with

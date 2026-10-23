@@ -25,9 +25,9 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// TestListPodStatsMapsFootprint is the M2.8 ListPodStats proof: a pod's
+// TestListPodStatsMapsFootprint is the ListPodStats proof: a pod's
 // ri_phys_footprint working set maps onto PodStats.containers[].memory.working_set_bytes
-// (the typed wire form of the M2.5 sampler); empty pod_id returns every pod,
+// (the typed wire form of the sampler); empty pod_id returns every pod,
 // including one with no memory limit (the limit selects OOM enforcement, not
 // metering — a `kubectl top` that omitted unlimited pods would lie by omission).
 func TestListPodStatsMapsFootprint(t *testing.T) {
@@ -131,7 +131,7 @@ func (f fakeRUsager) RUsage(pid int) (supervisor.RUsage, error) {
 	return supervisor.RUsage{PhysFootprintBytes: f.bytes, CPUTimeNanos: f.cpu[pid]}, nil
 }
 
-// TestListPodStatsCarriesCPUJointlyWithMemory is the B14 producer proof: a sampled
+// TestListPodStatsCarriesCPUJointlyWithMemory is the producer proof: a sampled
 // pod's ContainerStats and PodStats carry CPU **and** memory together, sourced from
 // the one rusage_info_v2 sample, and the CPU value is a monotone cumulative counter.
 //

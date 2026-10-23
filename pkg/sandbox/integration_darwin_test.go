@@ -137,7 +137,7 @@ func runUnderShim(t *testing.T, shim, profile string, env []string, argv ...stri
 	return buf.String(), err
 }
 
-// TestIntegrationConfinement is acceptance M1.2-a1 (live half): a process spawned
+// TestIntegrationConfinement is an acceptance test (live half): a process spawned
 // under a generated profile reads /System but is denied /Users.
 func TestIntegrationConfinement(t *testing.T) {
 	shim := buildExecShim(t)
@@ -176,11 +176,11 @@ func TestIntegrationConfinement(t *testing.T) {
 	})
 }
 
-// TestIntegrationNetworkStanzaCompiles is the M10.1 P0 regression gate: a
+// TestIntegrationNetworkStanzaCompiles is the P0 regression gate: a
 // profile generated with the full production networked-pod shape —
 // AllowNetwork=true, a PodIP, and both node VIPs set — must actually COMPILE
 // and APPLY through the real exec-shim/libsandbox path. On macOS 26 Seatbelt
-// network filters accept only localhost/* hosts, so the pre-M10.1 IP-scoped
+// network filters accept only localhost/* hosts, so the earlier IP-scoped
 // stanza ((remote ip "<VIP>:53"), (local ip "<PodIP>:*")) failed sandbox_apply
 // ("host must be * or localhost in network address") and every networked pod
 // died at spawn. This test goes red if such a filter ever returns. User-space
@@ -215,7 +215,7 @@ func TestIntegrationNetworkStanzaCompiles(t *testing.T) {
 		// The listen() leg is load-bearing: a bare network-bind passes bind() but a
 		// TCP server's listen() is gated by the separate network-inbound operation, so
 		// without it every server pod (a Service target, a readiness/liveness HTTP
-		// server) fails listen() with EPERM (the M10.1 regression this test now guards).
+		// server) fails listen() with EPERM (the regression this test now guards).
 		bin := filepath.Join(work, "bindbin")
 		src := filepath.Join(work, "bind.c")
 		if err := os.WriteFile(src, []byte(
@@ -294,7 +294,7 @@ func TestIntegrationDYLDPreserved(t *testing.T) {
 	}
 }
 
-// TestIntegrationLaunchShimNeverLoadsPodDylib is the rig negative case of the
+// TestIntegrationLaunchShimNeverLoadsPodDylib is the hardware negative case of the
 // empty-environ launch, runnable without root: a DYLD_INSERT_LIBRARIES the pod
 // sets names a library whose constructor appends getprogname() to a marker
 // file. Through the real exec-shim, the pod binary must load it (the env still

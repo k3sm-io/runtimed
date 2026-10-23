@@ -115,7 +115,7 @@ func findShare(cfg MachineConfig, tag string) (ShareConfig, bool) {
 	return ShareConfig{}, false
 }
 
-// TestMachineConfigFromSpec is B227's translator gate. FromSpec carries all the
+// TestMachineConfigFromSpec is the translator gate. FromSpec carries all the
 // validation between an untranslated proto and a machine this helper is willing to
 // boot, so this is the table that says what "willing" means.
 //
@@ -512,7 +512,7 @@ func TestMachineConfigFromSpec(t *testing.T) {
 	// --- the rest ------------------------------------------------------------
 
 	t.Run("rejects-a-rosetta-request", func(t *testing.T) {
-		// B229's other half, at the helper: the node does not advertise
+		// the other half, at the helper: the node does not advertise
 		// guest-Rosetta, and if a spec asks for it anyway the helper refuses rather
 		// than booting a guest that silently cannot execute the payloads the share
 		// was requested for.

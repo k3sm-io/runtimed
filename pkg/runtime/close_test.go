@@ -64,7 +64,7 @@ func closed(ch <-chan struct{}) bool {
 	}
 }
 
-// TestRuntimeCloseSweepsSupervision pins B40's shutdown sweep: every live pod's
+// TestRuntimeCloseSweepsSupervision pins the shutdown sweep: every live pod's
 // supervision — the per-container kqueue reapers and the ~1 Hz memory sampler —
 // is stopped when the daemon shuts down, not left to be collected by process
 // exit. Before this existed, only DeletePod fired those cancels, so a shutdown

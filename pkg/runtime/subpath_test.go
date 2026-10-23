@@ -86,7 +86,7 @@ func regularFilesUnder(t *testing.T, root string) []string {
 	return out
 }
 
-// TestVolumeSubPathMaterialization is the B77 gate: subPath materialization exposes
+// TestVolumeSubPathMaterialization is the gate: subPath materialization exposes
 // only the volume's <subPath> element at the mount path (a file or a subdir), never
 // the whole volume, with the escape/fail-closed guards — and leaves the no-subPath
 // path unchanged. It drives mount.Materialize with a fake Resolver + a temp dataVol

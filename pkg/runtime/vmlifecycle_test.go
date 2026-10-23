@@ -52,14 +52,13 @@ import (
 // spine must thread to the helper as its stop budget.
 //
 // Its container names an OCI REFERENCE and carries a command, because both are
-// what a vm pod needs to resolve at all (M11.2-d11): the absolute-path
+// what a vm pod needs to resolve at all: the absolute-path
 // host-binary convention is refused on this path, and the harness's fake image
 // config declares no Entrypoint, so a container with no command of its own would
 // fail the merge rather than reach the backend.
 //
 // It takes the runtime for the same reason hostBinBox does: data_volume_path is
-// accepted only when it is byte-equal to one of this pod's own derived spellings
-// (B142), and the runtime under test is rooted at a t.TempDir().
+// accepted only when it is byte-equal to one of this pod's own derived spellings, and the runtime under test is rooted at a t.TempDir().
 func vmPodBox(rt *Runtime, podID string, graceSeconds int64) *runtimev1.PodBox {
 	dataVol := filepath.Join(rt.cache.PodsRoot(), podID)
 	if id, err := image.ParsePodID(podID); err == nil {
@@ -151,7 +150,7 @@ func TestCreateVMPodAssemblesARunningPod(t *testing.T) {
 
 	t.Run("no host memory sampler is armed", func(t *testing.T) {
 		// A vm pod's ceiling is the hypervisor's memorySize and its OOM truth is
-		// the guest cgroup's; a host sample would meter the vmhost helper (B107).
+		// the guest cgroup's; a host sample would meter the vmhost helper.
 		p, _ := rt.lookupPod(box.GetPodId())
 		p.mu.Lock()
 		sampler, cancel := p.memSampler, p.memCancel
@@ -721,7 +720,7 @@ type olderGuestAgent struct {
 // FOUND BY the LIVE SMOKE, not BY REVIEW. A helper's exit is observed by two
 // watchers — the stop's own GracefulStop and watchVMHelperExit, whose whole job
 // is to fail a pod whose machine died under it — and cancelling supervision
-// after the stop left which one won to chance. On the rig the watcher won
+// after the stop left which one won to chance. On hardware the watcher won
 // routinely: an ordinary DeletePod logged "the vm host helper exited while its
 // pod was running; the guest is gone" and published a Failed status for a pod the
 // operator had just asked to delete. A provider consuming that event sees a

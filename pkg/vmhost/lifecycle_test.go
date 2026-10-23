@@ -145,7 +145,7 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// TestLifecycleStateMachine is B227's lifecycle gate. It drives the New -> Starting
+// TestLifecycleStateMachine is the lifecycle gate. It drives the New -> Starting
 // -> Running -> Stopping -> Stopped|Failed machine through every transition and
 // pins the shutdown order, which is the property the whole design turns on
 // (the M11 plan's Resolution 5).

@@ -140,7 +140,7 @@ func (a *attachedPod) status2(t *testing.T, name string) *runtimev1.ContainerSta
 	return nil
 }
 
-// TestRestartContainerOnAttachedPodRebuildsItsSandbox is the B409 runtimed
+// TestRestartContainerOnAttachedPodRebuildsItsSandbox is the runtimed
 // gate. A pod re-attached after a daemon restart recompiles its sandbox profile
 // from the spec and this daemon's posture, verifies it against the digest each
 // container recorded at spawn, and so restarts ONE container in place — the

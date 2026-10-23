@@ -101,7 +101,7 @@ func mustCreatePod(t *testing.T, rt *Runtime, box *runtimev1.PodBox) {
 	}
 }
 
-// TestDeletePodGracefulStop is the runtime-level M2.4 proof: the SIGTERM→SIGKILL
+// TestDeletePodGracefulStop is the runtime-level proof: the SIGTERM→SIGKILL
 // resolution + the reaper race wired through DeletePod. The deterministic deadline
 // escalation itself is proven in supervisor.TestGracefulStop.
 func TestDeletePodGracefulStop(t *testing.T) {

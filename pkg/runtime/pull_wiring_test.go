@@ -80,7 +80,7 @@ func TestDefaultPullerPlatformWiring(t *testing.T) {
 				}
 				// The command is absolute, and on a pulled image that names a path
 				// in the IMAGE, not on the host — so it resolves under this pod's
-				// rootfs (B197). The subject here is still the platform wiring;
+				// rootfs. The subject here is still the platform wiring;
 				// the argv rule itself is gated by
 				// TestPulledImageAbsoluteArgvResolvesInRootfs.
 				if want := filepath.Join(rootfs, "app"); rb.path != want {
@@ -136,7 +136,7 @@ func pushPlatformImage(t *testing.T, host, repo, os, arch string) string {
 	return ref.String()
 }
 
-// TestPullPolicyForwardedToPuller pins the runtimed half of the M12.1 skew
+// TestPullPolicyForwardedToPuller pins the runtimed half of the skew
 // contract: the container's stamped imagePullPolicy reaches the puller exactly
 // as the PodBox carried it, and an unset field arrives as UNSPECIFIED (the
 // legacy pull-through) rather than being re-derived from the tag.

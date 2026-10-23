@@ -42,8 +42,8 @@ limitations under the License.
 //     pod-set DYLD_INSERT_LIBRARIES reaches the pod, never the unconfined
 //     shim). It deliberately does not use
 //     Apple's /usr/bin/sandbox-exec, which is a platform binary that strips
-//     DYLD_* from the environment and would break the DNS shim (Wave-0
-//     confirmed this live). The backend is OS-version-gated and FAILS closed:
+//     DYLD_* from the environment and would break the DNS shim (verified on
+//     hardware). The backend is OS-version-gated and FAILS closed:
 //     if unavailable it refuses to start the pod rather than running unconfined.
 //
 // The cgo libsandbox SPI (sandbox_compile_string / sandbox_apply) is private and

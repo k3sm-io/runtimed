@@ -30,14 +30,14 @@ import (
 // CONFIG digest may ever appear in image_id. The index digest is shared by every
 // platform of a multi-platform image and the layer digest names a component, so
 // either one in a per-container identity field resolves the wrong artifact —
-// which is the defect B132 exists to close, not a stylistic preference.
+// which is the defect this test exists to close, not a stylistic preference.
 const (
 	testConfigDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	testIndexDigest  = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	testLayerDigest  = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 )
 
-// TestContainerStatusIdentityFields is the B132 gate: ContainerStatus.image_id
+// TestContainerStatusIdentityFields is the gate: ContainerStatus.image_id
 // and ContainerStatus.container_id are populated by the real status-assembly path
 // (CreatePod → startContainer → containerStatusOf → GetPodStatus), with the
 // substrate faked at the injected seams.

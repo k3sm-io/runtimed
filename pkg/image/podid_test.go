@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// TestPodRootfsRejectsTraversal is B136's named gate.
+// TestPodRootfsRejectsTraversal is the named gate.
 //
 // It pins the REJECTION half of the contract: a pod id that is not a legal path
 // component yields no PodID, and therefore no path — the derivation is

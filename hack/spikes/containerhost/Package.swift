@@ -1,5 +1,5 @@
 // swift-tools-version: 6.2
-// B267 spike: a throwaway helper that boots one Linux container VM on the
+// Spike: a throwaway helper that boots one Linux container VM on the
 // Containerization Swift package, from a kernel k3sm built itself and a rootfs
 // ext4 image k3sm built from its own unpacked OCI tree. Not shipped.
 import PackageDescription

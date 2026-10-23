@@ -30,8 +30,8 @@ const sZomb = 5
 
 // ReadProcTable is the production ProcTable: one sysctl kern.proc.all for
 // every process's pid, parent, group, start time and state, plus getsid(2) per
-// process for its session (kinfo_proc carries no usable session id). On the
-// lab Macs a whole read costs well under a millisecond.
+// process for its session (kinfo_proc carries no usable session id). On an
+// M1 Max a whole read costs well under a millisecond.
 func ReadProcTable() ([]ProcEntry, bool) {
 	kps, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {

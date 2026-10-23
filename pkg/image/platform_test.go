@@ -287,7 +287,7 @@ func mustCandidates(t *testing.T, p PlatformPolicy) []Platform {
 // The gate.
 // ---------------------------------------------------------------------------
 
-// TestManifestListPlatformSelection is the B99 gate: k3sm
+// TestManifestListPlatformSelection is the gate: k3sm
 // selects the manifest of a multi-platform image by an explicit, fail-closed
 // policy, and there is structurally no path left on which
 // go-containerregistry's implicit linux/amd64 default can fire.
@@ -418,7 +418,7 @@ func TestManifestListPlatformSelection(t *testing.T) {
 	// The production path itself, not a fake: NewPuller(cache, RemoteFetch) is
 	// exactly how runtime.New builds the daemon's puller, so this subtest is the
 	// only thing standing between a green table and a green table that never
-	// executed RemoteFetch (the pre-B99 pull tests all replaced the fetcher).
+	// executed RemoteFetch (the earlier pull tests all replaced the fetcher).
 	t.Run("e2e/production_puller_fails_closed", func(t *testing.T) {
 		ref := pushIndex(t, host, "prodlinuxonly",
 			child(linuxAMD64, ggcrPlatform("linux", "amd64", "")),

@@ -54,7 +54,7 @@ const (
 	ExitTrap
 	// ExitResourceLimit means the engine's own resource backstop trapped the
 	// guest (a store limit on memory or tables). It is distinct from ExitTrap
-	// because the start path reports it as OOMKilled, by operator ruling; the
+	// because the start path reports it as OOMKilled; the
 	// mapping itself belongs to that path, not to this package.
 	ExitResourceLimit
 )

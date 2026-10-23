@@ -23,7 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestRlimitShimArgvRoundTrip is the B7 argv-codec slice: the resolved numeric
+// TestRlimitShimArgvRoundTrip is the argv-codec slice: the resolved numeric
 // rlimit plan and the qos flag each encode as one fixed-position shim argv token
 // (inserted before the profile path), decode back to the identical plan, and any
 // malformed/truncated token is a shim-fatal error (fail-closed under daemon/shim
@@ -144,7 +144,7 @@ func TestRlimitShimArgvRoundTrip(t *testing.T) {
 }
 
 // TestNormalizeNOFILE is the pure-arithmetic table for the darwin RLIMIT_NOFILE
-// taxonomy (B7): darwin setrlimit(2) returns EINVAL — not a clamp — for
+// taxonomy: darwin setrlimit(2) returns EINVAL — not a clamp — for
 // rlim_cur=RLIM_INFINITY (or beyond OPEN_MAX) on RLIMIT_NOFILE, so an
 // infinite/oversized soft limit is clamped down to min(OPEN_MAX ceiling, hard)
 // before the syscall; and a too-tight soft limit is floored UP to minNOFILESoft

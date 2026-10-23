@@ -154,7 +154,7 @@ func TestChainID(t *testing.T) {
 	})
 }
 
-// TestLinuxSnapshotCommitsUnderChainID is the store half of the M11.2-d1 gate:
+// TestLinuxSnapshotCommitsUnderChainID is the store half of the gate:
 // a Linux-dialect unpack lands in snapshots/<algo>/<chainid> with the record and
 // the ownership sidecar committed beside the payload, and the NATIVE dialect's
 // store is untouched by it.

@@ -90,7 +90,7 @@ if not out.strip():
 print("GENERATE_OK", len(out))
 `
 
-// TestIntegrationMetalMatmulUnderProfile is acceptance M8.2-a4: a real MLX matmul
+// TestIntegrationMetalMatmulUnderProfile is an acceptance test: a real MLX matmul
 // runs on the GPU inside the profile Generate produces for allow_gpu.
 //
 // It is the only check that can falsify the Metal allow-set. The unit goldens pin
@@ -100,7 +100,7 @@ print("GENERATE_OK", len(out))
 // a family whose class names differ, or a macOS release that renames one, is
 // caught.
 //
-// It skips off a GPU lab rig (k3smtest gates it on the apple-gpu capability), which
+// It skips off a machine without a GPU (k3smtest gates it on the apple-gpu capability), which
 // is the expected outcome of an ordinary `go test ./...`. It is deliberately not
 // behind the `integration` build tag so it still COMPILES in that run: a lab-only
 // gate that stops compiling is a gate nobody notices is broken until the lab needs

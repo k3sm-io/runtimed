@@ -526,7 +526,7 @@ func TestApplyLayerLimits(t *testing.T) {
 
 // TestNewLayerApplierRequiresAValidPolicy pins the fail-closed dialect check: an
 // unset or unknown LayerSemantics never falls through to the native rules.
-// "linux" is a real dialect since M11.2-d1, so the unknown-value rows name
+// "linux" is a real dialect, so the unknown-value rows name
 // values no dialect will ever claim.
 func TestNewLayerApplierRequiresAValidPolicy(t *testing.T) {
 	root, err := os.OpenRoot(t.TempDir())

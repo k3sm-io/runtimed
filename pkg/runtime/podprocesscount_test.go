@@ -27,7 +27,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// TestPodProcessCountsFromLedger is the B190 runtimed gate: PodProcessCounts
+// TestPodProcessCountsFromLedger is the runtimed gate: PodProcessCounts
 // counts, per pod, the live members of the process groups the pod-reap ledger
 // records, through the injected procGroup seam and nothing else. Each case seeds
 // ledger records over a fake process-group table.
@@ -202,7 +202,7 @@ func seedPodProcRecordFull(t *testing.T, rt *Runtime, rec podProcRecord) {
 	}
 }
 
-// TestListPodStatsCarriesProcessCount pins the wire half of B190: ListPodStats
+// TestListPodStatsCarriesProcessCount pins the wire half: ListPodStats
 // carries each pod's ledger-derived process count in PodStats.process, a
 // present message even when the count is 0.
 func TestListPodStatsCarriesProcessCount(t *testing.T) {

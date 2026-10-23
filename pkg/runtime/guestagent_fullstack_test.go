@@ -141,11 +141,10 @@ func startRealGuestAgent(t *testing.T, podID string, deps guestagent.Deps) Guest
 	return func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }
 }
 
-// TestGuestAgentServesTheHostRoutes is B228's gate, and it exists to retire a
+// TestGuestAgentServesTheHostRoutes is the gate, and it exists to retire a
 // standing caveat rather than to add coverage.
 //
-// pkg/runtime's vm routes — execGuest, getLogsGuest, vmPodStats — shipped in
-// B101/B107 and guest_test.go says outright that they are exercised "against
+// pkg/runtime's vm routes — execGuest, getLogsGuest, vmPodStats — shipped earlier and guest_test.go says outright that they are exercised "against
 // in-process FAKE agents": nothing anywhere answered guest/v1, so the far end of
 // every one of those routes was a test double written to satisfy the near end.
 // A contract asserted only against a fake of itself is not asserted.

@@ -96,7 +96,7 @@ func requireTrustedShadowSet(t *testing.T) {
 	}
 }
 
-// TestShadowShellIsNotRestricted is the B243 gate for the re-signed shell
+// TestShadowShellIsNotRestricted is the gate for the re-signed shell
 // copies. It clones /bin/bash and /usr/bin/env the way the installer does
 // (cp -c + image.AdHocSign), runs the pod shape "sh -c '...'" through
 // shadowRewrite with the built path shim inserted, and asserts:

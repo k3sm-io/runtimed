@@ -70,7 +70,7 @@ func (f fakeTemplate) Template(_ context.Context, _, _ string) (string, bool, er
 	return f.dir, f.present, f.err
 }
 
-// TestPVCMaterializeStableDir is acceptance runtimed:M3.1-a1 (root-free): a PodBox
+// TestPVCMaterializeStableDir is an acceptance test (root-free): a PodBox
 // with a PVC source materializes the dir at storagev1 DataDir, and the same
 // (namespace, claim) resolves to the same path across calls (stable), with a
 // symlink linking it into each pod's rootfs.
@@ -141,7 +141,7 @@ func TestPVCMaterializeStableDir(t *testing.T) {
 	}
 }
 
-// TestPVCSeedOnce proves clonefile seeding happens only on first create (M3.1-d2):
+// TestPVCSeedOnce proves clonefile seeding happens only on first create:
 // a fresh claim with a configured template is seeded; a reuse is not re-seeded
 // (even after the seeded content is removed), and a claim whose class has no
 // template is empty-created with no clone.

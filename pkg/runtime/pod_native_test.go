@@ -82,7 +82,7 @@ func TestResolveBinaryNativeSentinel(t *testing.T) {
 // image-platform candidate list. A future native rung that did not would be
 // mis-selected through a valid enum value, so the fail-closed default in
 // image.Candidates could never fire — the failure would be silent, which is the
-// class of bug B99 exists to remove.
+// class of bug the platform policy exists to remove.
 func TestResolveBinaryPullPolicyCarriesResolvedBackend(t *testing.T) {
 	backends := []runtimev1.SandboxBackend{
 		runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC,
@@ -104,9 +104,9 @@ func TestResolveBinaryPullPolicyCarriesResolvedBackend(t *testing.T) {
 			}
 			// Every native rung must still resolve to darwin/arm64 only: the
 			// host-process spine runs Mach-O, and HostRosetta stays false even
-			// though the capability probe now EXISTS (B103) — the pull path
+			// though the capability probe now EXISTS — the pull path
 			// deliberately does not consume it until the Seatbelt x Rosetta spawn
-			// is proven (B105). This assertion is what keeps that decision honest.
+			// is proven. This assertion is what keeps that decision honest.
 			cands, err := image.Candidates(pol)
 			if err != nil {
 				t.Fatalf("pull policy has no candidates: %v", err)

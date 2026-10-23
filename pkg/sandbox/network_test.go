@@ -30,7 +30,7 @@ import (
 
 const egressDataVol = "/var/lib/k3sm/pods/pod-egress1/rootfs"
 
-// TestGenerateEgressGolden is acceptance M8.2-a1's egress half: the profile an
+// TestGenerateEgressGolden is the acceptance check for the egress half: the profile an
 // allow_internet_egress pod runs under is pinned byte-for-byte against
 // testdata/pod-egress.golden.sb — the DOCUMENTED-ceiling form.
 //
@@ -318,7 +318,7 @@ func TestGenerateDeniesKinePort(t *testing.T) {
 	})
 }
 
-// TestValidateNetworkScope is acceptance M8.2-a1's adversarial half: the re-scoped
+// TestValidateNetworkScope is the acceptance check for the adversarial half: the re-scoped
 // check accepts exactly the generated stanza under a request for it, and refuses
 // every other shape — including profiles that are perfectly well-formed SBPL and
 // would pass the fail-closed Validate.

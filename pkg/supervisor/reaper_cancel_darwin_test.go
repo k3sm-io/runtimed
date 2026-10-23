@@ -41,7 +41,7 @@ const cancelBound = 50 * time.Millisecond
 // polling reaper fail with probability 1 - 0.2^5, i.e. every run in practice.
 const cancelTrials = 5
 
-// TestKqueueReaperCancelIsImmediate is the B255 gate: WaitExit's cancellation
+// TestKqueueReaperCancelIsImmediate is the gate: WaitExit's cancellation
 // path is event-driven (an EVFILT_USER wakeup on the reaper's own kqueue), not
 // a 250 ms poll — and the exit-status path it shares the kqueue with is
 // unchanged: a normal exit and a signalled exit still report through, and the

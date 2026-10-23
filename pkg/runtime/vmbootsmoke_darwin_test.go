@@ -45,7 +45,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// the M11.2-d9 LIVE VM-BOOT SMOKE: a real k3sm-vmhost, a real Virtualization
+// the LIVE VM-BOOT SMOKE: a real k3sm-vmhost, a real Virtualization
 // machine, a real Linux guest, driven by a real in-process runtime.Runtime.
 //
 // what IT IS for, given the unit tier already exists. The unit gate (a8) drives
@@ -152,7 +152,7 @@ func buildSignedVMHost(t *testing.T) string {
 //
 // It shells out to cpio rather than writing newc bytes here, for a scope reason
 // rather than a laziness one: a pure-Go byte-DETERMINISTIC newc writer is a named
-// M11.2-d3 deliverable with its own golden gate, and a second implementation in a
+// deliverable with its own golden gate, and a second implementation in a
 // test file is exactly the drifting duplicate that gate exists to prevent. This
 // archive only has to be readable by one kernel, once.
 func buildSmokeInitramfs(t *testing.T, modules []string) string {
@@ -355,7 +355,7 @@ func TestIntegrationVMBootSmokeLifecycle(t *testing.T) {
 			t.Errorf("guest spec agent_port = %d, want %d — the guest would listen where the host does not dial",
 				gs.GetAgentPort(), sandbox.VMAgentVsockPort)
 		}
-		// The CONTAINERS reached the share too (M11.2-d11). The lab guest runs
+		// The CONTAINERS reached the share too. The lab guest runs
 		// none of them — it answers Health and nothing else, by design — so this
 		// is deliberately a spec assertion and not a workload one: on a real rig
 		// the file the guest mounts must name the pod's own containers, because
@@ -686,7 +686,7 @@ func smokeHelperPIDs(t *testing.T, root, podID string) []int {
 //
 // It signals the process GROUP, which is the helper's own session (SETSID), so a
 // helper that forked is torn down whole. A test that leaves a virtual machine
-// running has cost the rig memory and a hypervisor slot until someone notices,
+// running has cost the host memory and a hypervisor slot until someone notices,
 // which is exactly the failure mode the orphan sweep exists for — a smoke that
 // created it would be embarrassing.
 func killSmokeHelpers(t *testing.T, root, podID string) {

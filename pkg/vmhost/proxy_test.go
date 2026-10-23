@@ -94,7 +94,7 @@ func newTestProxy(t *testing.T, dialErr error) (string, <-chan fakeGuestEnd, con
 	return sock, ends, cancel, settle
 }
 
-// TestProxyRelayShutdown is B227's proxy gate. The agent proxy is the only path
+// TestProxyRelayShutdown is the proxy gate. The agent proxy is the only path
 // between the daemon and a guest, and it runs inside the one k3sm binary carrying
 // com.apple.security.virtualization — so what it must get right is relaying bytes
 // faithfully and then GOING AWAY COMPLETELY, leaving no goroutine holding a vsock

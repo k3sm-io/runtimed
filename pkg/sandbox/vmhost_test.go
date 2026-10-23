@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// TestVMAvailableRequiresEntitledHelper is B227's named gate. It proves the vm
+// TestVMAvailableRequiresEntitledHelper is the named gate. It proves the vm
 // backend's availability is the full five-term conjunction — darwin, the macOS
 // floor, +[VZVirtualMachine isSupported], the k3sm-vmhost helper resolving at its
 // installed path, and that helper's signature being valid and
@@ -185,7 +185,7 @@ func TestFindVMHostMirrorsExecShimLookup(t *testing.T) {
 	})
 }
 
-// TestGuestRosettaShareWithheld is B229's pkg/sandbox half: the node's
+// TestGuestRosettaShareWithheld is the pkg/sandbox half: the node's
 // guest-Rosetta advertisement is gated on what the k3sm-vmhost helper BUILDS, and
 // this build's helper attaches no Rosetta share.
 //

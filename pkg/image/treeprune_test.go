@@ -159,7 +159,7 @@ func treeVerdict(t *testing.T, plan *PrunePlan, tf treeFixture) PruneReason {
 	return ""
 }
 
-// TestPruneSeesUnpackedTrees is B191's gate: the unpacked/ and snapshots/ tree
+// TestPruneSeesUnpackedTrees is the gate: the unpacked/ and snapshots/ tree
 // stores are visible to the disk-pressure accounting and to the prune planner,
 // under a root-set rule that protects a tree whose backing image a live pod
 // still names.
@@ -335,7 +335,7 @@ func TestPruneSeesUnpackedTrees(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)
 		// Blobs YOUNGER than grace, tree older: the tree goes, the blobs stay by
-		// the blob rule alone. That is the ordering B191 asks for — a tree is
+		// the blob rule alone. That is the ordering required — a tree is
 		// rebuildable from its blobs, so it is given up first.
 		cfgDigest := f.blob("config bytes", time.Second)
 		layerDigest := f.blob("layer bytes", time.Second)

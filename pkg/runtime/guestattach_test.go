@@ -253,7 +253,7 @@ func TestVMPodAttachRoutesToGuestAgent(t *testing.T) {
 
 		// The M2 native limitation still applies, and the guest was never dialed.
 		if code := status.Code(rt.Attach(st)); code != codes.Unimplemented {
-			t.Errorf("native attach with stdin = %s, want Unimplemented (PHASES M2.7)", code)
+			t.Errorf("native attach with stdin = %s, want Unimplemented", code)
 		}
 		if got := dialed(); len(got) != 0 {
 			t.Errorf("a host-process pod's attach dialed a guest agent: %v", got)

@@ -25,7 +25,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestDataVolumePathRejectsProtectedTree is B142's sink-side gate: the data
+// TestDataVolumePathRejectsProtectedTree is the sink-side gate: the data
 // volume must be a proper descendant of <Posture.WorkDir>/pods, so a hostile
 // SandboxProfile.data_volume_path can no longer clobber the protected deny-set.
 //

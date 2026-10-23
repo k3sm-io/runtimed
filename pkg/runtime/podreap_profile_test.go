@@ -74,7 +74,7 @@ func reaches(f sbplFilter, target string) bool {
 
 // TestPodProfileDeniesTheReapStore asserts, on the profile the runtime actually
 // renders for a pod, the defense the reap records rely on: the records drive
-// root kills (the group kill and, since B572, a per-pid kill of each recorded
+// root kills (the group kill and, a per-pid kill of each recorded
 // survivor), so a confined pod must not be able to read or forge them. The
 // store (<root>/podreap, sandbox.PodReapSubdir) must sit in a read+write deny
 // in both firmlink spellings, and no allow after that deny may reach the store,

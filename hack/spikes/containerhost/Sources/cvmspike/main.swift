@@ -1,4 +1,4 @@
-// B267 spike (see hack/spikes/containerhost/README.md). Subcommands:
+// Spike (see hack/spikes/containerhost/README.md). Subcommands:
 //   mkext4 <tree-dir> <out.img> <size-bytes>      build an ext4 root from a materialized tree
 //   boot   <kernel-Image> <store-dir> <rootfs.img> [--memory MiB] [--hold SECONDS] [--cmd CMD]
 //          boot the VM, run CMD (default: uname -sm), then exec `cat /proc/1/comm`, print JSON

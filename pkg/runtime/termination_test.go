@@ -167,7 +167,7 @@ func (s *heldWriteEnd) release() {
 	}
 }
 
-// TestContainerExitFinalizesTerminatedState is the B11 gate, re-targeted onto
+// TestContainerExitFinalizesTerminatedState is the gate, re-targeted onto
 // the on-disk split.
 //
 // runtimed NO LONGER synthesizes a FallbackToLogsOnError termination message:
@@ -237,7 +237,7 @@ func TestContainerExitFinalizesTerminatedState(t *testing.T) {
 		},
 		{
 			// Signal-kill (OOMKilled, sig 9 / code 137): term.Reason stays
-			// "OOMKilled" (the M2.5 OOM test depends on it).
+			// "OOMKilled" (the OOM test depends on it).
 			name:       "oomkill-signal-reason-preserved",
 			payload:    "allocating\nallocating more\n" + lastLine,
 			waiter:     cannedWaiter{code: 137, sig: 9},

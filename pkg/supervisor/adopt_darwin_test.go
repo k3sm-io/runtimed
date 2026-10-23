@@ -54,7 +54,7 @@ func startOrphan(t *testing.T) int {
 	return pid
 }
 
-// TestNonChildExitIsReportedUnknown is the B124 supervisor gate. An adopted
+// TestNonChildExitIsReportedUnknown is the supervisor gate. An adopted
 // process's exit is observed through NOTE_EXIT and reported as ErrExitUnknown,
 // never as a fabricated exit code 0 — which is what KqueueReaper's ECHILD branch
 // reports, and why the adopted path needs its own waiter. The child path is

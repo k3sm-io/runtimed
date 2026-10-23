@@ -87,7 +87,7 @@ func waitPayloads(t *testing.T, want int, paths ...string) {
 	}
 }
 
-// TestReopenVMContainerLogRotates is B652's gate: the node's rotation of a vm
+// TestReopenVMContainerLogRotates is the gate: the node's rotation of a vm
 // container's log works the way it does for a native one. The node renames
 // 0.log aside and calls ReopenContainerLog while the container is writing; the
 // follower must then be writing into a fresh 0.log, the renamed file must end

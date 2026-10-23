@@ -131,7 +131,7 @@ func TestResolveRlimitPlan(t *testing.T) {
 	}
 }
 
-// TestResolveBgQoS pins the B7 QoS mapping decision (apis QOSClass → the
+// TestResolveBgQoS pins the QoS mapping decision (apis QOSClass → the
 // supervisor-local background flag), made here in the runtime layer so the
 // supervisor stays decoupled from apis: BEST_EFFORT and UNSPECIFIED map to the
 // darwin background band (PRIO_DARWIN_BG via the launch sequence); GUARANTEED,
