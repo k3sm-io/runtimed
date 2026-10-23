@@ -173,3 +173,31 @@ func TestPullPolicyForwardedToPuller(t *testing.T) {
 		})
 	}
 }
+
+// TestFlatRegistryWiring pins that Deps.FlatRegistry reaches the daemon's own
+// puller: a reference spelled with an alias of the flat name is fetched from the
+// configured endpoint (the alias port answers nothing here), and an invalid
+// mapping fails construction rather than being ignored.
+func TestFlatRegistryWiring(t *testing.T) {
+	host := testRegistryHost(t)
+	pushPlatformImage(t, host, "native", "darwin", "arm64")
+	flat := image.FlatRegistry{
+		Host:     "registry-k3sm:6450",
+		Endpoint: image.RegistryEndpoint{Addr: host},
+		Aliases:  []string{"localhost:1"},
+	}
+	rt, err := New(Config{Root: t.TempDir()}, testDeps(t, Deps{FlatRegistry: flat}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p := &pod{box: hostBinBox(rt, "pod-flat"), backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
+	c := &runtimev1.Container{Name: "app", Image: "localhost:1/native:v1", Command: []string{"/app"}}
+	if _, err := rt.resolveBinary(context.Background(), p, t.TempDir(), c); err != nil {
+		t.Fatalf("resolveBinary through the flat registry: %v", err)
+	}
+
+	flat.Endpoint = image.RegistryEndpoint{Addr: "100.64.0.1:6450"}
+	if _, err := New(Config{Root: t.TempDir()}, testDeps(t, Deps{FlatRegistry: flat})); err == nil {
+		t.Fatal("New accepted a plaintext flat registry endpoint off loopback")
+	}
+}
