@@ -97,7 +97,7 @@ limitations under the License.
 //	(5) execve's the pod binary with the pod's environment from the launch
 //	    payload — so DYLD_INSERT_LIBRARIES (the darwin-net DNS-shim enabler)
 //	    reaches the pod. This is deliberately not /usr/bin/sandbox-exec: that
-//	    platform binary strips DYLD_* (Wave-0 confirmed this live), which would
+//	    platform binary strips DYLD_* (verified on hardware), which would
 //	    break the shim.
 //	    The exec is posix_spawn(POSIX_SPAWN_SETEXEC) carrying the pcontrol-KILL
 //	    attribute (a plain execve clears that mark), falling back to execve.

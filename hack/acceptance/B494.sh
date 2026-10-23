@@ -22,7 +22,7 @@
 #     the empty file;
 #   - row (a) is FAIL on WASI_HTTP, or its evidence says WASI_HTTP: ABSENT
 #     whatever the verdict: that is a HARD STOP for the wasi:http bindings
-#     (a source-built engine is out of scope), never an in-plan fallback;
+#     (a source-built engine is out of scope), never a fallback;
 #   - row (a) is PASS but its evidence lacks a "WASI_HTTP: present" marker;
 #   - row (a) is FAIL and neither its note nor its evidence mentions
 #     WASI_HTTP: the hard stop cannot be decided (a WARN line, still red);
@@ -41,7 +41,9 @@
 #
 # --check with no --evidence re-hashes against the committed
 # hack/acceptance/testdata/B494/evidence/ when that directory exists.
-# --plan may also come from B494_PLAN. --record prints one filled table row
+# --plan names the markdown file holding the results table (optional input:
+# the committed fixtures under testdata/B494 need none); it may also come from
+# B494_PLAN. --record prints one filled table row
 # with the digest computed from <file>, so no cell is typed by hand.
 #
 # Exit: 0 green, 1 red, 2 usage.
@@ -170,7 +172,7 @@ check() {
 			if [ "$ans" = FAIL ] || [ "$wh_absent" = 1 ]; then
 				red=1
 				if [ "$wh_note" = 1 ] || [ "$wh_absent" = 1 ]; then
-					echo "RED  HARD STOP: row (a) fails on WASI_HTTP; the wasi:http bindings need a new plan, never an in-plan source build"
+					echo "RED  HARD STOP: row (a) fails on WASI_HTTP; the wasi:http bindings need a new design, never an in-gate source build"
 					hard=1
 				else
 					echo "WARN row (a) is FAIL and neither its note nor its evidence ties the failure to WASI_HTTP: the hard stop could not be decided"

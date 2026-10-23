@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."   # repo root
 
 CGO=1   # runtimed needs cgo (darwin syscall shims: libsandbox, memorystatus, clonefile)
 STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
-GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and hack/etcd-wrapper.sh
+GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and k3sm/hack/etcd-wrapper.sh
 
 echo "==> [runtimed] gofmt"
 fmt=$(gofmt -l .) || true
