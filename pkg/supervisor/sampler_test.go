@@ -27,6 +27,9 @@ import (
 type fakeFootprinter struct {
 	mu sync.Mutex
 	fp map[int]uint64
+	// reads, when set, receives one value per Footprint call, so a test can wait
+	// until a tick's sample has read the footprint before it changes the value.
+	reads chan struct{}
 }
 
 func newFakeFootprinter() *fakeFootprinter { return &fakeFootprinter{fp: map[int]uint64{}} }
@@ -39,8 +42,12 @@ func (f *fakeFootprinter) set(pid int, bytes uint64) {
 
 func (f *fakeFootprinter) Footprint(pid int) (uint64, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.fp[pid], nil
+	b := f.fp[pid]
+	f.mu.Unlock()
+	if f.reads != nil {
+		f.reads <- struct{}{}
+	}
+	return b, nil
 }
 
 // TestMemorySamplerMetersWorkingSet drives the meter-only path (limit 0): the
@@ -150,6 +157,7 @@ func TestMemorySamplerUnderLimitNoBreach(t *testing.T) {
 // steady state — must not accumulate its spikes into a kill.
 func TestMemorySamplerBreachRequiresConsecutiveSamples(t *testing.T) {
 	ff := newFakeFootprinter()
+	ff.reads = make(chan struct{}, 8)
 	const limit = 1 << 20
 
 	breaches := make(chan uint64, 4)
@@ -164,6 +172,7 @@ func TestMemorySamplerBreachRequiresConsecutiveSamples(t *testing.T) {
 	for _, fp := range []uint64{8 << 20, 8 << 20, 512 << 10, 8 << 20, 8 << 20} {
 		ff.set(10, fp)
 		ticks <- time.Now()
+		<-ff.reads // the sample has read fp; only now may the next value replace it
 	}
 	select {
 	case b := <-breaches:
