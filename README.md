@@ -10,7 +10,8 @@ a Linux-style mount namespace. It pulls OCI images, unpacks them with APFS `clon
 copy-on-write, ad-hoc signs the resulting binaries so they pass Apple's code-signing checks, and
 supervises each Pod's processes with `posix_spawn` and `kqueue`. For Pods that need an actual
 Linux environment, `runtimed` also hosts a per-Pod Linux micro-VM on top of the Virtualization
-framework; that path is experimental and is described below.
+framework; that path is experimental and is described below. A `wasm` RuntimeClass seam exists in
+`pkg/wasmhost`; its host helper is not built yet.
 
 ## Where this repo sits
 
@@ -61,6 +62,20 @@ never talks to the control plane directly.
 - **`guestagent`** — the in-guest half of the micro-VM boundary: a small gRPC-like service,
   reachable only over a virtio-vsock socket, that answers health, exec, log, and stats requests
   for the one Pod its guest booted.
+- **`execsession`** — runs one `kubectl exec` session: wires a started command's stdio to an exec
+  stream, carries stdin and terminal resizes the other way, and reports the exit as the stream's
+  last frame.
+- **`crilog`** — writes a container's output to disk in the CRI log format, the on-disk contract
+  between a container runtime and the kubelet.
+- **`guestartifacts`** — composes the boot artifacts a vm-backend Pod's micro-VM is started from,
+  byte-deterministically.
+- **`shadowset`** — the one declared list of host binaries a node keeps an ad-hoc re-signed
+  "shadow" copy of, and the exec paths each copy stands in for.
+- **`pathsafe`** — path checks that must not follow symlinks, for the trees the daemon creates,
+  stamps and deletes by string.
+- **`wasmhost`** — the seam between the daemon and the host process for a `wasm` RuntimeClass
+  Pod: the launch-spec builder and parser, and the engine interface. The `k3sm-wasmhost` helper
+  binary is not in this repository yet, so nothing runs WebAssembly today.
 - **`guestinit`** — pure, unit-tested logic that turns a guest specification into the ordered
   steps a Linux guest's PID 1 must execute (mounts, hostname, container start order, the
   reap-and-stop state machine). It performs no syscalls itself; a small Linux-only executor
@@ -78,6 +93,18 @@ never talks to the control plane directly.
   narrowly-scoped process rather than linked into it.
 - **`k3sm-guest-init`** — PID 1 inside the micro-VM guest, built for Linux. It is a thin executor
   over the plans `pkg/guestinit` produces; almost none of its own logic is guest-boot policy.
+
+- **`guest-initramfs`** — composes the micro-VM guest's initramfs from a cross-compiled
+  `k3sm-guest-init` binary.
+
+### `internal/` and `shim/`
+
+- **`internal/execshim`** — the core of the `k3sm-execshim` helper's modes.
+- **`internal/spicanary`** — the symbol canary for the private Darwin interfaces.
+- **`internal/wasmcanary`** — the decision core of a build-time canary over the wasmtime archive
+  the wasm host will link.
+- **`internal/testwire`** — wire-level `PodBox` fixtures for tests.
+- **`shim/`** — the C path-rebase shim, with its shadow table header.
 
 ## Isolation model
 
@@ -98,7 +125,7 @@ CGO is required. `runtimed` isolates its use of private and deprecated Darwin in
 `libsandbox` for Seatbelt, `memorystatus` for memory pressure, `clonefile` for copy-on-write —
 behind `*_darwin.go` files and plain Go interfaces, and a symbol canary test
 (`internal/spicanary`) fails the build loudly if one of those symbols stops resolving on a given
-macOS release. The repository targets darwin/arm64 on macOS 26 and later, and Go 1.25.
+macOS release. The repository targets darwin/arm64 on macOS 26 and later, and Go 1.26.
 
 ```sh
 gofmt -l .                  # must print nothing
@@ -109,9 +136,11 @@ go mod tidy
 hack/verify-boilerplate.sh  # every .go file carries the license header
 ```
 
-`hack/ci.sh` runs the full commit gate above in one command, and additionally cross-builds
+`hack/ci.sh` runs the full commit gate above in one command. It also cross-builds
 `k3sm-guest-init` for `linux/arm64` and `linux/amd64` (that binary never builds as part of the
-main darwin build, since it ships inside a guest's own initramfs). Some tests require hardware
+main darwin build, since it ships inside a guest's own initramfs), runs the pinned
+`staticcheck` (`-tests=false`) and `govulncheck`, and runs `hack/verify-deps.sh`, which checks the
+module graph against `hack/deps.lock` and needs network access. Some tests require hardware
 this environment may not have — a Rosetta-capable Mac, an entitled build for the Virtualization
 framework, a discrete GPU — and use `t.Skip` to fail open when that hardware or entitlement is
 absent rather than failing the whole suite.
