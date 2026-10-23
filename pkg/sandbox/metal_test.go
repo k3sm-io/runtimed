@@ -41,7 +41,7 @@ func gpuProfile(t *testing.T) string {
 	return got
 }
 
-// TestGenerateGPUGolden is acceptance M8.2-a1's Metal half: the full rendered
+// TestGenerateGPUGolden is the acceptance check for the Metal half: the full rendered
 // allow_gpu profile is pinned byte-for-byte against testdata/pod-gpu.golden.sb.
 //
 // A golden rather than a substring assertion because the thing under test is a

@@ -37,7 +37,7 @@ func env(kv ...string) []*runtimev1.EnvVar {
 	return out
 }
 
-// TestMergeRunSpecFourQuadrants is the M11.2-d1 gate's merge half: Kubernetes'
+// TestMergeRunSpecFourQuadrants is the gate's merge half: Kubernetes'
 // command/args table, all four rows, plus the asymmetry that makes row 3 the one
 // implementations get wrong — a pod command discards the image's Cmd, because
 // that Cmd is arguments to an entrypoint the pod just replaced.

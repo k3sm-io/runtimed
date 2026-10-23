@@ -30,7 +30,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// TestPodProcessCountsCountsVMHelper is the B767 gate: a vm pod's host
+// TestPodProcessCountsCountsVMHelper is the gate: a vm pod's host
 // processes are its k3sm-vmhost helper's process group, recorded in the vm
 // orphan store rather than the pod-reap ledger, and PodProcessCounts reports
 // them exactly as it reports a native pod's: the live members of a group the

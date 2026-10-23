@@ -31,7 +31,7 @@ import (
 // the SPAWN, whether the directory a spec's TMPDIR names already exists and what
 // its permissions are. Checking after CreatePod returns would not distinguish
 // "provisioned before the pod ran" from "provisioned too late to be usable",
-// which is the whole ordering B203 is about.
+// which is the whole ordering this test is about.
 type tmpProbeSpawner struct {
 	mu       sync.Mutex
 	next     int
@@ -70,7 +70,7 @@ func (f *tmpProbeSpawner) last() (supervisor.SpawnSpec, bool, os.FileMode) {
 	return f.specs[n-1], f.tmpFound[n-1], f.tmpModes[n-1]
 }
 
-// TestPodLaunchEnvCarriesTmpInDataVolume is the B203 gate.
+// TestPodLaunchEnvCarriesTmpInDataVolume is the gate.
 //
 // A confined pod has no usable temp directory: the profile write-allows neither
 // /tmp nor /var/tmp and nothing set TMPDIR, so a workload that asks the platform

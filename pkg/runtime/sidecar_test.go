@@ -67,7 +67,7 @@ func podPhase(t *testing.T, rt *Runtime, podID string) runtimev1.PodPhase {
 	return gs.GetStatus().GetPhase()
 }
 
-// TestNativeSidecarStaysRunning is the M10.2-a1 sequencing proof (sidecar-not-
+// TestNativeSidecarStaysRunning is the sequencing proof (sidecar-not-
 // waited): an init list [sidecar(always), plain-init(UNSPECIFIED)] spawns the
 // sidecar, does not wait it (spawn-equals-started), runs the plain init to
 // completion while the sidecar is still up, starts the main, and reaches
@@ -150,7 +150,7 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 	w.release(1003)
 }
 
-// TestInitContainerUnsetLegacyBlocks pins the byte-legacy contract (M10.2): an
+// TestInitContainerUnsetLegacyBlocks pins the byte-legacy contract: an
 // init container with restart_policy UNSPECIFIED runs TO COMPLETION exactly as
 // before the field existed — CreatePod blocks on it (no main starts until it
 // exits) and a non-zero exit fails the create.
@@ -221,13 +221,13 @@ func TestInitContainerUnsetLegacyBlocks(t *testing.T) {
 	})
 }
 
-// TestSidecarMainsOnlyPhase is the M10.2/B74 phase proof: the pod's terminal
+// TestSidecarMainsOnlyPhase is the sidecar phase proof: the pod's terminal
 // phase derives from the main containers only. A main exiting 0 makes the pod
 // Succeeded (and tears the sidecar down); a main exiting non-zero makes it
 // Failed; a sidecar exit alone — even a crash — never flips the phase.
 //
 // The teardown assertion holds for both terminal phases and is the delivered
-// milestone gate, restored after B26 briefly inverted the Failed case: a pod is
+// milestone gate, restored after an earlier change briefly inverted the Failed case: a pod is
 // terminal on Failed too (restartPolicy Never/OnFailure), and Kubernetes retains
 // failed pods, so withholding the teardown there leaks the sidecar process tree
 // forever. See trulyTerminalLocked.
@@ -300,7 +300,7 @@ func TestSidecarMainsOnlyPhase(t *testing.T) {
 	})
 }
 
-// TestSidecarReverseOrderTeardown is the M10.2-a1 teardown proof: two sidecars
+// TestSidecarReverseOrderTeardown is the teardown proof: two sidecars
 // started A-then-B are stopped B-then-A, both on voluntary completion (the last
 // main exits by itself) and on DeletePod (mains stopped first, then the
 // sidecars) — all SIGTERM-only while the shared grace budget lasts.
@@ -368,7 +368,7 @@ func TestSidecarReverseOrderTeardown(t *testing.T) {
 }
 
 // TestDeletePodSidecarRemainingGrace proves the one-pod-level-budget remainder
-// rule (M10.2, bounded timing): with a 1s grace and a main that ignores SIGTERM,
+// rule (bounded timing): with a 1s grace and a main that ignores SIGTERM,
 // phase 1 consumes the entire budget (SIGTERM → 1s timer → SIGKILL), so the
 // sidecars' remainder is <= 0 and phase 2 takes the immediate-SIGKILL path — no
 // sidecar SIGTERM — still in reverse start order.

@@ -27,7 +27,7 @@ import (
 )
 
 // vmPVCBox is a vm-routed pod with one local-path PVC, the shape that failed on
-// the rig: postgres with its data directory on a claim.
+// a real deployment: postgres with its data directory on a claim.
 func vmPVCBox(rt *Runtime, podID, claim string) *runtimev1.PodBox {
 	box := vmPodBox(rt, podID, 0)
 	box.Volumes = []*runtimev1.Volume{{
@@ -77,7 +77,7 @@ func TestCreateVMPodProvisionsPersistentVolumes(t *testing.T) {
 	})
 
 	t.Run("an-existing-claims-contents-are-preserved", func(t *testing.T) {
-		// M3.1 durability: a PVC is lifecycle-decoupled (ReclaimPolicy Retain), so
+		// Durability: a PVC is lifecycle-decoupled (ReclaimPolicy Retain), so
 		// the second pod to mount a claim must find the first pod's data. A
 		// provisioning step that re-created or re-seeded the dir would silently
 		// destroy a database.

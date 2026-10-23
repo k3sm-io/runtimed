@@ -29,7 +29,7 @@ import (
 )
 
 // TestGenerateGolden pins the full rendered profile against the golden file:
-// acceptance M1.2-a2 (always (import "system.sb")) and the M2.2 rule ordering
+// acceptance (always (import "system.sb")) and the rule ordering
 // (protected denies after the allows, narrow re-allows last). Run with -update to
 // regenerate the golden.
 func TestGenerateGolden(t *testing.T) {
@@ -60,7 +60,7 @@ func TestGenerateGolden(t *testing.T) {
 // TestGenerateDenySet asserts the full deny-set: the profile is default-deny,
 // imports system.sb, denies /Users, /private/var/db (with the dyld-only read
 // exception), the shared pods root, and the dyld cryptex (write), then re-allows
-// the pod's own data volume. This is the security contract of M1.2-a1 + M2.2.
+// the pod's own data volume. This is the security contract of the profile.
 func TestGenerateDenySet(t *testing.T) {
 	const dataVol = "/var/lib/k3sm/pods/p1/rootfs"
 	sp := &runtimev1.SandboxProfile{DataVolumePath: dataVol, AllowNetwork: true}
@@ -97,7 +97,7 @@ func TestGenerateDenySet(t *testing.T) {
 
 	// /Users must never appear in an allow, the var-db store must never be
 	// granted write, and no per-IP network filter may ever be emitted (it does
-	// not compile on macOS 26 — the M10.1 P0).
+	// not compile on macOS 26 — the P0).
 	mustNotContain := []struct{ name, frag string }{
 		{"no-users-allow", "(allow file-read* file-write*\n  (subpath \"/Users\""},
 		{"no-write-var-db", "(allow file-write*\n  (subpath \"/private/var/db\")"},
@@ -113,7 +113,7 @@ func TestGenerateDenySet(t *testing.T) {
 	}
 }
 
-// TestGenerateProtectedDeniesAfterExtraAllows is acceptance M2.2-a2 (ordering
+// TestGenerateProtectedDeniesAfterExtraAllows is an acceptance test (ordering
 // half): SBPL is last-match-wins, so the protected denies must be emitted after
 // any extra-path allow (a hostPath-style extra path cannot override them), and
 // the pod's own data-volume re-allow must come after the pods-root deny (so the
@@ -145,7 +145,7 @@ func TestGenerateProtectedDeniesAfterExtraAllows(t *testing.T) {
 	}
 }
 
-// TestGenerateRejectsProtectedExtraPath is acceptance M2.2-a2 (rejection half): a
+// TestGenerateRejectsProtectedExtraPath is an acceptance test (rejection half): a
 // caller-supplied extra path at/under the protected deny-set is rejected with
 // ErrProtectedPath, so a hostPath can never widen the allow-list into /Users, the
 // secrets store, a sibling pod's dir, or the dyld cryptex.
@@ -175,7 +175,7 @@ func TestGenerateRejectsProtectedExtraPath(t *testing.T) {
 	}
 }
 
-// TestProtectedPathRefusalNamesPodRootRemedy is B179: a protected-path refusal
+// TestProtectedPathRefusalNamesPodRootRemedy is the gate: a protected-path refusal
 // must name its remedy, not just its cause. It goes through Generate (never
 // validateExtraPaths directly) with the same trigger as the
 // "pv-write-under-users" case above — a WritePaths entry under /Users — so this
@@ -197,7 +197,7 @@ func TestProtectedPathRefusalNamesPodRootRemedy(t *testing.T) {
 	}
 }
 
-// TestGenerateSecretReadOnlySubScope is acceptance M2.2-a3 (SBPL half): a
+// TestGenerateSecretReadOnlySubScope is an acceptance test (SBPL half): a
 // credential mount (secret / SA-token) gets file-read* and an explicit
 // file-write* deny, emitted last so the write-deny wins even though the secret
 // lives inside the writable data volume — a pod can read but not overwrite its
@@ -225,7 +225,7 @@ func TestGenerateSecretReadOnlySubScope(t *testing.T) {
 	}
 }
 
-// TestPVCInSBPLWriteScope is acceptance runtimed:M3.1-a1 (SBPL half): a read-write
+// TestPVCInSBPLWriteScope is an acceptance test (SBPL half): a read-write
 // persistent-volume mount root (opts.WritePaths) — which lives outside the pod data
 // volume on the APFS storage root — gets both a file-write* and a file-read* allow,
 // a read-only PV root (opts.ReadPaths) gets read but not write, and the protected
@@ -744,7 +744,7 @@ func TestGenerateInvalid(t *testing.T) {
 
 // TestValidate covers the fail-closed gate: a profile must have (deny default)
 // and (import "system.sb"); the generator's output passes, a hand-rolled profile
-// lacking either is rejected (acceptance M1.2-a2).
+// lacking either is rejected (acceptance).
 func TestValidate(t *testing.T) {
 	good, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"}, GenerateOptions{})
 	if err != nil {
@@ -903,8 +903,8 @@ func TestGeneratePostureWorkDir(t *testing.T) {
 	}
 }
 
-// TestGenerateNetworkBindUnfiltered is the M10.1 P0 contract: an allow_network
-// pod gets an UNFILTERED (allow network-bind) — never the pre-M10.1 (local ip
+// TestGenerateNetworkBindUnfiltered is the P0 contract: an allow_network
+// pod gets an UNFILTERED (allow network-bind) — never the earlier (local ip
 // "<PodIP>:*") scoping, which the macOS 26 Seatbelt grammar rejects at
 // sandbox_apply ("host must be * or localhost in network address"), making
 // every networked pod fail to spawn. A known PodIP must not change the rendered
@@ -960,10 +960,10 @@ func TestGenerateNetworkBindUnfiltered(t *testing.T) {
 	}
 }
 
-// TestGenerateVIPsDoNotRenderSBPL is the M10.1 P0 contract for the node VIPs:
+// TestGenerateVIPsDoNotRenderSBPL is the P0 contract for the node VIPs:
 // Posture.ResolverVIP and Posture.APIServerVIP are plumbing-only — they render
 // NO (remote ip …) filter, because per-IP network filters do not compile on
-// macOS 26 (the pre-M10.1 VIP-scoped egress failed sandbox_apply and no
+// macOS 26 (the earlier VIP-scoped egress failed sandbox_apply and no
 // networked pod could spawn). A networked pod instead gets the unfiltered
 // (allow network-outbound), and the AF_UNIX helper-socket deny stays intact and
 // after it (last-match-wins keeps the socket denied).

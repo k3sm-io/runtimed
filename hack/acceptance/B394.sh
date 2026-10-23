@@ -265,7 +265,7 @@ fi
 [ -z "$(ls -A "$VTMP")" ] || { echo "home left behind: $(ls -A "$VTMP")" >&2; f2=no; }
 ladder "$f2" "b394.f  the spike's host_verify_sums dies on a bad signature and leaves no daemon and no home"
 
-# ---- (g) build.sh still passes B392 ------------------------------------------
+# ---- (g) build.sh still passes the pinned-key gate ------------------------------------------
 if "$GATE_DIR/B392.sh" > "$SCRATCH/b392.out" 2>&1; then
   ladder ok "b394.g  hack/acceptance/B392.sh still green after the lib.sh extraction ($(tail -1 "$SCRATCH/b392.out"))"
 else

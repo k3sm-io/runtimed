@@ -31,7 +31,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestRefDigestIndexDecidesPresence is the B128 / M12.1-d1 gate: the on-disk
+// TestRefDigestIndexDecidesPresence is the gate: the on-disk
 // ref->digest index decides presence-BY-REFERENCE for this node, and does so
 // without ever becoming a reachability root.
 //

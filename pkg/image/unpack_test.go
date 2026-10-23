@@ -647,7 +647,7 @@ func TestUnpackVerifiesContent(t *testing.T) {
 func TestUnpackRefusesUnsupportedLayerMediaType(t *testing.T) {
 	c, u := newTestUnpacker(t)
 	mfst := commitImage(t, c, imageFrom(t, layerFrom(t, []tarSpec{{name: "app", mode: 0o755, data: "V1"}})))
-	// xz, not zstd: zstd joined the allowlist with the Linux dialect (M11.2-d1),
+	// xz, not zstd: zstd joined the allowlist with the Linux dialect,
 	// and a row that pins "refused" must name a media type nothing decompresses.
 	mfst.Layers[0].MediaType = "application/vnd.oci.image.layer.v1.tar+xz"
 	_, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy())

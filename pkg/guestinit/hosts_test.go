@@ -29,7 +29,7 @@ import (
 // leasedAddr is the guest's DHCP-leased address the re-render maps.
 const leasedAddr = "10.0.2.15"
 
-// TestHostsAliasForSubdomainPods is the B573 item gate: Plan, then the
+// TestHostsAliasForSubdomainPods is the gate: Plan, then the
 // lease-time RenderHosts, then ReplaceEtcFile into a temp dir, read back.
 //
 // The pod line follows the kubelet's managedHostsFileContent: FQDN first then

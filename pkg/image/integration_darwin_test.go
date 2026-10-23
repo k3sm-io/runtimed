@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestIntegrationClonefileCoW is acceptance M1.1-a2: materialization is a real
+// TestIntegrationClonefileCoW is an acceptance test: materialization is a real
 // APFS clone (not a byte copy) and is idempotent. It clones a file with
 // APFSCloner and asserts the clone reports cow==true and shares no inode (a
 // distinct inode with shared extents is what APFS CoW produces). Requires the
@@ -67,7 +67,7 @@ func TestIntegrationClonefileCoW(t *testing.T) {
 }
 
 // TestIntegrationMaterializeIdempotent clones a tree, then re-materializes and
-// verifies no error and identical content (M1.1-a2 idempotence).
+// verifies no error and identical content (idempotence).
 func TestIntegrationMaterializeIdempotent(t *testing.T) {
 	src := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(src, "bin"), 0o755); err != nil {
@@ -112,7 +112,7 @@ func TestIntegrationQuarantineDetected(t *testing.T) {
 	}
 }
 
-// TestIntegrationAdHocSignAMFI is acceptance M1.1-a3: an unsigned arm64 binary
+// TestIntegrationAdHocSignAMFI is an acceptance test: an unsigned arm64 binary
 // runs after ad-hoc signing, and the require-signed policy rejects an ad-hoc
 // binary. Uses a tiny compiled C binary so the signature can be stripped/applied.
 func TestIntegrationAdHocSignAMFI(t *testing.T) {

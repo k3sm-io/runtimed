@@ -106,7 +106,7 @@ func runFakeVMHost(args []string) int {
 	return 0
 }
 
-// TestAttachPodAdoptsARunningVMHelper is the B713 runtimed gate: a vm pod's
+// TestAttachPodAdoptsARunningVMHelper is the runtimed gate: a vm pod's
 // helper survives a daemon restart and the next daemon adopts it, fail closed.
 //
 // One real helper process per row, spawned by the real backend through the

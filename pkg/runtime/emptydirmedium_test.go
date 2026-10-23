@@ -44,7 +44,7 @@ func wantsNativeRefusal(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "is not served by the native backend")
 }
 
-// TestMaterializeRefusesNonEmptyMediumNatively is B303's gate: a PodBox
+// TestMaterializeRefusesNonEmptyMediumNatively is the gate: a PodBox
 // carrying an emptyDir volume whose medium is anything other than the empty
 // string is refused by createPod — before the materializer (which never reads
 // Medium at all — see its emptyDir comment) or any write-side sink runs —

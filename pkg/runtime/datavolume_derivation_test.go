@@ -32,10 +32,10 @@ import (
 // exist to turn a NODE-WIDE outage that reports itself one pod at a time into a
 // single startup error:
 //
-//   - relative (B140) — supervisor.ChownForFSGroup's strict-containment bound
+//   - relative — supervisor.ChownForFSGroup's strict-containment bound
 //     admits nothing when either operand is relative, so fsGroup would fail for
 //     every pod as a rootfs-setup fault.
-//   - unclean (B142) — the root is passed through as sandbox.Posture.WorkDir,
+//   - unclean — the root is passed through as sandbox.Posture.WorkDir,
 //     which resolvePosture rejects unless it is already clean, so SBPL generation
 //     would fail for every pod as a sandbox-setup fault; and the provider's
 //     concatenated data_volume_path would stop matching the cache's Join-derived
@@ -57,7 +57,7 @@ func TestNewRejectsUnusableRoot(t *testing.T) {
 	})
 }
 
-// TestDataVolumePathMustBeDerived is B142's primary gate: a
+// TestDataVolumePathMustBeDerived is the primary gate: a
 // sandbox_profile.data_volume_path that is not one of this pod's two derived
 // spellings is refused at the CreatePod ingress, with the terminal reason.
 //

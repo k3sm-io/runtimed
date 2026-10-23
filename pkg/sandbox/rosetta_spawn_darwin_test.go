@@ -172,11 +172,11 @@ func assertMachOArch(t *testing.T, bin, wantGOARCH string) {
 	}
 }
 
-// TestHostRosettaSpawnUnderSeatbelt is the B105 regression pin: the generated
+// TestHostRosettaSpawnUnderSeatbelt is the regression pin: the generated
 // default-deny Seatbelt profile admits a darwin/amd64 pod payload translated by
 // host Rosetta 2, on the same terms as a native arm64 one.
 //
-// This pins a measured fact rather than discovering one. The B103 critique pass
+// This pins a measured fact rather than discovering one. The critique pass
 // measured that a cold-translated, ad-hoc-signed x86_64 Mach-O spawns and runs
 // under the unmodified generated profile, and that every proposed "translation
 // surface" grant (an oahd mach-lookup, /var/db/oah, /usr/libexec/rosetta) is

@@ -26,7 +26,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestContainerStatusReportsTheImagePullOutcome is the B119 image_pull gate: every
+// TestContainerStatusReportsTheImagePullOutcome is the image_pull gate: every
 // container status carries how its image was obtained for the container's most
 // recent RESOLVED start attempt, and carries nothing while the image question is
 // still open.

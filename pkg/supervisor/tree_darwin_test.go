@@ -117,7 +117,7 @@ func readPid(t *testing.T, dir, name string) (int, bool) {
 	return pid, err == nil
 }
 
-// TestContainerExitKillsTheRestOfTheGroup is the B572 gate. A pod-shaped init
+// TestContainerExitKillsTheRestOfTheGroup is the gate. A pod-shaped init
 // (/bin/sh -c, its own session) forks a TERM-ignoring sleeper, a setsid
 // escapee, and a double-forker whose parent exits before the stop. The stop
 // sends SIGTERM to the init alone (the resident-shim shape), the init exits on

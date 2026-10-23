@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestPVCSurvivesPodTeardown is acceptance runtimed:M3.1-a2 (root-free): data
+// TestPVCSurvivesPodTeardown is an acceptance test (root-free): data
 // written to a PVC-backed volume survives the pod-teardown path (the PV dir is not
 // removed with the pod dir — ReclaimPolicy Retain), while the pod rootfs IS removed
 // (the contrast). It also asserts the PV mount root landed in the pod's SBPL
@@ -60,7 +60,7 @@ func TestPVCSurvivesPodTeardown(t *testing.T) {
 	}
 	// The SIGKILL hook releases the fake reaper for the signalled pid, so the
 	// fake behaves like a real process group: it dies when killed. DeletePod now
-	// waits for the reaper's exit observation before returning (B40), so a fake
+	// waits for the reaper's exit observation before returning, so a fake
 	// that never reports the exit would spend the full observation bound here.
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal

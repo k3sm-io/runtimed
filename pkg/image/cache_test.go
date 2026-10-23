@@ -107,7 +107,7 @@ func blobDirEntries(t *testing.T, c *Cache, algo string) []string {
 // Compressed(), Digest() and Size() all describe payload. The image's manifest
 // descriptor still names the original layer, so this fixture is exactly the
 // tautology case — a checker that took its "claimed" digest from the layer (as
-// writeBlob's caller did before B129) would compare the payload against a digest
+// writeBlob's caller did before digests were verified) would compare the payload against a digest
 // derived from the payload and always pass.
 type fakeLayer struct {
 	ggcrv1.Layer
@@ -169,7 +169,7 @@ func (i lyingImage) Layers() ([]ggcrv1.Layer, error) {
 // The gate.
 // ---------------------------------------------------------------------------
 
-// TestWriteBlobRejectsDigestMismatch is the B129 gate: the content-addressed
+// TestWriteBlobRejectsDigestMismatch is the gate: the content-addressed
 // store verifies every blob against its claimed digest AT the COMMIT point, in
 // one exported home (Cache.CommitBlob) that Puller.writeBlob merely delegates to.
 //
@@ -247,7 +247,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 			t.Errorf("blob dir is not empty after a rejection: %v", ents)
 		}
 		// REGRESSION PIN, not red-before evidence: the temp file is removed. This
-		// clause was already green before B129 (the deferred os.Remove predates
+		// clause was already green before digests were verified (the deferred os.Remove predates
 		// this change), which is exactly why it cannot be the gate's decisive
 		// assertion — a compare-then-rename-anyway diff satisfies it, because the
 		// rename consumes the temp file.
@@ -300,7 +300,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// Fail-closed on the digest STRING, before any side effect. The pre-B129
+	// Fail-closed on the digest STRING, before any side effect. The earlier
 	// blobPath sanitized only the hex half, so the algorithm half flowed into
 	// filepath.Join unchecked: "../../etc:passwd" resolved to <root>/../etc/passwd,
 	// which pull.go then MkdirAll'd 0755 as the root LaunchDaemon before any
@@ -357,7 +357,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 					t.Errorf("filesystem changed under a rejected digest:\nbefore %v\nafter  %v", before, after)
 				}
 				// blobPath must not hand out a path either — every path-building
-				// caller (Has, B117's ingest) inherits the same allowlist.
+				// caller (Has, the ingest path) inherits the same allowlist.
 				if p, perr := c.BlobPath(tc.digest); perr == nil {
 					t.Errorf("blobPath(%q) returned %q, want an error", tc.digest, p)
 				}
@@ -370,10 +370,10 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 
 	// The documented ceiling, made executable rather than left as folklore:
 	// verification happens at WRITE time only. A blob already on disk is trusted
-	// on its NAME — including every blob written before B129, which this repo
+	// on its NAME — including every blob written before digests were verified, which this repo
 	// never hashed. Verify-on-read is deliberately not done here (it is O(image
-	// bytes) on the hot path and would regress the M1.1-a1 cache-hit acceptance
-	// path); the natural closer is M11.2-d7, the unpacker.
+	// bytes) on the hot path and would regress the cache-hit acceptance
+	// path); the natural closer is the unpacker.
 	t.Run("cache hit skips verification (the documented ceiling)", func(t *testing.T) {
 		c, _ := deepCache(t)
 		dig := digestOf([]byte("the honest bytes"))
@@ -439,7 +439,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 
 	// F1: os.Stat FOLLOWS symlinks, so a bare Stat+IsRegular would accept a
 	// symlink→regular as a cached blob — suppressing verification forever for that
-	// digest and pointing every downstream reader (materialize, the M11.2-d7
+	// digest and pointing every downstream reader (materialize, the
 	// unpacker) at bytes outside the cache root, as root. Lstat is what makes the
 	// doc comment true.
 	t.Run("a symlink at the blob path is not a cache hit", func(t *testing.T) {
@@ -526,7 +526,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 	// The fixture's layer is self-consistent about the wrong bytes — its Digest()
 	// IS the sha256 of what its Compressed() serves — so a checker that took the
 	// claimed digest from the layer (img.ConfigName()/layer.Digest(), the
-	// pre-B129 sources) would compare the bytes against a digest derived from
+	// earlier sources) would compare the bytes against a digest derived from
 	// those same bytes and could never fail. Only the manifest descriptor
 	// disagrees.
 	t.Run("pull rejects a layer contradicting its manifest descriptor", func(t *testing.T) {

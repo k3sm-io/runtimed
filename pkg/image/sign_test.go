@@ -41,7 +41,7 @@ func (f fakeInspector) Notarized(context.Context, string) (bool, error) {
 }
 
 // TestCheckSignaturePolicy is the decision table for the gate, including the
-// fail-closed UNSPECIFIED case (acceptance support for M1.1-a3's reject half and
+// fail-closed UNSPECIFIED case (acceptance support for the reject half and
 // the apis fail-closed contract).
 func TestCheckSignaturePolicy(t *testing.T) {
 	const bin = "/var/lib/k3sm/pods/p/rootfs/app"

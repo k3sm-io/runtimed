@@ -725,7 +725,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// swiftc (Swift 6.3.x / Command Line Tools 27.0) aborted with "unable to set
 	// working directory: <dataVol>" after a `deny file-read-metadata /private`,
 	// and hand-patching exactly these literals into the rendered profile made the
-	// same compile succeed (B277).
+	// same compile succeed.
 	//
 	// Two things separate it from the xcode stanza's otherwise identical ancestor
 	// grant, and both are why it cannot simply be emitted there:
@@ -1031,7 +1031,7 @@ func strictAncestors(p string) []string {
 // /var/lib/k3sm/pods/<id>/rootfs actually tests; the raw form is what a rule
 // written against a path the kernel does not rebase (a work-dir already under
 // /private, or off the firmlinked trees entirely) needs. Emitting both is how the
-// bare /private grant — the first node of the resolved walk, and the denial B277
+// bare /private grant — the first node of the resolved walk, and the denial that was
 // observed — comes to exist at all.
 func ancestorMetadataPaths(roots []string) []string {
 	seen := make(map[string]struct{})

@@ -49,7 +49,7 @@ func TestLadderDropsUIDJailWhenNotRoot(t *testing.T) {
 	}
 }
 
-// TestSelectBackendUnspecifiedUsesLadder is the host-process default path (M5.1):
+// TestSelectBackendUnspecifiedUsesLadder is the host-process default path:
 // a pod with no explicit backend — UNSPECIFIED, what the provider stamps for a pod
 // without a vm RuntimeClass — walks the host-OS-gated ladder. It degrades to a
 // stronger rung, never a weaker one, and never to "unconfined":
@@ -122,7 +122,7 @@ func TestSelectBackendUnspecifiedUsesLadder(t *testing.T) {
 	}
 }
 
-// TestSelectBackendVMRequestedUnavailableFailsClosed is the M5.1 safety fix: a pod
+// TestSelectBackendVMRequestedUnavailableFailsClosed is the safety fix: a pod
 // that requested the vm backend (a Linux image / untrusted tenancy) on a host
 // where the vm backend is UNAVAILABLE must be refused with ErrBackendUnavailable
 // — it must never silently downgrade to Seatbelt (the weaker rung, on which a

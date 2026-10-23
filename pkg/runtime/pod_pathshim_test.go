@@ -138,7 +138,7 @@ func TestContainerEnvExplicitDyldWins(t *testing.T) {
 	}
 }
 
-// TestContainerEnvKeepsEntriesAfterDYLD is the B205 regression gate: an
+// TestContainerEnvKeepsEntriesAfterDYLD is the regression gate: an
 // explicit DYLD_INSERT_LIBRARIES entry mid-slice must not truncate the base
 // env at that point — every entry before and after it must survive, in
 // order, and the injected-annotation (non-explicit) DYLD path must still

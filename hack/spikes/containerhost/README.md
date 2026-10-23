@@ -1,4 +1,4 @@
-# containerhost spike (B267, M15.0)
+# containerhost spike
 
 A throwaway helper that boots one Linux container VM on the open-source Containerization Swift
 package, to answer the questions the `container-vm` RuntimeClass plan asks before any product code

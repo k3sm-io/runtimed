@@ -30,8 +30,7 @@ func TestSymbolsResolve(t *testing.T) {
 	}
 }
 
-// TestResourceSymbolsResolve is the M2 half of the symbol-canary (acceptance
-// M2.1-a2): it asserts the userspace-resource SPI the M2.5 memory subsystem links
+// TestResourceSymbolsResolve is the M2 half of the symbol-canary (acceptance check): it asserts the userspace-resource SPI the memory subsystem links
 // — proc_pid_rusage (public, <libproc.h>) and memorystatus_control (private
 // jetsam SPI, no public header) — still resolves on the current macOS. As with
 // the libsandbox half, the load-bearing check is that canary_darwin.go LINKS; a

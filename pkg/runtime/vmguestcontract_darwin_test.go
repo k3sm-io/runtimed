@@ -37,8 +37,8 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// where the two DELIVERABLES MEET: the container mapper (M11.2-d11, this
-// package) and the guest-spec writer (M11.2-d10, pkg/sandbox) are joined by the
+// where the two DELIVERABLES MEET: the container mapper (this
+// package) and the guest-spec writer (pkg/sandbox) are joined by the
 // guest's own reader (pkg/guestinit), and the join is asserted end to end.
 //
 // It lives here, not in pkg/sandbox's round-trip, because the import direction

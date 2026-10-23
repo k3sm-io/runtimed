@@ -93,7 +93,7 @@ func assertWaiting(t *testing.T, rt *Runtime, podID, name string, want runtimev1
 	return w
 }
 
-// TestContainerStartFailureIsTypedByCause is the B119 classification gate: every
+// TestContainerStartFailureIsTypedByCause is the classification gate: every
 // way a container can fail BEFORE its process is spawned carries its own
 // FailureReason out of startContainer, so the provider can render the kubelet's
 // waiting reason (ErrImagePull / ErrImageNeverPull / InvalidImageName /
@@ -289,7 +289,7 @@ func TestHostBinaryRoutesNeverReachTheReferenceParser(t *testing.T) {
 	}
 }
 
-// TestCreatePodStartsWhatItCanAndWaitsTheRest is the B119 partial-start gate: a
+// TestCreatePodStartsWhatItCanAndWaitsTheRest is the partial-start gate: a
 // container whose image cannot be resolved leaves the POD created, that one
 // container Waiting with a typed reason, and every other container running —
 // the kubelet's per-container pull semantics.

@@ -95,7 +95,7 @@ func startVMLogFollower(t *testing.T, rt *Runtime, p *pod, container string) str
 	return path
 }
 
-// TestFastExitContainerLogLineReachesTheFile is B616's gate: a vm container
+// TestFastExitContainerLogLineReachesTheFile is the gate: a vm container
 // that prints one line and exits within its first second must have that line
 // in its CRI log file by the time its exit is recorded.
 //

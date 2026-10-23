@@ -27,7 +27,7 @@ import (
 // testPlatform is the platform every index record in this file is keyed under.
 var testPlatform = image.Platform{OS: "darwin", Architecture: "arm64"}
 
-// TestListImagesEnumeratesTheIndex is B198's gate: the listing enumerates the
+// TestListImagesEnumeratesTheIndex is the gate: the listing enumerates the
 // ref->digest index, so an image this node holds is visible whether or not a
 // pod happens to reference it — while the GC's reachability semantics are
 // untouched.

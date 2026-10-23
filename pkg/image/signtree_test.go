@@ -105,7 +105,7 @@ func writeFile(t *testing.T, path string, data []byte) {
 	}
 }
 
-// TestAdHocSignTree is acceptance M8.2-a2: the tree walk's decisions, proven over a
+// TestAdHocSignTree is an acceptance test: the tree walk's decisions, proven over a
 // fake signer with no codesign, no Mach-O toolchain, and no privilege.
 func TestAdHocSignTree(t *testing.T) {
 	const adhoc = runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK

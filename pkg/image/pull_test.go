@@ -28,7 +28,7 @@ import (
 
 // fakeFetch returns a fixed in-memory image, counting calls so the test can
 // assert the cache hit path does (or does not) re-fetch. It also records the last
-// credential it received (M2.6) and the last platform policy (B99) so a test can
+// credential it received and the last platform policy so a test can
 // assert both reach the pull client.
 type fakeFetch struct {
 	img        ggcrv1.Image
@@ -49,7 +49,7 @@ func nativePolicy() PlatformPolicy {
 	return PlatformPolicy{Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC}
 }
 
-// TestPullCachesAndHits is the unit form of acceptance M1.1-a1: the first pull
+// TestPullCachesAndHits is the unit form of acceptance: the first pull
 // populates the content-addressed cache; a second pull of the same content is a
 // cache hit (no blob re-written) and the manifest round-trips into the apis type.
 func TestPullCachesAndHits(t *testing.T) {
@@ -58,7 +58,7 @@ func TestPullCachesAndHits(t *testing.T) {
 		t.Fatalf("random image: %v", err)
 	}
 	// Pull verifies the fetched image's own config against the policy at the
-	// choke point (B99), so the fixture declares the native platform — a plain
+	// choke point, so the fixture declares the native platform — a plain
 	// random.Image declares none and is refused.
 	ff := &fakeFetch{img: withPlatform(t, img, "darwin", "arm64", "")}
 
@@ -103,7 +103,7 @@ func TestPullCachesAndHits(t *testing.T) {
 	}
 }
 
-// TestPullPassesCredentialToFetch is the image-level half of M2.6-a1: the
+// TestPullPassesCredentialToFetch is the image-level half: the
 // imagePullSecret credential is handed to the pull client (the FetchFunc) and is
 // not dropped on the floor. The on-disk confinement (credential never in the pod
 // dir) is asserted at the runtime level.
@@ -129,7 +129,7 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 	if ff.lastCred.Username != "robot" || ff.lastCred.Password != "s3cret" {
 		t.Errorf("fetch received cred %+v, want robot/s3cret", ff.lastCred)
 	}
-	// B99: the per-call platform policy rides the same seam and is not dropped.
+	// The per-call platform policy rides the same seam and is not dropped.
 	if ff.lastPolicy != nativePolicy() {
 		t.Errorf("fetch received policy %+v, want %+v", ff.lastPolicy, nativePolicy())
 	}
@@ -138,7 +138,7 @@ func TestPullPassesCredentialToFetch(t *testing.T) {
 // TestCacheBlobPathValidation rejects malformed digests (no path traversal).
 //
 // It attacks the HEX half only; the algorithm half — the one that was actually
-// traversable before B129 — is attacked by the gate
+// traversable before digests were verified — is attacked by the gate
 // (TestWriteBlobRejectsDigestMismatch/rejects_unsupported_or_malformed_digest).
 func TestCacheBlobPathValidation(t *testing.T) {
 	c, err := NewCache(t.TempDir())
@@ -147,7 +147,7 @@ func TestCacheBlobPathValidation(t *testing.T) {
 	}
 	bad := []string{
 		"", "sha256", ":abc", "sha256:", "sha256:../escape", "sha256:a/b",
-		// B129: the hex body must be the algorithm's exact length. A short body
+		// The hex body must be the algorithm's exact length. A short body
 		// was accepted before, and no real blob can ever hash to one.
 		"sha256:deadbeef",
 	}

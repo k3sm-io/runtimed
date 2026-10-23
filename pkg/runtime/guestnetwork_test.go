@@ -127,7 +127,7 @@ func distinctiveGuestNetwork() sandbox.GuestNetworkConfig {
 	}
 }
 
-// TestCreateVMPodUsesGuestNetworkerWhenPresent is the M11.2-d8 acceptance
+// TestCreateVMPodUsesGuestNetworkerWhenPresent is the acceptance
 // (present half): when Deps.Network additionally implements GuestNetworker, the
 // config that producer returns for the pod is what the vm backend RECEIVES in
 // VMSpec.Network — structured DNS fields, rendered resolv.conf, and NAT advisory
@@ -178,7 +178,7 @@ func TestCreateVMPodUsesGuestNetworkerWhenPresent(t *testing.T) {
 	}
 }
 
-// TestCreateVMPodFallsBackWhenGuestNetworkerAbsent is the M11.2-d8 acceptance
+// TestCreateVMPodFallsBackWhenGuestNetworkerAbsent is the acceptance
 // (absent half): with no config available the miss is LOGGED, nothing partial or
 // invented reaches the backend, and — since the pod's PUBLISHED IDENTITY has no
 // other source — the pod is REFUSED before the machine is built.

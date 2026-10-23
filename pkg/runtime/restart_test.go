@@ -28,7 +28,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestRestartContainerReExecs is the M2.8 RestartContainer proof: a restart
+// TestRestartContainerReExecs is the RestartContainer proof: a restart
 // terminates the container's process group and re-spawns it from the same SPEC
 // through the startContainer path (same SBPL profile + exec-shim drop), bumping
 // restart_count; an unknown pod or container is NOT_FOUND.

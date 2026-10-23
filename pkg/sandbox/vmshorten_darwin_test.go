@@ -189,7 +189,7 @@ func stopAllBackend(t *testing.T, runDir string, grace time.Duration, order *ord
 	return b, &logs
 }
 
-// TestStopAllVMsShortensACutGrace pins the daemon half of B718: a stop of
+// TestStopAllVMsShortensACutGrace pins the daemon half: a stop of
 // every guest asks a helper whose grace its bound would cut to start its stop
 // with the grace that fits, over the real control socket and before the
 // SIGTERM; a helper whose grace fits is not asked; and a helper that predates

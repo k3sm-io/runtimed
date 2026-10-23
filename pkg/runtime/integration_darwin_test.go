@@ -205,7 +205,7 @@ func TestIntegrationFullStackCreatePod(t *testing.T) {
 	}
 }
 
-// TestIntegrationMaterializeTreeThenExec is acceptance M11.2-a6: the M11.2-d7
+// TestIntegrationMaterializeTreeThenExec is an acceptance test: the
 // unpacker produces an unpacked tree that createPod materializes via
 // MaterializeTree, and the pod EXECS argv[0] out of a MULTI-LAYER image.
 //
@@ -284,7 +284,7 @@ func TestIntegrationMaterializeTreeThenExec(t *testing.T) {
 		SignaturePolicy: runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK,
 		Containers: []*runtimev1.Container{
 			// A relative command: it is resolvable only because the unpacked tree
-			// was materialized into the pod rootfs. Before M11.2-d7 this named a
+			// was materialized into the pod rootfs. Before the unpacker this named a
 			// file that never existed.
 			{Name: "main", Image: ref, Command: []string{"bin/app"}},
 		},

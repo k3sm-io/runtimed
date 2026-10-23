@@ -31,7 +31,7 @@ type runtimeFakeFootprinter struct{ bytes uint64 }
 
 func (f runtimeFakeFootprinter) Footprint(int) (uint64, error) { return f.bytes, nil }
 
-// TestCreatePodOOMKilled is the runtime-level M2.5 OOM proof: a pod whose sampled
+// TestCreatePodOOMKilled is the runtime-level OOM proof: a pod whose sampled
 // footprint exceeds its memory limit is SIGKILLed and its ContainerStatus reports
 // OOMKilled. The sampler mechanics (sample/breach-once/stop) are proven in
 // supervisor.TestMemorySampler*.
@@ -86,7 +86,7 @@ func TestCreatePodNoLimitNoOOM(t *testing.T) {
 	w.release(1001)
 }
 
-// TestPodMetricsSurfacesFootprint is the runtime-level M2.5 Summary-API proof: a
+// TestPodMetricsSurfacesFootprint is the runtime-level Summary-API proof: a
 // metered pod's latest ri_phys_footprint is surfaced via PodMetrics (the kubectl
 // top source the provider wires to the kubelet Summary endpoint in Wave 3).
 func TestPodMetricsSurfacesFootprint(t *testing.T) {
@@ -125,8 +125,8 @@ func TestPodMetricsSurfacesFootprint(t *testing.T) {
 	}
 }
 
-// TestMemoryLimitFromTypedField is the M2.8 typed-contract proof: podMemoryLimitBytes
-// reads the typed PodBox.memory_limit_bytes (apis:M2.2) first, falls back to the
+// TestMemoryLimitFromTypedField is the typed-contract proof: podMemoryLimitBytes
+// reads the typed PodBox.memory_limit_bytes first, falls back to the
 // legacy k3sm.io/memory-limit-bytes annotation when the typed field is unset, and
 // the typed field WINS when both are set — the consumer half of the annotation→typed
 // swap, with no transition window in either land order.

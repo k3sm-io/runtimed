@@ -50,7 +50,7 @@ type recordingSeam struct {
 	inherited   map[int]unix.Rlimit // what Getrlimit returns per resource (the inherited ceiling)
 	epermAbove  map[int]uint64      // Setrlimit returns EPERM when lim.Max exceeds this (a non-root hard-raise denial)
 
-	// qos recording: every Setpriority(which, who, prio) the seam saw (B7).
+	// qos recording: every Setpriority(which, who, prio) the seam saw.
 	prioCalls []setprioCall
 }
 
@@ -106,7 +106,7 @@ func (s *recordingSeam) Getrlimit(resource int) (unix.Rlimit, error) {
 	return unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}, nil
 }
 
-// TestRunLaunchSequenceOrder is the M2.3-a1 ordering proof: with a securityContext
+// TestRunLaunchSequenceOrder is the ordering proof: with a securityContext
 // drop requested (as root), the exec-shim sequence is exactly
 // setgid → initgroups → setuid → sandbox_apply → exec, and without a drop it is
 // sandbox_apply → exec — even on a non-root daemon, where NO setuid is attempted
@@ -352,7 +352,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 	})
 
-	// (B7 post-critique, security HIGH) the inherited-ceiling clamp is
+	// (post-critique, security HIGH) the inherited-ceiling clamp is
 	// UNCONDITIONAL: even in the ROOT posture — where a euid-0 setrlimit hard
 	// raise would succeed (the EPERM clamp never fires for root) — a pod-sourced
 	// plan must not raise limits above the daemon's inherited posture, or a pod
@@ -398,7 +398,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 	})
 
-	// (B7) darwin NOFILE taxonomy: an infinite soft NOFILE is clamped down before
+	// darwin NOFILE taxonomy: an infinite soft NOFILE is clamped down before
 	// the syscall (darwin setrlimit(2) returns EINVAL for rlim_cur=RLIM_INFINITY on
 	// RLIMIT_NOFILE — the launch would abort), so the seam receives the OPEN_MAX
 	// ceiling, never RLIM_INFINITY, in Cur.
@@ -421,7 +421,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		}
 	})
 
-	// (B7) shim NOFILE floor: a too-tight soft NOFILE starves sandbox_compile's
+	// shim NOFILE floor: a too-tight soft NOFILE starves sandbox_compile's
 	// profile read and the exec'd image's dyld after confinement, so Cur is raised
 	// to the named floor (256) with a warning before the syscall.
 	t.Run("nofile-tight-soft-floored-up-with-warning", func(t *testing.T) {
@@ -447,7 +447,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 	})
 }
 
-// TestRunLaunchSequence_QoSPriority is the B7 qos slice: a background (BestEffort
+// TestRunLaunchSequence_QoSPriority is the qos slice: a background (BestEffort
 // / unspecified — the mapping from the apis QOSClass enum to the supervisor-local
 // BgQoS bool lives daemon-side in runtime.resolveBgQoS) launch performs exactly
 // one Setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) call, positioned before
@@ -626,7 +626,7 @@ func TestParseCredentialErrors(t *testing.T) {
 	}
 }
 
-// TestChownForFSGroup is the root-free half of M2.3-a2: the writable mount root is
+// TestChownForFSGroup is the root-free half: the writable mount root is
 // group-owned by fsGroup and group-accessible, with the setgid bit on dirs. It
 // chowns to the test process's own gid (a group it is a member of), so no root is
 // needed; the real fsGroup chown under an arbitrary gid is the m2.sh e2e.
@@ -688,7 +688,7 @@ func TestChownForFSGroupRejectsRootGid(t *testing.T) {
 	}
 }
 
-// TestChownForFSGroupRejectsUnboundedRoot is the B140 sink-side half: the
+// TestChownForFSGroupRejectsUnboundedRoot is the sink-side half: the
 // recursive group-rwx + setgid grant refuses a root outside the permitted tree
 // REGARDLESS of the caller, and refuses it before touching the filesystem. The
 // pre-created victim's mode is asserted unchanged, because an error return alone

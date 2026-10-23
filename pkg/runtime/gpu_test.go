@@ -55,7 +55,7 @@ func gpuHost() sandbox.GPUProbeResult {
 	}
 }
 
-// TestGetRuntimeInfoGPUFacts is acceptance M8.2-a3 at the RPC boundary: the facts a
+// TestGetRuntimeInfoGPUFacts is an acceptance test at the RPC boundary: the facts a
 // consumer actually receives, driven end to end by the fake probe seam. The
 // derivation itself is pinned in pkg/sandbox; what this adds is that the daemon
 // probes once, holds the result immutably, and stamps it onto every response.

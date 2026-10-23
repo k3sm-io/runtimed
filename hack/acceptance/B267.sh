@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B267 — the M15.0 spike: a k3sm-owned Swift helper boots one Linux container VM on the
+# The spike: a k3sm-owned Swift helper boots one Linux container VM on the
 # Containerization Swift package, from a kernel k3sm built itself and an ext4 root k3sm built
 # from its own unpacked OCI tree.
 #

@@ -37,7 +37,7 @@ func unixSIGKILL() os.Signal { return unix.SIGKILL }
 // KqueueReaper against a real child: it spawns /bin/sh that writes a line and
 // exits non-zero, then asserts the kqueue reaper (the sole reaper) collects the
 // exact exit code and the combined-log pipe captured the output. This is the live
-// half of the M1.2-d3 supervisor lifecycle.
+// half of the supervisor lifecycle.
 func TestIntegrationSpawnReapRealProcess(t *testing.T) {
 	var mu sync.Mutex
 	var lines []string

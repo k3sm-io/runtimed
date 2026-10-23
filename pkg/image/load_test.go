@@ -236,7 +236,7 @@ func contentBlobs(t *testing.T, c *Cache) []BlobNode {
 	return nodes
 }
 
-// TestLoadImageRehashBeforeLeaseCommit is B169's named gate: an ingest must
+// TestLoadImageRehashBeforeLeaseCommit is the named gate: an ingest must
 // re-hash every blob against the digest its archive's manifest CLAIMS, and it
 // must do so before any lease is taken and any blob is committed — not as a
 // post-hoc rollback.

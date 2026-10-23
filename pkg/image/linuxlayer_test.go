@@ -217,7 +217,7 @@ func exists(t *testing.T, tree, rel string) bool {
 	return false
 }
 
-// TestLinuxRootfsWhiteoutOpaqueApply is the M11.2-d1 GATE.
+// TestLinuxRootfsWhiteoutOpaqueApply is the gate for Linux whiteout and opaque-directory handling.
 //
 // It drives the committed layer fixtures through the LINUX dialect and pins the
 // three deletion semantics OCI defines, each against the property that

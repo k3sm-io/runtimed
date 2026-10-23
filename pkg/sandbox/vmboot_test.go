@@ -47,7 +47,7 @@ import (
 // the readiness race between "the agent answered" and "the helper died", the
 // deadline kill, the one-grace-budget stop, the orphan sweep's exact-instance
 // identity — are asserted against fakes on any machine, rather than only on an
-// entitled rig where a failure is expensive to reproduce. What the rig proves is
+// entitled machine where a failure is expensive to reproduce. What the machine proves is
 // the other half: that the real helper, kernel and guest agent actually complete
 // the handshake these fakes stand in for.
 
@@ -708,7 +708,7 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 	})
 
 	t.Run("a guest that takes its full grace does not escalate", func(t *testing.T) {
-		// B712. The helper's grace clock and the daemon's wait start at the same
+		// The helper's grace clock and the daemon's wait start at the same
 		// SIGTERM, and a guest that uses its whole grace still leaves the helper
 		// its hard stop and its exit to do. A daemon that waited exactly the
 		// grace SIGKILLed the helper in the middle of that every time, so a slow
@@ -815,7 +815,7 @@ func TestStopVMHonoursTheHelpersOwnBudget(t *testing.T) {
 		for _, tc := range []struct{ in, want time.Duration }{
 			{0, VMHostDefaultStopGrace},
 			{5 * time.Second, 5 * time.Second},
-			// A pod's 90 s grace reaches the helper intact (B712); it used to be
+			// A pod's 90 s grace reaches the helper intact; it used to be
 			// clamped to 30 s here.
 			{90 * time.Second, 90 * time.Second},
 			{VMHostMaxStopGrace, VMHostMaxStopGrace},

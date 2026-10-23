@@ -91,7 +91,7 @@ func (p *countingGuestProbe) calledTimes() int {
 // rosettaDeps builds the Deps for a Rosetta-condition case: the two probe fakes
 // plus a vm backend whose availability decides whether the guest probe runs at all.
 // rosettaShare is set true here because these cases are about the PROBE's states;
-// the share term is B229's own gate and is exercised by
+// the share term is the own gate and is exercised by
 // TestGuestRosettaWithheldWithoutVMHostShare.
 func rosettaDeps(host *countingHostProbe, guest *countingGuestProbe, vmAvailable bool) Deps {
 	return Deps{
@@ -101,7 +101,7 @@ func rosettaDeps(host *countingHostProbe, guest *countingGuestProbe, vmAvailable
 	}
 }
 
-// TestGetRuntimeInfo_RosettaAvailability is B103's gate. It proves GetRuntimeInfo
+// TestGetRuntimeInfo_RosettaAvailability is the gate. It proves GetRuntimeInfo
 // advertises the two Rosetta capabilities as ADDITIVE RuntimeConditions driven by
 // the injectable Deps.HostRosetta / Deps.GuestRosetta probe seams: independent of
 // each other, fail-closed on every non-available state, distinct machine Reasons,
@@ -437,7 +437,7 @@ func TestGetRuntimeInfo_RosettaAvailability(t *testing.T) {
 	})
 }
 
-// TestGuestRosettaWithheldWithoutVMHostShare is B229's gate: a node must not
+// TestGuestRosettaWithheldWithoutVMHostShare is the gate: a node must not
 // advertise a capability it lacks.
 //
 // The regression it forecloses is specific and would have arrived silently. The

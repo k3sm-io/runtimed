@@ -133,7 +133,7 @@ func allowsPath(profile, kind, path string) bool {
 	return false
 }
 
-// TestGenerateAncestorMetadataLiterals is the B277 shape pin: the strict
+// TestGenerateAncestorMetadataLiterals is the shape pin: the strict
 // ancestors of the data volume get file-read-metadata — in BOTH firmlink forms,
 // so the bare /private node a resolved stat-walk hits first is granted — in ONE
 // stanza emitted after the pods-root deny, and they get nothing else. A

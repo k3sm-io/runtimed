@@ -30,7 +30,7 @@ import (
 )
 
 // orderedSigner records the order of Sign/Check calls so a test can assert the
-// policy gate runs in the right sequence relative to the ad-hoc-sign step (M2.6).
+// policy gate runs in the right sequence relative to the ad-hoc-sign step.
 type orderedSigner struct {
 	mu    sync.Mutex
 	calls []string
@@ -73,7 +73,7 @@ func (s *orderedSigner) seq() []string {
 	return out
 }
 
-// TestGateSignatureOrdering is the M2.6-d2 proof on a fake signer: the signature
+// TestGateSignatureOrdering is the proof on a fake signer: the signature
 // policy is enforced before (and instead of) ad-hoc signing for require-* policies
 // (no silent downgrade), while adhoc-ok signs then checks.
 func TestGateSignatureOrdering(t *testing.T) {
@@ -181,7 +181,7 @@ func (f *fakeCredentialResolver) PullCredential(_ context.Context, ns string, se
 	return f.cred, true, nil
 }
 
-// TestCreatePodImagePullSecretConfinedToPuller is the M2.6-d1 proof: the
+// TestCreatePodImagePullSecretConfinedToPuller is the proof: the
 // imagePullSecret credential reaches the pull client and is never written into the
 // pod dir / materialized filesystem.
 func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
@@ -219,7 +219,7 @@ func TestCreatePodImagePullSecretConfinedToPuller(t *testing.T) {
 	if resolver.gotNS != "team-a" || len(resolver.gotSecrets) != 1 || resolver.gotSecrets[0].GetName() != "regcred" {
 		t.Errorf("resolver got ns=%q secrets=%v", resolver.gotNS, resolver.gotSecrets)
 	}
-	// (1b) B99: the host-process spine pulls under a NATIVE platform policy, so a
+	// (1b) the host-process spine pulls under a NATIVE platform policy, so a
 	// multi-platform image resolves to darwin/arm64 and never to
 	// go-containerregistry's implicit linux/amd64 default. This runs through the
 	// real createPod, so it also proves the wiring the unit test cannot: the

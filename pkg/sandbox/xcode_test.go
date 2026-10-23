@@ -230,7 +230,7 @@ func TestXcodeToolchainAbsentWhenEmpty(t *testing.T) {
 		t.Errorf("an empty xcode_toolchain_dir changed the default profile.\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 	// The sentinel is the stanza's own comment marker, not the bare operation
-	// name: since B277 the base profile always carries a file-read-metadata
+	// name: the base profile now always carries a file-read-metadata
 	// stanza of its own (the ancestor stat-walk grant), so "no file-read-metadata"
 	// would now assert something false about every profile rather than something
 	// true about this one.
@@ -488,8 +488,8 @@ func TestXcodeToolchainGrantReachesTheToolchain(t *testing.T) {
 			// The compiler's module cache defaults to the invoking user's shared
 			// /var/folders tree, which the pod profile denies and this grant
 			// deliberately does not open. Pointing it at the pod's own volume is
-			// the documented workload-side setting, the same one the B264
-			// acceptance pod uses — not a widening of the profile.
+			// the documented workload-side setting, the same one the acceptance
+			// pod uses — not a widening of the profile.
 			"CLANG_MODULE_CACHE_PATH="+filepath.Join(dataVol, "tmp", "mc"),
 		)
 		out, err := cmd.CombinedOutput()

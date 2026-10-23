@@ -202,7 +202,7 @@ func testAgent(t *testing.T, podID string, deps Deps) guestv1.GuestAgentClient {
 	return guestv1.NewGuestAgentClient(conn)
 }
 
-// TestGuestAgentRejectsForeignPodID is B228's single-pod gate.
+// TestGuestAgentRejectsForeignPodID is the single-pod gate.
 //
 // guest.proto is explicit that "the agent must reject a pod_id that is not the pod
 // it booted", and states why: the id is an ASSERTION that the caller reached the

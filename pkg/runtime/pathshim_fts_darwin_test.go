@@ -43,7 +43,7 @@ func ftsTree(top string) func(*testing.T, string) {
 	}
 }
 
-// TestShadowCopiesRebaseFtsWalks is the B434 gate: an fts(3) walk of a
+// TestShadowCopiesRebaseFtsWalks is the gate: an fts(3) walk of a
 // mounted directory (rm -r, ls, ls -R, chmod -R, find, cp -R, du) lands under
 // the rootfs, because the shim now rebases libc's own open$NOCANCEL and
 // openat$NOCANCEL, the opens fts makes. Each positive row runs a re-signed

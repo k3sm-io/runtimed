@@ -41,7 +41,7 @@ func (w unknownExitWaiter) WaitExit(ctx context.Context, pid int) (int, int, err
 	return 0, 0, supervisor.ErrExitUnknown
 }
 
-// TestAttachPopulatesOwnedBeforeTheStartupReap is the B124 runtimed gate. The
+// TestAttachPopulatesOwnedBeforeTheStartupReap is the runtimed gate. The
 // table pins attachDecision: only a record whose leader is alive under the
 // recorded pgid with EXACTLY the recorded start, written by this very build, is
 // adopted — the reap's own kill predicate plus the fingerprint, never a window.

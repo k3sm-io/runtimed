@@ -52,7 +52,7 @@ func tree(t *testing.T, root string) []string {
 	return out
 }
 
-// TestCreatePodRejectsTraversingPodID is the artifact half of B136's contract,
+// TestCreatePodRejectsTraversingPodID is the artifact half of the contract,
 // and the half that can actually fail: it exercises the call sites that TOUCH
 // the filesystem (createPod's MkdirAll, DeletePod's RemoveAll, and the reap
 // store's MkdirAll/RemoveAll) rather than the pure path-building function.
@@ -65,7 +65,7 @@ func tree(t *testing.T, root string) []string {
 //     unreachable — the destructive path would never execute and the test would
 //     pass against unfixed code. This harness builds the pair explicitly because
 //     it also nests them (below); the default one (testDeps) stopped splitting
-//     them under B142, which is the production wiring.
+//     them under the data-volume bound, which is the production wiring.
 //   - The root is nested inside an observable parent, so an escape above it is
 //     detectable. A test that only watched the root itself could not see the very
 //     traversal it exists to catch.
