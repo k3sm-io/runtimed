@@ -373,6 +373,12 @@ func imageStatusError(err error) error {
 // records its root first — releasing first reopens the window between "the blob
 // is on disk" and "something names it", which is exactly the window a concurrent
 // reclaim deletes into.
+//
+// A CACHE-ONLY pull (PullImageRequest.cache_only) records the index edge and
+// NO operator root: it warms the store for an image whose name lives elsewhere
+// (a built or loaded image), so prune reclaims it once no pod uses it. It adds
+// no root and removes none: a root an earlier normal pull recorded for the same
+// reference stays until UntagImage removes it.
 func (s *imagesService) PullImage(ctx context.Context, req *runtimev1.PullImageRequest) (*runtimev1.PullImageResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
@@ -389,9 +395,13 @@ func (s *imagesService) PullImage(ctx context.Context, req *runtimev1.PullImageR
 	if err != nil {
 		return nil, pullStatusError(err)
 	}
-	rootErr := s.rt.recordOperatorImage(ref, res.Platform, res.Manifest)
-	// Release only after the root is recorded (or has failed, in which case
-	// nothing is named and the blobs are correctly reclaimable).
+	var rootErr error
+	if !req.GetCacheOnly() {
+		rootErr = s.rt.recordOperatorImage(ref, res.Platform, res.Manifest)
+	}
+	// Release only after the root is recorded (or has failed, or was not asked
+	// for, in which case nothing is named and the blobs are correctly
+	// reclaimable).
 	res.Lease.Release()
 	if rootErr != nil {
 		return nil, imageStatusError(rootErr)
