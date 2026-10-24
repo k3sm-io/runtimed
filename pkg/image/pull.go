@@ -532,7 +532,11 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // When the node has the FLAT REGISTRY mapped (WithFlatRegistry), a reference
 // naming the cluster's one registry name, or one of its aliases, is fetched from
 // the configured endpoint and recorded under that one name, and a bare name the
-// node's own registry answers is recorded under it too; see FlatRegistry.
+// node's own registry answers is recorded under it too; see FlatRegistry. A
+// PUBLIC reference on such a node is still pulled from its own registry first;
+// only when that registry cannot be reached is the cluster registry's copy at
+// "<flat registry>/<host>/<path>" consulted, and the result is recorded under the
+// reference as written (publicmirror.go).
 //
 // This function never derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
@@ -624,11 +628,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		}
 		p.logger().Debug("the flat registry does not have this bare name; continuing upstream",
 			"ref", ref, "flatRef", flatRef, "error", ferr)
-		img, err := p.primaryFetch(ctx, ref, cred, policy)
-		if err != nil {
-			return nil, err
-		}
-		return p.ingest(ctx, ref, img, want)
+		return p.fetchUpstreamOrMirror(ctx, ref, cred, policy, want)
 	}
 
 	// LOCAL INGEST REGISTRY FIRST, and only for a reference that names no
@@ -644,6 +644,13 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		}
 		p.logger().Debug("the node's ingest registry does not have this reference; continuing upstream",
 			"ref", ref, "localRegistry", p.localRegistry, "error", lerr)
+	}
+
+	// A PUBLIC reference on a node with the flat registry mapped: upstream
+	// first, and the cluster registry's copy only when upstream is unreachable
+	// (publicmirror.go). A cluster-local reference never enters it.
+	if p.publicMirrorApplies(ref) {
+		return p.fetchUpstreamOrMirror(ctx, ref, cred, policy, want)
 	}
 
 	img, err := p.primaryFetch(ctx, ref, cred, policy)
