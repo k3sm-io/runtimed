@@ -128,12 +128,17 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 // Sharing it is deliberate: every fail-closed property documented on RemoteFetch
 // is a property of THIS function, so the mirror path cannot drift into a second
 // fetcher with a weaker platform story.
-func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
+//
+// extra carries a transport a caller pins (the flat registry's endpoint dial and
+// trust anchor); it is appended after the defaults so it rides every round trip,
+// the index children included.
+func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, extra ...remote.Option) (ggcrv1.Image, error) {
 	want, err := Candidates(policy)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
 	opts := []remote.Option{remote.WithContext(ctx)}
+	opts = append(opts, extra...)
 	if cred != nil {
 		opts = append(opts, remote.WithAuth(cred.authenticator()))
 	}
@@ -387,6 +392,11 @@ type Puller struct {
 	// the default — switches the whole bare-name behavior off.
 	localRegistry string
 
+	// flatConfig is what WithFlatRegistry was given and flat its validated form,
+	// built by NewPuller; nil switches the flat-name mapping off (flatregistry.go).
+	flatConfig FlatRegistry
+	flat       *flatRegistry
+
 	// log reports mirror fallback (WithPullLogger). Nil discards. The primary
 	// path logs nothing, so a puller without a logger is silent as before.
 	log *slog.Logger
@@ -456,6 +466,13 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 				quoteBounded(p.localRegistry, maxMirrorHostLen))
 		}
 	}
+	// The flat registry is validated last: its aliases must be cluster-local, and
+	// an admitted cluster registry is one of the ways an authority can be.
+	flat, err := p.newFlatRegistry(p.flatConfig)
+	if err != nil {
+		return nil, fmt.Errorf("image puller: %w", err)
+	}
+	p.flat = flat
 	return p, nil
 }
 
@@ -512,6 +529,11 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 // no reference that names a registry of its own; see WithLocalRegistry for the
 // full statement of the divergence and its bounds.
 //
+// When the node has the FLAT REGISTRY mapped (WithFlatRegistry), a reference
+// naming the cluster's one registry name, or one of its aliases, is fetched from
+// the configured endpoint and recorded under that one name, and a bare name the
+// node's own registry answers is recorded under it too; see FlatRegistry.
+//
 // This function never derives a policy from the image tag. Defaulting
 // (`:latest`/untagged -> Always) belongs to the embedded apiserver, which stamps
 // it on the pod spec; the provider forwards that value verbatim and it arrives
@@ -536,9 +558,17 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
 
+	// The FLAT REGISTRY spelling (flatregistry.go): an alias of the cluster's
+	// one registry name is that name, and a bare name the node's own registry
+	// answers is too. flatRef is "" when neither applies.
+	flatRef, explicitFlat := p.flatCanonical(ref)
+	if !explicitFlat {
+		flatRef, _ = p.flatBareName(ref)
+	}
+
 	if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT ||
 		pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
-		entry, lease, present, err := p.presentLocally(ctx, ref, policy)
+		entry, lease, present, err := p.presentAs(ctx, policy, flatRef, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -579,6 +609,26 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 	// asked for always.
 	if err := p.admitFetch(ref); err != nil {
 		return nil, err
+	}
+
+	// The FLAT REGISTRY, from its endpoint and under its one name. An explicit
+	// spelling of it is answered there and nowhere else; a bare name it does not
+	// have continues upstream, exactly as the local-registry attempt below does.
+	if flatRef != "" {
+		if explicitFlat {
+			return p.pullFromFlatRegistry(ctx, flatRef, cred, policy, want)
+		}
+		res, ferr := p.pullFromFlatRegistry(ctx, flatRef, nil, policy, want)
+		if ferr == nil || !mirrorFallbackEligible(ferr) {
+			return res, ferr
+		}
+		p.logger().Debug("the flat registry does not have this bare name; continuing upstream",
+			"ref", ref, "flatRef", flatRef, "error", ferr)
+		img, err := p.primaryFetch(ctx, ref, cred, policy)
+		if err != nil {
+			return nil, err
+		}
+		return p.ingest(ctx, ref, img, want)
 	}
 
 	// LOCAL INGEST REGISTRY FIRST, and only for a reference that names no
@@ -790,6 +840,26 @@ func manifestDescriptorDigests(mfst *ggcrv1.Manifest) []string {
 		out = append(out, l.Digest.String())
 	}
 	return out
+}
+
+// presentAs is presentLocally over the spellings a reference may have been
+// recorded under, in order; an empty spelling is skipped. The first one present
+// wins, so the flat registry's name is preferred and an entry recorded under the
+// written spelling (before the flat mapping existed, or by an image load) still
+// serves.
+func (p *Puller) presentAs(ctx context.Context, policy PlatformPolicy, refs ...string) (IndexEntry, *Lease, bool, error) {
+	seen := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		entry, lease, ok, err := p.presentLocally(ctx, r, policy)
+		if err != nil || ok {
+			return entry, lease, ok, err
+		}
+	}
+	return IndexEntry{}, nil, false, nil
 }
 
 // presentLocally reports whether ref is on this node for policy's platform: the

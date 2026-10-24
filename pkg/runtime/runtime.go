@@ -618,6 +618,14 @@ type Deps struct {
 	// cannot be configured to treat some third-party registry as its own. Like
 	// the two seams above it is ignored when Deps.Puller is set.
 	LocalRegistryHost string
+	// FlatRegistry maps the cluster's one registry name ("registry-k3sm:6450")
+	// to the endpoint this node reaches it at, and names the loopback spellings
+	// recorded under it (image.FlatRegistry). The zero value — the default, and
+	// what the STANDALONE daemon always has — leaves every reference resolving as
+	// before. Like the seams above it is supplied by the embedding control plane,
+	// which knows where the cluster's registry is served, and it is ignored when
+	// Deps.Puller is set.
+	FlatRegistry image.FlatRegistry
 	// ImageIndexObserver is notified after every committed change to this node's
 	// local image index — a pull, a `k3sm image load`, a tag, an untag
 	// (image.IndexObserver). Nil — the default, and what the STANDALONE daemon
@@ -834,6 +842,9 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		if deps.LocalRegistryHost != "" {
 			opts = append(opts, image.WithLocalRegistry(deps.LocalRegistryHost))
+		}
+		if deps.FlatRegistry.Host != "" {
+			opts = append(opts, image.WithFlatRegistry(deps.FlatRegistry))
 		}
 		if deps.ImageMirrors != nil {
 			// image.RemoteMirrorFetch is named here for the same reason
