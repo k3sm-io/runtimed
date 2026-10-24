@@ -24,24 +24,16 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 )
 
-// TestLoadedImageHasNoOperatorRootAndPruneDeletesIt pins CURRENT behaviour on
-// purpose: an image ingested through LoadImage records an index entry but no
-// operator root, so a prune with no pod using it reclaims its blobs and the
-// entry stops resolving. A later change moves load and build onto the
-// registry; the loaded-image assertions below are expected to flip then, and
-// whoever flips them is changing the contract, not fixing a test.
-//
-// The control is a pulled image: PullImage records an operator root, so the
-// same prune keeps its blobs.
+// TestLoadedImageHasNoOperatorRootAndPruneDeletesIt pins that an image
+// ingested into the store records an index entry but no operator root, so a
+// prune with no pod using it reclaims its blobs. The pull side of the same
+// contract, and the control that a recorded root still keeps its blobs, is
+// TestPullImageRecordsNoOperatorRoot.
 func TestLoadedImageHasNoOperatorRootAndPruneDeletesIt(t *testing.T) {
-	const pulledRef = "example.com/verbs:pulled"
-
-	var pulledCfg string
-	fp := &fakePuller{}
-	client, rt := imagesTestClientDeps(t, Deps{Puller: fp})
+	client, rt := imagesTestClient(t)
 
 	// Loaded image.
-	_, cfg, layer := loadFixture(t, client, verbRef)
+	_, cfg, layer := loadFixture(t, rt, verbRef)
 	list, err := client.ListImages(context.Background(), &runtimev1.ListImagesRequest{Reference: verbRef})
 	if err != nil {
 		t.Fatalf("ListImages: %v", err)
@@ -55,30 +47,6 @@ func TestLoadedImageHasNoOperatorRootAndPruneDeletesIt(t *testing.T) {
 	}
 	if len(roots) != 0 {
 		t.Fatalf("OperatorImageRoots = %v after a load, want none", roots)
-	}
-
-	// Control: a pulled image whose blobs are really in the store.
-	pulledCfg = putBlob(t, rt, "pulled-config")
-	pulledLayer := putBlob(t, rt, "pulled-layer")
-	fp.manifest = &runtimev1.ImageManifest{
-		Reference: pulledRef,
-		Config:    &runtimev1.Descriptor{Digest: pulledCfg, Size: int64(len("pulled-config"))},
-		Layers:    []*runtimev1.Descriptor{{Digest: pulledLayer, Size: int64(len("pulled-layer"))}},
-	}
-	fp.descriptor = &runtimev1.Descriptor{
-		MediaType: "application/vnd.oci.image.manifest.v1+json",
-		Digest:    "sha256:" + hexOf("pulled-manifest"),
-		Size:      56,
-	}
-	if _, err := client.PullImage(context.Background(), &runtimev1.PullImageRequest{Reference: pulledRef}); err != nil {
-		t.Fatalf("PullImage: %v", err)
-	}
-	roots, err = rt.cache.OperatorImageRoots()
-	if err != nil {
-		t.Fatalf("OperatorImageRoots: %v", err)
-	}
-	if len(roots) != 1 || roots[0].Reference != pulledRef {
-		t.Fatalf("OperatorImageRoots = %v, want exactly the pulled image's root", roots)
 	}
 
 	ageBlobs(t, rt)
@@ -108,9 +76,4 @@ func TestLoadedImageHasNoOperatorRootAndPruneDeletesIt(t *testing.T) {
 		t.Errorf("the index entry for %q was removed by the prune; it was left dangling when this was pinned", verbRef)
 	}
 
-	for _, d := range []string{pulledCfg, pulledLayer} {
-		if contains(prune.GetRemovedDigests(), d) || !rt.cache.Has(d) {
-			t.Errorf("pulled blob %s was reclaimed despite its operator root", d)
-		}
-	}
 }

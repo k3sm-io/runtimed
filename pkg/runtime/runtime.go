@@ -311,16 +311,9 @@ type Runtime struct {
 	// It is the seam that replaced resolveBinary's earlier "the blobs are
 	// cached, the rootfs is empty" placeholder.
 	unpacker Unpacker
-	// loader is the archive-ingest path the Images service's LoadImage serves
-	// (`k3sm image load` / `import`). It is a CONCRETE *image.Loader, not a seam:
-	// the property that makes an ingest safe is the store's own commit ordering
-	// (verify every blob, then lease, then commit, then record — see
-	// image.Loader), and a fakeable seam here would let the daemon's tests go
-	// green against an implementation that does not have it.
-	loader *image.Loader
 	// index is the node's ref->digest image index — the record of which
 	// references this daemon pulled or ingested, and to which manifest. It is
-	// the same instance the puller and the loader write through (New builds
+	// the same instance the puller writes through (New builds
 	// exactly one), which is what makes the Images service's listing agree with
 	// what a warm IfNotPresent pull will find.
 	//
@@ -867,10 +860,6 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		unpacker = u
 	}
-	loader, err := image.NewLoader(cache, index)
-	if err != nil {
-		return nil, fmt.Errorf("init image loader: %w", err)
-	}
 	signer := deps.Signer
 	if signer == nil {
 		signer = defaultSigner{staging: cache.SignStagingDir()}
@@ -1029,7 +1018,6 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		cache:          cache,
 		puller:         puller,
 		unpacker:       unpacker,
-		loader:         loader,
 		index:          index,
 		signer:         signer,
 		credentials:    deps.Credentials,

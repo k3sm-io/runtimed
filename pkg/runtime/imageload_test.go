@@ -31,8 +31,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
@@ -41,32 +39,32 @@ import (
 // loadRef is the reference every ingest in this file records under.
 const loadRef = "example.com/app:v1"
 
-// sendArchive streams archive over LoadImage in small chunks and returns the
-// terminal response.
+// sendArchive ingests archive into rt's store through the daemon's own
+// image.Loader, in process, and reports the result in LoadImage's wire shape.
 //
-// The chunking is deliberately smaller than any fixture: the wire contract says
-// chunk boundaries carry no meaning, and a server that only worked when an
-// archive arrived in one frame would satisfy every single-frame test and fail
-// against a real multi-megabyte upload.
-func sendArchive(t *testing.T, client runtimev1.ImagesClient, first *runtimev1.LoadImageRequest, archive []byte) (*runtimev1.LoadImageResponse, error) {
+// LoadImage is no longer served (the node store is a pull cache), but the
+// loader still writes the store exactly as an ingest always did, so it remains
+// the honest way to seed fixtures: an entry a test hand-wrote would prove the
+// verbs agree with the test, not with the store's own commit ordering.
+func sendArchive(t *testing.T, rt *Runtime, first *runtimev1.LoadImageRequest, archive []byte) (*runtimev1.LoadImageResponse, error) {
 	t.Helper()
-	stream, err := client.LoadImage(context.Background())
+	loader, err := image.NewLoader(rt.cache, rt.index)
 	if err != nil {
-		t.Fatalf("open LoadImage stream: %v", err)
+		t.Fatalf("NewLoader: %v", err)
 	}
-	if err := stream.Send(first); err != nil {
-		t.Fatalf("send metadata frame: %v", err)
+	res, err := loader.Load(context.Background(), image.LoadRequest{
+		Reference: first.GetReference(),
+		Format:    first.GetFormat(),
+		Digest:    first.GetDigest(),
+		Size:      first.GetSize(),
+	}, bytes.NewReader(archive))
+	if err != nil {
+		return nil, err
 	}
-	const chunk = 64
-	for off := 0; off < len(archive); off += chunk {
-		end := min(off+chunk, len(archive))
-		if err := stream.Send(&runtimev1.LoadImageRequest{Chunk: archive[off:end]}); err != nil {
-			// A server-side refusal closes the stream, so a Send can fail with
-			// io.EOF; the real status comes from CloseAndRecv below.
-			break
-		}
-	}
-	return stream.CloseAndRecv()
+	return &runtimev1.LoadImageResponse{
+		Images:        []*runtimev1.Image{{ManifestDescriptor: res.Descriptor, Manifest: res.Manifest}},
+		ReceivedBytes: res.ReceivedBytes,
+	}, nil
 }
 
 // ociTarball builds a tarred OCI image layout for one config + one layer.
@@ -192,144 +190,6 @@ func storedBlobs(t *testing.T, rt *Runtime) []image.BlobNode {
 		t.Fatalf("EnumerateBlobs: %v", err)
 	}
 	return nodes
-}
-
-// TestLoadImageIngestsOverTheWire is the daemon-side half of the ingest surface:
-// the archive arrives as a client stream, the store ends up holding exactly the
-// blobs the archive's manifest named, digest-addressed, and the reference is
-// recorded in the same on-disk index the pull path answers presence from.
-func TestLoadImageIngestsOverTheWire(t *testing.T) {
-	t.Run("a docker-save archive lands blobs and the reference", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		archive, img := dockerSaveTarball(t, loadRef)
-
-		resp, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
-			Reference: loadRef,
-			Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE,
-		}, archive)
-		if err != nil {
-			t.Fatalf("LoadImage: %v", err)
-		}
-		if resp.GetReceivedBytes() != int64(len(archive)) {
-			t.Errorf("server counted %d bytes, want %d", resp.GetReceivedBytes(), len(archive))
-		}
-		if len(resp.GetImages()) != 1 {
-			t.Fatalf("response carried %d images, want 1", len(resp.GetImages()))
-		}
-		want, err := img.Digest()
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := resp.GetImages()[0]
-		if got.GetManifestDescriptor().GetDigest() != want.String() {
-			t.Errorf("reported image digest %q, want %q", got.GetManifestDescriptor().GetDigest(), want.String())
-		}
-		mfst, err := img.Manifest()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, d := range append([]string{mfst.Config.Digest.String()}, layerDigests(mfst)...) {
-			if !rt.cache.Has(d) {
-				t.Errorf("blob %s is not in the store", d)
-			}
-		}
-		// Every stored blob sits at its own digest's path: the store is
-		// content-addressed, so a blob under any other name would be one the
-		// ingest named rather than hashed.
-		for _, n := range storedBlobs(t, rt) {
-			if n.Kind != image.BlobKindContent {
-				t.Errorf("ingest left a non-content node %q in the blob store", n.Path)
-				continue
-			}
-			if !rt.cache.Has(n.Digest) {
-				t.Errorf("blob node %q is not addressable by its digest %q", n.Path, n.Digest)
-			}
-		}
-		// The reference is recorded in the index the PULL path reads, so a warm
-		// IfNotPresent resolves a loaded image without a registry.
-		assertRecorded(t, rt, loadRef)
-	})
-
-	t.Run("an OCI-layout archive lands blobs and the reference", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		archive, mfstDigest, cfgDigest, layerDigest := ociTarball(t, []byte("oci-layer-bytes"), nil)
-
-		resp, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
-			Reference: loadRef,
-			Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
-		}, archive)
-		if err != nil {
-			t.Fatalf("LoadImage: %v", err)
-		}
-		got := resp.GetImages()[0]
-		if got.GetManifestDescriptor().GetDigest() != mfstDigest {
-			t.Errorf("reported image digest %q, want %q", got.GetManifestDescriptor().GetDigest(), mfstDigest)
-		}
-		if got.GetManifest().GetConfig().GetDigest() != cfgDigest {
-			t.Errorf("reported config digest %q, want %q", got.GetManifest().GetConfig().GetDigest(), cfgDigest)
-		}
-		for _, d := range []string{cfgDigest, layerDigest} {
-			if !rt.cache.Has(d) {
-				t.Errorf("blob %s is not in the store", d)
-			}
-		}
-		assertRecorded(t, rt, loadRef)
-	})
-
-	t.Run("a digest-mismatched blob is refused and the store is untouched", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		// Same length as the claimed bytes, so the verdict is the DIGEST
-		// comparison and not the declared-size guard.
-		archive, _, cfgDigest, layerDigest := ociTarball(t, []byte("honest-layer-bytes"), []byte("POISON-layer-bytes"))
-
-		_, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
-			Reference: loadRef,
-			Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
-		}, archive)
-		if status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("LoadImage error = %v (code %v); want InvalidArgument", err, status.Code(err))
-		}
-		// Not admitted, not admitted-then-flagged: the store is exactly as empty
-		// as it was, including the config that precedes the bad layer.
-		if nodes := storedBlobs(t, rt); len(nodes) != 0 {
-			t.Errorf("a refused ingest left %d node(s) in the store: %+v", len(nodes), nodes)
-		}
-		for _, d := range []string{cfgDigest, layerDigest} {
-			if rt.cache.Has(d) {
-				t.Errorf("blob %s was admitted by a load that failed", d)
-			}
-		}
-		assertNotRecorded(t, rt, loadRef)
-	})
-
-	t.Run("a multi-tag docker-save archive is refused", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		archive, _ := dockerSaveTarball(t, loadRef, "example.com/app:latest")
-
-		_, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
-			Reference: loadRef,
-			Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE,
-		}, archive)
-		if status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("LoadImage error = %v (code %v); want InvalidArgument — v1 refuses rather than dropping a tag",
-				err, status.Code(err))
-		}
-		if nodes := storedBlobs(t, rt); len(nodes) != 0 {
-			t.Errorf("a refused ingest left %d node(s) in the store", len(nodes))
-		}
-		assertNotRecorded(t, rt, loadRef)
-	})
-
-	t.Run("a stream with no frames is refused", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		stream, err := client.LoadImage(context.Background())
-		if err != nil {
-			t.Fatalf("open LoadImage stream: %v", err)
-		}
-		if _, err := stream.CloseAndRecv(); status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("empty-stream error = %v (code %v); want InvalidArgument", err, status.Code(err))
-		}
-	})
 }
 
 // layerDigests is the digest of every layer a go-containerregistry manifest names.
