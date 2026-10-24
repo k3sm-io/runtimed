@@ -50,10 +50,10 @@ func hexOf(name string) string {
 // archive's digests. Going through LoadImage rather than writing the index
 // directly is what makes these rows about the SHIPPED store: an entry a test
 // hand-wrote would prove the verbs agree with the test, not with the ingest.
-func loadFixture(t *testing.T, client runtimev1.ImagesClient, ref string) (manifestDigest, configDigest, layerDigest string) {
+func loadFixture(t *testing.T, rt *Runtime, ref string) (manifestDigest, configDigest, layerDigest string) {
 	t.Helper()
 	archive, manifestDigest, configDigest, layerDigest := ociTarball(t, []byte("verb-layer"), nil)
-	resp, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
+	resp, err := sendArchive(t, rt, &runtimev1.LoadImageRequest{
 		Reference: ref,
 		Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
 	}, archive)
@@ -97,8 +97,8 @@ func ageBlobs(t *testing.T, rt *Runtime) {
 }
 
 // TestPullImageDrivesTheDaemonsOwnPuller is the wire half of the CLI pull: the
-// RPC must reach the SAME puller a pod-driven pull uses, and it must leave an
-// operator root behind.
+// RPC must reach the SAME puller a pod-driven pull uses, and it must leave no
+// operator root behind: the store is a pull cache that names nothing.
 //
 // The puller is faked at the runtime's own seam, so no registry is contacted;
 // what the row proves is the WIRING and the provenance, which is exactly the
@@ -122,7 +122,7 @@ func TestPullImageDrivesTheDaemonsOwnPuller(t *testing.T) {
 		return client, rt, fp
 	}
 
-	t.Run("a pull reports the resolved digest and records an operator root", func(t *testing.T) {
+	t.Run("a pull reports the resolved digest and records no operator root", func(t *testing.T) {
 		client, rt, fp := newPull(t)
 		resp, err := client.PullImage(context.Background(), &runtimev1.PullImageRequest{Reference: verbRef})
 		if err != nil {
@@ -137,21 +137,14 @@ func TestPullImageDrivesTheDaemonsOwnPuller(t *testing.T) {
 		if !resp.GetAlreadyPresent() {
 			t.Error("already_present = false; the fake puller reported a full cache hit")
 		}
-		// The provenance claim: an operator root now pins the pulled blobs, which
-		// is why a pulled-but-unused image survives a prune.
+		// The provenance claim: a pull is a cache warm, so it names nothing and
+		// a pulled-but-unused image is reclaimable by the next prune.
 		roots, err := rt.cache.OperatorImageRoots()
 		if err != nil {
 			t.Fatalf("OperatorImageRoots: %v", err)
 		}
-		if len(roots) != 1 || roots[0].Reference != verbRef {
-			t.Fatalf("OperatorImageRoots = %v, want one root for %q", roots, verbRef)
-		}
-		got := map[string]bool{}
-		for _, d := range roots[0].Root.Digests() {
-			got[d] = true
-		}
-		if !got[fp.manifest.GetConfig().GetDigest()] || !got[fp.manifest.GetLayers()[0].GetDigest()] {
-			t.Errorf("operator root digests = %v, want the config and layer the pull resolved", roots[0].Root.Digests())
+		if len(roots) != 0 {
+			t.Fatalf("OperatorImageRoots = %v after a pull, want none", roots)
 		}
 	})
 
@@ -280,299 +273,6 @@ func TestPullImageDrivesTheDaemonsOwnPuller(t *testing.T) {
 	})
 }
 
-// TestTagImageIsAdditiveOnly pins the tag contract: a new name for existing
-// content, never a re-point, and never a fetch.
-func TestTagImageIsAdditiveOnly(t *testing.T) {
-	const tagged = "example.com/verbs:tagged"
-
-	t.Run("a tag names existing content and roots it", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		digest, cfg, layer := loadFixture(t, client, verbRef)
-
-		resp, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: tagged,
-		})
-		if err != nil {
-			t.Fatalf("TagImage: %v", err)
-		}
-		if resp.GetAlreadyPresent() {
-			t.Error("already_present = true for a new name")
-		}
-		if got := resp.GetImage().GetManifest().GetReference(); got != tagged {
-			t.Errorf("tagged manifest names %q, want %q", got, tagged)
-		}
-		if got := resp.GetImage().GetManifestDescriptor().GetDigest(); got != digest {
-			t.Errorf("tagged manifest digest = %s, want %s (a tag names content, it does not change it)", got, digest)
-		}
-
-		// The new name is listable...
-		list, err := client.ListImages(context.Background(), &runtimev1.ListImagesRequest{Reference: tagged})
-		if err != nil {
-			t.Fatalf("ListImages: %v", err)
-		}
-		if len(list.GetImages()) != 1 {
-			t.Fatalf("ListImages(%q) = %v, want the tagged entry", tagged, list.GetImages())
-		}
-		// ...and it carries an operator root over the same blobs.
-		roots, err := rt.cache.OperatorImageRoots()
-		if err != nil {
-			t.Fatalf("OperatorImageRoots: %v", err)
-		}
-		if len(roots) != 1 || roots[0].Reference != tagged {
-			t.Fatalf("OperatorImageRoots = %v, want one root for the tag", roots)
-		}
-		pinned := map[string]bool{}
-		for _, d := range roots[0].Root.Digests() {
-			pinned[d] = true
-		}
-		if !pinned[cfg] || !pinned[layer] {
-			t.Errorf("the tag's root pins %v, want the config and layer digests", roots[0].Root.Digests())
-		}
-	})
-
-	t.Run("no blob is written and no name is invented", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		digest, _, _ := loadFixture(t, client, verbRef)
-		before := len(storedBlobs(t, rt))
-		if _, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: tagged,
-		}); err != nil {
-			t.Fatalf("TagImage: %v", err)
-		}
-		if after := len(storedBlobs(t, rt)); after != before {
-			t.Errorf("the store held %d blobs before the tag and %d after; a tag writes no blob", before, after)
-		}
-	})
-
-	t.Run("a repeat tag of the same digest is idempotent", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		digest, _, _ := loadFixture(t, client, verbRef)
-		if _, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: tagged,
-		}); err != nil {
-			t.Fatalf("first TagImage: %v", err)
-		}
-		resp, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: tagged,
-		})
-		if err != nil {
-			t.Fatalf("repeat TagImage: %v", err)
-		}
-		if !resp.GetAlreadyPresent() {
-			t.Error("already_present = false on the idempotent repeat")
-		}
-	})
-
-	t.Run("a tag never re-points an existing entry", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		digest, _, _ := loadFixture(t, client, verbRef)
-		// A second, DIFFERENT image under the name the tag will aim at.
-		otherArchive, otherDigest, _, _ := ociTarball(t, []byte("other-layer"), nil)
-		if _, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
-			Reference: tagged, Format: runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
-		}, otherArchive); err != nil {
-			t.Fatalf("LoadImage(other): %v", err)
-		}
-		if otherDigest == digest {
-			t.Fatal("the fixture images are identical; the row cannot observe a re-point")
-		}
-		_, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: tagged,
-		})
-		wantCode(t, err, codes.FailedPrecondition, "TagImage over a conflicting name")
-
-		// And the existing entry is untouched: a refused tag drops no edge.
-		entry, err := rt.index.Resolve(context.Background(), tagged, nil)
-		if err != nil {
-			t.Fatalf("Resolve(%q): %v", tagged, err)
-		}
-		if entry.Descriptor.GetDigest() != otherDigest {
-			t.Errorf("%q now resolves to %s, want the untouched %s", tagged, entry.Descriptor.GetDigest(), otherDigest)
-		}
-	})
-
-	t.Run("a tag may not name content this node does not have", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		loadFixture(t, client, verbRef)
-		_, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: "sha256:" + hexOf("absent"), Reference: tagged,
-		})
-		wantCode(t, err, codes.NotFound, "TagImage over an absent digest")
-	})
-
-	t.Run("a malformed digest or reference is refused", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		digest, _, _ := loadFixture(t, client, verbRef)
-		_, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: "not-a-digest", Reference: tagged,
-		})
-		wantCode(t, err, codes.InvalidArgument, "TagImage with a malformed digest")
-		_, err = client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: "NOT A REF",
-		})
-		wantCode(t, err, codes.InvalidArgument, "TagImage with an unparseable reference")
-	})
-}
-
-// TestUntagImageRemovesOneName is the sanctioned explicit untag, and the row
-// that proves the provenance model closes: an operator's pin can be released.
-func TestUntagImageRemovesOneName(t *testing.T) {
-	const tagged = "example.com/verbs:tagged"
-
-	t.Run("untag drops the name, the root, and nothing else", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		digest, cfg, layer := loadFixture(t, client, verbRef)
-		if _, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: tagged,
-		}); err != nil {
-			t.Fatalf("TagImage: %v", err)
-		}
-
-		resp, err := client.UntagImage(context.Background(), &runtimev1.UntagImageRequest{Reference: tagged})
-		if err != nil {
-			t.Fatalf("UntagImage: %v", err)
-		}
-		if got := resp.GetRemoved().GetManifestDescriptor().GetDigest(); got != digest {
-			t.Errorf("removed entry digest = %s, want %s", got, digest)
-		}
-		// The name is gone...
-		list, err := client.ListImages(context.Background(), &runtimev1.ListImagesRequest{Reference: tagged})
-		if err != nil {
-			t.Fatalf("ListImages: %v", err)
-		}
-		if len(list.GetImages()) != 0 {
-			t.Errorf("ListImages(%q) = %v after the untag, want none", tagged, list.GetImages())
-		}
-		// ...the original name is not...
-		if _, err := rt.index.Resolve(context.Background(), verbRef, nil); err != nil {
-			t.Errorf("the untag disturbed %q: %v", verbRef, err)
-		}
-		// ...the root is gone...
-		roots, err := rt.cache.OperatorImageRoots()
-		if err != nil {
-			t.Fatalf("OperatorImageRoots: %v", err)
-		}
-		if len(roots) != 0 {
-			t.Errorf("OperatorImageRoots = %v after the untag, want none", roots)
-		}
-		// ...and the BYTES are still there. Untag removes a name, not content.
-		for _, d := range []string{cfg, layer} {
-			if !rt.cache.Has(d) {
-				t.Errorf("the untag unlinked blob %s; only PruneImages reclaims content", d)
-			}
-		}
-	})
-
-	t.Run("the operator root is what makes a tagged image survive a prune", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		digest, cfg, layer := loadFixture(t, client, verbRef)
-		ageBlobs(t, rt)
-
-		// Loaded but untagged: an index entry is an EDGE, so the content is
-		// reclaimable. This is the counterfactual the rest of the row rests on.
-		prune, err := client.PruneImages(context.Background(), &runtimev1.PruneImagesRequest{DryRun: true})
-		if err != nil {
-			t.Fatalf("PruneImages: %v", err)
-		}
-		for _, d := range []string{cfg, layer} {
-			if !contains(prune.GetRemovedDigests(), d) {
-				t.Fatalf("a loaded-but-unrooted blob %s was kept (%v); the counterfactual does not hold",
-					d, prune.GetSkipped())
-			}
-		}
-
-		// Tagged: the operator root makes it reachable.
-		if _, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest: digest, Reference: "example.com/verbs:pinned",
-		}); err != nil {
-			t.Fatalf("TagImage: %v", err)
-		}
-		prune, err = client.PruneImages(context.Background(), &runtimev1.PruneImagesRequest{DryRun: true})
-		if err != nil {
-			t.Fatalf("PruneImages: %v", err)
-		}
-		for _, d := range []string{cfg, layer} {
-			if contains(prune.GetRemovedDigests(), d) {
-				t.Errorf("a tagged image's blob %s is still reclaim-eligible; the operator root does not reach the GC", d)
-			}
-		}
-
-		// Untagged again: releasable.
-		if _, err := client.UntagImage(context.Background(), &runtimev1.UntagImageRequest{
-			Reference: "example.com/verbs:pinned",
-		}); err != nil {
-			t.Fatalf("UntagImage: %v", err)
-		}
-		prune, err = client.PruneImages(context.Background(), &runtimev1.PruneImagesRequest{DryRun: true})
-		if err != nil {
-			t.Fatalf("PruneImages: %v", err)
-		}
-		for _, d := range []string{cfg, layer} {
-			if !contains(prune.GetRemovedDigests(), d) {
-				t.Errorf("blob %s is still pinned after the untag (%v); an operator pin must be releasable",
-					d, prune.GetSkipped())
-			}
-		}
-	})
-
-	t.Run("an absent name is NOT_FOUND, never silence", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		loadFixture(t, client, verbRef)
-		_, err := client.UntagImage(context.Background(), &runtimev1.UntagImageRequest{
-			Reference: "example.com/verbs:never-tagged",
-		})
-		wantCode(t, err, codes.NotFound, "UntagImage of an absent name")
-	})
-
-	t.Run("an ambiguous untag removes nothing", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		digest, _, _ := loadFixture(t, client, verbRef)
-		// A second platform entry under one reference — the shape a
-		// multi-platform node reaches by pulling the same tag on both spines.
-		if _, err := client.TagImage(context.Background(), &runtimev1.TagImageRequest{
-			Digest:    digest,
-			Reference: verbRef,
-			Platform:  &runtimev1.Platform{Os: "linux", Architecture: "arm64"},
-		}); err != nil {
-			t.Fatalf("TagImage(linux): %v", err)
-		}
-		_, err := client.UntagImage(context.Background(), &runtimev1.UntagImageRequest{Reference: verbRef})
-		wantCode(t, err, codes.FailedPrecondition, "UntagImage with an ambiguous reference")
-
-		// Nothing was removed — both entries survive.
-		list, err := client.ListImages(context.Background(), &runtimev1.ListImagesRequest{Reference: verbRef})
-		if err != nil {
-			t.Fatalf("ListImages: %v", err)
-		}
-		if len(list.GetImages()) != 2 {
-			t.Fatalf("ListImages(%q) = %d entries after the refusal, want 2", verbRef, len(list.GetImages()))
-		}
-		// Naming the platform removes exactly one.
-		if _, err := client.UntagImage(context.Background(), &runtimev1.UntagImageRequest{
-			Reference: verbRef,
-			Platform:  &runtimev1.Platform{Os: "linux", Architecture: "arm64"},
-		}); err != nil {
-			t.Fatalf("UntagImage(linux): %v", err)
-		}
-		if _, err := rt.index.Resolve(context.Background(), verbRef, nil); err != nil {
-			t.Errorf("the darwin entry did not survive the linux untag: %v", err)
-		}
-	})
-
-	t.Run("a digest pin the entry does not satisfy removes nothing", func(t *testing.T) {
-		client, rt := imagesTestClient(t)
-		loadFixture(t, client, verbRef)
-		_, err := client.UntagImage(context.Background(), &runtimev1.UntagImageRequest{
-			Reference: verbRef,
-			Digest:    "sha256:" + hexOf("some-other-image"),
-		})
-		wantCode(t, err, codes.FailedPrecondition, "UntagImage with a mismatched digest pin")
-		if _, err := rt.index.Resolve(context.Background(), verbRef, nil); err != nil {
-			t.Errorf("the refused untag removed the entry anyway: %v", err)
-		}
-	})
-}
-
 // TestInspectImageIsLocalOnly pins the read side: what the store knows, read out
 // of the index and the config blob, with no registry, no lease and no root.
 func TestInspectImageIsLocalOnly(t *testing.T) {
@@ -593,7 +293,7 @@ func TestInspectImageIsLocalOnly(t *testing.T) {
 		t.Helper()
 		client, rt := imagesTestClient(t)
 		archive, manifestDigest, _, _ := ociTarballConfig(t, richConfig, []byte("verb-layer"), nil)
-		if _, err := sendArchive(t, client, &runtimev1.LoadImageRequest{
+		if _, err := sendArchive(t, rt, &runtimev1.LoadImageRequest{
 			Reference: verbRef, Format: runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
 		}, archive); err != nil {
 			t.Fatalf("LoadImage: %v", err)
@@ -762,7 +462,7 @@ func assertNoArchiveBytes(t *testing.T, archive []byte, terminal *runtimev1.Save
 func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 	t.Run("load -> save -> load preserves the digest", func(t *testing.T) {
 		client, rt := imagesTestClient(t)
-		digest, cfg, layer := loadFixture(t, client, verbRef)
+		digest, cfg, layer := loadFixture(t, rt, verbRef)
 		blobsAfterLoad := len(storedBlobs(t, rt))
 
 		archive, terminal, err := receiveArchive(t, client, &runtimev1.SaveImageRequest{Reference: verbRef})
@@ -783,7 +483,7 @@ func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 		// UNSPECIFIED so the server has to DETECT it — an export the daemon's own
 		// detector cannot classify is not an interoperable archive.
 		const reRef = "example.com/verbs:reimported"
-		resp, err := sendArchive(t, client, &runtimev1.LoadImageRequest{Reference: reRef}, archive)
+		resp, err := sendArchive(t, rt, &runtimev1.LoadImageRequest{Reference: reRef}, archive)
 		if err != nil {
 			t.Fatalf("re-load of the exported archive: %v", err)
 		}
@@ -805,8 +505,8 @@ func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 	})
 
 	t.Run("two exports of one image are byte-identical", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		loadFixture(t, client, verbRef)
+		client, rt := imagesTestClient(t)
+		loadFixture(t, rt, verbRef)
 		first, _, err := receiveArchive(t, client, &runtimev1.SaveImageRequest{Reference: verbRef})
 		if err != nil {
 			t.Fatalf("first SaveImage: %v", err)
@@ -821,8 +521,8 @@ func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 	})
 
 	t.Run("an export by digest is the same archive as by reference", func(t *testing.T) {
-		client, _ := imagesTestClient(t)
-		digest, _, _ := loadFixture(t, client, verbRef)
+		client, rt := imagesTestClient(t)
+		digest, _, _ := loadFixture(t, rt, verbRef)
 		byRef, _, err := receiveArchive(t, client, &runtimev1.SaveImageRequest{Reference: verbRef})
 		if err != nil {
 			t.Fatalf("SaveImage(reference): %v", err)
@@ -841,7 +541,7 @@ func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 
 	t.Run("an export records nothing and unlinks nothing", func(t *testing.T) {
 		client, rt := imagesTestClient(t)
-		loadFixture(t, client, verbRef)
+		loadFixture(t, rt, verbRef)
 		before := len(storedBlobs(t, rt))
 		roots, err := rt.cache.Roots()
 		if err != nil {
@@ -864,7 +564,7 @@ func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 
 	t.Run("the refusals are decided before a chunk is sent", func(t *testing.T) {
 		client, rt := imagesTestClient(t)
-		loadFixture(t, client, verbRef)
+		loadFixture(t, rt, verbRef)
 
 		t.Run("an absent reference", func(t *testing.T) {
 			archive, terminal, err := receiveArchive(t, client, &runtimev1.SaveImageRequest{
@@ -889,7 +589,7 @@ func TestSaveImageRoundTripsOverTheWire(t *testing.T) {
 		})
 
 		t.Run("an image whose blobs the store no longer holds", func(t *testing.T) {
-			_, _, layer := loadFixture(t, client, "example.com/verbs:pruned")
+			_, _, layer := loadFixture(t, rt, "example.com/verbs:pruned")
 			p, err := rt.cache.BlobPath(layer)
 			if err != nil {
 				t.Fatalf("BlobPath: %v", err)

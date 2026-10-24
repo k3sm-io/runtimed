@@ -21,18 +21,19 @@ import (
 	"testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
 )
 
-// TestWarmPullRecordsNoOperatorRoot pins that a cache_only pull warms the
-// store without naming the image: it records no operator root, so a prune
-// with no pod using it reclaims its blobs. A normal pull of another image in
-// the same run still records its root and survives the same prune, and a
-// cache_only pull of an already-rooted reference leaves that root in place
-// ("add none", never "drop one").
-func TestWarmPullRecordsNoOperatorRoot(t *testing.T) {
+// TestPullImageRecordsNoOperatorRoot pins that every pull is a cache warm: a
+// normal pull and a cache_only pull alike record no operator root, so a prune
+// with no pod using either reclaims both. A root an older daemon recorded for a
+// reference is neither dropped nor duplicated by a later pull of it ("add none,
+// remove none").
+func TestPullImageRecordsNoOperatorRoot(t *testing.T) {
 	const (
 		warmRef   = "example.com/verbs:warm"
 		pulledRef = "example.com/verbs:pulled"
+		legacyRef = "example.com/verbs:legacy"
 	)
 	ctx := context.Background()
 	fp := &fakePuller{}
@@ -66,7 +67,6 @@ func TestWarmPullRecordsNoOperatorRoot(t *testing.T) {
 		return refs
 	}
 
-	// A cache-only (warm) pull: no operator root.
 	warmCfg, warmLayer := stage(warmRef, "warm")
 	if _, err := client.PullImage(ctx, &runtimev1.PullImageRequest{Reference: warmRef, CacheOnly: true}); err != nil {
 		t.Fatalf("PullImage(cache_only): %v", err)
@@ -75,40 +75,44 @@ func TestWarmPullRecordsNoOperatorRoot(t *testing.T) {
 		t.Fatalf("OperatorImageRoots = %v after a cache_only pull, want none", refs)
 	}
 
-	// A normal pull still records its root.
 	pulledCfg, pulledLayer := stage(pulledRef, "pulled")
 	if _, err := client.PullImage(ctx, &runtimev1.PullImageRequest{Reference: pulledRef}); err != nil {
 		t.Fatalf("PullImage: %v", err)
 	}
-	if refs := rootRefs(); len(refs) != 1 || refs[0] != pulledRef {
-		t.Fatalf("OperatorImageRoots = %v after a normal pull, want exactly %q", refs, pulledRef)
+	if refs := rootRefs(); len(refs) != 0 {
+		t.Fatalf("OperatorImageRoots = %v after a normal pull, want none", refs)
 	}
 
-	// A cache_only pull of the rooted reference adds none and drops none.
-	if _, err := client.PullImage(ctx, &runtimev1.PullImageRequest{Reference: pulledRef, CacheOnly: true}); err != nil {
-		t.Fatalf("PullImage(cache_only, rooted ref): %v", err)
+	// A root an older daemon recorded survives a re-pull of its reference.
+	legacyCfg, legacyLayer := stage(legacyRef, "legacy")
+	if err := rt.cache.RecordOperatorImage(legacyRef, image.Platform{OS: "darwin", Architecture: "arm64"},
+		image.ImageRoot{Reference: legacyRef, Config: legacyCfg, Layers: []string{legacyLayer}}); err != nil {
+		t.Fatalf("RecordOperatorImage: %v", err)
 	}
-	if refs := rootRefs(); len(refs) != 1 || refs[0] != pulledRef {
-		t.Fatalf("OperatorImageRoots = %v after a cache_only re-pull, want the existing root %q kept", refs, pulledRef)
+	if _, err := client.PullImage(ctx, &runtimev1.PullImageRequest{Reference: legacyRef}); err != nil {
+		t.Fatalf("PullImage(legacy): %v", err)
+	}
+	if refs := rootRefs(); len(refs) != 1 || refs[0] != legacyRef {
+		t.Fatalf("OperatorImageRoots = %v after re-pulling a rooted reference, want the existing root %q kept", refs, legacyRef)
 	}
 
-	// With no pod holding either image, prune reclaims the warm image only.
+	// With no pod holding them, prune reclaims both pulled images.
 	ageBlobs(t, rt)
 	prune, err := client.PruneImages(ctx, &runtimev1.PruneImagesRequest{})
 	if err != nil {
 		t.Fatalf("PruneImages: %v", err)
 	}
-	for _, d := range []string{warmCfg, warmLayer} {
+	for _, d := range []string{warmCfg, warmLayer, pulledCfg, pulledLayer} {
 		if !contains(prune.GetRemovedDigests(), d) {
-			t.Errorf("warm blob %s not reported removed (%v)", d, prune.GetSkipped())
+			t.Errorf("pulled blob %s not reported removed (%v)", d, prune.GetSkipped())
 		}
 		if rt.cache.Has(d) {
-			t.Errorf("warm blob %s survived a prune with no root and no pod", d)
+			t.Errorf("pulled blob %s survived a prune with no root and no pod", d)
 		}
 	}
-	for _, d := range []string{pulledCfg, pulledLayer} {
-		if contains(prune.GetRemovedDigests(), d) || !rt.cache.Has(d) {
-			t.Errorf("pulled blob %s was reclaimed despite its operator root", d)
+	for _, d := range []string{legacyCfg, legacyLayer} {
+		if !rt.cache.Has(d) {
+			t.Errorf("legacy-rooted blob %s was reclaimed despite its operator root", d)
 		}
 	}
 }
