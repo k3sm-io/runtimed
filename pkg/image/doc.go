@@ -47,6 +47,15 @@ limitations under the License.
 //     serving content that fails verification is walked past, not accepted. A
 //     node with no MirrorSource (every standalone daemon) never enters this path.
 //
+//   - Public copy (fallback): on a node with the cluster's one registry mapped
+//     (FlatRegistry), a PUBLIC reference is still pulled from its own registry
+//     first; only when that registry cannot be reached (DNS, a refused or
+//     timed-out connection, a TLS handshake lost to the network) is the cluster
+//     registry's copy at <flat registry>/<host>/<path> pulled instead
+//     (publicmirror.go). Any answer from the public registry, a 401, 403, 404 or
+//     digest mismatch included, stands. The copy passes the same digest
+//     verification and is recorded under the reference the pod wrote.
+//
 //   - Record: write the (reference x platform) -> manifest entry to the on-disk
 //     index (index.go) once the pull has fully succeeded, so this node can
 //     answer presence BY REFERENCE — which the digest-keyed blob store cannot.
