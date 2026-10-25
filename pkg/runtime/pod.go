@@ -2633,9 +2633,11 @@ type resolvedBinary struct {
 	// imageID is the pulled image's digested reference,
 	// "<repository>@<algo>:<hex>" — what ContainerStatus.image_id publishes, and
 	// the same shape containerd's CRI reports as image_ref: the pod's reference
-	// without its tag, at the top-level digest that reference resolved to at
-	// pull (see repoDigestImageID). It comes from the pull result itself, so it
-	// is never re-derived from registry bytes at status time.
+	// without its tag and normalized as containerd and the pull read it (a name
+	// with no registry is a docker.io name), at the top-level digest that
+	// reference resolved to at pull, the index digest for a multi-platform tag
+	// (see repoDigestImageID). It comes from the pull result itself, so it is
+	// never re-derived from registry bytes at status time.
 	//
 	// It is not the config digest. The config digest names a blob no registry
 	// serves as a manifest, so a consumer that pulls or audits "<repo>@<id>"

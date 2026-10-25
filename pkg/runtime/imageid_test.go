@@ -34,9 +34,10 @@ const (
 
 // TestContainerStatusImageIDIsRepoDigest is the gate: image_id, read back
 // through the real status-assembly path, is "<repository>@<digest>" (containerd's
-// CRI image_ref) where <repository> is the pod's reference without its tag in
-// the pod's own spelling, and <digest> is the top-level digest the reference
-// resolved to at pull. It is never the config digest, which names no manifest a
+// CRI image_ref) where <repository> is the pod's reference without its tag, under
+// containerd's normalization (Docker Hub for a name with no registry, an explicit
+// registry kept), and <digest> is the top-level digest the reference resolved
+// to at pull. It is never the config digest, which names no manifest a
 // registry serves.
 func TestContainerStatusImageIDIsRepoDigest(t *testing.T) {
 	cases := []struct {
@@ -59,6 +60,16 @@ func TestContainerStatusImageIDIsRepoDigest(t *testing.T) {
 			name:  "a tag and a digest together drop the tag and keep the pin",
 			image: "example.com/ns/app:v1@" + testPinnedDigest,
 			want:  "example.com/ns/app@" + testPinnedDigest,
+		},
+		{
+			name:  "a bare official image is normalized to docker.io/library",
+			image: "alpine:3.20",
+			want:  "docker.io/library/alpine@" + testManifestDigest,
+		},
+		{
+			name:  "a user repository is normalized to docker.io/<user>",
+			image: "user/app",
+			want:  "docker.io/user/app@" + testManifestDigest,
 		},
 		{
 			name:        "a tag resolved through an index publishes the index digest",
@@ -103,31 +114,6 @@ func TestContainerStatusImageIDIsRepoDigest(t *testing.T) {
 	}
 }
 
-// TestSplitRepoDigest pins the reference split the image_id is built from: a
-// registry port is never mistaken for a tag, and the spelling is never
-// normalized.
-func TestSplitRepoDigest(t *testing.T) {
-	cases := []struct {
-		ref, repo, digest string
-	}{
-		{"registry-k3sm:6450/ois/app:v1", "registry-k3sm:6450/ois/app", ""},
-		{"registry-k3sm:6450/ois/app", "registry-k3sm:6450/ois/app", ""},
-		{"nginx", "nginx", ""},
-		{"nginx:1.27", "nginx", ""},
-		{"docker.io/library/nginx:1.27", "docker.io/library/nginx", ""},
-		{"localhost:5000/app@" + testPinnedDigest, "localhost:5000/app", testPinnedDigest},
-		{"example.com/app:v1@" + testPinnedDigest, "example.com/app", testPinnedDigest},
-	}
-	for _, tc := range cases {
-		t.Run(tc.ref, func(t *testing.T) {
-			repo, digest := splitRepoDigest(tc.ref)
-			if repo != tc.repo || digest != tc.digest {
-				t.Errorf("splitRepoDigest(%q) = (%q, %q), want (%q, %q)", tc.ref, repo, digest, tc.repo, tc.digest)
-			}
-		})
-	}
-}
-
 // TestRepoDigestImageIDEmptyWithoutDigest: an index entry that recorded no
 // manifest descriptor yields no digest, and image_id is then empty rather than
 // a config digest standing in for one.
@@ -135,5 +121,17 @@ func TestRepoDigestImageIDEmptyWithoutDigest(t *testing.T) {
 	res := &image.PullResult{Manifest: &runtimev1.ImageManifest{Config: &runtimev1.Descriptor{Digest: testConfigDigest}}}
 	if got := repoDigestImageID("example.com/app:v1", res); got != "" {
 		t.Errorf("repoDigestImageID with no descriptor = %q, want empty", got)
+	}
+}
+
+// TestRepoDigestImageIDRefusesMalformedDigest: a resolved digest that is not
+// "<algo>:<hex>" publishes nothing rather than a value no consumer can resolve.
+func TestRepoDigestImageIDRefusesMalformedDigest(t *testing.T) {
+	res := &image.PullResult{
+		Manifest:   &runtimev1.ImageManifest{IndexDigest: "sha256:not-hex"},
+		Descriptor: &runtimev1.Descriptor{Digest: testManifestDigest},
+	}
+	if got := repoDigestImageID("example.com/app:v1", res); got != "" {
+		t.Errorf("repoDigestImageID with a malformed index digest = %q, want empty", got)
 	}
 }

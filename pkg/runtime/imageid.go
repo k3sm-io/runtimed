@@ -17,61 +17,38 @@ limitations under the License.
 package runtime
 
 import (
-	"strings"
-
 	"k3sm.io/runtimed/pkg/image"
 )
 
 // repoDigestImageID is the value ContainerStatus.image_id publishes for a
 // container whose image was pulled: "<repository>@<digest>", the digested
 // reference containerd's CRI reports as image_ref and a kubelet copies into
-// status.containerStatuses[].imageID.
+// status.containerStatuses[].imageID. image.RepoDigest builds it: the
+// repository normalized as containerd and the pull both read it, and the digest
+// ref is pinned to when it is pinned.
 //
-// <repository> is ref without its tag or digest, in the spelling the pod asked
-// for: no registry or library/ normalization is applied, because the field
-// names what the pod pulled, and a rewritten spelling would name a reference
-// the pod never used.
+// For a tag, the digest is the top-level digest the tag resolved to at pull:
+//   - the manifest's index_digest, when the tag pointed at a multi-platform
+//     index (the pull records it with the manifest, so a warm serve reports
+//     the same value);
+//   - otherwise the resolved manifest's own descriptor digest, which is what
+//     the registry serves for a single-platform tag and what the node image
+//     listing shows. An index entry recorded before index digests were kept
+//     falls back here too.
 //
-// <digest> is the top-level digest ref resolved to at pull, taken in this order:
-//   - the digest ref is pinned to, when it is pinned: that IS the top-level
-//     digest, whether it names a manifest or an index, and the pull resolved it
-//     by that digest;
-//   - the manifest's index_digest, when the pull recorded one: the index is
-//     what a tag pointed at;
-//   - the resolved manifest's own descriptor digest, which is what the registry
-//     serves for a single-platform tag and what the node image listing shows.
-//
-// It is empty when none of the three is known (an index entry written before
-// the store retained manifest descriptors): an empty field degrades visibly,
-// and the config digest in its place would be a different kind of value in a
-// field consumers read as a pullable digested reference.
+// It is empty when the reference does not parse, no digest is known (an entry
+// recorded before the store kept manifest descriptors), or the digest is not a
+// well-formed "<algo>:<hex>": an empty field degrades visibly, and the config
+// digest in its place would be a different kind of value in a field consumers
+// read as a pullable digested reference.
 func repoDigestImageID(ref string, res *image.PullResult) string {
-	repo, pinned := splitRepoDigest(ref)
-	digest := pinned
-	if digest == "" {
-		digest = res.Manifest.GetIndexDigest()
+	resolved := res.Manifest.GetIndexDigest()
+	if resolved == "" {
+		resolved = res.Descriptor.GetDigest()
 	}
-	if digest == "" {
-		digest = res.Descriptor.GetDigest()
-	}
-	if repo == "" || digest == "" {
+	id, ok := image.RepoDigest(ref, resolved)
+	if !ok {
 		return ""
 	}
-	return repo + "@" + digest
-}
-
-// splitRepoDigest splits an image reference into its repository (tag and digest
-// removed, spelling kept) and the digest it is pinned to, if any.
-//
-// A tag is the text after the last ':' that follows the last '/': a ':' before
-// the last '/' is a registry port (registry:6450/ns/app), never a tag.
-func splitRepoDigest(ref string) (repo, digest string) {
-	repo = ref
-	if at := strings.IndexByte(repo, '@'); at >= 0 {
-		repo, digest = repo[:at], repo[at+1:]
-	}
-	if c := strings.LastIndexByte(repo, ':'); c > strings.LastIndexByte(repo, '/') {
-		repo = repo[:c]
-	}
-	return repo, digest
+	return id
 }
