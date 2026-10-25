@@ -186,7 +186,16 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 		if err != nil {
 			return nil, err
 		}
-		return imageByDigest(r.Context().Digest(selected.Digest.String()), opts)
+		img, err := imageByDigest(r.Context().Digest(selected.Digest.String()), opts)
+		if err != nil {
+			return nil, err
+		}
+		// The index's own digest is what the reference pointed at, and it is
+		// known only here: carry it with the child so ingest can record it
+		// (ImageManifest.index_digest). go-containerregistry computed it from
+		// the bytes it received, and verified them against it when the
+		// reference was pinned by digest.
+		return indexChild{Image: img, index: desc.Digest.String()}, nil
 	case desc.MediaType.IsImage():
 		// Safe: Descriptor.Image() applies the (defaulted) platform only on the
 		// index branch, which this is not.
@@ -206,6 +215,25 @@ func resolveImage(r name.Reference, desc *remote.Descriptor, want []Platform, op
 		return nil, fmt.Errorf("unsupported manifest media type %s: %w",
 			quoteBounded(string(desc.MediaType), maxMediaTypeLen), ErrNoPlatformMatch)
 	}
+}
+
+// indexChild is an image selected out of a multi-platform index, carrying the
+// digest of the index it was selected from. It is the one way a fetcher hands
+// that digest to ingest without widening FetchFunc: ingest asks for it with
+// resolvedIndexDigest, and every other method is the child's own.
+type indexChild struct {
+	ggcrv1.Image
+	index string
+}
+
+// resolvedIndexDigest is the digest of the index img was selected from, or ""
+// when img was not reached through one (a single manifest, a test fake, an
+// image built in memory).
+func resolvedIndexDigest(img ggcrv1.Image) string {
+	if c, ok := img.(indexChild); ok {
+		return c.index
+	}
+	return ""
 }
 
 // imageByDigest resolves one index child by its explicit digest.
@@ -758,6 +786,11 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 		MediaType:   string(mfst.MediaType),
 		Config:      descriptorFromGGCR(mfst.Config),
 		Annotations: mfst.Annotations,
+		// The index this manifest was selected from, when the reference
+		// resolved through one: the digest the reference pointed at, which a
+		// container's image_id publishes. Empty for a single manifest. It is
+		// recorded with the manifest, so a warm serve reports the same value.
+		IndexDigest: resolvedIndexDigest(img),
 	}
 
 	layers, err := img.Layers()

@@ -26,11 +26,11 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// The three digests a pull resolves, kept distinguishable on purpose: only the
-// CONFIG digest may ever appear in image_id. The index digest is shared by every
-// platform of a multi-platform image and the layer digest names a component, so
-// either one in a per-container identity field resolves the wrong artifact —
-// which is the defect this test exists to close, not a stylistic preference.
+// The three digests a pull resolves, kept distinguishable on purpose. image_id
+// carries the TOP-LEVEL digest the reference resolved to (the index digest when
+// the pull went through one) behind the repository, never the config digest
+// (which names no manifest a registry serves) and never a layer digest (which
+// names a component).
 const (
 	testConfigDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	testIndexDigest  = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -44,14 +44,14 @@ const (
 //
 // The two values are asserted against their SOURCES, not against literals a
 // regression could drift past together with the code:
-//   - image_id must equal the config digest of the manifest the pull resolved —
-//     the same digest recorded as the pod's reachability root — and must not be
-//     the index digest, a layer digest, or the mutable reference;
+//   - image_id must equal "<repository>@<top-level digest>" (containerd's CRI
+//     image_ref; TestContainerStatusImageIDIsRepoDigest covers its shapes), and
+//     must not be the config digest, a layer digest, or the mutable reference;
 //   - container_id must equal the id derived from the pod's own reap record, so
 //     the published identity and the (pgid, leader-start) pair the reap is
 //     willing to SIGKILL can never be two different schemes.
 func TestContainerStatusIdentityFields(t *testing.T) {
-	t.Run("pulled image publishes the config digest and a record-derived id", func(t *testing.T) {
+	t.Run("pulled image publishes the repo digest and a record-derived id", func(t *testing.T) {
 		const podID = "pod-identity"
 		w := newBlockingWaiter()
 		pull := &fakePuller{manifest: &runtimev1.ImageManifest{
@@ -70,11 +70,11 @@ func TestContainerStatusIdentityFields(t *testing.T) {
 
 		st := containerStatusNamed(t, rt, podID, "main")
 
-		if got := st.GetImageId(); got != testConfigDigest {
-			t.Errorf("image_id = %q, want the resolved CONFIG digest %q", got, testConfigDigest)
+		if got, want := st.GetImageId(), "example.com/app@"+testIndexDigest; got != want {
+			t.Errorf("image_id = %q, want the repo digest %q", got, want)
 		}
-		if got := st.GetImageId(); got == testIndexDigest || got == testLayerDigest {
-			t.Errorf("image_id = %q: an index/layer digest is not the image's per-platform identity", got)
+		if got := st.GetImageId(); strings.HasSuffix(got, testConfigDigest) || strings.HasSuffix(got, testLayerDigest) {
+			t.Errorf("image_id = %q: a config/layer digest names no manifest a registry serves", got)
 		}
 		if got := st.GetImageId(); got == st.GetImage() {
 			t.Errorf("image_id = %q equals the mutable reference; a tag is not a content address", got)
