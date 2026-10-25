@@ -1749,8 +1749,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			// that owns the count — RestartContainer — overwrites this with the
 			// same value under its own lock.
 			RestartCount: instance,
-			// The image's content identity (config digest), empty on the two
-			// host-binary routes — see resolvedBinary.imageID.
+			// The image's digested reference (<repository>@<digest>), empty on
+			// the two host-binary routes — see resolvedBinary.imageID.
 			ImageId: rb.imageID,
 			State: &runtimev1.ContainerState{
 				Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()},
@@ -2630,12 +2630,17 @@ type resolvedBinary struct {
 	// A host binary is already validly signed and lives at a read-only host path,
 	// so it must never be ad-hoc re-signed (see gateSignature).
 	hostBinary bool
-	// imageID is the pulled image's config digest ("<algo>:<hex>") — the
-	// per-platform content identity of the image this container runs, and what
-	// ContainerStatus.image_id publishes. It comes from the manifest the pull
-	// path itself resolved and verified (every blob is checked against that
-	// manifest's descriptors at commit), so it is never re-derived from registry
-	// bytes at status time.
+	// imageID is the pulled image's digested reference,
+	// "<repository>@<algo>:<hex>" — what ContainerStatus.image_id publishes, and
+	// the same shape containerd's CRI reports as image_ref: the pod's reference
+	// without its tag, at the top-level digest that reference resolved to at
+	// pull (see repoDigestImageID). It comes from the pull result itself, so it
+	// is never re-derived from registry bytes at status time.
+	//
+	// It is not the config digest. The config digest names a blob no registry
+	// serves as a manifest, so a consumer that pulls or audits "<repo>@<id>"
+	// would resolve nothing; the config digest stays where something needs it,
+	// as this pod's reachability root (recordPodImage, image.ImageRoot.Config).
 	//
 	// It is empty, correctly, for both host-binary routes: the native sentinel
 	// and the absolute-host-path convention run an already-present host
@@ -2834,17 +2839,14 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 	argv := append([]string{}, run.Argv...)
 	argv[0] = bin
-	// The config digest, not the index digest and not the reference: it is the
-	// per-platform content identity (the same value a containerd-backed kubelet
-	// reports), whereas an index digest is shared by every platform of a
-	// multi-platform image and a reference is a mutable tag — both would resolve
-	// the wrong artifact in a field consumers read as content-addressable. It is
-	// the digest recorded as this pod's reachability root (recordPodImage above,
-	// image.ImageRoot.Config), so status and GC name the same blob.
+	// The digested reference, not the config digest: image_id is read as a
+	// pullable "<repository>@<digest>" (containerd's image_ref), and the config
+	// digest names no manifest. The GC root recorded above keeps the config
+	// digest; status and GC are two different questions.
 	return resolvedBinary{
 		path:       bin,
 		argv:       argv,
-		imageID:    res.Manifest.GetConfig().GetDigest(),
+		imageID:    repoDigestImageID(c.GetImage(), res),
 		env:        run.Env,
 		workingDir: run.WorkingDir,
 		// Reported by the puller, never re-derived here: only it knows whether a

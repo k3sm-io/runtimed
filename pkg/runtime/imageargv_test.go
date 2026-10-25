@@ -172,11 +172,14 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 			spawner := &fakeSpawner{}
 			waiter := newBlockingWaiter()
 			rt := newTestRuntime(t, Deps{
-				Signer:   signer,
-				Backend:  backend,
-				Spawner:  spawner,
-				Waiter:   waiter,
-				Puller:   &fakePuller{manifest: &runtimev1.ImageManifest{Reference: "example.test/mlx-serve:v1", Config: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('c')}}},
+				Signer:  signer,
+				Backend: backend,
+				Spawner: spawner,
+				Waiter:  waiter,
+				Puller: &fakePuller{
+					manifest:   &runtimev1.ImageManifest{Reference: "example.test/mlx-serve:v1", Config: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('c')}},
+					descriptor: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('d')},
+				},
 				Unpacker: &treeUnpacker{files: imageTree, runCfg: image.ImageRunConfig{Entrypoint: tc.entrypoint}},
 			})
 
@@ -268,7 +271,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 				t.Errorf("host-binary route published image_id %q, want empty", cs[0].GetImageId())
 			}
 			if !tc.hostBinary && cs[0].GetImageId() == "" {
-				t.Errorf("pulled route published no image_id; want the config digest")
+				t.Errorf("pulled route published no image_id; want the repo digest")
 			}
 		})
 	}

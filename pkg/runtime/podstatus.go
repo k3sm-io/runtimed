@@ -118,7 +118,7 @@ func containerStatusOf(cp *containerProc) *runtimev1.ContainerStatus {
 	st := &runtimev1.ContainerStatus{
 		Name:  cp.state.GetName(),
 		Image: cp.state.GetImage(),
-		// The identity pair: image_id is the pulled image's config digest (empty
+		// The identity pair: image_id is the pulled image's digested reference (empty
 		// on the host-binary routes, which have no manifest — see
 		// resolvedBinary.imageID), container_id is derived from the container's
 		// reap record (podProcRecord.containerID). Both are stamped at spawn and

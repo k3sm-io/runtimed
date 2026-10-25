@@ -556,8 +556,8 @@ type fakePuller struct {
 	// test flips an entry between calls to drive a retry from failing to healed.
 	errByRef map[string]error
 	// manifest, when set, is what Pull returns — so a test can control the
-	// resolved CONFIG digest a status must publish as image_id. Nil keeps
-	// the historical empty manifest.
+	// config, layer and index digests a pull resolved. Nil keeps the historical
+	// empty manifest.
 	manifest *runtimev1.ImageManifest
 	// descriptor and platform are the manifest's own content descriptor and the
 	// index KEY the pull resolved to, which the real Puller reports and the
