@@ -492,6 +492,56 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 		}
 	})
 
+	t.Run("a record-less pod dir is skipped only when the daemon clears it", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name      string
+			untracked UntrackedPodFunc
+			malformed bool
+			wantErr   bool
+		}{
+			{"no predicate stays fatal", nil, false, true},
+			{"a tracked pod stays fatal", func(PodID) bool { return false }, false, true},
+			{"an untracked pod is skipped", func(PodID) bool { return true }, false, false},
+			{"a malformed record stays fatal even untracked", func(PodID) bool { return true }, true, true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newGCFixture(t)
+				orphan := f.blob("orphan", 24*time.Hour)
+				pid := f.pod("pod-gone")
+				rec := filepath.Join(f.cache.PodDir(pid), PodReferencesName)
+				var err error
+				if tc.malformed {
+					err = os.WriteFile(rec, []byte("{"), 0o644)
+				} else {
+					err = os.Remove(rec)
+				}
+				if err != nil {
+					t.Fatalf("prepare record: %v", err)
+				}
+				cfg := press(f)
+				cfg.UntrackedPod = tc.untracked
+				_, err = f.cache.ReclaimUnderPressure(context.Background(), cfg)
+				if tc.wantErr {
+					if !errors.Is(err, ErrRootsIncomplete) {
+						t.Fatalf("err = %v; want ErrRootsIncomplete", err)
+					}
+					if !f.exists(orphan) {
+						t.Errorf("a blob was deleted from an incomplete root set")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("reclaim: %v", err)
+				}
+				if f.exists(orphan) {
+					t.Errorf("the unreferenced blob survived a prune past an untracked pod dir")
+				}
+			})
+		}
+	})
+
 	t.Run("an in-flight pull's blobs are pinned by its lease", func(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)

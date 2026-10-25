@@ -449,6 +449,10 @@ type Runtime struct {
 
 	mu   sync.Mutex
 	pods map[string]*pod
+	// creating counts the CreatePod calls in flight per pod id, under mu: from
+	// the registry check until the pod is registered or the create has failed.
+	// A pod in it has a dir that may not carry its reachability record yet.
+	creating map[string]int
 
 	// podReapStarted is set, under mu, at the moment the startup pod reap
 	// snapshots the pods it must not touch. AttachPod registers an adopted pod
@@ -1040,6 +1044,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		procGroup:      procGroup,
 		broker:         newBroker(),
 		pods:           make(map[string]*pod),
+		creating:       make(map[string]int),
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,

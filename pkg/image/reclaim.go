@@ -186,6 +186,10 @@ type ReclaimConfig struct {
 	Now func() time.Time
 	// Log receives the pressure transitions. Nil discards.
 	Log *slog.Logger
+	// UntrackedPod lets the root set skip a pod dir that has no reachability
+	// record when the daemon holds nothing for that pod (see Cache.roots). Nil
+	// keeps every record-less pod dir fatal.
+	UntrackedPod UntrackedPodFunc
 
 	// afterInventory runs between the blob inventory and the root read. It is
 	// UNEXPORTED and exists only so an in-package test can drive the interleaving
@@ -358,9 +362,13 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		cfg.afterInventory()
 	}
 	// Fail-closed: an incomplete root set aborts the whole pass (see Roots).
-	roots, err := c.Roots()
+	roots, skipped, err := c.roots(cfg.UntrackedPod)
 	if err != nil {
 		return nil, err
+	}
+	if len(skipped) > 0 {
+		log.Warn("image gc skipped pod dirs with no reachability record that no live pod owns",
+			"pods", skipped)
 	}
 	leased := make([]string, 0)
 	for d := range c.leasedDigests() {
