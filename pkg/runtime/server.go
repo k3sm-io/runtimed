@@ -50,7 +50,19 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		r.mu.Unlock()
 		return &runtimev1.CreatePodResponse{Status: r.podStatus(existing)}, nil
 	}
+	// Mark the create in flight until the pod is registered or has failed, so
+	// the image GC never reads its half-built dir as an untracked one
+	// (podUntracked).
+	r.creating[box.GetPodId()]++
 	r.mu.Unlock()
+	registered := false
+	defer func() {
+		if !registered {
+			r.mu.Lock()
+			r.endCreatingLocked(box.GetPodId())
+			r.mu.Unlock()
+		}
+	}()
 
 	// A vm pod whose previous helper still runs, unowned, is not created
 	// again: that would boot a second guest for one pod and remove the pod dir
@@ -76,6 +88,8 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 
 	r.mu.Lock()
 	r.pods[box.GetPodId()] = p
+	r.endCreatingLocked(box.GetPodId())
+	registered = true
 	r.mu.Unlock()
 
 	// Arm the memory sampler only NOW, after registration: armMemorySampler

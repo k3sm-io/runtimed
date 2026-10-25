@@ -240,6 +240,9 @@ func TestPruneImagesRefusesAndReportsTypedReasons(t *testing.T) {
 		client, rt := imagesTestClient(t)
 		orphan := putBlob(t, rt, "orphan")
 		pid := putPod(t, rt, "pod-live", image.ImageRoot{Reference: "app:v1", Config: putBlob(t, rt, "cfg")})
+		// The pod is LIVE: an untracked pod dir without a record is skipped
+		// instead (TestPruneIgnoresUntrackedPodDirWithoutRecord).
+		registerLivePod(rt, "pod-live")
 		if err := os.Remove(filepath.Join(rt.cache.PodDir(pid), image.PodReferencesName)); err != nil {
 			t.Fatalf("remove record: %v", err)
 		}

@@ -211,7 +211,8 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 //   - a node under the pods tree that is not a directory (a stray file, a
 //     symlink planted where a pod dir belongs);
 //   - a pod dir with no reachability record — the pod's blobs would look
-//     unreferenced;
+//     unreferenced (a reclaim pass may skip one the daemon proves untracked;
+//     see roots);
 //   - a record that cannot be read or decoded;
 //   - a record naming a digest this store's closed algorithm allowlist cannot
 //     parse, since a root the store cannot map to a path cannot protect one.
@@ -224,32 +225,57 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 // rather than judged — see the loop below for why that is total and not a
 // loosening.
 func (c *Cache) Roots() ([]ImageRoot, error) {
+	roots, _, err := c.roots(nil)
+	return roots, err
+}
+
+// UntrackedPodFunc reports whether the daemon PROVABLY holds nothing for a pod:
+// no sandbox, no in-flight create, no durable process record, no running vm
+// helper. It is the daemon's answer, never the store's: the store cannot see
+// which pods are live.
+type UntrackedPodFunc func(PodID) bool
+
+// roots is Roots with one narrowing, for a pod dir that has NO reachability
+// record at all: when untracked reports that pod as one the daemon holds
+// nothing for, the dir is skipped and named in the returned list instead of
+// aborting the whole set.
+//
+// That skip removes no protection. A pod the daemon is not running has no
+// process that needs its blobs, and a pull in flight holds a lease until its
+// record is written (RecordPodImage), so no blob depends on a record that does
+// not exist. Every other condition stays fatal: a record that exists but cannot
+// be read or decoded, a non-directory node, a name that is not a pod id, and an
+// absent record for any pod untracked does not clear, including every pod when
+// untracked is nil. Such dirs are what an interrupted pod-dir removal leaves
+// behind (the RemoveAll took images.json and failed on rootfs/).
+func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error) {
 	// Operator roots FIRST, and their read failure is fatal for the same reason a
 	// pod record's is: a prune deletes what no root names, so a root set that is
 	// silently short does not degrade the answer, it inverts it.
 	operator, err := c.OperatorImageRoots()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	podsRoot := c.PodsRoot()
 	entries, err := os.ReadDir(podsRoot)
 	if errors.Is(err, fs.ErrNotExist) {
-		return operatorRootSet(operator), nil
+		return operatorRootSet(operator), nil, nil
 	}
 	if err != nil {
 		// LOCAL-ONLY, no boundErr (this one and the OpenRoot below): stdlib os
 		// errors over the daemon's OWN store root. Their rendering is a path this
 		// package composed plus an errno — none of the foreign, unbounded content
 		// boundErr exists to cap can reach them.
-		return nil, fmt.Errorf("%w: read pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
+		return nil, nil, fmt.Errorf("%w: read pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
 	}
 	root, err := os.OpenRoot(podsRoot)
 	if err != nil {
-		return nil, fmt.Errorf("%w: open pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
+		return nil, nil, fmt.Errorf("%w: open pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
 	}
 	defer root.Close()
 
 	var out []ImageRoot
+	var skipped []string
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		names = append(names, e.Name())
@@ -279,26 +305,32 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 		if err != nil {
 			// LOCAL-ONLY, no boundErr: an fs.PathError naming a pod directory this
 			// daemon created. It reads no record, so no stored content is in it.
-			return nil, fmt.Errorf("%w: stat pod dir %q: %v", ErrRootsIncomplete, name, err)
+			return nil, nil, fmt.Errorf("%w: stat pod dir %q: %v", ErrRootsIncomplete, name, err)
 		}
 		if !fi.IsDir() {
-			return nil, fmt.Errorf("%w: %q under %s is not a pod directory (mode %v)",
+			return nil, nil, fmt.Errorf("%w: %q under %s is not a pod directory (mode %v)",
 				ErrRootsIncomplete, name, podsRoot, fi.Mode().Type())
 		}
 		buf, err := readAnchored(root, filepath.Join(name, PodReferencesName))
+		if errors.Is(err, fs.ErrNotExist) && untracked != nil {
+			if id, perr := ParsePodID(name); perr == nil && untracked(id) {
+				skipped = append(skipped, name)
+				continue
+			}
+		}
 		if err != nil {
 			// LOCAL-ONLY, no boundErr: readAnchored fails with an fs.PathError (or
 			// its own not-a-regular-file message) naming a daemon-composed path. The
 			// record's CONTENT reaches a message only at the decode below — which is
 			// bounded, because that is where foreign bytes actually arrive.
-			return nil, fmt.Errorf("%w: pod %q: %v", ErrRootsIncomplete, name, err)
+			return nil, nil, fmt.Errorf("%w: pod %q: %v", ErrRootsIncomplete, name, err)
 		}
 		var rec podReferences
 		if err := json.Unmarshal(buf, &rec); err != nil {
 			// encoding/json echoes the offending byte of the document it was handed,
 			// and this document's fields were filled from registry-supplied image
 			// references and digests. Bounded as DATA, never adopted.
-			return nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, boundErr(err))
+			return nil, nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, boundErr(err))
 		}
 		for _, r := range rec.Images {
 			for _, d := range r.Digests() {
@@ -307,13 +339,13 @@ func (c *Cache) Roots() ([]ImageRoot, error) {
 					// package's own error, and parseBlobDigest caps both halves of it —
 					// quoteBounded on the registry-supplied digest, boundErr on ggcr's
 					// parser message. Wrapping again would only re-quote a quoted string.
-					return nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
+					return nil, nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
 				}
 			}
 			out = append(out, r)
 		}
 	}
-	return append(out, operatorRootSet(operator)...), nil
+	return append(out, operatorRootSet(operator)...), skipped, nil
 }
 
 // operatorRootSet flattens the operator record to the ImageRoot shape the prune

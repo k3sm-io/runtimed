@@ -176,9 +176,10 @@ func (s *imagesService) RemoveImage(context.Context, *runtimev1.RemoveImageReque
 // leases are honored, and every unlink re-verifies its target.
 func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneImagesRequest) (*runtimev1.PruneImagesResponse, error) {
 	rep, err := s.rt.cache.ReclaimUnderPressure(ctx, image.ReclaimConfig{
-		Force:  true,
-		DryRun: req.GetDryRun(),
-		Log:    s.rt.log,
+		Force:        true,
+		DryRun:       req.GetDryRun(),
+		Log:          s.rt.log,
+		UntrackedPod: s.rt.podUntracked,
 	})
 	if err != nil {
 		return nil, imageStatusError(err)
@@ -694,6 +695,7 @@ func (r *Runtime) RunImageGC(ctx context.Context, interval time.Duration, cfg im
 	if cfg.Log == nil {
 		cfg.Log = r.log
 	}
+	cfg.UntrackedPod = r.podUntracked
 	// Force is a caller-facing operator verb (PruneImages); the timer is the
 	// pressure trigger by definition, so it can never be forced.
 	cfg.Force = false
