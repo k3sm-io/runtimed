@@ -177,7 +177,7 @@ func (b *VMBackend) vmReapRoot() string {
 // startup sweep, which is the whole orphan class this file closes — so a pod that
 // cannot be recorded is a pod whose guest could outlive the daemon unnoticed, and
 // refusing it is the fail-closed answer. (A backend with no state root records
-// nothing and says so once at construction; see WithStateRoot.)
+// nothing; see WithStateRoot, which the shipped daemon always sets.)
 func (b *VMBackend) recordVMProc(vp *vmProc) (string, error) {
 	root := b.vmReapRoot()
 	if root == "" {

@@ -213,8 +213,8 @@ func (r *Ring) Snapshot(sel Selector) []LogEntry {
 // The two must be read together or not at all: a reader that takes the entries
 // and then asks Dropped separately can be told about a gap that did not precede
 // what it was given, or shown a gap it was never told about, because the writer
-// evicts between the two calls. The in-band truncation notice is only honest if
-// the count describes exactly the entries being served.
+// evicts between the two calls. A count is only meaningful if it describes
+// exactly the entries being served.
 func (r *Ring) SnapshotWithDropped(sel Selector) ([]LogEntry, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

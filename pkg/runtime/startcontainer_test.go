@@ -486,7 +486,7 @@ func TestStartContainerStartsANeverStartedContainer(t *testing.T) {
 	})
 }
 
-// TestStartContainerResumesTheInitSequence is R12's proof: a waiting INIT
+// TestStartContainerResumesTheInitSequence is the proof that a started init container resumes the sequence: a waiting INIT
 // container that starts successfully does not just start itself — the runtime
 // runs the rest of the init list and then the mains, and those states arrive on
 // GetPodStatus rather than in the RPC response (which carries only the named
@@ -536,7 +536,7 @@ func TestStartContainerResumesTheInitSequence(t *testing.T) {
 		t.Errorf("response carried %q; it must carry the named container only", got.GetStatus().GetName())
 	}
 
-	// The resumed sequence is observed through the status surface, per R12.
+	// The resumed sequence is observed through the status surface.
 	waitFor(t, 3*time.Second, "the main container to run after the resumed init sequence", func() bool {
 		return statusNamed(t, rt, podID, "main").GetState().GetRunning() != nil
 	})
@@ -557,7 +557,7 @@ func TestStartContainerResumesTheInitSequence(t *testing.T) {
 	}
 }
 
-// TestRestartContainerRefusesANeverStartedContainer is R11's guard: a Waiting
+// TestRestartContainerRefusesANeverStartedContainer is the guard against restarting a never-started container: a Waiting
 // container has no process, and RestartContainer's contract is to terminate one
 // and record its last termination. Called on a never-started container it must
 // refuse — never dereference the absent process (supervisor.Process.PID has no

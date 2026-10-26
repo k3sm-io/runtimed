@@ -88,8 +88,8 @@ func main() {
 // trueHostArch returns the HARDWARE architecture of this host — correct even when
 // the caller is itself running translated.
 //
-// This is not paranoia: the toolchain in this workspace is an amd64 build running
-// under Rosetta, so a test binary compiled by it reports runtime.GOARCH == "amd64"
+// This is not paranoia: a Go toolchain installed as an amd64 build and run
+// under Rosetta reports runtime.GOARCH == "amd64"
 // and is handed a masked hw.machine == "x86_64" by the kernel, on a Mac that is
 // physically arm64. Trusting either would make this gate decide "there is nothing
 // to translate here" on precisely the hardware it is meant to run on.

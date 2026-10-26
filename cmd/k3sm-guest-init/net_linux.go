@@ -212,7 +212,7 @@ func linkHardwareAddr(name string) ([]byte, error) {
 	return append([]byte(nil), iface.HardwareAddr...), nil
 }
 
-// linkMTU reads a link's MTU. The S5 spike measured 1500 on this hardware and
+// linkMTU reads a link's MTU. A measurement on this hardware found 1500 and
 // recorded that the link will not lower it; this reports what the kernel says
 // rather than restating that number.
 func linkMTU(name string) (int, error) {

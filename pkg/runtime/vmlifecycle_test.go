@@ -44,7 +44,7 @@ import (
 // pkg/sandbox owns the boot state machine and tests it there; what is asserted
 // here is the RUNTIME's half — that a booted guest becomes a registered Running
 // pod, that DeletePod tears down the helper instead of iterating containerProcs a
-// vm pod does not have, that shutdown stops helpers a host pod would survive, and
+// vm pod does not have, that shutdown detaches helpers and stops none, so the next daemon can adopt them, and
 // that a helper dying under a live pod is noticed rather than leaving it Running
 // forever.
 

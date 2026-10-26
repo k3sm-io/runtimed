@@ -569,8 +569,8 @@ func TestGuestAgentAnswersItsOwnRPCs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ContainerEvents: %v", err)
 		}
-		// Give the subscription time to land before publishing: a subscriber that
-		// arrives after an event misses it, by design.
+		// Give the subscription time to land before publishing, so the event is delivered live;
+		// a subscriber that arrives after it would receive it from the snapshot instead.
 		time.Sleep(50 * time.Millisecond)
 		events.Publish(ContainerEvent{
 			Container: "app", At: time.Unix(1, 0),

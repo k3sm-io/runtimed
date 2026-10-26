@@ -63,7 +63,8 @@ var ErrInvalidSpec = errors.New("invalid wasm launch spec")
 
 // Bounds are the trusted directories every host path in a spec must sit under.
 // They never come from the spec: the daemon fills them from its own state, and
-// the wasm host takes PodDir from its daemon-built argv (ParseArgs). Without
+// the wasm host takes both from its daemon-built argv (--pod-dir and the
+// optional --volume-root, parsed by ParseArgs). Without
 // them a spec could name its own containment root, and containment would be a
 // tautology.
 type Bounds struct {

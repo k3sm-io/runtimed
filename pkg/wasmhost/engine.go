@@ -22,8 +22,8 @@ import (
 )
 
 // Engine runs one validated launch spec to completion. The wasmtime
-// implementation lives in a cgo subpackage linked only by the helper binary;
-// wasmhosttest.FakeEngine is the fail-closed implementation for unit tests.
+// implementation is to live in a cgo subpackage (not yet present) linked only
+// by the helper binary; wasmhosttest.FakeEngine is the fail-closed implementation for unit tests.
 //
 // An implementation MUST take its preopen directories and its module through
 // OpenPreopens and never reopen a host path by name: the descriptors are what
@@ -54,8 +54,8 @@ const (
 	ExitTrap
 	// ExitResourceLimit means the engine's own resource backstop trapped the
 	// guest (a store limit on memory or tables). It is distinct from ExitTrap
-	// because the start path reports it as OOMKilled; the
-	// mapping itself belongs to that path, not to this package.
+	// because the start path is to report it as OOMKilled;
+	// the mapping itself belongs to that path, not to this package.
 	ExitResourceLimit
 )
 

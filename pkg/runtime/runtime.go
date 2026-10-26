@@ -328,7 +328,7 @@ type Runtime struct {
 	// routes a selected vm pod to CreateVM (away from the host-process path).
 	vmBackend VMBackend
 	// guestDialer dials a vm pod's runtimed-private guest-agent socket.
-	// It is the transport seam under the Exec/GetLogs vm route; production dials
+	// It is the transport seam under the Exec and guest log follower vm routes; production dials
 	// the unix socket, tests inject an in-process listener. Never nil after New.
 	guestDialer GuestDialer
 	// rosettaHost / rosettaGuest are the two Rosetta capability probes' outcomes
@@ -365,7 +365,7 @@ type Runtime struct {
 	signalGroup func(pgid int, sig os.Signal) error
 
 	// drainGrace bounds watchContainerExit's wait for a terminated container's log
-	// pump to reach EOF before snapshotting the FallbackToLogsOnError message; 0
+	// pump to reach EOF before publishing the terminated status; 0
 	// selects defaultDrainGrace. It is a field (not a const) so tests can shrink it
 	// for fast, deterministic runs — there is no clock seam in this package.
 	drainGrace time.Duration
@@ -659,8 +659,8 @@ type Deps struct {
 	// Virtualization.framework + the com.apple.security.virtualization entitlement
 	// (so a vm-requested pod fails closed off a capable host). Tests inject a fake.
 	VMBackend VMBackend
-	// GuestDialer dials one vm pod's guest-agent socket for the Exec/GetLogs vm
-	// route. Defaults to dialGuestUnix, a plain unix-domain dial of
+	// GuestDialer dials one vm pod's guest-agent socket for the Exec and guest log
+	// follower vm routes. Defaults to dialGuestUnix, a plain unix-domain dial of
 	// the vmhost-proxied <Root>/run/vm/<pod>/agent.sock; tests inject a dialer
 	// backed by an in-process listener so the whole gRPC round trip runs against
 	// a fake GuestAgent with no VM. See GuestDialer (guest.go).
@@ -885,10 +885,12 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		// The state root is always supplied: it is where the vm orphan store lives
 		// (<Root>/vmreap), and a backend without one cannot record the helpers it
 		// spawns — so a `kill -9`ed daemon would leave guests running that no
-		// later start could find. No guest-artifact locator is wired here: that
-		// feeder is its own deliverable, and until it lands CreateVM fails every
-		// vm pod closed with sandbox.ErrGuestArtifactsUnavailable rather than
-		// booting an unpinned kernel off a guessed path.
+		// later start could find. No guest-artifact locator is wired on this
+		// fallback path (the daemon's main supplies a VMBackend built with
+		// sandbox.WithGuestArtifacts(guestartifacts.Locator(...))), so a Runtime
+		// built with no VMBackend fails every vm pod closed with
+		// sandbox.ErrGuestArtifactsUnavailable rather than booting an unpinned
+		// kernel off a guessed path.
 		vmBackend = sandbox.NewVMBackend(
 			sandbox.WithStateRoot(cfg.Root),
 			sandbox.WithLogger(log),
@@ -985,8 +987,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// New takes none, and both production callers hold a live one they DROP: this
 	// repo's own cmd/k3sm-runtimed/main.go builds a signal.NotifyContext in the very
 	// function that calls New, and in the shipped single binary k3sm's startNode(ctx) →
-	// buildProvider(ctx, …) → provider.NewRuntimed(cfg) drops the ctx at the provider
-	// boundary. So this genuinely IS a background context below a live one, and the
+	// buildProvider(ctx, …) → provider.NewRuntimed(ctx, cfg) uses the ctx for the startup re-attachment
+	// and does not pass it on to runtime.New. So this genuinely IS a background context below a live one, and the
 	// GO-STANDARDS §Context rule against that is not satisfied by call depth.
 	//
 	// What makes it safe is the probe's own internal ceiling, chosen as the deliberate
@@ -1097,7 +1099,7 @@ const defaultDrainGrace = 2 * time.Second
 
 // drainGraceDuration is the bounded wait (Runtime.drainGrace, default
 // defaultDrainGrace) watchContainerExit gives the log pump to reach EOF before it
-// snapshots the terminated container's log tail.
+// publishes the terminated status.
 func (r *Runtime) drainGraceDuration() time.Duration {
 	if r.drainGrace > 0 {
 		return r.drainGrace

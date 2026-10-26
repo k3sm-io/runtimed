@@ -38,12 +38,12 @@ import (
 // one where the other was pinned. The config half therefore rides in the
 // identity, not in a comment.
 //
-// The "-pending" suffix is the honest value for a config hash that has not been
-// minted yet: the guest kernel build has not run, so no config hash exists to
-// name. The pin entry below is correspondingly incomplete, Lookup refuses it
-// with ErrPinIncomplete, and every vm pod fails closed until the build lands the
-// real identity and the real digests together. A fabricated hash here would buy
-// nothing but a cache key that matches no artifact anyone can fetch.
+// The identity is minted from a real build: the kernel version, then the hash of
+// the k3sm kernel config the shipped kernel was built with. A build that has not
+// yet minted its identity carries a "-pending" suffix, whose pin entry is
+// incomplete; Lookup refuses it with ErrPinIncomplete and every vm pod fails
+// closed until the real identity and digests land together. A fabricated hash
+// would buy nothing but a cache key that matches no artifact anyone can fetch.
 const ActiveGuestKernel = "v6.18.57-bc162009c43b"
 
 // ImageFileName and InitramfsFileName are the basenames the two artifacts of a
@@ -178,7 +178,7 @@ func IsValidDigest(s string) bool {
 // It answers exactly one question — "has the build minted this pin yet?" — and
 // deliberately not "is this pin usable?". Well-formedness of the digests and the
 // presence of a release url are Lookup's to enforce, so that a pin which is
-// merely unminted (the shipped state before the guest build has run) is
+// merely unminted (a pin whose digests the guest build has not produced yet) is
 // distinguishable in code from one that is minted wrong.
 func (p GuestKernelPin) Complete() bool {
 	return p.ImageSHA256 != "" && p.InitramfsSHA256 != ""
@@ -219,7 +219,7 @@ func Lookup(version string) (GuestKernelPin, error) {
 
 // lookupIn is Lookup against an explicit table, so the rules above are testable
 // against complete, incomplete and malformed pins while the shipped table
-// legitimately holds only one unminted entry.
+// holds only the one minted entry.
 func lookupIn(pins map[string]GuestKernelPin, version string) (GuestKernelPin, error) {
 	if version == "" {
 		return GuestKernelPin{}, fmt.Errorf("look up the guest kernel pin: the version is empty: %w", ErrUnknownVersion)

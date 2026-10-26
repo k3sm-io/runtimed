@@ -156,7 +156,7 @@ type Statusr interface {
 	Status(ctx context.Context) Status
 }
 
-// Deps are the server's six seams plus its two concrete registries.
+// Deps are the server's seven seams plus its two concrete registries.
 type Deps struct {
 	Runner  Runner
 	Sampler Sampler
@@ -175,7 +175,7 @@ type Deps struct {
 	// Attach is the retained-stdio registry the guest's spawn path registers
 	// each container in. It is concrete for the SAME reason Events is: it holds
 	// no policy and performs no syscall of its own, so it is a registry this
-	// package owns and tests directly rather than a sixth seam onto the guest.
+	// package owns and tests directly rather than another seam onto the guest.
 	// A nil one is replaced with an empty hub, which makes every attach that
 	// asks for stdin fail with the stated FailedPrecondition rather than panic.
 	Attach *AttachHub
@@ -847,7 +847,8 @@ func attachFrame(chunk ByteChunk, wantStdout, wantStderr bool) (*runtimev1.Attac
 }
 
 // attachDropNotice is the in-band line a client gets when the bounds cost it
-// bytes — the Capture truncationNotice idiom, restated for a terminal.
+// bytes. Unlike the log ring, which drops silently, an attached terminal has no
+// other channel to learn about the gap.
 //
 // It is CRLF-wrapped and names ^L because its reader is a terminal that has
 // just been handed a discontinuity: without the notice, a half-drawn screen and

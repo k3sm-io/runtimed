@@ -18,8 +18,12 @@ limitations under the License.
 
 // Command k3sm-vmhost builds and runs one vm-backend pod's Linux micro-VM.
 //
-// IT IS the only k3sm BINARY CARRYING com.apple.security.virtualization
+// It is the only k3sm binary carrying com.apple.security.virtualization
 // (vmhost.entitlements). That is the whole reason it is a separate process: the
+// daemon parses images, serves a gRPC socket and talks to the provider, and none
+// of that should sit inside a process holding the authority to create virtual
+// machines. The daemon spawns one of these per vm pod and holds no virtualization
+// entitlement itself.
 //
 // # The entitlement set, and why it is exactly one key
 //
@@ -46,11 +50,6 @@ limitations under the License.
 //   - any Rosetta share entitlement — this helper attaches no Rosetta directory
 //     share and the node does not advertise the capability, so the entitlement
 //     would be authority for nothing.
-//
-// daemon parses images, serves a gRPC socket and talks to the provider, and none
-// of that should sit inside a process holding the authority to create virtual
-// machines. The daemon spawns one of these per vm pod and holds no virtualization
-// entitlement itself.
 //
 // It is DUMB BY DESIGN. Every policy decision was made before it started; it reads
 // vmhost.spec.json, translates it (pkg/vmhost.FromSpec, which carries all the

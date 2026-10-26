@@ -140,7 +140,7 @@ func containerStatusByName(st *runtimev1.PodStatus) map[string]*runtimev1.Contai
 // actually is: pkg/supervisor owns the proc_pid_rusage sampler mechanism and has
 // no notion of a backend, while the decision "which kernel produced this pod's
 // numbers" is taken by pkg/runtime's ListPodStats/podStats over the pod's
-// RESOLVED backend. The BACKLOG-named test name is kept.
+// RESOLVED backend.
 //
 //  1. source FORK — a vm pod's working set and CPU come from the guest agent's
 //     cgroup2 Stats verb, ON demand at ListPodStats, and the host rusage seam is

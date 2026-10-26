@@ -313,9 +313,10 @@ func (c *Capture) CloseAll() {
 //
 // Every Selector field is either honoured or REFUSED, never ignored. TailLines,
 // SinceTime and Follow are applied (the first two by Ring.Snapshot, in upstream's
-// order); Previous is refused with a stated reason, because this init starts a
-// container exactly once and the host recreates the whole pod on failure, so there
-// is no earlier instance in this guest to have retained. Silently serving the
+// order); Previous is refused with a stated reason, because a restart
+// discards the replaced instance's rings (Capture.Reset) and the host already holds
+// that output in its own log file, so there is no earlier instance in this guest to
+// have retained. Silently serving the
 // current instance for a `--previous` request would answer a question about a
 // crash with output from the process that replaced it.
 func (c *Capture) Stream(ctx context.Context, container string, sel Selector) (<-chan LogEntry, func(), error) {

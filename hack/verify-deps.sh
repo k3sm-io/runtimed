@@ -1180,7 +1180,7 @@ self_test() {
 case "${1:-}" in
 "") mkwork; check ;;
 --modules) [ $# -eq 2 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test | --modules <file>]" >&2; exit 2; }; mkwork; modules "$2" ;;
---update) [ $# -eq 1 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test]" >&2; exit 2; }; mkwork; update ;;
---self-test) [ $# -eq 1 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test]" >&2; exit 2; }; self_test ;;
-*) echo "usage: hack/verify-deps.sh [--update | --self-test]" >&2; exit 2 ;;
+--update) [ $# -eq 1 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test | --modules <file>]" >&2; exit 2; }; mkwork; update ;;
+--self-test) [ $# -eq 1 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test | --modules <file>]" >&2; exit 2; }; self_test ;;
+*) echo "usage: hack/verify-deps.sh [--update | --self-test | --modules <file>]" >&2; exit 2 ;;
 esac

@@ -3,15 +3,15 @@
 # Containerization Swift package, from a kernel k3sm built itself and an ext4 root k3sm built
 # from its own unpacked OCI tree.
 #
-# EXIT-CODE CONTRACT (the item's notes): this gate passes iff
+# EXIT-CODE CONTRACT: this gate passes iff
 #   (a) the helper, ad-hoc signed with only com.apple.security.virtualization, boots the guest
 #       and `uname -sm` inside it prints "Linux aarch64"; and
 #   (e) on SIGTERM the helper stops its machine and exits 0 within 30 s; after kill -9 nothing is
 #       orphaned (no cvmspike process survives) and a fresh boot succeeds.
 # Every other criterion — (b) timings, (c) vminitd's surface, (d) toolchain, (f) rootfs API,
 # (g) ownership, (h) unentitled launch, (i) memory posture, (j) network segment, (k) the k3sm-built
-# kernel — is REC-class: printed with its answer and evidence, never a gate failure (the m11.9
-# rule: a recording criterion never fails the gate, so an honest "no" is never punished).
+# kernel — is REC-class: printed with its answer and evidence, never a gate failure (a recording
+# criterion never fails the gate, so an honest "no" is never punished).
 #
 # Inputs (env, all optional):
 #   B267_KERNEL  the arm64 Image k3sm built from the framework's config
@@ -103,7 +103,7 @@ orph="$( { pgrep -f 'cvmspike boot' || true; } | wc -l | tr -d ' ')"   # no matc
 if [ "$orph" = "0" ]; then echo "  (e) kill -9: PASS — no cvmspike survives (the VZ machine lives in-process)"; else echo "  (e) kill -9: FAIL — $orph orphan(s)"; pkill -9 -f 'cvmspike boot'; fail=1; fi
 out2="$("$BIN" boot "$KERNEL" "$STORE" "$IMG" --cmd 'uname -sm' 2>&1)" && echo "  (e) fresh boot after kill -9: PASS" || { echo "  (e) fresh boot after kill -9: FAIL: $out2"; fail=1; }
 
-# ---- (i) memory posture: alloc-then-free 2 GiB, idle, sample host RSS.
+# ---- (i) memory posture: alloc-then-free 400 MiB in a 1 GiB guest, idle, sample host RSS.
 "$BIN" boot "$KERNEL" "$STORE" "$IMG" --memory 1024 --hold 40 --cmd 'dd if=/dev/zero of=/dev/shm/x bs=1M count=400 2>/dev/null; rm -f /dev/shm/x' > "$SCRATCH/mem.log" 2>&1 &
 mp=$!; sleep 25; rss_after="$( { ps -o rss= -p $mp 2>/dev/null || true; } | tr -d ' ')"; sleep 12; rss_idle="$( { ps -o rss= -p $mp 2>/dev/null || true; } | tr -d ' ')"; wait $mp 2>/dev/null || true
 rec "(i) memory posture on $MACHINE: host RSS of the helper after the guest allocated and freed 400 MiB in tmpfs: ${rss_after:-?} KiB at +25 s, ${rss_idle:-?} KiB at +37 s idle (guest memory 1 GiB); k3sm-vmhost on the same experiment: ${B267_VMHOST_RSS:+$B267_VMHOST_RSS KiB}${B267_VMHOST_RSS:-not measured in this spike} (1 GiB guest, 400 MiB allocated and freed)"

@@ -88,7 +88,7 @@ func TestCreatePodNoLimitNoOOM(t *testing.T) {
 
 // TestPodMetricsSurfacesFootprint is the runtime-level Summary-API proof: a
 // metered pod's latest ri_phys_footprint is surfaced via PodMetrics (the kubectl
-// top source the provider wires to the kubelet Summary endpoint in Wave 3).
+// top source the provider wires to the kubelet Summary endpoint).
 func TestPodMetricsSurfacesFootprint(t *testing.T) {
 	w := newBlockingWaiter()
 	ff := runtimeFakeFootprinter{bytes: 4 << 20} // 4 MiB

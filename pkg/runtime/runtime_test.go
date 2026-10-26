@@ -820,10 +820,10 @@ func newTestRuntimeCfg(t *testing.T, cfg Config, d Deps) *Runtime {
 	// waiting behaviour itself is gated in pkg/supervisor, so shrinking it here
 	// hides nothing; a test that needs the real value sets the field back.
 	rt.exitObsGrace = 50 * time.Millisecond
-	// Stop every pod's supervision — reapers AND capture-file tails — before
-	// the temp root is removed (cleanups run last-in first-out, and the root's
-	// was registered above): a tail still persisting its offset into a pod dir
-	// the cleanup is deleting fails the RemoveAll.
+	// Stop every pod's supervision (reapers and log pumps) before the temp
+	// root is removed (cleanups run last-in first-out, and the root's was
+	// registered above): a pump still writing into a pod dir the cleanup is
+	// deleting fails the RemoveAll.
 	t.Cleanup(func() { _ = rt.Close() })
 	return rt
 }
@@ -1136,7 +1136,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreatePod transport error: %v", err)
 		}
-		// The vm boot is a lab-gated stub, so the pod surfaces a SANDBOX_SETUP error.
+		// The fake vm backend fails its boot by default (ErrVMBootNotImplemented), so the pod surfaces a SANDBOX_SETUP error.
 		if resp.GetError() == nil {
 			t.Fatal("vm-routed pod should surface the lab-gated boot error")
 		}
@@ -1188,7 +1188,7 @@ func TestCreatePodVMRoutingBypassesHostProcessSteps(t *testing.T) {
 		if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP {
 			t.Errorf("reason = %v, want SANDBOX_SETUP", resp.GetFailureReason())
 		}
-		// Fail-closed means it never even reached the (stubbed) boot.
+		// Fail-closed means it never even reached the fake's boot.
 		if n, _ := vmb.created(); n != 0 {
 			t.Errorf("CreateVM called %d times on an unavailable vm backend; must be 0 (fail closed before routing)", n)
 		}
@@ -1281,7 +1281,7 @@ func TestCreateVMPod_GuestNetworkPlumbing(t *testing.T) {
 		box := vmPodBox(rt, "pod-vm-net", 0)
 
 		// The producer holds the config; createVMPod pulls it through the seam. The
-		// lab-gated boot stub then surfaces an error, which is expected and orthogonal
+		// fake's default boot failure then surfaces an error, which is expected and orthogonal
 		// to the plumbing assertion.
 		if _, _, err := rt.createPod(context.Background(), box); err == nil {
 			t.Fatal("vm createPod should surface the lab-gated boot error")
@@ -1568,7 +1568,7 @@ func TestUpdatePod(t *testing.T) {
 	})
 }
 
-// TestUnknownPodErrors covers NOT_FOUND on GetPodStatus/UpdatePod/GetLogs.
+// TestUnknownPodErrors covers NOT_FOUND on GetPodStatus/UpdatePod.
 func TestUnknownPodErrors(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
 	gs, _ := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: "nope"})

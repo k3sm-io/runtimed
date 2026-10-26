@@ -83,7 +83,7 @@ never talks to the control plane directly.
 
 ### `cmd/`
 
-- **`k3sm-runtimed`** — the root daemon. It hosts the runtime server behind a gRPC endpoint on a
+- **`k3sm-runtimed`** — the runtime daemon. It hosts the runtime server behind a gRPC endpoint on a
   Unix domain socket that the k3sm node provider dials.
 - **`k3sm-execshim`** — a small, ad-hoc-signed helper that the supervisor `posix_spawn`s in place
   of a container's own binary. It drops privileges to the container's declared identity, applies

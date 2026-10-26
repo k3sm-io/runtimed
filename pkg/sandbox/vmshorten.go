@@ -61,8 +61,8 @@ import (
 const VMHostMinShortenBound = VMHelperStopMargin + time.Second
 
 // vmHostShortenTimeout bounds one shorten exchange, dial to reply. The helper
-// answers from its accept loop under one mutex and never touches the guest to
-// do it, so a healthy helper answers at once; the bound is for a wedged one,
+// answers on the connection's own goroutine, under the Lifecycle's one mutex,
+// and never touches the guest to do it, so a healthy helper answers at once; the bound is for a wedged one,
 // and it is short because it is spent inside the stopper's own bound.
 const vmHostShortenTimeout = time.Second
 

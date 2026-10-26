@@ -41,7 +41,7 @@ import (
 //     (the documented ceiling in the shim header). /usr is on the sealed system
 //     volume too, so /usr/k3sm-b425-mnt cannot be created either. A fictitious
 //     ancestor ("/k3sm-b425/mnt") would make the walk fail at "/k3sm-b425" by
-//     design, which is the ceiling, not this item.
+//     design, which is the ceiling, not this gate.
 const (
 	dirMetaMount     = "/k3sm-b425-mnt"
 	dirMetaDeepMount = "/usr/k3sm-b425-mnt"

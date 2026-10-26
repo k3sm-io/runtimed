@@ -119,10 +119,10 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	return remoteFetch(ctx, r, ref, cred, policy)
 }
 
-// remoteFetch is the registry round trip shared by RemoteFetch and
-// RemoteMirrorFetch. r is the ALREADY-PARSED reference — which is the whole of
-// the difference between the two callers, since a cluster mirror parses with
-// name.Insecure (see Mirror.PlainHTTP) — and ref is the reference as the caller
+// remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
+// RemoteInsecureFetch, RemoteMirrorFetch and the flat registry's endpointFetch.
+// r is the ALREADY-PARSED reference (a cluster mirror and an admitted cluster
+// registry parse with name.Insecure, see Mirror.PlainHTTP), and ref is the reference as the caller
 // spells it, used only in messages.
 //
 // Sharing it is deliberate: every fail-closed property documented on RemoteFetch
@@ -325,9 +325,9 @@ type PullResult struct {
 // No registry round trip has been made when it is returned.
 //
 // It is deliberately a plain sentinel and not a classified pull failure: the
-// kubelet waiting-reason taxonomy (ErrImageNeverPull and its siblings) is a
-// separate deliverable that consumes this sentinel with errors.Is — the wrapped
-// chain out of Pull is the contract it builds on.
+// runtime maps it to the kubelet waiting reason (ErrImageNeverPull and its
+// siblings, pullFailureReason in pkg/runtime) with errors.Is — the wrapped chain
+// out of Pull is the contract.
 var ErrImageNotPresent = errors.New("image not present locally and the pull policy forbids fetching it")
 
 // LocalIndex answers presence-BY-REFERENCE for the node: it records which

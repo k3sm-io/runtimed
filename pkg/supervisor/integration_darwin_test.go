@@ -36,7 +36,7 @@ func unixSIGKILL() os.Signal { return unix.SIGKILL }
 // TestIntegrationSpawnReapRealProcess drives the production PosixSpawner +
 // KqueueReaper against a real child: it spawns /bin/sh that writes a line and
 // exits non-zero, then asserts the kqueue reaper (the sole reaper) collects the
-// exact exit code and the combined-log pipe captured the output. This is the live
+// exact exit code and the stdout pipe's log pump delivered the output to the sink. This is the live
 // half of the supervisor lifecycle.
 func TestIntegrationSpawnReapRealProcess(t *testing.T) {
 	var mu sync.Mutex
@@ -90,7 +90,7 @@ func TestIntegrationSpawnReapRealProcess(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("combined-log pipe did not capture output: %v", lines)
+		t.Errorf("stdout pipe did not capture output: %v", lines)
 	}
 }
 

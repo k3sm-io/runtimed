@@ -48,7 +48,7 @@ func gpuProfile(t *testing.T) string {
 // pair of exact IOKit class-name STRINGS with no linker-symbol canary behind them
 // (SBPL class names are data): a substring check would pass a profile that also
 // granted mach-lookup, iokit-get-properties, or a shader-cache write — every one
-// of which the S1 spike measured unnecessary and rejected as over-scope. The
+// of which the lab measurements found unnecessary and rejected as over-scope. The
 // golden is what makes an ADDED rule as red as a changed one. Run with -update to
 // regenerate.
 func TestGenerateGPUGolden(t *testing.T) {
@@ -72,7 +72,7 @@ func TestGenerateGPUGolden(t *testing.T) {
 // TestMetalStanzaShape pins the properties of the allow-set that the golden alone
 // would let a future edit satisfy in a wrong way: the two exact class names, their
 // presence in one iokit-open rule, and — the load-bearing negatives — the absence
-// of every candidate the S1 ablation dropped.
+// of every candidate the ablation dropped.
 func TestMetalStanzaShape(t *testing.T) {
 	profile := gpuProfile(t)
 
@@ -179,8 +179,8 @@ func (b stubBackend) WrapCommand(_ context.Context, _ string, _ []string, _ supe
 	return "", nil, func() error { return nil }, nil
 }
 
-// TestSandboxGPUSupported pins the fail-closed advertisement control (Resolution
-// 14): sandbox_gpu_supported is the and of "the selected backend can express the
+// TestSandboxGPUSupported pins the fail-closed advertisement control:
+// sandbox_gpu_supported is the and of "the selected backend can express the
 // Metal allow-set" and "the functional probe passed". Every other combination
 // reports false.
 func TestSandboxGPUSupported(t *testing.T) {

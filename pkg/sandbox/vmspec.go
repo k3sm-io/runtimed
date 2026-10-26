@@ -93,9 +93,11 @@ const VMAgentVsockPort uint32 = 1024
 // the daemon's wait provably >= the helper's.
 //
 // The ceiling is the guest agent's own (300 s), so a pod's
-// terminationGracePeriodSeconds reaches the guest intact on a deletion. A daemon
-// exit does not get that long: StopAllVMs divides the exit bound it is handed and
-// cuts, with a log line, any helper whose grace does not fit.
+// terminationGracePeriodSeconds reaches the guest intact on a deletion. A bounded
+// stop of every guest does not get that long: StopAllVMs stops every helper
+// concurrently within VMStopAllBound and cuts, with a log line, any helper whose
+// grace does not fit. A daemon exit stops no helper (they outlive it and the next
+// daemon adopts them).
 //
 // The pairing is pinned by a TEST that may import both
 // (pkg/vmhost.TestStopGraceBoundsAreSingleValued), exactly as the Rosetta
@@ -148,9 +150,10 @@ type GuestArtifacts struct {
 // fails every vm pod with one legible reason instead of silently booting whatever
 // happens to be on disk.
 //
-// It is deliberately UNSET in the shipped constructor. The production feeder is
-// its own deliverable (the EnsureGuestArtifacts slice); until it lands, CreateVM
-// fails closed with ErrGuestArtifactsUnavailable rather than guessing a path.
+// The sandbox constructor leaves it unset; the daemon wires it in
+// cmd/k3sm-runtimed from guestartifacts.EnsureGuestArtifacts and
+// guestartifacts.Locator, and without it CreateVM fails closed with
+// ErrGuestArtifactsUnavailable rather than guessing a path.
 type GuestArtifactLocator func() (GuestArtifacts, error)
 
 // ErrGuestArtifactsUnavailable reports that the pinned guest kernel/initramfs
@@ -353,9 +356,8 @@ func marshalVMHostSpec(hs *guestv1.VMHostSpec) ([]byte, error) {
 // the share root is created here because FromSpec appends that share
 // unconditionally and VZ refuses a shared directory that does not exist, so a
 // missing dir would fail the boot with a framework error naming a path the pod
-// spec never mentioned. It is created empty: the GuestSpec that belongs inside it
-// is written by the guest-provisioning slice, not by this one, and a guest that
-// finds an empty share fails in its own init with its own reason.
+// spec never mentioned. It is created empty here: writeGuestSpec (vmguestspec.go) puts the GuestSpec
+// inside it later in the same boot, before the helper is spawned.
 //
 // The write is atomic (temp + rename) for the ordinary reason: the helper reads
 // this file as its first act, and a half-written spec would be a parse error

@@ -185,7 +185,7 @@ func TestProcessLifecycle(t *testing.T) {
 	}
 }
 
-// TestProcessLogCapture checks the combined-log pump delivers the child's output
+// TestProcessLogCapture checks the log pumps deliver the child's output
 // to the sink (via a real pipe wired by the fake spawner).
 func TestProcessLogCapture(t *testing.T) {
 	sp := &fakeSpawner{pid: 1, logLine: "hello-pod"}
@@ -333,7 +333,7 @@ func TestNodeNetwork(t *testing.T) {
 }
 
 // logPipeSpawner is a Spawner that plays a scripted byte stream into the
-// Process's combined-log pipe. Unlike fakeSpawner it writes from a goroutine on
+// Process's stdout pipe. Unlike fakeSpawner it writes from a goroutine on
 // its own dup of the write end — the way a real child does — which is required
 // for payloads larger than the pipe buffer: a synchronous in-Spawn write would
 // deadlock, because Start only launches the pump after Spawn returns. The dup

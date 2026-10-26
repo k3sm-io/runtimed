@@ -173,7 +173,7 @@ func (i lyingImage) Layers() ([]ggcrv1.Layer, error) {
 // store verifies every blob against its claimed digest AT the COMMIT point, in
 // one exported home (Cache.CommitBlob) that Puller.writeBlob merely delegates to.
 //
-// every assertion the gate makes is a subtest of this function — the item is run
+// every assertion the gate makes is a subtest of this function: the gate is run
 // as `go test -run '^TestWriteBlobRejectsDigestMismatch$'`, so anything parked in
 // a sibling Test... would not be gate-proving.
 //
@@ -181,18 +181,18 @@ func (i lyingImage) Layers() ([]ggcrv1.Layer, error) {
 // with a fake FetchFunc. A fetcher-driven table structurally cannot reach the
 // config-blob call site: for any ordinary go-containerregistry image
 // ConfigName() IS the sha256 of RawConfigFile(), so the config path cannot be
-// handed mismatched bytes, and a layer-only fix would pass such a table. One
-// through-Pull row is kept as a WIRING witness (the error surfaces out of Pull
+// handed mismatched bytes, and a layer-only fix would pass such a table. Two
+// through-Pull rows are kept as WIRING witnesses (the error surfaces out of Pull
 // rather than being swallowed), never as the whole table.
 //
-// Behaviour at main, for each row:
+// What each row asserts:
 //
-//	correct bytes commit                      → committed (already green)
-//	digest-mismatched bytes                   → committed under the claimed name (RED)
-//	short stream                              → committed under the claimed name (RED)
-//	oversized stream                          → committed, unbounded bytes first (RED)
-//	"../../etc:passwd"                        → MkdirAll'd <root>/../etc as root (RED)
-//	layer contradicting its manifest descriptor → committed via Pull (RED)
+//	correct bytes                             → commit under their digest
+//	digest-mismatched bytes                   → rejected, nothing committed
+//	short stream                              → rejected, nothing committed
+//	oversized stream                          → rejected at the cap
+//	"../../etc:passwd"                        → rejected with no side effect
+//	layer contradicting its manifest descriptor → rejected out of Pull
 //	cache hit / regular-file cache hit        → see each row
 func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 	t.Run("commits correct bytes", func(t *testing.T) {
@@ -437,7 +437,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// F1: os.Stat FOLLOWS symlinks, so a bare Stat+IsRegular would accept a
+	// os.Stat FOLLOWS symlinks, so a bare Stat+IsRegular would accept a
 	// symlink→regular as a cached blob — suppressing verification forever for that
 	// digest and pointing every downstream reader (materialize, the
 	// unpacker) at bytes outside the cache root, as root. Lstat is what makes the
@@ -480,7 +480,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// F2: size 0 is a real cap (the empty blob), not "no cap" — only the explicit
+	// size 0 is a real cap (the empty blob), not "no cap" — only the explicit
 	// SizeUnknown sentinel opts out. A `size > 0` guard would silently disable the
 	// cap for any descriptor declaring zero.
 	t.Run("size 0 caps rather than disabling the guard", func(t *testing.T) {
@@ -498,7 +498,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// F8: a fill that DISCARDS its write error must not let an oversized input be
+	// a fill that DISCARDS its write error must not let an oversized input be
 	// relabelled as a poisoned blob — the two imply different remediations.
 	t.Run("an oversized stream stays ErrBlobTooLarge even if fill swallows the error", func(t *testing.T) {
 		c, _ := deepCache(t)
@@ -571,7 +571,7 @@ func TestWriteBlobRejectsDigestMismatch(t *testing.T) {
 		}
 	})
 
-	// F3: a self-contradictory manifest is not a poisoned blob — no blob was
+	// a self-contradictory manifest is not a poisoned blob — no blob was
 	// hashed, so ErrDigestMismatch's message would be false. The two sentinels stay
 	// distinguishable because the remediations differ: reject the source vs
 	// quarantine the blob.

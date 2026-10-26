@@ -144,8 +144,9 @@ func startRealGuestAgent(t *testing.T, podID string, deps guestagent.Deps) Guest
 // TestGuestAgentServesTheHostRoutes is the gate, and it exists to retire a
 // standing caveat rather than to add coverage.
 //
-// pkg/runtime's vm routes — execGuest, getLogsGuest, vmPodStats — shipped earlier and guest_test.go says outright that they are exercised "against
-// in-process FAKE agents": nothing anywhere answered guest/v1, so the far end of
+// pkg/runtime's vm routes (execGuest, attachGuest, followGuestContainerLog,
+// vmPodStats) were first exercised only against in-process fake agents
+// (guest_test.go): nothing anywhere answered guest/v1, so the far end of
 // every one of those routes was a test double written to satisfy the near end.
 // A contract asserted only against a fake of itself is not asserted.
 //
