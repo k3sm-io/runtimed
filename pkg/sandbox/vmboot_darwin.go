@@ -170,7 +170,7 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 //	Failed to issue Fuse sandbox extension."
 //
 // — a confined process cannot issue the virtiofs sandbox extension VZ needs for
-// a shared directory, which is exactly the device surface the S1(5) spike
+// a shared directory, which is exactly the device surface the earlier spike
 // disclaimed when it showed SBPL and VZ coexisting for a share-less guest.
 //
 // residual, recorded rather than papered over: the helper is the one k3sm binary

@@ -147,8 +147,7 @@ func quietLogger() *slog.Logger {
 
 // TestLifecycleStateMachine is the lifecycle gate. It drives the New -> Starting
 // -> Running -> Stopping -> Stopped|Failed machine through every transition and
-// pins the shutdown order, which is the property the whole design turns on
-// (the M11 plan's Resolution 5).
+// pins the shutdown order, which is the property the whole design turns on.
 //
 // every assertion is a t.Run subtest of this one function on purpose: the gate runs
 // `go test -run '^TestLifecycleStateMachine$'`, so a sibling top-level Test* would

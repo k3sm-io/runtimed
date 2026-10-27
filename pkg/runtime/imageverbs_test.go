@@ -46,8 +46,9 @@ func hexOf(name string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// loadFixture ingests a small OCI-layout image over the wire and returns the
-// archive's digests. Going through LoadImage rather than writing the index
+// loadFixture ingests a small OCI-layout image through the daemon's own
+// image.Loader (see sendArchive; LoadImage is no longer served) and returns the
+// archive's digests. Going through the loader rather than writing the index
 // directly is what makes these rows about the SHIPPED store: an entry a test
 // hand-wrote would prove the verbs agree with the test, not with the ingest.
 func loadFixture(t *testing.T, rt *Runtime, ref string) (manifestDigest, configDigest, layerDigest string) {

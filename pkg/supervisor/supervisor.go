@@ -77,8 +77,10 @@ type SpawnSpec struct {
 	// ExecSyncFD is the write end of the exec-sync pipe, dup2'd onto the
 	// child's fd ExecSyncChildFD (0 = none). The exec-shim marks that
 	// descriptor close-on-exec (LaunchPayload.ExecSync), so the parent's read end sees
-	// EOF at the moment the shim execs the pod binary, or when it exits. It is
-	// set by Process.ObserveExec, never by a caller.
+	// EOF at the moment the shim execs the pod binary, or when it exits. The spawn
+	// path sets it when an observer is registered (Process.ObserveExec); the one
+	// caller that sets it itself is ShimSpec.ContainerSpawn, which relays the
+	// serve-mode shim's inherited exec-sync descriptor to the container.
 	ExecSyncFD uintptr
 }
 

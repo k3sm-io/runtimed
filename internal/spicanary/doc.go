@@ -22,17 +22,19 @@ limitations under the License.
 // the userspace-resource SPI the memory subsystem links. The covered set:
 //
 //   - libsandbox:  sandbox_compile_string / sandbox_apply / sandbox_free_error /
-//     sandbox_free_profile                                                       (Seatbelt)
+//     sandbox_free_profile / sandbox_check                                       (Seatbelt)
 //   - SBPL grammar: the per-pod POSIX semaphore grant (sandbox.PosixSemStanza)    must compile
 //   - libSystem:   proc_pid_rusage                                               (ri_phys_footprint sampler), PUBLIC but load-bearing
 //   - libSystem:   memorystatus_control                                          (jetsam probe), PRIVATE/deprecated SPI
 //   - libSystem:   posix_spawnattr_setpcontrol_np                                (pod pressure-kill mark), PRIVATE SPI
 //   - libSystem:   csops                                                         (restricted-process detection), PRIVATE SPI
+//   - libsystem_kernel: open$NOCANCEL / openat$NOCANCEL                           (path shim interposer targets), non-public exports, checked by name through dlsym
 //   - libc:        clonefile / clonefileat                                       (APFS CoW)      — covered via golang.org/x/sys/unix.Clonefile
 //
-// The two resource symbols resolve from libSystem (no extra -l flag); proc_pid_rusage is a
+// The resource symbols resolve from libSystem (no extra -l flag); proc_pid_rusage is a
 // public <libproc.h> export but is canaried because the whole OOMKilled + Summary path
-// depends on it staying linkable, and memorystatus_control has NO public header at all.
+// depends on it staying linkable, and memorystatus_control and
+// posix_spawnattr_setpcontrol_np have NO public SDK declaration at all.
 // Note Virtualization.framework (the vm sandbox backend) is a PUBLIC framework and is explicitly
 // not a canary case — do not add VZ symbols here.
 //
@@ -43,8 +45,10 @@ limitations under the License.
 //
 // canary_darwin.go (cgo) takes the address of each symbol so the package fails to LINK if one
 // vanishes; TestSymbolsResolve (libsandbox), TestResourceSymbolsResolve (the resource SPI) and
-// TestCodeSignSymbolsResolve (csops) run from the standard go-test gate, the workspace
-// hack/ci.sh, and the macOS CI on every OS beta. TestResourceSymbolsWantList additionally names
-// each resource symbol through dlsym, so a missing one is reported by name. The canary sits
+// TestCodeSignSymbolsResolve (csops) run in the standard go-test gate (hack/ci.sh), so
+// running the tests on a new macOS release is what catches a removed symbol.
+// TestResourceSymbolsWantList additionally names each resource symbol through dlsym, so a
+// missing one is reported by name, and TestPathShimNocancelSymbolsWantList names the path
+// shim's two NOCANCEL targets the same way. The canary sits
 // beside the swappable sandbox.Backend so the "engine is replaceable" mitigation stays concrete.
 package spicanary

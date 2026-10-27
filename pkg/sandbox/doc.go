@@ -46,7 +46,9 @@ limitations under the License.
 //     hardware). The backend is OS-version-gated and FAILS closed:
 //     if unavailable it refuses to start the pod rather than running unconfined.
 //
-// The cgo libsandbox SPI (sandbox_compile_string / sandbox_apply) is private and
-// deprecated; it is isolated in execshim_darwin.go behind this package and a
-// CI symbol-canary (internal/spicanary), per the standards.
+// The cgo libsandbox SPI is private and deprecated. sandbox_compile_string /
+// sandbox_apply are called by the exec-shim (internal/execshim/execshim_darwin.go);
+// this package only compiles, never applies, through the same SPI resolved by
+// dlsym in posixsem_darwin.go (the semaphore grammar probe). A CI symbol-canary
+// (internal/spicanary) links every symbol, per the standards.
 package sandbox

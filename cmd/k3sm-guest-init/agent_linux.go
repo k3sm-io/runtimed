@@ -86,8 +86,8 @@ func (g *guestStatus) setReady(rosetta bool) {
 // this again.
 //
 // no RENEWAL LOOP exists yet, and that ceiling is recorded rather than implied:
-// this is called exactly once, at boot. The S5 spike measured the lease stable
-// across restarts given the host's deterministic MAC, so a v0.1 guest that never
+// this is called exactly once, at boot. A measurement of the lease across restarts
+// found it stable given the host's deterministic MAC, so a guest that never
 // renews keeps its address for its own lifetime — but a lease whose duration
 // expires mid-life would not be re-acquired, and the host would keep dialing an
 // address the segment has reassigned.

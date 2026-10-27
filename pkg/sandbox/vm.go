@@ -160,8 +160,10 @@ type VMSpec struct {
 	// checks it; it is not yet forwarded into the GuestSpec, because the pinned
 	// guest init decodes the spec strictly and predates the field.
 	FQDN string
-	// FSGroup is the pod's fsGroup, honoured in the guest by idmapped mounts
-	// rather than a recursive chown (guest/v1 GuestSpec.fs_group). Zero means
+	// FSGroup is the pod's fsGroup as the guest spec carries it (guest/v1
+	// GuestSpec.fs_group). The runtime never stamps it: a vm pod that requests
+	// fsGroup is refused (errVMFsGroupUnsupported) because the host's virtiofs
+	// cannot supply the idmapped mount that would apply it. Zero means
 	// unset — the proto has no presence for it, so "unset" and "group 0" are
 	// the same wire value, exactly as pkg/runtime already reads run_as_user.
 	FSGroup int64
@@ -221,8 +223,9 @@ type VMSpec struct {
 // every Kubernetes indirection is already gone by the time a value lands here:
 // the argv is the four-quadrant merge of the pod spec against the image config
 // (pkg/image.MergeRunSpec), the environment is fully expanded "KEY=value"
-// entries, and the identity is numeric. The guest performs no merge and consults
-// no image config of its own, which is what lets it boot with no cluster access.
+// entries, and the identity is numeric, except for a non-numeric image USER, which
+// crosses as ImageUser for the guest to resolve against the container's own
+// rootfs. The guest performs no merge and needs no cluster access.
 type VMContainer struct {
 	// Name is the container name, unique within the pod. It is the selector
 	// Exec / Logs / Stats and the guest's ContainerEvents use.
@@ -301,16 +304,9 @@ type VMContainer struct {
 // libsandbox/memorystatus SPI symbol-canary case — internal/spicanary is
 // deliberately left unchanged by the vm backend's addition.
 //
-// LAB-GATED remainder (needs a VZ-capable, entitled Mac; tracked off CreateVM):
-//   - the live guest boot — a VZVirtualMachineConfiguration driven on a per-VM
-//     SERIAL dispatch queue (VZ's threading rule), behind an opaque handle, with
-//     the VZ-delegate→exit / SIGTERM→ACPI requestStop lifecycle;
-//   - the cmd/k3sm-vmhost helper-process lifecycle (VZ-delegate→exit,
-//     SIGTERM→requestStop);
-//   - the OCI-Linux-rootfs → bootable-root builder (digest-pinned tenant images;
-//     no codesign — the guest payload is a Linux rootfs, not arm64 Mach-O);
-//   - VM metering (the memory limit → memorySize; working set sourced from a guest
-//     agent, not proc_pid_rusage, which only sees the vmnet/host task).
+// The live boot, the k3sm-vmhost lifecycle, the rootfs materialization and the
+// guest-agent metering are implemented; the live boot is exercised by the lab
+// smoke test (vmbootsmoke_darwin_test.go in pkg/runtime).
 //
 // Construct it with NewVMBackend. The zero value is not usable.
 type VMBackend struct {
@@ -331,8 +327,8 @@ type VMBackend struct {
 	helperEntitledFn func(path string) bool
 
 	// artifacts resolves this node's pinned guest kernel + initramfs. nil BY
-	// DEFAULT, and CreateVM fails closed on nil: the production feeder is its
-	// own deliverable, and a backend that guessed a path would boot whatever
+	// DEFAULT, and CreateVM fails closed on nil: the daemon sets it from
+	// guestartifacts.Locator, and a backend that guessed a path would boot whatever
 	// happened to be on disk under a digest pin it never checked.
 	artifacts GuestArtifactLocator
 	// stateRoot is the runtime work-dir the orphan-record store lives under
@@ -398,8 +394,9 @@ type VMBackend struct {
 
 // VMBackendOption configures a VMBackend at construction.
 //
-// Options rather than a config struct because the shipped daemon sets exactly
-// one of them today (the state root) while a test sets five, and a struct would
+// Options rather than a config struct because the shipped daemon sets only a
+// few of them (the state root, the logger and the guest-artifact locator) while
+// tests set more, and a struct would
 // make every unset field a decision someone has to read past. They are also what
 // keeps NewVMBackend's existing zero-argument call sites compiling unchanged.
 type VMBackendOption func(*VMBackend)

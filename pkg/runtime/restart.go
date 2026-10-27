@@ -113,10 +113,9 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 			"restart %s/%s: %v", req.GetPodId(), oldCP.name, err), nil
 	}
 	if reaped {
-		// The replacement tails the SAME capture files from the persisted
-		// offset, so the old instance's final drain must finish first or both
-		// tails read the same bytes. It follows the reap promptly (a file tail
-		// has no inherited-pipe EOF to wait for); the bound is the backstop.
+		// The old instance's final drain must finish first, or its last output
+		// can be lost or duplicated in its log file. It follows the reap
+		// promptly; a grandchild holding the pipe is why the wait is bounded.
 		if !r.awaitLogsDrained(oldProc) {
 			r.log.Warn("old instance's log tail still running at restart; its last output may be lost or duplicated",
 				"pod", req.GetPodId(), "container", oldCP.name, "grace", r.drainGraceDuration())

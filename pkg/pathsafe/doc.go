@@ -26,9 +26,10 @@ limitations under the License.
 // or pod root with chroot semantics and refuses any resolution that leaves it.
 //
 // It is a package of its own, and deliberately a small one, because its callers
-// sit in two others that must not depend on each other: pkg/mount writes a vm
-// pod's share roots and credential content BEFORE pkg/sandbox boots the guest.
-// Homing the check in either would make one import the other — and pkg/sandbox
+// sit in packages that must not depend on each other: pkg/mount writes a vm
+// pod's share roots and credential content BEFORE pkg/sandbox boots the guest,
+// and pkg/guestinit, pkg/image and pkg/wasmhost resolve paths with it too.
+// Homing the check in any of them would make the others import it — and pkg/sandbox
 // carries cgo (Seatbelt, Metal, the darwin SPI shims), which has no business in
 // the volume renderer. So this package imports nothing but the standard library
 // and will keep that property: anything needing a k3sm type does not belong here.

@@ -359,11 +359,9 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// — runtimed never deletes one that holds output — so the node can still read a deleted pod's
 	// logs until its own GC removes the tree.
 	//
-	// The log tails read the containers' capture files under the pod dir and
-	// persist their offsets there, and they finish with a final drain after
-	// the reap — so wait for them (bounded) before the writers close and the
-	// dir goes, or a last batch is lost and a late offset write races the
-	// RemoveAll.
+	// The log pumps copy the containers' output into the CRI log files and
+	// finish with a final drain after the reap, so wait for them (bounded)
+	// before the writers close and the dir goes.
 	r.awaitLogTails(p)
 	r.closeContainerLogs(p)
 	if err := r.removePodDir(req.GetPodId()); err != nil {

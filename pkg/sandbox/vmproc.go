@@ -421,9 +421,9 @@ const VMStopAllBound = 45 * time.Second
 // helper's wait is divided out of what is left of it (exitStopWait).
 //
 // CONCURRENCY IS required, not AN OPTIMIZATION. Each helper's graceful stop can
-// spend most of that budget, so stopping serially blows it with two vm pods —
-// and launchd's answer to a blown timeout is SIGKILL of the daemon, which strands
-// exactly the helpers this sweep exists to stop. Fanning out makes the whole
+// spend most of that budget, so stopping serially blows it with two vm pods,
+// and every helper still running at the bound is SIGKILLed with its guest
+// mid-stop. Fanning out makes the whole
 // node's cost one budget rather than one per pod.
 //
 // Each helper is stopped with ITS own recorded grace, not a shared one: the

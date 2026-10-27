@@ -112,7 +112,7 @@ func TestRestartContainerReExecs(t *testing.T) {
 	w.release(1002)
 }
 
-// TestRestartContainerDuringDeleteKillsTheLateSpawn is the F3 teardown-completeness
+// TestRestartContainerDuringDeleteKillsTheLateSpawn is the teardown-completeness
 // gate for RestartContainer, the sibling of the StartContainer one
 // (TestDeletePodKillsASpawnThatLandsDuringTeardown).
 //

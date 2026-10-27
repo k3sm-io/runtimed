@@ -39,7 +39,7 @@ extern int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *, const int);
 
 // k3sm_spawn_addchdir is the posix_spawn file-action that gives the child its
 // own working directory before exec. DARWIN SPI DISCIPLINE, per
-// docs/GO-STANDARDS.md Â§Darwin/cgo: there is NO golang.org/x/sys/unix binding
+// docs/GO-STANDARDS.md §Darwin/cgo: there is NO golang.org/x/sys/unix binding
 // for a posix_spawn file action (unix exposes no posix_spawn at all), and the
 // Go-level alternative — fork+chdir+exec via os/exec — is exactly what this
 // supervisor rejected for pod spawns, because it gives up the single-kqueue
@@ -49,9 +49,9 @@ extern int posix_spawnattr_setpcontrol_np(posix_spawnattr_t *, const int);
 // two SPELLINGS, one MEANING, chosen by DEPLOYMENT TARGET so the build is
 // warning-free on either:
 //
-//   - posix_spawn_file_actions_addchdir     â the POSIX-standard name, new in
+//   - posix_spawn_file_actions_addchdir     — the POSIX-standard name, new in
 //     macOS 26.0. Not declared at all by an older SDK.
-//   - posix_spawn_file_actions_addchdir_np  â the Darwin/BSD extension it
+//   - posix_spawn_file_actions_addchdir_np  — the Darwin/BSD extension it
 //     replaced (macOS 10.15+), DEPRECATED as of macOS 26.0.
 //
 // The _np arm is the deprecated-SPI use the standards require documenting: it is
@@ -99,7 +99,7 @@ static int k3sm_spawn_keep_stream(posix_spawn_file_actions_t *fa, int src, int d
 // downstream can recover it from a merged pipe.
 //
 // A dir that cannot be chdir'd into FAILS the SPAWN with that chdir's errno
-// (ENOENT / ENOTDIR / EACCES) and no child survives it â posix_spawn evaluates
+// (ENOENT / ENOTDIR / EACCES) and no child survives it — posix_spawn evaluates
 // file actions in the kernel and reports the first failure to the caller. There
 // is no arm in which the child runs with the caller's cwd instead; the Go side
 // (planSpawn) refuses an unusable dir before it gets here, and this is the

@@ -53,7 +53,7 @@ import (
 // own VM (and, with a guessable neighbour path, ask the daemon to dial a socket a
 // neighbour planted). Keeping it under <Root>/run, which no generated profile
 // ever re-allows, makes "no pod SBPL allows any agent.sock" a property of the
-// LAYOUT rather than of every future profile edit. guestAgentSocketOutsidePodTree
+// LAYOUT rather than of every future profile edit. TestGuestAgentSocketIsRuntimedPrivate
 // (guest_test.go) pins it.
 const (
 	guestRunDirName      = "run"
@@ -683,8 +683,6 @@ func guestRestartUnsupported(podID, container string) *runtimev1.RestartContaine
 // never reports the replacement's start does not leave the container refused as
 // in flight. A restart that fails leaves no new log file behind unless output
 // reached it (settleGuestRestartLog), so refusals do not advance the numbering.
-//
-// The initramfs pin is unchanged; until the next guest publish the capability gate answers UNSUPPORTED.
 func (r *Runtime) restartGuest(ctx context.Context, p *pod, req *runtimev1.RestartContainerRequest) *runtimev1.RestartContainerResponse {
 	podID := p.box.GetPodId()
 	name, err := vmContainerName(p.box, req.GetContainer())

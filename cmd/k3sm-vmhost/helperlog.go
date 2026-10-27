@@ -28,9 +28,10 @@ import (
 // helperLog is the helper's own output file, kept under a size cap by the one
 // process that writes it.
 //
-// The daemon opens the file and hands it to the helper as fd 1 and fd 2; it
-// never truncates it, because a daemon may not be there (the helper outlives
-// it) and a reader that truncates races the writer. So the WRITER bounds it:
+// The daemon opens the file (truncated, with its old rotation removed, before
+// the helper exists) and hands it to the helper as fd 1 and fd 2. After the
+// spawn it never truncates it, because a daemon may not be there (the helper
+// outlives it) and a reader that truncates races the writer. So the WRITER bounds it:
 // before a write that would take the file past max, the file is renamed to
 // path.1 (replacing the previous rotation) and a fresh path is opened and
 // dup2'd onto every descriptor in fds, so later writes — this writer's and any

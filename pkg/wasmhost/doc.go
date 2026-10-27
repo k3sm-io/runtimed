@@ -19,8 +19,8 @@ limitations under the License.
 //
 // The contract: a wasm pod is a native pod whose process is the k3sm-wasmhost
 // helper. A caller builds a LaunchSpec against its own Bounds, writes it to a
-// daemon-owned file, and gives the helper exactly --spec=<path> and
-// --pod-dir=<dir> (HostArgs). The helper calls ParseArgs and ReadLaunchSpec,
+// daemon-owned file, and gives the helper --spec=<path>, --pod-dir=<dir>
+// and, when the daemon has a volume root, --volume-root=<dir> (HostArgs). The helper calls ParseArgs and ReadLaunchSpec,
 // then hands the Validated result to an Engine, which takes its directories
 // and its module through OpenPreopens. Neither the helper (cmd/k3sm-wasmhost)
 // nor the daemon start-path wiring that rewrites the container argv is built

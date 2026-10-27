@@ -69,9 +69,10 @@ import (
 // folded, which is what every re-attach reported before; that start is
 // persisted then, so the next restart keeps it.
 
-// ErrVMHelperUnadoptable reports a vm pod whose helper is still running its
-// guest but that this runtime may neither adopt nor stop: another runtime
-// holds the helper's record (sandbox.ErrVMHelperHeld). AttachPod returns it
+// ErrVMHelperUnadoptable reports a vm pod whose recorded helper is still running
+// its guest but is not owned by this runtime: another runtime holds the helper's
+// record (sandbox.ErrVMHelperHeld), or the startup sweep was deferred
+// (DeferVMSweep) and the helper was left running unadopted. AttachPod returns it
 // wrapped together with ErrNothingToAttach, and CreatePod refuses such a pod
 // with it, so the node never boots a second guest beside the live one.
 //

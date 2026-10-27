@@ -146,7 +146,8 @@ func (p LaunchPayload) PodExec(argv []string) (path string, execArgv, envp []str
 }
 
 // Getenv returns the value of name in the payload's environment, or "" when
-// it is unset (the last entry wins, as getenv does on a duplicate).
+// it is unset. On a duplicate the last entry wins (as os/exec's environment
+// dedup does); the pod's libc getenv would see the first.
 func (p LaunchPayload) Getenv(name string) string {
 	v := ""
 	for _, e := range p.Env {

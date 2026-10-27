@@ -138,7 +138,7 @@ const testExitWait = 30 * time.Millisecond
 // gatedWaiter is a controllable ExitWaiter: WaitExit announces that the reaper
 // has entered the wait (entered), then withholds the exit until the test
 // releases it — or reports ctx.Err() if the supervision context is cancelled
-// first, exactly as KqueueReaper.WaitExit does at its poll-loop ctx check. That
+// first, exactly as KqueueReaper.WaitExit does when its EVFILT_USER cancellation event fires. That
 // second arm is what makes the teardown race constructible: it is the path a
 // premature p.cancel() takes the process down, replacing a real SIGKILL status
 // with "context canceled".

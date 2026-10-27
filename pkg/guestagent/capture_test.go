@@ -162,8 +162,9 @@ func TestCaptureServesPerContainerOutput(t *testing.T) {
 }
 
 // TestCaptureSelectorAndBounds pins the two things a guest with no disk must get
-// right: honouring the selection the caller asked for, and truncating VISIBLY
-// rather than growing without limit.
+// right: honouring the selection the caller asked for, and bounding retention
+// without growing: the ring drops oldest-first, counts the drops (Ring.Dropped) and
+// writes no notice into the output.
 func TestCaptureSelectorAndBounds(t *testing.T) {
 	t.Run("tail-lines-counts-lines", func(t *testing.T) {
 		c := NewCapture(0, 0, 0)

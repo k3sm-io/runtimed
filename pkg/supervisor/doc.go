@@ -25,7 +25,7 @@ limitations under the License.
 //
 // A container's output must outlive this daemon, and a pipe whose read end is
 // here cannot: when the daemon dies the child's next write takes EPIPE. So a
-// pod container runs beside a RESIDENT SHIM (NewShimProcess, shim.go): the
+// pod container runs beside a RESIDENT SHIM (NewShimProcess, shimprocess.go; the connection side in shim.go): the
 // exec-shim helper stays alive as the pod group's leader and the container's
 // parent, holds the pipes, writes the CRI log, reaps the container and persists
 // its exit status, and serves shimv1.ContainerShim on a socket. A restarted

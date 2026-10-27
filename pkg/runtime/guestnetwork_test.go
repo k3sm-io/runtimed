@@ -144,10 +144,10 @@ func TestCreateVMPodUsesGuestNetworkerWhenPresent(t *testing.T) {
 	pn := &guestNetworkerNetwork{cfg: want, ok: true}
 	rt, vmb, _ := newGuestNetworkRuntime(t, pn)
 
-	// The lab-gated CreateVM stub fails the pod after recording the spec —
+	// The fake VM backend fails the boot by default after recording the spec —
 	// expected, and orthogonal to what is asserted here.
 	if _, _, err := rt.createPod(context.Background(), vmBackedBox(rt, "pod-guestnet-present")); err == nil {
-		t.Fatal("vm createPod should surface the lab-gated boot error")
+		t.Fatal("vm createPod should surface the fake backend's boot error")
 	}
 
 	n, spec := vmb.created()

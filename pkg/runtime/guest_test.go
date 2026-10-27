@@ -176,7 +176,7 @@ func (f *fakeGuestAgent) logsRequest() *runtimev1.GetLogsRequest {
 
 // startFakeGuestAgent serves agent on an in-process bufconn listener and returns
 // a GuestDialer reaching it plus an accessor for the addresses the daemon asked
-// to dial. The addresses are what pins the Resolution 7 socket invariant AT the
+// to dial. The addresses are what pins the runtimed-private socket invariant AT the
 // ROUTE (guestAgentSocket's own shape is pinned separately, below): the route
 // must ask for the runtimed-private path, never a pod-dir one.
 func startFakeGuestAgent(t *testing.T, agent guestv1.GuestAgentServer) (GuestDialer, func() []string) {
@@ -213,12 +213,10 @@ func startFakeGuestAgent(t *testing.T, agent guestv1.GuestAgentServer) (GuestDia
 // addVMPod registers a running vm-backend pod in rt's pod table.
 //
 // It builds the pod directly instead of going through CreatePod because the vm
-// pod ASSEMBLY is a different deliverable: createVMPod still fails at the
-// lab-gated CreateVM (sandbox.ErrVMBootNotImplemented), so no CreatePod call can
-// produce one yet — the machine builder (pkg/vmhost, cmd/k3sm-vmhost) exists, but
-// the runtime spine that spawns it is a later wave. What the route keys off — pod.backend == SANDBOX_BACKEND_VM, the
-// resolved backend createVMPod records when it assembles a running pod — is set
-// here exactly as that assembly will set it.
+// pod assembly needs a booted guest, which a unit test cannot have. What the
+// route keys off — pod.backend == SANDBOX_BACKEND_VM, the resolved backend
+// createVMPod records when it assembles a running pod — is set here exactly as
+// that assembly sets it.
 func addVMPod(t *testing.T, rt *Runtime, podID string, containers ...string) *pod {
 	t.Helper()
 	box := hostBinBox(rt, podID)

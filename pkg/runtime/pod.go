@@ -1008,7 +1008,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	}
 	// The agent socket is derived here, by the same function the daemon's own
 	// GuestDialer uses, and stamped onto the spec — so the socket the helper
-	// binds and the socket Exec/GetLogs dial are one string by construction. It
+	// binds and the socket Exec and the guest log follower dial are one string by construction. It
 	// lives outside the pod dir; see guestAgentSocket for why that is a layout
 	// property.
 	agentSocket, err := guestAgentSocket(r.cfg.Root, box.GetPodId())
@@ -1101,9 +1101,10 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// guest to resolve) and the share-plan tag its rootfs lower
 	// layer arrives under. The guest performs no merge and reads no image
 	// config, which is what lets it boot with no cluster access — see
-	// resolveVMContainers for what this pulls and the fail-closed refusals (a
-	// host-binary image, and a pod whose containers name more than one image,
-	// which the single pod-wide rootfs share cannot represent).
+	// resolveVMContainers for what this pulls, the fail-closed refusal of a
+	// host-binary image, and the logged ceiling for a pod whose containers name
+	// more than one image (only the first is materialized into the single
+	// pod-wide rootfs share).
 	//
 	// vmRootfs is handed down because the same pass MATERIALIZES the pod's image
 	// into it: the rootfs share the guest overlays is exported from that
@@ -1745,9 +1746,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			LogPath: logPath,
 			// The instance number and the restart count are ONE number: the
 			// file is named for the count, and a cold start recovers the count
-			// from the files (upstream's calcRestartCountByLogDir). A caller
-			// that owns the count — RestartContainer — overwrites this with the
-			// same value under its own lock.
+			// from the files (upstream's calcRestartCountByLogDir). RestartContainer
+			// passes the count it wants as the floor and asserts the stamped
+			// value agrees; it never overwrites it.
 			RestartCount: instance,
 			// The image's digested reference (<repository>@<digest>), empty on
 			// the two host-binary routes — see resolvedBinary.imageID.
@@ -1862,10 +1863,10 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	}
 
 	// Wait for the container's log pump to copy the dying child's combined output
-	// to EOF before snapshotting it below for the FallbackToLogsOnError
-	// termination message. The supervisor's pump drains the final bytes — the
+	// to EOF before the terminated status is published, so the CRI log file the node
+	// reads for the termination message holds the final lines. The supervisor's pump drains the final bytes — the
 	// panic / stack trace that is the most diagnostic part of a failure —
-	// independently of the kqueue reaper that just unblocked Wait; snapshotting
+	// independently of the kqueue reaper that just unblocked Wait; publishing
 	// straight away races the pump and intermittently loses those last lines.
 	// This drain-wait sits outside pod.mu so the lock order stays leaf-ward
 	// (pod.mu → the log writer's mu, never inverted).
@@ -1878,7 +1879,7 @@ func (r *Runtime) watchContainerExit(ctx context.Context, p *pod, cp *containerP
 	// context.WithoutCancel whose Done() never fires, so LogsDrained would be
 	// the only reachable arm. The terminated-status path must finalize
 	// regardless (else the pod shows Running while dead and restartPolicy never
-	// fires), so on the deadline we snapshot whatever the pump has buffered so
+	// fires), so on the deadline we publish with whatever the pump has written so
 	// far — a partial tail is still diagnostic.
 	drainTimer := time.NewTimer(r.drainGraceDuration())
 	defer drainTimer.Stop()
@@ -2989,11 +2990,10 @@ func pullPolicy(backend runtimev1.SandboxBackend) image.PlatformPolicy {
 // to the native rules, which would apply Mach-O semantics to a Linux image and
 // commit the result under a key claiming otherwise.
 //
-// Every live caller is still native: the vm spine resolves its containers
-// without materializing anything (composing the guest's rootfs lower layer out
-// of the pulled blobs is the rootfs-builder deliverable — see
-// resolveVMContainers), so the Linux dialect is exercised by tests until that
-// lands.
+// Both spines call it: the host-process spine from resolveBinary, and the vm
+// spine from resolveVMContainers, which materializes the pod's image into the
+// guest rootfs share under the Linux dialect (image.UnpackPolicyFor with the vm
+// backend).
 func unpackPolicy(backend runtimev1.SandboxBackend) (image.UnpackPolicy, error) {
 	return image.UnpackPolicyFor(backend)
 }

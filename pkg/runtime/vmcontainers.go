@@ -193,11 +193,10 @@ func vmRootfsShareTag(plan mount.SharePlan) (string, error) {
 // merge needs the image's own Entrypoint/Cmd/Env/WorkingDir/User, and a pull is
 // the only way to hold a verified config for them — and its blobs are recorded
 // as this pod's reachability roots before the pull lease is released, in that
-// order, exactly as the host-process spine does it. It is not materialized:
-// composing the guest's rootfs lower layer out of those blobs is the
-// rootfs-builder deliverable (see vmRootfsShareTag for the share-plan ceiling it
-// closes), and materializing every container's image into the one pod-wide
-// rootfs share would have them overwrite each other.
+// order, exactly as the host-process spine does it. Only the first
+// container's image, in start order, is materialized into the pod's single
+// rootfs share (see vmRootfsShareTag for the one-share ceiling); materializing
+// every container's image into that share would have them overwrite each other.
 //
 // none OF the HOST-PROCESS RESOLUTION HAPPENS. argv[0] is not resolved against a
 // host rootfs (resolveImageArgv0's containment check is about a path this daemon
