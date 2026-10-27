@@ -49,9 +49,9 @@ never talks to the control plane directly.
   micro-VM backend: composing a guest machine description, driving `k3sm-vmhost`, and bridging
   exec/log/stats calls to the in-guest agent.
 - **`supervisor`** — spawns and reaps native Pod processes. Each Pod is a process group:
-  containers are `posix_spawn`ed into their own session, logs are captured over a combined
-  stdout/stderr pipe, and `kqueue(EVFILT_PROC)` is the single reaper so process exit status is
-  never read twice.
+  containers are `posix_spawn`ed into their own session, stdout and stderr are captured over
+  separate pipes (the CRI log keeps the two labels apart), and `kqueue(EVFILT_PROC)` is the single
+  reaper so process exit status is never read twice.
 - **`volume`** — materializes APFS-backed persistent volumes for a Pod. Unlike `mount`, a
   persistent volume lives at a stable path outside the Pod's own directory tree and survives Pod
   restarts and deletion.
