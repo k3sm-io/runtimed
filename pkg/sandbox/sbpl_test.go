@@ -431,6 +431,10 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		// The pinned kernel + initramfs every vm pod boots. Corrupting the set
 		// fails the node's vm capability closed until an operator clears it.
 		"guest-artifacts",
+		// The retained consoles of failed vm boots: other pods' guest output,
+		// and a store the daemon prunes, so a pod must neither read nor plant
+		// files there.
+		"vmboot-failures",
 	}
 
 	// (0) The mesh private key's absolute home is denied even though this posture's

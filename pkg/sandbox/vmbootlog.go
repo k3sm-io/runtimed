@@ -40,7 +40,9 @@ import (
 // failed boot is a failed pod: the pod dir is removed with the pod, so the one
 // file that explains why the guest never answered was gone by the time anyone
 // looked. A copy under the work-dir outlives the pod and sits beside the other
-// runtime-private stores (vmreap, podreap).
+// runtime-private stores (vmreap, podreap). It is in DaemonTreeSubdirs, so no
+// pod profile can read another pod's guest output here or plant files the
+// prune would act on.
 const VMBootFailureSubdir = "vmboot-failures"
 
 // vmBootFailureKeep is how many retained failed-boot consoles are kept; older

@@ -48,7 +48,7 @@
 ;; extra path (even an ancestor work-dir grant) can't win.
 ;;   reap stores: podreap, vmreap
 ;;   daemon trees: server, agent, run, blobs, sbpl, index, operator,
-;;     unpacked, snapshots, ingest, guest-artifacts
+;;     unpacked, snapshots, ingest, guest-artifacts, vmboot-failures
 (deny file-read* file-write*
   (subpath "/Users"))
 (deny file-read* file-write*
@@ -87,6 +87,8 @@
   (subpath "/private/var/lib/k3sm/ingest")
   (subpath "/var/lib/k3sm/guest-artifacts")
   (subpath "/private/var/lib/k3sm/guest-artifacts")
+  (subpath "/var/lib/k3sm/vmboot-failures")
+  (subpath "/private/var/lib/k3sm/vmboot-failures")
   (subpath "/var/log/pods")
   (subpath "/private/var/log/pods")
   (subpath "/var/log/containers")
