@@ -47,10 +47,10 @@ import (
 // create is not competing with the last one's guest.
 //
 // A guest whose agent never answered is booted once more before CreateVM
-// fails (vmBootAttempts), and the console of every failed attempt is kept
-// under <stateRoot>/vmboot-failures, named in the error together with its last
-// lines (retainBootConsole), because the pod dir that holds the live console
-// goes away with the failed pod.
+// fails (vmBootAttempts). The console of every failed attempt is kept under
+// <stateRoot>/vmboot-failures, and the error names the last attempt's copy
+// together with its last lines (retainBootConsole), because the pod dir that
+// holds the live console goes away with the failed pod.
 func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	if err := validateVMSpec(spec); err != nil {
 		return err
