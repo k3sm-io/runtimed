@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/runtimed/pkg/image"
 )
@@ -214,4 +215,71 @@ func TestOwnershipKindsMatchTheHostSet(t *testing.T) {
 			t.Errorf("host kind %q != guest kind %q", host, guest)
 		}
 	}
+}
+
+// TestOwnershipStepReportsProgress pins the console cadence of the apply: one
+// line at the start, a progress line at most every OwnershipProgressInterval
+// of the injected clock, and one line at the end.
+func TestOwnershipStepReportsProgress(t *testing.T) {
+	entries := make([]image.OwnershipEntry, 10)
+	for i := range entries {
+		entries[i] = image.OwnershipEntry{Path: fmt.Sprintf("f%d", i), Type: image.OwnershipTypeFile}
+	}
+	src := jsonl(t, entries...)
+
+	run := func(step time.Duration) []string {
+		var lines []string
+		now := time.Unix(0, 0)
+		tgt := &clockTarget{recordingTarget: &recordingTarget{}, now: &now, step: step}
+		p := OwnershipProgress{
+			Now:    func() time.Time { return now },
+			Report: func(s string) { lines = append(lines, s) },
+		}
+		if _, err := ApplyOwnershipProgress(context.Background(), strings.NewReader(src), tgt, p); err != nil {
+			t.Fatal(err)
+		}
+		return lines
+	}
+
+	t.Run("slow walk", func(t *testing.T) {
+		lines := run(700 * time.Millisecond) // 7 s over 10 entries
+		if len(lines) < 3 {
+			t.Fatalf("want start, progress and end, got %q", lines)
+		}
+		if !strings.HasPrefix(lines[0], "ownership: start") {
+			t.Errorf("first line %q", lines[0])
+		}
+		if !strings.HasPrefix(lines[len(lines)-1], "ownership: done entries=10") {
+			t.Errorf("last line %q", lines[len(lines)-1])
+		}
+		progress := 0
+		for _, l := range lines[1 : len(lines)-1] {
+			if !strings.HasPrefix(l, "ownership: progress entries=") {
+				t.Errorf("middle line %q", l)
+			}
+			progress++
+		}
+		if progress < 1 || progress > 3 {
+			t.Errorf("progress lines = %d, want 1..3 for 7 s at a 2 s cadence", progress)
+		}
+	})
+
+	t.Run("fast walk", func(t *testing.T) {
+		lines := run(time.Millisecond)
+		if len(lines) != 2 {
+			t.Fatalf("want exactly start and end, got %q", lines)
+		}
+	})
+}
+
+// clockTarget advances a fake clock on every Open.
+type clockTarget struct {
+	*recordingTarget
+	now  *time.Time
+	step time.Duration
+}
+
+func (c *clockTarget) Open(rel string, kind OwnershipKind) (OwnershipNode, error) {
+	*c.now = c.now.Add(c.step)
+	return c.recordingTarget.Open(rel, kind)
 }

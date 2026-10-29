@@ -28,6 +28,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 )
 
 // the OWNERSHIP SIDECAR, guest half.
@@ -205,7 +206,48 @@ func (r OwnershipReport) Summary() string {
 // MaxOwnershipErrors, and the next line is applied. The returned error is only
 // a READ failure of r or ctx's cancellation; the report is valid either way.
 func ApplyOwnership(ctx context.Context, r io.Reader, target OwnershipTarget) (OwnershipReport, error) {
+	return ApplyOwnershipProgress(ctx, r, target, OwnershipProgress{})
+}
+
+// OwnershipProgressInterval is the longest the apply stays silent on the
+// console. The host's boot wait resets whenever the guest console grows, so a
+// large rootfs must keep printing or a slow apply reads as an idle guest.
+const OwnershipProgressInterval = 2 * time.Second
+
+// OwnershipProgress is where ApplyOwnershipProgress reports. The zero value
+// reports nothing.
+type OwnershipProgress struct {
+	// Label names what is being restored (the container and its root); it
+	// ends every line.
+	Label string
+	// Now is the clock; nil means time.Now. Tests inject a fake.
+	Now func() time.Time
+	// Report receives one console line: the start, a progress line at most
+	// every OwnershipProgressInterval, and the end. Nil disables reporting.
+	Report func(line string)
+}
+
+// ApplyOwnershipProgress is ApplyOwnership with console progress: a start
+// line, a line with the entries done so far at most every
+// OwnershipProgressInterval while it runs, and an end line with the entry
+// count and elapsed time. The apply itself is identical.
+func ApplyOwnershipProgress(ctx context.Context, r io.Reader, target OwnershipTarget, prog OwnershipProgress) (OwnershipReport, error) {
 	var rep OwnershipReport
+	now := prog.Now
+	if now == nil {
+		now = time.Now
+	}
+	say := func(format string, args ...any) {
+		if prog.Report != nil {
+			prog.Report(fmt.Sprintf(format, args...) + " " + prog.Label)
+		}
+	}
+	started := now()
+	lastSaid := started
+	say("ownership: start")
+	defer func() {
+		say("ownership: done entries=%d failed=%d elapsed=%s", rep.Applied+rep.Failed, rep.Failed, now().Sub(started).Round(time.Millisecond))
+	}()
 	br := bufio.NewReaderSize(r, maxOwnershipLine)
 	for line := 1; ; line++ {
 		if err := ctx.Err(); err != nil {
@@ -214,6 +256,10 @@ func ApplyOwnership(ctx context.Context, r io.Reader, target OwnershipTarget) (O
 		raw, overlong, err := readOwnershipLine(br)
 		if len(bytes.TrimSpace(raw)) > 0 || overlong {
 			applyOwnershipLine(line, raw, overlong, target, &rep)
+		}
+		if t := now(); t.Sub(lastSaid) >= OwnershipProgressInterval {
+			lastSaid = t
+			say("ownership: progress entries=%d", rep.Applied+rep.Failed)
 		}
 		if errors.Is(err, io.EOF) {
 			return rep, nil
