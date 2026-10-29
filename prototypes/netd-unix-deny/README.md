@@ -1,7 +1,7 @@
 # Prototype: Seatbelt AF_UNIX helper-socket deny
 
-A manual proof, not built or run by the test suite, kept so the barrier can be re-checked on a
-new macOS release.
+Historical prototype: a manual proof, not built or run by the test suite or any gate; kept so the
+barrier can be re-checked on a new macOS release.
 
 Integration-tier proof of the runtimed **AF_UNIX barrier**: a pod confined by a generated SBPL profile **cannot
 `connect()`** to a denied AF_UNIX socket path — the explicit

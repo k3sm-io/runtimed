@@ -9,9 +9,10 @@ process** at its real host paths, confined by a generated Seatbelt (sandbox) pro
 a Linux-style mount namespace. It pulls OCI images, unpacks them with APFS `clonefile`
 copy-on-write, ad-hoc signs the resulting binaries so they pass Apple's code-signing checks, and
 supervises each Pod's processes with `posix_spawn` and `kqueue`. For Pods that need an actual
-Linux environment, `runtimed` also hosts a per-Pod Linux micro-VM on top of the Virtualization
-framework; that path is experimental and is described below. A `wasm` RuntimeClass seam exists in
-`pkg/wasmhost`; its host helper is not built yet.
+Linux environment, `runtimed` also hosts a per-Pod Linux micro-VM (the `vm` RuntimeClass, for
+`linux/arm64` images) on top of the Virtualization framework, described below. A `wasm`
+RuntimeClass seam exists in `pkg/wasmhost`; the `k3sm-wasmhost` helper binary is not in this
+repository, so nothing here runs WebAssembly.
 
 ## Where this repo sits
 
@@ -92,8 +93,7 @@ never talks to the control plane directly.
   and runs a single Pod's Linux micro-VM and is spawned by the daemon as a separate,
   narrowly-scoped process rather than linked into it.
 - **`k3sm-guest-init`** — PID 1 inside the micro-VM guest, built for Linux. It is a thin executor
-  over the plans `pkg/guestinit` produces; almost none of its own logic is guest-boot policy.
-
+  over the plans `pkg/guestinit` produces; the boot policy lives there.
 - **`guest-initramfs`** — composes the micro-VM guest's initramfs from a cross-compiled
   `k3sm-guest-init` binary.
 
@@ -116,8 +116,8 @@ declares. This gives strong filesystem and network confinement, but it does not 
 kernel level the way Linux containers do: **there is no per-Pod uid isolation**, and processes
 running under different Pods' profiles still share the same kernel. Workloads that need stronger
 isolation, or that need an actual Linux environment, run instead in the per-Pod Linux micro-VM
-backend described above. That backend is **experimental**: it is functional, but it has not yet
-had the same production hardening as the native process path.
+backend described above. It is a separate kernel per Pod, so it is the isolation to use for
+untrusted tenancy.
 
 ## Building and testing
 
