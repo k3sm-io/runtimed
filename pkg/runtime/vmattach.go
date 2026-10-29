@@ -59,6 +59,12 @@ import (
 // absent), and the container ids, which the replayed starts mint afresh because
 // the fold stamps them with host time.
 //
+// The image ID IS rebuilt, from the LOCAL image index only (localVMImageID): the
+// container's reference is resolved as a never-pull would resolve it, so no
+// registry is contacted, and the digested reference is the one the create-time
+// pull published. An image the index no longer holds leaves the ID empty; the
+// attach does not fail over a status field.
+//
 // The container START is rebuilt, from the vm backend's persisted starts
 // (vmContainerStartStore): each container's entry is seeded with the start and
 // guest pid of the run its predecessor folded, and the replay of that same run
@@ -185,6 +191,7 @@ func (r *Runtime) attachVMPod(ctx context.Context, box *runtimev1.PodBox) (*runt
 		path := filepath.Join(logDir, containerLogFile(instance))
 		st := p.guestContainerLocked(name, c.spec.GetImage())
 		st.RestartCount = instance
+		st.ImageId = r.localVMImageID(ctx, podID, name, c.spec.GetImage())
 		p.guestAwaitingReplay[name] = true
 		if s, ok := starts[name]; ok && s.StartUnixNano != 0 {
 			// The run the previous daemon folded. It is held beside the entry,
@@ -244,6 +251,34 @@ func (r *Runtime) attachVMPod(ctx context.Context, box *runtimev1.PodBox) (*runt
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_ADDED, st)
 	return st, nil
+}
+
+// localVMImageID returns the image_id a re-attached vm container publishes:
+// repoDigestImageID over ref resolved against this node's LOCAL image index, or
+// empty when the index cannot answer. It pulls under IMAGE_PULL_POLICY_NEVER,
+// which the puller answers from its index without a registry round trip (and
+// without credentials, which a presence check does not need), so a daemon
+// restart never turns into image traffic. The lease the answer comes back
+// holding is released at once: the pod's own image record, written when the pod
+// was created, is what keeps the blobs reachable, and nothing is recorded here.
+//
+// Every failure, an image the index no longer holds included, is an empty ID
+// and a debug line, never an attach failure: the guest is running regardless,
+// and an empty image_id is the visible degradation repoDigestImageID documents.
+func (r *Runtime) localVMImageID(ctx context.Context, podID, name, ref string) string {
+	if ref == "" {
+		return ""
+	}
+	res, err := r.puller.Pull(ctx, ref, nil,
+		pullPolicy(runtimev1.SandboxBackend_SANDBOX_BACKEND_VM),
+		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER)
+	if err != nil {
+		r.log.Debug("re-attached vm container reports no image id: its image is not in the local index",
+			"pod", podID, "container", name, "image", ref, "err", err)
+		return ""
+	}
+	res.Lease.Release()
+	return repoDigestImageID(ref, res)
 }
 
 // lastCRILogStamp returns the timestamp of the last complete line in a CRI log
