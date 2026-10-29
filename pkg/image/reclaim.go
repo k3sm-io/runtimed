@@ -366,9 +366,9 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	if err != nil {
 		return nil, err
 	}
-	if len(skipped) > 0 {
+	if fresh := c.newlySkipped(skipped); len(fresh) > 0 {
 		log.Warn("image gc skipped pod dirs with no reachability record that no live pod owns",
-			"pods", skipped)
+			"pods", fresh)
 	}
 	leased := make([]string, 0)
 	for d := range c.leasedDigests() {
@@ -473,4 +473,26 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 			"deleted", exec.Deleted, "trees_deleted", treeExec.Deleted)
 	}
 	return rep, nil
+}
+
+// newlySkipped returns the pod dirs in skipped that the previous pass did not
+// also skip, and remembers skipped as the reported set. A record-less dir the
+// daemon proves untracked stays on disk until something removes it, so every
+// pass skips it again; naming it once per pod id keeps the warning about a new
+// leftover from drowning in the same list every interval. Replacing the set
+// (rather than adding to it) bounds it by the dirs on disk now, and a dir that
+// leaves and later returns is reported again.
+func (c *Cache) newlySkipped(skipped []string) []string {
+	c.skipMu.Lock()
+	defer c.skipMu.Unlock()
+	var fresh []string
+	next := make(map[string]struct{}, len(skipped))
+	for _, name := range skipped {
+		if _, seen := c.skipReported[name]; !seen {
+			fresh = append(fresh, name)
+		}
+		next[name] = struct{}{}
+	}
+	c.skipReported = next
+	return fresh
 }

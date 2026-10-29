@@ -65,6 +65,11 @@ type Cache struct {
 	// writes only its own file.
 	operatorMu sync.Mutex
 
+	// skipMu guards skipReported: the record-less pod dirs the last reclaim pass
+	// skipped and has already named in its warning (newlySkipped).
+	skipMu       sync.Mutex
+	skipReported map[string]struct{}
+
 	// now is the clock every time-dependent decision in this package reads. It
 	// is a field, not a call to time.Now, so the lease TTL and the reclaim grace
 	// window are testable without sleeping.
