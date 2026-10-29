@@ -79,6 +79,7 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 			// pkg/sandbox's own.
 			sandbox.PodReapSubdir,
 			sandbox.VMReapSubdir,
+			sandbox.VMBootFailureSubdir,
 			sandbox.ServerSubdir,
 			sandbox.AgentSubdir,
 			sandbox.RunSubdir,

@@ -87,8 +87,9 @@ func ReapStoreSubdirs() []string {
 // control-plane trees, in deny order: the control-plane state (server), the
 // node-agent state (agent), the daemon sockets + mesh key (run), the
 // content-addressed blob store (blobs), the per-pod SBPL staging dir (sbpl), the
-// five image-store siblings (index, operator, unpacked, snapshots, ingest) and
-// the guest-artifact cache (guest-artifacts).
+// five image-store siblings (index, operator, unpacked, snapshots, ingest), the
+// guest-artifact cache (guest-artifacts) and the retained consoles of failed vm
+// boots (vmboot-failures), which hold other pods' guest output.
 //
 // The returned slice is freshly allocated, so a caller cannot mutate the
 // deny-set by holding on to it.
@@ -105,5 +106,6 @@ func DaemonTreeSubdirs() []string {
 		ImageSnapshotsSubdir,
 		ImageIngestSubdir,
 		GuestArtifactsSubdir,
+		VMBootFailureSubdir,
 	}
 }
