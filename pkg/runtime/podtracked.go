@@ -17,10 +17,6 @@ limitations under the License.
 package runtime
 
 import (
-	"errors"
-	"io/fs"
-	"os"
-
 	"k3sm.io/runtimed/pkg/image"
 )
 
@@ -44,7 +40,8 @@ func (r *Runtime) endCreatingLocked(podID string) {
 //   - a CreatePod in flight is building the dir and has not written the
 //     record yet;
 //   - a durable process record under the pod-reap store names a process group
-//     a previous run left, and a reap-store read error is a doubt;
+//     a previous run left, and a reap-store read error is a doubt (a reap
+//     directory with no record file in it is not a record);
 //   - a vm host helper that still runs for the pod, unadopted, holds a guest.
 func (r *Runtime) podUntracked(id image.PodID) bool {
 	podID := id.String()
@@ -56,11 +53,7 @@ func (r *Runtime) podUntracked(id image.PodID) bool {
 	if !reaped || live || inFlight {
 		return false
 	}
-	dir, err := r.podReapDir(podID)
-	if err != nil {
-		return false
-	}
-	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+	if has, ok := r.podHasReapRecord(podID); !ok || has {
 		return false
 	}
 	if pr, ok := r.vmBackend.(unadoptedHelperProber); ok {

@@ -434,6 +434,13 @@ type Runtime struct {
 	podReapOnce sync.Once
 	podReapErr  error
 
+	// reapStoreMu serializes every write and removal under the pod-reap store
+	// (<root>/podreap/<pod>/), so a pod's directory can be removed with its last
+	// record without racing a writer that has created the directory and not
+	// yet committed its file. It is a leaf lock: nothing else is acquired while
+	// it is held.
+	reapStoreMu sync.Mutex
+
 	// fingerprint identifies the build of this daemon (runtimeFingerprint). It
 	// is written into every podreap record and AttachPod adopts only records
 	// carrying the same value. Immutable after New.
