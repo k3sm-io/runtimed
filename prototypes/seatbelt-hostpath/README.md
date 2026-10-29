@@ -1,7 +1,7 @@
 # Prototype: Seatbelt host-path confinement (no chroot)
 
-A validation prototype from the first runtime design, kept as the reference for the default-deny
-profile `pkg/sandbox` now generates.
+Historical prototype, superseded by the profile generator in `pkg/sandbox`; kept as the record of
+the result below, not run by any gate.
 
 Validates the core k3sm runtime assumption ([DESIGN.md §5a](https://github.com/k3sm-io/k3sm/blob/main/docs/DESIGN.md)):
 a native Mach-O process runs **at its real host path** under a **default-deny Seatbelt
