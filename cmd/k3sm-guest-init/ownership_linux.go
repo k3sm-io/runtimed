@@ -71,7 +71,10 @@ func applyOwnership(ctx context.Context, log *slog.Logger, container string, st 
 	}
 	defer func() { _ = unix.Close(rootFD) }()
 
-	rep, err := guestinit.ApplyOwnership(ctx, f, ownershipRoot{fd: rootFD})
+	rep, err := guestinit.ApplyOwnershipProgress(ctx, f, ownershipRoot{fd: rootFD}, guestinit.OwnershipProgress{
+		Label:  "container=" + container + " root=" + st.Root,
+		Report: func(line string) { log.Info(line) },
+	})
 	switch {
 	case err != nil:
 		log.Warn("ownership apply stopped early", "container", container,
