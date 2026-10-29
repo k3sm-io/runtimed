@@ -79,6 +79,7 @@ type imageWorld struct {
 	mu           sync.Mutex
 	pulled       []string
 	policies     []image.PlatformPolicy
+	pullPolicies []runtimev1.ImagePullPolicy
 	materialized int
 }
 
@@ -124,16 +125,22 @@ func (w *imageWorld) takes(ref string, d time.Duration) *imageWorld {
 	return w
 }
 
-func (w *imageWorld) Pull(_ context.Context, ref string, _ *image.RegistryCredential, policy image.PlatformPolicy, _ runtimev1.ImagePullPolicy) (*image.PullResult, error) {
+func (w *imageWorld) Pull(_ context.Context, ref string, _ *image.RegistryCredential, policy image.PlatformPolicy, pull runtimev1.ImagePullPolicy) (*image.PullResult, error) {
 	w.mu.Lock()
 	w.pulled = append(w.pulled, ref)
 	w.policies = append(w.policies, policy)
+	w.pullPolicies = append(w.pullPolicies, pull)
 	w.mu.Unlock()
 	if err, ok := w.errs[ref]; ok {
 		return nil, err
 	}
 	if _, ok := w.cfgs[ref]; !ok {
 		return nil, fmt.Errorf("no image %q in this world", ref)
+	}
+	// Never answers from the local index alone, as image.Puller does: a
+	// reference the index does not hold is ErrImageNotPresent, not a fetch.
+	if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER && !w.indexHits[ref] {
+		return nil, fmt.Errorf("image %q: %w", ref, image.ErrImageNotPresent)
 	}
 	if d := w.delays[ref]; d > 0 {
 		time.Sleep(d)
@@ -845,6 +852,84 @@ func TestVMContainerStatusCarriesImageID(t *testing.T) {
 			}
 			if pulled := mains[0].GetImagePull().GetPulled(); pulled == tc.fromIndex {
 				t.Errorf("image_pull.pulled = %v, want %v: the identity must ride beside the outcome, not replace it", pulled, !tc.fromIndex)
+			}
+		})
+	}
+}
+
+// TestVMReattachRecomputesImageIDLocally pins image_id across a daemon restart:
+// a vm pod the next daemon re-attaches (attachVMPod) has no plan, so the ID is
+// recomputed from the LOCAL image index, under the never-pull policy, so the
+// restart contacts no registry. An image the index no longer holds, or an index
+// that cannot answer, leaves the ID empty and the attach succeeds anyway. The
+// image_pull outcome stays absent on every row: no pull happened in this
+// daemon's life, and a presence check must not be reported as one.
+func TestVMReattachRecomputesImageIDLocally(t *testing.T) {
+	const (
+		ref        = "docker.io/library/alpine:3" // vmPodBox's one container
+		descDigest = "sha256:" + "6666666666666666666666666666666666666666666666666666666666666666"
+	)
+	wantID, ok := image.RepoDigest(ref, descDigest)
+	if !ok {
+		t.Fatalf("fixture: image.RepoDigest(%q, %q) is not a digested reference", ref, descDigest)
+	}
+	cases := []struct {
+		name   string
+		world  func() *imageWorld
+		wantID string
+	}{
+		{name: "an image still in the local index keeps its id", wantID: wantID,
+			world: func() *imageWorld {
+				return newImageWorld(map[string]image.ImageRunConfig{ref: {}}).
+					servesFromIndex(ref).digested(ref, descDigest, "")
+			}},
+		{name: "an image gone from the local index leaves the id empty",
+			world: func() *imageWorld {
+				return newImageWorld(map[string]image.ImageRunConfig{ref: {}}).digested(ref, descDigest, "")
+			}},
+		{name: "an index that cannot answer leaves the id empty",
+			world: func() *imageWorld {
+				return newImageWorld(map[string]image.ImageRunConfig{ref: {}}).
+					failsWith(ref, errors.New("index unreadable"))
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.world()
+			rt := newTestRuntime(t, Deps{
+				VMBackend: &fakeVMBackend{available: true, bootOK: true},
+				Network:   &guestNetworkerNetwork{cfg: testGuestNetwork(), ok: true},
+				Resolver:  fakeResolver{},
+				Puller:    w,
+				Unpacker:  w,
+			})
+			const podID = "pod-vm-reattach-imageid"
+			if _, err := rt.AttachPod(context.Background(), vmPodBox(rt, podID, 0)); err != nil {
+				t.Fatalf("AttachPod: %v (an image id must never fail the attach)", err)
+			}
+			p, ok := rt.lookupPod(podID)
+			if !ok {
+				t.Fatal("the attached vm pod is not registered")
+			}
+			replayStarted(rt, p, 7)
+
+			mains := rt.podStatus(p).GetContainerStatuses()
+			if len(mains) != 1 {
+				t.Fatalf("got %d container statuses, want 1", len(mains))
+			}
+			if got := mains[0].GetImageId(); got != tc.wantID {
+				t.Errorf("image_id = %q, want %q", got, tc.wantID)
+			}
+			if ip := mains[0].GetImagePull(); ip != nil {
+				t.Errorf("image_pull = %v, want absent: a re-attach pulled nothing", ip)
+			}
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			if len(w.pullPolicies) != 1 {
+				t.Fatalf("the re-attach resolved the image %d times, want once", len(w.pullPolicies))
+			}
+			if got := w.pullPolicies[0]; got != runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
+				t.Errorf("the re-attach resolved under %v, want IMAGE_PULL_POLICY_NEVER: a restart must not fetch", got)
 			}
 		})
 	}
