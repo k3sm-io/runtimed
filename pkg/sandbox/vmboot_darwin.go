@@ -45,6 +45,12 @@ import (
 // before returning, so a CreateVM that reports an error leaves no machine
 // running and no handle registered. The caller may retry, and the pod's next
 // create is not competing with the last one's guest.
+//
+// A guest whose agent never answered is booted once more before CreateVM
+// fails (vmBootAttempts), and the console of every failed attempt is kept
+// under <stateRoot>/vmboot-failures, named in the error together with its last
+// lines (retainBootConsole), because the pod dir that holds the live console
+// goes away with the failed pod.
 func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 	if err := validateVMSpec(spec); err != nil {
 		return err
@@ -115,27 +121,40 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 		return fail(VMBootHelperNotFound, "", err)
 	}
 
-	vp, err := b.spawnVMHost(ctx, spec, helper, specPath, consolePath)
-	if err != nil {
-		return fail(VMBootSpawnFailed, "", err)
-	}
-
-	if err := b.awaitGuestReady(ctx, vp); err != nil {
-		// Every non-ready outcome kills the helper before reporting: a helper
-		// left running would hold a VM for a pod the caller is about to be told
-		// does not exist. The helper's output is read first: the stop removes
-		// the run dir the output file lives in.
-		output := vp.helperOutput()
-		b.hardStop(vp)
+	// Boot, and boot once more when (only when) the guest agent never
+	// answered. Each attempt that fails after the spawn is torn down whole
+	// (hardStop) before the next one starts or the failure returns, so a retry
+	// never runs beside the attempt it replaces; and each attempt's console is
+	// copied out of the pod dir first, because the next attempt's helper
+	// truncates it and the pod's cleanup removes it.
+	var vp *vmProc
+	for attempt := 1; ; attempt++ {
 		var bootErr *VMBootError
-		if errors.As(err, &bootErr) {
-			bootErr.ConsolePath = consolePath
-			b.logger().Error("vm pod boot failed",
-				"pod", spec.PodID, "cause", string(bootErr.Cause), "console", consolePath,
-				"err", bootErr.Err, "helper_output", bootErr.Detail)
+		vp, bootErr = b.bootOnce(ctx, spec, helper, specPath, consolePath)
+		if bootErr == nil {
+			break
+		}
+		bootErr.ConsolePath = consolePath
+		bootErr.Attempts = attempt
+		// A spawn failure ran no helper, so there is no console to keep.
+		if bootErr.Cause != VMBootSpawnFailed {
+			retained, data, rerr := retainBootConsole(b.stateRoot, spec.PodID, consolePath, attempt, time.Now())
+			if rerr != nil {
+				b.logger().Warn("could not keep the console of a failed vm boot",
+					"pod", spec.PodID, "console", consolePath, "err", rerr)
+			}
+			bootErr.RetainedConsole = retained
+			bootErr.ConsoleTail = consoleExcerpt(data)
+		}
+		b.logger().Error("vm pod boot failed",
+			"pod", spec.PodID, "cause", string(bootErr.Cause), "attempt", attempt,
+			"console", consolePath, "console_kept", bootErr.RetainedConsole,
+			"err", bootErr.Err, "console_tail", bootErr.ConsoleTail, "helper_output", bootErr.Detail)
+		if bootErr.Cause != VMBootAgentNeverReady || attempt >= vmBootAttempts || ctx.Err() != nil {
 			return bootErr
 		}
-		return fail(VMBootAgentNeverReady, output, err)
+		b.logger().Warn("retrying the boot of a vm pod whose guest agent never answered",
+			"pod", spec.PodID, "next_attempt", attempt+1, "of", vmBootAttempts)
 	}
 
 	b.mu.Lock()
@@ -291,19 +310,62 @@ func (b *VMBackend) spawnVMHost(ctx context.Context, spec VMSpec, helper, specPa
 	return vp, nil
 }
 
-// awaitGuestReady polls the guest agent's Health RPC until it answers, the helper
-// dies, the caller cancels, or the deadline expires.
+// bootOnce spawns one helper and waits for its guest agent. On failure the
+// helper has already been killed and its run dir and record removed, and the
+// returned error carries the cause and the helper's output tail.
+func (b *VMBackend) bootOnce(ctx context.Context, spec VMSpec, helper, specPath, consolePath string) (*vmProc, *VMBootError) {
+	vp, err := b.spawnVMHost(ctx, spec, helper, specPath, consolePath)
+	if err != nil {
+		return nil, &VMBootError{PodID: spec.PodID, Cause: VMBootSpawnFailed, Err: err}
+	}
+	if err := b.awaitGuestReady(ctx, vp); err != nil {
+		// Every non-ready outcome kills the helper before reporting: a helper
+		// left running would hold a VM for a pod the caller is about to be told
+		// does not exist. The helper's output is read first: the stop removes
+		// the run dir the output file lives in.
+		output := vp.helperOutput()
+		b.hardStop(vp)
+		var bootErr *VMBootError
+		if errors.As(err, &bootErr) {
+			return nil, bootErr
+		}
+		return nil, &VMBootError{PodID: spec.PodID, Cause: VMBootAgentNeverReady, Detail: output, Err: err}
+	}
+	return vp, nil
+}
+
+// consoleProgress reports the console's size and modification time, the
+// observable trace of a guest that is still working: the guest kernel and
+// guest-init print to it as they go. A missing file reads as no output yet.
+func consoleProgress(path string) (int64, time.Time) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return -1, time.Time{}
+	}
+	return st.Size(), st.ModTime()
+}
+
+// awaitGuestReady polls the guest agent's Health RPC until it answers, the
+// helper dies, the caller cancels, the guest console stays silent for the idle
+// window, or the ceiling passes (see vmBootIdleDeadline).
 //
 // the exit race is the point. A helper that fails after spawn — an unentitled
 // binary, a spec the contract rejects, a kernel VZ will not boot — exits in
-// milliseconds. Polling alone would spend the whole 30-second deadline before
+// milliseconds. Polling alone would spend the whole idle window before
 // reporting it, and would then report the wrong cause: "the agent never became
 // ready" instead of the helper's own one-line explanation. Racing Process.Done()
 // (closed by the sole kqueue reaper) turns that into an immediate failure
 // carrying the stderr the helper actually printed.
+//
+// PROGRESS is the console's size or modification time changing between polls.
+// Neither is trusted for anything but extending the wait, and the extension is
+// itself bounded by the ceiling, so a guest that prints forever cannot hold
+// the boot open.
 func (b *VMBackend) awaitGuestReady(ctx context.Context, vp *vmProc) error {
-	deadline := time.NewTimer(vmBootDeadline)
-	defer deadline.Stop()
+	idle, ceiling := b.bootTiming.bounds()
+	start := time.Now()
+	lastProgress := start
+	lastSize, lastMod := consoleProgress(vp.consolePath)
 	poll := time.NewTicker(vmHealthPollInterval)
 	defer poll.Stop()
 
@@ -330,14 +392,26 @@ func (b *VMBackend) awaitGuestReady(ctx context.Context, vp *vmProc) error {
 			return nil
 		}
 
+		now := time.Now()
+		if size, mod := consoleProgress(vp.consolePath); size != lastSize || !mod.Equal(lastMod) {
+			lastSize, lastMod, lastProgress = size, mod, now
+		}
+		switch {
+		case now.Sub(start) >= ceiling:
+			return &VMBootError{PodID: vp.podID, Cause: VMBootAgentNeverReady, Detail: vp.helperOutput(),
+				Err: fmt.Errorf("no Health response within the %s ceiling, though the guest console was active %s ago; last attempt: %w",
+					ceiling, now.Sub(lastProgress).Round(time.Millisecond), err)}
+		case now.Sub(lastProgress) >= idle:
+			return &VMBootError{PodID: vp.podID, Cause: VMBootAgentNeverReady, Detail: vp.helperOutput(),
+				Err: fmt.Errorf("no Health response after %s, and no guest console output for the last %s; last attempt: %w",
+					now.Sub(start).Round(time.Millisecond), idle, err)}
+		}
+
 		select {
 		case <-vp.exit.Done():
 			return died()
 		case <-ctx.Done():
 			return &VMBootError{PodID: vp.podID, Cause: VMBootCanceled, Err: ctx.Err()}
-		case <-deadline.C:
-			return &VMBootError{PodID: vp.podID, Cause: VMBootAgentNeverReady, Detail: vp.helperOutput(),
-				Err: fmt.Errorf("no Health response within %s; last attempt: %w", vmBootDeadline, err)}
 		case <-poll.C:
 		}
 	}

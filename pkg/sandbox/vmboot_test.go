@@ -614,8 +614,8 @@ func TestCreateVMSurfacesAPreReadyHelperDeath(t *testing.T) {
 	if bootErr.Cause != VMBootHelperDied {
 		t.Errorf("cause = %q, want %q — a helper that died must not be reported as an unready agent", bootErr.Cause, VMBootHelperDied)
 	}
-	if elapsed > vmBootDeadline/2 {
-		t.Errorf("CreateVM took %s to report a helper that died immediately; the exit race must not wait out the %s deadline", elapsed, vmBootDeadline)
+	if elapsed > vmBootIdleDeadline/2 {
+		t.Errorf("CreateVM took %s to report a helper that died immediately; the exit race must not wait out the %s idle window", elapsed, vmBootIdleDeadline)
 	}
 	if bootErr.Detail == "" {
 		t.Error("the failure carries no helper output; the tail is the only diagnosis a pre-ready death has")

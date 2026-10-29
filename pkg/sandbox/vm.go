@@ -344,6 +344,9 @@ type VMBackend struct {
 	// health is the readiness probe: a real guest/v1 Health round trip, never a
 	// socket dial. See GuestHealthFunc for why the distinction is load-bearing.
 	health GuestHealthFunc
+	// bootTiming bounds the readiness wait; the zero value is the production
+	// vmBootIdleDeadline/vmBootCeiling. Set directly by in-package tests only.
+	bootTiming vmBootTiming
 	// signal sends a signal to a process GROUP (supervisor.SignalGroup in
 	// production); a field so the whole stop/escalate/reap policy is testable
 	// against a recorder.

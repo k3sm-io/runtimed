@@ -35,23 +35,67 @@ import (
 	guestv1 "k3sm.io/apis/guest/v1"
 )
 
-// vmBootDeadline bounds spec-write -> spawn -> VM attach -> guest boot -> agent
-// handshake for one pod.
+// vmBootIdleDeadline and vmBootCeiling bound how long CreateVM waits for one
+// boot's guest agent to answer: the boot fails once the guest console has been
+// silent for vmBootIdleDeadline, or once vmBootCeiling has passed since the
+// spawn, whichever comes first.
 //
-// DERIVATION, not a round number. A spike measured create->guest-token
-// at 165 ms median / 172 ms max on one uncontended VM; a live smoke run on the
-// same machine measured the whole chain — helper spawn through a Health round trip
-// over agent.sock — at 668-707 ms across five runs. So 30 s is roughly forty
-// times the observed worst case, which is the margin a node under real pod
-// churn needs: several guests booting at once contend for CPU, page cache and
-// the APFS clone the rootfs share was just built from, and none of that shows
-// up in a single-VM measurement.
+// WHY TWO BOUNDS, NOT ONE. Readiness is the guest agent's Health, and guest-init
+// starts the agent only after the pod's containers have started (see
+// GuestHealthFunc), so the wait covers the guest kernel boot, the guest network,
+// the pod mounts, every container's root (including the ownership sidecar,
+// which re-owns every file of the image over the virtiofs share) and the init
+// containers. Measured on an M1 Max node: 1.1-2.5 s for a small image, 5-7 s
+// for a typical one, and a 9.7 s boot of a ~10k-file image spent 7.9 s of it in
+// the ownership step alone. Under host load the same work stretched: boots of
+// 12-20 s were logged at moderate load, and at a load average of 50-60 an
+// identical pod failed a fixed 30 s deadline that it passed in 19 s and 9.7 s
+// half an hour later. A single fixed deadline is therefore wrong in both
+// directions: generous for a guest that never started, too short for one that
+// is plainly working through a large image on a busy host.
 //
-// It is a ceiling, never a delay — readiness ends the wait the instant the agent
-// answers, and a helper that dies first ends it sooner still (CreateVM races the
-// poll against Process.Done). The bound exists so a guest that will never boot
-// fails one pod in bounded time instead of holding a CreatePod RPC open forever.
-const vmBootDeadline = 30 * time.Second
+// So the 30 s is now an IDLE window: it restarts whenever the guest console
+// grows, which is what the guest kernel and guest-init do while they work, and
+// it still fails a guest that went quiet (hung, wedged, or never started) 30 s
+// after its last line. The ceiling bounds a guest that keeps printing but never
+// answers, so one boot can hold a CreatePod RPC for at most two minutes.
+//
+// Both are ceilings, never delays: readiness ends the wait the instant the
+// agent answers, and a helper that dies ends it sooner still (the poll races
+// Process.Done).
+const (
+	vmBootIdleDeadline = 30 * time.Second
+	vmBootCeiling      = 120 * time.Second
+)
+
+// vmBootAttempts is how many times CreateVM boots a guest whose agent never
+// answered before it fails the pod. A second boot, from a fully torn-down
+// helper, absorbs a transient stall (a host saturated for exactly the boot's
+// window) without hiding a guest that cannot boot: that one fails twice, with
+// both consoles retained. Only VMBootAgentNeverReady is retried; every other
+// cause (no artifacts, a helper that died, a spawn failure, cancellation) is a
+// fault a second boot would only repeat.
+const vmBootAttempts = 2
+
+// vmBootTiming is the readiness wait's two bounds; the zero value means the
+// production constants. It is a field so the boot state machine is testable
+// with scaled-down bounds instead of minute-long tests.
+type vmBootTiming struct {
+	idle    time.Duration
+	ceiling time.Duration
+}
+
+// bounds returns t with each zero field replaced by its production default.
+func (t vmBootTiming) bounds() (idle, ceiling time.Duration) {
+	idle, ceiling = t.idle, t.ceiling
+	if idle <= 0 {
+		idle = vmBootIdleDeadline
+	}
+	if ceiling <= 0 {
+		ceiling = vmBootCeiling
+	}
+	return idle, ceiling
+}
 
 // vmHealthPollInterval is how often the readiness poll retries the Health RPC
 // while the guest boots. It is short relative to the sub-second boot the smoke
@@ -103,7 +147,9 @@ const (
 	// stderr tail is the diagnosis and is carried in the error.
 	VMBootHelperDied VMBootCause = "helper-died-pre-ready"
 	// VMBootAgentNeverReady: the helper stayed alive but no Health round trip
-	// completed within vmBootDeadline. The guest console is the diagnosis.
+	// completed before the guest console went quiet for vmBootIdleDeadline or
+	// vmBootCeiling passed. The guest console is the diagnosis. It is the one
+	// cause CreateVM retries (vmBootAttempts).
 	VMBootAgentNeverReady VMBootCause = "agent-never-ready"
 	// VMBootCanceled: the caller's context ended during the boot.
 	VMBootCanceled VMBootCause = "canceled"
@@ -125,6 +171,17 @@ type VMBootError struct {
 	// Detail is cause-specific evidence — for VMBootHelperDied, the helper's
 	// captured stderr tail. Empty when the cause carries none.
 	Detail string
+	// Attempts is how many boots were made; above 1 only for a retried
+	// VMBootAgentNeverReady. Zero reads as one.
+	Attempts int
+	// RetainedConsole is the copy of the last attempt's console kept under
+	// <stateRoot>/vmboot-failures, which outlives the pod dir. Empty when
+	// nothing was kept (no boot was attempted, or no state root is set).
+	RetainedConsole string
+	// ConsoleTail is the sanitised end of the last attempt's console (at most
+	// vmBootConsoleTailLines lines and vmBootConsoleTailBytes bytes), so the
+	// pod's own status shows what the guest last printed.
+	ConsoleTail string
 	// Err is the underlying error, if any.
 	Err error
 }
@@ -133,9 +190,20 @@ type VMBootError struct {
 // those are the two things a reader acts on.
 func (e *VMBootError) Error() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "vm pod %s failed to boot (%s; guest console %s)", e.PodID, e.Cause, e.ConsolePath)
+	fmt.Fprintf(&b, "vm pod %s failed to boot", e.PodID)
+	if e.Attempts > 1 {
+		fmt.Fprintf(&b, " after %d attempts", e.Attempts)
+	}
+	fmt.Fprintf(&b, " (%s; guest console %s", e.Cause, e.ConsolePath)
+	if e.RetainedConsole != "" {
+		fmt.Fprintf(&b, ", kept at %s", e.RetainedConsole)
+	}
+	b.WriteString(")")
 	if e.Err != nil {
 		fmt.Fprintf(&b, ": %v", e.Err)
+	}
+	if e.ConsoleTail != "" {
+		fmt.Fprintf(&b, "; console tail: %s", e.ConsoleTail)
 	}
 	if e.Detail != "" {
 		fmt.Fprintf(&b, "; helper output: %s", e.Detail)
