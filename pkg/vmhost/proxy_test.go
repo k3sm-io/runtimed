@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -327,4 +328,69 @@ func shortSocketPath(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "agent.sock")
+}
+
+// recordingHandler captures log messages for assertions.
+type recordingHandler struct {
+	mu   sync.Mutex
+	msgs []string
+	args []map[string]any
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	a := map[string]any{}
+	r.Attrs(func(at slog.Attr) bool { a[at.Key] = at.Value.Any(); return true })
+	h.mu.Lock()
+	h.msgs = append(h.msgs, r.Message)
+	h.args = append(h.args, a)
+	h.mu.Unlock()
+	return nil
+}
+
+func TestVsockResetIsLoggedOncePerAttempt(t *testing.T) {
+	h := &recordingHandler{}
+	reset := errors.New("read: connection reset by peer")
+	fail := true
+	dial := func(context.Context) (net.Conn, error) {
+		if fail {
+			return nil, reset
+		}
+		c, _ := net.Pipe()
+		return c, nil
+	}
+	p := NewProxy(nil, dial, slog.New(h))
+	relayOnce := func() {
+		client, peer := net.Pipe()
+		_ = peer.Close()
+		p.relay(context.Background(), client)
+	}
+
+	const n = 25
+	for range n {
+		relayOnce()
+	}
+	fail = false
+	relayOnce() // the agent answers: the attempt ends
+
+	if len(h.msgs) != 2 {
+		t.Fatalf("attempt 1 logged %d lines %q, want 1 reset line + 1 count line", len(h.msgs), h.msgs)
+	}
+	if got := h.args[1]["failed_dials"]; got != int64(n) {
+		t.Fatalf("count line failed_dials = %v, want %d", got, n)
+	}
+
+	fail = true
+	for range 3 {
+		relayOnce()
+	}
+	p.endAttempt("ended") // timeout or cancel
+	if len(h.msgs) != 4 {
+		t.Fatalf("attempt 2 logged %d new lines, want first reset again + count: %q", len(h.msgs)-2, h.msgs[2:])
+	}
+	if got := h.args[3]["failed_dials"]; got != int64(3) {
+		t.Fatalf("second count = %v, want 3", got)
+	}
 }

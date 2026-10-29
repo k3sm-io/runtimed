@@ -56,6 +56,12 @@ type Proxy struct {
 	log  *slog.Logger
 
 	wg sync.WaitGroup
+
+	// failMu guards fails, the length of the current run of failed dials. A run is
+	// one connect attempt: it opens at the first failure after a success (or after
+	// start) and closes when a dial succeeds or Serve ends.
+	failMu sync.Mutex
+	fails  int
 }
 
 // NewProxy builds a proxy relaying lis to the guest agent reached through dial.
@@ -104,6 +110,7 @@ func (p *Proxy) Serve(ctx context.Context) error {
 	watcher.Wait()
 	closeListener()
 	p.wg.Wait()
+	p.endAttempt("ended")
 
 	select {
 	case <-ctx.Done():
@@ -131,6 +138,31 @@ func (p *Proxy) acceptLoop(ctx context.Context) error {
 	}
 }
 
+// noteDialFailure logs the first failed dial of a connect attempt and counts the
+// rest. While the guest boots the agent refuses or resets every connection, many
+// per second, and one line each would bury the boot console the helper retains.
+func (p *Proxy) noteDialFailure(err error) {
+	p.failMu.Lock()
+	p.fails++
+	first := p.fails == 1
+	p.failMu.Unlock()
+	if first {
+		p.log.Warn("could not reach the guest agent for a relayed connection; further failures in this attempt are counted, not logged", "err", err)
+	}
+}
+
+// endAttempt closes the current connect attempt, if one is open, with one
+// summary line carrying the failure count. outcome says how it closed.
+func (p *Proxy) endAttempt(outcome string) {
+	p.failMu.Lock()
+	n := p.fails
+	p.fails = 0
+	p.failMu.Unlock()
+	if n > 0 {
+		p.log.Info("guest agent connect attempt finished", "outcome", outcome, "failed_dials", n)
+	}
+}
+
 // relay bridges one accepted client connection to one fresh guest-agent
 // connection.
 //
@@ -143,9 +175,10 @@ func (p *Proxy) relay(ctx context.Context, client net.Conn) {
 
 	guest, err := p.dial(ctx)
 	if err != nil {
-		p.log.Warn("could not reach the guest agent for a relayed connection", "err", err)
+		p.noteDialFailure(err)
 		return
 	}
+	p.endAttempt("answered")
 	defer func() { _ = guest.Close() }()
 
 	// A cancelled ctx must tear the relay down even though both copies are blocked
