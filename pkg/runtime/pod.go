@@ -117,7 +117,7 @@ type pod struct {
 	// guestImagePulls is what each container's HOST-SIDE image step did, keyed
 	// by container name — the plan createVMPod resolved before the machine
 	// existed (resolveVMContainers), carried here because it is the only source
-	// of ContainerStatus.image_pull for a vm pod. The guest reports that a
+	// of ContainerStatus.image_pull and image_id for a vm pod. The guest reports that a
 	// container started; it never saw a registry, so the fold cannot derive the
 	// outcome from the event it is folding and reads it from here instead.
 	//

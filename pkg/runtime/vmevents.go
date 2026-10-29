@@ -461,6 +461,11 @@ func guestTerminationReason(exited *guestv1.ContainerExited) string {
 // guestContainerLocked returns name's guest container status on p, creating it
 // on first sight and recording the declaration order so the status list is
 // stable across reads. The caller holds p.mu.
+//
+// image_id and image_pull are both stamped here, at creation, from the plan's
+// host-side record of the image step, under the rule imagePullOutcomeLocked
+// documents: the answer that was true when the container came to exist. A
+// container the plan never resolved gets an empty image_id, never a guess.
 func (p *pod) guestContainerLocked(name, image string) *runtimev1.ContainerStatus {
 	if p.guestContainers == nil {
 		p.guestContainers = map[string]*runtimev1.ContainerStatus{}
@@ -468,7 +473,12 @@ func (p *pod) guestContainerLocked(name, image string) *runtimev1.ContainerStatu
 	if st, ok := p.guestContainers[name]; ok {
 		return st
 	}
-	st := &runtimev1.ContainerStatus{Name: name, Image: image, ImagePull: p.imagePullOutcomeLocked(name)}
+	st := &runtimev1.ContainerStatus{
+		Name:      name,
+		Image:     image,
+		ImageId:   p.guestImagePulls[name].imageID,
+		ImagePull: p.imagePullOutcomeLocked(name),
+	}
 	p.guestContainers[name] = st
 	p.guestContainerOrder = append(p.guestContainerOrder, name)
 	return st

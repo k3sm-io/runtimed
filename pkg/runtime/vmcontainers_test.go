@@ -66,6 +66,11 @@ type imageWorld struct {
 	// has a real lower bound to test against instead of a zero it cannot
 	// distinguish from an unstamped field.
 	delays map[string]time.Duration
+	// descDigests and indexDigests give a reference's pull result a manifest
+	// descriptor digest and an index digest, the two sources repoDigestImageID
+	// reads; a reference absent from both resolves with no digest at all.
+	descDigests  map[string]string
+	indexDigests map[string]string
 
 	// ownership is the sidecar path the fake materializer reports on the tree
 	// it returns (image.Tree.Ownership); empty reports none.
@@ -100,6 +105,16 @@ func (w *imageWorld) failsWith(ref string, err error) *imageWorld {
 	return w
 }
 
+// digested makes ref resolve to the manifest descriptor digest desc and, when
+// index is non-empty, through an index with that digest.
+func (w *imageWorld) digested(ref, desc, index string) *imageWorld {
+	if w.descDigests == nil {
+		w.descDigests, w.indexDigests = map[string]string{}, map[string]string{}
+	}
+	w.descDigests[ref], w.indexDigests[ref] = desc, index
+	return w
+}
+
 // takes makes ref's pull last at least d.
 func (w *imageWorld) takes(ref string, d time.Duration) *imageWorld {
 	if w.delays == nil {
@@ -123,17 +138,22 @@ func (w *imageWorld) Pull(_ context.Context, ref string, _ *image.RegistryCreden
 	if d := w.delays[ref]; d > 0 {
 		time.Sleep(d)
 	}
-	return &image.PullResult{
+	res := &image.PullResult{
 		Manifest: &runtimev1.ImageManifest{
-			Reference: ref,
-			Config:    &runtimev1.Descriptor{Digest: "sha256:" + strings.Repeat("a", 64)},
+			Reference:   ref,
+			Config:      &runtimev1.Descriptor{Digest: "sha256:" + strings.Repeat("a", 64)},
+			IndexDigest: w.indexDigests[ref],
 		},
 		CacheHit: true,
 		// The fact ContainerStatus.image_pull is made of: whether a registry was
 		// contacted. It is not CacheHit inverted (see image.PullResult.Fetched),
 		// which is why this world sets the two independently.
 		Fetched: !w.indexHits[ref],
-	}, nil
+	}
+	if d := w.descDigests[ref]; d != "" {
+		res.Descriptor = &runtimev1.Descriptor{Digest: d}
+	}
+	return res, nil
 }
 
 func (w *imageWorld) MaterializeTree(_ context.Context, _ *runtimev1.ImageManifest, policy image.UnpackPolicy, dst string) (*image.MaterializeResult, error) {
@@ -753,6 +773,80 @@ func TestVMContainerStatusReportsTheImagePullOutcome(t *testing.T) {
 	}
 	if init.GetDuration() == nil {
 		t.Error("a local hit reports no duration; it is the time spent proving the image was there, not an absence")
+	}
+}
+
+// TestVMContainerStatusCarriesImageID pins ContainerStatus.image_id on the vm
+// spine to the same value the host-process spine publishes: the digested
+// reference of the image the HOST resolved for the container
+// (repoDigestImageID), stamped when the status entry is created from the guest's
+// first event. The guest never saw a registry, so the only source is the plan's
+// record of the pull; before it was recorded, every vm container reported an
+// empty image_id and a node's image listing could not tell which images a vm
+// pod was using.
+//
+// Both image-step shapes are driven: an image fetched from the registry and one
+// served from the node's local index carry the same identity, because image_id
+// names WHAT the container runs, not how it got onto the node. The expected value
+// is built from the fixture's own digests through image.RepoDigest, and must not
+// be the config digest or the mutable reference.
+func TestVMContainerStatusCarriesImageID(t *testing.T) {
+	const (
+		descDigest  = "sha256:" + "4444444444444444444444444444444444444444444444444444444444444444"
+		indexDigest = "sha256:" + "5555555555555555555555555555555555555555555555555555555555555555"
+		configDig   = "sha256:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+	cases := []struct {
+		name       string
+		ref        string
+		fromIndex  bool
+		index      string
+		wantDigest string
+	}{
+		{name: "fresh pull of a single-platform tag", ref: "docker.io/library/app:1", wantDigest: descDigest},
+		{name: "fresh pull through a multi-platform index", ref: "docker.io/library/app:2", index: indexDigest, wantDigest: indexDigest},
+		{name: "cached image served from the local index", ref: "docker.io/library/app:3", fromIndex: true, wantDigest: descDigest},
+		{name: "cached image recorded through an index", ref: "docker.io/library/app:4", fromIndex: true, index: indexDigest, wantDigest: indexDigest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newImageWorld(map[string]image.ImageRunConfig{
+				tc.ref: {Entrypoint: []string{"/app"}},
+			}).digested(tc.ref, descDigest, tc.index)
+			if tc.fromIndex {
+				w.servesFromIndex(tc.ref)
+			}
+			rt, _ := newVMImageRuntime(t, w)
+			box := vmBoxWith(rt, "pod-vm-imageid", nil,
+				[]*runtimev1.Container{{Name: "app", Image: tc.ref}})
+			p, _, err := rt.createPod(context.Background(), box)
+			if err != nil {
+				t.Fatalf("createPod: %v", err)
+			}
+			rt.applyGuestContainerEvent(p, &guestv1.ContainerEvent{
+				Container: "app",
+				Started:   &guestv1.ContainerStarted{Pid: 7},
+			})
+
+			mains := rt.podStatus(p).GetContainerStatuses()
+			if len(mains) != 1 {
+				t.Fatalf("got %d container statuses, want 1", len(mains))
+			}
+			want, ok := image.RepoDigest(tc.ref, tc.wantDigest)
+			if !ok || want == "" {
+				t.Fatalf("fixture: image.RepoDigest(%q, %q) is not a digested reference", tc.ref, tc.wantDigest)
+			}
+			got := mains[0].GetImageId()
+			if got != want {
+				t.Errorf("image_id = %q, want %q (the repository at the digest the host resolved)", got, want)
+			}
+			if got == configDig || strings.HasSuffix(got, "@"+configDig) || got == tc.ref {
+				t.Errorf("image_id = %q is the config digest or the mutable reference, not a pullable digested reference", got)
+			}
+			if pulled := mains[0].GetImagePull().GetPulled(); pulled == tc.fromIndex {
+				t.Errorf("image_pull.pulled = %v, want %v: the identity must ride beside the outcome, not replace it", pulled, !tc.fromIndex)
+			}
+		})
 	}
 }
 

@@ -117,6 +117,12 @@ type vmImagePull struct {
 	// the transfer alone would report a fraction of the same wait on the two
 	// spines for the same image.
 	duration time.Duration
+	// imageID is the digested reference ContainerStatus.image_id publishes for
+	// this container (repoDigestImageID over the same pull result), recorded
+	// with pulled so a fetched image and one served from the local index report
+	// the same identity. Empty when the pull result carries no usable digest,
+	// exactly as on the host-process spine.
+	imageID string
 }
 
 // vmContainerPlan is the host-side result of resolving a vm pod's containers:
@@ -426,7 +432,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	// The image question is answered: this container has a runnable program.
 	// Everything below is mapping, so the step is stopped here rather than at
 	// the return.
-	imagePull := vmImagePull{pulled: res.Fetched, duration: time.Since(imageStart)}
+	imagePull := vmImagePull{pulled: res.Fetched, duration: time.Since(imageStart), imageID: repoDigestImageID(ref, res)}
 	return resolvedVMContainer{guest: sandbox.VMContainer{
 		Name: name,
 		Init: e.init,
