@@ -278,6 +278,8 @@ func (r *Runtime) recordChild(rec podProcRecord, child int, childStart int64) (p
 // writePodProcRecord writes rec to <podreap>/<podID>/<pgid>.json through a tmp
 // file and a rename, so a reader sees the old record or the new one.
 func (r *Runtime) writePodProcRecord(rec podProcRecord) error {
+	r.reapStoreMu.Lock()
+	defer r.reapStoreMu.Unlock()
 	podID, pgid := rec.PodID, rec.Pgid
 	dir, err := r.podReapDir(podID)
 	if err != nil {
@@ -303,13 +305,104 @@ func (r *Runtime) writePodProcRecord(rec podProcRecord) error {
 
 // removePodProcRecord drops a container's process-group record once its group
 // is observed empty (best-effort: a leftover record is harmless — the reap's
-// identity check drops it unsignaled).
+// identity check drops it unsignaled). The pod's directory goes with its last
+// record.
 func (r *Runtime) removePodProcRecord(podID string, pgid int) {
 	dir, err := r.podReapDir(podID)
 	if err != nil {
 		return // an unvalidated id never produced a record
 	}
+	r.reapStoreMu.Lock()
+	defer r.reapStoreMu.Unlock()
 	_ = os.Remove(filepath.Join(dir, strconv.Itoa(pgid)+".json"))
+	r.dropEmptyPodReapDirLocked(dir)
+}
+
+// podReapTmpSuffix is the suffix of a record write that has not been renamed
+// into place yet (writePodProcRecord).
+const podReapTmpSuffix = ".json.tmp"
+
+// isPodReapRecordName reports whether a reap-dir entry name is a committed
+// record (<pgid>.json), the only name readPodReapStore reads.
+func isPodReapRecordName(name string) bool {
+	return filepath.Ext(name) == ".json"
+}
+
+// dropEmptyPodReapDirLocked removes a pod's reap directory when no committed
+// record is left in it. Every write holds reapStoreMu, which the caller holds
+// too, so a tmp file found here is the debris of an interrupted write, not one
+// in flight, and goes with the directory. Any other entry (a record, a
+// subdirectory, an unknown name) keeps the directory: this never removes
+// anything it cannot name. Best-effort. reapStoreMu must be held.
+func (r *Runtime) dropEmptyPodReapDirLocked(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var debris []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), podReapTmpSuffix) {
+			debris = append(debris, filepath.Join(dir, e.Name()))
+			continue
+		}
+		return
+	}
+	for _, f := range debris {
+		_ = os.Remove(f)
+	}
+	// os.Remove on a directory is rmdir: it refuses a non-empty one, so a file
+	// that appeared despite the lock is never deleted with it.
+	_ = os.Remove(dir)
+}
+
+// podHasReapRecord reports whether the pod-reap store holds a committed record
+// for podID. A directory with no record in it (left by a build that removed
+// records but never their directory) is not a record. ok is false when the
+// store cannot be read, which the caller treats as a doubt.
+func (r *Runtime) podHasReapRecord(podID string) (has, ok bool) {
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return false, false
+	}
+	r.reapStoreMu.Lock()
+	defer r.reapStoreMu.Unlock()
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, true
+	}
+	if err != nil {
+		return false, false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && isPodReapRecordName(e.Name()) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// sweepEmptyPodReapDirs removes every pod directory under the reap store that
+// holds no committed record. It runs in the startup reap, after the records
+// the reap dropped are gone, and also clears the empty directories earlier
+// builds left behind. Best-effort.
+func (r *Runtime) sweepEmptyPodReapDirs() {
+	root := r.podReapRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir, err := r.podReapDir(e.Name())
+		if err != nil {
+			continue // not a pod id: never ours to remove
+		}
+		r.reapStoreMu.Lock()
+		r.dropEmptyPodReapDirLocked(dir)
+		r.reapStoreMu.Unlock()
+	}
 }
 
 // keptSurvivors is one container's survivors of a tree sweep, by the pgid its
@@ -353,6 +446,7 @@ func (r *Runtime) retirePodReapRecords(podID string, keep map[int]keptSurvivors)
 	if err != nil {
 		return
 	}
+	r.reapStoreMu.Lock()
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		pgid, err := strconv.Atoi(strings.TrimSuffix(e.Name(), ".json"))
@@ -363,6 +457,9 @@ func (r *Runtime) retirePodReapRecords(podID string, keep map[int]keptSurvivors)
 		}
 		_ = os.Remove(filepath.Join(dir, e.Name()))
 	}
+	// Released before the retains below: writePodProcRecord takes the lock
+	// itself, and recreates the directory if it has to.
+	r.reapStoreMu.Unlock()
 	for pgid, k := range keep {
 		if err := r.retainPodProcRecord(podID, k.container, pgid, k.survivors); err != nil {
 			r.log.Warn("record the survivors of a deleted pod's process tree", "pod", podID, "container", k.container, "err", err)
@@ -377,6 +474,8 @@ func (r *Runtime) removePodReapRecords(podID string) {
 	if err != nil {
 		return // an unvalidated id never produced records
 	}
+	r.reapStoreMu.Lock()
+	defer r.reapStoreMu.Unlock()
 	_ = os.RemoveAll(dir)
 }
 
@@ -951,8 +1050,11 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	}
 	for _, f := range quarantine {
 		r.log.Warn("removing malformed reap record", "path", f)
+		r.reapStoreMu.Lock()
 		_ = os.Remove(f)
+		r.reapStoreMu.Unlock()
 	}
+	r.sweepEmptyPodReapDirs()
 	r.sweepStaleSandboxProfiles()
 	r.sweepStaleShimDirs()
 	r.sweepStaleSignStaging()
