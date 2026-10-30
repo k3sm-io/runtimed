@@ -19,7 +19,7 @@ package runtime
 import (
 	"testing"
 
-	"k3sm.io/apis/k3smtest"
+	"k3sm.io/apis/k3smtest/runtimecontract"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -29,8 +29,8 @@ import (
 // re-proved by every end-to-end test that crosses the seam.
 func TestRuntimeContract(t *testing.T) {
 	rt := newTestRuntime(t, Deps{})
-	k3smtest.RunRuntimeContract(t, k3smtest.RuntimeContract{
-		Client: k3smtest.ServeRuntime(t, rt),
+	runtimecontract.RunRuntimeContract(t, runtimecontract.RuntimeContract{
+		Client: runtimecontract.ServeRuntime(t, rt),
 		Pod:    func(id string) *runtimev1.PodBox { return hostBinBox(rt, id) },
 	})
 }
