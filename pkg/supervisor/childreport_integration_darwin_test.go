@@ -41,8 +41,11 @@ func buildPathShim(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "libk3sm_pathrebase_shim.dylib")
-	if b, err := exec.Command("clang", "-arch", "arm64", "-arch", "arm64e", "-dynamiclib", "-fPIC", "-O2",
-		"-Wall", "-Wextra", "-o", out, src).CombinedOutput(); err != nil {
+	cmd := exec.Command("clang", "-arch", "arm64", "-arch", "arm64e", "-dynamiclib", "-fPIC", "-O2",
+		"-Wall", "-Wextra", "-o", out, src)
+	// A multi-arch compile leaves one empty directory per -arch in TMPDIR.
+	cmd.Env = append(os.Environ(), "TMPDIR="+t.TempDir())
+	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build the path shim: %v\n%s", err, b)
 	}
 	return out
