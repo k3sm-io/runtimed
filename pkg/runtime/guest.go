@@ -339,7 +339,7 @@ func knownGuestCapability(tok string) bool {
 	switch tok {
 	case guestagent.CapabilityTTYExec, guestagent.CapabilityAttach, guestagent.CapabilityLogPartial,
 		guestagent.CapabilityGuestPrivateMounts, guestagent.CapabilitySidecarInit, guestagent.CapabilityImageUser,
-		guestagent.CapabilityRestartContainer:
+		guestagent.CapabilityRestartContainer, guestagent.CapabilityMemoryLimits:
 		return true
 	}
 	return false

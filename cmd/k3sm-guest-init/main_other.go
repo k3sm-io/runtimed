@@ -35,6 +35,13 @@ import (
 // portable decoder (and its untagged test) part of every platform's build.
 var _ = decodeSpec
 
+// The memory-limit apply and the OOM verdict are likewise linux-only callers'
+// helpers kept portable so their gate runs here.
+var (
+	_ = applyContainerMemory
+	_ = newOOMWatch
+)
+
 func main() {
 	fmt.Fprintf(os.Stderr,
 		"k3sm-guest-init is the PID 1 of a Linux micro-VM guest and cannot run on %s/%s\n",

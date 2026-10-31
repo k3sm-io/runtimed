@@ -120,3 +120,54 @@ func WorkingSet(memoryCurrent, memoryStat string) (uint64, error) {
 	}
 	return current - inactiveFile, nil
 }
+
+// MemoryEvents are the counters of a cgroup2 memory.events file. Each is
+// cumulative over the cgroup's life.
+type MemoryEvents struct {
+	// Low counts reclaims below memory.low.
+	Low uint64
+	// High counts the times usage went over memory.high and was throttled.
+	High uint64
+	// Max counts the times usage was about to go over memory.max.
+	Max uint64
+	// OOM counts the times the cgroup reached its limit and allocation failed.
+	OOM uint64
+	// OOMKill counts processes in the cgroup killed by an OOM killer. It is the
+	// counter that proves an OOM kill, so it is the one ParseMemoryEvents
+	// requires.
+	OOMKill uint64
+}
+
+// ParseMemoryEvents parses a memory.events file. Unknown keys are skipped
+// (newer kernels add oom_group_kill and others); oom_kill must be present,
+// since an absent kill counter is unknown, not zero, and a caller deciding
+// OOMKilled from it must not read absence as "not killed" by accident.
+func ParseMemoryEvents(content string) (MemoryEvents, error) {
+	var ev MemoryEvents
+	fields := map[string]*uint64{
+		"low": &ev.Low, "high": &ev.High, "max": &ev.Max, "oom": &ev.OOM, "oom_kill": &ev.OOMKill,
+	}
+	sawKill := false
+	for _, line := range strings.Split(content, "\n") {
+		key, rest, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		dst, known := fields[key]
+		if !known {
+			continue
+		}
+		v, err := strconv.ParseUint(strings.TrimSpace(rest), 10, 64)
+		if err != nil {
+			return MemoryEvents{}, fmt.Errorf("memory.events field %q: %w", key, err)
+		}
+		*dst = v
+		if key == "oom_kill" {
+			sawKill = true
+		}
+	}
+	if !sawKill {
+		return MemoryEvents{}, fmt.Errorf("%w: %q", ErrCgroupFieldAbsent, "oom_kill")
+	}
+	return ev, nil
+}

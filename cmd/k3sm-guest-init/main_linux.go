@@ -304,6 +304,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 		log.Info("delegated cgroup2 controllers", "root", cgroup2Root, "controllers", enabled)
 	}
 
+	// The OOM verdict for each container exit: the leaf's memory.events
+	// oom_kill counter, compared against its count when the instance started.
+	oom := newOOMWatch(cgroup2Root)
+
 	reaper := guestinit.NewReaper(proc, sigchld, guestinit.ReaperOptions{
 		Logger: log,
 		// Mains stop first, then the native sidecars in reverse start order.
@@ -343,17 +347,22 @@ func run(ctx context.Context, log *slog.Logger) error {
 			// would hang the container's session up with SIGHUP — turning a
 			// detach into a kill.
 			attachHub.Release(ev.Container)
-			// OOMKilled is deliberately not set here. It is the one fact only
-			// the guest can supply, and this init does not yet read the cgroup2
-			// memory.events that would prove it — so it is left false rather
-			// than guessed, because upstream treats OOMKilled as the pod's own
-			// fault and charges a restart against a Job's backoff.
+			// OOMKilled is the one fact only the guest can supply. It is set
+			// only when the container leaf's memory.events counted an oom_kill
+			// since this instance started (oomWatch), never guessed from the
+			// signal: upstream treats OOMKilled as the pod's own fault and
+			// charges a restart against a Job's backoff.
+			oomKilled := oom.killed(ev.Container)
+			if oomKilled {
+				log.Info("container was killed by the cgroup OOM killer", "container", ev.Container)
+			}
 			events.Publish(guestagent.ContainerEvent{
 				Container: ev.Container,
 				At:        time.Now(),
 				Exited: &guestagent.ContainerExited{
-					ExitCode: int32(ev.Status.ExitCode),
-					Signal:   int32(ev.Status.Signal),
+					ExitCode:  int32(ev.Status.ExitCode),
+					Signal:    int32(ev.Status.Signal),
+					OOMKilled: oomKilled,
 				},
 			})
 		},
@@ -367,7 +376,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}()
 
 	if err := guestinit.RunStart(plan, &starter{
-		ctx: ctx, log: log, reaper: reaper, events: events, capture: capture, hub: attachHub,
+		ctx: ctx, log: log, reaper: reaper, events: events, capture: capture, hub: attachHub, oom: oom,
 	}); err != nil {
 		// Anything already running has to be torn down; Stop is the only
 		// path that both signals and powers off. A compose or detach failure
@@ -408,7 +417,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		RawOutput: capture,
 		Execer:    &procExecer{plans: byName, reaper: reaper, log: log},
 		Restarter: &planRestarter{
-			plans: byName, reaper: reaper, events: events, capture: capture, hub: attachHub, log: log,
+			plans: byName, reaper: reaper, events: events, capture: capture, hub: attachHub, oom: oom, log: log,
 		},
 		Status: status,
 		Events: events,
@@ -626,6 +635,8 @@ type starter struct {
 	events  *guestagent.Events
 	capture *guestagent.Capture
 	hub     *guestagent.AttachHub
+	// oom takes each instance's OOM baseline at its spawn.
+	oom *oomWatch
 }
 
 // Compose builds one container's root: the rootfs composition, the ownership
@@ -685,7 +696,7 @@ func (s *starter) Detach(step guestinit.MountStep) error {
 // must exit 0. A sidecar is not waited for: the next container starts once its
 // process exists.
 func (s *starter) Start(cp guestinit.ContainerPlan) error {
-	pid, err := spawn(cp, s.capture, s.hub, s.log)
+	pid, err := spawn(cp, s.capture, s.hub, s.oom, s.log)
 	if err != nil {
 		return fmt.Errorf("start container %s: %w", cp.Name, err)
 	}
@@ -768,7 +779,7 @@ const exitDrainBound = 2 * time.Second
 // cgroup.procs would be the only alternative, and it necessarily has that window.
 // The post-fork JoinLeaf below is a reconcile for the one case this cannot cover
 // (a kernel too old for clone3), not the mechanism.
-func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestagent.AttachHub, log *slog.Logger) (int, error) {
+func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestagent.AttachHub, oom *oomWatch, log *slog.Logger) (int, error) {
 	groups := make([]uint32, 0, len(cp.Ident.Groups))
 	for _, g := range cp.Ident.Groups {
 		groups = append(groups, uint32(g))
@@ -835,6 +846,16 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestag
 	if leafDir != nil {
 		defer func() { _ = leafDir.Close() }()
 	}
+	// The memory limits go into the leaf BEFORE the fork places the child in
+	// it, so the container never runs unbounded. Unlike the metering above
+	// this is fail-closed: a limit the host asked for and could not be applied
+	// fails the start (applyContainerMemory).
+	if err := applyContainerMemory(leaf, cp); err != nil {
+		cio.closeAll()
+		return 0, err
+	}
+	// The OOM baseline for this instance, taken before it can allocate.
+	oom.arm(cp.Name)
 	attr := &syscall.ProcAttr{
 		Dir:   dir,
 		Env:   cp.Env,

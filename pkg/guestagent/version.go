@@ -110,6 +110,14 @@ const (
 	// absence is what lets the host refuse the verb with a stated reason rather
 	// than send it into an agent that would answer Unimplemented.
 	CapabilityRestartContainer = "restart-container"
+
+	// CapabilityMemoryLimits reports that the guest writes
+	// GuestContainer.memory_limit_bytes and memory_high_bytes to the
+	// container's cgroup2 memory.max and memory.high before the container
+	// runs, and reports a cgroup OOM kill as ContainerExited.oom_killed. Like
+	// CapabilityImageUser it is diagnostic: the older guest's unknown-field
+	// refusal is what fails closed.
+	CapabilityMemoryLimits = "memory-limits"
 )
 
 // Capabilities is the token set this build advertises, in a STABLE order so a
@@ -122,6 +130,6 @@ func Capabilities() []string {
 	return []string{
 		CapabilityTTYExec, CapabilityAttach, CapabilityLogPartial,
 		CapabilityGuestPrivateMounts, CapabilitySidecarInit, CapabilityImageUser,
-		CapabilityRestartContainer,
+		CapabilityRestartContainer, CapabilityMemoryLimits,
 	}
 }

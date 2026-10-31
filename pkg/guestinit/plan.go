@@ -110,6 +110,14 @@ type ContainerPlan struct {
 	TTY   bool
 	Stdin bool
 
+	// MemoryMaxBytes and MemoryHighBytes are GuestContainer.memory_limit_bytes
+	// and memory_high_bytes, written to the container's cgroup2 leaf as
+	// memory.max and memory.high before its process is forked into it. 0 means
+	// the file is left as the kernel made it ("max", no limit). The values are
+	// the host's: the plan validates them and derives no default of its own.
+	MemoryMaxBytes  int64
+	MemoryHighBytes int64
+
 	// Ownership restores the image's uid/gid/mode inside Root, or is nil when
 	// the spec share carries no sidecar for this container's rootfs. The
 	// executor applies it after Mounts[:Ownership.AfterMount] and before the
@@ -320,6 +328,25 @@ func StartOrder(containers []*guestv1.GuestContainer) ([]StartStep, error) {
 	return append(inits, mains...), nil
 }
 
+// validMemoryLimits applies guest/v1's refusal for the memory fields: neither
+// may be negative, and memory.high may not exceed memory.max when both are set.
+// A guest that applied such a pair would either write a value the kernel
+// rejects at spawn or throttle above the point it is killed at, so the spec is
+// refused at plan time, before any container exists.
+func validMemoryLimits(c *guestv1.GuestContainer) error {
+	limit, high := c.GetMemoryLimitBytes(), c.GetMemoryHighBytes()
+	switch {
+	case limit < 0:
+		return fmt.Errorf("%w: container %q memory_limit_bytes %d is negative", ErrInvalidSpec, c.GetName(), limit)
+	case high < 0:
+		return fmt.Errorf("%w: container %q memory_high_bytes %d is negative", ErrInvalidSpec, c.GetName(), high)
+	case limit > 0 && high > limit:
+		return fmt.Errorf("%w: container %q memory_high_bytes %d exceeds memory_limit_bytes %d",
+			ErrInvalidSpec, c.GetName(), high, limit)
+	}
+	return nil
+}
+
 // validContainerName rejects a name that cannot be used as a path element.
 //
 // The name is a component of every per-container path this package composes
@@ -361,6 +388,9 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 			return ContainerPlan{}, fmt.Errorf("container %q working_dir: %w", c.GetName(), err)
 		}
 	}
+	if err := validMemoryLimits(c); err != nil {
+		return ContainerPlan{}, err
+	}
 	ident, err := ContainerIdent(c, fsGroup)
 	if err != nil {
 		return ContainerPlan{}, err
@@ -391,6 +421,8 @@ func containerPlan(step StartStep, fsGroup int64, podMounts []MountStep, upperSi
 		Ident:            ident,
 		TTY:              c.GetTty(),
 		Stdin:            c.GetStdin(),
+		MemoryMaxBytes:   c.GetMemoryLimitBytes(),
+		MemoryHighBytes:  c.GetMemoryHighBytes(),
 		// Split in after the rootfs composition and before the first mount
 		// inside it (OwnershipStep.AfterMount).
 		Ownership: ownershipStep(c.GetName(), c.GetRootfsTag(), staged, len(rootfs)),

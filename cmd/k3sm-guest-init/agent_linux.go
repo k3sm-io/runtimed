@@ -137,6 +137,7 @@ type planRestarter struct {
 	events  *guestagent.Events
 	capture *guestagent.Capture
 	hub     *guestagent.AttachHub
+	oom     *oomWatch
 	log     *slog.Logger
 }
 
@@ -165,7 +166,7 @@ func (r *planRestarter) RestartContainer(ctx context.Context, container string, 
 	if r.reaper.Stopping() {
 		return fmt.Errorf("restart container %s: %w", container, guestinit.ErrStopped)
 	}
-	st := &starter{ctx: ctx, log: r.log, reaper: r.reaper, events: r.events, capture: r.capture, hub: r.hub}
+	st := &starter{ctx: ctx, log: r.log, reaper: r.reaper, events: r.events, capture: r.capture, hub: r.hub, oom: r.oom}
 	return st.Start(cp)
 }
 
