@@ -32,7 +32,7 @@ import (
 // scratch TMPDIR every shim build leaks them into the caller's temp dir.
 func TestPathShimBuildLeavesNoTempDirs(t *testing.T) {
 	if _, err := exec.LookPath("clang"); err != nil {
-		t.Skipf("SKIP: clang not on PATH, the path shim cannot be built: %v", err)
+		t.Fatalf("clang not on PATH, the path shim cannot be built (this gate must not be skipped): %v", err)
 	}
 	root := pathShimRepoRoot(t)
 	tmp := t.TempDir()
