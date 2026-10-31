@@ -40,6 +40,8 @@ var _ = decodeSpec
 var (
 	_ = applyContainerMemory
 	_ = newOOMWatch
+	_ = (*oomWatch).arm
+	_ = (*oomWatch).killed
 )
 
 func main() {
