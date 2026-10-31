@@ -727,6 +727,52 @@ func TestGenerateShadowBinDirRead(t *testing.T) {
 	}
 }
 
+// TestShadowAllowFollowsVersionedDir pins the shadow read grant for an install
+// whose binaries live in a versioned directory: given the resolved
+// <InstallDir>/versions/<v>/shadow, the profile allows exactly that subpath (not
+// the flat <InstallDir>/shadow name), and a directory that is relative or still
+// carries unresolved ".." or "." components is refused rather than rendered.
+func TestShadowAllowFollowsVersionedDir(t *testing.T) {
+	sp := &runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p/rootfs"}
+	const versioned = "/Library/k3sm/versions/v0.3.0/shadow"
+	cases := []struct {
+		name    string
+		dir     string
+		wantErr bool
+	}{
+		{"resolved versioned dir", versioned, false},
+		{"relative versioned dir", "versions/v0.3.0/shadow", true},
+		{"dot-relative versioned dir", "./versions/v0.3.0/shadow", true},
+		{"unresolved parent component", "/Library/k3sm/current/../versions/v0.3.0/shadow", true},
+		{"unresolved dot component", "/Library/k3sm/versions/./v0.3.0/shadow", true},
+		{"trailing slash", versioned + "/", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(sp, GenerateOptions{Posture: Posture{ShadowBinDir: tc.dir}})
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidShadowBinDir) {
+					t.Fatalf("Generate(%q) = %v, want ErrInvalidShadowBinDir", tc.dir, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := `(allow file-read* (subpath "` + versioned + `"))`
+			if !strings.Contains(out, grant) {
+				t.Fatalf("missing the versioned shadow grant %s:\n%s", grant, out)
+			}
+			if strings.Contains(out, `(subpath "/Library/k3sm/shadow")`) {
+				t.Errorf("the flat shadow name is granted instead of the resolved dir:\n%s", out)
+			}
+			if strings.Index(out, grant) > strings.Index(out, ";; PROTECTED") {
+				t.Errorf("the versioned shadow grant is after the protected denies:\n%s", out)
+			}
+		})
+	}
+}
+
 // TestGenerateInvalid checks rejection of profiles with no writable data volume.
 func TestGenerateInvalid(t *testing.T) {
 	cases := []struct {
