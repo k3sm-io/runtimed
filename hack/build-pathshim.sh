@@ -32,7 +32,13 @@ mkdir -p "$OUT_DIR"
 # ABI for third-party code, so the slice is proven by a LIVE load, not by headers:
 # pkg/runtime TestPathShimLoadsIntoArm64e. TestPathShimIsUniversalBinary asserts
 # the other two slices -- assert the ARTIFACT, never these flags.
-clang \
+#
+# A multi-arch compile makes the clang driver leave one empty "<source>-<hex>"
+# directory per -arch in TMPDIR, so clang gets a scratch TMPDIR of its own that
+# the EXIT trap removes.
+CLANG_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$CLANG_TMPDIR"' EXIT
+TMPDIR="$CLANG_TMPDIR" clang \
   -arch arm64 \
   -arch arm64e \
   -arch x86_64 \
