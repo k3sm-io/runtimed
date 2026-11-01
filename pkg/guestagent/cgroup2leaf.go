@@ -215,7 +215,11 @@ var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
 // memory.high, then memory.oom.group = 1. With a limit set, the other one, if
 // unset, is written as "max": a restart reuses the leaf, and a value an
 // earlier instance left there must not outlive the spec that asked for it.
-// With no limit set it writes nothing.
+// With no limit set it resets the leaf in the same order, "max", "max" and
+// memory.oom.group = 0, for the same reason: a container whose new spec is
+// unbounded must not run under the previous instance's bound and group kill.
+// On a fresh leaf those are the kernel's defaults, so the writes change
+// nothing.
 //
 // It must run BEFORE the container's process is placed in the leaf, so the
 // process never runs a single instruction unbounded. Every write failing is
@@ -250,8 +254,10 @@ func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
 		return fmt.Errorf("%w: max %d, high %d", ErrInvalidMemoryLimits, l.Max, l.High)
 	case l.Max > 0 && l.High > l.Max:
 		return fmt.Errorf("%w: high %d exceeds max %d", ErrInvalidMemoryLimits, l.High, l.Max)
-	case !l.Set():
-		return nil
+	}
+	oomGroup := "0"
+	if l.Set() {
+		oomGroup = "1"
 	}
 	if err := write(filepath.Join(leaf, MemoryMaxFile), limitValue(l.Max)); err != nil {
 		return fmt.Errorf("set memory.max: %w", err)
@@ -259,7 +265,7 @@ func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
 	if err := write(filepath.Join(leaf, MemoryHighFile), limitValue(l.High)); err != nil {
 		return fmt.Errorf("set memory.high: %w", err)
 	}
-	if err := write(filepath.Join(leaf, MemoryOOMGroupFile), "1"); err != nil {
+	if err := write(filepath.Join(leaf, MemoryOOMGroupFile), oomGroup); err != nil {
 		return fmt.Errorf("set memory.oom.group: %w", err)
 	}
 	return nil

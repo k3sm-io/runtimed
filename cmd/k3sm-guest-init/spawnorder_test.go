@@ -137,13 +137,75 @@ func TestSpawnAppliesMemoryLimitsBeforeFork(t *testing.T) {
 		}
 	})
 
-	t.Run("no limit forks with no write", func(t *testing.T) {
+	t.Run("no limit resets the leaf, then forks", func(t *testing.T) {
 		r := &spawnRecorder{}
 		if _, err := r.spawn(leaf, plan(0, 0)); err != nil {
 			t.Fatalf("spawn: %v", err)
 		}
-		if want := []string{"arm app", "fork"}; !reflect.DeepEqual(r.calls, want) {
+		want := []string{
+			guestagent.MemoryMaxFile + "=max",
+			guestagent.MemoryHighFile + "=max",
+			guestagent.MemoryOOMGroupFile + "=0",
+			"arm app",
+			"fork",
+		}
+		if !reflect.DeepEqual(r.calls, want) {
 			t.Errorf("calls = %q, want %q", r.calls, want)
 		}
 	})
+}
+
+// TestSpawnResetsStaleLimitsOnReusedLeaf is the B1160 gate: a restart reuses
+// the container's leaf, so when the new spec sets no memory limit the leaf
+// still holds the earlier instance's memory.max, memory.high and
+// memory.oom.group = 1. Spawn writes max, max and 0 over them before the fork,
+// so an unbounded container does not run bounded and group-killed; and a
+// failed reset write means no fork, the same as a failed limit write.
+func TestSpawnResetsStaleLimitsOnReusedLeaf(t *testing.T) {
+	const leaf = "/sys/fs/cgroup/k3sm/app"
+	unset := guestinit.ContainerPlan{Name: "app"}
+	prior := func() map[string]string {
+		return map[string]string{
+			guestagent.MemoryMaxFile:      "1073741824",
+			guestagent.MemoryHighFile:     "966367641",
+			guestagent.MemoryOOMGroupFile: "1",
+		}
+	}
+
+	r := &spawnRecorder{files: prior()}
+	pid, err := r.spawn(leaf, unset)
+	if err != nil || pid != 42 {
+		t.Fatalf("spawn = %d, %v; want 42, nil", pid, err)
+	}
+	want := []string{
+		guestagent.MemoryMaxFile + "=max",
+		guestagent.MemoryHighFile + "=max",
+		guestagent.MemoryOOMGroupFile + "=0",
+		"arm app",
+		"fork",
+	}
+	if !reflect.DeepEqual(r.calls, want) {
+		t.Errorf("calls = %q\nwant    %q", r.calls, want)
+	}
+	for f, v := range map[string]string{
+		guestagent.MemoryMaxFile:      "max",
+		guestagent.MemoryHighFile:     "max",
+		guestagent.MemoryOOMGroupFile: "0",
+	} {
+		if got := r.files[f]; got != v {
+			t.Errorf("%s = %q after the reset, want %q", f, got, v)
+		}
+	}
+
+	for _, f := range []string{guestagent.MemoryMaxFile, guestagent.MemoryHighFile, guestagent.MemoryOOMGroupFile} {
+		r := &spawnRecorder{failOn: f, files: prior()}
+		if _, err := r.spawn(leaf, unset); err == nil {
+			t.Errorf("%s reset failing: spawn succeeded, want the start to fail", f)
+		}
+		for _, c := range r.calls {
+			if c == "fork" {
+				t.Errorf("%s reset failing: the container was forked: calls %q", f, r.calls)
+			}
+		}
+	}
 }

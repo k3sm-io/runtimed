@@ -30,11 +30,16 @@ import (
 // the container's process is forked into it. leaf is "" when no leaf could be
 // made.
 //
-// With no limit it writes nothing and a missing leaf is the unmetered case the
-// spawn already degrades to. With a limit, a missing leaf or a failed write
-// fails the container's start: the host asked for a bound and this guest
-// advertises memory-limits, so running the container without it would let it
-// take the whole VM's memory while the pod spec says it cannot.
+// With no limit a missing leaf is the unmetered case the spawn already
+// degrades to, and an existing leaf is reset to unbounded (memory.max and
+// memory.high "max", memory.oom.group 0): a restart reuses the leaf, and the
+// previous instance's bound must not outlive the spec that set it. A failed
+// reset write fails the start like a failed limit write, since the container
+// would otherwise run under a bound and a group kill its spec does not have.
+// With a limit, a missing leaf or a failed write fails the container's start:
+// the host asked for a bound and this guest advertises memory-limits, so
+// running the container without it would let it take the whole VM's memory
+// while the pod spec says it cannot.
 //
 // It lives in an untagged file so the gate runs on the darwin host; the linux
 // spawn is its only caller.
@@ -46,10 +51,10 @@ func applyContainerMemory(leaf string, cp guestinit.ContainerPlan) error {
 // through write.
 func applyContainerMemoryVia(write guestagent.LeafWriter, leaf string, cp guestinit.ContainerPlan) error {
 	limits := guestagent.MemoryLimits{Max: cp.MemoryMaxBytes, High: cp.MemoryHighBytes}
-	if !limits.Set() {
-		return nil
-	}
 	if leaf == "" {
+		if !limits.Set() {
+			return nil
+		}
 		return fmt.Errorf("container %s has a memory limit but no cgroup2 leaf to apply it to", cp.Name)
 	}
 	if err := guestagent.ApplyMemoryLimitsVia(write, leaf, limits); err != nil {
