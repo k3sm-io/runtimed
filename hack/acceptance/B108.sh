@@ -282,7 +282,7 @@ probe() {
 
 		go 1.25
 	EOF
-	(cd "$d" && env GOWORK=off GOFLAGS= GOARCH=arm64 CGO_ENABLED=1 go test ./... >"$d/out.log" 2>&1) || rc=$?
+	(cd "$d" && env GOWORK=off GOFLAGS= GOARCH=arm64 CGO_ENABLED=1 go test -count=1 ./... >"$d/out.log" 2>&1) || rc=$?
 	echo "$rc"
 }
 
