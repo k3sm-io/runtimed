@@ -32,6 +32,7 @@ func TestCapabilitiesAdvertiseGuestFieldTokens(t *testing.T) {
 		"sidecar-init":         CapabilitySidecarInit,
 		"image-user":           CapabilityImageUser,
 		"restart-container":    CapabilityRestartContainer,
+		"memory-limits":        CapabilityMemoryLimits,
 	}
 	got := Capabilities()
 	for wire, constant := range want {

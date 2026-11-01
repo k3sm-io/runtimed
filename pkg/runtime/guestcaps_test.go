@@ -35,7 +35,7 @@ func TestKnownGuestCapabilityCoversAgentTokens(t *testing.T) {
 	}
 	for _, tok := range []string{
 		guestagent.CapabilityGuestPrivateMounts, guestagent.CapabilitySidecarInit, guestagent.CapabilityImageUser,
-		guestagent.CapabilityRestartContainer,
+		guestagent.CapabilityRestartContainer, guestagent.CapabilityMemoryLimits,
 	} {
 		if !knownGuestCapability(tok) {
 			t.Errorf("knownGuestCapability(%q) = false", tok)

@@ -181,3 +181,82 @@ func appendLine(path, line string) error {
 	}
 	return nil
 }
+
+// The cgroup2 memory interface files a container leaf carries once the memory
+// controller is delegated to it (EnableSubtreeControllers).
+const (
+	// MemoryMaxFile is the hard limit; above it the cgroup OOM killer runs.
+	MemoryMaxFile = "memory.max"
+	// MemoryHighFile is the throttle point: above it the kernel reclaims the
+	// cgroup's pages hard and counts a high event, but kills nothing.
+	MemoryHighFile = "memory.high"
+	// MemoryOOMGroupFile makes the whole cgroup the OOM kill unit when 1.
+	MemoryOOMGroupFile = "memory.oom.group"
+	// MemoryEventsFile carries the cgroup's low/high/max/oom/oom_kill counters.
+	MemoryEventsFile = "memory.events"
+)
+
+// MemoryLimits are one container's memory.max and memory.high in bytes, as
+// GuestContainer.memory_limit_bytes and memory_high_bytes carry them. 0 means
+// unset: the file keeps the kernel's "max".
+type MemoryLimits struct {
+	Max  int64
+	High int64
+}
+
+// Set reports whether either limit is set.
+func (l MemoryLimits) Set() bool { return l.Max > 0 || l.High > 0 }
+
+// ErrInvalidMemoryLimits reports a limit pair guest/v1 forbids: a negative
+// value, or memory.high above a set memory.max.
+var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
+
+// ApplyMemoryLimits writes l into the container leaf: memory.max, then
+// memory.high, then memory.oom.group = 1. An unset limit's file is not
+// written. With no limit set it writes nothing.
+//
+// It must run BEFORE the container's process is placed in the leaf, so the
+// process never runs a single instruction unbounded. Every write failing is
+// returned, never logged and skipped: a limit the host asked for and the guest
+// did not apply is a container that can take the whole VM's memory while the
+// pod spec says it cannot, and the guest advertises memory-limits on the
+// promise that this does not happen.
+//
+// memory.oom.group = 1 makes the container's cgroup the OOM kill unit: when
+// its limit is hit the kernel kills every process in it, not just the largest
+// one. That is what the kubelet does on cgroup v2, and it is what makes the
+// exit a container exit (with oom_kill counted in memory.events) instead of a
+// container that lost one child and kept running.
+func ApplyMemoryLimits(leaf string, l MemoryLimits) error {
+	switch {
+	case l.Max < 0 || l.High < 0:
+		return fmt.Errorf("%w: max %d, high %d", ErrInvalidMemoryLimits, l.Max, l.High)
+	case l.Max > 0 && l.High > l.Max:
+		return fmt.Errorf("%w: high %d exceeds max %d", ErrInvalidMemoryLimits, l.High, l.Max)
+	case !l.Set():
+		return nil
+	}
+	if l.Max > 0 {
+		if err := appendLine(filepath.Join(leaf, MemoryMaxFile), strconv.FormatInt(l.Max, 10)); err != nil {
+			return fmt.Errorf("set memory.max: %w", err)
+		}
+	}
+	if l.High > 0 {
+		if err := appendLine(filepath.Join(leaf, MemoryHighFile), strconv.FormatInt(l.High, 10)); err != nil {
+			return fmt.Errorf("set memory.high: %w", err)
+		}
+	}
+	if err := appendLine(filepath.Join(leaf, MemoryOOMGroupFile), "1"); err != nil {
+		return fmt.Errorf("set memory.oom.group: %w", err)
+	}
+	return nil
+}
+
+// ReadMemoryEvents reads and parses the leaf's memory.events.
+func ReadMemoryEvents(leaf string) (MemoryEvents, error) {
+	raw, err := os.ReadFile(filepath.Join(leaf, MemoryEventsFile))
+	if err != nil {
+		return MemoryEvents{}, fmt.Errorf("read memory.events: %w", err)
+	}
+	return ParseMemoryEvents(string(raw))
+}
