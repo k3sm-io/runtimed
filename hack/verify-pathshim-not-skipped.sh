@@ -1,46 +1,59 @@
 #!/usr/bin/env bash
-# The path shim temp-dir test must run, not skip, on a host that can run it.
+# The path shim build tests must run, not skip, on a host that can run them.
 #
-# TestPathShimBuildLeavesNoTempDirs (pkg/runtime/pathshim_tmpdir_test.go) skips
-# when the toolchain cannot emit an x86_64 slice, so the unit tier stays green on
-# a host without one. go test without -v prints no SKIP line, so a toolchain that
-# loses its x86_64 slice would turn the test into a silent pass. This stage runs
-# the test alone with -v and goes RED unless it reports PASS.
+# TestPathShimBuildLeavesNoTempDirs (pkg/runtime/pathshim_tmpdir_test.go) and
+# TestPathShimIsUniversalBinary (pkg/runtime/pathshim_arch_test.go) skip when the
+# toolchain cannot emit an x86_64 slice, so the unit tier stays green on a host
+# without one. go test without -v prints no SKIP line, so a toolchain that loses
+# its x86_64 slice would turn both tests into silent passes. This stage runs them
+# in one go test invocation with -v and goes RED unless each reports PASS.
 #
-# It applies only where the test can run: Apple silicon hardware (hw.optional.arm64,
+# It applies only where the tests can run: Apple silicon hardware (hw.optional.arm64,
 # which stays 1 under a Rosetta-translated shell, unlike uname -m) with an Xcode or
 # Command Line Tools clang that xcrun can find. Anywhere else it says so and exits 0.
 #
-# RED when: the test reports SKIP; it fails; it does not run at all (renamed or
-# removed, so -run matches nothing).
+# RED when any of the tests: reports SKIP; fails; does not run at all (renamed or
+# removed, so -run matches nothing for it). Every offending test is named.
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-test_name=TestPathShimBuildLeavesNoTempDirs
+tests=(TestPathShimBuildLeavesNoTempDirs TestPathShimIsUniversalBinary)
 pkg=./pkg/runtime/
 
 if [ "$(uname -s)" != Darwin ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" != 1 ]; then
-	echo "    $test_name: not an Apple silicon Mac, not required to run here"
+	echo "    ${tests[*]}: not an Apple silicon Mac, not required to run here"
 	exit 0
 fi
 if ! xcrun --find clang >/dev/null 2>&1; then
-	echo "    $test_name: xcrun finds no clang, not required to run here"
+	echo "    ${tests[*]}: xcrun finds no clang, not required to run here"
 	exit 0
 fi
 
+run_re="^($(IFS='|'; echo "${tests[*]}"))\$"
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 rc=0
-CGO_ENABLED=1 go test -race -count=1 -v -run "^${test_name}\$" "$pkg" > "$log" 2>&1 || rc=$?
-if grep -q -- "--- SKIP: ${test_name}" "$log"; then
+CGO_ENABLED=1 go test -race -count=1 -v -run "$run_re" "$pkg" > "$log" 2>&1 || rc=$?
+
+bad=()
+for t in "${tests[@]}"; do
+	if grep -q -- "--- SKIP: ${t} " "$log"; then
+		bad+=("$t skipped")
+	elif grep -q -- "--- FAIL: ${t} " "$log"; then
+		bad+=("$t failed")
+	elif ! grep -q -- "--- PASS: ${t} " "$log"; then
+		bad+=("$t did not run")
+	fi
+done
+if [ "$rc" -ne 0 ] && [ "${#bad[@]}" -eq 0 ]; then
+	bad+=("go test exited $rc")
+fi
+if [ "${#bad[@]}" -ne 0 ]; then
 	cat "$log" >&2
-	echo "FAIL: [runtimed] $test_name skipped on an Apple silicon Mac where xcrun finds clang;" \
-		"the toolchain clang on PATH cannot build the universal path shim (see the SKIP reason above)" >&2
+	for b in "${bad[@]}"; do
+		echo "FAIL: [runtimed] $b on an Apple silicon Mac where xcrun finds clang" >&2
+	done
+	echo "    a skip means the clang on PATH cannot build the universal path shim (see the SKIP reason above)" >&2
 	exit 1
 fi
-if [ "$rc" -ne 0 ] || ! grep -q -- "--- PASS: ${test_name}" "$log"; then
-	cat "$log" >&2
-	echo "FAIL: [runtimed] $test_name did not pass (exit $rc)" >&2
-	exit 1
-fi
-echo "    $test_name: PASS"
+for t in "${tests[@]}"; do echo "    $t: PASS"; done
