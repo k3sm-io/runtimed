@@ -76,16 +76,16 @@ func newStopAgent(block bool) *stopAgent {
 	return &stopAgent{block: block, got: make(chan *guestv1.StopRequest, 1), cancelled: make(chan struct{})}
 }
 
-// promptly bounds every wait in this file. It is generous on purpose: the cases
-// assert that something happens, not how fast a loaded machine does it.
-const promptly = 10 * time.Second
-
 // TestGuestStopperIssuesStopRPC drives the production agentStopper,
 // NewAgentStopper, over a real gRPC connection to an in-process guest agent:
 // the Stop RPC arrives carrying the grace graceSeconds computes, graceSeconds
 // saturates at both bounds, and a Stop whose context is cancelled while the
-// guest holds the call returns promptly with the one outcome on its channel,
-// the server having seen the cancel.
+// guest holds the call returns with the one outcome on its channel, the server
+// having seen the cancel.
+//
+// Every wait is a plain channel receive with no wall-clock bound: a Stop that
+// never reaches the guest, or never delivers its outcome, hangs the case and
+// the go test timeout reports it with every goroutine's stack.
 func TestGuestStopperIssuesStopRPC(t *testing.T) {
 	t.Run("the-rpc-carries-the-computed-grace", func(t *testing.T) {
 		cases := []struct {
@@ -102,28 +102,17 @@ func TestGuestStopperIssuesStopRPC(t *testing.T) {
 				agent := newStopAgent(false)
 				stopper := NewAgentStopper(serveStopAgent(t, agent))
 
-				ctx, cancel := context.WithTimeout(context.Background(), promptly)
-				defer cancel()
-				done := stopper.Stop(ctx, tc.grace)
+				done := stopper.Stop(t.Context(), tc.grace)
 
-				select {
-				case req := <-agent.got:
-					if got := req.GetGraceSeconds(); got != tc.want {
-						t.Errorf("Stop RPC grace_seconds = %d, want %d", got, tc.want)
-					}
-					if got, computed := req.GetGraceSeconds(), graceSeconds(tc.grace); got != computed {
-						t.Errorf("Stop RPC grace_seconds = %d, graceSeconds(%v) = %d", got, tc.grace, computed)
-					}
-				case <-time.After(promptly):
-					t.Fatal("the guest agent never received the Stop RPC")
+				req := <-agent.got
+				if got := req.GetGraceSeconds(); got != tc.want {
+					t.Errorf("Stop RPC grace_seconds = %d, want %d", got, tc.want)
 				}
-				select {
-				case err := <-done:
-					if err != nil {
-						t.Errorf("Stop outcome = %v, want nil for an accepted request", err)
-					}
-				case <-time.After(promptly):
-					t.Fatal("Stop never delivered its outcome")
+				if got, computed := req.GetGraceSeconds(), graceSeconds(tc.grace); got != computed {
+					t.Errorf("Stop RPC grace_seconds = %d, graceSeconds(%v) = %d", got, tc.grace, computed)
+				}
+				if err := <-done; err != nil {
+					t.Errorf("Stop outcome = %v, want nil for an accepted request", err)
 				}
 			})
 		}
@@ -154,7 +143,7 @@ func TestGuestStopperIssuesStopRPC(t *testing.T) {
 		}
 	})
 
-	t.Run("cancel-returns-promptly", func(t *testing.T) {
+	t.Run("cancel-ends-the-call", func(t *testing.T) {
 		agent := newStopAgent(true)
 		stopper := NewAgentStopper(serveStopAgent(t, agent))
 
@@ -164,11 +153,7 @@ func TestGuestStopperIssuesStopRPC(t *testing.T) {
 		// started, its outcome is not in yet.
 		done := stopper.Stop(ctx, 5*time.Second)
 
-		select {
-		case <-agent.got:
-		case <-time.After(promptly):
-			t.Fatal("the guest agent never received the Stop RPC")
-		}
+		<-agent.got
 		select {
 		case err := <-done:
 			t.Fatalf("Stop delivered %v while the guest still held the call", err)
@@ -177,21 +162,15 @@ func TestGuestStopperIssuesStopRPC(t *testing.T) {
 
 		cancel()
 
-		select {
-		case <-agent.cancelled:
-		case <-time.After(promptly):
-			t.Fatal("the guest agent's handler never saw the cancel")
-		}
+		// The handler holds the call until its context ends, so it closes
+		// cancelled only once the client's cancel has crossed the wire.
+		<-agent.cancelled
 		// Receiving the outcome is what proves the RPC goroutine finished: it
 		// sends exactly once, as its last act, so a drained channel leaves
 		// nothing behind.
-		select {
-		case err := <-done:
-			if code := status.Code(err); code != codes.Canceled {
-				t.Errorf("Stop outcome = %v (code %v), want codes.Canceled", err, code)
-			}
-		case <-time.After(promptly):
-			t.Fatal("Stop did not return its outcome after its context was cancelled")
+		err := <-done
+		if code := status.Code(err); code != codes.Canceled {
+			t.Errorf("Stop outcome = %v (code %v), want codes.Canceled", err, code)
 		}
 	})
 }
