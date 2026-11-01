@@ -64,6 +64,11 @@ if [ -n "$go_pkgs" ]; then
 		exit 1
 	fi
 
+	# The path shim temp-dir test skips without an x86_64-capable clang, and a
+	# skip is invisible in the run above; on a host that can run it, it must pass.
+	echo "==> [runtimed] path shim temp-dir test ran"
+	hack/verify-pathshim-not-skipped.sh
+
 	# Wall-clock waits and fixed ports in tests, outside hack/test-sleeps.allow.
 	echo "==> [runtimed] test-sleep lint"
 	hack/verify-test-sleeps.sh --self-test
