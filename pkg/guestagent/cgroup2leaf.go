@@ -198,7 +198,7 @@ const (
 
 // MemoryLimits are one container's memory.max and memory.high in bytes, as
 // GuestContainer.memory_limit_bytes and memory_high_bytes carry them. 0 means
-// unset: the file keeps the kernel's "max".
+// unset: no limit, the kernel's "max".
 type MemoryLimits struct {
 	Max  int64
 	High int64
@@ -212,8 +212,10 @@ func (l MemoryLimits) Set() bool { return l.Max > 0 || l.High > 0 }
 var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
 
 // ApplyMemoryLimits writes l into the container leaf: memory.max, then
-// memory.high, then memory.oom.group = 1. An unset limit's file is not
-// written. With no limit set it writes nothing.
+// memory.high, then memory.oom.group = 1. With a limit set, the other one, if
+// unset, is written as "max": a restart reuses the leaf, and a value an
+// earlier instance left there must not outlive the spec that asked for it.
+// With no limit set it writes nothing.
 //
 // It must run BEFORE the container's process is placed in the leaf, so the
 // process never runs a single instruction unbounded. Every write failing is
@@ -228,6 +230,21 @@ var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
 // exit a container exit (with oom_kill counted in memory.events) instead of a
 // container that lost one child and kept running.
 func ApplyMemoryLimits(leaf string, l MemoryLimits) error {
+	return ApplyMemoryLimitsVia(WriteLeafFile, leaf, l)
+}
+
+// LeafWriter writes one value to one cgroup2 interface file, in one write.
+// WriteLeafFile is the real one; a test passes a recorder to see the order of
+// the writes a spawn makes before its fork.
+type LeafWriter func(path, value string) error
+
+// WriteLeafFile writes value to the cgroup2 interface file at path in one
+// write(2), the way the kernel parses it.
+func WriteLeafFile(path, value string) error { return appendLine(path, value) }
+
+// ApplyMemoryLimitsVia is ApplyMemoryLimits with the file writes going through
+// write.
+func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
 	switch {
 	case l.Max < 0 || l.High < 0:
 		return fmt.Errorf("%w: max %d, high %d", ErrInvalidMemoryLimits, l.Max, l.High)
@@ -236,20 +253,25 @@ func ApplyMemoryLimits(leaf string, l MemoryLimits) error {
 	case !l.Set():
 		return nil
 	}
-	if l.Max > 0 {
-		if err := appendLine(filepath.Join(leaf, MemoryMaxFile), strconv.FormatInt(l.Max, 10)); err != nil {
-			return fmt.Errorf("set memory.max: %w", err)
-		}
+	if err := write(filepath.Join(leaf, MemoryMaxFile), limitValue(l.Max)); err != nil {
+		return fmt.Errorf("set memory.max: %w", err)
 	}
-	if l.High > 0 {
-		if err := appendLine(filepath.Join(leaf, MemoryHighFile), strconv.FormatInt(l.High, 10)); err != nil {
-			return fmt.Errorf("set memory.high: %w", err)
-		}
+	if err := write(filepath.Join(leaf, MemoryHighFile), limitValue(l.High)); err != nil {
+		return fmt.Errorf("set memory.high: %w", err)
 	}
-	if err := appendLine(filepath.Join(leaf, MemoryOOMGroupFile), "1"); err != nil {
+	if err := write(filepath.Join(leaf, MemoryOOMGroupFile), "1"); err != nil {
 		return fmt.Errorf("set memory.oom.group: %w", err)
 	}
 	return nil
+}
+
+// limitValue is the interface-file value for one limit: the byte count, or the
+// kernel's "max" (no limit) for an unset one.
+func limitValue(n int64) string {
+	if n > 0 {
+		return strconv.FormatInt(n, 10)
+	}
+	return "max"
 }
 
 // ReadMemoryEvents reads and parses the leaf's memory.events.
