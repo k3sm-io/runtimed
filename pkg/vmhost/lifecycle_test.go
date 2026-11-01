@@ -81,18 +81,26 @@ func (m *fakeMachine) Stop(ctx context.Context) error {
 
 // fakeAgent is the agentStopper seam. onStop lets a case decide what the guest
 // does in response: exit within the budget, ignore the request, or refuse it.
+//
+// The call is recorded on the caller's goroutine, before Stop returns, because
+// that is the seam's contract (the request has begun when Stop returns); the
+// guest's response runs on a goroutine of its own, as the real RPC does.
 type fakeAgent struct {
 	rec    *callLog
 	err    error
 	onStop func(grace time.Duration)
 }
 
-func (a *fakeAgent) Stop(ctx context.Context, grace time.Duration) error {
+func (a *fakeAgent) Stop(ctx context.Context, grace time.Duration) <-chan error {
 	a.rec.add("agent.Stop")
-	if a.onStop != nil {
-		a.onStop(grace)
-	}
-	return a.err
+	done := make(chan error, 1)
+	go func() {
+		if a.onStop != nil {
+			a.onStop(grace)
+		}
+		done <- a.err
+	}()
+	return done
 }
 
 // callLog is an ordered, concurrency-safe record of seam calls.

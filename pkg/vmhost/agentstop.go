@@ -57,9 +57,25 @@ func NewAgentStopper(dial vsockDialer) agentStopper { return &guestStopper{dial:
 // would read to the guest as "kill immediately", turning a clamping bug into data
 // loss.
 //
+// The RPC runs on its own goroutine, and Stop returns once that goroutine is
+// running, so the request is under way before the caller can reach its hard
+// stop (see agentStopper). The outcome is the one value on the returned channel.
+func (s *guestStopper) Stop(ctx context.Context, grace time.Duration) <-chan error {
+	done := make(chan error, 1)
+	running := make(chan struct{})
+	go func() {
+		close(running)
+		done <- s.call(ctx, grace)
+	}()
+	<-running
+	return done
+}
+
+// call is the one guest/v1 Stop RPC.
+//
 // A fresh connection per call, closed here: this call happens once per machine
 // lifetime, on the way out.
-func (s *guestStopper) Stop(ctx context.Context, grace time.Duration) error {
+func (s *guestStopper) call(ctx context.Context, grace time.Duration) error {
 	conn, err := grpc.NewClient("passthrough:///guest-agent",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(dctx context.Context, _ string) (net.Conn, error) {
