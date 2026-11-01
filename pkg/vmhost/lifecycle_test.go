@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -149,6 +150,14 @@ func (m *manualTimer) fire() {
 	}
 }
 
+// dueTimer is a NewTimer seam whose timer has already expired when it is armed:
+// its channel holds a value before the caller ever selects on it.
+func dueTimer(time.Duration) (<-chan time.Time, func() bool) {
+	ch := make(chan time.Time, 1)
+	ch <- time.Now()
+	return ch, func() bool { return true }
+}
+
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -263,31 +272,47 @@ func TestLifecycleStateMachine(t *testing.T) {
 		// A hard stop is a power cut: for a pod mid-write it is data loss, and for
 		// a PVC it is data loss that outlives the pod. So the graceful leg must
 		// come first, and the hard stop only after the budget is spent.
-		rec := &callLog{}
-		m := newFakeMachine(rec)
-		timer := newManualTimer()
-		lc := NewLifecycle(m, &fakeAgent{rec: rec}, LifecycleOptions{
-			Logger: quietLogger(), NewTimer: timer.new,
-		})
+		//
+		// The deadline is ALREADY DUE when shutdown arms it: the worst case, a
+		// shutdown goroutine descheduled past the whole budget. The hard stop is
+		// then reachable the moment the select first looks, so the only thing
+		// that can put agent.Stop ahead of machine.Stop in the log is the
+		// lifecycle issuing the request before that select. Firing the timer
+		// later, after StateStopping, left the request a window to land first by
+		// luck, and a request moved back onto a goroutine of its own passed most
+		// runs.
+		//
+		// A correct lifecycle passes every round by construction. The rounds are
+		// for the regression: a request issued from a goroutine of its own loses
+		// the race to the due deadline in most single rounds, so one gate run
+		// over many rounds reds on it with near certainty.
+		const rounds = 50
+		for i := range rounds {
+			rec := &callLog{}
+			m := newFakeMachine(rec)
+			lc := NewLifecycle(m, &fakeAgent{rec: rec}, LifecycleOptions{
+				Logger: quietLogger(), NewTimer: dueTimer,
+			})
 
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- lc.Run(ctx) }()
-		waitForState(t, lc, StateRunning)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- lc.Run(ctx) }()
+			waitForState(t, lc, StateRunning)
 
-		cancel()
-		waitForState(t, lc, StateStopping)
-		// The guest ignores the request; the budget expires.
-		<-timer.asked
-		timer.fire()
+			// The guest ignores the request; the budget is already spent.
+			cancel()
 
-		if err := <-done; err != nil {
-			t.Fatalf("Run: %v", err)
-		}
-		want := []string{"machine.Start", "agent.Stop", "machine.Stop"}
-		assertCalls(t, rec.snapshot(), want)
-		if lc.State() != StateStopped {
-			t.Errorf("state = %v, want Stopped", lc.State())
+			if err := <-done; err != nil {
+				t.Fatalf("round %d: Run: %v", i, err)
+			}
+			want := []string{"machine.Start", "agent.Stop", "machine.Stop"}
+			if got := rec.snapshot(); !slices.Equal(got, want) {
+				t.Fatalf("round %d of %d: calls = %v, want %v; the machine must not be halted before the guest is asked",
+					i+1, rounds, got, want)
+			}
+			if lc.State() != StateStopped {
+				t.Fatalf("round %d: state = %v, want Stopped", i, lc.State())
+			}
 		}
 	})
 
