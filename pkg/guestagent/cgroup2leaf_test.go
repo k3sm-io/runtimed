@@ -117,6 +117,7 @@ func TestCgroup2LeafProvisioning(t *testing.T) {
 				"cpu.stat":       "usage_usec 1234\nuser_usec 900\nsystem_usec 334\n",
 				"memory.current": "20480\n",
 				"memory.stat":    "anon 8192\ninactive_file 4096\n",
+				MemoryEventsFile: "low 0\nhigh 2\nmax 0\noom 0\noom_kill 0\n",
 				ProcsFile:        "",
 			}
 			for name, content := range write {

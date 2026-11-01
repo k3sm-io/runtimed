@@ -27,8 +27,8 @@ import (
 
 // The cgroup2 interface files this package reads or writes, named once.
 //
-// SampleFiles are exactly the three the Sampler needs, and they are listed here
-// rather than restated in a test: a leaf that does not carry all three produces
+// SampleFiles are exactly the four the Sampler needs, and they are listed here
+// rather than restated in a test: a leaf that does not carry all four produces
 // no sample at all (a partially-read sample is not a sample — see
 // ContainerSample), so "which files must exist" is a property of the leaf, not of
 // the reader.
@@ -44,12 +44,12 @@ const (
 )
 
 // SampleFiles are the interface files cgroupSampler reads from a leaf.
-var SampleFiles = []string{"cpu.stat", "memory.current", "memory.stat"}
+var SampleFiles = []string{"cpu.stat", "memory.current", "memory.stat", MemoryEventsFile}
 
 // StatsControllers are the cgroup2 controllers whose presence in a parent's
 // subtree_control is what creates SampleFiles in its children. cpu.stat exists in
-// every v2 cgroup, but memory.current and memory.stat do not: they appear only
-// when the memory controller is delegated downward.
+// every v2 cgroup, but memory.current, memory.stat and memory.events do not: they
+// appear only when the memory controller is delegated downward.
 var StatsControllers = []string{"cpu", "memory"}
 
 // ErrInvalidCgroupName reports a container name that cannot be a cgroup leaf

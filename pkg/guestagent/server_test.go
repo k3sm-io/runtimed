@@ -593,3 +593,37 @@ func TestGuestAgentAnswersItsOwnRPCs(t *testing.T) {
 		}
 	})
 }
+
+// TestStatsSampleCarriesMemoryHighEvents pins that the Stats verb sends the
+// container's memory.events high counter to the host. Two samples with a rising
+// count must each reach the wire as read: the host diffs them to see memory.high
+// throttling, so a dropped or stale value hides it.
+func TestStatsSampleCarriesMemoryHighEvents(t *testing.T) {
+	const booted = "pod-high"
+	sampler := &fakeSampler{samples: map[string]ContainerSample{}}
+	client := testAgent(t, booted, Deps{
+		Runner:  &fakeRunner{names: []string{"app"}},
+		Sampler: sampler,
+	})
+	for _, tc := range []struct {
+		name string
+		high uint64
+	}{
+		{name: "first-sample", high: 3},
+		{name: "rising-count", high: 17},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sampler.samples["app"] = ContainerSample{CPUUsageUsec: 1, MemoryWorkingSetBytes: 2048, MemoryHighEvents: tc.high}
+			resp, err := client.Stats(context.Background(), &guestv1.StatsRequest{PodId: booted})
+			if err != nil {
+				t.Fatalf("Stats: %v", err)
+			}
+			if len(resp.GetContainers()) != 1 {
+				t.Fatalf("got %d samples, want 1", len(resp.GetContainers()))
+			}
+			if got := resp.GetContainers()[0].GetMemoryHighEvents(); got != tc.high {
+				t.Errorf("memory_high_events = %d, want %d", got, tc.high)
+			}
+		})
+	}
+}

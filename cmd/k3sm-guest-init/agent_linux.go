@@ -185,7 +185,8 @@ type cgroupSampler struct {
 	root string
 }
 
-// Sample reads the container's cpu.stat and memory files.
+// Sample reads the container's cpu.stat, memory.current, memory.stat and
+// memory.events files.
 //
 // A container with no leaf is guestagent.ErrNotFound, which the server treats as
 // "omit". A leaf whose files exist but cannot be parsed is a different error and is
@@ -216,7 +217,11 @@ func (c *cgroupSampler) Sample(_ context.Context, container string) (guestagent.
 	if err != nil {
 		return guestagent.ContainerSample{}, err
 	}
-	return guestagent.ContainerSample{CPUUsageUsec: usage, MemoryWorkingSetBytes: ws}, nil
+	events, err := guestagent.ReadMemoryEvents(dir)
+	if err != nil {
+		return guestagent.ContainerSample{}, err
+	}
+	return guestagent.ContainerSample{CPUUsageUsec: usage, MemoryWorkingSetBytes: ws, MemoryHighEvents: events.High}, nil
 }
 
 // procExecer is the Execer seam: fork/exec one command inside a container's

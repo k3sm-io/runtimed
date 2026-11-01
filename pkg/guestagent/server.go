@@ -80,6 +80,10 @@ type ContainerSample struct {
 	CPUUsageUsec uint64
 	// MemoryWorkingSetBytes is the working set as WorkingSet computes it.
 	MemoryWorkingSetBytes uint64
+	// MemoryHighEvents is the cgroup2 memory.events high counter: how many
+	// times usage went over memory.high and was throttled. Monotonic over the
+	// leaf's life.
+	MemoryHighEvents uint64
 }
 
 // The consumer seams. Each is the smallest thing the server needs from the
@@ -401,6 +405,7 @@ func (s *Server) Stats(ctx context.Context, req *guestv1.StatsRequest) (*guestv1
 			Container:             name,
 			CpuUsageUsec:          sample.CPUUsageUsec,
 			MemoryWorkingSetBytes: sample.MemoryWorkingSetBytes,
+			MemoryHighEvents:      sample.MemoryHighEvents,
 		})
 	}
 	return out, nil
