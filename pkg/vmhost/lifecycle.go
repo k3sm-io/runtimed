@@ -99,10 +99,21 @@ type machineRunner interface {
 // compromised, or simply not listening yet, while the hypervisor-level stop cannot.
 // A lifecycle that could not tell the two apart would have to treat an unreachable
 // agent as a machine failure.
+//
+// Stop issues the request and returns at once; the outcome arrives later on the
+// returned channel. Splitting the two is what orders the request before the
+// hard stop: the lifecycle calls Stop on the goroutine that later halts the
+// machine, so the request has been issued before the halt can be reached. A
+// seam that returned only after the RPC would have to run on a goroutine of its
+// own, and nothing would then order that goroutine's call before a deadline
+// that was already ready when the shutdown loop first looked.
 type agentStopper interface {
-	// Stop asks the guest to shut down within grace. An error means the request
-	// did not get through; the caller falls back to the hard stop.
-	Stop(ctx context.Context, grace time.Duration) error
+	// Stop asks the guest to shut down within grace. The request has begun by
+	// the time Stop returns; the returned channel receives exactly one value,
+	// nil when the guest accepted the request, or an error meaning the request
+	// did not get through, in which case the caller falls back to the hard stop.
+	// ctx bounds the request.
+	Stop(ctx context.Context, grace time.Duration) <-chan error
 }
 
 // DefaultStopGrace is the graceful-termination budget used when none is supplied.
@@ -418,7 +429,10 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 //
 // The grace clock starts here, before the agent is asked anything, and the agent
 // call runs beside it rather than in front of it: a wedged RPC spends the same
-// budget the guest would have, never extra.
+// budget the guest would have, never extra. The request itself is issued on this
+// goroutine before the loop that can reach the hard stop, so a deadline that is
+// already due (this goroutine descheduled past it) still cannot halt a guest
+// that was never asked.
 func (l *Lifecycle) shutdown(waited <-chan error) error {
 	start := l.now()
 	elapsed := func() time.Duration { return l.now().Sub(start) }
@@ -447,11 +461,13 @@ func (l *Lifecycle) shutdown(waited <-chan error) error {
 	rpcCtx, cancelRPC := context.WithCancel(context.Background())
 	defer cancelRPC()
 
-	agentDone := make(chan error, 1)
+	var agentDone <-chan error
 	if l.agent == nil {
-		agentDone <- errors.New("no guest agent transport")
+		noAgent := make(chan error, 1)
+		noAgent <- errors.New("no guest agent transport")
+		agentDone = noAgent
 	} else {
-		go func() { agentDone <- l.agent.Stop(rpcCtx, sent) }()
+		agentDone = l.agent.Stop(rpcCtx, sent)
 	}
 
 	var fallback <-chan time.Time

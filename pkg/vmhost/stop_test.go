@@ -101,18 +101,23 @@ func newGateAgent(rec *callLog) *gateAgent {
 	return &gateAgent{rec: rec, entered: make(chan struct{})}
 }
 
-func (a *gateAgent) Stop(ctx context.Context, grace time.Duration) error {
+func (a *gateAgent) Stop(ctx context.Context, grace time.Duration) <-chan error {
 	a.rec.add("agent.Stop")
 	a.mu.Lock()
 	a.grace = grace
 	a.mu.Unlock()
 	close(a.entered)
-	defer a.returned.Store(true)
-	if a.block {
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	return a.err
+	done := make(chan error, 1)
+	go func() {
+		defer a.returned.Store(true)
+		if a.block {
+			<-ctx.Done()
+			done <- ctx.Err()
+			return
+		}
+		done <- a.err
+	}()
+	return done
 }
 
 func (a *gateAgent) sentGrace() time.Duration {
