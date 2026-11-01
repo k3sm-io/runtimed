@@ -242,6 +242,24 @@ func TestContainerLogFileNumberingSurvivesDaemonRestart(t *testing.T) {
 			t.Fatalf("write run-one: %v", err)
 		}
 		w1.release(1001)
+		// The first daemon is gone before the second starts, as under
+		// `launchctl kickstart -k` (launchd runs one instance of the label).
+		// Without this the first runtime's exit path (drop the reap record,
+		// then rmdir the pod's reap dir) runs under its own reapStoreMu while
+		// the second writes the same pod's record: the rmdir lands between
+		// the second's MkdirAll and its write or rename, and the write fails
+		// ENOENT or the rename EINVAL (APFS on a directory being removed).
+		waitFor(t, 5*time.Second, "the first run to observe its container's exit", func() bool {
+			st, err := rt1.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: "pod-rs"})
+			if err != nil {
+				return false
+			}
+			cs := st.GetStatus().GetContainerStatuses()
+			return len(cs) == 1 && cs[0].GetState().GetTerminated() != nil
+		})
+		if err := rt1.Close(); err != nil {
+			t.Fatalf("Close the first run: %v", err)
+		}
 
 		w2 := newBlockingWaiter()
 		rt2 := newTestRuntimeCfg(t, Config{Root: root, PodLogsDir: logs}, Deps{Waiter: w2})
