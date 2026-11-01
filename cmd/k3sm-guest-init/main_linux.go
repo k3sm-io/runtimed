@@ -846,29 +846,27 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestag
 	if leafDir != nil {
 		defer func() { _ = leafDir.Close() }()
 	}
-	// The memory limits go into the leaf BEFORE the fork places the child in
-	// it, so the container never runs unbounded. Unlike the metering above
-	// this is fail-closed: a limit the host asked for and could not be applied
-	// fails the start (applyContainerMemory).
-	if err := applyContainerMemory(leaf, cp); err != nil {
-		cio.closeAll()
-		return 0, err
-	}
-	// The OOM baseline for this instance, taken before it can allocate.
-	oom.arm(cp.Name)
 	attr := &syscall.ProcAttr{
 		Dir:   dir,
 		Env:   cp.Env,
 		Files: cio.childFiles(),
 		Sys:   sys,
 	}
-	pid, err := syscall.ForkExec(prog, cp.Argv, attr)
-	// This process's copies of the child's ends go immediately after the fork:
-	// holding a pipe's write end open means the readers below never see EOF, so
-	// a container's log stream would never end even after the container did —
-	// and holding the pty slave open means the master never sees EIO, which is
-	// the same failure wearing a different errno.
-	cio.closeChildEnds()
+	// The memory limits go into the leaf BEFORE the fork places the child in
+	// it, so the container never runs unbounded, and the OOM baseline for this
+	// instance is taken before it can allocate (limitThenFork). Unlike the
+	// metering above this is fail-closed: a limit the host asked for and could
+	// not be applied fails the start (applyContainerMemory).
+	pid, err := limitThenFork(leaf, cp, guestagent.WriteLeafFile, oom.arm, func() (int, error) {
+		pid, ferr := syscall.ForkExec(prog, cp.Argv, attr)
+		// This process's copies of the child's ends go immediately after the
+		// fork: holding a pipe's write end open means the readers below never
+		// see EOF, so a container's log stream would never end even after the
+		// container did, and holding the pty slave open means the master never
+		// sees EIO, which is the same failure wearing a different errno.
+		cio.closeChildEnds()
+		return pid, ferr
+	})
 	if err != nil {
 		cio.closeAll()
 		return 0, err

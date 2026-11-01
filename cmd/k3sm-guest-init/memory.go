@@ -37,6 +37,12 @@ import (
 // It lives in an untagged file so the gate runs on the darwin host; the linux
 // spawn is its only caller.
 func applyContainerMemory(leaf string, cp guestinit.ContainerPlan) error {
+	return applyContainerMemoryVia(guestagent.WriteLeafFile, leaf, cp)
+}
+
+// applyContainerMemoryVia is applyContainerMemory with the leaf writes going
+// through write.
+func applyContainerMemoryVia(write guestagent.LeafWriter, leaf string, cp guestinit.ContainerPlan) error {
 	limits := guestagent.MemoryLimits{Max: cp.MemoryMaxBytes, High: cp.MemoryHighBytes}
 	if !limits.Set() {
 		return nil
@@ -44,10 +50,27 @@ func applyContainerMemory(leaf string, cp guestinit.ContainerPlan) error {
 	if leaf == "" {
 		return fmt.Errorf("container %s has a memory limit but no cgroup2 leaf to apply it to", cp.Name)
 	}
-	if err := guestagent.ApplyMemoryLimits(leaf, limits); err != nil {
+	if err := guestagent.ApplyMemoryLimitsVia(write, leaf, limits); err != nil {
 		return fmt.Errorf("container %s: %w", cp.Name, err)
 	}
 	return nil
+}
+
+// limitThenFork is the order spawn starts a container in, kept portable so its
+// gate runs on the darwin host: the memory limits are written into the leaf,
+// then the instance's OOM baseline is taken, then fork places the child in the
+// leaf. A limit that cannot be written means no fork, so the container never
+// runs a single instruction without the bound its spec asked for.
+//
+// write is the leaf writer (guestagent.WriteLeafFile in the guest), arm the
+// OOM baseline, and fork the fork into the leaf (CLONE_INTO_CGROUP).
+func limitThenFork(leaf string, cp guestinit.ContainerPlan, write guestagent.LeafWriter,
+	arm func(container string), fork func() (int, error)) (int, error) {
+	if err := applyContainerMemoryVia(write, leaf, cp); err != nil {
+		return 0, err
+	}
+	arm(cp.Name)
+	return fork()
 }
 
 // oomWatch decides ContainerExited.oom_killed from each container leaf's
