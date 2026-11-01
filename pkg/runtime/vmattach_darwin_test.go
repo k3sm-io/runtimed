@@ -496,7 +496,11 @@ func TestDeferredVMSweepKeepsHelpersRunning(t *testing.T) {
 		t.Fatalf("CreatePod beside the kept helper = %v, want ErrVMHelperUnadoptable", err)
 	}
 
-	// The next start, with its pod list, adopts it as usual.
+	// The next start, with its pod list, adopts it as usual. The deferred run
+	// exits first, as a daemon does: the root is one runtime's at a time.
+	if err := rt2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	rt3 := h.restart(t)
 	if _, err := rt3.AttachPod(context.Background(), h.box); err != nil {
 		t.Fatalf("AttachPod on the next start: %v", err)

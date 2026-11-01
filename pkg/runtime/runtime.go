@@ -454,6 +454,10 @@ type Runtime struct {
 	// New.
 	shimDialer supervisor.ShimDialer
 
+	// rootLock is the exclusive flock on cfg.Root that New took (rootlock.go);
+	// Close releases it. Never nil after New.
+	rootLock *rootLock
+
 	mu   sync.Mutex
 	pods map[string]*pod
 	// creating counts the CreatePod calls in flight per pod id, under mu: from
@@ -765,6 +769,10 @@ type Deps struct {
 	// KillProcess signals one process by pid (a tree member, or a survivor a
 	// reap record names). Defaults to supervisor.KillPID.
 	KillProcess func(pid int, sig syscall.Signal) error
+	// RootLockWait bounds New's wait for another Runtime to release the root's
+	// lock (RootLockName) before it fails with ErrRootInUse. Zero selects
+	// DefaultRootLockWait; tests shrink it.
+	RootLockWait time.Duration
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -805,6 +813,26 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if _, err := sandbox.ValidatePodLogsDir(cfg.PodLogsDir); err != nil {
 		return nil, err
 	}
+	// Own the root before touching anything under it: two live Runtimes over one
+	// root race on the podreap records, the image index and the pod dirs (one
+	// removes a pod's reap dir while the other commits a record into it).
+	// launchd's one-instance-per-label rule is the only other thing keeping a
+	// second daemon off the root, and it does not cover a hand-started daemon
+	// or an embedder's second Runtime. The lock is held for the Runtime's life
+	// and released by Close (or by the process exit).
+	if err := os.MkdirAll(cfg.Root, 0o755); err != nil {
+		return nil, fmt.Errorf("create runtime root %s: %w", cfg.Root, err)
+	}
+	lock, err := acquireRootLock(cfg.Root, deps.RootLockWait)
+	if err != nil {
+		return nil, err
+	}
+	constructed := false
+	defer func() {
+		if !constructed {
+			_ = lock.release() // New is failing; its own error is the one reported
+		}
+	}()
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -1024,7 +1052,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	logRosettaProbe(log, ConditionRosettaGuestAvailable, rosettaGuest)
 	logGPUProbe(log, gpuFacts, gpuResult.Metal.DeviceName)
 
-	return &Runtime{
+	rt := &Runtime{
 		cfg:            cfg,
 		home:           daemonHome(cfg.Root),
 		log:            log,
@@ -1062,7 +1090,10 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		procSession:    procSession,
 		killProcess:    killProcess,
 		shimDialer:     shimDialer,
-	}, nil
+		rootLock:       lock,
+	}
+	constructed = true
+	return rt, nil
 }
 
 // ImageIndexSnapshot returns every image currently recorded in this node's local
