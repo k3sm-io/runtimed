@@ -197,31 +197,7 @@ func (c *cgroupSampler) Sample(_ context.Context, container string) (guestagent.
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return guestagent.ContainerSample{}, fmt.Errorf("%w: no cgroup2 leaf at %s", guestagent.ErrNotFound, dir)
 	}
-	cpuStat, err := os.ReadFile(path.Join(dir, "cpu.stat"))
-	if err != nil {
-		return guestagent.ContainerSample{}, fmt.Errorf("read cpu.stat: %w", err)
-	}
-	usage, err := guestagent.CPUUsageUsec(string(cpuStat))
-	if err != nil {
-		return guestagent.ContainerSample{}, err
-	}
-	current, err := os.ReadFile(path.Join(dir, "memory.current"))
-	if err != nil {
-		return guestagent.ContainerSample{}, fmt.Errorf("read memory.current: %w", err)
-	}
-	memStat, err := os.ReadFile(path.Join(dir, "memory.stat"))
-	if err != nil {
-		return guestagent.ContainerSample{}, fmt.Errorf("read memory.stat: %w", err)
-	}
-	ws, err := guestagent.WorkingSet(string(current), string(memStat))
-	if err != nil {
-		return guestagent.ContainerSample{}, err
-	}
-	events, err := guestagent.ReadMemoryEvents(dir)
-	if err != nil {
-		return guestagent.ContainerSample{}, err
-	}
-	return guestagent.ContainerSample{CPUUsageUsec: usage, MemoryWorkingSetBytes: ws, MemoryHighEvents: events.High}, nil
+	return sampleLeaf(dir)
 }
 
 // procExecer is the Execer seam: fork/exec one command inside a container's
