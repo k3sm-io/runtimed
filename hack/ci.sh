@@ -101,8 +101,14 @@ if [ -n "$go_pkgs" ]; then
 	# `//lint:ignore <Check> <reason>` comment on the preceding line
 	# (`//nolint` is golangci-lint's spelling and is inert here).
 	# Runs after vet/build/test so a mismatched host tool never stops those.
+	# Candidates, in order: $(go env GOPATH)/bin/staticcheck-<pin> (the versioned
+	# name, so two pins can be installed side by side while the repos switch),
+	# then staticcheck on PATH, then $(go env GOPATH)/bin/staticcheck; the first
+	# reporting exactly the pin wins.
 	sc=""; sc_seen=""
-	for c in "$(command -v staticcheck 2>/dev/null || true)" "$(go env GOPATH)/bin/staticcheck"; do
+	sc_gopath="$(go env GOPATH)"
+	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
+	for c in "${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}" "$(command -v staticcheck 2>/dev/null || true)" "${sc_gopath}/bin/staticcheck"; do
 		[ -n "$c" ] && [ -x "$c" ] || continue
 		v="$("$c" -version 2>/dev/null | awk '{print $2}')" || v=""
 		sc_seen="$sc_seen
@@ -111,10 +117,10 @@ if [ -n "$go_pkgs" ]; then
 	done
 	if [ -z "$sc" ]; then
 		if [ -z "$sc_seen" ]; then
-			echo "==> [runtimed] staticcheck: not installed; the gate needs ${STATICCHECK_VERSION} (go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION})" >&2
+			echo "==> [runtimed] staticcheck: not installed; the gate needs ${STATICCHECK_VERSION} (${sc_hint})" >&2
 		else
 			echo "==> [runtimed] staticcheck: the gate needs ${STATICCHECK_VERSION}, found:${sc_seen}" >&2
-			echo "    install it with: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" >&2
+			echo "    install it with: ${sc_hint}" >&2
 		fi
 		exit 1
 	fi
