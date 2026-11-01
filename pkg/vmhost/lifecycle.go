@@ -100,10 +100,10 @@ type machineRunner interface {
 // A lifecycle that could not tell the two apart would have to treat an unreachable
 // agent as a machine failure.
 //
-// Stop issues the request and returns at once; the outcome arrives later on the
+// Stop starts the request and returns at once; the outcome arrives later on the
 // returned channel. Splitting the two is what orders the request before the
 // hard stop: the lifecycle calls Stop on the goroutine that later halts the
-// machine, so the request has been issued before the halt can be reached. A
+// machine, so the request has been started before the halt can be reached. A
 // seam that returned only after the RPC would have to run on a goroutine of its
 // own, and nothing would then order that goroutine's call before a deadline
 // that was already ready when the shutdown loop first looked.
@@ -429,7 +429,7 @@ func (l *Lifecycle) Run(ctx context.Context) error {
 //
 // The grace clock starts here, before the agent is asked anything, and the agent
 // call runs beside it rather than in front of it: a wedged RPC spends the same
-// budget the guest would have, never extra. The request itself is issued on this
+// budget the guest would have, never extra. The request itself is started on this
 // goroutine before the loop that can reach the hard stop, so a deadline that is
 // already due (this goroutine descheduled past it) still cannot halt a guest
 // that was never asked.
