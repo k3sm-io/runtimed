@@ -19,6 +19,7 @@ package guestagent
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -207,6 +208,12 @@ type MemoryLimits struct {
 // Set reports whether either limit is set.
 func (l MemoryLimits) Set() bool { return l.Max > 0 || l.High > 0 }
 
+// ErrNoMemoryController reports a leaf with no memory interface files because
+// the memory controller is not enabled in it. ApplyMemoryLimits returns it
+// only when no limit is set, where it means there is nothing to reset; with a
+// limit set the missing file is an ordinary write failure.
+var ErrNoMemoryController = errors.New("guestagent: the leaf has no memory controller")
+
 // ErrInvalidMemoryLimits reports a limit pair guest/v1 forbids: a negative
 // value, or memory.high above a set memory.max.
 var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
@@ -219,7 +226,9 @@ var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
 // memory.oom.group = 0, for the same reason: a container whose new spec is
 // unbounded must not run under the previous instance's bound and group kill.
 // On a fresh leaf those are the kernel's defaults, so the writes change
-// nothing.
+// nothing. A leaf without the memory controller (no memory.max) has no bound
+// to reset: with no limit set that returns ErrNoMemoryController and writes
+// nothing, and the caller starts the container unmetered.
 //
 // It must run BEFORE the container's process is placed in the leaf, so the
 // process never runs a single instruction unbounded. Every write failing is
@@ -260,6 +269,9 @@ func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
 		oomGroup = "1"
 	}
 	if err := write(filepath.Join(leaf, MemoryMaxFile), limitValue(l.Max)); err != nil {
+		if !l.Set() && errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %w", ErrNoMemoryController, err)
+		}
 		return fmt.Errorf("set memory.max: %w", err)
 	}
 	if err := write(filepath.Join(leaf, MemoryHighFile), limitValue(l.High)); err != nil {

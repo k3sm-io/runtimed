@@ -17,7 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,9 +35,12 @@ import (
 // With no limit a missing leaf is the unmetered case the spawn already
 // degrades to, and an existing leaf is reset to unbounded (memory.max and
 // memory.high "max", memory.oom.group 0): a restart reuses the leaf, and the
-// previous instance's bound must not outlive the spec that set it. A failed
-// reset write fails the start like a failed limit write, since the container
-// would otherwise run under a bound and a group kill its spec does not have.
+// previous instance's bound must not outlive the spec that set it. A leaf
+// without the memory controller (EnableSubtreeControllers is best effort) has
+// no bound to be stale, so it is logged and the container starts unmetered.
+// Any other failed reset write fails the start like a failed limit write,
+// since the container would otherwise run under a bound and a group kill its
+// spec does not have.
 // With a limit, a missing leaf or a failed write fails the container's start:
 // the host asked for a bound and this guest advertises memory-limits, so
 // running the container without it would let it take the whole VM's memory
@@ -43,13 +48,13 @@ import (
 //
 // It lives in an untagged file so the gate runs on the darwin host; the linux
 // spawn is its only caller.
-func applyContainerMemory(leaf string, cp guestinit.ContainerPlan) error {
-	return applyContainerMemoryVia(guestagent.WriteLeafFile, leaf, cp)
+func applyContainerMemory(log *slog.Logger, leaf string, cp guestinit.ContainerPlan) error {
+	return applyContainerMemoryVia(log, guestagent.WriteLeafFile, leaf, cp)
 }
 
 // applyContainerMemoryVia is applyContainerMemory with the leaf writes going
 // through write.
-func applyContainerMemoryVia(write guestagent.LeafWriter, leaf string, cp guestinit.ContainerPlan) error {
+func applyContainerMemoryVia(log *slog.Logger, write guestagent.LeafWriter, leaf string, cp guestinit.ContainerPlan) error {
 	limits := guestagent.MemoryLimits{Max: cp.MemoryMaxBytes, High: cp.MemoryHighBytes}
 	if leaf == "" {
 		if !limits.Set() {
@@ -58,6 +63,11 @@ func applyContainerMemoryVia(write guestagent.LeafWriter, leaf string, cp guesti
 		return fmt.Errorf("container %s has a memory limit but no cgroup2 leaf to apply it to", cp.Name)
 	}
 	if err := guestagent.ApplyMemoryLimitsVia(write, leaf, limits); err != nil {
+		if errors.Is(err, guestagent.ErrNoMemoryController) {
+			log.Info("the container's cgroup2 leaf has no memory controller; it runs unmetered",
+				"container", cp.Name, "leaf", leaf)
+			return nil
+		}
 		return fmt.Errorf("container %s: %w", cp.Name, err)
 	}
 	return nil
@@ -71,9 +81,9 @@ func applyContainerMemoryVia(write guestagent.LeafWriter, leaf string, cp guesti
 //
 // write is the leaf writer (guestagent.WriteLeafFile in the guest), arm the
 // OOM baseline, and fork the fork into the leaf (CLONE_INTO_CGROUP).
-func limitThenFork(leaf string, cp guestinit.ContainerPlan, write guestagent.LeafWriter,
+func limitThenFork(log *slog.Logger, leaf string, cp guestinit.ContainerPlan, write guestagent.LeafWriter,
 	arm func(container string), fork func() (int, error)) (int, error) {
-	if err := applyContainerMemoryVia(write, leaf, cp); err != nil {
+	if err := applyContainerMemoryVia(log, write, leaf, cp); err != nil {
 		return 0, err
 	}
 	arm(cp.Name)

@@ -18,8 +18,12 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"k3sm.io/runtimed/pkg/guestagent"
@@ -27,16 +31,22 @@ import (
 )
 
 // spawnRecorder is the injected leaf writer, OOM arm and forker of
-// limitThenFork: it records every call in order, and fails the write to one
-// file when failOn names it.
+// limitThenFork: it records every call in order, fails the write to one file
+// when failOn names it, and models a leaf without the memory controller when
+// noMemory is set: every memory interface file is absent, so a write fails
+// the way opening a missing file does.
 type spawnRecorder struct {
-	failOn string
-	calls  []string
-	files  map[string]string
+	failOn   string
+	noMemory bool
+	calls    []string
+	files    map[string]string
 }
 
 func (r *spawnRecorder) write(path, value string) error {
 	name := filepath.Base(path)
+	if r.noMemory && strings.HasPrefix(name, "memory.") {
+		return fmt.Errorf("open %s: %w", path, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist})
+	}
 	if name == r.failOn {
 		return errors.New("injected write failure")
 	}
@@ -56,7 +66,7 @@ func (r *spawnRecorder) fork() (int, error) {
 }
 
 func (r *spawnRecorder) spawn(leaf string, cp guestinit.ContainerPlan) (int, error) {
-	return limitThenFork(leaf, cp, r.write, r.arm, r.fork)
+	return limitThenFork(slog.New(slog.DiscardHandler), leaf, cp, r.write, r.arm, r.fork)
 }
 
 // TestSpawnAppliesMemoryLimitsBeforeFork is the B1140 gate: spawn's start
@@ -208,4 +218,41 @@ func TestSpawnResetsStaleLimitsOnReusedLeaf(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSpawnStartsUnmeteredWithoutMemoryController covers a leaf the memory
+// controller was never enabled in (EnableSubtreeControllers is best effort, and
+// a kernel may lack the controller): it has no memory.max, so no bound can be
+// stale. A spec with no limit skips the reset and forks; a spec with a limit
+// still fails the start, since the bound it asked for cannot be applied.
+func TestSpawnStartsUnmeteredWithoutMemoryController(t *testing.T) {
+	const leaf = "/sys/fs/cgroup/k3sm/app"
+
+	t.Run("no limit forks with no write", func(t *testing.T) {
+		r := &spawnRecorder{noMemory: true}
+		pid, err := r.spawn(leaf, guestinit.ContainerPlan{Name: "app"})
+		if err != nil || pid != 42 {
+			t.Fatalf("spawn = %d, %v; want 42, nil", pid, err)
+		}
+		if want := []string{"arm app", "fork"}; !reflect.DeepEqual(r.calls, want) {
+			t.Errorf("calls = %q, want %q", r.calls, want)
+		}
+	})
+
+	t.Run("a limit still fails the start", func(t *testing.T) {
+		for _, cp := range []guestinit.ContainerPlan{
+			{Name: "app", MemoryMaxBytes: 1 << 30},
+			{Name: "app", MemoryHighBytes: 1 << 29},
+		} {
+			r := &spawnRecorder{noMemory: true}
+			if _, err := r.spawn(leaf, cp); err == nil {
+				t.Errorf("max %d high %d: spawn succeeded, want the start to fail", cp.MemoryMaxBytes, cp.MemoryHighBytes)
+			}
+			for _, c := range r.calls {
+				if c == "fork" {
+					t.Errorf("max %d high %d: the container was forked: calls %q", cp.MemoryMaxBytes, cp.MemoryHighBytes, r.calls)
+				}
+			}
+		}
+	})
 }

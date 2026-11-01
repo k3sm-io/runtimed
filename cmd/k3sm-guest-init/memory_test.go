@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,9 @@ import (
 // fakeLeaf makes a directory carrying the memory interface files a delegated
 // cgroup2 leaf has, empty, so what the guest writes is exactly what is read
 // back. cgroupfs files always exist; the writer opens them without O_CREATE.
+// discard is the logger the memory-apply tests pass.
+var discard = slog.New(slog.DiscardHandler)
+
 func fakeLeaf(t *testing.T, events string) string {
 	t.Helper()
 	leaf := filepath.Join(t.TempDir(), "app")
@@ -99,7 +103,7 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("both limits are written before the container runs", func(t *testing.T) {
 		leaf := fakeLeaf(t, eventsZero)
-		if err := applyContainerMemory(leaf, plan(t, memSpec(limit, high))); err != nil {
+		if err := applyContainerMemory(discard, leaf, plan(t, memSpec(limit, high))); err != nil {
 			t.Fatalf("applyContainerMemory: %v", err)
 		}
 		if got := readLeafFile(t, leaf, guestagent.MemoryMaxFile); got != "1073741824" {
@@ -115,7 +119,7 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("no limit resets the leaf to unbounded", func(t *testing.T) {
 		leaf := fakeLeaf(t, eventsZero)
-		if err := applyContainerMemory(leaf, plan(t, memSpec(0, 0))); err != nil {
+		if err := applyContainerMemory(discard, leaf, plan(t, memSpec(0, 0))); err != nil {
 			t.Fatalf("applyContainerMemory: %v", err)
 		}
 		for f, want := range map[string]string{
@@ -131,14 +135,21 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("a limit with no leaf fails closed", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "absent")
-		if err := applyContainerMemory(missing, plan(t, memSpec(limit, high))); err == nil {
+		if err := applyContainerMemory(discard, missing, plan(t, memSpec(limit, high))); err == nil {
 			t.Fatal("a limit that could not be written must fail the start")
 		}
-		if err := applyContainerMemory("", plan(t, memSpec(limit, 0))); err == nil {
+		if err := applyContainerMemory(discard, "", plan(t, memSpec(limit, 0))); err == nil {
 			t.Fatal("a limit with no cgroup leaf must fail the start")
 		}
-		if err := applyContainerMemory("", plan(t, memSpec(0, 0))); err != nil {
+		if err := applyContainerMemory(discard, "", plan(t, memSpec(0, 0))); err != nil {
 			t.Fatalf("no limit and no leaf is the unmetered case, not an error: %v", err)
+		}
+		bare := t.TempDir() // a leaf without the memory controller: no memory files
+		if err := applyContainerMemory(discard, bare, plan(t, memSpec(0, 0))); err != nil {
+			t.Fatalf("no limit on a leaf with no memory controller is the unmetered case: %v", err)
+		}
+		if err := applyContainerMemory(discard, bare, plan(t, memSpec(limit, 0))); err == nil {
+			t.Fatal("a limit on a leaf with no memory controller must fail the start")
 		}
 	})
 
