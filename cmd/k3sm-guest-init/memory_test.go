@@ -18,8 +18,10 @@ package main
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -224,20 +226,12 @@ func TestSampleCarriesMemoryHighEvents(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			leaf := filepath.Join(t.TempDir(), "app")
-			if err := os.MkdirAll(leaf, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			for name, body := range map[string]string{
+			leaf := sampleFixture(t, t.TempDir(), "app", map[string]string{
 				"cpu.stat":                  cpuStat,
 				"memory.current":            current,
 				"memory.stat":               memStat,
 				guestagent.MemoryEventsFile: tc.events,
-			} {
-				if err := os.WriteFile(filepath.Join(leaf, name), []byte(body), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
+			})
 			got, err := sampleLeaf(leaf)
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
@@ -253,6 +247,81 @@ func TestSampleCarriesMemoryHighEvents(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("sampleLeaf = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// sampleFixture makes root/container as a cgroup2 leaf carrying files, one
+// file per entry, and returns its path. A file left out of files is absent.
+func sampleFixture(t *testing.T, root, container string, files map[string]string) string {
+	t.Helper()
+	leaf := filepath.Join(root, container)
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(leaf, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return leaf
+}
+
+// goodSampleFiles is a leaf every file of which sampleLeaf reads cleanly.
+func goodSampleFiles() map[string]string {
+	return map[string]string{
+		"cpu.stat":                  "usage_usec 4200\nuser_usec 3000\nsystem_usec 1200\n",
+		"memory.current":            "10485760\n",
+		"memory.stat":               "anon 6291456\nfile 4194304\ninactive_file 2097152\n",
+		guestagent.MemoryEventsFile: "low 0\nhigh 7\nmax 0\noom 0\noom_kill 0\n",
+	}
+}
+
+// TestSampleLeafFailsWholeOnAnyBadFile pins sampleLeaf's documented contract
+// file by file: any one of the four files missing, or any one that does not
+// parse, fails the whole sample with an error naming why and no partial
+// numbers. Each case starts from a leaf that samples cleanly and breaks one
+// file, so the error can only come from that file.
+func TestSampleLeafFailsWholeOnAnyBadFile(t *testing.T) {
+	const missing = "\x00missing"
+	cases := []struct {
+		name    string
+		file    string
+		body    string // missing removes the file
+		wantErr error
+	}{
+		{name: "missing cpu.stat", file: "cpu.stat", body: missing, wantErr: fs.ErrNotExist},
+		{name: "missing memory.current", file: "memory.current", body: missing, wantErr: fs.ErrNotExist},
+		{name: "missing memory.stat", file: "memory.stat", body: missing, wantErr: fs.ErrNotExist},
+		{name: "missing memory.events", file: guestagent.MemoryEventsFile, body: missing, wantErr: fs.ErrNotExist},
+		{name: "malformed cpu.stat", file: "cpu.stat", body: "usage_usec lots\n", wantErr: strconv.ErrSyntax},
+		{name: "malformed memory.current", file: "memory.current", body: "ten megabytes\n", wantErr: strconv.ErrSyntax},
+		{name: "malformed memory.stat", file: "memory.stat", body: "anon 6291456\ninactive_file some\n", wantErr: strconv.ErrSyntax},
+		{name: "memory.stat without inactive_file", file: "memory.stat", body: "anon 6291456\nfile 4194304\n", wantErr: guestagent.ErrCgroupFieldAbsent},
+	}
+	t.Run("baseline samples cleanly", func(t *testing.T) {
+		if _, err := sampleLeaf(sampleFixture(t, t.TempDir(), "app", goodSampleFiles())); err != nil {
+			t.Fatalf("sampleLeaf on the good leaf: %v", err)
+		}
+	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := goodSampleFiles()
+			if tc.body == missing {
+				delete(files, tc.file)
+			} else {
+				files[tc.file] = tc.body
+			}
+			got, err := sampleLeaf(sampleFixture(t, t.TempDir(), "app", files))
+			if err == nil {
+				t.Fatalf("sampleLeaf = %+v, nil; want an error", got)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("sampleLeaf error = %v, want errors.Is %v", err, tc.wantErr)
+			}
+			if got != (guestagent.ContainerSample{}) {
+				t.Fatalf("sampleLeaf = %+v on error, want the zero sample", got)
 			}
 		})
 	}
