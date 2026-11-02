@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -33,6 +34,7 @@ import (
 // is a named red. The fakes are shell stubs on a temp GOPATH and PATH, so no
 // real staticcheck and no network are involved.
 func TestStaticcheckCandidateOrder(t *testing.T) {
+	t.Run("ci_sh_wires_picker", checkStaticcheckCIWiring)
 	const pin = "2026.2.2"
 	const other = "staticcheck 2025.1 (0.6.0)"
 	atPin := "staticcheck " + pin + " (0.8.1)"
@@ -56,9 +58,11 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 	}{
 		{name: "versioned_binary_wins", versioned: atPin, onPath: atPin, plain: atPin, wantBy: "versioned"},
 		{name: "versioned_wrong_version_falls_back", versioned: other, onPath: atPin, plain: atPin, wantBy: "path"},
+		{name: "path_before_plain_gopath", onPath: atPin, plain: atPin, wantBy: "path"},
+		{name: "plain_gopath_last_resort", plain: atPin, wantBy: "plain"},
 		{name: "path_wrong_version_falls_back_to_plain", onPath: other, plain: atPin, wantBy: "plain"},
 		{name: "no_candidate_is_named_red", wantRed: true, wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin}},
-		{name: "no_candidate_at_pin_is_named_red", versioned: other, onPath: other, wantRed: true, wantOut: []string{"the gate needs " + pin, "2025.1"}},
+		{name: "no_candidate_at_pin_is_named_red", versioned: other, onPath: other, wantRed: true, wantOut: []string{pin, "2025.1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -128,6 +132,23 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 				t.Errorf("linted by %q, want %q", got, tc.wantBy)
 			}
 		})
+	}
+}
+
+// checkStaticcheckCIWiring pins the call site, which the order test never sees
+// because it sources the picker directly: hack/ci.sh must source the picker and
+// call staticcheck_pick followed by `|| exit 1`, so a red pick stops the gate.
+func checkStaticcheckCIWiring(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "ci.sh"))
+	if err != nil {
+		t.Fatalf("read ci.sh: %v", err)
+	}
+	ci := string(raw)
+	if !regexp.MustCompile(`(?m)^\s*(source|\.)\s+hack/staticcheck-pick\.sh\s*$`).MatchString(ci) {
+		t.Errorf("ci.sh does not source hack/staticcheck-pick.sh")
+	}
+	if !regexp.MustCompile(`(?m)^\s*staticcheck_pick\s*\|\|\s*exit 1\s*$`).MatchString(ci) {
+		t.Errorf("ci.sh does not call staticcheck_pick followed by || exit 1")
 	}
 }
 
