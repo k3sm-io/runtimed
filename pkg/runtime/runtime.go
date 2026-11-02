@@ -773,6 +773,11 @@ type Deps struct {
 	// lock (RootLockName) before it fails with ErrRootInUse. Zero selects
 	// DefaultRootLockWait; tests shrink it.
 	RootLockWait time.Duration
+	// rootLockBusy, when set, is called each time New finds the root's lock held
+	// and is about to wait a poll tick. It is a test seam: a test releases the
+	// holder on the first call, so the release is ordered after the wait began
+	// by an event rather than by a sleep. Nil in production.
+	rootLockBusy func()
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -823,7 +828,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if err := os.MkdirAll(cfg.Root, 0o755); err != nil {
 		return nil, fmt.Errorf("create runtime root %s: %w", cfg.Root, err)
 	}
-	lock, err := acquireRootLock(cfg.Root, deps.RootLockWait)
+	lock, err := acquireRootLock(cfg.Root, deps.RootLockWait, deps.rootLockBusy)
 	if err != nil {
 		return nil, err
 	}

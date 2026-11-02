@@ -75,8 +75,9 @@ type rootLock struct {
 // acquireRootLock opens (creating 0600 if absent) <root>/RootLockName without
 // following a symlink, takes an exclusive flock on it, waiting up to wait for a
 // current holder to let go, and records this process's pid in it. A wait of 0
-// or less selects DefaultRootLockWait.
-func acquireRootLock(root string, wait time.Duration) (*rootLock, error) {
+// or less selects DefaultRootLockWait. onBusy, when non-nil, is called after
+// each refused attempt that will be retried (the Deps.rootLockBusy test seam).
+func acquireRootLock(root string, wait time.Duration, onBusy func()) (*rootLock, error) {
 	if wait <= 0 {
 		wait = DefaultRootLockWait
 	}
@@ -116,6 +117,9 @@ func acquireRootLock(root string, wait time.Duration) (*rootLock, error) {
 			holder := lockHolder(fd)
 			_ = f.Close() // the refusal is the one reported
 			return nil, fmt.Errorf("%w: %s is held by pid %s (waited %s)", ErrRootInUse, path, holder, wait)
+		}
+		if onBusy != nil {
+			onBusy()
 		}
 		time.Sleep(rootLockPoll)
 	}

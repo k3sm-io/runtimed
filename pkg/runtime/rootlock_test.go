@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,29 +83,46 @@ func TestRootLockReleasedByClose(t *testing.T) {
 }
 
 // TestRootLockWaiterAcquiresOnRelease is the kickstart order: the old holder lets
-// go partway through the new one's wait, and the new New succeeds.
+// go partway through the new one's wait, and the new New succeeds. The release
+// is ordered by an event, not a sleep: the holder closes only once the waiter
+// has reported a refused attempt, so the waiter is provably mid-wait when the
+// lock is let go.
 func TestRootLockWaiterAcquiresOnRelease(t *testing.T) {
 	root := t.TempDir()
 	first := newTestRuntimeCfg(t, Config{Root: root}, Deps{RootLockWait: lockTestWait})
-	wait := 5 * time.Second
-	hold := 200 * time.Millisecond
+	busy := make(chan struct{}, 1)
+	var refused atomic.Int32
+	onBusy := func() {
+		refused.Add(1)
+		select {
+		case busy <- struct{}{}:
+		default:
+		}
+	}
+	done := make(chan struct{})
+	defer close(done)
+	released := make(chan struct{})
 	go func() {
-		time.Sleep(hold)
-		_ = first.Close() // the waiter's outcome is the assertion
+		defer close(released)
+		select {
+		case <-busy:
+			_ = first.Close() // the waiter's outcome is the assertion
+		case <-done:
+		}
 	}()
-	start := time.Now()
-	rt, err := New(Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs")},
-		testDeps(t, Deps{RootLockWait: wait}))
-	elapsed := time.Since(start)
+	d := testDeps(t, Deps{RootLockWait: 5 * time.Second})
+	d.rootLockBusy = onBusy
+	rt, err := New(Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs")}, d)
 	if err != nil {
 		t.Fatalf("New waiting on a releasing holder: %v", err)
 	}
 	t.Cleanup(func() { _ = rt.Close() })
-	// No upper check: a New that outwaited its bound failed above with
-	// ErrRootInUse, and the rest of New's construction time is not the lock's.
-	if elapsed < hold-rootLockPoll {
-		t.Errorf("acquired after %s, before the holder's %s hold ended", elapsed, hold)
+	// The waiter must have been refused at least once before it acquired: a
+	// New that took the lock on its first attempt never waited on the holder.
+	if n := refused.Load(); n < 1 {
+		t.Fatalf("New acquired after %d refused attempts, want it to wait on the holder", n)
 	}
+	<-released
 	got, err := os.ReadFile(filepath.Join(root, RootLockName))
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +137,7 @@ func TestRootLockWaiterAcquiresOnRelease(t *testing.T) {
 func TestRootLockFile(t *testing.T) {
 	t.Run("created-0600", func(t *testing.T) {
 		root := t.TempDir()
-		l, err := acquireRootLock(root, lockTestWait)
+		l, err := acquireRootLock(root, lockTestWait, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +156,7 @@ func TestRootLockFile(t *testing.T) {
 		if err := os.Symlink(target, filepath.Join(root, RootLockName)); err != nil {
 			t.Fatal(err)
 		}
-		l, err := acquireRootLock(root, lockTestWait)
+		l, err := acquireRootLock(root, lockTestWait, nil)
 		if err == nil {
 			_ = l.release()
 			t.Fatal("acquireRootLock followed a symlink")
@@ -152,7 +170,7 @@ func TestRootLockFile(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(root, RootLockName), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		l, err := acquireRootLock(root, lockTestWait)
+		l, err := acquireRootLock(root, lockTestWait, nil)
 		if err == nil {
 			_ = l.release()
 			t.Fatal("acquireRootLock accepted a directory")
