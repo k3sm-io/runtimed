@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/grpc"
@@ -367,15 +368,19 @@ func TestGuestStopperErrorOutcomes(t *testing.T) {
 
 // stopWithin calls s.Stop and fails the test if it does not return promptly: a
 // Stop that waited for the RPC would otherwise hang the test instead of failing
-// it.
+// it. The watchdog is a context deadline derived from the test's own context, so
+// it never outlives the test; inside a synctest bubble it runs on the bubble's
+// fake clock, and a Stop that blocks for good is reported as a deadlock first.
 func stopWithin(t *testing.T, s agentStopper, ctx context.Context, grace time.Duration) <-chan error {
 	t.Helper()
+	watchdog, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
 	returned := make(chan (<-chan error), 1)
 	go func() { returned <- s.Stop(ctx, grace) }()
 	select {
 	case done := <-returned:
 		return done
-	case <-time.After(5 * time.Second):
+	case <-watchdog.Done():
 		t.Fatal("Stop did not return while the call was still in flight")
 		return nil
 	}
@@ -389,37 +394,10 @@ func stopWithin(t *testing.T, s agentStopper, ctx context.Context, grace time.Du
 // cancel-ends-the-call case.
 func TestGuestStopperStopReturnsBeforeTheCall(t *testing.T) {
 	t.Run("returns-before-the-rpc-completes-and-delivers-one-value", func(t *testing.T) {
-		agent, dial, dialed := startBlockingAgent(t)
-		done := stopWithin(t, NewAgentStopper(dial), context.Background(), 7*time.Second)
-
-		select {
-		case err := <-done:
-			t.Fatalf("Stop's channel delivered %v before the agent answered", err)
-		default:
-		}
-
-		if got := (<-agent.got).GetGraceSeconds(); got != 7 {
-			t.Errorf("grace sent = %d s, want 7", got)
-		}
-		// The handler holds the RPC open: still no outcome.
-		select {
-		case err := <-done:
-			t.Fatalf("Stop's channel delivered %v while the RPC was still open", err)
-		default:
-		}
-
-		if n := dialed.Load(); n != 1 {
-			t.Errorf("the agent was dialed %d times, want 1", n)
-		}
-		close(agent.release)
-		if err := <-done; err != nil {
-			t.Fatalf("Stop outcome = %v, want nil for an accepted request", err)
-		}
-		select {
-		case err, ok := <-done:
-			t.Fatalf("Stop's channel delivered a second value (%v, open=%v); want exactly one", err, ok)
-		case <-time.After(20 * time.Millisecond):
-		}
+		// A bubble so the exactly-one check below can wait for every goroutine
+		// the call started to finish or block for good, instead of watching the
+		// channel for a while.
+		synctest.Test(t, returnsBeforeTheRPCAndDeliversOneValue)
 	})
 
 	t.Run("a-wedged-dial-does-not-hold-stop", func(t *testing.T) {
@@ -461,4 +439,43 @@ func TestGuestStopperStopReturnsBeforeTheCall(t *testing.T) {
 			t.Fatal("Stop outcome = nil for an already-cancelled ctx, want an error")
 		}
 	})
+}
+
+// returnsBeforeTheRPCAndDeliversOneValue is the first case of
+// TestGuestStopperStopReturnsBeforeTheCall, run inside a synctest bubble.
+func returnsBeforeTheRPCAndDeliversOneValue(t *testing.T) {
+	agent, dial, dialed := startBlockingAgent(t)
+	done := stopWithin(t, NewAgentStopper(dial), context.Background(), 7*time.Second)
+
+	select {
+	case err := <-done:
+		t.Fatalf("Stop's channel delivered %v before the agent answered", err)
+	default:
+	}
+
+	if got := (<-agent.got).GetGraceSeconds(); got != 7 {
+		t.Errorf("grace sent = %d s, want 7", got)
+	}
+	// The handler holds the RPC open: still no outcome.
+	select {
+	case err := <-done:
+		t.Fatalf("Stop's channel delivered %v while the RPC was still open", err)
+	default:
+	}
+
+	if n := dialed.Load(); n != 1 {
+		t.Errorf("the agent was dialed %d times, want 1", n)
+	}
+	close(agent.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Stop outcome = %v, want nil for an accepted request", err)
+	}
+	// Every goroutine in the bubble has now exited or is durably blocked, so
+	// a second send or a close would already be visible on the channel.
+	synctest.Wait()
+	select {
+	case err, ok := <-done:
+		t.Fatalf("Stop's channel delivered a second value (%v, open=%v); want exactly one", err, ok)
+	default:
+	}
 }
