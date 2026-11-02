@@ -18,6 +18,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"k3sm.io/runtimed/pkg/guestagent"
@@ -131,4 +133,42 @@ func (w *oomWatch) count(container string) (uint64, bool) {
 		return 0, false
 	}
 	return ev.OOMKill, true
+}
+
+// sampleLeaf reads one container leaf's cpu.stat, memory.current, memory.stat
+// and memory.events into a sample. It is cgroupSampler.Sample's body below the
+// leaf-exists check, in an untagged file so the gate runs on the darwin host.
+//
+// Any file that is missing or does not parse fails the whole sample: a
+// partially-read sample is not a sample, and reporting the half that parsed
+// would put a CPU counter next to a working set of zero. That includes a
+// memory.events without oom_kill (guestagent.ErrCgroupFieldAbsent).
+//
+//lint:ignore U1000 called from agent_linux.go; the darwin gate sees only the test caller
+func sampleLeaf(dir string) (guestagent.ContainerSample, error) {
+	cpuStat, err := os.ReadFile(filepath.Join(dir, "cpu.stat"))
+	if err != nil {
+		return guestagent.ContainerSample{}, fmt.Errorf("read cpu.stat: %w", err)
+	}
+	usage, err := guestagent.CPUUsageUsec(string(cpuStat))
+	if err != nil {
+		return guestagent.ContainerSample{}, err
+	}
+	current, err := os.ReadFile(filepath.Join(dir, "memory.current"))
+	if err != nil {
+		return guestagent.ContainerSample{}, fmt.Errorf("read memory.current: %w", err)
+	}
+	memStat, err := os.ReadFile(filepath.Join(dir, "memory.stat"))
+	if err != nil {
+		return guestagent.ContainerSample{}, fmt.Errorf("read memory.stat: %w", err)
+	}
+	ws, err := guestagent.WorkingSet(string(current), string(memStat))
+	if err != nil {
+		return guestagent.ContainerSample{}, err
+	}
+	events, err := guestagent.ReadMemoryEvents(dir)
+	if err != nil {
+		return guestagent.ContainerSample{}, err
+	}
+	return guestagent.ContainerSample{CPUUsageUsec: usage, MemoryWorkingSetBytes: ws, MemoryHighEvents: events.High}, nil
 }

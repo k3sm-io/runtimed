@@ -194,3 +194,66 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 		}
 	})
 }
+
+// TestSampleCarriesMemoryHighEvents pins sampleLeaf, the one producer of
+// ContainerSample.MemoryHighEvents: memory.events' high count reaches the
+// sample, and a memory.events without oom_kill omits the whole sample, CPU and
+// working set included.
+func TestSampleCarriesMemoryHighEvents(t *testing.T) {
+	const (
+		cpuStat = "usage_usec 4200\nuser_usec 3000\nsystem_usec 1200\n"
+		current = "10485760\n"
+		memStat = "anon 6291456\nfile 4194304\ninactive_file 2097152\n"
+	)
+	cases := []struct {
+		name    string
+		events  string
+		want    guestagent.ContainerSample
+		wantErr error
+	}{
+		{
+			name:   "high count carried",
+			events: "low 0\nhigh 7\nmax 0\noom 0\noom_kill 0\n",
+			want:   guestagent.ContainerSample{CPUUsageUsec: 4200, MemoryWorkingSetBytes: 10485760 - 2097152, MemoryHighEvents: 7},
+		},
+		{
+			name:    "no oom_kill omits the sample",
+			events:  "low 0\nhigh 7\nmax 0\noom 0\n",
+			wantErr: guestagent.ErrCgroupFieldAbsent,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			leaf := filepath.Join(t.TempDir(), "app")
+			if err := os.MkdirAll(leaf, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, body := range map[string]string{
+				"cpu.stat":                  cpuStat,
+				"memory.current":            current,
+				"memory.stat":               memStat,
+				guestagent.MemoryEventsFile: tc.events,
+			} {
+				if err := os.WriteFile(filepath.Join(leaf, name), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := sampleLeaf(leaf)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("sampleLeaf error = %v, want %v", err, tc.wantErr)
+				}
+				if got != (guestagent.ContainerSample{}) {
+					t.Fatalf("sampleLeaf = %+v on error, want the zero sample (omitted)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("sampleLeaf: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("sampleLeaf = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
