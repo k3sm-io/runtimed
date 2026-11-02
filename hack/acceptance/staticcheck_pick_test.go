@@ -61,8 +61,8 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 		{name: "path_before_plain_gopath", onPath: atPin, plain: atPin, wantBy: "path"},
 		{name: "plain_gopath_last_resort", plain: atPin, wantBy: "plain"},
 		{name: "path_wrong_version_falls_back_to_plain", onPath: other, plain: atPin, wantBy: "plain"},
-		{name: "no_candidate_is_named_red", wantRed: true, wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin}},
-		{name: "no_candidate_at_pin_is_named_red", versioned: other, onPath: other, wantRed: true, wantOut: []string{pin, "2025.1"}},
+		{name: "no_candidate_is_red", wantRed: true, wantOut: []string{"not installed", "staticcheck@" + pin, "staticcheck-" + pin}},
+		{name: "no_candidate_at_pin_is_red", versioned: other, onPath: other, wantRed: true, wantOut: []string{pin, "2025.1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
