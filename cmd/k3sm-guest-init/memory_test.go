@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,9 @@ import (
 // fakeLeaf makes a directory carrying the memory interface files a delegated
 // cgroup2 leaf has, empty, so what the guest writes is exactly what is read
 // back. cgroupfs files always exist; the writer opens them without O_CREATE.
+// discard is the logger the memory-apply tests pass.
+var discard = slog.New(slog.DiscardHandler)
+
 func fakeLeaf(t *testing.T, events string) string {
 	t.Helper()
 	leaf := filepath.Join(t.TempDir(), "app")
@@ -80,7 +84,8 @@ const eventsZero = "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
 // TestGuestInitSetsMemoryMaxAndHigh is the M21.9 gate: a GuestContainer's
 // memory_limit_bytes and memory_high_bytes reach the container's cgroup2
 // memory.max and memory.high (with memory.oom.group = 1) through the same
-// plan-then-apply path the linux spawn takes, an unset limit writes nothing,
+// plan-then-apply path the linux spawn takes, no limit resets the leaf to
+// unbounded,
 // a forbidden pair is refused at plan time, and an OOM kill counted in
 // memory.events after the container started is reported as oom_killed.
 func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
@@ -98,7 +103,7 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("both limits are written before the container runs", func(t *testing.T) {
 		leaf := fakeLeaf(t, eventsZero)
-		if err := applyContainerMemory(leaf, plan(t, memSpec(limit, high))); err != nil {
+		if err := applyContainerMemory(discard, leaf, plan(t, memSpec(limit, high))); err != nil {
 			t.Fatalf("applyContainerMemory: %v", err)
 		}
 		if got := readLeafFile(t, leaf, guestagent.MemoryMaxFile); got != "1073741824" {
@@ -112,28 +117,39 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 		}
 	})
 
-	t.Run("no limit writes nothing", func(t *testing.T) {
+	t.Run("no limit resets the leaf to unbounded", func(t *testing.T) {
 		leaf := fakeLeaf(t, eventsZero)
-		if err := applyContainerMemory(leaf, plan(t, memSpec(0, 0))); err != nil {
+		if err := applyContainerMemory(discard, leaf, plan(t, memSpec(0, 0))); err != nil {
 			t.Fatalf("applyContainerMemory: %v", err)
 		}
-		for _, f := range []string{guestagent.MemoryMaxFile, guestagent.MemoryHighFile, guestagent.MemoryOOMGroupFile} {
-			if got := readLeafFile(t, leaf, f); got != "" {
-				t.Errorf("%s = %q, want untouched", f, got)
+		for f, want := range map[string]string{
+			guestagent.MemoryMaxFile:      "max",
+			guestagent.MemoryHighFile:     "max",
+			guestagent.MemoryOOMGroupFile: "0",
+		} {
+			if got := readLeafFile(t, leaf, f); got != want {
+				t.Errorf("%s = %q, want %q", f, got, want)
 			}
 		}
 	})
 
 	t.Run("a limit with no leaf fails closed", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "absent")
-		if err := applyContainerMemory(missing, plan(t, memSpec(limit, high))); err == nil {
+		if err := applyContainerMemory(discard, missing, plan(t, memSpec(limit, high))); err == nil {
 			t.Fatal("a limit that could not be written must fail the start")
 		}
-		if err := applyContainerMemory("", plan(t, memSpec(limit, 0))); err == nil {
+		if err := applyContainerMemory(discard, "", plan(t, memSpec(limit, 0))); err == nil {
 			t.Fatal("a limit with no cgroup leaf must fail the start")
 		}
-		if err := applyContainerMemory("", plan(t, memSpec(0, 0))); err != nil {
+		if err := applyContainerMemory(discard, "", plan(t, memSpec(0, 0))); err != nil {
 			t.Fatalf("no limit and no leaf is the unmetered case, not an error: %v", err)
+		}
+		bare := t.TempDir() // a leaf without the memory controller: no memory files
+		if err := applyContainerMemory(discard, bare, plan(t, memSpec(0, 0))); err != nil {
+			t.Fatalf("no limit on a leaf with no memory controller is the unmetered case: %v", err)
+		}
+		if err := applyContainerMemory(discard, bare, plan(t, memSpec(limit, 0))); err == nil {
+			t.Fatal("a limit on a leaf with no memory controller must fail the start")
 		}
 	})
 
