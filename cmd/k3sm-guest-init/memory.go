@@ -120,6 +120,8 @@ func (w *oomWatch) count(container string) (uint64, bool) {
 // partially-read sample is not a sample, and reporting the half that parsed
 // would put a CPU counter next to a working set of zero. That includes a
 // memory.events without oom_kill (guestagent.ErrCgroupFieldAbsent).
+//
+//lint:ignore U1000 called from agent_linux.go; the darwin gate sees only the test caller
 func sampleLeaf(dir string) (guestagent.ContainerSample, error) {
 	cpuStat, err := os.ReadFile(filepath.Join(dir, "cpu.stat"))
 	if err != nil {
