@@ -104,7 +104,7 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 			cmd := exec.Command("bash", "-c", driver)
 			cmd.Env = []string{
 				"PATH=" + bin + ":" + pathDir,
-				"HOME=" + t.TempDir(),
+				"HOME=" + telemetryOffHome(t),
 				"GOPATH=" + gopath,
 				"GOFLAGS=",
 				"GOTOOLCHAIN=local",
@@ -159,4 +159,38 @@ func goEnv(t *testing.T, goBin, key string) string {
 		t.Fatalf("go env %s: %v", key, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// telemetryOffHome returns a temp HOME whose Go telemetry mode is off, for a
+// child that runs go. In the default local mode every go invocation under a
+// fresh HOME starts a telemetry sidecar in its own session (setsid, so the test
+// cannot wait for it) that keeps writing under HOME/Library/Application
+// Support/go after go exits, and t.TempDir cleanup then races it ("directory
+// not empty"). GOTELEMETRY is read-only in the environment; the mode file is the
+// switch, and with it off go opens no counter file and starts no sidecar.
+func telemetryOffHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	dir := filepath.Join(home, "Library", "Application Support", "go", "telemetry")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mode"), []byte("off\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Registered after t.TempDir, so it runs before the removal: anything
+		// beside the mode file means go ignored it and a late writer may exist.
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			t.Errorf("read telemetry dir: %v", err)
+			return
+		}
+		for _, e := range ents {
+			if e.Name() != "mode" {
+				t.Errorf("go wrote telemetry %s despite mode off", e.Name())
+			}
+		}
+	})
+	return home
 }
