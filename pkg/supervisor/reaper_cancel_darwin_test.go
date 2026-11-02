@@ -21,57 +21,121 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// cancelBound is the latency a cancelled WaitExit must beat. The old reaper
-// polled kevent every 250 ms and looked at ctx.Err() on each wake, so a
-// cancellation landed anywhere in [0, 250 ms) before it was noticed; an
-// event-driven wake is sub-millisecond, and 50 ms leaves room for a loaded
-// -race run without ever admitting the poll.
-const cancelBound = 50 * time.Millisecond
+// quietWindow is how long WaitExit is left blocked on a context that is not yet
+// done while the test watches whether it consults that context. The old reaper
+// woke every 250 ms and called ctx.Err() on each wake, so three poll intervals
+// fit in the window. Nothing here is a latency bound: an event-driven wait makes
+// zero context calls however long the window runs, and host load can only make a
+// polling loop wake LESS often (a false pass), never make the event-driven one
+// wake at all. That is what keeps this test from failing on a loaded host.
+const quietWindow = 750 * time.Millisecond
 
-// cancelTrials is how many sequential cancellations must ALL beat cancelBound.
-// One trial is not a test of the poll: a cancel that happens to land within
-// 50 ms of a poll wake passes by luck one time in five. Five trials make the
-// polling reaper fail with probability 1 - 0.2^5, i.e. every run in practice.
-const cancelTrials = 5
+// returnBound is a liveness bound only, for "the reaper returned at all".
+// It is generous on purpose; the property under test is decided by quietWindow.
+const returnBound = 30 * time.Second
+
+// probeCtx is a context whose Done channel the test closes by hand and whose
+// Done and Err calls are counted. Err reports context.Canceled from the start,
+// so a reaper that polls ctx.Err() returns during the quiet window, and one that
+// polls ctx.Done() shows up in the Done count. The event-driven reaper reads
+// Done once (its trigger goroutine) and Err only after the EVFILT_USER wakeup.
+type probeCtx struct {
+	context.Context
+	done  chan struct{}
+	dones atomic.Int64
+	errs  atomic.Int64
+}
+
+func newProbeCtx() *probeCtx {
+	return &probeCtx{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *probeCtx) Done() <-chan struct{} {
+	c.dones.Add(1)
+	return c.done
+}
+
+func (c *probeCtx) Err() error {
+	c.errs.Add(1)
+	return context.Canceled
+}
 
 // TestKqueueReaperCancelIsImmediate is the gate: WaitExit's cancellation
 // path is event-driven (an EVFILT_USER wakeup on the reaper's own kqueue), not
-// a 250 ms poll — and the exit-status path it shares the kqueue with is
+// a 250 ms poll, and the exit-status path it shares the kqueue with is
 // unchanged: a normal exit and a signalled exit still report through, and the
 // trigger goroutine is gone once WaitExit has returned.
 func TestKqueueReaperCancelIsImmediate(t *testing.T) {
-	t.Run("cancel wakes the reaper well inside the old poll interval", func(t *testing.T) {
-		var worst time.Duration
-		for i := 0; i < cancelTrials; i++ {
-			ctx, cancel := context.WithCancel(context.Background())
-			p, _ := startSleeper(t, ctx)
-			// Let the reaper reach its blocking wait before cancelling, so the
-			// measurement is the wake latency and not the spawn.
-			time.Sleep(20 * time.Millisecond)
-			start := time.Now()
-			cancel()
-			select {
-			case <-p.Done():
-			case <-time.After(5 * time.Second):
-				t.Fatalf("trial %d: the reaper did not return within 5s of cancellation", i)
-			}
-			if d := time.Since(start); d > worst {
-				worst = d
-			}
-			if _, _, err := p.Wait(context.Background()); !errors.Is(err, context.Canceled) {
-				t.Fatalf("trial %d: Wait after cancellation: err = %v, want context.Canceled", i, err)
-			}
+	t.Run("the reaper does not poll its context and wakes on cancel", func(t *testing.T) {
+		cmd := exec.Command("/bin/sleep", "300")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start /bin/sleep: %v", err)
 		}
-		if worst > cancelBound {
-			t.Fatalf("worst cancel-to-return latency over %d trials = %s, want < %s "+
-				"(a 250 ms poll loop would show up here)", cancelTrials, worst, cancelBound)
+		pid := cmd.Process.Pid
+		// WaitExit hands an unreaped child to reapDetached on cancellation;
+		// killing it lets that collect it. cmd.Wait is never called: the
+		// reaper under test must stay the sole wait4 caller.
+		t.Cleanup(func() { _ = unix.Kill(pid, unix.SIGKILL) })
+
+		ctx := newProbeCtx()
+		type result struct {
+			code, sig int
+			err       error
+		}
+		ret := make(chan result, 1)
+		go func() {
+			code, sig, err := KqueueReaper{}.WaitExit(ctx, pid)
+			ret <- result{code, sig, err}
+		}()
+
+		select {
+		case r := <-ret:
+			t.Fatalf("WaitExit returned (%d, %d, %v) before cancellation: it consulted ctx.Err() "+
+				"instead of blocking on the kqueue", r.code, r.sig, r.err)
+		case <-time.After(quietWindow):
+		}
+		if n := ctx.errs.Load(); n != 0 {
+			t.Fatalf("ctx.Err() called %d times while the context was not done: the reaper polls", n)
+		}
+		if n := ctx.dones.Load(); n > 1 {
+			t.Fatalf("ctx.Done() called %d times while the context was not done, want at most 1 "+
+				"(the trigger goroutine): the reaper polls", n)
+		}
+
+		close(ctx.done)
+		select {
+		case r := <-ret:
+			if !errors.Is(r.err, context.Canceled) {
+				t.Fatalf("WaitExit after cancellation: err = %v, want context.Canceled", r.err)
+			}
+		case <-time.After(returnBound):
+			t.Fatalf("WaitExit did not return within %s of cancellation: the cancel path does not wake the kqueue", returnBound)
+		}
+		if n := ctx.errs.Load(); n != 1 {
+			t.Fatalf("ctx.Err() called %d times in total, want exactly 1 (after the EVFILT_USER wakeup)", n)
+		}
+	})
+
+	t.Run("cancelling a supervised process returns context.Canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		p, _ := startSleeper(t, ctx)
+		cancel()
+		select {
+		case <-p.Done():
+		case <-time.After(returnBound):
+			t.Fatalf("the reaper did not return within %s of cancellation", returnBound)
+		}
+		if _, _, err := p.Wait(context.Background()); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait after cancellation: err = %v, want context.Canceled", err)
 		}
 	})
 
