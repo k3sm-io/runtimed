@@ -88,6 +88,13 @@ const (
 	// pkg/image derives the same dir from its own copy of this literal; the
 	// sandbox gate asserts the two still agree.
 	BlobsSubdir = "blobs"
+	// StatusSubdir is the node's status record dir (<WorkDir>/status): the
+	// world-readable records `k3sm status` reports, including the node-local
+	// budget record, which has no other copy and is read as evidence. A pod able
+	// to write here could forge it. Same cross-repo residual as ServerSubdir: the
+	// k3sm control plane writes it at its data root, which is this work-dir only
+	// when the runtime root is left at its default.
+	StatusSubdir = "status"
 )
 
 // DefaultResolverVIP is the cluster DNS Service VIP assumed when a Posture

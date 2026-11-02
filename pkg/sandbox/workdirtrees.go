@@ -86,9 +86,9 @@ func ReapStoreSubdirs() []string {
 // DaemonTreeSubdirs returns the work-dir-relative daemon-private and
 // control-plane trees, in deny order: the control-plane state (server), the
 // node-agent state (agent), the daemon sockets + mesh key (run), the
-// content-addressed blob store (blobs), the per-pod SBPL staging dir (sbpl), the
-// five image-store siblings (index, operator, unpacked, snapshots, ingest), the
-// guest-artifact cache (guest-artifacts) and the retained consoles of failed vm
+// content-addressed blob store (blobs), the status record dir (status), the
+// per-pod SBPL staging dir (sbpl), the five image-store siblings (index,
+// operator, unpacked, snapshots, ingest), the guest-artifact cache (guest-artifacts) and the retained consoles of failed vm
 // boots (vmboot-failures), which hold other pods' guest output.
 //
 // The returned slice is freshly allocated, so a caller cannot mutate the
@@ -99,6 +99,7 @@ func DaemonTreeSubdirs() []string {
 		AgentSubdir,
 		RunSubdir,
 		BlobsSubdir,
+		StatusSubdir,
 		ProfileSubdir,
 		ImageIndexSubdir,
 		ImageOperatorSubdir,
