@@ -39,6 +39,11 @@ import (
 // is empty by contract, so there is no guest-shaped data to interpret.
 type guestStopper struct {
 	dial vsockDialer
+
+	// onRunning is a test seam, nil in production: when set, the request
+	// goroutine calls it as its first act, before it signals Stop that it is
+	// running, so a test can see what Stop's return is ordered after.
+	onRunning func()
 }
 
 // NewAgentStopper builds the guest-agent stop seam over dial. It is used by
@@ -64,6 +69,9 @@ func (s *guestStopper) Stop(ctx context.Context, grace time.Duration) <-chan err
 	done := make(chan error, 1)
 	running := make(chan struct{})
 	go func() {
+		if s.onRunning != nil {
+			s.onRunning()
+		}
 		close(running)
 		done <- s.call(ctx, grace)
 	}()
