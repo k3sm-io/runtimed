@@ -78,7 +78,20 @@ func (r *Runtime) closeGraceDuration() time.Duration {
 // (ErrSupervisionNotStopped); one wedged pod never short-circuits the sweep,
 // because a shutdown that stops at the first stuck pod leaves exactly the
 // goroutines Close exists to stop.
+//
+// Close then releases the root lock New took (rootlock.go), so a new Runtime on
+// the same root can start. The Runtime must not serve after Close.
 func (r *Runtime) Close() error {
+	err := r.stopSupervision()
+	// Release the root last, after every supervision this daemon owns has been
+	// told to stop, so a successor's New cannot start reaping or attaching while
+	// this one is still winding down. A second Close finds it already released.
+	return errors.Join(err, r.rootLock.release())
+}
+
+// stopSupervision is Close's supervision half: everything Close does before it
+// lets go of the root lock.
+func (r *Runtime) stopSupervision() error {
 	r.mu.Lock()
 	pods := make([]*pod, 0, len(r.pods))
 	for _, p := range r.pods {
