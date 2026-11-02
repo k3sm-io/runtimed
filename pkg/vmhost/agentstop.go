@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -41,8 +42,8 @@ type guestStopper struct {
 	dial vsockDialer
 
 	// onRunning is a test seam, nil in production: when set, the request
-	// goroutine calls it as its first act, before it signals Stop that it is
-	// running, so a test can see what Stop's return is ordered after.
+	// goroutine calls it as its first act, before the call that signals Stop
+	// to return, so a test can see what Stop's return is ordered after.
 	onRunning func()
 }
 
@@ -62,31 +63,44 @@ func NewAgentStopper(dial vsockDialer) agentStopper { return &guestStopper{dial:
 // would read to the guest as "kill immediately", turning a clamping bug into data
 // loss.
 //
-// The RPC runs on its own goroutine, and Stop returns once that goroutine is
-// running, so the request is under way before the caller can reach its hard
-// stop (see agentStopper). The outcome is the one value on the returned channel.
+// The RPC runs on its own goroutine, and Stop returns once the dial to the guest
+// agent has begun: the moment the gRPC client first calls the vsock dialer, so
+// the request is under way before the caller can reach its hard stop (see
+// agentStopper). If the call ends without ever dialing (the client could not be
+// built, or ctx was already done), Stop returns when it ends instead, so it
+// never waits on a dial that will not come. The outcome is the one value on the
+// returned channel.
 func (s *guestStopper) Stop(ctx context.Context, grace time.Duration) <-chan error {
 	done := make(chan error, 1)
-	running := make(chan struct{})
+	finished := make(chan struct{})
+	dialing := make(chan struct{})
+	var once sync.Once
+	began := func() { once.Do(func() { close(dialing) }) }
 	go func() {
 		if s.onRunning != nil {
 			s.onRunning()
 		}
-		close(running)
-		done <- s.call(ctx, grace)
+		defer close(finished)
+		done <- s.call(ctx, grace, began)
 	}()
-	<-running
+	select {
+	case <-dialing:
+	case <-finished:
+	}
 	return done
 }
 
-// call is the one guest/v1 Stop RPC.
+// call is the one guest/v1 Stop RPC. began is called each time the client
+// opens a connection to the agent, before the vsock dial itself; the caller
+// makes it idempotent.
 //
 // A fresh connection per call, closed here: this call happens once per machine
 // lifetime, on the way out.
-func (s *guestStopper) call(ctx context.Context, grace time.Duration) error {
+func (s *guestStopper) call(ctx context.Context, grace time.Duration, began func()) error {
 	conn, err := grpc.NewClient("passthrough:///guest-agent",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(dctx context.Context, _ string) (net.Conn, error) {
+			began()
 			return s.dial(dctx)
 		}),
 	)

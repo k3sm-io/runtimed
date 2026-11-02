@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/grpc"
@@ -35,14 +36,15 @@ import (
 )
 
 // stopAgent is an in-process guest agent that serves only Stop. Each request is
-// handed to the test on got; with block set, the handler holds the call open
-// until its context ends and then closes cancelled, so a case can see the
-// client's cancel arrive on the server side.
+// handed to the test on got. With release nil the handler answers at once;
+// otherwise it holds the call open until the test closes release (an accepted
+// request) or the call's context ends, in which case it closes cancelled, so a
+// case can see the client's cancel arrive on the server side.
 type stopAgent struct {
 	guestv1.UnimplementedGuestAgentServer
-	block     bool
 	fail      error // when set, the handler returns it once the request is in
 	got       chan *guestv1.StopRequest
+	release   chan struct{}
 	cancelled chan struct{}
 }
 
@@ -51,12 +53,16 @@ func (a *stopAgent) Stop(ctx context.Context, req *guestv1.StopRequest) (*guestv
 	if a.fail != nil {
 		return nil, a.fail
 	}
-	if a.block {
-		<-ctx.Done()
+	if a.release == nil {
+		return &guestv1.StopResponse{}, nil
+	}
+	select {
+	case <-a.release:
+		return &guestv1.StopResponse{}, nil
+	case <-ctx.Done():
 		close(a.cancelled)
 		return nil, ctx.Err()
 	}
-	return &guestv1.StopResponse{}, nil
 }
 
 // serveStopAgent runs agent on a bufconn and returns the vsockDialer that
@@ -79,8 +85,32 @@ func serveStopAgent(t *testing.T, agent *stopAgent) vsockDialer {
 	return func(ctx context.Context) (net.Conn, error) { return lis.DialContext(ctx) }
 }
 
+// newStopAgent returns a stopAgent; with block set it holds each call open
+// until release is closed or the call's context ends.
 func newStopAgent(block bool) *stopAgent {
-	return &stopAgent{block: block, got: make(chan *guestv1.StopRequest, 1), cancelled: make(chan struct{})}
+	a := &stopAgent{got: make(chan *guestv1.StopRequest, 1), cancelled: make(chan struct{})}
+	if block {
+		a.release = make(chan struct{})
+	}
+	return a
+}
+
+// countDials wraps dial so a test can see how many times the client dialed.
+func countDials(dial vsockDialer) (vsockDialer, *atomic.Int32) {
+	var dialed atomic.Int32
+	return func(ctx context.Context) (net.Conn, error) {
+		dialed.Add(1)
+		return dial(ctx)
+	}, &dialed
+}
+
+// startBlockingAgent serves a blocking stopAgent and returns it with a
+// counting vsockDialer onto it.
+func startBlockingAgent(t *testing.T) (*stopAgent, vsockDialer, *atomic.Int32) {
+	t.Helper()
+	agent := newStopAgent(true)
+	dial, dialed := countDials(serveStopAgent(t, agent))
+	return agent, dial, dialed
 }
 
 // stopWatchdog bounds every wait in these tests. It is a hang guard, not a
@@ -228,12 +258,12 @@ func TestGuestStopperIssuesStopRPC(t *testing.T) {
 	})
 }
 
-// TestGuestStopperStartsRPCBeforeStopReturns pins Stop's running handshake:
-// when Stop returns, the request goroutine is already running. The onRunning
-// seam is the goroutine's first act; it writes ran with no synchronisation of
-// its own, so the only thing ordering that write before the read below is the
-// handshake. Without it the read finds ran false, and under -race the
-// unordered pair is a reported race either way.
+// TestGuestStopperStartsRPCBeforeStopReturns pins Stop's handshake: when Stop
+// returns, the request goroutine is already running (it has begun the dial, or
+// the call has ended). The onRunning seam is the goroutine's first act; it
+// writes ran with no synchronisation of its own, so the only thing ordering
+// that write before the read below is the handshake. Without it the read finds
+// ran false, and under -race the unordered pair is a reported race either way.
 func TestGuestStopperStartsRPCBeforeStopReturns(t *testing.T) {
 	agent := newStopAgent(false)
 	ran := false
@@ -334,4 +364,118 @@ func TestGuestStopperErrorOutcomes(t *testing.T) {
 			t.Error("the dialed connection was not closed by the time the outcome arrived")
 		}
 	})
+}
+
+// stopWithin calls s.Stop and fails the test if it does not return promptly: a
+// Stop that waited for the RPC would otherwise hang the test instead of failing
+// it. The watchdog is a context deadline derived from the test's own context, so
+// it never outlives the test; inside a synctest bubble it runs on the bubble's
+// fake clock, and a Stop that blocks for good is reported as a deadlock first.
+func stopWithin(t *testing.T, s agentStopper, ctx context.Context, grace time.Duration) <-chan error {
+	t.Helper()
+	watchdog, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	returned := make(chan (<-chan error), 1)
+	go func() { returned <- s.Stop(ctx, grace) }()
+	select {
+	case done := <-returned:
+		return done
+	case <-watchdog.Done():
+		t.Fatal("Stop did not return while the call was still in flight")
+		return nil
+	}
+}
+
+// TestGuestStopperStopReturnsBeforeTheCall pins the production agentStopper to
+// the seam's contract: Stop returns while the RPC is still in flight, and does
+// not wait on a dial that hangs; the channel then delivers exactly one value;
+// and a ctx already done before Stop still returns an error rather than a hang.
+// A ctx cancelled mid-call is TestGuestStopperIssuesStopRPC's
+// cancel-ends-the-call case.
+func TestGuestStopperStopReturnsBeforeTheCall(t *testing.T) {
+	t.Run("returns-before-the-rpc-completes-and-delivers-one-value", func(t *testing.T) {
+		// A bubble so the exactly-one check below can wait for every goroutine
+		// the call started to finish or block for good, instead of watching the
+		// channel for a while.
+		synctest.Test(t, returnsBeforeTheRPCAndDeliversOneValue)
+	})
+
+	t.Run("a-wedged-dial-does-not-hold-stop", func(t *testing.T) {
+		// Stop waits for the dial to BEGIN, never for it to finish: a vsock dial
+		// that hangs must not hang the shutdown that is about to fall back to
+		// the hard stop.
+		entered := make(chan struct{})
+		dial := func(ctx context.Context) (net.Conn, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := stopWithin(t, NewAgentStopper(dial), ctx, time.Second)
+		<-entered
+		select {
+		case err := <-done:
+			t.Fatalf("Stop's channel delivered %v while the dial was still wedged", err)
+		default:
+		}
+		cancel()
+		if err := <-done; err == nil {
+			t.Fatal("Stop outcome = nil for a dial that never connected, want an error")
+		}
+	})
+
+	t.Run("an-already-cancelled-ctx-returns-without-waiting-for-a-dial", func(t *testing.T) {
+		// A ctx done before Stop may mean the client never dials at all; Stop
+		// must then return on the call's end, not wait for a dial that never
+		// comes.
+		_, dial, _ := startBlockingAgent(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		done := stopWithin(t, NewAgentStopper(dial), ctx, time.Second)
+		if err := <-done; err == nil {
+			t.Fatal("Stop outcome = nil for an already-cancelled ctx, want an error")
+		}
+	})
+}
+
+// returnsBeforeTheRPCAndDeliversOneValue is the first case of
+// TestGuestStopperStopReturnsBeforeTheCall, run inside a synctest bubble.
+func returnsBeforeTheRPCAndDeliversOneValue(t *testing.T) {
+	agent, dial, dialed := startBlockingAgent(t)
+	done := stopWithin(t, NewAgentStopper(dial), context.Background(), 7*time.Second)
+
+	select {
+	case err := <-done:
+		t.Fatalf("Stop's channel delivered %v before the agent answered", err)
+	default:
+	}
+
+	if got := (<-agent.got).GetGraceSeconds(); got != 7 {
+		t.Errorf("grace sent = %d s, want 7", got)
+	}
+	// The handler holds the RPC open: still no outcome.
+	select {
+	case err := <-done:
+		t.Fatalf("Stop's channel delivered %v while the RPC was still open", err)
+	default:
+	}
+
+	if n := dialed.Load(); n != 1 {
+		t.Errorf("the agent was dialed %d times, want 1", n)
+	}
+	close(agent.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Stop outcome = %v, want nil for an accepted request", err)
+	}
+	// Every goroutine in the bubble has now exited or is durably blocked, so
+	// a second send or a close would already be visible on the channel.
+	synctest.Wait()
+	select {
+	case err, ok := <-done:
+		t.Fatalf("Stop's channel delivered a second value (%v, open=%v); want exactly one", err, ok)
+	default:
+	}
 }
