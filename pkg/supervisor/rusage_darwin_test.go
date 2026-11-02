@@ -57,13 +57,25 @@ func TestPhysFootprinterDeadPidErrors(t *testing.T) {
 // MONOTONE across samples (the property metrics-server's rate computation
 // requires — it rejects a sample pair whose later cumulative value is smaller).
 //
-// The magnitude is also sanity-checked against the wall clock: the loop below
-// burns CPU for a measured interval, and the reported CPU delta must be within an
-// order of magnitude of it. That is deliberately loose except in one direction —
-// it is tight enough to catch the un-scaled mach-absolute-time reading, which
-// would report ~1/41.67 of the truth on Apple Silicon. The exact conversion is
-// pinned hermetically in TestMachTimebaseNanos.
+// The magnitude is also sanity-checked against an independent CPU reference:
+// getrusage(RUSAGE_SELF) user plus system time, which the kernel converts to
+// microseconds itself and so never passes through the user-space mach timebase
+// scaling RUsage applies. The loop below burns CPU until that reference has
+// advanced by at least minCPU, and the reported CPU delta must be within an order
+// of magnitude of the reference delta in either direction. That is tight enough
+// to catch the un-scaled mach-absolute-time reading, which would report ~1/41.67
+// of the truth on Apple Silicon (or an inverted scaling, ~41.67x too much). The
+// exact conversion is pinned hermetically in TestMachTimebaseNanos.
+//
+// The reference is CPU time, not wall time, on purpose: on a loaded host the
+// burning thread is scheduled for only a fraction of a wall interval, so a wall
+// comparison fails for a scheduling reason rather than a timebase error.
 func TestPhysFootprinterRUsageSelf(t *testing.T) {
+	const (
+		minCPU   = 100 * time.Millisecond // reference CPU the burn must reach
+		deadline = 10 * time.Second       // wall bound on reaching it
+	)
+
 	f := PhysFootprinter{}
 	first, err := f.RUsage(os.Getpid())
 	if err != nil {
@@ -76,13 +88,23 @@ func TestPhysFootprinterRUsageSelf(t *testing.T) {
 		t.Error("self cumulative CPU = 0 ns, want > 0 (this process has run)")
 	}
 
-	// Burn a known slice of CPU on this thread.
-	const burn = 200 * time.Millisecond
+	// The reference interval sits inside the RUsage interval, so the reported
+	// delta covers at least the reference delta.
+	ref0 := selfCPU(t)
 	start := time.Now()
+	var ref time.Duration
 	x := 0.0
-	for time.Since(start) < burn {
+	for {
 		for i := 0; i < 100000; i++ {
 			x += float64(i) * 0.5
+		}
+		ref = selfCPU(t) - ref0
+		if ref >= minCPU {
+			break
+		}
+		if time.Since(start) > deadline {
+			t.Fatalf("burned only %v of process CPU in %v of wall time (want %v); "+
+				"the host is too loaded for the magnitude check", ref, time.Since(start), minCPU)
 		}
 	}
 	_ = x
@@ -96,7 +118,7 @@ func TestPhysFootprinterRUsageSelf(t *testing.T) {
 		t.Fatalf("cumulative CPU went backwards: %d then %d", first.CPUTimeNanos, second.CPUTimeNanos)
 	}
 	delta := time.Duration(second.CPUTimeNanos - first.CPUTimeNanos)
-	t.Logf("burned wall=%v, reported CPU delta=%v", wall, delta)
+	t.Logf("burned wall=%v, getrusage CPU delta=%v, reported CPU delta=%v", wall, ref, delta)
 	if translated() {
 		// Under Rosetta the process-visible mach timebase is 1/1 (Rosetta presents
 		// mach_absolute_time in nanoseconds) while proc_pid_rusage still reports the
@@ -109,13 +131,29 @@ func TestPhysFootprinterRUsageSelf(t *testing.T) {
 		t.Skip("running under Rosetta: the visible mach timebase (1/1) does not describe " +
 			"the native rusage counters; re-run with GOARCH=arm64 for the magnitude check")
 	}
-	// A busy loop consumes at least a large fraction of a core for the interval.
-	// One tenth of the wall time is far below any plausible scheduling shortfall
-	// and far above the ~1/41.67 an unscaled mach-tick reading would produce.
-	if delta < wall/10 {
-		t.Errorf("CPU delta %v is implausibly small for %v of busy-looping — "+
-			"the mach-absolute-time scaling looks to be missing", delta, wall)
+	// Both counters measure the same process CPU over (nearly) the same interval,
+	// so they agree closely; a factor of ten either way is far outside any
+	// sampling or granularity difference and far inside the ~41.67x of a missing
+	// or inverted mach-tick scaling.
+	if delta < ref/10 {
+		t.Errorf("CPU delta %v is implausibly small against getrusage's %v — "+
+			"the mach-absolute-time scaling looks to be missing", delta, ref)
 	}
+	if delta > ref*10 {
+		t.Errorf("CPU delta %v is implausibly large against getrusage's %v — "+
+			"the mach-absolute-time scaling looks to be inverted", delta, ref)
+	}
+}
+
+// selfCPU returns this process's cumulative user plus system CPU time as
+// getrusage(RUSAGE_SELF) reports it.
+func selfCPU(t *testing.T) time.Duration {
+	t.Helper()
+	var ru unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &ru); err != nil {
+		t.Fatalf("getrusage(RUSAGE_SELF): %v", err)
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }
 
 // translated reports whether this process is running under Rosetta translation
