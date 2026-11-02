@@ -49,8 +49,9 @@
 ;; the symlink dir) — read+write, AFTER the allows so a caller's
 ;; extra path (even an ancestor work-dir grant) can't win.
 ;;   reap stores: podreap, vmreap
-;;   daemon trees: server, agent, run, blobs, sbpl, index, operator,
-;;     unpacked, snapshots, ingest, guest-artifacts, vmboot-failures
+;;   daemon trees: server, agent, run, blobs, status, sbpl, index,
+;;     operator, unpacked, snapshots, ingest, guest-artifacts,
+;;     vmboot-failures
 (deny file-read* file-write*
   (subpath "/Users"))
 (deny file-read* file-write*
@@ -75,6 +76,8 @@
   (subpath "/private/var/lib/k3sm/run")
   (subpath "/var/lib/k3sm/blobs")
   (subpath "/private/var/lib/k3sm/blobs")
+  (subpath "/var/lib/k3sm/status")
+  (subpath "/private/var/lib/k3sm/status")
   (subpath "/var/lib/k3sm/sbpl")
   (subpath "/private/var/lib/k3sm/sbpl")
   (subpath "/var/lib/k3sm/index")
