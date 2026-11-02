@@ -77,9 +77,15 @@ type rootLock struct {
 // current holder to let go, and records this process's pid in it. A wait of 0
 // or less selects DefaultRootLockWait. onBusy, when non-nil, is called after
 // each refused attempt that will be retried (the Deps.rootLockBusy test seam).
-func acquireRootLock(root string, wait time.Duration, onBusy func()) (*rootLock, error) {
+// flock, when non-nil, replaces unix.Flock; it is a test seam for the errors a
+// real filesystem rarely returns (ENOTSUP on a volume without flock support),
+// and New always passes nil.
+func acquireRootLock(root string, wait time.Duration, onBusy func(), flock func(fd, how int) error) (*rootLock, error) {
 	if wait <= 0 {
 		wait = DefaultRootLockWait
+	}
+	if flock == nil {
+		flock = unix.Flock
 	}
 	path := filepath.Join(root, RootLockName)
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
@@ -102,7 +108,7 @@ func acquireRootLock(root string, wait time.Duration, onBusy func()) (*rootLock,
 
 	deadline := time.Now().Add(wait)
 	for {
-		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		err := flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			break
 		}

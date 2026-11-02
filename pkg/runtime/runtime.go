@@ -828,7 +828,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if err := os.MkdirAll(cfg.Root, 0o755); err != nil {
 		return nil, fmt.Errorf("create runtime root %s: %w", cfg.Root, err)
 	}
-	lock, err := acquireRootLock(cfg.Root, deps.RootLockWait, deps.rootLockBusy)
+	lock, err := acquireRootLock(cfg.Root, deps.RootLockWait, deps.rootLockBusy, nil)
 	if err != nil {
 		return nil, err
 	}
