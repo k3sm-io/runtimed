@@ -18,6 +18,7 @@ limitations under the License.
 package acceptance
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -66,7 +67,10 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gopath, pathDir := t.TempDir(), t.TempDir()
+			// root holds every place go keeps state; pathDir and bin hold only
+			// read-only fakes and links.
+			root, pathDir := t.TempDir(), t.TempDir()
+			gopath := filepath.Join(root, "gopath")
 			if err := os.MkdirAll(filepath.Join(gopath, "bin"), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -102,16 +106,15 @@ func TestStaticcheckCandidateOrder(t *testing.T) {
 			// PATH fake, so that fake's directory is searched after bin.
 			driver := fmt.Sprintf(". %q\nSTATICCHECK_VERSION=%s\nstaticcheck_pick || exit 7\n\"$sc\" -tests=false ./...\n", script, pin)
 			cmd := exec.Command("bash", "-c", driver)
-			cmd.Env = []string{
-				"PATH=" + bin + ":" + pathDir,
-				"HOME=" + telemetryOffHome(t),
-				"GOPATH=" + gopath,
+			cmd.Env = append(hermeticGoEnv(t, root),
+				"PATH="+bin+":"+pathDir,
+				"GOPATH="+gopath,
 				"GOFLAGS=",
 				"GOTOOLCHAIN=local",
-				"GOROOT=" + goEnv(t, goBin, "GOROOT"),
-				"GOCACHE=" + t.TempDir(),
+				"GOROOT="+goEnv(t, goBin, "GOROOT"),
 				"GOWORK=off",
-			}
+			)
+			assertGoStateInRoot(t, goBin, cmd.Env, root)
 			outB, err := cmd.CombinedOutput()
 			out := string(outB)
 			if tc.wantRed {
@@ -161,16 +164,66 @@ func goEnv(t *testing.T, goBin, key string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// telemetryOffHome returns a temp HOME whose Go telemetry mode is off, for a
-// child that runs go. In the default local mode every go invocation under a
-// fresh HOME starts a telemetry sidecar in its own session (setsid, so the test
-// cannot wait for it) that keeps writing under HOME/Library/Application
+// hermeticGoEnv returns the HOME, GOENV, GOCACHE and TMPDIR entries for a
+// child that runs go, all under root, so go keeps no state outside it. GOCACHE
+// is private because the picker compiles nothing and needs no shared cache.
+// HOME carries a telemetry mode file set to off (see telemetryOffHome), which
+// also places GOTELEMETRYDIR under root: go derives that directory from HOME
+// and ignores GOTELEMETRY and GOTELEMETRYDIR in the environment.
+func hermeticGoEnv(t *testing.T, root string) []string {
+	t.Helper()
+	tmp := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return []string{
+		"HOME=" + telemetryOffHome(t, root),
+		"GOENV=" + filepath.Join(root, "goenv", "env"),
+		"GOCACHE=" + filepath.Join(root, "gocache"),
+		"TMPDIR=" + tmp,
+	}
+}
+
+// assertGoStateInRoot asks go, under the child's env, where it would write
+// state, and fails unless every such location lies inside root and telemetry is
+// off. It checks what go resolves, not the strings the test passed, so a
+// variable go ignores or a default derived from the real home is caught.
+func assertGoStateInRoot(t *testing.T, goBin string, env []string, root string) {
+	t.Helper()
+	cmd := exec.Command(goBin, "env", "-json", "GOENV", "GOCACHE", "GOMODCACHE", "GOPATH", "GOTMPDIR", "GOTELEMETRY", "GOTELEMETRYDIR")
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go env under the child env: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("parse go env -json: %v\n%s", err, out)
+	}
+	if got["GOTELEMETRY"] != "off" {
+		t.Errorf("child GOTELEMETRY=%q, want off", got["GOTELEMETRY"])
+	}
+	for _, k := range []string{"GOENV", "GOCACHE", "GOMODCACHE", "GOPATH", "GOTMPDIR", "GOTELEMETRYDIR"} {
+		v := got[k]
+		if v == "" && k == "GOTMPDIR" {
+			continue // unset: go uses TMPDIR, which hermeticGoEnv puts in root
+		}
+		if !strings.HasPrefix(v, root+string(filepath.Separator)) {
+			t.Errorf("child %s=%q is outside the case root %q", k, v, root)
+		}
+	}
+}
+
+// telemetryOffHome creates root/home with its Go telemetry mode off and returns
+// it, for a child that runs go. In the default local mode every go invocation
+// under a fresh HOME starts a telemetry sidecar in its own session (setsid, so
+// the test cannot wait for it) that keeps writing under HOME/Library/Application
 // Support/go after go exits, and t.TempDir cleanup then races it ("directory
 // not empty"). GOTELEMETRY is read-only in the environment; the mode file is the
 // switch, and with it off go opens no counter file and starts no sidecar.
-func telemetryOffHome(t *testing.T) string {
+func telemetryOffHome(t *testing.T, root string) string {
 	t.Helper()
-	home := t.TempDir()
+	home := filepath.Join(root, "home")
 	dir := filepath.Join(home, "Library", "Application Support", "go", "telemetry")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -179,8 +232,9 @@ func telemetryOffHome(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		// Registered after t.TempDir, so it runs before the removal: anything
-		// beside the mode file means go ignored it and a late writer may exist.
+		// Registered after root's t.TempDir, so it runs before the removal:
+		// anything beside the mode file means go ignored it and a late writer
+		// may exist.
 		ents, err := os.ReadDir(dir)
 		if err != nil {
 			t.Errorf("read telemetry dir: %v", err)
