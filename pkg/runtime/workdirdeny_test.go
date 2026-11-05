@@ -249,3 +249,28 @@ func TestStatusRecordDirReachesTheProfile(t *testing.T) {
 		t.Errorf("New with a relative status record dir: err = %v, want ErrInvalidStatusRecordDir", err)
 	}
 }
+
+// TestDataRootReachesTheProfile pins the one hop pkg/sandbox cannot see: the node's
+// Config value is the Posture the pod's profile compiles from, and New refuses a
+// value the denies cannot be written from.
+func TestDataRootReachesTheProfile(t *testing.T) {
+	root := t.TempDir()
+	dataRoot := filepath.Join(filepath.Dir(root), "node-data")
+
+	rt := newTestRuntimeCfg(t, Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs"), DataRoot: dataRoot}, Deps{})
+	profile, err := rt.boxProfile(hostBinBox(rt, "pod-data-root"))
+	if err != nil {
+		t.Fatalf("boxProfile: %v", err)
+	}
+	for _, sub := range []string{"server", "agent"} {
+		if denied := filepath.Join(dataRoot, sub); !strings.Contains(profile, "(subpath \""+denied+"\")") {
+			t.Errorf("Config.DataRoot's %q is not denied in the compiled profile:\n%s", denied, profile)
+		}
+	}
+
+	bad := Config{Root: t.TempDir(), DataRoot: "relative/root"}
+	bad.PodLogsDir = filepath.Join(bad.Root, "podlogs")
+	if _, err := New(bad, testDeps(t, Deps{})); !errors.Is(err, sandbox.ErrInvalidDataRoot) {
+		t.Errorf("New with a relative data root: err = %v, want ErrInvalidDataRoot", err)
+	}
+}
