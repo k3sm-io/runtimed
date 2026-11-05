@@ -19,7 +19,9 @@ package runtime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -30,8 +32,9 @@ import (
 // ctx, as KqueueReaper does at its poll-loop check. The wedged waits are
 // released at test cleanup so no goroutine outlives the test.
 type wedgedWaiter struct {
-	wedged map[int]bool
-	stop   chan struct{}
+	wedged   map[int]bool
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 func newWedgedWaiter(pids ...int) *wedgedWaiter {
@@ -51,7 +54,7 @@ func (w *wedgedWaiter) WaitExit(ctx context.Context, pid int) (int, int, error) 
 	return 0, 0, ctx.Err()
 }
 
-func (w *wedgedWaiter) release() { close(w.stop) }
+func (w *wedgedWaiter) release() { w.stopOnce.Do(func() { close(w.stop) }) }
 
 // closed reports whether ch is closed within a short bound (the supervision
 // goroutine still has to be scheduled after the cancel).
@@ -218,6 +221,61 @@ func TestRuntimeCloseSweepsSupervision(t *testing.T) {
 			t.Fatalf("Close on an empty runtime: %v", err)
 		}
 	})
+}
+
+// TestCloseWedgedPodRootLockContract pins when Close lets go of the root: only
+// once supervision has confirmed stopped. While a wedged pod's goroutines can
+// still write podreap records, a successor must not reap or attach under them, so
+// a Close that reports ErrSupervisionNotStopped keeps the lock (process exit frees
+// it). The wedge is released by an event and the last Close waits on a bound far
+// above the reaper's return, so the outcome does not depend on the machine's load.
+func TestCloseWedgedPodRootLockContract(t *testing.T) {
+	root := t.TempDir()
+	ww := newWedgedWaiter(1001)
+	t.Cleanup(ww.release)
+	rt := newTestRuntimeCfg(t, Config{Root: root}, Deps{Spawner: &fakeSpawner{}, Waiter: ww})
+	rt.closeGrace = 100 * time.Millisecond
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-wedged"))
+
+	assertRefused := func(when string) {
+		t.Helper()
+		d := testDeps(t, Deps{RootLockWait: lockTestWait})
+		onBusy, busy := busyCounter()
+		d.rootLockBusy = onBusy
+		successor, err := New(Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs")}, d)
+		if err == nil {
+			_ = successor.Close() // the acquisition is the failure reported here
+			t.Fatalf("%s: a successor acquired the root while a wedged supervision was running", when)
+		}
+		if !errors.Is(err, ErrRootInUse) {
+			t.Fatalf("%s: New on the root: err = %v, want ErrRootInUse", when, err)
+		}
+		if n := busy.Load(); n < 1 {
+			t.Errorf("%s: refused after %d waits, want it to wait on the holder", when, n)
+		}
+	}
+
+	if err := rt.Close(); !errors.Is(err, ErrSupervisionNotStopped) {
+		t.Fatalf("Close over a wedged pod: err = %v, want ErrSupervisionNotStopped", err)
+	}
+	assertRefused("after Close")
+
+	// A second Close re-observes the same wedge and must not release it either.
+	if err := rt.Close(); !errors.Is(err, ErrSupervisionNotStopped) {
+		t.Fatalf("second Close over a wedged pod: err = %v, want ErrSupervisionNotStopped", err)
+	}
+	assertRefused("after the second Close")
+
+	ww.release()
+	rt.closeGrace = 30 * time.Second
+	if err := rt.Close(); err != nil {
+		t.Fatalf("Close once the wedge cleared: %v", err)
+	}
+	onBusy, busy := busyCounter()
+	newTestRuntimeCfg(t, Config{Root: root}, Deps{RootLockWait: lockTestWait, rootLockBusy: onBusy})
+	if n := busy.Load(); n != 0 {
+		t.Errorf("New after the confirmed Close waited %d times, want no wait for a released lock", n)
+	}
 }
 
 // TestCloseGraceDefault pins the shutdown bound's default, so shrinking it in a

@@ -455,7 +455,7 @@ type Runtime struct {
 	shimDialer supervisor.ShimDialer
 
 	// rootLock is the exclusive flock on cfg.Root that New took (rootlock.go);
-	// Close releases it. Never nil after New.
+	// Close releases it once supervision has confirmed stopped. Never nil after New.
 	rootLock *rootLock
 
 	mu   sync.Mutex

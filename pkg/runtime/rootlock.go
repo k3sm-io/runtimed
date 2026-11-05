@@ -158,7 +158,10 @@ func lockHolder(fd int) string {
 }
 
 // release clears the recorded pid and drops the flock by closing the
-// descriptor. The file itself is left in place on purpose: unlinking a lock
+// descriptor. Its caller owes the contract that nothing this Runtime started can
+// still write under the root: New's failure paths hold no supervision yet, and
+// Close calls it only after supervision has confirmed stopped, otherwise leaving
+// the flock for the kernel to drop at process death. The file itself is left in place on purpose: unlinking a lock
 // file another New already has open would let a third New create a fresh inode
 // and lock it while the second holds the old one, so two Runtimes would each
 // believe they own the root.
