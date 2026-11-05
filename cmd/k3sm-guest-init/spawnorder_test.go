@@ -37,6 +37,7 @@ import (
 // the way opening a missing file does.
 type spawnRecorder struct {
 	failOn   string
+	missing  string
 	noMemory bool
 	calls    []string
 	files    map[string]string
@@ -45,6 +46,9 @@ type spawnRecorder struct {
 func (r *spawnRecorder) write(path, value string) error {
 	name := filepath.Base(path)
 	if r.noMemory && strings.HasPrefix(name, "memory.") {
+		return fmt.Errorf("open %s: %w", path, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist})
+	}
+	if name == r.missing {
 		return fmt.Errorf("open %s: %w", path, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist})
 	}
 	if name == r.failOn {
@@ -255,4 +259,32 @@ func TestSpawnStartsUnmeteredWithoutMemoryController(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestSpawnMissingFileAfterMaxIsFatal pins that once memory.max has been
+// written, an ENOENT on memory.high or memory.oom.group fails the start and
+// forks nothing, with or without a limit in the spec. Only an ENOENT on the
+// first write means "no memory controller"; widening that match past the first
+// write would start a half-limited container.
+func TestSpawnMissingFileAfterMaxIsFatal(t *testing.T) {
+	const leaf = "/sys/fs/cgroup/k3sm/app"
+	for _, f := range []string{guestagent.MemoryHighFile, guestagent.MemoryOOMGroupFile} {
+		for _, cp := range []guestinit.ContainerPlan{
+			{Name: "app"},
+			{Name: "app", MemoryMaxBytes: 1 << 30},
+		} {
+			r := &spawnRecorder{missing: f}
+			if _, err := r.spawn(leaf, cp); err == nil {
+				t.Errorf("%s missing, max %d: spawn succeeded, want the start to fail", f, cp.MemoryMaxBytes)
+			}
+			if len(r.calls) == 0 || r.calls[0] != guestagent.MemoryMaxFile+"="+map[bool]string{true: "1073741824", false: "max"}[cp.MemoryMaxBytes > 0] {
+				t.Errorf("%s missing: memory.max was not written first: calls %q", f, r.calls)
+			}
+			for _, c := range r.calls {
+				if c == "fork" {
+					t.Errorf("%s missing: the container was forked: calls %q", f, r.calls)
+				}
+			}
+		}
+	}
 }
