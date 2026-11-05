@@ -241,6 +241,13 @@ type Config struct {
 	// its own subtree in log_directory; this is the ROOT the deny is written
 	// against, never a path runtimed derives a log file from.
 	PodLogsDir string
+	// StatusRecordDir is where the node's status records really live (the k3sm
+	// data root's status directory), threaded into
+	// sandbox.Posture.StatusRecordDir, where it renders a read+write DENY for every
+	// confined pod in addition to the <Root>/status deny. Empty adds nothing: the
+	// <Root>/status deny stands alone, which leaves a record kept elsewhere
+	// undefended. New refuses a set value the deny cannot be written from.
+	StatusRecordDir string
 	// PathShimPath is the on-disk path of the path-rebase DYLD interpose shim
 	// (shim/pathrebase_shim.c). When set, containerEnv injects it into a mounting
 	// container's DYLD_INSERT_LIBRARIES with K3SM_ROOTFS + K3SM_MOUNT_PATHS so an
@@ -816,6 +823,11 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// startup-side one, which turns a node-wide misconfiguration into a single
 	// clear error instead of one sandbox-setup failure per pod.
 	if _, err := sandbox.ValidatePodLogsDir(cfg.PodLogsDir); err != nil {
+		return nil, err
+	}
+	// The same startup-side check for the status record deny, which is optional
+	// but must be sound when set.
+	if err := sandbox.ValidateStatusRecordDir(cfg.StatusRecordDir, cfg.Root); err != nil {
 		return nil, err
 	}
 	// Own the root before touching anything under it: two live Runtimes over one
