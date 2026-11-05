@@ -34,11 +34,13 @@ import (
 // limitThenFork: it records every call in order, fails the write to one file
 // when failOn names it, and models a leaf without the memory controller when
 // noMemory is set: every memory interface file is absent, so a write fails
-// the way opening a missing file does.
+// the way opening a missing file does. leafErr is what its leaf probe returns:
+// nil reports the leaf present, whatever the leaf path is on this host.
 type spawnRecorder struct {
 	failOn   string
 	missing  string
 	noMemory bool
+	leafErr  error
 	calls    []string
 	files    map[string]string
 }
@@ -62,6 +64,8 @@ func (r *spawnRecorder) write(path, value string) error {
 	return nil
 }
 
+func (r *spawnRecorder) probe(string) error { return r.leafErr }
+
 func (r *spawnRecorder) arm(container string) { r.calls = append(r.calls, "arm "+container) }
 
 func (r *spawnRecorder) fork() (int, error) {
@@ -70,7 +74,7 @@ func (r *spawnRecorder) fork() (int, error) {
 }
 
 func (r *spawnRecorder) spawn(leaf string, cp guestinit.ContainerPlan) (int, error) {
-	return limitThenFork(slog.New(slog.DiscardHandler), leaf, cp, r.write, r.arm, r.fork)
+	return limitThenFork(slog.New(slog.DiscardHandler), leaf, cp, r.write, r.probe, r.arm, r.fork)
 }
 
 // TestSpawnAppliesMemoryLimitsBeforeFork is the B1140 gate: spawn's start
@@ -285,6 +289,44 @@ func TestSpawnMissingFileAfterMaxIsFatal(t *testing.T) {
 					t.Errorf("%s missing: the container was forked: calls %q", f, r.calls)
 				}
 			}
+		}
+	}
+}
+
+// TestSpawnFailsWhenLeafCannotBeConfirmed covers the other way memory.max can be
+// missing: the leaf itself is gone, or the check for it failed. Neither is proof
+// of a leaf with no controller, so neither starts an unmetered container. The
+// spawn fails here, naming the leaf, rather than later at the fork into it. The
+// leaf is a real directory, so only the injected probe can report it absent.
+func TestSpawnFailsWhenLeafCannotBeConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"absent", fs.ErrNotExist},
+		{"the check failed", fs.ErrPermission},
+	} {
+		for _, cp := range []guestinit.ContainerPlan{
+			{Name: "app"},
+			{Name: "app", MemoryMaxBytes: 1 << 30},
+		} {
+			t.Run(fmt.Sprintf("%s, max %d", tc.name, cp.MemoryMaxBytes), func(t *testing.T) {
+				leaf := t.TempDir()
+				r := &spawnRecorder{noMemory: true, leafErr: tc.err}
+				_, err := r.spawn(leaf, cp)
+				if err == nil {
+					t.Fatalf("spawn succeeded with calls %q, want the start to fail", r.calls)
+				}
+				if errors.Is(err, guestagent.ErrNoMemoryController) || !errors.Is(err, tc.err) {
+					t.Errorf("err = %v, want one wrapping %v and not ErrNoMemoryController", err, tc.err)
+				}
+				if !strings.Contains(strings.ReplaceAll(err.Error(), filepath.Join(leaf, guestagent.MemoryMaxFile), ""), leaf) {
+					t.Errorf("err = %v, want the leaf %s named apart from its memory.max path", err, leaf)
+				}
+				if len(r.calls) != 0 {
+					t.Errorf("calls = %q, want no arm and no fork", r.calls)
+				}
+			})
 		}
 	}
 }

@@ -210,8 +210,9 @@ func (l MemoryLimits) Set() bool { return l.Max > 0 || l.High > 0 }
 
 // ErrNoMemoryController reports a leaf with no memory interface files because
 // the memory controller is not enabled in it. ApplyMemoryLimits returns it
-// only when no limit is set, where it means there is nothing to reset; with a
-// limit set the missing file is an ordinary write failure.
+// only for a leaf known to exist and only when no limit is set, where it means
+// there is nothing to reset; with a limit set the missing file is an ordinary
+// write failure.
 var ErrNoMemoryController = errors.New("guestagent: the leaf has no memory controller")
 
 // ErrInvalidMemoryLimits reports a limit pair guest/v1 forbids: a negative
@@ -228,7 +229,9 @@ var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
 // On a fresh leaf those are the kernel's defaults, so the writes change
 // nothing. A leaf without the memory controller (no memory.max) has no bound
 // to reset: with no limit set that returns ErrNoMemoryController and writes
-// nothing, and the caller starts the container unmetered.
+// nothing, and the caller starts the container unmetered. A leaf that is
+// missing, or whose existence could not be checked, is an error naming it,
+// never ErrNoMemoryController.
 //
 // It must run BEFORE the container's process is placed in the leaf, so the
 // process never runs a single instruction unbounded. Every write failing is
@@ -243,7 +246,7 @@ var ErrInvalidMemoryLimits = errors.New("guestagent: invalid memory limits")
 // exit a container exit (with oom_kill counted in memory.events) instead of a
 // container that lost one child and kept running.
 func ApplyMemoryLimits(leaf string, l MemoryLimits) error {
-	return ApplyMemoryLimitsVia(WriteLeafFile, leaf, l)
+	return ApplyMemoryLimitsVia(WriteLeafFile, StatLeaf, leaf, l)
 }
 
 // LeafWriter writes one value to one cgroup2 interface file, in one write.
@@ -255,9 +258,21 @@ type LeafWriter func(path, value string) error
 // write(2), the way the kernel parses it.
 func WriteLeafFile(path, value string) error { return appendLine(path, value) }
 
+// LeafProbe reports whether a cgroup2 leaf directory exists: nil when it does,
+// an error wrapping fs.ErrNotExist when it does not, and any other error when
+// the check itself failed. StatLeaf is the real one; a test passes a fake beside
+// its LeafWriter, so the two describe the same leaf.
+type LeafProbe func(leaf string) error
+
+// StatLeaf is the LeafProbe over the real filesystem.
+func StatLeaf(leaf string) error {
+	_, err := os.Stat(leaf)
+	return err
+}
+
 // ApplyMemoryLimitsVia is ApplyMemoryLimits with the file writes going through
-// write.
-func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
+// write and the leaf existence check going through probe.
+func ApplyMemoryLimitsVia(write LeafWriter, probe LeafProbe, leaf string, l MemoryLimits) error {
 	switch {
 	case l.Max < 0 || l.High < 0:
 		return fmt.Errorf("%w: max %d, high %d", ErrInvalidMemoryLimits, l.Max, l.High)
@@ -270,12 +285,17 @@ func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
 	}
 	if err := write(filepath.Join(leaf, MemoryMaxFile), limitValue(l.Max)); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			// A missing memory.max means no controller only when the leaf
-			// itself is there; a missing leaf is its own failure.
-			if _, statErr := os.Stat(leaf); errors.Is(statErr, fs.ErrNotExist) {
+			// A missing memory.max means no controller only when the leaf is
+			// known to be there. A missing leaf is its own failure, and so is a
+			// check that could not tell: that is no proof the leaf has nothing
+			// to reset, and it does not prove the leaf gone either, so the
+			// write's ENOENT is reported but not wrapped.
+			switch probeErr := probe(leaf); {
+			case errors.Is(probeErr, fs.ErrNotExist):
 				return fmt.Errorf("cgroup leaf %s does not exist: %w", leaf, err)
-			}
-			if !l.Set() {
+			case probeErr != nil:
+				return fmt.Errorf("check cgroup leaf %s: %w (set memory.max: %v)", leaf, probeErr, err)
+			case !l.Set():
 				return fmt.Errorf("%w: %w", ErrNoMemoryController, err)
 			}
 		}

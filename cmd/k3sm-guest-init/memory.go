@@ -32,12 +32,16 @@ import (
 // the container's process is forked into it. leaf is "" when no leaf could be
 // made.
 //
-// With no limit a missing leaf is the unmetered case the spawn already
-// degrades to, and an existing leaf is reset to unbounded (memory.max and
-// memory.high "max", memory.oom.group 0): a restart reuses the leaf, and the
-// previous instance's bound must not outlive the spec that set it. A leaf
-// without the memory controller (EnableSubtreeControllers is best effort) has
-// no bound to be stale, so it is logged and the container starts unmetered.
+// With no limit and no leaf ("") the container takes the unmetered case the
+// spawn already degrades to, and an existing leaf is reset to unbounded
+// (memory.max and memory.high "max", memory.oom.group 0): a restart reuses the
+// leaf, and the previous instance's bound must not outlive the spec that set
+// it. A leaf without the memory controller (EnableSubtreeControllers is best
+// effort) has no bound to be stale, so it is logged and the container starts
+// unmetered.
+// A leaf path that is gone, or that cannot be checked, fails the start here
+// with an error naming it: neither proves a leaf with no bound to be stale, and
+// a fork into a missing leaf would only fail later with a less useful cause.
 // Any other failed reset write fails the start like a failed limit write,
 // since the container would otherwise run under a bound and a group kill its
 // spec does not have.
@@ -49,12 +53,12 @@ import (
 // It lives in an untagged file so the gate runs on the darwin host; the linux
 // spawn is its only caller.
 func applyContainerMemory(log *slog.Logger, leaf string, cp guestinit.ContainerPlan) error {
-	return applyContainerMemoryVia(log, guestagent.WriteLeafFile, leaf, cp)
+	return applyContainerMemoryVia(log, guestagent.WriteLeafFile, guestagent.StatLeaf, leaf, cp)
 }
 
 // applyContainerMemoryVia is applyContainerMemory with the leaf writes going
-// through write.
-func applyContainerMemoryVia(log *slog.Logger, write guestagent.LeafWriter, leaf string, cp guestinit.ContainerPlan) error {
+// through write and the leaf existence check through probe.
+func applyContainerMemoryVia(log *slog.Logger, write guestagent.LeafWriter, probe guestagent.LeafProbe, leaf string, cp guestinit.ContainerPlan) error {
 	limits := guestagent.MemoryLimits{Max: cp.MemoryMaxBytes, High: cp.MemoryHighBytes}
 	if leaf == "" {
 		if !limits.Set() {
@@ -62,7 +66,7 @@ func applyContainerMemoryVia(log *slog.Logger, write guestagent.LeafWriter, leaf
 		}
 		return fmt.Errorf("container %s has a memory limit but no cgroup2 leaf to apply it to", cp.Name)
 	}
-	if err := guestagent.ApplyMemoryLimitsVia(write, leaf, limits); err != nil {
+	if err := guestagent.ApplyMemoryLimitsVia(write, probe, leaf, limits); err != nil {
 		if errors.Is(err, guestagent.ErrNoMemoryController) {
 			log.Info("the container's cgroup2 leaf has no memory controller; it runs unmetered",
 				"container", cp.Name, "leaf", leaf)
@@ -79,11 +83,12 @@ func applyContainerMemoryVia(log *slog.Logger, write guestagent.LeafWriter, leaf
 // leaf. A limit that cannot be written means no fork, so the container never
 // runs a single instruction without the bound its spec asked for.
 //
-// write is the leaf writer (guestagent.WriteLeafFile in the guest), arm the
-// OOM baseline, and fork the fork into the leaf (CLONE_INTO_CGROUP).
-func limitThenFork(log *slog.Logger, leaf string, cp guestinit.ContainerPlan, write guestagent.LeafWriter,
+// write is the leaf writer (guestagent.WriteLeafFile in the guest), probe the
+// leaf existence check (guestagent.StatLeaf), arm the OOM baseline, and fork
+// the fork into the leaf (CLONE_INTO_CGROUP).
+func limitThenFork(log *slog.Logger, leaf string, cp guestinit.ContainerPlan, write guestagent.LeafWriter, probe guestagent.LeafProbe,
 	arm func(container string), fork func() (int, error)) (int, error) {
-	if err := applyContainerMemoryVia(log, write, leaf, cp); err != nil {
+	if err := applyContainerMemoryVia(log, write, probe, leaf, cp); err != nil {
 		return 0, err
 	}
 	arm(cp.Name)
