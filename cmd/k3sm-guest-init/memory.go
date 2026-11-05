@@ -28,7 +28,7 @@ import (
 	"k3sm.io/runtimed/pkg/guestinit"
 )
 
-// applyContainerMemory writes cp's memory limits into its cgroup2 leaf before
+// applyContainerMemoryVia writes cp's memory limits into its cgroup2 leaf before
 // the container's process is forked into it. leaf is "" when no leaf could be
 // made.
 //
@@ -50,14 +50,10 @@ import (
 // running the container without it would let it take the whole VM's memory
 // while the pod spec says it cannot.
 //
-// It lives in an untagged file so the gate runs on the darwin host; the linux
-// spawn is its only caller.
-func applyContainerMemory(log *slog.Logger, leaf string, cp guestinit.ContainerPlan) error {
-	return applyContainerMemoryVia(log, guestagent.WriteLeafFile, guestagent.StatLeaf, leaf, cp)
-}
-
-// applyContainerMemoryVia is applyContainerMemory with the leaf writes going
-// through write and the leaf existence check through probe.
+// The leaf writes go through write (guestagent.WriteLeafFile in the guest) and
+// the leaf existence check through probe (guestagent.StatLeaf). It lives in an
+// untagged file so the gate runs on the darwin host; limitThenFork, which the
+// linux spawn calls, is its only caller.
 func applyContainerMemoryVia(log *slog.Logger, write guestagent.LeafWriter, probe guestagent.LeafProbe, leaf string, cp guestinit.ContainerPlan) error {
 	limits := guestagent.MemoryLimits{Max: cp.MemoryMaxBytes, High: cp.MemoryHighBytes}
 	if leaf == "" {

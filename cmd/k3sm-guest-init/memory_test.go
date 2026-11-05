@@ -103,8 +103,8 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("both limits are written before the container runs", func(t *testing.T) {
 		leaf := fakeLeaf(t, eventsZero)
-		if err := applyContainerMemory(discard, leaf, plan(t, memSpec(limit, high))); err != nil {
-			t.Fatalf("applyContainerMemory: %v", err)
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, leaf, plan(t, memSpec(limit, high))); err != nil {
+			t.Fatalf("applyContainerMemoryVia: %v", err)
 		}
 		if got := readLeafFile(t, leaf, guestagent.MemoryMaxFile); got != "1073741824" {
 			t.Errorf("memory.max = %q, want 1073741824", got)
@@ -119,8 +119,8 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("no limit resets the leaf to unbounded", func(t *testing.T) {
 		leaf := fakeLeaf(t, eventsZero)
-		if err := applyContainerMemory(discard, leaf, plan(t, memSpec(0, 0))); err != nil {
-			t.Fatalf("applyContainerMemory: %v", err)
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, leaf, plan(t, memSpec(0, 0))); err != nil {
+			t.Fatalf("applyContainerMemoryVia: %v", err)
 		}
 		for f, want := range map[string]string{
 			guestagent.MemoryMaxFile:      "max",
@@ -135,20 +135,20 @@ func TestGuestInitSetsMemoryMaxAndHigh(t *testing.T) {
 
 	t.Run("a limit with no leaf fails closed", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "absent")
-		if err := applyContainerMemory(discard, missing, plan(t, memSpec(limit, high))); err == nil {
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, missing, plan(t, memSpec(limit, high))); err == nil {
 			t.Fatal("a limit that could not be written must fail the start")
 		}
-		if err := applyContainerMemory(discard, "", plan(t, memSpec(limit, 0))); err == nil {
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, "", plan(t, memSpec(limit, 0))); err == nil {
 			t.Fatal("a limit with no cgroup leaf must fail the start")
 		}
-		if err := applyContainerMemory(discard, "", plan(t, memSpec(0, 0))); err != nil {
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, "", plan(t, memSpec(0, 0))); err != nil {
 			t.Fatalf("no limit and no leaf is the unmetered case, not an error: %v", err)
 		}
 		bare := t.TempDir() // a leaf without the memory controller: no memory files
-		if err := applyContainerMemory(discard, bare, plan(t, memSpec(0, 0))); err != nil {
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, bare, plan(t, memSpec(0, 0))); err != nil {
 			t.Fatalf("no limit on a leaf with no memory controller is the unmetered case: %v", err)
 		}
-		if err := applyContainerMemory(discard, bare, plan(t, memSpec(limit, 0))); err == nil {
+		if err := applyContainerMemoryVia(discard, guestagent.WriteLeafFile, guestagent.StatLeaf, bare, plan(t, memSpec(limit, 0))); err == nil {
 			t.Fatal("a limit on a leaf with no memory controller must fail the start")
 		}
 	})
