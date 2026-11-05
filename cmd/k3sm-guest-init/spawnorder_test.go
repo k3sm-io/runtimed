@@ -77,7 +77,7 @@ func (r *spawnRecorder) spawn(leaf string, cp guestinit.ContainerPlan) (int, err
 	return limitThenFork(slog.New(slog.DiscardHandler), leaf, cp, r.write, r.probe, r.arm, r.fork)
 }
 
-// TestSpawnAppliesMemoryLimitsBeforeFork is the B1140 gate: spawn's start
+// TestSpawnAppliesMemoryLimitsBeforeFork pins spawn's start
 // order, through the same limitThenFork the linux spawn calls with the real
 // leaf writer and ForkExec. The limits are written max, then high, then
 // oom.group, all before the fork places the child in its leaf; a failed write
@@ -173,7 +173,7 @@ func TestSpawnAppliesMemoryLimitsBeforeFork(t *testing.T) {
 	})
 }
 
-// TestSpawnResetsStaleLimitsOnReusedLeaf is the B1160 gate: a restart reuses
+// TestSpawnResetsStaleLimitsOnReusedLeaf covers a restart, which reuses
 // the container's leaf, so when the new spec sets no memory limit the leaf
 // still holds the earlier instance's memory.max, memory.high and
 // memory.oom.group = 1. Spawn writes max, max and 0 over them before the fork,
