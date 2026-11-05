@@ -18,6 +18,7 @@ package guestagent
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,4 +212,105 @@ func TestCgroup2LeafProvisioning(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestApplyMemoryLimitsMissingLeafIsNotNoController(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "gone")
+	// WriteLeafFile yields the real appendLine ENOENT shape.
+	err := ApplyMemoryLimitsVia(WriteLeafFile, StatLeaf, absent, MemoryLimits{})
+	if err == nil || errors.Is(err, ErrNoMemoryController) {
+		t.Fatalf("missing leaf: got %v, want an error that is not ErrNoMemoryController", err)
+	}
+	if !errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), absent) {
+		t.Fatalf("missing leaf error must wrap ENOENT and name the leaf: %v", err)
+	}
+
+	present := t.TempDir()
+	err = ApplyMemoryLimitsVia(WriteLeafFile, StatLeaf, present, MemoryLimits{})
+	if !errors.Is(err, ErrNoMemoryController) {
+		t.Fatalf("present leaf without memory.max: got %v, want ErrNoMemoryController", err)
+	}
+}
+
+// TestApplyMemoryLimitsProbeDecides pins that the injected probe, never the host
+// filesystem, tells a missing leaf from a missing controller. The leaf is a real
+// directory throughout, so a call that stats the host instead reads it as present
+// and the absent and failed-check cases go red.
+func TestApplyMemoryLimitsProbeDecides(t *testing.T) {
+	missingMax := func(path, _ string) error {
+		return &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	}
+	limit := MemoryLimits{Max: 1 << 30}
+	for _, tc := range []struct {
+		name          string
+		write         LeafWriter
+		probeErr      error
+		limits        MemoryLimits
+		wantProbes    int
+		wantNoCtrl    bool
+		wantIs        error
+		wantNotIs     error
+		wantNamesLeaf bool
+	}{
+		{
+			name: "present leaf without memory.max, no limit, is no controller", write: missingMax,
+			wantProbes: 1, wantNoCtrl: true, wantIs: fs.ErrNotExist,
+		},
+		{
+			name: "present leaf without memory.max, with a limit, is a write failure", write: missingMax,
+			limits: limit, wantProbes: 1, wantIs: fs.ErrNotExist,
+		},
+		{
+			name: "absent leaf, no limit, names the leaf", write: missingMax, probeErr: fs.ErrNotExist,
+			wantProbes: 1, wantIs: fs.ErrNotExist, wantNamesLeaf: true,
+		},
+		{
+			name: "absent leaf, with a limit, names the leaf", write: missingMax, probeErr: fs.ErrNotExist,
+			limits: limit, wantProbes: 1, wantIs: fs.ErrNotExist, wantNamesLeaf: true,
+		},
+		{
+			name: "a failed check, no limit, is not read as no controller", write: missingMax, probeErr: fs.ErrPermission,
+			wantProbes: 1, wantIs: fs.ErrPermission, wantNotIs: fs.ErrNotExist, wantNamesLeaf: true,
+		},
+		{
+			name: "a failed check, with a limit, names the leaf", write: missingMax, probeErr: fs.ErrPermission,
+			limits: limit, wantProbes: 1, wantIs: fs.ErrPermission, wantNotIs: fs.ErrNotExist, wantNamesLeaf: true,
+		},
+		{
+			name:   "a write failing for another reason does not probe",
+			write:  func(string, string) error { return fs.ErrPermission },
+			wantIs: fs.ErrPermission,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leaf := t.TempDir()
+			probes := 0
+			probe := func(got string) error {
+				probes++
+				if got != leaf {
+					t.Errorf("probe(%q), want the leaf %q", got, leaf)
+				}
+				return tc.probeErr
+			}
+			err := ApplyMemoryLimitsVia(tc.write, probe, leaf, tc.limits)
+			if err == nil {
+				t.Fatal("got nil, want an error")
+			}
+			if probes != tc.wantProbes {
+				t.Errorf("probed %d times, want %d", probes, tc.wantProbes)
+			}
+			if got := errors.Is(err, ErrNoMemoryController); got != tc.wantNoCtrl {
+				t.Errorf("errors.Is(%v, ErrNoMemoryController) = %v, want %v", err, got, tc.wantNoCtrl)
+			}
+			if !errors.Is(err, tc.wantIs) {
+				t.Errorf("%v does not wrap %v", err, tc.wantIs)
+			}
+			if tc.wantNotIs != nil && errors.Is(err, tc.wantNotIs) {
+				t.Errorf("%v must not wrap %v", err, tc.wantNotIs)
+			}
+			if tc.wantNamesLeaf && !strings.Contains(strings.ReplaceAll(err.Error(), filepath.Join(leaf, MemoryMaxFile), ""), leaf) {
+				t.Errorf("%v does not name the leaf %s apart from its memory.max path", err, leaf)
+			}
+		})
+	}
 }

@@ -38,8 +38,9 @@ var forkNames = map[string]bool{
 
 // shapeViolations parses src (a Go file holding func spawn) and returns one
 // line per way spawn departs from the pinned shape: its only fork is the
-// closure passed to limitThenFork, with guestagent.WriteLeafFile and oom.arm
-// as its other arguments, and the JoinLeaf reconcile after that call.
+// closure passed to limitThenFork, with guestagent.WriteLeafFile,
+// guestagent.StatLeaf and oom.arm as its other arguments, and the JoinLeaf
+// reconcile after that call.
 //
 // It cannot see a fork reached through a helper function spawn calls, through
 // a method value stored in a struct or interface, or through reflection.
@@ -91,16 +92,19 @@ func shapeViolations(src string) []string {
 	if limit == nil {
 		return append(out, "spawn does not call limitThenFork")
 	}
-	if len(limit.Args) != 6 {
-		return append(out, fmt.Sprintf("limitThenFork has %d arguments, want 6", len(limit.Args)))
+	if len(limit.Args) != 7 {
+		return append(out, fmt.Sprintf("limitThenFork has %d arguments, want 7", len(limit.Args)))
 	}
 	if sel, ok := limit.Args[3].(*ast.SelectorExpr); !ok || sel.Sel.Name != "WriteLeafFile" || !identIs(sel.X, "guestagent") {
 		out = append(out, "limitThenFork's writer argument is not guestagent.WriteLeafFile")
 	}
-	if sel, ok := limit.Args[4].(*ast.SelectorExpr); !ok || sel.Sel.Name != "arm" || !identIs(sel.X, "oom") {
+	if sel, ok := limit.Args[4].(*ast.SelectorExpr); !ok || sel.Sel.Name != "StatLeaf" || !identIs(sel.X, "guestagent") {
+		out = append(out, "limitThenFork's probe argument is not guestagent.StatLeaf")
+	}
+	if sel, ok := limit.Args[5].(*ast.SelectorExpr); !ok || sel.Sel.Name != "arm" || !identIs(sel.X, "oom") {
 		out = append(out, "limitThenFork's arm argument is not oom.arm")
 	}
-	closure, ok := limit.Args[5].(*ast.FuncLit)
+	closure, ok := limit.Args[6].(*ast.FuncLit)
 	if !ok {
 		return append(out, "limitThenFork's fork argument is not a function literal")
 	}
@@ -154,7 +158,7 @@ func TestSpawnUsesLimitThenForkOnly(t *testing.T) {
 func TestShapeViolationsCases(t *testing.T) {
 	const pre = "package main\nimport (\n\t\"syscall\"\n\tsc \"syscall\"\n\t. \"syscall\"\n)\n"
 	mk := func(before, inside, after string) string {
-		return pre + "func spawn() {\n" + before + "\tpid, err := limitThenFork(log, leaf, cp, guestagent.WriteLeafFile, oom.arm, func() (int, error) {\n" +
+		return pre + "func spawn() {\n" + before + "\tpid, err := limitThenFork(log, leaf, cp, guestagent.WriteLeafFile, guestagent.StatLeaf, oom.arm, func() (int, error) {\n" +
 			inside + "\t\treturn 0, nil\n\t})\n" + after + "\tguestagent.JoinLeaf(leaf, pid)\n}\n"
 	}
 	good := "\t\tpid, ferr := syscall.ForkExec(prog, argv, attr)\n"
@@ -171,8 +175,9 @@ func TestShapeViolationsCases(t *testing.T) {
 		{"an exec.Command", mk("", good, "\texec.Command(\"x\").Start()\n"), "outside the limitThenFork closure"},
 		{"no fork in the closure", mk("", "", ""), "holds 0"},
 		{"two forks in the closure", mk("", good+good, ""), "holds 2"},
-		{"the join before the call", pre + "func spawn() {\n\tguestagent.JoinLeaf(leaf, 1)\n\tlimitThenFork(log, leaf, cp, guestagent.WriteLeafFile, oom.arm, func() (int, error) { return syscall.ForkExec(p, a, b) })\n}\n", "not after limitThenFork"},
+		{"the join before the call", pre + "func spawn() {\n\tguestagent.JoinLeaf(leaf, 1)\n\tlimitThenFork(log, leaf, cp, guestagent.WriteLeafFile, guestagent.StatLeaf, oom.arm, func() (int, error) { return syscall.ForkExec(p, a, b) })\n}\n", "not after limitThenFork"},
 		{"another writer", strings.Replace(mk("", good, ""), "guestagent.WriteLeafFile", "other.Write", 1), "writer argument"},
+		{"another probe", strings.Replace(mk("", good, ""), "guestagent.StatLeaf", "other.Probe", 1), "probe argument"},
 		{"another arm", strings.Replace(mk("", good, ""), "oom.arm", "noop", 1), "arm argument"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

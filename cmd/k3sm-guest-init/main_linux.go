@@ -857,7 +857,7 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestag
 	// instance is taken before it can allocate (limitThenFork). Unlike the
 	// metering above this is fail-closed: a limit the host asked for and could
 	// not be applied fails the start (applyContainerMemory).
-	pid, err := limitThenFork(log, leaf, cp, guestagent.WriteLeafFile, oom.arm, func() (int, error) {
+	pid, err := limitThenFork(log, leaf, cp, guestagent.WriteLeafFile, guestagent.StatLeaf, oom.arm, func() (int, error) {
 		pid, ferr := syscall.ForkExec(prog, cp.Argv, attr)
 		// This process's copies of the child's ends go immediately after the
 		// fork: holding a pipe's write end open means the readers below never
