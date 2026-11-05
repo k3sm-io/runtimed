@@ -38,7 +38,6 @@ var _ = decodeSpec
 // The memory-limit apply and the OOM verdict are likewise linux-only callers'
 // helpers kept portable so their gate runs here.
 var (
-	_ = applyContainerMemory
 	_ = limitThenFork
 	_ = newOOMWatch
 	_ = (*oomWatch).arm

@@ -856,7 +856,7 @@ func spawn(cp guestinit.ContainerPlan, capture *guestagent.Capture, hub *guestag
 	// it, so the container never runs unbounded, and the OOM baseline for this
 	// instance is taken before it can allocate (limitThenFork). Unlike the
 	// metering above this is fail-closed: a limit the host asked for and could
-	// not be applied fails the start (applyContainerMemory).
+	// not be applied fails the start (applyContainerMemoryVia).
 	pid, err := limitThenFork(log, leaf, cp, guestagent.WriteLeafFile, guestagent.StatLeaf, oom.arm, func() (int, error) {
 		pid, ferr := syscall.ForkExec(prog, cp.Argv, attr)
 		// This process's copies of the child's ends go immediately after the
