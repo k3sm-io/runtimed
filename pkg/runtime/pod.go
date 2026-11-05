@@ -783,6 +783,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 			// read the whole node's logs and rewrite its neighbours'. New
 			// refuses an empty value at construction, so it is always set here.
 			PodLogsDir: r.cfg.PodLogsDir,
+			// NOT plumbing either: the status records' real location, denied
+			// beside <Root>/status. Empty adds nothing.
+			StatusRecordDir: r.cfg.StatusRecordDir,
 			// The re-signed shell copies: an explicit read grant beside the
 			// /Library baseline (Config.ShadowBinDir).
 			ShadowBinDir: r.cfg.ShadowBinDir,

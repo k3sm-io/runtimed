@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -224,4 +225,27 @@ func (b *profileCapturingBackend) profile() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.last
+}
+
+// TestStatusRecordDirReachesTheProfile pins the one hop pkg/sandbox cannot see:
+// the node's Config value is the Posture the pod's profile compiles from, and New
+// refuses a value the deny cannot be written from.
+func TestStatusRecordDirReachesTheProfile(t *testing.T) {
+	root := t.TempDir()
+	statusDir := filepath.Join(filepath.Dir(root), "node-data", "status")
+
+	rt := newTestRuntimeCfg(t, Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs"), StatusRecordDir: statusDir}, Deps{})
+	profile, err := rt.boxProfile(hostBinBox(rt, "pod-status-record"))
+	if err != nil {
+		t.Fatalf("boxProfile: %v", err)
+	}
+	if !strings.Contains(profile, "(subpath \""+statusDir+"\")") {
+		t.Errorf("Config.StatusRecordDir %q is not denied in the compiled profile:\n%s", statusDir, profile)
+	}
+
+	bad := Config{Root: t.TempDir(), StatusRecordDir: "relative/status"}
+	bad.PodLogsDir = filepath.Join(bad.Root, "podlogs")
+	if _, err := New(bad, testDeps(t, Deps{})); !errors.Is(err, sandbox.ErrInvalidStatusRecordDir) {
+		t.Errorf("New with a relative status record dir: err = %v, want ErrInvalidStatusRecordDir", err)
+	}
 }

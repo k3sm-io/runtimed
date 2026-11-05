@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -91,9 +92,10 @@ const (
 	// StatusSubdir is the node's status record dir (<WorkDir>/status): the
 	// world-readable records `k3sm status` reports, including the node-local
 	// budget record, which has no other copy and is read as evidence. A pod able
-	// to write here could forge it. Same cross-repo residual as ServerSubdir: the
-	// k3sm control plane writes it at its data root, which is this work-dir only
-	// when the runtime root is left at its default.
+	// to write here could forge it. The k3sm control plane writes it at its data
+	// root, which is this work-dir only when the runtime root is left at its
+	// default; Posture.StatusRecordDir names the real location, and without it
+	// this deny carries the same residual as ServerSubdir.
 	StatusSubdir = "status"
 )
 
@@ -218,6 +220,13 @@ var ErrInvalidWorkDir = errors.New("sbpl: invalid work-dir")
 // able to read — and rewrite — every other pod's log file, silently.
 var ErrInvalidPodLogsDir = errors.New("sbpl: invalid pod-logs dir")
 
+// ErrInvalidStatusRecordDir reports a set Posture.StatusRecordDir that cannot
+// hold its deny: not absolute and clean, the filesystem root, a path whose
+// rendered SBPL string would differ from its bytes, or a path at or under the
+// pods root, where the data-volume re-allow emitted after the denies could beat
+// it. An empty value is not this error (see Posture.StatusRecordDir).
+var ErrInvalidStatusRecordDir = errors.New("sbpl: invalid status record dir")
+
 // ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
 // not reside under the configured Posture.Home. In the unprivileged user-space
 // posture the daemon's data area lives under its home; a work-dir outside it
@@ -293,6 +302,29 @@ type Posture struct {
 	// that baseline is ever narrowed. It must be absolute and clean
 	// (ErrInvalidShadowBinDir). Empty emits nothing.
 	ShadowBinDir string
+	// StatusRecordDir is the node's status record directory where the control
+	// plane really writes it: <data root>/status, which is not <WorkDir>/status on
+	// a node started with a non-default pod root. Its write barrier is this
+	// profile alone, because the records are owned by the uid pods run as.
+	//
+	// When set, Generate denies it read+write in the protected tier, in both
+	// firmlink forms, and validateExtraPaths refuses any caller-supplied path at
+	// or under it. That is IN ADDITION to the <WorkDir>/status deny, which is
+	// emitted whatever this field holds, so no value can narrow the deny-set.
+	//
+	// Empty means the caller did not say where the records are: the profile
+	// carries the <WorkDir>/status deny alone, byte for byte what it carried
+	// before this field existed, and a record kept elsewhere has no deny. A value
+	// equal to <WorkDir>/status also renders that same profile, so a node whose
+	// data root is its work-dir sees no profile drift on re-attach.
+	//
+	// It must be absolute, clean, not "/", free of anything the profile's string
+	// quoting would rewrite, and not at or under <WorkDir>/pods
+	// (ErrInvalidStatusRecordDir). Generate refuses the whole profile rather than
+	// drop the deny. libsandbox matches resolved paths, and only the /var, /tmp and
+	// /etc firmlinks are rewritten here, so the caller passes a path with no other
+	// symlink in it: a deny written through one would match nothing.
+	StatusRecordDir string
 }
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are not part of
@@ -440,6 +472,7 @@ type GenerateOptions struct {
 // ErrDataVolumeUnbounded if that volume is not under the posture's pods root,
 // ErrProtectedPath if any extra/credential path is under the protected deny-set,
 // ErrXcodeToolchainDir if xcode_toolchain_dir is not a usable DEVELOPER_DIR,
+// ErrInvalidStatusRecordDir for a set status record dir that cannot hold its deny,
 // and the work-dir errors above for a bad Posture; otherwise the rendered profile
 // is always well-formed and passes Validate.
 func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
@@ -896,6 +929,17 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 		return "", nil, nil, err
 	}
 	workDirDenyRoots = append(workDirDenyRoots, podLogsDir, ContainerLogSymlinkDir)
+	// The status record's real location, when the caller named one. It adds to the
+	// <WorkDir>/status deny above and never replaces it, and the same joined path
+	// adds nothing, so a node whose data root is its work-dir keeps its profile
+	// byte for byte (a changed profile refuses every re-attach as drift).
+	statusDir, err := resolveStatusRecordDir(p.StatusRecordDir, podsRoot)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if statusDir != "" && statusDir != filepath.Join(workDir, StatusSubdir) {
+		workDirDenyRoots = append(workDirDenyRoots, statusDir)
+	}
 	// Pin every work-dir root into the protected deny-set so a caller's extra
 	// path can never reach a sibling pod, the reap store, or a control-plane
 	// tree, then keep the fixed system subtrees.
@@ -927,6 +971,50 @@ func resolvePodLogsDir(dir string) (string, error) {
 		return "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidPodLogsDir, dir)
 	case filepath.Clean(dir) != dir:
 		return "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidPodLogsDir, dir)
+	}
+	return dir, nil
+}
+
+// ValidateStatusRecordDir reports whether dir can be a Posture.StatusRecordDir on
+// a node with this runtime work-dir (empty workDir means DefaultWorkDir). It is
+// exported so the daemon can refuse a bad value once at startup rather than once
+// per pod: the check is the one Generate applies, asked early.
+func ValidateStatusRecordDir(dir, workDir string) error {
+	if workDir == "" {
+		workDir = DefaultWorkDir
+	}
+	_, err := resolveStatusRecordDir(dir, filepath.Join(workDir, "pods"))
+	return err
+}
+
+// resolveStatusRecordDir validates a Posture.StatusRecordDir. Empty is not an
+// error and returns "": the field's documented unset state, which adds no deny.
+//
+// The quoting check is an identity test rather than a list of bad characters.
+// Every path reaches the profile through %q, which rewrites a quote, a backslash,
+// a control byte, a non-printable rune or invalid UTF-8 into a Go escape. SBPL's
+// own string syntax does not promise to read those back as the same bytes, so a
+// value %q would change is a deny on some other path, or no deny at all. Printable
+// non-ASCII passes because %q leaves its bytes alone; the deny then matches those
+// bytes, in the Unicode normalization form the caller wrote them in.
+//
+// The pods-root bound exists because the pod's data volume, which lives under
+// that root, is re-allowed after the protected denies and last match wins. A
+// status directory there could be re-opened by a pod whose volume contains it.
+func resolveStatusRecordDir(dir, podsRoot string) (string, error) {
+	switch {
+	case dir == "":
+		return "", nil
+	case strconv.Quote(dir) != `"`+dir+`"`:
+		return "", fmt.Errorf("%w: %q cannot be carried in a profile string unchanged", ErrInvalidStatusRecordDir, dir)
+	case !filepath.IsAbs(dir):
+		return "", fmt.Errorf("%w: %q is not absolute", ErrInvalidStatusRecordDir, dir)
+	case dir == "/":
+		return "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidStatusRecordDir, dir)
+	case filepath.Clean(dir) != dir:
+		return "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidStatusRecordDir, dir)
+	case isUnder(dir, podsRoot):
+		return "", fmt.Errorf("%w: %q is at or under the pods root %q", ErrInvalidStatusRecordDir, dir, podsRoot)
 	}
 	return dir, nil
 }
