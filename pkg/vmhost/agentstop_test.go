@@ -171,7 +171,11 @@ func countingDialer(dial vsockDialer, closes *atomic.Int32) vsockDialer {
 // watchdog, so a Stop that never reaches the guest, or never delivers its
 // outcome, fails naming the wait instead of hanging the package.
 func TestGuestStopperIssuesStopRPC(t *testing.T) {
-	t.Run("the-rpc-carries-the-computed-grace", func(t *testing.T) {
+	// Defensive cases: the lifecycle only ever hands the stopper whole seconds in
+	// [1 s, MaxStopGrace] (guestGrace), so 7.9 s, 0 and MaxInt64 are unreachable
+	// through it. They pin the stopper's own conversion if it gains another
+	// caller. What the lifecycle can send is TestLifecycleGraceReachesTheWire.
+	t.Run("the-rpc-carries-the-computed-grace-defensive", func(t *testing.T) {
 		cases := []struct {
 			name  string
 			grace time.Duration
@@ -480,5 +484,49 @@ func returnsBeforeTheRPCAndDeliversOneValue(t *testing.T) {
 	case err, ok := <-done:
 		t.Fatalf("Stop's channel delivered a second value (%v, open=%v); want exactly one", err, ok)
 	default:
+	}
+}
+
+// TestLifecycleGraceReachesTheWire composes the lifecycle's grace policy (the
+// clamp in NewLifecycle and guestGrace) with the production stopper over the
+// bufconn seam, and asserts the grace_seconds the guest receives at the
+// reachable bounds: the 1 s floor, the 300 s ceiling and a 400 s request
+// clamped to that ceiling.
+func TestLifecycleGraceReachesTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ask  time.Duration
+		want int32
+	}{
+		{"one-second", time.Second, 1},
+		{"at-the-ceiling", MaxStopGrace, 300},
+		{"clamped-over-the-ceiling", 400 * time.Second, 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newStopAgent(false)
+			rec := &callLog{}
+			m := newFakeMachine(rec)
+			timer := newManualTimer()
+			frozen := time.Unix(0, 0)
+			lc := NewLifecycle(m, NewAgentStopper(serveStopAgent(t, agent)), LifecycleOptions{
+				Grace: tc.ask, Logger: quietLogger(), NewTimer: timer.new,
+				Now: func() time.Time { return frozen },
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- lc.Run(ctx) }()
+			waitForState(t, lc, StateRunning)
+			cancel()
+
+			req := await(t, agent.got, "the Stop request at the guest")
+			if got := req.GetGraceSeconds(); got != tc.want {
+				t.Errorf("Stop RPC grace_seconds = %d, want %d", got, tc.want)
+			}
+			m.exit <- nil
+			if err := await(t, done, "Run to return"); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+		})
 	}
 }
