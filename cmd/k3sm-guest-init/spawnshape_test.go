@@ -39,8 +39,9 @@ var forkNames = map[string]bool{
 // shapeViolations parses src (a Go file holding func spawn) and returns one
 // line per way spawn departs from the pinned shape: its only fork is the
 // closure passed to limitThenFork, with guestagent.WriteLeafFile,
-// guestagent.StatLeaf and oom.arm as its other arguments, and the JoinLeaf
-// reconcile after that call.
+// guestagent.StatLeaf and oom.arm as its other arguments, the log, leaf and cp
+// arguments being spawn's own identifiers (a rebuilt cp would drop the limits),
+// and the JoinLeaf reconcile after that call.
 //
 // It cannot see a fork reached through a helper function spawn calls, through
 // a method value stored in a struct or interface, or through reflection.
@@ -94,6 +95,11 @@ func shapeViolations(src string) []string {
 	}
 	if len(limit.Args) != 7 {
 		return append(out, fmt.Sprintf("limitThenFork has %d arguments, want 7", len(limit.Args)))
+	}
+	for i, name := range map[int]string{0: "log", 1: "leaf", 2: "cp"} {
+		if !identIs(limit.Args[i], name) {
+			out = append(out, fmt.Sprintf("limitThenFork's argument %d is not the identifier %s spawn holds", i, name))
+		}
 	}
 	if sel, ok := limit.Args[3].(*ast.SelectorExpr); !ok || sel.Sel.Name != "WriteLeafFile" || !identIs(sel.X, "guestagent") {
 		out = append(out, "limitThenFork's writer argument is not guestagent.WriteLeafFile")
@@ -178,6 +184,8 @@ func TestShapeViolationsCases(t *testing.T) {
 		{"the join before the call", pre + "func spawn() {\n\tguestagent.JoinLeaf(leaf, 1)\n\tlimitThenFork(log, leaf, cp, guestagent.WriteLeafFile, guestagent.StatLeaf, oom.arm, func() (int, error) { return syscall.ForkExec(p, a, b) })\n}\n", "not after limitThenFork"},
 		{"another writer", strings.Replace(mk("", good, ""), "guestagent.WriteLeafFile", "other.Write", 1), "writer argument"},
 		{"another probe", strings.Replace(mk("", good, ""), "guestagent.StatLeaf", "other.Probe", 1), "probe argument"},
+		{"a composite-literal cp", strings.Replace(mk("", good, ""), "leaf, cp,", "leaf, guestinit.ContainerPlan{Name: cp.Name},", 1), "argument 2 is not the identifier cp"},
+		{"a wrong leaf identifier", strings.Replace(mk("", good, ""), "log, leaf,", "log, other,", 1), "argument 1 is not the identifier leaf"},
 		{"another arm", strings.Replace(mk("", good, ""), "oom.arm", "noop", 1), "arm argument"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
