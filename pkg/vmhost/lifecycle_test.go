@@ -268,8 +268,9 @@ func TestLifecycleStateMachine(t *testing.T) {
 
 	// --- the shutdown order, which is the whole point ------------------------
 
-	t.Run("the-agent-is-asked-before-the-machine-is-halted", func(t *testing.T) {
-		// A hard stop is a power cut: for a pod mid-write it is data loss, and for
+	t.Run("the-agent-request-is-under-way-before-the-machine-is-halted", func(t *testing.T) {
+		// The request is under way before the hard stop. A hard stop is a
+		// power cut: for a pod mid-write it is data loss, and for
 		// a PVC it is data loss that outlives the pod. So the graceful leg must
 		// come first, and the hard stop only after the budget is spent.
 		//
