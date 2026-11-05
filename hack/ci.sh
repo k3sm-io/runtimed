@@ -326,6 +326,13 @@ if [ -n "$go_pkgs" ]; then
 	. hack/staticcheck-pick.sh
 	staticcheck_pick || exit 1
 	echo "==> [runtimed] staticcheck ${STATICCHECK_VERSION} (non-test)"; CGO_ENABLED=$CGO "$sc" -tests=false ./...
+	# The guest init is linux-only, so the darwin run above never analyses its
+	# linux files: a helper only the linux spawn calls reads as unused there and
+	# nowhere else. Check the package under GOOS=linux with the same pinned binary.
+	# Only this package: the rest of the tree is darwin code, unused on linux.
+	if [ -d cmd/k3sm-guest-init ]; then
+		echo "==> [runtimed] staticcheck ${STATICCHECK_VERSION} (guest-init, GOOS=linux, non-test)"; GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$sc" -tests=false ./cmd/k3sm-guest-init
+	fi
 else
 	echo "==> [runtimed] (no Go packages yet — skipping vet/build/test)"
 fi
