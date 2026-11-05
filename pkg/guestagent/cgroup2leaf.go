@@ -269,8 +269,15 @@ func ApplyMemoryLimitsVia(write LeafWriter, leaf string, l MemoryLimits) error {
 		oomGroup = "1"
 	}
 	if err := write(filepath.Join(leaf, MemoryMaxFile), limitValue(l.Max)); err != nil {
-		if !l.Set() && errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("%w: %w", ErrNoMemoryController, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			// A missing memory.max means no controller only when the leaf
+			// itself is there; a missing leaf is its own failure.
+			if _, statErr := os.Stat(leaf); errors.Is(statErr, fs.ErrNotExist) {
+				return fmt.Errorf("cgroup leaf %s does not exist: %w", leaf, err)
+			}
+			if !l.Set() {
+				return fmt.Errorf("%w: %w", ErrNoMemoryController, err)
+			}
 		}
 		return fmt.Errorf("set memory.max: %w", err)
 	}

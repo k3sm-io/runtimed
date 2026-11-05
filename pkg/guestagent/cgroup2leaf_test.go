@@ -18,6 +18,7 @@ package guestagent
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,4 +212,22 @@ func TestCgroup2LeafProvisioning(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestApplyMemoryLimitsMissingLeafIsNotNoController(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "gone")
+	// WriteLeafFile yields the real appendLine ENOENT shape.
+	err := ApplyMemoryLimitsVia(WriteLeafFile, absent, MemoryLimits{})
+	if err == nil || errors.Is(err, ErrNoMemoryController) {
+		t.Fatalf("missing leaf: got %v, want an error that is not ErrNoMemoryController", err)
+	}
+	if !errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), absent) {
+		t.Fatalf("missing leaf error must wrap ENOENT and name the leaf: %v", err)
+	}
+
+	present := t.TempDir()
+	err = ApplyMemoryLimitsVia(WriteLeafFile, present, MemoryLimits{})
+	if !errors.Is(err, ErrNoMemoryController) {
+		t.Fatalf("present leaf without memory.max: got %v, want ErrNoMemoryController", err)
+	}
 }
