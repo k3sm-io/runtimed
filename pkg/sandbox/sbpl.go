@@ -68,12 +68,15 @@ const (
 	// CA private keys, the generated kubeconfigs, and the kine SQLite datastore.
 	// It is written by the k3sm control plane rather than by runtimed, and
 	// runtimed cannot import k3sm, so the name cannot be single-sourced across
-	// the repo boundary today. residual: the control plane takes its state root
-	// from a --work-dir flag with a posture-aware default, so on a node started
-	// with a different value this deny guards a directory nothing writes.
+	// the repo boundary today. The control plane keeps it at its data root, which
+	// is this work-dir only when the runtime root is left at its default;
+	// Posture.DataRoot names the real location. residual: without that field, on a
+	// node started with a different root this deny guards a directory nothing
+	// writes.
 	ServerSubdir = "server"
 	// AgentSubdir is the node-agent state dir (<WorkDir>/agent): the node
-	// password and the agent kubeconfig. Same cross-repo residual as ServerSubdir.
+	// password and the agent kubeconfig. Same data-root rule, and same residual
+	// without Posture.DataRoot, as ServerSubdir.
 	AgentSubdir = "agent"
 	// RunSubdir is the daemon socket + key dir (<WorkDir>/run): the runtimed and
 	// k3sm-netd control sockets and the wireguard mesh private key under
@@ -227,6 +230,12 @@ var ErrInvalidPodLogsDir = errors.New("sbpl: invalid pod-logs dir")
 // it. An empty value is not this error (see Posture.StatusRecordDir).
 var ErrInvalidStatusRecordDir = errors.New("sbpl: invalid status record dir")
 
+// ErrInvalidDataRoot reports a set Posture.DataRoot that cannot hold its denies:
+// the same refusals as ErrInvalidStatusRecordDir, plus a pods root at or under one
+// of the denied directories, where the deny would swallow the runtime's own tree.
+// An empty value is not this error (see Posture.DataRoot).
+var ErrInvalidDataRoot = errors.New("sbpl: invalid data root")
+
 // ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
 // not reside under the configured Posture.Home. In the unprivileged user-space
 // posture the daemon's data area lives under its home; a work-dir outside it
@@ -325,6 +334,28 @@ type Posture struct {
 	// /etc firmlinks are rewritten here, so the caller passes a path with no other
 	// symlink in it: a deny written through one would match nothing.
 	StatusRecordDir string
+	// DataRoot is the k3sm data root: the directory whose server and agent
+	// children (DataRootDenySubdirs) hold the cluster CA keys, the kine database
+	// and the node password. It is not <WorkDir> on a node started with a
+	// non-default pod root, and then the <WorkDir>/server and <WorkDir>/agent denies
+	// land on directories nothing writes.
+	//
+	// When set, Generate denies both children read+write in the protected tier, in
+	// both firmlink forms, and validateExtraPaths refuses any caller-supplied path
+	// at or under them. That is IN ADDITION to the <WorkDir> denies, which are
+	// emitted whatever this field holds, and it does not include the data root
+	// itself: only the children are named, as under <WorkDir>. An allow at or above
+	// the data root stays permitted by validation and is re-denied by these lines.
+	//
+	// Empty adds nothing, and so does a value equal to <WorkDir>: both render the
+	// profile the node had before this field existed, so a node whose data root is
+	// its work-dir sees no profile drift on re-attach.
+	//
+	// It carries the StatusRecordDir requirements, and additionally the pods root
+	// must not be at or under either child (ErrInvalidDataRoot). Generate refuses
+	// the whole profile rather than drop a deny. The caller passes a path with no
+	// symlink but the /var, /tmp and /etc firmlinks, in it or in either child.
+	DataRoot string
 }
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are not part of
@@ -473,6 +504,7 @@ type GenerateOptions struct {
 // ErrProtectedPath if any extra/credential path is under the protected deny-set,
 // ErrXcodeToolchainDir if xcode_toolchain_dir is not a usable DEVELOPER_DIR,
 // ErrInvalidStatusRecordDir for a set status record dir that cannot hold its deny,
+// ErrInvalidDataRoot for a set data root that cannot hold its denies,
 // and the work-dir errors above for a bad Posture; otherwise the rendered profile
 // is always well-formed and passes Validate.
 func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
@@ -940,6 +972,17 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	if statusDir != "" && statusDir != filepath.Join(workDir, StatusSubdir) {
 		workDirDenyRoots = append(workDirDenyRoots, statusDir)
 	}
+	// The control-plane secrets' real location, under the same two rules: the
+	// <WorkDir> denies above stay, and the same root adds nothing.
+	dataRoot, err := resolveDataRoot(p.DataRoot, podsRoot)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if dataRoot != "" && dataRoot != workDir {
+		for _, sub := range DataRootDenySubdirs() {
+			workDirDenyRoots = append(workDirDenyRoots, filepath.Join(dataRoot, sub))
+		}
+	}
 	// Pin every work-dir root into the protected deny-set so a caller's extra
 	// path can never reach a sibling pod, the reap store, or a control-plane
 	// tree, then keep the fixed system subtrees.
@@ -987,8 +1030,60 @@ func ValidateStatusRecordDir(dir, workDir string) error {
 	return err
 }
 
+// DataRootDenySubdirs returns the data-root-relative trees Posture.DataRoot denies,
+// so the check that the denies can match (k3sm's startup check) walks the same list
+// the profile renders. The returned slice is freshly allocated, so a caller cannot
+// mutate the deny-set by holding on to it.
+func DataRootDenySubdirs() []string {
+	return []string{ServerSubdir, AgentSubdir}
+}
+
+// ValidateDataRoot reports whether dir can be a Posture.DataRoot on a node with
+// this runtime work-dir (empty workDir means DefaultWorkDir). It is exported so the
+// daemon can refuse a bad value once at startup rather than once per pod: the check
+// is the one Generate applies, asked early.
+func ValidateDataRoot(dir, workDir string) error {
+	if workDir == "" {
+		workDir = DefaultWorkDir
+	}
+	_, err := resolveDataRoot(dir, filepath.Join(workDir, "pods"))
+	return err
+}
+
+// resolveDataRoot validates a Posture.DataRoot. Empty is not an error and returns
+// "": the field's documented unset state, which adds no deny.
+//
+// A pods root inside a denied child is refused because the deny would cover the
+// runtime's own tree: the data volume is re-allowed after it, but every PV grant
+// under the work-dir would fail validation, pod by pod, for a reason the node's
+// configuration decided at startup.
+func resolveDataRoot(dir, podsRoot string) (string, error) {
+	if err := checkDenyDir(dir, podsRoot, ErrInvalidDataRoot); err != nil {
+		return "", err
+	}
+	if dir == "" {
+		return "", nil
+	}
+	for _, sub := range DataRootDenySubdirs() {
+		if denied := filepath.Join(dir, sub); isUnder(podsRoot, denied) {
+			return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidDataRoot, podsRoot, denied)
+		}
+	}
+	return dir, nil
+}
+
 // resolveStatusRecordDir validates a Posture.StatusRecordDir. Empty is not an
 // error and returns "": the field's documented unset state, which adds no deny.
+func resolveStatusRecordDir(dir, podsRoot string) (string, error) {
+	if err := checkDenyDir(dir, podsRoot, ErrInvalidStatusRecordDir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// checkDenyDir refuses, with sentinel, a set directory a protected-tier deny cannot
+// honestly be written from. An empty dir passes: each field documents its unset
+// state.
 //
 // The quoting check is an identity test rather than a list of bad characters.
 // Every path reaches the profile through %q, which rewrites a quote, a backslash,
@@ -1000,23 +1095,23 @@ func ValidateStatusRecordDir(dir, workDir string) error {
 //
 // The pods-root bound exists because the pod's data volume, which lives under
 // that root, is re-allowed after the protected denies and last match wins. A
-// status directory there could be re-opened by a pod whose volume contains it.
-func resolveStatusRecordDir(dir, podsRoot string) (string, error) {
+// directory there could be re-opened by a pod whose volume contains it.
+func checkDenyDir(dir, podsRoot string, sentinel error) error {
 	switch {
 	case dir == "":
-		return "", nil
+		return nil
 	case strconv.Quote(dir) != `"`+dir+`"`:
-		return "", fmt.Errorf("%w: %q cannot be carried in a profile string unchanged", ErrInvalidStatusRecordDir, dir)
+		return fmt.Errorf("%w: %q cannot be carried in a profile string unchanged", sentinel, dir)
 	case !filepath.IsAbs(dir):
-		return "", fmt.Errorf("%w: %q is not absolute", ErrInvalidStatusRecordDir, dir)
+		return fmt.Errorf("%w: %q is not absolute", sentinel, dir)
 	case dir == "/":
-		return "", fmt.Errorf("%w: %q is the filesystem root", ErrInvalidStatusRecordDir, dir)
+		return fmt.Errorf("%w: %q is the filesystem root", sentinel, dir)
 	case filepath.Clean(dir) != dir:
-		return "", fmt.Errorf("%w: %q is not a clean path", ErrInvalidStatusRecordDir, dir)
+		return fmt.Errorf("%w: %q is not a clean path", sentinel, dir)
 	case isUnder(dir, podsRoot):
-		return "", fmt.Errorf("%w: %q is at or under the pods root %q", ErrInvalidStatusRecordDir, dir, podsRoot)
+		return fmt.Errorf("%w: %q is at or under the pods root %q", sentinel, dir, podsRoot)
 	}
-	return dir, nil
+	return nil
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected

@@ -786,6 +786,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 			// NOT plumbing either: the status records' real location, denied
 			// beside <Root>/status. Empty adds nothing.
 			StatusRecordDir: r.cfg.StatusRecordDir,
+			// NOT plumbing either: where the control-plane secrets really live,
+			// denied beside <Root>/server and <Root>/agent. Empty adds nothing.
+			DataRoot: r.cfg.DataRoot,
 			// The re-signed shell copies: an explicit read grant beside the
 			// /Library baseline (Config.ShadowBinDir).
 			ShadowBinDir: r.cfg.ShadowBinDir,

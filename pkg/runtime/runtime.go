@@ -248,6 +248,13 @@ type Config struct {
 	// <Root>/status deny stands alone, which leaves a record kept elsewhere
 	// undefended. New refuses a set value the deny cannot be written from.
 	StatusRecordDir string
+	// DataRoot is the k3sm data root, whose server and agent directories hold the
+	// CA keys, the kine database and the node password, threaded into
+	// sandbox.Posture.DataRoot, where those two render a read+write DENY for every
+	// confined pod in addition to the <Root>/server and <Root>/agent denies. Empty
+	// adds nothing: those denies stand alone, which leaves state kept elsewhere to
+	// default-deny. New refuses a set value the denies cannot be written from.
+	DataRoot string
 	// PathShimPath is the on-disk path of the path-rebase DYLD interpose shim
 	// (shim/pathrebase_shim.c). When set, containerEnv injects it into a mounting
 	// container's DYLD_INSERT_LIBRARIES with K3SM_ROOTFS + K3SM_MOUNT_PATHS so an
@@ -828,6 +835,9 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// The same startup-side check for the status record deny, which is optional
 	// but must be sound when set.
 	if err := sandbox.ValidateStatusRecordDir(cfg.StatusRecordDir, cfg.Root); err != nil {
+		return nil, err
+	}
+	if err := sandbox.ValidateDataRoot(cfg.DataRoot, cfg.Root); err != nil {
 		return nil, err
 	}
 	// Own the root before touching anything under it: two live Runtimes over one
