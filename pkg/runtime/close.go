@@ -31,8 +31,9 @@ import (
 const defaultCloseGrace = 2 * time.Second
 
 // ErrSupervisionNotStopped reports that a pod's supervision goroutine had not
-// stopped when Close's bound expired. It is informational: the daemon is exiting
-// regardless, and the goroutine dies with the process.
+// stopped when Close's bound expired. The daemon is exiting regardless and the
+// goroutine dies with the process, so it is not fatal, but until then the root
+// stays locked: that goroutine can still write podreap records.
 var ErrSupervisionNotStopped = errors.New("supervision did not stop before the close deadline")
 
 // closeGraceDuration is Close's bounded wait for supervision to stop
@@ -80,13 +81,18 @@ func (r *Runtime) closeGraceDuration() time.Duration {
 // goroutines Close exists to stop.
 //
 // Close then releases the root lock New took (rootlock.go), so a new Runtime on
-// the same root can start. The Runtime must not serve after Close.
+// the same root can start, but only when every supervision has confirmed stopped.
+// On any miss the lock stays held and exit frees it: a successor reaping or
+// attaching under a goroutine that still writes podreap records is the race the
+// lock exists to prevent, and a daemon whose Close failed is exiting anyway. A
+// later Close that confirms the stop releases it. The Runtime must not serve after
+// Close.
 func (r *Runtime) Close() error {
-	err := r.stopSupervision()
-	// Release the root last, after every supervision this daemon owns has been
-	// told to stop, so a successor's New cannot start reaping or attaching while
-	// this one is still winding down. A second Close finds it already released.
-	return errors.Join(err, r.rootLock.release())
+	if err := r.stopSupervision(); err != nil {
+		return fmt.Errorf("keep runtime root locked until exit: %w", err)
+	}
+	// A second Close finds the lock already released.
+	return r.rootLock.release()
 }
 
 // stopSupervision is Close's supervision half: everything Close does before it

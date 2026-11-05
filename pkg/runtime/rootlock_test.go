@@ -183,6 +183,11 @@ const rootLockHelperEnv = "K3SM_TEST_ROOTLOCK_HELPER_ROOT"
 // root, so the parent proceeds on an event rather than a sleep.
 const rootLockHelperReady = "rootlock-helper-ready"
 
+// rootLockHelperReadyBound bounds the wait for that line. It is a ceiling for a
+// helper wedged before it prints, far above a healthy start on a loaded machine,
+// and it fails with the helper's stderr long before the package timeout would.
+const rootLockHelperReadyBound = 30 * time.Second
+
 // TestRootLockHelperProcess is not a test of its own: TestRootLockCrossProcess
 // re-executes the test binary to run it, as a second process that takes the
 // root through New and then holds it until it is killed or its stdin closes.
@@ -204,6 +209,7 @@ func startRootLockHolder(t *testing.T, root string) *exec.Cmd {
 	cmd.Env = append(os.Environ(), rootLockHelperEnv+"="+root)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	cmd.WaitDelay = 5 * time.Second // a descendant holding stderr cannot hang the failure path's Wait
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -220,15 +226,67 @@ func startRootLockHolder(t *testing.T, root string) *exec.Cmd {
 		_ = cmd.Process.Kill()    // and is killed if it does not
 		_, _ = cmd.Process.Wait() // reaped either way; a test that already waited gets an error here
 	})
-	sc := bufio.NewScanner(stdout)
-	for sc.Scan() {
-		if sc.Text() == rootLockHelperReady {
-			return cmd
-		}
+	if err := awaitReadyLine(stdout, rootLockHelperReady, rootLockHelperReadyBound); err != nil {
+		_ = cmd.Process.Kill() // a wedged holder would otherwise keep Wait from returning
+		_ = cmd.Wait()         // collects stderr for the message below
+		t.Fatalf("root holder did not report the root held: %v: %s", err, stderr.String())
 	}
-	_ = cmd.Wait() // collects stderr for the message below
-	t.Fatalf("root holder exited before holding the root: %s", stderr.String())
-	return nil
+	return cmd
+}
+
+// awaitReadyLine scans r for a line equal to want, giving up after bound. The scan
+// runs in its own goroutine, because a read from a wedged writer does not return
+// on its own; it ends when r is closed or reaches EOF, which for a child's stdout
+// happens when the child is killed and waited for.
+func awaitReadyLine(r io.Reader, want string, bound time.Duration) error {
+	result := make(chan error, 1)
+	go func() {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			if sc.Text() == want {
+				result <- nil
+				return
+			}
+		}
+		if err := sc.Err(); err != nil {
+			result <- fmt.Errorf("read before line %q: %w", want, err)
+			return
+		}
+		result <- fmt.Errorf("end of output before line %q", want)
+	}()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("no line %q within %s", want, bound)
+	}
+}
+
+// TestAwaitReadyLine pins the readiness scan's three outcomes, the third being why it
+// is bounded: a writer that stays silent fails the scan instead of blocking until
+// the package timeout.
+func TestAwaitReadyLine(t *testing.T) {
+	t.Run("line-found", func(t *testing.T) {
+		if err := awaitReadyLine(strings.NewReader("noise\nready\n"), "ready", time.Minute); err != nil {
+			t.Errorf("awaitReadyLine: %v", err)
+		}
+	})
+	t.Run("output-ends-first", func(t *testing.T) {
+		err := awaitReadyLine(strings.NewReader("noise\n"), "ready", time.Minute)
+		if err == nil || !strings.Contains(err.Error(), "end of output") {
+			t.Errorf("awaitReadyLine = %v, want the end of output reported", err)
+		}
+	})
+	t.Run("silent-writer-hits-the-bound", func(t *testing.T) {
+		pr, pw := io.Pipe()
+		t.Cleanup(func() { _ = pw.Close() }) // ends the scan goroutine
+		err := awaitReadyLine(pr, "ready", 10*time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), "within") {
+			t.Errorf("awaitReadyLine = %v, want the bound reported", err)
+		}
+	})
 }
 
 // TestRootLockCrossProcess pins the lock across processes, which is the case it

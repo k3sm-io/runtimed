@@ -131,7 +131,7 @@ func run(socketPath, root, version, podLogsDir string, log *slog.Logger) error {
 	// caller may end (by closing its listener) while keeping the Runtime; daemon
 	// shutdown is this function.
 	if err := rt.Close(); err != nil {
-		log.Warn("pod supervision did not fully stop at shutdown", "err", err)
+		log.Warn("pod supervision did not fully stop at shutdown; the runtime root stays locked until this process exits", "err", err)
 	}
 	return serveErr
 }
