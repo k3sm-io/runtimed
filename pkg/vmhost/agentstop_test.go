@@ -22,6 +22,7 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -386,6 +387,34 @@ func stopWithin(t *testing.T, s agentStopper, ctx context.Context, grace time.Du
 	}
 }
 
+// TestAgentStopperWedgedDialDoesNotHoldStop pins that Stop waits for the dial to
+// begin, never for it to finish: a vsock dial that hangs must not hang the
+// shutdown that is about to fall back to the hard stop.
+func TestAgentStopperWedgedDialDoesNotHoldStop(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	dial := func(ctx context.Context) (net.Conn, error) {
+		// A redial must not panic on a second close.
+		once.Do(func() { close(entered) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := stopWithin(t, NewAgentStopper(dial), ctx, time.Second)
+	<-entered
+	select {
+	case err := <-done:
+		t.Fatalf("Stop's channel delivered %v while the dial was still wedged", err)
+	default:
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("Stop outcome = nil for a dial that never connected, want an error")
+	}
+}
+
 // TestGuestStopperStopReturnsBeforeTheCall pins the production agentStopper to
 // the seam's contract: Stop returns while the RPC is still in flight, and does
 // not wait on a dial that hangs; the channel then delivers exactly one value;
@@ -398,32 +427,6 @@ func TestGuestStopperStopReturnsBeforeTheCall(t *testing.T) {
 		// the call started to finish or block for good, instead of watching the
 		// channel for a while.
 		synctest.Test(t, returnsBeforeTheRPCAndDeliversOneValue)
-	})
-
-	t.Run("a-wedged-dial-does-not-hold-stop", func(t *testing.T) {
-		// Stop waits for the dial to BEGIN, never for it to finish: a vsock dial
-		// that hangs must not hang the shutdown that is about to fall back to
-		// the hard stop.
-		entered := make(chan struct{})
-		dial := func(ctx context.Context) (net.Conn, error) {
-			close(entered)
-			<-ctx.Done()
-			return nil, ctx.Err()
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		done := stopWithin(t, NewAgentStopper(dial), ctx, time.Second)
-		<-entered
-		select {
-		case err := <-done:
-			t.Fatalf("Stop's channel delivered %v while the dial was still wedged", err)
-		default:
-		}
-		cancel()
-		if err := <-done; err == nil {
-			t.Fatal("Stop outcome = nil for a dial that never connected, want an error")
-		}
 	})
 
 	t.Run("an-already-cancelled-ctx-returns-without-waiting-for-a-dial", func(t *testing.T) {

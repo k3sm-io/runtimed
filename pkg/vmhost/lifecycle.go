@@ -100,13 +100,17 @@ type machineRunner interface {
 // A lifecycle that could not tell the two apart would have to treat an unreachable
 // agent as a machine failure.
 //
-// Stop starts the request and returns at once; the outcome arrives later on the
-// returned channel. Splitting the two is what orders the request before the
-// hard stop: the lifecycle calls Stop on the goroutine that later halts the
-// machine, so the request has been started before the halt can be reached. A
-// seam that returned only after the RPC would have to run on a goroutine of its
-// own, and nothing would then order that goroutine's call before a deadline
-// that was already ready when the shutdown loop first looked.
+// Stop starts the request and returns once it is under way (the dial has begun,
+// or the call has already ended); the outcome arrives later on the returned
+// channel. Splitting the two is what puts the request under way before the hard
+// stop: the lifecycle calls Stop on the goroutine that later halts the machine,
+// so the request has begun before the halt can be reached. That is a statement
+// about the dial having begun, not about the Stop RPC having reached the guest:
+// with a grace deadline already due, the hard stop can run first, and no
+// handshake could save a zero-grace stop. A seam that returned only after the
+// RPC would have to run on a goroutine of its own, and nothing would then order
+// that goroutine's call before a deadline that was already ready when the
+// shutdown loop first looked.
 type agentStopper interface {
 	// Stop asks the guest to shut down within grace. The request has begun by
 	// the time Stop returns; the returned channel receives exactly one value,
