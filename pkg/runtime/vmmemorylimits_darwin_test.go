@@ -85,7 +85,8 @@ func composeVMBoot(t *testing.T, podID string, inits, mains []*runtimev1.Contain
 
 // TestVMContainerMemoryLimitsReachGuestSpec is the gate for the per-container
 // memory limit: runtime/v1 Container.memory_limit_bytes has to arrive in the
-// file the guest init reads, with a memory.high this host derived.
+// file the guest init reads, with a memory.high this host derived, and the
+// count of memory.high events has to come back through stats.
 //
 // The negative half carries as much weight as the positive one. The pinned
 // initramfs predates the fields and refuses a spec that sets them, so a pod with
@@ -228,5 +229,31 @@ func TestVMContainerMemoryLimitsReachGuestSpec(t *testing.T) {
 			t.Errorf("message = %q, want it to name %s", got, guestagent.CapabilityMemoryLimits)
 		}
 		waitFor(t, 5*time.Second, "the VM to be torn down", func() bool { return len(vmb.stops()) > 0 })
+	})
+
+	t.Run("the high event count reaches container stats", func(t *testing.T) {
+		const podID = "pod-mem-stats"
+		agent := &guestStatsAgent{
+			bootedPod: podID,
+			sample: &guestv1.StatsResponse{Containers: []*guestv1.GuestContainerStats{
+				{Container: "throttled", MemoryWorkingSetBytes: 1 << 20, MemoryHighEvents: 42},
+				{Container: "quiet", MemoryWorkingSetBytes: 1 << 20},
+			}},
+		}
+		dial, _ := startFakeGuestAgent(t, agent)
+		rt := newTestRuntime(t, Deps{GuestDialer: dial})
+		addVMPod(t, rt, podID, "throttled", "quiet")
+
+		resp, err := rt.ListPodStats(context.Background(), &runtimev1.ListPodStatsRequest{PodId: podID})
+		if err != nil {
+			t.Fatalf("ListPodStats: %v", err)
+		}
+		got := map[string]uint64{}
+		for _, cs := range statsByPodID(resp)[podID].GetContainers() {
+			got[cs.GetName()] = cs.GetMemory().GetMemoryHighEvents()
+		}
+		if len(got) != 2 || got["throttled"] != 42 || got["quiet"] != 0 {
+			t.Errorf("memory_high_events by container = %v, want throttled=42 quiet=0", got)
+		}
 	})
 }

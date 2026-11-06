@@ -202,7 +202,8 @@ func vmContainerStats(box *runtimev1.PodBox, resp *guestv1.StatsResponse, ts *ti
 				// kubelet defines a working set (guest.proto). It is a different
 				// kernel's figure from the host path's ri_phys_footprint; the
 				// provenance is why guest/v1 keeps its own message type.
-				WorkingSetBytes: gcs.GetMemoryWorkingSetBytes(),
+				WorkingSetBytes:  gcs.GetMemoryWorkingSetBytes(),
+				MemoryHighEvents: gcs.GetMemoryHighEvents(),
 			},
 		}
 		if nanos, ok := usecToNanos(gcs.GetCpuUsageUsec()); ok {
