@@ -318,6 +318,12 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	case ref == NativeImage || image.IsHostPathReference(ref):
 		return invalid(fmt.Errorf("%w: image %q names a host binary, and this pod runs in a Linux guest", errVMHostBinaryImage, ref))
 	}
+	// Refused here rather than left to the guest, whose refusal of a negative
+	// value would surface as a failed boot with the reason on its console.
+	memoryLimit := c.GetMemoryLimitBytes()
+	if memoryLimit < 0 {
+		return invalid(fmt.Errorf("memory limit %d is negative", memoryLimit))
+	}
 	// The identity the merge reasons about is the same one the container will
 	// run as (the container > pod > box precedence chain), so the runAsNonRoot
 	// verdict is made about the identity that actually runs — the host-process
@@ -454,7 +460,18 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		ImageUser:        imageUser,
 		SupplementalGIDs: gids,
 		OwnershipPath:    ownership,
+		MemoryLimitBytes: memoryLimit,
+		MemoryHighBytes:  vmMemoryHighBytes(memoryLimit),
 	}, imagePull: imagePull}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// vmMemoryHighBytes derives a container's memory.high from its memory limit: 90
+// percent, rounded down, so it never exceeds the limit the guest checks it
+// against. No limit means no memory.high, and so does a limit of 1 byte, whose
+// 90 percent rounds to the 0 guest/v1 reads as unset. Splitting off the tens
+// keeps the multiplication inside int64 for every limit.
+func vmMemoryHighBytes(limit int64) int64 {
+	return limit/10*9 + limit%10*9/10
 }
 
 // hostnameEnv is the variable a container runtime sets to the sandbox hostname.

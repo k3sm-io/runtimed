@@ -277,6 +277,12 @@ type VMContainer struct {
 	// It never crosses as a path: the guest reads the staged copy by its
 	// derived name.
 	OwnershipPath string
+	// MemoryLimitBytes and MemoryHighBytes are the container's cgroup2
+	// memory.max and memory.high in bytes; 0 means unset. They cross as
+	// GuestContainer.memory_limit_bytes and memory_high_bytes, which only an
+	// initramfs advertising guestagent.CapabilityMemoryLimits knows.
+	MemoryLimitBytes int64
+	MemoryHighBytes  int64
 }
 
 // VMBackend is the Virtualization.framework micro-VM isolation backend —

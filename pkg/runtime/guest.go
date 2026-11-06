@@ -411,12 +411,14 @@ const vmReasonGuestCapabilityMissing = "GuestCapabilityMissing"
 //     decision, not a second copy of it);
 //   - guestagent.CapabilitySidecarInit when any container is a native sidecar;
 //   - guestagent.CapabilityImageUser when any container hands the guest an
-//     image user to resolve.
+//     image user to resolve;
+//   - guestagent.CapabilityMemoryLimits when any container sets a memory limit.
 func vmRequiredGuestCapabilities(spec sandbox.VMSpec) []string {
-	var sidecar, imageUser bool
+	var sidecar, imageUser, memoryLimits bool
 	for _, c := range spec.Containers {
 		sidecar = sidecar || c.Sidecar
 		imageUser = imageUser || c.ImageUser != ""
+		memoryLimits = memoryLimits || c.MemoryLimitBytes != 0 || c.MemoryHighBytes != 0
 	}
 	var out []string
 	if spec.Volumes.HasGuestPrivateMounts() {
@@ -427,6 +429,9 @@ func vmRequiredGuestCapabilities(spec sandbox.VMSpec) []string {
 	}
 	if imageUser {
 		out = append(out, guestagent.CapabilityImageUser)
+	}
+	if memoryLimits {
+		out = append(out, guestagent.CapabilityMemoryLimits)
 	}
 	return out
 }
