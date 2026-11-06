@@ -158,13 +158,12 @@ func (p *Puller) newFlatRegistry(f FlatRegistry) (*flatRegistry, error) {
 	return fr, nil
 }
 
-// endpointFetch returns the FetchFunc that reaches the registry named host at
-// ep. The reference keeps host as its authority, so the request, the TLS server
-// name and every log line name the registry; only the DIAL is redirected, and
-// only for host itself. A dial to anything else (a redirect off the registry) is
-// refused: the cluster's own registry has no business sending this node
-// elsewhere.
-func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchFunc {
+// endpointTransport is the dial half of endpointFetch: a transport that reaches
+// the registry named host at ep and refuses to dial anything else, carrying the
+// endpoint's own trust anchor when ep.TLS is set. It is shared with
+// ArtifactTransport so the artifact path cannot drift into a second transport
+// with a weaker dial or trust story.
+func endpointTransport(host string, ep RegistryEndpoint, pool *x509.CertPool) *http.Transport {
 	dialer := &net.Dialer{Timeout: flatRegistryDialTimeout, KeepAlive: 30 * time.Second}
 	tr := &http.Transport{
 		// No Proxy: the endpoint is cluster-internal, and an environment proxy
@@ -182,14 +181,26 @@ func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchF
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
-	var opts []name.Option
 	if ep.TLS {
 		serverName := host
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			serverName = h
 		}
 		tr.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: serverName, MinVersion: tls.VersionTLS12}
-	} else {
+	}
+	return tr
+}
+
+// endpointFetch returns the FetchFunc that reaches the registry named host at
+// ep. The reference keeps host as its authority, so the request, the TLS server
+// name and every log line name the registry; only the DIAL is redirected, and
+// only for host itself. A dial to anything else (a redirect off the registry) is
+// refused: the cluster's own registry has no business sending this node
+// elsewhere.
+func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchFunc {
+	tr := endpointTransport(host, ep, pool)
+	var opts []name.Option
+	if !ep.TLS {
 		opts = append(opts, name.Insecure)
 	}
 	return func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
@@ -203,6 +214,35 @@ func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchF
 		}
 		return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(tr))
 	}
+}
+
+// ArtifactTransport returns the transport that reaches the flat registry f
+// names, and whether that hop is plain HTTP. It is the artifact path's
+// transport seam (pkg/artifact): the same dial-only-Host rule and the same
+// single trust anchor as the image path's endpoint fetcher, validated by the
+// same rules newFlatRegistry applies to Host and Endpoint. Aliases play no part:
+// the artifact path admits the canonical Host alone.
+func ArtifactTransport(f FlatRegistry) (http.RoundTripper, bool, error) {
+	if err := validateRegistryAuthority("flat registry host", f.Host); err != nil {
+		return nil, false, err
+	}
+	if _, port, err := net.SplitHostPort(f.Host); err != nil || port == "" {
+		return nil, false, fmt.Errorf("flat registry host %s must carry a port", quoteBounded(f.Host, maxMirrorHostLen))
+	}
+	if host, _, err := net.SplitHostPort(f.Endpoint.Addr); err != nil || host == "" {
+		return nil, false, fmt.Errorf("flat registry endpoint %s must be host:port", quoteBounded(f.Endpoint.Addr, maxMirrorHostLen))
+	}
+	var pool *x509.CertPool
+	if f.Endpoint.TLS {
+		pool = x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(f.Endpoint.CAPEM) {
+			return nil, false, errors.New("flat registry endpoint uses TLS but its CA bundle holds no certificate")
+		}
+	} else if !loopbackAuthority(f.Endpoint.Addr) {
+		return nil, false, fmt.Errorf("flat registry endpoint %s is plain HTTP but not loopback",
+			quoteBounded(f.Endpoint.Addr, maxMirrorHostLen))
+	}
+	return endpointTransport(f.Host, f.Endpoint, pool), !f.Endpoint.TLS, nil
 }
 
 // flatCanonical reports the canonical spelling of ref when ref names the flat

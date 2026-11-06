@@ -68,6 +68,12 @@ const (
 	// every vm pod on the node — a corrupted set makes the vm capability fail
 	// closed until an operator clears it by hand.
 	GuestArtifactsSubdir = "guest-artifacts"
+	// ArtifactPartialSubdir is the staging dir (<WorkDir>/artifact-partial)
+	// resumable OCI artifact layers download into before their digest is
+	// verified and they are committed to the blob store. A pod able to read here
+	// reads another workload's model weights mid-transfer; one able to write
+	// here makes every resume of that layer fail its digest check.
+	ArtifactPartialSubdir = "artifact-partial"
 )
 
 // ReapStoreSubdirs returns the work-dir-relative reap-store dirs, in deny order:
@@ -88,7 +94,7 @@ func ReapStoreSubdirs() []string {
 // node-agent state (agent), the daemon sockets + mesh key (run), the
 // content-addressed blob store (blobs), the status record dir (status), the
 // per-pod SBPL staging dir (sbpl), the five image-store siblings (index,
-// operator, unpacked, snapshots, ingest), the guest-artifact cache (guest-artifacts) and the retained consoles of failed vm
+// operator, unpacked, snapshots, ingest), the guest-artifact cache (guest-artifacts), the artifact download staging dir (artifact-partial) and the retained consoles of failed vm
 // boots (vmboot-failures), which hold other pods' guest output.
 //
 // The returned slice is freshly allocated, so a caller cannot mutate the
@@ -107,6 +113,7 @@ func DaemonTreeSubdirs() []string {
 		ImageSnapshotsSubdir,
 		ImageIngestSubdir,
 		GuestArtifactsSubdir,
+		ArtifactPartialSubdir,
 		VMBootFailureSubdir,
 	}
 }

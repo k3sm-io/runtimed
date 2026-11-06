@@ -31,7 +31,7 @@ import (
 
 // TestImagesServiceServesOnlyCacheVerbs pins the node store's surface: it is an
 // internal pull cache, so it serves the cache verbs (list, fs info, prune, the
-// warm pull, inspect) and the read-only SaveImage export the one-time move into
+// warm pull, the artifact pull, inspect) and the read-only SaveImage export the one-time move into
 // the cluster registry reads, and it answers every verb that would write a user
 // name into the store with UNIMPLEMENTED naming the cluster-registry
 // replacement.
@@ -65,6 +65,10 @@ func TestImagesServiceServesOnlyCacheVerbs(t *testing.T) {
 		}},
 		{"PullImage", true, "", func() error {
 			_, err := client.PullImage(ctx, &runtimev1.PullImageRequest{Reference: "NOT A REF"})
+			return err
+		}},
+		{"PullArtifact", true, "", func() error {
+			_, err := client.PullArtifact(ctx, &runtimev1.PullArtifactRequest{Reference: "NOT A REF"})
 			return err
 		}},
 		{"InspectImage", true, "", func() error {

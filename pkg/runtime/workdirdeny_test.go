@@ -87,6 +87,7 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 			sandbox.BlobsSubdir,
 			sandbox.StatusSubdir,
 			sandbox.ProfileSubdir,
+			sandbox.ArtifactPartialSubdir,
 			// pkg/image's, named from the OWNING package so this half of the
 			// test fails on a rename even if the mirror check above were
 			// deleted.
@@ -120,6 +121,26 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 		for sub := range denied {
 			if !want[sub] {
 				t.Errorf("%q is denied but is not in this test's list of daemon-private subdirs — either add it here or drop the deny", sub)
+			}
+		}
+	})
+
+	// (2b) Stores nested inside a denied tree are covered by that tree's deny,
+	// not by a line of their own. Each is named here with the tree that covers
+	// it, so moving one out to the work-dir root fails this test.
+	t.Run("nested stores sit inside a denied tree", func(t *testing.T) {
+		denied := map[string]bool{}
+		for _, sub := range append(sandbox.ReapStoreSubdirs(), sandbox.DaemonTreeSubdirs()...) {
+			denied[sub] = true
+		}
+		for _, tc := range []struct{ nested, parent string }{
+			{image.ArtifactIndexSubdir, image.IndexSubdir},
+		} {
+			if !denied[tc.parent] {
+				t.Errorf("%q lives under %q, which is not denied", tc.nested, tc.parent)
+			}
+			if denied[tc.nested] {
+				t.Errorf("%q is a nested store but is also denied at the work-dir root", tc.nested)
 			}
 		}
 	})
