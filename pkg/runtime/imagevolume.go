@@ -33,13 +33,41 @@ import (
 var (
 	// ErrArtifactPullRefused: the artifact could not be fetched into the node
 	// cache (a foreign registry, a refused type, a short volume, a transfer
-	// failure, no cluster registry on this node).
+	// failure, no cluster registry on this node). Its FailureReason says which
+	// kind (artifactPullReason).
 	ErrArtifactPullRefused = errors.New("ArtifactPullRefused")
 	// ErrArtifactMountRefused: the artifact is not mountable as asked (a subset
 	// of paths, which this runtime does not serve) or its view could not be
 	// built or linked into the pod.
 	ErrArtifactMountRefused = errors.New("ArtifactMountRefused")
+
+	// errArtifactCredential marks a failure to resolve the pod's pull
+	// credential, before any registry request.
+	errArtifactCredential = errors.New("resolve pull credential")
 )
+
+// artifactPullReason types an ArtifactPullRefused failure, so the provider can
+// tell what a retry can fix from what it cannot without reading the message:
+//
+//   - IMAGE_PULL_CREDENTIAL: the pod's imagePullSecret could not be resolved,
+//     as the image path reports it;
+//   - RESOURCE_EXHAUSTED: the store volume would fall below its free-space
+//     floor; the node, not the artifact, is short;
+//   - INVALID_POD_BOX: the reference names a registry other than the cluster
+//     registry, which this node never fetches from, so no retry succeeds;
+//   - IMAGE_PULL: everything else, a transfer or registry failure among them.
+func artifactPullReason(err error) runtimev1.FailureReason {
+	switch {
+	case errors.Is(err, errArtifactCredential):
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL
+	case errors.Is(err, artifact.ErrInsufficientSpace):
+		return runtimev1.FailureReason_FAILURE_REASON_RESOURCE_EXHAUSTED
+	case errors.Is(err, artifact.ErrNotClusterRegistry):
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX
+	default:
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL
+	}
+}
 
 // imageVolumeViews fetches every mounted image volume of box into the node
 // cache, through the same puller, IMAGE_VOLUME policy and pull credentials
@@ -86,7 +114,7 @@ func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (
 func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vol *runtimev1.Volume) (string, runtimev1.FailureReason, error) {
 	ref := vol.GetImage().GetReference()
 	pullRefused := func(err error) (string, runtimev1.FailureReason, error) {
-		return "", runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+		return "", artifactPullReason(err),
 			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactPullRefused, box.GetPodId(), vol.GetName(), err)
 	}
 	if err := image.ValidateReference(ref); err != nil {
@@ -106,7 +134,7 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 		defer func() { <-r.artifactSem }()
 		cred, err := r.pullCredential(ctx, box, ref)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", errArtifactCredential, err)
 		}
 		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
 	}()

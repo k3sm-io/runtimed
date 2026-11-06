@@ -18,12 +18,15 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"testing"
 
+	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/sandbox"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -119,20 +122,47 @@ func TestCreatePodRefusesImageVolumePaths(t *testing.T) {
 	}
 }
 
-// TestCreatePodImageVolumePullRefused pins the fetch refusal: a reference off
-// the cluster registry fails the create with the stable ArtifactPullRefused
-// reason, as IMAGE_PULL.
-func TestCreatePodImageVolumePullRefused(t *testing.T) {
-	rt := newTestRuntime(t, Deps{ArtifactPuller: &scriptedArtifactPuller{}})
-	box := imageVolumeBox(rt, "pod-foreign", "ghcr.io/evil/model:v1")
-	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
-	if err != nil {
-		t.Fatalf("CreatePod: %v", err)
-	}
-	if !strings.HasPrefix(resp.GetError().GetMessage(), "ArtifactPullRefused") {
-		t.Errorf("error = %q, want it to begin with ArtifactPullRefused", resp.GetError().GetMessage())
-	}
-	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL {
-		t.Errorf("reason = %v, want IMAGE_PULL", resp.GetFailureReason())
+// TestCreatePodImageVolumePullRefusalReasons pins the typed fetch refusals:
+// every one begins with the stable ArtifactPullRefused prefix, and its
+// FailureReason tells a credential, a short volume and a foreign registry
+// apart from a transient pull failure.
+func TestCreatePodImageVolumePullRefusalReasons(t *testing.T) {
+	ref := artifactTestHost + "/models/tiny:v1"
+	for _, tc := range []struct {
+		name    string
+		ref     string
+		pullErr error
+		credErr error
+		want    runtimev1.FailureReason
+	}{
+		{name: "foreign registry", ref: "ghcr.io/evil/model:v1",
+			want: runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX},
+		{name: "pull credential", ref: ref, credErr: errors.New("secret regcred not found"),
+			want: runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL},
+		{name: "insufficient space", ref: ref, pullErr: fmt.Errorf("need 40 GB: %w", artifact.ErrInsufficientSpace),
+			want: runtimev1.FailureReason_FAILURE_REASON_RESOURCE_EXHAUSTED},
+		{name: "foreign registry from the puller", ref: ref, pullErr: fmt.Errorf("redirected: %w", artifact.ErrNotClusterRegistry),
+			want: runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX},
+		{name: "stalled transfer", ref: ref, pullErr: fmt.Errorf("%w: %w", artifact.ErrBlobTransfer, artifact.ErrBlobStalled),
+			want: runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL},
+		{name: "cancelled", ref: ref, pullErr: context.Canceled,
+			want: runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			creds := &fakeCredentialResolver{err: tc.credErr}
+			rt := newTestRuntime(t, Deps{ArtifactPuller: &scriptedArtifactPuller{err: tc.pullErr}, Credentials: creds})
+			box := imageVolumeBox(rt, "pod-refused", tc.ref)
+			box.ImagePullSecrets = []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			if !strings.HasPrefix(resp.GetError().GetMessage(), "ArtifactPullRefused") {
+				t.Errorf("error = %q, want it to begin with ArtifactPullRefused", resp.GetError().GetMessage())
+			}
+			if resp.GetFailureReason() != tc.want {
+				t.Errorf("reason = %v, want %v", resp.GetFailureReason(), tc.want)
+			}
+		})
 	}
 }
