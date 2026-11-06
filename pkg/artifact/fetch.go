@@ -148,7 +148,7 @@ func (p *Puller) reserve(ctx context.Context, missing []blob) (*reservation, err
 		}
 		return free, free >= want, nil
 	}
-	free, ok, err := fits()
+	_, ok, err := fits()
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +158,7 @@ func (p *Puller) reserve(ctx context.Context, missing []blob) (*reservation, err
 		}); rerr != nil {
 			p.log.Warn("artifact pull: reclaim pass failed", "err", rerr)
 		}
-		free, ok, err = fits()
+		free, ok, err := fits()
 		if err != nil {
 			return nil, err
 		}
