@@ -188,9 +188,11 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 //     and a relative path, which means the session's working directory. Start
 //     reads a relative argv[0] against the rootfs, which is the same directory
 //     unless a working directory is set; a session keeps cwd's ordinary meaning.
-//   - A path under one of the container's volume mounts. A volume is not the
-//     image and the gate below does not answer for it; the session's path
-//     interposer rebases such a path into the rootfs as it always has.
+//   - A path under one of the container's volume mounts, apart from cleaning its
+//     name, which is the form this check tested and the one the session's path
+//     interposer then reads. A volume is not the image and the gate below does not
+//     answer for it; the interposer rebases such a path into the rootfs as it
+//     always has.
 //
 // # What it grants
 //
@@ -209,7 +211,7 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	}
 	if rebase := mountRebaser(rootfs, containerMountPaths(c)); rebase != nil {
 		if clean := filepath.Clean(argv0); rebase(clean) != clean {
-			return cmdv, nil
+			return append([]string{clean}, cmdv[1:]...), nil
 		}
 	}
 	bin, inImage, err := resolveImageExecPath(rootfs, argv0)

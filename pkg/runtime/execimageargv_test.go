@@ -331,13 +331,15 @@ func TestExecLeavesOtherShapesAsSent(t *testing.T) {
 		}
 		// There is no interposer in this harness to rebase the name, so the
 		// session fails to start; the assertion is that it was asked to run the
-		// name as sent, past no gate.
-		got, _, err := p.exec(t, "/data/tool")
-		if code := status.Code(err); code != codes.Internal {
-			t.Fatalf("Exec error = %v, want the start failure of a name no interposer rebased", err)
-		}
-		if got != "/data/tool" {
-			t.Errorf("argv[0] = %q, want /data/tool", got)
+		// cleaned name, past no gate, so the daemon and the interposer read one form.
+		for _, name := range []string{"/data/tool", "/bin/../data/tool", "/data//tool", "/data/./tool"} {
+			got, _, err := p.exec(t, name)
+			if code := status.Code(err); code != codes.Internal {
+				t.Fatalf("Exec %q error = %v, want the start failure of a name no interposer rebased", name, err)
+			}
+			if got != "/data/tool" {
+				t.Errorf("Exec %q: argv[0] = %q, want /data/tool", name, got)
+			}
 		}
 	})
 }
