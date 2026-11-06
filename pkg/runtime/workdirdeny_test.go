@@ -88,6 +88,7 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 			sandbox.StatusSubdir,
 			sandbox.ProfileSubdir,
 			sandbox.ArtifactPartialSubdir,
+			sandbox.ArtifactViewsSubdir,
 			// pkg/image's, named from the OWNING package so this half of the
 			// test fails on a rename even if the mirror check above were
 			// deleted.

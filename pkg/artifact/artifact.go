@@ -26,6 +26,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -38,6 +39,7 @@ import (
 	artifactv1 "k3sm.io/apis/artifact/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // Limits. MaxManifestBytes matches the cap the cluster registry applies to a
@@ -90,6 +92,7 @@ var (
 	ErrBlobTransfer       = errors.New("artifact: blob transfer failed")
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
+	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
 )
 
 // BlobCommitter is the cache seam: *image.Cache satisfies it. CommitBlob is the
@@ -133,10 +136,13 @@ type Config struct {
 	// RegistryHost is the cluster registry authority (host:port). A reference
 	// naming any other host is refused before any request. Required.
 	RegistryHost string
-	// PartialDir holds resumable partial blobs. It must be on the cache volume
-	// and private to the daemon. Required.
+	// PartialDir holds resumable partial blobs. It must be exactly
+	// <StorePath>/<sandbox.ArtifactPartialSubdir>: the one child of the cache
+	// root the work-dir deny-set names, so it is on the cache volume and no pod
+	// can read or write it. Required.
 	PartialDir string
-	// StorePath is the path whose volume free space is measured (the cache root).
+	// StorePath is the cache root: the parent of PartialDir and the path whose
+	// volume free space is measured. Required, absolute.
 	StorePath string
 	// FreeBytes samples free space. Nil means image.StatfsFreeBytes.
 	FreeBytes image.FreeBytesFunc
@@ -184,8 +190,8 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 	if cfg.RegistryHost == "" {
 		return nil, errors.New("artifact puller: cluster registry host is required")
 	}
-	if cfg.PartialDir == "" {
-		return nil, errors.New("artifact puller: partial dir is required")
+	if err := checkPartialPlacement(cfg.PartialDir, cfg.StorePath); err != nil {
+		return nil, err
 	}
 	if deps.Blobs == nil || deps.Leases == nil || deps.Reclaimer == nil || deps.Index == nil || deps.Fetcher == nil {
 		return nil, errors.New("artifact puller: every dependency is required")
@@ -199,9 +205,6 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 	if cfg.MaxConcurrentLayers <= 0 {
 		cfg.MaxConcurrentLayers = DefaultMaxConcurrentLayers
 	}
-	if cfg.StorePath == "" {
-		cfg.StorePath = cfg.PartialDir
-	}
 	log := cfg.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -213,6 +216,24 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 		sem:      make(chan struct{}, cfg.MaxConcurrentLayers),
 		inflight: make(map[string]chan struct{}),
 	}, nil
+}
+
+// checkPartialPlacement refuses a partial dir that is not exactly the
+// ArtifactPartialSubdir child of the absolute store path. Anywhere else is
+// outside the work-dir deny-set (a pod could read weights mid-transfer or make
+// every resume fail its digest) or off the cache volume.
+func checkPartialPlacement(partial, store string) error {
+	if partial == "" || store == "" {
+		return fmt.Errorf("%w: partial dir and store path are required", ErrPartialDir)
+	}
+	if !filepath.IsAbs(store) {
+		return fmt.Errorf("%w: store path %q is not absolute", ErrPartialDir, store)
+	}
+	want := filepath.Join(filepath.Clean(store), sandbox.ArtifactPartialSubdir)
+	if filepath.Clean(partial) != want {
+		return fmt.Errorf("%w: %q, want %q", ErrPartialDir, partial, want)
+	}
+	return nil
 }
 
 // Result is what a pull resolved and committed.
@@ -464,15 +485,9 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 		if total > MaxArtifactBytes {
 			return "", nil, nil, fmt.Errorf("declared total over %d bytes: %w", MaxArtifactBytes, ErrSizeCap)
 		}
-		p := l.Annotations[annotationFilepathModern]
-		if p == "" {
-			p = l.Annotations[annotationTitle]
-		}
-		if p == "" {
-			return "", nil, nil, fmt.Errorf("layer %d has no file path: %w", i, ErrLayerPath)
-		}
-		if err := artifactv1.ValidatePath(p); err != nil {
-			return "", nil, nil, fmt.Errorf("layer %d: %w: %w", i, ErrLayerPath, err)
+		p, err := layerFilePath(i, l)
+		if err != nil {
+			return "", nil, nil, err
 		}
 		paths[i] = p
 	}
@@ -480,6 +495,22 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 		return "", nil, nil, fmt.Errorf("%w: %w", ErrLayerPath, err)
 	}
 	return typ, m.Layers, paths, nil
+}
+
+// layerFilePath returns layer i's validated file path: the ModelPack filepath
+// annotation, else the OCI title.
+func layerFilePath(i int, l descriptor) (string, error) {
+	p := l.Annotations[annotationFilepathModern]
+	if p == "" {
+		p = l.Annotations[annotationTitle]
+	}
+	if p == "" {
+		return "", fmt.Errorf("layer %d has no file path: %w", i, ErrLayerPath)
+	}
+	if err := artifactv1.ValidatePath(p); err != nil {
+		return "", fmt.Errorf("layer %d: %w: %w", i, ErrLayerPath, err)
+	}
+	return p, nil
 }
 
 func checkDescriptor(what string, d descriptor) error {

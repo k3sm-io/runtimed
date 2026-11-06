@@ -194,9 +194,10 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 
 // Roots enumerates the COMPLETE reachability root set for this store: every
 // image every pod dir records, PLUS every image an operator named (the operator
-// record — see OperatorImageRoot).
+// record — see OperatorImageRoot), PLUS the blobs of every artifact record in
+// the index's artifact namespace (see FileIndex.PutArtifactRecord).
 //
-// The two kinds are unioned here and nowhere else, so there is exactly one
+// The kinds are unioned here and nowhere else, so there is exactly one
 // answer to "what is reachable" and a prune cannot be written against half of
 // it. They stay distinct on disk because they are removed by different parties:
 // a pod's roots go when its dir goes, an operator's go only when the operator
@@ -256,10 +257,16 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Artifact records, for the same reason and with the same fatality.
+	artifacts, err := c.artifactRoots()
+	if err != nil {
+		return nil, nil, err
+	}
+	shared := append(operatorRootSet(operator), artifacts...)
 	podsRoot := c.PodsRoot()
 	entries, err := os.ReadDir(podsRoot)
 	if errors.Is(err, fs.ErrNotExist) {
-		return operatorRootSet(operator), nil, nil
+		return shared, nil, nil
 	}
 	if err != nil {
 		// LOCAL-ONLY, no boundErr (this one and the OpenRoot below): stdlib os
@@ -345,7 +352,34 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 			out = append(out, r)
 		}
 	}
-	return append(out, operatorRootSet(operator)...), skipped, nil
+	return append(out, shared...), skipped, nil
+}
+
+// artifactRoots returns one root per artifact record in the index's artifact
+// namespace (see FileIndex.PutArtifactRecord). A record is a root while it
+// exists; removing it (FileIndex.RemoveArtifactRecord) is what makes its blobs
+// collectable. Any record that cannot be listed, read or decoded, and an
+// artifact namespace that fails the index's ownership checks, make the whole
+// set ErrRootsIncomplete, naming the record's file so the refusal the GC logs
+// says which one to look at. An absent index or namespace has no records.
+func (c *Cache) artifactRoots() ([]ImageRoot, error) {
+	x := &FileIndex{dir: c.IndexRoot()}
+	records, err := x.artifactRecords()
+	if err != nil {
+		// LOCAL-ONLY, no second boundErr: ArtifactRecords renders paths this
+		// package composed plus errnos, and DecodeArtifactRoot bounds the foreign
+		// text it echoes.
+		return nil, fmt.Errorf("%w: artifact records: %v", ErrRootsIncomplete, err)
+	}
+	out := make([]ImageRoot, 0, len(records))
+	for _, rec := range records {
+		r, err := DecodeArtifactRoot(rec.buf)
+		if err != nil {
+			return nil, fmt.Errorf("%w: artifact record %q: %v", ErrRootsIncomplete, rec.name, err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // operatorRootSet flattens the operator record to the ImageRoot shape the prune

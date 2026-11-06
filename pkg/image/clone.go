@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // QuarantineXattr is the macOS attribute Gatekeeper sets on downloaded files.
@@ -35,14 +36,24 @@ const QuarantineXattr = "com.apple.quarantine"
 var ErrQuarantined = errors.New("image: materialized file has com.apple.quarantine xattr")
 
 // Cloner copies a single regular file from src to dst. The production
-// implementation (clonefile_darwin.go) uses an APFS copy-on-write clone and
-// falls back to a byte copy on EXDEV/ENOTSUP; a portable byte-copy implementation
+// implementation (APFSCloner, clone_darwin.go) uses an APFS copy-on-write clone
+// and falls back to a byte copy on EXDEV/ENOTSUP; CloneOnly never falls back; a portable byte-copy implementation
 // (ByteCopier) is used off darwin and in unit tests that don't need real CoW.
 type Cloner interface {
 	// Clone copies the regular file src to dst (which must not yet exist). It
 	// reports whether the copy was a real APFS clone (cow) via the bool, so
 	// callers/tests can distinguish a clone from a byte-copy fallback.
 	Clone(src, dst string) (cow bool, err error)
+}
+
+// IsCloneUnsupported reports whether err is clonefile(2) saying the clone
+// cannot be made on these volumes at all: EXDEV (src and dst on different
+// volumes), or ENOTSUP/EOPNOTSUPP (the filesystem is not APFS). It is the
+// condition APFSCloner degrades to a byte copy on and CloneOnly refuses on.
+func IsCloneUnsupported(err error) bool {
+	// syscall.Errno matches errors.ErrUnsupported for ENOTSUP, EOPNOTSUPP and
+	// ENOSYS.
+	return errors.Is(err, syscall.EXDEV) || errors.Is(err, errors.ErrUnsupported)
 }
 
 // ByteCopier is a Cloner that always byte-copies (never CoW). It is the portable

@@ -65,4 +65,29 @@ limitations under the License.
 // bytes already in partial files are already off free space and are not
 // counted twice. If short, one ReclaimUnderPressure pass runs and the check is
 // repeated; still short is ErrInsufficientSpace.
+//
+// # Views
+//
+// Views (view.go) turns a recorded artifact into what a pod reads: a
+// directory under <cache>/artifacts/<manifest-hex>/<PathSetKey(paths)> holding
+// each selected layer under its file path. Each file is an APFS clone of the
+// cache blob, a distinct inode sharing its blocks, so the view's mode and owner
+// are its own and not the blob's (a hardlink would share them). The cloner is
+// clone-only (image.CloneOnly): a volume that cannot clone (a different
+// volume, a non-APFS filesystem) is ErrCrossVolume before any byte is copied,
+// never a silent copy of a model, and NewViews refuses a views root on another
+// device than the blob store at start. A view is built in a staging directory
+// beside it, files 0444 and directories 0555 there, and renamed into place.
+// Views are a rebuildable cache and are not fsynced: at daemon start, staging
+// left by a crash is reaped and a published view that is not read-only is
+// removed, to be rebuilt on next use.
+//
+// # Lifetime
+//
+// The artifact record is a GC root (image.Cache.Roots): while it exists, the
+// cache never prunes or reclaims the blobs it names. Views.Forget removes the
+// record, and with the last record of a manifest, that manifest's views; the
+// blobs are then collectable like any unreferenced blob. The views of a
+// manifest no record names any more (its record was replaced for a new
+// manifest) are removed by the image prune (Views.SweepOrphans) and at start.
 package artifact

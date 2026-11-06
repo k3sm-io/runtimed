@@ -20,6 +20,7 @@ package image
 
 import (
 	"errors"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,13 +41,29 @@ func (APFSCloner) Clone(src, dst string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if errors.Is(err, unix.EXDEV) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+	if IsCloneUnsupported(err) {
 		if cErr := byteCopyFile(src, dst); cErr != nil {
 			return false, cErr
 		}
 		return false, nil
 	}
 	return false, err
+}
+
+// CloneOnly is the Cloner for a copy that must share extents with its source
+// (an artifact view): it calls clonefile(2) and nothing else. Where the clone
+// cannot be made (IsCloneUnsupported: another volume, or not APFS) it fails
+// before any byte is written, where APFSCloner would copy. cow is true on
+// every success.
+type CloneOnly struct{}
+
+// Clone CoW-clones src to dst, which must not already exist. It never copies.
+func (CloneOnly) Clone(src, dst string) (bool, error) {
+	// CLONE_NOFOLLOW: a symlink at src is cloned as itself, never followed.
+	if err := unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW); err != nil {
+		return false, &os.LinkError{Op: "clonefile", Old: src, New: dst, Err: err}
+	}
+	return true, nil
 }
 
 // assertNoQuarantine returns ErrQuarantined if path carries the

@@ -43,9 +43,11 @@ import (
 //
 // Being a sibling is the structural half of the edge-not-root invariant (see
 // FileIndex): the GC's enumerators read blobs/ (Cache.EnumerateBlobs), pods/
-// (Cache.Roots) and the tree stores (Cache.EnumerateTrees), and none of them can
-// reach this tree, so an index entry cannot become a reachability root by any
-// code path — not merely by convention.
+// (Cache.Roots) and the tree stores (Cache.EnumerateTrees), and none of them
+// reads an image entry, so an index entry cannot become a reachability root by
+// any code path — not merely by convention. The one subtree Cache.Roots does
+// read is the artifact namespace (ArtifactIndexSubdir), whose records are roots
+// by design and which image entries can never alias.
 //
 // It is a named constant because a confined pod must never be able to write
 // here (a writable index is a way to make a reference resolve to another
@@ -130,7 +132,8 @@ var ErrIndexDigestMismatch = errors.New("image: the index entry resolves to a di
 // An entry records that a reference resolved to a manifest. It does NOT assert
 // that anything still needs those blobs, and it can NEVER protect a blob from
 // the GC. Reachability roots are daemon-authored per-pod records under pods/
-// (see ImageRoot) and in-flight leases; this tree is not consulted by
+// (see ImageRoot), operator records, artifact records (the artifact/ subtree,
+// see PutArtifactRecord) and in-flight leases; no image entry is consulted by
 // Cache.Roots, by Cache.EnumerateBlobs, or by PlanPrune. A blob whose only
 // mention is an index entry is UNREFERENCED and is reclaimed — which is what
 // makes an index entry safe to write from the pull path without any GC

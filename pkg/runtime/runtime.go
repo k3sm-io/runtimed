@@ -343,8 +343,9 @@ type Runtime struct {
 	// exactly one), which is what makes the Images service's listing agree with
 	// what a warm IfNotPresent pull will find.
 	//
-	// It is the LISTING source, never a GC input: entries are edges, and no
-	// reachability enumerator can reach this tree (see image.FileIndex).
+	// It is the LISTING source, never a GC input for images: image entries are
+	// edges no reachability enumerator reads (see image.FileIndex). Its
+	// artifact namespace is the exception: artifact records are GC roots.
 	index       *image.FileIndex
 	signer      Signer
 	credentials CredentialResolver
@@ -354,7 +355,11 @@ type Runtime struct {
 	// artifactSem bounds concurrent PullArtifact RPCs
 	// (maxConcurrentArtifactPulls).
 	artifactSem chan struct{}
-	backend     sandbox.Backend
+	// views builds the read-only artifact views the mount path serves; nil,
+	// with viewsErr set, when the views root was refused at start.
+	views    *artifact.Views
+	viewsErr error
+	backend  sandbox.Backend
 	// vmBackend is the Virtualization.framework micro-VM rung. createPod
 	// queries Available() so a vm-requested pod fails closed when it is absent, and
 	// routes a selected vm pod to CreateVM (away from the host-process path).
@@ -955,6 +960,20 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		artifacts = a
 	}
+	// Built unconditionally, so the start-time reap of half-built views runs
+	// whether or not this node has a cluster registry. A refused views root
+	// disables views, loudly, and nothing else: the daemon still serves pods.
+	//
+	// context.Background() is the residual described at evalHostRosetta below:
+	// New takes no ctx. The reap reads only the local store and consults the ctx
+	// for nothing but an early cancellation check, so it cannot wedge.
+	views, viewsErr := artifact.NewViews(context.Background(), artifact.ViewsConfig{
+		StorePath: cache.Root(),
+		Log:       log,
+	}, cache, index)
+	if viewsErr != nil {
+		log.Error("artifact views disabled: views root refused", "err", viewsErr)
+	}
 	unpacker := deps.Unpacker
 	if unpacker == nil {
 		u, err := image.NewUnpacker(cache, image.WithUnpackLogger(log))
@@ -1128,6 +1147,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		credentials:    deps.Credentials,
 		artifacts:      artifacts,
 		artifactSem:    make(chan struct{}, maxConcurrentArtifactPulls),
+		views:          views,
+		viewsErr:       viewsErr,
 		backend:        backend,
 		vmBackend:      vmBackend,
 		guestDialer:    guestDialer,

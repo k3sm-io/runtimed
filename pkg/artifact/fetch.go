@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/bits"
 	"os"
 	"path/filepath"
@@ -67,6 +68,32 @@ func (p *Puller) Reserved() uint64 {
 // the sha256 pattern, so the name is a fixed, path-safe token.
 func (p *Puller) partialPath(digest string) string {
 	return filepath.Join(p.cfg.PartialDir, strings.Replace(digest, ":", "-", 1)+".partial")
+}
+
+// ensurePartialDir creates the partial dir (0700) when absent and refuses one
+// that is not a directory (a file, a symlink planted in its place) or is
+// writable by group or other, as the image index refuses its artifact
+// namespace: a partial dir another principal can write lets it choose the
+// bytes a resume continues from.
+func (p *Puller) ensurePartialDir() error {
+	dir := p.cfg.PartialDir
+	fi, err := os.Lstat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("create partial dir: %w", err)
+		}
+		fi, err = os.Lstat(dir)
+	}
+	if err != nil {
+		return fmt.Errorf("stat partial dir: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%w: %s is not a directory (mode %v)", ErrPartialDir, dir, fi.Mode().Type())
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%w: %s is writable by group or other (mode %v)", ErrPartialDir, dir, fi.Mode().Perm())
+	}
+	return nil
 }
 
 // partialBytes is how much of b is already in its partial file (never more
@@ -245,8 +272,8 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 	}
 	defer func() { <-p.sem }()
 
-	if err := os.MkdirAll(p.cfg.PartialDir, 0o700); err != nil {
-		return fmt.Errorf("create partial dir: %w", err)
+	if err := p.ensurePartialDir(); err != nil {
+		return err
 	}
 	path := p.partialPath(b.digest)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, 0o600)
