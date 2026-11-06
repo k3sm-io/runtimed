@@ -354,3 +354,16 @@ func TestPullArtifactRPCBoundsErrorText(t *testing.T) {
 		t.Errorf("status message of %d bytes; it must be bounded", n)
 	}
 }
+
+// TestPullArtifactRPCSizeRefusalsAreTerminal pins that a manifest declaring a hostile size is
+// refused as FailedPrecondition, a terminal verdict on untrusted input, not Internal.
+func TestPullArtifactRPCSizeRefusalsAreTerminal(t *testing.T) {
+	for _, sentinel := range []error{artifact.ErrSizeCap, artifact.ErrSizeOverflow} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			err := artifactStatusError(fmt.Errorf("layer 0: %w", sentinel))
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Fatalf("code = %v, want FailedPrecondition", got)
+			}
+		})
+	}
+}
