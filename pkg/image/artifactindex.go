@@ -144,6 +144,16 @@ func (x *FileIndex) ArtifactRecord(ctx context.Context, key string) ([]byte, boo
 // one was there. Removing a record is what makes its blobs collectable: while
 // it exists they are reachability roots (see Cache.Roots).
 func (x *FileIndex) RemoveArtifactRecord(ctx context.Context, key string) (bool, error) {
+	return x.RemoveArtifactRecordIf(ctx, key, nil)
+}
+
+// RemoveArtifactRecordIf removes the record stored under key only if match
+// accepts its current bytes (nil accepts any), reporting whether it removed
+// one. The read, the decision and the unlink run under the lock
+// PutArtifactRecord takes for key, so a concurrent put lands wholly before the
+// read or wholly after the unlink: a caller that matches on what it last read
+// can never remove a record written since.
+func (x *FileIndex) RemoveArtifactRecordIf(ctx context.Context, key string, match func(record []byte) bool) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -170,6 +180,28 @@ func (x *FileIndex) RemoveArtifactRecord(ctx context.Context, key string) (bool,
 		return false, err
 	}
 	defer sub.Close()
+	if match != nil {
+		fi, err := sub.Lstat(name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return false, nil
+			}
+			return false, fmt.Errorf("%w: stat artifact record: %v", ErrIndexEntryCorrupt, err)
+		}
+		if fi.Size() > MaxArtifactRecordBytes {
+			return false, fmt.Errorf("%w: artifact record of %d bytes: %w", ErrIndexEntryCorrupt, fi.Size(), ErrArtifactRecordTooLarge)
+		}
+		buf, err := readAnchored(sub, name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return false, nil
+			}
+			return false, fmt.Errorf("%w: read artifact record: %v", ErrIndexEntryCorrupt, err)
+		}
+		if !match(buf) {
+			return false, nil
+		}
+	}
 	if err := sub.Remove(name); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -184,20 +216,37 @@ func (x *FileIndex) RemoveArtifactRecord(ctx context.Context, key string) (bool,
 //
 // It fails closed on a record it cannot read or that exceeds its cap, as List
 // does: the GC unions these records into its root set, and a list silently
-// short of one record would let a prune take that artifact's blobs. A name
-// that is not a record this index writes (a ".index-" temp left by a crashed
-// commit, a non-regular node, a name without the .json suffix) is skipped, as
-// List skips it; no record is ever stored under such a name.
+// short of one record would let a prune take that artifact's blobs. For the
+// same reason a *.json entry that is not a regular file (a directory, a
+// symlink) is an error: it holds the name of a record, so it is damage, not
+// furniture. A name that is not a record this index writes (a ".index-" temp
+// left by a crashed commit, a name without the .json suffix) is skipped; no
+// record is ever stored under such a name.
 func (x *FileIndex) ArtifactRecords(ctx context.Context) ([][]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return x.artifactRecords()
+	recs, err := x.artifactRecords()
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.buf)
+	}
+	return out, nil
+}
+
+// namedRecord is one artifact record and the file name it was read from.
+type namedRecord struct {
+	name string
+	buf  []byte
 }
 
 // artifactRecords is ArtifactRecords without the context check, for the GC's
-// root enumerator, which runs under no request context.
-func (x *FileIndex) artifactRecords() ([][]byte, error) {
+// root enumerator, which runs under no request context. It keeps each record's
+// file name, so a record the GC cannot decode is named in its refusal.
+func (x *FileIndex) artifactRecords() ([]namedRecord, error) {
 	root, err := x.open()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -223,11 +272,14 @@ func (x *FileIndex) artifactRecords() ([][]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read artifact index: %w", err)
 	}
-	var out [][]byte
+	var out []namedRecord
 	for _, d := range entries {
 		name := d.Name()
-		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") || !d.Type().IsRegular() {
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
 			continue
+		}
+		if !d.Type().IsRegular() {
+			return nil, fmt.Errorf("%w: artifact record %q is not a regular file (mode %v)", ErrIndexEntryCorrupt, name, d.Type())
 		}
 		fi, err := sub.Lstat(name)
 		if err != nil {
@@ -235,6 +287,9 @@ func (x *FileIndex) artifactRecords() ([][]byte, error) {
 				continue // removed since the read; it is no longer a record
 			}
 			return nil, fmt.Errorf("%w: stat artifact record %q: %v", ErrIndexEntryCorrupt, name, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: artifact record %q is not a regular file (mode %v)", ErrIndexEntryCorrupt, name, fi.Mode().Type())
 		}
 		if fi.Size() > MaxArtifactRecordBytes {
 			return nil, fmt.Errorf("%w: artifact record %q of %d bytes: %w", ErrIndexEntryCorrupt, name, fi.Size(), ErrArtifactRecordTooLarge)
@@ -249,7 +304,7 @@ func (x *FileIndex) artifactRecords() ([][]byte, error) {
 		if int64(len(buf)) > MaxArtifactRecordBytes {
 			return nil, fmt.Errorf("%w: artifact record %q grew past its cap: %w", ErrIndexEntryCorrupt, name, ErrArtifactRecordTooLarge)
 		}
-		out = append(out, buf)
+		out = append(out, namedRecord{name: name, buf: buf})
 	}
 	return out, nil
 }

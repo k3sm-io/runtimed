@@ -196,6 +196,15 @@ type ReclaimConfig struct {
 	// the read order is chosen to survive; production can neither set it nor
 	// observe it.
 	afterInventory func()
+
+	// SweepDerived, when set, removes content derived from records rather than
+	// from blobs whose record is gone: the artifact views, which pkg/runtime
+	// wires in (this package cannot import their owner). A triggered pass that
+	// is not a dry run calls it before the inventory, so the extents such
+	// content shares with blobs this pass condemns are freed in the same pass.
+	// Its error is logged and does not stop the prune, which decides from its
+	// own fail-closed root set.
+	SweepDerived func(ctx context.Context) error
 }
 
 // ReclaimReport is the typed outcome of a reclaim pass.
@@ -335,6 +344,11 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		return rep, nil
 	}
 	rep.Triggered = true
+	if cfg.SweepDerived != nil && !cfg.DryRun {
+		if err := cfg.SweepDerived(ctx); err != nil {
+			log.Warn("image reclaim: sweep of record-derived content refused; it is kept", "err", err)
+		}
+	}
 
 	// INVENTORY FIRST, ROOTS second, LEASES last. The order is the whole race
 	// argument, and it is the opposite of the intuitive one.

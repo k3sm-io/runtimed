@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -152,5 +153,69 @@ func TestArtifactRootsAbsentIndex(t *testing.T) {
 	}
 	if roots, err := f.cache.Roots(); err != nil || len(roots) != 0 {
 		t.Fatalf("Roots with an empty index = %v, %v; want none", roots, err)
+	}
+}
+
+// TestArtifactRecordsRefuseNonRegularJSON pins that a *.json entry in the
+// artifact namespace that is not a regular file fails the listing, and so the
+// GC root set, rather than being skipped: no record is ever stored as one, so
+// it is damage, and skipping it could drop a root.
+func TestArtifactRecordsRefuseNonRegularJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, path string)
+	}{
+		{"a directory", func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a symlink", func(t *testing.T, path string) {
+			if err := os.Symlink("/etc/hosts", path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGCFixture(t)
+			x, err := NewFileIndex(f.cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			putArtifact(t, x, "k", f.blob("c", time.Hour))
+			name := strings.Repeat("a", 64) + ".json"
+			tc.plant(t, filepath.Join(f.cache.IndexRoot(), ArtifactIndexSubdir, name))
+			if _, err := x.ArtifactRecords(context.Background()); !errors.Is(err, ErrIndexEntryCorrupt) {
+				t.Errorf("ArtifactRecords err = %v; want ErrIndexEntryCorrupt", err)
+			}
+			_, err = f.cache.Roots()
+			if !errors.Is(err, ErrRootsIncomplete) {
+				t.Fatalf("Roots err = %v; want ErrRootsIncomplete", err)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("Roots err %q does not name the entry %s", err, name)
+			}
+		})
+	}
+}
+
+// TestArtifactRootsNameCorruptRecord pins that a record the GC cannot decode
+// is named in the ErrRootsIncomplete error, so the log says which file to
+// look at.
+func TestArtifactRootsNameCorruptRecord(t *testing.T) {
+	f := newGCFixture(t)
+	x, err := NewFileIndex(f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.PutArtifactRecord(context.Background(), "k", []byte("{ not json")); err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.cache.Roots()
+	if !errors.Is(err, ErrRootsIncomplete) {
+		t.Fatalf("Roots err = %v; want ErrRootsIncomplete", err)
+	}
+	if name := artifactEntryName("k"); !strings.Contains(err.Error(), name) {
+		t.Errorf("Roots err %q does not name the record %s", err, name)
 	}
 }

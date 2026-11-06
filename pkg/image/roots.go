@@ -360,7 +360,8 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 // exists; removing it (FileIndex.RemoveArtifactRecord) is what makes its blobs
 // collectable. Any record that cannot be listed, read or decoded, and an
 // artifact namespace that fails the index's ownership checks, make the whole
-// set ErrRootsIncomplete. An absent index or namespace has no records.
+// set ErrRootsIncomplete, naming the record's file so the refusal the GC logs
+// says which one to look at. An absent index or namespace has no records.
 func (c *Cache) artifactRoots() ([]ImageRoot, error) {
 	x := &FileIndex{dir: c.IndexRoot()}
 	records, err := x.artifactRecords()
@@ -372,9 +373,9 @@ func (c *Cache) artifactRoots() ([]ImageRoot, error) {
 	}
 	out := make([]ImageRoot, 0, len(records))
 	for _, rec := range records {
-		r, err := DecodeArtifactRoot(rec)
+		r, err := DecodeArtifactRoot(rec.buf)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrRootsIncomplete, err)
+			return nil, fmt.Errorf("%w: artifact record %q: %v", ErrRootsIncomplete, rec.name, err)
 		}
 		out = append(out, r)
 	}
