@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -81,39 +82,77 @@ func (p *Puller) partialBytes(b blob) int64 {
 // spaceNeeded is what a pull of missing may still add to the volume: the rest
 // of every download, plus the commit-time copy of the largest blobs that can be
 // committing at once (CommitBlob writes its own temp from the partial).
-func (p *Puller) spaceNeeded(missing []blob) uint64 {
+//
+// The sizes are capped by checkManifest, so this cannot wrap for a manifest
+// that passed it; the arithmetic is checked anyway, because a wrapped sum is a
+// zero reservation that bypasses the floor.
+func (p *Puller) spaceNeeded(missing []blob) (uint64, error) {
 	var need uint64
+	add := func(n int64) error {
+		if n < 0 {
+			return fmt.Errorf("negative size %d: %w", n, ErrSizeOverflow)
+		}
+		sum, carry := bits.Add64(need, uint64(n), 0)
+		if carry != 0 {
+			return ErrSizeOverflow
+		}
+		need = sum
+		return nil
+	}
 	sizes := make([]int64, 0, len(missing))
 	for _, b := range missing {
-		need += uint64(b.size - p.partialBytes(b))
+		if err := add(b.size - p.partialBytes(b)); err != nil {
+			return 0, err
+		}
 		sizes = append(sizes, b.size)
 	}
 	sort.Slice(sizes, func(i, j int) bool { return sizes[i] > sizes[j] })
 	for i := 0; i < len(sizes) && i < p.cfg.MaxConcurrentLayers; i++ {
-		need += uint64(sizes[i])
+		if err := add(sizes[i]); err != nil {
+			return 0, err
+		}
 	}
-	return need
+	return need, nil
+}
+
+// addChecked is a+b, refusing a wrap.
+func addChecked(a, b uint64) (uint64, error) {
+	sum, carry := bits.Add64(a, b, 0)
+	if carry != 0 {
+		return 0, ErrSizeOverflow
+	}
+	return sum, nil
 }
 
 // reserve claims space for missing before the first byte, running one reclaim
 // pass when short, and refuses with ErrInsufficientSpace when still short.
 func (p *Puller) reserve(ctx context.Context, missing []blob) (*reservation, error) {
-	need := p.spaceNeeded(missing)
+	need, err := p.spaceNeeded(missing)
+	if err != nil {
+		return nil, err
+	}
 	p.resv.mu.Lock()
 	defer p.resv.mu.Unlock()
+	claimed, err := addChecked(p.resv.held, need)
+	if err != nil {
+		return nil, err
+	}
+	want, err := addChecked(p.cfg.FloorBytes, claimed)
+	if err != nil {
+		return nil, err
+	}
 	fits := func() (uint64, bool, error) {
 		free, err := p.cfg.FreeBytes(p.cfg.StorePath)
 		if err != nil {
-			return 0, false, fmt.Errorf("%w: %v", image.ErrFreeSpaceUnknown, err)
+			return 0, false, fmt.Errorf("%w: %w", image.ErrFreeSpaceUnknown, bound(err))
 		}
-		return free, free >= p.cfg.FloorBytes && free-p.cfg.FloorBytes >= p.resv.held+need, nil
+		return free, free >= want, nil
 	}
 	free, ok, err := fits()
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		want := p.cfg.FloorBytes + p.resv.held + need
 		if _, rerr := p.deps.Reclaimer.ReclaimUnderPressure(ctx, image.ReclaimConfig{
 			HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: p.cfg.FreeBytes, Log: p.log,
 		}); rerr != nil {
@@ -128,7 +167,7 @@ func (p *Puller) reserve(ctx context.Context, missing []blob) (*reservation, err
 				need, free, p.resv.held, p.cfg.FloorBytes, ErrInsufficientSpace)
 		}
 	}
-	p.resv.held += need
+	p.resv.held = claimed
 	return &reservation{r: &p.resv, n: need}, nil
 }
 
@@ -256,7 +295,7 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, f *os.File, have int64) error {
 	body, start, err := p.deps.Fetcher.Blob(ctx, ref, cred, b.digest, have)
 	if err != nil {
-		return fmt.Errorf("fetch %s from %d: %w: %w", b.digest, have, ErrBlobTransfer, err)
+		return fmt.Errorf("fetch %s from %d: %w: %w", b.digest, have, ErrBlobTransfer, bound(err))
 	}
 	defer body.Close()
 	switch {
@@ -280,7 +319,7 @@ func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryC
 		return fmt.Errorf("fetch %s: more than %d bytes: %w", b.digest, b.size, image.ErrBlobTooLarge)
 	}
 	if cerr != nil {
-		return fmt.Errorf("fetch %s at %d: %w: %w", b.digest, have+n, ErrBlobTransfer, cerr)
+		return fmt.Errorf("fetch %s at %d: %w: %w", b.digest, have+n, ErrBlobTransfer, bound(cerr))
 	}
 	if serr != nil {
 		return fmt.Errorf("sync partial %s: %w", b.digest, serr)

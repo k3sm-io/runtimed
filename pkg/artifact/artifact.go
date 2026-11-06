@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"regexp"
@@ -44,6 +45,15 @@ import (
 const (
 	MaxManifestBytes = 4 << 20
 	MaxLayers        = 4096
+	// MaxLayerBytes caps one declared blob size: 256 GiB, above the largest
+	// single weight file a ModelPack splitter emits (tens of GiB), so no real
+	// layer reaches it, while keeping every size far from int64 and uint64 wrap.
+	MaxLayerBytes int64 = 256 << 30
+	// MaxArtifactBytes caps the declared total of one artifact: 1 TiB, above
+	// the largest open-weight model in bf16 (about 800 GB) and far below any
+	// sum that can wrap; 4096 layers at the per-layer cap could otherwise
+	// declare a petabyte.
+	MaxArtifactBytes int64 = 1 << 40
 	// DefaultMaxConcurrentLayers is how many layers transfer at once.
 	DefaultMaxConcurrentLayers = 2
 )
@@ -78,6 +88,8 @@ var (
 	ErrPathNotInArtifact  = errors.New("artifact: requested path is not in the artifact")
 	ErrInsufficientSpace  = errors.New("artifact: refusing the pull, the store volume would fall below its free-space floor")
 	ErrBlobTransfer       = errors.New("artifact: blob transfer failed")
+	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
+	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 )
 
 // BlobCommitter is the cache seam: *image.Cache satisfies it. CommitBlob is the
@@ -161,6 +173,10 @@ type Puller struct {
 	// write one partial file at once.
 	inflightMu sync.Mutex
 	inflight   map[string]chan struct{}
+
+	// recordStripes serialize the read-modify-write of one record key (see
+	// record), so concurrent subset pulls of one manifest never lose a layer.
+	recordStripes [32]sync.Mutex
 }
 
 // New returns a Puller.
@@ -259,7 +275,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 
 	raw, served, err := p.deps.Fetcher.Manifest(ctx, ref, cred)
 	if err != nil {
-		return nil, fmt.Errorf("fetch manifest %s: %w", image.QuoteBounded(ref, 512), err)
+		return nil, fmt.Errorf("fetch manifest %s: %w", image.QuoteBounded(ref, 512), bound(err))
 	}
 	if len(raw) > MaxManifestBytes {
 		return nil, fmt.Errorf("manifest of %d bytes, at most %d: %w", len(raw), MaxManifestBytes, ErrManifestTooLarge)
@@ -358,7 +374,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 func (p *Puller) checkHost(ref string) error {
 	r, err := name.ParseReference(ref, name.StrictValidation)
 	if err != nil {
-		return fmt.Errorf("%s: %w: %v", image.QuoteBounded(ref, 512), ErrInvalidReference, err)
+		return fmt.Errorf("%s: %w: %w", image.QuoteBounded(ref, 512), ErrInvalidReference, bound(err))
 	}
 	got := r.Context().RegistryStr()
 	if !strings.EqualFold(got, p.cfg.RegistryHost) {
@@ -429,6 +445,9 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 	if len(m.Layers) == 0 {
 		return "", nil, nil, ErrNoLayers
 	}
+	// Every declared size is capped (checkDescriptor) before it is summed, so
+	// this total of at most MaxLayers+1 capped terms cannot wrap.
+	total := m.Config.Size
 	paths := make([]string, len(m.Layers))
 	for i, l := range m.Layers {
 		if tarLayer(l.MediaType) {
@@ -439,6 +458,10 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 		}
 		if err := checkDescriptor(fmt.Sprintf("layer %d", i), l); err != nil {
 			return "", nil, nil, err
+		}
+		total += l.Size
+		if total > MaxArtifactBytes {
+			return "", nil, nil, fmt.Errorf("declared total over %d bytes: %w", MaxArtifactBytes, ErrSizeCap)
 		}
 		p := l.Annotations[annotationFilepathModern]
 		if p == "" {
@@ -465,7 +488,28 @@ func checkDescriptor(what string, d descriptor) error {
 	if d.Size < 0 {
 		return fmt.Errorf("%s size %d: %w", what, d.Size, ErrManifestInvalid)
 	}
+	if d.Size > MaxLayerBytes {
+		return fmt.Errorf("%s declares %d bytes, at most %d: %w", what, d.Size, MaxLayerBytes, ErrSizeCap)
+	}
 	return nil
+}
+
+// maxForeignErrBytes bounds foreign (registry, transport) error text carried
+// in an error this package returns; it reaches the gRPC status and the log.
+const maxForeignErrBytes = 512
+
+// boundedError renders a foreign error bounded and ASCII-quoted, keeping the
+// cause visible to errors.Is (the image package's boundErr convention).
+type boundedError struct{ err error }
+
+func (e *boundedError) Error() string { return image.QuoteBounded(e.err.Error(), maxForeignErrBytes) }
+func (e *boundedError) Unwrap() error { return e.err }
+
+func bound(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &boundedError{err: err}
 }
 
 // tarLayer reports an archive layer type, which needs an extractor (a
@@ -511,6 +555,11 @@ type Record struct {
 // the record names); a record of another manifest is replaced.
 func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byte, config string, layers []string) error {
 	key := Key(ref, typ)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key)) // hash.Hash.Write never returns an error
+	mu := &p.recordStripes[h.Sum32()%uint32(len(p.recordStripes))]
+	mu.Lock()
+	defer mu.Unlock()
 	have := append([]string(nil), layers...)
 	if old, ok, err := p.LookupRecord(ctx, ref, typ); err == nil && ok && old.ManifestDigest == mdigest {
 		have = append(have, old.LayerDigests...)

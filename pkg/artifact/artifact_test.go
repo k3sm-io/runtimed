@@ -653,7 +653,10 @@ func TestPullArtifactReservationCountsConcurrentPullsAndTemps(t *testing.T) {
 	ref2 := testHost + "/models/other:v1"
 	e.fetch.publishModel(ref2, other)
 	p := e.puller(t)
-	need1 := p.spaceNeeded([]blob{{digest: digestOfBytes([]byte("{}")), size: 2}, {digest: digestOfBytes(big.data), size: 4000}})
+	need1, err := p.spaceNeeded([]blob{{digest: digestOfBytes([]byte("{}")), size: 2}, {digest: digestOfBytes(big.data), size: 4000}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.free.Store(100 + need1 + need1/2) // room for one pull, not two
 	e.fetch.gate = make(chan struct{})
 	done := make(chan error, 1)
@@ -688,7 +691,10 @@ func TestPullArtifactReservationCountsConcurrentPullsAndTemps(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.partial, strings.Replace(d, ":", "-", 1)+".partial"), other.data[:3000], 0o600); err != nil {
 		t.Fatal(err)
 	}
-	withPartial := p.spaceNeeded([]blob{{digest: d, size: 4000}})
+	withPartial, err := p.spaceNeeded([]blob{{digest: d, size: 4000}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if want := uint64(1000 + 4000); withPartial != want {
 		t.Errorf("need with a 3000-byte partial = %d, want %d", withPartial, want)
 	}
