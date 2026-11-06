@@ -29,6 +29,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -65,6 +66,14 @@ const (
 // UNSPECIFIED zero value as anything but the legacy pull-through.
 type Puller interface {
 	Pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy image.PlatformPolicy, pull runtimev1.ImagePullPolicy) (*image.PullResult, error)
+}
+
+// ArtifactPuller is the platform-less artifact fetch seam Images.PullArtifact
+// consumes (the concrete *artifact.Puller satisfies it). It is a second entry
+// point beside Puller, never a relaxation of it: an artifact sent down Puller
+// still fails with image.ErrNoPlatformMatch.
+type ArtifactPuller interface {
+	PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error)
 }
 
 // Unpacker turns a pulled image into files in a pod's rootfs: it
@@ -336,7 +345,10 @@ type Runtime struct {
 	index       *image.FileIndex
 	signer      Signer
 	credentials CredentialResolver
-	backend     sandbox.Backend
+	// artifacts serves Images.PullArtifact; nil when no cluster registry is
+	// configured.
+	artifacts ArtifactPuller
+	backend   sandbox.Backend
 	// vmBackend is the Virtualization.framework micro-VM rung. createPod
 	// queries Available() so a vm-requested pod fails closed when it is absent, and
 	// routes a selected vm pod to CreateVM (away from the host-process path).
@@ -677,6 +689,11 @@ type Deps struct {
 	// the index is the daemon's own and every write path — including a
 	// caller-supplied puller that records into it — goes through it.
 	ImageIndexObserver image.IndexObserver
+	// ArtifactPuller fetches platform-less OCI artifacts (Images.PullArtifact).
+	// Nil builds the daemon's own artifact.Puller when FlatRegistry names the
+	// cluster registry, the one host it may fetch from; with no FlatRegistry
+	// (the standalone daemon) PullArtifact refuses every request.
+	ArtifactPuller ArtifactPuller
 	// Unpacker materializes a pulled image into a pod rootfs.
 	// Defaults to image.NewUnpacker(cache) — the same cache the puller commits
 	// blobs to, which is load-bearing: an unpacker over a different store could
@@ -924,6 +941,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		puller = p
 	}
+	artifacts := deps.ArtifactPuller
+	if artifacts == nil && deps.FlatRegistry.Host != "" {
+		a, err := newArtifactPuller(cache, index, deps.FlatRegistry, log)
+		if err != nil {
+			return nil, fmt.Errorf("init artifact puller: %w", err)
+		}
+		artifacts = a
+	}
 	unpacker := deps.Unpacker
 	if unpacker == nil {
 		u, err := image.NewUnpacker(cache, image.WithUnpackLogger(log))
@@ -1095,6 +1120,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		index:          index,
 		signer:         signer,
 		credentials:    deps.Credentials,
+		artifacts:      artifacts,
 		backend:        backend,
 		vmBackend:      vmBackend,
 		guestDialer:    guestDialer,

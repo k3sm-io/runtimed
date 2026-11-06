@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"path/filepath"
 	"time"
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
@@ -27,7 +29,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	artifactv1 "k3sm.io/apis/artifact/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
 )
 
@@ -722,4 +726,124 @@ func (r *Runtime) RunImageGC(ctx context.Context, interval time.Duration, cfg im
 			}
 		}
 	}
+}
+
+// artifactPartialDir is the cache-root-relative directory resumable artifact
+// partials live in: on the cache volume, so a committed partial is a same-volume
+// copy, and private to the daemon.
+const artifactPartialDir = "artifact-partial"
+
+// newArtifactPuller builds the daemon's own artifact puller over the same cache
+// and index the image puller uses, fetching only from the flat registry's
+// canonical host through that registry's own transport.
+func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.FlatRegistry, log *slog.Logger) (*artifact.Puller, error) {
+	tr, plain, err := image.ArtifactTransport(flat)
+	if err != nil {
+		return nil, err
+	}
+	return artifact.New(artifact.Config{
+		RegistryHost: flat.Host,
+		PartialDir:   filepath.Join(cache.Root(), artifactPartialDir),
+		StorePath:    cache.Root(),
+		Log:          log,
+	}, artifact.Deps{
+		Blobs: cache, Leases: cache, Reclaimer: cache, Index: index,
+		Fetcher: &artifact.RegistryFetcher{Transport: tr, PlainHTTP: plain},
+	})
+}
+
+// PullArtifact fetches a platform-less OCI artifact from the cluster registry
+// into the node cache (images.proto). It is idempotent and resumable; see
+// pkg/artifact for every fail-closed rule. The blobs are left reclaimable the
+// moment the call returns, as PullImage leaves an image's: the record is an
+// index edge, never a root.
+//
+// pull_policy is carried on the wire but not consulted yet: every call resolves
+// the manifest, and only the layers not already cached are fetched.
+func (s *imagesService) PullArtifact(ctx context.Context, req *runtimev1.PullArtifactRequest) (*runtimev1.PullArtifactResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	ref := req.GetReference()
+	if err := image.ValidateReference(ref); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if _, err := artifactv1.AllowSetFor(req.GetArtifactPolicy()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if s.rt.artifacts == nil {
+		return nil, status.Error(codes.FailedPrecondition,
+			"artifact pull refused: this node has no cluster registry configured")
+	}
+	cred, err := s.rt.artifactCredential(ctx, req)
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	res, err := s.rt.artifacts.PullArtifact(ctx, ref, cred, req.GetArtifactPolicy(), req.GetPaths())
+	if err != nil {
+		return nil, artifactStatusError(err)
+	}
+	res.Lease.Release()
+	s.rt.log.Info("pulled artifact", "reference", ref, "digest", res.ManifestDigest,
+		"type", res.ArtifactType, "layers", len(res.LayerDigests), "fetched", res.Fetched)
+	return &runtimev1.PullArtifactResponse{
+		ManifestDigest: res.ManifestDigest,
+		LayerDigests:   res.LayerDigests,
+	}, nil
+}
+
+// artifactCredential resolves the request's pull credential through the same
+// CredentialResolver seam, and under the same disclosure rules, as a pod's
+// image pull (pullCredential).
+func (r *Runtime) artifactCredential(ctx context.Context, req *runtimev1.PullArtifactRequest) (*image.RegistryCredential, error) {
+	return r.pullCredential(ctx, &runtimev1.PodBox{
+		Namespace:        req.GetNamespace(),
+		ImagePullSecrets: req.GetImagePullSecrets(),
+	}, req.GetReference())
+}
+
+// artifactStatusError maps an artifact pull failure onto a gRPC status. A
+// refusal of what the request asked for is INVALID_ARGUMENT, a host other than
+// the cluster registry PERMISSION_DENIED, an artifact this node will not accept
+// FAILED_PRECONDITION, a short volume RESOURCE_EXHAUSTED, bytes that fail their
+// digest DATA_LOSS and an interrupted transfer UNAVAILABLE (a retry resumes it).
+func artifactStatusError(err error) error {
+	switch {
+	case errors.Is(err, artifact.ErrNotClusterRegistry):
+		return status.Error(codes.PermissionDenied, err.Error())
+	case errors.Is(err, artifact.ErrInsufficientSpace):
+		return status.Error(codes.ResourceExhausted, err.Error())
+	case errors.Is(err, image.ErrDigestMismatch), errors.Is(err, artifact.ErrManifestDigest):
+		return status.Error(codes.DataLoss, err.Error())
+	case errors.Is(err, artifact.ErrBlobTransfer):
+		return status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, artifact.ErrIndexRefused), errors.Is(err, artifact.ErrImageNotArtifact),
+		errors.Is(err, artifact.ErrTypeRefused), errors.Is(err, artifact.ErrTarLayer),
+		errors.Is(err, artifact.ErrLayerTypeRefused), errors.Is(err, artifact.ErrTooManyLayers),
+		errors.Is(err, artifact.ErrNoLayers), errors.Is(err, artifact.ErrLayerPath),
+		errors.Is(err, artifact.ErrManifestTooLarge), errors.Is(err, artifact.ErrManifestInvalid),
+		errors.Is(err, artifact.ErrPathNotInArtifact), errors.Is(err, image.ErrBlobTooLarge):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, artifact.ErrInvalidReference), errors.Is(err, artifactv1.ErrUnknownPolicy),
+		isPathRuleError(err):
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return imageStatusError(err)
+}
+
+// isPathRuleError reports a requested-path refusal from artifactv1 (a layer
+// path refusal is caught earlier, under artifact.ErrLayerPath).
+func isPathRuleError(err error) bool {
+	for _, e := range []error{
+		artifactv1.ErrEmptyPath, artifactv1.ErrAbsolutePath, artifactv1.ErrPathCharset,
+		artifactv1.ErrPathComponent, artifactv1.ErrReservedComponent, artifactv1.ErrPathTooLong,
+		artifactv1.ErrPathDepth, artifactv1.ErrComponentTooLong, artifactv1.ErrCodeFile,
+		artifactv1.ErrDuplicatePath, artifactv1.ErrCaseCollision, artifactv1.ErrFileDirConflict,
+		artifactv1.ErrTooManyPaths,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
