@@ -235,6 +235,10 @@ type LayerApplier struct {
 	// meaningless (and unread) under the native dialect, which detects no
 	// collision at all.
 	destCaseSensitive bool
+	// destProbeErr is why that measurement failed, if it did, for the refusal
+	// to report: on a failed probe destCaseSensitive is the fail-closed reading
+	// and says nothing about the volume.
+	destProbeErr error
 	// nodes is the LINUX dialect's tree model, keyed by treeKey(path) so it
 	// answers the collision question and the ownership question with one map:
 	// a lookup that hits with a DIFFERENT Path is a case/normalization
@@ -267,6 +271,13 @@ type treeNode struct {
 // several layers into one tree owns the anchor's lifetime and a self-closing
 // applier would make the second layer unrepresentable.
 func NewLayerApplier(root *os.Root, policy UnpackPolicy, limits ApplyLimits) (*LayerApplier, error) {
+	return newLayerApplier(root, policy, limits, probeDestCaseSensitive)
+}
+
+// newLayerApplier is NewLayerApplier with the case-sensitivity measurement
+// supplied, which is how an Unpacker built WithCaseProbe reaches the tree it
+// stages.
+func newLayerApplier(root *os.Root, policy UnpackPolicy, limits ApplyLimits, probe CaseProbe) (*LayerApplier, error) {
 	if root == nil {
 		return nil, errors.New("layer applier: root is required")
 	}
@@ -286,11 +297,12 @@ func NewLayerApplier(root *os.Root, policy UnpackPolicy, limits ApplyLimits) (*L
 		// error is not fatal: it degrades to the case-insensitive reading, which
 		// is exactly the behaviour this check had before it could measure
 		// anything.
-		sensitive, perr := probeDestCaseSensitive(root)
+		sensitive, perr := probe(root)
 		if perr != nil {
 			sensitive = false
 		}
 		a.destCaseSensitive = sensitive
+		a.destProbeErr = perr
 		slog.Debug("image: probed the layer tree destination for case sensitivity",
 			"case_sensitive", sensitive, "err", perr)
 	}
@@ -524,9 +536,7 @@ func (a *LayerApplier) put(name string, own OwnershipEntry, explicit bool) error
 	key := a.treeKey(name)
 	if prev, ok := a.nodes[key]; ok {
 		if prev.path != name {
-			return fmt.Errorf("%w: %s and %s are distinct Linux paths that resolve to one file",
-				ErrPathCollision, quoteBounded(prev.path, maxLayerEntryNameLen),
-				quoteBounded(name, maxLayerEntryNameLen))
+			return collisionError(prev.path, name, a.destProbeErr)
 		}
 		if explicit {
 			prev.own = own
