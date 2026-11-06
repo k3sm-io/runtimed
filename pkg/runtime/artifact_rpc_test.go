@@ -31,7 +31,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -318,27 +318,27 @@ func TestPullArtifactRPCChecksHostBeforeCredentials(t *testing.T) {
 // TestPullArtifactRPCBoundsConcurrency: at most maxConcurrentArtifactPulls
 // PullArtifact calls run at once; the rest wait.
 func TestPullArtifactRPCBoundsConcurrency(t *testing.T) {
-	const callers = 8
-	ap := &scriptedArtifactPuller{gate: make(chan struct{}), entered: make(chan struct{}, callers)}
-	client, _ := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: ap})
-	var wg sync.WaitGroup
-	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, _ = client.PullArtifact(context.Background(), volumeReq(artifactTestHost+"/models/m:v1"))
-		}()
-	}
-	// Wait for the admitted pulls, then give the rest time to (wrongly) enter.
-	for range maxConcurrentArtifactPulls {
-		<-ap.entered
-	}
-	time.Sleep(100 * time.Millisecond)
-	if got := ap.peak.Load(); got != maxConcurrentArtifactPulls {
-		t.Errorf("peak concurrent pulls = %d, want %d", got, maxConcurrentArtifactPulls)
-	}
-	close(ap.gate)
-	wg.Wait()
+	synctest.Test(t, func(t *testing.T) {
+		const callers = 8
+		ap := &scriptedArtifactPuller{gate: make(chan struct{}), entered: make(chan struct{}, callers)}
+		client, _ := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: ap})
+		var wg sync.WaitGroup
+		for range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = client.PullArtifact(context.Background(), volumeReq(artifactTestHost+"/models/m:v1"))
+			}()
+		}
+		// Once every goroutine in the bubble is blocked, the admitted pulls hold
+		// the gate and the rest wait on the bound; none of them entered.
+		synctest.Wait()
+		if got := ap.peak.Load(); got != maxConcurrentArtifactPulls {
+			t.Errorf("peak concurrent pulls = %d, want %d", got, maxConcurrentArtifactPulls)
+		}
+		close(ap.gate)
+		wg.Wait()
+	})
 }
 
 // TestPullArtifactRPCBoundsErrorText: a failure carrying a huge foreign

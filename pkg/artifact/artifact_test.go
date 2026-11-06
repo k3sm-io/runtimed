@@ -27,11 +27,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	artifactv1 "k3sm.io/apis/artifact/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -61,6 +61,8 @@ type fakeFetcher struct {
 	ignoreRange bool
 	// gate, when non-nil, holds every blob body open until it is closed.
 	gate chan struct{}
+	// held, when non-nil, gets one signal as a body starts waiting on gate.
+	held chan struct{}
 
 	manifestCalls atomic.Int32
 	blobCalls     atomic.Int32
@@ -120,7 +122,7 @@ func (f *fakeFetcher) Blob(_ context.Context, _ string, _ *image.RegistryCredent
 			break
 		}
 	}
-	return &fakeBody{r: bytes.NewReader(body), tail: tail, f: f, gate: f.gate}, start, nil
+	return &fakeBody{r: bytes.NewReader(body), tail: tail, f: f, gate: f.gate, held: f.held}, start, nil
 }
 
 type fakeBody struct {
@@ -128,16 +130,23 @@ type fakeBody struct {
 	tail   error
 	f      *fakeFetcher
 	gate   chan struct{}
+	held   chan struct{}
 	waited bool
 	closed bool
 }
 
 func (b *fakeBody) Read(p []byte) (int, error) {
 	if b.gate != nil && !b.waited {
+		if b.held != nil {
+			select {
+			case b.held <- struct{}{}:
+			default:
+			}
+		}
 		<-b.gate
 		b.waited = true
 	} else if !b.waited {
-		time.Sleep(5 * time.Millisecond) // overlap concurrent transfers
+		runtime.Gosched() // let concurrent transfers overlap
 		b.waited = true
 	}
 	n, err := b.r.Read(p)
@@ -659,6 +668,7 @@ func TestPullArtifactReservationCountsConcurrentPullsAndTemps(t *testing.T) {
 	}
 	e.free.Store(100 + need1 + need1/2) // room for one pull, not two
 	e.fetch.gate = make(chan struct{})
+	e.fetch.held = make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
 		res, err := p.PullArtifact(context.Background(), testRef, nil, volume, nil)
@@ -667,10 +677,9 @@ func TestPullArtifactReservationCountsConcurrentPullsAndTemps(t *testing.T) {
 		}
 		done <- err
 	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for p.Reserved() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	// The space is reserved before any byte moves, so once a body is held the
+	// first pull's reservation stands.
+	<-e.fetch.held
 	if p.Reserved() != need1 {
 		t.Fatalf("reserved = %d, want %d", p.Reserved(), need1)
 	}
