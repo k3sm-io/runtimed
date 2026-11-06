@@ -744,6 +744,16 @@ func artifactStatus(c codes.Code, err error) error {
 	return status.Error(c, image.QuoteBounded(err.Error(), maxArtifactStatusBytes))
 }
 
+// ArtifactView returns the read-only view of the recorded artifact
+// manifestDigest restricted to paths (every file when empty), building it when
+// absent. It is the entry point the mount path uses; see artifact.Views.
+func (r *Runtime) ArtifactView(ctx context.Context, manifestDigest string, paths []string) (string, error) {
+	if r.views == nil {
+		return "", fmt.Errorf("artifact views unavailable: %w", r.viewsErr)
+	}
+	return r.views.View(ctx, manifestDigest, paths)
+}
+
 // newArtifactPuller builds the daemon's own artifact puller over the same cache
 // and index the image puller uses, fetching only from the flat registry's
 // canonical host through that registry's own transport.
@@ -767,9 +777,9 @@ func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.Fl
 
 // PullArtifact fetches a platform-less OCI artifact from the cluster registry
 // into the node cache (images.proto). It is idempotent and resumable; see
-// pkg/artifact for every fail-closed rule. The blobs are left reclaimable the
-// moment the call returns, as PullImage leaves an image's: the record is an
-// index edge, never a root.
+// pkg/artifact for every fail-closed rule. Unlike an image's, the blobs stay
+// after the call returns: the artifact record is a GC root until it is removed
+// (artifact.Views.Forget).
 //
 // pull_policy is carried on the wire but not consulted yet: every call resolves
 // the manifest, and only the layers not already cached are fetched.

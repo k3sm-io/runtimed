@@ -25,7 +25,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -367,4 +370,45 @@ func TestPullArtifactRPCSizeRefusalsAreTerminal(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestArtifactViewServesAPulledArtifact pins the wiring the mount path will
+// call: once PullArtifact has recorded an artifact, the runtime's own views
+// build its read-only view over the same cache and index.
+func TestArtifactViewServesAPulledArtifact(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("the daemon's views clone with APFS clonefile, darwin-only")
+	}
+	f := modelArtifact(map[string][]byte{"a.json": []byte("a"), "w.safetensors": []byte("w")}, []string{"a.json", "w.safetensors"})
+	client, rt := artifactRPCClient(t, f)
+	t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
+	ctx := context.Background()
+	if _, err := rt.ArtifactView(ctx, sha(f.manifest), nil); !errors.Is(err, artifact.ErrNotRecorded) {
+		t.Fatalf("view before the pull err = %v, want ErrNotRecorded", err)
+	}
+	if _, err := client.PullArtifact(ctx, &runtimev1.PullArtifactRequest{
+		Reference:      artifactTestHost + "/models/tiny:v1",
+		ArtifactPolicy: runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME,
+	}); err != nil {
+		t.Fatalf("PullArtifact: %v", err)
+	}
+	view, err := rt.ArtifactView(ctx, sha(f.manifest), []string{"w.safetensors"})
+	if err != nil {
+		t.Fatalf("ArtifactView: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(view, "w.safetensors")); err != nil || string(got) != "w" {
+		t.Fatalf("view file reads %q, %v", got, err)
+	}
+}
+
+// restoreWritable reopens a tree of read-only views so a non-root test's
+// TempDir cleanup can remove it.
+func restoreWritable(t *testing.T, dir string) {
+	t.Helper()
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(p, 0o700) // best effort: cleanup reports what it cannot remove
+		}
+		return nil
+	})
 }
