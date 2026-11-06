@@ -27,8 +27,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
@@ -292,6 +294,13 @@ type Unpacker struct {
 	cache  *Cache
 	cloner Cloner
 	limits ApplyLimits
+	// log reports a recovered layer panic (WithUnpackLogger). Nil discards.
+	log *slog.Logger
+	// decompress and applyTar are the calls applyLayer makes into code that reads
+	// a layer's bytes. They are fields so a test can raise a panic from inside
+	// them; NewUnpacker sets the production functions and nothing else writes them.
+	decompress func(mediaType string, r io.Reader) (io.ReadCloser, error)
+	applyTar   func(a *LayerApplier, ctx context.Context, r io.Reader) error
 }
 
 // UnpackerOption adjusts an Unpacker at construction.
@@ -310,6 +319,20 @@ func WithApplyLimits(l ApplyLimits) UnpackerOption {
 	return func(u *Unpacker) { u.limits = l }
 }
 
+// WithUnpackLogger sets the logger a recovered layer panic is reported on. Nil
+// discards.
+func WithUnpackLogger(log *slog.Logger) UnpackerOption {
+	return func(u *Unpacker) { u.log = log }
+}
+
+// logger returns the unpacker's logger, or a discarding one.
+func (u *Unpacker) logger() *slog.Logger {
+	if u.log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return u.log
+}
+
 // NewUnpacker returns an Unpacker over cache.
 //
 // The cache is required and is the same store the pull path committed the blobs
@@ -320,7 +343,12 @@ func NewUnpacker(cache *Cache, opts ...UnpackerOption) (*Unpacker, error) {
 	if cache == nil {
 		return nil, errors.New("image unpacker: cache is required")
 	}
-	u := &Unpacker{cache: cache, cloner: APFSCloner{}}
+	u := &Unpacker{
+		cache:      cache,
+		cloner:     APFSCloner{},
+		decompress: decompressLayer,
+		applyTar:   (*LayerApplier).Apply,
+	}
 	for _, o := range opts {
 		o(u)
 	}
@@ -733,7 +761,32 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 // because a hash is only known at eof. That ordering is safe because the apply
 // happens into a disposable staging tree that is discarded on any error — the
 // contract applyStaged is built to provide.
-func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, diffID string) error {
+//
+// # A panic is a malformed layer
+//
+// Everything under this function reads registry-supplied bytes on the caller's
+// goroutine: decoder construction, the decoders, archive/tar and the applier. The
+// recover deferred first below turns a panic in any of them into ErrLayerMalformed,
+// so one bad layer fails that layer rather than the node process. One recover
+// here is safe, and sufficient, for these reasons:
+//
+//   - nothing it unwinds holds a lock or starts a goroutine. The applier belongs
+//     to this one unpack, and the decoders run synchronously (decompressLayer);
+//   - a panicked decoder is never read again, because the unwind leaves nothing
+//     that would read it. Only its Close runs, and a panic there is caught too,
+//     since this defer runs last;
+//   - the applier's state and the tree it wrote are discarded. applyStaged treats
+//     this like any other layer error, stops, and removes the staging directory;
+//   - the file being written is closed by applyRegular's own defer.
+//
+// It does not reach what the runtime treats as fatal rather than as a panic: a
+// memory fault past the zero page (the decoders' assembly included), stack
+// exhaustion, and running out of memory still end the process. A panic on another
+// goroutine would too. Nor does it cover what runs on these bytes outside this
+// function, such as sorting and writing the ownership sidecar in Unpack.
+func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, diffID string) (retErr error) {
+	defer u.recoverLayerPanic(desc.GetDigest(), &retErr)
+
 	wantBlob, err := parseBlobDigest(desc.GetDigest())
 	if err != nil {
 		return err
@@ -751,7 +804,7 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 	blobHash := blobHashers[wantBlob.Algorithm]()
 	diffHash := blobHashers[wantDiff.Algorithm]()
 	compressed := io.TeeReader(f, blobHash)
-	plain, err := decompressLayer(desc.GetMediaType(), compressed)
+	plain, err := u.decompress(desc.GetMediaType(), compressed)
 	if err != nil {
 		return err
 	}
@@ -766,7 +819,7 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 	// padded layer failed verification against the diffID its own config
 	// correctly claimed.
 	plainTee := io.TeeReader(plain, diffHash)
-	if err := applier.Apply(ctx, plainTee); err != nil {
+	if err := u.applyTar(applier, ctx, plainTee); err != nil {
 		return err
 	}
 	// Drain whatever the tar reader left (its trailing padding, and any bytes
@@ -787,6 +840,33 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 			wantDiff.Algorithm, got, quoteBounded(diffID, maxDigestLen), ErrDiffIDMismatch)
 	}
 	return nil
+}
+
+// maxLayerPanicStackBytes bounds the stack a recovered layer panic logs. A
+// traceback is already limited to its innermost and outermost frames, so this
+// exists for frames with long names, and a cut one is still readable.
+const maxLayerPanicStackBytes = 16 << 10
+
+// recoverLayerPanic is applyLayer's deferred recover: it must be deferred directly
+// for its recover to see the panic.
+//
+// The panic value is foreign text on its way to a Pod status, so it is quoted as
+// bounded data, and fmt renders a value whose own String or Error method panics
+// without raising a second panic here. The stack is for whoever fixes the bug, and
+// goes only to the node log. A traceback prints argument words in hex rather than
+// the strings they point to, so it carries no layer content, and it never joins the
+// error, which reaches the Pod status and the datastore.
+func (u *Unpacker) recoverLayerPanic(digest string, retErr *error) {
+	v := recover()
+	if v == nil {
+		return
+	}
+	value := quoteBounded(fmt.Sprint(v), maxWrappedErrLen)
+	stack := make([]byte, maxLayerPanicStackBytes)
+	n := runtime.Stack(stack, false)
+	u.logger().Error("recovered a panic while applying an image layer",
+		"layer", quoteBounded(digest, maxDigestLen), "panic", value, "stack", string(stack[:n]))
+	*retErr = fmt.Errorf("%w: panic while applying layer: %s", ErrLayerMalformed, value)
 }
 
 // configDiffIDs reads the image config blob out of the store, re-hashes it
@@ -1030,6 +1110,12 @@ const maxZstdWindow = 128 << 20
 // garbage is refused at the first Read. Both end up as ErrLayerMalformed at the
 // caller, because LayerApplier.Apply wraps any read failure that way — the
 // verdict a caller acts on is therefore the same either way.
+//
+// A decoder panic is the same verdict, from applyLayer's recover. That recover
+// reaches a decoder only because the decoder runs on the calling goroutine:
+// compress/gzip and compress/flate start no goroutines, and klauspost zstd starts
+// its decoding goroutines only in Reset's startStreamDecoder arm, which it skips
+// at concurrency 1.
 func decompressLayer(mediaType string, r io.Reader) (io.ReadCloser, error) {
 	switch mediaType {
 	case mediaTypeOCILayerGzip, mediaTypeDockerLayerGzip:
@@ -1041,8 +1127,11 @@ func decompressLayer(mediaType string, r io.Reader) (io.ReadCloser, error) {
 	case mediaTypeOCILayerZstd:
 		// Single-goroutine, window-bounded: the caller already streams one layer
 		// at a time and the concurrency would only add goroutines whose lifetime
-		// this function cannot state. Close on the returned ReadCloser releases
-		// the decoder (zstd.Decoder.Close returns nothing to report).
+		// this function cannot state, and on which a decoder panic would end the
+		// process, because applyLayer's recover cannot reach another goroutine.
+		// TestLayerDecoderPanicIsMalformed crashes if this is raised. Close on the
+		// returned ReadCloser releases the decoder (zstd.Decoder.Close returns
+		// nothing to report).
 		zr, err := zstd.NewReader(r,
 			zstd.WithDecoderConcurrency(1),
 			zstd.WithDecoderMaxWindow(maxZstdWindow))

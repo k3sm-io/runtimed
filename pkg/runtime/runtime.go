@@ -920,7 +920,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	unpacker := deps.Unpacker
 	if unpacker == nil {
-		u, err := image.NewUnpacker(cache)
+		u, err := image.NewUnpacker(cache, image.WithUnpackLogger(log))
 		if err != nil {
 			return nil, fmt.Errorf("init image unpacker: %w", err)
 		}

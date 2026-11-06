@@ -728,6 +728,10 @@ func (a *LayerApplier) applyRegular(name string, hdr *tar.Header, content io.Rea
 	if err != nil {
 		return fmt.Errorf("create %s: %w", quoteBounded(name, maxLayerEntryNameLen), err)
 	}
+	// The copy below reads a decoder that can panic, and applyLayer recovers that
+	// and carries on, so this file must not depend on reaching the Close after the
+	// copy. A second Close only reports that the file is already closed.
+	defer func() { _ = f.Close() }()
 	remaining := a.limits.MaxBytes - a.stats.Bytes
 	// LimitReader at remaining+1 so an overrun is DETECTED rather than silently
 	// truncated into a short file that would then fail the layer's diffID check
