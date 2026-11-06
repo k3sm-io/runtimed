@@ -362,7 +362,7 @@ func TestPullArtifactRefusesImageConfig(t *testing.T) {
 	}
 }
 
-func TestPullArtifactRefusesIndex(t *testing.T) {
+func TestPullArtifactRefusesBareIndex(t *testing.T) {
 	e := newEnv(t)
 	child := e.fetch.publishModel(testRef, modelLayer("a.json", "a"))
 	idx, _ := json.Marshal(map[string]any{
@@ -425,7 +425,7 @@ func TestPullArtifactManifestCap(t *testing.T) {
 	}
 }
 
-func TestPullArtifactValidatesLayerPaths(t *testing.T) {
+func TestArtifactPathValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		layers []layer
@@ -614,7 +614,7 @@ func TestPullArtifactAtMostTwoLayersAtOnce(t *testing.T) {
 	}
 }
 
-func TestPullArtifactReservesBeforeFirstByte(t *testing.T) {
+func TestPullArtifactChecksSpaceBeforeFirstByte(t *testing.T) {
 	e := newEnv(t)
 	w := modelLayer("w.safetensors", strings.Repeat("z", 1000))
 	e.fetch.publishModel(testRef, w)
@@ -705,5 +705,18 @@ func TestPullArtifactRecordsOnlyAfterEveryLayer(t *testing.T) {
 	}
 	if _, ok, err := p.LookupRecord(context.Background(), testRef, artifactv1.ArtifactTypeModel); ok || err != nil {
 		t.Errorf("record after a failed layer: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPullArtifactRefusesTypeOutsideAllowSet(t *testing.T) {
+	for _, typ := range []string{artifactv1.ArtifactTypeGuest, "application/vnd.example.unknown.v1", artifactv1.MediaTypeModelConfig} {
+		e := newEnv(t)
+		e.fetch.publish(testRef, typ, artifactv1.MediaTypeModelConfig, []layer{modelLayer("a.json", "a")})
+		if _, err := e.puller(t).PullArtifact(context.Background(), testRef, nil, volume, nil); !errors.Is(err, ErrTypeRefused) {
+			t.Errorf("%s: err = %v, want ErrTypeRefused", typ, err)
+		}
+		if e.fetch.blobCalls.Load() != 0 {
+			t.Errorf("%s: blobs fetched for a refused type", typ)
+		}
 	}
 }
