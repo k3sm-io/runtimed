@@ -42,7 +42,7 @@ github.com/googleapis/gax-go/v2 v2.17.0 # 2026-02-03T18:41:38Z
 github.com/inconshreveable/mousetrap v1.1.0 # 2022-11-27T22:01:53Z
 github.com/json-iterator/go v1.1.12 # 2021-09-11T02:17:26Z
 github.com/keybase/go-keychain v0.0.1 # 2025-02-27T17:52:03Z
-github.com/klauspost/compress v1.18.7 # 2026-06-30T09:38:05Z
+github.com/klauspost/compress v1.20.2 # 2026-10-12T09:34:06Z
 github.com/moby/docker-image-spec v1.3.1 # 2024-02-09T17:17:29Z
 github.com/moby/moby/api v1.54.2 # 2026-04-20T10:34:33Z
 github.com/moby/moby/client v0.4.1 # 2026-04-20T14:44:55Z
