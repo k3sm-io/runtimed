@@ -236,6 +236,12 @@ var ErrInvalidStatusRecordDir = errors.New("sbpl: invalid status record dir")
 // An empty value is not this error (see Posture.DataRoot).
 var ErrInvalidDataRoot = errors.New("sbpl: invalid data root")
 
+// ErrInvalidArtifactView is returned by Generate when a
+// GenerateOptions.ArtifactViewPaths entry is not exactly one view directory,
+// <WorkDir>/artifacts/<manifest-hex>/<path-set-key>: never the views root, a
+// manifest directory, or anything outside them.
+var ErrInvalidArtifactView = errors.New("sbpl: invalid artifact view path")
+
 // ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
 // not reside under the configured Posture.Home. In the unprivileged user-space
 // posture the daemon's data area lives under its home; a work-dir outside it
@@ -393,6 +399,19 @@ type GenerateOptions struct {
 	// ReadPaths get a read-only allow (no write): the read_only persistent-volume
 	// mount roots. Default-deny then blocks writes to them.
 	ReadPaths []string
+	// ArtifactViewPaths are the read-only artifact view directories the pod's
+	// image volumes link to, each exactly
+	// <WorkDir>/artifacts/<manifest-hex>/<path-set-key>. They lie under the
+	// denied views root, so Generate grants each one file-read* AFTER the
+	// protected denies (last-match-wins), then denies process-exec* and
+	// file-map-executable on it, then denies file-write* on it last. Only the
+	// named views are granted: every other view and the blob cache stay denied.
+	//
+	// The exec and executable-map denies are hygiene for non-executable data,
+	// not a capability boundary: the profile allows process-exec* elsewhere and
+	// the data volume is writable, so a pod can copy a view file there and run
+	// it. They stop the view itself being executed or mapped executable.
+	ArtifactViewPaths []string
 	// PodUID is the kube Pod UID (PodBox.pod_id). When set, Generate grants the
 	// pod its own POSIX named semaphores, filtered to the prefix PosixSemPrefix
 	// derives from it (posixsem.go); empty grants none. Not in the proto: the
@@ -548,6 +567,13 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// protected-prefix set from the same resolvePosture — so a caller that asks
 	// before setting the field gets the answer this line will give.
 	xcodeDir, err := validateXcodeToolchainDir(sp.GetXcodeToolchainDir(), protectedPrefixes)
+	if err != nil {
+		return "", err
+	}
+
+	// The artifact views are checked by shape, not against the deny-set: each
+	// lies under the denied views root by design and is re-allowed after it.
+	viewPaths, err := validateArtifactViews(filepath.Dir(podsRoot), opts.ArtifactViewPaths)
 	if err != nil {
 		return "", err
 	}
@@ -817,6 +843,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// would grant metadata on the whole filesystem.
 	reallowed := append([]string{dataVol}, opts.WritePaths...)
 	reallowed = append(reallowed, opts.ReadPaths...)
+	reallowed = append(reallowed, viewPaths...)
 	if ancestors := ancestorMetadataPaths(reallowed); len(ancestors) > 0 {
 		b.WriteString(";; existence only: the strict ancestors of every re-allowed subtree, so a\n")
 		b.WriteString(";; stat-walk (chdir/realpath canonicalization — swift-driver, swift-frontend)\n")
@@ -842,6 +869,24 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("  )\n")
 		b.WriteString("(deny file-write*\n")
 		writeFirmlinkSubpaths(&b, credPaths)
+		b.WriteString("  )\n")
+	}
+
+	// --- artifact views: read one view, never write, exec or map it executable --
+	// After the protected denies, so the read grant is not voided by the deny on
+	// the views root; the write deny is the last rule in the profile.
+	if len(viewPaths) > 0 {
+		b.WriteString(";; artifact views (image volumes): read this pod's views only, emitted\n")
+		b.WriteString(";; after the views-root deny; no exec, no executable mapping (hygiene\n")
+		b.WriteString(";; for data, not a boundary), and the write deny LAST.\n")
+		b.WriteString("(allow file-read*\n")
+		writeFirmlinkSubpaths(&b, viewPaths)
+		b.WriteString("  )\n")
+		b.WriteString("(deny process-exec* file-map-executable\n")
+		writeFirmlinkSubpaths(&b, viewPaths)
+		b.WriteString("  )\n")
+		b.WriteString("(deny file-write*\n")
+		writeFirmlinkSubpaths(&b, viewPaths)
 		b.WriteString("  )\n")
 	}
 
@@ -1112,6 +1157,36 @@ func checkDenyDir(dir, podsRoot string, sentinel error) error {
 		return fmt.Errorf("%w: %q is at or under the pods root %q", sentinel, dir, podsRoot)
 	}
 	return nil
+}
+
+// validateArtifactViews returns views sorted and de-duplicated, refusing any
+// entry that is not exactly <workDir>/<ArtifactViewsSubdir>/<hex64>/<hex64>
+// (absolute and clean, compared lexically) with ErrInvalidArtifactView.
+func validateArtifactViews(workDir string, views []string) ([]string, error) {
+	root := filepath.Join(workDir, ArtifactViewsSubdir)
+	for _, v := range views {
+		if !filepath.IsAbs(v) || filepath.Clean(v) != v || !strictlyUnder(v, root) {
+			return nil, fmt.Errorf("%w: %q is not under %q", ErrInvalidArtifactView, v, root)
+		}
+		parts := strings.Split(strings.TrimPrefix(v, root+string(filepath.Separator)), string(filepath.Separator))
+		if len(parts) != 2 || !isHex64(parts[0]) || !isHex64(parts[1]) {
+			return nil, fmt.Errorf("%w: %q is not %s/<manifest>/<paths>", ErrInvalidArtifactView, v, root)
+		}
+	}
+	return dedupeSorted(views), nil
+}
+
+// isHex64 reports whether s is 64 lowercase hex digits (a hex sha256).
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // validateExtraPaths rejects any path in groups that is at or under a protected
