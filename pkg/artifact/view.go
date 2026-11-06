@@ -17,6 +17,7 @@ limitations under the License.
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -33,6 +34,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	artifactv1 "k3sm.io/apis/artifact/v1"
 	"k3sm.io/runtimed/pkg/image"
@@ -45,6 +47,7 @@ var (
 	ErrNotRecorded       = errors.New("artifact: no artifact record names the manifest")
 	ErrLayerNotCommitted = errors.New("artifact: a layer the view needs is not committed to the cache")
 	ErrViewsRoot         = errors.New("artifact: views directory is not a private directory")
+	ErrViewsNotOwned     = errors.New("artifact: views directory is not owned by this process or has the wrong mode")
 )
 
 // viewDirMode is the mode of every directory in a built view, the view root
@@ -65,17 +68,19 @@ const (
 var hex64 = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // BlobPaths is the cache seam the view builder clones from; *image.Cache
-// satisfies it.
+// satisfies it. BlobStoreDir is read once, at start, for the volume check.
 type BlobPaths interface {
 	Has(digest string) bool
 	BlobPath(digest string) (string, error)
+	BlobStoreDir() string
 }
 
-// RecordStore lists and removes artifact records; *image.FileIndex satisfies
+// RecordStore reads and removes artifact records; *image.FileIndex satisfies
 // it.
 type RecordStore interface {
 	ArtifactRecords(ctx context.Context) ([][]byte, error)
-	RemoveArtifactRecord(ctx context.Context, key string) (bool, error)
+	ArtifactRecord(ctx context.Context, key string) ([]byte, bool, error)
+	RemoveArtifactRecordIf(ctx context.Context, key string, match func(record []byte) bool) (bool, error)
 }
 
 // ViewsConfig configures Views.
@@ -84,11 +89,16 @@ type ViewsConfig struct {
 	// <StorePath>/<sandbox.ArtifactViewsSubdir>, on the blob store's volume.
 	// Required, absolute.
 	StorePath string
-	// Cloner clones a blob into a view. Nil means image.APFSCloner. It is used
-	// strictly: a clone that reports cow == false is ErrCrossVolume.
+	// Cloner clones a blob into a view. Nil means image.CloneOnly, which never
+	// copies. It is used strictly: a clone that reports cow == false, or fails
+	// because the volume cannot clone (image.IsCloneUnsupported), is
+	// ErrCrossVolume.
 	Cloner image.Cloner
 	// Log receives reaping and collection notes. Nil discards.
 	Log *slog.Logger
+
+	// statDev returns the st_dev of a path; nil means stat(2). A test seam.
+	statDev func(path string) (uint64, error)
 }
 
 // Views builds and owns the read-only artifact views: one directory per
@@ -103,7 +113,19 @@ type ViewsConfig struct {
 // staging directory or another model's view.
 //
 // A view exists only while some artifact record names its manifest; Forget
-// removes a record and, with the last record of a manifest, its views.
+// removes a record and, with the last record of a manifest, its views. A
+// record replaced for another manifest, or removed some other way, leaves the
+// old manifest's views to SweepOrphans, which the image prune calls, and to
+// the start-up reap.
+//
+// Views are a rebuildable cache, so nothing in one is fsynced: a crash can
+// publish a view whose clones or modes never reached the disk. The start-up
+// pass is the recovery: it removes every published view that is not exactly
+// 0555 directories over 0444 regular files, and the next View rebuilds it.
+//
+// View trusts the daemon-private blob store. A blob was digest-verified when
+// it was committed, and a view clones it without hashing it again: a party
+// that can rewrite the blob store already has the daemon's privilege.
 type Views struct {
 	root    string
 	cloner  image.Cloner
@@ -116,15 +138,22 @@ type Views struct {
 	// of one view never race. Builds of different manifests run in parallel
 	// unless they share a stripe.
 	stripes [32]sync.Mutex
+
+	// beforeRemove, when set, runs in Forget with the manifest lock held, just
+	// before the record is removed. A test seam for the re-put interleaving.
+	beforeRemove func()
 }
 
 // NewViews returns the daemon's view builder. It creates the views root
-// (0711) when absent and refuses one that is not a directory or is writable by
-// group or other. It is called once at daemon start, and it reaps there what a
-// crash left behind: every half-built staging directory, and every manifest
-// directory no artifact record names any more (a crash between removing a
-// record and removing its views). A failure to list the records skips the
-// second step, never the first.
+// (exactly 0711) when absent and refuses one that is not a directory, is not
+// owned by the daemon's euid, or has any other mode (ErrViewsNotOwned); it
+// refuses a views root on another device than the blob store (ErrCrossVolume),
+// before any clone is tried. It is called once at daemon start, and it reaps
+// there what a crash left behind: every half-built staging directory, every
+// published view that is no longer read-only, and every manifest directory no
+// artifact record names any more (a crash between removing a record and
+// removing its views). A failure to list the records skips the last step,
+// never the others.
 func NewViews(ctx context.Context, cfg ViewsConfig, blobs BlobPaths, records RecordStore) (*Views, error) {
 	if cfg.StorePath == "" || !filepath.IsAbs(cfg.StorePath) {
 		return nil, fmt.Errorf("%w: store path %q is not absolute", ErrViewsRoot, cfg.StorePath)
@@ -133,7 +162,11 @@ func NewViews(ctx context.Context, cfg ViewsConfig, blobs BlobPaths, records Rec
 		return nil, errors.New("artifact views: blobs and records are required")
 	}
 	if cfg.Cloner == nil {
-		cfg.Cloner = image.APFSCloner{}
+		cfg.Cloner = image.CloneOnly{}
+	}
+	statDev := cfg.statDev
+	if statDev == nil {
+		statDev = deviceOf
 	}
 	log := cfg.Log
 	if log == nil {
@@ -149,8 +182,32 @@ func NewViews(ctx context.Context, cfg ViewsConfig, blobs BlobPaths, records Rec
 	if err := ensurePrivateDir(v.root); err != nil {
 		return nil, err
 	}
+	vdev, err := statDev(v.root)
+	if err != nil {
+		return nil, fmt.Errorf("stat views root: %w", err)
+	}
+	bdev, err := statDev(blobs.BlobStoreDir())
+	if err != nil {
+		return nil, fmt.Errorf("stat blob store: %w", err)
+	}
+	if vdev != bdev {
+		return nil, fmt.Errorf("%w: views root %s is on device %d, the blob store on %d", ErrCrossVolume, v.root, vdev, bdev)
+	}
 	v.reap(ctx)
 	return v, nil
+}
+
+// deviceOf returns the st_dev of path, not following a final symlink.
+func deviceOf(path string) (uint64, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("%s: no device number", path)
+	}
+	return uint64(st.Dev), nil
 }
 
 // Root returns the views root directory.
@@ -286,6 +343,9 @@ func (v *Views) build(mdir, final string, set []string, files map[string]string)
 		}
 		cow, err := v.cloner.Clone(src, dst)
 		if err != nil {
+			if image.IsCloneUnsupported(err) {
+				return fmt.Errorf("clone %q: %w: %w", p, ErrCrossVolume, err)
+			}
 			return fmt.Errorf("clone %q: %w", p, err)
 		}
 		if !cow {
@@ -320,57 +380,134 @@ func (v *Views) build(mdir, final string, set []string, files map[string]string)
 // other record names its manifest, every view of that manifest. Its blobs
 // become collectable once no record roots them (image.Cache.Roots). A missing
 // record is not an error.
+//
+// The record is removed only if it still names the manifest Forget read, and
+// that check runs under the record's own lock (RecordStore.
+// RemoveArtifactRecordIf), so a concurrent pull that re-puts the key for a new
+// manifest is never undone: Forget then removes nothing and is ordered before
+// that put.
 func (v *Views) Forget(ctx context.Context, ref, artifactType string) error {
 	key := Key(ref, artifactType)
-	all, err := v.allRecords(ctx)
+	raw, ok, err := v.records.ArtifactRecord(ctx, key)
 	if err != nil {
-		return err
+		return fmt.Errorf("read artifact record: %w", err)
 	}
-	var mdigest string
-	for _, r := range all {
-		if r.Key == key {
-			mdigest = r.ManifestDigest
+	if !ok {
+		return nil
+	}
+	mdigest := recordManifest(raw)
+	if mdigest == "" {
+		// A record that names no manifest has no views; remove exactly it.
+		if _, err := v.records.RemoveArtifactRecordIf(ctx, key, func(cur []byte) bool { return bytes.Equal(cur, raw) }); err != nil {
+			return fmt.Errorf("remove artifact record: %w", err)
 		}
-	}
-	if mdigest == "" || !sha256Digest.MatchString(mdigest) {
-		_, err := v.records.RemoveArtifactRecord(ctx, key)
-		return err
+		return nil
 	}
 	mhex := strings.TrimPrefix(mdigest, "sha256:")
 	mu := v.stripe(mhex)
 	mu.Lock()
 	defer mu.Unlock()
-	if _, err := v.records.RemoveArtifactRecord(ctx, key); err != nil {
+	if v.beforeRemove != nil {
+		v.beforeRemove()
+	}
+	removed, err := v.records.RemoveArtifactRecordIf(ctx, key, func(cur []byte) bool { return recordManifest(cur) == mdigest })
+	if err != nil {
 		return fmt.Errorf("remove artifact record: %w", err)
 	}
-	left, err := v.recordsFor(ctx, mdigest)
+	if !removed {
+		v.log.Info("artifact forget: the record was replaced or removed meanwhile; left in place",
+			"key", image.QuoteBounded(key, 512), "manifest", mdigest)
+	}
+	return v.removeIfOrphanLocked(ctx, mhex)
+}
+
+// recordManifest returns the manifest digest a raw record names, or "" when
+// it does not decode to a valid one.
+func recordManifest(raw []byte) string {
+	var r Record
+	if err := json.Unmarshal(raw, &r); err != nil || r.Schema != recordSchema || !sha256Digest.MatchString(r.ManifestDigest) {
+		return ""
+	}
+	return r.ManifestDigest
+}
+
+// SweepOrphans removes the views of every manifest no artifact record names:
+// those of a record replaced for another manifest, or removed other than by
+// Forget. It is the start-up reap's rule, run again by the image prune
+// (image.ReclaimConfig.SweepDerived). Every removal is decided again under the
+// manifest's lock, against a fresh read of the records, so a manifest recorded
+// since the first read keeps its views. A record that does not decode fails
+// the sweep and keeps every view. Staging directories are left alone: outside
+// start-up one may be a build in flight in another process over this store.
+func (v *Views) SweepOrphans(ctx context.Context) error {
+	named, err := v.namedManifests(ctx)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(v.root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read views root: %w", err)
+	}
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		name := e.Name()
+		if !hex64.MatchString(name) || !e.IsDir() || named[name] {
+			continue
+		}
+		if err := v.removeIfOrphan(ctx, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeIfOrphan takes the manifest's lock and removes its views if no record
+// names it.
+func (v *Views) removeIfOrphan(ctx context.Context, mhex string) error {
+	mu := v.stripe(mhex)
+	mu.Lock()
+	defer mu.Unlock()
+	return v.removeIfOrphanLocked(ctx, mhex)
+}
+
+// removeIfOrphanLocked removes the views of mhex if no record names it. The
+// caller holds the manifest's stripe.
+func (v *Views) removeIfOrphanLocked(ctx context.Context, mhex string) error {
+	left, err := v.recordsFor(ctx, "sha256:"+mhex)
 	if err != nil {
 		return err
 	}
 	if len(left) > 0 {
 		return nil
 	}
-	if err := removeTree(filepath.Join(v.root, mhex)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove views of %s: %w", mdigest, err)
+	mdir := filepath.Join(v.root, mhex)
+	if err := removeTree(mdir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove views of sha256:%s: %w", mhex, err)
 	}
+	v.log.Info("artifact views: removed views no record names", "dir", mdir)
 	return nil
 }
 
-// reap removes every staging directory and every manifest directory no
-// record names. It runs once, at daemon start, before any build.
+// reap removes every staging directory, every published view that is not
+// read-only (checkPublished), and every manifest directory no record names.
+// It runs once, at daemon start, before any build.
 func (v *Views) reap(ctx context.Context) {
 	entries, err := os.ReadDir(v.root)
 	if err != nil {
 		v.log.Warn("artifact views: read root for reaping", "err", err)
 		return
 	}
-	named := map[string]bool{}
-	all, lerr := v.allRecords(ctx)
+	named, lerr := v.namedManifests(ctx)
 	if lerr != nil {
 		v.log.Warn("artifact views: records unreadable; keeping every view", "err", lerr)
-	}
-	for _, r := range all {
-		named[strings.TrimPrefix(r.ManifestDigest, "sha256:")] = true
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -380,10 +517,8 @@ func (v *Views) reap(ctx context.Context) {
 			continue
 		}
 		if lerr == nil && !named[name] {
-			if err := removeTree(mdir); err != nil {
+			if err := v.removeIfOrphan(ctx, name); err != nil {
 				v.log.Warn("artifact views: remove orphaned views", "dir", mdir, "err", err)
-			} else {
-				v.log.Info("artifact views: removed views no record names", "dir", mdir)
 			}
 			continue
 		}
@@ -393,17 +528,70 @@ func (v *Views) reap(ctx context.Context) {
 			continue
 		}
 		for _, s := range views {
-			if !strings.HasPrefix(s.Name(), stagePrefix) {
-				continue
-			}
-			stage := filepath.Join(mdir, s.Name())
-			if err := removeTree(stage); err != nil {
-				v.log.Warn("artifact views: reap staging", "dir", stage, "err", err)
-			} else {
-				v.log.Info("artifact views: reaped half-built staging", "dir", stage)
+			p := filepath.Join(mdir, s.Name())
+			switch {
+			case strings.HasPrefix(s.Name(), stagePrefix):
+				if err := removeTree(p); err != nil {
+					v.log.Warn("artifact views: reap staging", "dir", p, "err", err)
+				} else {
+					v.log.Info("artifact views: reaped half-built staging", "dir", p)
+				}
+			case hex64.MatchString(s.Name()):
+				cerr := checkPublished(p)
+				if cerr == nil {
+					continue
+				}
+				if err := removeTree(p); err != nil {
+					v.log.Warn("artifact views: remove a view that is not read-only", "dir", p, "reason", cerr, "err", err)
+				} else {
+					v.log.Warn("artifact views: removed a view that is not read-only; the next use rebuilds it", "dir", p, "reason", cerr)
+				}
+			default:
+				v.log.Warn("artifact views: unexpected entry left in place", "entry", p)
 			}
 		}
 	}
+}
+
+// checkPublished reports why a published view is not what build leaves:
+// directories exactly 0555, regular files exactly 0444, and nothing else (no
+// symlink, no special bit). Nothing is followed.
+func checkPublished(view string) error {
+	return filepath.WalkDir(view, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch m := fi.Mode(); {
+		case m.IsDir():
+			if m != fs.ModeDir|viewDirMode {
+				return fmt.Errorf("directory %s has mode %v, want %v", p, m, fs.ModeDir|viewDirMode)
+			}
+		case m.IsRegular():
+			if m != viewFileMode {
+				return fmt.Errorf("file %s has mode %v, want %v", p, m, fs.FileMode(viewFileMode))
+			}
+		default:
+			return fmt.Errorf("%s is not a file or a directory (mode %v)", p, m.Type())
+		}
+		return nil
+	})
+}
+
+// namedManifests returns the hex of every manifest some record names.
+func (v *Views) namedManifests(ctx context.Context) (map[string]bool, error) {
+	all, err := v.allRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	named := make(map[string]bool, len(all))
+	for _, r := range all {
+		named[strings.TrimPrefix(r.ManifestDigest, "sha256:")] = true
+	}
+	return named, nil
 }
 
 // allRecords decodes every artifact record. A record that does not decode, or
@@ -484,13 +672,20 @@ func manifestFiles(raw []byte, manifestDigest string) (map[string]string, error)
 	return files, nil
 }
 
-// ensurePrivateDir creates dir (0711) when absent and refuses one that is not
-// a directory (a symlink planted in its place included) or is writable by
-// group or other.
+// ensurePrivateDir creates dir at exactly 0711 when absent (Mkdir's mode is
+// filtered by the umask, so it is chmodded after) and refuses one that is not
+// a directory (a symlink planted in its place included, ErrViewsRoot), or is
+// not owned by the daemon's euid or has any other mode (ErrViewsNotOwned). An
+// existing directory is never repaired: a mode or owner this process did not
+// set means someone else touched it.
 func ensurePrivateDir(dir string) error {
 	fi, err := os.Lstat(dir)
 	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.Mkdir(dir, viewParentMode); err != nil && !errors.Is(err, fs.ErrExist) {
+		if err := os.Mkdir(dir, viewParentMode); err == nil {
+			if err := os.Chmod(dir, viewParentMode); err != nil {
+				return fmt.Errorf("chmod %s: %w", dir, err)
+			}
+		} else if !errors.Is(err, fs.ErrExist) {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 		fi, err = os.Lstat(dir)
@@ -501,8 +696,15 @@ func ensurePrivateDir(dir string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("%w: %s is not a directory (mode %v)", ErrViewsRoot, dir, fi.Mode().Type())
 	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%w: %s is writable by group or other (mode %v)", ErrViewsRoot, dir, fi.Mode().Perm())
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%w: %s: no owner", ErrViewsNotOwned, dir)
+	}
+	if euid := os.Geteuid(); int(st.Uid) != euid {
+		return fmt.Errorf("%w: %s is owned by uid %d, not %d", ErrViewsNotOwned, dir, st.Uid, euid)
+	}
+	if want := fs.ModeDir | viewParentMode; fi.Mode() != want {
+		return fmt.Errorf("%w: %s has mode %v, want %v", ErrViewsNotOwned, dir, fi.Mode(), want)
 	}
 	return nil
 }
