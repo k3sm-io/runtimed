@@ -4,13 +4,14 @@
 #
 # Gate for the artifact fetch path: a platform-less OCI artifact is fetched
 # from the cluster registry into the node cache, every blob digest-verified,
-# fail-closed on every rule. Network-free: every test runs over a fake fetcher
+# fail-closed on every rule, then viewed read-only as clones of its blobs, which
+# stay GC roots while its record exists. Network-free: every test runs over a fake fetcher
 # seam (and the image-path pin over an in-process loopback registry).
 #
-# --check runs the fetch-path tests and requires each named test to have run and
-# passed. The view, prune and eviction tests the plan also names are not built
-# yet; they are listed as PENDING, and while any is pending --check exits 3, which
-# is not a pass, even when every built test is green.
+# --check runs the fetch-path, view and lifetime tests and requires each named
+# test to have run and passed. A named test not built yet is listed as PENDING,
+# and while any is pending --check exits 3, which is not a pass, even when every
+# built test is green.
 #
 # Exit 0 pass, 1 fail, 2 usage, 3 PENDING: not a pass.
 #
@@ -57,14 +58,16 @@ BUILT=(
 	"./pkg/runtime/:TestPullArtifactRPCChecksHostBeforeCredentials"
 	"./pkg/runtime/:TestPullArtifactRPCBoundsConcurrency"
 	"./pkg/runtime/:TestPullArtifactRPCBoundsErrorText"
+	"./pkg/artifact/:TestArtifactViewIsCloneNotLink"
+	"./pkg/artifact/:TestArtifactViewRefusesCrossVolume"
+	"./pkg/artifact/:TestArtifactViewKeyedByPathSet"
+	"./pkg/artifact/:TestStaleViewStagingReapedAtStart"
+	"./pkg/artifact/:TestArtifactPartialDirMustBeTheCacheChild"
+	"./pkg/image/:TestPruneKeepsLiveArtifactReclaimsDeadOne"
 )
 
-# Named by the plan, owned by a later step (the view and its lifetime).
-PENDING=(
-	"TestArtifactViewIsCloneNotLink"
-	"TestArtifactViewRefusesCrossVolume"
-	"TestPruneKeepsLiveArtifactReclaimsDeadOne"
-)
+# Named tests not built yet. Empty: every named test is in BUILT.
+PENDING=()
 
 check() {
 	cd "$ROOT"
