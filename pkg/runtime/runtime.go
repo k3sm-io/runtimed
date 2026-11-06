@@ -981,6 +981,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	views, viewsErr := artifact.NewViews(context.Background(), artifact.ViewsConfig{
 		StorePath: cache.Root(),
 		Log:       log,
+		Holds:     index,
 	}, cache, index)
 	if viewsErr != nil {
 		log.Error("artifact views disabled: views root refused", "err", viewsErr)

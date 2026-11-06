@@ -141,9 +141,14 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	if err != nil {
 		return pullRefused(err)
 	}
-	// The lease pins the blobs until the view's clones exist; after that the
-	// artifact record is what keeps them, and the pod's hold keeps the record.
+	// The lease pins the blobs until the pod's hold names the manifest; from
+	// then on the hold keeps the manifest's blobs and views for the pod's life,
+	// even if a moved tag replaces the record that names it.
 	defer res.Lease.Release()
+	if err := r.holdManifest(ctx, box, res); err != nil {
+		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), err)
+	}
 	view, err := r.views.View(ctx, res.ManifestDigest, nil)
 	if err != nil {
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
@@ -182,6 +187,23 @@ func (r *Runtime) holdArtifacts(ctx context.Context, box *runtimev1.PodBox, vols
 	defer r.holdMu.Unlock()
 	if err := r.index.PutArtifactHold(ctx, id, refs); err != nil {
 		return fmt.Errorf("record the pod's artifact hold: %w", err)
+	}
+	return nil
+}
+
+// holdManifest adds the manifest res resolved, with its blobs, to box's pod's
+// hold.
+func (r *Runtime) holdManifest(ctx context.Context, box *runtimev1.PodBox, res *artifact.Result) error {
+	id, err := image.ParsePodID(box.GetPodId())
+	if err != nil {
+		return fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	r.holdMu.Lock()
+	defer r.holdMu.Unlock()
+	if err := r.index.AddArtifactHoldManifest(ctx, id, image.HeldManifest{
+		Digest: res.ManifestDigest, Config: res.ConfigDigest, Layers: res.LayerDigests,
+	}); err != nil {
+		return fmt.Errorf("record the mounted manifest in the pod's hold: %w", err)
 	}
 	return nil
 }
@@ -241,14 +263,14 @@ func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string) {
 		return
 	}
 	held := map[string]bool{}
-	for id, refs := range holds {
+	for id, h := range holds {
 		if r.podUntracked(id) {
 			if err := r.index.RemoveArtifactHold(id); err != nil {
 				r.log.Warn("remove a gone pod's artifact hold", "pod", id.String(), "err", err)
 			}
 			continue
 		}
-		for _, ref := range refs {
+		for _, ref := range h.References {
 			held[ref] = true
 		}
 	}

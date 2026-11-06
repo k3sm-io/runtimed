@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ type lifetimeFixture struct {
 	t      *testing.T
 	rt     *Runtime
 	client runtimev1.ImagesClient
+	fetch  *fakeArtifactFetcher
 	ref    string
 	mdig   string
 	blobs  []string
@@ -52,7 +54,7 @@ func newLifetimeFixture(t *testing.T) *lifetimeFixture {
 	client, rt := artifactRPCClient(t, f)
 	t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
 	return &lifetimeFixture{
-		t: t, rt: rt, client: client,
+		t: t, rt: rt, client: client, fetch: f,
 		ref:   artifactTestHost + "/models/tiny:v1",
 		mdig:  sha(f.manifest),
 		blobs: []string{sha(cfg), sha(w)},
@@ -80,15 +82,23 @@ func (f *lifetimeFixture) delete(podID string) {
 // does an hour from now.
 func (f *lifetimeFixture) prune() {
 	f.t.Helper()
+	if err := f.reclaim(true); err != nil {
+		f.t.Fatalf("prune: %v", err)
+	}
+}
+
+// reclaim runs one reclaim pass an hour from now: forced, as PruneImages
+// runs it, or under disk pressure (free space reads zero), as the daemon's
+// own pass does.
+func (f *lifetimeFixture) reclaim(force bool) error {
 	_, err := f.rt.cache.ReclaimUnderPressure(context.Background(), image.ReclaimConfig{
-		Force:        true,
+		Force:        force,
+		FreeBytes:    func(string) (uint64, error) { return 0, nil },
 		Now:          func() time.Time { return time.Now().Add(time.Hour) },
 		UntrackedPod: f.rt.podUntracked,
 		SweepDerived: f.rt.viewSweeper(),
 	})
-	if err != nil {
-		f.t.Fatalf("prune: %v", err)
-	}
+	return err
 }
 
 // kept reports whether the artifact's record, view and blobs are all present
@@ -180,7 +190,9 @@ func TestImageVolumeLifetimeFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.delete("pod-a")
-	f.prune()
+	if err := f.reclaim(true); err == nil {
+		t.Fatal("a prune ran although the holds could not all be read")
+	}
 	if !f.kept(view) {
 		t.Fatal("the artifact was released although the holds could not all be read")
 	}
@@ -221,5 +233,60 @@ func TestImageVolumeLifetimeStartupRelease(t *testing.T) {
 	f.prune()
 	if f.kept(view) {
 		t.Fatal("a pod that was not re-attached still holds its artifact")
+	}
+}
+
+// TestImageVolumeLifetimeSurvivesAMovedTag pins that a pod keeps the manifest
+// it mounted when its tag moves: pod A mounts tag -> M1, then the tag moves to
+// M2 (a second pod's create or an operator pull replaces the record), and
+// neither a prune nor a pressure reclaim takes M1's view or blobs while A
+// lives. Once A is deleted, the prune takes them.
+func TestImageVolumeLifetimeSurvivesAMovedTag(t *testing.T) {
+	for _, mover := range []string{"second pod", "operator pull"} {
+		t.Run(mover, func(t *testing.T) {
+			f := newLifetimeFixture(t)
+			viewM1 := f.create("pod-a")
+			m1Weights := f.blobs[1]
+
+			m2 := modelArtifact(map[string][]byte{"config.json": []byte(`{}`), "w.safetensors": []byte("weights v2")}, []string{"config.json", "w.safetensors"})
+			f.fetch.manifest = m2.manifest
+			for d, b := range m2.blobs {
+				f.fetch.blobs[d] = b
+			}
+			if mover == "second pod" {
+				if f.create("pod-b") == viewM1 {
+					t.Fatal("the moved tag still resolved to M1")
+				}
+			} else if _, err := f.client.PullArtifact(context.Background(), &runtimev1.PullArtifactRequest{
+				Reference: f.ref, ArtifactPolicy: runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME,
+			}); err != nil {
+				t.Fatalf("PullArtifact: %v", err)
+			}
+			rec, ok, err := f.rt.index.ArtifactRecord(context.Background(), artifact.Key(f.ref, artifactv1.ArtifactTypeModel))
+			if err != nil || !ok || !strings.Contains(string(rec), sha(m2.manifest)) {
+				t.Fatalf("the record does not name M2 after the move (%v, %v)", ok, err)
+			}
+
+			for _, force := range []bool{true, false} {
+				if err := f.reclaim(force); err != nil {
+					t.Fatalf("reclaim (force %v): %v", force, err)
+				}
+				if b, err := os.ReadFile(filepath.Join(viewM1, "w.safetensors")); err != nil || string(b) != "weights" {
+					t.Fatalf("after a reclaim (force %v) pod-a's M1 view reads %q, %v", force, b, err)
+				}
+				if !f.rt.cache.Has(m1Weights) {
+					t.Fatalf("a reclaim (force %v) took M1's weights while pod-a mounts them", force)
+				}
+			}
+
+			f.delete("pod-a")
+			f.prune()
+			if _, err := os.Lstat(viewM1); err == nil {
+				t.Error("M1's view survived the deletion of the only pod that mounted it")
+			}
+			if f.rt.cache.Has(m1Weights) {
+				t.Error("M1's weights survived the deletion of the only pod that mounted them")
+			}
+		})
 	}
 }

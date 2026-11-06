@@ -83,6 +83,13 @@ type RecordStore interface {
 	RemoveArtifactRecordIf(ctx context.Context, key string, match func(record []byte) bool) (bool, error)
 }
 
+// HoldReader reports the manifests pods mount; *image.FileIndex satisfies it.
+type HoldReader interface {
+	// HeldManifests returns the digest of every manifest some pod's artifact
+	// hold names. An error means the holds could not all be read.
+	HeldManifests(ctx context.Context) (map[string]bool, error)
+}
+
 // ViewsConfig configures Views.
 type ViewsConfig struct {
 	// StorePath is the cache root. Views live under
@@ -96,6 +103,10 @@ type ViewsConfig struct {
 	Cloner image.Cloner
 	// Log receives reaping and collection notes. Nil discards.
 	Log *slog.Logger
+	// Holds names the manifests pods mount. Every view of a held manifest is
+	// kept by every removal path, whatever the records say, and a hold set
+	// that cannot be read removes nothing. Nil means no pod holds anything.
+	Holds HoldReader
 
 	// statDev returns the st_dev of a path; nil means stat(2). A test seam.
 	statDev func(path string) (uint64, error)
@@ -112,8 +123,9 @@ type ViewsConfig struct {
 // pod is granted one view directory, never the root, so it cannot reach a
 // staging directory or another model's view.
 //
-// A view exists only while some artifact record names its manifest; Forget
-// removes a record and, with the last record of a manifest, its views. A
+// A view exists only while some artifact record or some pod's hold
+// (ViewsConfig.Holds) names its manifest; Forget removes a record and, with
+// the last record of a manifest no hold names, its views. A
 // record replaced for another manifest, or removed some other way, leaves the
 // old manifest's views to SweepOrphans, which the image prune calls, and to
 // the start-up reap.
@@ -131,6 +143,7 @@ type Views struct {
 	cloner  image.Cloner
 	blobs   BlobPaths
 	records RecordStore
+	holds   HoldReader
 	log     *slog.Logger
 
 	// stripes serialize every build and removal for one manifest (keyed by its
@@ -177,6 +190,7 @@ func NewViews(ctx context.Context, cfg ViewsConfig, blobs BlobPaths, records Rec
 		cloner:  cfg.Cloner,
 		blobs:   blobs,
 		records: records,
+		holds:   cfg.Holds,
 		log:     log,
 	}
 	if err := ensurePrivateDir(v.root); err != nil {
@@ -469,9 +483,9 @@ func recordManifest(raw []byte) string {
 	return r.ManifestDigest
 }
 
-// SweepOrphans removes the views of every manifest no artifact record names:
-// those of a record replaced for another manifest, or removed other than by
-// Forget. It is the start-up reap's rule, run again by the image prune
+// SweepOrphans removes the views of every manifest no artifact record and no
+// pod's hold names: those of a record replaced for another manifest, or
+// removed other than by Forget, once no pod mounts them. It is the start-up reap's rule, run again by the image prune
 // (image.ReclaimConfig.SweepDerived). Every removal is decided again under the
 // manifest's lock, against a fresh read of the records, so a manifest recorded
 // since the first read keeps its views. A record that does not decode fails
@@ -513,8 +527,11 @@ func (v *Views) removeIfOrphan(ctx context.Context, mhex string) error {
 	return v.removeIfOrphanLocked(ctx, mhex)
 }
 
-// removeIfOrphanLocked removes the views of mhex if no record names it. The
-// caller holds the manifest's stripe.
+// removeIfOrphanLocked removes the views of mhex if no record names it and no
+// pod's hold names it: a pod that mounts a manifest whose record a moved tag
+// replaced keeps its view until the pod is gone. Both are read fresh, under
+// the manifest's stripe, which every build takes too. A hold set that cannot
+// be read removes nothing. The caller holds the manifest's stripe.
 func (v *Views) removeIfOrphanLocked(ctx context.Context, mhex string) error {
 	left, err := v.recordsFor(ctx, "sha256:"+mhex)
 	if err != nil {
@@ -522,6 +539,15 @@ func (v *Views) removeIfOrphanLocked(ctx context.Context, mhex string) error {
 	}
 	if len(left) > 0 {
 		return nil
+	}
+	if v.holds != nil {
+		held, err := v.holds.HeldManifests(ctx)
+		if err != nil {
+			return fmt.Errorf("read artifact holds; keeping the views of sha256:%s: %w", mhex, err)
+		}
+		if held["sha256:"+mhex] {
+			return nil
+		}
 	}
 	mdir := filepath.Join(v.root, mhex)
 	if err := removeTree(mdir); err != nil {

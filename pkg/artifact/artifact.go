@@ -267,6 +267,8 @@ type Result struct {
 	ManifestDigest string
 	// ArtifactType is the resolved artifact type.
 	ArtifactType string
+	// ConfigDigest is the manifest's config blob.
+	ConfigDigest string
 	// LayerDigests are the layers committed for the request, in manifest order.
 	LayerDigests []string
 	// Paths are the file paths of LayerDigests, index for index.
@@ -379,7 +381,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	}
 
 	need := []blob{{digest: m.Config.Digest, size: m.Config.Size}}
-	res := &Result{ManifestDigest: mdigest, ArtifactType: typ}
+	res := &Result{ManifestDigest: mdigest, ArtifactType: typ, ConfigDigest: m.Config.Digest}
 	for _, i := range selected {
 		need = append(need, blob{digest: layers[i].Digest, size: layers[i].Size})
 		res.LayerDigests = append(res.LayerDigests, layers[i].Digest)
