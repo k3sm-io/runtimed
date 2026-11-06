@@ -43,12 +43,20 @@ BUILT=(
 	"./pkg/artifact/:TestPullArtifactAtMostTwoLayersAtOnce"
 	"./pkg/artifact/:TestPullArtifactChecksSpaceBeforeFirstByte"
 	"./pkg/artifact/:TestPullArtifactReservationCountsConcurrentPullsAndTemps"
+	"./pkg/artifact/:TestPullArtifactRefusesHostileLayerSizes"
+	"./pkg/artifact/:TestSpaceArithmeticRefusesOverflow"
+	"./pkg/artifact/:TestPullArtifactBoundsErrorText"
+	"./pkg/artifact/:TestRegistryFetcherManifestReadIsBounded"
+	"./pkg/artifact/:TestRecordConcurrentSubsetsKeepEveryLayer"
 	"./pkg/runtime/:TestImagePathStillRefusesArtifact"
 	"./pkg/runtime/:TestImagesServiceServesOnlyCacheVerbs"
 	"./pkg/runtime/:TestPullArtifactRPCServesThroughThePuller"
 	"./pkg/runtime/:TestPullArtifactRPCRefusesSwappedByte"
 	"./pkg/runtime/:TestPullArtifactRPCRefusals"
 	"./pkg/runtime/:TestPullArtifactRefusedWithoutClusterRegistry"
+	"./pkg/runtime/:TestPullArtifactRPCChecksHostBeforeCredentials"
+	"./pkg/runtime/:TestPullArtifactRPCBoundsConcurrency"
+	"./pkg/runtime/:TestPullArtifactRPCBoundsErrorText"
 )
 
 # Named by the plan, owned by a later step (the view and its lifetime).
