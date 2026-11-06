@@ -58,6 +58,11 @@ const (
 	MaxArtifactBytes int64 = 1 << 40
 	// DefaultMaxConcurrentLayers is how many layers transfer at once.
 	DefaultMaxConcurrentLayers = 2
+	// DefaultStallTimeout is how long a blob transfer may go without one byte
+	// arriving, from the request to the end of the body, before it fails. It is
+	// an idle bound, never a deadline: a transfer that keeps moving runs as
+	// long as it needs (a 40 GB model over a slow link takes many minutes).
+	DefaultStallTimeout = 60 * time.Second
 )
 
 // Media types the manifest-level checks name.
@@ -90,6 +95,7 @@ var (
 	ErrPathNotInArtifact  = errors.New("artifact: requested path is not in the artifact")
 	ErrInsufficientSpace  = errors.New("artifact: refusing the pull, the store volume would fall below its free-space floor")
 	ErrBlobTransfer       = errors.New("artifact: blob transfer failed")
+	ErrBlobStalled        = errors.New("artifact: blob transfer stalled, no byte arrived within the stall timeout")
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
@@ -151,8 +157,21 @@ type Config struct {
 	FloorBytes uint64
 	// MaxConcurrentLayers bounds layer transfers. Zero means 2.
 	MaxConcurrentLayers int
+	// StallTimeout fails a blob transfer that receives no byte for this long
+	// (ErrBlobStalled, which is also ErrBlobTransfer, so a retry resumes it).
+	// Zero means DefaultStallTimeout.
+	StallTimeout time.Duration
 	// Log receives progress. Nil discards.
 	Log *slog.Logger
+
+	// afterFunc arms the stall timer; nil means time.AfterFunc. A test seam.
+	afterFunc func(d time.Duration, f func()) idleTimer
+}
+
+// idleTimer is the part of *time.Timer the stall watchdog uses.
+type idleTimer interface {
+	Reset(d time.Duration) bool
+	Stop() bool
 }
 
 // Deps are the seams a Puller consumes.
@@ -204,6 +223,12 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 	}
 	if cfg.MaxConcurrentLayers <= 0 {
 		cfg.MaxConcurrentLayers = DefaultMaxConcurrentLayers
+	}
+	if cfg.StallTimeout <= 0 {
+		cfg.StallTimeout = DefaultStallTimeout
+	}
+	if cfg.afterFunc == nil {
+		cfg.afterFunc = func(d time.Duration, f func()) idleTimer { return time.AfterFunc(d, f) }
 	}
 	log := cfg.Log
 	if log == nil {

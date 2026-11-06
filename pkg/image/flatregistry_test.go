@@ -435,3 +435,21 @@ func TestFlatRegistryFetchRefusesAnotherRegistry(t *testing.T) {
 		t.Fatalf("fetch of a foreign reference = %v, want a refusal", err)
 	}
 }
+
+// TestArtifactTransportBoundsResponseHeaders pins the flat-registry
+// transport's header bound: a registry that accepts a request and never
+// answers fails it, while the body has no deadline at all (no client timeout
+// exists on this path, so a long blob streams to completion).
+func TestArtifactTransportBoundsResponseHeaders(t *testing.T) {
+	rt, _, err := ArtifactTransport(FlatRegistry{Host: flatHost, Endpoint: RegistryEndpoint{Addr: "127.0.0.1:6450"}})
+	if err != nil {
+		t.Fatalf("ArtifactTransport: %v", err)
+	}
+	tr, ok := rt.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", rt)
+	}
+	if tr.ResponseHeaderTimeout != flatRegistryResponseHeaderTimeout || tr.ResponseHeaderTimeout <= 0 {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, flatRegistryResponseHeaderTimeout)
+	}
+}
