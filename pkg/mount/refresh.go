@@ -217,6 +217,8 @@ func skipReason(pm plannedMount, st RefreshState) string {
 		return "emptyDir has no source to refresh"
 	case classOther:
 		return "source is not refreshable"
+	case classImage:
+		return "an image volume is a read-only artifact view"
 	}
 	if st.Immutable[pm.mount.GetName()] {
 		return "every source is immutable"

@@ -147,11 +147,17 @@ const (
 	// classOther is any other source (hostPath, or none this materializer
 	// knows). Materialize renders it flat, which refuses it; Refresh skips it.
 	classOther
+	// classImage is an image volume (an OCI artifact's read-only view), with or
+	// without a subPath. Materialize skips it, as it skips a PVC: the view is
+	// linked into place by LinkImageVolumes, never rendered into the pod.
+	classImage
 )
 
 // classify returns vol's mountClass for a mount selecting subPath.
 func classify(vol *runtimev1.Volume, subPath string) mountClass {
 	switch {
+	case vol.GetImage() != nil:
+		return classImage
 	case subPath != "":
 		return classSubPath
 	case vol.GetEmptyDir() != nil:
@@ -249,7 +255,9 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 // that names no PodBox.volume, or whose mount path would escape the data volume,
 // is rejected (fail closed). A persistentVolumeClaim mount is SKIPPED here — it is
 // durable and lifecycle-decoupled, bound by pkg/volume to a stable dir outside the
-// pod tree, not materialized into the pod data volume.
+// pod tree, not materialized into the pod data volume. An image volume mount is
+// skipped too (it takes part in the conflict guard): LinkImageVolumes links its
+// read-only view into place.
 func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP string, r Resolver) (*Layout, error) {
 	dataVol = filepath.Clean(dataVol)
 	plans, err := planMounts(box, dataVol)
@@ -259,6 +267,9 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 
 	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}}}
 	for _, pm := range plans {
+		if pm.class == classImage {
+			continue // linked by LinkImageVolumes, never materialized
+		}
 		var credential bool
 		switch pm.class {
 		case classSubPath:

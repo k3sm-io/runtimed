@@ -48,6 +48,11 @@ const (
 	// the volume's index in sorted-volume-name order among the pod's PVC
 	// volumes.
 	ShareTagPVCPrefix = "k3sm.pvc"
+	// ShareTagImagePrefix prefixes the per-image-volume share tags:
+	// "k3sm.img<i>" with i the volume's index in sorted-volume-name order among
+	// the pod's image volumes that have a view. Each exports one read-only
+	// artifact view directory.
+	ShareTagImagePrefix = "k3sm.img"
 )
 
 // vmRootfsDirName / vmProjDirName / vmVolsDirName are the fixed on-disk
@@ -86,7 +91,8 @@ type SharePlan struct {
 	// Shares are the virtiofs share devices in deterministic order: rootfs,
 	// proj, vols (each of the pooled shares emitted only when a declared
 	// volume of its class exists; rootfs always), then one share per PVC
-	// volume in sorted-volume-name order.
+	// volume in sorted-volume-name order, then one read-only share per image
+	// volume view in sorted-volume-name order.
 	Shares []Share
 	// Binds are the per-container share-backed binds, keyed by CONTAINER NAME
 	// (init and main containers alike, each container's own declared
@@ -171,6 +177,17 @@ type Tmpfs struct {
 // relocated tree. It is pure data: no filesystem access, no chown. Any box
 // the planner cannot prove safe is rejected with an error (fail closed).
 func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class storagev1.LocalPathClass) (SharePlan, error) {
+	return ComputeSharePlanWithViews(box, podDir, workRoot, class, ImageViews{})
+}
+
+// ComputeSharePlanWithViews is ComputeSharePlan for a pod with image volumes:
+// views names the read-only artifact view built for each mounted image volume.
+// Each view becomes one share whose Writable is false, and every bind of it is
+// read-only whatever the volumeMount says. A mounted image volume with no
+// view, a view that is not exactly <views.Root>/<manifest>/<paths>, or a views
+// root outside workRoot is refused. An image volume no container mounts gets
+// no share.
+func ComputeSharePlanWithViews(box *runtimev1.PodBox, podDir, workRoot string, class storagev1.LocalPathClass, views ImageViews) (SharePlan, error) {
 	if box == nil {
 		return SharePlan{}, errors.New("nil pod box")
 	}
@@ -189,7 +206,7 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 	// container mounting it.
 	vols := make(map[string]vmVolume, len(box.GetVolumes()))
 	haveProj, haveVols := false, false
-	var pvcNames []string
+	var pvcNames, imageNames []string
 	for _, v := range box.GetVolumes() {
 		name := v.GetName()
 		if name == "" {
@@ -210,6 +227,10 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 			haveVols = true
 		case vmClassPVC:
 			pvcNames = append(pvcNames, name)
+		case vmClassImage:
+			if _, ok := views.ByVolume[name]; ok {
+				imageNames = append(imageNames, name)
+			}
 		}
 	}
 
@@ -257,6 +278,20 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 		tag := fmt.Sprintf("%s%d", ShareTagPVCPrefix, i)
 		pvcTags[name] = tag
 		shares = append(shares, Share{Tag: tag, Root: root, Writable: !src.GetReadOnly()})
+	}
+	imageStart := len(shares)
+	sort.Strings(imageNames)
+	imageTags := make(map[string]string, len(imageNames))
+	for i, name := range imageNames {
+		root, err := views.view(name)
+		if err != nil {
+			return SharePlan{}, err
+		}
+		tag := fmt.Sprintf("%s%d", ShareTagImagePrefix, i)
+		imageTags[name] = tag
+		// Writable stays false: a view is read-only on the device, whatever
+		// any volumeMount asks for.
+		shares = append(shares, Share{Tag: tag, Root: root})
 	}
 
 	// Binds and tmpfs per container — init and main lists alike, each keyed by
@@ -313,6 +348,18 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 					SizeLimit:  info.vol.GetEmptyDir().GetSizeLimit(),
 					ReadOnly:   m.GetReadOnly(),
 				})
+			case vmClassImage:
+				tag, ok := imageTags[m.GetName()]
+				if !ok {
+					return SharePlan{}, fmt.Errorf("container %s: image volume %s has no view", cname, m.GetName())
+				}
+				binds[cname] = append(binds[cname], Bind{
+					VolumeName: m.GetName(),
+					ShareTag:   tag,
+					MountPath:  mp,
+					SubPath:    sp,
+					ReadOnly:   true,
+				})
 			case vmClassPVC:
 				binds[cname] = append(binds[cname], Bind{
 					VolumeName: m.GetName(),
@@ -340,7 +387,7 @@ func ComputeSharePlan(box *runtimev1.PodBox, podDir, workRoot string, class stor
 		}
 	}
 
-	if err := guardShareRoots(shares, podDirShares, podDir, workRoot, class.BasePath); err != nil {
+	if err := guardShareRoots(shares, podDirShares, imageStart, podDir, workRoot, class.BasePath, views.Root); err != nil {
 		return SharePlan{}, err
 	}
 	if len(binds) == 0 {
@@ -366,6 +413,9 @@ const (
 	vmClassTmpfs
 	// vmClassPVC — persistentVolumeClaim, one share per volume.
 	vmClassPVC
+	// vmClassImage — an image volume: one read-only share of its artifact
+	// view per volume.
+	vmClassImage
 )
 
 // vmVolume is one classified declared volume.
@@ -383,9 +433,9 @@ type vmVolume struct {
 // classifyVMVolume ARITY-CHECKS a declared volume's source union and
 // classifies the single set source. The union is not a proto oneof, so the
 // dispatch COUNTS the set sources across the known source getters (proto
-// fields 2–7) and rejects anything but exactly one:
+// fields 2–7 and 9) and rejects anything but exactly one:
 //
-//   - a FUTURE source field (host_path = 8, and 9, 10, … after it) is unknown
+//   - a FUTURE source field (host_path = 8, and 10, … after 9) is unknown
 //     to this build, sets none of the known getters, and lands in the
 //     count == 0 reject BY construction — where a first-match dispatch would
 //     silently plan an empty/wrong device for it (fail open);
@@ -400,6 +450,7 @@ func classifyVMVolume(v *runtimev1.Volume) (vmVolume, error) {
 		v.GetDownwardApi() != nil,
 		v.GetProjected() != nil,
 		v.GetPersistentVolumeClaim() != nil,
+		v.GetImage() != nil,
 	} {
 		if set {
 			count++
@@ -431,6 +482,11 @@ func classifyVMVolume(v *runtimev1.Volume) (vmVolume, error) {
 		}
 	case v.GetPersistentVolumeClaim() != nil:
 		info.class = vmClassPVC
+	case v.GetImage() != nil:
+		if n := len(v.GetImage().GetPaths()); n > 0 {
+			return vmVolume{}, fmt.Errorf("%w (it names %d paths)", ErrImageVolumePaths, n)
+		}
+		info.class = vmClassImage
 	}
 	return info, nil
 }
@@ -499,7 +555,9 @@ func validateVMPathComponent(field, v string) error {
 
 // guardShareRoots is the fail-closed defence-in-depth over the assembled share
 // roots. shares[:podDirShares] are the pod-dir shares (Join(podDir, <fixed
-// literal>)); the rest are PVC shares (the class DataDir join).
+// literal>)); shares[podDirShares:imageStart] are PVC shares (the class
+// DataDir join); the rest are image view shares, each exactly one view under
+// viewsRoot, which must itself sit strictly inside workRoot.
 //
 // The comparisons are LEXICAL — no filepath.EvalSymlinks — and that is SOUND
 // here only because of a load-bearing precondition: every compared path
@@ -511,7 +569,7 @@ func validateVMPathComponent(field, v string) error {
 // derivation cannot disagree about firmlink/symlink spellings (/var vs
 // /private/var), which is the case lexical comparison cannot judge. Keep that
 // precondition true when extending the planner.
-func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePath string) error {
+func guardShareRoots(shares []Share, podDirShares, imageStart int, podDir, workRoot, basePath, viewsRoot string) error {
 	// The pod dir must itself sit strictly inside the runtime pod tree
 	// <workRoot>/pods before it may anchor any share root. The three pod-dir
 	// roots are Join(podDir, <fixed literal>) — strictly under podDir BY
@@ -533,6 +591,16 @@ func guardShareRoots(shares []Share, podDirShares int, podDir, workRoot, basePat
 			// this uses IsStrictlyUnder and not isUnder (equality-true).
 			if !IsStrictlyUnder(s.Root, podDir) {
 				return fmt.Errorf("share %s root %q escapes the pod dir %q", s.Tag, s.Root, podDir)
+			}
+		} else if i >= imageStart {
+			if s.Writable {
+				return fmt.Errorf("share %s exports an image view writable", s.Tag)
+			}
+			if !IsStrictlyUnder(viewsRoot, workRoot) || isUnder(viewsRoot, podsRoot) || isUnder(podsRoot, viewsRoot) {
+				return fmt.Errorf("share %s: views root %q is not a work-root tree apart from the pods root %q", s.Tag, viewsRoot, podsRoot)
+			}
+			if err := CheckView(viewsRoot, s.Root); err != nil {
+				return fmt.Errorf("share %s: %w", s.Tag, err)
 			}
 		} else {
 			// A PVC root is already re-derivation-asserted at build time
