@@ -319,10 +319,25 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 
 // transfer appends the rest of b to f from offset have. A failure leaves what
 // arrived in f, synced, for the next attempt to resume.
+//
+// A watchdog cancels the transfer when no byte arrives for the stall timeout,
+// from the request through the last read of the body; every byte re-arms it.
+// There is no overall deadline: a transfer that keeps moving is never cut off.
 func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, f *os.File, have int64) error {
-	body, start, err := p.deps.Fetcher.Blob(ctx, ref, cred, b.digest, have)
+	tctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := p.cfg.StallTimeout
+	timer := p.cfg.afterFunc(stall, func() { cancel(ErrBlobStalled) })
+	defer timer.Stop()
+	stalled := func(at int64, err error) error {
+		if ctx.Err() == nil && errors.Is(context.Cause(tctx), ErrBlobStalled) {
+			return fmt.Errorf("fetch %s at %d: no byte for %v: %w: %w", b.digest, at, stall, ErrBlobTransfer, ErrBlobStalled)
+		}
+		return err
+	}
+	body, start, err := p.deps.Fetcher.Blob(tctx, ref, cred, b.digest, have)
 	if err != nil {
-		return fmt.Errorf("fetch %s from %d: %w: %w", b.digest, have, ErrBlobTransfer, bound(err))
+		return stalled(have, fmt.Errorf("fetch %s from %d: %w: %w", b.digest, have, ErrBlobTransfer, bound(err)))
 	}
 	defer body.Close()
 	switch {
@@ -339,14 +354,15 @@ func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryC
 	if _, err := f.Seek(have, io.SeekStart); err != nil {
 		return fmt.Errorf("seek partial %s: %w", b.digest, err)
 	}
-	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(body, b.size-have+1))
+	progress := &progressReader{r: body, moved: func() { timer.Reset(stall) }}
+	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(progress, b.size-have+1))
 	serr := f.Sync()
 	if have+n > b.size {
 		_ = f.Truncate(0) // an overrun is the server's fault; restart clean
 		return fmt.Errorf("fetch %s: more than %d bytes: %w", b.digest, b.size, image.ErrBlobTooLarge)
 	}
 	if cerr != nil {
-		return fmt.Errorf("fetch %s at %d: %w: %w", b.digest, have+n, ErrBlobTransfer, bound(cerr))
+		return stalled(have+n, fmt.Errorf("fetch %s at %d: %w: %w", b.digest, have+n, ErrBlobTransfer, bound(cerr)))
 	}
 	if serr != nil {
 		return fmt.Errorf("sync partial %s: %w", b.digest, serr)
@@ -355,4 +371,18 @@ func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryC
 		return fmt.Errorf("fetch %s: body ended at %d of %d: %w", b.digest, have+n, b.size, ErrBlobTransfer)
 	}
 	return nil
+}
+
+// progressReader calls moved after every read that returned bytes.
+type progressReader struct {
+	r     io.Reader
+	moved func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.moved()
+	}
+	return n, err
 }

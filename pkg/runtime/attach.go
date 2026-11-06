@@ -524,8 +524,9 @@ func attachableContainers(box *runtimev1.PodBox) []*runtimev1.Container {
 
 // boxProfile compiles a host-process pod's SBPL profile from its spec alone,
 // through the pure halves of the create-time volume work: mount.CredentialPaths
-// for the credential read-only sub-scope and volume.Binder.Plan for the PV
-// read/write scope, then compileProfile — the derivation createPod feeds from
+// for the credential read-only sub-scope, volume.Binder.Plan for the PV
+// read/write scope and the image volumes' links for their view grants
+// (linkedImageViews), then compileProfile — the derivation createPod feeds from
 // Materialize and Bind. Nothing is rendered, bound or created.
 func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
 	rootfs, err := r.rootfsPath(box)
@@ -550,7 +551,11 @@ func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
 			pvWrite = append(pvWrite, bd.DataDir)
 		}
 	}
-	return r.compileProfile(box, rootfs, box.GetPodIp(), credPaths, pvWrite, pvRead)
+	views, err := r.linkedImageViews(box, rootfs)
+	if err != nil {
+		return "", err
+	}
+	return r.compileProfile(box, rootfs, box.GetPodIp(), credPaths, pvWrite, pvRead, views)
 }
 
 // isSidecarSpec reports whether an init-list container is a native sidecar

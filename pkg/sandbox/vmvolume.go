@@ -30,7 +30,8 @@ package sandbox
 type VMVolumePlan struct {
 	// Shares are the virtiofs share devices, in the plan's deterministic order
 	// (rootfs, proj, vols, then one share per PVC volume in sorted-volume-name
-	// order).
+	// order, then one share per image volume, each exporting that volume's
+	// read-only artifact view with Writable false).
 	Shares []VMShare
 	// Binds are the per-container volume binds, keyed by CONTAINER NAME (init
 	// and main containers alike). A container absent from the map mounts no
@@ -67,7 +68,7 @@ type VMShare struct {
 	Root string
 	// Writable marks the share host-writable via the VZ device config; the
 	// zero value is read-only (fail-closed). See the type doc for the
-	// enforcement point.
+	// enforcement point. An image volume's view share is never writable.
 	Writable bool
 }
 

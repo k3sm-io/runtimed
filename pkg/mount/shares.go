@@ -80,7 +80,8 @@ const (
 //
 //   - PVC shares are skipped entirely. Their roots are durable and
 //     lifecycle-decoupled; pkg/volume owns creating and seeding them, exactly
-//     as Materialize documents for the native spine.
+//     as Materialize documents for the native spine. Image view shares are
+//     skipped too: the view is built, read-only, before the plan is computed.
 //   - A bind's SubPath is NOT applied here. The guest composes the bind source
 //     as <shareRoot>/<SourceRel>/<SubPath> (sandbox.guestMounts), so the host
 //     renders the WHOLE volume at <shareRoot>/<SourceRel> and the guest selects
@@ -109,6 +110,9 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string
 	for _, s := range plan.Shares {
 		if strings.HasPrefix(s.Tag, ShareTagPVCPrefix) {
 			continue // pkg/volume owns a PVC's data dir
+		}
+		if strings.HasPrefix(s.Tag, ShareTagImagePrefix) {
+			continue // the artifact view is built by the daemon, read-only
 		}
 		if s.Root == "" {
 			return fmt.Errorf("share %s has an empty root", s.Tag)
@@ -148,7 +152,7 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string
 		for _, b := range plan.Binds[cname] {
 			root, ok := roots[b.ShareTag]
 			if !ok {
-				continue // a PVC share (skipped above); pkg/volume owns it
+				continue // a PVC or image view share (skipped above)
 			}
 			// SourceRel is the volume name and becomes a path component here,
 			// so it is validated where it turns into one. The planner does not

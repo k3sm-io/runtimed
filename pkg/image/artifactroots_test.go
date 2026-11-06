@@ -219,3 +219,65 @@ func TestArtifactRootsNameCorruptRecord(t *testing.T) {
 		t.Errorf("Roots err %q does not name the record %s", err, name)
 	}
 }
+
+// TestArtifactHoldRootsKeepHeldBlobs pins the hold half of the root set: a
+// manifest a pod's hold names keeps its blobs with no artifact record at all
+// (the record a moved tag replaced), they go once the hold does, and a hold
+// the store cannot read aborts the root set rather than drop them.
+func TestArtifactHoldRootsKeepHeldBlobs(t *testing.T) {
+	f := newGCFixture(t)
+	x, err := NewFileIndex(f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := f.blob("held config", time.Hour)
+	layer := f.blob("held weights", time.Hour)
+	manifest := f.blob("held manifest", time.Hour)
+	id, err := ParsePodID("pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := x.AddArtifactHoldReferences(ctx, id, []string{"reg/m:v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.AddArtifactHoldManifest(ctx, id, HeldManifest{Digest: manifest, Config: cfg, Layers: []string{layer}}); err != nil {
+		t.Fatal(err)
+	}
+	free := &fakeFree{free: []uint64{0}}
+	reclaim := func() error {
+		_, err := f.cache.ReclaimUnderPressure(ctx, ReclaimConfig{Force: true, Grace: time.Minute, FreeBytes: free.sample})
+		return err
+	}
+	if err := reclaim(); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	for _, d := range []string{cfg, layer} {
+		if !f.exists(d) {
+			t.Errorf("held blob %s was reclaimed", d)
+		}
+	}
+
+	junk := filepath.Join(x.dir, ArtifactHoldIndexSubdir, "pod-b.json")
+	if err := os.WriteFile(junk, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaim(); !errors.Is(err, ErrRootsIncomplete) {
+		t.Fatalf("reclaim with an unreadable hold = %v, want ErrRootsIncomplete", err)
+	}
+	if err := os.Remove(junk); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := x.RemoveArtifactHold(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaim(); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	for _, d := range []string{cfg, layer} {
+		if f.exists(d) {
+			t.Errorf("blob %s survived the end of its hold", d)
+		}
+	}
+}

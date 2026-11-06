@@ -58,6 +58,13 @@ const (
 	MaxArtifactBytes int64 = 1 << 40
 	// DefaultMaxConcurrentLayers is how many layers transfer at once.
 	DefaultMaxConcurrentLayers = 2
+	// DefaultStallTimeout is how long a blob transfer may go without one byte
+	// arriving, from the request (the response headers included) to the end of
+	// the body, before it fails. It is an idle bound, never a deadline: a
+	// transfer that keeps moving runs as long as it needs (a 40 GB model over a
+	// slow link takes many minutes). A manifest, at most MaxManifestBytes, must
+	// arrive whole within it.
+	DefaultStallTimeout = 60 * time.Second
 )
 
 // Media types the manifest-level checks name.
@@ -90,6 +97,8 @@ var (
 	ErrPathNotInArtifact  = errors.New("artifact: requested path is not in the artifact")
 	ErrInsufficientSpace  = errors.New("artifact: refusing the pull, the store volume would fall below its free-space floor")
 	ErrBlobTransfer       = errors.New("artifact: blob transfer failed")
+	ErrBlobStalled        = errors.New("artifact: blob transfer stalled, no byte arrived within the stall timeout")
+	ErrManifestStalled    = errors.New("artifact: manifest fetch did not complete within the stall timeout")
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
@@ -151,8 +160,21 @@ type Config struct {
 	FloorBytes uint64
 	// MaxConcurrentLayers bounds layer transfers. Zero means 2.
 	MaxConcurrentLayers int
+	// StallTimeout fails a blob transfer that receives no byte for this long
+	// (ErrBlobStalled, which is also ErrBlobTransfer, so a retry resumes it).
+	// Zero means DefaultStallTimeout.
+	StallTimeout time.Duration
 	// Log receives progress. Nil discards.
 	Log *slog.Logger
+
+	// afterFunc arms the stall timer; nil means time.AfterFunc. A test seam.
+	afterFunc func(d time.Duration, f func()) idleTimer
+}
+
+// idleTimer is the part of *time.Timer the stall watchdog uses.
+type idleTimer interface {
+	Reset(d time.Duration) bool
+	Stop() bool
 }
 
 // Deps are the seams a Puller consumes.
@@ -205,6 +227,12 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 	if cfg.MaxConcurrentLayers <= 0 {
 		cfg.MaxConcurrentLayers = DefaultMaxConcurrentLayers
 	}
+	if cfg.StallTimeout <= 0 {
+		cfg.StallTimeout = DefaultStallTimeout
+	}
+	if cfg.afterFunc == nil {
+		cfg.afterFunc = func(d time.Duration, f func()) idleTimer { return time.AfterFunc(d, f) }
+	}
 	log := cfg.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -242,6 +270,8 @@ type Result struct {
 	ManifestDigest string
 	// ArtifactType is the resolved artifact type.
 	ArtifactType string
+	// ConfigDigest is the manifest's config blob.
+	ConfigDigest string
 	// LayerDigests are the layers committed for the request, in manifest order.
 	LayerDigests []string
 	// Paths are the file paths of LayerDigests, index for index.
@@ -280,7 +310,22 @@ type blob struct {
 // allow-set policy selects, restricted to paths when non-empty, and records it
 // once every requested blob is committed. It is idempotent: blobs already
 // cached are not fetched again.
+//
+// It is the operator's pull: the record it writes is pinned (Record.PodOnly
+// false) and stays a root until it is removed (Views.Forget).
 func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
+	return p.pull(ctx, ref, cred, policy, paths, false)
+}
+
+// PullForPod is PullArtifact for a pod's image volume. The record it writes is
+// PodOnly unless the operator already pinned the key, so it is released when
+// no pod holds the reference any more (Views.ReleasePodOnly). It never unpins
+// an operator's record.
+func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
+	return p.pull(ctx, ref, cred, policy, paths, true)
+}
+
+func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, podOnly bool) (*Result, error) {
 	allow, err := artifactv1.AllowSetFor(policy)
 	if err != nil {
 		return nil, err
@@ -294,9 +339,9 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 		return nil, err
 	}
 
-	raw, served, err := p.deps.Fetcher.Manifest(ctx, ref, cred)
+	raw, served, err := p.fetchManifest(ctx, ref, cred)
 	if err != nil {
-		return nil, fmt.Errorf("fetch manifest %s: %w", image.QuoteBounded(ref, 512), bound(err))
+		return nil, err
 	}
 	if len(raw) > MaxManifestBytes {
 		return nil, fmt.Errorf("manifest of %d bytes, at most %d: %w", len(raw), MaxManifestBytes, ErrManifestTooLarge)
@@ -339,7 +384,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 	}
 
 	need := []blob{{digest: m.Config.Digest, size: m.Config.Size}}
-	res := &Result{ManifestDigest: mdigest, ArtifactType: typ}
+	res := &Result{ManifestDigest: mdigest, ArtifactType: typ, ConfigDigest: m.Config.Digest}
 	for _, i := range selected {
 		need = append(need, blob{digest: layers[i].Digest, size: layers[i].Size})
 		res.LayerDigests = append(res.LayerDigests, layers[i].Digest)
@@ -380,7 +425,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 		}
 		res.Fetched = true
 	}
-	if err := p.record(ctx, ref, typ, mdigest, raw, m.Config.Digest, res.LayerDigests); err != nil {
+	if err := p.record(ctx, ref, typ, mdigest, raw, m.Config.Digest, res.LayerDigests, podOnly); err != nil {
 		return nil, err
 	}
 	p.log.Info("artifact pulled", "reference", ref, "digest", mdigest, "type", typ,
@@ -388,6 +433,26 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 	res.Lease = lease
 	ok = true
 	return res, nil
+}
+
+// fetchManifest fetches ref's manifest under the stall timeout as a whole: a
+// manifest is at most MaxManifestBytes, so a registry that has not answered
+// with all of it by then is stalled (ErrManifestStalled, also ErrBlobTransfer,
+// so a retry is invited). The blob transfers carry their own idle bound.
+func (p *Puller) fetchManifest(ctx context.Context, ref string, cred *image.RegistryCredential) ([]byte, string, error) {
+	mctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := p.cfg.StallTimeout
+	timer := p.cfg.afterFunc(stall, func() { cancel(ErrManifestStalled) })
+	defer timer.Stop()
+	raw, served, err := p.deps.Fetcher.Manifest(mctx, ref, cred)
+	if err == nil {
+		return raw, served, nil
+	}
+	if ctx.Err() == nil && errors.Is(context.Cause(mctx), ErrManifestStalled) {
+		return nil, "", fmt.Errorf("fetch manifest %s: not complete within %v: %w: %w", image.QuoteBounded(ref, 512), stall, ErrBlobTransfer, ErrManifestStalled)
+	}
+	return nil, "", fmt.Errorf("fetch manifest %s: %w", image.QuoteBounded(ref, 512), bound(err))
 }
 
 // CheckHost refuses a reference whose registry is not the cluster registry.
@@ -580,12 +645,19 @@ type Record struct {
 	ManifestRaw    []byte   `json:"manifestRaw"`
 	ConfigDigest   string   `json:"configDigest"`
 	LayerDigests   []string `json:"layerDigests"`
+	// PodOnly marks a record only pods' image volumes asked for. It is
+	// released when no pod holds its reference (Views.ReleasePodOnly). A
+	// record without it, every record an operator pull wrote or touched and
+	// every record older than the field, is pinned.
+	PodOnly bool `json:"podOnly,omitempty"`
 }
 
 // record writes the artifact record. A previous record of the same manifest
 // keeps its committed layers (a later subset pull widens, never narrows, what
-// the record names); a record of another manifest is replaced.
-func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byte, config string, layers []string) error {
+// the record names); a record of another manifest is replaced. A pinned key
+// stays pinned: podOnly holds only if the previous record, of any manifest,
+// was PodOnly too, and an unreadable previous record pins.
+func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byte, config string, layers []string, podOnly bool) error {
 	key := Key(ref, typ)
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key)) // hash.Hash.Write never returns an error
@@ -593,14 +665,19 @@ func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byt
 	mu.Lock()
 	defer mu.Unlock()
 	have := append([]string(nil), layers...)
-	if old, ok, err := p.LookupRecord(ctx, ref, typ); err == nil && ok && old.ManifestDigest == mdigest {
+	old, ok, err := p.LookupRecord(ctx, ref, typ)
+	if err == nil && ok && old.ManifestDigest == mdigest {
 		have = append(have, old.LayerDigests...)
+	}
+	if err != nil || (ok && !old.PodOnly) {
+		podOnly = false
 	}
 	sort.Strings(have)
 	have = slices.Compact(have)
 	buf, err := json.Marshal(Record{
 		Schema: recordSchema, Key: key, Reference: ref, ArtifactType: typ,
 		ManifestDigest: mdigest, ManifestRaw: raw, ConfigDigest: config, LayerDigests: have,
+		PodOnly: podOnly,
 	})
 	if err != nil {
 		return fmt.Errorf("encode artifact record: %w", err)

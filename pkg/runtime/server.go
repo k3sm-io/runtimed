@@ -77,6 +77,7 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	if err != nil {
 		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", err)
 		_ = r.removePodDir(box.GetPodId())
+		r.releasePodArtifacts(ctx, box, 1)
 		return createFailure(reason, err), nil
 	}
 
@@ -121,7 +122,10 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	}
 	r.mu.Unlock()
 	if !ok {
-		return &runtimev1.DeletePodResponse{}, nil // idempotent
+		// Idempotent. A pod this daemon does not hold (one not re-attached
+		// after a restart) may still have an artifact hold; its delete ends it.
+		r.releaseArtifactHolds(context.WithoutCancel(ctx), req.GetPodId(), 0)
+		return &runtimev1.DeletePodResponse{}, nil
 	}
 
 	// Stop the memory sampler: the pod is going away. The read takes p.mu —
@@ -205,6 +209,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		if err := r.removePodDir(req.GetPodId()); err != nil {
 			r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 		}
+		r.releasePodArtifacts(ctx, p.box, 0)
 		return &runtimev1.DeletePodResponse{}, nil
 	}
 
@@ -381,6 +386,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// not touch them) have served their purpose, except a record whose
 	// container's tree left survivors, which is kept naming them.
 	r.retirePodReapRecords(req.GetPodId(), survivors)
+	r.releasePodArtifacts(ctx, p.box, 0)
 	p.mu.Lock()
 	shimDirs := p.shimDirs
 	p.mu.Unlock()
@@ -738,7 +744,7 @@ const (
 )
 
 // GetRuntimeInfo reports the daemon version + health for the provider handshake.
-func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
+func (r *Runtime) GetRuntimeInfo(ctx context.Context, _ *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
 	healthy := r.backend.Available()
 	cond := runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
 	reason := "Available"
@@ -787,6 +793,11 @@ func (r *Runtime) GetRuntimeInfo(_ context.Context, _ *runtimev1.GetRuntimeInfoR
 	// self-check failed). It does not touch Healthy: an unmarked pod is still a
 	// confined pod; what is lost is the victim preference under memory exhaustion.
 	if c := pressureKillCondition(r.pressureKill); c != nil {
+		conditions = append(conditions, c)
+	}
+	// Likewise appended only while degraded, and not touching Healthy: pods
+	// still run; what stops is the release of the artifacts they held.
+	if c := r.artifactHoldsCondition(ctx); c != nil {
 		conditions = append(conditions, c)
 	}
 	return &runtimev1.GetRuntimeInfoResponse{

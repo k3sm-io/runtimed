@@ -577,6 +577,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
 	}
 
+	// Fetch every mounted image volume and build its read-only view, before
+	// anything is rendered into the pod: a refused artifact fails the create
+	// with a stable reason (ErrArtifactPullRefused, ErrArtifactMountRefused).
+	imageViews, reason, err := r.imageVolumeViews(ctx, box)
+	if err != nil {
+		return nil, reason, err
+	}
+
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
 	// projected) into the pod data volume. Secrets + the projected
 	// SA-token come back as credential paths that get the SBPL read-only
@@ -593,6 +601,13 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 		credPaths = layout.CredentialPaths()
 		projState = layout.State
+	}
+	// Link each image volume's view at its mount path; the views come back as
+	// the profile's read-only, no-exec grants.
+	viewPaths, err := mount.LinkImageVolumes(box, rootfs, imageViews)
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("%w: link image volumes for pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err)
 	}
 
 	// Bind APFS-backed persistent volumes (PVCs): ensure each claim's
@@ -635,7 +650,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
-	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths)
+	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths, viewPaths)
 	if err != nil {
 		if errors.Is(err, errInvalidPodBox) {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
@@ -748,11 +763,13 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // under the profile the create compiled (AttachPod verifies that by hash;
 // profileDigest). rootfs is the pod's derived rootfs; ip is the pod IP; credPaths
 // are the credential mounts (the read-only sub-scope, mount.CredentialPaths);
-// pvWrite and pvRead are the bound PV dirs (volume.Binder.Plan).
+// pvWrite and pvRead are the bound PV dirs (volume.Binder.Plan); views are the
+// artifact view directories its image mounts link to (mount.LinkImageVolumes),
+// each granted read-only and no-exec.
 //
 // An underived data volume is errInvalidPodBox (wrapped); any other failure is
 // the generator's.
-func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credPaths, pvWrite, pvRead []string) (string, error) {
+func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credPaths, pvWrite, pvRead, views []string) (string, error) {
 	// The data volume the profile is about to re-allow read+write must be one this
 	// runtime derived for this pod. Checked here, immediately before the
 	// only call that consumes it: sandbox.Generate emits it after the protected
@@ -806,6 +823,8 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 		ReadOnlyPaths: credPaths,
 		WritePaths:    pvWrite,
 		ReadPaths:     pvRead,
+		// Each image volume's view: read, never write, exec or map executable.
+		ArtifactViewPaths: views,
 		// The pod's own POSIX semaphore prefix is derived from this and nothing
 		// else; containerEnv publishes the same derivation to the shim.
 		PodUID: box.GetPodId(),
@@ -1016,7 +1035,14 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
-	plan, err := mount.ComputeSharePlan(box, podDir, r.cfg.Root, r.binder.Class())
+	// Every mounted image volume is fetched and its view built before the plan,
+	// which exports each view as one read-only share. A refusal fails the create
+	// with a stable reason (ErrArtifactPullRefused, ErrArtifactMountRefused).
+	imageViews, reason, err := r.imageVolumeViews(ctx, box)
+	if err != nil {
+		return nil, reason, err
+	}
+	plan, err := mount.ComputeSharePlanWithViews(box, podDir, r.cfg.Root, r.binder.Class(), imageViews)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)

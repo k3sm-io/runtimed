@@ -149,6 +149,10 @@ func (l *lazyArtifactPuller) PullArtifact(ctx context.Context, ref string, cred 
 	return l.p.PullArtifact(ctx, ref, cred, policy, paths)
 }
 
+func (l *lazyArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
+	return l.p.PullForPod(ctx, ref, cred, policy, paths)
+}
+
 func modelArtifact(layers map[string][]byte, order []string) *fakeArtifactFetcher {
 	cfg := []byte(`{}`)
 	f := &fakeArtifactFetcher{blobs: map[string][]byte{sha(cfg): cfg}}
@@ -295,6 +299,10 @@ func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _
 		return nil, s.err
 	}
 	return &artifact.Result{ManifestDigest: sha([]byte("m"))}, nil
+}
+
+func (s *scriptedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
+	return s.PullArtifact(ctx, ref, cred, policy, paths)
 }
 
 func volumeReq(ref string) *runtimev1.PullArtifactRequest {

@@ -195,7 +195,8 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 // Roots enumerates the COMPLETE reachability root set for this store: every
 // image every pod dir records, PLUS every image an operator named (the operator
 // record — see OperatorImageRoot), PLUS the blobs of every artifact record in
-// the index's artifact namespace (see FileIndex.PutArtifactRecord).
+// the index's artifact namespace (see FileIndex.PutArtifactRecord), PLUS the
+// blobs of every manifest a pod's artifact hold names (ArtifactHold).
 //
 // The kinds are unioned here and nowhere else, so there is exactly one
 // answer to "what is reachable" and a prune cannot be written against half of
@@ -262,7 +263,13 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 	if err != nil {
 		return nil, nil, err
 	}
-	shared := append(operatorRootSet(operator), artifacts...)
+	// Pods' artifact holds, with the same fatality: a held manifest whose
+	// record a moved tag replaced is rooted by nothing else.
+	held, err := c.artifactHoldRoots()
+	if err != nil {
+		return nil, nil, err
+	}
+	shared := append(append(operatorRootSet(operator), artifacts...), held...)
 	podsRoot := c.PodsRoot()
 	entries, err := os.ReadDir(podsRoot)
 	if errors.Is(err, fs.ErrNotExist) {
