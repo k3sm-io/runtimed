@@ -62,6 +62,14 @@ func TestArtifactMountHelperProcess(t *testing.T) {
 		err = exec.Command(path).Run()
 	case "mmap-read", "mmap-exec":
 		err = mapFile(path, op == "mmap-exec")
+	case "link-alias":
+		err = linkAlias(path, os.Getenv(artifactHelperEnv+"_ALIAS"))
+	case "fchmod":
+		var f *os.File
+		if f, err = os.Open(path); err == nil {
+			err = f.Chmod(0o644)
+			_ = f.Close()
+		}
 	default:
 		t.Fatalf("unknown op %q", op)
 	}
@@ -69,6 +77,27 @@ func TestArtifactMountHelperProcess(t *testing.T) {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// linkAlias hard-links path to alias, makes the alias writable and appends to
+// it: what a pod that owns a view file's inode would do to change the bytes
+// every other pod mounting that view reads.
+func linkAlias(path, alias string) error {
+	if err := os.Link(path, alias); err != nil {
+		return err
+	}
+	if err := os.Chmod(alias, 0o644); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(alias, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString("tampered"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // mapFile maps path PROT_READ MAP_PRIVATE, plus PROT_EXEC when exec is set.
@@ -228,5 +257,141 @@ func copyExecutable(t *testing.T, src, dst string) {
 	}
 	if err := out.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestArtifactViewHardLinkAlias probes the shared-inode alias: a pod hard-links
+// a 0444 view file into its writable data volume, chmods the alias and writes
+// through it. Every pod mounting that view reads the same inode, so a write
+// that lands changes another pod's model.
+//
+// It runs in both postures. In the root posture the view file is the daemon's
+// (root's) and the pod runs as another uid. In the user posture the daemon and
+// the pod are one uid, so the pod owns the inode and file permissions alone
+// would let the chmod through; the probe chowns the view file to the pod's uid
+// to stand for that. Each posture runs the operation without the profile as a
+// control and states its outcome, then requires that under the profile it
+// fails and the view's bytes are unchanged. A read-only descriptor's fchmod is
+// probed the same way.
+func TestArtifactViewHardLinkAlias(t *testing.T) {
+	k3smtest.SkipUnless(t, k3smtest.Root)
+	for _, posture := range []string{"root", "user"} {
+		t.Run(posture, func(t *testing.T) {
+			f := modelArtifact(map[string][]byte{"w.safetensors": []byte("weights")}, []string{"w.safetensors"})
+			_, rt := artifactRPCClient(t, f)
+			t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
+			ctx := context.Background()
+			box := imageVolumeBox(rt, "pod-ln", artifactTestHost+"/models/tiny:v1")
+			views, _, err := rt.imageVolumeViews(ctx, box)
+			if err != nil {
+				t.Fatalf("imageVolumeViews: %v", err)
+			}
+			view := views.ByVolume["model"]
+			rootfs := filepath.Join(rt.cfg.Root, "pods", "pod-ln", "rootfs")
+			if err := os.MkdirAll(rootfs, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			grants, err := mount.LinkImageVolumes(box, rootfs, views)
+			if err != nil {
+				t.Fatalf("LinkImageVolumes: %v", err)
+			}
+			profile, err := rt.compileProfile(box, rootfs, "", nil, nil, nil, grants)
+			if err != nil {
+				t.Fatalf("compileProfile: %v", err)
+			}
+			for d := rt.cfg.Root; d != "/" && d != "."; d = filepath.Dir(d) {
+				if fi, err := os.Stat(d); err == nil && fi.Mode().Perm()&0o001 == 0 {
+					if err := os.Chmod(d, fi.Mode().Perm()|0o011); err != nil {
+						t.Fatalf("make %s traversable: %v", d, err)
+					}
+				}
+			}
+			// The data volume is the pod's own, writable by its uid.
+			if err := os.Chown(rootfs, nobodyUID, nobodyUID); err != nil {
+				t.Fatal(err)
+			}
+			viewFile := filepath.Join(view, "w.safetensors")
+			if posture == "user" {
+				if err := os.Chown(viewFile, nobodyUID, nobodyUID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			helper := filepath.Join(rootfs, "probe")
+			copyExecutable(t, os.Args[0], helper)
+			sb := filepath.Join(rt.cfg.Root, "pod-ln.sb")
+			if err := os.WriteFile(sb, []byte(profile), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			reset := func() {
+				t.Helper()
+				for _, a := range []string{"alias", "alias-ctl"} {
+					_ = os.Remove(filepath.Join(rootfs, a))
+				}
+				if err := os.Chmod(viewFile, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(viewFile, []byte("weights"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(viewFile, 0o444); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run := func(sandboxed bool, op, path, alias string) bool {
+				t.Helper()
+				argv := []string{helper, "-test.run=^TestArtifactMountHelperProcess$"}
+				if sandboxed {
+					argv = append([]string{"/usr/bin/sandbox-exec", "-f", sb}, argv...)
+				}
+				cmd := exec.Command(argv[0], argv[1:]...)
+				cmd.Env = []string{artifactHelperEnv + "=1", artifactHelperEnv + "_OP=" + op,
+					artifactHelperEnv + "_PATH=" + path, artifactHelperEnv + "_ALIAS=" + alias}
+				cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: nobodyUID, Gid: nobodyUID}}
+				return cmd.Run() == nil
+			}
+			intact := func() bool {
+				t.Helper()
+				b, err := os.ReadFile(viewFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fi, err := os.Stat(viewFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(b) == "weights" && fi.Mode().Perm() == 0o444
+			}
+			// Through the pod's mount path, as the pod sees the file.
+			mounted := filepath.Join(rootfs, "models", "w.safetensors")
+
+			reset()
+			ctl := run(false, "link-alias", mounted, filepath.Join(rootfs, "alias-ctl"))
+			t.Logf("posture %s: link, chmod and write through an alias WITHOUT the profile: succeeded=%v, view intact=%v", posture, ctl, intact())
+			reset()
+			if run(true, "link-alias", mounted, filepath.Join(rootfs, "alias")) {
+				t.Errorf("posture %s: link, chmod and write through an alias succeeded under the profile", posture)
+			}
+			if !intact() {
+				t.Errorf("posture %s: the shared view file changed under the profile", posture)
+			}
+			// The refused link is the load-bearing step: an alias in the data
+			// volume is a path the profile lets the pod chmod and write, so in the
+			// user posture only the link's refusal (the view's file-write* deny
+			// covers link(2) of a file under it) keeps the inode shared-read-only.
+			if _, err := os.Lstat(filepath.Join(rootfs, "alias")); err == nil {
+				t.Errorf("posture %s: a hard link to a view file was made in the data volume under the profile", posture)
+			}
+
+			reset()
+			ctl = run(false, "fchmod", mounted, "")
+			t.Logf("posture %s: fchmod of a read-only descriptor WITHOUT the profile: succeeded=%v", posture, ctl)
+			reset()
+			if run(true, "fchmod", mounted, "") {
+				t.Errorf("posture %s: fchmod of a read-only descriptor succeeded under the profile", posture)
+			}
+			if !intact() {
+				t.Errorf("posture %s: the shared view file's mode changed under the profile", posture)
+			}
+		})
 	}
 }
