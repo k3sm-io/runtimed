@@ -412,3 +412,41 @@ func restoreWritable(t *testing.T, dir string) {
 		return nil
 	})
 }
+
+// TestPruneImagesSweepsOrphanedArtifactViews pins the prune wiring: once the
+// record for a reference names a new manifest, PruneImages removes the views
+// of the old one, which no record names any more.
+func TestPruneImagesSweepsOrphanedArtifactViews(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("the daemon's views clone with APFS clonefile, darwin-only")
+	}
+	f := modelArtifact(map[string][]byte{"a.json": []byte("a")}, []string{"a.json"})
+	client, rt := artifactRPCClient(t, f)
+	t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
+	ctx := context.Background()
+	req := &runtimev1.PullArtifactRequest{
+		Reference:      artifactTestHost + "/models/tiny:v1",
+		ArtifactPolicy: runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME,
+	}
+	if _, err := client.PullArtifact(ctx, req); err != nil {
+		t.Fatalf("PullArtifact: %v", err)
+	}
+	old, err := rt.ArtifactView(ctx, sha(f.manifest), nil)
+	if err != nil {
+		t.Fatalf("ArtifactView: %v", err)
+	}
+	next := modelArtifact(map[string][]byte{"a.json": []byte("a v2")}, []string{"a.json"})
+	f.manifest, f.blobs = next.manifest, next.blobs
+	if _, err := client.PullArtifact(ctx, req); err != nil {
+		t.Fatalf("re-pull: %v", err)
+	}
+	if _, err := client.PruneImages(ctx, &runtimev1.PruneImagesRequest{}); err != nil {
+		t.Fatalf("PruneImages: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(old)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("views of the replaced manifest survived PruneImages: %v", err)
+	}
+	if _, err := rt.ArtifactView(ctx, sha(f.manifest), nil); err != nil {
+		t.Fatalf("view of the current manifest after the prune: %v", err)
+	}
+}

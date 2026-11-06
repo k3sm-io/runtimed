@@ -185,6 +185,7 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 		DryRun:       req.GetDryRun(),
 		Log:          s.rt.log,
 		UntrackedPod: s.rt.podUntracked,
+		SweepDerived: s.rt.viewSweeper(),
 	})
 	if err != nil {
 		return nil, imageStatusError(err)
@@ -701,6 +702,7 @@ func (r *Runtime) RunImageGC(ctx context.Context, interval time.Duration, cfg im
 		cfg.Log = r.log
 	}
 	cfg.UntrackedPod = r.podUntracked
+	cfg.SweepDerived = r.viewSweeper()
 	// Force is a caller-facing operator verb (PruneImages); the timer is the
 	// pressure trigger by definition, so it can never be forced.
 	cfg.Force = false
@@ -752,6 +754,17 @@ func (r *Runtime) ArtifactView(ctx context.Context, manifestDigest string, paths
 		return "", fmt.Errorf("artifact views unavailable: %w", r.viewsErr)
 	}
 	return r.views.View(ctx, manifestDigest, paths)
+}
+
+// viewSweeper is the image prune's hook into the artifact views: it removes
+// the views of manifests no record names (artifact.Views.SweepOrphans). It is
+// passed in here, from the wiring, because pkg/image cannot import
+// pkg/artifact. Nil when views are disabled.
+func (r *Runtime) viewSweeper() func(context.Context) error {
+	if r.views == nil {
+		return nil
+	}
+	return r.views.SweepOrphans
 }
 
 // newArtifactPuller builds the daemon's own artifact puller over the same cache
