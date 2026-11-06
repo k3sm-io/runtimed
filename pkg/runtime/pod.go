@@ -2754,7 +2754,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// supply the argv. Previously this branch refused an OCI-referenced
 	// container with no command, so a perfectly ordinary `image: nginx` pod
 	// could not run.
-	if len(cmd) == 0 && len(c.GetArgs()) == 0 && image.IsHostPathReference(c.GetImage()) {
+	if hostBinaryRoute(c) {
 		bin := c.GetImage()
 		// No manifest exists on this route either — imageID stays empty.
 		return resolvedBinary{path: bin, argv: []string{bin}, hostBinary: true, workingDir: c.GetWorkingDir()}, nil
@@ -2865,6 +2865,16 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}, nil
 }
 
+// hostBinaryRoute reports whether c takes one of resolveBinary's host-binary arms,
+// where argv[0] names a host path, rather than its pull arm, where it names a file
+// in the image. An empty image takes neither at start and has no image to read, so
+// it counts here: this is also the answer for a container whose spec is unknown.
+func hostBinaryRoute(c *runtimev1.Container) bool {
+	ref := c.GetImage()
+	return ref == "" || ref == NativeImage ||
+		(len(c.GetCommand()) == 0 && len(c.GetArgs()) == 0 && image.IsHostPathReference(ref))
+}
+
 // ErrImageArgvEscapes reports that a pulled image's argv[0] resolves outside the
 // pod rootfs it must run from. It is a sentinel so a caller (and a test) can
 // name the refusal without matching on the message.
@@ -2909,7 +2919,8 @@ var ErrImageArgvEscapes = errors.New("image program escapes the pod rootfs")
 // here would not close that (the tree is writable by the pod, so any answer is
 // stale the moment it is given); the profile is what bounds what the process
 // may then touch, and this check is what keeps the daemon from being the one
-// that walks out.
+// that walks out. An exec session adds that walk before it runs a name someone
+// other than the image chose (resolveImageExecPath).
 func resolveImageArgv0(rootfs, argv0 string) (string, error) {
 	if argv0 == "" {
 		return "", errors.New("image program is empty")
