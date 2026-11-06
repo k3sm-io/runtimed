@@ -773,8 +773,11 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 // What runs here, around readLayer, is the daemon's own setup and no decoder:
 // parsing the digests, opening the blob, comparing the hashes. It stays outside
 // readLayer's recover, so a bug in it is a crash and not a report of a bad layer.
-// The digests are registry strings, but parseBlobDigest is not a new exposure
-// for them: locate and the pull path already parse their kind with no recover.
+// The digests are registry strings, so keeping that setup outside the recover
+// rests on the parser it calls: ggcrv1.NewHash, read in full, is pure string
+// validation with no panic reachable from a registry-supplied digest. A future
+// bump of that library that adds a panic would crash the daemon here, because
+// this setup is deliberately outside the recover.
 func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, diffID string) error {
 	wantBlob, err := parseBlobDigest(desc.GetDigest())
 	if err != nil {
