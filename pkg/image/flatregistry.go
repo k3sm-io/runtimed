@@ -113,11 +113,6 @@ type flatRegistry struct {
 // flatRegistryDialTimeout bounds one dial to the endpoint.
 const flatRegistryDialTimeout = 30 * time.Second
 
-// flatRegistryResponseHeaderTimeout bounds the wait for a response's headers
-// once a request is written. It is not a deadline on the body: a blob that
-// keeps arriving streams for as long as it takes.
-const flatRegistryResponseHeaderTimeout = 60 * time.Second
-
 // newFlatRegistry validates f against the puller's cluster-local set and builds
 // its fetcher. A zero f yields nil, which switches the mapping off.
 func (p *Puller) newFlatRegistry(f FlatRegistry) (*flatRegistry, error) {
@@ -184,7 +179,6 @@ func endpointTransport(host string, ep RegistryEndpoint, pool *x509.CertPool) *h
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: flatRegistryResponseHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
 	if ep.TLS {

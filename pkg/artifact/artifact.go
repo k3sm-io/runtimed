@@ -59,9 +59,11 @@ const (
 	// DefaultMaxConcurrentLayers is how many layers transfer at once.
 	DefaultMaxConcurrentLayers = 2
 	// DefaultStallTimeout is how long a blob transfer may go without one byte
-	// arriving, from the request to the end of the body, before it fails. It is
-	// an idle bound, never a deadline: a transfer that keeps moving runs as
-	// long as it needs (a 40 GB model over a slow link takes many minutes).
+	// arriving, from the request (the response headers included) to the end of
+	// the body, before it fails. It is an idle bound, never a deadline: a
+	// transfer that keeps moving runs as long as it needs (a 40 GB model over a
+	// slow link takes many minutes). A manifest, at most MaxManifestBytes, must
+	// arrive whole within it.
 	DefaultStallTimeout = 60 * time.Second
 )
 
@@ -96,6 +98,7 @@ var (
 	ErrInsufficientSpace  = errors.New("artifact: refusing the pull, the store volume would fall below its free-space floor")
 	ErrBlobTransfer       = errors.New("artifact: blob transfer failed")
 	ErrBlobStalled        = errors.New("artifact: blob transfer stalled, no byte arrived within the stall timeout")
+	ErrManifestStalled    = errors.New("artifact: manifest fetch did not complete within the stall timeout")
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
@@ -336,9 +339,9 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 		return nil, err
 	}
 
-	raw, served, err := p.deps.Fetcher.Manifest(ctx, ref, cred)
+	raw, served, err := p.fetchManifest(ctx, ref, cred)
 	if err != nil {
-		return nil, fmt.Errorf("fetch manifest %s: %w", image.QuoteBounded(ref, 512), bound(err))
+		return nil, err
 	}
 	if len(raw) > MaxManifestBytes {
 		return nil, fmt.Errorf("manifest of %d bytes, at most %d: %w", len(raw), MaxManifestBytes, ErrManifestTooLarge)
@@ -430,6 +433,26 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	res.Lease = lease
 	ok = true
 	return res, nil
+}
+
+// fetchManifest fetches ref's manifest under the stall timeout as a whole: a
+// manifest is at most MaxManifestBytes, so a registry that has not answered
+// with all of it by then is stalled (ErrManifestStalled, also ErrBlobTransfer,
+// so a retry is invited). The blob transfers carry their own idle bound.
+func (p *Puller) fetchManifest(ctx context.Context, ref string, cred *image.RegistryCredential) ([]byte, string, error) {
+	mctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stall := p.cfg.StallTimeout
+	timer := p.cfg.afterFunc(stall, func() { cancel(ErrManifestStalled) })
+	defer timer.Stop()
+	raw, served, err := p.deps.Fetcher.Manifest(mctx, ref, cred)
+	if err == nil {
+		return raw, served, nil
+	}
+	if ctx.Err() == nil && errors.Is(context.Cause(mctx), ErrManifestStalled) {
+		return nil, "", fmt.Errorf("fetch manifest %s: not complete within %v: %w: %w", image.QuoteBounded(ref, 512), stall, ErrBlobTransfer, ErrManifestStalled)
+	}
+	return nil, "", fmt.Errorf("fetch manifest %s: %w", image.QuoteBounded(ref, 512), bound(err))
 }
 
 // CheckHost refuses a reference whose registry is not the cluster registry.

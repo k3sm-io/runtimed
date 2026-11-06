@@ -54,10 +54,21 @@ func (f *fakeIdle) after(d time.Duration, fn func()) idleTimer {
 	return f
 }
 
-// stallFetcher serves manifests from the fake and blob bodies from body.
+// stallFetcher serves manifests from the fake, or never when silentManifest
+// is set, and blob bodies from body.
 type stallFetcher struct {
 	*fakeFetcher
-	body func(ctx context.Context, data []byte) io.ReadCloser
+	body           func(ctx context.Context, data []byte) io.ReadCloser
+	silentManifest chan<- struct{}
+}
+
+func (s *stallFetcher) Manifest(ctx context.Context, ref string, cred *image.RegistryCredential) ([]byte, string, error) {
+	if s.silentManifest == nil {
+		return s.fakeFetcher.Manifest(ctx, ref, cred)
+	}
+	s.silentManifest <- struct{}{}
+	<-ctx.Done()
+	return nil, "", ctx.Err()
 }
 
 func (s *stallFetcher) Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, offset int64) (io.ReadCloser, int64, error) {
@@ -157,5 +168,31 @@ func TestPullArtifactSlowBlobIsNotCutOff(t *testing.T) {
 	defer idle.mu.Unlock()
 	if idle.resets < len("weights") {
 		t.Errorf("the stall timer was re-armed %d times, want at least one per byte", idle.resets)
+	}
+}
+
+// TestPullArtifactFailsAStalledManifest pins the manifest's bound: a registry
+// that never answers the manifest request fails the pull when the stall timer
+// fires, as a resumable transfer failure. Without it nothing bounds the wait,
+// since the registry transport carries no header timeout.
+func TestPullArtifactFailsAStalledManifest(t *testing.T) {
+	e := newEnv(t)
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", "weights"))
+	asked := make(chan struct{}, 1)
+	f := &stallFetcher{fakeFetcher: e.fetch, silentManifest: asked}
+	idle := &fakeIdle{}
+	p := stallPuller(t, e, f, idle)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.PullArtifact(context.Background(), testRef, nil, volume, nil)
+		done <- err
+	}()
+	<-asked
+	idle.mu.Lock()
+	fire := idle.fire
+	idle.mu.Unlock()
+	fire()
+	if err := <-done; !errors.Is(err, ErrManifestStalled) || !errors.Is(err, ErrBlobTransfer) {
+		t.Fatalf("PullArtifact = %v, want a stalled, resumable manifest fetch", err)
 	}
 }
