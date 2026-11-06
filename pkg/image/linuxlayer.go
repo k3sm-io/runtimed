@@ -63,26 +63,48 @@ const SemanticsLinux LayerSemantics = "linux"
 // LinuxUnpackPolicy is the policy for the vm (Linux-guest) spine.
 func LinuxUnpackPolicy() UnpackPolicy { return UnpackPolicy{Semantics: SemanticsLinux} }
 
-// ErrPathCollision reports that a Linux layer names two DISTINCT paths that a
-// case-insensitive (or normalization-insensitive) filesystem would merge into
-// one file.
+// ErrPathCollision reports that a Linux layer names two DISTINCT paths that the
+// destination filesystem would merge into one file.
 //
 // It is fail-closed and fatal to the whole unpack — never a per-entry skip, and
 // never a silent merge — because the two outcomes of a merge are both
 // unacceptable: the later entry's content silently replaces the earlier one's
 // under a name the image never wrote, and the resulting tree is then committed
-// under a ChainID that claims to be the image. The design puts the
-// snapshot store on a dedicated case-sensitive APFS volume so this condition
-// should be unreachable in production; this check is the defense in depth that
-// makes a mis-provisioned volume LOUD instead of silently lossy.
+// under a ChainID that claims to be the image.
 //
 // It is raised against the DESTINATION as measured, never against an assumption
 // about it: a case pair is a collision only where probeDestCaseSensitive found a
-// case-insensitive filesystem, because on a correctly provisioned node the two
-// paths are exactly what they claim to be — two files. A normalization pair is
-// refused on every destination, since APFS is normalization-insensitive in both
-// its case-sensitive and its case-insensitive form.
-var ErrPathCollision = errors.New("image: linux layer paths collide on a case-insensitive filesystem")
+// case-insensitive filesystem, because on a case-sensitive data volume the two
+// paths are exactly what they claim to be — two files. A plain-directory data
+// root sits on the boot volume, which is case-insensitive, so this refusal is
+// reachable on a node installed without --data-volume, and collisionError says so
+// to its operator. A normalization pair is refused on every destination, since
+// APFS is normalization-insensitive in both its case-sensitive and its
+// case-insensitive form.
+var ErrPathCollision = errors.New("image: linux layer paths collide")
+
+// collisionError renders the refusal of a pair: both paths, what the filesystem
+// does to them, and what the operator can do about it. probeErr is why the
+// destination could not be measured, if it could not, because then "merges them"
+// is the fail-closed reading and not a fact about the volume.
+//
+// A pair whose NFC forms match is a normalization pair, which no volume keeps
+// apart, so the data-volume remedy would send the operator on a migration that
+// changes nothing and it names the image instead.
+func collisionError(prev, name string, probeErr error) error {
+	a, b := quoteBounded(prev, maxLayerEntryNameLen), quoteBounded(name, maxLayerEntryNameLen)
+	if norm.NFC.String(prev) == norm.NFC.String(name) {
+		return fmt.Errorf("%w: %s and %s differ only by Unicode normalization, which APFS merges on every volume; rebuild the image without one of them",
+			ErrPathCollision, a, b)
+	}
+	const remedy = "put this node's k3sm data root on a case-sensitive APFS volume with `sudo k3sm install --data-volume`, or use an image without the pair"
+	if probeErr != nil {
+		return fmt.Errorf("%w: %s and %s differ only by case, and this node's filesystem could not be measured (%v), so it is treated as merging them into one file; %s",
+			ErrPathCollision, a, b, boundErr(probeErr), remedy)
+	}
+	return fmt.Errorf("%w: %s and %s differ only by case, and this node's case-insensitive filesystem would merge them into one file; %s",
+		ErrPathCollision, a, b, remedy)
+}
 
 // OCI/AUFS whiteout markers, as specified by the OCI image-spec ("Applying
 // Changesets") and as produced by every builder that writes an OCI layer.
@@ -199,6 +221,10 @@ const (
 	caseProbeNameLower = ".k3sm-case-probe-a"
 	caseProbeNameUpper = ".k3sm-case-probe-A"
 )
+
+// CaseProbe reports whether the directory anchored at root holds two entries
+// whose names differ only in case. An error reads as case-insensitive.
+type CaseProbe func(root *os.Root) (sensitive bool, err error)
 
 // probeDestCaseSensitive reports whether the directory anchored at root lives on
 // a case-SENSITIVE filesystem, by creating one entry and then asking for the

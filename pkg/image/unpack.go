@@ -301,6 +301,9 @@ type Unpacker struct {
 	// them; NewUnpacker sets the production functions and nothing else writes them.
 	decompress func(mediaType string, r io.Reader) (io.ReadCloser, error)
 	applyTar   func(a *LayerApplier, ctx context.Context, r io.Reader) error
+	// caseProbe measures a directory's case sensitivity. NewUnpacker defaults it
+	// to probeDestCaseSensitive; only WithCaseProbe replaces it.
+	caseProbe CaseProbe
 }
 
 // UnpackerOption adjusts an Unpacker at construction.
@@ -311,6 +314,14 @@ type UnpackerOption func(*Unpacker)
 // elsewhere); tests inject ByteCopier.
 func WithCloner(c Cloner) UnpackerOption {
 	return func(u *Unpacker) { u.cloner = c }
+}
+
+// WithCaseProbe replaces the measurement of a directory's case sensitivity. The
+// default creates a pair of names in the directory itself (see
+// probeDestCaseSensitive). It exists for tests, because the case-sensitive
+// answer needs a volume a stock host's temp directory is not on.
+func WithCaseProbe(p CaseProbe) UnpackerOption {
+	return func(u *Unpacker) { u.caseProbe = p }
 }
 
 // WithApplyLimits sets the unpack resource guards (see ApplyLimits). The zero
@@ -348,6 +359,7 @@ func NewUnpacker(cache *Cache, opts ...UnpackerOption) (*Unpacker, error) {
 		cloner:     APFSCloner{},
 		decompress: decompressLayer,
 		applyTar:   (*LayerApplier).Apply,
+		caseProbe:  probeDestCaseSensitive,
 	}
 	for _, o := range opts {
 		o(u)
@@ -747,7 +759,7 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 	}
 	defer root.Close()
 
-	applier, err := NewLayerApplier(root, policy, u.limits)
+	applier, err := newLayerApplier(root, policy, u.limits, u.caseProbe)
 	if err != nil {
 		return ApplyStats{}, nil, "", err
 	}
