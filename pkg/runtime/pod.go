@@ -71,6 +71,10 @@ type pod struct {
 	// candidates).
 	backend runtimev1.SandboxBackend
 
+	// execGates shares one signature gate among overlapping exec sessions of this
+	// pod. It has its own lock: a gate runs codesign, far too long to hold mu.
+	execGates execGateFlights
+
 	mu         sync.Mutex
 	phase      runtimev1.PodPhase
 	reason     string

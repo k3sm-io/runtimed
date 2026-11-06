@@ -21,8 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -90,4 +93,243 @@ func TestExecGateRefusalNamesTheContainerPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// heldSigner blocks every first check of a file under /bin/ until release closes,
+// or until the caller's context ends, which reads as a refusal just as a killed
+// codesign does (runCodesignVerify). Sign clears a file.
+type heldSigner struct {
+	mu      sync.Mutex
+	release chan struct{}
+	entered int
+	signed  []string
+}
+
+func (s *heldSigner) arm() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.release = make(chan struct{})
+}
+
+func (s *heldSigner) open() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	close(s.release)
+}
+
+func (s *heldSigner) Sign(ctx context.Context, _, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.signed = append(s.signed, path)
+	return nil
+}
+
+func (s *heldSigner) Check(ctx context.Context, _ runtimev1.SignaturePolicy, path string) error {
+	if !strings.Contains(path, "/bin/") {
+		return nil
+	}
+	s.mu.Lock()
+	s.entered++
+	release := s.release
+	done := slices.Contains(s.signed, path)
+	s.mu.Unlock()
+	if done {
+		return nil
+	}
+	select {
+	case <-release:
+	case <-ctx.Done():
+	}
+	return fmt.Errorf("%w: %s is unsigned", image.ErrSignatureRejected, path)
+}
+
+func (s *heldSigner) counts() (entered, signed int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.entered, len(s.signed)
+}
+
+// heldExec is one exec session running against a heldSigner.
+type heldExec struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error
+	exit   *runtimev1.ExecResult
+}
+
+// startHeldExec starts one session. Everything it blocks on is made here, inside
+// the caller's synctest bubble, so synctest.Wait sees it as durably blocked.
+func startHeldExec(p *execArgvPod, cmdv ...string) *heldExec {
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &heldExec{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(e.done)
+		st := newFakeExecStream(ctx)
+		st.feed(&runtimev1.ExecRequest{PodId: p.podID, Command: cmdv})
+		st.closeSend()
+		e.err = p.rt.Exec(st)
+		for {
+			select {
+			case resp := <-st.out:
+				if ex := resp.GetExit(); ex != nil {
+					e.exit = ex
+				}
+			default:
+				return
+			}
+		}
+	}()
+	return e
+}
+
+func (e *heldExec) wait(t *testing.T) {
+	t.Helper()
+	<-e.done
+	e.cancel()
+}
+
+func (e *heldExec) wantRan(t *testing.T) {
+	t.Helper()
+	e.wait(t)
+	if e.err != nil {
+		t.Errorf("Exec: %v", e.err)
+	} else if e.exit == nil || e.exit.GetExitCode() != 0 {
+		t.Errorf("exit = %v, want 0", e.exit)
+	}
+}
+
+// TestConcurrentExecsShareOneGate pins that sessions arriving together cost one
+// run of the gate: under ADHOC_OK that run copies a pod-written file, signs it and
+// flushes it in the daemon. Only sessions that overlap share: a later session gates
+// the file again, because the pod can have changed it.
+func TestConcurrentExecsShareOneGate(t *testing.T) {
+	const sessions = 8
+	tree := map[string]string{"bin/tool": imageScript, "bin/other": imageScript}
+	require := func(box *runtimev1.PodBox) {
+		box.SignaturePolicy = runtimev1.SignaturePolicy_SIGNATURE_POLICY_REQUIRE_SIGNED
+	}
+
+	t.Run("overlapping_sessions_run_one_gate", func(t *testing.T) {
+		signer := &heldSigner{}
+		p := newExecArgvPod(t, tree, signer, nil)
+		synctest.Test(t, func(t *testing.T) {
+			signer.arm()
+			var execs []*heldExec
+			for range sessions {
+				execs = append(execs, startHeldExec(p, "/bin/tool"))
+			}
+			synctest.Wait()
+			if entered, _ := signer.counts(); entered != 1 {
+				t.Errorf("%d gates ran for %d overlapping sessions, want 1", entered, sessions)
+			}
+			signer.open()
+			for _, e := range execs {
+				e.wantRan(t)
+			}
+			if _, signed := signer.counts(); signed != 1 {
+				t.Errorf("signed %d times, want 1", signed)
+			}
+
+			before, _ := signer.counts()
+			startHeldExec(p, "/bin/tool").wantRan(t)
+			if after, _ := signer.counts(); after != before+1 {
+				t.Errorf("a later session ran %d checks, want 1: an old answer must not be reused", after-before)
+			}
+		})
+	})
+
+	t.Run("a_refusal_reaches_every_session_without_the_host_path", func(t *testing.T) {
+		signer := &heldSigner{}
+		p := newExecArgvPod(t, tree, signer, require)
+		synctest.Test(t, func(t *testing.T) {
+			signer.arm()
+			var execs []*heldExec
+			for range sessions {
+				execs = append(execs, startHeldExec(p, "/bin/tool"))
+			}
+			synctest.Wait()
+			if entered, _ := signer.counts(); entered != 1 {
+				t.Errorf("%d gates ran, want 1", entered)
+			}
+			signer.open()
+			for _, e := range execs {
+				e.wait(t)
+				if status.Code(e.err) != codes.FailedPrecondition {
+					t.Errorf("Exec error = %v, want FailedPrecondition", e.err)
+				}
+				if msg := status.Convert(e.err).Message(); strings.Contains(msg, p.rt.cfg.Root) {
+					t.Errorf("message %q shows a host path", msg)
+				}
+			}
+		})
+	})
+
+	t.Run("a_canceled_leader_hands_the_gate_to_a_waiter", func(t *testing.T) {
+		signer := &heldSigner{}
+		p := newExecArgvPod(t, tree, signer, nil)
+		synctest.Test(t, func(t *testing.T) {
+			signer.arm()
+			leader := startHeldExec(p, "/bin/tool")
+			synctest.Wait()
+			waiter := startHeldExec(p, "/bin/tool")
+			synctest.Wait()
+			if entered, _ := signer.counts(); entered != 1 {
+				t.Errorf("%d gates ran before the cancel, want 1", entered)
+			}
+
+			leader.cancel()
+			leader.wait(t)
+			if status.Code(leader.err) != codes.Canceled {
+				t.Errorf("the canceled session's error = %v, want Canceled", leader.err)
+			}
+			synctest.Wait()
+			if entered, _ := signer.counts(); entered != 2 {
+				t.Errorf("%d gates ran after the cancel, want 2: the waiter runs its own", entered)
+			}
+			signer.open()
+			waiter.wantRan(t)
+		})
+	})
+
+	t.Run("a_canceled_waiter_leaves_the_gate_running", func(t *testing.T) {
+		signer := &heldSigner{}
+		p := newExecArgvPod(t, tree, signer, nil)
+		synctest.Test(t, func(t *testing.T) {
+			signer.arm()
+			leader := startHeldExec(p, "/bin/tool")
+			synctest.Wait()
+			waiter := startHeldExec(p, "/bin/tool")
+			synctest.Wait()
+
+			waiter.cancel()
+			waiter.wait(t)
+			if status.Code(waiter.err) != codes.Canceled {
+				t.Errorf("the canceled waiter's error = %v, want Canceled", waiter.err)
+			}
+			signer.open()
+			leader.wantRan(t)
+			if _, signed := signer.counts(); signed != 1 {
+				t.Errorf("signed %d times, want 1", signed)
+			}
+		})
+	})
+
+	t.Run("different_paths_do_not_share", func(t *testing.T) {
+		signer := &heldSigner{}
+		p := newExecArgvPod(t, tree, signer, nil)
+		synctest.Test(t, func(t *testing.T) {
+			signer.arm()
+			one, other := startHeldExec(p, "/bin/tool"), startHeldExec(p, "/bin/other")
+			synctest.Wait()
+			if entered, _ := signer.counts(); entered != 2 {
+				t.Errorf("%d gates ran for two paths, want 2", entered)
+			}
+			signer.open()
+			one.wantRan(t)
+			other.wantRan(t)
+		})
+	})
 }

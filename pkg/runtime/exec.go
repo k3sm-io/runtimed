@@ -211,7 +211,8 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 // operator error: a file the policy refuses, while it is still that file. It reads
 // the file once, and a running pod can swap the file straight after the check, so
 // passing it says nothing about what the session then runs. A host file is not
-// gated, as it never was for exec.
+// gated, as it never was for exec. Overlapping sessions share one run of the gate
+// (execGateFlights).
 func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.Container, cmdv []string) ([]string, error) {
 	argv0 := cmdv[0]
 	if hostBinaryRoute(c) || !filepath.IsAbs(argv0) {
@@ -234,14 +235,92 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 		return cmdv, nil
 	}
 	policy := p.box.GetSignaturePolicy()
-	if err := r.gateSignature(ctx, policy, rootfs, bin, false); err != nil {
-		// The gate's errors name the host rootfs, which is the daemon's to know.
-		r.log.Warn("exec: signature gate refused an image file",
-			"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
+	err = p.execGates.do(ctx, bin, func(ctx context.Context) error {
+		err := r.gateSignature(ctx, policy, rootfs, bin, false)
+		if err != nil && ctx.Err() == nil {
+			// The gate's errors name the host rootfs, which is the daemon's to know.
+			r.log.Warn("exec: signature gate refused an image file",
+				"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
+		}
+		return err
+	})
+	if err != nil {
+		// A killed codesign reads as "not signed", so the session's own context
+		// says whether this was a refusal at all.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, status.FromContextError(cerr).Err()
+		}
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"exec: %q refused by the signature gate under %s; the daemon log has the cause", argv0, policy)
 	}
 	return append([]string{bin}, cmdv[1:]...), nil
+}
+
+// execGateFlights lets a pod's overlapping exec sessions share one run of the
+// signature gate per resolved path. Exec is not serialized per pod, and under
+// ADHOC_OK a run copies a pod-written file, signs it and flushes it in the daemon.
+// The copy has no size bound here or on the start path.
+//
+// It shares only what overlaps: a session that arrives after a run ended starts
+// another, because the pod can have changed the file. The golang.org/x/sync
+// version is not used because a run belongs to its first session's context, and a
+// waiter must not inherit that session's cancellation as a refusal.
+//
+// The zero value is ready to use. mu guards calls and is never held across a run.
+type execGateFlights struct {
+	mu    sync.Mutex
+	calls map[string]*execGateCall
+}
+
+// execGateCall is one run of the gate. err and abandoned are written before done
+// closes and read only after.
+type execGateCall struct {
+	done chan struct{}
+	err  error
+	// abandoned means the run ended with no answer about the file: its session's
+	// context ended, or the gate panicked. A waiter runs the gate itself.
+	abandoned bool
+}
+
+// do runs gate for path, or waits for the run already in flight and returns its
+// answer. It returns ctx.Err() if ctx ends during the wait.
+func (f *execGateFlights) do(ctx context.Context, path string, gate func(context.Context) error) error {
+	for {
+		f.mu.Lock()
+		call, inFlight := f.calls[path]
+		if !inFlight {
+			call = &execGateCall{done: make(chan struct{}), abandoned: true}
+			if f.calls == nil {
+				f.calls = make(map[string]*execGateCall)
+			}
+			f.calls[path] = call
+			f.mu.Unlock()
+			return f.run(ctx, path, call, gate)
+		}
+		f.mu.Unlock()
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if !call.abandoned {
+			return call.err
+		}
+	}
+}
+
+// run is one run of the gate; its deferred release also frees the waiters if gate
+// panics.
+func (f *execGateFlights) run(ctx context.Context, path string, call *execGateCall, gate func(context.Context) error) error {
+	defer func() {
+		f.mu.Lock()
+		delete(f.calls, path)
+		f.mu.Unlock()
+		close(call.done)
+	}()
+	call.err = gate(ctx)
+	call.abandoned = ctx.Err() != nil
+	return call.err
 }
 
 // resolveImageExecPath resolves an exec session's absolute argv[0] in the pod
