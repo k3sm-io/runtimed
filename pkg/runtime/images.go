@@ -33,6 +33,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // imagesService serves the Images RPCs (apis/runtime/v1/images.proto) over the
@@ -728,11 +729,6 @@ func (r *Runtime) RunImageGC(ctx context.Context, interval time.Duration, cfg im
 	}
 }
 
-// artifactPartialDir is the cache-root-relative directory resumable artifact
-// partials live in: on the cache volume, so a committed partial is a same-volume
-// copy, and private to the daemon.
-const artifactPartialDir = "artifact-partial"
-
 // maxConcurrentArtifactPulls bounds PullArtifact RPCs in flight. Each holds a
 // manifest (up to 4 MiB) and drives up to two layer transfers, and the caller
 // is the local socket, so a small bound keeps memory and connection use flat;
@@ -758,9 +754,11 @@ func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.Fl
 	}
 	return artifact.New(artifact.Config{
 		RegistryHost: flat.Host,
-		PartialDir:   filepath.Join(cache.Root(), artifactPartialDir),
-		StorePath:    cache.Root(),
-		Log:          log,
+		// On the cache volume, so committing a partial is a same-volume copy; denied
+		// to pods like every other daemon-private tree.
+		PartialDir: filepath.Join(cache.Root(), sandbox.ArtifactPartialSubdir),
+		StorePath:  cache.Root(),
+		Log:        log,
 	}, artifact.Deps{
 		Blobs: cache, Leases: cache, Reclaimer: cache, Index: index,
 		Fetcher: &artifact.RegistryFetcher{Transport: tr, PlainHTTP: plain},

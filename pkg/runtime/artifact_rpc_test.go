@@ -46,6 +46,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 const artifactTestHost = "registry-k3sm:6450"
@@ -124,7 +125,7 @@ func artifactRPCClient(t *testing.T, fetch artifact.Fetcher) (runtimev1.ImagesCl
 	client, rt := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: lazy})
 	p, err := artifact.New(artifact.Config{
 		RegistryHost: artifactTestHost,
-		PartialDir:   filepath.Join(rt.cache.Root(), artifactPartialDir),
+		PartialDir:   filepath.Join(rt.cache.Root(), sandbox.ArtifactPartialSubdir),
 		StorePath:    rt.cache.Root(),
 		FreeBytes:    func(string) (uint64, error) { return 1 << 40, nil },
 	}, artifact.Deps{Blobs: rt.cache, Leases: rt.cache, Reclaimer: rt.cache, Index: rt.index, Fetcher: fetch})
