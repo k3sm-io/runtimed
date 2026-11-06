@@ -23,10 +23,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -134,6 +139,8 @@ func artifactRPCClient(t *testing.T, fetch artifact.Fetcher) (runtimev1.ImagesCl
 // own cache, which exists only once the runtime does.
 type lazyArtifactPuller struct{ p *artifact.Puller }
 
+func (l *lazyArtifactPuller) CheckHost(ref string) error { return l.p.CheckHost(ref) }
+
 func (l *lazyArtifactPuller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
 	return l.p.PullArtifact(ctx, ref, cred, policy, paths)
 }
@@ -237,5 +244,113 @@ func TestPullArtifactRefusedWithoutClusterRegistry(t *testing.T) {
 	})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("err = %v, want FAILED_PRECONDITION", err)
+	}
+}
+
+// scriptedArtifactPuller is a fake ArtifactPuller: it can block every pull on
+// gate, records the peak number of pulls in flight, and fails with err.
+type scriptedArtifactPuller struct {
+	gate           chan struct{}
+	err            error
+	active, peak   atomic.Int32
+	entered        chan struct{}
+	hostCheckCalls atomic.Int32
+}
+
+func (s *scriptedArtifactPuller) CheckHost(ref string) error {
+	s.hostCheckCalls.Add(1)
+	if !strings.HasPrefix(ref, artifactTestHost+"/") {
+		return artifact.ErrNotClusterRegistry
+	}
+	return nil
+}
+
+func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string) (*artifact.Result, error) {
+	if err := s.CheckHost(ref); err != nil {
+		return nil, err
+	}
+	n := s.active.Add(1)
+	defer s.active.Add(-1)
+	for {
+		m := s.peak.Load()
+		if n <= m || s.peak.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	if s.entered != nil {
+		s.entered <- struct{}{}
+	}
+	if s.gate != nil {
+		select {
+		case <-s.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &artifact.Result{ManifestDigest: sha([]byte("m"))}, nil
+}
+
+func volumeReq(ref string) *runtimev1.PullArtifactRequest {
+	return &runtimev1.PullArtifactRequest{Reference: ref, ArtifactPolicy: runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME}
+}
+
+// TestPullArtifactRPCChecksHostBeforeCredentials: a foreign host is refused
+// before the daemon resolves any imagePullSecret, so naming another registry
+// can never make it read a Secret.
+func TestPullArtifactRPCChecksHostBeforeCredentials(t *testing.T) {
+	creds := &fakeCredentialResolver{cred: &image.RegistryCredential{Username: "u", Password: "p"}}
+	client, _ := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: &scriptedArtifactPuller{}, Credentials: creds})
+	req := volumeReq("ghcr.io/models/m:v1")
+	req.Namespace = "team"
+	req.ImagePullSecrets = []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+	_, err := client.PullArtifact(context.Background(), req)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("err = %v, want PERMISSION_DENIED", err)
+	}
+	if creds.gotNS != "" || creds.gotSecrets != nil {
+		t.Errorf("a credential was resolved (%q, %v) for a foreign host", creds.gotNS, creds.gotSecrets)
+	}
+}
+
+// TestPullArtifactRPCBoundsConcurrency: at most maxConcurrentArtifactPulls
+// PullArtifact calls run at once; the rest wait.
+func TestPullArtifactRPCBoundsConcurrency(t *testing.T) {
+	const callers = 8
+	ap := &scriptedArtifactPuller{gate: make(chan struct{}), entered: make(chan struct{}, callers)}
+	client, _ := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: ap})
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = client.PullArtifact(context.Background(), volumeReq(artifactTestHost+"/models/m:v1"))
+		}()
+	}
+	// Wait for the admitted pulls, then give the rest time to (wrongly) enter.
+	for range maxConcurrentArtifactPulls {
+		<-ap.entered
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := ap.peak.Load(); got != maxConcurrentArtifactPulls {
+		t.Errorf("peak concurrent pulls = %d, want %d", got, maxConcurrentArtifactPulls)
+	}
+	close(ap.gate)
+	wg.Wait()
+}
+
+// TestPullArtifactRPCBoundsErrorText: a failure carrying a huge foreign
+// message reaches the caller bounded.
+func TestPullArtifactRPCBoundsErrorText(t *testing.T) {
+	ap := &scriptedArtifactPuller{err: fmt.Errorf("%w: %s", artifact.ErrBlobTransfer, strings.Repeat("B", 100<<10))}
+	client, _ := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: ap})
+	_, err := client.PullArtifact(context.Background(), volumeReq(artifactTestHost+"/models/m:v1"))
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("err code = %v, want UNAVAILABLE", status.Code(err))
+	}
+	if n := len(status.Convert(err).Message()); n > 2048 {
+		t.Errorf("status message of %d bytes; it must be bounded", n)
 	}
 }

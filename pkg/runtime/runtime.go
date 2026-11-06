@@ -73,6 +73,9 @@ type Puller interface {
 // point beside Puller, never a relaxation of it: an artifact sent down Puller
 // still fails with image.ErrNoPlatformMatch.
 type ArtifactPuller interface {
+	// CheckHost refuses a reference that does not name the cluster registry,
+	// with no request; the RPC runs it before resolving any credential.
+	CheckHost(ref string) error
 	PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error)
 }
 
@@ -348,7 +351,10 @@ type Runtime struct {
 	// artifacts serves Images.PullArtifact; nil when no cluster registry is
 	// configured.
 	artifacts ArtifactPuller
-	backend   sandbox.Backend
+	// artifactSem bounds concurrent PullArtifact RPCs
+	// (maxConcurrentArtifactPulls).
+	artifactSem chan struct{}
+	backend     sandbox.Backend
 	// vmBackend is the Virtualization.framework micro-VM rung. createPod
 	// queries Available() so a vm-requested pod fails closed when it is absent, and
 	// routes a selected vm pod to CreateVM (away from the host-process path).
@@ -1121,6 +1127,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		signer:         signer,
 		credentials:    deps.Credentials,
 		artifacts:      artifacts,
+		artifactSem:    make(chan struct{}, maxConcurrentArtifactPulls),
 		backend:        backend,
 		vmBackend:      vmBackend,
 		guestDialer:    guestDialer,

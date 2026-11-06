@@ -269,7 +269,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 			return nil, fmt.Errorf("requested paths: %w", err)
 		}
 	}
-	if err := p.checkHost(ref); err != nil {
+	if err := p.CheckHost(ref); err != nil {
 		return nil, err
 	}
 
@@ -369,9 +369,10 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 	return res, nil
 }
 
-// checkHost refuses a reference whose registry is not the cluster registry.
-// It parses locally and makes no request.
-func (p *Puller) checkHost(ref string) error {
+// CheckHost refuses a reference whose registry is not the cluster registry.
+// It parses locally and makes no request, so a caller can run it before it
+// resolves any credential for the reference.
+func (p *Puller) CheckHost(ref string) error {
 	r, err := name.ParseReference(ref, name.StrictValidation)
 	if err != nil {
 		return fmt.Errorf("%s: %w: %w", image.QuoteBounded(ref, 512), ErrInvalidReference, bound(err))

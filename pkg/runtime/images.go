@@ -733,6 +733,21 @@ func (r *Runtime) RunImageGC(ctx context.Context, interval time.Duration, cfg im
 // copy, and private to the daemon.
 const artifactPartialDir = "artifact-partial"
 
+// maxConcurrentArtifactPulls bounds PullArtifact RPCs in flight. Each holds a
+// manifest (up to 4 MiB) and drives up to two layer transfers, and the caller
+// is the local socket, so a small bound keeps memory and connection use flat;
+// excess callers wait for a slot under their own deadline.
+const maxConcurrentArtifactPulls = 4
+
+// maxArtifactStatusBytes bounds an error rendered into a PullArtifact status:
+// the message carries registry text and travels into Pod Events.
+const maxArtifactStatusBytes = 1024
+
+// artifactStatus renders err bounded and ASCII-quoted for a status message.
+func artifactStatus(c codes.Code, err error) error {
+	return status.Error(c, image.QuoteBounded(err.Error(), maxArtifactStatusBytes))
+}
+
 // newArtifactPuller builds the daemon's own artifact puller over the same cache
 // and index the image puller uses, fetching only from the flat registry's
 // canonical host through that registry's own transport.
@@ -769,15 +784,26 @@ func (s *imagesService) PullArtifact(ctx context.Context, req *runtimev1.PullArt
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if _, err := artifactv1.AllowSetFor(req.GetArtifactPolicy()); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, artifactStatus(codes.InvalidArgument, err)
 	}
 	if s.rt.artifacts == nil {
 		return nil, status.Error(codes.FailedPrecondition,
 			"artifact pull refused: this node has no cluster registry configured")
 	}
+	// The host is checked BEFORE any credential is resolved, so naming a
+	// foreign registry can never make the daemon read a Secret.
+	if err := s.rt.artifacts.CheckHost(ref); err != nil {
+		return nil, artifactStatusError(err)
+	}
+	select {
+	case s.rt.artifactSem <- struct{}{}:
+		defer func() { <-s.rt.artifactSem }()
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 	cred, err := s.rt.artifactCredential(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
+		return nil, artifactStatus(codes.FailedPrecondition, err)
 	}
 	res, err := s.rt.artifacts.PullArtifact(ctx, ref, cred, req.GetArtifactPolicy(), req.GetPaths())
 	if err != nil {
@@ -810,25 +836,31 @@ func (r *Runtime) artifactCredential(ctx context.Context, req *runtimev1.PullArt
 func artifactStatusError(err error) error {
 	switch {
 	case errors.Is(err, artifact.ErrNotClusterRegistry):
-		return status.Error(codes.PermissionDenied, err.Error())
+		return artifactStatus(codes.PermissionDenied, err)
 	case errors.Is(err, artifact.ErrInsufficientSpace):
-		return status.Error(codes.ResourceExhausted, err.Error())
+		return artifactStatus(codes.ResourceExhausted, err)
 	case errors.Is(err, image.ErrDigestMismatch), errors.Is(err, artifact.ErrManifestDigest):
-		return status.Error(codes.DataLoss, err.Error())
+		return artifactStatus(codes.DataLoss, err)
 	case errors.Is(err, artifact.ErrBlobTransfer):
-		return status.Error(codes.Unavailable, err.Error())
+		return artifactStatus(codes.Unavailable, err)
 	case errors.Is(err, artifact.ErrIndexRefused), errors.Is(err, artifact.ErrImageNotArtifact),
 		errors.Is(err, artifact.ErrTypeRefused), errors.Is(err, artifact.ErrTarLayer),
 		errors.Is(err, artifact.ErrLayerTypeRefused), errors.Is(err, artifact.ErrTooManyLayers),
 		errors.Is(err, artifact.ErrNoLayers), errors.Is(err, artifact.ErrLayerPath),
 		errors.Is(err, artifact.ErrManifestTooLarge), errors.Is(err, artifact.ErrManifestInvalid),
 		errors.Is(err, artifact.ErrPathNotInArtifact), errors.Is(err, image.ErrBlobTooLarge):
-		return status.Error(codes.FailedPrecondition, err.Error())
+		return artifactStatus(codes.FailedPrecondition, err)
 	case errors.Is(err, artifact.ErrInvalidReference), errors.Is(err, artifactv1.ErrUnknownPolicy),
 		isPathRuleError(err):
-		return status.Error(codes.InvalidArgument, err.Error())
+		return artifactStatus(codes.InvalidArgument, err)
 	}
-	return imageStatusError(err)
+	if errors.Is(err, image.ErrFreeSpaceUnknown) {
+		return artifactStatus(codes.Unavailable, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return status.FromContextError(err).Err()
+	}
+	return artifactStatus(codes.Internal, err)
 }
 
 // isPathRuleError reports a requested-path refusal from artifactv1 (a layer
