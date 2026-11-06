@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -968,6 +969,11 @@ const (
 // tail into the old file is followed by one that writes the new instance into the
 // new file, and the old writer is closed only once this follower has moved off it.
 //
+// THE GUEST'S STOP IS FOLLOWED TOO. A container's SIGTERM handler runs while the
+// guest stops, so a delete holds the followers past the supervision cancel and
+// ends them once the guest has gone (holdGuestLogFollowers,
+// finishGuestLogFollowers). Every other cancel of the pod ends them with it.
+//
 // THE EXIT WAITS FOR THE FILE. The event watch folds a container's exit only
 // after awaitGuestLogDrain has had a connection begun after the exit end cleanly
 // into the current file, and a restart wakes the follower onto the new file at
@@ -988,7 +994,7 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 		backoff = vmLogFollowBaseBackoff
 	)
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || r.guestLogsFinal(p) {
 			return
 		}
 		w, asked := r.bindGuestLog(p, container)
@@ -1013,6 +1019,9 @@ func (r *Runtime) followGuestContainerLog(ctx context.Context, p *pod, container
 			r.log.Warn("stopping the guest log follower: the container log file is unwritable",
 				"pod", podID, "container", container, "err", err)
 			return
+		}
+		if r.guestLogsFinal(p) {
+			return // the guest has gone, and this stream had all it wrote
 		}
 		if err != nil {
 			r.log.Warn("guest log stream ended; reconnecting",
@@ -1092,10 +1101,7 @@ func (r *Runtime) awaitGuestLogDrain(ctx context.Context, p *pod, container stri
 	}
 	f.asked++
 	want := f.asked
-	select {
-	case f.wake <- struct{}{}:
-	default:
-	}
+	f.wakeLocked()
 	p.mu.Unlock()
 
 	timer := time.NewTimer(vmExitLogDrainWait)
@@ -1149,6 +1155,8 @@ func (r *Runtime) guestLogWake(p *pod, container string) <-chan struct{} {
 // fold waits on (awaitGuestLogDrain). Guarded by pod.mu.
 type guestLogFollower struct {
 	bound *crilog.Writer
+	// cancel ends this follower's connection, wherever it is blocked.
+	cancel context.CancelFunc
 	// wake (capacity 1) cuts the follower's reconnect backoff short.
 	wake chan struct{}
 	// asked is the newest drain generation requested; drained the newest a
@@ -1161,8 +1169,17 @@ type guestLogFollower struct {
 }
 
 // newGuestLogFollower builds an idle registration.
-func newGuestLogFollower() *guestLogFollower {
-	return &guestLogFollower{wake: make(chan struct{}, 1), changed: make(chan struct{})}
+func newGuestLogFollower(cancel context.CancelFunc) *guestLogFollower {
+	return &guestLogFollower{cancel: cancel, wake: make(chan struct{}, 1), changed: make(chan struct{})}
+}
+
+// wakeLocked cuts the follower's reconnect backoff short. A wake already pending
+// is the same wake. The caller holds pod.mu.
+func (f *guestLogFollower) wakeLocked() {
+	select {
+	case f.wake <- struct{}{}:
+	default:
+	}
 }
 
 // signalLocked wakes every drain waiter to re-check. The caller holds pod.mu.
@@ -1175,8 +1192,17 @@ func (f *guestLogFollower) signalLocked() {
 // already running. The registration is taken under p.mu before the goroutine
 // starts, so two callers can never start two followers that would each write
 // every entry into the same file.
+//
+// The follower's context is not p.supCtx, because a delete cancels that before it
+// stops the guest, and the guest's last output comes after. It is detached from
+// p.supCtx and ended by that cancel unless a delete holds it, so every other way
+// a pod's supervision ends still ends the follower.
 func (r *Runtime) startGuestLogFollower(p *pod, container string) {
 	p.mu.Lock()
+	if p.guestLogsDone {
+		p.mu.Unlock()
+		return // the guest has gone: nothing more will be written
+	}
 	if p.guestLogFollow == nil {
 		p.guestLogFollow = map[string]*guestLogFollower{}
 	}
@@ -1184,16 +1210,125 @@ func (r *Runtime) startGuestLogFollower(p *pod, container string) {
 		// A restart calls this after giving the container a new file. The
 		// running follower must move onto it now, not after whatever backoff
 		// it is sleeping out: the new instance may print and exit at once.
-		select {
-		case f.wake <- struct{}{}:
-		default:
-		}
+		f.wakeLocked()
 		p.mu.Unlock()
 		return
 	}
-	p.guestLogFollow[container] = newGuestLogFollower()
+	ctx, cancel := context.WithCancel(context.WithoutCancel(p.supCtx))
+	p.guestLogFollow[container] = newGuestLogFollower(cancel)
 	p.mu.Unlock()
-	go r.followGuestContainerLog(p.supCtx, p, container)
+	unwatch := context.AfterFunc(p.supCtx, func() {
+		p.mu.Lock()
+		held := p.guestLogsHeld
+		p.mu.Unlock()
+		if !held {
+			cancel()
+		}
+	})
+	go func() {
+		defer cancel()
+		defer unwatch()
+		r.followGuestContainerLog(ctx, p, container)
+	}()
+}
+
+// holdGuestLogFollowers keeps p's log followers running past the cancel of its
+// supervision, for a delete about to stop the guest. Call it BEFORE that cancel,
+// and follow the stop with finishGuestLogFollowers, which ends what this holds.
+//
+// A follower sitting out a long backoff is woken, so it is connected while the
+// guest can still answer.
+func (r *Runtime) holdGuestLogFollowers(p *pod) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.guestLogsHeld = true
+	for _, f := range p.guestLogFollow {
+		f.wakeLocked()
+	}
+}
+
+// finishGuestLogFollowers ends p's log followers now that its guest has gone. A
+// follower whose stream ends stops rather than reconnects, having written what
+// the guest sent, and this waits for that. The guest's end ends the streams, so
+// the wait is normally brief. After bound it cancels whatever is left: a stream
+// that never ends costs its remaining output, not the delete.
+func (r *Runtime) finishGuestLogFollowers(p *pod, bound time.Duration) {
+	p.mu.Lock()
+	p.guestLogsDone = true
+	followers := maps.Clone(p.guestLogFollow)
+	for _, f := range followers {
+		f.wakeLocked()
+	}
+	p.mu.Unlock()
+
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	expired := false
+	for name, f := range followers {
+		for !expired {
+			p.mu.Lock()
+			running := p.guestLogFollow[name] == f
+			changed := f.changed
+			p.mu.Unlock()
+			if !running {
+				break
+			}
+			select {
+			case <-changed:
+			case <-timer.C:
+				expired = true
+			}
+		}
+		if expired {
+			break
+		}
+	}
+	if !expired {
+		return
+	}
+	p.mu.Lock()
+	left := make([]string, 0, len(p.guestLogFollow))
+	for name, f := range p.guestLogFollow {
+		left = append(left, name)
+		f.cancel()
+	}
+	p.mu.Unlock()
+	if len(left) > 0 {
+		r.log.Warn("gave up on a stopped vm pod's log streams; output still in them is lost",
+			"pod", p.box.GetPodId(), "containers", left, "waited", bound)
+	}
+}
+
+// guestLogsFinal reports whether p's guest has gone, so that no further
+// connection can bring a follower anything.
+func (r *Runtime) guestLogsFinal(p *pod) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.guestLogsDone
+}
+
+// defaultVMStopLogDrain and vmStopLogDrainFloor shape the wait after a vm pod's
+// guest has gone for its log followers to finish (guestStopLogDrainBound).
+//
+// The ceiling is short because the wait is short when anything is working: the
+// helper's exit ends every stream, and what remains is reading what had already
+// crossed. The floor is what lets a guest that spent its whole grace, or a grace
+// 0 stop, still have what crossed reach the file.
+const (
+	defaultVMStopLogDrain = 2 * time.Second
+	vmStopLogDrainFloor   = 250 * time.Millisecond
+)
+
+// guestStopLogDrainBound returns how long a delete may wait for p's log followers
+// after the guest has gone, given what is left of the pod's grace: the ceiling,
+// cut to the grace left so a stuck stream cannot extend the delete past the grace
+// period, but never under the floor.
+func (r *Runtime) guestStopLogDrainBound(graceLeft time.Duration) time.Duration {
+	ceiling := defaultVMStopLogDrain
+	if r.vmStopLogDrain > 0 {
+		ceiling = r.vmStopLogDrain
+	}
+	return min(ceiling, max(graceLeft, vmStopLogDrainFloor))
 }
 
 // bindGuestLog returns the container's current writer and records it as the

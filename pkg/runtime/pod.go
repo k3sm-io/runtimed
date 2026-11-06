@@ -146,6 +146,11 @@ type pod struct {
 	// container's writer without closing one under a follower still draining
 	// the previous instance's tail. Guarded by mu.
 	guestLogFollow map[string]*guestLogFollower
+	// guestLogsHeld means a delete keeps the followers running past the cancel of
+	// supervision, because its stop of the guest is still to produce output.
+	// guestLogsDone means the guest has gone: followers end, and none starts.
+	// Both latch; guarded by mu.
+	guestLogsHeld, guestLogsDone bool
 	// guestRestarts holds the in-guest restart in flight for each vm container,
 	// keyed by name. Its presence is the restart's claim, and the ContainerEvents
 	// fold consumes it on the replacement's start. Guarded by mu.

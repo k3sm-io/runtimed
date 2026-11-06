@@ -399,6 +399,12 @@ type Runtime struct {
 	// drainGrace is one: tests shrink it, there being no clock seam here.
 	guestLeasePoll time.Duration
 
+	// vmStopLogDrain caps how long a vm pod's delete waits, after its guest has
+	// gone, for the log followers to finish writing what the guest sent; 0
+	// selects defaultVMStopLogDrain. A field for the same reason drainGrace is
+	// one: tests move it, there being no clock seam here.
+	vmStopLogDrain time.Duration
+
 	// netReconcileOnce/netReconcileErr make the optional network startup
 	// reconcile (NetworkReconciler) run exactly once per Runtime, before any
 	// CreatePod is served. Once.Do provides the happens-before for the error
