@@ -64,6 +64,16 @@ BUILT=(
 	"./pkg/artifact/:TestStaleViewStagingReapedAtStart"
 	"./pkg/artifact/:TestArtifactPartialDirMustBeTheCacheChild"
 	"./pkg/image/:TestPruneKeepsLiveArtifactReclaimsDeadOne"
+	"./pkg/artifact/:TestArtifactViewCloneRefusesBeforeAnyCopy"
+	"./pkg/artifact/:TestViewsRefuseOtherDeviceAtStart"
+	"./pkg/artifact/:TestViewsDirsOwnedExactMode"
+	"./pkg/artifact/:TestPruneSweepsViewsOfReplacedManifest"
+	"./pkg/artifact/:TestForgetKeepsRecordRePutConcurrently"
+	"./pkg/artifact/:TestStartupRemovesTamperedViews"
+	"./pkg/image/:TestCloneOnlyClonesOrRefuses"
+	"./pkg/image/:TestArtifactRecordsRefuseNonRegularJSON"
+	"./pkg/image/:TestArtifactRootsNameCorruptRecord"
+	"./pkg/runtime/:TestPruneImagesSweepsOrphanedArtifactViews"
 )
 
 # Named tests not built yet. Empty: every named test is in BUILT.
