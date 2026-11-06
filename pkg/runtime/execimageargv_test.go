@@ -350,10 +350,11 @@ func TestExecLeavesOtherShapesAsSent(t *testing.T) {
 	})
 }
 
-// TestExecOfAnImageFileGetsTheStartGate pins "no more than start grants". The
-// file exec reaches in the image passes the gate the container's own argv[0]
-// passed, in the same order, so a pod whose policy refuses a binary at start does
-// not run it by exec; and a host file keeps exec's present answer, ungated.
+// TestExecOfAnImageFileGetsTheStartGate pins that the file exec reaches in the
+// image passes the gate the container's own argv[0] passed, in the same order, so
+// a file the policy refuses when the check runs does not start a session; and that
+// a host file keeps exec's present answer, ungated. The gate reads the file once:
+// it does not hold against a pod that swaps the file after the check.
 func TestExecOfAnImageFileGetsTheStartGate(t *testing.T) {
 	tree := map[string]string{"bin/tool": imageScript}
 	require := func(box *runtimev1.PodBox) {

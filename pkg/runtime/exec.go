@@ -177,8 +177,15 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 // missing file fails the container. Exec does, only when the image has no entry
 // at that path: the command is left as sent and runs the host's file, which is
 // how a session of a host shell or tool works in an image that ships neither.
-// An image entry that cannot run is refused and never falls back, so a planted
-// link cannot quietly swap in a host binary.
+// An image entry that cannot run is refused and does not fall back, so a link
+// that leaves the root never becomes a run of the host's file.
+//
+// The pod decides which side of that rule a name lands on, because it can write
+// its rootfs. Removing the entry forces the host fallback, and writing one makes
+// the image's copy win, so an operator's /bin/sh may be the host's or the image's,
+// and in the second case it holds whatever the pod put there. Neither answer
+// changes the confinement described below, and neither tells the operator which
+// file ran.
 //
 // # What is left as sent
 //
@@ -194,12 +201,17 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 //     answer for it; the interposer rebases such a path into the rootfs as it
 //     always has.
 //
-// # What it grants
+// # What bounds the session
 //
-// Nothing beyond start. The session keeps the pod's profile, credential and
-// limits, whatever path it names, and the image file passes gateSignature, the
-// gate the container's own argv[0] passed, so a policy that would refuse a binary
-// at start refuses it here. A host file is not gated, as it never was for exec.
+// The pod's profile does. The session keeps the pod's profile, credential and
+// limits, whatever path it names, and that is the boundary against a running pod.
+//
+// The signature gate is not that boundary. The image file passes gateSignature,
+// the gate the container's own argv[0] passed, which catches a bad image or an
+// operator error: a file the policy refuses, while it is still that file. It reads
+// the file once, and a running pod can swap the file straight after the check, so
+// passing it says nothing about what the session then runs. A host file is not
+// gated, as it never was for exec.
 func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.Container, cmdv []string) ([]string, error) {
 	argv0 := cmdv[0]
 	if hostBinaryRoute(c) || !filepath.IsAbs(argv0) {
