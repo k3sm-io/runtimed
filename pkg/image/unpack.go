@@ -296,7 +296,7 @@ type Unpacker struct {
 	limits ApplyLimits
 	// log reports a recovered layer panic (WithUnpackLogger). Nil discards.
 	log *slog.Logger
-	// decompress and applyTar are the calls applyLayer makes into code that reads
+	// decompress and applyTar are the calls readLayer makes into code that reads
 	// a layer's bytes. They are fields so a test can raise a panic from inside
 	// them; NewUnpacker sets the production functions and nothing else writes them.
 	decompress func(mediaType string, r io.Reader) (io.ReadCloser, error)
@@ -507,6 +507,14 @@ func (u *Unpacker) Unpack(ctx context.Context, mfst *runtimev1.ImageManifest, po
 	}
 	defer os.RemoveAll(staging) // no-op after a successful rename
 
+	// Sorting the ownership entries (applyStaged, through Ownership) and writing
+	// the two documents below stay outside readLayer's recover. Their layer-derived
+	// input is plain strings and numbers, ordered by string comparison and encoded
+	// by encoding/json: no decoder and no parser of layer bytes runs here, so no
+	// value a layer can name reaches code that can panic on it. A panic here is a
+	// bug in the daemon, which should not read as a bad layer. It ends the process,
+	// and running out of memory on a huge entry list would end it under any recover.
+	// TestTreeDocumentsHaveNoLayerPanicSurface fails when a field stops being plain.
 	rec := treeRecord{
 		Version: treeRecordVersion,
 		Key:     loc.key,
@@ -759,8 +767,50 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 // The two hashers are wired around the decompressor rather than after it so the
 // bytes are hashed exactly once each; the verdicts are checked after the apply
 // because a hash is only known at eof. That ordering is safe because the apply
-// happens into a disposable staging tree that is discarded on any error — the
+// happens into a disposable staging tree that is discarded on any error, the
 // contract applyStaged is built to provide.
+//
+// What runs here, around readLayer, is the daemon's own setup and no decoder:
+// parsing the digests, opening the blob, comparing the hashes. It stays outside
+// readLayer's recover, so a bug in it is a crash and not a report of a bad layer.
+// The digests are registry strings, so keeping that setup outside the recover
+// rests on the parser it calls: ggcrv1.NewHash, read in full, is pure string
+// validation with no panic reachable from a registry-supplied digest. A future
+// bump of that library that adds a panic would crash the daemon here, because
+// this setup is deliberately outside the recover.
+func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, diffID string) error {
+	wantBlob, err := parseBlobDigest(desc.GetDigest())
+	if err != nil {
+		return err
+	}
+	wantDiff, err := parseBlobDigest(diffID)
+	if err != nil {
+		return fmt.Errorf("config diffID: %w", err)
+	}
+	f, err := u.cache.openBlob(desc.GetDigest())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	blobHash := blobHashers[wantBlob.Algorithm]()
+	diffHash := blobHashers[wantDiff.Algorithm]()
+	if err := u.readLayer(ctx, applier, desc, io.TeeReader(f, blobHash), diffHash); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(blobHash.Sum(nil)); got != wantBlob.Hex {
+		return fmt.Errorf("blob hashed to %s:%s: %w", wantBlob.Algorithm, got, ErrDigestMismatch)
+	}
+	if got := hex.EncodeToString(diffHash.Sum(nil)); got != wantDiff.Hex {
+		return fmt.Errorf("layer content hashed to %s:%s, config claims %s: %w",
+			wantDiff.Algorithm, got, quoteBounded(diffID, maxDigestLen), ErrDiffIDMismatch)
+	}
+	return nil
+}
+
+// readLayer decompresses compressed and applies it through applier, feeding every
+// decompressed byte to diffHash, then drains both streams so each hasher has seen
+// the whole of its stream.
 //
 // # A panic is a malformed layer
 //
@@ -779,31 +829,18 @@ func (u *Unpacker) applyStaged(ctx context.Context, layers []*runtimev1.Descript
 //     this like any other layer error, stops, and removes the staging directory;
 //   - the file being written is closed by applyRegular's own defer.
 //
+// The applier is the daemon's own code, and it is under the recover because it is
+// what reads the tar. So a bug in it also reads as a malformed layer: the verdict
+// cannot tell the two apart, and the logged stack is what does.
+//
 // It does not reach what the runtime treats as fatal rather than as a panic: a
 // memory fault past the zero page (the decoders' assembly included), stack
 // exhaustion, and running out of memory still end the process. A panic on another
-// goroutine would too. Nor does it cover what runs on these bytes outside this
-// function, such as sorting and writing the ownership sidecar in Unpack.
-func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, diffID string) (retErr error) {
+// goroutine would too. Nor does it cover what runs after the layers, sorting and
+// writing the tree's documents; Unpack says why those stay out.
+func (u *Unpacker) readLayer(ctx context.Context, applier *LayerApplier, desc *runtimev1.Descriptor, compressed io.Reader, diffHash io.Writer) (retErr error) {
 	defer u.recoverLayerPanic(desc.GetDigest(), &retErr)
 
-	wantBlob, err := parseBlobDigest(desc.GetDigest())
-	if err != nil {
-		return err
-	}
-	wantDiff, err := parseBlobDigest(diffID)
-	if err != nil {
-		return fmt.Errorf("config diffID: %w", err)
-	}
-	f, err := u.cache.openBlob(desc.GetDigest())
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	blobHash := blobHashers[wantBlob.Algorithm]()
-	diffHash := blobHashers[wantDiff.Algorithm]()
-	compressed := io.TeeReader(f, blobHash)
 	plain, err := u.decompress(desc.GetMediaType(), compressed)
 	if err != nil {
 		return err
@@ -812,7 +849,7 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 
 	// ONE tee, shared by the apply and the drain below. The diffID is defined as
 	// the digest of the RAW decompressed layer bytes, so every byte that leaves
-	// the decompressor must pass through diffHash — including the ones the tar
+	// the decompressor must pass through diffHash, including the ones the tar
 	// reader never asks for. Draining the decompressor DIRECTLY (which this did)
 	// hashes a prefix: archive/tar stops at the end-of-archive marker and never
 	// reads the 10240-byte block padding GNU tar and buildkit emit, so every
@@ -824,20 +861,13 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 	}
 	// Drain whatever the tar reader left (its trailing padding, and any bytes
 	// after the archive's end-of-archive marker) so both hashers see the whole
-	// stream. Without this the digests are computed over a prefix and the checks
-	// below would pass for a blob with arbitrary appended content.
+	// stream. Without this the digests are computed over a prefix and applyLayer's
+	// checks would pass for a blob with arbitrary appended content.
 	if _, err := io.Copy(io.Discard, plainTee); err != nil {
 		return fmt.Errorf("%w: drain layer: %v", ErrLayerMalformed, boundErr(err))
 	}
 	if _, err := io.Copy(io.Discard, compressed); err != nil {
 		return fmt.Errorf("%w: drain layer blob: %v", ErrLayerMalformed, boundErr(err))
-	}
-	if got := hex.EncodeToString(blobHash.Sum(nil)); got != wantBlob.Hex {
-		return fmt.Errorf("blob hashed to %s:%s: %w", wantBlob.Algorithm, got, ErrDigestMismatch)
-	}
-	if got := hex.EncodeToString(diffHash.Sum(nil)); got != wantDiff.Hex {
-		return fmt.Errorf("layer content hashed to %s:%s, config claims %s: %w",
-			wantDiff.Algorithm, got, quoteBounded(diffID, maxDigestLen), ErrDiffIDMismatch)
 	}
 	return nil
 }
@@ -847,7 +877,7 @@ func (u *Unpacker) applyLayer(ctx context.Context, applier *LayerApplier, desc *
 // exists for frames with long names, and a cut one is still readable.
 const maxLayerPanicStackBytes = 16 << 10
 
-// recoverLayerPanic is applyLayer's deferred recover: it must be deferred directly
+// recoverLayerPanic is readLayer's deferred recover: it must be deferred directly
 // for its recover to see the panic.
 //
 // The panic value is foreign text on its way to a Pod status, so it is quoted as
@@ -1111,7 +1141,7 @@ const maxZstdWindow = 128 << 20
 // caller, because LayerApplier.Apply wraps any read failure that way — the
 // verdict a caller acts on is therefore the same either way.
 //
-// A decoder panic is the same verdict, from applyLayer's recover. That recover
+// A decoder panic is the same verdict, from readLayer's recover. That recover
 // reaches a decoder only because the decoder runs on the calling goroutine:
 // compress/gzip and compress/flate start no goroutines, and klauspost zstd starts
 // its decoding goroutines only in Reset's startStreamDecoder arm, which it skips
@@ -1128,7 +1158,7 @@ func decompressLayer(mediaType string, r io.Reader) (io.ReadCloser, error) {
 		// Single-goroutine, window-bounded: the caller already streams one layer
 		// at a time and the concurrency would only add goroutines whose lifetime
 		// this function cannot state, and on which a decoder panic would end the
-		// process, because applyLayer's recover cannot reach another goroutine.
+		// process, because readLayer's recover cannot reach another goroutine.
 		// TestLayerDecoderPanicIsMalformed crashes if this is raised. Close on the
 		// returned ReadCloser releases the decoder (zstd.Decoder.Close returns
 		// nothing to report).

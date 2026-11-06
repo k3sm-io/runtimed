@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +29,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -526,4 +530,180 @@ func TestLayerApplierPanicIsMalformed(t *testing.T) {
 			t.Errorf("open descriptors went from %d to %d over 8 panics", before, after)
 		}
 	})
+}
+
+// layerByteMarker is what the stack tests look for: bytes that only the layer
+// holds, which appear in a logged stack only if a traceback starts rendering what
+// its argument words point to.
+const layerByteMarker = "k3sm-layer-content-marker-7f3a"
+
+// panicHoldingLayerBytes panics with value from a frame whose string and slice
+// arguments hold layer content. It is not inlined so the frame, and the argument
+// words a traceback prints for it, exist.
+//
+//go:noinline
+func panicHoldingLayerBytes(value any, s string, b []byte) {
+	if len(s) != len(b) {
+		return
+	}
+	panic(value)
+}
+
+// TestLayerPanicStackCarriesNoLayerBytes pins what recoverLayerPanic's doc comment
+// relies on: a traceback prints argument words in hex, not the strings and slices
+// they point to, so layer content passed down the stack stays out of the node log.
+// A toolchain that began rendering them would fail here, not on a node.
+//
+// The panic value is a separate path. It is foreign text the recover quotes on
+// purpose into the panic attribute and the error, so the second case lets a value
+// carry the marker and asserts only that it stays out of the stack attribute.
+func TestLayerPanicStackCarriesNoLayerBytes(t *testing.T) {
+	plain := buildTar(t, []tarSpec{{name: "app", mode: 0o755, data: layerByteMarker}})
+	unpack := func(t *testing.T, value any) (*panicLog, error) {
+		t.Helper()
+		log := &panicLog{}
+		c, u := newTestUnpacker(t, WithUnpackLogger(log.logger()))
+		u.applyTar = func(_ *LayerApplier, _ context.Context, r io.Reader) error {
+			layer, err := io.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			if !bytes.Contains(layer, []byte(layerByteMarker)) {
+				t.Errorf("the frame's arguments do not hold the marker")
+			}
+			panicHoldingLayerBytes(value, string(layer), layer)
+			return nil
+		}
+		mfst := commitLayerImage(t, c, plain, plain, mediaTypeOCILayerTar)
+		_, err := unpackSeeingPanics(t, u, mfst, LinuxUnpackPolicy())
+		if !errors.Is(err, ErrLayerMalformed) {
+			t.Fatalf("unpack error = %v, want ErrLayerMalformed", err)
+		}
+		return log, err
+	}
+	assertCleanStack := func(t *testing.T, log *panicLog) {
+		t.Helper()
+		recs := log.records(t)
+		if len(recs) != 1 {
+			t.Fatalf("logged %d records, want 1", len(recs))
+		}
+		stack, _ := recs[0]["stack"].(string)
+		if !strings.Contains(stack, "panicHoldingLayerBytes") {
+			t.Fatalf("logged stack does not name the frame holding the bytes: %s", stack)
+		}
+		for _, leak := range []string{layerByteMarker, hex.EncodeToString([]byte(layerByteMarker))} {
+			if strings.Contains(stack, leak) {
+				t.Errorf("logged stack carries layer content %q: %s", leak, stack)
+			}
+		}
+	}
+
+	t.Run("arguments_holding_the_bytes", func(t *testing.T) {
+		log, err := unpack(t, "layer state is gone")
+		assertCleanStack(t, log)
+		if strings.Contains(log.buf.String(), layerByteMarker) {
+			t.Errorf("the log record carries layer content: %s", log.buf.String())
+		}
+		if strings.Contains(err.Error(), layerByteMarker) {
+			t.Errorf("the error carries layer content: %s", err)
+		}
+	})
+
+	t.Run("a_panic_value_holding_the_bytes", func(t *testing.T) {
+		log, _ := unpack(t, "bad entry "+layerByteMarker)
+		assertCleanStack(t, log)
+		// The control: the marker did travel the value's path, so its absence from
+		// the stack above is the stack's doing.
+		if got, _ := log.records(t)[0]["panic"].(string); !strings.Contains(got, layerByteMarker) {
+			t.Errorf("the panic attribute = %q, want it to quote the value", got)
+		}
+	})
+}
+
+// TestLayerSetupPanicIsNotMalformed pins the recover's narrow reach: a nil
+// dereference in the daemon's own setup, here the blob store being absent, is a
+// bug and must not be reported as a bad layer, so it reaches the caller and no
+// layer verdict is logged.
+func TestLayerSetupPanicIsNotMalformed(t *testing.T) {
+	var log panicLog
+	_, u := newTestUnpacker(t, WithUnpackLogger(log.logger()))
+	u.cache = nil
+	digest := "sha256:" + strings.Repeat("a", 64)
+
+	var err error
+	raised := func() (v any) {
+		defer func() { v = recover() }()
+		err = u.applyLayer(context.Background(), nil, &runtimev1.Descriptor{Digest: digest}, digest)
+		return nil
+	}()
+	if raised == nil {
+		t.Errorf("no panic reached the caller; applyLayer returned %v", err)
+	}
+	if log.buf.Len() != 0 {
+		t.Errorf("a setup panic logged a layer verdict: %s", log.buf.String())
+	}
+}
+
+// assertPlainDocType fails on a type in a tree document whose JSON encoding could
+// run anything but encoding/json's own handling of strings, numbers and containers.
+func assertPlainDocType(t *testing.T, typ reflect.Type) {
+	t.Helper()
+	for _, m := range []reflect.Type{
+		reflect.TypeFor[json.Marshaler](),
+		reflect.TypeFor[encoding.TextMarshaler](),
+	} {
+		if typ.Implements(m) || reflect.PointerTo(typ).Implements(m) {
+			t.Errorf("%s implements %s, so encoding it runs code on layer-derived values", typ, m)
+		}
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		for f := range typ.Fields() {
+			assertPlainDocType(t, f.Type)
+		}
+	case reflect.Map:
+		assertPlainDocType(t, typ.Key())
+		assertPlainDocType(t, typ.Elem())
+	case reflect.Slice, reflect.Array:
+		assertPlainDocType(t, typ.Elem())
+	case reflect.Interface, reflect.Pointer, reflect.Func, reflect.Chan:
+		t.Errorf("%s has kind %s, which leaves what is encoded open", typ, typ.Kind())
+	}
+}
+
+// TestTreeDocumentsHaveNoLayerPanicSurface is why sorting and writing the ownership
+// sidecar and the tree record stay outside the layer recover (see Unpack): their
+// layer-derived input is plain strings and numbers, ordered by string comparison
+// and encoded by encoding/json, so no value a layer can name reaches code that can
+// panic on it. A field whose type runs its own encoding changes that, and fails
+// here, which is the point to revisit the decision.
+func TestTreeDocumentsHaveNoLayerPanicSurface(t *testing.T) {
+	assertPlainDocType(t, reflect.TypeFor[OwnershipEntry]())
+	assertPlainDocType(t, reflect.TypeFor[treeRecord]())
+
+	hostile := []string{
+		"", ".", "..", "/", "a/../b", "\x00", "a\x00b", "\xff\xfe", "caf\xe9",
+		" ", `"`, `\`, "<>&", "line\nbreak", strings.Repeat("a/", 1<<16),
+	}
+	var entries []OwnershipEntry
+	for i, p := range hostile {
+		entries = append(entries, OwnershipEntry{
+			Path:   p,
+			Type:   OwnershipEntryType(p),
+			UID:    -1 << 63,
+			GID:    1<<63 - 1,
+			Mode:   uint32(i),
+			Xattrs: map[string][]byte{p: []byte(p)},
+		}, OwnershipEntry{Path: p})
+	}
+	sortOwnership(entries)
+
+	dir := t.TempDir()
+	if err := writeOwnershipSidecar(filepath.Join(dir, SnapshotOwnershipName), entries); err != nil {
+		t.Errorf("write ownership sidecar: %v", err)
+	}
+	rec := treeRecord{Key: "\xff\xfe", Config: "caf\xe9", Layers: hostile, DiffIDs: hostile, Ownership: "a\x00b"}
+	if err := writeTreeRecord(filepath.Join(dir, SnapshotRecordName), rec); err != nil {
+		t.Errorf("write tree record: %v", err)
+	}
 }
