@@ -102,6 +102,11 @@ func NewCache(root string) (*Cache, error) {
 // and its validation can only ever be changed here.
 func (c *Cache) Root() string { return c.root }
 
+// BlobStoreDir returns the directory of the content-addressed blob store, for
+// a check about the store as a whole (which volume it is on). It is not a way
+// to reach a blob: see Root for why a path is never joined onto it.
+func (c *Cache) BlobStoreDir() string { return c.blobsDir() }
+
 // blobsDir is the content-addressed blob store.
 func (c *Cache) blobsDir() string { return filepath.Join(c.root, "blobs") }
 

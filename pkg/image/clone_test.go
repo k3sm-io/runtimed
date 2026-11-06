@@ -17,8 +17,12 @@ limitations under the License.
 package image
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
 )
 
@@ -93,4 +97,46 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestCloneOnlyClonesOrRefuses pins the clone-only cloner: the errnos that
+// mean "this volume cannot clone" are what IsCloneUnsupported reports and a
+// permission error is not, and on darwin a same-volume clone succeeds as a
+// clone; off darwin every clone is refused as unsupported, with nothing
+// written.
+func TestCloneOnlyClonesOrRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{syscall.EXDEV, true},
+		{syscall.ENOTSUP, true},
+		{syscall.EOPNOTSUPP, true},
+		{fmt.Errorf("wrapped: %w", &os.LinkError{Op: "clonefile", Err: syscall.EXDEV}), true},
+		{syscall.EACCES, false},
+		{syscall.EEXIST, false},
+	} {
+		if got := IsCloneUnsupported(tc.err); got != tc.want {
+			t.Errorf("IsCloneUnsupported(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	mustWrite(t, src, "payload", 0o644)
+	cow, err := CloneOnly{}.Clone(src, dst)
+	if runtime.GOOS != "darwin" {
+		if !IsCloneUnsupported(err) || cow {
+			t.Fatalf("CloneOnly off darwin = %v, %v; want an unsupported refusal", cow, err)
+		}
+		if _, serr := os.Lstat(dst); !errors.Is(serr, os.ErrNotExist) {
+			t.Errorf("a refused clone left %s: %v", dst, serr)
+		}
+		return
+	}
+	if err != nil || !cow {
+		t.Fatalf("CloneOnly on one APFS volume = %v, %v; want a clone", cow, err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "payload" {
+		t.Errorf("clone reads %q, %v", got, err)
+	}
 }

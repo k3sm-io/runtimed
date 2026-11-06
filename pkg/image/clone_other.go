@@ -18,6 +18,11 @@ limitations under the License.
 
 package image
 
+import (
+	"errors"
+	"os"
+)
+
 // APFSCloner off darwin has no APFS CoW; it byte-copies. It exists so the
 // package builds and unit-tests run on non-darwin CI; production is darwin-only.
 type APFSCloner struct{}
@@ -28,6 +33,15 @@ func (APFSCloner) Clone(src, dst string) (bool, error) {
 		return false, err
 	}
 	return false, nil
+}
+
+// CloneOnly off darwin has no clonefile, so every clone is refused as
+// unsupported (IsCloneUnsupported) without copying.
+type CloneOnly struct{}
+
+// Clone refuses: there is no copy-on-write clone off darwin.
+func (CloneOnly) Clone(src, dst string) (bool, error) {
+	return false, &os.LinkError{Op: "clonefile", Old: src, New: dst, Err: errors.ErrUnsupported}
 }
 
 // assertNoQuarantine is a no-op off darwin (no com.apple.quarantine concept).
