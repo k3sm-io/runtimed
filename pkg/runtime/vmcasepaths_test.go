@@ -277,7 +277,8 @@ func tempIsCaseSensitive(t *testing.T) bool {
 // holds two names differing only by case, from CreatePod down through the real
 // puller and unpacker: the store's measured case sensitivity decides, a
 // case-sensitive store holds both names, and a case-insensitive one refuses and
-// says what to do.
+// says what to do. Nothing collapses the pair silently, at the unpack or at the
+// clone into the pod.
 //
 // The measured rows inject the measurement, because a stock host's temp directory
 // is case-insensitive and a case-sensitive volume needs a mount. The real rows
@@ -322,6 +323,19 @@ func TestVMImageWithCaseOnlyPathsMaterializes(t *testing.T) {
 	t.Run("a store that cannot be measured refuses and says so", func(t *testing.T) {
 		rig := newCaseRig(t, func(*os.Root) (bool, error) { return false, errors.New("probe boom") })
 		rig.assertRefusal(t, rig.create(t, pairRef), casePathManUpper, casePathManLower, remedy, "probe boom")
+	})
+
+	t.Run("a case-insensitive pod rootfs refuses a pair the store holds", func(t *testing.T) {
+		rig := newCaseRig(t, func(root *os.Root) (bool, error) {
+			return !strings.Contains(root.Name(), "/pods/"), nil
+		})
+		rig.assertRefusal(t, rig.create(t, pairRef), casePathConfigUpper, casePathConfigLower, remedy)
+		if got := rig.cloner.n.Load(); got != 0 {
+			t.Errorf("%d files were cloned ahead of the refusal", got)
+		}
+		if snaps := rig.snapshots(t); len(snaps) != 1 {
+			t.Errorf("committed snapshots = %v, want the store to keep its one tree", snaps)
+		}
 	})
 
 	t.Run("a pair-free image is not refused on a case-insensitive store", func(t *testing.T) {

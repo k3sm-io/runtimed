@@ -106,6 +106,21 @@ func collisionError(prev, name string, probeErr error) error {
 		ErrPathCollision, a, b, remedy)
 }
 
+// firstCasePair returns the first two entries whose paths a case-insensitive
+// filesystem would merge. Every ancestor directory has its own entry, so a pair
+// only a parent spells ("Foo/a", "foo/b") is found through "Foo" and "foo".
+func firstCasePair(entries []OwnershipEntry) (prev, name string, found bool) {
+	seen := make(map[string]string, len(entries))
+	for _, e := range entries {
+		key := foldKey(e.Path)
+		if p, ok := seen[key]; ok && p != e.Path {
+			return p, e.Path, true
+		}
+		seen[key] = e.Path
+	}
+	return "", "", false
+}
+
 // OCI/AUFS whiteout markers, as specified by the OCI image-spec ("Applying
 // Changesets") and as produced by every builder that writes an OCI layer.
 const (

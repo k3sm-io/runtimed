@@ -647,6 +647,10 @@ func (u *Unpacker) locate(mfst *runtimev1.ImageManifest, policy UnpackPolicy) (t
 // copy goes through the package's MaterializeTree walk, so it is idempotent, it
 // preserves symlinks as symlinks, and it re-asserts the com.apple.quarantine
 // invariant on every file it lands.
+//
+// Under the Linux dialect it first refuses a tree the destination would merge
+// (see refuseCaseMerge), so a tree that is correct on its own store never loses a
+// path on the way into a pod.
 func (u *Unpacker) MaterializeTree(ctx context.Context, mfst *runtimev1.ImageManifest, policy UnpackPolicy, dstRootfs string) (*MaterializeResult, error) {
 	if dstRootfs == "" {
 		return nil, errors.New("materialize tree: destination rootfs is required")
@@ -661,11 +665,50 @@ func (u *Unpacker) MaterializeTree(ctx context.Context, mfst *runtimev1.ImageMan
 	if err := os.MkdirAll(dstRootfs, 0o755); err != nil {
 		return nil, fmt.Errorf("create rootfs %s: %w", dstRootfs, err)
 	}
+	if policy.Semantics == SemanticsLinux {
+		if err := u.refuseCaseMerge(t, dstRootfs); err != nil {
+			return nil, fmt.Errorf("materialize tree %s into %s: %w", quoteBounded(t.Key, maxDigestLen), dstRootfs, err)
+		}
+	}
 	cloned, err := MaterializeTree(u.cloner, t.Rootfs, dstRootfs)
 	if err != nil {
 		return nil, fmt.Errorf("materialize tree %s into %s: %w", quoteBounded(t.Key, maxDigestLen), dstRootfs, err)
 	}
 	return &MaterializeResult{Tree: t, Cloned: cloned}, nil
+}
+
+// refuseCaseMerge returns ErrPathCollision when t holds a case-only pair and
+// dstRootfs would merge it.
+//
+// The unpack measured the store, and dstRootfs is a different directory, so a
+// store and a pod rootfs that straddle a mount can disagree. The clone cannot be
+// left to find out: its walk treats a destination that already exists as already
+// materialized, which drops the second spelling, and it joins plain paths, so a
+// symlink "Dir" and a file "dir/x" from a case-sensitive store would write x
+// through the link and out of the pod's rootfs.
+//
+// The measurement comes first because it is four syscalls and the sidecar is
+// O(entries), and on a case-sensitive destination the sidecar has no question to
+// answer. A failed measurement reads as case-insensitive, as it does at the
+// unpack, which refuses only a tree that holds a pair.
+func (u *Unpacker) refuseCaseMerge(t *Tree, dstRootfs string) error {
+	root, err := os.OpenRoot(dstRootfs)
+	if err != nil {
+		return fmt.Errorf("anchor pod rootfs: %w", err)
+	}
+	defer root.Close()
+	sensitive, perr := u.caseProbe(root)
+	if perr == nil && sensitive {
+		return nil
+	}
+	entries, err := ReadOwnershipSidecar(t.Ownership)
+	if err != nil {
+		return err
+	}
+	if prev, name, found := firstCasePair(entries); found {
+		return collisionError(prev, name, perr)
+	}
+	return nil
 }
 
 // openCommitted returns the tree already committed at dir, if there is a
