@@ -17,6 +17,7 @@ limitations under the License.
 package runtime
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1058,6 +1059,11 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	r.sweepStaleSandboxProfiles()
 	r.sweepStaleShimDirs()
 	r.sweepStaleSignStaging()
+	// The pods the node did not re-attach are untracked from here on, so their
+	// artifact holds end and what only they held is released. The reap takes
+	// no context (it runs once, from Serve's start hook); the release reads and
+	// removes only local state.
+	r.releaseArtifactHolds(context.Background(), "")
 	return nil
 }
 

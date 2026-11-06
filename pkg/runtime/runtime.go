@@ -76,7 +76,11 @@ type ArtifactPuller interface {
 	// CheckHost refuses a reference that does not name the cluster registry,
 	// with no request; the RPC runs it before resolving any credential.
 	CheckHost(ref string) error
+	// PullArtifact is the operator's pull: its record is pinned.
 	PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error)
+	// PullForPod is a pod's image-volume pull: its record is released when no
+	// pod holds the reference (artifact.Puller.PullForPod).
+	PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error)
 }
 
 // Unpacker turns a pulled image into files in a pod's rootfs: it
@@ -359,7 +363,14 @@ type Runtime struct {
 	// with viewsErr set, when the views root was refused at start.
 	views    *artifact.Views
 	viewsErr error
-	backend  sandbox.Backend
+	// holdMu orders a pod's artifact hold before its fetch against a release
+	// pass (releaseArtifactHolds): a release reads every hold and forgets what
+	// none names under it, and CreatePod writes its hold under it before the
+	// fetch writes a record. So a record a create is about to use is either
+	// held when the release reads, or forgotten before the create's fetch
+	// re-records it.
+	holdMu  sync.Mutex
+	backend sandbox.Backend
 	// vmBackend is the Virtualization.framework micro-VM rung. createPod
 	// queries Available() so a vm-requested pod fails closed when it is absent, and
 	// routes a selected vm pod to CreateVM (away from the host-process path).

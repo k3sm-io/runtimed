@@ -387,7 +387,12 @@ func (v *Views) build(mdir, final string, set []string, files map[string]string)
 // manifest is never undone: Forget then removes nothing and is ordered before
 // that put.
 func (v *Views) Forget(ctx context.Context, ref, artifactType string) error {
-	key := Key(ref, artifactType)
+	return v.forget(ctx, Key(ref, artifactType), func([]byte) bool { return true })
+}
+
+// forget is Forget for key, removing the record only while keep accepts its
+// current bytes as well; keep runs under the record's lock.
+func (v *Views) forget(ctx context.Context, key string, keep func(record []byte) bool) error {
 	raw, ok, err := v.records.ArtifactRecord(ctx, key)
 	if err != nil {
 		return fmt.Errorf("read artifact record: %w", err)
@@ -398,7 +403,7 @@ func (v *Views) Forget(ctx context.Context, ref, artifactType string) error {
 	mdigest := recordManifest(raw)
 	if mdigest == "" {
 		// A record that names no manifest has no views; remove exactly it.
-		if _, err := v.records.RemoveArtifactRecordIf(ctx, key, func(cur []byte) bool { return bytes.Equal(cur, raw) }); err != nil {
+		if _, err := v.records.RemoveArtifactRecordIf(ctx, key, func(cur []byte) bool { return bytes.Equal(cur, raw) && keep(cur) }); err != nil {
 			return fmt.Errorf("remove artifact record: %w", err)
 		}
 		return nil
@@ -410,7 +415,7 @@ func (v *Views) Forget(ctx context.Context, ref, artifactType string) error {
 	if v.beforeRemove != nil {
 		v.beforeRemove()
 	}
-	removed, err := v.records.RemoveArtifactRecordIf(ctx, key, func(cur []byte) bool { return recordManifest(cur) == mdigest })
+	removed, err := v.records.RemoveArtifactRecordIf(ctx, key, func(cur []byte) bool { return recordManifest(cur) == mdigest && keep(cur) })
 	if err != nil {
 		return fmt.Errorf("remove artifact record: %w", err)
 	}
@@ -419,6 +424,39 @@ func (v *Views) Forget(ctx context.Context, ref, artifactType string) error {
 			"key", image.QuoteBounded(key, 512), "manifest", mdigest)
 	}
 	return v.removeIfOrphanLocked(ctx, mhex)
+}
+
+// ReleasePodOnly forgets every PodOnly record whose reference no pod holds:
+// held reports whether some pod still holds a reference. Each record is
+// removed only if it is still PodOnly and still names the manifest read here,
+// decided under the record's lock, so an operator pull that pins it meanwhile
+// keeps it. With its last record a manifest's views go too (Forget), and its
+// blobs become collectable after the store's grace.
+//
+// It fails closed: a record that cannot be listed or decoded releases nothing.
+// It returns the keys it found unheld and forgot (a key replaced meanwhile is
+// left in place, and still listed).
+func (v *Views) ReleasePodOnly(ctx context.Context, held func(ref string) bool) ([]string, error) {
+	all, err := v.allRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var released []string
+	for _, r := range all {
+		if !r.PodOnly || held(r.Reference) {
+			continue
+		}
+		mdigest := r.ManifestDigest
+		stillPodOnly := func(cur []byte) bool {
+			var c Record
+			return json.Unmarshal(cur, &c) == nil && c.PodOnly && c.ManifestDigest == mdigest
+		}
+		if err := v.forget(ctx, r.Key, stillPodOnly); err != nil {
+			return released, fmt.Errorf("release %s: %w", image.QuoteBounded(r.Key, 512), err)
+		}
+		released = append(released, r.Key)
+	}
+	return released, nil
 }
 
 // recordManifest returns the manifest digest a raw record names, or "" when

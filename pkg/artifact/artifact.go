@@ -280,7 +280,22 @@ type blob struct {
 // allow-set policy selects, restricted to paths when non-empty, and records it
 // once every requested blob is committed. It is idempotent: blobs already
 // cached are not fetched again.
+//
+// It is the operator's pull: the record it writes is pinned (Record.PodOnly
+// false) and stays a root until it is removed (Views.Forget).
 func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
+	return p.pull(ctx, ref, cred, policy, paths, false)
+}
+
+// PullForPod is PullArtifact for a pod's image volume. The record it writes is
+// PodOnly unless the operator already pinned the key, so it is released when
+// no pod holds the reference any more (Views.ReleasePodOnly). It never unpins
+// an operator's record.
+func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
+	return p.pull(ctx, ref, cred, policy, paths, true)
+}
+
+func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, podOnly bool) (*Result, error) {
 	allow, err := artifactv1.AllowSetFor(policy)
 	if err != nil {
 		return nil, err
@@ -380,7 +395,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 		}
 		res.Fetched = true
 	}
-	if err := p.record(ctx, ref, typ, mdigest, raw, m.Config.Digest, res.LayerDigests); err != nil {
+	if err := p.record(ctx, ref, typ, mdigest, raw, m.Config.Digest, res.LayerDigests, podOnly); err != nil {
 		return nil, err
 	}
 	p.log.Info("artifact pulled", "reference", ref, "digest", mdigest, "type", typ,
@@ -580,12 +595,19 @@ type Record struct {
 	ManifestRaw    []byte   `json:"manifestRaw"`
 	ConfigDigest   string   `json:"configDigest"`
 	LayerDigests   []string `json:"layerDigests"`
+	// PodOnly marks a record only pods' image volumes asked for. It is
+	// released when no pod holds its reference (Views.ReleasePodOnly). A
+	// record without it, every record an operator pull wrote or touched and
+	// every record older than the field, is pinned.
+	PodOnly bool `json:"podOnly,omitempty"`
 }
 
 // record writes the artifact record. A previous record of the same manifest
 // keeps its committed layers (a later subset pull widens, never narrows, what
-// the record names); a record of another manifest is replaced.
-func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byte, config string, layers []string) error {
+// the record names); a record of another manifest is replaced. A pinned key
+// stays pinned: podOnly holds only if the previous record, of any manifest,
+// was PodOnly too, and an unreadable previous record pins.
+func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byte, config string, layers []string, podOnly bool) error {
 	key := Key(ref, typ)
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key)) // hash.Hash.Write never returns an error
@@ -593,14 +615,19 @@ func (p *Puller) record(ctx context.Context, ref, typ, mdigest string, raw []byt
 	mu.Lock()
 	defer mu.Unlock()
 	have := append([]string(nil), layers...)
-	if old, ok, err := p.LookupRecord(ctx, ref, typ); err == nil && ok && old.ManifestDigest == mdigest {
+	old, ok, err := p.LookupRecord(ctx, ref, typ)
+	if err == nil && ok && old.ManifestDigest == mdigest {
 		have = append(have, old.LayerDigests...)
+	}
+	if err != nil || (ok && !old.PodOnly) {
+		podOnly = false
 	}
 	sort.Strings(have)
 	have = slices.Compact(have)
 	buf, err := json.Marshal(Record{
 		Schema: recordSchema, Key: key, Reference: ref, ArtifactType: typ,
 		ManifestDigest: mdigest, ManifestRaw: raw, ConfigDigest: config, LayerDigests: have,
+		PodOnly: podOnly,
 	})
 	if err != nil {
 		return fmt.Errorf("encode artifact record: %w", err)

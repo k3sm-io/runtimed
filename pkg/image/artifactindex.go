@@ -344,24 +344,31 @@ func DecodeArtifactRoot(record []byte) (ImageRoot, error) {
 // when create is set, and refuses one that is not a directory or is writable by
 // group or other, for the reason FileIndex.open gives.
 func (x *FileIndex) openArtifactRoot(root *os.Root, create bool) (*os.Root, error) {
+	return x.openSubdir(root, ArtifactIndexSubdir, create)
+}
+
+// openSubdir opens the index-relative directory name under root, creating it
+// (0700) when create is set, and refuses one that is not a directory or is
+// writable by group or other, for the reason FileIndex.open gives.
+func (x *FileIndex) openSubdir(root *os.Root, name string, create bool) (*os.Root, error) {
 	if create {
-		if err := root.Mkdir(ArtifactIndexSubdir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-			return nil, fmt.Errorf("create artifact index: %w", err)
+		if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, fmt.Errorf("create %s index: %w", name, err)
 		}
 	}
-	fi, err := root.Lstat(ArtifactIndexSubdir)
+	fi, err := root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
 	if !fi.IsDir() {
-		return nil, fmt.Errorf("%w: %s/%s is not a directory (mode %v)", ErrIndexNotOwned, x.dir, ArtifactIndexSubdir, fi.Mode().Type())
+		return nil, fmt.Errorf("%w: %s/%s is not a directory (mode %v)", ErrIndexNotOwned, x.dir, name, fi.Mode().Type())
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("%w: %s/%s is writable by group or other (mode %v)", ErrIndexNotOwned, x.dir, ArtifactIndexSubdir, fi.Mode().Perm())
+		return nil, fmt.Errorf("%w: %s/%s is writable by group or other (mode %v)", ErrIndexNotOwned, x.dir, name, fi.Mode().Perm())
 	}
-	sub, err := root.OpenRoot(ArtifactIndexSubdir)
+	sub, err := root.OpenRoot(name)
 	if err != nil {
-		return nil, fmt.Errorf("open artifact index: %w", err)
+		return nil, fmt.Errorf("open %s index: %w", name, err)
 	}
 	return sub, nil
 }

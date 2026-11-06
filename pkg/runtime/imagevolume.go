@@ -66,6 +66,10 @@ func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("%w: pod %s: artifact views unavailable: %w", ErrArtifactMountRefused, box.GetPodId(), r.viewsErr)
 	}
+	if err := r.holdArtifacts(ctx, box, vols); err != nil {
+		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("%w: pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err)
+	}
 	views := mount.ImageViews{Root: r.views.Root(), ByVolume: make(map[string]string, len(vols))}
 	for _, v := range vols {
 		view, reason, err := r.imageVolumeView(ctx, box, v)
@@ -104,13 +108,13 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 		if err != nil {
 			return nil, err
 		}
-		return r.artifacts.PullArtifact(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
+		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
 	}()
 	if err != nil {
 		return pullRefused(err)
 	}
 	// The lease pins the blobs until the view's clones exist; after that the
-	// artifact record is what keeps them.
+	// artifact record is what keeps them, and the pod's hold keeps the record.
 	defer res.Lease.Release()
 	view, err := r.views.View(ctx, res.ManifestDigest, nil)
 	if err != nil {
@@ -132,4 +136,99 @@ func (r *Runtime) linkedImageViews(box *runtimev1.PodBox, rootfs string) ([]stri
 		return nil, fmt.Errorf("%w: artifact views unavailable: %w", ErrArtifactMountRefused, r.viewsErr)
 	}
 	return mount.LinkedImageViews(box, rootfs, r.views.Root())
+}
+
+// holdArtifacts records, durably and before any fetch, that box's pod holds
+// the references of vols. Under holdMu, so a release pass either sees the hold
+// or finishes before the fetch re-records what it forgot (see Runtime.holdMu).
+func (r *Runtime) holdArtifacts(ctx context.Context, box *runtimev1.PodBox, vols []*runtimev1.Volume) error {
+	id, err := image.ParsePodID(box.GetPodId())
+	if err != nil {
+		return fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	refs := make([]string, 0, len(vols))
+	for _, v := range vols {
+		refs = append(refs, v.GetImage().GetReference())
+	}
+	r.holdMu.Lock()
+	defer r.holdMu.Unlock()
+	if err := r.index.PutArtifactHold(ctx, id, refs); err != nil {
+		return fmt.Errorf("record the pod's artifact hold: %w", err)
+	}
+	return nil
+}
+
+// hasImageVolume reports whether box declares any image volume, so may hold
+// an artifact.
+func hasImageVolume(box *runtimev1.PodBox) bool {
+	for _, v := range box.GetVolumes() {
+		if v.GetImage() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// releasePodArtifacts ends a deleted (or never created) pod's artifact hold,
+// for a pod that declared an image volume. It is detached from the caller's
+// cancellation: a delete that has removed the pod must not leave its hold.
+func (r *Runtime) releasePodArtifacts(ctx context.Context, box *runtimev1.PodBox) {
+	if !hasImageVolume(box) {
+		return
+	}
+	r.releaseArtifactHolds(context.WithoutCancel(ctx), box.GetPodId())
+}
+
+// releaseArtifactHolds removes podID's artifact hold (none when podID is
+// empty), then forgets every pod-only artifact record no remaining pod holds
+// (artifact.Views.ReleasePodOnly): its views go with its last record, and its
+// blobs become collectable after the store's grace. An operator-pinned record
+// is never released.
+//
+// A hold counts unless its pod is one the daemon provably holds nothing for
+// (podUntracked): a pod that was not re-attached after a restart has no live
+// mount, so its stale hold is removed here. Before the startup reap every hold
+// counts. It fails closed: when the holds cannot all be read, nothing is
+// released.
+func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string) {
+	if r.index == nil {
+		return
+	}
+	r.holdMu.Lock()
+	defer r.holdMu.Unlock()
+	if podID != "" {
+		if id, err := image.ParsePodID(podID); err == nil {
+			if err := r.index.RemoveArtifactHold(id); err != nil {
+				// The hold is still there, so the read below still counts it.
+				r.log.Warn("remove the pod's artifact hold", "pod", podID, "err", err)
+			}
+		}
+	}
+	if r.views == nil {
+		return
+	}
+	holds, err := r.index.ArtifactHolds(ctx)
+	if err != nil {
+		r.log.Warn("artifact release skipped: the pods' holds cannot all be read, releasing nothing", "err", err)
+		return
+	}
+	held := map[string]bool{}
+	for id, refs := range holds {
+		if r.podUntracked(id) {
+			if err := r.index.RemoveArtifactHold(id); err != nil {
+				r.log.Warn("remove a gone pod's artifact hold", "pod", id.String(), "err", err)
+			}
+			continue
+		}
+		for _, ref := range refs {
+			held[ref] = true
+		}
+	}
+	released, err := r.views.ReleasePodOnly(ctx, func(ref string) bool { return held[ref] })
+	if len(released) > 0 {
+		r.log.Info("released artifacts no pod holds", "keys", len(released))
+	}
+	if err != nil {
+		r.log.Warn("artifact release", "err", err)
+	}
 }

@@ -77,6 +77,7 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	if err != nil {
 		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", err)
 		_ = r.removePodDir(box.GetPodId())
+		r.releasePodArtifacts(ctx, box)
 		return createFailure(reason, err), nil
 	}
 
@@ -205,6 +206,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		if err := r.removePodDir(req.GetPodId()); err != nil {
 			r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 		}
+		r.releasePodArtifacts(ctx, p.box)
 		return &runtimev1.DeletePodResponse{}, nil
 	}
 
@@ -381,6 +383,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// not touch them) have served their purpose, except a record whose
 	// container's tree left survivors, which is kept naming them.
 	r.retirePodReapRecords(req.GetPodId(), survivors)
+	r.releasePodArtifacts(ctx, p.box)
 	p.mu.Lock()
 	shimDirs := p.shimDirs
 	p.mu.Unlock()
