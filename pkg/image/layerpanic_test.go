@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -524,6 +525,94 @@ func TestLayerApplierPanicIsMalformed(t *testing.T) {
 		}
 		if after := openFDs(); after > before {
 			t.Errorf("open descriptors went from %d to %d over 8 panics", before, after)
+		}
+	})
+}
+
+// layerByteMarker is what the stack tests look for: bytes that only the layer
+// holds, which appear in a logged stack only if a traceback starts rendering what
+// its argument words point to.
+const layerByteMarker = "k3sm-layer-content-marker-7f3a"
+
+// panicHoldingLayerBytes panics with value from a frame whose string and slice
+// arguments hold layer content. It is not inlined so the frame, and the argument
+// words a traceback prints for it, exist.
+//
+//go:noinline
+func panicHoldingLayerBytes(value any, s string, b []byte) {
+	if len(s) != len(b) {
+		return
+	}
+	panic(value)
+}
+
+// TestLayerPanicStackCarriesNoLayerBytes pins what recoverLayerPanic's doc comment
+// relies on: a traceback prints argument words in hex, not the strings and slices
+// they point to, so layer content passed down the stack stays out of the node log.
+// A toolchain that began rendering them would fail here, not on a node.
+//
+// The panic value is a separate path. It is foreign text the recover quotes on
+// purpose into the panic attribute and the error, so the second case lets a value
+// carry the marker and asserts only that it stays out of the stack attribute.
+func TestLayerPanicStackCarriesNoLayerBytes(t *testing.T) {
+	plain := buildTar(t, []tarSpec{{name: "app", mode: 0o755, data: layerByteMarker}})
+	unpack := func(t *testing.T, value any) (*panicLog, error) {
+		t.Helper()
+		log := &panicLog{}
+		c, u := newTestUnpacker(t, WithUnpackLogger(log.logger()))
+		u.applyTar = func(_ *LayerApplier, _ context.Context, r io.Reader) error {
+			layer, err := io.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			if !bytes.Contains(layer, []byte(layerByteMarker)) {
+				t.Errorf("the frame's arguments do not hold the marker")
+			}
+			panicHoldingLayerBytes(value, string(layer), layer)
+			return nil
+		}
+		mfst := commitLayerImage(t, c, plain, plain, mediaTypeOCILayerTar)
+		_, err := unpackSeeingPanics(t, u, mfst, LinuxUnpackPolicy())
+		if !errors.Is(err, ErrLayerMalformed) {
+			t.Fatalf("unpack error = %v, want ErrLayerMalformed", err)
+		}
+		return log, err
+	}
+	assertCleanStack := func(t *testing.T, log *panicLog) {
+		t.Helper()
+		recs := log.records(t)
+		if len(recs) != 1 {
+			t.Fatalf("logged %d records, want 1", len(recs))
+		}
+		stack, _ := recs[0]["stack"].(string)
+		if !strings.Contains(stack, "panicHoldingLayerBytes") {
+			t.Fatalf("logged stack does not name the frame holding the bytes: %s", stack)
+		}
+		for _, leak := range []string{layerByteMarker, hex.EncodeToString([]byte(layerByteMarker))} {
+			if strings.Contains(stack, leak) {
+				t.Errorf("logged stack carries layer content %q: %s", leak, stack)
+			}
+		}
+	}
+
+	t.Run("arguments_holding_the_bytes", func(t *testing.T) {
+		log, err := unpack(t, "layer state is gone")
+		assertCleanStack(t, log)
+		if strings.Contains(log.buf.String(), layerByteMarker) {
+			t.Errorf("the log record carries layer content: %s", log.buf.String())
+		}
+		if strings.Contains(err.Error(), layerByteMarker) {
+			t.Errorf("the error carries layer content: %s", err)
+		}
+	})
+
+	t.Run("a_panic_value_holding_the_bytes", func(t *testing.T) {
+		log, _ := unpack(t, "bad entry "+layerByteMarker)
+		assertCleanStack(t, log)
+		// The control: the marker did travel the value's path, so its absence from
+		// the stack above is the stack's doing.
+		if got, _ := log.records(t)[0]["panic"].(string); !strings.Contains(got, layerByteMarker) {
+			t.Errorf("the panic attribute = %q, want it to quote the value", got)
 		}
 	})
 }
