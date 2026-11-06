@@ -1060,10 +1060,11 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	r.sweepStaleShimDirs()
 	r.sweepStaleSignStaging()
 	// The pods the node did not re-attach are untracked from here on, so their
-	// artifact holds end and what only they held is released. The reap takes
-	// no context (it runs once, from Serve's start hook); the release reads and
-	// removes only local state.
-	r.releaseArtifactHolds(context.Background(), "")
+	// artifact holds end, broken or not, and what only they held is released.
+	// The reap takes no context (it runs once, from Serve's start hook); the
+	// release reads and removes only local state.
+	r.sweepArtifactHolds()
+	r.releaseArtifactHolds(context.Background(), "", 0)
 	return nil
 }
 

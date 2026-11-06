@@ -238,7 +238,7 @@ func TestArtifactHoldRootsKeepHeldBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := x.PutArtifactHold(ctx, id, []string{"reg/m:v1"}); err != nil {
+	if err := x.AddArtifactHoldReferences(ctx, id, []string{"reg/m:v1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := x.AddArtifactHoldManifest(ctx, id, HeldManifest{Digest: manifest, Config: cfg, Layers: []string{layer}}); err != nil {

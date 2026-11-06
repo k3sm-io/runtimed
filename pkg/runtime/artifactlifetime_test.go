@@ -180,13 +180,16 @@ func TestImageVolumeLifetimeKeepsOperatorPin(t *testing.T) {
 }
 
 // TestImageVolumeLifetimeFailsClosed pins that a hold set the daemon cannot
-// read in full releases nothing: a foreign entry in the hold store keeps the
-// artifact past its last pod.
+// read in full releases and removes nothing: a live pod's unreadable hold
+// keeps another pod's artifact past its last pod, refuses the prune, survives
+// the start-up sweep and is reported by GetRuntimeInfo, naming its file.
+// Once it reads again, the next release takes the artifact.
 func TestImageVolumeLifetimeFailsClosed(t *testing.T) {
 	f := newLifetimeFixture(t)
 	view := f.create("pod-a")
-	junk := filepath.Join(f.rt.cache.IndexRoot(), image.ArtifactHoldIndexSubdir, "not a pod id.json")
-	if err := os.WriteFile(junk, []byte("{}"), 0o600); err != nil {
+	registerLivePod(f.rt, "pod-z")
+	broken := filepath.Join(f.rt.cache.IndexRoot(), image.ArtifactHoldIndexSubdir, "pod-z.json")
+	if err := os.WriteFile(broken, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f.delete("pod-a")
@@ -196,14 +199,33 @@ func TestImageVolumeLifetimeFailsClosed(t *testing.T) {
 	if !f.kept(view) {
 		t.Fatal("the artifact was released although the holds could not all be read")
 	}
-	// The next release, once the store reads again, takes it.
-	if err := os.Remove(junk); err != nil {
+	f.rt.sweepArtifactHolds()
+	if _, err := os.Lstat(broken); err != nil {
+		t.Fatalf("the start-up sweep removed a live pod's hold: %v", err)
+	}
+	info, err := f.rt.GetRuntimeInfo(context.Background(), &runtimev1.GetRuntimeInfoRequest{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	f.rt.releaseArtifactHolds(context.Background(), "")
+	c := findCondition(info, ConditionArtifactHoldsReadable)
+	if c == nil || c.GetStatus() != runtimev1.ConditionStatus_CONDITION_STATUS_FALSE || !strings.Contains(c.GetMessage(), broken) {
+		t.Fatalf("GetRuntimeInfo condition = %v, want %s FALSE naming %s", c, ConditionArtifactHoldsReadable, broken)
+	}
+
+	if err := os.Remove(broken); err != nil {
+		t.Fatal(err)
+	}
+	f.rt.releaseArtifactHolds(context.Background(), "", 0)
 	f.prune()
 	if f.kept(view) {
 		t.Fatal("the artifact survived a release with every hold readable")
+	}
+	info, err = f.rt.GetRuntimeInfo(context.Background(), &runtimev1.GetRuntimeInfoRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := findCondition(info, ConditionArtifactHoldsReadable); c != nil {
+		t.Errorf("GetRuntimeInfo still reports %v with every hold readable", c)
 	}
 }
 
@@ -222,14 +244,14 @@ func TestImageVolumeLifetimeStartupRelease(t *testing.T) {
 	f.rt.mu.Unlock()
 	f.rt.removePodReapRecords("pod-a")
 
-	f.rt.releaseArtifactHolds(context.Background(), "")
+	f.rt.releaseArtifactHolds(context.Background(), "", 0)
 	if !f.kept(view) {
 		t.Fatal("a hold was ended before the startup reap could prove its pod gone")
 	}
 	f.rt.mu.Lock()
 	f.rt.podReapStarted = true
 	f.rt.mu.Unlock()
-	f.rt.releaseArtifactHolds(context.Background(), "")
+	f.rt.releaseArtifactHolds(context.Background(), "", 0)
 	f.prune()
 	if f.kept(view) {
 		t.Fatal("a pod that was not re-attached still holds its artifact")

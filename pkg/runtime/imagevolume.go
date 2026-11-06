@@ -185,7 +185,7 @@ func (r *Runtime) holdArtifacts(ctx context.Context, box *runtimev1.PodBox, vols
 	}
 	r.holdMu.Lock()
 	defer r.holdMu.Unlock()
-	if err := r.index.PutArtifactHold(ctx, id, refs); err != nil {
+	if err := r.index.AddArtifactHoldReferences(ctx, id, refs); err != nil {
 		return fmt.Errorf("record the pod's artifact hold: %w", err)
 	}
 	return nil
@@ -220,17 +220,19 @@ func hasImageVolume(box *runtimev1.PodBox) bool {
 }
 
 // releasePodArtifacts ends a deleted (or never created) pod's artifact hold,
-// for a pod that declared an image volume. It is detached from the caller's
-// cancellation: a delete that has removed the pod must not leave its hold.
-func (r *Runtime) releasePodArtifacts(ctx context.Context, box *runtimev1.PodBox) {
+// for a pod that declared an image volume; ownCreates is how many in-flight
+// creates of the id the caller itself is (see releaseArtifactHolds). It is
+// detached from the caller's cancellation: a delete that has removed the pod
+// must not leave its hold.
+func (r *Runtime) releasePodArtifacts(ctx context.Context, box *runtimev1.PodBox, ownCreates int) {
 	if !hasImageVolume(box) {
 		return
 	}
-	r.releaseArtifactHolds(context.WithoutCancel(ctx), box.GetPodId())
+	r.releaseArtifactHolds(context.WithoutCancel(ctx), box.GetPodId(), ownCreates)
 }
 
 // releaseArtifactHolds removes podID's artifact hold (none when podID is
-// empty), then forgets every pod-only artifact record no remaining pod holds
+// empty) when the caller owns it, then forgets every pod-only artifact record no remaining pod holds
 // (artifact.Views.ReleasePodOnly): its views go with its last record, and its
 // blobs become collectable after the store's grace. An operator-pinned record
 // is never released.
@@ -239,8 +241,16 @@ func (r *Runtime) releasePodArtifacts(ctx context.Context, box *runtimev1.PodBox
 // (podUntracked): a pod that was not re-attached after a restart has no live
 // mount, so its stale hold is removed here. Before the startup reap every hold
 // counts. It fails closed: when the holds cannot all be read, nothing is
-// released.
-func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string) {
+// released, and the unreadable hold is logged at Error with its path (and
+// reported by GetRuntimeInfo, artifactHoldsCondition).
+//
+// The caller owns podID's hold when the pod is not live and no create of the
+// id is in flight beyond the ownCreates the caller itself is: a DeletePod
+// passes 0, a failed CreatePod 1 (its own count). Otherwise another create or
+// registration of the same id holds it, and it is left. The check runs under
+// holdMu, which a create takes to write its hold, so a create that starts
+// after it writes its hold after this pass ends.
+func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string, ownCreates int) {
 	if r.index == nil {
 		return
 	}
@@ -248,7 +258,13 @@ func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string) {
 	defer r.holdMu.Unlock()
 	if podID != "" {
 		if id, err := image.ParsePodID(podID); err == nil {
-			if err := r.index.RemoveArtifactHold(id); err != nil {
+			r.mu.Lock()
+			_, live := r.pods[podID]
+			owned := !live && r.creating[podID] <= ownCreates
+			r.mu.Unlock()
+			if !owned {
+				r.log.Info("artifact hold left to the pod's other create or registration", "pod", podID)
+			} else if err := r.index.RemoveArtifactHold(id); err != nil {
 				// The hold is still there, so the read below still counts it.
 				r.log.Warn("remove the pod's artifact hold", "pod", podID, "err", err)
 			}
@@ -259,7 +275,7 @@ func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string) {
 	}
 	holds, err := r.index.ArtifactHolds(ctx)
 	if err != nil {
-		r.log.Warn("artifact release skipped: the pods' holds cannot all be read, releasing nothing", "err", err)
+		r.logHoldsUnreadable("artifact release skipped: the pods' holds cannot all be read, releasing nothing", err)
 		return
 	}
 	held := map[string]bool{}
@@ -280,5 +296,61 @@ func (r *Runtime) releaseArtifactHolds(ctx context.Context, podID string) {
 	}
 	if err != nil {
 		r.log.Warn("artifact release", "err", err)
+	}
+}
+
+// logHoldsUnreadable logs a hold read failure at Error, naming the hold's
+// path when the failure is one hold file's.
+func (r *Runtime) logHoldsUnreadable(msg string, err error) {
+	path := ""
+	var he *image.HoldReadError
+	if errors.As(err, &he) {
+		path = he.Path
+	}
+	r.log.Error(msg, "path", path, "err", err)
+}
+
+// sweepArtifactHolds runs once, at the end of the start-up reap, when the
+// daemon knows its complete pod set: it removes every hold of a pod that is
+// neither live nor re-attached (podUntracked), readable or not, and every
+// entry of the hold store that can never be a hold. A broken hold of a live
+// pod stays, and keeps every release failing closed.
+func (r *Runtime) sweepArtifactHolds() {
+	if r.index == nil {
+		return
+	}
+	r.holdMu.Lock()
+	defer r.holdMu.Unlock()
+	removed, err := r.index.SweepArtifactHolds(func(id image.PodID) bool { return !r.podUntracked(id) })
+	if len(removed) > 0 {
+		r.log.Info("removed artifact holds of pods gone at start-up", "entries", removed)
+	}
+	if err != nil {
+		r.log.Warn("sweep artifact holds", "err", err)
+	}
+}
+
+// ConditionArtifactHoldsReadable is the RuntimeCondition Type GetRuntimeInfo
+// appends, FALSE, while some pod's artifact hold cannot be read. Every artifact
+// release and every view or blob removal fails closed meanwhile, so artifacts
+// accumulate until an operator repairs or removes the named file. Absent when
+// the holds read.
+const ConditionArtifactHoldsReadable = "ArtifactHoldsReadable"
+
+// artifactHoldsCondition reads the holds and renders the degraded condition,
+// or nil when they read.
+func (r *Runtime) artifactHoldsCondition(ctx context.Context) *runtimev1.RuntimeCondition {
+	if r.index == nil {
+		return nil
+	}
+	_, err := r.index.ArtifactHolds(ctx)
+	if err == nil || ctx.Err() != nil {
+		return nil
+	}
+	return &runtimev1.RuntimeCondition{
+		Type:    ConditionArtifactHoldsReadable,
+		Status:  runtimev1.ConditionStatus_CONDITION_STATUS_FALSE,
+		Reason:  "Unreadable",
+		Message: image.QuoteBounded(err.Error(), 1024) + "; artifact release and view/blob removal are refused until it is repaired",
 	}
 }

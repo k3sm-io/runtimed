@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -48,6 +49,30 @@ const MaxArtifactHoldBytes = 4 << 20
 // ErrArtifactHoldsIncomplete reports that the set of pod holds could not be
 // read in full, so nothing may be released or removed on its strength.
 var ErrArtifactHoldsIncomplete = errors.New("image: artifact hold set is incomplete")
+
+// HoldReadError is the ErrArtifactHoldsIncomplete failure for one hold file,
+// naming its path so the operator can find it.
+type HoldReadError struct {
+	Path string
+	Err  error
+}
+
+func (e *HoldReadError) Error() string {
+	return fmt.Sprintf("%v: %s: %v", ErrArtifactHoldsIncomplete, e.Path, e.Err)
+}
+
+func (e *HoldReadError) Unwrap() []error { return []error{ErrArtifactHoldsIncomplete, e.Err} }
+
+// holdID returns the pod a hold file name belongs to: <pod-id>.json, with
+// the id valid. Any other name can never be a hold.
+func holdID(name string) (PodID, bool) {
+	base, ok := strings.CutSuffix(name, ".json")
+	if !ok {
+		return PodID{}, false
+	}
+	id, err := ParsePodID(base)
+	return id, err == nil
+}
 
 // ArtifactHold is one pod's hold.
 type ArtifactHold struct {
@@ -86,12 +111,21 @@ func (m HeldManifest) check() error {
 
 func artifactHoldName(id PodID) string { return id.String() + ".json" }
 
-// PutArtifactHold records that pod id holds refs, replacing any previous hold
-// for it (and the manifests it named), atomically (temp, fsync, rename).
-func (x *FileIndex) PutArtifactHold(ctx context.Context, id PodID, refs []string) error {
-	refs = append([]string(nil), refs...)
-	sort.Strings(refs)
-	return x.updateArtifactHold(ctx, id, func(*ArtifactHold) ArtifactHold { return ArtifactHold{References: refs} })
+// AddArtifactHoldReferences adds refs to pod id's hold, creating it when
+// absent, atomically (temp, fsync, rename). It never drops what the hold
+// names already, so a second create of the same pod id merges into the hold
+// the first one wrote rather than replacing the manifests it mounts.
+func (x *FileIndex) AddArtifactHoldReferences(ctx context.Context, id PodID, refs []string) error {
+	return x.updateArtifactHold(ctx, id, func(cur *ArtifactHold) ArtifactHold {
+		var h ArtifactHold
+		if cur != nil {
+			h = *cur
+		}
+		h.References = append(h.References, refs...)
+		sort.Strings(h.References)
+		h.References = slices.Compact(h.References)
+		return h
+	})
 }
 
 // AddArtifactHoldManifest adds m to pod id's hold, keeping what it holds
@@ -137,7 +171,7 @@ func (x *FileIndex) updateArtifactHold(ctx context.Context, id PodID, next func(
 		return err
 	}
 	defer sub.Close()
-	cur, err := readArtifactHold(sub, name, id)
+	cur, err := readArtifactHold(sub, filepath.Join(x.dir, ArtifactHoldIndexSubdir, name), name, id)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
@@ -182,12 +216,14 @@ func (x *FileIndex) RemoveArtifactHold(id PodID) error {
 // ArtifactHolds returns every pod's hold, keyed by pod. An absent index or
 // hold directory is the empty set.
 //
-// It fails closed, with ErrArtifactHoldsIncomplete: an entry whose name is not
-// a pod id, one that is not a regular file, one that cannot be read or decoded,
-// and one naming a digest this store cannot map to a path abort the whole set,
-// because a set silently short of one pod's hold would release or remove what
-// that pod still mounts. A ".index-" temp left by a crashed commit is skipped;
-// no hold is stored under a dot name.
+// It fails closed, with ErrArtifactHoldsIncomplete (a *HoldReadError naming
+// the file): a hold that is not a regular file, cannot be read or decoded, or
+// names a digest this store cannot map to a path aborts the whole set, because
+// a set silently short of one pod's hold would release or remove what that pod
+// still mounts. An entry whose name is not <pod-id>.json can never be a hold
+// (none is ever written under such a name) and is skipped, as is a ".index-"
+// temp left by a crashed commit; SweepArtifactHolds removes the former at
+// start-up.
 func (x *FileIndex) ArtifactHolds(ctx context.Context) (map[PodID]ArtifactHold, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -246,11 +282,11 @@ func (x *FileIndex) artifactHolds() (map[PodID]ArtifactHold, error) {
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
-		id, perr := ParsePodID(strings.TrimSuffix(name, ".json"))
-		if perr != nil || !strings.HasSuffix(name, ".json") {
-			return nil, fmt.Errorf("%w: entry %s is not a pod's hold", ErrArtifactHoldsIncomplete, QuoteBounded(name, 256))
+		id, ok := holdID(name)
+		if !ok {
+			continue
 		}
-		h, err := readArtifactHold(sub, name, id)
+		h, err := readArtifactHold(sub, filepath.Join(x.dir, ArtifactHoldIndexSubdir, name), name, id)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // removed since the read; that pod holds nothing now
 		}
@@ -262,36 +298,101 @@ func (x *FileIndex) artifactHolds() (map[PodID]ArtifactHold, error) {
 	return out, nil
 }
 
-// readArtifactHold reads and checks pod id's hold from sub. An absent hold is
-// fs.ErrNotExist; anything else wrong with it is ErrArtifactHoldsIncomplete.
-func readArtifactHold(sub *os.Root, name string, id PodID) (*ArtifactHold, error) {
+// readArtifactHold reads and checks pod id's hold from sub; path names it
+// for errors. An absent hold is fs.ErrNotExist; anything else wrong with it is
+// a *HoldReadError.
+func readArtifactHold(sub *os.Root, path, name string, id PodID) (*ArtifactHold, error) {
+	bad := func(format string, args ...any) error {
+		return &HoldReadError{Path: path, Err: fmt.Errorf("hold of pod %s: "+format, append([]any{id}, args...)...)}
+	}
 	fi, err := sub.Lstat(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: stat hold of pod %s: %v", ErrArtifactHoldsIncomplete, id, err)
+		return nil, bad("stat: %v", err)
 	}
 	if !fi.Mode().IsRegular() || fi.Size() > MaxArtifactHoldBytes {
-		return nil, fmt.Errorf("%w: hold of pod %s is not a regular file within its cap (mode %v, %d bytes)", ErrArtifactHoldsIncomplete, id, fi.Mode().Type(), fi.Size())
+		return nil, bad("not a regular file within its cap (mode %v, %d bytes)", fi.Mode().Type(), fi.Size())
 	}
 	buf, err := readAnchored(sub, name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: read hold of pod %s: %v", ErrArtifactHoldsIncomplete, id, err)
+		return nil, bad("read: %v", err)
 	}
 	var h ArtifactHold
 	if err := json.Unmarshal(buf, &h); err != nil {
-		return nil, fmt.Errorf("%w: decode hold of pod %s: %v", ErrArtifactHoldsIncomplete, id, boundErr(err))
+		return nil, bad("decode: %v", boundErr(err))
 	}
 	for _, m := range h.Manifests {
 		if err := m.check(); err != nil {
-			return nil, fmt.Errorf("%w: hold of pod %s: %v", ErrArtifactHoldsIncomplete, id, err)
+			return nil, bad("%v", err)
 		}
 	}
 	return &h, nil
+}
+
+// SweepArtifactHolds removes, at daemon start, every entry of the hold
+// directory that is not the hold of a pod keep accepts: an entry whose name is
+// not <pod-id>.json (it can never be a hold), and the hold of every pod keep
+// rejects, whether or not it can be read. The caller knows the complete pod
+// set there, so a hold of a pod outside it holds nothing; a hold of a pod
+// inside it is left alone however broken, and keeps failing closed. Dot
+// entries (a crashed commit's temp) are left. It returns the names it
+// removed.
+func (x *FileIndex) SweepArtifactHolds(keep func(PodID) bool) ([]string, error) {
+	root, err := x.open()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer root.Close()
+	sub, err := x.openSubdir(root, ArtifactHoldIndexSubdir, false)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer sub.Close()
+	dir, err := sub.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("open artifact holds: %w", err)
+	}
+	entries, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read artifact holds: %w", err)
+	}
+	var removed []string
+	var errs []error
+	for _, d := range entries {
+		name := d.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if id, ok := holdID(name); ok {
+			if keep(id) {
+				continue
+			}
+			mu := x.stripeFor(ArtifactHoldIndexSubdir + "/" + name)
+			mu.Lock()
+			err = sub.RemoveAll(name)
+			mu.Unlock()
+		} else {
+			err = sub.RemoveAll(name)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", QuoteBounded(name, 256), err))
+			continue
+		}
+		removed = append(removed, name)
+	}
+	return removed, errors.Join(errs...)
 }
 
 // artifactHoldRoots returns one root per manifest some pod's hold names,
