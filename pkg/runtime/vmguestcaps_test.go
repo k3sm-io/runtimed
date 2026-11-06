@@ -69,6 +69,12 @@ func (a *capsAgent) healthCalls() int {
 	return a.calls
 }
 
+// pinnedGuestCapabilities is what the guest init in the pinned initramfs
+// advertises (pins.go names the runtimed commit it was built from, and that
+// commit's guestagent.Capabilities is this list). It lacks memory-limits. Update
+// it when the pin moves.
+var pinnedGuestCapabilities = []string{"tty-exec", "attach", "log-partial", "guest-private-mounts", "sidecar-init", "image-user", "restart-container"}
+
 // capsWithout returns this build's advertised token set minus drop: what an
 // initramfs that predates exactly that token would advertise.
 func capsWithout(drop string) []string {
@@ -285,8 +291,6 @@ func TestGuestPrivateTokenAbsentFailsPod(t *testing.T) {
 // It goes through setGuestCapabilities, so the allowlist filter is in the path.
 func TestPinnedGuestSatisfiesEveryRequiredToken(t *testing.T) {
 	t.Parallel()
-	pinned := []string{"tty-exec", "attach", "log-partial", "guest-private-mounts", "sidecar-init", "image-user", "restart-container"}
-
 	spec := sandbox.VMSpec{
 		Containers: []sandbox.VMContainer{
 			{Name: "proxy", Init: true, Sidecar: true},
@@ -307,7 +311,7 @@ func TestPinnedGuestSatisfiesEveryRequiredToken(t *testing.T) {
 
 	r := &Runtime{}
 	p := &pod{}
-	r.setGuestCapabilities(p, pinned)
+	r.setGuestCapabilities(p, pinnedGuestCapabilities)
 	for _, tok := range required {
 		if got := classifyGuestCapability(p.guestCapsObserved, p.guestCaps, tok); got != guestCapPresent {
 			t.Errorf("token %q: verdict %v against the pinned guest's advertised set, want present", tok, got)

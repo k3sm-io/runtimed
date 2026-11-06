@@ -227,11 +227,13 @@ func guestContainers(containers []VMContainer, shares map[string]VMShare) ([]*gu
 			Gid:              c.GID,
 			SupplementalGids: append([]int64(nil), c.SupplementalGIDs...),
 			Init:             c.Init,
-			// Both are zero unless the container needs them, and a zero proto3
+			// These are zero unless the container needs them, and a zero proto3
 			// field is absent from guest-spec.json — which is what lets a pod
-			// that uses neither boot against an initramfs that knows neither.
-			Sidecar:   c.Sidecar,
-			ImageUser: c.ImageUser,
+			// that uses none of them boot against an initramfs that knows none.
+			Sidecar:          c.Sidecar,
+			ImageUser:        c.ImageUser,
+			MemoryLimitBytes: c.MemoryLimitBytes,
+			MemoryHighBytes:  c.MemoryHighBytes,
 		})
 	}
 	return out, nil
