@@ -177,6 +177,14 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		//
 		// Nothing is lost by stopping the event fold early: the pod is going
 		// away, and its status is replaced with SUCCEEDED below.
+		//
+		// The log followers are the exception, held past the cancel. A container's
+		// SIGTERM handler runs inside the stop, so its output has yet to cross,
+		// and it belongs in the container's log as it does upstream. They end
+		// after the stop, within what the grace leaves, and before the DELETED
+		// publish and the close of their writers.
+		stopBegan := time.Now()
+		r.holdGuestLogFollowers(p)
 		if p.cancel != nil {
 			p.cancel()
 		}
@@ -186,6 +194,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			// helper's record is kept for the next startup sweep.
 			r.log.Warn("stop the vm host helper", "pod", req.GetPodId(), "err", err)
 		}
+		r.finishGuestLogFollowers(p, r.guestStopLogDrainBound(grace-time.Since(stopBegan)))
 		st := r.podStatus(p)
 		st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
 		r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
