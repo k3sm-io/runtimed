@@ -221,8 +221,13 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	if !inImage {
 		return cmdv, nil
 	}
-	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rootfs, bin, false); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "exec: %v", err)
+	policy := p.box.GetSignaturePolicy()
+	if err := r.gateSignature(ctx, policy, rootfs, bin, false); err != nil {
+		// The gate's errors name the host rootfs, which is the daemon's to know.
+		r.log.Warn("exec: signature gate refused an image file",
+			"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"exec: %q refused by the signature gate under %s; the daemon log has the cause", argv0, policy)
 	}
 	return append([]string{bin}, cmdv[1:]...), nil
 }

@@ -55,6 +55,12 @@ type execArgvPod struct {
 // the file it names, and spawns no shim.
 func newExecArgvPod(t *testing.T, tree map[string]string, signer Signer, edit func(*runtimev1.PodBox)) *execArgvPod {
 	t.Helper()
+	return newExecArgvPodCfg(t, Config{}, tree, signer, edit)
+}
+
+// newExecArgvPodCfg is newExecArgvPod with a caller-supplied Config.
+func newExecArgvPodCfg(t *testing.T, cfg Config, tree map[string]string, signer Signer, edit func(*runtimev1.PodBox)) *execArgvPod {
+	t.Helper()
 	files := map[string]string{"app-main": imageScript}
 	for k, v := range tree {
 		files[k] = v
@@ -62,7 +68,7 @@ func newExecArgvPod(t *testing.T, tree map[string]string, signer Signer, edit fu
 	be := &recordingExecBackend{}
 	w := newBlockingWaiter()
 	t.Cleanup(func() { w.release(1001) })
-	rt := newTestRuntime(t, Deps{
+	rt := newTestRuntimeCfg(t, cfg, Deps{
 		Backend: be,
 		Waiter:  w,
 		Signer:  signer,
