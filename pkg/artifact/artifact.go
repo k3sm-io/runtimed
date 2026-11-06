@@ -485,15 +485,9 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 		if total > MaxArtifactBytes {
 			return "", nil, nil, fmt.Errorf("declared total over %d bytes: %w", MaxArtifactBytes, ErrSizeCap)
 		}
-		p := l.Annotations[annotationFilepathModern]
-		if p == "" {
-			p = l.Annotations[annotationTitle]
-		}
-		if p == "" {
-			return "", nil, nil, fmt.Errorf("layer %d has no file path: %w", i, ErrLayerPath)
-		}
-		if err := artifactv1.ValidatePath(p); err != nil {
-			return "", nil, nil, fmt.Errorf("layer %d: %w: %w", i, ErrLayerPath, err)
+		p, err := layerFilePath(i, l)
+		if err != nil {
+			return "", nil, nil, err
 		}
 		paths[i] = p
 	}
@@ -501,6 +495,22 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 		return "", nil, nil, fmt.Errorf("%w: %w", ErrLayerPath, err)
 	}
 	return typ, m.Layers, paths, nil
+}
+
+// layerFilePath returns layer i's validated file path: the ModelPack filepath
+// annotation, else the OCI title.
+func layerFilePath(i int, l descriptor) (string, error) {
+	p := l.Annotations[annotationFilepathModern]
+	if p == "" {
+		p = l.Annotations[annotationTitle]
+	}
+	if p == "" {
+		return "", fmt.Errorf("layer %d has no file path: %w", i, ErrLayerPath)
+	}
+	if err := artifactv1.ValidatePath(p); err != nil {
+		return "", fmt.Errorf("layer %d: %w: %w", i, ErrLayerPath, err)
+	}
+	return p, nil
 }
 
 func checkDescriptor(what string, d descriptor) error {
