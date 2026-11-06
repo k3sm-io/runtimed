@@ -74,6 +74,12 @@ const (
 	// reads another workload's model weights mid-transfer; one able to write
 	// here makes every resume of that layer fail its digest check.
 	ArtifactPartialSubdir = "artifact-partial"
+	// ArtifactViewsSubdir is the root (<WorkDir>/artifacts) of the read-only
+	// artifact views: one directory of cloned files per manifest and path set.
+	// The root is denied as a whole; a pod is granted the one view directory it
+	// mounts, never the root, so it cannot open a file in another model's view
+	// or reach a view still being built in a staging directory beside it.
+	ArtifactViewsSubdir = "artifacts"
 )
 
 // ReapStoreSubdirs returns the work-dir-relative reap-store dirs, in deny order:
@@ -94,8 +100,10 @@ func ReapStoreSubdirs() []string {
 // node-agent state (agent), the daemon sockets + mesh key (run), the
 // content-addressed blob store (blobs), the status record dir (status), the
 // per-pod SBPL staging dir (sbpl), the five image-store siblings (index,
-// operator, unpacked, snapshots, ingest), the guest-artifact cache (guest-artifacts), the artifact download staging dir (artifact-partial) and the retained consoles of failed vm
-// boots (vmboot-failures), which hold other pods' guest output.
+// operator, unpacked, snapshots, ingest), the guest-artifact cache
+// (guest-artifacts), the artifact download staging dir (artifact-partial), the
+// artifact views root (artifacts) and the retained consoles of failed vm boots
+// (vmboot-failures), which hold other pods' guest output.
 //
 // The returned slice is freshly allocated, so a caller cannot mutate the
 // deny-set by holding on to it.
@@ -114,6 +122,7 @@ func DaemonTreeSubdirs() []string {
 		ImageIngestSubdir,
 		GuestArtifactsSubdir,
 		ArtifactPartialSubdir,
+		ArtifactViewsSubdir,
 		VMBootFailureSubdir,
 	}
 }
