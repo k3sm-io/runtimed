@@ -269,10 +269,16 @@ func copyExecutable(t *testing.T, src, dst string) {
 // (root's) and the pod runs as another uid. In the user posture the daemon and
 // the pod are one uid, so the pod owns the inode and file permissions alone
 // would let the chmod through; the probe chowns the view file to the pod's uid
-// to stand for that. Each posture runs the operation without the profile as a
-// control and states its outcome, then requires that under the profile it
-// fails and the view's bytes are unchanged. A read-only descriptor's fchmod is
-// probed the same way.
+// to stand for that.
+//
+// The probe must not pass vacuously. It first requires the view and the data
+// volume to be on one volume: a hard link across volumes fails with EXDEV
+// whatever the profile says, and would hide a missing deny. Then, in the user
+// posture, the attack without the profile must succeed and change the view
+// (the positive control); the root posture's control is reported, since file
+// permissions refuse it there. Under the profile the attack must fail, make no
+// link, and leave the view's bytes and mode unchanged in both postures. A
+// read-only descriptor's fchmod is probed the same way.
 func TestArtifactViewHardLinkAlias(t *testing.T) {
 	k3smtest.SkipUnless(t, k3smtest.Root)
 	for _, posture := range []string{"root", "user"} {
@@ -311,6 +317,19 @@ func TestArtifactViewHardLinkAlias(t *testing.T) {
 				t.Fatal(err)
 			}
 			viewFile := filepath.Join(view, "w.safetensors")
+			devOf := func(p string) uint64 {
+				t.Helper()
+				var st unix.Stat_t
+				if err := unix.Stat(p, &st); err != nil {
+					t.Fatal(err)
+				}
+				return uint64(st.Dev)
+			}
+			if vd, dd := devOf(view), devOf(rootfs); vd != dd {
+				t.Fatalf("the view (%s, device %d) and the pod data volume (%s, device %d) are on different volumes: "+
+					"a hard link between them fails with EXDEV whatever the profile allows, so this probe cannot test the deny here",
+					view, vd, rootfs, dd)
+			}
 			if posture == "user" {
 				if err := os.Chown(viewFile, nobodyUID, nobodyUID); err != nil {
 					t.Fatal(err)
@@ -366,7 +385,12 @@ func TestArtifactViewHardLinkAlias(t *testing.T) {
 
 			reset()
 			ctl := run(false, "link-alias", mounted, filepath.Join(rootfs, "alias-ctl"))
-			t.Logf("posture %s: link, chmod and write through an alias WITHOUT the profile: succeeded=%v, view intact=%v", posture, ctl, intact())
+			changed := !intact()
+			t.Logf("posture %s: link, chmod and write through an alias WITHOUT the profile: succeeded=%v, view changed=%v", posture, ctl, changed)
+			if posture == "user" && (!ctl || !changed) {
+				t.Fatalf("positive control failed: as the inode's owner, without the profile, link, chmod and write through an alias "+
+					"succeeded=%v and changed the view=%v; both must hold or the denial under the profile proves nothing", ctl, changed)
+			}
 			reset()
 			if run(true, "link-alias", mounted, filepath.Join(rootfs, "alias")) {
 				t.Errorf("posture %s: link, chmod and write through an alias succeeded under the profile", posture)
@@ -385,6 +409,9 @@ func TestArtifactViewHardLinkAlias(t *testing.T) {
 			reset()
 			ctl = run(false, "fchmod", mounted, "")
 			t.Logf("posture %s: fchmod of a read-only descriptor WITHOUT the profile: succeeded=%v", posture, ctl)
+			if posture == "user" && !ctl {
+				t.Fatal("positive control failed: as the inode's owner, without the profile, fchmod of a read-only descriptor was refused")
+			}
 			reset()
 			if run(true, "fchmod", mounted, "") {
 				t.Errorf("posture %s: fchmod of a read-only descriptor succeeded under the profile", posture)
