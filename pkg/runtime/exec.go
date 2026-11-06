@@ -17,18 +17,26 @@ limitations under the License.
 package runtime
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net"
+	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/execsession"
+	"k3sm.io/runtimed/pkg/pathsafe"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -48,6 +56,9 @@ const pumpChunkSize = 32 * 1024
 // (the single source of truth for the launch order) with the user's argv in
 // place of the pod entrypoint. An exec is therefore a fresh, equally-confined
 // process and cannot escape the pod's sandbox.
+//
+// An absolute argv[0] on a pulled-image container names a file in the image, as
+// the container's own argv[0] does; see resolveExecCommand.
 //
 // The first ExecRequest carries the parameters (pod_id, container, command, tty,
 // stdin); subsequent frames carry stdin bytes and tty resize events. stdout and
@@ -84,6 +95,13 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if len(cmdv) == 0 {
 		return status.Error(codes.InvalidArgument, "exec: command is required")
 	}
+	// Before the route split: a shim-backed session is forked by the shim, which
+	// runs the command it is sent.
+	cmdv, err = r.resolveExecCommand(ctx, p, cp.spec, cmdv)
+	if err != nil {
+		return err
+	}
+	first.Command = cmdv
 	if cp.proc != nil {
 		if conn := cp.proc.Shim(); conn != nil {
 			return r.execViaShim(stream, p, conn, cp, first)
@@ -146,6 +164,248 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	}
 	defer release()
 	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin(), func(int) { release() })
+}
+
+// resolveExecCommand applies the start path's argv[0] rule to an exec session's
+// command, so exec and start agree on what a path names in a pulled image.
+//
+// # Precedence
+//
+// On a pulled-image container an absolute argv[0] resolves in the pod rootfs
+// first (resolveImageArgv0), and the image's copy wins over a host file of the
+// same name. Start has no second step: its program comes from the image, and a
+// missing file fails the container. Exec does, only when the image has no entry
+// at that path: the command is left as sent and runs the host's file, which is
+// how a session of a host shell or tool works in an image that ships neither.
+// An image entry that cannot run is refused and does not fall back, so a link
+// that leaves the root never becomes a run of the host's file.
+//
+// The pod decides which side of that rule a name lands on, because it can write
+// its rootfs. Removing the entry forces the host fallback, and writing one makes
+// the image's copy win, so an operator's /bin/sh may be the host's or the image's,
+// and in the second case it holds whatever the pod put there. Neither answer
+// changes the confinement described below, and neither tells the operator which
+// file ran.
+//
+// # What is left as sent
+//
+//   - Every command on a host-binary container (hostBinaryRoute): its paths are
+//     host paths, whatever its rootfs holds.
+//   - A bare name, searched on the session's PATH (supervisor.ResolveExecPath),
+//     and a relative path, which means the session's working directory. Start
+//     reads a relative argv[0] against the rootfs, which is the same directory
+//     unless a working directory is set; a session keeps cwd's ordinary meaning.
+//   - A path under one of the container's volume mounts, apart from cleaning its
+//     name, which is the form this check tested and the one the session's path
+//     interposer then reads. A volume is not the image and the gate below does not
+//     answer for it; the interposer rebases such a path into the rootfs as it
+//     always has.
+//
+// # What bounds the session
+//
+// The pod's profile does. The session keeps the pod's profile, credential and
+// limits, whatever path it names, and that is the boundary against a running pod.
+//
+// The signature gate is not that boundary. The image file passes gateSignature,
+// the gate the container's own argv[0] passed, which catches a bad image or an
+// operator error: a file the policy refuses, while it is still that file. It reads
+// the file once, and a running pod can swap the file straight after the check, so
+// passing it says nothing about what the session then runs. A host file is not
+// gated, as it never was for exec. Overlapping sessions share one run of the gate
+// (execGateFlights).
+func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.Container, cmdv []string) ([]string, error) {
+	argv0 := cmdv[0]
+	if hostBinaryRoute(c) || !filepath.IsAbs(argv0) {
+		return cmdv, nil
+	}
+	rootfs, err := r.rootfsPath(p.box)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "exec: %v", err)
+	}
+	if rebase := mountRebaser(rootfs, containerMountPaths(c)); rebase != nil {
+		if clean := filepath.Clean(argv0); rebase(clean) != clean {
+			return append([]string{clean}, cmdv[1:]...), nil
+		}
+	}
+	bin, inImage, err := resolveImageExecPath(rootfs, argv0)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "exec: %v", err)
+	}
+	if !inImage {
+		return cmdv, nil
+	}
+	policy := p.box.GetSignaturePolicy()
+	err = p.execGates.do(ctx, bin, func(ctx context.Context) error {
+		err := r.gateSignature(ctx, policy, rootfs, bin, false)
+		if err != nil && ctx.Err() == nil {
+			// The gate's errors name the host rootfs, which is the daemon's to know.
+			r.log.Warn("exec: signature gate refused an image file",
+				"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
+		}
+		return err
+	})
+	if err != nil {
+		// A killed codesign reads as "not signed", so the session's own context
+		// says whether this was a refusal at all.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, status.FromContextError(cerr).Err()
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"exec: %q refused by the signature gate under %s; the daemon log has the cause", argv0, policy)
+	}
+	return append([]string{bin}, cmdv[1:]...), nil
+}
+
+// execGateFlights lets a pod's overlapping exec sessions share one run of the
+// signature gate per resolved path. Exec is not serialized per pod, and under
+// ADHOC_OK a run copies a pod-written file, signs it and flushes it in the daemon.
+// The copy has no size bound here or on the start path.
+//
+// It shares only what overlaps: a session that arrives after a run ended starts
+// another, because the pod can have changed the file. The golang.org/x/sync
+// version is not used because a run belongs to its first session's context, and a
+// waiter must not inherit that session's cancellation as a refusal.
+//
+// The zero value is ready to use. mu guards calls and is never held across a run.
+type execGateFlights struct {
+	mu    sync.Mutex
+	calls map[string]*execGateCall
+}
+
+// execGateCall is one run of the gate. err and abandoned are written before done
+// closes and read only after.
+type execGateCall struct {
+	done chan struct{}
+	err  error
+	// abandoned means the run ended with no answer about the file: its session's
+	// context ended, or the gate panicked. A waiter runs the gate itself.
+	abandoned bool
+}
+
+// do runs gate for path, or waits for the run already in flight and returns its
+// answer. It returns ctx.Err() if ctx ends during the wait.
+func (f *execGateFlights) do(ctx context.Context, path string, gate func(context.Context) error) error {
+	for {
+		f.mu.Lock()
+		call, inFlight := f.calls[path]
+		if !inFlight {
+			call = &execGateCall{done: make(chan struct{}), abandoned: true}
+			if f.calls == nil {
+				f.calls = make(map[string]*execGateCall)
+			}
+			f.calls[path] = call
+			f.mu.Unlock()
+			return f.run(ctx, path, call, gate)
+		}
+		f.mu.Unlock()
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if !call.abandoned {
+			return call.err
+		}
+	}
+}
+
+// run is one run of the gate; its deferred release also frees the waiters if gate
+// panics.
+func (f *execGateFlights) run(ctx context.Context, path string, call *execGateCall, gate func(context.Context) error) error {
+	defer func() {
+		f.mu.Lock()
+		delete(f.calls, path)
+		f.mu.Unlock()
+		close(call.done)
+	}()
+	call.err = gate(ctx)
+	call.abandoned = ctx.Err() != nil
+	return call.err
+}
+
+// resolveImageExecPath resolves an exec session's absolute argv[0] in the pod
+// rootfs, reporting the path to exec and whether the image has an entry there.
+// With none, the caller keeps the name it was sent.
+//
+// resolveImageArgv0 bounds the name, and this bounds the place, which start
+// leaves to the profile: a link in the rootfs is walked with chroot semantics
+// (pathsafe.WalkInRoot) and one that leaves the root is refused, so the daemon
+// never names a host file on the pod's say-so. The walk describes the tree at
+// this moment, and the pod can write the tree. A link swapped in afterwards runs
+// under the pod's profile with the pod's identity, which is what the pod could
+// already do by exec'ing that file itself.
+//
+// A path whose links all stay inside the root is returned as named, because the
+// kernel reads it the same way and the program sees the argv[0] start gives it: a
+// multi-call binary and a venv's interpreter both depend on that name. A
+// root-absolute link is returned as the file it means in the image, because the
+// kernel would follow it to the host.
+func resolveImageExecPath(rootfs, argv0 string) (string, bool, error) {
+	bin, err := resolveImageArgv0(rootfs, argv0)
+	if err != nil {
+		return "", false, err
+	}
+	root, err := os.OpenRoot(rootfs)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("open the pod rootfs: %w", err)
+	}
+	defer func() { _ = root.Close() }() // read-only handle
+	rel, err := filepath.Rel(rootfs, bin)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: %q: %w", ErrImageArgvEscapes, argv0, err)
+	}
+	rel = filepath.ToSlash(rel)
+	present, err := imageHasEntry(root, rel)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: %q: %w", ErrImageArgvEscapes, argv0, err)
+	}
+	if !present {
+		return "", false, nil
+	}
+	resolved, hops, exists, err := pathsafe.WalkInRoot(root, rel)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: %q: %w", ErrImageArgvEscapes, argv0, err)
+	}
+	if !exists || resolved == "" {
+		return "", false, fmt.Errorf("%w: %q is a link to nothing in the image", ErrImageArgvEscapes, argv0)
+	}
+	if hops == 0 {
+		return bin, true, nil
+	}
+	inRoot := filepath.Join(rootfs, filepath.FromSlash(resolved))
+	named, nerr := filepath.EvalSymlinks(bin)
+	target, terr := filepath.EvalSymlinks(inRoot)
+	if nerr == nil && terr == nil && named == target {
+		return bin, true, nil
+	}
+	return inRoot, true, nil
+}
+
+// imageHasEntry reports whether the rootfs has anything at rel, without following
+// a link in its last component: a dangling link is an entry, and a missing file
+// under a directory link is not. Only a link that leaves the root is an error.
+func imageHasEntry(root *os.Root, rel string) (bool, error) {
+	dir, _, exists, err := pathsafe.WalkInRoot(root, path.Dir(rel))
+	if errors.Is(err, syscall.ENOTDIR) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	_, err = root.Lstat(path.Join(dir, path.Base(rel)))
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Attach attaches to an already-running container's streams (`kubectl attach`).
