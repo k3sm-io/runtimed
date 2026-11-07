@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,5 +151,41 @@ func TestStoreBytesByClass(t *testing.T) {
 		if IsArtifactClass(class) != wantArtifact {
 			t.Errorf("IsArtifactClass(%q) = %v; want %v", class, !wantArtifact, wantArtifact)
 		}
+	}
+}
+
+// TestArtifactClassClampsTheKey pins that only a media-type-shaped
+// artifactType of at most 255 bytes becomes a class key; anything else is
+// ClassArtifact, so a registry-supplied type cannot pose as another class or
+// carry arbitrary bytes into a report.
+func TestArtifactClassClampsTheKey(t *testing.T) {
+	// The longest type the grammar allows is two 127-byte names: 255 bytes.
+	atCap := strings.Repeat("a", 127) + "/" + strings.Repeat("b", 127)
+	for _, tc := range []struct {
+		name, typ, want string
+	}{
+		{"model media type", testModelType, testModelType},
+		{"wasm media type", testWasmType, testWasmType},
+		{"empty", "", ClassArtifact},
+		{"poses as image", ClassImage, ClassArtifact},
+		{"poses as unattributed", ClassUnattributed, ClassArtifact},
+		{"no subtype", "application/", ClassArtifact},
+		{"two slashes", "application/a/b", ClassArtifact},
+		{"parameters", "application/json; charset=utf-8", ClassArtifact},
+		{"control byte", "application/x\n", ClassArtifact},
+		{"non-ascii", "application/modèle", ClassArtifact},
+		{"leading punctuation", "application/+json", ClassArtifact},
+		{"name over 127 bytes", "application/" + strings.Repeat("a", 128), ClassArtifact},
+		{"over the cap", atCap + "b", ClassArtifact},
+		{"at the cap", atCap, atCap},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.want) > maxClassBytes {
+				t.Fatalf("bad fixture: want is %d bytes", len(tc.want))
+			}
+			if got := artifactClass(tc.typ); got != tc.want {
+				t.Fatalf("artifactClass(%q) = %q; want %q", tc.typ, got, tc.want)
+			}
+		})
 	}
 }
