@@ -50,5 +50,9 @@ func cloneFileAt(_, _ *os.File, name string) error {
 	return &os.PathError{Op: "fclonefileat", Path: name, Err: errors.ErrUnsupported}
 }
 
+// scrubClone off darwin has no file flags to clear; no clone is ever made
+// there (cloneFileAt refuses), so it is never reached with one.
+func scrubClone(*os.File) error { return nil }
+
 // assertNoQuarantine is a no-op off darwin (no com.apple.quarantine concept).
 func assertNoQuarantine(string) error { return nil }

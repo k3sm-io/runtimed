@@ -86,20 +86,23 @@ func writeStoreFile(t *testing.T, dir, name string, content []byte) string {
 	return p
 }
 
-// blobTemps lists the in-flight temp files in the store's sha256 directory.
+// blobTemps lists the temp files in the store's sha256 directory and in the
+// local staging directory.
 func blobTemps(t *testing.T, c *Cache) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(c.BlobStoreDir(), "sha256"))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		t.Fatal(err)
-	}
 	var out []string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".blob-") {
-			out = append(out, e.Name())
+	for _, dir := range []string{filepath.Join(c.BlobStoreDir(), "sha256"), filepath.Join(c.Root(), localStageDir)} {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".blob-") {
+				out = append(out, filepath.Join(dir, e.Name()))
+			}
 		}
 	}
 	return out
@@ -206,6 +209,29 @@ func TestLocalStoreTamperedBlobRefused(t *testing.T) {
 	}
 	if temps := blobTemps(t, cache); len(temps) != 0 {
 		t.Errorf("temp clone not removed: %v", temps)
+	}
+}
+
+// TestCommitFromLocalRefusesUnknownSize: a blob of unknown size never takes
+// the local path, so the fetch path's bounds apply to it.
+func TestCommitFromLocalRefusesUnknownSize(t *testing.T) {
+	root := t.TempDir()
+	cache, err := NewCache(filepath.Join(root, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("layer")
+	digest := sha256Digest(content)
+	store := &fakeLocalStore{files: map[string]string{digest: writeStoreFile(t, root, "store-blob", content)}}
+	wrote, err := cache.CommitFromLocal(digest, SizeUnknown, store)
+	if !errors.Is(err, ErrBlobNotLocal) || wrote {
+		t.Fatalf("CommitFromLocal = (%v, %v), want ErrBlobNotLocal", wrote, err)
+	}
+	if store.askedCount() != 0 {
+		t.Error("the local store was consulted for a blob of unknown size")
+	}
+	if cache.Has(digest) {
+		t.Error("blob of unknown size was committed")
 	}
 }
 
