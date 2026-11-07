@@ -318,3 +318,79 @@ func TestGuestStoreOpenBlobRefusesNonRegular(t *testing.T) {
 		})
 	}
 }
+
+// hostileFetcher returns a registry error full of control characters from the
+// manifest or the blob call.
+type hostileFetcher struct {
+	*fakeFetcher
+	manifestErr, blobErr error
+}
+
+func (h *hostileFetcher) Manifest(ctx context.Context, ref string, c *image.RegistryCredential) ([]byte, string, error) {
+	if h.manifestErr != nil {
+		return nil, "", h.manifestErr
+	}
+	return h.fakeFetcher.Manifest(ctx, ref, c)
+}
+
+func (h *hostileFetcher) Blob(ctx context.Context, ref string, c *image.RegistryCredential, d string, off int64) (io.ReadCloser, int64, error) {
+	if h.blobErr != nil {
+		return nil, 0, h.blobErr
+	}
+	return h.fakeFetcher.Blob(ctx, ref, c, d, off)
+}
+
+func TestGuestStoreRegistryErrorBoundedAndQuoted(t *testing.T) {
+	hostile := errors.New("\x1b[2J\x1b[31mFORGED\nlevel=INFO msg=ok\r\x00\x07" + strings.Repeat("\x1b]8;;evil\x07", 2000))
+	sum := func(b []byte) string { return strings.TrimPrefix(digestOfBytes(b), "sha256:") }
+	pin := guestartifacts.GuestKernelPin{
+		KernelVersion: "v6.18.48", ImageSHA256: sum(guestKernel), InitramfsSHA256: sum(guestInitramfs),
+		ReleaseURL: "https://example.invalid/guest", Cmdline: "console=hvc0",
+	}
+	const version = "v6.18.48-0123456789ab"
+	art, err := guestartifacts.NewStoreArtifact(version, pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name          string
+		manifest, blb error
+	}{
+		{"manifest error", hostile, nil},
+		{"blob error", nil, hostile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fetch.publish(art.Reference(testHost), art.ArtifactType, mediaTypeOCIEmpty, guestLayers())
+			hf := &hostileFetcher{fakeFetcher: e.fetch, manifestErr: tc.manifest, blobErr: tc.blb}
+			p, err := New(Config{
+				RegistryHost: testHost, PartialDir: e.partial, StorePath: e.cache.Root(),
+				FreeBytes:  func(string) (uint64, error) { return e.free.Load(), nil },
+				FloorBytes: 100,
+			}, Deps{Blobs: e.cache, Leases: e.cache, Reclaimer: e.reclaim, Index: e.index, Fetcher: hf})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = guestartifacts.EnsureGuestArtifactsFromStore(context.Background(),
+				filepath.Join(t.TempDir(), "g"), version, pin, testHost, &GuestStore{Puller: p, Blobs: e.cache})
+			if !errors.Is(err, guestartifacts.ErrNotInClusterStore) || !errors.Is(err, hostile) {
+				t.Fatalf("err = %v, want ErrNotInClusterStore wrapping the registry error", err)
+			}
+			msg := err.Error()
+			for i := 0; i < len(msg); i++ {
+				if c := msg[i]; c < 0x20 || c == 0x7f {
+					t.Fatalf("control byte %#x at %d in %q", c, i, msg)
+				}
+			}
+			if strings.Contains(msg, "\x1b") || strings.Contains(msg, "\n") {
+				t.Errorf("raw control text survived: %q", msg)
+			}
+			if len(msg) > 2048 {
+				t.Errorf("message is %d bytes; the registry text is not bounded", len(msg))
+			}
+			if !strings.Contains(msg, version) {
+				t.Errorf("message does not name the pin: %q", msg)
+			}
+		})
+	}
+}
