@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("{\"manifests\":[{\"annotations\":{\"io.k3sm.model.variant\":\"bf16\"},\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"size\":4194304}],\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"schemaVersion\":2}")
+string("application/vnd.oci.image.index.v1+json; charset=utf-8")
+string("bf16")

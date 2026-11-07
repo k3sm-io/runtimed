@@ -871,9 +871,12 @@ func artifactStatusError(err error) error {
 		errors.Is(err, artifact.ErrNoLayers), errors.Is(err, artifact.ErrLayerPath),
 		errors.Is(err, artifact.ErrManifestTooLarge), errors.Is(err, artifact.ErrManifestInvalid),
 		errors.Is(err, artifact.ErrPathNotInArtifact), errors.Is(err, image.ErrBlobTooLarge),
-		errors.Is(err, artifact.ErrSizeCap), errors.Is(err, artifact.ErrSizeOverflow):
+		errors.Is(err, artifact.ErrSizeCap), errors.Is(err, artifact.ErrSizeOverflow),
+		errors.Is(err, artifact.ErrVariantNotFound), errors.Is(err, artifact.ErrVariantAmbiguous),
+		errors.Is(err, artifact.ErrVariantOnManifest):
 		return artifactStatus(codes.FailedPrecondition, err)
 	case errors.Is(err, artifact.ErrInvalidReference), errors.Is(err, artifactv1.ErrUnknownPolicy),
+		errors.Is(err, artifact.ErrVariantInvalid),
 		isPathRuleError(err):
 		return artifactStatus(codes.InvalidArgument, err)
 	}

@@ -145,12 +145,12 @@ type lazyArtifactPuller struct{ p *artifact.Puller }
 
 func (l *lazyArtifactPuller) CheckHost(ref string) error { return l.p.CheckHost(ref) }
 
-func (l *lazyArtifactPuller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
-	return l.p.PullArtifact(ctx, ref, cred, policy, paths)
+func (l *lazyArtifactPuller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	return l.p.PullArtifact(ctx, ref, cred, policy, paths, opts...)
 }
 
-func (l *lazyArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
-	return l.p.PullForPod(ctx, ref, cred, policy, paths)
+func (l *lazyArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	return l.p.PullForPod(ctx, ref, cred, policy, paths, opts...)
 }
 
 func modelArtifact(layers map[string][]byte, order []string) *fakeArtifactFetcher {
@@ -273,7 +273,7 @@ func (s *scriptedArtifactPuller) CheckHost(ref string) error {
 	return nil
 }
 
-func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string) (*artifact.Result, error) {
+func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string, _ ...artifact.PullOption) (*artifact.Result, error) {
 	if err := s.CheckHost(ref); err != nil {
 		return nil, err
 	}
@@ -301,8 +301,8 @@ func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _
 	return &artifact.Result{ManifestDigest: sha([]byte("m"))}, nil
 }
 
-func (s *scriptedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
-	return s.PullArtifact(ctx, ref, cred, policy, paths)
+func (s *scriptedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	return s.PullArtifact(ctx, ref, cred, policy, paths, opts...)
 }
 
 func volumeReq(ref string) *runtimev1.PullArtifactRequest {
@@ -375,6 +375,32 @@ func TestPullArtifactRPCSizeRefusalsAreTerminal(t *testing.T) {
 			err := artifactStatusError(fmt.Errorf("layer 0: %w", sentinel))
 			if got := status.Code(err); got != codes.FailedPrecondition {
 				t.Fatalf("code = %v, want FailedPrecondition", got)
+			}
+		})
+	}
+}
+
+// TestArtifactStatusErrorMapsVariantRefusals pins the variant refusals: what
+// the artifact does not offer (no match, several matches, a selector for a
+// single manifest) is a terminal FailedPrecondition, a malformed selector is
+// the caller's InvalidArgument, and an index pulled with no selector stays
+// FailedPrecondition through ErrIndexRefused.
+func TestArtifactStatusErrorMapsVariantRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{"not found", artifact.ErrVariantNotFound, codes.FailedPrecondition},
+		{"ambiguous", artifact.ErrVariantAmbiguous, codes.FailedPrecondition},
+		{"on a manifest", artifact.ErrVariantOnManifest, codes.FailedPrecondition},
+		{"invalid selector", artifact.ErrVariantInvalid, codes.InvalidArgument},
+		{"required", fmt.Errorf("%w: %w", artifact.ErrIndexRefused, artifact.ErrVariantRequired), codes.FailedPrecondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := artifactStatusError(fmt.Errorf("variant %q: %w", "8bit", tc.err))
+			if got := status.Code(err); got != tc.want {
+				t.Fatalf("code = %v, want %v", got, tc.want)
 			}
 		})
 	}
