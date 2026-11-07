@@ -380,6 +380,32 @@ func TestPullArtifactRPCSizeRefusalsAreTerminal(t *testing.T) {
 	}
 }
 
+// TestArtifactStatusErrorMapsVariantRefusals pins the variant refusals: what
+// the artifact does not offer (no match, several matches, a selector for a
+// single manifest) is a terminal FailedPrecondition, a malformed selector is
+// the caller's InvalidArgument, and an index pulled with no selector stays
+// FailedPrecondition through ErrIndexRefused.
+func TestArtifactStatusErrorMapsVariantRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{"not found", artifact.ErrVariantNotFound, codes.FailedPrecondition},
+		{"ambiguous", artifact.ErrVariantAmbiguous, codes.FailedPrecondition},
+		{"on a manifest", artifact.ErrVariantOnManifest, codes.FailedPrecondition},
+		{"invalid selector", artifact.ErrVariantInvalid, codes.InvalidArgument},
+		{"required", fmt.Errorf("%w: %w", artifact.ErrIndexRefused, artifact.ErrVariantRequired), codes.FailedPrecondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := artifactStatusError(fmt.Errorf("variant %q: %w", "8bit", tc.err))
+			if got := status.Code(err); got != tc.want {
+				t.Fatalf("code = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestArtifactViewServesAPulledArtifact pins the wiring the mount path will
 // call: once PullArtifact has recorded an artifact, the runtime's own views
 // build its read-only view over the same cache and index.
