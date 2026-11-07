@@ -24,10 +24,11 @@ type Entry struct {
 	// symlink (/usr/bin/tar is one, so tar's Source is /usr/bin/bsdtar).
 	Source string
 	// Hosts are the exec paths swapped for the copy. A binary that
-	// dispatches on argv[0] (grep/zgrep, gunzip/zcat) lists every name that
+	// dispatches on argv[0] (gunzip/zcat) lists every name that
 	// reaches the same file; the swap keeps argv[0], so the copy dispatches
 	// exactly as the host binary would. macOS 27 split test/[ and grep/egrep
-	// into separate files, so each of those names has its own entry.
+	// into separate files, and 27.2 links zgrep with egrep rather than
+	// grep, so each of those names has its own entry.
 	Hosts []string
 	// Shell marks the shell entries. The runtime keys its shell-only rules on
 	// it (a direct exec of a host-shell script interpreter, and its policy
@@ -63,9 +64,10 @@ var entries = []Entry{
 	{Copy: "sleep", Source: "/bin/sleep", Hosts: []string{"/bin/sleep"}},
 	{Copy: "date", Source: "/bin/date", Hosts: []string{"/bin/date"}},
 	{Copy: "sed", Source: "/usr/bin/sed", Hosts: []string{"/usr/bin/sed"}},
-	{Copy: "grep", Source: "/usr/bin/grep", Hosts: []string{"/usr/bin/grep", "/usr/bin/zgrep"}},
+	{Copy: "grep", Source: "/usr/bin/grep", Hosts: []string{"/usr/bin/grep"}},
 	{Copy: "egrep", Source: "/usr/bin/egrep", Hosts: []string{"/usr/bin/egrep"}},
 	{Copy: "fgrep", Source: "/usr/bin/fgrep", Hosts: []string{"/usr/bin/fgrep"}},
+	{Copy: "zgrep", Source: "/usr/bin/zgrep", Hosts: []string{"/usr/bin/zgrep"}},
 	{Copy: "awk", Source: "/usr/bin/awk", Hosts: []string{"/usr/bin/awk"}},
 	{Copy: "tee", Source: "/usr/bin/tee", Hosts: []string{"/usr/bin/tee"}},
 	{Copy: "head", Source: "/usr/bin/head", Hosts: []string{"/usr/bin/head"}},

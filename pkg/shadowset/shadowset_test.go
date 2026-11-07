@@ -78,7 +78,7 @@ func TestLookups(t *testing.T) {
 		{"/usr/bin/tar", "tar", false},
 		{"/usr/bin/bsdtar", "tar", false},
 		{"/usr/bin/egrep", "egrep", false},
-		{"/usr/bin/zgrep", "grep", false},
+		{"/usr/bin/zgrep", "zgrep", false},
 		{"/usr/bin/fgrep", "fgrep", false},
 		{"/usr/bin/zcat", "gunzip", false},
 		{"/usr/bin/gzip", "gzip", false},
