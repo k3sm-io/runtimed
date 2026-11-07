@@ -24,8 +24,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -106,7 +108,7 @@ func (x *FileIndex) PutArtifactRecord(ctx context.Context, key string, record []
 // differs from record, the bytes about to replace it. The caller has checked
 // the file is regular and within its cap.
 func (x *FileIndex) keepReplaced(root, sub *os.Root, name string, record []byte) {
-	if prev, err := readAnchored(sub, name); err == nil && !bytes.Equal(prev, record) && int64(len(prev)) <= MaxArtifactRecordBytes {
+	if prev, err := readAnchoredLimit(sub, name, MaxArtifactRecordBytes); err == nil && !bytes.Equal(prev, record) {
 		// A replaced record keeps its artifactType for the blobs only it named.
 		// The copy is an eviction-order hint and never a root, so failing to
 		// write it must not fail the put; the blobs it would describe are
@@ -385,9 +387,13 @@ const (
 	releasedTempMaxAge       = time.Hour
 )
 
-// releasedMu serializes every bound sweep of a released directory in this
-// process, across FileIndex values (the cache builds its own for the GC). A
-// removal that still races a release in another process only loses a hint.
+// releasedMu serializes, in this process and across FileIndex values (the
+// cache builds its own for the GC), the writes of a released directory: each
+// release's commit, and each bound's re-check-and-remove of the names it
+// condemned. It is never held across a directory scan or a decode, so a pull
+// or delete that releases a record never waits on a sweep reading the whole
+// directory. A removal that races a release in another process only loses a
+// hint.
 var releasedMu sync.Mutex
 
 // validReleasedName reports whether name is <64 lowercase hex>.json, the only
@@ -419,7 +425,14 @@ func (x *FileIndex) keepReleased(root *os.Root, record []byte) error {
 		return err
 	}
 	defer sub.Close()
-	if err := x.commit(sub, releasedName(record), record); err != nil {
+	// The commit runs under releasedMu so a bound's re-check and removal of a
+	// name (boundReleased) never interleave with a release rewriting it. The
+	// lock is never held across a scan or a decode, so this waits only for
+	// another commit or another bound's removals.
+	releasedMu.Lock()
+	err = x.commit(sub, releasedName(record), record)
+	releasedMu.Unlock()
+	if err != nil {
 		return err
 	}
 	// The release path bounds by name, size and count only; decoding every
@@ -483,6 +496,14 @@ func (x *FileIndex) openReleased() (*os.Root, error) {
 type scannedCopy struct {
 	releasedArtifact
 	size int64
+	fi   fs.FileInfo
+}
+
+// scannedFile is a file a scan condemned, with what it saw, so the removal can
+// re-check the name still holds that file.
+type scannedFile struct {
+	name string
+	fi   fs.FileInfo
 }
 
 // scanReleased reads the released directory sub. It returns the copies that
@@ -493,7 +514,7 @@ type scannedCopy struct {
 // commit in flight and is neither. With decode unset nothing is read or
 // decoded: every well-named regular file within the cap counts as a copy with
 // a zero root, which is enough to bound the directory.
-func scanReleased(sub *os.Root, now time.Time, decode bool) (copies []scannedCopy, junk []string, err error) {
+func scanReleased(sub *os.Root, now time.Time, decode bool) (copies []scannedCopy, junk []scannedFile, err error) {
 	dir, err := sub.Open(".")
 	if err != nil {
 		return nil, nil, fmt.Errorf("open released artifact records: %w", err)
@@ -511,30 +532,55 @@ func scanReleased(sub *os.Root, now time.Time, decode bool) (copies []scannedCop
 		}
 		if strings.HasPrefix(name, ".index-") {
 			if fi.Mode().IsRegular() && now.Sub(fi.ModTime()) > releasedTempMaxAge {
-				junk = append(junk, name)
+				junk = append(junk, scannedFile{name, fi})
 			}
 			continue
 		}
 		if !validReleasedName(name) || !fi.Mode().IsRegular() || fi.Size() > MaxArtifactRecordBytes {
-			junk = append(junk, name)
+			junk = append(junk, scannedFile{name, fi})
 			continue
 		}
 		var r artifactRecordRoot
 		if !decode {
-			copies = append(copies, scannedCopy{releasedArtifact{name: name, releasedAt: fi.ModTime()}, fi.Size()})
+			copies = append(copies, scannedCopy{releasedArtifact{name: name, releasedAt: fi.ModTime()}, fi.Size(), fi})
 			continue
 		}
-		buf, err := readAnchored(sub, name)
+		buf, err := readAnchoredLimit(sub, name, MaxArtifactRecordBytes)
 		if err != nil {
 			continue
 		}
 		if decodeRecordRoot(buf, &r) != nil {
-			junk = append(junk, name)
+			junk = append(junk, scannedFile{name, fi})
 			continue
 		}
-		copies = append(copies, scannedCopy{releasedArtifact{name: name, root: r, releasedAt: fi.ModTime()}, fi.Size()})
+		copies = append(copies, scannedCopy{releasedArtifact{name: name, root: r, releasedAt: fi.ModTime()}, fi.Size(), fi})
 	}
 	return copies, junk, nil
+}
+
+// readAnchoredLimit is readAnchored reading at most limit bytes: a file that
+// grew past limit since its Lstat is an error, never read in full.
+func readAnchoredLimit(root *os.Root, rel string, limit int64) ([]byte, error) {
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode %v)", rel, fi.Mode().Type())
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes: %w", rel, limit, ErrArtifactRecordTooLarge)
+	}
+	return buf, nil
 }
 
 // boundReleased removes from the released directory sub every file
@@ -543,8 +589,8 @@ func scanReleased(sub *os.Root, now time.Time, decode bool) (copies []scannedCop
 // recurses: a directory planted there stays, and its failed removal is
 // reported.
 func boundReleased(sub *os.Root, maxCount int, maxBytes int64, now time.Time, decode bool) error {
-	releasedMu.Lock()
-	defer releasedMu.Unlock()
+	// Scan and decode with NO lock held: this is the part that can read the
+	// whole directory, and a release must never wait on it.
 	copies, junk, err := scanReleased(sub, now, decode)
 	if err != nil {
 		return err
@@ -558,15 +604,27 @@ func boundReleased(sub *os.Root, maxCount int, maxBytes int64, now time.Time, de
 	var total int64
 	for i, rc := range copies {
 		if i >= maxCount || total+rc.size > maxBytes {
-			junk = append(junk, rc.name)
+			junk = append(junk, scannedFile{rc.name, rc.fi})
 			continue
 		}
 		total += rc.size
 	}
+	if len(junk) == 0 {
+		return nil
+	}
+	// Remove under the lock every release's commit takes, and only a name
+	// that still holds the file the scan judged: same file, size and mtime. A
+	// copy released again since the scan was rewritten, so it is left.
+	releasedMu.Lock()
+	defer releasedMu.Unlock()
 	var errs []error
-	for _, name := range junk {
-		if err := sub.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("remove released artifact record %s: %w", QuoteBounded(name, 256), err))
+	for _, j := range junk {
+		cur, err := sub.Lstat(j.name)
+		if err != nil || !os.SameFile(cur, j.fi) || cur.Size() != j.fi.Size() || !cur.ModTime().Equal(j.fi.ModTime()) {
+			continue
+		}
+		if err := sub.Remove(j.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove released artifact record %s: %w", QuoteBounded(j.name, 256), err))
 		}
 	}
 	return errors.Join(errs...)
@@ -650,26 +708,43 @@ func (x *FileIndex) openSubdir(root *os.Root, name string, create bool) (*os.Roo
 			return nil, fmt.Errorf("create %s index: %w", name, err)
 		}
 	}
-	fi, err := root.Lstat(name)
+	path := filepath.Join(x.dir, name)
+	// Lstat first, so a symlink planted at the name is refused rather than
+	// followed to another directory under the index (OpenRoot would follow it).
+	pre, err := root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("%w: %s/%s is not a directory (mode %v)", ErrIndexNotOwned, x.dir, name, fi.Mode().Type())
+	if !pre.IsDir() {
+		return nil, fmt.Errorf("%w: index subdirectory %s is not a directory (mode %v)", ErrIndexNotOwned, path, pre.Mode().Type())
+	}
+	sub, err := root.OpenRoot(name)
+	if err != nil {
+		return nil, fmt.Errorf("open %s index: %w", name, err)
+	}
+	// Mode and owner are judged on the OPENED handle, and it must be the
+	// directory the Lstat saw: a swap between the two is refused.
+	fi, err := sub.Stat(".")
+	if err != nil {
+		sub.Close()
+		return nil, fmt.Errorf("stat index subdirectory %s: %w", path, err)
+	}
+	if !os.SameFile(pre, fi) {
+		sub.Close()
+		return nil, fmt.Errorf("%w: index subdirectory %s was replaced while it was opened", ErrIndexNotOwned, path)
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("%w: %s/%s is writable by group or other (mode %v)", ErrIndexNotOwned, x.dir, name, fi.Mode().Perm())
+		sub.Close()
+		return nil, fmt.Errorf("%w: index subdirectory %s is writable by group or other (mode %v); expected 0700", ErrIndexNotOwned, path, fi.Mode().Perm())
 	}
 	// The owner check FileIndex.open makes, for the same reason and with the
 	// same best-effort caveat where stat carries no uid.
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		if euid := os.Geteuid(); int(st.Uid) != euid {
-			return nil, fmt.Errorf("%w: %s/%s is owned by uid %d, not %d", ErrIndexNotOwned, x.dir, name, st.Uid, euid)
+			sub.Close()
+			return nil, fmt.Errorf("%w: index subdirectory %s is owned by uid %d; expected uid %d (the daemon's effective uid)",
+				ErrIndexNotOwned, path, st.Uid, euid)
 		}
-	}
-	sub, err := root.OpenRoot(name)
-	if err != nil {
-		return nil, fmt.Errorf("open %s index: %w", name, err)
 	}
 	return sub, nil
 }

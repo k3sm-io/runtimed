@@ -18,10 +18,12 @@ package image
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -145,4 +147,58 @@ func symmetricDiff(a, b []string) []string {
 		}
 	}
 	return out
+}
+
+// TestOpenSubdirNamesTheSubdirectory pins that an ownership refusal names the
+// index subdirectory and what was expected, so the operator can fix it, and
+// that a symlink planted at a subdirectory's name is refused, not followed.
+func TestOpenSubdirNamesTheSubdirectory(t *testing.T) {
+	f := newGCFixture(t)
+	x, err := NewFileIndex(f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(x.dir, ArtifactReleasedIndexSubdir)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	_, err = x.releasedArtifacts()
+	if !errors.Is(err, ErrIndexNotOwned) || !strings.Contains(err.Error(), dir) || !strings.Contains(err.Error(), "expected 0700") {
+		t.Fatalf("releasedArtifacts on a 0777 subdirectory = %v; want ErrIndexNotOwned naming %s and the expected mode", err, dir)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(x.dir, ArtifactIndexSubdir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ArtifactIndexSubdir, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.BoundReleasedArtifacts(); !errors.Is(err, ErrIndexNotOwned) {
+		t.Fatalf("BoundReleasedArtifacts through a symlinked subdirectory = %v; want ErrIndexNotOwned", err)
+	}
+}
+
+// TestReadAnchoredLimitRefusesAnOversizedFile pins the bounded read the
+// released copies and a replaced record go through.
+func TestReadAnchoredLimitRefusesAnOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("12345"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if buf, err := readAnchoredLimit(root, "f", 5); err != nil || string(buf) != "12345" {
+		t.Fatalf("readAnchoredLimit at the limit = %q, %v", buf, err)
+	}
+	if _, err := readAnchoredLimit(root, "f", 4); !errors.Is(err, ErrArtifactRecordTooLarge) {
+		t.Fatalf("readAnchoredLimit over the limit = %v; want ErrArtifactRecordTooLarge", err)
+	}
 }
