@@ -191,3 +191,29 @@ func TestReclaimEvictsLeastRecentlyReleasedArtifactFirst(t *testing.T) {
 		t.Fatalf("released copies after the drain = %+v; want only the young one", copies)
 	}
 }
+
+// TestDropLeasedHonoursALeaseTakenAfterPlanning pins the re-read of the leases
+// before each executor run: a planned blob that an ingest leased since the
+// plan is dropped from the run and reported kept as leased.
+func TestDropLeasedHonoursALeaseTakenAfterPlanning(t *testing.T) {
+	f := newGCFixture(t)
+	a := f.blob("planned a", time.Hour)
+	b := f.blob("planned b", time.Hour)
+	dels := []PruneDecision{
+		{Node: BlobNode{Path: "sha256/" + a[len("sha256:"):], Digest: a, Kind: BlobKindContent}, Reason: ReasonDeleteUnreferenced},
+		{Node: BlobNode{Path: "sha256/" + b[len("sha256:"):], Digest: b, Kind: BlobKindContent}, Reason: ReasonDeleteUnreferenced},
+	}
+	lease := f.cache.AcquireLease([]string{b}, time.Hour)
+	defer lease.Release()
+	rep := &ReclaimReport{}
+	got := f.cache.dropLeased(dels, rep)
+	if len(got) != 1 || got[0].Node.Digest != a {
+		t.Fatalf("dropLeased kept %v; want only %s", got, a)
+	}
+	if len(rep.Kept) != 1 || rep.Kept[0].Digest != b || rep.Kept[0].Reason != ReasonKeptLeased {
+		t.Fatalf("rep.Kept = %+v; want %s kept as leased", rep.Kept, b)
+	}
+	if len(dels) != 2 || dels[1].Node.Digest != b {
+		t.Fatal("dropLeased modified the caller's plan")
+	}
+}

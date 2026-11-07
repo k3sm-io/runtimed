@@ -382,6 +382,17 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	if err != nil {
 		return nil, err
 	}
+	// CLASSES next, before the roots and the plan, so reading them adds nothing
+	// to the time between planning and unlinking. They are eviction order only
+	// (see orderEvictions): no class can make a blob eligible or keep one, so
+	// when they are read relative to the roots does not matter for safety.
+	// Unreadable classes are no reason to stop defending the volume; the pass
+	// then evicts in path order, as before classes existed.
+	classes, cerr := c.readBlobClasses(ctx)
+	if cerr != nil {
+		log.Warn("image reclaim: blob classes unreadable; evicting in path order", "err", cerr)
+		classes = &blobClasses{}
+	}
 	if cfg.afterInventory != nil {
 		cfg.afterInventory()
 	}
@@ -409,17 +420,13 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: k.Node.Store, Key: k.Node.Key, Path: k.Node.Path, Reason: k.Reason})
 	}
 
-	// EVICTION ORDER. Classes are read after the plan and only reorder its
-	// Delete set (orderEvictions is a permutation), so they can never make a
-	// blob eligible or keep one: holds, pins, pod records and leases have
-	// already decided membership above, and every unlink still re-verifies.
-	// Unreadable classes are no reason to stop defending the volume; the pass
-	// then evicts in path order, as before classes existed.
-	classes, cerr := c.readBlobClasses(ctx)
-	if cerr != nil {
-		log.Warn("image reclaim: blob classes unreadable; evicting in path order", "err", cerr)
-		classes = &blobClasses{}
-	}
+	// EVICTION ORDER. The classes only reorder the plan's Delete set
+	// (orderEvictions is a permutation), so they can never make a blob
+	// eligible or keep one: holds, pins, pod records and leases have already
+	// decided membership above. What the executor re-checks before each unlink
+	// is narrower: the path still fits the blob grammar, Lstat still reports a
+	// regular file, and its mtime is still older than grace. It does not re-read
+	// the roots; the leases are re-read before each executor run (dropLeased).
 	artifactDels, restDels := orderEvictions(plan.Delete, classes)
 	plan.Delete = append(append([]PruneDecision(nil), artifactDels...), restDels...)
 	rep.ReclaimedByClass = map[string]int64{}
@@ -486,6 +493,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// target stops having given up the cheaper thing — and it can never orphan
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
+	artifactDels = c.dropLeased(artifactDels, rep)
 	artExec, err := c.ExecutePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop)
 	if err != nil {
 		return nil, err
@@ -503,6 +511,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
+	restDels = c.dropLeased(restDels, rep)
 	restExec, err := c.ExecutePrune(&PrunePlan{Delete: restDels}, grace, now(), stop)
 	if err != nil {
 		return nil, err
@@ -547,6 +556,28 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 			"deleted", exec.Deleted, "trees_deleted", treeExec.Deleted)
 	}
 	return rep, nil
+}
+
+// dropLeased returns dels without the decisions whose digest a live lease
+// pins now, reporting each dropped one in rep.Kept as ReasonKeptLeased. The
+// planner read the leases once; an ingest that leased a planned blob since
+// (a cache hit on an old blob, which no grace window covers) is honoured
+// here, just before the executor runs. A lease taken during the executor's own
+// run is not seen; the grace re-check and the next pass are what remain.
+func (c *Cache) dropLeased(dels []PruneDecision, rep *ReclaimReport) []PruneDecision {
+	leased := c.leasedDigests()
+	if len(leased) == 0 {
+		return dels
+	}
+	out := dels[:0:0]
+	for _, d := range dels {
+		if d.Node.Digest != "" && leased[d.Node.Digest] {
+			rep.Kept = append(rep.Kept, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // newlySkipped returns the pod dirs in skipped that the previous pass did not
