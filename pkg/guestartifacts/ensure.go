@@ -360,9 +360,23 @@ func ensureArtifact(ctx context.Context, dir, setDir, name, digest, releaseURL s
 // start would find, verify, and correctly reject — one re-fetch later than
 // necessary and one boot of the wrong kernel earlier than acceptable.
 func fetchVerified(ctx context.Context, dir, final, url, digest string, f Fetcher) error {
+	return installVerified(ctx, dir, final, url, digest, func() (io.ReadCloser, error) {
+		body, err := f.Fetch(ctx, url)
+		if err != nil {
+			return nil, fmt.Errorf("fetch the guest artifact %s: %w", url, err)
+		}
+		return body, nil
+	})
+}
+
+// installVerified copies the body open returns into a temp file in dir,
+// verifies the whole body against digest, and only then renames it to final.
+// It is the one install path of the cache, whatever the source: what names the
+// source in errors, and the temp-verify-rename order is fetchVerified's.
+func installVerified(ctx context.Context, dir, final, what, digest string, open func() (io.ReadCloser, error)) error {
 	tmp, err := os.CreateTemp(dir, tempPrefix+"*")
 	if err != nil {
-		return fmt.Errorf("create a temp file for %s: %w", url, err)
+		return fmt.Errorf("create a temp file for %s: %w", what, err)
 	}
 	tmpName := tmp.Name()
 	// The temp file is removed on every path that does not rename it away;
@@ -373,29 +387,29 @@ func fetchVerified(ctx context.Context, dir, final, url, digest string, f Fetche
 		_ = os.Remove(tmpName)
 	}()
 
-	body, err := f.Fetch(ctx, url)
+	body, err := open()
 	if err != nil {
-		return fmt.Errorf("fetch the guest artifact %s: %w", url, err)
+		return err
 	}
 	defer func() { _ = body.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(tmp, h), &ctxReader{ctx: ctx, r: body}); err != nil {
-		return fmt.Errorf("download the guest artifact %s: %w", url, err)
+		return fmt.Errorf("download the guest artifact %s: %w", what, err)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != digest {
-		return fmt.Errorf("the guest artifact at %s hashes to %s, want %s: %w", url, got, digest, ErrDigestMismatch)
+		return fmt.Errorf("the guest artifact at %s hashes to %s, want %s: %w", what, got, digest, ErrDigestMismatch)
 	}
 	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("flush the guest artifact downloaded from %s: %w", url, err)
+		return fmt.Errorf("flush the guest artifact downloaded from %s: %w", what, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close the guest artifact downloaded from %s: %w", url, err)
+		return fmt.Errorf("close the guest artifact downloaded from %s: %w", what, err)
 	}
 	// 0644: the cache is world-readable by design — it holds published release
 	// bytes whose integrity comes from the digest, never from its permissions.
 	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fmt.Errorf("set the mode of the guest artifact downloaded from %s: %w", url, err)
+		return fmt.Errorf("set the mode of the guest artifact downloaded from %s: %w", what, err)
 	}
 	// The set directory is created here, immediately before the rename, and not
 	// before the fetch: a fetch that fails must leave no trace, and an empty
