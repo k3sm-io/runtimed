@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -360,4 +361,41 @@ func TestWrongDigestFromStoreRefused(t *testing.T) {
 			t.Errorf("kernel not replaced: %q", b)
 		}
 	})
+}
+
+// expectingStore is a fakeStore that also takes the expected layers, and
+// refuses PullGuest so a fallback to it is visible.
+type expectingStore struct {
+	*fakeStore
+	want [][]StoreLayer
+}
+
+func (s *expectingStore) PullGuest(context.Context, string) (map[string]string, func(), error) {
+	return nil, nil, errors.New("expecting store: PullGuest called")
+}
+
+func (s *expectingStore) PullGuestLayers(ctx context.Context, ref string, want []StoreLayer) (map[string]string, func(), error) {
+	s.mu.Lock()
+	s.want = append(s.want, append([]StoreLayer(nil), want...))
+	s.mu.Unlock()
+	return s.fakeStore.PullGuest(ctx, ref)
+}
+
+// TestEnsurePassesThePinnedLayersToAnExpectingStore pins that the ensure
+// hands a LayerExpectingStore the pin's exact layers, so it can refuse a
+// hostile manifest before any blob fetch, and never falls back to PullGuest.
+func TestEnsurePassesThePinnedLayersToAnExpectingStore(t *testing.T) {
+	pin := testPin()
+	art, err := NewStoreArtifact(testStoreVersion, pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &expectingStore{fakeStore: newFakeStore()}
+	st.publish(t, testStoreVersion, pin, testKernelBytes, testInitramfsBytes)
+	if _, err := EnsureGuestArtifactsFromStore(context.Background(), filepath.Join(t.TempDir(), "g"), testStoreVersion, pin, testStoreHost, st); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if len(st.want) != 1 || !slices.Equal(st.want[0], art.Layers) {
+		t.Fatalf("expected layers passed = %+v, want one call with %+v", st.want, art.Layers)
+	}
 }

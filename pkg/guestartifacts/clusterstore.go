@@ -123,6 +123,20 @@ type ClusterStore interface {
 	OpenBlob(digest string) (io.ReadCloser, error)
 }
 
+// LayerExpectingStore is a ClusterStore that refuses the artifact before
+// fetching any blob unless its manifest declares exactly want: the same file
+// names, the pinned digests, and sizes within MaxArtifactBytes. The production
+// store (artifact.GuestStore) implements it, and EnsureGuestArtifactsFromStore
+// prefers it over PullGuest, so a hostile registry cannot make a worker
+// download and cache anything the pin does not name. The after-pull checks
+// still run either way.
+type LayerExpectingStore interface {
+	ClusterStore
+	// PullGuestLayers is PullGuest with the expected layers checked against
+	// the manifest before the first blob request.
+	PullGuestLayers(ctx context.Context, ref string, want []StoreLayer) (layers map[string]string, release func(), err error)
+}
+
 // ErrNotInClusterStore reports that the pinned guest artifact could not be
 // obtained from the cluster store: the server does not hold the pin, or the
 // worker cannot reach it. From a worker's position the two are one event, and
@@ -197,7 +211,15 @@ func EnsureGuestArtifactsFromStore(ctx context.Context, dir, version string, pin
 	ref := art.Reference(registryHost)
 	fail := func(err error) error { return &ClusterStoreError{Version: version, Reference: ref, Err: err} }
 
-	layers, release, err := store.PullGuest(ctx, ref)
+	var (
+		layers  map[string]string
+		release func()
+	)
+	if es, ok := store.(LayerExpectingStore); ok {
+		layers, release, err = es.PullGuestLayers(ctx, ref, art.Layers)
+	} else {
+		layers, release, err = store.PullGuest(ctx, ref)
+	}
 	if err != nil {
 		return zero, fail(fmt.Errorf("%w: %w", ErrNotInClusterStore, err))
 	}

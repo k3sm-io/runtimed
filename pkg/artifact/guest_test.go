@@ -19,6 +19,7 @@ package artifact
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -41,7 +42,7 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 )
 
-var _ guestartifacts.ClusterStore = (*GuestStore)(nil)
+var _ guestartifacts.LayerExpectingStore = (*GuestStore)(nil)
 
 const mediaTypeOCIEmpty = "application/vnd.oci.empty.v1+json"
 
@@ -57,6 +58,131 @@ func guestLayers() []layer {
 	}
 }
 
+// guestWant is the expected set for guestLayers, as a pin names it.
+func guestWant() []GuestLayer {
+	var want []GuestLayer
+	for _, l := range guestLayers() {
+		want = append(want, GuestLayer{Path: l.path, Digest: digestOfBytes(l.data), MaxBytes: guestartifacts.MaxArtifactBytes})
+	}
+	return want
+}
+
+// rawGuestLayer is a manifest layer with a declared size the fake registry
+// need not be able to serve.
+type rawGuestLayer struct {
+	mt, path, digest string
+	size             int64
+}
+
+// publishRawGuest publishes a guest manifest whose descriptors are written as
+// given, for refusals that must fire before any blob is requested. The
+// registry serves the config and the fixture pair only.
+func publishRawGuest(f *fakeFetcher, ref string, configSize int64, layers []rawGuestLayer) {
+	cfg := []byte(`{}`)
+	var ls []map[string]any
+	for _, l := range layers {
+		ls = append(ls, map[string]any{
+			"mediaType": l.mt, "digest": l.digest, "size": l.size,
+			"annotations": map[string]string{artifactv1.AnnotationFilepath: l.path},
+		})
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     mediaTypeOCIManifest,
+		"artifactType":  artifactv1.ArtifactTypeGuest,
+		"config":        map[string]any{"mediaType": mediaTypeOCIEmpty, "digest": digestOfBytes(cfg), "size": configSize},
+		"layers":        ls,
+	})
+	f.mu.Lock()
+	for _, b := range [][]byte{cfg, guestKernel, guestInitramfs} {
+		f.blobs[digestOfBytes(b)] = b
+	}
+	f.manifests[ref] = served{raw: raw, mt: mediaTypeOCIManifest}
+	f.mu.Unlock()
+}
+
+// TestPullGuestArtifactRefusesUnexpectedLayersBeforeAnyBlob pins that a guest
+// manifest naming anything but the expected layers is refused with no blob
+// request, so a hostile registry cannot make a worker download junk, and that
+// the expected manifest still pulls.
+func TestPullGuestArtifactRefusesUnexpectedLayersBeforeAnyBlob(t *testing.T) {
+	kernel := rawGuestLayer{artifactv1.MediaTypeGuestKernel, guestartifacts.ImageFileName, digestOfBytes(guestKernel), int64(len(guestKernel))}
+	initramfs := rawGuestLayer{artifactv1.MediaTypeGuestInitramfs, guestartifacts.InitramfsFileName, digestOfBytes(guestInitramfs), int64(len(guestInitramfs))}
+	junk := "sha256:" + strings.Repeat("a", 64)
+	const big = 200 << 30
+	for _, tc := range []struct {
+		name       string
+		configSize int64
+		layers     []rawGuestLayer
+	}{
+		{"an extra large layer", 2, []rawGuestLayer{kernel, initramfs,
+			{artifactv1.MediaTypeGuestKernel, "Image2", junk, big}}},
+		{"a substituted large kernel", 2, []rawGuestLayer{
+			{artifactv1.MediaTypeGuestKernel, guestartifacts.ImageFileName, junk, big}, initramfs}},
+		{"the pinned digest declared oversized", 2, []rawGuestLayer{
+			{kernel.mt, kernel.path, kernel.digest, guestartifacts.MaxArtifactBytes + 1}, initramfs}},
+		{"a layer under another name", 2, []rawGuestLayer{
+			{kernel.mt, "vmlinuz", kernel.digest, kernel.size}, initramfs}},
+		{"a missing layer", 2, []rawGuestLayer{kernel}},
+		{"an oversized config", MaxGuestConfigBytes + 1, []rawGuestLayer{kernel, initramfs}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			publishRawGuest(e.fetch, testRef, tc.configSize, tc.layers)
+			_, err := e.puller(t).PullGuestArtifact(context.Background(), testRef, nil, guestWant())
+			if !errors.Is(err, ErrGuestLayersMismatch) {
+				t.Fatalf("err = %v, want ErrGuestLayersMismatch", err)
+			}
+			if n := e.fetch.blobCalls.Load(); n != 0 {
+				t.Errorf("%d blob requests before the refusal, want 0", n)
+			}
+		})
+	}
+
+	t.Run("the expected manifest pulls", func(t *testing.T) {
+		e := newEnv(t)
+		publishRawGuest(e.fetch, testRef, 2, []rawGuestLayer{kernel, initramfs})
+		res, err := e.puller(t).PullGuestArtifact(context.Background(), testRef, nil, guestWant())
+		if err != nil {
+			t.Fatalf("guest pull: %v", err)
+		}
+		res.Lease.Release()
+		for _, d := range []string{kernel.digest, initramfs.digest} {
+			if !e.cache.Has(d) {
+				t.Errorf("%s not committed", d)
+			}
+		}
+	})
+}
+
+func TestPullGuestArtifactRequiresExpectedLayers(t *testing.T) {
+	ok := guestWant()
+	for _, tc := range []struct {
+		name string
+		want []GuestLayer
+	}{
+		{"none", nil},
+		{"a malformed digest", []GuestLayer{{Path: "Image", Digest: "sha256:x", MaxBytes: 1}}},
+		{"a non-positive size cap", []GuestLayer{{Path: ok[0].Path, Digest: ok[0].Digest}}},
+		{"a repeated path", []GuestLayer{ok[0], ok[0]}},
+		{"an invalid path", []GuestLayer{{Path: "../Image", Digest: ok[0].Digest, MaxBytes: 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fetch.publish(testRef, artifactv1.ArtifactTypeGuest, mediaTypeOCIEmpty, guestLayers())
+			if _, err := e.puller(t).PullGuestArtifact(context.Background(), testRef, nil, tc.want); !errors.Is(err, ErrGuestLayersRequired) {
+				t.Fatalf("err = %v, want ErrGuestLayersRequired", err)
+			}
+			if n := e.fetch.manifestCalls.Load() + e.fetch.blobCalls.Load(); n != 0 {
+				t.Errorf("%d requests, want 0", n)
+			}
+		})
+	}
+	if _, _, err := (&GuestStore{}).PullGuest(context.Background(), testRef); !errors.Is(err, ErrGuestLayersRequired) {
+		t.Errorf("GuestStore.PullGuest: err = %v, want ErrGuestLayersRequired", err)
+	}
+}
+
 func TestPullGuestArtifactIsTheOnlyGuestEntry(t *testing.T) {
 	e := newEnv(t)
 	e.fetch.publish(testRef, artifactv1.ArtifactTypeGuest, mediaTypeOCIEmpty, guestLayers())
@@ -68,7 +194,7 @@ func TestPullGuestArtifactIsTheOnlyGuestEntry(t *testing.T) {
 	if _, err := p.PullForPod(context.Background(), testRef, nil, volume, nil); !errors.Is(err, ErrTypeRefused) {
 		t.Fatalf("pod pull of a guest artifact: err = %v, want ErrTypeRefused", err)
 	}
-	res, err := p.PullGuestArtifact(context.Background(), testRef, nil)
+	res, err := p.PullGuestArtifact(context.Background(), testRef, nil, guestWant())
 	if err != nil {
 		t.Fatalf("guest pull: %v", err)
 	}
@@ -86,12 +212,12 @@ func TestPullGuestArtifactIsTheOnlyGuestEntry(t *testing.T) {
 
 	// The guest entry admits the guest type and its two layer types only.
 	e.fetch.publishModel(testRef, modelLayer("a.json", "a"))
-	if _, err := p.PullGuestArtifact(context.Background(), testRef, nil); !errors.Is(err, ErrTypeRefused) {
+	if _, err := p.PullGuestArtifact(context.Background(), testRef, nil, guestWant()); !errors.Is(err, ErrTypeRefused) {
 		t.Errorf("guest pull of a model: err = %v, want ErrTypeRefused", err)
 	}
 	e.fetch.publish(testRef, artifactv1.ArtifactTypeGuest, mediaTypeOCIEmpty,
 		[]layer{{mt: artifactv1.MediaTypeModelWeight, path: "Image", data: guestKernel}})
-	if _, err := p.PullGuestArtifact(context.Background(), testRef, nil); !errors.Is(err, ErrLayerTypeRefused) {
+	if _, err := p.PullGuestArtifact(context.Background(), testRef, nil, guestWant()); !errors.Is(err, ErrLayerTypeRefused) {
 		t.Errorf("guest pull with a model layer: err = %v, want ErrLayerTypeRefused", err)
 	}
 }
@@ -124,6 +250,22 @@ func TestGuestStoreFillsGuestArtifactsCache(t *testing.T) {
 		if err != nil || !bytes.Equal(b, want) {
 			t.Errorf("%s = %q (%v), want %q", path, b, err, want)
 		}
+	}
+
+	// A store whose manifest adds a layer is refused before any blob request.
+	e2 := newEnv(t)
+	publishRawGuest(e2.fetch, art.Reference(testHost), 2, []rawGuestLayer{
+		{artifactv1.MediaTypeGuestKernel, guestartifacts.ImageFileName, digestOfBytes(guestKernel), int64(len(guestKernel))},
+		{artifactv1.MediaTypeGuestInitramfs, guestartifacts.InitramfsFileName, digestOfBytes(guestInitramfs), int64(len(guestInitramfs))},
+		{artifactv1.MediaTypeGuestKernel, "extra", "sha256:" + strings.Repeat("b", 64), 100 << 30},
+	})
+	_, err = guestartifacts.EnsureGuestArtifactsFromStore(context.Background(),
+		filepath.Join(t.TempDir(), "g"), version, pin, testHost, &GuestStore{Puller: e2.puller(t), Blobs: e2.cache})
+	if !errors.Is(err, ErrGuestLayersMismatch) || !errors.Is(err, guestartifacts.ErrNotInClusterStore) {
+		t.Errorf("extra layer: err = %v, want ErrNotInClusterStore wrapping ErrGuestLayersMismatch", err)
+	}
+	if n := e2.fetch.blobCalls.Load(); n != 0 {
+		t.Errorf("extra layer: %d blob requests, want 0", n)
 	}
 
 	// A store without the pin is a named refusal.
@@ -249,7 +391,7 @@ func TestPullGuestArtifactLeaseOutlivesInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := p.PullGuestArtifact(context.Background(), testRef, nil)
+	res, err := p.PullGuestArtifact(context.Background(), testRef, nil, guestWant())
 	if err != nil {
 		t.Fatal(err)
 	}

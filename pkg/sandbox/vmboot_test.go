@@ -598,6 +598,29 @@ func TestSetGuestArtifactsFlipsCreateVM(t *testing.T) {
 	}
 }
 
+// TestCreateVMRacesSetGuestArtifacts runs a boot concurrently with the late
+// wiring, for the race detector: the boot either fails closed with
+// ErrGuestArtifactsUnavailable or boots with the installed set, never
+// anything between.
+func TestCreateVMRacesSetGuestArtifacts(t *testing.T) {
+	for i := range 4 {
+		root := t.TempDir()
+		spec := labSpec(t, root)
+		locator := labArtifacts(t, root)
+		b, _, _, _ := labBackend(t, root, func(context.Context, string) error { return nil })
+		b.SetGuestArtifacts(nil)
+
+		var wg sync.WaitGroup
+		var err error
+		wg.Go(func() { err = b.CreateVM(context.Background(), spec) })
+		wg.Go(func() { b.SetGuestArtifacts(locator) })
+		wg.Wait()
+		if err != nil && !errors.Is(err, ErrGuestArtifactsUnavailable) {
+			t.Fatalf("round %d: CreateVM err = %v, want nil or ErrGuestArtifactsUnavailable", i, err)
+		}
+	}
+}
+
 // TestCreateVMSurfacesAPreReadyHelperDeath is the READINESS RACE gate.
 //
 // A helper that dies after spawn — an unentitled binary, a spec the contract

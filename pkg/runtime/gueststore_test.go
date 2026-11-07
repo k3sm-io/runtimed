@@ -22,18 +22,26 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	artifactv1 "k3sm.io/apis/artifact/v1"
+	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/guestartifacts"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -65,9 +73,30 @@ func (m rawManifest) RawManifest() ([]byte, error) { return m, nil }
 
 func (rawManifest) MediaType() (types.MediaType, error) { return types.OCIManifestSchema1, nil }
 
+// countingRegistryHost is testRegistryHost with a count of the blob GETs it
+// serves.
+func countingRegistryHost(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+	var gets atomic.Int32
+	reg := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/sha256:") {
+			gets.Add(1)
+		}
+		reg.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Host, &gets
+}
+
 // pushGuestArtifact publishes the fixture pair to the registry at host under
-// the store names the pin derives, as the server's publisher does.
-func pushGuestArtifact(t *testing.T, host string, art guestartifacts.StoreArtifact) {
+// the store names the pin derives, as the server's publisher does. extra
+// layers are added to the manifest only; their blobs are never pushed.
+func pushGuestArtifact(t *testing.T, host string, art guestartifacts.StoreArtifact, extra ...map[string]any) {
 	t.Helper()
 	repo, err := name.NewRepository(host + "/" + art.Repository)
 	if err != nil {
@@ -96,6 +125,7 @@ func pushGuestArtifact(t *testing.T, host string, art guestartifacts.StoreArtifa
 			"annotations": map[string]string{artifactv1.AnnotationFilepath: l.FileName},
 		})
 	}
+	layers = append(layers, extra...)
 	m, err := json.Marshal(map[string]any{
 		"schemaVersion": 2,
 		"mediaType":     string(types.OCIManifestSchema1),
@@ -116,7 +146,7 @@ func pushGuestArtifact(t *testing.T, host string, art guestartifacts.StoreArtifa
 // built over the node's own cache and index, and the installed files are the
 // pinned bytes.
 func TestGuestClusterStorePullsThroughTheRuntimeCache(t *testing.T) {
-	host := testRegistryHost(t)
+	host, gets := countingRegistryHost(t)
 	pin := guestStorePin()
 	art, err := guestartifacts.NewStoreArtifact(guestStoreTestVersion, pin)
 	if err != nil {
@@ -154,6 +184,9 @@ func TestGuestClusterStorePullsThroughTheRuntimeCache(t *testing.T) {
 			t.Errorf("%s = %q, want %q", f.path, b, f.want)
 		}
 	}
+	if gets.Load() == 0 {
+		t.Error("no blob GET reached the registry, so the refusal test's zero count proves nothing")
+	}
 	for _, l := range art.Layers {
 		if !rt.cache.Has(l.Digest) {
 			t.Errorf("%s (%s) is not in the runtime's blob cache", l.FileName, l.Digest)
@@ -161,6 +194,38 @@ func TestGuestClusterStorePullsThroughTheRuntimeCache(t *testing.T) {
 	}
 	if _, ok, err := rt.guestPuller.LookupRecord(context.Background(), art.Reference(artifactTestHost), artifactv1.ArtifactTypeGuest); err != nil || !ok {
 		t.Errorf("the guest record is not in the runtime's index: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestGuestClusterStoreRefusesAnExtraLayerWithNoBlobGET pins, over a real
+// registry, that a manifest declaring a layer the pin does not name is refused
+// before the runtime's puller requests a single blob.
+func TestGuestClusterStoreRefusesAnExtraLayerWithNoBlobGET(t *testing.T) {
+	host, gets := countingRegistryHost(t)
+	pin := guestStorePin()
+	art, err := guestartifacts.NewStoreArtifact(guestStoreTestVersion, pin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushGuestArtifact(t, host, art, map[string]any{
+		"mediaType":   artifactv1.MediaTypeGuestKernel,
+		"digest":      "sha256:" + strings.Repeat("c", 64),
+		"size":        int64(200 << 30),
+		"annotations": map[string]string{artifactv1.AnnotationFilepath: "junk"},
+	})
+	flat := image.FlatRegistry{Host: artifactTestHost, Endpoint: image.RegistryEndpoint{Addr: host}}
+	rt, err := New(Config{Root: t.TempDir()}, testDeps(t, Deps{FlatRegistry: flat}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gets.Store(0)
+	dir := filepath.Join(t.TempDir(), guestartifacts.GuestArtifactsSubdir)
+	_, err = guestartifacts.EnsureGuestArtifactsFromStore(context.Background(), dir, guestStoreTestVersion, pin, artifactTestHost, rt.GuestClusterStore(nil))
+	if !errors.Is(err, artifact.ErrGuestLayersMismatch) {
+		t.Fatalf("err = %v, want ErrGuestLayersMismatch", err)
+	}
+	if n := gets.Load(); n != 0 {
+		t.Errorf("%d blob GETs before the refusal, want 0", n)
 	}
 }
 
