@@ -17,6 +17,7 @@ limitations under the License.
 package image
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"time"
 )
 
 // ArtifactIndexSubdir is the index-relative directory artifact records live
@@ -91,6 +93,13 @@ func (x *FileIndex) PutArtifactRecord(ctx context.Context, key string, record []
 		return err
 	}
 	defer sub.Close()
+	if prev, err := readAnchored(sub, name); err == nil && !bytes.Equal(prev, record) && int64(len(prev)) <= MaxArtifactRecordBytes {
+		// A replaced record keeps its artifactType for the blobs only it named.
+		// The copy is an eviction-order hint and never a root, so failing to
+		// write it must not fail the put; the blobs it would describe are
+		// classed as unattributed instead.
+		_ = x.keepReleased(root, prev)
+	}
 	return x.commit(sub, name, record)
 }
 
@@ -180,6 +189,7 @@ func (x *FileIndex) RemoveArtifactRecordIf(ctx context.Context, key string, matc
 		return false, err
 	}
 	defer sub.Close()
+	var buf []byte
 	if match != nil {
 		fi, err := sub.Lstat(name)
 		if err != nil {
@@ -191,7 +201,7 @@ func (x *FileIndex) RemoveArtifactRecordIf(ctx context.Context, key string, matc
 		if fi.Size() > MaxArtifactRecordBytes {
 			return false, fmt.Errorf("%w: artifact record of %d bytes: %w", ErrIndexEntryCorrupt, fi.Size(), ErrArtifactRecordTooLarge)
 		}
-		buf, err := readAnchored(sub, name)
+		buf, err = readAnchored(sub, name)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return false, nil
@@ -201,6 +211,17 @@ func (x *FileIndex) RemoveArtifactRecordIf(ctx context.Context, key string, matc
 		if !match(buf) {
 			return false, nil
 		}
+	} else if fi, err := sub.Lstat(name); err == nil && fi.Mode().IsRegular() && fi.Size() <= MaxArtifactRecordBytes {
+		// An unconditional removal still removes a record it cannot read; it
+		// only keeps no released copy of one.
+		buf, _ = readAnchored(sub, name)
+	}
+	if buf != nil {
+		// Kept before the root goes, so no instant has the blobs collectable
+		// with their artifactType lost. A copy that cannot be written is an
+		// eviction-order hint lost, never a reason to keep the root: the
+		// caller asked for the blobs to become collectable.
+		_ = x.keepReleased(root, buf)
 	}
 	if err := sub.Remove(name); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -310,12 +331,105 @@ func (x *FileIndex) artifactRecords() ([]namedRecord, error) {
 }
 
 // artifactRecordRoot is the part of an artifact record the GC reads. The
-// record's format belongs to pkg/artifact; these three field names are the
-// contract between the two packages, pinned by a round-trip test there.
+// record's format belongs to pkg/artifact; these field names are the contract
+// between the two packages, pinned by a round-trip test there. ArtifactType
+// only classes the blobs for accounting and eviction order; reachability never
+// reads it.
 type artifactRecordRoot struct {
 	Reference    string   `json:"reference"`
+	ArtifactType string   `json:"artifactType"`
 	ConfigDigest string   `json:"configDigest"`
 	LayerDigests []string `json:"layerDigests"`
+}
+
+// ArtifactReleasedIndexSubdir is the index-relative directory that keeps a
+// copy of every artifact record removed (RemoveArtifactRecordIf) or replaced
+// for different bytes (PutArtifactRecord): <root>/index/artifact-released.
+//
+// A released copy is NEVER a reachability root: nothing in Cache.Roots reads
+// this directory, so keeping one makes no blob less collectable. It exists so
+// that once a record is gone, and its blobs are reclaim-eligible, the store
+// still knows which artifactType they belonged to and when they were released,
+// which is what lets StoreBytesByClass class them. Each copy is named by the
+// sha256 of its bytes, so releasing the same record twice refreshes one file.
+const ArtifactReleasedIndexSubdir = "artifact-released"
+
+// releasedName is the file name of the released copy of record.
+func releasedName(record []byte) string {
+	sum := sha256.Sum256(record)
+	return hex.EncodeToString(sum[:]) + ".json"
+}
+
+// keepReleased writes a released copy of record (see
+// ArtifactReleasedIndexSubdir) under root, the open index directory.
+func (x *FileIndex) keepReleased(root *os.Root, record []byte) error {
+	sub, err := x.openSubdir(root, ArtifactReleasedIndexSubdir, true)
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+	return x.commit(sub, releasedName(record), record)
+}
+
+// releasedArtifact is one released copy as the classifier reads it.
+type releasedArtifact struct {
+	name       string
+	root       artifactRecordRoot
+	releasedAt time.Time
+}
+
+// releasedArtifacts returns every released copy that decodes, with its
+// release time (the copy's mtime). It is advisory input to accounting and
+// eviction order, so a copy that cannot be read or decoded is skipped rather
+// than failing the caller; only a released directory that cannot be listed
+// is an error. An absent index or directory is the empty list.
+func (x *FileIndex) releasedArtifacts() ([]releasedArtifact, error) {
+	root, err := x.open()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer root.Close()
+	sub, err := x.openSubdir(root, ArtifactReleasedIndexSubdir, false)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer sub.Close()
+	dir, err := sub.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("open released artifact records: %w", err)
+	}
+	entries, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read released artifact records: %w", err)
+	}
+	var out []releasedArtifact
+	for _, d := range entries {
+		name := d.Name()
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") || !d.Type().IsRegular() {
+			continue
+		}
+		fi, err := sub.Lstat(name)
+		if err != nil || !fi.Mode().IsRegular() || fi.Size() > MaxArtifactRecordBytes {
+			continue
+		}
+		buf, err := readAnchored(sub, name)
+		if err != nil {
+			continue
+		}
+		var r artifactRecordRoot
+		if json.Unmarshal(buf, &r) != nil {
+			continue
+		}
+		out = append(out, releasedArtifact{name: name, root: r, releasedAt: fi.ModTime()})
+	}
+	return out, nil
 }
 
 // DecodeArtifactRoot returns the blobs an artifact record names, as a
