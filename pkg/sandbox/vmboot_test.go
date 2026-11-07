@@ -566,6 +566,38 @@ func TestCreateVMFailsClosedWithoutArtifacts(t *testing.T) {
 	}
 }
 
+// TestSetGuestArtifactsFlipsCreateVM pins the late wiring a worker uses: a
+// backend built with no locator fails CreateVM closed, SetGuestArtifacts
+// installs one while readers race it, and the next CreateVM boots.
+func TestSetGuestArtifactsFlipsCreateVM(t *testing.T) {
+	root := t.TempDir()
+	spec := labSpec(t, root)
+	locator := labArtifacts(t, root)
+	b, sp, _, _ := labBackend(t, root, func(context.Context, string) error { return nil })
+	b.SetGuestArtifacts(nil)
+
+	if err := b.CreateVM(context.Background(), spec); !errors.Is(err, ErrGuestArtifactsUnavailable) {
+		t.Fatalf("CreateVM before SetGuestArtifacts: err = %v, want ErrGuestArtifactsUnavailable", err)
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() { _ = b.guestArtifactLocator() })
+	}
+	wg.Go(func() { b.SetGuestArtifacts(locator) })
+	wg.Wait()
+
+	if err := b.CreateVM(context.Background(), spec); err != nil {
+		t.Fatalf("CreateVM after SetGuestArtifacts: %v", err)
+	}
+	sp.mu.Lock()
+	spawned := len(sp.specs)
+	sp.mu.Unlock()
+	if spawned != 1 {
+		t.Errorf("spawned %d helpers, want 1 (only the boot after SetGuestArtifacts)", spawned)
+	}
+}
+
 // TestCreateVMSurfacesAPreReadyHelperDeath is the READINESS RACE gate.
 //
 // A helper that dies after spawn — an unentitled binary, a spec the contract

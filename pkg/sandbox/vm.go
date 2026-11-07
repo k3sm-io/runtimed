@@ -332,6 +332,10 @@ type VMBackend struct {
 	// for tests.
 	helperEntitledFn func(path string) bool
 
+	// artifactsMu guards artifacts: SetGuestArtifacts may install a locator
+	// after construction while CreateVM reads it. It is held only to copy the
+	// func value, never across the locator call.
+	artifactsMu sync.RWMutex
 	// artifacts resolves this node's pinned guest kernel + initramfs. nil BY
 	// DEFAULT, and CreateVM fails closed on nil: the daemon sets it from
 	// guestartifacts.Locator, and a backend that guessed a path would boot whatever
@@ -415,6 +419,26 @@ type VMBackendOption func(*VMBackend)
 // see GuestArtifactLocator for why the shipped constructor leaves it unset.
 func WithGuestArtifacts(locator GuestArtifactLocator) VMBackendOption {
 	return func(b *VMBackend) { b.artifacts = locator }
+}
+
+// SetGuestArtifacts installs the guest-artifact locator after construction,
+// replacing any locator WithGuestArtifacts set. It is for a node whose pinned
+// kernel and initramfs are ensured only after the backend is built, such as a
+// worker filling its cache from the cluster store. A nil locator clears it, so
+// CreateVM fails closed again. Safe for concurrent use with CreateVM; a boot
+// already past its locator call keeps the artifacts it resolved.
+func (b *VMBackend) SetGuestArtifacts(locator GuestArtifactLocator) {
+	b.artifactsMu.Lock()
+	b.artifacts = locator
+	b.artifactsMu.Unlock()
+}
+
+// guestArtifactLocator returns the current locator under artifactsMu; nil when
+// none is wired.
+func (b *VMBackend) guestArtifactLocator() GuestArtifactLocator {
+	b.artifactsMu.RLock()
+	defer b.artifactsMu.RUnlock()
+	return b.artifacts
 }
 
 // WithStateRoot supplies the runtime work-dir the vm orphan-record store lives
