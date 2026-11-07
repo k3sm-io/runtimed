@@ -29,6 +29,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
@@ -115,7 +116,10 @@ func keysOf(m map[string]grpc.ServiceInfo) []string {
 }
 
 // imagesTestClient stands up the daemon over a bufconn and returns an Images
-// client plus the Runtime whose store it serves.
+// client plus the Runtime whose store it serves. It returns only once Serve's
+// startup reap has run to completion, so state a test plants afterwards is
+// never raced by that reap (which drops malformed reap records and sweeps
+// empty reap dirs) and podUntracked already answers as it does in steady state.
 func imagesTestClient(t *testing.T) (runtimev1.ImagesClient, *Runtime) {
 	t.Helper()
 	return imagesTestClientDeps(t, Deps{})
@@ -141,7 +145,35 @@ func imagesTestClientDeps(t *testing.T, d Deps) (runtimev1.ImagesClient, *Runtim
 		t.Fatalf("grpc.NewClient: %v", err)
 	}
 	t.Cleanup(func() { _ = cc.Close() })
+	waitStartupReaped(t, cc, rt)
 	return runtimev1.NewImagesClient(cc), rt
+}
+
+// waitStartupReaped blocks until the server behind cc is accepting, which
+// Serve reaches only after its startup reconciles and ReapOrphanedPods have
+// returned, so Serve's own ordering of those steps is kept. A bufconn dial
+// completes only once Serve accepts it. The trailing ReapOrphanedPods is then
+// the sticky once's cached result, and it pins that the reap has finished
+// before the caller plants any fixture.
+func waitStartupReaped(t *testing.T, cc *grpc.ClientConn, rt *Runtime) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cc.Connect()
+	for st := cc.GetState(); st != connectivity.Ready; st = cc.GetState() {
+		if !cc.WaitForStateChange(ctx, st) {
+			t.Fatalf("daemon never became ready (last state %v): %v", st, ctx.Err())
+		}
+	}
+	if err := rt.ReapOrphanedPods(); err != nil {
+		t.Fatalf("ReapOrphanedPods: %v", err)
+	}
+	rt.mu.Lock()
+	started := rt.podReapStarted
+	rt.mu.Unlock()
+	if !started {
+		t.Fatalf("the startup reap had not started once the daemon was serving")
+	}
 }
 
 // putBlob commits content into rt's store and back-dates it past any grace

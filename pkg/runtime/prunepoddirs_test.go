@@ -108,8 +108,13 @@ func TestPruneFailsClosedOnTrackedPodDirWithoutRecord(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client, rt := imagesTestClient(t)
 			orphan := putBlob(t, rt, "orphan")
-			putUntrackedPodDir(t, rt, "pod-tracked")
+			pid := putUntrackedPodDir(t, rt, "pod-tracked")
 			tc.track(t, rt, "pod-tracked")
+			// Non-vacuity: the fixture must be what keeps the dir fatal, not a
+			// startup reap that has not run yet or has since erased the fixture.
+			if rt.podUntracked(pid) {
+				t.Fatalf("precondition: the pod is judged untracked before the prune; the fixture does not track it")
+			}
 
 			_, err := client.PruneImages(context.Background(), &runtimev1.PruneImagesRequest{})
 			if status.Code(err) != codes.FailedPrecondition {
