@@ -42,7 +42,9 @@ limitations under the License.
 //     be in the allow-set for the artifact type.
 //   - Every layer carries a file path (org.cncf.model.filepath, else
 //     org.opencontainers.image.title), validated by artifactv1.ValidatePath, and
-//     the set by artifactv1.ValidatePathSet.
+//     the set by artifactv1.ValidatePathSet. The one exception is a wasm
+//     artifact of exactly one application/wasm layer with neither annotation,
+//     whose module is given the path module.wasm; no other type has a default.
 //   - Every blob is committed through CommitBlob against its descriptor digest
 //     and size; the artifact is recorded only after every one commits.
 //

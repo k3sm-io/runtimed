@@ -550,7 +550,7 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 		if total > MaxArtifactBytes {
 			return "", nil, nil, fmt.Errorf("declared total over %d bytes: %w", MaxArtifactBytes, ErrSizeCap)
 		}
-		p, err := layerFilePath(i, l)
+		p, err := layerFilePath(m, i)
 		if err != nil {
 			return "", nil, nil, err
 		}
@@ -562,12 +562,17 @@ func checkManifest(m *manifest, allow artifactv1.AllowSet) (string, []descriptor
 	return typ, m.Layers, paths, nil
 }
 
-// layerFilePath returns layer i's validated file path: the ModelPack filepath
-// annotation, else the OCI title.
-func layerFilePath(i int, l descriptor) (string, error) {
+// layerFilePath returns layer i of m's validated file path: the ModelPack
+// filepath annotation, else the OCI title, else, for a wasm artifact's sole
+// module layer only, wasmModulePath (untitledWasmModule).
+func layerFilePath(m *manifest, i int) (string, error) {
+	l := m.Layers[i]
 	p := l.Annotations[annotationFilepathModern]
 	if p == "" {
 		p = l.Annotations[annotationTitle]
+	}
+	if p == "" && untitledWasmModule(m) {
+		p = wasmModulePath
 	}
 	if p == "" {
 		return "", fmt.Errorf("layer %d has no file path: %w", i, ErrLayerPath)
@@ -576,6 +581,30 @@ func layerFilePath(i int, l descriptor) (string, error) {
 		return "", fmt.Errorf("layer %d: %w: %w", i, ErrLayerPath, err)
 	}
 	return p, nil
+}
+
+// wasmModulePath is the file path given to the single module of a wasm
+// artifact whose layer names no path. The CNCF wasm OCI artifact does not
+// require a title annotation on its application/wasm layer.
+const wasmModulePath = "module.wasm"
+
+// untitledWasmModule reports whether m is a wasm artifact made of exactly one
+// application/wasm layer carrying neither the filepath nor the title
+// annotation (the keys absent, not merely empty). Only that shape gets
+// wasmModulePath: with two or more modules there is no single name to give,
+// so a missing path is still refused, and no other artifact type has a
+// default path.
+func untitledWasmModule(m *manifest) bool {
+	if artifactv1.ArtifactType(m.ArtifactType, m.Config.MediaType) != artifactv1.MediaTypeWasmConfig || len(m.Layers) != 1 {
+		return false
+	}
+	l := m.Layers[0]
+	if l.MediaType != artifactv1.MediaTypeWasmLayer {
+		return false
+	}
+	_, hasPath := l.Annotations[annotationFilepathModern]
+	_, hasTitle := l.Annotations[annotationTitle]
+	return !hasPath && !hasTitle
 }
 
 func checkDescriptor(what string, d descriptor) error {

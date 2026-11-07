@@ -75,6 +75,29 @@ func TestPullArtifactAcceptsWasmModule(t *testing.T) {
 		})
 	}
 
+	// The CNCF wasm artifact does not require a title: a sole module layer
+	// with neither path annotation is given module.wasm, by the pull and by
+	// the view builder's re-check of the recorded manifest alike.
+	t.Run("single untitled module at module.wasm", func(t *testing.T) {
+		e := newEnv(t)
+		raw := e.fetch.publish(wasmRef, "", artifactv1.MediaTypeWasmConfig, []layer{wasmLayer("", "\x00asm\x01\x00\x00\x00")})
+		res, err := e.puller(t).PullArtifact(context.Background(), wasmRef, nil, volume, nil)
+		if err != nil {
+			t.Fatalf("PullArtifact: %v", err)
+		}
+		defer res.Lease.Release()
+		if len(res.Paths) != 1 || res.Paths[0] != "module.wasm" {
+			t.Errorf("paths = %q, want [module.wasm]", res.Paths)
+		}
+		files, err := manifestFiles(raw, res.ManifestDigest)
+		if err != nil {
+			t.Fatalf("manifestFiles: %v", err)
+		}
+		if len(files) != 1 || files["module.wasm"] != res.LayerDigests[0] {
+			t.Errorf("view files = %v, want module.wasm -> %s", files, res.LayerDigests[0])
+		}
+	})
+
 	// Regression: adding the wasm type leaves the model allow-set as it was.
 	// The ModelPack weight, weight-config and doc layers pass; code and a wasm
 	// layer under the model type are still refused.
@@ -147,6 +170,33 @@ func TestWasmArtifactRefusesNonWasmLayer(t *testing.T) {
 				}
 			})
 		}
+	}
+
+	// The default path is for one untitled module only. Two modules have no
+	// single name to give, and the model types never get a default.
+	for _, tc := range []struct {
+		name         string
+		artifactType string
+		config       string
+		layers       []layer
+	}{
+		{"two untitled modules", "", artifactv1.MediaTypeWasmConfig,
+			[]layer{wasmLayer("", "\x00asm-a"), wasmLayer("", "\x00asm-b")}},
+		{"a titled and an untitled module", "", artifactv1.MediaTypeWasmConfig,
+			[]layer{wasmLayer("a.wasm", "\x00asm-a"), wasmLayer("", "\x00asm-b")}},
+		{"untitled model layer", artifactv1.ArtifactTypeModel, artifactv1.MediaTypeModelConfig,
+			[]layer{modelLayer("", "weights")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fetch.publish(wasmRef, tc.artifactType, tc.config, tc.layers)
+			if _, err := e.puller(t).PullArtifact(context.Background(), wasmRef, nil, volume, nil); !errors.Is(err, ErrLayerPath) {
+				t.Fatalf("err = %v, want ErrLayerPath", err)
+			}
+			if n := e.fetch.blobCalls.Load(); n != 0 {
+				t.Errorf("%d blobs fetched before the refusal", n)
+			}
+		})
 	}
 
 	// application/wasm is required: a wasm manifest with no layer is refused.
