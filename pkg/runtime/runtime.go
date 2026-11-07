@@ -317,6 +317,13 @@ type Config struct {
 	// are guest processes that never enter startContainer, so neither the
 	// rewrite nor the exec observation runs for them.
 	ShadowBinDir string
+	// LocalBlobSource is a blob store on this machine the puller offers each
+	// blob to before fetching it (image.WithLocalBlobSource). Optional: set it
+	// only on a node whose cluster registry store shares the image cache's
+	// volume, where a held blob is cloned and re-hashed instead of copied over
+	// HTTP. Nil — the default — keeps every pull HTTP-only. Like the pull seams
+	// on Deps it is ignored when Deps.Puller is set.
+	LocalBlobSource image.LocalBlobSource
 }
 
 // Runtime is the in-process node runtime implementing runtimev1.RuntimeServer.
@@ -960,6 +967,9 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 			// node states it rather than inheriting it. Both halves go in one
 			// call — NewPuller refuses a half-wiring.
 			opts = append(opts, image.WithMirrors(deps.ImageMirrors, image.RemoteMirrorFetch))
+		}
+		if cfg.LocalBlobSource != nil {
+			opts = append(opts, image.WithLocalBlobSource(cfg.LocalBlobSource))
 		}
 		p, err := image.NewPuller(cache, image.RemoteFetch, index, opts...)
 		if err != nil {

@@ -428,6 +428,10 @@ type Puller struct {
 	// log reports mirror fallback (WithPullLogger). Nil discards. The primary
 	// path logs nothing, so a puller without a logger is silent as before.
 	log *slog.Logger
+
+	// localBlobs is a same-volume blob store consulted before each blob is
+	// fetched (WithLocalBlobSource). Nil — the default — fetches every blob.
+	localBlobs LocalBlobSource
 }
 
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
@@ -967,7 +971,25 @@ func manifestDigests(mfst *runtimev1.ImageManifest) []string {
 // ingest path (the tarball-ingest path links this package in-process) rather than
 // locked behind a *Puller, whose constructor requires a FetchFunc an ingest path
 // has no business supplying.
+//
+// With a LocalBlobSource (WithLocalBlobSource) the blob is first offered to
+// Cache.CommitFromLocal, which clones and re-hashes it; fill — the network
+// fetch — runs only when that does not commit it. ErrBlobNotLocal falls back
+// quietly. Any other refusal (a local copy whose bytes contradict the digest)
+// is logged at Warn before falling back, so a tampered store is never hidden
+// behind a successful pull.
 func (p *Puller) writeBlob(digest string, size int64, fill func(io.Writer) error) (wrote bool, err error) {
+	if p.localBlobs != nil {
+		wrote, lerr := p.cache.CommitFromLocal(digest, size, p.localBlobs)
+		switch {
+		case lerr == nil:
+			return wrote, nil
+		case errors.Is(lerr, ErrBlobNotLocal):
+		default:
+			p.logger().Warn("local blob store copy refused, fetching from the registry",
+				"digest", quoteBounded(digest, maxDigestLen), "err", lerr)
+		}
+	}
 	return p.cache.CommitBlob(digest, size, fill)
 }
 

@@ -74,6 +74,11 @@ type Cache struct {
 	// is a field, not a call to time.Now, so the lease TTL and the reclaim grace
 	// window are testable without sleeping.
 	now func() time.Time
+
+	// sameVolume decides whether a local blob source's file and the blob store
+	// share a volume (CommitFromLocal). Nil means sameDevice, the st_dev
+	// comparison; it is a field only so a test can model a second volume.
+	sameVolume func(src, store os.FileInfo) bool
 }
 
 // NewCache returns a Cache rooted at root (DefaultRoot if empty), creating the
@@ -324,18 +329,11 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 		// API called from the root daemon, and a nil fill must not panic there.
 		return false, fmt.Errorf("commit blob %s: fill is required", quoteBounded(digest, maxDigestLen))
 	}
-	if size < 0 && size != SizeUnknown {
-		return false, fmt.Errorf("commit blob %s: negative size %d (use SizeUnknown to opt out of the size guard)",
-			quoteBounded(digest, maxDigestLen), size)
+	if err := checkCommitSize(digest, size); err != nil {
+		return false, err
 	}
 	dst := c.pathFor(want)
-	// Cache hit — a regular file only, judged by Lstat so a SYMLINK is not
-	// silently accepted (Stat would resolve it and report the target's mode). A
-	// directory or a symlink at the blob path is not a blob, and accepting one
-	// would suppress the write — and with it the verification — forever. Falling
-	// through is safe and self-healing: rename(2) replaces a symlink at the
-	// destination with the verified file.
-	if fi, serr := os.Lstat(dst); serr == nil && fi.Mode().IsRegular() {
+	if blobHit(dst) {
 		return false, nil
 	}
 	dir := filepath.Dir(dst)
@@ -398,6 +396,39 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 		return false, fmt.Errorf("close blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
 
+	if err := verifyAndRename(digest, want, hasher, func() error { return os.Rename(tmpName, dst) }); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// checkCommitSize enforces the size contract every commit path shares: size is
+// >= 0 or exactly SizeUnknown (see CommitBlob).
+func checkCommitSize(digest string, size int64) error {
+	if size < 0 && size != SizeUnknown {
+		return fmt.Errorf("commit blob %s: negative size %d (use SizeUnknown to opt out of the size guard)",
+			quoteBounded(digest, maxDigestLen), size)
+	}
+	return nil
+}
+
+// blobHit is the cache-hit test every commit path shares: a regular file only,
+// judged by Lstat so a SYMLINK is not silently accepted (Stat would resolve it
+// and report the target's mode). A directory or a symlink at the blob path is
+// not a blob, and accepting one would suppress the write — and with it the
+// verification — forever. Reporting a miss is safe and self-healing: rename(2)
+// replaces a symlink at the destination with the verified file.
+func blobHit(dst string) bool {
+	fi, err := os.Lstat(dst)
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// verifyAndRename is the commit step every path into the store ends in: it
+// compares the hash of the bytes now in the synced temp file against want and
+// runs rename — which moves that temp onto its blob path — only on a match. On
+// a mismatch it leaves the temp for the caller's cleanup, so a rejected blob
+// leaves NO artifact at its blob path.
+func verifyAndRename(digest string, want ggcrv1.Hash, hasher hash.Hash, rename func() error) error {
 	// Plain ==, on the canonical lowercase hex both sides are normalized to.
 	// Deliberately not hmac.Equal / subtle.ConstantTimeCompare: there is no secret
 	// on either side and the attacker controls both operands, so a constant-time
@@ -405,15 +436,13 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 	// one of these values is confidential.
 	got := hex.EncodeToString(hasher.Sum(nil))
 	if got != want.Hex {
-		// The deferred Remove drops the temp file, so the destination is never
-		// created: a rejected blob leaves NO artifact at its blob path.
-		return false, fmt.Errorf("blob %s hashed to %s:%s: %w",
+		return fmt.Errorf("blob %s hashed to %s:%s: %w",
 			quoteBounded(digest, maxDigestLen), want.Algorithm, got, ErrDigestMismatch)
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return false, fmt.Errorf("commit blob %s: %w", quoteBounded(digest, maxDigestLen), err)
+	if err := rename(); err != nil {
+		return fmt.Errorf("commit blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
-	return true, nil
+	return nil
 }
 
 // cappedWriter fails once more than remaining bytes are written. It is the
