@@ -28,11 +28,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	artifactv1 "k3sm.io/apis/artifact/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/guestartifacts"
+	"k3sm.io/runtimed/pkg/image"
 )
 
 var _ guestartifacts.ClusterStore = (*GuestStore)(nil)
@@ -211,5 +214,52 @@ func TestNoPolicySelectsGuestAllowSet(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// ttlLeaser records the TTL each lease is asked for.
+type ttlLeaser struct {
+	inner Leaser
+	mu    sync.Mutex
+	ttls  []time.Duration
+}
+
+func (l *ttlLeaser) AcquireLease(digests []string, ttl time.Duration) *image.Lease {
+	l.mu.Lock()
+	l.ttls = append(l.ttls, ttl)
+	l.mu.Unlock()
+	return l.inner.AcquireLease(digests, ttl)
+}
+
+func TestPullGuestArtifactLeaseOutlivesInstall(t *testing.T) {
+	e := newEnv(t)
+	e.fetch.publish(testRef, artifactv1.ArtifactTypeGuest, mediaTypeOCIEmpty, guestLayers())
+	e.fetch.publishModel(testHost+"/models/other:v1", modelLayer("a.json", "a"))
+	lz := &ttlLeaser{inner: e.cache}
+	p, err := New(Config{
+		RegistryHost: testHost,
+		PartialDir:   e.partial,
+		StorePath:    e.cache.Root(),
+		FreeBytes:    func(string) (uint64, error) { return e.free.Load(), nil },
+		FloorBytes:   100,
+	}, Deps{Blobs: e.cache, Leases: lz, Reclaimer: e.reclaim, Index: e.index, Fetcher: e.fetch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := p.PullGuestArtifact(context.Background(), testRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Lease.Release()
+	res, err = p.PullArtifact(context.Background(), testHost+"/models/other:v1", nil, volume, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Lease.Release()
+	if len(lz.ttls) != 2 || lz.ttls[0] != GuestLeaseTTL || lz.ttls[1] != 0 {
+		t.Errorf("lease TTLs = %v, want [%v 0]: only the guest pull takes the long lease", lz.ttls, GuestLeaseTTL)
+	}
+	if GuestLeaseTTL < 2*image.DefaultLeaseTTL {
+		t.Errorf("GuestLeaseTTL %v is not well above the default %v", GuestLeaseTTL, image.DefaultLeaseTTL)
 	}
 }

@@ -318,7 +318,7 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 	if err != nil {
 		return nil, err
 	}
-	return p.pull(ctx, ref, cred, allow, paths, false)
+	return p.pull(ctx, ref, cred, allow, paths, false, 0)
 }
 
 // PullForPod is PullArtifact for a pod's image volume. The record it writes is
@@ -330,7 +330,7 @@ func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.Registr
 	if err != nil {
 		return nil, err
 	}
-	return p.pull(ctx, ref, cred, allow, paths, true)
+	return p.pull(ctx, ref, cred, allow, paths, true, 0)
 }
 
 // PullGuestArtifact is the internal entry point for the guest kernel and
@@ -342,11 +342,24 @@ func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.Registr
 // record is released by the next Views.ReleasePodOnly and its blobs become
 // collectable. The durable copy is the guest-artifacts cache, which the caller
 // fills while it holds Result.Lease.
+//
+// That lease is taken for GuestLeaseTTL, not the default: it must outlast the
+// pull, the caller's verification pass and its copy into the guest-artifacts
+// cache, because the lease is the only thing keeping the record-less blobs
+// from a reclaim pass until the copy is done.
 func (p *Puller) PullGuestArtifact(ctx context.Context, ref string, cred *image.RegistryCredential) (*Result, error) {
-	return p.pull(ctx, ref, cred, artifactv1.GuestAllowSet(), nil, true)
+	return p.pull(ctx, ref, cred, artifactv1.GuestAllowSet(), nil, true, GuestLeaseTTL)
 }
 
-func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, allow artifactv1.AllowSet, paths []string, podOnly bool) (*Result, error) {
+// GuestLeaseTTL is the lease PullGuestArtifact holds on the guest blobs: four
+// times image.DefaultLeaseTTL, so a slow pull of the guest pair still leaves
+// its caller ample time to verify and install before the lease can expire. An
+// unreleased lease still self-heals, an hour later.
+const GuestLeaseTTL = time.Hour
+
+// pull is every entry point's body. leaseTTL is the lease on the pulled
+// blobs; zero means image.DefaultLeaseTTL.
+func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, allow artifactv1.AllowSet, paths []string, podOnly bool, leaseTTL time.Duration) (*Result, error) {
 	if len(paths) > 0 {
 		if err := artifactv1.ValidatePathSet(paths); err != nil {
 			return nil, fmt.Errorf("requested paths: %w", err)
@@ -416,7 +429,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	// The lease is taken over the whole set BEFORE the presence check, for the
 	// reason image.Lease gives: a cache hit writes nothing, so it is exactly the
 	// blob old enough for a reclaim pass to take.
-	lease := p.deps.Leases.AcquireLease(digests, 0)
+	lease := p.deps.Leases.AcquireLease(digests, leaseTTL)
 	ok := false
 	defer func() {
 		if !ok {
