@@ -37,11 +37,14 @@ import (
 )
 
 // Argv markers the liveGroups fake acts on: a spawn whose argv carries
-// markFailSpawn fails, and a group whose argv carries markExitNonZero exits 1
-// on its own the moment it is waited.
+// markFailSpawn fails; a group whose argv carries markExitNonZero exits 1 as it
+// is spawned; and one carrying markExitHoldPipes exits 0 as it is spawned while
+// its pipe write ends stay held, as a grandchild that inherited them would hold
+// them, so its log pump never sees EOF.
 const (
-	markFailSpawn   = "--refused-create-fail-spawn"
-	markExitNonZero = "--refused-create-exit-1"
+	markFailSpawn     = "--refused-create-fail-spawn"
+	markExitNonZero   = "--refused-create-exit-1"
+	markExitHoldPipes = "--refused-create-exit-hold-pipes"
 )
 
 // liveGroups is one fake process table behind the spawner, waiter, signal and
@@ -54,21 +57,63 @@ const (
 // reachable and open — for exactly as long as the group lives. Without that
 // the pump would see EOF at once and the writer would be closed by nothing but
 // the garbage collector, which is not what a leaked container does.
+//
+// It records every signal per pgid, and which exited groups the runtime has
+// inspected (procGroup): watchContainerExit inspects a group only after the
+// process's Wait returned, so an inspected group's supervisor.Process is
+// already Done.
 type liveGroups struct {
-	mu    sync.Mutex
-	next  int
-	exit  map[int]chan struct{}
-	code  map[int]int
-	live  map[int]bool
-	pipes map[int][]int
+	mu       sync.Mutex
+	next     int
+	exit     map[int]chan struct{}
+	code     map[int]int
+	live     map[int]bool
+	pipes    map[int][]int
+	held     []int
+	signals  map[int][]os.Signal
+	observed map[int]bool
 }
 
-func newLiveGroups() *liveGroups {
-	return &liveGroups{exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{}, pipes: map[int][]int{}}
+func newLiveGroups(t *testing.T) *liveGroups {
+	g := &liveGroups{
+		exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{},
+		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, observed: map[int]bool{},
+	}
+	t.Cleanup(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for _, fd := range g.held {
+			_ = unix.Close(fd)
+		}
+		g.held = nil
+	})
+	return g
+}
+
+// awaitExitedObserved blocks, within a bound, until every group that has
+// exited has been inspected by its watcher, so a spawn failing after it is
+// returned only once the earlier process is known to be Done.
+func (g *liveGroups) awaitExitedObserved() {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		g.mu.Lock()
+		all := true
+		for pid := range g.exit {
+			if !g.live[pid] && !g.observed[pid] {
+				all = false
+			}
+		}
+		g.mu.Unlock()
+		if all {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (g *liveGroups) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
 	if slices.Contains(spec.Argv, markFailSpawn) {
+		g.awaitExitedObserved()
 		return 0, errors.New("posix_spawn: no such file or directory")
 	}
 	if _, err := podEnvSpawn(spec); err != nil {
@@ -93,6 +138,12 @@ func (g *liveGroups) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, e
 	}
 	if slices.Contains(spec.Argv, markExitNonZero) {
 		g.code[pid] = 1
+		g.exitLocked(pid)
+	}
+	if slices.Contains(spec.Argv, markExitHoldPipes) {
+		g.held = append(g.held, g.pipes[pid]...)
+		delete(g.pipes, pid)
+		g.code[pid] = 0
 		g.exitLocked(pid)
 	}
 	return pid, nil
@@ -129,11 +180,12 @@ func (g *liveGroups) WaitExit(ctx context.Context, pid int) (int, int, error) {
 }
 
 func (g *liveGroups) signal(pgid int, sig os.Signal) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.signals[pgid] = append(g.signals[pgid], sig)
 	if sig != termSignal && sig != killSignal {
 		return nil
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.exitLocked(pgid)
 	return nil
 }
@@ -144,6 +196,7 @@ func (g *liveGroups) procGroup(pgid int) ([]supervisor.ProcMember, bool) {
 	if g.live[pgid] {
 		return []supervisor.ProcMember{{Pid: pgid, StartUnixNano: 1}}, true
 	}
+	g.observed[pgid] = true
 	return nil, true
 }
 
@@ -158,6 +211,12 @@ func (g *liveGroups) livePIDs() []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+func (g *liveGroups) signalsTo(pgid int) []os.Signal {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]os.Signal(nil), g.signals[pgid]...)
 }
 
 func (g *liveGroups) spawned() int {
@@ -263,7 +322,8 @@ func TestRefusedCreateLeavesNoLiveContainer(t *testing.T) {
 		inits     []*runtimev1.Container
 		mains     []*runtimev1.Container
 		attempts  int
-		wantSpawn int // groups each attempt spawns
+		wantSpawn int   // groups each attempt spawns
+		exited    []int // pgids that exit on their own and must never be signalled
 	}{
 		{
 			name:  "second-main-spawn-fails",
@@ -291,6 +351,20 @@ func TestRefusedCreateLeavesNoLiveContainer(t *testing.T) {
 			wantSpawn: 2,
 		},
 		{
+			// c1 runs to completion before c2's spawn fails, but its output pipe
+			// is still held, so its terminated state is not yet written when the
+			// unwind runs: only the process's own Done says it is gone.
+			name:  "exited-main-is-never-signalled",
+			grace: 30,
+			mains: []*runtimev1.Container{
+				{Name: "c1", Image: NativeImage, Command: []string{"/bin/sleep", markExitHoldPipes}},
+				{Name: "c2", Image: NativeImage, Command: []string{"/bin/sleep", markFailSpawn}},
+			},
+			attempts:  1,
+			wantSpawn: 1,
+			exited:    []int{3001},
+		},
+		{
 			name: "retry-after-refusal",
 			mains: []*runtimev1.Container{
 				{Name: "c1", Image: "/bin/sleep"},
@@ -302,7 +376,7 @@ func TestRefusedCreateLeavesNoLiveContainer(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			g := newLiveGroups()
+			g := newLiveGroups(t)
 			rt := newTestRuntime(t, Deps{Spawner: g, Waiter: g, SignalGroup: g.signal, ProcGroup: g.procGroup})
 			const podID = "pod-refused-create"
 			for attempt := 1; attempt <= tc.attempts; attempt++ {
@@ -324,6 +398,11 @@ func TestRefusedCreateLeavesNoLiveContainer(t *testing.T) {
 					t.Fatalf("attempt %d: %d groups spawned so far, want %d", attempt, got, want)
 				}
 				assertRefusedCreateUnwound(t, rt, g, podID, attempt)
+				for _, pgid := range tc.exited {
+					if sigs := g.signalsTo(pgid); len(sigs) > 0 {
+						t.Errorf("attempt %d: pgid %d exited on its own before the refusal but was signalled %v", attempt, pgid, sigs)
+					}
+				}
 			}
 		})
 	}

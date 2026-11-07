@@ -780,6 +780,25 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // survivors of the sweep. Nothing is published, because the pod was never
 // ADDED. The network, the shim dirs and the pod dir are createPod's and
 // CreatePod's own unwinds.
+//
+// A main whose process has already exited (it ran to completion before the
+// refusal) is skipped, never signalled: its group is reaped and its pgid may
+// already name another process. stopSidecars skips an exited sidecar the same
+// way. A plain init container is in neither stop set, so one still running in
+// p.containers would get only the tree sweep's SIGKILL; in practice none is
+// there, because finishInitStep drops a plain init container from
+// p.containers once its wait returns.
+//
+// The stop is bounded: the mains run concurrently and the sidecars in turn
+// against one deadline, so the signalling waits at most
+// grace + (1+len(sidecars))*exitObservationGrace, and the log-tail drain adds
+// at most drainGrace after it.
+//
+// Two flags guard it, both set under p.mu before anything is signalled:
+// p.stopping closes the pod to new process groups (an install still in flight
+// kills its own spawn), and p.sidecarTeardown claims the sidecar stop, so a
+// main exit this stop induces does not also start the voluntary-completion
+// teardown.
 func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 	podID := p.box.GetPodId()
 	p.mu.Lock()
@@ -803,7 +822,9 @@ func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 	var wg sync.WaitGroup
 	for _, proc := range mains {
 		pid := proc.PID()
-		if pid <= 0 {
+		if pid <= 0 || procDone(proc) {
+			// Already exited and reaped: nothing to stop, and a signal to its
+			// pgid could reach whatever reuses it.
 			continue
 		}
 		wg.Add(1)
