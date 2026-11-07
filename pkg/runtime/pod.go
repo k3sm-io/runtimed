@@ -711,6 +711,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		projState: projState,
 		shimDirs:  shimDirs,
 	}
+	// A refused create stops what it already started. Registered after the
+	// podCancel defer so it runs BEFORE it: the groups are signalled while their
+	// supervision still watches them, as DeletePod orders it.
+	defer func() {
+		if retErr != nil {
+			r.unwindRefusedCreate(ctx, p)
+		}
+	}()
 
 	// init_containers run first, sequentially; then the main containers start.
 	// The order, and what a failure of either class does to it, is startSequence
@@ -755,6 +763,71 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// registration — would silently leave every limited pod unenforced.
 
 	return p, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// unwindRefusedCreate stops every process group a refused createPod already
+// spawned and releases what each one holds. A refused pod is never registered,
+// so DeletePod no-ops on it and nothing else stops these groups before the next
+// daemon start's reap: without this, each retry of the create would leave
+// another running copy, with its reap record and an open log file.
+//
+// It is DeletePod's host-process stop for a pod that was never published. The
+// mains are stopped concurrently, then the native sidecars in reverse start
+// order, inside one budget: the pod's own grace (podDefaultGrace), through
+// supervisor.GracefulStop and its bounded exit-observation wait. Then the
+// supervision is cancelled, the trees are swept, the log tails are drained and
+// the writers closed, and the reap records are retired, keeping any that name
+// survivors of the sweep. Nothing is published, because the pod was never
+// ADDED. The network, the shim dirs and the pod dir are createPod's and
+// CreatePod's own unwinds.
+func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
+	podID := p.box.GetPodId()
+	p.mu.Lock()
+	// Closed to new groups first, as DeletePod does: an install still in flight
+	// kills its own spawn instead of adding one this unwind will not signal.
+	p.stopping = true
+	// The mains this stop induces must not start the voluntary-completion
+	// teardown concurrently with the sidecar stop below.
+	p.sidecarTeardown = true
+	var mains []*supervisor.Process
+	for _, cp := range liveContainersLocked(p) {
+		if !cp.initDeclared {
+			mains = append(mains, cp.proc)
+		}
+	}
+	sidecars := sidecarsLocked(p)
+	p.mu.Unlock()
+
+	grace := podDefaultGrace(0, p)
+	deadline := time.Now().Add(grace)
+	var wg sync.WaitGroup
+	for _, proc := range mains {
+		pid := proc.PID()
+		if pid <= 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(proc *supervisor.Process, pid int) {
+			defer wg.Done()
+			if _, observed, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
+				termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
+				r.log.Warn("stop a container of a refused pod", "pod", podID, "pid", pid, "err", err)
+			} else if !observed {
+				r.log.Warn("container exit of a refused pod not observed before the bound",
+					"pod", podID, "pid", pid, "bound", r.exitObservationGrace().String())
+			}
+		}(proc, pid)
+	}
+	wg.Wait()
+	r.stopSidecars(ctx, podID, sidecars, deadline)
+
+	if p.cancel != nil {
+		p.cancel()
+	}
+	survivors := r.sweepPodTrees(podID, p)
+	r.awaitLogTails(p)
+	r.closeContainerLogs(p)
+	r.retirePodReapRecords(podID, survivors)
 }
 
 // compileProfile compiles a host-process pod's SBPL profile from its spec and
@@ -1592,6 +1665,12 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	p.mu.Lock()
 	removeContainerLocked(p, cp.name)
 	p.mu.Unlock()
+	if werr != nil || code != 0 {
+		// The step refuses the sequence, and the entry just left p.containers,
+		// so no teardown will ever reach its log writer: release it here, on
+		// the drained-or-bounded terms a replaced instance's log gets.
+		r.releaseReplacedContainerLog(cp)
+	}
 	if werr != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s wait: %w", cp.name, werr)
@@ -1702,6 +1781,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	p.mu.Unlock()
 	env, err := r.containerEnv(envBox, c, rb.env)
 	if err != nil {
+		_ = cleanup()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
 	}
 	// The pod cwd: the merged working directory — the pod's working_dir,
@@ -1845,6 +1925,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		proc.NoteKill(syscall.SIGKILL)
 		_ = r.signalGroup(proc.PID(), killSignal)
 		_ = cleanup()
+		closeLog()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("record container %s process group: %w", c.GetName(), err)
 	}
