@@ -25,7 +25,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"golang.org/x/sys/unix"
@@ -54,6 +56,11 @@ import (
 //
 // Nothing the source returns is trusted. Its file is never read as the blob:
 // the cache re-hashes its own clone and commits only on a digest match.
+//
+// That integrity boundary holds only when the source's files are owned by a
+// different uid than the daemon. A source running as the daemon's own uid
+// could write the cache directly, so for it the clone adds no protection —
+// and loses none either.
 type LocalBlobSource interface {
 	OpenBlob(digest string) (*os.File, int64, error)
 }
@@ -93,8 +100,12 @@ const maxCloneNameAttempts = 8
 // renamed into the blob store. A mismatch removes the clone and returns an
 // error naming the digest and wrapping ErrDigestMismatch.
 //
+// The checks above defend against a source owned by a different uid than the
+// daemon; see LocalBlobSource for why a same-uid source is outside them.
+//
 // It returns an error matching ErrBlobNotLocal when src does not hold the
-// blob, when size is SizeUnknown, when the source file is on a different
+// blob, when size is SizeUnknown, when the source or its clone has a mode this
+// process cannot read, when the source file is on a different
 // volume from the store (st_dev mismatch), or when the clone cannot be made
 // there (EXDEV, ENOTSUP, or a platform without clonefile); the caller then
 // pulls normally. Any other error is a refusal the caller must surface: it may
@@ -166,22 +177,24 @@ func (c *Cache) CommitFromLocal(digest string, size int64, src LocalBlobSource) 
 
 	name, err := cloneToTemp(f, stage)
 	if err != nil {
-		if IsCloneUnsupported(err) {
+		// EACCES: the kernel refuses to clone a source this process cannot
+		// read (mode 0000/0200 for a non-root daemon). Like an unreadable
+		// clone (hashClone), that is the source's choice, not tampering.
+		if IsCloneUnsupported(err) || errors.Is(err, fs.ErrPermission) {
 			return false, fmt.Errorf("commit blob %s from local store: %v: %w",
 				quoteBounded(digest, maxDigestLen), err, ErrBlobNotLocal)
 		}
 		return false, fmt.Errorf("clone local blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
-	tmpName := filepath.Join(stage.Name(), name)
 	defer func() {
 		// No-op after a successful rename. A clone that cannot be removed is
 		// reported with the refusal rather than dropped, so the debris is seen.
-		if rerr := os.Remove(tmpName); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		if rerr := removeStaged(stage, name); rerr != nil {
 			err = errors.Join(err, fmt.Errorf("remove staged clone of blob %s: %w", quoteBounded(digest, maxDigestLen), rerr))
 		}
 	}()
 
-	if err := hashClone(digest, want, size, stage, name, tmpName, dst); err != nil {
+	if err := hashClone(digest, want, size, stage, name, dst); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -189,9 +202,10 @@ func (c *Cache) CommitFromLocal(digest string, size int64, src LocalBlobSource) 
 
 // openStageDir creates (once) and opens the private staging directory, and
 // verifies on every use that it is a real directory — never a symlink — of
-// mode exactly 0700 owned by this process, and that the directory opened is
-// the one checked. A staging directory anyone else can traverse is refused,
-// not repaired: it would mean the cache root is not what this package made.
+// mode exactly 0700, owned by this process, carrying no ACL, and that the
+// directory opened is the one checked. A staging directory anyone else could
+// reach is refused, not repaired: it would mean the cache root is not what
+// this package made. It then sweeps stale clones a crash left (sweepStage).
 func (c *Cache) openStageDir() (*os.File, os.FileInfo, error) {
 	p := filepath.Join(c.root, localStageDir)
 	if err := os.Mkdir(p, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
@@ -221,7 +235,69 @@ func (c *Cache) openStageDir() (*os.File, os.FileInfo, error) {
 		d.Close()
 		return nil, nil, fmt.Errorf("local blob staging dir %s: %w", p, err)
 	}
+	acl, err := hasACL(d)
+	if err != nil {
+		d.Close()
+		if errors.Is(err, errors.ErrUnsupported) {
+			return nil, nil, fmt.Errorf("local blob staging dir %s: %v: %w", p, err, ErrBlobNotLocal)
+		}
+		return nil, nil, fmt.Errorf("local blob staging dir %s: %w", p, err)
+	}
+	if acl {
+		d.Close()
+		return nil, nil, fmt.Errorf("local blob staging dir %s carries an ACL", p)
+	}
+	c.sweepStage(d)
 	return d, fi, nil
+}
+
+// staleStageAge is how long a staged clone may exist before a later call
+// treats it as a crash's debris. It is far longer than any one clone takes to
+// hash, so an in-flight clone of another call is never swept.
+const staleStageAge = time.Hour
+
+// maxStageSweep bounds the entries one sweep looks at, so a staging directory
+// full of debris costs each call a fixed amount of work.
+const maxStageSweep = 64
+
+// sweepStage removes up to maxStageSweep ".blob-*" clones in stage whose
+// status-change time is older than staleStageAge, clearing their file flags
+// first. It is best-effort: a clone it cannot remove is left for the next
+// sweep, and nothing it does can affect a commit.
+func (c *Cache) sweepStage(stage *os.File) {
+	entries, err := stage.ReadDir(maxStageSweep)
+	if err != nil && len(entries) == 0 {
+		return
+	}
+	cutoff := c.now().Add(-staleStageAge)
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".blob-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !statusChanged(info).Before(cutoff) {
+			continue
+		}
+		// Best-effort by design (see above): the next sweep retries.
+		_ = removeStaged(stage, e.Name())
+	}
+}
+
+// removeStaged clears the file flags on the clone name in stage — an inherited
+// UF_IMMUTABLE or UF_APPEND would otherwise make it undeletable — and removes
+// it. A clone that is already gone is not an error.
+func removeStaged(stage *os.File, name string) error {
+	p := filepath.Join(stage.Name(), name)
+	if err := clearFlags(p); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // checkPrivateDir requires a directory of mode exactly 0700 owned by the
@@ -245,9 +321,19 @@ func checkPrivateDir(fi os.FileInfo) error {
 
 // hashClone opens the staged clone name inside stage, makes it the cache's own
 // private file, re-hashes it from that one descriptor under the size guard,
-// syncs it, and commits it through verifyAndRename (tmpName is its path).
-func hashClone(digest string, want ggcrv1.Hash, size int64, stage *os.File, name, tmpName, dst string) error {
+// syncs it, and renames it from stage onto dst through verifyAndRename.
+//
+// The order matters: flags are cleared and xattrs removed before the chmod,
+// because an inherited UF_IMMUTABLE would make the chmod fail.
+func hashClone(digest string, want ggcrv1.Hash, size int64, stage *os.File, name, dst string) error {
 	clone, err := openAt(stage, name)
+	if errors.Is(err, fs.ErrPermission) {
+		// The clone inherited a mode this process cannot read (0000, 0200).
+		// That is the source's choice, not tampering; the deferred cleanup
+		// removes the clone and the caller pulls normally.
+		return fmt.Errorf("commit blob %s from local store: clone is unreadable: %v: %w",
+			quoteBounded(digest, maxDigestLen), err, ErrBlobNotLocal)
+	}
 	if err != nil {
 		return fmt.Errorf("open clone of blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
@@ -259,11 +345,18 @@ func hashClone(digest string, want ggcrv1.Hash, size int64, stage *os.File, name
 	if err := checkOwnClone(fi); err != nil {
 		return fmt.Errorf("clone of blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
-	if err := clone.Chmod(0o600); err != nil {
-		return fmt.Errorf("chmod clone of blob %s: %w", quoteBounded(digest, maxDigestLen), err)
-	}
 	if err := scrubClone(clone); err != nil {
 		return fmt.Errorf("scrub clone of blob %s: %w", quoteBounded(digest, maxDigestLen), err)
+	}
+	acl, err := hasACL(clone)
+	if err != nil {
+		return fmt.Errorf("clone of blob %s: %w", quoteBounded(digest, maxDigestLen), err)
+	}
+	if acl {
+		return fmt.Errorf("clone of blob %s carries an ACL", quoteBounded(digest, maxDigestLen))
+	}
+	if err := clone.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod clone of blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
 	hasher := blobHashers[want.Algorithm]()
 	capped := &cappedWriter{w: hasher, remaining: size}
@@ -280,7 +373,7 @@ func hashClone(digest string, want ggcrv1.Hash, size int64, stage *os.File, name
 	if err := clone.Sync(); err != nil {
 		return fmt.Errorf("sync blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
-	if err := verifyAndRename(digest, want, hasher, tmpName, dst); err != nil {
+	if err := verifyAndRename(digest, want, hasher, func() error { return renameFromStage(stage, name, dst) }); err != nil {
 		return fmt.Errorf("local blob store copy refused: %w", err)
 	}
 	return nil

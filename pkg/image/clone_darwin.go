@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -175,6 +177,53 @@ func listXattrs(fd int) ([]string, error) {
 		return names, nil
 	}
 	return nil, errors.New("flistxattr: attribute list kept changing")
+}
+
+// clearFlags clears every file flag on path without following a symlink. It
+// is only called on names inside the private staging directory, where no
+// other user can swap the entry.
+func clearFlags(path string) error {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return &os.PathError{Op: "lstat", Path: path, Err: err}
+	}
+	if st.Flags == 0 || st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return nil
+	}
+	if err := unix.Chflags(path, 0); err != nil {
+		return &os.PathError{Op: "chflags", Path: path, Err: err}
+	}
+	return nil
+}
+
+// statusChanged returns fi's status-change time. A clone's ctime is when it
+// was made (its mtime is the source's), which is what the staging sweep ages.
+func statusChanged(fi os.FileInfo) time.Time {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fi.ModTime()
+	}
+	return time.Unix(st.Ctimespec.Sec, st.Ctimespec.Nsec)
+}
+
+// renameFromStage renames name inside the open staging directory onto the
+// absolute path dst with renameat(2), so the source side is resolved from the
+// directory descriptor that was verified, not from a path.
+func renameFromStage(stage *os.File, name, dst string) error {
+	conn, err := stage.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var renErr error
+	if err := conn.Control(func(fd uintptr) {
+		renErr = unix.Renameat(int(fd), name, unix.AT_FDCWD, dst)
+	}); err != nil {
+		return err
+	}
+	if renErr != nil {
+		return &os.LinkError{Op: "renameat", Old: name, New: dst, Err: renErr}
+	}
+	return nil
 }
 
 // assertNoQuarantine returns ErrQuarantined if path carries the

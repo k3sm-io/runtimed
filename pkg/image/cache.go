@@ -396,7 +396,7 @@ func (c *Cache) CommitBlob(digest string, size int64, fill func(io.Writer) error
 		return false, fmt.Errorf("close blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
 
-	if err := verifyAndRename(digest, want, hasher, tmpName, dst); err != nil {
+	if err := verifyAndRename(digest, want, hasher, func() error { return os.Rename(tmpName, dst) }); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -424,11 +424,11 @@ func blobHit(dst string) bool {
 }
 
 // verifyAndRename is the commit step every path into the store ends in: it
-// compares the hash of the bytes now in the synced, closed temp file tmpName
-// against want and renames the temp onto dst only on a match. On a mismatch it
-// leaves the temp for the caller's deferred Remove, so a rejected blob leaves
-// NO artifact at its blob path.
-func verifyAndRename(digest string, want ggcrv1.Hash, hasher hash.Hash, tmpName, dst string) error {
+// compares the hash of the bytes now in the synced temp file against want and
+// runs rename — which moves that temp onto its blob path — only on a match. On
+// a mismatch it leaves the temp for the caller's cleanup, so a rejected blob
+// leaves NO artifact at its blob path.
+func verifyAndRename(digest string, want ggcrv1.Hash, hasher hash.Hash, rename func() error) error {
 	// Plain ==, on the canonical lowercase hex both sides are normalized to.
 	// Deliberately not hmac.Equal / subtle.ConstantTimeCompare: there is no secret
 	// on either side and the attacker controls both operands, so a constant-time
@@ -439,7 +439,7 @@ func verifyAndRename(digest string, want ggcrv1.Hash, hasher hash.Hash, tmpName,
 		return fmt.Errorf("blob %s hashed to %s:%s: %w",
 			quoteBounded(digest, maxDigestLen), want.Algorithm, got, ErrDigestMismatch)
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
+	if err := rename(); err != nil {
 		return fmt.Errorf("commit blob %s: %w", quoteBounded(digest, maxDigestLen), err)
 	}
 	return nil

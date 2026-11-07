@@ -21,9 +21,11 @@ package image
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -160,6 +162,218 @@ func TestCommitFromLocalRefusesUnsafeStagingDir(t *testing.T) {
 			}
 			if cache.Has(digest) {
 				t.Error("blob committed through an unsafe staging dir")
+			}
+		})
+	}
+}
+
+// setUchg sets UF_IMMUTABLE on path, skipping the test where the owner may
+// not, and clears it at cleanup so the temp dir can be removed.
+func setUchg(t *testing.T, path string) {
+	t.Helper()
+	if err := unix.Chflags(path, unix.UF_IMMUTABLE); err != nil {
+		t.Skipf("chflags uchg not permitted: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Chflags(path, 0) })
+}
+
+// addACL gives path an ACL entry, skipping the test where chmod +a fails.
+func addACL(t *testing.T, path string) {
+	t.Helper()
+	if out, err := exec.Command("/bin/chmod", "+a", "everyone allow read", path).CombinedOutput(); err != nil {
+		t.Skipf("chmod +a not available: %v: %s", err, out)
+	}
+}
+
+// TestCommitFromLocalImmutableSourceLeavesNoClone: a source carrying
+// UF_IMMUTABLE hands its clone the flag; the clone is committed when it
+// matches, and removed when it does not — never left undeletable.
+func TestCommitFromLocalImmutableSourceLeavesNoClone(t *testing.T) {
+	content := []byte("immutable layer")
+	t.Run("matching", func(t *testing.T) {
+		_, blob := commitFromHostileSource(t, content, func(p string) { setUchg(t, p) })
+		var st unix.Stat_t
+		if err := unix.Lstat(blob, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Flags != 0 {
+			t.Errorf("blob flags = %#x, want 0", st.Flags)
+		}
+	})
+	t.Run("tampered", func(t *testing.T) {
+		root := t.TempDir()
+		cache, err := NewCache(filepath.Join(root, "cache"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256Digest(content)
+		src := writeStoreFile(t, root, "store-blob", []byte("immutable LAYER"))
+		setUchg(t, src)
+		store := &fakeLocalStore{files: map[string]string{digest: src}}
+		wrote, err := cache.CommitFromLocal(digest, int64(len(content)), store)
+		if !errors.Is(err, ErrDigestMismatch) || wrote {
+			t.Fatalf("CommitFromLocal = (%v, %v), want ErrDigestMismatch", wrote, err)
+		}
+		if temps := blobTemps(t, cache); len(temps) != 0 {
+			t.Errorf("immutable clone left behind: %v", temps)
+		}
+	})
+}
+
+// TestCommitFromLocalSweepsStaleClones: a clone a crash left in the staging
+// directory — even an immutable one — is removed by a later call once it is
+// older than staleStageAge.
+func TestCommitFromLocalSweepsStaleClones(t *testing.T) {
+	root := t.TempDir()
+	cache, err := NewCache(filepath.Join(root, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(cache.Root(), localStageDir)
+	if err := os.Mkdir(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	debris := filepath.Join(stage, ".blob-crashed")
+	if err := os.WriteFile(debris, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setUchg(t, debris)
+	fresh := filepath.Join(stage, ".blob-inflight")
+	if err := os.WriteFile(fresh, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	content := []byte("layer")
+	digest := sha256Digest(content)
+	store := &fakeLocalStore{files: map[string]string{digest: writeStoreFile(t, root, "store-blob", content)}}
+
+	// Not yet stale: both survive.
+	if _, err := cache.CommitFromLocal(digest, int64(len(content)), store); err != nil {
+		t.Fatalf("CommitFromLocal: %v", err)
+	}
+	for _, p := range []string{debris, fresh} {
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("%s swept before it was stale: %v", p, err)
+		}
+	}
+
+	// Past the age: the sweep on the next call removes both.
+	cache.now = func() time.Time { return time.Now().Add(2 * staleStageAge) }
+	other := []byte("another layer")
+	otherDigest := sha256Digest(other)
+	store.files[otherDigest] = writeStoreFile(t, root, "store-blob-2", other)
+	if _, err := cache.CommitFromLocal(otherDigest, int64(len(other)), store); err != nil {
+		t.Fatalf("CommitFromLocal: %v", err)
+	}
+	if temps := blobTemps(t, cache); len(temps) != 0 {
+		t.Errorf("stale clones not swept: %v", temps)
+	}
+}
+
+// TestCommitFromLocalACL: a staging directory carrying an ACL is refused, and
+// a source's ACL never reaches the committed blob (the clone is made without
+// CLONE_ACL, and a clone that carried one would be refused).
+func TestCommitFromLocalACL(t *testing.T) {
+	content := []byte("acl layer")
+	digest := sha256Digest(content)
+
+	t.Run("probe sees an ACL", func(t *testing.T) {
+		p := writeStoreFile(t, t.TempDir(), "f", content)
+		addACL(t, p)
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if got, err := hasACL(f); err != nil || !got {
+			t.Fatalf("hasACL = (%v, %v), want (true, nil)", got, err)
+		}
+	})
+
+	t.Run("staging dir with an ACL is refused", func(t *testing.T) {
+		root := t.TempDir()
+		cache, err := NewCache(filepath.Join(root, "cache"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stage := filepath.Join(cache.Root(), localStageDir)
+		if err := os.Mkdir(stage, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		addACL(t, stage)
+		store := &fakeLocalStore{files: map[string]string{digest: writeStoreFile(t, root, "store-blob", content)}}
+		wrote, err := cache.CommitFromLocal(digest, int64(len(content)), store)
+		if err == nil || wrote || errors.Is(err, ErrBlobNotLocal) {
+			t.Fatalf("CommitFromLocal = (%v, %v), want a refusal that is not ErrBlobNotLocal", wrote, err)
+		}
+		if cache.Has(digest) {
+			t.Error("blob committed through a staging dir with an ACL")
+		}
+	})
+
+	t.Run("source ACL does not reach the blob", func(t *testing.T) {
+		_, blob := commitFromHostileSource(t, content, func(p string) { addACL(t, p) })
+		f, err := os.Open(blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if got, err := hasACL(f); err != nil || got {
+			t.Fatalf("committed blob hasACL = (%v, %v), want (false, nil)", got, err)
+		}
+	})
+}
+
+// preopenedSource hands out a file it opened before its mode was changed.
+type preopenedSource struct {
+	digest string
+	f      *os.File
+	size   int64
+}
+
+func (s *preopenedSource) OpenBlob(digest string) (*os.File, int64, error) {
+	if digest != s.digest || s.f == nil {
+		return nil, 0, ErrBlobNotLocal
+	}
+	f := s.f
+	s.f = nil
+	return f, s.size, nil
+}
+
+// TestCommitFromLocalUnreadableCloneFallsBack: a source whose file is mode
+// 0000 or 0200 cannot be cloned or read by this process; that is
+// ErrBlobNotLocal (pull normally), and the clone is removed.
+func TestCommitFromLocalUnreadableCloneFallsBack(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any mode")
+	}
+	content := []byte("unreadable layer")
+	digest := sha256Digest(content)
+	for _, mode := range []os.FileMode{0o000, 0o200} {
+		t.Run(mode.String(), func(t *testing.T) {
+			root := t.TempDir()
+			cache, err := NewCache(filepath.Join(root, "cache"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := writeStoreFile(t, root, "store-blob", content)
+			f, err := os.Open(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(p, mode); err != nil {
+				t.Fatal(err)
+			}
+			src := &preopenedSource{digest: digest, f: f, size: int64(len(content))}
+			wrote, err := cache.CommitFromLocal(digest, int64(len(content)), src)
+			if !errors.Is(err, ErrBlobNotLocal) || wrote {
+				t.Fatalf("CommitFromLocal = (%v, %v), want ErrBlobNotLocal", wrote, err)
+			}
+			if cache.Has(digest) {
+				t.Error("blob committed from an unreadable clone")
+			}
+			if temps := blobTemps(t, cache); len(temps) != 0 {
+				t.Errorf("unreadable clone left behind: %v", temps)
 			}
 		})
 	}
