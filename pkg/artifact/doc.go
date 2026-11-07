@@ -31,7 +31,9 @@ limitations under the License.
 // # Fail-closed rules
 //
 //   - The allow-set comes from artifactv1.AllowSetFor(policy); UNSPECIFIED and
-//     unknown policies are refused.
+//     unknown policies are refused. The guest allow-set has no policy value: it
+//     is reachable only from PullGuestArtifact, the internal entry point the
+//     guest kernel and initramfs use (GuestStore), never from a pod.
 //   - The reference must name the configured cluster registry host; any other
 //     host is refused before any request.
 //   - The manifest is at most MaxManifestBytes, is an OCI image manifest (a

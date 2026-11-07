@@ -314,7 +314,11 @@ type blob struct {
 // It is the operator's pull: the record it writes is pinned (Record.PodOnly
 // false) and stays a root until it is removed (Views.Forget).
 func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
-	return p.pull(ctx, ref, cred, policy, paths, false)
+	allow, err := artifactv1.AllowSetFor(policy)
+	if err != nil {
+		return nil, err
+	}
+	return p.pull(ctx, ref, cred, allow, paths, false)
 }
 
 // PullForPod is PullArtifact for a pod's image volume. The record it writes is
@@ -322,14 +326,27 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 // no pod holds the reference any more (Views.ReleasePodOnly). It never unpins
 // an operator's record.
 func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
-	return p.pull(ctx, ref, cred, policy, paths, true)
-}
-
-func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, podOnly bool) (*Result, error) {
 	allow, err := artifactv1.AllowSetFor(policy)
 	if err != nil {
 		return nil, err
 	}
+	return p.pull(ctx, ref, cred, allow, paths, true)
+}
+
+// PullGuestArtifact is the internal entry point for the guest kernel and
+// initramfs: PullArtifact under artifactv1.GuestAllowSet, every layer. No
+// ArtifactPolicy selects that set, so neither the PullArtifact RPC nor a pod
+// image volume can reach it, and this entry point accepts nothing else.
+//
+// The record it writes is PodOnly: no pod ever holds a guest reference, so the
+// record is released by the next Views.ReleasePodOnly and its blobs become
+// collectable. The durable copy is the guest-artifacts cache, which the caller
+// fills while it holds Result.Lease.
+func (p *Puller) PullGuestArtifact(ctx context.Context, ref string, cred *image.RegistryCredential) (*Result, error) {
+	return p.pull(ctx, ref, cred, artifactv1.GuestAllowSet(), nil, true)
+}
+
+func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, allow artifactv1.AllowSet, paths []string, podOnly bool) (*Result, error) {
 	if len(paths) > 0 {
 		if err := artifactv1.ValidatePathSet(paths); err != nil {
 			return nil, fmt.Errorf("requested paths: %w", err)
