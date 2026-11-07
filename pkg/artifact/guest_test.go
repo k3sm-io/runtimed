@@ -24,6 +24,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -31,6 +32,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	artifactv1 "k3sm.io/apis/artifact/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -261,5 +264,57 @@ func TestPullGuestArtifactLeaseOutlivesInstall(t *testing.T) {
 	}
 	if GuestLeaseTTL < 2*image.DefaultLeaseTTL {
 		t.Errorf("GuestLeaseTTL %v is not well above the default %v", GuestLeaseTTL, image.DefaultLeaseTTL)
+	}
+}
+
+type pathAt string
+
+func (p pathAt) BlobPath(string) (string, error) { return string(p), nil }
+
+func TestGuestStoreOpenBlobRefusesNonRegular(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular")
+	if err := os.WriteFile(regular, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(regular, link); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "dir")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, path string
+		ok         bool
+	}{
+		{"regular file", regular, true},
+		{"fifo", fifo, false},
+		{"directory", sub, false},
+		{"symlink", link, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, err := (&GuestStore{Blobs: pathAt(tc.path)}).OpenBlob("sha256:" + strings.Repeat("0", 64))
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("open: %v", err)
+				}
+				b, _ := io.ReadAll(rc)
+				_ = rc.Close()
+				if string(b) != "ok" {
+					t.Errorf("read %q", b)
+				}
+				return
+			}
+			if err == nil {
+				_ = rc.Close()
+				t.Fatal("opened")
+			}
+		})
 	}
 }

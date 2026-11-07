@@ -28,6 +28,10 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 )
 
+// ErrBlobNotRegular reports that the path a blob digest names is not a
+// regular file. Compare with errors.Is.
+var ErrBlobNotRegular = errors.New("artifact: blob is not a regular file")
+
 // BlobPather locates a committed blob; *image.Cache satisfies it.
 type BlobPather interface {
 	BlobPath(digest string) (string, error)
@@ -63,7 +67,10 @@ func (g *GuestStore) PullGuest(ctx context.Context, ref string) (map[string]stri
 }
 
 // OpenBlob opens a committed blob read-only. The final component is opened
-// O_NOFOLLOW, as BlobPath's contract requires of a reader running as root.
+// O_NOFOLLOW, as BlobPath's contract requires of a reader running as root, and
+// O_NONBLOCK so a FIFO planted at the path cannot hang the open; the opened
+// file must then be a regular file by fstat, so a directory or device is
+// refused rather than read.
 func (g *GuestStore) OpenBlob(digest string) (io.ReadCloser, error) {
 	if g == nil || g.Blobs == nil {
 		return nil, errors.New("guest store: a blob cache is required")
@@ -72,9 +79,18 @@ func (g *GuestStore) OpenBlob(digest string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(p, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(p, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open blob %s: %w", digest, err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat blob %s: %w", digest, err)
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("blob %s is a %v, not a regular file: %w", digest, fi.Mode().Type(), ErrBlobNotRegular)
 	}
 	return f, nil
 }
