@@ -141,7 +141,7 @@ func (p *Puller) resolve(ctx context.Context, ref string, cred *image.RegistryCr
 		m, err := parseManifest(raw, served)
 		return m, raw, mdigest, err
 	}
-	entry, err := selectVariant(raw, served, variant)
+	entry, err := selectEntry(raw, served, variant)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -170,12 +170,45 @@ func (p *Puller) resolve(ctx context.Context, ref string, cred *image.RegistryCr
 	return m, craw, cdigest, nil
 }
 
-// selectVariant checks the index and returns the one entry carrying variant.
+// IndexEntry is the index entry SelectVariant picked: the variant manifest's
+// digest ("sha256:<hex>"), its size in bytes and its media type (always the
+// OCI image manifest type).
+type IndexEntry struct {
+	Digest    string
+	Size      int64
+	MediaType string
+}
+
+// SelectVariant parses index, the raw bytes of an OCI image index, and returns
+// the one entry whose AnnotationVariant equals variant. It makes no request:
+// the caller fetches the entry by digest and must verify the bytes against
+// Digest and Size. mediaType is the type the registry served index as; empty
+// means the index body must name the OCI index type itself.
+//
+// It applies the same rules PullArtifact does: a docker manifest list, an
+// empty variant (ErrVariantRequired), a variant over MaxVariantLength
+// (ErrVariantInvalid), an index over MaxIndexBytes (ErrManifestTooLarge) or
+// MaxIndexEntries, an entry that is not an OCI image manifest (a nested
+// index), a malformed digest or a size outside 1..MaxManifestBytes
+// (ErrManifestInvalid) are refused, as are no match (ErrVariantNotFound) and
+// several matches (ErrVariantAmbiguous).
+func SelectVariant(index []byte, mediaType, variant string) (IndexEntry, error) {
+	if len(variant) > MaxVariantLength {
+		return IndexEntry{}, fmt.Errorf("%d bytes, at most %d: %w", len(variant), MaxVariantLength, ErrVariantInvalid)
+	}
+	d, err := selectEntry(index, mediaType, variant)
+	if err != nil {
+		return IndexEntry{}, err
+	}
+	return IndexEntry{Digest: d.Digest, Size: d.Size, MediaType: d.MediaType}, nil
+}
+
+// selectEntry checks the index and returns the one entry carrying variant.
 // Only an OCI image index is accepted (a docker manifest list is refused), at
 // most MaxIndexBytes and MaxIndexEntries, every entry an OCI image manifest
 // (never a nested index) with a well-formed digest and a size within
 // MaxManifestBytes.
-func selectVariant(raw []byte, served, variant string) (descriptor, error) {
+func selectEntry(raw []byte, served, variant string) (descriptor, error) {
 	st := servedType(served)
 	if st == mediaTypeDockerList {
 		return descriptor{}, fmt.Errorf("served as %s: %w", st, ErrIndexRefused)

@@ -245,3 +245,44 @@ func TestVariantIndexBounds(t *testing.T) {
 		})
 	}
 }
+
+// TestSelectVariantFromIndexBytes pins the network-free selection a caller
+// resolving a variant to a digest uses: the same entry, and the same
+// refusals, as the pull.
+func TestSelectVariantFromIndexBytes(t *testing.T) {
+	f := newFake()
+	e4 := f.publishVariant("4bit", modelLayer("a.json", "a"))
+	e8 := f.publishVariant("8bit", modelLayer("a.json", "b"))
+	idx := f.publishIndex(testRef, e4, e8)
+	for _, mt := range []string{mediaTypeOCIIndex, mediaTypeOCIIndex + "; charset=utf-8", ""} {
+		got, err := SelectVariant(idx, mt, "8bit")
+		if err != nil {
+			t.Fatalf("served as %q: %v", mt, err)
+		}
+		want := IndexEntry{Digest: e8["digest"].(string), Size: int64(e8["size"].(int)), MediaType: mediaTypeOCIManifest}
+		if got != want {
+			t.Errorf("served as %q: got %+v, want %+v", mt, got, want)
+		}
+	}
+	dup := f.publishIndex(testRef, e8, e8)
+	for _, tc := range []struct {
+		name    string
+		raw     []byte
+		mt, sel string
+		want    error
+	}{
+		{"no match", idx, mediaTypeOCIIndex, "bf16", ErrVariantNotFound},
+		{"two matches", dup, mediaTypeOCIIndex, "8bit", ErrVariantAmbiguous},
+		{"no selector", idx, mediaTypeOCIIndex, "", ErrVariantRequired},
+		{"selector too long", idx, mediaTypeOCIIndex, strings.Repeat("x", MaxVariantLength+1), ErrVariantInvalid},
+		{"docker list", idx, mediaTypeDockerList, "8bit", ErrIndexRefused},
+		{"served as a manifest", idx, mediaTypeOCIManifest, "8bit", ErrIndexRefused},
+		{"not json", []byte("{"), mediaTypeOCIIndex, "8bit", ErrManifestInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := SelectVariant(tc.raw, tc.mt, tc.sel); !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
