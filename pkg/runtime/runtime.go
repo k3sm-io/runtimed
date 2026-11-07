@@ -77,10 +77,10 @@ type ArtifactPuller interface {
 	// with no request; the RPC runs it before resolving any credential.
 	CheckHost(ref string) error
 	// PullArtifact is the operator's pull: its record is pinned.
-	PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error)
+	PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error)
 	// PullForPod is a pod's image-volume pull: its record is released when no
 	// pod holds the reference (artifact.Puller.PullForPod).
-	PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error)
+	PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error)
 }
 
 // Unpacker turns a pulled image into files in a pod's rootfs: it

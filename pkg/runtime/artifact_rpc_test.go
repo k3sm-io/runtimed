@@ -145,12 +145,12 @@ type lazyArtifactPuller struct{ p *artifact.Puller }
 
 func (l *lazyArtifactPuller) CheckHost(ref string) error { return l.p.CheckHost(ref) }
 
-func (l *lazyArtifactPuller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
-	return l.p.PullArtifact(ctx, ref, cred, policy, paths)
+func (l *lazyArtifactPuller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	return l.p.PullArtifact(ctx, ref, cred, policy, paths, opts...)
 }
 
-func (l *lazyArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
-	return l.p.PullForPod(ctx, ref, cred, policy, paths)
+func (l *lazyArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	return l.p.PullForPod(ctx, ref, cred, policy, paths, opts...)
 }
 
 func modelArtifact(layers map[string][]byte, order []string) *fakeArtifactFetcher {
@@ -273,7 +273,7 @@ func (s *scriptedArtifactPuller) CheckHost(ref string) error {
 	return nil
 }
 
-func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string) (*artifact.Result, error) {
+func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string, _ ...artifact.PullOption) (*artifact.Result, error) {
 	if err := s.CheckHost(ref); err != nil {
 		return nil, err
 	}
@@ -301,8 +301,8 @@ func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _
 	return &artifact.Result{ManifestDigest: sha([]byte("m"))}, nil
 }
 
-func (s *scriptedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*artifact.Result, error) {
-	return s.PullArtifact(ctx, ref, cred, policy, paths)
+func (s *scriptedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	return s.PullArtifact(ctx, ref, cred, policy, paths, opts...)
 }
 
 func volumeReq(ref string) *runtimev1.PullArtifactRequest {

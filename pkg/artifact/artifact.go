@@ -314,26 +314,31 @@ type blob struct {
 // once every requested blob is committed. It is idempotent: blobs already
 // cached are not fetched again.
 //
+// ref names one artifact manifest, or, with WithVariant, an OCI image index of
+// variant manifests from which the one entry carrying that variant is pulled.
+// An index without a variant, a variant no entry or several entries carry, and
+// a variant for a single manifest are refused before any blob is requested.
+//
 // It is the operator's pull: the record it writes is pinned (Record.PodOnly
 // false) and stays a root until it is removed (Views.Forget).
-func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
+func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...PullOption) (*Result, error) {
 	allow, err := artifactv1.AllowSetFor(policy)
 	if err != nil {
 		return nil, err
 	}
-	return p.pull(ctx, ref, cred, allow, paths, false, 0, nil)
+	return p.pull(ctx, ref, cred, allow, paths, false, 0, nil, opts)
 }
 
 // PullForPod is PullArtifact for a pod's image volume. The record it writes is
 // PodOnly unless the operator already pinned the key, so it is released when
 // no pod holds the reference any more (Views.ReleasePodOnly). It never unpins
 // an operator's record.
-func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
+func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...PullOption) (*Result, error) {
 	allow, err := artifactv1.AllowSetFor(policy)
 	if err != nil {
 		return nil, err
 	}
-	return p.pull(ctx, ref, cred, allow, paths, true, 0, nil)
+	return p.pull(ctx, ref, cred, allow, paths, true, 0, nil, opts)
 }
 
 // PullGuestArtifact is the internal entry point for the guest kernel and
@@ -362,7 +367,7 @@ func (p *Puller) PullGuestArtifact(ctx context.Context, ref string, cred *image.
 	if err := checkGuestLayers(want); err != nil {
 		return nil, err
 	}
-	return p.pull(ctx, ref, cred, artifactv1.GuestAllowSet(), nil, true, GuestLeaseTTL, want)
+	return p.pull(ctx, ref, cred, artifactv1.GuestAllowSet(), nil, true, GuestLeaseTTL, want, nil)
 }
 
 // GuestLeaseTTL is the lease PullGuestArtifact holds on the guest blobs: four
@@ -375,7 +380,11 @@ const GuestLeaseTTL = time.Hour
 // blobs; zero means image.DefaultLeaseTTL. expect, when non-nil, is the exact
 // layer set the manifest must declare (matchGuestLayers), checked before any
 // lease or blob request.
-func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, allow artifactv1.AllowSet, paths []string, podOnly bool, leaseTTL time.Duration, expect []GuestLayer) (*Result, error) {
+func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, allow artifactv1.AllowSet, paths []string, podOnly bool, leaseTTL time.Duration, expect []GuestLayer, opts []PullOption) (*Result, error) {
+	o, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	if len(paths) > 0 {
 		if err := artifactv1.ValidatePathSet(paths); err != nil {
 			return nil, fmt.Errorf("requested paths: %w", err)
@@ -397,7 +406,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	if want, ok := digestOf(ref); ok && want != mdigest {
 		return nil, fmt.Errorf("manifest hashed to %s, reference names %s: %w", mdigest, want, ErrManifestDigest)
 	}
-	m, err := parseManifest(raw, served)
+	m, raw, mdigest, err := p.resolve(ctx, ref, cred, raw, served, mdigest, o.variant)
 	if err != nil {
 		return nil, err
 	}

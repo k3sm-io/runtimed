@@ -38,8 +38,16 @@ limitations under the License.
 //     exactly them, within their size caps, is refused before any blob request.
 //   - The reference must name the configured cluster registry host; any other
 //     host is refused before any request.
-//   - The manifest is at most MaxManifestBytes, is an OCI image manifest (a
-//     bare index is refused), and carries at most MaxLayers layers.
+//   - The manifest is at most MaxManifestBytes, is an OCI image manifest, and
+//     carries at most MaxLayers layers.
+//   - An OCI image index is accepted only with a variant selector
+//     (WithVariant): it is at most MaxIndexBytes and MaxIndexEntries, every
+//     entry is an OCI image manifest (never a nested index), and exactly one
+//     entry may carry the selector in its AnnotationVariant. That manifest is
+//     fetched by digest, verified against the entry, and checked as a direct
+//     pull is. No selector, no match, several matches, and a selector for a
+//     single manifest are refused before any blob request. A docker manifest
+//     list is always refused.
 //   - The artifact type is artifactType, or the config mediaType when that is
 //     empty. An OCI image config is never accepted.
 //   - Tar layers (.tar, +gzip, +zstd) are refused; every layer media type must
