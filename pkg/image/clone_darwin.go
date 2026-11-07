@@ -66,6 +66,36 @@ func (CloneOnly) Clone(src, dst string) (bool, error) {
 	return true, nil
 }
 
+// cloneFileAt CoW-clones the open file src to name inside the open directory
+// dir with fclonefileat(2) (the x/sys binding, not hand cgo). Cloning from the
+// descriptor means the inode cloned is the inode the caller already checked;
+// no path is resolved on the source side. CLONE_NOFOLLOW refuses a symlink at
+// the destination name, and CLONE_NOOWNERCOPY makes the clone owned by this
+// process rather than by the source file's owner. name must not exist.
+func cloneFileAt(src, dir *os.File, name string) error {
+	srcConn, err := src.SyscallConn()
+	if err != nil {
+		return err
+	}
+	dirConn, err := dir.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var cloneErr, innerErr error
+	err = srcConn.Control(func(srcFD uintptr) {
+		innerErr = dirConn.Control(func(dirFD uintptr) {
+			cloneErr = unix.Fclonefileat(int(srcFD), int(dirFD), name, unix.CLONE_NOFOLLOW|unix.CLONE_NOOWNERCOPY)
+		})
+	})
+	if err = errors.Join(err, innerErr); err != nil {
+		return err
+	}
+	if cloneErr != nil {
+		return &os.PathError{Op: "fclonefileat", Path: name, Err: cloneErr}
+	}
+	return nil
+}
+
 // assertNoQuarantine returns ErrQuarantined if path carries the
 // com.apple.quarantine xattr. On darwin, Getxattr with a zero-length buffer
 // returns the attribute size (nil error) when the attr exists, or ENOATTR when

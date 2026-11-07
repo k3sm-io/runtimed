@@ -44,5 +44,11 @@ func (CloneOnly) Clone(src, dst string) (bool, error) {
 	return false, &os.LinkError{Op: "clonefile", Old: src, New: dst, Err: errors.ErrUnsupported}
 }
 
+// cloneFileAt off darwin has no fclonefileat, so every clone is refused as
+// unsupported (IsCloneUnsupported) without copying.
+func cloneFileAt(_, _ *os.File, name string) error {
+	return &os.PathError{Op: "fclonefileat", Path: name, Err: errors.ErrUnsupported}
+}
+
 // assertNoQuarantine is a no-op off darwin (no com.apple.quarantine concept).
 func assertNoQuarantine(string) error { return nil }

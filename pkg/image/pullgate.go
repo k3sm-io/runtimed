@@ -85,8 +85,19 @@ var ErrPullRefusedDiskPressure = errors.New("image: refusing to start a pull, th
 //     cluster, which is not a degraded pull path but the only one there is. It
 //     is still not a silent default: the option takes BOTH halves and NewPuller
 //     refuses a half-wiring, so a node either states its mirrors or has none;
-//   - the logger (WithPullLogger) selects a sink, never a behavior.
+//   - the logger (WithPullLogger) selects a sink, never a behavior;
+//   - the local blob source (WithLocalBlobSource) is absent on every node whose
+//     registry does not share the cache's volume, and it cannot change which
+//     bytes are committed: a local copy is committed only on a digest match.
 type PullerOption func(*Puller)
+
+// WithLocalBlobSource has the puller offer each blob to src before fetching it:
+// a blob src holds on the cache's volume is cloned and re-hashed
+// (Cache.CommitFromLocal) instead of copied over the network. Nil leaves every
+// blob fetched, exactly as without the option.
+func WithLocalBlobSource(src LocalBlobSource) PullerOption {
+	return func(p *Puller) { p.localBlobs = src }
+}
 
 // WithPullFloor overrides the free-space floor under which new fetches are
 // refused. Zero means DefaultPullRefuseFreeBytes.
