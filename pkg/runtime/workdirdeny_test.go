@@ -137,6 +137,7 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 		for _, tc := range []struct{ nested, parent string }{
 			{image.ArtifactIndexSubdir, image.IndexSubdir},
 			{image.ArtifactHoldIndexSubdir, image.IndexSubdir},
+			{image.ArtifactReleasedIndexSubdir, image.IndexSubdir},
 		} {
 			if !denied[tc.parent] {
 				t.Errorf("%q lives under %q, which is not denied", tc.nested, tc.parent)
