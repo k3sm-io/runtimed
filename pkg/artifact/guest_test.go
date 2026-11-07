@@ -20,12 +20,18 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	artifactv1 "k3sm.io/apis/artifact/v1"
+	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/guestartifacts"
 )
 
@@ -119,5 +125,91 @@ func TestGuestStoreFillsGuestArtifactsCache(t *testing.T) {
 		filepath.Join(t.TempDir(), "g"), "v6.18.49-0123456789ab", pin, testHost, store)
 	if !errors.Is(err, guestartifacts.ErrNotInClusterStore) {
 		t.Errorf("missing pin: err = %v, want ErrNotInClusterStore", err)
+	}
+}
+
+// TestPullGuestArtifactCallersAreConfined fails when any non-test Go file in
+// this module names PullGuestArtifact outside the guest adapter and the
+// guestartifacts package. The guest allow-set is an internal entry point; a
+// new caller (an RPC handler, a pod path) would widen who can make the daemon
+// fetch a guest artifact, and must be a reviewed change to this list.
+func TestPullGuestArtifactCallersAreConfined(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		t.Fatalf("module root %s: %v", root, err)
+	}
+	allowed := func(rel string) bool {
+		return rel == filepath.Join("pkg", "artifact", "guest.go") ||
+			strings.HasPrefix(rel, filepath.Join("pkg", "guestartifacts")+string(filepath.Separator))
+	}
+	fset := token.NewFileSet()
+	seen := 0
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "testdata", "vendor", ".git":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", rel, err)
+		}
+		seen++
+		ast.Inspect(f, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if ok && sel.Sel.Name == "PullGuestArtifact" && !allowed(rel) {
+				t.Errorf("%s names PullGuestArtifact; only pkg/artifact/guest.go and pkg/guestartifacts may", fset.Position(sel.Pos()))
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen < 50 {
+		t.Fatalf("walked only %d Go files under %s; the guard is not looking at the module", seen, root)
+	}
+}
+
+// TestNoPolicySelectsGuestAllowSet asserts the guest allow-set is unreachable
+// from an ArtifactPolicy: every declared policy, and values past them, either
+// fails or yields a set that refuses the guest type.
+func TestNoPolicySelectsGuestAllowSet(t *testing.T) {
+	var policies []runtimev1.ArtifactPolicy
+	for v := range runtimev1.ArtifactPolicy_name {
+		policies = append(policies, runtimev1.ArtifactPolicy(v))
+	}
+	policies = append(policies, -1, 1<<20)
+	for v := int32(0); v < 64; v++ {
+		policies = append(policies, runtimev1.ArtifactPolicy(v))
+	}
+	for _, pol := range policies {
+		set, err := artifactv1.AllowSetFor(pol)
+		if err != nil {
+			continue
+		}
+		if set.AllowsType(artifactv1.ArtifactTypeGuest) || set.Name() == artifactv1.GuestAllowSet().Name() {
+			t.Errorf("policy %v (%d) yields the guest allow-set %q", pol, int32(pol), set.Name())
+		}
+		for _, mt := range []string{artifactv1.MediaTypeGuestKernel, artifactv1.MediaTypeGuestInitramfs} {
+			for _, typ := range set.ArtifactTypes() {
+				if set.AllowsLayer(typ, mt) {
+					t.Errorf("policy %v admits guest layer %s under %s", pol, mt, typ)
+				}
+			}
+		}
 	}
 }
