@@ -43,8 +43,8 @@ const (
 	MaxIndexBytes = 256 << 10
 	// MaxIndexEntries caps the manifests one index lists.
 	MaxIndexEntries = 64
-	// MaxVariantLength caps a variant selector, the bound the model CRD
-	// applies to the field that carries it.
+	// MaxVariantLength caps a variant selector: the same bound as the
+	// model CRD's variant field, enforced here independently of it.
 	MaxVariantLength = 128
 )
 

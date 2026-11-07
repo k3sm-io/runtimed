@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("{\"schemaVersion\":2,\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":1,\"annotations\":{\"io.k3sm.model.variant\":\"8bit\"}}]}")
+string("")
+string("8bit")
