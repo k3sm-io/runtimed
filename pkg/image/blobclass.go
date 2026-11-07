@@ -19,8 +19,11 @@ package image
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -272,4 +275,74 @@ func (c *Cache) StoreBytesByClass(ctx context.Context) (map[string]int64, error)
 		out[ClassImage] += t.Size
 	}
 	return out, nil
+}
+
+// orderEvictions splits a delete plan into the eviction order reclaim runs:
+// first the blobs of released artifacts, least recently released first (a
+// pod-only record is released when its last pod goes, so this is least
+// recently mounted first); then the rest, content nothing names before image
+// content, each group in its plan (path) order.
+//
+// It is a permutation of dels and nothing else: every decision in dels comes
+// back exactly once in first or rest, unchanged, so the order can never add a
+// blob to the plan, drop one, or alter a verdict.
+func orderEvictions(dels []PruneDecision, classes *blobClasses) (first, rest []PruneDecision) {
+	var unnamed, images []PruneDecision
+	for _, d := range dels {
+		class := ClassUnattributed
+		if d.Node.Kind == BlobKindContent && d.Node.Digest != "" {
+			class = classes.classOf(d.Node.Digest)
+		}
+		switch {
+		case IsArtifactClass(class):
+			first = append(first, d)
+		case class == ClassImage:
+			images = append(images, d)
+		default:
+			unnamed = append(unnamed, d)
+		}
+	}
+	slices.SortStableFunc(first, func(a, b PruneDecision) int {
+		return classes.released[a.Node.Digest].releasedAt.Compare(classes.released[b.Node.Digest].releasedAt)
+	})
+	return first, append(unnamed, images...)
+}
+
+// classBytes sums the logical size of the removed digests by class; the
+// removed bytes no digest accounts for (ingest temps) are ClassUnattributed.
+func classBytes(dels []PruneDecision, removed []string, deleted int64, classes *blobClasses, into map[string]int64) {
+	size := make(map[string]int64, len(dels))
+	for _, d := range dels {
+		if d.Node.Digest != "" {
+			size[d.Node.Digest] = d.Node.Size
+		}
+	}
+	var named int64
+	for _, dg := range removed {
+		into[classes.classOf(dg)] += size[dg]
+		named += size[dg]
+	}
+	if rest := deleted - named; rest > 0 {
+		into[ClassUnattributed] += rest
+	}
+}
+
+// sweepReleased removes the released record copies that class nothing any
+// more: every blob they name is gone from the store or named by a live
+// record. It is called after a reclaim pass's unlinks.
+func (c *Cache) sweepReleased(classes *blobClasses) error {
+	var drop []string
+	for _, rc := range classes.copies {
+		if !slices.ContainsFunc(recordDigests(rc.root), func(d string) bool {
+			_, live := classes.live[d]
+			return !live && c.Has(d)
+		}) {
+			drop = append(drop, rc.name)
+		}
+	}
+	x := &FileIndex{dir: c.IndexRoot()}
+	if err := x.sweepReleasedArtifacts(drop); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }

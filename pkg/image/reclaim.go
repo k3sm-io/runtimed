@@ -224,6 +224,9 @@ type ReclaimReport struct {
 	// trees together. Under APFS clonefile this OVERSTATES what the volume got
 	// back; FreeAfter minus FreeBefore is the measured truth.
 	ReclaimedBytes int64
+	// ReclaimedByClass is ReclaimedBytes split by class, as StoreBytesByClass
+	// classes the store (trees are ClassImage). It carries the same overstatement.
+	ReclaimedByClass map[string]int64
 	// Kept is every blob the pass considered and did not delete, with its
 	// verdict — the planner's Keep set plus anything the executor refused.
 	Kept []KeptBlob
@@ -296,9 +299,16 @@ type KeptBlob struct {
 //
 // The pass sweeps two stores: the content-addressed blobs, and the derived trees
 // under unpacked/ and snapshots/. Trees are decided from the same root set under
-// their own rule (planTrees) and removed FIRST, by a separate executor that
-// cannot reach a blob. The one property that spans both: nothing read out of a
-// tree can keep a blob alive.
+// their own rule (planTrees) and removed by a separate executor that cannot
+// reach a blob. The one property that spans both: nothing read out of a tree
+// can keep a blob alive.
+//
+// The eviction order is: the blobs of artifacts whose record was released,
+// least recently released first; then the trees; then the remaining blobs,
+// content nothing names before image content. The order is a permutation of
+// the delete plan, read after the plan is fixed, so it only decides what goes
+// first under a measured target: a held, pinned, pod-recorded, leased or young
+// blob is never in the plan to be ordered.
 func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -399,6 +409,21 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: k.Node.Store, Key: k.Node.Key, Path: k.Node.Path, Reason: k.Reason})
 	}
 
+	// EVICTION ORDER. Classes are read after the plan and only reorder its
+	// Delete set (orderEvictions is a permutation), so they can never make a
+	// blob eligible or keep one: holds, pins, pod records and leases have
+	// already decided membership above, and every unlink still re-verifies.
+	// Unreadable classes are no reason to stop defending the volume; the pass
+	// then evicts in path order, as before classes existed.
+	classes, cerr := c.readBlobClasses(ctx)
+	if cerr != nil {
+		log.Warn("image reclaim: blob classes unreadable; evicting in path order", "err", cerr)
+		classes = &blobClasses{}
+	}
+	artifactDels, restDels := orderEvictions(plan.Delete, classes)
+	plan.Delete = append(append([]PruneDecision(nil), artifactDels...), restDels...)
+	rep.ReclaimedByClass = map[string]int64{}
+
 	if cfg.DryRun {
 		for _, d := range plan.Delete {
 			if d.Node.Digest != "" {
@@ -411,6 +436,14 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 			}
 		}
 		rep.ReclaimedBytes = plan.DeletedBytes()
+		var blobBytes int64
+		for _, d := range plan.Delete {
+			blobBytes += d.Node.Size
+		}
+		classBytes(plan.Delete, rep.Removed, blobBytes, classes, rep.ReclaimedByClass)
+		if trees := rep.ReclaimedBytes - blobBytes; trees > 0 {
+			rep.ReclaimedByClass[ClassImage] += trees
+		}
 		rep.ReachedTarget = before >= target
 		return rep, nil
 	}
@@ -439,31 +472,58 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		}
 		return f >= target
 	}
-	// TREES before BLOBS. A tree is derived content: it is rebuildable from the
-	// blobs the image names, so removing it costs a re-unpack, while removing the
-	// blobs costs a registry round-trip the node may not be able to make. Running
-	// the tree half first also means a pass that stops on its measured target
-	// stops having given up the cheaper thing — and it can never orphan a tree,
-	// because a tree is only ever condemned in the same pass that condemns the
-	// blobs it was built from.
+	// RELEASED ARTIFACTS, then TREES, then the remaining BLOBS.
+	//
+	// An artifact whose record was released goes first: it is typically the
+	// largest content on the node and the cheapest to fetch again, from the
+	// cluster's own registry. It has no tree, so evicting it first cannot
+	// orphan one.
+	//
+	// A tree is derived content: it is rebuildable from the blobs the image
+	// names, so removing it costs a re-unpack, while removing the blobs costs a
+	// registry round-trip the node may not be able to make. Running the tree
+	// half before the image blobs also means a pass that stops on its measured
+	// target stops having given up the cheaper thing — and it can never orphan
+	// a tree, because a tree is only ever condemned in the same pass that
+	// condemns the blobs it was built from.
+	artExec, err := c.ExecutePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop)
+	if err != nil {
+		return nil, err
+	}
 	treeExec, err := c.ExecuteTreePrune(plan, grace, now(), stop)
 	if err != nil {
 		return nil, err
 	}
 	rep.RemovedTrees = treeExec.Removed
 	rep.ReclaimedBytes = treeExec.DeletedBytes
+	if treeExec.DeletedBytes > 0 {
+		rep.ReclaimedByClass[ClassImage] += treeExec.DeletedBytes
+	}
 	for _, s := range treeExec.Skipped {
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
-	exec, err := c.ExecutePrune(plan, grace, now(), stop)
+	restExec, err := c.ExecutePrune(&PrunePlan{Delete: restDels}, grace, now(), stop)
 	if err != nil {
 		return nil, err
 	}
+	exec := &ExecuteReport{}
+	for _, e := range []*ExecuteReport{artExec, restExec} {
+		exec.Removed = append(exec.Removed, e.Removed...)
+		exec.Deleted += e.Deleted
+		exec.DeletedBytes += e.DeletedBytes
+		exec.Skipped = append(exec.Skipped, e.Skipped...)
+	}
 	rep.Removed = exec.Removed
 	rep.ReclaimedBytes += exec.DeletedBytes
+	classBytes(plan.Delete, exec.Removed, exec.DeletedBytes, classes, rep.ReclaimedByClass)
 	for _, s := range exec.Skipped {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: s.Digest, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
+	}
+	if cerr == nil {
+		if err := c.sweepReleased(classes); err != nil {
+			log.Warn("image reclaim: sweep of released artifact records failed; they are kept", "err", err)
+		}
 	}
 
 	after, ferr := free(c.root)

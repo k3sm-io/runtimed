@@ -349,9 +349,12 @@ type artifactRecordRoot struct {
 // A released copy is NEVER a reachability root: nothing in Cache.Roots reads
 // this directory, so keeping one makes no blob less collectable. It exists so
 // that once a record is gone, and its blobs are reclaim-eligible, the store
-// still knows which artifactType they belonged to and when they were released,
-// which is what lets StoreBytesByClass class them. Each copy is named by the
-// sha256 of its bytes, so releasing the same record twice refreshes one file.
+// still knows which artifactType they belonged to and when they were released:
+// that is what lets reclaim evict them before unreferenced images, oldest
+// release first, and lets StoreBytesByClass class them. Each copy is named by
+// the sha256 of its bytes, so releasing the same record twice refreshes one
+// file. The reclaim pass removes a copy once every blob it names is gone or is
+// named by a live record (sweepReleasedArtifacts).
 const ArtifactReleasedIndexSubdir = "artifact-released"
 
 // releasedName is the file name of the released copy of record.
@@ -430,6 +433,37 @@ func (x *FileIndex) releasedArtifacts() ([]releasedArtifact, error) {
 		out = append(out, releasedArtifact{name: name, root: r, releasedAt: fi.ModTime()})
 	}
 	return out, nil
+}
+
+// sweepReleasedArtifacts removes the released copies named in names. The
+// reclaim pass names the copies whose blobs are all gone from the store or
+// named by a live record, so they class nothing any more. A copy released
+// again between that read and this removal loses its hint, which costs only
+// eviction order. A copy that cannot be removed is left for the next pass.
+func (x *FileIndex) sweepReleasedArtifacts(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	root, err := x.open()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	sub, err := x.openSubdir(root, ArtifactReleasedIndexSubdir, false)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer sub.Close()
+	var errs []error
+	for _, name := range names {
+		if err := sub.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove released artifact record %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // DecodeArtifactRoot returns the blobs an artifact record names, as a
