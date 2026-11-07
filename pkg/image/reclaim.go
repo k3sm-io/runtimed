@@ -349,6 +349,14 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		return nil, fmt.Errorf("%w: %v", ErrFreeSpaceUnknown, err)
 	}
 	rep := &ReclaimReport{DryRun: cfg.DryRun, FreeBefore: before, FreeAfter: before}
+	// The released artifact record copies are bounded on EVERY pass, triggered
+	// or not, so an idle node's index stays bounded too. They are hints, never
+	// roots, so a failure here costs eviction order and stops nothing.
+	if !cfg.DryRun {
+		if err := (&FileIndex{dir: c.IndexRoot()}).BoundReleasedArtifacts(); err != nil {
+			log.Warn("image reclaim: bound of released artifact records failed", "err", err)
+		}
+	}
 	if !cfg.Force && before >= high {
 		rep.ReachedTarget = before >= target
 		return rep, nil

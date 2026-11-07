@@ -26,7 +26,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -93,6 +96,16 @@ func (x *FileIndex) PutArtifactRecord(ctx context.Context, key string, record []
 		return err
 	}
 	defer sub.Close()
+	if fi, err := sub.Lstat(name); err == nil && fi.Mode().IsRegular() && fi.Size() <= MaxArtifactRecordBytes {
+		x.keepReplaced(root, sub, name, record)
+	}
+	return x.commit(sub, name, record)
+}
+
+// keepReplaced keeps a released copy of the record under name in sub when it
+// differs from record, the bytes about to replace it. The caller has checked
+// the file is regular and within its cap.
+func (x *FileIndex) keepReplaced(root, sub *os.Root, name string, record []byte) {
 	if prev, err := readAnchored(sub, name); err == nil && !bytes.Equal(prev, record) && int64(len(prev)) <= MaxArtifactRecordBytes {
 		// A replaced record keeps its artifactType for the blobs only it named.
 		// The copy is an eviction-order hint and never a root, so failing to
@@ -100,7 +113,6 @@ func (x *FileIndex) PutArtifactRecord(ctx context.Context, key string, record []
 		// classed as unattributed instead.
 		_ = x.keepReleased(root, prev)
 	}
-	return x.commit(sub, name, record)
 }
 
 // ArtifactRecord returns the record stored under key, ok=false when there is
@@ -355,7 +367,43 @@ type artifactRecordRoot struct {
 // the sha256 of its bytes, so releasing the same record twice refreshes one
 // file. The reclaim pass removes a copy once every blob it names is gone or is
 // named by a live record (sweepReleasedArtifacts).
+//
+// The directory is bounded (boundReleased): at most MaxReleasedArtifacts
+// copies and MaxReleasedArtifactBytes in total, the oldest dropped first, and
+// no file that is not a decodable copy under its own name. Losing a copy only
+// costs eviction order, so the bound is enforced by dropping, never by
+// refusing a release.
 const ArtifactReleasedIndexSubdir = "artifact-released"
+
+// MaxReleasedArtifacts and MaxReleasedArtifactBytes bound the released
+// copies kept (see ArtifactReleasedIndexSubdir). releasedTempMaxAge is how old
+// a commit temp in that directory must be before a sweep takes it for a crash
+// leftover rather than a commit in flight.
+const (
+	MaxReleasedArtifacts     = 256
+	MaxReleasedArtifactBytes = 64 << 20
+	releasedTempMaxAge       = time.Hour
+)
+
+// releasedMu serializes every bound sweep of a released directory in this
+// process, across FileIndex values (the cache builds its own for the GC). A
+// removal that still races a release in another process only loses a hint.
+var releasedMu sync.Mutex
+
+// validReleasedName reports whether name is <64 lowercase hex>.json, the only
+// name keepReleased writes.
+func validReleasedName(name string) bool {
+	h, ok := strings.CutSuffix(name, ".json")
+	if !ok || len(h) != 64 {
+		return false
+	}
+	for _, r := range h {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // releasedName is the file name of the released copy of record.
 func releasedName(record []byte) string {
@@ -371,7 +419,13 @@ func (x *FileIndex) keepReleased(root *os.Root, record []byte) error {
 		return err
 	}
 	defer sub.Close()
-	return x.commit(sub, releasedName(record), record)
+	if err := x.commit(sub, releasedName(record), record); err != nil {
+		return err
+	}
+	// The release path bounds by name, size and count only; decoding every
+	// copy on each pod deletion would cost up to the byte cap per release. The
+	// reclaim pass's sweep (BoundReleasedArtifacts) decodes.
+	return boundReleased(sub, MaxReleasedArtifacts, MaxReleasedArtifactBytes, time.Now(), false)
 }
 
 // releasedArtifact is one released copy as the classifier reads it.
@@ -381,12 +435,32 @@ type releasedArtifact struct {
 	releasedAt time.Time
 }
 
-// releasedArtifacts returns every released copy that decodes, with its
-// release time (the copy's mtime). It is advisory input to accounting and
-// eviction order, so a copy that cannot be read or decoded is skipped rather
-// than failing the caller; only a released directory that cannot be listed
-// is an error. An absent index or directory is the empty list.
+// releasedArtifacts returns every released copy that decodes under its own
+// name, with its release time (the copy's mtime). It is advisory input to
+// accounting and eviction order, so a file that is not such a copy is skipped
+// (boundReleased removes it) rather than failing the caller; only a released
+// directory that cannot be opened or listed is an error. An absent index or
+// directory is the empty list.
 func (x *FileIndex) releasedArtifacts() ([]releasedArtifact, error) {
+	sub, err := x.openReleased()
+	if sub == nil || err != nil {
+		return nil, err
+	}
+	defer sub.Close()
+	copies, _, err := scanReleased(sub, time.Now(), true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]releasedArtifact, 0, len(copies))
+	for _, rc := range copies {
+		out = append(out, rc.releasedArtifact)
+	}
+	return out, nil
+}
+
+// openReleased opens the released directory, nil with no error when it or the
+// index is absent.
+func (x *FileIndex) openReleased() (*os.Root, error) {
 	root, err := x.open()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -402,37 +476,112 @@ func (x *FileIndex) releasedArtifacts() ([]releasedArtifact, error) {
 		}
 		return nil, err
 	}
-	defer sub.Close()
+	return sub, nil
+}
+
+// scannedCopy is a released copy with its size, for the bound.
+type scannedCopy struct {
+	releasedArtifact
+	size int64
+}
+
+// scanReleased reads the released directory sub. It returns the copies that
+// decode under their own name, and the names of the files that should not be
+// there: a name keepReleased never writes, a non-regular or over-cap file, a
+// copy that does not decode as a record (DecodeArtifactRoot, bounded), and a
+// commit temp older than releasedTempMaxAge at now. A younger temp may be a
+// commit in flight and is neither. With decode unset nothing is read or
+// decoded: every well-named regular file within the cap counts as a copy with
+// a zero root, which is enough to bound the directory.
+func scanReleased(sub *os.Root, now time.Time, decode bool) (copies []scannedCopy, junk []string, err error) {
 	dir, err := sub.Open(".")
 	if err != nil {
-		return nil, fmt.Errorf("open released artifact records: %w", err)
+		return nil, nil, fmt.Errorf("open released artifact records: %w", err)
 	}
 	entries, err := dir.ReadDir(-1)
 	dir.Close()
 	if err != nil {
-		return nil, fmt.Errorf("read released artifact records: %w", err)
+		return nil, nil, fmt.Errorf("read released artifact records: %w", err)
 	}
-	var out []releasedArtifact
 	for _, d := range entries {
 		name := d.Name()
-		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") || !d.Type().IsRegular() {
+		fi, err := sub.Lstat(name)
+		if err != nil {
+			continue // removed since the read
+		}
+		if strings.HasPrefix(name, ".index-") {
+			if fi.Mode().IsRegular() && now.Sub(fi.ModTime()) > releasedTempMaxAge {
+				junk = append(junk, name)
+			}
 			continue
 		}
-		fi, err := sub.Lstat(name)
-		if err != nil || !fi.Mode().IsRegular() || fi.Size() > MaxArtifactRecordBytes {
+		if !validReleasedName(name) || !fi.Mode().IsRegular() || fi.Size() > MaxArtifactRecordBytes {
+			junk = append(junk, name)
+			continue
+		}
+		var r artifactRecordRoot
+		if !decode {
+			copies = append(copies, scannedCopy{releasedArtifact{name: name, releasedAt: fi.ModTime()}, fi.Size()})
 			continue
 		}
 		buf, err := readAnchored(sub, name)
 		if err != nil {
 			continue
 		}
-		var r artifactRecordRoot
-		if json.Unmarshal(buf, &r) != nil {
+		if decodeRecordRoot(buf, &r) != nil {
+			junk = append(junk, name)
 			continue
 		}
-		out = append(out, releasedArtifact{name: name, root: r, releasedAt: fi.ModTime()})
+		copies = append(copies, scannedCopy{releasedArtifact{name: name, root: r, releasedAt: fi.ModTime()}, fi.Size()})
 	}
-	return out, nil
+	return copies, junk, nil
+}
+
+// boundReleased removes from the released directory sub every file
+// scanReleased calls junk (decoding each copy when decode is set), then the
+// oldest copies beyond maxCount copies or maxBytes in total. It never
+// recurses: a directory planted there stays, and its failed removal is
+// reported.
+func boundReleased(sub *os.Root, maxCount int, maxBytes int64, now time.Time, decode bool) error {
+	releasedMu.Lock()
+	defer releasedMu.Unlock()
+	copies, junk, err := scanReleased(sub, now, decode)
+	if err != nil {
+		return err
+	}
+	sort.Slice(copies, func(i, j int) bool {
+		if !copies[i].releasedAt.Equal(copies[j].releasedAt) {
+			return copies[i].releasedAt.After(copies[j].releasedAt)
+		}
+		return copies[i].name < copies[j].name
+	})
+	var total int64
+	for i, rc := range copies {
+		if i >= maxCount || total+rc.size > maxBytes {
+			junk = append(junk, rc.name)
+			continue
+		}
+		total += rc.size
+	}
+	var errs []error
+	for _, name := range junk {
+		if err := sub.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove released artifact record %s: %w", QuoteBounded(name, 256), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// BoundReleasedArtifacts applies the released directory's bound
+// (boundReleased) with the package limits. The reclaim pass runs it on every
+// pass, triggered or not, so the directory stays bounded on an idle node too.
+func (x *FileIndex) BoundReleasedArtifacts() error {
+	sub, err := x.openReleased()
+	if sub == nil || err != nil {
+		return err
+	}
+	defer sub.Close()
+	return boundReleased(sub, MaxReleasedArtifacts, MaxReleasedArtifactBytes, time.Now(), true)
 }
 
 // sweepReleasedArtifacts removes the released copies named in names. The
@@ -444,21 +593,18 @@ func (x *FileIndex) sweepReleasedArtifacts(names []string) error {
 	if len(names) == 0 {
 		return nil
 	}
-	root, err := x.open()
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	sub, err := x.openSubdir(root, ArtifactReleasedIndexSubdir, false)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	sub, err := x.openReleased()
+	if sub == nil || err != nil {
 		return err
 	}
 	defer sub.Close()
+	releasedMu.Lock()
+	defer releasedMu.Unlock()
 	var errs []error
 	for _, name := range names {
+		if !validReleasedName(name) {
+			continue
+		}
 		if err := sub.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("remove released artifact record %s: %w", name, err))
 		}
@@ -513,6 +659,13 @@ func (x *FileIndex) openSubdir(root *os.Root, name string, create bool) (*os.Roo
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
 		return nil, fmt.Errorf("%w: %s/%s is writable by group or other (mode %v)", ErrIndexNotOwned, x.dir, name, fi.Mode().Perm())
+	}
+	// The owner check FileIndex.open makes, for the same reason and with the
+	// same best-effort caveat where stat carries no uid.
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if euid := os.Geteuid(); int(st.Uid) != euid {
+			return nil, fmt.Errorf("%w: %s/%s is owned by uid %d, not %d", ErrIndexNotOwned, x.dir, name, st.Uid, euid)
+		}
 	}
 	sub, err := root.OpenRoot(name)
 	if err != nil {
