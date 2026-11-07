@@ -42,6 +42,15 @@ func TestRecordDecodesAsGCRoot(t *testing.T) {
 	if root.Config != cfg || !slices.Equal(root.Layers, layers) || root.Reference != testRef {
 		t.Fatalf("root = %+v; want config %s, layers %v", root, cfg, layers)
 	}
+	// pkg/image classes a record's blobs by this field (StoreBytesByClass and
+	// the reclaim order); a renamed tag would class every artifact as untyped.
+	var fields map[string]any
+	if err := json.Unmarshal(buf, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["artifactType"] != "t" {
+		t.Fatalf("record fields = %v; want artifactType %q", fields, "t")
+	}
 }
 
 func make64(c byte) []byte {

@@ -724,6 +724,7 @@ func (r *Runtime) RunImageGC(ctx context.Context, interval time.Duration, cfg im
 			if rep.Triggered {
 				r.log.Info("image gc reclaimed unreferenced image content",
 					"removed", len(rep.Removed), "bytes", rep.ReclaimedBytes,
+					"bytes_by_class", rep.ReclaimedByClass,
 					"free_before", rep.FreeBefore, "free_after", rep.FreeAfter,
 					"reached_target", rep.ReachedTarget)
 			}
