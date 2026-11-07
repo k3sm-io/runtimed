@@ -288,3 +288,265 @@ func TestDataRootRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		})
 	}
 }
+
+// TestStateDirDeniedUnderACustomLeaf pins the deny to the role's real state dir.
+// The DataRoot denies name only <data root>/server and <data root>/agent, so a
+// --work-dir with another leaf, <data root>/cp, kept its CA keys, kine database
+// and node password outside every deny. Each row lists the trees that must be
+// denied exactly once per firmlink form, and the profile must otherwise match the
+// one rendered without the field plus those lines.
+//
+// The paths are literals, not built from ServerSubdir and AgentSubdir, so a
+// dropped or renamed leaf fails here rather than moving with it.
+func TestStateDirDeniedUnderACustomLeaf(t *testing.T) {
+	const (
+		workDir  = "/opt/k3sm-pods"
+		dataRoot = "/opt/k3sm-data"
+	)
+	sp := func() *runtimev1.SandboxProfile {
+		return &runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"}
+	}
+	render := func(t *testing.T, p Posture) string {
+		t.Helper()
+		out, err := Generate(sp(), GenerateOptions{Posture: p})
+		if err != nil {
+			t.Fatalf("Generate(%+v): %v", p, err)
+		}
+		return out
+	}
+	for name, tc := range map[string]struct {
+		dataRoot, stateDir string
+		// once lists every subpath form that must appear exactly once.
+		once []string
+		// sameAsUnset is set when the field must not change the profile at all.
+		sameAsUnset bool
+	}{
+		"custom leaf under the data root": {
+			dataRoot: dataRoot, stateDir: dataRoot + "/cp",
+			once: []string{dataRoot + "/cp", dataRoot + "/server", dataRoot + "/agent"},
+		},
+		"custom leaf under a firmlinked data root": {
+			dataRoot: "/var/k3sm-data", stateDir: "/var/k3sm-data/cp",
+			once: []string{"/var/k3sm-data/cp", "/private/var/k3sm-data/cp"},
+		},
+		"default server leaf adds no duplicate": {
+			dataRoot: dataRoot, stateDir: dataRoot + "/server",
+			once: []string{dataRoot + "/server", dataRoot + "/agent"}, sameAsUnset: true,
+		},
+		"default agent leaf adds no duplicate": {
+			dataRoot: dataRoot, stateDir: dataRoot + "/agent",
+			once: []string{dataRoot + "/server", dataRoot + "/agent"}, sameAsUnset: true,
+		},
+		"default leaf under the work-dir data root adds no duplicate": {
+			dataRoot: workDir, stateDir: workDir + "/server",
+			once: []string{workDir + "/server", workDir + "/agent"}, sameAsUnset: true,
+		},
+		"private form of a denied leaf adds no duplicate": {
+			dataRoot: "/var/k3sm-data", stateDir: "/private/var/k3sm-data/agent",
+			once: []string{"/var/k3sm-data/agent", "/private/var/k3sm-data/agent"}, sameAsUnset: true,
+		},
+		"default leaf without a data root is still denied": {
+			stateDir: dataRoot + "/server",
+			once:     []string{dataRoot + "/server"},
+		},
+		"state dir outside the data root is its own tree": {
+			dataRoot: dataRoot, stateDir: "/srv/k3sm-state",
+			once: []string{"/srv/k3sm-state", dataRoot + "/server", dataRoot + "/agent"},
+		},
+		"empty keeps the data root profile": {
+			dataRoot: dataRoot,
+			once:     []string{dataRoot + "/server", dataRoot + "/agent"}, sameAsUnset: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			unset := render(t, Posture{WorkDir: workDir, DataRoot: tc.dataRoot})
+			out := render(t, Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir})
+			for _, form := range tc.once {
+				if n := strings.Count(out, "(subpath \""+form+"\")\n"); n != 1 {
+					t.Errorf("subpath %q appears %d times, want 1:\n%s", form, n, out)
+				}
+			}
+			if tc.sameAsUnset && out != unset {
+				t.Errorf("the state dir changed the profile, which would drift a re-attached pod:\n--- unset ---\n%s\n--- set ---\n%s", unset, out)
+			}
+			if !tc.sameAsUnset {
+				// The only difference is the state dir's own deny lines.
+				var extra strings.Builder
+				writeFirmlinkSubpaths(&extra, []string{tc.stateDir})
+				if got := strings.Replace(out, extra.String(), "", 1); got != unset {
+					t.Errorf("the state dir changed more than its own deny:\n--- unset ---\n%s\n--- set ---\n%s", unset, out)
+				}
+			}
+			for _, p := range []string{tc.stateDir, tc.stateDir + "/tls/server-ca.key"} {
+				if tc.stateDir == "" {
+					continue
+				}
+				opts := GenerateOptions{
+					Posture:   Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir},
+					ReadPaths: []string{p},
+				}
+				if _, err := Generate(sp(), opts); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("Generate with read path %q: err = %v, want ErrProtectedPath", p, err)
+				}
+			}
+		})
+	}
+
+	t.Run("DataRootDenyTrees is the rendered list", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			dataRoot, stateDir string
+			want               []string
+		}{
+			"custom leaf":   {dataRoot, dataRoot + "/cp", []string{dataRoot + "/server", dataRoot + "/agent", dataRoot + "/cp"}},
+			"server leaf":   {dataRoot, dataRoot + "/server", []string{dataRoot + "/server", dataRoot + "/agent"}},
+			"agent leaf":    {dataRoot, dataRoot + "/agent", []string{dataRoot + "/server", dataRoot + "/agent"}},
+			"outside":       {dataRoot, "/srv/state", []string{dataRoot + "/server", dataRoot + "/agent", "/srv/state"}},
+			"no data root":  {"", "/srv/state", []string{"/srv/state"}},
+			"empty":         {dataRoot, "", []string{dataRoot + "/server", dataRoot + "/agent"}},
+			"both empty":    {"", "", nil},
+			"private alias": {"/var/d", "/private/var/d/server", []string{"/var/d/server", "/var/d/agent", "/private/var/d/server"}},
+		} {
+			t.Run(name, func(t *testing.T) {
+				got := DataRootDenyTrees(tc.dataRoot, tc.stateDir)
+				if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+					t.Errorf("DataRootDenyTrees(%q, %q) = %q, want %q", tc.dataRoot, tc.stateDir, got, tc.want)
+				}
+			})
+		}
+	})
+}
+
+// TestStateDirRefusesWhatCannotHoldTheDeny pins the fail-closed half: a state
+// dir the deny could not honestly be written from, a non-canonical spelling
+// included, fails the whole profile, exactly as a data root does, and the startup
+// check gives the same answer.
+func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
+	const workDir = "/opt/k3sm-pods"
+	generate := func(workDir, dir string) (string, error) {
+		return Generate(&runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"},
+			GenerateOptions{Posture: Posture{WorkDir: workDir, DataRoot: "/opt/k3sm-data", StateDir: dir}})
+	}
+	for name, tc := range map[string]struct{ workDir, dir string }{
+		"relative":                 {workDir, "cp"},
+		"parent segment":           {workDir, "/opt/k3sm-data/x/../cp"},
+		"parent segment to leaf":   {workDir, "/opt/k3sm-data/cp/.."},
+		"trailing slash":           {workDir, "/opt/k3sm-data/cp/"},
+		"doubled separator":        {workDir, "/opt/k3sm-data//cp"},
+		"filesystem root":          {workDir, "/"},
+		"sbpl breakout":            {workDir, `/opt/x")) (allow file-write* (subpath "/`},
+		"newline":                  {workDir, "/opt/c\np"},
+		"the pods root":            {workDir, workDir + "/pods"},
+		"under the pods root":      {workDir, workDir + "/pods/cp"},
+		"the work-dir":             {workDir, workDir},
+		"above the work-dir":       {workDir, "/opt"},
+		"work-dir under state dir": {"/opt/k3sm-data/cp/pods-root", "/opt/k3sm-data/cp"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidStateDir) {
+				t.Errorf("Generate(%q) err = %v, want ErrInvalidStateDir; profile:\n%s", tc.dir, err, out)
+			} else if out != "" {
+				t.Errorf("Generate(%q) returned a profile beside its error:\n%s", tc.dir, out)
+			}
+			if err := ValidateStateDir(tc.dir, tc.workDir); !errors.Is(err, ErrInvalidStateDir) {
+				t.Errorf("ValidateStateDir(%q) = %v, want ErrInvalidStateDir", tc.dir, err)
+			}
+		})
+	}
+	for name, dir := range map[string]string{
+		"empty":           "",
+		"custom leaf":     "/opt/k3sm-data/cp",
+		"default leaf":    "/opt/k3sm-data/server",
+		"outside":         "/srv/k3sm-state",
+		"sibling of pods": workDir + "/podsx",
+		"private form":    "/private/var/k3sm-data/cp",
+	} {
+		t.Run("accepted/"+name, func(t *testing.T) {
+			if _, err := generate(workDir, dir); err != nil {
+				t.Errorf("Generate(%q): %v", dir, err)
+			}
+			if err := ValidateStateDir(dir, workDir); err != nil {
+				t.Errorf("ValidateStateDir(%q): %v", dir, err)
+			}
+		})
+	}
+}
+
+// TestStateDirEnforcedUnderACustomLeaf is the kernel's verdict on the custom-leaf
+// deny, through the sandbox-exec the DataRoot enforced cases use: with DataRoot
+// alone a secret in <data root>/cp is readable through an ancestor grant (the
+// defect), and with StateDir set it is neither readable nor writable.
+func TestStateDirEnforcedUnderACustomLeaf(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not present")
+	}
+	base, err := os.MkdirTemp("/tmp", "k3sm-sd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	// Written in the resolved /private form, the spelling the k3sm caller's
+	// resolved-path check hands over; the read below also goes through /tmp.
+	base = "/private" + base
+	pods, data := filepath.Join(base, "pods-root"), filepath.Join(base, "data")
+	stateDir := filepath.Join(data, "cp")
+	secret, sibling := filepath.Join(stateDir, "server-ca.key"), filepath.Join(data, "sibling")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const original = "private-key\n"
+	for _, f := range []string{secret, sibling} {
+		if err := os.WriteFile(f, []byte(original), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(posture Posture, script, target string) ([]byte, string, error) {
+		t.Helper()
+		prof, err := Generate(&runtimev1.SandboxProfile{
+			DataVolumePath:  filepath.Join(pods, "pods", "p1", "rootfs"),
+			ExtraReadPaths:  []string{data},
+			ExtraWritePaths: []string{data},
+		}, GenerateOptions{Posture: posture})
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		sb := filepath.Join(t.TempDir(), "statedir.sb")
+		if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, "/bin/sh", "-c", script, "sh", target).Output()
+		return out, prof, err
+	}
+	const (
+		writeScript = `printf forged > "$1"`
+		readScript  = `IFS= read -r line < "$1" && printf '%s' "$line"`
+	)
+	rootOnly := Posture{WorkDir: pods, DataRoot: data}
+	withState := Posture{WorkDir: pods, DataRoot: data, StateDir: stateDir}
+
+	// The controls: the grant reaches the sibling with the field set, and the
+	// secret itself with DataRoot alone, so a refusal below is this deny.
+	if out, prof, err := run(withState, readScript, sibling); err != nil || string(out) != "private-key" {
+		t.Fatalf("the ancestor grant did not read %s, so the deny is unproven: %v\n%s\n--- profile ---\n%s", sibling, err, out, prof)
+	}
+	if out, prof, err := run(rootOnly, readScript, secret); err != nil || string(out) != "private-key" {
+		t.Fatalf("with DataRoot alone the custom-leaf secret was not readable, so this case proves nothing: %v\n%s\n--- profile ---\n%s", err, out, prof)
+	}
+
+	for _, target := range []string{secret, strings.TrimPrefix(secret, "/private")} {
+		if out, prof, err := run(withState, readScript, target); err == nil || strings.Contains(string(out), "private-key") {
+			t.Errorf("read of %s succeeded under the generated profile: %q\n--- profile ---\n%s", target, out, prof)
+		}
+	}
+	newFile := filepath.Join(stateDir, "new.key")
+	for _, target := range []string{secret, newFile} {
+		if out, prof, err := run(withState, writeScript, target); err == nil {
+			t.Errorf("write to %s succeeded under the generated profile: %s\n--- profile ---\n%s", target, out, prof)
+		}
+	}
+	if got, err := os.ReadFile(secret); err != nil || string(got) != original {
+		t.Errorf("secret after the attempts = %q, %v; want %q", got, err, original)
+	}
+	if _, err := os.Stat(newFile); err == nil {
+		t.Errorf("a new file landed in %s", stateDir)
+	}
+}

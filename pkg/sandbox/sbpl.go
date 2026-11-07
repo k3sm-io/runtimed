@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,7 +73,7 @@ const (
 	// is this work-dir only when the runtime root is left at its default;
 	// Posture.DataRoot names the real location. residual: without that field, on a
 	// node started with a different root this deny guards a directory nothing
-	// writes.
+	// writes. Posture.StateDir names a role state dir with another leaf.
 	ServerSubdir = "server"
 	// AgentSubdir is the node-agent state dir (<WorkDir>/agent): the node
 	// password and the agent kubeconfig. Same data-root rule, and same residual
@@ -236,6 +237,12 @@ var ErrInvalidStatusRecordDir = errors.New("sbpl: invalid status record dir")
 // An empty value is not this error (see Posture.DataRoot).
 var ErrInvalidDataRoot = errors.New("sbpl: invalid data root")
 
+// ErrInvalidStateDir reports a set Posture.StateDir that cannot hold its deny:
+// the same refusals as ErrInvalidStatusRecordDir, plus a pods root at or under
+// the state dir, where the deny would swallow the runtime's own tree. An empty
+// value is not this error (see Posture.StateDir).
+var ErrInvalidStateDir = errors.New("sbpl: invalid state dir")
+
 // ErrInvalidArtifactView is returned by Generate when a
 // GenerateOptions.ArtifactViewPaths entry is not exactly one view directory,
 // <WorkDir>/artifacts/<manifest-hex>/<path-set-key>: never the views root, a
@@ -362,6 +369,30 @@ type Posture struct {
 	// the whole profile rather than drop a deny. The caller passes a path with no
 	// symlink but the /var, /tmp and /etc firmlinks, in it or in either child.
 	DataRoot string
+	// StateDir is the role's real state directory: the k3sm --work-dir itself,
+	// which holds the CA keys, the kine database and the node password. The
+	// DataRoot denies name only the fixed children server and agent, so a work dir
+	// with any other leaf, <data root>/cp for example, keeps its secrets outside
+	// every deny. This field names that tree.
+	//
+	// When set, Generate denies it read+write in the protected tier, in both
+	// firmlink forms, and validateExtraPaths refuses any caller-supplied path at
+	// or under it, IN ADDITION to every other deny. A value that renders exactly
+	// the forms of a tree already denied (one of the <WorkDir> or DataRoot
+	// children, the default server and agent leaves) adds no line, so a node whose
+	// work dir has a default leaf keeps its profile byte for byte. A value outside
+	// the data root is denied as its own tree all the same.
+	//
+	// Empty adds nothing: the profile is the one the node had before this field
+	// existed.
+	//
+	// It carries the StatusRecordDir requirements, and additionally the pods root
+	// must not be at or under it (ErrInvalidStateDir), because the deny would then
+	// swallow the runtime's own tree. Generate refuses the whole profile rather
+	// than drop the deny. As for DataRoot the check is lexical: the caller passes
+	// a path with no symlink but the /var, /tmp and /etc firmlinks in it, and
+	// DataRootDenyTrees is the list it checks the resolved paths of.
+	StateDir string
 }
 
 // GenerateOptions carries the runtimed-internal SBPL inputs that are not part of
@@ -524,6 +555,7 @@ type GenerateOptions struct {
 // ErrXcodeToolchainDir if xcode_toolchain_dir is not a usable DEVELOPER_DIR,
 // ErrInvalidStatusRecordDir for a set status record dir that cannot hold its deny,
 // ErrInvalidDataRoot for a set data root that cannot hold its denies,
+// ErrInvalidStateDir for a set state dir that cannot hold its deny,
 // and the work-dir errors above for a bad Posture; otherwise the rendered profile
 // is always well-formed and passes Validate.
 func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error) {
@@ -1018,20 +1050,34 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 		workDirDenyRoots = append(workDirDenyRoots, statusDir)
 	}
 	// The control-plane secrets' real location, under the same two rules: the
-	// <WorkDir> denies above stay, and the same root adds nothing.
+	// <WorkDir> denies above stay, and a tree already denied adds nothing. That
+	// covers a data root equal to <WorkDir> and a state dir with a default leaf,
+	// so both render the profile the node had before (a changed profile refuses
+	// every re-attach as drift). The list is DataRootDenyTrees, the one the
+	// caller's resolved-path check walks.
 	dataRoot, err := resolveDataRoot(p.DataRoot, podsRoot)
 	if err != nil {
 		return "", nil, nil, err
 	}
-	if dataRoot != "" && dataRoot != workDir {
-		for _, sub := range DataRootDenySubdirs() {
-			workDirDenyRoots = append(workDirDenyRoots, filepath.Join(dataRoot, sub))
+	stateDir, err := resolveStateDir(p.StateDir, podsRoot)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	var unrendered []string
+	for _, tree := range DataRootDenyTrees(dataRoot, stateDir) {
+		if !rendersDenied(workDirDenyRoots, tree) {
+			workDirDenyRoots = append(workDirDenyRoots, tree)
+		} else if !slices.Contains(workDirDenyRoots, tree) {
+			// Another spelling of a rendered tree (its /private form): no new
+			// line, since the deny already matches it, but validateExtraPaths
+			// compares strings, so it still joins the protected set.
+			unrendered = append(unrendered, tree)
 		}
 	}
 	// Pin every work-dir root into the protected deny-set so a caller's extra
 	// path can never reach a sibling pod, the reap store, or a control-plane
 	// tree, then keep the fixed system subtrees.
-	protectedPrefixes = append(append([]string{}, workDirDenyRoots...), systemProtectedPrefixes...)
+	protectedPrefixes = append(append(append([]string{}, workDirDenyRoots...), unrendered...), systemProtectedPrefixes...)
 	return podsRoot, workDirDenyRoots, protectedPrefixes, nil
 }
 
@@ -1081,6 +1127,70 @@ func ValidateStatusRecordDir(dir, workDir string) error {
 // mutate the deny-set by holding on to it.
 func DataRootDenySubdirs() []string {
 	return []string{ServerSubdir, AgentSubdir}
+}
+
+// DataRootDenyTrees returns the absolute trees Posture.DataRoot and
+// Posture.StateDir deny: the DataRootDenySubdirs children of dataRoot, then
+// stateDir unless it is one of them. Either argument may be empty, and adds
+// nothing then. It is the list Generate denies for the two fields (a member whose
+// firmlink forms are already rendered adds no line), so the caller's check that
+// each deny can match (each path is its own resolved path) walks exactly what the
+// profile denies. The values are joined
+// lexically and not validated here: ValidateDataRoot and ValidateStateDir do
+// that. The returned slice is freshly allocated.
+func DataRootDenyTrees(dataRoot, stateDir string) []string {
+	var trees []string
+	if dataRoot != "" {
+		for _, sub := range DataRootDenySubdirs() {
+			trees = append(trees, filepath.Join(dataRoot, sub))
+		}
+	}
+	if stateDir != "" && !slices.Contains(trees, stateDir) {
+		trees = append(trees, stateDir)
+	}
+	return trees
+}
+
+// rendersDenied reports whether every firmlink form of p is already a form of a
+// member of roots, so appending p would only repeat (subpath ...) lines.
+func rendersDenied(roots []string, p string) bool {
+	have := make(map[string]bool)
+	for _, r := range roots {
+		for _, form := range firmlinkForms(r) {
+			have[form] = true
+		}
+	}
+	for _, form := range firmlinkForms(p) {
+		if !have[form] {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateStateDir reports whether dir can be a Posture.StateDir on a node with
+// this runtime work-dir (empty workDir means DefaultWorkDir). It is exported so
+// the daemon can refuse a bad value once at startup rather than once per pod: the
+// check is the one Generate applies, asked early.
+func ValidateStateDir(dir, workDir string) error {
+	if workDir == "" {
+		workDir = DefaultWorkDir
+	}
+	_, err := resolveStateDir(dir, filepath.Join(workDir, "pods"))
+	return err
+}
+
+// resolveStateDir validates a Posture.StateDir. Empty is not an error and returns
+// "": the field's documented unset state, which adds no deny. A pods root at or
+// under the state dir is refused for the reason resolveDataRoot gives.
+func resolveStateDir(dir, podsRoot string) (string, error) {
+	if err := checkDenyDir(dir, podsRoot, ErrInvalidStateDir); err != nil {
+		return "", err
+	}
+	if dir != "" && isUnder(podsRoot, dir) {
+		return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidStateDir, podsRoot, dir)
+	}
+	return dir, nil
 }
 
 // ValidateDataRoot reports whether dir can be a Posture.DataRoot on a node with
