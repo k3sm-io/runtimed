@@ -102,6 +102,9 @@ var (
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
+	// ErrGuestLayersMismatch reports a guest manifest whose layers or config
+	// are not the set PullGuestArtifact was told to expect.
+	ErrGuestLayersMismatch = errors.New("artifact: the guest manifest does not declare exactly the expected layers")
 )
 
 // BlobCommitter is the cache seam: *image.Cache satisfies it. CommitBlob is the
@@ -314,7 +317,11 @@ type blob struct {
 // It is the operator's pull: the record it writes is pinned (Record.PodOnly
 // false) and stays a root until it is removed (Views.Forget).
 func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
-	return p.pull(ctx, ref, cred, policy, paths, false)
+	allow, err := artifactv1.AllowSetFor(policy)
+	if err != nil {
+		return nil, err
+	}
+	return p.pull(ctx, ref, cred, allow, paths, false, 0, nil)
 }
 
 // PullForPod is PullArtifact for a pod's image volume. The record it writes is
@@ -322,14 +329,53 @@ func (p *Puller) PullArtifact(ctx context.Context, ref string, cred *image.Regis
 // no pod holds the reference any more (Views.ReleasePodOnly). It never unpins
 // an operator's record.
 func (p *Puller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string) (*Result, error) {
-	return p.pull(ctx, ref, cred, policy, paths, true)
-}
-
-func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, podOnly bool) (*Result, error) {
 	allow, err := artifactv1.AllowSetFor(policy)
 	if err != nil {
 		return nil, err
 	}
+	return p.pull(ctx, ref, cred, allow, paths, true, 0, nil)
+}
+
+// PullGuestArtifact is the internal entry point for the guest kernel and
+// initramfs: PullArtifact under artifactv1.GuestAllowSet, every layer. No
+// ArtifactPolicy selects that set, so neither the PullArtifact RPC nor a pod
+// image volume can reach it, and this entry point accepts nothing else.
+//
+// The record it writes is PodOnly: no pod ever holds a guest reference, so the
+// record is released by the next Views.ReleasePodOnly and its blobs become
+// collectable. The durable copy is the guest-artifacts cache, which the caller
+// fills while it holds Result.Lease.
+//
+// That lease is taken for GuestLeaseTTL, not the default: it must outlast the
+// pull, the caller's verification pass and its copy into the guest-artifacts
+// cache, because the lease is the only thing keeping the record-less blobs
+// from a reclaim pass until the copy is done.
+//
+// want is the exact layer set the caller's pin names, and is required. The
+// manifest is refused with ErrGuestLayersMismatch, before the first blob
+// request, unless its layers are exactly want (count, path, digest, and each
+// declared size within its MaxBytes) and its config is at most
+// MaxGuestConfigBytes. A hostile registry therefore cannot make a worker
+// download and cache anything but the pinned blobs, at their bounded sizes;
+// the bytes are still hashed on commit, and the caller verifies them again.
+func (p *Puller) PullGuestArtifact(ctx context.Context, ref string, cred *image.RegistryCredential, want []GuestLayer) (*Result, error) {
+	if err := checkGuestLayers(want); err != nil {
+		return nil, err
+	}
+	return p.pull(ctx, ref, cred, artifactv1.GuestAllowSet(), nil, true, GuestLeaseTTL, want)
+}
+
+// GuestLeaseTTL is the lease PullGuestArtifact holds on the guest blobs: four
+// times image.DefaultLeaseTTL, so a slow pull of the guest pair still leaves
+// its caller ample time to verify and install before the lease can expire. An
+// unreleased lease still self-heals, an hour later.
+const GuestLeaseTTL = time.Hour
+
+// pull is every entry point's body. leaseTTL is the lease on the pulled
+// blobs; zero means image.DefaultLeaseTTL. expect, when non-nil, is the exact
+// layer set the manifest must declare (matchGuestLayers), checked before any
+// lease or blob request.
+func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCredential, allow artifactv1.AllowSet, paths []string, podOnly bool, leaseTTL time.Duration, expect []GuestLayer) (*Result, error) {
 	if len(paths) > 0 {
 		if err := artifactv1.ValidatePathSet(paths); err != nil {
 			return nil, fmt.Errorf("requested paths: %w", err)
@@ -358,6 +404,11 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	typ, layers, layerPaths, err := checkManifest(m, allow)
 	if err != nil {
 		return nil, err
+	}
+	if expect != nil {
+		if err := matchGuestLayers(m.Config, layers, layerPaths, expect); err != nil {
+			return nil, err
+		}
 	}
 
 	// Select the requested subset, in manifest order.
@@ -399,7 +450,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	// The lease is taken over the whole set BEFORE the presence check, for the
 	// reason image.Lease gives: a cache hit writes nothing, so it is exactly the
 	// blob old enough for a reclaim pass to take.
-	lease := p.deps.Leases.AcquireLease(digests, 0)
+	lease := p.deps.Leases.AcquireLease(digests, leaseTTL)
 	ok := false
 	defer func() {
 		if !ok {

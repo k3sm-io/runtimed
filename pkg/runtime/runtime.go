@@ -356,6 +356,10 @@ type Runtime struct {
 	// artifacts serves Images.PullArtifact; nil when no cluster registry is
 	// configured.
 	artifacts ArtifactPuller
+	// guestPuller is artifacts as the concrete *artifact.Puller GuestClusterStore
+	// pulls through; nil when no cluster registry is configured or an injected
+	// ArtifactPuller is not one. Set once in New.
+	guestPuller *artifact.Puller
 	// artifactSem bounds concurrent PullArtifact RPCs
 	// (maxConcurrentArtifactPulls).
 	artifactSem chan struct{}
@@ -971,6 +975,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		}
 		artifacts = a
 	}
+	// A nil interface asserts to nil, which GuestClusterStore reports.
+	guestPuller, _ := artifacts.(*artifact.Puller)
 	// Built unconditionally, so the start-time reap of half-built views runs
 	// whether or not this node has a cluster registry. A refused views root
 	// disables views, loudly, and nothing else: the daemon still serves pods.
@@ -1158,6 +1164,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		signer:         signer,
 		credentials:    deps.Credentials,
 		artifacts:      artifacts,
+		guestPuller:    guestPuller,
 		artifactSem:    make(chan struct{}, maxConcurrentArtifactPulls),
 		views:          views,
 		viewsErr:       viewsErr,

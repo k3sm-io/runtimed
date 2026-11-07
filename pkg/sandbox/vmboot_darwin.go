@@ -76,11 +76,12 @@ func (b *VMBackend) CreateVM(ctx context.Context, spec VMSpec) error {
 		return e
 	}
 
-	if b.artifacts == nil {
+	locate := b.guestArtifactLocator()
+	if locate == nil {
 		return fail(VMBootArtifactsMissing, "",
 			fmt.Errorf("%w: no guest-artifact locator is wired on this node, so no vm pod can boot", ErrGuestArtifactsUnavailable))
 	}
-	art, err := b.artifacts()
+	art, err := locate()
 	if err != nil {
 		return fail(VMBootArtifactsMissing, "", fmt.Errorf("%w: %w", ErrGuestArtifactsUnavailable, err))
 	}
