@@ -298,3 +298,52 @@ func TestDataRootReachesTheProfile(t *testing.T) {
 		t.Errorf("New with a relative data root: err = %v, want ErrInvalidDataRoot", err)
 	}
 }
+
+// TestStateDirReachesTheProfile pins the hop from Config.StateDir to the compiled
+// profile, and New's refusal of a value the deny cannot be written from. The leaf
+// is a custom one, cp, which the DataRoot denies never name.
+func TestStateDirReachesTheProfile(t *testing.T) {
+	for name, tc := range map[string]struct {
+		dataRoot bool
+		leaf     string
+	}{
+		"custom leaf under the data root": {dataRoot: true, leaf: "node-data/cp"},
+		"custom leaf without a data root": {leaf: "node-data/cp"},
+		"outside the data root":           {dataRoot: true, leaf: "elsewhere/state"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			parent := filepath.Dir(root)
+			cfg := Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs"), StateDir: filepath.Join(parent, tc.leaf)}
+			if tc.dataRoot {
+				cfg.DataRoot = filepath.Join(parent, "node-data")
+			}
+			rt := newTestRuntimeCfg(t, cfg, Deps{})
+			profile, err := rt.boxProfile(hostBinBox(rt, "pod-state-dir"))
+			if err != nil {
+				t.Fatalf("boxProfile: %v", err)
+			}
+			if !strings.Contains(profile, "(subpath \""+cfg.StateDir+"\")") {
+				t.Errorf("Config.StateDir %q is not denied in the compiled profile:\n%s", cfg.StateDir, profile)
+			}
+		})
+	}
+
+	for name, stateDir := range map[string]func(root string) string{
+		"relative":            func(string) string { return "relative/cp" },
+		"parent segment":      func(root string) string { return filepath.Dir(root) + "/x/../cp" },
+		"trailing slash":      func(root string) string { return filepath.Dir(root) + "/cp/" },
+		"filesystem root":     func(string) string { return "/" },
+		"the runtime root":    func(root string) string { return root },
+		"under the pods root": func(root string) string { return filepath.Join(root, "pods", "cp") },
+	} {
+		t.Run("refused/"+name, func(t *testing.T) {
+			bad := Config{Root: t.TempDir()}
+			bad.PodLogsDir = filepath.Join(bad.Root, "podlogs")
+			bad.StateDir = stateDir(bad.Root)
+			if _, err := New(bad, testDeps(t, Deps{})); !errors.Is(err, sandbox.ErrInvalidStateDir) {
+				t.Errorf("New with state dir %q: err = %v, want ErrInvalidStateDir", bad.StateDir, err)
+			}
+		})
+	}
+}
