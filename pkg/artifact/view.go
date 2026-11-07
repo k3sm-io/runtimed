@@ -723,7 +723,7 @@ func manifestFiles(raw []byte, manifestDigest string) (map[string]string, error)
 		if err := checkDescriptor(fmt.Sprintf("layer %d", i), l); err != nil {
 			return nil, err
 		}
-		p, err := layerFilePath(i, l)
+		p, err := layerFilePath(&m, i)
 		if err != nil {
 			return nil, err
 		}
