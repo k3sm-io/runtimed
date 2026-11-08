@@ -124,16 +124,17 @@ func TestDeletePodGracefulStop(t *testing.T) {
 	t.Run("positive-grace-voluntary-exit-skips-sigkill", func(t *testing.T) {
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{Waiter: w})
-		rec := &recordingSignalGroup{}
+		// The container honours SIGTERM: it exits when signalled, so the reaper
+		// closes proc.Done() within the grace. DeletePod must observe the exit
+		// and not escalate to SIGKILL. (A container released before the delete
+		// has exited on its own and is never signalled at all.)
+		rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 		rt.signalGroup = rec.signal
 
 		box := hostBinBox(rt, "pod-gp")
 		box.TerminationGracePeriodSeconds = 30 // long grace from the PodBox
 		mustCreatePod(t, rt, box)
 
-		// The container exits "voluntarily": release it so the reaper closes
-		// proc.Done(). DeletePod must observe the exit and not escalate to SIGKILL.
-		w.release(1001)
 		if _, err := rt.DeletePod(context.Background(),
 			&runtimev1.DeletePodRequest{PodId: "pod-gp", GracePeriodSeconds: 30}); err != nil {
 			t.Fatalf("DeletePod: %v", err)
@@ -151,12 +152,11 @@ func TestDeletePodGracefulStop(t *testing.T) {
 		// SIGTERMs first. The caller resolves the pod's grace and sends it.
 		w := newBlockingWaiter()
 		rt := newTestRuntime(t, Deps{Waiter: w})
-		rec := &recordingSignalGroup{}
+		rec := &recordingSignalGroup{onTerm: func(pid int) { w.release(pid) }}
 		rt.signalGroup = rec.signal
 		box := hostBinBox(rt, "pod-gr")
 		box.TerminationGracePeriodSeconds = 30
 		mustCreatePod(t, rt, box)
-		w.release(1001)
 		if _, err := rt.DeletePod(context.Background(),
 			&runtimev1.DeletePodRequest{PodId: "pod-gr", GracePeriodSeconds: 30}); err != nil {
 			t.Fatalf("DeletePod: %v", err)

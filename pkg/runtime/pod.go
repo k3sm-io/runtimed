@@ -777,10 +777,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // and the pod dir are createPod's and CreatePod's own unwinds, so it sets
 // neither hook.
 //
-// It differs from DeletePod's stop in one way, spareExited: a main whose
-// process has already exited (it ran to completion before the refusal) is
-// never signalled, because its group is reaped and its pgid may already name
-// another process. stopSidecars skips an exited sidecar the same way.
+// As in DeletePod, a main whose process has already exited (it ran to
+// completion before the refusal) is never signalled, because its group is
+// reaped and its pgid may already name another process. stopSidecars skips an
+// exited sidecar the same way.
 //
 // The stop is bounded: the mains run concurrently and the sidecars in turn
 // against one deadline, so the signalling waits at most
@@ -789,7 +789,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // p.containers), each SIGKILLed in turn once supervision is cancelled. The
 // log-tail drain adds at most drainGrace after it.
 func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
-	r.stopHostPod(ctx, p, hostStop{grace: podDefaultGrace(0, p), spareExited: true})
+	r.stopHostPod(ctx, p, hostStop{grace: podDefaultGrace(0, p)})
 }
 
 // compileProfile compiles a host-process pod's SBPL profile from its spec and

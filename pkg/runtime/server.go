@@ -246,11 +246,6 @@ type hostStop struct {
 	// grace is the one pod-level budget: the mains are stopped within it and
 	// the native sidecars get what remains. 0 is an immediate SIGKILL.
 	grace time.Duration
-	// spareExited leaves unsignalled every main whose process is already Done,
-	// not only one a StopContainer claimed. A refused create sets it: a main
-	// that ran to completion before the refusal is reaped and its pgid may
-	// already name another process.
-	spareExited bool
 	// swept, when set, runs after the tree sweep and before the log tails are
 	// drained: DeletePod publishes DELETED and releases the network there.
 	swept func()
@@ -293,16 +288,16 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 			continue
 		}
 		signalled[cp.proc] = struct{}{}
-		// A container a StopContainer claimed whose process has already exited
-		// is being concluded by that verb: there is no group left to signal,
-		// and a second stop sequence against its pid would signal whatever
-		// reuses it. It stays in `signalled` so the late sweep below skips it
-		// too. A claimed container still alive is stopped here as any other.
-		if cp.stopped && procDone(cp.proc) {
-			continue
-		}
-		// The same holds for any main already exited when s.spareExited is set.
-		if s.spareExited && procDone(cp.proc) {
+		// A main whose process is already Done is never signalled, however it
+		// ended: a StopContainer concluded it, it ran to completion on its own
+		// (a finished Job container), or it exited before a refused create
+		// unwound. Its leader is reaped, so its pgid may already name an
+		// unrelated process, and GracefulStop signals before it looks at Done.
+		// It stays in `signalled` so the late sweep below skips it too. What
+		// its tree left behind (a daemonized child still in its group) is the
+		// tree sweep's below, which signals only members proven ours by exact
+		// instance and a group only while such a member is in it.
+		if procDone(cp.proc) {
 			continue
 		}
 		mains = append(mains, cp.proc)
