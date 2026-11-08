@@ -170,7 +170,11 @@ type procTree struct {
 	// selfPgid is the daemon's own process group, never signalled.
 	selfPgid int
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// leader is the group leader's recorded instance (Pid 0 when it was not
+	// found at tracking start), whose group a sweep checks once it is reaped
+	// (adoptGroupOrphansLocked).
+	leader  TreeMember
 	roots   []TreeMember
 	pgid    int
 	sid     int
@@ -191,12 +195,15 @@ func newProcTree(cfg TreeConfig, rootPids ...int) *procTree {
 	for _, e := range entries {
 		byPid[e.Pid] = e
 	}
-	for _, pid := range rootPids {
+	for i, pid := range rootPids {
 		e, found := byPid[pid]
 		if pid <= 1 || pid == t.self || !found {
 			continue
 		}
 		t.roots = append(t.roots, memberOf(e))
+		if i == 0 {
+			t.leader = memberOf(e)
+		}
 		if t.pgid == 0 {
 			t.pgid, t.sid = e.Pgid, e.Sid
 		}
@@ -328,7 +335,9 @@ func (t *procTree) isRoot(m TreeMember) bool {
 // runc rule is KILL to everything left. Each member is signalled by pid only
 // while it is the exact instance recorded; a process group is signalled only
 // when a member proven ours was in it at the same table read (a group with
-// none left may carry a recycled id, and is skipped). It is idempotent: a later sweep starts
+// none left may carry a recycled id, and is skipped). Its first table read is
+// fresh and also looks for an unrecorded process left in the reaped leader's
+// group (adoptGroupOrphansLocked). It is idempotent: a later sweep starts
 // from the survivors of the last one.
 func (t *procTree) sweep() TreeSweep {
 	t.mu.Lock()
@@ -344,10 +353,22 @@ func (t *procTree) sweep() TreeSweep {
 	deadline := time.Now().Add(budget)
 	signalled := map[TreeMember]bool{}
 	killed := 0
+	// The first read is fresh, not the shared snapshot: a child forked since
+	// the last refresh is only in a read taken after the leader was reaped.
+	maxAge := time.Duration(0)
 	for {
-		if entries, ok := t.cfg.readTable(treeKillPoll); ok {
+		entries, ok := t.cfg.readTable(maxAge)
+		switch {
+		case ok:
 			t.refreshLocked(entries)
+			if maxAge == 0 {
+				t.adoptGroupOrphansLocked(entries)
+			}
+		case maxAge == 0:
+			log.Debug("could not read the process table for a sweep; an unrecorded child of the leader's group is not looked for",
+				"pgid", t.pgid)
 		}
+		maxAge = treeKillPoll
 		if len(t.members) == 0 {
 			break
 		}
@@ -405,6 +426,43 @@ func (t *procTree) sweep() TreeSweep {
 	}
 	t.last = res
 	return res
+}
+
+// adoptGroupOrphansLocked records, from a fresh table read taken once the
+// leader is gone, the live processes still in the leader's process group: a
+// child forked after the last refresh whose only recorded relative was the
+// leader (sh -c 'daemon & exit') is in no other set, and the sweep then
+// signals it, and its group, like any member. Caller holds t.mu.
+//
+// It trusts the group number only while that group provably is the pod's.
+// BSD does not reuse a pid while a process group by that number exists, so a
+// live process in group leader-pid means the group never emptied, unless the
+// leader's pid was itself recycled into a new group leader: a table that
+// still lists the leader's pid adopts nothing (the same instance already
+// vouched for its group in refreshLocked; another one is a stranger). A
+// candidate must also be in the leader's session, since a group never spans
+// sessions, have started no earlier than the leader, and not be a zombie. The
+// leader must have led its own group (pgid == pid), with a known session, and
+// that group must not be the daemon's own.
+func (t *procTree) adoptGroupOrphansLocked(entries []ProcEntry) {
+	l := t.leader
+	if l.Pid <= 1 || l.Pgid != l.Pid || l.Sid <= 1 || l.Pgid == t.selfPgid {
+		return
+	}
+	for _, e := range entries {
+		if e.Pid == l.Pid {
+			return
+		}
+	}
+	for _, e := range entries {
+		if e.Pgid != l.Pgid || e.Sid != l.Sid || e.Zombie || e.Pid <= 1 || e.Pid == t.self ||
+			e.StartUnixNano < l.StartUnixNano {
+			continue
+		}
+		if _, known := t.members[e.Pid]; !known {
+			t.members[e.Pid] = memberOf(e)
+		}
+	}
 }
 
 // getpgid reads pid's current process group through the seam.

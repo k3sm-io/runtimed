@@ -326,3 +326,94 @@ func TestProcTableCacheSharesOneRead(t *testing.T) {
 		t.Fatalf("after a failed read the cache serves %v %v, want the last good snapshot", e, ok)
 	}
 }
+
+// TestExitSweepTakesAnOrphanForkedAfterTheLastRefresh pins the fresh read a
+// sweep makes once the leader is reaped: a process forked after the last
+// refresh, left in the reaped leader's group (sh -c 'daemon & exit'), was
+// never recorded, yet its group is signalled; a group the fresh read does not
+// show as live in the pod's session is not.
+func TestExitSweepTakesAnOrphanForkedAfterTheLastRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// after are the rows that appear once the last refresh is done.
+		after []ProcEntry
+		// unreadable fails every table read the sweep makes.
+		unreadable bool
+		wantGroups []int
+		wantKilled []int
+	}{
+		{
+			name:       "an unrecorded orphan in the leader's group is swept",
+			after:      []ProcEntry{row(101, 1, 100, 100, 2)},
+			wantGroups: []int{100},
+			wantKilled: []int{101},
+		},
+		{
+			name: "no live member left in the leader's group signals nothing",
+		},
+		{
+			name: "a zombie in the leader's group signals nothing",
+			after: []ProcEntry{func() ProcEntry {
+				e := row(101, 1, 100, 100, 2)
+				e.Zombie = true
+				return e
+			}()},
+		},
+		{
+			name:  "a process in a group numbered like the leader but another session signals nothing",
+			after: []ProcEntry{row(101, 1, 100, 300, 2)},
+		},
+		{
+			name:       "a table the sweep cannot read signals nothing",
+			after:      []ProcEntry{row(101, 1, 100, 100, 2)},
+			unreadable: true,
+		},
+		{
+			name:  "a recycled leader pid means the group is not the pod's and signals nothing",
+			after: []ProcEntry{row(100, 1, 100, 100, 50), row(101, 100, 100, 100, 51)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeTable{rows: map[int]ProcEntry{
+				100: row(100, 50, 100, 100, 1), // the leader, the only member
+			}}
+			tr := newProcTree(f.config(), 100)
+			if tc.unreadable {
+				tr.cfg.Table = func() ([]ProcEntry, bool) { return nil, false }
+			}
+			// After the last refresh the leader forks, exits and is reaped.
+			f.mu.Lock()
+			delete(f.rows, 100)
+			f.mu.Unlock()
+			for _, e := range tc.after {
+				f.set(e)
+			}
+			if got := tr.snapshot(); len(got) != 1 || got[0].Pid != 100 {
+				t.Fatalf("members before the sweep = %+v, want only the leader", got)
+			}
+			res := tr.sweep()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if !equalInts(f.groups, tc.wantGroups) || !equalInts(f.killed, tc.wantKilled) {
+				t.Fatalf("signalled groups %v pids %v, want groups %v pids %v", f.groups, f.killed, tc.wantGroups, tc.wantKilled)
+			}
+			// An unreadable table keeps the last record, the leader's, as
+			// unproven; only the signals are asserted then.
+			if res.Killed != len(tc.wantKilled) || (!tc.unreadable && len(res.Survivors) != 0) {
+				t.Fatalf("sweep = %+v, want %d killed, no survivors", res, len(tc.wantKilled))
+			}
+		})
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
