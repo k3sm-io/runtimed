@@ -38,12 +38,14 @@ import (
 
 // Argv markers the liveGroups fake acts on: a spawn whose argv carries
 // markFailSpawn fails; a group whose argv carries markExitNonZero exits 1 as it
-// is spawned; and one carrying markExitHoldPipes exits 0 as it is spawned while
-// its pipe write ends stay held, as a grandchild that inherited them would hold
-// them, so its log pump never sees EOF.
+// is spawned; one carrying markExitZero exits 0 as it is spawned, as a
+// completed Job container does; and one carrying markExitHoldPipes exits 0 as
+// it is spawned while its pipe write ends stay held, as a grandchild that
+// inherited them would hold them, so its log pump never sees EOF.
 const (
 	markFailSpawn     = "--refused-create-fail-spawn"
 	markExitNonZero   = "--refused-create-exit-1"
+	markExitZero      = "--refused-create-exit-0"
 	markExitHoldPipes = "--refused-create-exit-hold-pipes"
 )
 
@@ -160,6 +162,10 @@ func (g *liveGroups) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, e
 	}
 	if slices.Contains(spec.Argv, markExitNonZero) {
 		g.code[pid] = 1
+		g.exitLocked(pid)
+	}
+	if slices.Contains(spec.Argv, markExitZero) {
+		g.code[pid] = 0
 		g.exitLocked(pid)
 	}
 	if slices.Contains(spec.Argv, markExitHoldPipes) {
@@ -622,6 +628,84 @@ func TestRefusedCreateStopHonoursGraceAndEscalation(t *testing.T) {
 			}
 			if tc.maxGap > 0 && gap > tc.maxGap {
 				t.Errorf("SIGKILL followed SIGTERM after %v, want an escalation within %v", gap, tc.maxGap)
+			}
+		})
+	}
+}
+
+// TestDeletePodSparesAnExitedMain pins that DeletePod never signals the
+// process group of a main whose process is already Done: one that exited on
+// its own, as a completed Job container does, with no StopContainer claiming
+// it. Once its leader is reaped the pgid may name an unrelated process, and the
+// daemon is privileged. Its tree is the pod-tree sweep's (sweepPodTrees), which
+// signals only members proven ours by exact instance. The sibling main still
+// running is stopped as before. The groups ignore every signal
+// (liveGroups.deaf), so each signal recorded is the stop's own decision.
+func TestDeletePodSparesAnExitedMain(t *testing.T) {
+	const (
+		exited  = 3001 // c1: exits 0 as it is spawned
+		running = 3002 // c2: runs until the stop
+	)
+	cases := []struct {
+		name string
+		// grace is the DeletePod request's grace_period_seconds.
+		grace int64
+		// want is every signal the running main's group gets, in order.
+		want []os.Signal
+	}{
+		{name: "immediate-kill", grace: 0, want: []os.Signal{killSignal}},
+		{name: "graceful-stop", grace: 1, want: []os.Signal{termSignal, killSignal}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newLiveGroups(t)
+			g.deaf = true
+			rt := newTestRuntime(t, Deps{Spawner: g, Waiter: g, SignalGroup: g.signal, ProcGroup: g.procGroup})
+			rt.drainGrace = 50 * time.Millisecond
+			rt.exitObsGrace = 50 * time.Millisecond
+			// Registered after the runtime, so it runs before rt.Close.
+			t.Cleanup(g.exitAll)
+			const podID = "pod-delete-exited-main"
+			box := hostBinBox(rt, podID)
+			box.Containers = []*runtimev1.Container{
+				{Name: "c1", Image: NativeImage, Command: []string{"/bin/sleep", markExitZero}},
+				{Name: "c2", Image: "/bin/sleep"},
+			}
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil || resp.GetError() != nil {
+				t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+			}
+			if got := g.spawned(); got != 2 {
+				t.Fatalf("%d groups spawned, want 2", got)
+			}
+			// The fixture's premise: c1's process is Done and nothing claimed it.
+			g.awaitExitedObserved()
+			rt.mu.Lock()
+			p := rt.pods[podID]
+			rt.mu.Unlock()
+			if p == nil {
+				t.Fatal("created pod is not registered")
+			}
+			p.mu.Lock()
+			var c1Done, c1Stopped bool
+			for _, cp := range p.containers {
+				if cp.name == "c1" && cp.proc != nil {
+					c1Done, c1Stopped = procDone(cp.proc), cp.stopped
+				}
+			}
+			p.mu.Unlock()
+			if !c1Done || c1Stopped {
+				t.Fatalf("c1 before the delete: done=%v stopped=%v, want done and unclaimed", c1Done, c1Stopped)
+			}
+
+			if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: tc.grace}); err != nil {
+				t.Fatalf("DeletePod: %v", err)
+			}
+			if sigs := g.signalsTo(exited); len(sigs) > 0 {
+				t.Errorf("pgid %d exited on its own before the delete but was signalled %v", exited, sigs)
+			}
+			if sigs := g.signalsTo(running); !slices.Equal(sigs, tc.want) {
+				t.Errorf("running main pgid %d was signalled %v, want %v", running, sigs, tc.want)
 			}
 		})
 	}
