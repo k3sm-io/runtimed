@@ -213,11 +213,74 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		return &runtimev1.DeletePodResponse{}, nil
 	}
 
+	r.stopHostPod(ctx, p, hostStop{
+		grace: grace,
+		swept: func() {
+			st := r.podStatus(p)
+			st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
+			r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
+			// Release the pod's networking (with real IPAM behind the seam, its /32 lo0
+			// alias — skipping this leaks one address of the 253/node pool per pod
+			// churn). Best-effort log-and-continue: a teardown error never blocks the
+			// delete (the startup reconcile sweeps any stragglers).
+			if err := r.network.Teardown(req.GetPodId()); err != nil {
+				r.log.Warn("network teardown", "pod", req.GetPodId(), "err", err)
+			}
+		},
+		logsClosed: func() {
+			if err := r.removePodDir(req.GetPodId()); err != nil {
+				r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
+			}
+		},
+	})
+	r.releasePodArtifacts(ctx, p.box, 0)
+	p.mu.Lock()
+	shimDirs := p.shimDirs
+	p.mu.Unlock()
+	removeShimDirs(shimDirs)
+	return &runtimev1.DeletePodResponse{}, nil
+}
+
+// hostStop configures stopHostPod for its caller.
+type hostStop struct {
+	// grace is the one pod-level budget: the mains are stopped within it and
+	// the native sidecars get what remains. 0 is an immediate SIGKILL.
+	grace time.Duration
+	// spareExited leaves unsignalled every main whose process is already Done,
+	// not only one a StopContainer claimed. A refused create sets it: a main
+	// that ran to completion before the refusal is reaped and its pgid may
+	// already name another process.
+	spareExited bool
+	// swept, when set, runs after the tree sweep and before the log tails are
+	// drained: DeletePod publishes DELETED and releases the network there.
+	swept func()
+	// logsClosed, when set, runs after the log writers close and before the
+	// reap records are retired: DeletePod removes the pod dir there.
+	logsClosed func()
+}
+
+// stopHostPod is the host-process pod stop, the one sequence DeletePod and a
+// refused create (unwindRefusedCreate) both run, in this order: the mains are
+// graceful-stopped concurrently, then the native sidecars in reverse start
+// order with the budget's remainder; supervision is cancelled; any process
+// group that appeared since the snapshot is SIGKILLed; the exec sessions end;
+// every container's process tree is swept; the log tails are drained and the
+// writers closed; and the reap records are retired, keeping any that name
+// survivors of the sweep. The order is load-bearing, and each step says why.
+//
+// It sets p.stopping and p.sidecarTeardown under p.mu before the snapshot of
+// what it will signal.
+func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
+	podID := p.box.GetPodId()
+
 	// The ONE pod-level grace budget: anchor its deadline BEFORE the
 	// mains are stopped so the sidecars that follow get only the REMAINDER.
-	deadline := time.Now().Add(grace)
+	deadline := time.Now().Add(s.grace)
 
 	p.mu.Lock()
+	// Closed to new process groups before the snapshot. DeletePod has already
+	// set it, at its top; a refused create sets it here.
+	p.stopping = true
 	signalled := make(map[*supervisor.Process]struct{}, len(p.containers))
 	mains := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range p.containers {
@@ -238,6 +301,10 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		if cp.stopped && procDone(cp.proc) {
 			continue
 		}
+		// The same holds for any main already exited when s.spareExited is set.
+		if s.spareExited && procDone(cp.proc) {
+			continue
+		}
 		mains = append(mains, cp.proc)
 	}
 	sidecars := sidecarsLocked(p)
@@ -246,7 +313,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			signalled[cp.proc] = struct{}{}
 		}
 	}
-	// Claim the sidecar teardown for THIS delete: the main exits phase 1 induces
+	// Claim the sidecar teardown for THIS stop: the main exits phase 1 induces
 	// would otherwise conclude the pod in watchContainerExit and trigger the
 	// voluntary-completion teardown concurrently with phase 2 (a double stop).
 	p.sidecarTeardown = true
@@ -265,16 +332,16 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		wg.Add(1)
 		go func(proc *supervisor.Process, pid int) {
 			defer wg.Done()
-			escalated, observed, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
+			escalated, observed, err := supervisor.GracefulStop(ctx, pid, s.grace, proc.Done(),
 				termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace())
 			if err != nil {
-				r.log.Warn("graceful stop pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
+				r.log.Warn("graceful stop pod group", "pod", podID, "pid", pid, "err", err)
 			}
 			// Diagnostic: escalated=true means the grace timer fired (SIGTERM did NOT
 			// cause an exit → SIGKILL); escalated=false means the process exited within
 			// grace (SIGTERM honored). Localizes a slow delete to runtimed vs the caller.
 			r.log.Info("pod container graceful-stop outcome",
-				"pod", req.GetPodId(), "pid", pid, "grace", grace.String(), "escalated", escalated)
+				"pod", podID, "pid", pid, "grace", s.grace.String(), "escalated", escalated)
 			// observed=false means the reaper did not report the exit within the
 			// observation bound, so the p.cancel below CAN still preempt it and the
 			// container's terminated status may read "context canceled" for a group
@@ -283,7 +350,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			// only record that the status which follows is not trustworthy.
 			if !observed {
 				r.log.Warn("pod container exit not observed before teardown deadline",
-					"pod", req.GetPodId(), "pid", pid, "bound", r.exitObservationGrace().String())
+					"pod", podID, "pid", pid, "bound", r.exitObservationGrace().String())
 			}
 		}(proc, pid)
 	}
@@ -296,7 +363,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// where a main's post-SIGKILL exit-observation wait ran past the budget: the
 	// grace window is the workload's promise, and a main that had to be killed
 	// and then waited for has already spent it.
-	r.stopSidecars(ctx, req.GetPodId(), sidecars, deadline)
+	r.stopSidecars(ctx, podID, sidecars, deadline)
 
 	// End the pod-lifetime supervision context AFTER the graceful stop: the reapers
 	// have collected the real exits — GracefulStop now WAITS for each observation
@@ -339,10 +406,10 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			continue
 		}
 		r.log.Warn("SIGKILLing a container process that appeared during teardown",
-			"pod", req.GetPodId(), "pid", pid)
+			"pod", podID, "pid", pid)
 		if _, _, err := supervisor.GracefulStop(context.WithoutCancel(ctx), pid, 0, proc.Done(),
 			termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
-			r.log.Warn("sigkill a late pod group", "pod", req.GetPodId(), "pid", pid, "err", err)
+			r.log.Warn("sigkill a late pod group", "pod", podID, "pid", pid, "err", err)
 		}
 	}
 
@@ -352,20 +419,14 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// reparented to launchd and lives on. Each container's tree was swept when
 	// its leader exited; sweep again unconditionally here (the exit sweep does
 	// not run on a wait the cancel above cut short), after ending the exec
-	// sessions, which lead their own groups. The memory sampler was cancelled
-	// at the top, so no kill here can be read as an OOM.
+	// sessions, which lead their own groups. DeletePod cancelled the memory
+	// sampler before this, and a refused pod never had one armed, so no kill
+	// here can be read as an OOM.
 	r.endExecSessions(p)
-	survivors := r.sweepPodTrees(req.GetPodId(), p)
+	survivors := r.sweepPodTrees(podID, p)
 
-	st := r.podStatus(p)
-	st.Phase = runtimev1.PodPhase_POD_PHASE_SUCCEEDED
-	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_DELETED, st)
-	// Release the pod's networking (with real IPAM behind the seam, its /32 lo0
-	// alias — skipping this leaks one address of the 253/node pool per pod
-	// churn). Best-effort log-and-continue: a teardown error never blocks the
-	// delete (the startup reconcile sweeps any stragglers).
-	if err := r.network.Teardown(req.GetPodId()); err != nil {
-		r.log.Warn("network teardown", "pod", req.GetPodId(), "err", err)
+	if s.swept != nil {
+		s.swept()
 	}
 	// Release the container log files, AFTER the stop above: the pumps have had
 	// the pod's whole grace budget to flush the dying children's final output,
@@ -378,20 +439,14 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	// before the writers close and the dir goes.
 	r.awaitLogTails(p)
 	r.closeContainerLogs(p)
-	if err := r.removePodDir(req.GetPodId()); err != nil {
-		r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
+	if s.logsClosed != nil {
+		s.logsClosed()
 	}
 	// Drop the pod's reap records: its groups were just SIGKILL-escalated above,
 	// so the durable records (stored outside the pod dir, so removePodDir does
 	// not touch them) have served their purpose, except a record whose
 	// container's tree left survivors, which is kept naming them.
-	r.retirePodReapRecords(req.GetPodId(), survivors)
-	r.releasePodArtifacts(ctx, p.box, 0)
-	p.mu.Lock()
-	shimDirs := p.shimDirs
-	p.mu.Unlock()
-	removeShimDirs(shimDirs)
-	return &runtimev1.DeletePodResponse{}, nil
+	r.retirePodReapRecords(podID, survivors)
 }
 
 // sweepPodTrees sweeps the process tree of every container process p holds
