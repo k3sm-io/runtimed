@@ -255,6 +255,13 @@ func TestDataRootRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"work-dir is under server":   {"/opt/data/server/pods-root", "/opt/data"},
 		"work-dir is the agent dir":  {"/opt/data/agent", "/opt/data"},
 		"work-dir is under agent":    {"/opt/data/agent/pods-root", "/opt/data"},
+		// Both bounds compare every firmlink spelling, and case-insensitively.
+		"private spelling under a var pods root": {"/var/lib/k3sm", "/private/var/lib/k3sm/pods/data"},
+		"var spelling under a private pods root": {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/data"},
+		"var work-dir in the private server dir": {"/var/data/server/pods-root", "/private/var/data"},
+		"private work-dir in the var agent dir":  {"/private/var/data/agent", "/var/data"},
+		"other case under the pods root":         {workDir, "/opt/k3sm-pods/Pods/data"},
+		"work-dir in the other-case server dir":  {"/opt/data/SERVER/pods-root", "/opt/data"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidDataRoot) {
@@ -461,6 +468,13 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"above the artifacts root":                 {"/opt/k3sm-data/cp/root", "/opt/k3sm-data/cp"},
 		"private artifacts root of a var work-dir": {"/var/lib/k3sm", "/private/var/lib/k3sm/artifacts"},
 		"var view under a private work-dir":        {"/private/var/lib/k3sm", "/var/lib/k3sm/artifacts/cp"},
+		// The default volume is case-insensitive and so is the kernel's match, so
+		// a spelling that differs only by case is the same directory.
+		"other case of the work-dir":          {workDir, "/OPT/K3SM-PODS"},
+		"other case of the pods root":         {workDir, "/opt/k3sm-pods/PODS"},
+		"other case under the pods root":      {workDir, "/opt/K3sm-Pods/pods/cp"},
+		"other case of the artifacts root":    {workDir, "/opt/k3sm-pods/Artifacts"},
+		"other case under the artifacts root": {workDir, "/OPT/k3sm-pods/ARTIFACTS/cp"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidStateDir) {
@@ -502,6 +516,68 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 			}
 			if err := ValidateStateDir(tc.dir, tc.workDir); err != nil {
 				t.Errorf("ValidateStateDir(%q): %v", tc.dir, err)
+			}
+		})
+	}
+}
+
+// TestProtectedPathsMatchEverySpelling pins validateExtraPaths to the directory
+// rather than the bytes: a caller-supplied allow spelled in the other firmlink
+// form, or in another case, still names a protected tree on the default volume,
+// and the post-deny allows (the credential read-only scope above all) would
+// re-open it. Every group a caller can fill is checked.
+func TestProtectedPathsMatchEverySpelling(t *testing.T) {
+	const workDir = "/opt/k3sm-pods"
+	for name, tc := range map[string]struct {
+		dataRoot, stateDir, path string
+	}{
+		"private spelling under a var state dir":   {"/var/k3sm-data", "/var/k3sm-data/cp", "/private/var/k3sm-data/cp/tls/server-ca.key"},
+		"var spelling under a private state dir":   {"/private/var/k3sm-data", "/private/var/k3sm-data/cp", "/var/k3sm-data/cp/tls/server-ca.key"},
+		"var spelling of a private state dir":      {"/private/var/k3sm-data", "/private/var/k3sm-data/cp", "/var/k3sm-data/cp"},
+		"other case under the state dir":           {"/opt/k3sm-data", "/opt/k3sm-data/cp", "/opt/k3sm-data/CP/tls/server-ca.key"},
+		"other case under a data root child":       {"/opt/k3sm-data", "", "/opt/K3SM-DATA/server/tls/server-ca.key"},
+		"other case under the pods root":           {"", "", "/opt/k3sm-pods/PODS/p2/rootfs"},
+		"var spelling under the private db prefix": {"", "", "/var/db/sudo"},
+		"other case under the user homes":          {"", "", "/users/alice/.ssh/id_ed25519"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			posture := Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir}
+			for group, opts := range map[string]GenerateOptions{
+				"read-only": {Posture: posture, ReadOnlyPaths: []string{tc.path}},
+				"write":     {Posture: posture, WritePaths: []string{tc.path}},
+				"read":      {Posture: posture, ReadPaths: []string{tc.path}},
+			} {
+				sp := &runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"}
+				if _, err := Generate(sp, opts); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("Generate with %s path %q: err = %v, want ErrProtectedPath", group, tc.path, err)
+				}
+			}
+			for group, sp := range map[string]*runtimev1.SandboxProfile{
+				"extra read":  {DataVolumePath: workDir + "/pods/p1/rootfs", ExtraReadPaths: []string{tc.path}},
+				"extra write": {DataVolumePath: workDir + "/pods/p1/rootfs", ExtraWritePaths: []string{tc.path}},
+			} {
+				if _, err := Generate(sp, GenerateOptions{Posture: posture}); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("Generate with %s path %q: err = %v, want ErrProtectedPath", group, tc.path, err)
+				}
+			}
+		})
+	}
+	// A path beside a protected tree whose name only extends it is not under it,
+	// in either case: the fold respects the segment boundary.
+	for name, path := range map[string]string{
+		"sibling of the state dir":    "/opt/k3sm-data/cpx/file",
+		"other-case sibling":          "/opt/k3sm-data/CPX/file",
+		"sibling of the users prefix": "/UsersX/file",
+		"the pod's own data volume":   workDir + "/pods/p1/rootfs/secret",
+	} {
+		t.Run("accepted/"+name, func(t *testing.T) {
+			sp := &runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"}
+			opts := GenerateOptions{
+				Posture:       Posture{WorkDir: workDir, DataRoot: "/opt/k3sm-data", StateDir: "/opt/k3sm-data/cp"},
+				ReadOnlyPaths: []string{path},
+			}
+			if _, err := Generate(sp, opts); err != nil {
+				t.Errorf("Generate with read-only path %q: %v", path, err)
 			}
 		})
 	}

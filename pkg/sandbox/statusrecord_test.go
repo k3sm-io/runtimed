@@ -303,4 +303,25 @@ func TestStatusRecordDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 			}
 		})
 	}
+
+	// The pods-root bound holds whichever firmlink spelling, and whichever case,
+	// either side is written in: each pair names the same directory on the
+	// default volume.
+	for name, tc := range map[string]struct{ workDir, dir string }{
+		"private spelling under a var pods root": {"/var/lib/k3sm", "/private/var/lib/k3sm/pods/status"},
+		"var spelling under a private pods root": {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/status"},
+		"other case under the pods root":         {workDir, "/opt/k3sm-pods/PODS/status"},
+		"other case of the pods root":            {workDir, "/OPT/K3SM-PODS/pods"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: tc.workDir + "/pods/p1/rootfs"},
+				GenerateOptions{Posture: Posture{WorkDir: tc.workDir, StatusRecordDir: tc.dir}})
+			if !errors.Is(err, ErrInvalidStatusRecordDir) {
+				t.Errorf("Generate(%q) err = %v, want ErrInvalidStatusRecordDir", tc.dir, err)
+			}
+			if err := ValidateStatusRecordDir(tc.dir, tc.workDir); !errors.Is(err, ErrInvalidStatusRecordDir) {
+				t.Errorf("ValidateStatusRecordDir(%q) = %v, want ErrInvalidStatusRecordDir", tc.dir, err)
+			}
+		})
+	}
 }
