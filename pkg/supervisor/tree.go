@@ -171,10 +171,16 @@ type procTree struct {
 	selfPgid int
 
 	mu sync.Mutex
-	// leader is the group leader's recorded instance (Pid 0 when it was not
-	// found at tracking start), whose group a sweep checks once it is reaped
-	// (adoptGroupOrphansLocked).
-	leader  TreeMember
+	// leader is the group leader's recorded instance, whose group the first
+	// sweep checks once for orphans (adoptGroupOrphansLocked). Pid 0 when it
+	// was not found at tracking start, or once that check has run.
+	leader TreeMember
+	// leaderGoneAt is when the leader was first seen gone, in Unix
+	// nanoseconds: its reap, or the first table read that no longer lists that
+	// instance alive (0 = not yet). An orphan it forked started before then.
+	leaderGoneAt int64
+	// now reads the clock leaderGoneAt is taken from (nil selects time.Now).
+	now     func() time.Time
 	roots   []TreeMember
 	pgid    int
 	sid     int
@@ -267,6 +273,11 @@ func (t *procTree) refreshLocked(entries []ProcEntry) {
 	for _, e := range entries {
 		byPid[e.Pid] = e
 		children[e.Ppid] = append(children[e.Ppid], e.Pid)
+	}
+	if l := t.leader; l.Pid > 1 {
+		if e, ok := byPid[l.Pid]; !ok || e.StartUnixNano != l.StartUnixNano || e.Zombie {
+			t.markLeaderGoneLocked()
+		}
 	}
 	same := func(m TreeMember) (ProcEntry, bool) {
 		e, ok := byPid[m.Pid]
@@ -428,6 +439,27 @@ func (t *procTree) sweep() TreeSweep {
 	return res
 }
 
+// markLeaderGoneLocked records the first moment the leader was seen gone.
+// Caller holds t.mu.
+func (t *procTree) markLeaderGoneLocked() {
+	if t.leader.Pid <= 1 || t.leaderGoneAt != 0 {
+		return
+	}
+	now := time.Now
+	if t.now != nil {
+		now = t.now
+	}
+	t.leaderGoneAt = now().UnixNano()
+}
+
+// leaderExited records the leader's reap as the moment it was gone, unless a
+// table read saw it gone earlier.
+func (t *procTree) leaderExited() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.markLeaderGoneLocked()
+}
+
 // adoptGroupOrphansLocked records, from a fresh table read taken once the
 // leader is gone, the live processes still in the leader's process group: a
 // child forked after the last refresh whose only recorded relative was the
@@ -440,13 +472,23 @@ func (t *procTree) sweep() TreeSweep {
 // leader's pid was itself recycled into a new group leader: a table that
 // still lists the leader's pid adopts nothing (the same instance already
 // vouched for its group in refreshLocked; another one is a stranger). A
-// candidate must also be in the leader's session, since a group never spans
-// sessions, have started no earlier than the leader, and not be a zombie. The
-// leader must have led its own group (pgid == pid), with a known session, and
+// candidate must be in the leader's session (a group never spans sessions),
+// have started no earlier than the leader and no later than the leader was
+// seen gone (a recycled leader's child starts after both), and not be a
+// zombie. The leader must have led its own session and group
+// (sid == pgid == pid, as POSIX_SPAWN_SETSID makes every tracked leader), and
 // that group must not be the daemon's own.
+//
+// It runs once: the leader is disarmed whether or not anything was adopted,
+// so a later sweep (DeletePod's, long after the reap) never re-trusts a group
+// number the kernel may since have handed to a stranger.
 func (t *procTree) adoptGroupOrphansLocked(entries []ProcEntry) {
-	l := t.leader
-	if l.Pid <= 1 || l.Pgid != l.Pid || l.Sid <= 1 || l.Pgid == t.selfPgid {
+	l, goneAt := t.leader, t.leaderGoneAt
+	if l.Pid <= 1 {
+		return
+	}
+	t.leader = TreeMember{}
+	if l.Pgid != l.Pid || l.Sid != l.Pid || l.Pgid == t.selfPgid || goneAt == 0 {
 		return
 	}
 	for _, e := range entries {
@@ -456,7 +498,7 @@ func (t *procTree) adoptGroupOrphansLocked(entries []ProcEntry) {
 	}
 	for _, e := range entries {
 		if e.Pgid != l.Pgid || e.Sid != l.Sid || e.Zombie || e.Pid <= 1 || e.Pid == t.self ||
-			e.StartUnixNano < l.StartUnixNano {
+			e.StartUnixNano < l.StartUnixNano || e.StartUnixNano > goneAt {
 			continue
 		}
 		if _, known := t.members[e.Pid]; !known {
@@ -590,6 +632,7 @@ func (p *Process) sweepOnExit(err error) {
 		return
 	}
 	if t := p.procTreeOf(); t != nil {
+		t.leaderExited()
 		t.sweep()
 	}
 }

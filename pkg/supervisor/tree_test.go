@@ -335,6 +335,11 @@ func TestProcTableCacheSharesOneRead(t *testing.T) {
 func TestExitSweepTakesAnOrphanForkedAfterTheLastRefresh(t *testing.T) {
 	for _, tc := range []struct {
 		name string
+		// leader is the leader's row (zero selects pid 100 leading group and
+		// session 100).
+		leader ProcEntry
+		// setup adjusts the tree before the leader goes.
+		setup func(*procTree)
 		// after are the rows that appear once the last refresh is done.
 		after []ProcEntry
 		// unreadable fails every table read the sweep makes.
@@ -369,15 +374,61 @@ func TestExitSweepTakesAnOrphanForkedAfterTheLastRefresh(t *testing.T) {
 			unreadable: true,
 		},
 		{
+			name:  "a candidate that started after the leader was seen gone is rejected",
+			after: []ProcEntry{row(101, 1, 100, 100, 20)},
+			setup: func(tr *procTree) { tr.now = func() time.Time { return time.Unix(0, 10) } },
+		},
+		{
+			name:       "a candidate that started before the leader was seen gone is swept",
+			after:      []ProcEntry{row(101, 1, 100, 100, 5)},
+			setup:      func(tr *procTree) { tr.now = func() time.Time { return time.Unix(0, 10) } },
+			wantGroups: []int{100},
+			wantKilled: []int{101},
+		},
+		{
+			name:   "a leader that did not lead its own group adopts nothing",
+			leader: row(100, 50, 200, 100, 1),
+			after:  []ProcEntry{row(101, 1, 200, 100, 2)},
+		},
+		{
+			name:  "the daemon's own group adopts nothing",
+			after: []ProcEntry{row(101, 1, 100, 100, 2)},
+			setup: func(tr *procTree) { tr.selfPgid = 100 },
+		},
+		{
+			name:   "a leader with an unknown session adopts nothing",
+			leader: row(100, 50, 100, 0, 1),
+			after:  []ProcEntry{row(101, 1, 100, 0, 2)},
+		},
+		{
+			name:   "a leader that did not lead its own session adopts nothing",
+			leader: row(100, 50, 100, 50, 1),
+			after:  []ProcEntry{row(101, 1, 100, 50, 2)},
+		},
+		{
+			name:  "the daemon itself is never adopted",
+			after: []ProcEntry{row(101, 1, 100, 100, 2)},
+			setup: func(tr *procTree) { tr.self = 101 },
+		},
+		{
+			name:  "pid 1 is never adopted",
+			after: []ProcEntry{row(1, 0, 100, 100, 2)},
+		},
+		{
 			name:  "a recycled leader pid means the group is not the pod's and signals nothing",
 			after: []ProcEntry{row(100, 1, 100, 100, 50), row(101, 100, 100, 100, 51)},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeTable{rows: map[int]ProcEntry{
-				100: row(100, 50, 100, 100, 1), // the leader, the only member
-			}}
+			leader := tc.leader
+			if leader.Pid == 0 {
+				leader = row(100, 50, 100, 100, 1)
+			}
+			f := &fakeTable{rows: map[int]ProcEntry{100: leader}} // the only member
 			tr := newProcTree(f.config(), 100)
+			if tc.setup != nil {
+				tc.setup(tr)
+			}
 			if tc.unreadable {
 				tr.cfg.Table = func() ([]ProcEntry, bool) { return nil, false }
 			}
@@ -416,4 +467,27 @@ func equalInts(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// TestStaleSweepAdoptsNoRecycledLeadersOrphan pins that adoption is one-shot:
+// after the exit sweep, the leader's pid is recycled into a new setsid'd
+// leader (pgid == sid == the old pid) that forks and exits; a later KillTree
+// (DeletePod's) must not take that stranger's orphan for the pod's.
+func TestStaleSweepAdoptsNoRecycledLeadersOrphan(t *testing.T) {
+	f := &fakeTable{rows: map[int]ProcEntry{
+		100: row(100, 50, 100, 100, 1),
+	}}
+	tr := newProcTree(f.config(), 100)
+	f.mu.Lock()
+	delete(f.rows, 100)
+	f.mu.Unlock()
+	tr.sweep() // the exit sweep: nothing left
+	// Pid 100 is recycled into a setsid'd leader, which forks 101 and exits.
+	f.set(row(101, 1, 100, 100, 51))
+	tr.sweep() // the delete sweep, long after
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.killed) != 0 || len(f.groups) != 0 {
+		t.Fatalf("a stale sweep signalled pids %v groups %v, want none", f.killed, f.groups)
+	}
 }
