@@ -17,6 +17,7 @@ limitations under the License.
 package supervisor
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -324,5 +325,263 @@ func TestProcTableCacheSharesOneRead(t *testing.T) {
 	fail = false
 	if e, ok := c.Read(time.Hour); !ok || e[0].Pid != 2 {
 		t.Fatalf("after a failed read the cache serves %v %v, want the last good snapshot", e, ok)
+	}
+}
+
+// TestExitSweepTakesAnOrphanForkedAfterTheLastRefresh pins the fresh read a
+// sweep makes once the leader is reaped: a process forked after the last
+// refresh, left in the reaped leader's group (sh -c 'daemon & exit'), was
+// never recorded, yet its group is signalled; a group the fresh read does not
+// show as live in the pod's session is not.
+func TestExitSweepTakesAnOrphanForkedAfterTheLastRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// leader is the leader's row (zero selects pid 100 leading group and
+		// session 100).
+		leader ProcEntry
+		// setup adjusts the tree before the leader goes.
+		setup func(*procTree)
+		// after are the rows that appear once the last refresh is done.
+		after []ProcEntry
+		// unreadable fails every table read the sweep makes.
+		unreadable bool
+		wantGroups []int
+		wantKilled []int
+	}{
+		{
+			name:       "an unrecorded orphan in the leader's group is swept",
+			after:      []ProcEntry{row(101, 1, 100, 100, 2)},
+			wantGroups: []int{100},
+			wantKilled: []int{101},
+		},
+		{
+			name: "no live member left in the leader's group signals nothing",
+		},
+		{
+			name: "a zombie in the leader's group signals nothing",
+			after: []ProcEntry{func() ProcEntry {
+				e := row(101, 1, 100, 100, 2)
+				e.Zombie = true
+				return e
+			}()},
+		},
+		{
+			name:  "a process in a group numbered like the leader but another session signals nothing",
+			after: []ProcEntry{row(101, 1, 100, 300, 2)},
+		},
+		{
+			name:       "a table the sweep cannot read signals nothing",
+			after:      []ProcEntry{row(101, 1, 100, 100, 2)},
+			unreadable: true,
+		},
+		{
+			name:  "a candidate that started after the leader was seen gone is rejected",
+			after: []ProcEntry{row(101, 1, 100, 100, 20)},
+			setup: func(tr *procTree) { tr.now = func() time.Time { return time.Unix(0, 10) } },
+		},
+		{
+			name:       "a candidate that started before the leader was seen gone is swept",
+			after:      []ProcEntry{row(101, 1, 100, 100, 5)},
+			setup:      func(tr *procTree) { tr.now = func() time.Time { return time.Unix(0, 10) } },
+			wantGroups: []int{100},
+			wantKilled: []int{101},
+		},
+		{
+			name:   "a leader that did not lead its own group adopts nothing",
+			leader: row(100, 50, 200, 100, 1),
+			after:  []ProcEntry{row(101, 1, 200, 100, 2)},
+		},
+		{
+			name:  "the daemon's own group adopts nothing",
+			after: []ProcEntry{row(101, 1, 100, 100, 2)},
+			setup: func(tr *procTree) { tr.selfPgid = 100 },
+		},
+		{
+			name:   "a leader with an unknown session adopts nothing",
+			leader: row(100, 50, 100, 0, 1),
+			after:  []ProcEntry{row(101, 1, 100, 0, 2)},
+		},
+		{
+			name:   "a leader that did not lead its own session adopts nothing",
+			leader: row(100, 50, 100, 50, 1),
+			after:  []ProcEntry{row(101, 1, 100, 50, 2)},
+		},
+		{
+			name:  "the daemon itself is never adopted",
+			after: []ProcEntry{row(101, 1, 100, 100, 2)},
+			setup: func(tr *procTree) { tr.self = 101 },
+		},
+		{
+			name:  "pid 1 is never adopted",
+			after: []ProcEntry{row(1, 0, 100, 100, 2)},
+		},
+		{
+			name:  "a recycled leader pid means the group is not the pod's and signals nothing",
+			after: []ProcEntry{row(100, 1, 100, 100, 50), row(101, 100, 100, 100, 51)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leader := tc.leader
+			if leader.Pid == 0 {
+				leader = row(100, 50, 100, 100, 1)
+			}
+			f := &fakeTable{rows: map[int]ProcEntry{100: leader}} // the only member
+			tr := newProcTree(f.config(), 100)
+			if tc.setup != nil {
+				tc.setup(tr)
+			}
+			if tc.unreadable {
+				tr.cfg.Table = func() ([]ProcEntry, bool) { return nil, false }
+			}
+			// After the last refresh the leader forks, exits and is reaped.
+			f.mu.Lock()
+			delete(f.rows, 100)
+			f.mu.Unlock()
+			for _, e := range tc.after {
+				f.set(e)
+			}
+			if got := tr.snapshot(); len(got) != 1 || got[0].Pid != 100 {
+				t.Fatalf("members before the sweep = %+v, want only the leader", got)
+			}
+			res := tr.sweep()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if !equalInts(f.groups, tc.wantGroups) || !equalInts(f.killed, tc.wantKilled) {
+				t.Fatalf("signalled groups %v pids %v, want groups %v pids %v", f.groups, f.killed, tc.wantGroups, tc.wantKilled)
+			}
+			// An unreadable table keeps the last record, the leader's, as
+			// unproven; only the signals are asserted then.
+			if res.Killed != len(tc.wantKilled) || (!tc.unreadable && len(res.Survivors) != 0) {
+				t.Fatalf("sweep = %+v, want %d killed, no survivors", res, len(tc.wantKilled))
+			}
+		})
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestStaleSweepAdoptsNoRecycledLeadersOrphan pins that adoption is one-shot:
+// after the exit sweep, the leader's pid is recycled into a new setsid'd
+// leader (pgid == sid == the old pid) that forks and exits; a later KillTree
+// (DeletePod's) must not take that stranger's orphan for the pod's.
+func TestStaleSweepAdoptsNoRecycledLeadersOrphan(t *testing.T) {
+	f := &fakeTable{rows: map[int]ProcEntry{
+		100: row(100, 50, 100, 100, 1),
+	}}
+	tr := newProcTree(f.config(), 100)
+	f.mu.Lock()
+	delete(f.rows, 100)
+	f.mu.Unlock()
+	tr.sweep() // the exit sweep: nothing left
+	// Pid 100 is recycled into a setsid'd leader, which forks 101 and exits.
+	f.set(row(101, 1, 100, 100, 51))
+	tr.sweep() // the delete sweep, long after
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.killed) != 0 || len(f.groups) != 0 {
+		t.Fatalf("a stale sweep signalled pids %v groups %v, want none", f.killed, f.groups)
+	}
+}
+
+// fakeClock is a settable clock for procTree.now.
+type fakeClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func (c *fakeClock) set(ns int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = ns
+}
+
+func (c *fakeClock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Unix(0, c.now)
+}
+
+// TestReapStampsTheLeadersExitForALaterSweep pins the reap-time stamp on the
+// production reap path: the leader is reaped at t=100, a stranger in a group
+// numbered like it starts at t=150 (the leader's pid recycled into a setsid'd
+// leader that forked and exited), and a KillTree at t=200 must not signal it.
+// On the shim-crash path no exit sweep runs, so only the reap stamp stands
+// between that stranger and adoption.
+func TestReapStampsTheLeadersExitForALaterSweep(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		shim bool
+	}{
+		{name: "a crashed shim, which skips the exit sweep", shim: true},
+		{name: "a plain process, whose exit sweep runs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeTable{rows: map[int]ProcEntry{100: row(100, 50, 100, 100, 1)}}
+			clk := &fakeClock{}
+			tr := newProcTree(f.config(), 100)
+			tr.now = clk.read
+			p := &Process{pid: 100, tree: tr, done: make(chan struct{}), drained: make(chan struct{})}
+			if tc.shim {
+				p.shimDir = t.TempDir() // no exit record and no kill: ErrShimCrashed
+			}
+			w := newGatedWaiter(0, 0)
+			w.release()
+			p.waiter = w
+			f.mu.Lock()
+			delete(f.rows, 100)
+			f.mu.Unlock()
+			clk.set(100)
+			p.reap(t.Context(), 100)
+			<-p.Done()
+			if _, _, err := p.Wait(t.Context()); tc.shim && !errors.Is(err, ErrShimCrashed) {
+				t.Fatalf("reap err = %v, want ErrShimCrashed", err)
+			}
+			f.set(row(101, 1, 100, 100, 150))
+			clk.set(200)
+			p.KillTree()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if len(f.killed) != 0 || len(f.groups) != 0 {
+				t.Fatalf("a stranger started after the reap was signalled: pids %v groups %v", f.killed, f.groups)
+			}
+		})
+	}
+}
+
+// TestLeaderGoneStampEarliestWins pins that the first sighting of the leader's
+// exit is the one kept: a tick that no longer lists the leader at t=50 stamps
+// it, a reap observed at t=100 does not move it, so a process started at t=70
+// is no orphan of the leader's.
+func TestLeaderGoneStampEarliestWins(t *testing.T) {
+	f := &fakeTable{rows: map[int]ProcEntry{100: row(100, 50, 100, 100, 1)}}
+	clk := &fakeClock{}
+	tr := newProcTree(f.config(), 100)
+	tr.now = clk.read
+	f.mu.Lock()
+	delete(f.rows, 100)
+	f.mu.Unlock()
+	clk.set(50)
+	tr.refresh(0)
+	clk.set(100)
+	tr.leaderExited()
+	if tr.leaderGoneAt != 50 {
+		t.Fatalf("leaderGoneAt = %d, want the earliest stamp 50", tr.leaderGoneAt)
+	}
+	f.set(row(101, 1, 100, 100, 70))
+	tr.sweep()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.killed) != 0 || len(f.groups) != 0 {
+		t.Fatalf("a process started after the earliest stamp was signalled: pids %v groups %v", f.killed, f.groups)
 	}
 }

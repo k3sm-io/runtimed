@@ -170,7 +170,18 @@ type procTree struct {
 	// selfPgid is the daemon's own process group, never signalled.
 	selfPgid int
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// leader is the group leader's recorded instance, whose group a sweep
+	// checks once for orphans (adoptGroupOrphansLocked). Pid 0 when it was not
+	// found at tracking start, or once a sweep's fresh read has consumed it.
+	leader TreeMember
+	// leaderGoneAt is when the leader was first seen gone, in Unix
+	// nanoseconds: its observed exit at the reap (noteTreeLeaderExit), or the
+	// first table read that no longer lists that instance alive, whichever
+	// came first (0 = not yet). An orphan it forked started before then.
+	leaderGoneAt int64
+	// now reads the clock leaderGoneAt is taken from (nil selects time.Now).
+	now     func() time.Time
 	roots   []TreeMember
 	pgid    int
 	sid     int
@@ -191,12 +202,15 @@ func newProcTree(cfg TreeConfig, rootPids ...int) *procTree {
 	for _, e := range entries {
 		byPid[e.Pid] = e
 	}
-	for _, pid := range rootPids {
+	for i, pid := range rootPids {
 		e, found := byPid[pid]
 		if pid <= 1 || pid == t.self || !found {
 			continue
 		}
 		t.roots = append(t.roots, memberOf(e))
+		if i == 0 {
+			t.leader = memberOf(e)
+		}
 		if t.pgid == 0 {
 			t.pgid, t.sid = e.Pgid, e.Sid
 		}
@@ -260,6 +274,11 @@ func (t *procTree) refreshLocked(entries []ProcEntry) {
 	for _, e := range entries {
 		byPid[e.Pid] = e
 		children[e.Ppid] = append(children[e.Ppid], e.Pid)
+	}
+	if l := t.leader; l.Pid > 1 {
+		if e, ok := byPid[l.Pid]; !ok || e.StartUnixNano != l.StartUnixNano || e.Zombie {
+			t.markLeaderGoneLocked()
+		}
 	}
 	same := func(m TreeMember) (ProcEntry, bool) {
 		e, ok := byPid[m.Pid]
@@ -328,7 +347,9 @@ func (t *procTree) isRoot(m TreeMember) bool {
 // runc rule is KILL to everything left. Each member is signalled by pid only
 // while it is the exact instance recorded; a process group is signalled only
 // when a member proven ours was in it at the same table read (a group with
-// none left may carry a recycled id, and is skipped). It is idempotent: a later sweep starts
+// none left may carry a recycled id, and is skipped). Its first table read is
+// fresh and also looks for an unrecorded process left in the reaped leader's
+// group (adoptGroupOrphansLocked). It is idempotent: a later sweep starts
 // from the survivors of the last one.
 func (t *procTree) sweep() TreeSweep {
 	t.mu.Lock()
@@ -344,10 +365,22 @@ func (t *procTree) sweep() TreeSweep {
 	deadline := time.Now().Add(budget)
 	signalled := map[TreeMember]bool{}
 	killed := 0
+	// The first read is fresh, not the shared snapshot: a child forked since
+	// the last refresh is only in a read taken after the leader was reaped.
+	maxAge := time.Duration(0)
 	for {
-		if entries, ok := t.cfg.readTable(treeKillPoll); ok {
+		entries, ok := t.cfg.readTable(maxAge)
+		switch {
+		case ok:
 			t.refreshLocked(entries)
+			if maxAge == 0 {
+				t.adoptGroupOrphansLocked(entries)
+			}
+		case maxAge == 0:
+			log.Debug("could not read the process table for a sweep; an unrecorded child of the leader's group is not looked for",
+				"pgid", t.pgid)
 		}
+		maxAge = treeKillPoll
 		if len(t.members) == 0 {
 			break
 		}
@@ -405,6 +438,78 @@ func (t *procTree) sweep() TreeSweep {
 	}
 	t.last = res
 	return res
+}
+
+// markLeaderGoneLocked records the first moment the leader was seen gone.
+// Caller holds t.mu.
+func (t *procTree) markLeaderGoneLocked() {
+	if t.leader.Pid <= 1 || t.leaderGoneAt != 0 {
+		return
+	}
+	now := time.Now
+	if t.now != nil {
+		now = t.now
+	}
+	t.leaderGoneAt = now().UnixNano()
+}
+
+// leaderExited records the leader's observed exit as the moment it was gone,
+// unless a table read saw it gone earlier: the earliest stamp wins.
+func (t *procTree) leaderExited() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.markLeaderGoneLocked()
+}
+
+// adoptGroupOrphansLocked records, from a fresh table read taken once the
+// leader is gone, the live processes still in the leader's process group: a
+// child forked after the last refresh whose only recorded relative was the
+// leader (sh -c 'daemon & exit') is in no other set, and the sweep then
+// signals it, and its group, like any member. Caller holds t.mu.
+//
+// It trusts the group number only while that group provably is the pod's.
+// BSD does not reuse a pid while a process group by that number exists, so a
+// live process in group leader-pid means the group never emptied, unless the
+// leader's pid was itself recycled into a new group leader: a table that
+// still lists the leader's pid adopts nothing (the same instance already
+// vouched for its group in refreshLocked; another one is a stranger). A
+// candidate must be in the leader's session (a group never spans sessions),
+// have started no earlier than the leader and no later than the leader was
+// seen gone (a recycled leader's child starts after both), and not be a
+// zombie. The leader must have led its own session and group
+// (sid == pgid == pid, as POSIX_SPAWN_SETSID makes every tracked leader), and
+// that group must not be the daemon's own.
+//
+// It is one-shot: the first successful fresh read a sweep makes consumes the
+// leader, whether or not anything was adopted, including when that read still
+// lists the leader (alive, a zombie, or its pid recycled). A failed read does
+// not consume it; a later sweep may then still adopt, bounded by
+// leaderGoneAt, which the reap stamps even when no exit sweep runs. So a
+// sweep long after the reap (DeletePod's) never trusts a group number the
+// kernel may since have handed to a stranger's processes.
+func (t *procTree) adoptGroupOrphansLocked(entries []ProcEntry) {
+	l, goneAt := t.leader, t.leaderGoneAt
+	if l.Pid <= 1 {
+		return
+	}
+	t.leader = TreeMember{}
+	if l.Pgid != l.Pid || l.Sid != l.Pid || l.Pgid == t.selfPgid || goneAt == 0 {
+		return
+	}
+	for _, e := range entries {
+		if e.Pid == l.Pid {
+			return
+		}
+	}
+	for _, e := range entries {
+		if e.Pgid != l.Pgid || e.Sid != l.Sid || e.Zombie || e.Pid <= 1 || e.Pid == t.self ||
+			e.StartUnixNano < l.StartUnixNano || e.StartUnixNano > goneAt {
+			continue
+		}
+		if _, known := t.members[e.Pid]; !known {
+			t.members[e.Pid] = memberOf(e)
+		}
+	}
 }
 
 // getpgid reads pid's current process group through the seam.
@@ -528,13 +633,32 @@ func (p *Process) TreeMembers() []TreeMember {
 // whether the leader lives (a daemon shutdown cancels it while every pod runs
 // on by design), so only an observed exit sweeps.
 func (p *Process) sweepOnExit(err error) {
-	if err != nil && !isErrExitUnknown(err) {
+	if !exitObserved(err) {
 		return
 	}
 	if t := p.procTreeOf(); t != nil {
 		t.sweep()
 	}
 }
+
+// noteTreeLeaderExit stamps the tree's leader as gone when observed is set:
+// the exit wait saw the process exit, or its shim crashed. The reap calls it
+// before done closes and whether or not an exit sweep follows (a crashed
+// shim's container gets none), so a later sweep's orphan check is bounded by
+// the exit, not by when that sweep happens to run.
+func (p *Process) noteTreeLeaderExit(observed bool) {
+	if !observed {
+		return
+	}
+	if t := p.procTreeOf(); t != nil {
+		t.leaderExited()
+	}
+}
+
+// exitObserved reports whether an exit wait's error still means the exit was
+// observed: none, or ErrExitUnknown (an adopted process). A cancelled or
+// failed wait says nothing about whether the process lives.
+func exitObserved(err error) bool { return err == nil || isErrExitUnknown(err) }
 
 // isErrExitUnknown reports an observed exit whose status could not be read
 // (an adopted process): the exit itself is real.
