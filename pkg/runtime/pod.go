@@ -1619,11 +1619,35 @@ func (r *Runtime) killUntrackedSpawn(ctx context.Context, p *pod, cp *containerP
 // A non-zero exit or a failed wait is a POD-class SPAWN failure, unchanged: an
 // init container that ran and failed is not an image problem and has no waiting
 // reason in the kubelet vocabulary, so it stays the pod-level failure it was.
+//
+// A failed wait under an ended supervision context keeps the entry: Wait
+// returned an error and ctx (the pod-lifetime supervision context the wait ran
+// under) is done. The error then says nothing about whether the process lives,
+// whatever its class: DeletePod cancels ctx while a long init still runs, Wait
+// returns ctx.Err() on its own arm, the reaper finishes with the same error,
+// and a shim-backed wait can surface a raw waiter error that raced the cancel.
+// Such an entry stays in p.containers, with its log writer and its reap record.
+// The stop does not signal it in its first phase (that phase skips
+// init-declared entries), and its late snapshot misses it once
+// watchContainerExit has written the entry Terminated, so what reliably reaches
+// its group is the pod-tree sweep (sweepPodTrees) over the kept entry; the
+// record retirement keeps the record while the sweep reports survivors.
+// Dropping the entry here instead races that sweep, and the retirement then
+// drops the record of a group no sweep reached.
+//
+// Under a live ctx, an observed exit or any wait error (an exit status that
+// cannot be read, a crashed shim, even one wrapping a context error of its
+// own) drops the entry as before, so a later StartContainer of the init is not
+// refused as already started for the life of the pod.
 func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc) (runtimev1.FailureReason, error) {
 	if cp.sidecar() {
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 	}
 	code, _, werr := cp.proc.Wait(ctx)
+	if werr != nil && ctx.Err() != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+			fmt.Errorf("init container %s wait: %w", cp.name, werr)
+	}
 	p.mu.Lock()
 	removeContainerLocked(p, cp.name)
 	p.mu.Unlock()

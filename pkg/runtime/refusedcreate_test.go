@@ -75,6 +75,10 @@ type liveGroups struct {
 	signals  map[int][]os.Signal
 	sentAt   map[int][]time.Time
 	observed map[int]bool
+	// waitErr, when it holds an error for a pid, is what WaitExit returns for
+	// that pid at once, while the group stays live: a wait that failed for a
+	// reason other than its context, as an unreadable exit status does.
+	waitErr map[int]error
 	// deaf makes the table ignore every signal: a group then runs until the
 	// test ends it (exitAll), so a stop that escalates is seen to escalate
 	// rather than being cut short by an exit the first signal caused.
@@ -91,8 +95,8 @@ func newLiveGroups(t *testing.T) *liveGroups {
 	g := &liveGroups{
 		exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{},
 		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, sentAt: map[int][]time.Time{},
-		observed: map[int]bool{},
-		changed:  make(chan struct{}),
+		observed: map[int]bool{}, waitErr: map[int]error{},
+		changed: make(chan struct{}),
 	}
 	t.Cleanup(func() {
 		g.mu.Lock()
@@ -198,9 +202,13 @@ func (g *liveGroups) WaitExit(ctx context.Context, pid int) (int, int, error) {
 	g.mu.Lock()
 	ch, ok := g.exit[pid]
 	code := g.code[pid]
+	werr := g.waitErr[pid]
 	g.mu.Unlock()
 	if !ok {
 		return 0, 0, errors.New("wait for a pid the fake never spawned")
+	}
+	if werr != nil {
+		return 0, 0, werr
 	}
 	select {
 	case <-ch:
