@@ -388,9 +388,11 @@ type Posture struct {
 	//
 	// It carries the StatusRecordDir requirements, and additionally the pods root
 	// must not be at or under it (ErrInvalidStateDir), because the deny would then
-	// swallow the runtime's own tree. Generate refuses the whole profile rather
-	// than drop the deny. As for DataRoot the check is lexical: the caller passes
-	// a path with no symlink but the /var, /tmp and /etc firmlinks in it, and
+	// swallow the runtime's own tree. Both pods-root tests compare the /var, /tmp
+	// and /etc spellings with their /private ones, so a resolved value is held to
+	// the same bound as the work-dir's own spelling. Generate refuses the whole
+	// profile rather than drop the deny. Beyond the firmlinks the check is
+	// lexical: the caller passes a path with no other symlink in it, and
 	// DataRootDenyTrees is the list it checks the resolved paths of.
 	StateDir string
 }
@@ -1183,14 +1185,40 @@ func ValidateStateDir(dir, workDir string) error {
 // resolveStateDir validates a Posture.StateDir. Empty is not an error and returns
 // "": the field's documented unset state, which adds no deny. A pods root at or
 // under the state dir is refused for the reason resolveDataRoot gives.
+//
+// Both containment tests compare every firmlink spelling of each side
+// (underAnyForm), because the k3sm caller hands over a resolved /private path
+// while the work-dir is often its /var spelling: lexically /private/var/lib is
+// no ancestor of /var/lib/k3sm/pods, yet it is the same directory.
 func resolveStateDir(dir, podsRoot string) (string, error) {
 	if err := checkDenyDir(dir, podsRoot, ErrInvalidStateDir); err != nil {
 		return "", err
 	}
-	if dir != "" && isUnder(podsRoot, dir) {
+	if dir == "" {
+		return "", nil
+	}
+	if underAnyForm(dir, podsRoot) {
+		return "", fmt.Errorf("%w: %q is at or under the pods root %q", ErrInvalidStateDir, dir, podsRoot)
+	}
+	if underAnyForm(podsRoot, dir) {
 		return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidStateDir, podsRoot, dir)
 	}
 	return dir, nil
+}
+
+// underAnyForm reports whether some firmlink form of path is at or under some
+// firmlink form of prefix (firmlinkForms), so the answer does not depend on
+// which spelling of /var, /tmp or /etc either side was written in. Both are
+// assumed already filepath.Clean'd.
+func underAnyForm(path, prefix string) bool {
+	for _, p := range firmlinkForms(path) {
+		for _, pre := range firmlinkForms(prefix) {
+			if isUnder(p, pre) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ValidateDataRoot reports whether dir can be a Posture.DataRoot on a node with

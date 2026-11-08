@@ -440,6 +440,18 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"the work-dir":             {workDir, workDir},
 		"above the work-dir":       {workDir, "/opt"},
 		"work-dir under state dir": {"/opt/k3sm-data/cp/pods-root", "/opt/k3sm-data/cp"},
+		// The pods root is compared in both firmlink spellings: the k3sm caller
+		// hands over a resolved /private path while the runtime's work-dir is
+		// often the /var one, and each names the same directory.
+		"private ancestor of a var pods root":     {"/var/lib/k3sm", "/private/var/lib"},
+		"private spelling of a var work-dir":      {"/var/lib/k3sm", "/private/var/lib/k3sm"},
+		"bare private above a var pods root":      {"/var/lib/k3sm", "/private"},
+		"private spelling under a var pods root":  {"/var/lib/k3sm", "/private/var/lib/k3sm/pods/cp"},
+		"var ancestor of a private pods root":     {"/private/var/lib/k3sm", "/var/lib"},
+		"var spelling of a private work-dir":      {"/private/var/lib/k3sm", "/var/lib/k3sm"},
+		"var spelling under a private pods root":  {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/cp"},
+		"tmp ancestor of a private tmp pods root": {"/private/tmp/k3sm", "/tmp"},
+		"private tmp ancestor of a tmp pods root": {"/tmp/k3sm", "/private/tmp"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidStateDir) {
@@ -466,6 +478,20 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 			}
 			if err := ValidateStateDir(dir, workDir); err != nil {
 				t.Errorf("ValidateStateDir(%q): %v", dir, err)
+			}
+		})
+	}
+	for name, tc := range map[string]struct{ workDir, dir string }{
+		"private sibling leaf of a var work-dir": {"/var/lib/k3sm", "/private/var/lib/k3sm-cp"},
+		"var sibling leaf of a private work-dir": {"/private/var/lib/k3sm", "/var/lib/k3sm-cp"},
+		"private data root leaf beside var pods": {"/var/lib/k3sm/pods-root", "/private/var/lib/k3sm/cp"},
+	} {
+		t.Run("accepted/"+name, func(t *testing.T) {
+			if _, err := generate(tc.workDir, tc.dir); err != nil {
+				t.Errorf("Generate(%q): %v", tc.dir, err)
+			}
+			if err := ValidateStateDir(tc.dir, tc.workDir); err != nil {
+				t.Errorf("ValidateStateDir(%q): %v", tc.dir, err)
 			}
 		})
 	}
