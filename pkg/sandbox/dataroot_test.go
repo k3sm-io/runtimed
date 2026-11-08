@@ -255,6 +255,17 @@ func TestDataRootRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"work-dir is under server":   {"/opt/data/server/pods-root", "/opt/data"},
 		"work-dir is the agent dir":  {"/opt/data/agent", "/opt/data"},
 		"work-dir is under agent":    {"/opt/data/agent/pods-root", "/opt/data"},
+		// Both bounds compare every firmlink spelling, and case-insensitively.
+		"private spelling under a var pods root": {"/var/lib/k3sm", "/private/var/lib/k3sm/pods/data"},
+		"var spelling under a private pods root": {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/data"},
+		"var work-dir in the private server dir": {"/var/data/server/pods-root", "/private/var/data"},
+		"private work-dir in the var agent dir":  {"/private/var/data/agent", "/var/data"},
+		"other case under the pods root":         {workDir, "/opt/k3sm-pods/Pods/data"},
+		"work-dir in the other-case server dir":  {"/opt/data/SERVER/pods-root", "/opt/data"},
+		"VAR head under a private pods root":     {"/private/var/lib/k3sm", "/VAR/lib/k3sm/pods/data"},
+		"Tmp head under a private tmp pods root": {"/private/tmp/k3sm", "/Tmp/k3sm/pods/data"},
+		"PRIVATE head under a VAR pods root":     {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/pods/data"},
+		"private work-dir in a VAR server dir":   {"/private/var/data/server/pods-root", "/VAR/data"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidDataRoot) {
@@ -440,6 +451,39 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"the work-dir":             {workDir, workDir},
 		"above the work-dir":       {workDir, "/opt"},
 		"work-dir under state dir": {"/opt/k3sm-data/cp/pods-root", "/opt/k3sm-data/cp"},
+		// The pods root is compared in both firmlink spellings: the k3sm caller
+		// hands over a resolved /private path while the runtime's work-dir is
+		// often the /var one, and each names the same directory.
+		"private ancestor of a var pods root":     {"/var/lib/k3sm", "/private/var/lib"},
+		"private spelling of a var work-dir":      {"/var/lib/k3sm", "/private/var/lib/k3sm"},
+		"bare private above a var pods root":      {"/var/lib/k3sm", "/private"},
+		"private spelling under a var pods root":  {"/var/lib/k3sm", "/private/var/lib/k3sm/pods/cp"},
+		"var ancestor of a private pods root":     {"/private/var/lib/k3sm", "/var/lib"},
+		"var spelling of a private work-dir":      {"/private/var/lib/k3sm", "/var/lib/k3sm"},
+		"var spelling under a private pods root":  {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/cp"},
+		"tmp ancestor of a private tmp pods root": {"/private/tmp/k3sm", "/tmp"},
+		"private tmp ancestor of a tmp pods root": {"/tmp/k3sm", "/private/tmp"},
+		// The artifact view allows are emitted after the protected deny, so a
+		// state dir at, under or above <WorkDir>/artifacts would be re-opened by
+		// a pod's view grant.
+		"the artifacts root":                       {workDir, workDir + "/artifacts"},
+		"under the artifacts root":                 {workDir, workDir + "/artifacts/cp"},
+		"an artifact view":                         {workDir, workDir + "/artifacts/" + strings.Repeat("a", 64) + "/" + strings.Repeat("b", 64)},
+		"above the artifacts root":                 {"/opt/k3sm-data/cp/root", "/opt/k3sm-data/cp"},
+		"private artifacts root of a var work-dir": {"/var/lib/k3sm", "/private/var/lib/k3sm/artifacts"},
+		"var view under a private work-dir":        {"/private/var/lib/k3sm", "/var/lib/k3sm/artifacts/cp"},
+		// The default volume is case-insensitive and so is the kernel's match, so
+		// a spelling that differs only by case is the same directory.
+		"other case of the work-dir":          {workDir, "/OPT/K3SM-PODS"},
+		"other case of the pods root":         {workDir, "/opt/k3sm-pods/PODS"},
+		"other case under the pods root":      {workDir, "/opt/K3sm-Pods/pods/cp"},
+		"other case of the artifacts root":    {workDir, "/opt/k3sm-pods/Artifacts"},
+		"other case under the artifacts root": {workDir, "/OPT/k3sm-pods/ARTIFACTS/cp"},
+		// A firmlink head in another case still has its other spelling.
+		"VAR ancestor of a private pods root":      {"/private/var/lib/k3sm", "/VAR/lib"},
+		"Tmp ancestor of a private tmp pods root":  {"/private/tmp/k3sm", "/Tmp"},
+		"PRIVATE artifacts root of a VAR work-dir": {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/artifacts"},
+		"PRIVATE head under a VAR pods root":       {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/pods/cp"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidStateDir) {
@@ -453,12 +497,13 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		})
 	}
 	for name, dir := range map[string]string{
-		"empty":           "",
-		"custom leaf":     "/opt/k3sm-data/cp",
-		"default leaf":    "/opt/k3sm-data/server",
-		"outside":         "/srv/k3sm-state",
-		"sibling of pods": workDir + "/podsx",
-		"private form":    "/private/var/k3sm-data/cp",
+		"empty":             "",
+		"custom leaf":       "/opt/k3sm-data/cp",
+		"default leaf":      "/opt/k3sm-data/server",
+		"outside":           "/srv/k3sm-state",
+		"sibling of pods":   workDir + "/podsx",
+		"private form":      "/private/var/k3sm-data/cp",
+		"artifacts sibling": workDir + "/artifactsx",
 	} {
 		t.Run("accepted/"+name, func(t *testing.T) {
 			if _, err := generate(workDir, dir); err != nil {
@@ -469,84 +514,264 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 			}
 		})
 	}
+	for name, tc := range map[string]struct{ workDir, dir string }{
+		"private sibling leaf of a var work-dir": {"/var/lib/k3sm", "/private/var/lib/k3sm-cp"},
+		"var sibling leaf of a private work-dir": {"/private/var/lib/k3sm", "/var/lib/k3sm-cp"},
+		"private data root leaf beside var pods": {"/var/lib/k3sm/pods-root", "/private/var/lib/k3sm/cp"},
+	} {
+		t.Run("accepted/"+name, func(t *testing.T) {
+			if _, err := generate(tc.workDir, tc.dir); err != nil {
+				t.Errorf("Generate(%q): %v", tc.dir, err)
+			}
+			if err := ValidateStateDir(tc.dir, tc.workDir); err != nil {
+				t.Errorf("ValidateStateDir(%q): %v", tc.dir, err)
+			}
+		})
+	}
+}
+
+// TestProtectedPathsMatchEverySpelling pins validateExtraPaths to the directory
+// rather than the bytes: a caller-supplied allow spelled in the other firmlink
+// form, or in another case, still names a protected tree on the default volume,
+// and the post-deny allows (the credential read-only scope above all) would
+// re-open it. Every group a caller can fill is checked.
+func TestProtectedPathsMatchEverySpelling(t *testing.T) {
+	const workDir = "/opt/k3sm-pods"
+	for name, tc := range map[string]struct {
+		dataRoot, stateDir, path string
+	}{
+		"private spelling under a var state dir":   {"/var/k3sm-data", "/var/k3sm-data/cp", "/private/var/k3sm-data/cp/tls/server-ca.key"},
+		"var spelling under a private state dir":   {"/private/var/k3sm-data", "/private/var/k3sm-data/cp", "/var/k3sm-data/cp/tls/server-ca.key"},
+		"var spelling of a private state dir":      {"/private/var/k3sm-data", "/private/var/k3sm-data/cp", "/var/k3sm-data/cp"},
+		"other case under the state dir":           {"/opt/k3sm-data", "/opt/k3sm-data/cp", "/opt/k3sm-data/CP/tls/server-ca.key"},
+		"other case under a data root child":       {"/opt/k3sm-data", "", "/opt/K3SM-DATA/server/tls/server-ca.key"},
+		"other case under the pods root":           {"", "", "/opt/k3sm-pods/PODS/p2/rootfs"},
+		"var spelling under the private db prefix": {"", "", "/var/db/sudo"},
+		"other case under the user homes":          {"", "", "/users/alice/.ssh/id_ed25519"},
+		"VAR head under a private state dir":       {"/private/var/k3sm-data", "/private/var/k3sm-data/cp", "/VAR/k3sm-data/cp/tls/server-ca.key"},
+		"VAR head under the private db prefix":     {"", "", "/VAR/db/sudo"},
+		"PRIVATE head under a VAR state dir":       {"/VAR/k3sm-data", "/VAR/k3sm-data/cp", "/PRIVATE/var/k3sm-data/cp/tls/server-ca.key"},
+		"Tmp head under a private tmp state dir":   {"/private/tmp/k3sm-data", "/private/tmp/k3sm-data/cp", "/Tmp/k3sm-data/cp/x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			posture := Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir}
+			for group, opts := range map[string]GenerateOptions{
+				"read-only": {Posture: posture, ReadOnlyPaths: []string{tc.path}},
+				"write":     {Posture: posture, WritePaths: []string{tc.path}},
+				"read":      {Posture: posture, ReadPaths: []string{tc.path}},
+			} {
+				sp := &runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"}
+				if _, err := Generate(sp, opts); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("Generate with %s path %q: err = %v, want ErrProtectedPath", group, tc.path, err)
+				}
+			}
+			for group, sp := range map[string]*runtimev1.SandboxProfile{
+				"extra read":  {DataVolumePath: workDir + "/pods/p1/rootfs", ExtraReadPaths: []string{tc.path}},
+				"extra write": {DataVolumePath: workDir + "/pods/p1/rootfs", ExtraWritePaths: []string{tc.path}},
+			} {
+				if _, err := Generate(sp, GenerateOptions{Posture: posture}); !errors.Is(err, ErrProtectedPath) {
+					t.Errorf("Generate with %s path %q: err = %v, want ErrProtectedPath", group, tc.path, err)
+				}
+			}
+		})
+	}
+	// A path beside a protected tree whose name only extends it is not under it,
+	// in either case: the fold respects the segment boundary.
+	for name, path := range map[string]string{
+		"sibling of the state dir":    "/opt/k3sm-data/cpx/file",
+		"other-case sibling":          "/opt/k3sm-data/CPX/file",
+		"sibling of the users prefix": "/UsersX/file",
+		"the pod's own data volume":   workDir + "/pods/p1/rootfs/secret",
+	} {
+		t.Run("accepted/"+name, func(t *testing.T) {
+			sp := &runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"}
+			opts := GenerateOptions{
+				Posture:       Posture{WorkDir: workDir, DataRoot: "/opt/k3sm-data", StateDir: "/opt/k3sm-data/cp"},
+				ReadOnlyPaths: []string{path},
+			}
+			if _, err := Generate(sp, opts); err != nil {
+				t.Errorf("Generate with read-only path %q: %v", path, err)
+			}
+		})
+	}
+}
+
+// stateDirTree is a temp work-dir layout for the enforced state-dir cases: a
+// pods root and a data root side by side, the role's state dir at
+// <data>/<leaf> holding a secret, and a sibling file beside it that the ancestor
+// grant on <data> reaches.
+type stateDirTree struct {
+	pods, data, stateDir, secret, sibling string
+}
+
+const stateDirSecret = "private-key\n"
+
+// newStateDirTree builds a stateDirTree under a fresh directory in tmp, spelled
+// with its /private prefix when private is set, and removes it at cleanup.
+func newStateDirTree(t *testing.T, tmp string, private bool, leaf string) stateDirTree {
+	t.Helper()
+	base, err := os.MkdirTemp(tmp, "k3sm-sd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	if private {
+		base = "/private" + base
+	}
+	tr := stateDirTree{pods: filepath.Join(base, "pods-root"), data: filepath.Join(base, "data")}
+	tr.stateDir = filepath.Join(tr.data, leaf)
+	tr.secret, tr.sibling = filepath.Join(tr.stateDir, "server-ca.key"), filepath.Join(tr.data, "sibling")
+	if err := os.MkdirAll(tr.stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{tr.secret, tr.sibling} {
+		if err := os.WriteFile(f, []byte(stateDirSecret), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tr
+}
+
+// run renders a profile for posture that grants the whole data root read and
+// write, the ancestor grant the state-dir deny has to beat, and runs script
+// under sandbox-exec with target as $1.
+func (tr stateDirTree) run(t *testing.T, posture Posture, script, target string) ([]byte, string, error) {
+	t.Helper()
+	prof, err := Generate(&runtimev1.SandboxProfile{
+		DataVolumePath:  filepath.Join(tr.pods, "pods", "p1", "rootfs"),
+		ExtraReadPaths:  []string{tr.data},
+		ExtraWritePaths: []string{tr.data},
+	}, GenerateOptions{Posture: posture})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	sb := filepath.Join(t.TempDir(), "statedir.sb")
+	if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, "/bin/sh", "-c", script, "sh", target).Output()
+	return out, prof, err
+}
+
+const (
+	stateDirWriteScript = `printf forged > "$1"`
+	stateDirReadScript  = `IFS= read -r line < "$1" && printf '%s' "$line"`
+)
+
+// requireSandboxDenied fails t unless err is the sandboxed shell exiting non-zero
+// with the kernel's refusal on stderr, so a denied row cannot pass on a missing
+// file, a bad script or a sandbox-exec that never ran.
+func requireSandboxDenied(t *testing.T, what string, out []byte, err error, prof string) {
+	t.Helper()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Errorf("%s: err = %v, want the sandboxed shell to exit non-zero; stdout %q\n--- profile ---\n%s", what, err, out, prof)
+		return
+	}
+	if msg := string(ee.Stderr); !strings.Contains(msg, "Operation not permitted") && !strings.Contains(msg, "Permission denied") {
+		t.Errorf("%s: exited %v without a permission refusal on stderr: %q\n--- profile ---\n%s", what, ee, msg, prof)
+	}
+	if strings.Contains(string(out), "private-key") {
+		t.Errorf("%s: the secret reached stdout: %q", what, out)
+	}
+}
+
+// requireStateDirControls runs the two-sided controls every enforced case needs
+// under the profile with StateDir set: the ancestor grant on the data root still
+// reads a sibling of the state dir and still writes a fresh file beside it, so a
+// refusal inside the state dir is its deny and not a profile that refuses all.
+func (tr stateDirTree) requireStateDirControls(t *testing.T, withState Posture) {
+	t.Helper()
+	if out, prof, err := tr.run(t, withState, stateDirReadScript, tr.sibling); err != nil || string(out) != "private-key" {
+		t.Fatalf("the ancestor grant did not read %s, so the deny is unproven: %v\n%s\n--- profile ---\n%s", tr.sibling, err, out, prof)
+	}
+	fresh := filepath.Join(tr.data, "fresh")
+	if out, prof, err := tr.run(t, withState, stateDirWriteScript, fresh); err != nil {
+		t.Fatalf("the ancestor grant did not write %s, so the write deny is unproven: %v\n%s\n--- profile ---\n%s", fresh, err, out, prof)
+	}
+	if got, err := os.ReadFile(fresh); err != nil || string(got) != "forged" {
+		t.Fatalf("%s after the control write = %q, %v; want %q", fresh, got, err, "forged")
+	}
+}
+
+// otherFirmlinkSpelling returns p in its other firmlink spelling: without the
+// /private prefix when it has one, with it otherwise.
+func otherFirmlinkSpelling(p string) string {
+	if rest, ok := strings.CutPrefix(p, "/private/"); ok {
+		return "/" + rest
+	}
+	return "/private" + p
 }
 
 // TestStateDirEnforcedUnderACustomLeaf is the kernel's verdict on the custom-leaf
 // deny, through the sandbox-exec the DataRoot enforced cases use: with DataRoot
 // alone a secret in <data root>/cp is readable through an ancestor grant (the
-// defect), and with StateDir set it is neither readable nor writable.
+// defect), and with StateDir set it is neither readable nor writable, through
+// the spelling the posture names and through its other firmlink spelling. Each
+// row writes the posture in one spelling: the resolved /private one the k3sm
+// caller hands over, and the /var one a work-dir under /var/lib is written in.
 func TestStateDirEnforcedUnderACustomLeaf(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
 	}
-	base, err := os.MkdirTemp("/tmp", "k3sm-sd-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
-	// Written in the resolved /private form, the spelling the k3sm caller's
-	// resolved-path check hands over; the read below also goes through /tmp.
-	base = "/private" + base
-	pods, data := filepath.Join(base, "pods-root"), filepath.Join(base, "data")
-	stateDir := filepath.Join(data, "cp")
-	secret, sibling := filepath.Join(stateDir, "server-ca.key"), filepath.Join(data, "sibling")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	const original = "private-key\n"
-	for _, f := range []string{secret, sibling} {
-		if err := os.WriteFile(f, []byte(original), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	run := func(posture Posture, script, target string) ([]byte, string, error) {
-		t.Helper()
-		prof, err := Generate(&runtimev1.SandboxProfile{
-			DataVolumePath:  filepath.Join(pods, "pods", "p1", "rootfs"),
-			ExtraReadPaths:  []string{data},
-			ExtraWritePaths: []string{data},
-		}, GenerateOptions{Posture: posture})
-		if err != nil {
-			t.Fatalf("Generate: %v", err)
-		}
-		sb := filepath.Join(t.TempDir(), "statedir.sb")
-		if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		out, err := exec.Command("/usr/bin/sandbox-exec", "-f", sb, "/bin/sh", "-c", script, "sh", target).Output()
-		return out, prof, err
-	}
-	const (
-		writeScript = `printf forged > "$1"`
-		readScript  = `IFS= read -r line < "$1" && printf '%s' "$line"`
-	)
-	rootOnly := Posture{WorkDir: pods, DataRoot: data}
-	withState := Posture{WorkDir: pods, DataRoot: data, StateDir: stateDir}
+	for name, tc := range map[string]struct {
+		tmp     string
+		private bool
+	}{
+		"private spelling under /tmp": {"/tmp", true},
+		"var spelling under /var/tmp": {"/var/tmp", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr := newStateDirTree(t, tc.tmp, tc.private, "cp")
+			rootOnly := Posture{WorkDir: tr.pods, DataRoot: tr.data}
+			withState := Posture{WorkDir: tr.pods, DataRoot: tr.data, StateDir: tr.stateDir}
 
-	// The controls: the grant reaches the sibling with the field set, and the
-	// secret itself with DataRoot alone, so a refusal below is this deny.
-	if out, prof, err := run(withState, readScript, sibling); err != nil || string(out) != "private-key" {
-		t.Fatalf("the ancestor grant did not read %s, so the deny is unproven: %v\n%s\n--- profile ---\n%s", sibling, err, out, prof)
-	}
-	if out, prof, err := run(rootOnly, readScript, secret); err != nil || string(out) != "private-key" {
-		t.Fatalf("with DataRoot alone the custom-leaf secret was not readable, so this case proves nothing: %v\n%s\n--- profile ---\n%s", err, out, prof)
-	}
+			// The controls: the grant reads and writes beside the state dir with
+			// the field set, and reaches the secret itself with DataRoot alone,
+			// so a refusal below is this deny.
+			tr.requireStateDirControls(t, withState)
+			if out, prof, err := tr.run(t, rootOnly, stateDirReadScript, tr.secret); err != nil || string(out) != "private-key" {
+				t.Fatalf("with DataRoot alone the custom-leaf secret was not readable, so this case proves nothing: %v\n%s\n--- profile ---\n%s", err, out, prof)
+			}
 
-	for _, target := range []string{secret, strings.TrimPrefix(secret, "/private")} {
-		if out, prof, err := run(withState, readScript, target); err == nil || strings.Contains(string(out), "private-key") {
-			t.Errorf("read of %s succeeded under the generated profile: %q\n--- profile ---\n%s", target, out, prof)
+			for _, target := range []string{tr.secret, otherFirmlinkSpelling(tr.secret)} {
+				out, prof, err := tr.run(t, withState, stateDirReadScript, target)
+				requireSandboxDenied(t, "read of "+target, out, err, prof)
+			}
+			newFile := filepath.Join(tr.stateDir, "new.key")
+			for _, target := range []string{tr.secret, newFile, otherFirmlinkSpelling(newFile)} {
+				out, prof, err := tr.run(t, withState, stateDirWriteScript, target)
+				requireSandboxDenied(t, "write to "+target, out, err, prof)
+			}
+			if got, err := os.ReadFile(tr.secret); err != nil || string(got) != stateDirSecret {
+				t.Errorf("secret after the attempts = %q, %v; want %q", got, err, stateDirSecret)
+			}
+			if _, err := os.Stat(newFile); err == nil {
+				t.Errorf("a new file landed in %s", tr.stateDir)
+			}
+		})
+	}
+}
+
+// TestComparisonFormsPairsEveryHead pins the comparison twin of firmlinkForms:
+// the heads match in any case on a segment boundary, both directions map, and a
+// path off the firmlinks, or one that only extends a head's name, has one form.
+func TestComparisonFormsPairsEveryHead(t *testing.T) {
+	for in, want := range map[string]string{
+		"/var/lib/k3sm":         "/var/lib/k3sm,/private/var/lib/k3sm",
+		"/VAR/lib/k3sm":         "/VAR/lib/k3sm,/private/VAR/lib/k3sm",
+		"/Tmp":                  "/Tmp,/private/Tmp",
+		"/etc/ssl":              "/etc/ssl,/private/etc/ssl",
+		"/private/var/lib/k3sm": "/private/var/lib/k3sm,/var/lib/k3sm",
+		"/PRIVATE/var/lib":      "/PRIVATE/var/lib,/var/lib",
+		"/Private/TMP":          "/Private/TMP,/TMP",
+		"/private":              "/private",
+		"/variable/x":           "/variable/x",
+		"/private/varx":         "/private/varx",
+		"/opt/var":              "/opt/var",
+	} {
+		if got := strings.Join(comparisonForms(in), ","); got != want {
+			t.Errorf("comparisonForms(%q) = %s, want %s", in, got, want)
 		}
-	}
-	newFile := filepath.Join(stateDir, "new.key")
-	for _, target := range []string{secret, newFile} {
-		if out, prof, err := run(withState, writeScript, target); err == nil {
-			t.Errorf("write to %s succeeded under the generated profile: %s\n--- profile ---\n%s", target, out, prof)
-		}
-	}
-	if got, err := os.ReadFile(secret); err != nil || string(got) != original {
-		t.Errorf("secret after the attempts = %q, %v; want %q", got, err, original)
-	}
-	if _, err := os.Stat(newFile); err == nil {
-		t.Errorf("a new file landed in %s", stateDir)
 	}
 }

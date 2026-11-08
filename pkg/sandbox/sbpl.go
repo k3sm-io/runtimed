@@ -239,8 +239,10 @@ var ErrInvalidDataRoot = errors.New("sbpl: invalid data root")
 
 // ErrInvalidStateDir reports a set Posture.StateDir that cannot hold its deny:
 // the same refusals as ErrInvalidStatusRecordDir, plus a pods root at or under
-// the state dir, where the deny would swallow the runtime's own tree. An empty
-// value is not this error (see Posture.StateDir).
+// the state dir, where the deny would swallow the runtime's own tree, and a
+// state dir at, under or above <WorkDir>/artifacts, where an artifact view
+// allow emitted after the deny could re-open it. An empty value is not this
+// error (see Posture.StateDir).
 var ErrInvalidStateDir = errors.New("sbpl: invalid state dir")
 
 // ErrInvalidArtifactView is returned by Generate when a
@@ -388,10 +390,24 @@ type Posture struct {
 	//
 	// It carries the StatusRecordDir requirements, and additionally the pods root
 	// must not be at or under it (ErrInvalidStateDir), because the deny would then
-	// swallow the runtime's own tree. Generate refuses the whole profile rather
-	// than drop the deny. As for DataRoot the check is lexical: the caller passes
-	// a path with no symlink but the /var, /tmp and /etc firmlinks in it, and
+	// swallow the runtime's own tree, and it must not overlap <WorkDir>/artifacts
+	// at, under or above it, because the artifact view allows come after the
+	// deny and would re-open it. These containment tests compare the /var, /tmp
+	// and /etc spellings with their /private ones, so a resolved value is held to
+	// the same bound as the work-dir's own spelling, and they ignore case, as the
+	// default case-insensitive volume and the kernel's match do (on a
+	// case-sensitive volume that only refuses more). Generate refuses the whole
+	// profile rather than drop the deny. Beyond the firmlinks and case the check
+	// is lexical: the caller passes a path with no other symlink in it, and
 	// DataRootDenyTrees is the list it checks the resolved paths of.
+	//
+	// Known limit: Unicode normalization is not compared. APFS opens an NFD and
+	// an NFC spelling of a name as the same entry, but the standard library has
+	// no normaliser, so an NFD state dir is not seen as overlapping an NFC pods
+	// or artifacts root, nor an NFD allow as under an NFC deny. The kernel's own
+	// deny matched both spellings of the leaf under sandbox-exec (see
+	// TestStateDirEnforcedAcrossCaseAndNormalization); the gap is in these
+	// refusal checks only.
 	StateDir string
 }
 
@@ -1069,8 +1085,8 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 			workDirDenyRoots = append(workDirDenyRoots, tree)
 		} else if !slices.Contains(workDirDenyRoots, tree) {
 			// Another spelling of a rendered tree (its /private form): no new
-			// line, since the deny already matches it, but validateExtraPaths
-			// compares strings, so it still joins the protected set.
+			// line, since the deny already matches it. It still joins the
+			// protected set, which underAnyForm makes redundant but harmless.
 			unrendered = append(unrendered, tree)
 		}
 	}
@@ -1183,14 +1199,98 @@ func ValidateStateDir(dir, workDir string) error {
 // resolveStateDir validates a Posture.StateDir. Empty is not an error and returns
 // "": the field's documented unset state, which adds no deny. A pods root at or
 // under the state dir is refused for the reason resolveDataRoot gives.
+//
+// Both containment tests compare every firmlink spelling of each side
+// (underAnyForm), because the k3sm caller hands over a resolved /private path
+// while the work-dir is often its /var spelling: lexically /private/var/lib is
+// no ancestor of /var/lib/k3sm/pods, yet it is the same directory.
 func resolveStateDir(dir, podsRoot string) (string, error) {
 	if err := checkDenyDir(dir, podsRoot, ErrInvalidStateDir); err != nil {
 		return "", err
 	}
-	if dir != "" && isUnder(podsRoot, dir) {
+	if dir == "" {
+		return "", nil
+	}
+	if underAnyForm(dir, podsRoot) {
+		return "", fmt.Errorf("%w: %q is at or under the pods root %q", ErrInvalidStateDir, dir, podsRoot)
+	}
+	if underAnyForm(podsRoot, dir) {
 		return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidStateDir, podsRoot, dir)
 	}
+	// The artifact view allows (validateArtifactViews: views directly under
+	// <WorkDir>/artifacts) are emitted after the protected deny, and last match
+	// wins, so a view at or under the state dir would re-open it, and a state
+	// dir at or under the views root could be inside a view. Either overlap is
+	// refused rather than left to the views a pod happens to be granted.
+	views := filepath.Join(filepath.Dir(podsRoot), ArtifactViewsSubdir)
+	if underAnyForm(dir, views) || underAnyForm(views, dir) {
+		return "", fmt.Errorf("%w: %q overlaps the artifact views root %q", ErrInvalidStateDir, dir, views)
+	}
 	return dir, nil
+}
+
+// underAnyForm reports whether some spelling of path is at or under some
+// spelling of prefix (comparisonForms), comparing path segments without regard
+// to case (underFold). The answer then does not depend on which
+// spelling of /var, /tmp or /etc either side was written in, nor on its case:
+// the default macOS volume is case-insensitive APFS, and libsandbox matches a
+// deny string against it case-insensitively too, so /opt/K3SM/pods is the
+// /opt/k3sm/pods tree there. On a case-sensitive volume the fold only refuses
+// more than it must, which is the fail-closed direction for every caller: each
+// uses a true answer to refuse.
+//
+// Unicode normalization is not folded: the standard library has no normaliser,
+// so an NFD spelling of an NFC prefix is not seen as under it. Both are assumed
+// already filepath.Clean'd.
+func underAnyForm(path, prefix string) bool {
+	for _, p := range comparisonForms(path) {
+		for _, pre := range comparisonForms(prefix) {
+			if underFold(p, pre) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// comparisonForms returns the cleaned p and its other firmlink spelling, for
+// comparison only: /VAR/lib gains /private/VAR/lib, and /PRIVATE/var/lib gains
+// /var/lib. Unlike firmlinkForms it matches the /var, /tmp and /etc heads (and
+// the /private head before them) case-insensitively on a segment boundary and
+// maps in both directions, so underAnyForm pairs every spelling of either side.
+// firmlinkForms stays byte-wise and one-way because it also renders the
+// profile's (subpath ...) lines, and a node's rendered profile must not move.
+func comparisonForms(p string) []string {
+	p = filepath.Clean(p)
+	for _, fl := range macOSFirmlinks {
+		if underFold(p, fl) {
+			return []string{p, "/private" + p}
+		}
+		if underFold(p, "/private"+fl) {
+			// p is "/<private>/<head>[/rest]"; drop the first segment as written.
+			return []string{p, p[strings.Index(p[1:], "/")+1:]}
+		}
+	}
+	return []string{p}
+}
+
+// underFold is isUnder with each path segment compared by strings.EqualFold, so
+// the prefix ends on a segment boundary: /opt/CPX is not under /opt/cp. Both are
+// assumed already filepath.Clean'd.
+func underFold(path, prefix string) bool {
+	if prefix == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	ps, pres := strings.Split(path, "/"), strings.Split(prefix, "/")
+	if len(ps) < len(pres) {
+		return false
+	}
+	for i, seg := range pres {
+		if !strings.EqualFold(ps[i], seg) {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateDataRoot reports whether dir can be a Posture.DataRoot on a node with
@@ -1220,7 +1320,7 @@ func resolveDataRoot(dir, podsRoot string) (string, error) {
 		return "", nil
 	}
 	for _, sub := range DataRootDenySubdirs() {
-		if denied := filepath.Join(dir, sub); isUnder(podsRoot, denied) {
+		if denied := filepath.Join(dir, sub); underAnyForm(podsRoot, denied) {
 			return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidDataRoot, podsRoot, denied)
 		}
 	}
@@ -1250,7 +1350,8 @@ func resolveStatusRecordDir(dir, podsRoot string) (string, error) {
 //
 // The pods-root bound exists because the pod's data volume, which lives under
 // that root, is re-allowed after the protected denies and last match wins. A
-// directory there could be re-opened by a pod whose volume contains it.
+// directory there could be re-opened by a pod whose volume contains it. It
+// compares every firmlink spelling and case (underAnyForm).
 func checkDenyDir(dir, podsRoot string, sentinel error) error {
 	switch {
 	case dir == "":
@@ -1263,7 +1364,7 @@ func checkDenyDir(dir, podsRoot string, sentinel error) error {
 		return fmt.Errorf("%w: %q is the filesystem root", sentinel, dir)
 	case filepath.Clean(dir) != dir:
 		return fmt.Errorf("%w: %q is not a clean path", sentinel, dir)
-	case isUnder(dir, podsRoot):
+	case underAnyForm(dir, podsRoot):
 		return fmt.Errorf("%w: %q is at or under the pods root %q", sentinel, dir, podsRoot)
 	}
 	return nil
@@ -1303,6 +1404,14 @@ func isHex64(s string) bool {
 // prefix, returning ErrProtectedPath. The pod's own data volume (dataVol) is
 // always permitted (it is re-allowed by Generate). Non-absolute paths and "/" are
 // rejected — a relative or whole-filesystem grant is never intended.
+//
+// The protected test is underAnyForm, so an allow spelled in the other firmlink
+// form or another case cannot slip under a deny it names the same directory as;
+// the allows emitted after the protected denies (the credential scope, the
+// artifact views) would otherwise re-open it. The data-volume carve-out stays a
+// byte match on purpose: widening it by case would let a case-sensitive volume
+// grant another pod's tree, so another spelling of the pod's own volume is
+// refused instead (fail closed).
 func validateExtraPaths(dataVol string, protectedPrefixes []string, groups ...[]string) error {
 	cleanData := filepath.Clean(dataVol)
 	for _, g := range groups {
@@ -1321,7 +1430,7 @@ func validateExtraPaths(dataVol string, protectedPrefixes []string, groups ...[]
 				continue // the pod's own dir is always allowed
 			}
 			for _, pre := range protectedPrefixes {
-				if isUnder(p, pre) {
+				if underAnyForm(p, pre) {
 					return fmt.Errorf("%w: %q is under protected %q; relocate the runtime root off this prefix with the k3sm server --pod-root flag", ErrProtectedPath, raw, pre)
 				}
 			}
