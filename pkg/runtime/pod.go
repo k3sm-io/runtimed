@@ -815,6 +815,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 			// NOT plumbing either: where the control-plane secrets really live,
 			// denied beside <Root>/server and <Root>/agent. Empty adds nothing.
 			DataRoot: r.cfg.DataRoot,
+			// NOT plumbing either: the role's own state dir, whatever its leaf,
+			// denied beside the DataRoot children. Empty adds nothing.
+			StateDir: r.cfg.StateDir,
 			// The re-signed shell copies: an explicit read grant beside the
 			// /Library baseline (Config.ShadowBinDir).
 			ShadowBinDir: r.cfg.ShadowBinDir,

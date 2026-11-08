@@ -271,6 +271,14 @@ type Config struct {
 	// adds nothing: those denies stand alone, which leaves state kept elsewhere to
 	// default-deny. New refuses a set value the denies cannot be written from.
 	DataRoot string
+	// StateDir is the k3sm role's real state directory, its --work-dir itself,
+	// which holds the CA keys, the kine database and the node password whatever
+	// its leaf. It is threaded into sandbox.Posture.StateDir, where it renders a
+	// read+write DENY for every confined pod beside the DataRoot ones, which name
+	// only the fixed server and agent leaves. Empty adds nothing, and a default
+	// leaf renders the profile unchanged. New refuses a set value the deny cannot
+	// be written from (sandbox.ErrInvalidStateDir).
+	StateDir string
 	// PathShimPath is the on-disk path of the path-rebase DYLD interpose shim
 	// (shim/pathrebase_shim.c). When set, containerEnv injects it into a mounting
 	// container's DYLD_INSERT_LIBRARIES with K3SM_ROOTFS + K3SM_MOUNT_PATHS so an
@@ -894,6 +902,9 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		return nil, err
 	}
 	if err := sandbox.ValidateDataRoot(cfg.DataRoot, cfg.Root); err != nil {
+		return nil, err
+	}
+	if err := sandbox.ValidateStateDir(cfg.StateDir, cfg.Root); err != nil {
 		return nil, err
 	}
 	// Own the root before touching anything under it: two live Runtimes over one
