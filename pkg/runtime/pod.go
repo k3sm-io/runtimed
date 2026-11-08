@@ -771,84 +771,25 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // daemon start's reap: without this, each retry of the create would leave
 // another running copy, with its reap record and an open log file.
 //
-// It is DeletePod's host-process stop for a pod that was never published. The
-// mains are stopped concurrently, then the native sidecars in reverse start
-// order, inside one budget: the pod's own grace (podDefaultGrace), through
-// supervisor.GracefulStop and its bounded exit-observation wait. Then the
-// supervision is cancelled, the trees are swept, the log tails are drained and
-// the writers closed, and the reap records are retired, keeping any that name
-// survivors of the sweep. Nothing is published, because the pod was never
-// ADDED. The network, the shim dirs and the pod dir are createPod's and
-// CreatePod's own unwinds.
+// It is DeletePod's host-process stop (stopHostPod) for a pod that was never
+// published, within the pod's own grace (podDefaultGrace). Nothing is
+// published, because the pod was never ADDED, and the network, the shim dirs
+// and the pod dir are createPod's and CreatePod's own unwinds, so it sets
+// neither hook.
 //
-// A main whose process has already exited (it ran to completion before the
-// refusal) is skipped, never signalled: its group is reaped and its pgid may
-// already name another process. stopSidecars skips an exited sidecar the same
-// way. A plain init container is in neither stop set, so one still running in
-// p.containers would get only the tree sweep's SIGKILL; in practice none is
-// there, because finishInitStep drops a plain init container from
-// p.containers once its wait returns.
+// It differs from DeletePod's stop in one way, spareExited: a main whose
+// process has already exited (it ran to completion before the refusal) is
+// never signalled, because its group is reaped and its pgid may already name
+// another process. stopSidecars skips an exited sidecar the same way.
 //
 // The stop is bounded: the mains run concurrently and the sidecars in turn
 // against one deadline, so the signalling waits at most
-// grace + (1+len(sidecars))*exitObservationGrace, and the log-tail drain adds
-// at most drainGrace after it.
-//
-// Two flags guard it, both set under p.mu before anything is signalled:
-// p.stopping closes the pod to new process groups (an install still in flight
-// kills its own spawn), and p.sidecarTeardown claims the sidecar stop, so a
-// main exit this stop induces does not also start the voluntary-completion
-// teardown.
+// grace + (1+len(sidecars)+late)*exitObservationGrace, where late counts the
+// running groups outside both stop sets (a plain init container still in
+// p.containers), each SIGKILLed in turn once supervision is cancelled. The
+// log-tail drain adds at most drainGrace after it.
 func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
-	podID := p.box.GetPodId()
-	p.mu.Lock()
-	// Closed to new groups first, as DeletePod does: an install still in flight
-	// kills its own spawn instead of adding one this unwind will not signal.
-	p.stopping = true
-	// The mains this stop induces must not start the voluntary-completion
-	// teardown concurrently with the sidecar stop below.
-	p.sidecarTeardown = true
-	var mains []*supervisor.Process
-	for _, cp := range liveContainersLocked(p) {
-		if !cp.initDeclared {
-			mains = append(mains, cp.proc)
-		}
-	}
-	sidecars := sidecarsLocked(p)
-	p.mu.Unlock()
-
-	grace := podDefaultGrace(0, p)
-	deadline := time.Now().Add(grace)
-	var wg sync.WaitGroup
-	for _, proc := range mains {
-		pid := proc.PID()
-		if pid <= 0 || procDone(proc) {
-			// Already exited and reaped: nothing to stop, and a signal to its
-			// pgid could reach whatever reuses it.
-			continue
-		}
-		wg.Add(1)
-		go func(proc *supervisor.Process, pid int) {
-			defer wg.Done()
-			if _, observed, err := supervisor.GracefulStop(ctx, pid, grace, proc.Done(),
-				termSignal, killSignal, proc.StopSignal(r.signalGroup), r.exitObservationGrace()); err != nil {
-				r.log.Warn("stop a container of a refused pod", "pod", podID, "pid", pid, "err", err)
-			} else if !observed {
-				r.log.Warn("container exit of a refused pod not observed before the bound",
-					"pod", podID, "pid", pid, "bound", r.exitObservationGrace().String())
-			}
-		}(proc, pid)
-	}
-	wg.Wait()
-	r.stopSidecars(ctx, podID, sidecars, deadline)
-
-	if p.cancel != nil {
-		p.cancel()
-	}
-	survivors := r.sweepPodTrees(podID, p)
-	r.awaitLogTails(p)
-	r.closeContainerLogs(p)
-	r.retirePodReapRecords(podID, survivors)
+	r.stopHostPod(ctx, p, hostStop{grace: podDefaultGrace(0, p), spareExited: true})
 }
 
 // compileProfile compiles a host-process pod's SBPL profile from its spec and

@@ -71,7 +71,15 @@ type liveGroups struct {
 	pipes    map[int][]int
 	held     []int
 	signals  map[int][]os.Signal
+	sentAt   map[int][]time.Time
 	observed map[int]bool
+	// deaf makes the table ignore every signal: a group then runs until the
+	// test ends it (exitAll), so a stop that escalates is seen to escalate
+	// rather than being cut short by an exit the first signal caused.
+	deaf bool
+	// onFailSpawn, when set, runs as a markFailSpawn spawn is refused: the
+	// moment the create's refusal is decided.
+	onFailSpawn func()
 	// changed is closed and replaced (under mu) whenever a group goes live,
 	// exits or is observed gone, so a waiter blocks on it instead of sleeping.
 	changed chan struct{}
@@ -80,8 +88,9 @@ type liveGroups struct {
 func newLiveGroups(t *testing.T) *liveGroups {
 	g := &liveGroups{
 		exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{},
-		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, observed: map[int]bool{},
-		changed: make(chan struct{}),
+		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, sentAt: map[int][]time.Time{},
+		observed: map[int]bool{},
+		changed:  make(chan struct{}),
 	}
 	t.Cleanup(func() {
 		g.mu.Lock()
@@ -124,6 +133,9 @@ func (g *liveGroups) awaitExitedObserved() {
 func (g *liveGroups) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, error) {
 	if slices.Contains(spec.Argv, markFailSpawn) {
 		g.awaitExitedObserved()
+		if g.onFailSpawn != nil {
+			g.onFailSpawn()
+		}
 		return 0, errors.New("posix_spawn: no such file or directory")
 	}
 	if _, err := podEnvSpawn(spec); err != nil {
@@ -199,7 +211,8 @@ func (g *liveGroups) signal(pgid int, sig os.Signal) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.signals[pgid] = append(g.signals[pgid], sig)
-	if sig != termSignal && sig != killSignal {
+	g.sentAt[pgid] = append(g.sentAt[pgid], time.Now())
+	if g.deaf || (sig != termSignal && sig != killSignal) {
 		return nil
 	}
 	g.exitLocked(pgid)
@@ -234,6 +247,22 @@ func (g *liveGroups) signalsTo(pgid int) []os.Signal {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]os.Signal(nil), g.signals[pgid]...)
+}
+
+// signalTimes returns when each signal signalsTo reports was delivered.
+func (g *liveGroups) signalTimes(pgid int) []time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]time.Time(nil), g.sentAt[pgid]...)
+}
+
+// exitAll ends every group still live, as the end of the test does.
+func (g *liveGroups) exitAll() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for pid := range g.exit {
+		g.exitLocked(pid)
+	}
 }
 
 func (g *liveGroups) spawned() int {
@@ -463,5 +492,137 @@ func assertRefusedCreateUnwound(t *testing.T, rt *Runtime, g *liveGroups, podID 
 	}
 	if len(openLog) > 0 {
 		t.Errorf("attempt %d: container log files still open: %v", attempt, openLog)
+	}
+}
+
+// TestRefusedCreateStopHonoursGraceAndEscalation pins the stop a refused
+// CreatePod runs against groups that do not die when signalled, which is what
+// separates a stop that escalates from one an exit happened to end. The table's
+// groups ignore every signal (liveGroups.deaf), so each row's signals are the
+// stop's own decisions:
+//
+//   - a main that ignores SIGTERM is sent SIGKILL once the pod's grace has run,
+//     and not before;
+//   - a request ctx cancelled at the refusal escalates to SIGKILL at once,
+//     long before the grace would;
+//   - a plain init container still running at the refusal, which is in neither
+//     the mains' nor the sidecars' stop set, is SIGKILLed after supervision is
+//     cancelled instead of being left to the tree sweep.
+//
+// There is no clock seam in this package, so the grace row runs on the
+// shortest grace the API can express (one second) and the timings are read
+// from when the fake received each signal.
+func TestRefusedCreateStopHonoursGraceAndEscalation(t *testing.T) {
+	cases := []struct {
+		name string
+		// grace is the pod's termination_grace_period_seconds.
+		grace int64
+		// cancelAtRefusal cancels the CreatePod ctx as the refusing spawn fails.
+		cancelAtRefusal bool
+		// plainInit runs the unwind directly on a pod whose one running
+		// container is a plain init container: createPod drops a plain init
+		// from p.containers once its wait returns, so no create refusal leaves
+		// one there today, and the row pins what the stop would do if one did.
+		plainInit bool
+		// want is every signal container 1's group gets, in order.
+		want []os.Signal
+		// minGap and maxGap bound the time from the first signal to the second
+		// (zero: unchecked).
+		minGap, maxGap time.Duration
+	}{
+		{
+			name:   "sigterm-ignoring-main-escalates-after-grace",
+			grace:  1,
+			want:   []os.Signal{termSignal, killSignal},
+			minGap: time.Second,
+		},
+		{
+			name:            "cancelled-ctx-escalates-at-once",
+			grace:           30,
+			cancelAtRefusal: true,
+			want:            []os.Signal{termSignal, killSignal},
+			maxGap:          10 * time.Second,
+		},
+		{
+			name:      "plain-init-running-at-refusal-is-killed",
+			grace:     30,
+			plainInit: true,
+			want:      []os.Signal{killSignal},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newLiveGroups(t)
+			g.deaf = true
+			rt := newTestRuntime(t, Deps{Spawner: g, Waiter: g, SignalGroup: g.signal, ProcGroup: g.procGroup})
+			rt.drainGrace = 50 * time.Millisecond
+			// Registered after the runtime, so it runs before rt.Close: the groups
+			// end and their log pumps see EOF before supervision is torn down.
+			t.Cleanup(g.exitAll)
+			const (
+				podID = "pod-refused-create-stop"
+				c1    = 3001
+			)
+			box := hostBinBox(rt, podID)
+			box.TerminationGracePeriodSeconds = tc.grace
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			if tc.plainInit {
+				box.Containers = []*runtimev1.Container{{Name: "init", Image: "/bin/sleep"}}
+				resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
+				if err != nil || resp.GetError() != nil {
+					t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+				}
+				rt.mu.Lock()
+				p := rt.pods[podID]
+				delete(rt.pods, podID)
+				rt.mu.Unlock()
+				if p == nil {
+					t.Fatal("created pod is not registered")
+				}
+				p.mu.Lock()
+				for _, cp := range p.containers {
+					// Re-declare the running container as a plain init: restart
+					// policy unspecified, so it is init-declared but no sidecar.
+					cp.initDeclared = true
+				}
+				p.mu.Unlock()
+				rt.unwindRefusedCreate(ctx, p)
+			} else {
+				box.Containers = []*runtimev1.Container{
+					{Name: "c1", Image: "/bin/sleep"},
+					{Name: "c2", Image: NativeImage, Command: []string{"/bin/sleep", markFailSpawn}},
+				}
+				if tc.cancelAtRefusal {
+					g.onFailSpawn = cancel
+				}
+				resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
+				if err != nil {
+					t.Fatalf("CreatePod: %v", err)
+				}
+				if got := resp.GetFailureReason(); resp.GetError() == nil || got != runtimev1.FailureReason_FAILURE_REASON_SPAWN {
+					t.Fatalf("CreatePod = reason %v, error %v; want a SPAWN refusal", got, resp.GetError())
+				}
+			}
+
+			if got := g.spawned(); got != 1 {
+				t.Fatalf("%d groups spawned, want 1", got)
+			}
+			sigs, at := g.signalsTo(c1), g.signalTimes(c1)
+			if !slices.Equal(sigs, tc.want) {
+				t.Fatalf("container 1 was signalled %v, want %v", sigs, tc.want)
+			}
+			if len(tc.want) < 2 {
+				return
+			}
+			gap := at[1].Sub(at[0])
+			if tc.minGap > 0 && gap < tc.minGap {
+				t.Errorf("SIGKILL followed SIGTERM after %v, inside the %v grace", gap, tc.minGap)
+			}
+			if tc.maxGap > 0 && gap > tc.maxGap {
+				t.Errorf("SIGKILL followed SIGTERM after %v, want an escalation within %v", gap, tc.maxGap)
+			}
+		})
 	}
 }
