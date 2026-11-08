@@ -262,6 +262,10 @@ func TestDataRootRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"private work-dir in the var agent dir":  {"/private/var/data/agent", "/var/data"},
 		"other case under the pods root":         {workDir, "/opt/k3sm-pods/Pods/data"},
 		"work-dir in the other-case server dir":  {"/opt/data/SERVER/pods-root", "/opt/data"},
+		"VAR head under a private pods root":     {"/private/var/lib/k3sm", "/VAR/lib/k3sm/pods/data"},
+		"Tmp head under a private tmp pods root": {"/private/tmp/k3sm", "/Tmp/k3sm/pods/data"},
+		"PRIVATE head under a VAR pods root":     {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/pods/data"},
+		"private work-dir in a VAR server dir":   {"/private/var/data/server/pods-root", "/VAR/data"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidDataRoot) {
@@ -475,6 +479,11 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"other case under the pods root":      {workDir, "/opt/K3sm-Pods/pods/cp"},
 		"other case of the artifacts root":    {workDir, "/opt/k3sm-pods/Artifacts"},
 		"other case under the artifacts root": {workDir, "/OPT/k3sm-pods/ARTIFACTS/cp"},
+		// A firmlink head in another case still has its other spelling.
+		"VAR ancestor of a private pods root":      {"/private/var/lib/k3sm", "/VAR/lib"},
+		"Tmp ancestor of a private tmp pods root":  {"/private/tmp/k3sm", "/Tmp"},
+		"PRIVATE artifacts root of a VAR work-dir": {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/artifacts"},
+		"PRIVATE head under a VAR pods root":       {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/pods/cp"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidStateDir) {
@@ -539,6 +548,10 @@ func TestProtectedPathsMatchEverySpelling(t *testing.T) {
 		"other case under the pods root":           {"", "", "/opt/k3sm-pods/PODS/p2/rootfs"},
 		"var spelling under the private db prefix": {"", "", "/var/db/sudo"},
 		"other case under the user homes":          {"", "", "/users/alice/.ssh/id_ed25519"},
+		"VAR head under a private state dir":       {"/private/var/k3sm-data", "/private/var/k3sm-data/cp", "/VAR/k3sm-data/cp/tls/server-ca.key"},
+		"VAR head under the private db prefix":     {"", "", "/VAR/db/sudo"},
+		"PRIVATE head under a VAR state dir":       {"/VAR/k3sm-data", "/VAR/k3sm-data/cp", "/PRIVATE/var/k3sm-data/cp/tls/server-ca.key"},
+		"Tmp head under a private tmp state dir":   {"/private/tmp/k3sm-data", "/private/tmp/k3sm-data/cp", "/Tmp/k3sm-data/cp/x"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			posture := Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir}
@@ -737,5 +750,28 @@ func TestStateDirEnforcedUnderACustomLeaf(t *testing.T) {
 				t.Errorf("a new file landed in %s", tr.stateDir)
 			}
 		})
+	}
+}
+
+// TestComparisonFormsPairsEveryHead pins the comparison twin of firmlinkForms:
+// the heads match in any case on a segment boundary, both directions map, and a
+// path off the firmlinks, or one that only extends a head's name, has one form.
+func TestComparisonFormsPairsEveryHead(t *testing.T) {
+	for in, want := range map[string]string{
+		"/var/lib/k3sm":         "/var/lib/k3sm,/private/var/lib/k3sm",
+		"/VAR/lib/k3sm":         "/VAR/lib/k3sm,/private/VAR/lib/k3sm",
+		"/Tmp":                  "/Tmp,/private/Tmp",
+		"/etc/ssl":              "/etc/ssl,/private/etc/ssl",
+		"/private/var/lib/k3sm": "/private/var/lib/k3sm,/var/lib/k3sm",
+		"/PRIVATE/var/lib":      "/PRIVATE/var/lib,/var/lib",
+		"/Private/TMP":          "/Private/TMP,/TMP",
+		"/private":              "/private",
+		"/variable/x":           "/variable/x",
+		"/private/varx":         "/private/varx",
+		"/opt/var":              "/opt/var",
+	} {
+		if got := strings.Join(comparisonForms(in), ","); got != want {
+			t.Errorf("comparisonForms(%q) = %s, want %s", in, got, want)
+		}
 	}
 }

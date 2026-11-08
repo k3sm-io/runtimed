@@ -312,6 +312,10 @@ func TestStatusRecordDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"var spelling under a private pods root": {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/status"},
 		"other case under the pods root":         {workDir, "/opt/k3sm-pods/PODS/status"},
 		"other case of the pods root":            {workDir, "/OPT/K3SM-PODS/pods"},
+		// A firmlink head in another case still has its other spelling.
+		"VAR head under a private pods root":     {"/private/var/lib/k3sm", "/VAR/lib/k3sm/pods/status"},
+		"Tmp head under a private tmp pods root": {"/private/tmp/k3sm", "/Tmp/k3sm/pods/status"},
+		"PRIVATE head under a VAR pods root":     {"/VAR/lib/k3sm", "/PRIVATE/var/lib/k3sm/pods/status"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: tc.workDir + "/pods/p1/rootfs"},

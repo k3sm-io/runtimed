@@ -1229,9 +1229,9 @@ func resolveStateDir(dir, podsRoot string) (string, error) {
 	return dir, nil
 }
 
-// underAnyForm reports whether some firmlink form of path is at or under some
-// firmlink form of prefix (firmlinkForms), comparing path segments without
-// regard to case (underFold). The answer then does not depend on which
+// underAnyForm reports whether some spelling of path is at or under some
+// spelling of prefix (comparisonForms), comparing path segments without regard
+// to case (underFold). The answer then does not depend on which
 // spelling of /var, /tmp or /etc either side was written in, nor on its case:
 // the default macOS volume is case-insensitive APFS, and libsandbox matches a
 // deny string against it case-insensitively too, so /opt/K3SM/pods is the
@@ -1243,14 +1243,35 @@ func resolveStateDir(dir, podsRoot string) (string, error) {
 // so an NFD spelling of an NFC prefix is not seen as under it. Both are assumed
 // already filepath.Clean'd.
 func underAnyForm(path, prefix string) bool {
-	for _, p := range firmlinkForms(path) {
-		for _, pre := range firmlinkForms(prefix) {
+	for _, p := range comparisonForms(path) {
+		for _, pre := range comparisonForms(prefix) {
 			if underFold(p, pre) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// comparisonForms returns the cleaned p and its other firmlink spelling, for
+// comparison only: /VAR/lib gains /private/VAR/lib, and /PRIVATE/var/lib gains
+// /var/lib. Unlike firmlinkForms it matches the /var, /tmp and /etc heads (and
+// the /private head before them) case-insensitively on a segment boundary and
+// maps in both directions, so underAnyForm pairs every spelling of either side.
+// firmlinkForms stays byte-wise and one-way because it also renders the
+// profile's (subpath ...) lines, and a node's rendered profile must not move.
+func comparisonForms(p string) []string {
+	p = filepath.Clean(p)
+	for _, fl := range macOSFirmlinks {
+		if underFold(p, fl) {
+			return []string{p, "/private" + p}
+		}
+		if underFold(p, "/private"+fl) {
+			// p is "/<private>/<head>[/rest]"; drop the first segment as written.
+			return []string{p, p[strings.Index(p[1:], "/")+1:]}
+		}
+	}
+	return []string{p}
 }
 
 // underFold is isUnder with each path segment compared by strings.EqualFold, so
