@@ -379,6 +379,7 @@ func (p *Process) reap(ctx context.Context, pid int) {
 	code, sig, err := p.waiter.WaitExit(ctx, pid)
 	waitErr := err
 	code, sig, err = p.shimExit(ctx, code, sig, err)
+	p.noteTreeLeaderExit(exitObserved(waitErr) || errors.Is(err, ErrShimCrashed))
 	// A shim that crashed leaves its container possibly alive, for the runtime
 	// to take over: that is not the container's exit, so nothing is swept.
 	if !errors.Is(err, ErrShimCrashed) {
@@ -394,6 +395,7 @@ func (p *Process) reap(ctx context.Context, pid int) {
 // reapPID is reap for a process whose own wait status is its exit.
 func (p *Process) reapPID(ctx context.Context, pid int) {
 	code, sig, err := p.waiter.WaitExit(ctx, pid)
+	p.noteTreeLeaderExit(exitObserved(err))
 	p.sweepOnExit(err)
 	p.finish(code, sig, err)
 }

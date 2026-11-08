@@ -17,6 +17,7 @@ limitations under the License.
 package supervisor
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -489,5 +490,98 @@ func TestStaleSweepAdoptsNoRecycledLeadersOrphan(t *testing.T) {
 	defer f.mu.Unlock()
 	if len(f.killed) != 0 || len(f.groups) != 0 {
 		t.Fatalf("a stale sweep signalled pids %v groups %v, want none", f.killed, f.groups)
+	}
+}
+
+// fakeClock is a settable clock for procTree.now.
+type fakeClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func (c *fakeClock) set(ns int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = ns
+}
+
+func (c *fakeClock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Unix(0, c.now)
+}
+
+// TestReapStampsTheLeadersExitForALaterSweep pins the reap-time stamp on the
+// production reap path: the leader is reaped at t=100, a stranger in a group
+// numbered like it starts at t=150 (the leader's pid recycled into a setsid'd
+// leader that forked and exited), and a KillTree at t=200 must not signal it.
+// On the shim-crash path no exit sweep runs, so only the reap stamp stands
+// between that stranger and adoption.
+func TestReapStampsTheLeadersExitForALaterSweep(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		shim bool
+	}{
+		{name: "a crashed shim, which skips the exit sweep", shim: true},
+		{name: "a plain process, whose exit sweep runs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeTable{rows: map[int]ProcEntry{100: row(100, 50, 100, 100, 1)}}
+			clk := &fakeClock{}
+			tr := newProcTree(f.config(), 100)
+			tr.now = clk.read
+			p := &Process{pid: 100, tree: tr, done: make(chan struct{}), drained: make(chan struct{})}
+			if tc.shim {
+				p.shimDir = t.TempDir() // no exit record and no kill: ErrShimCrashed
+			}
+			w := newGatedWaiter(0, 0)
+			w.release()
+			p.waiter = w
+			f.mu.Lock()
+			delete(f.rows, 100)
+			f.mu.Unlock()
+			clk.set(100)
+			p.reap(t.Context(), 100)
+			<-p.Done()
+			if _, _, err := p.Wait(t.Context()); tc.shim && !errors.Is(err, ErrShimCrashed) {
+				t.Fatalf("reap err = %v, want ErrShimCrashed", err)
+			}
+			f.set(row(101, 1, 100, 100, 150))
+			clk.set(200)
+			p.KillTree()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if len(f.killed) != 0 || len(f.groups) != 0 {
+				t.Fatalf("a stranger started after the reap was signalled: pids %v groups %v", f.killed, f.groups)
+			}
+		})
+	}
+}
+
+// TestLeaderGoneStampEarliestWins pins that the first sighting of the leader's
+// exit is the one kept: a tick that no longer lists the leader at t=50 stamps
+// it, a reap observed at t=100 does not move it, so a process started at t=70
+// is no orphan of the leader's.
+func TestLeaderGoneStampEarliestWins(t *testing.T) {
+	f := &fakeTable{rows: map[int]ProcEntry{100: row(100, 50, 100, 100, 1)}}
+	clk := &fakeClock{}
+	tr := newProcTree(f.config(), 100)
+	tr.now = clk.read
+	f.mu.Lock()
+	delete(f.rows, 100)
+	f.mu.Unlock()
+	clk.set(50)
+	tr.refresh(0)
+	clk.set(100)
+	tr.leaderExited()
+	if tr.leaderGoneAt != 50 {
+		t.Fatalf("leaderGoneAt = %d, want the earliest stamp 50", tr.leaderGoneAt)
+	}
+	f.set(row(101, 1, 100, 100, 70))
+	tr.sweep()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.killed) != 0 || len(f.groups) != 0 {
+		t.Fatalf("a process started after the earliest stamp was signalled: pids %v groups %v", f.killed, f.groups)
 	}
 }
