@@ -287,23 +287,20 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 			continue
 		}
 		// A plain init container's tracked entry with a process is the one
-		// init step currently running, or one that already ended. A running
-		// one is stopped alongside the mains with the pod's grace (SIGTERM,
-		// then SIGKILL once the grace runs out), as the kubelet's pod kill
-		// stops every running container, init containers included. One that
-		// already ended is left exactly as before: never signalled here, and
-		// not claimed, so the late snapshot and the tree sweep below still
-		// see it as they always did.
-		if cp.initDeclared && procDone(cp.proc) {
-			continue
-		}
+		// init step currently running, or one that already ended and is kept
+		// for the tree sweep (finishInitStep). It is handled exactly as a main:
+		// a running one is stopped with the pod's grace (SIGTERM, then SIGKILL
+		// once the grace runs out), as the kubelet's pod kill stops every
+		// running container, init containers included, and an ended one is
+		// never signalled.
 		signalled[cp.proc] = struct{}{}
-		// A main whose process is already Done is never signalled, however it
+		// A process that is already Done is never signalled, however it
 		// ended: a StopContainer concluded it, it ran to completion on its own
-		// (a finished Job container), or it exited before a refused create
-		// unwound. Its leader is reaped, so its pgid may already name an
-		// unrelated process, and GracefulStop signals before it looks at Done.
-		// It stays in `signalled` so the late sweep below skips it too. What
+		// (a finished Job container, a completed init), or it exited before a
+		// refused create unwound. Its leader is reaped, so its pgid may already
+		// name an unrelated process, and GracefulStop signals before it looks
+		// at Done. It stays in `signalled` so the late sweep below skips it
+		// too, whether or not its entry reads Terminated yet. What
 		// its tree left behind (a daemonized child still in its group) is the
 		// tree sweep's below, which signals only members proven ours by exact
 		// instance and a group only while such a member is in it.

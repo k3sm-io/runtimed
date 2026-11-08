@@ -785,9 +785,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // The stop is bounded: the mains run concurrently and the sidecars in turn
 // against one deadline, so the signalling waits at most
 // grace + (1+len(sidecars)+late)*exitObservationGrace, where late counts the
-// running groups outside both stop sets (a plain init container still in
-// p.containers), each SIGKILLed in turn once supervision is cancelled. The
-// log-tail drain adds at most drainGrace after it.
+// running groups that appeared after the stop's snapshot, each SIGKILLed in
+// turn once supervision is cancelled. A plain init container still running is
+// not one of them: the first phase stops it with the mains. The log-tail drain
+// adds at most drainGrace after it.
 func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 	r.stopHostPod(ctx, p, hostStop{grace: podDefaultGrace(0, p)})
 }
@@ -1627,18 +1628,27 @@ func (r *Runtime) killUntrackedSpawn(ctx context.Context, p *pod, cp *containerP
 // returns ctx.Err() on its own arm, the reaper finishes with the same error,
 // and a shim-backed wait can surface a raw waiter error that raced the cancel.
 // Such an entry stays in p.containers, with its log writer and its reap record.
-// The stop does not signal it in its first phase (that phase skips
-// init-declared entries), and its late snapshot misses it once
-// watchContainerExit has written the entry Terminated, so what reliably reaches
-// its group is the pod-tree sweep (sweepPodTrees) over the kept entry; the
-// record retirement keeps the record while the sweep reports survivors.
-// Dropping the entry here instead races that sweep, and the retirement then
-// drops the record of a group no sweep reached.
+// The stop's first phase gives a running plain init the pod's grace, but the
+// wait it cut short says nothing of whether that ended the group, and once
+// watchContainerExit has written the entry Terminated the late snapshot misses
+// it, so what reliably reaches its tree is the pod-tree sweep (sweepPodTrees)
+// over the kept entry; the record retirement keeps the record while the sweep
+// reports survivors. Dropping the entry here instead races that sweep, and the
+// retirement then drops the record of a group no sweep reached.
 //
-// Under a live ctx, an observed exit or any wait error (an exit status that
-// cannot be read, a crashed shim, even one wrapping a context error of its
-// own) drops the entry as before, so a later StartContainer of the init is not
-// refused as already started for the life of the pod.
+// Any wait outcome on a stopping pod keeps the entry the same way, checked
+// under p.mu together with the removal. The stop cancels ctx only after its
+// first phase, so an init that exits on that phase's SIGTERM returns here
+// under a live ctx; dropped, its tree would escape sweepPodTrees and the
+// retirement would remove the survivor record watchContainerExit wrote. The
+// step then refuses the sequence with errPodStopping, so nothing further is
+// spawned into a pod being deleted.
+//
+// Under a live ctx on a pod that is not stopping, an observed exit or any wait
+// error (an exit status that cannot be read, a crashed shim, even one wrapping
+// a context error of its own) drops the entry as before, so a later
+// StartContainer of the init is not refused as already started for the life of
+// the pod.
 func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc) (runtimev1.FailureReason, error) {
 	if cp.sidecar() {
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
@@ -1649,6 +1659,11 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 			fmt.Errorf("init container %s wait: %w", cp.name, werr)
 	}
 	p.mu.Lock()
+	if p.stopping {
+		p.mu.Unlock()
+		return installFailureReason(errPodStopping),
+			fmt.Errorf("init container %s: %w", cp.name, errPodStopping)
+	}
 	removeContainerLocked(p, cp.name)
 	p.mu.Unlock()
 	if werr != nil || code != 0 {

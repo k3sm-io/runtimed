@@ -89,6 +89,11 @@ type liveGroups struct {
 	// changed is closed and replaced (under mu) whenever a group goes live,
 	// exits or is observed gone, so a waiter blocks on it instead of sleeping.
 	changed chan struct{}
+	// escapees maps an escaped child's pid to its parent's: procTable lists
+	// it, in its own group and session, for as long as the test runs, and it
+	// ignores every signal, so a tree sweep that adopted it reports it as a
+	// survivor.
+	escapees map[int]int
 }
 
 func newLiveGroups(t *testing.T) *liveGroups {
@@ -96,7 +101,7 @@ func newLiveGroups(t *testing.T) *liveGroups {
 		exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{},
 		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, sentAt: map[int][]time.Time{},
 		observed: map[int]bool{}, waitErr: map[int]error{},
-		changed: make(chan struct{}),
+		changed: make(chan struct{}), escapees: map[int]int{},
 	}
 	t.Cleanup(func() {
 		g.mu.Lock()
