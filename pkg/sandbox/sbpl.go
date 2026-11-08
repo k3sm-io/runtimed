@@ -239,8 +239,10 @@ var ErrInvalidDataRoot = errors.New("sbpl: invalid data root")
 
 // ErrInvalidStateDir reports a set Posture.StateDir that cannot hold its deny:
 // the same refusals as ErrInvalidStatusRecordDir, plus a pods root at or under
-// the state dir, where the deny would swallow the runtime's own tree. An empty
-// value is not this error (see Posture.StateDir).
+// the state dir, where the deny would swallow the runtime's own tree, and a
+// state dir at, under or above <WorkDir>/artifacts, where an artifact view
+// allow emitted after the deny could re-open it. An empty value is not this
+// error (see Posture.StateDir).
 var ErrInvalidStateDir = errors.New("sbpl: invalid state dir")
 
 // ErrInvalidArtifactView is returned by Generate when a
@@ -388,7 +390,9 @@ type Posture struct {
 	//
 	// It carries the StatusRecordDir requirements, and additionally the pods root
 	// must not be at or under it (ErrInvalidStateDir), because the deny would then
-	// swallow the runtime's own tree. Both pods-root tests compare the /var, /tmp
+	// swallow the runtime's own tree, and it must not overlap <WorkDir>/artifacts
+	// at, under or above it, because the artifact view allows come after the
+	// deny and would re-open it. These containment tests compare the /var, /tmp
 	// and /etc spellings with their /private ones, so a resolved value is held to
 	// the same bound as the work-dir's own spelling. Generate refuses the whole
 	// profile rather than drop the deny. Beyond the firmlinks the check is
@@ -1202,6 +1206,15 @@ func resolveStateDir(dir, podsRoot string) (string, error) {
 	}
 	if underAnyForm(podsRoot, dir) {
 		return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidStateDir, podsRoot, dir)
+	}
+	// The artifact view allows (validateArtifactViews: views directly under
+	// <WorkDir>/artifacts) are emitted after the protected deny, and last match
+	// wins, so a view at or under the state dir would re-open it, and a state
+	// dir at or under the views root could be inside a view. Either overlap is
+	// refused rather than left to the views a pod happens to be granted.
+	views := filepath.Join(filepath.Dir(podsRoot), ArtifactViewsSubdir)
+	if underAnyForm(dir, views) || underAnyForm(views, dir) {
+		return "", fmt.Errorf("%w: %q overlaps the artifact views root %q", ErrInvalidStateDir, dir, views)
 	}
 	return dir, nil
 }

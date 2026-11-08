@@ -452,6 +452,15 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		"var spelling under a private pods root":  {"/private/var/lib/k3sm", "/var/lib/k3sm/pods/cp"},
 		"tmp ancestor of a private tmp pods root": {"/private/tmp/k3sm", "/tmp"},
 		"private tmp ancestor of a tmp pods root": {"/tmp/k3sm", "/private/tmp"},
+		// The artifact view allows are emitted after the protected deny, so a
+		// state dir at, under or above <WorkDir>/artifacts would be re-opened by
+		// a pod's view grant.
+		"the artifacts root":                       {workDir, workDir + "/artifacts"},
+		"under the artifacts root":                 {workDir, workDir + "/artifacts/cp"},
+		"an artifact view":                         {workDir, workDir + "/artifacts/" + strings.Repeat("a", 64) + "/" + strings.Repeat("b", 64)},
+		"above the artifacts root":                 {"/opt/k3sm-data/cp/root", "/opt/k3sm-data/cp"},
+		"private artifacts root of a var work-dir": {"/var/lib/k3sm", "/private/var/lib/k3sm/artifacts"},
+		"var view under a private work-dir":        {"/private/var/lib/k3sm", "/var/lib/k3sm/artifacts/cp"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if out, err := generate(tc.workDir, tc.dir); !errors.Is(err, ErrInvalidStateDir) {
@@ -465,12 +474,13 @@ func TestStateDirRefusesWhatCannotHoldTheDeny(t *testing.T) {
 		})
 	}
 	for name, dir := range map[string]string{
-		"empty":           "",
-		"custom leaf":     "/opt/k3sm-data/cp",
-		"default leaf":    "/opt/k3sm-data/server",
-		"outside":         "/srv/k3sm-state",
-		"sibling of pods": workDir + "/podsx",
-		"private form":    "/private/var/k3sm-data/cp",
+		"empty":             "",
+		"custom leaf":       "/opt/k3sm-data/cp",
+		"default leaf":      "/opt/k3sm-data/server",
+		"outside":           "/srv/k3sm-state",
+		"sibling of pods":   workDir + "/podsx",
+		"private form":      "/private/var/k3sm-data/cp",
+		"artifacts sibling": workDir + "/artifactsx",
 	} {
 		t.Run("accepted/"+name, func(t *testing.T) {
 			if _, err := generate(workDir, dir); err != nil {
