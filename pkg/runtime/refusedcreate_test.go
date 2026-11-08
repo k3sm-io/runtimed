@@ -72,12 +72,16 @@ type liveGroups struct {
 	held     []int
 	signals  map[int][]os.Signal
 	observed map[int]bool
+	// changed is closed and replaced (under mu) whenever a group goes live,
+	// exits or is observed gone, so a waiter blocks on it instead of sleeping.
+	changed chan struct{}
 }
 
 func newLiveGroups(t *testing.T) *liveGroups {
 	g := &liveGroups{
 		exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{},
 		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, observed: map[int]bool{},
+		changed: make(chan struct{}),
 	}
 	t.Cleanup(func() {
 		g.mu.Lock()
@@ -94,8 +98,9 @@ func newLiveGroups(t *testing.T) *liveGroups {
 // exited has been inspected by its watcher, so a spawn failing after it is
 // returned only once the earlier process is known to be Done.
 func (g *liveGroups) awaitExitedObserved() {
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for {
 		g.mu.Lock()
 		all := true
 		for pid := range g.exit {
@@ -103,11 +108,16 @@ func (g *liveGroups) awaitExitedObserved() {
 				all = false
 			}
 		}
+		changed := g.changed
 		g.mu.Unlock()
 		if all {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case <-changed:
+		case <-timeout.C:
+			return
+		}
 	}
 }
 
@@ -149,9 +159,15 @@ func (g *liveGroups) Spawn(_ context.Context, spec supervisor.SpawnSpec) (int, e
 	return pid, nil
 }
 
+func (g *liveGroups) notifyLocked() {
+	close(g.changed)
+	g.changed = make(chan struct{})
+}
+
 func (g *liveGroups) exitLocked(pid int) {
 	if g.live[pid] {
 		g.live[pid] = false
+		g.notifyLocked()
 		close(g.exit[pid])
 		for _, fd := range g.pipes[pid] {
 			_ = unix.Close(fd)
@@ -197,6 +213,7 @@ func (g *liveGroups) procGroup(pgid int) ([]supervisor.ProcMember, bool) {
 		return []supervisor.ProcMember{{Pid: pgid, StartUnixNano: 1}}, true
 	}
 	g.observed[pgid] = true
+	g.notifyLocked()
 	return nil, true
 }
 
@@ -420,7 +437,10 @@ func assertRefusedCreateUnwound(t *testing.T, rt *Runtime, g *liveGroups, podID 
 		recOK   bool
 		openLog []string
 	)
-	deadline := time.Now().Add(5 * time.Second)
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		live = g.livePIDs()
 		hasRec, recOK = rt.podHasReapRecord(podID)
@@ -428,10 +448,12 @@ func assertRefusedCreateUnwound(t *testing.T, rt *Runtime, g *liveGroups, podID 
 		if len(live) == 0 && !hasRec && recOK && len(openLog) == 0 {
 			return
 		}
-		if time.Now().After(deadline) {
-			break
+		select {
+		case <-tick.C:
+			continue
+		case <-timeout.C:
 		}
-		time.Sleep(10 * time.Millisecond)
+		break
 	}
 	if len(live) > 0 {
 		t.Errorf("attempt %d: process groups still live after the refusal: %v", attempt, live)
