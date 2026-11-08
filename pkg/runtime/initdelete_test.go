@@ -34,7 +34,8 @@ import (
 // procTable is the fake process table behind tree tracking
 // (supervisor.TrackTree): one entry per live group, its leader alone, with the
 // start time testDeps' ProcStartTime reports, so every live leader is a tree
-// member proven ours by exact instance.
+// member proven ours by exact instance; and one per escapee, a child of its
+// parent in a group and session of its own.
 func (g *liveGroups) procTable() ([]supervisor.ProcEntry, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -43,6 +44,9 @@ func (g *liveGroups) procTable() ([]supervisor.ProcEntry, bool) {
 		if l {
 			out = append(out, supervisor.ProcEntry{Pid: pid, Ppid: 1, Pgid: pid, Sid: pid, StartUnixNano: 1, Comm: "fake"})
 		}
+	}
+	for pid, parent := range g.escapees {
+		out = append(out, supervisor.ProcEntry{Pid: pid, Ppid: parent, Pgid: pid, Sid: pid, StartUnixNano: 1, Comm: "fake"})
 	}
 	return out, true
 }
@@ -164,11 +168,12 @@ func (f *initStepFixture) initTracked() bool {
 //
 // The first row is the DeletePod it exists for. DeletePod cancels that
 // context, which ends the init step's Wait while the process may still run.
-// stopHostPod's first phase skips init-declared entries, and its late snapshot
-// misses the init once watchContainerExit has written it Terminated, so what
-// reliably reaches the group is the pod-tree sweep (sweepPodTrees) over the
-// kept entry, and the reap record survives only while that sweep reports the
-// group as a survivor. Dropping the entry on the cancelled wait races the
+// stopHostPod's first phase stops the running init with the delete's grace
+// (here 0, an immediate SIGKILL; TestDeletePodGivesARunningInitItsGrace pins
+// the grace), but the group ignores it, and once watchContainerExit has
+// written the init Terminated, what still reaches the group is the pod-tree
+// sweep (sweepPodTrees) over the kept entry, and the reap record survives only
+// while that sweep reports the group as a survivor. Dropping the entry on the cancelled wait races the
 // sweep, and the retirement then drops the record that is the only thing
 // naming the group. The group ignores every signal, so it is still running
 // through the whole stop: it must get a SIGKILL, its reap record must be kept
@@ -330,3 +335,134 @@ func (endedCtx) Err() error            { return context.Canceled }
 type errWaiter struct{ err error }
 
 func (w errWaiter) WaitExit(context.Context, int) (int, int, error) { return 0, 0, w.err }
+
+// TestDeletePodGivesARunningInitItsGrace pins that DeletePod stops a plain
+// init container still running when it arrives as the kubelet's pod kill does
+// every running container: SIGTERM first, then a wait of up to the pod's
+// grace, then SIGKILL only if the init is still running. stopHostPod's first
+// phase once skipped init-declared entries, so such an init got no SIGTERM and
+// no grace, only the late SIGKILL or the pod-tree sweep.
+//
+// An init that exits on that SIGTERM ends its wait under a live supervision
+// context (the stop cancels it only after its first phase), so the step must
+// keep the entry because the pod is stopping: the Waiting main is never
+// spawned, the entry is still tracked for sweepPodTrees, and a survivor of the
+// init's tree keeps the reap record watchContainerExit wrote for it.
+//
+// The grace is DeletePod's own, in whole seconds, and runs on the stop's real
+// timer (there is no clock seam in this package): the deaf row waits it out
+// once, and its SIGKILL is checked to come no sooner than the grace after the
+// SIGTERM.
+func TestDeletePodGivesARunningInitItsGrace(t *testing.T) {
+	const (
+		graceSecs  = 1
+		escapeePID = 4001
+	)
+	grace := graceSecs * time.Second
+	cases := []struct {
+		name string
+		// deaf makes the init ignore SIGTERM, so only the SIGKILL ends it.
+		deaf bool
+		// escapee gives the init a child that escaped to a session of its
+		// own and survives every signal.
+		escapee bool
+	}{
+		{name: "an-init-that-exits-on-sigterm-gets-no-sigkill"},
+		{name: "an-init-that-ignores-sigterm-is-killed-after-the-grace", deaf: true},
+		{name: "a-survivor-of-an-init-that-exits-on-sigterm-keeps-its-record", escapee: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newInitStepFixture(t)
+			f.g.mu.Lock()
+			f.g.deaf = tc.deaf
+			if tc.escapee {
+				f.g.escapees[escapeePID] = initStepPID
+			}
+			f.g.mu.Unlock()
+			timeout := time.NewTimer(10 * time.Second)
+			defer timeout.Stop()
+			started := f.startInit(t, timeout.C)
+
+			if _, err := f.rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{
+				PodId: initStepPodID, GracePeriodSeconds: graceSecs,
+			}); err != nil {
+				t.Fatalf("DeletePod: %v", err)
+			}
+			select {
+			case <-started:
+			case <-timeout.C:
+				t.Fatal("timed out waiting for StartContainer to return after the delete")
+			}
+
+			sigs := f.g.signalsTo(initStepPID)
+			if len(sigs) == 0 || sigs[0] != termSignal {
+				t.Fatalf("init pgid %d, running when the delete arrived, was signalled %v, want SIGTERM first", initStepPID, sigs)
+			}
+			if got := f.g.spawned(); got != 1 {
+				t.Errorf("%d groups spawned, want 1: the Waiting main was started into a pod being deleted", got)
+			}
+			if tc.deaf {
+				kill := slices.Index(sigs, killSignal)
+				if kill < 0 {
+					t.Fatalf("init pgid %d ignored SIGTERM and was signalled %v, want a SIGKILL after the grace", initStepPID, sigs)
+				}
+				at := f.g.signalTimes(initStepPID)
+				if waited := at[kill].Sub(at[0]); waited < grace {
+					t.Errorf("init pgid %d was SIGKILLed %v after its SIGTERM, want no sooner than the %v grace", initStepPID, waited, grace)
+				}
+				return
+			}
+			if !tc.escapee && slices.Contains(sigs, killSignal) {
+				t.Errorf("init pgid %d exited on SIGTERM but was signalled %v, want no SIGKILL", initStepPID, sigs)
+			}
+			if !f.initTracked() {
+				t.Errorf("the init that exited on the stop's SIGTERM was dropped from the tracked set before the pod-tree sweep")
+			}
+			if !tc.escapee {
+				return
+			}
+			records, _, err := f.rt.listPodProcRecords()
+			if err != nil {
+				t.Fatal(err)
+			}
+			kept := false
+			for _, rec := range records {
+				if rec.PodID == initStepPodID && rec.Pgid == initStepPID &&
+					slices.ContainsFunc(rec.Survivors, func(s ReapSurvivor) bool { return s.Pid == escapeePID }) {
+					kept = true
+				}
+			}
+			if !kept {
+				t.Errorf("the reap record of init pgid %d naming survivor %d was dropped by the delete; records = %+v", initStepPID, escapeePID, records)
+			}
+		})
+	}
+}
+
+// TestStopHostPodNeverSignalsADoneInit pins that the pod stop never signals a
+// plain init container whose process is already Done, even while its entry
+// does not yet read Terminated (the window before watchContainerExit writes
+// it): its leader is reaped, so its pgid may already name another process.
+func TestStopHostPodNeverSignalsADoneInit(t *testing.T) {
+	g := newLiveGroups(t)
+	rt := newTestRuntime(t, Deps{SignalGroup: g.signal, ProcGroup: g.procGroup})
+	proc := supervisor.NewProcess(&fakeSpawner{}, errWaiter{},
+		supervisor.SpawnSpec{Path: "/init", Argv: []string{"/init"}}, nil)
+	if err := proc.Start(context.Background()); err != nil {
+		t.Fatalf("start the init process: %v", err)
+	}
+	<-proc.Done()
+	cp := &containerProc{
+		name: "init", proc: proc, initDeclared: true,
+		spec:  &runtimev1.Container{Name: "init"},
+		state: &runtimev1.ContainerStatus{Name: "init"},
+	}
+	p := &pod{box: &runtimev1.PodBox{PodId: "pod-done-init"}, containers: []*containerProc{cp}}
+
+	rt.stopHostPod(context.Background(), p, hostStop{grace: time.Second})
+
+	if sigs := g.signalsTo(proc.PID()); len(sigs) != 0 {
+		t.Errorf("done init pgid %d was signalled %v by the pod stop, want nothing", proc.PID(), sigs)
+	}
+}

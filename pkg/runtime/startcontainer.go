@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 
 	"google.golang.org/grpc/codes"
 
@@ -269,6 +270,11 @@ func (r *Runtime) resumeInitSequence(p *pod, rootfs string, cp *containerProc) {
 		return
 	}
 	if reason, err := r.finishInitStep(p.supCtx, p, cp); err != nil {
+		if errors.Is(err, errPodStopping) {
+			r.log.Info("pod is being deleted; not resuming its start sequence",
+				"pod", p.box.GetPodId(), "container", cp.name)
+			return
+		}
 		r.log.Error("resumed init step failed; the pod's remaining containers keep waiting",
 			"pod", p.box.GetPodId(), "container", cp.name, "reason", reason.String(), "err", err)
 		return
@@ -282,7 +288,13 @@ func (r *Runtime) resumeInitSequence(p *pod, rootfs string, cp *containerProc) {
 	if waitingContainersLocked(p) == 0 && p.phase == runtimev1.PodPhase_POD_PHASE_PENDING {
 		p.phase = runtimev1.PodPhase_POD_PHASE_RUNNING
 	}
+	// A pod being deleted publishes DELETED from its stop; a MODIFIED here
+	// could land after it.
+	stopping := p.stopping
 	p.mu.Unlock()
+	if stopping {
+		return
+	}
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 }
 

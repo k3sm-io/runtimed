@@ -255,8 +255,9 @@ type hostStop struct {
 }
 
 // stopHostPod is the host-process pod stop, the one sequence DeletePod and a
-// refused create (unwindRefusedCreate) both run, in this order: the mains are
-// graceful-stopped concurrently, then the native sidecars in reverse start
+// refused create (unwindRefusedCreate) both run, in this order: the mains, and
+// a plain init container still running, are graceful-stopped concurrently
+// with the pod's grace, then the native sidecars in reverse start
 // order with the budget's remainder; supervision is cancelled; any process
 // group that appeared since the snapshot is SIGKILLed; the exec sessions end;
 // every container's process tree is swept; the log tails are drained and the
@@ -279,21 +280,27 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 	signalled := make(map[*supervisor.Process]struct{}, len(p.containers))
 	mains := make([]*supervisor.Process, 0, len(p.containers))
 	for _, cp := range p.containers {
-		// Init-declared containers are not mains: native sidecars are stopped in
-		// phase 2 below, and an init container's tracked entry is either a
-		// never-spawned WAITING placeholder or the one init step currently
-		// running, neither of which belongs in the mains' concurrent stop. A
-		// container with no process has nothing to stop at all.
-		if cp.initDeclared || cp.proc == nil {
+		// Native sidecars are stopped in phase 2 below, in reverse start order
+		// with the budget's remainder. A container with no process (a
+		// never-spawned WAITING placeholder) has nothing to stop at all.
+		if cp.sidecar() || cp.proc == nil {
 			continue
 		}
+		// A plain init container's tracked entry with a process is the one
+		// init step currently running, or one that already ended and is kept
+		// for the tree sweep (finishInitStep). It is handled exactly as a main:
+		// a running one is stopped with the pod's grace (SIGTERM, then SIGKILL
+		// once the grace runs out), as the kubelet's pod kill stops every
+		// running container, init containers included, and an ended one is
+		// never signalled.
 		signalled[cp.proc] = struct{}{}
-		// A main whose process is already Done is never signalled, however it
+		// A process that is already Done is never signalled, however it
 		// ended: a StopContainer concluded it, it ran to completion on its own
-		// (a finished Job container), or it exited before a refused create
-		// unwound. Its leader is reaped, so its pgid may already name an
-		// unrelated process, and GracefulStop signals before it looks at Done.
-		// It stays in `signalled` so the late sweep below skips it too. What
+		// (a finished Job container, a completed init), or it exited before a
+		// refused create unwound. Its leader is reaped, so its pgid may already
+		// name an unrelated process, and GracefulStop signals before it looks
+		// at Done. It stays in `signalled` so the late sweep below skips it
+		// too, whether or not its entry reads Terminated yet. What
 		// its tree left behind (a daemonized child still in its group) is the
 		// tree sweep's below, which signals only members proven ours by exact
 		// instance and a group only while such a member is in it.
@@ -314,8 +321,9 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 	p.sidecarTeardown = true
 	p.mu.Unlock()
 
-	// Phase 1: graceful-stop each MAIN container's process group concurrently: the
-	// per-PID grace timers start together, so a multi-container pod shares one
+	// Phase 1: graceful-stop each MAIN container's process group, and a running
+	// plain init's, concurrently: the per-PID grace timers start together, so a
+	// multi-container pod shares one
 	// effective grace window. GracefulStop only OBSERVES proc.Done (the kqueue
 	// reaper stays the sole reaper) — an early voluntary exit skips the SIGKILL.
 	var wg sync.WaitGroup

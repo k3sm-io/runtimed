@@ -89,6 +89,11 @@ type liveGroups struct {
 	// changed is closed and replaced (under mu) whenever a group goes live,
 	// exits or is observed gone, so a waiter blocks on it instead of sleeping.
 	changed chan struct{}
+	// escapees maps an escaped child's pid to its parent's: procTable lists
+	// it, in its own group and session, for as long as the test runs, and it
+	// ignores every signal, so a tree sweep that adopted it reports it as a
+	// survivor.
+	escapees map[int]int
 }
 
 func newLiveGroups(t *testing.T) *liveGroups {
@@ -96,7 +101,7 @@ func newLiveGroups(t *testing.T) *liveGroups {
 		exit: map[int]chan struct{}{}, code: map[int]int{}, live: map[int]bool{},
 		pipes: map[int][]int{}, signals: map[int][]os.Signal{}, sentAt: map[int][]time.Time{},
 		observed: map[int]bool{}, waitErr: map[int]error{},
-		changed: make(chan struct{}),
+		changed: make(chan struct{}), escapees: map[int]int{},
 	}
 	t.Cleanup(func() {
 		g.mu.Lock()
@@ -519,9 +524,9 @@ func assertRefusedCreateUnwound(t *testing.T, rt *Runtime, g *liveGroups, podID 
 //     and not before;
 //   - a request ctx cancelled at the refusal escalates to SIGKILL at once,
 //     long before the grace would;
-//   - a plain init container still running at the refusal, which is in neither
-//     the mains' nor the sidecars' stop set, is SIGKILLed after supervision is
-//     cancelled instead of being left to the tree sweep.
+//   - a plain init container still running at the refusal is stopped with the
+//     mains, as the kubelet's pod kill stops every running container: SIGTERM,
+//     then SIGKILL once the pod's grace has run, and not before.
 //
 // There is no clock seam in this package, so the grace row runs on the
 // shortest grace the API can express (one second) and the timings are read
@@ -558,10 +563,11 @@ func TestRefusedCreateStopHonoursGraceAndEscalation(t *testing.T) {
 			maxGap:          10 * time.Second,
 		},
 		{
-			name:      "plain-init-running-at-refusal-is-killed",
-			grace:     30,
+			name:      "plain-init-running-at-refusal-escalates-after-grace",
+			grace:     1,
 			plainInit: true,
-			want:      []os.Signal{killSignal},
+			want:      []os.Signal{termSignal, killSignal},
+			minGap:    time.Second,
 		},
 	}
 	for _, tc := range cases {
