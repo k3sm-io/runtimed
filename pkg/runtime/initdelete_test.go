@@ -164,11 +164,12 @@ func (f *initStepFixture) initTracked() bool {
 //
 // The first row is the DeletePod it exists for. DeletePod cancels that
 // context, which ends the init step's Wait while the process may still run.
-// stopHostPod's first phase skips init-declared entries, and its late snapshot
-// misses the init once watchContainerExit has written it Terminated, so what
-// reliably reaches the group is the pod-tree sweep (sweepPodTrees) over the
-// kept entry, and the reap record survives only while that sweep reports the
-// group as a survivor. Dropping the entry on the cancelled wait races the
+// stopHostPod's first phase stops the running init with the delete's grace
+// (here 0, an immediate SIGKILL; TestDeletePodGivesARunningInitItsGrace pins
+// the grace), but the group ignores it, and once watchContainerExit has
+// written the init Terminated, what still reaches the group is the pod-tree
+// sweep (sweepPodTrees) over the kept entry, and the reap record survives only
+// while that sweep reports the group as a survivor. Dropping the entry on the cancelled wait races the
 // sweep, and the retirement then drops the record that is the only thing
 // naming the group. The group ignores every signal, so it is still running
 // through the whole stop: it must get a SIGKILL, its reap record must be kept
@@ -330,3 +331,67 @@ func (endedCtx) Err() error            { return context.Canceled }
 type errWaiter struct{ err error }
 
 func (w errWaiter) WaitExit(context.Context, int) (int, int, error) { return 0, 0, w.err }
+
+// TestDeletePodGivesARunningInitItsGrace pins that DeletePod stops a plain
+// init container still running when it arrives as the kubelet's pod kill does
+// every running container: SIGTERM first, then a wait of up to the pod's
+// grace, then SIGKILL only if the init is still running. stopHostPod's first
+// phase once skipped init-declared entries, so such an init got no SIGTERM and
+// no grace, only the late SIGKILL or the pod-tree sweep.
+//
+// The grace is DeletePod's own, in whole seconds, and runs on the stop's real
+// timer: the deaf row waits it out once, and its SIGKILL is checked to come no
+// sooner than the grace after the SIGTERM.
+func TestDeletePodGivesARunningInitItsGrace(t *testing.T) {
+	const graceSecs = 1
+	grace := graceSecs * time.Second
+	cases := []struct {
+		name string
+		// deaf makes the init ignore SIGTERM, so only the SIGKILL ends it.
+		deaf bool
+	}{
+		{name: "an-init-that-exits-on-sigterm-gets-no-sigkill", deaf: false},
+		{name: "an-init-that-ignores-sigterm-is-killed-after-the-grace", deaf: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newInitStepFixture(t)
+			f.g.mu.Lock()
+			f.g.deaf = tc.deaf
+			f.g.mu.Unlock()
+			timeout := time.NewTimer(10 * time.Second)
+			defer timeout.Stop()
+			started := f.startInit(t, timeout.C)
+
+			if _, err := f.rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{
+				PodId: initStepPodID, GracePeriodSeconds: graceSecs,
+			}); err != nil {
+				t.Fatalf("DeletePod: %v", err)
+			}
+			select {
+			case <-started:
+			case <-timeout.C:
+				t.Fatal("timed out waiting for StartContainer to return after the delete")
+			}
+
+			sigs := f.g.signalsTo(initStepPID)
+			if len(sigs) == 0 || sigs[0] != termSignal {
+				t.Fatalf("init pgid %d, running when the delete arrived, was signalled %v, want SIGTERM first", initStepPID, sigs)
+			}
+			if !tc.deaf {
+				if slices.Contains(sigs, killSignal) {
+					t.Errorf("init pgid %d exited on SIGTERM but was signalled %v, want no SIGKILL", initStepPID, sigs)
+				}
+				return
+			}
+			kill := slices.Index(sigs, killSignal)
+			if kill < 0 {
+				t.Fatalf("init pgid %d ignored SIGTERM and was signalled %v, want a SIGKILL after the grace", initStepPID, sigs)
+			}
+			at := f.g.signalTimes(initStepPID)
+			if waited := at[kill].Sub(at[0]); waited < grace {
+				t.Errorf("init pgid %d was SIGKILLed %v after its SIGTERM, want no sooner than the %v grace", initStepPID, waited, grace)
+			}
+		})
+	}
+}
