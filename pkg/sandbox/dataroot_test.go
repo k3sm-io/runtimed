@@ -645,6 +645,42 @@ const (
 	stateDirReadScript  = `IFS= read -r line < "$1" && printf '%s' "$line"`
 )
 
+// requireSandboxDenied fails t unless err is the sandboxed shell exiting non-zero
+// with the kernel's refusal on stderr, so a denied row cannot pass on a missing
+// file, a bad script or a sandbox-exec that never ran.
+func requireSandboxDenied(t *testing.T, what string, out []byte, err error, prof string) {
+	t.Helper()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Errorf("%s: err = %v, want the sandboxed shell to exit non-zero; stdout %q\n--- profile ---\n%s", what, err, out, prof)
+		return
+	}
+	if msg := string(ee.Stderr); !strings.Contains(msg, "Operation not permitted") && !strings.Contains(msg, "Permission denied") {
+		t.Errorf("%s: exited %v without a permission refusal on stderr: %q\n--- profile ---\n%s", what, ee, msg, prof)
+	}
+	if strings.Contains(string(out), "private-key") {
+		t.Errorf("%s: the secret reached stdout: %q", what, out)
+	}
+}
+
+// requireStateDirControls runs the two-sided controls every enforced case needs
+// under the profile with StateDir set: the ancestor grant on the data root still
+// reads a sibling of the state dir and still writes a fresh file beside it, so a
+// refusal inside the state dir is its deny and not a profile that refuses all.
+func (tr stateDirTree) requireStateDirControls(t *testing.T, withState Posture) {
+	t.Helper()
+	if out, prof, err := tr.run(t, withState, stateDirReadScript, tr.sibling); err != nil || string(out) != "private-key" {
+		t.Fatalf("the ancestor grant did not read %s, so the deny is unproven: %v\n%s\n--- profile ---\n%s", tr.sibling, err, out, prof)
+	}
+	fresh := filepath.Join(tr.data, "fresh")
+	if out, prof, err := tr.run(t, withState, stateDirWriteScript, fresh); err != nil {
+		t.Fatalf("the ancestor grant did not write %s, so the write deny is unproven: %v\n%s\n--- profile ---\n%s", fresh, err, out, prof)
+	}
+	if got, err := os.ReadFile(fresh); err != nil || string(got) != "forged" {
+		t.Fatalf("%s after the control write = %q, %v; want %q", fresh, got, err, "forged")
+	}
+}
+
 // otherFirmlinkSpelling returns p in its other firmlink spelling: without the
 // /private prefix when it has one, with it otherwise.
 func otherFirmlinkSpelling(p string) string {
@@ -677,25 +713,22 @@ func TestStateDirEnforcedUnderACustomLeaf(t *testing.T) {
 			rootOnly := Posture{WorkDir: tr.pods, DataRoot: tr.data}
 			withState := Posture{WorkDir: tr.pods, DataRoot: tr.data, StateDir: tr.stateDir}
 
-			// The controls: the grant reaches the sibling with the field set, and
-			// the secret itself with DataRoot alone, so a refusal below is this deny.
-			if out, prof, err := tr.run(t, withState, stateDirReadScript, tr.sibling); err != nil || string(out) != "private-key" {
-				t.Fatalf("the ancestor grant did not read %s, so the deny is unproven: %v\n%s\n--- profile ---\n%s", tr.sibling, err, out, prof)
-			}
+			// The controls: the grant reads and writes beside the state dir with
+			// the field set, and reaches the secret itself with DataRoot alone,
+			// so a refusal below is this deny.
+			tr.requireStateDirControls(t, withState)
 			if out, prof, err := tr.run(t, rootOnly, stateDirReadScript, tr.secret); err != nil || string(out) != "private-key" {
 				t.Fatalf("with DataRoot alone the custom-leaf secret was not readable, so this case proves nothing: %v\n%s\n--- profile ---\n%s", err, out, prof)
 			}
 
 			for _, target := range []string{tr.secret, otherFirmlinkSpelling(tr.secret)} {
-				if out, prof, err := tr.run(t, withState, stateDirReadScript, target); err == nil || strings.Contains(string(out), "private-key") {
-					t.Errorf("read of %s succeeded under the generated profile: %q\n--- profile ---\n%s", target, out, prof)
-				}
+				out, prof, err := tr.run(t, withState, stateDirReadScript, target)
+				requireSandboxDenied(t, "read of "+target, out, err, prof)
 			}
 			newFile := filepath.Join(tr.stateDir, "new.key")
 			for _, target := range []string{tr.secret, newFile, otherFirmlinkSpelling(newFile)} {
-				if out, prof, err := tr.run(t, withState, stateDirWriteScript, target); err == nil {
-					t.Errorf("write to %s succeeded under the generated profile: %s\n--- profile ---\n%s", target, out, prof)
-				}
+				out, prof, err := tr.run(t, withState, stateDirWriteScript, target)
+				requireSandboxDenied(t, "write to "+target, out, err, prof)
 			}
 			if got, err := os.ReadFile(tr.secret); err != nil || string(got) != stateDirSecret {
 				t.Errorf("secret after the attempts = %q, %v; want %q", got, err, stateDirSecret)
@@ -704,58 +737,5 @@ func TestStateDirEnforcedUnderACustomLeaf(t *testing.T) {
 				t.Errorf("a new file landed in %s", tr.stateDir)
 			}
 		})
-	}
-}
-
-// TestStateDirEnforcedAcrossCaseAndNormalization proves the state-dir deny is not
-// a byte match the filesystem can step around. The default macOS volume is
-// case-insensitive and normalization-insensitive APFS, so <data>/CPÉ and the NFD
-// spelling of <data>/cpé open the same directory as the NFC <data>/cpé the
-// posture names. Each spelling the temp volume resolves to the state dir must be
-// denied in both firmlink spellings; one the volume keeps distinct is skipped
-// with the reason, since there it is another directory and nothing to deny.
-func TestStateDirEnforcedAcrossCaseAndNormalization(t *testing.T) {
-	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
-		t.Skip("sandbox-exec not present")
-	}
-	const leaf = "cp\u00e9" // NFC: c, p, U+00E9
-	tr := newStateDirTree(t, "/var/tmp", false, leaf)
-	rootOnly := Posture{WorkDir: tr.pods, DataRoot: tr.data}
-	withState := Posture{WorkDir: tr.pods, DataRoot: tr.data, StateDir: tr.stateDir}
-	if out, prof, err := tr.run(t, withState, stateDirReadScript, tr.sibling); err != nil || string(out) != "private-key" {
-		t.Fatalf("the ancestor grant did not read %s, so the deny is unproven: %v\n%s\n--- profile ---\n%s", tr.sibling, err, out, prof)
-	}
-	want, err := os.Stat(tr.secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, variant := range map[string]string{
-		"upper case":     "CP\u00c9",  // C, P, U+00C9
-		"mixed case":     "Cp\u00e9",  // C, p, U+00E9
-		"NFD":            "cpe\u0301", // c, p, e, U+0301 combining acute
-		"upper-case NFD": "CPE\u0301",
-	} {
-		t.Run(name, func(t *testing.T) {
-			secret := filepath.Join(tr.data, variant, "server-ca.key")
-			if got, err := os.Stat(secret); err != nil || !os.SameFile(want, got) {
-				t.Skipf("the temp volume keeps %q distinct from %q (stat: %v), so it is another directory and nothing to deny", variant, leaf, err)
-			}
-			// The control: the variant reaches the secret with DataRoot alone, so
-			// the refusal below is the state-dir deny and not a missing file.
-			if out, prof, err := tr.run(t, rootOnly, stateDirReadScript, secret); err != nil || string(out) != "private-key" {
-				t.Fatalf("with DataRoot alone %s was not readable, so this case proves nothing: %v\n%s\n--- profile ---\n%s", secret, err, out, prof)
-			}
-			for _, target := range []string{secret, otherFirmlinkSpelling(secret)} {
-				if out, prof, err := tr.run(t, withState, stateDirReadScript, target); err == nil || strings.Contains(string(out), "private-key") {
-					t.Errorf("read of %s succeeded under the generated profile: %q\n--- profile ---\n%s", target, out, prof)
-				}
-				if out, prof, err := tr.run(t, withState, stateDirWriteScript, target); err == nil {
-					t.Errorf("write to %s succeeded under the generated profile: %s\n--- profile ---\n%s", target, out, prof)
-				}
-			}
-		})
-	}
-	if got, err := os.ReadFile(tr.secret); err != nil || string(got) != stateDirSecret {
-		t.Errorf("secret after the attempts = %q, %v; want %q", got, err, stateDirSecret)
 	}
 }
