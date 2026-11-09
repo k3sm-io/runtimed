@@ -44,7 +44,7 @@ import (
 // incomplete; Lookup refuses it with ErrPinIncomplete and every vm pod fails
 // closed until the real identity and digests land together. A fabricated hash
 // would buy nothing but a cache key that matches no artifact anyone can fetch.
-const ActiveGuestKernel = "v6.18.57-bc162009c43b"
+const ActiveGuestKernel = "v6.18.62-886d6691c04e"
 
 // ImageFileName and InitramfsFileName are the basenames the two artifacts of a
 // pinned set are stored under, inside that set's content-addressed directory,
@@ -112,15 +112,14 @@ type GuestKernelPin struct {
 // exactly why ensure retains the previous one.
 var guestKernelPins = map[string]GuestKernelPin{
 	ActiveGuestKernel: {
-		KernelVersion: "v6.18.57",
-		// Minted 2026-10-18 from the v6.18.57-k3sm.3 release, an
-		// initramfs-only rebuild. The KERNEL is unchanged from k3sm.1:
-		// upstream 6.18.57 built from a kernel.config regenerated for it with
-		// every initrd decompressor off (config hash bc162009c43b…, the
-		// -suffix of ActiveGuestKernel); build.sh --repro produced a
-		// byte-identical Image across two clean builds. The INITRAMFS carries
-		// k3sm-guest-init built from runtimed 0e05269, the first whose guest
-		// init logs each container's pid and signal as the guest stops.
+		KernelVersion: "v6.18.62",
+		// Minted 2026-11-08 from the v6.18.62-k3sm.1 release: upstream 6.18.62
+		// (the 6.18 longterm point release of 2026-11-06), built from a
+		// kernel.config regenerated for it under olddefconfig with every
+		// required symbol built in (config hash 886d6691c04e…, the -suffix of
+		// ActiveGuestKernel); build.sh --repro produced a byte-identical Image
+		// across two clean builds. The INITRAMFS carries k3sm-guest-init built
+		// from runtimed 49078a2 against apis 5c7f0a4.
 		//
 		// Two clean builds (fresh GOCACHE, GOWORK=off, -trimpath
 		// -buildvcs=false -ldflags=-buildid=) produced a byte-identical cpio,
@@ -128,9 +127,9 @@ var guestKernelPins = map[string]GuestKernelPin{
 		// the published assets, never from the local build output, so a
 		// mismatch between what was built and what was uploaded cannot hide
 		// here.
-		ImageSHA256:     "579d70e047faa7ece419d585f00fc569a37d16b3285c453b4501c9845f30851b",
-		InitramfsSHA256: "0283e1e7ee1e63ceea052857f97562223a6274e36f0d644f4fdea4bd5617232e",
-		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.57-k3sm.3",
+		ImageSHA256:     "e713ec1713a9f9a74b1754a0f163ae8a21b5f832b0d4ffdf8808c841405e3e77",
+		InitramfsSHA256: "8c413b1692cece7076841b2875f36b25d1556a63fc7a3424d277f55aa106c786",
+		ReleaseURL:      "https://github.com/k3sm-io/linux-guest/releases/download/v6.18.62-k3sm.1",
 		Cmdline:         "console=hvc0 reboot=k panic=1",
 	},
 }

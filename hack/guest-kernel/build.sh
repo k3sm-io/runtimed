@@ -66,17 +66,17 @@ source "$KEYS_DIR/lib.sh"
 
 # ---------------------------------------------------------------- the pins
 
-readonly KERNEL_VERSION="6.18.57"
+readonly KERNEL_VERSION="6.18.62"
 readonly KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 readonly KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${KERNEL_TARBALL}"
 readonly KERNEL_SUMS_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc"
 
-# MINTED 2026-10-16, PGP-VERIFIED. sha256sums.asc was fetched and verified
-# inside the pinned toolchain against the key below, imported as the keyring's
-# sole key (issuer B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1, signature made
-# 2026-10-15), and this value is the linux-6.18.57.tar.xz line of the VERIFIED
-# cleartext. It was NOT taken from an unverified sums file.
-readonly KERNEL_SHA256="5bd9acdc82ec5efc3790ae840e5aaa40dfde7efff261cf6dde902dc570acf98c"
+# MINTED 2026-11-08, PGP-VERIFIED AT BUILD. This value is the linux-6.18.62.tar.xz line
+# of kernel.org's sha256sums.asc; the --repro build that produced the published release
+# verified that file inside the pinned toolchain against the key below, imported as
+# the keyring's sole key, and refuses any pin that differs from the verified line
+# (PIN MISMATCH below), so this value is the VERIFIED cleartext's.
+readonly KERNEL_SHA256="490a7aedf1b355c565d3a6c05333ccccb5da82064eca46b590448a7099d7d651"
 
 # "Kernel.org checksum autosigner <autosigner@kernel.org>", rsa4096, created
 # 2013-01-24. This is the PRIMARY key fingerprint; its long id 632D3A06589DA6B1
