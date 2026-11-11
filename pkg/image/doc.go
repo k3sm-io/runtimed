@@ -119,6 +119,18 @@ limitations under the License.
 // CoW and codesign touch Darwin specifics; the cgo-free Clonefile binding lives
 // behind cowCopy (clonefile_darwin.go) so callers stay platform-agnostic.
 //
+// # Absolute links in a linux-dialect tree
+//
+// A linux-dialect tree may hold symlinks whose targets are absolute or resolve
+// through one ("a -> /", "b -> a/etc"), and those targets name paths in the
+// guest's chroot, never on the host. No host-side code in this package follows
+// one: unpack, MaterializeTree, AdHocSignTree and the tree prune treat every link
+// as an opaque name (lstat, readlink, os.Root), and only the vm backend's guest
+// resolves them. The dialect is bound into the tree key and checked against the
+// tree's record on open, so a linux tree is never served to the native spine,
+// whose pod rootfs has no chroot around it.
+// TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide is the gate.
+//
 // # The CAS verification ceiling
 //
 // Cache.CommitBlob is the one place the content-addressed store checks that the
