@@ -73,6 +73,45 @@ func TestMaterializeTreeNeverWritesThroughADestinationLink(t *testing.T) {
 				assertVictimEmpty(t, victim)
 			})
 
+			t.Run("in_root_directory_link_composes", func(t *testing.T) {
+				src, dst := t.TempDir(), t.TempDir()
+				mustWrite(t, filepath.Join(src, "lib", "x"), "x", 0o644)
+				if err := os.MkdirAll(filepath.Join(dst, "usr", "lib"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("usr/lib", filepath.Join(dst, "lib")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := MaterializeTree(c, src, dst); err != nil {
+					t.Fatalf("materialize through an in-root link: %v", err)
+				}
+				if got, err := os.ReadFile(filepath.Join(dst, "usr", "lib", "x")); err != nil || string(got) != "x" {
+					t.Fatalf("usr/lib/x = %q, %v; want x", got, err)
+				}
+				if fi, err := os.Lstat(filepath.Join(dst, "lib")); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+					t.Fatalf("lib = %v, %v; want the link left in place", fi, err)
+				}
+			})
+
+			t.Run("relative_link_escaping_root_refused", func(t *testing.T) {
+				src, base := t.TempDir(), t.TempDir()
+				mustWrite(t, filepath.Join(src, "etc", "passwd"), "root", 0o644)
+				dst := filepath.Join(base, "pod", "rootfs")
+				victim := filepath.Join(base, "victim")
+				for _, d := range []string{dst, victim} {
+					if err := os.MkdirAll(d, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Symlink("../../victim", filepath.Join(dst, "etc")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := MaterializeTree(c, src, dst); !errors.Is(err, ErrDestinationLink) {
+					t.Fatalf("err = %v, want ErrDestinationLink", err)
+				}
+				assertVictimEmpty(t, victim)
+			})
+
 			t.Run("leaf_link_where_source_has_file", func(t *testing.T) {
 				src, dst, victim := newSrc(t), t.TempDir(), t.TempDir()
 				target := filepath.Join(victim, "target")

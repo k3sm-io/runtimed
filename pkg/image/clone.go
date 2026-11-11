@@ -103,13 +103,17 @@ type destDir struct {
 // number of files that were materialized as real APFS clones.
 //
 // dstDir itself is the caller's trust anchor and is created and opened by path.
-// Beneath it no link is ever followed: every destination directory is opened
-// relative to its parent's descriptor with O_NOFOLLOW|O_DIRECTORY, and every
-// directory, file and symlink is created relative to its parent's descriptor,
-// so a link a pod planted in its own rootfs cannot redirect a later
-// re-materialize. A symlink or non-directory where the tree needs a directory,
-// or a symlink where the tree lands a regular file, fails with
-// ErrDestinationLink. Idempotence is decided by lstat: an existing regular file
+// Beneath it the walk never leaves dstDir: every destination directory is
+// opened relative to its parent's descriptor with O_NOFOLLOW|O_DIRECTORY, and
+// every directory, file and symlink is created relative to its parent's
+// descriptor. A symlink where the tree needs a directory is resolved beneath
+// dstDir (os.Root), so images composed into one shared pod rootfs still compose
+// (one ships lib -> usr/lib, the next writes lib/x into usr/lib); a link that
+// would leave dstDir (an absolute target, a .. climb out, a chain stepping
+// out), or resolves to a non-directory, fails with ErrDestinationLink, so a link
+// a pod planted in its own rootfs cannot redirect a later re-materialize out of
+// it. A non-directory where the tree needs a directory, or a symlink where the
+// tree lands a regular file, fails with ErrDestinationLink too. Idempotence is decided by lstat: an existing regular file
 // (or any other non-link entry) where the tree lands a file is kept, and any
 // existing entry where the tree lands a symlink is kept.
 func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
@@ -125,6 +129,16 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 		return 0, fmt.Errorf("open destination %s: %w", dstDir, err)
 	}
 	stack := []destDir{{rel: ".", f: root}}
+	// inRoot resolves a destination directory link beneath dstDir. It follows
+	// links whose targets stay inside dstDir (a merged-usr lib -> usr/lib one
+	// image shipped and the next image writes through) and refuses any that
+	// leave it (an absolute target, a .. climb, a chain stepping out).
+	inRoot, err := os.OpenRoot(dstDir)
+	if err != nil {
+		root.Close()
+		return 0, fmt.Errorf("open destination root %s: %w", dstDir, err)
+	}
+	defer inRoot.Close()
 	defer func() {
 		for _, d := range stack {
 			d.f.Close()
@@ -161,7 +175,7 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 			if ierr != nil {
 				return ierr
 			}
-			f, oerr := mkdirOpenAt(parent, name, info.Mode().Perm()|0o100)
+			f, oerr := mkdirOpenAt(inRoot, parent, name, rel, info.Mode().Perm()|0o100)
 			if oerr != nil {
 				return fmt.Errorf("mkdir %s: %w", dst, oerr)
 			}
@@ -237,10 +251,14 @@ func withFD(dir *os.File, fn func(fd int) error) error {
 }
 
 // mkdirOpenAt creates name inside dir (an existing directory is kept) and
-// opens it without following a link. A symlink or non-directory at name fails
-// with ErrDestinationLink.
-func mkdirOpenAt(dir *os.File, name string, perm os.FileMode) (*os.File, error) {
+// opens it without following a link. A symlink at name is resolved beneath
+// root instead, by rel (name's path from the destination root): a link that
+// stays inside root and reaches a directory is opened there, and one that
+// would leave root, or reaches a non-directory, fails with ErrDestinationLink.
+// A non-directory, non-link entry at name fails with ErrDestinationLink.
+func mkdirOpenAt(root *os.Root, dir *os.File, name, rel string, perm os.FileMode) (*os.File, error) {
 	var fd int
+	isLink := false
 	err := withFD(dir, func(dfd int) error {
 		if err := unix.Mkdirat(dfd, name, uint32(perm)); err != nil && !errors.Is(err, unix.EEXIST) {
 			return &os.PathError{Op: "mkdirat", Path: name, Err: err}
@@ -251,6 +269,15 @@ func mkdirOpenAt(dir *os.File, name string, perm os.FileMode) (*os.File, error) 
 			return nil
 		}
 		if errors.Is(oerr, unix.ELOOP) || errors.Is(oerr, unix.ENOTDIR) {
+			// Some kernels report a link opened O_NOFOLLOW|O_DIRECTORY as
+			// ENOTDIR rather than ELOOP; lstat tells a link from a file.
+			var st unix.Stat_t
+			if serr := unix.Fstatat(dfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); serr == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
+				isLink = true
+				return nil
+			}
+		}
+		if errors.Is(oerr, unix.ELOOP) || errors.Is(oerr, unix.ENOTDIR) {
 			return fmt.Errorf("%w: %s: %w", ErrDestinationLink, name, oerr)
 		}
 		return &os.PathError{Op: "openat", Path: name, Err: oerr}
@@ -258,7 +285,35 @@ func mkdirOpenAt(dir *os.File, name string, perm os.FileMode) (*os.File, error) 
 	if err != nil {
 		return nil, err
 	}
+	if isLink {
+		return openDirInRoot(root, rel)
+	}
 	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+// openDirInRoot opens rel beneath root, following only links that stay inside
+// root, and requires the result to be a directory. A resolution that would
+// leave root (os.Root refuses it) or that ends at a non-directory fails with
+// ErrDestinationLink; a missing target or a permission failure is returned as
+// itself.
+func openDirInRoot(root *os.Root, rel string) (*os.File, error) {
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %s: %w", ErrDestinationLink, rel, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.IsDir() {
+		f.Close()
+		return nil, fmt.Errorf("%w: %s resolves to a non-directory", ErrDestinationLink, rel)
+	}
+	return f, nil
 }
 
 // lstatAt reports the type bits of name inside dir without following a link,
