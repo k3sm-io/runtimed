@@ -43,11 +43,12 @@ type recordManifest struct {
 // manifestDigest, cannot be shown to be the target and count as other.
 //
 // It fails CLOSED. An index entry, artifact record or released copy that
-// cannot be read or decoded returns an error wrapping ErrIndexEntryCorrupt and
+// cannot be read or decoded, or a ".json" name in any of the three directories
+// that is not a regular file, returns an error wrapping ErrIndexEntryCorrupt and
 // no set, as does a released-directory entry named like a copy that is not
 // one: a set silently short of one manifest's blobs would let eviction delete
 // a blob that manifest still names. A file a concurrent writer removed between
-// the listing and the read is skipped, as List does. Commit temps (names
+// the listing and the read is skipped. Commit temps (names
 // starting with ".") and names without the .json suffix are not records. An
 // absent index or namespace contributes nothing. A malformed target digest is
 // an error.
@@ -65,7 +66,7 @@ func (c *Cache) evictSharedSet(ctx context.Context, manifest string) (map[string
 	}
 	x := &FileIndex{dir: c.IndexRoot()}
 
-	entries, err := x.List(ctx)
+	entries, err := x.sharedEntries(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("evict shared set: image index: %w", err)
 	}
@@ -102,6 +103,72 @@ func (c *Cache) evictSharedSet(ctx context.Context, manifest string) (map[string
 	}
 	if err := x.releasedShared(manifest, add); err != nil {
 		return nil, fmt.Errorf("evict shared set: released artifact records: %w", err)
+	}
+	return out, nil
+}
+
+// sharedEntries returns every image index entry, failing closed as
+// evictSharedSet documents. It is List with one difference: a ".json" name
+// that is not a regular file (a symlink, a directory, a device) is an error
+// wrapping ErrIndexEntryCorrupt rather than skipped, because the entry it
+// stands for might name a blob nothing else protects. Each name is Lstat'd
+// before it is read through the fd-anchored root, so a symlink is refused, not
+// followed. The order of the result is unspecified.
+func (x *FileIndex) sharedEntries(ctx context.Context) ([]IndexEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	root, err := x.open()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer root.Close()
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("open image index %s: %w", x.dir, err)
+	}
+	names, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read image index %s: %w", x.dir, err)
+	}
+	out := make([]IndexEntry, 0, len(names))
+	for _, d := range names {
+		name := d.Name()
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		fi, err := root.Lstat(name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // replaced or removed since the listing
+			}
+			return nil, fmt.Errorf("%w: stat %q: %v", ErrIndexEntryCorrupt, name, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: %q is not a regular file (mode %v)", ErrIndexEntryCorrupt, name, fi.Mode().Type())
+		}
+		buf, err := readAnchored(root, name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			// LOCAL-ONLY, no boundErr: as in List, an fs.PathError over an entry
+			// file name already restricted to "*.json".
+			return nil, fmt.Errorf("%w: read %q: %v", ErrIndexEntryCorrupt, name, err)
+		}
+		e, err := decodeEntry(name, buf)
+		if err != nil {
+			return nil, err
+		}
+		if entryName(e.Reference, e.Platform) != name {
+			return nil, fmt.Errorf("%w: %q holds the record for %q/%s",
+				ErrIndexEntryCorrupt, name, e.Reference, e.Platform)
+		}
+		out = append(out, e)
 	}
 	return out, nil
 }

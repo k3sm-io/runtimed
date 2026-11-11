@@ -184,6 +184,42 @@ func TestEvictSharedSet(t *testing.T) {
 			wantErr: ErrIndexEntryCorrupt,
 		},
 		{
+			name:   "symlink named like an index entry fails closed",
+			target: mA,
+			setup: func(f *sharedFixture) {
+				f.entry("b", "B", false, cfgB, ownB)
+				dst := filepath.Join(f.cache.IndexRoot(), "elsewhere")
+				if err := os.WriteFile(dst, []byte("{}"), 0o600); err != nil {
+					f.f(err)
+				}
+				if err := os.Symlink("elsewhere", filepath.Join(f.cache.IndexRoot(), "x.json")); err != nil {
+					f.f(err)
+				}
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "directory named like an index entry fails closed",
+			target: mA,
+			setup: func(f *sharedFixture) {
+				f.entry("b", "B", false, cfgB, ownB)
+				if err := os.Mkdir(filepath.Join(f.cache.IndexRoot(), "x.json"), 0o700); err != nil {
+					f.f(err)
+				}
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "index temps and non-record names are skipped",
+			target: mA,
+			setup: func(f *sharedFixture) {
+				f.entry("b", "B", false, cfgB, ownB)
+				writeEntryFile(f.t, f.cache, ".index-123", []byte("temp in flight"))
+				writeEntryFile(f.t, f.cache, "notes.txt", []byte("not a record"))
+			},
+			want: []string{mB, cfgB, ownB},
+		},
+		{
 			name:   "undecodable artifact record fails closed",
 			target: mR,
 			setup: func(f *sharedFixture) {
