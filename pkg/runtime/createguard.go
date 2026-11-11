@@ -39,9 +39,10 @@ import (
 // re-run on every create.
 //
 // FAIL CLOSED per pod id: a record directory for this id that exists but
-// cannot be read, a record file in it that cannot be read, or a recorded group
-// that cannot be inspected refuses too. A group with no record is invisible to
-// this check by construction.
+// cannot be read, a record file in it that cannot be read, a recorded group
+// that cannot be inspected, or a live leader under a record with no leader
+// identity refuses too. A group with no record is invisible to this check by
+// construction. The error names the record directory.
 var ErrPodGroupStillAlive = errors.New("runtime: a process group an earlier run started for the pod is still alive")
 
 // liveRecordedGroup is one recorded group the create guard found alive.
@@ -59,14 +60,21 @@ type liveRecordedGroup struct {
 // reap record for podID names a group this runtime does not own that is, or
 // may be, still alive, and nil otherwise. It never signals anything.
 //
+// An id that is not a legal pod id is returned as that error, without
+// ErrPodGroupStillAlive: retrying it cannot succeed.
+//
 // It must run before createPod: a createPod failure removes the pod dir, which
 // would delete the rootfs the live group uses.
 func (r *Runtime) refuseBesideLiveNativeGroup(podID string) error {
-	records, err := r.readPodReapRecordsFor(podID)
+	dir, err := r.podReapDir(podID)
+	if err != nil {
+		return fmt.Errorf("create pod %s: reap record dir: %w", podID, err)
+	}
+	records, err := r.readPodReapRecordsIn(dir)
 	if err != nil {
 		r.log.Warn("not creating a pod whose process-group records cannot be read: a group an earlier run started may still be alive",
-			"pod", podID, "err", err)
-		return fmt.Errorf("create pod %s: %w: %w", podID, err, ErrPodGroupStillAlive)
+			"pod", podID, "recordDir", dir, "err", err)
+		return fmt.Errorf("create pod %s: records in %s: %w: %w", podID, dir, err, ErrPodGroupStillAlive)
 	}
 	if len(records) == 0 {
 		return nil
@@ -81,22 +89,18 @@ func (r *Runtime) refuseBesideLiveNativeGroup(podID string) error {
 			continue
 		}
 		r.log.Warn("not creating a pod while a process group an earlier run started for it is still alive (not signalled)",
-			"pod", podID, "container", g.container, "pgid", g.pgid, "survivors", g.survivors, "why", g.why)
-		return fmt.Errorf("create pod %s: process group %d (%s): %w", podID, g.pgid, g.why, ErrPodGroupStillAlive)
+			"pod", podID, "container", g.container, "pgid", g.pgid, "survivors", g.survivors, "why", g.why, "recordDir", dir)
+		return fmt.Errorf("create pod %s: process group %d (%s), record in %s: %w", podID, g.pgid, g.why, dir, ErrPodGroupStillAlive)
 	}
 	return nil
 }
 
-// readPodReapRecordsFor returns the well-formed reap records of podID. A
-// missing directory is no record. A directory, or a record file in it, that
+// readPodReapRecordsIn returns the well-formed reap records in dir, one pod's
+// reap record directory (podReapDir). A missing directory is no record. A directory, or a record file in it, that
 // exists but cannot be read is an error: the caller treats it as a doubt. A
 // file that does not parse, or names a pgid <= 1, identifies no group and is
 // skipped (the startup reap quarantines it).
-func (r *Runtime) readPodReapRecordsFor(podID string) ([]podProcRecord, error) {
-	dir, err := r.podReapDir(podID)
-	if err != nil {
-		return nil, fmt.Errorf("reap record dir: %w", err)
-	}
+func (r *Runtime) readPodReapRecordsIn(dir string) ([]podProcRecord, error) {
 	r.reapStoreMu.Lock()
 	defer r.reapStoreMu.Unlock()
 	entries, err := os.ReadDir(dir)
@@ -142,8 +146,11 @@ func (r *Runtime) ownedPgids() map[int]bool {
 // or may be alive. Unlike provenGroupMembers it does not need the leader: a
 // non-empty group whose leader is gone is exactly the leaked shape this guard
 // exists for, so it counts as alive. Only a live leader with a start other
-// than the recorded one, and no recorded container matching, is read as a
-// recycled pgid that is not this pod's.
+// than a recorded, non-zero one, and no recorded container or survivor
+// matching, is read as a recycled pgid that is not this pod's. A record with
+// no leader start (recordPodProc writes 0 when the leader's start could not
+// be read) cannot tell a recycled pgid from its own leader, so a live leader
+// under it counts as alive.
 func (r *Runtime) recordedGroupAlive(rec podProcRecord) (liveRecordedGroup, bool) {
 	g := liveRecordedGroup{pgid: rec.Pgid, container: rec.Container}
 	for _, s := range rec.Survivors {
@@ -171,7 +178,10 @@ func (r *Runtime) recordedGroupAlive(rec podProcRecord) (liveRecordedGroup, bool
 	case !found:
 		g.why = "leader gone, group not empty"
 		return g, true
-	case rec.StartUnixNano != 0 && leader.StartUnixNano == rec.StartUnixNano:
+	case rec.StartUnixNano == 0:
+		g.why = "leader alive, no recorded leader identity"
+		return g, true
+	case leader.StartUnixNano == rec.StartUnixNano:
 		g.why = "recorded leader alive"
 		return g, true
 	case childIsRecordedInstance(rec, members):

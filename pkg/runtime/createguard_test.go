@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -33,6 +34,17 @@ import (
 type guardProcTable struct {
 	mu     sync.Mutex
 	groups map[int][]supervisor.ProcMember
+	// broken names the groups that cannot be inspected (ok=false).
+	broken map[int]bool
+}
+
+func (g *guardProcTable) breakGroup(pgid int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.broken == nil {
+		g.broken = map[int]bool{}
+	}
+	g.broken[pgid] = true
 }
 
 func (g *guardProcTable) set(pgid int, members ...supervisor.ProcMember) {
@@ -44,6 +56,9 @@ func (g *guardProcTable) set(pgid int, members ...supervisor.ProcMember) {
 func (g *guardProcTable) procGroup(pgid int) ([]supervisor.ProcMember, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.broken[pgid] {
+		return nil, false
+	}
 	return append([]supervisor.ProcMember(nil), g.groups[pgid]...), true
 }
 
@@ -274,5 +289,85 @@ func TestCreatePodRefusesBesideALiveNativeGroup(t *testing.T) {
 		// Neither unreadable directory is this id's: the create proceeds.
 		third, err := f.create("pod-third")
 		assertCreated(t, third, err)
+	})
+
+	t.Run("a group that cannot be inspected refuses", func(t *testing.T) {
+		f := newGuardFixture(t, podID)
+		seed(t, f, podProcRecord{Pgid: pgid, StartUnixNano: start})
+		f.procs.breakGroup(pgid)
+		resp, err := f.create(podID)
+		f.assertRefused(t, podID, resp, err)
+	})
+
+	t.Run("unreadable record file in a readable directory refuses", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("a mode-000 file is readable by root")
+		}
+		f := newGuardFixture(t, podID)
+		seed(t, f, podProcRecord{Pgid: pgid, StartUnixNano: start})
+		dir, err := f.rt.podReapDir(podID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(dir, "4242.json")
+		if err := os.Chmod(file, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(file, 0o600) })
+		resp, err := f.create(podID)
+		f.assertRefused(t, podID, resp, err)
+		if !strings.Contains(err.Error(), dir) {
+			t.Errorf("refusal %q does not name the record directory %s", err, dir)
+		}
+	})
+
+	t.Run("corrupt record is skipped", func(t *testing.T) {
+		f := newGuardFixture(t, podID)
+		dir, err := f.rt.podReapDir(podID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "4242.json"), []byte("{not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f.procs.set(pgid, supervisor.ProcMember{Pid: pgid, StartUnixNano: start})
+		resp, err := f.create(podID)
+		assertCreated(t, resp, err)
+	})
+
+	t.Run("zero-start record with a live leader refuses", func(t *testing.T) {
+		f := newGuardFixture(t, podID)
+		seed(t, f, podProcRecord{Pgid: pgid, StartUnixNano: 0})
+		f.procs.set(pgid, supervisor.ProcMember{Pid: pgid, StartUnixNano: start + 99})
+		resp, err := f.create(podID)
+		f.assertRefused(t, podID, resp, err)
+	})
+
+	t.Run("two records where only the second is alive refuses", func(t *testing.T) {
+		const second = pgid + 100
+		f := newGuardFixture(t, podID)
+		seed(t, f, podProcRecord{Pgid: pgid, StartUnixNano: start})
+		seed(t, f, podProcRecord{Pgid: second, StartUnixNano: start, Container: "sidecar"})
+		f.procs.set(second, supervisor.ProcMember{Pid: second, StartUnixNano: start})
+		resp, err := f.create(podID)
+		f.assertRefused(t, podID, resp, err)
+		dir, derr := f.rt.podReapDir(podID)
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		if msg := err.Error(); !strings.Contains(msg, dir) {
+			t.Errorf("refusal %q does not name the record directory %s", msg, dir)
+		}
+	})
+
+	t.Run("malformed pod id is not reported as a live group", func(t *testing.T) {
+		f := newGuardFixture(t, podID)
+		err := f.rt.refuseBesideLiveNativeGroup("../escape")
+		if err == nil || errors.Is(err, ErrPodGroupStillAlive) {
+			t.Fatalf("guard(malformed id) = %v, want a non-retryable error without ErrPodGroupStillAlive", err)
+		}
 	})
 }
