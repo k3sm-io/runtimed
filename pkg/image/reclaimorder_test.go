@@ -304,3 +304,37 @@ func TestExecutePruneKeepsABlobLeasedMidBatch(t *testing.T) {
 		t.Fatalf("rep.pinned = %+v; want %s kept as leased", rep.pinned, b)
 	}
 }
+
+// TestLeaseHasMatchesLeasedDigests checks that the per-blob lease check agrees
+// with the full lease set for live, released and expired leases, and that it
+// allocates nothing.
+func TestLeaseHasMatchesLeasedDigests(t *testing.T) {
+	f := newGCFixture(t)
+	f.cache.AcquireLease([]string{"sha256:live-a", "sha256:shared"}, time.Hour)
+	released := f.cache.AcquireLease([]string{"sha256:released", "sha256:shared"}, time.Hour)
+	f.cache.AcquireLease([]string{"sha256:expired"}, time.Minute)
+	f.cache.AcquireLease([]string{"sha256:live-b"}, 2*time.Hour)
+	released.Release()
+	f.clock = f.clock.Add(30 * time.Minute)
+
+	digests := []string{"sha256:live-a", "sha256:live-b", "sha256:shared", "sha256:released", "sha256:expired", "sha256:never"}
+	want := map[string]bool{"sha256:live-a": true, "sha256:live-b": true, "sha256:shared": true}
+	for _, d := range digests {
+		got := f.cache.leaseHas(d)
+		if set := f.cache.leasedDigests()[d]; got != set {
+			t.Errorf("leaseHas(%q) = %v, leasedDigests has %v", d, got, set)
+		}
+		if got != want[d] {
+			t.Errorf("leaseHas(%q) = %v, want %v", d, got, want[d])
+		}
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		for _, d := range digests {
+			_ = f.cache.leaseHas(d)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("leaseHas allocated %v times per run, want 0", allocs)
+	}
+}

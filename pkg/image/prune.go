@@ -478,8 +478,9 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // leased, when non-nil, is asked about each entry's digest immediately before
 // that entry's Lstat and unlink, and an entry it reports leased is kept as
 // ReasonKeptLeased. The pin set is one read per batch; this in-memory read
-// narrows the window a lease taken during the batch can miss to the single
-// unlink in progress.
+// narrows the window a lease taken during the batch can miss to one blob's
+// lease check, Lstat and Remove. It sees live leases only: a pull that recorded
+// a root and released its lease after the batch's pin read is not seen by it.
 func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, leased func(digest string) bool) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")

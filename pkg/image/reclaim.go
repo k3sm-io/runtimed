@@ -513,7 +513,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
 	pinned := func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
-	leasedNow := func(d string) bool { return c.leasedDigests()[d] }
+	leasedNow := c.leaseHas
 	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned, leasedNow)
 	if err != nil {
 		return nil, err

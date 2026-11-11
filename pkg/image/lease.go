@@ -106,16 +106,40 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 func (c *Cache) leasedDigests() map[string]bool {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
-	now := c.now()
+	c.expireLeasesLocked()
 	out := make(map[string]bool)
-	for id, l := range c.leases {
-		if now.After(l.expires) {
-			delete(c.leases, id)
-			continue
-		}
+	for _, l := range c.leases {
 		for _, d := range l.digests {
 			out[d] = true
 		}
 	}
 	return out
+}
+
+// leaseHas reports whether a live lease pins digest, dropping leases whose TTL
+// has passed exactly as leasedDigests does. It allocates nothing, so a per-blob
+// re-check costs one scan of the live leases rather than a copy of their set.
+func (c *Cache) leaseHas(digest string) bool {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.expireLeasesLocked()
+	for _, l := range c.leases {
+		for _, d := range l.digests {
+			if d == digest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// expireLeasesLocked deletes every lease whose TTL has passed. The caller holds
+// leaseMu. It is the one statement of the expiry rule.
+func (c *Cache) expireLeasesLocked() {
+	now := c.now()
+	for id, l := range c.leases {
+		if now.After(l.expires) {
+			delete(c.leases, id)
+		}
+	}
 }
