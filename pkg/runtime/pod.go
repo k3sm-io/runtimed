@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1771,8 +1772,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	cred := resolveCredential(p.box, c)
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, execArgv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
+		// The backend's error names the profile staging dir and path.
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-			fmt.Errorf("wrap command for %s: %w", c.GetName(), err)
+			wrapStartError(c.GetName(), err)
 	}
 
 	// The environment reads the box's annotations, which UpdatePod replaces
@@ -1908,8 +1910,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if err := proc.Start(ctx); err != nil {
 		_ = cleanup()
 		closeLog()
+		// The spawn's error names the exec-shim's host path and the cache root.
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
-			fmt.Errorf("spawn container %s: %w", c.GetName(), err)
+			spawnStartError(c.GetName(), err)
 	}
 	// Track the container's whole process tree from now on: on macOS there is
 	// no pid namespace whose end kills everything the container started, so
@@ -2438,6 +2441,40 @@ func (e *clientMessageError) Unwrap() error { return e.err }
 // withClientMessage pairs err with the fixed sentence a client sees in its place.
 func withClientMessage(message string, err error) error {
 	return &clientMessageError{message: message, err: err}
+}
+
+// spawnStartError is the start failure for container name whose spawn failed
+// with err. The client sentence keeps the errno class when it is one a tenant
+// fixes in its image (spawnErrnoClass), never the error's free text.
+func spawnStartError(name string, err error) error {
+	full := fmt.Errorf("spawn container %s: %w", name, err)
+	if class := spawnErrnoClass(err); class != "" {
+		return withClientMessage(fmt.Sprintf("container %q could not be started (%s); the daemon log has the cause", name, class), full)
+	}
+	return withClientMessage(fmt.Sprintf("container %q could not be started; the daemon log has the cause", name), full)
+}
+
+// spawnErrnoClass names the closed set of spawn failure classes a client may
+// read: a missing program, a denied one, one the kernel cannot execute. Any
+// other cause is "", and the client reads only that the start failed.
+func spawnErrnoClass(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "program not found"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, syscall.ENOEXEC):
+		return "exec format error"
+	default:
+		return ""
+	}
+}
+
+// wrapStartError is the start failure for container name whose sandbox wrap
+// failed with err, which names the profile staging dir and path.
+func wrapStartError(name string, err error) error {
+	return withClientMessage(fmt.Sprintf("container %q could not be sandboxed; the daemon log has the cause", name),
+		fmt.Errorf("wrap command for %s: %w", name, err))
 }
 
 // signatureGateMessage is the client-visible sentence for a start whose gate

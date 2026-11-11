@@ -20,12 +20,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -40,6 +44,25 @@ const unpackDetail = "UNPACK-DETAIL: no space left on device"
 func (u *failingUnpacker) MaterializeTree(_ context.Context, _ *runtimev1.ImageManifest, _ image.UnpackPolicy, dst string) (*image.MaterializeResult, error) {
 	return nil, fmt.Errorf("materialize tree %q into %s: %w", "sha256:"+hexRun('e'), dst, errors.New(unpackDetail))
 }
+
+// toggleWrapBackend fails WrapCommand, once failing is set, the way the sbpl
+// backend does when it cannot stage a profile: the staging path and a cause.
+type toggleWrapBackend struct {
+	fakeBackend
+	failing *atomic.Bool
+}
+
+const wrapDetail = "WRAP-DETAIL"
+
+func (b toggleWrapBackend) WrapCommand(ctx context.Context, profile string, argv []string, spec supervisor.LaunchSpec) (string, []string, func() error, error) {
+	if b.failing.Load() {
+		return "", nil, nil, fmt.Errorf("stage profile %s: %w", "/var/k3sm/sbpl/"+wrapDetail+"/profile.sb", errors.New("read-only file system"))
+	}
+	return b.fakeBackend.WrapCommand(ctx, profile, argv, spec)
+}
+
+// spawnDetail marks the host exec-shim path a failed spawn's error names.
+const spawnDetail = "SPAWN-DETAIL"
 
 // TestStartFailureMessageHidesHostPaths pins what a pod is told when its
 // container's start fails because the image program escapes the rootfs or the
@@ -132,6 +155,89 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 		})
 	}
 
+	// The spawn and the wrap are pod-class at CreatePod, so they reach a client
+	// through the restart reply (startErrorReply), driven here end to end.
+	restarts := []struct {
+		name     string
+		sentence string
+		reason   runtimev1.FailureReason
+		marker   string
+		wants    []string
+		fail     func(sp *fakeSpawner, wrap *atomic.Bool, cacheRoot string)
+	}{
+		{
+			name:     "spawn-missing-program",
+			sentence: "could not be started (program not found); the daemon log has the cause",
+			reason:   runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+			marker:   spawnDetail,
+			wants:    []string{"spawn container main", "no such file or directory"},
+			fail: func(sp *fakeSpawner, _ *atomic.Bool, cacheRoot string) {
+				sp.mu.Lock()
+				sp.err = &fs.PathError{Op: "fork/exec", Path: filepath.Join(cacheRoot, spawnDetail, "exec-shim"), Err: syscall.ENOENT}
+				sp.mu.Unlock()
+			},
+		},
+		{
+			name:     "wrap-command",
+			sentence: "could not be sandboxed; the daemon log has the cause",
+			reason:   runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			marker:   wrapDetail,
+			wants:    []string{"wrap command for main", "read-only file system"},
+			fail:     func(_ *fakeSpawner, wrap *atomic.Bool, _ string) { wrap.Store(true) },
+		},
+	}
+	for i, tc := range restarts {
+		t.Run("restart/"+tc.name, func(t *testing.T) {
+			podID := fmt.Sprintf("pod-restart-msg-%d", i)
+			logs := &lockedBuffer{}
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+			sp := &fakeSpawner{}
+			wrap := &atomic.Bool{}
+			w := newBlockingWaiter()
+			rt := newTestRuntimeCfg(t, cfg, Deps{
+				Backend: toggleWrapBackend{fakeBackend: fakeBackend{available: true}, failing: wrap},
+				Signer:  &scriptedSigner{check: func(string) error { return nil }},
+				Spawner: sp,
+				Waiter:  w,
+				Puller: &fakePuller{
+					manifest:   &runtimev1.ImageManifest{Reference: imageRef, Config: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('c')}},
+					descriptor: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('d')},
+				},
+				Unpacker: &treeUnpacker{
+					files:  map[string]string{"bin/app": "payload"},
+					runCfg: image.ImageRunConfig{Entrypoint: []string{"/bin/app"}},
+				},
+			})
+			box := hostBinBox(rt, podID)
+			box.Containers = []*runtimev1.Container{{Name: "main", Image: imageRef}}
+			rootfs := derivedRootfs(t, rt, podID)
+
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.GetError() != nil {
+				t.Fatalf("CreatePod failed: %v", resp.GetError())
+			}
+
+			tc.fail(sp, wrap, rt.cache.Root())
+			go w.release(1001) // the old instance exits when RestartContainer stops it
+			rresp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{PodId: podID, Container: "main"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rresp.GetError() == nil {
+				t.Fatal("RestartContainer succeeded through a failing start")
+			}
+			if got := rresp.GetFailureReason(); got != tc.reason {
+				t.Errorf("failure_reason = %v, want %v", got, tc.reason)
+			}
+			assertNoHostPaths(t, "RestartContainer error", rresp.GetError().GetMessage(),
+				podID+"/main", `container \"main\"`, tc.sentence, rt.cache.Root(), rootfs, spawnDetail, wrapDetail)
+			assertLoggedOnceAt(t, logs.String(), "level=ERROR", tc.marker, tc.wants)
+		})
+	}
+
 	// The fixed sentence rides beside the error, not instead of it: the
 	// sentinel, the reason and the full text stay what callers match on.
 	t.Run("error-identity", func(t *testing.T) {
@@ -155,9 +261,46 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 	})
 }
 
+// TestSpawnStartErrorClass pins the closed errno classes a failed spawn's
+// client sentence may name, and that any other cause names none, while the
+// full error and its sentinels stay what errors.Is sees.
+func TestSpawnStartErrorClass(t *testing.T) {
+	const tail = "; the daemon log has the cause"
+	for _, tc := range []struct {
+		errno syscall.Errno
+		want  string
+	}{
+		{syscall.ENOENT, `container "main" could not be started (program not found)` + tail},
+		{syscall.EACCES, `container "main" could not be started (permission denied)` + tail},
+		{syscall.ENOEXEC, `container "main" could not be started (exec format error)` + tail},
+		{syscall.E2BIG, `container "main" could not be started` + tail},
+	} {
+		cause := &fs.PathError{Op: "fork/exec", Path: "/cache/" + spawnDetail + "/exec-shim", Err: tc.errno}
+		err := spawnStartError("main", cause)
+		if !errors.Is(err, tc.errno) {
+			t.Errorf("%v: errors.Is lost the errno", tc.errno)
+		}
+		if want := "spawn container main: " + cause.Error(); err.Error() != want {
+			t.Errorf("%v: Error() = %q, want %q", tc.errno, err.Error(), want)
+		}
+		if got, want := boundedFailureMessage(err), fmt.Sprintf("%q", tc.want); got != want {
+			t.Errorf("%v: boundedFailureMessage = %s, want %s", tc.errno, got, want)
+		}
+		if got := startErrorReply(err); strings.Contains(got, spawnDetail) {
+			t.Errorf("%v: startErrorReply %q carries the host path", tc.errno, got)
+		}
+	}
+}
+
 // assertLoggedOnce fails t unless exactly one line of out carries marker,
 // holding every one of wants.
 func assertLoggedOnce(t *testing.T, out, marker string, wants []string) {
+	t.Helper()
+	assertLoggedOnceAt(t, out, "level=WARN", marker, wants)
+}
+
+// assertLoggedOnceAt is assertLoggedOnce at the given slog level token.
+func assertLoggedOnceAt(t *testing.T, out, level, marker string, wants []string) {
 	t.Helper()
 	var lines []string
 	for _, line := range strings.Split(out, "\n") {
@@ -168,8 +311,8 @@ func assertLoggedOnce(t *testing.T, out, marker string, wants []string) {
 	if len(lines) != 1 {
 		t.Fatalf("the full start error (%q) was logged %d times, want once:\n%s", marker, len(lines), out)
 	}
-	if !strings.Contains(lines[0], "level=WARN") {
-		t.Errorf("start error logged as %q, want level=WARN", lines[0])
+	if !strings.Contains(lines[0], level) {
+		t.Errorf("start error logged as %q, want %s", lines[0], level)
 	}
 	for _, want := range wants {
 		if !strings.Contains(lines[0], want) {
