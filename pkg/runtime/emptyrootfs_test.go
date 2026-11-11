@@ -96,11 +96,13 @@ func TestCreatePodStartsFromAnEmptyRootfs(t *testing.T) {
 
 // gatedSpawner holds the first Spawn until release is closed, after writing a
 // file into the pod's rootfs and signalling entered: it stands for a create
-// that has built its rootfs and has not registered the pod yet.
+// that has built its rootfs and has not registered the pod yet. With fail set,
+// the held first Spawn then fails, so that first create fails.
 type gatedSpawner struct {
 	fakeSpawner
 	once    sync.Once
 	place   string
+	fail    bool
 	entered chan struct{}
 	release chan struct{}
 }
@@ -114,31 +116,31 @@ func (g *gatedSpawner) Spawn(ctx context.Context, spec supervisor.SpawnSpec) (in
 		}
 		close(g.entered)
 		<-g.release
+		if g.fail {
+			return 0, errors.New("gated spawn failure")
+		}
 	}
 	return g.fakeSpawner.Spawn(ctx, spec)
 }
 
-// TestConcurrentCreateDoesNotClearALivePodRootfs pins that a second CreatePod
-// for a pod id whose first create is still in flight is refused, and that the
-// refusal leaves the first create's rootfs and its outcome untouched.
-func TestConcurrentCreateDoesNotClearALivePodRootfs(t *testing.T) {
-	const podID = "pod-twice"
-	sp := &gatedSpawner{entered: make(chan struct{}), release: make(chan struct{})}
-	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: newBlockingWaiter()})
+type createResult struct {
+	resp *runtimev1.CreatePodResponse
+	err  error
+}
+
+// startHeldCreate starts a first CreatePod of podID on rt and returns once it
+// is held inside sp's first Spawn, with the channel its result arrives on.
+func startHeldCreate(t *testing.T, rt *Runtime, sp *gatedSpawner, podID string) <-chan createResult {
+	t.Helper()
 	podDir, err := rt.podDir(podID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sp.place = filepath.Join(podDir, "rootfs", "placed-by-first")
-
-	type result struct {
-		resp *runtimev1.CreatePodResponse
-		err  error
-	}
-	first := make(chan result, 1)
+	first := make(chan createResult, 1)
 	go func() {
 		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
-		first <- result{resp, err}
+		first <- createResult{resp, err}
 	}()
 	select {
 	case <-sp.entered:
@@ -146,21 +148,135 @@ func TestConcurrentCreateDoesNotClearALivePodRootfs(t *testing.T) {
 		close(sp.release)
 		t.Fatal("first create never reached its spawn")
 	}
+	return first
+}
 
-	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
-	close(sp.release)
-	if !errors.Is(err, ErrPodCreateInFlight) {
-		t.Errorf("second CreatePod = (%v, %v), want ErrPodCreateInFlight", resp, err)
-	} else if got := status.Code(err); got != codes.Aborted {
-		t.Errorf("second CreatePod code = %v, want Aborted", got)
-	}
-
-	var r result
+// waitResult reads one create result, failing the test after 30s.
+func waitResult(t *testing.T, ch <-chan createResult, what string) createResult {
+	t.Helper()
 	select {
-	case r = <-first:
+	case r := <-ch:
+		return r
 	case <-time.After(30 * time.Second):
-		t.Fatal("first create never returned")
+		t.Fatalf("%s never returned", what)
+		return createResult{}
 	}
+}
+
+// TestConcurrentCreateDoesNotClearALivePodRootfs pins that a second CreatePod
+// for a pod id whose first create is still in flight waits for the first, then
+// answers with the registered pod's status, and leaves the first create's
+// rootfs untouched.
+func TestConcurrentCreateDoesNotClearALivePodRootfs(t *testing.T) {
+	const podID = "pod-twice"
+	sp := &gatedSpawner{entered: make(chan struct{}), release: make(chan struct{})}
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: newBlockingWaiter()})
+	first := startHeldCreate(t, rt, sp, podID)
+
+	second := make(chan createResult, 1)
+	go func() {
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+		second <- createResult{resp, err}
+	}()
+	select {
+	case r := <-second:
+		close(sp.release)
+		t.Fatalf("second CreatePod returned (%v, %v) while the first was held", r.resp, r.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(sp.release)
+
+	r := waitResult(t, first, "first create")
+	if r.err != nil || r.resp.GetError() != nil {
+		t.Fatalf("first CreatePod = (%v, %v), want success", r.resp, r.err)
+	}
+	r2 := waitResult(t, second, "second create")
+	if r2.err != nil || r2.resp.GetError() != nil {
+		t.Fatalf("second CreatePod = (%v, %v), want the registered pod's status", r2.resp, r2.err)
+	}
+	if got, want := r2.resp.GetStatus().GetPodId(), podID; got != want {
+		t.Errorf("second CreatePod status pod id = %q, want %q", got, want)
+	}
+	if b, err := os.ReadFile(sp.place); err != nil || string(b) != "first" {
+		t.Errorf("file the first create placed = (%q, %v), want it intact", b, err)
+	}
+}
+
+// TestConcurrentCreateAfterAFailedFirstCreatesAfresh pins that a second
+// CreatePod waiting on a first create that then fails runs its own create,
+// after the first's pod dir removal, and succeeds on a fresh rootfs.
+func TestConcurrentCreateAfterAFailedFirstCreatesAfresh(t *testing.T) {
+	const podID = "pod-retry"
+	sp := &gatedSpawner{fail: true, entered: make(chan struct{}), release: make(chan struct{})}
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: newBlockingWaiter()})
+	first := startHeldCreate(t, rt, sp, podID)
+
+	second := make(chan createResult, 1)
+	go func() {
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+		second <- createResult{resp, err}
+	}()
+	select {
+	case r := <-second:
+		close(sp.release)
+		t.Fatalf("second CreatePod returned (%v, %v) while the first was held", r.resp, r.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(sp.release)
+
+	r := waitResult(t, first, "first create")
+	if r.err != nil || r.resp.GetError() == nil {
+		t.Fatalf("first CreatePod = (%v, %v), want a create failure", r.resp, r.err)
+	}
+	r2 := waitResult(t, second, "second create")
+	if r2.err != nil || r2.resp.GetError() != nil {
+		t.Fatalf("second CreatePod = (%v, %v), want success", r2.resp, r2.err)
+	}
+	if _, err := os.Stat(sp.place); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file the failed first create placed: stat err = %v, want it gone (fresh rootfs)", err)
+	}
+	rt.mu.Lock()
+	_, live := rt.pods[podID]
+	rt.mu.Unlock()
+	if !live {
+		t.Error("pod not registered after the second create")
+	}
+}
+
+// TestConcurrentCreateWaiterCtxCancel pins that a second CreatePod waiting on
+// an in-flight first create returns promptly when its ctx is cancelled, with
+// context.Canceled and ErrPodCreateInFlight in the chain, and that the first
+// create is unaffected.
+func TestConcurrentCreateWaiterCtxCancel(t *testing.T) {
+	const podID = "pod-cancel"
+	sp := &gatedSpawner{entered: make(chan struct{}), release: make(chan struct{})}
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: newBlockingWaiter()})
+	first := startHeldCreate(t, rt, sp, podID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	second := make(chan createResult, 1)
+	go func() {
+		resp, err := rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+		second <- createResult{resp, err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	var r2 createResult
+	select {
+	case r2 = <-second:
+	case <-time.After(5 * time.Second):
+		close(sp.release)
+		t.Fatal("cancelled second CreatePod did not return promptly")
+	}
+	if !errors.Is(r2.err, context.Canceled) || !errors.Is(r2.err, ErrPodCreateInFlight) {
+		t.Errorf("second CreatePod = (%v, %v), want context.Canceled and ErrPodCreateInFlight", r2.resp, r2.err)
+	}
+	if got := status.Code(r2.err); got != codes.Canceled {
+		t.Errorf("second CreatePod code = %v, want Canceled", got)
+	}
+	close(sp.release)
+
+	r := waitResult(t, first, "first create")
 	if r.err != nil || r.resp.GetError() != nil {
 		t.Fatalf("first CreatePod = (%v, %v), want success", r.resp, r.err)
 	}

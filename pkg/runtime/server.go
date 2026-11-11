@@ -35,25 +35,28 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// ErrPodCreateInFlight is the error CreatePod returns (wrapped, gRPC code
-// Aborted) when another CreatePod for the same pod id has not finished yet.
-// The first create is left untouched; a retry after it ends sees the
-// registered pod, or creates the pod afresh if the first create failed.
+// ErrPodCreateInFlight is in the chain of the error CreatePod returns when it
+// waited for another CreatePod of the same pod id to finish and its own ctx
+// ended first; the ctx error (context.Canceled or DeadlineExceeded) is in the
+// chain too. The first create is left untouched.
 var ErrPodCreateInFlight = errors.New("runtime: another create of this pod is in flight")
 
-// podCreateInFlightError carries ErrPodCreateInFlight with the pod id and maps
-// to gRPC code Aborted, a retryable conflict, on the wire.
-type podCreateInFlightError struct{ podID string }
-
-func (e *podCreateInFlightError) Error() string {
-	return fmt.Sprintf("create pod %s: %v", e.podID, ErrPodCreateInFlight)
+// podCreateInFlightError carries ErrPodCreateInFlight and the waiter's ctx
+// error with the pod id, and maps to the ctx error's gRPC code on the wire.
+type podCreateInFlightError struct {
+	podID string
+	cause error
 }
 
-func (e *podCreateInFlightError) Unwrap() error { return ErrPodCreateInFlight }
+func (e *podCreateInFlightError) Error() string {
+	return fmt.Sprintf("create pod %s: waiting: %v: %v", e.podID, ErrPodCreateInFlight, e.cause)
+}
+
+func (e *podCreateInFlightError) Unwrap() []error { return []error{ErrPodCreateInFlight, e.cause} }
 
 // GRPCStatus is the status the gRPC server sends for this error.
 func (e *podCreateInFlightError) GRPCStatus() *status.Status {
-	return status.New(codes.Aborted, e.Error())
+	return status.New(status.FromContextError(e.cause).Code(), e.Error())
 }
 
 // CreatePod materializes and starts a PodBox. It is idempotent on pod id: a
@@ -66,28 +69,39 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		return createFailure(reason, err), nil
 	}
 
-	r.mu.Lock()
-	if existing, ok := r.pods[box.GetPodId()]; ok {
-		r.mu.Unlock()
-		return &runtimev1.CreatePodResponse{Status: r.podStatus(existing)}, nil
-	}
 	// One create per pod id at a time: the create clears the id's rootfs
 	// (freshRootfs) and, on failure, removes the pod dir, so a second create
 	// running beside it would destroy what the first is building or has
-	// just registered. It is an RPC error rather than a create failure, so
-	// nothing of the first create is unwound; the caller retries and then
-	// sees the registered pod (or creates it afresh if the first failed).
-	if _, busy := r.createClaims[box.GetPodId()]; busy {
+	// just registered. A second create waits, under its own ctx, for the
+	// claimant to release, then re-checks: the registered pod answers it as
+	// the idempotent no-op, or, if the first failed, it claims the id itself.
+	r.mu.Lock()
+	for {
+		if existing, ok := r.pods[box.GetPodId()]; ok {
+			r.mu.Unlock()
+			return &runtimev1.CreatePodResponse{Status: r.podStatus(existing)}, nil
+		}
+		done, busy := r.createClaims[box.GetPodId()]
+		if !busy {
+			break
+		}
 		r.mu.Unlock()
-		r.log.Warn("refusing a create while another create of the same pod is in flight", "pod", box.GetPodId())
-		return nil, &podCreateInFlightError{podID: box.GetPodId()}
+		r.log.Info("waiting for another create of the same pod to finish", "pod", box.GetPodId())
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, &podCreateInFlightError{podID: box.GetPodId(), cause: ctx.Err()}
+		}
+		r.mu.Lock()
 	}
-	r.createClaims[box.GetPodId()] = struct{}{}
-	// Released last, after a failed create has removed its pod dir, so the
-	// next create of the id never starts while that removal runs.
+	claim := make(chan struct{})
+	r.createClaims[box.GetPodId()] = claim
+	// Released last, after a failed create has removed its pod dir, so a
+	// waiting create never starts while that removal runs.
 	defer func() {
 		r.mu.Lock()
 		delete(r.createClaims, box.GetPodId())
+		close(claim)
 		r.mu.Unlock()
 	}()
 	// Mark the create in flight until the pod is registered or has failed, so

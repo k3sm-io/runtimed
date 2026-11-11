@@ -21,6 +21,8 @@ import (
 )
 
 // endCreatingLocked ends one in-flight CreatePod for podID. r.mu must be held.
+// CreatePod's claim serializes creates of one id, so the count is normally 1
+// here; the decrement branch for a higher count is a fallback.
 func (r *Runtime) endCreatingLocked(podID string) {
 	if r.creating[podID] <= 1 {
 		delete(r.creating, podID)

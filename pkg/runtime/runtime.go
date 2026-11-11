@@ -534,14 +534,17 @@ type Runtime struct {
 	mu   sync.Mutex
 	pods map[string]*pod
 	// creating counts the CreatePod calls in flight per pod id, under mu: from
-	// the registry check until the pod is registered or the create has failed.
-	// A pod in it has a dir that may not carry its reachability record yet.
+	// the claim until the pod is registered or the create has failed. A pod in
+	// it has a dir that may not carry its reachability record yet. The claim
+	// (createClaims) serializes creates of one id, so the count is 0 or 1 on
+	// that path; a count above 1 is a fallback the accounting still honors.
 	creating map[string]int
-	// createClaims holds, under mu, the pod ids a CreatePod owns from the
-	// registry check until the pod is registered or its failure is unwound.
-	// A second CreatePod for a claimed id is refused (ErrPodCreateInFlight),
-	// so only one create ever clears and rebuilds an id's rootfs.
-	createClaims map[string]struct{}
+	// createClaims holds, under mu, a done channel per pod id a CreatePod owns
+	// from the registry check until the pod is registered or its failure is
+	// unwound; the claimant closes it on release. A second CreatePod for a
+	// claimed id waits on it (or its own ctx) and then re-checks, so only one
+	// create at a time ever clears and rebuilds an id's rootfs.
+	createClaims map[string]chan struct{}
 
 	// podReapStarted is set, under mu, at the moment the startup pod reap
 	// snapshots the pods it must not touch. AttachPod registers an adopted pod
@@ -1214,7 +1217,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		broker:         newBroker(),
 		pods:           make(map[string]*pod),
 		creating:       make(map[string]int),
-		createClaims:   make(map[string]struct{}),
+		createClaims:   make(map[string]chan struct{}),
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,
