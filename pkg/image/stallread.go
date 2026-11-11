@@ -59,6 +59,10 @@ const defaultLayerStallWindow = 2 * time.Minute
 // is still the live one, so a fire can cut only the Read that armed it. One
 // reused timer cannot do this: with Reset the callback is fixed at creation and
 // cannot tell which window it belongs to.
+//
+// Read must not be called concurrently: one caller at a time, as io.Copy does.
+// Overlapping Reads would make an earlier Read's window stale while it is still
+// in flight, so its stall would go undetected.
 type stallReader struct {
 	body      io.ReadCloser
 	window    time.Duration
