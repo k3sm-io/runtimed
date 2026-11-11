@@ -21,8 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build"
+	"go/constant"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,8 +42,9 @@ import (
 )
 
 // evictKeepReasonValues maps every EvictKeepReason constant pkg/image's
-// non-test source declares, by name, to its value. It reads the source so a
-// reason added there is seen here without anyone remembering to list it.
+// non-test source declares for this build, by name, to its value. It reads the
+// source so a reason added there is seen here without anyone remembering to
+// list it.
 func evictKeepReasonValues(t *testing.T) map[string]image.EvictKeepReason {
 	t.Helper()
 	dir := filepath.Join("..", "image")
@@ -48,41 +53,126 @@ func evictKeepReasonValues(t *testing.T) map[string]image.EvictKeepReason {
 		t.Fatalf("read %s: %v", dir, err)
 	}
 	fset := token.NewFileSet()
-	out := make(map[string]image.EvictKeepReason)
+	var files []*ast.File
 	for _, e := range ents {
 		n := e.Name()
 		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		if ok, err := build.Default.MatchFile(dir, n); err != nil || !ok {
+			if err != nil {
+				t.Fatalf("match %s: %v", n, err)
+			}
 			continue
 		}
 		f, err := parser.ParseFile(fset, filepath.Join(dir, n), nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", n, err)
 		}
-		for _, d := range f.Decls {
-			gd, ok := d.(*ast.GenDecl)
-			if !ok || gd.Tok != token.CONST {
-				continue
-			}
-			for _, s := range gd.Specs {
-				vs := s.(*ast.ValueSpec)
-				typ, ok := vs.Type.(*ast.Ident)
-				if !ok || typ.Name != "EvictKeepReason" {
-					continue
-				}
-				for i, name := range vs.Names {
-					lit, ok := vs.Values[i].(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
-						t.Fatalf("%s: EvictKeepReason %s is not a string literal", n, name.Name)
-					}
-					out[name.Name] = image.EvictKeepReason(strings.Trim(lit.Value, "\"`"))
-				}
-			}
-		}
+		files = append(files, f)
 	}
-	if len(out) == 0 {
+	vals, err := typedStringConsts(fset, files, "EvictKeepReason")
+	if err != nil {
+		t.Fatalf("%s: %v", dir, err)
+	}
+	if len(vals) == 0 {
 		t.Fatalf("found no EvictKeepReason constants under %s", dir)
 	}
+	out := make(map[string]image.EvictKeepReason, len(vals))
+	for name, v := range vals {
+		out[name] = image.EvictKeepReason(v)
+	}
 	return out
+}
+
+// emptyImporter satisfies every import with an empty package, so
+// typedStringConsts can type-check one package's files without loading its
+// dependencies. A use of an imported name is then a type error the checker
+// reports and typedStringConsts ignores; a constant that depends on one has no
+// known value, which typedStringConsts does report.
+type emptyImporter struct{}
+
+func (emptyImporter) Import(path string) (*types.Package, error) {
+	pkg := types.NewPackage(path, filepath.Base(path))
+	pkg.MarkComplete()
+	return pkg, nil
+}
+
+// typedStringConsts type-checks files as one package and returns every
+// package-level constant whose type is the package's own named type typeName,
+// by name, to its string value. go/types resolves the forms a syntactic walk
+// misses: a conversion (X = T("x")), an implicit repeat in a const block, a
+// constant built from another one, and a spec with too few values, which is
+// an error here rather than a panic.
+func typedStringConsts(fset *token.FileSet, files []*ast.File, typeName string) (map[string]string, error) {
+	conf := types.Config{Importer: emptyImporter{}, Error: func(error) {}}
+	pkg, _ := conf.Check("evictconsts", fset, files, nil)
+	if pkg == nil {
+		return nil, errors.New("type-check returned no package")
+	}
+	scope := pkg.Scope()
+	out := make(map[string]string)
+	for _, name := range scope.Names() {
+		c, ok := scope.Lookup(name).(*types.Const)
+		if !ok {
+			continue
+		}
+		named, ok := c.Type().(*types.Named)
+		if !ok || named.Obj().Pkg() != pkg || named.Obj().Name() != typeName {
+			continue
+		}
+		if c.Val().Kind() != constant.String {
+			return nil, fmt.Errorf("%s constant %s has no known string value (%s)", typeName, name, c.Val())
+		}
+		out[name] = constant.StringVal(c.Val())
+	}
+	return out, nil
+}
+
+// TestEvictTypedStringConsts proves the collector the completeness check stands on
+// over the declaration forms a syntactic walk would miss or panic on.
+func TestEvictTypedStringConsts(t *testing.T) {
+	const decls = "type R string\n\ntype Other string\n\n"
+	cases := []struct {
+		name    string
+		imports string
+		src     string
+		want    map[string]string
+		wantErr bool
+	}{
+		{name: "explicit type", src: `const A R = "a"`, want: map[string]string{"A": "a"}},
+		{name: "conversion", src: `const A = R("a")`, want: map[string]string{"A": "a"}},
+		{name: "implicit repeat", src: "const (\n\tA R = \"a\"\n\tB\n)", want: map[string]string{"A": "a", "B": "a"}},
+		{name: "several names in one spec", src: `const A, B R = "a", "b"`, want: map[string]string{"A": "a", "B": "b"}},
+		{name: "built from another constant", src: "const A R = \"a\"\nconst B = A + \"-b\"", want: map[string]string{"A": "a", "B": "a-b"}},
+		{name: "raw string", src: "const A R = `a`", want: map[string]string{"A": "a"}},
+		{name: "untyped and other types are not collected", src: "const A = \"a\"\nconst B Other = \"b\"\nconst C string = \"c\"", want: map[string]string{}},
+		{name: "function-local constants are not collected", src: "func f() R {\n\tconst A R = \"a\"\n\treturn A\n}", want: map[string]string{}},
+		{name: "too few values is an error, not a panic", src: `const A, B R = "a"`, wantErr: true},
+		{name: "a value from an unloaded import is an error", imports: `import "example.com/q"`, src: "const A R = R(q.X)", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "p.go", "package p\n\n"+tc.imports+"\n\n"+decls+tc.src+"\n", 0)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			got, err := typedStringConsts(fset, []*ast.File{f}, "R")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("typedStringConsts = %v, nil; want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("typedStringConsts: %v", err)
+			}
+			if !maps.Equal(got, tc.want) {
+				t.Fatalf("typedStringConsts = %v; want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestEvictSkipReasonMapping pins the map from every kept reason onto the
@@ -170,6 +260,8 @@ func TestEvictStatusError(t *testing.T) {
 		err        error
 		wantCode   codes.Code
 		wantReason string // "" means no ErrorInfo detail
+		msgHas     string // "" means no check
+		msgLacks   string // "" means no check
 	}{
 		{name: "ok", res: &image.EvictResult{}, wantCode: codes.OK},
 		{name: "ok with every kept reason but unlink-failed", res: &image.EvictResult{Kept: []image.EvictKept{
@@ -208,6 +300,44 @@ func TestEvictStatusError(t *testing.T) {
 		{name: "corrupt index entry carries no detail", err: image.ErrIndexEntryCorrupt, wantCode: codes.FailedPrecondition},
 		{name: "cancelled", err: context.Canceled, wantCode: codes.Canceled},
 		{name: "untyped error", err: errors.New("disk on fire"), wantCode: codes.Internal},
+
+		// A refusal beside an explicit nil result: still the refusal, and the
+		// message names no unlinked count.
+		{name: "in use beside a nil result", res: nil, err: fmt.Errorf("pod p1: %w", errEvictImageInUse),
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonImageInUse, msgLacks: "unlinked"},
+		{name: "reference ambiguous beside a nil result", res: nil, err: image.ErrIndexEntryAmbiguous,
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonReferenceAmbiguous, msgLacks: "unlinked"},
+		{name: "roots incomplete beside a nil result names no count", res: nil, err: image.ErrRootsIncomplete,
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete, msgLacks: "unlinked"},
+		{name: "roots incomplete after an unlink names the count", res: removedOne, err: image.ErrRootsIncomplete,
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete, msgHas: "1 blob(s) were unlinked"},
+
+		// Two sentinels joined: the first refusal in evictRefusalReason's order
+		// (in use, ambiguous, roots incomplete) names the detail, and a refusal
+		// outranks a non-refusal sentinel.
+		{name: "joined in use and roots incomplete", err: errors.Join(image.ErrRootsIncomplete, errEvictImageInUse),
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonImageInUse},
+		{name: "joined ambiguous and roots incomplete", err: errors.Join(image.ErrRootsIncomplete, image.ErrIndexEntryAmbiguous),
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonReferenceAmbiguous},
+		{name: "joined not found and roots incomplete", err: errors.Join(image.ErrIndexEntryNotFound, image.ErrRootsIncomplete),
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete},
+		{name: "joined not found and invalid digest carries no detail", err: errors.Join(image.ErrIndexEntryNotFound, image.ErrInvalidDigest),
+			wantCode: codes.NotFound},
+
+		// Context errors keep their own codes and carry no detail.
+		{name: "deadline exceeded", err: context.DeadlineExceeded, wantCode: codes.DeadlineExceeded},
+		{name: "wrapped deadline exceeded after an unlink", res: removedOne, err: fmt.Errorf("evict: %w", context.DeadlineExceeded),
+			wantCode: codes.DeadlineExceeded},
+		{name: "wrapped cancelled", err: fmt.Errorf("evict: %w", context.Canceled), wantCode: codes.Canceled},
+
+		// No error and no result is OK.
+		{name: "nil error with nil result", res: nil, err: nil, wantCode: codes.OK},
+
+		// Only unlink-failed kept blobs, nothing removed: INTERNAL, counted.
+		{name: "only unlink-failed kept blobs", res: &image.EvictResult{Kept: []image.EvictKept{
+			{Digest: blob, Reason: image.EvictKeptUnlinkFailed},
+			{Digest: blob, Reason: image.EvictKeptUnlinkFailed},
+		}}, wantCode: codes.Internal, msgHas: "2 target blob(s) could not be unlinked"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -224,6 +354,12 @@ func TestEvictStatusError(t *testing.T) {
 			}
 			if st.Code() != tc.wantCode {
 				t.Fatalf("code = %v; want %v (%v)", st.Code(), tc.wantCode, st.Message())
+			}
+			if tc.msgHas != "" && !strings.Contains(st.Message(), tc.msgHas) {
+				t.Fatalf("message = %q; want it to contain %q", st.Message(), tc.msgHas)
+			}
+			if tc.msgLacks != "" && strings.Contains(st.Message(), tc.msgLacks) {
+				t.Fatalf("message = %q; want it not to contain %q", st.Message(), tc.msgLacks)
 			}
 			var infos []*errdetails.ErrorInfo
 			for _, d := range st.Details() {
@@ -245,6 +381,11 @@ func TestEvictStatusError(t *testing.T) {
 			if infos[0].GetReason() != tc.wantReason || infos[0].GetDomain() != runtimev1.EvictErrorInfoDomain {
 				t.Fatalf("ErrorInfo = %s/%s; want %s/%s", infos[0].GetDomain(), infos[0].GetReason(),
 					runtimev1.EvictErrorInfoDomain, tc.wantReason)
+			}
+			// evictRefusalStatus sets reason and domain only; pin that it sets
+			// no metadata, so a key added later is a deliberate change here.
+			if md := infos[0].GetMetadata(); len(md) != 0 {
+				t.Fatalf("ErrorInfo metadata = %v; want none", md)
 			}
 		})
 	}
