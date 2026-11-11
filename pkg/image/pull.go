@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -432,6 +433,11 @@ type Puller struct {
 	// localBlobs is a same-volume blob store consulted before each blob is
 	// fetched (WithLocalBlobSource). Nil — the default — fetches every blob.
 	localBlobs LocalBlobSource
+
+	// layerStallWindow is how long a layer body may deliver no byte before its
+	// fetch is aborted with ErrLayerBodyStalled (stallread.go). Zero means
+	// defaultLayerStallWindow; tests set it directly.
+	layerStallWindow time.Duration
 }
 
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
@@ -816,8 +822,9 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 			if oerr != nil {
 				return oerr
 			}
-			defer rc.Close()
-			_, cerr := io.Copy(w, rc)
+			body := newStallReader(rc, p.stallWindow())
+			defer body.Close()
+			_, cerr := io.Copy(w, body)
 			return cerr
 		})
 		if err != nil {
@@ -991,6 +998,15 @@ func (p *Puller) writeBlob(digest string, size int64, fill func(io.Writer) error
 		}
 	}
 	return p.cache.CommitBlob(digest, size, fill)
+}
+
+// stallWindow is the layer-body progress window: layerStallWindow, or
+// defaultLayerStallWindow when unset.
+func (p *Puller) stallWindow() time.Duration {
+	if p.layerStallWindow > 0 {
+		return p.layerStallWindow
+	}
+	return defaultLayerStallWindow
 }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
