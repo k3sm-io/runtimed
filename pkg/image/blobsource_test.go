@@ -17,9 +17,12 @@ limitations under the License.
 package image
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"strings"
@@ -330,5 +333,46 @@ func TestBlobSourceScheme(t *testing.T) {
 				t.Errorf("credential present = %v, want %v", got, tc.wantCred)
 			}
 		})
+	}
+}
+
+// TestBlobSourceRedaction pins that no formatting of a BlobSource, nor its slog
+// form, carries a credential's secret fields, while the ref and the presence of
+// a credential stay visible.
+func TestBlobSourceRedaction(t *testing.T) {
+	secrets := []string{"s3cr3t-password", "s3cr3t-identity-token", "s3cr3t-registry-token", "czNjcjN0LWF1dGg="}
+	src := BlobSource{
+		Ref:      "registry.example.com/team/app:v1",
+		Registry: registryfetch.Registry{PlainHTTP: true},
+		Credential: &registryfetch.Credential{
+			Username: "user", Password: secrets[0], IdentityToken: secrets[1], RegistryToken: secrets[2], Auth: secrets[3],
+		},
+	}
+	var logged bytes.Buffer
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("blob", "src", src, "srcPtr", &src)
+	var text bytes.Buffer
+	slog.New(slog.NewTextHandler(&text, nil)).Info("blob", "src", src)
+
+	for name, got := range map[string]string{
+		"%v":      fmt.Sprintf("%v", src),
+		"%+v":     fmt.Sprintf("%+v", src),
+		"%#v":     fmt.Sprintf("%#v", src),
+		"%v ptr":  fmt.Sprintf("%v", &src),
+		"%+v ptr": fmt.Sprintf("%+v", &src),
+		"%s":      fmt.Sprintf("%s", src),
+		"json":    logged.String(),
+		"text":    text.String(),
+	} {
+		for _, secret := range secrets {
+			if strings.Contains(got, secret) {
+				t.Errorf("%s output carries a secret", name)
+			}
+		}
+		if !strings.Contains(got, src.Ref) {
+			t.Errorf("%s output lost the ref: %q", name, got)
+		}
+	}
+	if !strings.Contains(logged.String(), `"credential":true`) || !strings.Contains(logged.String(), `"plainHTTP":true`) {
+		t.Errorf("slog form lost the credential or plain-HTTP flag: %s", logged.String())
 	}
 }
