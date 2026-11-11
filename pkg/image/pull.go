@@ -822,7 +822,7 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 // with cred: the primary path's BlobSource, when the puller has both that
 // route and a partial store. Nil otherwise, and ingest then reads each layer
 // from the fetched image, as it does without either. A route that cannot be
-// built is also nil (logged at Debug): the layer still arrives over the image
+// built is also nil (logged at Warn, since it is misconfiguration): the layer still arrives over the image
 // fetch, and CommitBlob verifies it either way.
 func (p *Puller) resumeSource(ref string, cred *RegistryCredential) *BlobSource {
 	if p.partials == nil {
@@ -830,7 +830,7 @@ func (p *Puller) resumeSource(ref string, cred *RegistryCredential) *BlobSource 
 	}
 	src, ok, err := p.primaryBlobSource(ref, cred)
 	if err != nil {
-		p.logger().Debug("no resumable blob route for this reference; fetching layers whole",
+		p.logger().Warn("no resumable blob route for this reference; fetching layers whole",
 			"ref", ref, "error", err)
 		return nil
 	}
@@ -1220,7 +1220,13 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		},
 	})
 	switch {
-	case errors.Is(err, registryfetch.ErrPartialBudget) || errors.Is(err, registryfetch.ErrPartialCap):
+	case errors.Is(err, registryfetch.ErrPartialCap):
+		// Admit refused before the store was touched; a layer over the
+		// per-partial cap is misconfiguration, not load.
+		p.logger().Warn("layer partial over the per-partial cap; fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	case errors.Is(err, registryfetch.ErrPartialBudget):
 		// Admit refused before the store was touched.
 		p.logger().Debug("layer partial over budget; fetching it whole",
 			"digest", digest, "error", err)
@@ -1236,8 +1242,11 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 // transferBlob appends the rest of the size-byte blob digest to f from offset
 // have, over src. A server that answers from 0 instead (a 200 to the Range
 // request) restarts the partial: f is truncated and written from 0. A failure
-// leaves what arrived in f, synced, for the next pull to resume; an overrun
-// empties it, since those bytes are the server's fault.
+// leaves what arrived in f, synced, for the next pull to resume. A body that
+// runs past size is refused with ErrBlobTooLarge and f is emptied; the real
+// route's body (registryfetch.Registry.Blob) already stops at size with an
+// error, so there the partial stays at size and the next pull verifies it in
+// CommitBlob or removes it.
 func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64) error {
 	body, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
 	if err != nil {
