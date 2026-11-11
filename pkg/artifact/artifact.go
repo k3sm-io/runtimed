@@ -208,6 +208,11 @@ type Puller struct {
 	// recordStripes serialize the read-modify-write of one record key (see
 	// record), so concurrent subset pulls of one manifest never lose a layer.
 	recordStripes [32]sync.Mutex
+
+	// afterPresence, when set, runs once the presence check (and any fetch it
+	// led to) is done and before the record is written: the window in which a
+	// reclaim pass can unlink a blob the check saw. Tests only.
+	afterPresence func()
 }
 
 // New returns a Puller.
@@ -484,6 +489,9 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 			return nil, err
 		}
 		res.Fetched = true
+	}
+	if p.afterPresence != nil {
+		p.afterPresence()
 	}
 	if err := p.record(ctx, ref, typ, mdigest, raw, m.Config.Digest, res.LayerDigests, podOnly); err != nil {
 		return nil, err
