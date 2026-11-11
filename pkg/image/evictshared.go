@@ -255,6 +255,41 @@ func (x *FileIndex) releasedShared(contribute func(label string, ds []string)) e
 	return nil
 }
 
+// ReleasedArtifact returns the manifest digest and the blobs (config and
+// layers) of the released artifact copy for manifest, and whether one was
+// found. It reads the released directory with the strict reader the evict
+// shared set uses (releasedShared), so it fails CLOSED: any released copy that
+// cannot be read or decoded, is not named for its bytes, or is not a regular
+// file returns ErrIndexEntryCorrupt and nothing found, since the copy a corrupt
+// entry hides may be the one asked for. No copy for manifest, or no released
+// directory, is found=false with a nil error. Copies of different record bytes
+// for one manifest contribute the union of their blobs, in first-seen order. A
+// malformed manifest digest is an error.
+func (x *FileIndex) ReleasedArtifact(manifest string) (manifestDigest string, blobs []string, found bool, err error) {
+	if _, err := parseBlobDigest(manifest); err != nil {
+		return "", nil, false, fmt.Errorf("released artifact: manifest: %w", err)
+	}
+	seen := make(map[string]struct{})
+	if err := x.releasedShared(func(m string, ds []string) {
+		if m != manifest {
+			return
+		}
+		found = true
+		for _, d := range ds {
+			if _, ok := seen[d]; !ok {
+				seen[d] = struct{}{}
+				blobs = append(blobs, d)
+			}
+		}
+	}); err != nil {
+		return "", nil, false, fmt.Errorf("released artifact %s: %w", manifest, err)
+	}
+	if !found {
+		return "", nil, false, nil
+	}
+	return manifest, blobs, true, nil
+}
+
 // decodeSharedRecord returns the manifest digest and the blobs an artifact
 // record (live or released) names, refusing a record DecodeArtifactRoot
 // refuses.
