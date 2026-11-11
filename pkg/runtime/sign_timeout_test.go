@@ -50,6 +50,27 @@ func (s *hungSigner) Check(ctx context.Context, _ runtimev1.SignaturePolicy, _ s
 	return ctx.Err()
 }
 
+// hungSignSigner answers Check at once with a plain "unsigned" verdict (an
+// error that is neither a timeout nor a cancellation) and hangs in Sign until
+// its context ends. Both are counted.
+type hungSignSigner struct {
+	signs  atomic.Int32
+	checks atomic.Int32
+}
+
+var errUnsigned = errors.New("code object is not signed at all")
+
+func (s *hungSignSigner) Sign(ctx context.Context, _, _ string) error {
+	s.signs.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *hungSignSigner) Check(context.Context, runtimev1.SignaturePolicy, string) error {
+	s.checks.Add(1)
+	return errUnsigned
+}
+
 // shortenSignatureTimeouts sets the gate's deadlines for one test.
 func shortenSignatureTimeouts(t *testing.T, check, sign time.Duration) {
 	t.Helper()
@@ -66,10 +87,12 @@ func shortenSignatureTimeouts(t *testing.T, check, sign time.Duration) {
 // cancelled caller is reported as a cancellation, not as the timeout.
 func TestGateSignatureHungSignerFailsClosedWithinTimeout(t *testing.T) {
 	const timeout = 200 * time.Millisecond
+	// The sign deadline is long, so a check bounded by it fails the elapsed bound.
+	const longTimeout = 10 * time.Second
 	const slack = 3 * time.Second
 
 	t.Run("adhoc-ok-no-sign-target-unchanged", func(t *testing.T) {
-		shortenSignatureTimeouts(t, timeout, timeout)
+		shortenSignatureTimeouts(t, timeout, longTimeout)
 		signer := &hungSigner{}
 		rt := newTestRuntime(t, Deps{Signer: signer})
 		rootfs := t.TempDir()
@@ -110,7 +133,7 @@ func TestGateSignatureHungSignerFailsClosedWithinTimeout(t *testing.T) {
 		runtimev1.SignaturePolicy_SIGNATURE_POLICY_REQUIRE_NOTARIZED,
 	} {
 		t.Run(policy.String(), func(t *testing.T) {
-			shortenSignatureTimeouts(t, timeout, timeout)
+			shortenSignatureTimeouts(t, timeout, longTimeout)
 			podID := "pod-sig-hung"
 			signer := &hungSigner{}
 			sp := &fakeSpawner{}
@@ -173,4 +196,37 @@ func TestGateSignatureHungSignerFailsClosedWithinTimeout(t *testing.T) {
 			t.Errorf("Sign called %d times after a cancel, want 0", n)
 		}
 	})
+}
+
+// TestGateSignatureSignTimeout pins the ADHOC_OK sign path when the signer
+// hangs: an "unsigned" check leads to one Sign, which is bounded by the sign
+// deadline (not the much longer check deadline) and reported as the
+// image.ErrSignatureCheckTimeout sentinel with the retryable IMAGE_PULL reason;
+// the timed-out sign is not followed by a re-check.
+func TestGateSignatureSignTimeout(t *testing.T) {
+	const checkTimeout = 10 * time.Second
+	const signTimeout = 400 * time.Millisecond
+	const slack = 3 * time.Second
+	shortenSignatureTimeouts(t, checkTimeout, signTimeout)
+	signer := &hungSignSigner{}
+	rt := newTestRuntime(t, Deps{Signer: signer})
+	start := time.Now()
+	err := rt.gateSignature(context.Background(), runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK, "/fake", "/fake/bin", false)
+	elapsed := time.Since(start)
+	if !errors.Is(err, image.ErrSignatureCheckTimeout) {
+		t.Fatalf("gateSignature err = %v, want ErrSignatureCheckTimeout", err)
+	}
+	if elapsed > signTimeout+slack || elapsed >= checkTimeout {
+		t.Errorf("gate returned after %s, want within %s (the sign deadline, not the %s check deadline)",
+			elapsed, signTimeout+slack, checkTimeout)
+	}
+	if got := signatureFailureReason(err); got != runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL {
+		t.Errorf("failure reason = %v, want IMAGE_PULL (retryable), never SIGNATURE_REJECTED", got)
+	}
+	if n := signer.signs.Load(); n != 1 {
+		t.Errorf("Sign called %d times, want exactly 1", n)
+	}
+	if n := signer.checks.Load(); n != 1 {
+		t.Errorf("Check called %d times, want 1 (no re-check after a timed-out sign)", n)
+	}
 }
