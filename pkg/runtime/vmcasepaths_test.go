@@ -22,10 +22,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -114,25 +114,12 @@ func pushCaseImage(t *testing.T, host, repo string, entries []caseEntry) string 
 	return ref.String()
 }
 
-// countingCloner counts the clones a materialize attempted, so a refusal can be
-// shown to have stopped ahead of the first one. It counts through
-// image.CountClones, so the materialize keeps its descriptor-relative copy.
-type countingCloner struct {
-	n atomic.Int64
-}
-
-// cloner is the image.Cloner that byte-copies and counts into c.n.
-func (c *countingCloner) cloner() image.Cloner {
-	return image.CountClones(image.ByteCopier{}, &c.n)
-}
-
 // caseRig is a runtime with the real puller and the real unpacker over one
 // cache, and a vm backend that boots nothing.
 type caseRig struct {
-	rt     *Runtime
-	vmb    *fakeVMBackend
-	cache  *image.Cache
-	cloner *countingCloner
+	rt    *Runtime
+	vmb   *fakeVMBackend
+	cache *image.Cache
 }
 
 // newCaseRig builds a caseRig. A nil probe leaves the real measurement in place.
@@ -143,8 +130,7 @@ func newCaseRig(t *testing.T, probe image.CaseProbe) *caseRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cloner := &countingCloner{}
-	opts := []image.UnpackerOption{image.WithCloner(cloner.cloner())}
+	opts := []image.UnpackerOption{image.WithCloner(image.ByteCopier{})}
 	if probe != nil {
 		opts = append(opts, image.WithCaseProbe(probe))
 	}
@@ -163,7 +149,7 @@ func newCaseRig(t *testing.T, probe image.CaseProbe) *caseRig {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
 	cfg, deps := vmPodConfig(t, Deps{VMBackend: vmb, Puller: puller, Unpacker: unpacker})
 	cfg.Root, deps.Cache = root, cache
-	return &caseRig{rt: newTestRuntimeCfg(t, cfg, deps), vmb: vmb, cache: cache, cloner: cloner}
+	return &caseRig{rt: newTestRuntimeCfg(t, cfg, deps), vmb: vmb, cache: cache}
 }
 
 // create drives the real CreatePod for a one-container vm pod running ref.
@@ -218,6 +204,62 @@ func (r *caseRig) ownershipPaths(t *testing.T) map[string]bool {
 		paths[e.Path] = true
 	}
 	return paths
+}
+
+// assertClonedIntoPod proves the committed tree was copied into the pod: the
+// pod rootfs is a real directory holding a regular file with a fixture payload
+// that is a separate file from the snapshot's, which only a clone or byte copy
+// out of the snapshot makes. Either spelling of the config pair counts, because
+// a case-insensitive host merges the two into one node.
+func (r *caseRig) assertClonedIntoPod(t *testing.T) {
+	t.Helper()
+	rootfs := r.podRootfs(t)
+	if fi, err := os.Lstat(rootfs); err != nil || !fi.IsDir() {
+		t.Fatalf("pod rootfs %s is not a directory: %v, %v", rootfs, fi, err)
+	}
+	snaps := r.snapshots(t)
+	if len(snaps) != 1 {
+		t.Fatalf("committed snapshots = %v, want exactly one", snaps)
+	}
+	for _, p := range []string{casePathConfigUpper, casePathConfigLower} {
+		dst := filepath.Join(rootfs, p)
+		fi, err := os.Lstat(dst)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		got, err := os.ReadFile(dst)
+		if err != nil || (string(got) != "upper" && string(got) != "lower") {
+			continue
+		}
+		src, err := os.Stat(filepath.Join(snaps[0], image.TreeRootfsName, p))
+		if err == nil && os.SameFile(fi, src) {
+			t.Fatalf("%s is the snapshot's own file, not a copy of it", dst)
+		}
+		return
+	}
+	t.Errorf("the pod rootfs %s holds no copy of %s or %s: the tree was never cloned into the pod", rootfs, casePathConfigUpper, casePathConfigLower)
+}
+
+// assertNothingClonedIntoPod proves a refusal stopped ahead of the first copy:
+// the pod rootfs is absent, or holds directories only.
+func (r *caseRig) assertNothingClonedIntoPod(t *testing.T) {
+	t.Helper()
+	rootfs := r.podRootfs(t)
+	if _, err := os.Lstat(rootfs); errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	err := filepath.WalkDir(rootfs, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			t.Errorf("%s was copied into the pod ahead of the refusal", p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", rootfs, err)
+	}
 }
 
 // assertRefusal checks a refusal is ROOTFS_SETUP and names
@@ -308,9 +350,7 @@ func TestVMImageWithCaseOnlyPathsMaterializes(t *testing.T) {
 				t.Errorf("the ownership sidecar has no entry for %s", p)
 			}
 		}
-		if rig.cloner.n.Load() == 0 {
-			t.Error("the tree was never cloned into the pod")
-		}
+		rig.assertClonedIntoPod(t)
 	})
 
 	t.Run("a store measured case-insensitive refuses and names the pair and the fix", func(t *testing.T) {
@@ -331,9 +371,7 @@ func TestVMImageWithCaseOnlyPathsMaterializes(t *testing.T) {
 			return !strings.Contains(root.Name(), "/pods/"), nil
 		})
 		rig.assertRefusal(t, rig.create(t, pairRef), casePathConfigUpper, casePathConfigLower, remedy)
-		if got := rig.cloner.n.Load(); got != 0 {
-			t.Errorf("%d files were cloned ahead of the refusal", got)
-		}
+		rig.assertNothingClonedIntoPod(t)
 		if snaps := rig.snapshots(t); len(snaps) != 1 {
 			t.Errorf("committed snapshots = %v, want the store to keep its one tree", snaps)
 		}

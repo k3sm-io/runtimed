@@ -23,7 +23,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -45,8 +44,8 @@ var ErrQuarantined = errors.New("image: materialized file has com.apple.quaranti
 //
 // MaterializeTree copies only descriptor-relative (into the open parent
 // directory, resolving no destination path), through the unexported cloneAt
-// method every Cloner this package ships (ByteCopier, APFSCloner, CloneOnly,
-// and CountClones's wrapper) has. It refuses a Cloner without that method with
+// method every Cloner this package ships (ByteCopier, APFSCloner, CloneOnly)
+// has. It refuses a Cloner without that method with
 // ErrPathOnlyCloner: copying by a joined path after the parent was checked
 // would leave a race between that check and the copy.
 type Cloner interface {
@@ -99,39 +98,6 @@ var ErrPathOnlyCloner = errors.New("image: cloner cannot copy relative to a dire
 // MaterializeTree refuses a Cloner that does not (ErrPathOnlyCloner).
 type cloneAter interface {
 	cloneAt(src string, dir *os.File, name string) (cow bool, err error)
-}
-
-// CountClones returns a Cloner that copies with c and adds one to n before
-// every file it is asked to copy, by either method. It lets a test outside
-// this package observe how many files a materialize copied without giving up
-// the descriptor-relative copy. c must be a Cloner this package ships (or
-// another CountClones result): the returned Cloner's descriptor-relative copy
-// fails with ErrPathOnlyCloner otherwise.
-func CountClones(c Cloner, n *atomic.Int64) Cloner {
-	return countClones{inner: c, n: n}
-}
-
-// countClones is CountClones's Cloner.
-type countClones struct {
-	inner Cloner
-	n     *atomic.Int64
-}
-
-// Clone counts the copy and copies src to dst by path with the wrapped Cloner.
-func (c countClones) Clone(src, dst string) (bool, error) {
-	c.n.Add(1)
-	return c.inner.Clone(src, dst)
-}
-
-// cloneAt counts the copy and copies src to name inside dir with the wrapped
-// Cloner's descriptor-relative method.
-func (c countClones) cloneAt(src string, dir *os.File, name string) (bool, error) {
-	at, ok := c.inner.(cloneAter)
-	if !ok {
-		return false, ErrPathOnlyCloner
-	}
-	c.n.Add(1)
-	return at.cloneAt(src, dir, name)
 }
 
 // ErrTreeTooDeep reports that MaterializeTree met a source directory nested
