@@ -462,19 +462,25 @@ type ExecuteReport struct {
 // extents are still shared frees nothing, so the only honest stopping rule is to
 // re-measure.
 func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*ExecuteReport, error) {
-	return c.executePrune(plan, grace, now, stop, nil)
+	return c.executePrune(plan, grace, now, stop, nil, nil)
 }
 
 // pinnedFunc returns the digests that must survive an unlink batch, each with
 // the reason it is kept. It is read under pruneMu, just before the batch.
 type pinnedFunc func() (map[string]PruneReason, error)
 
-// executePrune is ExecutePrune with one more re-check. pinned, when non-nil,
+// executePrune is ExecutePrune with two more re-checks. pinned, when non-nil,
 // is called once under pruneMu before the first unlink, and every entry whose
 // digest it names is left in place and reported in ExecuteReport.pinned. A
 // pinned error aborts the run before anything is unlinked: the pin set is a
 // root set, and a short one would invert the answer.
-func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc) (*ExecuteReport, error) {
+//
+// leased, when non-nil, is asked about each entry's digest immediately before
+// that entry's Lstat and unlink, and an entry it reports leased is kept as
+// ReasonKeptLeased. The pin set is one read per batch; this in-memory read
+// narrows the window a lease taken during the batch can miss to the single
+// unlink in progress.
+func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, leased func(digest string) bool) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
 	}
@@ -514,6 +520,10 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 		}
 		if why, ok := pins[d.Node.Digest]; ok && d.Node.Digest != "" {
 			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
+			continue
+		}
+		if leased != nil && d.Node.Digest != "" && leased(d.Node.Digest) {
+			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
 			continue
 		}
 		rel := d.Node.Path

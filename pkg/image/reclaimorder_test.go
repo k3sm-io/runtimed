@@ -19,6 +19,7 @@ package image
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -206,7 +207,7 @@ func TestPinnedNowHonoursALeaseTakenAfterPlanning(t *testing.T) {
 	lease := f.cache.AcquireLease([]string{b}, time.Hour)
 	defer lease.Release()
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	rep, err := f.cache.executePrune(&PrunePlan{Delete: dels}, 0, f.clock, nil, pinned)
+	rep, err := f.cache.executePrune(&PrunePlan{Delete: dels}, 0, f.clock, nil, pinned, nil)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -218,5 +219,88 @@ func TestPinnedNowHonoursALeaseTakenAfterPlanning(t *testing.T) {
 	}
 	if !f.exists(b) {
 		t.Fatal("the leased blob was unlinked")
+	}
+}
+
+// planOf returns a delete plan naming each digest's blob.
+func planOf(digests ...string) *PrunePlan {
+	p := &PrunePlan{}
+	for _, d := range digests {
+		p.Delete = append(p.Delete, PruneDecision{
+			Node:   BlobNode{Path: "sha256/" + d[len("sha256:"):], Digest: d, Kind: BlobKindContent},
+			Reason: ReasonDeleteUnreferenced,
+		})
+	}
+	return p
+}
+
+// TestExecutePruneUnlinksNothingWhenThePinReadFails pins the fail-closed rule
+// of the per-batch pin read: an error from pinned aborts the run before any
+// unlink, because a short pin set would condemn what it failed to name.
+func TestExecutePruneUnlinksNothingWhenThePinReadFails(t *testing.T) {
+	f := newGCFixture(t)
+	a := f.blob("planned a", time.Hour)
+	b := f.blob("planned b", time.Hour)
+	boom := errors.New("pin read failed")
+	pinned := func() (map[string]PruneReason, error) { return nil, boom }
+	if _, err := f.cache.executePrune(planOf(a, b), 0, f.clock, nil, pinned, nil); !errors.Is(err, boom) {
+		t.Fatalf("executePrune error = %v; want %v", err, boom)
+	}
+	if !f.exists(a) || !f.exists(b) {
+		t.Fatalf("a failed pin read still unlinked: a exists=%v b exists=%v", f.exists(a), f.exists(b))
+	}
+}
+
+// TestPinnedNowFailsClosedOnAnIncompleteRootSet pins that the batch's root
+// re-read inherits the roots' fatality: a node under the pods tree that is
+// not a pod dir makes pinnedNow fail, and the batch unlinks nothing.
+func TestPinnedNowFailsClosedOnAnIncompleteRootSet(t *testing.T) {
+	f := newGCFixture(t)
+	a := f.blob("planned a", time.Hour)
+	f.pod("pod-a")
+	if err := os.WriteFile(filepath.Join(f.cache.PodsRoot(), "stray"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
+	if _, err := f.cache.executePrune(planOf(a), 0, f.clock, nil, pinned, nil); !errors.Is(err, ErrRootsIncomplete) {
+		t.Fatalf("executePrune error = %v; want ErrRootsIncomplete", err)
+	}
+	if !f.exists(a) {
+		t.Fatal("an incomplete root set still unlinked a planned blob")
+	}
+}
+
+// TestExecutePruneKeepsABlobLeasedMidBatch pins the per-unlink lease re-check:
+// a lease taken after the batch's pin read, before that blob's unlink, keeps
+// the blob, while the blob unlinked before it is gone. stop runs before each
+// entry's checks, which is what places the lease inside the batch.
+func TestExecutePruneKeepsABlobLeasedMidBatch(t *testing.T) {
+	f := newGCFixture(t)
+	a := f.blob("planned a", time.Hour)
+	b := f.blob("planned b", time.Hour)
+	var lease *Lease
+	defer func() { lease.Release() }()
+	calls := 0
+	stop := func() bool {
+		calls++
+		if calls == 2 { // after a's unlink, before b's
+			lease = f.cache.AcquireLease([]string{b}, time.Hour)
+		}
+		return false
+	}
+	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
+	leased := func(d string) bool { return f.cache.leasedDigests()[d] }
+	rep, err := f.cache.executePrune(planOf(a, b), 0, f.clock, stop, pinned, leased)
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
+	}
+	if f.exists(a) {
+		t.Fatal("the blob before the lease survived, so the run proved nothing")
+	}
+	if !f.exists(b) {
+		t.Fatal("a blob leased mid-batch was unlinked")
+	}
+	if len(rep.pinned) != 1 || rep.pinned[0].Digest != b || rep.pinned[0].Reason != ReasonKeptLeased {
+		t.Fatalf("rep.pinned = %+v; want %s kept as leased", rep.pinned, b)
 	}
 }

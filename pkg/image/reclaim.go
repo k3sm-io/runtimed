@@ -444,7 +444,8 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// regular file, and its mtime is still older than grace. Once per batch,
 	// under pruneMu and before the first unlink, it also re-reads the leases and
 	// the roots (pinnedNow), so a pull that rooted a planned blob since the plan
-	// keeps it.
+	// keeps it; and just before each unlink it re-reads the live leases, so a
+	// pull that leased the blob during the batch keeps it too.
 	artifactDels, restDels := orderEvictions(plan.Delete, classes)
 	plan.Delete = append(append([]PruneDecision(nil), artifactDels...), restDels...)
 	rep.ReclaimedByClass = map[string]int64{}
@@ -512,7 +513,8 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
 	pinned := func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
-	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned)
+	leasedNow := func(d string) bool { return c.leasedDigests()[d] }
+	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned, leasedNow)
 	if err != nil {
 		return nil, err
 	}
@@ -529,7 +531,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
-	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned)
+	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned, leasedNow)
 	if err != nil {
 		return nil, err
 	}
