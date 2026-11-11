@@ -35,10 +35,13 @@ limitations under the License.
 //   - The file name is derived from a digest that must match
 //     sha256:<64 hex>, so it is a fixed, path-safe token.
 //   - The directory is created 0700 when absent and refused when it is not a
-//     directory (a file, or a symlink planted in its place) or is writable by
-//     group or other: a partial dir another principal can write lets it choose
-//     the bytes a resume continues from.
-//   - The partial is opened O_NOFOLLOW, so a symlink in its place is refused.
+//     directory (a file, or a symlink planted in its place), is writable by
+//     group or other, or is not owned by the effective uid: a partial dir
+//     another principal can write or own lets it choose the bytes a resume
+//     continues from.
+//   - The partial is opened O_NOFOLLOW|O_NONBLOCK and must be a regular file
+//     by fstat of the opened descriptor (ErrPartialFile), so a symlink, a
+//     FIFO or a directory in its place is refused without blocking.
 //   - The transfer is handed the partial positioned at its current length,
 //     and restarts it itself when the source answers from another offset;
 //     after it the file must be exactly the blob's size (ErrPartialLength),
@@ -46,8 +49,8 @@ limitations under the License.
 //     so a whole blob appended to a prefix is never committed.
 //   - A complete partial is replayed whole to the caller's commit, which
 //     re-hashes it; when the commit reports the bytes poisoned (a digest
-//     mismatch, an overrun) the partial is removed, so a poisoned prefix never
-//     survives to be resumed.
+//     mismatch, an overrun), or fails with no poison test given, the partial
+//     is removed, so a poisoned prefix never survives to be resumed.
 //
 // Three opt-in helpers serve a caller that shares one store across
 // concurrent pulls; a caller that uses none of them sees no change. Claim
