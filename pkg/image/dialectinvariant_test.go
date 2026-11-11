@@ -87,3 +87,24 @@ func TestUnpackPolicyForCoversEverySandboxBackend(t *testing.T) {
 		t.Errorf("UnpackPolicyFor(%d) error = %v, want ErrUnsupportedLayerSemantics", int32(outOfRange), err)
 	}
 }
+
+// TestTreeKeyBindsDialect pins that the dialect is an input to the tree key: the
+// same manifest unpacked under the native and the linux policy names two
+// distinct trees, so one dialect's tree is never served for the other.
+func TestTreeKeyBindsDialect(t *testing.T) {
+	mfst := &runtimev1.ImageManifest{
+		Config: &runtimev1.Descriptor{Digest: "sha256:" + hexOf('a')},
+		Layers: []*runtimev1.Descriptor{{Digest: "sha256:" + hexOf('1')}},
+	}
+	nativeKey, err := TreeKey(mfst, NativeUnpackPolicy())
+	if err != nil {
+		t.Fatalf("TreeKey native: %v", err)
+	}
+	linuxKey, err := TreeKey(mfst, LinuxUnpackPolicy())
+	if err != nil {
+		t.Fatalf("TreeKey linux: %v", err)
+	}
+	if nativeKey == linuxKey {
+		t.Fatalf("TreeKey is %q under both the native and the linux policy; the dialect must be bound into the key", nativeKey)
+	}
+}
