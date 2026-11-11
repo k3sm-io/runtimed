@@ -315,24 +315,94 @@ func TestExternalTransportHeaderTimeoutThroughPull(t *testing.T) {
 	}
 }
 
-// timeoutNetError is a net.Error that reports a timeout.
-type timeoutNetError struct{}
-
-func (timeoutNetError) Error() string   { return "i/o timeout" }
-func (timeoutNetError) Timeout() bool   { return true }
-func (timeoutNetError) Temporary() bool { return true }
-
 // TestMirrorFallbackResolveAndHeaderTimeouts pins what the mirror fallback does
-// today with the two bounds' errors: a resolve-bound failure is not eligible,
-// a transport timeout (the header bound's kind of error) is.
+// with the two bounds' errors: neither is eligible. The resolve bound is a
+// pull failure about the host that does not hand the pull to another. The
+// header bound's REAL error (from net/http, through remoteFetch) satisfies
+// errors.Is(err, context.DeadlineExceeded), and mirrorFallbackEligible refuses
+// a deadline before it looks at the connection class. Not-eligible is the safe
+// verdict: a stalled primary ends the pull and cannot force a fallback to a
+// less trusted source.
 func TestMirrorFallbackResolveAndHeaderTimeouts(t *testing.T) {
 	resolve := fmt.Errorf("pull %q: %w after %s: %v", "r/app:v1", ErrPullResolveTimeout, time.Minute, context.Canceled)
 	if mirrorFallbackEligible(resolve) {
 		t.Errorf("mirrorFallbackEligible(%v) = true, want false", resolve)
 	}
-	var ne net.Error = timeoutNetError{}
-	header := fmt.Errorf("pull %q: %w", "r/app:v1", ne)
-	if !mirrorFallbackEligible(header) {
-		t.Errorf("mirrorFallbackEligible(%v) = false, want true", header)
+
+	setDuration(t, &responseHeaderTimeout, 50*time.Millisecond)
+	setDuration(t, &resolveTimeout, 30*time.Second)
+	freshExternalTransport(t)
+	r, err := name.ParseReference(silentServer(t) + "/silent/app:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = remoteFetch(context.Background(), r, r.String(), nil, nativePolicy())
+	if err == nil {
+		t.Fatal("remoteFetch on a silent registry succeeded")
+	}
+	header := fmt.Errorf("pull %q: %w", r.String(), err)
+	var chain []string
+	for e := error(header); e != nil; e = errors.Unwrap(e) {
+		chain = append(chain, fmt.Sprintf("%T", e))
+	}
+	t.Logf("header timeout error: %v; type chain: %s", header, strings.Join(chain, " -> "))
+	if !strings.Contains(header.Error(), "timeout awaiting response headers") {
+		t.Fatalf("error = %v, want a response header timeout", header)
+	}
+	if !errors.Is(header, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(%v, context.DeadlineExceeded) = false, want true", header)
+	}
+	if mirrorFallbackEligible(header) {
+		t.Errorf("mirrorFallbackEligible(%v) = true, want false", header)
+	}
+}
+
+// TestFlatTransportRedirectOffHostGetsNoDialNoCredential pins that a flat
+// registry that answers with a redirect to another host and port is not
+// followed: the endpoint transport refuses the dial, so the second server sees
+// no connection and no Authorization header.
+func TestFlatTransportRedirectOffHostGetsNoDialNoCredential(t *testing.T) {
+	var hits atomic.Int64
+	var gotAuth atomic.Value
+	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		gotAuth.Store(r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(other.Close)
+	var otherConns atomic.Int64
+	other.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			otherConns.Add(1)
+		}
+	}
+
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(reg.Close)
+	u, err := url.Parse(reg.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const host = "flat.test:5000"
+	fetch := endpointFetch(host, RegistryEndpoint{Addr: u.Host}, nil)
+	cred := &RegistryCredential{Username: "u", Password: "secret-pw"}
+	_, err = fetch(context.Background(), host+"/app:v1", cred, nativePolicy())
+	if err == nil {
+		t.Fatal("fetch through an off-host redirect succeeded")
+	}
+	t.Logf("redirect error: %v", err)
+	if !strings.Contains(err.Error(), "refusing to dial") {
+		t.Fatalf("error = %v, want a refused dial", err)
+	}
+	if n := otherConns.Load(); n != 0 {
+		t.Errorf("redirect target saw %d connections, want 0", n)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("redirect target served %d requests, want 0", n)
+	}
+	if v, _ := gotAuth.Load().(string); v != "" {
+		t.Errorf("redirect target saw Authorization %q, want none", v)
 	}
 }
