@@ -1,0 +1,3 @@
+go test fuzz v1
+string("L a/b/l ../..\nL a/b/l/x/y ../../../..")
+bool(false)
