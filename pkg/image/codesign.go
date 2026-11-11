@@ -37,9 +37,11 @@ func (CodesignTool) Signed(ctx context.Context, path string) (bool, error) {
 	return runCodesignVerify(ctx, []string{"--verify", "--strict", path})
 }
 
-// runCodesignVerify runs codesign with a verification argv and maps its exit status
-// to a verdict: exit 0 is "validly signed", any non-zero exit is "not validly
-// signed", and only a failure to run the tool at all is an error.
+// runCodesignVerify runs codesign with a verification argv, under the check
+// deadline, and maps its exit status to a verdict (exitVerdict): exit 0 is
+// "validly signed", any non-zero exit is "not validly signed", and a failure to
+// run the tool, a timeout (ErrSignatureCheckTimeout) or a cancellation is an
+// error.
 //
 // It is shared by the per-binary inspector and the tree signer so both read a
 // non-zero exit the same way. That reading is deliberately coarse — codesign exits
@@ -50,9 +52,20 @@ func (CodesignTool) Signed(ctx context.Context, path string) (bool, error) {
 // CodesignTreeSigner.VerifyArch and pickVerifyArch, which is why that choice is
 // made from the file's own slice list rather than assumed).
 func runCodesignVerify(ctx context.Context, args []string) (bool, error) {
-	err := exec.CommandContext(ctx, "codesign", args...).Run()
+	return exitVerdict(runTool(ctx, checkTimeout, nil, nil, "codesign", args...))
+}
+
+// exitVerdict maps one check run's error to a verdict. The abort test comes
+// FIRST: a tool killed at its deadline, or stopped by a cancelled caller, also
+// exits non-zero, and reading that as "not validly signed" would turn a hung
+// policy daemon into an unsigned verdict. Only then is a non-zero exit "not
+// validly signed"; any other failure to run the tool is an error.
+func exitVerdict(err error) (bool, error) {
 	if err == nil {
 		return true, nil
+	}
+	if toolAborted(err) {
+		return false, err
 	}
 	if exitErr := (&exec.ExitError{}); asExit(err, exitErr) {
 		// Non-zero exit means not validly signed; not a tool failure.
@@ -66,13 +79,9 @@ func runCodesignVerify(ctx context.Context, args []string) (bool, error) {
 // signatures. codesign writes the detail to stderr.
 func (CodesignTool) AdHoc(ctx context.Context, path string) (bool, error) {
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "codesign", "-dv", path)
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if exitErr := (&exec.ExitError{}); asExit(err, exitErr) {
-			// Unsigned binaries make -dv exit non-zero; they are not ad-hoc.
-			return false, nil
-		}
+	// Unsigned binaries make -dv exit non-zero; exitVerdict reads that as false
+	// (not ad-hoc) after ruling out a timeout or a cancellation.
+	if ok, err := exitVerdict(runTool(ctx, checkTimeout, nil, &stderr, "codesign", "-dv", path)); !ok {
 		return false, err
 	}
 	out := stderr.String()
@@ -82,14 +91,7 @@ func (CodesignTool) AdHoc(ctx context.Context, path string) (bool, error) {
 // Notarized reports whether path passes Gatekeeper notarization assessment:
 // `spctl --assess --type execute` exits 0.
 func (CodesignTool) Notarized(ctx context.Context, path string) (bool, error) {
-	err := exec.CommandContext(ctx, "spctl", "--assess", "--type", "execute", path).Run()
-	if err == nil {
-		return true, nil
-	}
-	if exitErr := (&exec.ExitError{}); asExit(err, exitErr) {
-		return false, nil
-	}
-	return false, err
+	return exitVerdict(runTool(ctx, checkTimeout, nil, nil, "spctl", "--assess", "--type", "execute", path))
 }
 
 // asExit reports whether err is an *exec.ExitError, copying it into dst.

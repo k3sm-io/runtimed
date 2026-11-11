@@ -17,12 +17,12 @@ limitations under the License.
 package image
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -121,11 +121,7 @@ func CheckSignaturePolicy(ctx context.Context, insp SignatureInspector, policy r
 func AdHocSign(ctx context.Context, path string) error {
 	// -s - : ad-hoc identity. -f : replace any existing signature. No -o options
 	// => no hardened runtime, no library validation (both block DYLD insert).
-	cmd := exec.CommandContext(ctx, "codesign", "-s", "-", "-f", path)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ad-hoc sign %s: %w: %s", path, err, string(out))
-	}
-	return nil
+	return runSign(ctx, path, "-s", "-", "-f", path)
 }
 
 // ErrSignTarget reports that a binary to be ad-hoc signed does not resolve to a
@@ -219,9 +215,17 @@ func AdHocSignByReplace(ctx context.Context, staging, root, target string) error
 // flags as AdHocSign. It is only ever pointed at a temp file in the private
 // staging directory.
 func codesignAs(ctx context.Context, path, ident string) error {
-	cmd := exec.CommandContext(ctx, "codesign", "-s", "-", "-f", "-i", ident, path)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ad-hoc sign %s: %w: %s", path, err, string(out))
+	return runSign(ctx, path, "-s", "-", "-f", "-i", ident, path)
+}
+
+// runSign runs one codesign signing invocation on path under the per-file sign
+// deadline (signTimeout). A timeout surfaces as ErrSignatureCheckTimeout and a
+// cancellation as the caller's context error; either way the tool's output is
+// attached as text.
+func runSign(ctx context.Context, path string, args ...string) error {
+	var out bytes.Buffer
+	if err := runTool(ctx, signTimeout, &out, &out, "codesign", args...); err != nil {
+		return fmt.Errorf("ad-hoc sign %s: %w: %s", path, err, out.String())
 	}
 	return nil
 }

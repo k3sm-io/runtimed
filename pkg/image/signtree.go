@@ -138,6 +138,10 @@ type TreeSignStats struct {
 // ADHOC_OK rather than running it. Refusing to write through an alias the walk
 // cannot see is the safer half of that trade.
 //
+// DEADLINES. Each check runs under SignatureCheckTimeout and each file's sign
+// under SignatureSignTimeout, per file and never for the tree as a whole; a
+// timeout fails the call with ErrSignatureCheckTimeout.
+//
 // POLICY. Only ADHOC_OK reaches the signing path; every other policy returns
 // ErrTreeSignPolicy before a single file is opened (see ErrTreeSignPolicy).
 //
@@ -209,6 +213,9 @@ func AdHocSignTree(ctx context.Context, signer TreeSigner, policy runtimev1.Sign
 
 		arch := pickVerifyArch(arches, runtime.GOARCH)
 		valid, err := signer.VerifyArch(ctx, path, arch)
+		// The error is read before the verdict: a check that timed out
+		// (ErrSignatureCheckTimeout) or was cancelled is not "invalid", so it
+		// fails the walk and is never answered with a Sign.
 		if err != nil {
 			return fmt.Errorf("verify %s: %w", path, err)
 		}
