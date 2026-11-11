@@ -130,24 +130,42 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	case <-ctx.Done():
 		return pullRefused(ctx.Err())
 	}
+	// The lease pins the blobs until the pod's hold names the manifest; from
+	// then on the hold keeps the manifest's blobs and views for the pod's life,
+	// even if a moved tag replaces the record that names it. The hold is
+	// written inside the pull (artifact.WithHold), so the pull re-checks the
+	// blobs after it, still under the lease, and refetches any a reclaim pass
+	// unlinked in between.
+	var held bool
+	var holdErr error
+	hold := artifact.WithHold(func(ctx context.Context, res *artifact.Result) error {
+		holdErr = r.holdManifest(ctx, box, res)
+		held = holdErr == nil
+		return holdErr
+	})
 	res, err := func() (*artifact.Result, error) {
 		defer func() { <-r.artifactSem }()
 		cred, err := r.pullCredential(ctx, box, ref)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errArtifactCredential, err)
 		}
-		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
+		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil, hold)
 	}()
+	if holdErr != nil {
+		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), holdErr)
+	}
 	if err != nil {
 		return pullRefused(err)
 	}
-	// The lease pins the blobs until the pod's hold names the manifest; from
-	// then on the hold keeps the manifest's blobs and views for the pod's life,
-	// even if a moved tag replaces the record that names it.
 	defer res.Lease.Release()
-	if err := r.holdManifest(ctx, box, res); err != nil {
-		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), err)
+	// An ArtifactPuller that does not run WithHold (a test double) still gets
+	// the pod's hold written, without the re-check the real puller adds.
+	if !held {
+		if err := r.holdManifest(ctx, box, res); err != nil {
+			return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), err)
+		}
 	}
 	view, err := r.views.View(ctx, res.ManifestDigest, nil)
 	if err != nil {
