@@ -35,6 +35,27 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
+// ErrPodCreateInFlight is the error CreatePod returns (wrapped, gRPC code
+// Aborted) when another CreatePod for the same pod id has not finished yet.
+// The first create is left untouched; a retry after it ends sees the
+// registered pod, or creates the pod afresh if the first create failed.
+var ErrPodCreateInFlight = errors.New("runtime: another create of this pod is in flight")
+
+// podCreateInFlightError carries ErrPodCreateInFlight with the pod id and maps
+// to gRPC code Aborted, a retryable conflict, on the wire.
+type podCreateInFlightError struct{ podID string }
+
+func (e *podCreateInFlightError) Error() string {
+	return fmt.Sprintf("create pod %s: %v", e.podID, ErrPodCreateInFlight)
+}
+
+func (e *podCreateInFlightError) Unwrap() error { return ErrPodCreateInFlight }
+
+// GRPCStatus is the status the gRPC server sends for this error.
+func (e *podCreateInFlightError) GRPCStatus() *status.Status {
+	return status.New(codes.Aborted, e.Error())
+}
+
 // CreatePod materializes and starts a PodBox. It is idempotent on pod id: a
 // second call for a live pod returns the current status as a no-op. On failure it
 // returns a structured google.rpc.Status plus a typed FailureReason; the RPC
@@ -50,6 +71,25 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		r.mu.Unlock()
 		return &runtimev1.CreatePodResponse{Status: r.podStatus(existing)}, nil
 	}
+	// One create per pod id at a time: the create clears the id's rootfs
+	// (freshRootfs) and, on failure, removes the pod dir, so a second create
+	// running beside it would destroy what the first is building or has
+	// just registered. It is an RPC error rather than a create failure, so
+	// nothing of the first create is unwound; the caller retries and then
+	// sees the registered pod (or creates it afresh if the first failed).
+	if _, busy := r.createClaims[box.GetPodId()]; busy {
+		r.mu.Unlock()
+		r.log.Warn("refusing a create while another create of the same pod is in flight", "pod", box.GetPodId())
+		return nil, &podCreateInFlightError{podID: box.GetPodId()}
+	}
+	r.createClaims[box.GetPodId()] = struct{}{}
+	// Released last, after a failed create has removed its pod dir, so the
+	// next create of the id never starts while that removal runs.
+	defer func() {
+		r.mu.Lock()
+		delete(r.createClaims, box.GetPodId())
+		r.mu.Unlock()
+	}()
 	// Mark the create in flight until the pod is registered or has failed, so
 	// the image GC never reads its half-built dir as an untracked one
 	// (podUntracked).

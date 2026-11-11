@@ -3544,15 +3544,25 @@ func (r *Runtime) freshRootfs(podID string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	// os.OpenRoot follows a symlink, so a pod dir planted as one would point
+	// the clear below at its target. Refuse it rather than follow it.
+	if fi, err := os.Lstat(dir); err != nil {
+		return err
+	} else if !fi.IsDir() {
+		return fmt.Errorf("pod dir %s is not a directory (mode %s)", dir, fi.Mode().Type())
+	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
 
+	// The probe only chooses the log line: one that cannot read the stale
+	// rootfs reads it as non-empty and the clear goes ahead.
 	const name = "rootfs"
-	if stale, err := rootfsEntryNonEmpty(root, name); err != nil {
-		return err
+	stale, err := rootfsEntryNonEmpty(root, name)
+	if err != nil {
+		r.log.Warn("cannot read the rootfs an earlier pod with this id left behind; clearing it", "pod", podID, "err", err)
 	} else if stale {
 		r.log.Warn("clearing a non-empty rootfs an earlier pod with this id left behind", "pod", podID)
 	}

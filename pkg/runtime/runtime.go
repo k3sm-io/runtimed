@@ -537,6 +537,11 @@ type Runtime struct {
 	// the registry check until the pod is registered or the create has failed.
 	// A pod in it has a dir that may not carry its reachability record yet.
 	creating map[string]int
+	// createClaims holds, under mu, the pod ids a CreatePod owns from the
+	// registry check until the pod is registered or its failure is unwound.
+	// A second CreatePod for a claimed id is refused (ErrPodCreateInFlight),
+	// so only one create ever clears and rebuilds an id's rootfs.
+	createClaims map[string]struct{}
 
 	// podReapStarted is set, under mu, at the moment the startup pod reap
 	// snapshots the pods it must not touch. AttachPod registers an adopted pod
@@ -1209,6 +1214,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		broker:         newBroker(),
 		pods:           make(map[string]*pod),
 		creating:       make(map[string]int),
+		createClaims:   make(map[string]struct{}),
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,
