@@ -541,6 +541,38 @@ func stageEntries(t *testing.T, cache *Cache) []string {
 	return names
 }
 
+// volumeSpy wraps the cache's sameVolume seam with a recorder that delegates
+// to the real check, so a test can tell whether the clone path was reached
+// and whether it judged the source and the store to share a volume.
+type volumeSpy struct {
+	mu    sync.Mutex
+	calls int
+	last  bool
+}
+
+func spyOnVolume(cache *Cache) *volumeSpy {
+	s := &volumeSpy{}
+	real := cache.sameVolume
+	if real == nil {
+		real = sameDevice
+	}
+	cache.sameVolume = func(src, store os.FileInfo) bool {
+		ok := real(src, store)
+		s.mu.Lock()
+		s.calls++
+		s.last = ok
+		s.mu.Unlock()
+		return ok
+	}
+	return s
+}
+
+func (s *volumeSpy) seen() (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.last
+}
+
 // TestPullResumeCommitsByClone pins the in-place commit of a resumed layer on
 // one APFS volume: the complete partial is cloned into the cache's staging
 // dir and the clone re-hashed, rather than replayed into a second temp file.
@@ -561,6 +593,9 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		}
 		dir := filepath.Join(t.TempDir(), "partials")
 		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		var logs bytes.Buffer
+		p.log = slog.New(slog.NewTextHandler(&logs, nil))
+		spy := spyOnVolume(cache)
 
 		if _, err := pullAlways(p, c.ref); err == nil {
 			t.Fatal("first pull succeeded through a cut layer")
@@ -572,6 +607,16 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		res.Lease.Release()
 		verifyLayer(t, cache, c)
 		layerBytesEqual(t, cache, c)
+		calls, same := spy.seen()
+		if calls > 0 && !same {
+			t.Skip("the temp dir and the partial are not on one clonable volume")
+		}
+		if calls == 0 {
+			t.Fatal("the clone path never reached its volume check: the layer was not committed by clone")
+		}
+		if out := logs.String(); strings.Contains(out, "replaying") {
+			t.Fatalf("the resumed layer was replayed, not cloned:\n%s", out)
+		}
 		if _, err := os.Lstat(partialPath(dir, c.layer)); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("partial survived its commit: %v", err)
 		}
@@ -581,6 +626,42 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		}
 		if len(names) != 0 {
 			t.Fatalf("staging dir holds %q after the commit, want it empty", names)
+		}
+	})
+
+	t.Run("another volume replays quietly", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		c.arm(1, 0, false)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cache.sameVolume = func(_, _ os.FileInfo) bool { return false }
+		dir := filepath.Join(t.TempDir(), "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		var logs bytes.Buffer
+		p.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+		if _, err := pullAlways(p, c.ref); err == nil {
+			t.Fatal("first pull succeeded through a cut layer")
+		}
+		c.takeRanges()
+
+		res, err := pullAlways(p, c.ref)
+		if err != nil {
+			t.Fatalf("resumed pull across volumes: %v", err)
+		}
+		res.Lease.Release()
+		if got := c.takeRanges(); len(got) == 0 {
+			t.Fatal("resumed pull sent no Range header: the layer was fetched whole, not resumed")
+		}
+		verifyLayer(t, cache, c)
+		layerBytesEqual(t, cache, c)
+		if _, err := os.Lstat(partialPath(dir, c.layer)); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("partial survived its replayed commit: %v", err)
+		}
+		if out := logs.String(); strings.Contains(out, "level=ERROR") {
+			t.Fatalf("another volume is the quiet fallback, but an Error was logged:\n%s", out)
 		}
 	})
 
@@ -654,6 +735,9 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		c.takeRanges()
 		// Complete the partial with a tail whose last byte is flipped, so the
 		// next pull commits it without a transfer.
+		if fi, err := os.Stat(partialPath(dir, c.layer)); err != nil || fi.Size() != cutAt {
+			t.Fatalf("partial before the tail is appended: size %v, err %v, want exactly %d bytes", fi, err, cutAt)
+		}
 		tail := bytes.Clone(c.body[cutAt:])
 		tail[len(tail)-1] ^= 0xFF
 		f, err := os.OpenFile(partialPath(dir, c.layer), os.O_WRONLY|os.O_APPEND, 0)
