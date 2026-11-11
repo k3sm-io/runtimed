@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -162,7 +163,7 @@ func TestBlobSourcePerPath(t *testing.T) {
 			}
 			if !ok {
 				if !reflect.DeepEqual(src, BlobSource{}) {
-					t.Fatalf("no route yielded a non-zero source %+v", src)
+					t.Fatalf("no route yielded a non-zero source with ref %q", src.Ref)
 				}
 				return
 			}
@@ -176,7 +177,7 @@ func TestBlobSourcePerPath(t *testing.T) {
 				t.Errorf("PlainHTTP = %v, want %v", src.Registry.PlainHTTP, tc.wantPlainHTTP)
 			}
 			if !reflect.DeepEqual(src.Credential, tc.wantCred) {
-				t.Errorf("Credential = %+v, want %+v", src.Credential, tc.wantCred)
+				t.Errorf("Credential = %s, want %s", describeCredential(src.Credential), describeCredential(tc.wantCred))
 			}
 			want := tc.wantTransport
 			if want == flatTransport {
@@ -206,5 +207,128 @@ func assertPinnedFlatTransport(t *testing.T, tr *http.Transport, ca testCA) {
 	pool := tr.TLSClientConfig.RootCAs
 	if _, err := ca.cert.Verify(x509.VerifyOptions{Roots: pool}); err != nil {
 		t.Errorf("the endpoint CA does not verify against the pinned pool: %v", err)
+	}
+}
+
+// describeCredential names whether c is present without printing a secret.
+func describeCredential(c *registryfetch.Credential) string {
+	if c == nil {
+		return "<none>"
+	}
+	return "<present>"
+}
+
+// TestBlobSourceScheme pins the scheme, host-case and credential edges of the
+// flat and mirror routes with no network.
+func TestBlobSourceScheme(t *testing.T) {
+	ca := newTestCA(t, "blobsource-edge-ca")
+	tlsEP := RegistryEndpoint{Addr: "100.64.0.1:6450", TLS: true, CAPEM: ca.pem}
+	plainEP := RegistryEndpoint{Addr: "127.0.0.1:6450"}
+	cred := &RegistryCredential{Username: "u", Password: "p", Auth: "YTpi", IdentityToken: "id", RegistryToken: "rt"}
+	noFetch := func(context.Context, string, *RegistryCredential, PlatformPolicy) (ggcrv1.Image, error) {
+		return nil, errors.New("no fetch in this test")
+	}
+	noMirrorFetch := func(context.Context, string, Mirror, PlatformPolicy) (ggcrv1.Image, error) {
+		return nil, errors.New("no fetch in this test")
+	}
+	puller := func(t *testing.T, ep RegistryEndpoint, m Mirror) *Puller {
+		t.Helper()
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := NewPuller(cache, noFetch, NoLocalIndex{}, WithFlatRegistry(FlatRegistry{Host: flatHost, Endpoint: ep}),
+			WithMirrors(blobSourceMirrors{m: m}, noMirrorFetch),
+			WithRegistryBlobSource(RemoteBlobSource, RemoteMirrorBlobSource))
+		if err != nil {
+			t.Fatalf("NewPuller: %v", err)
+		}
+		return p
+	}
+
+	for _, tc := range []struct {
+		name          string
+		ep            RegistryEndpoint
+		mirror        Mirror
+		route         func(p *Puller, m Mirror) (BlobSource, bool, error)
+		wantErr       bool
+		wantPlainHTTP bool
+		wantRef       string
+		wantCred      bool
+	}{
+		{
+			name: "flat endpoint without TLS is plain HTTP",
+			ep:   plainEP,
+			route: func(p *Puller, _ Mirror) (BlobSource, bool, error) {
+				return p.flatBlobSource(flatHost+"/team/app:v1", cred)
+			},
+			wantPlainHTTP: true,
+			wantRef:       flatHost + "/team/app:v1",
+			wantCred:      true,
+		},
+		{
+			name: "flat endpoint with TLS is not plain HTTP",
+			ep:   tlsEP,
+			route: func(p *Puller, _ Mirror) (BlobSource, bool, error) {
+				return p.flatBlobSource(flatHost+"/team/app:v1", cred)
+			},
+			wantRef:  flatHost + "/team/app:v1",
+			wantCred: true,
+		},
+		{
+			name:   "mirror with PlainHTTP false is not plain HTTP",
+			ep:     tlsEP,
+			mirror: Mirror{Host: "100.64.1.1:6450", PlainHTTP: false},
+			route: func(p *Puller, m Mirror) (BlobSource, bool, error) {
+				return p.mirrorBlobSource(m.Host+"/team/app:v1", m)
+			},
+			wantRef: "100.64.1.1:6450/team/app:v1",
+		},
+		{
+			name: "flat host in a different letter case than the registry is accepted, ref kept as given",
+			ep:   tlsEP,
+			route: func(p *Puller, _ Mirror) (BlobSource, bool, error) {
+				return p.flatBlobSource(strings.ToUpper(flatHost)+"/team/app:v1", cred)
+			},
+			wantRef:  strings.ToUpper(flatHost) + "/team/app:v1",
+			wantCred: true,
+		},
+		{
+			name:   "mirror-rewritten reference never carries a credential even though the primary lookup had one",
+			ep:     tlsEP,
+			mirror: Mirror{Host: "100.64.1.1:6450", PlainHTTP: true},
+			route: func(p *Puller, m Mirror) (BlobSource, bool, error) {
+				primary, ok, err := p.primaryBlobSource("registry.example.com/team/app:v1", cred)
+				if err != nil || !ok || primary.Credential == nil {
+					t.Fatalf("primary lookup: ok=%v err=%v credential=%s, want a credential", ok, err, describeCredential(primary.Credential))
+				}
+				return p.mirrorBlobSource(m.Host+"/team/app:v1", m)
+			},
+			wantPlainHTTP: true,
+			wantRef:       "100.64.1.1:6450/team/app:v1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := puller(t, tc.ep, tc.mirror)
+			src, ok, err := tc.route(p, tc.mirror)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want error %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if !ok {
+				t.Fatal("no route yielded")
+			}
+			if src.Ref != tc.wantRef {
+				t.Errorf("Ref = %q, want %q", src.Ref, tc.wantRef)
+			}
+			if src.Registry.PlainHTTP != tc.wantPlainHTTP {
+				t.Errorf("PlainHTTP = %v, want %v", src.Registry.PlainHTTP, tc.wantPlainHTTP)
+			}
+			if got := src.Credential != nil; got != tc.wantCred {
+				t.Errorf("credential present = %v, want %v", got, tc.wantCred)
+			}
+		})
 	}
 }
