@@ -1152,8 +1152,16 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// and be populated BEFORE CreateVM boots it. PVC shares are skipped (the
 	// binder owns their dirs), and a bind's subPath is applied guest-side.
 	if err := mount.MaterializeShares(ctx, box, podDir, plan, podIP, r.resolver); err != nil {
+		what := "its volume shares could not be prepared"
+		// A volume name that cannot be a share directory is the pod
+		// author's to fix, so the sentence names it.
+		var nameErr *mount.ShareVolumeNameError
+		if errors.As(err, &nameErr) {
+			what = fmt.Sprintf("container %s: volume %s is not a single path component, so it cannot name a share directory",
+				image.QuoteBounded(nameErr.Container, maxArtifactRefBytes), image.QuoteBounded(nameErr.Volume, maxArtifactRefBytes))
+		}
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			vmPodStartError(box.GetPodId(), "its volume shares could not be prepared",
+			vmPodStartError(box.GetPodId(), what,
 				fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err))
 	}
 	// Provision each PVC's stable dir on the storage root. MaterializeShares
