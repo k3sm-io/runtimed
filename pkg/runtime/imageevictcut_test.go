@@ -147,9 +147,9 @@ func cutViewHookCancels(t *testing.T, s *evictRPCScene) {
 }
 
 // cutUnlinkRefused: A's own blobs cannot be unlinked (their directory is
-// read-only). The RPC answers INTERNAL for the kept unlink-failed blobs and
-// every blob is still present, but A's view was removed; restoring the mode,
-// the re-run converges.
+// read-only). The RPC answers INTERNAL for the kept unlink-failed blobs,
+// every blob is still present and A's view is kept; restoring the mode, the
+// re-run removes both.
 func cutUnlinkRefused(t *testing.T, s *evictRPCScene) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
@@ -184,9 +184,9 @@ func cutUnlinkRefused(t *testing.T, s *evictRPCScene) {
 		t.Errorf("cut pass: code = %v (err %v), want Internal", got, err)
 	}
 	want := wantEvicted()
-	// Cache.Evict reports the kept unlink-failed blobs without an error, so
-	// the view hook still ran: A's view is gone though its blobs are not.
-	want["blob cfgA"], want["blob ownA"] = true, true
+	// A target blob kept unlink-failed stops the view hook: A's view stays
+	// with its blobs, and the re-run removes both.
+	want["blob cfgA"], want["blob ownA"], want["view A"] = true, true, true
 	diffState(t, "after the cut pass", s.state(), want)
 	restore()
 	rerunConverges(t, s)

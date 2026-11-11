@@ -100,10 +100,12 @@ var ErrEvictTooManyBlobs = errors.New("image: evict target names too many blobs"
 // cfg.DryRun plans and unlinks nothing; the result has the same shape. Of
 // cfg's other fields Grace, FreeBytes, Now, Log and UntrackedPod apply as they
 // do to a reclaim pass; HighFreeBytes, TargetFreeBytes, Force and
-// SweepDerived are ignored. cfg.EvictDerived runs once with manifest after a
-// pass that returned without error under a live context, never on a dry run
-// and never when the pass errored; its error is logged at Warn and the
-// eviction still succeeds.
+// SweepDerived are ignored. cfg.EvictDerived runs once with manifest, only
+// after a pass that returned no error under a live context and in which no
+// target blob failed to unlink (none is kept EvictKeptUnlinkFailed; a blob
+// kept for any other reason does not stop it); never on a dry run and never
+// when the pass errored. Its error is logged at Warn and the eviction still
+// succeeds.
 //
 // Every target blob lands in exactly one of the result's Removed, Kept and
 // Absent. A blob an executor refused is kept with the refusal's typed reason,
@@ -159,12 +161,28 @@ func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg 
 	if cfg.DryRun {
 		return ev.plan.result()
 	}
-	if cfg.EvictDerived != nil {
+	res, err := c.evictOutcome(ev)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.EvictDerived != nil && !keptUnlinkFailed(res) {
 		if herr := cfg.EvictDerived(ctx, manifest); herr != nil && cfg.Log != nil {
 			cfg.Log.Warn("image evict: removal of the target's derived content refused; it is kept", "manifest", manifest, "err", herr)
 		}
 	}
-	return c.evictOutcome(ev)
+	return res, nil
+}
+
+// keptUnlinkFailed reports whether res keeps any target blob
+// EvictKeptUnlinkFailed: such a blob is still on disk, so its image's derived
+// content must stay with it.
+func keptUnlinkFailed(res *EvictResult) bool {
+	for _, k := range res.Kept {
+		if k.Reason == EvictKeptUnlinkFailed {
+			return true
+		}
+	}
+	return false
 }
 
 // evictGuards returns the executor seams of a narrow pass: evictHooks with its

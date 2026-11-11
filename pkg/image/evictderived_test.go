@@ -21,6 +21,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -152,4 +153,51 @@ func TestEvictDerivedSkipped(t *testing.T) {
 			t.Fatalf("Evict = %+v; want %+v", got, want)
 		}
 	})
+}
+
+// TestEvictDerivedSkippedWhenUnlinkFails pins that a target blob kept
+// EvictKeptUnlinkFailed stops the hook: the blob directory is made read-only
+// so the unlinks of A's own blobs fail, the pass returns no error and keeps
+// them unlink-failed, and the derived content stays with them (skipped as
+// root, which ignores the mode).
+func TestEvictDerivedSkippedWhenUnlinkFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	t.Parallel()
+	s := newEvictScene(t)
+	p, err := s.f.cache.BlobPath(s.cfgA)
+	if err != nil {
+		t.Fatalf("BlobPath: %v", err)
+	}
+	dir := filepath.Dir(p)
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat blob dir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod blob dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, fi.Mode().Perm()); err != nil {
+			t.Errorf("restore blob dir: %v", err)
+		}
+	})
+	r := &evictDerivedRecorder{s: s}
+	got, err := s.evictWith(context.Background(), false, r.hook, nil)
+	if err != nil {
+		t.Fatalf("Evict: %v; an unlink failure is a kept blob, not an error", err)
+	}
+	failed := map[string]bool{}
+	for _, k := range got.Kept {
+		if k.Reason == EvictKeptUnlinkFailed {
+			failed[k.Digest] = true
+		}
+	}
+	if !failed[s.cfgA] || !failed[s.ownA] {
+		t.Fatalf("Evict kept = %+v; want %s and %s kept %s", got.Kept, s.cfgA, s.ownA, EvictKeptUnlinkFailed)
+	}
+	if len(r.manifests) != 0 {
+		t.Errorf("EvictDerived calls = %v; a target blob that failed to unlink must keep the derived content", r.manifests)
+	}
 }
