@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -30,6 +31,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // RegistryCredential is a private-registry pull credential (an imagePullSecret).
@@ -63,6 +65,73 @@ func (c *RegistryCredential) authenticator() authn.Authenticator {
 		IdentityToken: c.IdentityToken,
 		RegistryToken: c.RegistryToken,
 	})
+}
+
+// registryfetchCredential converts the credential to the registryfetch form,
+// field for field, so a direct blob fetch authenticates exactly as
+// authenticator() does for the image fetch. A nil credential stays nil, which
+// registryfetch reads as anonymous, as remoteFetch does.
+func (c *RegistryCredential) registryfetchCredential() *registryfetch.Credential {
+	if c == nil {
+		return nil
+	}
+	return &registryfetch.Credential{
+		Username:      c.Username,
+		Password:      c.Password,
+		Auth:          c.Auth,
+		IdentityToken: c.IdentityToken,
+		RegistryToken: c.RegistryToken,
+	}
+}
+
+// registryTransport is the transport a registry round trip that pins none of
+// its own is made over: go-containerregistry's remote.DefaultTransport (an
+// http.Transport with Proxy: http.ProxyFromEnvironment, a 30s dial timeout and
+// the system TLS roots). It is read at call time, as remote's own option
+// defaulting reads it, so passing it to remote.WithTransport selects the same
+// transport value ggcr would otherwise pick implicitly; ggcr wraps it in its
+// retry (and debug logger) layer either way, because it is not a
+// transport.Wrapper. It is named here so the direct blob route (BlobSource)
+// and the image fetch share one dial, TLS and proxy story.
+func registryTransport() http.RoundTripper {
+	return remote.DefaultTransport
+}
+
+// BlobSource is the direct registry route to one reference's blobs: the
+// transport, scheme and credential the image fetch for that reference uses,
+// in the form registryfetch.Registry.Blob takes.
+//
+// Ref is the reference as registryfetch should be handed it: fully qualified
+// (registry, repository and tag or digest spelled out), because registryfetch
+// parses with name.StrictValidation while the image fetch accepts a short
+// name ("ubuntu"). It names the registry and repository the image fetch
+// dialled, so Credential is never presented to a different host.
+type BlobSource struct {
+	Ref        string
+	Registry   registryfetch.Registry
+	Credential *registryfetch.Credential
+}
+
+// BlobSourceFunc yields the BlobSource for ref fetched with cred. It is the
+// direct-blob counterpart of a FetchFunc and must yield the transport, scheme
+// and credential that FetchFunc uses for the same arguments; RemoteBlobSource
+// is the counterpart of RemoteFetch.
+type BlobSourceFunc func(ref string, cred *RegistryCredential) (BlobSource, error)
+
+// RemoteBlobSource is the BlobSourceFunc paired with RemoteFetch:
+// registryTransport, the scheme go-containerregistry infers for ref's registry
+// (PlainHTTP false, so no name.Insecure, exactly as RemoteFetch parses), and
+// cred converted field for field (nil stays anonymous).
+func RemoteBlobSource(ref string, cred *RegistryCredential) (BlobSource, error) {
+	r, err := name.ParseReference(ref)
+	if err != nil {
+		return BlobSource{}, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
+	}
+	return BlobSource{
+		Ref:        r.Name(),
+		Registry:   registryfetch.Registry{Transport: registryTransport()},
+		Credential: cred.registryfetchCredential(),
+	}, nil
 }
 
 // FetchFunc resolves an image reference to a go-containerregistry image, using
@@ -116,7 +185,7 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
-	return remoteFetch(ctx, r, ref, cred, policy)
+	return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(registryTransport()))
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
@@ -432,6 +501,28 @@ type Puller struct {
 	// localBlobs is a same-volume blob store consulted before each blob is
 	// fetched (WithLocalBlobSource). Nil — the default — fetches every blob.
 	localBlobs LocalBlobSource
+
+	// remoteBlobs and mirrorBlobs are the direct blob routes paired with fetch
+	// and mirrorFetch (WithRegistryBlobSource); nil yields no route for that
+	// path. The flat registry's route is its own (flatRegistry.blobs), because
+	// its transport is built here, not injected.
+	remoteBlobs BlobSourceFunc
+	mirrorBlobs MirrorBlobSourceFunc
+}
+
+// primaryBlobSource yields the direct blob route for ref on the primary path
+// (primaryFetch), fetched with cred. ok is false when the path has none: no
+// WithRegistryBlobSource, or an authority WithClusterRegistries admitted,
+// whose plain-HTTP fetcher has no paired route.
+func (p *Puller) primaryBlobSource(ref string, cred *RegistryCredential) (_ BlobSource, ok bool, _ error) {
+	if p.remoteBlobs == nil || p.configuredClusterRegistry(ref) {
+		return BlobSource{}, false, nil
+	}
+	src, err := p.remoteBlobs(ref, cred)
+	if err != nil {
+		return BlobSource{}, false, err
+	}
+	return src, true, nil
 }
 
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
