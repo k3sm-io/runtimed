@@ -324,6 +324,8 @@ func TestAdmit(t *testing.T) {
 		}, wantErr: ErrPartialBudget},
 		{name: "cap MaxInt64 with others", max: math.MaxInt64, want: math.MaxInt64, setup: writeSized(other, 1), wantErr: ErrPartialBudget},
 		{name: "missing dir", max: 100, want: 100, setup: func(t *testing.T, s *PartialStore) { s.Dir = filepath.Join(s.Dir, "absent") }},
+		{name: "negative cap", max: -1, want: 0, wantErr: ErrPartialCap},
+		{name: "cap MinInt64", max: math.MinInt64, want: 1, wantErr: ErrPartialCap},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &PartialStore{Dir: t.TempDir(), MaxBytes: tc.max}

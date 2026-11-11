@@ -41,6 +41,9 @@ var (
 	// ErrPartialBudget reports that growing a partial would take the store's
 	// regular files past MaxBytes.
 	ErrPartialBudget = errors.New("registryfetch: partial store over its byte budget")
+	// ErrPartialCap reports a negative MaxBytes, a misconfigured store that
+	// Admit refuses rather than treat as uncapped.
+	ErrPartialCap = errors.New("registryfetch: partial store MaxBytes is negative")
 	// ErrPartialClaimed reports a Claim of a digest another claim holds; it
 	// is transient, unlike ErrInvalidDigest.
 	ErrPartialClaimed = errors.New("registryfetch: partial already claimed")
@@ -89,7 +92,8 @@ type PartialStore struct {
 	// away. Nil discards it.
 	Log *slog.Logger
 	// MaxBytes caps the summed size of the regular files in Dir, enforced by
-	// Admit. Zero means no cap.
+	// Admit. Zero means no cap; a negative value is a misconfiguration that
+	// Admit refuses with ErrPartialCap, never read as no cap.
 	MaxBytes int64
 
 	mu      sync.Mutex
@@ -131,8 +135,9 @@ func (s *PartialStore) Claim(digest string) (release func(), err error) {
 // its name, by its apparent size (st_size from fstatat AT_SYMLINK_NOFOLLOW,
 // not allocated blocks); links are never followed and other kinds of entry
 // are not counted. Digest's own current partial is left out of the sum, since
-// want replaces it. A zero MaxBytes admits everything; a missing Dir counts
-// as empty.
+// want replaces it. A zero MaxBytes admits everything; a negative MaxBytes
+// admits nothing and the error matches ErrPartialCap; a missing Dir counts as
+// empty.
 //
 // With a cap set Admit fails closed: want is a registry-supplied size, so a
 // negative want or one past MaxBytes is refused before Dir is read, and the
@@ -146,7 +151,10 @@ func (s *PartialStore) Admit(digest string, want int64) error {
 	if !sha256Digest.MatchString(digest) {
 		return fmt.Errorf("partial %s: %w", quoteBounded(digest, 128), ErrInvalidDigest)
 	}
-	if s.MaxBytes <= 0 {
+	if s.MaxBytes < 0 {
+		return fmt.Errorf("partial %s: cap %d: %w", digest, s.MaxBytes, ErrPartialCap)
+	}
+	if s.MaxBytes == 0 {
 		return nil
 	}
 	if want < 0 || want > s.MaxBytes {

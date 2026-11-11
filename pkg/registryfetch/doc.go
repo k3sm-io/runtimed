@@ -50,7 +50,8 @@ limitations under the License.
 // says whether the digest is held (ErrPartialClaimed, retryable) or malformed
 // (ErrInvalidDigest, never retryable). Admit checks MaxBytes over the regular
 // files in the directory before a partial grows (ErrPartialBudget); it fails
-// closed on a negative or over-cap size and sums without overflow. Sweep
+// closed on a negative or over-cap size and sums without overflow. A zero
+// MaxBytes means no cap; a negative one is refused (ErrPartialCap). Sweep
 // removes old, unclaimed partials, matching only the store's own file-name
 // grammar and unlinking relative to a descriptor of the directory opened
 // O_NOFOLLOW, so it never follows a link. The stall watchdog and the blob
