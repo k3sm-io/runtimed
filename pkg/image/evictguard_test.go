@@ -17,8 +17,10 @@ limitations under the License.
 package image
 
 import (
+	"context"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -32,7 +34,10 @@ import (
 //     keeps the blob on disk, typed rooted (operator root) or in-use (pod
 //     record);
 //   - a lease taken after the plan and still held keeps it, typed leased;
-//   - with no writer, the blob is unlinked.
+//   - with no writer, the blob is unlinked;
+//   - through Cache.Evict itself, a root written and its lease released after
+//     the plan, at the guard of the executor call that holds the blob, keeps
+//     it, typed rooted in the result.
 func TestEvictRacesRootAndLease(t *testing.T) {
 	t.Parallel()
 
@@ -82,6 +87,10 @@ func TestEvictRacesRootAndLease(t *testing.T) {
 			race: func(*testing.T, *gcFixture, PodID, string) func() { return nil },
 		},
 	}
+	t.Run("through Cache.Evict: operator root written and lease released after the plan", func(t *testing.T) {
+		t.Parallel()
+		testEvictRacesThroughEvict(t)
+	})
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -111,11 +120,14 @@ func TestEvictRacesRootAndLease(t *testing.T) {
 				raced <- tc.race(t, f, pid, digest)
 			}()
 			var cleanup func()
+			var once sync.Once
 			calls := 0
 			cfg := &ReclaimConfig{afterPlan: func() {
 				calls++
-				close(planned)
-				cleanup = <-raced
+				once.Do(func() {
+					close(planned)
+					cleanup = <-raced
+				})
 			}}
 			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, f.cache.evictHooks(cfg))
 			if cleanup != nil {
@@ -186,5 +198,60 @@ func TestUnlinkUnlessLeasedRootsUnreadable(t *testing.T) {
 	want := SkipRefusal{Digest: digest, Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed}
 	if len(rep.Skipped) != 1 || rep.Skipped[0].Refusal == nil || *rep.Skipped[0].Refusal != want {
 		t.Fatalf("Skipped = %+v; want one refusal %+v", rep.Skipped, want)
+	}
+}
+
+// testEvictRacesThroughEvict is the Cache.Evict case of
+// TestEvictRacesRootAndLease, run as its subtest so the gate name covers it.
+func testEvictRacesThroughEvict(t *testing.T) {
+	f := newGCFixture(t)
+	digest := f.blob("evict-race-pass", time.Hour)
+	sf := &sharedFixture{t: t, cache: f.cache, idx: &FileIndex{dir: f.cache.IndexRoot()}}
+	manifest := sf.entry("app:v1", "race", false, digest)
+
+	// The guard runs once per executor call: released artifacts, trees, then
+	// the remaining blobs, which hold the target. The writer runs at the
+	// third call, after that guard's own roots read, so only the per-blob
+	// re-read under leaseMu can see the root.
+	const blobCall = 3
+	planned := make(chan struct{})
+	raced := make(chan struct{})
+	go func() {
+		<-planned
+		l := f.cache.AcquireLease([]string{digest}, 0)
+		err := f.cache.RecordOperatorImage("app:v1", Platform{OS: "linux", Architecture: "arm64"}, ImageRoot{Reference: "app:v1", Config: digest})
+		l.Release()
+		if err != nil {
+			t.Errorf("RecordOperatorImage: %v", err)
+		}
+		close(raced)
+	}()
+	var once sync.Once
+	calls := 0
+	cfg := ReclaimConfig{
+		FreeBytes: func(string) (uint64, error) { return 1, nil },
+		afterPlan: func() {
+			calls++
+			if calls == blobCall {
+				once.Do(func() {
+					close(planned)
+					<-raced
+				})
+			}
+		},
+	}
+	res, err := f.cache.Evict(context.Background(), manifest, []string{digest}, cfg)
+	if err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if calls != blobCall {
+		t.Errorf("guard ran %d times; want %d, once per executor call", calls, blobCall)
+	}
+	if !f.exists(digest) {
+		t.Fatalf("%s unlinked; want it kept as rooted", digest)
+	}
+	want := &EvictResult{Kept: []EvictKept{{Digest: digest, Reason: EvictKeptRooted}}}
+	if !reflect.DeepEqual(res, want) {
+		t.Errorf("Evict = %+v; want %+v", res, want)
 	}
 }
