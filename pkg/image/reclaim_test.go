@@ -651,59 +651,125 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 
 // TestReclaimKeepsBlobHeldBetweenPlanAndUnlink drives an artifact cache hit
 // into the window between the pass's root and lease reads and its first
-// unlink: the pull leases the blob, finds it present (touching nothing),
-// rewrites its record, writes the pod's hold and releases the lease. The plan
-// condemned the blob before any of that, and the lease is gone by the time
-// the executor runs, so only a re-read of the roots before the unlink can keep
-// it. An unreferenced blob next to it is removed, so the pass is not vacuous.
+// unlink. The plan condemns the blob before the pull touches it, so only the
+// executor's re-check before the unlink can keep it, and each subtest proves
+// one of its two protections on its own:
+//
+//   - the roots re-read: the pull leases the blob, rewrites its record, writes
+//     the pod's hold and releases the lease, all before the executor runs, so
+//     only the root it wrote can keep the blob (ReasonKeptInUse);
+//   - the lease re-read: the pull leases the blob and still holds the lease
+//     when the executor reaches it, with no root naming the blob, so only the
+//     live lease can keep it (ReasonKeptLeased). Released, a second pass
+//     removes it, so the pin is not vacuous. The executor reads leases twice
+//     (once per batch in pinnedNow, once per unlink via leaseHas), and this
+//     case fails only when both reads are gone.
+//
+// An unreferenced blob next to it is removed, so neither pass is vacuous.
 func TestReclaimKeepsBlobHeldBetweenPlanAndUnlink(t *testing.T) {
 	t.Parallel()
-	f := newGCFixture(t)
-	held := f.blob("artifact layer hit from cache", 24*time.Hour)
-	stray := f.blob("unreferenced layer", 24*time.Hour)
-	pid := f.pod("pod-artifact")
-	x, err := NewFileIndex(f.cache)
-	if err != nil {
-		t.Fatalf("NewFileIndex: %v", err)
-	}
-	sum := sha256.Sum256([]byte("held artifact manifest"))
-	manifest := "sha256:" + hex.EncodeToString(sum[:])
-	key := "registry.example/models/m:v1@" + testModelType
 
-	cfg := ReclaimConfig{
+	t.Run("a root written between plan and unlink keeps the blob after its lease is released", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		held := f.blob("artifact layer hit from cache", 24*time.Hour)
+		stray := f.blob("unreferenced layer", 24*time.Hour)
+		pid := f.pod("pod-artifact")
+		x, err := NewFileIndex(f.cache)
+		if err != nil {
+			t.Fatalf("NewFileIndex: %v", err)
+		}
+		sum := sha256.Sum256([]byte("held artifact manifest"))
+		manifest := "sha256:" + hex.EncodeToString(sum[:])
+		key := "registry.example/models/m:v1@" + testModelType
+
+		cfg := midPassReclaimConfig()
+		cfg.afterRoots = func() {
+			lease := f.cache.AcquireLease([]string{held}, time.Minute)
+			defer lease.Release()
+			if !f.cache.Has(held) {
+				t.Errorf("the cache hit found its blob absent before the unlink")
+			}
+			putTypedArtifact(t, x, key, testModelType, held, held)
+			if err := x.AddArtifactHoldManifest(context.Background(), pid, HeldManifest{
+				Digest: manifest, Config: held, Layers: []string{held},
+			}); err != nil {
+				t.Errorf("AddArtifactHoldManifest: %v", err)
+			}
+		}
+		rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		if !f.exists(held) {
+			t.Errorf("a blob a hold and a record named before the unlink was deleted")
+		}
+		if f.exists(stray) {
+			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+		}
+		if reason := keptReason(rep, held); reason != ReasonKeptInUse {
+			t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+		}
+	})
+
+	t.Run("a lease taken between plan and unlink and still held keeps the blob with no root", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		held := f.blob("artifact layer leased mid-pass", 24*time.Hour)
+		stray := f.blob("unreferenced layer", 24*time.Hour)
+		f.pod("pod-artifact")
+
+		var lease *Lease
+		cfg := midPassReclaimConfig()
+		cfg.afterRoots = func() {
+			// The plan's lease read is already done and saw no lease; no record
+			// or hold names the blob. The lease outlives the whole pass.
+			lease = f.cache.AcquireLease([]string{held}, time.Hour)
+		}
+		rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		if lease == nil {
+			t.Fatalf("afterRoots never ran, so the window was not driven")
+		}
+		if !f.exists(held) {
+			t.Errorf("a blob leased between plan and unlink was deleted while the lease was held")
+		}
+		if f.exists(stray) {
+			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+		}
+		if reason := keptReason(rep, held); reason != ReasonKeptLeased {
+			t.Errorf("leased blob kept for reason %q; want %q", reason, ReasonKeptLeased)
+		}
+
+		// Released, with no root naming it, the same blob IS collectable, so the
+		// lease above is what kept it.
+		lease.Release()
+		if _, err := f.cache.ReclaimUnderPressure(context.Background(), midPassReclaimConfig()); err != nil {
+			t.Fatalf("second ReclaimUnderPressure: %v", err)
+		}
+		if f.exists(held) {
+			t.Errorf("the blob survived after its lease was released, so the pin proved nothing")
+		}
+	})
+}
+
+// midPassReclaimConfig is a pass under permanent pressure with no grace, so
+// every blob nothing protects is condemned.
+func midPassReclaimConfig() ReclaimConfig {
+	return ReclaimConfig{
 		HighFreeBytes: 1 << 40, TargetFreeBytes: 1 << 40, Grace: 0,
 		FreeBytes: (&fakeFree{free: []uint64{0}}).sample,
 	}
-	cfg.afterRoots = func() {
-		lease := f.cache.AcquireLease([]string{held}, time.Minute)
-		defer lease.Release()
-		if !f.cache.Has(held) {
-			t.Errorf("the cache hit found its blob absent before the unlink")
-		}
-		putTypedArtifact(t, x, key, testModelType, held, held)
-		if err := x.AddArtifactHoldManifest(context.Background(), pid, HeldManifest{
-			Digest: manifest, Config: held, Layers: []string{held},
-		}); err != nil {
-			t.Errorf("AddArtifactHoldManifest: %v", err)
-		}
-	}
-	rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("ReclaimUnderPressure: %v", err)
-	}
-	if !f.exists(held) {
-		t.Errorf("a blob a hold and a record named before the unlink was deleted")
-	}
-	if f.exists(stray) {
-		t.Errorf("the unreferenced blob survived, so the pass proved nothing")
-	}
-	var reason PruneReason
+}
+
+// keptReason returns the reason rep kept digest for, or "" if it did not.
+func keptReason(rep *ReclaimReport, digest string) PruneReason {
 	for _, k := range rep.Kept {
-		if k.Digest == held {
-			reason = k.Reason
+		if k.Digest == digest {
+			return k.Reason
 		}
 	}
-	if reason != ReasonKeptInUse {
-		t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
-	}
+	return ""
 }
