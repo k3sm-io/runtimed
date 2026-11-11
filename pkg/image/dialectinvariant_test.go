@@ -17,8 +17,16 @@ limitations under the License.
 package image
 
 import (
+	"archive/tar"
+	"bytes"
+	"context"
 	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -107,4 +115,238 @@ func TestTreeKeyBindsDialect(t *testing.T) {
 	if nativeKey == linuxKey {
 		t.Fatalf("TreeKey is %q under both the native and the linux policy; the dialect must be bound into the key", nativeKey)
 	}
+}
+
+// pathRecordingSigner records the full path of every verify and sign call and
+// reports every file unsigned, so AdHocSignTree takes its signing path for each
+// Mach-O it reaches.
+type pathRecordingSigner struct {
+	paths []string
+}
+
+func (s *pathRecordingSigner) VerifyArch(_ context.Context, path, _ string) (bool, error) {
+	s.paths = append(s.paths, path)
+	return false, nil
+}
+
+func (s *pathRecordingSigner) Sign(_ context.Context, path string) error {
+	s.paths = append(s.paths, path)
+	return nil
+}
+
+// within reports whether path is root or lies under it, lexically.
+func within(path, root string) bool {
+	path, root = filepath.Clean(path), filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+// TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide is the gate for the
+// invariant the linux dialect's absolute-symlink admission rests on: the links
+// are admitted because only the guest, chrooted into the tree, resolves them,
+// so every host-side reader in this package must treat them as opaque names.
+//
+// The tree carries "a -> /", "b -> a/etc" (relative, but resolving through a
+// to the host's /etc) and absolute links to a canary Mach-O and its directory
+// outside the tree. Unpack, MaterializeTree, AdHocSignTree and the tree prune
+// are driven over it, and the canary must come out byte-for-byte and
+// mtime-for-mtime untouched, with no path outside the tree in any output.
+func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
+	outside := t.TempDir()
+	canary := filepath.Join(outside, "canary")
+	thinMachO(t, canary)
+	canaryBytes, err := os.ReadFile(canary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(canary, old, old); err != nil {
+		t.Fatal(err)
+	}
+	assertCanary := func(t *testing.T, stage string) {
+		t.Helper()
+		fi, err := os.Lstat(canary)
+		if err != nil {
+			t.Fatalf("%s: canary gone: %v", stage, err)
+		}
+		if !fi.ModTime().Equal(old) {
+			t.Errorf("%s: canary mtime = %v, want %v: a host reader wrote through a link", stage, fi.ModTime(), old)
+		}
+		got, err := os.ReadFile(canary)
+		if err != nil || !bytes.Equal(got, canaryBytes) {
+			t.Errorf("%s: canary content changed (err %v)", stage, err)
+		}
+		ents, err := os.ReadDir(outside)
+		if err != nil || len(ents) != 1 {
+			t.Errorf("%s: directory outside the tree holds %d entries (err %v), want only the canary", stage, len(ents), err)
+		}
+	}
+
+	c, u := newTestUnpacker(t)
+	mfst := commitImage(t, c, linuxImageFrom(t, layerFrom(t, []tarSpec{
+		{name: "etc", typ: tar.TypeDir, mode: 0o755},
+		{name: "etc/hostname", mode: 0o644, data: "guest"},
+		{name: "a", typ: tar.TypeSymlink, link: "/"},
+		{name: "b", typ: tar.TypeSymlink, link: "a/etc"},
+		{name: "canary", typ: tar.TypeSymlink, link: canary},
+		{name: "canarydir", typ: tar.TypeSymlink, link: outside},
+	})))
+
+	tree, err := u.Unpack(context.Background(), mfst, LinuxUnpackPolicy())
+	if err != nil {
+		t.Fatalf("linux Unpack: %v", err)
+	}
+	if tree.Stats.Symlinks != 4 {
+		t.Fatalf("Symlinks = %d, want 4: the fixture did not land as written", tree.Stats.Symlinks)
+	}
+	cacheRoot := filepath.Dir(c.SnapshotsRoot())
+	for _, p := range []string{tree.Rootfs, tree.Ownership} {
+		if !within(p, cacheRoot) {
+			t.Errorf("tree path %s is outside the cache root %s", p, cacheRoot)
+		}
+	}
+	entries, err := ReadOwnershipSidecar(tree.Ownership)
+	if err != nil {
+		t.Fatalf("ReadOwnershipSidecar: %v", err)
+	}
+	for _, e := range entries {
+		if filepath.IsAbs(e.Path) || strings.HasPrefix(e.Path, "..") {
+			t.Errorf("ownership entry %q is not tree-relative", e.Path)
+		}
+	}
+	assertCanary(t, "unpack")
+
+	t.Run("materialize", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "rootfs")
+		for i := range 2 { // the second pass is the idempotent branch
+			if _, err := u.MaterializeTree(context.Background(), mfst, LinuxUnpackPolicy(), dst); err != nil {
+				t.Fatalf("MaterializeTree pass %d: %v", i, err)
+			}
+		}
+		for name, want := range map[string]string{"a": "/", "b": "a/etc", "canary": canary, "canarydir": outside} {
+			fi, err := os.Lstat(filepath.Join(dst, name))
+			if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+				t.Errorf("materialized %s: mode %v, err %v; want a symlink, not a copy of its target", name, fi, err)
+				continue
+			}
+			if got, _ := os.Readlink(filepath.Join(dst, name)); got != want {
+				t.Errorf("materialized %s -> %q, want %q verbatim", name, got, want)
+			}
+		}
+		// Every regular file in the pod rootfs is one the tree holds: nothing
+		// was copied in from behind a link.
+		var regular []string
+		if err := filepath.WalkDir(dst, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d.Type().IsRegular() {
+				rel, _ := filepath.Rel(dst, p)
+				regular = append(regular, rel)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(regular) != 1 || regular[0] != filepath.Join("etc", "hostname") {
+			t.Errorf("pod rootfs regular files = %v, want only etc/hostname", regular)
+		}
+		assertCanary(t, "materialize")
+	})
+
+	t.Run("sign", func(t *testing.T) {
+		s := &pathRecordingSigner{}
+		stats, err := AdHocSignTree(context.Background(), s, runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK, tree.Rootfs)
+		if err != nil {
+			t.Fatalf("AdHocSignTree: %v", err)
+		}
+		if stats.MachO != 0 || stats.SkippedLinks != 4 {
+			t.Errorf("stats = %+v, want 0 Mach-O and the 4 links skipped", stats)
+		}
+		for _, p := range s.paths {
+			if !within(p, tree.Rootfs) {
+				t.Errorf("signer reached %s, outside the tree %s", p, tree.Rootfs)
+			}
+		}
+		if len(s.paths) != 0 {
+			t.Errorf("signer was called on %v; the tree holds no Mach-O of its own", s.paths)
+		}
+		assertCanary(t, "sign")
+	})
+
+	t.Run("native_open_refuses_the_linux_tree", func(t *testing.T) {
+		// The keys already differ (TestTreeKeyBindsDialect), so a native open of
+		// this manifest misses the snapshot and builds its own tree, and the
+		// native rules refuse the absolute links rather than serve them.
+		if _, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy()); !errors.Is(err, ErrLayerEscapes) {
+			t.Fatalf("native Unpack error = %v, want ErrLayerEscapes: the linux tree must not be served natively", err)
+		}
+
+		// Plant the linux tree, record and all, where the native key files, so
+		// the only thing between it and a native pod is the record's policy.
+		nativeKey, err := TreeKey(mfst, NativeUnpackPolicy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := parseBlobDigest(nativeKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		planted := c.treeDir(h.Algorithm, h.Hex)
+		if err := os.MkdirAll(filepath.Join(planted, TreeRootfsName), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("/", filepath.Join(planted, TreeRootfsName, "a")); err != nil {
+			t.Fatal(err)
+		}
+		rec := treeRecord{
+			Version: treeRecordVersion,
+			Key:     nativeKey,
+			Policy:  LinuxUnpackPolicy(),
+			Config:  mfst.GetConfig().GetDigest(),
+		}
+		for _, l := range mfst.GetLayers() {
+			rec.Layers = append(rec.Layers, l.GetDigest())
+		}
+		if err := writeTreeRecord(filepath.Join(planted, TreeRecordName), rec); err != nil {
+			t.Fatal(err)
+		}
+		got, err := u.Unpack(context.Background(), mfst, NativeUnpackPolicy())
+		if !errors.Is(err, ErrTreeInconsistent) || got != nil {
+			t.Fatalf("native Unpack over a linux-policy record = %+v, %v; want ErrTreeInconsistent", got, err)
+		}
+		if _, err := u.MaterializeTree(context.Background(), mfst, NativeUnpackPolicy(), filepath.Join(t.TempDir(), "rootfs")); !errors.Is(err, ErrTreeInconsistent) {
+			t.Fatalf("native MaterializeTree over a linux-policy record error = %v, want ErrTreeInconsistent", err)
+		}
+		if err := os.RemoveAll(planted); err != nil {
+			t.Fatal(err)
+		}
+		assertCanary(t, "native open")
+	})
+
+	t.Run("prune", func(t *testing.T) {
+		trees, err := c.EnumerateTrees()
+		if err != nil {
+			t.Fatalf("EnumerateTrees: %v", err)
+		}
+		nodes, err := c.EnumerateBlobs()
+		if err != nil {
+			t.Fatalf("EnumerateBlobs: %v", err)
+		}
+		later := time.Now().Add(time.Hour)
+		plan, err := PlanPrune(nodes, trees, nil, nil, time.Minute, later)
+		if err != nil {
+			t.Fatalf("PlanPrune: %v", err)
+		}
+		rep, err := c.ExecuteTreePrune(plan, time.Minute, later, nil)
+		if err != nil {
+			t.Fatalf("ExecuteTreePrune: %v", err)
+		}
+		if rep.Deleted != 1 {
+			t.Fatalf("Deleted = %d, skipped %v; want the one linux tree removed", rep.Deleted, rep.Skipped)
+		}
+		if _, err := os.Lstat(tree.Rootfs); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("tree rootfs after prune: %v, want gone", err)
+		}
+		if _, err := os.Stat("/etc"); err != nil {
+			t.Errorf("host /etc after prune: %v", err)
+		}
+		assertCanary(t, "prune")
+	})
 }
