@@ -44,17 +44,20 @@ import (
 
 // cutRegistry is a plain-HTTP in-memory registry holding one image whose
 // layer blob it serves itself: the first cut GETs of that blob stop after cutAt
-// bytes, and every layer GET's Range header is recorded.
+// bytes, the first badRange ranged GETs are answered with a Content-Range
+// that is not the one asked for, and every layer GET's Range header is
+// recorded.
 type cutRegistry struct {
-	host   string
-	ref    string
-	layer  ggcrv1.Hash
-	size   int64
-	cutAt  int64
-	body   []byte
-	mu     sync.Mutex
-	cuts   int      // GETs still to cut
-	ranges []string // the Range header of every layer GET, in order
+	host     string
+	ref      string
+	layer    ggcrv1.Hash
+	size     int64
+	cutAt    int64
+	body     []byte
+	mu       sync.Mutex
+	cuts     int      // GETs still to cut
+	badRange int      // ranged GETs still to answer with a wrong Content-Range
+	ranges   []string // the Range header of every layer GET, in order
 }
 
 func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
@@ -98,7 +101,19 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 		if cut {
 			c.cuts--
 		}
+		bad := !cut && c.badRange > 0 && r.Header.Get("Range") != ""
+		if bad {
+			c.badRange--
+		}
 		c.mu.Unlock()
+		if bad {
+			// The whole blob, labelled as a range from 0: not the offset asked for.
+			w.Header().Set("Content-Range", "bytes 0-"+strconv.FormatInt(c.size-1, 10)+"/"+strconv.FormatInt(c.size, 10))
+			w.Header().Set("Content-Length", strconv.FormatInt(c.size, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(c.body)
+			return
+		}
 		if cut {
 			w.Header().Set("Content-Length", strconv.FormatInt(c.size, 10))
 			w.WriteHeader(http.StatusOK)
@@ -282,5 +297,45 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 			t.Fatalf("pull after the poisoned partial Range headers = %q, want one GET from 0", got)
 		}
 		verifyLayer(t, cache, c)
+	})
+
+	t.Run("wrong range answer empties the partial and fetches the layer whole", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		c.cuts = 1
+		c.badRange = 1
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "partials")
+		store := &registryfetch.PartialStore{Dir: dir}
+		p := resumePuller(t, c, cache, store)
+
+		if _, err := pullAlways(p, c.ref); err == nil {
+			t.Fatal("first pull succeeded through a cut layer")
+		}
+		if got := store.Bytes(c.layer.String(), c.size); got != cutAt {
+			t.Fatalf("partial holds %d bytes after the cut pull, want %d", got, cutAt)
+		}
+		c.takeRanges()
+
+		res, err := pullAlways(p, c.ref)
+		if err != nil {
+			t.Fatalf("pull over a wrong range answer: %v", err)
+		}
+		res.Lease.Release()
+		verifyLayer(t, cache, c)
+		if got := store.Bytes(c.layer.String(), c.size); got != 0 {
+			t.Fatalf("partial holds %d bytes after the wrong range answer, want 0", got)
+		}
+		ranged := 0
+		for _, r := range c.takeRanges() {
+			if r != "" {
+				ranged++
+			}
+		}
+		if ranged != 1 {
+			t.Fatalf("pull over a wrong range answer made %d ranged requests, want 1", ranged)
+		}
 	})
 }
