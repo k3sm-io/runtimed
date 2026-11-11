@@ -24,6 +24,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -251,40 +252,114 @@ type UntrackedPodFunc func(PodID) bool
 // untracked is nil. Such dirs are what an interrupted pod-dir removal leaves
 // behind (the RemoveAll took images.json and failed on rootfs/).
 func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error) {
+	cr, err := c.classifiedRoots(untracked)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cr.flatten(), cr.skipped, nil
+}
+
+// rootSet is one fail-closed read of the reachability root set with each
+// source kept apart, so a caller can say which kind of root names a blob.
+//
+// The kinds fall in two classes. Operator roots and artifact records are
+// ROOTED: they last until their owner removes them. Per-pod records and pods'
+// artifact holds are IN USE: they go when the pod does. flatten is the one
+// union prune plans over; the classes never change what is reachable.
+type rootSet struct {
+	// pods are the per-pod records, in pod-name order.
+	pods []ImageRoot
+	// operator is the operator record, flattened by operatorRootSet.
+	operator []ImageRoot
+	// artifacts are the artifact records in the index's artifact namespace.
+	artifacts []ImageRoot
+	// holds are the manifests pods' artifact holds name.
+	holds []ImageRoot
+	// skipped names the pod dirs with no record that untracked cleared.
+	skipped []string
+}
+
+// flatten returns the union prune plans over: per-pod records, then operator
+// roots, artifact records and holds, the order roots has always returned.
+//
+// It clips before appending, so the result never writes into the set's own
+// slices' spare capacity.
+func (s *rootSet) flatten() []ImageRoot {
+	shared := append(append(slices.Clip(s.operator), s.artifacts...), s.holds...)
+	return append(slices.Clip(s.pods), shared...)
+}
+
+// rootedDigests returns every non-empty blob digest an operator root or an
+// artifact record names. A nil set names none.
+func (s *rootSet) rootedDigests() map[string]struct{} {
+	if s == nil {
+		return nil
+	}
+	return digestsOf(s.operator, s.artifacts)
+}
+
+// inUseDigests returns every non-empty blob digest a per-pod record or a pod's
+// artifact hold names. A nil set names none.
+func (s *rootSet) inUseDigests() map[string]struct{} {
+	if s == nil {
+		return nil
+	}
+	return digestsOf(s.pods, s.holds)
+}
+
+// digestsOf unions the non-empty blob digests of every root in groups.
+func digestsOf(groups ...[]ImageRoot) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, g := range groups {
+		for _, r := range g {
+			for _, d := range r.Digests() {
+				if d != "" {
+					out[d] = struct{}{}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// classifiedRoots is roots with each source kept apart (see rootSet). It reads
+// the same sources in the same order with the same fail-closed rules, and an
+// error returns no set at all rather than a partial one.
+func (c *Cache) classifiedRoots(untracked UntrackedPodFunc) (*rootSet, error) {
 	// Operator roots FIRST, and their read failure is fatal for the same reason a
 	// pod record's is: a prune deletes what no root names, so a root set that is
 	// silently short does not degrade the answer, it inverts it.
 	operator, err := c.OperatorImageRoots()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	// Artifact records, for the same reason and with the same fatality.
 	artifacts, err := c.artifactRoots()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	// Pods' artifact holds, with the same fatality: a held manifest whose
 	// record a moved tag replaced is rooted by nothing else.
 	held, err := c.artifactHoldRoots()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	shared := append(append(operatorRootSet(operator), artifacts...), held...)
+	set := &rootSet{operator: operatorRootSet(operator), artifacts: artifacts, holds: held}
 	podsRoot := c.PodsRoot()
 	entries, err := os.ReadDir(podsRoot)
 	if errors.Is(err, fs.ErrNotExist) {
-		return shared, nil, nil
+		return set, nil
 	}
 	if err != nil {
 		// LOCAL-ONLY, no boundErr (this one and the OpenRoot below): stdlib os
 		// errors over the daemon's OWN store root. Their rendering is a path this
 		// package composed plus an errno — none of the foreign, unbounded content
 		// boundErr exists to cap can reach them.
-		return nil, nil, fmt.Errorf("%w: read pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
+		return nil, fmt.Errorf("%w: read pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
 	}
 	root, err := os.OpenRoot(podsRoot)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: open pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
+		return nil, fmt.Errorf("%w: open pods root %s: %v", ErrRootsIncomplete, podsRoot, err)
 	}
 	defer root.Close()
 
@@ -319,10 +394,10 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 		if err != nil {
 			// LOCAL-ONLY, no boundErr: an fs.PathError naming a pod directory this
 			// daemon created. It reads no record, so no stored content is in it.
-			return nil, nil, fmt.Errorf("%w: stat pod dir %q: %v", ErrRootsIncomplete, name, err)
+			return nil, fmt.Errorf("%w: stat pod dir %q: %v", ErrRootsIncomplete, name, err)
 		}
 		if !fi.IsDir() {
-			return nil, nil, fmt.Errorf("%w: %q under %s is not a pod directory (mode %v)",
+			return nil, fmt.Errorf("%w: %q under %s is not a pod directory (mode %v)",
 				ErrRootsIncomplete, name, podsRoot, fi.Mode().Type())
 		}
 		buf, err := readAnchored(root, filepath.Join(name, PodReferencesName))
@@ -337,14 +412,14 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 			// its own not-a-regular-file message) naming a daemon-composed path. The
 			// record's CONTENT reaches a message only at the decode below — which is
 			// bounded, because that is where foreign bytes actually arrive.
-			return nil, nil, fmt.Errorf("%w: pod %q: %v", ErrRootsIncomplete, name, err)
+			return nil, fmt.Errorf("%w: pod %q: %v", ErrRootsIncomplete, name, err)
 		}
 		var rec podReferences
 		if err := json.Unmarshal(buf, &rec); err != nil {
 			// encoding/json echoes the offending byte of the document it was handed,
 			// and this document's fields were filled from registry-supplied image
 			// references and digests. Bounded as DATA, never adopted.
-			return nil, nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, boundErr(err))
+			return nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, boundErr(err))
 		}
 		for _, r := range rec.Images {
 			for _, d := range r.Digests() {
@@ -353,13 +428,14 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 					// package's own error, and parseBlobDigest caps both halves of it —
 					// quoteBounded on the registry-supplied digest, boundErr on ggcr's
 					// parser message. Wrapping again would only re-quote a quoted string.
-					return nil, nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
+					return nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
 				}
 			}
 			out = append(out, r)
 		}
 	}
-	return append(out, shared...), skipped, nil
+	set.pods, set.skipped = out, skipped
+	return set, nil
 }
 
 // artifactRoots returns one root per artifact record in the index's artifact
