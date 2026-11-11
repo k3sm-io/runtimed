@@ -1,0 +1,213 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package image
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+)
+
+// evictPass is the state of one reclaim pass run in narrow mode by
+// Cache.Evict. Its inputs are the target; the pass fills the rest so Evict can
+// build its result from what the pass planned and what the executors did.
+type evictPass struct {
+	// manifest is the target manifest digest.
+	manifest string
+	// target is the target's blob digests (config and layers).
+	target map[string]struct{}
+
+	// plan is the prune plan narrowed to the target and refined from the
+	// classified roots; set by the pass after planning.
+	plan *EvictPlan
+	// removed are the digests the blob executors unlinked.
+	removed []string
+	// skipped are the blob executors' refusals, typed where the executor
+	// typed them.
+	skipped []SkippedBlob
+	// leased are the digests dropLeased took out before an executor ran.
+	leased map[string]struct{}
+	// deletedBytes is the blob executors' summed DeletedBytes.
+	deletedBytes int64
+}
+
+// Evict evicts the cache blobs of one target manifest, and the trees backed
+// only by them, through the one reclaim pass: ReclaimUnderPressure run in
+// narrow mode. manifest is the target manifest digest and blobs its config and
+// layer digests; resolving a reference to them is the caller's job.
+//
+// Narrow mode changes the pass in three ways and no others:
+//
+//   - the delete sets are narrowed to the target: PlanEvict over the prune
+//     plan for blobs, with the shared set (evictSharedSet) read fail-closed
+//     after the roots and before the leases, and narrowTreesByBacking for
+//     trees, so nothing the prune plan would keep is ever deleted and nothing
+//     outside the target is touched;
+//   - every executor call (released artifacts, trees, blobs) runs a guard that
+//     re-reads the classified roots and the shared set and drops what they
+//     name, and every blob unlink runs through unlinkUnlessLeased;
+//   - the pressure check and the free-space stopping rule, the released-copy
+//     bound and sweep, and cfg.SweepDerived are skipped: only cancellation
+//     ends the executors early, and nothing outside the target is removed.
+//
+// cfg.DryRun plans and unlinks nothing; the result has the same shape. Of
+// cfg's other fields Grace, FreeBytes, Now, Log and UntrackedPod apply as they
+// do to a reclaim pass; HighFreeBytes, TargetFreeBytes, Force and
+// SweepDerived are ignored.
+//
+// Every target blob lands in exactly one of the result's Removed, Kept and
+// Absent. A blob an executor refused is kept with the refusal's typed reason,
+// or EvictKeptUnlinkFailed when the refusal is untyped; a planned blob that
+// vanished before its unlink is absent. A cancelled context returns its error
+// and no result: the executors may have removed some of the target, and a
+// re-run re-plans from scratch.
+func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg ReclaimConfig) (*EvictResult, error) {
+	if _, err := parseBlobDigest(manifest); err != nil {
+		return nil, fmt.Errorf("evict: target manifest: %w", err)
+	}
+	if len(blobs) == 0 {
+		return nil, errors.New("evict: target names no blobs")
+	}
+	target := make(map[string]struct{}, len(blobs))
+	for _, d := range blobs {
+		if _, err := parseBlobDigest(d); err != nil {
+			return nil, fmt.Errorf("evict: target blob: %w", err)
+		}
+		target[d] = struct{}{}
+	}
+	ev := &evictPass{manifest: manifest, target: target, leased: make(map[string]struct{})}
+	cfg.evict = ev
+	if _, err := c.ReclaimUnderPressure(ctx, cfg); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ev.plan == nil {
+		return nil, errors.New("evict: reclaim pass did not plan")
+	}
+	if cfg.DryRun {
+		return ev.plan.result()
+	}
+	return c.evictOutcome(ev)
+}
+
+// evictGuards returns the executor seams of a narrow pass: evictHooks with its
+// guard extended to re-read the shared set after the roots, dropping every
+// blob another cached manifest now names as evictShared (a root's reason wins),
+// and the same guard for the tree executor.
+func (c *Cache) evictGuards(ctx context.Context, cfg *ReclaimConfig) (*pruneHooks, *treePruneHooks) {
+	h := c.evictHooks(cfg)
+	rootsGuard, ev := h.guard, cfg.evict
+	h.guard = func() (map[string]evictReason, error) {
+		drop, err := rootsGuard()
+		if err != nil {
+			return nil, err
+		}
+		others, err := c.evictSharedSet(ctx, ev.manifest, ev.target)
+		if err != nil {
+			return nil, err
+		}
+		for d := range others {
+			if _, ok := drop[d]; !ok {
+				drop[d] = evictShared
+			}
+		}
+		return drop, nil
+	}
+	return h, &treePruneHooks{guard: h.guard}
+}
+
+// narrowForEvict narrows plan to ev's target in place: its blob delete set to
+// PlanEvict's, refined from roots, and its tree delete set to the trees backed
+// only by that set. It records the narrowed plan in ev.
+func narrowForEvict(plan *PrunePlan, ev *evictPass, others map[string]struct{}, roots *rootSet) error {
+	ep, err := PlanEvict(plan, ev.target, others)
+	if err != nil {
+		return err
+	}
+	ep = refineEvictRooted(ep, roots)
+	set := make(map[string]struct{}, len(ep.Delete))
+	for _, d := range ep.Delete {
+		set[d.Node.Digest] = struct{}{}
+	}
+	plan.DeleteTrees = narrowTreesByBacking(plan, set).DeleteTrees
+	plan.Delete = ep.Delete
+	ev.plan = ep
+	return nil
+}
+
+// evictOutcome builds the real path's result from the plan and the executors:
+// the plan's kept and absent sets as planned, and every digest the plan
+// condemned placed by what happened to it, in this order of precedence:
+//
+//  1. any node of it refused with a typed reason: kept with that reason;
+//  2. any node of it refused untyped while the blob is still present: kept
+//     EvictKeptUnlinkFailed;
+//  3. removed by an executor: removed;
+//  4. gone from the store: absent (it vanished before its unlink);
+//  5. dropped by dropLeased: kept EvictKeptLeased;
+//  6. otherwise (never attempted, still present): kept EvictKeptUnlinkFailed.
+func (c *Cache) evictOutcome(ev *evictPass) (*EvictResult, error) {
+	planned, err := ev.plan.result()
+	if err != nil {
+		return nil, err
+	}
+	out := &EvictResult{Kept: planned.Kept, Absent: planned.Absent, ReclaimedBytes: ev.deletedBytes}
+	refused := make(map[string]EvictKeepReason)
+	for _, s := range ev.skipped {
+		if s.Digest == "" {
+			continue
+		}
+		switch {
+		case s.Refusal != nil:
+			refused[s.Digest] = s.Refusal.Reason
+		case c.Has(s.Digest):
+			if _, typed := refused[s.Digest]; !typed {
+				refused[s.Digest] = EvictKeptUnlinkFailed
+			}
+		}
+	}
+	removed := make(map[string]struct{}, len(ev.removed))
+	for _, d := range ev.removed {
+		removed[d] = struct{}{}
+	}
+	for _, d := range planned.Removed {
+		if r, ok := refused[d]; ok {
+			out.Kept = append(out.Kept, EvictKept{Digest: d, Reason: r})
+			continue
+		}
+		if _, ok := removed[d]; ok {
+			out.Removed = append(out.Removed, d)
+			continue
+		}
+		if !c.Has(d) {
+			out.Absent = append(out.Absent, d)
+			continue
+		}
+		r := EvictKeptUnlinkFailed
+		if _, ok := ev.leased[d]; ok {
+			r = EvictKeptLeased
+		}
+		out.Kept = append(out.Kept, EvictKept{Digest: d, Reason: r})
+	}
+	sort.Strings(out.Removed)
+	sort.Strings(out.Absent)
+	sort.Slice(out.Kept, func(i, j int) bool { return out.Kept[i].Digest < out.Kept[j].Digest })
+	return out, nil
+}

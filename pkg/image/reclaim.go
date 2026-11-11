@@ -204,6 +204,12 @@ type ReclaimConfig struct {
 	// leaves it nil, and a nil afterPlan changes nothing.
 	afterPlan func()
 
+	// evict, when non-nil, runs the pass in narrow mode for one eviction
+	// target (see Cache.Evict, the only setter). It is UNEXPORTED so the
+	// narrowing and the guards cannot be half-configured by a caller; nil
+	// leaves the pass exactly as ReclaimUnderPressure documents it.
+	evict *evictPass
+
 	// SweepDerived, when set, removes content derived from records rather than
 	// from blobs whose record is gone: the artifact views, which pkg/runtime
 	// wires in (this package cannot import their owner). A triggered pass that
@@ -356,20 +362,23 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		return nil, fmt.Errorf("%w: %v", ErrFreeSpaceUnknown, err)
 	}
 	rep := &ReclaimReport{DryRun: cfg.DryRun, FreeBefore: before, FreeAfter: before}
+	// Narrow mode (Cache.Evict) removes nothing outside its target: no
+	// released-copy bound or sweep, no SweepDerived, and no pressure check.
+	narrow := cfg.evict != nil
 	// The released artifact record copies are bounded on EVERY pass, triggered
 	// or not, so an idle node's index stays bounded too. They are hints, never
 	// roots, so a failure here costs eviction order and stops nothing.
-	if !cfg.DryRun {
+	if !cfg.DryRun && !narrow {
 		if err := (&FileIndex{dir: c.IndexRoot()}).BoundReleasedArtifacts(); err != nil {
 			log.Warn("image reclaim: bound of released artifact records failed", "err", err)
 		}
 	}
-	if !cfg.Force && before >= high {
+	if !cfg.Force && !narrow && before >= high {
 		rep.ReachedTarget = before >= target
 		return rep, nil
 	}
 	rep.Triggered = true
-	if cfg.SweepDerived != nil && !cfg.DryRun {
+	if cfg.SweepDerived != nil && !cfg.DryRun && !narrow {
 		if err := cfg.SweepDerived(ctx); err != nil {
 			log.Warn("image reclaim: sweep of record-derived content refused; it is kept", "err", err)
 		}
@@ -412,13 +421,22 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		cfg.afterInventory()
 	}
 	// Fail-closed: an incomplete root set aborts the whole pass (see Roots).
-	roots, skipped, err := c.roots(cfg.UntrackedPod)
+	cr, err := c.classifiedRoots(cfg.UntrackedPod)
 	if err != nil {
 		return nil, err
 	}
+	roots, skipped := cr.flatten(), cr.skipped
 	if fresh := c.newlySkipped(skipped); len(fresh) > 0 {
 		log.Warn("image gc skipped pod dirs with no reachability record that no live pod owns",
 			"pods", fresh)
+	}
+	// The shared set, in narrow mode, AFTER the roots and BEFORE the leases:
+	// it only protects, so reading it later can only grow the protection.
+	var others map[string]struct{}
+	if narrow {
+		if others, err = c.evictSharedSet(ctx, cfg.evict.manifest, cfg.evict.target); err != nil {
+			return nil, err
+		}
 	}
 	leased := make([]string, 0)
 	for d := range c.leasedDigests() {
@@ -427,6 +445,11 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	plan, err := PlanPrune(nodes, trees, roots, leased, grace, now())
 	if err != nil {
 		return nil, err
+	}
+	if narrow {
+		if err := narrowForEvict(plan, cfg.evict, others, cr); err != nil {
+			return nil, err
+		}
 	}
 	for _, k := range plan.Keep {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: k.Node.Digest, Path: k.Node.Path, Reason: k.Reason})
@@ -484,7 +507,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		if ctx.Err() != nil {
 			return true
 		}
-		if cfg.Force {
+		if cfg.Force || narrow {
 			return false
 		}
 		f, err := free(c.root)
@@ -508,12 +531,17 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// target stops having given up the cheaper thing — and it can never orphan
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
+	var blobHooks *pruneHooks
+	var treeHooks *treePruneHooks
+	if narrow {
+		blobHooks, treeHooks = c.evictGuards(ctx, &cfg)
+	}
 	artifactDels = c.dropLeased(artifactDels, rep)
-	artExec, err := c.ExecutePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop)
+	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, blobHooks)
 	if err != nil {
 		return nil, err
 	}
-	treeExec, err := c.ExecuteTreePrune(plan, grace, now(), stop)
+	treeExec, err := c.executeTreePrune(plan, grace, now(), stop, treeHooks)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +555,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	}
 
 	restDels = c.dropLeased(restDels, rep)
-	restExec, err := c.ExecutePrune(&PrunePlan{Delete: restDels}, grace, now(), stop)
+	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, blobHooks)
 	if err != nil {
 		return nil, err
 	}
@@ -543,6 +571,16 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	classBytes(plan.Delete, exec.Removed, exec.DeletedBytes, classes, rep.ReclaimedByClass)
 	for _, s := range exec.Skipped {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: s.Digest, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
+	}
+	if narrow {
+		ev := cfg.evict
+		ev.removed, ev.skipped, ev.deletedBytes = exec.Removed, exec.Skipped, exec.DeletedBytes
+		for _, k := range rep.Kept {
+			if k.Reason == ReasonKeptLeased && k.Digest != "" {
+				ev.leased[k.Digest] = struct{}{}
+			}
+		}
+		return rep, nil
 	}
 	if cerr == nil {
 		if err := c.sweepReleased(classes); err != nil {
