@@ -19,6 +19,7 @@ package image
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 )
@@ -94,9 +95,13 @@ func (CodesignTool) Notarized(ctx context.Context, path string) (bool, error) {
 	return exitVerdict(runTool(ctx, checkTimeout, nil, nil, "spctl", "--assess", "--type", "execute", path))
 }
 
-// asExit reports whether err is an *exec.ExitError, copying it into dst.
+// asExit reports whether err is, or wraps, an *exec.ExitError, copying it into
+// dst. It looks through wrapping, so a killed tool's exit error wrapped with an
+// abort cause would also match; that is why exitVerdict must test toolAborted
+// before it.
 func asExit(err error, dst *exec.ExitError) bool {
-	if ee, ok := err.(*exec.ExitError); ok {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
 		*dst = *ee
 		return true
 	}

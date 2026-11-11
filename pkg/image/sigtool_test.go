@@ -29,10 +29,15 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// testToolTimeout is the shortened check and sign deadline these tests run
-// under; slack is how far past it a call may return and still count as bounded.
+// testToolTimeout is the shortened check deadline these tests run under, and
+// testSignTimeout the shortened sign deadline the sign tests run under. The
+// other deadline in each case is set to testLongTimeout, so a call bounded by the
+// wrong one runs past the elapsed bound and fails. slack is how far past the
+// deadline a call may return and still count as bounded.
 const (
 	testToolTimeout = 200 * time.Millisecond
+	testSignTimeout = 400 * time.Millisecond
+	testLongTimeout = 10 * time.Second
 	slack           = 3 * time.Second
 )
 
@@ -50,8 +55,9 @@ func (s *toolStub) names() []string {
 	return append([]string(nil), s.calls...)
 }
 
-// stubTools points commandContext at stub and shortens the deadlines, restoring
-// all of it when the test ends.
+// stubTools points commandContext at stub and shortens the check deadline to
+// testToolTimeout (the sign deadline is testLongTimeout), restoring all of it
+// when the test ends.
 func stubTools(t *testing.T, stub func(ctx context.Context) *exec.Cmd) *toolStub {
 	t.Helper()
 	rec := &toolStub{}
@@ -62,7 +68,7 @@ func stubTools(t *testing.T, stub func(ctx context.Context) *exec.Cmd) *toolStub
 		rec.mu.Unlock()
 		return stub(ctx)
 	}
-	checkTimeout, signTimeout, toolWaitDelay = testToolTimeout, testToolTimeout, 200*time.Millisecond
+	checkTimeout, signTimeout, toolWaitDelay = testToolTimeout, testLongTimeout, 200*time.Millisecond
 	t.Cleanup(func() {
 		commandContext, checkTimeout, signTimeout, toolWaitDelay = oldCmd, oldCheck, oldSign, oldWait
 	})
@@ -138,9 +144,15 @@ func TestSignatureToolTimeoutSign(t *testing.T) {
 	for _, s := range signers {
 		t.Run(s.name, func(t *testing.T) {
 			stubTools(t, sleeper)
+			checkTimeout, signTimeout = testLongTimeout, testSignTimeout
 			start := time.Now()
 			err := s.run(context.Background())
-			assertTimeout(t, err, time.Since(start))
+			elapsed := time.Since(start)
+			assertTimeout(t, err, elapsed)
+			if elapsed >= checkTimeout {
+				t.Errorf("returned after %s, at or past the %s check deadline; want the %s sign deadline",
+					elapsed, checkTimeout, testSignTimeout)
+			}
 		})
 	}
 }
@@ -180,6 +192,9 @@ func TestSignatureToolParentCancelIsNotTimeout(t *testing.T) {
 // that answers with a non-zero exit inside its deadline is "not signed", nil.
 func TestSignatureToolExitStillMapsToUnsigned(t *testing.T) {
 	stubTools(t, func(ctx context.Context) *exec.Cmd { return exec.CommandContext(ctx, "/usr/bin/false") })
+	// A generous deadline: this test is about the exit mapping, and a short one
+	// could expire on a loaded host before /usr/bin/false answers.
+	checkTimeout = 30 * time.Second
 	ok, err := CodesignTool{}.Signed(context.Background(), "/x")
 	if ok || err != nil {
 		t.Fatalf("Signed = %v, %v; want false, nil", ok, err)
