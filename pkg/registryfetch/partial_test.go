@@ -966,3 +966,163 @@ func TestResumeCommitFileUnsupportedFallsBackToReplay(t *testing.T) {
 		t.Fatalf("committed partial survived: %v", err)
 	}
 }
+
+// TestResumeCommitFileReopenRefusals pins reopenReadOnly's refusals: a
+// partial path that no longer names the file Transfer wrote, swapped from
+// inside Transfer, is refused with ErrPartialFile before CommitFile, Commit or
+// Poisoned run, and whatever is at the path is left as it is.
+func TestResumeCommitFileReopenRefusals(t *testing.T) {
+	const size, have = 100, 40
+	data, digest := blobData(size)
+
+	for _, tc := range []struct {
+		name string
+		// swap replaces the partial at path once Transfer has written it,
+		// and returns a check of what must then be at path.
+		swap func(t *testing.T, path string) func(t *testing.T)
+		// also, when set, must match the error too: the refusal came from
+		// the reopen itself and not from the inode comparison after it.
+		also error
+	}{
+		{
+			name: "regular file renamed over the path",
+			swap: func(t *testing.T, path string) func(t *testing.T) {
+				other := bytes.Repeat([]byte{'x'}, size)
+				tmp := path + ".other"
+				if err := os.WriteFile(tmp, other, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(tmp, path); err != nil {
+					t.Fatal(err)
+				}
+				return func(t *testing.T) {
+					got, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatalf("file renamed over the partial is gone: %v", err)
+					}
+					if !bytes.Equal(got, other) {
+						t.Fatal("file renamed over the partial was changed")
+					}
+				}
+			},
+		},
+		{
+			name: "symlink at the path",
+			swap: func(t *testing.T, path string) func(t *testing.T) {
+				target := filepath.Join(t.TempDir(), "victim")
+				if err := os.WriteFile(target, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+				return func(t *testing.T) {
+					fi, err := os.Lstat(path)
+					if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+						t.Fatalf("symlink at the partial path was not left alone: %v, %v", fi, err)
+					}
+				}
+			},
+			also: unix.ELOOP,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+			if err := s.EnsureDir(); err != nil {
+				t.Fatal(err)
+			}
+			path := s.path(digest)
+			if err := os.WriteFile(path, data[:have], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var check func(*testing.T)
+			var fileCalls, commitCalls, poisonCalls int
+			err := s.Resume(Fill{
+				Digest: digest, Size: size,
+				Transfer: func(f *os.File, off int64) error {
+					if _, err := f.Write(data[off:]); err != nil {
+						return err
+					}
+					check = tc.swap(t, path)
+					return nil
+				},
+				CommitFile: func(*os.File) error { fileCalls++; return nil },
+				Commit:     func(func(io.Writer) error) error { commitCalls++; return nil },
+				Poisoned:   func(error) bool { poisonCalls++; return true },
+			})
+			if !errors.Is(err, ErrPartialFile) {
+				t.Fatalf("Resume over a swapped partial: err = %v, want ErrPartialFile", err)
+			}
+			if tc.also != nil && !errors.Is(err, tc.also) {
+				t.Fatalf("Resume over a swapped partial: err = %v, want it to match %v", err, tc.also)
+			}
+			if fileCalls != 0 || commitCalls != 0 || poisonCalls != 0 {
+				t.Fatalf("CommitFile ran %d, Commit %d, Poisoned %d times; want none", fileCalls, commitCalls, poisonCalls)
+			}
+			check(t)
+		})
+	}
+}
+
+// TestReopenReadOnlyRefusesLength pins reopenReadOnly's length check: the
+// file at the path, the same inode as the descriptor handed in, must hold
+// exactly Size bytes. Resume checks the length after Transfer and nothing
+// runs between that check and the reopen, so the arm is driven directly.
+func TestReopenReadOnlyRefusesLength(t *testing.T) {
+	const size = 100
+	data, digest := blobData(size)
+	path := filepath.Join(t.TempDir(), "p")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(data[:size-1]); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := reopenReadOnly(f, path, Fill{Digest: digest, Size: size})
+	if err == nil {
+		ro.Close()
+	}
+	if !errors.Is(err, ErrPartialLength) {
+		t.Fatalf("reopenReadOnly over %d of %d bytes: err = %v, want ErrPartialLength", size-1, size, err)
+	}
+}
+
+// TestResumeCommitFileZeroByteBlob pins the empty blob: a zero-length partial
+// needs no Transfer and is handed to CommitFile as an empty read-only file.
+func TestResumeCommitFileZeroByteBlob(t *testing.T) {
+	_, digest := blobData(0)
+	s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+	var calls int
+	err := s.Resume(Fill{
+		Digest: digest, Size: 0, Transfer: noTransfer(t),
+		CommitFile: func(f *os.File) error {
+			calls++
+			fi, err := f.Stat()
+			if err != nil {
+				return err
+			}
+			if fi.Size() != 0 {
+				return fmt.Errorf("CommitFile got %d bytes, want 0", fi.Size())
+			}
+			return nil
+		},
+		Commit: func(func(io.Writer) error) error {
+			t.Error("Commit ran although CommitFile committed")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Resume of a zero-byte blob: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("CommitFile ran %d times, want 1", calls)
+	}
+	if _, err := os.Lstat(s.path(digest)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("committed partial survived: %v", err)
+	}
+}
