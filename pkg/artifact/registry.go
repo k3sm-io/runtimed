@@ -122,9 +122,9 @@ func (f *RegistryFetcher) client(ctx context.Context, ref string, cred *image.Re
 	return r, c, fetchErr(err)
 }
 
-// Blob opens digest in ref's repository from offset, with a Range request when
-// offset > 0 (registryfetch.Registry.Blob).
-func (f *RegistryFetcher) Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, offset int64) (io.ReadCloser, int64, error) {
-	body, start, err := f.registry().Blob(ctx, ref, fetchCredential(cred), digest, offset)
+// Blob opens the size-byte blob digest in ref's repository from offset, with a
+// Range request when offset > 0 (registryfetch.Registry.Blob).
+func (f *RegistryFetcher) Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, size, offset int64) (io.ReadCloser, int64, error) {
+	body, start, err := f.registry().Blob(ctx, ref, fetchCredential(cred), digest, size, offset)
 	return body, start, fetchErr(err)
 }

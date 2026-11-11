@@ -19,11 +19,14 @@ limitations under the License.
 //
 // # Ranged GET
 //
-// Registry.Blob opens a blob from an offset, with a Range request when the
-// offset is past zero. A 200 to a Range request means the server sent the
-// whole blob, so the returned start is 0 and the caller restarts its partial;
-// a 206 must carry a Content-Range starting exactly at the offset asked for;
-// a 416 is retried once without a Range. Registry.Session is the
+// Registry.Blob opens a blob of a known size from an offset, with a Range
+// request when the offset is past zero. A 200 to a Range request means the
+// server sent the whole blob, so the returned start is 0 and the caller
+// restarts its partial. A 206 must carry exactly one Content-Range, exactly
+// "bytes <offset>-<size-1>/<size>" in canonical ASCII decimals (no sign, no
+// leading zero, no "*"); anything else matches ErrBlobRange. A 416 is retried
+// once without a Range, and that retry must be a 200 or a 206 of the whole
+// blob from 0. Registry.Session is the
 // authenticated, pull-scoped client the GET runs on, exported so a caller can
 // issue its own bounded reads (a manifest) over the same transport.
 //

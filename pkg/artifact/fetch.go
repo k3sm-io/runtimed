@@ -281,7 +281,7 @@ func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryC
 		}
 		return err
 	}
-	body, start, err := p.deps.Fetcher.Blob(tctx, ref, cred, b.digest, have)
+	body, start, err := p.deps.Fetcher.Blob(tctx, ref, cred, b.digest, b.size, have)
 	if err != nil {
 		return stalled(have, fmt.Errorf("fetch %s from %d: %w: %w", b.digest, have, ErrBlobTransfer, bound(err)))
 	}

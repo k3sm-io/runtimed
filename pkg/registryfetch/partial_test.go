@@ -566,7 +566,7 @@ func TestResumeRangeAnsweredWith200(t *testing.T) {
 			err := s.Resume(Fill{
 				Digest: digest, Size: size,
 				Transfer: func(f *os.File, have int64) error {
-					body, start, err := reg.Blob(context.Background(), ref, nil, digest, have)
+					body, start, err := reg.Blob(context.Background(), ref, nil, digest, size, have)
 					if err != nil {
 						return err
 					}
