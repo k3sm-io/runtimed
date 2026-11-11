@@ -35,6 +35,10 @@ var (
 	ErrInvalidReference = errors.New("registryfetch: reference does not parse")
 	// ErrTransportRequired reports a Registry without a Transport.
 	ErrTransportRequired = errors.New("registryfetch: transport is required")
+	// ErrBlobRange reports a ranged answer that is not the bytes asked for
+	// (a Content-Range other than offset to the end of the blob), or an
+	// offset outside the blob's size.
+	ErrBlobRange = errors.New("registryfetch: blob range is not the one asked for")
 )
 
 // ReferenceError is the error for a reference that does not parse. It
@@ -111,10 +115,16 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 	return r, &http.Client{Transport: rt}, nil
 }
 
-// Blob opens digest in ref's repository from offset, with a Range request when
-// offset > 0. A 200 to a Range request restarts at 0; a 416 is retried once
-// without a Range. start is the offset the body begins at.
-func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, digest string, offset int64) (body io.ReadCloser, start int64, err error) {
+// Blob opens the size-byte blob digest in ref's repository from offset, with
+// a Range request when offset > 0. A 200 restarts at 0; a 206 is accepted only
+// with exactly one Content-Range of "bytes <offset>-<size-1>/<size>" (see
+// parseContentRange); a 416 is retried once without a Range, and that retry
+// must be a 200 or a 206 of the whole object from 0. start is the offset the
+// body begins at.
+func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, digest string, size, offset int64) (body io.ReadCloser, start int64, err error) {
+	if size < 0 || offset < 0 || offset > size {
+		return nil, 0, fmt.Errorf("blob %s: offset %d of size %d: %w", quoteBounded(digest, 128), offset, size, ErrBlobRange)
+	}
 	r, client, err := g.Session(ctx, ref, cred)
 	if err != nil {
 		return nil, 0, err
@@ -146,13 +156,18 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 	case http.StatusOK:
 		return resp.Body, 0, nil
 	case http.StatusPartialContent:
-		start, ok := contentRangeStart(resp.Header.Get("Content-Range"))
-		if !ok || start != offset {
-			resp.Body.Close()
-			return nil, 0, fmt.Errorf("blob %s: Content-Range %s does not start at %d",
-				digest, quoteBounded(resp.Header.Get("Content-Range"), 128), offset)
+		crs := resp.Header.Values("Content-Range")
+		var cr string
+		if len(crs) == 1 {
+			cr = crs[0]
 		}
-		return resp.Body, start, nil
+		first, last, total, ok := parseContentRange(cr)
+		if !ok || first != offset || last != size-1 || total != size {
+			resp.Body.Close()
+			return nil, 0, fmt.Errorf("blob %s: Content-Range %s is not bytes %d-%d/%d: %w",
+				digest, quoteBounded(strings.Join(crs, ", "), 128), offset, size-1, size, ErrBlobRange)
+		}
+		return resp.Body, first, nil
 	}
 	defer resp.Body.Close()
 	if err := transport.CheckError(resp, http.StatusOK, http.StatusPartialContent); err != nil {
@@ -161,18 +176,46 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 	return nil, 0, fmt.Errorf("blob %s: status %d", digest, resp.StatusCode)
 }
 
-// contentRangeStart parses the first byte of "bytes <first>-<last>/<size>".
-func contentRangeStart(v string) (int64, bool) {
+// parseContentRange parses exactly "bytes <first>-<last>/<total>": the
+// lowercase unit, one space, and three ASCII decimals with no sign and no
+// leading zero (a lone 0 aside), each within int64. Anything else (an
+// unsatisfied "*", a missing part, trailing text) is refused. It checks the
+// grammar only; Blob compares the numbers with what it asked for.
+func parseContentRange(v string) (first, last, total int64, ok bool) {
 	rest, ok := strings.CutPrefix(v, "bytes ")
 	if !ok {
-		return 0, false
+		return 0, 0, 0, false
 	}
-	first, _, ok := strings.Cut(rest, "-")
+	a, rest, ok := strings.Cut(rest, "-")
 	if !ok {
+		return 0, 0, 0, false
+	}
+	b, c, ok := strings.Cut(rest, "/")
+	if !ok {
+		return 0, 0, 0, false
+	}
+	var oks [3]bool
+	first, oks[0] = decimal(a)
+	last, oks[1] = decimal(b)
+	total, oks[2] = decimal(c)
+	if !oks[0] || !oks[1] || !oks[2] {
+		return 0, 0, 0, false
+	}
+	return first, last, total, true
+}
+
+// decimal parses a canonical non-negative ASCII decimal that fits an int64.
+func decimal(s string) (int64, bool) {
+	if s == "" || len(s) > 1 && s[0] == '0' {
 		return 0, false
 	}
-	n, err := strconv.ParseInt(first, 10, 64)
-	return n, err == nil && n >= 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
 }
 
 // maxForeignErrBytes bounds foreign (registry, transport) error text carried
