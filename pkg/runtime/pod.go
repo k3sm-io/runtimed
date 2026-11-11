@@ -22,6 +22,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -526,7 +528,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// the vm rung has already been routed away) rather than the box's requested
 	// backend: an UNSPECIFIED request the ladder degraded to vm legitimately
 	// honours Memory, and refusing it here would reject a pod that runs fine.
-	// It must run before the rootfs MkdirAll below (and provisionPodTmpDir /
+	// It must run before the rootfs setup below (freshRootfs, provisionPodTmpDir /
 	// recordPodReferences), the same reasoning the pod_id check in
 	// validatePodBox already uses for its own sinks — a refused pod must leave
 	// no trace on disk.
@@ -558,7 +560,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
-	if err := os.MkdirAll(rootfs, 0o755); err != nil {
+	if err := r.freshRootfs(box.GetPodId()); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
 	}
@@ -3523,6 +3525,70 @@ func (r *Runtime) rootfsPath(box *runtimev1.PodBox) (string, error) {
 		return "", err
 	}
 	return r.cache.PodRootfs(id), nil
+}
+
+// freshRootfs makes <pods>/<pod id>/rootfs an empty directory, so a create
+// never inherits what an earlier life of the pod id left there. The pod id must
+// already be validated (rootfsPath).
+//
+// Only the rootfs entry is cleared: the pod dir also holds the image GC's
+// reachability record, which outlives one create. The clear runs through an
+// os.Root on the pod dir, so a symlink anywhere under the stale rootfs (the
+// entry itself included) is unlinked and never followed out of the pod dir.
+// A non-empty stale rootfs is logged once at Warn.
+func (r *Runtime) freshRootfs(podID string) error {
+	dir, err := r.podDir(podID)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	const name = "rootfs"
+	if stale, err := rootfsEntryNonEmpty(root, name); err != nil {
+		return err
+	} else if stale {
+		r.log.Warn("clearing a non-empty rootfs an earlier pod with this id left behind", "pod", podID)
+	}
+	if err := root.RemoveAll(name); err != nil {
+		return err
+	}
+	return root.Mkdir(name, 0o755)
+}
+
+// rootfsEntryNonEmpty reports whether name under root exists as anything but an
+// empty directory. It never follows a symlink: a symlink (or any non-directory)
+// counts as non-empty.
+func rootfsEntryNonEmpty(root *os.Root, name string) (bool, error) {
+	fi, err := root.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !fi.IsDir() {
+		return true, nil
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if errors.Is(err, io.EOF) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(names) > 0, nil
 }
 
 // retiredFieldLogCap bounds the retired field's value in the Warn line, so a
