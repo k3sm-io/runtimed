@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -205,43 +206,47 @@ func TestClaim(t *testing.T) {
 		name string
 		run  func(t *testing.T, s *PartialStore)
 	}{
-		{"second claim refused", func(t *testing.T, s *PartialStore) {
-			rel, ok := s.Claim(a)
-			if !ok {
-				t.Fatal("first claim refused")
+		{"second claim refused as claimed", func(t *testing.T, s *PartialStore) {
+			rel, err := s.Claim(a)
+			if err != nil {
+				t.Fatalf("first claim refused: %v", err)
 			}
 			defer rel()
-			if _, ok := s.Claim(a); ok {
-				t.Fatal("second claim of a held digest granted")
+			rel2, err := s.Claim(a)
+			rel2()
+			if !errors.Is(err, ErrPartialClaimed) || errors.Is(err, ErrInvalidDigest) {
+				t.Fatalf("second claim of a held digest = %v, want ErrPartialClaimed only", err)
 			}
 		}},
 		{"other digest free", func(t *testing.T, s *PartialStore) {
 			rel, _ := s.Claim(a)
 			defer rel()
-			relB, ok := s.Claim(b)
-			if !ok {
-				t.Fatal("claim of an unrelated digest refused")
+			relB, err := s.Claim(b)
+			if err != nil {
+				t.Fatalf("claim of an unrelated digest refused: %v", err)
 			}
 			relB()
 		}},
 		{"release frees and is idempotent", func(t *testing.T, s *PartialStore) {
 			rel, _ := s.Claim(a)
 			rel()
-			rel2, ok := s.Claim(a)
-			if !ok {
-				t.Fatal("claim after release refused")
+			rel2, err := s.Claim(a)
+			if err != nil {
+				t.Fatalf("claim after release refused: %v", err)
 			}
 			rel() // a stale release must not end the new claim
-			if _, ok := s.Claim(a); ok {
-				t.Fatal("repeated release ended a later claim")
+			if _, err := s.Claim(a); !errors.Is(err, ErrPartialClaimed) {
+				t.Fatalf("repeated release ended a later claim: %v", err)
 			}
 			rel2()
 		}},
-		{"invalid digest refused", func(t *testing.T, s *PartialStore) {
-			rel, ok := s.Claim("sha256:../x")
-			rel()
-			if ok {
-				t.Fatal("claim of an unsafe digest granted")
+		{"invalid digest refused as invalid", func(t *testing.T, s *PartialStore) {
+			for _, d := range []string{"sha256:../x", "", testDigest('A'), "sha512:" + strings.Repeat("a", 64)} {
+				rel, err := s.Claim(d)
+				rel()
+				if !errors.Is(err, ErrInvalidDigest) || errors.Is(err, ErrPartialClaimed) {
+					t.Fatalf("Claim(%q) = %v, want ErrInvalidDigest only", d, err)
+				}
 			}
 		}},
 		{"contention grants exactly one", func(t *testing.T, s *PartialStore) {
@@ -253,9 +258,13 @@ func TestClaim(t *testing.T) {
 				for range 16 {
 					wg.Go(func() {
 						<-start
-						if rel, ok := s.Claim(a); ok {
+						rel, err := s.Claim(a)
+						switch {
+						case err == nil:
 							wins.Add(1)
 							rels <- rel
+						case !errors.Is(err, ErrPartialClaimed):
+							t.Errorf("contended claim = %v, want ErrPartialClaimed", err)
 						}
 					})
 				}
@@ -302,6 +311,18 @@ func TestAdmit(t *testing.T) {
 			}
 		}},
 		{name: "negative want", max: 100, want: -1, wantErr: ErrPartialBudget},
+		{name: "want MaxInt64 wraps with one other byte", max: 100, want: math.MaxInt64, setup: writeSized(other, 1), wantErr: ErrPartialBudget},
+		{name: "want MaxInt64 alone", max: 100, want: math.MaxInt64, wantErr: ErrPartialBudget},
+		{name: "want just over cap", max: 100, want: 101, setup: writeSized(own, 10), wantErr: ErrPartialBudget},
+		{name: "sizes sum exactly to cap", max: 100, want: 30, setup: func(t *testing.T, s *PartialStore) {
+			writeSized(other, 50)(t, s)
+			writeNamed("stray", 20)(t, s)
+		}},
+		{name: "sizes sum one past cap", max: 100, want: 31, setup: func(t *testing.T, s *PartialStore) {
+			writeSized(other, 50)(t, s)
+			writeNamed("stray", 20)(t, s)
+		}, wantErr: ErrPartialBudget},
+		{name: "cap MaxInt64 with others", max: math.MaxInt64, want: math.MaxInt64, setup: writeSized(other, 1), wantErr: ErrPartialBudget},
 		{name: "missing dir", max: 100, want: 100, setup: func(t *testing.T, s *PartialStore) { s.Dir = filepath.Join(s.Dir, "absent") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -389,9 +410,9 @@ func TestSweep(t *testing.T) {
 		}
 		if e.claimed {
 			digest := strings.Replace(strings.TrimSuffix(e.name, ".partial"), "-", ":", 1)
-			rel, ok := s.Claim(digest)
-			if !ok {
-				t.Fatal("claim refused")
+			rel, err := s.Claim(digest)
+			if err != nil {
+				t.Fatal(err)
 			}
 			defer rel()
 		}

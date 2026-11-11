@@ -46,12 +46,26 @@ limitations under the License.
 //
 // Three opt-in helpers serve a caller that shares one store across
 // concurrent pulls; a caller that uses none of them sees no change. Claim
-// gives one writer per digest within a store, without blocking. Admit
-// enforces MaxBytes over the regular files in the directory before a partial
-// grows (ErrPartialBudget). Sweep removes old, unclaimed partials, matching
-// only the store's own file-name grammar and unlinking relative to a
-// descriptor of the directory opened O_NOFOLLOW, so it never follows a link.
-// The stall watchdog and the blob cache itself belong to the caller.
+// gives one writer per digest within a store, without blocking; its refusal
+// says whether the digest is held (ErrPartialClaimed, retryable) or malformed
+// (ErrInvalidDigest, never retryable). Admit checks MaxBytes over the regular
+// files in the directory before a partial grows (ErrPartialBudget); it fails
+// closed on a negative or over-cap size and sums without overflow. Sweep
+// removes old, unclaimed partials, matching only the store's own file-name
+// grammar and unlinking relative to a descriptor of the directory opened
+// O_NOFOLLOW, so it never follows a link. The stall watchdog and the blob
+// cache itself belong to the caller.
+//
+// Their limits are part of the contract:
+//
+//   - Sweep protects only claimed digests. Every Resume caller that shares a
+//     store with a Sweep must hold the digest's Claim for the whole Resume,
+//     or Sweep can remove the partial out from under it.
+//   - Admit is advisory: it holds nothing between its check and the growth,
+//     so two concurrent Admits can both pass. It counts every regular file in
+//     the directory, whatever its name, by apparent size.
+//   - The directory's parent path is trusted (root-owned, or writable only by
+//     this principal). O_NOFOLLOW covers only the last path component.
 //
 // # Errors
 //
