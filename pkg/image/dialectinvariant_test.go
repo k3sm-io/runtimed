@@ -154,9 +154,10 @@ func within(path, root string) bool {
 // The FIFO makes a read-only follow visible: opening it for reading blocks, so a
 // reader that opens through the link hangs and the sign subtest times it out.
 //
-// What this gates is the SOURCE side: every reader of the tree. MaterializeTree's
-// destination side joins plain paths and follows links already in the
-// destination; populated_destination pins what that does today, and
+// What this gates is mainly the SOURCE side: every reader of the tree.
+// populated_destination pins that MaterializeTree refuses, rather than
+// follows, a link already planted in the destination (the full destination
+// gate is TestMaterializeTreeNeverWritesThroughADestinationLink), and
 // write_through_across_layers pins that a later layer's entries do not resolve
 // through an earlier layer's link at unpack time.
 func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
@@ -309,16 +310,10 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 	})
 
 	t.Run("populated_destination", func(t *testing.T) {
-		// MaterializeTree's destination side is NOT link-safe: it joins plain
-		// paths and MkdirAll/Stat/OpenFile follow a link already present in the
-		// destination. The vm spine relies on handing it a per-pod rootfs no
-		// earlier writer populated; nothing in production verifies that the
-		// directory is new or empty. This subtest pins today's behaviour with a
-		// destination that already holds "etc -> <victim>": the tree's
-		// etc/hostname is written THROUGH the planted link into the victim
-		// directory. It is a recorded finding, not a contract: when the
-		// destination side is made link-safe (or the spine verifies a fresh
-		// destination), flip it to assert a refusal and an untouched victim.
+		// A destination that already holds "etc -> <victim>" (a link a pod
+		// planted in its own rootfs before a restart re-materializes into it):
+		// MaterializeTree must refuse with ErrDestinationLink and write
+		// nothing through the link.
 		victim := t.TempDir()
 		dst := filepath.Join(t.TempDir(), "rootfs")
 		if err := os.MkdirAll(dst, 0o755); err != nil {
@@ -328,12 +323,11 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := u.MaterializeTree(context.Background(), mfst, LinuxUnpackPolicy(), dst)
-		if err != nil {
-			t.Fatalf("MaterializeTree into a populated destination: %v; today it succeeds — update this pin if the destination side now refuses", err)
+		if !errors.Is(err, ErrDestinationLink) {
+			t.Fatalf("MaterializeTree into a destination with a planted etc link: err = %v, want ErrDestinationLink", err)
 		}
-		got, rerr := os.ReadFile(filepath.Join(victim, "hostname"))
-		if rerr != nil || string(got) != "guest" {
-			t.Fatalf("victim/hostname = %q, %v; today the write lands through the planted link — update this pin if that changed", got, rerr)
+		if ents, rerr := os.ReadDir(victim); rerr != nil || len(ents) != 0 {
+			t.Fatalf("victim holds %d entries (err %v), want none: the write went through the planted link", len(ents), rerr)
 		}
 		if fi, lerr := os.Lstat(filepath.Join(dst, "etc")); lerr != nil || fi.Mode()&fs.ModeSymlink == 0 {
 			t.Errorf("destination etc = %v, %v; want the planted link left in place", fi, lerr)

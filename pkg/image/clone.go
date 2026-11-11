@@ -24,6 +24,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // QuarantineXattr is the macOS attribute Gatekeeper sets on downloaded files.
@@ -68,12 +70,68 @@ func (ByteCopier) Clone(src, dst string) (bool, error) {
 	return false, nil
 }
 
+// cloneAt byte-copies src to name inside dir. cow is always false.
+func (ByteCopier) cloneAt(src string, dir *os.File, name string) (bool, error) {
+	return false, byteCopyAt(src, dir, name)
+}
+
+// ErrDestinationLink reports that MaterializeTree found a symlink, or some
+// other non-directory, in the destination where the tree needs a directory, or
+// a symlink where the tree lands a regular file. Nothing is written through it.
+var ErrDestinationLink = errors.New("image: materialize destination holds a link where the tree needs a directory or file")
+
+// cloneAter is the descriptor-relative half of a Cloner: it copies the regular
+// file src to name inside the open directory dir, resolving no destination
+// path component. Every Cloner this package ships implements it; a Cloner that
+// does not (a test double from another package) is called with a joined path
+// after its parent was verified through a descriptor, which leaves the window
+// between that check and the copy open.
+type cloneAter interface {
+	cloneAt(src string, dir *os.File, name string) (cow bool, err error)
+}
+
+// destDir is one open destination directory on the walk's stack.
+type destDir struct {
+	rel string
+	f   *os.File
+}
+
 // MaterializeTree recursively copies the directory tree rooted at srcDir into
 // dstDir using c, preserving structure and mode. Existing destination files are
 // left in place (idempotent re-materialize). After copying each regular file it
 // asserts the file does not carry the com.apple.quarantine xattr. It returns the
 // number of files that were materialized as real APFS clones.
+//
+// dstDir itself is the caller's trust anchor and is created and opened by path.
+// Beneath it no link is ever followed: every destination directory is opened
+// relative to its parent's descriptor with O_NOFOLLOW|O_DIRECTORY, and every
+// directory, file and symlink is created relative to its parent's descriptor,
+// so a link a pod planted in its own rootfs cannot redirect a later
+// re-materialize. A symlink or non-directory where the tree needs a directory,
+// or a symlink where the tree lands a regular file, fails with
+// ErrDestinationLink. Idempotence is decided by lstat: an existing regular file
+// (or any other non-link entry) where the tree lands a file is kept, and any
+// existing entry where the tree lands a symlink is kept.
 func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
+	srcInfo, err := os.Stat(srcDir)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(dstDir, srcInfo.Mode().Perm()|0o100); err != nil {
+		return 0, fmt.Errorf("mkdir %s: %w", dstDir, err)
+	}
+	root, err := os.OpenFile(dstDir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, fmt.Errorf("open destination %s: %w", dstDir, err)
+	}
+	stack := []destDir{{rel: ".", f: root}}
+	defer func() {
+		for _, d := range stack {
+			d.f.Close()
+		}
+	}()
+	at, _ := c.(cloneAter)
+
 	walkErr := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -82,7 +140,20 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 		if err != nil {
 			return err
 		}
+		if rel == "." {
+			return nil // the root is already open
+		}
 		dst := filepath.Join(dstDir, rel)
+		parentRel := filepath.Dir(rel)
+		for len(stack) > 1 && stack[len(stack)-1].rel != parentRel {
+			stack[len(stack)-1].f.Close()
+			stack = stack[:len(stack)-1]
+		}
+		if stack[len(stack)-1].rel != parentRel {
+			return fmt.Errorf("materialize %s: parent directory not open", dst)
+		}
+		parent := stack[len(stack)-1].f
+		name := filepath.Base(rel)
 
 		switch {
 		case d.IsDir():
@@ -90,36 +161,57 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 			if ierr != nil {
 				return ierr
 			}
-			if err := os.MkdirAll(dst, info.Mode().Perm()|0o100); err != nil {
-				return fmt.Errorf("mkdir %s: %w", dst, err)
+			f, oerr := mkdirOpenAt(parent, name, info.Mode().Perm()|0o100)
+			if oerr != nil {
+				return fmt.Errorf("mkdir %s: %w", dst, oerr)
 			}
+			stack = append(stack, destDir{rel: rel, f: f})
 			return nil
 		case d.Type()&fs.ModeSymlink != 0:
 			target, lerr := os.Readlink(path)
 			if lerr != nil {
 				return fmt.Errorf("readlink %s: %w", path, lerr)
 			}
-			if _, serr := os.Lstat(dst); serr == nil {
-				return nil // idempotent: link already present
+			if _, present, serr := lstatAt(parent, name); serr != nil {
+				return fmt.Errorf("lstat %s: %w", dst, serr)
+			} else if present {
+				return nil // idempotent: an entry is already present
 			}
-			if err := os.Symlink(target, dst); err != nil {
+			if err := symlinkAt(target, parent, name); err != nil {
 				return fmt.Errorf("symlink %s: %w", dst, err)
 			}
 			return nil
 		case d.Type().IsRegular():
-			if _, serr := os.Stat(dst); serr == nil {
-				// Idempotent: destination already materialized. Still assert the
-				// quarantine invariant on the existing file.
-				return assertNoQuarantine(dst)
+			mode, present, serr := lstatAt(parent, name)
+			if serr != nil {
+				return fmt.Errorf("lstat %s: %w", dst, serr)
 			}
-			cow, cerr := c.Clone(path, dst)
+			if present {
+				switch mode & unix.S_IFMT {
+				case unix.S_IFLNK:
+					return fmt.Errorf("materialize %s: %w", dst, ErrDestinationLink)
+				case unix.S_IFREG:
+					// Idempotent: destination already materialized. Still
+					// assert the quarantine invariant on the existing file.
+					return assertNoQuarantineAt(parent, name)
+				default:
+					return nil // idempotent, as before: something is there
+				}
+			}
+			var cow bool
+			var cerr error
+			if at != nil {
+				cow, cerr = at.cloneAt(path, parent, name)
+			} else {
+				cow, cerr = c.Clone(path, dst)
+			}
 			if cerr != nil {
 				return fmt.Errorf("clone %s -> %s: %w", path, dst, cerr)
 			}
 			if cow {
 				cloned++
 			}
-			return assertNoQuarantine(dst)
+			return assertNoQuarantineAt(parent, name)
 		default:
 			// Skip sockets/devices/pipes — not part of an image payload.
 			return nil
@@ -129,6 +221,121 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 		return cloned, walkErr
 	}
 	return cloned, nil
+}
+
+// withFD runs fn with dir's descriptor.
+func withFD(dir *os.File, fn func(fd int) error) error {
+	conn, err := dir.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var inner error
+	if err := conn.Control(func(fd uintptr) { inner = fn(int(fd)) }); err != nil {
+		return err
+	}
+	return inner
+}
+
+// mkdirOpenAt creates name inside dir (an existing directory is kept) and
+// opens it without following a link. A symlink or non-directory at name fails
+// with ErrDestinationLink.
+func mkdirOpenAt(dir *os.File, name string, perm os.FileMode) (*os.File, error) {
+	var fd int
+	err := withFD(dir, func(dfd int) error {
+		if err := unix.Mkdirat(dfd, name, uint32(perm)); err != nil && !errors.Is(err, unix.EEXIST) {
+			return &os.PathError{Op: "mkdirat", Path: name, Err: err}
+		}
+		var oerr error
+		fd, oerr = unix.Openat(dfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if oerr == nil {
+			return nil
+		}
+		if errors.Is(oerr, unix.ELOOP) || errors.Is(oerr, unix.ENOTDIR) {
+			return fmt.Errorf("%w: %s: %w", ErrDestinationLink, name, oerr)
+		}
+		return &os.PathError{Op: "openat", Path: name, Err: oerr}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+// lstatAt reports the type bits of name inside dir without following a link,
+// and whether anything is there at all.
+func lstatAt(dir *os.File, name string) (mode uint32, present bool, err error) {
+	err = withFD(dir, func(dfd int) error {
+		var st unix.Stat_t
+		serr := unix.Fstatat(dfd, name, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(serr, unix.ENOENT) {
+			return nil
+		}
+		if serr != nil {
+			return &os.PathError{Op: "fstatat", Path: name, Err: serr}
+		}
+		mode, present = uint32(st.Mode), true
+		return nil
+	})
+	return mode, present, err
+}
+
+// symlinkAt creates the symlink name -> target inside dir.
+func symlinkAt(target string, dir *os.File, name string) error {
+	return withFD(dir, func(dfd int) error {
+		if err := unix.Symlinkat(target, dfd, name); err != nil {
+			return &os.LinkError{Op: "symlinkat", Old: target, New: name, Err: err}
+		}
+		return nil
+	})
+}
+
+// openNoFollowAt opens name inside dir read-only without following a link and
+// without blocking on a FIFO.
+func openNoFollowAt(dir *os.File, name string) (*os.File, error) {
+	var fd int
+	err := withFD(dir, func(dfd int) error {
+		var oerr error
+		fd, oerr = unix.Openat(dfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if oerr != nil {
+			return &os.PathError{Op: "openat", Path: name, Err: oerr}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+// byteCopyAt copies src to name inside dir, preserving permission bits. name
+// must not exist; a link at name is refused, never followed.
+func byteCopyAt(src string, dir *os.File, name string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	var fd int
+	if err := withFD(dir, func(dfd int) error {
+		var oerr error
+		fd, oerr = unix.Openat(dfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(info.Mode().Perm()))
+		if oerr != nil {
+			return &os.PathError{Op: "openat", Path: name, Err: oerr}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	out := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // byteCopyFile copies src to dst preserving permission bits. dst must not exist.

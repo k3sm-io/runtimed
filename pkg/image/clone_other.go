@@ -37,6 +37,11 @@ func (APFSCloner) Clone(src, dst string) (bool, error) {
 	return false, nil
 }
 
+// cloneAt byte-copies src to name inside dir (cow is always false off darwin).
+func (APFSCloner) cloneAt(src string, dir *os.File, name string) (bool, error) {
+	return false, byteCopyAt(src, dir, name)
+}
+
 // CloneOnly off darwin has no clonefile, so every clone is refused as
 // unsupported (IsCloneUnsupported) without copying.
 type CloneOnly struct{}
@@ -44,6 +49,11 @@ type CloneOnly struct{}
 // Clone refuses: there is no copy-on-write clone off darwin.
 func (CloneOnly) Clone(src, dst string) (bool, error) {
 	return false, &os.LinkError{Op: "clonefile", Old: src, New: dst, Err: errors.ErrUnsupported}
+}
+
+// cloneAt refuses: there is no copy-on-write clone off darwin.
+func (CloneOnly) cloneAt(src string, _ *os.File, name string) (bool, error) {
+	return false, &os.LinkError{Op: "clonefileat", Old: src, New: name, Err: errors.ErrUnsupported}
 }
 
 // cloneFileAt off darwin has no fclonefileat, so every clone is refused as
@@ -72,3 +82,6 @@ func renameFromStage(stage *os.File, name, dst string) error {
 
 // assertNoQuarantine is a no-op off darwin (no com.apple.quarantine concept).
 func assertNoQuarantine(string) error { return nil }
+
+// assertNoQuarantineAt is a no-op off darwin.
+func assertNoQuarantineAt(*os.File, string) error { return nil }

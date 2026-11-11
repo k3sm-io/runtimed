@@ -54,6 +54,34 @@ func (APFSCloner) Clone(src, dst string) (bool, error) {
 	return false, err
 }
 
+// cloneAt CoW-clones src to name inside dir with clonefileat(2), so no
+// destination path component is resolved; CLONE_NOFOLLOW refuses a link at
+// name. It falls back to a byte copy into the same descriptor on EXDEV or
+// ENOTSUP, as Clone does.
+func (APFSCloner) cloneAt(src string, dir *os.File, name string) (bool, error) {
+	err := clonefileAt(src, dir, name)
+	if err == nil {
+		return true, nil
+	}
+	if IsCloneUnsupported(err) {
+		if cErr := byteCopyAt(src, dir, name); cErr != nil {
+			return false, cErr
+		}
+		return false, nil
+	}
+	return false, err
+}
+
+// clonefileAt runs clonefileat(2) from the path src to name inside dir.
+func clonefileAt(src string, dir *os.File, name string) error {
+	return withFD(dir, func(dfd int) error {
+		if err := unix.Clonefileat(unix.AT_FDCWD, src, dfd, name, unix.CLONE_NOFOLLOW); err != nil {
+			return &os.LinkError{Op: "clonefileat", Old: src, New: name, Err: err}
+		}
+		return nil
+	})
+}
+
 // CloneOnly is the Cloner for a copy that must share extents with its source
 // (an artifact view): it calls clonefile(2) and nothing else. Where the clone
 // cannot be made (IsCloneUnsupported: another volume, or not APFS) it fails
@@ -66,6 +94,15 @@ func (CloneOnly) Clone(src, dst string) (bool, error) {
 	// CLONE_NOFOLLOW: a symlink at src is cloned as itself, never followed.
 	if err := unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW); err != nil {
 		return false, &os.LinkError{Op: "clonefile", Old: src, New: dst, Err: err}
+	}
+	return true, nil
+}
+
+// cloneAt CoW-clones src to name inside dir with clonefileat(2). It never
+// copies.
+func (CloneOnly) cloneAt(src string, dir *os.File, name string) (bool, error) {
+	if err := clonefileAt(src, dir, name); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -224,6 +261,22 @@ func renameFromStage(stage *os.File, name, dst string) error {
 		return &os.LinkError{Op: "renameat", Old: name, New: dst, Err: renErr}
 	}
 	return nil
+}
+
+// assertNoQuarantineAt is assertNoQuarantine on name inside dir, opened
+// without following a link so the check reads the entry that is there.
+func assertNoQuarantineAt(dir *os.File, name string) error {
+	f, err := openNoFollowAt(dir, name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return withFD(f, func(fd int) error {
+		if _, err := unix.Fgetxattr(fd, QuarantineXattr, nil); err == nil {
+			return ErrQuarantined
+		}
+		return nil // ENOATTR, no xattr support, or an unexpected error: as assertNoQuarantine
+	})
 }
 
 // assertNoQuarantine returns ErrQuarantined if path carries the
