@@ -18,6 +18,7 @@ package image
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"strings"
 	"testing"
@@ -232,6 +233,7 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 		name       string
 		hooks      func(f *gcFixture, keep string) *pruneHooks
 		prep       func(t *testing.T, f *gcFixture, keep string)
+		edit       func(plan *PrunePlan, keep string)
 		wantString string
 		want       *SkipRefusal // Digest is filled in by the loop
 	}{
@@ -254,6 +256,25 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 			},
 			wantString: "dropped by guard: bogus",
 			want:       &SkipRefusal{Kind: RefusedByGuard, Reason: EvictKeptUnlinkFailed},
+		},
+		{
+			// A guard entry keyed by the empty digest drops nothing: the other
+			// blob, planned with no digest, is still removed.
+			name: "guard entry for the empty digest drops nothing",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{guard: func() (map[string]evictReason, error) {
+					return map[string]evictReason{"": evictShared, keep: evictShared}, nil
+				}}
+			},
+			edit: func(plan *PrunePlan, keep string) {
+				for i := range plan.Delete {
+					if plan.Delete[i].Node.Digest != keep {
+						plan.Delete[i].Node.Digest = ""
+					}
+				}
+			},
+			wantString: "dropped by guard: shared",
+			want:       &SkipRefusal{Kind: RefusedByGuard, Reason: EvictKeptShared},
 		},
 		{
 			name:       "unlink seam refusal",
@@ -320,7 +341,7 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newGCFixture(t)
-			f.blob("typed-a", time.Hour)
+			a := f.blob("typed-a", time.Hour)
 			b := f.blob("typed-b", time.Hour)
 			nodes, err := f.cache.EnumerateBlobs()
 			if err != nil {
@@ -333,6 +354,9 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 			if tc.prep != nil {
 				tc.prep(t, f, b)
 			}
+			if tc.edit != nil {
+				tc.edit(plan, b)
+			}
 			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, tc.hooks(f, b))
 			if err != nil {
 				t.Fatalf("executePrune: %v", err)
@@ -343,6 +367,12 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 			s := rep.Skipped[0]
 			if s.Reason != tc.wantString {
 				t.Errorf("Reason = %q; want %q byte-for-byte", s.Reason, tc.wantString)
+			}
+			if blobOnDisk(t, f, a) {
+				t.Errorf("unrefused blob %s is still on disk", a)
+			}
+			if tc.want != nil && !blobOnDisk(t, f, b) {
+				t.Errorf("refused blob %s was removed anyway", b)
 			}
 			if tc.want == nil {
 				if s.Refusal != nil {
@@ -357,4 +387,22 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 			}
 		})
 	}
+}
+
+// blobOnDisk reports whether digest's blob file is present, by Lstat of its
+// path so a symlink left in its place still counts as present.
+func blobOnDisk(t *testing.T, f *gcFixture, digest string) bool {
+	t.Helper()
+	p, err := f.cache.BlobPath(digest)
+	if err != nil {
+		t.Fatalf("BlobPath: %v", err)
+	}
+	_, err = os.Lstat(p)
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Lstat %s: %v", p, err)
+	}
+	return false
 }
