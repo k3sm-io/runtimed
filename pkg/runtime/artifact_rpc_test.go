@@ -256,10 +256,13 @@ func TestPullArtifactRefusedWithoutClusterRegistry(t *testing.T) {
 }
 
 // scriptedArtifactPuller is a fake ArtifactPuller: it can block every pull on
-// gate, records the peak number of pulls in flight, and fails with err.
+// gate, records the peak number of pulls in flight, and fails with err. A
+// pull that passes err runs the WithHold callback, as *artifact.Puller does,
+// then fails with afterHold's error when it is set (a failed re-check).
 type scriptedArtifactPuller struct {
 	gate           chan struct{}
 	err            error
+	afterHold      func() error
 	active, peak   atomic.Int32
 	entered        chan struct{}
 	hostCheckCalls atomic.Int32
@@ -273,7 +276,7 @@ func (s *scriptedArtifactPuller) CheckHost(ref string) error {
 	return nil
 }
 
-func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string, _ ...artifact.PullOption) (*artifact.Result, error) {
+func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string, opts ...artifact.PullOption) (*artifact.Result, error) {
 	if err := s.CheckHost(ref); err != nil {
 		return nil, err
 	}
@@ -298,7 +301,16 @@ func (s *scriptedArtifactPuller) PullArtifact(ctx context.Context, ref string, _
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &artifact.Result{ManifestDigest: sha([]byte("m"))}, nil
+	res := &artifact.Result{ManifestDigest: sha([]byte("m")), ConfigDigest: sha([]byte("c")), LayerDigests: []string{sha([]byte("l"))}}
+	if err := artifact.RunHold(ctx, res, opts...); err != nil {
+		return nil, err
+	}
+	if s.afterHold != nil {
+		if err := s.afterHold(); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
 }
 
 func (s *scriptedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {

@@ -102,7 +102,9 @@ var (
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
-	ErrBlobReclaimed      = errors.New("artifact: a blob was reclaimed during the pull and is still absent after a refetch")
+	// ErrBlobReclaimed reports a blob the pull's re-check found unlinked by a
+	// reclaim pass and still absent after its one refetch.
+	ErrBlobReclaimed = errors.New("artifact: a blob was reclaimed during the pull and is still absent after a refetch")
 	// ErrGuestLayersMismatch reports a guest manifest whose layers or config
 	// are not the set PullGuestArtifact was told to expect.
 	ErrGuestLayersMismatch = errors.New("artifact: the guest manifest does not declare exactly the expected layers")
@@ -501,7 +503,10 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	// its pins from now on keeps them. A pass that planned a blob before the
 	// lease existed can still have unlinked it after the presence check, so
 	// the blobs are checked again, still under the lease, and what is gone is
-	// fetched once more.
+	// fetched once more. This narrows the race rather than closing it:
+	// reclaim's lease check and its unlink are not atomic with AcquireLease,
+	// so a pull that fits entirely between the two can still lose a blob
+	// after this re-check.
 	if err := p.recheck(ctx, ref, cred, need, res); err != nil {
 		return nil, err
 	}
@@ -513,12 +518,36 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 }
 
 // WithHold runs hold after the pull's record is written and before the pull
-// re-checks its blobs, while the pull's lease still pins them. A caller whose
-// own durable reference (a pod's hold) must name the blobs passes it here, so
-// that the re-check covers the moment the lease stops being the only pin. An
-// error from hold fails the pull, unwrapped beyond what hold returns.
+// re-checks its blobs. A caller whose own durable reference (a pod's hold)
+// must name the blobs passes it here, so that the re-check covers the moment
+// the lease stops being the only pin.
+//
+// The contract:
+//   - hold is called at most once per pull, and only after the record is
+//     written, with the pull's lease live.
+//   - Inside hold only the Result's ManifestDigest, ConfigDigest and
+//     LayerDigests are valid: Lease is nil, and Fetched is provisional (the
+//     re-check may still set it).
+//   - An error from hold fails the pull with that error.
+//   - The hold may already be written when the pull then fails (the re-check
+//     refetch fails, or ErrBlobReclaimed): the caller owns it and releases it
+//     on that failure.
 func WithHold(hold func(context.Context, *Result) error) PullOption {
 	return func(o *pullOptions) { o.hold = hold }
+}
+
+// RunHold runs the WithHold callback among opts, if any, against res. It is
+// how an ArtifactPuller other than *Puller (a test double) honours WithHold;
+// *Puller runs the callback itself, inside the pull.
+func RunHold(ctx context.Context, res *Result, opts ...PullOption) error {
+	o, err := applyOptions(opts)
+	if err != nil {
+		return err
+	}
+	if o.hold == nil {
+		return nil
+	}
+	return o.hold(ctx, res)
 }
 
 // recheck confirms every blob in need is still committed, and fetches the ones
