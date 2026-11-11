@@ -48,7 +48,8 @@ import (
 // layer blob it serves itself: the first cut GETs of that blob stop after cutAt
 // bytes, the first badRange ranged GETs are answered with a Content-Range
 // that is not the one asked for, and every layer GET's Range header is
-// recorded.
+// recorded. With wholeOn200 set, an uncut GET ignores its Range header and
+// is answered with a plain 200 and the whole body.
 type cutRegistry struct {
 	host     string
 	ref      string
@@ -60,6 +61,17 @@ type cutRegistry struct {
 	cuts     int      // GETs still to cut
 	badRange int      // ranged GETs still to answer with a wrong Content-Range
 	ranges   []string // the Range header of every layer GET, in order
+	// wholeOn200 makes every uncut GET ignore Range and answer 200 whole.
+	wholeOn200 bool
+}
+
+// arm sets the fixture's fault counters under its mutex.
+func (c *cutRegistry) arm(cuts, badRange int, wholeOn200 bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cuts = cuts
+	c.badRange = badRange
+	c.wholeOn200 = wholeOn200
 }
 
 func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
@@ -107,7 +119,14 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 		if bad {
 			c.badRange--
 		}
+		whole := !cut && !bad && c.wholeOn200
 		c.mu.Unlock()
+		if whole {
+			w.Header().Set("Content-Length", strconv.FormatInt(c.size, 10))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(c.body)
+			return
+		}
 		if bad {
 			// The whole blob, labelled as a range from 0: not the offset asked for.
 			w.Header().Set("Content-Range", "bytes 0-"+strconv.FormatInt(c.size-1, 10)+"/"+strconv.FormatInt(c.size, 10))
@@ -212,6 +231,23 @@ func verifyLayer(t *testing.T, cache *Cache, c *cutRegistry) {
 	}
 }
 
+// layerBytesEqual reads the committed layer blob and compares it byte for
+// byte with the body the registry served.
+func layerBytesEqual(t *testing.T, cache *Cache, c *cutRegistry) {
+	t.Helper()
+	path, err := cache.BlobPath(c.layer.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("committed layer: %v", err)
+	}
+	if !bytes.Equal(got, c.body) {
+		t.Fatalf("committed layer bytes differ from the served body (%d bytes, want %d)", len(got), len(c.body))
+	}
+}
+
 // TestPullResumesCutLayerWithRange pins the resumable layer fetch: a pull cut
 // mid-layer keeps the bytes it received, the next pull asks for the rest with
 // a Range request and completes with the layer verifying, and a partial whose
@@ -221,7 +257,7 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 
 	t.Run("cut layer resumes from the bytes received", func(t *testing.T) {
 		c := newCutRegistry(t, cutAt)
-		c.cuts = 1
+		c.arm(1, 0, false)
 		cache, err := NewCache(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -253,6 +289,7 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 			t.Fatalf("second pull layer Range headers = %q, want [%q]", got, want)
 		}
 		verifyLayer(t, cache, c)
+		layerBytesEqual(t, cache, c)
 		if _, err := os.Stat(partialPath(dir, c.layer)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("partial survived its commit: %v", err)
 		}
@@ -303,8 +340,7 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 
 	t.Run("wrong range answer removes the partial and fetches the layer whole", func(t *testing.T) {
 		c := newCutRegistry(t, cutAt)
-		c.cuts = 1
-		c.badRange = 1
+		c.arm(1, 1, false)
 		cache, err := NewCache(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -341,6 +377,53 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 			t.Fatalf("pull over a wrong range answer made %d ranged requests, want 1", ranged)
 		}
 	})
+}
+
+// TestPullResumesRestartsOn200ToRange pins the restart branch of the resumable
+// layer fetch: a registry that answers the resume's Range request with a plain
+// 200 and the whole body makes the pull drop the partial's prefix and write
+// the body from 0, so the committed layer is the body and not prefix+body.
+func TestPullResumesRestartsOn200ToRange(t *testing.T) {
+	const cutAt = 4096
+	c := newCutRegistry(t, cutAt)
+	c.arm(1, 0, true)
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "partials")
+	p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+
+	if _, err := pullAlways(p, c.ref); err == nil {
+		t.Fatal("first pull succeeded through a cut layer")
+	}
+	fi, err := os.Stat(partialPath(dir, c.layer))
+	if err != nil {
+		t.Fatalf("no partial after the cut pull: %v", err)
+	}
+	if fi.Size() != cutAt {
+		t.Fatalf("partial holds %d bytes, want %d", fi.Size(), cutAt)
+	}
+
+	res, err := pullAlways(p, c.ref)
+	if err != nil {
+		t.Fatalf("pull over a 200 answer to a Range request: %v", err)
+	}
+	res.Lease.Release()
+	ranged := 0
+	for _, r := range c.takeRanges() {
+		if r != "" {
+			ranged++
+		}
+	}
+	if ranged != 1 {
+		t.Fatalf("pulls made %d ranged requests, want 1", ranged)
+	}
+	verifyLayer(t, cache, c)
+	layerBytesEqual(t, cache, c)
+	if _, err := os.Stat(partialPath(dir, c.layer)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial survived its commit: %v", err)
+	}
 }
 
 // TestPullResumesFallsBackOnPartialStoreEnv pins that a partial store whose
