@@ -307,6 +307,21 @@ func (s *rootSet) inUseDigests() map[string]struct{} {
 	return digestsOf(s.pods, s.holds)
 }
 
+// InUseDigests returns every non-empty blob digest a per-pod record or a pod's
+// artifact hold names right now: the config and layers of the images and
+// artifacts a pod runs (a hold's manifest digest is not a blob it names, so it
+// is not in the set). untracked narrows a pod dir with no record exactly as it
+// narrows a reclaim pass's root set (see roots). It reads the same fail-closed
+// root set Roots does, so any condition Roots refuses returns
+// ErrRootsIncomplete and no set at all, never a partial one.
+func (c *Cache) InUseDigests(untracked UntrackedPodFunc) (map[string]struct{}, error) {
+	cr, err := c.classifiedRoots(untracked)
+	if err != nil {
+		return nil, err
+	}
+	return cr.inUseDigests(), nil
+}
+
 // digestsOf unions the non-empty blob digests of every root in groups.
 func digestsOf(groups ...[]ImageRoot) map[string]struct{} {
 	out := make(map[string]struct{})

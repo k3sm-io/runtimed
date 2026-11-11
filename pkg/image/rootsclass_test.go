@@ -192,3 +192,39 @@ func TestClassifiedRootsSplitsRootedFromInUse(t *testing.T) {
 		t.Fatalf("classifiedRoots = %v, %v; want nil, ErrRootsIncomplete", got, err)
 	}
 }
+
+// TestInUseDigests pins the exported in-use reader: a pod record's and a pod
+// hold's blobs are in the set, operator, artifact-record and unrooted blobs are
+// not, and a pod dir with no record fails closed with ErrRootsIncomplete and no
+// set, unless untracked clears that pod.
+func TestInUseDigests(t *testing.T) {
+	t.Parallel()
+	r := newRootsFixture(t)
+	c := r.f.cache
+	got, err := c.InUseDigests(nil)
+	if err != nil {
+		t.Fatalf("InUseDigests: %v", err)
+	}
+	want := map[string]struct{}{}
+	for _, d := range []string{r.podCfg, r.podLayer, r.shared, r.holdCfg, r.holdLayer} {
+		want[d] = struct{}{}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("InUseDigests = %v; want %v", got, want)
+	}
+	for _, d := range []string{r.opCfg, r.opLayer, r.artCfg, r.artLayer, r.orphan} {
+		if _, ok := got[d]; ok {
+			t.Errorf("InUseDigests names %s, which no pod record or hold names", d)
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Join(c.PodsRoot(), "pod-b"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got, err := c.InUseDigests(nil); !errors.Is(err, ErrRootsIncomplete) || got != nil {
+		t.Fatalf("InUseDigests with an unrecorded pod = %v, %v; want nil, ErrRootsIncomplete", got, err)
+	}
+	if got, err := c.InUseDigests(func(PodID) bool { return true }); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("InUseDigests(untracked) = %v, %v; want %v, nil", got, err, want)
+	}
+}
