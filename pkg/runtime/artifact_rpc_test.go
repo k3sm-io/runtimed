@@ -256,9 +256,10 @@ func TestPullArtifactRefusedWithoutClusterRegistry(t *testing.T) {
 }
 
 // scriptedArtifactPuller is a fake ArtifactPuller: it can block every pull on
-// gate, records the peak number of pulls in flight, and fails with err. A
-// pull that passes err runs the WithHold callback, as *artifact.Puller does,
-// then fails with afterHold's error when it is set (a failed re-check).
+// gate, records the peak number of pulls in flight, and fails with err. err is
+// returned before the WithHold callback runs. A pull that passes err runs the
+// callback (artifact.RunHold), then fails with afterHold's error when it is
+// set (a failed re-check).
 type scriptedArtifactPuller struct {
 	gate           chan struct{}
 	err            error
