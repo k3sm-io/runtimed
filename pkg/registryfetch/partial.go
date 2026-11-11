@@ -54,6 +54,10 @@ var (
 	// ErrPartialFile reports a partial path that is not a regular file (a
 	// FIFO, a directory, a device planted in its place).
 	ErrPartialFile = errors.New("registryfetch: partial is not a regular file")
+	// ErrCommitFileUnsupported is the answer a Fill.CommitFile gives when it
+	// cannot commit the partial in place (another volume, no clone support);
+	// Resume then commits through Commit and its replay instead.
+	ErrCommitFileUnsupported = errors.New("registryfetch: partial cannot be committed in place")
 )
 
 // PartialDirError is the error for a partial dir that is not a private
@@ -410,6 +414,16 @@ type Fill struct {
 	// Commit consumes the complete partial: replay writes all of it, from
 	// byte 0, to w. Commit is where the whole file is re-hashed.
 	Commit func(replay func(w io.Writer) error) error
+	// CommitFile, when set, consumes the complete partial in place of Commit,
+	// so a caller that can take the file as it is (a copy-on-write clone it
+	// then re-hashes) does not write the blob a second time. f is a read-only
+	// descriptor of the partial, opened O_NOFOLLOW and checked to be the same
+	// file Transfer wrote, exactly Size bytes long; Resume closes it after
+	// CommitFile returns, and CommitFile may close it first. An error
+	// matching ErrCommitFileUnsupported means nothing was committed and
+	// Resume falls back to Commit; any other error is the commit's verdict
+	// and goes through Poisoned like a Commit error.
+	CommitFile func(f *os.File) error
 	// Poisoned reports a Commit error that condemns the partial's bytes (a
 	// digest mismatch, an overrun); the partial is then removed. A nil
 	// Poisoned condemns every Commit error: keeping bytes is the choice a
@@ -420,7 +434,8 @@ type Fill struct {
 // Resume brings one blob through its partial: Admit(Digest, Size), ensure
 // Dir, open the partial (O_NOFOLLOW, a regular file only; see openPartial),
 // restart an overlong one, let Transfer complete a short one from its current
-// length, then hand the whole file to Commit. A poisoned
+// length, then hand the whole file to CommitFile when it is set (falling
+// back to Commit on ErrCommitFileUnsupported) or else to Commit. A poisoned
 // partial is removed so it is never resumed; a committed one is removed.
 //
 // After a Transfer that returns nil the file must be exactly Size bytes, else
@@ -470,13 +485,27 @@ func (s *PartialStore) Resume(fl Fill) error {
 			return err
 		}
 	}
-	err = fl.Commit(func(w io.Writer) error {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
+	committed := false
+	if fl.CommitFile != nil {
+		// A reopen failure is not the commit's verdict: it is returned as
+		// it is and the partial is left alone.
+		ro, rerr := reopenReadOnly(f, path, fl)
+		if rerr != nil {
+			return rerr
 		}
-		_, err := io.Copy(w, struct{ io.Reader }{f})
-		return err
-	})
+		err = fl.CommitFile(ro)
+		_ = ro.Close() // read-only; CommitFile may already have closed it
+		committed = !errors.Is(err, ErrCommitFileUnsupported)
+	}
+	if !committed {
+		err = fl.Commit(func(w io.Writer) error {
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			_, err := io.Copy(w, struct{ io.Reader }{f})
+			return err
+		})
+	}
 	if err != nil {
 		if fl.Poisoned == nil || fl.Poisoned(err) {
 			// A poisoned partial must not survive to be resumed.
@@ -488,6 +517,44 @@ func (s *PartialStore) Resume(fl Fill) error {
 		s.Log.Warn("artifact pull: remove committed partial", "digest", fl.Digest, "err", err)
 	}
 	return nil
+}
+
+// reopenReadOnly opens the partial at path again for Fill.CommitFile:
+// O_RDONLY|O_NOFOLLOW (with O_NONBLOCK and O_NOCTTY, as in openPartial), and
+// required to be the inode of f, the read-write descriptor Transfer wrote,
+// and Size bytes long.
+func reopenReadOnly(f *os.File, path string, fl Fill) (*os.File, error) {
+	var fd int
+	var err error
+	for {
+		fd, err = unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reopen partial %s read-only: %w: %w", fl.Digest, ErrPartialFile, err)
+	}
+	ro := os.NewFile(uintptr(fd), path)
+	roInfo, err := ro.Stat()
+	if err != nil {
+		ro.Close()
+		return nil, fmt.Errorf("stat partial %s: %w", fl.Digest, err)
+	}
+	rwInfo, err := f.Stat()
+	if err != nil {
+		ro.Close()
+		return nil, fmt.Errorf("stat partial %s: %w", fl.Digest, err)
+	}
+	if !os.SameFile(roInfo, rwInfo) {
+		ro.Close()
+		return nil, fmt.Errorf("partial %s was replaced while open: %w", fl.Digest, ErrPartialFile)
+	}
+	if roInfo.Size() != fl.Size {
+		ro.Close()
+		return nil, fmt.Errorf("partial %s holds %d of %d bytes at commit: %w", fl.Digest, roInfo.Size(), fl.Size, ErrPartialLength)
+	}
+	return ro, nil
 }
 
 // checkLength refuses a partial that is not size bytes after a transfer,

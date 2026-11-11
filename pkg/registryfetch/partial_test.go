@@ -866,3 +866,103 @@ func TestRemove(t *testing.T) {
 		})
 	}
 }
+
+// TestResumeCommitFileSkipsReplay pins the in-place commit: with CommitFile
+// set, a partial that a Transfer completes is handed to CommitFile once, as a
+// read-only descriptor holding Size bytes, Commit never runs, and the partial
+// is removed after the commit.
+func TestResumeCommitFileSkipsReplay(t *testing.T) {
+	const size, have = 100, 40
+	data, digest := blobData(size)
+	s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+	if err := s.EnsureDir(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path(digest), data[:have], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	err := s.Resume(Fill{
+		Digest: digest, Size: size,
+		Transfer: func(f *os.File, off int64) error {
+			_, err := f.Write(data[off:])
+			return err
+		},
+		CommitFile: func(f *os.File) error {
+			calls++
+			fi, err := f.Stat()
+			if err != nil {
+				return err
+			}
+			if fi.Size() != size {
+				return fmt.Errorf("CommitFile got %d bytes, want %d", fi.Size(), size)
+			}
+			if _, err := f.WriteAt([]byte{0}, 0); err == nil {
+				return errors.New("CommitFile was handed a writable descriptor")
+			}
+			got, err := io.ReadAll(io.NewSectionReader(f, 0, size))
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(got, data) {
+				return errors.New("CommitFile read bytes that are not the blob")
+			}
+			return nil
+		},
+		Commit: func(func(io.Writer) error) error {
+			t.Error("Commit ran although CommitFile committed")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("CommitFile ran %d times, want 1", calls)
+	}
+	if _, err := os.Lstat(s.path(digest)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("committed partial survived: %v", err)
+	}
+}
+
+// TestResumeCommitFileUnsupportedFallsBackToReplay pins the fallback: a
+// CommitFile that answers ErrCommitFileUnsupported leaves the commit to
+// Commit, whose replay writes the whole blob once, and the partial is then
+// removed as after any commit.
+func TestResumeCommitFileUnsupportedFallsBackToReplay(t *testing.T) {
+	const size = 100
+	data, digest := blobData(size)
+	s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+	if err := s.EnsureDir(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path(digest), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var fileCalls, commitCalls int
+	var got []byte
+	commit := verifyCommit(digest, size, &got)
+	err := s.Resume(Fill{
+		Digest: digest, Size: size, Transfer: noTransfer(t),
+		CommitFile: func(*os.File) error {
+			fileCalls++
+			return fmt.Errorf("clone across volumes: %w", ErrCommitFileUnsupported)
+		},
+		Commit: func(replay func(io.Writer) error) error {
+			commitCalls++
+			return commit(replay)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if fileCalls != 1 || commitCalls != 1 {
+		t.Fatalf("CommitFile ran %d times and Commit %d, want 1 and 1", fileCalls, commitCalls)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("replay wrote %d bytes that are not the blob", len(got))
+	}
+	if _, err := os.Lstat(s.path(digest)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("committed partial survived: %v", err)
+	}
+}
