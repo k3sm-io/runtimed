@@ -127,6 +127,13 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	if err := r.refuseBesideUnadoptedHelper(box); err != nil {
 		return nil, err
 	}
+	// The native counterpart: a process group an earlier run started for this
+	// id that the reap left alive still uses the rootfs createPod would clear.
+	// Refused here, not inside createPod, whose failure path removes the pod
+	// dir (see ErrPodGroupStillAlive).
+	if err := r.refuseBesideLiveNativeGroup(box.GetPodId()); err != nil {
+		return nil, err
+	}
 
 	p, reason, err := r.createPod(ctx, box)
 	if err != nil {
