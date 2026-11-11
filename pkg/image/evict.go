@@ -18,6 +18,7 @@ package image
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -29,7 +30,8 @@ type evictReason string
 const (
 	// evictRooted marks a blob an operator root or an artifact record keeps.
 	// The prune plan alone does not tell a rooted blob from an in-use one
-	// (both are ReasonKeptInUse); the classified roots refine it later.
+	// (both are ReasonKeptInUse); refineEvictRooted relabels it from the
+	// classified roots.
 	evictRooted evictReason = "rooted"
 	// evictInUse marks a blob a daemon-authored root reaches.
 	evictInUse evictReason = "in-use"
@@ -133,4 +135,35 @@ func PlanEvict(plan *PrunePlan, target, others map[string]struct{}) (*EvictPlan,
 	}
 	sort.Strings(out.absent)
 	return out, nil
+}
+
+// refineEvictRooted returns a copy of plan in which every blob kept as
+// evictInUse that an operator root or an artifact record in roots names is
+// kept as evictRooted instead.
+//
+// PlanEvict has no roots input, so it cannot tell a rooted blob from an in-use
+// one: the prune plan keeps both as ReasonKeptInUse. This is the pure
+// refinement over the classified roots. It only relabels: Delete and absent
+// are copied unchanged, the kept set keeps exactly its digests, and no reason
+// other than evictInUse is touched. A blob a pod also names is still labelled
+// evictRooted, because the pod going away does not free it. A nil roots, an
+// empty digest and a digest only a pod names relabel nothing. A nil plan
+// returns nil.
+func refineEvictRooted(plan *EvictPlan, roots *rootSet) *EvictPlan {
+	if plan == nil {
+		return nil
+	}
+	out := &EvictPlan{
+		Delete: slices.Clone(plan.Delete),
+		kept:   make(map[string]evictReason, len(plan.kept)),
+		absent: slices.Clone(plan.absent),
+	}
+	rooted := roots.rootedDigests()
+	for dg, r := range plan.kept {
+		if _, ok := rooted[dg]; ok && r == evictInUse && dg != "" {
+			r = evictRooted
+		}
+		out.kept[dg] = r
+	}
+	return out
 }

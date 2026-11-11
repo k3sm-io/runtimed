@@ -18,6 +18,7 @@ package image
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -204,5 +205,78 @@ func TestPlanEvict(t *testing.T) {
 				t.Errorf("deleted+kept+absent = %d, want |T| = %d", n, len(tc.target))
 			}
 		})
+	}
+}
+
+// TestRefineEvictRooted pins the refinement over the classified roots: a blob
+// kept in use that an operator root or artifact record names becomes rooted,
+// nothing else changes, and no blob ever moves between kept and Delete.
+func TestRefineEvictRooted(t *testing.T) {
+	used, other := node('1', 10, time.Hour), node('2', 20, time.Hour)
+	gone := node('3', 30, time.Hour)
+	leased, shared := node('4', 40, time.Hour), node('5', 50, time.Hour)
+	root := func(ds ...string) []ImageRoot { return []ImageRoot{{Reference: "r", Layers: ds}} }
+	base := func() *EvictPlan {
+		return &EvictPlan{
+			Delete: []PruneDecision{{Node: gone, Reason: ReasonDeleteUnreferenced}},
+			kept: map[string]evictReason{
+				used.Digest:   evictInUse,
+				other.Digest:  evictInUse,
+				leased.Digest: evictLeased,
+				shared.Digest: evictShared,
+			},
+			absent: []string{"sha256:" + strings.Repeat("9", 64)},
+		}
+	}
+	keptWith := func(over map[string]evictReason) map[string]evictReason {
+		k := base().kept
+		for d, r := range over {
+			k[d] = r
+		}
+		return k
+	}
+	cases := []struct {
+		name  string
+		plan  func() *EvictPlan
+		roots *rootSet
+		want  map[string]evictReason
+	}{
+		{"operator root only", base, &rootSet{operator: root(used.Digest)},
+			keptWith(map[string]evictReason{used.Digest: evictRooted})},
+		{"artifact record only", base, &rootSet{artifacts: root(used.Digest)},
+			keptWith(map[string]evictReason{used.Digest: evictRooted})},
+		{"in use only", base, &rootSet{pods: root(used.Digest), holds: root(other.Digest)}, keptWith(nil)},
+		{"both rooted and in use", base, &rootSet{pods: root(used.Digest), operator: root(used.Digest)},
+			keptWith(map[string]evictReason{used.Digest: evictRooted})},
+		{"neither", base, &rootSet{operator: root(node('8', 1, 0).Digest)}, keptWith(nil)},
+		{"empty digest", func() *EvictPlan {
+			p := base()
+			p.kept[""] = evictInUse
+			return p
+		}, &rootSet{operator: root(""), artifacts: root("")}, keptWith(map[string]evictReason{"": evictInUse})},
+		{"nil roots", base, nil, keptWith(nil)},
+		{"rooted delete stays deleted", base, &rootSet{operator: root(gone.Digest)}, keptWith(nil)},
+		{"other reasons untouched", base, &rootSet{operator: root(leased.Digest, shared.Digest)}, keptWith(nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.plan()
+			before := tc.plan()
+			got := refineEvictRooted(in, tc.roots)
+			if !reflect.DeepEqual(got.kept, tc.want) {
+				t.Errorf("kept = %v; want %v", got.kept, tc.want)
+			}
+			// Relabel only: Delete and absent are unchanged, and the input is
+			// not mutated.
+			if !reflect.DeepEqual(got.Delete, before.Delete) || !reflect.DeepEqual(got.absent, before.absent) {
+				t.Errorf("Delete/absent changed: %v %v; want %v %v", got.Delete, got.absent, before.Delete, before.absent)
+			}
+			if !reflect.DeepEqual(in, before) {
+				t.Errorf("input plan mutated: %#v", in)
+			}
+		})
+	}
+	if refineEvictRooted(nil, &rootSet{}) != nil {
+		t.Error("nil plan refined to non-nil")
 	}
 }
