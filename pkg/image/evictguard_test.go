@@ -397,3 +397,27 @@ func TestEvictTreePerTreeCheck(t *testing.T) {
 		t.Fatalf("tree %s removed (%v); want it kept by the per-tree check", tree, err)
 	}
 }
+
+// TestUnlinkUnlessHeldSharedUnderLeaseMu pins that the per-blob shared-set
+// read runs under leaseMu: the sharedNow stub finds the lock held, so moving
+// the read out of the lock goes red.
+func TestUnlinkUnlessHeldSharedUnderLeaseMu(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	digest := f.blob("evict-shared-locked", time.Hour)
+	asked := false
+	removed, why, err := f.cache.unlinkUnlessHeld(digest, func() error { return nil }, nil, func(d string) (bool, error) {
+		asked = true
+		if d != digest {
+			t.Errorf("sharedNow asked about %s; want %s", d, digest)
+		}
+		if f.cache.leaseMu.TryLock() {
+			f.cache.leaseMu.Unlock()
+			t.Error("leaseMu not held across the shared-set read")
+		}
+		return false, nil
+	})
+	if err != nil || !removed || why != "" || !asked {
+		t.Fatalf("unlinkUnlessHeld = %v, %q, %v (sharedNow called %v); want removed", removed, why, err, asked)
+	}
+}
