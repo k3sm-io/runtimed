@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -243,8 +244,8 @@ func TestExecRefusesASymlinkLeavingTheRootfs(t *testing.T) {
 			if status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("Exec error = %v, want InvalidArgument", err)
 			}
-			if !strings.Contains(err.Error(), ErrImageArgvEscapes.Error()) {
-				t.Errorf("Exec error = %v, want it to name %q", err, ErrImageArgvEscapes)
+			if want := fmt.Sprintf("exec: %q resolves outside the container image and was refused", tc.cmd); status.Convert(err).Message() != want {
+				t.Errorf("Exec error = %v, want the reply %q", err, want)
 			}
 			if got != "" {
 				t.Errorf("a refused exec reached the confinement seam with argv[0] %q", got)
