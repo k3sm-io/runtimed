@@ -41,6 +41,9 @@ var (
 	// ErrPartialBudget reports that growing a partial would take the store's
 	// regular files past MaxBytes.
 	ErrPartialBudget = errors.New("registryfetch: partial store over its byte budget")
+	// ErrPartialClaimed reports a Claim of a digest another claim holds; it
+	// is transient, unlike ErrInvalidDigest.
+	ErrPartialClaimed = errors.New("registryfetch: partial already claimed")
 )
 
 // PartialDirError is the error for a partial dir that is not a private
@@ -65,6 +68,16 @@ var (
 // either by its own means or with Claim. A PartialStore must not be copied
 // after first use.
 //
+// Sweep protects only claimed digests, so every Resume caller that shares a
+// store with a Sweep must hold the digest's Claim for the whole Resume. Admit
+// is advisory (two concurrent Admits can both pass) and counts every regular
+// file in Dir by apparent size.
+//
+// Trust: Dir's parent path is trusted, i.e. root-owned or otherwise writable
+// only by this principal. O_NOFOLLOW and the descriptor-relative operations
+// cover only Dir's last component and its entries; a writable ancestor could
+// swap the path above Dir.
+//
 // Locking: mu guards claimed and nothing else. Claim and its release take it
 // for a map update; Sweep holds it across the claimed check and the unlink of
 // each one entry, so a Claim cannot land between the two. No method calls out
@@ -84,17 +97,19 @@ type PartialStore struct {
 }
 
 // Claim makes the caller the one writer of digest's partial within this
-// store. It never blocks: ok is false when the digest is already claimed (or
-// is not sha256:<64 hex>), and release is then a no-op. release ends the
-// claim and is idempotent.
-func (s *PartialStore) Claim(digest string) (release func(), ok bool) {
+// store. It never blocks. The error tells the two refusals apart: one
+// matching ErrPartialClaimed means the digest is held by another claim and a
+// later retry can succeed; one matching ErrInvalidDigest means the digest is
+// not sha256:<64 hex> and no retry ever will. On error release is a no-op,
+// never nil. release ends the claim and is idempotent.
+func (s *PartialStore) Claim(digest string) (release func(), err error) {
 	if !sha256Digest.MatchString(digest) {
-		return func() {}, false
+		return func() {}, fmt.Errorf("claim %s: %w", quoteBounded(digest, 128), ErrInvalidDigest)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, held := s.claimed[digest]; held {
-		return func() {}, false
+		return func() {}, fmt.Errorf("claim %s: %w", digest, ErrPartialClaimed)
 	}
 	if s.claimed == nil {
 		s.claimed = make(map[string]struct{})
@@ -107,14 +122,26 @@ func (s *PartialStore) Claim(digest string) (release func(), ok bool) {
 			delete(s.claimed, digest)
 			s.mu.Unlock()
 		})
-	}, true
+	}, nil
 }
 
 // Admit reports whether digest's partial may grow to want bytes: the sizes of
-// every other regular file in Dir (Lstat, links never followed) plus want must
-// not exceed MaxBytes, else the error matches ErrPartialBudget. Digest's own
-// current partial is left out of the sum, since want replaces it. A zero
-// MaxBytes admits everything; a missing Dir counts as empty.
+// every other regular file in Dir plus want must not exceed MaxBytes, else the
+// error matches ErrPartialBudget. Every regular file in Dir counts, whatever
+// its name, by its apparent size (st_size from fstatat AT_SYMLINK_NOFOLLOW,
+// not allocated blocks); links are never followed and other kinds of entry
+// are not counted. Digest's own current partial is left out of the sum, since
+// want replaces it. A zero MaxBytes admits everything; a missing Dir counts
+// as empty.
+//
+// With a cap set Admit fails closed: want is a registry-supplied size, so a
+// negative want or one past MaxBytes is refused before Dir is read, and the
+// sum is compared without overflow, so no size wraps it negative.
+//
+// Admit is advisory: it reads Dir and decides, holding nothing, so two
+// concurrent Admits for different digests can both pass and together take
+// the store past MaxBytes. A caller that needs a hard bound serializes its
+// Admit-then-grow sequences itself.
 func (s *PartialStore) Admit(digest string, want int64) error {
 	if !sha256Digest.MatchString(digest) {
 		return fmt.Errorf("partial %s: %w", quoteBounded(digest, 128), ErrInvalidDigest)
@@ -122,22 +149,24 @@ func (s *PartialStore) Admit(digest string, want int64) error {
 	if s.MaxBytes <= 0 {
 		return nil
 	}
+	if want < 0 || want > s.MaxBytes {
+		return fmt.Errorf("partial %s wants %d bytes, cap is %d: %w",
+			digest, want, s.MaxBytes, ErrPartialBudget)
+	}
 	own := filepath.Base(s.path(digest))
-	total := want
+	total := want // invariant: 0 <= total <= s.MaxBytes
 	err := s.eachEntry(func(fd int, name string, st *unix.Stat_t) error {
-		if name != own && st.Mode&unix.S_IFMT == unix.S_IFREG {
-			total += st.Size
+		if name == own || st.Mode&unix.S_IFMT != unix.S_IFREG {
+			return nil
 		}
+		if st.Size < 0 || st.Size > s.MaxBytes-total {
+			return fmt.Errorf("partial %s wants %d bytes, other files exceed the %d left of %d: %w",
+				digest, want, s.MaxBytes-want, s.MaxBytes, ErrPartialBudget)
+		}
+		total += st.Size
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	if want < 0 || total > s.MaxBytes {
-		return fmt.Errorf("partial %s wants %d bytes, store would hold %d of %d: %w",
-			digest, want, total, s.MaxBytes, ErrPartialBudget)
-	}
-	return nil
+	return err
 }
 
 // Sweep removes the partials whose mtime is older than maxAge at now and
@@ -146,9 +175,13 @@ func (s *PartialStore) Admit(digest string, want int64) error {
 // or a foreign name is left alone. Dir is opened O_NOFOLLOW and every entry
 // is stat'ed and unlinked relative to that descriptor (fstatat
 // AT_SYMLINK_NOFOLLOW, unlinkat without AT_REMOVEDIR), so neither a swapped
-// path component nor a link in an entry's place redirects a removal. A
-// missing Dir sweeps nothing. Per-entry failures are joined; the sweep goes
-// on past them.
+// entry nor a link in an entry's place redirects a removal. A missing Dir
+// sweeps nothing. Per-entry failures are joined; the sweep goes on past them.
+//
+// Sweep protects only claimed digests: it does not know about a Resume in
+// progress, so it can unlink the partial of an unclaimed one out from under
+// it. Every Resume caller that shares a store with a Sweep must therefore
+// hold the digest's Claim for the whole Resume.
 func (s *PartialStore) Sweep(now time.Time, maxAge time.Duration) (removed int, err error) {
 	cutoff := now.Add(-maxAge)
 	var errs []error
