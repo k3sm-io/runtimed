@@ -1104,7 +1104,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// record would otherwise create it first at its own, wider mode.
 	if err := os.MkdirAll(podDir, 0o750); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("create pod dir %s: %w", podDir, err)
+			vmPodStartError(box.GetPodId(), "its directory could not be created", fmt.Errorf("create pod dir %s: %w", podDir, err))
 	}
 	// The pod dir's reachability record, at the same point in the sequence the
 	// host-process spine writes it: the moment the dir exists, and BEFORE any
@@ -1152,7 +1152,8 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// binder owns their dirs), and a bind's subPath is applied guest-side.
 	if err := mount.MaterializeShares(ctx, box, podDir, plan, podIP, r.resolver); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err)
+			vmPodStartError(box.GetPodId(), "its volume shares could not be prepared",
+				fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err))
 	}
 	// Provision each PVC's stable dir on the storage root. MaterializeShares
 	// deliberately skips these — pkg/volume owns a claim's lifecycle — and until
@@ -1173,7 +1174,8 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	if hasPersistentVolume(box) {
 		if _, berr := r.binder.Provision(ctx, box); berr != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-				fmt.Errorf("provision persistent volumes for pod %s: %w", box.GetPodId(), berr)
+				vmPodStartError(box.GetPodId(), "its persistent volumes could not be provisioned",
+					fmt.Errorf("provision persistent volumes for pod %s: %w", box.GetPodId(), berr))
 		}
 	}
 	// Every container is resolved host-side: the four-quadrant merge of
@@ -1222,9 +1224,10 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	if err := r.vmBackend.CreateVM(ctx, spec); err != nil {
 		// Every sub-cause is SANDBOX_SETUP at the enum level — the runtime/v1
 		// taxonomy has no finer bucket for "the guest did not come up" — the
-		// error's own message names which one and where the console log is.
+		// error's own message names which one and where the console log is,
+		// so it goes to the daemon log and the client reads a fixed sentence.
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-			fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err)
+			vmPodStartError(box.GetPodId(), "its vm could not be created", fmt.Errorf("create vm for pod %s: %w", box.GetPodId(), err))
 	}
 
 	// The guest is up. Assemble the pod and start its two supervision goroutines.
@@ -2506,6 +2509,13 @@ func procRecordStartError(name string, err error) error {
 // could not be recorded; err, kept as is, names the image root's paths.
 func imageRecordError(ref string, err error) error {
 	return withClientMessage(fmt.Sprintf("image %q could not be recorded for the pod; the daemon log has the cause", ref), err)
+}
+
+// vmPodStartError is the pod-level failure of vm pod podID whose host-side step
+// failed with err, which names host paths (the pod dir, a share root, a claim
+// dir, the console log). what says which step, in the pod's own terms.
+func vmPodStartError(podID, what string, err error) error {
+	return withClientMessage(fmt.Sprintf("pod %s: %s; the daemon log has the cause", podID, what), err)
 }
 
 // logOpenStartError is the start failure for container name whose CRI log

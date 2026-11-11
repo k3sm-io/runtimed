@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -40,18 +41,35 @@ func (configFailWorld) ImageRunConfig(*runtimev1.ImageManifest) (image.ImageRunC
 	return image.ImageRunConfig{}, configReadErr
 }
 
+// consoleDetail marks the console log path a failed vm boot names.
+const consoleDetail = "CONSOLE-DETAIL"
+
 // TestVMStartFailureMessageHidesHostPaths pins what a vm pod's CreatePod
-// reply says when its image cannot be pulled or its config cannot be read: a
-// fixed sentence naming only the pod's image reference, while the daemon's one
-// Error line carries the full error with the host blob path.
+// reply says when one of its host-side steps fails: a fixed sentence naming
+// only what the pod wrote (container name, image reference, pod id), while the
+// daemon's one Error line carries the full error with the host path. A
+// container's failure keeps the "container <name>:" token a consumer
+// attributes it by, at the start of the sentence.
 func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 	const ref = "example.test/vmapp:v1"
+	type env struct {
+		rt     *Runtime
+		vmb    *fakeVMBackend
+		box    *runtimev1.PodBox
+		podDir string
+	}
 	for i, tc := range []struct {
-		name     string
-		world    func(w *imageWorld) Unpacker
+		name  string
+		world func(w *imageWorld) Unpacker
+		setup func(t *testing.T, e env)
+		// pod is set for a pod-level failure, whose sentence starts with
+		// "pod <id>:"; otherwise it starts with "container app:".
+		pod      bool
+		reason   runtimev1.FailureReason
 		sentence string
+		created  int
 		marker   string
-		wants    []string
+		wants    func(e env) []string
 	}{
 		{
 			name: "pull",
@@ -59,44 +77,151 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 				w.failsWith(ref, &fs.PathError{Op: "open", Path: "/var/k3sm/blobs/PULL-DETAIL/sha256", Err: fs.ErrPermission})
 				return w
 			},
+			reason:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
 			sentence: "could not be pulled; the daemon log has the cause",
 			marker:   "PULL-DETAIL",
-			wants:    []string{"pull image", fs.ErrPermission.Error()},
+			wants:    func(env) []string { return []string{"pull image", fs.ErrPermission.Error()} },
 		},
 		{
 			name:     "config-read",
 			world:    func(w *imageWorld) Unpacker { return configFailWorld{w} },
+			reason:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
 			sentence: "could not be read; the daemon log has the cause",
 			marker:   configDetail,
-			wants:    []string{"read image config for", fs.ErrPermission.Error()},
+			wants:    func(env) []string { return []string{"read image config for", fs.ErrPermission.Error()} },
+		},
+		{
+			// A directory where the pod's image record belongs: the record of
+			// the pulled image cannot be read back, naming the pod dir.
+			name: "image-record",
+			setup: func(t *testing.T, e env) {
+				if err := os.MkdirAll(filepath.Join(e.podDir, image.PodReferencesName), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			reason:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			sentence: "could not be recorded for the pod; the daemon log has the cause",
+			marker:   "record image references for pod",
+			wants:    func(e env) []string { return []string{e.podDir} },
+		},
+		{
+			// A file where the pod dir belongs.
+			name: "pod-dir",
+			setup: func(t *testing.T, e env) {
+				if err := os.MkdirAll(filepath.Dir(e.podDir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(e.podDir, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "its directory could not be created; the daemon log has the cause",
+			marker:   "create pod dir",
+			wants:    func(e env) []string { return []string{e.podDir} },
+		},
+		{
+			// A file where the rootfs share root belongs.
+			name: "volume-shares",
+			setup: func(t *testing.T, e env) {
+				if err := os.MkdirAll(e.podDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(e.podDir, "rootfs"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "its volume shares could not be prepared; the daemon log has the cause",
+			marker:   "materialize vm volume shares",
+			wants:    func(e env) []string { return []string{filepath.Join(e.podDir, "rootfs")} },
+		},
+		{
+			// A file where the PV storage root belongs.
+			name: "provision",
+			setup: func(t *testing.T, e env) {
+				e.box.Volumes = []*runtimev1.Volume{{
+					Name:                  "data",
+					PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "pgdata"},
+				}}
+				e.box.Containers[0].VolumeMounts = []*runtimev1.VolumeMount{{Name: "data", MountPath: "/data"}}
+				if err := os.WriteFile(filepath.Join(e.rt.cfg.Root, "storage"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "its persistent volumes could not be provisioned; the daemon log has the cause",
+			marker:   "provision persistent volumes",
+			wants: func(e env) []string {
+				return []string{filepath.Join(e.rt.cfg.Root, "storage", "default", "pgdata")}
+			},
+		},
+		{
+			// The backend names the console log of the guest that did not
+			// come up.
+			name: "create-vm",
+			setup: func(_ *testing.T, e env) {
+				e.vmb.err = fmt.Errorf("guest did not come up; console log %s: %w",
+					"/var/k3sm/pods/"+consoleDetail+"/console.log", errors.New("boot timed out"))
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			sentence: "its vm could not be created; the daemon log has the cause",
+			created:  1,
+			marker:   consoleDetail,
+			wants:    func(env) []string { return []string{"create vm for pod", "boot timed out"} },
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			podID := fmt.Sprintf("pod-vm-start-msg-%d", i)
 			w := newImageWorld(map[string]image.ImageRunConfig{ref: {Entrypoint: []string{"/app"}}})
+			var u Unpacker = w
+			if tc.world != nil {
+				u = tc.world(w)
+			}
 			logs := &lockedBuffer{}
 			vmb := &fakeVMBackend{available: true, bootOK: true}
-			cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: w, Unpacker: tc.world(w)})
+			cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: w, Unpacker: u})
 			cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 			rt := newTestRuntimeCfg(t, cfg, d)
-			box := vmBoxWith(rt, fmt.Sprintf("pod-vm-start-msg-%d", i), nil,
-				[]*runtimev1.Container{{Name: "app", Image: ref}})
+			box := vmBoxWith(rt, podID, nil, []*runtimev1.Container{{Name: "app", Image: ref}})
+			id, err := image.ParsePodID(podID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := env{rt: rt, vmb: vmb, box: box, podDir: rt.cache.PodDir(id)}
+			if tc.setup != nil {
+				tc.setup(t, e)
+			}
 
 			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if resp.GetError() == nil {
-				t.Fatal("CreatePod succeeded through a failing image resolution")
+				t.Fatal("CreatePod succeeded through a failing host-side step")
 			}
-			if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL {
-				t.Errorf("failure_reason = %v, want IMAGE_PULL", got)
+			if got := resp.GetFailureReason(); got != tc.reason {
+				t.Errorf("failure_reason = %v, want %v", got, tc.reason)
 			}
-			if n, _ := vmb.created(); n != 0 {
-				t.Errorf("CreateVM called %d times after a failed image resolution; must be 0", n)
+			if n, _ := vmb.created(); n != tc.created {
+				t.Errorf("CreateVM called %d times, want %d", n, tc.created)
 			}
-			assertNoHostPaths(t, "CreatePod error", resp.GetError().GetMessage(), ref, ref, tc.sentence,
-				rt.cache.Root(), "/var/k3sm/blobs", "PULL-DETAIL", configDetail)
-			assertLoggedOnceAt(t, logs.String(), "level=ERROR", tc.marker, tc.wants)
+			msg := resp.GetError().GetMessage()
+			prefix, subject := "container app:", ref
+			if tc.pod {
+				prefix, subject = "pod "+podID+":", podID
+			}
+			assertNoHostPaths(t, "CreatePod error", msg, prefix, subject, tc.sentence,
+				rt.cfg.Root, rt.cache.Root(), e.podDir, "/var/k3sm", "PULL-DETAIL", configDetail,
+				consoleDetail)
+			if plain, err := strconv.Unquote(msg); err != nil || !strings.HasPrefix(plain, prefix) {
+				t.Errorf("CreatePod error %s does not start with %q (unquote: %v)", msg, prefix, err)
+			}
+			assertLoggedOnceAt(t, logs.String(), "level=ERROR", tc.marker, tc.wants(e))
 		})
 	}
 }
