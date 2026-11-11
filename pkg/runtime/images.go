@@ -361,8 +361,11 @@ type evictTarget struct {
 // NOT_FOUND is returned only when no source names the target. A reference
 // that the index resolves and that a live record names with another manifest
 // is REFERENCE_AMBIGUOUS, as is one that records name with several manifests.
-// Unreadable records fail closed (ErrIndexEntryCorrupt): the record a corrupt
-// one hides may be the one asked for.
+// A record matches by reference with the request's platform ignored, since a
+// record carries none. An undecodable record fails closed
+// (ErrIndexEntryCorrupt) only when the index missed, because the record it
+// hides may be the one asked for; when the index resolved the target it is
+// skipped for the ambiguity check and logged at Warn.
 func (s *imagesService) resolveEvictTarget(ctx context.Context, req *runtimev1.EvictImageRequest) (evictTarget, error) {
 	t, err := s.lookupEvictTarget(ctx, req)
 	if err != nil {
@@ -389,9 +392,12 @@ func (s *imagesService) evictTargetByDigest(ctx context.Context, d string) (evic
 	case !errors.Is(err, image.ErrIndexEntryNotFound):
 		return evictTarget{}, err
 	}
-	recs, err := s.evictRecords(ctx)
+	recs, corrupt, err := s.evictRecords(ctx)
 	if err != nil {
 		return evictTarget{}, err
+	}
+	if corrupt != nil {
+		return evictTarget{}, corrupt
 	}
 	if t, ok := evictTargetFromRecords(recs, func(r artifact.Record) bool { return r.ManifestDigest == d }); ok {
 		return t, nil
@@ -411,9 +417,13 @@ func (s *imagesService) evictTargetByReference(ctx context.Context, ref string, 
 	if ierr != nil && !errors.Is(ierr, image.ErrIndexEntryNotFound) {
 		return evictTarget{}, ierr
 	}
-	recs, err := s.evictRecords(ctx)
+	recs, corrupt, err := s.evictRecords(ctx)
 	if err != nil {
 		return evictTarget{}, err
+	}
+	if corrupt != nil && ierr != nil {
+		// The index missed: the undecodable record may be the one asked for.
+		return evictTarget{}, corrupt
 	}
 	byRef := func(r artifact.Record) bool { return r.Reference == ref }
 	manifests := make(map[string]struct{})
@@ -480,24 +490,35 @@ func evictTargetFromRecords(recs []artifact.Record, match func(artifact.Record) 
 }
 
 // evictRecords decodes every live artifact record. A record that does not
-// decode, or names no manifest, is ErrIndexEntryCorrupt.
-func (s *imagesService) evictRecords(ctx context.Context) ([]artifact.Record, error) {
+// decode, or names no manifest, is left out of recs, logged once at Warn with
+// its key (empty when the bytes do not decode far enough to name one), and
+// reported as corrupt, an ErrIndexEntryCorrupt for the first such record; the
+// caller decides whether it fails the call. err is a failure to read the
+// records at all.
+func (s *imagesService) evictRecords(ctx context.Context) (recs []artifact.Record, corrupt, err error) {
 	bufs, err := s.rt.index.ArtifactRecords(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := make([]artifact.Record, 0, len(bufs))
+	recs = make([]artifact.Record, 0, len(bufs))
 	for _, b := range bufs {
 		var r artifact.Record
-		if err := json.Unmarshal(b, &r); err != nil {
-			return nil, fmt.Errorf("%w: artifact record: %v", image.ErrIndexEntryCorrupt, err)
+		var bad error
+		if derr := json.Unmarshal(b, &r); derr != nil {
+			bad = fmt.Errorf("%w: artifact record: %v", image.ErrIndexEntryCorrupt, derr)
+		} else if r.ManifestDigest == "" {
+			bad = fmt.Errorf("%w: artifact record %q names no manifest digest", image.ErrIndexEntryCorrupt, r.Key)
 		}
-		if r.ManifestDigest == "" {
-			return nil, fmt.Errorf("%w: artifact record %q names no manifest digest", image.ErrIndexEntryCorrupt, r.Key)
+		if bad != nil {
+			s.rt.log.Warn("evict image: skipping an undecodable artifact record", "key", r.Key)
+			if corrupt == nil {
+				corrupt = bad
+			}
+			continue
 		}
-		out = append(out, r)
+		recs = append(recs, r)
 	}
-	return out, nil
+	return recs, corrupt, nil
 }
 
 // evictTargetBlobs is every distinct non-empty blob digest a manifest names:

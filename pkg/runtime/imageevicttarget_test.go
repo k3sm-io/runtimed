@@ -242,3 +242,40 @@ func TestEvictArtifactByReference(t *testing.T) {
 		t.Errorf("EvictImage(%s) = %v, want REFERENCE_AMBIGUOUS", s.refA, err)
 	}
 }
+
+// TestEvictCorruptRecordBlocksOnlyAnIndexMiss pins that an undecodable
+// artifact record does not block resolving a target the image index names
+// (it is skipped for the ambiguity check), while an index miss fails closed
+// FAILED_PRECONDITION with no detail, by reference and by digest, since the
+// hidden record may be the one asked for.
+func TestEvictCorruptRecordBlocksOnlyAnIndexMiss(t *testing.T) {
+	s := newEvictRPCScene(t)
+	if err := s.rt.index.PutArtifactRecord(context.Background(),
+		artifact.Key("registry.test/evict/corrupt:v1", "application/vnd.test.artifact"), []byte("{not json")); err != nil {
+		t.Fatal(err)
+	}
+	// The resolution step is called directly: past it, the reachability root
+	// set fails closed on the same record (ROOTS_INCOMPLETE), which is
+	// Cache.Evict's rule, not the target resolution's.
+	svc := &imagesService{rt: s.rt}
+	for _, req := range []*runtimev1.EvictImageRequest{{Reference: s.refA}, {Digest: s.manA}} {
+		tg, err := svc.resolveEvictTarget(context.Background(), req)
+		if err != nil || tg.manifest != s.manA {
+			t.Fatalf("resolveEvictTarget(%v) = %v, %v; want manifest %s", req, tg, err, s.manA)
+		}
+	}
+	sum := sha256.Sum256([]byte("evict-rpc-missing"))
+	for _, req := range []*runtimev1.EvictImageRequest{
+		{Reference: "registry.test/evict/missing:v1"},
+		{Digest: "sha256:" + hex.EncodeToString(sum[:])},
+	} {
+		_, err := s.client.EvictImage(context.Background(), req)
+		st := status.Convert(err)
+		if st.Code() != codes.FailedPrecondition {
+			t.Errorf("EvictImage(%v) = %v, want FAILED_PRECONDITION", req, err)
+		}
+		if len(st.Details()) != 0 {
+			t.Errorf("EvictImage(%v) details = %v, want none", req, st.Details())
+		}
+	}
+}
