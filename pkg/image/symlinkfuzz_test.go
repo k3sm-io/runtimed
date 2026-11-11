@@ -89,7 +89,9 @@ func FuzzSymlinkTargetContained(f *testing.F) {
 // tree resolves above the tree root.
 //
 // The script is one entry per line: "L <name> <target>" for a symlink,
-// "D <name>" for a directory, "F <name>" for a regular file. Unknown lines
+// "D <name>" for a directory, "F <name>" for a regular file, "H <name>
+// <target>" for a hard link (tar.TypeLink; the target is read like L's).
+// Unknown lines
 // are skipped. A refused entry ends the layer, exactly as in production; what
 // was written before it stays and is checked.
 func FuzzApplyLayer(f *testing.F) {
@@ -97,13 +99,32 @@ func FuzzApplyLayer(f *testing.F) {
 	f.Add("L a/b/l ../..\nL a/b/l/x/y ../../../..", false)
 	f.Add("D usr/lib\nL lib usr/lib\nF usr/lib/libc.so.6\nL lib/libc.so libc.so.6", false)
 	f.Add("L bin usr/bin\nL usr/bin/sh /bin/busybox", true)
+	// Writes and hard links that go through a link or climb out, aimed at the
+	// canary that sits beside the unpack root (../outside/canary).
+	for _, linux := range []bool{false, true} {
+		f.Add("L out ../outside\nF out/canary", linux)
+		f.Add("L out ../outside\nH h out/canary", linux)
+		f.Add("L d .\nL out d/../outside\nF out/canary", linux)
+		f.Add("H h ../outside/canary", linux)
+		f.Add("D a\nH a/h ../../outside/canary\nF a/h", linux)
+	}
 	f.Fuzz(func(t *testing.T, script string, linux bool) {
 		layer, ok := fuzzLayer(script)
 		if !ok {
 			return
 		}
-		tree := filepath.Join(t.TempDir(), "rootfs")
+		base := t.TempDir()
+		tree := filepath.Join(base, "rootfs")
 		if err := os.Mkdir(tree, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		outside := filepath.Join(base, "outside")
+		if err := os.Mkdir(outside, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		canary := filepath.Join(outside, "canary")
+		canaryBytes := []byte("canary: must never change\n")
+		if err := os.WriteFile(canary, canaryBytes, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		root, err := os.OpenRoot(tree)
@@ -120,6 +141,16 @@ func FuzzApplyLayer(f *testing.F) {
 			t.Fatal(err)
 		}
 		_ = a.Apply(context.Background(), bytes.NewReader(layer)) // a refusal is a valid outcome; the tree is checked either way
+
+		if got, err := os.ReadFile(canary); err != nil || !bytes.Equal(got, canaryBytes) {
+			t.Errorf("canary outside the root changed (err %v, got %q)\nscript:\n%s", err, got, script)
+		}
+		if ents, err := os.ReadDir(outside); err != nil || len(ents) != 1 {
+			t.Errorf("sibling dir of the root holds %d entries (err %v), want exactly the canary\nscript:\n%s", len(ents), err, script)
+		}
+		if ents, err := os.ReadDir(base); err != nil || len(ents) != 2 {
+			t.Errorf("dir holding the root has %d entries (err %v), want rootfs and outside\nscript:\n%s", len(ents), err, script)
+		}
 
 		werr := filepath.WalkDir(tree, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -159,6 +190,8 @@ func fuzzLayer(script string) ([]byte, bool) {
 		switch {
 		case f[0] == "L" && len(f) == 3 && len(f[2]) <= fuzzMaxNameLen:
 			hdr.Typeflag, hdr.Linkname = tar.TypeSymlink, f[2]
+		case f[0] == "H" && len(f) == 3 && len(f[2]) <= fuzzMaxNameLen:
+			hdr.Typeflag, hdr.Linkname = tar.TypeLink, f[2]
 		case f[0] == "D" && len(f) == 2:
 			hdr.Typeflag = tar.TypeDir
 		case f[0] == "F" && len(f) == 2:
