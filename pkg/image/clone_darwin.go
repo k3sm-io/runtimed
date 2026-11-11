@@ -56,8 +56,10 @@ func (APFSCloner) Clone(src, dst string) (bool, error) {
 }
 
 // cloneAt CoW-clones src to name inside dir with clonefileat(2), so no
-// destination path component is resolved; CLONE_NOFOLLOW refuses a link at
-// name. It falls back to a byte copy into the same descriptor on EXDEV or
+// destination path component is resolved. clonefileat fails with EEXIST on any
+// existing entry at name, a dangling link included, so nothing is written
+// through a link there (CLONE_NOFOLLOW governs the source: a link at src is
+// cloned as itself). It falls back to a byte copy into the same descriptor on EXDEV or
 // ENOTSUP, as Clone does.
 func (APFSCloner) cloneAt(src string, dir *os.File, name string) (bool, error) {
 	err := clonefileAt(src, dir, name)
@@ -111,8 +113,9 @@ func (CloneOnly) cloneAt(src string, dir *os.File, name string) (bool, error) {
 // cloneFileAt CoW-clones the open file src to name inside the open directory
 // dir with fclonefileat(2) (the x/sys binding, not hand cgo). Cloning from the
 // descriptor means the inode cloned is the inode the caller already checked;
-// no path is resolved on the source side. CLONE_NOFOLLOW refuses a symlink at
-// the destination name, and CLONE_NOOWNERCOPY makes the clone owned by this
+// no path is resolved on the source side. fclonefileat fails with EEXIST on
+// any existing entry at the destination name (CLONE_NOFOLLOW governs the
+// source, not the destination), and CLONE_NOOWNERCOPY makes the clone owned by this
 // process rather than by the source file's owner. name must not exist.
 //
 // The clone still carries the source's mode, file flags and extended

@@ -135,18 +135,22 @@ limitations under the License.
 //     record on open, so a linux tree is never served to the native spine, whose
 //     pod rootfs has no chroot around it.
 //
-// MaterializeTree's DESTINATION side is not link-safe: it joins plain paths, and
-// its MkdirAll, Stat and OpenFile follow a link already present in the
-// destination (see refuseCaseMerge). It is safe only while the destination holds
-// no link it did not itself create. The vm spine's one call
-// (pkg/runtime/vmcontainers.go resolveVMContainer) passes the per-pod
+// MaterializeTree's DESTINATION side never leaves the destination root: every
+// directory beneath it is opened and every entry created relative to its
+// parent's descriptor, a link where the tree needs a directory is followed only
+// while it resolves inside the root (os.Root), so images composed into one pod
+// rootfs still compose, and a link that would leave the root, or a link where
+// the tree lands a regular file, fails with ErrDestinationLink. The destination
+// directory itself is the caller's anchor and is opened by path. The vm spine's
+// one call (pkg/runtime/vmcontainers.go resolveVMContainer) passes the per-pod
 // Cache.PodRootfs directory (<root>/pods/<podID>/rootfs, derived from a parsed
-// PodID); nothing in production verifies that directory is new or empty, so
-// that is an assumption about the pod lifecycle, not a checked property.
+// PodID).
 //
 // TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide is the gate for the first
-// three points; its populated_destination subtest records what the destination
-// side does today when that assumption fails.
+// three points, and its populated_destination subtest pins that a link planted
+// in the destination is refused rather than written through;
+// TestMaterializeTreeNeverWritesThroughADestinationLink gates the destination
+// walk itself.
 //
 // # The CAS verification ceiling
 //

@@ -683,9 +683,10 @@ func (u *Unpacker) MaterializeTree(ctx context.Context, mfst *runtimev1.ImageMan
 // The unpack measured the store, and dstRootfs is a different directory, so a
 // store and a pod rootfs that straddle a mount can disagree. The clone cannot be
 // left to find out: its walk treats a destination that already exists as already
-// materialized, which drops the second spelling, and it joins plain paths, so a
-// symlink "Dir" and a file "dir/x" from a case-sensitive store would write x
-// through the link and out of the pod's rootfs.
+// materialized, which drops the second spelling, and a symlink "Dir" and a file
+// "dir/x" from a case-sensitive store would merge on the destination, landing x
+// wherever "Dir" points inside the pod's rootfs (the walk never leaves the
+// rootfs, but it would follow an in-root link the store kept apart).
 //
 // The measurement comes first because it is four syscalls and the sidecar is
 // O(entries), and on a case-sensitive destination the sidecar has no question to

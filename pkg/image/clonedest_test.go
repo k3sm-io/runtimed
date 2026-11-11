@@ -195,3 +195,32 @@ func TestMaterializeTreeNeverWritesThroughADestinationLink(t *testing.T) {
 		})
 	}
 }
+
+// TestClonerAtRefusesADanglingLeafLink gates the descriptor-relative copy
+// itself, below the walk's lstat: a dangling link at the destination name (one
+// a follow would create the target of) fails the copy with EEXIST and nothing
+// is created at its target. Each shipped Cloner runs it.
+func TestClonerAtRefusesADanglingLeafLink(t *testing.T) {
+	for cname, c := range map[string]cloneAter{"byte": ByteCopier{}, "apfs": APFSCloner{}} {
+		t.Run(cname, func(t *testing.T) {
+			srcDir, dstDir, victim := t.TempDir(), t.TempDir(), t.TempDir()
+			src := filepath.Join(srcDir, "file")
+			mustWrite(t, src, "payload", 0o644)
+			target := filepath.Join(victim, "target")
+			if err := os.Symlink(target, filepath.Join(dstDir, "leaf")); err != nil {
+				t.Fatal(err)
+			}
+			dir, err := os.Open(dstDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dir.Close()
+			if _, err := c.cloneAt(src, dir, "leaf"); !errors.Is(err, fs.ErrExist) {
+				t.Fatalf("cloneAt over a dangling link: err = %v, want EEXIST", err)
+			}
+			if _, err := os.Lstat(target); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("link target exists (err %v); want nothing written through the link", err)
+			}
+		})
+	}
+}

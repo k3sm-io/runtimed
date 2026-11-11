@@ -41,6 +41,13 @@ var ErrQuarantined = errors.New("image: materialized file has com.apple.quaranti
 // implementation (APFSCloner, clone_darwin.go) uses an APFS copy-on-write clone
 // and falls back to a byte copy on EXDEV/ENOTSUP; CloneOnly never falls back; a portable byte-copy implementation
 // (ByteCopier) is used off darwin and in unit tests that don't need real CoW.
+//
+// MaterializeTree copies descriptor-relative (into the open parent directory,
+// resolving no destination path) only through a Cloner that also has the
+// unexported cloneAt method. A Cloner without it is called with a joined path
+// after its parent directory was verified through a descriptor, which leaves a
+// race between that check and the copy. Every Cloner this package ships
+// (ByteCopier, APFSCloner, CloneOnly) has the method.
 type Cloner interface {
 	// Clone copies the regular file src to dst (which must not yet exist). It
 	// reports whether the copy was a real APFS clone (cow) via the bool, so
