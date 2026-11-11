@@ -323,17 +323,19 @@ func (f *execGateFlights) run(ctx context.Context, path string, call *execGateCa
 	return call.err
 }
 
-// resolveImageExecPath resolves an exec session's absolute argv[0] in the pod
-// rootfs, reporting the path to exec and whether the image has an entry there.
-// With none, the caller keeps the name it was sent.
+// resolveImageExecPath resolves a pulled image's argv[0] in the pod rootfs,
+// reporting the path to gate and exec and whether the image has an entry there.
+// With none it returns the lexical in-root path (resolveImageArgv0) and false:
+// an exec session then keeps the name it was sent, and a container start gates
+// and execs the lexical path, which fails as a missing file. It is the one
+// resolver for both: a container start (resolveBinary) and an exec session.
 //
-// resolveImageArgv0 bounds the name, and this bounds the place, which start
-// leaves to the profile: a link in the rootfs is walked with chroot semantics
-// (pathsafe.WalkInRoot) and one that leaves the root is refused, so the daemon
-// never names a host file on the pod's say-so. The walk describes the tree at
-// this moment, and the pod can write the tree. A link swapped in afterwards runs
-// under the pod's profile with the pod's identity, which is what the pod could
-// already do by exec'ing that file itself.
+// resolveImageArgv0 bounds the name, and this bounds the place: a link in the
+// rootfs is walked with chroot semantics (pathsafe.WalkInRoot) and one that
+// leaves the root is refused, so the daemon never names a host file on the pod's
+// say-so. The walk describes the tree at this moment, and the pod can write the
+// tree. A link swapped in afterwards runs under the pod's profile with the pod's
+// identity, which is what the pod could already do by exec'ing that file itself.
 //
 // A path whose links all stay inside the root is returned as named, because the
 // kernel reads it the same way and the program sees the argv[0] start gives it: a
@@ -348,7 +350,7 @@ func resolveImageExecPath(rootfs, argv0 string) (string, bool, error) {
 	root, err := os.OpenRoot(rootfs)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", false, nil
+			return bin, false, nil
 		}
 		return "", false, fmt.Errorf("open the pod rootfs: %w", err)
 	}
@@ -363,7 +365,7 @@ func resolveImageExecPath(rootfs, argv0 string) (string, bool, error) {
 		return "", false, fmt.Errorf("%w: %q: %w", ErrImageArgvEscapes, argv0, err)
 	}
 	if !present {
-		return "", false, nil
+		return bin, false, nil
 	}
 	resolved, hops, exists, err := pathsafe.WalkInRoot(root, rel)
 	if err != nil {

@@ -736,6 +736,7 @@ func (f *fakeUnpacker) manifest() *runtimev1.ImageManifest {
 type fakeSigner struct {
 	mu        sync.Mutex
 	signed    []string
+	checked   []string
 	checkErr  error
 	signError error
 }
@@ -748,6 +749,9 @@ func (f *fakeSigner) Sign(_ context.Context, _, path string) error {
 }
 
 func (f *fakeSigner) Check(_ context.Context, policy runtimev1.SignaturePolicy, path string) error {
+	f.mu.Lock()
+	f.checked = append(f.checked, path)
+	f.mu.Unlock()
 	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_UNSPECIFIED {
 		return image.ErrPolicyUnspecified
 	}

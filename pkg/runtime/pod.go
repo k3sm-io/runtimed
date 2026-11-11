@@ -2961,7 +2961,24 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// argv[0] is the merged program resolved inside this pod's materialized
 	// rootfs — whether or not it carries a leading slash. See resolveImageArgv0
 	// for why the leading slash carries no meaning on this route.
-	bin, err := resolveImageArgv0(rootfs, run.Argv[0])
+	//
+	// It is resolved ONCE, here, with the walk an exec session uses
+	// (resolveImageExecPath): a link is followed beneath the rootfs with chroot
+	// semantics, and one whose target leaves the root fails with
+	// ErrImageArgvEscapes before anything is signed, checked or spawned. The one
+	// path this returns is what startContainer hands to the ad-hoc sign, to the
+	// signature check and to the exec shim's argv, so the three name the same
+	// file. Resolving lexically instead let a link the pod wrote at argv[0] make
+	// codesign (which follows links) describe a different file than the one the
+	// shim ran, or one outside the rootfs. An in-image link whose target stays
+	// in the root keeps its lexical name, as it does for exec, because a
+	// multi-call binary or a venv interpreter reads that name.
+	//
+	// This NARROWS the swap window; it does not close it. codesign and the shim
+	// are separate processes that each take a path, and the pod can write its
+	// rootfs, so an in-place swap of the resolved file between the check and the
+	// shim's exec remains possible.
+	bin, _, err := resolveImageExecPath(rootfs, run.Argv[0])
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
 			fmt.Errorf("container %s: %w", c.GetName(), err))
@@ -3039,8 +3056,9 @@ var ErrImageArgvEscapes = errors.New("image program escapes the pod rootfs")
 // here would not close that (the tree is writable by the pod, so any answer is
 // stale the moment it is given); the profile is what bounds what the process
 // may then touch, and this check is what keeps the daemon from being the one
-// that walks out. An exec session adds that walk before it runs a name someone
-// other than the image chose (resolveImageExecPath).
+// that walks out. A container start and an exec session both add that walk
+// (resolveImageExecPath), so the daemon never signs, checks or spawns a link
+// that leaves the root; what the walk cannot do is keep its answer true.
 func resolveImageArgv0(rootfs, argv0 string) (string, error) {
 	if argv0 == "" {
 		return "", errors.New("image program is empty")
