@@ -967,6 +967,13 @@ func TestVMImagePullFailureIsTypedLikeTheHostSpine(t *testing.T) {
 		pullPolicy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
 		want:       runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL,
 	}, {
+		// A registry that stopped answering is an ordinary, retryable pull
+		// failure, wrapped the way the image package's pull path wraps it
+		// (the cause is flattened with %v, so no context error rides along).
+		name:    "resolve-timeout-is-IMAGE_PULL",
+		pullErr: fmt.Errorf("pull %q: %w after %s: %v", ref, image.ErrPullResolveTimeout, 2*time.Minute, context.Canceled),
+		want:    runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+	}, {
 		name:    "no-platform-match-is-IMAGE_NO_PLATFORM_MATCH",
 		pullErr: fmt.Errorf("%q: %w", ref, image.ErrNoPlatformMatch),
 		want:    runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
