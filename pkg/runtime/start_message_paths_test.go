@@ -143,6 +143,25 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			wants:    func(e env) []string { return []string{e.podDir} },
 		},
 		{
+			// A pod dir the daemon cannot write: the pod's empty image record,
+			// written before any pull, cannot be created in it.
+			name: "pod-references",
+			setup: func(t *testing.T, e env) {
+				if err := os.MkdirAll(filepath.Dir(e.podDir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(e.podDir, 0o500); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(e.podDir, 0o750) })
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "its image references could not be recorded; the daemon log has the cause",
+			marker:   "record image references for pod",
+			wants:    func(e env) []string { return []string{e.podDir, fs.ErrPermission.Error()} },
+		},
+		{
 			// A file where the rootfs share root belongs.
 			name: "volume-shares",
 			setup: func(t *testing.T, e env) {

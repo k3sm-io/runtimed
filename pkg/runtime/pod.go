@@ -1118,7 +1118,8 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// consequence of a bad image reference, which is the property the GC's
 	// fail-closed reading depends on to be useful.
 	if err := r.recordPodReferences(box.GetPodId()); err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			vmPodStartError(box.GetPodId(), "its image references could not be recorded", err)
 	}
 	// Resolved once, and used three times: the guest's DNS/NAT configuration on
 	// the spec below, the status.podIP a downward-API projection resolves to, and
