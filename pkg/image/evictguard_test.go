@@ -421,3 +421,64 @@ func TestUnlinkUnlessHeldSharedUnderLeaseMu(t *testing.T) {
 		t.Fatalf("unlinkUnlessHeld = %v, %q, %v (sharedNow called %v); want removed", removed, why, err, asked)
 	}
 }
+
+// TestTreeUnlessHeld pins the per-tree check's branches: a live lease on a
+// backing blob keeps the tree typed leased and names that blob; an unreadable
+// root set keeps it and returns an error; otherwise remove runs under leaseMu.
+func TestTreeUnlessHeld(t *testing.T) {
+	t.Parallel()
+	t.Run("leased", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		cfgDigest := f.blob("tree-held-cfg", time.Hour)
+		layer := f.blob("tree-held-layer", time.Hour)
+		l := f.cache.AcquireLease([]string{layer}, 0)
+		defer l.Release()
+		called := false
+		removed, dg, why, err := f.cache.treeUnlessHeld([]string{"", cfgDigest, layer}, func() error {
+			called = true
+			return nil
+		}, nil)
+		if err != nil || removed || called || dg != layer || why != evictLeased {
+			t.Fatalf("treeUnlessHeld = %v, %s, %q, %v (remove called %v); want kept leased by %s", removed, dg, why, err, called, layer)
+		}
+	})
+	t.Run("roots unreadable", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		cfgDigest := f.blob("tree-unreadable-cfg", time.Hour)
+		// A pod dir with no record is an incomplete root set.
+		pid, err := ParsePodID("pod-b")
+		if err != nil {
+			t.Fatalf("ParsePodID: %v", err)
+		}
+		if err := os.MkdirAll(f.cache.PodDir(pid), 0o755); err != nil {
+			t.Fatalf("mkdir pod dir: %v", err)
+		}
+		called := false
+		removed, _, why, err := f.cache.treeUnlessHeld([]string{cfgDigest}, func() error {
+			called = true
+			return nil
+		}, nil)
+		if err == nil || removed || called || why != "" {
+			t.Fatalf("treeUnlessHeld = %v, %q, %v (remove called %v); want kept with an error", removed, why, err, called)
+		}
+	})
+	t.Run("remove under leaseMu", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		cfgDigest := f.blob("tree-locked-cfg", time.Hour)
+		called := false
+		removed, dg, why, err := f.cache.treeUnlessHeld([]string{cfgDigest}, func() error {
+			called = true
+			if f.cache.leaseMu.TryLock() {
+				f.cache.leaseMu.Unlock()
+				t.Error("leaseMu not held across the tree removal")
+			}
+			return nil
+		}, nil)
+		if err != nil || !removed || dg != "" || why != "" || !called {
+			t.Fatalf("treeUnlessHeld = %v, %s, %q, %v (remove called %v); want removed", removed, dg, why, err, called)
+		}
+	})
+}
