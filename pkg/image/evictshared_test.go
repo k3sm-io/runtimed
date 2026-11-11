@@ -352,12 +352,53 @@ func TestEvictSharedSet(t *testing.T) {
 	}
 }
 
-// TestEvictSharedSetHonoursCancel pins that a cancelled context returns no set.
+// TestEvictSharedSetHonoursCancel pins each of evictSharedSet's three
+// cancellation checks on its own: with every leg populated, a context
+// cancelled before the call, before the artifact records or before the
+// released copies returns no set, and the phases after the cancellation never
+// start. It sets a package seam, so it must not run in parallel.
 func TestEvictSharedSetHonoursCancel(t *testing.T) {
-	cache, _ := newIndexedCache(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if got, err := cache.evictSharedSet(ctx, fakeDigest('a'), nil); !errors.Is(err, context.Canceled) || got != nil {
-		t.Fatalf("evictSharedSet = %v, %v; want nil, context.Canceled", got, err)
+	cfgB, ownB, shared := fakeDigest('d'), fakeDigest('e'), fakeDigest('c')
+	_, descB := manifestBytes("B")
+	mB := descB.GetDigest()
+	tests := []struct {
+		name     string
+		cancelAt string // "" cancels before the call
+		wantSeen []string
+	}{
+		{name: "cancelled before the call", cancelAt: "", wantSeen: nil},
+		{name: "cancelled before the artifact records", cancelAt: "records", wantSeen: []string{"records"}},
+		{name: "cancelled before the released copies", cancelAt: "released", wantSeen: []string{"records", "released"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, idx := newIndexedCache(t)
+			f := &sharedFixture{t: t, cache: cache, idx: idx}
+			f.entry("b", "B", false, cfgB, ownB, shared)
+			f.record("s@t", mB, cfgB, shared)
+			f.releasedFile("", f.recordBytes("s@t", mB, cfgB, shared))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancelAt == "" {
+				cancel()
+			}
+			var seen []string
+			evictSharedPhaseHook = func(phase string) {
+				seen = append(seen, phase)
+				if phase == tc.cancelAt {
+					cancel()
+				}
+			}
+			t.Cleanup(func() { evictSharedPhaseHook = nil })
+
+			got, err := cache.evictSharedSet(ctx, fakeDigest('a'), nil)
+			if !errors.Is(err, context.Canceled) || got != nil {
+				t.Fatalf("evictSharedSet = %v, %v; want nil, context.Canceled", got, err)
+			}
+			if !reflect.DeepEqual(seen, tc.wantSeen) {
+				t.Errorf("phases started = %v; want %v", seen, tc.wantSeen)
+			}
+		})
 	}
 }

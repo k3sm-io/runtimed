@@ -32,6 +32,11 @@ type recordManifest struct {
 	ManifestDigest string `json:"manifestDigest"`
 }
 
+// evictSharedPhaseHook, when non-nil, is called by evictSharedSet with the
+// name of the phase about to start ("records", then "released"), just before
+// the cancellation check that guards it. It is a test seam: nil in production.
+var evictSharedPhaseHook func(phase string)
+
 // evictSharedSet returns the blob digests named by every cached manifest other
 // than the eviction target manifest, whose own blobs are target: every image
 // index entry, live artifact record and released copy. Each contributes its
@@ -98,6 +103,9 @@ func (c *Cache) evictSharedSet(ctx context.Context, manifest string, target map[
 		contribute(e.Descriptor.GetDigest(), ds)
 	}
 
+	if evictSharedPhaseHook != nil {
+		evictSharedPhaseHook("records")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -113,6 +121,9 @@ func (c *Cache) evictSharedSet(ctx context.Context, manifest string, target map[
 		contribute(m, ds)
 	}
 
+	if evictSharedPhaseHook != nil {
+		evictSharedPhaseHook("released")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
