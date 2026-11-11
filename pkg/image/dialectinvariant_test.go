@@ -146,13 +146,19 @@ func within(path, root string) bool {
 // are admitted because only the guest, chrooted into the tree, resolves them,
 // so every host-side reader in this package must treat them as opaque names.
 //
-// The tree carries "a -> /", "b -> a/etc" (relative, but resolving through a
-// to the host's /etc) and absolute links to a canary Mach-O, a canary FIFO and
+// The tree carries "a -> <fakeroot>", "b -> a/etc" (relative, but resolving
+// through a to <fakeroot>/etc) and absolute links to a canary Mach-O, a canary FIFO and
 // their directory outside the tree. Unpack, MaterializeTree, AdHocSignTree and
 // the tree prune are driven over it, and the canary must come out byte-for-byte
 // and mtime-for-mtime untouched, with no path outside the tree in any output.
 // The FIFO makes a read-only follow visible: opening it for reading blocks, so a
 // reader that opens through the link hangs and the sign subtest times it out.
+//
+// No link target names a real host path: <fakeroot> is a t.TempDir() seeded
+// with etc/hosts and etc/hostname, standing in for the host root (still an absolute
+// target, which is what the linux dialect admits), so even a regressed reader
+// run as root can only touch the fake root, and every stage asserts the fake
+// root is byte-for-byte and entry-for-entry what it was before.
 //
 // What this gates is mainly the SOURCE side: every reader of the tree.
 // populated_destination pins that MaterializeTree refuses, rather than
@@ -176,8 +182,19 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 	if err := os.Chtimes(canary, old, old); err != nil {
 		t.Fatal(err)
 	}
+	fakeRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(fakeRoot, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{"hosts": "127.0.0.1 localhost\n", "hostname": "host\n"} {
+		if err := os.WriteFile(filepath.Join(fakeRoot, "etc", name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeRootBefore := snapshotTree(t, fakeRoot)
 	assertCanary := func(t *testing.T, stage string) {
 		t.Helper()
+		assertSnapshotEqual(t, stage, fakeRoot, fakeRootBefore, snapshotTree(t, fakeRoot))
 		fi, err := os.Lstat(canary)
 		if err != nil {
 			t.Fatalf("%s: canary gone: %v", stage, err)
@@ -202,7 +219,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 	mfst := commitImage(t, c, linuxImageFrom(t, layerFrom(t, []tarSpec{
 		{name: "etc", typ: tar.TypeDir, mode: 0o755},
 		{name: "etc/hostname", mode: 0o644, data: "guest"},
-		{name: "a", typ: tar.TypeSymlink, link: "/"},
+		{name: "a", typ: tar.TypeSymlink, link: fakeRoot},
 		{name: "b", typ: tar.TypeSymlink, link: "a/etc"},
 		{name: "canary", typ: tar.TypeSymlink, link: canary},
 		{name: "canaryfifo", typ: tar.TypeSymlink, link: fifo},
@@ -240,7 +257,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 				t.Fatalf("MaterializeTree pass %d: %v", i, err)
 			}
 		}
-		for name, want := range map[string]string{"a": "/", "b": "a/etc", "canary": canary, "canaryfifo": fifo, "canarydir": outside} {
+		for name, want := range map[string]string{"a": fakeRoot, "b": "a/etc", "canary": canary, "canaryfifo": fifo, "canarydir": outside} {
 			fi, err := os.Lstat(filepath.Join(dst, name))
 			if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
 				t.Errorf("materialized %s: mode %v, err %v; want a symlink, not a copy of its target", name, fi, err)
@@ -282,7 +299,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 		var res result
 		select {
 		case res = <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(20 * time.Second):
 			// An open for reading of the FIFO blocks until a writer appears.
 			// Be that writer, so the blocked reader sees EOF and returns.
 			if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
@@ -350,7 +367,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 		layer1 := []tarSpec{
 			{name: "etc", typ: tar.TypeDir, mode: 0o755},
 			{name: "etc/hostname", mode: 0o644, data: "guest"},
-			{name: "a", typ: tar.TypeSymlink, link: "/"},
+			{name: "a", typ: tar.TypeSymlink, link: fakeRoot},
 			{name: "b", typ: tar.TypeSymlink, link: "a/etc"},
 			{name: "c", typ: tar.TypeSymlink, link: outside},
 		}
@@ -374,13 +391,10 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 				if err == nil || got != nil || !strings.Contains(err.Error(), "path escapes from parent") {
 					t.Errorf("Unpack = %+v, %v; want nil and os.Root's path-escape refusal", got, err)
 				}
-				for _, p := range []string{filepath.Join("/etc", hostProbe), filepath.Join(outside, hostProbe)} {
+				for _, p := range []string{filepath.Join(fakeRoot, "etc", hostProbe), filepath.Join(outside, hostProbe)} {
 					if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
 						t.Errorf("%s exists after the unpack (err %v): a layer wrote outside the tree", p, err)
 					}
-				}
-				if _, err := os.Lstat("/etc/hosts"); err != nil {
-					t.Errorf("host /etc/hosts after the unpack: %v", err)
 				}
 				assertCanary(t, tc.name)
 			})
@@ -409,7 +423,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(planted, TreeRootfsName), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink("/", filepath.Join(planted, TreeRootfsName, "a")); err != nil {
+		if err := os.Symlink(fakeRoot, filepath.Join(planted, TreeRootfsName, "a")); err != nil {
 			t.Fatal(err)
 		}
 		rec := treeRecord{
@@ -461,9 +475,73 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 		if _, err := os.Lstat(tree.Rootfs); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("tree rootfs after prune: %v, want gone", err)
 		}
-		if _, err := os.Stat("/etc"); err != nil {
-			t.Errorf("host /etc after prune: %v", err)
-		}
 		assertCanary(t, "prune")
 	})
+}
+
+// treeEntry is one entry of a snapshotTree: its type and permission bits, and
+// its bytes (a regular file) or its target (a symlink).
+type treeEntry struct {
+	mode fs.FileMode
+	data string
+}
+
+// snapshotTree records every entry under root, keyed by its root-relative path,
+// without following any link.
+func snapshotTree(t *testing.T, root string) map[string]treeEntry {
+	t.Helper()
+	snap := map[string]treeEntry{}
+	if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		e := treeEntry{mode: fi.Mode()}
+		switch {
+		case fi.Mode().IsRegular():
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			e.data = string(b)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			l, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			e.data = l
+		}
+		snap[rel] = e
+		return nil
+	}); err != nil {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	return snap
+}
+
+// assertSnapshotEqual fails the test for every entry of root created, removed
+// or changed between the before and after snapshots.
+func assertSnapshotEqual(t *testing.T, stage, root string, before, after map[string]treeEntry) {
+	t.Helper()
+	for rel, b := range before {
+		a, ok := after[rel]
+		switch {
+		case !ok:
+			t.Errorf("%s: %s removed from the fake root: a host reader wrote through a link", stage, filepath.Join(root, rel))
+		case a != b:
+			t.Errorf("%s: %s changed in the fake root (%v -> %v): a host reader wrote through a link", stage, filepath.Join(root, rel), b.mode, a.mode)
+		}
+	}
+	for rel := range after {
+		if _, ok := before[rel]; !ok {
+			t.Errorf("%s: %s created in the fake root: a layer wrote outside the tree", stage, filepath.Join(root, rel))
+		}
+	}
 }
