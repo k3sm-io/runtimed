@@ -275,6 +275,21 @@ func (s *PartialStore) eachEntry(fn func(fd int, name string, st *unix.Stat_t) e
 	return walkErr
 }
 
+// Remove deletes digest's partial; a partial that is not there is success. The
+// digest must be sha256:<64 hex>, else the error matches ErrInvalidDigest and
+// nothing is touched. The caller must hold the digest's Claim, and no Resume of
+// it may be running: Remove does not look at claims, so without the Claim it
+// can unlink the file out from under another writer.
+func (s *PartialStore) Remove(digest string) error {
+	if !sha256Digest.MatchString(digest) {
+		return fmt.Errorf("remove partial %s: %w", quoteBounded(digest, 128), ErrInvalidDigest)
+	}
+	if err := os.Remove(s.path(digest)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove partial %s: %w", digest, err)
+	}
+	return nil
+}
+
 // path is where the partial of digest lives. digest has passed the sha256
 // pattern, so the name is a fixed, path-safe token.
 func (s *PartialStore) path(digest string) string {

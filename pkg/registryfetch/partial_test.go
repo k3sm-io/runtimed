@@ -829,3 +829,40 @@ func TestResumeAdmitRefusalTouchesNothing(t *testing.T) {
 		})
 	}
 }
+
+func TestRemove(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	other := "sha256:" + strings.Repeat("b", 64)
+	cases := []struct {
+		name    string
+		arg     string
+		want    error
+		present bool // digest's partial exists after
+	}{
+		{"existing partial", digest, nil, false},
+		{"not exist", other, nil, false},
+		{"invalid digest", "nope", ErrInvalidDigest, true},
+		{"traversal", "sha256:../" + strings.Repeat("a", 64), ErrInvalidDigest, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := &PartialStore{Dir: dir}
+			keep := s.path(digest)
+			if err := os.WriteFile(keep, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := s.Remove(tc.arg)
+			if !errors.Is(err, tc.want) || (tc.want == nil && err != nil) {
+				t.Fatalf("Remove(%q) = %v, want %v", tc.arg, err, tc.want)
+			}
+			_, serr := os.Lstat(keep)
+			if present := serr == nil; present != tc.present && tc.arg != other {
+				t.Fatalf("partial present = %v, want %v", present, tc.present)
+			}
+			if tc.arg == other && serr != nil {
+				t.Fatalf("removing an absent digest touched another partial: %v", serr)
+			}
+		})
+	}
+}
