@@ -129,6 +129,14 @@ func (l ApplyLimits) withDefaults() (ApplyLimits, error) {
 // they are quoted as bounded DATA exactly like a digest or a media type.
 const maxLayerEntryNameLen = 256
 
+// maxLayerEntryPathLen is the longest entry name layerEntryPath admits, in
+// bytes. It is Linux PATH_MAX, so no name a real image can hold is refused,
+// and it is what bounds every per-component walk of a name in this file (the
+// symlink ancestor check among them): archive/tar alone admits a PAX or GNU
+// long name of up to 1 MiB. maxLayerEntryNameLen is unrelated; it bounds only
+// how much of a name an error message QUOTES.
+const maxLayerEntryPathLen = 4096
+
 // ApplyStats counts what one tree's layers produced. It is recorded in the
 // tree's daemon-authored record (see treeRecord) so a later reader can tell what
 // the unpacker DID without re-walking the tree — in particular how much of the
@@ -917,6 +925,10 @@ func layerEntryPath(name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("%w: empty entry name", ErrLayerMalformed)
 	}
+	if len(name) > maxLayerEntryPathLen {
+		return "", fmt.Errorf("%w: entry name %s is %d bytes, over the %d-byte limit",
+			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen), len(name), maxLayerEntryPathLen)
+	}
 	if strings.ContainsRune(name, 0) {
 		return "", fmt.Errorf("%w: entry name %s contains NUL",
 			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen))
@@ -1100,10 +1112,12 @@ func targetClimbs(target string) bool {
 // symlink and its ".." would climb from somewhere other than the spelled
 // directory symlinkTargetContained measured.
 //
-// The walk is bounded by the name's own components (at most
-// maxLayerEntryNameLen bytes), one Lstat each, and stops at the first absent
-// ancestor: what does not exist yet, ensureParent creates as a real directory.
-// Any Lstat failure other than absence fails closed.
+// The walk is one Lstat per ancestor, and each ancestor is a prefix SLICE of
+// the name, so building them is linear in the name's bytes. The name has
+// passed layerEntryPath, so it is at most maxLayerEntryPathLen bytes and the
+// walk is bounded by that. It stops at the first absent ancestor: what does
+// not exist yet, ensureParent creates as a real directory. Any Lstat failure
+// other than absence fails closed.
 func symlinkParentIsReal(root *os.Root, name, target string) error {
 	if !targetClimbs(target) {
 		return nil
@@ -1112,9 +1126,13 @@ func symlinkParentIsReal(root *os.Root, name, target string) error {
 	if dir == "." {
 		return nil
 	}
-	comps := strings.Split(dir, "/")
-	for i := range comps {
-		anc := strings.Join(comps[:i+1], "/")
+	for end := 0; end < len(dir); {
+		if next := strings.IndexByte(dir[end+1:], '/'); next >= 0 {
+			end += 1 + next
+		} else {
+			end = len(dir)
+		}
+		anc := dir[:end]
 		fi, err := root.Lstat(anc)
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil

@@ -20,7 +20,9 @@ import (
 	"archive/tar"
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -77,4 +79,51 @@ func TestSymlinkChainCannotEscapeTree(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLayerEntryNameLengthIsBounded pins the cap that bounds every walk of an
+// entry name: a name over maxLayerEntryPathLen is refused before it reaches
+// the filesystem, and a name exactly at it — with a climbing symlink at the
+// bottom, so the ancestor check walks every component of the name —
+// still applies.
+//
+// The name at the limit is 32 components of 127-128 bytes rather than 2048
+// one-byte ones: each component stays under NAME_MAX, and the tree stays
+// cheap enough to create and remove in a unit test.
+func TestLayerEntryNameLengthIsBounded(t *testing.T) {
+	atLimit := strings.Repeat(strings.Repeat("d", 127)+"/", 31) + strings.Repeat("l", 128)
+	if len(atLimit) != maxLayerEntryPathLen {
+		t.Fatalf("test name is %d bytes, want %d", len(atLimit), maxLayerEntryPathLen)
+	}
+
+	t.Run("over_the_limit_is_refused", func(t *testing.T) {
+		over := atLimit + "x"
+		if _, err := layerEntryPath(over); !errors.Is(err, ErrLayerMalformed) {
+			t.Fatalf("layerEntryPath(%d bytes) error = %v, want ErrLayerMalformed", len(over), err)
+		}
+		_, _, err := applyInto(t, ApplyLimits{}, []tarSpec{{name: over, typ: tar.TypeSymlink, link: ".."}})
+		if !errors.Is(err, ErrLayerMalformed) {
+			t.Fatalf("Apply error = %v, want ErrLayerMalformed", err)
+		}
+	})
+
+	t.Run("deep_name_at_the_limit_applies", func(t *testing.T) {
+		parent := path.Dir(atLimit)
+		tree, _, err := applyInto(t, ApplyLimits{}, []tarSpec{
+			{name: parent, typ: tar.TypeDir, mode: 0o755},
+			{name: atLimit, typ: tar.TypeSymlink, link: ".."},
+		})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		root, err := os.OpenRoot(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		got, err := root.Readlink(atLimit)
+		if err != nil || got != ".." {
+			t.Fatalf("Readlink = %q, %v; want \"..\"", got, err)
+		}
+	})
 }
