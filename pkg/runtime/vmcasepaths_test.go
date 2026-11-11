@@ -115,14 +115,15 @@ func pushCaseImage(t *testing.T, host, repo string, entries []caseEntry) string 
 }
 
 // countingCloner counts the clones a materialize attempted, so a refusal can be
-// shown to have stopped ahead of the first one.
+// shown to have stopped ahead of the first one. It counts through
+// image.CountClones, so the materialize keeps its descriptor-relative copy.
 type countingCloner struct {
 	n atomic.Int64
 }
 
-func (c *countingCloner) Clone(src, dst string) (bool, error) {
-	c.n.Add(1)
-	return image.ByteCopier{}.Clone(src, dst)
+// cloner is the image.Cloner that byte-copies and counts into c.n.
+func (c *countingCloner) cloner() image.Cloner {
+	return image.CountClones(image.ByteCopier{}, &c.n)
 }
 
 // caseRig is a runtime with the real puller and the real unpacker over one
@@ -143,7 +144,7 @@ func newCaseRig(t *testing.T, probe image.CaseProbe) *caseRig {
 		t.Fatal(err)
 	}
 	cloner := &countingCloner{}
-	opts := []image.UnpackerOption{image.WithCloner(cloner)}
+	opts := []image.UnpackerOption{image.WithCloner(cloner.cloner())}
 	if probe != nil {
 		opts = append(opts, image.WithCaseProbe(probe))
 	}

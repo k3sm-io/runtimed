@@ -224,3 +224,34 @@ func TestClonerAtRefusesADanglingLeafLink(t *testing.T) {
 		})
 	}
 }
+
+// pathOnlyCloner has only the exported Clone method, the shape a Cloner from
+// another package takes. It counts its calls and copies by path.
+type pathOnlyCloner struct{ calls int }
+
+func (c *pathOnlyCloner) Clone(src, dst string) (bool, error) {
+	c.calls++
+	return ByteCopier{}.Clone(src, dst)
+}
+
+// TestMaterializeTreeRefusesAPathOnlyCloner gates the descriptor-only copy: a
+// Cloner without the descriptor clone method would copy by a joined path after
+// its parent was checked, so MaterializeTree refuses it with ErrPathOnlyCloner
+// before it creates the destination or calls the Cloner.
+func TestMaterializeTreeRefusesAPathOnlyCloner(t *testing.T) {
+	src := t.TempDir()
+	mustWrite(t, filepath.Join(src, "a", "file"), "payload", 0o644)
+	dst := filepath.Join(t.TempDir(), "dst")
+	c := &pathOnlyCloner{}
+
+	_, err := MaterializeTree(c, src, dst)
+	if !errors.Is(err, ErrPathOnlyCloner) {
+		t.Fatalf("MaterializeTree with a path-only Cloner: err = %v, want ErrPathOnlyCloner", err)
+	}
+	if c.calls != 0 {
+		t.Errorf("the path-only Cloner was called %d times, want 0", c.calls)
+	}
+	if _, err := os.Lstat(dst); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("destination exists (err %v), want nothing written", err)
+	}
+}

@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -42,12 +43,12 @@ var ErrQuarantined = errors.New("image: materialized file has com.apple.quaranti
 // and falls back to a byte copy on EXDEV/ENOTSUP; CloneOnly never falls back; a portable byte-copy implementation
 // (ByteCopier) is used off darwin and in unit tests that don't need real CoW.
 //
-// MaterializeTree copies descriptor-relative (into the open parent directory,
-// resolving no destination path) only through a Cloner that also has the
-// unexported cloneAt method. A Cloner without it is called with a joined path
-// after its parent directory was verified through a descriptor, which leaves a
-// race between that check and the copy. Every Cloner this package ships
-// (ByteCopier, APFSCloner, CloneOnly) has the method.
+// MaterializeTree copies only descriptor-relative (into the open parent
+// directory, resolving no destination path), through the unexported cloneAt
+// method every Cloner this package ships (ByteCopier, APFSCloner, CloneOnly,
+// and CountClones's wrapper) has. It refuses a Cloner without that method with
+// ErrPathOnlyCloner: copying by a joined path after the parent was checked
+// would leave a race between that check and the copy.
 type Cloner interface {
 	// Clone copies the regular file src to dst (which must not yet exist). It
 	// reports whether the copy was a real APFS clone (cow) via the bool, so
@@ -87,14 +88,50 @@ func (ByteCopier) cloneAt(src string, dir *os.File, name string) (bool, error) {
 // a symlink where the tree lands a regular file. Nothing is written through it.
 var ErrDestinationLink = errors.New("image: materialize destination holds a link where the tree needs a directory or file")
 
+// ErrPathOnlyCloner reports that MaterializeTree was given a Cloner without
+// the descriptor-relative clone method (one defined outside this package that
+// does not wrap a Cloner it ships). Nothing is created or copied.
+var ErrPathOnlyCloner = errors.New("image: cloner cannot copy relative to a directory descriptor")
+
 // cloneAter is the descriptor-relative half of a Cloner: it copies the regular
 // file src to name inside the open directory dir, resolving no destination
-// path component. Every Cloner this package ships implements it; a Cloner that
-// does not (a test double from another package) is called with a joined path
-// after its parent was verified through a descriptor, which leaves the window
-// between that check and the copy open.
+// path component. Every Cloner this package ships implements it, and
+// MaterializeTree refuses a Cloner that does not (ErrPathOnlyCloner).
 type cloneAter interface {
 	cloneAt(src string, dir *os.File, name string) (cow bool, err error)
+}
+
+// CountClones returns a Cloner that copies with c and adds one to n before
+// every file it is asked to copy, by either method. It lets a test outside
+// this package observe how many files a materialize copied without giving up
+// the descriptor-relative copy. c must be a Cloner this package ships (or
+// another CountClones result): the returned Cloner's descriptor-relative copy
+// fails with ErrPathOnlyCloner otherwise.
+func CountClones(c Cloner, n *atomic.Int64) Cloner {
+	return countClones{inner: c, n: n}
+}
+
+// countClones is CountClones's Cloner.
+type countClones struct {
+	inner Cloner
+	n     *atomic.Int64
+}
+
+// Clone counts the copy and copies src to dst by path with the wrapped Cloner.
+func (c countClones) Clone(src, dst string) (bool, error) {
+	c.n.Add(1)
+	return c.inner.Clone(src, dst)
+}
+
+// cloneAt counts the copy and copies src to name inside dir with the wrapped
+// Cloner's descriptor-relative method.
+func (c countClones) cloneAt(src string, dir *os.File, name string) (bool, error) {
+	at, ok := c.inner.(cloneAter)
+	if !ok {
+		return false, ErrPathOnlyCloner
+	}
+	c.n.Add(1)
+	return at.cloneAt(src, dir, name)
 }
 
 // ErrTreeTooDeep reports that MaterializeTree met a source directory nested
@@ -139,8 +176,14 @@ type destDir struct {
 // A non-directory where the tree needs a directory, or a symlink where the
 // tree lands a regular file, fails with ErrDestinationLink too. Idempotence is decided by lstat: an existing regular file
 // (or any other non-link entry) where the tree lands a file is kept, and any
-// existing entry where the tree lands a symlink is kept.
+// existing entry where the tree lands a symlink is kept. Every file is copied
+// relative to its parent's descriptor; a Cloner that cannot do that fails with
+// ErrPathOnlyCloner before anything is created.
 func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
+	at, ok := c.(cloneAter)
+	if !ok {
+		return 0, fmt.Errorf("materialize %s: %T: %w", dstDir, c, ErrPathOnlyCloner)
+	}
 	srcInfo, err := os.Stat(srcDir)
 	if err != nil {
 		return 0, err
@@ -168,7 +211,6 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 			d.f.Close()
 		}
 	}()
-	at, _ := c.(cloneAter)
 
 	walkErr := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -240,13 +282,7 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 					return nil // idempotent, as before: something is there
 				}
 			}
-			var cow bool
-			var cerr error
-			if at != nil {
-				cow, cerr = at.cloneAt(path, parent, name)
-			} else {
-				cow, cerr = c.Clone(path, dst)
-			}
+			cow, cerr := at.cloneAt(path, parent, name)
 			if cerr != nil {
 				return fmt.Errorf("clone %s -> %s: %w", path, dst, cerr)
 			}

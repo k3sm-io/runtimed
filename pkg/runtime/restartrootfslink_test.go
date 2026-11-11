@@ -164,7 +164,7 @@ func newNativeLinkRig(t *testing.T) linkRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unpacker, err := image.NewUnpacker(cache, image.WithCloner(&countingCloner{}))
+	unpacker, err := image.NewUnpacker(cache, image.WithCloner((&countingCloner{}).cloner()))
 	if err != nil {
 		t.Fatal(err)
 	}
