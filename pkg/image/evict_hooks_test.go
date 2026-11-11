@@ -207,3 +207,154 @@ func TestExecutePruneHooks(t *testing.T) {
 		})
 	}
 }
+
+// TestExecutePruneTypedRefusal pins the typed refusal beside each skip's
+// string: a guard drop, an unlink-seam refusal, a blob younger than grace and
+// a failed removal each fill Refusal with the blob's digest, the path's kind
+// and the exported reason, while the string stays byte-for-byte what prune's
+// callers read. A skip on any other path (here, a blob already gone) carries
+// no Refusal.
+func TestExecutePruneTypedRefusal(t *testing.T) {
+	t.Parallel()
+
+	errHook := errors.New("hook failed")
+	refuse := func(why evictReason, err error) func(*gcFixture, string) *pruneHooks {
+		return func(_ *gcFixture, keep string) *pruneHooks {
+			return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+				if digest == keep {
+					return false, why, err
+				}
+				return true, "", remove()
+			}}
+		}
+	}
+	tests := []struct {
+		name       string
+		hooks      func(f *gcFixture, keep string) *pruneHooks
+		prep       func(t *testing.T, f *gcFixture, keep string)
+		wantString string
+		want       *SkipRefusal // Digest is filled in by the loop
+	}{
+		{
+			name: "guard drop",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{guard: func() (map[string]evictReason, error) {
+					return map[string]evictReason{keep: evictShared}, nil
+				}}
+			},
+			wantString: "dropped by guard: shared",
+			want:       &SkipRefusal{Kind: RefusedByGuard, Reason: EvictKeptShared},
+		},
+		{
+			name: "guard drop with an unknown reason is unlink-failed",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{guard: func() (map[string]evictReason, error) {
+					return map[string]evictReason{keep: "bogus"}, nil
+				}}
+			},
+			wantString: "dropped by guard: bogus",
+			want:       &SkipRefusal{Kind: RefusedByGuard, Reason: EvictKeptUnlinkFailed},
+		},
+		{
+			name:       "unlink seam refusal",
+			hooks:      refuse(evictLeased, nil),
+			wantString: "refused by unlink: leased",
+			want:       &SkipRefusal{Kind: RefusedByUnlink, Reason: EvictKeptLeased},
+		},
+		{
+			name:       "unlink seam refusal with no reason is unlink-failed",
+			hooks:      refuse("", nil),
+			wantString: "refused by unlink: ",
+			want:       &SkipRefusal{Kind: RefusedByUnlink, Reason: EvictKeptUnlinkFailed},
+		},
+		{
+			name:  "younger than grace",
+			hooks: func(*gcFixture, string) *pruneHooks { return nil },
+			prep: func(t *testing.T, f *gcFixture, keep string) {
+				p, err := f.cache.BlobPath(keep)
+				if err != nil {
+					t.Fatalf("BlobPath: %v", err)
+				}
+				if err := os.Chtimes(p, f.clock, f.clock); err != nil {
+					t.Fatalf("Chtimes: %v", err)
+				}
+			},
+			wantString: "younger than grace",
+			want:       &SkipRefusal{Kind: RefusedYoung, Reason: EvictKeptYoung},
+		},
+		{
+			name:       "removal error",
+			hooks:      refuse("", errHook),
+			wantString: "remove: " + errHook.Error(),
+			want:       &SkipRefusal{Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed},
+		},
+		{
+			name: "removed report the root contradicts",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+					if digest == keep {
+						return true, "", nil
+					}
+					return true, "", remove()
+				}}
+			},
+			wantString: "remove: unlink reported removed but blob is still present",
+			want:       &SkipRefusal{Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed},
+		},
+		{
+			name:  "already absent carries no refusal",
+			hooks: func(*gcFixture, string) *pruneHooks { return nil },
+			prep: func(t *testing.T, f *gcFixture, keep string) {
+				p, err := f.cache.BlobPath(keep)
+				if err != nil {
+					t.Fatalf("BlobPath: %v", err)
+				}
+				if err := os.Remove(p); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+			},
+			wantString: "already absent",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newGCFixture(t)
+			f.blob("typed-a", time.Hour)
+			b := f.blob("typed-b", time.Hour)
+			nodes, err := f.cache.EnumerateBlobs()
+			if err != nil {
+				t.Fatalf("EnumerateBlobs: %v", err)
+			}
+			plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
+			if err != nil {
+				t.Fatalf("PlanPrune: %v", err)
+			}
+			if tc.prep != nil {
+				tc.prep(t, f, b)
+			}
+			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, tc.hooks(f, b))
+			if err != nil {
+				t.Fatalf("executePrune: %v", err)
+			}
+			if len(rep.Skipped) != 1 || rep.Skipped[0].Digest != b {
+				t.Fatalf("Skipped = %+v; want exactly %s", rep.Skipped, b)
+			}
+			s := rep.Skipped[0]
+			if s.Reason != tc.wantString {
+				t.Errorf("Reason = %q; want %q byte-for-byte", s.Reason, tc.wantString)
+			}
+			if tc.want == nil {
+				if s.Refusal != nil {
+					t.Errorf("Refusal = %+v; want nil", s.Refusal)
+				}
+				return
+			}
+			want := *tc.want
+			want.Digest = b
+			if s.Refusal == nil || *s.Refusal != want {
+				t.Errorf("Refusal = %+v; want %+v", s.Refusal, want)
+			}
+		})
+	}
+}

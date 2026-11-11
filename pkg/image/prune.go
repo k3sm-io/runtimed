@@ -418,6 +418,48 @@ type SkippedBlob struct {
 	Digest string
 	// Reason is a short human-readable refusal reason.
 	Reason string
+	// Refusal is the typed form of Reason for the four refusals an eviction
+	// reports: a guard drop, an unlink-seam refusal, a blob younger than grace
+	// and a failed removal. It is nil on every other skip path. A caller
+	// reads it, never Reason's text.
+	Refusal *SkipRefusal
+}
+
+// SkipRefusalKind names the executor path that refused a blob.
+type SkipRefusalKind string
+
+const (
+	// RefusedByGuard: the pass-level guard dropped the blob.
+	RefusedByGuard SkipRefusalKind = "guard"
+	// RefusedByUnlink: the per-blob unlink seam declined to remove it.
+	RefusedByUnlink SkipRefusalKind = "unlink"
+	// RefusedYoung: re-verification found it younger than grace.
+	RefusedYoung SkipRefusalKind = "young"
+	// RefusedRemoveFailed: the removal failed, or reported success while the
+	// blob is still present.
+	RefusedRemoveFailed SkipRefusalKind = "remove-failed"
+)
+
+// SkipRefusal is one typed refusal: the blob, the path that refused it, and
+// the exported reason. A guard or unlink-seam reason outside the closed set,
+// or none, is EvictKeptUnlinkFailed, so an unnameable refusal reads as a
+// failure rather than as some other verdict.
+type SkipRefusal struct {
+	// Digest is the refused blob's content digest, empty for a temp file.
+	Digest string
+	// Kind is the executor path that refused the blob.
+	Kind SkipRefusalKind
+	// Reason is why the blob was kept.
+	Reason EvictKeepReason
+}
+
+// hookRefusal is the SkipRefusal for a reason a guard or unlink hook gave.
+func hookRefusal(digest string, kind SkipRefusalKind, why evictReason) *SkipRefusal {
+	r, err := exportEvictReason(why)
+	if err != nil {
+		r = EvictKeptUnlinkFailed
+	}
+	return &SkipRefusal{Digest: digest, Kind: kind, Reason: r}
 }
 
 // ExecuteReport summarizes one ExecutePrune run.
@@ -516,13 +558,19 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	skip := func(d PruneDecision, reason string) {
 		rep.Skipped = append(rep.Skipped, SkippedBlob{Path: d.Node.Path, Digest: d.Node.Digest, Reason: reason})
 	}
+	refuse := func(d PruneDecision, reason string, r *SkipRefusal) {
+		rep.Skipped = append(rep.Skipped, SkippedBlob{Path: d.Node.Path, Digest: d.Node.Digest, Reason: reason, Refusal: r})
+	}
+	failed := func(d PruneDecision) *SkipRefusal {
+		return &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed}
+	}
 	for _, d := range plan.Delete {
 		if stop != nil && stop() {
 			rep.StoppedEarly = true
 			break
 		}
 		if why, ok := drop[d.Node.Digest]; ok && d.Node.Digest != "" {
-			skip(d, fmt.Sprintf("dropped by guard: %s", why))
+			refuse(d, fmt.Sprintf("dropped by guard: %s", why), hookRefusal(d.Node.Digest, RefusedByGuard, why))
 			continue
 		}
 		rel := d.Node.Path
@@ -544,28 +592,28 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			continue
 		}
 		if now.Sub(fi.ModTime()) < grace {
-			skip(d, "younger than grace")
+			refuse(d, "younger than grace", &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedYoung, Reason: EvictKeptYoung})
 			continue
 		}
 		if hooks != nil && hooks.unlink != nil {
 			removed, why, err := hooks.unlink(d.Node.Digest, func() error { return root.Remove(rel) })
 			if err != nil {
-				skip(d, fmt.Sprintf("remove: %v", err))
+				refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
 				continue
 			}
 			if !removed {
-				skip(d, fmt.Sprintf("refused by unlink: %s", why))
+				refuse(d, fmt.Sprintf("refused by unlink: %s", why), hookRefusal(d.Node.Digest, RefusedByUnlink, why))
 				continue
 			}
 			if _, err := root.Lstat(rel); err == nil {
-				skip(d, "remove: unlink reported removed but blob is still present")
+				refuse(d, "remove: unlink reported removed but blob is still present", failed(d))
 				continue
 			} else if !errors.Is(err, fs.ErrNotExist) {
-				skip(d, fmt.Sprintf("remove: verify: %v", err))
+				refuse(d, fmt.Sprintf("remove: verify: %v", err), failed(d))
 				continue
 			}
 		} else if err := root.Remove(rel); err != nil {
-			skip(d, fmt.Sprintf("remove: %v", err))
+			refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
 			continue
 		}
 		rep.Deleted++
