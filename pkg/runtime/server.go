@@ -889,10 +889,13 @@ func (r *Runtime) findContainer(p *pod, name string) *containerProc {
 	return nil
 }
 
-// createFailure builds a CreatePodResponse carrying a structured failure.
+// createFailure builds a CreatePodResponse carrying a structured failure. A
+// first start's failure that carries a fixed client sentence publishes it
+// through startErrorReply, as StartContainer and RestartContainer do; CreatePod
+// has already logged the full error once.
 func createFailure(reason runtimev1.FailureReason, err error) *runtimev1.CreatePodResponse {
 	return &runtimev1.CreatePodResponse{
-		Error:         rpcStatus(failureCode(err), "%s", err.Error()),
+		Error:         rpcStatus(failureCode(err), "%s", startErrorReply(err)),
 		FailureReason: reason,
 	}
 }

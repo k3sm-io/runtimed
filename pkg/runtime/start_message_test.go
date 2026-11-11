@@ -255,6 +255,49 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 		})
 	}
 
+	// At first create the same spawn and wrap failures are pod-class, so they
+	// reach a client through the CreatePod reply (createFailure).
+	for i, tc := range restarts[:2] {
+		t.Run("create/"+tc.name, func(t *testing.T) {
+			podID := fmt.Sprintf("pod-create-msg-%d", i)
+			logs := &lockedBuffer{}
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+			sp := &fakeSpawner{}
+			wrap := &atomic.Bool{}
+			rt := newTestRuntimeCfg(t, cfg, Deps{
+				Backend: toggleWrapBackend{fakeBackend: fakeBackend{available: true}, failing: wrap},
+				Signer:  &scriptedSigner{check: func(string) error { return nil }},
+				Spawner: sp,
+				Puller: &fakePuller{
+					manifest:   &runtimev1.ImageManifest{Reference: imageRef, Config: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('c')}},
+					descriptor: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('d')},
+				},
+				Unpacker: &treeUnpacker{
+					files:  map[string]string{"bin/app": "payload"},
+					runCfg: image.ImageRunConfig{Entrypoint: []string{"/bin/app"}},
+				},
+			})
+			box := hostBinBox(rt, podID)
+			box.Containers = []*runtimev1.Container{{Name: "main", Image: imageRef}}
+			rootfs := derivedRootfs(t, rt, podID)
+
+			tc.fail(t, sp, wrap, rt.cache.Root(), box.GetLogDirectory())
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.GetError() == nil {
+				t.Fatal("CreatePod succeeded through a failing first start")
+			}
+			if got := resp.GetFailureReason(); got != tc.reason {
+				t.Errorf("failure_reason = %v, want %v", got, tc.reason)
+			}
+			assertNoHostPaths(t, "CreatePod error", resp.GetError().GetMessage(),
+				`container \"main\"`, `container \"main\"`, tc.sentence, rt.cache.Root(), rootfs, spawnDetail, wrapDetail)
+			assertLoggedOnceAt(t, logs.String(), "level=ERROR", tc.marker, tc.wants)
+		})
+	}
+
 	// The fixed sentence rides beside the error, not instead of it: the
 	// sentinel, the reason and the full text stay what callers match on.
 	t.Run("error-identity", func(t *testing.T) {
