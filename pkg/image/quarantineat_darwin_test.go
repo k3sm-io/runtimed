@@ -25,10 +25,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestAssertNoQuarantineAtNeedsNoReadPermission gates that the descriptor-
-// relative quarantine check does not regress on a file its unprivileged caller
-// cannot read: a 0o200 file is checked by the no-read fallback rather than
-// failing the O_RDONLY open with EACCES.
+// TestAssertNoQuarantineAtNeedsNoReadPermission gates the descriptor-relative
+// quarantine check on an entry its unprivileged caller cannot open for
+// reading: a 0o200 regular file returns nil whether or not it is quarantined
+// (its attribute cannot be read without read permission, and no path is
+// re-resolved to try), and a non-regular entry returns ErrDestinationLink.
 func TestAssertNoQuarantineAtNeedsNoReadPermission(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses the read-permission check this test exercises")
@@ -49,26 +50,29 @@ func TestAssertNoQuarantineAtNeedsNoReadPermission(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	sub := filepath.Join(dirPath, "sub")
+	if err := os.Mkdir(sub, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o755) })
 	dir, err := os.Open(dirPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dir.Close()
-	if _, err := openNoFollowAt(dir, "clean"); !errors.Is(err, unix.EACCES) {
-		t.Fatalf("O_RDONLY open of a 0o200 file: err = %v, want EACCES (the case the fallback covers)", err)
+	for _, name := range []string{"clean", "quarantined", "sub"} {
+		if _, err := openNoFollowAt(dir, name); !errors.Is(err, unix.EACCES) {
+			t.Fatalf("O_RDONLY open of unreadable %s: err = %v, want EACCES (the case the fallback covers)", name, err)
+		}
 	}
 	if err := assertNoQuarantineAt(dir, "clean"); err != nil {
-		t.Fatalf("assertNoQuarantineAt on an unreadable clean file: %v", err)
+		t.Fatalf("assertNoQuarantineAt on an unreadable clean file: %v, want nil", err)
 	}
-	// darwin's getxattr checks read (readextattr) permission too, so for a
-	// 0o200 file the attribute is unreadable by any path, as it was for the
-	// old path-based check: the result must be no error, never EACCES.
-	if _, probeErr := unix.Lgetxattr(quarantined, QuarantineXattr, nil); errors.Is(probeErr, unix.EACCES) {
-		if err := assertNoQuarantineAt(dir, "quarantined"); err != nil {
-			t.Fatalf("assertNoQuarantineAt on an unreadable quarantined file: %v, want nil as the path-based check gave", err)
-		}
-	} else if err := assertNoQuarantineAt(dir, "quarantined"); !errors.Is(err, ErrQuarantined) {
-		t.Fatalf("assertNoQuarantineAt on a quarantined file whose xattr is readable: err = %v, want ErrQuarantined", err)
+	if err := assertNoQuarantineAt(dir, "quarantined"); err != nil {
+		t.Fatalf("assertNoQuarantineAt on an unreadable quarantined file: %v, want nil", err)
+	}
+	if err := assertNoQuarantineAt(dir, "sub"); !errors.Is(err, ErrDestinationLink) {
+		t.Fatalf("assertNoQuarantineAt on an unreadable non-regular entry: err = %v, want ErrDestinationLink", err)
 	}
 
 	// Through MaterializeTree: a re-materialize over a destination that

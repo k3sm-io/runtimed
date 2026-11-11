@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -291,18 +290,15 @@ func assertNoQuarantineAt(dir *os.File, name string) error {
 	})
 }
 
-// quarantineNoReadAt checks an entry its caller cannot open for reading. It
-// first confirms with fstatat(AT_SYMLINK_NOFOLLOW), relative to dir's
-// descriptor, that name is a regular file, then reads the attribute by path
-// with Lgetxattr (getxattr with XATTR_NOFOLLOW), which needs no open and never
-// follows a link at the leaf. darwin's getxattr checks the readextattr right,
-// which an ACL can grant without read but which plain mode bits tie to read;
-// where it is denied the result is nil, exactly what the path-based
-// assertNoQuarantine gave before the descriptor check. This is safe because the
-// read is metadata only and writes nothing: the leaf cannot redirect it (no
-// follow), and the residual window, a parent component of dir's path swapped
-// between the fstatat and the getxattr, can at worst misreport the attribute
-// of an entry this walk already created, never write through a link.
+// quarantineNoReadAt handles an entry its caller cannot open for reading. It
+// confirms with fstatat(AT_SYMLINK_NOFOLLOW), relative to dir's descriptor,
+// that name is a regular file (anything else is ErrDestinationLink) and then
+// returns nil. An unreadable file's quarantine attribute cannot be read without
+// read permission (darwin's getxattr checks readextattr, which plain mode bits
+// tie to read, and there is no fgetxattrat), and the old path-based
+// assertNoQuarantine returned nil there too. No path is re-resolved: a
+// path-based read inside a pod-writable tree could be redirected through a
+// swapped ancestor.
 func quarantineNoReadAt(dir *os.File, name string) error {
 	mode, present, err := lstatAt(dir, name)
 	if err != nil {
@@ -311,10 +307,7 @@ func quarantineNoReadAt(dir *os.File, name string) error {
 	if !present || mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("quarantine check %s: %w", name, ErrDestinationLink)
 	}
-	if _, err := unix.Lgetxattr(filepath.Join(dir.Name(), name), QuarantineXattr, nil); err == nil {
-		return ErrQuarantined
-	}
-	return nil // ENOATTR, no xattr support, or an unexpected error: as assertNoQuarantine
+	return nil
 }
 
 // assertNoQuarantine returns ErrQuarantined if path carries the
