@@ -134,7 +134,11 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// accounting) and it would miss the reverse-order teardown. The supervision
 	// (reaper + watchContainerExit) must outlive this RPC, so detach the spawn
 	// context from the RPC's cancellation (the pull/sign/wrap during a restart are
-	// fast/cache-backed).
+	// fast/cache-backed). It must still stop with the pod: once the spawn
+	// returns, the pod-lifetime supervision context's cancel (DeletePod,
+	// Runtime.Close) is forwarded to it, the shape startGuestLogFollower uses. Not
+	// p.supCtx itself: a delete racing the restart would then abort the pull and
+	// lose the late spawn TestRestartContainerDuringDeleteKillsTheLateSpawn pins.
 	restartRootfs, err := r.rootfsPath(p.box)
 	if err != nil {
 		return restartFailure(codes.InvalidArgument, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, "restart %s: %v", req.GetPodId(), err), nil
@@ -143,12 +147,16 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	// also the floor on its log file's instance number — so the new instance
 	// writes <n+1>.log and the run being replaced keeps its own file for
 	// `kubectl logs --previous` to read.
-	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, restartRootfs, spec, initDeclared, oldRestartCount+1)
+	spawnCtx, cancelSpawn := context.WithCancel(context.WithoutCancel(ctx))
+	newCP, reason, err := r.startContainer(spawnCtx, p, restartRootfs, spec, initDeclared, oldRestartCount+1)
 	if err != nil {
+		cancelSpawn()
 		r.clearRestarting(ctx, p, oldCP)
 		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", err)
 		return restartFailure(codes.Internal, reason, "restart %s/%s: %v", req.GetPodId(), oldCP.name, err), nil
 	}
+	// Fires at once if the pod's supervision is already cancelled.
+	context.AfterFunc(p.supCtx, cancelSpawn)
 
 	// Swap the new container in for the old (the old is now reaped + detached),
 	// carrying the incremented restart_count and the prior run's termination state.

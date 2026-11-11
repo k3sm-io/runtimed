@@ -215,3 +215,61 @@ func TestRestartContainerDuringDeleteKillsTheLateSpawn(t *testing.T) {
 		t.Errorf("deleted pod still tracks %v", tracked)
 	}
 }
+
+// TestRestartContainerReaperStopsOnClose pins the restarted process's
+// supervision to the pod-lifetime context. Close cancels each pod's supCtx and
+// waits (bounded by closeGrace) for the supervision to stop; a restart that
+// spawned under a context detached from supCtx left the replacement's reaper and
+// exit watcher uncancellable, so Close waited out the whole grace and returned
+// ErrSupervisionNotStopped.
+func TestRestartContainerReaperStopsOnClose(t *testing.T) {
+	sp := &fakeSpawner{}
+	w := newBlockingWaiter()
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: w})
+	// The restart SIGKILLs the old group; releasing its pid lets the reaper
+	// stand-in collect the exit so the restart can re-spawn. The replacement's
+	// pid is never released: only the supervision cancel can end its reap.
+	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
+	rt.signalGroup = rec.signal
+
+	mustCreatePod(t, rt, hostBinBox(rt, "pod-rc"))
+
+	resp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{
+		PodId: "pod-rc", Container: "main", Reason: "liveness probe failed",
+	})
+	if err != nil {
+		t.Fatalf("RestartContainer: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("RestartContainer failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
+	}
+
+	rt.mu.Lock()
+	p := rt.pods["pod-rc"]
+	rt.mu.Unlock()
+	if p == nil {
+		t.Fatal("pod-rc not registered")
+	}
+	p.mu.Lock()
+	var done <-chan struct{}
+	for _, cp := range p.containers {
+		if cp.name == "main" {
+			done = cp.proc.Done()
+		}
+	}
+	p.mu.Unlock()
+	if done == nil {
+		t.Fatal("restarted container main not found")
+	}
+
+	start := time.Now()
+	if err := rt.Close(); err != nil {
+		t.Fatalf("Close after a restart: %v", err)
+	}
+	if elapsed, ceiling := time.Since(start), defaultCloseGrace/2; elapsed >= ceiling {
+		t.Errorf("Close took %v, want well under closeGrace (< %v)", elapsed, ceiling)
+	}
+	if !closed(done) {
+		t.Error("restarted process's Done not closed after Close: its reaper was not cancelled")
+	}
+}
