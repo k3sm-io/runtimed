@@ -342,3 +342,80 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 		}
 	})
 }
+
+// TestPullResumesFallsBackOnPartialStoreEnv pins that a partial store whose
+// own environment is unusable does not fail the pull: the layer is fetched
+// whole and verifies. A done context is not retried whole.
+func TestPullResumesFallsBackOnPartialStoreEnv(t *testing.T) {
+	t.Run("partial dir parent does not exist", func(t *testing.T) {
+		c := newCutRegistry(t, 4096)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "missing", "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+
+		res, err := pullAlways(p, c.ref)
+		if err != nil {
+			t.Fatalf("pull over a partial dir with no parent: %v", err)
+		}
+		res.Lease.Release()
+		verifyLayer(t, cache, c)
+	})
+
+	t.Run("partial path is a directory", func(t *testing.T) {
+		c := newCutRegistry(t, 4096)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "partials")
+		store := &registryfetch.PartialStore{Dir: dir}
+		if err := store.EnsureDir(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(partialPath(dir, c.layer), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		p := resumePuller(t, c, cache, store)
+
+		res, err := pullAlways(p, c.ref)
+		if err != nil {
+			t.Fatalf("pull over a partial path that is a directory: %v", err)
+		}
+		res.Lease.Release()
+		verifyLayer(t, cache, c)
+	})
+
+	t.Run("cancelled context does not fall back", func(t *testing.T) {
+		c := newCutRegistry(t, 4096)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "missing", "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// whole would succeed without the network, so only the context
+		// guard can make this fail.
+		whole := func(w io.Writer) error {
+			_, werr := w.Write(c.body)
+			return werr
+		}
+		_, err = p.resumeBlob(ctx, BlobSource{}, c.layer.String(), c.size, whole)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("resumeBlob with a cancelled context: err = %v, want context.Canceled", err)
+		}
+		if cache.Has(c.layer.String()) {
+			t.Fatal("a cancelled pull committed the layer whole")
+		}
+
+		_, err = p.Pull(ctx, c.ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pull with a cancelled context: err = %v, want context.Canceled", err)
+		}
+	})
+}
