@@ -47,6 +47,25 @@ const (
 	volShareDirMode os.FileMode = 0o755
 )
 
+// ErrShareVolumeName marks a vm pod volume whose name cannot become its share
+// directory: it is empty, or not a single clean path component. The pod
+// author fixes it in the pod spec; nothing on the host can.
+var ErrShareVolumeName = errors.New("volume name cannot name a share directory")
+
+// ShareVolumeNameError is MaterializeShares' refusal of a volume name. It
+// names only what the pod wrote (the container and the volume), never a share
+// root, and errors.Is matches it to ErrShareVolumeName.
+type ShareVolumeNameError struct {
+	Container, Volume string
+	Err               error
+}
+
+func (e *ShareVolumeNameError) Error() string {
+	return fmt.Sprintf("container %s: volume %s: %v", e.Container, e.Volume, e.Err)
+}
+
+func (e *ShareVolumeNameError) Unwrap() []error { return []error{ErrShareVolumeName, e.Err} }
+
 // MaterializeShares renders a computed SharePlan's pooled-share content onto
 // disk: it creates each pod-dir share root (rootfs / proj / vols), materializes
 // every proj-share bind's volume into <projRoot>/<volume name>, and creates
@@ -161,7 +180,7 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string
 			// guard against a name that would address a sibling or an ancestor
 			// of the share root.
 			if err := validateVMPathComponent("volume name", b.SourceRel); err != nil {
-				return fmt.Errorf("container %s: volume %s: %w", cname, b.VolumeName, err)
+				return &ShareVolumeNameError{Container: cname, Volume: b.VolumeName, Err: err}
 			}
 			dir := filepath.Join(root, b.SourceRel)
 			if prev, dup := seen[dir]; dup {

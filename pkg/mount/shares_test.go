@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -266,8 +267,19 @@ func TestMaterializeSharesRejectsTraversingVolumeName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeSharePlan: %v", err)
 	}
-	if err := MaterializeShares(context.Background(), box, podDir, plan, "", nil); err == nil {
+	err = MaterializeShares(context.Background(), box, podDir, plan, "", nil)
+	if err == nil {
 		t.Fatal("a traversing volume name must be rejected")
+	}
+	var nameErr *ShareVolumeNameError
+	if !errors.Is(err, ErrShareVolumeName) || !errors.As(err, &nameErr) {
+		t.Fatalf("err = %v, want a ShareVolumeNameError", err)
+	}
+	if nameErr.Container != "main" || nameErr.Volume != "../escape" {
+		t.Errorf("refusal names container %q volume %q", nameErr.Container, nameErr.Volume)
+	}
+	if strings.Contains(err.Error(), workRoot) {
+		t.Errorf("refusal %q names the share root", err)
 	}
 	if _, err := os.Stat(filepath.Join(workRoot, "pods", "escape")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the traversing name must not have been materialized")
