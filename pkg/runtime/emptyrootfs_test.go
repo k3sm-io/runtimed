@@ -350,3 +350,176 @@ func TestCreatePodClearsAnUnreadableStaleRootfs(t *testing.T) {
 		t.Errorf("rootfs after create = (%v, %v), want a fresh usable directory", fi, err)
 	}
 }
+
+// TestCreatePodReplacesASymlinkedRootfsEntry pins that a stale rootfs entry
+// that is itself a symlink to a directory outside the pod dir is unlinked, not
+// followed: the outside directory and its file survive and rootfs is a real
+// directory afterwards.
+func TestCreatePodReplacesASymlinkedRootfsEntry(t *testing.T) {
+	const podID = "pod-rootfs-link"
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: newBlockingWaiter()})
+	podDir, err := rt.podDir(podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	keep := filepath.Join(outside, "keep")
+	if err := os.WriteFile(keep, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(podDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(podDir, "rootfs")
+	if err := os.Symlink(outside, rootfs); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod = (%v, %v), want success", resp, err)
+	}
+	if b, err := os.ReadFile(keep); err != nil || string(b) != "outside" {
+		t.Errorf("file in the outside directory = (%q, %v), want it intact", b, err)
+	}
+	if fi, err := os.Lstat(rootfs); err != nil || !fi.Mode().IsDir() {
+		t.Errorf("Lstat(rootfs) = (%v, %v), want a real directory, not a symlink", fi, err)
+	}
+}
+
+// TestCreatePodReplacesAFileRootfsEntry pins that a stale rootfs entry that is
+// a regular file is replaced and the create succeeds with a directory.
+func TestCreatePodReplacesAFileRootfsEntry(t *testing.T) {
+	const podID = "pod-rootfs-file"
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: newBlockingWaiter()})
+	podDir, err := rt.podDir(podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(podDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(podDir, "rootfs")
+	if err := os.WriteFile(rootfs, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod = (%v, %v), want success", resp, err)
+	}
+	if fi, err := os.Lstat(rootfs); err != nil || !fi.Mode().IsDir() {
+		t.Errorf("Lstat(rootfs) = (%v, %v), want a directory", fi, err)
+	}
+}
+
+// TestCreatePodRepeatLeavesARegisteredPodRootfs pins that a repeated CreatePod
+// for an already registered pod leaves a file placed in its rootfs untouched
+// and returns the pod's status without error.
+func TestCreatePodRepeatLeavesARegisteredPodRootfs(t *testing.T) {
+	const podID = "pod-repeat"
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: newBlockingWaiter()})
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("first CreatePod = (%v, %v), want success", resp, err)
+	}
+	podDir, err := rt.podDir(podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed := filepath.Join(podDir, "rootfs", "placed")
+	if err := os.WriteFile(placed, []byte("after-first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err = rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("repeated CreatePod = (%v, %v), want the status and no error", resp, err)
+	}
+	if got := resp.GetStatus().GetPodId(); got != podID {
+		t.Errorf("repeated CreatePod status pod id = %q, want %q", got, podID)
+	}
+	if b, err := os.ReadFile(placed); err != nil || string(b) != "after-first" {
+		t.Errorf("file placed after the first create = (%q, %v), want it intact", b, err)
+	}
+}
+
+// TestFailedCreateReleasesItsClaim pins that a create that fails releases its
+// claim: a following CreatePod of the same id succeeds and createClaims is
+// empty afterwards.
+func TestFailedCreateReleasesItsClaim(t *testing.T) {
+	const podID = "pod-claim"
+	sp := &gatedSpawner{fail: true, entered: make(chan struct{}), release: make(chan struct{})}
+	rt := newTestRuntime(t, Deps{Spawner: sp, Waiter: newBlockingWaiter()})
+	first := startHeldCreate(t, rt, sp, podID)
+	close(sp.release)
+	r := waitResult(t, first, "first create")
+	if r.err != nil || r.resp.GetError() == nil {
+		t.Fatalf("first CreatePod = (%v, %v), want a create failure", r.resp, r.err)
+	}
+
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("following CreatePod = (%v, %v), want success", resp, err)
+	}
+	rt.mu.Lock()
+	n := len(rt.createClaims)
+	rt.mu.Unlock()
+	if n != 0 {
+		t.Errorf("createClaims has %d entries after both creates, want 0", n)
+	}
+}
+
+// TestCreatePodWithAnUnreadableNonEmptyStaleDir pins today's behaviour for a
+// non-empty directory the process cannot read inside the stale rootfs
+// (rootfs/d holding f, d at mode 000): the create fails cleanly with the
+// rootfs-setup reason (RemoveAll cannot empty d), registers no pod, and a
+// retry after the mode is restored succeeds with a fresh empty rootfs.
+func TestCreatePodWithAnUnreadableNonEmptyStaleDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-000 directory")
+	}
+	const podID = "pod-unreadable-nested"
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: newBlockingWaiter()})
+	podDir, err := rt.podDir(podID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(podDir, "rootfs")
+	d := filepath.Join(rootfs, "d")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "f"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(d, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(d, 0o755) })
+
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() == nil {
+		t.Fatalf("CreatePod = (%v, %v), want a create failure", resp, err)
+	}
+	if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP {
+		t.Errorf("reason = %v, want ROOTFS_SETUP", got)
+	}
+	rt.mu.Lock()
+	_, live := rt.pods[podID]
+	rt.mu.Unlock()
+	if live {
+		t.Error("pod registered after a failed create")
+	}
+
+	if err := os.Chmod(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("retry CreatePod = (%v, %v), want success", resp, err)
+	}
+	if _, err := os.Lstat(d); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("stale d after the retry: %v, want it gone", err)
+	}
+}
