@@ -487,6 +487,54 @@ func TestStallReaderLostStopRace(t *testing.T) {
 		readOne(t, s, ft, pw, "cd")
 	})
 
+	// A fire that arrives after Close is stale: Close bumped the generation, so
+	// the body is closed once (by Close) and later Reads see the closed body, not
+	// a stall. The generation bump in Close matters while a Read is still in
+	// flight, so that case uses a body whose Read outlives its Close.
+	t.Run("the fire runs after Close, its Read having returned", func(t *testing.T) {
+		ft := newFakeTimer()
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		body := &countingCloser{PipeReader: pr}
+		s := newFakeStallReader(body, window, ft)
+
+		stale := readOne(t, s, ft, pw, "ab")
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close = %v, want nil", err)
+		}
+		stale()
+		if got := body.closes.Load(); got != 1 {
+			t.Fatalf("body closed %d times, want 1 (by Close)", got)
+		}
+		if _, err := s.Read(make([]byte, 8)); errors.Is(err, ErrLayerBodyStalled) || !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("Read after Close and a stale fire = %v, want io.ErrClosedPipe and no stall", err)
+		}
+	})
+
+	t.Run("the fire runs after Close, its Read still in flight", func(t *testing.T) {
+		ft := newFakeTimer()
+		body := &lingeringBody{release: make(chan struct{})}
+		s := newFakeStallReader(body, window, ft)
+		waitArmed(t, ft, "the stopped timer start created never armed")
+
+		drainArmed(ft)
+		done := readAsync(s)
+		waitArmed(t, ft, "the Read never armed the watchdog")
+		stale := ft.lastCallback()
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close = %v, want nil", err)
+		}
+		stale()
+		close(body.release)
+		awaitRead(t, done, "the in-flight Read never returned")
+		if got := body.closes.Load(); got != 1 {
+			t.Fatalf("body closed %d times, want 1 (by Close)", got)
+		}
+		if _, err := s.Read(make([]byte, 8)); errors.Is(err, ErrLayerBodyStalled) || !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("Read after Close and a stale fire = %v, want io.ErrClosedPipe and no stall", err)
+		}
+	})
+
 	t.Run("the fire runs while a later Read is in flight", func(t *testing.T) {
 		ft := newFakeTimer()
 		pr, pw := io.Pipe()
@@ -522,4 +570,22 @@ func TestStallReaderLostStopRace(t *testing.T) {
 			t.Fatalf("body closed %d times by its own window, want 1", got)
 		}
 	})
+}
+
+// lingeringBody is a body whose in-flight Read outlives its Close: Read
+// returns only once release is closed, and a Read on a closed body reports
+// io.ErrClosedPipe, as a pipe does.
+type lingeringBody struct {
+	release chan struct{}
+	closes  atomic.Int32
+}
+
+func (l *lingeringBody) Read([]byte) (int, error) {
+	<-l.release
+	return 0, io.ErrClosedPipe
+}
+
+func (l *lingeringBody) Close() error {
+	l.closes.Add(1)
+	return nil
 }
