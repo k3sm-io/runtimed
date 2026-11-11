@@ -92,11 +92,13 @@ func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (
 	}
 	if r.views == nil {
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: pod %s: artifact views unavailable: %w", ErrArtifactMountRefused, box.GetPodId(), r.viewsErr)
+			artifactViewsUnavailable(box.GetPodId(), r.viewsErr)
 	}
 	if err := r.holdArtifacts(ctx, box, vols); err != nil {
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err)
+			withArtifactMessage(fmt.Sprintf("%s: pod %s: its artifact hold could not be recorded; the daemon log has the cause",
+				ErrArtifactMountRefused, box.GetPodId()),
+				fmt.Errorf("%w: pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err))
 	}
 	views := mount.ImageViews{Root: r.views.Root(), ByVolume: make(map[string]string, len(vols))}
 	for _, v := range vols {
@@ -113,9 +115,25 @@ func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (
 // An error begins with its stable reason, then names the pod and the volume.
 func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vol *runtimev1.Volume) (string, runtimev1.FailureReason, error) {
 	ref := vol.GetImage().GetReference()
+	// subject is the "pod <id> image volume <name>" token every refusal of vol
+	// carries after its stable reason; the provider attributes it by that.
+	subject := fmt.Sprintf("pod %s image volume %s", box.GetPodId(), vol.GetName())
+	quoted := image.QuoteBounded(ref, maxArtifactRefBytes)
+	// pullRefused publishes err whole: a malformed reference, a foreign
+	// registry or a cancellation names only what the pod wrote.
 	pullRefused := func(err error) (string, runtimev1.FailureReason, error) {
 		return "", artifactPullReason(err),
-			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactPullRefused, box.GetPodId(), vol.GetName(), err)
+			fmt.Errorf("%w: %s: %w", ErrArtifactPullRefused, subject, err)
+	}
+	// fetchRefused publishes a fixed sentence in err's place: a credential or
+	// fetch error can name the artifact store, the cache or a staging path.
+	// Its class is the one artifactPullReason types, never err's text.
+	fetchRefused := func(err error) (string, runtimev1.FailureReason, error) {
+		reason := artifactPullReason(err)
+		return "", reason, withArtifactMessage(
+			fmt.Sprintf("%s: %s: image %s could not be fetched%s; the daemon log has the cause",
+				ErrArtifactPullRefused, subject, quoted, artifactPullClass(reason)),
+			fmt.Errorf("%w: %s: %w", ErrArtifactPullRefused, subject, err))
 	}
 	if err := image.ValidateReference(ref); err != nil {
 		return pullRefused(err)
@@ -139,7 +157,7 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
 	}()
 	if err != nil {
-		return pullRefused(err)
+		return fetchRefused(err)
 	}
 	// The lease pins the blobs until the pod's hold names the manifest; from
 	// then on the hold keeps the manifest's blobs and views for the pod's life,
@@ -147,12 +165,16 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	defer res.Lease.Release()
 	if err := r.holdManifest(ctx, box, res); err != nil {
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), err)
+			withArtifactMessage(fmt.Sprintf("%s: %s: image %s could not be recorded in the pod's artifact hold; the daemon log has the cause",
+				ErrArtifactMountRefused, subject, quoted),
+				fmt.Errorf("%w: %s: %w", ErrArtifactMountRefused, subject, err))
 	}
 	view, err := r.views.View(ctx, res.ManifestDigest, nil)
 	if err != nil {
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: pod %s image volume %s: build view of %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), res.ManifestDigest, err)
+			withArtifactMessage(fmt.Sprintf("%s: %s: the view of image %s could not be built; the daemon log has the cause",
+				ErrArtifactMountRefused, subject, quoted),
+				fmt.Errorf("%w: %s: build view of %s: %w", ErrArtifactMountRefused, subject, res.ManifestDigest, err))
 	}
 	r.log.Info("image volume view ready", "pod", box.GetPodId(), "reference", ref, "digest", res.ManifestDigest, "fetched", res.Fetched)
 	return view, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
@@ -166,9 +188,37 @@ func (r *Runtime) linkedImageViews(box *runtimev1.PodBox, rootfs string) ([]stri
 		return nil, err
 	}
 	if r.views == nil {
-		return nil, fmt.Errorf("%w: artifact views unavailable: %w", ErrArtifactMountRefused, r.viewsErr)
+		return nil, artifactViewsUnavailable(box.GetPodId(), r.viewsErr)
 	}
 	return mount.LinkedImageViews(box, rootfs, r.views.Root())
+}
+
+// maxArtifactRefBytes bounds the quoted image reference in an image volume's
+// fixed refusal sentence.
+const maxArtifactRefBytes = 512
+
+// artifactViewsUnavailable is the refusal of pod podID's image volumes when
+// the daemon could not open its artifact views; viewsErr names the views root.
+func artifactViewsUnavailable(podID string, viewsErr error) error {
+	return withArtifactMessage(fmt.Sprintf("%s: pod %s: artifact views are unavailable on this node; the daemon log has the cause",
+		ErrArtifactMountRefused, podID),
+		fmt.Errorf("%w: pod %s: artifact views unavailable: %w", ErrArtifactMountRefused, podID, viewsErr))
+}
+
+// artifactPullClass names, for a fixed fetch refusal, the class a pod author
+// or operator acts on, in the terms artifactPullReason types it; "" for a
+// transfer or registry failure, whose detail only the daemon log has.
+func artifactPullClass(reason runtimev1.FailureReason) string {
+	switch reason {
+	case runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL:
+		return " (its pull credential could not be resolved)"
+	case runtimev1.FailureReason_FAILURE_REASON_RESOURCE_EXHAUSTED:
+		return " (the node's artifact store is short of space)"
+	case runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX:
+		return " (it is not served by this node's cluster registry)"
+	default:
+		return ""
+	}
 }
 
 // holdArtifacts records, durably and before any fetch, that box's pod holds

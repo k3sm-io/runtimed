@@ -2440,6 +2440,10 @@ var errAdHocSign = errors.New("ad-hoc sign")
 type clientMessageError struct {
 	message string
 	err     error
+	// unquoted publishes message in an RPC reply as it is, not quoted: an
+	// image volume's refusal is matched by its leading stable reason. Its
+	// message quotes everything the pod wrote that is not a validated name.
+	unquoted bool
 }
 
 func (e *clientMessageError) Error() string { return e.err.Error() }
@@ -2448,6 +2452,12 @@ func (e *clientMessageError) Unwrap() error { return e.err }
 // withClientMessage pairs err with the fixed sentence a client sees in its place.
 func withClientMessage(message string, err error) error {
 	return &clientMessageError{message: message, err: err}
+}
+
+// withArtifactMessage is withClientMessage for an image volume's refusal,
+// whose reply begins with its stable reason, unquoted (startErrorReply).
+func withArtifactMessage(message string, err error) error {
+	return &clientMessageError{message: message, err: err, unquoted: true}
 }
 
 // spawnStartError is the start failure for container name whose spawn failed

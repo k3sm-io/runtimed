@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 
@@ -325,9 +326,21 @@ func initContainerIndex(box *runtimev1.PodBox, name string) int {
 func startErrorReply(err error) string {
 	var ge *clientMessageError
 	if errors.As(err, &ge) {
+		if ge.unquoted {
+			return boundUnquoted(ge.message, maxReplyMessageBytes)
+		}
 		return image.QuoteBounded(ge.message, maxReplyMessageBytes)
 	}
 	return err.Error()
+}
+
+// boundUnquoted cuts s to at most max bytes on a rune boundary, marking a cut
+// with "...".
+func boundUnquoted(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "") + "..."
 }
 
 // maxReplyMessageBytes bounds a fixed client sentence in an RPC reply.
