@@ -1258,8 +1258,15 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		if cerr := ctx.Err(); cerr != nil {
 			return false, fmt.Errorf("layer %s: %w (partial store: %w)", digest, cerr, err)
 		}
-		p.logger().Warn("layer partial store unusable; fetching it whole",
-			"digest", digest, "error", err)
+		if errors.Is(err, registryfetch.ErrPartialDir) || errors.Is(err, registryfetch.ErrPartialFile) {
+			// A planted owner, mode, symlink or special file is not an
+			// ordinary environment fault.
+			p.logger().Error("layer partial store unusable; fetching it whole",
+				"digest", digest, "error", err, "possibleTampering", true)
+		} else {
+			p.logger().Warn("layer partial store unusable; fetching it whole",
+				"digest", digest, "error", err)
+		}
 		return p.writeBlob(digest, size, whole)
 	case err == nil && reached && from > 0:
 		p.logger().Info("layer resumed from a partial",
