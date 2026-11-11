@@ -24,8 +24,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -332,4 +334,159 @@ func TestConcurrentExecsShareOneGate(t *testing.T) {
 			other.wantRan(t)
 		})
 	})
+}
+
+// timeoutSigner gives no verdict on a file ending in suffix: with hang unset its
+// Check returns image.ErrSignatureCheckTimeout at once, and with hang set it blocks
+// until its context ends, as codesign does on a dead policy daemon, so the gate's
+// own deadline produces the sentinel. entered closes on the first such check.
+// Every other file passes.
+type timeoutSigner struct {
+	suffix  string
+	hang    bool
+	once    sync.Once
+	entered chan struct{}
+	checks  atomic.Int32
+	signs   atomic.Int32
+}
+
+func newTimeoutSigner(hang bool) *timeoutSigner {
+	return &timeoutSigner{suffix: "/bin/tool", hang: hang, entered: make(chan struct{})}
+}
+
+func (s *timeoutSigner) Sign(context.Context, string, string) error {
+	s.signs.Add(1)
+	return nil
+}
+
+func (s *timeoutSigner) Check(ctx context.Context, _ runtimev1.SignaturePolicy, path string) error {
+	if !strings.HasSuffix(path, s.suffix) {
+		return nil
+	}
+	s.checks.Add(1)
+	s.once.Do(func() { close(s.entered) })
+	if !s.hang {
+		return fmt.Errorf("check %s: %w", path, image.ErrSignatureCheckTimeout)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func requireSigned(box *runtimev1.PodBox) {
+	box.SignaturePolicy = runtimev1.SignaturePolicy_SIGNATURE_POLICY_REQUIRE_SIGNED
+}
+
+// TestExecGateTimeoutIsUnavailable pins that a check which timed out reads as
+// retryable, not as a refusal: it gave no verdict about the file.
+func TestExecGateTimeoutIsUnavailable(t *testing.T) {
+	logs := &lockedBuffer{}
+	cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	p := newExecArgvPodCfg(t, cfg, map[string]string{"bin/tool": imageScript}, newTimeoutSigner(false), requireSigned)
+
+	got, _, err := p.exec(t, "/bin/tool")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("Exec error = %v, want Unavailable", err)
+	}
+	if got != "" {
+		t.Errorf("a timed-out exec reached the confinement seam with argv[0] %q", got)
+	}
+	msg := status.Convert(err).Message()
+	for _, want := range []string{`"/bin/tool"`, "timed out", "may be retried"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q does not contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "refused") {
+		t.Errorf("message %q calls a timeout a refusal", msg)
+	}
+	if strings.Contains(msg, p.rt.cfg.Root) {
+		t.Errorf("message %q shows the caller a host path under %q", msg, p.rt.cfg.Root)
+	}
+	line := logs.String()
+	if !strings.Contains(line, "timed out") {
+		t.Errorf("daemon log %q does not say the check timed out", line)
+	}
+	if strings.Contains(line, "refused") {
+		t.Errorf("daemon log %q calls a timeout a refusal", line)
+	}
+}
+
+// TestExecGateRejectionStaysFailedPrecondition pins that a real verdict against
+// the file is still a refusal.
+func TestExecGateRejectionStaysFailedPrecondition(t *testing.T) {
+	signer := pathErrorSigner{suffix: "/bin/tool", signErr: errors.New("no space left")}
+	p := newExecArgvPod(t, map[string]string{"bin/tool": imageScript}, signer, requireSigned)
+
+	got, _, err := p.exec(t, "/bin/tool")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Exec error = %v, want FailedPrecondition", err)
+	}
+	if got != "" {
+		t.Errorf("a refused exec reached the confinement seam with argv[0] %q", got)
+	}
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, "refused by the signature gate") {
+		t.Errorf("message %q lost the refusal text", msg)
+	}
+}
+
+// TestExecGateCancelStaysContextError pins that a session cancelled while its
+// check hangs is reported as the cancellation, not as a timed-out check.
+func TestExecGateCancelStaysContextError(t *testing.T) {
+	shortenSignatureTimeouts(t, time.Minute, time.Minute)
+	signer := newTimeoutSigner(true)
+	p := newExecArgvPod(t, map[string]string{"bin/tool": imageScript}, signer, requireSigned)
+
+	before := p.wrapCalls()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := newFakeExecStream(ctx)
+	st.feed(&runtimev1.ExecRequest{PodId: p.podID, Command: []string{"/bin/tool"}})
+	st.closeSend()
+	errc := make(chan error, 1)
+	go func() { errc <- p.rt.Exec(st) }()
+
+	select {
+	case <-signer.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the signature check was never entered")
+	}
+	cancel()
+	var err error
+	select {
+	case err = <-errc:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Exec did not return after its context was cancelled")
+	}
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("Exec error = %v, want Canceled", err)
+	}
+	if n := p.wrapCalls() - before; n != 0 {
+		t.Errorf("a cancelled exec reached the confinement seam %d times", n)
+	}
+}
+
+// TestExecGateTimeoutNeverRunsBinary pins that a check cut off by the gate's own
+// deadline fails closed: the file is neither signed nor wrapped nor run.
+func TestExecGateTimeoutNeverRunsBinary(t *testing.T) {
+	shortenSignatureTimeouts(t, 100*time.Millisecond, time.Minute)
+	signer := newTimeoutSigner(true)
+	p := newExecArgvPod(t, map[string]string{"bin/tool": imageScript}, signer, requireSigned)
+
+	before := p.wrapCalls()
+	got, stdout, err := p.exec(t, "/bin/tool")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("Exec error = %v, want Unavailable", err)
+	}
+	if got != "" || stdout != "" {
+		t.Errorf("a timed-out exec ran: argv[0] %q, stdout %q", got, stdout)
+	}
+	if n := p.wrapCalls() - before; n != 0 {
+		t.Errorf("a timed-out exec reached the confinement seam %d times", n)
+	}
+	if n := signer.checks.Load(); n == 0 {
+		t.Error("the gate never checked the file")
+	}
+	if n := signer.signs.Load(); n != 0 {
+		t.Errorf("a timed-out check led to %d signs", n)
+	}
 }

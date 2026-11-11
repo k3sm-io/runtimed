@@ -36,6 +36,7 @@ import (
 
 	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/execsession"
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/pathsafe"
 	"k3sm.io/runtimed/pkg/supervisor"
 
@@ -237,8 +238,13 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	policy := p.box.GetSignaturePolicy()
 	err = p.execGates.do(ctx, bin, func(ctx context.Context) error {
 		err := r.gateSignature(ctx, policy, rootfs, bin, false)
-		if err != nil && ctx.Err() == nil {
+		switch {
+		case err == nil || ctx.Err() != nil:
+		case errors.Is(err, image.ErrSignatureCheckTimeout):
 			// The gate's errors name the host rootfs, which is the daemon's to know.
+			r.log.Warn("exec: signature check of an image file timed out",
+				"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
+		default:
 			r.log.Warn("exec: signature gate refused an image file",
 				"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
 		}
@@ -249,6 +255,12 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 		// says whether this was a refusal at all.
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, status.FromContextError(cerr).Err()
+		}
+		// A check that ran out of time gave no verdict: the policy daemon may be
+		// down, so it is reported as retryable rather than as a refusal.
+		if errors.Is(err, image.ErrSignatureCheckTimeout) {
+			return nil, status.Errorf(codes.Unavailable,
+				"exec: signature check of %q timed out under %s; it gave no verdict and may be retried", argv0, policy)
 		}
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"exec: %q refused by the signature gate under %s; the daemon log has the cause", argv0, policy)
