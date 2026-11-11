@@ -137,7 +137,9 @@ func TestFlatTransportHeaderTimeout(t *testing.T) {
 	if tr.Proxy != nil {
 		t.Fatal("flat transport has a proxy function")
 	}
-	c := &http.Client{Transport: tr}
+	// The client deadline is only a hard stop: without the header bound the
+	// request would otherwise hang, and the assertion below must fail instead.
+	c := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 
 	start := time.Now()
 	resp, err := c.Get("http://" + host + "/v2/")
@@ -207,7 +209,7 @@ func TestExternalTransportHeaderTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	resp, err := (&http.Client{Transport: tr}).Get("http://" + silentServer(t) + "/v2/")
+	resp, err := (&http.Client{Transport: tr, Timeout: 10 * time.Second}).Get("http://" + silentServer(t) + "/v2/")
 	if err == nil {
 		resp.Body.Close()
 		t.Fatal("GET on a silent registry succeeded")
