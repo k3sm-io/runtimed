@@ -124,7 +124,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return r.execFailure(p, c.GetName(), codes.Internal,
-			fmt.Sprintf("exec: %q could not be sandboxed; the daemon log has the cause", cmdv[0]), err)
+			fmt.Sprintf("exec: %s could not be sandboxed; the daemon log has the cause", quoteArgv0(cmdv[0])), err)
 	}
 	defer func() { _ = cleanup() }()
 
@@ -233,9 +233,9 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	if err != nil {
 		// The error names the resolved host path and the pod rootfs; the
 		// reply names only the argv[0] the tenant sent.
-		sentence := fmt.Sprintf("exec: %q could not be resolved in the container image; the daemon log has the cause", argv0)
+		sentence := fmt.Sprintf("exec: %s could not be resolved in the container image; the daemon log has the cause", quoteArgv0(argv0))
 		if errors.Is(err, ErrImageArgvEscapes) {
-			sentence = fmt.Sprintf("exec: %q resolves outside the container image and was refused", argv0)
+			sentence = fmt.Sprintf("exec: %s resolves outside the container image and was refused", quoteArgv0(argv0))
 		}
 		return nil, r.execFailure(p, c.GetName(), codes.InvalidArgument, sentence, err)
 	}
@@ -372,16 +372,33 @@ func (f *execGateFlights) run(ctx context.Context, path string, call *execGateCa
 // execFailure logs err, whose text can name host paths (the pod rootfs, the
 // cache root, a sandbox staging file), once at Warn with the pod and container,
 // and returns a status carrying only sentence, which names what the client
-// sent and nothing of the host.
+// sent and nothing of the host. err embeds the tenant's argv[0] and the path it
+// resolved to, so its text is cut to execFailureLogCap bytes and quoted by
+// image.QuoteBounded (which marks a cut with "..."): one megabyte-long argv[0]
+// is one bounded Warn line, not megabytes of daemon log.
 func (r *Runtime) execFailure(p *pod, container string, code codes.Code, sentence string, err error) error {
-	r.log.Warn("exec failed", "pod", p.box.GetPodId(), "container", container, "err", err)
+	r.log.Warn("exec failed", "pod", p.box.GetPodId(), "container", container,
+		"err", image.QuoteBounded(err.Error(), execFailureLogCap))
 	return status.Error(code, sentence)
+}
+
+// execFailureLogCap bounds the error text execFailure logs. It is a few KB, not
+// the reply's cap: the log line is the operator's only copy of the host paths,
+// so it keeps room for the rootfs and the resolved path of a sane argv[0].
+const execFailureLogCap = 4096
+
+// quoteArgv0 quotes the tenant's argv[0] for an exec failure reply, cut to
+// maxWaitingMessageBytes (the cap the start path's boundedFailureMessage puts on
+// a reply-bound string) by image.QuoteBounded, so a megabyte-long argv[0] cannot
+// make a megabyte-long reply.
+func quoteArgv0(argv0 string) string {
+	return image.QuoteBounded(argv0, maxWaitingMessageBytes)
 }
 
 // execPrepareSentence is the reply for an exec whose session could not be set
 // up after its command was sandboxed: its environment or its launch payload.
 func execPrepareSentence(argv0 string) string {
-	return fmt.Sprintf("exec of %q could not be prepared; the daemon log has the cause", argv0)
+	return fmt.Sprintf("exec of %s could not be prepared; the daemon log has the cause", quoteArgv0(argv0))
 }
 
 // resolveImageExecPath resolves an exec session's absolute argv[0] in the pod

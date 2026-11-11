@@ -91,6 +91,39 @@ func TestExecFailureMessageHidesHostPaths(t *testing.T) {
 			assertLoggedOnce(t, strings.TrimPrefix(logs.String(), before), tc.marker(p), tc.wants(p))
 		})
 	}
+	// A 1 MiB argv[0] that escapes the rootfs: the reply and the one Warn
+	// line are bounded, and the reply keeps the fixed sentence's prefix.
+	t.Run("megabyte_argv0_is_bounded", func(t *testing.T) {
+		logs := &lockedBuffer{}
+		cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+		p := newExecArgvPodCfg(t, cfg, nil, nil, nil)
+		before := logs.String()
+		argv0 := "/../../" + strings.Repeat("a", 1<<20)
+		_, _, err := p.exec(t, argv0)
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("Exec error = %v, want %v", err, codes.InvalidArgument)
+		}
+		msg := status.Convert(err).Message()
+		if len(msg) >= 1<<10 {
+			t.Errorf("reply is %d bytes, want under 1 KiB", len(msg))
+		}
+		if prefix := `exec: "/../../aaa`; !strings.HasPrefix(msg, prefix) {
+			t.Errorf("reply %.80q does not start with %q", msg, prefix)
+		}
+		got := strings.TrimPrefix(logs.String(), before)
+		var warns []string
+		for _, line := range strings.Split(got, "\n") {
+			if strings.Contains(line, "exec failed") {
+				warns = append(warns, line)
+			}
+		}
+		if len(warns) != 1 {
+			t.Fatalf("got %d exec failed lines, want 1", len(warns))
+		}
+		if len(warns[0]) >= 16<<10 {
+			t.Errorf("Warn line is %d bytes, want under 16 KiB", len(warns[0]))
+		}
+	})
 }
 
 // plantedStaging is a sandbox staging path under p's cache root, the shape of
