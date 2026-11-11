@@ -680,82 +680,143 @@ func TestChownForFSGroup(t *testing.T) {
 }
 
 // TestChownForFSGroupSkipsHardLinkedFiles pins that the fsGroup pass never
-// changes an inode it cannot prove belongs to the tree: a non-directory with a
-// link count above one may share its inode with a file outside root, so the
-// pass skips it (no error) while still converting the ordinary file beside it.
-// It is root-free: the target gid is a group this process is a member of,
-// chosen to differ from the canary's current group where possible so a group
-// change would be observable, and the mode change (0600 -> 0660) is the signal
-// that holds on any host.
+// changes an inode it cannot prove belongs to the tree: an inode with a name
+// outside root is skipped for every in-tree name (no error), while the ordinary
+// file beside it is still converted. It is root-free: the target gid is a group
+// this process is a member of, chosen to differ from the canary's current group
+// where possible so a group change would be observable, and the mode change
+// (0600 -> 0660) is the signal that holds on any host.
 func TestChownForFSGroupSkipsHardLinkedFiles(t *testing.T) {
-	if os.Getgid() <= 0 {
-		t.Skip("test process gid <= 0 (running as root?); fsGroup chown asserts a >0 gid")
-	}
-	base := t.TempDir()
-	podsRoot := filepath.Join(base, "pods")
-	root := filepath.Join(podsRoot, "pod-a", "rootfs")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// The canary lives outside root (and outside the pods root entirely).
-	canary := filepath.Join(base, "outside-canary")
-	if err := os.WriteFile(canary, []byte("host"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(canary, 0o600); err != nil { // defeat umask either way
-		t.Fatal(err)
-	}
-	if err := os.Link(canary, filepath.Join(root, "linked")); err != nil {
-		t.Fatal(err)
-	}
-	ordinary := filepath.Join(root, "ordinary")
-	if err := os.WriteFile(ordinary, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(ordinary, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	before, err := os.Lstat(canary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	beforeGid := int(before.Sys().(*syscall.Stat_t).Gid)
-	gid := os.Getgid()
-	if groups, gerr := os.Getgroups(); gerr == nil {
-		for _, g := range groups {
-			if g > 0 && g != beforeGid {
-				gid = g
-				break
+	for _, tc := range []struct {
+		name   string
+		inTree []string // in-tree names linked to the outside canary
+	}{
+		{name: "one in-tree name", inTree: []string{"linked"}},
+		{name: "two in-tree names", inTree: []string{"linked", "sub/linked2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			podsRoot, root := fsGroupTree(t)
+			// The canary lives outside root (and outside the pods root entirely).
+			canary := filepath.Join(filepath.Dir(podsRoot), "outside-canary")
+			writeMode(t, canary, 0o600)
+			for _, n := range tc.inTree {
+				if err := os.Link(canary, filepath.Join(root, n)); err != nil {
+					t.Fatal(err)
+				}
 			}
-		}
+			ordinary := filepath.Join(root, "ordinary")
+			writeMode(t, ordinary, 0o600)
+
+			before := lstatT(t, canary)
+			gid := fsGroupTestGid(int(before.Gid))
+
+			if err := ChownForFSGroup(podsRoot, root, gid); err != nil {
+				t.Fatalf("ChownForFSGroup: %v", err)
+			}
+
+			after := lstatT(t, canary)
+			if after.Mode != before.Mode {
+				t.Errorf("outside canary mode = %o, want unchanged %o (hard link inside root was followed)", after.Mode, before.Mode)
+			}
+			if after.Gid != before.Gid {
+				t.Errorf("outside canary gid = %d, want unchanged %d (hard link inside root was followed)", after.Gid, before.Gid)
+			}
+			for _, n := range tc.inTree {
+				if st := lstatT(t, filepath.Join(root, n)); st.Mode != before.Mode || st.Gid != before.Gid {
+					t.Errorf("in-tree name %s changed: mode %o gid %d, want %o gid %d", n, st.Mode, st.Gid, before.Mode, before.Gid)
+				}
+			}
+
+			oi := lstatT(t, ordinary)
+			if oi.Mode&0o777 != 0o660 {
+				t.Errorf("ordinary file perm = %o, want 660 (owner rw granted to group)", oi.Mode&0o777)
+			}
+			if int(oi.Gid) != gid {
+				t.Errorf("ordinary file gid = %d, want %d", oi.Gid, gid)
+			}
+		})
 	}
+}
+
+// TestChownForFSGroupConvertsInTreeHardLinks pins the other half of the
+// per-inode rule: an inode whose every name is inside root (busybox applets,
+// git, python3) is converted like an ordinary file, group and mode, no error.
+func TestChownForFSGroupConvertsInTreeHardLinks(t *testing.T) {
+	podsRoot, root := fsGroupTree(t)
+	first := filepath.Join(root, "bin", "busybox")
+	second := filepath.Join(root, "sub", "sh")
+	writeMode(t, first, 0o700)
+	if err := os.Link(first, second); err != nil {
+		t.Fatal(err)
+	}
+	before := lstatT(t, first)
+	gid := fsGroupTestGid(int(before.Gid))
 
 	if err := ChownForFSGroup(podsRoot, root, gid); err != nil {
 		t.Fatalf("ChownForFSGroup: %v", err)
 	}
 
-	after, err := os.Lstat(canary)
-	if err != nil {
-		t.Fatal(err)
+	for _, p := range []string{first, second} {
+		st := lstatT(t, p)
+		if st.Mode&0o777 != 0o770 {
+			t.Errorf("%s perm = %o, want 770 (owner rwx granted to group)", p, st.Mode&0o777)
+		}
+		if int(st.Gid) != gid {
+			t.Errorf("%s gid = %d, want %d", p, st.Gid, gid)
+		}
 	}
-	if after.Mode() != before.Mode() {
-		t.Errorf("outside canary mode = %v, want unchanged %v (hard link inside root was followed)", after.Mode(), before.Mode())
-	}
-	if g := int(after.Sys().(*syscall.Stat_t).Gid); g != beforeGid {
-		t.Errorf("outside canary gid = %d, want unchanged %d (hard link inside root was followed)", g, beforeGid)
-	}
+}
 
-	oi, err := os.Lstat(ordinary)
-	if err != nil {
+// fsGroupTree makes a pods root and a pod rootfs (with bin/ and sub/) under
+// t.TempDir().
+func fsGroupTree(t *testing.T) (podsRoot, root string) {
+	t.Helper()
+	if os.Getgid() <= 0 {
+		t.Skip("test process gid <= 0 (running as root?); fsGroup chown asserts a >0 gid")
+	}
+	podsRoot = filepath.Join(t.TempDir(), "pods")
+	root = filepath.Join(podsRoot, "pod-a", "rootfs")
+	for _, d := range []string{"bin", "sub"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return podsRoot, root
+}
+
+// writeMode creates path with exactly mode (chmod defeats the umask).
+func writeMode(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("x"), mode); err != nil {
 		t.Fatal(err)
 	}
-	if oi.Mode().Perm() != 0o660 {
-		t.Errorf("ordinary file perm = %o, want 660 (owner rw granted to group)", oi.Mode().Perm())
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
 	}
-	if g := int(oi.Sys().(*syscall.Stat_t).Gid); g != gid {
-		t.Errorf("ordinary file gid = %d, want %d", g, gid)
+}
+
+// lstatT lstats path or fails the test.
+func lstatT(t *testing.T, path string) unix.Stat_t {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
 	}
+	return st
+}
+
+// fsGroupTestGid picks a group this process is in, preferring one that differs
+// from current so a group change is observable.
+func fsGroupTestGid(current int) int {
+	gid := os.Getgid()
+	if groups, err := os.Getgroups(); err == nil {
+		for _, g := range groups {
+			if g > 0 && g != current {
+				return g
+			}
+		}
+	}
+	return gid
 }
 
 // TestChownForFSGroupRejectsRootGid rejects a non-positive fsGroup (0 = wheel is
