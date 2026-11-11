@@ -467,8 +467,15 @@ func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time
 type pruneHooks struct {
 	// guard, when non-nil, runs once per call inside pruneMu, before the
 	// unlink loop. Every digest in the returned set is skipped rather than
-	// removed; an error aborts the call with nothing unlinked.
-	guard func() (drop map[string]struct{}, err error)
+	// removed, with its reason carried into the skip record; an error aborts
+	// the call with nothing unlinked.
+	guard func() (drop map[string]evictReason, err error)
+
+	// unlink, when non-nil, replaces root.Remove for one blob that passed
+	// re-verification. rel is the blobs-root-relative path. A false removed
+	// with a nil error records the blob as skipped with reason; an error
+	// records it as skipped with the error, exactly as a failed root.Remove.
+	unlink func(rel, digest string) (removed bool, reason evictReason, err error)
 }
 
 // executePrune is ExecutePrune with hooks; see ExecutePrune for the contract.
@@ -494,7 +501,7 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	}
 	defer root.Close()
 
-	var drop map[string]struct{}
+	var drop map[string]evictReason
 	if hooks != nil && hooks.guard != nil {
 		if drop, err = hooks.guard(); err != nil {
 			return nil, fmt.Errorf("execute prune: guard: %w", err)
@@ -510,8 +517,8 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			rep.StoppedEarly = true
 			break
 		}
-		if _, ok := drop[d.Node.Digest]; ok && d.Node.Digest != "" {
-			skip(d, "dropped by guard")
+		if why, ok := drop[d.Node.Digest]; ok && d.Node.Digest != "" {
+			skip(d, fmt.Sprintf("dropped by guard: %s", why))
 			continue
 		}
 		rel := d.Node.Path
@@ -536,7 +543,17 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			skip(d, "younger than grace")
 			continue
 		}
-		if err := root.Remove(rel); err != nil {
+		if hooks != nil && hooks.unlink != nil {
+			removed, why, err := hooks.unlink(rel, d.Node.Digest)
+			if err != nil {
+				skip(d, fmt.Sprintf("remove: %v", err))
+				continue
+			}
+			if !removed {
+				skip(d, fmt.Sprintf("refused by unlink: %s", why))
+				continue
+			}
+		} else if err := root.Remove(rel); err != nil {
 			skip(d, fmt.Sprintf("remove: %v", err))
 			continue
 		}
