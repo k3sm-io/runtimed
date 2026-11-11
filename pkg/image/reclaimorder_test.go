@@ -192,10 +192,10 @@ func TestReclaimEvictsLeastRecentlyReleasedArtifactFirst(t *testing.T) {
 	}
 }
 
-// TestDropLeasedHonoursALeaseTakenAfterPlanning pins the re-read of the leases
+// TestPinnedNowHonoursALeaseTakenAfterPlanning pins the re-read of the leases
 // before each executor run: a planned blob that an ingest leased since the
-// plan is dropped from the run and reported kept as leased.
-func TestDropLeasedHonoursALeaseTakenAfterPlanning(t *testing.T) {
+// plan is left in place and reported kept as leased.
+func TestPinnedNowHonoursALeaseTakenAfterPlanning(t *testing.T) {
 	f := newGCFixture(t)
 	a := f.blob("planned a", time.Hour)
 	b := f.blob("planned b", time.Hour)
@@ -205,15 +205,18 @@ func TestDropLeasedHonoursALeaseTakenAfterPlanning(t *testing.T) {
 	}
 	lease := f.cache.AcquireLease([]string{b}, time.Hour)
 	defer lease.Release()
-	rep := &ReclaimReport{}
-	got := f.cache.dropLeased(dels, rep)
-	if len(got) != 1 || got[0].Node.Digest != a {
-		t.Fatalf("dropLeased kept %v; want only %s", got, a)
+	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
+	rep, err := f.cache.executePrune(&PrunePlan{Delete: dels}, 0, f.clock, nil, pinned)
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
 	}
-	if len(rep.Kept) != 1 || rep.Kept[0].Digest != b || rep.Kept[0].Reason != ReasonKeptLeased {
-		t.Fatalf("rep.Kept = %+v; want %s kept as leased", rep.Kept, b)
+	if len(rep.Removed) != 1 || rep.Removed[0] != a {
+		t.Fatalf("executePrune removed %v; want only %s", rep.Removed, a)
 	}
-	if len(dels) != 2 || dels[1].Node.Digest != b {
-		t.Fatal("dropLeased modified the caller's plan")
+	if len(rep.pinned) != 1 || rep.pinned[0].Digest != b || rep.pinned[0].Reason != ReasonKeptLeased {
+		t.Fatalf("rep.pinned = %+v; want %s kept as leased", rep.pinned, b)
+	}
+	if !f.exists(b) {
+		t.Fatal("the leased blob was unlinked")
 	}
 }
