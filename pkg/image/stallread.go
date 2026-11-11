@@ -44,25 +44,40 @@ const defaultLayerStallWindow = 2 * time.Minute
 // window without returning, the timer closes the body, which unblocks that
 // Read, and Read reports ErrLayerBodyStalled with the read's error as the cause.
 //
-// Lifetime: the timer is a time.AfterFunc, so no goroutine exists until it
-// fires, and it is stopped whenever no body.Read is in flight. Close stops it,
+// Lifetime: the timer is a time.AfterFunc (made through afterFunc, which tests
+// replace with a hand-fired fake), so no goroutine exists until it fires, and it is stopped whenever no body.Read is in flight. Close stops it,
 // and Close and the timer share one sync.Once around the body's Close, so Close
 // returns only after any in-flight timer close has finished: nothing this
 // reader started outlives its Close.
 type stallReader struct {
-	body    io.ReadCloser
-	window  time.Duration
-	timer   *time.Timer
-	stalled atomic.Bool
-	once    sync.Once
-	err     error
+	body      io.ReadCloser
+	window    time.Duration
+	afterFunc func(time.Duration, func()) stallTimer
+	timer     stallTimer
+	stalled   atomic.Bool
+	once      sync.Once
+	err       error
 }
+
+// stallTimer is the part of *time.Timer the watchdog uses; it is the seam a
+// test drives by hand instead of waiting out a real window.
+type stallTimer interface {
+	Reset(d time.Duration) bool
+	Stop() bool
+}
+
+// timeAfterFunc is the production afterFunc: a real time.AfterFunc.
+func timeAfterFunc(d time.Duration, f func()) stallTimer { return time.AfterFunc(d, f) }
 
 // newStallReader wraps body with a watchdog of the given window. The timer is
 // created stopped; each Read arms it for the duration of one body.Read.
 func newStallReader(body io.ReadCloser, window time.Duration) *stallReader {
-	s := &stallReader{body: body, window: window}
-	s.timer = time.AfterFunc(window, s.fire)
+	return (&stallReader{body: body, window: window, afterFunc: timeAfterFunc}).start()
+}
+
+// start creates the watchdog timer through s.afterFunc, stopped, and returns s.
+func (s *stallReader) start() *stallReader {
+	s.timer = s.afterFunc(s.window, s.fire)
 	s.timer.Stop()
 	return s
 }
