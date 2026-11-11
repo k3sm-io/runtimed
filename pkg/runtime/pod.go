@@ -2979,6 +2979,16 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// are separate processes that each take a path, and the pod can write its
 	// rootfs, so an in-place swap of the resolved file between the check and the
 	// shim's exec remains possible.
+	//
+	// An argv[0] that is exactly one of the container's image-volume mount
+	// paths is refused first, by name, from the box's mounts and never from the
+	// rootfs: a view file is read-only data (0444), the sandbox profile denies
+	// exec on view paths, and the signer refuses a link leaving the rootfs, so
+	// such a program could never run.
+	if mp, ok := imageVolumeMountAt(p.box, c, run.Argv[0]); ok {
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
+			fmt.Errorf("container %s: %w: %q is the mount path of an image volume, which holds data, not programs", c.GetName(), ErrImageArgvEscapes, mp))
+	}
 	bin, _, err := resolveImageExecPath(rootfs, run.Argv[0])
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
@@ -3017,6 +3027,28 @@ func hostBinaryRoute(c *runtimev1.Container) bool {
 // pod rootfs it must run from. It is a sentinel so a caller (and a test) can
 // name the refusal without matching on the message.
 var ErrImageArgvEscapes = errors.New("image program escapes the pod rootfs")
+
+// imageVolumeMountAt reports whether argv0, read as an in-root path with or
+// without a leading slash, names exactly one of c's mount paths whose volume in
+// box is an image volume, and returns that mount path. It reads only the box's
+// mounts and volumes, never the rootfs.
+func imageVolumeMountAt(box *runtimev1.PodBox, c *runtimev1.Container, argv0 string) (string, bool) {
+	if argv0 == "" {
+		return "", false
+	}
+	want := filepath.Join("/", argv0)
+	for _, m := range c.GetVolumeMounts() {
+		if m.GetMountPath() == "" || filepath.Join("/", m.GetMountPath()) != want {
+			continue
+		}
+		for _, v := range box.GetVolumes() {
+			if v.GetName() == m.GetName() && v.GetImage() != nil {
+				return m.GetMountPath(), true
+			}
+		}
+	}
+	return "", false
+}
 
 // resolveImageArgv0 resolves a pulled image's argv[0] against the pod's
 // materialized rootfs and refuses anything that lands outside it.

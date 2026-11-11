@@ -21,8 +21,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
+
+	"k3sm.io/runtimed/pkg/artifact"
+	"k3sm.io/runtimed/pkg/sandbox"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -295,4 +299,68 @@ func TestStartSpawnsTheBinaryTheGateChecked(t *testing.T) {
 				checks0, checks, signs0, signs, spawns0, spawns)
 		}
 	})
+}
+
+// TestStartRefusesAnImageVolumeProgram pins a container whose argv[0] is
+// exactly an image-volume mount path with a subPath naming a file: an image
+// volume holds data, not programs (its view files are 0444, the profile denies
+// exec on view paths), so start refuses it by name with ErrImageArgvEscapes
+// before anything is signed, checked or spawned, even while the mount is the
+// link the daemon placed.
+func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("the daemon's views clone with APFS clonefile, darwin-only")
+	}
+	const podID = "pod-volprog"
+	f := modelArtifact(map[string][]byte{"run.json": []byte("prog"), "w.safetensors": []byte("w")}, []string{"run.json", "w.safetensors"})
+	sg, sp, w := &fakeSigner{}, &fakeSpawner{}, newBlockingWaiter()
+	lazy := &lazyArtifactPuller{}
+	_, rt := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: lazy, Signer: sg, Spawner: sp, Waiter: w})
+	ap, err := artifact.New(artifact.Config{
+		RegistryHost: artifactTestHost,
+		PartialDir:   filepath.Join(rt.cache.Root(), sandbox.ArtifactPartialSubdir),
+		StorePath:    rt.cache.Root(),
+		FreeBytes:    func(string) (uint64, error) { return 1 << 40, nil },
+	}, artifact.Deps{Blobs: rt.cache, Leases: rt.cache, Reclaimer: rt.cache, Index: rt.index, Fetcher: f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy.p = ap
+	t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
+	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
+	rt.signalGroup = rec.signal
+	const mountPath = "/opt/run"
+	c := &runtimev1.Container{
+		Name: "main", Image: pullRef, Command: []string{mountPath},
+		VolumeMounts: []*runtimev1.VolumeMount{{Name: "model", MountPath: mountPath, SubPath: "run.json"}},
+	}
+	box := pullBox(rt, podID, c)
+	box.Volumes = []*runtimev1.Volume{{
+		Name:  "model",
+		Image: &runtimev1.ImageVolumeSource{Reference: artifactTestHost + "/models/tiny:v1"},
+	}}
+	mustCreatePod(t, rt, box)
+	view, err := rt.ArtifactView(context.Background(), sha(f.manifest), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs := derivedRootfs(t, rt, podID)
+	if got, err := os.Readlink(filepath.Join(rootfs, "opt", "run")); err != nil || got != filepath.Join(view, "run.json") {
+		t.Fatalf("mount link = %q, %v; want the daemon-placed view file", got, err)
+	}
+	rt.mu.Lock()
+	p := rt.pods[podID]
+	rt.mu.Unlock()
+	checks0, signs0, spawns0 := counts(sg, sp)
+	_, _, err = rt.startContainer(p.supCtx, p, rootfs, c, false, 0)
+	if !errors.Is(err, ErrImageArgvEscapes) {
+		t.Fatalf("startContainer err = %v, want ErrImageArgvEscapes", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, mountPath) || !strings.Contains(msg, "holds data, not programs") {
+		t.Errorf("startContainer err = %q, want it to name %q and say an image volume holds data, not programs", msg, mountPath)
+	}
+	if checks, signs, spawns := counts(sg, sp); checks != checks0 || signs != signs0 || spawns != spawns0 {
+		t.Errorf("the refused start reached the gate or the spawner: checks %d->%d, signs %d->%d, spawns %d->%d",
+			checks0, checks, signs0, signs, spawns0, spawns)
+	}
 }
