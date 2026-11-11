@@ -37,15 +37,18 @@ var ErrLayerBodyStalled = errors.New("image: layer body stalled")
 // longer hangs until the caller's context ends.
 const defaultLayerStallWindow = 2 * time.Minute
 
-// stallReader is a progress watchdog on one layer body. Every Read that returns
-// at least one byte pushes the deadline out by window; when the deadline passes
-// with no byte delivered, the timer closes the body, which unblocks the pending
-// Read, and that Read reports ErrLayerBodyStalled.
+// stallReader is a progress watchdog on one layer body. It times only the
+// body: the timer is armed on entry to each body.Read and stopped before Read
+// returns, so time the consumer spends between Reads (writing the bytes to a
+// slow disk on a loaded host) never counts. When one body.Read runs a whole
+// window without returning, the timer closes the body, which unblocks that
+// Read, and Read reports ErrLayerBodyStalled with the read's error as the cause.
 //
 // Lifetime: the timer is a time.AfterFunc, so no goroutine exists until it
-// fires, and Close stops it. Close and the timer share one sync.Once around
-// the body's Close, so Close returns only after any in-flight timer close has
-// finished: nothing this reader started outlives its Close.
+// fires, and it is stopped whenever no body.Read is in flight. Close stops it,
+// and Close and the timer share one sync.Once around the body's Close, so Close
+// returns only after any in-flight timer close has finished: nothing this
+// reader started outlives its Close.
 type stallReader struct {
 	body    io.ReadCloser
 	window  time.Duration
@@ -55,14 +58,18 @@ type stallReader struct {
 	err     error
 }
 
-// newStallReader wraps body with a watchdog of the given window, armed now.
+// newStallReader wraps body with a watchdog of the given window. The timer is
+// created stopped; each Read arms it for the duration of one body.Read.
 func newStallReader(body io.ReadCloser, window time.Duration) *stallReader {
 	s := &stallReader{body: body, window: window}
 	s.timer = time.AfterFunc(window, s.fire)
+	s.timer.Stop()
 	return s
 }
 
-// fire runs on the timer's goroutine when window passed with no byte.
+// fire runs on the timer's goroutine when one body.Read ran a whole window. It
+// marks the reader stalled before closing the body, so a read failure the close
+// causes always observes the flag.
 func (s *stallReader) fire() {
 	s.stalled.Store(true)
 	s.closeBody()
@@ -73,16 +80,34 @@ func (s *stallReader) closeBody() {
 	s.once.Do(func() { s.err = s.body.Close() })
 }
 
-// Read reads from the body, re-arming the watchdog on progress.
+// stallError is the error Read reports once the watchdog has closed the body;
+// cause is the body.Read error that close produced, or nil.
+func (s *stallReader) stallError(cause error) error {
+	if cause == nil {
+		return fmt.Errorf("no byte for %s: %w", s.window, ErrLayerBodyStalled)
+	}
+	return fmt.Errorf("no byte for %s: %w (%v)", s.window, ErrLayerBodyStalled, cause)
+}
+
+// Read reads from the body with the watchdog armed only while body.Read runs.
+// Bytes the body delivered are always returned, with a nil error if the
+// watchdog fired in the same instant (the next Read reports the stall). A read
+// that failed after the watchdog closed the body reports ErrLayerBodyStalled
+// with the read's error as the cause; any other error is returned unchanged.
 func (s *stallReader) Read(p []byte) (int, error) {
-	n, err := s.body.Read(p)
 	if s.stalled.Load() {
-		return n, fmt.Errorf("no byte for %s: %w", s.window, ErrLayerBodyStalled)
+		return 0, s.stallError(nil)
+	}
+	s.timer.Reset(s.window)
+	n, err := s.body.Read(p)
+	s.timer.Stop()
+	if !s.stalled.Load() {
+		return n, err
 	}
 	if n > 0 {
-		s.timer.Reset(s.window)
+		return n, nil
 	}
-	return n, err
+	return 0, s.stallError(err)
 }
 
 // Close stops the watchdog and closes the body.
