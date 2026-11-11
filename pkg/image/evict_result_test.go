@@ -73,7 +73,7 @@ func TestEvictPlanResult(t *testing.T) {
 	young, leased, used := node('e', 50, time.Minute), node('f', 60, time.Hour), node('1', 70, time.Hour)
 	alias := cfg
 	alias.Path = "sha256/.blob-alias"
-	gone := node('9', 1, time.Hour)
+	gone, gone2 := node('9', 1, time.Hour), node('8', 1, time.Hour)
 	del := func(ns ...BlobNode) []PruneDecision {
 		var ds []PruneDecision
 		for _, n := range ns {
@@ -82,7 +82,8 @@ func TestEvictPlanResult(t *testing.T) {
 		return ds
 	}
 	plan := &PrunePlan{
-		Delete: del(cfg, alias, l1, shared),
+		// Out of digest order, so Removed's sort is what orders the result.
+		Delete: del(shared, l1, alias, cfg),
 		Keep: []PruneDecision{
 			{Node: young, Reason: ReasonKeptYoung},
 			{Node: leased, Reason: ReasonKeptLeased},
@@ -101,7 +102,7 @@ func TestEvictPlanResult(t *testing.T) {
 	}{
 		{
 			name:   "every outcome at once",
-			target: digestSet(cfg, l1, shared, young, leased, used, gone),
+			target: digestSet(cfg, l1, shared, young, leased, used, gone, gone2),
 			others: digestSet(shared),
 			// cfg has two nodes (an alias path): one digest, both files' bytes.
 			wantRemoved: sorted(cfg.Digest, l1.Digest),
@@ -111,8 +112,21 @@ func TestEvictPlanResult(t *testing.T) {
 				EvictKept{leased.Digest, EvictKeptLeased},
 				EvictKept{used.Digest, EvictKeptInUse},
 			),
-			wantAbsent: []string{gone.Digest},
+			wantAbsent: []string{gone2.Digest, gone.Digest},
 			wantBytes:  cfg.Size + alias.Size + l1.Size,
+		},
+		{
+			// Written out in digest order rather than through sortedKept, so
+			// the order itself is the assertion.
+			name:   "several kept digests come back in digest order",
+			target: digestSet(shared, young, leased, used),
+			others: digestSet(shared),
+			wantKept: []EvictKept{
+				{used.Digest, EvictKeptInUse},
+				{shared.Digest, EvictKeptShared},
+				{young.Digest, EvictKeptYoung},
+				{leased.Digest, EvictKeptLeased},
+			},
 		},
 		{
 			name:     "rooted relabel is carried into the result",
