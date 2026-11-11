@@ -255,3 +255,24 @@ func testEvictRacesThroughEvict(t *testing.T) {
 		t.Errorf("Evict = %+v; want %+v", res, want)
 	}
 }
+
+// TestUnlinkUnlessLeasedHoldsLeaseMu pins that the per-blob roots re-read and
+// the unlink run under leaseMu: the remove closure finds the lock held, so
+// hoisting the unlink out of the lock goes red.
+func TestUnlinkUnlessLeasedHoldsLeaseMu(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	digest := f.blob("evict-locked", time.Hour)
+	called := false
+	removed, why, err := f.cache.unlinkUnlessLeased(digest, func() error {
+		called = true
+		if f.cache.leaseMu.TryLock() {
+			f.cache.leaseMu.Unlock()
+			t.Error("leaseMu not held across the unlink")
+		}
+		return nil
+	}, nil)
+	if err != nil || !removed || why != "" || !called {
+		t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want removed", removed, why, err, called)
+	}
+}
