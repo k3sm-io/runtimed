@@ -168,7 +168,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 	}{
 		{
 			name:     "spawn-missing-program",
-			sentence: "could not be started (program not found); the daemon log has the cause",
+			sentence: "could not be started (no such file or directory); the daemon log has the cause",
 			reason:   runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			marker:   spawnDetail,
 			wants:    []string{"spawn container main", "no such file or directory"},
@@ -330,7 +330,7 @@ func TestSpawnStartErrorClass(t *testing.T) {
 		errno syscall.Errno
 		want  string
 	}{
-		{syscall.ENOENT, `container "main" could not be started (program not found)` + tail},
+		{syscall.ENOENT, `container "main" could not be started (no such file or directory)` + tail},
 		{syscall.EACCES, `container "main" could not be started (permission denied)` + tail},
 		{syscall.ENOEXEC, `container "main" could not be started (exec format error)` + tail},
 		{syscall.E2BIG, `container "main" could not be started` + tail},

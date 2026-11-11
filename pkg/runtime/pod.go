@@ -2458,12 +2458,14 @@ func spawnStartError(name string, err error) error {
 }
 
 // spawnErrnoClass names the closed set of spawn failure classes a client may
-// read: a missing program, a denied one, one the kernel cannot execute. Any
-// other cause is "", and the client reads only that the start failed.
+// read, as the errno's own neutral words: the missing or denied file may be
+// the host exec-shim or the working directory rather than the tenant's
+// program, so no class claims which file. Any other cause is "", and the
+// client reads only that the start failed.
 func spawnErrnoClass(err error) string {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return "program not found"
+		return "no such file or directory"
 	case errors.Is(err, fs.ErrPermission):
 		return "permission denied"
 	case errors.Is(err, syscall.ENOEXEC):
