@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -131,18 +133,111 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 // fetcher with a weaker platform story.
 //
 // extra carries a transport a caller pins (the flat registry's endpoint dial and
-// trust anchor); it is appended after the defaults so it rides every round trip,
-// the index children included.
+// trust anchor); it is appended after the defaults, the header-bounded external
+// transport included, so it wins and rides every round trip, the index children
+// included.
 func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, extra ...remote.Option) (ggcrv1.Image, error) {
 	want, err := Candidates(policy)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
-	opts := []remote.Option{remote.WithContext(ctx)}
+	rctx, disarm, cancel := resolveContext(ctx, resolveTimeout)
+	opts := []remote.Option{remote.WithContext(rctx)}
+	// The header-bounded transport goes BEFORE extra: go-containerregistry
+	// applies options in order and WithTransport is a plain assignment, so a
+	// caller's own transport (the flat registry's restricted dial) still wins.
+	if tr := externalTransport(); tr != nil {
+		opts = append(opts, remote.WithTransport(tr))
+	}
 	opts = append(opts, extra...)
 	if cred != nil {
 		opts = append(opts, remote.WithAuth(cred.authenticator()))
 	}
+	img, err := resolveRemote(r, ref, want, opts)
+	if err == nil && !disarm() {
+		// The bound fired after the last resolve round trip returned but before
+		// it could be disarmed: rctx is cancelled, so the image's layer fetches
+		// would fail. Report the bound rather than hand that image on.
+		err = context.Cause(rctx)
+	}
+	if err != nil {
+		cancel()
+		if ctx.Err() == nil && errors.Is(context.Cause(rctx), errResolveBound) {
+			// %v, not %w, for the cause: it wraps context.Canceled, and a
+			// registry that stopped answering is about the host, not a caller
+			// that gave up (see mirrorFallbackEligible).
+			return nil, fmt.Errorf("pull %q: %w after %s: %v", ref, ErrPullResolveTimeout, resolveTimeout, err)
+		}
+		return nil, err
+	}
+	return img, nil
+}
+
+// ErrPullResolveTimeout is returned (wrapped) when resolving a reference (the
+// manifest or index, the selected child and the image config, with any token
+// round trip they need) does not finish within the resolve bound. It is an
+// ordinary fetch failure; a cancelled caller context is reported as that
+// cancellation, never as this.
+var ErrPullResolveTimeout = errors.New("image: pull resolve timed out")
+
+// defaultResolveTimeout bounds the resolve step of one pull. Every round trip
+// in it moves a few kilobytes, so two minutes is far above any healthy
+// registry and below the time a stuck one would otherwise hold the pull.
+const defaultResolveTimeout = 2 * time.Minute
+
+// resolveTimeout is the resolve bound remoteFetch applies; tests shorten it.
+var resolveTimeout = defaultResolveTimeout
+
+// errResolveBound is the cancellation cause resolveContext records when the
+// bound fires; remoteFetch turns it into ErrPullResolveTimeout.
+var errResolveBound = errors.New("resolve bound elapsed")
+
+// resolveContext derives the context the resolve round trips run under: it is
+// cancelled when parent is, and also when d elapses before disarm is called.
+//
+// It is a disarmable bound rather than context.WithTimeout because
+// go-containerregistry keeps the context of the options a descriptor was
+// fetched with inside the lazy image it returns, and fetches every layer under
+// it. A deadline would cap those later layer fetches, and a deferred cancel
+// would fail them outright. disarm stops the timer once the resolve is done
+// (it reports false if the timer already fired), after which the context ends
+// only with parent, so the layer fetches keep the caller's own lifetime.
+// cancel releases the context on a failed resolve; on success it is left for
+// parent to end, as the image still uses it.
+func resolveContext(parent context.Context, d time.Duration) (ctx context.Context, disarm func() bool, cancel func()) {
+	c, cancelCause := context.WithCancelCause(parent)
+	t := time.AfterFunc(d, func() { cancelCause(errResolveBound) })
+	return c, t.Stop, func() { t.Stop(); cancelCause(context.Canceled) }
+}
+
+// externalTransport is the transport an external registry pull uses: a clone
+// of http.DefaultTransport (its proxy function and dial and TLS timeouts kept)
+// that also bounds the wait for response headers. It is built once, so pulls
+// share its connection pool, and the global is never mutated. It is nil when
+// http.DefaultTransport is not an *http.Transport (a test or embedder replaced
+// it), in which case the library's default stays in place.
+var externalTransport = sync.OnceValue(func() http.RoundTripper {
+	if tr := newExternalTransport(responseHeaderTimeout); tr != nil {
+		return tr
+	}
+	return nil
+})
+
+// newExternalTransport clones http.DefaultTransport with the given header
+// bound, or returns nil when the default is not an *http.Transport.
+func newExternalTransport(headerTimeout time.Duration) *http.Transport {
+	def, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil
+	}
+	tr := def.Clone()
+	tr.ResponseHeaderTimeout = headerTimeout
+	return tr
+}
+
+// resolveRemote is the resolve step of remoteFetch: fetch the manifest, select
+// and resolve the one image want allows, and verify its config.
+func resolveRemote(r name.Reference, ref string, want []Platform, opts []remote.Option) (ggcrv1.Image, error) {
 	desc, err := remote.Get(r, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
