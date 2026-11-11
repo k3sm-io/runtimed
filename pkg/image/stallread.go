@@ -104,6 +104,10 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	if !s.stalled.Load() {
 		return n, err
 	}
+	if errors.Is(err, io.EOF) {
+		// The body ended as the watchdog fired: it is complete, not stalled.
+		return n, err
+	}
 	if n > 0 {
 		return n, nil
 	}
