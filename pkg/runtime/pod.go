@@ -1758,7 +1758,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// signing, before exec. A host binary is never ad-hoc re-signed
 	// (hostBinary).
 	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rootfs, gatePath, rb.hostBinary); err != nil {
-		return nil, signatureFailureReason(err), err
+		return nil, signatureFailureReason(err), &signatureGateError{
+			message: signatureGateMessage(ctx, err, rb.program, p.box.GetSignaturePolicy()),
+			err:     err,
+		}
 	}
 
 	// Resolve the container's securityContext identity plus the pod's rlimit plan
@@ -2353,7 +2356,8 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //   - UNSPECIFIED / unknown: Check fails closed (ErrPolicyUnspecified); no signing.
 //
 // Both Sign and Check errors are returned wrapped (ErrSignatureRejected /
-// ErrPolicyUnspecified), which the caller maps to SIGNATURE_REJECTED.
+// ErrPolicyUnspecified), which the caller maps to SIGNATURE_REJECTED. A Sign
+// error also carries errAdHocSign, so the start's message can name the step.
 //
 // DEADLINES. ctx is the pod-lifetime context, which no request can cancel, and
 // the signature tools block for minutes when the system policy daemon is down.
@@ -2386,7 +2390,7 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 			return r.signer.Sign(ctx, rootfs, path)
 		})
 		if err != nil {
-			return fmt.Errorf("ad-hoc sign %s: %w", path, err)
+			return fmt.Errorf("%w %s: %w", errAdHocSign, path, err)
 		}
 		return r.checkSignature(ctx, policy, path)
 	}
@@ -2411,6 +2415,42 @@ func (r *Runtime) checkSignature(ctx context.Context, policy runtimev1.Signature
 	return image.WithSignatureDeadline(ctx, signatureCheckTimeout, func(ctx context.Context) error {
 		return r.signer.Check(ctx, policy, path)
 	})
+}
+
+// errAdHocSign marks a gateSignature error that came from the ad-hoc Sign step,
+// so a start can say the sign failed rather than that the policy refused the
+// file. Its text keeps the gate's "ad-hoc sign <path>: <cause>" wording.
+var errAdHocSign = errors.New("ad-hoc sign")
+
+// signatureGateError is a start's signature-gate failure. Error is the gate's
+// full error, which names the host rootfs and, for a failed sign, the staging
+// copy and the tool's output: it is for the daemon's one Warn line, which every
+// caller of startContainer writes. message is the fixed sentence a client sees
+// (boundedFailureMessage), naming only the program as the pod wrote it.
+type signatureGateError struct {
+	message string
+	err     error
+}
+
+func (e *signatureGateError) Error() string { return e.err.Error() }
+func (e *signatureGateError) Unwrap() error { return e.err }
+
+// signatureGateMessage is the client-visible sentence for a start whose gate
+// failed with err under ctx. It reuses the exec gate's classification, so the
+// two gates cannot disagree on what a timeout or a cancellation is, and splits
+// the exec gate's refusal into a failed ad-hoc sign and a policy rejection.
+// program is the container's program as the pod wrote it, never a host path.
+func signatureGateMessage(ctx context.Context, err error, program string, policy runtimev1.SignaturePolicy) string {
+	switch classifyExecGate(ctx, err) {
+	case execGateCancelled:
+		return fmt.Sprintf("signature check of %q was cancelled before it gave a verdict", program)
+	case execGateTimedOut:
+		return fmt.Sprintf("signature check of %q timed out under %s; it gave no verdict and may be retried", program, policy)
+	}
+	if errors.Is(err, errAdHocSign) {
+		return fmt.Sprintf("ad-hoc sign of %q failed under %s; the daemon log has the cause", program, policy)
+	}
+	return fmt.Sprintf("%q was rejected by the signature gate under %s; the daemon log has the cause", program, policy)
 }
 
 // signatureFailureReason classifies a gateSignature failure. A signature tool
@@ -2553,7 +2593,14 @@ const maxWaitingMessageBytes = 256
 // the truncate-and-quote rule here: this function was a byte-for-byte copy of
 // image.QuoteBounded until the copy was collapsed, and a safety rule with two
 // implementations only has to be fixed in one of them to be wrong.
+//
+// A signature-gate failure publishes its fixed sentence instead of its error
+// (signatureGateError): the error names daemon paths and tool output.
 func boundedFailureMessage(err error) string {
+	var ge *signatureGateError
+	if errors.As(err, &ge) {
+		return image.QuoteBounded(ge.message, maxWaitingMessageBytes)
+	}
 	return image.QuoteBounded(err.Error(), maxWaitingMessageBytes)
 }
 
@@ -2799,6 +2846,10 @@ type resolvedBinary struct {
 	path string
 	// argv is the child's argument vector (argv[0] is path).
 	argv []string
+	// program is argv[0] as the pod wrote it (the native command[0], the
+	// host-path image, or the merged image program before it is joined to the
+	// rootfs). It is what a client-visible failure may name; path is not.
+	program string
 	// hostBinary reports whether path is a HOST binary (the native sentinel or
 	// the empty-command host-path convention) rather than a pulled-image payload.
 	// A host binary is already validly signed and lives at a read-only host path,
@@ -2902,6 +2953,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 		return resolvedBinary{
 			path:       bin,
 			argv:       append(append([]string{}, cmd...), c.GetArgs()...),
+			program:    bin,
 			hostBinary: true,
 			workingDir: c.GetWorkingDir(),
 		}, nil
@@ -2924,7 +2976,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	if hostBinaryRoute(c) {
 		bin := c.GetImage()
 		// No manifest exists on this route either — imageID stays empty.
-		return resolvedBinary{path: bin, argv: []string{bin}, hostBinary: true, workingDir: c.GetWorkingDir()}, nil
+		return resolvedBinary{path: bin, argv: []string{bin}, program: bin, hostBinary: true, workingDir: c.GetWorkingDir()}, nil
 	}
 
 	// Resolve the imagePullSecret credential via the consumer-side seam. It
@@ -3022,6 +3074,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	return resolvedBinary{
 		path:       bin,
 		argv:       argv,
+		program:    run.Argv[0],
 		imageID:    repoDigestImageID(c.GetImage(), res),
 		env:        run.Env,
 		workingDir: run.WorkingDir,
