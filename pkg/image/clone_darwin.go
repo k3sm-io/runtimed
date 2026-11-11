@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -265,8 +266,16 @@ func renameFromStage(stage *os.File, name, dst string) error {
 
 // assertNoQuarantineAt is assertNoQuarantine on name inside dir, opened
 // without following a link so the check reads the entry that is there.
+//
+// The O_RDONLY open needs read permission: a mode 0o000 or 0o200 file fails it
+// with EACCES for an unprivileged caller (darwin's O_EVTONLY does not avoid
+// that check, and there is no fgetxattrat). On EACCES/EPERM it falls back to
+// quarantineNoReadAt so such a file does not fail the materialize.
 func assertNoQuarantineAt(dir *os.File, name string) error {
 	f, err := openNoFollowAt(dir, name)
+	if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
+		return quarantineNoReadAt(dir, name)
+	}
 	if err != nil {
 		return err
 	}
@@ -277,6 +286,32 @@ func assertNoQuarantineAt(dir *os.File, name string) error {
 		}
 		return nil // ENOATTR, no xattr support, or an unexpected error: as assertNoQuarantine
 	})
+}
+
+// quarantineNoReadAt checks an entry its caller cannot open for reading. It
+// first confirms with fstatat(AT_SYMLINK_NOFOLLOW), relative to dir's
+// descriptor, that name is a regular file, then reads the attribute by path
+// with Lgetxattr (getxattr with XATTR_NOFOLLOW), which needs no open and never
+// follows a link at the leaf. darwin's getxattr checks the readextattr right,
+// which an ACL can grant without read but which plain mode bits tie to read;
+// where it is denied the result is nil, exactly what the path-based
+// assertNoQuarantine gave before the descriptor check. This is safe because the
+// read is metadata only and writes nothing: the leaf cannot redirect it (no
+// follow), and the residual window, a parent component of dir's path swapped
+// between the fstatat and the getxattr, can at worst misreport the attribute
+// of an entry this walk already created, never write through a link.
+func quarantineNoReadAt(dir *os.File, name string) error {
+	mode, present, err := lstatAt(dir, name)
+	if err != nil {
+		return err
+	}
+	if !present || mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("quarantine check %s: %w", name, ErrDestinationLink)
+	}
+	if _, err := unix.Lgetxattr(filepath.Join(dir.Name(), name), QuarantineXattr, nil); err == nil {
+		return ErrQuarantined
+	}
+	return nil // ENOATTR, no xattr support, or an unexpected error: as assertNoQuarantine
 }
 
 // assertNoQuarantine returns ErrQuarantined if path carries the
