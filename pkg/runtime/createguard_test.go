@@ -36,6 +36,27 @@ type guardProcTable struct {
 	groups map[int][]supervisor.ProcMember
 	// broken names the groups that cannot be inspected (ok=false).
 	broken map[int]bool
+	// exited names the pids procStart reports gone; every other pid has
+	// start 1, as testDeps' default.
+	exited map[int]bool
+}
+
+func (g *guardProcTable) exit(pid int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.exited == nil {
+		g.exited = map[int]bool{}
+	}
+	g.exited[pid] = true
+}
+
+func (g *guardProcTable) procStart(pid int) (int64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.exited[pid] {
+		return 0, false
+	}
+	return 1, true
 }
 
 func (g *guardProcTable) breakGroup(pgid int) {
@@ -103,7 +124,7 @@ func newGuardFixture(t *testing.T, podID string) *guardFixture {
 		net:   &guardNetwork{setup: map[string]int{}},
 		sigs:  &recordingSignalGroup{},
 	}
-	f.rt = newTestRuntime(t, Deps{Network: f.net, ProcGroup: f.procs.procGroup, SignalGroup: f.sigs.signal})
+	f.rt = newTestRuntime(t, Deps{Network: f.net, ProcGroup: f.procs.procGroup, ProcStartTime: f.procs.procStart, SignalGroup: f.sigs.signal})
 	podDir, err := f.rt.podDir(podID)
 	if err != nil {
 		t.Fatal(err)
@@ -132,8 +153,10 @@ func (f *guardFixture) assertRefused(t *testing.T, podID string, resp *runtimev1
 	if _, ok := f.rt.lookupPod(podID); ok {
 		t.Error("the refused pod was registered")
 	}
-	if b, err := os.ReadFile(f.marker); err != nil || string(b) != "live" {
-		t.Errorf("rootfs marker = (%q, %v), want it intact", b, err)
+	if f.marker != "" {
+		if b, err := os.ReadFile(f.marker); err != nil || string(b) != "live" {
+			t.Errorf("rootfs marker = (%q, %v), want it intact", b, err)
+		}
 	}
 	if n := f.net.count(podID); n != 0 {
 		t.Errorf("%d network setups remain for the refused pod", n)
@@ -154,8 +177,9 @@ func assertCreated(t *testing.T, resp *runtimev1.CreatePodResponse, err error) {
 }
 
 // TestCreatePodRefusesBesideALiveNativeGroup pins that a create for a pod id
-// whose recorded process group an earlier run left alive is refused before
-// anything about the pod is touched, and is re-evaluated on every create.
+// whose recorded process group is still alive, left by an earlier run or by a
+// delete in this run, is refused before anything about the pod is touched,
+// and is re-evaluated on every create.
 func TestCreatePodRefusesBesideALiveNativeGroup(t *testing.T) {
 	const (
 		podID = "pod-survivor"
@@ -361,6 +385,61 @@ func TestCreatePodRefusesBesideALiveNativeGroup(t *testing.T) {
 		if msg := err.Error(); !strings.Contains(msg, dir) {
 			t.Errorf("refusal %q does not name the record directory %s", msg, dir)
 		}
+	})
+
+	t.Run("a recreate beside survivors kept after a delete refuses, then succeeds once they exit", func(t *testing.T) {
+		const survivor = 9191
+		f := newGuardFixture(t, podID)
+		resp, err := f.create(podID)
+		assertCreated(t, resp, err)
+		p, ok := f.rt.lookupPod(podID)
+		if !ok {
+			t.Fatal("created pod not registered")
+		}
+		pgids := p.containerPgids()
+		if len(pgids) == 0 {
+			t.Fatal("created pod owns no process group")
+		}
+		if _, err := f.rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: podID}); err != nil {
+			t.Fatal(err)
+		}
+		// Seeded, not driven: the fakes cannot make a container's tree sweep
+		// leave survivors, so write the record DeletePod keeps for one
+		// through the same call it uses. The group is empty; only the
+		// survivor lives, under its recorded start.
+		if err := f.rt.retainPodProcRecord(podID, "main", pgids[0], []ReapSurvivor{{Pid: survivor, StartUnixNano: 1, Sid: pgids[0]}}); err != nil {
+			t.Fatal(err)
+		}
+		// DeletePod removed the pod dir, so there is no rootfs marker left,
+		// and its own teardown signals are not the guard's.
+		f.marker = ""
+		f.sigs.mu.Lock()
+		f.sigs.sent = nil
+		f.sigs.mu.Unlock()
+		resp, err = f.create(podID)
+		f.assertRefused(t, podID, resp, err)
+
+		f.procs.exit(survivor)
+		resp, err = f.create(podID)
+		assertCreated(t, resp, err)
+	})
+
+	t.Run("a record left while a delete is still in flight refuses", func(t *testing.T) {
+		f := newGuardFixture(t, podID)
+		// The state between DeletePod unregistering the pod and retiring its
+		// records: not registered, record present, group alive.
+		seed(t, f, podProcRecord{Pgid: pgid, StartUnixNano: start})
+		f.procs.set(pgid, supervisor.ProcMember{Pid: pgid, StartUnixNano: start})
+		if _, ok := f.rt.lookupPod(podID); ok {
+			t.Fatal("pod registered before the create")
+		}
+		resp, err := f.create(podID)
+		f.assertRefused(t, podID, resp, err)
+
+		f.rt.removePodReapRecords(podID)
+		f.procs.set(pgid)
+		resp, err = f.create(podID)
+		assertCreated(t, resp, err)
 	})
 
 	t.Run("malformed pod id is not reported as a live group", func(t *testing.T) {

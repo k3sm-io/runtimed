@@ -26,12 +26,17 @@ import (
 )
 
 // ErrPodGroupStillAlive is returned (wrapped) by CreatePod for a pod id whose
-// recorded process group, from an earlier run, may still be alive and is not
-// owned by this runtime.
+// recorded process group may still be alive and is not owned by a pod this
+// runtime has registered.
 //
-// The startup reap leaves such a group running in several cases: its leader
-// is gone but a descendant lives (keep-and-warn), the pre-signal re-probe no
-// longer matched, the kill failed, or the reap store could not be read. A
+// Such a group comes from an earlier run or from this one. The startup reap
+// leaves an earlier run's group running in several cases: its leader is gone
+// but a descendant lives (keep-and-warn), the pre-signal re-probe no longer
+// matched, the kill failed, or the reap store could not be read. Within one
+// run, DeletePod unregisters the pod before it retires the pod's records, so
+// a create racing a delete of the same id sees a group that is still exiting;
+// and DeletePod keeps the record of a container whose tree left survivors, so
+// a create of that id is refused while a survivor lives. A
 // create for the same id clears the pod's rootfs, which those processes may
 // still use, so the create is refused instead. Nothing is torn down and
 // nothing is signalled; the create succeeds once the group is gone (or its
@@ -43,7 +48,7 @@ import (
 // that cannot be inspected, or a live leader under a record with no leader
 // identity refuses too. A group with no record is invisible to this check by
 // construction. The error names the record directory.
-var ErrPodGroupStillAlive = errors.New("runtime: a process group an earlier run started for the pod is still alive")
+var ErrPodGroupStillAlive = errors.New("runtime: a recorded process group of the pod is still alive")
 
 // liveRecordedGroup is one recorded group the create guard found alive.
 type liveRecordedGroup struct {
@@ -57,8 +62,11 @@ type liveRecordedGroup struct {
 }
 
 // refuseBesideLiveNativeGroup returns ErrPodGroupStillAlive (wrapped) when a
-// reap record for podID names a group this runtime does not own that is, or
-// may be, still alive, and nil otherwise. It never signals anything.
+// reap record for podID names a group no registered pod owns that is, or may
+// be, still alive, and nil otherwise. The group may be an earlier run's, or
+// this run's: still exiting under a delete in flight, or survivors kept after
+// a delete. Refusing is the intended answer in every case (the rootfs may be
+// in use) and the caller retries. It never signals anything.
 //
 // An id that is not a legal pod id is returned as that error, without
 // ErrPodGroupStillAlive: retrying it cannot succeed.
@@ -72,7 +80,7 @@ func (r *Runtime) refuseBesideLiveNativeGroup(podID string) error {
 	}
 	records, err := r.readPodReapRecordsIn(dir)
 	if err != nil {
-		r.log.Warn("not creating a pod whose process-group records cannot be read: a group an earlier run started may still be alive",
+		r.log.Warn("not creating a pod whose process-group records cannot be read: a recorded group may still be alive",
 			"pod", podID, "recordDir", dir, "err", err)
 		return fmt.Errorf("create pod %s: records in %s: %w: %w", podID, dir, err, ErrPodGroupStillAlive)
 	}
@@ -88,7 +96,7 @@ func (r *Runtime) refuseBesideLiveNativeGroup(podID string) error {
 		if !alive {
 			continue
 		}
-		r.log.Warn("not creating a pod while a process group an earlier run started for it is still alive (not signalled)",
+		r.log.Warn("not creating a pod while a recorded process group of it is still alive (not signalled)",
 			"pod", podID, "container", g.container, "pgid", g.pgid, "survivors", g.survivors, "why", g.why, "recordDir", dir)
 		return fmt.Errorf("create pod %s: process group %d (%s), record in %s: %w", podID, g.pgid, g.why, dir, ErrPodGroupStillAlive)
 	}
