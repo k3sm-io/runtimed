@@ -48,17 +48,24 @@ limitations under the License.
 //   - The partial is opened O_NOFOLLOW|O_NONBLOCK and must be a regular file
 //     by fstat of the opened descriptor (ErrPartialFile), so a symlink, a
 //     FIFO or a directory in its place is refused without blocking.
-//   - The transfer is handed the partial positioned at its current length,
-//     and restarts it itself when the source answers from another offset;
-//     after it the file must be exactly the blob's size (ErrPartialLength),
-//     a short one kept for the next resume and a long one cut to the size,
-//     so a whole blob appended to a prefix is never committed.
+//   - A partial already longer than the blob is truncated to zero by Resume
+//     before any transfer, and the transfer then starts from 0.
+//   - The transfer is handed the partial positioned at its current length.
+//     Restarting belongs to the transfer: when the source answers from
+//     another offset (a 200 to a Range request starts at 0), the transfer
+//     truncates the file to that offset and seeks there before writing.
+//     Resume does not guess. After a transfer that returns nil the file must
+//     be exactly the blob's size (ErrPartialLength): a short one is kept for
+//     the next resume and a long one is cut to the size by Resume, so a whole
+//     blob appended to a prefix is never committed.
 //   - A complete partial is replayed whole to the caller's commit, which
 //     re-hashes it; when the commit reports the bytes poisoned (a digest
 //     mismatch, an overrun), or fails with no poison test given, the partial
 //     is removed, so a poisoned prefix never survives to be resumed.
+//   - A partial whose commit succeeds is removed; a failure to remove it is
+//     logged to PartialStore.Log (when set) and does not fail the Resume.
 //
-// Three opt-in helpers serve a caller that shares one store across
+// Four opt-in helpers serve a caller that shares one store across
 // concurrent pulls; a caller that uses none of them sees no change. Claim
 // gives one writer per digest within a store, without blocking; its refusal
 // says whether the digest is held (ErrPartialClaimed, retryable) or malformed
@@ -69,7 +76,10 @@ limitations under the License.
 // MaxBytes means no cap; a negative one is refused (ErrPartialCap). Sweep
 // removes old, unclaimed partials, matching only the store's own file-name
 // grammar and unlinking relative to a descriptor of the directory opened
-// O_NOFOLLOW, so it never follows a link. The stall watchdog and the blob
+// O_NOFOLLOW, so it never follows a link. Remove deletes one digest's
+// partial and treats a missing one as success; the caller must hold the
+// digest's Claim and have no Resume of it running, because Remove does not
+// look at claims. The stall watchdog and the blob
 // cache itself belong to the caller.
 //
 // Their limits are part of the contract:
