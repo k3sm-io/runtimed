@@ -733,12 +733,18 @@ func (f *fakeUnpacker) manifest() *runtimev1.ImageManifest {
 }
 
 // fakeSigner records sign calls and applies a policy-gate decision.
+//
+// failNextCheck, when set, is returned by the next Check alone and then
+// cleared, so an ADHOC_OK gate goes on to Sign and re-check. statOnCheck makes
+// Check stat the path first, failing as codesign does on a file not on disk.
 type fakeSigner struct {
-	mu        sync.Mutex
-	signed    []string
-	checked   []string
-	checkErr  error
-	signError error
+	mu            sync.Mutex
+	signed        []string
+	checked       []string
+	checkErr      error
+	signError     error
+	failNextCheck error
+	statOnCheck   bool
 }
 
 func (f *fakeSigner) Sign(_ context.Context, _, path string) error {
@@ -751,9 +757,20 @@ func (f *fakeSigner) Sign(_ context.Context, _, path string) error {
 func (f *fakeSigner) Check(_ context.Context, policy runtimev1.SignaturePolicy, path string) error {
 	f.mu.Lock()
 	f.checked = append(f.checked, path)
+	once := f.failNextCheck
+	f.failNextCheck = nil
+	statOnCheck := f.statOnCheck
 	f.mu.Unlock()
 	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_UNSPECIFIED {
 		return image.ErrPolicyUnspecified
+	}
+	if statOnCheck {
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("codesign -v %s: %w", path, err)
+		}
+	}
+	if once != nil {
+		return once
 	}
 	return f.checkErr
 }

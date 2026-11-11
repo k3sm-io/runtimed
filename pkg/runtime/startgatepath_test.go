@@ -160,6 +160,104 @@ func TestStartSpawnsTheBinaryTheGateChecked(t *testing.T) {
 		}
 	})
 
+	// The ad-hoc sign is the one gate step that writes a file, so it must be
+	// handed the resolved path too. The fake's first Check fails, which makes
+	// the ADHOC_OK gate (the rig's policy) sign and re-check.
+	t.Run("adhoc_sign_receives_the_checked_and_spawned_path", func(t *testing.T) {
+		r := newRig(t)
+		link(t, r.rootfs, "/bin/app.real")
+		checks0, signs0, _ := counts(r.signer, r.spawn)
+		r.signer.mu.Lock()
+		r.signer.failNextCheck = errors.New("code object is not signed at all")
+		r.signer.mu.Unlock()
+		if _, _, err := r.rt.startContainer(r.p.supCtx, r.p, r.rootfs, r.c, false, 0); err != nil {
+			t.Fatalf("startContainer: %v", err)
+		}
+		r.signer.mu.Lock()
+		checked := append([]string(nil), r.signer.checked[checks0:]...)
+		signed := append([]string(nil), r.signer.signed[signs0:]...)
+		r.signer.mu.Unlock()
+		if len(signed) != 1 {
+			t.Fatalf("Sign calls = %v, want exactly one (the first Check failed)", signed)
+		}
+		if len(checked) != 2 {
+			t.Fatalf("Check calls = %v, want a failed check and a re-check", checked)
+		}
+		argv0 := spawnedPodArgv0(t, r.spawn)
+		want := filepath.Join(r.rootfs, "bin", "app.real")
+		if argv0 != want {
+			t.Errorf("argv[0] = %q, want the in-image file %q", argv0, want)
+		}
+		if signed[0] != argv0 {
+			t.Errorf("Sign(%q) but the shim was handed argv[0] %q", signed[0], argv0)
+		}
+		for _, got := range checked {
+			if got != signed[0] {
+				t.Errorf("Check(%q) but Sign(%q)", got, signed[0])
+			}
+		}
+	})
+
+	// A relative link whose target stays in the root keeps its lexical name, as
+	// exec does: the program may read its own argv[0] (a multi-call binary).
+	t.Run("relative_in_root_link_keeps_the_lexical_name", func(t *testing.T) {
+		r := newRig(t) // bin/app -> app.real
+		checks0, _, _ := counts(r.signer, r.spawn)
+		if _, _, err := r.rt.startContainer(r.p.supCtx, r.p, r.rootfs, r.c, false, 0); err != nil {
+			t.Fatalf("startContainer: %v", err)
+		}
+		r.signer.mu.Lock()
+		checked := append([]string(nil), r.signer.checked[checks0:]...)
+		r.signer.mu.Unlock()
+		if len(checked) == 0 {
+			t.Fatal("the signature gate was never asked")
+		}
+		want := filepath.Join(r.rootfs, "bin", "app")
+		if argv0 := spawnedPodArgv0(t, r.spawn); argv0 != want {
+			t.Errorf("argv[0] = %q, want the lexical name %q, not the link target", argv0, want)
+		}
+		for _, got := range checked {
+			if got != want {
+				t.Errorf("Check(%q), want the lexical name %q, not the link target", got, want)
+			}
+		}
+	})
+
+	// With no entry in the image at argv[0], the walker returns the lexical
+	// path and false. Start then fails as it did before the walk: the gate is
+	// asked about a file that is not there (statOnCheck stands in for
+	// codesign's ENOENT), not with an escape error, and nothing is spawned.
+	t.Run("missing_argv0_fails_as_a_missing_file", func(t *testing.T) {
+		r := newRig(t)
+		if err := os.Remove(filepath.Join(r.rootfs, "bin", "app")); err != nil {
+			t.Fatal(err)
+		}
+		r.signer.mu.Lock()
+		r.signer.statOnCheck = true
+		r.signer.mu.Unlock()
+		checks0, _, spawns0 := counts(r.signer, r.spawn)
+		_, _, err := r.rt.startContainer(r.p.supCtx, r.p, r.rootfs, r.c, false, 0)
+		if err == nil {
+			t.Fatal("startContainer of a missing argv[0] succeeded")
+		}
+		if errors.Is(err, ErrImageArgvEscapes) {
+			t.Fatalf("startContainer err = %v, want a missing-file failure, not an escape", err)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("startContainer err = %v, want one wrapping os.ErrNotExist", err)
+		}
+		r.signer.mu.Lock()
+		checked := append([]string(nil), r.signer.checked[checks0:]...)
+		r.signer.mu.Unlock()
+		want := filepath.Join(r.rootfs, "bin", "app")
+		if len(checked) == 0 || checked[0] != want {
+			t.Errorf("Check calls = %v, want the lexical path %q first", checked, want)
+		}
+		if _, _, spawns := counts(r.signer, r.spawn); spawns != spawns0 {
+			t.Errorf("spawns %d->%d, want none for a missing argv[0]", spawns0, spawns)
+		}
+	})
+
 	t.Run("out_of_root_link_is_refused_before_check_and_spawn", func(t *testing.T) {
 		r := newRig(t)
 		link(t, r.rootfs, outside(t, r.rootfs))

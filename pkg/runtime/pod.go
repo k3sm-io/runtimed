@@ -2967,8 +2967,9 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// semantics, and one whose target leaves the root fails with
 	// ErrImageArgvEscapes before anything is signed, checked or spawned. The one
 	// path this returns is what startContainer hands to the ad-hoc sign, to the
-	// signature check and to the exec shim's argv, so the three name the same
-	// file. Resolving lexically instead let a link the pod wrote at argv[0] make
+	// signature check and to the exec shim's argv, so the three receive the same
+	// path string. codesign and the kernel each resolve that string again, so
+	// what is shared is the path, not the inode. Resolving lexically instead let a link the pod wrote at argv[0] make
 	// codesign (which follows links) describe a different file than the one the
 	// shim ran, or one outside the rootfs. An in-image link whose target stays
 	// in the root keeps its lexical name, as it does for exec, because a
