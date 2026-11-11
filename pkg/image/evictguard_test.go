@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -481,4 +482,39 @@ func TestTreeUnlessHeld(t *testing.T) {
 			t.Fatalf("treeUnlessHeld = %v, %s, %q, %v (remove called %v); want removed", removed, dg, why, err, called)
 		}
 	})
+}
+
+// TestEvictOutcomeBranches pins two of evictOutcome's placements: a condemned
+// blob refused with a typed reason is kept with that reason, even when an
+// untyped refusal for it follows; a condemned blob neither removed nor
+// refused that is gone from the store is absent.
+func TestEvictOutcomeBranches(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	shared := f.blob("outcome-shared", time.Hour)
+	vanished := "sha256:" + strings.Repeat("a", 64)
+	if f.cache.Has(vanished) {
+		t.Fatalf("%s present; want it missing from the store", vanished)
+	}
+	ev := &evictPass{
+		plan: &EvictPlan{Delete: []PruneDecision{
+			{Node: BlobNode{Digest: shared}},
+			{Node: BlobNode{Digest: vanished}},
+		}},
+		skipped: []SkippedBlob{
+			{Digest: shared, Refusal: &SkipRefusal{Digest: shared, Kind: RefusedByGuard, Reason: EvictKeptShared}},
+			{Digest: shared, Reason: "untyped"},
+		},
+	}
+	res, err := f.cache.evictOutcome(ev)
+	if err != nil {
+		t.Fatalf("evictOutcome: %v", err)
+	}
+	want := &EvictResult{
+		Kept:   []EvictKept{{Digest: shared, Reason: EvictKeptShared}},
+		Absent: []string{vanished},
+	}
+	if !reflect.DeepEqual(res, want) {
+		t.Errorf("evictOutcome = %+v; want %+v", res, want)
+	}
 }
