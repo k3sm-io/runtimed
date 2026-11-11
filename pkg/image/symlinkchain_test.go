@@ -19,11 +19,13 @@ package image
 import (
 	"archive/tar"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSymlinkChainCannotEscapeTree is the gate for a symlink whose target is
@@ -168,4 +170,33 @@ func TestLayerEntryDepthIsBounded(t *testing.T) {
 			t.Fatalf("Readlink = %q, %v; want \"..\"", got, err)
 		}
 	})
+}
+
+// TestClimbingLinksInADeepChainApplyQuickly pins the cost of the ancestor walk
+// in symlinkParentIsReal: it must be linear per entry, not quadratic. The layer
+// is 200 climbing symlinks at the bottom of one real chain at the
+// maxLayerEntryDepth limit, so each link's walk inspects 127 ancestors. With
+// each prefix resolved from the root the layer took about a minute; the bound
+// is generous so that only a quadratic walk trips it.
+func TestClimbingLinksInADeepChainApplyQuickly(t *testing.T) {
+	const links = 200
+	chain := strings.Repeat("d/", maxLayerEntryDepth-1)
+	specs := make([]tarSpec, 0, links)
+	for i := range links {
+		specs = append(specs, tarSpec{name: fmt.Sprintf("%sl%d", chain, i), typ: tar.TypeSymlink, link: "../x"})
+	}
+	start := time.Now()
+	tree, _, err := applyInto(t, ApplyLimits{}, specs)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	t.Logf("%d climbing links in a %d-component chain applied in %v", links, maxLayerEntryDepth, elapsed)
+	if bound := 20 * time.Second; elapsed > bound {
+		t.Fatalf("Apply took %v, want under %v: the ancestor walk is not linear", elapsed, bound)
+	}
+	last := filepath.Join(tree, filepath.FromSlash(fmt.Sprintf("%sl%d", chain, links-1)))
+	if fi, serr := os.Lstat(last); serr != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Lstat(last link) = %v, %v; want a symlink", fi, serr)
+	}
 }

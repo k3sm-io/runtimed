@@ -138,12 +138,13 @@ const maxLayerEntryNameLen = 256
 const maxLayerEntryPathLen = 4096
 
 // maxLayerEntryDepth is the most path components layerEntryPath admits in one
-// entry name. The byte limit alone still admits a name 2048 components deep,
-// and the per-ancestor walks of a name (os.Root resolves each prefix from the
-// root, so a walk of n ancestors costs on the order of n squared component
-// lookups) took about 0.3s at 128 components, 1.6s at 256 and 10.5s at 512 on
-// an Apple-silicon Mac. 128 keeps the worst accepted entry well under a
-// second; real image trees are far shallower.
+// entry name. The byte limit alone still admits a name 2048 components deep.
+// When the ancestor walk in symlinkParentIsReal resolved each prefix from the
+// root (n squared component lookups for n ancestors) it took about 0.3s at 128
+// components, 1.6s at 256 and 10.5s at 512 on an Apple-silicon Mac; that walk
+// now descends with nested roots and is linear, but the cap still bounds every
+// other per-name walk (ensureParent's MkdirAll among them). Real image trees
+// are far shallower.
 const maxLayerEntryDepth = 128
 
 // ApplyStats counts what one tree's layers produced. It is recorded in the
@@ -1126,12 +1127,18 @@ func targetClimbs(target string) bool {
 // symlink and its ".." would climb from somewhere other than the spelled
 // directory symlinkTargetContained measured.
 //
-// The walk is one Lstat per ancestor, and each ancestor is a prefix SLICE of
-// the name, so building them is linear in the name's bytes. The name has
+// The walk descends with nested roots: at each ancestor it Lstats the single
+// next component on the root opened for the ancestor above it, then opens that
+// component as the next root, so every step resolves one component and one
+// entry's walk is linear in its depth (os.Root resolves a multi-component path
+// from the root, so Lstat of each full prefix would be quadratic). Each
+// ancestor quoted in an error is a prefix SLICE of the name. The name has
 // passed layerEntryPath, so it is at most maxLayerEntryPathLen bytes and
-// maxLayerEntryDepth components, and the walk is bounded by both. It stops at the first absent ancestor: what does
-// not exist yet, ensureParent creates as a real directory. Any Lstat failure
-// other than absence fails closed.
+// maxLayerEntryDepth components, and the walk is bounded by both. It stops at
+// the first absent ancestor: what does not exist yet, ensureParent creates as
+// a real directory. Any Lstat or OpenRoot failure other than absence fails
+// closed. Every root the walk opens is closed before it returns; the layer
+// root is never closed.
 func symlinkParentIsReal(root *os.Root, name, target string) error {
 	if !targetClimbs(target) {
 		return nil
@@ -1140,21 +1147,25 @@ func symlinkParentIsReal(root *os.Root, name, target string) error {
 	if dir == "." {
 		return nil
 	}
-	for end := 0; end < len(dir); {
-		if next := strings.IndexByte(dir[end+1:], '/'); next >= 0 {
-			end += 1 + next
+	cur := root
+	defer func() {
+		if cur != root {
+			_ = cur.Close() // read-only handle; nothing to flush
+		}
+	}()
+	for start, end := 0, 0; end < len(dir); start = end + 1 {
+		if next := strings.IndexByte(dir[start:], '/'); next >= 0 {
+			end = start + next
 		} else {
 			end = len(dir)
 		}
-		anc := dir[:end]
-		fi, err := root.Lstat(anc)
+		anc, comp := dir[:end], dir[start:end]
+		fi, err := cur.Lstat(comp)
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("%w: symlink %s: cannot inspect its parent %s: %v",
-				ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
-				quoteBounded(anc, maxLayerEntryNameLen), boundErr(err))
+			return parentInspectErr(name, anc, err)
 		}
 		if fi.Mode()&fs.ModeSymlink != 0 {
 			return fmt.Errorf("%w: symlink %s targets %s, which climbs from a parent reached through the symlink %s",
@@ -1166,6 +1177,28 @@ func symlinkParentIsReal(root *os.Root, name, target string) error {
 			// so there is nothing further up the name to follow.
 			return nil
 		}
+		if end == len(dir) {
+			return nil
+		}
+		sub, err := cur.OpenRoot(comp)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return parentInspectErr(name, anc, err)
+		}
+		if cur != root {
+			_ = cur.Close() // read-only handle; nothing to flush
+		}
+		cur = sub
 	}
 	return nil
+}
+
+// parentInspectErr is symlinkParentIsReal's fail-closed error for an ancestor
+// anc of the link name that could not be inspected.
+func parentInspectErr(name, anc string, err error) error {
+	return fmt.Errorf("%w: symlink %s: cannot inspect its parent %s: %v",
+		ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
+		quoteBounded(anc, maxLayerEntryNameLen), boundErr(err))
 }
