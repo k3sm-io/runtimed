@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
 )
 
@@ -75,6 +76,75 @@ func TestEvictImageRejectsMalformedRequests(t *testing.T) {
 					t.Errorf("EvictImage(force=%v) = %v, want INVALID_ARGUMENT", force, err)
 				}
 				if len(st.Details()) != 0 {
+					t.Errorf("EvictImage(force=%v) details = %v, want none", force, st.Details())
+				}
+				diffState(t, "after the refusal", s.state(), before)
+			}
+		})
+	}
+}
+
+// TestEvictImageFailsClosed pins, through the RPC, the refusals that fail
+// closed: each returns its code (and reason, where one is named) with nothing
+// unlinked and no view removed, forced or not.
+func TestEvictImageFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		call       func(s *evictRPCScene) (context.Context, *runtimev1.EvictImageRequest)
+		wantCode   codes.Code
+		wantReason string
+	}{
+		{name: "entry with no retained manifest digest", wantCode: codes.FailedPrecondition,
+			call: func(s *evictRPCScene) (context.Context, *runtimev1.EvictImageRequest) {
+				ref := "registry.test/evict/old:v1"
+				if err := s.rt.index.Record(context.Background(), image.IndexEntry{
+					Reference: ref, Platform: image.Platform{OS: "linux", Architecture: "arm64"},
+					Manifest: &runtimev1.ImageManifest{Reference: ref, Config: &runtimev1.Descriptor{Digest: s.cfgA, Size: 1},
+						Layers: []*runtimev1.Descriptor{{Digest: s.ownA, Size: 1}}},
+				}); err != nil {
+					s.t.Fatalf("record %s: %v", ref, err)
+				}
+				return context.Background(), &runtimev1.EvictImageRequest{Reference: ref}
+			}},
+		{name: "incomplete root set", wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete,
+			call: func(s *evictRPCScene) (context.Context, *runtimev1.EvictImageRequest) {
+				if err := s.rt.index.PutArtifactRecord(context.Background(),
+					artifact.Key("registry.test/evict/corrupt:v1", "application/vnd.test.artifact"), []byte("{not json")); err != nil {
+					s.t.Fatal(err)
+				}
+				return context.Background(), &runtimev1.EvictImageRequest{Reference: s.refA}
+			}},
+		{name: "records naming different manifests", wantCode: codes.FailedPrecondition,
+			wantReason: runtimev1.EvictReasonReferenceAmbiguous,
+			call: func(s *evictRPCScene) (context.Context, *runtimev1.EvictImageRequest) {
+				ref := "registry.test/evict/amb:v1"
+				s.putRecord(ref, "application/vnd.test.one", s.manA, s.cfgA, s.ownA)
+				s.putRecord(ref, "application/vnd.test.two", s.manB, s.cfgB, s.ownB)
+				return context.Background(), &runtimev1.EvictImageRequest{Reference: ref}
+			}},
+		{name: "context cancelled before the call", wantCode: codes.Canceled,
+			call: func(s *evictRPCScene) (context.Context, *runtimev1.EvictImageRequest) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, &runtimev1.EvictImageRequest{Reference: s.refA}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newEvictRPCScene(t)
+			ctx, req := tc.call(s)
+			before := s.state()
+			for _, force := range []bool{false, true} {
+				req.Force = force
+				_, err := s.client.EvictImage(ctx, req)
+				st := status.Convert(err)
+				if st.Code() != tc.wantCode {
+					t.Errorf("EvictImage(force=%v) = %v, want %v", force, err, tc.wantCode)
+				}
+				if tc.wantReason != "" {
+					if !hasReason(err, tc.wantReason) {
+						t.Errorf("EvictImage(force=%v) = %v, want reason %s", force, err, tc.wantReason)
+					}
+				} else if len(st.Details()) != 0 {
 					t.Errorf("EvictImage(force=%v) details = %v, want none", force, st.Details())
 				}
 				diffState(t, "after the refusal", s.state(), before)
