@@ -208,7 +208,8 @@ func (c *Cache) SignStagingDir() string {
 // F_FULLFSYNC before the rename and the parent directory is fsynced after it. On
 // any error before the rename, a sign killed at its deadline or by a cancelled
 // ctx included, the temp file and codesign's own temp beside it are removed
-// (removeSignTemps) and the original is left exactly as it was.
+// best effort (removeSignTemps, which states the limit) and the original is
+// left exactly as it was.
 func AdHocSignByReplace(ctx context.Context, staging, root, target string) error {
 	return signByReplace(ctx, staging, root, target, codesignAs, nil)
 }
@@ -305,7 +306,9 @@ func signByReplace(ctx context.Context, staging, root, target string, sign signF
 	defer func() {
 		if err != nil && !renamed {
 			_ = tmp.Close() // already failing; the temp is removed next
-			removeSignTemps(tmpPath)
+			// stage is still open: its Close was deferred earlier, so it
+			// runs after this one.
+			removeSignTemps(stage, filepath.Base(tmpPath))
 		}
 	}()
 
@@ -354,16 +357,22 @@ func signByReplace(ctx context.Context, staging, root, target string, sign signF
 const codesignTempSuffix = ".cstemp"
 
 // removeSignTemps removes, best effort, what a failed sign left in the staging
-// directory: the staged copy at tmpPath and codesign's own temp beside it. It
-// runs on an error path, so it never returns an error that could replace the
-// one being reported; a removal that fails is logged at Warn, and a file that is
-// already gone is not a failure. The startup sweep (SweepSignStaging) removes
-// anything left here.
-func removeSignTemps(tmpPath string) {
-	for _, p := range []string{tmpPath, tmpPath + codesignTempSuffix} {
-		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+// directory: the staged copy named base and codesign's own temp beside it. Both
+// are unlinked relative to stage, the open staging directory descriptor, the
+// same one the success path renames from. It runs on an error path, so it never
+// returns an error that could replace the one being reported; a removal that
+// fails is logged at Warn, and a file that is already gone is not a failure.
+//
+// LIMIT. The sign tool is killed as one process and the wait returns after a
+// short delay, so a helper of it that outlives the kill could write its temp
+// again after this removal. Such a file stays inside the private staging
+// directory until the startup sweep (SweepSignStaging) removes it. The original
+// is never touched, because the rename into place happens only on success.
+func removeSignTemps(stage *os.File, base string) {
+	for _, name := range []string{base, base + codesignTempSuffix} {
+		if err := unix.Unlinkat(int(stage.Fd()), name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			slog.Warn("image: removing a staged sign file failed; the startup sweep removes it",
-				"path", p, "error", err)
+				"path", filepath.Join(stage.Name(), name), "error", err)
 		}
 	}
 }
