@@ -51,6 +51,7 @@ It keeps the record and warns instead.
   processes keep running exactly as they were.
 - **Did not remove anything.** Whatever the surviving descendant(s) hold —
   memory, open ports, `lo0` bindings — stays held until someone acts.
+- **Refuses `CreatePod` for that pod id** (`ErrPodGroupStillAlive`, logged as "not creating a pod while a process group an earlier run started for it is still alive") until the group is gone or its record is removed (recovery (a) or (b) below); an unreadable `<root>/podreap/<podID>/` refuses too.
 
 ## Triage
 
