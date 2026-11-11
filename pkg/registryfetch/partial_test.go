@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -698,6 +699,128 @@ func TestResumeRefusesNonRegularPartial(t *testing.T) {
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("Resume blocked on a non-regular partial")
+			}
+		})
+	}
+}
+
+// TestResumeOverlongBodyFailsWithinSize: a registry streaming more than Size
+// bytes, at 200 and at 206, fails the Resume with ErrBlobOverrun and leaves a
+// partial no larger than Size.
+func TestResumeOverlongBodyFailsWithinSize(t *testing.T) {
+	const size = 1000
+	data, digest := blobData(size)
+	for _, tc := range []struct {
+		name string
+		have int
+	}{
+		{"200", 0},
+		{"206", 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg, ref := serve(t, &fakeRegistry{data: data, extra: bytes.Repeat([]byte("x"), 4096)})
+			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+			if err := s.EnsureDir(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(s.path(digest), data[:tc.have], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var got []byte
+			err := s.Resume(Fill{
+				Digest: digest, Size: size,
+				Transfer: func(f *os.File, have int64) error {
+					body, start, err := reg.Blob(context.Background(), ref, nil, digest, size, have)
+					if err != nil {
+						return err
+					}
+					defer body.Close()
+					if start != have {
+						return fmt.Errorf("start %d, asked %d", start, have)
+					}
+					_, err = io.Copy(f, body)
+					return err
+				},
+				Commit:   verifyCommit(digest, size, &got),
+				Poisoned: func(error) bool { return true },
+			})
+			if !errors.Is(err, ErrBlobOverrun) {
+				t.Fatalf("Resume = %v, want ErrBlobOverrun", err)
+			}
+			if fi, err := os.Lstat(s.path(digest)); err != nil || fi.Size() > size {
+				t.Fatalf("partial = %v %v, want at most %d bytes", fi, err, size)
+			}
+		})
+	}
+}
+
+// TestResumeAdmitRefusalTouchesNothing: Resume asks Admit for Size before
+// anything else and returns its refusal with the store as it was: no dir or
+// file created, no partial truncated or removed, no Transfer run.
+func TestResumeAdmitRefusalTouchesNothing(t *testing.T) {
+	data, digest := blobData(100)
+	noTransfer := func(t *testing.T) Fill {
+		return Fill{
+			Digest: digest, Size: 100,
+			Transfer: func(*os.File, int64) error { t.Fatal("Transfer ran after a refused Admit"); return nil },
+			Commit:   func(func(io.Writer) error) error { t.Fatal("Commit ran after a refused Admit"); return nil },
+		}
+	}
+	t.Run("absent dir", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "partial")
+		s := &PartialStore{Dir: dir, MaxBytes: 99}
+		if err := s.Resume(noTransfer(t)); !errors.Is(err, ErrPartialBudget) {
+			t.Fatalf("Resume = %v, want ErrPartialBudget", err)
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("partial dir created: %v", err)
+		}
+	})
+	t.Run("negative cap", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "partial")
+		s := &PartialStore{Dir: dir, MaxBytes: -1}
+		if err := s.Resume(noTransfer(t)); !errors.Is(err, ErrPartialCap) {
+			t.Fatalf("Resume = %v, want ErrPartialCap", err)
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("partial dir created: %v", err)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		own  []byte // the digest's partial beforehand (nil: none)
+	}{
+		{"no partial", nil},
+		{"short partial", data[:40]},
+		{"overlong partial", append(bytes.Clone(data), "extra"...)},
+		{"complete partial", data},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial"), MaxBytes: 150}
+			if err := s.EnsureDir(); err != nil {
+				t.Fatal(err)
+			}
+			other := filepath.Join(s.Dir, "other")
+			if err := os.WriteFile(other, make([]byte, 60), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.own != nil {
+				if err := os.WriteFile(s.path(digest), tc.own, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Resume(noTransfer(t)); !errors.Is(err, ErrPartialBudget) {
+				t.Fatalf("Resume = %v, want ErrPartialBudget", err)
+			}
+			if b, err := os.ReadFile(other); err != nil || len(b) != 60 {
+				t.Fatalf("other file = %d bytes, %v; want it untouched", len(b), err)
+			}
+			b, err := os.ReadFile(s.path(digest))
+			switch {
+			case tc.own == nil && !errors.Is(err, os.ErrNotExist):
+				t.Fatalf("partial created: %v", err)
+			case tc.own != nil && (err != nil || !bytes.Equal(b, tc.own)):
+				t.Fatalf("partial changed: %d bytes, %v", len(b), err)
 			}
 		})
 	}

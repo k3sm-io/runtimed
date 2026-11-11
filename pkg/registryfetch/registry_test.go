@@ -50,9 +50,10 @@ type fakeRegistry struct {
 	// extra is sent after the blob, to model a body longer than its size.
 	extra []byte
 
-	mu     sync.Mutex
-	ranges []string
-	cut    bool
+	mu        sync.Mutex
+	ranges    []string
+	encodings []string
+	cut       bool
 }
 
 func (r *fakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -67,6 +68,7 @@ func (r *fakeRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rg := req.Header.Get("Range")
 	r.mu.Lock()
 	r.ranges = append(r.ranges, rg)
+	r.encodings = append(r.encodings, req.Header.Get("Accept-Encoding"))
 	cut := r.cutAt > 0 && !r.cut && rg == ""
 	if cut {
 		r.cut = true
@@ -124,6 +126,12 @@ func (r *fakeRegistry) seen() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.ranges...)
+}
+
+func (r *fakeRegistry) acceptEncodings() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.encodings...)
 }
 
 func serve(t *testing.T, fr *fakeRegistry) (*Registry, string) {
@@ -383,6 +391,76 @@ func TestParseContentRange(t *testing.T) {
 		if ok != tc.ok || ok && (first != tc.first || last != tc.last || total != tc.total) {
 			t.Errorf("parseContentRange(%q) = %d,%d,%d,%v; want %d,%d,%d,%v",
 				tc.in, first, last, total, ok, tc.first, tc.last, tc.total, tc.ok)
+		}
+	}
+}
+
+// TestBlobBodyStopsAtSize: a body longer than size-start is an error from
+// Read once the size is reached, never more bytes and never a silent cut.
+func TestBlobBodyStopsAtSize(t *testing.T) {
+	data, digest := blobData(1000)
+	for _, tc := range []struct {
+		name   string
+		offset int64
+	}{
+		{"200", 0},
+		{"206", 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg, ref := serve(t, &fakeRegistry{data: data, extra: []byte("x")})
+			body, start, err := reg.Blob(context.Background(), ref, nil, digest, 1000, tc.offset)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer body.Close()
+			b, err := io.ReadAll(body)
+			if !errors.Is(err, ErrBlobOverrun) {
+				t.Fatalf("read err = %v, want ErrBlobOverrun", err)
+			}
+			if start != tc.offset || !bytes.Equal(b, data[start:]) {
+				t.Fatalf("start %d, %d bytes read; want %d and the rest of the blob", start, len(b), tc.offset)
+			}
+		})
+	}
+}
+
+// TestBlobExactBodyReadsToEOF: the ceiling does not turn a body of exactly
+// size-start bytes into an error.
+func TestBlobExactBodyReadsToEOF(t *testing.T) {
+	data, digest := blobData(1000)
+	for _, offset := range []int64{0, 300} {
+		reg, ref := serve(t, &fakeRegistry{data: data})
+		body, start, err := reg.Blob(context.Background(), ref, nil, digest, 1000, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(body)
+		body.Close()
+		if err != nil || !bytes.Equal(b, data[start:]) {
+			t.Fatalf("offset %d: %d bytes, err %v", offset, len(b), err)
+		}
+	}
+}
+
+func TestBlobAsksForIdentityEncoding(t *testing.T) {
+	data, digest := blobData(1000)
+	fr := &fakeRegistry{data: data, rangeStatus: http.StatusRequestedRangeNotSatisfiable}
+	reg, ref := serve(t, fr)
+	body, _, err := reg.Blob(context.Background(), ref, nil, digest, 1000, 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if got := fr.acceptEncodings(); fmt.Sprint(got) != fmt.Sprint([]string{"identity", "identity"}) {
+		t.Fatalf("Accept-Encoding = %q, want identity on both requests", got)
+	}
+}
+
+func TestBlobRefusesOffsetOutsideSize(t *testing.T) {
+	reg := &Registry{Transport: http.DefaultTransport, PlainHTTP: true}
+	for _, tc := range [][2]int64{{-1, 0}, {10, -1}, {10, 11}} {
+		if _, _, err := reg.Blob(context.Background(), "h/r:t", nil, "sha256:00", tc[0], tc[1]); !errors.Is(err, ErrBlobRange) {
+			t.Errorf("size %d offset %d: err = %v, want ErrBlobRange", tc[0], tc[1], err)
 		}
 	}
 }
