@@ -459,6 +459,20 @@ type ExecuteReport struct {
 // extents are still shared frees nothing, so the only honest stopping rule is to
 // re-measure.
 func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*ExecuteReport, error) {
+	return c.executePrune(plan, grace, now, stop, nil)
+}
+
+// pruneHooks are the optional seams of executePrune. A nil *pruneHooks, or a
+// nil field, leaves the executor exactly as ExecutePrune documents it.
+type pruneHooks struct {
+	// guard, when non-nil, runs once per call inside pruneMu, before the
+	// unlink loop. Every digest in the returned set is skipped rather than
+	// removed; an error aborts the call with nothing unlinked.
+	guard func() (drop map[string]struct{}, err error)
+}
+
+// executePrune is ExecutePrune with hooks; see ExecutePrune for the contract.
+func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, hooks *pruneHooks) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
 	}
@@ -480,6 +494,13 @@ func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	}
 	defer root.Close()
 
+	var drop map[string]struct{}
+	if hooks != nil && hooks.guard != nil {
+		if drop, err = hooks.guard(); err != nil {
+			return nil, fmt.Errorf("execute prune: guard: %w", err)
+		}
+	}
+
 	rep := &ExecuteReport{}
 	skip := func(d PruneDecision, reason string) {
 		rep.Skipped = append(rep.Skipped, SkippedBlob{Path: d.Node.Path, Digest: d.Node.Digest, Reason: reason})
@@ -488,6 +509,10 @@ func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time
 		if stop != nil && stop() {
 			rep.StoppedEarly = true
 			break
+		}
+		if _, ok := drop[d.Node.Digest]; ok && d.Node.Digest != "" {
+			skip(d, "dropped by guard")
+			continue
 		}
 		rel := d.Node.Path
 		if cls, _ := classifyBlobRel(rel); cls == relInvalid {
