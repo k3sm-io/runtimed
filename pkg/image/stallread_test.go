@@ -216,6 +216,16 @@ func (ft *fakeTimer) advance(d time.Duration) bool {
 	return fire
 }
 
+// waitArmed waits for the fake timer to be armed, failing with msg if it never is.
+func waitArmed(t *testing.T, ft *fakeTimer, msg string) {
+	t.Helper()
+	select {
+	case <-ft.armed:
+	case <-time.After(10 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
 // newFakeStallReader is newStallReader with ft in place of time.AfterFunc.
 func newFakeStallReader(body io.ReadCloser, window time.Duration, ft *fakeTimer) *stallReader {
 	return (&stallReader{body: body, window: window, afterFunc: ft.afterFunc}).start()
@@ -359,7 +369,7 @@ func TestStallReader(t *testing.T) {
 		defer pw.Close()
 		s := newFakeStallReader(pr, window, ft)
 		defer s.Close()
-		<-ft.armed // the stopped timer start created
+		waitArmed(t, ft, "the stopped timer start created never armed")
 		type result struct {
 			n   int
 			err error
@@ -369,14 +379,19 @@ func TestStallReader(t *testing.T) {
 			n, err := s.Read(make([]byte, 8))
 			done <- result{n, err}
 		}()
-		<-ft.armed // the Read armed the watchdog
+		waitArmed(t, ft, "the Read never armed the watchdog")
 		if ft.advance(window - time.Nanosecond) {
 			t.Fatal("watchdog fired before a whole window")
 		}
 		if !ft.advance(time.Nanosecond) {
 			t.Fatal("watchdog did not fire at a whole window")
 		}
-		r := <-done
+		var r result
+		select {
+		case r = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("Read never returned after the watchdog fired: the body was never closed")
+		}
 		if r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
 			t.Fatalf("Read = %d, %v; want 0, ErrLayerBodyStalled", r.n, r.err)
 		}
