@@ -197,6 +197,11 @@ type ReclaimConfig struct {
 	// observe it.
 	afterInventory func()
 
+	// afterRoots runs after the root and lease reads the plan is built from,
+	// before any unlink. It is UNEXPORTED for the same reason as afterInventory:
+	// an in-package test drives a pull that roots a planned blob in that window.
+	afterRoots func()
+
 	// SweepDerived, when set, removes content derived from records rather than
 	// from blobs whose record is gone: the artifact views, which pkg/runtime
 	// wires in (this package cannot import their owner). A triggered pass that
@@ -416,6 +421,9 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	leased := make([]string, 0)
 	for d := range c.leasedDigests() {
 		leased = append(leased, d)
+	}
+	if cfg.afterRoots != nil {
+		cfg.afterRoots()
 	}
 	plan, err := PlanPrune(nodes, trees, roots, leased, grace, now())
 	if err != nil {
