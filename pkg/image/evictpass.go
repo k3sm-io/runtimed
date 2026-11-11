@@ -90,7 +90,10 @@ func (ev *evictPass) record(rep *ReclaimReport, execs ...*ExecuteReport) {
 // cfg.DryRun plans and unlinks nothing; the result has the same shape. Of
 // cfg's other fields Grace, FreeBytes, Now, Log and UntrackedPod apply as they
 // do to a reclaim pass; HighFreeBytes, TargetFreeBytes, Force and
-// SweepDerived are ignored.
+// SweepDerived are ignored. cfg.EvictDerived runs once with manifest after a
+// pass that returned without error under a live context, never on a dry run
+// and never when the pass errored; its error is logged at Warn and the
+// eviction still succeeds.
 //
 // Every target blob lands in exactly one of the result's Removed, Kept and
 // Absent. A blob an executor refused is kept with the refusal's typed reason,
@@ -141,6 +144,11 @@ func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg 
 	}
 	if cfg.DryRun {
 		return ev.plan.result()
+	}
+	if cfg.EvictDerived != nil {
+		if herr := cfg.EvictDerived(ctx, manifest); herr != nil && cfg.Log != nil {
+			cfg.Log.Warn("image evict: removal of the target's derived content refused; it is kept", "manifest", manifest, "err", herr)
+		}
 	}
 	return c.evictOutcome(ev)
 }

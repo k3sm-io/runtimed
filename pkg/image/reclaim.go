@@ -219,6 +219,17 @@ type ReclaimConfig struct {
 	// Its error is logged and does not stop the prune, which decides from its
 	// own fail-closed root set.
 	SweepDerived func(ctx context.Context) error
+
+	// EvictDerived, when set, removes the content derived from one evicted
+	// manifest: the target's artifact views, which pkg/runtime wires in (this
+	// package cannot import their owner). Only Cache.Evict calls it, once, with
+	// the target manifest digest, after the pass returned without error and
+	// only when the context is not cancelled and the call is not a dry run, so
+	// the blobs it was cloned from are already gone. Every other pass ignores
+	// it. Its error is logged at Warn and does not fail the eviction, as
+	// SweepDerived's does not fail the prune: the blobs are already unlinked
+	// and the view is derived content.
+	EvictDerived func(ctx context.Context, manifest string) error
 }
 
 // ReclaimReport is the typed outcome of a reclaim pass.
