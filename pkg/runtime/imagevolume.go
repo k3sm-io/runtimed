@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
@@ -353,4 +355,96 @@ func (r *Runtime) artifactHoldsCondition(ctx context.Context) *runtimev1.Runtime
 		Reason:  "Unreadable",
 		Message: image.QuoteBounded(err.Error(), 1024) + "; artifact release and view/blob removal are refused until it is repaired",
 	}
+}
+
+// imageMountProgram reports whether argv0 names exactly one of c's image-volume
+// mount paths and, when it does, returns the lexical in-root path start signs,
+// checks and execs. ok is false when argv0 is no image mount path, and the
+// caller resolves it with resolveImageExecPath as for any other program.
+//
+// LinkImageVolumes placed rootfs/<mountPath> as a link to an absolute path in
+// the view cache, so the in-root walk would read it as leaving the root. The
+// link lies in the pod-writable rootfs and is not trusted: it is read without
+// being followed (Lstat, Readlink) and must equal, byte for byte, a target the
+// daemon derives itself, which is the whole-artifact view of a manifest this
+// pod's hold names (artifact.Views.View, as imageVolumeView built it at create)
+// joined with the mount's subPath. Anything else is ErrImageArgvEscapes, before
+// anything is signed, checked or spawned.
+//
+// The hold records the pod's manifests but not which volume resolved to which,
+// so with several image volumes a link re-pointed at the same subPath in
+// another of the pod's own artifacts passes: a file the daemon placed for this
+// pod and its profile grants, never one the pod named.
+func (r *Runtime) imageMountProgram(ctx context.Context, box *runtimev1.PodBox, c *runtimev1.Container, rootfs, argv0 string) (string, bool, error) {
+	if argv0 == "" {
+		return "", false, nil
+	}
+	want := filepath.Join("/", argv0)
+	var vm *runtimev1.VolumeMount
+	for _, m := range c.GetVolumeMounts() {
+		if m.GetMountPath() != "" && filepath.Clean(m.GetMountPath()) == want {
+			vm = m
+			break
+		}
+	}
+	if vm == nil {
+		return "", false, nil
+	}
+	var vol *runtimev1.Volume
+	for _, v := range box.GetVolumes() {
+		if v.GetName() == vm.GetName() {
+			vol = v
+			break
+		}
+	}
+	if vol.GetImage() == nil {
+		return "", false, nil
+	}
+	refuse := func(format string, args ...any) (string, bool, error) {
+		return "", true, fmt.Errorf("%w: %q is image volume %s's mount: %s", ErrImageArgvEscapes, argv0, vol.GetName(), fmt.Sprintf(format, args...))
+	}
+	bin, err := resolveImageArgv0(rootfs, argv0)
+	if err != nil {
+		return "", true, err
+	}
+	fi, err := os.Lstat(bin)
+	if err != nil {
+		return refuse("%v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return refuse("it is not the link the daemon placed")
+	}
+	got, err := os.Readlink(bin)
+	if err != nil {
+		return refuse("%v", err)
+	}
+	if r.views == nil || r.index == nil {
+		return refuse("artifact views unavailable")
+	}
+	id, err := image.ParsePodID(box.GetPodId())
+	if err != nil {
+		return "", true, fmt.Errorf("%w: %w", errInvalidPodBox, err)
+	}
+	holds, err := r.index.ArtifactHolds(ctx)
+	if err != nil {
+		return refuse("read the pod's artifact hold: %v", err)
+	}
+	sub := vm.GetSubPath()
+	for _, m := range holds[id].Manifests {
+		view, err := r.views.View(ctx, m.Digest, nil)
+		if err != nil {
+			return refuse("view of held manifest %s: %v", m.Digest, err)
+		}
+		target := view
+		if sub != "" {
+			target = filepath.Join(view, sub)
+			if !mount.IsStrictlyUnder(target, view) {
+				return refuse("sub_path %q escapes the view", sub)
+			}
+		}
+		if got == target {
+			return bin, true, nil
+		}
+	}
+	return refuse("the link names %q, not the view the daemon placed", got)
 }
