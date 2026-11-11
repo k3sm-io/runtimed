@@ -230,7 +230,13 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	}
 	bin, inImage, err := resolveImageExecPath(rootfs, argv0)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "exec: %v", err)
+		// The error names the resolved host path and the pod rootfs; the
+		// reply names only the argv[0] the tenant sent.
+		sentence := fmt.Sprintf("exec: %q could not be resolved in the container image; the daemon log has the cause", argv0)
+		if errors.Is(err, ErrImageArgvEscapes) {
+			sentence = fmt.Sprintf("exec: %q resolves outside the container image and was refused", argv0)
+		}
+		return nil, r.execFailure(p, c.GetName(), codes.InvalidArgument, sentence, err)
 	}
 	if !inImage {
 		return cmdv, nil
@@ -360,6 +366,15 @@ func (f *execGateFlights) run(ctx context.Context, path string, call *execGateCa
 	call.err = gate(ctx)
 	call.abandoned = ctx.Err() != nil
 	return call.err
+}
+
+// execFailure logs err, whose text can name host paths (the pod rootfs, the
+// cache root, a sandbox staging file), once at Warn with the pod and container,
+// and returns a status carrying only sentence, which names what the client
+// sent and nothing of the host.
+func (r *Runtime) execFailure(p *pod, container string, code codes.Code, sentence string, err error) error {
+	r.log.Warn("exec failed", "pod", p.box.GetPodId(), "container", container, "err", err)
+	return status.Error(code, sentence)
 }
 
 // resolveImageExecPath resolves an exec session's absolute argv[0] in the pod
