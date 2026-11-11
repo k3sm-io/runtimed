@@ -97,6 +97,17 @@ type cloneAter interface {
 	cloneAt(src string, dir *os.File, name string) (cow bool, err error)
 }
 
+// ErrTreeTooDeep reports that MaterializeTree met a source directory nested
+// deeper than maxMaterializeDepth. The walk stops before creating or opening it.
+var ErrTreeTooDeep = errors.New("image: materialize source tree is nested too deeply")
+
+// maxMaterializeDepth is the most directory levels below dstDir MaterializeTree
+// descends. The destination walk keeps one open descriptor per level, so an
+// unbounded tree could exhaust the daemon's descriptors (the default soft limit
+// is 256). It equals maxLayerEntryDepth: an unpacked layer never names a path
+// deeper than that, so no tree this package produced is refused.
+const maxMaterializeDepth = maxLayerEntryDepth
+
 // destDir is one open destination directory on the walk's stack.
 type destDir struct {
 	rel string
@@ -184,6 +195,10 @@ func MaterializeTree(c Cloner, srcDir, dstDir string) (cloned int, err error) {
 
 		switch {
 		case d.IsDir():
+			// stack[0] is dstDir, so this directory is len(stack) levels deep.
+			if len(stack) > maxMaterializeDepth {
+				return fmt.Errorf("%w: %s exceeds %d levels", ErrTreeTooDeep, rel, maxMaterializeDepth)
+			}
 			info, ierr := d.Info()
 			if ierr != nil {
 				return ierr

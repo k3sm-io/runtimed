@@ -212,3 +212,52 @@ func TestMaterializeTreeDestinationLinkRules(t *testing.T) {
 		})
 	}
 }
+
+// TestMaterializeTreeRefusesATreeDeeperThanTheBound pins the destination
+// walk's depth bound: a source tree one directory level past
+// maxMaterializeDepth fails with ErrTreeTooDeep and nothing lands at its
+// bottom, while a tree exactly at the bound materializes.
+func TestMaterializeTreeRefusesATreeDeeperThanTheBound(t *testing.T) {
+	build := func(t *testing.T, levels int) (src, bottomRel string) {
+		t.Helper()
+		src = t.TempDir()
+		comps := make([]string, levels)
+		for i := range comps {
+			comps[i] = "d"
+		}
+		bottomRel = filepath.Join(append(comps, "f")...)
+		if err := os.MkdirAll(filepath.Join(src, filepath.Dir(bottomRel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, bottomRel), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return src, bottomRel
+	}
+
+	t.Run("deeper than the bound", func(t *testing.T) {
+		src, bottomRel := build(t, maxMaterializeDepth+1)
+		dst := filepath.Join(t.TempDir(), "rootfs")
+		_, err := MaterializeTree(ByteCopier{}, src, dst)
+		if !errors.Is(err, ErrTreeTooDeep) {
+			t.Fatalf("MaterializeTree err = %v, want ErrTreeTooDeep", err)
+		}
+		if _, serr := os.Lstat(filepath.Join(dst, bottomRel)); !errors.Is(serr, fs.ErrNotExist) {
+			t.Fatalf("bottom file lstat err = %v, want not exist", serr)
+		}
+		if _, serr := os.Lstat(filepath.Join(dst, filepath.Dir(bottomRel))); !errors.Is(serr, fs.ErrNotExist) {
+			t.Fatalf("directory past the bound lstat err = %v, want not exist", serr)
+		}
+	})
+
+	t.Run("exactly at the bound", func(t *testing.T) {
+		src, bottomRel := build(t, maxMaterializeDepth)
+		dst := filepath.Join(t.TempDir(), "rootfs")
+		if _, err := MaterializeTree(ByteCopier{}, src, dst); err != nil {
+			t.Fatalf("MaterializeTree: %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(dst, bottomRel)); err != nil {
+			t.Fatalf("bottom file: %v", err)
+		}
+	})
+}
