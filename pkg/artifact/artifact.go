@@ -537,8 +537,9 @@ func WithHold(hold func(context.Context, *Result) error) PullOption {
 }
 
 // RunHold runs the WithHold callback among opts, if any, against res. It is
-// how an ArtifactPuller other than *Puller (a test double) honours WithHold;
-// *Puller runs the callback itself, inside the pull.
+// how an ArtifactPuller other than *Puller (a test double) honours WithHold.
+// *Puller runs the callback itself, inside the pull under the lease. A puller
+// must not call RunHold and then delegate to *Puller: the hold would run twice.
 func RunHold(ctx context.Context, res *Result, opts ...PullOption) error {
 	o, err := applyOptions(opts)
 	if err != nil {

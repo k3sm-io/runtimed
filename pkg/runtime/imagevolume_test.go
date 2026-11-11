@@ -171,8 +171,10 @@ func TestCreatePodImageVolumePullRefusalReasons(t *testing.T) {
 // TestCreatePodImageVolumeRecheckFailureAfterHold: a pull whose re-check
 // fails after the pod's hold was written (artifact.ErrBlobReclaimed) refuses
 // the create with ArtifactPullRefused and IMAGE_PULL. That the failed create
-// then releases the hold is TestFailedCreateRemovesOnlyItsOwnHold's; this
-// asserts the hold was written, through WithHold, before the failure.
+// then releases it: the hold is written through artifact.WithHold before the
+// failure, and gone from both ArtifactHolds and HeldManifests after it.
+// (TestFailedCreateRemovesOnlyItsOwnHold fails its pull before the hold
+// callback runs, so it cannot prove this.)
 func TestCreatePodImageVolumeRecheckFailureAfterHold(t *testing.T) {
 	var rt *Runtime
 	var heldAtFailure bool
@@ -200,6 +202,21 @@ func TestCreatePodImageVolumeRecheckFailureAfterHold(t *testing.T) {
 	}
 	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL {
 		t.Errorf("reason = %v, want IMAGE_PULL", resp.GetFailureReason())
+	}
+	holds, err := rt.index.ArtifactHolds(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := image.ParsePodID("pod-recheck")
+	if h, ok := holds[pid]; ok {
+		t.Errorf("the failed create left the pod's hold behind: %+v", h)
+	}
+	held, err := rt.index.HeldManifests(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held[sha([]byte("m"))] {
+		t.Error("the manifest is still held after the failed create")
 	}
 }
 
