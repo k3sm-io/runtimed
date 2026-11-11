@@ -212,3 +212,29 @@ func TestEvictPartialResultOnGuardError(t *testing.T) {
 		t.Errorf("Evict = %+v; want %+v", res, want)
 	}
 }
+
+// TestEvictRefusesMalformedTarget pins Evict's input refusals: an empty blob
+// list, a malformed manifest digest and a malformed blob digest each return an
+// error and no result, with nothing removed.
+func TestEvictRefusesMalformedTarget(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	d := f.blob("evict-refuse", time.Hour)
+	for _, tc := range []struct {
+		name     string
+		manifest string
+		blobs    []string
+	}{
+		{"empty blob list", fakeDigest('a'), nil},
+		{"malformed manifest", "sha256:nope", []string{d}},
+		{"malformed blob", fakeDigest('a'), []string{d, "sha256:nope"}},
+	} {
+		res, err := f.cache.Evict(context.Background(), tc.manifest, tc.blobs, ReclaimConfig{FreeBytes: func(string) (uint64, error) { return 1, nil }})
+		if err == nil || res != nil {
+			t.Errorf("%s: Evict = %+v, %v; want nil and an error", tc.name, res, err)
+		}
+		if !f.exists(d) {
+			t.Fatalf("%s: %s removed", tc.name, d)
+		}
+	}
+}
