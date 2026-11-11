@@ -129,7 +129,11 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	return 0, s.stallError(err)
 }
 
-// Close stops the watchdog and closes the body.
+// Close stops the timer and closes the body, once in all: whichever of Close
+// and the watchdog gets there first closes it, and every Close returns that one
+// body.Close error. Stopping the timer only prevents a firing that has not
+// started; a timer callback already running is not waited for beyond the shared
+// once around the body's Close.
 func (s *stallReader) Close() error {
 	s.timer.Stop()
 	s.closeBody()
