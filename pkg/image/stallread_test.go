@@ -101,25 +101,52 @@ func layerBodyServer(t *testing.T, body func(w http.ResponseWriter, r *http.Requ
 // connection fails the pull with ErrLayerBodyStalled. That a body which keeps
 // delivering is never cut is pinned with a fake timer in TestStallReader.
 func TestLayerPullStalledBodyAborts(t *testing.T) {
+	// The server holds the connection, sending nothing more, until the test
+	// releases it; nothing here depends on how long the stall lasts.
+	release := make(chan struct{})
 	ref := layerBodyServer(t, func(w http.ResponseWriter, r *http.Request, layer []byte) {
 		_, _ = w.Write(layer[:16])
 		w.(http.Flusher).Flush()
-		<-r.Context().Done()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
 	})
+	// Registered after the server's cleanups, so it runs first and frees the
+	// held handler before the server closes.
+	t.Cleanup(func() { close(release) })
 	cache, err := NewCache(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	p := mustPullerIndex(t, cache, RemoteFetch, NoLocalIndex{})
-	p.layerStallWindow = 200 * time.Millisecond
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// A knob, not a measurement: any window fires, it only has to be short.
+	p.layerStallWindow = 10 * time.Millisecond
+	// The outer guard only turns a regression (a pull that never returns) into a
+	// failure; the happy path never waits on it.
+	const guard = 60 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), guard)
 	defer cancel()
-	res, err := p.Pull(ctx, ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-	if res != nil && res.Lease != nil {
-		res.Lease.Release()
+	type pullResult struct {
+		res *PullResult
+		err error
 	}
-	if !errors.Is(err, ErrLayerBodyStalled) {
-		t.Fatalf("Pull error = %v, want ErrLayerBodyStalled", err)
+	done := make(chan pullResult, 1)
+	go func() {
+		res, err := p.Pull(ctx, ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+		done <- pullResult{res, err}
+	}()
+	var got pullResult
+	select {
+	case got = <-done:
+	case <-time.After(guard):
+		t.Fatal("Pull did not return: the stall watchdog never aborted the held body")
+	}
+	if got.res != nil && got.res.Lease != nil {
+		got.res.Lease.Release()
+	}
+	if !errors.Is(got.err, ErrLayerBodyStalled) {
+		t.Fatalf("Pull error = %v, want ErrLayerBodyStalled", got.err)
 	}
 }
 
@@ -215,6 +242,82 @@ func (c *clockedReader) Read(p []byte) (int, error) {
 }
 
 func (c *clockedReader) Close() error { return nil }
+
+// firingReader fires the watchdog from inside its Read, with the timer armed,
+// then returns the scripted result: the watchdog and the read land in the same
+// instant, with no sleep.
+type firingReader struct {
+	ft   *fakeTimer
+	fire bool
+	n    int
+	err  error
+}
+
+func (f *firingReader) Read(p []byte) (int, error) {
+	if f.fire {
+		f.ft.advance(time.Hour)
+	}
+	for i := 0; i < f.n; i++ {
+		p[i] = 'x'
+	}
+	return f.n, f.err
+}
+
+func (f *firingReader) Close() error { return nil }
+
+// TestStallReaderSameInstant pins the rules for the watchdog firing in the same
+// instant as a body.Read returning: delivered bytes and a clean EOF always win,
+// a read that delivered nothing is a stall, and a read the watchdog did not
+// race is passed through untouched.
+func TestStallReaderSameInstant(t *testing.T) {
+	const window = time.Minute
+	boom := errors.New("read failed")
+	tests := []struct {
+		name      string
+		fire      bool
+		n         int
+		err       error
+		wantN     int
+		wantErr   error // matched with errors.Is; nil means exactly nil
+		wantCause bool  // the stall error names boom
+		nextStall bool  // the following Read reports the stall
+	}{
+		{name: "no fire, data", n: 3, wantN: 3},
+		{name: "no fire, error", err: boom, wantErr: boom},
+		{name: "fire, data", fire: true, n: 3, wantN: 3, nextStall: true},
+		{name: "fire, data with error", fire: true, n: 3, err: boom, wantN: 3, nextStall: true},
+		{name: "fire, data with EOF", fire: true, n: 3, err: io.EOF, wantN: 3, wantErr: io.EOF},
+		{name: "fire, bare EOF", fire: true, err: io.EOF, wantErr: io.EOF},
+		{name: "fire, error", fire: true, err: boom, wantErr: ErrLayerBodyStalled, wantCause: true, nextStall: true},
+		{name: "fire, nothing", fire: true, wantErr: ErrLayerBodyStalled, nextStall: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ft := newFakeTimer()
+			body := &firingReader{ft: ft, fire: tt.fire, n: tt.n, err: tt.err}
+			s := newFakeStallReader(body, window, ft)
+			defer s.Close()
+			n, err := s.Read(make([]byte, 8))
+			if n != tt.wantN {
+				t.Fatalf("Read n = %d, want %d", n, tt.wantN)
+			}
+			switch {
+			case tt.wantErr == nil && err != nil:
+				t.Fatalf("Read error = %v, want nil", err)
+			case tt.wantErr != nil && !errors.Is(err, tt.wantErr):
+				t.Fatalf("Read error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantCause && !strings.Contains(err.Error(), boom.Error()) {
+				t.Fatalf("stall error %q does not name the cause %q", err, boom)
+			}
+			if tt.nextStall {
+				if _, next := s.Read(make([]byte, 8)); !errors.Is(next, ErrLayerBodyStalled) {
+					t.Fatalf("next Read error = %v, want ErrLayerBodyStalled", next)
+				}
+			}
+		})
+	}
+}
 
 // TestStallReader pins the watchdog at the reader level on a fake timer: it
 // times only the body.Read, never the consumer between Reads; a stall reports
