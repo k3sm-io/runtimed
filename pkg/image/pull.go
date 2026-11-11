@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -529,6 +530,11 @@ type Puller struct {
 	// its transport is built here, not injected.
 	remoteBlobs BlobSourceFunc
 	mirrorBlobs MirrorBlobSourceFunc
+
+	// partials keeps the layer bytes a cut fetch already received, so the next
+	// pull resumes with a Range request (WithPartialStore). Nil — the default —
+	// fetches every layer from byte 0.
+	partials *registryfetch.PartialStore
 }
 
 // primaryBlobSource yields the direct blob route for ref on the primary path
@@ -809,10 +815,37 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		}
 		return nil, err
 	}
-	return p.ingest(ctx, ref, img, want)
+	return p.ingestVia(ctx, ref, img, want, p.resumeSource(ref, cred))
 }
 
-// ingest commits one fetched image into the store under ref and records it: the
+// resumeSource is the blob route ingest resumes ref's layers through, fetched
+// with cred: the primary path's BlobSource, when the puller has both that
+// route and a partial store. Nil otherwise, and ingest then reads each layer
+// from the fetched image, as it does without either. A route that cannot be
+// built is also nil (logged at Debug): the layer still arrives over the image
+// fetch, and CommitBlob verifies it either way.
+func (p *Puller) resumeSource(ref string, cred *RegistryCredential) *BlobSource {
+	if p.partials == nil {
+		return nil
+	}
+	src, ok, err := p.primaryBlobSource(ref, cred)
+	if err != nil {
+		p.logger().Debug("no resumable blob route for this reference; fetching layers whole",
+			"ref", ref, "error", err)
+		return nil
+	}
+	if !ok {
+		return nil
+	}
+	return &src
+}
+
+// ingest is ingestVia with no blob route: every layer is read from img.
+func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want []Platform) (*PullResult, error) {
+	return p.ingestVia(ctx, ref, img, want, nil)
+}
+
+// ingestVia commits one fetched image into the store under ref and records it: the
 // platform re-verification, the lease over the whole digest set, every config
 // and layer blob, and the index entry — everything after the bytes are in hand.
 //
@@ -826,7 +859,11 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 //
 // ref is the reference the pull was ASKED for, never the mirror-rewritten one:
 // it is what the manifest reports and what the index records.
-func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want []Platform) (_ *PullResult, retErr error) {
+//
+// src, when not nil, is the direct blob route for ref (resumeSource): each
+// layer then comes through the partial store (resumeBlob) rather than from
+// img, and a cut transfer is resumed by the next pull.
+func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, want []Platform, src *BlobSource) (_ *PullResult, retErr error) {
 	cfg, err := img.ConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
@@ -923,7 +960,7 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 	}
 	for i, layer := range layers {
 		desc := mfst.Layers[i]
-		wrote, err := p.writeBlob(desc.Digest.String(), desc.Size, func(w io.Writer) error {
+		whole := func(w io.Writer) error {
 			rc, oerr := layer.Compressed()
 			if oerr != nil {
 				return oerr
@@ -931,7 +968,13 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 			defer rc.Close()
 			_, cerr := io.Copy(w, rc)
 			return cerr
-		})
+		}
+		var wrote bool
+		if src != nil {
+			wrote, err = p.resumeBlob(ctx, *src, desc.Digest.String(), desc.Size, whole)
+		} else {
+			wrote, err = p.writeBlob(desc.Digest.String(), desc.Size, whole)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1091,18 +1134,126 @@ func manifestDigests(mfst *runtimev1.ImageManifest) []string {
 // is logged at Warn before falling back, so a tampered store is never hidden
 // behind a successful pull.
 func (p *Puller) writeBlob(digest string, size int64, fill func(io.Writer) error) (wrote bool, err error) {
-	if p.localBlobs != nil {
-		wrote, lerr := p.cache.CommitFromLocal(digest, size, p.localBlobs)
-		switch {
-		case lerr == nil:
-			return wrote, nil
-		case errors.Is(lerr, ErrBlobNotLocal):
-		default:
-			p.logger().Warn("local blob store copy refused, fetching from the registry",
-				"digest", quoteBounded(digest, maxDigestLen), "err", lerr)
-		}
+	if wrote, ok := p.commitLocal(digest, size); ok {
+		return wrote, nil
 	}
 	return p.cache.CommitBlob(digest, size, fill)
+}
+
+// commitLocal offers digest to the LocalBlobSource, when there is one. ok is
+// true when that committed it (wrote as CommitFromLocal reports); otherwise
+// the caller fetches it, and a refusal other than ErrBlobNotLocal has been
+// logged at Warn (see writeBlob).
+func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
+	if p.localBlobs == nil {
+		return false, false
+	}
+	wrote, lerr := p.cache.CommitFromLocal(digest, size, p.localBlobs)
+	switch {
+	case lerr == nil:
+		return wrote, true
+	case errors.Is(lerr, ErrBlobNotLocal):
+	default:
+		p.logger().Warn("local blob store copy refused, fetching from the registry",
+			"digest", quoteBounded(digest, maxDigestLen), "err", lerr)
+	}
+	return false, false
+}
+
+// resumeBlob is writeBlob for a layer with a direct blob route: the size-byte
+// blob digest is fetched through the puller's partial store, so the bytes a
+// cut transfer received stay on disk and the next pull asks src for the rest
+// with a Range request. size and digest are the manifest descriptor's, the
+// same claimed values writeBlob takes.
+//
+// The partial is claimed first, so one digest has one writer; a digest
+// another pull is already resuming, one that is not sha256, or a partial
+// store over its budget falls back to writeBlob with whole, the same fill
+// ingest uses without a route. A held claim is then offered to the
+// LocalBlobSource and checked against the cache before any byte is fetched.
+//
+// The complete partial is replayed into CommitBlob, which re-hashes all of it
+// against digest; a mismatch or an overrun condemns the partial and Resume
+// removes it, so the next pull starts from byte 0. Nothing about the hash is
+// carried from one attempt to the next.
+func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
+	release, cerr := p.partials.Claim(digest)
+	if cerr != nil {
+		p.logger().Debug("layer partial not claimable; fetching it whole",
+			"digest", quoteBounded(digest, maxDigestLen), "error", cerr)
+		return p.writeBlob(digest, size, whole)
+	}
+	defer release()
+	if wrote, ok := p.commitLocal(digest, size); ok {
+		return wrote, nil
+	}
+	if p.cache.Has(digest) {
+		return false, nil
+	}
+	err = p.partials.Resume(registryfetch.Fill{
+		Digest: digest,
+		Size:   size,
+		Transfer: func(f *os.File, have int64) error {
+			return transferBlob(ctx, src, digest, size, f, have)
+		},
+		Commit: func(replay func(io.Writer) error) error {
+			w, err := p.cache.CommitBlob(digest, size, replay)
+			wrote = w
+			return err
+		},
+		Poisoned: func(err error) bool {
+			return errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrBlobTooLarge)
+		},
+	})
+	if errors.Is(err, registryfetch.ErrPartialBudget) || errors.Is(err, registryfetch.ErrPartialCap) {
+		// Admit refused before the store was touched.
+		p.logger().Debug("layer partial over budget; fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	}
+	return wrote, err
+}
+
+// transferBlob appends the rest of the size-byte blob digest to f from offset
+// have, over src. A server that answers from 0 instead (a 200 to the Range
+// request) restarts the partial: f is truncated and written from 0. A failure
+// leaves what arrived in f, synced, for the next pull to resume; an overrun
+// empties it, since those bytes are the server's fault.
+func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64) error {
+	body, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
+	if err != nil {
+		return fmt.Errorf("fetch blob %s from %d: %w", digest, have, err)
+	}
+	defer body.Close()
+	switch {
+	case start == have:
+	case start == 0:
+		if err := f.Truncate(0); err != nil {
+			return fmt.Errorf("reset partial %s: %w", digest, err)
+		}
+		have = 0
+	default:
+		return fmt.Errorf("fetch blob %s: asked for offset %d, got %d: %w", digest, have, start, registryfetch.ErrBlobRange)
+	}
+	if _, err := f.Seek(have, io.SeekStart); err != nil {
+		return fmt.Errorf("seek partial %s: %w", digest, err)
+	}
+	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(body, size-have+1))
+	serr := f.Sync()
+	if have+n > size {
+		_ = f.Truncate(0) // the overrun error is the one reported
+		return fmt.Errorf("fetch blob %s: more than %d bytes: %w", digest, size, ErrBlobTooLarge)
+	}
+	if cerr != nil {
+		return fmt.Errorf("fetch blob %s at %d: %w", digest, have+n, boundErr(cerr))
+	}
+	if serr != nil {
+		return fmt.Errorf("sync partial %s: %w", digest, serr)
+	}
+	if have+n < size {
+		return fmt.Errorf("fetch blob %s: body ended at %d of %d: %w", digest, have+n, size, io.ErrUnexpectedEOF)
+	}
+	return nil
 }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
