@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -299,7 +301,7 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 		verifyLayer(t, cache, c)
 	})
 
-	t.Run("wrong range answer empties the partial and fetches the layer whole", func(t *testing.T) {
+	t.Run("wrong range answer removes the partial and fetches the layer whole", func(t *testing.T) {
 		c := newCutRegistry(t, cutAt)
 		c.cuts = 1
 		c.badRange = 1
@@ -325,8 +327,9 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 		}
 		res.Lease.Release()
 		verifyLayer(t, cache, c)
-		if got := store.Bytes(c.layer.String(), c.size); got != 0 {
-			t.Fatalf("partial holds %d bytes after the wrong range answer, want 0", got)
+		part := filepath.Join(dir, strings.Replace(c.layer.String(), ":", "-", 1)+".partial")
+		if _, err := os.Lstat(part); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("partial %s after the wrong range answer: err %v, want not exist", part, err)
 		}
 		ranged := 0
 		for _, r := range c.takeRanges() {

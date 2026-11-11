@@ -1179,11 +1179,11 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 //
 // A ranged answer that is not the bytes asked for (ErrBlobRange: a server or
 // proxy that mishandles Range) would fail the same way on every later pull
-// resuming from the same offset, so the partial is emptied, under the claim,
-// through the file Resume hands Transfer, and the layer is fetched whole by
-// writeBlob within this pull. PartialStore has no exported removal, so the
-// emptied file stays as a zero-length partial; the next resume of it starts
-// from byte 0 with no Range header.
+// resuming from the same offset, so the partial is removed, under the claim,
+// and the layer is fetched whole by writeBlob within this pull. Transfer also
+// empties the file it was handed, so a failed Remove still leaves a
+// zero-length partial that the next resume starts from byte 0, with no Range
+// header.
 func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
 	release, cerr := p.partials.Claim(digest)
 	if cerr != nil {
@@ -1232,7 +1232,12 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 			"digest", digest, "error", err)
 		return p.writeBlob(digest, size, whole)
 	case errors.Is(err, registryfetch.ErrBlobRange):
-		p.logger().Warn("layer range answer is not the one asked for; partial emptied, fetching it whole",
+		// The claim is still held: release is deferred above.
+		if rerr := p.partials.Remove(digest); rerr != nil {
+			p.logger().Warn("layer partial not removed after a wrong range answer",
+				"digest", digest, "error", rerr)
+		}
+		p.logger().Warn("layer range answer is not the one asked for; partial removed, fetching it whole",
 			"digest", digest, "error", err)
 		return p.writeBlob(digest, size, whole)
 	}
