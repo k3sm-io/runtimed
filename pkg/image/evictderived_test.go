@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -184,7 +185,8 @@ func TestEvictDerivedSkippedWhenUnlinkFails(t *testing.T) {
 		}
 	})
 	r := &evictDerivedRecorder{s: s}
-	got, err := s.evictWith(context.Background(), false, r.hook, nil)
+	var logs syncBuffer
+	got, err := s.evictWith(context.Background(), false, r.hook, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatalf("Evict: %v; an unlink failure is a kept blob, not an error", err)
 	}
@@ -199,5 +201,43 @@ func TestEvictDerivedSkippedWhenUnlinkFails(t *testing.T) {
 	}
 	if len(r.manifests) != 0 {
 		t.Errorf("EvictDerived calls = %v; a target blob that failed to unlink must keep the derived content", r.manifests)
+	}
+	out := logs.take()
+	for _, w := range []string{"level=WARN", "derived content kept, a target blob failed to unlink", "manifest=" + s.manifestA, "unlinkFailed=2"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("log = %q; want a Warn line containing %q", out, w)
+		}
+	}
+}
+
+// TestEvictDerivedRunsForOtherKeptReasons pins that only an unlink failure
+// stops the hook: a target blob kept for another reason leaves the hook called
+// once, with that blob reported under its reason.
+func TestEvictDerivedRunsForOtherKeptReasons(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		digest func(*evictScene) string
+		reason EvictKeepReason
+	}{
+		{"shared with another image", func(s *evictScene) string { return s.shared }, EvictKeptShared},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newEvictScene(t)
+			r := &evictDerivedRecorder{s: s}
+			got, err := s.evictWith(context.Background(), false, r.hook, nil)
+			if err != nil {
+				t.Fatalf("Evict: %v", err)
+			}
+			want := EvictKept{Digest: tc.digest(s), Reason: tc.reason}
+			if !slices.Contains(got.Kept, want) {
+				t.Fatalf("Evict kept = %+v; want %+v", got.Kept, want)
+			}
+			if !reflect.DeepEqual(r.manifests, []string{s.manifestA}) {
+				t.Errorf("EvictDerived calls = %v; want exactly [%s]", r.manifests, s.manifestA)
+			}
+		})
 	}
 }

@@ -165,24 +165,29 @@ func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg 
 	if err != nil {
 		return nil, err
 	}
-	if cfg.EvictDerived != nil && !keptUnlinkFailed(res) {
-		if herr := cfg.EvictDerived(ctx, manifest); herr != nil && cfg.Log != nil {
+	if cfg.EvictDerived != nil {
+		if n := keptUnlinkFailed(res); n > 0 {
+			if cfg.Log != nil {
+				cfg.Log.Warn("evict: derived content kept, a target blob failed to unlink", "manifest", manifest, "unlinkFailed", n)
+			}
+		} else if herr := cfg.EvictDerived(ctx, manifest); herr != nil && cfg.Log != nil {
 			cfg.Log.Warn("image evict: removal of the target's derived content refused; it is kept", "manifest", manifest, "err", herr)
 		}
 	}
 	return res, nil
 }
 
-// keptUnlinkFailed reports whether res keeps any target blob
-// EvictKeptUnlinkFailed: such a blob is still on disk, so its image's derived
-// content must stay with it.
-func keptUnlinkFailed(res *EvictResult) bool {
+// keptUnlinkFailed counts the target blobs res keeps EvictKeptUnlinkFailed:
+// such a blob is still on disk, so its image's derived content must stay with
+// it while the count is non-zero.
+func keptUnlinkFailed(res *EvictResult) int {
+	n := 0
 	for _, k := range res.Kept {
 		if k.Reason == EvictKeptUnlinkFailed {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 // evictGuards returns the executor seams of a narrow pass: evictHooks with its
