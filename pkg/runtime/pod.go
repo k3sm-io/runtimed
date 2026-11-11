@@ -2979,16 +2979,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// are separate processes that each take a path, and the pod can write its
 	// rootfs, so an in-place swap of the resolved file between the check and the
 	// shim's exec remains possible.
-	//
-	// The one exception is an argv[0] that is exactly an image-volume mount
-	// path: the daemon placed that link at an absolute path in the view cache,
-	// which the walk would refuse. imageMountProgram does not trust it; it keeps
-	// the lexical path only while the link equals the target the daemon derives
-	// for the mount, and refuses with ErrImageArgvEscapes otherwise.
-	bin, isMount, err := r.imageMountProgram(ctx, p.box, c, rootfs, run.Argv[0])
-	if err == nil && !isMount {
-		bin, _, err = resolveImageExecPath(rootfs, run.Argv[0])
-	}
+	bin, _, err := resolveImageExecPath(rootfs, run.Argv[0])
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
 			fmt.Errorf("container %s: %w", c.GetName(), err))
