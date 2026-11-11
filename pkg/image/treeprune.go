@@ -419,6 +419,10 @@ type SkippedTree struct {
 	Key string
 	// Reason is a short human-readable refusal reason.
 	Reason string
+	// Refusal is the typed form of Reason for a guard drop: Kind is
+	// RefusedByGuard and Digest is the backing blob digest the guard named
+	// (the tree itself is Key). It is nil on every other skip path.
+	Refusal *SkipRefusal
 }
 
 // TreeExecuteReport summarizes one ExecuteTreePrune run.
@@ -469,6 +473,25 @@ type TreeExecuteReport struct {
 // stop, when non-nil, is consulted before each removal and ends the run when it
 // returns true, on the same measured-target terms as ExecutePrune.
 func (c *Cache) ExecuteTreePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*TreeExecuteReport, error) {
+	return c.executeTreePrune(plan, grace, now, stop, nil)
+}
+
+// treePruneHooks are the optional seams of executeTreePrune. A nil
+// *treePruneHooks, or a nil field, leaves the executor exactly as
+// ExecuteTreePrune documents it.
+type treePruneHooks struct {
+	// guard, when non-nil, runs once per call inside pruneMu, before the tree
+	// loop. Its set is keyed by BLOB digest, the same shape pruneHooks.guard
+	// returns, so one guard serves both executors: a planned tree any of whose
+	// Backing digests is in the set is skipped rather than removed, with the
+	// reason of the first such digest in Backing order carried into the skip
+	// record. An error aborts the call with nothing removed.
+	guard func() (drop map[string]evictReason, err error)
+}
+
+// executeTreePrune is ExecuteTreePrune with hooks; see ExecuteTreePrune for
+// the contract.
+func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, hooks *treePruneHooks) (*TreeExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute tree prune: nil plan")
 	}
@@ -480,6 +503,14 @@ func (c *Cache) ExecuteTreePrune(plan *PrunePlan, grace time.Duration, now time.
 	}
 	c.pruneMu.Lock()
 	defer c.pruneMu.Unlock()
+
+	var drop map[string]evictReason
+	if hooks != nil && hooks.guard != nil {
+		var err error
+		if drop, err = hooks.guard(); err != nil {
+			return nil, fmt.Errorf("execute tree prune: guard: %w", err)
+		}
+	}
 
 	rep := &TreeExecuteReport{}
 	skip := func(d TreeDecision, reason string) {
@@ -499,6 +530,14 @@ func (c *Cache) ExecuteTreePrune(plan *PrunePlan, grace time.Duration, now time.
 		if stop != nil && stop() {
 			rep.StoppedEarly = true
 			break
+		}
+		if dg, why, ok := droppedBacking(d.Node, drop); ok {
+			r := hookRefusal(dg, RefusedByGuard, why)
+			rep.Skipped = append(rep.Skipped, SkippedTree{
+				Store: d.Node.Store, Path: d.Node.Path, Key: d.Node.Key,
+				Reason: fmt.Sprintf("dropped by guard: %s", why), Refusal: r,
+			})
+			continue
 		}
 		rel := d.Node.Path
 		if _, ok := classifyTreeKey(rel); !ok {
@@ -554,4 +593,15 @@ func (c *Cache) ExecuteTreePrune(plan *PrunePlan, grace time.Duration, now time.
 		}
 	}
 	return rep, nil
+}
+
+// droppedBacking reports the first of n's Backing digests, in Backing order,
+// that drop names, and its reason. An empty digest never matches.
+func droppedBacking(n TreeNode, drop map[string]evictReason) (string, evictReason, bool) {
+	for _, dg := range n.Backing {
+		if why, ok := drop[dg]; ok && dg != "" {
+			return dg, why, true
+		}
+	}
+	return "", "", false
 }
