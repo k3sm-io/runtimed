@@ -46,6 +46,21 @@ func (u *failingUnpacker) MaterializeTree(_ context.Context, _ *runtimev1.ImageM
 	return nil, fmt.Errorf("materialize tree %q into %s: %w", "sha256:"+hexRun('e'), dst, errors.New(unpackDetail))
 }
 
+// configDetail marks the host blob path a failed image config read names.
+const configDetail = "CONFIG-DETAIL"
+
+// configReadErr is the error a failed image config read returns: the host
+// path of the config blob it could not open.
+var configReadErr = &fs.PathError{Op: "open", Path: "/var/k3sm/blobs/" + configDetail + "/sha256", Err: fs.ErrPermission}
+
+// failingConfigUnpacker materializes like treeUnpacker but cannot read the
+// image's config blob.
+type failingConfigUnpacker struct{ treeUnpacker }
+
+func (u *failingConfigUnpacker) ImageRunConfig(*runtimev1.ImageManifest) (image.ImageRunConfig, error) {
+	return image.ImageRunConfig{}, configReadErr
+}
+
 // toggleWrapBackend fails WrapCommand, once failing is set, the way the sbpl
 // backend does when it cannot stage a profile: the staging path and a cause.
 type toggleWrapBackend struct {
@@ -118,6 +133,15 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 			marker:   func(string) string { return "PULL-DETAIL" },
 			wants:    func(string) []string { return []string{"pull image", fs.ErrPermission.Error()} },
 		},
+		{
+			name:     "config-read",
+			unpacker: &failingConfigUnpacker{},
+			own:      imageRef,
+			sentence: "could not be read; the daemon log has the cause",
+			reason:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			marker:   func(string) string { return configDetail },
+			wants:    func(string) []string { return []string{"read image config for", fs.ErrPermission.Error()} },
+		},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,7 +177,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				t.Errorf("failure_reason = %v, want %v", got, tc.reason)
 			}
 			assertNoHostPaths(t, "waiting message", w.GetMessage(), tc.own, tc.own, tc.sentence,
-				rt.cache.Root(), rootfs, "UNPACK-DETAIL", "PULL-DETAIL")
+				rt.cache.Root(), rootfs, "UNPACK-DETAIL", "PULL-DETAIL", configDetail)
 
 			assertLoggedOnce(t, logs.String(), tc.marker(rootfs), tc.wants(rootfs))
 
@@ -165,7 +189,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				t.Fatal("StartContainer succeeded through a failing start")
 			}
 			assertNoHostPaths(t, "StartContainer error", sresp.GetError().GetMessage(),
-				podID+"/main", tc.own, tc.sentence, rt.cache.Root(), rootfs, "UNPACK-DETAIL", "PULL-DETAIL")
+				podID+"/main", tc.own, tc.sentence, rt.cache.Root(), rootfs, "UNPACK-DETAIL", "PULL-DETAIL", configDetail)
 		})
 	}
 
