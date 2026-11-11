@@ -19,8 +19,10 @@ package image
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -190,6 +192,12 @@ func TestExternalTransportHeaderTimeout(t *testing.T) {
 	if tr.ResponseHeaderTimeout != 50*time.Millisecond {
 		t.Fatalf("ResponseHeaderTimeout = %s, want 50ms", tr.ResponseHeaderTimeout)
 	}
+	if tr.DialContext == nil {
+		t.Fatal("clone dropped the dialer: no dial timeout")
+	}
+	if tr.MaxIdleConnsPerHost != externalMaxIdleConnsPerHost || externalMaxIdleConnsPerHost != 50 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 50", tr.MaxIdleConnsPerHost)
+	}
 	if tr.TLSHandshakeTimeout != def.TLSHandshakeTimeout {
 		t.Fatalf("TLSHandshakeTimeout = %s, want the default's %s", tr.TLSHandshakeTimeout, def.TLSHandshakeTimeout)
 	}
@@ -233,5 +241,97 @@ func TestExternalTransportHeaderTimeout(t *testing.T) {
 	}
 	if rec.n.Load() == 0 {
 		t.Fatal("the caller's transport carried no round trip: the default transport option overrode it")
+	}
+}
+
+// freshExternalTransport makes remoteFetch build its external transport anew
+// (so it reads the current header bound) and restores the shared one after.
+func freshExternalTransport(t *testing.T) {
+	t.Helper()
+	old := externalTransport
+	next := onceExternalTransport()
+	externalTransport = next
+	t.Cleanup(func() {
+		externalTransport = old
+		if tr, ok := next().(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	})
+}
+
+// TestExternalTransportHeaderTimeoutThroughPull pins that remoteFetch, with no
+// caller transport, carries its round trips on the header-bounded transport: a
+// registry that never writes headers fails on the header bound, long before the
+// resolve bound, and http.DefaultTransport is left as it was.
+func TestExternalTransportHeaderTimeoutThroughPull(t *testing.T) {
+	def := http.DefaultTransport.(*http.Transport)
+	beforeHeader := def.ResponseHeaderTimeout
+	beforeProxy := fmt.Sprintf("%p", def.Proxy)
+	beforeDial := fmt.Sprintf("%p", def.DialContext)
+
+	setDuration(t, &responseHeaderTimeout, 50*time.Millisecond)
+	setDuration(t, &resolveTimeout, 5*time.Second)
+	freshExternalTransport(t)
+
+	r, err := name.ParseReference(silentServer(t) + "/silent/app:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = remoteFetch(context.Background(), r, r.String(), nil, nativePolicy())
+	el := time.Since(start)
+	if err == nil {
+		t.Fatal("remoteFetch on a silent registry succeeded")
+	}
+	if errors.Is(err, ErrPullResolveTimeout) {
+		t.Fatalf("remoteFetch error = %v, want the header bound, not the resolve bound", err)
+	}
+	if !strings.Contains(err.Error(), "timeout awaiting response headers") {
+		t.Fatalf("remoteFetch error = %v, want a response header timeout", err)
+	}
+	if el > resolveTimeout/2 {
+		t.Fatalf("remoteFetch took %s, want well under the %s resolve bound", el, resolveTimeout)
+	}
+
+	tr, ok := externalTransport().(*http.Transport)
+	if !ok {
+		t.Fatal("external transport is not an *http.Transport")
+	}
+	if tr.ResponseHeaderTimeout != 50*time.Millisecond || tr.DialContext == nil {
+		t.Fatalf("external transport: header timeout %s, dialer set %t", tr.ResponseHeaderTimeout, tr.DialContext != nil)
+	}
+	if tr.MaxIdleConnsPerHost != 50 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 50", tr.MaxIdleConnsPerHost)
+	}
+	if def.ResponseHeaderTimeout != beforeHeader {
+		t.Fatalf("http.DefaultTransport ResponseHeaderTimeout mutated to %s", def.ResponseHeaderTimeout)
+	}
+	if got := fmt.Sprintf("%p", def.Proxy); got != beforeProxy {
+		t.Fatalf("http.DefaultTransport Proxy changed: %s, was %s", got, beforeProxy)
+	}
+	if got := fmt.Sprintf("%p", def.DialContext); got != beforeDial {
+		t.Fatalf("http.DefaultTransport DialContext changed: %s, was %s", got, beforeDial)
+	}
+}
+
+// timeoutNetError is a net.Error that reports a timeout.
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "i/o timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+// TestMirrorFallbackResolveAndHeaderTimeouts pins what the mirror fallback does
+// today with the two bounds' errors: a resolve-bound failure is not eligible,
+// a transport timeout (the header bound's kind of error) is.
+func TestMirrorFallbackResolveAndHeaderTimeouts(t *testing.T) {
+	resolve := fmt.Errorf("pull %q: %w after %s: %v", "r/app:v1", ErrPullResolveTimeout, time.Minute, context.Canceled)
+	if mirrorFallbackEligible(resolve) {
+		t.Errorf("mirrorFallbackEligible(%v) = true, want false", resolve)
+	}
+	var ne net.Error = timeoutNetError{}
+	header := fmt.Errorf("pull %q: %w", "r/app:v1", ne)
+	if !mirrorFallbackEligible(header) {
+		t.Errorf("mirrorFallbackEligible(%v) = false, want true", header)
 	}
 }

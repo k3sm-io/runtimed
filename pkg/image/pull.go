@@ -215,13 +215,26 @@ func resolveContext(parent context.Context, d time.Duration) (ctx context.Contex
 // that also bounds the wait for response headers. It is built once, so pulls
 // share its connection pool, and the global is never mutated. It is nil when
 // http.DefaultTransport is not an *http.Transport (a test or embedder replaced
-// it), in which case the library's default stays in place.
-var externalTransport = sync.OnceValue(func() http.RoundTripper {
-	if tr := newExternalTransport(responseHeaderTimeout); tr != nil {
-		return tr
-	}
-	return nil
-})
+// it), in which case the library's default stays in place. It is a variable
+// so a test can install a fresh onceExternalTransport after changing the bound.
+var externalTransport = onceExternalTransport()
+
+// onceExternalTransport returns a function that builds the external transport
+// on first use, reading responseHeaderTimeout then, and returns that one
+// transport on every later call.
+func onceExternalTransport() func() http.RoundTripper {
+	return sync.OnceValue(func() http.RoundTripper {
+		if tr := newExternalTransport(responseHeaderTimeout); tr != nil {
+			return tr
+		}
+		return nil
+	})
+}
+
+// externalMaxIdleConnsPerHost is the idle connection cap per registry host, the
+// value go-containerregistry's own default transport uses (http.Transport's
+// zero value would mean 2, too few for parallel layer fetches).
+const externalMaxIdleConnsPerHost = 50
 
 // newExternalTransport clones http.DefaultTransport with the given header
 // bound, or returns nil when the default is not an *http.Transport.
@@ -232,6 +245,7 @@ func newExternalTransport(headerTimeout time.Duration) *http.Transport {
 	}
 	tr := def.Clone()
 	tr.ResponseHeaderTimeout = headerTimeout
+	tr.MaxIdleConnsPerHost = externalMaxIdleConnsPerHost
 	return tr
 }
 
