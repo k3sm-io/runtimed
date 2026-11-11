@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -474,5 +475,37 @@ func TestForeignErrorTextIsBounded(t *testing.T) {
 	}
 	if len(err.Error()) > 8*maxForeignErrBytes || !strings.HasSuffix(err.Error(), "...") {
 		t.Fatalf("bounded text is %d bytes, not cut", len(err.Error()))
+	}
+}
+
+func TestCredentialRedacts(t *testing.T) {
+	c := Credential{
+		Username: "alice", Password: "pw-SECRET-1", Auth: "auth-SECRET-2",
+		IdentityToken: "idt-SECRET-3", RegistryToken: "rt-SECRET-4",
+	}
+	secrets := []string{c.Password, c.Auth, c.IdentityToken, c.RegistryToken}
+	var text, js bytes.Buffer
+	slog.New(slog.NewTextHandler(&text, nil)).Info("login", "cred", c, "ptr", &c)
+	slog.New(slog.NewJSONHandler(&js, nil)).Info("login", "cred", c, "ptr", &c)
+	outs := map[string]string{
+		"%v":      fmt.Sprintf("%v", c),
+		"%+v":     fmt.Sprintf("%+v", c),
+		"%#v":     fmt.Sprintf("%#v", c),
+		"%s":      fmt.Sprintf("%s", c),
+		"ptr %v":  fmt.Sprintf("%v", &c),
+		"ptr %+v": fmt.Sprintf("%+v", &c),
+		"ptr %#v": fmt.Sprintf("%#v", &c),
+		"text":    text.String(),
+		"json":    js.String(),
+	}
+	for name, out := range outs {
+		for _, s := range secrets {
+			if strings.Contains(out, s) {
+				t.Errorf("%s output leaks %q: %s", name, s, out)
+			}
+		}
+		if !strings.Contains(out, "alice") {
+			t.Errorf("%s output lost the username: %s", name, out)
+		}
 	}
 }
