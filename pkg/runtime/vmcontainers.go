@@ -345,7 +345,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	}
 	res, err := r.puller.Pull(ctx, ref, pullCred, pullPolicy(backend), c.GetImagePullPolicy())
 	if err != nil {
-		return failed(pullFailureReason(c, err), fmt.Errorf("pull image %q: %w", ref, err))
+		return failed(pullFailureReason(c, err), withClientMessage(fmt.Sprintf("image %q could not be pulled; the daemon log has the cause", ref), fmt.Errorf("pull image %q: %w", ref, err)))
 	}
 	// RECORD the ROOT, then release the LEASE — the ordering resolveBinary
 	// documents: the blobs are on disk and named by nothing until the record
@@ -404,7 +404,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
 	if err != nil {
 		return failed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
-			fmt.Errorf("read image config for %q: %w", ref, err))
+			withClientMessage(fmt.Sprintf("image %q could not be read; the daemon log has the cause", ref), fmt.Errorf("read image config for %q: %w", ref, err)))
 	}
 	run, err := image.MergeRunSpec(runCfg, runSpecRequest(box, c, int64(cred.UID)))
 	switch {

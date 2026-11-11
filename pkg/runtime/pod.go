@@ -3076,7 +3076,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	res, err := r.puller.Pull(ctx, c.GetImage(), cred, pullPolicy(p.backend), c.GetImagePullPolicy())
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(pullFailureReason(c, err),
-			fmt.Errorf("pull image %q: %w", c.GetImage(), err))
+			withClientMessage(fmt.Sprintf("image %q could not be pulled; the daemon log has the cause", c.GetImage()), fmt.Errorf("pull image %q: %w", c.GetImage(), err)))
 	}
 	// Record the root, then release the lease — in that order, never reversed.
 	// Pull returns with its blobs pinned by a lease precisely because they are
@@ -3136,7 +3136,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	runCfg, err := r.unpacker.ImageRunConfig(res.Manifest)
 	if err != nil {
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
-			fmt.Errorf("read image config for %q: %w", c.GetImage(), err))
+			withClientMessage(fmt.Sprintf("image %q could not be read; the daemon log has the cause", c.GetImage()), fmt.Errorf("read image config for %q: %w", c.GetImage(), err)))
 	}
 	run, err := image.MergeRunSpec(runCfg, runSpecRequest(p.box, c, int64(resolveCredential(p.box, c).UID)))
 	if err != nil {

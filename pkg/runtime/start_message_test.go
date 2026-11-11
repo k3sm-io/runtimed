@@ -76,6 +76,8 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 	cases := []struct {
 		name     string
 		unpacker Unpacker
+		// pullErr, when set, fails the pull with it.
+		pullErr error
 		// own is the pod's own string the sentence must name.
 		own      string
 		sentence string
@@ -106,6 +108,16 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 			marker:   func(string) string { return "UNPACK-DETAIL" },
 			wants:    func(rootfs string) []string { return []string{rootfs, unpackDetail} },
 		},
+		{
+			name:     "pull",
+			unpacker: &treeUnpacker{},
+			pullErr:  &fs.PathError{Op: "open", Path: "/var/k3sm/blobs/PULL-DETAIL/sha256", Err: fs.ErrPermission},
+			own:      imageRef,
+			sentence: "could not be pulled; the daemon log has the cause",
+			reason:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			marker:   func(string) string { return "PULL-DETAIL" },
+			wants:    func(string) []string { return []string{"pull image", fs.ErrPermission.Error()} },
+		},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,6 +130,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				Puller: &fakePuller{
 					manifest:   &runtimev1.ImageManifest{Reference: imageRef, Config: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('c')}},
 					descriptor: &runtimev1.Descriptor{Digest: "sha256:" + hexRun('d')},
+					err:        tc.pullErr,
 				},
 				Unpacker: tc.unpacker,
 			})
@@ -140,7 +153,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				t.Errorf("failure_reason = %v, want %v", got, tc.reason)
 			}
 			assertNoHostPaths(t, "waiting message", w.GetMessage(), tc.own, tc.own, tc.sentence,
-				rt.cache.Root(), rootfs, "UNPACK-DETAIL")
+				rt.cache.Root(), rootfs, "UNPACK-DETAIL", "PULL-DETAIL")
 
 			assertLoggedOnce(t, logs.String(), tc.marker(rootfs), tc.wants(rootfs))
 
@@ -152,7 +165,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				t.Fatal("StartContainer succeeded through a failing start")
 			}
 			assertNoHostPaths(t, "StartContainer error", sresp.GetError().GetMessage(),
-				podID+"/main", tc.own, tc.sentence, rt.cache.Root(), rootfs, "UNPACK-DETAIL")
+				podID+"/main", tc.own, tc.sentence, rt.cache.Root(), rootfs, "UNPACK-DETAIL", "PULL-DETAIL")
 		})
 	}
 
