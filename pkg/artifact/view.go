@@ -227,6 +227,11 @@ func deviceOf(path string) (uint64, error) {
 // Root returns the views root directory.
 func (v *Views) Root() string { return v.root }
 
+// HasHoldSource reports whether v was built with a hold source
+// (ViewsConfig.Holds). Without one, RemoveIfOrphan consults no pod hold, so a
+// caller that may remove a view a pod mounts checks this first.
+func (v *Views) HasHoldSource() bool { return v != nil && v.holds != nil }
+
 // PathSetKey is the view name for a path set: the hex sha256 of the sorted
 // paths, each terminated by a NUL byte. Validated paths never contain NUL, so
 // distinct sets never share a key. The order of paths does not matter.

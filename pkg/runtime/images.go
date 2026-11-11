@@ -1110,11 +1110,12 @@ func (r *Runtime) viewSweeper() func(context.Context) error {
 // the views of the one evicted manifest when no artifact record and no pod
 // hold names it (artifact.Views.RemoveIfOrphan). It is passed in here, from
 // the wiring, because pkg/image cannot import pkg/artifact. Nil when views are
-// disabled, or when there is no image index: the runtime builds its Views with
-// that index as their hold source, and a Views with no hold source would
-// remove a view a pod mounts.
+// disabled, when there is no image index (the runtime builds its Views with
+// that index as their hold source), or when the Views has no hold source: its
+// RemoveIfOrphan would then consult no pod hold and remove a view a pod
+// mounts. A nil hook removes no view; the blobs are still evicted.
 func (r *Runtime) viewEvictor() func(context.Context, string) error {
-	if r.views == nil || r.index == nil {
+	if r.views == nil || r.index == nil || !r.views.HasHoldSource() {
 		return nil
 	}
 	return r.views.RemoveIfOrphan
