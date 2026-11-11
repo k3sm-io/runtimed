@@ -188,6 +188,15 @@ func TestEvictStatusError(t *testing.T) {
 		{name: "roots incomplete with an empty partial result", res: &image.EvictResult{}, err: image.ErrRootsIncomplete,
 			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete},
 		{name: "roots incomplete after an unlink", res: removedOne, err: image.ErrRootsIncomplete,
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete},
+		{name: "roots incomplete after an unlink with never-attempted blobs", res: &image.EvictResult{
+			Removed: []string{blob},
+			Kept:    []image.EvictKept{{Digest: blob, Reason: image.EvictKeptUnlinkFailed}},
+		}, err: fmt.Errorf("evict: %w", image.ErrRootsIncomplete),
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete},
+		{name: "roots incomplete beside a nil result", res: nil, err: errors.Join(image.ErrRootsIncomplete, errors.New("outcome")),
+			wantCode: codes.FailedPrecondition, wantReason: runtimev1.EvictReasonRootsIncomplete},
+		{name: "untyped error after an unlink", res: removedOne, err: errors.New("disk on fire"),
 			wantCode: codes.Internal},
 		{name: "unlink failed", res: &image.EvictResult{Removed: []string{blob}, Kept: []image.EvictKept{
 			{Digest: blob, Reason: image.EvictKeptYoung},

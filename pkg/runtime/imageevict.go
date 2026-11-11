@@ -89,12 +89,18 @@ func evictUnlinkFailed(res *image.EvictResult) int {
 //	image.ErrIndexEntryAmbiguous -> REFERENCE_AMBIGUOUS
 //	image.ErrRootsIncomplete     -> ROOTS_INCOMPLETE
 //
-// The contract says those cases unlinked nothing, so a refusal that comes back
-// with a result that removed blobs (a later executor's guard failing after an
-// earlier one unlinked) is INTERNAL instead: some blobs are gone, and a
-// FAILED_PRECONDITION would say they were not. Any other error goes through
-// indexStatusError, which carries no detail. With no error, a result with any
-// blob kept EvictKeptUnlinkFailed is INTERNAL: an unlink that failed or whose
+// A refusal stays FAILED_PRECONDITION whatever result comes back beside it.
+// The in-use and ambiguous cases are decided before any unlink. Roots
+// incomplete is checked again before each removal stage, so a later stage can
+// find it after an earlier one unlinked: the contract says that case may
+// follow removals already made and a re-run converges, so it is still
+// FAILED_PRECONDITION with its detail, and the message names how many blobs
+// were unlinked. The result's other kept blobs, the never-attempted ones
+// Cache.Evict keeps EvictKeptUnlinkFailed included, do not change that. A nil
+// result beside the error (Cache.Evict could not build one) is the same
+// refusal with no count. Any other error goes through indexStatusError, which
+// carries no detail. With no error, a result with any blob kept
+// EvictKeptUnlinkFailed is INTERNAL: an unlink that failed or whose
 // re-verification refused it is a failure, not a partial success.
 func evictStatusError(res *image.EvictResult, err error) error {
 	if err != nil {
@@ -103,7 +109,7 @@ func evictStatusError(res *image.EvictResult, err error) error {
 			return indexStatusError(err)
 		}
 		if res != nil && len(res.Removed) > 0 {
-			return status.Error(codes.Internal, fmt.Sprintf("evict: refused after %d blob(s) were unlinked: %v", len(res.Removed), err))
+			err = fmt.Errorf("refused after %d blob(s) were unlinked, a re-run converges: %w", len(res.Removed), err)
 		}
 		return evictRefusalStatus(reason, err)
 	}
