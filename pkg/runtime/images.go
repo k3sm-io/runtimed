@@ -215,7 +215,7 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 // (INVALID_ARGUMENT, nothing read), then the target is resolved from the
 // image index, the live artifact records and the released artifact copies
 // (resolveEvictTarget: NOT_FOUND, or FAILED_PRECONDITION REFERENCE_AMBIGUOUS),
-// then a
+// then a target naming no blobs is OK with nothing removed, then a
 // target a pod runs is refused IMAGE_IN_USE before any unlink. A pod that
 // appears after that read is not a refusal: Cache.Evict keeps its blobs and
 // the response reports them kept IN_USE. An unset force is a dry run with the
@@ -241,6 +241,12 @@ func (s *imagesService) EvictImage(ctx context.Context, req *runtimev1.EvictImag
 		return nil, err
 	}
 	manifest, blobs := target.manifest, target.blobs
+	if len(blobs) == 0 {
+		// A recorded target whose blobs are all gone is already evicted: OK,
+		// nothing removed, no Cache.Evict call and no view removed, so a
+		// re-run converges instead of failing INTERNAL.
+		return &runtimev1.EvictImageResponse{ManifestDigest: manifest}, nil
+	}
 	if len(blobs) > image.MaxEvictBlobs {
 		return nil, status.Errorf(codes.InvalidArgument,
 			"EvictImage: the target names %d blobs, limit %d", len(blobs), image.MaxEvictBlobs)
@@ -296,8 +302,8 @@ func (s *imagesService) EvictImage(ctx context.Context, req *runtimev1.EvictImag
 // blob list is never in use and reads nothing.
 func (s *imagesService) refuseEvictInUse(manifest string, blobs []string) error {
 	if len(blobs) == 0 {
-		// No pod can run a target that names no blob, so it is never in use:
-		// Cache.Evict reports the empty target itself.
+		// No pod can run a target that names no blob, so it is never in use
+		// (EvictImage answers such a target OK before this check).
 		return nil
 	}
 	inUse, err := s.rt.cache.InUseDigests(s.rt.podUntracked)

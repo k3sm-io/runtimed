@@ -33,22 +33,28 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 )
 
-// TestEvictEmptyTargetIsNotInUse pins that a target naming no blobs is never
-// refused IMAGE_IN_USE (a retryable refusal with no pod to wait for): it
-// reaches Cache.Evict, whose empty-target error stays INTERNAL with no
-// ErrorInfo detail, for a forced call and a dry run alike.
-func TestEvictEmptyTargetIsNotInUse(t *testing.T) {
+// TestEvictEmptyTargetIsOK pins that a target naming no blobs (a recorded
+// target whose blobs are already gone) is OK with its manifest digest and
+// nothing removed or kept, for a forced call and a dry run alike: never
+// IMAGE_IN_USE (no pod to wait for) and never INTERNAL (a re-run converges).
+func TestEvictEmptyTargetIsOK(t *testing.T) {
 	s := newEvictRPCScene(t)
 	ref := "registry.test/evict/empty:v1"
-	s.entry(ref, "empty", "")
+	manifest := s.entry(ref, "empty", "")
+	view := s.view(manifest)
 	for _, force := range []bool{false, true} {
-		_, err := s.client.EvictImage(context.Background(), &runtimev1.EvictImageRequest{Reference: ref, Force: force})
-		st := status.Convert(err)
-		if st.Code() != codes.Internal {
-			t.Fatalf("EvictImage(empty, force=%v) = %v, want INTERNAL", force, err)
+		resp, err := s.client.EvictImage(context.Background(), &runtimev1.EvictImageRequest{Reference: ref, Force: force})
+		if err != nil {
+			t.Fatalf("EvictImage(empty, force=%v) = %v, want OK", force, err)
 		}
-		if len(st.Details()) != 0 {
-			t.Errorf("EvictImage(empty, force=%v) details = %v, want none", force, st.Details())
+		if resp.GetManifestDigest() != manifest {
+			t.Errorf("EvictImage(empty, force=%v) manifest = %q, want %q", force, resp.GetManifestDigest(), manifest)
+		}
+		if len(resp.GetRemovedDigests()) != 0 || len(resp.GetKept()) != 0 || resp.GetReclaimedBytes() != 0 {
+			t.Errorf("EvictImage(empty, force=%v) = %v, want nothing removed or kept", force, resp)
+		}
+		if _, err := os.Stat(view); err != nil {
+			t.Errorf("EvictImage(empty, force=%v) touched the view: %v", force, err)
 		}
 	}
 }
