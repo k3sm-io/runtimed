@@ -19,7 +19,6 @@ package image
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -28,17 +27,23 @@ import (
 // TestExecutePruneHooks drives executePrune directly with each pruneHooks seam
 // on a fixture cache: a nil hooks pointer behaves as ExecutePrune, a guard drop
 // keeps its blob with the reason in the report, a guard error unlinks nothing,
-// and an unlink hook that refuses a blob keeps it with the reason.
+// an unlink hook that refuses a blob keeps it with the reason, a blob the
+// executor's own re-verification refuses never reaches the hook, a hook error
+// is a skip, and a removed report the root handle contradicts is a failed
+// removal.
 func TestExecutePruneHooks(t *testing.T) {
 	t.Parallel()
 
 	errGuard := errors.New("guard failed")
+	errHook := errors.New("hook failed")
 
 	tests := []struct {
 		name string
 		// hooks builds the hooks for the run; keep is the digest a hook
 		// targets (empty when none does).
-		hooks      func(f *gcFixture, keep string) *pruneHooks
+		hooks func(f *gcFixture, keep string) *pruneHooks
+		// prep, when non-nil, runs after planning and before executing.
+		prep       func(t *testing.T, f *gcFixture, keep string)
 		targetKeep bool
 		wantErr    error
 		wantReason string
@@ -77,15 +82,63 @@ func TestExecutePruneHooks(t *testing.T) {
 		{
 			name: "unlink hook refusal keeps that blob with its reason",
 			hooks: func(f *gcFixture, keep string) *pruneHooks {
-				return &pruneHooks{unlink: func(rel, digest string) (bool, evictReason, error) {
+				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
 					if digest == keep {
 						return false, evictLeased, nil
 					}
-					return true, "", os.Remove(filepath.Join(f.cache.blobsDir(), rel))
+					return true, "", remove()
 				}}
 			},
 			targetKeep: true,
 			wantReason: string(evictLeased),
+		},
+		{
+			name: "blob refused by re-verification is never offered to the hook",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+					if digest == keep {
+						return false, "", errors.New("hook offered a blob younger than grace")
+					}
+					return true, "", remove()
+				}}
+			},
+			prep: func(t *testing.T, f *gcFixture, keep string) {
+				p, err := f.cache.BlobPath(keep)
+				if err != nil {
+					t.Fatalf("BlobPath: %v", err)
+				}
+				if err := os.Chtimes(p, f.clock, f.clock); err != nil {
+					t.Fatalf("Chtimes: %v", err)
+				}
+			},
+			targetKeep: true,
+			wantReason: "younger than grace",
+		},
+		{
+			name: "hook error is a skip and counts nothing deleted",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+					if digest == keep {
+						return false, "", errHook
+					}
+					return true, "", remove()
+				}}
+			},
+			targetKeep: true,
+			wantReason: "remove: " + errHook.Error(),
+		},
+		{
+			name: "removed report without calling remove is a failed removal",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+					if digest == keep {
+						return true, "", nil
+					}
+					return true, "", remove()
+				}}
+			},
+			targetKeep: true,
+			wantReason: "still present",
 		},
 	}
 	for _, tc := range tests {
@@ -107,6 +160,9 @@ func TestExecutePruneHooks(t *testing.T) {
 				t.Fatalf("plan.Delete = %d; want 3", len(plan.Delete))
 			}
 
+			if tc.prep != nil {
+				tc.prep(t, f, b)
+			}
 			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, tc.hooks(f, b))
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {

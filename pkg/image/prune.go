@@ -471,11 +471,15 @@ type pruneHooks struct {
 	// the call with nothing unlinked.
 	guard func() (drop map[string]evictReason, err error)
 
-	// unlink, when non-nil, replaces root.Remove for one blob that passed
-	// re-verification. rel is the blobs-root-relative path. A false removed
-	// with a nil error records the blob as skipped with reason; an error
-	// records it as skipped with the error, exactly as a failed root.Remove.
-	unlink func(rel, digest string) (removed bool, reason evictReason, err error)
+	// unlink, when non-nil, decides the removal of one blob that passed
+	// re-verification. remove is root.Remove bound to that blob's path under
+	// the executor's *os.Root; a hook MUST delete only through remove, so it
+	// cannot unlink outside the blobs root. A false removed with a nil error
+	// records the blob as skipped with reason; an error records it as skipped
+	// with the error, exactly as a failed root.Remove. A true removed is not
+	// trusted: the executor re-checks the path through the root handle and
+	// records the blob as a failed removal if it is still present.
+	unlink func(digest string, remove func() error) (removed bool, reason evictReason, err error)
 }
 
 // executePrune is ExecutePrune with hooks; see ExecutePrune for the contract.
@@ -544,13 +548,20 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			continue
 		}
 		if hooks != nil && hooks.unlink != nil {
-			removed, why, err := hooks.unlink(rel, d.Node.Digest)
+			removed, why, err := hooks.unlink(d.Node.Digest, func() error { return root.Remove(rel) })
 			if err != nil {
 				skip(d, fmt.Sprintf("remove: %v", err))
 				continue
 			}
 			if !removed {
 				skip(d, fmt.Sprintf("refused by unlink: %s", why))
+				continue
+			}
+			if _, err := root.Lstat(rel); err == nil {
+				skip(d, "remove: unlink reported removed but blob is still present")
+				continue
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				skip(d, fmt.Sprintf("remove: verify: %v", err))
 				continue
 			}
 		} else if err := root.Remove(rel); err != nil {
