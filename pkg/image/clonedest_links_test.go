@@ -163,6 +163,21 @@ func TestMaterializeTreeDestinationLinkRules(t *testing.T) {
 				check()
 			})
 
+			t.Run("dangling_in_root_directory_link_refused", func(t *testing.T) {
+				src, dst, _, check := setup(t)
+				mustWrite(t, filepath.Join(src, "lib", "x"), "x", 0o644)
+				link(t, "gone", filepath.Join(dst, "lib"))
+				_, err := MaterializeTree(c, src, dst)
+				if !errors.Is(err, ErrDestinationLink) {
+					t.Fatalf("err = %v, want ErrDestinationLink", err)
+				}
+				if !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("err = %v, want the not-exist cause kept in the chain", err)
+				}
+				missing(t, filepath.Join(dst, "gone"))
+				check()
+			})
+
 			t.Run("absolute_target_to_host_refused", func(t *testing.T) {
 				src, dst, victim, check := setup(t)
 				mustWrite(t, filepath.Join(src, "etc", "hostname"), "h", 0o644)

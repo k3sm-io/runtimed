@@ -299,16 +299,14 @@ func mkdirOpenAt(root *os.Root, dir *os.File, name, rel string, perm os.FileMode
 }
 
 // openDirInRoot opens rel beneath root, following only links that stay inside
-// root, and requires the result to be a directory. A resolution that would
-// leave root (os.Root refuses it) or that ends at a non-directory fails with
-// ErrDestinationLink; a missing target or a permission failure is returned as
-// itself.
+// root, and requires the result to be a directory. Every failure is
+// ErrDestinationLink with the cause kept in the chain: a resolution that would
+// leave root (os.Root refuses it), a dangling or unopenable target, and a
+// target that is not a directory all mean a link stands where the tree needs a
+// directory and cannot be used.
 func openDirInRoot(root *os.Root, rel string) (*os.File, error) {
 	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
-			return nil, err
-		}
 		return nil, fmt.Errorf("%w: %s: %w", ErrDestinationLink, rel, err)
 	}
 	info, err := f.Stat()
