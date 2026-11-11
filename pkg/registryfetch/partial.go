@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -50,6 +51,9 @@ var (
 	// ErrPartialLength reports a partial whose length after a Transfer that
 	// returned nil is not the blob's Size.
 	ErrPartialLength = errors.New("registryfetch: partial length is not the blob size")
+	// ErrPartialFile reports a partial path that is not a regular file (a
+	// FIFO, a directory, a device planted in its place).
+	ErrPartialFile = errors.New("registryfetch: partial is not a regular file")
 )
 
 // PartialDirError is the error for a partial dir that is not a private
@@ -61,6 +65,10 @@ func (e *PartialDirError) Error() string { return ErrPartialDir.Error() + ": " +
 
 // Is reports target == ErrPartialDir.
 func (e *PartialDirError) Is(target error) bool { return target == ErrPartialDir }
+
+// effectiveUID is the uid EnsureDir requires Dir to be owned by; a seam so a
+// test can drive the comparison without chown.
+var effectiveUID = os.Geteuid
 
 var (
 	sha256Digest = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
@@ -274,9 +282,10 @@ func (s *PartialStore) path(digest string) string {
 }
 
 // EnsureDir creates Dir (0700) when absent and refuses one that is not a
-// directory (a file, a symlink planted in its place) or is writable by group
-// or other: a partial dir another principal can write lets it choose the
-// bytes a resume continues from.
+// directory (a file, a symlink planted in its place), is writable by group
+// or other, or is not owned by the effective uid: a partial dir another
+// principal can write, or owns and so can chmod, lets it choose the bytes a
+// resume continues from.
 func (s *PartialStore) EnsureDir() error {
 	dir := s.Dir
 	fi, err := os.Lstat(dir)
@@ -295,7 +304,60 @@ func (s *PartialStore) EnsureDir() error {
 	if fi.Mode().Perm()&0o022 != 0 {
 		return &PartialDirError{Detail: fmt.Sprintf("%s is writable by group or other (mode %v)", dir, fi.Mode().Perm())}
 	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return &PartialDirError{Detail: fmt.Sprintf("%s has no owner to check", dir)}
+	}
+	if euid := effectiveUID(); euid < 0 || st.Uid != uint32(euid) {
+		return &PartialDirError{Detail: fmt.Sprintf("%s is owned by uid %d, not the effective uid %d", dir, st.Uid, euid)}
+	}
 	return nil
+}
+
+// openPartial opens (creating 0600) the partial at path without following a
+// symlink in its place and refuses anything but a regular file with an error
+// matching ErrPartialFile.
+//
+// The open itself carries O_NONBLOCK rather than an lstat before it: a stat
+// first leaves a window in which the entry can be swapped for a FIFO between
+// the check and the open, and opening a FIFO can wait for a peer. With
+// O_NONBLOCK the open of whatever is there returns at once, fstat on the
+// descriptor judges what was actually opened, and O_NONBLOCK is cleared again
+// before a regular file is handed on. O_NOCTTY keeps a planted terminal from
+// becoming the controlling one; a directory fails the O_RDWR open with EISDIR.
+func openPartial(path string) (*os.File, error) {
+	var fd int
+	var err error
+	for {
+		fd, err = unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY|unix.O_CLOEXEC, 0o600)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if errors.Is(err, unix.EISDIR) {
+		return nil, fmt.Errorf("open %s: %w", path, ErrPartialFile)
+	}
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, &os.PathError{Op: "fstat", Path: path, Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return nil, fmt.Errorf("open %s (mode %#o): %w", path, st.Mode&unix.S_IFMT, ErrPartialFile)
+	}
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err == nil {
+		_, err = unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags&^unix.O_NONBLOCK)
+	}
+	if err != nil {
+		unix.Close(fd)
+		return nil, &os.PathError{Op: "fcntl", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(fd), path), nil
 }
 
 // Bytes is how much of a size-byte blob is already in digest's partial (never
@@ -331,12 +393,14 @@ type Fill struct {
 	// byte 0, to w. Commit is where the whole file is re-hashed.
 	Commit func(replay func(w io.Writer) error) error
 	// Poisoned reports a Commit error that condemns the partial's bytes (a
-	// digest mismatch, an overrun); the partial is then removed.
+	// digest mismatch, an overrun); the partial is then removed. A nil
+	// Poisoned condemns every Commit error: keeping bytes is the choice a
+	// caller has to make explicitly.
 	Poisoned func(error) bool
 }
 
 // Resume brings one blob through its partial: ensure Dir, open the partial
-// (O_NOFOLLOW), restart an overlong one, let Transfer complete a short one
+// (O_NOFOLLOW, a regular file only; see openPartial), restart an overlong one, let Transfer complete a short one
 // from its current length, then hand the whole file to Commit. A poisoned
 // partial is removed so it is never resumed; a committed one is removed.
 //
@@ -353,7 +417,7 @@ func (s *PartialStore) Resume(fl Fill) error {
 		return err
 	}
 	path := s.path(fl.Digest)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, 0o600)
+	f, err := openPartial(path)
 	if err != nil {
 		return fmt.Errorf("open partial %s: %w", fl.Digest, err)
 	}
@@ -388,7 +452,7 @@ func (s *PartialStore) Resume(fl Fill) error {
 		return err
 	})
 	if err != nil {
-		if fl.Poisoned != nil && fl.Poisoned(err) {
+		if fl.Poisoned == nil || fl.Poisoned(err) {
 			// A poisoned partial must not survive to be resumed.
 			_ = os.Remove(path) // the commit error is the one reported
 		}

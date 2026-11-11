@@ -30,6 +30,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestEnsureDirCreatesPrivateDir(t *testing.T) {
@@ -600,6 +602,102 @@ func TestResumeRangeAnsweredWith200(t *testing.T) {
 			}
 			if !bytes.Equal(got, data) {
 				t.Fatal("committed bytes are not exactly the blob")
+			}
+		})
+	}
+}
+
+// TestResumeNilPoisonedRemovesPartial: with no Poisoned callback every Commit
+// error condemns the partial.
+func TestResumeNilPoisonedRemovesPartial(t *testing.T) {
+	data, digest := blobData(100)
+	s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+	if err := s.EnsureDir(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path(digest), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Resume(Fill{
+		Digest: digest, Size: 100, Transfer: noTransfer(t),
+		Commit: func(func(io.Writer) error) error { return errors.New("any failure") },
+	})
+	if err == nil {
+		t.Fatal("commit error swallowed")
+	}
+	if _, err := os.Lstat(s.path(digest)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial survived a commit error with nil Poisoned: %v", err)
+	}
+}
+
+// TestEnsureDirRequiresOwner: Dir must be owned by the effective uid. Tests
+// cannot chown, so the comparison is driven through the effectiveUID seam.
+func TestEnsureDirRequiresOwner(t *testing.T) {
+	euid := os.Geteuid()
+	for _, tc := range []struct {
+		name    string
+		uid     int
+		existed bool
+		wantErr bool
+	}{
+		{name: "owner-existing", uid: euid, existed: true},
+		{name: "owner-created", uid: euid},
+		{name: "other-existing", uid: euid + 1, existed: true, wantErr: true},
+		{name: "other-created", uid: euid + 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func(old func() int) { effectiveUID = old }(effectiveUID)
+			effectiveUID = func() int { return tc.uid }
+			dir := filepath.Join(t.TempDir(), "partial")
+			if tc.existed {
+				if err := os.Mkdir(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := (&PartialStore{Dir: dir}).EnsureDir()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("EnsureDir = %v, wantErr %v", err, tc.wantErr)
+			}
+			var pe *PartialDirError
+			if tc.wantErr && (!errors.Is(err, ErrPartialDir) || !errors.As(err, &pe) || !strings.Contains(pe.Detail, "owned by uid")) {
+				t.Fatalf("err = %v, want an owner ErrPartialDir", err)
+			}
+		})
+	}
+}
+
+// TestResumeRefusesNonRegularPartial: a FIFO or a directory in the partial's
+// place is refused, and promptly: opening a FIFO must not wait for a peer.
+func TestResumeRefusesNonRegularPartial(t *testing.T) {
+	_, digest := blobData(100)
+	for name, plant := range map[string]func(path string) error{
+		"fifo":      func(p string) error { return unix.Mkfifo(p, 0o600) },
+		"directory": func(p string) error { return os.Mkdir(p, 0o700) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+			if err := s.EnsureDir(); err != nil {
+				t.Fatal(err)
+			}
+			if err := plant(s.path(digest)); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				var got []byte
+				done <- s.Resume(Fill{
+					Digest: digest, Size: 100,
+					Transfer: func(*os.File, int64) error { return errors.New("Transfer ran on a non-regular partial") },
+					Commit:   verifyCommit(digest, 100, &got),
+				})
+			}()
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrPartialFile) {
+					t.Fatalf("err = %v, want ErrPartialFile", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Resume blocked on a non-regular partial")
 			}
 		})
 	}
