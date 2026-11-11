@@ -95,6 +95,31 @@ func (f *sharedFixture) releasedFile(name string, buf []byte) {
 	}
 }
 
+// plantSymlink makes name in the index subdirectory sub a relative symlink to
+// a regular file holding buf beside it. The target is a dot name the scan
+// skips and stays inside sub, so only the regular-file check refuses the link.
+func (f *sharedFixture) plantSymlink(sub, name string, buf []byte) {
+	f.t.Helper()
+	dir := filepath.Join(f.cache.IndexRoot(), sub)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		f.f(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".link-target"), buf, 0o600); err != nil {
+		f.f(err)
+	}
+	if err := os.Symlink(".link-target", filepath.Join(dir, name)); err != nil {
+		f.f(err)
+	}
+}
+
+// plantDir makes name in the index subdirectory sub a directory.
+func (f *sharedFixture) plantDir(sub, name string) {
+	f.t.Helper()
+	if err := os.MkdirAll(filepath.Join(f.cache.IndexRoot(), sub, name), 0o700); err != nil {
+		f.f(err)
+	}
+}
+
 func (f *sharedFixture) f(err error) {
 	f.t.Helper()
 	f.t.Fatal(err)
@@ -295,6 +320,59 @@ func TestEvictSharedSet(t *testing.T) {
 			target: mR,
 			setup: func(f *sharedFixture) {
 				f.releasedFile("planted.json", f.recordBytes("s@t", mB, cfgB, shared))
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "symlink named like a released copy fails closed",
+			target: mR,
+			setup: func(f *sharedFixture) {
+				f.releasedFile("", f.recordBytes("s@t", mB, cfgB, shared))
+				f.plantSymlink(ArtifactReleasedIndexSubdir, strings.Repeat("0", 64)+".json", f.recordBytes("r@t", mR, cfgR, ownB))
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "directory named like a released copy fails closed",
+			target: mR,
+			setup: func(f *sharedFixture) {
+				f.releasedFile("", f.recordBytes("s@t", mB, cfgB, shared))
+				f.plantDir(ArtifactReleasedIndexSubdir, strings.Repeat("0", 64)+".json")
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "symlink named like an artifact record fails closed",
+			target: mR,
+			setup: func(f *sharedFixture) {
+				f.record("s@t", mB, cfgB, shared)
+				f.plantSymlink(ArtifactIndexSubdir, "x.json", f.recordBytes("r@t", mR, cfgR, ownB))
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "directory named like an artifact record fails closed",
+			target: mR,
+			setup: func(f *sharedFixture) {
+				f.record("s@t", mB, cfgB, shared)
+				f.plantDir(ArtifactIndexSubdir, "x.json")
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
+			name:   "index entry under another entry's name fails closed",
+			target: mA,
+			setup: func(f *sharedFixture) {
+				f.entry("b", "B", false, cfgB, ownB)
+				src := filepath.Join(f.cache.IndexRoot(), entryName("b", Platform{OS: "linux", Architecture: "arm64"}))
+				buf, err := os.ReadFile(src)
+				if err != nil {
+					f.f(err)
+				}
+				if err := os.Remove(src); err != nil {
+					f.f(err)
+				}
+				writeEntryFile(f.t, f.cache, strings.Repeat("0", 64)+".json", buf)
 			},
 			wantErr: ErrIndexEntryCorrupt,
 		},
