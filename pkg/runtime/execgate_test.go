@@ -342,8 +342,10 @@ func TestConcurrentExecsShareOneGate(t *testing.T) {
 // own deadline produces the sentinel. entered closes on the first such check.
 // Every other file passes.
 type timeoutSigner struct {
-	suffix  string
-	hang    bool
+	suffix string
+	hang   bool
+	// wrap makes a hung check return the timeout sentinel wrapping the cancel.
+	wrap    bool
 	once    sync.Once
 	entered chan struct{}
 	checks  atomic.Int32
@@ -369,6 +371,9 @@ func (s *timeoutSigner) Check(ctx context.Context, _ runtimev1.SignaturePolicy, 
 		return fmt.Errorf("check %s: %w", path, image.ErrSignatureCheckTimeout)
 	}
 	<-ctx.Done()
+	if s.wrap {
+		return fmt.Errorf("%w: %w", image.ErrSignatureCheckTimeout, ctx.Err())
+	}
 	return ctx.Err()
 }
 
@@ -430,38 +435,52 @@ func TestExecGateRejectionStaysFailedPrecondition(t *testing.T) {
 }
 
 // TestExecGateCancelStaysContextError pins that a session cancelled while its
-// check hangs is reported as the cancellation, not as a timed-out check.
+// check hangs is reported as the cancellation, not as a timed-out check. The
+// wrapped-sentinel case pins the order of the checks in resolveExecCommand: the
+// session's context is consulted before the timeout sentinel, so a check error
+// that wraps image.ErrSignatureCheckTimeout still reads as Canceled.
 func TestExecGateCancelStaysContextError(t *testing.T) {
-	shortenSignatureTimeouts(t, time.Minute, time.Minute)
-	signer := newTimeoutSigner(true)
-	p := newExecArgvPod(t, map[string]string{"bin/tool": imageScript}, signer, requireSigned)
+	for _, tc := range []struct {
+		name string
+		wrap bool
+	}{
+		{name: "context error", wrap: false},
+		{name: "wrapped timeout sentinel", wrap: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shortenSignatureTimeouts(t, time.Minute, time.Minute)
+			signer := newTimeoutSigner(true)
+			signer.wrap = tc.wrap
+			p := newExecArgvPod(t, map[string]string{"bin/tool": imageScript}, signer, requireSigned)
 
-	before := p.wrapCalls()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	st := newFakeExecStream(ctx)
-	st.feed(&runtimev1.ExecRequest{PodId: p.podID, Command: []string{"/bin/tool"}})
-	st.closeSend()
-	errc := make(chan error, 1)
-	go func() { errc <- p.rt.Exec(st) }()
+			before := p.wrapCalls()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			st := newFakeExecStream(ctx)
+			st.feed(&runtimev1.ExecRequest{PodId: p.podID, Command: []string{"/bin/tool"}})
+			st.closeSend()
+			errc := make(chan error, 1)
+			go func() { errc <- p.rt.Exec(st) }()
 
-	select {
-	case <-signer.entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the signature check was never entered")
-	}
-	cancel()
-	var err error
-	select {
-	case err = <-errc:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Exec did not return after its context was cancelled")
-	}
-	if status.Code(err) != codes.Canceled {
-		t.Fatalf("Exec error = %v, want Canceled", err)
-	}
-	if n := p.wrapCalls() - before; n != 0 {
-		t.Errorf("a cancelled exec reached the confinement seam %d times", n)
+			select {
+			case <-signer.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the signature check was never entered")
+			}
+			cancel()
+			var err error
+			select {
+			case err = <-errc:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Exec did not return after its context was cancelled")
+			}
+			if status.Code(err) != codes.Canceled {
+				t.Fatalf("Exec error = %v, want Canceled", err)
+			}
+			if n := p.wrapCalls() - before; n != 0 {
+				t.Errorf("a cancelled exec reached the confinement seam %d times", n)
+			}
+		})
 	}
 }
 
