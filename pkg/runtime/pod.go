@@ -1758,7 +1758,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// signing, before exec. A host binary is never ad-hoc re-signed
 	// (hostBinary).
 	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rootfs, gatePath, rb.hostBinary); err != nil {
-		return nil, runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED, err
+		return nil, signatureFailureReason(err), err
 	}
 
 	// Resolve the container's securityContext identity plus the pod's rlimit plan
@@ -2354,27 +2354,70 @@ func (r *Runtime) recomputePhaseLocked(p *pod) {
 //
 // Both Sign and Check errors are returned wrapped (ErrSignatureRejected /
 // ErrPolicyUnspecified), which the caller maps to SIGNATURE_REJECTED.
+//
+// DEADLINES. ctx is the pod-lifetime context, which no request can cancel, and
+// the signature tools block for minutes when the system policy daemon is down.
+// So every Check runs under signatureCheckTimeout and the Sign under
+// signatureSignTimeout (image.WithSignatureDeadline). A timeout is not a
+// verdict: the gate returns image.ErrSignatureCheckTimeout at once — no Sign, no
+// re-check, under every policy — and the caller reports it as retryable
+// (signatureFailureReason). A cancelled ctx likewise stops the gate before any
+// Sign.
 func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignaturePolicy, rootfs, path string, hostBinary bool) error {
 	if hostBinary {
 		// Already signed + read-only: verify the existing signature, never re-sign.
-		return r.signer.Check(ctx, policy, path)
+		return r.checkSignature(ctx, policy, path)
 	}
 	if policy == runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK {
 		// Already valid: return without signing — this is the clone-preserving path
 		// (see the ADHOC_OK bullet above). A check that fails for a reason other than
 		// an absent signature (a codesign tool failure) also falls through to sign +
-		// re-check, which surfaces the underlying error rather than hiding it.
-		if err := r.signer.Check(ctx, policy, path); err == nil {
+		// re-check, which surfaces the underlying error rather than hiding it. A
+		// check that timed out or was cancelled did not answer, so it is returned
+		// as is and never answered with a Sign.
+		err := r.checkSignature(ctx, policy, path)
+		if err == nil {
 			return nil
 		}
-		if err := r.signer.Sign(ctx, rootfs, path); err != nil {
+		if errors.Is(err, image.ErrSignatureCheckTimeout) || ctx.Err() != nil {
+			return err
+		}
+		err = image.WithSignatureDeadline(ctx, signatureSignTimeout, func(ctx context.Context) error {
+			return r.signer.Sign(ctx, rootfs, path)
+		})
+		if err != nil {
 			return fmt.Errorf("ad-hoc sign %s: %w", path, err)
 		}
-		return r.signer.Check(ctx, policy, path)
+		return r.checkSignature(ctx, policy, path)
 	}
 	// require-signed / require-notarized / unspecified: check the as-pulled binary;
 	// do not ad-hoc sign (no silent downgrade).
-	return r.signer.Check(ctx, policy, path)
+	return r.checkSignature(ctx, policy, path)
+}
+
+// signatureCheckTimeout and signatureSignTimeout bound one Signer.Check and one
+// Signer.Sign in gateSignature. Variables only so tests can shorten them.
+var (
+	signatureCheckTimeout = image.SignatureCheckTimeout
+	signatureSignTimeout  = image.SignatureSignTimeout
+)
+
+// checkSignature runs one Signer.Check under signatureCheckTimeout.
+func (r *Runtime) checkSignature(ctx context.Context, policy runtimev1.SignaturePolicy, path string) error {
+	return image.WithSignatureDeadline(ctx, signatureCheckTimeout, func(ctx context.Context) error {
+		return r.signer.Check(ctx, policy, path)
+	})
+}
+
+// signatureFailureReason classifies a gateSignature failure. A signature tool
+// that timed out gave no verdict, so it is IMAGE_PULL — the container-class,
+// RETRYABLE bucket (see resolveFailureReason) — and never the terminal
+// SIGNATURE_REJECTED; every other gate failure is a rejection.
+func signatureFailureReason(err error) runtimev1.FailureReason {
+	if errors.Is(err, image.ErrSignatureCheckTimeout) {
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL
+	}
+	return runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED
 }
 
 // NativeImage is the k3sm HostProcess sentinel image reference
