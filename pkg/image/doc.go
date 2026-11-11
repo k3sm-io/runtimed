@@ -123,13 +123,30 @@ limitations under the License.
 //
 // A linux-dialect tree may hold symlinks whose targets are absolute or resolve
 // through one ("a -> /", "b -> a/etc"), and those targets name paths in the
-// guest's chroot, never on the host. No host-side code in this package follows
-// one: unpack, MaterializeTree, AdHocSignTree and the tree prune treat every link
-// as an opaque name (lstat, readlink, os.Root), and only the vm backend's guest
-// resolves them. The dialect is bound into the tree key and checked against the
-// tree's record on open, so a linux tree is never served to the native spine,
-// whose pod rootfs has no chroot around it.
-// TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide is the gate.
+// guest's chroot, never on the host. What holds, and what each part rests on:
+//
+//   - Unpack resolves every entry of every layer inside the tree (os.Root), so a
+//     later layer's file, directory, hard link, whiteout or opaque marker named
+//     through an earlier layer's link is refused rather than applied outside.
+//   - Every READER of the tree (MaterializeTree's source walk, AdHocSignTree and
+//     the tree prune) treats a link as an opaque name (WalkDir, lstat, readlink)
+//     and never opens, stats or deletes through it.
+//   - The dialect is bound into the tree key and checked against the tree's
+//     record on open, so a linux tree is never served to the native spine, whose
+//     pod rootfs has no chroot around it.
+//
+// MaterializeTree's DESTINATION side is not link-safe: it joins plain paths, and
+// its MkdirAll, Stat and OpenFile follow a link already present in the
+// destination (see refuseCaseMerge). It is safe only while the destination holds
+// no link it did not itself create. The vm spine's one call
+// (pkg/runtime/vmcontainers.go resolveVMContainer) passes the per-pod
+// Cache.PodRootfs directory (<root>/pods/<podID>/rootfs, derived from a parsed
+// PodID); nothing in production verifies that directory is new or empty, so
+// that is an assumption about the pod lifecycle, not a checked property.
+//
+// TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide is the gate for the first
+// three points; its populated_destination subtest records what the destination
+// side does today when that assumption fails.
 //
 // # The CAS verification ceiling
 //
