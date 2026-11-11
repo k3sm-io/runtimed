@@ -181,7 +181,7 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 		r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
 		return &runtimev1.StartContainerResponse{
 			Status:        status,
-			Error:         rpcStatus(failureCode(err), "start %s/%s: %v", req.GetPodId(), cp.name, err),
+			Error:         rpcStatus(failureCode(err), "start %s/%s: %s", req.GetPodId(), cp.name, startErrorReply(err)),
 			FailureReason: reason,
 		}, nil
 	}
@@ -307,6 +307,19 @@ func initContainerIndex(box *runtimev1.PodBox, name string) int {
 		}
 	}
 	return -1
+}
+
+// startErrorReply renders a startContainer error for an RPC reply a client
+// reads. A signature-gate failure (signatureGateError) publishes the same
+// bounded fixed sentence its Waiting message does, because its error names the
+// cache root, the sign staging directory and the tool's output; the daemon's
+// log line carries that error once. Every other error keeps its full text.
+func startErrorReply(err error) string {
+	var ge *signatureGateError
+	if errors.As(err, &ge) {
+		return boundedFailureMessage(err)
+	}
+	return err.Error()
 }
 
 // startFailure builds a StartContainerResponse carrying a structured failure.
