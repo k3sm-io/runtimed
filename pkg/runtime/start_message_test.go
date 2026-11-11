@@ -402,3 +402,38 @@ func assertLoggedOnceAt(t *testing.T, out, level, marker string, wants []string)
 		}
 	}
 }
+
+// TestThreeMoreStartErrorsHidePaths covers the shim dir allocation, the
+// process record and the pod's image record: each builds its error as its
+// site does and both client renderers are asserted directly.
+func TestThreeMoreStartErrorsHidePaths(t *testing.T) {
+	const detail = "HOST-DETAIL"
+	cause := &fs.PathError{Op: "open", Path: "/cache/" + detail + "/rec", Err: fs.ErrPermission}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantError string
+		want      string
+	}{
+		{"shim dir", shimDirStartError("main", cause), cause.Error(),
+			`container "main" could not be started: its shim could not be prepared; the daemon log has the cause`},
+		{"process record", procRecordStartError("main", cause), "record container main process group: " + cause.Error(),
+			`container "main" could not be started: its process record could not be written; the daemon log has the cause`},
+		{"image record", imageRecordError("example.com/app:1", cause), cause.Error(),
+			`image "example.com/app:1" could not be recorded for the pod; the daemon log has the cause`},
+	} {
+		if !errors.Is(tc.err, fs.ErrPermission) {
+			t.Errorf("%s: errors.Is lost the cause", tc.name)
+		}
+		if tc.err.Error() != tc.wantError {
+			t.Errorf("%s: Error() = %q, want %q", tc.name, tc.err.Error(), tc.wantError)
+		}
+		want := fmt.Sprintf("%q", tc.want)
+		if got := boundedFailureMessage(tc.err); got != want {
+			t.Errorf("%s: boundedFailureMessage = %s, want %s", tc.name, got, want)
+		}
+		if got := startErrorReply(tc.err); got != want || strings.Contains(got, detail) {
+			t.Errorf("%s: startErrorReply = %s, want %s", tc.name, got, want)
+		}
+	}
+}

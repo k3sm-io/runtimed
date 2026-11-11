@@ -1823,7 +1823,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	if hostsResidentShim(r.backend) {
 		if shimDir, err = r.containerShimDir(p, c.GetName()); err != nil {
 			_ = cleanup()
-			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
+			// The error names the host shim directory.
+			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, shimDirStartError(c.GetName(), err)
 		}
 		proc, cleanup, err = r.spawnBesideShim(p, shimLaunchPlan{
 			podID: p.box.GetPodId(), container: c.GetName(),
@@ -1934,7 +1935,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		_ = cleanup()
 		closeLog()
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SPAWN,
-			fmt.Errorf("record container %s process group: %w", c.GetName(), err)
+			procRecordStartError(c.GetName(), err)
 	}
 	if shimDir != "" {
 		// Best-effort: the container's own identity, the one a group whose shim
@@ -2484,6 +2485,25 @@ func wrapStartError(name string, err error) error {
 func shimStartError(name string, err error) error {
 	return withClientMessage(fmt.Sprintf("container %q could not be started: its shim could not be prepared; the daemon log has the cause", name),
 		fmt.Errorf("prepare the resident shim for %s: %w", name, err))
+}
+
+// shimDirStartError is the start failure for container name whose shim
+// directory could not be allocated; err, kept as is, names the host shim dir.
+func shimDirStartError(name string, err error) error {
+	return withClientMessage(fmt.Sprintf("container %q could not be started: its shim could not be prepared; the daemon log has the cause", name), err)
+}
+
+// procRecordStartError is the start failure for container name whose process
+// group could not be recorded; err names the reap-record path.
+func procRecordStartError(name string, err error) error {
+	return withClientMessage(fmt.Sprintf("container %q could not be started: its process record could not be written; the daemon log has the cause", name),
+		fmt.Errorf("record container %s process group: %w", name, err))
+}
+
+// imageRecordError is the start failure for a pod whose reference to image ref
+// could not be recorded; err, kept as is, names the image root's paths.
+func imageRecordError(ref string, err error) error {
+	return withClientMessage(fmt.Sprintf("image %q could not be recorded for the pod; the daemon log has the cause", ref), err)
 }
 
 // logOpenStartError is the start failure for container name whose CRI log
@@ -3064,7 +3084,8 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// lease is what covers the instant before it exists.
 	if err := r.recordPodImage(p.box.GetPodId(), res.Manifest); err != nil {
 		res.Lease.Release()
-		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, err)
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			imageRecordError(c.GetImage(), err))
 	}
 	res.Lease.Release()
 
