@@ -39,6 +39,11 @@ limitations under the License.
 //     group or other: a partial dir another principal can write lets it choose
 //     the bytes a resume continues from.
 //   - The partial is opened O_NOFOLLOW, so a symlink in its place is refused.
+//   - The transfer is handed the partial positioned at its current length,
+//     and restarts it itself when the source answers from another offset;
+//     after it the file must be exactly the blob's size (ErrPartialLength),
+//     a short one kept for the next resume and a long one cut to the size,
+//     so a whole blob appended to a prefix is never committed.
 //   - A complete partial is replayed whole to the caller's commit, which
 //     re-hashes it; when the commit reports the bytes poisoned (a digest
 //     mismatch, an overrun) the partial is removed, so a poisoned prefix never

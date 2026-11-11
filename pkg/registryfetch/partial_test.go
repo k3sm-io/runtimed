@@ -18,9 +18,11 @@ package registryfetch
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -466,5 +468,139 @@ func TestSweepRefusesSymlinkedDir(t *testing.T) {
 	}
 	if n, err := (&PartialStore{Dir: filepath.Join(real, "absent")}).Sweep(time.Now(), time.Hour); n != 0 || err != nil {
 		t.Fatalf("Sweep of a missing dir = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// TestResumeChecksLengthAfterTransfer: Resume hands Transfer a file positioned
+// at have and, after a nil Transfer, refuses a file of the wrong length: a
+// short one is kept for the next Resume, a long one is cut to Size.
+func TestResumeChecksLengthAfterTransfer(t *testing.T) {
+	data, digest := blobData(100)
+	for _, tc := range []struct {
+		name     string
+		have     int    // bytes already in the partial
+		write    []byte // what Transfer writes at the current position
+		wantErr  bool   // Resume fails
+		wantSize int64  // file length afterwards (-1: removed)
+		wantPos  int64  // the position Transfer saw
+	}{
+		{name: "exact", have: 40, write: data[40:], wantSize: -1, wantPos: 40},
+		{name: "short", have: 40, write: data[40:90], wantErr: true, wantSize: 90, wantPos: 40},
+		{name: "long", have: 40, write: append(bytes.Clone(data[40:]), "extra"...), wantErr: true, wantSize: 100, wantPos: 40},
+		{name: "empty-start", have: 0, write: data, wantSize: -1, wantPos: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+			if err := s.EnsureDir(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(s.path(digest), data[:tc.have], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pos := int64(-1)
+			var got []byte
+			err := s.Resume(Fill{
+				Digest: digest, Size: 100,
+				Transfer: func(f *os.File, have int64) error {
+					// Move away first: Resume must not rely on where the
+					// file was left by an earlier open.
+					pos, _ = f.Seek(0, io.SeekCurrent)
+					_, err := f.Write(tc.write)
+					return err
+				},
+				Commit:   verifyCommit(digest, 100, &got),
+				Poisoned: func(error) bool { return false },
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Resume = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !errors.Is(err, ErrPartialLength) {
+				t.Fatalf("err = %v, want ErrPartialLength", err)
+			}
+			if pos != tc.wantPos {
+				t.Fatalf("Transfer saw position %d, want %d", pos, tc.wantPos)
+			}
+			fi, statErr := os.Lstat(s.path(digest))
+			switch {
+			case tc.wantSize < 0 && !errors.Is(statErr, os.ErrNotExist):
+				t.Fatalf("partial still present after commit: %v", statErr)
+			case tc.wantSize >= 0 && (statErr != nil || fi.Size() != tc.wantSize):
+				t.Fatalf("partial = %v %v, want %d bytes", fi, statErr, tc.wantSize)
+			}
+			if !tc.wantErr && !bytes.Equal(got, data) {
+				t.Fatal("committed bytes differ from the blob")
+			}
+		})
+	}
+}
+
+// TestResumeRangeAnsweredWith200: with have > 0 the server answers the Range
+// with the whole blob. Transfer is the one that learns start, so it truncates;
+// one that appends anyway ends as prefix+blob, which Resume refuses and cuts
+// to Size, never committing it.
+func TestResumeRangeAnsweredWith200(t *testing.T) {
+	const size, have = 1000, 300
+	data, digest := blobData(size)
+	for _, tc := range []struct {
+		name     string
+		truncate bool
+		wantErr  bool
+	}{
+		{name: "transfer-truncates", truncate: true},
+		{name: "transfer-appends", truncate: false, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg, ref := serve(t, &fakeRegistry{data: data, rangeStatus: http.StatusOK})
+			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
+			if err := s.EnsureDir(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(s.path(digest), data[:have], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			committed := false
+			var got []byte
+			commit := verifyCommit(digest, size, &got)
+			err := s.Resume(Fill{
+				Digest: digest, Size: size,
+				Transfer: func(f *os.File, have int64) error {
+					body, start, err := reg.Blob(context.Background(), ref, nil, digest, have)
+					if err != nil {
+						return err
+					}
+					defer body.Close()
+					if start != have && tc.truncate {
+						if err := f.Truncate(start); err != nil {
+							return err
+						}
+						if _, err := f.Seek(start, io.SeekStart); err != nil {
+							return err
+						}
+					}
+					_, err = io.Copy(f, body)
+					return err
+				},
+				Commit: func(replay func(io.Writer) error) error {
+					committed = true
+					return commit(replay)
+				},
+				Poisoned: func(error) bool { return true },
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Resume = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if committed || !errors.Is(err, ErrPartialLength) {
+					t.Fatalf("err = %v committed=%v, want ErrPartialLength before Commit", err, committed)
+				}
+				if fi, err := os.Lstat(s.path(digest)); err != nil || fi.Size() > size {
+					t.Fatalf("partial = %v %v, want at most %d bytes", fi, err, size)
+				}
+				return
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatal("committed bytes are not exactly the blob")
+			}
+		})
 	}
 }

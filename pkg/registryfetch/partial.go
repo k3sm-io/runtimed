@@ -47,6 +47,9 @@ var (
 	// ErrPartialClaimed reports a Claim of a digest another claim holds; it
 	// is transient, unlike ErrInvalidDigest.
 	ErrPartialClaimed = errors.New("registryfetch: partial already claimed")
+	// ErrPartialLength reports a partial whose length after a Transfer that
+	// returned nil is not the blob's Size.
+	ErrPartialLength = errors.New("registryfetch: partial length is not the blob size")
 )
 
 // PartialDirError is the error for a partial dir that is not a private
@@ -313,9 +316,16 @@ type Fill struct {
 	// Digest and Size name the blob.
 	Digest string
 	Size   int64
-	// Transfer appends the rest of the blob to f from offset have; it runs
-	// only when the partial is short. A failure must leave what arrived in f
-	// for the next Resume.
+	// Transfer appends the rest of the blob to f, which Resume hands over
+	// positioned at offset have; it runs only when the partial is short. A
+	// failure must leave what arrived in f for the next Resume.
+	//
+	// Transfer owns restarting: when the source answers from an offset other
+	// than have (a 200 to a Range request starts at 0), Transfer is the only
+	// party that knows it, so Transfer truncates f to that offset and seeks
+	// there before writing. Resume does not guess; after a nil Transfer it
+	// checks that f is exactly Size bytes (see Resume), so a Transfer that
+	// appends a whole blob to a prefix fails rather than commits.
 	Transfer func(f *os.File, have int64) error
 	// Commit consumes the complete partial: replay writes all of it, from
 	// byte 0, to w. Commit is where the whole file is re-hashed.
@@ -326,9 +336,15 @@ type Fill struct {
 }
 
 // Resume brings one blob through its partial: ensure Dir, open the partial
-// (O_NOFOLLOW), restart an overlong one, let Transfer complete a short one,
-// then hand the whole file to Commit. A poisoned partial is removed so it is
-// never resumed; a committed one is removed.
+// (O_NOFOLLOW), restart an overlong one, let Transfer complete a short one
+// from its current length, then hand the whole file to Commit. A poisoned
+// partial is removed so it is never resumed; a committed one is removed.
+//
+// After a Transfer that returns nil the file must be exactly Size bytes, else
+// the error matches ErrPartialLength and Commit does not run: a short file is
+// kept as it is for the next Resume; a long one is truncated to Size, so the
+// store never holds more than Size bytes for the digest (its prefix is then
+// re-hashed, and refused, by the next Commit).
 func (s *PartialStore) Resume(fl Fill) error {
 	if !sha256Digest.MatchString(fl.Digest) {
 		return fmt.Errorf("partial %s: %w", quoteBounded(fl.Digest, 128), ErrInvalidDigest)
@@ -354,7 +370,13 @@ func (s *PartialStore) Resume(fl Fill) error {
 		have = 0
 	}
 	if have < fl.Size {
+		if _, err := f.Seek(have, io.SeekStart); err != nil {
+			return fmt.Errorf("seek partial %s: %w", fl.Digest, err)
+		}
 		if err := fl.Transfer(f, have); err != nil {
+			return err
+		}
+		if err := checkLength(f, fl.Digest, fl.Size); err != nil {
 			return err
 		}
 	}
@@ -374,6 +396,27 @@ func (s *PartialStore) Resume(fl Fill) error {
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) && s.Log != nil {
 		s.Log.Warn("artifact pull: remove committed partial", "digest", fl.Digest, "err", err)
+	}
+	return nil
+}
+
+// checkLength refuses a partial that is not size bytes after a transfer,
+// truncating a long one to size.
+func checkLength(f *os.File, digest string, size int64) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat partial %s: %w", digest, err)
+	}
+	switch n := fi.Size(); {
+	case n < size:
+		return fmt.Errorf("partial %s holds %d of %d bytes after transfer: %w", digest, n, size, ErrPartialLength)
+	case n > size:
+		if err := f.Truncate(size); err != nil {
+			return fmt.Errorf("partial %s holds %d of %d bytes after transfer: %w (truncate: %w)",
+				digest, n, size, ErrPartialLength, err)
+		}
+		return fmt.Errorf("partial %s held %d of %d bytes after transfer, cut to %d: %w",
+			digest, n, size, size, ErrPartialLength)
 	}
 	return nil
 }
