@@ -18,9 +18,11 @@ package image
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -228,10 +230,14 @@ func TestEvictRefusesMalformedTarget(t *testing.T) {
 		{"empty blob list", fakeDigest('a'), nil},
 		{"malformed manifest", "sha256:nope", []string{d}},
 		{"malformed blob", fakeDigest('a'), []string{d, "sha256:nope"}},
+		{"too many blobs", fakeDigest('a'), append([]string{d}, slices.Repeat([]string{fakeDigest('b')}, MaxEvictBlobs)...)},
 	} {
 		res, err := f.cache.Evict(context.Background(), tc.manifest, tc.blobs, ReclaimConfig{FreeBytes: func(string) (uint64, error) { return 1, nil }})
 		if err == nil || res != nil {
 			t.Errorf("%s: Evict = %+v, %v; want nil and an error", tc.name, res, err)
+		}
+		if len(tc.blobs) > MaxEvictBlobs && !errors.Is(err, ErrEvictTooManyBlobs) {
+			t.Errorf("%s: Evict err = %v; want ErrEvictTooManyBlobs", tc.name, err)
 		}
 		if !f.exists(d) {
 			t.Fatalf("%s: %s removed", tc.name, d)

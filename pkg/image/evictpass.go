@@ -68,6 +68,16 @@ func (ev *evictPass) record(rep *ReclaimReport, execs ...*ExecuteReport) {
 	ev.ran = true
 }
 
+// MaxEvictBlobs bounds the blob list one Cache.Evict call accepts: one config
+// plus 4096 layers. Each target blob costs a full roots walk and a full
+// shared-set read under leaseMu, so the function that takes the lock bounds
+// its own input.
+const MaxEvictBlobs = 4097
+
+// ErrEvictTooManyBlobs reports a Cache.Evict target naming more than
+// MaxEvictBlobs blobs; nothing is removed.
+var ErrEvictTooManyBlobs = errors.New("image: evict target names too many blobs")
+
 // Evict evicts the cache blobs of one target manifest, and the trees backed
 // only by them, through the one reclaim pass: ReclaimUnderPressure run in
 // narrow mode. manifest is the target manifest digest and blobs its config and
@@ -100,7 +110,8 @@ func (ev *evictPass) record(rep *ReclaimReport, execs ...*ExecuteReport) {
 // or EvictKeptUnlinkFailed when the refusal is untyped; a planned blob that
 // vanished before its unlink is absent.
 //
-// Errors. A malformed target, an empty blob list, or any error before an
+// Errors. A malformed target, an empty blob list, a list longer than
+// MaxEvictBlobs (ErrEvictTooManyBlobs), or any error before an
 // executor call completed (a roots, shared-set or plan failure, the first
 // executor's guard failing, a context cancelled before any executor ran)
 // returns the error and a nil result: nothing was removed. Once an executor
@@ -115,6 +126,9 @@ func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg 
 	}
 	if len(blobs) == 0 {
 		return nil, errors.New("evict: target names no blobs")
+	}
+	if len(blobs) > MaxEvictBlobs {
+		return nil, fmt.Errorf("%w: %d, limit %d", ErrEvictTooManyBlobs, len(blobs), MaxEvictBlobs)
 	}
 	target := make(map[string]struct{}, len(blobs))
 	for _, d := range blobs {
