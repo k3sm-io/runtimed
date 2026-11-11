@@ -1832,14 +1832,16 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		}, shimDir, cleanup)
 		if err != nil {
 			_ = cleanup()
+			// The error names the container log path, the shim argv and staging paths.
 			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
-				fmt.Errorf("prepare the resident shim for %s: %w", c.GetName(), err)
+				shimStartError(c.GetName(), err)
 		}
 	} else {
 		if logw, err = crilog.Open(logPath); err != nil {
 			_ = cleanup()
+			// The error names the host log path.
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-				fmt.Errorf("open container log for %s: %w", c.GetName(), err)
+				logOpenStartError(c.GetName(), err)
 		}
 		fanout = &logFanout{}
 		// An EMPTY environment: env and the argv[0] override reach the
@@ -2477,6 +2479,20 @@ func wrapStartError(name string, err error) error {
 		fmt.Errorf("wrap command for %s: %w", name, err))
 }
 
+// shimStartError is the start failure for container name whose resident shim
+// could not be prepared; err names the log path, the shim argv and staging paths.
+func shimStartError(name string, err error) error {
+	return withClientMessage(fmt.Sprintf("container %q could not be started: its shim could not be prepared; the daemon log has the cause", name),
+		fmt.Errorf("prepare the resident shim for %s: %w", name, err))
+}
+
+// logOpenStartError is the start failure for container name whose CRI log
+// file could not be opened; err names the host log path.
+func logOpenStartError(name string, err error) error {
+	return withClientMessage(fmt.Sprintf("container %q could not be started: its log could not be opened; the daemon log has the cause", name),
+		fmt.Errorf("open container log for %s: %w", name, err))
+}
+
 // signatureGateMessage is the client-visible sentence for a start whose gate
 // failed with err under ctx. It reuses the exec gate's classification, so the
 // two gates cannot disagree on what a timeout or a cancellation is, and splits
@@ -2637,7 +2653,8 @@ const maxWaitingMessageBytes = 256
 // implementations only has to be fixed in one of them to be wrong.
 //
 // A start failure carrying a fixed client sentence (clientMessageError: the
-// signature gate, an escaping image program, a failed materialization)
+// signature gate, an escaping image program, a failed materialization, a
+// failed wrap, shim preparation, log open or spawn)
 // publishes that sentence instead of its error, which names daemon paths.
 func boundedFailureMessage(err error) string {
 	var ge *clientMessageError

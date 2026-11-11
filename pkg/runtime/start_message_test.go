@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -163,7 +164,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 		reason   runtimev1.FailureReason
 		marker   string
 		wants    []string
-		fail     func(sp *fakeSpawner, wrap *atomic.Bool, cacheRoot string)
+		fail     func(t *testing.T, sp *fakeSpawner, wrap *atomic.Bool, cacheRoot, logDir string)
 	}{
 		{
 			name:     "spawn-missing-program",
@@ -171,7 +172,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 			reason:   runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			marker:   spawnDetail,
 			wants:    []string{"spawn container main", "no such file or directory"},
-			fail: func(sp *fakeSpawner, _ *atomic.Bool, cacheRoot string) {
+			fail: func(_ *testing.T, sp *fakeSpawner, _ *atomic.Bool, cacheRoot, _ string) {
 				sp.mu.Lock()
 				sp.err = &fs.PathError{Op: "fork/exec", Path: filepath.Join(cacheRoot, spawnDetail, "exec-shim"), Err: syscall.ENOENT}
 				sp.mu.Unlock()
@@ -183,7 +184,23 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 			reason:   runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 			marker:   wrapDetail,
 			wants:    []string{"wrap command for main", "read-only file system"},
-			fail:     func(_ *fakeSpawner, wrap *atomic.Bool, _ string) { wrap.Store(true) },
+			fail:     func(_ *testing.T, _ *fakeSpawner, wrap *atomic.Bool, _, _ string) { wrap.Store(true) },
+		},
+		{
+			// The container's log dir turned read-only under the daemon: the next
+			// instance's log file cannot be created.
+			name:     "open-container-log",
+			sentence: "could not be started: its log could not be opened; the daemon log has the cause",
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			marker:   "open container log for main",
+			wants:    []string{"permission denied"},
+			fail: func(t *testing.T, _ *fakeSpawner, _ *atomic.Bool, _, logDir string) {
+				dir := containerLogDir(logDir, "main")
+				if err := os.Chmod(dir, 0o555); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+			},
 		},
 	}
 	for i, tc := range restarts {
@@ -220,7 +237,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				t.Fatalf("CreatePod failed: %v", resp.GetError())
 			}
 
-			tc.fail(sp, wrap, rt.cache.Root())
+			tc.fail(t, sp, wrap, rt.cache.Root(), box.GetLogDirectory())
 			go w.release(1001) // the old instance exits when RestartContainer stops it
 			rresp, err := rt.RestartContainer(context.Background(), &runtimev1.RestartContainerRequest{PodId: podID, Container: "main"})
 			if err != nil {
@@ -233,7 +250,7 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 				t.Errorf("failure_reason = %v, want %v", got, tc.reason)
 			}
 			assertNoHostPaths(t, "RestartContainer error", rresp.GetError().GetMessage(),
-				podID+"/main", `container \"main\"`, tc.sentence, rt.cache.Root(), rootfs, spawnDetail, wrapDetail)
+				podID+"/main", `container \"main\"`, tc.sentence, rt.cache.Root(), rootfs, box.GetLogDirectory(), spawnDetail, wrapDetail)
 			assertLoggedOnceAt(t, logs.String(), "level=ERROR", tc.marker, tc.wants)
 		})
 	}
@@ -289,6 +306,28 @@ func TestSpawnStartErrorClass(t *testing.T) {
 		if got := startErrorReply(err); strings.Contains(got, spawnDetail) {
 			t.Errorf("%v: startErrorReply %q carries the host path", tc.errno, got)
 		}
+	}
+}
+
+// TestShimStartErrorHidesHostPaths covers the resident-shim preparation site,
+// which CreatePod reaches only with the concrete exec-shim backend
+// (hostsResidentShim): the error is built as the site builds it and both
+// client renderers are asserted directly.
+func TestShimStartErrorHidesHostPaths(t *testing.T) {
+	cause := fmt.Errorf("stage shim argv %s: %w", "/cache/run/shim/SHIM-DETAIL/argv", fs.ErrPermission)
+	err := shimStartError("main", cause)
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Error("errors.Is lost the cause")
+	}
+	if want := "prepare the resident shim for main: " + cause.Error(); err.Error() != want {
+		t.Errorf("Error() = %q, want %q", err.Error(), want)
+	}
+	const want = `"container \"main\" could not be started: its shim could not be prepared; the daemon log has the cause"`
+	if got := boundedFailureMessage(err); got != want {
+		t.Errorf("boundedFailureMessage = %s, want %s", got, want)
+	}
+	if got := startErrorReply(err); got != want {
+		t.Errorf("startErrorReply = %s, want %s", got, want)
 	}
 }
 
