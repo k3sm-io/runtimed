@@ -238,34 +238,61 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	policy := p.box.GetSignaturePolicy()
 	err = p.execGates.do(ctx, bin, func(ctx context.Context) error {
 		err := r.gateSignature(ctx, policy, rootfs, bin, false)
-		switch {
-		case err == nil || ctx.Err() != nil:
-		case errors.Is(err, image.ErrSignatureCheckTimeout):
+		switch classifyExecGate(ctx, err) {
+		case execGatePassed, execGateCancelled:
+		case execGateTimedOut:
 			// The gate's errors name the host rootfs, which is the daemon's to know.
 			r.log.Warn("exec: signature check of an image file timed out",
 				"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
-		default:
+		case execGateRefused:
 			r.log.Warn("exec: signature gate refused an image file",
 				"pod", p.box.GetPodId(), "argv0", argv0, "path", bin, "err", err)
 		}
 		return err
 	})
-	if err != nil {
+	switch classifyExecGate(ctx, err) {
+	case execGatePassed:
+	case execGateCancelled:
 		// A killed codesign reads as "not signed", so the session's own context
 		// says whether this was a refusal at all.
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, status.FromContextError(cerr).Err()
-		}
+		return nil, status.FromContextError(ctx.Err()).Err()
+	case execGateTimedOut:
 		// A check that ran out of time gave no verdict: the policy daemon may be
 		// down, so it is reported as retryable rather than as a refusal.
-		if errors.Is(err, image.ErrSignatureCheckTimeout) {
-			return nil, status.Errorf(codes.Unavailable,
-				"exec: signature check of %q timed out under %s; it gave no verdict and may be retried", argv0, policy)
-		}
+		return nil, status.Errorf(codes.Unavailable,
+			"exec: signature check of %q timed out under %s; it gave no verdict and may be retried", argv0, policy)
+	default:
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"exec: %q refused by the signature gate under %s; the daemon log has the cause", argv0, policy)
 	}
 	return append([]string{bin}, cmdv[1:]...), nil
+}
+
+// execGateOutcome is how one exec signature gate ended, as classifyExecGate
+// decides it for both the gate's log line and the session's gRPC status.
+type execGateOutcome int
+
+const (
+	execGatePassed    execGateOutcome = iota // the gate let the file run
+	execGateCancelled                        // ctx ended, so the error is no verdict
+	execGateTimedOut                         // the signature tool ran out of time: no verdict
+	execGateRefused                          // every other error is a refusal
+)
+
+// classifyExecGate classifies the gate's err under ctx. The order is fixed: a
+// nil err passes, then an ended ctx is a cancellation whatever err says, then
+// the timeout sentinel, then everything else is a refusal.
+func classifyExecGate(ctx context.Context, err error) execGateOutcome {
+	switch {
+	case err == nil:
+		return execGatePassed
+	case ctx.Err() != nil:
+		return execGateCancelled
+	case errors.Is(err, image.ErrSignatureCheckTimeout):
+		return execGateTimedOut
+	default:
+		return execGateRefused
+	}
 }
 
 // execGateFlights lets a pod's overlapping exec sessions share one run of the

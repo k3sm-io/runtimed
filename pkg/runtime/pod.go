@@ -2396,7 +2396,11 @@ func (r *Runtime) gateSignature(ctx context.Context, policy runtimev1.SignatureP
 }
 
 // signatureCheckTimeout and signatureSignTimeout bound one Signer.Check and one
-// Signer.Sign in gateSignature. Variables only so tests can shorten them.
+// Signer.Sign in gateSignature. The image package's exported values are the
+// single source; these are variables only so tests can shorten them. The default
+// signer's codesign tool already runs under the same deadlines inside pkg/image,
+// so for it the inner bound fires first or at the same time; this outer layer
+// exists because it bounds any Signer, including one that is not that tool.
 var (
 	signatureCheckTimeout = image.SignatureCheckTimeout
 	signatureSignTimeout  = image.SignatureSignTimeout
