@@ -163,6 +163,7 @@ func (e errReadCloser) Close() error             { return nil }
 type fakeTimer struct {
 	mu       sync.Mutex
 	f        func()
+	fs       []func()
 	now      time.Duration
 	deadline time.Duration
 	running  bool
@@ -175,6 +176,7 @@ func newFakeTimer() *fakeTimer { return &fakeTimer{armed: make(chan struct{}, 64
 func (ft *fakeTimer) afterFunc(d time.Duration, f func()) stallTimer {
 	ft.mu.Lock()
 	ft.f = f
+	ft.fs = append(ft.fs, f)
 	ft.mu.Unlock()
 	ft.Reset(d)
 	return ft
@@ -214,6 +216,14 @@ func (ft *fakeTimer) advance(d time.Duration) bool {
 		f()
 	}
 	return fire
+}
+
+// lastCallback returns the callback the most recent afterFunc was given, so a
+// test can run it late, as a fire that had already started when Stop ran.
+func (ft *fakeTimer) lastCallback() func() {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return ft.fs[len(ft.fs)-1]
 }
 
 // waitArmed waits for the fake timer to be armed, failing with msg if it never is.

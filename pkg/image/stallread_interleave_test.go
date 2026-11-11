@@ -436,3 +436,90 @@ func assertNoPartialBlobs(t *testing.T, cache *Cache) {
 		t.Fatalf("walk blob store: %v", err)
 	}
 }
+
+// drainArmed empties the fake timer's armed signals, so the next waitArmed
+// waits for an arm that has not happened yet.
+func drainArmed(ft *fakeTimer) {
+	for {
+		select {
+		case <-ft.armed:
+		default:
+			return
+		}
+	}
+}
+
+// TestStallReaderLostStopRace pins that a watchdog fire belongs to the Read
+// that armed it even when Read's Stop lost the race: the callback had already
+// started, so it runs after that Read returned bytes. Run then, or while a
+// later Read is in flight, it must neither close the body nor mark the reader
+// stalled; the later Read is cut only by its own window.
+func TestStallReaderLostStopRace(t *testing.T) {
+	const window = time.Minute
+	// readOne runs one Read that the pipe satisfies with b and returns the
+	// callback that Read armed.
+	readOne := func(t *testing.T, s *stallReader, ft *fakeTimer, pw *io.PipeWriter, b string) func() {
+		t.Helper()
+		drainArmed(ft)
+		done := readAsync(s)
+		waitArmed(t, ft, "the Read never armed the watchdog")
+		stale := ft.lastCallback()
+		go func() { _, _ = pw.Write([]byte(b)) }()
+		if r := awaitRead(t, done, "Read never returned its bytes"); r.n != len(b) || r.err != nil {
+			t.Fatalf("Read = %d, %v; want %d, nil", r.n, r.err, len(b))
+		}
+		return stale
+	}
+
+	t.Run("the fire runs after its Read returned", func(t *testing.T) {
+		ft := newFakeTimer()
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		body := &countingCloser{PipeReader: pr}
+		s := newFakeStallReader(body, window, ft)
+		defer s.Close()
+
+		stale := readOne(t, s, ft, pw, "ab")
+		stale()
+		if got := body.closes.Load(); got != 0 {
+			t.Fatalf("a stale fire closed the body %d times, want 0", got)
+		}
+		readOne(t, s, ft, pw, "cd")
+	})
+
+	t.Run("the fire runs while a later Read is in flight", func(t *testing.T) {
+		ft := newFakeTimer()
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		body := &countingCloser{PipeReader: pr}
+		s := newFakeStallReader(body, window, ft)
+		defer s.Close()
+
+		stale := readOne(t, s, ft, pw, "ab")
+		drainArmed(ft)
+		done := readAsync(s)
+		waitArmed(t, ft, "the second Read never armed the watchdog")
+		stale()
+		if got := body.closes.Load(); got != 0 {
+			t.Fatalf("a stale fire closed the body under a later Read %d times, want 0", got)
+		}
+		go func() { _, _ = pw.Write([]byte("cd")) }()
+		if r := awaitRead(t, done, "the in-flight Read never returned"); r.n != 2 || r.err != nil {
+			t.Fatalf("in-flight Read = %d, %v; want 2, nil", r.n, r.err)
+		}
+
+		// The later Read's own window still cuts it.
+		drainArmed(ft)
+		done = readAsync(s)
+		waitArmed(t, ft, "the third Read never armed the watchdog")
+		if !ft.advance(window) {
+			t.Fatal("the third Read's own window did not fire")
+		}
+		if r := awaitRead(t, done, "the stalled Read never returned"); r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
+			t.Fatalf("stalled Read = %d, %v; want 0, ErrLayerBodyStalled", r.n, r.err)
+		}
+		if got := body.closes.Load(); got != 1 {
+			t.Fatalf("body closed %d times by its own window, want 1", got)
+		}
+	})
+}
