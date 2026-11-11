@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -513,6 +514,125 @@ func TestPullResumesFallsBackOnPartialStoreEnv(t *testing.T) {
 		_, err = p.Pull(ctx, c.ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("pull with a cancelled context: err = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// stageEntries lists the cache's local staging directory: nil when it was
+// never created, which is the mark of a commit that did not go through
+// CommitFromLocal.
+func stageEntries(t *testing.T, cache *Cache) []string {
+	t.Helper()
+	d, err := os.Open(filepath.Join(cache.Root(), localStageDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names == nil {
+		names = []string{}
+	}
+	return names
+}
+
+// TestPullResumeCommitsByClone pins the in-place commit of a resumed layer on
+// one APFS volume: the complete partial is cloned into the cache's staging
+// dir and the clone re-hashed, rather than replayed into a second temp file.
+// A partial whose tail is wrong is refused with the digest mismatch, and
+// leaves no blob, no clone in the staging dir and no partial.
+func TestPullResumeCommitsByClone(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("clonefile is darwin only")
+	}
+	const cutAt = 4096
+
+	t.Run("cut layer commits through a clone", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		c.arm(1, 0, false)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+
+		if _, err := pullAlways(p, c.ref); err == nil {
+			t.Fatal("first pull succeeded through a cut layer")
+		}
+		res, err := pullAlways(p, c.ref)
+		if err != nil {
+			t.Fatalf("resumed pull: %v", err)
+		}
+		res.Lease.Release()
+		verifyLayer(t, cache, c)
+		layerBytesEqual(t, cache, c)
+		if _, err := os.Lstat(partialPath(dir, c.layer)); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("partial survived its commit: %v", err)
+		}
+		names := stageEntries(t, cache)
+		if names == nil {
+			t.Fatal("no staging dir: the resumed layer was not committed by clone")
+		}
+		if len(names) != 0 {
+			t.Fatalf("staging dir holds %q after the commit, want it empty", names)
+		}
+	})
+
+	t.Run("tampered tail is refused and leaves nothing", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		c.arm(1, 0, false)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+
+		if _, err := pullAlways(p, c.ref); err == nil {
+			t.Fatal("first pull succeeded through a cut layer")
+		}
+		c.takeRanges()
+		// Complete the partial with a tail whose last byte is flipped, so the
+		// next pull commits it without a transfer.
+		tail := bytes.Clone(c.body[cutAt:])
+		tail[len(tail)-1] ^= 0xFF
+		f, err := os.OpenFile(partialPath(dir, c.layer), os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(tail); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = pullAlways(p, c.ref)
+		if !errors.Is(err, ErrDigestMismatch) {
+			t.Fatalf("pull over a tampered tail: err = %v, want ErrDigestMismatch", err)
+		}
+		if got := c.takeRanges(); len(got) != 0 {
+			t.Fatalf("pull over a complete partial fetched the layer: Range headers %q", got)
+		}
+		if cache.Has(c.layer.String()) {
+			t.Fatal("a layer that failed its digest check is in the cache")
+		}
+		names := stageEntries(t, cache)
+		if names == nil {
+			t.Fatal("no staging dir: the tampered partial was not checked by clone")
+		}
+		if len(names) != 0 {
+			t.Fatalf("staging dir holds %q after a refused commit, want it empty", names)
+		}
+		if _, err := os.Lstat(partialPath(dir, c.layer)); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("poisoned partial was not removed: %v", err)
 		}
 	})
 }

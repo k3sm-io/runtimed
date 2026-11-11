@@ -1174,10 +1174,15 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 // ingest uses without a route. A held claim is then offered to the
 // LocalBlobSource and checked against the cache before any byte is fetched.
 //
-// The complete partial is replayed into CommitBlob, which re-hashes all of it
-// against digest; a mismatch or an overrun condemns the partial and Resume
-// removes it, so the next pull starts from byte 0. Nothing about the hash is
-// carried from one attempt to the next.
+// The complete partial is committed through CommitFromLocal, as a one-shot
+// read-only LocalBlobSource: it is cloned into the cache's staging dir, the
+// clone is re-hashed against digest and renamed into place only on a match,
+// so the blob is not written a second time. When it cannot be cloned there
+// (another volume, no clone support: ErrBlobNotLocal) the partial is replayed
+// into CommitBlob instead, which re-hashes all of it. Either way a mismatch or
+// an overrun condemns the partial and Resume removes it, so the next pull
+// starts from byte 0. Nothing about the hash is carried from one attempt to
+// the next.
 //
 // A ranged answer that is not the bytes asked for (ErrBlobRange: a server or
 // proxy that mishandles Range) would fail the same way on every later pull
@@ -1217,6 +1222,15 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
 				}
 			}
+			return err
+		},
+		CommitFile: func(f *os.File) error {
+			reached = true
+			w, err := p.cache.CommitFromLocal(digest, size, &partialBlob{digest: digest, f: f})
+			if errors.Is(err, ErrBlobNotLocal) {
+				return fmt.Errorf("%w: %w", registryfetch.ErrCommitFileUnsupported, err)
+			}
+			wrote = w
 			return err
 		},
 		Commit: func(replay func(io.Writer) error) error {
@@ -1273,6 +1287,29 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 			"digest", digest, "size", size, "offset", from)
 	}
 	return wrote, err
+}
+
+// partialBlob is the LocalBlobSource resumeBlob commits a complete partial
+// through: it offers f, the read-only O_NOFOLLOW descriptor Resume reopened,
+// once and for digest only. CommitFromLocal closes the file it is handed;
+// Resume closes it again, which is harmless.
+type partialBlob struct {
+	digest string
+	f      *os.File
+	used   bool
+}
+
+// OpenBlob returns the partial for its own digest, the first time only.
+func (b *partialBlob) OpenBlob(digest string) (*os.File, int64, error) {
+	if b.used || digest != b.digest {
+		return nil, 0, ErrBlobNotLocal
+	}
+	b.used = true
+	fi, err := b.f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat partial %s: %w", digest, err)
+	}
+	return b.f, fi.Size(), nil
 }
 
 // partialEnvErr reports whether err from PartialStore.Resume names the
