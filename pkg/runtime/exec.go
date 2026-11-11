@@ -123,7 +123,8 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	// automatically covers exec too.
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, cmdv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
-		return status.Errorf(codes.Internal, "exec: wrap command: %v", err)
+		return r.execFailure(p, c.GetName(), codes.Internal,
+			fmt.Sprintf("exec: %q could not be sandboxed; the daemon log has the cause", cmdv[0]), err)
 	}
 	defer func() { _ = cleanup() }()
 
@@ -153,7 +154,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	if cmdEnv == nil {
 		cmdEnv, err = r.containerEnv(p.box, c, nil)
 		if err != nil {
-			return status.Errorf(codes.InvalidArgument, "exec: %v", err)
+			return r.execFailure(p, c.GetName(), codes.InvalidArgument, execPrepareSentence(cmdv[0]), err)
 		}
 	}
 	cmd.Dir = dir
@@ -161,7 +162,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 	// environment reaches it as the launch payload, never its own environ.
 	release, err := supervisor.AttachLaunchPayload(cmd, supervisor.LaunchPayload{Env: cmdEnv})
 	if err != nil {
-		return status.Errorf(codes.Internal, "exec: %v", err)
+		return r.execFailure(p, c.GetName(), codes.Internal, execPrepareSentence(cmdv[0]), err)
 	}
 	defer release()
 	return execsession.Run(stream, cmd, first.GetTty(), first.GetStdin(), func(int) { release() })
@@ -375,6 +376,12 @@ func (f *execGateFlights) run(ctx context.Context, path string, call *execGateCa
 func (r *Runtime) execFailure(p *pod, container string, code codes.Code, sentence string, err error) error {
 	r.log.Warn("exec failed", "pod", p.box.GetPodId(), "container", container, "err", err)
 	return status.Error(code, sentence)
+}
+
+// execPrepareSentence is the reply for an exec whose session could not be set
+// up after its command was sandboxed: its environment or its launch payload.
+func execPrepareSentence(argv0 string) string {
+	return fmt.Sprintf("exec of %q could not be prepared; the daemon log has the cause", argv0)
 }
 
 // resolveImageExecPath resolves an exec session's absolute argv[0] in the pod

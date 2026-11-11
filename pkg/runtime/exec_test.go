@@ -50,6 +50,8 @@ type recordingExecBackend struct {
 	profiles []string
 	argvs    [][]string
 	specs    []supervisor.LaunchSpec
+	// wrapErr, when set, is returned by every later WrapCommand call.
+	wrapErr error
 }
 
 func (b *recordingExecBackend) Available() bool { return true }
@@ -59,7 +61,11 @@ func (b *recordingExecBackend) WrapCommand(_ context.Context, profile string, ar
 	b.profiles = append(b.profiles, profile)
 	b.argvs = append(b.argvs, append([]string{}, argv...))
 	b.specs = append(b.specs, spec)
+	wrapErr := b.wrapErr
 	b.mu.Unlock()
+	if wrapErr != nil {
+		return "", nil, nil, wrapErr
+	}
 	return argv[0], append([]string{}, argv...), func() error { return nil }, nil
 }
 
