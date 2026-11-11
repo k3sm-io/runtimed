@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,6 +69,35 @@ type Credential struct {
 	IdentityToken string
 	// RegistryToken is a bearer token sent directly to the registry.
 	RegistryToken string
+}
+
+// String redacts: it names the username and which secret fields are set,
+// never their values, so %v, %+v and %s cannot leak a login.
+func (c Credential) String() string {
+	return fmt.Sprintf("Credential{Username:%q Password:%s Auth:%s IdentityToken:%s RegistryToken:%s}",
+		c.Username, present(c.Password), present(c.Auth), present(c.IdentityToken), present(c.RegistryToken))
+}
+
+// GoString is the %#v form; it is String, redacted the same way.
+func (c Credential) GoString() string { return c.String() }
+
+// LogValue redacts for slog: the username and the set/unset state of each
+// secret field.
+func (c Credential) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("username", c.Username),
+		slog.String("password", present(c.Password)),
+		slog.String("auth", present(c.Auth)),
+		slog.String("identity_token", present(c.IdentityToken)),
+		slog.String("registry_token", present(c.RegistryToken)),
+	)
+}
+
+func present(s string) string {
+	if s == "" {
+		return "unset"
+	}
+	return "set"
 }
 
 // Registry reaches one registry over Transport, which the caller scopes (the
