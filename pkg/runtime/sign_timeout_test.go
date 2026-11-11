@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -229,4 +230,124 @@ func TestGateSignatureSignTimeout(t *testing.T) {
 	if n := signer.checks.Load(); n != 1 {
 		t.Errorf("Check called %d times, want 1 (no re-check after a timed-out sign)", n)
 	}
+}
+
+// fakeCodesign is a stand-in codesign put first, and alone, on PATH, so no test
+// using it can reach the real tool. A check (--verify, -dv) answers "unsigned"
+// at once; a sign writes codesign's own temp beside its target, as the real
+// tool does before its rename, and then hangs until it is killed.
+const fakeCodesign = `#!/bin/sh
+case "$1" in
+-s)
+	for a; do last=$a; done
+	printf partial > "$last.cstemp"
+	exec /bin/sleep 30
+	;;
+*)
+	exit 1
+	;;
+esac
+`
+
+// stubCodesignPath makes PATH hold only a directory with fakeCodesign in it.
+func stubCodesignPath(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codesign"), []byte(fakeCodesign), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+// TestGateSignatureHungSignLeavesNoStagedFile drives the production ADHOC_OK
+// sign path (defaultSigner, image.AdHocSignByReplace) with a codesign that
+// hangs mid-sign, and ends that sign two ways: at the gate's sign deadline, and
+// by cancelling the caller's context. Either way the gate fails (the deadline as
+// the retryable timeout sentinel, the cancel as a cancellation), the staging
+// directory holds no staged copy and no codesign temp, and the binary is
+// byte-identical and still the same inode at its name.
+func TestGateSignatureHungSignLeavesNoStagedFile(t *testing.T) {
+	const signTimeout = 400 * time.Millisecond
+	const slack = 3 * time.Second
+	cases := []struct {
+		name   string
+		cancel bool
+		want   error
+	}{
+		{"sign-deadline", false, image.ErrSignatureCheckTimeout},
+		{"parent-cancel", true, context.Canceled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.cancel {
+				shortenSignatureTimeouts(t, 10*time.Second, 10*time.Second)
+			} else {
+				shortenSignatureTimeouts(t, 10*time.Second, signTimeout)
+			}
+			stubCodesignPath(t)
+			base := t.TempDir() // rootfs and staging share a volume, as under Root
+			rootfs := filepath.Join(base, "rootfs")
+			staging := filepath.Join(base, "ingest", "sign")
+			if err := os.MkdirAll(rootfs, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(rootfs, "app")
+			const content = "unsigned-mach-o-bytes"
+			if err := os.WriteFile(target, []byte(content), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			beforeIno := fileIno(t, target)
+			rt := newTestRuntime(t, Deps{Signer: defaultSigner{staging: staging}})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				// Cancel once codesign has written its temp: the sign is under way.
+				go func() {
+					for ctx.Err() == nil {
+						if m, _ := filepath.Glob(filepath.Join(staging, "*.cstemp")); len(m) > 0 {
+							cancel()
+							return
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+				}()
+			}
+			start := time.Now()
+			err := rt.gateSignature(ctx, runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK, rootfs, target, false)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("gateSignature err = %v, want %v", err, tc.want)
+			}
+			if elapsed := time.Since(start); elapsed > signTimeout+slack {
+				t.Errorf("gate returned after %s, want within %s", elapsed, signTimeout+slack)
+			}
+			ents, err := os.ReadDir(staging)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range ents {
+				t.Errorf("staging holds %q after a hung sign", e.Name())
+			}
+			b, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("binary is gone: %v", err)
+			}
+			if string(b) != content {
+				t.Errorf("binary = %q, want byte-identical %q", b, content)
+			}
+			if got := fileIno(t, target); got != beforeIno {
+				t.Errorf("binary inode = %d, want %d (still in place)", got, beforeIno)
+			}
+		})
+	}
+}
+
+// fileIno returns the inode number of the file at p.
+func fileIno(t *testing.T, p string) uint64 {
+	t.Helper()
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Sys().(*syscall.Stat_t).Ino
 }

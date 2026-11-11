@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -205,8 +206,9 @@ func (c *Cache) SignStagingDir() string {
 // identifier equal to the resolved file's base name, because codesign otherwise
 // derives the identifier from the temp file's name. It is flushed with
 // F_FULLFSYNC before the rename and the parent directory is fsynced after it. On
-// any error before the rename the temp file is removed and the original is left
-// exactly as it was.
+// any error before the rename, a sign killed at its deadline or by a cancelled
+// ctx included, the temp file and codesign's own temp beside it are removed
+// (removeSignTemps) and the original is left exactly as it was.
 func AdHocSignByReplace(ctx context.Context, staging, root, target string) error {
 	return signByReplace(ctx, staging, root, target, codesignAs, nil)
 }
@@ -303,7 +305,7 @@ func signByReplace(ctx context.Context, staging, root, target string, sign signF
 	defer func() {
 		if err != nil && !renamed {
 			_ = tmp.Close() // already failing; the temp is removed next
-			_ = os.Remove(tmpPath)
+			removeSignTemps(tmpPath)
 		}
 	}()
 
@@ -343,6 +345,27 @@ func signByReplace(ctx context.Context, staging, root, target string, sign signF
 		return fmt.Errorf("sign %s: fsync parent dir: %w", target, err)
 	}
 	return nil
+}
+
+// codesignTempSuffix is the suffix codesign gives the file it writes the signed
+// image into, beside the file it signs, before renaming it over that file. A
+// codesign killed at its deadline, or by a cancelled caller, can leave that
+// file behind in the staging directory.
+const codesignTempSuffix = ".cstemp"
+
+// removeSignTemps removes, best effort, what a failed sign left in the staging
+// directory: the staged copy at tmpPath and codesign's own temp beside it. It
+// runs on an error path, so it never returns an error that could replace the
+// one being reported; a removal that fails is logged at Warn, and a file that is
+// already gone is not a failure. The startup sweep (SweepSignStaging) removes
+// anything left here.
+func removeSignTemps(tmpPath string) {
+	for _, p := range []string{tmpPath, tmpPath + codesignTempSuffix} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("image: removing a staged sign file failed; the startup sweep removes it",
+				"path", p, "error", err)
+		}
+	}
 }
 
 // openStaging creates staging (0700) if needed and opens it without following a
