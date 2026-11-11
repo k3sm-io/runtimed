@@ -44,8 +44,14 @@ limitations under the License.
 //     mismatch, an overrun) the partial is removed, so a poisoned prefix never
 //     survives to be resumed.
 //
-// Space accounting, the per-digest writer claim, the stall watchdog and the
-// blob cache itself belong to the caller.
+// Three opt-in helpers serve a caller that shares one store across
+// concurrent pulls; a caller that uses none of them sees no change. Claim
+// gives one writer per digest within a store, without blocking. Admit
+// enforces MaxBytes over the regular files in the directory before a partial
+// grows (ErrPartialBudget). Sweep removes old, unclaimed partials, matching
+// only the store's own file-name grammar and unlinking relative to a
+// descriptor of the directory opened O_NOFOLLOW, so it never follows a link.
+// The stall watchdog and the blob cache itself belong to the caller.
 //
 // # Errors
 //

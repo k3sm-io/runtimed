@@ -22,7 +22,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestEnsureDirCreatesPrivateDir(t *testing.T) {
@@ -190,5 +194,254 @@ func TestResumeRefusesUnsafeDigest(t *testing.T) {
 	}
 	if got := s.Bytes("sha256:../x", 1); got != 0 {
 		t.Fatalf("Bytes of an unsafe digest = %d, want 0", got)
+	}
+}
+
+func testDigest(c byte) string { return "sha256:" + strings.Repeat(string(c), 64) }
+
+func TestClaim(t *testing.T) {
+	a, b := testDigest('a'), testDigest('b')
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, s *PartialStore)
+	}{
+		{"second claim refused", func(t *testing.T, s *PartialStore) {
+			rel, ok := s.Claim(a)
+			if !ok {
+				t.Fatal("first claim refused")
+			}
+			defer rel()
+			if _, ok := s.Claim(a); ok {
+				t.Fatal("second claim of a held digest granted")
+			}
+		}},
+		{"other digest free", func(t *testing.T, s *PartialStore) {
+			rel, _ := s.Claim(a)
+			defer rel()
+			relB, ok := s.Claim(b)
+			if !ok {
+				t.Fatal("claim of an unrelated digest refused")
+			}
+			relB()
+		}},
+		{"release frees and is idempotent", func(t *testing.T, s *PartialStore) {
+			rel, _ := s.Claim(a)
+			rel()
+			rel2, ok := s.Claim(a)
+			if !ok {
+				t.Fatal("claim after release refused")
+			}
+			rel() // a stale release must not end the new claim
+			if _, ok := s.Claim(a); ok {
+				t.Fatal("repeated release ended a later claim")
+			}
+			rel2()
+		}},
+		{"invalid digest refused", func(t *testing.T, s *PartialStore) {
+			rel, ok := s.Claim("sha256:../x")
+			rel()
+			if ok {
+				t.Fatal("claim of an unsafe digest granted")
+			}
+		}},
+		{"contention grants exactly one", func(t *testing.T, s *PartialStore) {
+			for range 50 {
+				var wins atomic.Int32
+				var wg sync.WaitGroup
+				start := make(chan struct{})
+				rels := make(chan func(), 16)
+				for range 16 {
+					wg.Go(func() {
+						<-start
+						if rel, ok := s.Claim(a); ok {
+							wins.Add(1)
+							rels <- rel
+						}
+					})
+				}
+				close(start)
+				wg.Wait()
+				close(rels)
+				if n := wins.Load(); n != 1 {
+					t.Fatalf("%d concurrent claims granted, want 1", n)
+				}
+				for rel := range rels {
+					rel()
+					rel()
+				}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { tc.run(t, &PartialStore{Dir: t.TempDir()}) })
+	}
+}
+
+func TestAdmit(t *testing.T) {
+	own, other := testDigest('a'), testDigest('b')
+	for _, tc := range []struct {
+		name    string
+		max     int64
+		want    int64
+		setup   func(t *testing.T, s *PartialStore)
+		wantErr error
+	}{
+		{name: "no cap", max: 0, want: 1 << 40},
+		{name: "empty at boundary", max: 100, want: 100},
+		{name: "empty over boundary", max: 100, want: 101, wantErr: ErrPartialBudget},
+		{name: "others at boundary", max: 100, want: 40, setup: writeSized(other, 60)},
+		{name: "others over boundary", max: 100, want: 41, setup: writeSized(other, 60), wantErr: ErrPartialBudget},
+		{name: "own size not counted", max: 100, want: 100, setup: writeSized(own, 90)},
+		{name: "foreign regular file counted", max: 100, want: 50, setup: writeNamed("stray", 51), wantErr: ErrPartialBudget},
+		{name: "symlink not followed", max: 100, want: 100, setup: func(t *testing.T, s *PartialStore) {
+			big := filepath.Join(t.TempDir(), "big")
+			if err := os.WriteFile(big, make([]byte, 1000), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(big, s.path(other)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "negative want", max: 100, want: -1, wantErr: ErrPartialBudget},
+		{name: "missing dir", max: 100, want: 100, setup: func(t *testing.T, s *PartialStore) { s.Dir = filepath.Join(s.Dir, "absent") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &PartialStore{Dir: t.TempDir(), MaxBytes: tc.max}
+			if tc.setup != nil {
+				tc.setup(t, s)
+			}
+			err := s.Admit(own, tc.want)
+			if tc.wantErr == nil && err != nil || tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Admit(%d) under %d = %v, want %v", tc.want, tc.max, err, tc.wantErr)
+			}
+		})
+	}
+	if err := (&PartialStore{Dir: t.TempDir(), MaxBytes: 1}).Admit("sha256:../x", 0); !errors.Is(err, ErrInvalidDigest) {
+		t.Fatalf("Admit of an unsafe digest = %v, want ErrInvalidDigest", err)
+	}
+}
+
+func writeSized(digest string, n int) func(*testing.T, *PartialStore) {
+	return func(t *testing.T, s *PartialStore) { writeNamed(filepath.Base(s.path(digest)), n)(t, s) }
+}
+
+func writeNamed(name string, n int) func(*testing.T, *PartialStore) {
+	return func(t *testing.T, s *PartialStore) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(s.Dir, name), make([]byte, n), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSweep(t *testing.T) {
+	now := time.Now()
+	old, young := now.Add(-2*time.Hour), now.Add(-time.Minute)
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(victim, old, old); err != nil {
+		t.Fatal(err)
+	}
+	type entry struct {
+		name    string
+		kind    string // file, symlink, dir
+		mtime   time.Time
+		claimed bool
+		gone    bool
+	}
+	name := func(c byte) string { return "sha256-" + strings.Repeat(string(c), 64) + ".partial" }
+	entries := []entry{
+		{name: name('a'), kind: "file", mtime: old, gone: true},
+		{name: name('b'), kind: "file", mtime: young},
+		{name: name('c'), kind: "file", mtime: old, claimed: true},
+		{name: name('d'), kind: "symlink", mtime: old},
+		{name: name('e'), kind: "dir", mtime: old},
+		{name: "sha256-" + strings.Repeat("f", 63) + ".partial", kind: "file", mtime: old},
+		{name: "stray.txt", kind: "file", mtime: old},
+		{name: name('F'), kind: "file", mtime: old}, // uppercase hex: not the grammar
+		{name: name('g'), kind: "file", mtime: old}, // not hex
+		{name: name('9'), kind: "file", mtime: old, gone: true},
+	}
+	s := &PartialStore{Dir: t.TempDir()}
+	for _, e := range entries {
+		p := filepath.Join(s.Dir, e.name)
+		switch e.kind {
+		case "file":
+			if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(p, e.mtime, e.mtime); err != nil {
+				t.Fatal(err)
+			}
+		case "symlink":
+			if err := os.Symlink(victim, p); err != nil {
+				t.Fatal(err)
+			}
+		case "dir":
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(p, e.mtime, e.mtime); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if e.claimed {
+			digest := strings.Replace(strings.TrimSuffix(e.name, ".partial"), "-", ":", 1)
+			rel, ok := s.Claim(digest)
+			if !ok {
+				t.Fatal("claim refused")
+			}
+			defer rel()
+		}
+	}
+	removed, err := s.Sweep(now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRemoved := 0
+	for _, e := range entries {
+		t.Run(e.name, func(t *testing.T) {
+			_, err := os.Lstat(filepath.Join(s.Dir, e.name))
+			if gone := errors.Is(err, os.ErrNotExist); gone != e.gone {
+				t.Fatalf("%s %s (claimed %v): removed = %v, want %v", e.kind, e.name, e.claimed, gone, e.gone)
+			}
+		})
+		if e.gone {
+			wantRemoved++
+		}
+	}
+	if removed != wantRemoved {
+		t.Fatalf("Sweep removed %d, want %d", removed, wantRemoved)
+	}
+	if b, err := os.ReadFile(victim); err != nil || string(b) != "keep" {
+		t.Fatalf("symlink target touched: %q %v", b, err)
+	}
+}
+
+func TestSweepRefusesSymlinkedDir(t *testing.T) {
+	real := t.TempDir()
+	p := filepath.Join(real, "sha256-"+strings.Repeat("a", 64)+".partial")
+	if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "partial")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := (&PartialStore{Dir: link}).Sweep(time.Now(), time.Hour)
+	if !errors.Is(err, ErrPartialDir) || removed != 0 {
+		t.Fatalf("Sweep through a symlinked dir = %d, %v; want 0, ErrPartialDir", removed, err)
+	}
+	if _, err := os.Lstat(p); err != nil {
+		t.Fatalf("partial behind a symlinked dir removed: %v", err)
+	}
+	if n, err := (&PartialStore{Dir: filepath.Join(real, "absent")}).Sweep(time.Now(), time.Hour); n != 0 || err != nil {
+		t.Fatalf("Sweep of a missing dir = %d, %v; want 0, nil", n, err)
 	}
 }
