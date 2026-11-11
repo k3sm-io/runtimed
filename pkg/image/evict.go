@@ -167,3 +167,109 @@ func refineEvictRooted(plan *EvictPlan, roots *rootSet) *EvictPlan {
 	}
 	return out
 }
+
+// EvictKeepReason says why one blob of an eviction target was not removed. It
+// is the exported form of the package's kept reasons plus the executor's own
+// failure; the wire enum is mapped from it at the daemon boundary.
+type EvictKeepReason string
+
+const (
+	// EvictKeptRooted: an operator root or an artifact record names the blob.
+	EvictKeptRooted EvictKeepReason = "rooted"
+	// EvictKeptInUse: a per-pod record or a pod hold names the blob.
+	EvictKeptInUse EvictKeepReason = "in-use"
+	// EvictKeptLeased: an in-flight ingest holds a lease over the blob.
+	EvictKeptLeased EvictKeepReason = "leased"
+	// EvictKeptYoung: the blob is younger than the grace window.
+	EvictKeptYoung EvictKeepReason = "young"
+	// EvictKeptShared: another cached index entry, artifact record or
+	// released copy names the blob.
+	EvictKeptShared EvictKeepReason = "shared"
+	// EvictKeptUnlinkFailed: the executor's re-verification or unlink refused
+	// the blob, or its removal failed. It is a failure, never a plan verdict:
+	// no plan reason maps to it.
+	EvictKeptUnlinkFailed EvictKeepReason = "unlink-failed"
+)
+
+// EvictKept is one target blob an eviction did not remove, and why.
+type EvictKept struct {
+	// Digest is the blob's content digest.
+	Digest string
+	// Reason is why the blob was kept.
+	Reason EvictKeepReason
+}
+
+// EvictResult is the per-blob outcome of evicting one target. Every target
+// blob is in exactly one of Removed, Kept and Absent, so the three together
+// are the target's whole blob set and a partial eviction is never silent.
+type EvictResult struct {
+	// Removed are the digests removed, or that would be on a dry run, sorted.
+	Removed []string
+	// Kept are the target blobs not removed, with their reason, sorted by
+	// digest.
+	Kept []EvictKept
+	// Absent are the target blobs the store does not hold at all, sorted:
+	// there was nothing to remove or keep.
+	Absent []string
+	// ReclaimedBytes is the summed logical size of the removed files. Under
+	// APFS clonefile it over-states what the volume gets back, as
+	// PrunePlan.DeletedBytes does.
+	ReclaimedBytes int64
+}
+
+// exportEvictReason maps a kept reason onto the exported vocabulary:
+//
+//	evictRooted -> EvictKeptRooted
+//	evictInUse  -> EvictKeptInUse
+//	evictLeased -> EvictKeptLeased
+//	evictYoung  -> EvictKeptYoung
+//	evictShared -> EvictKeptShared
+//
+// Any other value, the empty one included, is an error: the set is closed, and
+// a reason that cannot be named must not be reported as some other one.
+func exportEvictReason(r evictReason) (EvictKeepReason, error) {
+	switch r {
+	case evictRooted:
+		return EvictKeptRooted, nil
+	case evictInUse:
+		return EvictKeptInUse, nil
+	case evictLeased:
+		return EvictKeptLeased, nil
+	case evictYoung:
+		return EvictKeptYoung, nil
+	case evictShared:
+		return EvictKeptShared, nil
+	default:
+		return "", fmt.Errorf("evict: unknown kept reason %q", r)
+	}
+}
+
+// result is the outcome p plans, before any unlink: Delete's digests as
+// removed (one entry per digest; every node's bytes counted), the kept set
+// with its reasons exported, and the absent list. It is pure; an unknown kept
+// reason or a nil plan is an error.
+func (p *EvictPlan) result() (*EvictResult, error) {
+	if p == nil {
+		return nil, fmt.Errorf("evict result: nil plan")
+	}
+	out := &EvictResult{Absent: slices.Clone(p.absent)}
+	seen := make(map[string]struct{}, len(p.Delete))
+	for _, d := range p.Delete {
+		out.ReclaimedBytes += d.Node.Size
+		if _, dup := seen[d.Node.Digest]; dup {
+			continue
+		}
+		seen[d.Node.Digest] = struct{}{}
+		out.Removed = append(out.Removed, d.Node.Digest)
+	}
+	sort.Strings(out.Removed)
+	for dg, r := range p.kept {
+		er, err := exportEvictReason(r)
+		if err != nil {
+			return nil, fmt.Errorf("evict result: %s: %w", dg, err)
+		}
+		out.Kept = append(out.Kept, EvictKept{Digest: dg, Reason: er})
+	}
+	sort.Slice(out.Kept, func(i, j int) bool { return out.Kept[i].Digest < out.Kept[j].Digest })
+	return out, nil
+}
