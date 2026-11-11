@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -212,7 +213,9 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 //
 // The order is the contract's: the request's shape is checked first
 // (INVALID_ARGUMENT, nothing read), then the target is resolved from the
-// image index (NOT_FOUND, or FAILED_PRECONDITION REFERENCE_AMBIGUOUS), then a
+// image index, the live artifact records and the released artifact copies
+// (resolveEvictTarget: NOT_FOUND, or FAILED_PRECONDITION REFERENCE_AMBIGUOUS),
+// then a
 // target a pod runs is refused IMAGE_IN_USE before any unlink. A pod that
 // appears after that read is not a refusal: Cache.Evict keeps its blobs and
 // the response reports them kept IN_USE. An unset force is a dry run with the
@@ -233,18 +236,11 @@ func (s *imagesService) EvictImage(ctx context.Context, req *runtimev1.EvictImag
 	if err := validateEvictRequest(s.rt.cache, req); err != nil {
 		return nil, err
 	}
-	entry, err := s.resolveEvictTarget(ctx, req)
+	target, err := s.resolveEvictTarget(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	manifest = entry.Descriptor.GetDigest()
-	if manifest == "" {
-		// An entry written before manifests were retained cannot name its
-		// manifest, and Cache.Evict narrows by it.
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"EvictImage: the entry for %q predates manifest retention and names no manifest digest; re-pull it", entry.Reference)
-	}
-	blobs := evictTargetBlobs(entry.Manifest)
+	manifest, blobs := target.manifest, target.blobs
 	if len(blobs) > image.MaxEvictBlobs {
 		return nil, status.Errorf(codes.InvalidArgument,
 			"EvictImage: the target names %d blobs, limit %d", len(blobs), image.MaxEvictBlobs)
@@ -337,23 +333,165 @@ func validateEvictRequest(c *image.Cache, req *runtimev1.EvictImageRequest) erro
 	return nil
 }
 
-// resolveEvictTarget resolves a validated request against the image index as
-// resolveTarget does, but maps the failure through evictStatusError so an
-// ambiguous reference carries its REFERENCE_AMBIGUOUS detail.
-func (s *imagesService) resolveEvictTarget(ctx context.Context, req *runtimev1.EvictImageRequest) (image.IndexEntry, error) {
-	var (
-		e   image.IndexEntry
-		err error
-	)
-	if d := req.GetDigest(); d != "" {
-		e, err = s.rt.index.ResolveDigest(ctx, d)
-	} else {
-		e, err = s.rt.index.Resolve(ctx, req.GetReference(), requestedPlatform(req.GetPlatform()))
-	}
+// evictTarget is what EvictImage evicts, whichever source named it: the
+// manifest digest Cache.Evict narrows by and the distinct blobs it names.
+type evictTarget struct {
+	manifest string
+	blobs    []string
+}
+
+// resolveEvictTarget resolves a validated request to its target, mapping every
+// failure through evictStatusError so an ambiguous reference carries its
+// REFERENCE_AMBIGUOUS detail. The sources are tried in order, the first that
+// names the target wins:
+//
+//   - by digest: the image index entry of that manifest, then the live
+//     artifact records naming it as their manifest, then its released copies
+//     (FileIndex.ReleasedArtifact);
+//   - by reference: the image index entry for the reference and platform,
+//     then the live artifact records pulled by that exact reference. Released
+//     copies are not looked up by reference.
+//
+// NOT_FOUND is returned only when no source names the target. A reference
+// that the index resolves and that a live record names with another manifest
+// is REFERENCE_AMBIGUOUS, as is one that records name with several manifests.
+// Unreadable records fail closed (ErrIndexEntryCorrupt): the record a corrupt
+// one hides may be the one asked for.
+func (s *imagesService) resolveEvictTarget(ctx context.Context, req *runtimev1.EvictImageRequest) (evictTarget, error) {
+	t, err := s.lookupEvictTarget(ctx, req)
 	if err != nil {
-		return image.IndexEntry{}, evictStatusError(nil, err)
+		if _, ok := status.FromError(err); ok {
+			return evictTarget{}, err
+		}
+		return evictTarget{}, evictStatusError(nil, err)
 	}
-	return e, nil
+	return t, nil
+}
+
+func (s *imagesService) lookupEvictTarget(ctx context.Context, req *runtimev1.EvictImageRequest) (evictTarget, error) {
+	if d := req.GetDigest(); d != "" {
+		return s.evictTargetByDigest(ctx, d)
+	}
+	return s.evictTargetByReference(ctx, req.GetReference(), requestedPlatform(req.GetPlatform()))
+}
+
+func (s *imagesService) evictTargetByDigest(ctx context.Context, d string) (evictTarget, error) {
+	e, err := s.rt.index.ResolveDigest(ctx, d)
+	switch {
+	case err == nil:
+		return evictTargetFromEntry(e)
+	case !errors.Is(err, image.ErrIndexEntryNotFound):
+		return evictTarget{}, err
+	}
+	recs, err := s.evictRecords(ctx)
+	if err != nil {
+		return evictTarget{}, err
+	}
+	if t, ok := evictTargetFromRecords(recs, func(r artifact.Record) bool { return r.ManifestDigest == d }); ok {
+		return t, nil
+	}
+	m, blobs, found, err := s.rt.index.ReleasedArtifact(d)
+	if err != nil {
+		return evictTarget{}, err
+	}
+	if found {
+		return evictTarget{manifest: m, blobs: blobs}, nil
+	}
+	return evictTarget{}, fmt.Errorf("%w: no image entry, artifact record or released copy names %s", image.ErrIndexEntryNotFound, d)
+}
+
+func (s *imagesService) evictTargetByReference(ctx context.Context, ref string, p *image.Platform) (evictTarget, error) {
+	e, ierr := s.rt.index.Resolve(ctx, ref, p)
+	if ierr != nil && !errors.Is(ierr, image.ErrIndexEntryNotFound) {
+		return evictTarget{}, ierr
+	}
+	recs, err := s.evictRecords(ctx)
+	if err != nil {
+		return evictTarget{}, err
+	}
+	byRef := func(r artifact.Record) bool { return r.Reference == ref }
+	manifests := make(map[string]struct{})
+	for _, r := range recs {
+		if byRef(r) {
+			manifests[r.ManifestDigest] = struct{}{}
+		}
+	}
+	if ierr == nil {
+		t, err := evictTargetFromEntry(e)
+		if err != nil {
+			return evictTarget{}, err
+		}
+		delete(manifests, t.manifest)
+		if len(manifests) > 0 {
+			return evictTarget{}, fmt.Errorf("%w: %q names manifest %s in the image index and another in an artifact record",
+				image.ErrIndexEntryAmbiguous, ref, t.manifest)
+		}
+		return t, nil
+	}
+	if len(manifests) > 1 {
+		return evictTarget{}, fmt.Errorf("%w: artifact records name %d manifests for %q", image.ErrIndexEntryAmbiguous, len(manifests), ref)
+	}
+	if t, ok := evictTargetFromRecords(recs, byRef); ok {
+		return t, nil
+	}
+	return evictTarget{}, ierr
+}
+
+// evictTargetFromEntry is the target an image index entry names.
+func evictTargetFromEntry(e image.IndexEntry) (evictTarget, error) {
+	manifest := e.Descriptor.GetDigest()
+	if manifest == "" {
+		// An entry written before manifests were retained cannot name its
+		// manifest, and Cache.Evict narrows by it.
+		return evictTarget{}, status.Errorf(codes.FailedPrecondition,
+			"EvictImage: the entry for %q predates manifest retention and names no manifest digest; re-pull it", e.Reference)
+	}
+	return evictTarget{manifest: manifest, blobs: evictTargetBlobs(e.Manifest)}, nil
+}
+
+// evictTargetFromRecords is the target of the live records match accepts:
+// their one manifest and the union of their blobs, in first-seen order. The
+// caller has ruled out matches of several manifests.
+func evictTargetFromRecords(recs []artifact.Record, match func(artifact.Record) bool) (evictTarget, bool) {
+	var (
+		t    evictTarget
+		seen = make(map[string]struct{})
+	)
+	for _, r := range recs {
+		if !match(r) {
+			continue
+		}
+		t.manifest = r.ManifestDigest
+		for _, d := range append([]string{r.ConfigDigest}, r.LayerDigests...) {
+			if _, ok := seen[d]; ok || d == "" {
+				continue
+			}
+			seen[d] = struct{}{}
+			t.blobs = append(t.blobs, d)
+		}
+	}
+	return t, t.manifest != ""
+}
+
+// evictRecords decodes every live artifact record. A record that does not
+// decode, or names no manifest, is ErrIndexEntryCorrupt.
+func (s *imagesService) evictRecords(ctx context.Context) ([]artifact.Record, error) {
+	bufs, err := s.rt.index.ArtifactRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]artifact.Record, 0, len(bufs))
+	for _, b := range bufs {
+		var r artifact.Record
+		if err := json.Unmarshal(b, &r); err != nil {
+			return nil, fmt.Errorf("%w: artifact record: %v", image.ErrIndexEntryCorrupt, err)
+		}
+		if r.ManifestDigest == "" {
+			return nil, fmt.Errorf("%w: artifact record %q names no manifest digest", image.ErrIndexEntryCorrupt, r.Key)
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // evictTargetBlobs is every distinct non-empty blob digest a manifest names:
