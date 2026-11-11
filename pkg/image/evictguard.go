@@ -27,7 +27,8 @@ import "fmt"
 //
 // Lock order: the executor holds pruneMu around both seams, and
 // unlinkUnlessLeased takes leaseMu inside it, then operatorMu inside leaseMu
-// (through OperatorImageRoots). No path takes them in another order.
+// (through OperatorImageRoots). The narrow-mode shared-set read under leaseMu
+// (unlinkUnlessHeld) takes no lock. No path takes them in another order.
 func (c *Cache) evictHooks(cfg *ReclaimConfig) *pruneHooks {
 	untracked, afterPlan := cfg.UntrackedPod, cfg.afterPlan
 	return &pruneHooks{
@@ -77,6 +78,20 @@ func rootedReasons(roots *rootSet) map[string]evictReason {
 // release their lease, and Release takes leaseMu, so a root written and its
 // lease released after the guard's pass-level read is seen by step 2.
 func (c *Cache) unlinkUnlessLeased(digest string, remove func() error, untracked UntrackedPodFunc) (bool, evictReason, error) {
+	return c.unlinkUnlessHeld(digest, remove, untracked, nil)
+}
+
+// unlinkUnlessHeld is unlinkUnlessLeased with one more step, run in narrow
+// mode: after the roots re-read and still under leaseMu, sharedNow, when
+// non-nil, is asked whether another index entry, artifact record or released
+// copy now names digest. A true answer keeps the blob (evictShared); an error
+// keeps it and is returned, typed as a roots read error is. A nil sharedNow
+// is unlinkUnlessLeased exactly.
+//
+// The shared set is re-read here because the guard's read is once per
+// executor call: an image indexed after it, whose puller then releases its
+// lease, names a target blob only this read can see.
+func (c *Cache) unlinkUnlessHeld(digest string, remove func() error, untracked UntrackedPodFunc, sharedNow func(digest string) (bool, error)) (bool, evictReason, error) {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	if c.leasedLocked(digest) {
@@ -88,6 +103,15 @@ func (c *Cache) unlinkUnlessLeased(digest string, remove func() error, untracked
 	}
 	if rooted {
 		return false, why, nil
+	}
+	if sharedNow != nil {
+		shared, err := sharedNow(digest)
+		if err != nil {
+			return false, "", fmt.Errorf("per-blob shared set read: %w", err)
+		}
+		if shared {
+			return false, evictShared, nil
+		}
 	}
 	return true, "", remove()
 }

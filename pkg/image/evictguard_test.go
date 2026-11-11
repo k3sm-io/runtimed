@@ -18,6 +18,7 @@ package image
 
 import (
 	"context"
+	"errors"
 	"os"
 	"reflect"
 	"sync"
@@ -274,5 +275,77 @@ func TestUnlinkUnlessLeasedHoldsLeaseMu(t *testing.T) {
 	}, nil)
 	if err != nil || !removed || why != "" || !called {
 		t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want removed", removed, why, err, called)
+	}
+}
+
+// TestEvictSharedPerBlob pins the narrow-mode per-blob shared-set read: an
+// index entry naming the target's layer, written under a lease that is
+// released after the blob executor's guard read and before its per-blob
+// check, keeps the layer, typed shared. Only the read under leaseMu can see
+// the entry, so removing it goes red.
+func TestEvictSharedPerBlob(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	cfgDigest := f.blob("evict-shared-cfg", time.Hour)
+	layer := f.blob("evict-shared-layer", time.Hour)
+	sf := &sharedFixture{t: t, cache: f.cache, idx: &FileIndex{dir: f.cache.IndexRoot()}}
+	manifest := sf.entry("app:v1", "target", false, cfgDigest, layer)
+
+	// Guard calls: released artifacts, trees, then the remaining blobs.
+	const blobCall = 3
+	planned := make(chan struct{})
+	raced := make(chan struct{})
+	go func() {
+		<-planned
+		l := f.cache.AcquireLease([]string{layer}, 0)
+		other := f.blob("evict-shared-other-cfg", time.Hour)
+		sf.entry("other:v1", "other", false, other, layer)
+		l.Release()
+		close(raced)
+	}()
+	var once sync.Once
+	calls := 0
+	cfg := ReclaimConfig{
+		FreeBytes: func(string) (uint64, error) { return 1, nil },
+		afterPlan: func() {
+			calls++
+			if calls == blobCall {
+				once.Do(func() {
+					close(planned)
+					<-raced
+				})
+			}
+		},
+	}
+	res, err := f.cache.Evict(context.Background(), manifest, []string{cfgDigest, layer}, cfg)
+	if err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if !f.exists(layer) {
+		t.Fatalf("%s unlinked; want it kept as shared", layer)
+	}
+	want := &EvictResult{
+		Removed:        []string{cfgDigest},
+		Kept:           []EvictKept{{Digest: layer, Reason: EvictKeptShared}},
+		ReclaimedBytes: res.ReclaimedBytes,
+	}
+	if !reflect.DeepEqual(res, want) {
+		t.Errorf("Evict = %+v; want %+v", res, want)
+	}
+}
+
+// TestUnlinkUnlessHeldSharedUnreadable pins the fail-closed per-blob shared
+// read: an error keeps the blob and is returned.
+func TestUnlinkUnlessHeldSharedUnreadable(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	digest := f.blob("evict-shared-unreadable", time.Hour)
+	called := false
+	removed, _, err := f.cache.unlinkUnlessHeld(digest, func() error {
+		called = true
+		return nil
+	}, nil, func(string) (bool, error) { return false, errors.New("boom") })
+	if err == nil || removed || called {
+		t.Fatalf("unlinkUnlessHeld = %v, %v (remove called %v); want kept with an error", removed, err, called)
 	}
 }

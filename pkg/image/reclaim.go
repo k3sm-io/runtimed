@@ -198,8 +198,9 @@ type ReclaimConfig struct {
 	afterInventory func()
 
 	// afterPlan runs on the eviction path after the plan and the guard's roots
-	// read and before the first unlink, once per guarded executor call (see
-	// evictHooks). It is UNEXPORTED and exists only so an in-package test can
+	// read (in narrow mode, also after its shared-set read) and before the
+	// first unlink, once per guarded executor call (see evictHooks and
+	// evictGuards). It is UNEXPORTED and exists only so an in-package test can
 	// interleave a root write, a lease and its release there; production
 	// leaves it nil, and a nil afterPlan changes nothing.
 	afterPlan func()
