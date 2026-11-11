@@ -1176,6 +1176,14 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 // against digest; a mismatch or an overrun condemns the partial and Resume
 // removes it, so the next pull starts from byte 0. Nothing about the hash is
 // carried from one attempt to the next.
+//
+// A ranged answer that is not the bytes asked for (ErrBlobRange: a server or
+// proxy that mishandles Range) would fail the same way on every later pull
+// resuming from the same offset, so the partial is emptied, under the claim,
+// through the file Resume hands Transfer, and the layer is fetched whole by
+// writeBlob within this pull. PartialStore has no exported removal, so the
+// emptied file stays as a zero-length partial; the next resume of it starts
+// from byte 0 with no Range header.
 func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
 	release, cerr := p.partials.Claim(digest)
 	if cerr != nil {
@@ -1194,7 +1202,13 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		Digest: digest,
 		Size:   size,
 		Transfer: func(f *os.File, have int64) error {
-			return transferBlob(ctx, src, digest, size, f, have)
+			err := transferBlob(ctx, src, digest, size, f, have)
+			if errors.Is(err, registryfetch.ErrBlobRange) {
+				if terr := f.Truncate(0); terr != nil {
+					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
+				}
+			}
+			return err
 		},
 		Commit: func(replay func(io.Writer) error) error {
 			w, err := p.cache.CommitBlob(digest, size, replay)
@@ -1205,9 +1219,14 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 			return errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrBlobTooLarge)
 		},
 	})
-	if errors.Is(err, registryfetch.ErrPartialBudget) || errors.Is(err, registryfetch.ErrPartialCap) {
+	switch {
+	case errors.Is(err, registryfetch.ErrPartialBudget) || errors.Is(err, registryfetch.ErrPartialCap):
 		// Admit refused before the store was touched.
 		p.logger().Debug("layer partial over budget; fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	case errors.Is(err, registryfetch.ErrBlobRange):
+		p.logger().Warn("layer range answer is not the one asked for; partial emptied, fetching it whole",
 			"digest", digest, "error", err)
 		return p.writeBlob(digest, size, whole)
 	}
