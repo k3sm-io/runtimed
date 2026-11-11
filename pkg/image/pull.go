@@ -22,9 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"syscall"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -1198,10 +1200,17 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 	if p.cache.Has(digest) {
 		return false, nil
 	}
+	// reached is set the moment Resume hands control to Transfer or Commit:
+	// an error with reached false came from the store's own setup (admit,
+	// directory, open, stat, seek) before a byte of this attempt moved.
+	var reached bool
+	from := size // the offset resumed from; size when Commit runs without a Transfer
 	err = p.partials.Resume(registryfetch.Fill{
 		Digest: digest,
 		Size:   size,
 		Transfer: func(f *os.File, have int64) error {
+			reached = true
+			from = have
 			err := transferBlob(ctx, src, digest, size, f, have)
 			if errors.Is(err, registryfetch.ErrBlobRange) {
 				if terr := f.Truncate(0); terr != nil {
@@ -1211,6 +1220,7 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 			return err
 		},
 		Commit: func(replay func(io.Writer) error) error {
+			reached = true
 			w, err := p.cache.CommitBlob(digest, size, replay)
 			wrote = w
 			return err
@@ -1240,8 +1250,35 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		p.logger().Warn("layer range answer is not the one asked for; partial removed, fetching it whole",
 			"digest", digest, "error", err)
 		return p.writeBlob(digest, size, whole)
+	case err != nil && !reached && partialEnvErr(err):
+		// The store could not be set up and nothing of this attempt was
+		// transferred or committed: the partial store is an optimisation, so
+		// its own environment must not fail a pull that works without it. A
+		// pull whose context is done is not retried whole.
+		if cerr := ctx.Err(); cerr != nil {
+			return false, fmt.Errorf("layer %s: %w (partial store: %w)", digest, cerr, err)
+		}
+		p.logger().Warn("layer partial store unusable; fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	case err == nil && reached && from > 0:
+		p.logger().Info("layer resumed from a partial",
+			"digest", digest, "size", size, "offset", from)
 	}
 	return wrote, err
+}
+
+// partialEnvErr reports whether err from PartialStore.Resume names the
+// store's own environment: a partial dir that is not a private directory, a
+// partial path that is not a regular file, or a partial dir or file that
+// could not be created or opened (a missing parent, permission, a read-only
+// filesystem). Network, transfer, digest and size errors do not match.
+func partialEnvErr(err error) bool {
+	return errors.Is(err, registryfetch.ErrPartialDir) ||
+		errors.Is(err, registryfetch.ErrPartialFile) ||
+		errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, syscall.EROFS)
 }
 
 // transferBlob appends the rest of the size-byte blob digest to f from offset
