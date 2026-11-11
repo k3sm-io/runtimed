@@ -349,3 +349,51 @@ func TestUnlinkUnlessHeldSharedUnreadable(t *testing.T) {
 		t.Fatalf("unlinkUnlessHeld = %v, %v (remove called %v); want kept with an error", removed, err, called)
 	}
 }
+
+// TestEvictTreePerTreeCheck pins the narrow-mode per-tree check: a root
+// written for the tree's backing blob, under a lease released after the tree
+// executor's guard read and before the tree's removal, keeps the tree. Only
+// the per-tree re-read under leaseMu can see it.
+func TestEvictTreePerTreeCheck(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	cfgDigest := f.blob("evict-tree-cfg", time.Hour)
+	layer := f.blob("evict-tree-layer", time.Hour)
+	sf := &sharedFixture{t: t, cache: f.cache, idx: &FileIndex{dir: f.cache.IndexRoot()}}
+	manifest := sf.entry("app:v1", "tree", false, cfgDigest, layer)
+	tree := f.nativeTree(cfgDigest, []string{layer}, 10, time.Hour).dir
+
+	const treeCall = 2
+	planned := make(chan struct{})
+	raced := make(chan struct{})
+	go func() {
+		<-planned
+		l := f.cache.AcquireLease([]string{cfgDigest}, 0)
+		err := f.cache.RecordOperatorImage("app:v1", Platform{OS: "linux", Architecture: "arm64"}, ImageRoot{Reference: "app:v1", Config: cfgDigest})
+		l.Release()
+		if err != nil {
+			t.Errorf("RecordOperatorImage: %v", err)
+		}
+		close(raced)
+	}()
+	var once sync.Once
+	calls := 0
+	cfg := ReclaimConfig{
+		FreeBytes: func(string) (uint64, error) { return 1, nil },
+		afterPlan: func() {
+			calls++
+			if calls == treeCall {
+				once.Do(func() {
+					close(planned)
+					<-raced
+				})
+			}
+		},
+	}
+	if _, err := f.cache.Evict(context.Background(), manifest, []string{cfgDigest, layer}, cfg); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if _, err := os.Lstat(tree); err != nil {
+		t.Fatalf("tree %s removed (%v); want it kept by the per-tree check", tree, err)
+	}
+}

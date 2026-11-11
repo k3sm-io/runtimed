@@ -132,6 +132,33 @@ func (c *Cache) blobRootedNow(digest string, untracked UntrackedPodFunc) (evictR
 	return why, ok, nil
 }
 
+// treeUnlessHeld removes one tree unless something now holds a blob backing
+// it. It holds leaseMu across the decision and remove: a live lease naming
+// any backing digest keeps the tree (evictLeased); then the roots are read
+// again, as blobRootedNow reads them, and a root naming any backing digest
+// keeps it (evictRooted or evictInUse); a read error keeps it and is
+// returned. dg is the first backing digest, in backing order, that kept it.
+func (c *Cache) treeUnlessHeld(backing []string, remove func() error, untracked UntrackedPodFunc) (bool, string, evictReason, error) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	for _, dg := range backing {
+		if dg != "" && c.leasedLocked(dg) {
+			return false, dg, evictLeased, nil
+		}
+	}
+	roots, err := c.classifiedRoots(untracked)
+	if err != nil {
+		return false, "", "", fmt.Errorf("per-tree roots read: %w", err)
+	}
+	rooted := rootedReasons(roots)
+	for _, dg := range backing {
+		if why, ok := rooted[dg]; ok && dg != "" {
+			return false, dg, why, nil
+		}
+	}
+	return true, "", "", remove()
+}
+
 // leasedLocked reports whether a live lease names digest, dropping expired
 // leases as leasedDigests does. The caller holds leaseMu.
 func (c *Cache) leasedLocked(digest string) bool {

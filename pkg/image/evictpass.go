@@ -150,7 +150,7 @@ func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg 
 // blob another cached manifest now names as evictShared (a root's reason wins),
 // and the same guard for the tree executor. Its unlink seam is
 // unlinkUnlessHeld with the shared set re-read for each blob under leaseMu,
-// after the lease and roots checks.
+// after the lease and roots checks. Its tree unlink seam is treeUnlessHeld.
 func (c *Cache) evictGuards(ctx context.Context, cfg *ReclaimConfig) (*pruneHooks, *treePruneHooks) {
 	// afterPlan runs after the guard's shared-set read, not inside the roots
 	// guard, so a test can interleave a writer after both of the guard's reads.
@@ -189,7 +189,10 @@ func (c *Cache) evictGuards(ctx context.Context, cfg *ReclaimConfig) (*pruneHook
 	h.unlink = func(digest string, remove func() error) (bool, evictReason, error) {
 		return c.unlinkUnlessHeld(digest, remove, untracked, sharedNow)
 	}
-	return h, &treePruneHooks{guard: h.guard}
+	treeUnlink := func(backing []string, remove func() error) (bool, string, evictReason, error) {
+		return c.treeUnlessHeld(backing, remove, untracked)
+	}
+	return h, &treePruneHooks{guard: h.guard, unlink: treeUnlink}
 }
 
 // narrowForEvict narrows plan to ev's target in place: its blob delete set to

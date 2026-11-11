@@ -487,6 +487,14 @@ type treePruneHooks struct {
 	// reason of the first such digest in Backing order carried into the skip
 	// record. An error aborts the call with nothing removed.
 	guard func() (drop map[string]evictReason, err error)
+
+	// unlink, when non-nil, decides the removal of one tree that passed
+	// re-verification: remove deletes its record then its payload through the
+	// executor's *os.Root. A false removed with a nil error records the tree
+	// as skipped with a refusal typed from reason for the backing digest dg;
+	// an error records it as skipped with the error. It is set only in
+	// narrow mode (evictGuards); nil outside it.
+	unlink func(backing []string, remove func() error) (removed bool, dg string, reason evictReason, err error)
 }
 
 // executeTreePrune is ExecuteTreePrune with hooks; see ExecuteTreePrune for
@@ -575,15 +583,33 @@ func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.
 			skip(d, "younger than grace")
 			continue
 		}
-		// Step 1: the record. An absent one is not a failure — a tree planned as
-		// RecordUnusable may never have had one.
-		if err := root.Remove(filepath.Join(rel, records[d.Node.Store])); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			skip(d, fmt.Sprintf("remove record: %v", err))
-			continue
+		removeTree := func() error {
+			// Step 1: the record. An absent one is not a failure — a tree planned
+			// as RecordUnusable may never have had one.
+			if err := root.Remove(filepath.Join(rel, records[d.Node.Store])); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("remove record: %w", err)
+			}
+			// Step 2: the payload.
+			if err := root.RemoveAll(rel); err != nil {
+				return fmt.Errorf("remove tree: %w", err)
+			}
+			return nil
 		}
-		// Step 2: the payload.
-		if err := root.RemoveAll(rel); err != nil {
-			skip(d, fmt.Sprintf("remove tree: %v", err))
+		if hooks != nil && hooks.unlink != nil {
+			removed, dg, why, err := hooks.unlink(d.Node.Backing, removeTree)
+			if err != nil {
+				skip(d, err.Error())
+				continue
+			}
+			if !removed {
+				rep.Skipped = append(rep.Skipped, SkippedTree{
+					Store: d.Node.Store, Path: d.Node.Path, Key: d.Node.Key,
+					Reason: fmt.Sprintf("refused by unlink: %s", why), Refusal: hookRefusal(dg, RefusedByUnlink, why),
+				})
+				continue
+			}
+		} else if err := removeTree(); err != nil {
+			skip(d, err.Error())
 			continue
 		}
 		rep.Deleted++
