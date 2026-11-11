@@ -408,3 +408,104 @@ func TestFlatTransportRedirectOffHostGetsNoDialNoCredential(t *testing.T) {
 		t.Errorf("redirect target saw Authorization %q, want none", v)
 	}
 }
+
+// TestResolveContextBranches is a direct table over the resolve bound's small
+// branches: which cause resolveContext records for each way the resolve context
+// can end, and what remoteFetch turns that into. The bound firing is a host
+// problem (ErrPullResolveTimeout, not wrapping context.Canceled); a parent
+// cancel or a parent deadline stays the caller's own error.
+func TestResolveContextBranches(t *testing.T) {
+	t.Run("resolveContext causes", func(t *testing.T) {
+		t.Run("bound fires", func(t *testing.T) {
+			ctx, _, cancel := resolveContext(context.Background(), time.Millisecond)
+			defer cancel()
+			<-ctx.Done()
+			if !errors.Is(context.Cause(ctx), errResolveBound) {
+				t.Fatalf("cause = %v, want errResolveBound", context.Cause(ctx))
+			}
+		})
+		t.Run("parent cancel", func(t *testing.T) {
+			parent, pcancel := context.WithCancel(context.Background())
+			ctx, _, cancel := resolveContext(parent, time.Hour)
+			defer cancel()
+			pcancel()
+			<-ctx.Done()
+			if !errors.Is(context.Cause(ctx), context.Canceled) || errors.Is(context.Cause(ctx), errResolveBound) {
+				t.Fatalf("cause = %v, want the parent's context.Canceled", context.Cause(ctx))
+			}
+		})
+		t.Run("parent deadline", func(t *testing.T) {
+			parent, pcancel := context.WithTimeout(context.Background(), time.Millisecond)
+			defer pcancel()
+			ctx, _, cancel := resolveContext(parent, time.Hour)
+			defer cancel()
+			<-ctx.Done()
+			if !errors.Is(context.Cause(ctx), context.DeadlineExceeded) || errors.Is(context.Cause(ctx), errResolveBound) {
+				t.Fatalf("cause = %v, want the parent's DeadlineExceeded", context.Cause(ctx))
+			}
+		})
+		t.Run("disarm before the bound", func(t *testing.T) {
+			ctx, disarm, cancel := resolveContext(context.Background(), time.Hour)
+			defer cancel()
+			if !disarm() {
+				t.Fatal("disarm = false before the bound fired")
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("context ended after disarm: %v", ctx.Err())
+			}
+		})
+	})
+
+	// Through remoteFetch, against a registry that never answers.
+	cases := []struct {
+		name          string
+		bound         time.Duration
+		ctx           func(t *testing.T) context.Context
+		wantTimeout   bool
+		wantCanceled  bool
+		wantDeadlineP bool
+	}{{
+		name:  "bound fires",
+		bound: 50 * time.Millisecond,
+		ctx:   func(*testing.T) context.Context { return context.Background() },
+
+		wantTimeout: true,
+	}, {
+		name:  "parent cancel",
+		bound: time.Minute,
+		ctx: func(t *testing.T) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			time.AfterFunc(50*time.Millisecond, cancel)
+			return ctx
+		},
+		wantCanceled: true,
+	}, {
+		name:  "parent deadline",
+		bound: time.Minute,
+		ctx: func(t *testing.T) context.Context {
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			t.Cleanup(cancel)
+			return ctx
+		},
+		wantDeadlineP: true,
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setDuration(t, &resolveTimeout, tc.bound)
+			_, err := RemoteFetch(tc.ctx(t), silentServer(t)+"/silent/app:v1", nil, nativePolicy())
+			if err == nil {
+				t.Fatal("RemoteFetch on a silent registry succeeded")
+			}
+			if got := errors.Is(err, ErrPullResolveTimeout); got != tc.wantTimeout {
+				t.Errorf("Is(ErrPullResolveTimeout) = %t, want %t (err = %v)", got, tc.wantTimeout, err)
+			}
+			if got := errors.Is(err, context.Canceled); got != tc.wantCanceled {
+				t.Errorf("Is(context.Canceled) = %t, want %t (err = %v)", got, tc.wantCanceled, err)
+			}
+			if got := errors.Is(err, context.DeadlineExceeded); got != tc.wantDeadlineP {
+				t.Errorf("Is(context.DeadlineExceeded) = %t, want %t (err = %v)", got, tc.wantDeadlineP, err)
+			}
+		})
+	}
+}
