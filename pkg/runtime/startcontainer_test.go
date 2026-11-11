@@ -342,9 +342,9 @@ func TestCreatePodStartsWhatItCanAndWaitsTheRest(t *testing.T) {
 	if strings.Contains(waiting.GetMessage(), "manifest unknown") {
 		t.Errorf("waiting message %q carries the raw pull error; it belongs in the daemon log", waiting.GetMessage())
 	}
-	if !strings.Contains(logs.String(), "manifest unknown") {
-		t.Errorf("daemon log does not carry the raw pull error:\n%s", logs.String())
-	}
+	assertCauseLoggedOnce(t, logs.String(), "manifest unknown", "level=WARN",
+		`msg="container could not be started; it waits while the pod's other containers run"`,
+		"pod="+podID, "container=bad", "reason=FAILURE_REASON_IMAGE_PULL")
 	if waiting.GetReason() != "" {
 		t.Errorf("waiting reason = %q; the kubelet reason string is the provider's to choose",
 			waiting.GetReason())

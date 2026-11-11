@@ -92,10 +92,43 @@ func capsWithout(drop string) []string {
 // agent, polling Health fast enough that a verdict lands in milliseconds.
 func newVMCapsRuntime(t *testing.T, w *imageWorld, agent guestv1.GuestAgentServer) (*Runtime, *fakeVMBackend) {
 	t.Helper()
+	return newVMCapsRuntimeLogged(t, w, agent, nil)
+}
+
+// newVMCapsRuntimeLogged is newVMCapsRuntime with the daemon's logger set to
+// logger; nil keeps the default.
+func newVMCapsRuntimeLogged(t *testing.T, w *imageWorld, agent guestv1.GuestAgentServer, logger *slog.Logger) (*Runtime, *fakeVMBackend) {
+	t.Helper()
 	dial, _ := startFakeGuestAgent(t, agent)
-	rt, vmb := newVMImageRuntimeWith(t, w, Deps{GuestDialer: dial})
+	vmb := &fakeVMBackend{available: true, bootOK: true}
+	cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: w, Unpacker: w, GuestDialer: dial})
+	if logger != nil {
+		cfg.Logger = logger
+	}
+	rt := newTestRuntimeCfg(t, cfg, d)
 	rt.guestLeasePoll = time.Millisecond
 	return rt, vmb
+}
+
+// assertCauseLoggedOnce fails t unless exactly one line of the captured text
+// log out carries cause, and that line holds every one of wants (the level, the
+// message and the attributes the production call site emits).
+func assertCauseLoggedOnce(t *testing.T, out, cause string, wants ...string) {
+	t.Helper()
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, cause) {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) != 1 {
+		t.Fatalf("the cause %q is on %d log lines, want exactly one:\n%s", cause, len(lines), out)
+	}
+	for _, want := range wants {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("log line %q lacks %q", lines[0], want)
+		}
+	}
 }
 
 // withScratchVolume gives the box's first main container an emptyDir. An
@@ -244,14 +277,11 @@ func TestGuestPrivateTokenAbsentFailsPod(t *testing.T) {
 		// decides it, and the create fails SANDBOX_SETUP with nothing to tear
 		// down afterwards.
 		agent := &capsAgent{err: status.Error(codes.Unavailable, "never")}
-		dial, _ := startFakeGuestAgent(t, agent)
-		vmb := &fakeVMBackend{available: true, bootOK: true}
-		cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: world(), Unpacker: world(), GuestDialer: dial})
 		logs := &lockedBuffer{}
-		cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-		rt := newTestRuntimeCfg(t, cfg, d)
-		rt.guestLeasePoll = time.Millisecond
+		rt, vmb := newVMCapsRuntimeLogged(t, world(), agent, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		const consoleDir = "/fake-host-dir/k3sm-pods/pod-gp-never"
 		vmb.err = &sandbox.VMBootError{PodID: "pod-gp-never", Cause: sandbox.VMBootAgentNeverReady,
+			ConsolePath: consoleDir + "/console.log", RetainedConsole: consoleDir + "/console.kept.log",
 			Err: errors.New("no Health response within the boot deadline")}
 		b := box(rt, "pod-gp-never")
 		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: b})
@@ -264,15 +294,11 @@ func TestGuestPrivateTokenAbsentFailsPod(t *testing.T) {
 		if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP {
 			t.Errorf("reason = %v, want SANDBOX_SETUP", got)
 		}
-		if want := "pod pod-gp-never: its vm could not be created; the daemon log has the cause"; !strings.Contains(resp.GetError().GetMessage(), want) {
-			t.Errorf("message %q, want the fixed sentence %q", resp.GetError().GetMessage(), want)
-		}
-		if strings.Contains(resp.GetError().GetMessage(), string(sandbox.VMBootAgentNeverReady)) {
-			t.Errorf("message %q carries the boot cause; it belongs in the daemon log", resp.GetError().GetMessage())
-		}
-		if !strings.Contains(logs.String(), string(sandbox.VMBootAgentNeverReady)) {
-			t.Errorf("daemon log does not record the boot cause %q:\n%s", sandbox.VMBootAgentNeverReady, logs.String())
-		}
+		msg := resp.GetError().GetMessage()
+		assertNoHostPaths(t, "message", msg, "pod pod-gp-never:", "its vm could not be created", "the daemon log has the cause",
+			string(sandbox.VMBootAgentNeverReady), consoleDir, "console.log", "console.kept.log")
+		assertCauseLoggedOnce(t, logs.String(), string(sandbox.VMBootAgentNeverReady),
+			"level=ERROR", `msg="create pod failed"`, "pod=pod-gp-never", consoleDir+"/console.log")
 		if _, ok := rt.lookupPod(b.GetPodId()); ok {
 			t.Error("a pod whose guest never answered was registered")
 		}
