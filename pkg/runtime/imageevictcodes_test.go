@@ -152,3 +152,23 @@ func TestEvictImageFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestEvictImageKeepsAHeldView is the hold-protected variant of the named
+// gate: a pod hold names image A's manifest but none of A's blobs, so a forced
+// eviction of A unlinks A's unshared blobs and still keeps A's view (the view
+// removal's own hold guard).
+func TestEvictImageKeepsAHeldView(t *testing.T) {
+	s := newEvictRPCScene(t)
+	pid, err := image.ParsePodID("evictpod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rt.index.AddArtifactHoldManifest(context.Background(), pid,
+		image.HeldManifest{Digest: s.manA, Config: s.cfgB, Layers: []string{s.ownB}}); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	s.evict(true)
+	want := wantEvicted()
+	want["view A"] = true
+	diffState(t, "after a forced eviction under a hold on A's manifest", s.state(), want)
+}
