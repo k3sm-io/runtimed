@@ -111,12 +111,14 @@ type vmContainerStartStore interface {
 // moved start again.
 var _ vmContainerStartStore = (*sandbox.VMBackend)(nil)
 
-// refuseBesideUnadoptedHelper returns ErrVMHelperUnadoptable (wrapped) for a vm
-// pod whose recorded helper is alive and unowned, and nil otherwise.
+// refuseBesideUnadoptedHelper returns ErrVMHelperUnadoptable (wrapped) for a
+// pod id whose recorded vm helper is alive and unowned, and nil otherwise.
+//
+// It refuses whatever backend the request names. The helper is keyed by the
+// pod id alone, and a vm guest's host-side rootfs is the same
+// <pods>/<pod id>/rootfs every backend uses, so a native create for that id
+// would write into the live guest's directory and, on failure, remove it.
 func (r *Runtime) refuseBesideUnadoptedHelper(box *runtimev1.PodBox) error {
-	if box.GetSandboxProfile().GetBackend() != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
-		return nil
-	}
 	pr, ok := r.vmBackend.(unadoptedHelperProber)
 	if !ok {
 		return nil
@@ -125,7 +127,7 @@ func (r *Runtime) refuseBesideUnadoptedHelper(box *runtimev1.PodBox) error {
 	if !live {
 		return nil
 	}
-	r.log.Warn("not creating a vm pod while an earlier helper it cannot adopt still runs its guest",
+	r.log.Warn("not creating a pod while an earlier vm helper this runtime cannot adopt still runs its guest",
 		"pod", box.GetPodId(), "pid", pid)
 	return fmt.Errorf("create pod %s: helper pid %d: %w", box.GetPodId(), pid, ErrVMHelperUnadoptable)
 }

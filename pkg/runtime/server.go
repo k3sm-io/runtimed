@@ -64,11 +64,12 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		}
 	}()
 
-	// A vm pod whose previous helper still runs, unowned, is not created
-	// again: that would boot a second guest for one pod and remove the pod dir
-	// the live guest shares. It is an RPC error rather than a create failure,
-	// so nothing about the pod is torn down; the next daemon start decides the
-	// helper (see ErrVMHelperUnadoptable).
+	// A pod whose previous vm helper still runs, unowned, is not created
+	// again, whatever backend the request names: a vm create would boot a
+	// second guest for one pod, and any create writes into (and on failure
+	// removes) the pod dir the live guest shares. It is an RPC error rather
+	// than a create failure, so nothing about the pod is torn down; the next
+	// daemon start decides the helper (see ErrVMHelperUnadoptable).
 	if err := r.refuseBesideUnadoptedHelper(box); err != nil {
 		return nil, err
 	}
