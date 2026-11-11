@@ -112,6 +112,27 @@ type BlobSource struct {
 	Credential *registryfetch.Credential
 }
 
+// LogValue is the slog form of a BlobSource: the reference, the plain-HTTP flag
+// and whether a credential is present, never the credential's secret fields.
+// It is a value-receiver method so that a BlobSource and a pointer to one both
+// log redacted, and it does not read Credential's fields at all, so the
+// redaction holds whether Credential stays a pointer or becomes a value.
+func (s BlobSource) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("ref", s.Ref),
+		slog.Bool("plainHTTP", s.Registry.PlainHTTP),
+		slog.Bool("credential", s.Credential != nil),
+	)
+}
+
+// String renders the same redacted form as LogValue, for %v and %+v.
+func (s BlobSource) String() string {
+	return fmt.Sprintf("BlobSource{ref=%s plainHTTP=%t credential=%t}", s.Ref, s.Registry.PlainHTTP, s.Credential != nil)
+}
+
+// GoString renders the same redacted form for %#v.
+func (s BlobSource) GoString() string { return s.String() }
+
 // BlobSourceFunc yields the BlobSource for ref fetched with cred. It is the
 // direct-blob counterpart of a FetchFunc and must yield the transport, scheme
 // and credential that FetchFunc uses for the same arguments; RemoteBlobSource
