@@ -117,6 +117,7 @@ func TestEvictSharedSet(t *testing.T) {
 	tests := []struct {
 		name    string
 		target  string
+		blobs   []string // the target's own blobs; nil uses the target's default
 		setup   func(f *sharedFixture)
 		want    []string
 		wantErr error // nil with wantAnyErr unset means success
@@ -220,6 +221,56 @@ func TestEvictSharedSet(t *testing.T) {
 			want: []string{mB, cfgB, ownB},
 		},
 		{
+			name:   "index entry labelled with the target cannot hide another blob",
+			target: mA,
+			setup: func(f *sharedFixture) {
+				f.entry("a", "A", false, cfgA, ownA, shared)
+				f.entry("a-planted", "A", false, cfgA, ownA, ownB)
+			},
+			want: []string{ownB},
+		},
+		{
+			name:   "live record labelled with the target cannot hide another blob",
+			target: mR,
+			setup: func(f *sharedFixture) {
+				f.record("r@t", mR, cfgR, layR)
+				f.record("planted@t", mR, cfgR, layR, ownB)
+			},
+			want: []string{ownB},
+		},
+		{
+			name:   "released copy labelled with the target cannot hide another blob",
+			target: mR,
+			setup: func(f *sharedFixture) {
+				f.releasedFile("", f.recordBytes("planted@t", mR, cfgB, layR))
+			},
+			want: []string{cfgB},
+		},
+		{
+			name:   "empty target blob set protects every blob a target-labelled entry names",
+			target: mR,
+			blobs:  []string{},
+			setup: func(f *sharedFixture) {
+				f.record("r@t", mR, cfgR, layR)
+			},
+			want: []string{cfgR, layR},
+		},
+		{
+			// The availability trade-off: one bad record makes the whole set
+			// unreadable, so eviction stops rather than guessing.
+			name:   "one malformed artifact record blocks the whole read",
+			target: mA,
+			setup: func(f *sharedFixture) {
+				f.entry("b", "B", false, cfgB, ownB, shared)
+				f.record("s@t", mB, cfgB, shared)
+				f.releasedFile("", f.recordBytes("s@t", mB, cfgB, shared))
+				if err := f.idx.PutArtifactRecord(context.Background(), "bad@t", []byte("{not json")); err != nil {
+					f.f(err)
+				}
+			},
+			wantErr: ErrIndexEntryCorrupt,
+		},
+		{
 			name:   "undecodable artifact record fails closed",
 			target: mR,
 			setup: func(f *sharedFixture) {
@@ -260,12 +311,21 @@ func TestEvictSharedSet(t *testing.T) {
 			anyErr: true,
 		},
 	}
+	defaults := map[string][]string{mA: {cfgA, ownA, shared}, mR: {cfgR, layR}}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cache, idx := newIndexedCache(t)
 			f := &sharedFixture{t: t, cache: cache, idx: idx}
 			tc.setup(f)
-			got, err := cache.evictSharedSet(context.Background(), tc.target)
+			blobs := tc.blobs
+			if blobs == nil {
+				blobs = defaults[tc.target]
+			}
+			own := make(map[string]struct{}, len(blobs))
+			for _, d := range blobs {
+				own[d] = struct{}{}
+			}
+			got, err := cache.evictSharedSet(context.Background(), tc.target, own)
 			if tc.wantErr != nil || tc.anyErr {
 				if err == nil || (tc.wantErr != nil && !errors.Is(err, tc.wantErr)) {
 					t.Fatalf("evictSharedSet = %v, %v; want error %v", got, err, tc.wantErr)
@@ -297,7 +357,7 @@ func TestEvictSharedSetHonoursCancel(t *testing.T) {
 	cache, _ := newIndexedCache(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got, err := cache.evictSharedSet(ctx, fakeDigest('a')); !errors.Is(err, context.Canceled) || got != nil {
+	if got, err := cache.evictSharedSet(ctx, fakeDigest('a'), nil); !errors.Is(err, context.Canceled) || got != nil {
 		t.Fatalf("evictSharedSet = %v, %v; want nil, context.Canceled", got, err)
 	}
 }

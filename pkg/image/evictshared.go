@@ -33,10 +33,17 @@ type recordManifest struct {
 }
 
 // evictSharedSet returns the blob digests named by every cached manifest other
-// than the eviction target manifest: every image index entry whose manifest
-// digest is not manifest, every live artifact record and every released copy
-// whose manifestDigest is not manifest. Each contributes its manifest digest,
-// config and layers. It is PlanEvict's others.
+// than the eviction target manifest, whose own blobs are target: every image
+// index entry, live artifact record and released copy. Each contributes its
+// manifest digest, config and layers. It is PlanEvict's others.
+//
+// An entry or record LABELLED with manifest (index descriptor digest or record
+// manifestDigest equal to it) is not trusted to be the target on its label
+// alone: every blob it names that is not in target, and is not manifest
+// itself, is still added, so a planted or corrupt record carrying the target's
+// label cannot hide a blob another image needs. Entries labelled otherwise add
+// their label and every blob they name. A nil or empty target therefore
+// protects every blob a target-labelled entry names.
 //
 // It only protects, so it errs toward naming more: an index entry recorded
 // without a manifest descriptor, and a record or copy without a
@@ -47,17 +54,30 @@ type recordManifest struct {
 // that is not a regular file, returns an error wrapping ErrIndexEntryCorrupt and
 // no set, as does a released-directory entry named like a copy that is not
 // one: a set silently short of one manifest's blobs would let eviction delete
-// a blob that manifest still names. A file a concurrent writer removed between
-// the listing and the read is skipped. Commit temps (names
+// a blob that manifest still names. The price is availability: one malformed
+// record blocks eviction until it is repaired. A file a concurrent writer
+// removed between the listing and the read is skipped. Commit temps (names
 // starting with ".") and names without the .json suffix are not records. An
 // absent index or namespace contributes nothing. A malformed target digest is
 // an error.
-func (c *Cache) evictSharedSet(ctx context.Context, manifest string) (map[string]struct{}, error) {
+func (c *Cache) evictSharedSet(ctx context.Context, manifest string, target map[string]struct{}) (map[string]struct{}, error) {
 	if _, err := parseBlobDigest(manifest); err != nil {
 		return nil, fmt.Errorf("evict shared set: target manifest: %w", err)
 	}
 	out := make(map[string]struct{})
-	add := func(ds ...string) {
+	// contribute adds what one entry or record labelled label names.
+	contribute := func(label string, ds []string) {
+		if label == manifest {
+			for _, d := range ds {
+				if _, own := target[d]; d != "" && d != manifest && !own {
+					out[d] = struct{}{}
+				}
+			}
+			return
+		}
+		if label != "" {
+			out[label] = struct{}{}
+		}
 		for _, d := range ds {
 			if d != "" {
 				out[d] = struct{}{}
@@ -71,13 +91,11 @@ func (c *Cache) evictSharedSet(ctx context.Context, manifest string) (map[string
 		return nil, fmt.Errorf("evict shared set: image index: %w", err)
 	}
 	for _, e := range entries {
-		if e.Descriptor.GetDigest() == manifest {
-			continue
-		}
-		add(e.Descriptor.GetDigest(), e.Manifest.GetConfig().GetDigest())
+		ds := []string{e.Manifest.GetConfig().GetDigest()}
 		for _, l := range e.Manifest.GetLayers() {
-			add(l.GetDigest())
+			ds = append(ds, l.GetDigest())
 		}
+		contribute(e.Descriptor.GetDigest(), ds)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -92,16 +110,13 @@ func (c *Cache) evictSharedSet(ctx context.Context, manifest string) (map[string
 		if err != nil {
 			return nil, fmt.Errorf("evict shared set: %w: artifact record %q: %v", ErrIndexEntryCorrupt, rec.name, err)
 		}
-		if m != manifest {
-			add(m)
-			add(ds...)
-		}
+		contribute(m, ds)
 	}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := x.releasedShared(manifest, add); err != nil {
+	if err := x.releasedShared(contribute); err != nil {
 		return nil, fmt.Errorf("evict shared set: released artifact records: %w", err)
 	}
 	return out, nil
@@ -173,12 +188,11 @@ func (x *FileIndex) sharedEntries(ctx context.Context) ([]IndexEntry, error) {
 	return out, nil
 }
 
-// releasedShared passes add the manifest digest and blobs of every released
-// copy whose manifestDigest is not manifest, failing closed as evictSharedSet
-// documents. It reads the directory itself rather than through
+// releasedShared passes contribute the manifestDigest and blobs of every
+// released copy, failing closed as evictSharedSet documents. It reads the directory itself rather than through
 // releasedArtifacts, which skips an undecodable copy because it only orders
 // eviction.
-func (x *FileIndex) releasedShared(manifest string, add func(...string)) error {
+func (x *FileIndex) releasedShared(contribute func(label string, ds []string)) error {
 	sub, err := x.openReleased()
 	if err != nil {
 		return err
@@ -225,10 +239,7 @@ func (x *FileIndex) releasedShared(manifest string, add func(...string)) error {
 		if err != nil {
 			return fmt.Errorf("%w: released copy %q: %v", ErrIndexEntryCorrupt, name, err)
 		}
-		if m != manifest {
-			add(m)
-			add(ds...)
-		}
+		contribute(m, ds)
 	}
 	return nil
 }
