@@ -781,6 +781,9 @@ func (a *LayerApplier) applySymlink(name string, hdr *tar.Header) error {
 	if err := symlinkTargetContained(name, target, a.linux); err != nil {
 		return err
 	}
+	if err := symlinkParentIsReal(a.root, name, target); err != nil {
+		return err
+	}
 	if err := a.note(name, hdr, OwnershipTypeSymlink); err != nil {
 		return err
 	}
@@ -969,8 +972,11 @@ func isLayerRootEntry(name string) bool {
 // symlinkTargetContained reports whether a symlink at the (already sanitized)
 // tree-relative path name may point at target, under the dialect linux selects.
 //
-// Both conditions are checked on the STRING, before anything is created, because
-// the link's target need not exist yet and so cannot be checked by stat'ing it.
+// It is a check on the STRING, made before anything is created, because the
+// link's target need not exist yet and so cannot be checked by stat'ing it. A
+// string check is sound only for what a string can see, so it is half of the
+// containment control; symlinkParentIsReal (called by applySymlink) is the half
+// that consults the tree.
 //
 // # The one per-dialect rule in this package
 //
@@ -992,9 +998,30 @@ func isLayerRootEntry(name string) bool {
 // applies — and a builder that means "the root" can spell it absolutely, which
 // the Linux dialect now admits.
 //
-// Containment composes: under the native dialect every link in the tree resolves
-// to a path inside the tree, so a chain of links does too, and no chain can
-// reach outside.
+// # Why a lexical join is not enough
+//
+// The kernel resolves a target one component at a time and FOLLOWS a symlink
+// before it applies the ".." after it, while path.Join cancels "l/.." away
+// without asking what l is. So "x/e -> ../a/b/l/../.." joins to "a" yet, with
+// "a/b/l -> ../.." already in the tree, climbs two levels above it. And a
+// link's own ".." are applied at the directory it REALLY lives in, which is not
+// its spelled parent when that parent was created through a link.
+//
+// The control is therefore the conservative form, in two rules:
+//
+//  1. (here) a relative target may climb only FIRST: once a component other
+//     than ".." (or ".") appears, a later ".." is refused, and the leading run
+//     of ".." may not climb above the tree from the link's spelled directory.
+//  2. (symlinkParentIsReal) a target with a leading ".." is refused when any
+//     ancestor of the link's own name is already a symlink in the tree, so the
+//     spelled directory the ".." climb from is the real one.
+//
+// Together they make containment compose: every link's climb ends at a real
+// directory inside the tree, the rest of its target only descends, and each
+// link that descent meets is itself contained — so a chain of links resolves
+// inside the tree, and no chain can reach outside. Each rule is a local fact
+// about one link that a later entry cannot invalidate: changing an ancestor of
+// an existing link means replacing it, and replace removes the link with it.
 func symlinkTargetContained(name, target string, linux bool) error {
 	if target == "" {
 		return fmt.Errorf("%w: symlink %s has an empty target",
@@ -1012,13 +1039,101 @@ func symlinkTargetContained(name, target string, linux bool) error {
 			ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
 			quoteBounded(target, maxLayerEntryNameLen))
 	}
-	// path.Join cleans, so an escape shows up as a leading "..". Both operands
-	// are relative, so the result is relative too.
-	resolved := path.Join(path.Dir(name), target)
-	if resolved == ".." || strings.HasPrefix(resolved, "../") {
-		return fmt.Errorf("%w: symlink %s targets %s, which resolves to %s",
+	// Rule 1, on the raw components rather than a cleaned join: "" (from "a//b"
+	// or a trailing slash) and "." are no-ops to the kernel and skipped here.
+	climb, descended := 0, false
+	for _, comp := range strings.Split(target, "/") {
+		switch comp {
+		case "", ".":
+		case "..":
+			if descended {
+				return fmt.Errorf("%w: symlink %s targets %s, which climbs with \"..\" after descending, "+
+					"so where it lands depends on what it descended through",
+					ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
+					quoteBounded(target, maxLayerEntryNameLen))
+			}
+			climb++
+		default:
+			descended = true
+		}
+	}
+	if depth := pathDepth(path.Dir(name)); climb > depth {
+		return fmt.Errorf("%w: symlink %s targets %s, which climbs %d levels from a directory %d deep",
 			ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
-			quoteBounded(target, maxLayerEntryNameLen), quoteBounded(resolved, maxLayerEntryNameLen))
+			quoteBounded(target, maxLayerEntryNameLen), climb, depth)
+	}
+	return nil
+}
+
+// pathDepth is the number of components in a cleaned tree-relative directory
+// ("." is the root, depth 0).
+func pathDepth(dir string) int {
+	if dir == "." || dir == "" {
+		return 0
+	}
+	return strings.Count(dir, "/") + 1
+}
+
+// targetClimbs reports whether a relative symlink target begins (after any ""
+// and "." components) with "..". It is the condition under which the link's
+// REAL directory matters, so the only one under which symlinkParentIsReal must
+// consult the tree.
+func targetClimbs(target string) bool {
+	if path.IsAbs(target) {
+		return false
+	}
+	for _, comp := range strings.Split(target, "/") {
+		switch comp {
+		case "", ".":
+		case "..":
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// symlinkParentIsReal is rule 2 of symlinkTargetContained: it refuses a link
+// whose target climbs when any ancestor of the link's own name is a symlink in
+// the tree, because ensureParent would then create the link THROUGH that
+// symlink and its ".." would climb from somewhere other than the spelled
+// directory symlinkTargetContained measured.
+//
+// The walk is bounded by the name's own components (at most
+// maxLayerEntryNameLen bytes), one Lstat each, and stops at the first absent
+// ancestor: what does not exist yet, ensureParent creates as a real directory.
+// Any Lstat failure other than absence fails closed.
+func symlinkParentIsReal(root *os.Root, name, target string) error {
+	if !targetClimbs(target) {
+		return nil
+	}
+	dir := path.Dir(name)
+	if dir == "." {
+		return nil
+	}
+	comps := strings.Split(dir, "/")
+	for i := range comps {
+		anc := strings.Join(comps[:i+1], "/")
+		fi, err := root.Lstat(anc)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%w: symlink %s: cannot inspect its parent %s: %v",
+				ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
+				quoteBounded(anc, maxLayerEntryNameLen), boundErr(err))
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%w: symlink %s targets %s, which climbs from a parent reached through the symlink %s",
+				ErrLayerEscapes, quoteBounded(name, maxLayerEntryNameLen),
+				quoteBounded(target, maxLayerEntryNameLen), quoteBounded(anc, maxLayerEntryNameLen))
+		}
+		if !fi.IsDir() {
+			// A regular file in the way: ensureParent's MkdirAll fails on it,
+			// so there is nothing further up the name to follow.
+			return nil
+		}
 	}
 	return nil
 }

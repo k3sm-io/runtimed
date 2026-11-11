@@ -192,6 +192,10 @@ func TestSymlinkTargetContained(t *testing.T) {
 		{"escapes_one", "l", "../outside", ErrLayerEscapes},
 		{"escapes_deep", "a/b/l", "../../../outside", ErrLayerEscapes},
 		{"escapes_exactly_root_parent", "a/l", "../..", ErrLayerEscapes},
+		{"climb_to_root_exactly", "a/b/l", "../..", nil},
+		{"dot_and_slashes_before_climb", "a/l", "./..//x/", nil},
+		{"dotdot_after_descent", "x/e", "../a/b/l/../..", ErrLayerEscapes},
+		{"dotdot_after_descent_in_tree", "l", "a/../b", ErrLayerEscapes},
 
 		{"empty", "l", "", ErrLayerMalformed},
 		{"nul", "l", "a\x00b", ErrLayerMalformed},
