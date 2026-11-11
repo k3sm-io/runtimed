@@ -137,6 +137,15 @@ const maxLayerEntryNameLen = 256
 // how much of a name an error message QUOTES.
 const maxLayerEntryPathLen = 4096
 
+// maxLayerEntryDepth is the most path components layerEntryPath admits in one
+// entry name. The byte limit alone still admits a name 2048 components deep,
+// and the per-ancestor walks of a name (os.Root resolves each prefix from the
+// root, so a walk of n ancestors costs on the order of n squared component
+// lookups) took about 0.3s at 128 components, 1.6s at 256 and 10.5s at 512 on
+// an Apple-silicon Mac. 128 keeps the worst accepted entry well under a
+// second; real image trees are far shallower.
+const maxLayerEntryDepth = 128
+
 // ApplyStats counts what one tree's layers produced. It is recorded in the
 // tree's daemon-authored record (see treeRecord) so a later reader can tell what
 // the unpacker DID without re-walking the tree — in particular how much of the
@@ -949,7 +958,12 @@ func layerEntryPath(name string) (string, error) {
 		return "", fmt.Errorf("%w: entry name %s names the tree root itself",
 			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen))
 	}
-	for _, comp := range strings.Split(trimmed, "/") {
+	comps := strings.Split(trimmed, "/")
+	if len(comps) > maxLayerEntryDepth {
+		return "", fmt.Errorf("%w: entry name %s has %d path components, over the %d-component limit",
+			ErrLayerMalformed, quoteBounded(name, maxLayerEntryNameLen), len(comps), maxLayerEntryDepth)
+	}
+	for _, comp := range comps {
 		switch comp {
 		case "":
 			return "", fmt.Errorf("%w: entry name %s has an empty path component",
@@ -1114,8 +1128,8 @@ func targetClimbs(target string) bool {
 //
 // The walk is one Lstat per ancestor, and each ancestor is a prefix SLICE of
 // the name, so building them is linear in the name's bytes. The name has
-// passed layerEntryPath, so it is at most maxLayerEntryPathLen bytes and the
-// walk is bounded by that. It stops at the first absent ancestor: what does
+// passed layerEntryPath, so it is at most maxLayerEntryPathLen bytes and
+// maxLayerEntryDepth components, and the walk is bounded by both. It stops at the first absent ancestor: what does
 // not exist yet, ensureParent creates as a real directory. Any Lstat failure
 // other than absence fails closed.
 func symlinkParentIsReal(root *os.Root, name, target string) error {

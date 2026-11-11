@@ -127,3 +127,45 @@ func TestLayerEntryNameLengthIsBounded(t *testing.T) {
 		}
 	})
 }
+
+// TestLayerEntryDepthIsBounded pins the component-count cap: a name one
+// component over maxLayerEntryDepth is refused before it reaches the
+// filesystem, and a name exactly at it applies a climbing symlink whose every
+// ancestor already exists — the case where the ancestor check walks the whole
+// name, which is the most expensive entry the cap admits.
+func TestLayerEntryDepthIsBounded(t *testing.T) {
+	atLimit := strings.Repeat("d/", maxLayerEntryDepth-1) + "l"
+
+	t.Run("one_over_the_limit_is_refused", func(t *testing.T) {
+		over := "d/" + atLimit
+		if _, err := layerEntryPath(over); !errors.Is(err, ErrLayerMalformed) {
+			t.Fatalf("layerEntryPath(%d components) error = %v, want ErrLayerMalformed",
+				maxLayerEntryDepth+1, err)
+		}
+		_, _, err := applyInto(t, ApplyLimits{}, []tarSpec{{name: over, typ: tar.TypeSymlink, link: ".."}})
+		if !errors.Is(err, ErrLayerMalformed) {
+			t.Fatalf("Apply error = %v, want ErrLayerMalformed", err)
+		}
+	})
+
+	t.Run("at_the_limit_applies", func(t *testing.T) {
+		if _, err := layerEntryPath(atLimit); err != nil {
+			t.Fatalf("layerEntryPath(%d components): %v", maxLayerEntryDepth, err)
+		}
+		tree, _, err := applyInto(t, ApplyLimits{}, []tarSpec{
+			{name: path.Dir(atLimit), typ: tar.TypeDir, mode: 0o755},
+			{name: atLimit, typ: tar.TypeSymlink, link: ".."},
+		})
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		root, err := os.OpenRoot(tree)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if got, err := root.Readlink(atLimit); err != nil || got != ".." {
+			t.Fatalf("Readlink = %q, %v; want \"..\"", got, err)
+		}
+	})
+}
