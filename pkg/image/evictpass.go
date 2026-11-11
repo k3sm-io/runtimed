@@ -44,6 +44,28 @@ type evictPass struct {
 	leased map[string]struct{}
 	// deletedBytes is the blob executors' summed DeletedBytes.
 	deletedBytes int64
+	// ran reports that at least one executor call completed, so the fields
+	// above describe what the pass did even when a later call failed.
+	ran bool
+}
+
+// record sets ev's executor fields from the blob executor reports that
+// completed and the leased drops dropLeased reported in rep.Kept, and marks
+// the pass as having run. It replaces, not accumulates: the caller passes
+// every completed report each time.
+func (ev *evictPass) record(rep *ReclaimReport, execs ...*ExecuteReport) {
+	ev.removed, ev.skipped, ev.deletedBytes = nil, nil, 0
+	for _, e := range execs {
+		ev.removed = append(ev.removed, e.Removed...)
+		ev.skipped = append(ev.skipped, e.Skipped...)
+		ev.deletedBytes += e.DeletedBytes
+	}
+	for _, k := range rep.Kept {
+		if k.Reason == ReasonKeptLeased && k.Digest != "" {
+			ev.leased[k.Digest] = struct{}{}
+		}
+	}
+	ev.ran = true
 }
 
 // Evict evicts the cache blobs of one target manifest, and the trees backed
@@ -73,9 +95,17 @@ type evictPass struct {
 // Every target blob lands in exactly one of the result's Removed, Kept and
 // Absent. A blob an executor refused is kept with the refusal's typed reason,
 // or EvictKeptUnlinkFailed when the refusal is untyped; a planned blob that
-// vanished before its unlink is absent. A cancelled context returns its error
-// and no result: the executors may have removed some of the target, and a
-// re-run re-plans from scratch.
+// vanished before its unlink is absent.
+//
+// Errors. A malformed target, an empty blob list, or any error before an
+// executor call completed (a roots, shared-set or plan failure, the first
+// executor's guard failing, a context cancelled before any executor ran)
+// returns the error and a nil result: nothing was removed. Once an executor
+// call has completed, every error, a later executor's guard failure and a
+// cancelled context alike, returns a non-nil result built from what the
+// executors did so far beside the error: its Removed are what was unlinked,
+// and a target blob never attempted is kept EvictKeptUnlinkFailed. A re-run
+// re-plans from scratch.
 func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg ReclaimConfig) (*EvictResult, error) {
 	if _, err := parseBlobDigest(manifest); err != nil {
 		return nil, fmt.Errorf("evict: target manifest: %w", err)
@@ -92,11 +122,19 @@ func (c *Cache) Evict(ctx context.Context, manifest string, blobs []string, cfg 
 	}
 	ev := &evictPass{manifest: manifest, target: target, leased: make(map[string]struct{})}
 	cfg.evict = ev
-	if _, err := c.ReclaimUnderPressure(ctx, cfg); err != nil {
-		return nil, err
+	_, err := c.ReclaimUnderPressure(ctx, cfg)
+	if err == nil {
+		err = ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if err != nil {
+		if !ev.ran || ev.plan == nil {
+			return nil, err
+		}
+		res, oerr := c.evictOutcome(ev)
+		if oerr != nil {
+			return nil, errors.Join(err, oerr)
+		}
+		return res, err
 	}
 	if ev.plan == nil {
 		return nil, errors.New("evict: reclaim pass did not plan")

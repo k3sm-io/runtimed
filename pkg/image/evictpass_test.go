@@ -156,3 +156,59 @@ func TestEvictDryRunDeletesNothing(t *testing.T) {
 		}
 	}
 }
+
+// TestEvictPartialResultOnGuardError pins Evict's partial result: the
+// released-artifact executor removes the target's config, then the blob
+// executor's guard fails (a pod dir with no record makes the roots
+// unreadable). Evict returns the error beside a result listing the removed
+// config and keeping the layer the failed call never reached.
+func TestEvictPartialResultOnGuardError(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	cfgDigest := f.blob("evict-partial-cfg", time.Hour)
+	layer := f.blob("evict-partial-layer", time.Hour)
+	sf := &sharedFixture{t: t, cache: f.cache, idx: &FileIndex{dir: f.cache.IndexRoot()}}
+	// No index entry: an image entry would class the config as an image. A
+	// released copy of the target's own artifact classes it as a released
+	// artifact, so the first executor call removes it.
+	manifest := fakeDigest('a')
+	sf.releasedFile("", sf.recordBytes("art", manifest, cfgDigest))
+
+	const treeCall = 2
+	calls := 0
+	cfg := ReclaimConfig{
+		FreeBytes: func(string) (uint64, error) { return 1, nil },
+		afterPlan: func() {
+			calls++
+			if calls != treeCall {
+				return
+			}
+			pid, err := ParsePodID("pod-unrecorded")
+			if err != nil {
+				t.Errorf("ParsePodID: %v", err)
+				return
+			}
+			if err := os.MkdirAll(f.cache.PodDir(pid), 0o755); err != nil {
+				t.Errorf("mkdir pod dir: %v", err)
+			}
+		},
+	}
+	res, err := f.cache.Evict(context.Background(), manifest, []string{cfgDigest, layer}, cfg)
+	if err == nil {
+		t.Fatalf("Evict = %+v, nil; want the blob guard's error", res)
+	}
+	if res == nil {
+		t.Fatalf("Evict = nil, %v; want a partial result beside the error", err)
+	}
+	if f.exists(cfgDigest) || !f.exists(layer) {
+		t.Fatalf("on disk: config %v, layer %v; want the config removed and the layer kept", f.exists(cfgDigest), f.exists(layer))
+	}
+	want := &EvictResult{
+		Removed:        []string{cfgDigest},
+		Kept:           []EvictKept{{Digest: layer, Reason: EvictKeptUnlinkFailed}},
+		ReclaimedBytes: int64(len("evict-partial-cfg")),
+	}
+	if !reflect.DeepEqual(res, want) {
+		t.Errorf("Evict = %+v; want %+v", res, want)
+	}
+}

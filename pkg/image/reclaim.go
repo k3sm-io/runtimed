@@ -544,6 +544,9 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	}
 	treeExec, err := c.executeTreePrune(plan, grace, now(), stop, treeHooks)
 	if err != nil {
+		if narrow {
+			cfg.evict.record(rep, artExec)
+		}
 		return nil, err
 	}
 	rep.RemovedTrees = treeExec.Removed
@@ -558,6 +561,9 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	restDels = c.dropLeased(restDels, rep)
 	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, blobHooks)
 	if err != nil {
+		if narrow {
+			cfg.evict.record(rep, artExec)
+		}
 		return nil, err
 	}
 	exec := &ExecuteReport{}
@@ -574,13 +580,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: s.Digest, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 	if narrow {
-		ev := cfg.evict
-		ev.removed, ev.skipped, ev.deletedBytes = exec.Removed, exec.Skipped, exec.DeletedBytes
-		for _, k := range rep.Kept {
-			if k.Reason == ReasonKeptLeased && k.Digest != "" {
-				ev.leased[k.Digest] = struct{}{}
-			}
-		}
+		cfg.evict.record(rep, artExec, restExec)
 		return rep, nil
 	}
 	if cerr == nil {
