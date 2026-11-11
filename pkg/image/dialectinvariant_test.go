@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -146,14 +147,26 @@ func within(path, root string) bool {
 // so every host-side reader in this package must treat them as opaque names.
 //
 // The tree carries "a -> /", "b -> a/etc" (relative, but resolving through a
-// to the host's /etc) and absolute links to a canary Mach-O and its directory
-// outside the tree. Unpack, MaterializeTree, AdHocSignTree and the tree prune
-// are driven over it, and the canary must come out byte-for-byte and
-// mtime-for-mtime untouched, with no path outside the tree in any output.
+// to the host's /etc) and absolute links to a canary Mach-O, a canary FIFO and
+// their directory outside the tree. Unpack, MaterializeTree, AdHocSignTree and
+// the tree prune are driven over it, and the canary must come out byte-for-byte
+// and mtime-for-mtime untouched, with no path outside the tree in any output.
+// The FIFO makes a read-only follow visible: opening it for reading blocks, so a
+// reader that opens through the link hangs and the sign subtest times it out.
+//
+// What this gates is the SOURCE side: every reader of the tree. MaterializeTree's
+// destination side joins plain paths and follows links already in the
+// destination; populated_destination pins what that does today, and
+// write_through_across_layers pins that a later layer's entries do not resolve
+// through an earlier layer's link at unpack time.
 func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 	outside := t.TempDir()
 	canary := filepath.Join(outside, "canary")
 	thinMachO(t, canary)
+	fifo := filepath.Join(outside, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	canaryBytes, err := os.ReadFile(canary)
 	if err != nil {
 		t.Fatal(err)
@@ -175,9 +188,12 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 		if err != nil || !bytes.Equal(got, canaryBytes) {
 			t.Errorf("%s: canary content changed (err %v)", stage, err)
 		}
+		if fi, err := os.Lstat(fifo); err != nil || fi.Mode()&fs.ModeNamedPipe == 0 {
+			t.Errorf("%s: canary fifo = %v, %v; want it still a FIFO", stage, fi, err)
+		}
 		ents, err := os.ReadDir(outside)
-		if err != nil || len(ents) != 1 {
-			t.Errorf("%s: directory outside the tree holds %d entries (err %v), want only the canary", stage, len(ents), err)
+		if err != nil || len(ents) != 2 {
+			t.Errorf("%s: directory outside the tree holds %d entries (err %v), want only the canary and the fifo", stage, len(ents), err)
 		}
 	}
 
@@ -188,6 +204,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 		{name: "a", typ: tar.TypeSymlink, link: "/"},
 		{name: "b", typ: tar.TypeSymlink, link: "a/etc"},
 		{name: "canary", typ: tar.TypeSymlink, link: canary},
+		{name: "canaryfifo", typ: tar.TypeSymlink, link: fifo},
 		{name: "canarydir", typ: tar.TypeSymlink, link: outside},
 	})))
 
@@ -195,8 +212,8 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 	if err != nil {
 		t.Fatalf("linux Unpack: %v", err)
 	}
-	if tree.Stats.Symlinks != 4 {
-		t.Fatalf("Symlinks = %d, want 4: the fixture did not land as written", tree.Stats.Symlinks)
+	if tree.Stats.Symlinks != 5 {
+		t.Fatalf("Symlinks = %d, want 5: the fixture did not land as written", tree.Stats.Symlinks)
 	}
 	cacheRoot := filepath.Dir(c.SnapshotsRoot())
 	for _, p := range []string{tree.Rootfs, tree.Ownership} {
@@ -222,7 +239,7 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 				t.Fatalf("MaterializeTree pass %d: %v", i, err)
 			}
 		}
-		for name, want := range map[string]string{"a": "/", "b": "a/etc", "canary": canary, "canarydir": outside} {
+		for name, want := range map[string]string{"a": "/", "b": "a/etc", "canary": canary, "canaryfifo": fifo, "canarydir": outside} {
 			fi, err := os.Lstat(filepath.Join(dst, name))
 			if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
 				t.Errorf("materialized %s: mode %v, err %v; want a symlink, not a copy of its target", name, fi, err)
@@ -252,12 +269,33 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 
 	t.Run("sign", func(t *testing.T) {
 		s := &pathRecordingSigner{}
-		stats, err := AdHocSignTree(context.Background(), s, runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK, tree.Rootfs)
+		type result struct {
+			stats TreeSignStats
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			stats, err := AdHocSignTree(context.Background(), s, runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK, tree.Rootfs)
+			done <- result{stats, err}
+		}()
+		var res result
+		select {
+		case res = <-done:
+		case <-time.After(5 * time.Second):
+			// An open for reading of the FIFO blocks until a writer appears.
+			// Be that writer, so the blocked reader sees EOF and returns.
+			if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+				w.Close()
+			}
+			<-done
+			t.Fatalf("AdHocSignTree blocked: a reader opened the canary fifo through the tree's link")
+		}
+		stats, err := res.stats, res.err
 		if err != nil {
 			t.Fatalf("AdHocSignTree: %v", err)
 		}
-		if stats.MachO != 0 || stats.SkippedLinks != 4 {
-			t.Errorf("stats = %+v, want 0 Mach-O and the 4 links skipped", stats)
+		if stats.MachO != 0 || stats.SkippedLinks != 5 {
+			t.Errorf("stats = %+v, want 0 Mach-O and the 5 links skipped", stats)
 		}
 		for _, p := range s.paths {
 			if !within(p, tree.Rootfs) {
@@ -268,6 +306,91 @@ func TestLinuxDialectAbsoluteLinkIsNeverFollowedHostSide(t *testing.T) {
 			t.Errorf("signer was called on %v; the tree holds no Mach-O of its own", s.paths)
 		}
 		assertCanary(t, "sign")
+	})
+
+	t.Run("populated_destination", func(t *testing.T) {
+		// MaterializeTree's destination side is NOT link-safe: it joins plain
+		// paths and MkdirAll/Stat/OpenFile follow a link already present in the
+		// destination. The vm spine relies on handing it a per-pod rootfs no
+		// earlier writer populated; nothing in production verifies that the
+		// directory is new or empty. This subtest pins today's behaviour with a
+		// destination that already holds "etc -> <victim>": the tree's
+		// etc/hostname is written THROUGH the planted link into the victim
+		// directory. It is a recorded finding, not a contract: when the
+		// destination side is made link-safe (or the spine verifies a fresh
+		// destination), flip it to assert a refusal and an untouched victim.
+		victim := t.TempDir()
+		dst := filepath.Join(t.TempDir(), "rootfs")
+		if err := os.MkdirAll(dst, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, filepath.Join(dst, "etc")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := u.MaterializeTree(context.Background(), mfst, LinuxUnpackPolicy(), dst)
+		if err != nil {
+			t.Fatalf("MaterializeTree into a populated destination: %v; today it succeeds — update this pin if the destination side now refuses", err)
+		}
+		got, rerr := os.ReadFile(filepath.Join(victim, "hostname"))
+		if rerr != nil || string(got) != "guest" {
+			t.Fatalf("victim/hostname = %q, %v; today the write lands through the planted link — update this pin if that changed", got, rerr)
+		}
+		if fi, lerr := os.Lstat(filepath.Join(dst, "etc")); lerr != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			t.Errorf("destination etc = %v, %v; want the planted link left in place", fi, lerr)
+		}
+		assertCanary(t, "populated destination")
+	})
+
+	t.Run("write_through_across_layers", func(t *testing.T) {
+		// Layer 1 plants the links; each layer-2 variant then names a path
+		// THROUGH one of them. The applier resolves entries inside the tree
+		// (os.Root), so every variant fails the unpack with os.Root's "path
+		// escapes from parent" refusal (wrapped, not ErrLayerEscapes: the
+		// applier's lexical check passes and the os.Root walk is what stops it),
+		// no tree is returned, and nothing outside the tree may be created,
+		// linked or deleted. Each
+		// variant is its own image so one refusal cannot mask the next. The
+		// hard-link rule on its own is TestLinuxRootfsHardlinkContainment; this
+		// is the cross-layer composition with admitted absolute symlinks.
+		hostProbe := "k3sm-dialect-invariant-probe"
+		layer1 := []tarSpec{
+			{name: "etc", typ: tar.TypeDir, mode: 0o755},
+			{name: "etc/hostname", mode: 0o644, data: "guest"},
+			{name: "a", typ: tar.TypeSymlink, link: "/"},
+			{name: "b", typ: tar.TypeSymlink, link: "a/etc"},
+			{name: "c", typ: tar.TypeSymlink, link: outside},
+		}
+		for _, tc := range []struct {
+			name   string
+			layer2 []tarSpec
+		}{
+			{"file_through_absolute_root_link", []tarSpec{{name: "a/etc/" + hostProbe, mode: 0o644, data: "x"}}},
+			{"file_through_absolute_dir_link", []tarSpec{{name: "c/" + hostProbe, mode: 0o644, data: "x"}}},
+			{"dir_through_absolute_dir_link", []tarSpec{{name: "c/" + hostProbe, typ: tar.TypeDir, mode: 0o755}}},
+			{"hardlink_target_through_link", []tarSpec{{name: "hl", typ: tar.TypeLink, link: "c/canary"}}},
+			{"hardlink_name_through_link", []tarSpec{{name: "c/" + hostProbe, typ: tar.TypeLink, link: "etc/hostname"}}},
+			{"whiteout_through_relative_link", []tarSpec{{name: "b/.wh.hosts", mode: 0o644}}},
+			{"whiteout_through_absolute_dir_link", []tarSpec{{name: "c/.wh.canary", mode: 0o644}}},
+			{"opaque_through_absolute_dir_link", []tarSpec{{name: "c/.wh..wh..opq", mode: 0o644}}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				c2, u2 := newTestUnpacker(t)
+				m := commitImage(t, c2, linuxImageFrom(t, layerFrom(t, layer1), layerFrom(t, tc.layer2)))
+				got, err := u2.Unpack(context.Background(), m, LinuxUnpackPolicy())
+				if err == nil || got != nil || !strings.Contains(err.Error(), "path escapes from parent") {
+					t.Errorf("Unpack = %+v, %v; want nil and os.Root's path-escape refusal", got, err)
+				}
+				for _, p := range []string{filepath.Join("/etc", hostProbe), filepath.Join(outside, hostProbe)} {
+					if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+						t.Errorf("%s exists after the unpack (err %v): a layer wrote outside the tree", p, err)
+					}
+				}
+				if _, err := os.Lstat("/etc/hosts"); err != nil {
+					t.Errorf("host /etc/hosts after the unpack: %v", err)
+				}
+				assertCanary(t, tc.name)
+			})
+		}
 	})
 
 	t.Run("native_open_refuses_the_linux_tree", func(t *testing.T) {
