@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -312,7 +314,8 @@ func TestCreatePodStartsWhatItCanAndWaitsTheRest(t *testing.T) {
 		badRef: errors.New("manifest unknown: no such image"),
 	}}
 	w := newBlockingWaiter()
-	rt := newTestRuntime(t, Deps{
+	logs := &lockedBuffer{}
+	rt := newTestRuntimeCfg(t, Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}, Deps{
 		Puller:   pull,
 		Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}},
 		Waiter:   w,
@@ -332,8 +335,15 @@ func TestCreatePodStartsWhatItCanAndWaitsTheRest(t *testing.T) {
 		t.Errorf("the resolvable container is not running: %v", statusNamed(t, rt, podID, "good").GetState())
 	}
 	waiting := assertWaiting(t, rt, podID, "bad", runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL)
-	if !strings.Contains(waiting.GetMessage(), "manifest unknown") {
-		t.Errorf("waiting message = %q, want the bounded pull error", waiting.GetMessage())
+	// The waiting message is the sentence quoted (image.QuoteBounded).
+	if want := strconv.Quote(`image "example.com/bad:v1" could not be pulled; the daemon log has the cause`); waiting.GetMessage() != want {
+		t.Errorf("waiting message = %q, want the fixed sentence %q", waiting.GetMessage(), want)
+	}
+	if strings.Contains(waiting.GetMessage(), "manifest unknown") {
+		t.Errorf("waiting message %q carries the raw pull error; it belongs in the daemon log", waiting.GetMessage())
+	}
+	if !strings.Contains(logs.String(), "manifest unknown") {
+		t.Errorf("daemon log does not carry the raw pull error:\n%s", logs.String())
 	}
 	if waiting.GetReason() != "" {
 		t.Errorf("waiting reason = %q; the kubelet reason string is the provider's to choose",

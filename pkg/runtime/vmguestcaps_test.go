@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -243,7 +244,13 @@ func TestGuestPrivateTokenAbsentFailsPod(t *testing.T) {
 		// decides it, and the create fails SANDBOX_SETUP with nothing to tear
 		// down afterwards.
 		agent := &capsAgent{err: status.Error(codes.Unavailable, "never")}
-		rt, vmb := newVMCapsRuntime(t, world(), agent)
+		dial, _ := startFakeGuestAgent(t, agent)
+		vmb := &fakeVMBackend{available: true, bootOK: true}
+		cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: world(), Unpacker: world(), GuestDialer: dial})
+		logs := &lockedBuffer{}
+		cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		rt := newTestRuntimeCfg(t, cfg, d)
+		rt.guestLeasePoll = time.Millisecond
 		vmb.err = &sandbox.VMBootError{PodID: "pod-gp-never", Cause: sandbox.VMBootAgentNeverReady,
 			Err: errors.New("no Health response within the boot deadline")}
 		b := box(rt, "pod-gp-never")
@@ -257,8 +264,14 @@ func TestGuestPrivateTokenAbsentFailsPod(t *testing.T) {
 		if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP {
 			t.Errorf("reason = %v, want SANDBOX_SETUP", got)
 		}
-		if !strings.Contains(resp.GetError().GetMessage(), string(sandbox.VMBootAgentNeverReady)) {
-			t.Errorf("message %q does not name the boot cause", resp.GetError().GetMessage())
+		if want := "pod pod-gp-never: its vm could not be created; the daemon log has the cause"; !strings.Contains(resp.GetError().GetMessage(), want) {
+			t.Errorf("message %q, want the fixed sentence %q", resp.GetError().GetMessage(), want)
+		}
+		if strings.Contains(resp.GetError().GetMessage(), string(sandbox.VMBootAgentNeverReady)) {
+			t.Errorf("message %q carries the boot cause; it belongs in the daemon log", resp.GetError().GetMessage())
+		}
+		if !strings.Contains(logs.String(), string(sandbox.VMBootAgentNeverReady)) {
+			t.Errorf("daemon log does not record the boot cause %q:\n%s", sandbox.VMBootAgentNeverReady, logs.String())
 		}
 		if _, ok := rt.lookupPod(b.GetPodId()); ok {
 			t.Error("a pod whose guest never answered was registered")
