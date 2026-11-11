@@ -145,7 +145,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 				return &runtimev1.Container{Name: "main", Image: "example.test/mlx-serve:v1"}
 			},
 			entrypoint:      []string{"/../escape"},
-			wantErrContains: "escapes the pod rootfs",
+			wantErrContains: "resolves outside the image's root filesystem",
 		},
 		{
 			name: "pulled_image_relative_argv_escaping_the_rootfs",
@@ -153,7 +153,7 @@ func TestPulledImageAbsoluteArgvResolvesInRootfs(t *testing.T) {
 				return &runtimev1.Container{Name: "main", Image: "example.test/mlx-serve:v1"}
 			},
 			entrypoint:      []string{"../escape"},
-			wantErrContains: "escapes the pod rootfs",
+			wantErrContains: "resolves outside the image's root filesystem",
 		},
 	}
 

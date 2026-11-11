@@ -310,12 +310,13 @@ func initContainerIndex(box *runtimev1.PodBox, name string) int {
 }
 
 // startErrorReply renders a startContainer error for an RPC reply a client
-// reads. A signature-gate failure (signatureGateError) publishes the same
-// bounded fixed sentence its Waiting message does, because its error names the
-// cache root, the sign staging directory and the tool's output; the daemon's
-// log line carries that error once. Every other error keeps its full text.
+// reads. A failure carrying a fixed client sentence (clientMessageError)
+// publishes the same bounded sentence its Waiting message does, because its
+// error names the cache root, the rootfs, the sign staging directory or a
+// tool's output; the daemon's log line carries that error once. Every other
+// error keeps its full text.
 func startErrorReply(err error) string {
-	var ge *signatureGateError
+	var ge *clientMessageError
 	if errors.As(err, &ge) {
 		return boundedFailureMessage(err)
 	}

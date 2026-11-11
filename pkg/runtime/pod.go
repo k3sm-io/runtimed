@@ -1758,10 +1758,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// signing, before exec. A host binary is never ad-hoc re-signed
 	// (hostBinary).
 	if err := r.gateSignature(ctx, p.box.GetSignaturePolicy(), rootfs, gatePath, rb.hostBinary); err != nil {
-		return nil, signatureFailureReason(err), &signatureGateError{
-			message: signatureGateMessage(ctx, err, rb.program, p.box.GetSignaturePolicy()),
-			err:     err,
-		}
+		return nil, signatureFailureReason(err), withClientMessage(
+			signatureGateMessage(ctx, err, rb.program, p.box.GetSignaturePolicy()), err)
 	}
 
 	// Resolve the container's securityContext identity plus the pod's rlimit plan
@@ -2422,18 +2420,25 @@ func (r *Runtime) checkSignature(ctx context.Context, policy runtimev1.Signature
 // file. Its text keeps the gate's "ad-hoc sign <path>: <cause>" wording.
 var errAdHocSign = errors.New("ad-hoc sign")
 
-// signatureGateError is a start's signature-gate failure. Error is the gate's
-// full error, which names the host rootfs and, for a failed sign, the staging
-// copy and the tool's output: it is for the daemon's one Warn line, which every
-// caller of startContainer writes. message is the fixed sentence a client sees
-// (boundedFailureMessage), naming only the program as the pod wrote it.
-type signatureGateError struct {
+// clientMessageError is a start failure whose error names daemon detail a
+// client must not read: the host rootfs, the cache root, a sign staging copy,
+// a tool's output. Error is the full error, for the daemon's one log line,
+// which every caller of startContainer writes; message is the fixed sentence a
+// client sees (boundedFailureMessage, startErrorReply), naming only what the
+// pod wrote — its program, its image reference. Unwrap keeps the sentinels and
+// the resolveError reason visible to errors.Is / errors.As.
+type clientMessageError struct {
 	message string
 	err     error
 }
 
-func (e *signatureGateError) Error() string { return e.err.Error() }
-func (e *signatureGateError) Unwrap() error { return e.err }
+func (e *clientMessageError) Error() string { return e.err.Error() }
+func (e *clientMessageError) Unwrap() error { return e.err }
+
+// withClientMessage pairs err with the fixed sentence a client sees in its place.
+func withClientMessage(message string, err error) error {
+	return &clientMessageError{message: message, err: err}
+}
 
 // signatureGateMessage is the client-visible sentence for a start whose gate
 // failed with err under ctx. It reuses the exec gate's classification, so the
@@ -2594,10 +2599,11 @@ const maxWaitingMessageBytes = 256
 // image.QuoteBounded until the copy was collapsed, and a safety rule with two
 // implementations only has to be fixed in one of them to be wrong.
 //
-// A signature-gate failure publishes its fixed sentence instead of its error
-// (signatureGateError): the error names daemon paths and tool output.
+// A start failure carrying a fixed client sentence (clientMessageError: the
+// signature gate, an escaping image program, a failed materialization)
+// publishes that sentence instead of its error, which names daemon paths.
 func boundedFailureMessage(err error) string {
-	var ge *signatureGateError
+	var ge *clientMessageError
 	if errors.As(err, &ge) {
 		return image.QuoteBounded(ge.message, maxWaitingMessageBytes)
 	}
@@ -3031,8 +3037,11 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 	mat, err := r.unpacker.MaterializeTree(ctx, res.Manifest, policy, rootfs)
 	if err != nil {
+		// The unpacker's error names the pod rootfs and the tree cache; the
+		// client reads the fixed sentence, the daemon log the whole error.
 		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
-			fmt.Errorf("materialize image %q: %w", c.GetImage(), err))
+			withClientMessage(fmt.Sprintf("image %q could not be prepared; the daemon log has the cause", c.GetImage()),
+				fmt.Errorf("materialize image %q: %w", c.GetImage(), err)))
 	}
 	r.log.Debug("materialized image tree",
 		"pod", p.box.GetPodId(), "container", c.GetName(), "image", c.GetImage(),
@@ -3062,8 +3071,13 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	// for why the leading slash carries no meaning on this route.
 	bin, err := resolveImageArgv0(rootfs, run.Argv[0])
 	if err != nil {
-		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
-			fmt.Errorf("container %s: %w", c.GetName(), err))
+		err = fmt.Errorf("container %s: %w", c.GetName(), err)
+		if errors.Is(err, ErrImageArgvEscapes) {
+			// The escape's error prints the resolved host path and the rootfs;
+			// the client reads the program as the pod's image or command wrote it.
+			err = withClientMessage(fmt.Sprintf("%q resolves outside the image's root filesystem", run.Argv[0]), err)
+		}
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
 	}
 	argv := append([]string{}, run.Argv...)
 	argv[0] = bin
