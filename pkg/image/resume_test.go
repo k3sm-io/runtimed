@@ -584,6 +584,58 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		}
 	})
 
+	t.Run("clone-stage refusal replays into CommitBlob", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		c.arm(1, 0, false)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		var logs bytes.Buffer
+		p.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+		if _, err := pullAlways(p, c.ref); err == nil {
+			t.Fatal("first pull succeeded through a cut layer")
+		}
+		c.takeRanges()
+		// A staging dir of a mode other than 0700 is refused by
+		// openStageDir with an error that is not ErrBlobNotLocal and says
+		// nothing about the partial's bytes.
+		stage := filepath.Join(cache.Root(), localStageDir)
+		if err := os.Mkdir(stage, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(stage, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := pullAlways(p, c.ref)
+		if err != nil {
+			t.Fatalf("resumed pull over a refused staging dir: %v", err)
+		}
+		res.Lease.Release()
+		if got := c.takeRanges(); len(got) == 0 {
+			t.Fatal("resumed pull sent no Range header: the layer was fetched whole, not resumed")
+		}
+		verifyLayer(t, cache, c)
+		layerBytesEqual(t, cache, c)
+		if _, err := os.Lstat(partialPath(dir, c.layer)); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("partial survived its replayed commit: %v", err)
+		}
+		if names := stageEntries(t, cache); len(names) != 0 {
+			t.Fatalf("refused staging dir holds %q, want it empty", names)
+		}
+		out := logs.String()
+		const line = "layer partial not committed by clone; replaying it"
+		if n := strings.Count(out, line); n != 1 ||
+			!strings.Contains(out, "level=ERROR msg=\""+line+"\"") ||
+			!strings.Contains(out, "possibleTampering=true") {
+			t.Fatalf("clone-stage refusal must be logged once at Error with possibleTampering (%d lines):\n%s", n, out)
+		}
+	})
+
 	t.Run("tampered tail is refused and leaves nothing", func(t *testing.T) {
 		c := newCutRegistry(t, cutAt)
 		c.arm(1, 0, false)
@@ -593,6 +645,8 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		}
 		dir := filepath.Join(t.TempDir(), "partials")
 		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		var logs bytes.Buffer
+		p.log = slog.New(slog.NewTextHandler(&logs, nil))
 
 		if _, err := pullAlways(p, c.ref); err == nil {
 			t.Fatal("first pull succeeded through a cut layer")
@@ -620,6 +674,11 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		}
 		if got := c.takeRanges(); len(got) != 0 {
 			t.Fatalf("pull over a complete partial fetched the layer: Range headers %q", got)
+		}
+		// The clone's digest verdict is final: it is not replayed into
+		// CommitBlob as a clone-stage refusal would be.
+		if out := logs.String(); strings.Contains(out, "not committed by clone") {
+			t.Fatalf("a digest mismatch from the clone was treated as a clone-stage refusal:\n%s", out)
 		}
 		if cache.Has(c.layer.String()) {
 			t.Fatal("a layer that failed its digest check is in the cache")

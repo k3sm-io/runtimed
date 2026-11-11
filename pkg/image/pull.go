@@ -1178,8 +1178,10 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 // read-only LocalBlobSource: it is cloned into the cache's staging dir, the
 // clone is re-hashed against digest and renamed into place only on a match,
 // so the blob is not written a second time. When it cannot be cloned there
-// (another volume, no clone support: ErrBlobNotLocal) the partial is replayed
-// into CommitBlob instead, which re-hashes all of it. Either way a mismatch or
+// (another volume, no clone support: ErrBlobNotLocal), or the clone path
+// refuses for any reason that is not a verdict on the bytes (logged at Error,
+// since a staging dir of the wrong mode or owner may be tampering), the
+// partial is replayed into CommitBlob instead, which re-hashes all of it. Either way a mismatch or
 // an overrun condemns the partial and Resume removes it, so the next pull
 // starts from byte 0. Nothing about the hash is carried from one attempt to
 // the next.
@@ -1227,11 +1229,24 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		CommitFile: func(f *os.File) error {
 			reached = true
 			w, err := p.cache.CommitFromLocal(digest, size, &partialBlob{digest: digest, f: f})
-			if errors.Is(err, ErrBlobNotLocal) {
+			switch {
+			case err == nil:
+				wrote = w
+				return nil
+			case errors.Is(err, ErrBlobNotLocal):
+				return fmt.Errorf("%w: %w", registryfetch.ErrCommitFileUnsupported, err)
+			case errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrBlobTooLarge):
+				// A verdict on the bytes: Poisoned condemns the partial.
+				return err
+			default:
+				// A refusal of the clone path itself (a staging dir of the
+				// wrong mode, owner or ACL, a mkdir, stat, scrub, chmod or
+				// sync failure) says nothing about the partial, and would
+				// repeat on every pull; CommitBlob re-hashes the replay.
+				p.logger().Error("layer partial not committed by clone; replaying it",
+					"digest", digest, "error", err, "possibleTampering", true)
 				return fmt.Errorf("%w: %w", registryfetch.ErrCommitFileUnsupported, err)
 			}
-			wrote = w
-			return err
 		},
 		Commit: func(replay func(io.Writer) error) error {
 			reached = true
