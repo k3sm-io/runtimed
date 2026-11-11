@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -438,10 +439,17 @@ func TestPullResumesFallsBackOnPartialStoreEnv(t *testing.T) {
 		}
 		dir := filepath.Join(t.TempDir(), "missing", "partials")
 		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		var logs bytes.Buffer
+		p.log = slog.New(slog.NewTextHandler(&logs, nil))
 
 		res, err := pullAlways(p, c.ref)
 		if err != nil {
 			t.Fatalf("pull over a partial dir with no parent: %v", err)
+		}
+		if out := logs.String(); !strings.Contains(out, "level=WARN") ||
+			!strings.Contains(out, "partial store unusable") ||
+			strings.Contains(out, "possibleTampering") || strings.Contains(out, "level=ERROR") {
+			t.Fatalf("missing parent must log at Warn without the tampering field:\n%s", out)
 		}
 		res.Lease.Release()
 		verifyLayer(t, cache, c)
@@ -462,10 +470,16 @@ func TestPullResumesFallsBackOnPartialStoreEnv(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := resumePuller(t, c, cache, store)
+		var logs bytes.Buffer
+		p.log = slog.New(slog.NewTextHandler(&logs, nil))
 
 		res, err := pullAlways(p, c.ref)
 		if err != nil {
 			t.Fatalf("pull over a partial path that is a directory: %v", err)
+		}
+		if out := logs.String(); !strings.Contains(out, "level=ERROR") ||
+			!strings.Contains(out, "possibleTampering=true") {
+			t.Fatalf("a directory where the partial belongs must log at Error with possibleTampering:\n%s", out)
 		}
 		res.Lease.Release()
 		verifyLayer(t, cache, c)
