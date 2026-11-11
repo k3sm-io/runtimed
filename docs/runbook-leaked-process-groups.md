@@ -51,7 +51,11 @@ It keeps the record and warns instead.
   processes keep running exactly as they were.
 - **Did not remove anything.** Whatever the surviving descendant(s) hold —
   memory, open ports, `lo0` bindings — stays held until someone acts.
-- **Refuses `CreatePod` for that pod id** (`ErrPodGroupStillAlive`) with an error that names the process group and its record directory, and if `ps -g <pgid>` prints nothing for that group, remove the record directory named in the error. Otherwise follow the triage below.
+- **Refuses `CreatePod` for that pod id** with the error "a recorded process
+  group of the pod is still alive". The error names the process group and its
+  record directory. The same refusal appears while a delete of that pod is
+  still finishing, after a delete left survivors, and when the pod's records
+  cannot be read. See "If a create is refused" below.
 
 ## Triage
 
@@ -111,6 +115,18 @@ refuses to guess. Cross-check by hand:
 
 If any of these disagree with "this is the pod's own leftover work," treat it
 as pgid reuse and use recovery branch (b).
+
+## If a create is refused
+
+Run `sudo ps -g <pgid>` with the group id from the error.
+
+- If it prints members, follow the triage above.
+- If it prints nothing, retry the create. A delete in flight clears by itself.
+- If the create is still refused and the group is empty, remove the record
+  directory named in the error.
+
+Never remove a record while the group has members. See "What NOT to do" below
+for why.
 
 ## Recovery
 
