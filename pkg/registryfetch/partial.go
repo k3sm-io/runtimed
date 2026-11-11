@@ -324,7 +324,7 @@ func (s *PartialStore) EnsureDir() error {
 // O_NONBLOCK the open of whatever is there returns at once, fstat on the
 // descriptor judges what was actually opened, and O_NONBLOCK is cleared again
 // before a regular file is handed on. O_NOCTTY keeps a planted terminal from
-// becoming the controlling one; a directory fails the O_RDWR open with EISDIR.
+// becoming the controlling one; a directory fails the O_RDWR open with EISDIR, a symlink with ELOOP.
 func openPartial(path string) (*os.File, error) {
 	var fd int
 	var err error
@@ -334,8 +334,11 @@ func openPartial(path string) (*os.File, error) {
 			break
 		}
 	}
-	if errors.Is(err, unix.EISDIR) {
-		return nil, fmt.Errorf("open %s: %w", path, ErrPartialFile)
+	// EISDIR: a directory. ELOOP: a symlink O_NOFOLLOW refused. ENXIO: a FIFO
+	// with no reader or a device that cannot be opened. The errno stays in
+	// the chain beside ErrPartialFile.
+	if errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENXIO) {
+		return nil, fmt.Errorf("open %s: %w: %w", path, ErrPartialFile, err)
 	}
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
