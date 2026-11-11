@@ -140,8 +140,12 @@ limitations under the License.
 // parent's descriptor, a link where the tree needs a directory is followed only
 // while it resolves inside the root (os.Root), so images composed into one pod
 // rootfs still compose, and a link that would leave the root, or a link where
-// the tree lands a regular file, fails with ErrDestinationLink. The destination
-// directory itself is the caller's anchor and is opened by path. The vm spine's
+// the tree lands a regular file, fails with ErrDestinationLink. A destination
+// directory link with an absolute target is refused and never reinterpreted
+// relative to the destination root; a link resolving inside the root is
+// followed. The in-root resolution re-walks the relative path from the root, so
+// a writer that swaps an ancestor during the walk can misplace an entry inside
+// the destination but never outside it. The destination directory itself is the caller's anchor and is opened by path. The vm spine's
 // one call (pkg/runtime/vmcontainers.go resolveVMContainer) passes the per-pod
 // Cache.PodRootfs directory (<root>/pods/<podID>/rootfs, derived from a parsed
 // PodID).

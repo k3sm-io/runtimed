@@ -119,7 +119,13 @@ type destDir struct {
 // would leave dstDir (an absolute target, a .. climb out, a chain stepping
 // out), or resolves to a non-directory, fails with ErrDestinationLink, so a link
 // a pod planted in its own rootfs cannot redirect a later re-materialize out of
-// it. A non-directory where the tree needs a directory, or a symlink where the
+// it. A destination directory link with an absolute target is refused and is
+// never reinterpreted relative to dstDir, even when it spells a path inside it;
+// a link resolving inside dstDir is followed, and one that dangles or cannot be
+// opened fails with ErrDestinationLink. The in-root resolution re-walks the
+// relative path from dstDir, so a writer that swaps an ancestor during the walk
+// can misplace an entry inside dstDir but never outside it.
+// A non-directory where the tree needs a directory, or a symlink where the
 // tree lands a regular file, fails with ErrDestinationLink too. Idempotence is decided by lstat: an existing regular file
 // (or any other non-link entry) where the tree lands a file is kept, and any
 // existing entry where the tree lands a symlink is kept.
