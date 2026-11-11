@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -537,6 +538,11 @@ type Puller struct {
 	// pull resumes with a Range request (WithPartialStore). Nil — the default —
 	// fetches every layer from byte 0.
 	partials *registryfetch.PartialStore
+
+	// layerStallWindow is how long a layer body may deliver no byte before its
+	// fetch is aborted with ErrLayerBodyStalled (stallread.go). Zero means
+	// defaultLayerStallWindow; tests set it directly.
+	layerStallWindow time.Duration
 }
 
 // primaryBlobSource yields the direct blob route for ref on the primary path
@@ -967,8 +973,9 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 			if oerr != nil {
 				return oerr
 			}
-			defer rc.Close()
-			_, cerr := io.Copy(w, rc)
+			body := newStallReader(rc, p.stallWindow())
+			defer body.Close()
+			_, cerr := io.Copy(w, body)
 			return cerr
 		}
 		var wrote bool
@@ -1386,6 +1393,15 @@ func transferBlob(ctx context.Context, src BlobSource, digest string, size int64
 		return fmt.Errorf("fetch blob %s: body ended at %d of %d: %w", digest, have+n, size, io.ErrUnexpectedEOF)
 	}
 	return nil
+}
+
+// stallWindow is the layer-body progress window: layerStallWindow, or
+// defaultLayerStallWindow when unset.
+func (p *Puller) stallWindow() time.Duration {
+	if p.layerStallWindow > 0 {
+		return p.layerStallWindow
+	}
+	return defaultLayerStallWindow
 }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
