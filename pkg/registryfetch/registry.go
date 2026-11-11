@@ -39,6 +39,9 @@ var (
 	// (a Content-Range other than offset to the end of the blob), or an
 	// offset outside the blob's size.
 	ErrBlobRange = errors.New("registryfetch: blob range is not the one asked for")
+	// ErrBlobOverrun reports a blob body longer than the size it was opened
+	// for; it is returned by the body's Read.
+	ErrBlobOverrun = errors.New("registryfetch: blob body is longer than its size")
 )
 
 // ReferenceError is the error for a reference that does not parse. It
@@ -121,6 +124,12 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 // parseContentRange); a 416 is retried once without a Range, and that retry
 // must be a 200 or a 206 of the whole object from 0. start is the offset the
 // body begins at.
+//
+// The body yields at most size-start bytes: a Read that would go past them
+// returns the bytes up to the size and an error matching ErrBlobOverrun, never
+// a silent cut. Each request sends Accept-Encoding: identity, so the bytes
+// counted are the stored blob's, not a transfer coding's; the caller's
+// Transport is not modified.
 func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, digest string, size, offset int64) (body io.ReadCloser, start int64, err error) {
 	if size < 0 || offset < 0 || offset > size {
 		return nil, 0, fmt.Errorf("blob %s: offset %d of size %d: %w", quoteBounded(digest, 128), offset, size, ErrBlobRange)
@@ -139,6 +148,7 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 		if from > 0 {
 			req.Header.Set("Range", "bytes="+strconv.FormatInt(from, 10)+"-")
 		}
+		req.Header.Set("Accept-Encoding", "identity")
 		return client.Do(req)
 	}
 	resp, err := get(offset)
@@ -154,7 +164,7 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return resp.Body, 0, nil
+		return ceiling(resp.Body, digest, size, 0), 0, nil
 	case http.StatusPartialContent:
 		crs := resp.Header.Values("Content-Range")
 		var cr string
@@ -167,7 +177,7 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 			return nil, 0, fmt.Errorf("blob %s: Content-Range %s is not bytes %d-%d/%d: %w",
 				digest, quoteBounded(strings.Join(crs, ", "), 128), offset, size-1, size, ErrBlobRange)
 		}
-		return resp.Body, first, nil
+		return ceiling(resp.Body, digest, size, first), first, nil
 	}
 	defer resp.Body.Close()
 	if err := transport.CheckError(resp, http.StatusOK, http.StatusPartialContent); err != nil {
@@ -175,6 +185,43 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 	}
 	return nil, 0, fmt.Errorf("blob %s: status %d", digest, resp.StatusCode)
 }
+
+// ceilingBody is a blob body that may yield left more bytes; one more is
+// ErrBlobOverrun from Read.
+type ceilingBody struct {
+	rc     io.ReadCloser
+	digest string
+	size   int64
+	left   int64
+	err    error // sticky overrun
+}
+
+func ceiling(rc io.ReadCloser, digest string, size, start int64) *ceilingBody {
+	return &ceilingBody{rc: rc, digest: digest, size: size, left: size - start}
+}
+
+// Read reads at most left+1 bytes, so a body of exactly left bytes ends with
+// the source's own EOF and one byte past it is seen as an overrun.
+func (c *ceilingBody) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	if c.left < int64(len(p)) {
+		p = p[:c.left+1]
+	}
+	n, err := c.rc.Read(p)
+	if int64(n) > c.left {
+		n = int(c.left)
+		c.left = 0
+		c.err = fmt.Errorf("blob %s: body longer than %d bytes: %w", c.digest, c.size, ErrBlobOverrun)
+		return n, c.err
+	}
+	c.left -= int64(n)
+	return n, err
+}
+
+// Close closes the response body.
+func (c *ceilingBody) Close() error { return c.rc.Close() }
 
 // parseContentRange parses exactly "bytes <first>-<last>/<total>": the
 // lowercase unit, one space, and three ASCII decimals with no sign and no

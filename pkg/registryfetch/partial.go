@@ -399,9 +399,10 @@ type Fill struct {
 	Poisoned func(error) bool
 }
 
-// Resume brings one blob through its partial: ensure Dir, open the partial
-// (O_NOFOLLOW, a regular file only; see openPartial), restart an overlong one, let Transfer complete a short one
-// from its current length, then hand the whole file to Commit. A poisoned
+// Resume brings one blob through its partial: Admit(Digest, Size), ensure
+// Dir, open the partial (O_NOFOLLOW, a regular file only; see openPartial),
+// restart an overlong one, let Transfer complete a short one from its current
+// length, then hand the whole file to Commit. A poisoned
 // partial is removed so it is never resumed; a committed one is removed.
 //
 // After a Transfer that returns nil the file must be exactly Size bytes, else
@@ -409,9 +410,16 @@ type Fill struct {
 // kept as it is for the next Resume; a long one is truncated to Size, so the
 // store never holds more than Size bytes for the digest (its prefix is then
 // re-hashed, and refused, by the next Commit).
+//
+// Admit runs first, before Dir is created or the partial opened, and its
+// refusal is returned with the store as it was: nothing created, truncated
+// or removed, and no Transfer.
 func (s *PartialStore) Resume(fl Fill) error {
 	if !sha256Digest.MatchString(fl.Digest) {
 		return fmt.Errorf("partial %s: %w", quoteBounded(fl.Digest, 128), ErrInvalidDigest)
+	}
+	if err := s.Admit(fl.Digest, fl.Size); err != nil {
+		return err
 	}
 	if err := s.EnsureDir(); err != nil {
 		return err

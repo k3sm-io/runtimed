@@ -26,9 +26,12 @@ limitations under the License.
 // "bytes <offset>-<size-1>/<size>" in canonical ASCII decimals (no sign, no
 // leading zero, no "*"); anything else matches ErrBlobRange. A 416 is retried
 // once without a Range, and that retry must be a 200 or a 206 of the whole
-// blob from 0. Registry.Session is the
-// authenticated, pull-scoped client the GET runs on, exported so a caller can
-// issue its own bounded reads (a manifest) over the same transport.
+// blob from 0. The returned body yields at most the rest of the size: a byte
+// past it is an error from Read matching ErrBlobOverrun, and every request
+// sends Accept-Encoding: identity so the bytes counted are the blob's own.
+// Registry.Session is the authenticated, pull-scoped client the GET runs on,
+// exported so a caller can issue its own bounded reads (a manifest) over the
+// same transport.
 //
 // # Partial store
 //
@@ -60,7 +63,8 @@ limitations under the License.
 // gives one writer per digest within a store, without blocking; its refusal
 // says whether the digest is held (ErrPartialClaimed, retryable) or malformed
 // (ErrInvalidDigest, never retryable). Admit checks MaxBytes over the regular
-// files in the directory before a partial grows (ErrPartialBudget); it fails
+// files in the directory before a partial grows (ErrPartialBudget), and
+// Resume runs it for the blob's size before touching the store; it fails
 // closed on a negative or over-cap size and sums without overflow. A zero
 // MaxBytes means no cap; a negative one is refused (ErrPartialCap). Sweep
 // removes old, unclaimed partials, matching only the store's own file-name
