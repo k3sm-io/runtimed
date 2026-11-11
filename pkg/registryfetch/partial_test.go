@@ -667,13 +667,14 @@ func TestEnsureDirRequiresOwner(t *testing.T) {
 	}
 }
 
-// TestResumeRefusesNonRegularPartial: a FIFO or a directory in the partial's
+// TestResumeRefusesNonRegularPartial: a FIFO, a directory or a symlink in the partial's
 // place is refused, and promptly: opening a FIFO must not wait for a peer.
 func TestResumeRefusesNonRegularPartial(t *testing.T) {
 	_, digest := blobData(100)
 	for name, plant := range map[string]func(path string) error{
 		"fifo":      func(p string) error { return unix.Mkfifo(p, 0o600) },
 		"directory": func(p string) error { return os.Mkdir(p, 0o700) },
+		"symlink":   func(p string) error { return os.Symlink(filepath.Join(filepath.Dir(p), "elsewhere"), p) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := &PartialStore{Dir: filepath.Join(t.TempDir(), "partial")}
@@ -696,6 +697,9 @@ func TestResumeRefusesNonRegularPartial(t *testing.T) {
 			case err := <-done:
 				if !errors.Is(err, ErrPartialFile) {
 					t.Fatalf("err = %v, want ErrPartialFile", err)
+				}
+				if name != "fifo" && !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.ELOOP) {
+					t.Fatalf("err = %v, lost the underlying errno", err)
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("Resume blocked on a non-regular partial")
