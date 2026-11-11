@@ -282,6 +282,18 @@ func vmExtraRootfsImage(ordered []vmContainer) (string, bool) {
 	return "", false
 }
 
+// materializeStartError is the start failure for vm container name whose image
+// ref could not be materialized into the pod's rootfs; err names the rootfs
+// and the store's paths. A path collision is the one cause a client can act on,
+// so its sentence carries the collision's own text (the image's case-only pair
+// and the remedy, never the probe error); any other cause is a fixed sentence.
+func materializeStartError(name, ref string, err error) error {
+	if msg, ok := image.PathCollisionMessage(err); ok {
+		return withClientMessage(fmt.Sprintf("container %s: image %q could not be unpacked: %s; the daemon log has the full error", name, ref, msg), err)
+	}
+	return withClientMessage(fmt.Sprintf("container %s: image %q could not be materialized; the daemon log has the cause", name, ref), err)
+}
+
 // resolveVMContainer resolves one container: pull, read the image config, merge
 // it with the pod spec, and map the result onto the guest carrier — plus the
 // host-side record of what the image step did (vmImagePull).
@@ -393,7 +405,7 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		}
 		mat, merr := r.unpacker.MaterializeTree(ctx, res.Manifest, policy, rootfsDest)
 		if merr != nil {
-			return rootfsFailed(fmt.Errorf("materialize image %q into %s: %w", ref, rootfsDest, merr))
+			return rootfsFailed(materializeStartError(name, ref, fmt.Errorf("materialize image %q into %s: %w", ref, rootfsDest, merr)))
 		}
 		r.log.Debug("materialized vm pod rootfs",
 			"pod", box.GetPodId(), "container", name, "image", ref, "rootfs", rootfsDest,

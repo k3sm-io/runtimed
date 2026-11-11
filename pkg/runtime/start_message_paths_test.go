@@ -41,6 +41,17 @@ func (configFailWorld) ImageRunConfig(*runtimev1.ImageManifest) (image.ImageRunC
 	return image.ImageRunConfig{}, configReadErr
 }
 
+// materializeFailWorld is an imageWorld whose pulls succeed but whose
+// rootfs materialization fails with an error naming a host store path.
+type materializeFailWorld struct{ *imageWorld }
+
+// materializeDetail marks the store path a failed materialization names.
+const materializeDetail = "MATERIALIZE-DETAIL"
+
+func (materializeFailWorld) MaterializeTree(context.Context, *runtimev1.ImageManifest, image.UnpackPolicy, string) (*image.MaterializeResult, error) {
+	return nil, &fs.PathError{Op: "mkdir", Path: "/var/k3sm/snapshots/" + materializeDetail, Err: fs.ErrPermission}
+}
+
 // consoleDetail marks the console log path a failed vm boot names.
 const consoleDetail = "CONSOLE-DETAIL"
 
@@ -89,6 +100,16 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			sentence: "could not be read; the daemon log has the cause",
 			marker:   configDetail,
 			wants:    func(env) []string { return []string{"read image config for", fs.ErrPermission.Error()} },
+		},
+		{
+			name:     "materialize",
+			world:    func(w *imageWorld) Unpacker { return materializeFailWorld{w} },
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "could not be materialized; the daemon log has the cause",
+			marker:   materializeDetail,
+			wants: func(e env) []string {
+				return []string{"materialize image", filepath.Join(e.podDir, "rootfs"), fs.ErrPermission.Error()}
+			},
 		},
 		{
 			// A directory where the pod's image record belongs: the record of
@@ -217,7 +238,7 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			}
 			assertNoHostPaths(t, "CreatePod error", msg, prefix, subject, tc.sentence,
 				rt.cfg.Root, rt.cache.Root(), e.podDir, "/var/k3sm", "PULL-DETAIL", configDetail,
-				consoleDetail)
+				consoleDetail, materializeDetail)
 			if plain, err := strconv.Unquote(msg); err != nil || !strings.HasPrefix(plain, prefix) {
 				t.Errorf("CreatePod error %s does not start with %q (unquote: %v)", msg, prefix, err)
 			}

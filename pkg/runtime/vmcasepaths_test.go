@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,6 +133,7 @@ type caseRig struct {
 	vmb    *fakeVMBackend
 	cache  *image.Cache
 	cloner *countingCloner
+	logs   *lockedBuffer
 }
 
 // newCaseRig builds a caseRig. A nil probe leaves the real measurement in place.
@@ -162,7 +164,9 @@ func newCaseRig(t *testing.T, probe image.CaseProbe) *caseRig {
 	vmb := &fakeVMBackend{available: true, bootOK: true}
 	cfg, deps := vmPodConfig(t, Deps{VMBackend: vmb, Puller: puller, Unpacker: unpacker})
 	cfg.Root, deps.Cache = root, cache
-	return &caseRig{rt: newTestRuntimeCfg(t, cfg, deps), vmb: vmb, cache: cache, cloner: cloner}
+	logs := &lockedBuffer{}
+	cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return &caseRig{rt: newTestRuntimeCfg(t, cfg, deps), vmb: vmb, cache: cache, cloner: cloner, logs: logs}
 }
 
 // create drives the real CreatePod for a one-container vm pod running ref.
@@ -219,8 +223,9 @@ func (r *caseRig) ownershipPaths(t *testing.T) map[string]bool {
 	return paths
 }
 
-// assertRefusal checks a refusal is ROOTFS_SETUP and names
-// every fragment in want, and that the guest was never asked for.
+// assertRefusal checks a refusal is ROOTFS_SETUP, names every fragment in want
+// in the collision's client sentence and no host path, and that the guest was
+// never asked for.
 func (r *caseRig) assertRefusal(t *testing.T, resp *runtimev1.CreatePodResponse, want ...string) {
 	t.Helper()
 	msg := resp.GetError().GetMessage()
@@ -230,9 +235,14 @@ func (r *caseRig) assertRefusal(t *testing.T, resp *runtimev1.CreatePodResponse,
 	if got := resp.GetFailureReason(); got != runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP {
 		t.Errorf("failure reason = %v, want ROOTFS_SETUP", got)
 	}
-	for _, s := range want {
+	for _, s := range append(want, `container probe: image`, "could not be unpacked: image: linux layer paths collide: ", "; the daemon log has the full error") {
 		if !strings.Contains(msg, s) {
 			t.Errorf("refusal does not name %q:\n%s", s, msg)
+		}
+	}
+	for _, leak := range []string{r.rt.cfg.Root, r.cache.Root(), "/pods/"} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("refusal carries host path %q:\n%s", leak, msg)
 		}
 	}
 	if n, _ := r.vmb.created(); n != 0 {
@@ -322,7 +332,12 @@ func TestVMImageWithCaseOnlyPathsMaterializes(t *testing.T) {
 
 	t.Run("a store that cannot be measured refuses and says so", func(t *testing.T) {
 		rig := newCaseRig(t, func(*os.Root) (bool, error) { return false, errors.New("probe boom") })
-		rig.assertRefusal(t, rig.create(t, pairRef), casePathManUpper, casePathManLower, remedy, "probe boom")
+		resp := rig.create(t, pairRef)
+		rig.assertRefusal(t, resp, casePathManUpper, casePathManLower, remedy, "could not be measured")
+		if msg := resp.GetError().GetMessage(); strings.Contains(msg, "probe boom") {
+			t.Errorf("refusal carries the probe error:\n%s", msg)
+		}
+		assertLoggedOnceAt(t, rig.logs.String(), "level=ERROR", "materialize image", []string{"probe boom", rig.podRootfs(t)})
 	})
 
 	t.Run("a case-insensitive pod rootfs refuses a pair the store holds", func(t *testing.T) {

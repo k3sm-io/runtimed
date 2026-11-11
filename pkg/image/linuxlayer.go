@@ -94,16 +94,44 @@ var ErrPathCollision = errors.New("image: linux layer paths collide")
 func collisionError(prev, name string, probeErr error) error {
 	a, b := quoteBounded(prev, maxLayerEntryNameLen), quoteBounded(name, maxLayerEntryNameLen)
 	if norm.NFC.String(prev) == norm.NFC.String(name) {
-		return fmt.Errorf("%w: %s and %s differ only by Unicode normalization, which APFS merges on every volume; rebuild the image without one of them",
+		err := fmt.Errorf("%w: %s and %s differ only by Unicode normalization, which APFS merges on every volume; rebuild the image without one of them",
 			ErrPathCollision, a, b)
+		return &pathCollisionError{err: err, client: err.Error()}
 	}
 	const remedy = "put this node's k3sm data root on a case-sensitive APFS volume with `sudo k3sm install --data-volume`, or use an image without the pair"
 	if probeErr != nil {
-		return fmt.Errorf("%w: %s and %s differ only by case, and this node's filesystem could not be measured (%v), so it is treated as merging them into one file; %s",
-			ErrPathCollision, a, b, boundErr(probeErr), remedy)
+		return &pathCollisionError{
+			err: fmt.Errorf("%w: %s and %s differ only by case, and this node's filesystem could not be measured (%v), so it is treated as merging them into one file; %s",
+				ErrPathCollision, a, b, boundErr(probeErr), remedy),
+			client: fmt.Sprintf("%v: %s and %s differ only by case, and this node's filesystem could not be measured, so it is treated as merging them into one file; %s",
+				ErrPathCollision, a, b, remedy),
+		}
 	}
-	return fmt.Errorf("%w: %s and %s differ only by case, and this node's case-insensitive filesystem would merge them into one file; %s",
+	err := fmt.Errorf("%w: %s and %s differ only by case, and this node's case-insensitive filesystem would merge them into one file; %s",
 		ErrPathCollision, a, b, remedy)
+	return &pathCollisionError{err: err, client: err.Error()}
+}
+
+// pathCollisionError is a collisionError refusal: err is the full error, and
+// client is the same sentence without the probe error, whose text can name a
+// host path. Both name only image-relative paths and the remedy.
+type pathCollisionError struct {
+	err    error
+	client string
+}
+
+func (e *pathCollisionError) Error() string { return e.err.Error() }
+func (e *pathCollisionError) Unwrap() error { return e.err }
+
+// PathCollisionMessage returns the client-safe text of the path collision err
+// wraps, and whether it wraps one: the image's colliding pair and the remedy,
+// without any measurement error or host path the full error carries.
+func PathCollisionMessage(err error) (string, bool) {
+	var pc *pathCollisionError
+	if errors.As(err, &pc) {
+		return pc.client, true
+	}
+	return "", false
 }
 
 // firstCasePair returns the first two entries whose paths a case-insensitive

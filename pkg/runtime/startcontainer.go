@@ -22,6 +22,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 
+	"k3sm.io/runtimed/pkg/image"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -311,17 +313,25 @@ func initContainerIndex(box *runtimev1.PodBox, name string) int {
 
 // startErrorReply renders a startContainer error for an RPC reply a client
 // reads. A failure carrying a fixed client sentence (clientMessageError)
-// publishes the same bounded sentence its Waiting message does, because its
-// error names the cache root, the rootfs, the sign staging directory or a
-// tool's output; the daemon's log line carries that error once. Every other
-// error keeps its full text.
+// publishes the sentence its Waiting message does, because its error names the
+// cache root, the rootfs, the sign staging directory or a tool's output; the
+// daemon's log line carries that error once. Every other error keeps its full
+// text.
+//
+// The reply is quoted the same way but bounded at maxReplyMessageBytes, not at
+// the Waiting message's limit: a vm image's path collision sentence carries the
+// colliding pair and the remedy, which together outgrow 256 bytes, and the
+// remedy is the part the operator acts on.
 func startErrorReply(err error) string {
 	var ge *clientMessageError
 	if errors.As(err, &ge) {
-		return boundedFailureMessage(err)
+		return image.QuoteBounded(ge.message, maxReplyMessageBytes)
 	}
 	return err.Error()
 }
+
+// maxReplyMessageBytes bounds a fixed client sentence in an RPC reply.
+const maxReplyMessageBytes = 1024
 
 // startFailure builds a StartContainerResponse carrying a structured failure.
 func startFailure(code codes.Code, reason runtimev1.FailureReason, format string, args ...any) *runtimev1.StartContainerResponse {
