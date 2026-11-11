@@ -234,12 +234,15 @@ func TestGateSignatureSignTimeout(t *testing.T) {
 
 // fakeCodesign is a stand-in codesign put first, and alone, on PATH, so no test
 // using it can reach the real tool. A check (--verify, -dv) answers "unsigned"
-// at once; a sign writes codesign's own temp beside its target, as the real
-// tool does before its rename, and then hangs until it is killed.
+// at once; a sign appends a marker to its target (the staged copy), so a staged
+// copy leaking into place would change the original's bytes, then writes
+// codesign's own temp beside it, as the real tool does before its rename, and
+// hangs until it is killed.
 const fakeCodesign = `#!/bin/sh
 case "$1" in
 -s)
 	for a; do last=$a; done
+	printf +signed >> "$last"
 	printf partial > "$last.cstemp"
 	exec /bin/sleep 30
 	;;
@@ -265,10 +268,14 @@ func stubCodesignPath(t *testing.T) {
 // by cancelling the caller's context. Either way the gate fails (the deadline as
 // the retryable timeout sentinel, the cancel as a cancellation), the staging
 // directory holds no staged copy and no codesign temp, and the binary is
-// byte-identical and still the same inode at its name.
+// byte-identical and still the same inode at its name. Both cases first see the
+// fake codesign's temp, so the sign is proven under way before it is ended.
 func TestGateSignatureHungSignLeavesNoStagedFile(t *testing.T) {
-	const signTimeout = 400 * time.Millisecond
-	const slack = 3 * time.Second
+	// The sign deadline leaves the fake codesign's shell time to start.
+	const signTimeout = 2 * time.Second
+	const longTimeout = 10 * time.Second
+	// Half the long deadline: a sign bounded by it fails the elapsed bound.
+	const bound = longTimeout / 2
 	cases := []struct {
 		name   string
 		cancel bool
@@ -280,9 +287,9 @@ func TestGateSignatureHungSignLeavesNoStagedFile(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.cancel {
-				shortenSignatureTimeouts(t, 10*time.Second, 10*time.Second)
+				shortenSignatureTimeouts(t, longTimeout, longTimeout)
 			} else {
-				shortenSignatureTimeouts(t, 10*time.Second, signTimeout)
+				shortenSignatureTimeouts(t, longTimeout, signTimeout)
 			}
 			stubCodesignPath(t)
 			base := t.TempDir() // rootfs and staging share a volume, as under Root
@@ -301,25 +308,47 @@ func TestGateSignatureHungSignLeavesNoStagedFile(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			if tc.cancel {
-				// Cancel once codesign has written its temp: the sign is under way.
-				go func() {
-					for ctx.Err() == nil {
-						if m, _ := filepath.Glob(filepath.Join(staging, "*.cstemp")); len(m) > 0 {
+			// Watch for codesign's temp: once it exists the sign is under way.
+			// In the cancel case that is when the caller cancels.
+			var sawTemp atomic.Bool
+			var cancelledAt atomic.Int64 // UnixNano of the cancel, 0 if none
+			stop := make(chan struct{})
+			watched := make(chan struct{})
+			go func() {
+				defer close(watched)
+				for {
+					if m, _ := filepath.Glob(filepath.Join(staging, "*.cstemp")); len(m) > 0 {
+						sawTemp.Store(true)
+						if tc.cancel {
+							cancelledAt.Store(time.Now().UnixNano())
 							cancel()
-							return
 						}
-						time.Sleep(5 * time.Millisecond)
+						return
 					}
-				}()
-			}
+					select {
+					case <-stop:
+						return
+					case <-time.After(5 * time.Millisecond):
+					}
+				}
+			}()
 			start := time.Now()
 			err := rt.gateSignature(ctx, runtimev1.SignaturePolicy_SIGNATURE_POLICY_ADHOC_OK, rootfs, target, false)
+			end := time.Now()
+			close(stop)
+			<-watched
+			if !sawTemp.Load() {
+				t.Fatalf("the fake codesign did not start in time: no codesign temp seen before the gate returned (err = %v)", err)
+			}
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("gateSignature err = %v, want %v", err, tc.want)
 			}
-			if elapsed := time.Since(start); elapsed > signTimeout+slack {
-				t.Errorf("gate returned after %s, want within %s", elapsed, signTimeout+slack)
+			from := start
+			if tc.cancel {
+				from = time.Unix(0, cancelledAt.Load())
+			}
+			if elapsed := end.Sub(from); elapsed > bound {
+				t.Errorf("gate returned %s after the deadline clock started, want within %s", elapsed, bound)
 			}
 			ents, err := os.ReadDir(staging)
 			if err != nil {

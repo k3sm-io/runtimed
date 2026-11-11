@@ -29,15 +29,23 @@ import (
 // deadline is far longer), and that error must read as an abort, never as an
 // "unsigned" or passing verdict.
 func TestToolAbortedParentDeadline(t *testing.T) {
-	stubTools(t, sleeper)
+	stub, marker := markedSleeper(t)
+	rec := stubTools(t, stub)
 
-	parent, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// Long enough for the stub's own process to start before the parent ends.
+	parent, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	start := time.Now()
 	err := runTool(parent, 30*time.Second, nil, nil, "stub-tool")
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Fatalf("call took %s, want it bounded by the parent deadline", elapsed)
+	}
+	if got := rec.names(); len(got) != 1 || got[0] != "stub-tool" {
+		t.Fatalf("tool invocations = %v, want exactly one stub-tool", got)
+	}
+	if !fileExists(marker) {
+		t.Fatal("the stubbed tool's process never started before the parent deadline")
 	}
 	if err == nil {
 		t.Fatal("runTool returned nil under an expired parent deadline")
