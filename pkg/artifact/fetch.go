@@ -21,17 +21,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"math/bits"
 	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 
-	"golang.org/x/sys/unix"
-
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // reservations is the in-process space ledger shared by concurrent pulls. mu
@@ -64,46 +60,25 @@ func (p *Puller) Reserved() uint64 {
 	return p.resv.held
 }
 
-// partialPath is where the partial of digest lives. digest has already passed
-// the sha256 pattern, so the name is a fixed, path-safe token.
-func (p *Puller) partialPath(digest string) string {
-	return filepath.Join(p.cfg.PartialDir, strings.Replace(digest, ":", "-", 1)+".partial")
+// partials is the partial store under Config.PartialDir.
+func (p *Puller) partials() *registryfetch.PartialStore {
+	return &registryfetch.PartialStore{Dir: p.cfg.PartialDir, Log: p.log}
 }
 
-// ensurePartialDir creates the partial dir (0700) when absent and refuses one
-// that is not a directory (a file, a symlink planted in its place) or is
-// writable by group or other, as the image index refuses its artifact
-// namespace: a partial dir another principal can write lets it choose the
-// bytes a resume continues from.
-func (p *Puller) ensurePartialDir() error {
-	dir := p.cfg.PartialDir
-	fi, err := os.Lstat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("create partial dir: %w", err)
-		}
-		fi, err = os.Lstat(dir)
+// partialErr maps registryfetch's partial-dir refusal to ErrPartialDir,
+// keeping the detail.
+func partialErr(err error) error {
+	var pe *registryfetch.PartialDirError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%w: %s", ErrPartialDir, pe.Detail)
 	}
-	if err != nil {
-		return fmt.Errorf("stat partial dir: %w", err)
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("%w: %s is not a directory (mode %v)", ErrPartialDir, dir, fi.Mode().Type())
-	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%w: %s is writable by group or other (mode %v)", ErrPartialDir, dir, fi.Mode().Perm())
-	}
-	return nil
+	return err
 }
 
 // partialBytes is how much of b is already in its partial file (never more
 // than b.size: an overlong partial is restarted, so it counts as nothing).
 func (p *Puller) partialBytes(b blob) int64 {
-	fi, err := os.Lstat(p.partialPath(b.digest))
-	if err != nil || !fi.Mode().IsRegular() || fi.Size() > b.size {
-		return 0
-	}
-	return fi.Size()
+	return p.partials().Bytes(b.digest, b.size)
 }
 
 // spaceNeeded is what a pull of missing may still add to the volume: the rest
@@ -272,49 +247,20 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 	}
 	defer func() { <-p.sem }()
 
-	if err := p.ensurePartialDir(); err != nil {
-		return err
-	}
-	path := p.partialPath(b.digest)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return fmt.Errorf("open partial %s: %w", b.digest, err)
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat partial %s: %w", b.digest, err)
-	}
-	have := fi.Size()
-	if have > b.size {
-		if err := f.Truncate(0); err != nil {
-			return fmt.Errorf("reset partial %s: %w", b.digest, err)
-		}
-		have = 0
-	}
-	if have < b.size {
-		if err := p.transfer(ctx, ref, cred, b, f, have); err != nil {
+	return partialErr(p.partials().Resume(registryfetch.Fill{
+		Digest: b.digest,
+		Size:   b.size,
+		Transfer: func(f *os.File, have int64) error {
+			return p.transfer(ctx, ref, cred, b, f, have)
+		},
+		Commit: func(replay func(io.Writer) error) error {
+			_, err := p.deps.Blobs.CommitBlob(b.digest, b.size, replay)
 			return err
-		}
-	}
-	_, err = p.deps.Blobs.CommitBlob(b.digest, b.size, func(w io.Writer) error {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		_, err := io.Copy(w, struct{ io.Reader }{f})
-		return err
-	})
-	if err != nil {
-		if errors.Is(err, image.ErrDigestMismatch) || errors.Is(err, image.ErrBlobTooLarge) {
-			// A poisoned partial must not survive to be resumed.
-			_ = os.Remove(path) // the commit error is the one reported
-		}
-		return fmt.Errorf("commit %s: %w", b.digest, err)
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		p.log.Warn("artifact pull: remove committed partial", "digest", b.digest, "err", err)
-	}
-	return nil
+		},
+		Poisoned: func(err error) bool {
+			return errors.Is(err, image.ErrDigestMismatch) || errors.Is(err, image.ErrBlobTooLarge)
+		},
+	}))
 }
 
 // transfer appends the rest of b to f from offset have. A failure leaves what
