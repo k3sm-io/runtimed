@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -33,6 +35,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 
 	"k3sm.io/runtimed/pkg/image"
 
@@ -100,10 +103,61 @@ func pushOSImage(t *testing.T, host, repo, osName string, entries []caseEntry) s
 	return ref.String()
 }
 
+// linkRig is the native-spine runtime plus the two fakes the assertions read:
+// the spawner (how many spawns happened) and the waiter (how many WaitExit
+// calls are still blocked).
+type linkRig struct {
+	rt     *Runtime
+	spawn  *fakeSpawner
+	waiter *trackingWaiter
+}
+
+// spawns is how many processes the fake spawner has started so far.
+func (lr linkRig) spawns() int {
+	lr.spawn.mu.Lock()
+	defer lr.spawn.mu.Unlock()
+	return len(lr.spawn.specs)
+}
+
+// trackingWaiter is blockingWaiter with a count of the WaitExit calls still
+// blocked, so a cleanup can show that no reaper outlives the rig.
+type trackingWaiter struct {
+	*blockingWaiter
+	inFlight atomic.Int64
+}
+
+func (w *trackingWaiter) WaitExit(ctx context.Context, pid int) (int, int, error) {
+	w.inFlight.Add(1)
+	defer w.inFlight.Add(-1)
+	return w.blockingWaiter.WaitExit(ctx, pid)
+}
+
+// releaseAll ends every wait not yet released, as the processes' exits would.
+// It runs only at cleanup, when no verb can race it into a double release.
+func (w *trackingWaiter) releaseAll() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, ch := range w.released {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+}
+
 // newNativeLinkRig is newCaseRig for the native spine: the real cache, puller
 // and unpacker (a fake tree cannot follow a link), a fake spawner, and the
 // restart seams of TestRestartContainerReExecs so a kill releases the waiter.
-func newNativeLinkRig(t *testing.T) *Runtime {
+//
+// Its cleanup releases every wait still blocked and closes the runtime
+// (idempotent; newTestRuntimeCfg's own Close then finds it done), then fails
+// the test if any WaitExit is still blocked: the blocking waiter's goroutines
+// must end with the test, not leak into the next. The release is needed, not
+// tidy: Close's supervision cancel does not reach the reaper of a replacement
+// a successful RestartContainer spawned, so without it that wait outlives the
+// test and Close spends its whole deadline on it.
+func newNativeLinkRig(t *testing.T) linkRig {
 	t.Helper()
 	root := t.TempDir()
 	cache, err := image.NewCache(root)
@@ -122,13 +176,41 @@ func newNativeLinkRig(t *testing.T) *Runtime {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := newBlockingWaiter()
+	w := &trackingWaiter{blockingWaiter: newBlockingWaiter()}
+	sp := &fakeSpawner{}
 	rt := newTestRuntimeCfg(t, Config{Root: root}, Deps{
-		Puller: puller, Unpacker: unpacker, Spawner: &fakeSpawner{}, Waiter: w, Cache: cache,
+		Puller: puller, Unpacker: unpacker, Spawner: sp, Waiter: w, Cache: cache,
 	})
 	rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
 	rt.signalGroup = rec.signal
-	return rt
+	t.Cleanup(func() {
+		w.releaseAll()
+		if err := rt.Close(); err != nil {
+			t.Errorf("close runtime: %v", err)
+		}
+		if n := w.inFlight.Load(); n != 0 {
+			t.Errorf("%d WaitExit call(s) still blocked after the runtime closed", n)
+		}
+	})
+	return linkRig{rt: rt, spawn: sp, waiter: w}
+}
+
+// assertRefusedByLink fails unless the verb's response names the
+// destination-link refusal: the typed reason the image-resolve path returns for
+// a materialize failure, and the sentinel's own text in the message. Any other
+// failure (a spawn error, a pull error) carries a different reason or message.
+func assertRefusedByLink(t *testing.T, verb string, st *rpcstatus.Status, reason runtimev1.FailureReason) {
+	t.Helper()
+	if st == nil {
+		t.Fatalf("%s reported success through a rootfs link", verb)
+	}
+	if reason != runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL {
+		t.Errorf("%s failure_reason = %v, want %v (a materialize refusal)",
+			verb, reason, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL)
+	}
+	if want := image.ErrDestinationLink.Error(); !strings.Contains(st.GetMessage(), want) {
+		t.Errorf("%s error message = %q, want it to carry %q", verb, st.GetMessage(), want)
+	}
 }
 
 // plantEtcLink does what a pod can do to its own rootfs: replace etc with a
@@ -210,12 +292,15 @@ func sortedKeys(m map[string]string) []string {
 // image tree into a pod's rootfs never follows a link the pod put at one of the
 // rootfs's directory components: the daemon writes as itself, so following it
 // writes the tree's files wherever the pod pointed. The verb must report the
-// failure instead, and leave the link's target byte-identical.
+// destination-link refusal as its cause, spawn nothing, and leave the link's
+// target byte-identical. A link that stays inside the rootfs is not refused,
+// so the refusal is not a blanket failure of any rootfs holding a link.
 func TestRestartContainerRefusesRootfsSymlinkEscape(t *testing.T) {
 	host := testRegistryHost(t)
 
 	t.Run("restart", func(t *testing.T) {
-		rt := newNativeLinkRig(t)
+		lr := newNativeLinkRig(t)
+		rt := lr.rt
 		ref := pushOSImage(t, host, "esc/restart", "darwin", linkEscapeEntries())
 		const podID = "pod-esc"
 		mustCreatePod(t, rt, pullBox(rt, podID,
@@ -225,6 +310,7 @@ func TestRestartContainerRefusesRootfsSymlinkEscape(t *testing.T) {
 			t.Fatalf("setup: the create did not materialize etc/hostname: %v", err)
 		}
 		before := statusNamed(t, rt, podID, "main").GetRestartCount()
+		spawnsBefore := lr.spawns()
 		victim, snap := plantEtcLink(t, rootfs)
 
 		resp, err := rt.RestartContainer(context.Background(),
@@ -232,8 +318,9 @@ func TestRestartContainerRefusesRootfsSymlinkEscape(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RestartContainer: %v", err)
 		}
-		if resp.GetError() == nil {
-			t.Errorf("RestartContainer reported success through a rootfs link (status %v)", resp.GetStatus().GetState())
+		assertRefusedByLink(t, "RestartContainer", resp.GetError(), resp.GetFailureReason())
+		if got := lr.spawns(); got != spawnsBefore {
+			t.Errorf("spawns = %d after the refused restart, want %d (no spawn through the link)", got, spawnsBefore)
 		}
 		if got := statusNamed(t, rt, podID, "main").GetRestartCount(); got != before {
 			t.Errorf("restart_count = %d, want %d (unchanged by a refused restart)", got, before)
@@ -242,7 +329,8 @@ func TestRestartContainerRefusesRootfsSymlinkEscape(t *testing.T) {
 	})
 
 	t.Run("start", func(t *testing.T) {
-		rt := newNativeLinkRig(t)
+		lr := newNativeLinkRig(t)
+		rt := lr.rt
 		good := pushOSImage(t, host, "esc/good", "darwin", linkEscapeEntries())
 		// Not pushed yet: the create leaves this container waiting on the pull,
 		// so StartContainer is the verb that later materializes it.
@@ -259,6 +347,7 @@ func TestRestartContainerRefusesRootfsSymlinkEscape(t *testing.T) {
 			t.Fatalf("setup: the create did not materialize etc/hostname: %v", err)
 		}
 		pushOSImage(t, host, "esc/late", "darwin", linkEscapeEntries())
+		spawnsBefore := lr.spawns()
 		victim, snap := plantEtcLink(t, rootfs)
 
 		resp, err := rt.StartContainer(context.Background(),
@@ -266,9 +355,54 @@ func TestRestartContainerRefusesRootfsSymlinkEscape(t *testing.T) {
 		if err != nil {
 			t.Fatalf("StartContainer: %v", err)
 		}
-		if resp.GetError() == nil {
-			t.Errorf("StartContainer reported success through a rootfs link (status %v)", resp.GetStatus().GetState())
+		assertRefusedByLink(t, "StartContainer", resp.GetError(), resp.GetFailureReason())
+		if got := lr.spawns(); got != spawnsBefore {
+			t.Errorf("spawns = %d after the refused start, want %d (no spawn through the link)", got, spawnsBefore)
 		}
 		assertVictimUntouched(t, victim, snap)
+	})
+
+	t.Run("in_root_link_still_restarts", func(t *testing.T) {
+		lr := newNativeLinkRig(t)
+		rt := lr.rt
+		ref := pushOSImage(t, host, "esc/inroot", "darwin", linkEscapeEntries())
+		const podID = "pod-esc-inroot"
+		mustCreatePod(t, rt, pullBox(rt, podID,
+			&runtimev1.Container{Name: "main", Image: ref, Command: []string{"/bin/app"}}))
+		rootfs := derivedRootfs(t, rt, podID)
+		if _, err := os.Stat(filepath.Join(rootfs, "etc", "hostname")); err != nil {
+			t.Fatalf("setup: the create did not materialize etc/hostname: %v", err)
+		}
+		before := statusNamed(t, rt, podID, "main").GetRestartCount()
+		spawnsBefore := lr.spawns()
+		// A relative link to a sibling inside the rootfs: etc -> etc.real.
+		etc := filepath.Join(rootfs, "etc")
+		if err := os.Rename(etc, filepath.Join(rootfs, "etc.real")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("etc.real", etc); err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := rt.RestartContainer(context.Background(),
+			&runtimev1.RestartContainerRequest{PodId: podID, Container: "main"})
+		if err != nil {
+			t.Fatalf("RestartContainer: %v", err)
+		}
+		if e := resp.GetError(); e != nil {
+			t.Fatalf("RestartContainer through an in-root link failed: %v (reason %v)", e, resp.GetFailureReason())
+		}
+		if got := statusNamed(t, rt, podID, "main").GetRestartCount(); got != before+1 {
+			t.Errorf("restart_count = %d, want %d", got, before+1)
+		}
+		if got := lr.spawns(); got != spawnsBefore+1 {
+			t.Errorf("spawns = %d, want %d (one re-spawn)", got, spawnsBefore+1)
+		}
+		if fi, err := os.Lstat(etc); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("etc is no longer the in-root link after the restart (lstat %v, err %v)", fi, err)
+		}
+		if _, err := os.Stat(filepath.Join(rootfs, "etc.real", "hostname")); err != nil {
+			t.Errorf("etc.real/hostname missing after the restart: %v", err)
+		}
 	})
 }
