@@ -296,8 +296,14 @@ func (s *imagesService) EvictImage(ctx context.Context, req *runtimev1.EvictImag
 // the target" is read as "every target blob is in use": a pod running the
 // target names its config and every layer. A target blob that only some other
 // in-use image shares is not a refusal; Cache.Evict keeps that blob and the
-// response reports it. An unreadable root set is ROOTS_INCOMPLETE.
+// response reports it. An unreadable root set is ROOTS_INCOMPLETE. An empty
+// blob list is never in use and reads nothing.
 func (s *imagesService) refuseEvictInUse(manifest string, blobs []string) error {
+	if len(blobs) == 0 {
+		// No pod can run a target that names no blob, so it is never in use:
+		// Cache.Evict reports the empty target itself.
+		return nil
+	}
 	inUse, err := s.rt.cache.InUseDigests(s.rt.podUntracked)
 	if err != nil {
 		return evictStatusError(nil, err)
