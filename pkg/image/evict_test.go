@@ -54,8 +54,17 @@ func TestPlanEvict(t *testing.T) {
 			{Node: used, Reason: ReasonKeptInUse},
 		},
 	}
+	dupKept := node('g', 80, time.Hour)
+	dupKeptAlias := dupKept
+	dupKeptAlias.Path = "sha256/.blob-dup"
+	unknown := node('h', 90, time.Hour)
+	emptyDigest := BlobNode{Path: "sha256/.blob-0", Kind: BlobKindContent, Size: 1}
 	tests := []struct {
-		name       string
+		name string
+		// plan overrides the shared plan when set; nilPlan passes nil.
+		plan       *PrunePlan
+		nilPlan    bool
+		wantErr    bool
 		target     map[string]struct{}
 		others     map[string]struct{}
 		wantDelete []PruneDecision
@@ -97,29 +106,98 @@ func TestPlanEvict(t *testing.T) {
 			wantKept:   map[string]evictReason{},
 			wantAbsent: []string{node('7', 1, 0).Digest, node('8', 1, 0).Digest},
 		},
+		{
+			name: "digest with nodes in both keep and delete is kept, not evicted",
+			plan: &PrunePlan{
+				Delete: del(dupKeptAlias),
+				Keep:   []PruneDecision{{Node: dupKept, Reason: ReasonKeptInUse}},
+			},
+			target:   digestSet(dupKept),
+			wantKept: map[string]evictReason{dupKept.Digest: evictInUse},
+		},
+		{
+			name: "keep entry with a non-keep reason is an error",
+			plan: &PrunePlan{
+				Keep: []PruneDecision{{Node: cfg, Reason: ReasonDeleteUnreferenced}},
+			},
+			target:  digestSet(cfg),
+			wantErr: true,
+		},
+		{
+			name:    "nil plan is an error",
+			nilPlan: true,
+			target:  digestSet(cfg),
+			wantErr: true,
+		},
+		{
+			name: "unknown provenance is kept as rooted",
+			plan: &PrunePlan{
+				Keep: []PruneDecision{{Node: unknown, Reason: ReasonKeptUnknownProvenance}},
+			},
+			target:   digestSet(unknown),
+			wantKept: map[string]evictReason{unknown.Digest: evictRooted},
+		},
+		{
+			name:     "digest in others and kept by prune reports the prune verdict",
+			target:   digestSet(young),
+			others:   digestSet(young),
+			wantKept: map[string]evictReason{young.Digest: evictYoung},
+		},
+		{
+			name: "delete node with an empty digest never matches the target",
+			plan: &PrunePlan{
+				Delete: []PruneDecision{{Node: emptyDigest, Reason: ReasonDeleteStaleTemp}},
+			},
+			target:     map[string]struct{}{"": {}},
+			wantAbsent: []string{""},
+		},
+		{
+			// A nil others means "no other manifest names anything". PlanEvict
+			// cannot tell that from a caller that forgot to compute it, so the
+			// caller must pass the complete set of blobs other cached manifests
+			// name; otherwise a shared blob is evicted. Fail closed at the
+			// caller: an incomplete others is a caller bug.
+			name:       "nil others with a blob prune would delete deletes it",
+			target:     digestSet(cfg),
+			others:     nil,
+			wantDelete: del(cfg),
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := PlanEvict(plan, tc.target, tc.others)
+			p := plan
+			if tc.plan != nil {
+				p = tc.plan
+			}
+			if tc.nilPlan {
+				p = nil
+			}
+			got, err := PlanEvict(p, tc.target, tc.others)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("PlanEvict: got nil error, want one (plan %+v)", got)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("PlanEvict: %v", err)
 			}
 			if !reflect.DeepEqual(got.Delete, tc.wantDelete) {
 				t.Errorf("Delete = %v, want %v", got.Delete, tc.wantDelete)
 			}
-			if !reflect.DeepEqual(got.kept, tc.wantKept) {
+			if !(len(got.kept) == 0 && len(tc.wantKept) == 0) && !reflect.DeepEqual(got.kept, tc.wantKept) {
 				t.Errorf("kept = %v, want %v", got.kept, tc.wantKept)
 			}
-			if !reflect.DeepEqual(got.absent, tc.wantAbsent) {
+			if !(len(got.absent) == 0 && len(tc.wantAbsent) == 0) && !reflect.DeepEqual(got.absent, tc.wantAbsent) {
 				t.Errorf("absent = %v, want %v", got.absent, tc.wantAbsent)
 			}
-			inPlan := make(map[string]struct{}, len(plan.Delete))
-			for _, d := range plan.Delete {
-				inPlan[d.Node.Path] = struct{}{}
+			inPlan := make(map[string]struct{}, len(p.Delete))
+			for _, d := range p.Delete {
+				inPlan[d.Node.Digest] = struct{}{}
 			}
 			for _, d := range got.Delete {
-				if _, ok := inPlan[d.Node.Path]; !ok {
-					t.Errorf("evict deletes %s, which plan.Delete does not", d.Node.Path)
+				if _, ok := inPlan[d.Node.Digest]; !ok {
+					t.Errorf("evict deletes %s, which plan.Delete does not", d.Node.Digest)
 				}
 			}
 			if n := len(got.Delete) + len(got.kept) + len(got.absent); n != len(tc.target) {
