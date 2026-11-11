@@ -17,6 +17,7 @@ limitations under the License.
 package image
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -97,7 +98,8 @@ func layerBodyServer(t *testing.T, body func(w http.ResponseWriter, r *http.Requ
 // TestLayerPullStalledBodyAborts is the gate for the layer-body watchdog: a
 // layer whose body stops after a few bytes while the server holds the
 // connection fails the pull with ErrLayerBodyStalled within a bound, and a body
-// that trickles a byte every quarter window for several windows is never cut.
+// that trickles a byte every eighth of a window for several windows is never
+// cut.
 func TestLayerPullStalledBodyAborts(t *testing.T) {
 	const window = 200 * time.Millisecond
 
@@ -135,7 +137,9 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 	})
 
 	t.Run("a slow body that keeps delivering is never cut", func(t *testing.T) {
-		const trickle = 20 // bytes at window/4 each: five windows
+		// Bytes at window/8 each, five windows in all: a scheduler pause of
+		// most of a window on a loaded host still cannot cut the trickle.
+		const trickle = 40
 		ref := layerBodyServer(t, func(w http.ResponseWriter, r *http.Request, layer []byte) {
 			cut := len(layer) - trickle
 			_, _ = w.Write(layer[:cut])
@@ -144,7 +148,7 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 				select {
 				case <-r.Context().Done():
 					return
-				case <-time.After(window / 4):
+				case <-time.After(window / 8):
 				}
 				_, _ = w.Write(layer[i : i+1])
 				w.(http.Flusher).Flush()
@@ -156,6 +160,72 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 		}
 		if took < 4*window {
 			t.Fatalf("trickling pull took %s, want at least %s: the trickle did not run", took, 4*window)
+		}
+	})
+}
+
+// errReadCloser is a body whose every Read fails with err.
+type errReadCloser struct{ err error }
+
+func (e errReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e errReadCloser) Close() error             { return nil }
+
+// TestStallReader pins the watchdog at the reader level: it times only the
+// body.Read, never the consumer between Reads; a stall reports the sentinel
+// with the read's error as the cause; and an error the watchdog did not cause
+// is returned unchanged.
+func TestStallReader(t *testing.T) {
+	const window = 50 * time.Millisecond
+
+	t.Run("a slow consumer is never reported as a stall", func(t *testing.T) {
+		want := bytes.Repeat([]byte("k3sm"), 4)
+		s := newStallReader(io.NopCloser(bytes.NewReader(want)), window)
+		defer s.Close()
+		var got []byte
+		buf := make([]byte, 4)
+		for {
+			n, err := s.Read(buf)
+			got = append(got, buf[:n]...)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Read after %d bytes: %v", len(got), err)
+			}
+			time.Sleep(3 * window) // a slow CommitBlob write between Reads
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("read %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a body.Read that blocks a window reports the sentinel with its cause", func(t *testing.T) {
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		s := newStallReader(pr, window)
+		defer s.Close()
+		start := time.Now()
+		n, err := s.Read(make([]byte, 8))
+		if n != 0 || !errors.Is(err, ErrLayerBodyStalled) {
+			t.Fatalf("Read = %d, %v; want 0, ErrLayerBodyStalled", n, err)
+		}
+		if !strings.Contains(err.Error(), io.ErrClosedPipe.Error()) {
+			t.Fatalf("stall error %q does not name the cause %q", err, io.ErrClosedPipe)
+		}
+		if took := time.Since(start); took >= 20*window {
+			t.Fatalf("stall reported after %s, want near %s", took, window)
+		}
+		if _, err := s.Read(make([]byte, 8)); !errors.Is(err, ErrLayerBodyStalled) {
+			t.Fatalf("Read after stall = %v, want ErrLayerBodyStalled", err)
+		}
+	})
+
+	t.Run("an error the watchdog did not cause is returned unchanged", func(t *testing.T) {
+		cause := errors.New("connection reset by peer")
+		s := newStallReader(errReadCloser{cause}, window)
+		defer s.Close()
+		if _, err := s.Read(make([]byte, 8)); err != cause {
+			t.Fatalf("Read error = %v, want the body's error unchanged", err)
 		}
 	})
 }
