@@ -197,6 +197,13 @@ type ReclaimConfig struct {
 	// observe it.
 	afterInventory func()
 
+	// afterPlan runs on the eviction path after the plan and the guard's roots
+	// read and before the first unlink, once per guarded executor call (see
+	// evictHooks). It is UNEXPORTED and exists only so an in-package test can
+	// interleave a root write, a lease and its release there; production
+	// leaves it nil, and a nil afterPlan changes nothing.
+	afterPlan func()
+
 	// SweepDerived, when set, removes content derived from records rather than
 	// from blobs whose record is gone: the artifact views, which pkg/runtime
 	// wires in (this package cannot import their owner). A triggered pass that
