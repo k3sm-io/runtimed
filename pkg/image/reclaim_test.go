@@ -1075,3 +1075,58 @@ func TestReclaimKeepsBlobRootedMidBatch(t *testing.T) {
 		t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
 	}
 }
+
+// TestReclaimSkipsRepinForUnrelatedLease pins the per-digest watch: a lease
+// taken mid-batch forces a fresh pin read only before a blob it names, so a
+// stream of pulls of blobs outside the plan costs no extra roots reads.
+func TestReclaimSkipsRepinForUnrelatedLease(t *testing.T) {
+	cases := []struct {
+		name      string
+		leaseLate bool // lease the later planned blob instead of an unplanned one
+		wantReads int
+	}{
+		{name: "lease names a digest outside the plan", leaseLate: false, wantReads: 1},
+		{name: "lease names a later planned blob", leaseLate: true, wantReads: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGCFixture(t)
+			first := f.blob("first planned blob", 24*time.Hour)
+			second := f.blob("second planned blob", 24*time.Hour)
+			sum := sha256.Sum256([]byte("blob not in the plan"))
+			outside := "sha256:" + hex.EncodeToString(sum[:])
+
+			fired := false
+			f.cache.beforePruneBlob = func(digest string) {
+				if fired || digest != first {
+					return
+				}
+				fired = true
+				target := outside
+				if tc.leaseLate {
+					target = second
+				}
+				f.cache.AcquireLease([]string{target}, time.Minute).Release()
+			}
+			reads := 0
+			pinned := func() (map[string]PruneReason, error) {
+				reads++
+				return f.cache.pinnedNow(nil)
+			}
+			if _, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned, f.cache.leaseHas); err != nil {
+				t.Fatalf("executePrune: %v", err)
+			}
+			if !fired {
+				t.Fatal("the hook never ran, so the window was not driven")
+			}
+			if reads != tc.wantReads {
+				t.Errorf("pin reads = %d; want %d", reads, tc.wantReads)
+			}
+			for _, d := range []string{first, second} {
+				if f.exists(d) {
+					t.Errorf("unrooted planned blob %s survived", d)
+				}
+			}
+		})
+	}
+}

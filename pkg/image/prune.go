@@ -472,28 +472,31 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // executePrune is ExecutePrune with three more re-checks. pinned, when
 // non-nil, is called under pruneMu before the first unlink, and every entry
 // whose digest it names is left in place and reported in ExecuteReport.pinned.
-// The lease generation (leaseGeneration) is read just before that pin read and
-// again before each entry; when it has moved, pinned is called again first and
-// its fresh set replaces the old one. A pinned error, first or repeated, aborts
-// the run before the next unlink: the pin set is a root set, and a short one
-// would invert the answer.
+// A lease watch (beginLeaseWatch) is opened just before that pin read; before
+// each entry, when a lease acquired since the last pin read names that entry's
+// digest (takeIfNamed), pinned is called again first and its fresh set
+// replaces the old one. A pinned error, first or repeated, aborts the run
+// before the next unlink: the pin set is a root set, and a short one would
+// invert the answer.
 //
 // leased, when non-nil, is asked about each entry's digest after its pin
 // lookup and immediately before its Lstat and unlink, and an entry it reports
 // leased is kept as ReasonKeptLeased.
 //
-// Per entry the order is: generation check (re-pin if moved), pin lookup,
-// live-lease check, Lstat, grace, unlink. INVARIANT: any pull that could root
-// this blob after the pin set in use was read either still holds its lease
-// when the live-lease check runs (and is seen by it) or bumped the generation
-// before the generation check (forcing a re-read that sees its record and
-// hold, since it writes both before releasing its lease).
+// Per entry the order is: watch check (re-pin if a new lease names this
+// digest), pin lookup, live-lease check, Lstat, grace, unlink. INVARIANT: a
+// blob is re-checked against a fresh pin read exactly when a lease taken since
+// the last pin read names its digest; a pull leases every blob it will root
+// before it writes the record or hold; so a blob no such lease names cannot
+// have become rooted since the last read, and one such a lease names is either
+// still held at the live-lease check or has its record and hold seen by the
+// re-read (the pull writes both before releasing its lease).
 //
-// RESIDUAL. The generation check, the lease check and the unlink are separate
+// RESIDUAL. The watch check, the lease check and the unlink are separate
 // steps, none of them atomic with AcquireLease. A pull whose AcquireLease
-// lands after this entry's generation check is seen only if its lease is still
+// lands after this entry's watch check is seen only if its lease is still
 // live at the lease check; a pull that leases, roots and releases entirely
-// between the generation check and the lease check, or that leases after the
+// between the watch check and the lease check, or that leases after the
 // lease check and roots before the Remove, is not seen. Closing that needs the
 // unlink under a lock AcquireLease also takes. The pull path's own re-check
 // under its lease (pkg/artifact) refetches what such a pass removed.
@@ -519,14 +522,15 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	}
 	defer root.Close()
 
-	// The generation is read BEFORE the pins it vouches for, for the same
-	// reason pinnedNow reads leases before roots: a lease acquired after this
-	// read moves the generation, and one acquired before it is seen by the pin
-	// read (live) or left a root that read sees (released).
+	// The watch opens BEFORE the pins it vouches for, for the same reason
+	// pinnedNow reads leases before roots: a lease acquired after this point
+	// lands in the watch, and one acquired before it is seen by the pin read
+	// (live) or left a root that read sees (released). pruneMu, held for the
+	// whole pass by every caller, keeps watches from nesting.
 	var pins map[string]PruneReason
-	var gen uint64
 	if pinned != nil {
-		gen = c.leaseGeneration()
+		c.beginLeaseWatch()
+		defer c.endLeaseWatch()
 		if pins, err = pinned(); err != nil {
 			return nil, fmt.Errorf("execute prune: %w", err)
 		}
@@ -544,12 +548,9 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 		if c.beforePruneBlob != nil {
 			c.beforePruneBlob(d.Node.Digest)
 		}
-		if pinned != nil {
-			if g := c.leaseGeneration(); g != gen {
-				gen = g
-				if pins, err = pinned(); err != nil {
-					return nil, fmt.Errorf("execute prune: %w", err)
-				}
+		if pinned != nil && c.takeIfNamed(d.Node.Digest) {
+			if pins, err = pinned(); err != nil {
+				return nil, fmt.Errorf("execute prune: %w", err)
 			}
 		}
 		if why, ok := pins[d.Node.Digest]; ok && d.Node.Digest != "" {
