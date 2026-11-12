@@ -173,6 +173,9 @@ type Config struct {
 	StorePath string
 	// FreeBytes samples free space. Nil means image.StatfsFreeBytes.
 	FreeBytes image.FreeBytesFunc
+	// TotalBytes samples the volume's total capacity. Nil means
+	// image.StatfsTotalBytes.
+	TotalBytes image.TotalBytesFunc
 	// FloorBytes is the free space a pull must leave. Zero means
 	// image.DefaultReclaimHighFreeBytes, the reclaim floor.
 	FloorBytes uint64
@@ -249,6 +252,9 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 	}
 	if cfg.FreeBytes == nil {
 		cfg.FreeBytes = image.StatfsFreeBytes
+	}
+	if cfg.TotalBytes == nil {
+		cfg.TotalBytes = image.StatfsTotalBytes
 	}
 	if cfg.FloorBytes == 0 {
 		cfg.FloorBytes = image.DefaultReclaimHighFreeBytes

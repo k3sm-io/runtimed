@@ -370,3 +370,88 @@ func TestPullRefusesHostileDeclaredSizes(t *testing.T) {
 		})
 	}
 }
+
+// countingReclaimer is a SpaceReclaimer that only counts its passes.
+type countingReclaimer struct{ passes atomic.Int32 }
+
+func (c *countingReclaimer) ReclaimUnderPressure(context.Context, ReclaimConfig) (*ReclaimReport, error) {
+	c.passes.Add(1)
+	return &ReclaimReport{}, nil
+}
+
+func fixedTotalBytes(n uint64) TotalBytesFunc {
+	return func(string) (uint64, error) { return n, nil }
+}
+
+// TestReserveRefusesAboveCapacityWithoutReclaim: a claim larger than the
+// whole volume is refused with no reclaim pass, since no eviction could make
+// it fit; a claim short of free space but within capacity still gets exactly
+// one pass; and a capacity that cannot be sampled refuses without a pass.
+func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
+	const floor, free, capacity = 100, 1_000, 10_000
+	for _, tc := range []struct {
+		name       string
+		need       uint64
+		total      TotalBytesFunc
+		wantErr    error
+		wantPasses int32
+	}{
+		{name: "above_capacity", need: capacity, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace},
+		{name: "capacity_unknown", need: free, total: func(string) (uint64, error) { return 0, errors.New("statfs: EIO") }, wantErr: ErrFreeSpaceUnknown},
+		{name: "above_free_within_capacity", need: free, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
+		{name: "exactly_capacity", need: capacity - floor, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ledger := &SpaceLedger{}
+			rec := &countingReclaimer{}
+			_, err := ledger.Reserve(context.Background(), SpaceClaim{
+				Need: tc.need, Path: t.TempDir(), FloorBytes: floor,
+				FreeBytes: fixedFreeBytes(free), TotalBytes: tc.total, Reclaimer: rec,
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Reserve error = %v, want %v", err, tc.wantErr)
+			}
+			if got := rec.passes.Load(); got != tc.wantPasses {
+				t.Errorf("reclaim passes = %d, want %d", got, tc.wantPasses)
+			}
+			if tc.name == "above_capacity" && !strings.Contains(err.Error(), "exceeds the volume's capacity") {
+				t.Errorf("refusal %q does not say the claim exceeds the volume's capacity", err)
+			}
+			if got := ledger.Reserved(); got != 0 {
+				t.Errorf("ledger holds %d bytes after a refusal, want 0", got)
+			}
+		})
+	}
+}
+
+// TestPullRefusesAboveCapacityWithoutReclaim drives the same rule through a
+// pull: a manifest declaring more than the volume holds is refused before any
+// layer request, and free space is sampled only by the admission gate and the
+// one reservation check, never by a reclaim pass.
+func TestPullRefusesAboveCapacityWithoutReclaim(t *testing.T) {
+	const capacity = 1 << 30
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opened, samples atomic.Int32
+	img := hookedImage{Image: declaredImage{Image: pullPolicyImage(t), sizes: []int64{2 * capacity}},
+		onLayer: func() error { opened.Add(1); return nil }}
+	free := func(string) (uint64, error) { samples.Add(1); return capacity / 2, nil }
+	p, err := NewPuller(cache, staticFetch(img), NoLocalIndex{}, WithPullFloor(1<<20),
+		WithFreeBytes(free), WithTotalBytes(fixedTotalBytes(capacity)), WithSpaceLedger(&SpaceLedger{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy(),
+		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if !errors.Is(err, ErrInsufficientSpace) || !errors.Is(err, ErrPullRefusedDiskPressure) {
+		t.Fatalf("Pull error = %v, want ErrInsufficientSpace and ErrPullRefusedDiskPressure", err)
+	}
+	if n := opened.Load(); n != 0 {
+		t.Errorf("%d layers opened for a refused pull, want 0", n)
+	}
+	if n := samples.Load(); n != 2 {
+		t.Errorf("free space sampled %d times, want 2 (admission and reservation, no reclaim pass)", n)
+	}
+}

@@ -506,6 +506,9 @@ type Puller struct {
 	// Both zero values mean the production defaults, which are fail-closed.
 	floorBytes uint64
 	freeBytes  FreeBytesFunc
+	// totalBytes samples the volume's capacity for reserveSpace; nil means
+	// StatfsTotalBytes.
+	totalBytes TotalBytesFunc
 
 	// ledger holds the space reservations of in-flight pulls (reserveSpace).
 	// WithSpaceLedger shares the daemon's; NewPuller defaults it to a private one.
