@@ -798,6 +798,9 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 		return IndexEntry{}, fmt.Errorf("%w: manifest for %q names %q",
 			ErrIndexEntryCorrupt, what, mfst.GetReference())
 	}
+	if err := validateRecordedBlobDigests(what, mfst); err != nil {
+		return IndexEntry{}, err
+	}
 	out := IndexEntry{
 		Reference:   e.Reference,
 		Platform:    e.Platform.platform(),
@@ -821,6 +824,37 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 		return IndexEntry{}, err
 	}
 	return out, nil
+}
+
+// validateRecordedBlobDigests checks that every blob digest the recorded
+// manifest names — the config and each layer — is in the canonical form
+// parseBlobDigest accepts.
+//
+// These strings leave the index as lease keys (Puller.presentLocally hands
+// manifestDigests of a looked-up entry to Cache.AcquireLease), and the lease,
+// the prune watch and the pinned set all compare digests as plain strings. A
+// non-canonical spelling (upper-case hex, no or an unknown algorithm, a wrong
+// length) would lease a key no reclaim ever compares against and so protect
+// nothing; such a record is refused as corrupt here, at the decode boundary,
+// exactly as an inconsistent manifest descriptor is.
+//
+// An EMPTY digest is not checked: manifestDigests skips it, so it never becomes
+// a lease key, and records carrying a manifest without a config (the
+// pre-retention shape) stay readable.
+func validateRecordedBlobDigests(what string, mfst *runtimev1.ImageManifest) error {
+	if d := mfst.GetConfig().GetDigest(); d != "" {
+		if _, err := parseBlobDigest(d); err != nil {
+			return fmt.Errorf("%w: %q: config digest: %v", ErrIndexEntryCorrupt, what, err)
+		}
+	}
+	for i, l := range mfst.GetLayers() {
+		if d := l.GetDigest(); d != "" {
+			if _, err := parseBlobDigest(d); err != nil {
+				return fmt.Errorf("%w: %q: layer %d digest: %v", ErrIndexEntryCorrupt, what, i, err)
+			}
+		}
+	}
+	return nil
 }
 
 // recordedManifestDescriptor validates the descriptor/bytes pair Record was
