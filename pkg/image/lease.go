@@ -159,6 +159,13 @@ func (c *Cache) leasedDigests() map[string]bool {
 func (c *Cache) leaseHas(digest string) bool {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
+	return c.leaseHasLocked(digest)
+}
+
+// leaseHasLocked is leaseHas for a caller that already holds leaseMu, which is
+// how executePrune makes a blob's lease check and its unlink one critical
+// section with respect to AcquireLease.
+func (c *Cache) leaseHasLocked(digest string) bool {
 	c.expireLeasesLocked()
 	for _, l := range c.leases {
 		for _, d := range l.digests {
