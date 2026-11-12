@@ -1193,3 +1193,48 @@ func TestExecutePruneOrdersALeaseAgainstTheUnlink(t *testing.T) {
 		t.Errorf("the pull found the blob absent but the pass did not report removing it: %v", rep.Removed)
 	}
 }
+
+// TestExecutePruneFailsClosedWhenTheRepinReadFails pins the fail-closed rule
+// of the mid-batch pin re-read: a lease taken during the batch names a later
+// planned blob, so the executor re-reads the pins before that blob, and an
+// error from that re-read ends the pass with the error and the blob in place.
+// The lease is released at once, so no live-lease check can be what keeps it.
+func TestExecutePruneFailsClosedWhenTheRepinReadFails(t *testing.T) {
+	f := newGCFixture(t)
+	first := f.blob("first planned blob", 24*time.Hour)
+	second := f.blob("second planned blob a lease names", 24*time.Hour)
+
+	fired := false
+	f.cache.beforePruneBlob = func(digest string) {
+		if fired || digest != first {
+			return
+		}
+		fired = true
+		f.cache.AcquireLease([]string{second}, time.Minute).Release()
+	}
+	boom := errors.New("re-pin read failed")
+	reads := 0
+	pinned := func() (map[string]PruneReason, error) {
+		reads++
+		if reads > 1 {
+			return nil, boom
+		}
+		return f.cache.pinnedNow(nil)
+	}
+	_, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned, f.cache.leaseHasLocked)
+	if !errors.Is(err, boom) {
+		t.Fatalf("executePrune error = %v; want %v", err, boom)
+	}
+	if !fired {
+		t.Fatal("the hook never ran, so the window was not driven")
+	}
+	if reads != 2 {
+		t.Fatalf("pin reads = %d; want 2 (the batch read and the failed re-read)", reads)
+	}
+	if f.exists(first) {
+		t.Error("the blob before the lease survived, so the pass proved nothing")
+	}
+	if !f.exists(second) {
+		t.Error("a failed pin re-read still unlinked the blob the new lease named")
+	}
+}
