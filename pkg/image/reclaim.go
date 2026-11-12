@@ -516,8 +516,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
 	pinned := func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
-	leasedNow := c.leaseHasLocked // executePrune calls it under leaseMu
-	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned, leasedNow)
+	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +533,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
-	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned, leasedNow)
+	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned)
 	if err != nil {
 		return nil, err
 	}

@@ -1053,7 +1053,7 @@ func TestReclaimKeepsBlobRootedMidBatch(t *testing.T) {
 		lease.Release()
 	}
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	rep, err := f.cache.executePrune(planOf(stray, held), 0, f.clock, nil, pinned, f.cache.leaseHasLocked)
+	rep, err := f.cache.executePrune(planOf(stray, held), 0, f.clock, nil, pinned)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -1114,7 +1114,7 @@ func TestReclaimSkipsRepinForUnrelatedLease(t *testing.T) {
 				reads++
 				return f.cache.pinnedNow(nil)
 			}
-			if _, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned, f.cache.leaseHasLocked); err != nil {
+			if _, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned); err != nil {
 				t.Fatalf("executePrune: %v", err)
 			}
 			if !fired {
@@ -1172,7 +1172,7 @@ func TestExecutePruneOrdersALeaseAgainstTheUnlink(t *testing.T) {
 		go pull()
 	}
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	rep, err := f.cache.executePrune(planOf(b), 0, f.clock, nil, pinned, f.cache.leaseHasLocked)
+	rep, err := f.cache.executePrune(planOf(b), 0, f.clock, nil, pinned)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -1221,7 +1221,7 @@ func TestExecutePruneFailsClosedWhenTheRepinReadFails(t *testing.T) {
 		}
 		return f.cache.pinnedNow(nil)
 	}
-	_, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned, f.cache.leaseHasLocked)
+	_, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned)
 	if !errors.Is(err, boom) {
 		t.Fatalf("executePrune error = %v; want %v", err, boom)
 	}
