@@ -469,18 +469,34 @@ func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time
 // the reason it is kept. It is read under pruneMu, just before the batch.
 type pinnedFunc func() (map[string]PruneReason, error)
 
-// executePrune is ExecutePrune with two more re-checks. pinned, when non-nil,
-// is called once under pruneMu before the first unlink, and every entry whose
-// digest it names is left in place and reported in ExecuteReport.pinned. A
-// pinned error aborts the run before anything is unlinked: the pin set is a
-// root set, and a short one would invert the answer.
+// executePrune is ExecutePrune with three more re-checks. pinned, when
+// non-nil, is called under pruneMu before the first unlink, and every entry
+// whose digest it names is left in place and reported in ExecuteReport.pinned.
+// The lease generation (leaseGeneration) is read just before that pin read and
+// again before each entry; when it has moved, pinned is called again first and
+// its fresh set replaces the old one. A pinned error, first or repeated, aborts
+// the run before the next unlink: the pin set is a root set, and a short one
+// would invert the answer.
 //
-// leased, when non-nil, is asked about each entry's digest immediately before
-// that entry's Lstat and unlink, and an entry it reports leased is kept as
-// ReasonKeptLeased. The pin set is one read per batch; this in-memory read
-// narrows the window a lease taken during the batch can miss to one blob's
-// lease check, Lstat and Remove. It sees live leases only: a pull that recorded
-// a root and released its lease after the batch's pin read is not seen by it.
+// leased, when non-nil, is asked about each entry's digest after its pin
+// lookup and immediately before its Lstat and unlink, and an entry it reports
+// leased is kept as ReasonKeptLeased.
+//
+// Per entry the order is: generation check (re-pin if moved), pin lookup,
+// live-lease check, Lstat, grace, unlink. INVARIANT: any pull that could root
+// this blob after the pin set in use was read either still holds its lease
+// when the live-lease check runs (and is seen by it) or bumped the generation
+// before the generation check (forcing a re-read that sees its record and
+// hold, since it writes both before releasing its lease).
+//
+// RESIDUAL. The generation check, the lease check and the unlink are separate
+// steps, none of them atomic with AcquireLease. A pull whose AcquireLease
+// lands after this entry's generation check is seen only if its lease is still
+// live at the lease check; a pull that leases, roots and releases entirely
+// between the generation check and the lease check, or that leases after the
+// lease check and roots before the Remove, is not seen. Closing that needs the
+// unlink under a lock AcquireLease also takes. The pull path's own re-check
+// under its lease (pkg/artifact) refetches what such a pass removed.
 func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, leased func(digest string) bool) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
