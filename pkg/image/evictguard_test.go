@@ -35,6 +35,8 @@ import (
 //   - a root written under a lease that is released before the per-blob check
 //     keeps the blob on disk, typed rooted (operator root) or in-use (pod
 //     record);
+//   - a root written with no lease at all before the per-blob check keeps the
+//     blob the same way, typed rooted or in-use;
 //   - a lease taken after the plan and still held keeps it, typed leased;
 //   - with no writer, the blob is unlinked;
 //   - through Cache.Evict itself, a root written and its lease released after
@@ -71,6 +73,26 @@ func TestEvictRacesRootAndLease(t *testing.T) {
 				err := f.cache.RecordPodImage(pid, ImageRoot{Reference: "app:v1", Config: digest})
 				l.Release()
 				if err != nil {
+					t.Errorf("RecordPodImage: %v", err)
+				}
+				return nil
+			},
+			want: &SkipRefusal{Kind: RefusedByUnlink, Reason: EvictKeptInUse},
+		},
+		{
+			name: "operator root written with no lease before the per-blob check",
+			race: func(t *testing.T, f *gcFixture, _ PodID, digest string) func() {
+				if err := f.cache.RecordOperatorImage("app:v1", Platform{OS: "linux", Architecture: "arm64"}, ImageRoot{Reference: "app:v1", Config: digest}); err != nil {
+					t.Errorf("RecordOperatorImage: %v", err)
+				}
+				return nil
+			},
+			want: &SkipRefusal{Kind: RefusedByUnlink, Reason: EvictKeptRooted},
+		},
+		{
+			name: "pod root written with no lease before the per-blob check",
+			race: func(t *testing.T, f *gcFixture, pid PodID, digest string) func() {
+				if err := f.cache.RecordPodImage(pid, ImageRoot{Reference: "app:v1", Config: digest}); err != nil {
 					t.Errorf("RecordPodImage: %v", err)
 				}
 				return nil
@@ -277,6 +299,182 @@ func TestUnlinkUnlessLeasedHoldsLeaseMu(t *testing.T) {
 	if err != nil || !removed || why != "" || !called {
 		t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want removed", removed, why, err, called)
 	}
+}
+
+// TestUnlinkUnlessHeldUntrackedUnderLeaseMu pins where the UntrackedPod
+// callback runs today: the per-blob roots re-read (blobRootedNow, through
+// classifiedRoots) calls it for a pod dir with no references record while
+// unlinkUnlessHeld holds leaseMu. A true answer skips the dir and the blob is
+// removed; a false answer leaves the root set incomplete and the blob is kept
+// with the error.
+//
+// Consequence: an UntrackedPod callback must not take the lease lock or call
+// AcquireLease or Lease.Release; leaseMu is not reentrant, so either would
+// deadlock the eviction.
+func TestUnlinkUnlessHeldUntrackedUnderLeaseMu(t *testing.T) {
+	t.Parallel()
+	for _, untrackedAnswer := range []bool{true, false} {
+		name := "untracked"
+		if !untrackedAnswer {
+			name = "tracked"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newGCFixture(t)
+			digest := f.blob("evict-untracked-"+name, time.Hour)
+			pid := untrackedPodDir(t, f)
+			calls, lockFree := 0, 0
+			untracked := func(id PodID) bool {
+				calls++
+				if id != pid {
+					t.Errorf("untracked asked about %v; want %v", id, pid)
+				}
+				if f.cache.leaseMu.TryLock() {
+					f.cache.leaseMu.Unlock()
+					lockFree++
+				}
+				return untrackedAnswer
+			}
+			removeCalled := false
+			removed, why, err := f.cache.unlinkUnlessLeased(digest, func() error {
+				removeCalled = true
+				return nil
+			}, untracked)
+			if calls < 1 {
+				t.Fatalf("untracked called %d times; want at least once", calls)
+			}
+			if lockFree != 0 {
+				t.Errorf("leaseMu free in %d of %d untracked calls; want it held in every call", lockFree, calls)
+			}
+			if untrackedAnswer {
+				if err != nil || !removed || why != "" || !removeCalled {
+					t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want removed", removed, why, err, removeCalled)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRootsIncomplete) || removed || why != "" || removeCalled {
+				t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want kept with ErrRootsIncomplete", removed, why, err, removeCalled)
+			}
+			if !f.exists(digest) {
+				t.Errorf("%s gone; want it kept", digest)
+			}
+		})
+	}
+}
+
+// TestTreeUnlessHeldUntrackedUnderLeaseMu is the per-tree twin of
+// TestUnlinkUnlessHeldUntrackedUnderLeaseMu: treeUnlessHeld's roots re-read
+// calls the UntrackedPod callback with leaseMu held, under the same
+// consequence for what the callback may do.
+func TestTreeUnlessHeldUntrackedUnderLeaseMu(t *testing.T) {
+	t.Parallel()
+	for _, untrackedAnswer := range []bool{true, false} {
+		name := "untracked"
+		if !untrackedAnswer {
+			name = "tracked"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newGCFixture(t)
+			cfgDigest := f.blob("tree-untracked-"+name, time.Hour)
+			untrackedPodDir(t, f)
+			calls, lockFree := 0, 0
+			untracked := func(PodID) bool {
+				calls++
+				if f.cache.leaseMu.TryLock() {
+					f.cache.leaseMu.Unlock()
+					lockFree++
+				}
+				return untrackedAnswer
+			}
+			removeCalled := false
+			removed, dg, why, err := f.cache.treeUnlessHeld([]string{cfgDigest}, func() error {
+				removeCalled = true
+				return nil
+			}, untracked)
+			if calls < 1 {
+				t.Fatalf("untracked called %d times; want at least once", calls)
+			}
+			if lockFree != 0 {
+				t.Errorf("leaseMu free in %d of %d untracked calls; want it held in every call", lockFree, calls)
+			}
+			if untrackedAnswer {
+				if err != nil || !removed || dg != "" || why != "" || !removeCalled {
+					t.Fatalf("treeUnlessHeld = %v, %s, %q, %v (remove called %v); want removed", removed, dg, why, err, removeCalled)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRootsIncomplete) || removed || why != "" || removeCalled {
+				t.Fatalf("treeUnlessHeld = %v, %q, %v (remove called %v); want kept with ErrRootsIncomplete", removed, why, err, removeCalled)
+			}
+		})
+	}
+}
+
+// untrackedPodDir makes a pod dir with no references record, which the roots
+// read reports incomplete unless an UntrackedPod callback skips it.
+func untrackedPodDir(t *testing.T, f *gcFixture) PodID {
+	t.Helper()
+	pid, err := ParsePodID("pod-untracked")
+	if err != nil {
+		t.Fatalf("ParsePodID: %v", err)
+	}
+	if err := os.MkdirAll(f.cache.PodDir(pid), 0o755); err != nil {
+		t.Fatalf("mkdir pod dir: %v", err)
+	}
+	return pid
+}
+
+// TestEvictExpiredLease pins that a lease past its TTL does not keep a blob:
+// the per-blob check drops it from the lease table and unlinks, unless a root
+// written after the expiry names the blob, which keeps it typed rooted.
+func TestEvictExpiredLease(t *testing.T) {
+	t.Parallel()
+	t.Run("expired lease unlinks", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		digest := f.blob("evict-expired", time.Hour)
+		l := f.cache.AcquireLease([]string{digest}, time.Minute)
+		f.clock = f.clock.Add(time.Hour)
+		called := false
+		removed, why, err := f.cache.unlinkUnlessLeased(digest, func() error {
+			called = true
+			return nil
+		}, nil)
+		if err != nil || !removed || why != "" || !called {
+			t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want removed", removed, why, err, called)
+		}
+		f.cache.leaseMu.Lock()
+		_, live := f.cache.leases[l.id]
+		f.cache.leaseMu.Unlock()
+		if live {
+			t.Errorf("expired lease %d still in the lease table", l.id)
+		}
+	})
+	t.Run("expired lease with an operator root written after expiry", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		digest := f.blob("evict-expired-rooted", time.Hour)
+		f.cache.AcquireLease([]string{digest}, time.Minute)
+		f.clock = f.clock.Add(time.Hour)
+		if err := f.cache.RecordOperatorImage("app:v1", Platform{OS: "linux", Architecture: "arm64"}, ImageRoot{Reference: "app:v1", Config: digest}); err != nil {
+			t.Fatalf("RecordOperatorImage: %v", err)
+		}
+		called := false
+		removed, why, err := f.cache.unlinkUnlessLeased(digest, func() error {
+			called = true
+			return nil
+		}, nil)
+		if err != nil || removed || why != evictRooted || called {
+			t.Fatalf("unlinkUnlessLeased = %v, %q, %v (remove called %v); want kept %q", removed, why, err, called, evictRooted)
+		}
+		if got, err := exportEvictReason(why); err != nil || got != EvictKeptRooted {
+			t.Errorf("exportEvictReason(%q) = %q, %v; want %q", why, got, err, EvictKeptRooted)
+		}
+		if !f.exists(digest) {
+			t.Errorf("%s gone; want it kept", digest)
+		}
+	})
 }
 
 // TestEvictSharedPerBlob pins the narrow-mode per-blob shared-set read: an
