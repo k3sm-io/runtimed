@@ -1162,7 +1162,7 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 		var nameErr *mount.ShareVolumeNameError
 		if errors.As(err, &nameErr) {
 			what = fmt.Sprintf("container %s: volume %s is not a single path component, so it cannot name a share directory",
-				image.QuoteBounded(nameErr.Container, maxArtifactRefBytes), image.QuoteBounded(nameErr.Volume, maxArtifactRefBytes))
+				image.QuoteBounded(nameErr.Container, maxReplyNameBytes), image.QuoteBounded(nameErr.Volume, maxReplyNameBytes))
 		}
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			vmPodStartError(box.GetPodId(), what,
@@ -2452,10 +2452,10 @@ var errAdHocSign = errors.New("ad-hoc sign")
 type clientMessageError struct {
 	message string
 	err     error
-	// unquoted publishes message in an RPC reply as it is, not quoted: an
-	// image volume's refusal is matched by its leading stable reason. Its
-	// message quotes everything the pod wrote that is not a validated name.
-	unquoted bool
+	// sentinel is set only by artifactRefusal, whose message begins with
+	// sentinel's text and is published unquoted, as it is (startErrorReply):
+	// the provider matches an image volume's refusal by that leading text.
+	sentinel error
 }
 
 func (e *clientMessageError) Error() string { return e.err.Error() }
@@ -2464,12 +2464,6 @@ func (e *clientMessageError) Unwrap() error { return e.err }
 // withClientMessage pairs err with the fixed sentence a client sees in its place.
 func withClientMessage(message string, err error) error {
 	return &clientMessageError{message: message, err: err}
-}
-
-// withArtifactMessage is withClientMessage for an image volume's refusal,
-// whose reply begins with its stable reason, unquoted (startErrorReply).
-func withArtifactMessage(message string, err error) error {
-	return &clientMessageError{message: message, err: err, unquoted: true}
 }
 
 // spawnStartError is the start failure for container name whose spawn failed

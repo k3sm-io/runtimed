@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/image"
@@ -30,6 +31,13 @@ import (
 
 // The stable reasons a refused image volume carries, for the provider's Pod
 // Event. A CreatePod error that wraps one of these begins with its text.
+//
+// Consumer contract: the provider matches a refusal BY TEXT. It reads the
+// leading sentinel text ("ArtifactPullRefused" / "ArtifactMountRefused"), then
+// ": ", then the subject token "pod <id> image volume <name>:" (or "pod <id>:"
+// for a pod-level refusal) to attribute the refusal to a volume. Changing a
+// sentinel's text or that token's shape breaks the provider; the one renderer
+// is artifactRefusal, and TestArtifactRefusalReplyShape pins every sentence.
 var (
 	// ErrArtifactPullRefused: the artifact could not be fetched into the node
 	// cache (a foreign registry, a refused type, a short volume, a transfer
@@ -78,17 +86,27 @@ func artifactPullReason(err error) runtimev1.FailureReason {
 // PullArtifact resolves its manifest and finds every layer cached. A non-empty
 // paths is refused before any request, never served as the whole artifact.
 func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (mount.ImageViews, runtimev1.FailureReason, error) {
+	pod := podSubject(box.GetPodId())
 	vols, err := mount.ImageVolumes(box)
 	if err != nil {
+		// The only refusal ImageVolumes has is a volume naming a subset of
+		// paths; its error carries the volume's name raw, so the sentence
+		// names the volume through volumeSubject instead.
+		subject := pod
+		if v := pathsVolume(box); v != nil {
+			subject = volumeSubject(box.GetPodId(), v.GetName())
+		}
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
-			fmt.Errorf("%w: pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err)
+			artifactRefusal(ErrArtifactMountRefused, subject,
+				"it names a subset of the artifact's paths, which this runtime does not serve", err)
 	}
 	if len(vols) == 0 {
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 	}
 	if r.artifacts == nil {
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
-			fmt.Errorf("%w: pod %s: this node has no cluster registry configured", ErrArtifactPullRefused, box.GetPodId())
+			artifactRefusal(ErrArtifactPullRefused, pod, "this node has no cluster registry configured",
+				errors.New("no artifact puller"))
 	}
 	if r.views == nil {
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
@@ -96,9 +114,7 @@ func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (
 	}
 	if err := r.holdArtifacts(ctx, box, vols); err != nil {
 		return mount.ImageViews{}, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			withArtifactMessage(fmt.Sprintf("%s: pod %s: its artifact hold could not be recorded; the daemon log has the cause",
-				ErrArtifactMountRefused, box.GetPodId()),
-				fmt.Errorf("%w: pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err))
+			artifactRefusal(ErrArtifactMountRefused, pod, "its artifact hold could not be recorded", err)
 	}
 	views := mount.ImageViews{Root: r.views.Root(), ByVolume: make(map[string]string, len(vols))}
 	for _, v := range vols {
@@ -113,40 +129,32 @@ func (r *Runtime) imageVolumeViews(ctx context.Context, box *runtimev1.PodBox) (
 
 // imageVolumeView fetches vol's reference and returns its whole-artifact view.
 // An error begins with its stable reason, then names the pod and the volume.
+// Every refusal is a fixed sentence (artifactRefusal): a reference error
+// quotes what the pod wrote, a credential or fetch error can name the
+// artifact store, the cache or a staging path, so none is published.
 func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vol *runtimev1.Volume) (string, runtimev1.FailureReason, error) {
 	ref := vol.GetImage().GetReference()
-	// subject is the "pod <id> image volume <name>" token every refusal of vol
-	// carries after its stable reason; the provider attributes it by that.
-	subject := fmt.Sprintf("pod %s image volume %s", box.GetPodId(), vol.GetName())
+	subject := volumeSubject(box.GetPodId(), vol.GetName())
 	quoted := image.QuoteBounded(ref, maxArtifactRefBytes)
-	// pullRefused publishes err whole: a malformed reference, a foreign
-	// registry or a cancellation names only what the pod wrote.
-	pullRefused := func(err error) (string, runtimev1.FailureReason, error) {
-		return "", artifactPullReason(err),
-			fmt.Errorf("%w: %s: %w", ErrArtifactPullRefused, subject, err)
-	}
-	// fetchRefused publishes a fixed sentence in err's place: a credential or
-	// fetch error can name the artifact store, the cache or a staging path.
-	// Its class is the one artifactPullReason types, never err's text.
-	fetchRefused := func(err error) (string, runtimev1.FailureReason, error) {
+	// pullRefused publishes the fixed sentence of err's class, which
+	// artifactPullReason types; never err's text.
+	pullRefused := func(what string, err error) (string, runtimev1.FailureReason, error) {
 		reason := artifactPullReason(err)
-		return "", reason, withArtifactMessage(
-			fmt.Sprintf("%s: %s: image %s could not be fetched%s; the daemon log has the cause",
-				ErrArtifactPullRefused, subject, quoted, artifactPullClass(reason)),
-			fmt.Errorf("%w: %s: %w", ErrArtifactPullRefused, subject, err))
+		return "", reason, artifactRefusal(ErrArtifactPullRefused, subject,
+			fmt.Sprintf("image %s %s%s", quoted, what, artifactPullClass(reason)), err)
 	}
 	if err := image.ValidateReference(ref); err != nil {
-		return pullRefused(err)
+		return pullRefused("is not a valid reference", err)
 	}
 	// The host is checked before any credential is resolved, as the RPC does,
 	// so naming a foreign registry never makes the daemon read a Secret.
 	if err := r.artifacts.CheckHost(ref); err != nil {
-		return pullRefused(err)
+		return pullRefused("could not be fetched", err)
 	}
 	select {
 	case r.artifactSem <- struct{}{}:
 	case <-ctx.Done():
-		return pullRefused(ctx.Err())
+		return pullRefused("was not fetched before the request ended", ctx.Err())
 	}
 	res, err := func() (*artifact.Result, error) {
 		defer func() { <-r.artifactSem }()
@@ -157,7 +165,7 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
 	}()
 	if err != nil {
-		return fetchRefused(err)
+		return pullRefused("could not be fetched", err)
 	}
 	// The lease pins the blobs until the pod's hold names the manifest; from
 	// then on the hold keeps the manifest's blobs and views for the pod's life,
@@ -165,20 +173,99 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	defer res.Lease.Release()
 	if err := r.holdManifest(ctx, box, res); err != nil {
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			withArtifactMessage(fmt.Sprintf("%s: %s: image %s could not be recorded in the pod's artifact hold; the daemon log has the cause",
-				ErrArtifactMountRefused, subject, quoted),
-				fmt.Errorf("%w: %s: %w", ErrArtifactMountRefused, subject, err))
+			artifactRefusal(ErrArtifactMountRefused, subject,
+				fmt.Sprintf("image %s could not be recorded in the pod's artifact hold", quoted), err)
 	}
 	view, err := r.views.View(ctx, res.ManifestDigest, nil)
 	if err != nil {
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			withArtifactMessage(fmt.Sprintf("%s: %s: the view of image %s could not be built; the daemon log has the cause",
-				ErrArtifactMountRefused, subject, quoted),
-				fmt.Errorf("%w: %s: build view of %s: %w", ErrArtifactMountRefused, subject, res.ManifestDigest, err))
+			artifactRefusal(ErrArtifactMountRefused, subject,
+				fmt.Sprintf("the view of image %s could not be built", quoted),
+				fmt.Errorf("build view of %s: %w", res.ManifestDigest, err))
 	}
 	r.log.Info("image volume view ready", "pod", box.GetPodId(), "reference", ref, "digest", res.ManifestDigest, "fetched", res.Fetched)
 	return view, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
+
+// pathsVolume is the volume mount.ImageVolumes refuses for naming a subset of
+// paths: the first mounted image volume of box, in declaration order, with a
+// non-empty paths. nil if there is none.
+func pathsVolume(box *runtimev1.PodBox) *runtimev1.Volume {
+	mounted := map[string]bool{}
+	for _, c := range append(append([]*runtimev1.Container{}, box.GetInitContainers()...), box.GetContainers()...) {
+		for _, vm := range c.GetVolumeMounts() {
+			mounted[vm.GetName()] = true
+		}
+	}
+	for _, v := range box.GetVolumes() {
+		if v.GetImage() != nil && mounted[v.GetName()] && len(v.GetImage().GetPaths()) > 0 {
+			return v
+		}
+	}
+	return nil
+}
+
+// daemonLogTail ends every fixed refusal sentence. artifactRefusal keeps it
+// whole however long the detail before it is.
+const daemonLogTail = "; the daemon log has the cause"
+
+// artifactRefusal is the one renderer of an image volume's refusal. Its client
+// sentence is sentinel.Error() + ": " + subject + ": " + sentence +
+// daemonLogTail, bounded to maxReplyMessageBytes with the tail kept, and is
+// published unquoted (startErrorReply) because the provider matches its
+// leading text. Its error wraps sentinel and cause, and reads the same prefix,
+// so the daemon log keeps the cause. subject is podSubject or volumeSubject,
+// never a raw name; sentence quotes anything else the pod wrote.
+func artifactRefusal(sentinel error, subject, sentence string, cause error) error {
+	head := sentinel.Error() + ": " + subject + ": "
+	return &clientMessageError{
+		message:  head + boundKeepingTail(sentence, maxReplyMessageBytes-len(head)-len(daemonLogTail)) + daemonLogTail,
+		err:      fmt.Errorf("%w: %s: %w", sentinel, subject, cause),
+		sentinel: sentinel,
+	}
+}
+
+// boundKeepingTail cuts s to at most limit bytes on a rune boundary, marking a
+// cut with "...".
+func boundKeepingTail(s string, limit int) string {
+	if limit < len("...") {
+		limit = len("...")
+	}
+	if len(s) <= limit {
+		return s
+	}
+	return strings.ToValidUTF8(s[:limit-len("...")], "") + "..."
+}
+
+// podSubject is the "pod <id>" token of a pod-level refusal. An id that is
+// not a valid pod id is not echoed as written: it is quoted and bounded, so
+// no control byte or newline reaches the reply.
+func podSubject(podID string) string {
+	if _, err := image.ParsePodID(podID); err != nil {
+		return "pod " + image.QuoteBounded(podID, maxReplyNameBytes)
+	}
+	return "pod " + podID
+}
+
+// volumeSubject is the "pod <id> image volume <name>" token the provider
+// attributes a refusal by. A name that is not a DNS-1123 label (what a
+// Kubernetes volume name is) is never echoed: the token then reads
+// "pod <id> image volume (an invalid name)", which carries no byte the pod
+// wrote.
+func volumeSubject(podID, name string) string {
+	if validContainerLabel(name) != nil {
+		return podSubject(podID) + " image volume " + invalidVolumeName
+	}
+	return podSubject(podID) + " image volume " + name
+}
+
+// invalidVolumeName stands in volumeSubject for a name that is not a DNS-1123
+// label; the parentheses cannot begin a label, so it cannot be mistaken for one.
+const invalidVolumeName = "(an invalid name)"
+
+// maxReplyNameBytes bounds a name the pod wrote (a pod id, a container or a
+// volume name) quoted into a reply's fixed sentence.
+const maxReplyNameBytes = 128
 
 // linkedImageViews re-derives a host-process pod's granted artifact views from
 // its links (mount.LinkedImageViews), for a profile recompiled at attach.
@@ -200,9 +287,8 @@ const maxArtifactRefBytes = 512
 // artifactViewsUnavailable is the refusal of pod podID's image volumes when
 // the daemon could not open its artifact views; viewsErr names the views root.
 func artifactViewsUnavailable(podID string, viewsErr error) error {
-	return withArtifactMessage(fmt.Sprintf("%s: pod %s: artifact views are unavailable on this node; the daemon log has the cause",
-		ErrArtifactMountRefused, podID),
-		fmt.Errorf("%w: pod %s: artifact views unavailable: %w", ErrArtifactMountRefused, podID, viewsErr))
+	return artifactRefusal(ErrArtifactMountRefused, podSubject(podID), "artifact views are unavailable on this node",
+		fmt.Errorf("artifact views unavailable: %w", viewsErr))
 }
 
 // artifactPullClass names, for a fixed fetch refusal, the class a pod author
