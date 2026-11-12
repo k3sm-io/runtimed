@@ -810,7 +810,10 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 		return IndexEntry{}, fmt.Errorf("%w: manifest for %q names %q",
 			ErrIndexEntryCorrupt, what, mfst.GetReference())
 	}
-	if err := validateRecordedBlobDigests(what, mfst); err != nil {
+	// The record's own key is passed beside what: List names the record by its
+	// hashed file name, and an operator cannot find the image behind a refused
+	// entry from that alone.
+	if err := validateRecordedBlobDigests(what, e.Reference, e.Platform.platform(), mfst); err != nil {
 		return IndexEntry{}, err
 	}
 	out := IndexEntry{
@@ -853,9 +856,14 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 // An EMPTY digest is not checked: manifestDigests skips it, so it never becomes
 // a lease key, and records carrying a manifest without a config (the
 // pre-retention shape) stay readable.
-func validateRecordedBlobDigests(what string, mfst *runtimev1.ImageManifest) error {
+//
+// ref and p are the record's OWN reference and platform, as decoded from it.
+// They are named in the error beside what so a refused entry can be found and
+// re-pulled or removed by the key an operator knows, not only by a file hash.
+// FileIndex has no logger, so the error is the only report.
+func validateRecordedBlobDigests(what, ref string, p Platform, mfst *runtimev1.ImageManifest) error {
 	if err := checkBlobDigests(mfst); err != nil {
-		return fmt.Errorf("%w: %q: %v", ErrIndexEntryCorrupt, what, err)
+		return fmt.Errorf("%w: %q (recorded as %q/%s): %v", ErrIndexEntryCorrupt, what, ref, p, err)
 	}
 	return nil
 }

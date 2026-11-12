@@ -97,10 +97,22 @@ func TestIndexRefusesNonCanonicalBlobDigests(t *testing.T) {
 				}
 				writeEntryFile(t, cache, name, bytes.Replace(buf, []byte(placeholder), []byte(tc.digest), 1))
 
+				// A refused entry must be findable: the error names the record's
+				// reference and platform, not only the hashed file name.
+				findable := func(op string, err error) {
+					t.Helper()
+					for _, want := range []string{ref, p.String(), pos.name} {
+						if !strings.Contains(err.Error(), want) {
+							t.Errorf("%s error %q does not name %q", op, err, want)
+						}
+					}
+				}
 				got, ok, err := idx.Get(context.Background(), ref, p)
 				if tc.wantErr {
 					if !errors.Is(err, ErrIndexEntryCorrupt) {
 						t.Errorf("Get = (%v, %v, %v), want ErrIndexEntryCorrupt", got, ok, err)
+					} else {
+						findable("Get", err)
 					}
 				} else if err != nil || !ok {
 					t.Errorf("Get = (%v, %v, %v), want the entry", got, ok, err)
@@ -110,6 +122,11 @@ func TestIndexRefusesNonCanonicalBlobDigests(t *testing.T) {
 				if tc.wantErr {
 					if !errors.Is(err, ErrIndexEntryCorrupt) {
 						t.Errorf("List = (%v, %v), want ErrIndexEntryCorrupt", list, err)
+					} else {
+						findable("List", err)
+						if !strings.Contains(err.Error(), name) {
+							t.Errorf("List error %q does not name the entry file %q", err, name)
+						}
 					}
 				} else if err != nil || len(list) != 1 {
 					t.Errorf("List = (%v, %v), want the one entry", list, err)
