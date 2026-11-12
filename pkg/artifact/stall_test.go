@@ -229,12 +229,14 @@ func (b *slowBody) Close() error { return nil }
 // once the bytes are in and before the record is written, a reclaim pass
 // still finds the blobs leased instead of unreferenced.
 func TestPullArtifactLeaseOutlivesSlowBlob(t *testing.T) {
-	const ttl = 200 * time.Millisecond
+	// A 1 s lease with a byte every 100 ms for about 2.5 s: only a pause near
+	// a whole second between two bytes could lapse it falsely.
+	const ttl = time.Second
 	e := newEnv(t)
-	weights := "0123456789abcdefghijklmnopqrstuvwxyz" // 36 bytes, 20ms apart: > 3 TTLs
+	weights := "0123456789abcdefghijklmn" // 24 bytes, 100ms apart: ~2.4 s, > 2 TTLs
 	e.fetch.publishModel(testRef, modelLayer("w.safetensors", weights))
 	f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
-		return &slowBody{r: bytes.NewReader(data), gap: 20 * time.Millisecond}
+		return &slowBody{r: bytes.NewReader(data), gap: 100 * time.Millisecond}
 	}}
 	p := stallPuller(t, e, f, &fakeIdle{})
 	p.deps.Leases = &shortLeaser{inner: e.cache, ttl: ttl}
@@ -308,5 +310,88 @@ func TestFetchWithoutProgressDoesNotRenew(t *testing.T) {
 	}
 	if n := renews.Load(); n != 0 {
 		t.Errorf("a transfer that moved no byte renewed the lease %d times, want 0", n)
+	}
+}
+
+// countingBody returns its bytes one per read and counts the non-empty reads
+// on a counter shared across transfers.
+type countingBody struct {
+	r     io.Reader
+	reads *atomic.Int32
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := iotest.OneByteReader(b.r).Read(p)
+	if n > 0 {
+		b.reads.Add(1)
+	}
+	return n, err
+}
+
+func (b *countingBody) Close() error { return nil }
+
+// TestFetchRenewsPerRead pins renewal by progress without a clock: two blobs
+// fetched in one fetchAll call, each over several reads, call renew at least
+// once per non-empty read; a nil renew is accepted.
+func TestFetchRenewsPerRead(t *testing.T) {
+	tests := []struct {
+		name  string
+		renew bool
+	}{
+		{"counting renew", true},
+		{"nil renew", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fetch.publishModel(testRef, modelLayer("a.safetensors", "alpha"), modelLayer("b.safetensors", "bravo-two"))
+			var reads, renews atomic.Int32
+			f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
+				return &countingBody{r: bytes.NewReader(data), reads: &reads}
+			}}
+			p := stallPuller(t, e, f, &fakeIdle{})
+			missing := []blob{
+				{digest: digestOfBytes([]byte("alpha")), size: int64(len("alpha"))},
+				{digest: digestOfBytes([]byte("bravo-two")), size: int64(len("bravo-two"))},
+			}
+			var renew func()
+			if tc.renew {
+				renew = func() { renews.Add(1) }
+			}
+			if err := p.fetchAll(context.Background(), testRef, nil, missing, nil, renew); err != nil {
+				t.Fatalf("fetchAll: %v", err)
+			}
+			if r := reads.Load(); r < int32(len("alpha")+len("bravo-two")) {
+				t.Fatalf("non-empty reads = %d, want one per byte", r)
+			}
+			if tc.renew {
+				if n, r := renews.Load(), reads.Load(); n < r {
+					t.Errorf("renew called %d times over %d non-empty reads, want at least one per read", n, r)
+				}
+			}
+		})
+	}
+}
+
+// TestRecheckRefetchRenews pins that recheck passes renew through to its
+// refetch: a blob absent at recheck is fetched again, and its bytes renew.
+func TestRecheckRefetchRenews(t *testing.T) {
+	e := newEnv(t)
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", "weights"))
+	var reads, renews atomic.Int32
+	f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
+		return &countingBody{r: bytes.NewReader(data), reads: &reads}
+	}}
+	p := stallPuller(t, e, f, &fakeIdle{})
+	need := []blob{{digest: digestOfBytes([]byte("weights")), size: int64(len("weights"))}}
+	var res Result
+	if err := p.recheck(context.Background(), testRef, nil, need, &res, func() { renews.Add(1) }); err != nil {
+		t.Fatalf("recheck: %v", err)
+	}
+	if !res.Fetched {
+		t.Fatal("recheck did not refetch the absent blob")
+	}
+	if n, r := renews.Load(), reads.Load(); r == 0 || n < r {
+		t.Errorf("renew called %d times over %d non-empty reads of the refetch, want at least one per read", n, r)
 	}
 }

@@ -19,6 +19,7 @@ package image
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,12 +70,21 @@ type Lease struct {
 	// expires. Zero means no total cap.
 	maxEnd time.Time
 
+	// lastRenewNano mirrors lastRenew as unix nanoseconds. It is written only
+	// under c.leaseMu (with lastRenew) and read without it by Renew's fast
+	// path, which uses it purely as an early exit: the locked check stays the
+	// authority on whether a renewal happens.
+	lastRenewNano atomic.Int64
+
 	once sync.Once
 }
 
 // Renew extends the lease to now plus its TTL (capped at maxEnd when set). It
 // is nil-safe and throttled: a call less than a quarter of the TTL after the
-// last renewal changes nothing, so a per-read caller costs one lock.
+// last renewal changes nothing and returns before taking c.leaseMu (an atomic
+// read of lastRenewNano), so a per-read caller neither takes the lock per read
+// nor contends with a reclaim pass. Only a call past the throttle window takes
+// the lock, sweeps expired leases and re-checks the throttle there.
 //
 // A lease that has already lapsed, or was released, is never revived: Renew
 // is a no-op unless this very lease is still in the cache's lease table and
@@ -86,6 +96,12 @@ func (l *Lease) Renew() {
 		return
 	}
 	c := l.c
+	// Fast path: inside the throttle window the locked check below would
+	// return without effect, so skip the lock. A stale read can only send the
+	// call on to the locked path, never past it.
+	if time.Duration(c.now().UnixNano()-l.lastRenewNano.Load()) < l.ttl/4 {
+		return
+	}
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	c.expireLeasesLocked()
@@ -104,6 +120,7 @@ func (l *Lease) Renew() {
 		l.expires = exp
 	}
 	l.lastRenew = now
+	l.lastRenewNano.Store(now.UnixNano())
 }
 
 // Reader wraps r so every read that returns bytes renews the lease. A
@@ -174,6 +191,7 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 	}
 	now := c.now()
 	l := &Lease{c: c, id: c.nextLease, digests: held, ttl: ttl, expires: now.Add(ttl), lastRenew: now}
+	l.lastRenewNano.Store(now.UnixNano())
 	c.leases[l.id] = l
 	return l
 }
