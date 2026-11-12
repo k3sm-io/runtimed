@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -129,8 +131,18 @@ func authenticator(cred *Credential) authn.Authenticator {
 	})
 }
 
+// newAuthTransport builds the authenticating transport for one registry
+// repository. It is a variable so a test can replace it.
+var newAuthTransport = transport.NewWithContext
+
 // Session parses ref and returns an authenticated client for its repository,
 // scoped to pull, over the registry's transport.
+//
+// The client splits requests by origin: one whose scheme and host:port are
+// the registry's goes through the authenticating transport, and any other
+// goes straight to the registry's plain Transport. Real registries redirect
+// blob GETs to object storage on another host; that host must get no
+// credential, and its 401 challenges must never reach the token logic.
 func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (name.Reference, *http.Client, error) {
 	if g.Transport == nil {
 		return nil, nil, ErrTransportRequired
@@ -140,12 +152,51 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 		return nil, nil, err
 	}
 	repo := r.Context()
-	rt, err := transport.NewWithContext(ctx, repo.Registry, authenticator(cred), g.Transport,
+	rt, err := newAuthTransport(ctx, repo.Registry, authenticator(cred), g.Transport,
 		[]string{repo.Scope(transport.PullScope)})
 	if err != nil {
 		return nil, nil, fmt.Errorf("registry auth: %w", bound(err))
 	}
-	return r, &http.Client{Transport: rt}, nil
+	split := &hostSplit{
+		scheme: repo.Registry.Scheme(),
+		host:   canonicalHost(repo.Registry.Scheme(), repo.RegistryStr()),
+		auth:   rt,
+		plain:  g.Transport,
+	}
+	return r, &http.Client{Transport: split}, nil
+}
+
+// hostSplit routes a request to auth when its scheme and host:port are the
+// registry's, and to plain otherwise, so the authenticating transport never
+// sees a request for another origin.
+type hostSplit struct {
+	scheme, host string
+	auth, plain  http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper.
+func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
+	scheme := strings.ToLower(req.URL.Scheme)
+	if scheme == h.scheme && canonicalHost(scheme, req.URL.Host) == h.host {
+		return h.auth.RoundTrip(req)
+	}
+	return h.plain.RoundTrip(req)
+}
+
+// canonicalHost is host lower-cased with the scheme's default port filled in
+// when it names none.
+func canonicalHost(scheme, host string) string {
+	u := url.URL{Host: host}
+	name, port := strings.ToLower(u.Hostname()), u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(name, port)
 }
 
 // Blob opens the size-byte blob digest in ref's repository from offset, with
