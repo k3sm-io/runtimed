@@ -481,10 +481,13 @@ type pinnedFunc func() (map[string]PruneReason, error)
 //
 // leased, when non-nil, is asked about each entry's digest after its pin
 // lookup and immediately before its Lstat and unlink, and an entry it reports
-// leased is kept as ReasonKeptLeased.
+// leased is kept as ReasonKeptLeased. It is called with leaseMu held (see
+// unlinkUnlessLeased) and must not take leaseMu; reclaim passes
+// leaseHasLocked.
 //
 // Per entry the order is: watch check (re-pin if a new lease names this
-// digest), pin lookup, live-lease check, Lstat, grace, unlink. INVARIANT: a
+// digest), pin lookup, then ONE leaseMu critical section holding the
+// live-lease check, Lstat, grace and unlink. INVARIANT: a
 // blob is re-checked against a fresh pin read exactly when a lease taken since
 // the last pin read names its digest; a pull leases every blob it will root
 // before it writes the record or hold; so a blob no such lease names cannot
@@ -492,14 +495,21 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // still held at the live-lease check or has its record and hold seen by the
 // re-read (the pull writes both before releasing its lease).
 //
-// RESIDUAL. The watch check, the lease check and the unlink are separate
-// steps, none of them atomic with AcquireLease. A pull whose AcquireLease
-// lands after this entry's watch check is seen only if its lease is still
-// live at the lease check; a pull that leases, roots and releases entirely
-// between the watch check and the lease check, or that leases after the
-// lease check and roots before the Remove, is not seen. Closing that needs the
-// unlink under a lock AcquireLease also takes. The pull path's own re-check
-// under its lease (pkg/artifact) refetches what such a pass removed.
+// Because AcquireLease takes leaseMu too, a lease naming the entry's digest
+// either returns before the critical section (and, if still live there,
+// keeps the blob) or returns only after the Remove is done.
+//
+// RESIDUAL. The watch check and the critical section are separate steps, and
+// only the second is atomic with AcquireLease. A pull that leases after this
+// entry's watch check, roots the blob and releases its lease, all before the
+// critical section, is not seen: no live lease names the blob there and the
+// stale pin set does not either, so it is unlinked.
+//
+// The pull path's own presence re-check under its lease (pkg/artifact)
+// refetches a removed blob only when the Remove precedes that re-check. The
+// critical section guarantees that for every lease whose AcquireLease returns
+// after it, because the re-check runs after AcquireLease returns. It does not
+// for the residual above: there the re-check ran before the Remove.
 func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, leased func(digest string) bool) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
@@ -557,41 +567,55 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
 			continue
 		}
-		if leased != nil && d.Node.Digest != "" && leased(d.Node.Digest) {
-			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
-			continue
-		}
-		rel := d.Node.Path
-		if cls, _ := classifyBlobRel(rel); cls == relInvalid {
-			skip(d, "path fails blob grammar")
-			continue
-		}
-		fi, err := root.Lstat(rel)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				skip(d, "already absent")
-			} else {
-				skip(d, fmt.Sprintf("lstat: %v", err))
-			}
-			continue
-		}
-		if !fi.Mode().IsRegular() {
-			skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
-			continue
-		}
-		if now.Sub(fi.ModTime()) < grace {
-			skip(d, "younger than grace")
-			continue
-		}
-		if err := root.Remove(rel); err != nil {
-			skip(d, fmt.Sprintf("remove: %v", err))
-			continue
-		}
-		rep.Deleted++
-		rep.DeletedBytes += fi.Size()
-		if d.Node.Digest != "" {
-			rep.Removed = append(rep.Removed, d.Node.Digest)
-		}
+		c.unlinkUnlessLeased(root, d, grace, now, leased, rep, skip)
 	}
 	return rep, nil
+}
+
+// unlinkUnlessLeased runs one entry's live-lease check, Lstat, grace check and
+// Remove inside ONE leaseMu critical section, so an AcquireLease naming the
+// entry's digest either returns before the check (the entry is kept as
+// ReasonKeptLeased) or blocks until the Remove is done. leased, when non-nil,
+// is therefore called with leaseMu held and must not take it.
+func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, leased func(digest string) bool, rep *ExecuteReport, skip func(PruneDecision, string)) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if leased != nil && d.Node.Digest != "" && leased(d.Node.Digest) {
+		rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
+		return
+	}
+	rel := d.Node.Path
+	if cls, _ := classifyBlobRel(rel); cls == relInvalid {
+		skip(d, "path fails blob grammar")
+		return
+	}
+	fi, err := root.Lstat(rel)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			skip(d, "already absent")
+		} else {
+			skip(d, fmt.Sprintf("lstat: %v", err))
+		}
+		return
+	}
+	if !fi.Mode().IsRegular() {
+		skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
+		return
+	}
+	if now.Sub(fi.ModTime()) < grace {
+		skip(d, "younger than grace")
+		return
+	}
+	if c.beforePruneUnlink != nil {
+		c.beforePruneUnlink(d.Node.Digest)
+	}
+	if err := root.Remove(rel); err != nil {
+		skip(d, fmt.Sprintf("remove: %v", err))
+		return
+	}
+	rep.Deleted++
+	rep.DeletedBytes += fi.Size()
+	if d.Node.Digest != "" {
+		rep.Removed = append(rep.Removed, d.Node.Digest)
+	}
 }

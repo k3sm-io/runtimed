@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1052,7 +1053,7 @@ func TestReclaimKeepsBlobRootedMidBatch(t *testing.T) {
 		lease.Release()
 	}
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	rep, err := f.cache.executePrune(planOf(stray, held), 0, f.clock, nil, pinned, f.cache.leaseHas)
+	rep, err := f.cache.executePrune(planOf(stray, held), 0, f.clock, nil, pinned, f.cache.leaseHasLocked)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -1113,7 +1114,7 @@ func TestReclaimSkipsRepinForUnrelatedLease(t *testing.T) {
 				reads++
 				return f.cache.pinnedNow(nil)
 			}
-			if _, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned, f.cache.leaseHas); err != nil {
+			if _, err := f.cache.executePrune(planOf(first, second), 0, f.clock, nil, pinned, f.cache.leaseHasLocked); err != nil {
 				t.Fatalf("executePrune: %v", err)
 			}
 			if !fired {
@@ -1128,5 +1129,67 @@ func TestReclaimSkipsRepinForUnrelatedLease(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestExecutePruneOrdersALeaseAgainstTheUnlink races an AcquireLease against
+// one planned blob's unlink, from the point after every re-check passed and
+// just before the Remove. A pull that leases the blob and then finds it
+// present must keep it: either its lease lands before the executor's lease
+// check (kept as leased), or it lands after the Remove and the pull finds the
+// blob absent and refetches. The failure is the third ordering — the lease
+// lands, the pull sees the blob, and the unlink still happens.
+//
+// The hook runs while the executor may hold leaseMu, so it cannot simply call
+// AcquireLease: TryLock only decides whether it may lease in line (nothing
+// orders the lease against the unlink) or must lease from a goroutine that
+// AcquireLease blocks until the executor lets go. The assertion is about the
+// blob, not the lock.
+func TestExecutePruneOrdersALeaseAgainstTheUnlink(t *testing.T) {
+	f := newGCFixture(t)
+	b := f.blob("planned blob a pull leases at its unlink", 24*time.Hour)
+
+	type sighting struct {
+		lease   *Lease
+		present bool
+	}
+	seen := make(chan sighting, 1)
+	pull := func() {
+		l := f.cache.AcquireLease([]string{b}, time.Hour)
+		seen <- sighting{lease: l, present: f.cache.Has(b)}
+	}
+	fired := false
+	f.cache.beforePruneUnlink = func(digest string) {
+		if fired || digest != b {
+			return
+		}
+		fired = true
+		if f.cache.leaseMu.TryLock() {
+			f.cache.leaseMu.Unlock()
+			pull()
+			return
+		}
+		go pull()
+	}
+	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
+	rep, err := f.cache.executePrune(planOf(b), 0, f.clock, nil, pinned, f.cache.leaseHasLocked)
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
+	}
+	if !fired {
+		t.Fatal("the hook never ran, so the window was not driven")
+	}
+	var s sighting
+	select {
+	case s = <-seen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pull's AcquireLease never returned after the pass")
+	}
+	defer s.lease.Release()
+	if s.present && !f.exists(b) {
+		t.Fatal("a pull leased the blob and found it present, and the executor still unlinked it")
+	}
+	if !s.present && !slices.Contains(rep.Removed, b) {
+		t.Errorf("the pull found the blob absent but the pass did not report removing it: %v", rep.Removed)
 	}
 }

@@ -70,6 +70,14 @@ type Cache struct {
 	// unlink; production never sets it.
 	beforePruneBlob func(digest string)
 
+	// beforePruneUnlink, when set, runs inside executePrune's loop after an
+	// entry passed every re-check and immediately before its Remove, with
+	// that entry's digest, while executePrune holds leaseMu (see
+	// executePrune). It is UNEXPORTED and exists only so an in-package test
+	// can race an AcquireLease against the unlink; production never sets it.
+	// It must not take leaseMu itself.
+	beforePruneUnlink func(digest string)
+
 	// operatorMu serializes the read-modify-write of the OPERATOR reachability
 	// record (operatorroots.go). That record is a single file holding every
 	// operator-owned root, so two concurrent tag/untag/pull calls would otherwise

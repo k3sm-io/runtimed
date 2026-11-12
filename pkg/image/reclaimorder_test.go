@@ -289,7 +289,7 @@ func TestExecutePruneKeepsABlobLeasedMidBatch(t *testing.T) {
 		return false
 	}
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	leased := func(d string) bool { return f.cache.leasedDigests()[d] }
+	leased := f.cache.leaseHasLocked // executePrune calls it under leaseMu
 	rep, err := f.cache.executePrune(planOf(a, b), 0, f.clock, stop, pinned, leased)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
