@@ -1012,3 +1012,66 @@ func keptReason(rep *ReclaimReport, digest string) PruneReason {
 	}
 	return ""
 }
+
+// TestReclaimKeepsBlobRootedMidBatch drives a complete artifact cache hit
+// (lease, record, hold, release) into one batch after its pin read and before
+// the executor reaches the pulled blob, which is queued later in that batch.
+// The stale pin set does not name it and its lease is gone by the time the
+// executor examines it, so only a re-read of the pins triggered by the lease
+// generation can see the record and hold that root it. The unrooted blob
+// examined first is still unlinked, so the batch is not vacuous.
+func TestReclaimKeepsBlobRootedMidBatch(t *testing.T) {
+	f := newGCFixture(t)
+	stray := f.blob("unreferenced layer examined first", 24*time.Hour)
+	held := f.blob("artifact layer pulled mid-batch", 24*time.Hour)
+	pid := f.pod("pod-artifact")
+	x, err := NewFileIndex(f.cache)
+	if err != nil {
+		t.Fatalf("NewFileIndex: %v", err)
+	}
+	sum := sha256.Sum256([]byte("mid-batch artifact manifest"))
+	manifest := "sha256:" + hex.EncodeToString(sum[:])
+	key := "registry.example/models/m:mid@" + testModelType
+
+	pulled := false
+	f.cache.beforePruneBlob = func(digest string) {
+		if pulled || digest != stray {
+			return
+		}
+		pulled = true
+		lease := f.cache.AcquireLease([]string{held}, time.Minute)
+		if !f.cache.Has(held) {
+			t.Errorf("the cache hit found its blob absent before the executor reached it")
+		}
+		putTypedArtifact(t, x, key, testModelType, held, held)
+		if err := x.AddArtifactHoldManifest(context.Background(), pid, HeldManifest{
+			Digest: manifest, Config: held, Layers: []string{held},
+		}); err != nil {
+			t.Errorf("AddArtifactHoldManifest: %v", err)
+		}
+		lease.Release()
+	}
+	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
+	rep, err := f.cache.executePrune(planOf(stray, held), 0, f.clock, nil, pinned, f.cache.leaseHas)
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
+	}
+	if !pulled {
+		t.Fatal("the hook never ran, so the window was not driven")
+	}
+	if !f.exists(held) {
+		t.Errorf("a blob a record and a hold rooted mid-batch was deleted")
+	}
+	if f.exists(stray) {
+		t.Errorf("the unrooted blob survived, so the batch proved nothing")
+	}
+	var reason PruneReason
+	for _, k := range rep.pinned {
+		if k.Digest == held {
+			reason = k.Reason
+		}
+	}
+	if reason != ReasonKeptInUse {
+		t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+	}
+}
