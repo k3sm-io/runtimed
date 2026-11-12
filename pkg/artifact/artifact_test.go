@@ -208,13 +208,20 @@ func (f *fakeFetcher) publishModel(ref string, layers ...layer) []byte {
 	return f.publish(ref, artifactv1.ArtifactTypeModel, artifactv1.MediaTypeModelConfig, layers)
 }
 
+// countingReclaimer counts real passes in calls and dry runs in dry; a dry run
+// reports gain as the bytes its plan would free.
 type countingReclaimer struct {
 	calls atomic.Int32
+	dry   atomic.Int32
 	free  *atomic.Uint64 // raised by a pass when non-nil
 	gain  uint64
 }
 
-func (r *countingReclaimer) ReclaimUnderPressure(context.Context, image.ReclaimConfig) (*image.ReclaimReport, error) {
+func (r *countingReclaimer) ReclaimUnderPressure(_ context.Context, cfg image.ReclaimConfig) (*image.ReclaimReport, error) {
+	if cfg.DryRun {
+		r.dry.Add(1)
+		return &image.ReclaimReport{DryRun: true, ReclaimedBytes: int64(r.gain)}, nil
+	}
 	r.calls.Add(1)
 	if r.free != nil {
 		r.free.Add(r.gain)
@@ -632,8 +639,9 @@ func TestPullArtifactChecksSpaceBeforeFirstByte(t *testing.T) {
 	if !errors.Is(err, ErrInsufficientSpace) {
 		t.Fatalf("err = %v, want ErrInsufficientSpace", err)
 	}
-	if e.reclaim.calls.Load() != 1 {
-		t.Errorf("reclaim passes = %d, want exactly 1", e.reclaim.calls.Load())
+	// Reclaim plans to free nothing, so no real pass evicts anything.
+	if e.reclaim.dry.Load() != 1 || e.reclaim.calls.Load() != 0 {
+		t.Errorf("dry runs = %d, real passes = %d, want 1 and 0", e.reclaim.dry.Load(), e.reclaim.calls.Load())
 	}
 	if e.fetch.blobCalls.Load() != 0 {
 		t.Error("a byte was fetched before the space check")
@@ -647,6 +655,9 @@ func TestPullArtifactChecksSpaceBeforeFirstByte(t *testing.T) {
 	res, err := e.puller(t).PullArtifact(context.Background(), testRef, nil, volume, nil)
 	if err != nil {
 		t.Fatalf("after a productive reclaim: %v", err)
+	}
+	if e.reclaim.calls.Load() != 1 {
+		t.Errorf("real reclaim passes = %d, want exactly 1", e.reclaim.calls.Load())
 	}
 	res.Lease.Release()
 }

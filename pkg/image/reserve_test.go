@@ -371,12 +371,29 @@ func TestPullRefusesHostileDeclaredSizes(t *testing.T) {
 	}
 }
 
-// countingReclaimer is a SpaceReclaimer that only counts its passes.
-type countingReclaimer struct{ passes atomic.Int32 }
+// countingReclaimer is a SpaceReclaimer that counts its dry and real passes
+// separately. A dry run reports reclaimable bytes, or dryErr; a real pass adds
+// reclaimable to *free when free is set.
+type countingReclaimer struct {
+	dry, real   atomic.Int32
+	reclaimable int64
+	dryErr      error
+	free        *atomic.Uint64
+}
 
-func (c *countingReclaimer) ReclaimUnderPressure(context.Context, ReclaimConfig) (*ReclaimReport, error) {
-	c.passes.Add(1)
-	return &ReclaimReport{}, nil
+func (c *countingReclaimer) ReclaimUnderPressure(_ context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
+	if cfg.DryRun {
+		c.dry.Add(1)
+		if c.dryErr != nil {
+			return nil, c.dryErr
+		}
+		return &ReclaimReport{DryRun: true, ReclaimedBytes: c.reclaimable}, nil
+	}
+	c.real.Add(1)
+	if c.free != nil {
+		c.free.Add(uint64(c.reclaimable))
+	}
+	return &ReclaimReport{ReclaimedBytes: c.reclaimable}, nil
 }
 
 func fixedTotalBytes(n uint64) TotalBytesFunc {
@@ -385,24 +402,25 @@ func fixedTotalBytes(n uint64) TotalBytesFunc {
 
 // TestReserveRefusesAboveCapacityWithoutReclaim: a claim larger than the
 // whole volume is refused with no reclaim pass, since no eviction could make
-// it fit; a claim short of free space but within capacity still gets exactly
-// one pass, also when only the bytes other pulls hold push it past capacity;
-// and a capacity that cannot be sampled refuses without a pass.
+// it fit; a claim short of free space but within capacity gets a dry run (here
+// planning nothing, so no real pass); a claim past capacity only with the bytes
+// other pulls hold gets no pass; and a capacity that cannot be sampled refuses
+// without a pass.
 func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 	const floor, free, capacity = 100, 1_000, 10_000
 	for _, tc := range []struct {
-		name       string
-		need       uint64
-		held       uint64
-		total      TotalBytesFunc
-		wantErr    error
-		wantPasses int32
+		name    string
+		need    uint64
+		held    uint64
+		total   TotalBytesFunc
+		wantErr error
+		wantDry int32
 	}{
 		{name: "above_capacity", need: capacity, total: fixedTotalBytes(capacity), wantErr: ErrDeclaredSizeRejected},
 		{name: "capacity_unknown", need: free, total: func(string) (uint64, error) { return 0, errors.New("statfs: EIO") }, wantErr: ErrFreeSpaceUnknown},
-		{name: "above_free_within_capacity", need: free, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
-		{name: "exactly_capacity", need: capacity - floor, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
-		{name: "above_capacity_only_with_held", need: capacity / 2, held: capacity / 2, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
+		{name: "above_free_within_capacity", need: free, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantDry: 1},
+		{name: "exactly_capacity", need: capacity - floor, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantDry: 1},
+		{name: "above_capacity_only_with_held", need: capacity / 2, held: capacity / 2, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ledger := &SpaceLedger{held: tc.held}
@@ -414,8 +432,11 @@ func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Reserve error = %v, want %v", err, tc.wantErr)
 			}
-			if got := rec.passes.Load(); got != tc.wantPasses {
-				t.Errorf("reclaim passes = %d, want %d", got, tc.wantPasses)
+			if got := rec.dry.Load(); got != tc.wantDry {
+				t.Errorf("dry-run passes = %d, want %d", got, tc.wantDry)
+			}
+			if got := rec.real.Load(); got != 0 {
+				t.Errorf("real reclaim passes = %d, want 0", got)
 			}
 			if tc.name == "above_capacity" && !strings.Contains(err.Error(), "exceeds the volume's capacity") {
 				t.Errorf("refusal %q does not say the claim exceeds the volume's capacity", err)
@@ -459,5 +480,60 @@ func TestPullRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 	}
 	if n := samples.Load(); n != 2 {
 		t.Errorf("free space sampled %d times, want 2 (admission and reservation, no reclaim pass)", n)
+	}
+}
+
+// TestReserveRefusesBeyondReclaimableWithoutEviction: a claim that free space
+// plus what reclaim could free cannot satisfy is refused after a dry run with
+// no real pass, so the unreferenced cache is not evicted for nothing; a claim
+// that fits exactly gets one real pass; a dry-run error refuses with no real
+// pass; and a claim past capacity only with the held bytes gets no pass at all.
+func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
+	const floor, free, reclaimable, capacity = 100, 1_000, 2_000, 10_000
+	for _, tc := range []struct {
+		name     string
+		need     uint64
+		held     uint64
+		dryErr   error
+		wantErr  error
+		wantDry  int32
+		wantReal int32
+	}{
+		{name: "beyond_reclaimable", need: free + reclaimable + 1 - floor, wantErr: ErrInsufficientSpace, wantDry: 1},
+		{name: "exactly_reclaimable", need: free + reclaimable - floor, wantDry: 1, wantReal: 1},
+		{name: "dry_run_error", need: free, dryErr: errors.New("inventory: EIO"), wantErr: ErrInsufficientSpace, wantDry: 1},
+		{name: "above_capacity_with_held", need: capacity / 2, held: capacity/2 - floor + 1, wantErr: ErrInsufficientSpace},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var avail atomic.Uint64
+			avail.Store(free)
+			ledger := &SpaceLedger{held: tc.held}
+			rec := &countingReclaimer{reclaimable: reclaimable, dryErr: tc.dryErr, free: &avail}
+			r, err := ledger.Reserve(context.Background(), SpaceClaim{
+				Need: tc.need, Path: t.TempDir(), FloorBytes: floor,
+				FreeBytes:  func(string) (uint64, error) { return avail.Load(), nil },
+				TotalBytes: fixedTotalBytes(capacity), Reclaimer: rec,
+			})
+			if tc.wantErr == nil && err != nil {
+				t.Fatalf("Reserve error = %v, want nil", err)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Reserve error = %v, want %v", err, tc.wantErr)
+			}
+			if got := rec.dry.Load(); got != tc.wantDry {
+				t.Errorf("dry-run passes = %d, want %d", got, tc.wantDry)
+			}
+			if got := rec.real.Load(); got != tc.wantReal {
+				t.Errorf("real reclaim passes = %d, want %d", got, tc.wantReal)
+			}
+			wantHeld := tc.held
+			if tc.wantErr == nil {
+				wantHeld += tc.need
+			}
+			if got := ledger.Reserved(); got != wantHeld {
+				t.Errorf("ledger holds %d bytes, want %d", got, wantHeld)
+			}
+			r.Release()
+		})
 	}
 }
