@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -57,6 +58,8 @@ type redirectSetup struct {
 	// is A's own /token endpoint, and redirect a blob GET only when it carries
 	// that token; otherwise A answers the ping with 200.
 	bearer bool
+	// tokenHits, when set, counts the requests A's /token endpoint answers.
+	tokenHits *atomic.Int32
 }
 
 // redirectToken is the token A's /token endpoint issues.
@@ -95,6 +98,9 @@ func serveRedirectWith(t *testing.T, b http.Handler, s redirectSetup) (reg *Regi
 			w.WriteHeader(http.StatusOK)
 			return
 		case req.URL.Path == "/token" && s.bearer:
+			if s.tokenHits != nil {
+				s.tokenHits.Add(1)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"token":"`+redirectToken+`"}`)
 			return
@@ -242,4 +248,65 @@ func TestBlobRedirectToOtherPortDropsAuthorization(t *testing.T) {
 	}
 	body.Close()
 	checkHops(t, a, b, "")
+}
+
+// TestBlobRedirectBearerToOtherPortDropsAuthorization: A demands a bearer
+// token; B is the same host name as A (both 127.0.0.1) on a different port,
+// and the 307 there carries no Authorization.
+func TestBlobRedirectBearerToOtherPortDropsAuthorization(t *testing.T) {
+	data, digest := blobData(1000)
+	reg, ref, a, b := serveRedirectWith(t, &fakeRegistry{data: data}, redirectSetup{bHost: "127.0.0.1", bearer: true})
+	body, _, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if ah := a.seen(); len(ah) != 1 || ah[0].auth != "Bearer "+redirectToken {
+		t.Fatalf("origin saw %q, want one request with Authorization %q", ah, "Bearer "+redirectToken)
+	}
+	if bh := b.seen(); len(bh) != 1 || bh[0].auth != "" {
+		t.Fatalf("second host saw %q, want one request with no Authorization", bh)
+	}
+}
+
+// TestBlobRedirectForeignRealmChallengeIsNotFollowed: after A's bearer 307,
+// B answers the blob GET with a 401 whose Bearer realm is a third host C. The
+// client never asks C for a token, never sends B an Authorization, and asks
+// A's token endpoint at most twice.
+func TestBlobRedirectForeignRealmChallengeIsNotFollowed(t *testing.T) {
+	_, digest := blobData(1000)
+	var cHits atomic.Int32
+	csrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"token":"tok-evil"}`)
+	}))
+	t.Cleanup(csrv.Close)
+	evil := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="`+csrv.URL+`/token",service="evil"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	var tokenHits atomic.Int32
+	reg, ref, a, b := serveRedirectWith(t, evil, redirectSetup{bHost: "localhost", bearer: true, tokenHits: &tokenHits})
+	body, _, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 0)
+	if err == nil {
+		body.Close()
+		t.Fatal("a 401 from the second host was accepted as the blob")
+	}
+	if n := cHits.Load(); n != 0 {
+		t.Fatalf("foreign realm received %d requests, want 0", n)
+	}
+	bh := b.seen()
+	if len(bh) == 0 {
+		t.Fatal("second host received no request")
+	}
+	for _, h := range bh {
+		if h.auth != "" {
+			t.Fatalf("second host saw %q, want no Authorization on any request", bh)
+		}
+	}
+	if n := tokenHits.Load(); n > 2 {
+		t.Fatalf("origin token endpoint hit %d times, want at most 2", n)
+	}
+	t.Logf("err %v; origin saw %q; second host saw %q; origin token hits %d", err, a.seen(), bh, tokenHits.Load())
 }
