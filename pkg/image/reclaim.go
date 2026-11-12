@@ -444,8 +444,11 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// regular file, and its mtime is still older than grace. Once per batch,
 	// under pruneMu and before the first unlink, it also re-reads the leases and
 	// the roots (pinnedNow), so a pull that rooted a planned blob since the plan
-	// keeps it; and just before each unlink it re-reads the live leases, so a
-	// pull that leased the blob during the batch keeps it too.
+	// keeps it. Before each entry it re-reads them again if any lease was
+	// acquired since (the lease generation moved), so a pull that leased,
+	// rooted and released a blob during the batch keeps it; and just before
+	// each unlink it re-reads the live leases, so a pull still holding its
+	// lease keeps it too. The residual window is executePrune's to state.
 	artifactDels, restDels := orderEvictions(plan.Delete, classes)
 	plan.Delete = append(append([]PruneDecision(nil), artifactDels...), restDels...)
 	rep.ReclaimedByClass = map[string]int64{}
