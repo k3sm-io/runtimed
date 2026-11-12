@@ -109,6 +109,7 @@ func (p *Puller) reserve(ctx context.Context, missing []blob) (*image.Reservatio
 		Path:       p.cfg.StorePath,
 		FloorBytes: p.cfg.FloorBytes,
 		FreeBytes:  p.cfg.FreeBytes,
+		TotalBytes: p.cfg.TotalBytes,
 		Reclaimer:  p.deps.Reclaimer,
 		Log:        p.log,
 	})

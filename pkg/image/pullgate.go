@@ -127,6 +127,12 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 	return func(p *Puller) { p.freeBytes = free }
 }
 
+// WithTotalBytes overrides how the store volume's total capacity is sampled
+// for the space reservation. Nil means StatfsTotalBytes.
+func WithTotalBytes(total TotalBytesFunc) PullerOption {
+	return func(p *Puller) { p.totalBytes = total }
+}
+
 // admitFetch decides whether this node may BEGIN acquiring new image content.
 //
 // It is fail-closed on both axes:
@@ -144,6 +150,10 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 // presence decision, immediately before the FetchFunc — so a warm IfNotPresent
 // or Never serve is never affected, and no code path can acquire new content
 // without passing here.
+//
+// The gate is an early subset of the reservation check (reserveSpace), which
+// is why free space is sampled twice per pull: this one refuses before the
+// manifest is fetched, that one once its declared sizes are known.
 //
 // RECORDED residual, not fixed here: the ingest path (LoadImage and the image-load CLI)
 // writes the same store without traversing this function, so an operator
@@ -221,6 +231,7 @@ func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Mani
 		Path:       p.cache.Root(),
 		FloorBytes: p.pullFloor(),
 		FreeBytes:  p.sampleFree(),
+		TotalBytes: p.totalBytes,
 		Reclaimer:  p.cache,
 		Log:        p.logger(),
 	})

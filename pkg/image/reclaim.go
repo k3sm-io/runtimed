@@ -81,6 +81,20 @@ func StatfsFreeBytes(path string) (uint64, error) {
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
+// TotalBytesFunc samples the total capacity of the volume holding path. The
+// production implementation is StatfsTotalBytes; tests inject a fake.
+type TotalBytesFunc func(path string) (uint64, error)
+
+// StatfsTotalBytes is the production TotalBytesFunc: f_blocks x f_bsize, the
+// volume's whole size, used or not.
+func StatfsTotalBytes(path string) (uint64, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0, fmt.Errorf("statfs %s: %w", path, err)
+	}
+	return uint64(st.Blocks) * uint64(st.Bsize), nil
+}
+
 // FilesystemSample is a raw statfs measurement of the volume holding the image
 // store, at one instant.
 //

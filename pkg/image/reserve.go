@@ -51,6 +51,12 @@ var ErrSizeOverflow = errors.New("image: space arithmetic overflows")
 // (unpacked/ and snapshots/): that tree is written after the pull returns and
 // its reservation is released, and its size is not declared by any manifest.
 //
+// The image path reserves each missing blob at its full declared size even when
+// the blob will arrive by a local clone that adds little to the volume: a
+// deliberate over-estimate. A Puller the caller injects into the daemon, rather
+// than one the daemon builds, does not share the daemon's ledger, so its pulls
+// and the artifact pulls do not see one another's claims.
+//
 // mu guards held and is held across a reservation's whole check, including its
 // one reclaim pass, so two pulls can never both pass a check only one fits.
 type SpaceLedger struct {
@@ -80,6 +86,9 @@ type SpaceClaim struct {
 	FloorBytes uint64
 	// FreeBytes samples free space. Nil means StatfsFreeBytes.
 	FreeBytes FreeBytesFunc
+	// TotalBytes samples the volume's total capacity, checked before the
+	// reclaim pass. Nil means StatfsTotalBytes.
+	TotalBytes TotalBytesFunc
 	// Reclaimer runs the one reclaim pass when the claim does not fit. Nil
 	// means no pass: a claim that does not fit is refused at once.
 	Reclaimer SpaceReclaimer
@@ -111,12 +120,18 @@ func (r *Reservation) Release() {
 // fits when free space is at least c.FloorBytes plus everything already held
 // plus c.Need. When it does not, one c.Reclaimer pass runs, asked to bring free
 // space up to that sum, and the check is repeated; still short is
-// ErrInsufficientSpace. An unsamplable volume refuses with ErrFreeSpaceUnknown,
-// and a sum that would wrap refuses with ErrSizeOverflow.
+// ErrInsufficientSpace. A sum above the volume's total capacity is
+// ErrInsufficientSpace with no reclaim pass. An unsamplable volume (free space
+// or, before a pass, capacity) refuses with ErrFreeSpaceUnknown, and a sum that
+// would wrap refuses with ErrSizeOverflow.
 func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, error) {
 	free := c.FreeBytes
 	if free == nil {
 		free = StatfsFreeBytes
+	}
+	total := c.TotalBytes
+	if total == nil {
+		total = StatfsTotalBytes
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -140,6 +155,17 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		return nil, err
 	}
 	if !ok && c.Reclaimer != nil {
+		// A claim no reclaim could ever satisfy is refused without one: the
+		// declared sizes are a registry's, and an impossible declaration must
+		// not evict every unreferenced blob on each attempt and still fail.
+		capacity, err := total(c.Path)
+		if err != nil {
+			return nil, fmt.Errorf("%w: capacity: %w", ErrFreeSpaceUnknown, boundErr(err))
+		}
+		if want > capacity {
+			return nil, fmt.Errorf("need %d bytes, %d reserved by other pulls, floor %d: the claim exceeds the volume's capacity of %d bytes: %w",
+				c.Need, l.held, c.FloorBytes, capacity, ErrInsufficientSpace)
+		}
 		if _, rerr := c.Reclaimer.ReclaimUnderPressure(ctx, ReclaimConfig{
 			HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: free, Log: c.Log,
 		}); rerr != nil && c.Log != nil {
