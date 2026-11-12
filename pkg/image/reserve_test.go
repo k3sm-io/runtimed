@@ -386,12 +386,14 @@ func fixedTotalBytes(n uint64) TotalBytesFunc {
 // TestReserveRefusesAboveCapacityWithoutReclaim: a claim larger than the
 // whole volume is refused with no reclaim pass, since no eviction could make
 // it fit; a claim short of free space but within capacity still gets exactly
-// one pass; and a capacity that cannot be sampled refuses without a pass.
+// one pass, also when only the bytes other pulls hold push it past capacity;
+// and a capacity that cannot be sampled refuses without a pass.
 func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 	const floor, free, capacity = 100, 1_000, 10_000
 	for _, tc := range []struct {
 		name       string
 		need       uint64
+		held       uint64
 		total      TotalBytesFunc
 		wantErr    error
 		wantPasses int32
@@ -400,9 +402,10 @@ func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 		{name: "capacity_unknown", need: free, total: func(string) (uint64, error) { return 0, errors.New("statfs: EIO") }, wantErr: ErrFreeSpaceUnknown},
 		{name: "above_free_within_capacity", need: free, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
 		{name: "exactly_capacity", need: capacity - floor, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
+		{name: "above_capacity_only_with_held", need: capacity / 2, held: capacity / 2, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ledger := &SpaceLedger{}
+			ledger := &SpaceLedger{held: tc.held}
 			rec := &countingReclaimer{}
 			_, err := ledger.Reserve(context.Background(), SpaceClaim{
 				Need: tc.need, Path: t.TempDir(), FloorBytes: floor,
@@ -417,8 +420,8 @@ func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 			if tc.name == "above_capacity" && !strings.Contains(err.Error(), "exceeds the volume's capacity") {
 				t.Errorf("refusal %q does not say the claim exceeds the volume's capacity", err)
 			}
-			if got := ledger.Reserved(); got != 0 {
-				t.Errorf("ledger holds %d bytes after a refusal, want 0", got)
+			if got := ledger.Reserved(); got != tc.held {
+				t.Errorf("ledger holds %d bytes after a refusal, want %d", got, tc.held)
 			}
 		})
 	}

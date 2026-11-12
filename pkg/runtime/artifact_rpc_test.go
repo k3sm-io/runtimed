@@ -383,7 +383,7 @@ func TestPullArtifactRPCBoundsErrorText(t *testing.T) {
 // TestPullArtifactRPCSizeRefusalsAreTerminal pins that a manifest declaring a hostile size is
 // refused as FailedPrecondition, a terminal verdict on untrusted input, not Internal.
 func TestPullArtifactRPCSizeRefusalsAreTerminal(t *testing.T) {
-	for _, sentinel := range []error{artifact.ErrSizeCap, artifact.ErrSizeOverflow} {
+	for _, sentinel := range []error{artifact.ErrSizeCap, artifact.ErrSizeOverflow, artifact.ErrDeclaredSizeRejected} {
 		t.Run(sentinel.Error(), func(t *testing.T) {
 			err := artifactStatusError(fmt.Errorf("layer 0: %w", sentinel))
 			if got := status.Code(err); got != codes.FailedPrecondition {

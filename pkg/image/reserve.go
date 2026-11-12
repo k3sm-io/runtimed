@@ -40,8 +40,9 @@ var ErrInsufficientSpace = errors.New("image: refusing the pull, the store volum
 var ErrSizeOverflow = errors.New("image: space arithmetic overflows")
 
 // ErrDeclaredSizeRejected reports that the manifest declares more than this
-// volume can ever hold: the declared bytes, with the floor and what other pulls
-// hold, exceed the volume's total capacity, so no reclaim pass could make room.
+// volume can ever hold: the declared bytes and the floor alone exceed the
+// volume's total capacity, so no reclaim pass could make room. Bytes other pulls
+// hold do not count, since they are this node's state, not the manifest's claim.
 // The sizes are the serving registry's claim, so it is a refusal of that
 // source's manifest, not of this node's free space: another source may serve a
 // sane one. artifact.ErrDeclaredSizeRejected is the same value.
@@ -128,8 +129,10 @@ func (r *Reservation) Release() {
 // fits when free space is at least c.FloorBytes plus everything already held
 // plus c.Need. When it does not, one c.Reclaimer pass runs, asked to bring free
 // space up to that sum, and the check is repeated; still short is
-// ErrInsufficientSpace. A sum above the volume's total capacity is
-// ErrDeclaredSizeRejected with no reclaim pass. An unsamplable volume (free space
+// ErrInsufficientSpace. c.FloorBytes plus c.Need above the volume's total
+// capacity is ErrDeclaredSizeRejected with no reclaim pass; when only the bytes
+// other pulls hold push the sum past capacity, the pass runs as above. An
+// unsamplable volume (free space
 // or, before a pass, capacity) refuses with ErrFreeSpaceUnknown, and a sum that
 // would wrap refuses with ErrSizeOverflow.
 func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, error) {
@@ -163,16 +166,22 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		return nil, err
 	}
 	if !ok && c.Reclaimer != nil {
-		// A claim no reclaim could ever satisfy is refused without one: the
-		// declared sizes are a registry's, and an impossible declaration must
-		// not evict every unreferenced blob on each attempt and still fail.
+		// A declaration no reclaim could ever satisfy is refused without one:
+		// the declared sizes are a registry's, and an impossible declaration
+		// must not evict every unreferenced blob on each attempt and still
+		// fail. It is judged by this pull alone; bytes other pulls hold are a
+		// local shortfall, left to the pass and ErrInsufficientSpace.
 		capacity, err := total(c.Path)
 		if err != nil {
 			return nil, fmt.Errorf("%w: capacity: %w", ErrFreeSpaceUnknown, boundErr(err))
 		}
-		if want > capacity {
-			return nil, fmt.Errorf("need %d bytes, %d reserved by other pulls, floor %d: the claim exceeds the volume's capacity of %d bytes: %w",
-				c.Need, l.held, c.FloorBytes, capacity, ErrDeclaredSizeRejected)
+		own, err := addChecked(c.FloorBytes, c.Need)
+		if err != nil {
+			return nil, err
+		}
+		if own > capacity {
+			return nil, fmt.Errorf("need %d bytes, floor %d: the claim exceeds the volume's capacity of %d bytes: %w",
+				c.Need, c.FloorBytes, capacity, ErrDeclaredSizeRejected)
 		}
 		if _, rerr := c.Reclaimer.ReclaimUnderPressure(ctx, ReclaimConfig{
 			HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: free, Log: c.Log,
