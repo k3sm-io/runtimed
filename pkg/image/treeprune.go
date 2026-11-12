@@ -17,6 +17,7 @@ limitations under the License.
 package image
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -442,6 +444,13 @@ type TreeExecuteReport struct {
 	// StoppedEarly reports that stop() ended the run before the plan was
 	// exhausted — the disk-pressure target was met.
 	StoppedEarly bool
+	// TrashLeft counts removed trees whose detached trash could not be
+	// deleted this run. They are still counted in Removed — each is already
+	// unreachable by its real name — and the next run sweeps them.
+	TrashLeft int
+	// TrashSwept counts leftover trash directories this run's opening sweep
+	// deleted.
+	TrashSwept int
 }
 
 // ExecuteTreePrune executes plan's DeleteTrees set against this cache.
@@ -458,17 +467,24 @@ type TreeExecuteReport struct {
 // (a tree swapped for a symlink after planning is skipped, not followed), and
 // the mtime is still older than grace.
 //
-// # Why the record is unlinked first
+// # Detach, then delete
 //
-// The removal is two steps — unlink the record, then remove the directory — and
-// the order is load-bearing rather than tidy. A plain recursive remove deletes
-// children in filesystem order, so a concurrent Unpack could read a still-valid
-// record and then clone a half-DELETED payload into a pod's rootfs: a silently
-// truncated image, which is worse than any failure. Unlinking the record first
-// makes the tree read as absent to openCommitted (its ErrNotExist path) for the
-// whole of the removal, so a racing unpack rebuilds or fails loudly instead. If
-// the recursive remove then fails partway, the residue is a directory with no
-// record, which the next inventory classifies as RecordUnusable and re-plans.
+// The removal is two phases. Detach (detachTree) unlinks the record and then
+// renames the payload to a unique trash name under the same store root: after
+// it, the tree is unreachable by its real name, so a concurrent Unpack can
+// never read a still-valid record and clone a half-DELETED payload into a
+// pod's rootfs — a silently truncated image, which is worse than any failure;
+// it sees ErrNotExist and rebuilds instead. Delete then removes the trash
+// recursively. Only detach runs inside the unlink seam (under leaseMu in
+// narrow mode); the O(files) delete runs after the seam has returned, so a
+// large tree never holds leaseMu for the length of its own removal.
+//
+// A failed detach leaves the tree in place (record-less if the rename failed,
+// which the next inventory re-plans as RecordUnusable) and is a skip. A failed
+// delete is NOT a skip: the tree is already gone by name, so it is reported
+// removed, counted in TrashLeft, and its trash is swept at the start of the
+// next run. Trash directories are inventoried as TreeKindUnknown, never as
+// trees.
 //
 // stop, when non-nil, is consulted before each removal and ends the run when it
 // returns true, on the same measured-target terms as ExecutePrune.
@@ -489,12 +505,111 @@ type treePruneHooks struct {
 	guard func() (drop map[string]evictReason, err error)
 
 	// unlink, when non-nil, decides the removal of one tree that passed
-	// re-verification: remove deletes its record then its payload through the
-	// executor's *os.Root. A false removed with a nil error records the tree
-	// as skipped with a refusal typed from reason for the backing digest dg;
-	// an error records it as skipped with the error. It is set only in
-	// narrow mode (evictGuards); nil outside it.
+	// re-verification: remove deletes its record and renames its payload to a
+	// trash name through the executor's *os.Root (see detachTree); the
+	// executor deletes the trash only after unlink has returned. A false
+	// removed with a nil error records the tree as skipped with a refusal
+	// typed from reason for the backing digest dg; an error records it as
+	// skipped with the error. It is set only in narrow mode (evictGuards); nil
+	// outside it.
 	unlink func(backing []string, remove func() error) (removed bool, dg string, reason evictReason, err error)
+
+	// removeTrash, when non-nil, replaces root.RemoveAll for deleting one
+	// detached tree's trash name. It is a test seam: production leaves it nil.
+	removeTrash func(root *os.Root, name string) error
+}
+
+// treeTrashPrefix names a detached tree awaiting deletion: a directory
+// directly under a tree store root, created by detachTree, holding the
+// renamed tree. It follows the ".tree-*" staging convention's placement — a
+// dot-name at the store root, so on the store's own volume and outside the
+// "<algo>/<hex>" grammar, which makes EnumerateTrees inventory it as one
+// TreeKindUnknown node and makes it unreachable to Unpacker.locate — but it
+// carries its own prefix because the two must never be confused: a ".tree-*"
+// directory may be a live unpack's staging tree, while a trash directory is
+// only ever created and deleted inside executeTreePrune under pruneMu, so
+// any trash directory a pass finds at its start is a leftover and is safe to
+// sweep without an age check.
+const treeTrashPrefix = ".trash-"
+
+// treeTrashTreeName is the name the detached tree has inside its trash
+// directory.
+const treeTrashTreeName = "tree"
+
+// detachTree makes the tree at rel unreachable by its real name: it unlinks
+// the record (an absent one is not a failure — a tree planned as
+// RecordUnusable may never have had one), then renames the payload into a
+// freshly created, uniquely named trash directory under the same root. The
+// rename is atomic because the trash directory sits on the store's own
+// volume. It returns the trash directory's name, which the caller deletes.
+//
+// The record is still unlinked first so that a failed rename leaves a
+// directory with no record, which openCommitted refuses and the next
+// inventory re-plans as RecordUnusable — the same residue the in-place
+// removal used to leave.
+func detachTree(root *os.Root, rel, recordName string) (string, error) {
+	if err := root.Remove(filepath.Join(rel, recordName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("remove record: %w", err)
+	}
+	var trash string
+	for attempt := 0; ; attempt++ {
+		trash = treeTrashPrefix + rand.Text()
+		err := root.Mkdir(trash, 0o700)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) || attempt >= 3 {
+			return "", fmt.Errorf("create tree trash: %w", err)
+		}
+	}
+	if err := root.Rename(rel, filepath.Join(trash, treeTrashTreeName)); err != nil {
+		// Best-effort: an empty trash directory left here is swept next pass.
+		_ = root.Remove(trash)
+		return "", fmt.Errorf("move tree to trash: %w", err)
+	}
+	return trash, nil
+}
+
+// sweepTreeTrash removes up to maxStageSweep leftover trash directories from
+// every tree store: the residue of a pass whose delete failed after the
+// rename. It runs under pruneMu, which every trash directory is created and
+// deleted under, so nothing it sees is in use. It is best-effort: a leftover
+// it cannot remove is retried by the next pass, and it returns how many
+// entries it removed.
+func (c *Cache) sweepTreeTrash() int {
+	swept := 0
+	for _, store := range treeStores {
+		dir, _, err := c.treeStoreLayout(store)
+		if err != nil {
+			continue
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			continue // an absent store has nothing to sweep
+		}
+		f, err := root.Open(".")
+		if err != nil {
+			root.Close()
+			continue
+		}
+		// The store root holds only algorithm directories and dot-names, so
+		// reading it whole is cheap; the bound is on the removals.
+		entries, _ := f.ReadDir(-1)
+		f.Close()
+		for _, e := range entries {
+			if swept >= maxStageSweep {
+				break
+			}
+			if !strings.HasPrefix(e.Name(), treeTrashPrefix) {
+				continue
+			}
+			if root.RemoveAll(e.Name()) == nil {
+				swept++
+			}
+		}
+		root.Close()
+	}
+	return swept
 }
 
 // executeTreePrune is ExecuteTreePrune with hooks; see ExecuteTreePrune for
@@ -520,7 +635,11 @@ func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.
 		}
 	}
 
-	rep := &TreeExecuteReport{}
+	rep := &TreeExecuteReport{TrashSwept: c.sweepTreeTrash()}
+	removeTrash := func(root *os.Root, name string) error { return root.RemoveAll(name) }
+	if hooks != nil && hooks.removeTrash != nil {
+		removeTrash = hooks.removeTrash
+	}
 	skip := func(d TreeDecision, reason string) {
 		rep.Skipped = append(rep.Skipped, SkippedTree{Store: d.Node.Store, Path: d.Node.Path, Key: d.Node.Key, Reason: reason})
 	}
@@ -583,17 +702,13 @@ func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.
 			skip(d, "younger than grace")
 			continue
 		}
+		// removeTree only detaches the tree; under narrow mode it runs inside
+		// unlink, under leaseMu, so it must stay O(1) in the tree's size.
+		var trash string
 		removeTree := func() error {
-			// Step 1: the record. An absent one is not a failure — a tree planned
-			// as RecordUnusable may never have had one.
-			if err := root.Remove(filepath.Join(rel, records[d.Node.Store])); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return fmt.Errorf("remove record: %w", err)
-			}
-			// Step 2: the payload.
-			if err := root.RemoveAll(rel); err != nil {
-				return fmt.Errorf("remove tree: %w", err)
-			}
-			return nil
+			var err error
+			trash, err = detachTree(root, rel, records[d.Node.Store])
+			return err
 		}
 		if hooks != nil && hooks.unlink != nil {
 			removed, dg, why, err := hooks.unlink(d.Node.Backing, removeTree)
@@ -611,6 +726,14 @@ func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.
 		} else if err := removeTree(); err != nil {
 			skip(d, err.Error())
 			continue
+		}
+		// The tree is detached and unlink has returned, so leaseMu is no
+		// longer held: the O(files) delete runs outside it. A failed delete
+		// does not un-remove the tree — it is already unreachable by its real
+		// name — so it is counted as removed and its trash is left for the
+		// next pass's sweepTreeTrash.
+		if err := removeTrash(root, trash); err != nil {
+			rep.TrashLeft++
 		}
 		rep.Deleted++
 		rep.DeletedBytes += d.Node.Size

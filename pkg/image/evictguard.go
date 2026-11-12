@@ -138,6 +138,8 @@ func (c *Cache) blobRootedNow(digest string, untracked UntrackedPodFunc) (evictR
 // again, as blobRootedNow reads them, and a root naming any backing digest
 // keeps it (evictRooted or evictInUse); a read error keeps it and is
 // returned. dg is the first backing digest, in backing order, that kept it.
+// The executor's remove only detaches the tree (renames it to a trash name);
+// it deletes the trash after this returns, outside leaseMu.
 func (c *Cache) treeUnlessHeld(backing []string, remove func() error, untracked UntrackedPodFunc) (bool, string, evictReason, error) {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()

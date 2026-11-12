@@ -518,3 +518,140 @@ func TestEvictOutcomeBranches(t *testing.T) {
 		t.Errorf("evictOutcome = %+v; want %+v", res, want)
 	}
 }
+
+// TestEvictTreeTrashDeleteOutsideLeaseMu pins that the per-tree check holds
+// leaseMu only while the tree is detached, not while it is deleted: the
+// trash delete is blocked until another goroutine has taken leaseMu (through
+// AcquireLease), which deadlocks — and fails on the timeout — if the delete
+// runs under the lock. While the delete is blocked, the tree is already gone
+// by its real name and sits under a trash name outside the key grammar.
+func TestEvictTreeTrashDeleteOutsideLeaseMu(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	cfgDigest := f.blob("trash-unlocked-cfg", time.Hour)
+	tf := f.nativeTree(cfgDigest, nil, 10, time.Hour)
+	plan := f.planFor(time.Minute)
+	if len(plan.DeleteTrees) != 1 {
+		t.Fatalf("DeleteTrees = %v; want exactly %s", plan.DeleteTrees, tf.key)
+	}
+
+	deleted := 0
+	hooks := &treePruneHooks{
+		unlink: func(backing []string, remove func() error) (bool, string, evictReason, error) {
+			return f.cache.treeUnlessHeld(backing, remove, nil)
+		},
+		removeTrash: func(root *os.Root, name string) error {
+			deleted++
+			if !strings.HasPrefix(name, treeTrashPrefix) {
+				t.Errorf("trash name %q; want prefix %q", name, treeTrashPrefix)
+			}
+			if _, err := os.Lstat(tf.dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("tree %s reachable by its real name during the delete: %v", tf.dir, err)
+			}
+			leased := make(chan struct{})
+			go func() {
+				f.cache.AcquireLease([]string{cfgDigest}, 0).Release()
+				close(leased)
+			}()
+			select {
+			case <-leased:
+			case <-time.After(5 * time.Second):
+				t.Fatal("leaseMu held across the trash delete")
+			}
+			return root.RemoveAll(name)
+		},
+	}
+	rep, err := f.cache.executeTreePrune(plan, time.Minute, f.clock, nil, hooks)
+	if err != nil {
+		t.Fatalf("executeTreePrune: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("trash delete ran %d times; want 1", deleted)
+	}
+	if !reflect.DeepEqual(rep.Removed, []string{tf.key}) || len(rep.Skipped) != 0 || rep.TrashLeft != 0 {
+		t.Fatalf("report = %+v; want %s removed, nothing skipped or left", rep, tf.key)
+	}
+	assertNoTrash(t, f)
+}
+
+// TestEvictTreeTrashSwept pins the failed-delete path: a trash delete that
+// fails still reports the tree removed (it is unreachable by name), the
+// leftover trash is inventoried as an unknown node and never as a tree, and
+// the next run's opening sweep deletes it.
+func TestEvictTreeTrashSwept(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	cfgDigest := f.blob("trash-swept-cfg", time.Hour)
+	tf := f.nativeTree(cfgDigest, nil, 10, time.Hour)
+	plan := f.planFor(time.Minute)
+
+	hooks := &treePruneHooks{
+		unlink: func(backing []string, remove func() error) (bool, string, evictReason, error) {
+			return f.cache.treeUnlessHeld(backing, remove, nil)
+		},
+		removeTrash: func(*os.Root, string) error { return errors.New("delete failed") },
+	}
+	rep, err := f.cache.executeTreePrune(plan, time.Minute, f.clock, nil, hooks)
+	if err != nil {
+		t.Fatalf("executeTreePrune: %v", err)
+	}
+	if !reflect.DeepEqual(rep.Removed, []string{tf.key}) || rep.Deleted != 1 || len(rep.Skipped) != 0 || rep.TrashLeft != 1 {
+		t.Fatalf("report = %+v; want %s removed with one trash entry left", rep, tf.key)
+	}
+	if _, err := os.Lstat(tf.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tree %s still reachable by its real name: %v", tf.dir, err)
+	}
+
+	trees, err := f.cache.EnumerateTrees()
+	if err != nil {
+		t.Fatalf("EnumerateTrees: %v", err)
+	}
+	trash := 0
+	for _, n := range trees {
+		if n.Kind == TreeKindTree {
+			t.Errorf("tree listed after removal: %+v", n)
+		}
+		if strings.HasPrefix(n.Path, treeTrashPrefix) {
+			trash++
+			if n.Kind != TreeKindUnknown || n.Key != "" {
+				t.Errorf("trash node = %+v; want an unknown node with no key", n)
+			}
+		}
+	}
+	if trash != 1 {
+		t.Fatalf("inventory = %+v; want exactly one trash node", trees)
+	}
+	next := f.planFor(time.Minute)
+	if len(next.DeleteTrees) != 0 {
+		t.Fatalf("DeleteTrees = %+v; want the trash never planned as a tree", next.DeleteTrees)
+	}
+
+	rep, err = f.cache.ExecuteTreePrune(next, time.Minute, f.clock, nil)
+	if err != nil {
+		t.Fatalf("ExecuteTreePrune: %v", err)
+	}
+	if rep.TrashSwept != 1 {
+		t.Errorf("TrashSwept = %d; want 1", rep.TrashSwept)
+	}
+	assertNoTrash(t, f)
+}
+
+// assertNoTrash fails if any tree store holds a trash entry.
+func assertNoTrash(t *testing.T, f *gcFixture) {
+	t.Helper()
+	for _, store := range treeStores {
+		dir, _, err := f.cache.treeStoreLayout(store)
+		if err != nil {
+			t.Fatalf("treeStoreLayout: %v", err)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("ReadDir %s: %v", dir, err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), treeTrashPrefix) {
+				t.Errorf("trash entry %s left in %s", e.Name(), dir)
+			}
+		}
+	}
+}
