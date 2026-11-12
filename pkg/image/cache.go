@@ -52,15 +52,10 @@ type Cache struct {
 	// (lease.go) rather than by mutual exclusion.
 	pruneMu sync.Mutex
 
-	// leaseMu guards leases, nextLease, leaseGen and leaseWatch. See lease.go.
+	// leaseMu guards leases, nextLease and leaseWatch. See lease.go.
 	leaseMu   sync.Mutex
 	leases    map[uint64]*Lease
 	nextLease uint64
-
-	// leaseGen is the lease generation: it is incremented on every
-	// AcquireLease, in the same leaseMu critical section that makes the lease
-	// visible, and never decreases. See leaseGeneration.
-	leaseGen uint64
 
 	// leaseWatch, while a prune pass with a pin function runs, collects the
 	// digests of every lease acquired since that pass's last pin read; it is

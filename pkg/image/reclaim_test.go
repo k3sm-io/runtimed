@@ -1018,7 +1018,7 @@ func keptReason(rep *ReclaimReport, digest string) PruneReason {
 // the executor reaches the pulled blob, which is queued later in that batch.
 // The stale pin set does not name it and its lease is gone by the time the
 // executor examines it, so only a re-read of the pins triggered by the lease
-// generation can see the record and hold that root it. The unrooted blob
+// watch can see the record and hold that root it. The unrooted blob
 // examined first is still unlinked, so the batch is not vacuous.
 func TestReclaimKeepsBlobRootedMidBatch(t *testing.T) {
 	f := newGCFixture(t)

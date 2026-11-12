@@ -138,9 +138,9 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	// even if a moved tag replaces the record that names it. The hold is
 	// written inside the pull (artifact.WithHold), so the pull re-checks the
 	// blobs after it, still under the lease, and refetches any a reclaim pass
-	// unlinked in between. Reclaim re-reads its pins when any lease was
-	// acquired since its last read and checks live leases before each unlink;
-	// the race left is the per-blob window between its generation check and
+	// unlinked in between. Reclaim re-reads its pins when a lease acquired
+	// since its last read names the blob and checks live leases before each
+	// unlink; the race left is the per-blob window between its watch check and
 	// its unlink, which is not atomic with the lease (see executePrune in
 	// pkg/image).
 	//
