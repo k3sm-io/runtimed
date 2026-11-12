@@ -174,11 +174,24 @@ func checkPodReferences(path string) error {
 	}
 	// The same digest check Roots applies: a record that decodes but names a
 	// digest this store cannot map to a path would fail Roots just the same.
+	if perr := validateRecordDigests(rec); perr != nil {
+		// Already bounded at the source (see validateRecordDigests).
+		return fmt.Errorf("%s records unusable digest: %v", PodReferencesName, perr)
+	}
+	return nil
+}
+
+// validateRecordDigests parses every digest rec names and returns the first
+// parse failure unwrapped, so each caller adds its own context. The error is
+// ALREADY BOUNDED AT THE SOURCE, so callers apply no second boundErr: it is
+// this package's own error, and parseBlobDigest caps both halves of it —
+// quoteBounded on the registry-supplied digest, boundErr on ggcr's parser
+// message. Wrapping again would only re-quote a quoted string.
+func validateRecordDigests(rec podReferences) error {
 	for _, r := range rec.Images {
 		for _, d := range r.Digests() {
-			if _, perr := parseBlobDigest(d); perr != nil {
-				// Already bounded at the source (see the matching site in roots).
-				return fmt.Errorf("%s records unusable digest: %v", PodReferencesName, perr)
+			if _, err := parseBlobDigest(d); err != nil {
+				return err
 			}
 		}
 	}
@@ -434,18 +447,12 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 			// references and digests. Bounded as DATA, never adopted.
 			return nil, nil, fmt.Errorf("%w: pod %q: decode %s: %v", ErrRootsIncomplete, name, PodReferencesName, boundErr(err))
 		}
-		for _, r := range rec.Images {
-			for _, d := range r.Digests() {
-				if _, perr := parseBlobDigest(d); perr != nil {
-					// ALREADY BOUNDED AT THE SOURCE, so no second boundErr: perr is this
-					// package's own error, and parseBlobDigest caps both halves of it —
-					// quoteBounded on the registry-supplied digest, boundErr on ggcr's
-					// parser message. Wrapping again would only re-quote a quoted string.
-					return nil, nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
-				}
-			}
-			out = append(out, r)
+		if perr := validateRecordDigests(rec); perr != nil {
+			// Already bounded at the source (see validateRecordDigests). Fail-closed:
+			// one unusable digest makes the whole set incomplete.
+			return nil, nil, fmt.Errorf("%w: pod %q records unusable digest: %v", ErrRootsIncomplete, name, perr)
 		}
+		out = append(out, rec.Images...)
 	}
 	return append(out, shared...), skipped, nil
 }

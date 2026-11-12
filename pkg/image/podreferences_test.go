@@ -38,6 +38,8 @@ func TestEnsurePodReferencesRecordValidation(t *testing.T) {
 	// to a path, so Roots would refuse it.
 	const unusableDigest = `{"images":[{"reference":"example.test/app:v1","config":"sha256:` +
 		`1111111111111111111111111111111111111111111111111111111111111111","layers":["sha256:not-hex"]}]}`
+	// The same refusal reached through the Config digest instead of a layer.
+	const unusableConfig = `{"images":[{"reference":"example.test/app:v1","config":"sha256:not-hex","layers":[]}]}`
 	tests := []struct {
 		name string
 		// seed plants the entry at record; outside is a scratch dir off the pod tree.
@@ -127,7 +129,18 @@ func TestEnsurePodReferencesRecordValidation(t *testing.T) {
 			check:   wantFile(unusableDigest),
 		},
 		{
-			name: "fifo is refused without blocking and left",
+			name: "record with an unusable config digest is refused and left",
+			seed: func(t *testing.T, record, outside string) {
+				mustWrite(t, record, unusableConfig, 0o644)
+			},
+			wantErr: true,
+			check:   wantFile(unusableConfig),
+		},
+		{
+			// The caller's Lstat pre-check refuses this before any open, so this row
+			// does not exercise O_NONBLOCK; TestCheckPodReferencesFIFONonBlocking is
+			// what proves the open itself cannot block on a FIFO.
+			name: "fifo is refused by the Lstat pre-check and left",
 			seed: func(t *testing.T, record, outside string) {
 				if err := syscall.Mkfifo(record, 0o644); err != nil {
 					t.Fatal(err)
