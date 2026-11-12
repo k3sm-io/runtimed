@@ -52,7 +52,7 @@ type Cache struct {
 	// (lease.go) rather than by mutual exclusion.
 	pruneMu sync.Mutex
 
-	// leaseMu guards leases, nextLease and leaseGen. See lease.go.
+	// leaseMu guards leases, nextLease, leaseGen and leaseWatch. See lease.go.
 	leaseMu   sync.Mutex
 	leases    map[uint64]*Lease
 	nextLease uint64
@@ -61,6 +61,12 @@ type Cache struct {
 	// AcquireLease, in the same leaseMu critical section that makes the lease
 	// visible, and never decreases. See leaseGeneration.
 	leaseGen uint64
+
+	// leaseWatch, while a prune pass with a pin function runs, collects the
+	// digests of every lease acquired since that pass's last pin read; it is
+	// nil when no such pass is running. AcquireLease adds to it in the same
+	// critical section that makes the lease visible. See beginLeaseWatch.
+	leaseWatch map[string]struct{}
 
 	// beforePruneBlob, when set, runs inside executePrune's loop after the
 	// batch's pin read and before each entry is examined, with that entry's

@@ -97,6 +97,11 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 	defer c.leaseMu.Unlock()
 	c.nextLease++
 	c.leaseGen++
+	if c.leaseWatch != nil {
+		for _, d := range held {
+			c.leaseWatch[d] = struct{}{}
+		}
+	}
 	l := &Lease{c: c, id: c.nextLease, digests: held, expires: c.now().Add(ttl)}
 	c.leases[l.id] = l
 	return l
@@ -115,6 +120,38 @@ func (c *Cache) leaseGeneration() uint64 {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	return c.leaseGen
+}
+
+// beginLeaseWatch starts collecting the digests of every lease acquired from
+// now on (see Cache.leaseWatch). It is called under pruneMu, which every
+// executePrune caller takes for the whole pass, so at most one watch is open
+// at a time and begin/end never nest.
+func (c *Cache) beginLeaseWatch() {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.leaseWatch = make(map[string]struct{})
+}
+
+// endLeaseWatch stops collecting lease digests.
+func (c *Cache) endLeaseWatch() {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.leaseWatch = nil
+}
+
+// takeIfNamed reports whether a lease acquired since the watch began (or
+// since the last time takeIfNamed returned true) names d. When it does, the
+// watch is reset to empty in the same leaseMu critical section, so the caller
+// re-reads its pins AFTER the reset and a lease acquired during that re-read
+// lands in the fresh set.
+func (c *Cache) takeIfNamed(d string) bool {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if _, ok := c.leaseWatch[d]; !ok {
+		return false
+	}
+	c.leaseWatch = make(map[string]struct{})
+	return true
 }
 
 // leasedDigests returns the set of digests currently pinned by a live lease,
