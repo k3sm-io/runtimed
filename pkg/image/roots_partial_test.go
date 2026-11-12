@@ -25,11 +25,23 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 		}
 	}
 	bad := ImageRoot{Reference: "bad:v1", Config: "sha256:not-hex", Layers: []string{}}
+	// badLayer has a usable Config, so only the Layers walk can catch it.
+	badLayer := good("badlayer:v1", "4")
+	badLayer.Layers = append(badLayer.Layers, "sha256:not-hex")
+	noColon := ImageRoot{Reference: "nocolon:v1", Config: strings.Repeat("5", 64)}
+	// sha512 is well formed but outside the store's closed allowlist.
+	unsupported := ImageRoot{Reference: "sha512:v1", Config: "sha512:" + strings.Repeat("6", 128)}
+	operator := good("op:v1", "7")
 
 	cases := []struct {
 		name    string
 		records map[string][]ImageRoot
-		wantErr bool
+		// operator, when set, is recorded as an operator root: a non-pod root
+		// that Roots unions into the same returned set.
+		operator *ImageRoot
+		wantErr  bool
+		// wantPod is the pod the refusal must name.
+		wantPod string
 		want    int
 	}{
 		{
@@ -38,6 +50,7 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 				"pod-a": {good("a:v1", "1"), bad},
 			},
 			wantErr: true,
+			wantPod: "pod-a",
 		},
 		{
 			name: "two records, the first valid and the second with an unusable digest",
@@ -46,6 +59,49 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 				"pod-b": {bad},
 			},
 			wantErr: true,
+			wantPod: "pod-b",
+		},
+		{
+			name: "valid config digest, unusable layer digest",
+			records: map[string][]ImageRoot{
+				"pod-a": {good("a:v1", "1"), badLayer},
+			},
+			wantErr: true,
+			wantPod: "pod-a",
+		},
+		{
+			name: "digest with no colon",
+			records: map[string][]ImageRoot{
+				"pod-a": {noColon},
+			},
+			wantErr: true,
+			wantPod: "pod-a",
+		},
+		{
+			name: "digest with an unsupported algorithm",
+			records: map[string][]ImageRoot{
+				"pod-a": {unsupported},
+			},
+			wantErr: true,
+			wantPod: "pod-a",
+		},
+		{
+			name: "two records, the first in sorted order unusable and the second valid",
+			records: map[string][]ImageRoot{
+				"pod-a": {bad},
+				"pod-b": {good("b:v1", "2")},
+			},
+			wantErr: true,
+			wantPod: "pod-a",
+		},
+		{
+			name: "operator root present alongside an unusable pod digest",
+			records: map[string][]ImageRoot{
+				"pod-a": {bad},
+			},
+			operator: &operator,
+			wantErr:  true,
+			wantPod:  "pod-a",
 		},
 		{
 			name: "control: both records valid returns every image",
@@ -54,6 +110,14 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 				"pod-b": {good("c:v1", "3")},
 			},
 			want: 3,
+		},
+		{
+			name: "control: a valid record and an operator root returns both",
+			records: map[string][]ImageRoot{
+				"pod-a": {good("a:v1", "1")},
+			},
+			operator: &operator,
+			want:     2,
 		},
 	}
 	for _, tc := range cases {
@@ -73,13 +137,25 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 				}
 			}
 
+			if tc.operator != nil {
+				platform := Platform{OS: "darwin", Architecture: "arm64"}
+				if err := f.cache.RecordOperatorImage(tc.operator.Reference, platform, *tc.operator); err != nil {
+					t.Fatalf("RecordOperatorImage: %v", err)
+				}
+			}
+
 			roots, err := f.cache.Roots()
 			if tc.wantErr {
 				if !errors.Is(err, ErrRootsIncomplete) {
 					t.Fatalf("Roots err = %v; want ErrRootsIncomplete", err)
 				}
+				// nil covers the operator root too: Roots unions it into this
+				// same set, so it must not escape alongside the refusal either.
 				if roots != nil {
 					t.Fatalf("Roots returned %v alongside the refusal; want nil", roots)
+				}
+				if want := `pod "` + tc.wantPod + `"`; !strings.Contains(err.Error(), want) {
+					t.Fatalf("Roots err = %q; want it to name %s", err, want)
 				}
 				return
 			}
@@ -99,6 +175,9 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 						t.Errorf("Roots is missing %q", im.Reference)
 					}
 				}
+			}
+			if tc.operator != nil && !got[tc.operator.Reference] {
+				t.Errorf("Roots is missing operator root %q", tc.operator.Reference)
 			}
 		})
 	}
