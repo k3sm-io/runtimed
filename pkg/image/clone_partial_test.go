@@ -141,3 +141,16 @@ func TestByteCopyFileFailureRemovesOnlyItsOwnFile(t *testing.T) {
 		t.Fatalf("destination mode = %v, want the swapped-in directory", info.Mode())
 	}
 }
+
+// TestByteCopyFileMissingSourceCreatesNoParent checks a missing source fails
+// before the destination's parent directory is created.
+func TestByteCopyFileMissingSourceCreatesNoParent(t *testing.T) {
+	tmp := t.TempDir()
+	newdir := filepath.Join(tmp, "newdir")
+	if _, err := (ByteCopier{}).Clone(filepath.Join(tmp, "missing"), filepath.Join(newdir, "f")); err == nil {
+		t.Fatal("Clone of a missing source returned nil error")
+	}
+	if _, err := os.Lstat(newdir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("parent %s exists after failed clone: err = %v", newdir, err)
+	}
+}

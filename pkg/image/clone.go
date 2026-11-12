@@ -443,6 +443,11 @@ func byteCopyAt(src string, dir *os.File, name string) error {
 // the removal is an unlinkat(2) of the base name, which never removes a
 // directory swapped in at dst after the create.
 func byteCopyFile(src, dst string) error {
+	// Check the source first so a missing or unreadable one leaves no new
+	// parent directory behind.
+	if _, err := os.Stat(src); err != nil {
+		return err
+	}
 	parent := filepath.Dir(dst)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
