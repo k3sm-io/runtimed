@@ -210,7 +210,21 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
-	return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(registryTransport()))
+	return splitFetch(ctx, r, ref, cred, policy, registryTransport())
+}
+
+// splitFetch is remoteFetch over tr split by origin (registryfetch's
+// OriginSplit, the transport Session uses for blobs): cred authenticates only
+// requests to r's registry, and a redirect to another host goes over plain tr,
+// so neither the credential nor that host's 401 challenge reaches the token
+// logic. cred rides the split transport, so remoteFetch gets none.
+func splitFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, tr http.RoundTripper) (ggcrv1.Image, error) {
+	reg := registryfetch.Registry{Transport: tr}
+	rt, err := reg.OriginSplit(ctx, r.Context(), cred.registryfetchCredential())
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
+	}
+	return remoteFetch(ctx, r, ref, nil, policy, remote.WithTransport(rt))
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
