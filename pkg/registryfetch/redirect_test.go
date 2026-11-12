@@ -49,10 +49,30 @@ func (r *recorder) seen() []hit {
 	return append([]hit(nil), r.hits...)
 }
 
+// redirectSetup shapes the two hosts serveRedirectWith starts.
+type redirectSetup struct {
+	// bHost is the host name B is reached by; A is always "127.0.0.1".
+	bHost string
+	// bearer makes A answer the /v2/ ping with a Bearer challenge whose realm
+	// is A's own /token endpoint, and redirect a blob GET only when it carries
+	// that token; otherwise A answers the ping with 200.
+	bearer bool
+}
+
+// redirectToken is the token A's /token endpoint issues.
+const redirectToken = "tok-redirect"
+
 // serveRedirect starts origin A, which answers the /v2/ ping itself and every
 // blob GET with a 307 to the same path on a second host B, served by b. B is
 // reached as "localhost", A as "127.0.0.1", so the two differ by host name.
 func serveRedirect(t *testing.T, b http.Handler) (reg *Registry, ref string, a, bseen *recorder) {
+	t.Helper()
+	return serveRedirectWith(t, b, redirectSetup{bHost: "localhost"})
+}
+
+// serveRedirectWith is serveRedirect with B's host name and A's auth scheme
+// chosen by s.
+func serveRedirectWith(t *testing.T, b http.Handler, s redirectSetup) (reg *Registry, ref string, a, bseen *recorder) {
 	t.Helper()
 	a, bseen = &recorder{}, &recorder{}
 	bsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -60,13 +80,30 @@ func serveRedirect(t *testing.T, b http.Handler) (reg *Registry, ref string, a, 
 		b.ServeHTTP(w, req)
 	}))
 	t.Cleanup(bsrv.Close)
-	bURL := strings.Replace(bsrv.URL, "127.0.0.1", "localhost", 1)
+	bURL := strings.Replace(bsrv.URL, "127.0.0.1", s.bHost, 1)
 	asrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/v2/" {
+		challenge := func() {
+			w.Header().Set("WWW-Authenticate",
+				`Bearer realm="http://`+req.Host+`/token",service="redirect-test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+		switch {
+		case req.URL.Path == "/v2/" && s.bearer:
+			challenge()
+			return
+		case req.URL.Path == "/v2/":
 			w.WriteHeader(http.StatusOK)
+			return
+		case req.URL.Path == "/token" && s.bearer:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"token":"`+redirectToken+`"}`)
 			return
 		}
 		a.note(req)
+		if s.bearer && req.Header.Get("Authorization") != "Bearer "+redirectToken {
+			challenge()
+			return
+		}
 		http.Redirect(w, req, bURL+req.URL.Path, http.StatusTemporaryRedirect)
 	}))
 	t.Cleanup(asrv.Close)
@@ -86,6 +123,15 @@ func checkHops(t *testing.T, a, b *recorder, wantRange string) {
 	}
 	if len(bh) != 1 || bh[0].auth != "" || bh[0].rng != wantRange {
 		t.Fatalf("second host saw %q, want one request with no Authorization and Range %q", bh, wantRange)
+	}
+}
+
+// checkOneHopEach: A issued exactly one redirect and B received exactly one
+// blob request.
+func checkOneHopEach(t *testing.T, a, b *recorder) {
+	t.Helper()
+	if ah, bh := a.seen(), b.seen(); len(ah) != 1 || len(bh) != 1 {
+		t.Fatalf("origin saw %q and second host saw %q, want one blob request each", ah, bh)
 	}
 }
 
@@ -122,12 +168,13 @@ func TestBlobRedirectKeepsRangeDropsAuthorization(t *testing.T) {
 // ignores the Range and sends the whole blob; Blob reports start 0.
 func TestBlobRedirectRangeAnsweredWith200RestartsAtZero(t *testing.T) {
 	data, digest := blobData(1000)
-	reg, ref, _, _ := serveRedirect(t, &fakeRegistry{data: data, rangeStatus: http.StatusOK})
+	reg, ref, a, b := serveRedirect(t, &fakeRegistry{data: data, rangeStatus: http.StatusOK})
 	body, start, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer body.Close()
+	checkOneHopEach(t, a, b)
 	if got, err := io.ReadAll(body); start != 0 || err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("start %d, %d bytes, err %v; want the whole blob from 0", start, len(got), err)
 	}
@@ -137,7 +184,7 @@ func TestBlobRedirectRangeAnsweredWith200RestartsAtZero(t *testing.T) {
 // Content-Range other than the one asked for is ErrBlobRange.
 func TestBlobRedirectWrongContentRangeIsRefused(t *testing.T) {
 	data, digest := blobData(1000)
-	reg, ref, _, _ := serveRedirect(t, &fakeRegistry{data: data, contentRange: "bytes 0-999/1000"})
+	reg, ref, a, b := serveRedirect(t, &fakeRegistry{data: data, contentRange: "bytes 0-999/1000"})
 	body, _, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 300)
 	if err == nil {
 		body.Close()
@@ -146,19 +193,53 @@ func TestBlobRedirectWrongContentRangeIsRefused(t *testing.T) {
 	if !errors.Is(err, ErrBlobRange) {
 		t.Fatalf("err = %v, want ErrBlobRange", err)
 	}
+	checkOneHopEach(t, a, b)
 }
 
 // TestBlobRedirectPartialContentReturnsFromOffset: the second host's 206 with
 // the asked Content-Range is the body from the offset.
 func TestBlobRedirectPartialContentReturnsFromOffset(t *testing.T) {
 	data, digest := blobData(1000)
-	reg, ref, _, _ := serveRedirect(t, &fakeRegistry{data: data})
+	reg, ref, a, b := serveRedirect(t, &fakeRegistry{data: data})
 	body, start, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer body.Close()
+	checkOneHopEach(t, a, b)
 	if got, err := io.ReadAll(body); start != 300 || err != nil || !bytes.Equal(got, data[300:]) {
 		t.Fatalf("start %d, %d bytes, err %v; want 300 and the blob from 300", start, len(got), err)
 	}
+}
+
+// TestBlobRedirectBearerTokenStaysOnOrigin: A demands a bearer token from its
+// own token endpoint; the blob GET to A carries it, and the 307 to another
+// host carries no Authorization at all.
+func TestBlobRedirectBearerTokenStaysOnOrigin(t *testing.T) {
+	data, digest := blobData(1000)
+	reg, ref, a, b := serveRedirectWith(t, &fakeRegistry{data: data}, redirectSetup{bHost: "localhost", bearer: true})
+	body, _, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if ah := a.seen(); len(ah) != 1 || ah[0].auth != "Bearer "+redirectToken {
+		t.Fatalf("origin saw %q, want one request with Authorization %q", ah, "Bearer "+redirectToken)
+	}
+	if bh := b.seen(); len(bh) != 1 || bh[0].auth != "" {
+		t.Fatalf("second host saw %q, want one request with no Authorization", bh)
+	}
+}
+
+// TestBlobRedirectToOtherPortDropsAuthorization: B is the same host name as A
+// (both 127.0.0.1) on a different port, and still gets no Authorization.
+func TestBlobRedirectToOtherPortDropsAuthorization(t *testing.T) {
+	data, digest := blobData(1000)
+	reg, ref, a, b := serveRedirectWith(t, &fakeRegistry{data: data}, redirectSetup{bHost: "127.0.0.1"})
+	body, _, err := reg.Blob(context.Background(), ref, redirectCred, digest, 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	checkHops(t, a, b, "")
 }
