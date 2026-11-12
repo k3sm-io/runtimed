@@ -78,6 +78,14 @@ type Cache struct {
 	// It must not take leaseMu itself.
 	beforePruneUnlink func(digest string)
 
+	// beforePruneLock, when set, runs inside executePrune's loop each time
+	// the executor is about to take leaseMu for an entry's critical section
+	// (whose first step is the lease-watch check), with that entry's digest
+	// and leaseMu NOT held. It is UNEXPORTED and exists only so an in-package
+	// test can drive a whole pull into the window before that section;
+	// production never sets it.
+	beforePruneLock func(digest string)
+
 	// operatorMu serializes the read-modify-write of the OPERATOR reachability
 	// record (operatorroots.go). That record is a single file holding every
 	// operator-owned root, so two concurrent tag/untag/pull calls would otherwise
