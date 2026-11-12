@@ -436,6 +436,11 @@ type TreeExecuteReport struct {
 	// DeletedBytes is the summed accounted size of the removed trees. Like
 	// ExecuteReport.DeletedBytes it is what was REMOVED, not what the volume got
 	// back — the payload's extents may still be shared with a live pod rootfs.
+	// It also includes the size of every TrashLeft tree, whose bytes are still
+	// on the volume under a trash name until a later sweep deletes them. No
+	// reader takes it as freed space: the disk-pressure stop rule measures free
+	// space with statfs, and ReclaimReport.ReclaimedBytes carries the same
+	// overstatement on its face.
 	DeletedBytes int64
 	// Skipped lists planned trees that failed re-verification or whose removal
 	// failed. A skip is never an error: it leaves the tree in place for the next
@@ -448,9 +453,16 @@ type TreeExecuteReport struct {
 	// deleted this run. They are still counted in Removed — each is already
 	// unreachable by its real name — and the next run sweeps them.
 	TrashLeft int
-	// TrashSwept counts leftover trash directories this run's opening sweep
+	// TrashSwept counts leftover trash entries this run's opening sweep
 	// deleted.
 	TrashSwept int
+	// TrashRemaining counts the leftover trash entries the opening sweep saw
+	// and left in place: their removal failed, or the pass's maxStageSweep cap
+	// was reached. The next run retries them. It does not include TrashLeft.
+	TrashRemaining int
+	// TrashErr is the first error the opening sweep or a trash delete met,
+	// nil when there was none. It is for logging; it never fails the run.
+	TrashErr error
 }
 
 // ExecuteTreePrune executes plan's DeleteTrees set against this cache.
@@ -570,46 +582,67 @@ func detachTree(root *os.Root, rel, recordName string) (string, error) {
 	return trash, nil
 }
 
-// sweepTreeTrash removes up to maxStageSweep leftover trash directories from
+// sweepTreeTrash removes up to maxStageSweep leftover trash entries from
 // every tree store: the residue of a pass whose delete failed after the
 // rename. It runs under pruneMu, which every trash directory is created and
-// deleted under, so nothing it sees is in use. It is best-effort: a leftover
-// it cannot remove is retried by the next pass, and it returns how many
-// entries it removed.
-func (c *Cache) sweepTreeTrash() int {
-	swept := 0
+// deleted under, so nothing it sees is in use. Each entry is removed by name
+// through the store's *os.Root, so a ".trash-*" symlink is unlinked, never
+// followed.
+//
+// It is best-effort: a leftover it cannot remove, or one past the per-pass
+// cap, is retried by the next pass. It reports how many entries it removed,
+// how many ".trash-*" entries it saw and left in place (failed or past the
+// cap), and the first error it met; an absent store is not an error.
+func (c *Cache) sweepTreeTrash() (swept, remaining int, firstErr error) {
+	note := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 	for _, store := range treeStores {
 		dir, _, err := c.treeStoreLayout(store)
 		if err != nil {
+			note(err)
 			continue
 		}
 		root, err := os.OpenRoot(dir)
 		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				note(fmt.Errorf("sweep tree trash: open %s: %w", dir, err))
+			}
 			continue // an absent store has nothing to sweep
 		}
 		f, err := root.Open(".")
 		if err != nil {
 			root.Close()
+			note(fmt.Errorf("sweep tree trash: open %s: %w", dir, err))
 			continue
 		}
 		// The store root holds only algorithm directories and dot-names, so
 		// reading it whole is cheap; the bound is on the removals.
-		entries, _ := f.ReadDir(-1)
+		entries, err := f.ReadDir(-1)
 		f.Close()
+		if err != nil {
+			note(fmt.Errorf("sweep tree trash: read %s: %w", dir, err))
+		}
 		for _, e := range entries {
-			if swept >= maxStageSweep {
-				break
-			}
 			if !strings.HasPrefix(e.Name(), treeTrashPrefix) {
 				continue
 			}
-			if root.RemoveAll(e.Name()) == nil {
-				swept++
+			if swept >= maxStageSweep {
+				remaining++
+				continue
 			}
+			if err := root.RemoveAll(e.Name()); err != nil {
+				remaining++
+				note(fmt.Errorf("sweep tree trash %s/%s: %w", dir, e.Name(), err))
+				continue
+			}
+			swept++
 		}
 		root.Close()
 	}
-	return swept
+	return swept, remaining, firstErr
 }
 
 // executeTreePrune is ExecuteTreePrune with hooks; see ExecuteTreePrune for
@@ -635,7 +668,8 @@ func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.
 		}
 	}
 
-	rep := &TreeExecuteReport{TrashSwept: c.sweepTreeTrash()}
+	rep := &TreeExecuteReport{}
+	rep.TrashSwept, rep.TrashRemaining, rep.TrashErr = c.sweepTreeTrash()
 	removeTrash := func(root *os.Root, name string) error { return root.RemoveAll(name) }
 	if hooks != nil && hooks.removeTrash != nil {
 		removeTrash = hooks.removeTrash
@@ -734,6 +768,9 @@ func (c *Cache) executeTreePrune(plan *PrunePlan, grace time.Duration, now time.
 		// next pass's sweepTreeTrash.
 		if err := removeTrash(root, trash); err != nil {
 			rep.TrashLeft++
+			if rep.TrashErr == nil {
+				rep.TrashErr = fmt.Errorf("delete tree trash %s: %w", trash, err)
+			}
 		}
 		rep.Deleted++
 		rep.DeletedBytes += d.Node.Size

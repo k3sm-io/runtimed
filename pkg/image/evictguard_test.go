@@ -598,6 +598,9 @@ func TestEvictTreeTrashSwept(t *testing.T) {
 	if !reflect.DeepEqual(rep.Removed, []string{tf.key}) || rep.Deleted != 1 || len(rep.Skipped) != 0 || rep.TrashLeft != 1 {
 		t.Fatalf("report = %+v; want %s removed with one trash entry left", rep, tf.key)
 	}
+	if rep.TrashErr == nil || !strings.Contains(rep.TrashErr.Error(), "delete failed") {
+		t.Errorf("TrashErr = %v; want the failed delete's error", rep.TrashErr)
+	}
 	if _, err := os.Lstat(tf.dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("tree %s still reachable by its real name: %v", tf.dir, err)
 	}
@@ -630,8 +633,8 @@ func TestEvictTreeTrashSwept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteTreePrune: %v", err)
 	}
-	if rep.TrashSwept != 1 {
-		t.Errorf("TrashSwept = %d; want 1", rep.TrashSwept)
+	if rep.TrashSwept != 1 || rep.TrashRemaining != 0 || rep.TrashErr != nil {
+		t.Errorf("sweep = %d swept, %d remaining, err %v; want 1, 0, nil", rep.TrashSwept, rep.TrashRemaining, rep.TrashErr)
 	}
 	assertNoTrash(t, f)
 }

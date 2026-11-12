@@ -560,6 +560,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		}
 		return nil, err
 	}
+	logTreeTrash(log, treeExec)
 	rep.RemovedTrees = treeExec.Removed
 	rep.ReclaimedBytes = treeExec.DeletedBytes
 	if treeExec.DeletedBytes > 0 {
@@ -621,6 +622,24 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 			"deleted", exec.Deleted, "trees_deleted", treeExec.Deleted)
 	}
 	return rep, nil
+}
+
+// logTreeTrash reports the tree executor's trash outcome in one line: a Warn
+// when detached trees are still on the volume under a trash name (this run's
+// failed deletes, or leftovers the opening sweep could not or did not reach),
+// with the counts and the first error (a sweep that could not even read a
+// store is a Warn with zero counts); otherwise an Info when the opening
+// sweep recovered leftovers from an earlier run. A clean run logs nothing.
+func logTreeTrash(log *slog.Logger, rep *TreeExecuteReport) {
+	switch {
+	case rep.TrashLeft > 0 || rep.TrashRemaining > 0 || rep.TrashErr != nil:
+		log.Warn("image reclaim left detached tree trash on the volume; the next pass retries it",
+			"trash_left", rep.TrashLeft, "trash_remaining", rep.TrashRemaining,
+			"trash_swept", rep.TrashSwept, "err", rep.TrashErr)
+	case rep.TrashSwept > 0:
+		log.Info("image reclaim swept leftover tree trash",
+			"trash_swept", rep.TrashSwept, "err", rep.TrashErr)
+	}
 }
 
 // dropLeased returns dels without the decisions whose digest a live lease
