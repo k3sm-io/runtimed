@@ -505,11 +505,13 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	// the blobs are checked again, still under the lease, and what is gone is
 	// fetched once more. This narrows the race rather than closing it.
 	// Reclaim re-reads its pins whenever a lease acquired since its last
-	// read names the blob and checks live leases before each unlink, but
-	// neither is atomic with AcquireLease: a pull that leases after reclaim's
-	// per-blob watch check and either releases before its lease check or roots
-	// before its unlink can still lose a blob after this re-check
-	// (executePrune in pkg/image states that residual).
+	// read names the blob, and checks live leases and unlinks in one
+	// critical section AcquireLease also takes, so a lease that lands after
+	// that check is ordered after the unlink and this re-check refetches.
+	// The watch check is not atomic with AcquireLease: a pull that leases
+	// after reclaim's per-blob watch check and releases before its lease
+	// check can still lose a blob after this re-check (executePrune in
+	// pkg/image states that residual).
 	if err := p.recheck(ctx, ref, cred, need, res); err != nil {
 		return nil, err
 	}

@@ -487,7 +487,9 @@ type pinnedFunc func() (map[string]PruneReason, error)
 //
 // Per entry the order is: watch check (re-pin if a new lease names this
 // digest), pin lookup, then ONE leaseMu critical section holding the
-// live-lease check, Lstat, grace and unlink. INVARIANT: a
+// live-lease check, Lstat, grace and unlink. INVARIANT, which holds only when
+// pinned is non-nil (with a nil pinned there is no pin set and no watch, and
+// only leased stands between a newly rooted blob and its unlink): a
 // blob is re-checked against a fresh pin read exactly when a lease taken since
 // the last pin read names its digest; a pull leases every blob it will root
 // before it writes the record or hold; so a blob no such lease names cannot
@@ -535,8 +537,8 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	// The watch opens BEFORE the pins it vouches for, for the same reason
 	// pinnedNow reads leases before roots: a lease acquired after this point
 	// lands in the watch, and one acquired before it is seen by the pin read
-	// (live) or left a root that read sees (released). pruneMu, held for the
-	// whole pass by every caller, keeps watches from nesting.
+	// (live) or left a root that read sees (released). pruneMu, which this
+	// function takes itself for the whole pass, keeps watches from nesting.
 	var pins map[string]PruneReason
 	if pinned != nil {
 		c.beginLeaseWatch()
