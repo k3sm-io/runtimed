@@ -107,6 +107,11 @@ func present(s string) string {
 type Registry struct {
 	Transport http.RoundTripper
 	PlainHTTP bool
+
+	// newAuth builds the authenticating transport for one repository; nil
+	// means transport.NewWithContext. It is a field, not a package variable,
+	// so a test sets it on its own Registry and mutates no shared state.
+	newAuth func(ctx context.Context, reg name.Registry, auth authn.Authenticator, t http.RoundTripper, scopes []string) (http.RoundTripper, error)
 }
 
 func (g *Registry) parse(ref string) (name.Reference, error) {
@@ -131,10 +136,6 @@ func authenticator(cred *Credential) authn.Authenticator {
 	})
 }
 
-// newAuthTransport builds the authenticating transport for one registry
-// repository. It is a variable so a test can replace it.
-var newAuthTransport = transport.NewWithContext
-
 // Session parses ref and returns an authenticated client for its repository,
 // scoped to pull, over the registry's transport.
 //
@@ -152,7 +153,11 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 		return nil, nil, err
 	}
 	repo := r.Context()
-	rt, err := newAuthTransport(ctx, repo.Registry, authenticator(cred), g.Transport,
+	newAuth := g.newAuth
+	if newAuth == nil {
+		newAuth = transport.NewWithContext
+	}
+	rt, err := newAuth(ctx, repo.Registry, authenticator(cred), g.Transport,
 		[]string{repo.Scope(transport.PullScope)})
 	if err != nil {
 		return nil, nil, fmt.Errorf("registry auth: %w", bound(err))
@@ -220,9 +225,9 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 		return nil, 0, err
 	}
 	repo := r.Context()
-	url := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", repo.Registry.Scheme(), repo.RegistryStr(), repo.RepositoryStr(), digest)
+	blobURL := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", repo.Registry.Scheme(), repo.RegistryStr(), repo.RepositoryStr(), digest)
 	get := func(from int64) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
 		if err != nil {
 			return nil, err
 		}
