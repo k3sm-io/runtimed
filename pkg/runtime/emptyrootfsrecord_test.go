@@ -323,8 +323,17 @@ func TestRecordPodReferencesRefusals(t *testing.T) {
 			}
 			if podDir == "" {
 				entries, rerr := os.ReadDir(rt.cache.PodsRoot())
-				if rerr == nil && len(entries) != 0 {
+				if rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+					t.Errorf("read pods root: %v", rerr)
+				}
+				if len(entries) != 0 {
 					t.Errorf("pods root holds %d entries after a refused id, want none", len(entries))
+				}
+				escaped := filepath.Join(rt.cache.PodsRoot(), tc.podID)
+				for _, p := range []string{escaped, filepath.Join(escaped, image.PodReferencesName)} {
+					if _, serr := os.Lstat(p); !errors.Is(serr, fs.ErrNotExist) {
+						t.Errorf("escape path %s exists after a refused id (stat err %v), want not-exist", p, serr)
+					}
 				}
 				return
 			}
@@ -350,7 +359,7 @@ func wantRecordBytes(want string) func(t *testing.T, rt *Runtime, record string)
 	}
 }
 
-// writeFile writes content to path, creating its parent.
+// writeRecordFixture writes content to path, creating its parent.
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
