@@ -1238,3 +1238,131 @@ func TestExecutePruneFailsClosedWhenTheRepinReadFails(t *testing.T) {
 		t.Error("a failed pin re-read still unlinked the blob the new lease named")
 	}
 }
+
+// TestReclaimKeepsBlobRootedBeforeItsCriticalSection drives a complete pull
+// (lease, record, hold, release) into the window just before the executor
+// takes leaseMu for the pulled blob, after the batch's pin read. No live
+// lease names the blob inside the critical section and the stale pin set
+// does not either, so only a lease-watch check made inside that section can
+// force the re-read that sees the record and hold. The unrooted blob
+// examined first is still unlinked, so the batch is not vacuous.
+func TestReclaimKeepsBlobRootedBeforeItsCriticalSection(t *testing.T) {
+	f := newGCFixture(t)
+	stray := f.blob("unreferenced layer examined first", 24*time.Hour)
+	held := f.blob("artifact layer pulled before its critical section", 24*time.Hour)
+	pid := f.pod("pod-artifact")
+	x, err := NewFileIndex(f.cache)
+	if err != nil {
+		t.Fatalf("NewFileIndex: %v", err)
+	}
+	sum := sha256.Sum256([]byte("pre-section artifact manifest"))
+	manifest := "sha256:" + hex.EncodeToString(sum[:])
+	key := "registry.example/models/m:presection@" + testModelType
+
+	pulled := false
+	f.cache.beforePruneLock = func(digest string) {
+		if pulled || digest != held {
+			return
+		}
+		pulled = true
+		lease := f.cache.AcquireLease([]string{held}, time.Minute)
+		putTypedArtifact(t, x, key, testModelType, held, held)
+		if err := x.AddArtifactHoldManifest(context.Background(), pid, HeldManifest{
+			Digest: manifest, Config: held, Layers: []string{held},
+		}); err != nil {
+			t.Errorf("AddArtifactHoldManifest: %v", err)
+		}
+		lease.Release()
+	}
+	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
+	rep, err := f.cache.executePrune(planOf(stray, held), 0, f.clock, nil, pinned)
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
+	}
+	if !pulled {
+		t.Fatal("the hook never ran, so the window was not driven")
+	}
+	if !f.exists(held) {
+		t.Fatal("a blob a pull rooted before its critical section was deleted")
+	}
+	if f.exists(stray) {
+		t.Errorf("the unrooted blob survived, so the batch proved nothing")
+	}
+	var reason PruneReason
+	for _, k := range rep.pinned {
+		if k.Digest == held {
+			reason = k.Reason
+		}
+	}
+	if reason != ReasonKeptInUse {
+		t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+	}
+}
+
+// TestExecutePruneKeepsABlobRenamedOnEveryRepin pins the re-read bound: a
+// lease naming the same planned blob lands before every one of its critical
+// sections, so every locked watch check asks for another pin re-read. After
+// maxPruneRepins re-reads the executor stops asking, keeps the blob and
+// reports it skipped, rather than unlinking it or looping. The blob examined
+// first is unlinked, so the pass is not vacuous.
+func TestExecutePruneKeepsABlobRenamedOnEveryRepin(t *testing.T) {
+	f := newGCFixture(t)
+	first := f.blob("first planned blob", 24*time.Hour)
+	renamed := f.blob("planned blob a lease names on every retry", 24*time.Hour)
+
+	locks := 0
+	f.cache.beforePruneLock = func(digest string) {
+		if digest != renamed {
+			return
+		}
+		locks++
+		f.cache.AcquireLease([]string{renamed}, time.Minute).Release()
+	}
+	reads := 0
+	pinned := func() (map[string]PruneReason, error) {
+		reads++
+		return f.cache.pinnedNow(nil)
+	}
+	type result struct {
+		rep *ExecuteReport
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		rep, err := f.cache.executePrune(planOf(first, renamed), 0, f.clock, nil, pinned)
+		done <- result{rep, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("executePrune did not return; the re-read loop is unbounded")
+	}
+	if r.err != nil {
+		t.Fatalf("executePrune: %v", r.err)
+	}
+	if !f.exists(renamed) {
+		t.Fatal("a blob a new lease named on every retry was unlinked")
+	}
+	if f.exists(first) {
+		t.Error("the blob examined first survived, so the pass proved nothing")
+	}
+	if want := 1 + maxPruneRepins; reads != want {
+		t.Errorf("pin reads = %d; want %d (the batch read and %d re-reads)", reads, want, maxPruneRepins)
+	}
+	if want := 1 + maxPruneRepins; locks != want {
+		t.Errorf("critical sections for the renamed blob = %d; want %d", locks, want)
+	}
+	if slices.Contains(r.rep.Removed, renamed) {
+		t.Errorf("the pass reported removing the kept blob: %v", r.rep.Removed)
+	}
+	skipped := false
+	for _, s := range r.rep.Skipped {
+		if s.Digest == renamed {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Errorf("rep.Skipped = %+v; want %s skipped after the bound", r.rep.Skipped, renamed)
+	}
+}

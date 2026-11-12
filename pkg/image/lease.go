@@ -123,19 +123,14 @@ func (c *Cache) endLeaseWatch() {
 	c.leaseWatch = nil
 }
 
-// takeIfNamed reports whether a lease acquired since the watch began (or
-// since the last time takeIfNamed returned true) names d. When it does, the
-// watch is reset to empty in the same leaseMu critical section, so the caller
-// re-reads its pins AFTER the reset and a lease acquired during that re-read
-// lands in the fresh set.
-func (c *Cache) takeIfNamed(d string) bool {
-	c.leaseMu.Lock()
-	defer c.leaseMu.Unlock()
-	if _, ok := c.leaseWatch[d]; !ok {
-		return false
-	}
-	c.leaseWatch = make(map[string]struct{})
-	return true
+// leaseWatchNamesLocked reports whether a lease acquired since the watch began
+// (or since the watch was last reset) names d. The caller holds leaseMu. Its
+// only caller is executePrune's critical section (unlinkUnlessLeased), which
+// resets the watch in that same section when it is about to re-read its pins,
+// so a lease acquired during that re-read lands in the fresh watch.
+func (c *Cache) leaseWatchNamesLocked(d string) bool {
+	_, ok := c.leaseWatch[d]
+	return ok
 }
 
 // leasedDigests returns the set of digests currently pinned by a live lease,
