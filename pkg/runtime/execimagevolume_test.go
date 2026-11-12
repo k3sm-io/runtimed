@@ -27,6 +27,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"k3sm.io/runtimed/pkg/artifact"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -43,7 +44,10 @@ import (
 // refuses it with the same sentinel. A sibling that only shares a string prefix
 // with the mount path is a real in-image program and resolves, and a program
 // under an ordinary (non-image) volume mount keeps the early return, left as
-// sent but cleaned.
+// sent but cleaned. The by-name check covers only an absolute argv[0] on the
+// image route: a relative name and every command on the host-binary route are
+// left as sent, as before, and those rows pin that. No refusal names the host
+// rootfs or the image-volume view, which are the daemon's to know.
 func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 	if goruntime.GOOS != "darwin" {
 		t.Skip("the daemon's views clone with APFS clonefile, darwin-only")
@@ -61,6 +65,9 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 		// byWalk marks a refusal that comes from the rootfs walk following an
 		// in-image link into the view, not from the by-name mount check.
 		byWalk bool
+		// hostRoute resolves through a copy of the container on the host-binary
+		// route (Image: NativeImage), where nothing is checked by name.
+		hostRoute bool
 		// want is the resolved argv[0] of an accepted row, given the rootfs.
 		want func(rootfs string) string
 	}{
@@ -69,12 +76,25 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 		{name: "case variant", argv0: "/Models/run.json", mountPath: "/models", refused: true},
 		{name: "trailing slash argv0", argv0: "/opt/run/", mountPath: "/opt/run", subPath: "run.json", refused: true},
 		{name: "trailing slash directory mount", argv0: "/models/run.json", mountPath: "/models/", refused: true},
+		{name: "dot-dot through a sibling", argv0: "/opt/../models/run.json", mountPath: "/models", refused: true},
+		{name: "doubled leading slash", argv0: "//models/run.json", mountPath: "/models", refused: true},
 		{name: "in-image link into the mount", argv0: "/bin/tool", mountPath: "/models",
 			linkAt: "bin/tool", linkTo: "/models/run.json", refused: true, byWalk: true},
 		{name: "sibling sharing a prefix", argv0: "/models2/x", mountPath: "/models", program: "models2/x",
 			want: func(rootfs string) string { return filepath.Join(rootfs, "models2/x") }},
 		{name: "ordinary volume mount keeps the early return", argv0: "/data//tool", mountPath: "/models", program: "data/tool",
 			want: func(string) string { return "/data/tool" }},
+		// Today's behaviour, pinned: the host-binary route returns before the
+		// by-name check, so the mount refusal deliberately does not fire there.
+		{name: "host-binary route is left as sent", argv0: "/models/run.json", mountPath: "/models", hostRoute: true,
+			want: func(string) string { return "/models/run.json" }},
+		// Today's behaviour, pinned: a relative argv[0] means the session's
+		// working directory and is not checked by name; the pod's profile is the
+		// boundary there, not this check.
+		{name: "relative name is left as sent", argv0: "models/run.json", mountPath: "/models",
+			want: func(string) string { return "models/run.json" }},
+		{name: "dot-relative name is left as sent", argv0: "./models/run.json", mountPath: "/models",
+			want: func(string) string { return "./models/run.json" }},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -139,7 +159,12 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 			p := rt.pods[podID]
 			rt.mu.Unlock()
 			checks0, signs0, spawns0 := counts(sg, sp)
-			got, err := rt.resolveExecCommand(context.Background(), p, c, []string{tc.argv0, "arg"})
+			ec := c
+			if tc.hostRoute {
+				ec = proto.Clone(c).(*runtimev1.Container)
+				ec.Image = NativeImage
+			}
+			got, err := rt.resolveExecCommand(context.Background(), p, ec, []string{tc.argv0, "arg"})
 			if !tc.refused {
 				if err != nil {
 					t.Fatalf("resolveExecCommand(%q): %v", tc.argv0, err)
@@ -156,6 +181,11 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 			if !strings.Contains(msg, ErrImageArgvEscapes.Error()) {
 				t.Errorf("resolveExecCommand err = %q, want it to name %q", msg, ErrImageArgvEscapes)
 			}
+			for _, host := range hostForms(rootfs, view) {
+				if strings.Contains(msg, host) {
+					t.Errorf("resolveExecCommand err = %q names the host path %q, which is the daemon's to know", msg, host)
+				}
+			}
 			if !tc.byWalk && (!strings.Contains(msg, tc.mountPath) || !strings.Contains(msg, "holds data, not programs")) {
 				t.Errorf("resolveExecCommand err = %q, want it to name %q and say an image volume holds data, not programs", msg, tc.mountPath)
 			}
@@ -165,4 +195,18 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hostForms returns each of paths and, where it differs, its form with links
+// resolved (/var is /private/var on darwin), so a message naming either is
+// caught.
+func hostForms(paths ...string) []string {
+	var out []string
+	for _, p := range paths {
+		out = append(out, p)
+		if r, err := filepath.EvalSymlinks(p); err == nil && r != p {
+			out = append(out, r)
+		}
+	}
+	return out
 }

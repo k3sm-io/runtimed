@@ -203,12 +203,15 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 //
 // # What is refused by name
 //
-// An absolute argv[0] that is one of the container's image-volume mount paths,
-// or lies beneath one, is refused with ErrImageArgvEscapes before the volume
-// rule above, as start refuses it (imageVolumeMountAt: cleaned, compared
-// case-insensitively, a prefix only on a separator boundary). An image volume
-// holds data, not programs. The check reads the box's mounts, never the rootfs;
-// an in-image link into such a mount is not matched by name, and the rootfs walk
+// Only an absolute argv[0] on the image route is checked by name: one that is
+// one of the container's image-volume mount paths, or lies beneath one, is
+// refused with ErrImageArgvEscapes before the volume rule above, using start's
+// match (imageVolumeMountAt: cleaned, compared case-insensitively, a prefix only
+// on a separator boundary). An image volume holds data, not programs. A bare
+// name, a relative path and every command on the host-binary route are not
+// checked by name and are left as sent, as before; the pod's profile is the
+// boundary for them. The check reads the box's mounts, never the rootfs; an
+// in-image link into such a mount is not matched by name, and the rootfs walk
 // below refuses it with the same sentinel when it follows the link out of the
 // root.
 //
