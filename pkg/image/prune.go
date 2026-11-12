@@ -461,8 +461,12 @@ type ExecuteReport struct {
 // rather than on a precomputed byte budget: under APFS clonefile an unlink whose
 // extents are still shared frees nothing, so the only honest stopping rule is to
 // re-measure.
+//
+// It consults no pin set and no lease: a planned blob a live lease names is
+// unlinked like any other. Reclaim, which must honour leases, runs the
+// unexported executor with a pin function instead.
 func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*ExecuteReport, error) {
-	return c.executePrune(plan, grace, now, stop, nil, nil)
+	return c.executePrune(plan, grace, now, stop, nil)
 }
 
 // pinnedFunc returns the digests that must survive an unlink batch, each with
@@ -479,17 +483,19 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // before the next unlink: the pin set is a root set, and a short one would
 // invert the answer.
 //
-// leased, when non-nil, is asked about each entry's digest after its pin
-// lookup and immediately before its Lstat and unlink, and an entry it reports
-// leased is kept as ReasonKeptLeased. It is called with leaseMu held (see
-// unlinkUnlessLeased) and must not take leaseMu; reclaim passes
-// leaseHasLocked.
+// When pinned is non-nil the executor also asks the cache's own lease table
+// (leaseHasLocked) about each entry's digest after its pin lookup and
+// immediately before its Lstat and unlink, and keeps an entry a live lease
+// names as ReasonKeptLeased. That lookup is the executor's own, made with
+// leaseMu already held, so no caller can hand it a check that takes leaseMu
+// again. With a nil pinned (ExecutePrune) there is no lease check.
 //
 // Per entry the order is: watch check (re-pin if a new lease names this
 // digest), pin lookup, then ONE leaseMu critical section holding the
 // live-lease check, Lstat, grace and unlink. INVARIANT, which holds only when
-// pinned is non-nil (with a nil pinned there is no pin set and no watch, and
-// only leased stands between a newly rooted blob and its unlink): a
+// pinned is non-nil (with a nil pinned there is no pin set, no watch and no
+// lease check, so nothing stands between a newly rooted blob and its
+// unlink): a
 // blob is re-checked against a fresh pin read exactly when a lease taken since
 // the last pin read names its digest; a pull leases every blob it will root
 // before it writes the record or hold; so a blob no such lease names cannot
@@ -512,7 +518,7 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // critical section guarantees that for every lease whose AcquireLease returns
 // after it, because the re-check runs after AcquireLease returns. It does not
 // for the residual above: there the re-check ran before the Remove.
-func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, leased func(digest string) bool) (*ExecuteReport, error) {
+func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
 	}
@@ -569,7 +575,7 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
 			continue
 		}
-		c.unlinkUnlessLeased(root, d, grace, now, leased, rep, skip)
+		c.unlinkUnlessLeased(root, d, grace, now, pinned != nil, rep, skip)
 	}
 	return rep, nil
 }
@@ -577,12 +583,13 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 // unlinkUnlessLeased runs one entry's live-lease check, Lstat, grace check and
 // Remove inside ONE leaseMu critical section, so an AcquireLease naming the
 // entry's digest either returns before the check (the entry is kept as
-// ReasonKeptLeased) or blocks until the Remove is done. leased, when non-nil,
-// is therefore called with leaseMu held and must not take it.
-func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, leased func(digest string) bool, rep *ExecuteReport, skip func(PruneDecision, string)) {
+// ReasonKeptLeased) or blocks until the Remove is done. The live-lease check
+// runs only when checkLeases is set, and is always the cache's own locked
+// lookup.
+func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, checkLeases bool, rep *ExecuteReport, skip func(PruneDecision, string)) {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
-	if leased != nil && d.Node.Digest != "" && leased(d.Node.Digest) {
+	if checkLeases && d.Node.Digest != "" && c.leaseHasLocked(d.Node.Digest) {
 		rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
 		return
 	}

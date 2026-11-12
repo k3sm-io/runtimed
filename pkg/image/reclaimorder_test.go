@@ -207,7 +207,7 @@ func TestPinnedNowHonoursALeaseTakenAfterPlanning(t *testing.T) {
 	lease := f.cache.AcquireLease([]string{b}, time.Hour)
 	defer lease.Release()
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	rep, err := f.cache.executePrune(&PrunePlan{Delete: dels}, 0, f.clock, nil, pinned, nil)
+	rep, err := f.cache.executePrune(&PrunePlan{Delete: dels}, 0, f.clock, nil, pinned)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestExecutePruneUnlinksNothingWhenThePinReadFails(t *testing.T) {
 	b := f.blob("planned b", time.Hour)
 	boom := errors.New("pin read failed")
 	pinned := func() (map[string]PruneReason, error) { return nil, boom }
-	if _, err := f.cache.executePrune(planOf(a, b), 0, f.clock, nil, pinned, nil); !errors.Is(err, boom) {
+	if _, err := f.cache.executePrune(planOf(a, b), 0, f.clock, nil, pinned); !errors.Is(err, boom) {
 		t.Fatalf("executePrune error = %v; want %v", err, boom)
 	}
 	if !f.exists(a) || !f.exists(b) {
@@ -262,7 +262,7 @@ func TestPinnedNowFailsClosedOnAnIncompleteRootSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	if _, err := f.cache.executePrune(planOf(a), 0, f.clock, nil, pinned, nil); !errors.Is(err, ErrRootsIncomplete) {
+	if _, err := f.cache.executePrune(planOf(a), 0, f.clock, nil, pinned); !errors.Is(err, ErrRootsIncomplete) {
 		t.Fatalf("executePrune error = %v; want ErrRootsIncomplete", err)
 	}
 	if !f.exists(a) {
@@ -289,8 +289,7 @@ func TestExecutePruneKeepsABlobLeasedMidBatch(t *testing.T) {
 		return false
 	}
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	leased := f.cache.leaseHasLocked // executePrune calls it under leaseMu
-	rep, err := f.cache.executePrune(planOf(a, b), 0, f.clock, stop, pinned, leased)
+	rep, err := f.cache.executePrune(planOf(a, b), 0, f.clock, stop, pinned)
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
