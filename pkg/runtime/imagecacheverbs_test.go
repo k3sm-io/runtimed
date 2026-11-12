@@ -30,11 +30,14 @@ import (
 )
 
 // TestImagesServiceServesOnlyCacheVerbs pins the node store's surface: it is an
-// internal pull cache, so it serves the cache verbs (list, fs info, prune, the
-// warm pull, the artifact pull, inspect) and the read-only SaveImage export the one-time move into
-// the cluster registry reads, and it answers every verb that would write a user
+// internal pull cache, so it serves the cache verbs (list, fs info, prune,
+// evict, the warm pull, the artifact pull, inspect) and the read-only SaveImage
+// export the one-time move into the cluster registry reads, and it answers every verb that would write a user
 // name into the store with UNIMPLEMENTED naming the cluster-registry
 // replacement.
+//
+// Evict is served because it only removes one cached image's bytes and binds no
+// name into the store.
 //
 // The table is checked against the service descriptor, so a verb added to the
 // wire without a row here fails this test rather than defaulting to served.
@@ -90,7 +93,7 @@ func TestImagesServiceServesOnlyCacheVerbs(t *testing.T) {
 			}
 		}},
 		{"EvictImage", true, "", func() error {
-			_, err := client.EvictImage(ctx, &runtimev1.EvictImageRequest{})
+			_, err := client.EvictImage(ctx, &runtimev1.EvictImageRequest{Digest: "sha256:" + hexOf("absent-evict-target")})
 			return err
 		}},
 		{"RemoveImage", false, "k3sm image untag", func() error {
@@ -150,5 +153,13 @@ func TestImagesServiceServesOnlyCacheVerbs(t *testing.T) {
 				t.Errorf("%s refusal %q does not name the cluster registry and %q", r.verb, msg, r.replace)
 			}
 		})
+	}
+
+	// The EvictImage row only proves "not UNIMPLEMENTED"; this pins that its
+	// probe (a well-formed digest nothing names, force unset) passes request
+	// validation and is answered by the resolve path, mutating nothing.
+	_, err := client.EvictImage(ctx, &runtimev1.EvictImageRequest{Digest: "sha256:" + hexOf("absent-evict-target")})
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("EvictImage of an unnamed digest answered %v (%v); want NOT_FOUND from the resolve path", got, err)
 	}
 }
