@@ -65,6 +65,27 @@ type cutRegistry struct {
 	ranges   []string // the Range header of every layer GET, in order
 	// wholeOn200 makes every uncut GET ignore Range and answer 200 whole.
 	wholeOn200 bool
+	// hold, when not nil, keeps every served layer GET waiting until it is
+	// closed; inflight counts the GETs waiting and maxInflight its peak.
+	hold        chan struct{}
+	inflight    int
+	maxInflight int
+}
+
+// holdServes makes every later served layer GET wait until the returned
+// channel is closed.
+func (c *cutRegistry) holdServes() chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hold = make(chan struct{})
+	return c.hold
+}
+
+// held reports how many layer GETs are waiting on hold now, and the peak.
+func (c *cutRegistry) held() (now, peak int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inflight, c.maxInflight
 }
 
 // arm sets the fixture's fault counters under its mutex.
@@ -122,7 +143,21 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 			c.badRange--
 		}
 		whole := !cut && !bad && c.wholeOn200
+		hold := c.hold
+		if hold != nil && !cut {
+			c.inflight++
+			c.maxInflight = max(c.maxInflight, c.inflight)
+		}
 		c.mu.Unlock()
+		if hold != nil && !cut {
+			select {
+			case <-hold:
+			case <-r.Context().Done():
+			}
+			c.mu.Lock()
+			c.inflight--
+			c.mu.Unlock()
+		}
 		if whole {
 			w.Header().Set("Content-Length", strconv.FormatInt(c.size, 10))
 			w.WriteHeader(http.StatusOK)
@@ -777,5 +812,170 @@ func TestPullResumeCommitsByClone(t *testing.T) {
 		if _, err := os.Lstat(partialPath(dir, c.layer)); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("poisoned partial was not removed: %v", err)
 		}
+	})
+}
+
+// TestPullResumeConcurrentSameLayer pins resume under contention: with a cut
+// partial on disk, several pulls of the same layer run at once over one
+// partial store, every layer GET held open until all are in flight. Exactly
+// one pull resumes the partial with a Range request; the rest fetch the layer
+// whole rather than reading the partial another pull is still growing. Every
+// pull succeeds with the layer verifying byte for byte, and no partial or
+// staging file is left behind.
+func TestPullResumeConcurrentSameLayer(t *testing.T) {
+	const (
+		cutAt   = 4096
+		pullers = 6
+	)
+	resumed := "bytes=" + strconv.FormatInt(cutAt, 10) + "-"
+
+	// run seeds a cut partial through pulls[0], then runs every pull at once
+	// and returns each one's error.
+	run := func(t *testing.T, c *cutRegistry, dir string, pulls []*Puller) []error {
+		t.Helper()
+		c.arm(1, 0, false)
+		if _, err := pullAlways(pulls[0], c.ref); err == nil {
+			t.Fatal("seeding pull succeeded through a cut layer")
+		}
+		fi, err := os.Stat(partialPath(dir, c.layer))
+		if err != nil || fi.Size() != cutAt {
+			t.Fatalf("partial after the cut pull: %v, err %v, want %d bytes", fi, err, cutAt)
+		}
+		c.takeRanges()
+
+		hold := c.holdServes()
+		released := false
+		release := func() {
+			if !released {
+				released = true
+				close(hold)
+			}
+		}
+		defer release()
+		errs := make([]error, len(pulls))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i, p := range pulls {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				res, err := pullAlways(p, c.ref)
+				if err == nil {
+					res.Lease.Release()
+				}
+				errs[i] = err
+			}()
+		}
+		close(start)
+		// Release once every pull's GET is in flight, or after a bound if
+		// the cache serializes some of them; the peak is checked below.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			now, _ := c.held()
+			if now >= len(pulls) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		release()
+		wg.Wait()
+		if _, peak := c.held(); peak < 2 {
+			t.Fatalf("at most %d layer GET was in flight at once: the pulls did not overlap", peak)
+		}
+		return errs
+	}
+
+	// leftovers fails on any entry in the partial dir or the staging dir.
+	leftovers := func(t *testing.T, dir string, caches ...*Cache) {
+		t.Helper()
+		names, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(names) != 0 {
+			t.Fatalf("partial dir holds %v after every pull, want it empty", names)
+		}
+		for _, cache := range caches {
+			if names := stageEntries(t, cache); len(names) != 0 {
+				t.Fatalf("staging dir holds %q after every pull, want it empty", names)
+			}
+		}
+	}
+
+	// oneResume fails unless exactly one layer GET was the resume from cutAt
+	// and no other GET asked for a range.
+	oneResume := func(t *testing.T, c *cutRegistry) {
+		t.Helper()
+		got := c.takeRanges()
+		n := 0
+		for _, r := range got {
+			switch r {
+			case resumed:
+				n++
+			case "":
+			default:
+				t.Fatalf("layer GET asked for %q, want only %q or none (all: %q)", r, resumed, got)
+			}
+		}
+		if n != 1 {
+			t.Fatalf("%d layer GETs resumed the partial, want exactly 1 (all: %q)", n, got)
+		}
+	}
+
+	t.Run("one puller", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		cache, err := NewCache(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(t.TempDir(), "partials")
+		p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+		pulls := make([]*Puller, pullers)
+		for i := range pulls {
+			pulls[i] = p
+		}
+		for i, err := range run(t, c, dir, pulls) {
+			if err != nil {
+				t.Errorf("pull %d: %v", i, err)
+			}
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
+		oneResume(t, c)
+		verifyLayer(t, cache, c)
+		layerBytesEqual(t, cache, c)
+		leftovers(t, dir, cache)
+	})
+
+	t.Run("a cache per puller over one partial store", func(t *testing.T) {
+		c := newCutRegistry(t, cutAt)
+		dir := filepath.Join(t.TempDir(), "partials")
+		store := &registryfetch.PartialStore{Dir: dir}
+		pulls := make([]*Puller, pullers)
+		caches := make([]*Cache, pullers)
+		for i := range pulls {
+			cache, err := NewCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			caches[i] = cache
+			pulls[i] = resumePuller(t, c, cache, store)
+		}
+		for i, err := range run(t, c, dir, pulls) {
+			if err != nil {
+				t.Errorf("pull %d: %v", i, err)
+			}
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
+		oneResume(t, c)
+		for _, cache := range caches {
+			verifyLayer(t, cache, c)
+			layerBytesEqual(t, cache, c)
+		}
+		leftovers(t, dir, caches...)
 	})
 }
