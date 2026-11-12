@@ -28,8 +28,8 @@ import (
 
 // ErrInsufficientSpace reports a pull refused before its first blob request:
 // the bytes its manifest declares, added to what other in-flight pulls have
-// reserved, would take the store volume below its free-space floor, and one
-// reclaim pass did not make room. The image pull and the artifact pull return
+// reserved, would take the store volume below its free-space floor, and reclaim
+// could not make room (by its plan, or by its one real pass). The image pull and the artifact pull return
 // this one sentinel (artifact.ErrInsufficientSpace is the same value).
 var ErrInsufficientSpace = errors.New("image: refusing the pull, the store volume would fall below its free-space floor")
 
@@ -67,7 +67,8 @@ var ErrDeclaredSizeRejected = errors.New("image: refusing the pull, the manifest
 // and the artifact pulls do not see one another's claims.
 //
 // mu guards held and is held across a reservation's whole check, including its
-// one reclaim pass, so two pulls can never both pass a check only one fits.
+// dry run and its one reclaim pass, so two pulls can never both pass a check
+// only one fits.
 type SpaceLedger struct {
 	mu   sync.Mutex
 	held uint64
@@ -81,6 +82,9 @@ func (l *SpaceLedger) Reserved() uint64 {
 }
 
 // SpaceReclaimer runs one disk-pressure reclaim pass; *Cache satisfies it.
+// Reserve calls it first with ReclaimConfig.DryRun set and reads the bytes the
+// plan would delete from ReclaimReport.ReclaimedBytes, then runs the real pass
+// only when those bytes could make the claim fit.
 type SpaceReclaimer interface {
 	ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*ReclaimReport, error)
 }
@@ -98,7 +102,8 @@ type SpaceClaim struct {
 	// TotalBytes samples the volume's total capacity, checked before the
 	// reclaim pass. Nil means StatfsTotalBytes.
 	TotalBytes TotalBytesFunc
-	// Reclaimer runs the one reclaim pass when the claim does not fit. Nil
+	// Reclaimer plans (dry run) and then runs the one reclaim pass when the
+	// claim does not fit. Nil
 	// means no pass: a claim that does not fit is refused at once.
 	Reclaimer SpaceReclaimer
 	// Log receives a failed reclaim pass. Nil discards.
@@ -127,14 +132,28 @@ func (r *Reservation) Release() {
 
 // Reserve claims c.Need bytes before the pull's first blob request. The claim
 // fits when free space is at least c.FloorBytes plus everything already held
-// plus c.Need. When it does not, one c.Reclaimer pass runs, asked to bring free
-// space up to that sum, and the check is repeated; still short is
-// ErrInsufficientSpace. c.FloorBytes plus c.Need above the volume's total
-// capacity is ErrDeclaredSizeRejected with no reclaim pass; when only the bytes
-// other pulls hold push the sum past capacity, the pass runs as above. An
-// unsamplable volume (free space
-// or, before a pass, capacity) refuses with ErrFreeSpaceUnknown, and a sum that
-// would wrap refuses with ErrSizeOverflow.
+// plus c.Need. When it does not and c.Reclaimer is set:
+//
+//   - c.FloorBytes plus c.Need above the volume's total capacity is
+//     ErrDeclaredSizeRejected, with no reclaim pass of either kind.
+//   - c.FloorBytes plus the held bytes plus c.Need above capacity is
+//     ErrInsufficientSpace with no pass: reclaim cannot free what in-flight
+//     pulls hold.
+//   - Otherwise a dry-run pass plans the eviction without unlinking. A plan
+//     error, or free space plus the planned bytes still short of the sum, is
+//     ErrInsufficientSpace with no real pass, so a claim reclaim could not
+//     satisfy never empties the unreferenced cache. Only then does one real
+//     pass run, asked to bring free space up to the sum, and the check is
+//     repeated; still short is ErrInsufficientSpace.
+//
+// Stated limit: the dry run skips the bound of released artifact records,
+// which the real pass runs on every pass, and those bytes are not in its
+// plan. (Reserve sets no ReclaimConfig.SweepDerived, so its real pass does not
+// sweep artifact views either.) A pull that would fit only after that bound is
+// refused; the daemon's own pressure pass runs it.
+//
+// An unsamplable volume (free space or, before a pass, capacity) refuses with
+// ErrFreeSpaceUnknown, and a sum that would wrap refuses with ErrSizeOverflow.
 func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, error) {
 	free := c.FreeBytes
 	if free == nil {
@@ -170,7 +189,7 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		// the declared sizes are a registry's, and an impossible declaration
 		// must not evict every unreferenced blob on each attempt and still
 		// fail. It is judged by this pull alone; bytes other pulls hold are a
-		// local shortfall, left to the pass and ErrInsufficientSpace.
+		// local shortfall, refused below as ErrInsufficientSpace.
 		capacity, err := total(c.Path)
 		if err != nil {
 			return nil, fmt.Errorf("%w: capacity: %w", ErrFreeSpaceUnknown, boundErr(err))
@@ -183,9 +202,29 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 			return nil, fmt.Errorf("need %d bytes, floor %d: the claim exceeds the volume's capacity of %d bytes: %w",
 				c.Need, c.FloorBytes, capacity, ErrDeclaredSizeRejected)
 		}
-		if _, rerr := c.Reclaimer.ReclaimUnderPressure(ctx, ReclaimConfig{
-			HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: free, Log: c.Log,
-		}); rerr != nil && c.Log != nil {
+		// Reclaim cannot free what in-flight pulls hold, so a sum past capacity
+		// only because of them is refused without a pass.
+		if want > capacity {
+			return nil, fmt.Errorf("need %d bytes, %d reserved by other pulls, floor %d: the sum exceeds the volume's capacity of %d bytes: %w",
+				c.Need, l.held, c.FloorBytes, capacity, ErrInsufficientSpace)
+		}
+		cfg := ReclaimConfig{HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: free, Log: c.Log}
+		dry := cfg
+		dry.DryRun = true
+		plan, derr := c.Reclaimer.ReclaimUnderPressure(ctx, dry)
+		if derr != nil {
+			return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan failed: %v: %w",
+				c.Need, avail, c.FloorBytes, derr, ErrInsufficientSpace)
+		}
+		var reclaimable uint64
+		if plan != nil && plan.ReclaimedBytes > 0 {
+			reclaimable = uint64(plan.ReclaimedBytes)
+		}
+		if reach, oerr := addChecked(avail, reclaimable); oerr == nil && reach < want {
+			return nil, fmt.Errorf("need %d bytes, %d free, %d reclaimable, %d reserved by other pulls, floor %d: %w",
+				c.Need, avail, reclaimable, l.held, c.FloorBytes, ErrInsufficientSpace)
+		}
+		if _, rerr := c.Reclaimer.ReclaimUnderPressure(ctx, cfg); rerr != nil && c.Log != nil {
 			c.Log.Warn("pull: reclaim pass before a space reservation failed", "err", rerr)
 		}
 		avail, ok, err = fits()
