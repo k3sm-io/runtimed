@@ -107,7 +107,7 @@ type podReferences struct {
 
 // EnsurePodReferences creates an EMPTY reachability record for podID if none
 // exists, and is a no-op if a valid one does. An existing entry that is not a
-// regular file holding a decodable record is refused with
+// regular file holding a decodable record whose every digest parses is refused with
 // ErrPodReferencesInvalid and left untouched: accepting it would let the create
 // succeed and then fail Roots for the whole node.
 //
@@ -141,10 +141,14 @@ func (c *Cache) EnsurePodReferences(podID PodID) error {
 
 // checkPodReferences reads the record at path without following a final
 // symlink, re-checks on the open descriptor that it is a regular file (the
-// Lstat in the caller can race a swap), bounds the read, and decodes it. Its
+// Lstat in the caller can race a swap), bounds the read, decodes it, and parses
+// every digest it names. Its
 // errors name only PodReferencesName, never path.
 func checkPodReferences(path string) error {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// O_NONBLOCK so a FIFO swapped in after the caller's Lstat cannot block the
+	// open waiting for a writer; the descriptor check below then refuses it. A
+	// regular file ignores the flag, so the read is unaffected.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return fmt.Errorf("open %s: %v", PodReferencesName, unwrapPath(err))
 	}
@@ -167,6 +171,16 @@ func checkPodReferences(path string) error {
 	if err := json.Unmarshal(buf, &rec); err != nil {
 		// Bounded as DATA: encoding/json echoes the offending byte.
 		return fmt.Errorf("decode %s: %v", PodReferencesName, boundErr(err))
+	}
+	// The same digest check Roots applies: a record that decodes but names a
+	// digest this store cannot map to a path would fail Roots just the same.
+	for _, r := range rec.Images {
+		for _, d := range r.Digests() {
+			if _, perr := parseBlobDigest(d); perr != nil {
+				// Already bounded at the source (see the matching site in roots).
+				return fmt.Errorf("%s records unusable digest: %v", PodReferencesName, perr)
+			}
+		}
 	}
 	return nil
 }

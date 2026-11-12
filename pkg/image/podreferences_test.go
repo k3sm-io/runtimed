@@ -21,7 +21,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // TestEnsurePodReferencesRecordValidation pins what EnsurePodReferences
@@ -32,6 +34,10 @@ import (
 func TestEnsurePodReferencesRecordValidation(t *testing.T) {
 	const valid = `{"images":[{"reference":"example.test/app:v1","config":"sha256:` +
 		`1111111111111111111111111111111111111111111111111111111111111111","layers":[]}]}`
+	// Decodes as the record, but its layer digest is not one this store can map
+	// to a path, so Roots would refuse it.
+	const unusableDigest = `{"images":[{"reference":"example.test/app:v1","config":"sha256:` +
+		`1111111111111111111111111111111111111111111111111111111111111111","layers":["sha256:not-hex"]}]}`
 	tests := []struct {
 		name string
 		// seed plants the entry at record; outside is a scratch dir off the pod tree.
@@ -112,6 +118,24 @@ func TestEnsurePodReferencesRecordValidation(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "record with an unusable digest is refused and left",
+			seed: func(t *testing.T, record, outside string) {
+				mustWrite(t, record, unusableDigest, 0o644)
+			},
+			wantErr: true,
+			check:   wantFile(unusableDigest),
+		},
+		{
+			name: "fifo is refused without blocking and left",
+			seed: func(t *testing.T, record, outside string) {
+				if err := syscall.Mkfifo(record, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: true,
+			check:   wantFIFO,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,7 +159,7 @@ func TestEnsurePodReferencesRecordValidation(t *testing.T) {
 			record := filepath.Join(podDir, PodReferencesName)
 			tc.seed(t, record, outside)
 
-			err = cache.EnsurePodReferences(pid)
+			err = withTimeout(t, func() error { return cache.EnsurePodReferences(pid) }, record)
 			if got := errors.Is(err, ErrPodReferencesInvalid); got != tc.wantErr {
 				t.Fatalf("EnsurePodReferences = %v, want ErrPodReferencesInvalid %v", err, tc.wantErr)
 			}
@@ -154,5 +178,52 @@ func wantFile(want string) func(t *testing.T, path, _ string) {
 		if err != nil || string(b) != want {
 			t.Errorf("%s = (%q, %v), want %q", filepath.Base(path), b, err, want)
 		}
+	}
+}
+
+// TestCheckPodReferencesFIFONonBlocking pins the descriptor-side half of the
+// FIFO refusal: a FIFO swapped in after EnsurePodReferences' Lstat reaches the
+// open itself, and that open must return (to be refused by the regular-file
+// check on the descriptor) instead of blocking for a writer that never comes.
+func TestCheckPodReferencesFIFONonBlocking(t *testing.T) {
+	base := t.TempDir()
+	record := filepath.Join(base, PodReferencesName)
+	if err := syscall.Mkfifo(record, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := withTimeout(t, func() error { return checkPodReferences(record) }, record)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("checkPodReferences(fifo) = %v, want a not-a-regular-file refusal", err)
+	}
+	if strings.Contains(err.Error(), base) {
+		t.Errorf("err %q names the host path %s", err, base)
+	}
+	wantFIFO(t, record, "")
+}
+
+// withTimeout runs fn and fails the test if it has not returned within a few
+// seconds, so a regression that blocks (an open on a FIFO with no writer)
+// fails instead of hanging the run. On timeout it opens record for writing to
+// release a reader blocked on a FIFO there, so the goroutine does not leak.
+func withTimeout(t *testing.T, fn func() error, record string) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		if w, err := os.OpenFile(record, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			w.Close()
+		}
+		t.Fatalf("call did not return within 5s: blocked on %s", filepath.Base(record))
+		return nil
+	}
+}
+
+func wantFIFO(t *testing.T, path, _ string) {
+	t.Helper()
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Errorf("Lstat(%s) = (%v, %v), want the seeded fifo", filepath.Base(path), fi, err)
 	}
 }
