@@ -388,8 +388,14 @@ func openNoFollowAt(dir *os.File, name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
 }
 
+// copyContent copies a source file's bytes into a freshly created destination
+// in the byte-copy fallback. It is io.Copy; a test substitutes a copy that fails
+// part-way to prove a failed copy leaves no partial file behind.
+var copyContent = io.Copy
+
 // byteCopyAt copies src to name inside dir, preserving permission bits. name
-// must not exist; a link at name is refused, never followed.
+// must not exist; a link at name is refused, never followed. On a copy or close
+// error the partially written name is removed.
 func byteCopyAt(src string, dir *os.File, name string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -412,14 +418,26 @@ func byteCopyAt(src string, dir *os.File, name string) error {
 		return err
 	}
 	out := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+	_, err = copyContent(out, in)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		// Remove the partial file: a later materialization keeps any regular
+		// file it finds, so a truncated one would stay in the tree. The unlink
+		// is relative to dir, like the create, and never follows a link.
+		if uerr := withFD(dir, func(dfd int) error {
+			return unix.Unlinkat(dfd, name, 0)
+		}); uerr != nil && !errors.Is(uerr, unix.ENOENT) {
+			return errors.Join(err, &os.PathError{Op: "unlinkat", Path: name, Err: uerr})
+		}
 		return err
 	}
-	return out.Close()
+	return nil
 }
 
 // byteCopyFile copies src to dst preserving permission bits. dst must not exist.
+// On a copy or close error the partially written dst is removed.
 func byteCopyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -437,9 +455,17 @@ func byteCopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+	_, err = copyContent(out, in)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		// Remove the partial file, by the same path it was created at, so a
+		// later materialization does not keep a truncated file.
+		if rerr := os.Remove(dst); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			return errors.Join(err, rerr)
+		}
 		return err
 	}
-	return out.Close()
+	return nil
 }
