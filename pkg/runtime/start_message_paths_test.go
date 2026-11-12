@@ -29,8 +29,10 @@ import (
 	"testing"
 
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/volume"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	storagev1 "k3sm.io/apis/storage/v1"
 )
 
 // configFailWorld is an imageWorld whose pulls succeed but whose image config
@@ -188,6 +190,27 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			sentence: "its volume shares could not be prepared; the daemon log has the cause",
 			marker:   "materialize vm volume shares",
 			wants:    func(e env) []string { return []string{filepath.Join(e.podDir, "rootfs")} },
+		},
+		{
+			// A PV storage root inside the runtime socket tree: the share
+			// plan refuses the PVC share, naming the share root and the run
+			// dir.
+			name: "share-plan",
+			setup: func(t *testing.T, e env) {
+				class := storagev1.DefaultLocalPathClass()
+				class.BasePath = filepath.Join(e.rt.cfg.Root, "run", "storage")
+				e.rt.binder = volume.NewBinder(class, image.APFSCloner{}, nil, e.rt.log)
+				e.box.Volumes = []*runtimev1.Volume{{
+					Name:                  "data",
+					PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "pgdata"},
+				}}
+				e.box.Containers[0].VolumeMounts = []*runtimev1.VolumeMount{{Name: "data", MountPath: "/data"}}
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			sentence: "its volume share plan could not be computed; the daemon log has the cause",
+			marker:   "vm volume share plan for pod",
+			wants:    func(e env) []string { return []string{filepath.Join(e.rt.cfg.Root, "run")} },
 		},
 		{
 			// A file where the PV storage root belongs.

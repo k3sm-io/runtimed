@@ -1084,8 +1084,12 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	}
 	plan, err := mount.ComputeSharePlanWithViews(box, podDir, r.cfg.Root, r.binder.Class(), imageViews)
 	if err != nil {
+		// The plan's errors name the pod dir, the pods, views and run roots
+		// and the share roots, so the reply is a fixed sentence; the cause
+		// stays in the chain for the daemon log.
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
+			vmPodStartError(box.GetPodId(), "its volume share plan could not be computed",
+				fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err))
 	}
 	// The agent socket is derived here, by the same function the daemon's own
 	// GuestDialer uses, and stamped onto the spec — so the socket the helper
