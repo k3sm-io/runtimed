@@ -378,3 +378,71 @@ func TestPodImageRootsRefusesAFIFOWithoutBlocking(t *testing.T) {
 		})
 	}
 }
+
+// TestRecordReadsRefuseASymlink pins that a pod's record is opened without
+// following a symlink: with images.json replaced by a link to a regular file
+// holding a valid record, Roots reports the roots incomplete naming the pod and
+// returns none, and PodImageRoots returns an error and none. Following the link
+// would hand back the target's roots as if the pod had recorded them.
+func TestRecordReadsRefuseASymlink(t *testing.T) {
+	t.Parallel()
+
+	// plant replaces the pod's record with a symlink to a valid record held
+	// outside the pod directory.
+	plant := func(t *testing.T, f *gcFixture, pid PodID) string {
+		t.Helper()
+		target := filepath.Join(t.TempDir(), "target.json")
+		body, err := json.Marshal(podReferences{Images: []ImageRoot{{
+			Reference: "linked:v1",
+			Config:    "sha256:" + strings.Repeat("a", 64),
+			Layers:    []string{"sha256:" + strings.Repeat("b", 64)},
+		}}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := os.WriteFile(target, body, 0o644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		path := filepath.Join(f.cache.PodDir(pid), PodReferencesName)
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove record: %v", err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		return path
+	}
+
+	t.Run("Roots", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		pid := f.pod("pod-a")
+		plant(t, f, pid)
+
+		roots, err := f.cache.Roots()
+		if !errors.Is(err, ErrRootsIncomplete) {
+			t.Fatalf("Roots err = %v; want ErrRootsIncomplete", err)
+		}
+		if roots != nil {
+			t.Fatalf("Roots returned %v alongside the refusal; want nil", roots)
+		}
+		if !strings.Contains(err.Error(), `pod "pod-a"`) {
+			t.Fatalf("Roots err = %q; want it to name pod \"pod-a\"", err)
+		}
+	})
+
+	t.Run("PodImageRoots", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		pid := f.pod("pod-a")
+		plant(t, f, pid)
+
+		roots, err := f.cache.PodImageRoots(pid)
+		if err == nil {
+			t.Fatalf("PodImageRoots err = nil, roots = %v; want a refusal", roots)
+		}
+		if roots != nil {
+			t.Fatalf("PodImageRoots returned %v alongside the refusal; want nil", roots)
+		}
+	})
+}
