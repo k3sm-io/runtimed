@@ -74,18 +74,16 @@ func (s *stampingAuth) seen() []string {
 	return append([]string(nil), s.urls...)
 }
 
-// stampAuth replaces newAuthTransport for the test with a stampingAuth over
-// the inner transport Session passes, and returns it.
+// stampAuth returns a stampingAuth; its newAuth is the Registry.newAuth seam
+// that wraps the inner transport Session passes.
 func stampAuth(t *testing.T) *stampingAuth {
 	t.Helper()
-	s := &stampingAuth{}
-	prev := newAuthTransport
-	newAuthTransport = func(_ context.Context, _ name.Registry, _ authn.Authenticator, inner http.RoundTripper, _ []string) (http.RoundTripper, error) {
-		s.inner = inner
-		return s, nil
-	}
-	t.Cleanup(func() { newAuthTransport = prev })
-	return s
+	return &stampingAuth{}
+}
+
+func (s *stampingAuth) newAuth(_ context.Context, _ name.Registry, _ authn.Authenticator, inner http.RoundTripper, _ []string) (http.RoundTripper, error) {
+	s.inner = inner
+	return s, nil
 }
 
 // serveOK starts a server that records each request and answers 200.
@@ -113,11 +111,12 @@ func serveRedirectTo(t *testing.T, target string) (*httptest.Server, *credLog) {
 	return srv, log
 }
 
-// getVia opens a Session for a repository on origin and GETs path on it.
-func getVia(t *testing.T, inner http.RoundTripper, origin, path string) (*http.Response, error) {
+// getVia opens a Session, with stamp as the authenticating transport, for a
+// repository on origin and GETs path on it.
+func getVia(t *testing.T, stamp *stampingAuth, inner http.RoundTripper, origin, path string) (*http.Response, error) {
 	t.Helper()
 	host := strings.TrimPrefix(origin, "http://")
-	reg := &Registry{Transport: inner, PlainHTTP: true}
+	reg := &Registry{Transport: inner, PlainHTTP: true, newAuth: stamp.newAuth}
 	_, client, err := reg.Session(context.Background(), host+"/models/tiny:v1", redirectCred)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +137,7 @@ func TestSessionCheckRedirectStripsCredentials(t *testing.T) {
 	b, blog := serveOK(t)
 	bURL := strings.Replace(b.URL, "127.0.0.1", "localhost", 1)
 	a, alog := serveRedirectTo(t, bURL)
-	resp, err := getVia(t, http.DefaultTransport, a.URL, "/v2/models/tiny/blobs/x")
+	resp, err := getVia(t, stamp, http.DefaultTransport, a.URL, "/v2/models/tiny/blobs/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +159,7 @@ func TestSessionRedirectToOtherPortIsAnotherHost(t *testing.T) {
 	stamp := stampAuth(t)
 	b, blog := serveOK(t)
 	a, alog := serveRedirectTo(t, b.URL)
-	resp, err := getVia(t, http.DefaultTransport, a.URL, "/v2/models/tiny/blobs/x")
+	resp, err := getVia(t, stamp, http.DefaultTransport, a.URL, "/v2/models/tiny/blobs/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +213,7 @@ func TestSessionRedirectToOtherSchemeIsAnotherHost(t *testing.T) {
 		http.Redirect(w, req, target+req.URL.Path, http.StatusTemporaryRedirect)
 	}))
 	t.Cleanup(srv.Close)
-	resp, err := getVia(t, plain, srv.URL, "/v2/models/tiny/blobs/x")
+	resp, err := getVia(t, stamp, plain, srv.URL, "/v2/models/tiny/blobs/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,22 +245,62 @@ func (r *routeRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
 }
 
+// TestSessionWiresRoutes: Session itself puts the newAuth result on the
+// registry's origin and Registry.Transport on every other host.
+func TestSessionWiresRoutes(t *testing.T) {
+	authMark, plainMark := &routeRecorder{}, &routeRecorder{}
+	reg := &Registry{
+		Transport: plainMark,
+		newAuth: func(context.Context, name.Registry, authn.Authenticator, http.RoundTripper, []string) (http.RoundTripper, error) {
+			return authMark, nil
+		},
+	}
+	_, client, err := reg.Session(context.Background(), "registry.example/models/tiny:v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(u string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	get("https://registry.example/v2/models/tiny/blobs/x")
+	if authMark.n != 1 || plainMark.n != 0 {
+		t.Fatalf("registry origin: auth %d plain %d, want auth 1 plain 0", authMark.n, plainMark.n)
+	}
+	get("https://blobs.example/x")
+	if authMark.n != 1 || plainMark.n != 1 {
+		t.Fatalf("other host: auth %d plain %d, want auth 1 plain 1", authMark.n, plainMark.n)
+	}
+}
+
 // TestHostSplitRoutes: scheme and host:port decide the route, with default
 // ports filled in and host names compared case-insensitively.
 func TestHostSplitRoutes(t *testing.T) {
 	for _, tc := range []struct {
-		scheme, host, url string
-		auth              bool
+		name, scheme, host, url string
+		auth                    bool
 	}{
-		{"https", "registry.example", "https://registry.example/v2/", true},
-		{"https", "registry.example", "https://registry.example:443/v2/", true},
-		{"https", "registry.example:443", "https://REGISTRY.example/v2/", true},
-		{"http", "registry.example", "http://registry.example:80/v2/", true},
-		{"https", "registry.example", "http://registry.example/v2/", false},
-		{"https", "registry.example", "http://registry.example:443/v2/", false},
-		{"https", "registry.example", "https://registry.example:5000/v2/", false},
-		{"https", "registry.example", "https://blobs.example/v2/", false},
-		{"https", "registry.example", "https://registry.example.evil/v2/", false},
+		{"same origin", "https", "registry.example", "https://registry.example/v2/", true},
+		{"explicit default port", "https", "registry.example", "https://registry.example:443/v2/", true},
+		{"host case", "https", "registry.example:443", "https://REGISTRY.example/v2/", true},
+		{"http default port", "http", "registry.example", "http://registry.example:80/v2/", true},
+		{"other scheme", "https", "registry.example", "http://registry.example/v2/", false},
+		{"other scheme same port", "https", "registry.example", "http://registry.example:443/v2/", false},
+		{"other port", "https", "registry.example", "https://registry.example:5000/v2/", false},
+		{"other host", "https", "registry.example", "https://blobs.example/v2/", false},
+		{"suffixed host", "https", "registry.example", "https://registry.example.evil/v2/", false},
+		{"ipv6 same port", "http", "[::1]:5000", "http://[::1]:5000/v2/", true},
+		{"ipv6 other port", "http", "[::1]:5000", "http://[::1]:5001/v2/", false},
+		{"trailing dot is another host", "https", "registry.example", "https://registry.example./v2/", false},
+		{"userinfo routes by host", "https", "registry.example", "https://user:pass@registry.example/v2/", true},
 	} {
 		auth, plain := &routeRecorder{}, &routeRecorder{}
 		h := &hostSplit{scheme: tc.scheme, host: canonicalHost(tc.scheme, tc.host), auth: auth, plain: plain}
@@ -275,8 +314,8 @@ func TestHostSplitRoutes(t *testing.T) {
 		}
 		resp.Body.Close()
 		if got := auth.n == 1 && plain.n == 0; got != tc.auth {
-			t.Errorf("registry %s://%s, request %s: auth %d plain %d, want auth route %v",
-				tc.scheme, tc.host, tc.url, auth.n, plain.n, tc.auth)
+			t.Errorf("%s: registry %s://%s, request %s: auth %d plain %d, want auth route %v",
+				tc.name, tc.scheme, tc.host, tc.url, auth.n, plain.n, tc.auth)
 		}
 	}
 }
