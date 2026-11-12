@@ -95,12 +95,10 @@ var (
 	ErrNoLayers           = errors.New("artifact: manifest has no layers")
 	ErrLayerPath          = errors.New("artifact: layer file path is missing or invalid")
 	ErrPathNotInArtifact  = errors.New("artifact: requested path is not in the artifact")
-	ErrInsufficientSpace  = errors.New("artifact: refusing the pull, the store volume would fall below its free-space floor")
 	ErrBlobTransfer       = errors.New("artifact: blob transfer failed")
 	ErrBlobStalled        = errors.New("artifact: blob transfer stalled, no byte arrived within the stall timeout")
 	ErrManifestStalled    = errors.New("artifact: manifest fetch did not complete within the stall timeout")
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
-	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
 	// ErrBlobReclaimed reports a blob the pull's re-check found unlinked by a
 	// reclaim pass and still absent after its one refetch.
@@ -108,6 +106,17 @@ var (
 	// ErrGuestLayersMismatch reports a guest manifest whose layers or config
 	// are not the set PullGuestArtifact was told to expect.
 	ErrGuestLayersMismatch = errors.New("artifact: the guest manifest does not declare exactly the expected layers")
+)
+
+// The space refusals are pkg/image's, so the image and artifact pulls, which
+// reserve on one ledger, refuse with one sentinel each.
+var (
+	// ErrInsufficientSpace is image.ErrInsufficientSpace: the image and
+	// artifact pulls reserve on one ledger and refuse with one sentinel.
+	ErrInsufficientSpace = image.ErrInsufficientSpace
+	// ErrSizeOverflow is image.ErrSizeOverflow, the shared space arithmetic's
+	// refusal of a negative size or a sum that would wrap.
+	ErrSizeOverflow = image.ErrSizeOverflow
 )
 
 // BlobCommitter is the cache seam: *image.Cache satisfies it. CommitBlob is the
@@ -172,6 +181,11 @@ type Config struct {
 	StallTimeout time.Duration
 	// Log receives progress. Nil discards.
 	Log *slog.Logger
+	// Ledger holds the space reservations of in-flight pulls. The daemon passes
+	// the one it also gives the image puller (image.WithSpaceLedger), so the
+	// two paths cannot overcommit the volume against each other. Nil means a
+	// ledger private to this puller.
+	Ledger *image.SpaceLedger
 
 	// afterFunc arms the stall timer; nil means time.AfterFunc. A test seam.
 	afterFunc func(d time.Duration, f func()) idleTimer
@@ -199,8 +213,9 @@ type Puller struct {
 	log  *slog.Logger
 	sem  chan struct{}
 
-	// resv is the in-process space reservation shared by concurrent pulls.
-	resv reservations
+	// ledger is the space reservation ledger shared by concurrent pulls
+	// (Config.Ledger).
+	ledger *image.SpaceLedger
 
 	// inflightMu guards inflight: the digests some pull is transferring now,
 	// each with a channel closed when that transfer ends, so two pulls never
@@ -248,10 +263,15 @@ func New(cfg Config, deps Deps) (*Puller, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	ledger := cfg.Ledger
+	if ledger == nil {
+		ledger = &image.SpaceLedger{}
+	}
 	return &Puller{
 		cfg:      cfg,
 		deps:     deps,
 		log:      log,
+		ledger:   ledger,
 		sem:      make(chan struct{}, cfg.MaxConcurrentLayers),
 		inflight: make(map[string]chan struct{}),
 	}, nil
@@ -481,7 +501,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 			return nil, err
 		}
 		err = p.fetchAll(ctx, ref, cred, missing, r, lease.Renew)
-		r.release()
+		r.Release()
 		if err != nil {
 			return nil, err
 		}
@@ -575,7 +595,7 @@ func (p *Puller) recheck(ctx context.Context, ref string, cred *image.RegistryCr
 		return err
 	}
 	err = p.fetchAll(ctx, ref, cred, gone, r, renew)
-	r.release()
+	r.Release()
 	if err != nil {
 		return err
 	}

@@ -399,6 +399,10 @@ type Puller struct {
 	floorBytes uint64
 	freeBytes  FreeBytesFunc
 
+	// ledger holds the space reservations of in-flight pulls (reserveSpace).
+	// WithSpaceLedger shares the daemon's; NewPuller defaults it to a private one.
+	ledger *SpaceLedger
+
 	// mirrors and mirrorFetch are the CLUSTER MIRROR fallback (mirror.go), set
 	// together by WithMirrors and both nil by default — a nil pair is a node with
 	// no cluster to fall back to, and restores the pre-mirror behavior exactly.
@@ -462,6 +466,9 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 	p := &Puller{cache: cache, fetch: fetch, index: index}
 	for _, o := range opts {
 		o(p)
+	}
+	if p.ledger == nil {
+		p.ledger = &SpaceLedger{}
 	}
 	// A HALF-WIRED mirror fallback is refused rather than ignored: either half
 	// alone silently disables the whole mechanism, and a node that believed it
@@ -770,6 +777,17 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 			lease.Release()
 		}
 	}()
+
+	// RESERVE the declared bytes of every missing blob before any layer is
+	// requested, so a pull that cannot fit is refused before it spends the
+	// volume rather than bounded only one layer at a time at commit. Taken
+	// here, after the lease, every fetching path (primary, flat, local, mirror)
+	// is covered. The reservation ends with ingest, on every path.
+	space, err := p.reserveSpace(ctx, ref, mfst)
+	if err != nil {
+		return nil, err
+	}
+	defer space.Release()
 
 	// Config blob.
 	rawCfg, err := img.RawConfigFile()

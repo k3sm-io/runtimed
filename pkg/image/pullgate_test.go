@@ -130,10 +130,15 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 		free uint64
 		fail bool
 		// wantSamples is how many times the volume must be measured. Zero means
-		// the decision was made before the gate — the warm-serve path.
+		// the decision was made before the gate — the warm-serve path. A pull
+		// that fetches samples twice: once at the gate and once when it
+		// reserves its declared bytes.
 		wantSamples int
-		wantFetches int
-		wantErr     error
+		// samplesAtLeast makes wantSamples a lower bound, for a row whose
+		// reservation runs a reclaim pass that samples on its own.
+		samplesAtLeast bool
+		wantFetches    int
+		wantErr        error
 		// wantErrAlso is a second sentinel the error must also match.
 		wantErrAlso  error
 		wantCacheHit bool
@@ -144,19 +149,25 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			pull:        runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
 			state:       stateAbsent,
 			free:        roomy,
-			wantSamples: 1,
+			wantSamples: 2,
 			wantFetches: 1,
 		},
 		{
 			// The boundary is `free < floor` refuses, so exactly AT the floor the
-			// pull still proceeds. Pinned because an off-by-one here silently
-			// moves the whole ladder by one byte in the direction of refusing.
-			name:        "exactly_at_the_floor_still_pulls",
-			pull:        runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
-			state:       stateAbsent,
-			free:        atFloor,
-			wantSamples: 1,
-			wantFetches: 1,
+			// gate still admits the pull and it fetches. Pinned because an
+			// off-by-one here silently moves the whole ladder by one byte in the
+			// direction of refusing. The pull then cannot reserve its declared
+			// bytes above the floor, so it is refused there, before any blob is
+			// written: the insufficient-space verdict, not the gate's.
+			name:           "exactly_at_the_floor_admits_then_reservation_refuses",
+			pull:           runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
+			state:          stateAbsent,
+			free:           atFloor,
+			wantSamples:    2,
+			samplesAtLeast: true,
+			wantFetches:    1,
+			wantErr:        ErrInsufficientSpace,
+			wantErrAlso:    ErrPullRefusedDiskPressure,
 		},
 		{
 			name:        "one_byte_below_the_floor_refuses",
@@ -301,13 +312,13 @@ func TestPullRefusesUnderDiskPressure(t *testing.T) {
 			res, perr := p.Pull(context.Background(), ref, nil, nativePolicy(), tc.pull)
 			after := blobFileSet(t, cache)
 
-			if probe.calls != tc.wantSamples {
+			if probe.calls != tc.wantSamples && !(tc.samplesAtLeast && probe.calls > tc.wantSamples) {
 				t.Errorf("free-space samples = %d, want %d", probe.calls, tc.wantSamples)
 			}
 			if fetches := ff.calls + off.calls; fetches != tc.wantFetches {
 				t.Errorf("fetch calls = %d, want %d", fetches, tc.wantFetches)
 			}
-			if tc.wantFetches == 0 && !sameFileSet(before, after) {
+			if (tc.wantFetches == 0 || tc.wantErr != nil) && !sameFileSet(before, after) {
 				t.Errorf("blob store changed (%d -> %d files); a pull that made no fetch must write nothing",
 					len(before), len(after))
 			}
