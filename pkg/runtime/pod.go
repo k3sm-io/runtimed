@@ -608,7 +608,9 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	viewPaths, err := mount.LinkImageVolumes(box, rootfs, imageViews)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: link image volumes for pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err)
+			artifactRefusal(ErrArtifactMountRefused, podSubject(box.GetPodId()),
+				"its image volumes could not be linked into the container root",
+				fmt.Errorf("link image volumes: %w", err))
 	}
 
 	// Bind APFS-backed persistent volumes (PVCs): ensure each claim's

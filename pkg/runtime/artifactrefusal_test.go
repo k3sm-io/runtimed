@@ -21,11 +21,16 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/artifact"
+	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/sandbox"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -76,6 +81,22 @@ func TestArtifactRefusalReplyShape(t *testing.T) {
 				d.ArtifactPuller = &scriptedArtifactPuller{err: &fs.PathError{Op: "open", Path: "/var/k3sm/" + artifactDetail, Err: fs.ErrPermission}}
 			},
 			want: vol + "image " + quoted + " could not be fetched" + daemonLogTail},
+		{name: "hold artifacts", ref: artifactRef,
+			setup: func(rt *Runtime) {
+				// A regular file where the hold subdirectory belongs: the
+				// index refuses it with an error that names the path.
+				if err := os.WriteFile(filepath.Join(rt.cache.IndexRoot(), image.ArtifactHoldIndexSubdir), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "ArtifactMountRefused: pod " + podID + ": its artifact hold could not be recorded" + daemonLogTail},
+		// scriptedArtifactPuller resolves a manifest with no config digest,
+		// which the hold refuses.
+		{name: "hold manifest", ref: artifactRef,
+			want: "ArtifactMountRefused: pod " + podID + " image volume model: image " + quoted + " could not be recorded in the pod's artifact hold" + daemonLogTail},
+		{name: "view build", ref: artifactRef,
+			deps: func(d *Deps) { d.ArtifactPuller = &uncachedArtifactPuller{} },
+			want: "ArtifactMountRefused: pod " + podID + " image volume model: the view of image " + quoted + " could not be built" + daemonLogTail},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := Deps{ArtifactPuller: &scriptedArtifactPuller{}}
@@ -168,5 +189,47 @@ func TestArtifactRefusalKeepsTail(t *testing.T) {
 	if !errors.Is(err, ErrArtifactPullRefused) || !errors.Is(err, cause) ||
 		!strings.HasPrefix(err.Error(), "ArtifactPullRefused: pod pod-a image volume model: CAUSE") {
 		t.Errorf("chain = %v", err)
+	}
+}
+
+// uncachedArtifactPuller resolves a well-formed manifest whose blobs the
+// cache does not have, so the hold records it and building its view fails.
+type uncachedArtifactPuller struct{ scriptedArtifactPuller }
+
+func (u *uncachedArtifactPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	if _, err := u.PullArtifact(ctx, ref, cred, policy, paths, opts...); err != nil {
+		return nil, err
+	}
+	return &artifact.Result{
+		ManifestDigest: sha([]byte("uncached manifest")),
+		ConfigDigest:   sha([]byte("uncached config")),
+		LayerDigests:   []string{sha([]byte("uncached layer"))},
+	}, nil
+}
+
+// TestLinkImageVolumesRefusalHostPath fails the host-process path's link of
+// a built view (a sub_path the view does not have, whose error names the
+// view): the reply is the fixed sentence, with no host path.
+func TestLinkImageVolumesRefusalHostPath(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("the daemon's views clone with APFS clonefile, darwin-only")
+	}
+	const podID = "pod-link-refusal"
+	f := modelArtifact(map[string][]byte{"config.json": []byte("{}"), "w.safetensors": []byte("w")}, []string{"config.json", "w.safetensors"})
+	_, rt := artifactRPCClient(t, f)
+	t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
+	box := imageVolumeBox(rt, podID, artifactTestHost+"/models/tiny:v1")
+	box.Containers[0].VolumeMounts[0].SubPath = "absent-" + artifactDetail
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	msg := resp.GetError().GetMessage()
+	want := "ArtifactMountRefused: pod " + podID + ": its image volumes could not be linked into the container root" + daemonLogTail
+	if msg != want {
+		t.Errorf("reply =\n  %s\nwant\n  %s", msg, want)
+	}
+	if strings.Contains(msg, rt.cfg.Root) || strings.Contains(msg, rt.cache.Root()) || strings.Contains(msg, artifactDetail) {
+		t.Errorf("reply %q carries a host path or the cause", msg)
 	}
 }
