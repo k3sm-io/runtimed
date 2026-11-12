@@ -1347,7 +1347,7 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		Transfer: func(f *os.File, have int64) error {
 			reached = true
 			from = have
-			err := transferBlob(ctx, src, digest, size, f, have)
+			err := transferBlob(ctx, src, digest, size, f, have, p.stallWindow())
 			if errors.Is(err, registryfetch.ErrBlobRange) {
 				if terr := f.Truncate(0); terr != nil {
 					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
@@ -1476,12 +1476,15 @@ func partialEnvErr(err error) bool {
 // runs past size is refused with ErrBlobTooLarge and f is emptied; the real
 // route's body (registryfetch.Registry.Blob) already stops at size with an
 // error, so there the partial stays at size and the next pull verifies it in
-// CommitBlob or removes it.
-func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64) error {
-	body, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
+// CommitBlob or removes it. The body is read through the same progress
+// watchdog as a whole-layer fetch: a body that delivers no byte for window is
+// closed and the transfer fails with ErrLayerBodyStalled, keeping what arrived.
+func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64, window time.Duration) error {
+	rc, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
 	if err != nil {
 		return fmt.Errorf("fetch blob %s from %d: %w", digest, have, err)
 	}
+	body := newStallReader(rc, window)
 	defer body.Close()
 	switch {
 	case start == have:

@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -477,6 +478,107 @@ func TestPullResumesRestartsOn200ToRange(t *testing.T) {
 	layerBytesEqual(t, cache, c)
 	if _, err := os.Stat(partialPath(dir, c.layer)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial survived its commit: %v", err)
+	}
+}
+
+// TestResumedTransferAbortsWhenTheBodyStalls pins the layer-body watchdog on
+// the resume path: a registry that answers the resume's Range request with its
+// headers and part of the body, then holds the connection silent, fails the
+// pull with ErrLayerBodyStalled within the puller's stall window instead of
+// holding it until the caller's context ends, and the partial keeps every byte
+// that arrived for the next pull to resume from.
+func TestResumedTransferAbortsWhenTheBodyStalls(t *testing.T) {
+	const (
+		cutAt  = 4096
+		extra  = 1024
+		window = 200 * time.Millisecond
+		guard  = 8 * time.Second
+	)
+	c := newCutRegistry(t, cutAt)
+	c.arm(1, 0, false)
+
+	// A front for c: a ranged GET of the layer is answered here, with 206
+	// headers and extra bytes from the offset asked for, then nothing until
+	// the client gives up or the test ends; every other request goes to c.
+	upstream := &url.URL{Scheme: "http", Host: c.host}
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	proxy.ErrorLog = log.New(io.Discard, "", 0)
+	layerPath := "/v2/test/app/blobs/" + c.layer.String()
+	done := make(chan struct{})
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rng := r.Header.Get("Range")
+		if r.Method != http.MethodGet || r.URL.Path != layerPath || rng == "" {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		from, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(rng, "bytes="), "-"), 10, 64)
+		if err != nil || from < 0 || from+extra > c.size {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(from, 10)+"-"+
+			strconv.FormatInt(c.size-1, 10)+"/"+strconv.FormatInt(c.size, 10))
+		w.Header().Set("Content-Length", strconv.FormatInt(c.size-from, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(c.body[from : from+extra])
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	front.Config.ErrorLog = log.New(io.Discard, "", 0)
+	// Cleanups run last-in first-out: release the held handler, then close.
+	t.Cleanup(front.Close)
+	t.Cleanup(func() { close(done) })
+	fu, err := url.Parse(front.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := fu.Host + "/test/app:v1"
+
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "partials")
+	p := resumePuller(t, c, cache, &registryfetch.PartialStore{Dir: dir})
+	p.layerStallWindow = window
+
+	if _, err := pullAlways(p, ref); err == nil {
+		t.Fatal("first pull succeeded through a cut layer")
+	}
+	// The front may drop part of what c sent before its cut, so the partial
+	// holds some prefix of the body; the resume asks for the rest from there.
+	fi, err := os.Stat(partialPath(dir, c.layer))
+	if err != nil || fi.Size() <= 0 || fi.Size() > cutAt {
+		t.Fatalf("partial after the cut pull: %v, %v; want 1 to %d bytes", fi, err, cutAt)
+	}
+	have := fi.Size()
+
+	ctx, cancel := context.WithTimeout(context.Background(), guard)
+	defer cancel()
+	start := time.Now()
+	res, err := p.Pull(ctx, ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	elapsed := time.Since(start)
+	if res != nil && res.Lease != nil {
+		res.Lease.Release()
+	}
+	if !errors.Is(err, ErrLayerBodyStalled) {
+		t.Fatalf("resumed pull over a stalled body: err = %v after %v, want ErrLayerBodyStalled", err, elapsed)
+	}
+	if elapsed >= guard/2 {
+		t.Fatalf("resumed pull took %v to abort a body stalled for a %v window", elapsed, window)
+	}
+	got, err := os.ReadFile(partialPath(dir, c.layer))
+	if err != nil {
+		t.Fatalf("no partial after the stalled resume: %v", err)
+	}
+	if !bytes.Equal(got, c.body[:have+extra]) {
+		t.Fatalf("partial holds %d bytes after the stalled resume, want the %d received", len(got), have+extra)
+	}
+	if cache.Has(c.layer.String()) {
+		t.Fatal("a stalled layer is in the cache")
 	}
 }
 
