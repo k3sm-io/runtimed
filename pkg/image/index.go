@@ -863,7 +863,8 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 // FileIndex has no logger, so the error is the only report.
 func validateRecordedBlobDigests(what, ref string, p Platform, mfst *runtimev1.ImageManifest) error {
 	if err := checkBlobDigests(mfst); err != nil {
-		return fmt.Errorf("%w: %q (recorded as %q/%s): %v", ErrIndexEntryCorrupt, what, ref, p, err)
+		return fmt.Errorf("%w: %s (recorded as %s/%s): %v", ErrIndexEntryCorrupt,
+			quoteBounded(what, maxReferenceLen), quoteBounded(ref, maxReferenceLen), p, boundErr(err))
 	}
 	return nil
 }

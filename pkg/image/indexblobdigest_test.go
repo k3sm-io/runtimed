@@ -203,3 +203,38 @@ func TestRecordRefusesNonCanonicalBlobDigests(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexBoundsRecordedReferenceInCorruptError pins that the read-side
+// refusal of a non-canonical blob digest does not echo an oversized on-disk
+// reference: the error still wraps ErrIndexEntryCorrupt and names the layer
+// position, but stays small.
+func TestIndexBoundsRecordedReferenceInCorruptError(t *testing.T) {
+	const ref = "example.com/app:v1"
+	p := Platform{OS: "darwin", Architecture: "arm64"}
+	cache, idx := newIndexedCache(t)
+	if err := idx.Record(context.Background(), IndexEntry{
+		Reference: ref, Platform: p,
+		Manifest: &runtimev1.ImageManifest{
+			Reference: ref,
+			Layers:    []*runtimev1.Descriptor{{Digest: "sha256:" + strings.Repeat("ab", 32), Size: 1}},
+		},
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	name := entryName(ref, p)
+	buf := readEntryFile(t, cache, name)
+	buf = bytes.Replace(buf, []byte("sha256:"+strings.Repeat("ab", 32)), []byte("sha256:"+strings.Repeat("AB", 32)), 1)
+	buf = bytes.Replace(buf, []byte(`"`+ref+`"`), []byte(`"example.com/`+strings.Repeat("a", 64<<10)+`"`), -1)
+	writeEntryFile(t, cache, name, buf)
+
+	_, err := idx.List(context.Background())
+	if !errors.Is(err, ErrIndexEntryCorrupt) {
+		t.Fatalf("List error = %v, want ErrIndexEntryCorrupt", err)
+	}
+	if !strings.Contains(err.Error(), "layer 0") {
+		t.Errorf("error does not name the layer position: %.200q", err)
+	}
+	if got := len(err.Error()); got > 2048 {
+		t.Errorf("error is %d bytes, want <= 2048", got)
+	}
+}
