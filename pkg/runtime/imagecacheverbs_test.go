@@ -89,6 +89,10 @@ func TestImagesServiceServesOnlyCacheVerbs(t *testing.T) {
 				}
 			}
 		}},
+		{"EvictImage", true, "", func() error {
+			_, err := client.EvictImage(ctx, &runtimev1.EvictImageRequest{})
+			return err
+		}},
 		{"RemoveImage", false, "k3sm image untag", func() error {
 			_, err := client.RemoveImage(ctx, &runtimev1.RemoveImageRequest{})
 			return err
