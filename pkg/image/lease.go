@@ -70,11 +70,19 @@ type Lease struct {
 	// expires. Zero means no total cap.
 	maxEnd time.Time
 
-	// lastRenewNano mirrors lastRenew as unix nanoseconds. It is written only
-	// under c.leaseMu (with lastRenew) and read without it by Renew's fast
-	// path, which uses it purely as an early exit: the locked check stays the
-	// authority on whether a renewal happens.
-	lastRenewNano atomic.Int64
+	// acquired is the instant AcquireLease created the lease (the same now as
+	// the first expires); immutable after AcquireLease. It anchors
+	// lastRenewOffset so the fast path measures elapsed time with now.Sub,
+	// which uses the monotonic reading when present.
+	acquired time.Time
+	// lastRenewOffset mirrors lastRenew as lastRenew.Sub(acquired) in
+	// nanoseconds (zero at AcquireLease). It is written only under c.leaseMu
+	// (with lastRenew) and read without it by Renew's fast path, which uses it
+	// purely as an early exit: the locked check stays the authority on whether
+	// a renewal happens. An offset rather than wall-clock unix nanoseconds
+	// keeps the early exit on the same monotonic clock as the locked check and
+	// expiry, so a wall-clock step backwards cannot suppress renewals.
+	lastRenewOffset atomic.Int64
 
 	once sync.Once
 }
@@ -82,7 +90,7 @@ type Lease struct {
 // Renew extends the lease to now plus its TTL (capped at maxEnd when set). It
 // is nil-safe and throttled: a call less than a quarter of the TTL after the
 // last renewal changes nothing and returns before taking c.leaseMu (an atomic
-// read of lastRenewNano), so a per-read caller neither takes the lock per read
+// read of lastRenewOffset), so a per-read caller neither takes the lock per read
 // nor contends with a reclaim pass. Only a call past the throttle window takes
 // the lock, sweeps expired leases and re-checks the throttle there.
 //
@@ -99,7 +107,7 @@ func (l *Lease) Renew() {
 	// Fast path: inside the throttle window the locked check below would
 	// return without effect, so skip the lock. A stale read can only send the
 	// call on to the locked path, never past it.
-	if time.Duration(c.now().UnixNano()-l.lastRenewNano.Load()) < l.ttl/4 {
+	if c.now().Sub(l.acquired)-time.Duration(l.lastRenewOffset.Load()) < l.ttl/4 {
 		return
 	}
 	c.leaseMu.Lock()
@@ -120,7 +128,7 @@ func (l *Lease) Renew() {
 		l.expires = exp
 	}
 	l.lastRenew = now
-	l.lastRenewNano.Store(now.UnixNano())
+	l.lastRenewOffset.Store(int64(now.Sub(l.acquired)))
 }
 
 // Reader wraps r so every read that returns bytes renews the lease. A
@@ -190,8 +198,8 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 		}
 	}
 	now := c.now()
-	l := &Lease{c: c, id: c.nextLease, digests: held, ttl: ttl, expires: now.Add(ttl), lastRenew: now}
-	l.lastRenewNano.Store(now.UnixNano())
+	l := &Lease{c: c, id: c.nextLease, digests: held, ttl: ttl, expires: now.Add(ttl), lastRenew: now, acquired: now}
+	l.lastRenewOffset.Store(0)
 	c.leases[l.id] = l
 	return l
 }

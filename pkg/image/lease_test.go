@@ -290,6 +290,48 @@ func TestLeaseRenewThrottledSkipsTheLock(t *testing.T) {
 	}
 }
 
+// TestLeaseRenewThrottleFollowsTheClock pins that the fast path measures
+// elapsed time on the cache clock from the last effective Renew (the offset
+// from acquired), not from acquisition: after a renewal at a quarter TTL, one
+// nanosecond under the next quarter TTL skips the sweep, and the quarter TTL
+// itself sweeps and extends.
+func TestLeaseRenewThrottleFollowsTheClock(t *testing.T) {
+	ttl := time.Minute
+	tests := []struct {
+		name        string
+		advance     time.Duration // clock advance after the first renewal
+		otherInTbl  bool
+		wantExpires time.Duration // from the start
+	}{
+		{"inside the window after a renewal", ttl/4 - time.Nanosecond, true, ttl/4 + ttl},
+		{"at the boundary after a renewal", ttl / 4, false, ttl/2 + ttl},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGCFixture(t)
+			start := f.clock
+			l := f.cache.AcquireLease([]string{"sha256:mine"}, ttl)
+			f.clock = start.Add(ttl / 4)
+			l.Renew() // effective: offset now ttl/4
+			renewed := f.clock
+			// other expires one nanosecond after the first renewal.
+			f.cache.AcquireLease([]string{"sha256:other"}, time.Nanosecond)
+			f.clock = renewed.Add(tc.advance)
+			l.Renew()
+
+			if got := leaseCount(f.cache); got != map[bool]int{true: 2, false: 1}[tc.otherInTbl] {
+				t.Errorf("lease table size = %d, other expired lease still present want %v", got, tc.otherInTbl)
+			}
+			f.cache.leaseMu.Lock()
+			exp := l.expires
+			f.cache.leaseMu.Unlock()
+			if want := start.Add(tc.wantExpires); !exp.Equal(want) {
+				t.Errorf("expires = %v, want %v", exp, want)
+			}
+		})
+	}
+}
+
 // TestLeaseRenewConcurrent drives Renew (both its fast path and its locked
 // path), Release and the cache's lease check on one cache from several
 // goroutines on a real clock with a TTL short enough that renewals are
