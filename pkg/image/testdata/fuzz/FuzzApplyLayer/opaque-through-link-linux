@@ -1,0 +1,3 @@
+go test fuzz v1
+string("D real\nF real/f\nL d real\nL e .\n--\nO d\nO e\nL x e/real/../..")
+bool(true)

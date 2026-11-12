@@ -34,6 +34,8 @@ import (
 const (
 	fuzzMaxEntries = 32
 	fuzzMaxNameLen = 256
+	// fuzzMaxLayers bounds the "--"-separated layers in one script.
+	fuzzMaxLayers = 8
 	// fuzzHopCap bounds the symlink expansions resolveFromTree performs for
 	// one link. A chain longer than this is a loop (the kernel gives ELOOP at
 	// 32 on darwin), so stopping there is not an escape.
@@ -89,21 +91,37 @@ func FuzzSymlinkTargetContained(f *testing.F) {
 // tree resolves above the tree root.
 //
 // The script is one entry per line: "L <name> <target>" for a symlink,
-// "D <name>" for a directory, "F <name>" for a regular file. Unknown lines
-// are skipped. A refused entry ends the layer, exactly as in production; what
-// was written before it stays and is checked.
+// "H <name> <target>" for a hardlink, "D <name>" for a directory, "F <name>"
+// for a regular file, "W <name>" for a whiteout of name (the ".wh." marker
+// beside it), "O <dir>" for an opaque marker in dir, and "--" to end one
+// layer and start the next. Unknown lines are skipped. A refused entry ends
+// that layer and the apply, exactly as in production; what was written before
+// it stays and is checked. The oracle holds for every entry kind: hardlinks
+// and markers create no symlink, and a sentinel directory beside the tree
+// must survive every iteration unchanged, so a removal or write that escapes
+// the tree is caught as well as a link that resolves above it.
 func FuzzApplyLayer(f *testing.F) {
 	f.Add("L a/b/l ../..\nL x/e ../a/b/l/../..", false)
 	f.Add("L a/b/l ../..\nL a/b/l/x/y ../../../..", false)
 	f.Add("D usr/lib\nL lib usr/lib\nF usr/lib/libc.so.6\nL lib/libc.so libc.so.6", false)
 	f.Add("L bin usr/bin\nL usr/bin/sh /bin/busybox", true)
+	f.Add("D d\nF d/c\n--\nL d e\n--\nL d/x ../..", true)
+	f.Add("L d ../outside\nL e .\n--\nW e/d\nO e\nH h e/d", true)
 	f.Fuzz(func(t *testing.T, script string, linux bool) {
-		layer, ok := fuzzLayer(script)
+		layers, ok := fuzzLayers(script)
 		if !ok {
 			return
 		}
-		tree := filepath.Join(t.TempDir(), "rootfs")
+		base := t.TempDir()
+		tree := filepath.Join(base, "rootfs")
 		if err := os.Mkdir(tree, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sentinel := filepath.Join(base, "outside", "keep")
+		if err := os.MkdirAll(filepath.Dir(sentinel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sentinel, []byte("host"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		root, err := os.OpenRoot(tree)
@@ -119,7 +137,20 @@ func FuzzApplyLayer(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = a.Apply(context.Background(), bytes.NewReader(layer)) // a refusal is a valid outcome; the tree is checked either way
+		for _, layer := range layers {
+			if a.Apply(context.Background(), bytes.NewReader(layer)) != nil {
+				break // a refusal is a valid outcome; the tree is checked either way
+			}
+		}
+		if b, err := os.ReadFile(sentinel); err != nil || string(b) != "host" {
+			t.Errorf("the sentinel outside the tree changed: %q (%v)\nscript:\n%s", b, err, script)
+		}
+		if ents, err := os.ReadDir(base); err != nil || len(ents) != 2 {
+			t.Errorf("the tree's parent holds %d entries (%v), want rootfs and outside\nscript:\n%s", len(ents), err, script)
+		}
+		if ents, err := os.ReadDir(filepath.Dir(sentinel)); err != nil || len(ents) != 1 {
+			t.Errorf("the sentinel directory holds %d entries (%v), want 1\nscript:\n%s", len(ents), err, script)
+		}
 
 		werr := filepath.WalkDir(tree, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -143,15 +174,35 @@ func FuzzApplyLayer(f *testing.F) {
 	})
 }
 
-// fuzzLayer renders a FuzzApplyLayer script as an uncompressed tar. It
-// reports false for a script the tar writer cannot encode, which is a fuzz
-// input to skip rather than a finding.
-func fuzzLayer(script string) ([]byte, bool) {
+// fuzzLayers renders a FuzzApplyLayer script as uncompressed tars, one per
+// "--"-separated layer. fuzzMaxEntries bounds the entries across ALL layers
+// and fuzzMaxLayers the layer count. It reports false for a script the tar
+// writer cannot encode, which is a fuzz input to skip rather than a finding.
+func fuzzLayers(script string) ([][]byte, bool) {
+	var out [][]byte
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
+	flush := func() bool {
+		if err := tw.Close(); err != nil {
+			return false
+		}
+		out = append(out, append([]byte(nil), buf.Bytes()...))
+		buf.Reset()
+		tw = tar.NewWriter(&buf)
+		return true
+	}
 	n := 0
 	for _, line := range strings.Split(script, "\n") {
 		f := strings.Fields(line)
+		if len(f) == 1 && f[0] == "--" {
+			if len(out)+1 >= fuzzMaxLayers {
+				break
+			}
+			if !flush() {
+				return nil, false
+			}
+			continue
+		}
 		if len(f) < 2 || len(f[1]) > fuzzMaxNameLen {
 			continue
 		}
@@ -159,10 +210,18 @@ func fuzzLayer(script string) ([]byte, bool) {
 		switch {
 		case f[0] == "L" && len(f) == 3 && len(f[2]) <= fuzzMaxNameLen:
 			hdr.Typeflag, hdr.Linkname = tar.TypeSymlink, f[2]
+		case f[0] == "H" && len(f) == 3 && len(f[2]) <= fuzzMaxNameLen:
+			hdr.Typeflag, hdr.Linkname = tar.TypeLink, f[2]
 		case f[0] == "D" && len(f) == 2:
 			hdr.Typeflag = tar.TypeDir
 		case f[0] == "F" && len(f) == 2:
 			hdr.Typeflag, hdr.Mode = tar.TypeReg, 0o644
+		case f[0] == "W" && len(f) == 2:
+			hdr.Typeflag, hdr.Mode = tar.TypeReg, 0o644
+			hdr.Name = path.Join(path.Dir(f[1]), ".wh."+path.Base(f[1]))
+		case f[0] == "O" && len(f) == 2:
+			hdr.Typeflag, hdr.Mode = tar.TypeReg, 0o644
+			hdr.Name = path.Join(f[1], ".wh..wh..opq")
 		default:
 			continue
 		}
@@ -173,10 +232,10 @@ func fuzzLayer(script string) ([]byte, bool) {
 			return nil, false
 		}
 	}
-	if err := tw.Close(); err != nil {
+	if !flush() {
 		return nil, false
 	}
-	return buf.Bytes(), true
+	return out, true
 }
 
 // resolveFromTree resolves the symlink at the tree-relative path rel the way
