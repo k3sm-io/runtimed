@@ -57,6 +57,13 @@ type Cache struct {
 	leases    map[uint64]*Lease
 	nextLease uint64
 
+	// beforePruneBlob, when set, runs inside executePrune's loop after the
+	// batch's pin read and before each entry is examined, with that entry's
+	// digest. It is UNEXPORTED and exists only so an in-package test can drive
+	// a whole pull into the window between the pin read and a later blob's
+	// unlink; production never sets it.
+	beforePruneBlob func(digest string)
+
 	// operatorMu serializes the read-modify-write of the OPERATOR reachability
 	// record (operatorroots.go). That record is a single file holding every
 	// operator-owned root, so two concurrent tag/untag/pull calls would otherwise

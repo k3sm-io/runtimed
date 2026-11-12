@@ -519,6 +519,9 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			rep.StoppedEarly = true
 			break
 		}
+		if c.beforePruneBlob != nil {
+			c.beforePruneBlob(d.Node.Digest)
+		}
 		if why, ok := pins[d.Node.Digest]; ok && d.Node.Digest != "" {
 			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
 			continue
