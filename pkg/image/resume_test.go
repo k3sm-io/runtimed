@@ -66,26 +66,35 @@ type cutRegistry struct {
 	// wholeOn200 makes every uncut GET ignore Range and answer 200 whole.
 	wholeOn200 bool
 	// hold, when not nil, keeps every served layer GET waiting until it is
-	// closed; inflight counts the GETs waiting and maxInflight its peak.
+	// closed; inflight counts the GETs waiting, maxInflight its peak and
+	// arrivals every GET that reached the hold. allHeld is closed the first
+	// time holdWant GETs wait on hold at once.
 	hold        chan struct{}
+	holdWant    int
+	allHeld     chan struct{}
 	inflight    int
 	maxInflight int
+	arrivals    int
 }
 
-// holdServes makes every later served layer GET wait until the returned
-// channel is closed.
-func (c *cutRegistry) holdServes() chan struct{} {
+// holdServes makes every later served layer GET wait until the returned hold
+// channel is closed. The returned all channel is closed by the fake itself
+// the moment want GETs are waiting on hold at the same time.
+func (c *cutRegistry) holdServes(want int) (hold, all chan struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.hold = make(chan struct{})
-	return c.hold
+	c.holdWant = want
+	c.allHeld = make(chan struct{})
+	return c.hold, c.allHeld
 }
 
-// held reports how many layer GETs are waiting on hold now, and the peak.
-func (c *cutRegistry) held() (now, peak int) {
+// held reports how many layer GETs reached the hold, and the peak waiting on
+// it at once.
+func (c *cutRegistry) held() (arrivals, peak int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.inflight, c.maxInflight
+	return c.arrivals, c.maxInflight
 }
 
 // arm sets the fixture's fault counters under its mutex.
@@ -146,7 +155,15 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 		hold := c.hold
 		if hold != nil && !cut {
 			c.inflight++
+			c.arrivals++
 			c.maxInflight = max(c.maxInflight, c.inflight)
+			if c.inflight == c.holdWant {
+				select {
+				case <-c.allHeld:
+				default:
+					close(c.allHeld)
+				}
+			}
 		}
 		c.mu.Unlock()
 		if hold != nil && !cut {
@@ -843,7 +860,16 @@ func TestPullResumeConcurrentSameLayer(t *testing.T) {
 		}
 		c.takeRanges()
 
-		hold := c.holdServes()
+		// Every pull is expected to have its own layer GET waiting at once, in
+		// both subtests: nothing in the pull path coalesces pulls of one
+		// digest. PartialStore.Claim never blocks, so the pulls that lose the
+		// claim fall back to writeBlob at once (resumeBlob); CommitBlob takes
+		// no per-digest lock, and its only shortcut, a blob already committed,
+		// cannot apply while every GET is still held. A shared Cache therefore
+		// changes nothing here: waiting for fewer GETs would let the pulls run
+		// one after another unnoticed.
+		want := len(pulls)
+		hold, allHeld := c.holdServes(want)
 		released := false
 		release := func() {
 			if !released {
@@ -868,20 +894,24 @@ func TestPullResumeConcurrentSameLayer(t *testing.T) {
 			}()
 		}
 		close(start)
-		// Release once every pull's GET is in flight, or after a bound if
-		// the cache serializes some of them; the peak is checked below.
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			now, _ := c.held()
-			if now >= len(pulls) || time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(5 * time.Millisecond)
+		// Release only once the fake has seen every expected GET waiting at
+		// the same time. The deadline is a hang guard, generous enough for a
+		// loaded machine under -race; reaching it fails the test, it never
+		// releases the hold early.
+		timer := time.NewTimer(2 * time.Minute)
+		defer timer.Stop()
+		select {
+		case <-allHeld:
+		case <-timer.C:
+			release()
+			wg.Wait()
+			arrived, peak := c.held()
+			t.Fatalf("only %d of %d layer GETs reached the registry within the deadline (peak %d at once): the pulls did not overlap", arrived, want, peak)
 		}
 		release()
 		wg.Wait()
-		if _, peak := c.held(); peak < 2 {
-			t.Fatalf("at most %d layer GET was in flight at once: the pulls did not overlap", peak)
+		if _, peak := c.held(); peak < want {
+			t.Fatalf("at most %d layer GETs were in flight at once, want %d: the pulls did not overlap", peak, want)
 		}
 		return errs
 	}
