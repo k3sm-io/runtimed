@@ -79,6 +79,28 @@ func (c *Cache) IndexRoot() string {
 // rather than silently changing what the node does.
 var ErrIndexEntryCorrupt = errors.New("image: index entry is unreadable or inconsistent")
 
+// ErrIndexEntryTooLarge reports that a serialized index entry is larger than
+// the index's own readers will accept (maxIndexEntryBytes). Record refuses such
+// an entry and writes nothing: committing it would leave a file that Lookup
+// reports as corrupt and that fails List for every reference on the node.
+var ErrIndexEntryTooLarge = errors.New("image: index entry exceeds the index read limit")
+
+// indexEntryLimit is the write-side ceiling on one serialized index entry. It
+// equals the read limit (maxIndexEntryBytes) so the writer can never commit an
+// entry its reader would refuse; it is a variable only so a test can lower it
+// instead of building a 64 MiB fixture.
+var indexEntryLimit = int64(maxIndexEntryBytes)
+
+// checkEntrySize refuses a serialized index entry larger than limit. The error
+// states the size and the limit only: no host path and none of the entry's
+// (registry-supplied) bytes.
+func checkEntrySize(buf []byte, limit int64) error {
+	if n := int64(len(buf)); n > limit {
+		return fmt.Errorf("%w: %d bytes, limit %d", ErrIndexEntryTooLarge, n, limit)
+	}
+	return nil
+}
+
 // ErrIndexNotOwned reports that the index directory is not owned by this process
 // or is writable by another principal, so nothing under it may be believed.
 //
@@ -456,6 +478,11 @@ func (x *FileIndex) record(ctx context.Context, e IndexEntry) (Platform, error) 
 	})
 	if err != nil {
 		return Platform{}, fmt.Errorf("encode image index %q: %w", ref, err)
+	}
+	// Refuse, before anything touches disk, an entry the readers would refuse:
+	// committed, it would read back as corrupt and fail List for the whole node.
+	if err := checkEntrySize(buf, indexEntryLimit); err != nil {
+		return Platform{}, fmt.Errorf("record image index %q: %w", ref, err)
 	}
 	// Re-create the tree if it has gone missing since construction. This is not
 	// a weakening of the eager create: MkdirAll is a no-op on an existing
