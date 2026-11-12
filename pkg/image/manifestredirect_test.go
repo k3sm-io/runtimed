@@ -44,6 +44,7 @@ func TestManifestFetchRedirectDoesNotReachTokenLogic(t *testing.T) {
 				mu       sync.Mutex
 				scopes   []string
 				foreignA []string
+				bHits    int
 			)
 			b := httptest.NewServer(nil)
 			defer b.Close()
@@ -78,6 +79,9 @@ func TestManifestFetchRedirectDoesNotReachTokenLogic(t *testing.T) {
 				}
 			})
 			b.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				bHits++
+				mu.Unlock()
 				if h := r.Header.Get("Authorization"); h != "" {
 					mu.Lock()
 					foreignA = append(foreignA, h)
@@ -96,6 +100,9 @@ func TestManifestFetchRedirectDoesNotReachTokenLogic(t *testing.T) {
 
 			mu.Lock()
 			defer mu.Unlock()
+			if bHits == 0 {
+				t.Error("redirect target was never reached; the fetch failed before the redirect")
+			}
 			if len(foreignA) != 0 {
 				t.Errorf("redirect target received Authorization %q; want none", foreignA)
 			}

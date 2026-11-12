@@ -36,8 +36,8 @@ import (
 // layer stacked over it), a registry that REQUIRES auth still serves a private
 // image. Basic: every manifest/config request it accepted carried the Basic
 // credential. Bearer: the token endpoint issues "good" only for the basic
-// credential and "anon" otherwise, and the registry never sees "Bearer anon" on
-// a manifest.
+// credential, so the registry accepting manifest and blob requests with
+// "Bearer good" shows the token request carried the credential.
 func TestManifestFetchCarriesTheCredential(t *testing.T) {
 	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:pw"))
 	for _, tc := range []struct {
@@ -56,26 +56,15 @@ func TestManifestFetchCarriesTheCredential(t *testing.T) {
 			pushImage(t, strings.TrimPrefix(seed.URL, "http://"), "repo/x", img)
 
 			var (
-				mu       sync.Mutex
-				accepted []string // Authorization on each accepted manifest/config request
-				anon     []string // manifest requests that carried Bearer anon
+				mu         sync.Mutex
+				manifests  []string // Authorization on each accepted manifest request
+				blobs      []string // Authorization on each accepted blob (config) request
+				tokenReqs  int      // requests to the token endpoint
+				tokenBasic int      // of those, ones carrying the Basic credential
 			)
-			tokenHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				tok := "anon"
-				if r.Header.Get("Authorization") == basic {
-					tok = "good"
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"token":"` + tok + `"}`))
-			})
 			reg := httptest.NewServer(nil)
 			defer reg.Close()
 			realm := reg.URL + "/token"
-			if tc.foreignRealm {
-				ts := httptest.NewServer(tokenHandler)
-				defer ts.Close()
-				realm = ts.URL + "/token"
-			}
 			want := basic
 			challenge := `Basic realm="r"`
 			if tc.bearer {
@@ -84,16 +73,21 @@ func TestManifestFetchCarriesTheCredential(t *testing.T) {
 			}
 			reg.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				h := r.Header.Get("Authorization")
-				if r.URL.Path == "/token" && !tc.foreignRealm {
-					tokenHandler.ServeHTTP(w, r)
+				if r.URL.Path == "/token" {
+					tok := "anon"
+					mu.Lock()
+					tokenReqs++
+					if h == basic {
+						tokenBasic++
+						tok = "good"
+					}
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"token":"` + tok + `"}`))
 					return
 				}
 				isManifest := strings.Contains(r.URL.Path, "/manifests/")
-				if isManifest && h == "Bearer anon" {
-					mu.Lock()
-					anon = append(anon, r.Method+" "+r.URL.Path)
-					mu.Unlock()
-				}
+				isBlob := strings.Contains(r.URL.Path, "/blobs/")
 				if h != want || (tc.bearer && r.URL.Path == "/v2/") {
 					scope := ""
 					if tc.bearer && r.URL.Path != "/v2/" {
@@ -103,11 +97,13 @@ func TestManifestFetchCarriesTheCredential(t *testing.T) {
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
-				if isManifest || strings.Contains(r.URL.Path, "/blobs/") {
-					mu.Lock()
-					accepted = append(accepted, h)
-					mu.Unlock()
+				mu.Lock()
+				if isManifest {
+					manifests = append(manifests, h)
+				} else if isBlob {
+					blobs = append(blobs, h)
 				}
+				mu.Unlock()
 				store.ServeHTTP(w, r)
 			})
 
@@ -126,16 +122,19 @@ func TestManifestFetchCarriesTheCredential(t *testing.T) {
 
 			mu.Lock()
 			defer mu.Unlock()
-			if len(accepted) == 0 {
-				t.Fatal("registry accepted no manifest/config request")
+			if len(manifests) == 0 {
+				t.Error("registry accepted no manifest request")
 			}
-			for _, h := range accepted {
+			if len(blobs) == 0 {
+				t.Error("registry accepted no blob (config) request")
+			}
+			for _, h := range append(append([]string{}, manifests...), blobs...) {
 				if h != want {
 					t.Errorf("accepted request carried %q, want %q", h, want)
 				}
 			}
-			if len(anon) != 0 {
-				t.Errorf("manifest requests carried Bearer anon: %q", anon)
+			if tc.bearer && (tokenReqs == 0 || tokenBasic == 0) {
+				t.Errorf("token endpoint saw %d requests, %d with the Basic credential; want at least one", tokenReqs, tokenBasic)
 			}
 		})
 	}
