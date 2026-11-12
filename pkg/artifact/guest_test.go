@@ -475,11 +475,11 @@ func (h *hostileFetcher) Manifest(ctx context.Context, ref string, c *image.Regi
 	return h.fakeFetcher.Manifest(ctx, ref, c)
 }
 
-func (h *hostileFetcher) Blob(ctx context.Context, ref string, c *image.RegistryCredential, d string, off int64) (io.ReadCloser, int64, error) {
+func (h *hostileFetcher) Blob(ctx context.Context, ref string, c *image.RegistryCredential, d string, size, off int64) (io.ReadCloser, int64, error) {
 	if h.blobErr != nil {
 		return nil, 0, h.blobErr
 	}
-	return h.fakeFetcher.Blob(ctx, ref, c, d, off)
+	return h.fakeFetcher.Blob(ctx, ref, c, d, size, off)
 }
 
 func TestGuestStoreRegistryErrorBoundedAndQuoted(t *testing.T) {

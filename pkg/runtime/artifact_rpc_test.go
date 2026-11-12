@@ -107,7 +107,7 @@ func (f *fakeArtifactFetcher) Manifest(context.Context, string, *image.RegistryC
 	return f.manifest, "application/vnd.oci.image.manifest.v1+json", nil
 }
 
-func (f *fakeArtifactFetcher) Blob(_ context.Context, _ string, _ *image.RegistryCredential, digest string, offset int64) (io.ReadCloser, int64, error) {
+func (f *fakeArtifactFetcher) Blob(_ context.Context, _ string, _ *image.RegistryCredential, digest string, _, offset int64) (io.ReadCloser, int64, error) {
 	b, ok := f.blobs[digest]
 	if !ok || offset > int64(len(b)) {
 		return nil, 0, errors.New("blob unknown")
