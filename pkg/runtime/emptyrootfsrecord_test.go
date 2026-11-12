@@ -46,9 +46,11 @@ const staleRecord = `{"images":[{"reference":"example.test/app:v1",` +
 // reachability record (<pod dir>/images.json) holds after a create that starts
 // from an empty rootfs, for each state an earlier life of the pod id can leave
 // it in: the rootfs clear never touches the record; an absent record is
-// written empty; an existing one is kept byte for byte, whatever it holds,
-// so a record the GC refuses (a directory, malformed JSON) still fails the
-// GC's enumeration after a successful create.
+// written empty; an existing valid one is kept byte for byte. An existing entry
+// the GC would refuse (a directory, a symlink, malformed JSON) fails the create
+// with image.ErrPodReferencesInvalid and a path-free message; the failed
+// create's cleanup removes the pod dir, the GC's enumeration then succeeds, and
+// a retry of the same pod id succeeds with a fresh empty record.
 func TestCreatePodReachabilityRecordAcrossTheRootfsClear(t *testing.T) {
 	tests := []struct {
 		name string
@@ -56,8 +58,9 @@ func TestCreatePodReachabilityRecordAcrossTheRootfsClear(t *testing.T) {
 		seed func(t *testing.T, record string)
 		// check inspects the record after the create.
 		check func(t *testing.T, rt *Runtime, record string)
-		// rootsIncomplete is whether the GC's Roots must refuse afterwards.
-		rootsIncomplete bool
+		// refused is whether the create must fail on the record; check then
+		// runs after the failed create, before the retry.
+		refused bool
 	}{
 		{
 			name: "no earlier life writes an empty record",
@@ -98,26 +101,35 @@ func TestCreatePodReachabilityRecordAcrossTheRootfsClear(t *testing.T) {
 			check: wantRecordBytes(emptyRecord),
 		},
 		{
-			name: "malformed record is kept and the GC refuses",
+			name: "malformed record is refused and the failed create removes it",
 			seed: func(t *testing.T, record string) {
 				writeFile(t, record, "not json")
 			},
-			check:           wantRecordBytes("not json"),
-			rootsIncomplete: true,
+			check:   wantPodDirGone,
+			refused: true,
 		},
 		{
-			name: "record that is a directory is kept and the GC refuses",
+			name: "record that is a directory is refused and the failed create removes it",
 			seed: func(t *testing.T, record string) {
 				if err := os.Mkdir(record, 0o755); err != nil {
 					t.Fatal(err)
 				}
 			},
-			check: func(t *testing.T, _ *Runtime, record string) {
-				if fi, err := os.Lstat(record); err != nil || !fi.IsDir() {
-					t.Errorf("Lstat(record) = (%v, %v), want the seeded directory", fi, err)
+			check:   wantPodDirGone,
+			refused: true,
+		},
+		{
+			name: "record that is a symlink to a valid record is refused and its target untouched",
+			seed: func(t *testing.T, record string) {
+				target := filepath.Join(t.TempDir(), "target.json")
+				writeFile(t, target, staleRecord)
+				if err := os.Symlink(target, record); err != nil {
+					t.Fatal(err)
 				}
+				t.Cleanup(func() { wantRecordBytes(staleRecord)(t, nil, target) })
 			},
-			rootsIncomplete: true,
+			check:   wantPodDirGone,
+			refused: true,
 		},
 	}
 	for _, tc := range tests {
@@ -138,6 +150,31 @@ func TestCreatePodReachabilityRecordAcrossTheRootfsClear(t *testing.T) {
 			tc.seed(t, record)
 
 			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+			if tc.refused {
+				if err != nil || resp.GetError() == nil {
+					t.Fatalf("CreatePod = (%v, %v), want a create failure", resp, err)
+				}
+				msg := resp.GetError().GetMessage()
+				if !strings.Contains(msg, image.ErrPodReferencesInvalid.Error()) {
+					t.Errorf("create failure %q, want it to carry %q", msg, image.ErrPodReferencesInvalid)
+				}
+				if strings.Contains(msg, rt.cache.Root()) || strings.Contains(msg, os.TempDir()) {
+					t.Errorf("create failure %q names a host path", msg)
+				}
+				tc.check(t, rt, record)
+				if _, err := rt.cache.Roots(); err != nil {
+					t.Errorf("Roots after the failed create = %v, want nil", err)
+				}
+				resp, err = rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
+				if err != nil || resp.GetError() != nil {
+					t.Fatalf("retry CreatePod = (%v, %v), want success", resp, err)
+				}
+				wantRecordBytes(emptyRecord)(t, rt, record)
+				if _, err := rt.cache.Roots(); err != nil {
+					t.Errorf("Roots after the retry = %v, want nil", err)
+				}
+				return
+			}
 			if err != nil || resp.GetError() != nil {
 				t.Fatalf("CreatePod = (%v, %v), want success", resp, err)
 			}
@@ -146,11 +183,19 @@ func TestCreatePodReachabilityRecordAcrossTheRootfsClear(t *testing.T) {
 			}
 			tc.check(t, rt, record)
 
-			_, err = rt.cache.Roots()
-			if got := errors.Is(err, image.ErrRootsIncomplete); got != tc.rootsIncomplete {
-				t.Errorf("Roots err = %v, want ErrRootsIncomplete %v", err, tc.rootsIncomplete)
+			if _, err := rt.cache.Roots(); err != nil {
+				t.Errorf("Roots err = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// wantPodDirGone checks that a failed create's cleanup removed the pod dir,
+// the refused record with it.
+func wantPodDirGone(t *testing.T, _ *Runtime, record string) {
+	t.Helper()
+	if _, err := os.Lstat(filepath.Dir(record)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("pod dir after the failed create: %v, want it removed", err)
 	}
 }
 
@@ -268,6 +313,7 @@ func TestRecordPodReferencesRefusals(t *testing.T) {
 		seed        func(t *testing.T, podDir string)
 		wantErr     bool
 		wantInvalid bool
+		wantRefused bool   // errors.Is(err, image.ErrPodReferencesInvalid)
 		wantRecord  string // "" wants no record
 	}{
 		{
@@ -290,6 +336,16 @@ func TestRecordPodReferencesRefusals(t *testing.T) {
 				unwritable(t, podDir)
 			},
 			wantRecord: staleRecord,
+		},
+		{
+			name:  "malformed record is refused and left",
+			podID: "pod-bad-record",
+			seed: func(t *testing.T, podDir string) {
+				writeFile(t, filepath.Join(podDir, image.PodReferencesName), "not json")
+			},
+			wantErr:     true,
+			wantRefused: true,
+			wantRecord:  "not json",
 		},
 		{
 			name:       "writable pod dir and no record",
@@ -317,6 +373,12 @@ func TestRecordPodReferencesRefusals(t *testing.T) {
 			}
 			if got := errors.Is(err, errInvalidPodBox); got != tc.wantInvalid {
 				t.Errorf("errors.Is(err, errInvalidPodBox) = %v, want %v (err %v)", got, tc.wantInvalid, err)
+			}
+			if got := errors.Is(err, image.ErrPodReferencesInvalid); got != tc.wantRefused {
+				t.Errorf("errors.Is(err, image.ErrPodReferencesInvalid) = %v, want %v (err %v)", got, tc.wantRefused, err)
+			}
+			if tc.wantRefused && strings.Contains(err.Error(), podDir) {
+				t.Errorf("err %q names the host path %s", err, podDir)
 			}
 			if tc.wantErr && !tc.wantInvalid && !strings.Contains(err.Error(), "record image references for pod "+tc.podID) {
 				t.Errorf("err = %v, want it to name the pod's record", err)

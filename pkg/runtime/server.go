@@ -131,7 +131,12 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	p, reason, err := r.createPod(ctx, box)
 	if err != nil {
 		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", err)
-		_ = r.removePodDir(box.GetPodId())
+		// This cleanup is also what clears an invalid reachability record the
+		// create refused (image.ErrPodReferencesInvalid), so a retry starts
+		// clean; a failure here leaves that record, so it is surfaced.
+		if rerr := r.removePodDir(box.GetPodId()); rerr != nil {
+			r.log.Warn("remove pod dir after failed create", "pod", box.GetPodId(), "err", rerr)
+		}
 		r.releasePodArtifacts(ctx, box, 1)
 		return createFailure(reason, err), nil
 	}

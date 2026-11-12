@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // PodReferencesName is the per-pod reachability record the daemon writes inside
@@ -49,6 +50,22 @@ const PodReferencesName = "images.json"
 // So an unreadable, absent, malformed, or unexpected node anywhere under the
 // pods tree aborts the whole prune with this error and deletes nothing.
 var ErrRootsIncomplete = errors.New("image: reachability root set is incomplete")
+
+// ErrPodReferencesInvalid reports that a pod dir already holds an entry at
+// PodReferencesName that is not a usable record: not a regular file (a
+// directory, a symlink, a device), larger than maxPodReferencesBytes, or not
+// decodable as the record. EnsurePodReferences refuses it rather than accept it
+// as "already there", because Roots would then fail closed for the whole node.
+// The ensure step leaves the entry untouched; the failed create's pod-dir
+// cleanup is what clears it. Its text names no host path, so it is safe in an
+// RPC response.
+var ErrPodReferencesInvalid = errors.New("image: pod reachability record is not a valid record")
+
+// maxPodReferencesBytes bounds the read of an existing pod reachability record
+// at ensure time. A record holds one ImageRoot per image the pod pulled, each a
+// reference and a handful of digests, so this is orders of magnitude above any
+// real record while keeping a planted file from being read whole.
+const maxPodReferencesBytes = 8 << 20
 
 // ImageRoot is one daemon-authored reachability root: the blobs one pod
 // resolved for one image reference.
@@ -89,7 +106,10 @@ type podReferences struct {
 }
 
 // EnsurePodReferences creates an EMPTY reachability record for podID if none
-// exists, and is a no-op if one does.
+// exists, and is a no-op if a valid one does. An existing entry that is not a
+// regular file holding a decodable record is refused with
+// ErrPodReferencesInvalid and left untouched: accepting it would let the create
+// succeed and then fail Roots for the whole node.
 //
 // Every pod dir must carry a record from the moment it exists, including a pod
 // that pulls nothing (a native host-binary pod, a vm pod). Absence is what
@@ -98,13 +118,67 @@ type podReferences struct {
 // pod. Creating the empty record at pod-dir creation is what keeps absence rare
 // enough to be treated as the anomaly it is.
 func (c *Cache) EnsurePodReferences(podID PodID) error {
-	dir := c.PodDir(podID)
-	if _, err := os.Lstat(filepath.Join(dir, PodReferencesName)); err == nil {
-		return nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("stat pod references %s: %w", podID, err)
+	path := filepath.Join(c.PodDir(podID), PodReferencesName)
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return c.writePodReferences(podID, nil)
 	}
-	return c.writePodReferences(podID, nil)
+	if err != nil {
+		return fmt.Errorf("stat pod references %s: %w", podID, unwrapPath(err))
+	}
+	// An existing entry counts as "already there" only if Roots would accept
+	// it: a regular file (judged on itself, never through a link) that decodes
+	// as the record. Anything else is refused and left exactly as found.
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%w: pod %s: %s is not a regular file (mode %v)",
+			ErrPodReferencesInvalid, podID, PodReferencesName, fi.Mode().Type())
+	}
+	if err := checkPodReferences(path); err != nil {
+		return fmt.Errorf("%w: pod %s: %v", ErrPodReferencesInvalid, podID, err)
+	}
+	return nil
+}
+
+// checkPodReferences reads the record at path without following a final
+// symlink, re-checks on the open descriptor that it is a regular file (the
+// Lstat in the caller can race a swap), bounds the read, and decodes it. Its
+// errors name only PodReferencesName, never path.
+func checkPodReferences(path string) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %v", PodReferencesName, unwrapPath(err))
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %v", PodReferencesName, unwrapPath(err))
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (mode %v)", PodReferencesName, fi.Mode().Type())
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, maxPodReferencesBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %v", PodReferencesName, unwrapPath(err))
+	}
+	if len(buf) > maxPodReferencesBytes {
+		return fmt.Errorf("%s exceeds %d bytes", PodReferencesName, maxPodReferencesBytes)
+	}
+	var rec podReferences
+	if err := json.Unmarshal(buf, &rec); err != nil {
+		// Bounded as DATA: encoding/json echoes the offending byte.
+		return fmt.Errorf("decode %s: %v", PodReferencesName, boundErr(err))
+	}
+	return nil
+}
+
+// unwrapPath strips the host path an *fs.PathError carries, keeping its
+// operation-independent cause, so an error built from it is path-free.
+func unwrapPath(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
 }
 
 // RecordPodImage records that podID references root's blobs, unioning it into
