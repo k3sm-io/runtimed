@@ -21,7 +21,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -194,5 +196,117 @@ func TestPullArtifactFailsAStalledManifest(t *testing.T) {
 	fire()
 	if err := <-done; !errors.Is(err, ErrManifestStalled) || !errors.Is(err, ErrBlobTransfer) {
 		t.Fatalf("PullArtifact = %v, want a stalled, resumable manifest fetch", err)
+	}
+}
+
+// shortLeaser hands out the cache's own leases with a short TTL, so a test
+// can outlast one on the real clock: the lease clock is the cache's and
+// pkg/artifact has no seam into it.
+type shortLeaser struct {
+	inner Leaser
+	ttl   time.Duration
+}
+
+func (l *shortLeaser) AcquireLease(digests []string, _ time.Duration) *image.Lease {
+	return l.inner.AcquireLease(digests, l.ttl)
+}
+
+// slowBody sends one byte per read, sleeping gap before each.
+type slowBody struct {
+	r   io.Reader
+	gap time.Duration
+}
+
+func (b *slowBody) Read(p []byte) (int, error) {
+	time.Sleep(b.gap)
+	return iotest.OneByteReader(b.r).Read(p)
+}
+
+func (b *slowBody) Close() error { return nil }
+
+// TestPullArtifactLeaseOutlivesSlowBlob pins lease renewal by progress: a blob
+// whose bytes arrive across several lease TTLs keeps the pull's lease, so
+// once the bytes are in and before the record is written, a reclaim pass
+// still finds the blobs leased instead of unreferenced.
+func TestPullArtifactLeaseOutlivesSlowBlob(t *testing.T) {
+	const ttl = 200 * time.Millisecond
+	e := newEnv(t)
+	weights := "0123456789abcdefghijklmnopqrstuvwxyz" // 36 bytes, 20ms apart: > 3 TTLs
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", weights))
+	f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
+		return &slowBody{r: bytes.NewReader(data), gap: 20 * time.Millisecond}
+	}}
+	p := stallPuller(t, e, f, &fakeIdle{})
+	p.deps.Leases = &shortLeaser{inner: e.cache, ttl: ttl}
+	victim := digestOfBytes([]byte(weights))
+	start := time.Now()
+	var checked bool
+	p.afterPresence = func() {
+		if checked {
+			return
+		}
+		checked = true
+		if took := time.Since(start); took < 2*ttl {
+			t.Errorf("the transfer took %v, want more than two lease TTLs (%v)", took, 2*ttl)
+		}
+		rep, err := e.cache.ReclaimUnderPressure(context.Background(), image.ReclaimConfig{
+			Force: true, DryRun: true, Grace: time.Nanosecond,
+			FreeBytes: func(string) (uint64, error) { return 1 << 40, nil },
+		})
+		if err != nil {
+			t.Errorf("dry-run reclaim: %v", err)
+			return
+		}
+		if slices.Contains(rep.Removed, victim) {
+			t.Errorf("a reclaim pass would take %s: the pull's lease lapsed while its bytes arrived", victim)
+		}
+		leased := false
+		for _, k := range rep.Kept {
+			if k.Digest == victim && k.Reason == image.ReasonKeptLeased {
+				leased = true
+			}
+		}
+		if !leased {
+			t.Errorf("%s is not kept as leased after the transfer; kept: %+v", victim, rep.Kept)
+		}
+	}
+	res, err := p.PullArtifact(context.Background(), testRef, nil, volume, nil)
+	if err != nil {
+		t.Fatalf("PullArtifact: %v", err)
+	}
+	res.Lease.Release()
+	if !checked {
+		t.Fatal("the presence hook never ran")
+	}
+}
+
+// TestFetchWithoutProgressDoesNotRenew pins the other half: renewal follows
+// bytes, not time. A transfer whose body sends nothing until the stall timer
+// fires never calls renew.
+func TestFetchWithoutProgressDoesNotRenew(t *testing.T) {
+	e := newEnv(t)
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", "weights"))
+	reading := make(chan struct{}, 1)
+	f := &stallFetcher{fakeFetcher: e.fetch, body: func(ctx context.Context, _ []byte) io.ReadCloser {
+		return &silentBody{ctx: ctx, reading: reading}
+	}}
+	idle := &fakeIdle{}
+	p := stallPuller(t, e, f, idle)
+	d := digestOfBytes([]byte("weights"))
+	var renews atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		done <- p.fetchAll(context.Background(), testRef, nil, []blob{{digest: d, size: int64(len("weights"))}}, nil, func() { renews.Add(1) })
+	}()
+	<-reading
+	idle.mu.Lock()
+	fire := idle.fire
+	idle.mu.Unlock()
+	fire()
+	if err := <-done; !errors.Is(err, ErrBlobStalled) {
+		t.Fatalf("fetchAll = %v, want a stalled transfer", err)
+	}
+	if n := renews.Load(); n != 0 {
+		t.Errorf("a transfer that moved no byte renewed the lease %d times, want 0", n)
 	}
 }

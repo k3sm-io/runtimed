@@ -201,7 +201,13 @@ func (p *Puller) reserve(ctx context.Context, missing []blob) (*reservation, err
 // fetchAll transfers and commits every blob in missing, at most
 // MaxConcurrentLayers at a time across the whole process. The first failure
 // cancels the rest; partials of the cancelled transfers survive for a retry.
-func (p *Puller) fetchAll(ctx context.Context, ref string, cred *image.RegistryCredential, missing []blob, _ *reservation) error {
+//
+// renew is called on every read that returns bytes, from every transfer; it
+// keeps the pull's lease alive while its bytes arrive. Nil means no lease.
+func (p *Puller) fetchAll(ctx context.Context, ref string, cred *image.RegistryCredential, missing []blob, _ *reservation, renew func()) error {
+	if renew == nil {
+		renew = func() {}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
@@ -213,7 +219,7 @@ func (p *Puller) fetchAll(ctx context.Context, ref string, cred *image.RegistryC
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := p.fetchOne(ctx, ref, cred, b); err != nil {
+			if err := p.fetchOne(ctx, ref, cred, b, renew); err != nil {
 				errMu.Lock()
 				if first == nil {
 					first = err
@@ -255,8 +261,9 @@ func (p *Puller) claim(ctx context.Context, digest string) (func(), error) {
 }
 
 // fetchOne brings one blob into the cache: resume its partial with a Range
-// request, then commit it through CommitBlob, which re-hashes it.
-func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryCredential, b blob) error {
+// request, then commit it through CommitBlob, which re-hashes it. renew is
+// passed to transfer.
+func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, renew func()) error {
 	end, err := p.claim(ctx, b.digest)
 	if err != nil {
 		return err
@@ -293,7 +300,7 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 		have = 0
 	}
 	if have < b.size {
-		if err := p.transfer(ctx, ref, cred, b, f, have); err != nil {
+		if err := p.transfer(ctx, ref, cred, b, f, have, renew); err != nil {
 			return err
 		}
 	}
@@ -323,7 +330,9 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 // A watchdog cancels the transfer when no byte arrives for the stall timeout,
 // from the request through the last read of the body; every byte re-arms it.
 // There is no overall deadline: a transfer that keeps moving is never cut off.
-func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, f *os.File, have int64) error {
+// Every byte also calls renew (non-nil), so the pull's lease outlives a slow
+// transfer for as long as it keeps moving; a stalled one renews nothing.
+func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, f *os.File, have int64, renew func()) error {
 	tctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	stall := p.cfg.StallTimeout
@@ -354,7 +363,10 @@ func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryC
 	if _, err := f.Seek(have, io.SeekStart); err != nil {
 		return fmt.Errorf("seek partial %s: %w", b.digest, err)
 	}
-	progress := &progressReader{r: body, moved: func() { timer.Reset(stall) }}
+	progress := &progressReader{r: body, moved: func() {
+		timer.Reset(stall)
+		renew()
+	}}
 	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(progress, b.size-have+1))
 	serr := f.Sync()
 	if have+n > b.size {

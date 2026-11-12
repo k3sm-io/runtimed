@@ -480,11 +480,14 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 		if err != nil {
 			return nil, err
 		}
-		err = p.fetchAll(ctx, ref, cred, missing, r)
+		err = p.fetchAll(ctx, ref, cred, missing, r, lease.Renew)
 		r.release()
 		if err != nil {
 			return nil, err
 		}
+		// The last byte renewed the lease; renew once more so the record is
+		// written under a full TTL, however long the commits took.
+		lease.Renew()
 		res.Fetched = true
 	}
 	if p.afterPresence != nil {
@@ -511,7 +514,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	// and this re-check refetches. What remains is a lease that outlived
 	// its TTL before the record was written (executePrune in pkg/image
 	// states that residual).
-	if err := p.recheck(ctx, ref, cred, need, res); err != nil {
+	if err := p.recheck(ctx, ref, cred, need, res, lease.Renew); err != nil {
 		return nil, err
 	}
 	p.log.Info("artifact pulled", "reference", ref, "digest", mdigest, "type", typ,
@@ -557,8 +560,10 @@ func RunHold(ctx context.Context, res *Result, opts ...PullOption) error {
 
 // recheck confirms every blob in need is still committed, and fetches the ones
 // a reclaim pass unlinked since the presence check. It refetches at most once:
-// a blob still absent after that fails the pull with ErrBlobReclaimed.
-func (p *Puller) recheck(ctx context.Context, ref string, cred *image.RegistryCredential, need []blob, res *Result) error {
+// a blob still absent after that fails the pull with ErrBlobReclaimed. It runs
+// under the pull's lease; renew keeps that lease alive while a refetch's bytes
+// arrive.
+func (p *Puller) recheck(ctx context.Context, ref string, cred *image.RegistryCredential, need []blob, res *Result, renew func()) error {
 	gone := p.absent(need)
 	if len(gone) == 0 {
 		return nil
@@ -569,7 +574,7 @@ func (p *Puller) recheck(ctx context.Context, ref string, cred *image.RegistryCr
 	if err != nil {
 		return err
 	}
-	err = p.fetchAll(ctx, ref, cred, gone, r)
+	err = p.fetchAll(ctx, ref, cred, gone, r, renew)
 	r.release()
 	if err != nil {
 		return err
