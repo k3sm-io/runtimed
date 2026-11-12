@@ -324,7 +324,10 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 		program   string // an in-image file written before create, "" for none
 		linkAt    string // an in-image symlink planted before create, "" for none
 		linkTo    string // linkAt's target, as written into the link
-		refused   bool
+		// extraLinkAt/extraLinkTo plant a second in-image link, for a two-hop chain.
+		extraLinkAt string
+		extraLinkTo string
+		refused     bool
 		// byWalk marks a refusal that comes from the rootfs walk following an
 		// in-image link into the view, not from the by-name mount check, so its
 		// message need not name the mount.
@@ -344,6 +347,8 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 			linkAt: "bin/tool", linkTo: "../opt/run", refused: true, byWalk: true},
 		{name: "in-image link beneath a directory mount", argv0: "/bin/tool", mountPath: "/models",
 			linkAt: "bin/tool", linkTo: "/models/run.json", refused: true, byWalk: true},
+		{name: "two-hop in-image link beneath a directory mount", argv0: "/bin/tool", mountPath: "/models",
+			linkAt: "bin/tool", linkTo: "/bin/hop", extraLinkAt: "bin/hop", extraLinkTo: "/models/run.json", refused: true, byWalk: true},
 		{name: "sibling sharing a prefix", argv0: "/opt/runner", mountPath: "/opt/run", subPath: "run.json", program: "opt/runner"},
 	}
 	for i, tc := range cases {
@@ -382,6 +387,15 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := os.Symlink(tc.linkTo, at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.extraLinkAt != "" {
+				at := filepath.Join(rootfs, filepath.FromSlash(tc.extraLinkAt))
+				if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(tc.extraLinkTo, at); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -53,7 +53,7 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 		t.Skip("the daemon's views clone with APFS clonefile, darwin-only")
 	}
 	const dataMount = "/data"
-	cases := []struct {
+	type row struct {
 		name      string
 		argv0     string
 		mountPath string
@@ -70,7 +70,8 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 		hostRoute bool
 		// want is the resolved argv[0] of an accepted row, given the rootfs.
 		want func(rootfs string) string
-	}{
+	}
+	cases := []row{
 		{name: "exact mount path", argv0: "/opt/run", mountPath: "/opt/run", subPath: "run.json", refused: true},
 		{name: "beneath a directory mount", argv0: "/models/run.json", mountPath: "/models", refused: true},
 		{name: "case variant", argv0: "/Models/run.json", mountPath: "/models", refused: true},
@@ -84,117 +85,124 @@ func TestExecRefusesAnImageVolumeProgram(t *testing.T) {
 			want: func(rootfs string) string { return filepath.Join(rootfs, "models2/x") }},
 		{name: "ordinary volume mount keeps the early return", argv0: "/data//tool", mountPath: "/models", program: "data/tool",
 			want: func(string) string { return "/data/tool" }},
-		// Today's behaviour, pinned: the host-binary route returns before the
-		// by-name check, so the mount refusal deliberately does not fire there.
+	}
+	// CHARACTERIZATION rows: these pin what exec does today on routes the by-name
+	// check does not cover, where the boundary is the pod's sandbox profile. A
+	// change that makes exec refuse them should update these rows, not be treated
+	// as a regression.
+	characterization := []row{
 		{name: "host-binary route is left as sent", argv0: "/models/run.json", mountPath: "/models", hostRoute: true,
 			want: func(string) string { return "/models/run.json" }},
-		// Today's behaviour, pinned: a relative argv[0] means the session's
-		// working directory and is not checked by name; the pod's profile is the
-		// boundary there, not this check.
 		{name: "relative name is left as sent", argv0: "models/run.json", mountPath: "/models",
 			want: func(string) string { return "models/run.json" }},
 		{name: "dot-relative name is left as sent", argv0: "./models/run.json", mountPath: "/models",
 			want: func(string) string { return "./models/run.json" }},
 	}
-	for i, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			podID := fmt.Sprintf("pod-execvolprog-%d", i)
-			f := modelArtifact(map[string][]byte{"run.json": []byte("prog"), "w.safetensors": []byte("w")}, []string{"run.json", "w.safetensors"})
-			sg, sp, w := &fakeSigner{}, &fakeSpawner{}, newBlockingWaiter()
-			lazy := &lazyArtifactPuller{}
-			_, rt := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: lazy, Signer: sg, Spawner: sp, Waiter: w})
-			ap, err := artifact.New(artifact.Config{
-				RegistryHost: artifactTestHost,
-				PartialDir:   filepath.Join(rt.cache.Root(), sandbox.ArtifactPartialSubdir),
-				StorePath:    rt.cache.Root(),
-				FreeBytes:    func(string) (uint64, error) { return 1 << 40, nil },
-			}, artifact.Deps{Blobs: rt.cache, Leases: rt.cache, Reclaimer: rt.cache, Index: rt.index, Fetcher: f})
-			if err != nil {
+	run := func(t *testing.T, i int, tc row) {
+		podID := fmt.Sprintf("pod-execvolprog-%d", i)
+		f := modelArtifact(map[string][]byte{"run.json": []byte("prog"), "w.safetensors": []byte("w")}, []string{"run.json", "w.safetensors"})
+		sg, sp, w := &fakeSigner{}, &fakeSpawner{}, newBlockingWaiter()
+		lazy := &lazyArtifactPuller{}
+		_, rt := imagesTestClientDeps(t, Deps{Puller: &fakePuller{}, ArtifactPuller: lazy, Signer: sg, Spawner: sp, Waiter: w})
+		ap, err := artifact.New(artifact.Config{
+			RegistryHost: artifactTestHost,
+			PartialDir:   filepath.Join(rt.cache.Root(), sandbox.ArtifactPartialSubdir),
+			StorePath:    rt.cache.Root(),
+			FreeBytes:    func(string) (uint64, error) { return 1 << 40, nil },
+		}, artifact.Deps{Blobs: rt.cache, Leases: rt.cache, Reclaimer: rt.cache, Index: rt.index, Fetcher: f})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lazy.p = ap
+		t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
+		rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
+		rt.signalGroup = rec.signal
+		rootfs := derivedRootfs(t, rt, podID)
+		if tc.program != "" {
+			at := filepath.Join(rootfs, filepath.FromSlash(tc.program))
+			if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			lazy.p = ap
-			t.Cleanup(func() { restoreWritable(t, filepath.Join(rt.cache.Root(), sandbox.ArtifactViewsSubdir)) })
-			rec := &recordingSignalGroup{onKill: func(pid int) { w.release(pid) }}
-			rt.signalGroup = rec.signal
-			rootfs := derivedRootfs(t, rt, podID)
-			if tc.program != "" {
-				at := filepath.Join(rootfs, filepath.FromSlash(tc.program))
-				if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(at, []byte("x"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if tc.linkAt != "" {
-				at := filepath.Join(rootfs, filepath.FromSlash(tc.linkAt))
-				if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(tc.linkTo, at); err != nil {
-					t.Fatal(err)
-				}
-			}
-			c := &runtimev1.Container{
-				Name: "main", Image: pullRef, Command: []string{tc.argv0},
-				VolumeMounts: []*runtimev1.VolumeMount{
-					{Name: "model", MountPath: tc.mountPath, SubPath: tc.subPath},
-					{Name: "data", MountPath: dataMount},
-				},
-			}
-			box := pullBox(rt, podID, c)
-			box.Volumes = []*runtimev1.Volume{
-				{Name: "model", Image: &runtimev1.ImageVolumeSource{Reference: artifactTestHost + "/models/tiny:v1"}},
-				mediumVolume("data", ""),
-			}
-			mustCreatePod(t, rt, box)
-			view, err := rt.ArtifactView(context.Background(), sha(f.manifest), nil)
-			if err != nil {
+			if err := os.WriteFile(at, []byte("x"), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := os.Readlink(filepath.Join(rootfs, filepath.FromSlash(tc.mountPath))); err != nil || got != filepath.Join(view, tc.subPath) {
-				t.Fatalf("mount link = %q, %v; want the daemon-placed view", got, err)
+		}
+		if tc.linkAt != "" {
+			at := filepath.Join(rootfs, filepath.FromSlash(tc.linkAt))
+			if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+				t.Fatal(err)
 			}
-			rt.mu.Lock()
-			p := rt.pods[podID]
-			rt.mu.Unlock()
-			checks0, signs0, spawns0 := counts(sg, sp)
-			ec := c
-			if tc.hostRoute {
-				ec = proto.Clone(c).(*runtimev1.Container)
-				ec.Image = NativeImage
+			if err := os.Symlink(tc.linkTo, at); err != nil {
+				t.Fatal(err)
 			}
-			got, err := rt.resolveExecCommand(context.Background(), p, ec, []string{tc.argv0, "arg"})
-			if !tc.refused {
-				if err != nil {
-					t.Fatalf("resolveExecCommand(%q): %v", tc.argv0, err)
-				}
-				if want := tc.want(rootfs); len(got) != 2 || got[0] != want || got[1] != "arg" {
-					t.Errorf("resolveExecCommand(%q) = %q, want [%q arg]", tc.argv0, got, want)
-				}
-				return
+		}
+		c := &runtimev1.Container{
+			Name: "main", Image: pullRef, Command: []string{tc.argv0},
+			VolumeMounts: []*runtimev1.VolumeMount{
+				{Name: "model", MountPath: tc.mountPath, SubPath: tc.subPath},
+				{Name: "data", MountPath: dataMount},
+			},
+		}
+		box := pullBox(rt, podID, c)
+		box.Volumes = []*runtimev1.Volume{
+			{Name: "model", Image: &runtimev1.ImageVolumeSource{Reference: artifactTestHost + "/models/tiny:v1"}},
+			mediumVolume("data", ""),
+		}
+		mustCreatePod(t, rt, box)
+		view, err := rt.ArtifactView(context.Background(), sha(f.manifest), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.Readlink(filepath.Join(rootfs, filepath.FromSlash(tc.mountPath))); err != nil || got != filepath.Join(view, tc.subPath) {
+			t.Fatalf("mount link = %q, %v; want the daemon-placed view", got, err)
+		}
+		rt.mu.Lock()
+		p := rt.pods[podID]
+		rt.mu.Unlock()
+		checks0, signs0, spawns0 := counts(sg, sp)
+		ec := c
+		if tc.hostRoute {
+			ec = proto.Clone(c).(*runtimev1.Container)
+			ec.Image = NativeImage
+		}
+		got, err := rt.resolveExecCommand(context.Background(), p, ec, []string{tc.argv0, "arg"})
+		if !tc.refused {
+			if err != nil {
+				t.Fatalf("resolveExecCommand(%q): %v", tc.argv0, err)
 			}
-			if status.Code(err) != codes.InvalidArgument {
-				t.Fatalf("resolveExecCommand(%q) = %q, %v; want InvalidArgument", tc.argv0, got, err)
+			if want := tc.want(rootfs); len(got) != 2 || got[0] != want || got[1] != "arg" {
+				t.Errorf("resolveExecCommand(%q) = %q, want [%q arg]", tc.argv0, got, want)
 			}
-			msg := err.Error()
-			if !strings.Contains(msg, ErrImageArgvEscapes.Error()) {
-				t.Errorf("resolveExecCommand err = %q, want it to name %q", msg, ErrImageArgvEscapes)
+			return
+		}
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("resolveExecCommand(%q) = %q, %v; want InvalidArgument", tc.argv0, got, err)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, ErrImageArgvEscapes.Error()) {
+			t.Errorf("resolveExecCommand err = %q, want it to name %q", msg, ErrImageArgvEscapes)
+		}
+		for _, host := range hostForms(rootfs, view) {
+			if strings.Contains(msg, host) {
+				t.Errorf("resolveExecCommand err = %q names the host path %q, which is the daemon's to know", msg, host)
 			}
-			for _, host := range hostForms(rootfs, view) {
-				if strings.Contains(msg, host) {
-					t.Errorf("resolveExecCommand err = %q names the host path %q, which is the daemon's to know", msg, host)
-				}
-			}
-			if !tc.byWalk && (!strings.Contains(msg, tc.mountPath) || !strings.Contains(msg, "holds data, not programs")) {
-				t.Errorf("resolveExecCommand err = %q, want it to name %q and say an image volume holds data, not programs", msg, tc.mountPath)
-			}
-			if checks, signs, spawns := counts(sg, sp); checks != checks0 || signs != signs0 || spawns != spawns0 {
-				t.Errorf("the refused exec reached the gate or the spawner: checks %d->%d, signs %d->%d, spawns %d->%d",
-					checks0, checks, signs0, signs, spawns0, spawns)
-			}
-		})
+		}
+		if !tc.byWalk && (!strings.Contains(msg, tc.mountPath) || !strings.Contains(msg, "holds data, not programs")) {
+			t.Errorf("resolveExecCommand err = %q, want it to name %q and say an image volume holds data, not programs", msg, tc.mountPath)
+		}
+		if checks, signs, spawns := counts(sg, sp); checks != checks0 || signs != signs0 || spawns != spawns0 {
+			t.Errorf("the refused exec reached the gate or the spawner: checks %d->%d, signs %d->%d, spawns %d->%d",
+				checks0, checks, signs0, signs, spawns0, spawns)
+		}
 	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { run(t, i, tc) })
+	}
+	t.Run("not checked by name today", func(t *testing.T) {
+		for i, tc := range characterization {
+			t.Run(tc.name, func(t *testing.T) { run(t, len(cases)+i, tc) })
+		}
+	})
 }
 
 // hostForms returns each of paths and, where it differs, its form with links
