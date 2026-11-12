@@ -195,11 +195,22 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 //     and a relative path, which means the session's working directory. Start
 //     reads a relative argv[0] against the rootfs, which is the same directory
 //     unless a working directory is set; a session keeps cwd's ordinary meaning.
-//   - A path under one of the container's volume mounts, apart from cleaning its
-//     name, which is the form this check tested and the one the session's path
-//     interposer then reads. A volume is not the image and the gate below does not
-//     answer for it; the interposer rebases such a path into the rootfs as it
-//     always has.
+//   - A path under one of the container's volume mounts other than an image
+//     volume, apart from cleaning its name, which is the form this check tested
+//     and the one the session's path interposer then reads. A volume is not the
+//     image and the gate below does not answer for it; the interposer rebases
+//     such a path into the rootfs as it always has.
+//
+// # What is refused by name
+//
+// An absolute argv[0] that is one of the container's image-volume mount paths,
+// or lies beneath one, is refused with ErrImageArgvEscapes before the volume
+// rule above, as start refuses it (imageVolumeMountAt: cleaned, compared
+// case-insensitively, a prefix only on a separator boundary). An image volume
+// holds data, not programs. The check reads the box's mounts, never the rootfs;
+// an in-image link into such a mount is not matched by name, and the rootfs walk
+// below refuses it with the same sentinel when it follows the link out of the
+// root.
 //
 // # What bounds the session
 //
@@ -221,6 +232,11 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	rootfs, err := r.rootfsPath(p.box)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "exec: %v", err)
+	}
+	if mp, ok := imageVolumeMountAt(p.box, c, argv0); ok {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"exec: container %s: %v: %q is at or beneath %q, the mount path of an image volume, which holds data, not programs",
+			c.GetName(), ErrImageArgvEscapes, argv0, mp)
 	}
 	if rebase := mountRebaser(rootfs, containerMountPaths(c)); rebase != nil {
 		if clean := filepath.Clean(argv0); rebase(clean) != clean {
