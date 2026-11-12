@@ -886,6 +886,65 @@ func TestReclaimHeldBlobEdges(t *testing.T) {
 		}
 	})
 
+	t.Run("a blob stays on one pod's hold after its record is removed", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		shared := f.blob("layer held by pod-b alone", 24*time.Hour)
+		stray := f.blob("unreferenced layer", 24*time.Hour)
+		podA := f.pod("pod-a")
+		podB := f.pod("pod-b")
+		x, err := NewFileIndex(f.cache)
+		if err != nil {
+			t.Fatalf("NewFileIndex: %v", err)
+		}
+		key := "registry.example/models/shared:v1@" + testModelType
+
+		ran := false
+		cfg := midPassReclaimConfig()
+		cfg.afterRoots = func() {
+			ran = true
+			lease := f.cache.AcquireLease([]string{shared}, time.Minute)
+			putTypedArtifact(t, x, key, testModelType, shared, shared)
+			for _, h := range []struct {
+				pod  PodID
+				name string
+			}{{podA, "manifest a"}, {podB, "manifest b"}} {
+				if err := x.AddArtifactHoldManifest(context.Background(), h.pod, HeldManifest{
+					Digest: manifestDigest(h.name), Config: shared, Layers: []string{shared},
+				}); err != nil {
+					t.Errorf("AddArtifactHoldManifest(%s): %v", h.pod, err)
+				}
+			}
+			// pod-a's hold and the record both go before the executor runs, and
+			// the lease is released: pod-b's hold is the only root left.
+			if err := x.RemoveArtifactHold(podA); err != nil {
+				t.Errorf("RemoveArtifactHold: %v", err)
+			}
+			if _, err := x.RemoveArtifactRecord(context.Background(), key); err != nil {
+				t.Errorf("RemoveArtifactRecord: %v", err)
+			}
+			lease.Release()
+		}
+		rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		if !ran {
+			t.Fatalf("afterRoots never ran, so the window was not driven")
+		}
+		// With no record and no lease, only pod-b's hold (artifactHoldRoots)
+		// can keep the blob, so this isolates the hold as a root.
+		if !f.exists(shared) {
+			t.Errorf("a blob pod-b's live hold still names was deleted once its record was removed")
+		}
+		if reason := keptReason(rep, shared); reason != ReasonKeptInUse {
+			t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+		}
+		if f.exists(stray) {
+			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+		}
+	})
+
 	t.Run("a hold taken and released inside the window leaves the blob collectable", func(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)
