@@ -63,6 +63,14 @@ var ErrRootsIncomplete = errors.New("image: reachability root set is incomplete"
 // RPC response.
 var ErrPodReferencesInvalid = errors.New("image: pod reachability record is not a valid record")
 
+// ErrPodReferencesTooLarge reports that a pod reachability record would
+// serialize to more than maxPodReferencesBytes. writePodReferences refuses to
+// write it, because every reader refuses a record that large and Roots would
+// then fail closed for the whole node; the pod's existing record is left as it
+// was. Its text names no host path and no registry-supplied text, so it is safe
+// in an RPC response.
+var ErrPodReferencesTooLarge = errors.New("image: pod reachability record is too large")
+
 // maxPodReferencesBytes bounds the read of an existing pod reachability record
 // at ensure time. A record holds one ImageRoot per image the pod pulled, each a
 // reference and a handful of digests, so this is orders of magnitude above any
@@ -283,6 +291,12 @@ func (c *Cache) writePodReferences(podID PodID, roots []ImageRoot) error {
 	buf, err := json.Marshal(podReferences{Images: roots})
 	if err != nil {
 		return fmt.Errorf("encode pod references %s: %w", podID, err)
+	}
+	// Refuse a record every reader would refuse, before anything is written:
+	// on disk it would make Roots fail closed for the whole node.
+	if len(buf) > maxPodReferencesBytes {
+		return fmt.Errorf("write pod references %s: %w: %d bytes exceeds the %d-byte limit",
+			podID, ErrPodReferencesTooLarge, len(buf), maxPodReferencesBytes)
 	}
 	tmp, err := os.CreateTemp(dir, ".images-*")
 	if err != nil {
