@@ -308,7 +308,9 @@ func TestStartSpawnsTheBinaryTheGateChecked(t *testing.T) {
 // volume holds data, not programs (its view files are 0444, the profile denies
 // exec on view paths), so start refuses it by name with ErrImageArgvEscapes
 // before anything is signed, checked or spawned, even while the mount is the
-// link the daemon placed. A sibling path that only shares a string prefix with
+// link the daemon placed. An in-image link whose target is or lies beneath a
+// mount path is not matched by name; the rootfs walk follows it into the view
+// and refuses it with the same sentinel. A sibling path that only shares a string prefix with
 // a mount path is a real in-image program and still starts.
 func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 	if goruntime.GOOS != "darwin" {
@@ -320,7 +322,13 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 		mountPath string
 		subPath   string
 		program   string // an in-image file written before create, "" for none
+		linkAt    string // an in-image symlink planted before create, "" for none
+		linkTo    string // linkAt's target, as written into the link
 		refused   bool
+		// byWalk marks a refusal that comes from the rootfs walk following an
+		// in-image link into the view, not from the by-name mount check, so its
+		// message need not name the mount.
+		byWalk bool
 	}{
 		{name: "exact", argv0: "/opt/run", mountPath: "/opt/run", subPath: "run.json", refused: true},
 		{name: "relative", argv0: "./opt/run", mountPath: "/opt/run", subPath: "run.json", refused: true},
@@ -328,6 +336,14 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 		{name: "dot-dot", argv0: "/opt/x/../run", mountPath: "/opt/run", subPath: "run.json", refused: true},
 		{name: "case variant", argv0: "/Opt/Run", mountPath: "/opt/run", subPath: "run.json", refused: true},
 		{name: "beneath a directory mount", argv0: "/models/run.json", mountPath: "/models", refused: true},
+		{name: "trailing slash argv0", argv0: "/opt/run/", mountPath: "/opt/run", subPath: "run.json", refused: true},
+		{name: "trailing slash directory mount", argv0: "/models/run.json", mountPath: "/models/", refused: true},
+		{name: "in-image link to the mount path", argv0: "/bin/tool", mountPath: "/opt/run", subPath: "run.json",
+			linkAt: "bin/tool", linkTo: "/opt/run", refused: true, byWalk: true},
+		{name: "relative in-image link to the mount path", argv0: "/bin/tool", mountPath: "/opt/run", subPath: "run.json",
+			linkAt: "bin/tool", linkTo: "../opt/run", refused: true, byWalk: true},
+		{name: "in-image link beneath a directory mount", argv0: "/bin/tool", mountPath: "/models",
+			linkAt: "bin/tool", linkTo: "/models/run.json", refused: true, byWalk: true},
 		{name: "sibling sharing a prefix", argv0: "/opt/runner", mountPath: "/opt/run", subPath: "run.json", program: "opt/runner"},
 	}
 	for i, tc := range cases {
@@ -357,6 +373,15 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := os.WriteFile(at, []byte("x"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.linkAt != "" {
+				at := filepath.Join(rootfs, filepath.FromSlash(tc.linkAt))
+				if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(tc.linkTo, at); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -394,7 +419,7 @@ func TestStartRefusesAnImageVolumeProgram(t *testing.T) {
 			if !errors.Is(err, ErrImageArgvEscapes) {
 				t.Fatalf("startContainer err = %v, want ErrImageArgvEscapes", err)
 			}
-			if msg := err.Error(); !strings.Contains(msg, tc.mountPath) || !strings.Contains(msg, "holds data, not programs") {
+			if msg := err.Error(); !tc.byWalk && (!strings.Contains(msg, tc.mountPath) || !strings.Contains(msg, "holds data, not programs")) {
 				t.Errorf("startContainer err = %q, want it to name %q and say an image volume holds data, not programs", msg, tc.mountPath)
 			}
 			if checks, signs, spawns := counts(sg, sp); checks != checks0 || signs != signs0 || spawns != spawns0 {
