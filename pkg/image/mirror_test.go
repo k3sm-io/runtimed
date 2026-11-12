@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -577,6 +578,8 @@ func TestMirrorFallbackEligibility(t *testing.T) {
 		{"no runnable platform", fmt.Errorf("pull: %w", ErrNoPlatformMatch), false},
 		{"a nested index", fmt.Errorf("pull: %w", ErrNestedIndex), false},
 		{"refused under disk pressure", fmt.Errorf("pull: %w", ErrPullRefusedDiskPressure), false},
+		{"refused for insufficient space", fmt.Errorf("pull: %w", ErrInsufficientSpace), false},
+		{"refused on space arithmetic overflow", fmt.Errorf("pull: %w", ErrSizeOverflow), false},
 		{"the pull policy forbids fetching", fmt.Errorf("image: %w", ErrImageNotPresent), false},
 		{"the caller cancelled", fmt.Errorf("fetch: %w", context.Canceled), false},
 		{"the caller's deadline expired", fmt.Errorf("fetch: %w", context.DeadlineExceeded), false},
@@ -920,6 +923,35 @@ func TestMirrorFailuresReachTheError(t *testing.T) {
 			t.Errorf("pull error %q counted an unusable candidate as consulted", err)
 		}
 	})
+}
+
+// TestMirrorLoopStopsOnLocalSpaceRefusal: when this node refuses a mirror's
+// image for space, no further mirror is tried (another host cannot change the
+// local volume) and the caller gets the space refusal, not the primary's miss.
+func TestMirrorLoopStopsOnLocalSpaceRefusal(t *testing.T) {
+	cache, index, _ := newFixtureStore(t)
+	img := nativeImage(t)
+	src := &fixedMirrors{list: []Mirror{
+		{Host: "100.64.1.1:6450", PlainHTTP: true},
+		{Host: "100.64.1.2:6450", PlainHTTP: true},
+	}}
+	mf := newMirrorFetcher()
+	mf.byRef["100.64.1.1:6450/team/app:v1"] = img
+	mf.byRef["100.64.1.2:6450/team/app:v1"] = img
+	const free = 64 << 30
+	p, err := NewPuller(cache, (&stubFetch{err: registryStatus(http.StatusNotFound)}).fetch, index,
+		WithFreeBytes(fixedFreeBytes(free)), WithPullFloor(free-16), WithTotalBytes(fixedTotalBytes(1<<50)),
+		WithMirrors(src, mf.fetch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Pull(context.Background(), localRef, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if !errors.Is(err, ErrInsufficientSpace) || !errors.Is(err, ErrPullRefusedDiskPressure) {
+		t.Fatalf("pull error = %v, want the local space refusal", err)
+	}
+	if want := []string{"100.64.1.1:6450/team/app:v1"}; !slices.Equal(mf.asked, want) {
+		t.Errorf("mirrors asked %v, want only %v", mf.asked, want)
+	}
 }
 
 // ---------------------------------------------------------------------------

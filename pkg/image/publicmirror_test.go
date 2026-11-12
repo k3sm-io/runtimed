@@ -282,6 +282,27 @@ func TestMirroredReferenceServedOnlyWhenUpstreamUnreachable(t *testing.T) {
 		}
 	})
 
+	t.Run("unreachable upstream, the copy refused for local space, returns the space refusal", func(t *testing.T) {
+		w := newWorld(t)
+		cache, idx := newIndexedCache(t)
+		up := unreachable[0].up(t)
+		fetch, _ := upstreamFetch(up.dial, nil)
+		const free = 64 << 30
+		p, err := NewPuller(cache, fetch, idx,
+			WithFreeBytes(fixedFreeBytes(free)), WithPullFloor(free-16), WithTotalBytes(fixedTotalBytes(1<<50)),
+			WithFlatRegistry(FlatRegistry{Host: flatHost, Endpoint: RegistryEndpoint{Addr: w.mirror.addr, TLS: true, CAPEM: w.mirrorCA.pem}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Pull(context.Background(), ref, nil, nativePolicy(), always)
+		if !errors.Is(err, ErrInsufficientSpace) || !errors.Is(err, ErrPullRefusedDiskPressure) {
+			t.Fatalf("Pull(%q) = %v, want the local space refusal as the error", ref, err)
+		}
+		if got := listedReferences(t, idx); len(got) != 0 {
+			t.Errorf("index lists %v after a refused copy, want nothing", got)
+		}
+	})
+
 	t.Run("unreachable upstream, a pinned digest the copy lacks, fails with the upstream cause", func(t *testing.T) {
 		w := newWorld(t)
 		otherDigest, err := w.other.Digest()
