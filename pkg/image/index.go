@@ -438,6 +438,18 @@ func (x *FileIndex) record(ctx context.Context, e IndexEntry) (Platform, error) 
 	if p.OS == "" || p.Architecture == "" {
 		return Platform{}, fmt.Errorf("record image index %q: incomplete platform %s", ref, p)
 	}
+	// The read-side rule (validateRecordedBlobDigests), applied before anything
+	// is written: a non-canonical config or layer digest would otherwise be
+	// committed and then refused as corrupt on every later read. This is a
+	// caller-supplied bad manifest, not a damaged entry, so it is refused with
+	// ErrInvalidDigest (alongside ErrUnsupportedDigestAlgorithm for an unknown
+	// algorithm), never ErrIndexEntryCorrupt.
+	if err := checkBlobDigests(e.Manifest); err != nil {
+		if errors.Is(err, ErrInvalidDigest) {
+			return Platform{}, fmt.Errorf("record image index %q: %w", ref, err)
+		}
+		return Platform{}, fmt.Errorf("record image index %q: %w: %w", ref, ErrInvalidDigest, err)
+	}
 	desc, err := recordedManifestDescriptor(ref, e)
 	if err != nil {
 		return Platform{}, err
@@ -842,15 +854,27 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 // a lease key, and records carrying a manifest without a config (the
 // pre-retention shape) stay readable.
 func validateRecordedBlobDigests(what string, mfst *runtimev1.ImageManifest) error {
+	if err := checkBlobDigests(mfst); err != nil {
+		return fmt.Errorf("%w: %q: %v", ErrIndexEntryCorrupt, what, err)
+	}
+	return nil
+}
+
+// checkBlobDigests is the rule validateRecordedBlobDigests applies on read and
+// Record applies on write: every non-empty config and layer digest must parse
+// as canonical (parseBlobDigest). The returned error names the position and
+// wraps parseBlobDigest's error, so it carries ErrInvalidDigest or
+// ErrUnsupportedDigestAlgorithm; each caller chooses what to wrap it in.
+func checkBlobDigests(mfst *runtimev1.ImageManifest) error {
 	if d := mfst.GetConfig().GetDigest(); d != "" {
 		if _, err := parseBlobDigest(d); err != nil {
-			return fmt.Errorf("%w: %q: config digest: %v", ErrIndexEntryCorrupt, what, err)
+			return fmt.Errorf("config digest: %w", err)
 		}
 	}
 	for i, l := range mfst.GetLayers() {
 		if d := l.GetDigest(); d != "" {
 			if _, err := parseBlobDigest(d); err != nil {
-				return fmt.Errorf("%w: %q: layer %d digest: %v", ErrIndexEntryCorrupt, what, i, err)
+				return fmt.Errorf("layer %d digest: %w", i, err)
 			}
 		}
 	}
