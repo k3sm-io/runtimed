@@ -227,7 +227,9 @@ func (p *Puller) sampleFree() FreeBytesFunc {
 // A refusal for space is ErrInsufficientSpace and also ErrPullRefusedDiskPressure,
 // so a caller that keys on the admission refusal keys on this one too. A
 // declared size that is negative or sums past uint64 refuses with
-// ErrSizeOverflow. A pull missing nothing reserves nothing (a nil Reservation).
+// ErrSizeOverflow, and a claim above the volume's capacity with
+// ErrDeclaredSizeRejected; neither is ErrPullRefusedDiskPressure, because both
+// refuse the serving registry's manifest rather than this node's free space. A pull missing nothing reserves nothing (a nil Reservation).
 //
 // The unpacked tree the layers are later extracted into is not covered; see
 // SpaceLedger.

@@ -396,7 +396,7 @@ func TestReserveRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 		wantErr    error
 		wantPasses int32
 	}{
-		{name: "above_capacity", need: capacity, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace},
+		{name: "above_capacity", need: capacity, total: fixedTotalBytes(capacity), wantErr: ErrDeclaredSizeRejected},
 		{name: "capacity_unknown", need: free, total: func(string) (uint64, error) { return 0, errors.New("statfs: EIO") }, wantErr: ErrFreeSpaceUnknown},
 		{name: "above_free_within_capacity", need: free, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
 		{name: "exactly_capacity", need: capacity - floor, total: fixedTotalBytes(capacity), wantErr: ErrInsufficientSpace, wantPasses: 1},
@@ -445,8 +445,11 @@ func TestPullRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 	}
 	_, err = p.Pull(context.Background(), "example.com/app:v1", nil, nativePolicy(),
 		runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-	if !errors.Is(err, ErrInsufficientSpace) || !errors.Is(err, ErrPullRefusedDiskPressure) {
-		t.Fatalf("Pull error = %v, want ErrInsufficientSpace and ErrPullRefusedDiskPressure", err)
+	if !errors.Is(err, ErrDeclaredSizeRejected) {
+		t.Fatalf("Pull error = %v, want ErrDeclaredSizeRejected", err)
+	}
+	if errors.Is(err, ErrInsufficientSpace) || errors.Is(err, ErrPullRefusedDiskPressure) {
+		t.Errorf("Pull error = %v reads as a local space shortfall", err)
 	}
 	if n := opened.Load(); n != 0 {
 		t.Errorf("%d layers opened for a refused pull, want 0", n)

@@ -117,6 +117,9 @@ var (
 	// ErrSizeOverflow is image.ErrSizeOverflow, the shared space arithmetic's
 	// refusal of a negative size or a sum that would wrap.
 	ErrSizeOverflow = image.ErrSizeOverflow
+	// ErrDeclaredSizeRejected is image.ErrDeclaredSizeRejected: the manifest
+	// declares more than the store volume can ever hold.
+	ErrDeclaredSizeRejected = image.ErrDeclaredSizeRejected
 )
 
 // BlobCommitter is the cache seam: *image.Cache satisfies it. CommitBlob is the
