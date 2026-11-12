@@ -153,7 +153,7 @@ func (x *FileIndex) ArtifactRecord(ctx context.Context, key string) ([]byte, boo
 	if fi.Size() > MaxArtifactRecordBytes {
 		return nil, false, fmt.Errorf("%w: artifact record of %d bytes: %w", ErrIndexEntryCorrupt, fi.Size(), ErrArtifactRecordTooLarge)
 	}
-	buf, err := readAnchored(sub, name)
+	buf, err := readAnchored(sub, name, MaxArtifactRecordBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, false, nil
@@ -215,7 +215,7 @@ func (x *FileIndex) RemoveArtifactRecordIf(ctx context.Context, key string, matc
 		if fi.Size() > MaxArtifactRecordBytes {
 			return false, fmt.Errorf("%w: artifact record of %d bytes: %w", ErrIndexEntryCorrupt, fi.Size(), ErrArtifactRecordTooLarge)
 		}
-		buf, err = readAnchored(sub, name)
+		buf, err = readAnchored(sub, name, MaxArtifactRecordBytes)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return false, nil
@@ -228,7 +228,7 @@ func (x *FileIndex) RemoveArtifactRecordIf(ctx context.Context, key string, matc
 	} else if fi, err := sub.Lstat(name); err == nil && fi.Mode().IsRegular() && fi.Size() <= MaxArtifactRecordBytes {
 		// An unconditional removal still removes a record it cannot read; it
 		// only keeps no released copy of one.
-		buf, _ = readAnchored(sub, name)
+		buf, _ = readAnchored(sub, name, MaxArtifactRecordBytes)
 	}
 	if buf != nil {
 		// Kept before the root goes, so no instant has the blobs collectable
@@ -329,7 +329,7 @@ func (x *FileIndex) artifactRecords() ([]namedRecord, error) {
 		if fi.Size() > MaxArtifactRecordBytes {
 			return nil, fmt.Errorf("%w: artifact record %q of %d bytes: %w", ErrIndexEntryCorrupt, name, fi.Size(), ErrArtifactRecordTooLarge)
 		}
-		buf, err := readAnchored(sub, name)
+		buf, err := readAnchored(sub, name, MaxArtifactRecordBytes)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue

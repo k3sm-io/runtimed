@@ -315,7 +315,7 @@ func readArtifactHold(sub *os.Root, path, name string, id PodID) (*ArtifactHold,
 	if !fi.Mode().IsRegular() || fi.Size() > MaxArtifactHoldBytes {
 		return nil, bad("not a regular file within its cap (mode %v, %d bytes)", fi.Mode().Type(), fi.Size())
 	}
-	buf, err := readAnchored(sub, name)
+	buf, err := readAnchored(sub, name, MaxArtifactRecordBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, err

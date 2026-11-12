@@ -148,11 +148,26 @@ func (c *Cache) EnsurePodReferences(podID PodID) error {
 // file ignores O_NONBLOCK, so its read is unaffected.
 const recordOpenFlags = os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
 
+// maxIndexEntryBytes bounds the read of one image index entry and of one tree
+// record. It must admit every entry FileIndex.Record accepts, or a single large
+// entry makes List fail for the whole node. An entry carries the manifest
+// twice: Raw, capped at maxIndexManifestBytes (4 MiB) and base64-encoded by
+// encoding/json, so at most 4/3 x 4 MiB (about 5.4 MiB); and the protojson copy
+// of the same manifest, which the writer does NOT cap, so no tighter bound is
+// provable from the code. 64 MiB is sixteen times the manifest ceiling, room for
+// the base64 copy plus a protojson copy many times the manifest's size (JSON
+// escaping at worst sixfold a byte), plus the small fixed envelope.
+//
+// Tree records share the constant: they are this package's own small JSON
+// records with no tighter cap of their own, and the bound only has to stop an
+// unbounded read, not size them.
+const maxIndexEntryBytes = 64 << 20
+
 // readCheckedRecord re-checks on the open descriptor f that it is a regular
 // file (a check made before the open can race a swap) and reads it bounded by
-// maxPodReferencesBytes: a record past the bound is refused, never read whole.
-// Its errors name only name, never a path, and each refusal says which it is.
-func readCheckedRecord(f *os.File, name string) ([]byte, error) {
+// limit: a record past the bound is refused, never read whole. Its errors name
+// only name, never a path, and each refusal says which it is.
+func readCheckedRecord(f *os.File, name string, limit int64) ([]byte, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat %s: %v", name, unwrapPath(err))
@@ -160,12 +175,12 @@ func readCheckedRecord(f *os.File, name string) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file (mode %v)", name, fi.Mode().Type())
 	}
-	buf, err := io.ReadAll(io.LimitReader(f, maxPodReferencesBytes+1))
+	buf, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %v", name, unwrapPath(err))
 	}
-	if len(buf) > maxPodReferencesBytes {
-		return nil, fmt.Errorf("%s exceeds %d bytes", name, maxPodReferencesBytes)
+	if int64(len(buf)) > limit {
+		return nil, fmt.Errorf("%s exceeds %d bytes", name, limit)
 	}
 	return buf, nil
 }
@@ -181,7 +196,7 @@ func checkPodReferences(path string) error {
 		return fmt.Errorf("open %s: %v", PodReferencesName, unwrapPath(err))
 	}
 	defer f.Close()
-	buf, err := readCheckedRecord(f, PodReferencesName)
+	buf, err := readCheckedRecord(f, PodReferencesName, maxPodReferencesBytes)
 	if err != nil {
 		return err
 	}
@@ -310,7 +325,7 @@ func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
 		return nil, fmt.Errorf("read pod references %s: %w", podID, err)
 	}
 	defer f.Close()
-	buf, err := readCheckedRecord(f, PodReferencesName)
+	buf, err := readCheckedRecord(f, PodReferencesName, maxPodReferencesBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read pod references %s: %w", podID, err)
 	}
@@ -454,7 +469,7 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 			return nil, nil, fmt.Errorf("%w: %q under %s is not a pod directory (mode %v)",
 				ErrRootsIncomplete, name, podsRoot, fi.Mode().Type())
 		}
-		buf, err := readAnchored(root, filepath.Join(name, PodReferencesName))
+		buf, err := readAnchored(root, filepath.Join(name, PodReferencesName), maxPodReferencesBytes)
 		if errors.Is(err, fs.ErrNotExist) && untracked != nil {
 			if id, perr := ParsePodID(name); perr == nil && untracked(id) {
 				skipped = append(skipped, name)
@@ -531,11 +546,13 @@ func operatorRootSet(roots []OperatorImageRoot) []ImageRoot {
 // the ensure-time check (checkPodReferences): its directory is resolved inside
 // root, its final component is opened with recordOpenFlags (no symlink
 // followed, no block on a FIFO), and readCheckedRecord refuses anything that is
-// not a regular file or exceeds maxPodReferencesBytes. It exists so the
+// not a regular file or exceeds limit, which each caller sizes to its record
+// kind (maxPodReferencesBytes, MaxArtifactRecordBytes, maxIndexEntryBytes). It
+// exists so the
 // "absent" and "not a regular file" cases both surface as errors here rather
 // than as an empty record at the call site; an absent file keeps its
 // fs.ErrNotExist identity.
-func readAnchored(root *os.Root, rel string) ([]byte, error) {
+func readAnchored(root *os.Root, rel string, limit int64) ([]byte, error) {
 	dir, err := root.Open(filepath.Dir(rel))
 	if err != nil {
 		return nil, err
@@ -554,5 +571,5 @@ func readAnchored(root *os.Root, rel string) ([]byte, error) {
 	}
 	f := os.NewFile(uintptr(fd), rel)
 	defer f.Close()
-	return readCheckedRecord(f, rel)
+	return readCheckedRecord(f, rel, limit)
 }

@@ -737,7 +737,7 @@ func (x *FileIndex) ResolveDigest(ctx context.Context, digest string) (IndexEntr
 // index would make a reference resolve to another image.
 func (x *FileIndex) lookupOne(root *os.Root, ref string, p Platform) (IndexEntry, bool, error) {
 	name := entryName(ref, p)
-	buf, err := readAnchored(root, name)
+	buf, err := readAnchored(root, name, maxIndexEntryBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return IndexEntry{}, false, nil
@@ -979,7 +979,7 @@ func (x *FileIndex) List(ctx context.Context) ([]IndexEntry, error) {
 		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") || !d.Type().IsRegular() {
 			continue
 		}
-		buf, err := readAnchored(root, name)
+		buf, err := readAnchored(root, name, maxIndexEntryBytes)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue // raced with a concurrent replace; the next list sees it
