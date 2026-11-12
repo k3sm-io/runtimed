@@ -34,6 +34,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // silentServer accepts every request and never writes a byte of response; a
@@ -314,6 +316,63 @@ func TestExternalTransportHeaderTimeoutThroughPull(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%p", def.DialContext); got != beforeDial {
 		t.Fatalf("http.DefaultTransport DialContext changed: %s, was %s", got, beforeDial)
+	}
+}
+
+// TestRegistryTransportCarriesHeaderTimeout pins that the transport RemoteFetch,
+// RemoteMirrorFetch and the direct blob routes pass explicitly is the
+// header-bounded one: WithTransport is last-wins, so an unbounded
+// registryTransport would undo the bound remoteFetch installs first. A
+// registry that never writes headers fails on the header bound both through
+// RemoteFetch and through a registryfetch blob GET, and http.DefaultTransport
+// is left as it was.
+func TestRegistryTransportCarriesHeaderTimeout(t *testing.T) {
+	def := http.DefaultTransport.(*http.Transport)
+	beforeHeader := def.ResponseHeaderTimeout
+
+	setDuration(t, &responseHeaderTimeout, 50*time.Millisecond)
+	setDuration(t, &resolveTimeout, 5*time.Second)
+	freshExternalTransport(t)
+
+	host := silentServer(t)
+	start := time.Now()
+	_, err := RemoteFetch(context.Background(), host+"/silent/app:v1", nil, nativePolicy())
+	if err == nil {
+		t.Fatal("RemoteFetch on a silent registry succeeded")
+	}
+	if errors.Is(err, ErrPullResolveTimeout) || !strings.Contains(err.Error(), "timeout awaiting response headers") {
+		t.Errorf("RemoteFetch error = %v, want a response header timeout, not the resolve bound", err)
+	}
+	if el := time.Since(start); el > 30*time.Second {
+		t.Errorf("RemoteFetch took %s, want no hang (guard 30s)", el)
+	}
+
+	// The context deadline is only a hard stop, so an unbounded transport
+	// fails the assertion below instead of hanging the test.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reg := registryfetch.Registry{Transport: registryTransport()}
+	body, _, err := reg.Blob(ctx, host+"/silent/app:v1", nil, "sha256:"+strings.Repeat("0", 64), 1, 0)
+	if err == nil {
+		body.Close()
+		t.Fatal("blob GET on a silent registry succeeded")
+	}
+	if !strings.Contains(err.Error(), "timeout awaiting response headers") {
+		t.Errorf("blob GET error = %v, want a response header timeout", err)
+	}
+
+	tr, ok := registryTransport().(*http.Transport)
+	if !ok {
+		t.Fatalf("registryTransport() = %T, want an *http.Transport", registryTransport())
+	}
+	if tr.ResponseHeaderTimeout != 50*time.Millisecond {
+		t.Errorf("registryTransport() ResponseHeaderTimeout = %s, want 50ms", tr.ResponseHeaderTimeout)
+	}
+	if tr == def {
+		t.Error("registryTransport() is http.DefaultTransport itself")
+	}
+	if def.ResponseHeaderTimeout != beforeHeader {
+		t.Errorf("http.DefaultTransport ResponseHeaderTimeout mutated to %s", def.ResponseHeaderTimeout)
 	}
 }
 

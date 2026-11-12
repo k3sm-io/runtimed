@@ -30,7 +30,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"k3sm.io/runtimed/pkg/registryfetch"
 )
@@ -78,14 +77,14 @@ func TestBlobSourcePerPath(t *testing.T) {
 		wantCred      *registryfetch.Credential
 	}{
 		{
-			name: "default path: ggcr default transport, converted credential",
+			name: "default path: registry transport, converted credential",
 			opts: wired,
 			route: func(p *Puller) (BlobSource, bool, error) {
 				return p.primaryBlobSource("registry.example.com/team/app:v1", cred)
 			},
 			wantOK:        true,
 			wantRef:       "registry.example.com/team/app:v1",
-			wantTransport: remote.DefaultTransport,
+			wantTransport: registryTransport(),
 			wantCred:      wantCred,
 		},
 		{
@@ -94,7 +93,7 @@ func TestBlobSourcePerPath(t *testing.T) {
 			route:         func(p *Puller) (BlobSource, bool, error) { return p.primaryBlobSource("ubuntu", nil) },
 			wantOK:        true,
 			wantRef:       "index.docker.io/library/ubuntu:latest",
-			wantTransport: remote.DefaultTransport,
+			wantTransport: registryTransport(),
 		},
 		{
 			name:          "flat path: pinned-CA endpoint transport, converted credential",
@@ -114,14 +113,14 @@ func TestBlobSourcePerPath(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "mirror path: default transport, candidate scheme, anonymous",
+			name: "mirror path: registry transport, candidate scheme, anonymous",
 			opts: wired,
 			route: func(p *Puller) (BlobSource, bool, error) {
 				return p.mirrorBlobSource(mirror.Host+"/team/app:v1", mirror)
 			},
 			wantOK:        true,
 			wantRef:       mirror.Host + "/team/app:v1",
-			wantTransport: remote.DefaultTransport,
+			wantTransport: registryTransport(),
 			wantPlainHTTP: true,
 		},
 		{

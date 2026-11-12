@@ -90,15 +90,20 @@ func (c *RegistryCredential) registryfetchCredential() *registryfetch.Credential
 }
 
 // registryTransport is the transport a registry round trip that pins none of
-// its own is made over: go-containerregistry's remote.DefaultTransport (an
-// http.Transport with Proxy: http.ProxyFromEnvironment, a 30s dial timeout and
-// the system TLS roots). It is read at call time, as remote's own option
-// defaulting reads it, so passing it to remote.WithTransport selects the same
-// transport value ggcr would otherwise pick implicitly; ggcr wraps it in its
-// retry (and debug logger) layer either way, because it is not a
+// its own is made over: the header-bounded externalTransport (a clone of
+// http.DefaultTransport, so its proxy function, dial and TLS timeouts and the
+// system TLS roots, plus responseHeaderTimeout), or go-containerregistry's
+// remote.DefaultTransport when externalTransport is nil because
+// http.DefaultTransport was replaced. RemoteFetch and RemoteMirrorFetch pass
+// it to remote.WithTransport, which is last-wins, so it must carry the header
+// bound itself or it would undo the one remoteFetch installs first. ggcr wraps
+// it in its retry (and debug logger) layer, because it is not a
 // transport.Wrapper. It is named here so the direct blob route (BlobSource)
-// and the image fetch share one dial, TLS and proxy story.
+// and the image fetch share one dial, TLS, proxy and header-bound story.
 func registryTransport() http.RoundTripper {
+	if tr := externalTransport(); tr != nil {
+		return tr
+	}
 	return remote.DefaultTransport
 }
 
