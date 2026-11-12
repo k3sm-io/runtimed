@@ -817,7 +817,9 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 				return oerr
 			}
 			defer rc.Close()
-			_, cerr := io.Copy(w, rc)
+			// Arriving bytes renew the lease, so a layer slower than the
+			// lease TTL keeps its protection against a reclaim pass.
+			_, cerr := io.Copy(w, lease.Reader(rc))
 			return cerr
 		})
 		if err != nil {
@@ -857,6 +859,9 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 		return nil, fmt.Errorf("pull %q: record image index: %w", ref, err)
 	}
 
+	// The caller still has to record its own reference before it releases
+	// the lease; start that window from a fresh TTL where the throttle allows.
+	lease.Renew()
 	return &PullResult{
 		Manifest: out,
 		CacheHit: !wroteAny,

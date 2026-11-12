@@ -17,6 +17,7 @@ limitations under the License.
 package image
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,4 +94,160 @@ func TestLeaseConcurrentUse(t *testing.T) {
 			t.Errorf("leaseHas(%q) after all releases, want false", d)
 		}
 	}
+}
+
+// TestLeaseOutlivesItsTTLWhileThePullRuns pins renewal: a lease kept alive by
+// arriving bytes outlives its TTL, lapses one TTL after the last renewal, is
+// throttled to one renewal per quarter TTL, is never revived once lapsed or
+// released, and never passes a set maxEnd.
+func TestLeaseOutlivesItsTTLWhileThePullRuns(t *testing.T) {
+	const d = "sha256:renew"
+	ttl := time.Minute
+	quarter := ttl / 4
+
+	t.Run("renewed every quarter TTL is held at three TTLs", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		l := f.cache.AcquireLease([]string{d}, ttl)
+		for f.clock.Before(start.Add(3 * ttl)) {
+			f.clock = f.clock.Add(quarter)
+			l.Renew()
+		}
+		if !f.cache.leaseHas(d) {
+			t.Fatalf("lease lapsed at three TTLs despite renewals")
+		}
+		last := f.clock
+		f.clock = last.Add(ttl)
+		if !f.cache.leaseHas(d) {
+			t.Errorf("lease lapsed before one TTL after the last renewal")
+		}
+		f.clock = last.Add(ttl + time.Nanosecond)
+		if f.cache.leaseHas(d) {
+			t.Errorf("lease still held past one TTL after the last renewal")
+		}
+	})
+
+	t.Run("no renewal lapses at TTL", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		f.cache.AcquireLease([]string{d}, ttl)
+		f.clock = start.Add(ttl + time.Nanosecond)
+		if f.cache.leaseHas(d) {
+			t.Errorf("unrenewed lease held past its TTL")
+		}
+	})
+
+	t.Run("renew inside the throttle window does not move expiry", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		l := f.cache.AcquireLease([]string{d}, ttl)
+		f.clock = start.Add(quarter - time.Nanosecond)
+		l.Renew()
+		if got, want := l.expires, start.Add(ttl); !got.Equal(want) {
+			t.Errorf("expires after throttled Renew = %v, want %v", got, want)
+		}
+		f.clock = start.Add(quarter)
+		l.Renew()
+		if got, want := l.expires, start.Add(quarter+ttl); !got.Equal(want) {
+			t.Errorf("expires after Renew past the window = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("renew after lapse is a no-op", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		l := f.cache.AcquireLease([]string{d}, ttl)
+		f.clock = start.Add(ttl + time.Nanosecond)
+		l.Renew() // lapsed but not yet swept
+		if f.cache.leaseHas(d) {
+			t.Errorf("Renew revived a lapsed lease")
+		}
+		if n := leaseCount(f.cache); n != 0 {
+			t.Errorf("lease table has %d entries, want 0", n)
+		}
+	})
+
+	t.Run("renew after release is a no-op", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		l := f.cache.AcquireLease([]string{d}, ttl)
+		l.Release()
+		f.clock = start.Add(quarter)
+		l.Renew()
+		if f.cache.leaseHas(d) {
+			t.Errorf("Renew revived a released lease")
+		}
+		if n := leaseCount(f.cache); n != 0 {
+			t.Errorf("lease table has %d entries, want 0", n)
+		}
+	})
+
+	t.Run("nil lease", func(t *testing.T) {
+		var l *Lease
+		l.Renew()
+		(&Lease{}).Renew()
+		if _, err := l.Reader(strings.NewReader("x")).Read(make([]byte, 1)); err != nil {
+			t.Errorf("Read through a nil lease's reader: %v", err)
+		}
+	})
+
+	t.Run("maxEnd caps renewal", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		l := f.cache.AcquireLease([]string{d}, ttl)
+		maxEnd := start.Add(2 * ttl)
+		l.maxEnd = maxEnd
+		for f.clock.Before(start.Add(3 * ttl)) {
+			f.clock = f.clock.Add(quarter)
+			l.Renew()
+		}
+		if f.cache.leaseHas(d) {
+			t.Errorf("lease held past maxEnd")
+		}
+		f2 := newGCFixture(t)
+		l2 := f2.cache.AcquireLease([]string{d}, ttl)
+		l2.maxEnd = f2.clock.Add(2 * ttl)
+		start2 := f2.clock
+		f2.clock = start2.Add(3 * quarter)
+		l2.Renew() // expires at 1.75 TTL, under the cap
+		f2.clock = start2.Add(6 * quarter)
+		l2.Renew() // would be 2.5 TTL; capped at 2 TTL
+		if got, want := l2.expires, l2.maxEnd; !got.Equal(want) {
+			t.Errorf("expires = %v, want capped at maxEnd %v", got, want)
+		}
+		f2.clock = l2.maxEnd
+		if !f2.cache.leaseHas(d) {
+			t.Errorf("lease lapsed before maxEnd")
+		}
+		f2.clock = l2.maxEnd.Add(time.Nanosecond)
+		if f2.cache.leaseHas(d) {
+			t.Errorf("lease held past maxEnd")
+		}
+	})
+
+	t.Run("reader renews on bytes, not on a zero-byte read", func(t *testing.T) {
+		f := newGCFixture(t)
+		start := f.clock
+		l := f.cache.AcquireLease([]string{d}, ttl)
+		f.clock = start.Add(quarter)
+		if n, _ := l.Reader(strings.NewReader("")).Read(make([]byte, 1)); n != 0 {
+			t.Fatalf("empty read returned %d bytes", n)
+		}
+		if got, want := l.expires, start.Add(ttl); !got.Equal(want) {
+			t.Errorf("zero-byte read moved expires to %v, want %v", got, want)
+		}
+		if n, _ := l.Reader(strings.NewReader("abc")).Read(make([]byte, 3)); n != 3 {
+			t.Fatalf("read returned %d bytes, want 3", n)
+		}
+		if got, want := l.expires, start.Add(quarter+ttl); !got.Equal(want) {
+			t.Errorf("read of bytes left expires at %v, want %v", got, want)
+		}
+	})
+}
+
+// leaseCount returns the size of the lease table.
+func leaseCount(c *Cache) int {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	return len(c.leases)
 }

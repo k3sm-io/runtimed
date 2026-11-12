@@ -17,6 +17,7 @@ limitations under the License.
 package image
 
 import (
+	"io"
 	"sync"
 	"time"
 )
@@ -47,13 +48,83 @@ const DefaultLeaseTTL = 15 * time.Minute
 // A Lease is safe for concurrent use and Release is idempotent; the zero value
 // and a nil *Lease both Release as no-ops so a caller that never took one, or
 // took one from a failed pull, needs no branch.
+//
+// A pull keeps its lease alive while bytes arrive (Renew, Reader): the TTL
+// bounds how long a lease outlives the last sign of progress, not how long a
+// slow pull may take.
 type Lease struct {
 	c       *Cache
 	id      uint64
 	digests []string
+	// ttl is the TTL the lease was acquired with; immutable after
+	// AcquireLease. Renew extends expires by it.
+	ttl time.Duration
+
+	// expires, lastRenew and maxEnd are guarded by c.leaseMu.
 	expires time.Time
+	// lastRenew is when expires was last set (at AcquireLease, then by each
+	// effective Renew); Renew is throttled against it.
+	lastRenew time.Time
+	// maxEnd, when non-zero, is the instant past which Renew never extends
+	// expires. Zero means no total cap.
+	maxEnd time.Time
 
 	once sync.Once
+}
+
+// Renew extends the lease to now plus its TTL (capped at maxEnd when set). It
+// is nil-safe and throttled: a call less than a quarter of the TTL after the
+// last renewal changes nothing, so a per-read caller costs one lock.
+//
+// A lease that has already lapsed, or was released, is never revived: Renew
+// is a no-op unless this very lease is still in the cache's lease table and
+// its expiry has not passed. A lapsed lease may already have let a reclaim
+// pass take its blobs, so reviving it would claim a protection it no longer
+// gives.
+func (l *Lease) Renew() {
+	if l == nil || l.c == nil {
+		return
+	}
+	c := l.c
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.expireLeasesLocked()
+	if cur, ok := c.leases[l.id]; !ok || cur != l {
+		return
+	}
+	now := c.now()
+	if now.Sub(l.lastRenew) < l.ttl/4 {
+		return
+	}
+	exp := now.Add(l.ttl)
+	if !l.maxEnd.IsZero() && exp.After(l.maxEnd) {
+		exp = l.maxEnd
+	}
+	if exp.After(l.expires) {
+		l.expires = exp
+	}
+	l.lastRenew = now
+}
+
+// Reader wraps r so every read that returns bytes renews the lease. A
+// zero-byte read renews nothing. It is nil-safe: a nil lease's reader reads r
+// unchanged.
+func (l *Lease) Reader(r io.Reader) io.Reader {
+	return &renewingReader{l: l, r: r}
+}
+
+// renewingReader is Lease.Reader's wrapper.
+type renewingReader struct {
+	l *Lease
+	r io.Reader
+}
+
+func (rr *renewingReader) Read(b []byte) (int, error) {
+	n, err := rr.r.Read(b)
+	if n > 0 {
+		rr.l.Renew()
+	}
+	return n, err
 }
 
 // Digests returns the digests this lease pins (a copy).
@@ -101,7 +172,8 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 			c.leaseWatch[d] = struct{}{}
 		}
 	}
-	l := &Lease{c: c, id: c.nextLease, digests: held, expires: c.now().Add(ttl)}
+	now := c.now()
+	l := &Lease{c: c, id: c.nextLease, digests: held, ttl: ttl, expires: now.Add(ttl), lastRenew: now}
 	c.leases[l.id] = l
 	return l
 }
