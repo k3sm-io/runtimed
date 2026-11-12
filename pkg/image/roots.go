@@ -27,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // PodReferencesName is the per-pod reachability record the daemon writes inside
@@ -139,33 +141,49 @@ func (c *Cache) EnsurePodReferences(podID PodID) error {
 	return nil
 }
 
+// recordOpenFlags is the one way this package opens a record it is about to
+// trust: never through a final symlink (O_NOFOLLOW), and O_NONBLOCK so a FIFO
+// planted (or swapped in after a caller's Lstat) cannot block the open waiting
+// for a writer; readCheckedRecord then refuses it on the descriptor. A regular
+// file ignores O_NONBLOCK, so its read is unaffected.
+const recordOpenFlags = os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
+
+// readCheckedRecord re-checks on the open descriptor f that it is a regular
+// file (a check made before the open can race a swap) and reads it bounded by
+// maxPodReferencesBytes: a record past the bound is refused, never read whole.
+// Its errors name only name, never a path, and each refusal says which it is.
+func readCheckedRecord(f *os.File, name string) ([]byte, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %v", name, unwrapPath(err))
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode %v)", name, fi.Mode().Type())
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, maxPodReferencesBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %v", name, unwrapPath(err))
+	}
+	if len(buf) > maxPodReferencesBytes {
+		return nil, fmt.Errorf("%s exceeds %d bytes", name, maxPodReferencesBytes)
+	}
+	return buf, nil
+}
+
 // checkPodReferences reads the record at path without following a final
 // symlink, re-checks on the open descriptor that it is a regular file (the
 // Lstat in the caller can race a swap), bounds the read, decodes it, and parses
 // every digest it names. Its
 // errors name only PodReferencesName, never path.
 func checkPodReferences(path string) error {
-	// O_NONBLOCK so a FIFO swapped in after the caller's Lstat cannot block the
-	// open waiting for a writer; the descriptor check below then refuses it. A
-	// regular file ignores the flag, so the read is unaffected.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, recordOpenFlags, 0)
 	if err != nil {
 		return fmt.Errorf("open %s: %v", PodReferencesName, unwrapPath(err))
 	}
 	defer f.Close()
-	fi, err := f.Stat()
+	buf, err := readCheckedRecord(f, PodReferencesName)
 	if err != nil {
-		return fmt.Errorf("stat %s: %v", PodReferencesName, unwrapPath(err))
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file (mode %v)", PodReferencesName, fi.Mode().Type())
-	}
-	buf, err := io.ReadAll(io.LimitReader(f, maxPodReferencesBytes+1))
-	if err != nil {
-		return fmt.Errorf("read %s: %v", PodReferencesName, unwrapPath(err))
-	}
-	if len(buf) > maxPodReferencesBytes {
-		return fmt.Errorf("%s exceeds %d bytes", PodReferencesName, maxPodReferencesBytes)
+		return err
 	}
 	var rec podReferences
 	if err := json.Unmarshal(buf, &rec); err != nil {
@@ -435,7 +453,7 @@ func (c *Cache) roots(untracked UntrackedPodFunc) ([]ImageRoot, []string, error)
 		}
 		if err != nil {
 			// LOCAL-ONLY, no boundErr: readAnchored fails with an fs.PathError (or
-			// its own not-a-regular-file message) naming a daemon-composed path. The
+			// its own not-a-regular-file or over-the-bound message) naming a daemon-composed path. The
 			// record's CONTENT reaches a message only at the decode below — which is
 			// bounded, because that is where foreign bytes actually arrive.
 			return nil, nil, fmt.Errorf("%w: pod %q: %v", ErrRootsIncomplete, name, err)
@@ -499,21 +517,32 @@ func operatorRootSet(roots []OperatorImageRoot) []ImageRoot {
 	return out
 }
 
-// readAnchored reads rel through root, refusing anything that is not a regular
-// file. It exists so the "absent" and "not a regular file" cases both surface as
-// errors here rather than as an empty record at the call site.
+// readAnchored reads rel through root with the same checked open and bound as
+// the ensure-time check (checkPodReferences): its directory is resolved inside
+// root, its final component is opened with recordOpenFlags (no symlink
+// followed, no block on a FIFO), and readCheckedRecord refuses anything that is
+// not a regular file or exceeds maxPodReferencesBytes. It exists so the
+// "absent" and "not a regular file" cases both surface as errors here rather
+// than as an empty record at the call site; an absent file keeps its
+// fs.ErrNotExist identity.
 func readAnchored(root *os.Root, rel string) ([]byte, error) {
-	f, err := root.Open(rel)
+	dir, err := root.Open(filepath.Dir(rel))
 	if err != nil {
 		return nil, err
 	}
+	defer dir.Close()
+	base := filepath.Base(rel)
+	var fd int
+	for {
+		fd, err = unix.Openat(int(dir.Fd()), base, recordOpenFlags, 0)
+		if err != unix.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: rel, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), rel)
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file (mode %v)", rel, fi.Mode().Type())
-	}
-	return io.ReadAll(f)
+	return readCheckedRecord(f, rel)
 }
