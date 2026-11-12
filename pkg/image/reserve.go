@@ -39,6 +39,14 @@ var ErrInsufficientSpace = errors.New("image: refusing the pull, the store volum
 // artifact.ErrSizeOverflow is the same value.
 var ErrSizeOverflow = errors.New("image: space arithmetic overflows")
 
+// ErrDeclaredSizeRejected reports that the manifest declares more than this
+// volume can ever hold: the declared bytes, with the floor and what other pulls
+// hold, exceed the volume's total capacity, so no reclaim pass could make room.
+// The sizes are the serving registry's claim, so it is a refusal of that
+// source's manifest, not of this node's free space: another source may serve a
+// sane one. artifact.ErrDeclaredSizeRejected is the same value.
+var ErrDeclaredSizeRejected = errors.New("image: refusing the pull, the manifest declares more than the store volume can hold")
+
 // SpaceLedger is the in-process ledger of the bytes in-flight pulls have
 // reserved on the store volume. The daemon builds one and hands the same
 // instance to the image puller (WithSpaceLedger) and the artifact puller, so
@@ -121,7 +129,7 @@ func (r *Reservation) Release() {
 // plus c.Need. When it does not, one c.Reclaimer pass runs, asked to bring free
 // space up to that sum, and the check is repeated; still short is
 // ErrInsufficientSpace. A sum above the volume's total capacity is
-// ErrInsufficientSpace with no reclaim pass. An unsamplable volume (free space
+// ErrDeclaredSizeRejected with no reclaim pass. An unsamplable volume (free space
 // or, before a pass, capacity) refuses with ErrFreeSpaceUnknown, and a sum that
 // would wrap refuses with ErrSizeOverflow.
 func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, error) {
@@ -164,7 +172,7 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		}
 		if want > capacity {
 			return nil, fmt.Errorf("need %d bytes, %d reserved by other pulls, floor %d: the claim exceeds the volume's capacity of %d bytes: %w",
-				c.Need, l.held, c.FloorBytes, capacity, ErrInsufficientSpace)
+				c.Need, l.held, c.FloorBytes, capacity, ErrDeclaredSizeRejected)
 		}
 		if _, rerr := c.Reclaimer.ReclaimUnderPressure(ctx, ReclaimConfig{
 			HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: free, Log: c.Log,

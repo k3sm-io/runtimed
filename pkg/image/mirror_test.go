@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -579,7 +580,8 @@ func TestMirrorFallbackEligibility(t *testing.T) {
 		{"a nested index", fmt.Errorf("pull: %w", ErrNestedIndex), false},
 		{"refused under disk pressure", fmt.Errorf("pull: %w", ErrPullRefusedDiskPressure), false},
 		{"refused for insufficient space", fmt.Errorf("pull: %w", ErrInsufficientSpace), false},
-		{"refused on space arithmetic overflow", fmt.Errorf("pull: %w", ErrSizeOverflow), false},
+		{"the primary declared sizes that overflow", fmt.Errorf("pull: %w", ErrSizeOverflow), false},
+		{"the primary declared more than the volume holds", fmt.Errorf("pull: %w", ErrDeclaredSizeRejected), false},
 		{"the pull policy forbids fetching", fmt.Errorf("image: %w", ErrImageNotPresent), false},
 		{"the caller cancelled", fmt.Errorf("fetch: %w", context.Canceled), false},
 		{"the caller's deadline expired", fmt.Errorf("fetch: %w", context.DeadlineExceeded), false},
@@ -951,6 +953,44 @@ func TestMirrorLoopStopsOnLocalSpaceRefusal(t *testing.T) {
 	}
 	if want := []string{"100.64.1.1:6450/team/app:v1"}; !slices.Equal(mf.asked, want) {
 		t.Errorf("mirrors asked %v, want only %v", mf.asked, want)
+	}
+}
+
+// TestMirrorLoopSkipsARejectedSizeDeclaration: a mirror whose manifest declares
+// sizes this node refuses (more than the volume holds, or arithmetic that
+// overflows) is one mirror failing, so the next mirror's sane image is pulled.
+func TestMirrorLoopSkipsARejectedSizeDeclaration(t *testing.T) {
+	const capacity = 1 << 40
+	for _, tc := range []struct {
+		name  string
+		sizes []int64
+	}{
+		{name: "above_capacity", sizes: []int64{2 * capacity}},
+		{name: "overflowing", sizes: []int64{math.MaxInt64, math.MaxInt64, math.MaxInt64}},
+		{name: "negative", sizes: []int64{100, -1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, index, _ := newFixtureStore(t)
+			src := &fixedMirrors{list: []Mirror{
+				{Host: "100.64.1.1:6450", PlainHTTP: true},
+				{Host: "100.64.1.2:6450", PlainHTTP: true},
+			}}
+			mf := newMirrorFetcher()
+			mf.byRef["100.64.1.1:6450/team/app:v1"] = declaredImage{Image: nativeImage(t), sizes: tc.sizes}
+			mf.byRef["100.64.1.2:6450/team/app:v1"] = nativeImage(t)
+			p, err := NewPuller(cache, (&stubFetch{err: registryStatus(http.StatusNotFound)}).fetch, index,
+				WithFreeBytes(fixedFreeBytes(capacity/2)), WithPullFloor(1<<20),
+				WithTotalBytes(fixedTotalBytes(capacity)), WithMirrors(src, mf.fetch))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.Pull(context.Background(), localRef, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS); err != nil {
+				t.Fatalf("pull error = %v, want the second mirror's image", err)
+			}
+			if want := []string{"100.64.1.1:6450/team/app:v1", "100.64.1.2:6450/team/app:v1"}; !slices.Equal(mf.asked, want) {
+				t.Errorf("mirrors asked %v, want %v", mf.asked, want)
+			}
+		})
 	}
 }
 
