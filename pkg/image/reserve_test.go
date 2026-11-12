@@ -29,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/registry"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
@@ -538,6 +539,82 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 				t.Errorf("ledger holds %d bytes, want %d", got, wantHeld)
 			}
 			r.Release()
+		})
+	}
+}
+
+// TestPullRefusalBeyondReclaimableKeepsTheCache: through the real Puller and
+// Cache, a pull whose declaration is one byte past free space plus what reclaim
+// could free (but within capacity) is refused before any layer request and
+// leaves the old, unreferenced blob in the cache. The control declares the same
+// pull against one more byte of free space: reclaim evicts that blob and the
+// pull proceeds, so the blob really was evictable.
+func TestPullRefusalBeyondReclaimableKeepsTheCache(t *testing.T) {
+	const floor = 1 << 20
+	const seedContent = "an unreferenced blob old enough to reclaim"
+	seedSize := uint64(len(seedContent))
+	reg := newBlobCountingRegistry(t)
+	img := pullPolicyImage(t)
+	ref := pushImage(t, reg.host, "app", img)
+	need := declaredNeed(t, img)
+	if need <= seedSize {
+		t.Fatalf("declared need %d must exceed the seeded blob's %d bytes", need, seedSize)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		short  uint64 // free space short of floor+need while the blob exists
+		refuse bool
+	}{
+		{name: "beyond reclaimable", short: seedSize + 1, refuse: true},
+		{name: "fits after reclaim", short: seedSize, refuse: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg.reset()
+			f := newGCFixture(t)
+			seed := f.blob(seedContent, time.Hour)
+			base := uint64(floor) + need - tc.short
+			// Free space rises by the blob's size once it is unlinked, as the
+			// reclaim loop's re-sampling expects.
+			free := func(string) (uint64, error) {
+				if f.cache.Has(seed) {
+					return base, nil
+				}
+				return base + seedSize, nil
+			}
+			ledger := &SpaceLedger{}
+			p, err := NewPuller(f.cache, RemoteFetch, NoLocalIndex{}, WithPullFloor(floor),
+				WithFreeBytes(free), WithTotalBytes(fixedTotalBytes(1<<40)), WithSpaceLedger(ledger))
+			if err != nil {
+				t.Fatalf("NewPuller: %v", err)
+			}
+			res, err := p.Pull(context.Background(), ref, nil, nativePolicy(),
+				runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+			if tc.refuse {
+				if !errors.Is(err, ErrInsufficientSpace) {
+					t.Fatalf("Pull error = %v, want ErrInsufficientSpace", err)
+				}
+				if n := reg.layerGets(t, img); n != 0 {
+					t.Errorf("registry saw %d layer requests for a refused pull, want 0", n)
+				}
+				if !f.exists(seed) {
+					t.Error("a refused pull evicted the unreferenced blob")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Pull that fits after reclaim: %v", err)
+				}
+				res.Lease.Release()
+				if n := reg.layerGets(t, img); n == 0 {
+					t.Error("the admitted pull requested no layer")
+				}
+				if f.exists(seed) {
+					t.Error("the seeded blob survived the reclaim the pull needed; the refusal case is vacuous")
+				}
+			}
+			if got := ledger.Reserved(); got != 0 {
+				t.Errorf("ledger holds %d bytes after the pull, want 0", got)
+			}
 		})
 	}
 }
