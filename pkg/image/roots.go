@@ -296,11 +296,21 @@ func (c *Cache) writePodReferences(podID PodID, roots []ImageRoot) error {
 // empty slice with no error — the caller that is WRITING a record must be able
 // to read the absent one first; it is Roots, the GC's enumerator, that treats
 // absence as fatal.
+//
+// The record is opened with recordOpenFlags and read through readCheckedRecord,
+// as Roots reads it: a FIFO planted at the name is refused on its descriptor
+// rather than blocking the caller, and a record past maxPodReferencesBytes is
+// refused rather than read whole.
 func (c *Cache) PodImageRoots(podID PodID) ([]ImageRoot, error) {
-	buf, err := os.ReadFile(filepath.Join(c.PodDir(podID), PodReferencesName))
+	f, err := os.OpenFile(filepath.Join(c.PodDir(podID), PodReferencesName), recordOpenFlags, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, fmt.Errorf("read pod references %s: %w", podID, err)
+	}
+	defer f.Close()
+	buf, err := readCheckedRecord(f, PodReferencesName)
 	if err != nil {
 		return nil, fmt.Errorf("read pod references %s: %w", podID, err)
 	}

@@ -295,3 +295,86 @@ func TestRootsReadRefusesAFIFOWithoutBlocking(t *testing.T) {
 		})
 	}
 }
+
+// TestPodImageRootsRefusesAFIFOWithoutBlocking pins that PodImageRoots opens a
+// pod's record the way Roots does: non-blocking, so a FIFO planted at
+// PodReferencesName is refused on its descriptor instead of hanging the caller
+// waiting for a writer; and bounded, so a record past maxPodReferencesBytes is
+// refused rather than read whole. Each returns an error carrying the refusal's
+// cause and no roots.
+func TestPodImageRootsRefusesAFIFOWithoutBlocking(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		plant     func(t *testing.T, path string)
+		wantCause string
+	}{
+		{
+			name: "fifo at the record name",
+			plant: func(t *testing.T, path string) {
+				if err := unix.Mkfifo(path, 0o644); err != nil {
+					t.Fatalf("mkfifo: %v", err)
+				}
+			},
+			wantCause: "not a regular file",
+		},
+		{
+			name: "regular file one byte over the cap",
+			plant: func(t *testing.T, path string) {
+				// JSON whitespace: under the cap it would fail to decode with a
+				// different cause, so only the bound can produce the wanted one.
+				body := make([]byte, maxPodReferencesBytes+1)
+				for i := range body {
+					body[i] = ' '
+				}
+				if err := os.WriteFile(path, body, 0o644); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			},
+			wantCause: "exceeds",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newGCFixture(t)
+			pid := f.pod("pod-a")
+			path := filepath.Join(f.cache.PodDir(pid), PodReferencesName)
+			// f.pod wrote a valid record; the planted entry replaces it.
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove record: %v", err)
+			}
+			tc.plant(t, path)
+
+			type result struct {
+				roots []ImageRoot
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				roots, err := f.cache.PodImageRoots(pid)
+				done <- result{roots, err}
+			}()
+			var got result
+			select {
+			case got = <-done:
+			case <-time.After(5 * time.Second):
+				// Release a reader blocked on the FIFO so the goroutine ends.
+				if w, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+					_ = w.Close()
+				}
+				t.Fatalf("PodImageRoots did not return within 5s: the record read blocked")
+			}
+			if got.err == nil {
+				t.Fatalf("PodImageRoots err = nil, roots = %v; want a refusal", got.roots)
+			}
+			if got.roots != nil {
+				t.Fatalf("PodImageRoots returned %v alongside the refusal; want nil", got.roots)
+			}
+			if !strings.Contains(got.err.Error(), tc.wantCause) {
+				t.Fatalf("PodImageRoots err = %q; want it to carry %q", got.err, tc.wantCause)
+			}
+		})
+	}
+}
