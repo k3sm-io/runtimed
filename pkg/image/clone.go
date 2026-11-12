@@ -436,36 +436,21 @@ func byteCopyAt(src string, dir *os.File, name string) error {
 	return nil
 }
 
-// byteCopyFile copies src to dst preserving permission bits. dst must not exist.
-// On a copy or close error the partially written dst is removed.
+// byteCopyFile copies src to dst preserving permission bits. dst must not exist;
+// a link at dst is refused, never followed. It opens dst's parent directory and
+// delegates to byteCopyAt, so the create and, on a copy or close error, the
+// removal of the partial file are both relative to that directory descriptor:
+// the removal is an unlinkat(2) of the base name, which never removes a
+// directory swapped in at dst after the create.
 func byteCopyFile(src, dst string) error {
-	in, err := os.Open(src)
+	parent := filepath.Dir(dst)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	dir, err := os.OpenFile(parent, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	_, err = copyContent(out, in)
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		// Remove the partial file, by the same path it was created at, so a
-		// later materialization does not keep a truncated file.
-		if rerr := os.Remove(dst); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			return errors.Join(err, rerr)
-		}
-		return err
-	}
-	return nil
+	defer dir.Close()
+	return byteCopyAt(src, dir, filepath.Base(dst))
 }

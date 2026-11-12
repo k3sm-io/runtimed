@@ -104,3 +104,40 @@ func TestByteCopyFailureLeavesNoPartialFile(t *testing.T) {
 		t.Fatalf("second materialization: got %d bytes, want the whole %d-byte file", len(got), len(payload))
 	}
 }
+
+// TestByteCopyFileFailureRemovesOnlyItsOwnFile checks that the cleanup after a
+// failed byte copy removes only the file byteCopyFile created: when the
+// destination name is swapped for an empty directory before the copy fails,
+// the directory survives (a by-path os.Remove would rmdir it) and the returned
+// error still carries the copy failure.
+func TestByteCopyFileFailureRemovesOnlyItsOwnFile(t *testing.T) {
+	tmp := t.TempDir()
+	srcFile := filepath.Join(tmp, "src")
+	if err := os.WriteFile(srcFile, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(tmp, "dst")
+
+	orig := copyContent
+	copyContent = func(io.Writer, io.Reader) (int64, error) {
+		if err := os.Remove(dst); err != nil {
+			t.Errorf("remove created file: %v", err)
+		}
+		if err := os.Mkdir(dst, 0o755); err != nil {
+			t.Errorf("mkdir in its place: %v", err)
+		}
+		return 0, errInjectedRead
+	}
+	defer func() { copyContent = orig }()
+
+	if err := byteCopyFile(srcFile, dst); !errors.Is(err, errInjectedRead) {
+		t.Fatalf("byteCopyFile with a failing copy: err = %v, want %v", err, errInjectedRead)
+	}
+	info, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatalf("the directory swapped in at the destination was removed: lstat err = %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("destination mode = %v, want the swapped-in directory", info.Mode())
+	}
+}
