@@ -96,9 +96,25 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	c.nextLease++
+	c.leaseGen++
 	l := &Lease{c: c, id: c.nextLease, digests: held, expires: c.now().Add(ttl)}
 	c.leases[l.id] = l
 	return l
+}
+
+// leaseGeneration returns the lease generation, which moves on every
+// AcquireLease, and AcquireLease is the only thing that moves it. That is
+// enough under the rule pinnedNow already relies on: a pull that writes a
+// record or a hold naming a blob takes a lease on it first and keeps it until
+// the write is done, so a root written after a generation read either belongs
+// to a lease that is still live or follows a bump that read did not see. A
+// writer that roots a blob WITHOUT a lease is outside what the generation (or
+// pinnedNow) can see. The prune executor compares it before each entry to
+// know when its pin set may be stale.
+func (c *Cache) leaseGeneration() uint64 {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	return c.leaseGen
 }
 
 // leasedDigests returns the set of digests currently pinned by a live lease,

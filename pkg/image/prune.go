@@ -503,8 +503,14 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	}
 	defer root.Close()
 
+	// The generation is read BEFORE the pins it vouches for, for the same
+	// reason pinnedNow reads leases before roots: a lease acquired after this
+	// read moves the generation, and one acquired before it is seen by the pin
+	// read (live) or left a root that read sees (released).
 	var pins map[string]PruneReason
+	var gen uint64
 	if pinned != nil {
+		gen = c.leaseGeneration()
 		if pins, err = pinned(); err != nil {
 			return nil, fmt.Errorf("execute prune: %w", err)
 		}
@@ -521,6 +527,14 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 		}
 		if c.beforePruneBlob != nil {
 			c.beforePruneBlob(d.Node.Digest)
+		}
+		if pinned != nil {
+			if g := c.leaseGeneration(); g != gen {
+				gen = g
+				if pins, err = pinned(); err != nil {
+					return nil, fmt.Errorf("execute prune: %w", err)
+				}
+			}
 		}
 		if why, ok := pins[d.Node.Digest]; ok && d.Node.Digest != "" {
 			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
