@@ -107,9 +107,9 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 }
 
 // beginLeaseWatch starts collecting the digests of every lease acquired from
-// now on (see Cache.leaseWatch). It is called under pruneMu, which every
-// executePrune caller takes for the whole pass, so at most one watch is open
-// at a time and begin/end never nest.
+// now on (see Cache.leaseWatch). Its only caller is executePrune, which takes
+// pruneMu itself for the whole pass, so at most one watch is open at a time
+// and begin/end never nest.
 func (c *Cache) beginLeaseWatch() {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
