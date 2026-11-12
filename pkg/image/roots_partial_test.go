@@ -42,15 +42,23 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 		wantErr  bool
 		// wantPod is the pod the refusal must name.
 		wantPod string
-		want    int
+		// wantCause, when set, is text the refusal must also contain: the
+		// distinguishing words of the parseBlobDigest branch that produced it.
+		// Roots renders the cause with %v, so only the text is matchable.
+		wantCause string
+		// wantNoCause, when set, is text the refusal must not contain, to tell
+		// two branches that share a sentinel apart.
+		wantNoCause string
+		want        int
 	}{
 		{
 			name: "one record, valid image then an unusable digest",
 			records: map[string][]ImageRoot{
 				"pod-a": {good("a:v1", "1"), bad},
 			},
-			wantErr: true,
-			wantPod: "pod-a",
+			wantErr:   true,
+			wantPod:   "pod-a",
+			wantCause: "found non-hex character in hash",
 		},
 		{
 			name: "two records, the first valid and the second with an unusable digest",
@@ -74,16 +82,19 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 			records: map[string][]ImageRoot{
 				"pod-a": {noColon},
 			},
-			wantErr: true,
-			wantPod: "pod-a",
+			wantErr:     true,
+			wantPod:     "pod-a",
+			wantCause:   "malformed digest",
+			wantNoCause: "found non-hex character in hash",
 		},
 		{
 			name: "digest with an unsupported algorithm",
 			records: map[string][]ImageRoot{
 				"pod-a": {unsupported},
 			},
-			wantErr: true,
-			wantPod: "pod-a",
+			wantErr:   true,
+			wantPod:   "pod-a",
+			wantCause: "unsupported digest algorithm",
 		},
 		{
 			name: "two records, the first in sorted order unusable and the second valid",
@@ -156,6 +167,12 @@ func TestRootsReturnsNothingOnABadDigest(t *testing.T) {
 				}
 				if want := `pod "` + tc.wantPod + `"`; !strings.Contains(err.Error(), want) {
 					t.Fatalf("Roots err = %q; want it to name %s", err, want)
+				}
+				if tc.wantCause != "" && !strings.Contains(err.Error(), tc.wantCause) {
+					t.Fatalf("Roots err = %q; want it to carry the cause %q", err, tc.wantCause)
+				}
+				if tc.wantNoCause != "" && strings.Contains(err.Error(), tc.wantNoCause) {
+					t.Fatalf("Roots err = %q; must not carry %q", err, tc.wantNoCause)
 				}
 				return
 			}
