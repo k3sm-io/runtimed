@@ -1007,12 +1007,16 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init image index: %w", err)
 	}
+	// ONE space ledger for both pull paths: the image puller and the artifact
+	// puller reserve declared bytes on it before they fetch, so neither can
+	// overcommit the store volume against the other.
+	space := &image.SpaceLedger{}
 	puller := deps.Puller
 	if puller == nil {
 		// image.RemoteFetch is named explicitly: it is the decision that chooses
 		// which platform's bytes a pod runs, so the daemon states its production
 		// fetcher here instead of inheriting a constructor default.
-		opts := []image.PullerOption{image.WithPullLogger(log)}
+		opts := []image.PullerOption{image.WithPullLogger(log), image.WithSpaceLedger(space)}
 		if len(deps.ClusterRegistries) > 0 {
 			// image.RemoteInsecureFetch is named here for the same reason
 			// RemoteFetch is: it is the transport decision for a named set of
@@ -1044,7 +1048,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	artifacts := deps.ArtifactPuller
 	if artifacts == nil && deps.FlatRegistry.Host != "" {
-		a, err := newArtifactPuller(cache, index, deps.FlatRegistry, log)
+		a, err := newArtifactPuller(cache, index, deps.FlatRegistry, space, log)
 		if err != nil {
 			return nil, fmt.Errorf("init artifact puller: %w", err)
 		}

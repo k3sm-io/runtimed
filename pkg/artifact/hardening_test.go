@@ -91,7 +91,14 @@ func TestSpaceArithmeticRefusesOverflow(t *testing.T) {
 		t.Errorf("spaceNeeded over 2^64: err = %v, want ErrSizeOverflow", err)
 	}
 	// A ledger already near the top must not wrap into "fits".
-	p.resv.held = math.MaxUint64 - 10
+	ledger := &image.SpaceLedger{}
+	if _, err := ledger.Reserve(context.Background(), image.SpaceClaim{
+		Need:      math.MaxUint64 - 10,
+		FreeBytes: func(string) (uint64, error) { return math.MaxUint64, nil },
+	}); err != nil {
+		t.Fatalf("fill the ledger: %v", err)
+	}
+	p.ledger = ledger
 	if _, err := p.reserve(context.Background(), []blob{{digest: digestOfBytes([]byte("c")), size: 100}}); !errors.Is(err, ErrSizeOverflow) {
 		t.Errorf("reserve over a near-full ledger: err = %v, want ErrSizeOverflow", err)
 	}

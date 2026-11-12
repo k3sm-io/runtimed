@@ -770,8 +770,9 @@ func (r *Runtime) viewSweeper() func(context.Context) error {
 
 // newArtifactPuller builds the daemon's own artifact puller over the same cache
 // and index the image puller uses, fetching only from the flat registry's
-// canonical host through that registry's own transport.
-func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.FlatRegistry, log *slog.Logger) (*artifact.Puller, error) {
+// canonical host through that registry's own transport. space is the ledger the
+// image puller reserves on too.
+func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.FlatRegistry, space *image.SpaceLedger, log *slog.Logger) (*artifact.Puller, error) {
 	tr, plain, err := image.ArtifactTransport(flat)
 	if err != nil {
 		return nil, err
@@ -783,6 +784,7 @@ func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.Fl
 		PartialDir: filepath.Join(cache.Root(), sandbox.ArtifactPartialSubdir),
 		StorePath:  cache.Root(),
 		Log:        log,
+		Ledger:     space,
 	}, artifact.Deps{
 		Blobs: cache, Leases: cache, Reclaimer: cache, Index: index,
 		Fetcher: &artifact.RegistryFetcher{Transport: tr, PlainHTTP: plain},
