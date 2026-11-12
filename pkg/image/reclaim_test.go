@@ -755,6 +755,125 @@ func TestReclaimKeepsBlobHeldBetweenPlanAndUnlink(t *testing.T) {
 	})
 }
 
+// TestReclaimHeldBlobEdges drives two edges of the same plan-to-unlink window
+// TestReclaimKeepsBlobHeldBetweenPlanAndUnlink covers:
+//
+//   - a blob shared by two pods' artifact holds, one of which is released
+//     inside the window: the other hold still roots it, so it is kept
+//     (ReasonKeptInUse) while an unreferenced blob in the same pass goes;
+//   - a hold, record and lease all taken AND released inside the window, with
+//     no root left behind: the blob is reclaimed in that same pass, so the
+//     executor's re-check does not over-retain.
+func TestReclaimHeldBlobEdges(t *testing.T) {
+	t.Parallel()
+
+	manifestDigest := func(s string) string {
+		sum := sha256.Sum256([]byte(s))
+		return "sha256:" + hex.EncodeToString(sum[:])
+	}
+
+	t.Run("a shared blob stays while one of its two holders is released", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		shared := f.blob("layer shared by two artifacts", 24*time.Hour)
+		stray := f.blob("unreferenced layer", 24*time.Hour)
+		podA := f.pod("pod-a")
+		podB := f.pod("pod-b")
+		x, err := NewFileIndex(f.cache)
+		if err != nil {
+			t.Fatalf("NewFileIndex: %v", err)
+		}
+		key := "registry.example/models/shared:v1@" + testModelType
+
+		ran := false
+		cfg := midPassReclaimConfig()
+		cfg.afterRoots = func() {
+			ran = true
+			lease := f.cache.AcquireLease([]string{shared}, time.Minute)
+			defer lease.Release()
+			putTypedArtifact(t, x, key, testModelType, shared, shared)
+			for _, h := range []struct {
+				pod  PodID
+				name string
+			}{{podA, "manifest a"}, {podB, "manifest b"}} {
+				if err := x.AddArtifactHoldManifest(context.Background(), h.pod, HeldManifest{
+					Digest: manifestDigest(h.name), Config: shared, Layers: []string{shared},
+				}); err != nil {
+					t.Errorf("AddArtifactHoldManifest(%s): %v", h.pod, err)
+				}
+			}
+			// One holder goes away before the executor runs; the other stays.
+			if err := x.RemoveArtifactHold(podA); err != nil {
+				t.Errorf("RemoveArtifactHold: %v", err)
+			}
+		}
+		rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		if !ran {
+			t.Fatalf("afterRoots never ran, so the window was not driven")
+		}
+		if !f.exists(shared) {
+			t.Errorf("a blob one live hold still names was deleted when the other hold was released")
+		}
+		if reason := keptReason(rep, shared); reason != ReasonKeptInUse {
+			t.Errorf("shared blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+		}
+		if f.exists(stray) {
+			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+		}
+	})
+
+	t.Run("a hold taken and released inside the window leaves the blob collectable", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		transient := f.blob("layer held only inside the window", 24*time.Hour)
+		stray := f.blob("unreferenced layer", 24*time.Hour)
+		pid := f.pod("pod-transient")
+		x, err := NewFileIndex(f.cache)
+		if err != nil {
+			t.Fatalf("NewFileIndex: %v", err)
+		}
+		key := "registry.example/models/transient:v1@" + testModelType
+
+		ran := false
+		cfg := midPassReclaimConfig()
+		cfg.afterRoots = func() {
+			ran = true
+			lease := f.cache.AcquireLease([]string{transient}, time.Minute)
+			putTypedArtifact(t, x, key, testModelType, transient, transient)
+			if err := x.AddArtifactHoldManifest(context.Background(), pid, HeldManifest{
+				Digest: manifestDigest("transient manifest"), Config: transient, Layers: []string{transient},
+			}); err != nil {
+				t.Errorf("AddArtifactHoldManifest: %v", err)
+			}
+			// Everything the pull wrote is undone before the executor runs.
+			if err := x.RemoveArtifactHold(pid); err != nil {
+				t.Errorf("RemoveArtifactHold: %v", err)
+			}
+			if _, err := x.RemoveArtifactRecord(context.Background(), key); err != nil {
+				t.Errorf("RemoveArtifactRecord: %v", err)
+			}
+			lease.Release()
+		}
+		rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		if !ran {
+			t.Fatalf("afterRoots never ran, so the window was not driven")
+		}
+		if f.exists(transient) {
+			t.Errorf("a blob with no hold, record or lease left was kept (reason %q): over-retention",
+				keptReason(rep, transient))
+		}
+		if f.exists(stray) {
+			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+		}
+	})
+}
+
 // midPassReclaimConfig is a pass under permanent pressure with no grace, so
 // every blob nothing protects is condemned.
 func midPassReclaimConfig() ReclaimConfig {
