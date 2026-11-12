@@ -106,6 +106,9 @@ func TestManifestFetchRedirectDoesNotReachTokenLogic(t *testing.T) {
 			if len(foreignA) != 0 {
 				t.Errorf("redirect target received Authorization %q; want none", foreignA)
 			}
+			if len(scopes) == 0 {
+				t.Fatal("token endpoint never hit; the push-scope check is vacuous")
+			}
 			for _, s := range scopes {
 				if strings.Contains(s, "push") {
 					t.Errorf("token endpoint asked for scope %q; want no push scope (all: %q)", s, scopes)
