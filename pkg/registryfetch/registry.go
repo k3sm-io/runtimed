@@ -152,7 +152,25 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 	if err != nil {
 		return nil, nil, err
 	}
-	repo := r.Context()
+	split, err := g.OriginSplit(ctx, r.Context(), cred)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r, &http.Client{Transport: split}, nil
+}
+
+// OriginSplit returns the round tripper Session's client uses for repo: a
+// request whose scheme and host:port are repo's registry's goes through an
+// authenticating transport scoped to pull, and any other goes to the plain
+// Transport. A response from another origin reaches the caller without its
+// WWW-Authenticate challenges, so an authenticating layer a caller stacks on
+// top (go-containerregistry's remote package always adds one) cannot turn a
+// redirect target's 401 into a token request. Pass it to remote.WithTransport
+// without remote.WithAuth.
+func (g *Registry) OriginSplit(ctx context.Context, repo name.Repository, cred *Credential) (http.RoundTripper, error) {
+	if g.Transport == nil {
+		return nil, ErrTransportRequired
+	}
 	newAuth := g.newAuth
 	if newAuth == nil {
 		newAuth = transport.NewWithContext
@@ -160,20 +178,20 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 	rt, err := newAuth(ctx, repo.Registry, authenticator(cred), g.Transport,
 		[]string{repo.Scope(transport.PullScope)})
 	if err != nil {
-		return nil, nil, fmt.Errorf("registry auth: %w", bound(err))
+		return nil, fmt.Errorf("registry auth: %w", bound(err))
 	}
-	split := &hostSplit{
+	return &hostSplit{
 		scheme: repo.Registry.Scheme(),
 		host:   canonicalHost(repo.Registry.Scheme(), repo.RegistryStr()),
 		auth:   rt,
 		plain:  g.Transport,
-	}
-	return r, &http.Client{Transport: split}, nil
+	}, nil
 }
 
 // hostSplit routes a request to auth when its scheme and host:port are the
 // registry's, and to plain otherwise, so the authenticating transport never
-// sees a request for another origin.
+// sees a request for another origin. A plain response loses its
+// WWW-Authenticate header, so no layer above can act on its challenge.
 type hostSplit struct {
 	scheme, host string
 	auth, plain  http.RoundTripper
@@ -185,7 +203,11 @@ func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
 	if scheme == h.scheme && canonicalHost(scheme, req.URL.Host) == h.host {
 		return h.auth.RoundTrip(req)
 	}
-	return h.plain.RoundTrip(req)
+	res, err := h.plain.RoundTrip(req)
+	if res != nil {
+		res.Header.Del("WWW-Authenticate")
+	}
+	return res, err
 }
 
 // canonicalHost is host lower-cased with the scheme's default port filled in
