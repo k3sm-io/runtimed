@@ -759,8 +759,11 @@ func TestReclaimKeepsBlobHeldBetweenPlanAndUnlink(t *testing.T) {
 // TestReclaimKeepsBlobHeldBetweenPlanAndUnlink covers:
 //
 //   - a blob shared by two pods' artifact holds, one of which is released
-//     inside the window: the other hold still roots it, so it is kept
-//     (ReasonKeptInUse) while an unreferenced blob in the same pass goes;
+//     inside the window, whose artifact record still stands: it is kept
+//     (ReasonKeptInUse) while an unreferenced blob in the same pass goes. The
+//     record alone roots it (artifactRoots: a record is a root while it
+//     exists), as the control with BOTH holds released shows, so this edge
+//     does not isolate pod-b's remaining hold;
 //   - a hold, record and lease all taken AND released inside the window, with
 //     no root left behind: the blob is reclaimed in that same pass, so the
 //     executor's re-check does not over-retain.
@@ -772,7 +775,7 @@ func TestReclaimHeldBlobEdges(t *testing.T) {
 		return "sha256:" + hex.EncodeToString(sum[:])
 	}
 
-	t.Run("a shared blob stays while one of its two holders is released", func(t *testing.T) {
+	t.Run("a shared blob stays while its record stands and one of its two holds is released", func(t *testing.T) {
 		t.Parallel()
 		f := newGCFixture(t)
 		shared := f.blob("layer shared by two artifacts", 24*time.Hour)
@@ -819,6 +822,64 @@ func TestReclaimHeldBlobEdges(t *testing.T) {
 		}
 		if reason := keptReason(rep, shared); reason != ReasonKeptInUse {
 			t.Errorf("shared blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+		}
+		if f.exists(stray) {
+			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+		}
+	})
+
+	t.Run("a recorded blob stays when both of its holds are released", func(t *testing.T) {
+		t.Parallel()
+		f := newGCFixture(t)
+		shared := f.blob("layer whose two holds both go", 24*time.Hour)
+		stray := f.blob("unreferenced layer", 24*time.Hour)
+		podA := f.pod("pod-a")
+		podB := f.pod("pod-b")
+		x, err := NewFileIndex(f.cache)
+		if err != nil {
+			t.Fatalf("NewFileIndex: %v", err)
+		}
+		key := "registry.example/models/shared:v1@" + testModelType
+
+		ran := false
+		cfg := midPassReclaimConfig()
+		cfg.afterRoots = func() {
+			ran = true
+			lease := f.cache.AcquireLease([]string{shared}, time.Minute)
+			defer lease.Release()
+			putTypedArtifact(t, x, key, testModelType, shared, shared)
+			for _, h := range []struct {
+				pod  PodID
+				name string
+			}{{podA, "manifest a"}, {podB, "manifest b"}} {
+				if err := x.AddArtifactHoldManifest(context.Background(), h.pod, HeldManifest{
+					Digest: manifestDigest(h.name), Config: shared, Layers: []string{shared},
+				}); err != nil {
+					t.Errorf("AddArtifactHoldManifest(%s): %v", h.pod, err)
+				}
+			}
+			// Both holders go away before the executor runs; the record stays.
+			for _, pid := range []PodID{podA, podB} {
+				if err := x.RemoveArtifactHold(pid); err != nil {
+					t.Errorf("RemoveArtifactHold(%s): %v", pid, err)
+				}
+			}
+		}
+		rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("ReclaimUnderPressure: %v", err)
+		}
+		if !ran {
+			t.Fatalf("afterRoots never ran, so the window was not driven")
+		}
+		// The artifact record is a root on its own, so with no hold left the
+		// blob is still kept: in the subtest above it is the record, not
+		// pod-b's remaining hold, that keeps the shared blob.
+		if !f.exists(shared) {
+			t.Errorf("a blob its artifact record still names was deleted once both holds were released")
+		}
+		if reason := keptReason(rep, shared); reason != ReasonKeptInUse {
+			t.Errorf("recorded blob kept for reason %q; want %q", reason, ReasonKeptInUse)
 		}
 		if f.exists(stray) {
 			t.Errorf("the unreferenced blob survived, so the pass proved nothing")
