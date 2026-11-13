@@ -108,7 +108,22 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 	t.Run("second-waits-and-returns-the-first-result", func(t *testing.T) {
 		rt, pn, first := heldDelete(t, podID)
 
+		rt.mu.Lock()
+		td := rt.deleting[podID]
+		rt.mu.Unlock()
+		if td == nil {
+			t.Fatal("no teardown record while the first DeletePod is held in its teardown")
+		}
 		second := startDelete(context.Background(), rt, podID)
+		// The deterministic signal: the second call has parked on the record.
+		parked := time.Now().Add(10 * time.Second)
+		for td.waiters.Load() == 0 {
+			if time.Now().After(parked) {
+				t.Fatal("the second DeletePod never started waiting on the teardown in flight")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		// The secondary check: once parked it stays parked while the teardown runs.
 		select {
 		case res := <-second:
 			t.Fatalf("second DeletePod returned (%v, %v) while the first teardown was still running", res.resp, res.err)
@@ -168,4 +183,36 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 			t.Fatalf("network Teardown calls = %v, want exactly one", got)
 		}
 	})
+}
+
+// TestFinishTeardownNotCompleted: a teardown that did not return normally (it
+// panicked; DeletePod's deferred finishTeardown still runs) must hand its
+// waiters an Internal error, never the (nil, nil) a success would look like,
+// and must still retire its record.
+func TestFinishTeardownNotCompleted(t *testing.T) {
+	const podID = "pod-panicked"
+	rt := newTestRuntime(t, Deps{})
+	td := &podTeardown{done: make(chan struct{})}
+	rt.mu.Lock()
+	rt.deleting[podID] = td
+	rt.mu.Unlock()
+
+	waiter := make(chan deleteResult, 1)
+	go func() {
+		resp, err := td.wait(context.Background(), rt.log, podID)
+		waiter <- deleteResult{resp: resp, err: err}
+	}()
+
+	rt.finishTeardown(podID, td, nil, nil, false)
+
+	w := awaitDelete(t, waiter, "waiter")
+	if code := status.Code(w.err); code != codes.Internal || w.resp != nil {
+		t.Fatalf("waiter = (%v, %v), want (nil, an Internal status)", w.resp, w.err)
+	}
+	rt.mu.Lock()
+	_, inFlight := rt.deleting[podID]
+	rt.mu.Unlock()
+	if inFlight {
+		t.Fatal("teardown record still present after an incomplete teardown")
+	}
 }

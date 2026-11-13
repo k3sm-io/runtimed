@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -132,7 +134,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	r.mu.Unlock()
 	if !ok {
 		if td != nil {
-			return td.wait(ctx)
+			return td.wait(ctx, r.log, podID)
 		}
 		// Idempotent. A pod this daemon does not hold (one not re-attached
 		// after a restart) may still have an artifact hold; its delete ends it.
@@ -142,15 +144,28 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 
 	var resp *runtimev1.DeletePodResponse
 	var err error
-	// Deferred so the record is retired on every return path of the teardown.
-	defer func() { r.finishTeardown(podID, td, resp, err) }()
+	completed := false
+	// Deferred so the record is retired on every exit of the teardown,
+	// including a panic, which is not recovered and still propagates; its
+	// waiters then get errTeardownIncomplete rather than (nil, nil).
+	defer func() { r.finishTeardown(podID, td, resp, err, completed) }()
 	resp, err = r.teardownPod(ctx, p, req)
+	completed = true
 	return resp, err
 }
 
 // podTeardown is one DeletePod teardown in flight, recorded in
 // Runtime.deleting from the moment the pod leaves Runtime.pods until the
 // teardown returns.
+//
+// A teardown step that never returns keeps the record for good: every later
+// DeletePod for the id then waits and ends with its own ctx error, never a
+// false success, and only a daemon restart clears it. A first caller whose ctx
+// is cancelled does not abandon the teardown: each graceful stop it is in
+// (supervisor.GracefulStop, for a host container and for the vm host helper
+// alike) cuts the grace short and sends SIGKILL at once, and every later step
+// (the late-group kill, the tree sweep, the log drain, the record retirement)
+// still runs to completion, because none of them waits on that ctx.
 //
 // Locking discipline: the map entry is inserted, looked up and removed only
 // under Runtime.mu, and never with p.mu held (mu is taken alone, as every
@@ -162,25 +177,43 @@ type podTeardown struct {
 	done chan struct{}
 	resp *runtimev1.DeletePodResponse
 	err  error
+	// waiters counts the DeletePods that have started waiting on this
+	// teardown. It is read only by tests, as the signal that a waiter is
+	// parked.
+	waiters atomic.Int32
 }
 
 // wait blocks until the teardown finishes and returns its result, or returns
 // ctx's error as a gRPC status (DeadlineExceeded / Canceled) if ctx ends
 // first. It never reports success for a teardown still running.
-func (td *podTeardown) wait(ctx context.Context) (*runtimev1.DeletePodResponse, error) {
+func (td *podTeardown) wait(ctx context.Context, log *slog.Logger, podID string) (*runtimev1.DeletePodResponse, error) {
+	td.waiters.Add(1)
 	select {
 	case <-td.done:
 		return td.resp, td.err
 	case <-ctx.Done():
+		log.Warn("DeletePod ended before the pod's teardown in flight finished",
+			"pod", podID, "err", ctx.Err())
 		return nil, status.FromContextError(ctx.Err()).Err()
 	}
 }
 
+// errTeardownIncomplete is what the waiters of a teardown get when it did not
+// return normally (it panicked).
+func errTeardownIncomplete(podID string) error {
+	return status.Errorf(codes.Internal, "teardown of pod %q did not complete", podID)
+}
+
 // finishTeardown publishes a teardown's result to its waiters and retires the
-// record. It removes the map entry only if it is still this teardown's: a
-// CreatePod may re-register the id while the teardown runs, and that pod's
-// own DeletePod then owns the entry.
-func (r *Runtime) finishTeardown(podID string, td *podTeardown, resp *runtimev1.DeletePodResponse, err error) {
+// record. completed is false when the teardown did not return normally; the
+// waiters then get errTeardownIncomplete in place of resp and err. It removes
+// the map entry only if it is still this teardown's: a CreatePod may
+// re-register the id while the teardown runs, and that pod's own DeletePod
+// then owns the entry.
+func (r *Runtime) finishTeardown(podID string, td *podTeardown, resp *runtimev1.DeletePodResponse, err error, completed bool) {
+	if !completed {
+		resp, err = nil, errTeardownIncomplete(podID)
+	}
 	td.resp, td.err = resp, err
 	r.mu.Lock()
 	if r.deleting[podID] == td {
