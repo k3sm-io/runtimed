@@ -147,7 +147,10 @@ func (r *Reservation) Release() {
 //     repeated; still short is ErrInsufficientSpace.
 //   - A failed plan also runs no real pass. When ctx is done, or the plan's
 //     error is context.Canceled or context.DeadlineExceeded, the error wraps
-//     the context error and is not ErrInsufficientSpace. Any other plan error
+//     the context error and is not ErrInsufficientSpace. When ctx is done and
+//     the plan's error is not that context error, the plan's cause is named in
+//     the text, bounded by boundErr, as text only: the result does not match
+//     the cause (for example ErrFreeSpaceUnknown). Any other plan error
 //     is a refusal that matches both ErrInsufficientSpace and the plan's own
 //     cause (for example ErrFreeSpaceUnknown), its text bounded by boundErr.
 //
@@ -220,9 +223,16 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		if derr != nil {
 			// A cancelled or expired context is the caller giving up, not a
 			// lack of space: report the context's error, not a refusal.
+			// When the plan failed for its own reason, that cause is kept as
+			// bounded text only (%v), so the result still matches nothing but
+			// the context error and status mapping stays a context answer.
 			if cerr := ctx.Err(); cerr != nil {
-				return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan interrupted: %w",
-					c.Need, avail, c.FloorBytes, cerr)
+				if errors.Is(derr, cerr) {
+					return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan interrupted: %w",
+						c.Need, avail, c.FloorBytes, cerr)
+				}
+				return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan interrupted (plan failed: %v): %w",
+					c.Need, avail, c.FloorBytes, boundErr(derr), cerr)
 			}
 			if errors.Is(derr, context.Canceled) || errors.Is(derr, context.DeadlineExceeded) {
 				return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan interrupted: %w",

@@ -507,6 +507,9 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 		wantErr  error
 		alsoErr  error
 		notErr   error
+		alsoNot  error
+		wantMsg  string
+		notMsg   string
 		maxLen   int
 		wantDry  int32
 		wantReal int32
@@ -515,8 +518,19 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 		{name: "exactly_reclaimable", need: free + reclaimable - floor, wantDry: 1, wantReal: 1},
 		{name: "dry_run_error", need: free, dryErr: errors.New("inventory: EIO"), wantErr: ErrInsufficientSpace, wantDry: 1},
 		{name: "above_capacity_with_held", need: capacity / 2, held: capacity/2 - floor + 1, wantErr: ErrInsufficientSpace},
-		{name: "dry_run_context_canceled", need: free, cancel: true, dryErr: context.Canceled,
-			wantErr: context.Canceled, notErr: ErrInsufficientSpace, wantDry: 1},
+		// The plan's error is the context error itself, so nothing of the
+		// plan's wrapping is named; checked before the plan's own error, the
+		// wrapping would appear.
+		{name: "dry_run_context_canceled", need: free, cancel: true, dryErr: fmt.Errorf("dry-run walk: %w", context.Canceled),
+			wantErr: context.Canceled, notErr: ErrInsufficientSpace, notMsg: "dry-run walk", wantDry: 1},
+		// A done context wins over the plan's own cause, which is named as
+		// text only.
+		{name: "dry_run_canceled_free_space_unknown", need: free, cancel: true,
+			dryErr:  fmt.Errorf("%w: statfs: EIO", ErrFreeSpaceUnknown),
+			wantErr: context.Canceled, notErr: ErrInsufficientSpace, alsoNot: ErrFreeSpaceUnknown,
+			wantMsg: "statfs: EIO", wantDry: 1},
+		{name: "dry_run_deadline_live_context", need: free, dryErr: context.DeadlineExceeded,
+			wantErr: context.DeadlineExceeded, notErr: ErrInsufficientSpace, wantDry: 1},
 		{name: "dry_run_free_space_unknown", need: free, dryErr: fmt.Errorf("%w: statfs: EIO", ErrFreeSpaceUnknown),
 			wantErr: ErrInsufficientSpace, alsoErr: ErrFreeSpaceUnknown, wantDry: 1},
 		{name: "dry_run_long_cause", need: free, dryErr: errors.New(strings.Repeat("x", 10*maxWrappedErrLen)),
@@ -548,6 +562,15 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 			}
 			if tc.notErr != nil && errors.Is(err, tc.notErr) {
 				t.Errorf("Reserve error = %v, must not match %v", err, tc.notErr)
+			}
+			if tc.alsoNot != nil && errors.Is(err, tc.alsoNot) {
+				t.Errorf("Reserve error = %v, must not match %v", err, tc.alsoNot)
+			}
+			if tc.wantMsg != "" && !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("Reserve error = %v, want it to name %q", err, tc.wantMsg)
+			}
+			if tc.notMsg != "" && strings.Contains(err.Error(), tc.notMsg) {
+				t.Errorf("Reserve error = %v, must not name %q", err, tc.notMsg)
 			}
 			if tc.maxLen > 0 && len(err.Error()) > tc.maxLen {
 				t.Errorf("Reserve error is %d bytes, want at most %d", len(err.Error()), tc.maxLen)
