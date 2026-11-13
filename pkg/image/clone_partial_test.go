@@ -154,3 +154,63 @@ func TestByteCopyFileMissingSourceCreatesNoParent(t *testing.T) {
 		t.Fatalf("parent %s exists after failed clone: err = %v", newdir, err)
 	}
 }
+
+// TestByteCopyFileSourceOpenBeforeParent checks a missing or unreadable source
+// fails with its own error identity and leaves no new parent directory, and a
+// readable source still copies and creates the parent.
+func TestByteCopyFileSourceOpenBeforeParent(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, tmp string) string
+		wantErr error
+	}{
+		{"missing-source", func(t *testing.T, tmp string) string {
+			return filepath.Join(tmp, "missing")
+		}, os.ErrNotExist},
+		{"unreadable-source", func(t *testing.T, tmp string) string {
+			if os.Geteuid() == 0 {
+				t.Skip("root can read a mode 000 file")
+			}
+			src := filepath.Join(tmp, "src")
+			if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(src, 0); err != nil {
+				t.Fatal(err)
+			}
+			return src
+		}, os.ErrPermission},
+		{"readable-source", func(t *testing.T, tmp string) string {
+			src := filepath.Join(tmp, "src")
+			if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return src
+		}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			src := tc.prepare(t, tmp)
+			newdir := filepath.Join(tmp, "newdir")
+			dst := filepath.Join(newdir, "f")
+			err := byteCopyFile(src, dst)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("byteCopyFile: %v", err)
+				}
+				got, rerr := os.ReadFile(dst)
+				if rerr != nil || string(got) != "data" {
+					t.Fatalf("destination = %q, %v; want data", got, rerr)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErr)
+			}
+			if _, serr := os.Lstat(newdir); !errors.Is(serr, os.ErrNotExist) {
+				t.Fatalf("parent %s exists after failed copy: err = %v", newdir, serr)
+			}
+		})
+	}
+}

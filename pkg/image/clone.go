@@ -402,6 +402,11 @@ func byteCopyAt(src string, dir *os.File, name string) error {
 		return err
 	}
 	defer in.Close()
+	return byteCopyFrom(in, dir, name)
+}
+
+// byteCopyFrom is byteCopyAt for an already open source.
+func byteCopyFrom(in *os.File, dir *os.File, name string) error {
 	info, err := in.Stat()
 	if err != nil {
 		return err
@@ -443,11 +448,13 @@ func byteCopyAt(src string, dir *os.File, name string) error {
 // the removal is an unlinkat(2) of the base name, which never removes a
 // directory swapped in at dst after the create.
 func byteCopyFile(src, dst string) error {
-	// Check the source first so a missing or unreadable one leaves no new
+	// Open the source first so a missing or unreadable one leaves no new
 	// parent directory behind.
-	if _, err := os.Stat(src); err != nil {
+	in, err := os.Open(src)
+	if err != nil {
 		return err
 	}
+	defer in.Close()
 	parent := filepath.Dir(dst)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -457,5 +464,5 @@ func byteCopyFile(src, dst string) error {
 		return err
 	}
 	defer dir.Close()
-	return byteCopyAt(src, dir, filepath.Base(dst))
+	return byteCopyFrom(in, dir, filepath.Base(dst))
 }
