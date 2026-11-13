@@ -145,6 +145,10 @@ func (r *Reservation) Release() {
 //     satisfy never empties the unreferenced cache. Only then does one real
 //     pass run, asked to bring free space up to the sum, and the check is
 //     repeated; still short is ErrInsufficientSpace.
+//     The dry plan and the real pass each work from their own snapshot: when the
+//     real pass frees less than the plan counted, the claim is refused after
+//     that one pass has evicted, and the pass itself stops at its target so it
+//     never evicts more than the claim asked for.
 //   - A failed plan also runs no real pass. When ctx is done, or the plan's
 //     error is context.Canceled or context.DeadlineExceeded, the error wraps
 //     the context error and is not ErrInsufficientSpace. When ctx is done and

@@ -593,6 +593,80 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 	}
 }
 
+// shortPassReclaimer plans planned bytes on a dry run and frees only freed
+// bytes (into *free) on a real pass, which returns realErr.
+type shortPassReclaimer struct {
+	dry, real atomic.Int32
+	planned   int64
+	freed     uint64
+	realErr   error
+	free      *atomic.Uint64
+}
+
+func (c *shortPassReclaimer) ReclaimUnderPressure(_ context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
+	if cfg.DryRun {
+		c.dry.Add(1)
+		return &ReclaimReport{DryRun: true, ReclaimedBytes: c.planned}, nil
+	}
+	c.real.Add(1)
+	c.free.Add(c.freed)
+	return &ReclaimReport{ReclaimedBytes: int64(c.freed)}, c.realErr
+}
+
+// TestReserveRealPassShortOfPlanRefusesAfterOnePass: the dry plan covers the
+// claim but the real pass frees less, so the claim is refused after exactly one
+// real pass (no retry) and nothing stays reserved. A real pass that returns an
+// error does not fail the claim by itself: free space is re-checked, so the
+// claim is refused when still short and admitted when the pass freed enough.
+func TestReserveRealPassShortOfPlanRefusesAfterOnePass(t *testing.T) {
+	const floor, free, planned, capacity = 100, 1_000, 2_000, 10_000
+	const need = free + planned - floor
+	for _, tc := range []struct {
+		name    string
+		freed   uint64
+		realErr error
+		wantErr error
+	}{
+		{name: "real_pass_frees_less_than_planned", freed: planned / 2, wantErr: ErrInsufficientSpace},
+		{name: "real_pass_error_still_short", freed: planned / 2, realErr: errors.New("evict: EIO"), wantErr: ErrInsufficientSpace},
+		{name: "real_pass_error_but_freed_enough", freed: planned, realErr: errors.New("evict: EIO")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var avail atomic.Uint64
+			avail.Store(free)
+			ledger := &SpaceLedger{}
+			rec := &shortPassReclaimer{planned: planned, freed: tc.freed, realErr: tc.realErr, free: &avail}
+			r, err := ledger.Reserve(context.Background(), SpaceClaim{
+				Need: need, Path: t.TempDir(), FloorBytes: floor,
+				FreeBytes:  func(string) (uint64, error) { return avail.Load(), nil },
+				TotalBytes: fixedTotalBytes(capacity), Reclaimer: rec,
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Reserve error = %v, want %v", err, tc.wantErr)
+			}
+			if got := rec.dry.Load(); got != 1 {
+				t.Errorf("dry-run passes = %d, want 1", got)
+			}
+			if got := rec.real.Load(); got != 1 {
+				t.Errorf("real reclaim passes = %d, want exactly 1", got)
+			}
+			wantHeld := uint64(0)
+			if tc.wantErr == nil {
+				wantHeld = need
+			}
+			if got := ledger.Reserved(); got != wantHeld {
+				t.Errorf("ledger holds %d bytes, want %d", got, wantHeld)
+			}
+			if r != nil {
+				r.Release()
+			}
+			if got := ledger.Reserved(); got != 0 {
+				t.Errorf("ledger holds %d bytes after release, want 0", got)
+			}
+		})
+	}
+}
+
 // TestPullRefusalBeyondReclaimableKeepsTheCache: through the real Puller and
 // Cache, a pull whose declaration is one byte past free space plus what reclaim
 // could free (but within capacity) is refused before any layer request and
