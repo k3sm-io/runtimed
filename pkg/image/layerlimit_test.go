@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -173,104 +174,73 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 
 	t.Run("pull", func(t *testing.T) {
 		for _, tc := range cases {
-			img := layerLimitImage(t, tc.layers)
-			cache, err := NewCache(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			ledger := &SpaceLedger{}
-			if !tc.refused {
-				// The accepted row is served in-process: 4096 GETs of one blob
-				// would prove nothing the refused row does not.
+			t.Run(fmt.Sprintf("in-process %d layers", tc.layers), func(t *testing.T) {
+				// Served by a static fetcher, so ingestVia is the only guard on
+				// the way: resolveRemote is not reached.
+				img := &configCountingImage{Image: layerLimitImage(t, tc.layers)}
+				cache, err := NewCache(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				obs := newAcquireObserver(cache)
 				p, err := NewPuller(cache, staticFetch(img), NoLocalIndex{},
-					WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(ledger))
+					WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(obs.ledger))
 				if err != nil {
 					t.Fatal(err)
 				}
 				res, err := p.Pull(context.Background(), "example.com/many:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-				if err != nil {
-					t.Fatalf("%d layers: Pull: %v", tc.layers, err)
+				if !tc.refused {
+					if err != nil {
+						t.Fatalf("Pull: %v", err)
+					}
+					defer res.Lease.Release()
+					requireManifestOf(t, res.Manifest, img)
+					obs.requireAcquired(t)
+					return
 				}
-				res.Lease.Release()
-				continue
-			}
-
-			reg := newBlobCountingRegistry(t)
-			ref := pushManyLayerImage(t, reg.host, "many", img)
-			reg.reset()
-			mfst, err := img.Manifest()
-			if err != nil {
-				t.Fatal(err)
-			}
-			p, err := NewPuller(cache, RemoteFetch, NoLocalIndex{},
-				WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(ledger))
-			if err != nil {
-				t.Fatalf("NewPuller: %v", err)
-			}
-			_, err = p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-			if !errors.Is(err, ErrTooManyLayers) {
-				t.Fatalf("%d layers: Pull error = %v, want ErrTooManyLayers", tc.layers, err)
-			}
-			if n := reg.layerGets(t, img); n != 0 {
-				t.Errorf("%d layers: registry saw %d layer GETs, want 0", tc.layers, n)
-			}
-			reg.mu.Lock()
-			cfgGets := reg.gets[mfst.Config.Digest.String()]
-			reg.mu.Unlock()
-			if cfgGets != 0 {
-				t.Errorf("%d layers: registry saw %d config GETs, want 0", tc.layers, cfgGets)
-			}
-			if n := leaseCount(cache); n != 0 {
-				t.Errorf("%d layers: %d leases held after the refusal, want 0", tc.layers, n)
-			}
-			if got := ledger.Reserved(); got != 0 {
-				t.Errorf("%d layers: ledger holds %d bytes after the refusal, want 0", tc.layers, got)
-			}
-		}
-	})
-
-	t.Run("ingest refuses before the lease", func(t *testing.T) {
-		// The ingest guard alone, reached without resolveRemote (a static
-		// fetcher stands in for the local, flat and mirror routes).
-		cache, err := NewCache(t.TempDir())
-		if err != nil {
-			t.Fatal(err)
-		}
-		ledger := &SpaceLedger{}
-		p, err := NewPuller(cache, staticFetch(layerLimitImage(t, MaxManifestLayers+1)), NoLocalIndex{},
-			WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(ledger))
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = p.Pull(context.Background(), "example.com/many:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-		if !errors.Is(err, ErrTooManyLayers) {
-			t.Fatalf("Pull error = %v, want ErrTooManyLayers", err)
-		}
-		if n := leaseCount(cache); n != 0 || ledger.Reserved() != 0 {
-			t.Errorf("leases = %d, reserved = %d after the refusal, want 0 and 0", n, ledger.Reserved())
+				if !errors.Is(err, ErrTooManyLayers) {
+					t.Fatalf("Pull error = %v, want ErrTooManyLayers", err)
+				}
+				if n := img.configReads.Load(); n != 0 {
+					t.Errorf("image config read %d times before the refusal, want 0", n)
+				}
+				obs.requireNoneAcquired(t)
+			})
+			t.Run(fmt.Sprintf("registry %d layers", tc.layers), func(t *testing.T) {
+				pullThroughRegistry(t, layerLimitImage(t, tc.layers), tc.refused, ErrTooManyLayers)
+			})
 		}
 	})
 
 	t.Run("oversized manifest bytes with few layers", func(t *testing.T) {
-		img := mutate.Annotations(layerLimitImage(t, 2),
-			map[string]string{"k3sm.io/pad": strings.Repeat("a", maxIndexManifestBytes)}).(ggcrv1.Image)
-		cache, err := NewCache(t.TempDir())
-		if err != nil {
-			t.Fatal(err)
+		padded := func(t *testing.T) ggcrv1.Image {
+			return mutate.Annotations(layerLimitImage(t, 2),
+				map[string]string{"k3sm.io/pad": strings.Repeat("a", maxIndexManifestBytes)}).(ggcrv1.Image)
 		}
-		ledger := &SpaceLedger{}
-		p, err := NewPuller(cache, staticFetch(img), NoLocalIndex{},
-			WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(ledger))
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = p.Pull(context.Background(), "example.com/big:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-		if !errors.Is(err, ErrManifestTooLarge) {
-			t.Fatalf("Pull error = %v, want ErrManifestTooLarge", err)
-		}
-		if n := leaseCount(cache); n != 0 || ledger.Reserved() != 0 {
-			t.Errorf("leases = %d, reserved = %d after the refusal, want 0 and 0", n, ledger.Reserved())
-		}
+		t.Run("in-process", func(t *testing.T) {
+			img := &configCountingImage{Image: padded(t)}
+			cache, err := NewCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			obs := newAcquireObserver(cache)
+			p, err := NewPuller(cache, staticFetch(img), NoLocalIndex{},
+				WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(obs.ledger))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = p.Pull(context.Background(), "example.com/big:v1", nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+			if !errors.Is(err, ErrManifestTooLarge) {
+				t.Fatalf("Pull error = %v, want ErrManifestTooLarge", err)
+			}
+			if n := img.configReads.Load(); n != 0 {
+				t.Errorf("image config read %d times before the refusal, want 0", n)
+			}
+			obs.requireNoneAcquired(t)
+		})
+		t.Run("registry", func(t *testing.T) {
+			pullThroughRegistry(t, padded(t), true, ErrManifestTooLarge)
+		})
 	})
 
 	t.Run("warm serve", func(t *testing.T) {
@@ -372,6 +342,9 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 				if res == nil {
 					t.Fatalf("%d layers: Load returned no result", tc.layers)
 				}
+				if n := len(res.Manifest.GetLayers()); n != MaxManifestLayers {
+					t.Errorf("%d layers: Load result manifest has %d layers, want %d", tc.layers, n, MaxManifestLayers)
+				}
 				continue
 			}
 			if !errors.Is(err, ErrTooManyLayers) {
@@ -472,4 +445,132 @@ func TestRefuseLayerCount(t *testing.T) {
 			}
 		})
 	}
+}
+
+// configCountingImage counts every read of the image config, so a row can
+// prove a refusal came before the config was fetched.
+type configCountingImage struct {
+	ggcrv1.Image
+	configReads atomic.Int64
+}
+
+func (c *configCountingImage) ConfigFile() (*ggcrv1.ConfigFile, error) {
+	c.configReads.Add(1)
+	return c.Image.ConfigFile()
+}
+
+func (c *configCountingImage) RawConfigFile() ([]byte, error) {
+	c.configReads.Add(1)
+	return c.Image.RawConfigFile()
+}
+
+// acquireObserver records lease ACQUISITION, not net holdings: the lease
+// table's monotonic id counter (Cache.nextLease, bumped by every AcquireLease),
+// so a lease taken and released still shows. Reservations have no such
+// counter: the only per-pull sample, the FreeBytesFunc, is also read by the
+// pull's admission check before any guard, so it cannot isolate Reserve. The
+// reservation is therefore read NET (SpaceLedger.Reserved after the call).
+type acquireObserver struct {
+	cache     *Cache
+	ledger    *SpaceLedger
+	leaseBase uint64
+}
+
+func newAcquireObserver(c *Cache) *acquireObserver {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	return &acquireObserver{cache: c, ledger: &SpaceLedger{}, leaseBase: c.nextLease}
+}
+
+func (o *acquireObserver) leasesAcquired() uint64 {
+	o.cache.leaseMu.Lock()
+	defer o.cache.leaseMu.Unlock()
+	return o.cache.nextLease - o.leaseBase
+}
+
+// requireNoneAcquired fails if any lease was ever acquired (a lease taken and
+// released still fails it) or if the ledger holds bytes after the call. The
+// ledger check is NET only: it proves no reservation is left held, NOT that
+// none was taken and released before the refusal.
+func (o *acquireObserver) requireNoneAcquired(t *testing.T) {
+	t.Helper()
+	if n := o.leasesAcquired(); n != 0 {
+		t.Errorf("%d leases acquired before the refusal, want 0", n)
+	}
+	if got := o.ledger.Reserved(); got != 0 {
+		t.Errorf("ledger holds %d bytes after the refusal, want 0", got)
+	}
+}
+
+// requireAcquired is the accepted rows' liveness check on the lease counter:
+// an accepted pull leases, so a zero here would mean the refused rows' zeros
+// prove nothing.
+func (o *acquireObserver) requireAcquired(t *testing.T) {
+	t.Helper()
+	if n := o.leasesAcquired(); n == 0 {
+		t.Errorf("accepted pull acquired %d leases, want > 0", n)
+	}
+}
+
+// requireManifestOf fails unless got is the manifest img was built from.
+func requireManifestOf(t *testing.T, got *runtimev1.ImageManifest, img ggcrv1.Image) {
+	t.Helper()
+	want, err := img.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(got.GetLayers()); n != len(want.Layers) || n != MaxManifestLayers {
+		t.Errorf("result manifest has %d layers, want %d (MaxManifestLayers %d)", n, len(want.Layers), MaxManifestLayers)
+	}
+	if d := got.GetConfig().GetDigest(); d != want.Config.Digest.String() {
+		t.Errorf("result manifest config = %s, want %s", d, want.Config.Digest)
+	}
+}
+
+// pullThroughRegistry pulls img from a counting registry, so resolveRemote's
+// guard is the first one reached. Accepted, the result must be img's
+// manifest; refused, the error must be want and no config GET, layer GET,
+// lease or reservation may have happened.
+func pullThroughRegistry(t *testing.T, img ggcrv1.Image, refused bool, want error) {
+	t.Helper()
+	reg := newBlobCountingRegistry(t)
+	ref := pushManyLayerImage(t, reg.host, "many", img)
+	reg.reset()
+	mfst, err := img.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs := newAcquireObserver(cache)
+	p, err := NewPuller(cache, RemoteFetch, NoLocalIndex{},
+		WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(obs.ledger))
+	if err != nil {
+		t.Fatalf("NewPuller: %v", err)
+	}
+	res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if !refused {
+		if err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		defer res.Lease.Release()
+		requireManifestOf(t, res.Manifest, img)
+		obs.requireAcquired(t)
+		return
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("Pull error = %v, want %v", err, want)
+	}
+	if n := reg.layerGets(t, img); n != 0 {
+		t.Errorf("registry saw %d layer GETs, want 0", n)
+	}
+	reg.mu.Lock()
+	cfgGets := reg.gets[mfst.Config.Digest.String()]
+	reg.mu.Unlock()
+	if cfgGets != 0 {
+		t.Errorf("registry saw %d config GETs, want 0", cfgGets)
+	}
+	obs.requireNoneAcquired(t)
 }
