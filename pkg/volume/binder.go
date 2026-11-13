@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"k3sm.io/runtimed/pkg/image"
 
@@ -49,14 +50,16 @@ type TemplateResolver interface {
 // local-path class (its BasePath is the storage root), a Cloner used only to seed
 // from a template, an optional TemplateResolver, and a logger.
 //
-// A Binder is safe for concurrent use: it owns no mutable state (os.MkdirAll and
-// the seed clone are idempotent, and distinct pods bind distinct dirs; two pods
-// sharing one (ns,claim) RWX volume share the dir by design).
+// A Binder is safe for concurrent use: os.MkdirAll is idempotent, distinct pods
+// bind distinct dirs, and its one piece of mutable state, seedMu, serializes
+// template seeds (two pods sharing one (ns,claim) RWX volume share the dir by
+// design, and must not seed it twice).
 type Binder struct {
 	class    storagev1.LocalPathClass
 	cloner   image.Cloner
 	template TemplateResolver
 	log      *slog.Logger
+	seedMu   sync.Mutex
 }
 
 // Binding is one PVC bound for a pod.
@@ -252,15 +255,7 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName, dataDir 
 			return false, fmt.Errorf("resolve seed template for %s/%s: %w", namespace, claimName, terr)
 		}
 		if ok {
-			if err := os.MkdirAll(dataDir, 0o755); err != nil {
-				return false, fmt.Errorf("create pv dir %s: %w", dataDir, err)
-			}
-			if _, err := image.MaterializeTree(b.cloner, src, dataDir); err != nil {
-				return false, fmt.Errorf("seed pv %s/%s from %s: %w", namespace, claimName, src, err)
-			}
-			b.log.Info("seeded persistent volume from template",
-				"namespace", namespace, "claim", claimName, "template", src, "dir", dataDir)
-			return true, nil
+			return b.seed(namespace, claimName, src, dataDir)
 		}
 	}
 
@@ -269,6 +264,63 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName, dataDir 
 	}
 	b.log.Info("created empty persistent volume", "namespace", namespace, "claim", claimName, "dir", dataDir)
 	return false, nil
+}
+
+// seed creates dataDir as a whole copy of the template src, or not at all.
+// image.MaterializeTree is not all-or-nothing, and a dataDir that exists is
+// reused without re-seeding, so seeding straight into dataDir would let a failed
+// seed's half-filled dir be reported as bound on the retry. Instead the tree is
+// materialized into a sibling staging dir and renamed onto dataDir only after it
+// completes; on error the staging dir is removed and dataDir never appears.
+//
+// The staging name is fixed per claim, so a stale one (left by a crash mid-seed)
+// is removed before seeding, and seedMu serializes seeds so two binds of one
+// shared claim never interleave in it. The second bind re-checks dataDir under
+// the lock and reuses what the first one seeded.
+func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, err error) {
+	b.seedMu.Lock()
+	defer b.seedMu.Unlock()
+
+	if _, statErr := os.Stat(dataDir); statErr == nil {
+		return false, nil // a concurrent bind of the same claim seeded it first
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return false, fmt.Errorf("stat pv dir %s: %w", dataDir, statErr)
+	}
+	if err := os.MkdirAll(filepath.Dir(dataDir), 0o755); err != nil {
+		return false, fmt.Errorf("create pv parent %s: %w", filepath.Dir(dataDir), err)
+	}
+	staging := stagingDir(dataDir)
+	if err := os.RemoveAll(staging); err != nil {
+		return false, fmt.Errorf("remove stale pv staging dir %s: %w", staging, err)
+	}
+	if err := os.Mkdir(staging, 0o755); err != nil {
+		return false, fmt.Errorf("create pv staging dir %s: %w", staging, err)
+	}
+	defer func() {
+		if err != nil {
+			if rmErr := os.RemoveAll(staging); rmErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove pv staging dir %s: %w", staging, rmErr))
+			}
+		}
+	}()
+	if _, err := image.MaterializeTree(b.cloner, src, staging); err != nil {
+		return false, fmt.Errorf("seed pv %s/%s from %s: %w", namespace, claimName, src, err)
+	}
+	if err := os.Rename(staging, dataDir); err != nil {
+		return false, fmt.Errorf("move seeded pv into place at %s: %w", dataDir, err)
+	}
+	b.log.Info("seeded persistent volume from template",
+		"namespace", namespace, "claim", claimName, "template", src, "dir", dataDir)
+	return true, nil
+}
+
+// stagingDir is the sibling dir a fresh volume is seeded into before it is
+// renamed onto dataDir. It shares dataDir's parent, so the rename is atomic on
+// one filesystem, and its leading dot keeps it out of the claim-name space (a
+// claim name is a DNS subdomain, which must start with an alphanumeric), so it
+// can never collide with another claim's dir.
+func stagingDir(dataDir string) string {
+	return filepath.Join(filepath.Dir(dataDir), "."+filepath.Base(dataDir)+".seeding")
 }
 
 // linkInto creates a symlink at the pod's (rebased) mount path that points to
