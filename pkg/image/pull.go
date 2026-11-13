@@ -226,11 +226,16 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 // logic. cred rides the split transport, so remoteFetch gets none.
 func splitFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, tr http.RoundTripper) (ggcrv1.Image, error) {
 	reg := registryfetch.Registry{Transport: tr}
-	rt, err := reg.OriginSplit(ctx, r.Context(), cred.registryfetchCredential())
-	if err != nil {
-		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
+	// OriginSplit pings the registry and may fetch a token, so it runs under
+	// the resolve bound (resolveFetch hands it rctx), not the caller's ctx.
+	split := func(rctx context.Context) (remote.Option, error) {
+		rt, err := reg.OriginSplit(rctx, r.Context(), cred.registryfetchCredential())
+		if err != nil {
+			return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
+		}
+		return remote.WithTransport(rt), nil
 	}
-	return remoteFetch(ctx, r, ref, nil, policy, remote.WithTransport(rt))
+	return resolveFetch(ctx, r, ref, nil, policy, split)
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
@@ -248,6 +253,16 @@ func splitFetch(ctx context.Context, r name.Reference, ref string, cred *Registr
 // transport included, so it wins and rides every round trip, the index children
 // included.
 func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, extra ...remote.Option) (ggcrv1.Image, error) {
+	return resolveFetch(ctx, r, ref, cred, policy, nil, extra...)
+}
+
+// resolveFetch is remoteFetch with an optional late option: when late is
+// non-nil it is called with the resolve-bounded context before the resolve,
+// and the option it returns goes after extra. A transport whose construction
+// itself makes round trips (splitFetch's OriginSplit pings the registry) is
+// built there, so those round trips sit under the resolve bound and its
+// ErrPullResolveTimeout mapping like the resolve's own.
+func resolveFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, late func(context.Context) (remote.Option, error), extra ...remote.Option) (ggcrv1.Image, error) {
 	want, err := Candidates(policy)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
@@ -264,7 +279,16 @@ func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *Regist
 	if cred != nil {
 		opts = append(opts, remote.WithAuth(cred.authenticator()))
 	}
-	img, err := resolveRemote(r, ref, want, opts)
+	var img ggcrv1.Image
+	if late != nil {
+		var opt remote.Option
+		if opt, err = late(rctx); err == nil {
+			opts = append(opts, opt)
+		}
+	}
+	if err == nil {
+		img, err = resolveRemote(r, ref, want, opts)
+	}
 	if err == nil && !disarm() {
 		// The bound fired after the last resolve round trip returned but before
 		// it could be disarmed: rctx is cancelled, so the image's layer fetches
