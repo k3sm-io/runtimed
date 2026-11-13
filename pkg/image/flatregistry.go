@@ -29,7 +29,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"k3sm.io/runtimed/pkg/registryfetch"
 )
@@ -230,7 +229,7 @@ func endpointFetchOver(host string, ep RegistryEndpoint, tr http.RoundTripper) F
 		if err != nil {
 			return nil, err
 		}
-		return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(tr))
+		return splitFetch(ctx, r, ref, cred, policy, tr)
 	}
 }
 

@@ -272,7 +272,7 @@ func TestBlobRedirectBearerToOtherPortDropsAuthorization(t *testing.T) {
 // TestBlobRedirectForeignRealmChallengeIsNotFollowed: after A's bearer 307,
 // B answers the blob GET with a 401 whose Bearer realm is a third host C. The
 // client never asks C for a token, never sends B an Authorization, and asks
-// A's token endpoint at most twice.
+// A's token endpoint exactly once: B's challenge never reaches the token logic.
 func TestBlobRedirectForeignRealmChallengeIsNotFollowed(t *testing.T) {
 	_, digest := blobData(1000)
 	var cHits atomic.Int32
@@ -305,8 +305,8 @@ func TestBlobRedirectForeignRealmChallengeIsNotFollowed(t *testing.T) {
 			t.Fatalf("second host saw %q, want no Authorization on any request", bh)
 		}
 	}
-	if n := tokenHits.Load(); n > 2 {
-		t.Fatalf("origin token endpoint hit %d times, want at most 2", n)
+	if n := tokenHits.Load(); n != 1 {
+		t.Fatalf("origin token endpoint hit %d times, want exactly 1", n)
 	}
 	t.Logf("err %v; origin saw %q; second host saw %q; origin token hits %d", err, a.seen(), bh, tokenHits.Load())
 }
