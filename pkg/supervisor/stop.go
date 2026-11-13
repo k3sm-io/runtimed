@@ -52,8 +52,12 @@ const DefaultExitObservationGrace = 2 * time.Second
 //     not an error. Any other error escalates to killSig at once, and the send
 //     error is returned alongside escalated == true and the observed result, so
 //     a non-nil err no longer means "nothing was killed". If that kill send
-//     fails too, nothing was sent: escalated == false, observed == false, no
-//     wait, and err joins both errors.
+//     fails too, err joins both errors.
+//
+// On EVERY path where the kill send itself fails (grace <= 0, the kill after the
+// deadline or a cancelled ctx, and the termSig-failure escalation) nothing was
+// sent: escalated == false, observed == false, no wait, and err carries the send
+// error. escalated means "the kill signal was sent", never "a kill was tried".
 //
 // EVERY path that sends killSig then WAITS for the reaper's exit observation,
 // bounded by exitWait (<= 0 selects DefaultExitObservationGrace), and reports
@@ -83,7 +87,7 @@ const DefaultExitObservationGrace = 2 * time.Second
 func GracefulStop(ctx context.Context, pgid int, grace time.Duration, exited <-chan struct{}, termSig, killSig os.Signal, signal func(pgid int, sig os.Signal) error, exitWait time.Duration) (escalated, observed bool, err error) {
 	if grace <= 0 {
 		if err := signal(pgid, killSig); err != nil {
-			return true, false, err
+			return false, false, err
 		}
 		return true, awaitExit(exited, exitWait), nil
 	}
@@ -116,7 +120,7 @@ func GracefulStop(ctx context.Context, pgid int, grace time.Duration, exited <-c
 		// half-terminated pod behind.
 	}
 	if err := signal(pgid, killSig); err != nil {
-		return true, false, err
+		return false, false, err
 	}
 	return true, awaitExit(exited, exitWait), nil
 }

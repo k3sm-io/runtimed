@@ -21,8 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"runtime"
 	"slices"
 	"sync"
 	"syscall"
@@ -461,36 +459,46 @@ func TestGracefulStopWhenBothSendsFail(t *testing.T) {
 	}
 }
 
-// TestGracefulStopRealSignalGroupOnGoneGroup drives the production SignalGroup
-// against a pgid that no longer exists. SignalGroup maps ESRCH to nil, so
-// GracefulStop never sees the errno: the graceful send "succeeds", the grace
-// expires, the kill send "succeeds" too, and with no exit reported the result is
-// escalated, unobserved, no error.
-func TestGracefulStopRealSignalGroupOnGoneGroup(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("production SignalGroup is darwin-only")
+// TestGracefulStopKillSendFailureIsNotEscalated pins that on the grace<=0 path
+// and on the post-deadline and cancelled-ctx kill paths, a failed kill send
+// means nothing was sent: escalated and observed are false and the error returns.
+func TestGracefulStopKillSendFailureIsNotEscalated(t *testing.T) {
+	const pgid = 4242
+	term, kill := os.Interrupt, os.Kill
+	errKill := errors.New("refused: kill send")
+	signal := func(_ int, sig os.Signal) error {
+		if sig == kill {
+			return errKill
+		}
+		return nil
 	}
-	cmd := exec.Command("/usr/bin/true")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot spawn a child: %v", err)
-	}
-	pgid := cmd.Process.Pid // Setpgid with Pgid 0: the child leads its own group
-	_ = cmd.Wait()          // exited and reaped: the group is gone
-	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Skipf("pgid %d still resolves (err=%v); not a deterministic gone group", pgid, err)
-	}
-
-	exited := make(chan struct{}) // never closes
-	esc, obs, err := GracefulStop(context.Background(), pgid, 20*time.Millisecond, exited,
-		syscall.SIGTERM, syscall.SIGKILL, SignalGroup, testExitWait)
-	if err != nil {
-		t.Errorf("err = %v, want nil (SignalGroup flattens ESRCH)", err)
-	}
-	if !esc {
-		t.Error("escalated = false, want true (the grace expired with no exit reported)")
-	}
-	if obs {
-		t.Error("observed = true, want false (nothing reported an exit)")
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name  string
+		ctx   context.Context
+		grace time.Duration
+	}{
+		{"grace-zero", context.Background(), 0},
+		{"after-grace-deadline", context.Background(), 20 * time.Millisecond},
+		{"cancelled-ctx", cancelled, 10 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exited := make(chan struct{}) // never closes
+			start := time.Now()
+			esc, obs, err := GracefulStop(tc.ctx, pgid, tc.grace, exited, term, kill, signal, 5*time.Second)
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Errorf("returned after %v, want no observation wait", elapsed)
+			}
+			if esc {
+				t.Error("escalated = true, want false (the kill send failed)")
+			}
+			if obs {
+				t.Error("observed = true, want false")
+			}
+			if !errors.Is(err, errKill) {
+				t.Errorf("err = %v, want it to wrap the kill send error", err)
+			}
+		})
 	}
 }
