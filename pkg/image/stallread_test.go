@@ -104,9 +104,11 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 	// The server holds the connection, sending nothing more, until the test
 	// releases it; nothing here depends on how long the stall lasts.
 	release := make(chan struct{})
+	sent := make(chan struct{})
 	ref := layerBodyServer(t, func(w http.ResponseWriter, r *http.Request, layer []byte) {
 		_, _ = w.Write(layer[:16])
 		w.(http.Flusher).Flush()
+		close(sent)
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -120,8 +122,9 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := mustPullerIndex(t, cache, RemoteFetch, NoLocalIndex{})
-	// A knob, not a measurement: any window fires, it only has to be short.
-	p.layerStallWindow = 10 * time.Millisecond
+	// Short enough to fire promptly, long enough that a loaded host delivers the
+	// 16 bytes before the window can expire.
+	p.layerStallWindow = 200 * time.Millisecond
 	// The outer guard only turns a regression (a pull that never returns) into a
 	// failure; the happy path never waits on it.
 	const guard = 60 * time.Second
@@ -147,6 +150,13 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 	}
 	if !errors.Is(got.err, ErrLayerBodyStalled) {
 		t.Fatalf("Pull error = %v, want ErrLayerBodyStalled", got.err)
+	}
+	// The server wrote and flushed the 16 bytes before the pull failed, so the
+	// abort came from silence after data, not from a stall before any byte.
+	select {
+	case <-sent:
+	default:
+		t.Fatal("Pull failed before the server flushed the 16 body bytes")
 	}
 }
 
