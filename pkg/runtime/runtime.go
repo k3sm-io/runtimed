@@ -537,6 +537,12 @@ type Runtime struct {
 	// the registry check until the pod is registered or the create has failed.
 	// A pod in it has a dir that may not carry its reachability record yet.
 	creating map[string]int
+	// deleting records, under mu, the DeletePod teardown in flight per pod id:
+	// from the moment DeletePod takes the pod out of pods until its teardown
+	// returns. A DeletePod that finds the id here (and not in pods) waits on
+	// the record instead of reporting the idempotent success while the first
+	// teardown still runs. See podTeardown for the locking discipline.
+	deleting map[string]*podTeardown
 
 	// podReapStarted is set, under mu, at the moment the startup pod reap
 	// snapshots the pods it must not touch. AttachPod registers an adopted pod
@@ -1209,6 +1215,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		broker:         newBroker(),
 		pods:           make(map[string]*pod),
 		creating:       make(map[string]int),
+		deleting:       make(map[string]*podTeardown),
 		codeSignStatus: codeSignStatus,
 		fingerprint:    fingerprint,
 		adoptWaiter:    adoptWaiter,

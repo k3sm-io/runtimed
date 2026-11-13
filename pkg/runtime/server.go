@@ -113,21 +113,85 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 // TWO-PHASE: the MAIN containers are stopped first (concurrently, as
 // before), then any native sidecars in REVERSE start order with whatever REMAINS
 // of the one pod-level grace budget (see resolveGrace / stopSidecars).
-// Idempotent: deleting an unknown pod succeeds.
+// Idempotent: deleting an unknown pod succeeds. A delete for a pod whose
+// teardown another DeletePod is still running waits for that teardown and
+// returns its result, or the request's ctx error if the ctx ends first — never
+// a success the teardown has not earned yet.
 func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
+	podID := req.GetPodId()
 	r.mu.Lock()
-	p, ok := r.pods[req.GetPodId()]
+	p, ok := r.pods[podID]
+	var td *podTeardown
 	if ok {
-		delete(r.pods, req.GetPodId())
+		delete(r.pods, podID)
+		td = &podTeardown{done: make(chan struct{})}
+		r.deleting[podID] = td
+	} else {
+		td = r.deleting[podID]
 	}
 	r.mu.Unlock()
 	if !ok {
+		if td != nil {
+			return td.wait(ctx)
+		}
 		// Idempotent. A pod this daemon does not hold (one not re-attached
 		// after a restart) may still have an artifact hold; its delete ends it.
-		r.releaseArtifactHolds(context.WithoutCancel(ctx), req.GetPodId(), 0)
+		r.releaseArtifactHolds(context.WithoutCancel(ctx), podID, 0)
 		return &runtimev1.DeletePodResponse{}, nil
 	}
 
+	var resp *runtimev1.DeletePodResponse
+	var err error
+	// Deferred so the record is retired on every return path of the teardown.
+	defer func() { r.finishTeardown(podID, td, resp, err) }()
+	resp, err = r.teardownPod(ctx, p, req)
+	return resp, err
+}
+
+// podTeardown is one DeletePod teardown in flight, recorded in
+// Runtime.deleting from the moment the pod leaves Runtime.pods until the
+// teardown returns.
+//
+// Locking discipline: the map entry is inserted, looked up and removed only
+// under Runtime.mu, and never with p.mu held (mu is taken alone, as every
+// other pods access takes it). resp and err are written exactly once, by the
+// tearing-down DeletePod, BEFORE done is closed, and read by a waiter only
+// AFTER it observes done closed — the close is the happens-before edge, so
+// they need no lock of their own. A waiter holds no lock while it waits.
+type podTeardown struct {
+	done chan struct{}
+	resp *runtimev1.DeletePodResponse
+	err  error
+}
+
+// wait blocks until the teardown finishes and returns its result, or returns
+// ctx's error as a gRPC status (DeadlineExceeded / Canceled) if ctx ends
+// first. It never reports success for a teardown still running.
+func (td *podTeardown) wait(ctx context.Context) (*runtimev1.DeletePodResponse, error) {
+	select {
+	case <-td.done:
+		return td.resp, td.err
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+// finishTeardown publishes a teardown's result to its waiters and retires the
+// record. It removes the map entry only if it is still this teardown's: a
+// CreatePod may re-register the id while the teardown runs, and that pod's
+// own DeletePod then owns the entry.
+func (r *Runtime) finishTeardown(podID string, td *podTeardown, resp *runtimev1.DeletePodResponse, err error) {
+	td.resp, td.err = resp, err
+	r.mu.Lock()
+	if r.deleting[podID] == td {
+		delete(r.deleting, podID)
+	}
+	r.mu.Unlock()
+	close(td.done)
+}
+
+// teardownPod is DeletePod's teardown of p, already removed from r.pods.
+func (r *Runtime) teardownPod(ctx context.Context, p *pod, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	// Stop the memory sampler: the pod is going away. The read takes p.mu —
 	// memCancel is REPLACED at arbitrary runtime by armMemorySampler (a
 	// RestartContainer re-exec re-arms it), so an unsynchronized read here is a
