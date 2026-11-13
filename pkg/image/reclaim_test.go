@@ -1239,6 +1239,54 @@ func TestExecutePruneFailsClosedWhenTheRepinReadFails(t *testing.T) {
 	}
 }
 
+// TestExecutePruneReportsRemovedBlobsWhenTheRepinReadFails pins the error
+// contract of a failed mid-batch pin re-read: the error comes back with a
+// non-nil partial report naming the blob already unlinked, and nothing after
+// the error is unlinked.
+func TestExecutePruneReportsRemovedBlobsWhenTheRepinReadFails(t *testing.T) {
+	f := newGCFixture(t)
+	first := f.blob("first planned blob", 24*time.Hour)
+	second := f.blob("second planned blob a lease names", 24*time.Hour)
+	third := f.blob("third planned blob after the error", 24*time.Hour)
+
+	fired := false
+	f.cache.beforePruneBlob = func(digest string) {
+		if fired || digest != first {
+			return
+		}
+		fired = true
+		f.cache.AcquireLease([]string{second}, time.Minute).Release()
+	}
+	boom := errors.New("re-pin read failed")
+	reads := 0
+	pinned := func() (map[string]PruneReason, error) {
+		reads++
+		if reads > 1 {
+			return nil, boom
+		}
+		return f.cache.pinnedNow(nil)
+	}
+	rep, err := f.cache.executePrune(planOf(first, second, third), 0, f.clock, nil, pinned)
+	if !errors.Is(err, boom) {
+		t.Fatalf("executePrune error = %v; want %v", err, boom)
+	}
+	if !fired || reads != 2 {
+		t.Fatalf("hook fired=%v pin reads=%d; want the re-read driven once", fired, reads)
+	}
+	if rep == nil {
+		t.Fatal("executePrune returned a nil report with the re-read error; the removed blob is unreported")
+	}
+	if len(rep.Removed) != 1 || rep.Removed[0] != first || rep.Deleted != 1 {
+		t.Fatalf("partial report Removed=%v Deleted=%d; want only %s", rep.Removed, rep.Deleted, first)
+	}
+	if f.exists(first) {
+		t.Error("the reported blob is still on disk")
+	}
+	if !f.exists(second) || !f.exists(third) {
+		t.Errorf("a blob after the error was unlinked: second exists=%v third exists=%v", f.exists(second), f.exists(third))
+	}
+}
+
 // TestReclaimKeepsBlobRootedBeforeItsCriticalSection drives a complete pull
 // (lease, record, hold, release) into the window just before the executor
 // takes leaseMu for the pulled blob, after the batch's pin read. No live
