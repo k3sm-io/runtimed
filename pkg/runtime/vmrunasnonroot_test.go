@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,7 +85,11 @@ func TestVMRunAsNonRootSurfacesCreateContainerConfigError(t *testing.T) {
 	if codes.Code(resp.GetError().GetCode()) == codes.InvalidArgument {
 		t.Error("the refusal carries InvalidArgument, the code of a pod the caller wrote wrongly")
 	}
-	msg := resp.GetError().GetMessage()
+	// The reply is the refusal's text, quoted and bounded (startErrorReply).
+	msg, uerr := strconv.Unquote(resp.GetError().GetMessage())
+	if uerr != nil {
+		t.Fatalf("reply %q is not one quoted string: %v", resp.GetError().GetMessage(), uerr)
+	}
 	wantText := `container has runAsNonRoot and image will run as root (pod: "p_default(pod-nonroot)", container: c)`
 	if !strings.Contains(msg, wantText) {
 		t.Errorf("message %q does not carry the kubelet text %q", msg, wantText)

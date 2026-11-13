@@ -325,8 +325,8 @@ func initContainerIndex(box *runtimev1.PodBox, name string) int {
 // publishes the sentence its Waiting message does, because its error names the
 // cache root, the rootfs, the sign staging directory or a tool's output; the
 // daemon's log line carries that error once. An error marked tenantText keeps
-// its full text; any other error is stage's fixed sentence, quoted, and its
-// cause is in the caller's log line.
+// its full text, quoted and bounded the same way; any other error is stage's
+// fixed sentence, quoted, and its cause is in the caller's log line.
 //
 // The reply is quoted the same way but bounded at maxReplyMessageBytes, not at
 // the Waiting message's limit: a vm image's path collision sentence carries the
@@ -343,7 +343,7 @@ func startErrorReply(stage failureStage, err error) string {
 	}
 	var tt *tenantTextError
 	if errors.As(err, &tt) {
-		return err.Error()
+		return image.QuoteBounded(err.Error(), maxReplyMessageBytes)
 	}
 	return image.QuoteBounded(stage.sentence(), maxReplyMessageBytes)
 }

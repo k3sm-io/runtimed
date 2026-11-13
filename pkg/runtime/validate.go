@@ -73,8 +73,11 @@ func (r *Runtime) validatePodBox(box *runtimev1.PodBox) (runtimev1.FailureReason
 	// stored box's profile is the one that was validated at create, and the
 	// structural check inside createPod covers the spine directly.
 	if _, err := r.dataVolumePath(box); err != nil {
-		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: %w", errInvalidPodBox, err)
+		// The reply names no path (dataVolumeRefusal); the paths go to the
+		// daemon log here, the one place this refusal is logged.
+		refusal := dataVolumeRefusal(err)
+		r.log.Warn("refused pod box data volume path", "pod", box.GetPodId(), "err", failureLogText(refusal))
+		return runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, refusal
 	}
 	// log_directory is REQUIRED, because it is the only thing that says where a
 	// container's output goes. The node creates the tree

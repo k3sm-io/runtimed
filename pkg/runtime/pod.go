@@ -817,7 +817,7 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 	// path. validatePodBox asks the same question earlier for the CreatePod
 	// ingress; a caller that reached this spine another way is refused here.
 	if _, err := r.dataVolumePath(box); err != nil {
-		return "", fmt.Errorf("%w: %w", errInvalidPodBox, err)
+		return "", dataVolumeRefusal(err)
 	}
 	// Having accepted either derived spelling, emit the narrower one: the accept
 	// set is a compatibility surface (the producer sends the pod dir), but nothing
@@ -2491,6 +2491,34 @@ func tenantText(err error) error {
 	return &tenantTextError{err: err}
 }
 
+// mergeRunSpecError marks an image.MergeRunSpec error as tenant text only when
+// it is one of the merge's refusals, which are worded for the pod's owner from
+// bounded pod and image values: no command anywhere (image.ErrRunSpecInvalid)
+// and the kubelet's runAsNonRoot text (image.ErrRunAsNonRoot, which also
+// matches ErrRunSpecInvalid). Any other merge error is returned unmarked, so a
+// client reads the stage's fixed sentence and the daemon log has the text.
+func mergeRunSpecError(err error) error {
+	if errors.Is(err, image.ErrRunSpecInvalid) || errors.Is(err, image.ErrRunAsNonRoot) {
+		return tenantText(err)
+	}
+	return err
+}
+
+// dataVolumeRefusalDetail is the published detail of a data_volume_path
+// refusal. dataVolumePath's error names the pod dir and the pod rootfs, which
+// are daemon host paths, so that text is never published.
+const dataVolumeRefusalDetail = "the data volume path is not one of the pod's directories"
+
+// dataVolumeRefusal is errInvalidPodBox for a data_volume_path dataVolumePath
+// refused with err. errInvalidPodBox is tenantText, which publishes the whole
+// chain's text; err names host paths, so the refusal carries a fixed client
+// sentence (clientMessageError) instead, and Error keeps err for the log.
+// errors.Is still matches errInvalidPodBox and err's sentinel.
+func dataVolumeRefusal(err error) error {
+	return withClientMessage(errInvalidPodBox.Error()+": "+dataVolumeRefusalDetail,
+		fmt.Errorf("%w: %w", errInvalidPodBox, err))
+}
+
 // failureStage names the verb a failure stopped, for the fixed sentence a
 // client reads when the error carries neither a clientMessageError nor a
 // tenantTextError.
@@ -3225,9 +3253,7 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 	run, err := image.MergeRunSpec(runCfg, runSpecRequest(p.box, c, int64(resolveCredential(p.box, c).UID)))
 	if err != nil {
-		// The merge's refusals (no command, the kubelet's runAsNonRoot text)
-		// are worded for the pod's owner from bounded pod and image values.
-		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, tenantText(err))
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, mergeRunSpecError(err))
 	}
 
 	// argv[0] is the merged program resolved inside this pod's materialized
