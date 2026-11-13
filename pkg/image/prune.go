@@ -508,11 +508,50 @@ type ExecuteReport struct {
 // unlinked like any other. Reclaim, which must honour leases, runs the
 // unexported executor with a pin function instead.
 func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*ExecuteReport, error) {
-	return c.executePrune(plan, grace, now, stop, nil, nil)
+	return c.executePrune(plan, grace, now, stop, plainPrune())
 }
 
-// pruneHooks are the optional seams of executePrune. A nil *pruneHooks, or a
-// nil field, leaves the executor exactly as ExecutePrune documents it.
+// pruneModeKind names which executor body a caller chose for executePrune.
+type pruneModeKind uint8
+
+const (
+	// pruneModePlain is ExecutePrune: no pin set, no lease watch, no lease
+	// check, no hooks.
+	pruneModePlain pruneModeKind = iota
+	// pruneModePressure is a disk-pressure pass: the pinned re-read, the
+	// lease watch and the live-lease check (unlinkUnlessLeased).
+	pruneModePressure
+	// pruneModeEvict is an eviction pass: the guard and unlink hooks
+	// (executeHookedEntry).
+	pruneModeEvict
+)
+
+// pruneMode is the caller's choice of executor body. Build one with
+// plainPrune, pressurePrune or evictPrune; executePrune dispatches on kind,
+// never on which of pinned or hooks happens to be set, and refuses a mode
+// whose kind lacks the seam it needs.
+type pruneMode struct {
+	kind   pruneModeKind
+	pinned pinnedFunc
+	hooks  *pruneHooks
+}
+
+// plainPrune is the mode ExecutePrune runs.
+func plainPrune() pruneMode { return pruneMode{kind: pruneModePlain} }
+
+// pressurePrune is the disk-pressure mode, guarded by pinned.
+func pressurePrune(pinned pinnedFunc) pruneMode {
+	return pruneMode{kind: pruneModePressure, pinned: pinned}
+}
+
+// evictPrune is the eviction mode, run through hooks.
+func evictPrune(hooks *pruneHooks) pruneMode {
+	return pruneMode{kind: pruneModeEvict, hooks: hooks}
+}
+
+// pruneHooks are the seams of executePrune's eviction mode (evictPrune). A
+// nil field leaves that seam out: no guard drops anything, and a blob that
+// passes re-verification is removed with a plain Remove.
 type pruneHooks struct {
 	// guard, when non-nil, runs once per call inside pruneMu, before the
 	// unlink loop. Every digest in the returned set is skipped rather than
@@ -535,8 +574,13 @@ type pruneHooks struct {
 // the reason it is kept. It is read under pruneMu, just before the batch.
 type pinnedFunc func() (map[string]PruneReason, error)
 
-// executePrune is ExecutePrune with three more re-checks. pinned, when
-// non-nil, is called under pruneMu before the first unlink, and every entry
+// executePrune runs plan in the body mode names. The plain and pressure modes
+// share unlinkUnlessLeased; the eviction mode runs executeHookedEntry. All
+// three report a blob younger than grace and a failed removal with a typed
+// SkippedBlob.Refusal (RefusedYoung, RefusedRemoveFailed).
+//
+// In pressure mode it is ExecutePrune with three more re-checks. pinned is
+// called under pruneMu before the first unlink, and every entry
 // whose digest it names is left in place and reported in ExecuteReport.pinned.
 // A lease watch (beginLeaseWatch) is opened just before that pin read. When
 // the watch names an entry's digest at that entry's critical section (a lease
@@ -546,11 +590,11 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // next unlink: the pin set is a root set, and a short one would invert the
 // answer.
 //
-// When pinned is non-nil the executor also asks the cache's own lease table
+// In pressure mode the executor also asks the cache's own lease table
 // (leaseHasLocked) about each entry's digest inside the critical section, and
 // keeps an entry a live lease names as ReasonKeptLeased. Both lease lookups
 // are the executor's own, made with leaseMu already held, so no caller can
-// hand it a check that takes leaseMu again. With a nil pinned (ExecutePrune)
+// hand it a check that takes leaseMu again. In plain mode (ExecutePrune)
 // there is no pin set, no watch and no lease check.
 //
 // Per entry the order is: pin lookup, then ONE leaseMu critical section
@@ -561,7 +605,7 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // is pruneMu then leaseMu, and pinned, which takes leaseMu itself, is never
 // called with leaseMu held.
 //
-// INVARIANT, which holds only when pinned is non-nil: an entry is unlinked
+// INVARIANT, which holds only in pressure mode: an entry is unlinked
 // only by a critical section whose watch check came back clean, so every
 // lease naming its digest was acquired either before the pin read the
 // executor holds (and that read saw it live, or saw the record and hold the
@@ -581,11 +625,11 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // read but before the entry's critical section is not seen there (no live
 // lease, a pin set read before the record, no lease acquired since that
 // read), so the blob it just found present is unlinked.
-// hooks (see pruneHooks) is the eviction path's seam. pinned and hooks are
-// mutually exclusive: the hooks' unlink takes leaseMu itself, so it cannot run
-// inside unlinkUnlessLeased's critical section. With hooks non-nil the entry
-// runs through executeHookedEntry, the eviction executor body, instead.
-func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, hooks *pruneHooks) (*ExecuteReport, error) {
+// The eviction mode (see pruneHooks) never combines with a pin set: the
+// hooks' unlink takes leaseMu itself, so it cannot run inside
+// unlinkUnlessLeased's critical section. Its entries run through
+// executeHookedEntry, the eviction executor body, instead.
+func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, mode pruneMode) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
 	}
@@ -594,6 +638,23 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	}
 	if grace < 0 {
 		return nil, fmt.Errorf("execute prune: negative grace %v", grace)
+	}
+	pinned, hooks := mode.pinned, mode.hooks
+	switch mode.kind {
+	case pruneModePlain:
+		if pinned != nil || hooks != nil {
+			return nil, errors.New("execute prune: plain mode takes no pin set and no hooks")
+		}
+	case pruneModePressure:
+		if pinned == nil || hooks != nil {
+			return nil, errors.New("execute prune: pressure mode takes a pin set and no hooks")
+		}
+	case pruneModeEvict:
+		if hooks == nil || pinned != nil {
+			return nil, errors.New("execute prune: evict mode takes hooks and no pin set")
+		}
+	default:
+		return nil, fmt.Errorf("execute prune: unknown mode %d", mode.kind)
 	}
 	c.pruneMu.Lock()
 	defer c.pruneMu.Unlock()
@@ -613,19 +674,15 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	// (live) or left a root that read sees (released). pruneMu, which this
 	// function takes itself for the whole pass, keeps watches from nesting.
 	var pins map[string]PruneReason
-	if pinned != nil {
+	if mode.kind == pruneModePressure {
 		c.beginLeaseWatch()
 		defer c.endLeaseWatch()
 		if pins, err = pinned(); err != nil {
 			return nil, fmt.Errorf("execute prune: %w", err)
 		}
 	}
-	if pinned != nil && hooks != nil {
-		return nil, errors.New("execute prune: pinned and hooks are mutually exclusive")
-	}
-
 	var drop map[string]evictReason
-	if hooks != nil && hooks.guard != nil {
+	if mode.kind == pruneModeEvict && hooks.guard != nil {
 		if drop, err = hooks.guard(); err != nil {
 			return nil, fmt.Errorf("execute prune: guard: %w", err)
 		}
@@ -650,7 +707,7 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			refuse(d, fmt.Sprintf("dropped by guard: %s", why), hookRefusal(d.Node.Digest, RefusedByGuard, why))
 			continue
 		}
-		if hooks != nil {
+		if mode.kind == pruneModeEvict {
 			c.executeHookedEntry(root, d, grace, now, hooks, rep, skip, refuse, failed)
 			continue
 		}
@@ -668,7 +725,7 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			if c.beforePruneLock != nil {
 				c.beforePruneLock(d.Node.Digest)
 			}
-			if !c.unlinkUnlessLeased(root, d, grace, now, pinned != nil, repins < maxPruneRepins, rep, skip) {
+			if !c.unlinkUnlessLeased(root, d, grace, now, mode.kind == pruneModePressure, repins < maxPruneRepins, rep, skip, refuse, failed) {
 				break
 			}
 			if pins, err = pinned(); err != nil {
@@ -752,15 +809,20 @@ func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Du
 // It returns true, having changed nothing, when the watch names the digest
 // and mayRepin is set: the watch is reset in this section and the caller must
 // re-read its pins, with leaseMu released, and call again. When the watch
-// names the digest and mayRepin is not set, the entry is kept and skipped and
-// the watch is left as it is, so a later entry it names still forces a
-// re-read.
-func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, guarded, mayRepin bool, rep *ExecuteReport, skip func(PruneDecision, string)) (repin bool) {
+// names the digest and mayRepin is not set, the entry is kept and skipped
+// (typed RefusedByUnlink, EvictKeptLeased) and the watch is left as it is, so
+// a later entry it names still forces a re-read.
+//
+// A blob younger than grace and a failed Remove are skipped with the same
+// typed refusals the eviction body reports (RefusedYoung, RefusedRemoveFailed)
+// beside the unchanged reason strings. A live lease keeps the entry in
+// rep.pinned as ReasonKeptLeased, not in Skipped.
+func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, guarded, mayRepin bool, rep *ExecuteReport, skip func(PruneDecision, string), refuse func(PruneDecision, string, *SkipRefusal), failed func(PruneDecision) *SkipRefusal) (repin bool) {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	if guarded && c.leaseWatchNamesLocked(d.Node.Digest) {
 		if !mayRepin {
-			skip(d, fmt.Sprintf("a new lease still names it after %d pin re-reads", maxPruneRepins))
+			refuse(d, fmt.Sprintf("a new lease still names it after %d pin re-reads", maxPruneRepins), hookRefusal(d.Node.Digest, RefusedByUnlink, evictLeased))
 			return false
 		}
 		c.leaseWatch = make(map[string]struct{})
@@ -789,14 +851,14 @@ func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Du
 		return false
 	}
 	if now.Sub(fi.ModTime()) < grace {
-		skip(d, "younger than grace")
+		refuse(d, "younger than grace", &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedYoung, Reason: EvictKeptYoung})
 		return false
 	}
 	if c.beforePruneUnlink != nil {
 		c.beforePruneUnlink(d.Node.Digest)
 	}
 	if err := root.Remove(rel); err != nil {
-		skip(d, fmt.Sprintf("remove: %v", err))
+		refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
 		return false
 	}
 	rep.Deleted++

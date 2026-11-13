@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -164,7 +165,7 @@ func TestExecutePruneHooks(t *testing.T) {
 			if tc.prep != nil {
 				tc.prep(t, f, b)
 			}
-			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, nil, tc.hooks(f, b))
+			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, hookedMode(tc.hooks(f, b)))
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("executePrune err = %v; want %v", err, tc.wantErr)
@@ -357,7 +358,7 @@ func TestExecutePruneTypedRefusal(t *testing.T) {
 			if tc.edit != nil {
 				tc.edit(plan, b)
 			}
-			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, nil, tc.hooks(f, b))
+			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, hookedMode(tc.hooks(f, b)))
 			if err != nil {
 				t.Fatalf("executePrune: %v", err)
 			}
@@ -405,4 +406,126 @@ func blobOnDisk(t *testing.T, f *gcFixture, digest string) bool {
 		t.Fatalf("Lstat %s: %v", p, err)
 	}
 	return false
+}
+
+// hookedMode is the mode a table case's hooks select: eviction when the case
+// supplies hooks, ExecutePrune's plain mode when it supplies none.
+func hookedMode(h *pruneHooks) pruneMode {
+	if h == nil {
+		return plainPrune()
+	}
+	return evictPrune(h)
+}
+
+// TestUnlinkUnlessLeasedTypedRefusal pins the typed refusals on the plain and
+// pressure bodies (unlinkUnlessLeased): a blob younger than grace and a failed
+// Remove carry the same Refusal the eviction body reports, beside their
+// unchanged reason strings.
+func TestUnlinkUnlessLeasedTypedRefusal(t *testing.T) {
+	t.Parallel()
+
+	modes := map[string]func() pruneMode{
+		"plain": plainPrune,
+		"pressure": func() pruneMode {
+			return pressurePrune(func() (map[string]PruneReason, error) { return nil, nil })
+		},
+	}
+	cases := []struct {
+		name       string
+		prep       func(t *testing.T, path string, now time.Time)
+		wantPrefix string
+		want       SkipRefusal
+	}{
+		{
+			name: "younger than grace",
+			prep: func(t *testing.T, path string, now time.Time) {
+				if err := os.Chtimes(path, now, now); err != nil {
+					t.Fatalf("Chtimes: %v", err)
+				}
+			},
+			wantPrefix: "younger than grace",
+			want:       SkipRefusal{Kind: RefusedYoung, Reason: EvictKeptYoung},
+		},
+		{
+			name: "remove fails",
+			prep: func(t *testing.T, path string, _ time.Time) {
+				dir := filepath.Dir(path)
+				if err := os.Chmod(dir, 0o500); err != nil {
+					t.Fatalf("Chmod: %v", err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+			},
+			wantPrefix: "remove: ",
+			want:       SkipRefusal{Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed},
+		},
+	}
+	for modeName, mode := range modes {
+		for _, tc := range cases {
+			t.Run(modeName+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				if tc.name == "remove fails" && os.Geteuid() == 0 {
+					t.Skip("root ignores directory permissions")
+				}
+				f := newGCFixture(t)
+				b := f.blob("pressure-typed", time.Hour)
+				p, err := f.cache.BlobPath(b)
+				if err != nil {
+					t.Fatalf("BlobPath: %v", err)
+				}
+				nodes, err := f.cache.EnumerateBlobs()
+				if err != nil {
+					t.Fatalf("EnumerateBlobs: %v", err)
+				}
+				plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
+				if err != nil {
+					t.Fatalf("PlanPrune: %v", err)
+				}
+				if len(plan.Delete) != 1 {
+					t.Fatalf("plan.Delete = %d; want 1", len(plan.Delete))
+				}
+				tc.prep(t, p, f.clock)
+				rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, mode())
+				if err != nil {
+					t.Fatalf("executePrune: %v", err)
+				}
+				if len(rep.Skipped) != 1 || rep.Skipped[0].Digest != b {
+					t.Fatalf("Skipped = %+v; want exactly %s", rep.Skipped, b)
+				}
+				s := rep.Skipped[0]
+				if !strings.HasPrefix(s.Reason, tc.wantPrefix) {
+					t.Errorf("Reason = %q; want prefix %q", s.Reason, tc.wantPrefix)
+				}
+				want := tc.want
+				want.Digest = b
+				if s.Refusal == nil || *s.Refusal != want {
+					t.Errorf("Refusal = %+v; want %+v", s.Refusal, want)
+				}
+				if !blobOnDisk(t, f, b) {
+					t.Errorf("refused blob %s was removed anyway", b)
+				}
+			})
+		}
+	}
+}
+
+// TestExecutePruneModeMismatch pins that executePrune refuses a mode whose
+// kind lacks, or carries, the wrong seam, before touching the cache.
+func TestExecutePruneModeMismatch(t *testing.T) {
+	t.Parallel()
+	pinned := func() (map[string]PruneReason, error) { return nil, nil }
+	for name, m := range map[string]pruneMode{
+		"pressure without pins": {kind: pruneModePressure},
+		"evict without hooks":   {kind: pruneModeEvict},
+		"plain with hooks":      {kind: pruneModePlain, hooks: &pruneHooks{}},
+		"evict with pins":       {kind: pruneModeEvict, hooks: &pruneHooks{}, pinned: pinned},
+		"unknown kind":          {kind: 9},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newGCFixture(t)
+			if _, err := f.cache.executePrune(&PrunePlan{}, 0, f.clock, nil, m); err == nil {
+				t.Fatal("executePrune accepted a mismatched mode")
+			}
+		})
+	}
 }

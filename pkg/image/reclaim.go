@@ -575,15 +575,16 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// The pinned re-read (lease watch, live-lease check) guards a pressure pass;
 	// an eviction (narrow) runs through evictGuards' hooks instead, whose
 	// per-blob unlink takes leaseMu itself, so the two are never combined.
-	var pinned pinnedFunc
-	var blobHooks *pruneHooks
+	var blobMode pruneMode
 	var treeHooks *treePruneHooks
 	if narrow {
+		var blobHooks *pruneHooks
 		blobHooks, treeHooks = c.evictGuards(ctx, &cfg)
+		blobMode = evictPrune(blobHooks)
 	} else {
-		pinned = func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
+		blobMode = pressurePrune(func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) })
 	}
-	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned, blobHooks)
+	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, blobMode)
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +604,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
-	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned, blobHooks)
+	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, blobMode)
 	if err != nil {
 		if narrow {
 			cfg.evict.record(rep, artExec)

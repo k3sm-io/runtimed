@@ -131,7 +131,7 @@ func TestEvictRacesRootAndLease(t *testing.T) {
 					cleanup = <-raced
 				})
 			}}
-			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, nil, f.cache.evictHooks(cfg))
+			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, evictPrune(f.cache.evictHooks(cfg)))
 			if cleanup != nil {
 				cleanup()
 			}
@@ -190,7 +190,7 @@ func TestUnlinkUnlessLeasedRootsUnreadable(t *testing.T) {
 	if err := os.MkdirAll(f.cache.PodDir(pid), 0o755); err != nil {
 		t.Fatalf("mkdir pod dir: %v", err)
 	}
-	rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, nil, hooks)
+	rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, evictPrune(hooks))
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}

@@ -101,7 +101,7 @@ func TestExecutePruneWatchResetKeepsAnotherNamedDigest(t *testing.T) {
 		reads++
 		return f.cache.pinnedNow(nil)
 	}
-	rep, err := f.cache.executePrune(planOf(a, b, stray), 0, f.clock, nil, pinned, nil)
+	rep, err := f.cache.executePrune(planOf(a, b, stray), 0, f.clock, nil, pressurePrune(pinned))
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestExecutePruneKeepsABlobLeasedDuringTheRepin(t *testing.T) {
 		}
 		return pins, err
 	}
-	rep, err := f.cache.executePrune(planOf(a, c), 0, f.clock, nil, pinned, nil)
+	rep, err := f.cache.executePrune(planOf(a, c), 0, f.clock, nil, pressurePrune(pinned))
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestExecutePruneExhaustionLeavesTheWatchForLaterEntries(t *testing.T) {
 		reads++
 		return f.cache.pinnedNow(nil)
 	}
-	rep, err := f.cache.executePrune(planOf(a, b), 0, f.clock, nil, pinned, nil)
+	rep, err := f.cache.executePrune(planOf(a, b), 0, f.clock, nil, pressurePrune(pinned))
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestExecutePruneKnownLimitExpiredLeaseDoesNotProtect(t *testing.T) {
 	f.clock = f.clock.Add(2 * time.Minute)
 
 	pinned := func() (map[string]PruneReason, error) { return f.cache.pinnedNow(nil) }
-	rep, err := f.cache.executePrune(planOf(expired, live), 0, f.clock, nil, pinned, nil)
+	rep, err := f.cache.executePrune(planOf(expired, live), 0, f.clock, nil, pressurePrune(pinned))
 	if err != nil {
 		t.Fatalf("executePrune: %v", err)
 	}
