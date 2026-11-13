@@ -45,7 +45,8 @@ func assertFixedSentence(t *testing.T, what, msg, sentence string) {
 	if strings.Contains(msg, "MARKER") || strings.Contains(msg, "/var/") {
 		t.Errorf("%s %q carries the host path", what, msg)
 	}
-	if m := absHostPath.FindString(msg); m != "" {
+	// The reply's "start <pod>/<container>: " prefix is identifiers, not a path.
+	if m := absHostPath.FindString(replyPrefix.ReplaceAllString(msg, "")); m != "" {
 		t.Errorf("%s %q matches the absolute path %q", what, msg, m)
 	}
 	if !strings.Contains(msg, sentence) {
@@ -90,6 +91,8 @@ func assertLoggedAttrs(t *testing.T, out, level, marker string, attrs map[string
 
 // absHostPath matches any absolute-path-looking run: a slash followed by a
 // path element. The fixed sentences carry no slash.
+var replyPrefix = regexp.MustCompile(`^start [A-Za-z0-9._-]+/[A-Za-z0-9._-]+: `)
+
 var absHostPath = regexp.MustCompile(`/[A-Za-z0-9._-]+`)
 
 // TestCreateFailureReplyHidesHostPathsByDefault drives an unwrapped create
