@@ -388,6 +388,10 @@ func openNoFollowAt(dir *os.File, name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
 }
 
+// copyFn is the byte copy byteCopyAt runs. It is a variable only so a test can
+// make the copy fail partway through.
+var copyFn = io.Copy
+
 // byteCopyAt copies src to name inside dir, preserving permission bits. name
 // must not exist; a link at name is refused, never followed.
 func byteCopyAt(src string, dir *os.File, name string) error {
@@ -412,34 +416,44 @@ func byteCopyAt(src string, dir *os.File, name string) error {
 		return err
 	}
 	out := os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name))
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := copyFn(out, in); err != nil {
 		out.Close()
-		return err
+		return removeCreatedAt(dir, name, err)
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return removeCreatedAt(dir, name, err)
+	}
+	return nil
+}
+
+// removeCreatedAt unlinks name, which the failed byte copy created, relative to
+// dir, so a short file never stays at the destination name to be kept as
+// already materialized by the next materialize. It returns cause, or an error
+// carrying both cause and the unlink failure.
+func removeCreatedAt(dir *os.File, name string, cause error) error {
+	uerr := withFD(dir, func(dfd int) error {
+		if err := unix.Unlinkat(dfd, name, 0); err != nil {
+			return &os.PathError{Op: "unlinkat", Path: name, Err: err}
+		}
+		return nil
+	})
+	if uerr != nil {
+		return errors.Join(cause, fmt.Errorf("remove partial copy: %w", uerr))
+	}
+	return cause
 }
 
 // byteCopyFile copies src to dst preserving permission bits. dst must not exist.
 func byteCopyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	// Copy relative to the held parent so a failed copy removes its short file
+	// through the same descriptor it was created in.
+	dir, err := os.OpenFile(filepath.Dir(dst), os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
+	defer dir.Close()
+	return byteCopyAt(src, dir, filepath.Base(dst))
 }
