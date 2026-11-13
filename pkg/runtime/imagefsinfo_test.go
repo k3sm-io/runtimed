@@ -198,3 +198,38 @@ func TestImageFsInfoClassFailureFailsCall(t *testing.T) {
 		t.Errorf("ImageFsInfo returned a response alongside the error: %v", resp)
 	}
 }
+
+// TestImageStoreBytesByClassMatchesImageFsInfo pins that the in-process accessor
+// and the RPC are one computation: equal map and sum on a seeded store, and both
+// fail on a store that cannot be classed.
+func TestImageStoreBytesByClassMatchesImageFsInfo(t *testing.T) {
+	ctx := context.Background()
+	client, rt := imagesTestClient(t)
+	recordIndex(t, rt, "example.test/app:v1", putBlob(t, rt, "image config"), putBlob(t, rt, "layer"))
+	putBlob(t, rt, "stray")
+
+	resp, err := client.ImageFsInfo(ctx, &runtimev1.ImageFsInfoRequest{})
+	if err != nil {
+		t.Fatalf("ImageFsInfo: %v", err)
+	}
+	byClass, sum, err := rt.ImageStoreBytesByClass(ctx)
+	if err != nil {
+		t.Fatalf("ImageStoreBytesByClass: %v", err)
+	}
+	if len(byClass) == 0 {
+		t.Fatal("ImageStoreBytesByClass returned no classes on a seeded store")
+	}
+	if !maps.Equal(byClass, resp.GetStoreBytesByClass()) || sum != resp.GetStoreBytes() {
+		t.Fatalf("accessor = %v (%d); RPC = %v (%d)", byClass, sum, resp.GetStoreBytesByClass(), resp.GetStoreBytes())
+	}
+
+	if err := rt.index.PutArtifactRecord(ctx, "example.test/bad:v1", []byte("not json")); err != nil {
+		t.Fatalf("PutArtifactRecord: %v", err)
+	}
+	if _, err := client.ImageFsInfo(ctx, &runtimev1.ImageFsInfoRequest{}); err == nil {
+		t.Error("ImageFsInfo succeeded with an undecodable artifact record")
+	}
+	if m, n, err := rt.ImageStoreBytesByClass(ctx); err == nil || m != nil || n != 0 {
+		t.Errorf("ImageStoreBytesByClass = %v, %d, %v; want nil, 0, error", m, n, err)
+	}
+}

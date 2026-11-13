@@ -1247,6 +1247,33 @@ func (r *Runtime) ImageIndexSnapshot(ctx context.Context) ([]image.IndexEntry, e
 	return r.index.List(ctx)
 }
 
+// ImageStoreBytesByClass returns the image store's measured bytes per content
+// class (image.ClassImage, one class per artifactType, image.ClassArtifact,
+// image.ClassUnattributed) and their sum.
+//
+// It is the one computation behind ImageFsInfo's store_bytes_by_class and
+// store_bytes, exported so an in-process embedder publishes the same numbers the
+// RPC reports. A class with no content is absent and the sum is of the returned
+// classes, so the two always agree. It fails CLOSED when the store cannot be
+// classed, for the reason ImageFsInfo does: a total beside an empty split would
+// read as "not reported" from a node that does report it.
+func (r *Runtime) ImageStoreBytesByClass(ctx context.Context) (map[string]uint64, uint64, error) {
+	split, err := r.cache.StoreBytesByClass(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("image store bytes by class: %w", err)
+	}
+	var stored uint64
+	byClass := make(map[string]uint64, len(split))
+	for class, n := range split {
+		if n <= 0 {
+			continue
+		}
+		byClass[class] = uint64(n)
+		stored += uint64(n)
+	}
+	return byClass, stored, nil
+}
+
 // sampleInterval is the memory sampler's polling period (Config.SampleInterval,
 // default 1s ≈ the ~1 Hz the design calls for).
 func (r *Runtime) sampleInterval() time.Duration {

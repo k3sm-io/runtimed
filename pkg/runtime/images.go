@@ -143,18 +143,9 @@ func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInf
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	split, err := s.rt.cache.StoreBytesByClass(ctx)
+	byClass, stored, err := s.rt.ImageStoreBytesByClass(ctx)
 	if err != nil {
 		return nil, imageStatusError(err)
-	}
-	var stored uint64
-	byClass := make(map[string]uint64, len(split))
-	for class, n := range split {
-		if n <= 0 {
-			continue
-		}
-		byClass[class] = uint64(n)
-		stored += uint64(n)
 	}
 	return &runtimev1.ImageFsInfoResponse{
 		Filesystems: []*runtimev1.FilesystemUsage{{
