@@ -126,6 +126,14 @@ func requestedPlatform(p *runtimev1.Platform) *image.Platform {
 // store, plus the store subtree's own measured size. The caller does the
 // arithmetic — see FilesystemUsage in the proto, and image.StoreBytes for why
 // the byte count is not a reclaim estimate.
+//
+// store_bytes_by_class splits that size by content class (image.ClassImage,
+// one class per artifactType, image.ClassArtifact, image.ClassUnattributed),
+// and store_bytes is the sum of that split rather than a second walk of the
+// store, so within one response the classes always sum to the total. A class
+// with no content is absent. A failure to class the store fails the call, as a
+// failure to size it always has: a total reported beside an empty split would
+// read as "not reported" from a daemon that does report it.
 func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInfoRequest) (*runtimev1.ImageFsInfoResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
@@ -135,9 +143,18 @@ func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInf
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	stored, err := s.rt.cache.StoreBytes()
+	split, err := s.rt.cache.StoreBytesByClass(ctx)
 	if err != nil {
 		return nil, imageStatusError(err)
+	}
+	var stored uint64
+	byClass := make(map[string]uint64, len(split))
+	for class, n := range split {
+		if n <= 0 {
+			continue
+		}
+		byClass[class] = uint64(n)
+		stored += uint64(n)
 	}
 	return &runtimev1.ImageFsInfoResponse{
 		Filesystems: []*runtimev1.FilesystemUsage{{
@@ -148,7 +165,8 @@ func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInf
 			AvailableBytes: sample.AvailableBytes,
 			InodesUsed:     sample.InodesUsed,
 		}},
-		StoreBytes: uint64(stored),
+		StoreBytes:        stored,
+		StoreBytesByClass: byClass,
 	}, nil
 }
 
