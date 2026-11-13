@@ -34,7 +34,9 @@ import (
 // at the cap round-trips, one byte over is refused before anything is written,
 // and an over-cap record planted on disk is refused by both readers. The
 // symlink and FIFO rows prove openCommitted's open does not follow a final
-// symlink and does not block on a FIFO.
+// symlink and does not block on a FIFO, and the symlinked-directory row proves
+// both readers, anchored at the store, refuse a tree directory that leads out
+// of it.
 func TestTreeRecordWriterRefusesWhatItsReaderRefuses(t *testing.T) {
 	key := treeDigest("a")
 	policy := NativeUnpackPolicy()
@@ -57,7 +59,8 @@ func TestTreeRecordWriterRefusesWhatItsReaderRefuses(t *testing.T) {
 		limit int64
 		// place puts the record at path: "write" through writeTreeRecord,
 		// "plant" with os.WriteFile, "symlink" as a link to a valid record,
-		// "fifo" as a named pipe.
+		// "fifo" as a named pipe, "symlinkdir" as a valid record (and rootfs)
+		// in a directory outside the store, the tree directory a link to it.
 		place string
 		// wantWriteErr is the sentinel writeTreeRecord must return ("write" rows).
 		wantWriteErr error
@@ -69,6 +72,7 @@ func TestTreeRecordWriterRefusesWhatItsReaderRefuses(t *testing.T) {
 		{name: "planted over the cap is refused by both readers", limit: size - 1, place: "plant"},
 		{name: "symlink at the record path is refused", limit: size, place: "symlink"},
 		{name: "fifo at the record path is refused without blocking", limit: size, place: "fifo"},
+		{name: "symlinked tree directory out of the store is refused", limit: size, place: "symlinkdir"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,8 +81,23 @@ func TestTreeRecordWriterRefusesWhatItsReaderRefuses(t *testing.T) {
 			t.Cleanup(func() { treeRecordLimit = saved })
 
 			tmp := t.TempDir()
-			dir := filepath.Join(tmp, "tree")
-			if err := os.MkdirAll(filepath.Join(dir, TreeRootfsName), 0o755); err != nil {
+			store := filepath.Join(tmp, "store")
+			dir := filepath.Join(store, "tree")
+			if tc.place == "symlinkdir" {
+				outside := filepath.Join(tmp, "outside")
+				if err := os.MkdirAll(filepath.Join(outside, TreeRootfsName), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeTreeRecord(filepath.Join(outside, TreeRecordName), rec); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(store, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, dir); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.MkdirAll(filepath.Join(dir, TreeRootfsName), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			path := filepath.Join(dir, TreeRecordName)
@@ -116,12 +135,12 @@ func TestTreeRecordWriterRefusesWhatItsReaderRefuses(t *testing.T) {
 				}
 			}
 
-			root, err := os.OpenRoot(dir)
+			root, err := os.OpenRoot(store)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer root.Close()
-			_, rerr := readTreeRecord(root, TreeRecordName, key)
+			_, rerr := readTreeRecord(root, filepath.Join("tree", TreeRecordName), key)
 			if (rerr == nil) != tc.wantOK {
 				t.Errorf("readTreeRecord = %v, want ok=%v", rerr, tc.wantOK)
 			}
@@ -133,7 +152,7 @@ func TestTreeRecordWriterRefusesWhatItsReaderRefuses(t *testing.T) {
 			done := make(chan result, 1)
 			go func() {
 				u := &Unpacker{}
-				_, ok, err := u.openCommitted(treeLocation{dir: dir, key: key, recordName: TreeRecordName}, policy)
+				_, ok, err := u.openCommitted(treeLocation{dir: dir, storeRoot: store, key: key, recordName: TreeRecordName}, policy)
 				done <- result{ok, err}
 			}()
 			var got result

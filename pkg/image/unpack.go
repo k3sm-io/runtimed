@@ -562,6 +562,10 @@ func (u *Unpacker) Unpack(ctx context.Context, mfst *runtimev1.ImageManifest, po
 type treeLocation struct {
 	// dir is the absolute directory the committed tree lives at.
 	dir string
+	// storeRoot is the store dir lives under (Cache.UnpackedRoot or
+	// Cache.SnapshotsRoot). openCommitted reads the record through an os.Root
+	// opened here, so no component below the store can lead out of it.
+	storeRoot string
 	// key is the content-addressed identity dir is named by: TreeKey under the
 	// native dialect, the OCI chain id under Linux.
 	key string
@@ -632,8 +636,10 @@ func (u *Unpacker) locate(mfst *runtimev1.ImageManifest, policy UnpackPolicy) (t
 	}
 	if policy.Semantics == SemanticsLinux {
 		loc.dir = u.cache.snapshotDir(h.Algorithm, h.Hex)
+		loc.storeRoot = u.cache.SnapshotsRoot()
 	} else {
 		loc.dir = u.cache.treeDir(h.Algorithm, h.Hex)
+		loc.storeRoot = u.cache.UnpackedRoot()
 	}
 	return loc, nil
 }
@@ -717,26 +723,37 @@ func (u *Unpacker) refuseCaseMerge(t *Tree, dstRootfs string) error {
 //
 // A directory with no record, an undecodable record, a record of an unknown
 // version, a record larger than treeRecordLimit, a record path that is a
-// symlink or not a regular file, or a record whose key or policy disagrees with
+// symlink or not a regular file, a tree directory that resolves out of its
+// store, or a record whose key or policy disagrees with
 // the path is ErrTreeInconsistent — refused, not rebuilt over. Rebuilding over it would mean
 // writing into a directory whose provenance is unknown while another process may
 // still be cloning out of it.
 func (u *Unpacker) openCommitted(loc treeLocation, policy UnpackPolicy) (*Tree, bool, error) {
 	dir, key := loc.dir, loc.key
-	// The record is opened with recordOpenFlags (no final symlink followed, no
-	// block on a FIFO) and read through readCheckedRecord: refused unless it is a
-	// regular file on the open descriptor and no larger than treeRecordLimit,
-	// the cap writeTreeRecord enforces. An over-cap record is refused like an
-	// undecodable one, never read whole and never rebuilt over.
-	f, err := os.OpenFile(filepath.Join(dir, loc.recordName), recordOpenFlags, 0)
+	// The record is read the way readTreeRecord reads it: through readAnchored
+	// on an os.Root at the store, so neither the tree directory nor any
+	// component under the store is followed out of it, the final component is
+	// opened with recordOpenFlags (no symlink followed, no block on a FIFO), and
+	// readCheckedRecord refuses anything not a regular file or larger than
+	// treeRecordLimit, the cap writeTreeRecord enforces. An over-cap record is
+	// refused like an undecodable one, never read whole and never rebuilt over.
+	// A missing store, tree directory or record is a miss.
+	rel, err := filepath.Rel(loc.storeRoot, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, false, fmt.Errorf("%w: tree %s is not under its store", ErrTreeInconsistent, quoteBounded(key, maxDigestLen))
+	}
+	root, err := os.OpenRoot(loc.storeRoot)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: open record for %s: %v", ErrTreeInconsistent, quoteBounded(key, maxDigestLen), boundErr(unwrapPath(err)))
+		return nil, false, fmt.Errorf("%w: anchor store for %s: %v", ErrTreeInconsistent, quoteBounded(key, maxDigestLen), boundErr(unwrapPath(err)))
 	}
-	buf, err := readCheckedRecord(f, loc.recordName, treeRecordLimit)
-	f.Close()
+	buf, err := readAnchored(root, filepath.Join(rel, loc.recordName), treeRecordLimit)
+	root.Close()
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: read record for %s: %v", ErrTreeInconsistent, quoteBounded(key, maxDigestLen), boundErr(err))
 	}
@@ -1158,14 +1175,16 @@ const maxOwnershipLineBytes = 64 << 10
 // write and an unbounded read, and it is sized so that every record the inputs'
 // own caps admit fits. A record is a small fixed envelope plus, per layer, one
 // quoted digest in Layers (about 74 bytes for sha256) natively, and on the
-// Linux path one more in DiffIDs (about 148 bytes per layer). The manifest that
+// Linux path that digest plus one more in DiffIDs, about 148 bytes per layer in
+// total (74 for the layer digest, 74 for the diff id). The manifest that
 // supplies the layers is capped at 4 MiB when its index entry is recorded
 // (maxIndexManifestBytes, index.go) and the Linux path's config that supplies
 // the diffIDs at 4 MiB (maxArchiveMetadataBytes, load.go). A layer descriptor
 // the unpacker can apply costs at least about 147 bytes of manifest (it must
 // carry one of the closed set of layer media types), so a 4 MiB manifest names
-// at most about 28,500 layers: about 2.1 MiB of record natively and about
-// 4.2 MiB on the Linux path. 5 MiB keeps headroom over both.
+// at most about 28,500 layers (4 MiB / 147 bytes): times 74 bytes, about
+// 2.0 MiB of record natively, and times 148 bytes, about 4.0 MiB on the Linux
+// path. 5 MiB keeps headroom over both.
 const maxTreeRecordBytes = 5 << 20
 
 // ErrTreeRecordTooLarge reports that a serialized tree record is larger than
