@@ -233,6 +233,13 @@ func (l *Loader) Load(ctx context.Context, req LoadRequest, src io.Reader) (*Loa
 		return nil, fmt.Errorf("load image %q: %w", ref, err)
 	}
 
+	// The layer limit before any blob is verified or leased: the archive's
+	// manifest is a claim like a registry's, and both phases below are linear
+	// in its layer count.
+	if err := refuseLayerCount(len(img.layers), img.manifestRaw); err != nil {
+		return nil, fmt.Errorf("load image %q: %w", ref, err)
+	}
+
 	// phase 1 — verify every blob before the store is touched at all. See the
 	// Loader doc comment: this pass is what makes a mismatch reject the whole
 	// load instead of leaving the blobs that happened to come first behind.

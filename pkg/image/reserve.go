@@ -48,6 +48,36 @@ var ErrSizeOverflow = errors.New("image: space arithmetic overflows")
 // sane one. artifact.ErrDeclaredSizeRejected is the same value.
 var ErrDeclaredSizeRejected = errors.New("image: refusing the pull, the manifest declares more than the store volume can hold")
 
+// MaxManifestLayers is the most layers one image manifest may name. A manifest
+// is the serving source's claim, and every path that acts on one (lease,
+// reservation, per-layer fetch, presence check) does work linear in its layer
+// count, so an unbounded count is a cost the source chooses for this node. Real
+// images stay in the tens; 4096 is far above any of them.
+const MaxManifestLayers = 4096
+
+// ErrTooManyLayers reports a manifest naming more than MaxManifestLayers
+// layers. It refuses that manifest, not the reference: another source may
+// serve a sane one.
+var ErrTooManyLayers = errors.New("image: refusing the manifest, it names too many layers")
+
+// ErrManifestTooLarge reports manifest bytes over maxIndexManifestBytes, the
+// cap the index already applies to the bytes it retains: a manifest over it
+// would be fetched and committed only to fail at the record.
+var ErrManifestTooLarge = errors.New("image: refusing the manifest, its bytes exceed the manifest size cap")
+
+// refuseLayerCount is the one check every manifest-acting path runs before it
+// leases, reserves or fetches: n is the manifest's layer count and rawManifest,
+// when not nil, its exact bytes.
+func refuseLayerCount(n int, rawManifest []byte) error {
+	if n > MaxManifestLayers {
+		return fmt.Errorf("%w: %d layers, limit %d", ErrTooManyLayers, n, MaxManifestLayers)
+	}
+	if rawManifest != nil && len(rawManifest) > maxIndexManifestBytes {
+		return fmt.Errorf("%w: %d bytes, limit %d", ErrManifestTooLarge, len(rawManifest), maxIndexManifestBytes)
+	}
+	return nil
+}
+
 // SpaceLedger is the in-process ledger of the bytes in-flight pulls have
 // reserved on the store volume. The daemon builds one and hands the same
 // instance to the image puller (WithSpaceLedger) and the artifact puller, so

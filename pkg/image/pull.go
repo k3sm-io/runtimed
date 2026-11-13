@@ -357,6 +357,11 @@ func resolveRemote(r name.Reference, ref string, want []Platform, opts []remote.
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
+	// The layer limit before the config GET: the manifest is already in hand,
+	// and an over-limit one is refused before this pull spends a request on it.
+	if err := refuseImageManifest(img); err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
 	// The child's own config is the authority — an index descriptor's platform
 	// is unsigned parent metadata (see VerifyConfigPlatform).
 	cfg, err := img.ConfigFile()
@@ -995,21 +1000,6 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 // layer then comes through the partial store (resumeBlob) rather than from
 // img, and a cut transfer is resumed by the next pull.
 func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, want []Platform, src *BlobSource) (_ *PullResult, retErr error) {
-	cfg, err := img.ConfigFile()
-	if err != nil {
-		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
-	}
-	// The platform the image's own config declares, as verified against this
-	// pod's candidates — that is the half of the index key the reference does not
-	// carry, and taking it from the verifier means the recorded key can only ever
-	// be a platform this pull proved runnable here.
-	resolved, err := VerifyConfigPlatform(cfg, want)
-	if err != nil {
-		return nil, fmt.Errorf("pull %q: %w", ref, err)
-	}
-
-	wroteAny := false
-
 	// The MANIFEST is resolved before any blob is written, because it — not the
 	// object that hands over the bytes — is where every claimed digest comes
 	// from. img.ConfigName() and layer.Digest() are not used as claimed values:
@@ -1032,6 +1022,28 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 	if err != nil {
 		return nil, fmt.Errorf("raw manifest %q: %w", ref, boundErr(err))
 	}
+	// The LAYER LIMIT, on the manifest just read and before the config fetch,
+	// the lease, the reservation and any layer: the manifest is the source's
+	// claim, and everything below does work linear in its layer count.
+	if err := refuseLayerCount(len(mfst.Layers), rawMfst); err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
+
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
+	}
+	// The platform the image's own config declares, as verified against this
+	// pod's candidates — that is the half of the index key the reference does not
+	// carry, and taking it from the verifier means the recorded key can only ever
+	// be a platform this pull proved runnable here.
+	resolved, err := VerifyConfigPlatform(cfg, want)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
+
+	wroteAny := false
+
 	mfstDigest, err := img.Digest()
 	if err != nil {
 		return nil, fmt.Errorf("manifest digest %q: %w", ref, boundErr(err))
@@ -1196,17 +1208,43 @@ func manifestDescriptorDigests(mfst *ggcrv1.Manifest) []string {
 // serves.
 func (p *Puller) presentAs(ctx context.Context, policy PlatformPolicy, refs ...string) (IndexEntry, *Lease, bool, error) {
 	seen := make(map[string]bool, len(refs))
+	var refused error
 	for _, r := range refs {
 		if r == "" || seen[r] {
 			continue
 		}
 		seen[r] = true
 		entry, lease, ok, err := p.presentLocally(ctx, r, policy)
+		if refusal(err) {
+			// One spelling's entry is over the limit; another may serve.
+			if refused == nil {
+				refused = err
+			}
+			continue
+		}
 		if err != nil || ok {
 			return entry, lease, ok, err
 		}
 	}
-	return IndexEntry{}, nil, false, nil
+	return IndexEntry{}, nil, false, refused
+}
+
+// refusal reports whether err is a manifest-limit refusal (refuseLayerCount).
+func refusal(err error) bool {
+	return errors.Is(err, ErrTooManyLayers) || errors.Is(err, ErrManifestTooLarge)
+}
+
+// refuseImageManifest is refuseLayerCount over a resolved image's manifest.
+func refuseImageManifest(img ggcrv1.Image) error {
+	raw, err := img.RawManifest()
+	if err != nil {
+		return fmt.Errorf("raw manifest: %w", boundErr(err))
+	}
+	mfst, err := img.Manifest()
+	if err != nil {
+		return fmt.Errorf("manifest: %w", boundErr(err))
+	}
+	return refuseLayerCount(len(mfst.Layers), raw)
 }
 
 // presentLocally reports whether ref is on this node for policy's platform: the
@@ -1228,6 +1266,12 @@ func (p *Puller) presentLocally(ctx context.Context, ref string, policy Platform
 	mfst := entry.Manifest
 	if !ok || mfst == nil {
 		return IndexEntry{}, nil, false, nil
+	}
+	// The layer limit before the lease: a recorded entry over it is an error,
+	// not a miss, so Never reports the refusal rather than "not present" and
+	// IfNotPresent does not go and fetch the same manifest again.
+	if err := refuseLayerCount(len(mfst.GetLayers()), entry.ManifestRaw); err != nil {
+		return IndexEntry{}, nil, false, fmt.Errorf("image %q: %w", ref, err)
 	}
 	// LEASE before the presence check, not after it. This path writes nothing at
 	// all, so there is no commit to hang a pin on and no mtime change for a grace
