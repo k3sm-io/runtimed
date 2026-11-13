@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	storagev1 "k3sm.io/apis/storage/v1"
 	"k3sm.io/runtimed/pkg/image"
 )
 
@@ -192,6 +193,95 @@ func TestSeedReusesDataDirCreatedDuringSeed(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(dataDir, "a.sql")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("template file present in data dir (err=%v); want not seeded", err)
+	}
+	if _, err := os.Lstat(stagingDir(dataDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staging dir remains (err=%v)", err)
+	}
+}
+
+// emptyDirCloner byte-copies but, on its first Clone, creates the data dir
+// empty (or as a regular file when asFile), modelling another creator mid-seed.
+type emptyDirCloner struct {
+	dataDir string
+	asFile  bool
+	done    bool
+}
+
+func (c *emptyDirCloner) Clone(src, dst string) (bool, error) {
+	if !c.done {
+		c.done = true
+		if c.asFile {
+			if err := os.MkdirAll(filepath.Dir(c.dataDir), 0o755); err != nil {
+				return false, err
+			}
+			if err := os.WriteFile(c.dataDir, []byte("F"), 0o644); err != nil {
+				return false, err
+			}
+		} else if err := os.MkdirAll(c.dataDir, 0o755); err != nil {
+			return false, err
+		}
+	}
+	return image.ByteCopier{}.Clone(src, dst)
+}
+
+func seedRaceFixture(t *testing.T) (class storagev1.LocalPathClass, tmpl fakeTemplate, dataDir, rootfs string) {
+	t.Helper()
+	root := t.TempDir()
+	class = testClass(root)
+	src := filepath.Join(root, "template")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"a.sql", "b.sql"} {
+		if err := os.WriteFile(filepath.Join(src, n), []byte(n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tmpl = fakeTemplate{dir: src, present: true}
+	var err error
+	if dataDir, err = class.DataDir("prod", "seeded"); err != nil {
+		t.Fatal(err)
+	}
+	rootfs = filepath.Join(root, "pods", "pod-a", "rootfs")
+	if err := os.MkdirAll(rootfs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return class, tmpl, dataDir, rootfs
+}
+
+// TestSeedReusesEmptyDataDirCreatedDuringSeed pins that an empty data dir made
+// mid-seed is reused, not replaced: os.Rename refuses to replace a directory
+// (EEXIST), so the bind succeeds unseeded, the dir stays empty, and no staging
+// dir remains.
+func TestSeedReusesEmptyDataDirCreatedDuringSeed(t *testing.T) {
+	class, tmpl, dataDir, rootfs := seedRaceFixture(t)
+	box := pvcBox("prod", "data", "seeded", "/seed", false)
+	bindings, err := NewBinder(class, &emptyDirCloner{dataDir: dataDir}, tmpl, nil).Bind(context.Background(), box, rootfs)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if bindings[0].Seeded {
+		t.Error("Seeded = true; want false (os.Rename does not replace a directory)")
+	}
+	if entries, err := os.ReadDir(dataDir); err != nil || len(entries) != 0 {
+		t.Errorf("data dir entries = %v, %v; want the creator's empty dir", entries, err)
+	}
+	if _, err := os.Lstat(stagingDir(dataDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staging dir remains (err=%v)", err)
+	}
+}
+
+// TestSeedFailsWhenDataPathIsFileDuringSeed pins that a regular file at the data
+// path mid-seed (rename fails ENOTDIR) fails the bind, keeps the file, and
+// leaves no staging dir.
+func TestSeedFailsWhenDataPathIsFileDuringSeed(t *testing.T) {
+	class, tmpl, dataDir, rootfs := seedRaceFixture(t)
+	box := pvcBox("prod", "data", "seeded", "/seed", false)
+	if _, err := NewBinder(class, &emptyDirCloner{dataDir: dataDir, asFile: true}, tmpl, nil).Bind(context.Background(), box, rootfs); err == nil {
+		t.Fatal("Bind succeeded over a regular file at the data path; want an error")
+	}
+	if b, err := os.ReadFile(dataDir); err != nil || string(b) != "F" {
+		t.Errorf("data path = %q, %v; want the untouched file", b, err)
 	}
 	if _, err := os.Lstat(stagingDir(dataDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("staging dir remains (err=%v)", err)

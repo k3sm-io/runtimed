@@ -280,6 +280,10 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName, dataDir 
 // is removed before seeding, and seedMu serializes seeds so two binds of one
 // shared claim never interleave in it. The second bind re-checks dataDir under
 // the lock and reuses what the first one seeded.
+//
+// Any dataDir another creator makes during the seed, empty or not, is reused
+// (Seeded=false): os.Rename refuses to replace an existing directory (EEXIST)
+// even though rename(2) itself would replace an empty one on Darwin.
 func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, err error) {
 	b.seedMu.Lock()
 	defer b.seedMu.Unlock()
@@ -299,8 +303,12 @@ func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, e
 	if err := os.Mkdir(staging, 0o755); err != nil {
 		return false, fmt.Errorf("create pv staging dir %s: %w", staging, err)
 	}
+	// The deferred cleanup is the single owner of staging removal: it runs on
+	// every error and when the rename lost the race (lostRace), so a removal
+	// failure is reported once.
+	lostRace := false
 	defer func() {
-		if err != nil {
+		if err != nil || lostRace {
 			if rmErr := os.RemoveAll(staging); rmErr != nil {
 				err = errors.Join(err, fmt.Errorf("remove pv staging dir %s: %w", staging, rmErr))
 			}
@@ -312,9 +320,7 @@ func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, e
 	if err := os.Rename(staging, dataDir); err != nil {
 		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
 			// Lost the race to another creator: reuse its dir, never re-seed.
-			if rmErr := os.RemoveAll(staging); rmErr != nil {
-				return false, fmt.Errorf("remove pv staging dir %s: %w", staging, rmErr)
-			}
+			lostRace = true
 			return false, nil
 		}
 		return false, fmt.Errorf("move seeded pv into place at %s: %w", dataDir, err)
