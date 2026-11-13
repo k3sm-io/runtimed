@@ -37,14 +37,13 @@ const DefaultLeaseTTL = 15 * time.Minute
 
 // Lease pins a set of blob digests against reclaim while an ingest is in flight.
 //
-// While live, it covers the window the content-addressed store cannot cover on
-// its own: a blob is committed (or found already present) before the reference that makes
-// it reachable is recorded, so between those two moments the blob is on disk and
-// named by nothing. A concurrent prune would compute it unreachable and delete
-// the layer of the pull that is still running. The lease is therefore acquired
-// over the whole manifest digest set before the presence check — not before the
-// first write — because a cache HIT writes nothing at all, and the hit path is
-// exactly where the blob is old enough for a grace window to have expired.
+// While live, it covers the window the content-addressed store cannot cover on its own: a blob is
+// committed (or found already present) before the reference that makes it reachable is recorded, so
+// between those two moments the blob is on disk and named by nothing. A concurrent prune would
+// compute it unreachable and delete the layer of the pull that is still running. The lease is
+// therefore acquired over the whole manifest digest set before the presence check — not before the
+// first write — because a cache HIT writes nothing at all, and the hit path is exactly where the
+// blob is old enough for a grace window to have expired.
 //
 // A Lease is safe for concurrent use and Release is idempotent; the zero value
 // and a nil *Lease both Release as no-ops so a caller that never took one, or

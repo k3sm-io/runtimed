@@ -311,10 +311,11 @@ type KeptBlob struct {
 //     without ever knowing which. This loop re-measures with statfs after every
 //     unlink and stops on the measured target.
 //
-// The safety property, stated exactly: a blob named by any pod's daemon-authored
-// reachability record, or pinned by any live ingest lease, is never in the delete
-// plan (a lease past its TTL no longer pins; executePrune states that residual) — and if the root set cannot be enumerated in full, nothing is deleted
-// (ErrRootsIncomplete). Reclaim is not best-effort about liveness; it refuses.
+// The safety property, stated exactly: a blob named by any pod's daemon-authored reachability
+// record, or pinned by any live ingest lease, is never in the delete plan (a lease past its TTL no
+// longer pins; the Lease type's comment states that residual) — and if the root set cannot be
+// enumerated in full, nothing is deleted (ErrRootsIncomplete). Reclaim is not best-effort about
+// liveness; it refuses.
 //
 // The pass sweeps two stores: the content-addressed blobs, and the derived trees
 // under unpacked/ and snapshots/. Trees are decided from the same root set under
