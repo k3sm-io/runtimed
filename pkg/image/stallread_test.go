@@ -1,0 +1,320 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package image
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
+)
+
+// layerBodyServer is a registry that serves one layer blob through body, which
+// writes the layer's bytes however the row wants; every other path is the real
+// in-process registry.
+func layerBodyServer(t *testing.T, body func(w http.ResponseWriter, r *http.Request, layer []byte)) string {
+	t.Helper()
+	img := testImage(t, "darwin", "arm64", "")
+	layers, err := img.Layers()
+	if err != nil || len(layers) != 1 {
+		t.Fatalf("layers: %d, %v", len(layers), err)
+	}
+	ld, err := layers[0].Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := layers[0].Compressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/blobs/"+ld.String()) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(layer)))
+			w.Header().Set("Docker-Content-Digest", ld.String())
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case <-done:
+			default:
+				body(w, r, layer)
+			}
+			return
+		}
+		store.ServeHTTP(w, r)
+	}))
+	// Cleanups run last-in first-out: release any held handler, then close.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(done) })
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := name.ParseReference(u.Host + "/stall/app:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Write(ref, img); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	return ref.String()
+}
+
+// TestLayerPullStalledBodyAborts is the gate for the layer-body watchdog end
+// to end: a layer whose body stops after a few bytes while the server holds the
+// connection fails the pull with ErrLayerBodyStalled. That a body which keeps
+// delivering is never cut is pinned with a fake timer in TestStallReader.
+func TestLayerPullStalledBodyAborts(t *testing.T) {
+	ref := layerBodyServer(t, func(w http.ResponseWriter, r *http.Request, layer []byte) {
+		_, _ = w.Write(layer[:16])
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustPullerIndex(t, cache, RemoteFetch, NoLocalIndex{})
+	p.layerStallWindow = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := p.Pull(ctx, ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+	if res != nil && res.Lease != nil {
+		res.Lease.Release()
+	}
+	if !errors.Is(err, ErrLayerBodyStalled) {
+		t.Fatalf("Pull error = %v, want ErrLayerBodyStalled", err)
+	}
+}
+
+// errReadCloser is a body whose every Read fails with err.
+type errReadCloser struct{ err error }
+
+func (e errReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e errReadCloser) Close() error             { return nil }
+
+// fakeTimer is a hand-driven stallTimer on a virtual clock: advance moves the
+// clock and runs the callback if the timer is armed and its deadline passed.
+// armed receives a value on every Reset so a test can wait for a Read to be in
+// flight without sleeping.
+type fakeTimer struct {
+	mu       sync.Mutex
+	f        func()
+	now      time.Duration
+	deadline time.Duration
+	running  bool
+	armed    chan struct{}
+}
+
+func newFakeTimer() *fakeTimer { return &fakeTimer{armed: make(chan struct{}, 64)} }
+
+// afterFunc is the stallReader.afterFunc the fake stands in for.
+func (ft *fakeTimer) afterFunc(d time.Duration, f func()) stallTimer {
+	ft.mu.Lock()
+	ft.f = f
+	ft.mu.Unlock()
+	ft.Reset(d)
+	return ft
+}
+
+func (ft *fakeTimer) Reset(d time.Duration) bool {
+	ft.mu.Lock()
+	was := ft.running
+	ft.deadline, ft.running = ft.now+d, true
+	ft.mu.Unlock()
+	select {
+	case ft.armed <- struct{}{}:
+	default:
+	}
+	return was
+}
+
+func (ft *fakeTimer) Stop() bool {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	was := ft.running
+	ft.running = false
+	return was
+}
+
+// advance moves the virtual clock by d and reports whether the timer fired.
+func (ft *fakeTimer) advance(d time.Duration) bool {
+	ft.mu.Lock()
+	ft.now += d
+	fire := ft.running && ft.now >= ft.deadline
+	if fire {
+		ft.running = false
+	}
+	f := ft.f
+	ft.mu.Unlock()
+	if fire {
+		f()
+	}
+	return fire
+}
+
+// newFakeStallReader is newStallReader with ft in place of time.AfterFunc.
+func newFakeStallReader(body io.ReadCloser, window time.Duration, ft *fakeTimer) *stallReader {
+	return (&stallReader{body: body, window: window, afterFunc: ft.afterFunc}).start()
+}
+
+// clockedReader delivers one byte of data per Read, each taking step of the
+// fake clock while the watchdog is armed.
+type clockedReader struct {
+	data []byte
+	step time.Duration
+	ft   *fakeTimer
+}
+
+func (c *clockedReader) Read(p []byte) (int, error) {
+	if len(c.data) == 0 {
+		return 0, io.EOF
+	}
+	if c.ft.advance(c.step) {
+		return 0, errors.New("clockedReader: watchdog fired mid-read")
+	}
+	n := copy(p[:1], c.data)
+	c.data = c.data[n:]
+	return n, nil
+}
+
+func (c *clockedReader) Close() error { return nil }
+
+// TestStallReader pins the watchdog at the reader level on a fake timer: it
+// times only the body.Read, never the consumer between Reads; a stall reports
+// the sentinel with the read's error as the cause and stays reported; bytes that
+// keep flowing are never cut; and an error the watchdog did not cause is
+// returned unchanged.
+func TestStallReader(t *testing.T) {
+	const window = 2 * time.Minute
+
+	t.Run("a slow consumer is never reported as a stall", func(t *testing.T) {
+		ft := newFakeTimer()
+		want := bytes.Repeat([]byte("k3sm"), 4)
+		s := newFakeStallReader(io.NopCloser(bytes.NewReader(want)), window, ft)
+		defer s.Close()
+		var got []byte
+		buf := make([]byte, 4)
+		for {
+			n, err := s.Read(buf)
+			got = append(got, buf[:n]...)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Read after %d bytes: %v", len(got), err)
+			}
+			// A slow CommitBlob write between Reads: three windows pass.
+			if ft.advance(3 * window) {
+				t.Fatalf("watchdog fired between Reads after %d bytes", len(got))
+			}
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("read %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a body.Read that blocks a window reports the sentinel and stays stalled", func(t *testing.T) {
+		ft := newFakeTimer()
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		s := newFakeStallReader(pr, window, ft)
+		defer s.Close()
+		<-ft.armed // the stopped timer start created
+		type result struct {
+			n   int
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			n, err := s.Read(make([]byte, 8))
+			done <- result{n, err}
+		}()
+		<-ft.armed // the Read armed the watchdog
+		if ft.advance(window - time.Nanosecond) {
+			t.Fatal("watchdog fired before a whole window")
+		}
+		if !ft.advance(time.Nanosecond) {
+			t.Fatal("watchdog did not fire at a whole window")
+		}
+		r := <-done
+		if r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
+			t.Fatalf("Read = %d, %v; want 0, ErrLayerBodyStalled", r.n, r.err)
+		}
+		if !strings.Contains(r.err.Error(), io.ErrClosedPipe.Error()) {
+			t.Fatalf("stall error %q does not name the cause %q", r.err, io.ErrClosedPipe)
+		}
+		for i := 0; i < 3; i++ {
+			if _, err := s.Read(make([]byte, 8)); !errors.Is(err, ErrLayerBodyStalled) {
+				t.Fatalf("Read %d after stall = %v, want ErrLayerBodyStalled", i, err)
+			}
+		}
+	})
+
+	t.Run("bytes that keep flowing are never cut", func(t *testing.T) {
+		// A byte every eighth of a window, five windows in all.
+		ft := newFakeTimer()
+		want := bytes.Repeat([]byte("k3sm"), 10)
+		body := &clockedReader{data: want, step: window / 8, ft: ft}
+		s := newFakeStallReader(body, window, ft)
+		defer s.Close()
+		got, err := io.ReadAll(s)
+		if err != nil {
+			t.Fatalf("ReadAll of a flowing body: %v", err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("read %q, want %q", got, want)
+		}
+		ft.mu.Lock()
+		elapsed := ft.now
+		ft.mu.Unlock()
+		if elapsed < 4*window {
+			t.Fatalf("flow ran %s of fake time, want at least %s", elapsed, 4*window)
+		}
+	})
+
+	t.Run("an error the watchdog did not cause is returned unchanged", func(t *testing.T) {
+		cause := errors.New("connection reset by peer")
+		s := newFakeStallReader(errReadCloser{cause}, window, newFakeTimer())
+		defer s.Close()
+		if _, err := s.Read(make([]byte, 8)); err != cause {
+			t.Fatalf("Read error = %v, want the body's error unchanged", err)
+		}
+	})
+}

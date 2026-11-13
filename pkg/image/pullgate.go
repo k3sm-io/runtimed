@@ -19,6 +19,8 @@ package image
 import (
 	"errors"
 	"fmt"
+
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // DefaultPullRefuseFreeBytes is the free-space floor under which the daemon
@@ -97,6 +99,30 @@ type PullerOption func(*Puller)
 // blob fetched, exactly as without the option.
 func WithLocalBlobSource(src LocalBlobSource) PullerOption {
 	return func(p *Puller) { p.localBlobs = src }
+}
+
+// WithRegistryBlobSource pairs a direct blob route with the primary fetcher
+// (primary, the counterpart of NewPuller's fetch) and with the cluster-mirror
+// fetcher (mirror, the counterpart of WithMirrors' fetch). The production pair
+// is RemoteBlobSource and RemoteMirrorBlobSource, matching RemoteFetch and
+// RemoteMirrorFetch. Either nil yields no route for that path; the flat
+// registry's route needs no option, because its transport is the puller's own.
+// The routes are data only: which bytes are committed is unchanged.
+func WithRegistryBlobSource(primary BlobSourceFunc, mirror MirrorBlobSourceFunc) PullerOption {
+	return func(p *Puller) {
+		p.remoteBlobs = primary
+		p.mirrorBlobs = mirror
+	}
+}
+
+// WithPartialStore has the puller keep each layer's received bytes in store
+// while it fetches them over the reference's direct blob route
+// (WithRegistryBlobSource), so a pull cut mid-layer is resumed by the next one
+// with a Range request. Every resumed layer is still re-hashed whole by
+// CommitBlob before it is committed. A layer with no route, or a nil store,
+// is fetched from byte 0 exactly as without the option.
+func WithPartialStore(store *registryfetch.PartialStore) PullerOption {
+	return func(p *Puller) { p.partials = store }
 }
 
 // WithPullFloor overrides the free-space floor under which new fetches are

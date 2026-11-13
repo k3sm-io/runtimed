@@ -27,6 +27,7 @@ import (
 	"testing"
 
 	"k3sm.io/runtimed/pkg/artifact"
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -164,5 +165,81 @@ func TestCreatePodImageVolumePullRefusalReasons(t *testing.T) {
 				t.Errorf("reason = %v, want %v", resp.GetFailureReason(), tc.want)
 			}
 		})
+	}
+}
+
+// TestCreatePodImageVolumeRecheckFailureAfterHold: a pull whose re-check
+// fails after the pod's hold was written (artifact.ErrBlobReclaimed) refuses
+// the create with ArtifactPullRefused and IMAGE_PULL. That the failed create
+// then releases it: the hold is written through artifact.WithHold before the
+// failure, and gone from both ArtifactHolds and HeldManifests after it.
+// (TestFailedCreateRemovesOnlyItsOwnHold fails its pull before the hold
+// callback runs, so it cannot prove this.)
+func TestCreatePodImageVolumeRecheckFailureAfterHold(t *testing.T) {
+	var rt *Runtime
+	var heldAtFailure bool
+	ap := &scriptedArtifactPuller{afterHold: func() error {
+		holds, err := rt.index.ArtifactHolds(context.Background())
+		if err != nil {
+			t.Error(err)
+		}
+		pid, _ := image.ParsePodID("pod-recheck")
+		for _, m := range holds[pid].Manifests {
+			heldAtFailure = heldAtFailure || m.Digest == sha([]byte("m"))
+		}
+		return fmt.Errorf("w.safetensors: %w", artifact.ErrBlobReclaimed)
+	}}
+	rt = newTestRuntime(t, Deps{ArtifactPuller: ap})
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: imageVolumeBox(rt, "pod-recheck", artifactTestHost+"/models/tiny:v1")})
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if !heldAtFailure {
+		t.Error("the pod's hold did not name the manifest when the re-check failed")
+	}
+	if !strings.HasPrefix(resp.GetError().GetMessage(), "ArtifactPullRefused") {
+		t.Errorf("error = %q, want it to begin with ArtifactPullRefused", resp.GetError().GetMessage())
+	}
+	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL {
+		t.Errorf("reason = %v, want IMAGE_PULL", resp.GetFailureReason())
+	}
+	holds, err := rt.index.ArtifactHolds(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := image.ParsePodID("pod-recheck")
+	if h, ok := holds[pid]; ok {
+		t.Errorf("the failed create left the pod's hold behind: %+v", h)
+	}
+	held, err := rt.index.HeldManifests(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held[sha([]byte("m"))] {
+		t.Error("the manifest is still held after the failed create")
+	}
+}
+
+// holdlessPuller succeeds without running the WithHold callback.
+type holdlessPuller struct{ *scriptedArtifactPuller }
+
+func (h holdlessPuller) PullForPod(ctx context.Context, ref string, cred *image.RegistryCredential, policy runtimev1.ArtifactPolicy, paths []string, _ ...artifact.PullOption) (*artifact.Result, error) {
+	return h.PullArtifact(ctx, ref, cred, policy, paths)
+}
+
+// TestCreatePodImageVolumeRefusesPullWithoutHold: a puller that reports
+// success without writing the pod's hold fails the mount closed, so a
+// wrapper that drops WithHold cannot skip the re-check silently.
+func TestCreatePodImageVolumeRefusesPullWithoutHold(t *testing.T) {
+	rt := newTestRuntime(t, Deps{ArtifactPuller: holdlessPuller{&scriptedArtifactPuller{}}})
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: imageVolumeBox(rt, "pod-holdless", artifactTestHost+"/models/tiny:v1")})
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if !strings.HasPrefix(resp.GetError().GetMessage(), "ArtifactMountRefused") || !strings.Contains(resp.GetError().GetMessage(), errHoldNotWritten.Error()) {
+		t.Errorf("error = %q, want ArtifactMountRefused naming the missing hold", resp.GetError().GetMessage())
+	}
+	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP {
+		t.Errorf("reason = %v, want ROOTFS_SETUP", resp.GetFailureReason())
 	}
 }

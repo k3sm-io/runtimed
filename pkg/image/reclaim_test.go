@@ -648,3 +648,62 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 		}
 	})
 }
+
+// TestReclaimKeepsBlobHeldBetweenPlanAndUnlink drives an artifact cache hit
+// into the window between the pass's root and lease reads and its first
+// unlink: the pull leases the blob, finds it present (touching nothing),
+// rewrites its record, writes the pod's hold and releases the lease. The plan
+// condemned the blob before any of that, and the lease is gone by the time
+// the executor runs, so only a re-read of the roots before the unlink can keep
+// it. An unreferenced blob next to it is removed, so the pass is not vacuous.
+func TestReclaimKeepsBlobHeldBetweenPlanAndUnlink(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	held := f.blob("artifact layer hit from cache", 24*time.Hour)
+	stray := f.blob("unreferenced layer", 24*time.Hour)
+	pid := f.pod("pod-artifact")
+	x, err := NewFileIndex(f.cache)
+	if err != nil {
+		t.Fatalf("NewFileIndex: %v", err)
+	}
+	sum := sha256.Sum256([]byte("held artifact manifest"))
+	manifest := "sha256:" + hex.EncodeToString(sum[:])
+	key := "registry.example/models/m:v1@" + testModelType
+
+	cfg := ReclaimConfig{
+		HighFreeBytes: 1 << 40, TargetFreeBytes: 1 << 40, Grace: 0,
+		FreeBytes: (&fakeFree{free: []uint64{0}}).sample,
+	}
+	cfg.afterRoots = func() {
+		lease := f.cache.AcquireLease([]string{held}, time.Minute)
+		defer lease.Release()
+		if !f.cache.Has(held) {
+			t.Errorf("the cache hit found its blob absent before the unlink")
+		}
+		putTypedArtifact(t, x, key, testModelType, held, held)
+		if err := x.AddArtifactHoldManifest(context.Background(), pid, HeldManifest{
+			Digest: manifest, Config: held, Layers: []string{held},
+		}); err != nil {
+			t.Errorf("AddArtifactHoldManifest: %v", err)
+		}
+	}
+	rep, err := f.cache.ReclaimUnderPressure(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("ReclaimUnderPressure: %v", err)
+	}
+	if !f.exists(held) {
+		t.Errorf("a blob a hold and a record named before the unlink was deleted")
+	}
+	if f.exists(stray) {
+		t.Errorf("the unreferenced blob survived, so the pass proved nothing")
+	}
+	var reason PruneReason
+	for _, k := range rep.Kept {
+		if k.Digest == held {
+			reason = k.Reason
+		}
+	}
+	if reason != ReasonKeptInUse {
+		t.Errorf("held blob kept for reason %q; want %q", reason, ReasonKeptInUse)
+	}
+}
