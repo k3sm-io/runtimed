@@ -83,6 +83,9 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 		{name: "ipv6 bracketed other port", registry: "[::1]:5000", insecure: true, scheme: "http", host: "[::1]:5001"},
 		{name: "ipv6 bracketed default port omitted", registry: "[::1]", insecure: true, scheme: "http", host: "[::1]:80", creds: true},
 		{name: "ipv6 bare request, bracketed registry", registry: "[::1]:5000", insecure: true, scheme: "http", host: "::1"},
+		// The standard library reads the unbracketed host "::1:5000" as hostname
+		// "::1" and port "5000" (asserted in the test body), the same endpoint
+		// as "[::1]:5000". Credentials sent there go to the registry itself.
 		{name: "ipv6 bare request with port form", registry: "[::1]:5000", insecure: true, scheme: "http", host: "::1:5000", creds: true},
 		{name: "default port written on request", registry: "registry.example", scheme: "https", host: "registry.example:443", creds: true},
 		{name: "default port written on registry", registry: "registry.example:443", scheme: "https", host: "registry.example", creds: true},
@@ -91,6 +94,13 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 		{name: "prefix lookalike", registry: "registry.example", scheme: "https", host: "evilregistry.example"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.host == "::1:5000" {
+				u := &url.URL{Host: tc.host}
+				if u.Hostname() != "::1" || u.Port() != "5000" {
+					t.Fatalf("url.URL{Host: %q}: Hostname %q, Port %q; want %q and %q",
+						tc.host, u.Hostname(), u.Port(), "::1", "5000")
+				}
+			}
 			var opts []name.Option
 			if tc.insecure {
 				opts = append(opts, name.Insecure)
@@ -115,6 +125,24 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 				t.Fatalf("RoundTrip: %v", err)
 			}
 			resp.Body.Close()
+			// The final (non-ping) request is the last one the inner transport saw.
+			inner.mu.Lock()
+			lastAuth := inner.auth[len(inner.auth)-1]
+			inner.mu.Unlock()
+			// The library's basic-auth layer attaches the header only when the
+			// request host string equals the registry string exactly, so a row
+			// the split routes to the credential transport by canonical form
+			// (case, default port) still carries no header. The header is
+			// therefore required only for an exact textual match.
+			sent := lastAuth != ""
+			if sent && !tc.creds {
+				t.Errorf("registry %q, request %s://%s: sends credentials to another origin (Authorization %q)",
+					tc.registry, tc.scheme, tc.host, lastAuth)
+			}
+			if !sent && tc.creds && tc.host == repo.RegistryStr() {
+				t.Errorf("registry %q, request %s://%s: withholds credentials from the registry's own origin",
+					tc.registry, tc.scheme, tc.host)
+			}
 			// A response that kept its challenge went through the credential
 			// transport; the plain route strips it.
 			if got := resp.Header.Get("Www-Authenticate") != ""; got != tc.creds {
