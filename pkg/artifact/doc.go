@@ -74,8 +74,9 @@ limitations under the License.
 // Before the first byte, the pull reserves the bytes it may still add to the
 // volume: the remaining download of every uncached blob plus the commit-time
 // copy of the largest blobs that can be committing at once (CommitBlob writes a
-// fresh temp from the partial). Reservations are held in-process across
-// concurrent pulls and measured against free space minus Config.FloorBytes;
+// fresh temp from the partial). Reservations are held on an image.SpaceLedger,
+// which the daemon shares with the image pull (Config.Ledger), and measured
+// against free space minus Config.FloorBytes;
 // bytes already in partial files are already off free space and are not
 // counted twice. If short, one ReclaimUnderPressure pass runs and the check is
 // repeated; still short is ErrInsufficientSpace.

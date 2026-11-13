@@ -770,8 +770,9 @@ func (r *Runtime) viewSweeper() func(context.Context) error {
 
 // newArtifactPuller builds the daemon's own artifact puller over the same cache
 // and index the image puller uses, fetching only from the flat registry's
-// canonical host through that registry's own transport.
-func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.FlatRegistry, log *slog.Logger) (*artifact.Puller, error) {
+// canonical host through that registry's own transport. space is the ledger the
+// image puller reserves on too.
+func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.FlatRegistry, space *image.SpaceLedger, log *slog.Logger) (*artifact.Puller, error) {
 	tr, plain, err := image.ArtifactTransport(flat)
 	if err != nil {
 		return nil, err
@@ -783,6 +784,7 @@ func newArtifactPuller(cache *image.Cache, index *image.FileIndex, flat image.Fl
 		PartialDir: filepath.Join(cache.Root(), sandbox.ArtifactPartialSubdir),
 		StorePath:  cache.Root(),
 		Log:        log,
+		Ledger:     space,
 	}, artifact.Deps{
 		Blobs: cache, Leases: cache, Reclaimer: cache, Index: index,
 		Fetcher: &artifact.RegistryFetcher{Transport: tr, PlainHTTP: plain},
@@ -872,6 +874,7 @@ func artifactStatusError(err error) error {
 		errors.Is(err, artifact.ErrManifestTooLarge), errors.Is(err, artifact.ErrManifestInvalid),
 		errors.Is(err, artifact.ErrPathNotInArtifact), errors.Is(err, image.ErrBlobTooLarge),
 		errors.Is(err, artifact.ErrSizeCap), errors.Is(err, artifact.ErrSizeOverflow),
+		errors.Is(err, artifact.ErrDeclaredSizeRejected),
 		errors.Is(err, artifact.ErrVariantNotFound), errors.Is(err, artifact.ErrVariantAmbiguous),
 		errors.Is(err, artifact.ErrVariantOnManifest):
 		return artifactStatus(codes.FailedPrecondition, err)

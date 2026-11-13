@@ -21,43 +21,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/bits"
 	"os"
-	"sort"
 	"sync"
 
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
-// reservations is the in-process space ledger shared by concurrent pulls. mu
-// guards held and is held across a reservation's whole check, including its one
-// reclaim pass, so two pulls can never both pass a check that only one fits.
-type reservations struct {
-	mu   sync.Mutex
-	held uint64
-}
-
-// reservation is one pull's claim on the ledger. release is idempotent.
-type reservation struct {
-	r    *reservations
-	n    uint64
-	once sync.Once
-}
-
-func (r *reservation) release() {
-	r.once.Do(func() {
-		r.r.mu.Lock()
-		r.r.held -= r.n
-		r.r.mu.Unlock()
-	})
-}
-
-// Reserved returns the bytes currently reserved by in-flight pulls.
+// Reserved returns the bytes currently reserved by in-flight pulls on the
+// puller's ledger, the image pull's included when the daemon shares one.
 func (p *Puller) Reserved() uint64 {
-	p.resv.mu.Lock()
-	defer p.resv.mu.Unlock()
-	return p.resv.held
+	return p.ledger.Reserved()
 }
 
 // partials is the partial store under Config.PartialDir.
@@ -83,100 +57,49 @@ func (p *Puller) partialBytes(b blob) int64 {
 
 // spaceNeeded is what a pull of missing may still add to the volume: the rest
 // of every download, plus the commit-time copy of the largest blobs that can be
-// committing at once (CommitBlob writes its own temp from the partial).
+// committing at once (CommitBlob writes its own temp from the partial). Bytes
+// already in a partial are already off free space and are not counted twice.
 //
 // The sizes are capped by checkManifest, so this cannot wrap for a manifest
-// that passed it; the arithmetic is checked anyway, because a wrapped sum is a
-// zero reservation that bypasses the floor.
+// that passed it; image.SpaceNeeded checks the arithmetic anyway, because a
+// wrapped sum is a zero reservation that bypasses the floor.
 func (p *Puller) spaceNeeded(missing []blob) (uint64, error) {
-	var need uint64
-	add := func(n int64) error {
-		if n < 0 {
-			return fmt.Errorf("negative size %d: %w", n, ErrSizeOverflow)
-		}
-		sum, carry := bits.Add64(need, uint64(n), 0)
-		if carry != 0 {
-			return ErrSizeOverflow
-		}
-		need = sum
-		return nil
-	}
-	sizes := make([]int64, 0, len(missing))
+	blobs := make([]image.BlobSpace, 0, len(missing))
 	for _, b := range missing {
-		if err := add(b.size - p.partialBytes(b)); err != nil {
-			return 0, err
-		}
-		sizes = append(sizes, b.size)
+		blobs = append(blobs, image.BlobSpace{Size: b.size, Have: p.partialBytes(b)})
 	}
-	sort.Slice(sizes, func(i, j int) bool { return sizes[i] > sizes[j] })
-	for i := 0; i < len(sizes) && i < p.cfg.MaxConcurrentLayers; i++ {
-		if err := add(sizes[i]); err != nil {
-			return 0, err
-		}
-	}
-	return need, nil
+	return image.SpaceNeeded(blobs, p.cfg.MaxConcurrentLayers)
 }
 
-// addChecked is a+b, refusing a wrap.
-func addChecked(a, b uint64) (uint64, error) {
-	sum, carry := bits.Add64(a, b, 0)
-	if carry != 0 {
-		return 0, ErrSizeOverflow
-	}
-	return sum, nil
-}
-
-// reserve claims space for missing before the first byte, running one reclaim
-// pass when short, and refuses with ErrInsufficientSpace when still short.
-func (p *Puller) reserve(ctx context.Context, missing []blob) (*reservation, error) {
+// reserve claims space for missing on the shared ledger before the first byte,
+// running one reclaim pass when short, and refuses with ErrInsufficientSpace
+// when still short (image.SpaceLedger.Reserve).
+func (p *Puller) reserve(ctx context.Context, missing []blob) (*image.Reservation, error) {
 	need, err := p.spaceNeeded(missing)
 	if err != nil {
 		return nil, err
 	}
-	p.resv.mu.Lock()
-	defer p.resv.mu.Unlock()
-	claimed, err := addChecked(p.resv.held, need)
-	if err != nil {
-		return nil, err
-	}
-	want, err := addChecked(p.cfg.FloorBytes, claimed)
-	if err != nil {
-		return nil, err
-	}
-	fits := func() (uint64, bool, error) {
-		free, err := p.cfg.FreeBytes(p.cfg.StorePath)
-		if err != nil {
-			return 0, false, fmt.Errorf("%w: %w", image.ErrFreeSpaceUnknown, bound(err))
-		}
-		return free, free >= want, nil
-	}
-	_, ok, err := fits()
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		if _, rerr := p.deps.Reclaimer.ReclaimUnderPressure(ctx, image.ReclaimConfig{
-			HighFreeBytes: want, TargetFreeBytes: want, FreeBytes: p.cfg.FreeBytes, Log: p.log,
-		}); rerr != nil {
-			p.log.Warn("artifact pull: reclaim pass failed", "err", rerr)
-		}
-		free, ok, err := fits()
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, fmt.Errorf("need %d bytes, %d free, %d reserved by other pulls, floor %d: %w",
-				need, free, p.resv.held, p.cfg.FloorBytes, ErrInsufficientSpace)
-		}
-	}
-	p.resv.held = claimed
-	return &reservation{r: &p.resv, n: need}, nil
+	return p.ledger.Reserve(ctx, image.SpaceClaim{
+		Need:       need,
+		Path:       p.cfg.StorePath,
+		FloorBytes: p.cfg.FloorBytes,
+		FreeBytes:  p.cfg.FreeBytes,
+		TotalBytes: p.cfg.TotalBytes,
+		Reclaimer:  p.deps.Reclaimer,
+		Log:        p.log,
+	})
 }
 
 // fetchAll transfers and commits every blob in missing, at most
 // MaxConcurrentLayers at a time across the whole process. The first failure
 // cancels the rest; partials of the cancelled transfers survive for a retry.
-func (p *Puller) fetchAll(ctx context.Context, ref string, cred *image.RegistryCredential, missing []blob, _ *reservation) error {
+//
+// renew is called on every read that returns bytes, from every transfer; it
+// keeps the pull's lease alive while its bytes arrive. Nil means no lease.
+func (p *Puller) fetchAll(ctx context.Context, ref string, cred *image.RegistryCredential, missing []blob, _ *image.Reservation, renew func()) error {
+	if renew == nil {
+		renew = func() {}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
@@ -188,7 +111,7 @@ func (p *Puller) fetchAll(ctx context.Context, ref string, cred *image.RegistryC
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := p.fetchOne(ctx, ref, cred, b); err != nil {
+			if err := p.fetchOne(ctx, ref, cred, b, renew); err != nil {
 				errMu.Lock()
 				if first == nil {
 					first = err
@@ -230,8 +153,9 @@ func (p *Puller) claim(ctx context.Context, digest string) (func(), error) {
 }
 
 // fetchOne brings one blob into the cache: resume its partial with a Range
-// request, then commit it through CommitBlob, which re-hashes it.
-func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryCredential, b blob) error {
+// request, then commit it through CommitBlob, which re-hashes it. renew is
+// passed to transfer.
+func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, renew func()) error {
 	end, err := p.claim(ctx, b.digest)
 	if err != nil {
 		return err
@@ -251,7 +175,7 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 		Digest: b.digest,
 		Size:   b.size,
 		Transfer: func(f *os.File, have int64) error {
-			return p.transfer(ctx, ref, cred, b, f, have)
+			return p.transfer(ctx, ref, cred, b, f, have, renew)
 		},
 		Commit: func(replay func(io.Writer) error) error {
 			_, err := p.deps.Blobs.CommitBlob(b.digest, b.size, replay)
@@ -269,7 +193,9 @@ func (p *Puller) fetchOne(ctx context.Context, ref string, cred *image.RegistryC
 // A watchdog cancels the transfer when no byte arrives for the stall timeout,
 // from the request through the last read of the body; every byte re-arms it.
 // There is no overall deadline: a transfer that keeps moving is never cut off.
-func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, f *os.File, have int64) error {
+// Every byte also calls renew (non-nil), so the pull's lease outlives a slow
+// transfer for as long as it keeps moving; a stalled one renews nothing.
+func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryCredential, b blob, f *os.File, have int64, renew func()) error {
 	tctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	stall := p.cfg.StallTimeout
@@ -300,7 +226,10 @@ func (p *Puller) transfer(ctx context.Context, ref string, cred *image.RegistryC
 	if _, err := f.Seek(have, io.SeekStart); err != nil {
 		return fmt.Errorf("seek partial %s: %w", b.digest, err)
 	}
-	progress := &progressReader{r: body, moved: func() { timer.Reset(stall) }}
+	progress := &progressReader{r: body, moved: func() {
+		timer.Reset(stall)
+		renew()
+	}}
 	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(progress, b.size-have+1))
 	serr := f.Sync()
 	if have+n > b.size {

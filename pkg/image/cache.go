@@ -52,10 +52,39 @@ type Cache struct {
 	// (lease.go) rather than by mutual exclusion.
 	pruneMu sync.Mutex
 
-	// leaseMu guards leases and nextLease. See lease.go.
+	// leaseMu guards leases, nextLease and leaseWatch. See lease.go.
 	leaseMu   sync.Mutex
 	leases    map[uint64]*Lease
 	nextLease uint64
+
+	// leaseWatch, while a prune pass with a pin function runs, collects the
+	// digests of every lease acquired since that pass's last pin read; it is
+	// nil when no such pass is running. AcquireLease adds to it in the same
+	// critical section that makes the lease visible. See beginLeaseWatch.
+	leaseWatch map[string]struct{}
+
+	// beforePruneBlob, when set, runs inside executePrune's loop after the
+	// batch's pin read and before each entry is examined, with that entry's
+	// digest. It is UNEXPORTED and exists only so an in-package test can drive
+	// a whole pull into the window between the pin read and a later blob's
+	// unlink; production never sets it.
+	beforePruneBlob func(digest string)
+
+	// beforePruneUnlink, when set, runs inside executePrune's loop after an
+	// entry passed every re-check and immediately before its Remove, with
+	// that entry's digest, while executePrune holds leaseMu (see
+	// executePrune). It is UNEXPORTED and exists only so an in-package test
+	// can race an AcquireLease against the unlink; production never sets it.
+	// It must not take leaseMu itself.
+	beforePruneUnlink func(digest string)
+
+	// beforePruneLock, when set, runs inside executePrune's loop each time
+	// the executor is about to take leaseMu for an entry's critical section
+	// (whose first step is the lease-watch check), with that entry's digest
+	// and leaseMu NOT held. It is UNEXPORTED and exists only so an in-package
+	// test can drive a whole pull into the window before that section;
+	// production never sets it.
+	beforePruneLock func(digest string)
 
 	// operatorMu serializes the read-modify-write of the OPERATOR reachability
 	// record (operatorroots.go). That record is a single file holding every

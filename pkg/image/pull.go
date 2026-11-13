@@ -619,6 +619,13 @@ type Puller struct {
 	// Both zero values mean the production defaults, which are fail-closed.
 	floorBytes uint64
 	freeBytes  FreeBytesFunc
+	// totalBytes samples the volume's capacity for reserveSpace; nil means
+	// StatfsTotalBytes.
+	totalBytes TotalBytesFunc
+
+	// ledger holds the space reservations of in-flight pulls (reserveSpace).
+	// WithSpaceLedger shares the daemon's; NewPuller defaults it to a private one.
+	ledger *SpaceLedger
 
 	// mirrors and mirrorFetch are the CLUSTER MIRROR fallback (mirror.go), set
 	// together by WithMirrors and both nil by default — a nil pair is a node with
@@ -715,6 +722,9 @@ func NewPuller(cache *Cache, fetch FetchFunc, index LocalIndex, opts ...PullerOp
 	p := &Puller{cache: cache, fetch: fetch, index: index}
 	for _, o := range opts {
 		o(p)
+	}
+	if p.ledger == nil {
+		p.ledger = &SpaceLedger{}
 	}
 	// A HALF-WIRED mirror fallback is refused rather than ignored: either half
 	// alone silently disables the whole mechanism, and a node that believed it
@@ -1055,6 +1065,17 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 		}
 	}()
 
+	// RESERVE the declared bytes of every missing blob before any layer is
+	// requested, so a pull that cannot fit is refused before it spends the
+	// volume rather than bounded only one layer at a time at commit. Taken
+	// here, after the lease, every fetching path (primary, flat, local, mirror)
+	// is covered. The reservation ends with ingest, on every path.
+	space, err := p.reserveSpace(ctx, ref, mfst)
+	if err != nil {
+		return nil, err
+	}
+	defer space.Release()
+
 	// Config blob.
 	rawCfg, err := img.RawConfigFile()
 	if err != nil {
@@ -1102,7 +1123,9 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 			}
 			body := newStallReader(rc, p.stallWindow())
 			defer body.Close()
-			_, cerr := io.Copy(w, body)
+			// Arriving bytes renew the lease, so a layer slower than the
+			// lease TTL keeps its protection against a reclaim pass.
+			_, cerr := io.Copy(w, lease.Reader(body))
 			return cerr
 		}
 		var wrote bool
@@ -1148,6 +1171,9 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 		return nil, fmt.Errorf("pull %q: record image index: %w", ref, err)
 	}
 
+	// The caller still has to record its own reference before it releases
+	// the lease; start that window from a fresh TTL where the throttle allows.
+	lease.Renew()
 	return &PullResult{
 		Manifest: out,
 		CacheHit: !wroteAny,

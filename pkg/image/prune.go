@@ -461,27 +461,65 @@ type ExecuteReport struct {
 // rather than on a precomputed byte budget: under APFS clonefile an unlink whose
 // extents are still shared frees nothing, so the only honest stopping rule is to
 // re-measure.
+//
+// It consults no pin set and no lease: a planned blob a live lease names is
+// unlinked like any other. Reclaim, which must honour leases, runs the
+// unexported executor with a pin function instead.
 func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*ExecuteReport, error) {
-	return c.executePrune(plan, grace, now, stop, nil, nil)
+	return c.executePrune(plan, grace, now, stop, nil)
 }
 
 // pinnedFunc returns the digests that must survive an unlink batch, each with
 // the reason it is kept. It is read under pruneMu, just before the batch.
 type pinnedFunc func() (map[string]PruneReason, error)
 
-// executePrune is ExecutePrune with two more re-checks. pinned, when non-nil,
-// is called once under pruneMu before the first unlink, and every entry whose
-// digest it names is left in place and reported in ExecuteReport.pinned. A
-// pinned error aborts the run before anything is unlinked: the pin set is a
-// root set, and a short one would invert the answer.
+// executePrune is ExecutePrune with three more re-checks. pinned, when
+// non-nil, is called under pruneMu before the first unlink, and every entry
+// whose digest it names is left in place and reported in ExecuteReport.pinned.
+// A lease watch (beginLeaseWatch) is opened just before that pin read. When
+// the watch names an entry's digest at that entry's critical section (a lease
+// naming it was acquired since the last pin read), the watch is reset and
+// pinned is called again, with leaseMu released, and its fresh set replaces
+// the old one. A pinned error, first or repeated, aborts the run before the
+// next unlink: the pin set is a root set, and a short one would invert the
+// answer.
 //
-// leased, when non-nil, is asked about each entry's digest immediately before
-// that entry's Lstat and unlink, and an entry it reports leased is kept as
-// ReasonKeptLeased. The pin set is one read per batch; this in-memory read
-// narrows the window a lease taken during the batch can miss to one blob's
-// lease check, Lstat and Remove. It sees live leases only: a pull that recorded
-// a root and released its lease after the batch's pin read is not seen by it.
-func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, leased func(digest string) bool) (*ExecuteReport, error) {
+// When pinned is non-nil the executor also asks the cache's own lease table
+// (leaseHasLocked) about each entry's digest inside the critical section, and
+// keeps an entry a live lease names as ReasonKeptLeased. Both lease lookups
+// are the executor's own, made with leaseMu already held, so no caller can
+// hand it a check that takes leaseMu again. With a nil pinned (ExecutePrune)
+// there is no pin set, no watch and no lease check.
+//
+// Per entry the order is: pin lookup, then ONE leaseMu critical section
+// (unlinkUnlessLeased) holding the watch check, the live-lease check, Lstat,
+// grace and unlink. A watch hit leaves that section without unlinking; the
+// executor re-reads the pins outside it and starts the entry again, at most
+// maxPruneRepins times, after which the entry is kept and skipped. Lock order
+// is pruneMu then leaseMu, and pinned, which takes leaseMu itself, is never
+// called with leaseMu held.
+//
+// INVARIANT, which holds only when pinned is non-nil: an entry is unlinked
+// only by a critical section whose watch check came back clean, so every
+// lease naming its digest was acquired either before the pin read the
+// executor holds (and that read saw it live, or saw the record and hold the
+// pull wrote before releasing it: a pull leases every blob it will root
+// before it writes either) or after that critical section, which AcquireLease
+// cannot enter, so it returns only after the Remove is done.
+//
+// The pull path's own presence re-check under its lease (pkg/artifact)
+// refetches a removed blob only when the Remove precedes that re-check. The
+// clean critical section guarantees that for every lease acquired after the
+// executor's pin read, because the re-check runs after AcquireLease returns.
+//
+// RESIDUAL, a pre-existing limit of the lease TTL rather than of this
+// ordering: a lease that outlives DefaultLeaseTTL (or its own ttl) stops
+// counting. A pull that leased before the executor's pin read, stalled until
+// its lease expired, and writes its record and runs its re-check after that
+// read but before the entry's critical section is not seen there (no live
+// lease, a pin set read before the record, no lease acquired since that
+// read), so the blob it just found present is unlinked.
+func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
 	}
@@ -503,8 +541,15 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	}
 	defer root.Close()
 
+	// The watch opens BEFORE the pins it vouches for, for the same reason
+	// pinnedNow reads leases before roots: a lease acquired after this point
+	// lands in the watch, and one acquired before it is seen by the pin read
+	// (live) or left a root that read sees (released). pruneMu, which this
+	// function takes itself for the whole pass, keeps watches from nesting.
 	var pins map[string]PruneReason
 	if pinned != nil {
+		c.beginLeaseWatch()
+		defer c.endLeaseWatch()
 		if pins, err = pinned(); err != nil {
 			return nil, fmt.Errorf("execute prune: %w", err)
 		}
@@ -519,45 +564,100 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			rep.StoppedEarly = true
 			break
 		}
-		if why, ok := pins[d.Node.Digest]; ok && d.Node.Digest != "" {
-			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
-			continue
+		if c.beforePruneBlob != nil {
+			c.beforePruneBlob(d.Node.Digest)
 		}
-		if leased != nil && d.Node.Digest != "" && leased(d.Node.Digest) {
-			rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
-			continue
-		}
-		rel := d.Node.Path
-		if cls, _ := classifyBlobRel(rel); cls == relInvalid {
-			skip(d, "path fails blob grammar")
-			continue
-		}
-		fi, err := root.Lstat(rel)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				skip(d, "already absent")
-			} else {
-				skip(d, fmt.Sprintf("lstat: %v", err))
+		// pinned takes leaseMu itself (pinnedNow reads the leases), so every
+		// re-read below runs with leaseMu released; the critical section only
+		// reports that one is due.
+		for repins := 0; ; repins++ {
+			if why, ok := pins[d.Node.Digest]; ok && d.Node.Digest != "" {
+				rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: why})
+				break
 			}
-			continue
-		}
-		if !fi.Mode().IsRegular() {
-			skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
-			continue
-		}
-		if now.Sub(fi.ModTime()) < grace {
-			skip(d, "younger than grace")
-			continue
-		}
-		if err := root.Remove(rel); err != nil {
-			skip(d, fmt.Sprintf("remove: %v", err))
-			continue
-		}
-		rep.Deleted++
-		rep.DeletedBytes += fi.Size()
-		if d.Node.Digest != "" {
-			rep.Removed = append(rep.Removed, d.Node.Digest)
+			if c.beforePruneLock != nil {
+				c.beforePruneLock(d.Node.Digest)
+			}
+			if !c.unlinkUnlessLeased(root, d, grace, now, pinned != nil, repins < maxPruneRepins, rep, skip) {
+				break
+			}
+			if pins, err = pinned(); err != nil {
+				return nil, fmt.Errorf("execute prune: %w", err)
+			}
 		}
 	}
 	return rep, nil
+}
+
+// maxPruneRepins bounds the pin re-reads one plan entry can trigger. Each
+// re-read is due only because a lease naming that very digest was acquired
+// during the previous one, so a pull of the blob costs at most one; three
+// absorbs a few concurrent pulls of the same blob while bounding the roots
+// reads a stream of them can force on one entry. An entry still named after
+// the last re-read is kept (fail closed) and reported in Skipped.
+const maxPruneRepins = 3
+
+// unlinkUnlessLeased runs one entry's lease-watch check, live-lease check,
+// Lstat, grace check and Remove inside ONE leaseMu critical section, so an
+// AcquireLease naming the entry's digest either returns before the checks
+// (the entry is re-pinned or kept as ReasonKeptLeased) or blocks until the
+// Remove is done. Both lease checks run only when guarded is set (the
+// executor has a pin set), and both are the cache's own locked lookups.
+//
+// It returns true, having changed nothing, when the watch names the digest
+// and mayRepin is set: the watch is reset in this section and the caller must
+// re-read its pins, with leaseMu released, and call again. When the watch
+// names the digest and mayRepin is not set, the entry is kept and skipped and
+// the watch is left as it is, so a later entry it names still forces a
+// re-read.
+func (c *Cache) unlinkUnlessLeased(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, guarded, mayRepin bool, rep *ExecuteReport, skip func(PruneDecision, string)) (repin bool) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	if guarded && c.leaseWatchNamesLocked(d.Node.Digest) {
+		if !mayRepin {
+			skip(d, fmt.Sprintf("a new lease still names it after %d pin re-reads", maxPruneRepins))
+			return false
+		}
+		c.leaseWatch = make(map[string]struct{})
+		return true
+	}
+	if guarded && d.Node.Digest != "" && c.leaseHasLocked(d.Node.Digest) {
+		rep.pinned = append(rep.pinned, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
+		return false
+	}
+	rel := d.Node.Path
+	if cls, _ := classifyBlobRel(rel); cls == relInvalid {
+		skip(d, "path fails blob grammar")
+		return false
+	}
+	fi, err := root.Lstat(rel)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			skip(d, "already absent")
+		} else {
+			skip(d, fmt.Sprintf("lstat: %v", err))
+		}
+		return false
+	}
+	if !fi.Mode().IsRegular() {
+		skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
+		return false
+	}
+	if now.Sub(fi.ModTime()) < grace {
+		skip(d, "younger than grace")
+		return false
+	}
+	if c.beforePruneUnlink != nil {
+		c.beforePruneUnlink(d.Node.Digest)
+	}
+	if err := root.Remove(rel); err != nil {
+		skip(d, fmt.Sprintf("remove: %v", err))
+		return false
+	}
+	rep.Deleted++
+	rep.DeletedBytes += fi.Size()
+	if d.Node.Digest != "" {
+		rep.Removed = append(rep.Removed, d.Node.Digest)
+	}
+	return false
 }
