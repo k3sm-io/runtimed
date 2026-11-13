@@ -428,7 +428,9 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	if err != nil {
 		return nil, err
 	}
-	if fresh := c.newlySkipped(skipped); len(fresh) > 0 {
+	// A dry pass names what a real pass would, but remembers nothing: it must
+	// not consume the report the real pass after it owes.
+	if fresh := c.newlySkipped(skipped, !cfg.DryRun); len(fresh) > 0 {
 		log.Warn("image gc skipped pod dirs with no reachability record that no live pod owns",
 			"pods", fresh)
 	}
@@ -630,13 +632,14 @@ func (c *Cache) pinnedNow(untracked UntrackedPodFunc) (map[string]PruneReason, e
 }
 
 // newlySkipped returns the pod dirs in skipped that the previous pass did not
-// also skip, and remembers skipped as the reported set. A record-less dir the
+// also skip, and, when remember is set, remembers skipped as the reported set.
+// A dry pass leaves remember unset so it changes no state. A record-less dir the
 // daemon proves untracked stays on disk until something removes it, so every
 // pass skips it again; naming it once per pod id keeps the warning about a new
 // leftover from drowning in the same list every interval. Replacing the set
 // (rather than adding to it) bounds it by the dirs on disk now, and a dir that
 // leaves and later returns is reported again.
-func (c *Cache) newlySkipped(skipped []string) []string {
+func (c *Cache) newlySkipped(skipped []string, remember bool) []string {
 	c.skipMu.Lock()
 	defer c.skipMu.Unlock()
 	var fresh []string
@@ -647,6 +650,8 @@ func (c *Cache) newlySkipped(skipped []string) []string {
 		}
 		next[name] = struct{}{}
 	}
-	c.skipReported = next
+	if remember {
+		c.skipReported = next
+	}
 	return fresh
 }
