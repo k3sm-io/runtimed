@@ -21,7 +21,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -194,5 +196,202 @@ func TestPullArtifactFailsAStalledManifest(t *testing.T) {
 	fire()
 	if err := <-done; !errors.Is(err, ErrManifestStalled) || !errors.Is(err, ErrBlobTransfer) {
 		t.Fatalf("PullArtifact = %v, want a stalled, resumable manifest fetch", err)
+	}
+}
+
+// shortLeaser hands out the cache's own leases with a short TTL, so a test
+// can outlast one on the real clock: the lease clock is the cache's and
+// pkg/artifact has no seam into it.
+type shortLeaser struct {
+	inner Leaser
+	ttl   time.Duration
+}
+
+func (l *shortLeaser) AcquireLease(digests []string, _ time.Duration) *image.Lease {
+	return l.inner.AcquireLease(digests, l.ttl)
+}
+
+// slowBody sends one byte per read, sleeping gap before each.
+type slowBody struct {
+	r   io.Reader
+	gap time.Duration
+}
+
+func (b *slowBody) Read(p []byte) (int, error) {
+	time.Sleep(b.gap)
+	return iotest.OneByteReader(b.r).Read(p)
+}
+
+func (b *slowBody) Close() error { return nil }
+
+// TestPullArtifactLeaseOutlivesSlowBlob pins lease renewal by progress: a blob
+// whose bytes arrive across several lease TTLs keeps the pull's lease, so
+// once the bytes are in and before the record is written, a reclaim pass
+// still finds the blobs leased instead of unreferenced.
+func TestPullArtifactLeaseOutlivesSlowBlob(t *testing.T) {
+	// A 1 s lease with a byte every 100 ms for about 2.5 s: only a pause near
+	// a whole second between two bytes could lapse it falsely.
+	const ttl = time.Second
+	e := newEnv(t)
+	weights := "0123456789abcdefghijklmn" // 24 bytes, 100ms apart: ~2.4 s, > 2 TTLs
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", weights))
+	f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
+		return &slowBody{r: bytes.NewReader(data), gap: 100 * time.Millisecond}
+	}}
+	p := stallPuller(t, e, f, &fakeIdle{})
+	p.deps.Leases = &shortLeaser{inner: e.cache, ttl: ttl}
+	victim := digestOfBytes([]byte(weights))
+	start := time.Now()
+	var checked bool
+	p.afterPresence = func() {
+		if checked {
+			return
+		}
+		checked = true
+		if took := time.Since(start); took < 2*ttl {
+			t.Errorf("the transfer took %v, want more than two lease TTLs (%v)", took, 2*ttl)
+		}
+		rep, err := e.cache.ReclaimUnderPressure(context.Background(), image.ReclaimConfig{
+			Force: true, DryRun: true, Grace: time.Nanosecond,
+			FreeBytes: func(string) (uint64, error) { return 1 << 40, nil },
+		})
+		if err != nil {
+			t.Errorf("dry-run reclaim: %v", err)
+			return
+		}
+		if slices.Contains(rep.Removed, victim) {
+			t.Errorf("a reclaim pass would take %s: the pull's lease lapsed while its bytes arrived", victim)
+		}
+		leased := false
+		for _, k := range rep.Kept {
+			if k.Digest == victim && k.Reason == image.ReasonKeptLeased {
+				leased = true
+			}
+		}
+		if !leased {
+			t.Errorf("%s is not kept as leased after the transfer; kept: %+v", victim, rep.Kept)
+		}
+	}
+	res, err := p.PullArtifact(context.Background(), testRef, nil, volume, nil)
+	if err != nil {
+		t.Fatalf("PullArtifact: %v", err)
+	}
+	res.Lease.Release()
+	if !checked {
+		t.Fatal("the presence hook never ran")
+	}
+}
+
+// TestFetchWithoutProgressDoesNotRenew pins the other half: renewal follows
+// bytes, not time. A transfer whose body sends nothing until the stall timer
+// fires never calls renew.
+func TestFetchWithoutProgressDoesNotRenew(t *testing.T) {
+	e := newEnv(t)
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", "weights"))
+	reading := make(chan struct{}, 1)
+	f := &stallFetcher{fakeFetcher: e.fetch, body: func(ctx context.Context, _ []byte) io.ReadCloser {
+		return &silentBody{ctx: ctx, reading: reading}
+	}}
+	idle := &fakeIdle{}
+	p := stallPuller(t, e, f, idle)
+	d := digestOfBytes([]byte("weights"))
+	var renews atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		done <- p.fetchAll(context.Background(), testRef, nil, []blob{{digest: d, size: int64(len("weights"))}}, nil, func() { renews.Add(1) })
+	}()
+	<-reading
+	idle.mu.Lock()
+	fire := idle.fire
+	idle.mu.Unlock()
+	fire()
+	if err := <-done; !errors.Is(err, ErrBlobStalled) {
+		t.Fatalf("fetchAll = %v, want a stalled transfer", err)
+	}
+	if n := renews.Load(); n != 0 {
+		t.Errorf("a transfer that moved no byte renewed the lease %d times, want 0", n)
+	}
+}
+
+// countingBody returns its bytes one per read and counts the non-empty reads
+// on a counter shared across transfers.
+type countingBody struct {
+	r     io.Reader
+	reads *atomic.Int32
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := iotest.OneByteReader(b.r).Read(p)
+	if n > 0 {
+		b.reads.Add(1)
+	}
+	return n, err
+}
+
+func (b *countingBody) Close() error { return nil }
+
+// TestFetchRenewsPerRead pins renewal by progress without a clock: two blobs
+// fetched in one fetchAll call, each over several reads, call renew at least
+// once per non-empty read; a nil renew is accepted.
+func TestFetchRenewsPerRead(t *testing.T) {
+	tests := []struct {
+		name  string
+		renew bool
+	}{
+		{"counting renew", true},
+		{"nil renew", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fetch.publishModel(testRef, modelLayer("a.safetensors", "alpha"), modelLayer("b.safetensors", "bravo-two"))
+			var reads, renews atomic.Int32
+			f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
+				return &countingBody{r: bytes.NewReader(data), reads: &reads}
+			}}
+			p := stallPuller(t, e, f, &fakeIdle{})
+			missing := []blob{
+				{digest: digestOfBytes([]byte("alpha")), size: int64(len("alpha"))},
+				{digest: digestOfBytes([]byte("bravo-two")), size: int64(len("bravo-two"))},
+			}
+			var renew func()
+			if tc.renew {
+				renew = func() { renews.Add(1) }
+			}
+			if err := p.fetchAll(context.Background(), testRef, nil, missing, nil, renew); err != nil {
+				t.Fatalf("fetchAll: %v", err)
+			}
+			if r := reads.Load(); r < int32(len("alpha")+len("bravo-two")) {
+				t.Fatalf("non-empty reads = %d, want one per byte", r)
+			}
+			if tc.renew {
+				if n, r := renews.Load(), reads.Load(); n < r {
+					t.Errorf("renew called %d times over %d non-empty reads, want at least one per read", n, r)
+				}
+			}
+		})
+	}
+}
+
+// TestRecheckRefetchRenews pins that recheck passes renew through to its
+// refetch: a blob absent at recheck is fetched again, and its bytes renew.
+func TestRecheckRefetchRenews(t *testing.T) {
+	e := newEnv(t)
+	e.fetch.publishModel(testRef, modelLayer("w.safetensors", "weights"))
+	var reads, renews atomic.Int32
+	f := &stallFetcher{fakeFetcher: e.fetch, body: func(_ context.Context, data []byte) io.ReadCloser {
+		return &countingBody{r: bytes.NewReader(data), reads: &reads}
+	}}
+	p := stallPuller(t, e, f, &fakeIdle{})
+	need := []blob{{digest: digestOfBytes([]byte("weights")), size: int64(len("weights"))}}
+	var res Result
+	if err := p.recheck(context.Background(), testRef, nil, need, &res, func() { renews.Add(1) }); err != nil {
+		t.Fatalf("recheck: %v", err)
+	}
+	if !res.Fetched {
+		t.Fatal("recheck did not refetch the absent blob")
+	}
+	if n, r := renews.Load(), reads.Load(); r == 0 || n < r {
+		t.Errorf("renew called %d times over %d non-empty reads of the refetch, want at least one per read", n, r)
 	}
 }

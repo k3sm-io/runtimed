@@ -438,6 +438,18 @@ func (x *FileIndex) record(ctx context.Context, e IndexEntry) (Platform, error) 
 	if p.OS == "" || p.Architecture == "" {
 		return Platform{}, fmt.Errorf("record image index %q: incomplete platform %s", ref, p)
 	}
+	// The read-side rule (validateRecordedBlobDigests), applied before anything
+	// is written: a non-canonical config or layer digest would otherwise be
+	// committed and then refused as corrupt on every later read. This is a
+	// caller-supplied bad manifest, not a damaged entry, so it is refused with
+	// ErrInvalidDigest (alongside ErrUnsupportedDigestAlgorithm for an unknown
+	// algorithm), never ErrIndexEntryCorrupt.
+	if err := checkBlobDigests(e.Manifest); err != nil {
+		if errors.Is(err, ErrInvalidDigest) {
+			return Platform{}, fmt.Errorf("record image index %q: %w", ref, err)
+		}
+		return Platform{}, fmt.Errorf("record image index %q: %w: %w", ref, ErrInvalidDigest, err)
+	}
 	desc, err := recordedManifestDescriptor(ref, e)
 	if err != nil {
 		return Platform{}, err
@@ -798,6 +810,12 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 		return IndexEntry{}, fmt.Errorf("%w: manifest for %q names %q",
 			ErrIndexEntryCorrupt, what, mfst.GetReference())
 	}
+	// The record's own key is passed beside what: List names the record by its
+	// hashed file name, and an operator cannot find the image behind a refused
+	// entry from that alone.
+	if err := validateRecordedBlobDigests(what, e.Reference, e.Platform.platform(), mfst); err != nil {
+		return IndexEntry{}, err
+	}
 	out := IndexEntry{
 		Reference:   e.Reference,
 		Platform:    e.Platform.platform(),
@@ -821,6 +839,55 @@ func decodeEntry(what string, buf []byte) (IndexEntry, error) {
 		return IndexEntry{}, err
 	}
 	return out, nil
+}
+
+// validateRecordedBlobDigests checks that every blob digest the recorded
+// manifest names — the config and each layer — is in the canonical form
+// parseBlobDigest accepts.
+//
+// These strings leave the index as lease keys (Puller.presentLocally hands
+// manifestDigests of a looked-up entry to Cache.AcquireLease), and the lease,
+// the prune watch and the pinned set all compare digests as plain strings. A
+// non-canonical spelling (upper-case hex, no or an unknown algorithm, a wrong
+// length) would lease a key no reclaim ever compares against and so protect
+// nothing; such a record is refused as corrupt here, at the decode boundary,
+// exactly as an inconsistent manifest descriptor is.
+//
+// An EMPTY digest is not checked: manifestDigests skips it, so it never becomes
+// a lease key, and records carrying a manifest without a config (the
+// pre-retention shape) stay readable.
+//
+// ref and p are the record's OWN reference and platform, as decoded from it.
+// They are named in the error beside what so a refused entry can be found and
+// re-pulled or removed by the key an operator knows, not only by a file hash.
+// FileIndex has no logger, so the error is the only report.
+func validateRecordedBlobDigests(what, ref string, p Platform, mfst *runtimev1.ImageManifest) error {
+	if err := checkBlobDigests(mfst); err != nil {
+		return fmt.Errorf("%w: %s (recorded as %s/%s): %v", ErrIndexEntryCorrupt,
+			quoteBounded(what, maxReferenceLen), quoteBounded(ref, maxReferenceLen), p, boundErr(err))
+	}
+	return nil
+}
+
+// checkBlobDigests is the rule validateRecordedBlobDigests applies on read and
+// Record applies on write: every non-empty config and layer digest must parse
+// as canonical (parseBlobDigest). The returned error names the position and
+// wraps parseBlobDigest's error, so it carries ErrInvalidDigest or
+// ErrUnsupportedDigestAlgorithm; each caller chooses what to wrap it in.
+func checkBlobDigests(mfst *runtimev1.ImageManifest) error {
+	if d := mfst.GetConfig().GetDigest(); d != "" {
+		if _, err := parseBlobDigest(d); err != nil {
+			return fmt.Errorf("config digest: %w", err)
+		}
+	}
+	for i, l := range mfst.GetLayers() {
+		if d := l.GetDigest(); d != "" {
+			if _, err := parseBlobDigest(d); err != nil {
+				return fmt.Errorf("layer %d digest: %w", i, err)
+			}
+		}
+	}
+	return nil
 }
 
 // recordedManifestDescriptor validates the descriptor/bytes pair Record was

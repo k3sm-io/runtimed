@@ -136,6 +136,9 @@ func (p *Puller) fetchUpstreamOrMirror(ctx context.Context, ref string, cred *Re
 	if merr == nil {
 		var res *PullResult
 		res, merr = p.ingest(ctx, ref, img, want)
+		if localRefusal(merr) {
+			return nil, merr
+		}
 		if merr == nil {
 			log.Info("the public registry is unreachable; pulled the cluster registry's copy",
 				"ref", ref, "mirrorRef", mirrorRef, "upstreamError", err)

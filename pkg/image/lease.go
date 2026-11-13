@@ -17,7 +17,9 @@ limitations under the License.
 package image
 
 import (
+	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,13 +49,107 @@ const DefaultLeaseTTL = 15 * time.Minute
 // A Lease is safe for concurrent use and Release is idempotent; the zero value
 // and a nil *Lease both Release as no-ops so a caller that never took one, or
 // took one from a failed pull, needs no branch.
+//
+// A pull keeps its lease alive while bytes arrive (Renew, Reader): the TTL
+// bounds how long a lease outlives the last sign of progress, not how long a
+// slow pull may take.
 type Lease struct {
 	c       *Cache
 	id      uint64
 	digests []string
+	// ttl is the TTL the lease was acquired with; immutable after
+	// AcquireLease. Renew extends expires by it.
+	ttl time.Duration
+
+	// expires, lastRenew and maxEnd are guarded by c.leaseMu.
 	expires time.Time
+	// lastRenew is when expires was last set (at AcquireLease, then by each
+	// effective Renew); Renew is throttled against it.
+	lastRenew time.Time
+	// maxEnd, when non-zero, is the instant past which Renew never extends
+	// expires. Zero means no total cap.
+	maxEnd time.Time
+
+	// acquired is the instant AcquireLease created the lease (the same now as
+	// the first expires); immutable after AcquireLease. It anchors
+	// lastRenewOffset so the fast path measures elapsed time with now.Sub,
+	// which uses the monotonic reading when present.
+	acquired time.Time
+	// lastRenewOffset mirrors lastRenew as lastRenew.Sub(acquired) in
+	// nanoseconds (zero at AcquireLease). It is written only under c.leaseMu
+	// (with lastRenew) and read without it by Renew's fast path, which uses it
+	// purely as an early exit: the locked check stays the authority on whether
+	// a renewal happens. An offset rather than wall-clock unix nanoseconds
+	// keeps the early exit on the same monotonic clock as the locked check and
+	// expiry, so a wall-clock step backwards cannot suppress renewals.
+	lastRenewOffset atomic.Int64
 
 	once sync.Once
+}
+
+// Renew extends the lease to now plus its TTL (capped at maxEnd when set). It
+// is nil-safe and throttled: a call less than a quarter of the TTL after the
+// last renewal changes nothing and returns before taking c.leaseMu (an atomic
+// read of lastRenewOffset), so a per-read caller neither takes the lock per read
+// nor contends with a reclaim pass. Only a call past the throttle window takes
+// the lock, sweeps expired leases and re-checks the throttle there.
+//
+// A lease that has already lapsed, or was released, is never revived: Renew
+// is a no-op unless this very lease is still in the cache's lease table and
+// its expiry has not passed. A lapsed lease may already have let a reclaim
+// pass take its blobs, so reviving it would claim a protection it no longer
+// gives.
+func (l *Lease) Renew() {
+	if l == nil || l.c == nil {
+		return
+	}
+	c := l.c
+	// Fast path: inside the throttle window the locked check below would
+	// return without effect, so skip the lock. A stale read can only send the
+	// call on to the locked path, never past it.
+	if c.now().Sub(l.acquired)-time.Duration(l.lastRenewOffset.Load()) < l.ttl/4 {
+		return
+	}
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.expireLeasesLocked()
+	if cur, ok := c.leases[l.id]; !ok || cur != l {
+		return
+	}
+	now := c.now()
+	if now.Sub(l.lastRenew) < l.ttl/4 {
+		return
+	}
+	exp := now.Add(l.ttl)
+	if !l.maxEnd.IsZero() && exp.After(l.maxEnd) {
+		exp = l.maxEnd
+	}
+	if exp.After(l.expires) {
+		l.expires = exp
+	}
+	l.lastRenew = now
+	l.lastRenewOffset.Store(int64(now.Sub(l.acquired)))
+}
+
+// Reader wraps r so every read that returns bytes renews the lease. A
+// zero-byte read renews nothing. It is nil-safe: a nil lease's reader reads r
+// unchanged.
+func (l *Lease) Reader(r io.Reader) io.Reader {
+	return &renewingReader{l: l, r: r}
+}
+
+// renewingReader is Lease.Reader's wrapper.
+type renewingReader struct {
+	l *Lease
+	r io.Reader
+}
+
+func (rr *renewingReader) Read(b []byte) (int, error) {
+	n, err := rr.r.Read(b)
+	if n > 0 {
+		rr.l.Renew()
+	}
+	return n, err
 }
 
 // Digests returns the digests this lease pins (a copy).
@@ -96,9 +192,43 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	c.nextLease++
-	l := &Lease{c: c, id: c.nextLease, digests: held, expires: c.now().Add(ttl)}
+	if c.leaseWatch != nil {
+		for _, d := range held {
+			c.leaseWatch[d] = struct{}{}
+		}
+	}
+	now := c.now()
+	l := &Lease{c: c, id: c.nextLease, digests: held, ttl: ttl, expires: now.Add(ttl), lastRenew: now, acquired: now}
+	l.lastRenewOffset.Store(0)
 	c.leases[l.id] = l
 	return l
+}
+
+// beginLeaseWatch starts collecting the digests of every lease acquired from
+// now on (see Cache.leaseWatch). Its only caller is executePrune, which takes
+// pruneMu itself for the whole pass, so at most one watch is open at a time
+// and begin/end never nest.
+func (c *Cache) beginLeaseWatch() {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.leaseWatch = make(map[string]struct{})
+}
+
+// endLeaseWatch stops collecting lease digests.
+func (c *Cache) endLeaseWatch() {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.leaseWatch = nil
+}
+
+// leaseWatchNamesLocked reports whether a lease acquired since the watch began
+// (or since the watch was last reset) names d. The caller holds leaseMu. Its
+// only caller is executePrune's critical section (unlinkUnlessLeased), which
+// resets the watch in that same section when it is about to re-read its pins,
+// so a lease acquired during that re-read lands in the fresh watch.
+func (c *Cache) leaseWatchNamesLocked(d string) bool {
+	_, ok := c.leaseWatch[d]
+	return ok
 }
 
 // leasedDigests returns the set of digests currently pinned by a live lease,
@@ -122,6 +252,13 @@ func (c *Cache) leasedDigests() map[string]bool {
 func (c *Cache) leaseHas(digest string) bool {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
+	return c.leaseHasLocked(digest)
+}
+
+// leaseHasLocked is leaseHas for a caller that already holds leaseMu, which is
+// how executePrune makes a blob's lease check and its unlink one critical
+// section with respect to AcquireLease.
+func (c *Cache) leaseHasLocked(digest string) bool {
 	c.expireLeasesLocked()
 	for _, l := range c.leases {
 		for _, d := range l.digests {
