@@ -162,7 +162,9 @@ func storeBlobCount(t *testing.T, c *Cache) int {
 // TestPullRefusesAManifestOverTheLayerLimit gates B1739: every path that acts on
 // a manifest (cold pull, warm serve, load) refuses one naming more than
 // MaxManifestLayers layers, and the cold pull does so before the config GET,
-// the lease, the space reservation and any layer GET.
+// any lease and any layer GET. The space-ledger check is a NET count: it
+// proves no reservation is left held after the refusal, not that none was
+// taken and released before it.
 func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 	cases := []struct {
 		layers  int
@@ -196,6 +198,11 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 					defer res.Lease.Release()
 					requireManifestOf(t, res.Manifest, img)
 					obs.requireAcquired(t)
+					// Liveness of the config counter: an accepted pull reads
+					// the config, so the refused row's zero is not vacuous.
+					if n := img.configReads.Load(); n == 0 {
+						t.Errorf("accepted pull read the image config %d times, want > 0", n)
+					}
 					return
 				}
 				if !errors.Is(err, ErrTooManyLayers) {
@@ -641,6 +648,14 @@ func pullThroughRegistry(t *testing.T, img ggcrv1.Image, refused bool, want erro
 		defer res.Lease.Release()
 		requireManifestOf(t, res.Manifest, img)
 		obs.requireAcquired(t)
+		// Liveness of the config GET counter: an accepted pull fetches the
+		// config, so the refused rows' zero is not vacuous.
+		reg.mu.Lock()
+		cfgGets := reg.gets[mfst.Config.Digest.String()]
+		reg.mu.Unlock()
+		if cfgGets == 0 {
+			t.Errorf("accepted pull made %d config GETs, want > 0", cfgGets)
+		}
 		return
 	}
 	if !errors.Is(err, want) {
