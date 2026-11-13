@@ -126,6 +126,27 @@ func TestResolveTimeoutIsPullFailure(t *testing.T) {
 	})
 }
 
+// TestMirrorFetchSilentRegistryHitsTheResolveBound pins that a mirror that
+// accepts the connection and never answers fails with ErrPullResolveTimeout in
+// about the resolve bound (the response-header timeout is set far longer), and
+// that the failure is not fallback-eligible.
+func TestMirrorFetchSilentRegistryHitsTheResolveBound(t *testing.T) {
+	setDuration(t, &resolveTimeout, 50*time.Millisecond)
+	setDuration(t, &responseHeaderTimeout, time.Minute)
+	host := silentServer(t)
+	start := time.Now()
+	_, err := RemoteMirrorFetch(context.Background(), host+"/silent/app:v1", Mirror{Host: host, PlainHTTP: true}, nativePolicy())
+	if !errors.Is(err, ErrPullResolveTimeout) {
+		t.Fatalf("RemoteMirrorFetch error = %v, want ErrPullResolveTimeout", err)
+	}
+	if el := time.Since(start); el > 10*time.Second {
+		t.Fatalf("RemoteMirrorFetch took %s, want about the 50ms bound, not the header timeout", el)
+	}
+	if mirrorFallbackEligible(err) {
+		t.Fatalf("mirrorFallbackEligible(%v) = true, want false", err)
+	}
+}
+
 // TestFlatTransportHeaderTimeout pins the header bound on the flat registry's
 // transport without loosening its dial restriction.
 func TestFlatTransportHeaderTimeout(t *testing.T) {

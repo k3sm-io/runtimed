@@ -261,7 +261,10 @@ func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *Regist
 // and the option it returns goes after extra. A transport whose construction
 // itself makes round trips (splitFetch's OriginSplit pings the registry) is
 // built there, so those round trips sit under the resolve bound and its
-// ErrPullResolveTimeout mapping like the resolve's own.
+// ErrPullResolveTimeout mapping like the resolve's own. late is applied after
+// extra and after the auth option, so it replaces a caller-pinned transport:
+// late and extra must not both carry a transport (only splitFetch passes late,
+// with no extra).
 func resolveFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, late func(context.Context) (remote.Option, error), extra ...remote.Option) (ggcrv1.Image, error) {
 	want, err := Candidates(policy)
 	if err != nil {
