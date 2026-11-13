@@ -466,7 +466,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// critical section as the unlink, so a pull that leased, rooted and
 	// released a blob during the batch keeps it; and in that section it
 	// re-reads the live leases, so a pull still holding its lease keeps it
-	// too. The residual (a lease past its TTL) is executePrune's to state.
+	// too. The residual (a lease past its TTL) is stated in the Lease type's comment.
 	artifactDels, restDels := orderEvictions(plan.Delete, classes)
 	plan.Delete = append(append([]PruneDecision(nil), artifactDels...), restDels...)
 	rep.ReclaimedByClass = map[string]int64{}
