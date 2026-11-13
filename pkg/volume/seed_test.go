@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	storagev1 "k3sm.io/apis/storage/v1"
@@ -249,10 +250,11 @@ func seedRaceFixture(t *testing.T) (class storagev1.LocalPathClass, tmpl fakeTem
 	return class, tmpl, dataDir, rootfs
 }
 
-// TestSeedReusesEmptyDataDirCreatedDuringSeed pins that an empty data dir made
-// mid-seed is reused, not replaced: os.Rename refuses to replace a directory
-// (EEXIST), so the bind succeeds unseeded, the dir stays empty, and no staging
-// dir remains.
+// TestSeedReusesEmptyDataDirCreatedDuringSeed asserts what must hold whether
+// os.Rename refuses an empty data dir made mid-seed (today) or replaces it: the
+// bind succeeds, the data dir exists, no staging dir remains, and the data dir
+// is either empty (Seeded=false) or the whole template (Seeded=true), never a
+// partial template.
 func TestSeedReusesEmptyDataDirCreatedDuringSeed(t *testing.T) {
 	class, tmpl, dataDir, rootfs := seedRaceFixture(t)
 	box := pvcBox("prod", "data", "seeded", "/seed", false)
@@ -260,11 +262,20 @@ func TestSeedReusesEmptyDataDirCreatedDuringSeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if bindings[0].Seeded {
-		t.Error("Seeded = true; want false (os.Rename does not replace a directory)")
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatalf("data dir: %v", err)
 	}
-	if entries, err := os.ReadDir(dataDir); err != nil || len(entries) != 0 {
-		t.Errorf("data dir entries = %v, %v; want the creator's empty dir", entries, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if bindings[0].Seeded {
+		if !slices.Equal(names, []string{"a.sql", "b.sql"}) {
+			t.Errorf("Seeded=true but data dir holds %v; want the whole template", names)
+		}
+	} else if len(names) != 0 {
+		t.Errorf("Seeded=false but data dir holds %v; want empty", names)
 	}
 	if _, err := os.Lstat(stagingDir(dataDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("staging dir remains (err=%v)", err)

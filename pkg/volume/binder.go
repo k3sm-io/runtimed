@@ -281,9 +281,11 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName, dataDir 
 // shared claim never interleave in it. The second bind re-checks dataDir under
 // the lock and reuses what the first one seeded.
 //
-// Any dataDir another creator makes during the seed, empty or not, is reused
-// (Seeded=false): os.Rename refuses to replace an existing directory (EEXIST)
-// even though rename(2) itself would replace an empty one on Darwin.
+// A dataDir another creator makes during the seed is reused (Seeded=false) when
+// the final rename refuses it: Go's os.Rename refuses a directory destination
+// today, so even an empty one is reused. Were an empty one replaced instead, the
+// result is a seeded volume and nothing is lost. Either way no half-seeded
+// directory is left.
 func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, err error) {
 	b.seedMu.Lock()
 	defer b.seedMu.Unlock()
@@ -304,14 +306,21 @@ func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, e
 		return false, fmt.Errorf("create pv staging dir %s: %w", staging, err)
 	}
 	// The deferred cleanup is the single owner of staging removal: it runs on
-	// every error and when the rename lost the race (lostRace), so a removal
-	// failure is reported once.
+	// every error and when the rename lost the race (lostRace). A removal
+	// failure joins the error on the error path and only warns on a lost race.
 	lostRace := false
 	defer func() {
-		if err != nil || lostRace {
-			if rmErr := os.RemoveAll(staging); rmErr != nil {
-				err = errors.Join(err, fmt.Errorf("remove pv staging dir %s: %w", staging, rmErr))
-			}
+		if err == nil && !lostRace {
+			return
+		}
+		rmErr := os.RemoveAll(staging)
+		switch {
+		case rmErr == nil:
+		case err != nil:
+			err = errors.Join(err, fmt.Errorf("remove pv staging dir %s: %w", staging, rmErr))
+		default:
+			// Lost race: a usable volume exists, so the bind must not fail.
+			b.log.Warn("remove leftover pv staging dir", "dir", staging, "error", rmErr)
 		}
 	}()
 	if _, err := image.MaterializeTree(b.cloner, src, staging); err != nil {
