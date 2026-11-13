@@ -298,28 +298,45 @@ func (x *FileIndex) artifactHolds() (map[PodID]ArtifactHold, error) {
 	return out, nil
 }
 
+// holdReadError is the *HoldReadError for pod id's hold at path.
+func holdReadError(path string, id PodID, format string, args ...any) error {
+	return &HoldReadError{Path: path, Err: fmt.Errorf("hold of pod %s: "+format, append([]any{id}, args...)...)}
+}
+
 // readArtifactHold reads and checks pod id's hold from sub; path names it
 // for errors. An absent hold is fs.ErrNotExist; anything else wrong with it is
 // a *HoldReadError.
+//
+// The Lstat here is only an early answer: the file can be swapped or grown
+// between it and the open, so loadArtifactHold enforces the same cap again on
+// the descriptor it reads.
 func readArtifactHold(sub *os.Root, path, name string, id PodID) (*ArtifactHold, error) {
-	bad := func(format string, args ...any) error {
-		return &HoldReadError{Path: path, Err: fmt.Errorf("hold of pod %s: "+format, append([]any{id}, args...)...)}
-	}
 	fi, err := sub.Lstat(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
-		return nil, bad("stat: %v", err)
+		return nil, holdReadError(path, id, "stat: %v", err)
 	}
 	if !fi.Mode().IsRegular() || fi.Size() > MaxArtifactHoldBytes {
-		return nil, bad("not a regular file within its cap (mode %v, %d bytes)", fi.Mode().Type(), fi.Size())
+		return nil, holdReadError(path, id, "not a regular file within its cap (mode %v, %d bytes)", fi.Mode().Type(), fi.Size())
 	}
-	buf, err := readAnchored(sub, name, MaxArtifactRecordBytes)
+	return loadArtifactHold(sub, path, name, id)
+}
+
+// loadArtifactHold is readArtifactHold after its Lstat: it reads the hold
+// bounded by MaxArtifactHoldBytes on the open descriptor, so a hold over the
+// cap is refused here even when it passed (or raced) the Lstat, then decodes
+// and checks it. Its errors are readArtifactHold's.
+func loadArtifactHold(sub *os.Root, path, name string, id PodID) (*ArtifactHold, error) {
+	bad := func(format string, args ...any) error { return holdReadError(path, id, format, args...) }
+	buf, err := readAnchored(sub, name, MaxArtifactHoldBytes)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
+		// An over-cap hold lands here as the same *HoldReadError the Lstat
+		// gives, so a hold grown after the pre-check fails List just the same.
 		return nil, bad("read: %v", err)
 	}
 	var h ArtifactHold

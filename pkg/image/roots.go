@@ -547,8 +547,8 @@ func operatorRootSet(roots []OperatorImageRoot) []ImageRoot {
 // root, its final component is opened with recordOpenFlags (no symlink
 // followed, no block on a FIFO), and readCheckedRecord refuses anything that is
 // not a regular file or exceeds limit, which each caller sizes to its record
-// kind (maxPodReferencesBytes, MaxArtifactRecordBytes, maxIndexEntryBytes). It
-// exists so the
+// kind (maxPodReferencesBytes, MaxArtifactRecordBytes, MaxArtifactHoldBytes,
+// maxIndexEntryBytes for index entries and tree records). It exists so the
 // "absent" and "not a regular file" cases both surface as errors here rather
 // than as an empty record at the call site; an absent file keeps its
 // fs.ErrNotExist identity.

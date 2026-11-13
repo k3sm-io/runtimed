@@ -281,3 +281,70 @@ func TestArtifactHoldRootsKeepHeldBlobs(t *testing.T) {
 		}
 	}
 }
+
+// TestArtifactHoldReadEnforcesHoldCap pins that the bounded read of a hold, not
+// only the Lstat in front of it, enforces MaxArtifactHoldBytes. The rows call
+// loadArtifactHold, the read readArtifactHold makes after its Lstat, so the
+// pre-check is bypassed exactly as a file grown between the Lstat and the open
+// would bypass it. Each body is a valid hold padded with JSON whitespace, so the
+// only thing that can refuse it is the cap.
+func TestArtifactHoldReadEnforcesHoldCap(t *testing.T) {
+	t.Parallel()
+	id, err := ParsePodID("pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold := func(t *testing.T, size int) []byte {
+		t.Helper()
+		body, err := json.Marshal(ArtifactHold{References: []string{"reg/m:v1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) > size {
+			t.Fatalf("hold body is %d bytes, larger than the %d asked for", len(body), size)
+		}
+		return append(body, []byte(strings.Repeat(" ", size-len(body)))...)
+	}
+	for _, tc := range []struct {
+		name string
+		size int
+		read func(sub *os.Root, path, name string, id PodID) (*ArtifactHold, error)
+		ok   bool
+	}{
+		{name: "read at the cap is accepted", size: MaxArtifactHoldBytes, read: loadArtifactHold, ok: true},
+		{name: "read one byte over the cap is refused with the pre-check bypassed", size: MaxArtifactHoldBytes + 1, read: loadArtifactHold},
+		{name: "pre-check refuses one byte over the cap", size: MaxArtifactHoldBytes + 1, read: readArtifactHold},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			const name = "pod-a.json"
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, hold(t, tc.size), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sub, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			h, err := tc.read(sub, path, name, id)
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("read of a %d-byte hold = %v; want it accepted", tc.size, err)
+				}
+				if len(h.References) != 1 || h.References[0] != "reg/m:v1" {
+					t.Fatalf("read of a %d-byte hold = %+v; want references [reg/m:v1]", tc.size, h)
+				}
+				return
+			}
+			var hre *HoldReadError
+			if !errors.As(err, &hre) || !errors.Is(err, ErrArtifactHoldsIncomplete) {
+				t.Fatalf("read of a %d-byte hold = %v, %+v; want a *HoldReadError wrapping ErrArtifactHoldsIncomplete", tc.size, err, h)
+			}
+			if h != nil {
+				t.Fatalf("read returned %+v alongside the refusal; want nil", h)
+			}
+		})
+	}
+}
