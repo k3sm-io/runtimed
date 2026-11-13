@@ -37,8 +37,8 @@ const DefaultLeaseTTL = 15 * time.Minute
 
 // Lease pins a set of blob digests against reclaim while an ingest is in flight.
 //
-// It closes the window the content-addressed store cannot close on its own: a
-// blob is committed (or found already present) before the reference that makes
+// While live, it covers the window the content-addressed store cannot cover on
+// its own: a blob is committed (or found already present) before the reference that makes
 // it reachable is recorded, so between those two moments the blob is on disk and
 // named by nothing. A concurrent prune would compute it unreachable and delete
 // the layer of the pull that is still running. The lease is therefore acquired
@@ -52,7 +52,10 @@ const DefaultLeaseTTL = 15 * time.Minute
 //
 // A pull keeps its lease alive while bytes arrive (Renew, Reader): the TTL
 // bounds how long a lease outlives the last sign of progress, not how long a
-// slow pull may take.
+// slow pull may take. A lease that lapses mid-pull (stalled past the TTL, no
+// renewal) leaves that pull's blobs unprotected; the cost is availability (a
+// refetch, a refused mount or a failed pod create), not corruption, because
+// unlinks are checked and a later read of a missing blob fails cleanly.
 type Lease struct {
 	c       *Cache
 	id      uint64

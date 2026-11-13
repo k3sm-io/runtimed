@@ -313,7 +313,7 @@ type KeptBlob struct {
 //
 // The safety property, stated exactly: a blob named by any pod's daemon-authored
 // reachability record, or pinned by any live ingest lease, is never in the delete
-// plan — and if the root set cannot be enumerated in full, nothing is deleted
+// plan (a lease past its TTL no longer pins; executePrune states that residual) — and if the root set cannot be enumerated in full, nothing is deleted
 // (ErrRootsIncomplete). Reclaim is not best-effort about liveness; it refuses.
 //
 // The pass sweeps two stores: the content-addressed blobs, and the derived trees
@@ -326,8 +326,8 @@ type KeptBlob struct {
 // least recently released first; then the trees; then the remaining blobs,
 // content nothing names before image content. The order is a permutation of
 // the delete plan, read after the plan is fixed, so it only decides what goes
-// first under a measured target: a held, pinned, pod-recorded, leased or young
-// blob is never in the plan to be ordered.
+// first under a measured target: a held, pinned, pod-recorded, live-leased or
+// young blob is never in the plan to be ordered.
 func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
