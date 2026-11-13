@@ -551,9 +551,9 @@ func evictPrune(hooks *pruneHooks) pruneMode {
 
 // pruneHooks are the seams of executePrune's eviction mode (evictPrune). A
 // nil guard drops nothing. unlink is REQUIRED: executePrune refuses evict mode
-// with a nil unlink before taking any lock, because the eviction body does its
-// Lstat and grace check outside leaseMu and relies on unlink to re-check roots
-// and leases at unlink time.
+// with a nil unlink before taking any lock, because the eviction body relies
+// on unlink to re-check roots and leases at unlink time, and runs its Lstat
+// and grace check only through the remove closure it hands to unlink.
 type pruneHooks struct {
 	// guard, when non-nil, runs once per call inside pruneMu, before the
 	// unlink loop. Every digest in the returned set is skipped rather than
@@ -561,10 +561,13 @@ type pruneHooks struct {
 	// the call with nothing unlinked.
 	guard func() (drop map[string]evictReason, err error)
 
-	// unlink (required, see above) decides the removal of one blob that passed
-	// re-verification. remove is root.Remove bound to that blob's path under
-	// the executor's *os.Root; a hook MUST delete only through remove, so it
-	// cannot unlink outside the blobs root. A false removed with a nil error
+	// unlink (required, see above) decides the removal of one blob. remove
+	// re-verifies the blob (Lstat, regularity, grace) and then calls
+	// root.Remove on its path under the executor's *os.Root, so a hook that
+	// calls remove inside its own lock runs that re-verification there. A
+	// blob remove keeps returns a non-nil error, and the executor reports the
+	// kept outcome whatever the hook returns. A hook MUST delete only through
+	// remove, so it cannot unlink outside the blobs root. A false removed with a nil error
 	// records the blob as skipped with reason; an error records it as skipped
 	// with the error, exactly as a failed root.Remove. A true removed is not
 	// trusted: the executor re-checks the path through the root handle and
@@ -656,9 +659,9 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			return nil, errors.New("execute prune: evict mode takes hooks and no pin set")
 		}
 		if hooks.unlink == nil {
-			// Lstat and the grace check run outside leaseMu; only the unlink
-			// hook re-checks roots and leases at unlink time. Without it the
-			// body would be a bare Remove racing a lease.
+			// Only the unlink hook re-checks roots and leases, and only it
+			// runs the Lstat and grace check (through remove) under leaseMu.
+			// Without it the body would be a bare Remove racing a lease.
 			return nil, errors.New("execute prune: evict mode requires an unlink hook")
 		}
 	default:
@@ -753,17 +756,28 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 const maxPruneRepins = 3
 
 // executeHookedEntry is the eviction executor's per-entry body (pruneHooks
-// non-nil): grammar, Lstat, regularity and grace re-verification, then the
-// unlink hook (which takes leaseMu itself; executePrune guarantees it is
-// non-nil), with the typed refusals the eviction reports.
+// non-nil): grammar, then the unlink hook (which takes leaseMu itself;
+// executePrune guarantees it is non-nil), with the typed refusals the eviction
+// reports.
+//
+// The Lstat, regularity and grace re-verification run inside the remove
+// closure handed to the hook, so they run in the hook's leaseMu section
+// immediately before the Remove. A blob commit is a lock-free rename that
+// refreshes the mtime; checked before the hook took its lock, a commit landing
+// in between would leave the grace verdict stale and a just-written blob
+// would be unlinked. The closure records a refusal in kept and returns
+// errEntryKept without removing anything; that outcome is reported as-is,
+// whatever the hook returns.
 func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, hooks *pruneHooks, rep *ExecuteReport, skip func(PruneDecision, string), refuse func(PruneDecision, string, *SkipRefusal), failed func(PruneDecision) *SkipRefusal) {
 	rel := d.Node.Path
 	if cls, _ := classifyBlobRel(rel); cls == relInvalid {
 		skip(d, "path fails blob grammar")
 		return
 	}
-	fi, err := root.Lstat(rel)
-	if err != nil {
+	// This early Lstat only skips an entry already gone (or unreadable)
+	// without paying for the hook's lease and roots checks. It is not the
+	// authoritative check: that is the one in remove, under leaseMu.
+	if _, err := root.Lstat(rel); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			skip(d, "already absent")
 		} else {
@@ -771,41 +785,64 @@ func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Du
 		}
 		return
 	}
-	if !fi.Mode().IsRegular() {
-		skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
-		return
-	}
-	if now.Sub(fi.ModTime()) < grace {
-		refuse(d, "younger than grace", &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedYoung, Reason: EvictKeptYoung})
-		return
-	}
-	if hooks.unlink != nil {
-		removed, why, err := hooks.unlink(d.Node.Digest, func() error { return root.Remove(rel) })
+	var (
+		kept func() // set by remove when re-verification keeps the blob
+		size int64  // the removed blob's size, from remove's Lstat
+	)
+	remove := func() error {
+		fi, err := root.Lstat(rel)
 		if err != nil {
-			refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
-			return
+			if errors.Is(err, fs.ErrNotExist) {
+				kept = func() { skip(d, "already absent") }
+			} else {
+				kept = func() { skip(d, fmt.Sprintf("lstat: %v", err)) }
+			}
+			return errEntryKept
 		}
-		if !removed {
-			refuse(d, fmt.Sprintf("refused by unlink: %s", why), hookRefusal(d.Node.Digest, RefusedByUnlink, why))
-			return
+		if !fi.Mode().IsRegular() {
+			kept = func() { skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type())) }
+			return errEntryKept
 		}
-		if _, err := root.Lstat(rel); err == nil {
-			refuse(d, "remove: unlink reported removed but blob is still present", failed(d))
-			return
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			refuse(d, fmt.Sprintf("remove: verify: %v", err), failed(d))
-			return
+		if now.Sub(fi.ModTime()) < grace {
+			kept = func() {
+				refuse(d, "younger than grace", &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedYoung, Reason: EvictKeptYoung})
+			}
+			return errEntryKept
 		}
-	} else if err := root.Remove(rel); err != nil {
+		size = fi.Size()
+		return root.Remove(rel)
+	}
+	removed, why, err := hooks.unlink(d.Node.Digest, remove)
+	if kept != nil {
+		kept()
+		return
+	}
+	if err != nil {
 		refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
 		return
 	}
+	if !removed {
+		refuse(d, fmt.Sprintf("refused by unlink: %s", why), hookRefusal(d.Node.Digest, RefusedByUnlink, why))
+		return
+	}
+	if _, err := root.Lstat(rel); err == nil {
+		refuse(d, "remove: unlink reported removed but blob is still present", failed(d))
+		return
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		refuse(d, fmt.Sprintf("remove: verify: %v", err), failed(d))
+		return
+	}
 	rep.Deleted++
-	rep.DeletedBytes += fi.Size()
+	rep.DeletedBytes += size
 	if d.Node.Digest != "" {
 		rep.Removed = append(rep.Removed, d.Node.Digest)
 	}
 }
+
+// errEntryKept is what executeHookedEntry's remove closure returns when its
+// re-verification keeps the blob: nothing was removed, so the hook sees a
+// failed removal, and the executor reports the closure's recorded outcome.
+var errEntryKept = errors.New("prune: entry kept by re-verification")
 
 // unlinkUnlessLeased runs one entry's lease-watch check, live-lease check,
 // Lstat, grace check and Remove inside ONE leaseMu critical section, so an

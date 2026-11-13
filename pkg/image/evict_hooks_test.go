@@ -30,7 +30,7 @@ import (
 // on a fixture cache: a nil hooks pointer behaves as ExecutePrune, a guard drop
 // keeps its blob with the reason in the report, a guard error unlinks nothing,
 // an unlink hook that refuses a blob keeps it with the reason, a blob the
-// executor's own re-verification refuses never reaches the hook, a hook error
+// executor's own re-verification (run by remove) refuses is kept, a hook error
 // is a skip, and a removed report the root handle contradicts is a failed
 // removal.
 func TestExecutePruneHooks(t *testing.T) {
@@ -95,12 +95,12 @@ func TestExecutePruneHooks(t *testing.T) {
 			wantReason: string(evictLeased),
 		},
 		{
-			name: "blob refused by re-verification is never offered to the hook",
-			hooks: func(_ *gcFixture, keep string) *pruneHooks {
+			// Re-verification runs inside remove, under the hook's lock: a
+			// hook that calls remove for a young blob removes nothing, and
+			// the young refusal wins over the hook's own report.
+			name: "blob refused by re-verification inside remove is kept",
+			hooks: func(*gcFixture, string) *pruneHooks {
 				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
-					if digest == keep {
-						return false, "", errors.New("hook offered a blob younger than grace")
-					}
 					return true, "", remove()
 				}}
 			},
@@ -546,5 +546,74 @@ func TestExecutePruneModeMismatch(t *testing.T) {
 				t.Errorf("executePrune err = %q; want %q", err, want)
 			}
 		})
+	}
+}
+
+// TestEvictGraceIsCheckedUnderTheLeaseLock pins that the eviction executor's
+// Lstat and grace check run inside the remove closure it hands the unlink
+// hook, so they run in the hook's critical section immediately before the
+// Remove. The hook here commits the blob again (a lock-free rename that
+// refreshes its mtime, as CommitBlob does) before calling remove: the blob
+// must survive with the typed young refusal and the unchanged reason string,
+// and the other blob is still removed.
+func TestEvictGraceIsCheckedUnderTheLeaseLock(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	a := f.blob("grace-lock-a", time.Hour)
+	b := f.blob("grace-lock-b", time.Hour)
+	nodes, err := f.cache.EnumerateBlobs()
+	if err != nil {
+		t.Fatalf("EnumerateBlobs: %v", err)
+	}
+	plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
+	if err != nil {
+		t.Fatalf("PlanPrune: %v", err)
+	}
+	recommit := func() {
+		p, err := f.cache.BlobPath(b)
+		if err != nil {
+			t.Fatalf("BlobPath: %v", err)
+		}
+		tmp := p + ".recommit"
+		if err := os.WriteFile(tmp, []byte("grace-lock-b"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if err := os.Chtimes(tmp, f.clock, f.clock); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			t.Fatalf("Rename: %v", err)
+		}
+	}
+	hooks := &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+		if digest == b {
+			recommit()
+		}
+		err := remove()
+		return err == nil, "", err
+	}}
+	rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, evictPrune(hooks))
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
+	}
+	if !blobOnDisk(t, f, b) {
+		t.Fatalf("blob %s committed under the hook was removed", b)
+	}
+	if blobOnDisk(t, f, a) {
+		t.Errorf("old blob %s is still on disk", a)
+	}
+	if rep.Deleted != 1 {
+		t.Errorf("Deleted = %d; want 1", rep.Deleted)
+	}
+	if len(rep.Skipped) != 1 || rep.Skipped[0].Digest != b {
+		t.Fatalf("Skipped = %+v; want exactly %s", rep.Skipped, b)
+	}
+	s := rep.Skipped[0]
+	if s.Reason != "younger than grace" {
+		t.Errorf("Reason = %q; want %q", s.Reason, "younger than grace")
+	}
+	want := SkipRefusal{Digest: b, Kind: RefusedYoung, Reason: EvictKeptYoung}
+	if s.Refusal == nil || *s.Refusal != want {
+		t.Errorf("Refusal = %+v; want %+v", s.Refusal, want)
 	}
 }
