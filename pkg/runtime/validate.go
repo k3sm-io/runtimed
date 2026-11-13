@@ -28,8 +28,10 @@ import (
 )
 
 // errInvalidPodBox is the sentinel for PodBox validation failures (mapped to
-// codes.InvalidArgument + FailureReason_INVALID_POD_BOX).
-var errInvalidPodBox = errors.New("invalid pod box")
+// codes.InvalidArgument + FailureReason_INVALID_POD_BOX). It is marked
+// tenantText: a refusal of the PodBox is worded for the pod's owner, so the
+// reply and the Waiting message carry its text, not a fixed sentence.
+var errInvalidPodBox = tenantText(errors.New("invalid pod box"))
 
 // validatePodBox checks the minimum a PodBox needs to be instantiable. It returns
 // a typed FailureReason and an errInvalidPodBox-wrapped error on failure.

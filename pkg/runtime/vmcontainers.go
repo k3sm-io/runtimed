@@ -427,8 +427,9 @@ func (r *Runtime) resolveVMContainer(ctx context.Context, box *runtimev1.PodBox,
 		// CONTAINER_CONFIG is container-class, which is what the provider
 		// parks as a waiting container on the vm spine (one guest per pod, so
 		// there is no partly started pod to hold the state). The message
-		// starts with "container <name>:" so the provider can attribute it.
-		return failed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
+		// starts with "container <name>:" so the provider can attribute it,
+		// and the kubelet's refusal is its text (tenantText).
+		return failed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, tenantText(err))
 	case err != nil:
 		// Any other merge refusal (no command anywhere) is a POD-SPEC verdict
 		// with nothing to retry, as before.

@@ -391,10 +391,10 @@ func TestWrappedStartErrorsReachClientRenderers(t *testing.T) {
 				t.Errorf("%s: the classified error lost its cause: %v", tc.name, err)
 			}
 			want := fmt.Sprintf("%q", tc.want)
-			if got := boundedFailureMessage(err); got != want {
+			if got := boundedFailureMessage(stageStart, err); got != want {
 				t.Errorf("%s: Waiting message = %s, want %s", tc.name, got, want)
 			}
-			if got := startErrorReply(err); got != want {
+			if got := startErrorReply(stageStart, err); got != want {
 				t.Errorf("%s: reply = %s, want %s", tc.name, got, want)
 			}
 			if got := createFailure(tc.reason, err).GetError().GetMessage(); strings.Contains(got, detail) {

@@ -171,10 +171,10 @@ func reserveEphemeralLocked(p *pod, appends []*runtimev1.Container) ([]*containe
 func (r *Runtime) startEphemeral(p *pod, placeholder *containerProc) {
 	fail := func(reason runtimev1.FailureReason, err error) {
 		r.log.Warn("ephemeral container could not be started",
-			"pod", p.box.GetPodId(), "container", placeholder.name, "reason", reason.String(), "err", err)
+			"pod", p.box.GetPodId(), "container", placeholder.name, "reason", reason.String(), "err", failureLogText(err))
 		p.mu.Lock()
 		placeholder.state.State = &runtimev1.ContainerState{Waiting: &runtimev1.ContainerStateWaiting{
-			Message: boundedFailureMessage(err), FailureReason: reason,
+			Message: boundedFailureMessage(stageStart, err), FailureReason: reason,
 		}}
 		releaseStartClaimLocked(placeholder)
 		p.mu.Unlock()

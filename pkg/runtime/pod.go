@@ -1479,9 +1479,9 @@ func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, init
 				return reason, err
 			}
 			r.log.Warn("init container could not be started; the rest of the pod waits",
-				"pod", p.box.GetPodId(), "container", c.GetName(), "reason", reason.String(), "err", err)
+				"pod", p.box.GetPodId(), "container", c.GetName(), "reason", reason.String(), "err", failureLogText(err))
 			p.mu.Lock()
-			r.setContainerOrLogLocked(p, r.waitingContainerProc(p.box.GetPodId(), c, true, reason, "", boundedFailureMessage(err)))
+			r.setContainerOrLogLocked(p, r.waitingContainerProc(p.box.GetPodId(), c, true, reason, "", boundedFailureMessage(stageStart, err)))
 			r.blockRemainingLocked(p, i+1)
 			releaseStartClaimLocked(claimed)
 			p.mu.Unlock()
@@ -1514,9 +1514,9 @@ func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, init
 				return reason, err
 			}
 			r.log.Warn("container could not be started; it waits while the pod's other containers run",
-				"pod", p.box.GetPodId(), "container", c.GetName(), "reason", reason.String(), "err", err)
+				"pod", p.box.GetPodId(), "container", c.GetName(), "reason", reason.String(), "err", failureLogText(err))
 			p.mu.Lock()
-			r.setContainerOrLogLocked(p, r.waitingContainerProc(p.box.GetPodId(), c, false, reason, "", boundedFailureMessage(err)))
+			r.setContainerOrLogLocked(p, r.waitingContainerProc(p.box.GetPodId(), c, false, reason, "", boundedFailureMessage(stageStart, err)))
 			releaseStartClaimLocked(claimed)
 			p.mu.Unlock()
 			continue
@@ -2468,6 +2468,56 @@ func withClientMessage(message string, err error) error {
 	return &clientMessageError{message: message, err: err}
 }
 
+// tenantTextError marks an error whose own text is written for the pod's
+// owner: a refusal of what the PodBox asked for, worded about the PodBox. An
+// error whose chain holds one is published as its full text, wrappers
+// included, by boundedFailureMessage and startErrorReply; every other error
+// without a clientMessageError is published as its stage's fixed sentence
+// (failureStage), so a new unwrapped error fails closed. Mark a sentinel
+// (errInvalidPodBox, ErrArtifactMountRefused), or, where the producer's
+// sentinel lives outside this package, the one site that raises a sentence
+// worded for the tenant (image.MergeRunSpec's refusals, pullCredential's). A
+// wrapper around a marked error must word only what the pod wrote. Unwrap
+// keeps errors.Is / errors.As on the marked error working.
+type tenantTextError struct {
+	err error
+}
+
+func (e *tenantTextError) Error() string { return e.err.Error() }
+func (e *tenantTextError) Unwrap() error { return e.err }
+
+// tenantText marks err's text as written for the pod's owner (tenantTextError).
+func tenantText(err error) error {
+	return &tenantTextError{err: err}
+}
+
+// failureStage names the verb a failure stopped, for the fixed sentence a
+// client reads when the error carries neither a clientMessageError nor a
+// tenantTextError.
+type failureStage int
+
+const (
+	// stageCreate is CreatePod: the pod was not created.
+	stageCreate failureStage = iota + 1
+	// stageStart is a container start: the first start, StartContainer,
+	// RestartContainer, an ephemeral container's start.
+	stageStart
+)
+
+// sentence is the fixed client sentence for an unwrapped failure at s.
+func (s failureStage) sentence() string {
+	if s == stageCreate {
+		return "the pod could not be created; the daemon log has the cause"
+	}
+	return "the container could not be started; the daemon log has the cause"
+}
+
+// failureLogText bounds err's text for the one daemon log line that carries a
+// start or create failure's cause, as execFailure bounds an exec failure's.
+func failureLogText(err error) string {
+	return image.QuoteBounded(err.Error(), execFailureLogCap)
+}
+
 // spawnStartError is the start failure for container name whose spawn failed
 // with err. The client sentence keeps the errno class when it is one a tenant
 // fixes in its image (spawnErrnoClass), never the error's free text.
@@ -2706,13 +2756,19 @@ const maxWaitingMessageBytes = 256
 // A start failure carrying a fixed client sentence (clientMessageError: the
 // signature gate, an escaping image program, a failed materialization, a
 // failed wrap, shim preparation, log open or spawn)
-// publishes that sentence instead of its error, which names daemon paths.
-func boundedFailureMessage(err error) string {
+// publishes that sentence instead of its error, which names daemon paths. An
+// error marked tenantText publishes its own text; any other error publishes
+// stage's fixed sentence, and its cause is in the caller's log line.
+func boundedFailureMessage(stage failureStage, err error) string {
 	var ge *clientMessageError
 	if errors.As(err, &ge) {
 		return image.QuoteBounded(ge.message, maxWaitingMessageBytes)
 	}
-	return image.QuoteBounded(err.Error(), maxWaitingMessageBytes)
+	var tt *tenantTextError
+	if errors.As(err, &tt) {
+		return image.QuoteBounded(err.Error(), maxWaitingMessageBytes)
+	}
+	return image.QuoteBounded(stage.sentence(), maxWaitingMessageBytes)
 }
 
 // waitingContainerProc builds the tracked entry for a container that could not
@@ -3169,7 +3225,9 @@ func (r *Runtime) resolveBinary(ctx context.Context, p *pod, rootfs string, c *r
 	}
 	run, err := image.MergeRunSpec(runCfg, runSpecRequest(p.box, c, int64(resolveCredential(p.box, c).UID)))
 	if err != nil {
-		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, err)
+		// The merge's refusals (no command, the kubelet's runAsNonRoot text)
+		// are worded for the pod's owner from bounded pod and image values.
+		return resolvedBinary{}, resolveFailed(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, tenantText(err))
 	}
 
 	// argv[0] is the merged program resolved inside this pod's materialized
@@ -3388,8 +3446,8 @@ func (r *Runtime) pullCredential(ctx context.Context, box *runtimev1.PodBox, ref
 		r.log.Warn("resolve imagePullSecret", "pod", box.GetPodId(), "namespace", box.GetNamespace(),
 			"secrets", image.QuoteBounded(imagePullSecretRefs(box), maxSecretRefBytes),
 			"image", ref, "err", image.QuoteBounded(err.Error(), maxResolverErrBytes))
-		return nil, fmt.Errorf("imagePullSecret %s could not be resolved",
-			image.QuoteBounded(imagePullSecretRefs(box), maxSecretRefBytes))
+		return nil, tenantText(fmt.Errorf("imagePullSecret %s could not be resolved",
+			image.QuoteBounded(imagePullSecretRefs(box), maxSecretRefBytes)))
 	}
 	if !ok {
 		return nil, nil

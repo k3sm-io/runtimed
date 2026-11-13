@@ -75,7 +75,7 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 
 	p, reason, err := r.createPod(ctx, box)
 	if err != nil {
-		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", err)
+		r.log.Error("create pod failed", "pod", box.GetPodId(), "reason", reason.String(), "err", failureLogText(err))
 		_ = r.removePodDir(box.GetPodId())
 		r.releasePodArtifacts(ctx, box, 1)
 		return createFailure(reason, err), nil
@@ -895,7 +895,7 @@ func (r *Runtime) findContainer(p *pod, name string) *containerProc {
 // has already logged the full error once.
 func createFailure(reason runtimev1.FailureReason, err error) *runtimev1.CreatePodResponse {
 	return &runtimev1.CreatePodResponse{
-		Error:         rpcStatus(failureCode(err), "%s", startErrorReply(err)),
+		Error:         rpcStatus(failureCode(err), "%s", startErrorReply(stageCreate, err)),
 		FailureReason: reason,
 	}
 }

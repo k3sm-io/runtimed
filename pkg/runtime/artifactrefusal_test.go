@@ -181,7 +181,7 @@ func TestArtifactRefusalKeepsTail(t *testing.T) {
 	cause := errors.New("CAUSE")
 	err := artifactRefusal(ErrArtifactPullRefused, volumeSubject("pod-a", "model"),
 		"image "+strings.Repeat("x", 4000)+" could not be fetched", cause)
-	msg := startErrorReply(err)
+	msg := startErrorReply(stageStart, err)
 	if !strings.HasPrefix(msg, "ArtifactPullRefused: pod pod-a image volume model: image ") ||
 		!strings.HasSuffix(msg, "..."+daemonLogTail) || len(msg) > maxReplyMessageBytes {
 		t.Errorf("reply (%d bytes) = %q", len(msg), msg)

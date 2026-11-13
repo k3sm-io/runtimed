@@ -146,8 +146,8 @@ func (r *Runtime) RestartContainer(ctx context.Context, req *runtimev1.RestartCo
 	newCP, reason, err := r.startContainer(context.WithoutCancel(ctx), p, restartRootfs, spec, initDeclared, oldRestartCount+1)
 	if err != nil {
 		r.clearRestarting(ctx, p, oldCP)
-		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", err)
-		return restartFailure(codes.Internal, reason, "restart %s/%s: %s", req.GetPodId(), oldCP.name, startErrorReply(err)), nil
+		r.log.Error("restart: re-spawn failed", "pod", req.GetPodId(), "container", oldCP.name, "err", failureLogText(err))
+		return restartFailure(codes.Internal, reason, "restart %s/%s: %s", req.GetPodId(), oldCP.name, startErrorReply(stageStart, err)), nil
 	}
 
 	// Swap the new container in for the old (the old is now reaped + detached),

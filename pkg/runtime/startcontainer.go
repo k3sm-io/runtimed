@@ -165,27 +165,7 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 	// 0.log unless a previous daemon run already wrote one.
 	newCP, reason, err := r.startContainer(p.supCtx, p, rootfs, cp.spec, cp.initDeclared, 0)
 	if err != nil {
-		r.log.Warn("start container failed; it stays waiting",
-			"pod", req.GetPodId(), "container", cp.name, "reason", reason.String(), "err", err)
-		p.mu.Lock()
-		// Re-type the SAME entry: the container is still waiting, now for this
-		// attempt's reason. The provider renders the kubelet waiting reason from
-		// it, so a stale cause here would have the operator chasing the previous
-		// failure.
-		cp.state.State = &runtimev1.ContainerState{
-			Waiting: &runtimev1.ContainerStateWaiting{
-				Message:       boundedFailureMessage(err),
-				FailureReason: reason,
-			},
-		}
-		status := containerStatusOf(cp)
-		p.mu.Unlock()
-		r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
-		return &runtimev1.StartContainerResponse{
-			Status:        status,
-			Error:         rpcStatus(failureCode(err), "start %s/%s: %s", req.GetPodId(), cp.name, startErrorReply(err)),
-			FailureReason: reason,
-		}, nil
+		return r.startFailed(p, cp, reason, err), nil
 	}
 
 	p.mu.Lock()
@@ -245,6 +225,35 @@ func (r *Runtime) StartContainer(ctx context.Context, req *runtimev1.StartContai
 		r.resumeInitSequence(p, rootfs, newCP)
 	}
 	return &runtimev1.StartContainerResponse{Status: status}, nil
+}
+
+// startFailed reports err, the failure of StartContainer's start of the
+// never-started cp: the cause once in the daemon log at Warn, bounded, and the
+// client's rendering of it (boundedFailureMessage, startErrorReply) on cp's
+// Waiting state and in the reply.
+func (r *Runtime) startFailed(p *pod, cp *containerProc, reason runtimev1.FailureReason, err error) *runtimev1.StartContainerResponse {
+	podID := p.box.GetPodId()
+	r.log.Warn("start container failed; it stays waiting",
+		"pod", podID, "container", cp.name, "reason", reason.String(), "err", failureLogText(err))
+	p.mu.Lock()
+	// Re-type the SAME entry: the container is still waiting, now for this
+	// attempt's reason. The provider renders the kubelet waiting reason from
+	// it, so a stale cause here would have the operator chasing the previous
+	// failure.
+	cp.state.State = &runtimev1.ContainerState{
+		Waiting: &runtimev1.ContainerStateWaiting{
+			Message:       boundedFailureMessage(stageStart, err),
+			FailureReason: reason,
+		},
+	}
+	status := containerStatusOf(cp)
+	p.mu.Unlock()
+	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED, r.podStatus(p))
+	return &runtimev1.StartContainerResponse{
+		Status:        status,
+		Error:         rpcStatus(failureCode(err), "start %s/%s: %s", podID, cp.name, startErrorReply(stageStart, err)),
+		FailureReason: reason,
+	}
 }
 
 // resumeInitSequence completes the init step cp just started and then runs the
@@ -315,14 +324,15 @@ func initContainerIndex(box *runtimev1.PodBox, name string) int {
 // reads. A failure carrying a fixed client sentence (clientMessageError)
 // publishes the sentence its Waiting message does, because its error names the
 // cache root, the rootfs, the sign staging directory or a tool's output; the
-// daemon's log line carries that error once. Every other error keeps its full
-// text.
+// daemon's log line carries that error once. An error marked tenantText keeps
+// its full text; any other error is stage's fixed sentence, quoted, and its
+// cause is in the caller's log line.
 //
 // The reply is quoted the same way but bounded at maxReplyMessageBytes, not at
 // the Waiting message's limit: a vm image's path collision sentence carries the
 // colliding pair and the remedy, which together outgrow 256 bytes, and the
 // remedy is the part the operator acts on.
-func startErrorReply(err error) string {
+func startErrorReply(stage failureStage, err error) string {
 	var ge *clientMessageError
 	if errors.As(err, &ge) {
 		if ge.sentinel != nil {
@@ -331,7 +341,11 @@ func startErrorReply(err error) string {
 		}
 		return image.QuoteBounded(ge.message, maxReplyMessageBytes)
 	}
-	return err.Error()
+	var tt *tenantTextError
+	if errors.As(err, &tt) {
+		return err.Error()
+	}
+	return image.QuoteBounded(stage.sentence(), maxReplyMessageBytes)
 }
 
 // maxReplyMessageBytes bounds a fixed client sentence in an RPC reply.

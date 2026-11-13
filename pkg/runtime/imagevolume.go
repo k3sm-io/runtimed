@@ -46,8 +46,10 @@ var (
 	ErrArtifactPullRefused = errors.New("ArtifactPullRefused")
 	// ErrArtifactMountRefused: the artifact is not mountable as asked (a subset
 	// of paths, which this runtime does not serve) or its view could not be
-	// built or linked into the pod.
-	ErrArtifactMountRefused = errors.New("ArtifactMountRefused")
+	// built or linked into the pod. It is marked tenantText: the provider
+	// matches its leading text, and every site raises it through
+	// artifactRefusal, whose fixed sentence is what the client reads.
+	ErrArtifactMountRefused = tenantText(errors.New("ArtifactMountRefused"))
 
 	// errArtifactCredential marks a failure to resolve the pod's pull
 	// credential, before any registry request.

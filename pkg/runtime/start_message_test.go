@@ -349,10 +349,10 @@ func TestStartFailureMessageHidesHostPaths(t *testing.T) {
 		if err.Error() != full.Error() {
 			t.Errorf("Error() = %q, want %q", err.Error(), full.Error())
 		}
-		if got := boundedFailureMessage(err); got != `"fixed"` {
+		if got := boundedFailureMessage(stageStart, err); got != `"fixed"` {
 			t.Errorf("boundedFailureMessage = %q, want the fixed sentence", got)
 		}
-		if got := startErrorReply(err); got != `"fixed"` {
+		if got := startErrorReply(stageStart, err); got != `"fixed"` {
 			t.Errorf("startErrorReply = %q, want the fixed sentence", got)
 		}
 	})
@@ -380,10 +380,10 @@ func TestSpawnStartErrorClass(t *testing.T) {
 		if want := "spawn container main: " + cause.Error(); err.Error() != want {
 			t.Errorf("%v: Error() = %q, want %q", tc.errno, err.Error(), want)
 		}
-		if got, want := boundedFailureMessage(err), fmt.Sprintf("%q", tc.want); got != want {
+		if got, want := boundedFailureMessage(stageStart, err), fmt.Sprintf("%q", tc.want); got != want {
 			t.Errorf("%v: boundedFailureMessage = %s, want %s", tc.errno, got, want)
 		}
-		if got := startErrorReply(err); strings.Contains(got, spawnDetail) {
+		if got := startErrorReply(stageStart, err); strings.Contains(got, spawnDetail) {
 			t.Errorf("%v: startErrorReply %q carries the host path", tc.errno, got)
 		}
 	}
@@ -403,10 +403,10 @@ func TestShimStartErrorHidesHostPaths(t *testing.T) {
 		t.Errorf("Error() = %q, want %q", err.Error(), want)
 	}
 	const want = `"container \"main\" could not be started: its shim could not be prepared; the daemon log has the cause"`
-	if got := boundedFailureMessage(err); got != want {
+	if got := boundedFailureMessage(stageStart, err); got != want {
 		t.Errorf("boundedFailureMessage = %s, want %s", got, want)
 	}
-	if got := startErrorReply(err); got != want {
+	if got := startErrorReply(stageStart, err); got != want {
 		t.Errorf("startErrorReply = %s, want %s", got, want)
 	}
 }
@@ -466,10 +466,10 @@ func TestThreeMoreStartErrorsHidePaths(t *testing.T) {
 			t.Errorf("%s: Error() = %q, want %q", tc.name, tc.err.Error(), tc.wantError)
 		}
 		want := fmt.Sprintf("%q", tc.want)
-		if got := boundedFailureMessage(tc.err); got != want {
+		if got := boundedFailureMessage(stageStart, tc.err); got != want {
 			t.Errorf("%s: boundedFailureMessage = %s, want %s", tc.name, got, want)
 		}
-		if got := startErrorReply(tc.err); got != want || strings.Contains(got, detail) {
+		if got := startErrorReply(stageStart, tc.err); got != want || strings.Contains(got, detail) {
 			t.Errorf("%s: startErrorReply = %s, want %s", tc.name, got, want)
 		}
 	}
