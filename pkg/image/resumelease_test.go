@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -204,8 +205,14 @@ func TestResumedTransferRenewsThePullLease(t *testing.T) {
 // arriving bytes (the zero-byte EOF read renews nothing) is covered by a
 // renewal at the start of the commit, on the clone route.
 func TestResumedCommitRenewsThePullLease(t *testing.T) {
-	{
-		t.Run("clone", func(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		replay bool
+	}{
+		{"clone", false},
+		{"replay", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			const (
 				ttl   = time.Minute
 				have  = 1024
@@ -221,6 +228,17 @@ func TestResumedCommitRenewsThePullLease(t *testing.T) {
 			}
 			clock := &leaseClock{t: time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)}
 			cache.now = clock.now
+			if tc.replay {
+				// Another volume: CommitFromLocal answers ErrBlobNotLocal and
+				// Resume falls back to the Commit callback and its replay. Time
+				// passes inside the refused clone attempt, after the renewal
+				// before CommitFile, so only the renewal in Commit covers it.
+				cache.sameVolume = func(_, _ os.FileInfo) bool {
+					clock.advance(ttl/4 + time.Second)
+					return false
+				}
+			}
+			spy := spyOnVolume(cache)
 
 			dir := filepath.Join(t.TempDir(), "partials")
 			if err := os.Mkdir(dir, 0o700); err != nil {
@@ -260,6 +278,22 @@ func TestResumedCommitRenewsThePullLease(t *testing.T) {
 			}
 			if _, err := p.resumeBlob(context.Background(), src, digest, int64(len(body)), whole, lease); err != nil {
 				t.Fatalf("resumeBlob: %v", err)
+			}
+			calls, same := spy.seen()
+			if calls != 1 {
+				t.Fatalf("the clone path's volume check ran %d times, want 1", calls)
+			}
+			switch {
+			case tc.replay && same:
+				t.Fatal("the volume check passed: the replay route was not forced")
+			case !tc.replay && runtime.GOOS == "darwin" && !same:
+				t.Skip("the temp dir and the partial are not on one clonable volume")
+			case !tc.replay && runtime.GOOS == "darwin":
+				// The volume check passed, so the clone route ran: the staging dir
+				// is empty again.
+				if names := stageEntries(t, cache); len(names) != 0 {
+					t.Fatalf("staging dir holds %q after the clone commit", names)
+				}
 			}
 			cache.leaseMu.Lock()
 			expires := lease.expires
