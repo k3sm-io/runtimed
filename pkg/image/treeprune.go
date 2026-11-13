@@ -293,7 +293,7 @@ func (r treeRecord) backing() []string {
 // and widening the inventory to every openCommitted refusal would put a second
 // copy of that check in the GC.
 func readTreeRecord(root *os.Root, rel, key string) (treeRecord, error) {
-	buf, err := readAnchored(root, rel, maxIndexEntryBytes)
+	buf, err := readAnchored(root, rel, treeRecordLimit)
 	if err != nil {
 		return treeRecord{}, fmt.Errorf("read tree record %s: %v", rel, boundErr(err))
 	}

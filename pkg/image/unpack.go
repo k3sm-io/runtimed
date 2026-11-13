@@ -716,16 +716,27 @@ func (u *Unpacker) refuseCaseMerge(t *Tree, dstRootfs string) error {
 // consistent one.
 //
 // A directory with no record, an undecodable record, a record of an unknown
-// version, or a record whose key or policy disagrees with the path is
-// ErrTreeInconsistent — refused, not rebuilt over. Rebuilding over it would mean
+// version, a record larger than treeRecordLimit, a record path that is a
+// symlink or not a regular file, or a record whose key or policy disagrees with
+// the path is ErrTreeInconsistent — refused, not rebuilt over. Rebuilding over it would mean
 // writing into a directory whose provenance is unknown while another process may
 // still be cloning out of it.
 func (u *Unpacker) openCommitted(loc treeLocation, policy UnpackPolicy) (*Tree, bool, error) {
 	dir, key := loc.dir, loc.key
-	buf, err := os.ReadFile(filepath.Join(dir, loc.recordName))
+	// The record is opened with recordOpenFlags (no final symlink followed, no
+	// block on a FIFO) and read through readCheckedRecord: refused unless it is a
+	// regular file on the open descriptor and no larger than treeRecordLimit,
+	// the cap writeTreeRecord enforces. An over-cap record is refused like an
+	// undecodable one, never read whole and never rebuilt over.
+	f, err := os.OpenFile(filepath.Join(dir, loc.recordName), recordOpenFlags, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, false, nil
 	}
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: open record for %s: %v", ErrTreeInconsistent, quoteBounded(key, maxDigestLen), boundErr(unwrapPath(err)))
+	}
+	buf, err := readCheckedRecord(f, loc.recordName, treeRecordLimit)
+	f.Close()
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: read record for %s: %v", ErrTreeInconsistent, quoteBounded(key, maxDigestLen), boundErr(err))
 	}
@@ -1138,6 +1149,37 @@ func ReadOwnershipSidecar(path string) ([]OwnershipEntry, error) {
 // constrain any entry this package writes.
 const maxOwnershipLineBytes = 64 << 10
 
+// maxTreeRecordBytes bounds one tree record (TreeRecordName or
+// SnapshotRecordName) at its writer, writeTreeRecord, and at both of its
+// readers, Unpacker.openCommitted and readTreeRecord, so the writer can never
+// commit a record its readers refuse.
+//
+// It is a SIZE FENCE, not a layer-count policy: it exists to stop an unbounded
+// write and an unbounded read, and it is sized so that every record the inputs'
+// own caps admit fits. A record is a small fixed envelope plus, per layer, one
+// quoted digest in Layers (about 74 bytes for sha256) natively, and on the
+// Linux path one more in DiffIDs (about 148 bytes per layer). The manifest that
+// supplies the layers is capped at 4 MiB when its index entry is recorded
+// (maxIndexManifestBytes, index.go) and the Linux path's config that supplies
+// the diffIDs at 4 MiB (maxArchiveMetadataBytes, load.go). A layer descriptor
+// the unpacker can apply costs at least about 147 bytes of manifest (it must
+// carry one of the closed set of layer media types), so a 4 MiB manifest names
+// at most about 28,500 layers: about 2.1 MiB of record natively and about
+// 4.2 MiB on the Linux path. 5 MiB keeps headroom over both.
+const maxTreeRecordBytes = 5 << 20
+
+// ErrTreeRecordTooLarge reports that a serialized tree record is larger than
+// its readers will accept (maxTreeRecordBytes). writeTreeRecord refuses such a
+// record and writes nothing: committed, it would make the tree read back as
+// ErrTreeInconsistent on every later unpack of the same image.
+var ErrTreeRecordTooLarge = errors.New("image: tree record exceeds its size cap")
+
+// treeRecordLimit is the ceiling writeTreeRecord, openCommitted and
+// readTreeRecord all apply. It equals maxTreeRecordBytes; it is a variable only
+// so a test can lower it instead of building a 5 MiB record, and the readers
+// read it too so a lowered value moves all three together.
+var treeRecordLimit = int64(maxTreeRecordBytes)
+
 // writeTreeRecord writes the tree's record. It is written inside the staging
 // directory before the commit rename, so the record and the payload become
 // visible in the same atomic step — there is deliberately no window in which a
@@ -1147,6 +1189,12 @@ func writeTreeRecord(path string, rec treeRecord) error {
 	buf, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("encode tree record: %w", err)
+	}
+	// Refuse, before anything touches disk, a record the readers would refuse:
+	// committed, it would make the tree ErrTreeInconsistent for good. The error
+	// states the size and the limit only, none of the record's bytes.
+	if n := int64(len(buf)); n > treeRecordLimit {
+		return fmt.Errorf("%w: %d bytes, limit %d", ErrTreeRecordTooLarge, n, treeRecordLimit)
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {

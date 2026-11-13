@@ -148,8 +148,7 @@ func (c *Cache) EnsurePodReferences(podID PodID) error {
 // file ignores O_NONBLOCK, so its read is unaffected.
 const recordOpenFlags = os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
 
-// maxIndexEntryBytes bounds the read of one image index entry and of one tree
-// record. It must admit every entry FileIndex.Record accepts, or a single large
+// maxIndexEntryBytes bounds the read of one image index entry. It must admit every entry FileIndex.Record accepts, or a single large
 // entry makes List fail for the whole node. An entry carries the manifest
 // twice: Raw, capped at maxIndexManifestBytes (4 MiB) and base64-encoded by
 // encoding/json, so at most 4/3 x 4 MiB (about 5.4 MiB); and the protojson copy
@@ -158,9 +157,8 @@ const recordOpenFlags = os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | 
 // the base64 copy plus a protojson copy many times the manifest's size (JSON
 // escaping at worst sixfold a byte), plus the small fixed envelope.
 //
-// Tree records share the constant: they are this package's own small JSON
-// records with no tighter cap of their own, and the bound only has to stop an
-// unbounded read, not size them.
+// Tree records do not share it: they have their own cap, maxTreeRecordBytes
+// (unpack.go), enforced at their writer and both readers.
 const maxIndexEntryBytes = 64 << 20
 
 // readCheckedRecord re-checks on the open descriptor f that it is a regular
@@ -548,10 +546,10 @@ func operatorRootSet(roots []OperatorImageRoot) []ImageRoot {
 // followed, no block on a FIFO), and readCheckedRecord refuses anything that is
 // not a regular file or exceeds limit, which each caller sizes to its record
 // kind (maxPodReferencesBytes, MaxArtifactRecordBytes, MaxArtifactHoldBytes,
-// maxIndexEntryBytes for index entries and tree records). It exists so the
-// "absent" and "not a regular file" cases both surface as errors here rather
-// than as an empty record at the call site; an absent file keeps its
-// fs.ErrNotExist identity.
+// maxIndexEntryBytes for index entries, treeRecordLimit (maxTreeRecordBytes)
+// for tree records). It exists so the "absent" and "not a regular file" cases
+// both surface as errors here rather than as an empty record at the call site;
+// an absent file keeps its fs.ErrNotExist identity.
 func readAnchored(root *os.Root, rel string, limit int64) ([]byte, error) {
 	dir, err := root.Open(filepath.Dir(rel))
 	if err != nil {
