@@ -109,7 +109,7 @@ func (b bigErrFetcher) Manifest(ctx context.Context, ref string, cred *image.Reg
 	return nil, "", errors.New(bigText)
 }
 
-func (b bigErrFetcher) Blob(context.Context, string, *image.RegistryCredential, string, int64) (io.ReadCloser, int64, error) {
+func (b bigErrFetcher) Blob(context.Context, string, *image.RegistryCredential, string, int64, int64) (io.ReadCloser, int64, error) {
 	return nil, 0, errors.New(bigText)
 }
 

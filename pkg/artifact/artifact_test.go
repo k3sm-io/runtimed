@@ -91,7 +91,7 @@ func (f *fakeFetcher) Manifest(_ context.Context, ref string, _ *image.RegistryC
 	return s.raw, s.mt, nil
 }
 
-func (f *fakeFetcher) Blob(_ context.Context, _ string, _ *image.RegistryCredential, digest string, offset int64) (io.ReadCloser, int64, error) {
+func (f *fakeFetcher) Blob(_ context.Context, _ string, _ *image.RegistryCredential, digest string, _, offset int64) (io.ReadCloser, int64, error) {
 	f.blobCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()

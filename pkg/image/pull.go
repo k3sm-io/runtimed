@@ -22,7 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"net/http"
+	"os"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -30,6 +36,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // RegistryCredential is a private-registry pull credential (an imagePullSecret).
@@ -63,6 +70,99 @@ func (c *RegistryCredential) authenticator() authn.Authenticator {
 		IdentityToken: c.IdentityToken,
 		RegistryToken: c.RegistryToken,
 	})
+}
+
+// registryfetchCredential converts the credential to the registryfetch form,
+// field for field, so a direct blob fetch authenticates exactly as
+// authenticator() does for the image fetch. A nil credential stays nil, which
+// registryfetch reads as anonymous, as remoteFetch does.
+func (c *RegistryCredential) registryfetchCredential() *registryfetch.Credential {
+	if c == nil {
+		return nil
+	}
+	return &registryfetch.Credential{
+		Username:      c.Username,
+		Password:      c.Password,
+		Auth:          c.Auth,
+		IdentityToken: c.IdentityToken,
+		RegistryToken: c.RegistryToken,
+	}
+}
+
+// registryTransport is the transport a registry round trip that pins none of
+// its own is made over: the header-bounded externalTransport (a clone of
+// http.DefaultTransport, so its proxy function, dial and TLS timeouts and the
+// system TLS roots, plus responseHeaderTimeout), or go-containerregistry's
+// remote.DefaultTransport when externalTransport is nil because
+// http.DefaultTransport was replaced. RemoteFetch and RemoteMirrorFetch pass
+// it to remote.WithTransport, which is last-wins, so it must carry the header
+// bound itself or it would undo the one remoteFetch installs first. ggcr wraps
+// it in its retry (and debug logger) layer, because it is not a
+// transport.Wrapper. It is named here so the direct blob route (BlobSource)
+// and the image fetch share one dial, TLS, proxy and header-bound story.
+func registryTransport() http.RoundTripper {
+	if tr := externalTransport(); tr != nil {
+		return tr
+	}
+	return remote.DefaultTransport
+}
+
+// BlobSource is the direct registry route to one reference's blobs: the
+// transport, scheme and credential the image fetch for that reference uses,
+// in the form registryfetch.Registry.Blob takes.
+//
+// Ref is the reference as registryfetch should be handed it: fully qualified
+// (registry, repository and tag or digest spelled out), because registryfetch
+// parses with name.StrictValidation while the image fetch accepts a short
+// name ("ubuntu"). It names the registry and repository the image fetch
+// dialled, so Credential is never presented to a different host.
+type BlobSource struct {
+	Ref        string
+	Registry   registryfetch.Registry
+	Credential *registryfetch.Credential
+}
+
+// LogValue is the slog form of a BlobSource: the reference, the plain-HTTP flag
+// and whether a credential is present, never the credential's secret fields.
+// It is a value-receiver method so that a BlobSource and a pointer to one both
+// log redacted, and it does not read Credential's fields at all, so the
+// redaction holds whether Credential stays a pointer or becomes a value.
+func (s BlobSource) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("ref", s.Ref),
+		slog.Bool("plainHTTP", s.Registry.PlainHTTP),
+		slog.Bool("credential", s.Credential != nil),
+	)
+}
+
+// String renders the same redacted form as LogValue, for %v and %+v.
+func (s BlobSource) String() string {
+	return fmt.Sprintf("BlobSource{ref=%s plainHTTP=%t credential=%t}", s.Ref, s.Registry.PlainHTTP, s.Credential != nil)
+}
+
+// GoString renders the same redacted form for %#v.
+func (s BlobSource) GoString() string { return s.String() }
+
+// BlobSourceFunc yields the BlobSource for ref fetched with cred. It is the
+// direct-blob counterpart of a FetchFunc and must yield the transport, scheme
+// and credential that FetchFunc uses for the same arguments; RemoteBlobSource
+// is the counterpart of RemoteFetch.
+type BlobSourceFunc func(ref string, cred *RegistryCredential) (BlobSource, error)
+
+// RemoteBlobSource is the BlobSourceFunc paired with RemoteFetch:
+// registryTransport, the scheme go-containerregistry infers for ref's registry
+// (PlainHTTP false, so no name.Insecure, exactly as RemoteFetch parses), and
+// cred converted field for field (nil stays anonymous).
+func RemoteBlobSource(ref string, cred *RegistryCredential) (BlobSource, error) {
+	r, err := name.ParseReference(ref)
+	if err != nil {
+		return BlobSource{}, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
+	}
+	return BlobSource{
+		Ref:        r.Name(),
+		Registry:   registryfetch.Registry{Transport: registryTransport()},
+		Credential: cred.registryfetchCredential(),
+	}, nil
 }
 
 // FetchFunc resolves an image reference to a go-containerregistry image, using
@@ -116,7 +216,7 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
-	return remoteFetch(ctx, r, ref, cred, policy)
+	return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(registryTransport()))
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
@@ -130,18 +230,125 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 // fetcher with a weaker platform story.
 //
 // extra carries a transport a caller pins (the flat registry's endpoint dial and
-// trust anchor); it is appended after the defaults so it rides every round trip,
-// the index children included.
+// trust anchor); it is appended after the defaults, the header-bounded external
+// transport included, so it wins and rides every round trip, the index children
+// included.
 func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, extra ...remote.Option) (ggcrv1.Image, error) {
 	want, err := Candidates(policy)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, err)
 	}
-	opts := []remote.Option{remote.WithContext(ctx)}
+	rctx, disarm, cancel := resolveContext(ctx, resolveTimeout)
+	opts := []remote.Option{remote.WithContext(rctx)}
+	// The header-bounded transport goes BEFORE extra: go-containerregistry
+	// applies options in order and WithTransport is a plain assignment, so a
+	// caller's own transport (the flat registry's restricted dial) still wins.
+	if tr := externalTransport(); tr != nil {
+		opts = append(opts, remote.WithTransport(tr))
+	}
 	opts = append(opts, extra...)
 	if cred != nil {
 		opts = append(opts, remote.WithAuth(cred.authenticator()))
 	}
+	img, err := resolveRemote(r, ref, want, opts)
+	if err == nil && !disarm() {
+		// The bound fired after the last resolve round trip returned but before
+		// it could be disarmed: rctx is cancelled, so the image's layer fetches
+		// would fail. Report the bound rather than hand that image on.
+		err = context.Cause(rctx)
+	}
+	if err != nil {
+		cancel()
+		if ctx.Err() == nil && errors.Is(context.Cause(rctx), errResolveBound) {
+			// %v, not %w, for the cause: it wraps context.Canceled, and a
+			// registry that stopped answering is about the host, not a caller
+			// that gave up (see mirrorFallbackEligible).
+			return nil, fmt.Errorf("pull %q: %w after %s: %v", ref, ErrPullResolveTimeout, resolveTimeout, err)
+		}
+		return nil, err
+	}
+	return img, nil
+}
+
+// ErrPullResolveTimeout is returned (wrapped) when resolving a reference (the
+// manifest or index, the selected child and the image config, with any token
+// round trip they need) does not finish within the resolve bound. It is an
+// ordinary fetch failure; a cancelled caller context is reported as that
+// cancellation, never as this.
+var ErrPullResolveTimeout = errors.New("image: pull resolve timed out")
+
+// defaultResolveTimeout bounds the resolve step of one pull. Every round trip
+// in it moves a few kilobytes, so two minutes is far above any healthy
+// registry and below the time a stuck one would otherwise hold the pull.
+const defaultResolveTimeout = 2 * time.Minute
+
+// resolveTimeout is the resolve bound remoteFetch applies; tests shorten it.
+var resolveTimeout = defaultResolveTimeout
+
+// errResolveBound is the cancellation cause resolveContext records when the
+// bound fires; remoteFetch turns it into ErrPullResolveTimeout.
+var errResolveBound = errors.New("resolve bound elapsed")
+
+// resolveContext derives the context the resolve round trips run under: it is
+// cancelled when parent is, and also when d elapses before disarm is called.
+//
+// It is a disarmable bound rather than context.WithTimeout because
+// go-containerregistry keeps the context of the options a descriptor was
+// fetched with inside the lazy image it returns, and fetches every layer under
+// it. A deadline would cap those later layer fetches, and a deferred cancel
+// would fail them outright. disarm stops the timer once the resolve is done
+// (it reports false if the timer already fired), after which the context ends
+// only with parent, so the layer fetches keep the caller's own lifetime.
+// cancel releases the context on a failed resolve; on success it is left for
+// parent to end, as the image still uses it.
+func resolveContext(parent context.Context, d time.Duration) (ctx context.Context, disarm func() bool, cancel func()) {
+	c, cancelCause := context.WithCancelCause(parent)
+	t := time.AfterFunc(d, func() { cancelCause(errResolveBound) })
+	return c, t.Stop, func() { t.Stop(); cancelCause(context.Canceled) }
+}
+
+// externalTransport is the transport an external registry pull uses: a clone
+// of http.DefaultTransport (its proxy function and dial and TLS timeouts kept)
+// that also bounds the wait for response headers. It is built once, so pulls
+// share its connection pool, and the global is never mutated. It is nil when
+// http.DefaultTransport is not an *http.Transport (a test or embedder replaced
+// it), in which case the library's default stays in place. It is a variable
+// so a test can install a fresh onceExternalTransport after changing the bound.
+var externalTransport = onceExternalTransport()
+
+// onceExternalTransport returns a function that builds the external transport
+// on first use, reading responseHeaderTimeout then, and returns that one
+// transport on every later call.
+func onceExternalTransport() func() http.RoundTripper {
+	return sync.OnceValue(func() http.RoundTripper {
+		if tr := newExternalTransport(responseHeaderTimeout); tr != nil {
+			return tr
+		}
+		return nil
+	})
+}
+
+// externalMaxIdleConnsPerHost is the idle connection cap per registry host, the
+// value go-containerregistry's own default transport uses (http.Transport's
+// zero value would mean 2, too few for parallel layer fetches).
+const externalMaxIdleConnsPerHost = 50
+
+// newExternalTransport clones http.DefaultTransport with the given header
+// bound, or returns nil when the default is not an *http.Transport.
+func newExternalTransport(headerTimeout time.Duration) *http.Transport {
+	def, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil
+	}
+	tr := def.Clone()
+	tr.ResponseHeaderTimeout = headerTimeout
+	tr.MaxIdleConnsPerHost = externalMaxIdleConnsPerHost
+	return tr
+}
+
+// resolveRemote is the resolve step of remoteFetch: fetch the manifest, select
+// and resolve the one image want allows, and verify its config.
+func resolveRemote(r name.Reference, ref string, want []Platform, opts []remote.Option) (ggcrv1.Image, error) {
 	desc, err := remote.Get(r, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
@@ -432,6 +639,38 @@ type Puller struct {
 	// localBlobs is a same-volume blob store consulted before each blob is
 	// fetched (WithLocalBlobSource). Nil — the default — fetches every blob.
 	localBlobs LocalBlobSource
+
+	// layerStallWindow is how long a layer body may deliver no byte before its
+	// fetch is aborted with ErrLayerBodyStalled (stallread.go). Zero means
+	// defaultLayerStallWindow; tests set it directly.
+	layerStallWindow time.Duration
+
+	// remoteBlobs and mirrorBlobs are the direct blob routes paired with fetch
+	// and mirrorFetch (WithRegistryBlobSource); nil yields no route for that
+	// path. The flat registry's route is its own (flatRegistry.blobs), because
+	// its transport is built here, not injected.
+	remoteBlobs BlobSourceFunc
+	mirrorBlobs MirrorBlobSourceFunc
+
+	// partials keeps the layer bytes a cut fetch already received, so the next
+	// pull resumes with a Range request (WithPartialStore). Nil — the default —
+	// fetches every layer from byte 0.
+	partials *registryfetch.PartialStore
+}
+
+// primaryBlobSource yields the direct blob route for ref on the primary path
+// (primaryFetch), fetched with cred. ok is false when the path has none: no
+// WithRegistryBlobSource, or an authority WithClusterRegistries admitted,
+// whose plain-HTTP fetcher has no paired route.
+func (p *Puller) primaryBlobSource(ref string, cred *RegistryCredential) (_ BlobSource, ok bool, _ error) {
+	if p.remoteBlobs == nil || p.configuredClusterRegistry(ref) {
+		return BlobSource{}, false, nil
+	}
+	src, err := p.remoteBlobs(ref, cred)
+	if err != nil {
+		return BlobSource{}, false, err
+	}
+	return src, true, nil
 }
 
 // NewPuller returns a Puller writing into cache, fetching via fetch, and deciding
@@ -697,10 +936,37 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 		}
 		return nil, err
 	}
-	return p.ingest(ctx, ref, img, want)
+	return p.ingestVia(ctx, ref, img, want, p.resumeSource(ref, cred))
 }
 
-// ingest commits one fetched image into the store under ref and records it: the
+// resumeSource is the blob route ingest resumes ref's layers through, fetched
+// with cred: the primary path's BlobSource, when the puller has both that
+// route and a partial store. Nil otherwise, and ingest then reads each layer
+// from the fetched image, as it does without either. A route that cannot be
+// built is also nil (logged at Warn, since it is misconfiguration): the layer still arrives over the image
+// fetch, and CommitBlob verifies it either way.
+func (p *Puller) resumeSource(ref string, cred *RegistryCredential) *BlobSource {
+	if p.partials == nil {
+		return nil
+	}
+	src, ok, err := p.primaryBlobSource(ref, cred)
+	if err != nil {
+		p.logger().Warn("no resumable blob route for this reference; fetching layers whole",
+			"ref", ref, "error", err)
+		return nil
+	}
+	if !ok {
+		return nil
+	}
+	return &src
+}
+
+// ingest is ingestVia with no blob route: every layer is read from img.
+func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want []Platform) (*PullResult, error) {
+	return p.ingestVia(ctx, ref, img, want, nil)
+}
+
+// ingestVia commits one fetched image into the store under ref and records it: the
 // platform re-verification, the lease over the whole digest set, every config
 // and layer blob, and the index entry — everything after the bytes are in hand.
 //
@@ -714,7 +980,11 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 //
 // ref is the reference the pull was ASKED for, never the mirror-rewritten one:
 // it is what the manifest reports and what the index records.
-func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want []Platform) (_ *PullResult, retErr error) {
+//
+// src, when not nil, is the direct blob route for ref (resumeSource): each
+// layer then comes through the partial store (resumeBlob) rather than from
+// img, and a cut transfer is resumed by the next pull.
+func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, want []Platform, src *BlobSource) (_ *PullResult, retErr error) {
 	cfg, err := img.ConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: image config: %w", ref, boundErr(err))
@@ -811,15 +1081,22 @@ func (p *Puller) ingest(ctx context.Context, ref string, img ggcrv1.Image, want 
 	}
 	for i, layer := range layers {
 		desc := mfst.Layers[i]
-		wrote, err := p.writeBlob(desc.Digest.String(), desc.Size, func(w io.Writer) error {
+		whole := func(w io.Writer) error {
 			rc, oerr := layer.Compressed()
 			if oerr != nil {
 				return oerr
 			}
-			defer rc.Close()
-			_, cerr := io.Copy(w, rc)
+			body := newStallReader(rc, p.stallWindow())
+			defer body.Close()
+			_, cerr := io.Copy(w, body)
 			return cerr
-		})
+		}
+		var wrote bool
+		if src != nil {
+			wrote, err = p.resumeBlob(ctx, *src, desc.Digest.String(), desc.Size, whole)
+		} else {
+			wrote, err = p.writeBlob(desc.Digest.String(), desc.Size, whole)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -979,18 +1256,265 @@ func manifestDigests(mfst *runtimev1.ImageManifest) []string {
 // is logged at Warn before falling back, so a tampered store is never hidden
 // behind a successful pull.
 func (p *Puller) writeBlob(digest string, size int64, fill func(io.Writer) error) (wrote bool, err error) {
-	if p.localBlobs != nil {
-		wrote, lerr := p.cache.CommitFromLocal(digest, size, p.localBlobs)
-		switch {
-		case lerr == nil:
-			return wrote, nil
-		case errors.Is(lerr, ErrBlobNotLocal):
-		default:
-			p.logger().Warn("local blob store copy refused, fetching from the registry",
-				"digest", quoteBounded(digest, maxDigestLen), "err", lerr)
-		}
+	if wrote, ok := p.commitLocal(digest, size); ok {
+		return wrote, nil
 	}
 	return p.cache.CommitBlob(digest, size, fill)
+}
+
+// stallWindow is the layer-body progress window: layerStallWindow, or
+// defaultLayerStallWindow when unset.
+func (p *Puller) stallWindow() time.Duration {
+	if p.layerStallWindow > 0 {
+		return p.layerStallWindow
+	}
+	return defaultLayerStallWindow
+}
+
+// commitLocal offers digest to the LocalBlobSource, when there is one. ok is
+// true when that committed it (wrote as CommitFromLocal reports); otherwise
+// the caller fetches it, and a refusal other than ErrBlobNotLocal has been
+// logged at Warn (see writeBlob).
+func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
+	if p.localBlobs == nil {
+		return false, false
+	}
+	wrote, lerr := p.cache.CommitFromLocal(digest, size, p.localBlobs)
+	switch {
+	case lerr == nil:
+		return wrote, true
+	case errors.Is(lerr, ErrBlobNotLocal):
+	default:
+		p.logger().Warn("local blob store copy refused, fetching from the registry",
+			"digest", quoteBounded(digest, maxDigestLen), "err", lerr)
+	}
+	return false, false
+}
+
+// resumeBlob is writeBlob for a layer with a direct blob route: the size-byte
+// blob digest is fetched through the puller's partial store, so the bytes a
+// cut transfer received stay on disk and the next pull asks src for the rest
+// with a Range request. size and digest are the manifest descriptor's, the
+// same claimed values writeBlob takes.
+//
+// The partial is claimed first, so one digest has one writer; a digest
+// another pull is already resuming, one that is not sha256, or a partial
+// store over its budget falls back to writeBlob with whole, the same fill
+// ingest uses without a route. A held claim is then offered to the
+// LocalBlobSource and checked against the cache before any byte is fetched.
+//
+// The complete partial is committed through CommitFromLocal, as a one-shot
+// read-only LocalBlobSource: it is cloned into the cache's staging dir, the
+// clone is re-hashed against digest and renamed into place only on a match,
+// so the blob is not written a second time. When it cannot be cloned there
+// (another volume, no clone support: ErrBlobNotLocal), or the clone path
+// refuses for any reason that is not a verdict on the bytes (logged at Error,
+// since a staging dir of the wrong mode or owner may be tampering), the
+// partial is replayed into CommitBlob instead, which re-hashes all of it. Either way a mismatch or
+// an overrun condemns the partial and Resume removes it, so the next pull
+// starts from byte 0. Nothing about the hash is carried from one attempt to
+// the next.
+//
+// A ranged answer that is not the bytes asked for (ErrBlobRange: a server or
+// proxy that mishandles Range) would fail the same way on every later pull
+// resuming from the same offset, so the partial is removed, under the claim,
+// and the layer is fetched whole by writeBlob within this pull. Transfer also
+// empties the file it was handed, so a failed Remove still leaves a
+// zero-length partial that the next resume starts from byte 0, with no Range
+// header.
+func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
+	release, cerr := p.partials.Claim(digest)
+	if cerr != nil {
+		p.logger().Debug("layer partial not claimable; fetching it whole",
+			"digest", quoteBounded(digest, maxDigestLen), "error", cerr)
+		return p.writeBlob(digest, size, whole)
+	}
+	defer release()
+	if wrote, ok := p.commitLocal(digest, size); ok {
+		return wrote, nil
+	}
+	if p.cache.Has(digest) {
+		return false, nil
+	}
+	// reached is set the moment Resume hands control to Transfer or Commit:
+	// an error with reached false came from the store's own setup (admit,
+	// directory, open, stat, seek) before a byte of this attempt moved.
+	var reached bool
+	from := size // the offset resumed from; size when Commit runs without a Transfer
+	err = p.partials.Resume(registryfetch.Fill{
+		Digest: digest,
+		Size:   size,
+		Transfer: func(f *os.File, have int64) error {
+			reached = true
+			from = have
+			err := transferBlob(ctx, src, digest, size, f, have, p.stallWindow())
+			if errors.Is(err, registryfetch.ErrBlobRange) {
+				if terr := f.Truncate(0); terr != nil {
+					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
+				}
+			}
+			return err
+		},
+		CommitFile: func(f *os.File) error {
+			reached = true
+			w, err := p.cache.CommitFromLocal(digest, size, &partialBlob{digest: digest, f: f})
+			switch {
+			case err == nil:
+				wrote = w
+				return nil
+			case errors.Is(err, ErrBlobNotLocal):
+				return fmt.Errorf("%w: %w", registryfetch.ErrCommitFileUnsupported, err)
+			case errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrBlobTooLarge):
+				// A verdict on the bytes: Poisoned condemns the partial.
+				return err
+			default:
+				// A refusal of the clone path itself (a staging dir of the
+				// wrong mode, owner or ACL, a mkdir, stat, scrub, chmod or
+				// sync failure) says nothing about the partial, and would
+				// repeat on every pull; CommitBlob re-hashes the replay.
+				p.logger().Error("layer partial not committed by clone; replaying it",
+					"digest", digest, "error", err, "possibleTampering", true)
+				return fmt.Errorf("%w: %w", registryfetch.ErrCommitFileUnsupported, err)
+			}
+		},
+		Commit: func(replay func(io.Writer) error) error {
+			reached = true
+			w, err := p.cache.CommitBlob(digest, size, replay)
+			wrote = w
+			return err
+		},
+		Poisoned: func(err error) bool {
+			return errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrBlobTooLarge)
+		},
+	})
+	switch {
+	case errors.Is(err, registryfetch.ErrPartialCap):
+		// Admit refused before the store was touched; a layer over the
+		// per-partial cap is misconfiguration, not load.
+		p.logger().Warn("layer partial over the per-partial cap; fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	case errors.Is(err, registryfetch.ErrPartialBudget):
+		// Admit refused before the store was touched.
+		p.logger().Debug("layer partial over budget; fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	case errors.Is(err, registryfetch.ErrBlobRange):
+		// The claim is still held: release is deferred above.
+		if rerr := p.partials.Remove(digest); rerr != nil {
+			p.logger().Warn("layer partial not removed after a wrong range answer",
+				"digest", digest, "error", rerr)
+		}
+		p.logger().Warn("layer range answer is not the one asked for; partial removed, fetching it whole",
+			"digest", digest, "error", err)
+		return p.writeBlob(digest, size, whole)
+	case err != nil && !reached && partialEnvErr(err):
+		// The store could not be set up and nothing of this attempt was
+		// transferred or committed: the partial store is an optimisation, so
+		// its own environment must not fail a pull that works without it. A
+		// pull whose context is done is not retried whole.
+		if cerr := ctx.Err(); cerr != nil {
+			return false, fmt.Errorf("layer %s: %w (partial store: %w)", digest, cerr, err)
+		}
+		if errors.Is(err, registryfetch.ErrPartialDir) || errors.Is(err, registryfetch.ErrPartialFile) {
+			// A planted owner, mode, symlink or special file is not an
+			// ordinary environment fault.
+			p.logger().Error("layer partial store unusable; fetching it whole",
+				"digest", digest, "error", err, "possibleTampering", true)
+		} else {
+			p.logger().Warn("layer partial store unusable; fetching it whole",
+				"digest", digest, "error", err)
+		}
+		return p.writeBlob(digest, size, whole)
+	case err == nil && reached && from > 0:
+		p.logger().Info("layer resumed from a partial",
+			"digest", digest, "size", size, "offset", from)
+	}
+	return wrote, err
+}
+
+// partialBlob is the LocalBlobSource resumeBlob commits a complete partial
+// through: it offers f, the read-only O_NOFOLLOW descriptor Resume reopened,
+// once and for digest only. CommitFromLocal closes the file it is handed;
+// Resume closes it again, which is harmless.
+type partialBlob struct {
+	digest string
+	f      *os.File
+	used   bool
+}
+
+// OpenBlob returns the partial for its own digest, the first time only.
+func (b *partialBlob) OpenBlob(digest string) (*os.File, int64, error) {
+	if b.used || digest != b.digest {
+		return nil, 0, ErrBlobNotLocal
+	}
+	b.used = true
+	fi, err := b.f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat partial %s: %w", digest, err)
+	}
+	return b.f, fi.Size(), nil
+}
+
+// partialEnvErr reports whether err from PartialStore.Resume names the
+// store's own environment: a partial dir that is not a private directory, a
+// partial path that is not a regular file, or a partial dir or file that
+// could not be created or opened (a missing parent, permission, a read-only
+// filesystem). Network, transfer, digest and size errors do not match.
+func partialEnvErr(err error) bool {
+	return errors.Is(err, registryfetch.ErrPartialDir) ||
+		errors.Is(err, registryfetch.ErrPartialFile) ||
+		errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, syscall.EROFS)
+}
+
+// transferBlob appends the rest of the size-byte blob digest to f from offset
+// have, over src. A server that answers from 0 instead (a 200 to the Range
+// request) restarts the partial: f is truncated and written from 0. A failure
+// leaves what arrived in f, synced, for the next pull to resume. A body that
+// runs past size is refused with ErrBlobTooLarge and f is emptied; the real
+// route's body (registryfetch.Registry.Blob) already stops at size with an
+// error, so there the partial stays at size and the next pull verifies it in
+// CommitBlob or removes it. The body is read through the same progress
+// watchdog as a whole-layer fetch: a body that delivers no byte for window is
+// closed and the transfer fails with ErrLayerBodyStalled, keeping what arrived.
+func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64, window time.Duration) error {
+	rc, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
+	if err != nil {
+		return fmt.Errorf("fetch blob %s from %d: %w", digest, have, err)
+	}
+	body := newStallReader(rc, window)
+	defer body.Close()
+	switch {
+	case start == have:
+	case start == 0:
+		if err := f.Truncate(0); err != nil {
+			return fmt.Errorf("reset partial %s: %w", digest, err)
+		}
+		have = 0
+	default:
+		return fmt.Errorf("fetch blob %s: asked for offset %d, got %d: %w", digest, have, start, registryfetch.ErrBlobRange)
+	}
+	if _, err := f.Seek(have, io.SeekStart); err != nil {
+		return fmt.Errorf("seek partial %s: %w", digest, err)
+	}
+	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(body, size-have+1))
+	serr := f.Sync()
+	if have+n > size {
+		_ = f.Truncate(0) // the overrun error is the one reported
+		return fmt.Errorf("fetch blob %s: more than %d bytes: %w", digest, size, ErrBlobTooLarge)
+	}
+	if cerr != nil {
+		return fmt.Errorf("fetch blob %s at %d: %w", digest, have+n, boundErr(cerr))
+	}
+	if serr != nil {
+		return fmt.Errorf("sync partial %s: %w", digest, serr)
+	}
+	if have+n < size {
+		return fmt.Errorf("fetch blob %s: body ended at %d of %d: %w", digest, have+n, size, io.ErrUnexpectedEOF)
+	}
+	return nil
 }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.

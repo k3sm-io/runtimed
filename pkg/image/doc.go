@@ -35,7 +35,11 @@ limitations under the License.
 //     a second pull of the same content is a cache hit. Every blob is re-hashed
 //     against the digest its MANIFEST DESCRIPTOR claims before it is committed —
 //     see Cache.CommitBlob, the single home of that invariant, and the ceiling
-//     below.
+//     below. A pull can also fetch a layer over a direct ranged route and keep
+//     the bytes received in a partial file between attempts, so a cut pull
+//     continues from where it stopped; this is off unless the caller supplies a
+//     partial store (WithPartialStore), and without one every layer is fetched
+//     from byte 0.
 //
 //   - Mirror (fallback): when the node's OWN ingest registry misses a
 //     node-relative reference (localhost:<port>/...), consult the peer ingest
