@@ -418,6 +418,48 @@ type SkippedBlob struct {
 	Digest string
 	// Reason is a short human-readable refusal reason.
 	Reason string
+	// Refusal is the typed form of Reason for the four refusals an eviction
+	// reports: a guard drop, an unlink-seam refusal, a blob younger than grace
+	// and a failed removal. It is nil on every other skip path. A caller
+	// reads it, never Reason's text.
+	Refusal *SkipRefusal
+}
+
+// SkipRefusalKind names the executor path that refused a blob.
+type SkipRefusalKind string
+
+const (
+	// RefusedByGuard: the pass-level guard dropped the blob.
+	RefusedByGuard SkipRefusalKind = "guard"
+	// RefusedByUnlink: the per-blob unlink seam declined to remove it.
+	RefusedByUnlink SkipRefusalKind = "unlink"
+	// RefusedYoung: re-verification found it younger than grace.
+	RefusedYoung SkipRefusalKind = "young"
+	// RefusedRemoveFailed: the removal failed, or reported success while the
+	// blob is still present.
+	RefusedRemoveFailed SkipRefusalKind = "remove-failed"
+)
+
+// SkipRefusal is one typed refusal: the blob, the path that refused it, and
+// the exported reason. A guard or unlink-seam reason outside the closed set,
+// or none, is EvictKeptUnlinkFailed, so an unnameable refusal reads as a
+// failure rather than as some other verdict.
+type SkipRefusal struct {
+	// Digest is the refused blob's content digest, empty for a temp file.
+	Digest string
+	// Kind is the executor path that refused the blob.
+	Kind SkipRefusalKind
+	// Reason is why the blob was kept.
+	Reason EvictKeepReason
+}
+
+// hookRefusal is the SkipRefusal for a reason a guard or unlink hook gave.
+func hookRefusal(digest string, kind SkipRefusalKind, why evictReason) *SkipRefusal {
+	r, err := exportEvictReason(why)
+	if err != nil {
+		r = EvictKeptUnlinkFailed
+	}
+	return &SkipRefusal{Digest: digest, Kind: kind, Reason: r}
 }
 
 // ExecuteReport summarizes one ExecutePrune run.
@@ -466,7 +508,27 @@ type ExecuteReport struct {
 // unlinked like any other. Reclaim, which must honour leases, runs the
 // unexported executor with a pin function instead.
 func (c *Cache) ExecutePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool) (*ExecuteReport, error) {
-	return c.executePrune(plan, grace, now, stop, nil)
+	return c.executePrune(plan, grace, now, stop, nil, nil)
+}
+
+// pruneHooks are the optional seams of executePrune. A nil *pruneHooks, or a
+// nil field, leaves the executor exactly as ExecutePrune documents it.
+type pruneHooks struct {
+	// guard, when non-nil, runs once per call inside pruneMu, before the
+	// unlink loop. Every digest in the returned set is skipped rather than
+	// removed, with its reason carried into the skip record; an error aborts
+	// the call with nothing unlinked.
+	guard func() (drop map[string]evictReason, err error)
+
+	// unlink, when non-nil, decides the removal of one blob that passed
+	// re-verification. remove is root.Remove bound to that blob's path under
+	// the executor's *os.Root; a hook MUST delete only through remove, so it
+	// cannot unlink outside the blobs root. A false removed with a nil error
+	// records the blob as skipped with reason; an error records it as skipped
+	// with the error, exactly as a failed root.Remove. A true removed is not
+	// trusted: the executor re-checks the path through the root handle and
+	// records the blob as a failed removal if it is still present.
+	unlink func(digest string, remove func() error) (removed bool, reason evictReason, err error)
 }
 
 // pinnedFunc returns the digests that must survive an unlink batch, each with
@@ -519,7 +581,11 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // read but before the entry's critical section is not seen there (no live
 // lease, a pin set read before the record, no lease acquired since that
 // read), so the blob it just found present is unlinked.
-func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc) (*ExecuteReport, error) {
+// hooks (see pruneHooks) is the eviction path's seam. pinned and hooks are
+// mutually exclusive: the hooks' unlink takes leaseMu itself, so it cannot run
+// inside unlinkUnlessLeased's critical section. With hooks non-nil the entry
+// runs through executeHookedEntry, the eviction executor body, instead.
+func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc, hooks *pruneHooks) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
 	}
@@ -554,15 +620,39 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 			return nil, fmt.Errorf("execute prune: %w", err)
 		}
 	}
+	if pinned != nil && hooks != nil {
+		return nil, errors.New("execute prune: pinned and hooks are mutually exclusive")
+	}
+
+	var drop map[string]evictReason
+	if hooks != nil && hooks.guard != nil {
+		if drop, err = hooks.guard(); err != nil {
+			return nil, fmt.Errorf("execute prune: guard: %w", err)
+		}
+	}
 
 	rep := &ExecuteReport{}
 	skip := func(d PruneDecision, reason string) {
 		rep.Skipped = append(rep.Skipped, SkippedBlob{Path: d.Node.Path, Digest: d.Node.Digest, Reason: reason})
 	}
+	refuse := func(d PruneDecision, reason string, r *SkipRefusal) {
+		rep.Skipped = append(rep.Skipped, SkippedBlob{Path: d.Node.Path, Digest: d.Node.Digest, Reason: reason, Refusal: r})
+	}
+	failed := func(d PruneDecision) *SkipRefusal {
+		return &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed}
+	}
 	for _, d := range plan.Delete {
 		if stop != nil && stop() {
 			rep.StoppedEarly = true
 			break
+		}
+		if why, ok := drop[d.Node.Digest]; ok && d.Node.Digest != "" {
+			refuse(d, fmt.Sprintf("dropped by guard: %s", why), hookRefusal(d.Node.Digest, RefusedByGuard, why))
+			continue
+		}
+		if hooks != nil {
+			c.executeHookedEntry(root, d, grace, now, hooks, rep, skip, refuse, failed)
+			continue
 		}
 		if c.beforePruneBlob != nil {
 			c.beforePruneBlob(d.Node.Digest)
@@ -596,6 +686,61 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 // reads a stream of them can force on one entry. An entry still named after
 // the last re-read is kept (fail closed) and reported in Skipped.
 const maxPruneRepins = 3
+
+// executeHookedEntry is the eviction executor's per-entry body (pruneHooks
+// non-nil): grammar, Lstat, regularity and grace re-verification, then the
+// unlink hook (which takes leaseMu itself) or a plain Remove, with the typed
+// refusals the eviction reports.
+func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, hooks *pruneHooks, rep *ExecuteReport, skip func(PruneDecision, string), refuse func(PruneDecision, string, *SkipRefusal), failed func(PruneDecision) *SkipRefusal) {
+	rel := d.Node.Path
+	if cls, _ := classifyBlobRel(rel); cls == relInvalid {
+		skip(d, "path fails blob grammar")
+		return
+	}
+	fi, err := root.Lstat(rel)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			skip(d, "already absent")
+		} else {
+			skip(d, fmt.Sprintf("lstat: %v", err))
+		}
+		return
+	}
+	if !fi.Mode().IsRegular() {
+		skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
+		return
+	}
+	if now.Sub(fi.ModTime()) < grace {
+		refuse(d, "younger than grace", &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedYoung, Reason: EvictKeptYoung})
+		return
+	}
+	if hooks.unlink != nil {
+		removed, why, err := hooks.unlink(d.Node.Digest, func() error { return root.Remove(rel) })
+		if err != nil {
+			refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
+			return
+		}
+		if !removed {
+			refuse(d, fmt.Sprintf("refused by unlink: %s", why), hookRefusal(d.Node.Digest, RefusedByUnlink, why))
+			return
+		}
+		if _, err := root.Lstat(rel); err == nil {
+			refuse(d, "remove: unlink reported removed but blob is still present", failed(d))
+			return
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			refuse(d, fmt.Sprintf("remove: verify: %v", err), failed(d))
+			return
+		}
+	} else if err := root.Remove(rel); err != nil {
+		refuse(d, fmt.Sprintf("remove: %v", err), failed(d))
+		return
+	}
+	rep.Deleted++
+	rep.DeletedBytes += fi.Size()
+	if d.Node.Digest != "" {
+		rep.Removed = append(rep.Removed, d.Node.Digest)
+	}
+}
 
 // unlinkUnlessLeased runs one entry's lease-watch check, live-lease check,
 // Lstat, grace check and Remove inside ONE leaseMu critical section, so an

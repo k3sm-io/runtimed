@@ -227,6 +227,11 @@ func deviceOf(path string) (uint64, error) {
 // Root returns the views root directory.
 func (v *Views) Root() string { return v.root }
 
+// HasHoldSource reports whether v was built with a hold source
+// (ViewsConfig.Holds). Without one, RemoveIfOrphan consults no pod hold, so a
+// caller that may remove a view a pod mounts checks this first.
+func (v *Views) HasHoldSource() bool { return v != nil && v.holds != nil }
+
 // PathSetKey is the view name for a path set: the hex sha256 of the sorted
 // paths, each terminated by a NUL byte. Validated paths never contain NUL, so
 // distinct sets never share a key. The order of paths does not matter.
@@ -516,6 +521,25 @@ func (v *Views) SweepOrphans(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// RemoveIfOrphan removes the views directory of the one manifest
+// manifestDigest names (a "sha256:<64 lowercase hex>" digest, else
+// ErrManifestInvalid), only when no live artifact record and no pod's hold
+// (ViewsConfig.Holds) names that manifest. Both are read fresh under the
+// manifest's stripe, which every build takes too, so a view is never removed
+// while it is built or once a record or hold names it again. It fails closed:
+// records or holds that cannot be read keep the views and return the error.
+// An absent views directory is a nil no-op, and no other manifest's views
+// are touched. A cancelled ctx returns ctx.Err() and removes nothing.
+func (v *Views) RemoveIfOrphan(ctx context.Context, manifestDigest string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !sha256Digest.MatchString(manifestDigest) {
+		return fmt.Errorf("manifest digest %s: %w", image.QuoteBounded(manifestDigest, 128), ErrManifestInvalid)
+	}
+	return v.removeIfOrphan(ctx, strings.TrimPrefix(manifestDigest, "sha256:"))
 }
 
 // removeIfOrphan takes the manifest's lock and removes its views if no record

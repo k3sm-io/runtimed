@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -163,13 +164,14 @@ func (s *imagesService) ImageFsInfo(ctx context.Context, _ *runtimev1.ImageFsInf
 //
 // The store holds no user names to remove either: it is an internal pull
 // cache, and a user image's name lives in the cluster registry, where `k3sm
-// image untag` removes it. A caller wanting bytes back calls PruneImages, which
-// re-derives reachability first.
+// image untag` removes it. A caller wanting one image's bytes back calls
+// EvictImage, which removes no root and re-derives reachability first;
+// PruneImages reclaims everything no pod uses.
 func (s *imagesService) RemoveImage(context.Context, *runtimev1.RemoveImageRequest) (*runtimev1.RemoveImageResponse, error) {
 	return nil, status.Error(codes.Unimplemented,
 		"RemoveImage: this node's image store is an internal pull cache with no user names to remove; "+
 			"user images live in the cluster registry, where `k3sm image untag` removes a name. "+
-			"PruneImages reclaims cache content no pod uses.")
+			"EvictImage reclaims one image's cache content, PruneImages all content no pod uses.")
 }
 
 // PruneImages deletes unreferenced blobs, honoring the request's dry_run.
@@ -201,6 +203,369 @@ func (s *imagesService) PruneImages(ctx context.Context, req *runtimev1.PruneIma
 		})
 	}
 	return out, nil
+}
+
+// EvictImage evicts the cache blobs of one image that the node's prune rule
+// already allows deleting and that no other cached manifest names, through
+// Cache.Evict. It removes no root, no index entry and no artifact record. A
+// forced call then removes the target manifest's artifact views when no record
+// and no pod hold names them (viewEvictor); a dry run touches no view.
+//
+// The order is the contract's: the request's shape is checked first
+// (INVALID_ARGUMENT, nothing read), then the target is resolved from the
+// image index, the live artifact records and the released artifact copies
+// (resolveEvictTarget: NOT_FOUND, or FAILED_PRECONDITION REFERENCE_AMBIGUOUS),
+// then a target naming no blobs is OK with nothing removed, then a
+// target a pod runs is refused IMAGE_IN_USE before any unlink. A pod that
+// appears after that read is not a refusal: Cache.Evict keeps its blobs and
+// the response reports them kept IN_USE. An unset force is a dry run with the
+// same response shape. Every outcome maps through evictStatusError, and every
+// call writes one Info line naming the target, the outcome and the status
+// code, which is where an INTERNAL call's kept list is read.
+func (s *imagesService) EvictImage(ctx context.Context, req *runtimev1.EvictImageRequest) (resp *runtimev1.EvictImageResponse, retErr error) {
+	var (
+		manifest string
+		res      *image.EvictResult
+	)
+	defer func() {
+		s.logEvict(req, manifest, res, retErr)
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	if err := validateEvictRequest(s.rt.cache, req); err != nil {
+		return nil, err
+	}
+	target, err := s.resolveEvictTarget(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	manifest, blobs := target.manifest, target.blobs
+	if len(blobs) == 0 {
+		// A recorded target whose blobs are all gone is already evicted: OK,
+		// nothing removed, no Cache.Evict call and no view removed, so a
+		// re-run converges instead of failing INTERNAL.
+		return &runtimev1.EvictImageResponse{ManifestDigest: manifest}, nil
+	}
+	if len(blobs) > image.MaxEvictBlobs {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"EvictImage: the target names %d blobs, limit %d", len(blobs), image.MaxEvictBlobs)
+	}
+	if err := s.refuseEvictInUse(manifest, blobs); err != nil {
+		return nil, err
+	}
+	cfg := image.ReclaimConfig{
+		DryRun:       !req.GetForce(),
+		Log:          s.rt.log,
+		UntrackedPod: s.rt.podUntracked,
+	}
+	if req.GetForce() {
+		// Only a forced call removes anything, and only after the target's
+		// blobs are gone (ReclaimConfig.EvictDerived).
+		cfg.EvictDerived = s.rt.viewEvictor()
+	}
+	res, err = s.rt.cache.Evict(ctx, manifest, blobs, cfg)
+	if serr := evictStatusError(res, err); serr != nil {
+		return nil, serr
+	}
+	if res == nil {
+		return nil, status.Error(codes.Internal, "EvictImage: the eviction returned no result")
+	}
+	out := &runtimev1.EvictImageResponse{
+		ManifestDigest: manifest,
+		RemovedDigests: res.Removed,
+		ReclaimedBytes: uint64(max(res.ReclaimedBytes, 0)),
+	}
+	for _, k := range res.Kept {
+		reason, ok := evictSkipReason(k.Reason)
+		if !ok {
+			// Unreachable after evictStatusError: an unlink-failed blob is
+			// INTERNAL. An unnamed reason is not sent as some other one.
+			return nil, status.Errorf(codes.Internal, "EvictImage: blob %s kept for unmapped reason %q", k.Digest, k.Reason)
+		}
+		out.Kept = append(out.Kept, &runtimev1.EvictKeptBlob{Digest: k.Digest, Reason: reason})
+	}
+	return out, nil
+}
+
+// refuseEvictInUse is EvictImage's in-use refusal: errEvictImageInUse, mapped
+// to FAILED_PRECONDITION IMAGE_IN_USE, when a pod runs the target, so that a
+// refusal unlinks nothing. It reads Cache.InUseDigests once, a point-in-time
+// advisory pre-check: a pod that starts after the read is caught by
+// Cache.Evict's own guards, which keep its blobs IN_USE.
+//
+// The set is flat (it does not say which pod named which blob), so "a pod runs
+// the target" is read as "every target blob is in use": a pod running the
+// target names its config and every layer. A target blob that only some other
+// in-use image shares is not a refusal; Cache.Evict keeps that blob and the
+// response reports it. An unreadable root set is ROOTS_INCOMPLETE. An empty
+// blob list is never in use and reads nothing.
+func (s *imagesService) refuseEvictInUse(manifest string, blobs []string) error {
+	if len(blobs) == 0 {
+		// No pod can run a target that names no blob, so it is never in use
+		// (EvictImage answers such a target OK before this check).
+		return nil
+	}
+	inUse, err := s.rt.cache.InUseDigests(s.rt.podUntracked)
+	if err != nil {
+		return evictStatusError(nil, err)
+	}
+	for _, d := range blobs {
+		if _, ok := inUse[d]; !ok {
+			return nil
+		}
+	}
+	return evictStatusError(nil, fmt.Errorf("manifest %s: %w", manifest, errEvictImageInUse))
+}
+
+// validateEvictRequest is EvictImage's shape check, before anything is read:
+// exactly one of reference and digest, no platform beside a digest (unlike
+// InspectImage, which ignores it there; resolving would silently drop it), and
+// a digest of the store's grammar. Every failure is INVALID_ARGUMENT.
+func validateEvictRequest(c *image.Cache, req *runtimev1.EvictImageRequest) error {
+	ref, digest := req.GetReference(), req.GetDigest()
+	switch {
+	case ref != "" && digest != "":
+		return status.Error(codes.InvalidArgument, "EvictImage: set exactly one of reference and digest, not both")
+	case ref == "" && digest == "":
+		return status.Error(codes.InvalidArgument, "EvictImage: a reference or a digest is required")
+	case digest != "" && req.GetPlatform() != nil:
+		return status.Error(codes.InvalidArgument, "EvictImage: a digest names one manifest; a platform beside it is not accepted")
+	case digest != "":
+		if _, err := c.BlobPath(digest); err != nil {
+			return status.Errorf(codes.InvalidArgument, "EvictImage: %v", err)
+		}
+	}
+	return nil
+}
+
+// evictTarget is what EvictImage evicts, whichever source named it: the
+// manifest digest Cache.Evict narrows by and the distinct blobs it names.
+type evictTarget struct {
+	manifest string
+	blobs    []string
+}
+
+// resolveEvictTarget resolves a validated request to its target, mapping every
+// failure through evictStatusError so an ambiguous reference carries its
+// REFERENCE_AMBIGUOUS detail. The sources are tried in order, the first that
+// names the target wins:
+//
+//   - by digest: the image index entry of that manifest, then the live
+//     artifact records naming it as their manifest, then its released copies
+//     (FileIndex.ReleasedArtifact);
+//   - by reference: the image index entry for the reference and platform,
+//     then the live artifact records pulled by that exact reference. Released
+//     copies are not looked up by reference.
+//
+// NOT_FOUND is returned only when no source names the target. A reference
+// that the index resolves and that a live record names with another manifest
+// is REFERENCE_AMBIGUOUS, as is one that records name with several manifests.
+// A record matches by reference with the request's platform ignored, since a
+// record carries none. An undecodable record fails closed
+// (ErrIndexEntryCorrupt) only when the index missed, because the record it
+// hides may be the one asked for; when the index resolved the target it is
+// skipped for the ambiguity check and logged at Warn.
+func (s *imagesService) resolveEvictTarget(ctx context.Context, req *runtimev1.EvictImageRequest) (evictTarget, error) {
+	t, err := s.lookupEvictTarget(ctx, req)
+	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return evictTarget{}, err
+		}
+		return evictTarget{}, evictStatusError(nil, err)
+	}
+	return t, nil
+}
+
+func (s *imagesService) lookupEvictTarget(ctx context.Context, req *runtimev1.EvictImageRequest) (evictTarget, error) {
+	if d := req.GetDigest(); d != "" {
+		return s.evictTargetByDigest(ctx, d)
+	}
+	return s.evictTargetByReference(ctx, req.GetReference(), requestedPlatform(req.GetPlatform()))
+}
+
+func (s *imagesService) evictTargetByDigest(ctx context.Context, d string) (evictTarget, error) {
+	e, err := s.rt.index.ResolveDigest(ctx, d)
+	switch {
+	case err == nil:
+		return evictTargetFromEntry(e)
+	case !errors.Is(err, image.ErrIndexEntryNotFound):
+		return evictTarget{}, err
+	}
+	recs, corrupt, err := s.evictRecords(ctx)
+	if err != nil {
+		return evictTarget{}, err
+	}
+	if corrupt != nil {
+		return evictTarget{}, corrupt
+	}
+	if t, ok := evictTargetFromRecords(recs, func(r artifact.Record) bool { return r.ManifestDigest == d }); ok {
+		return t, nil
+	}
+	m, blobs, found, err := s.rt.index.ReleasedArtifact(d)
+	if err != nil {
+		return evictTarget{}, err
+	}
+	if found {
+		return evictTarget{manifest: m, blobs: blobs}, nil
+	}
+	return evictTarget{}, fmt.Errorf("%w: no image entry, artifact record or released copy names %s", image.ErrIndexEntryNotFound, d)
+}
+
+func (s *imagesService) evictTargetByReference(ctx context.Context, ref string, p *image.Platform) (evictTarget, error) {
+	e, ierr := s.rt.index.Resolve(ctx, ref, p)
+	if ierr != nil && !errors.Is(ierr, image.ErrIndexEntryNotFound) {
+		return evictTarget{}, ierr
+	}
+	recs, corrupt, err := s.evictRecords(ctx)
+	if err != nil {
+		return evictTarget{}, err
+	}
+	if corrupt != nil && ierr != nil {
+		// The index missed: the undecodable record may be the one asked for.
+		return evictTarget{}, corrupt
+	}
+	byRef := func(r artifact.Record) bool { return r.Reference == ref }
+	manifests := make(map[string]struct{})
+	for _, r := range recs {
+		if byRef(r) {
+			manifests[r.ManifestDigest] = struct{}{}
+		}
+	}
+	if ierr == nil {
+		t, err := evictTargetFromEntry(e)
+		if err != nil {
+			return evictTarget{}, err
+		}
+		delete(manifests, t.manifest)
+		if len(manifests) > 0 {
+			return evictTarget{}, fmt.Errorf("%w: %q names manifest %s in the image index and another in an artifact record",
+				image.ErrIndexEntryAmbiguous, ref, t.manifest)
+		}
+		return t, nil
+	}
+	if len(manifests) > 1 {
+		return evictTarget{}, fmt.Errorf("%w: artifact records name %d manifests for %q", image.ErrIndexEntryAmbiguous, len(manifests), ref)
+	}
+	if t, ok := evictTargetFromRecords(recs, byRef); ok {
+		return t, nil
+	}
+	return evictTarget{}, ierr
+}
+
+// evictTargetFromEntry is the target an image index entry names.
+func evictTargetFromEntry(e image.IndexEntry) (evictTarget, error) {
+	manifest := e.Descriptor.GetDigest()
+	if manifest == "" {
+		// An entry written before manifests were retained cannot name its
+		// manifest, and Cache.Evict narrows by it.
+		return evictTarget{}, status.Errorf(codes.FailedPrecondition,
+			"EvictImage: the entry for %q predates manifest retention and names no manifest digest; re-pull it", e.Reference)
+	}
+	return evictTarget{manifest: manifest, blobs: evictTargetBlobs(e.Manifest)}, nil
+}
+
+// evictTargetFromRecords is the target of the live records match accepts:
+// their one manifest and the union of their blobs, in first-seen order. The
+// caller has ruled out matches of several manifests.
+func evictTargetFromRecords(recs []artifact.Record, match func(artifact.Record) bool) (evictTarget, bool) {
+	var (
+		t    evictTarget
+		seen = make(map[string]struct{})
+	)
+	for _, r := range recs {
+		if !match(r) {
+			continue
+		}
+		t.manifest = r.ManifestDigest
+		for _, d := range append([]string{r.ConfigDigest}, r.LayerDigests...) {
+			if _, ok := seen[d]; ok || d == "" {
+				continue
+			}
+			seen[d] = struct{}{}
+			t.blobs = append(t.blobs, d)
+		}
+	}
+	return t, t.manifest != ""
+}
+
+// evictRecords decodes every live artifact record. A record that does not
+// decode, or names no manifest, is left out of recs, logged once at Warn with
+// its key (empty when the bytes do not decode far enough to name one), and
+// reported as corrupt, an ErrIndexEntryCorrupt for the first such record; the
+// caller decides whether it fails the call. err is a failure to read the
+// records at all.
+func (s *imagesService) evictRecords(ctx context.Context) (recs []artifact.Record, corrupt, err error) {
+	bufs, err := s.rt.index.ArtifactRecords(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	recs = make([]artifact.Record, 0, len(bufs))
+	for _, b := range bufs {
+		var r artifact.Record
+		var bad error
+		if derr := json.Unmarshal(b, &r); derr != nil {
+			bad = fmt.Errorf("%w: artifact record: %v", image.ErrIndexEntryCorrupt, derr)
+		} else if r.ManifestDigest == "" {
+			bad = fmt.Errorf("%w: artifact record %q names no manifest digest", image.ErrIndexEntryCorrupt, r.Key)
+		}
+		if bad != nil {
+			s.rt.log.Warn("evict image: skipping an undecodable artifact record", "key", r.Key)
+			if corrupt == nil {
+				corrupt = bad
+			}
+			continue
+		}
+		recs = append(recs, r)
+	}
+	return recs, corrupt, nil
+}
+
+// evictTargetBlobs is every distinct non-empty blob digest a manifest names:
+// its config and its layers, the blobs the store holds for an image (the
+// manifest itself is never committed as a blob).
+func evictTargetBlobs(m *runtimev1.ImageManifest) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(d string) {
+		if d == "" {
+			return
+		}
+		if _, ok := seen[d]; ok {
+			return
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	add(m.GetConfig().GetDigest())
+	for _, l := range m.GetLayers() {
+		add(l.GetDigest())
+	}
+	return out
+}
+
+// logEvict writes EvictImage's one Info line per call. The kept list is
+// written with the pkg/image reasons, unlink-failed included, since that is
+// the only place an INTERNAL call's kept blobs are reported.
+func (s *imagesService) logEvict(req *runtimev1.EvictImageRequest, manifest string, res *image.EvictResult, err error) {
+	var (
+		removed []string
+		kept    []string
+		absent  int
+	)
+	if res != nil {
+		removed = res.Removed
+		for _, k := range res.Kept {
+			kept = append(kept, k.Digest+"="+string(k.Reason))
+		}
+		absent = len(res.Absent)
+	}
+	s.rt.log.Info("evict image on operator request",
+		"reference", req.GetReference(), "digest", req.GetDigest(),
+		"manifest", manifest, "force", req.GetForce(),
+		"removed_count", len(removed), "kept_count", len(kept), "absent_count", absent,
+		"removed", removed, "kept", kept,
+		"code", status.Code(err).String())
 }
 
 // LoadImage is not served: the node's image store is an internal pull cache,
@@ -766,6 +1131,21 @@ func (r *Runtime) viewSweeper() func(context.Context) error {
 		return nil
 	}
 	return r.views.SweepOrphans
+}
+
+// viewEvictor is the image eviction's hook into the artifact views: it removes
+// the views of the one evicted manifest when no artifact record and no pod
+// hold names it (artifact.Views.RemoveIfOrphan). It is passed in here, from
+// the wiring, because pkg/image cannot import pkg/artifact. Nil when views are
+// disabled, when there is no image index (the runtime builds its Views with
+// that index as their hold source), or when the Views has no hold source: its
+// RemoveIfOrphan would then consult no pod hold and remove a view a pod
+// mounts. A nil hook removes no view; the blobs are still evicted.
+func (r *Runtime) viewEvictor() func(context.Context, string) error {
+	if r.views == nil || r.index == nil || !r.views.HasHoldSource() {
+		return nil
+	}
+	return r.views.RemoveIfOrphan
 }
 
 // newArtifactPuller builds the daemon's own artifact puller over the same cache

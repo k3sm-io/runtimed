@@ -216,6 +216,20 @@ type ReclaimConfig struct {
 	// an in-package test drives a pull that roots a planned blob in that window.
 	afterRoots func()
 
+	// afterPlan runs on the eviction path after the plan and the guard's roots
+	// read (in narrow mode, also after its shared-set read) and before the
+	// first unlink, once per guarded executor call (see evictHooks and
+	// evictGuards). It is UNEXPORTED and exists only so an in-package test can
+	// interleave a root write, a lease and its release there; production
+	// leaves it nil, and a nil afterPlan changes nothing.
+	afterPlan func()
+
+	// evict, when non-nil, runs the pass in narrow mode for one eviction
+	// target (see Cache.Evict, the only setter). It is UNEXPORTED so the
+	// narrowing and the guards cannot be half-configured by a caller; nil
+	// leaves the pass exactly as ReclaimUnderPressure documents it.
+	evict *evictPass
+
 	// SweepDerived, when set, removes content derived from records rather than
 	// from blobs whose record is gone: the artifact views, which pkg/runtime
 	// wires in (this package cannot import their owner). A triggered pass that
@@ -224,6 +238,17 @@ type ReclaimConfig struct {
 	// Its error is logged and does not stop the prune, which decides from its
 	// own fail-closed root set.
 	SweepDerived func(ctx context.Context) error
+
+	// EvictDerived, when set, removes the content derived from one evicted
+	// manifest: the target's artifact views, which pkg/runtime wires in (this
+	// package cannot import their owner). Only Cache.Evict calls it, once, with
+	// the target manifest digest, after the pass returned without error and
+	// only when the context is not cancelled and the call is not a dry run, so
+	// the blobs it was cloned from are already gone. Every other pass ignores
+	// it. Its error is logged at Warn and does not fail the eviction, as
+	// SweepDerived's does not fail the prune: the blobs are already unlinked
+	// and the view is derived content.
+	EvictDerived func(ctx context.Context, manifest string) error
 }
 
 // ReclaimReport is the typed outcome of a reclaim pass.
@@ -368,20 +393,23 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		return nil, fmt.Errorf("%w: %v", ErrFreeSpaceUnknown, err)
 	}
 	rep := &ReclaimReport{DryRun: cfg.DryRun, FreeBefore: before, FreeAfter: before}
+	// Narrow mode (Cache.Evict) removes nothing outside its target: no
+	// released-copy bound or sweep, no SweepDerived, and no pressure check.
+	narrow := cfg.evict != nil
 	// The released artifact record copies are bounded on EVERY pass, triggered
 	// or not, so an idle node's index stays bounded too. They are hints, never
 	// roots, so a failure here costs eviction order and stops nothing.
-	if !cfg.DryRun {
+	if !cfg.DryRun && !narrow {
 		if err := (&FileIndex{dir: c.IndexRoot()}).BoundReleasedArtifacts(); err != nil {
 			log.Warn("image reclaim: bound of released artifact records failed", "err", err)
 		}
 	}
-	if !cfg.Force && before >= high {
+	if !cfg.Force && !narrow && before >= high {
 		rep.ReachedTarget = before >= target
 		return rep, nil
 	}
 	rep.Triggered = true
-	if cfg.SweepDerived != nil && !cfg.DryRun {
+	if cfg.SweepDerived != nil && !cfg.DryRun && !narrow {
 		if err := cfg.SweepDerived(ctx); err != nil {
 			log.Warn("image reclaim: sweep of record-derived content refused; it is kept", "err", err)
 		}
@@ -424,13 +452,22 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		cfg.afterInventory()
 	}
 	// Fail-closed: an incomplete root set aborts the whole pass (see Roots).
-	roots, skipped, err := c.roots(cfg.UntrackedPod)
+	cr, err := c.classifiedRoots(cfg.UntrackedPod)
 	if err != nil {
 		return nil, err
 	}
+	roots, skipped := cr.flatten(), cr.skipped
 	if fresh := c.newlySkipped(skipped); len(fresh) > 0 {
 		log.Warn("image gc skipped pod dirs with no reachability record that no live pod owns",
 			"pods", fresh)
+	}
+	// The shared set, in narrow mode, AFTER the roots and BEFORE the leases:
+	// it only protects, so reading it later can only grow the protection.
+	var others map[string]struct{}
+	if narrow {
+		if others, err = c.evictSharedSet(ctx, cfg.evict.manifest, cfg.evict.target); err != nil {
+			return nil, err
+		}
 	}
 	leased := make([]string, 0)
 	for d := range c.leasedDigests() {
@@ -442,6 +479,11 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	plan, err := PlanPrune(nodes, trees, roots, leased, grace, now())
 	if err != nil {
 		return nil, err
+	}
+	if narrow {
+		if err := narrowForEvict(plan, cfg.evict, others, cr); err != nil {
+			return nil, err
+		}
 	}
 	for _, k := range plan.Keep {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: k.Node.Digest, Path: k.Node.Path, Reason: k.Reason})
@@ -506,7 +548,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		if ctx.Err() != nil {
 			return true
 		}
-		if cfg.Force {
+		if cfg.Force || narrow {
 			return false
 		}
 		f, err := free(c.root)
@@ -530,13 +572,26 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// target stops having given up the cheaper thing — and it can never orphan
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
-	pinned := func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
-	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned)
+	// The pinned re-read (lease watch, live-lease check) guards a pressure pass;
+	// an eviction (narrow) runs through evictGuards' hooks instead, whose
+	// per-blob unlink takes leaseMu itself, so the two are never combined.
+	var pinned pinnedFunc
+	var blobHooks *pruneHooks
+	var treeHooks *treePruneHooks
+	if narrow {
+		blobHooks, treeHooks = c.evictGuards(ctx, &cfg)
+	} else {
+		pinned = func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
+	}
+	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned, blobHooks)
 	if err != nil {
 		return nil, err
 	}
-	treeExec, err := c.ExecuteTreePrune(plan, grace, now(), stop)
+	treeExec, err := c.executeTreePrune(plan, grace, now(), stop, treeHooks)
 	if err != nil {
+		if narrow {
+			cfg.evict.record(rep, artExec)
+		}
 		return nil, err
 	}
 	rep.RemovedTrees = treeExec.Removed
@@ -548,8 +603,11 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
-	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned)
+	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned, blobHooks)
 	if err != nil {
+		if narrow {
+			cfg.evict.record(rep, artExec)
+		}
 		return nil, err
 	}
 	exec := &ExecuteReport{}
@@ -565,6 +623,10 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	classBytes(plan.Delete, exec.Removed, exec.DeletedBytes, classes, rep.ReclaimedByClass)
 	for _, s := range exec.Skipped {
 		rep.Kept = append(rep.Kept, KeptBlob{Digest: s.Digest, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
+	}
+	if narrow {
+		cfg.evict.record(rep, artExec, restExec)
+		return rep, nil
 	}
 	if cerr == nil {
 		if err := c.sweepReleased(classes); err != nil {
