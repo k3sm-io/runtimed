@@ -338,6 +338,8 @@ func isOneOf(err error, want []error) bool {
 func TestLayerPullRetryAfterStall(t *testing.T) {
 	release := make(chan struct{})
 	var gets atomic.Int32
+	sent := make(chan struct{})
+	var sentOnce sync.Once
 	ref := layerBodyServer(t, func(w http.ResponseWriter, r *http.Request, layer []byte) {
 		if gets.Add(1) > 1 {
 			_, _ = w.Write(layer)
@@ -346,6 +348,7 @@ func TestLayerPullRetryAfterStall(t *testing.T) {
 		// The first fetch delivers a few bytes, then holds the connection.
 		_, _ = w.Write(layer[:16])
 		w.(http.Flusher).Flush()
+		sentOnce.Do(func() { close(sent) })
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -389,6 +392,14 @@ func TestLayerPullRetryAfterStall(t *testing.T) {
 	}
 	if !errors.Is(err, ErrLayerBodyStalled) {
 		t.Fatalf("first Pull error = %v, want ErrLayerBodyStalled", err)
+	}
+	// The server flushed the first bytes before the pull failed. As in
+	// TestLayerPullStalledBodyAborts this shows only the server side, but it does
+	// tell a pull that failed before the server handled the layer GET apart.
+	select {
+	case <-sent:
+	default:
+		t.Fatal("first Pull failed before the server flushed the 16 body bytes")
 	}
 	assertNoPartialBlobs(t, cache)
 
