@@ -46,17 +46,37 @@ const defaultLayerStallWindow = 2 * time.Minute
 //
 // Lifetime: the timer is a time.AfterFunc (made through afterFunc, which tests
 // replace with a hand-fired fake), so no goroutine exists until it fires, and it is stopped whenever no body.Read is in flight. Close stops it,
-// and Close and the timer share one sync.Once around the body's Close, so Close
-// returns only after any in-flight timer close has finished: nothing this
-// reader started outlives its Close.
+// and Close and the timer share one sync.Once around the body's Close.
+// Close returns after any callback that has entered the shared once has
+// finished; a callback scheduled but not yet running may finish after Close,
+// where it finds its window stale and does nothing.
+//
+// Stale fires: a callback that had already started when Read's timer.Stop ran
+// (Stop returned false) runs after that Read returned, perhaps while a later
+// Read is in flight. So each window carries a generation: Read bumps gen under
+// mu and arms a fresh timer whose callback captures that value, and every Read
+// return and Close bumps gen again. fire acts only if its captured generation
+// is still the live one, so a fire can cut only the Read that armed it. One
+// reused timer cannot do this: with Reset the callback is fixed at creation and
+// cannot tell which window it belongs to.
+//
+// Read must not be called concurrently: one caller at a time, as io.Copy does.
+// Overlapping Reads would make an earlier Read's window stale while it is still
+// in flight, so its stall would go undetected.
 type stallReader struct {
 	body      io.ReadCloser
 	window    time.Duration
 	afterFunc func(time.Duration, func()) stallTimer
-	timer     stallTimer
 	stalled   atomic.Bool
 	once      sync.Once
 	err       error
+
+	// mu guards timer and gen.
+	mu sync.Mutex
+	// timer is the window of the Read in flight, or a stopped one.
+	timer stallTimer
+	// gen is the live window's generation; a fire whose generation differs is stale.
+	gen uint64
 }
 
 // stallTimer is the part of *time.Timer the watchdog uses; it is the seam a
@@ -70,24 +90,51 @@ type stallTimer interface {
 func timeAfterFunc(d time.Duration, f func()) stallTimer { return time.AfterFunc(d, f) }
 
 // newStallReader wraps body with a watchdog of the given window. The timer is
-// created stopped; each Read arms it for the duration of one body.Read.
+// created stopped; each Read arms a fresh one for the duration of one body.Read.
 func newStallReader(body io.ReadCloser, window time.Duration) *stallReader {
 	return (&stallReader{body: body, window: window, afterFunc: timeAfterFunc}).start()
 }
 
 // start creates the watchdog timer through s.afterFunc, stopped, and returns s.
+// Its callback carries generation 0, which no Read ever arms, so it is inert.
 func (s *stallReader) start() *stallReader {
-	s.timer = s.afterFunc(s.window, s.fire)
+	s.timer = s.afterFunc(s.window, func() { s.fire(0) })
 	s.timer.Stop()
 	return s
 }
 
-// fire runs on the timer's goroutine when one body.Read ran a whole window. It
-// marks the reader stalled before closing the body, so a read failure the close
+// arm starts a fresh window for one body.Read, tied to a new generation.
+func (s *stallReader) arm() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gen++
+	g := s.gen
+	s.timer = s.afterFunc(s.window, func() { s.fire(g) })
+}
+
+// disarm ends the live window: it stops the timer and bumps gen, so a callback
+// Stop was too late to prevent finds its generation stale.
+func (s *stallReader) disarm() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gen++
+	s.timer.Stop()
+}
+
+// fire runs on the timer's goroutine when the window of generation g ran out.
+// A stale g (its Read returned, or Close ran) does nothing. Otherwise it marks
+// the reader stalled before closing the body, so a read failure the close
 // causes always observes the flag.
-func (s *stallReader) fire() {
-	s.stalled.Store(true)
-	s.closeBody()
+func (s *stallReader) fire(g uint64) {
+	s.mu.Lock()
+	live := g == s.gen
+	if live {
+		s.stalled.Store(true)
+	}
+	s.mu.Unlock()
+	if live {
+		s.closeBody()
+	}
 }
 
 // closeBody closes the body exactly once, from whichever side gets there first.
@@ -113,9 +160,9 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	if s.stalled.Load() {
 		return 0, s.stallError(nil)
 	}
-	s.timer.Reset(s.window)
+	s.arm()
 	n, err := s.body.Read(p)
-	s.timer.Stop()
+	s.disarm()
 	if !s.stalled.Load() {
 		return n, err
 	}
@@ -129,9 +176,13 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	return 0, s.stallError(err)
 }
 
-// Close stops the watchdog and closes the body.
+// Close stops the timer and closes the body, once in all: whichever of Close
+// and the watchdog gets there first closes it, and every Close returns that one
+// body.Close error. Stopping the timer only prevents a firing that has not
+// started; a timer callback already running is not waited for beyond the shared
+// once around the body's Close.
 func (s *stallReader) Close() error {
-	s.timer.Stop()
+	s.disarm()
 	s.closeBody()
 	return s.err
 }
