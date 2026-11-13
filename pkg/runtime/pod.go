@@ -608,7 +608,9 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	viewPaths, err := mount.LinkImageVolumes(box, rootfs, imageViews)
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: link image volumes for pod %s: %w", ErrArtifactMountRefused, box.GetPodId(), err)
+			artifactRefusal(ErrArtifactMountRefused, podSubject(box.GetPodId()),
+				"its image volumes could not be linked into the container root",
+				fmt.Errorf("link image volumes: %w", err))
 	}
 
 	// Bind APFS-backed persistent volumes (PVCs): ensure each claim's
@@ -1084,8 +1086,12 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	}
 	plan, err := mount.ComputeSharePlanWithViews(box, podDir, r.cfg.Root, r.binder.Class(), imageViews)
 	if err != nil {
+		// The plan's errors name the pod dir, the pods, views and run roots
+		// and the share roots, so the reply is a fixed sentence; the cause
+		// stays in the chain for the daemon log.
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
-			fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
+			vmPodStartError(box.GetPodId(), "its volume share plan could not be computed",
+				fmt.Errorf("%w: vm volume share plan for pod %s: %w", errInvalidPodBox, box.GetPodId(), err))
 	}
 	// The agent socket is derived here, by the same function the daemon's own
 	// GuestDialer uses, and stamped onto the spec — so the socket the helper
@@ -1152,8 +1158,16 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	// and be populated BEFORE CreateVM boots it. PVC shares are skipped (the
 	// binder owns their dirs), and a bind's subPath is applied guest-side.
 	if err := mount.MaterializeShares(ctx, box, podDir, plan, podIP, r.resolver); err != nil {
+		what := "its volume shares could not be prepared"
+		// A volume name that cannot be a share directory is the pod
+		// author's to fix, so the sentence names it.
+		var nameErr *mount.ShareVolumeNameError
+		if errors.As(err, &nameErr) {
+			what = fmt.Sprintf("container %s: volume %s is not a single path component, so it cannot name a share directory",
+				image.QuoteBounded(nameErr.Container, maxReplyNameBytes), image.QuoteBounded(nameErr.Volume, maxReplyNameBytes))
+		}
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			vmPodStartError(box.GetPodId(), "its volume shares could not be prepared",
+			vmPodStartError(box.GetPodId(), what,
 				fmt.Errorf("materialize vm volume shares for pod %s: %w", box.GetPodId(), err))
 	}
 	// Provision each PVC's stable dir on the storage root. MaterializeShares
@@ -2440,6 +2454,10 @@ var errAdHocSign = errors.New("ad-hoc sign")
 type clientMessageError struct {
 	message string
 	err     error
+	// sentinel is set only by artifactRefusal, whose message begins with
+	// sentinel's text and is published unquoted, as it is (startErrorReply):
+	// the provider matches an image volume's refusal by that leading text.
+	sentinel error
 }
 
 func (e *clientMessageError) Error() string { return e.err.Error() }

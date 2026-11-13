@@ -29,8 +29,10 @@ import (
 	"testing"
 
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/volume"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	storagev1 "k3sm.io/apis/storage/v1"
 )
 
 // configFailWorld is an imageWorld whose pulls succeed but whose image config
@@ -51,6 +53,12 @@ const materializeDetail = "MATERIALIZE-DETAIL"
 func (materializeFailWorld) MaterializeTree(context.Context, *runtimev1.ImageManifest, image.UnpackPolicy, string) (*image.MaterializeResult, error) {
 	return nil, &fs.PathError{Op: "mkdir", Path: "/var/k3sm/snapshots/" + materializeDetail, Err: fs.ErrPermission}
 }
+
+// artifactDetail marks the artifact store path a failed image volume names.
+const artifactDetail = "ARTIFACT-DETAIL"
+
+// artifactRef is the image volume reference a vm pod mounts.
+const artifactRef = artifactTestHost + "/models/tiny:v1"
 
 // consoleDetail marks the console log path a failed vm boot names.
 const consoleDetail = "CONSOLE-DETAIL"
@@ -75,7 +83,12 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 		setup func(t *testing.T, e env)
 		// pod is set for a pod-level failure, whose sentence starts with
 		// "pod <id>:"; otherwise it starts with "container app:".
-		pod      bool
+		pod bool
+		// artifact is set for an image volume's refusal: the box mounts
+		// one, the reply begins, unquoted, with artifact (the stable reason
+		// and the "pod <id> image volume <name>:" token the provider reads).
+		artifact string
+		deps     func(d *Deps)
 		reason   runtimev1.FailureReason
 		sentence string
 		created  int
@@ -179,6 +192,27 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			wants:    func(e env) []string { return []string{filepath.Join(e.podDir, "rootfs")} },
 		},
 		{
+			// A PV storage root inside the runtime socket tree: the share
+			// plan refuses the PVC share, naming the share root and the run
+			// dir.
+			name: "share-plan",
+			setup: func(t *testing.T, e env) {
+				class := storagev1.DefaultLocalPathClass()
+				class.BasePath = filepath.Join(e.rt.cfg.Root, "run", "storage")
+				e.rt.binder = volume.NewBinder(class, image.APFSCloner{}, nil, e.rt.log)
+				e.box.Volumes = []*runtimev1.Volume{{
+					Name:                  "data",
+					PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "pgdata"},
+				}}
+				e.box.Containers[0].VolumeMounts = []*runtimev1.VolumeMount{{Name: "data", MountPath: "/data"}}
+			},
+			pod:      true,
+			reason:   runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			sentence: "its volume share plan could not be computed; the daemon log has the cause",
+			marker:   "vm volume share plan for pod",
+			wants:    func(e env) []string { return []string{filepath.Join(e.rt.cfg.Root, "run")} },
+		},
+		{
 			// A file where the PV storage root belongs.
 			name: "provision",
 			setup: func(t *testing.T, e env) {
@@ -214,6 +248,42 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			marker:   consoleDetail,
 			wants:    func(env) []string { return []string{"create vm for pod", "boot timed out"} },
 		},
+		{
+			// The fetch fails with an error naming the artifact store.
+			name:     "artifact-pull",
+			artifact: "ArtifactPullRefused: pod %s image volume model:",
+			deps: func(d *Deps) {
+				d.ArtifactPuller = &scriptedArtifactPuller{err: &fs.PathError{Op: "open", Path: "/var/k3sm/artifacts/" + artifactDetail + "/blob", Err: fs.ErrPermission}}
+			},
+			reason:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			sentence: "could not be fetched; the daemon log has the cause",
+			marker:   artifactDetail,
+			wants:    func(env) []string { return []string{"image volume model", fs.ErrPermission.Error()} },
+		},
+		{
+			// The daemon could not open its artifact views at start.
+			name:     "artifact-views",
+			artifact: "ArtifactMountRefused: pod %s:",
+			deps:     func(d *Deps) { d.ArtifactPuller = &scriptedArtifactPuller{} },
+			setup: func(_ *testing.T, e env) {
+				e.rt.views = nil
+				e.rt.viewsErr = &fs.PathError{Op: "mkdir", Path: "/var/k3sm/views/" + artifactDetail, Err: fs.ErrPermission}
+			},
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "artifact views are unavailable on this node; the daemon log has the cause",
+			marker:   artifactDetail,
+			wants:    func(env) []string { return []string{"artifact views unavailable", fs.ErrPermission.Error()} },
+		},
+		{
+			// The fetched manifest cannot be added to the pod's hold.
+			name:     "artifact-hold",
+			artifact: "ArtifactMountRefused: pod %s image volume model:",
+			deps:     func(d *Deps) { d.ArtifactPuller = &scriptedArtifactPuller{} },
+			reason:   runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			sentence: "could not be recorded in the pod's artifact hold; the daemon log has the cause",
+			marker:   "record the mounted manifest in the pod's hold",
+			wants:    func(env) []string { return []string{"image volume model"} },
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			podID := fmt.Sprintf("pod-vm-start-msg-%d", i)
@@ -224,10 +294,22 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			}
 			logs := &lockedBuffer{}
 			vmb := &fakeVMBackend{available: true, bootOK: true}
-			cfg, d := vmPodConfig(t, Deps{VMBackend: vmb, Puller: w, Unpacker: u})
+			deps := Deps{VMBackend: vmb, Puller: w, Unpacker: u}
+			if tc.deps != nil {
+				tc.deps(&deps)
+			}
+			cfg, d := vmPodConfig(t, deps)
 			cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 			rt := newTestRuntimeCfg(t, cfg, d)
 			box := vmBoxWith(rt, podID, nil, []*runtimev1.Container{{Name: "app", Image: ref}})
+			if tc.artifact != "" {
+				box.Volumes = append(box.Volumes, &runtimev1.Volume{
+					Name:  "model",
+					Image: &runtimev1.ImageVolumeSource{Reference: artifactRef},
+				})
+				box.Containers[0].VolumeMounts = append(box.Containers[0].VolumeMounts,
+					&runtimev1.VolumeMount{Name: "model", MountPath: "/models"})
+			}
 			id, err := image.ParsePodID(podID)
 			if err != nil {
 				t.Fatal(err)
@@ -255,10 +337,19 @@ func TestVMStartFailureMessageHidesHostPaths(t *testing.T) {
 			if tc.pod {
 				prefix, subject = "pod "+podID+":", podID
 			}
+			if tc.artifact != "" {
+				prefix, subject = fmt.Sprintf(tc.artifact, podID), podID
+			}
 			assertNoHostPaths(t, "CreatePod error", msg, prefix, subject, tc.sentence,
 				rt.cfg.Root, rt.cache.Root(), e.podDir, "/var/k3sm", "PULL-DETAIL", configDetail,
-				consoleDetail, materializeDetail)
-			if plain, err := strconv.Unquote(msg); err != nil || !strings.HasPrefix(plain, prefix) {
+				consoleDetail, materializeDetail, artifactDetail)
+			if tc.artifact != "" {
+				// The provider matches an image volume's refusal by its
+				// leading text, so this reply is not quoted.
+				if !strings.HasPrefix(msg, prefix) {
+					t.Errorf("CreatePod error %s does not start with %q", msg, prefix)
+				}
+			} else if plain, err := strconv.Unquote(msg); err != nil || !strings.HasPrefix(plain, prefix) {
 				t.Errorf("CreatePod error %s does not start with %q (unquote: %v)", msg, prefix, err)
 			}
 			assertLoggedOnceAt(t, logs.String(), "level=ERROR", tc.marker, tc.wants(e))
