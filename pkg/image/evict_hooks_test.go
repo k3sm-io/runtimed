@@ -55,7 +55,7 @@ func TestExecutePruneHooks(t *testing.T) {
 			hooks: func(*gcFixture, string) *pruneHooks { return nil },
 		},
 		{
-			name:  "nil guard and nil unlink are no-ops",
+			name:  "nil guard with a pass-through unlink removes every blob",
 			hooks: func(*gcFixture, string) *pruneHooks { return &pruneHooks{} },
 		},
 		{
@@ -524,19 +524,26 @@ func TestExecutePruneModeMismatch(t *testing.T) {
 	t.Parallel()
 	pinned := func() (map[string]PruneReason, error) { return nil, nil }
 	passUnlink := func(_ string, remove func() error) (bool, evictReason, error) { return remove() == nil, "", nil }
-	for name, m := range map[string]pruneMode{
-		"pressure without pins": {kind: pruneModePressure},
-		"evict without hooks":   {kind: pruneModeEvict},
-		"plain with hooks":      {kind: pruneModePlain, hooks: &pruneHooks{}},
-		"evict with pins":       {kind: pruneModeEvict, hooks: &pruneHooks{unlink: passUnlink}, pinned: pinned},
-		"evict without unlink":  {kind: pruneModeEvict, hooks: &pruneHooks{}},
-		"unknown kind":          {kind: 9},
+	for name, tc := range map[string]struct {
+		mode pruneMode
+		want string
+	}{
+		"pressure without pins": {pruneMode{kind: pruneModePressure}, "pressure mode takes a pin set and no hooks"},
+		"evict without hooks":   {pruneMode{kind: pruneModeEvict}, "evict mode takes hooks and no pin set"},
+		"plain with hooks":      {pruneMode{kind: pruneModePlain, hooks: &pruneHooks{}}, "plain mode takes no pin set and no hooks"},
+		"evict with pins":       {pruneMode{kind: pruneModeEvict, hooks: &pruneHooks{unlink: passUnlink}, pinned: pinned}, "evict mode takes hooks and no pin set"},
+		"evict without unlink":  {pruneMode{kind: pruneModeEvict, hooks: &pruneHooks{}}, "evict mode requires an unlink hook"},
+		"unknown kind":          {pruneMode{kind: 9}, "unknown mode 9"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			f := newGCFixture(t)
-			if _, err := f.cache.executePrune(&PrunePlan{}, 0, f.clock, nil, m); err == nil {
+			_, err := f.cache.executePrune(&PrunePlan{}, 0, f.clock, nil, tc.mode)
+			if err == nil {
 				t.Fatal("executePrune accepted a mismatched mode")
+			}
+			if want := "execute prune: " + tc.want; err.Error() != want {
+				t.Errorf("executePrune err = %q; want %q", err, want)
 			}
 		})
 	}

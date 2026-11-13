@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -1356,13 +1357,86 @@ func TestExecutePruneKeepsABlobRenamedOnEveryRepin(t *testing.T) {
 	if slices.Contains(r.rep.Removed, renamed) {
 		t.Errorf("the pass reported removing the kept blob: %v", r.rep.Removed)
 	}
-	skipped := false
-	for _, s := range r.rep.Skipped {
+	var got *SkippedBlob
+	for i, s := range r.rep.Skipped {
 		if s.Digest == renamed {
-			skipped = true
+			got = &r.rep.Skipped[i]
 		}
 	}
-	if !skipped {
-		t.Errorf("rep.Skipped = %+v; want %s skipped after the bound", r.rep.Skipped, renamed)
+	if got == nil {
+		t.Fatalf("rep.Skipped = %+v; want %s skipped after the bound", r.rep.Skipped, renamed)
+	}
+	wantRefusal := SkipRefusal{Digest: renamed, Kind: RefusedByUnlink, Reason: EvictKeptLeased}
+	if got.Refusal == nil || *got.Refusal != wantRefusal {
+		t.Errorf("Refusal = %+v; want %+v", got.Refusal, wantRefusal)
+	}
+	if want := fmt.Sprintf("a new lease still names it after %d pin re-reads", maxPruneRepins); got.Reason != want {
+		t.Errorf("Reason = %q; want %q", got.Reason, want)
+	}
+}
+
+// TestExecutePrunePlainModeConsultsNoLease pins the documented behaviour of
+// ExecutePrune's plain mode: it takes no pin set and no lease watch and makes
+// no live-lease check, so a blob under a live lease that the plan lists and
+// that is old enough is removed, and nothing is reported pinned or skipped.
+// It exists so the plain mode cannot silently gain or lose a check.
+func TestExecutePrunePlainModeConsultsNoLease(t *testing.T) {
+	f := newGCFixture(t)
+	leased := f.blob("planned blob under a live lease", 24*time.Hour)
+	lease := f.cache.AcquireLease([]string{leased}, time.Minute)
+	defer lease.Release()
+
+	rep, err := f.cache.ExecutePrune(planOf(leased), 0, f.clock, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrune: %v", err)
+	}
+	if f.exists(leased) {
+		t.Error("plain mode kept a leased blob; it must not consult leases")
+	}
+	if !slices.Contains(rep.Removed, leased) {
+		t.Errorf("rep.Removed = %v; want %s", rep.Removed, leased)
+	}
+	if len(rep.pinned) != 0 {
+		t.Errorf("rep.pinned = %+v; plain mode reports nothing kept for a lease", rep.pinned)
+	}
+	if len(rep.Skipped) != 0 {
+		t.Errorf("rep.Skipped = %+v; want none", rep.Skipped)
+	}
+}
+
+// TestExecutePruneEvictUnlinkMayAcquireLease pins that an eviction unlink
+// hook which itself takes the cache's lease lock (AcquireLease) neither
+// deadlocks against the executor nor changes the outcome: the executor holds
+// no leaseMu around the hook, so the pass completes and removes the blob.
+func TestExecutePruneEvictUnlinkMayAcquireLease(t *testing.T) {
+	f := newGCFixture(t)
+	d := f.blob("planned blob whose unlink hook leases", 24*time.Hour)
+	hooks := &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+		f.cache.AcquireLease([]string{digest}, time.Minute).Release()
+		err := remove()
+		return err == nil, "", err
+	}}
+	type result struct {
+		rep *ExecuteReport
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		rep, err := f.cache.executePrune(planOf(d), 0, f.clock, nil, evictPrune(hooks))
+		done <- result{rep, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("executePrune: %v", r.err)
+		}
+		if !slices.Equal(r.rep.Removed, []string{d}) {
+			t.Errorf("Removed = %v; want [%s]", r.rep.Removed, d)
+		}
+		if f.exists(d) {
+			t.Error("blob survived")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("executePrune deadlocked: the unlink hook's AcquireLease never returned")
 	}
 }
