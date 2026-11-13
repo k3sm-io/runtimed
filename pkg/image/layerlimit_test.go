@@ -17,6 +17,7 @@ limitations under the License.
 package image
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -348,7 +349,7 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 	})
 
 	t.Run("load", func(t *testing.T) {
-		t.Skip("B1739: the docker-save fixture at 4096 entries is quadratic and times out; the load guard is unexercised here")
+		const ref = "example.com/many:v1"
 		for _, tc := range cases {
 			cache, err := NewCache(t.TempDir())
 			if err != nil {
@@ -356,14 +357,20 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 			}
 			idx := newRecordingIndex()
 			l := mustLoader(t, cache, idx)
-			archive := dockerSaveArchive(t, layerLimitImage(t, tc.layers), "example.com/many:v1")
-			_, err = l.Load(context.Background(), LoadRequest{
-				Reference: "example.com/many:v1",
-				Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE,
+			// The refused row stores bytes that contradict the layer's claimed
+			// digest: had the blobs been re-hashed before the guard, the error
+			// would be the mismatch, not ErrTooManyLayers.
+			archive := layerLimitOCIArchive(t, tc.layers, tc.refused)
+			res, err := l.Load(context.Background(), LoadRequest{
+				Reference: ref,
+				Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
 			}, bytes.NewReader(archive))
 			if !tc.refused {
 				if err != nil {
 					t.Fatalf("%d layers: Load: %v", tc.layers, err)
+				}
+				if res == nil {
+					t.Fatalf("%d layers: Load returned no result", tc.layers)
 				}
 				continue
 			}
@@ -376,6 +383,69 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 			}
 		}
 	})
+}
+
+// layerLimitOCIArchive is a tarred OCI layout whose manifest names ONE shared
+// tiny layer n times, written by hand so the tar holds one layer entry: a
+// per-entry fixture makes every blob open scan thousands of entries. With
+// poison, the stored layer bytes contradict the manifest's claim.
+func layerLimitOCIArchive(t *testing.T, n int, poison bool) []byte {
+	t.Helper()
+	cfg := nativeConfig(t)
+	layer := []byte("k3sm-layer-limit")
+	mfst := ggcrv1.Manifest{
+		SchemaVersion: 2,
+		MediaType:     types.OCIManifestSchema1,
+		Config:        ggcrv1.Descriptor{MediaType: types.OCIConfigJSON, Digest: ggcrHash(t, cfg), Size: int64(len(cfg))},
+	}
+	ld := ggcrv1.Descriptor{MediaType: types.OCILayer, Digest: ggcrHash(t, layer), Size: int64(len(layer))}
+	for range n {
+		mfst.Layers = append(mfst.Layers, ld)
+	}
+	rawMfst, err := json.Marshal(mfst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawIdx, err := json.Marshal(ggcrv1.IndexManifest{
+		SchemaVersion: 2,
+		MediaType:     types.OCIImageIndex,
+		Manifests: []ggcrv1.Descriptor{{
+			MediaType: types.OCIManifestSchema1, Digest: ggcrHash(t, rawMfst), Size: int64(len(rawMfst)),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := layer
+	if poison {
+		stored = []byte("k3sm-layer-LIMIT")
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	blobName := func(h ggcrv1.Hash) string { return "blobs/" + h.Algorithm + "/" + h.Hex }
+	for _, e := range []struct {
+		name string
+		body []byte
+	}{
+		{"oci-layout", []byte(`{"imageLayoutVersion":"1.0.0"}`)},
+		{"index.json", rawIdx},
+		{blobName(ggcrHash(t, rawMfst)), rawMfst},
+		{blobName(mfst.Config.Digest), cfg},
+		{blobName(ld.Digest), stored},
+	} {
+		if err := tw.WriteHeader(&tar.Header{
+			Typeflag: tar.TypeReg, Name: e.name, Mode: 0o644, Size: int64(len(e.body)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(e.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func TestRefuseLayerCount(t *testing.T) {
