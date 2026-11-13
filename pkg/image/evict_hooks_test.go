@@ -30,7 +30,7 @@ import (
 // on a fixture cache: a nil hooks pointer behaves as ExecutePrune, a guard drop
 // keeps its blob with the reason in the report, a guard error unlinks nothing,
 // an unlink hook that refuses a blob keeps it with the reason, a blob the
-// executor's own re-verification (run by remove) refuses is kept, a hook error
+// executor's own re-verification refuses never reaches the hook, a hook error
 // is a skip, and a removed report the root handle contradicts is a failed
 // removal.
 func TestExecutePruneHooks(t *testing.T) {
@@ -95,12 +95,12 @@ func TestExecutePruneHooks(t *testing.T) {
 			wantReason: string(evictLeased),
 		},
 		{
-			// Re-verification runs inside remove, under the hook's lock: a
-			// hook that calls remove for a young blob removes nothing, and
-			// the young refusal wins over the hook's own report.
-			name: "blob refused by re-verification inside remove is kept",
-			hooks: func(*gcFixture, string) *pruneHooks {
+			name: "blob refused by re-verification is never offered to the hook",
+			hooks: func(_ *gcFixture, keep string) *pruneHooks {
 				return &pruneHooks{unlink: func(digest string, remove func() error) (bool, evictReason, error) {
+					if digest == keep {
+						return false, "", errors.New("hook offered a blob younger than grace")
+					}
 					return true, "", remove()
 				}}
 			},
@@ -615,5 +615,99 @@ func TestEvictGraceIsCheckedUnderTheLeaseLock(t *testing.T) {
 	want := SkipRefusal{Digest: b, Kind: RefusedYoung, Reason: EvictKeptYoung}
 	if s.Refusal == nil || *s.Refusal != want {
 		t.Errorf("Refusal = %+v; want %+v", s.Refusal, want)
+	}
+}
+
+// TestEvictRemoveIsIdempotent pins that the remove closure handed to the
+// unlink hook replays its first result: a hook that calls remove twice gets a
+// blob reported deleted once with its bytes after a successful first call,
+// and kept once (still on disk) after a refusing first call.
+func TestEvictRemoveIsIdempotent(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		recommit bool // make the first remove refuse the blob as young
+	}{
+		{name: "successful first call"},
+		{name: "refusing first call", recommit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newGCFixture(t)
+			b := f.blob("remove-twice", time.Hour)
+			p, err := f.cache.BlobPath(b)
+			if err != nil {
+				t.Fatalf("BlobPath: %v", err)
+			}
+			fi, err := os.Stat(p)
+			if err != nil {
+				t.Fatalf("Stat: %v", err)
+			}
+			nodes, err := f.cache.EnumerateBlobs()
+			if err != nil {
+				t.Fatalf("EnumerateBlobs: %v", err)
+			}
+			plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
+			if err != nil {
+				t.Fatalf("PlanPrune: %v", err)
+			}
+			var errs [2]error
+			hooks := &pruneHooks{unlink: func(_ string, remove func() error) (bool, evictReason, error) {
+				if tc.recommit {
+					if err := os.Chtimes(p, f.clock, f.clock); err != nil {
+						t.Fatalf("Chtimes: %v", err)
+					}
+				}
+				errs[0] = remove()
+				if tc.recommit {
+					// Age the blob again: a second call that re-ran the
+					// checks would now remove it.
+					old := f.clock.Add(-time.Hour)
+					if err := os.Chtimes(p, old, old); err != nil {
+						t.Fatalf("Chtimes: %v", err)
+					}
+				}
+				errs[1] = remove()
+				return errs[1] == nil, "", errs[1]
+			}}
+			rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, evictPrune(hooks))
+			if err != nil {
+				t.Fatalf("executePrune: %v", err)
+			}
+			if errs[0] != errs[1] {
+				t.Errorf("second remove = %v; want the first call's %v", errs[1], errs[0])
+			}
+			if tc.recommit {
+				if !blobOnDisk(t, f, b) {
+					t.Fatalf("blob %s refused by the first remove was removed", b)
+				}
+				if rep.Deleted != 0 || rep.DeletedBytes != 0 || len(rep.Removed) != 0 {
+					t.Errorf("Deleted = %d, DeletedBytes = %d, Removed = %v; want none", rep.Deleted, rep.DeletedBytes, rep.Removed)
+				}
+				if len(rep.Skipped) != 1 || rep.Skipped[0].Digest != b {
+					t.Fatalf("Skipped = %+v; want exactly %s once", rep.Skipped, b)
+				}
+				want := SkipRefusal{Digest: b, Kind: RefusedYoung, Reason: EvictKeptYoung}
+				if r := rep.Skipped[0].Refusal; r == nil || *r != want {
+					t.Errorf("Refusal = %+v; want %+v", r, want)
+				}
+				return
+			}
+			if errs[0] != nil {
+				t.Fatalf("first remove: %v", errs[0])
+			}
+			if blobOnDisk(t, f, b) {
+				t.Errorf("blob %s is still on disk", b)
+			}
+			if rep.Deleted != 1 || rep.DeletedBytes != fi.Size() {
+				t.Errorf("Deleted = %d, DeletedBytes = %d; want 1, %d", rep.Deleted, rep.DeletedBytes, fi.Size())
+			}
+			if len(rep.Removed) != 1 || rep.Removed[0] != b {
+				t.Errorf("Removed = %v; want [%s]", rep.Removed, b)
+			}
+			if len(rep.Skipped) != 0 {
+				t.Errorf("Skipped = %+v; want none", rep.Skipped)
+			}
+		})
 	}
 }

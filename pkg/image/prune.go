@@ -561,13 +561,19 @@ type pruneHooks struct {
 	// the call with nothing unlinked.
 	guard func() (drop map[string]evictReason, err error)
 
-	// unlink (required, see above) decides the removal of one blob. remove
-	// re-verifies the blob (Lstat, regularity, grace) and then calls
-	// root.Remove on its path under the executor's *os.Root, so a hook that
-	// calls remove inside its own lock runs that re-verification there. A
-	// blob remove keeps returns a non-nil error, and the executor reports the
-	// kept outcome whatever the hook returns. A hook MUST delete only through
-	// remove, so it cannot unlink outside the blobs root. A false removed with a nil error
+	// unlink (required, see above) decides the removal of one blob. Checks run
+	// in this order: the executor's early, unlocked Lstat, regular-file and
+	// grace checks (a blob they refuse is never offered to the hook, and keeps
+	// its own refusal); then the hook's own roots and lease checks; then
+	// remove's re-check (Lstat, regularity, grace) immediately before
+	// root.Remove on the blob's path under the executor's *os.Root, which runs
+	// inside the hook's lock when the hook calls remove there, and is the
+	// authoritative check for a blob that changed after the early one. A blob
+	// remove keeps returns a non-nil error, and the executor reports the kept
+	// outcome whatever the hook returns. remove is safe to call more than
+	// once: later calls return the first call's result and touch nothing. A
+	// hook MUST delete only through remove, so it cannot unlink outside the
+	// blobs root. A false removed with a nil error
 	// records the blob as skipped with reason; an error records it as skipped
 	// with the error, exactly as a failed root.Remove. A true removed is not
 	// trusted: the executor re-checks the path through the root handle and
@@ -760,24 +766,30 @@ const maxPruneRepins = 3
 // executePrune guarantees it is non-nil), with the typed refusals the eviction
 // reports.
 //
-// The Lstat, regularity and grace re-verification run inside the remove
-// closure handed to the hook, so they run in the hook's leaseMu section
-// immediately before the Remove. A blob commit is a lock-free rename that
-// refreshes the mtime; checked before the hook took its lock, a commit landing
-// in between would leave the grace verdict stale and a just-written blob
-// would be unlinked. The closure records a refusal in kept and returns
-// errEntryKept without removing anything; that outcome is reported as-is,
-// whatever the hook returns.
+// The order of checks is: an early, unlocked Lstat, regular-file and grace
+// check, whose refusals keep their own outcomes and are never offered to the
+// hook; then the hook's roots and lease checks; then the same Lstat,
+// regularity and grace re-check inside the remove closure handed to the hook,
+// so it runs in the hook's leaseMu section immediately before the Remove. A
+// blob commit is a lock-free rename that refreshes the mtime; checked only
+// before the hook took its lock, a commit landing in between would leave the
+// grace verdict stale and a just-written blob would be unlinked. The closure
+// records a refusal in kept and returns errEntryKept without removing
+// anything; that outcome is reported as-is, whatever the hook returns. The
+// closure is idempotent: a second call returns the first call's result and
+// touches neither the file nor kept and size.
 func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, hooks *pruneHooks, rep *ExecuteReport, skip func(PruneDecision, string), refuse func(PruneDecision, string, *SkipRefusal), failed func(PruneDecision) *SkipRefusal) {
 	rel := d.Node.Path
 	if cls, _ := classifyBlobRel(rel); cls == relInvalid {
 		skip(d, "path fails blob grammar")
 		return
 	}
-	// This early Lstat only skips an entry already gone (or unreadable)
-	// without paying for the hook's lease and roots checks. It is not the
-	// authoritative check: that is the one in remove, under leaseMu.
-	if _, err := root.Lstat(rel); err != nil {
+	// The early checks run outside leaseMu. They keep the refusal precedence
+	// (a young or non-regular blob is reported as such, never with the hook's
+	// reason) and spare the hook's checks for an entry already refused. They
+	// are not authoritative: remove re-checks under the hook's lock.
+	fi, err := root.Lstat(rel)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			skip(d, "already absent")
 		} else {
@@ -785,11 +797,30 @@ func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Du
 		}
 		return
 	}
+	if !fi.Mode().IsRegular() {
+		skip(d, fmt.Sprintf("not a regular file (mode %v)", fi.Mode().Type()))
+		return
+	}
+	if now.Sub(fi.ModTime()) < grace {
+		refuse(d, "younger than grace", &SkipRefusal{Digest: d.Node.Digest, Kind: RefusedYoung, Reason: EvictKeptYoung})
+		return
+	}
 	var (
-		kept func() // set by remove when re-verification keeps the blob
-		size int64  // the removed blob's size, from remove's Lstat
+		verifyAndRemove func() error
+		kept            func() // set by remove when re-verification keeps the blob
+		size            int64  // the removed blob's size, from remove's Lstat
+		called          bool   // remove has run once; later calls replay its result
+		removeErr       error  // the first call's result
 	)
 	remove := func() error {
+		if called {
+			return removeErr
+		}
+		called = true
+		removeErr = verifyAndRemove()
+		return removeErr
+	}
+	verifyAndRemove = func() error {
 		fi, err := root.Lstat(rel)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
