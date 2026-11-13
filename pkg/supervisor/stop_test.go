@@ -466,7 +466,9 @@ func TestGracefulStopKillSendFailureIsNotEscalated(t *testing.T) {
 	const pgid = 4242
 	term, kill := os.Interrupt, os.Kill
 	errKill := errors.New("refused: kill send")
+	var sent []os.Signal
 	signal := func(_ int, sig os.Signal) error {
+		sent = append(sent, sig)
 		if sig == kill {
 			return errKill
 		}
@@ -478,12 +480,14 @@ func TestGracefulStopKillSendFailureIsNotEscalated(t *testing.T) {
 		name  string
 		ctx   context.Context
 		grace time.Duration
+		want  []os.Signal
 	}{
-		{"grace-zero", context.Background(), 0},
-		{"after-grace-deadline", context.Background(), 20 * time.Millisecond},
-		{"cancelled-ctx", cancelled, 10 * time.Second},
+		{"grace-zero", context.Background(), 0, []os.Signal{kill}},
+		{"after-grace-deadline", context.Background(), 20 * time.Millisecond, []os.Signal{term, kill}},
+		{"cancelled-ctx", cancelled, 10 * time.Second, []os.Signal{term, kill}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			sent = nil
 			exited := make(chan struct{}) // never closes
 			start := time.Now()
 			esc, obs, err := GracefulStop(tc.ctx, pgid, tc.grace, exited, term, kill, signal, 5*time.Second)
@@ -498,6 +502,9 @@ func TestGracefulStopKillSendFailureIsNotEscalated(t *testing.T) {
 			}
 			if !errors.Is(err, errKill) {
 				t.Errorf("err = %v, want it to wrap the kill send error", err)
+			}
+			if !slices.Equal(sent, tc.want) {
+				t.Errorf("signals attempted = %v, want %v", sent, tc.want)
 			}
 		})
 	}
