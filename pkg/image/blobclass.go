@@ -26,6 +26,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	imagestorev1 "k3sm.io/apis/imagestore/v1"
 )
 
 // The class names StoreBytesByClass reports besides artifact types. An
@@ -36,14 +38,14 @@ const (
 	// ClassImage is content an image names: the blobs a pull-cache index
 	// entry, an operator record or a pod's reachability record names, and
 	// every unpacked or snapshot tree.
-	ClassImage = "image"
+	ClassImage = imagestorev1.ClassImage
 	// ClassArtifact is an artifact blob whose artifactType is unknown: one a
 	// pod's hold names with no record, live or released, to type it, or one
 	// whose record carries no media-type-shaped artifactType.
-	ClassArtifact = "artifact"
+	ClassArtifact = imagestorev1.ClassArtifact
 	// ClassUnattributed is content nothing names: a blob whose image entry and
 	// records are all gone, and an ingest temp.
-	ClassUnattributed = "unattributed"
+	ClassUnattributed = imagestorev1.ClassUnattributed
 )
 
 // IsArtifactClass reports whether class names artifact content: an
@@ -52,44 +54,16 @@ func IsArtifactClass(class string) bool {
 	return class != "" && class != ClassImage && class != ClassUnattributed
 }
 
-// maxClassBytes caps an artifact class key: it is registry-supplied text that
-// reaches a report and a log line.
-const maxClassBytes = 255
-
 // artifactClass returns the class of an artifact whose record carries typ. A
-// type that is not a media type (isMediaType) or is longer than maxClassBytes
-// is ClassArtifact, so a registry-supplied type can never pose as ClassImage
-// or ClassUnattributed, nor carry arbitrary bytes into a class key.
+// type that is not a media-type class key (imagestorev1.IsClassKey, which also
+// bounds its length) is ClassArtifact, as is a reserved name, so a
+// registry-supplied type can never pose as ClassImage or ClassUnattributed,
+// nor carry arbitrary bytes into a class key.
 func artifactClass(typ string) string {
-	if len(typ) > maxClassBytes || !isMediaType(typ) {
+	if !strings.Contains(typ, "/") || !imagestorev1.IsClassKey(typ) {
 		return ClassArtifact
 	}
 	return typ
-}
-
-// isMediaType reports whether s is type "/" subtype, each a restricted-name
-// as RFC 6838 section 4.2 defines it: a letter or digit, then at most 126 of
-// letters, digits and "!#$&-^_.+". Parameters are not part of a class.
-func isMediaType(s string) bool {
-	typ, sub, ok := strings.Cut(s, "/")
-	return ok && isRestrictedName(typ) && isRestrictedName(sub)
-}
-
-func isRestrictedName(s string) bool {
-	if len(s) == 0 || len(s) > 127 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-		if i == 0 && !alnum {
-			return false
-		}
-		if !alnum && !strings.ContainsRune("!#$&-^_.+", rune(c)) {
-			return false
-		}
-	}
-	return true
 }
 
 // releasedClass is the artifactType and release time a released record copy

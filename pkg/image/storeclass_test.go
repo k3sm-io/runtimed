@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	imagestorev1 "k3sm.io/apis/imagestore/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -180,12 +181,36 @@ func TestArtifactClassClampsTheKey(t *testing.T) {
 		{"at the cap", atCap, atCap},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if len(tc.want) > maxClassBytes {
+			if len(tc.want) > imagestorev1.MaxClassKeyBytes {
 				t.Fatalf("bad fixture: want is %d bytes", len(tc.want))
 			}
 			if got := artifactClass(tc.typ); got != tc.want {
 				t.Fatalf("artifactClass(%q) = %q; want %q", tc.typ, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestArtifactClassIsClassKey pins that every key artifactClass can hand to
+// StoreBytesByClass is a key the shared class report accepts.
+func TestArtifactClassIsClassKey(t *testing.T) {
+	for _, typ := range []string{
+		"", "image", "artifact", "unattributed", "a/b", "/", "a/", "/b",
+		testModelType, testWasmType, "application/json; charset=utf-8",
+		"-a/b", "a/b/c", "a b/c", "é/x", strings.Repeat("a", 128) + "/b",
+		"a/" + strings.Repeat("b", imagestorev1.MaxClassKeyBytes),
+	} {
+		got := artifactClass(typ)
+		if !imagestorev1.IsClassKey(got) {
+			t.Errorf("artifactClass(%.40q) = %.40q, not a class key", typ, got)
+		}
+		if got != typ && got != ClassArtifact {
+			t.Errorf("artifactClass(%.40q) = %.40q, want the input or %q", typ, got, ClassArtifact)
+		}
+	}
+	for _, typ := range []string{"image", "unattributed", ""} {
+		if got := artifactClass(typ); got != ClassArtifact {
+			t.Errorf("artifactClass(%q) = %q, want %q", typ, got, ClassArtifact)
+		}
 	}
 }
