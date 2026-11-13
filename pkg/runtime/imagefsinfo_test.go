@@ -24,6 +24,8 @@ import (
 	"maps"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
 )
@@ -153,5 +155,46 @@ func TestImageFsInfoSplitsByClass(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestImageFsInfoEmptyStore pins a store with no blobs: the call succeeds, the
+// split is empty and the total is zero, and the filesystem sample is still
+// reported because it comes from statfs of the store root, not from the walk.
+func TestImageFsInfoEmptyStore(t *testing.T) {
+	client, rt := imagesTestClient(t)
+	resp, err := client.ImageFsInfo(context.Background(), &runtimev1.ImageFsInfoRequest{})
+	if err != nil {
+		t.Fatalf("ImageFsInfo on an empty store: %v", err)
+	}
+	if got := resp.GetStoreBytesByClass(); len(got) != 0 {
+		t.Errorf("store_bytes_by_class = %v; want empty", got)
+	}
+	if resp.GetStoreBytes() != 0 {
+		t.Errorf("store_bytes = %d; want 0", resp.GetStoreBytes())
+	}
+	if len(resp.GetFilesystems()) != 1 || resp.GetFilesystems()[0].GetMountpoint() != rt.cache.Root() {
+		t.Errorf("filesystems = %v; want one sample at the store root", resp.GetFilesystems())
+	}
+}
+
+// TestImageFsInfoClassFailureFailsCall pins that a store that cannot be classed
+// fails the RPC rather than answering with a total beside an empty split. An
+// artifact record that does not decode makes the class read fail.
+func TestImageFsInfoClassFailureFailsCall(t *testing.T) {
+	client, rt := imagesTestClient(t)
+	putBlob(t, rt, "some content")
+	if err := rt.index.PutArtifactRecord(context.Background(), "example.test/bad:v1", []byte("not json")); err != nil {
+		t.Fatalf("PutArtifactRecord: %v", err)
+	}
+	resp, err := client.ImageFsInfo(context.Background(), &runtimev1.ImageFsInfoRequest{})
+	if err == nil {
+		t.Fatalf("ImageFsInfo succeeded with an undecodable artifact record: %v", resp)
+	}
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("ImageFsInfo code = %v (%v); want Internal", got, err)
+	}
+	if resp != nil {
+		t.Errorf("ImageFsInfo returned a response alongside the error: %v", resp)
 	}
 }
