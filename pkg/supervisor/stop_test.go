@@ -466,6 +466,8 @@ func TestGracefulStopKillSendFailureIsNotEscalated(t *testing.T) {
 	const pgid = 4242
 	term, kill := os.Interrupt, os.Kill
 	errKill := errors.New("refused: kill send")
+	// No lock: GracefulStop calls the signaller synchronously on the caller's goroutine and
+	// subtests run in sequence (no t.Parallel); a signaller on another goroutine needs a mutex.
 	var sent []os.Signal
 	signal := func(_ int, sig os.Signal) error {
 		sent = append(sent, sig)
