@@ -136,3 +136,64 @@ func TestSeedFailureLeavesNoHalfSeededVolume(t *testing.T) {
 		t.Errorf("staging dir %s survives a successful seed (err=%v)", stale, err)
 	}
 }
+
+// racingCloner byte-copies but, on its first Clone, creates the data dir with a
+// foreign file, modelling another creator winning the race mid-seed.
+type racingCloner struct {
+	dataDir string
+	done    bool
+}
+
+func (c *racingCloner) Clone(src, dst string) (bool, error) {
+	if !c.done {
+		c.done = true
+		if err := os.MkdirAll(c.dataDir, 0o755); err != nil {
+			return false, err
+		}
+		if err := os.WriteFile(filepath.Join(c.dataDir, "foreign"), []byte("F"), 0o644); err != nil {
+			return false, err
+		}
+	}
+	return image.ByteCopier{}.Clone(src, dst)
+}
+
+// TestSeedReusesDataDirCreatedDuringSeed proves a data dir that appears while
+// the seed runs is a lost race, not a bind failure: the bind reuses it, leaves
+// it untouched, and leaves no staging dir.
+func TestSeedReusesDataDirCreatedDuringSeed(t *testing.T) {
+	root := t.TempDir()
+	class := testClass(root)
+	src := filepath.Join(root, "template")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.sql"), []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := fakeTemplate{dir: src, present: true}
+	box := pvcBox("prod", "data", "seeded", "/seed", false)
+	dataDir, err := class.DataDir("prod", "seeded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(root, "pods", "pod-a", "rootfs")
+	if err := os.MkdirAll(rootfs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := NewBinder(class, &racingCloner{dataDir: dataDir}, tmpl, nil).Bind(context.Background(), box, rootfs)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if bindings[0].Seeded {
+		t.Error("Seeded = true after losing the race; want false (reuse)")
+	}
+	if b, err := os.ReadFile(filepath.Join(dataDir, "foreign")); err != nil || string(b) != "F" {
+		t.Errorf("foreign file = %q, %v; want intact", b, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dataDir, "a.sql")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("template file present in data dir (err=%v); want not seeded", err)
+	}
+	if _, err := os.Lstat(stagingDir(dataDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staging dir remains (err=%v)", err)
+	}
+}

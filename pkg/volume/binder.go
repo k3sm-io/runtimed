@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"k3sm.io/runtimed/pkg/image"
 
@@ -53,7 +54,9 @@ type TemplateResolver interface {
 // A Binder is safe for concurrent use: os.MkdirAll is idempotent, distinct pods
 // bind distinct dirs, and its one piece of mutable state, seedMu, serializes
 // template seeds (two pods sharing one (ns,claim) RWX volume share the dir by
-// design, and must not seed it twice).
+// design, and must not seed it twice). seedMu is in-process only: a create by
+// another creator outside it (the no-template MkdirAll path) or by a second
+// process is handled at the final rename, which reuses the dir that won.
 type Binder struct {
 	class    storagev1.LocalPathClass
 	cloner   image.Cloner
@@ -307,6 +310,13 @@ func (b *Binder) seed(namespace, claimName, src, dataDir string) (seeded bool, e
 		return false, fmt.Errorf("seed pv %s/%s from %s: %w", namespace, claimName, src, err)
 	}
 	if err := os.Rename(staging, dataDir); err != nil {
+		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+			// Lost the race to another creator: reuse its dir, never re-seed.
+			if rmErr := os.RemoveAll(staging); rmErr != nil {
+				return false, fmt.Errorf("remove pv staging dir %s: %w", staging, rmErr)
+			}
+			return false, nil
+		}
 		return false, fmt.Errorf("move seeded pv into place at %s: %w", dataDir, err)
 	}
 	b.log.Info("seeded persistent volume from template",
