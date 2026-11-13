@@ -244,8 +244,111 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 	})
 
 	t.Run("warm serve", func(t *testing.T) {
-		const ref = "example.com/many:v1"
-		for _, tc := range cases {
+		// A stored entry over the limit is a MISS, never an error and never
+		// deleted: IfNotPresent goes to the cold path, Never reports both facts.
+		overLimitEntry := func(t *testing.T, cache *Cache, idx *fakeIndex, ref string) {
+			t.Helper()
+			primeLocalImage(t, cache, idx, ref, layerLimitImage(t, MaxManifestLayers), false)
+			m := idx.entries[ref]
+			m.Layers = append(m.Layers, proto.Clone(m.Layers[0]).(*runtimev1.Descriptor))
+		}
+		for _, served := range cases {
+			t.Run(fmt.Sprintf("IfNotPresent, registry serves %d layers", served.layers), func(t *testing.T) {
+				reg := newBlobCountingRegistry(t)
+				img := layerLimitImage(t, served.layers)
+				ref := pushManyLayerImage(t, reg.host, "many", img)
+				mfst, err := img.Manifest()
+				if err != nil {
+					t.Fatal(err)
+				}
+				cache, err := NewCache(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				idx := &fakeIndex{entries: map[string]*runtimev1.ImageManifest{}}
+				overLimitEntry(t, cache, idx, ref)
+				reg.reset()
+				obs := newAcquireObserver(cache)
+				p, err := NewPuller(cache, RemoteFetch, idx,
+					WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(obs.ledger))
+				if err != nil {
+					t.Fatal(err)
+				}
+				res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT)
+				if _, kept := idx.entries[ref]; !kept {
+					t.Fatalf("index entry %s was deleted", ref)
+				}
+				if !served.refused {
+					if err != nil {
+						t.Fatalf("Pull: %v", err)
+					}
+					defer res.Lease.Release()
+					if res.CacheHit && !res.Fetched {
+						t.Errorf("Pull served the over-limit entry warm: %+v", res)
+					}
+					requireManifestOf(t, res.Manifest, img)
+					if idx.records != 1 {
+						t.Errorf("index recorded %d times, want 1", idx.records)
+					}
+					if n := len(idx.entries[ref].GetLayers()); n != MaxManifestLayers {
+						t.Errorf("re-recorded entry has %d layers, want %d", n, MaxManifestLayers)
+					}
+					return
+				}
+				if !errors.Is(err, ErrTooManyLayers) {
+					t.Fatalf("Pull error = %v, want ErrTooManyLayers from the cold path", err)
+				}
+				if errors.Is(err, ErrImageNotPresent) {
+					t.Errorf("IfNotPresent error %v wraps ErrImageNotPresent; want the cold-path refusal", err)
+				}
+				if n := reg.layerGets(t, img); n != 0 {
+					t.Errorf("registry saw %d layer GETs, want 0", n)
+				}
+				reg.mu.Lock()
+				cfgGets := reg.gets[mfst.Config.Digest.String()]
+				reg.mu.Unlock()
+				if cfgGets != 0 {
+					t.Errorf("registry saw %d config GETs, want 0", cfgGets)
+				}
+				obs.requireNoneAcquired(t)
+				if idx.records != 0 {
+					t.Errorf("index recorded %d times after the refusal, want 0", idx.records)
+				}
+			})
+		}
+
+		t.Run("Never", func(t *testing.T) {
+			const ref = "example.com/many:v1"
+			cache, err := NewCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			idx := &fakeIndex{entries: map[string]*runtimev1.ImageManifest{}}
+			overLimitEntry(t, cache, idx, ref)
+			before := storeBlobCount(t, cache)
+			obs := newAcquireObserver(cache)
+			off := &offlineFetch{}
+			p := mustPullerIndex(t, cache, off.fetch, idx)
+			_, err = p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER)
+			if !errors.Is(err, ErrTooManyLayers) || !errors.Is(err, ErrImageNotPresent) {
+				t.Fatalf("Pull error = %v, want both ErrTooManyLayers and ErrImageNotPresent", err)
+			}
+			if off.calls != 0 {
+				t.Errorf("%d fetches, want 0", off.calls)
+			}
+			if n := obs.leasesAcquired(); n != 0 {
+				t.Errorf("%d leases acquired, want 0", n)
+			}
+			if after := storeBlobCount(t, cache); after != before {
+				t.Errorf("store went from %d to %d blobs", before, after)
+			}
+			if _, kept := idx.entries[ref]; !kept {
+				t.Errorf("index entry %s was deleted", ref)
+			}
+		})
+
+		t.Run("within the limit is still a warm hit", func(t *testing.T) {
+			const ref = "example.com/many:v1"
 			for _, pull := range []runtimev1.ImagePullPolicy{
 				runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
 				runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
@@ -256,38 +359,15 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 				}
 				idx := &fakeIndex{entries: map[string]*runtimev1.ImageManifest{}}
 				primeLocalImage(t, cache, idx, ref, layerLimitImage(t, MaxManifestLayers), false)
-				if tc.refused {
-					m := idx.entries[ref]
-					m.Layers = append(m.Layers, proto.Clone(m.Layers[0]).(*runtimev1.Descriptor))
-				}
-				before, leasesBefore := storeBlobCount(t, cache), leaseCount(cache)
 				off := &offlineFetch{}
 				p := mustPullerIndex(t, cache, off.fetch, idx)
 				res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), pull)
-				if off.calls != 0 {
-					t.Errorf("%d layers %v: %d fetches, want 0", tc.layers, pull, off.calls)
+				if err != nil || !res.CacheHit || off.calls != 0 {
+					t.Fatalf("%v: Pull = %+v, %v, %d fetches; want a cache hit", pull, res, err, off.calls)
 				}
-				if !tc.refused {
-					if err != nil || !res.CacheHit {
-						t.Fatalf("%d layers %v: Pull = %+v, %v; want a cache hit", tc.layers, pull, res, err)
-					}
-					res.Lease.Release()
-					continue
-				}
-				if !errors.Is(err, ErrTooManyLayers) {
-					t.Fatalf("%d layers %v: Pull error = %v, want ErrTooManyLayers", tc.layers, pull, err)
-				}
-				if errors.Is(err, ErrImageNotPresent) {
-					t.Errorf("%d layers %v: refusal %v wraps ErrImageNotPresent", tc.layers, pull, err)
-				}
-				if n := leaseCount(cache); n != leasesBefore {
-					t.Errorf("%d layers %v: %d leases after the refusal, want %d", tc.layers, pull, n, leasesBefore)
-				}
-				if after := storeBlobCount(t, cache); after != before {
-					t.Errorf("%d layers %v: store went from %d to %d blobs", tc.layers, pull, before, after)
-				}
+				res.Lease.Release()
 			}
-		}
+		})
 	})
 
 	t.Run("presentAs falls through to a valid spelling", func(t *testing.T) {
@@ -303,18 +383,21 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 		p := mustPullerIndex(t, cache, (&offlineFetch{}).fetch, idx)
 		leasesBefore := leaseCount(cache)
 
-		entry, lease, ok, err := p.presentAs(context.Background(), nativePolicy(), "example.com/bad:v1", "example.com/good:v1")
-		if err != nil || !ok || entry.Reference != "example.com/good:v1" {
-			t.Fatalf("presentAs(bad, good) = %q, %v, %v; want the good spelling", entry.Reference, ok, err)
+		pr, err := p.presentAs(context.Background(), nativePolicy(), "example.com/bad:v1", "example.com/good:v1")
+		if err != nil || !pr.ok || pr.entry.Reference != "example.com/good:v1" {
+			t.Fatalf("presentAs(bad, good) = %q, %v, %v; want the good spelling", pr.entry.Reference, pr.ok, err)
 		}
-		lease.Release()
+		pr.lease.Release()
 
-		_, _, ok, err = p.presentAs(context.Background(), nativePolicy(), "example.com/bad:v1", "example.com/missing:v1")
-		if ok || !errors.Is(err, ErrTooManyLayers) {
-			t.Fatalf("presentAs(bad, missing) = %v, %v; want ErrTooManyLayers", ok, err)
+		pr, err = p.presentAs(context.Background(), nativePolicy(), "example.com/bad:v1", "example.com/missing:v1")
+		if err != nil || pr.ok || !errors.Is(pr.refused, ErrTooManyLayers) {
+			t.Fatalf("presentAs(bad, missing) = %v, refused %v, err %v; want a miss carrying ErrTooManyLayers", pr.ok, pr.refused, err)
 		}
 		if n := leaseCount(cache); n != leasesBefore {
 			t.Errorf("%d leases after presentAs, want %d", n, leasesBefore)
+		}
+		if _, kept := idx.entries["example.com/bad:v1"]; !kept {
+			t.Errorf("over-limit index entry was deleted")
 		}
 	})
 

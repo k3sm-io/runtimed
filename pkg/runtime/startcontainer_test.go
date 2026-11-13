@@ -209,6 +209,20 @@ func TestContainerStartFailureIsTypedByCause(t *testing.T) {
 			wantIs:    image.ErrManifestTooLarge,
 		},
 		{
+			// A Never pull of a stored entry over the limit wraps both
+			// sentinels; the limit wins over the Never-pull typing.
+			name: "stored_entry_over_the_limit_under_pull_policy_never",
+			deps: Deps{Puller: &fakePuller{errByRef: map[string]error{
+				pullRef: fmt.Errorf("image %q: %w: %w", pullRef, image.ErrImageNotPresent, image.ErrTooManyLayers),
+			}}},
+			container: &runtimev1.Container{
+				Name: "c", Image: pullRef, Command: []string{"/app"},
+				ImagePullPolicy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
+			},
+			want:   runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+			wantIs: image.ErrTooManyLayers,
+		},
+		{
 			name: "the_registry_pull_failed",
 			deps: Deps{Puller: &fakePuller{errByRef: map[string]error{
 				pullRef: errors.New("manifest unknown: no such image"),

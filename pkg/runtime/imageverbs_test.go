@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -255,6 +256,7 @@ func TestPullImageDrivesTheDaemonsOwnPuller(t *testing.T) {
 			{"no manifest for the platform", image.ErrNoPlatformMatch, codes.FailedPrecondition},
 			{"manifest over the layer-count limit", image.ErrTooManyLayers, codes.FailedPrecondition},
 			{"manifest over the byte cap", image.ErrManifestTooLarge, codes.FailedPrecondition},
+			{"stored entry over the limit under Never wraps both", fmt.Errorf("image: %w: %w", image.ErrImageNotPresent, image.ErrTooManyLayers), codes.FailedPrecondition},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

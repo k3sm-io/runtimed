@@ -858,11 +858,12 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 
 	if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT ||
 		pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
-		entry, lease, present, err := p.presentAs(ctx, policy, flatRef, ref)
+		pr, err := p.presentAs(ctx, policy, flatRef, ref)
 		if err != nil {
 			return nil, err
 		}
-		if present {
+		entry, lease := pr.entry, pr.lease
+		if pr.ok {
 			// No blob was written and no registry was contacted. The lease comes
 			// back HELD — see PullResult.Lease. The manifest descriptor is the one
 			// the entry recorded, never one re-derived here: the store holds no
@@ -881,8 +882,18 @@ func (p *Puller) Pull(ctx context.Context, ref string, cred *RegistryCredential,
 			}, nil
 		}
 		if pull == runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER {
+			if pr.refused != nil {
+				// The stored entry is over the limit: both facts hold, so both
+				// sentinels match and the caller can type it either way.
+				return nil, fmt.Errorf("image %q: stored entry is over the manifest limit: %w: %w",
+					ref, ErrImageNotPresent, pr.refused)
+			}
 			return nil, fmt.Errorf("image %q: %w", ref, ErrImageNotPresent)
 		}
+		// IfNotPresent: a miss, including a stored entry over the limit, goes to
+		// the cold path, whose guards refuse the manifest again before the config
+		// fetch if the registry still serves it, or re-record the entry if the
+		// tag has moved.
 	}
 
 	// DISK-PRESSURE ADMISSION, at the one choke point every fetching path
@@ -1201,12 +1212,23 @@ func manifestDescriptorDigests(mfst *ggcrv1.Manifest) []string {
 	return out
 }
 
+// presence is the warm-serve verdict for a reference: entry and lease when ok;
+// refused carries a stored entry's manifest-limit refusal, which is a miss and
+// not an error, so Never can still say why the image is not served.
+type presence struct {
+	entry   IndexEntry
+	lease   *Lease
+	ok      bool
+	refused error
+}
+
 // presentAs is presentLocally over the spellings a reference may have been
 // recorded under, in order; an empty spelling is skipped. The first one present
 // wins, so the flat registry's name is preferred and an entry recorded under the
 // written spelling (before the flat mapping existed, or by an image load) still
-// serves.
-func (p *Puller) presentAs(ctx context.Context, policy PlatformPolicy, refs ...string) (IndexEntry, *Lease, bool, error) {
+// serves. When none serves, the result is a miss carrying the first spelling's
+// limit refusal, if any.
+func (p *Puller) presentAs(ctx context.Context, policy PlatformPolicy, refs ...string) (presence, error) {
 	seen := make(map[string]bool, len(refs))
 	var refused error
 	for _, r := range refs {
@@ -1214,24 +1236,19 @@ func (p *Puller) presentAs(ctx context.Context, policy PlatformPolicy, refs ...s
 			continue
 		}
 		seen[r] = true
-		entry, lease, ok, err := p.presentLocally(ctx, r, policy)
-		if refusal(err) {
-			// One spelling's entry is over the limit; another may serve.
-			if refused == nil {
-				refused = err
-			}
-			continue
+		pr, err := p.presentLocally(ctx, r, policy)
+		if err != nil {
+			return presence{}, err
 		}
-		if err != nil || ok {
-			return entry, lease, ok, err
+		if pr.ok {
+			return pr, nil
+		}
+		// One spelling's entry may be over the limit; another may serve.
+		if refused == nil {
+			refused = pr.refused
 		}
 	}
-	return IndexEntry{}, nil, false, refused
-}
-
-// refusal reports whether err is a manifest-limit refusal (refuseLayerCount).
-func refusal(err error) bool {
-	return errors.Is(err, ErrTooManyLayers) || errors.Is(err, ErrManifestTooLarge)
+	return presence{refused: refused}, nil
 }
 
 // refuseImageManifest is refuseLayerCount over a resolved image's manifest.
@@ -1258,20 +1275,26 @@ func refuseImageManifest(img ggcrv1.Image) error {
 // would otherwise start a container whose layers are gone — so a recorded
 // reference with missing blobs is a miss, which sends IfNotPresent back to the
 // registry and fails Never honestly.
-func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (IndexEntry, *Lease, bool, error) {
+func (p *Puller) presentLocally(ctx context.Context, ref string, policy PlatformPolicy) (presence, error) {
 	entry, ok, err := p.index.Lookup(ctx, ref, policy)
 	if err != nil {
-		return IndexEntry{}, nil, false, fmt.Errorf("image index lookup %q: %w", ref, err)
+		return presence{}, fmt.Errorf("image index lookup %q: %w", ref, err)
 	}
 	mfst := entry.Manifest
 	if !ok || mfst == nil {
-		return IndexEntry{}, nil, false, nil
+		return presence{}, nil
 	}
-	// The layer limit before the lease: a recorded entry over it is an error,
-	// not a miss, so Never reports the refusal rather than "not present" and
-	// IfNotPresent does not go and fetch the same manifest again.
+	// The layer limit before the lease: a recorded entry over it is a MISS
+	// carrying the refusal, never an error. An error here would refuse the
+	// entry forever, since nothing deletes an index entry; as a miss,
+	// IfNotPresent goes to the cold path (which refuses the manifest again if
+	// the registry still serves it, or re-records the entry if the tag has
+	// moved) and Never reports both "not present" and the refusal. No lease is
+	// taken and the entry is left in place.
 	if err := refuseLayerCount(len(mfst.GetLayers()), entry.ManifestRaw); err != nil {
-		return IndexEntry{}, nil, false, fmt.Errorf("image %q: %w", ref, err)
+		p.logger().Warn("stored image entry is over the manifest limit; treating it as a miss",
+			slog.String("ref", ref), slog.Any("err", err))
+		return presence{refused: fmt.Errorf("image %q: %w", ref, err)}, nil
 	}
 	// LEASE before the presence check, not after it. This path writes nothing at
 	// all, so there is no commit to hang a pin on and no mtime change for a grace
@@ -1282,15 +1305,15 @@ func (p *Puller) presentLocally(ctx context.Context, ref string, policy Platform
 	lease := p.cache.AcquireLease(manifestDigests(mfst), 0)
 	if !p.cache.Has(mfst.GetConfig().GetDigest()) {
 		lease.Release()
-		return IndexEntry{}, nil, false, nil
+		return presence{}, nil
 	}
 	for _, l := range mfst.GetLayers() {
 		if !p.cache.Has(l.GetDigest()) {
 			lease.Release()
-			return IndexEntry{}, nil, false, nil
+			return presence{}, nil
 		}
 	}
-	return entry, lease, true, nil
+	return presence{entry: entry, lease: lease, ok: true}, nil
 }
 
 // manifestDigests is every blob digest a resolved manifest names — the config

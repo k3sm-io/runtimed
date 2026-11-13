@@ -608,6 +608,12 @@ func (s *imagesService) resolveTarget(ctx context.Context, verb, ref, digest str
 // code, because a wrong code is acted on and an honest Internal is read.
 func pullStatusError(err error) error {
 	switch {
+	case errors.Is(err, image.ErrTooManyLayers), errors.Is(err, image.ErrManifestTooLarge):
+		// The manifest is over a node limit. Permanent for this digest: no
+		// retry shrinks it, so it is a precondition, not a transient fault.
+		// Before not-present: a Never pull of a stored entry over the limit
+		// wraps both, and the limit is the actionable fact.
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, image.ErrImageNotPresent):
 		// The reference is absent and the policy forbids fetching it. No registry
 		// round trip was made, so NOT_FOUND is a fact about this node.
@@ -619,10 +625,6 @@ func pullStatusError(err error) error {
 	case image.IsTerminalPlatformError(err):
 		// The image has no manifest for the platform asked for. Permanent for
 		// this (reference, platform) pair, and the operator can act on it.
-		return status.Error(codes.FailedPrecondition, err.Error())
-	case errors.Is(err, image.ErrTooManyLayers), errors.Is(err, image.ErrManifestTooLarge):
-		// The manifest is over a node limit. Permanent for this digest: no
-		// retry shrinks it, so it is a precondition, not a transient fault.
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	return imageStatusError(err)
