@@ -381,8 +381,8 @@ func TestLayerPullRetryAfterStall(t *testing.T) {
 		}
 	}
 
-	// A knob, not a measurement: any window fires on the held body.
-	p.layerStallWindow = 10 * time.Millisecond
+	// Long enough that a loaded host delivers the first bytes before it expires.
+	p.layerStallWindow = 200 * time.Millisecond
 	res, err := pull("the stalled pull did not return")
 	if res != nil && res.Lease != nil {
 		res.Lease.Release()
