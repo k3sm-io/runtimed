@@ -18,9 +18,13 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -41,10 +45,52 @@ func assertFixedSentence(t *testing.T, what, msg, sentence string) {
 	if strings.Contains(msg, "MARKER") || strings.Contains(msg, "/var/") {
 		t.Errorf("%s %q carries the host path", what, msg)
 	}
+	if m := absHostPath.FindString(msg); m != "" {
+		t.Errorf("%s %q matches the absolute path %q", what, msg, m)
+	}
 	if !strings.Contains(msg, sentence) {
 		t.Errorf("%s %q lacks the fixed sentence %q", what, msg, sentence)
 	}
 }
+
+// assertLoggedAttrs parses out as slog JSON records and requires exactly one
+// whose "err" attribute carries marker; that record must be at level and carry
+// every attrs entry as its own structured attribute (not a message substring).
+func assertLoggedAttrs(t *testing.T, out, level, marker string, attrs map[string]string) {
+	t.Helper()
+	var found []map[string]any
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q is not a JSON record: %v", line, err)
+		}
+		if e, _ := rec["err"].(string); strings.Contains(e, marker) {
+			found = append(found, rec)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("the cause (%q) was logged %d times, want once:\n%s", marker, len(found), out)
+	}
+	rec := found[0]
+	if got, _ := rec["level"].(string); got != level {
+		t.Errorf("level attribute = %q, want %q", got, level)
+	}
+	if msg, _ := rec["msg"].(string); strings.Contains(msg, marker) {
+		t.Errorf("the cause is in the log message %q, want it in the err attribute", msg)
+	}
+	for k, want := range attrs {
+		if got, ok := rec[k].(string); !ok || got != want {
+			t.Errorf("log attribute %s = %v, want %q (record %v)", k, rec[k], want, rec)
+		}
+	}
+}
+
+// absHostPath matches any absolute-path-looking run: a slash followed by a
+// path element. The fixed sentences carry no slash.
+var absHostPath = regexp.MustCompile(`/[A-Za-z0-9._-]+`)
 
 // TestCreateFailureReplyHidesHostPathsByDefault drives an unwrapped create
 // error (the network setup's, naming a host path) through CreatePod: the reply
@@ -52,7 +98,7 @@ func assertFixedSentence(t *testing.T, what, msg, sentence string) {
 func TestCreateFailureReplyHidesHostPathsByDefault(t *testing.T) {
 	const podID = "pod-unwrapped-create"
 	logs := &lockedBuffer{}
-	cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	cfg := Config{Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
 	netw := &recordingNetwork{setupErr: fmt.Errorf("open %s/lo0.lease: %w", unwrappedMarker, errors.New("permission denied"))}
 	rt := newTestRuntimeCfg(t, cfg, Deps{Network: netw})
 
@@ -67,7 +113,7 @@ func TestCreateFailureReplyHidesHostPathsByDefault(t *testing.T) {
 		t.Errorf("code = %v, want Internal", got)
 	}
 	assertFixedSentence(t, "CreatePod reply", resp.GetError().GetMessage(), stageCreate.sentence())
-	assertLoggedOnceAt(t, logs.String(), "level=ERROR", unwrappedMarker, []string{"pod=" + podID})
+	assertLoggedAttrs(t, logs.String(), "ERROR", unwrappedMarker, map[string]string{"pod": podID})
 }
 
 // TestUnwrappedStartErrorDoesNotReachTheTenant is the start-path sibling: an
@@ -78,7 +124,7 @@ func TestCreateFailureReplyHidesHostPathsByDefault(t *testing.T) {
 func TestUnwrappedStartErrorDoesNotReachTheTenant(t *testing.T) {
 	const podID = "pod-unwrapped-start"
 	logs := &lockedBuffer{}
-	cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	cfg := Config{Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
 	rt := newTestRuntimeCfg(t, cfg, Deps{})
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)})
 	if err != nil {
@@ -106,7 +152,7 @@ func TestUnwrappedStartErrorDoesNotReachTheTenant(t *testing.T) {
 		t.Fatal("container is not Waiting after a failed start")
 	}
 	assertFixedSentence(t, "Waiting message", w.GetMessage(), stageStart.sentence())
-	assertLoggedOnce(t, logs.String(), unwrappedMarker, []string{"pod=" + podID, "container=main"})
+	assertLoggedAttrs(t, logs.String(), "WARN", unwrappedMarker, map[string]string{"pod": podID, "container": "main"})
 
 	refusal := fmt.Errorf("%w: container main: command is required", errInvalidPodBox)
 	sresp = rt.startFailed(p, cp, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, refusal)
@@ -134,7 +180,7 @@ func TestUnwrappedStartErrorDoesNotReachTheTenant(t *testing.T) {
 func TestDataVolumeRefusalNamesNoHostPath(t *testing.T) {
 	const podID = "pod-datavol-refusal"
 	logs := &lockedBuffer{}
-	cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	cfg := Config{Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
 	rt := newTestRuntimeCfg(t, cfg, Deps{})
 	box := hostBinBox(rt, podID)
 	box.SandboxProfile.DataVolumePath = "/tmp/elsewhere"
@@ -211,5 +257,71 @@ func TestMergeRunSpecUnknownErrorIsFixedSentence(t *testing.T) {
 	refusal := mergeRunSpecError(fmt.Errorf("%w: container main has no command", image.ErrRunSpecInvalid))
 	if got := startErrorReply(stageCreate, refusal); !strings.Contains(got, "has no command") {
 		t.Errorf("create reply %q lost the merge's refusal", got)
+	}
+}
+
+// TestUnwrappedErrorShapesCarryNoAbsolutePath holds the fail-closed rule for
+// every unwrapped error shape, not only the fixture path: neither renderer, at
+// either stage, matches any absolute host path, and both are the stage's fixed
+// sentence quoted.
+func TestUnwrappedErrorShapesCarryNoAbsolutePath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"path in the middle", fmt.Errorf("copy %s/rootfs/bin to /private/tmp/x failed: busy", unwrappedMarker)},
+		{"wrapped chain", fmt.Errorf("start: %w", fmt.Errorf("prepare: %w", fmt.Errorf("open %s/a: %w", unwrappedMarker, fs.ErrPermission)))},
+		{"os.PathError", &fs.PathError{Op: "open", Path: unwrappedMarker + "/rec", Err: fs.ErrNotExist}},
+		{"joined", errors.Join(errors.New("a"), &fs.PathError{Op: "stat", Path: "/etc/k3sm/key", Err: fs.ErrPermission})},
+		{"bare path", errors.New("/var/run/k3sm.sock")},
+	} {
+		for _, stage := range []failureStage{stageCreate, stageStart} {
+			want := strconv.Quote(stage.sentence())
+			for what, got := range map[string]string{
+				"reply":           startErrorReply(stage, tc.err),
+				"Waiting message": boundedFailureMessage(stage, tc.err),
+			} {
+				if m := absHostPath.FindString(got); m != "" {
+					t.Errorf("%s/%d %s %q matches absolute path %q", tc.name, stage, what, got, m)
+				}
+				if got != want {
+					t.Errorf("%s/%d %s = %s, want %s", tc.name, stage, what, got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestTenantTextReplyIsQuotedAndCapped asserts the exact quoted form of a
+// tenant-text reply and Waiting message, and the byte cap of each (1024 for
+// the reply, maxWaitingMessageBytes for the message) with its "..." tail.
+func TestTenantTextReplyIsQuotedAndCapped(t *testing.T) {
+	short := "say \"hi\"\nnext \u00e9"
+	err := fmt.Errorf("wrapped: %w", tenantText(errors.New(short)))
+	wantShort := strconv.QuoteToASCII(err.Error())
+	if !strings.HasPrefix(wantShort, `"`) || !strings.Contains(wantShort, `\"hi\"\n`) {
+		t.Fatalf("fixture quoted form %s is not what the test means to pin", wantShort)
+	}
+	if got := startErrorReply(stageStart, err); got != wantShort {
+		t.Errorf("reply = %s, want %s", got, wantShort)
+	}
+	if got := boundedFailureMessage(stageStart, err); got != wantShort {
+		t.Errorf("Waiting message = %s, want %s", got, wantShort)
+	}
+
+	if maxReplyMessageBytes != 1024 {
+		t.Fatalf("maxReplyMessageBytes = %d, the reply cap is 1024", maxReplyMessageBytes)
+	}
+	long := tenantText(errors.New(strings.Repeat("b", 5000)))
+	text := long.Error()
+	if got, want := startErrorReply(stageStart, long), strconv.QuoteToASCII(text[:1024])+"..."; got != want {
+		t.Errorf("capped reply is %d bytes, want exactly the quoted first 1024 bytes plus ...: %d bytes", len(got), len(want))
+	}
+	if got, want := boundedFailureMessage(stageStart, long), strconv.QuoteToASCII(text[:maxWaitingMessageBytes])+"..."; got != want {
+		t.Errorf("capped Waiting message is %d bytes, want %d", len(got), len(want))
+	}
+	exact := tenantText(errors.New(strings.Repeat("c", 1024)))
+	if got, want := startErrorReply(stageStart, exact), strconv.Quote(exact.Error()); got != want {
+		t.Errorf("a reply of exactly 1024 bytes was capped: %d bytes", len(got))
 	}
 }
