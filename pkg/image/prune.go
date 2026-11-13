@@ -484,6 +484,14 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // next unlink: the pin set is a root set, and a short one would invert the
 // answer.
 //
+// ERROR CONTRACT: a non-nil report may accompany a non-nil error. An error
+// from a pin RE-read (after the batch's first read) returns the partial
+// report with it: its Removed, Deleted and DeletedBytes list exactly what
+// this call unlinked before the error, and nothing is unlinked after it. A
+// caller must still treat the call as failed. Every other error (bad
+// arguments, the blobs root, the first pin read) returns a nil report and
+// is raised before any unlink.
+//
 // When pinned is non-nil the executor also asks the cache's own lease table
 // (leaseHasLocked) about each entry's digest inside the critical section, and
 // keeps an entry a live lease names as ReasonKeptLeased. Both lease lookups
@@ -582,7 +590,7 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 				break
 			}
 			if pins, err = pinned(); err != nil {
-				return nil, fmt.Errorf("execute prune: %w", err)
+				return rep, fmt.Errorf("execute prune: %w", err)
 			}
 		}
 	}
