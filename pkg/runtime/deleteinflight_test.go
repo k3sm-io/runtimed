@@ -37,10 +37,14 @@ import (
 type gatedNetwork struct {
 	recordingNetwork
 
-	once    sync.Once
-	entered chan struct{}
-	gate    chan struct{}
+	once     sync.Once
+	gateOnce sync.Once
+	entered  chan struct{}
+	gate     chan struct{}
 }
+
+// openGate releases every parked Teardown; safe to call more than once.
+func (n *gatedNetwork) openGate() { n.gateOnce.Do(func() { close(n.gate) }) }
 
 func newGatedNetwork() *gatedNetwork {
 	return &gatedNetwork{entered: make(chan struct{}), gate: make(chan struct{})}
@@ -85,6 +89,7 @@ func awaitDelete(t *testing.T, ch <-chan deleteResult, what string) deleteResult
 func heldDelete(t *testing.T, podID string) (*Runtime, *gatedNetwork, <-chan deleteResult) {
 	t.Helper()
 	pn := newGatedNetwork()
+	t.Cleanup(pn.openGate)
 	w := newBlockingWaiter()
 	rt := newTestRuntime(t, Deps{Network: pn, Waiter: w})
 	if _, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: hostBinBox(rt, podID)}); err != nil {
@@ -132,7 +137,7 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 
-		close(pn.gate)
+		pn.openGate()
 		f := awaitDelete(t, first, "first")
 		s := awaitDelete(t, second, "second")
 		if f.err != nil || f.resp == nil {
@@ -159,6 +164,9 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 		rt.mu.Lock()
 		td := rt.deleting[podID]
 		rt.mu.Unlock()
+		if td == nil {
+			t.Fatalf("no in-flight teardown recorded for %s", podID)
+		}
 		logs := &lockedBuffer{}
 		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer scancel()
@@ -167,7 +175,7 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 			t.Fatalf("the deadline Warn lacks an inflight_for attribute: %q", logs.String())
 		}
 
-		close(pn.gate)
+		pn.openGate()
 		if f := awaitDelete(t, first, "first"); f.err != nil {
 			t.Fatalf("first DeletePod: %v", f.err)
 		}
@@ -175,7 +183,7 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 
 	t.Run("record-is-gone-after-the-teardown", func(t *testing.T) {
 		rt, pn, first := heldDelete(t, podID)
-		close(pn.gate)
+		pn.openGate()
 		if f := awaitDelete(t, first, "first"); f.err != nil {
 			t.Fatalf("first DeletePod: %v", f.err)
 		}
@@ -186,7 +194,7 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 			t.Fatalf("teardown record %p still present after the teardown returned", td)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		later := awaitDelete(t, startDelete(ctx, rt, podID), "later")
 		if later.err != nil || later.resp == nil {

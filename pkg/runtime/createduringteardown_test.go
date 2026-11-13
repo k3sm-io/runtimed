@@ -78,7 +78,7 @@ func TestCreatePodRefusedWhileTheSameIdIsTornDown(t *testing.T) {
 		t.Fatalf("after the refused create: creating = %d, registered = %v; want 0, false", creating, registered)
 	}
 
-	close(pn.gate)
+	pn.openGate()
 	if f := awaitDelete(t, first, "first"); f.err != nil {
 		t.Fatalf("DeletePod: %v", f.err)
 	}
