@@ -18,6 +18,8 @@ package runtime
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -152,6 +154,17 @@ func TestSecondDeletePodWaitsForTheFirstTeardown(t *testing.T) {
 		s := awaitDelete(t, startDelete(ctx, rt, podID), "second")
 		if code := status.Code(s.err); code != codes.DeadlineExceeded {
 			t.Fatalf("second DeletePod = (%v, %v), want a DeadlineExceeded status, not success", s.resp, s.err)
+		}
+
+		rt.mu.Lock()
+		td := rt.deleting[podID]
+		rt.mu.Unlock()
+		logs := &lockedBuffer{}
+		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer scancel()
+		_, _ = td.wait(sctx, slog.New(slog.NewTextHandler(logs, nil)), podID)
+		if !strings.Contains(logs.String(), "inflight_for=") {
+			t.Fatalf("the deadline Warn lacks an inflight_for attribute: %q", logs.String())
 		}
 
 		close(pn.gate)

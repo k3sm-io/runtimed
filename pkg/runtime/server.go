@@ -58,9 +58,10 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	// teardown removes the pod dir and releases the address by id alone, so a
 	// pod built now would lose both under it. Refuse without waiting and
 	// without creating anything; the caller retries once the delete is done.
-	if _, tearingDown := r.deleting[box.GetPodId()]; tearingDown {
+	if td, tearingDown := r.deleting[box.GetPodId()]; tearingDown {
 		r.mu.Unlock()
-		r.log.Warn("create refused: the pod's teardown is still running", "pod", box.GetPodId())
+		r.log.Warn("create refused: the pod's teardown is still running", "pod", box.GetPodId(),
+			"inflight_for", time.Since(td.started).Round(time.Millisecond))
 		return &runtimev1.CreatePodResponse{
 			Error: rpcStatus(codes.Unavailable,
 				"pod %s is still being deleted; retry the create after the delete completes", box.GetPodId()),
@@ -141,7 +142,7 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 	var td *podTeardown
 	if ok {
 		delete(r.pods, podID)
-		td = &podTeardown{done: make(chan struct{})}
+		td = &podTeardown{done: make(chan struct{}), started: time.Now()}
 		r.deleting[podID] = td
 	} else {
 		td = r.deleting[podID]
@@ -189,9 +190,11 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 // AFTER it observes done closed — the close is the happens-before edge, so
 // they need no lock of their own. A waiter holds no lock while it waits.
 type podTeardown struct {
-	done chan struct{}
-	resp *runtimev1.DeletePodResponse
-	err  error
+	// started is when the record was created; the Warn lines report how long ago.
+	started time.Time
+	done    chan struct{}
+	resp    *runtimev1.DeletePodResponse
+	err     error
 	// waiters counts the DeletePods that have started waiting on this
 	// teardown. It is read only by tests, as the signal that a waiter is
 	// parked.
@@ -208,7 +211,8 @@ func (td *podTeardown) wait(ctx context.Context, log *slog.Logger, podID string)
 		return td.resp, td.err
 	case <-ctx.Done():
 		log.Warn("DeletePod ended before the pod's teardown in flight finished",
-			"pod", podID, "err", ctx.Err())
+			"pod", podID, "err", ctx.Err(),
+			"inflight_for", time.Since(td.started).Round(time.Millisecond))
 		return nil, status.FromContextError(ctx.Err()).Err()
 	}
 }
