@@ -28,7 +28,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 
 	"k3sm.io/runtimed/pkg/registryfetch"
@@ -144,7 +143,7 @@ func RemoteMirrorFetch(ctx context.Context, ref string, mirror Mirror, policy Pl
 	if err != nil {
 		return nil, err
 	}
-	return remoteFetch(ctx, r, ref, nil, policy, remote.WithTransport(registryTransport()))
+	return splitFetch(ctx, r, ref, nil, policy, registryTransport())
 }
 
 // MirrorBlobSourceFunc yields the direct blob route for ref on mirror, the
