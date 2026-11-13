@@ -84,8 +84,10 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 		{name: "ipv6 bracketed default port omitted", registry: "[::1]", insecure: true, scheme: "http", host: "[::1]:80", creds: true},
 		{name: "ipv6 bare request, bracketed registry", registry: "[::1]:5000", insecure: true, scheme: "http", host: "::1"},
 		// The standard library reads the unbracketed host "::1:5000" as hostname
-		// "::1" and port "5000" (asserted in the test body), the same endpoint
-		// as "[::1]:5000". Credentials sent there go to the registry itself.
+		// "::1" and port "5000" (both asserted in the test body). The split
+		// therefore routes it to the credential transport as the registry's own
+		// endpoint. No header is required on it, because the host string is not
+		// an exact match for the registry string.
 		{name: "ipv6 bare request with port form", registry: "[::1]:5000", insecure: true, scheme: "http", host: "::1:5000", creds: true},
 		{name: "default port written on request", registry: "registry.example", scheme: "https", host: "registry.example:443", creds: true},
 		{name: "default port written on registry", registry: "registry.example:443", scheme: "https", host: "registry.example", creds: true},
@@ -127,13 +129,17 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 			resp.Body.Close()
 			// The final (non-ping) request is the last one the inner transport saw.
 			inner.mu.Lock()
+			if len(inner.auth) == 0 {
+				inner.mu.Unlock()
+				t.Fatalf("registry %q, request %s://%s: the fake recorded no request", tc.registry, tc.scheme, tc.host)
+			}
 			lastAuth := inner.auth[len(inner.auth)-1]
 			inner.mu.Unlock()
-			// The library's basic-auth layer attaches the header only when the
-			// request host string equals the registry string exactly, so a row
-			// the split routes to the credential transport by canonical form
-			// (case, default port) still carries no header. The header is
-			// therefore required only for an exact textual match.
+			// Of the 9 rows that expect the credential route, the header is
+			// required only on 3 of 9: those whose request host string equals
+			// the registry string exactly, because the registry client library
+			// attaches the header only on an exact host string match. The other
+			// rows' route is shown by the kept challenge header alone.
 			sent := lastAuth != ""
 			if sent && !tc.creds {
 				t.Errorf("registry %q, request %s://%s: sends credentials to another origin (Authorization %q)",
