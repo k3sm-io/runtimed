@@ -620,6 +620,10 @@ func pullStatusError(err error) error {
 		// The image has no manifest for the platform asked for. Permanent for
 		// this (reference, platform) pair, and the operator can act on it.
 		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, image.ErrTooManyLayers), errors.Is(err, image.ErrManifestTooLarge):
+		// The manifest is over a node limit. Permanent for this digest: no
+		// retry shrinks it, so it is a precondition, not a transient fault.
+		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	return imageStatusError(err)
 }

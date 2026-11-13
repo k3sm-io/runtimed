@@ -191,6 +191,24 @@ func TestContainerStartFailureIsTypedByCause(t *testing.T) {
 			wantIs:    image.ErrNoPlatformMatch,
 		},
 		{
+			name: "manifest_over_the_layer_count_limit",
+			deps: Deps{Puller: &fakePuller{errByRef: map[string]error{
+				pullRef: fmt.Errorf("pull %q: %w", pullRef, image.ErrTooManyLayers),
+			}}},
+			container: pulledContainer("c", pullRef),
+			want:      runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+			wantIs:    image.ErrTooManyLayers,
+		},
+		{
+			name: "manifest_over_the_byte_cap",
+			deps: Deps{Puller: &fakePuller{errByRef: map[string]error{
+				pullRef: fmt.Errorf("pull %q: %w", pullRef, image.ErrManifestTooLarge),
+			}}},
+			container: pulledContainer("c", pullRef),
+			want:      runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+			wantIs:    image.ErrManifestTooLarge,
+		},
+		{
 			name: "the_registry_pull_failed",
 			deps: Deps{Puller: &fakePuller{errByRef: map[string]error{
 				pullRef: errors.New("manifest unknown: no such image"),

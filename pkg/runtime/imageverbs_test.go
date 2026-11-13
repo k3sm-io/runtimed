@@ -253,6 +253,8 @@ func TestPullImageDrivesTheDaemonsOwnPuller(t *testing.T) {
 			{"absent under a policy that forbids fetching", image.ErrImageNotPresent, codes.NotFound},
 			{"refused under disk pressure", image.ErrPullRefusedDiskPressure, codes.ResourceExhausted},
 			{"no manifest for the platform", image.ErrNoPlatformMatch, codes.FailedPrecondition},
+			{"manifest over the layer-count limit", image.ErrTooManyLayers, codes.FailedPrecondition},
+			{"manifest over the byte cap", image.ErrManifestTooLarge, codes.FailedPrecondition},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

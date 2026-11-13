@@ -2450,6 +2450,9 @@ func pullFailureReason(c *runtimev1.Container, err error) runtimev1.FailureReaso
 		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL
 	case errors.Is(err, image.ErrNoPlatformMatch):
 		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH
+	case errors.Is(err, image.ErrTooManyLayers), errors.Is(err, image.ErrManifestTooLarge):
+		// Terminal like a platform mismatch; the label is imperfect, and a purpose-built reason needs an apis change.
+		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH
 	default:
 		return runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL
 	}
