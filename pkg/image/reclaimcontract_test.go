@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"io/fs"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -91,8 +90,8 @@ func TestSpaceReclaimerHonoursDryRun(t *testing.T) {
 	if samples != 1 {
 		t.Fatalf("dry pass sampled free space %d times, want 1", samples)
 	}
-	if after := storeSnapshot(t, f.cache.root); !maps.Equal(before, after) {
-		t.Fatalf("dry pass changed the store:\nbefore %v\nafter  %v", before, after)
+	if d := snapshotDiff(before, storeSnapshot(t, f.cache.root)); len(d) > 0 {
+		t.Fatalf("dry pass changed the store:\n%s", strings.Join(d, "\n"))
 	}
 	if !f.exists(dig) {
 		t.Fatalf("dry pass removed %s", dig)
@@ -118,12 +117,17 @@ func TestSpaceReclaimerHonoursDryRun(t *testing.T) {
 	}
 }
 
-// storeSnapshot maps every node under root to its type, size and, for a
-// regular file, a hash of its content.
+// storeSnapshot maps every node under root to its fields, keyed "node field":
+// type, permission mode, size (non-directories), a content hash (regular
+// files) and the modification time in nanoseconds (read with Lstat so a
+// symlink's own time is used). The reclaim grace period reads mtimes, so a
+// pass that touched one would change later behaviour. Directory mtimes are
+// recorded too: a dry pass leaves them stable (checked), so a change is a
+// write into the store.
 func storeSnapshot(t *testing.T, root string) map[string]string {
 	t.Helper()
 	out := map[string]string{}
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -131,29 +135,49 @@ func storeSnapshot(t *testing.T, root string) map[string]string {
 		if err != nil {
 			return err
 		}
-		fi, err := d.Info()
+		fi, err := os.Lstat(p)
 		if err != nil {
 			return err
 		}
-		v := fi.Mode().Type().String()
+		out[rel+" type"] = fi.Mode().Type().String()
+		out[rel+" perm"] = strconv.FormatUint(uint64(fi.Mode().Perm()), 8)
+		if !fi.IsDir() {
+			out[rel+" size"] = strconv.FormatInt(fi.Size(), 10)
+		}
+		out[rel+" mtime"] = strconv.FormatInt(fi.ModTime().UnixNano(), 10)
 		if fi.Mode().IsRegular() {
 			buf, err := os.ReadFile(p)
 			if err != nil {
 				return err
 			}
 			sum := sha256.Sum256(buf)
-			v += " " + hex.EncodeToString(sum[:])
+			out[rel+" sha256"] = hex.EncodeToString(sum[:])
 		}
-		if !fi.IsDir() {
-			v += " " + strconv.FormatInt(fi.Size(), 10)
-		}
-		out[rel] = v
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walk store %s: %v", root, err)
 	}
 	return out
+}
+
+// snapshotDiff names every node and field that differs between two snapshots.
+func snapshotDiff(before, after map[string]string) []string {
+	var d []string
+	for k, v := range before {
+		if w, ok := after[k]; !ok {
+			d = append(d, k+": removed (was "+v+")")
+		} else if w != v {
+			d = append(d, k+": "+v+" -> "+w)
+		}
+	}
+	for k, w := range after {
+		if _, ok := before[k]; !ok {
+			d = append(d, k+": added ("+w+")")
+		}
+	}
+	slices.Sort(d)
+	return d
 }
 
 // skipLines returns the skipped-pod-dir warnings in a captured log, each
