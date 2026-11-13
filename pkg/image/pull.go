@@ -1116,7 +1116,7 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 		}
 		var wrote bool
 		if src != nil {
-			wrote, err = p.resumeBlob(ctx, *src, desc.Digest.String(), desc.Size, whole)
+			wrote, err = p.resumeBlob(ctx, *src, desc.Digest.String(), desc.Size, whole, lease)
 		} else {
 			wrote, err = p.writeBlob(desc.Digest.String(), desc.Size, whole)
 		}
@@ -1348,7 +1348,7 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 // empties the file it was handed, so a failed Remove still leaves a
 // zero-length partial that the next resume starts from byte 0, with no Range
 // header.
-func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
+func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error, lease *Lease) (wrote bool, err error) {
 	release, cerr := p.partials.Claim(digest)
 	if cerr != nil {
 		p.logger().Debug("layer partial not claimable; fetching it whole",
@@ -1373,7 +1373,7 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		Transfer: func(f *os.File, have int64) error {
 			reached = true
 			from = have
-			err := transferBlob(ctx, src, digest, size, f, have, p.stallWindow())
+			err := transferBlob(ctx, src, digest, size, f, have, p.stallWindow(), lease)
 			if errors.Is(err, registryfetch.ErrBlobRange) {
 				if terr := f.Truncate(0); terr != nil {
 					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
@@ -1383,6 +1383,9 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		},
 		CommitFile: func(f *os.File) error {
 			reached = true
+			// The bytes are all here; start the hash from a fresh TTL where the
+			// throttle allows, so a slow verify is not the reclaim window.
+			lease.Renew()
 			w, err := p.cache.CommitFromLocal(digest, size, &partialBlob{digest: digest, f: f})
 			switch {
 			case err == nil:
@@ -1405,6 +1408,7 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		},
 		Commit: func(replay func(io.Writer) error) error {
 			reached = true
+			lease.Renew()
 			w, err := p.cache.CommitBlob(digest, size, replay)
 			wrote = w
 			return err
@@ -1505,7 +1509,8 @@ func partialEnvErr(err error) bool {
 // CommitBlob or removes it. The body is read through the same progress
 // watchdog as a whole-layer fetch: a body that delivers no byte for window is
 // closed and the transfer fails with ErrLayerBodyStalled, keeping what arrived.
-func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64, window time.Duration) error {
+// Every read that returns bytes renews lease (nil-safe).
+func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64, window time.Duration, lease *Lease) error {
 	rc, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
 	if err != nil {
 		return fmt.Errorf("fetch blob %s from %d: %w", digest, have, err)
@@ -1525,7 +1530,9 @@ func transferBlob(ctx context.Context, src BlobSource, digest string, size int64
 	if _, err := f.Seek(have, io.SeekStart); err != nil {
 		return fmt.Errorf("seek partial %s: %w", digest, err)
 	}
-	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(body, size-have+1))
+	// Arriving bytes renew the pull's lease, as on the whole-layer path, so a
+	// resumed layer slower than the lease TTL keeps its protection.
+	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(lease.Reader(body), size-have+1))
 	serr := f.Sync()
 	if have+n > size {
 		_ = f.Truncate(0) // the overrun error is the one reported
