@@ -139,12 +139,17 @@ func (r *Reservation) Release() {
 //   - c.FloorBytes plus the held bytes plus c.Need above capacity is
 //     ErrInsufficientSpace with no pass: reclaim cannot free what in-flight
 //     pulls hold.
-//   - Otherwise a dry-run pass plans the eviction without unlinking. A plan
-//     error, or free space plus the planned bytes still short of the sum, is
+//   - Otherwise a dry-run pass plans the eviction without unlinking. Free
+//     space plus the planned bytes still short of the sum is
 //     ErrInsufficientSpace with no real pass, so a claim reclaim could not
 //     satisfy never empties the unreferenced cache. Only then does one real
 //     pass run, asked to bring free space up to the sum, and the check is
 //     repeated; still short is ErrInsufficientSpace.
+//   - A failed plan also runs no real pass. When ctx is done, or the plan's
+//     error is context.Canceled or context.DeadlineExceeded, the error wraps
+//     the context error and is not ErrInsufficientSpace. Any other plan error
+//     is a refusal that matches both ErrInsufficientSpace and the plan's own
+//     cause (for example ErrFreeSpaceUnknown), its text bounded by boundErr.
 //
 // Stated limit: the dry run skips the bound of released artifact records,
 // which the real pass runs on every pass, and those bytes are not in its
@@ -213,8 +218,18 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		dry.DryRun = true
 		plan, derr := c.Reclaimer.ReclaimUnderPressure(ctx, dry)
 		if derr != nil {
-			return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan failed: %v: %w",
-				c.Need, avail, c.FloorBytes, derr, ErrInsufficientSpace)
+			// A cancelled or expired context is the caller giving up, not a
+			// lack of space: report the context's error, not a refusal.
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan interrupted: %w",
+					c.Need, avail, c.FloorBytes, cerr)
+			}
+			if errors.Is(derr, context.Canceled) || errors.Is(derr, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan interrupted: %w",
+					c.Need, avail, c.FloorBytes, boundErr(derr))
+			}
+			return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan failed: %w: %w",
+				c.Need, avail, c.FloorBytes, boundErr(derr), ErrInsufficientSpace)
 		}
 		var reclaimable uint64
 		if plan != nil && plan.ReclaimedBytes > 0 {

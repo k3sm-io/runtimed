@@ -19,6 +19,7 @@ package image
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -489,14 +490,24 @@ func TestPullRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 // no real pass, so the unreferenced cache is not evicted for nothing; a claim
 // that fits exactly gets one real pass; a dry-run error refuses with no real
 // pass; and a claim past capacity only with the held bytes gets no pass at all.
+// A failed dry run keeps its cause: a cancelled context is the context's error
+// and not a lack of space, any other cause stays visible to errors.Is beside
+// ErrInsufficientSpace, and a long cause is rendered bounded.
 func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 	const floor, free, reclaimable, capacity = 100, 1_000, 2_000, 10_000
+	// The refusal's own text around the bounded cause is short; this slack
+	// covers it and the quoting boundErr adds.
+	const msgSlack = 256
 	for _, tc := range []struct {
 		name     string
 		need     uint64
 		held     uint64
+		cancel   bool
 		dryErr   error
 		wantErr  error
+		alsoErr  error
+		notErr   error
+		maxLen   int
 		wantDry  int32
 		wantReal int32
 	}{
@@ -504,13 +515,24 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 		{name: "exactly_reclaimable", need: free + reclaimable - floor, wantDry: 1, wantReal: 1},
 		{name: "dry_run_error", need: free, dryErr: errors.New("inventory: EIO"), wantErr: ErrInsufficientSpace, wantDry: 1},
 		{name: "above_capacity_with_held", need: capacity / 2, held: capacity/2 - floor + 1, wantErr: ErrInsufficientSpace},
+		{name: "dry_run_context_canceled", need: free, cancel: true, dryErr: context.Canceled,
+			wantErr: context.Canceled, notErr: ErrInsufficientSpace, wantDry: 1},
+		{name: "dry_run_free_space_unknown", need: free, dryErr: fmt.Errorf("%w: statfs: EIO", ErrFreeSpaceUnknown),
+			wantErr: ErrInsufficientSpace, alsoErr: ErrFreeSpaceUnknown, wantDry: 1},
+		{name: "dry_run_long_cause", need: free, dryErr: errors.New(strings.Repeat("x", 10*maxWrappedErrLen)),
+			wantErr: ErrInsufficientSpace, maxLen: maxWrappedErrLen + msgSlack, wantDry: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var avail atomic.Uint64
 			avail.Store(free)
 			ledger := &SpaceLedger{held: tc.held}
 			rec := &countingReclaimer{reclaimable: reclaimable, dryErr: tc.dryErr, free: &avail}
-			r, err := ledger.Reserve(context.Background(), SpaceClaim{
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			r, err := ledger.Reserve(ctx, SpaceClaim{
 				Need: tc.need, Path: t.TempDir(), FloorBytes: floor,
 				FreeBytes:  func(string) (uint64, error) { return avail.Load(), nil },
 				TotalBytes: fixedTotalBytes(capacity), Reclaimer: rec,
@@ -520,6 +542,15 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 			}
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Reserve error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.alsoErr != nil && !errors.Is(err, tc.alsoErr) {
+				t.Errorf("Reserve error = %v, want it to also match %v", err, tc.alsoErr)
+			}
+			if tc.notErr != nil && errors.Is(err, tc.notErr) {
+				t.Errorf("Reserve error = %v, must not match %v", err, tc.notErr)
+			}
+			if tc.maxLen > 0 && len(err.Error()) > tc.maxLen {
+				t.Errorf("Reserve error is %d bytes, want at most %d", len(err.Error()), tc.maxLen)
 			}
 			if got := rec.dry.Load(); got != tc.wantDry {
 				t.Errorf("dry-run passes = %d, want %d", got, tc.wantDry)
