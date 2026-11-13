@@ -41,6 +41,8 @@ import (
 // second call for a live pod returns the current status as a no-op. On failure it
 // returns a structured google.rpc.Status plus a typed FailureReason; the RPC
 // itself returns (response, nil) so the typed failure crosses the wire.
+// Reason ALREADY_EXISTS with code Unavailable means the id is still being torn
+// down: retry.
 func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	box := req.GetPod()
 	if reason, err := r.validatePodBox(box); err != nil {
@@ -58,6 +60,7 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 	// without creating anything; the caller retries once the delete is done.
 	if _, tearingDown := r.deleting[box.GetPodId()]; tearingDown {
 		r.mu.Unlock()
+		r.log.Warn("create refused: the pod's teardown is still running", "pod", box.GetPodId())
 		return &runtimev1.CreatePodResponse{
 			Error: rpcStatus(codes.Unavailable,
 				"pod %s is still being deleted; retry the create after the delete completes", box.GetPodId()),
@@ -219,9 +222,10 @@ func errTeardownIncomplete(podID string) error {
 // finishTeardown publishes a teardown's result to its waiters and retires the
 // record. completed is false when the teardown did not return normally; the
 // waiters then get errTeardownIncomplete in place of resp and err. It removes
-// the map entry only if it is still this teardown's: a CreatePod may
-// re-register the id while the teardown runs, and that pod's own DeletePod
-// then owns the entry.
+// the map entry only if it is still this teardown's. CreatePod refuses an id
+// whose teardown is running, so the entry cannot be replaced meanwhile; the
+// identity check stays as a cheap defensive guard against deleting another
+// teardown's record.
 func (r *Runtime) finishTeardown(podID string, td *podTeardown, resp *runtimev1.DeletePodResponse, err error, completed bool) {
 	if !completed {
 		resp, err = nil, errTeardownIncomplete(podID)
