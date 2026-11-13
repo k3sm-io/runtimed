@@ -105,10 +105,11 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 	// releases it; nothing here depends on how long the stall lasts.
 	release := make(chan struct{})
 	sent := make(chan struct{})
+	var sentOnce sync.Once // a retried GET reruns the handler; close(sent) must not panic
 	ref := layerBodyServer(t, func(w http.ResponseWriter, r *http.Request, layer []byte) {
 		_, _ = w.Write(layer[:16])
 		w.(http.Flusher).Flush()
-		close(sent)
+		sentOnce.Do(func() { close(sent) })
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -151,8 +152,10 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 	if !errors.Is(got.err, ErrLayerBodyStalled) {
 		t.Fatalf("Pull error = %v, want ErrLayerBodyStalled", got.err)
 	}
-	// The server wrote and flushed the 16 bytes before the pull failed, so the
-	// abort came from silence after data, not from a stall before any byte.
+	// The server wrote and flushed the 16 bytes before the pull failed. This
+	// shows only the server side: the test has no non-test-code view of what the
+	// client's reader received, so it cannot prove the abort came from silence
+	// after data rather than a stall before the bytes arrived.
 	select {
 	case <-sent:
 	default:
