@@ -24,8 +24,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -135,6 +141,60 @@ func pushManyLayerImage(t *testing.T, host, repo string, img ggcrv1.Image) strin
 		t.Fatalf("put manifest %s: %v", ref, err)
 	}
 	return ref.String()
+}
+
+// manifestCountingProxy fronts a registry and counts the GET and HEAD requests
+// for any manifest, which blobCountingRegistry never sees: a warm error that
+// made no registry request leaves this at zero.
+type manifestCountingProxy struct {
+	host      string
+	manifests atomic.Int64
+}
+
+func newManifestCountingProxy(t *testing.T, upstreamHost string) *manifestCountingProxy {
+	t.Helper()
+	p := &manifestCountingProxy{}
+	rp := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: upstreamHost})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if (req.Method == http.MethodGet || req.Method == http.MethodHead) && strings.Contains(req.URL.Path, "/manifests/") {
+			p.manifests.Add(1)
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse proxy url %q: %v", srv.URL, err)
+	}
+	p.host = u.Host
+	return p
+}
+
+// recordingHandler is a slog handler that keeps every record's message.
+type recordingHandler struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Level.String()+" "+r.Message)
+	return nil
+}
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordingHandler) has(msg string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range h.msgs {
+		if m == msg {
+			return true
+		}
+	}
+	return false
 }
 
 // storeBlobCount is how many regular files the content store holds.
@@ -262,8 +322,9 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 		for _, served := range cases {
 			t.Run(fmt.Sprintf("IfNotPresent, registry serves %d layers", served.layers), func(t *testing.T) {
 				reg := newBlobCountingRegistry(t)
+				proxy := newManifestCountingProxy(t, reg.host)
 				img := layerLimitImage(t, served.layers)
-				ref := pushManyLayerImage(t, reg.host, "many", img)
+				ref := pushManyLayerImage(t, proxy.host, "many", img)
 				mfst, err := img.Manifest()
 				if err != nil {
 					t.Fatal(err)
@@ -275,15 +336,25 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 				idx := &fakeIndex{entries: map[string]*runtimev1.ImageManifest{}}
 				overLimitEntry(t, cache, idx, ref)
 				reg.reset()
+				proxy.manifests.Store(0)
 				obs := newAcquireObserver(cache)
+				logs := &recordingHandler{}
 				p, err := NewPuller(cache, RemoteFetch, idx,
-					WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(obs.ledger))
+					WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(obs.ledger),
+					WithPullLogger(slog.New(logs)))
 				if err != nil {
 					t.Fatal(err)
 				}
 				res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT)
 				if _, kept := idx.entries[ref]; !kept {
 					t.Fatalf("index entry %s was deleted", ref)
+				}
+				if !logs.has("WARN stored image entry is over the manifest limit; treating it as a miss") {
+					t.Errorf("no warn line for the skipped warm entry; got %q", logs.msgs)
+				}
+				// Proof the cold path ran: the warm skip makes no request.
+				if n := proxy.manifests.Load(); n == 0 {
+					t.Errorf("registry saw %d manifest requests, want > 0 from the cold path", n)
 				}
 				if !served.refused {
 					if err != nil {
@@ -320,6 +391,9 @@ func TestPullRefusesAManifestOverTheLayerLimit(t *testing.T) {
 				obs.requireNoneAcquired(t)
 				if idx.records != 0 {
 					t.Errorf("index recorded %d times after the refusal, want 0", idx.records)
+				}
+				if n := len(idx.entries[ref].GetLayers()); n != MaxManifestLayers+1 {
+					t.Errorf("stored entry has %d layers after the refusal, want its original %d", n, MaxManifestLayers+1)
 				}
 			})
 		}
