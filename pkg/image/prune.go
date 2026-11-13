@@ -573,7 +573,8 @@ type pruneHooks struct {
 	// outcome whatever the hook returns. remove is safe to call more than
 	// once: later calls return the first call's result and touch nothing. A
 	// hook MUST delete only through remove, so it cannot unlink outside the
-	// blobs root. A false removed with a nil error
+	// blobs root. remove must be called synchronously, before unlink
+	// returns, and not from another goroutine. A false removed with a nil error
 	// records the blob as skipped with reason; an error records it as skipped
 	// with the error, exactly as a failed root.Remove. A true removed is not
 	// trusted: the executor re-checks the path through the root handle and
@@ -861,6 +862,16 @@ func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Du
 		return
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		refuse(d, fmt.Sprintf("remove: verify: %v", err), failed(d))
+		return
+	}
+	// The blob is gone, but only the executor's own successful remove counts
+	// as a deletion: one that vanished by another hand removed nothing here.
+	if !called {
+		refuse(d, "remove: unlink reported removed but never removed the blob", failed(d))
+		return
+	}
+	if removeErr != nil {
+		refuse(d, fmt.Sprintf("remove: unlink reported removed but remove failed: %v", removeErr), failed(d))
 		return
 	}
 	rep.Deleted++

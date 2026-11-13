@@ -711,3 +711,46 @@ func TestEvictRemoveIsIdempotent(t *testing.T) {
 		})
 	}
 }
+
+// TestEvictHookRemovingItselfIsAFailure pins that a deletion is counted only
+// when the executor's own remove ran and succeeded: a hook that unlinks the
+// blob behind remove's back and reports removed=true is a failed removal, not
+// a deletion of size 0.
+func TestEvictHookRemovingItselfIsAFailure(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	b := f.blob("self-removed", time.Hour)
+	nodes, err := f.cache.EnumerateBlobs()
+	if err != nil {
+		t.Fatalf("EnumerateBlobs: %v", err)
+	}
+	plan, err := PlanPrune(nodes, nil, nil, nil, time.Minute, f.clock)
+	if err != nil {
+		t.Fatalf("PlanPrune: %v", err)
+	}
+	hooks := &pruneHooks{unlink: func(digest string, _ func() error) (bool, evictReason, error) {
+		p, err := f.cache.BlobPath(digest)
+		if err != nil {
+			return false, "", err
+		}
+		return true, "", os.Remove(p)
+	}}
+	rep, err := f.cache.executePrune(plan, time.Minute, f.clock, nil, hookedMode(hooks))
+	if err != nil {
+		t.Fatalf("executePrune: %v", err)
+	}
+	if rep.Deleted != 0 || rep.DeletedBytes != 0 || len(rep.Removed) != 0 {
+		t.Errorf("Deleted = %d, DeletedBytes = %d, Removed = %v; want 0, 0, empty", rep.Deleted, rep.DeletedBytes, rep.Removed)
+	}
+	if len(rep.Skipped) != 1 || rep.Skipped[0].Digest != b {
+		t.Fatalf("Skipped = %+v; want exactly %s", rep.Skipped, b)
+	}
+	s := rep.Skipped[0]
+	if want := "remove: unlink reported removed but never removed the blob"; s.Reason != want {
+		t.Errorf("Reason = %q; want %q", s.Reason, want)
+	}
+	want := SkipRefusal{Digest: b, Kind: RefusedRemoveFailed, Reason: EvictKeptUnlinkFailed}
+	if s.Refusal == nil || *s.Refusal != want {
+		t.Errorf("Refusal = %+v; want %+v", s.Refusal, want)
+	}
+}
