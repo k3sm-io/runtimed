@@ -52,6 +52,18 @@ func (r *Runtime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest
 		r.mu.Unlock()
 		return &runtimev1.CreatePodResponse{Status: r.podStatus(existing)}, nil
 	}
+	// An earlier DeletePod of this id is still tearing it down, and that
+	// teardown removes the pod dir and releases the address by id alone, so a
+	// pod built now would lose both under it. Refuse without waiting and
+	// without creating anything; the caller retries once the delete is done.
+	if _, tearingDown := r.deleting[box.GetPodId()]; tearingDown {
+		r.mu.Unlock()
+		return &runtimev1.CreatePodResponse{
+			Error: rpcStatus(codes.Unavailable,
+				"pod %s is still being deleted; retry the create after the delete completes", box.GetPodId()),
+			FailureReason: runtimev1.FailureReason_FAILURE_REASON_ALREADY_EXISTS,
+		}, nil
+	}
 	// Mark the create in flight until the pod is registered or has failed, so
 	// the image GC never reads its half-built dir as an untracked one
 	// (podUntracked).
