@@ -61,10 +61,15 @@ type tickingBody struct {
 	chunks [][]byte
 	clock  *leaseClock
 	step   time.Duration
+	// eofStep is added to the clock on the zero-byte EOF read, which renews
+	// nothing: time passes after the last arriving bytes and before commit.
+	eofStep time.Duration
 }
 
 func (b *tickingBody) Read(p []byte) (int, error) {
 	if len(b.chunks) == 0 {
+		b.clock.advance(b.eofStep)
+		b.eofStep = 0
 		return 0, io.EOF
 	}
 	b.clock.advance(b.step)
@@ -88,6 +93,8 @@ type rangedStub struct {
 	chunk int
 	clock *leaseClock
 	step  time.Duration
+	// eofStep: see tickingBody.eofStep.
+	eofStep time.Duration
 }
 
 func (s *rangedStub) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -112,7 +119,7 @@ func (s *rangedStub) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp.Header.Set("Content-Range", "bytes "+strconv.FormatInt(s.have, 10)+"-"+
 		strconv.FormatInt(size-1, 10)+"/"+strconv.FormatInt(size, 10))
 	resp.ContentLength = size - s.have
-	resp.Body = &tickingBody{chunks: chunks, clock: s.clock, step: s.step}
+	resp.Body = &tickingBody{chunks: chunks, clock: s.clock, step: s.step, eofStep: s.eofStep}
 	return resp, nil
 }
 
@@ -189,5 +196,77 @@ func TestResumedTransferRenewsThePullLease(t *testing.T) {
 	}
 	if !cache.leaseHas(digest) {
 		t.Fatalf("the pull lease lapsed during a resumed transfer of %v (TTL %v)", clock.now().Sub(start), ttl)
+	}
+}
+
+// TestResumedCommitRenewsThePullLease pins that the commit callbacks of the
+// resume path renew the lease before hashing: time that passes after the last
+// arriving bytes (the zero-byte EOF read renews nothing) is covered by a
+// renewal at the start of the commit, on the clone route.
+func TestResumedCommitRenewsThePullLease(t *testing.T) {
+	{
+		t.Run("clone", func(t *testing.T) {
+			const (
+				ttl   = time.Minute
+				have  = 1024
+				chunk = 1024
+			)
+			body := bytes.Repeat([]byte("resumed-layer-"), (have+chunk)/14+1)[:have+chunk]
+			sum := sha256.Sum256(body)
+			digest := "sha256:" + hex.EncodeToString(sum[:])
+
+			cache, err := NewCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock := &leaseClock{t: time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)}
+			cache.now = clock.now
+
+			dir := filepath.Join(t.TempDir(), "partials")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			h, err := ggcrv1.NewHash(digest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(partialPath(dir, h), body[:have], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fetch := func(context.Context, string, *RegistryCredential, PlatformPolicy) (ggcrv1.Image, error) {
+				t.Error("the manifest fetcher was called")
+				return nil, io.ErrUnexpectedEOF
+			}
+			p, err := NewPuller(cache, fetch, NoLocalIndex{},
+				WithFreeBytes(fixedFreeBytes(64<<30)),
+				WithPartialStore(&registryfetch.PartialStore{Dir: dir}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			eof := ttl/4 + time.Second // past the throttle, well inside the TTL
+			src := BlobSource{
+				Ref: "stub.invalid/test/app:v1",
+				Registry: registryfetch.Registry{
+					Transport: &rangedStub{t: t, body: body, have: have, chunk: chunk, clock: clock, step: time.Second, eofStep: eof},
+					PlainHTTP: true,
+				},
+			}
+
+			lease := cache.AcquireLease([]string{digest}, ttl)
+			defer lease.Release()
+			whole := func(io.Writer) error {
+				t.Error("the resumable layer was fetched whole")
+				return io.ErrUnexpectedEOF
+			}
+			if _, err := p.resumeBlob(context.Background(), src, digest, int64(len(body)), whole, lease); err != nil {
+				t.Fatalf("resumeBlob: %v", err)
+			}
+			cache.leaseMu.Lock()
+			expires := lease.expires
+			cache.leaseMu.Unlock()
+			if want := clock.now().Add(ttl); !expires.Equal(want) {
+				t.Fatalf("lease expires %v after the commit, want %v (renewed at commit start)", expires.Sub(clock.now()), ttl)
+			}
+		})
 	}
 }
