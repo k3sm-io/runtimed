@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,7 +38,9 @@ func padJSON(t *testing.T, doc string, size int) []byte {
 	if len(doc) > size {
 		t.Fatalf("document is %d bytes, larger than the %d asked for", len(doc), size)
 	}
-	return append([]byte(doc), bytes.Repeat([]byte(" "), size-len(doc))...)
+	buf := bytes.Repeat([]byte(" "), size)
+	copy(buf, doc)
+	return buf
 }
 
 // recordCapIndexEntry records a small valid index entry and returns its path.
@@ -72,7 +75,6 @@ func TestRecordReadsEnforceTheirOwnCap(t *testing.T) {
 	t.Parallel()
 
 	t.Run("pod references at the cap", func(t *testing.T) {
-		t.Parallel()
 		path := filepath.Join(t.TempDir(), PodReferencesName)
 		if err := os.WriteFile(path, padJSON(t, `{}`, maxPodReferencesBytes), 0o600); err != nil {
 			t.Fatal(err)
@@ -82,14 +84,39 @@ func TestRecordReadsEnforceTheirOwnCap(t *testing.T) {
 		}
 	})
 	t.Run("pod references one byte over the cap", func(t *testing.T) {
-		t.Parallel()
 		path := filepath.Join(t.TempDir(), PodReferencesName)
 		if err := os.WriteFile(path, padJSON(t, `{}`, maxPodReferencesBytes+1), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		err := checkPodReferences(path)
-		if err == nil || !strings.Contains(err.Error(), "exceeds") {
-			t.Fatalf("checkPodReferences one over = %v; want a refusal saying it exceeds the cap", err)
+		want := fmt.Sprintf("exceeds %d bytes", maxPodReferencesBytes)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("checkPodReferences one over = %v; want a refusal containing %q", err, want)
+		}
+	})
+
+	t.Run("bounded read", func(t *testing.T) {
+		t.Parallel()
+		const limit = 1024
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "at"), bytes.Repeat([]byte("x"), limit), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "over"), bytes.Repeat([]byte("x"), limit+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		buf, err := readAnchored(root, "at", limit)
+		if err != nil || len(buf) != limit {
+			t.Fatalf("readAnchored at the limit = (%d bytes, %v); want all %d bytes", len(buf), err, limit)
+		}
+		want := fmt.Sprintf("exceeds %d bytes", limit)
+		if _, err := readAnchored(root, "over", limit); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("readAnchored one over = %v; want a refusal containing %q", err, want)
 		}
 	})
 
@@ -103,7 +130,6 @@ func TestRecordReadsEnforceTheirOwnCap(t *testing.T) {
 		return idx, filepath.Join(idx.dir, ArtifactIndexSubdir, artifactEntryName(key))
 	}
 	t.Run("artifact record at the cap", func(t *testing.T) {
-		t.Parallel()
 		idx, path := artifactPath(t, "k")
 		if err := os.WriteFile(path, padJSON(t, `{}`, MaxArtifactRecordBytes), 0o600); err != nil {
 			t.Fatal(err)
@@ -113,8 +139,9 @@ func TestRecordReadsEnforceTheirOwnCap(t *testing.T) {
 			t.Fatalf("ArtifactRecord at the cap = (%d bytes, %v, %v); want the whole record", len(buf), ok, err)
 		}
 	})
+	// Pins the caller-visible refusal from the size pre-check; the read's own
+	// bound is pinned by the "bounded read" row below.
 	t.Run("artifact record one byte over the cap", func(t *testing.T) {
-		t.Parallel()
 		idx, path := artifactPath(t, "k")
 		if err := os.WriteFile(path, padJSON(t, `{}`, MaxArtifactRecordBytes+1), 0o600); err != nil {
 			t.Fatal(err)
