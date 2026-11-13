@@ -550,8 +550,10 @@ func evictPrune(hooks *pruneHooks) pruneMode {
 }
 
 // pruneHooks are the seams of executePrune's eviction mode (evictPrune). A
-// nil field leaves that seam out: no guard drops anything, and a blob that
-// passes re-verification is removed with a plain Remove.
+// nil guard drops nothing. unlink is REQUIRED: executePrune refuses evict mode
+// with a nil unlink before taking any lock, because the eviction body does its
+// Lstat and grace check outside leaseMu and relies on unlink to re-check roots
+// and leases at unlink time.
 type pruneHooks struct {
 	// guard, when non-nil, runs once per call inside pruneMu, before the
 	// unlink loop. Every digest in the returned set is skipped rather than
@@ -559,7 +561,7 @@ type pruneHooks struct {
 	// the call with nothing unlinked.
 	guard func() (drop map[string]evictReason, err error)
 
-	// unlink, when non-nil, decides the removal of one blob that passed
+	// unlink (required, see above) decides the removal of one blob that passed
 	// re-verification. remove is root.Remove bound to that blob's path under
 	// the executor's *os.Root; a hook MUST delete only through remove, so it
 	// cannot unlink outside the blobs root. A false removed with a nil error
@@ -652,6 +654,12 @@ func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time
 	case pruneModeEvict:
 		if hooks == nil || pinned != nil {
 			return nil, errors.New("execute prune: evict mode takes hooks and no pin set")
+		}
+		if hooks.unlink == nil {
+			// Lstat and the grace check run outside leaseMu; only the unlink
+			// hook re-checks roots and leases at unlink time. Without it the
+			// body would be a bare Remove racing a lease.
+			return nil, errors.New("execute prune: evict mode requires an unlink hook")
 		}
 	default:
 		return nil, fmt.Errorf("execute prune: unknown mode %d", mode.kind)
@@ -746,8 +754,8 @@ const maxPruneRepins = 3
 
 // executeHookedEntry is the eviction executor's per-entry body (pruneHooks
 // non-nil): grammar, Lstat, regularity and grace re-verification, then the
-// unlink hook (which takes leaseMu itself) or a plain Remove, with the typed
-// refusals the eviction reports.
+// unlink hook (which takes leaseMu itself; executePrune guarantees it is
+// non-nil), with the typed refusals the eviction reports.
 func (c *Cache) executeHookedEntry(root *os.Root, d PruneDecision, grace time.Duration, now time.Time, hooks *pruneHooks, rep *ExecuteReport, skip func(PruneDecision, string), refuse func(PruneDecision, string, *SkipRefusal), failed func(PruneDecision) *SkipRefusal) {
 	rel := d.Node.Path
 	if cls, _ := classifyBlobRel(rel); cls == relInvalid {

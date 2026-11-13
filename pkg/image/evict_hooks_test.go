@@ -414,6 +414,16 @@ func hookedMode(h *pruneHooks) pruneMode {
 	if h == nil {
 		return plainPrune()
 	}
+	if h.unlink == nil {
+		// Eviction requires an unlink hook; a case that exercises only the
+		// guard gets an explicit pass-through, equivalent to the old bare Remove.
+		c := *h
+		c.unlink = func(_ string, remove func() error) (bool, evictReason, error) {
+			err := remove()
+			return err == nil, "", err
+		}
+		h = &c
+	}
 	return evictPrune(h)
 }
 
@@ -513,11 +523,13 @@ func TestUnlinkUnlessLeasedTypedRefusal(t *testing.T) {
 func TestExecutePruneModeMismatch(t *testing.T) {
 	t.Parallel()
 	pinned := func() (map[string]PruneReason, error) { return nil, nil }
+	passUnlink := func(_ string, remove func() error) (bool, evictReason, error) { return remove() == nil, "", nil }
 	for name, m := range map[string]pruneMode{
 		"pressure without pins": {kind: pruneModePressure},
 		"evict without hooks":   {kind: pruneModeEvict},
 		"plain with hooks":      {kind: pruneModePlain, hooks: &pruneHooks{}},
-		"evict with pins":       {kind: pruneModeEvict, hooks: &pruneHooks{}, pinned: pinned},
+		"evict with pins":       {kind: pruneModeEvict, hooks: &pruneHooks{unlink: passUnlink}, pinned: pinned},
+		"evict without unlink":  {kind: pruneModeEvict, hooks: &pruneHooks{}},
 		"unknown kind":          {kind: 9},
 	} {
 		t.Run(name, func(t *testing.T) {
