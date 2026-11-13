@@ -19,8 +19,11 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -355,4 +358,72 @@ func TestGracefulStopAwaitsReaperObservation(t *testing.T) {
 			t.Errorf("terminated (code=%d sig=%d), want (137, 9): the container was SIGKILLed, and that is what its status must say", code, sig)
 		}
 	})
+}
+
+// TestGracefulStopKillsWhenTheFirstSignalFails pins what a failed graceful
+// (first) send does. A group the send could not reach for any reason other
+// than being gone (EPERM, a refused guard) may still be alive, so the stop must
+// escalate to killSig rather than return and leave it running; a group that is
+// already gone (ESRCH) must not be signalled again, because its pgid may be
+// reused.
+func TestGracefulStopKillsWhenTheFirstSignalFails(t *testing.T) {
+	const pgid = 4242
+	term, kill := os.Interrupt, os.Kill
+
+	for _, tc := range []struct {
+		name     string
+		termErr  error
+		wantSent []os.Signal
+		wantEsc  bool
+		wantErr  error // nil: no error expected
+	}{
+		{name: "eperm-escalates-to-sigkill", termErr: syscall.EPERM, wantSent: []os.Signal{term, kill}, wantEsc: true, wantErr: syscall.EPERM},
+		{name: "esrch-sends-nothing-more", termErr: syscall.ESRCH, wantSent: []os.Signal{term}, wantEsc: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exited := make(chan struct{})
+			var closeOnce sync.Once
+			markExited := func() { closeOnce.Do(func() { close(exited) }) }
+			if tc.termErr == syscall.ESRCH {
+				markExited() // the group is gone: the reaper reports its exit
+			}
+			rec := &recordingSignaller{}
+			signal := func(g int, sig os.Signal) error {
+				_ = rec.signal(g, sig)
+				if sig == term {
+					return fmt.Errorf("kill process group %d: %w", g, tc.termErr)
+				}
+				markExited() // SIGKILL lands; the reaper observes the exit
+				return nil
+			}
+			// A long grace: the failed first send must not spend it.
+			done := make(chan struct{})
+			var esc, obs bool
+			var err error
+			go func() {
+				esc, obs, err = GracefulStop(context.Background(), pgid, 10*time.Second, exited, term, kill, signal, 5*time.Second)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("GracefulStop spent the grace after the first send failed")
+			}
+			if got := rec.signals(); !slices.Equal(got, tc.wantSent) {
+				t.Errorf("signals = %v, want %v", got, tc.wantSent)
+			}
+			if esc != tc.wantEsc {
+				t.Errorf("escalated = %v, want %v", esc, tc.wantEsc)
+			}
+			if !obs {
+				t.Error("observed = false, want true (the exit was reported)")
+			}
+			switch {
+			case tc.wantErr == nil && err != nil:
+				t.Errorf("err = %v, want nil (an already-gone group is not a failure)", err)
+			case tc.wantErr != nil && !errors.Is(err, tc.wantErr):
+				t.Errorf("err = %v, want it to wrap %v", err, tc.wantErr)
+			}
+		})
+	}
 }

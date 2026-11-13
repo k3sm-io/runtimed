@@ -18,7 +18,9 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"os"
+	"syscall"
 	"time"
 )
 
@@ -46,6 +48,10 @@ const DefaultExitObservationGrace = 2 * time.Second
 //     returns WITHOUT sending killSig — the reaper already collected the status,
 //     so there is no double-kill and no leaked timer. On the deadline (or ctx
 //     cancellation) it escalates to killSig.
+//   - termSig send fails: ESRCH (the group is gone) sends nothing more and is
+//     not an error. Any other error escalates to killSig at once, and the send
+//     error is returned alongside escalated == true and the observed result, so
+//     a non-nil err no longer means "nothing was killed".
 //
 // EVERY path that sends killSig then WAITS for the reaper's exit observation,
 // bounded by exitWait (<= 0 selects DefaultExitObservationGrace), and reports
@@ -79,8 +85,21 @@ func GracefulStop(ctx context.Context, pgid int, grace time.Duration, exited <-c
 		}
 		return true, awaitExit(exited, exitWait), nil
 	}
-	if err := signal(pgid, termSig); err != nil {
-		return false, false, err
+	if termErr := signal(pgid, termSig); termErr != nil {
+		if errors.Is(termErr, syscall.ESRCH) {
+			// The group is already gone: not a failure, and its pgid may already
+			// name someone else's group, so nothing more is sent to it. Only the
+			// reaper's report of the exit is waited for.
+			return false, awaitExit(exited, exitWait), nil
+		}
+		// Any other failure (EPERM, EINVAL, a refused guard) leaves the group's
+		// fate unknown: it may be alive. Escalate now rather than spend the
+		// grace on a signal that never arrived, and return termErr joined with
+		// the kill outcome so the caller still sees escalated and observed.
+		if err := signal(pgid, killSig); err != nil {
+			return true, false, errors.Join(termErr, err)
+		}
+		return true, awaitExit(exited, exitWait), termErr
 	}
 	t := time.NewTimer(grace)
 	defer t.Stop() // stop the timer on every path (incl. early exit) — no leak

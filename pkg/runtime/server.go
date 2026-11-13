@@ -340,9 +340,10 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 			if err != nil {
 				r.log.Warn("graceful stop pod group", "pod", podID, "pid", pid, "err", err)
 			}
-			// Diagnostic: escalated=true means the grace timer fired (SIGTERM did NOT
-			// cause an exit → SIGKILL); escalated=false means the process exited within
-			// grace (SIGTERM honored). Localizes a slow delete to runtimed vs the caller.
+			// Diagnostic: escalated=true means SIGKILL was sent — the grace timer fired
+			// (SIGTERM did NOT cause an exit), or the SIGTERM send failed (err above);
+			// escalated=false means the process exited within grace (SIGTERM honored).
+			// Localizes a slow delete to runtimed vs the caller.
 			r.log.Info("pod container graceful-stop outcome",
 				"pod", podID, "pid", pid, "grace", s.grace.String(), "escalated", escalated)
 			// observed=false means the reaper did not report the exit within the
