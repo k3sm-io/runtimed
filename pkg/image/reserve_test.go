@@ -601,13 +601,17 @@ type shortPassReclaimer struct {
 	freed     uint64
 	realErr   error
 	free      *atomic.Uint64
+	// dryCfg and realCfg are the configs of the last dry and real pass.
+	dryCfg, realCfg ReclaimConfig
 }
 
 func (c *shortPassReclaimer) ReclaimUnderPressure(_ context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
 	if cfg.DryRun {
+		c.dryCfg = cfg
 		c.dry.Add(1)
 		return &ReclaimReport{DryRun: true, ReclaimedBytes: c.planned}, nil
 	}
+	c.realCfg = cfg
 	c.real.Add(1)
 	c.free.Add(c.freed)
 	return &ReclaimReport{ReclaimedBytes: int64(c.freed)}, c.realErr
@@ -649,6 +653,20 @@ func TestReserveRealPassShortOfPlanRefusesAfterOnePass(t *testing.T) {
 			}
 			if got := rec.real.Load(); got != 1 {
 				t.Errorf("real reclaim passes = %d, want exactly 1", got)
+			}
+			// The ledger held nothing before this claim, so the free space the
+			// claim needs is the floor plus its own need.
+			const want = uint64(floor + need)
+			if !rec.dryCfg.DryRun {
+				t.Errorf("dry pass config DryRun = false, want true")
+			}
+			if rec.realCfg.DryRun {
+				t.Errorf("real pass config DryRun = true, want false")
+			}
+			for name, cfg := range map[string]ReclaimConfig{"dry": rec.dryCfg, "real": rec.realCfg} {
+				if cfg.TargetFreeBytes != want || cfg.HighFreeBytes != want {
+					t.Errorf("%s pass target/high = %d/%d, want both %d", name, cfg.TargetFreeBytes, cfg.HighFreeBytes, want)
+				}
 			}
 			wantHeld := uint64(0)
 			if tc.wantErr == nil {
