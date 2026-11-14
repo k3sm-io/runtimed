@@ -3275,6 +3275,26 @@ const (
 // opening that read.
 const developerDirEnv = "DEVELOPER_DIR"
 
+// pathEnv is the search path variable, and defaultPathEnvValue the value
+// containerEnv gives a container whose environment carries none: containerd's
+// default for a Unix container whose image sets no PATH (its oci
+// DefaultPathEnv), so a pod spec behaves as it does on any other node.
+//
+// Why it matters on this node class: an `image: native` container, and an
+// image whose config names no PATH, used to start with no PATH at all. A
+// shell papers over that for its own lookups (bash falls back to a built-in
+// search path but does not export it), so the gap shows up one process down:
+// SwiftPM runs `codesign` by name as the last step of `swift build` and failed
+// with "unable to spawn process 'codesign' (No such file or directory)" after
+// every compile and link had succeeded.
+//
+// Spec beats injection, as for every variable here: a container or image that
+// sets PATH keeps it.
+const (
+	pathEnv             = "PATH"
+	defaultPathEnvValue = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
 // podModuleCacheDir is the pod's own clang module cache, one subdirectory of
 // the pod temp dir. It is derived from the data volume rather than from the
 // container's $TMPDIR, so a container that names its own temp directory still
@@ -3334,6 +3354,9 @@ func provisionPodTmpDir(dataVol string) error {
 // env can override it (rare). A container that sets DYLD_INSERT_LIBRARIES itself
 // opts out of both shims.
 //
+// PATH is given containerd's default (defaultPathEnvValue) when the base names
+// none, on the same spec-beats-injection terms.
+//
 // TMPDIR and CLANG_MODULE_CACHE_PATH are each injected only when the base does
 // not already carry that name, so a container that names its own temp directory
 // or module cache keeps it — the same spec-beats-injection rule
@@ -3387,6 +3410,10 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		if !envHasName(base, clangModuleCacheEnv) {
 			env = append(env, clangModuleCacheEnv+"="+podModuleCacheDir(dataVol))
 		}
+	}
+	// containerd's default search path, for a container that names none.
+	if !envHasName(base, pathEnv) {
+		env = append(env, pathEnv+"="+defaultPathEnvValue)
 	}
 	// The developer dir the profile granted. The field was validated by
 	// sandbox.Generate earlier in this same createPod (a value that would not
