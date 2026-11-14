@@ -29,20 +29,30 @@ import (
 // CreatePod that arrives without the provider's check must meet the same one.
 //
 // A pod with no mounted hostPath volume gets nil without the file being read.
-// Every grant is logged at Info with the pod, the path and the mode, which is
-// the node-side audit record of what each pod was given.
+// Every grant is logged at Info with the pod, the path and the mode, and the
+// uid whose delegated file holds the entry when one does: the node-side audit
+// record of what each pod was given. A delegated entry the node drops (it no
+// longer passes its delegation's checks) is logged at Warn on each create
+// that reads it.
 func (r *Runtime) hostShares(box *runtimev1.PodBox) ([]sandbox.HostShare, error) {
 	if !mountsHostPath(box) {
 		return nil, nil
 	}
-	var entries []hostshare.Entry
+	var eff hostshare.Effective
 	if r.cfg.HostSharesFile != "" {
 		var err error
-		if entries, err = hostshare.Load(r.cfg.HostSharesFile); err != nil {
+		if eff, err = hostshare.LoadEffective(r.cfg.HostSharesFile); err != nil {
 			return nil, err
 		}
 	}
-	grants, err := hostshare.Authorize(entries, box)
+	// Log only the drops this pod could have used (or a whole user file),
+	// so a user's list cannot flood the node log on every create.
+	for _, d := range eff.Dropped {
+		if d.Entry.Path == "" || coversVolume(box, d.Entry.Path) {
+			r.log.Warn("delegated host share not admitted", "uid", d.UID, "entry", d.Entry.String(), "reason", d.Reason)
+		}
+	}
+	grants, err := hostshare.Authorize(eff.Entries, box)
 	if err != nil {
 		return nil, err
 	}
@@ -55,11 +65,28 @@ func (r *Runtime) hostShares(box *runtimev1.PodBox) ([]sandbox.HostShare, error)
 		case g.ReadOnly:
 			mode = "ro"
 		}
-		r.log.Info("host share granted", "pod", box.GetPodId(), "namespace", box.GetNamespace(),
-			"name", box.GetName(), "volume", g.Volume, "path", g.Path, "mode", mode, "entry", g.Entry.String())
+		// The pod fields come from the request; the path, mode, entry and
+		// delegating uid are the node's own decision.
+		attrs := []any{"pod", box.GetPodId(), "namespace", box.GetNamespace(),
+			"name", box.GetName(), "volume", g.Volume, "path", g.Path, "mode", mode, "entry", g.Entry.String()}
+		if uid, ok := eff.Owners[g.Entry]; ok {
+			attrs = append(attrs, "delegated_uid", uid)
+		}
+		r.log.Info("host share granted", attrs...)
 		out = append(out, sandbox.HostShare{Path: g.Path, ReadOnly: g.ReadOnly, Socket: g.Socket})
 	}
 	return out, nil
+}
+
+// coversVolume reports whether p is at, under or above a hostPath volume of
+// box.
+func coversVolume(box *runtimev1.PodBox, p string) bool {
+	for _, v := range box.GetVolumes() {
+		if hp := v.GetHostPath(); hp != nil && (hostshare.AtOrUnder(hp.GetPath(), p) || hostshare.AtOrUnder(p, hp.GetPath())) {
+			return true
+		}
+	}
+	return false
 }
 
 // mountsHostPath reports whether any container of box mounts a hostPath volume.

@@ -188,6 +188,8 @@ func (f fakeFS) resolve(p string) (string, error) {
 	return p, nil
 }
 
+func (f fakeFS) foldsCase(string) bool { return true }
+
 func (f fakeFS) kind(p string) (string, error) {
 	k, ok := f.kinds[p]
 	if !ok {

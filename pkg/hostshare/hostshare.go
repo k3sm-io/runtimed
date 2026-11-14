@@ -108,6 +108,8 @@ var refusedRoots = []string{
 	"/var",
 	"/private/var",
 	"/Library/k3sm",
+	DefaultFile,
+	DefaultFile + ".d",
 	"/Library/Keychains",
 	"/Library/LaunchDaemons",
 	"/Library/LaunchAgents",
@@ -171,47 +173,110 @@ func ValidateEntry(e Entry) error {
 	return nil
 }
 
-// Parse reads an allowlist. Each line is "<mode> <absolute path>"; blank lines
-// and lines starting with '#' are ignored. Any malformed or invalid line fails
-// the whole file, so a typo never silently shares something else.
+// Parse reads a list of share entries, the format of a delegated user's file.
+// Each line is "<mode> <absolute path>"; blank lines and lines starting with
+// '#' are ignored. Any malformed or invalid line fails the whole file, so a
+// typo never silently shares something else. A delegate line is refused here:
+// only the root-owned node file (ParseFile) may carry one.
 func Parse(r io.Reader) ([]Entry, error) {
-	var out []Entry
+	f, err := parse(r, false, ValidateEntry)
+	return f.Entries, err
+}
+
+// ParseFile reads the node's root-owned file: share entries, and the
+// delegations that let a named user keep their own entries (see Delegation).
+func ParseFile(r io.Reader) (File, error) { return parse(r, true, ValidateEntry) }
+
+// parse takes the entry check as a parameter so a test can read files that
+// name temp directories, which sit under the refused /var.
+func parse(r io.Reader, delegations bool, validate func(Entry) error) (File, error) {
+	var out File
 	sc := bufio.NewScanner(io.LimitReader(r, maxFileBytes+1))
-	sc.Buffer(make([]byte, 0, 4096), maxPathBytes+64)
+	sc.Buffer(make([]byte, 0, 4096), maxPathBytes+256)
 	read := 0
 	line := 0
 	for sc.Scan() {
 		line++
 		read += len(sc.Bytes()) + 1
 		if read > maxFileBytes+1 {
-			return nil, fmt.Errorf("%w: file is over %d bytes", ErrInvalidEntry, maxFileBytes)
+			return File{}, fmt.Errorf("%w: file is over %d bytes", ErrInvalidEntry, maxFileBytes)
 		}
 		text := strings.TrimSpace(sc.Text())
 		if text == "" || strings.HasPrefix(text, "#") {
 			continue
 		}
 		fields := strings.Fields(text)
+		if fields[0] == delegateKeyword {
+			if !delegations {
+				return File{}, fmt.Errorf("%w: line %d: a delegation may only be set in the root-owned node file", ErrInvalidEntry, line)
+			}
+			d, err := parseDelegation(fields, validate)
+			if err != nil {
+				return File{}, fmt.Errorf("line %d: %w", line, err)
+			}
+			if len(out.Delegations) == maxDelegations {
+				return File{}, fmt.Errorf("%w: more than %d delegations", ErrInvalidEntry, maxDelegations)
+			}
+			out.Delegations = append(out.Delegations, d)
+			continue
+		}
 		if len(fields) != 2 {
-			return nil, fmt.Errorf("%w: line %d: want \"<mode> <path>\"", ErrInvalidEntry, line)
+			return File{}, fmt.Errorf("%w: line %d: want \"<mode> <path>\"", ErrInvalidEntry, line)
 		}
 		e := Entry{Mode: Mode(fields[0]), Path: fields[1]}
-		if err := ValidateEntry(e); err != nil {
-			return nil, fmt.Errorf("line %d: %w", line, err)
+		if err := validate(e); err != nil {
+			return File{}, fmt.Errorf("line %d: %w", line, err)
 		}
-		if len(out) == maxEntries {
-			return nil, fmt.Errorf("%w: more than %d entries", ErrInvalidEntry, maxEntries)
+		if len(out.Entries) == maxEntries {
+			return File{}, fmt.Errorf("%w: more than %d entries", ErrInvalidEntry, maxEntries)
 		}
-		out = append(out, e)
+		out.Entries = append(out.Entries, e)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidEntry, err)
+		return File{}, fmt.Errorf("%w: %v", ErrInvalidEntry, err)
 	}
 	return out, nil
 }
 
-// Format renders entries as an allowlist file, sorted and de-duplicated, with
+// Format renders entries as the node's file, sorted and de-duplicated, with
 // a header saying who writes it.
-func Format(entries []Entry) []byte {
+func Format(entries []Entry) []byte { return FormatFile(File{Entries: entries}) }
+
+// FormatFile renders the node's root-owned file: its entries, then its
+// delegations, each sorted and de-duplicated.
+func FormatFile(f File) []byte {
+	var b bytes.Buffer
+	b.WriteString("# k3sm host shares: the host paths native pods may mount with a hostPath volume.\n")
+	b.WriteString("# Written by `sudo k3sm share`. One \"<mode> <path>\" per line; mode is rw, ro or socket.\n")
+	writeEntries(&b, f.Entries)
+	if len(f.Delegations) > 0 {
+		b.WriteString("# Delegations: the named user adds shares under the prefix with `k3sm share add`, no sudo.\n")
+		ds := slices.Clone(f.Delegations)
+		slices.SortFunc(ds, func(a, b Delegation) int {
+			if c := strings.Compare(a.Prefix, b.Prefix); c != 0 {
+				return c
+			}
+			return int(a.UID) - int(b.UID)
+		})
+		ds = slices.CompactFunc(ds, func(a, b Delegation) bool { return a.String() == b.String() })
+		for _, d := range ds {
+			b.WriteString(d.String())
+			b.WriteByte('\n')
+		}
+	}
+	return b.Bytes()
+}
+
+// FormatUser renders a delegated user's own file.
+func FormatUser(entries []Entry) []byte {
+	var b bytes.Buffer
+	b.WriteString("# k3sm host shares delegated to this user: written by `k3sm share add|remove`, no sudo.\n")
+	b.WriteString("# The node admits a line only under a prefix the root-owned node file delegates to this uid.\n")
+	writeEntries(&b, entries)
+	return b.Bytes()
+}
+
+func writeEntries(b *bytes.Buffer, entries []Entry) {
 	sorted := slices.Clone(entries)
 	slices.SortFunc(sorted, func(a, b Entry) int {
 		if c := strings.Compare(a.Path, b.Path); c != 0 {
@@ -220,43 +285,56 @@ func Format(entries []Entry) []byte {
 		return strings.Compare(string(a.Mode), string(b.Mode))
 	})
 	sorted = slices.Compact(sorted)
-	var b bytes.Buffer
-	b.WriteString("# k3sm host shares: the host paths native pods may mount with a hostPath volume.\n")
-	b.WriteString("# Written by `sudo k3sm share`. One \"<mode> <path>\" per line; mode is rw, ro or socket.\n")
 	for _, e := range sorted {
 		b.WriteString(e.String())
 		b.WriteByte('\n')
 	}
-	return b.Bytes()
 }
 
-// Load reads the allowlist at path. A missing file is an empty allowlist, the
-// default: the node shares nothing. A file that is a symlink, not a regular
-// file, not owned by root, or writable by group or other is refused
+// LoadFile reads the node's root-owned file at path: its own entries and its
+// delegations, and nothing from any delegated user's file. A missing file is
+// empty, the default: the node shares nothing. A file that is a symlink, not a
+// regular file, not owned by root, or writable by group or other is refused
 // (ErrUnsafeFile), because the daemon that reads it runs unprivileged and must
-// not trust a list it, or a pod, could have written.
+// not trust a list it, or a pod, could have written. `sudo k3sm share` reads
+// and rewrites the file through this.
+func LoadFile(path string) (File, error) { return defaultLoader().loadFile(path) }
+
+// Load returns every entry the node admits: the root-owned file's own entries
+// and, for each delegation in it, the delegated user's entries that still
+// pass the delegation's checks now (LoadEffective). It is what the node
+// daemon and runtimed decide a pod's hostPath volumes from, on every create.
 func Load(path string) ([]Entry, error) {
+	eff, err := LoadEffective(path)
+	return eff.Entries, err
+}
+
+func (l loader) loadFile(path string) (File, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return File{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: open %s: %v", ErrUnsafeFile, path, err)
+		return File{}, fmt.Errorf("%w: open %s: %v", ErrUnsafeFile, path, err)
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("%w: stat %s: %v", ErrUnsafeFile, path, err)
+		return File{}, fmt.Errorf("%w: stat %s: %v", ErrUnsafeFile, path, err)
 	}
-	if err := checkOwnership(fi); err != nil {
-		return nil, fmt.Errorf("%w: %s: %v", ErrUnsafeFile, path, err)
+	if err := checkOwnedBy(fi, l.rootUID); err != nil {
+		return File{}, fmt.Errorf("%w: %s: %v", ErrUnsafeFile, path, err)
 	}
-	return Parse(f)
+	return parse(f, true, l.validate)
 }
 
 // checkOwnership is the root-owned, root-only-writable test, split out so a
 // test can feed it a FileInfo.
-func checkOwnership(fi os.FileInfo) error {
+func checkOwnership(fi os.FileInfo) error { return checkOwnedBy(fi, 0) }
+
+// checkOwnedBy is checkOwnership for an owner other than root: a regular file
+// owned by uid and writable by nobody else.
+func checkOwnedBy(fi os.FileInfo, uid uint32) error {
 	if !fi.Mode().IsRegular() {
 		return errors.New("not a regular file")
 	}
@@ -267,8 +345,8 @@ func checkOwnership(fi os.FileInfo) error {
 	if !ok {
 		return errors.New("no ownership information")
 	}
-	if st.Uid != 0 {
-		return fmt.Errorf("owned by uid %d, not root", st.Uid)
+	if st.Uid != uid {
+		return fmt.Errorf("owned by uid %d, not %d", st.Uid, uid)
 	}
 	return nil
 }
@@ -279,11 +357,16 @@ type fileChecker interface {
 	resolve(p string) (string, error)
 	// kind returns "dir", "socket" or "other" for an existing path.
 	kind(p string) (string, error)
+	// foldsCase reports whether the volume holding p compares names
+	// without regard to case.
+	foldsCase(p string) bool
 }
 
 type osChecker struct{}
 
 func (osChecker) resolve(p string) (string, error) { return filepath.EvalSymlinks(p) }
+
+func (osChecker) foldsCase(p string) bool { return FoldsCase(p) }
 
 func (osChecker) kind(p string) (string, error) {
 	fi, err := os.Lstat(p)
@@ -312,6 +395,9 @@ func (osChecker) kind(p string) (string, error) {
 //   - its type is empty, Directory or Socket, and the path exists as that kind;
 //   - the path contains no symlink (it resolves to itself), so a link cannot
 //     point an admitted spelling at a tree the admin never named;
+//   - the path is on a case-insensitive volume: Seatbelt matches a granted
+//     path without regard to case even on a case-sensitive volume, where the
+//     grant would also reach differently cased siblings (FoldsCase);
 //   - an rw or ro entry covers it (the path is at or under the entry), or a
 //     socket entry names exactly it;
 //   - a read-only entry is mounted readOnly by every container, and no volume
@@ -392,7 +478,7 @@ func authorizeOne(entries []Entry, v *runtimev1.Volume, ro, rw bool, fs fileChec
 	// refused without the daemon stat-ing it on the pod's behalf.
 	entry, ok := match(entries, p, typ)
 	if !ok {
-		return Grant{}, notShared(name, "no host share entry covers this path; the node admin adds one with `sudo k3sm share add`")
+		return Grant{}, notShared(name, "no host share entry covers this path; the node admin adds one with `sudo k3sm share add`, or a delegated user with `k3sm share add`")
 	}
 	if typ == "" {
 		want = map[Mode]string{ModeSocket: "socket"}[entry.Mode]
@@ -406,6 +492,9 @@ func authorizeOne(entries []Entry, v *runtimev1.Volume, ro, rw bool, fs fileChec
 	}
 	if resolved != p {
 		return Grant{}, notShared(name, "the path contains a symlink; name the resolved path instead")
+	}
+	if !fs.foldsCase(p) {
+		return Grant{}, notShared(name, "the path is on a case-sensitive volume, where the sandbox's case-insensitive match would also reach other names")
 	}
 	kind, err := fs.kind(p)
 	if err != nil || kind != want {
@@ -466,6 +555,44 @@ func findVolume(box *runtimev1.PodBox, name string) *runtimev1.Volume {
 		}
 	}
 	return nil
+}
+
+// FoldsCase reports whether the volume that holds the existing path p
+// compares names without regard to case, as APFS does by default. It looks
+// the path up again with the letters of one of its components flipped in
+// case: on a case-insensitive volume that names the same file. A path with
+// no ASCII letter in any component, or any failure, reports false, so a
+// caller refuses rather than guesses.
+func FoldsCase(p string) bool {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(p, "/")
+	for i := len(parts) - 1; i >= 1; i-- {
+		flipped := flipCase(parts[i])
+		if flipped == parts[i] {
+			continue
+		}
+		alt := slices.Clone(parts)
+		alt[i] = flipped
+		fj, err := os.Lstat(strings.Join(alt, "/"))
+		return err == nil && os.SameFile(fi, fj)
+	}
+	return false
+}
+
+func flipCase(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z':
+			b[i] = c - 'a' + 'A'
+		case c >= 'A' && c <= 'Z':
+			b[i] = c - 'A' + 'a'
+		}
+	}
+	return string(b)
 }
 
 // atOrUnder reports whether p is dir or inside it, by path components.
