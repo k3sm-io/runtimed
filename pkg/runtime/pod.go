@@ -826,6 +826,11 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 	sp := proto.Clone(box.GetSandboxProfile()).(*runtimev1.SandboxProfile)
 	sp.DataVolumePath = rootfs
 
+	shares, err := r.hostShares(box)
+	if err != nil {
+		return "", fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
+	}
+
 	// The generator validates every extra/PV path against the protected deny-set
 	// and emits the protected denies last (last-match-wins).
 	profile, err := sandbox.Generate(sp, sandbox.GenerateOptions{
@@ -864,6 +869,8 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 		ReadPaths:     pvRead,
 		// Each image volume's view: read, never write, exec or map executable.
 		ArtifactViewPaths: views,
+		// The node-admitted hostPath shares (hostShares), at their host paths.
+		HostShares: shares,
 		// The pod's own POSIX semaphore prefix is derived from this and nothing
 		// else; containerEnv publishes the same derivation to the shim.
 		PodUID: box.GetPodId(),
@@ -1751,7 +1758,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// Linux the kernel gates the interpreter, not the script.
 	execArgv, argv0, gatePath := rb.argv, "", rb.path
 	if rb.hostBinary {
-		execArgv, argv0, gatePath = r.hostExecPlan(p.box.GetPodId(), c, rootfs, rb)
+		execArgv, argv0, gatePath = r.hostExecPlan(p.box, c, rootfs, rb)
 	}
 
 	// Enforce the signature policy in the correct order relative to ad-hoc
@@ -3420,7 +3427,7 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	// Path-rebase shim: only when the shim is configured and this container mounts
 	// a volume (nothing to rebase otherwise). K3SM_ROOTFS/K3SM_MOUNT_PATHS configure
 	// it; a workload not loading the shim (a SIP platform binary) just ignores them.
-	if paths := containerMountPaths(c); r.cfg.PathShimPath != "" && len(paths) > 0 {
+	if paths := containerMountPaths(box, c); r.cfg.PathShimPath != "" && len(paths) > 0 {
 		rootfs, err := r.rootfsPath(box)
 		if err != nil {
 			return nil, err
@@ -3478,9 +3485,20 @@ func envHasName(env []string, name string) bool {
 
 // containerMountPaths returns c's absolute volume-mount container paths (the
 // prefixes the path-rebase shim rewrites under the pod data volume).
-func containerMountPaths(c *runtimev1.Container) []string {
+func containerMountPaths(box *runtimev1.PodBox, c *runtimev1.Container) []string {
+	hostPathVols := map[string]bool{}
+	for _, v := range box.GetVolumes() {
+		if v.GetHostPath() != nil {
+			hostPathVols[v.GetName()] = true
+		}
+	}
 	var paths []string
 	for _, vm := range c.GetVolumeMounts() {
+		// A host share is mounted at its own host path and never rebased: the
+		// pod reaches the real path, which its profile grants (hostShares).
+		if hostPathVols[vm.GetName()] {
+			continue
+		}
 		if p := vm.GetMountPath(); p != "" {
 			paths = append(paths, p)
 		}

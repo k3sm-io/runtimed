@@ -459,6 +459,13 @@ type GenerateOptions struct {
 	// the data volume is writable, so a pod can copy a view file there and run
 	// it. They stop the view itself being executed or mapped executable.
 	ArtifactViewPaths []string
+	// HostShares are the node-admitted host directories and sockets this pod
+	// mounts at their own host paths (pkg/hostshare decides them from the
+	// node's root-owned allowlist; the pod spec never does). Each is validated
+	// against the posture here again, and rendered in the re-allow tier after
+	// the protected denies, because a share under /Users is the one place the
+	// /Users deny is narrowed. See hostShareStanza.
+	HostShares []HostShare
 	// PodUID is the kube Pod UID (PodBox.pod_id). When set, Generate grants the
 	// pod its own POSIX named semaphores, filtered to the prefix PosixSemPrefix
 	// derives from it (posixsem.go); empty grants none. Not in the proto: the
@@ -622,6 +629,11 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// The artifact views are checked by shape, not against the deny-set: each
 	// lies under the denied views root by design and is re-allowed after it.
 	viewPaths, err := validateArtifactViews(filepath.Dir(podsRoot), opts.ArtifactViewPaths)
+	if err != nil {
+		return "", err
+	}
+
+	shares, err := validateHostShares(opts.HostShares, protectedPrefixes, dataVol)
 	if err != nil {
 		return "", err
 	}
@@ -861,6 +873,9 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("(allow file-read* file-write*\n")
 	writeFirmlinkSubpaths(&b, []string{dataVol})
 	b.WriteString("  )\n")
+	shareFiles, shareSockets := hostShareStanza(shares)
+	b.WriteString(shareFiles)
+	b.WriteString(shareSockets)
 
 	// The stat-walk grant for every subtree re-allowed above. A tool that
 	// canonicalizes its working directory — swift-driver and swift-frontend do,
@@ -892,6 +907,9 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	reallowed := append([]string{dataVol}, opts.WritePaths...)
 	reallowed = append(reallowed, opts.ReadPaths...)
 	reallowed = append(reallowed, viewPaths...)
+	for _, sh := range shares {
+		reallowed = append(reallowed, sh.Path)
+	}
 	if ancestors := ancestorMetadataPaths(reallowed); len(ancestors) > 0 {
 		b.WriteString(";; existence only: the strict ancestors of every re-allowed subtree, so a\n")
 		b.WriteString(";; stat-walk (chdir/realpath canonicalization — swift-driver, swift-frontend)\n")
@@ -944,7 +962,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// an edit that widens, narrows, or reorders it fails here — at generation, with
 	// the pod named — rather than at sandbox_apply, where a non-compiling stanza
 	// takes down every networked pod on the node one create at a time.
-	if err := ValidateNetworkScope(sp, out); err != nil {
+	//
+	// The host-share socket stanza is AF_UNIX connects to literal node-admitted
+	// paths, not IP networking, so it is checked on its own shape and left out
+	// of the network-scope check, which would read it as an unrequested allow.
+	if err := checkHostShareSocketStanza(shareSockets); err != nil {
+		return "", err
+	}
+	if err := ValidateNetworkScope(sp, strings.Replace(out, shareSockets, "", 1)); err != nil {
 		return "", err
 	}
 	return out, nil
