@@ -539,8 +539,56 @@ func TestContainerEnvMergesTheImageEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("containerEnv: %v", err)
 	}
-	if got := withoutName(withoutName(fallback, tmpDirEnv), clangModuleCacheEnv); len(got) != 1 || got[0] != "POD=1" {
+	if got := withoutName(withoutName(withoutName(fallback, tmpDirEnv), clangModuleCacheEnv), pathEnv); len(got) != 1 || got[0] != "POD=1" {
 		t.Errorf("fallback env = %v, want [POD=1]", fallback)
+	}
+}
+
+// TestContainerEnvDefaultsPath pins the containerd default search path for a
+// container whose environment names none, and that a PATH from the image or
+// the spec is kept as it is. Without it SwiftPM cannot find codesign, the
+// last step of every swift build.
+func TestContainerEnvDefaultsPath(t *testing.T) {
+	rt := newTestRuntime(t, Deps{})
+	box := hostBinBox(rt, "pod-path")
+	c := &runtimev1.Container{Name: "app"}
+
+	env, err := rt.containerEnv(box, c, nil)
+	if err != nil {
+		t.Fatalf("containerEnv: %v", err)
+	}
+	var paths []string
+	for _, e := range env {
+		if k, v, _ := strings.Cut(e, "="); k == pathEnv {
+			paths = append(paths, v)
+		}
+	}
+	if len(paths) != 1 || paths[0] != defaultPathEnvValue {
+		t.Errorf("PATH entries = %q, want exactly [%q]", paths, defaultPathEnvValue)
+	}
+
+	spec := &runtimev1.Container{Name: "app", Env: []*runtimev1.EnvVar{{Name: "PATH", Value: "/opt/bin"}}}
+	for _, tc := range []struct {
+		name string
+		c    *runtimev1.Container
+		base []string
+	}{
+		{"spec", spec, nil},
+		{"image", c, []string{"PATH=/opt/bin"}},
+	} {
+		env, err := rt.containerEnv(box, tc.c, tc.base)
+		if err != nil {
+			t.Fatalf("%s: containerEnv: %v", tc.name, err)
+		}
+		var got []string
+		for _, e := range env {
+			if k, v, _ := strings.Cut(e, "="); k == pathEnv {
+				got = append(got, v)
+			}
+		}
+		if len(got) != 1 || got[0] != "/opt/bin" {
+			t.Errorf("%s: PATH entries = %q, want the container's own [/opt/bin]", tc.name, got)
+		}
 	}
 }
 

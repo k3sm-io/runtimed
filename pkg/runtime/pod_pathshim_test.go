@@ -157,6 +157,7 @@ func TestContainerEnvKeepsEntriesAfterDYLD(t *testing.T) {
 		want := []string{
 			tmpDirEnv + "=" + podTmpDir(derivedRootfs(t, rt, "pod-6")),
 			clangModuleCacheEnv + "=" + podModuleCacheDir(derivedRootfs(t, rt, "pod-6")),
+			pathEnv + "=" + defaultPathEnvValue,
 			"A=1",
 			dyldInsertEnv + "=/custom.dylib",
 			"B=2",
@@ -178,6 +179,7 @@ func TestContainerEnvKeepsEntriesAfterDYLD(t *testing.T) {
 		want := []string{
 			tmpDirEnv + "=" + podTmpDir(derivedRootfs(t, rt, "pod-7")),
 			clangModuleCacheEnv + "=" + podModuleCacheDir(derivedRootfs(t, rt, "pod-7")),
+			pathEnv + "=" + defaultPathEnvValue,
 			"A=1",
 			"B=2",
 		}
@@ -199,6 +201,7 @@ func TestContainerEnvKeepsEntriesAfterDYLD(t *testing.T) {
 		want := []string{
 			tmpDirEnv + "=" + podTmpDir(derivedRootfs(t, rt, "pod-8")),
 			clangModuleCacheEnv + "=" + podModuleCacheDir(derivedRootfs(t, rt, "pod-8")),
+			pathEnv + "=" + defaultPathEnvValue,
 			"A=1",
 			"B=2",
 			dyldInsertEnv + "=/opt/k3sm/libdnsshim.dylib",
