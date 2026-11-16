@@ -290,6 +290,14 @@ type Config struct {
 	// shells, tar and the common coreutils, which this same shim then also
 	// rewrites at every exec.
 	PathShimPath string
+	// HostSharesFile is the node's host-share allowlist (hostshare.DefaultFile
+	// on an installed node): the host directories and sockets a native pod may
+	// mount with a hostPath volume at their own path. It is read on every
+	// profile compile, so an edit takes effect for the next pod and a removed
+	// share is not re-granted to a pod re-attached after a restart. Empty, or
+	// a missing file, shares nothing; a file that is not root-owned and
+	// root-only-writable fails every pod that mounts a hostPath volume.
+	HostSharesFile string
 	// ShadowBinDir is the node's directory of ad-hoc re-signed copies of the
 	// host binaries in the shadowset list (the shells bash, zsh, dash and env,
 	// bash also serving /bin/sh; tar; the common coreutils such as cat, cp,

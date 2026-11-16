@@ -384,15 +384,15 @@ func (r *Runtime) shadowExecFor(podID, container string, rb resolvedBinary, reba
 //     named unless a mount rebase moved it.
 //   - A file with no shebang is gated as itself, as before (and an unsigned
 //     one is still rejected).
-func (r *Runtime) hostExecPlan(podID string, c *runtimev1.Container, rootfs string, rb resolvedBinary) (execArgv []string, argv0, gatePath string) {
+func (r *Runtime) hostExecPlan(box *runtimev1.PodBox, c *runtimev1.Container, rootfs string, rb resolvedBinary) (execArgv []string, argv0, gatePath string) {
 	// The interposer rebases a mounted exec target; the spawn does the same so
 	// the two agree (only where the interposer is injected).
 	var rebase func(string) string
-	if paths := containerMountPaths(c); r.cfg.PathShimPath != "" && len(paths) > 0 {
+	if paths := containerMountPaths(box, c); r.cfg.PathShimPath != "" && len(paths) > 0 {
 		rebase = mountRebaser(rootfs, paths)
 	}
 	execArgv, gatePath = rb.argv, rb.path
-	if sx, ok := r.shadowExecFor(podID, c.GetName(), rb, rebase); ok {
+	if sx, ok := r.shadowExecFor(box.GetPodId(), c.GetName(), rb, rebase); ok {
 		execArgv = append([]string{sx.path}, sx.argv[1:]...)
 		if sx.argv[0] != sx.path {
 			argv0 = sx.argv[0]

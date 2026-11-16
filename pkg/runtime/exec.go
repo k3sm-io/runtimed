@@ -222,7 +222,7 @@ func (r *Runtime) resolveExecCommand(ctx context.Context, p *pod, c *runtimev1.C
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "exec: %v", err)
 	}
-	if rebase := mountRebaser(rootfs, containerMountPaths(c)); rebase != nil {
+	if rebase := mountRebaser(rootfs, containerMountPaths(p.box, c)); rebase != nil {
 		if clean := filepath.Clean(argv0); rebase(clean) != clean {
 			return append([]string{clean}, cmdv[1:]...), nil
 		}

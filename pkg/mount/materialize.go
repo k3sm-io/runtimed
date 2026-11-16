@@ -211,6 +211,14 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 			if vol.GetPersistentVolumeClaim() != nil {
 				continue
 			}
+			// A hostPath source is a host share: it is never materialized or
+			// rebased, because the pod reaches it at its own host path. The
+			// runtime decides it against the node's allowlist when it compiles
+			// the pod's profile (pkg/hostshare), and a share that is not admitted
+			// fails the pod there, before any container starts.
+			if vol.GetHostPath() != nil {
+				continue
+			}
 			// The destination is the rebased mount path ONLY — subPath selects a
 			// source element (applied at materialization), it is NOT folded into
 			// the destination.
