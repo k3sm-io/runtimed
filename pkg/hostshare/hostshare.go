@@ -515,6 +515,10 @@ func authorizeOne(entries []Entry, v *runtimev1.Volume, ro, rw bool, fs fileChec
 // match returns the entry that admits p for a volume of hostPath type typ.
 // Among directory entries the most specific one wins, so `ro /p/secrets`
 // narrows `rw /p`; between two entries for the same path read-write wins.
+// Paths compare with ASCII case folded, as APFS and Seatbelt compare them, so
+// `/p/SECRETS` is narrowed by `ro /p/secrets` too (a case-sensitive volume is
+// refused after the match). The narrowing is per requested path: a pod that
+// mounts `/p` itself gets `rw /p`, secrets included.
 func match(entries []Entry, p, typ string) (Entry, bool) {
 	var found Entry
 	ok := false
@@ -524,11 +528,11 @@ func match(entries []Entry, p, typ string) (Entry, bool) {
 		}
 		switch e.Mode {
 		case ModeSocket:
-			if typ != "Directory" && p == e.Path {
+			if typ != "Directory" && strings.EqualFold(p, e.Path) {
 				return e, true
 			}
 		case ModeReadWrite, ModeReadOnly:
-			if typ != "Socket" && atOrUnder(p, e.Path) {
+			if typ != "Socket" && atOrUnderFold(p, e.Path) {
 				switch {
 				case !ok, len(e.Path) > len(found.Path):
 					found, ok = e, true
