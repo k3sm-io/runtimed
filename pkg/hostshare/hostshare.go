@@ -328,12 +328,9 @@ func (l loader) loadFile(path string) (File, error) {
 	return parse(f, true, l.validate)
 }
 
-// checkOwnership is the root-owned, root-only-writable test, split out so a
-// test can feed it a FileInfo.
-func checkOwnership(fi os.FileInfo) error { return checkOwnedBy(fi, 0) }
-
-// checkOwnedBy is checkOwnership for an owner other than root: a regular file
-// owned by uid and writable by nobody else.
+// checkOwnedBy is the ownership test every list file passes: a regular file
+// owned by uid (root, 0, for the node file) and writable by nobody else. It
+// takes a FileInfo so a test can feed it one.
 func checkOwnedBy(fi os.FileInfo, uid uint32) error {
 	if !fi.Mode().IsRegular() {
 		return errors.New("not a regular file")
