@@ -804,6 +804,10 @@ type Deps struct {
 	// local-path class and empty-create only (no seed template). Tests inject one
 	// with a custom class/template; the provider may wire a TemplateResolver.
 	Binder *volume.Binder
+	// ExposeACL lets a host account into a pod's exposure volumes. It has NO
+	// default: the node (k3sm) wires one backed by acl(3). nil refuses every
+	// pod with an exposure volume (fail closed).
+	ExposeACL volume.ExposeACL
 	// Footprinter samples per-PID memory footprints for the OOM/metering sampler
 	// Defaults to supervisor.PhysFootprinter (proc_pid_rusage); tests
 	// inject a fake.
