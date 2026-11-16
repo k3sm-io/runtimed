@@ -410,8 +410,10 @@ func TestXcodeGrantStaysReadOnlyAndFileScoped(t *testing.T) {
 			t.Errorf("the toolchain stanza is missing its %s tier:\n%s", want, stanza)
 		}
 	}
-	if n := strings.Count(rules, "(allow "); n != 3 {
-		t.Errorf("the toolchain stanza emits %d allow rules; want exactly 3 (two read tiers plus the metadata tier)", n)
+	// Three read tiers (subpaths, literals, the per-platform manifest regex)
+	// plus the metadata tier.
+	if n := strings.Count(rules, "(allow "); n != 4 {
+		t.Errorf("the toolchain stanza emits %d allow rules; want exactly 4 (three read tiers plus the metadata tier)", n)
 	}
 }
 
@@ -839,5 +841,80 @@ func TestValidateXcodeToolchainDirTracksThePosture(t *testing.T) {
 	_, err := ValidateXcodeToolchainDir(dir, Posture{WorkDir: "/opt/k3sm-home"})
 	if !errors.Is(err, ErrXcodeToolchainDir) {
 		t.Fatalf("under a work-dir of /opt/k3sm-home, %q is inside the pods root; want ErrXcodeToolchainDir, got %v", dir, err)
+	}
+}
+
+// TestXcodeToolchainGrantReadsEveryPlatformManifest runs the rendered regex:
+// a confined read of a SIBLING platform's Info.plist succeeds (Swift Build
+// needs every manifest), while anything else in that sibling bundle stays
+// denied. A regex SBPL accepts but never matches is silent, so only running it
+// proves it.
+func TestXcodeToolchainGrantReadsEveryPlatformManifest(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not present")
+	}
+	out, err := exec.Command("/usr/bin/xcode-select", "-p").Output()
+	if err != nil {
+		t.Skip("xcode-select -p failed; no developer dir to grant")
+	}
+	dir := strings.TrimSpace(string(out))
+	if filepath.Base(dir) != xcodeDeveloperDirBase {
+		t.Skipf("xcode-select -p is %q, not a DEVELOPER_DIR this grant covers", dir)
+	}
+	var sibling string
+	ents, _ := os.ReadDir(filepath.Join(dir, "Platforms"))
+	for _, e := range ents {
+		if e.Name() != "MacOSX.platform" && strings.HasSuffix(e.Name(), ".platform") {
+			if _, err := os.Stat(filepath.Join(dir, "Platforms", e.Name(), "Info.plist")); err == nil {
+				sibling = filepath.Join(dir, "Platforms", e.Name())
+				break
+			}
+		}
+	}
+	if sibling == "" {
+		t.Skip("no sibling platform with an Info.plist on this host")
+	}
+	work := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(work); err == nil {
+		work = resolved
+	}
+	if strings.HasPrefix(work, "/Users/") {
+		t.Skipf("TMPDIR resolves under /Users (%s), which the pod profile denies", work)
+	}
+	dataVol := filepath.Join(work, "pods", "p1", "rootfs")
+	if err := os.MkdirAll(dataVol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol, XcodeToolchainDir: dir},
+		GenerateOptions{Posture: Posture{WorkDir: work}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profPath := filepath.Join(work, "xcode.sb")
+	if err := os.WriteFile(profPath, []byte(profile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cat := func(path string) error {
+		return exec.Command("/usr/bin/sandbox-exec", "-f", profPath, "/bin/cat", path).Run()
+	}
+	if err := cat(filepath.Join(sibling, "Info.plist")); err != nil {
+		t.Errorf("a confined read of %s/Info.plist failed under the grant: %v", sibling, err)
+	}
+	// Something else in the same sibling bundle: still denied.
+	other := ""
+	_ = filepath.WalkDir(sibling, func(p string, d os.DirEntry, err error) error {
+		if err != nil || other != "" {
+			return filepath.SkipDir
+		}
+		if d.Type().IsRegular() && filepath.Base(p) != "Info.plist" {
+			other = p
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if other != "" {
+		if err := cat(other); err == nil {
+			t.Errorf("a confined read of %s succeeded; the manifest grant reaches past Info.plist", other)
+		}
 	}
 }
