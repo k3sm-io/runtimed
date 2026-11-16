@@ -146,15 +146,15 @@ func TestLoad(t *testing.T) {
 	}
 }
 
-func TestCheckOwnership(t *testing.T) {
+func TestCheckOwnedByRoot(t *testing.T) {
 	t.Parallel()
 	// A root-owned system file passes; a user file and a writable one do not.
 	fi, err := os.Stat("/etc/hosts")
 	if err != nil {
 		t.Skip(err)
 	}
-	if err := checkOwnership(fi); err != nil {
-		t.Errorf("checkOwnership(/etc/hosts) = %v, want nil", err)
+	if err := checkOwnedBy(fi, 0); err != nil {
+		t.Errorf("checkOwnedBy(/etc/hosts, 0) = %v, want nil", err)
 	}
 	f := filepath.Join(t.TempDir(), "x")
 	if err := os.WriteFile(f, nil, 0o666); err != nil {
@@ -167,8 +167,8 @@ func TestCheckOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkOwnership(ufi); err == nil {
-		t.Error("checkOwnership(group/other-writable user file) = nil, want an error")
+	if err := checkOwnedBy(ufi, 0); err == nil {
+		t.Error("checkOwnedBy(group/other-writable user file, 0) = nil, want an error")
 	}
 }
 
@@ -187,6 +187,8 @@ func (f fakeFS) resolve(p string) (string, error) {
 	}
 	return p, nil
 }
+
+func (f fakeFS) foldsCase(string) bool { return true }
 
 func (f fakeFS) kind(p string) (string, error) {
 	k, ok := f.kinds[p]
@@ -328,6 +330,9 @@ func TestMatchMostSpecificEntryWins(t *testing.T) {
 		{"/Users/dev/Code/app/src", ModeReadWrite},
 		{"/Users/dev/Code/app/secrets", ModeReadOnly},
 		{"/Users/dev/Code/app/secrets/k", ModeReadOnly},
+		{"/Users/dev/Code/app/SECRETS", ModeReadOnly},
+		{"/users/dev/code/APP/Secrets/k", ModeReadOnly},
+		{"/USERS/dev/Code/app/src", ModeReadWrite},
 		{"/Volumes/data/x", ModeReadWrite},
 	} {
 		got, ok := match(entries, tc.path, "Directory")

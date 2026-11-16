@@ -33,6 +33,17 @@ limitations under the License.
 // boundary (pkg/sandbox emits the grant after its protected denies, so a share
 // under /Users is the one exception to the /Users deny the node admin made).
 //
+// Delegation. The root-owned file may also delegate a prefix to one user
+// account (Delegation). That user keeps their own entries under the prefix in
+// a file they own, UserFile, inside a directory root made for them beside the
+// node's file, so adding a share needs no root. The user's file is not
+// trusted: LoadEffective re-checks every line of it against the root-owned
+// delegation on every read (CheckDelegated: inside the prefix, no symlink,
+// every component owned by the delegated uid, the prefix the same directory
+// root named, the usual refusals). Removing the delegation from the root-owned
+// file drops every entry the user made at the next create. A pod runs as the
+// node's own user, which is never delegable, and can write neither file.
+//
 // What a share does NOT change: the pod's processes still run as the node's
 // unprivileged user, so writing into a share also needs the host's file
 // permissions to allow that user (the documented setup grants it with an
