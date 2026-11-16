@@ -31,10 +31,12 @@ import (
 	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/crilog"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
+	"k3sm.io/runtimed/pkg/volume"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
@@ -536,6 +538,16 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 				errInvalidPodBox, vol, medium)
 	}
 
+	// Exposure volumes are decided here, before the pod has a network or a
+	// directory: a node with no ExposeACL, an exposure no grant admits or a
+	// mount path that would nest refuses the pod with nothing to unwind. The
+	// grants are re-read from the root-owned file, never taken from the
+	// request (authorizeExposures).
+	exposures, err := r.prepareExposures(box)
+	if err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
+	}
+
 	ip, err := r.network.Setup(ctx, box.GetPodId())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INTERNAL,
@@ -631,6 +643,25 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 	}
 
+	// Bind the authorized exposures: each leaf is created empty under
+	// <data root>/expose/<ns>/<pod>, granted to its account by ACL and linked at
+	// its mount path, and joins the profile's read/write scope as a PV dir
+	// does. The leaves are pod-lifetime, so a refused create removes them.
+	defer func() {
+		if retErr != nil {
+			r.removeExposures(box)
+		}
+	}()
+	exposeLeaves, err := r.bindExposures(ctx, box, rootfs, exposures)
+	if err != nil {
+		if errors.Is(err, volume.ErrInvalid) || errors.Is(err, hostshare.ErrNotExposed) {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: bind exposures for pod %s: %w", errInvalidPodBox, box.GetPodId(), err)
+		}
+		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+			fmt.Errorf("bind exposures for pod %s: %w", box.GetPodId(), err)
+	}
+
 	// Every container's resident-shim dir, before the profile is compiled: a
 	// container keeps its dir for the pod's life (RestartContainer and
 	// StartContainer re-use it). The pod profile does not name the dirs — it
@@ -650,7 +681,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
-	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths, viewPaths)
+	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths, viewPaths, exposeLeaves)
 	if err != nil {
 		if errors.Is(err, errInvalidPodBox) {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
@@ -801,11 +832,13 @@ func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 // are the credential mounts (the read-only sub-scope, mount.CredentialPaths);
 // pvWrite and pvRead are the bound PV dirs (volume.Binder.Plan); views are the
 // artifact view directories its image mounts link to (mount.LinkImageVolumes),
-// each granted read-only and no-exec.
+// each granted read-only and no-exec; exposes are the pod's exposure leaves
+// (volume.PlanExposures), each granted read+write after the exposures-root
+// deny.
 //
 // An underived data volume is errInvalidPodBox (wrapped); any other failure is
 // the generator's.
-func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credPaths, pvWrite, pvRead, views []string) (string, error) {
+func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credPaths, pvWrite, pvRead, views, exposes []string) (string, error) {
 	// The data volume the profile is about to re-allow read+write must be one this
 	// runtime derived for this pod. Checked here, immediately before the
 	// only call that consumes it: sandbox.Generate emits it after the protected
@@ -869,6 +902,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 		ReadPaths:     pvRead,
 		// Each image volume's view: read, never write, exec or map executable.
 		ArtifactViewPaths: views,
+		// The pod's own exposure leaves, re-allowed after the exposures-root
+		// deny every pod carries.
+		ExposePaths: exposes,
 		// The node-admitted hostPath shares (hostShares), at their host paths.
 		HostShares: shares,
 		// The pod's own POSIX semaphore prefix is derived from this and nothing
@@ -1048,6 +1084,16 @@ func (r *Runtime) createVMPod(ctx context.Context, box *runtimev1.PodBox, sp *ru
 	if fsGroup := box.GetPodSecurityContext().GetFsGroup(); fsGroup != 0 {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: pod %s: %w", errInvalidPodBox, box.GetPodId(), errVMFsGroupUnsupported)
+	}
+	// An exposure is a host directory a named account reaches by ACL beside a
+	// pod running at a host path; a guest has neither, so it is refused, by
+	// name, before anything is pulled or created.
+	for _, v := range box.GetVolumes() {
+		if v.GetExpose() != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: pod %s: volume %q: %w: exposure volumes are served to native pods only, not to the vm backend",
+					errInvalidPodBox, box.GetPodId(), v.GetName(), hostshare.ErrNotExposed)
+		}
 	}
 
 	// The hostname is checked here too, before any pull, share materialization
