@@ -330,6 +330,9 @@ func TestMatchMostSpecificEntryWins(t *testing.T) {
 		{"/Users/dev/Code/app/src", ModeReadWrite},
 		{"/Users/dev/Code/app/secrets", ModeReadOnly},
 		{"/Users/dev/Code/app/secrets/k", ModeReadOnly},
+		{"/Users/dev/Code/app/SECRETS", ModeReadOnly},
+		{"/users/dev/code/APP/Secrets/k", ModeReadOnly},
+		{"/USERS/dev/Code/app/src", ModeReadWrite},
 		{"/Volumes/data/x", ModeReadWrite},
 	} {
 		got, ok := match(entries, tc.path, "Directory")
