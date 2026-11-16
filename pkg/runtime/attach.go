@@ -437,6 +437,10 @@ func (r *Runtime) AttachPod(ctx context.Context, box *runtimev1.PodBox) (*runtim
 	}
 	r.armMemorySampler(p)
 	r.log.Info("re-attached a pod that survived a daemon restart", "pod", podID, "containers", adopted)
+	// The profile above re-derived the exposure leaves without I/O; the grants
+	// are re-read now, and an account root revoked while the daemon was down
+	// loses its ACL entry (the pod keeps running).
+	r.recheckAttachedExposures(box)
 
 	st := r.podStatus(p)
 	r.publish(runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_ADDED, st)
@@ -526,7 +530,8 @@ func attachableContainers(box *runtimev1.PodBox) []*runtimev1.Container {
 // through the pure halves of the create-time volume work: mount.CredentialPaths
 // for the credential read-only sub-scope, volume.Binder.Plan for the PV
 // read/write scope and the image volumes' links for their view grants
-// (linkedImageViews), then compileProfile — the derivation createPod feeds from
+// (linkedImageViews) and volume.PlanExposures for the exposure leaves, then
+// compileProfile — the derivation createPod feeds from
 // Materialize and Bind. Nothing is rendered, bound or created.
 func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
 	rootfs, err := r.rootfsPath(box)
@@ -555,7 +560,11 @@ func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return r.compileProfile(box, rootfs, box.GetPodIp(), credPaths, pvWrite, pvRead, views)
+	exposes, err := r.exposePaths(box)
+	if err != nil {
+		return "", err
+	}
+	return r.compileProfile(box, rootfs, box.GetPodIp(), credPaths, pvWrite, pvRead, views, exposes)
 }
 
 // isSidecarSpec reports whether an init-list container is a native sidecar

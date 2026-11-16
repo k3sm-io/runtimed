@@ -30,6 +30,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"k3sm.io/runtimed/pkg/artifact"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -290,6 +291,14 @@ type Config struct {
 	// shells, tar and the common coreutils, which this same shim then also
 	// rewrites at every exec.
 	PathShimPath string
+	// HostSharesFile is the node's host-share allowlist (hostshare.DefaultFile
+	// on an installed node): the host directories and sockets a native pod may
+	// mount with a hostPath volume at their own path. It is read on every
+	// profile compile, so an edit takes effect for the next pod and a removed
+	// share is not re-granted to a pod re-attached after a restart. Empty, or
+	// a missing file, shares nothing; a file that is not root-owned and
+	// root-only-writable fails every pod that mounts a hostPath volume.
+	HostSharesFile string
 	// ShadowBinDir is the node's directory of ad-hoc re-signed copies of the
 	// host binaries in the shadowset list (the shells bash, zsh, dash and env,
 	// bash also serving /bin/sh; tar; the common coreutils such as cat, cp,
@@ -421,14 +430,21 @@ type Runtime struct {
 	// gpuDevice is the probed Metal device name, kept beside the facts for the one
 	// construction-time log line: it is a diagnostic string, never a reported fact
 	// (a device name is not a scheduling input), so it is not on the wire.
-	gpuDevice   string
-	spawner     supervisor.Spawner
-	waiter      supervisor.ExitWaiter
-	network     supervisor.PodNetwork
-	resolver    mount.Resolver
-	binder      *volume.Binder
-	footprinter supervisor.Footprinter
-	broker      *broker
+	gpuDevice string
+	spawner   supervisor.Spawner
+	waiter    supervisor.ExitWaiter
+	network   supervisor.PodNetwork
+	resolver  mount.Resolver
+	binder    *volume.Binder
+	// exposeACL lets a host account into a pod's exposure volumes
+	// (Deps.ExposeACL); nil refuses every pod with one. exposeGrants and
+	// accountName are test seams: nil reads the grants from
+	// Config.HostSharesFile and names a uid through os/user.
+	exposeACL    volume.ExposeACL
+	exposeGrants func() ([]hostshare.ExposeGrant, error)
+	accountName  hostshare.AccountName
+	footprinter  supervisor.Footprinter
+	broker       *broker
 
 	// signalGroup signals a pod's process GROUP (supervisor.SignalGroup in
 	// production); it is a field so the graceful-stop and OOM-kill
@@ -804,6 +820,10 @@ type Deps struct {
 	// local-path class and empty-create only (no seed template). Tests inject one
 	// with a custom class/template; the provider may wire a TemplateResolver.
 	Binder *volume.Binder
+	// ExposeACL lets a host account into a pod's exposure volumes. It has NO
+	// default: the node (k3sm) wires one backed by acl(3). nil refuses every
+	// pod with an exposure volume (fail closed).
+	ExposeACL volume.ExposeACL
 	// Footprinter samples per-PID memory footprints for the OOM/metering sampler
 	// Defaults to supervisor.PhysFootprinter (proc_pid_rusage); tests
 	// inject a fake.
@@ -1215,6 +1235,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		network:        network,
 		resolver:       deps.Resolver,
 		binder:         binder,
+		exposeACL:      deps.ExposeACL,
 		footprinter:    footprinter,
 		signalGroup:    signalGroup,
 		procStart:      procStart,

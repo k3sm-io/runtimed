@@ -953,6 +953,15 @@ func (r *Runtime) DeferVMSweep(reason string) {
 func (r *Runtime) ReapOrphanedPods() error {
 	r.podReapOnce.Do(func() {
 		r.podReapErr = r.reapOrphanedPodsOnce()
+		// The exposure sweep rides the same once-after-attach hook, and only
+		// once attaches are closed (podReapStarted): before that, a pod not yet
+		// re-attached would look deleted.
+		r.mu.Lock()
+		closed := r.podReapStarted
+		r.mu.Unlock()
+		if closed {
+			r.sweepExposures()
+		}
 	})
 	return r.podReapErr
 }

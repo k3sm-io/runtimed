@@ -251,6 +251,20 @@ var ErrInvalidStateDir = errors.New("sbpl: invalid state dir")
 // manifest directory, or anything outside them.
 var ErrInvalidArtifactView = errors.New("sbpl: invalid artifact view path")
 
+// ErrInvalidExposePath is returned by Generate when a GenerateOptions.ExposePaths
+// entry is not exactly one exposure leaf, <root>/<namespace>/<pod>/<volume>
+// under an exposures root (exposeRoots): never the root, a namespace or pod
+// directory, or anything outside them.
+var ErrInvalidExposePath = errors.New("sbpl: invalid exposure path")
+
+// ExposeSubdir is the exposures root under the data root (and under the work
+// dir): <root>/expose/<namespace>/<pod>/<volume>. It mirrors
+// k3sm.io/runtimed/pkg/hostshare ExposeSubdir, which this leaf package does not
+// import. The root is denied read+write for every pod in the protected tier,
+// and a pod's own leaves (GenerateOptions.ExposePaths) are re-allowed after
+// it, as the pod's data volume is re-allowed under the denied pods root.
+const ExposeSubdir = "expose"
+
 // ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
 // not reside under the configured Posture.Home. In the unprivileged user-space
 // posture the daemon's data area lives under its home; a work-dir outside it
@@ -459,6 +473,19 @@ type GenerateOptions struct {
 	// the data volume is writable, so a pod can copy a view file there and run
 	// it. They stop the view itself being executed or mapped executable.
 	ArtifactViewPaths []string
+	// HostShares are the node-admitted host directories and sockets this pod
+	// mounts at their own host paths (pkg/hostshare decides them from the
+	// node's root-owned allowlist; the pod spec never does). Each is validated
+	// against the posture here again, and rendered in the re-allow tier after
+	// the protected denies, because a share under /Users is the one place the
+	// /Users deny is narrowed. See hostShareStanza.
+	HostShares []HostShare
+	// ExposePaths are this pod's exposure leaves (pkg/volume PlanExposures),
+	// each exactly <exposures root>/<namespace>/<pod>/<volume>. The exposures
+	// root is denied for every pod in the protected tier, so each leaf is
+	// re-allowed read+write AFTER the denies (last-match-wins), beside the
+	// pod's data volume: a pod reaches its own leaves and no sibling's.
+	ExposePaths []string
 	// PodUID is the kube Pod UID (PodBox.pod_id). When set, Generate grants the
 	// pod its own POSIX named semaphores, filtered to the prefix PosixSemPrefix
 	// derives from it (posixsem.go); empty grants none. Not in the proto: the
@@ -627,6 +654,18 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// The artifact views are checked by shape, not against the deny-set: each
 	// lies under the denied views root by design and is re-allowed after it.
 	viewPaths, err := validateArtifactViews(filepath.Dir(podsRoot), opts.ArtifactViewPaths)
+	if err != nil {
+		return "", err
+	}
+
+	shares, err := validateHostShares(opts.HostShares, protectedPrefixes, dataVol)
+	if err != nil {
+		return "", err
+	}
+
+	// The exposure leaves, like the views, are checked by shape: each lies
+	// under a denied exposures root by design and is re-allowed after it.
+	exposePaths, err := validateExposePaths(exposeRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot), opts.ExposePaths)
 	if err != nil {
 		return "", err
 	}
@@ -845,6 +884,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// profile documents a protection it does not carry.
 	writeCommentNameList(&b, "reap stores", ReapStoreSubdirs())
 	writeCommentNameList(&b, "daemon trees", DaemonTreeSubdirs())
+	writeCommentNameList(&b, "exposures root", []string{ExposeSubdir})
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
@@ -875,6 +915,27 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("(allow file-read* file-write*\n")
 	writeFirmlinkSubpaths(&b, []string{dataVol})
 	b.WriteString("  )\n")
+	if len(exposePaths) > 0 {
+		b.WriteString(";; re-allow THIS pod's own exposure volumes (under the denied exposures root).\n")
+		b.WriteString("(allow file-read* file-write*\n")
+		writeFirmlinkSubpaths(&b, exposePaths)
+		b.WriteString("  )\n")
+		// The leaf directory itself is the grant boundary: runtimed set its
+		// 0700 mode and the receiving account's ACL entry, and the pod runs as
+		// the same uid as the directory's owner. Without this a pod could open
+		// its leaf to every local account (chmod 0777) or re-add an entry a
+		// revoke removed. Unlink and create are denied on the leaf node too: the
+		// pod owns the 0711 <ns>/<pod> parent, so without them it could rmdir
+		// the leaf and mkdir a fresh 0777 one with no ACL, or put a symlink in
+		// its place. What the pod creates below the leaf stays its own.
+		b.WriteString(";; keep THIS pod's exposure directories in place, with their own mode, ACL, flags and owner as runtimed set them.\n")
+		b.WriteString("(deny file-write-unlink file-write-create file-write-mode file-write-acl file-write-flags file-write-owner\n")
+		writeFirmlinkLiterals(&b, exposePaths)
+		b.WriteString("  )\n")
+	}
+	shareFiles, shareSockets := hostShareStanza(shares)
+	b.WriteString(shareFiles)
+	b.WriteString(shareSockets)
 
 	// The stat-walk grant for every subtree re-allowed above. A tool that
 	// canonicalizes its working directory — swift-driver and swift-frontend do,
@@ -906,6 +967,10 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	reallowed := append([]string{dataVol}, opts.WritePaths...)
 	reallowed = append(reallowed, opts.ReadPaths...)
 	reallowed = append(reallowed, viewPaths...)
+	reallowed = append(reallowed, exposePaths...)
+	for _, sh := range shares {
+		reallowed = append(reallowed, sh.Path)
+	}
 	if ancestors := ancestorMetadataPaths(reallowed); len(ancestors) > 0 {
 		b.WriteString(";; existence only: the strict ancestors of every re-allowed subtree, so a\n")
 		b.WriteString(";; stat-walk (chdir/realpath canonicalization — swift-driver, swift-frontend)\n")
@@ -963,7 +1028,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// an edit that widens, narrows, or reorders it fails here — at generation, with
 	// the pod named — rather than at sandbox_apply, where a non-compiling stanza
 	// takes down every networked pod on the node one create at a time.
-	if err := ValidateNetworkScope(sp, out); err != nil {
+	//
+	// The host-share socket stanza is AF_UNIX connects to literal node-admitted
+	// paths, not IP networking, so it is checked on its own shape and left out
+	// of the network-scope check, which would read it as an unrequested allow.
+	if err := checkHostShareSocketStanza(shareSockets); err != nil {
+		return "", err
+	}
+	if err := ValidateNetworkScope(sp, strings.Replace(out, shareSockets, "", 1)); err != nil {
 		return "", err
 	}
 	return out, nil
@@ -1099,7 +1171,11 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 		return "", nil, nil, err
 	}
 	var unrendered []string
-	for _, tree := range DataRootDenyTrees(dataRoot, stateDir) {
+	// The exposures roots join the DataRoot trees under the same rules: a
+	// spelling already rendered adds no line. A pod's own leaves are re-allowed
+	// after the protected denies (GenerateOptions.ExposePaths).
+	trees := append(DataRootDenyTrees(dataRoot, stateDir), exposeRoots(workDir, dataRoot)...)
+	for _, tree := range trees {
 		if !rendersDenied(workDirDenyRoots, tree) {
 			workDirDenyRoots = append(workDirDenyRoots, tree)
 		} else if !slices.Contains(workDirDenyRoots, tree) {
@@ -1404,6 +1480,42 @@ func validateArtifactViews(workDir string, views []string) ([]string, error) {
 		}
 	}
 	return dedupeSorted(views), nil
+}
+
+// exposeRoots returns the exposures roots a profile denies: <workDir>/expose,
+// and <dataRoot>/expose when a data root is set and differs from workDir. The
+// runtime keeps exposures under the data root when it has one, else under its
+// work dir; denying both keeps the deny right whichever it is.
+func exposeRoots(workDir, dataRoot string) []string {
+	roots := []string{filepath.Join(workDir, ExposeSubdir)}
+	if dataRoot != "" && dataRoot != workDir {
+		roots = append(roots, filepath.Join(dataRoot, ExposeSubdir))
+	}
+	return roots
+}
+
+// validateExposePaths returns leaves sorted and de-duplicated, refusing any
+// entry that is not absolute, clean, carried by a profile string unchanged and
+// exactly three components below one of roots (ErrInvalidExposePath).
+func validateExposePaths(roots, leaves []string) ([]string, error) {
+	for _, p := range leaves {
+		if !filepath.IsAbs(p) || filepath.Clean(p) != p || strconv.Quote(p) != `"`+p+`"` {
+			return nil, fmt.Errorf("%w: %q is not an absolute, clean path", ErrInvalidExposePath, p)
+		}
+		ok := false
+		for _, root := range roots {
+			if !strictlyUnder(p, root) {
+				continue
+			}
+			parts := strings.Split(strings.TrimPrefix(p, root+string(filepath.Separator)), string(filepath.Separator))
+			ok = len(parts) == 3
+			break
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: %q is not <exposures root>/<namespace>/<pod>/<volume> under %q", ErrInvalidExposePath, p, roots)
+		}
+	}
+	return dedupeSorted(leaves), nil
 }
 
 // isHex64 reports whether s is 64 lowercase hex digits (a hex sha256).

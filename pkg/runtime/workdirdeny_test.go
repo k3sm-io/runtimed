@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"k3sm.io/runtimed/pkg/guestartifacts"
+	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
@@ -165,6 +166,22 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 		rt := newTestRuntimeCfg(t, Config{Root: root}, Deps{})
 		if got, want := rt.binder.Class().BasePath, filepath.Join(root, storage); got != want {
 			t.Errorf("PV class base path = %q, want %q — the exemption names a directory the binder no longer uses", got, want)
+		}
+	})
+
+	// (3b) The exposures root is denied by its own stanza, not by a deny-list
+	// line: every pod's profile denies <root>/expose in the protected tier and
+	// then re-allows that pod's own leaves after it (sandbox.GenerateOptions
+	// ExposePaths), which a DaemonTreeSubdirs entry could not express. The
+	// sandbox name mirrors the one pkg/hostshare builds the leaves from.
+	t.Run("the exposures root has its own deny stanza", func(t *testing.T) {
+		if sandbox.ExposeSubdir != hostshare.ExposeSubdir {
+			t.Fatalf("sandbox.ExposeSubdir = %q, hostshare.ExposeSubdir = %q: the profile would deny one tree and the leaves live in another", sandbox.ExposeSubdir, hostshare.ExposeSubdir)
+		}
+		for _, sub := range append(sandbox.ReapStoreSubdirs(), sandbox.DaemonTreeSubdirs()...) {
+			if sub == sandbox.ExposeSubdir {
+				t.Errorf("%q is in a deny list; it is denied by its own stanza so a pod's leaves can be re-allowed after it", sub)
+			}
 		}
 	})
 

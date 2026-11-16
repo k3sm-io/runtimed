@@ -231,6 +231,8 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			if err := r.removePodDir(req.GetPodId()); err != nil {
 				r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 			}
+			// Exposures are pod-lifetime but live outside the pod dir.
+			r.removeExposures(p.box)
 		},
 	})
 	r.releasePodArtifacts(ctx, p.box, 0)
