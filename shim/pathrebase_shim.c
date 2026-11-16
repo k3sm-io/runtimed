@@ -173,6 +173,22 @@
  * DYLD_INSERT_LIBRARIES) keeps its own names and gets EPERM, and no rewrite
  * can reach another pod's prefix, because this one only ever writes its own.
  *
+ * Darwin user-dir suffix stickiness (a fifth job, configured by
+ *   DIRHELPER_USER_DIR_SUFFIX - the pod's per-pod user-dir suffix, "k3sm.<pod id>"
+ * and read ONCE, by the same load-time constructor). libSystem's dirhelper
+ * reads it to answer confstr(_CS_DARWIN_USER_TEMP_DIR|CACHE_DIR) with the
+ * pod's own links into its data volume (runtimed pkg/runtime/userdirs.go).
+ * Build systems run tasks with a curated environment: Swift Build gives its
+ * link step five variables (LLBUILD_* and PATH), so the swift-driver that
+ * links never sees the suffix, asks for the shared temp tree the profile
+ * denies and fails ("couldNotFindTmpDir"). execve and posix_spawn therefore
+ * append "DIRHELPER_USER_DIR_SUFFIX=<the value this process loaded with>" to
+ * a child envp that does not name it. An envp that names it (any value) is
+ * passed unchanged, and so is one longer than K3SM_STICKY_ENV_MAX entries
+ * (the child then fails closed, as before). Like the semaphore rewrite this is
+ * a compatibility aid: the profile's two metadata literals are the boundary,
+ * and another pod's suffix in an envp resolves nothing.
+ *
  * Everything on the exec path is async-signal-safe (stack buffers,
  * open/fstat/read/write/close/stat/lstat, no malloc; the rebase config is
  * parsed at load), because execve is routinely called in a forked child of a
@@ -814,6 +830,58 @@ int k3sm_sem_unlink(const char *name) {
     return sem_unlink(k3sm_sem_name(name, buf));
 }
 
+/* -------- DIRHELPER_USER_DIR_SUFFIX stickiness -------- */
+
+#define K3SM_DIRSFX_NAME "DIRHELPER_USER_DIR_SUFFIX="
+#define K3SM_DIRSFX_NAME_LEN (sizeof(K3SM_DIRSFX_NAME) - 1)
+#define K3SM_DIRSFX_MAX 255
+/* The longest envp the stickiness rebuilds, on the stack. Larger envps pass
+ * through unchanged (fail closed), so a fork child's stack is never at risk. */
+#define K3SM_STICKY_ENV_MAX 1024
+
+static char g_dirsfx_entry[K3SM_DIRSFX_NAME_LEN + K3SM_DIRSFX_MAX + 1];
+static int g_dirsfx_on;
+
+/* Called once from the constructor: capture the entry, or leave the feature
+ * off for an empty, oversized or path-like value. */
+static void k3sm_dirsfx_init(void) {
+    const char *v = getenv("DIRHELPER_USER_DIR_SUFFIX");
+    if (v == NULL || v[0] == '\0' || strchr(v, '/') != NULL) {
+        return;
+    }
+    size_t l = strlen(v);
+    if (l > K3SM_DIRSFX_MAX) {
+        return;
+    }
+    memcpy(g_dirsfx_entry, K3SM_DIRSFX_NAME, K3SM_DIRSFX_NAME_LEN);
+    memcpy(g_dirsfx_entry + K3SM_DIRSFX_NAME_LEN, v, l + 1);
+    g_dirsfx_on = 1;
+}
+
+/*
+ * k3sm_sticky_envp returns envp, or out filled with envp plus the captured
+ * suffix entry when envp lacks the name. out has K3SM_STICKY_ENV_MAX + 2
+ * slots. Async-signal-safe: no allocation, only reads and pointer copies.
+ */
+static char *const *k3sm_sticky_envp(char *const envp[], char **out) {
+    if (!g_dirsfx_on || envp == NULL) {
+        return envp;
+    }
+    size_t n = 0;
+    for (; envp[n] != NULL; n++) {
+        if (strncmp(envp[n], K3SM_DIRSFX_NAME, K3SM_DIRSFX_NAME_LEN) == 0) {
+            return envp;
+        }
+        if (n >= K3SM_STICKY_ENV_MAX) {
+            return envp;
+        }
+        out[n] = envp[n];
+    }
+    out[n] = g_dirsfx_entry;
+    out[n + 1] = NULL;
+    return out;
+}
+
 __attribute__((constructor)) static void k3sm_shadow_init(void) {
     /* Settle the rebase config at load too, so an exec in a forked child
      * never runs the (non-async-signal-safe) parse. */
@@ -827,6 +895,7 @@ __attribute__((constructor)) static void k3sm_shadow_init(void) {
         }
     }
     k3sm_sem_init();
+    k3sm_dirsfx_init();
     const char *d = getenv("K3SM_SHADOW_DIR");
     if (d == NULL || d[0] != '/') {
         return;
@@ -1120,7 +1189,9 @@ static void k3sm_fill_argv(const k3sm_exec_plan_t *pl, char *const argv[], size_
     nargv[j] = NULL;
 }
 
-int k3sm_execve(const char *path, char *const argv[], char *const envp[]) {
+int k3sm_execve(const char *path, char *const argv[], char *const envp_in[]) {
+    char *sticky[K3SM_STICKY_ENV_MAX + 2];
+    char *const *envp = k3sm_sticky_envp(envp_in, sticky);
     if (g_shadow_dir_len == 0 && !g_cfg.enabled) {
         return execve(path, argv, envp);
     }
@@ -1149,7 +1220,9 @@ int k3sm_execve(const char *path, char *const argv[], char *const envp[]) {
 }
 
 int k3sm_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
-                     const posix_spawnattr_t *attr, char *const argv[], char *const envp[]) {
+                     const posix_spawnattr_t *attr, char *const argv[], char *const envp_in[]) {
+    char *sticky[K3SM_STICKY_ENV_MAX + 2];
+    char *const *envp = k3sm_sticky_envp(envp_in, sticky);
     if (g_shadow_dir_len == 0 && !g_cfg.enabled) {
         return posix_spawn(pid, path, fa, attr, argv, envp);
     }

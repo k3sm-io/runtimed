@@ -868,6 +868,12 @@ func testDeps(t *testing.T, d Deps) Deps {
 	if d.Network == nil {
 		d.Network = supervisor.NodeNetwork{IP: "10.1.2.3"}
 	}
+	// The per-pod Darwin user dirs default OFF in unit tests: the real probe
+	// names this user's shared /var/folders trees, and a pod test would make
+	// links there. userdirs_test.go opts in with temp trees (fakeUserDirs).
+	if d.DarwinUserDirs == nil {
+		d.DarwinUserDirs = func() (string, string, error) { return "", "", errUserDirsOffInTests }
+	}
 	// Default the startup-reap seams to deterministic fakes so pod-lifecycle unit
 	// tests never fall through to the real kern.proc.* sysctls (nondeterministic,
 	// and a unit-tier dependency on the live process table). ProcStartTime reports

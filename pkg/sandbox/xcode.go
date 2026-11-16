@@ -86,6 +86,14 @@ package sandbox
 //     the other children (D/Library, the other .xctoolchain and .platform trees).
 //   - literal D/Platforms/MacOSX.platform/Info.plist — the platform manifest
 //     xcodebuild reads to identify the platform it just opened.
+//   - regex ^D/Platforms/[^/]+\.platform/Info\.plist$ — every platform's
+//     manifest, and nothing else in the sibling bundles. Swift Build, the
+//     default `swift build`, loads every platform at session start and fails the
+//     whole build ("unable to load platform: 'Info.plist' was malformed:
+//     Operation not permitted") when one manifest is unreadable. One file per
+//     platform, read-only; the reach is the list of installed platforms and
+//     their public version metadata. The sibling bundles' SDKs, tools and
+//     PrivatePlugIns stay denied. [^/]+ keeps the match inside Platforms.
 //   - literal B/Contents/Info.plist, B/Contents/version.plist — the two bundle
 //     plists the toolchain reads to identify which Xcode it is running inside.
 //     Files, named individually; Contents itself is never a subpath.
@@ -365,6 +373,16 @@ func xcodeToolchainStanza(dir string) string {
 	b.WriteString(";; bundle plists the toolchain reads — files, named one by one.\n")
 	b.WriteString("(allow file-read*\n")
 	writeFirmlinkLiterals(&b, literals)
+	b.WriteString("  )\n")
+	b.WriteString(";; every platform's manifest, and nothing else of a sibling platform:\n")
+	b.WriteString(";; Swift Build loads every platform at session start.\n")
+	b.WriteString("(allow file-read*\n")
+	for _, form := range firmlinkForms(filepath.Join(dir, "Platforms")) {
+		// NOT %q, as in writeXcodeHelperCarve: the pattern carries its own
+		// regex escapes. TestXcodeToolchainGrantReadsEveryPlatformManifest pins
+		// that it matches.
+		b.WriteString("  (regex #\"^" + regexp.QuoteMeta(form) + "/[^/]+\\.platform/Info\\.plist$\")\n")
+	}
 	b.WriteString("  )\n")
 	b.WriteString(";; existence only: the ancestors the tools stat-walk on the way down.\n")
 	b.WriteString("(allow file-read-metadata\n")

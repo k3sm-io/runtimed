@@ -65,6 +65,11 @@
   (literal "/Applications/Xcode.app/Contents/Info.plist")
   (literal "/Applications/Xcode.app/Contents/version.plist")
   )
+;; every platform's manifest, and nothing else of a sibling platform:
+;; Swift Build loads every platform at session start.
+(allow file-read*
+  (regex #"^/Applications/Xcode\.app/Contents/Developer/Platforms/[^/]+\.platform/Info\.plist$")
+  )
 ;; existence only: the ancestors the tools stat-walk on the way down.
 (allow file-read-metadata
   (literal "/Applications")

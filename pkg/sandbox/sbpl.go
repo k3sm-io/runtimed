@@ -491,6 +491,11 @@ type GenerateOptions struct {
 	// derives from it (posixsem.go); empty grants none. Not in the proto: the
 	// pod id already is, and the prefix is derived from it here, never sent.
 	PodUID string
+	// UserDirs, with PodUID, grants the pod's per-pod Darwin user dir links
+	// (userdirs.go): file-read-metadata on <Temp>/k3sm.<PodUID> and
+	// <Cache>/k3sm.<PodUID>, literals only. Zero (or an empty PodUID) grants
+	// nothing. Not in the proto: the runtime resolves it from its own uid.
+	UserDirs UserDirs
 }
 
 // Generate renders a default-deny SBPL profile for one pod from sp and opts.
@@ -708,6 +713,15 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// happens to set the flag.
 	deniedPorts, err := dedupeSortedPorts(sp.GetDeniedLocalPorts())
 	if err != nil {
+		return "", err
+	}
+	// The per-pod user dir links are validated with everything else, before a
+	// line is written.
+	userLinks, err := userDirLinks(opts.UserDirs, opts.PodUID)
+	if err != nil {
+		return "", err
+	}
+	if err := validateUserDirLinks(userLinks, protectedPrefixes); err != nil {
 		return "", err
 	}
 
@@ -969,6 +983,11 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		}
 		b.WriteString("  )\n")
 	}
+
+	// --- per-pod Darwin user dir links (metadata on two literals) ----------
+	// After the protected denies, like the ancestors above; the links are
+	// validated against the protected set, so this can re-open nothing.
+	b.WriteString(userDirLinkStanza(userLinks))
 
 	// --- credential read-only sub-scope (highest precedence) --------------
 	// last, so this file-write* deny wins even though the credential lives inside

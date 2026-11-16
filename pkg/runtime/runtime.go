@@ -352,6 +352,10 @@ type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
 	cfg Config
+	// userDirs is the node user's shared Darwin temp and cache trees the
+	// per-pod user dir links live in (userdirs.go); zero means off. Set once by
+	// New, read-only after.
+	userDirs darwinUserDirs
 	// home is the daemon user's home when the work-dir (cfg.Root) lives under it
 	// (the unprivileged user-space posture); else "". It is passed to the SBPL
 	// generator as the work-dir containment bound (sandbox.Posture.Home) so a
@@ -775,6 +779,10 @@ type Deps struct {
 	// sandbox.ProbeHostRosetta; tests inject a fake. New calls it eagerly exactly
 	// once (see the rosettaHost field), so it forks at most once per daemon lifetime.
 	HostRosetta func(ctx context.Context) sandbox.HostRosettaState
+	// DarwinUserDirs answers this daemon's own Darwin user temp and cache trees
+	// (the per-pod user dirs, userdirs.go). Defaults to sandbox.DarwinUserDirs
+	// (confstr); tests inject temp dirs. An error turns the feature off.
+	DarwinUserDirs func() (temp, cache string, err error)
 	// GuestRosetta probes whether a Linux GUEST on this host could translate
 	// linux/amd64 ELF payloads (Rosetta for Linux — the vm backend's capability).
 	// Defaults to sandbox.ProbeGuestRosetta; tests inject a fake. It takes no ctx
@@ -1077,6 +1085,10 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if guestDialer == nil {
 		guestDialer = dialGuestUnix
 	}
+	userDirsProbe := deps.DarwinUserDirs
+	if userDirsProbe == nil {
+		userDirsProbe = sandbox.DarwinUserDirs
+	}
 	hostRosettaProbe := deps.HostRosetta
 	if hostRosettaProbe == nil {
 		hostRosettaProbe = sandbox.ProbeHostRosetta
@@ -1196,6 +1208,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 
 	rt := &Runtime{
 		cfg:            cfg,
+		userDirs:       resolveDarwinUserDirs(userDirsProbe, log),
 		home:           daemonHome(cfg.Root),
 		log:            log,
 		cache:          cache,
@@ -1240,6 +1253,8 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		shimDialer:     shimDialer,
 		rootLock:       lock,
 	}
+	// The links of pods deleted while this daemon was down.
+	rt.sweepDanglingUserDirLinks()
 	constructed = true
 	return rt, nil
 }

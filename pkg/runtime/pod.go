@@ -579,6 +579,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	if err := provisionPodTmpDir(rootfs); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
 	}
+	// The per-pod Darwin user dirs: the targets now, while no container exists
+	// to have planted anything in the data volume, then the links (userdirs.go).
+	if r.userDirs.on() {
+		if err := provisionPodUserDirs(rootfs); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
+		}
+		r.ensurePodUserDirLinks(box)
+	}
 	// Give the pod dir its reachability record the moment the dir exists, even
 	// for a pod that will never pull (a native host-binary pod). The image GC
 	// reads an absent record as "this pod's references are unknown" and refuses
@@ -910,6 +918,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 		// The pod's own POSIX semaphore prefix is derived from this and nothing
 		// else; containerEnv publishes the same derivation to the shim.
 		PodUID: box.GetPodId(),
+		// The pod's two per-pod user dir links (userdirs.go), derived from the
+		// same PodUID; zero when the feature is off.
+		UserDirs: sandbox.UserDirs{Temp: r.userDirs.temp, Cache: r.userDirs.cache},
 	})
 	if err != nil {
 		return "", fmt.Errorf("generate sbpl for pod %s: %w", box.GetPodId(), err)
@@ -1833,6 +1844,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	p.mu.Lock()
 	envBox, _ := proto.Clone(p.box).(*runtimev1.PodBox)
 	p.mu.Unlock()
+	// The links before the env that names them: the OS empties T at boot, and
+	// containerEnv injects the suffix only when both links are in place.
+	r.ensurePodUserDirLinks(envBox)
 	env, err := r.containerEnv(envBox, c, rb.env)
 	if err != nil {
 		_ = cleanup()
@@ -3441,6 +3455,12 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 			env = append(env, clangModuleCacheEnv+"="+podModuleCacheDir(dataVol))
 		}
 	}
+	// The per-pod Darwin user dir suffix (userdirs.go): only while both links
+	// are in place, and only for a container that runs as the uid the links
+	// were made for. Runtime-owned: a spec value is dropped below.
+	if sfx, ok := r.podUserDirLinksReady(box); ok && r.containerRunsAsUserDirsUID(box, c) {
+		env = append(env, userDirSuffixEnv+"="+sfx)
+	}
 	// The developer dir the profile granted. The field was validated by
 	// sandbox.Generate earlier in this same createPod (a value that would not
 	// validate failed the pod there, with no profile emitted), so what is
@@ -3454,7 +3474,10 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		// it (appended below), so a spec cannot aim the interposer anywhere.
 		// K3SM_SHIM_REPORT likewise: only the runtime names the report file.
 		// K3SM_SEM_PREFIX likewise: only the pod UID derives it.
-		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv || name == semPrefixEnv {
+		// DIRHELPER_USER_DIR_SUFFIX likewise: only the links runtimed made
+		// may be named (a missing one would have dirhelper make an
+		// undeletable directory in the shared tree).
+		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv || name == semPrefixEnv || name == userDirSuffixEnv {
 			continue
 		}
 		env = append(env, e)
@@ -3810,6 +3833,9 @@ func (r *Runtime) removePodDir(podID string) error {
 	if !mount.IsStrictlyUnder(dir, r.cache.PodsRoot()) {
 		return nil
 	}
+	// The per-pod user dir links live outside the pod dir, in the shared T and
+	// C trees, so RemoveAll would leave them dangling.
+	r.removePodUserDirLinks(podID)
 	return os.RemoveAll(dir)
 }
 

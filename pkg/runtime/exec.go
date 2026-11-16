@@ -102,6 +102,9 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 		return err
 	}
 	first.Command = cmdv
+	// An exec session carries the container's env, suffix included, so the
+	// links it names must exist before it runs (the OS empties T at boot).
+	r.ensurePodUserDirLinks(p.box)
 	if cp.proc != nil {
 		if conn := cp.proc.Shim(); conn != nil {
 			return r.execViaShim(stream, p, conn, cp, first)
@@ -154,6 +157,12 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 		if err != nil {
 			return status.Errorf(codes.InvalidArgument, "exec: %v", err)
 		}
+	} else if _, ok := r.podUserDirLinksReady(p.box); !ok {
+		// The stored env carries the suffix from the container's start. If
+		// the links could not be re-made above, a process carrying it would
+		// make dirhelper create an undeletable directory at the pod's link
+		// path, so the session runs without it (the platform answer).
+		cmdEnv = withoutEnvName(cmdEnv, userDirSuffixEnv)
 	}
 	cmd.Dir = dir
 	// The exec-shim starts with an EMPTY environment: the container's
