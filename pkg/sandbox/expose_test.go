@@ -115,8 +115,12 @@ func TestExposeProfileEnforcedOnDarwin(t *testing.T) {
 	dataVol := filepath.Join(base, "pods", "pod-a", "rootfs")
 	leafA := filepath.Join(base, ExposeSubdir, "ns", "pod-a", "vol")
 	leafB := filepath.Join(base, ExposeSubdir, "ns", "pod-b", "vol")
+	// leafE is an empty leaf of pod-a, leafM one runtimed has not made yet:
+	// the pod may neither remove the first nor create the second.
+	leafE := filepath.Join(base, ExposeSubdir, "ns", "pod-a", "empty")
+	leafM := filepath.Join(base, ExposeSubdir, "ns", "pod-a", "missing")
 	stray := filepath.Join(base, ExposeSubdir, "stray")
-	for _, d := range []string{dataVol, leafA, leafB} {
+	for _, d := range []string{dataVol, leafA, leafB, leafE} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +132,7 @@ func TestExposeProfileEnforcedOnDarwin(t *testing.T) {
 	}
 	prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol, ExtraReadPaths: []string{base}}, GenerateOptions{
 		Posture:     Posture{WorkDir: base},
-		ExposePaths: []string{leafA},
+		ExposePaths: []string{leafA, leafE, leafM},
 	})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -155,6 +159,12 @@ func TestExposeProfileEnforcedOnDarwin(t *testing.T) {
 		{"chmod own leaf itself", []string{"/bin/chmod", "0777", leafA}, false},
 		{"add an ACL entry to own leaf", []string{"/bin/chmod", "+a", "everyone allow list,search", leafA}, false},
 		{"set a flag on own leaf", []string{"/usr/bin/chflags", "uchg", leafA}, false},
+		{"remove own empty leaf", []string{"/bin/rmdir", leafE}, false},
+		{"rename own leaf away", []string{"/bin/mv", leafE, leafE + ".x"}, false},
+		{"create a missing leaf", []string{"/bin/mkdir", leafM}, false},
+		{"plant a symlink at a missing leaf", []string{"/bin/ln", "-s", "/tmp", leafM}, false},
+		{"make a directory in own leaf", []string{"/bin/mkdir", filepath.Join(leafA, "d")}, true},
+		{"remove a file in own leaf", []string{"/bin/rm", filepath.Join(leafA, "new")}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if err := run(c.argv...); (err == nil) != c.allow {

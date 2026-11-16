@@ -910,9 +910,12 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		// 0700 mode and the receiving account's ACL entry, and the pod runs as
 		// the same uid as the directory's owner. Without this a pod could open
 		// its leaf to every local account (chmod 0777) or re-add an entry a
-		// revoke removed. What the pod creates below the leaf stays its own.
-		b.WriteString(";; keep THIS pod's exposure directories' own mode, ACL, flags and owner as runtimed set them.\n")
-		b.WriteString("(deny file-write-mode file-write-acl file-write-flags file-write-owner\n")
+		// revoke removed. Unlink and create are denied on the leaf node too: the
+		// pod owns the 0711 <ns>/<pod> parent, so without them it could rmdir
+		// the leaf and mkdir a fresh 0777 one with no ACL, or put a symlink in
+		// its place. What the pod creates below the leaf stays its own.
+		b.WriteString(";; keep THIS pod's exposure directories in place, with their own mode, ACL, flags and owner as runtimed set them.\n")
+		b.WriteString("(deny file-write-unlink file-write-create file-write-mode file-write-acl file-write-flags file-write-owner\n")
 		writeFirmlinkLiterals(&b, exposePaths)
 		b.WriteString("  )\n")
 	}
