@@ -219,6 +219,13 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 			if vol.GetHostPath() != nil {
 				continue
 			}
+			// An exposure is bound by pkg/volume (BindExposures): a pod-lifetime
+			// dir under <data root>/expose, outside the pod tree, that one host
+			// account is granted by ACL and the pod reaches through a symlink
+			// at its mount path, as a PVC. It is not materialized here.
+			if vol.GetExpose() != nil {
+				continue
+			}
 			// The destination is the rebased mount path ONLY — subPath selects a
 			// source element (applied at materialization), it is NOT folded into
 			// the destination.

@@ -222,3 +222,26 @@ func TestMaterializeOptionalMissing(t *testing.T) {
 		t.Errorf("optional mount dir should still exist: %v", err)
 	}
 }
+
+// TestMaterializeSkipsExposeVolume pins that an exposure volume is left to
+// pkg/volume: nothing is written at its mount path, and it is no credential.
+func TestMaterializeSkipsExposeVolume(t *testing.T) {
+	dataVol := t.TempDir()
+	box := boxWith(
+		&runtimev1.Volume{Name: "sockets", Expose: &runtimev1.ExposeVolumeSource{User: "miko", Uid: 501}},
+		&runtimev1.Volume{Name: "scratch", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
+	)
+	layout, err := Materialize(context.Background(), box, dataVol, "", nil)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dataVol, "etc", "sockets")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the exposure mount path was materialized: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dataVol, "etc", "scratch")); err != nil {
+		t.Errorf("the emptyDir beside it was not materialized: %v", err)
+	}
+	if creds := layout.CredentialPaths(); len(creds) != 0 {
+		t.Errorf("credential paths = %v, want none", creds)
+	}
+}

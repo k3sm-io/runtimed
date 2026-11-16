@@ -220,6 +220,20 @@ func parse(r io.Reader, delegations bool, validate func(Entry) error) (File, err
 			out.Delegations = append(out.Delegations, d)
 			continue
 		}
+		if fields[0] == exposeKeyword {
+			if !delegations {
+				return File{}, fmt.Errorf("%w: line %d: an exposure grant may only be set in the root-owned node file", ErrInvalidEntry, line)
+			}
+			g, err := parseExposeGrant(fields)
+			if err != nil {
+				return File{}, fmt.Errorf("line %d: %w", line, err)
+			}
+			if len(out.Exposes) == maxExposeGrants {
+				return File{}, fmt.Errorf("%w: more than %d exposure grants", ErrInvalidEntry, maxExposeGrants)
+			}
+			out.Exposes = append(out.Exposes, g)
+			continue
+		}
 		if len(fields) != 2 {
 			return File{}, fmt.Errorf("%w: line %d: want \"<mode> <path>\"", ErrInvalidEntry, line)
 		}
@@ -261,6 +275,21 @@ func FormatFile(f File) []byte {
 		ds = slices.CompactFunc(ds, func(a, b Delegation) bool { return a.String() == b.String() })
 		for _, d := range ds {
 			b.WriteString(d.String())
+			b.WriteByte('\n')
+		}
+	}
+	if len(f.Exposes) > 0 {
+		b.WriteString("# Exposure grants: pods in the namespaces may publish a volume to the user (`sudo k3sm expose allow`).\n")
+		gs := slices.Clone(f.Exposes)
+		slices.SortFunc(gs, func(a, b ExposeGrant) int {
+			if c := int(a.UID) - int(b.UID); c != 0 {
+				return c
+			}
+			return strings.Compare(a.String(), b.String())
+		})
+		gs = slices.CompactFunc(gs, func(a, b ExposeGrant) bool { return a.String() == b.String() })
+		for _, g := range gs {
+			b.WriteString(g.String())
 			b.WriteByte('\n')
 		}
 	}

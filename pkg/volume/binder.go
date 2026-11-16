@@ -223,7 +223,7 @@ func (b *Binder) Bind(ctx context.Context, box *runtimev1.PodBox, rootfs string)
 			if !ok {
 				continue // not a PVC mount (configMap/secret/etc. handled by pkg/mount)
 			}
-			link, err := b.linkInto(rootfs, vm.GetMountPath(), vm.GetSubPath(), bindings[idx].DataDir)
+			link, err := linkInto(rootfs, vm.GetMountPath(), vm.GetSubPath(), bindings[idx].DataDir)
 			if err != nil {
 				return nil, fmt.Errorf("link pvc %q into pod: %w", vm.GetName(), err)
 			}
@@ -276,7 +276,7 @@ func (b *Binder) materialize(ctx context.Context, namespace, claimName, dataDir 
 // interpreted relative to the pod rootfs (mirroring pkg/mount); a path that would
 // escape the rootfs is rejected. A pre-existing symlink at the target is replaced
 // (idempotent re-bind); a pre-existing real file/dir is a conflict (fail closed).
-func (b *Binder) linkInto(rootfs, mountPath, subPath, dataDir string) (string, error) {
+func linkInto(rootfs, mountPath, subPath, dataDir string) (string, error) {
 	if strings.TrimSpace(mountPath) == "" {
 		return "", fmt.Errorf("%w: empty mount path", ErrInvalid)
 	}

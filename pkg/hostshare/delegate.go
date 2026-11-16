@@ -59,6 +59,8 @@ var ErrNotDelegated = errors.New("hostshare: entry is not admitted by a delegati
 type File struct {
 	Entries     []Entry
 	Delegations []Delegation
+	// Exposes are the exposure grants root made (ExposeGrant).
+	Exposes []ExposeGrant
 }
 
 // Delegation lets one non-root user add and remove shares under one prefix
@@ -202,6 +204,8 @@ type Dropped struct {
 type Effective struct {
 	Entries     []Entry
 	Delegations []Delegation
+	// Exposes are the node file's exposure grants, as written by root.
+	Exposes []ExposeGrant
 	// Owners maps an admitted delegated entry to the uid whose file holds it.
 	// An entry absent from it came from the root-owned file.
 	Owners  map[Entry]uint32
@@ -281,7 +285,7 @@ func (l loader) loadEffective(path string) (Effective, error) {
 	if err != nil {
 		return Effective{}, err
 	}
-	eff := Effective{Entries: slices.Clone(f.Entries), Delegations: f.Delegations, Owners: map[Entry]uint32{}}
+	eff := Effective{Entries: slices.Clone(f.Entries), Delegations: f.Delegations, Exposes: f.Exposes, Owners: map[Entry]uint32{}}
 	root := map[Entry]bool{}
 	for _, e := range f.Entries {
 		root[e] = true
