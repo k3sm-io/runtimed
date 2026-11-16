@@ -290,3 +290,16 @@ func (r *Runtime) sweepDanglingUserDirLinks() {
 		}
 	}
 }
+
+// withoutEnvName returns env without any NAME=... entry for name, as a new
+// slice (env itself, a container's stored env, is never modified).
+func withoutEnvName(env []string, name string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if n, _, _ := strings.Cut(e, "="); n == name {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}

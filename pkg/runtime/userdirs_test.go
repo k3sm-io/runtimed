@@ -253,3 +253,20 @@ func TestPodUserDirs(t *testing.T) {
 func containsLine(s, line string) bool {
 	return slices.Contains(strings.Split(s, "\n"), line)
 }
+
+// TestWithoutEnvName pins the exec fallback's strip: every entry for the name
+// goes, a longer name that shares its prefix stays, and the stored env is not
+// modified.
+func TestWithoutEnvName(t *testing.T) {
+	t.Parallel()
+	env := []string{"PATH=/usr/bin", userDirSuffixEnv + "=k3sm.p1", userDirSuffixEnv + "X=keep", userDirSuffixEnv + "=k3sm.p2"}
+	orig := append([]string(nil), env...)
+	got := withoutEnvName(env, userDirSuffixEnv)
+	want := []string{"PATH=/usr/bin", userDirSuffixEnv + "X=keep"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("withoutEnvName = %q, want %q", got, want)
+	}
+	if strings.Join(env, "\n") != strings.Join(orig, "\n") {
+		t.Errorf("withoutEnvName modified its input: %q", env)
+	}
+}
