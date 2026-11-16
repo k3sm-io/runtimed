@@ -251,6 +251,20 @@ var ErrInvalidStateDir = errors.New("sbpl: invalid state dir")
 // manifest directory, or anything outside them.
 var ErrInvalidArtifactView = errors.New("sbpl: invalid artifact view path")
 
+// ErrInvalidExposePath is returned by Generate when a GenerateOptions.ExposePaths
+// entry is not exactly one exposure leaf, <root>/<namespace>/<pod>/<volume>
+// under an exposures root (exposeRoots): never the root, a namespace or pod
+// directory, or anything outside them.
+var ErrInvalidExposePath = errors.New("sbpl: invalid exposure path")
+
+// ExposeSubdir is the exposures root under the data root (and under the work
+// dir): <root>/expose/<namespace>/<pod>/<volume>. It mirrors
+// k3sm.io/runtimed/pkg/hostshare ExposeSubdir, which this leaf package does not
+// import. The root is denied read+write for every pod in the protected tier,
+// and a pod's own leaves (GenerateOptions.ExposePaths) are re-allowed after
+// it, as the pod's data volume is re-allowed under the denied pods root.
+const ExposeSubdir = "expose"
+
 // ErrWorkDirEscapesHome reports a Posture.WorkDir that, while well-formed, does
 // not reside under the configured Posture.Home. In the unprivileged user-space
 // posture the daemon's data area lives under its home; a work-dir outside it
@@ -466,6 +480,12 @@ type GenerateOptions struct {
 	// the protected denies, because a share under /Users is the one place the
 	// /Users deny is narrowed. See hostShareStanza.
 	HostShares []HostShare
+	// ExposePaths are this pod's exposure leaves (pkg/volume PlanExposures),
+	// each exactly <exposures root>/<namespace>/<pod>/<volume>. The exposures
+	// root is denied for every pod in the protected tier, so each leaf is
+	// re-allowed read+write AFTER the denies (last-match-wins), beside the
+	// pod's data volume: a pod reaches its own leaves and no sibling's.
+	ExposePaths []string
 	// PodUID is the kube Pod UID (PodBox.pod_id). When set, Generate grants the
 	// pod its own POSIX named semaphores, filtered to the prefix PosixSemPrefix
 	// derives from it (posixsem.go); empty grants none. Not in the proto: the
@@ -634,6 +654,13 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	}
 
 	shares, err := validateHostShares(opts.HostShares, protectedPrefixes, dataVol)
+	if err != nil {
+		return "", err
+	}
+
+	// The exposure leaves, like the views, are checked by shape: each lies
+	// under a denied exposures root by design and is re-allowed after it.
+	exposePaths, err := validateExposePaths(exposeRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot), opts.ExposePaths)
 	if err != nil {
 		return "", err
 	}
@@ -843,6 +870,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	// profile documents a protection it does not carry.
 	writeCommentNameList(&b, "reap stores", ReapStoreSubdirs())
 	writeCommentNameList(&b, "daemon trees", DaemonTreeSubdirs())
+	writeCommentNameList(&b, "exposures root", []string{ExposeSubdir})
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
@@ -873,6 +901,12 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("(allow file-read* file-write*\n")
 	writeFirmlinkSubpaths(&b, []string{dataVol})
 	b.WriteString("  )\n")
+	if len(exposePaths) > 0 {
+		b.WriteString(";; re-allow THIS pod's own exposure volumes (under the denied exposures root).\n")
+		b.WriteString("(allow file-read* file-write*\n")
+		writeFirmlinkSubpaths(&b, exposePaths)
+		b.WriteString("  )\n")
+	}
 	shareFiles, shareSockets := hostShareStanza(shares)
 	b.WriteString(shareFiles)
 	b.WriteString(shareSockets)
@@ -907,6 +941,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	reallowed := append([]string{dataVol}, opts.WritePaths...)
 	reallowed = append(reallowed, opts.ReadPaths...)
 	reallowed = append(reallowed, viewPaths...)
+	reallowed = append(reallowed, exposePaths...)
 	for _, sh := range shares {
 		reallowed = append(reallowed, sh.Path)
 	}
@@ -1105,7 +1140,11 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 		return "", nil, nil, err
 	}
 	var unrendered []string
-	for _, tree := range DataRootDenyTrees(dataRoot, stateDir) {
+	// The exposures roots join the DataRoot trees under the same rules: a
+	// spelling already rendered adds no line. A pod's own leaves are re-allowed
+	// after the protected denies (GenerateOptions.ExposePaths).
+	trees := append(DataRootDenyTrees(dataRoot, stateDir), exposeRoots(workDir, dataRoot)...)
+	for _, tree := range trees {
 		if !rendersDenied(workDirDenyRoots, tree) {
 			workDirDenyRoots = append(workDirDenyRoots, tree)
 		} else if !slices.Contains(workDirDenyRoots, tree) {
@@ -1410,6 +1449,42 @@ func validateArtifactViews(workDir string, views []string) ([]string, error) {
 		}
 	}
 	return dedupeSorted(views), nil
+}
+
+// exposeRoots returns the exposures roots a profile denies: <workDir>/expose,
+// and <dataRoot>/expose when a data root is set and differs from workDir. The
+// runtime keeps exposures under the data root when it has one, else under its
+// work dir; denying both keeps the deny right whichever it is.
+func exposeRoots(workDir, dataRoot string) []string {
+	roots := []string{filepath.Join(workDir, ExposeSubdir)}
+	if dataRoot != "" && dataRoot != workDir {
+		roots = append(roots, filepath.Join(dataRoot, ExposeSubdir))
+	}
+	return roots
+}
+
+// validateExposePaths returns leaves sorted and de-duplicated, refusing any
+// entry that is not absolute, clean, carried by a profile string unchanged and
+// exactly three components below one of roots (ErrInvalidExposePath).
+func validateExposePaths(roots, leaves []string) ([]string, error) {
+	for _, p := range leaves {
+		if !filepath.IsAbs(p) || filepath.Clean(p) != p || strconv.Quote(p) != `"`+p+`"` {
+			return nil, fmt.Errorf("%w: %q is not an absolute, clean path", ErrInvalidExposePath, p)
+		}
+		ok := false
+		for _, root := range roots {
+			if !strictlyUnder(p, root) {
+				continue
+			}
+			parts := strings.Split(strings.TrimPrefix(p, root+string(filepath.Separator)), string(filepath.Separator))
+			ok = len(parts) == 3
+			break
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: %q is not <exposures root>/<namespace>/<pod>/<volume> under %q", ErrInvalidExposePath, p, roots)
+		}
+	}
+	return dedupeSorted(leaves), nil
 }
 
 // isHex64 reports whether s is 64 lowercase hex digits (a hex sha256).
