@@ -906,6 +906,15 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("(allow file-read* file-write*\n")
 		writeFirmlinkSubpaths(&b, exposePaths)
 		b.WriteString("  )\n")
+		// The leaf directory itself is the grant boundary: runtimed set its
+		// 0700 mode and the receiving account's ACL entry, and the pod runs as
+		// the same uid as the directory's owner. Without this a pod could open
+		// its leaf to every local account (chmod 0777) or re-add an entry a
+		// revoke removed. What the pod creates below the leaf stays its own.
+		b.WriteString(";; keep THIS pod's exposure directories' own mode, ACL, flags and owner as runtimed set them.\n")
+		b.WriteString("(deny file-write-mode file-write-acl file-write-flags file-write-owner\n")
+		writeFirmlinkLiterals(&b, exposePaths)
+		b.WriteString("  )\n")
 	}
 	shareFiles, shareSockets := hostShareStanza(shares)
 	b.WriteString(shareFiles)

@@ -151,6 +151,10 @@ func TestExposeProfileEnforcedOnDarwin(t *testing.T) {
 		{"write sibling leaf", []string{"/usr/bin/touch", filepath.Join(leafB, "new")}, false},
 		{"read the exposures root", []string{"/bin/cat", stray}, false},
 		{"list the exposures root", []string{"/bin/ls", filepath.Join(base, ExposeSubdir)}, false},
+		{"chmod a file in own leaf", []string{"/bin/chmod", "0666", filepath.Join(leafA, "f")}, true},
+		{"chmod own leaf itself", []string{"/bin/chmod", "0777", leafA}, false},
+		{"add an ACL entry to own leaf", []string{"/bin/chmod", "+a", "everyone allow list,search", leafA}, false},
+		{"set a flag on own leaf", []string{"/usr/bin/chflags", "uchg", leafA}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if err := run(c.argv...); (err == nil) != c.allow {
