@@ -95,7 +95,7 @@ func TestPodUserDirs(t *testing.T) {
 		const podID = "pod-ud-prof"
 		box := hostBinBox(rt, podID)
 		mustCreatePod(t, rt, box)
-		prof, err := rt.compileProfile(box, derivedRootfs(t, rt, podID), "", nil, nil, nil, nil)
+		prof, err := rt.compileProfile(box, derivedRootfs(t, rt, podID), "", nil, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
