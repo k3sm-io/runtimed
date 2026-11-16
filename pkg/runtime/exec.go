@@ -102,6 +102,9 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 		return err
 	}
 	first.Command = cmdv
+	// An exec session carries the container's env, suffix included, so the
+	// links it names must exist before it runs (the OS empties T at boot).
+	r.ensurePodUserDirLinks(p.box)
 	if cp.proc != nil {
 		if conn := cp.proc.Shim(); conn != nil {
 			return r.execViaShim(stream, p, conn, cp, first)
