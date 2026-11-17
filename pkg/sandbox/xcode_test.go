@@ -933,8 +933,7 @@ func TestXcodeToolchainGrantReadsEveryPlatformManifest(t *testing.T) {
 
 // TestXcodePlugInsCarveCoversEveryEntitledExecutable is the guard on the PlugIns
 // read grant (B1786): on this host's Xcode, no Mach-O executable that the grant
-// leaves readable (outside the .app/.appex/.xpc carve) carries an Apple-private
-// entitlement. The carve is extension-based, so a future Xcode that ships an
+// leaves readable (outside the .app/.appex/.xpc carve) carries any entitlement. The carve is extension-based, so a future Xcode that ships an
 // entitled helper in a .bundle or a plain directory fails this test instead of
 // being handed out silently.
 func TestXcodePlugInsCarveCoversEveryEntitledExecutable(t *testing.T) {
@@ -964,8 +963,8 @@ func TestXcodePlugInsCarveCoversEveryEntitledExecutable(t *testing.T) {
 			t.Errorf("codesign -d %s: %v: %s", p, err, out)
 			return nil
 		}
-		if strings.Contains(string(out), "com.apple.private.") {
-			t.Errorf("%s is a readable executable with an Apple-private entitlement; widen the PlugIns carve", p)
+		if strings.Contains(string(out), "<key>") {
+			t.Errorf("%s is a readable executable with entitlements; widen the PlugIns carve", p)
 		}
 		return nil
 	})
