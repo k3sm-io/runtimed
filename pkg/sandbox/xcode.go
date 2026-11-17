@@ -317,6 +317,12 @@ func xcodeToolchainStanza(dir string) string {
 	subpaths := []string{
 		filepath.Join(dir, "usr", "bin"),
 		filepath.Join(dir, "usr", "lib"),
+		// Xcode's git: its system gitconfig and templates, and the helpers it
+		// execs for a fetch (git-remote-https). SwiftPM resolves a package's
+		// dependencies through it (B1786 rig, RC5: "unable to access
+		// .../usr/share/git-core/gitconfig"). None of the helpers is entitled.
+		filepath.Join(dir, "usr", "share", "git-core"),
+		filepath.Join(dir, "usr", "libexec", "git-core"),
 		filepath.Join(dir, "Toolchains", "XcodeDefault.xctoolchain"),
 		filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer"),
 		filepath.Join(dir, "Library", "Frameworks", "XcodeKit.framework"),

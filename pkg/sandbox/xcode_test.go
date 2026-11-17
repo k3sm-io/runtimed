@@ -93,6 +93,8 @@ func TestXcodeToolchainStanzaShape(t *testing.T) {
 		for _, want := range []string{
 			`(subpath "` + xcodeDevDir + `/usr/bin")`,
 			`(subpath "` + xcodeDevDir + `/usr/lib")`,
+			`(subpath "` + xcodeDevDir + `/usr/share/git-core")`,
+			`(subpath "` + xcodeDevDir + `/usr/libexec/git-core")`,
 			`(subpath "` + xcodeDevDir + `/Toolchains/XcodeDefault.xctoolchain")`,
 			`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
 			`(subpath "` + xcodeDevDir + `/Library/Frameworks/XcodeKit.framework")`,
@@ -992,4 +994,38 @@ func isMachOExecutable(p string) bool {
 	}
 	defer f.Close()
 	return f.Type == macho.TypeExec
+}
+
+// TestXcodeGitCoreHasNoEntitledExecutable guards the git-core read grant
+// (B1786 RC5): every Mach-O executable git may exec from Xcode's
+// usr/libexec/git-core carries no entitlement, so the grant hands a pod
+// nothing a re-signed copy would not.
+func TestXcodeGitCoreHasNoEntitledExecutable(t *testing.T) {
+	dir := filepath.Join(xcodeDevDir, "usr", "libexec", "git-core")
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("SKIP: no %s on this host", dir)
+	}
+	checked := 0
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !info.Mode().IsRegular() || !isMachOExecutable(p) {
+			return nil //nolint:nilerr // an unreadable entry is not this test's concern
+		}
+		checked++
+		out, err := exec.Command("codesign", "-d", "--entitlements", "-", "--xml", p).CombinedOutput()
+		if err != nil {
+			t.Errorf("codesign -d %s: %v: %s", p, err, out)
+			return nil
+		}
+		if strings.Contains(string(out), "<key>") {
+			t.Errorf("%s carries entitlements; the git-core grant would hand them out", p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked == 0 {
+		t.Fatalf("no Mach-O executable under %s; the scan proves nothing", dir)
+	}
+	t.Logf("checked %d executables under %s", checked, dir)
 }
