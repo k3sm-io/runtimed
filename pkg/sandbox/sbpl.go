@@ -231,6 +231,21 @@ var ErrInvalidPodLogsDir = errors.New("sbpl: invalid pod-logs dir")
 // it. An empty value is not this error (see Posture.StatusRecordDir).
 var ErrInvalidStatusRecordDir = errors.New("sbpl: invalid status record dir")
 
+// ErrInvalidWorkVolume reports a Posture.WorkVolume that is not an absolute,
+// clean path.
+var ErrInvalidWorkVolume = errors.New("sbpl: invalid work volume")
+
+// checkWorkVolume refuses a set WorkVolume a deny cannot be written from.
+func checkWorkVolume(v string) error {
+	if v == "" {
+		return nil
+	}
+	if !filepath.IsAbs(v) || filepath.Clean(v) != v || fmt.Sprintf("%q", v) != `"`+v+`"` {
+		return fmt.Errorf("%w: %q", ErrInvalidWorkVolume, v)
+	}
+	return nil
+}
+
 // ErrInvalidDataRoot reports a set Posture.DataRoot that cannot hold its denies:
 // the same refusals as ErrInvalidStatusRecordDir, plus a pods root at or under one
 // of the denied directories, where the deny would swallow the runtime's own tree.
@@ -340,6 +355,15 @@ type Posture struct {
 	// that baseline is ever narrowed. It must be absolute and clean
 	// (ErrInvalidShadowBinDir). Empty emits nothing.
 	ShadowBinDir string
+	// WorkVolume is the mount point, as statfs spells it, of the volume WorkDir
+	// is on. Generate denies <WorkVolume>/.TemporaryItems read+write in the
+	// protected tier, in both firmlink forms, in addition to the
+	// <WorkDir>/.TemporaryItems deny it always emits. Empty, the root volume, the
+	// data volume and the work-dir itself in either firmlink spelling add
+	// nothing, so a node whose work-dir is its volume's mount point renders the
+	// same profile with or without it. A non-empty value must
+	// be absolute and clean (ErrInvalidWorkVolume).
+	WorkVolume string
 	// StatusRecordDir is the node's status record directory where the control
 	// plane really writes it: <data root>/status, which is not <WorkDir>/status on
 	// a node started with a non-default pod root. Its write barrier is this
@@ -885,6 +909,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	writeCommentNameList(&b, "reap stores", ReapStoreSubdirs())
 	writeCommentNameList(&b, "daemon trees", DaemonTreeSubdirs())
 	writeCommentNameList(&b, "exposures root", []string{ExposeSubdir})
+	writeCommentNameList(&b, "shared volume temp dir", []string{SharedVolumeTempSubdir})
 	b.WriteString("(deny file-read* file-write*\n")
 	b.WriteString("  (subpath \"/Users\"))\n")
 	b.WriteString("(deny file-read* file-write*\n")
@@ -1120,6 +1145,33 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	// without being denied.
 	for _, sub := range DaemonTreeSubdirs() {
 		workDirDenyRoots = append(workDirDenyRoots, filepath.Join(workDir, sub))
+	}
+	// The shared replacement directory of the volume the pods live on.
+	// /var/lib/k3sm is its own APFS volume on a node, and Foundation stages an
+	// atomic write to a file on a volume other than the user temp dir's in
+	// <volume root>/.TemporaryItems/folders.<uid>: one directory per uid, so
+	// every pod of the node running as _k3sm would share it, a cross-pod
+	// channel. It is denied outright, never granted per uid. The runtime points
+	// the path-rebase shim at a path in the pod's own tree instead, where it
+	// does not exist, and Foundation then stages beside the file. Without the
+	// shim (a platform binary, an explicit DYLD_INSERT_LIBRARIES) the write
+	// fails with EPERM: the deny is the enforcement, and it must stay so.
+	//
+	// <WorkDir>/.TemporaryItems is denied whatever the posture says, which is
+	// the real directory when the work-dir is the volume's mount point (the
+	// default node). WorkVolume names the mount point when it is not, so the
+	// deny lands on the directory Foundation really uses. Here, rather than in
+	// DaemonTreeSubdirs, because no daemon creates or owns it.
+	workDirTemp := filepath.Join(workDir, SharedVolumeTempSubdir)
+	workDirDenyRoots = append(workDirDenyRoots, workDirTemp)
+	if err := checkWorkVolume(p.WorkVolume); err != nil {
+		return "", nil, nil, err
+	}
+	// statfs spells the default node's mount point /private/var/lib/k3sm and the
+	// work-dir is /var/lib/k3sm: the same directory, already denied in both
+	// forms, so it adds nothing and the profile does not drift.
+	if volTemp, ok := SharedVolumeTempDir(p.WorkVolume); ok && !rendersDenied(workDirDenyRoots, volTemp) {
+		workDirDenyRoots = append(workDirDenyRoots, volTemp)
 	}
 	// The socket + key dir also in its absolute form, when the work-dir is not the
 	// default. The wireguard mesh private key is written at a hard-coded absolute

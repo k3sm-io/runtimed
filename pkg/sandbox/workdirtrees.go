@@ -16,6 +16,8 @@ limitations under the License.
 
 package sandbox
 
+import "path/filepath"
+
 // The daemon-private work-dir subtrees, in one place.
 //
 // Every directory a confined pod must never read or write is named by exactly
@@ -93,6 +95,26 @@ const (
 // deny-set by holding on to it.
 func ReapStoreSubdirs() []string {
 	return []string{PodReapSubdir, VMReapSubdir}
+}
+
+// SharedVolumeTempSubdir is the directory at a volume's root where Foundation
+// stages atomic writes for files on that volume when it is not the user temp
+// dir's volume (<volume root>/.TemporaryItems/folders.<uid>). The work-dir's and
+// the work volume's are denied to every pod (resolvePosture); the runtime has
+// the path-rebase shim point each pod at a path in its own tree instead.
+const SharedVolumeTempSubdir = ".TemporaryItems"
+
+// SharedVolumeTempDir returns the shared replacement directory of the volume
+// mounted at mountPoint (as statfs spells it), and false for the root and data
+// volumes, where Foundation uses the user temp dir instead, and for an empty
+// mount point. It is the one definition the profile's deny and the runtime's
+// rebase are both built from.
+func SharedVolumeTempDir(mountPoint string) (string, bool) {
+	switch mountPoint {
+	case "", "/", "/System/Volumes/Data":
+		return "", false
+	}
+	return filepath.Join(mountPoint, SharedVolumeTempSubdir), true
 }
 
 // DaemonTreeSubdirs returns the work-dir-relative daemon-private and

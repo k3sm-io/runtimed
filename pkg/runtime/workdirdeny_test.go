@@ -185,6 +185,25 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 		}
 	})
 
+	// (3c) The shared volume temp dir is denied by its own stanza too, not by a
+	// deny-list line: resolvePosture denies <WorkDir>/.TemporaryItems and, when
+	// the work dir sits on another volume, that volume's own one (the deny and
+	// its placement are pinned in pkg/sandbox's sharedtemp_test.go). Nothing
+	// daemon-private lives there; it is Foundation's replacement directory,
+	// which the path-rebase shim points into each pod's own tree.
+	t.Run("the shared volume temp dir has its own deny stanza", func(t *testing.T) {
+		for _, sub := range append(sandbox.ReapStoreSubdirs(), sandbox.DaemonTreeSubdirs()...) {
+			if sub == sandbox.SharedVolumeTempSubdir {
+				t.Errorf("%q is in a deny list; it is denied by resolvePosture beside the work volume's own temp dir", sub)
+			}
+		}
+		const vol = "/Volumes/k3sm-work"
+		got, ok := sandbox.SharedVolumeTempDir(vol)
+		if want := filepath.Join(vol, sandbox.SharedVolumeTempSubdir); !ok || got != want {
+			t.Errorf("SharedVolumeTempDir(%q) = %q, %v; want %q, true", vol, got, ok, want)
+		}
+	})
+
 	// (4) The wiring pin. The deny-set is only worth anything if the work-dir it
 	// is computed from is the same directory the daemon's stores actually live
 	// under. runtime.New wires cfg.Root into the vm backend (WithStateRoot, so
