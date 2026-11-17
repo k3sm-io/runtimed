@@ -881,6 +881,9 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 			// pod's writable re-allow outside the daemon's data area.
 			WorkDir: r.cfg.Root,
 			Home:    r.home,
+			// NOT plumbing: the volume's shared replacement directory is
+			// denied (and rebased by the shim, shimRebasePrefixes).
+			WorkVolume: r.workVolume,
 			// The VIPs are plumbing-only (DNS env/status): they render
 			// no SBPL rule — per-IP network filters do not compile on macOS 26
 			// (sandbox.Generate's AllowNetwork stanza).
@@ -3510,23 +3513,31 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	}
 
 	var inserts []string
-	// Path-rebase shim: only when the shim is configured and this container mounts
-	// a volume (nothing to rebase otherwise). K3SM_ROOTFS/K3SM_MOUNT_PATHS configure
-	// it; a workload not loading the shim (a SIP platform binary) just ignores them.
-	if paths := containerMountPaths(box, c); r.cfg.PathShimPath != "" && len(paths) > 0 {
+	// Path-rebase shim: only when the shim is configured and there is something
+	// to rebase: this container's volume mounts, and the data volume's shared
+	// replacement directory, which every container gets on a node whose work-dir
+	// is its own volume (shimRebasePrefixes). K3SM_ROOTFS/K3SM_MOUNT_PATHS
+	// configure it; a workload not loading the shim (a SIP platform binary) just
+	// ignores them.
+	if r.cfg.PathShimPath != "" {
 		rootfs, err := r.rootfsPath(box)
 		if err != nil {
 			return nil, err
 		}
-		inserts = append(inserts, r.cfg.PathShimPath)
-		env = append(env,
-			pathShimRootfsEnv+"="+rootfs,
-			pathShimMountsEnv+"="+strings.Join(paths, ":"))
-		// The restricted-child report: only with the rebase enabled, where a
+		mounts := containerMountPaths(box, c)
+		if prefixes := r.shimRebasePrefixes(mounts); len(prefixes) > 0 {
+			inserts = append(inserts, r.cfg.PathShimPath)
+			env = append(env,
+				pathShimRootfsEnv+"="+rootfs,
+				pathShimMountsEnv+"="+strings.Join(prefixes, ":"))
+		}
+		// The restricted-child report: only with a volume mount, where a
 		// platform-binary child that loses the shim reads host paths. The
 		// reader derives the same file from the container name itself.
-		if name, err := supervisor.ChildReportName(c.GetName()); err == nil {
-			env = append(env, supervisor.ChildReportEnv+"="+filepath.Join(rootfs, name))
+		if len(mounts) > 0 {
+			if name, err := supervisor.ChildReportName(c.GetName()); err == nil {
+				env = append(env, supervisor.ChildReportEnv+"="+filepath.Join(rootfs, name))
+			}
 		}
 	}
 	// Shadow-shell exec rewrite: the same shim carries it, so it is inserted

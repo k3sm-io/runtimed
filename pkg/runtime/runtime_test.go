@@ -871,6 +871,11 @@ func testDeps(t *testing.T, d Deps) Deps {
 	// The per-pod Darwin user dirs default OFF in unit tests: the real probe
 	// names this user's shared /var/folders trees, and a pod test would make
 	// links there. userdirs_test.go opts in with temp trees (fakeUserDirs).
+	// Every data volume is on the data volume unless a test says otherwise, so
+	// no test depends on the host's volume layout (shimRebasePrefixes).
+	if d.VolumeMountPoint == nil {
+		d.VolumeMountPoint = func(string) (string, error) { return "/System/Volumes/Data", nil }
+	}
 	if d.DarwinUserDirs == nil {
 		d.DarwinUserDirs = func() (string, string, error) { return "", "", errUserDirsOffInTests }
 	}

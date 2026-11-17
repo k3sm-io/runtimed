@@ -356,6 +356,11 @@ type Runtime struct {
 	// per-pod user dir links live in (userdirs.go); zero means off. Set once by
 	// New, read-only after.
 	userDirs darwinUserDirs
+	// workVolume is the mount point of the volume cfg.Root is on, as statfs
+	// spells it; "" when New could not tell. The profile denies its shared
+	// replacement directory and the path-rebase shim rebases it
+	// (shimRebasePrefixes): one value for both, set once by New.
+	workVolume string
 	// home is the daemon user's home when the work-dir (cfg.Root) lives under it
 	// (the unprivileged user-space posture); else "". It is passed to the SBPL
 	// generator as the work-dir containment bound (sandbox.Posture.Home) so a
@@ -783,6 +788,11 @@ type Deps struct {
 	// (the per-pod user dirs, userdirs.go). Defaults to sandbox.DarwinUserDirs
 	// (confstr); tests inject temp dirs. An error turns the feature off.
 	DarwinUserDirs func() (temp, cache string, err error)
+	// VolumeMountPoint answers the mount point of the volume a path is on
+	// (shimRebasePrefixes, sandbox.Posture.WorkVolume). Defaults to statfs;
+	// tests inject a fixed volume. An error leaves the work volume unknown: the
+	// <Root>/.TemporaryItems deny stays, and nothing is rebased.
+	VolumeMountPoint func(path string) (string, error)
 	// GuestRosetta probes whether a Linux GUEST on this host could translate
 	// linux/amd64 ELF payloads (Rosetta for Linux — the vm backend's capability).
 	// Defaults to sandbox.ProbeGuestRosetta; tests inject a fake. It takes no ctx
@@ -1206,8 +1216,19 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	logRosettaProbe(log, ConditionRosettaGuestAvailable, rosettaGuest)
 	logGPUProbe(log, gpuFacts, gpuResult.Metal.DeviceName)
 
+	volumeProbe := deps.VolumeMountPoint
+	if volumeProbe == nil {
+		volumeProbe = statfsMountPoint
+	}
+	workVolume, err := volumeProbe(cfg.Root)
+	if err != nil {
+		log.Warn("work volume unknown: confined atomic writes into pod data volumes may fail", "root", cfg.Root, "err", err)
+		workVolume = ""
+	}
+
 	rt := &Runtime{
 		cfg:            cfg,
+		workVolume:     workVolume,
 		userDirs:       resolveDarwinUserDirs(userDirsProbe, log),
 		home:           daemonHome(cfg.Root),
 		log:            log,
