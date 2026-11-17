@@ -115,18 +115,27 @@ package sandbox
 // links a program that then runs, `swift build --disable-sandbox` does the same for
 // a package, and `xcodebuild -showsdks` lists the macOS SDK.
 //
-// NOT covered, and NOT a path-list problem: driving a full `xcodebuild build`.
-// Anything that must evaluate a project or package (`-list`, `-showBuildSettings`,
-// `build`) exits 66 under this profile, and the kernel log says why — such a build
-// needs job-creation (it spawns XCBBuildService through launchd), mach-lookup to
-// coreservicesd, lsd, FSEvents and DiskArbitration, write access to the invoking
-// user's shared /var/folders DeveloperTools cache, and reads of that user's
-// LaunchServices preferences under /Users. /Users is a PROTECTED deny and the Mach
-// services are not file paths at all, so no widening of a read grant reaches this:
-// it is a different isolation posture, which is what the vm backend is for. The
-// line is therefore Mach services and host-user state, NOT "the IDE's frameworks" —
-// those are granted above and xcodebuild loads them.
+// Also covered since B1786 (Xcode 27.1, macOS 27.2): a full `xcodebuild build`
+// of a project or package, with -derivedDataPath in the data volume and ad-hoc
+// signing. The 2026-09 reading that this needs job-creation and mach-lookup to
+// coreservicesd, lsd, FSEvents and DiskArbitration was wrong about cause: those
+// denials are logged but none is fatal (SWBBuildService runs as an ordinary
+// child, inside this sandbox). Ablation of a wide lab profile found three real
+// blockers, none of them a Mach service:
 //
+//   - xcodebuild carries Apple-private entitlements, so dyld and dirhelper treat
+//     it as restricted: no path-rebase shim and no per-pod user dirs, so it
+//     writes the daemon user's shared /var/folders trees (denied) and its
+//     Foundation saves miss the shim's replacement-dir redirect. Fixed outside
+//     this file: the node's shadow set holds an ad-hoc re-signed copy with no
+//     entitlements (pkg/shadowset, Relink), and the exec swap runs it.
+//   - xcrun, a platform binary, ignores the per-pod dirs too, so it never caches
+//     and spawns xcodebuild for every lookup. Same fix: a shadow copy.
+//   - The workspace load waits forever without B/Contents/PlugIns, where the IDE
+//     plug-ins register their extension points. Granted above, read-only, with
+//     their .app/.appex/.xpc helpers carved out like the other trees'.
+//
+// So the line is no longer "a full build"; it is the two invariants below.
 // That ceiling rests on TWO invariants, and the second is easy to lose track of
 // because it lives in another file. The first is that /Users stays a protected
 // deny. The second is that no profile carrying this grant ever gains a
@@ -147,14 +156,14 @@ package sandbox
 //     no exec reach, and narrowing it (the carve below) removes none.
 //   - Anything writable. This stanza emits file-read*, file-read-metadata and one
 //     file-read* deny, and nothing else; the pod's own data volume remains the
-//     only writable tree. The
-//     xcrun and DeveloperTools caches under /var/folders stay denied; xcrun and
-//     xcodebuild print a "couldn't create cache file" error and proceed.
+//     only writable tree. The shared xcrun and DeveloperTools caches under
+//     /var/folders stay denied; the shadow copies write the pod's own instead.
 //   - Any subpath on the bundle root, on B/Contents, or on D itself — each would
 //     collapse the narrow grants above into "read the whole of Xcode".
-//   - B/Contents/PlugIns, B/Contents/SystemFrameworks, B/Contents/Resources and
-//     D/Library beyond XcodeKit.framework — reached only by the project-evaluating
-//     path above, which cannot work regardless.
+//   - B/Contents/SystemFrameworks, B/Contents/Resources, D/Library beyond
+//     XcodeKit.framework, and the sibling platforms beyond their manifests: each
+//     was granted in the B1786 ablation and removed again, because a full build
+//     of a macOS app finished without it.
 //
 // # Placement
 //
@@ -318,6 +327,10 @@ func xcodeToolchainStanza(dir string) string {
 		subpaths = append(subpaths,
 			filepath.Join(bundle, "Contents", "SharedFrameworks"),
 			filepath.Join(bundle, "Contents", "Frameworks"),
+			// The IDE plug-ins: xcodebuild registers their extension points
+			// before it loads a project, and without them waits forever in
+			// _resolveInputOptions (B1786, measured on Xcode 27.1).
+			filepath.Join(bundle, "Contents", "PlugIns"),
 		)
 	}
 
@@ -360,10 +373,10 @@ func xcodeToolchainStanza(dir string) string {
 	b.WriteString(";; at the node's DEVELOPER_DIR. Lab-derived by ablation — every path\n")
 	b.WriteString(";; below was a real denial; nothing here is writable, and neither the\n")
 	b.WriteString(";; application bundle nor its Contents is ever granted as a subpath.\n")
-	b.WriteString(";; Covers the compilers, linker, SDK, xcrun, and the xcodebuild\n")
-	b.WriteString(";; subcommands that only interrogate the install. A full xcodebuild\n")
-	b.WriteString(";; build is out of reach of ANY read grant: it needs job-creation,\n")
-	b.WriteString(";; mach-lookup and host-user state under /Users, which stays denied.\n")
+	b.WriteString(";; Covers the compilers, linker, SDK, xcrun and xcodebuild, including a\n")
+	b.WriteString(";; full xcodebuild build run through the node's shadow copy (the IDE\n")
+	b.WriteString(";; plug-ins are read for it). No mach-lookup and no job-creation: a\n")
+	b.WriteString(";; build needs neither, and they stay denied.\n")
 	b.WriteString("(allow file-read*\n")
 	writeFirmlinkSubpaths(&b, subpaths)
 	b.WriteString("  )\n")
@@ -424,6 +437,11 @@ func writeXcodeHelperCarve(b *strings.Builder, dir, bundle string, hasBundle boo
 	if hasBundle {
 		for _, form := range firmlinkForms(filepath.Join(bundle, "Contents", "Frameworks")) {
 			pats = append(pats, "^"+regexp.QuoteMeta(form)+"/.*\\.xpc/")
+		}
+	}
+	if hasBundle {
+		for _, form := range firmlinkForms(filepath.Join(bundle, "Contents", "PlugIns")) {
+			pats = append(pats, "^"+regexp.QuoteMeta(form)+"/.*\\.(app|appex|xpc)/")
 		}
 	}
 	for _, form := range firmlinkForms(filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer")) {

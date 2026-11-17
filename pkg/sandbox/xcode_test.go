@@ -149,18 +149,18 @@ func TestXcodeToolchainStanzaShape(t *testing.T) {
 			`(subpath "` + bundle + `")`,
 			`(subpath "` + bundle + `/Contents")`,
 			`(subpath "` + xcodeDevDir + `")`,
-			// The two bundle framework trees are granted; the IDE trees beside
-			// them are not, and neither is D/Library above XcodeKit.framework.
+			// The two bundle framework trees and PlugIns are granted (B1786: the
+			// workspace load needs the plug-ins); the trees beside them are not,
+			// and neither is D/Library above XcodeKit.framework.
 			`(subpath "` + bundle + `/Contents/SystemFrameworks")`,
-			`(subpath "` + bundle + `/Contents/PlugIns")`,
 			`(subpath "` + bundle + `/Contents/Resources")`,
 			`(subpath "` + xcodeDevDir + `/Library")`,
 			`(subpath "` + xcodeDevDir + `/Library/Frameworks")`,
 			// Sibling platforms: only MacOSX.platform is in scope.
 			xcodeDevDir + `/Platforms/iPhoneOS.platform`,
 			xcodeDevDir + `/Platforms/DriverKit.platform`,
-			// The per-user caches a full xcodebuild build wants. They are not a
-			// path-list gap — see xcode.go on why that build is out of reach.
+			// The shared per-user caches and the Mach services: a full build
+			// needs none of them (B1786), so none is granted.
 			"DARWIN_USER_CACHE_DIR",
 			"DARWIN_USER_TEMP_DIR",
 			"user-preference-read",
@@ -638,6 +638,7 @@ func TestXcodeHelperCarveSubtractsFromTheGrantedTrees(t *testing.T) {
 	// It must come after BOTH subpath allows it subtracts from.
 	for _, granted := range []string{
 		`(subpath "/Applications/Xcode.app/Contents/Frameworks")`,
+		`(subpath "/Applications/Xcode.app/Contents/PlugIns")`,
 		`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
 	} {
 		at := strings.Index(rules, granted)
@@ -652,7 +653,7 @@ func TestXcodeHelperCarveSubtractsFromTheGrantedTrees(t *testing.T) {
 	// Single-escaped, as SBPL reads it. The doubled form is the %q bug
 	// TestXcodeHelperCarveActuallyDenies exists for: it renders, it compiles,
 	// and it matches nothing.
-	for _, want := range []string{`\.xpc/`, `\.(app|xpc)/`} {
+	for _, want := range []string{`\.xpc/`, `\.(app|xpc)/`, `PlugIns/.*\.(app|appex|xpc)/`} {
 		if !strings.Contains(rules, want) {
 			t.Errorf("the carve is missing the pattern %s:\n%s", want, stanza)
 		}
@@ -726,6 +727,16 @@ func TestXcodeHelperCarveActuallyDenies(t *testing.T) {
 
 	if readable(carved) {
 		t.Errorf("the carve did not bite: %s is still readable under the rendered profile", carved)
+	}
+	// The same over the PlugIns tree (B1786): its helper bundles stay carved,
+	// and a plug-in framework, what xcodebuild loads, stays readable.
+	plugins := filepath.Join(bundle, "Contents", "PlugIns")
+	if pc := findOne(t, plugins, ".xpc"); readable(pc) {
+		t.Errorf("the PlugIns carve did not bite: %s is still readable under the rendered profile", pc)
+	}
+	pk := filepath.Join(filepath.Dir(filepath.Dir(findOne(t, plugins, ".framework"))), "Resources", "Info.plist")
+	if !readable(pk) {
+		t.Errorf("the PlugIns grant does not reach %s, a plug-in framework a build loads", pk)
 	}
 	// The other half: the carve must not have swallowed the tree it subtracts
 	// from. A deny that denies everything would pass the assertion above.
