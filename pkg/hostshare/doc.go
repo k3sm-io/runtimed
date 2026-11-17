@@ -44,6 +44,19 @@ limitations under the License.
 // file drops every entry the user made at the next create. A pod runs as the
 // node's own user, which is never delegable, and can write neither file.
 //
+// Namespaces. A share line may name the namespaces whose pods it admits
+// (namespaces=<n1>,<n2>,..., each a namespace name or a prefix pattern ending
+// in one '*'); a line naming none is node-wide, as every line was before. The
+// decision considers only the lines that admit the pod's namespace; among
+// them the most specific path wins, then, on one path, the line naming the
+// namespace most specifically (an exact name, then the longer pattern, then
+// node-wide), and read-write only between lines equally specific. A
+// refusal names the pod's namespace but never another one. A delegation may
+// cap the namespaces its user's lines name: a line within the cap is admitted
+// as written, a line naming none takes the cap, and a line outside it is
+// dropped. A malformed namespaces= field fails the file, so a line is never
+// read as node-wide by mistake.
+//
 // What a share does NOT change: the pod's processes still run as the node's
 // unprivileged user, so writing into a share also needs the host's file
 // permissions to allow that user (the documented setup grants it with an

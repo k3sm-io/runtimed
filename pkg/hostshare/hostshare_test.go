@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -29,11 +30,11 @@ import (
 func TestValidateEntry(t *testing.T) {
 	t.Parallel()
 	ok := []Entry{
-		{ModeReadWrite, "/Users/dev/Code/app"},
-		{ModeReadWrite, "/Users/dev/Code/app.lanes"},
-		{ModeReadOnly, "/Volumes/data/models"},
-		{ModeSocket, "/Users/dev/Code/app/run/queue.sock"},
-		{ModeReadWrite, "/opt/work"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/app"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/app.lanes"},
+		{Mode: ModeReadOnly, Path: "/Volumes/data/models"},
+		{Mode: ModeSocket, Path: "/Users/dev/Code/app/run/queue.sock"},
+		{Mode: ModeReadWrite, Path: "/opt/work"},
 	}
 	for _, e := range ok {
 		if err := ValidateEntry(e); err != nil {
@@ -41,38 +42,38 @@ func TestValidateEntry(t *testing.T) {
 		}
 	}
 	bad := []Entry{
-		{"rwx", "/Users/dev/Code/app"},
-		{ModeReadWrite, ""},
-		{ModeReadWrite, "relative/path"},
-		{ModeReadWrite, "/"},
-		{ModeReadWrite, "/Users/dev/Code/../.ssh"},
-		{ModeReadWrite, "/Users/dev/Code/app/"},
-		{ModeReadWrite, "/Users"},
-		{ModeReadWrite, "/Users/dev"},
-		{ModeReadWrite, "/Users/dev/.ssh"},
-		{ModeReadWrite, "/Users/dev/Code/.secret"},
-		{ModeReadWrite, "/Users/dev/Library"},
-		{ModeReadWrite, "/Users/dev/Library/Keychains"},
-		{ModeReadWrite, "/var/lib/k3sm"},
-		{ModeReadWrite, "/private/var/lib/k3sm/pods"},
-		{ModeReadWrite, "/private/var/db"},
-		{ModeReadWrite, "/Library/k3sm"},
-		{ModeReadWrite, "/Library"},
-		{ModeReadWrite, "/private"},
-		{ModeReadWrite, "/System/Library"},
-		{ModeReadWrite, "/etc"},
+		{Mode: "rwx", Path: "/Users/dev/Code/app"},
+		{Mode: ModeReadWrite, Path: ""},
+		{Mode: ModeReadWrite, Path: "relative/path"},
+		{Mode: ModeReadWrite, Path: "/"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/../.ssh"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/app/"},
+		{Mode: ModeReadWrite, Path: "/Users"},
+		{Mode: ModeReadWrite, Path: "/Users/dev"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/.ssh"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/.secret"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Library"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Library/Keychains"},
+		{Mode: ModeReadWrite, Path: "/var/lib/k3sm"},
+		{Mode: ModeReadWrite, Path: "/private/var/lib/k3sm/pods"},
+		{Mode: ModeReadWrite, Path: "/private/var/db"},
+		{Mode: ModeReadWrite, Path: "/Library/k3sm"},
+		{Mode: ModeReadWrite, Path: "/Library"},
+		{Mode: ModeReadWrite, Path: "/private"},
+		{Mode: ModeReadWrite, Path: "/System/Library"},
+		{Mode: ModeReadWrite, Path: "/etc"},
 		// Case variants name the same directories to APFS and Seatbelt.
-		{ModeReadWrite, "/users/dev/.ssh"},
-		{ModeReadWrite, "/users/dev"},
-		{ModeReadWrite, "/USERS/dev/library/Preferences"},
-		{ModeReadWrite, "/LIBRARY/KEYCHAINS"},
-		{ModeReadWrite, "/system/Volumes/Data/Users/dev/Code"},
-		{ModeReadWrite, "/PRIVATE/VAR/db"},
-		{ModeReadWrite, "/Users/dev/Code/caf\u00e9"},
-		{ModeReadWrite, "/Users/dev/Code/a\"b"},
-		{ModeReadWrite, "/Users/dev/Code/a b"},
-		{ModeReadWrite, "/Users/dev/Code/a\nb"},
-		{ModeReadWrite, "/Users/dev/Code/" + strings.Repeat("x", maxPathBytes)},
+		{Mode: ModeReadWrite, Path: "/users/dev/.ssh"},
+		{Mode: ModeReadWrite, Path: "/users/dev"},
+		{Mode: ModeReadWrite, Path: "/USERS/dev/library/Preferences"},
+		{Mode: ModeReadWrite, Path: "/LIBRARY/KEYCHAINS"},
+		{Mode: ModeReadWrite, Path: "/system/Volumes/Data/Users/dev/Code"},
+		{Mode: ModeReadWrite, Path: "/PRIVATE/VAR/db"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/caf\u00e9"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/a\"b"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/a b"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/a\nb"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/" + strings.Repeat("x", maxPathBytes)},
 	}
 	for _, e := range bad {
 		if err := ValidateEntry(e); !errors.Is(err, ErrInvalidEntry) {
@@ -230,9 +231,9 @@ func TestAuthorize(t *testing.T) {
 		links: map[string]string{repo + "/escape": "/Users/dev/.ssh"},
 	}
 	entries := []Entry{
-		{ModeReadWrite, repo},
-		{ModeReadOnly, "/Volumes/data"},
-		{ModeSocket, repo + "/run/q.sock"},
+		{Mode: ModeReadWrite, Path: repo},
+		{Mode: ModeReadOnly, Path: "/Volumes/data"},
+		{Mode: ModeSocket, Path: repo + "/run/q.sock"},
 	}
 	granted := []struct {
 		name string
@@ -248,7 +249,7 @@ func TestAuthorize(t *testing.T) {
 	for _, tc := range granted {
 		t.Run("grant/"+tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := authorize(entries, tc.box, fs)
+			got, err := authorize(entries, "default", tc.box, fs)
 			if err != nil {
 				t.Fatalf("authorize = %v, want a grant", err)
 			}
@@ -257,7 +258,7 @@ func TestAuthorize(t *testing.T) {
 			}
 			g := got[0]
 			g.Entry = Entry{}
-			if g != tc.want {
+			if !reflect.DeepEqual(g, tc.want) {
 				t.Errorf("grant = %+v, want %+v", g, tc.want)
 			}
 		})
@@ -284,14 +285,14 @@ func TestAuthorize(t *testing.T) {
 	for _, tc := range refused {
 		t.Run("refuse/"+tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got, err := authorize(entries, tc.box, fs); !errors.Is(err, ErrNotShared) {
+			if got, err := authorize(entries, "default", tc.box, fs); !errors.Is(err, ErrNotShared) {
 				t.Errorf("authorize = %v, %v, want ErrNotShared", got, err)
 			}
 		})
 	}
 	t.Run("no_entries_refuses", func(t *testing.T) {
 		t.Parallel()
-		if _, err := authorize(nil, hostPathBox(repo, "", repo, ""), fs); !errors.Is(err, ErrNotShared) {
+		if _, err := authorize(nil, "default", hostPathBox(repo, "", repo, ""), fs); !errors.Is(err, ErrNotShared) {
 			t.Errorf("authorize(no entries) = %v, want ErrNotShared", err)
 		}
 	})
@@ -299,13 +300,13 @@ func TestAuthorize(t *testing.T) {
 		t.Parallel()
 		box := hostPathBox("/Users/dev/Code/oth", "", "/x", "")
 		box.Containers = nil
-		if got, err := authorize(nil, box, fs); err != nil || len(got) != 0 {
+		if got, err := authorize(nil, "default", box, fs); err != nil || len(got) != 0 {
 			t.Errorf("authorize(unmounted) = %v, %v, want no grant and no error", got, err)
 		}
 	})
 	t.Run("invalid_entry_admits_nothing", func(t *testing.T) {
 		t.Parallel()
-		if _, err := authorize([]Entry{{ModeReadWrite, "/Users/dev"}}, hostPathBox(repo, "", repo, ""), fs); !errors.Is(err, ErrNotShared) {
+		if _, err := authorize([]Entry{{Mode: ModeReadWrite, Path: "/Users/dev"}}, "default", hostPathBox(repo, "", repo, ""), fs); !errors.Is(err, ErrNotShared) {
 			t.Errorf("authorize(invalid entry) = %v, want ErrNotShared", err)
 		}
 	})
@@ -317,10 +318,10 @@ func TestAuthorize(t *testing.T) {
 func TestMatchMostSpecificEntryWins(t *testing.T) {
 	t.Parallel()
 	entries := []Entry{
-		{ModeReadWrite, "/Users/dev/Code/app"},
-		{ModeReadOnly, "/Users/dev/Code/app/secrets"},
-		{ModeReadOnly, "/Volumes/data"},
-		{ModeReadWrite, "/Volumes/data"},
+		{Mode: ModeReadWrite, Path: "/Users/dev/Code/app"},
+		{Mode: ModeReadOnly, Path: "/Users/dev/Code/app/secrets"},
+		{Mode: ModeReadOnly, Path: "/Volumes/data"},
+		{Mode: ModeReadWrite, Path: "/Volumes/data"},
 	}
 	for _, tc := range []struct {
 		path string
@@ -335,7 +336,7 @@ func TestMatchMostSpecificEntryWins(t *testing.T) {
 		{"/USERS/dev/Code/app/src", ModeReadWrite},
 		{"/Volumes/data/x", ModeReadWrite},
 	} {
-		got, ok := match(entries, tc.path, "Directory")
+		got, ok := match(entries, "default", tc.path, "Directory")
 		if !ok || got.Mode != tc.want {
 			t.Errorf("match(%s) = %v %v, want mode %s", tc.path, got, ok, tc.want)
 		}

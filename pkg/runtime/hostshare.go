@@ -24,9 +24,14 @@ import (
 
 // hostShares decides box's hostPath volumes against the node's allowlist
 // (Config.HostSharesFile) and returns the sandbox grants for them. It is the
-// runtime's own decision, made from the root-owned file and never from the
-// request: a pod shares this daemon's uid and can reach its gRPC socket, so a
-// CreatePod that arrives without the provider's check must meet the same one.
+// runtime's own decision: which paths are shared, and how, comes from the
+// root-owned file and never from the request, because a pod shares this
+// daemon's uid and can reach its gRPC socket, so a CreatePod that arrives
+// without the provider's check must meet the same one. The one input taken
+// from the request is the pod's namespace, which a namespaced line is matched
+// against: a pod that sends its own CreatePod can name any namespace, so the
+// namespace scope binds what the cluster schedules, not a pod speaking to this
+// socket directly (the residual risk in k3sm's host-shares design).
 //
 // A pod with no mounted hostPath volume gets nil without the file being read.
 // Every grant is logged at Info with the pod, the path and the mode, and the
@@ -52,7 +57,9 @@ func (r *Runtime) hostShares(box *runtimev1.PodBox) ([]sandbox.HostShare, error)
 			r.log.Warn("delegated host share not admitted", "uid", d.UID, "entry", d.Entry.String(), "reason", d.Reason)
 		}
 	}
-	grants, err := hostshare.Authorize(eff.Entries, box)
+	// The namespace is the request's: this daemon cannot see the cluster,
+	// and a share line naming namespaces admits only a box in one of them.
+	grants, err := hostshare.Authorize(eff.Entries, box.GetNamespace(), box)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +76,7 @@ func (r *Runtime) hostShares(box *runtimev1.PodBox) ([]sandbox.HostShare, error)
 		// delegating uid are the node's own decision.
 		attrs := []any{"pod", box.GetPodId(), "namespace", box.GetNamespace(),
 			"name", box.GetName(), "volume", g.Volume, "path", g.Path, "mode", mode, "entry", g.Entry.String()}
-		if uid, ok := eff.Owners[g.Entry]; ok {
+		if uid, ok := eff.Owner(g.Entry); ok {
 			attrs = append(attrs, "delegated_uid", uid)
 		}
 		r.log.Info("host share granted", attrs...)

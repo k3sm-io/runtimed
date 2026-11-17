@@ -63,10 +63,25 @@ const (
 type Entry struct {
 	Mode Mode
 	Path string
+	// Namespaces limits the entry to pods in these namespaces: each is a
+	// namespace name or a prefix pattern ending in one '*' (yurei-p-*). Empty
+	// is node-wide: the entry admits a pod in any namespace.
+	Namespaces []string
 }
 
-// String renders e as its file line.
-func (e Entry) String() string { return string(e.Mode) + " " + e.Path }
+// String renders e as its file line, with its namespaces sorted. Two entries
+// with the same String are the same entry.
+func (e Entry) String() string {
+	s := string(e.Mode) + " " + e.Path
+	if f := formatNamespaces(e.Namespaces); f != "" {
+		s += " " + f
+	}
+	return s
+}
+
+// Admits reports whether e admits a pod in namespace ns, by its namespaces
+// alone (not its path).
+func (e Entry) Admits(ns string) bool { return admitsNamespace(e.Namespaces, ns) }
 
 // Grant is one hostPath volume a pod is allowed to mount, as the sandbox
 // renders it: the path, and whether it is read-only or a socket.
@@ -170,11 +185,14 @@ func ValidateEntry(e Entry) error {
 			return bad("a share may not be the home's %s directory or under it", parts[2])
 		}
 	}
+	if err := ValidateNamespaces(e.Namespaces); err != nil {
+		return fmt.Errorf("%w (in the entry for %q)", err, e.Path)
+	}
 	return nil
 }
 
 // Parse reads a list of share entries, the format of a delegated user's file.
-// Each line is "<mode> <absolute path>"; blank lines and lines starting with
+// Each line is "<mode> <absolute path> [namespaces=<n1>,<n2>,...]"; blank lines and lines starting with
 // '#' are ignored. Any malformed or invalid line fails the whole file, so a
 // typo never silently shares something else. A delegate line is refused here:
 // only the root-owned node file (ParseFile) may carry one.
@@ -234,10 +252,19 @@ func parse(r io.Reader, delegations bool, validate func(Entry) error) (File, err
 			out.Exposes = append(out.Exposes, g)
 			continue
 		}
-		if len(fields) != 2 {
-			return File{}, fmt.Errorf("%w: line %d: want \"<mode> <path>\"", ErrInvalidEntry, line)
+		if len(fields) != 2 && len(fields) != 3 {
+			return File{}, fmt.Errorf("%w: line %d: want \"<mode> <path> [namespaces=<namespace,...>]\"", ErrInvalidEntry, line)
 		}
 		e := Entry{Mode: Mode(fields[0]), Path: fields[1]}
+		if len(fields) == 3 {
+			// A malformed field fails the file: the line is never read as
+			// node-wide.
+			nss, err := parseNamespacesField(fields[2])
+			if err != nil {
+				return File{}, fmt.Errorf("line %d: %w", line, err)
+			}
+			e.Namespaces = nss
+		}
 		if err := validate(e); err != nil {
 			return File{}, fmt.Errorf("line %d: %w", line, err)
 		}
@@ -261,7 +288,8 @@ func Format(entries []Entry) []byte { return FormatFile(File{Entries: entries}) 
 func FormatFile(f File) []byte {
 	var b bytes.Buffer
 	b.WriteString("# k3sm host shares: the host paths native pods may mount with a hostPath volume.\n")
-	b.WriteString("# Written by `sudo k3sm share`. One \"<mode> <path>\" per line; mode is rw, ro or socket.\n")
+	b.WriteString("# Written by `sudo k3sm share`. One \"<mode> <path> [namespaces=<n,...>]\" per line; mode is rw, ro or socket.\n")
+	b.WriteString("# A line with no namespaces= admits pods in every namespace.\n")
 	writeEntries(&b, f.Entries)
 	if len(f.Delegations) > 0 {
 		b.WriteString("# Delegations: the named user adds shares under the prefix with `k3sm share add`, no sudo.\n")
@@ -311,9 +339,12 @@ func writeEntries(b *bytes.Buffer, entries []Entry) {
 		if c := strings.Compare(a.Path, b.Path); c != 0 {
 			return c
 		}
-		return strings.Compare(string(a.Mode), string(b.Mode))
+		if c := strings.Compare(string(a.Mode), string(b.Mode)); c != 0 {
+			return c
+		}
+		return strings.Compare(a.String(), b.String())
 	})
-	sorted = slices.Compact(sorted)
+	sorted = slices.CompactFunc(sorted, func(a, b Entry) bool { return a.String() == b.String() })
 	for _, e := range sorted {
 		b.WriteString(e.String())
 		b.WriteByte('\n')
@@ -408,7 +439,8 @@ func (osChecker) kind(p string) (string, error) {
 	return "other", nil
 }
 
-// Authorize decides every hostPath volume box mounts against entries and
+// Authorize decides every hostPath volume box mounts against the entries
+// that admit namespace, the pod's namespace (Entry.Admits), and
 // returns one Grant per mounted hostPath volume, or an error wrapping
 // ErrNotShared that names the volume. A pod with no hostPath volume gets no
 // grants and no error. A hostPath volume no container mounts reaches nothing
@@ -424,16 +456,18 @@ func (osChecker) kind(p string) (string, error) {
 //   - the path is on a case-insensitive volume: Seatbelt matches a granted
 //     path without regard to case even on a case-sensitive volume, where the
 //     grant would also reach differently cased siblings (FoldsCase);
-//   - an rw or ro entry covers it (the path is at or under the entry), or a
-//     socket entry names exactly it;
+//   - an rw or ro entry that admits the pod's namespace covers it (the path
+//     is at or under the entry), or such a socket entry names exactly it;
+//     an entry for other namespaces only is as if it were not there, and an
+//     empty namespace is admitted by node-wide entries alone;
 //   - a read-only entry is mounted readOnly by every container, and no volume
 //     is mounted read-only by one container and read-write by another (the
 //     sandbox profile is per pod, so the stricter mount could not hold).
-func Authorize(entries []Entry, box *runtimev1.PodBox) ([]Grant, error) {
-	return authorize(entries, box, osChecker{})
+func Authorize(entries []Entry, namespace string, box *runtimev1.PodBox) ([]Grant, error) {
+	return authorize(entries, namespace, box, osChecker{})
 }
 
-func authorize(entries []Entry, box *runtimev1.PodBox, fs fileChecker) ([]Grant, error) {
+func authorize(entries []Entry, namespace string, box *runtimev1.PodBox, fs fileChecker) ([]Grant, error) {
 	type use struct{ ro, rw bool }
 	uses := map[string]*use{}
 	var bad error
@@ -472,7 +506,7 @@ func authorize(entries []Entry, box *runtimev1.PodBox, fs fileChecker) ([]Grant,
 		if v.GetHostPath() == nil || u == nil {
 			continue
 		}
-		g, err := authorizeOne(entries, v, u.ro, u.rw, fs)
+		g, err := authorizeOne(entries, namespace, v, u.ro, u.rw, fs)
 		if err != nil {
 			return nil, err
 		}
@@ -481,7 +515,7 @@ func authorize(entries []Entry, box *runtimev1.PodBox, fs fileChecker) ([]Grant,
 	return out, nil
 }
 
-func authorizeOne(entries []Entry, v *runtimev1.Volume, ro, rw bool, fs fileChecker) (Grant, error) {
+func authorizeOne(entries []Entry, namespace string, v *runtimev1.Volume, ro, rw bool, fs fileChecker) (Grant, error) {
 	name := v.GetName()
 	p := v.GetHostPath().GetPath()
 	typ := v.GetHostPath().GetType()
@@ -502,9 +536,11 @@ func authorizeOne(entries []Entry, v *runtimev1.Volume, ro, rw bool, fs fileChec
 	}
 	// Match before touching the filesystem: a path no entry covers is
 	// refused without the daemon stat-ing it on the pod's behalf.
-	entry, ok := match(entries, p, typ)
+	// The refusal names the pod's own namespace and never says whether an
+	// entry for another namespace covers the path, nor which one.
+	entry, ok := match(entries, namespace, p, typ)
 	if !ok {
-		return Grant{}, notShared(name, "no host share entry covers this path; the node admin adds one with `sudo k3sm share add`, or a delegated user with `k3sm share add`")
+		return Grant{}, notShared(name, fmt.Sprintf("no host share entry for namespace %q covers this path; the node admin adds one with `sudo k3sm share add`, or a delegated user with `k3sm share add`", namespace))
 	}
 	if typ == "" {
 		want = map[Mode]string{ModeSocket: "socket"}[entry.Mode]
@@ -541,18 +577,24 @@ func authorizeOne(entries []Entry, v *runtimev1.Volume, ro, rw bool, fs fileChec
 	return g, nil
 }
 
-// match returns the entry that admits p for a volume of hostPath type typ.
-// Among directory entries the most specific one wins, so `ro /p/secrets`
+// match returns the entry that admits p for a volume of hostPath type typ in
+// namespace ns. Only entries that admit ns are considered. Between two of
+// them for the same path, the one that names ns more specifically wins
+// (namespaceSpecificity: an exact name, then the longer pattern, then
+// node-wide), so a narrower ro line is never overridden by a broader rw one;
+// read-write wins only between lines equally specific. Otherwise,
+// directory entries the most specific one wins, so `ro /p/secrets`
 // narrows `rw /p`; between two entries for the same path read-write wins.
 // Paths compare with ASCII case folded, as APFS and Seatbelt compare them, so
 // `/p/SECRETS` is narrowed by `ro /p/secrets` too (a case-sensitive volume is
 // refused after the match). The narrowing is per requested path: a pod that
 // mounts `/p` itself gets `rw /p`, secrets included.
-func match(entries []Entry, p, typ string) (Entry, bool) {
+func match(entries []Entry, ns, p, typ string) (Entry, bool) {
 	var found Entry
+	foundSpec := 0
 	ok := false
 	for _, e := range entries {
-		if ValidateEntry(e) != nil {
+		if ValidateEntry(e) != nil || !e.Admits(ns) {
 			continue
 		}
 		switch e.Mode {
@@ -562,10 +604,14 @@ func match(entries []Entry, p, typ string) (Entry, bool) {
 			}
 		case ModeReadWrite, ModeReadOnly:
 			if typ != "Socket" && atOrUnderFold(p, e.Path) {
+				spec := namespaceSpecificity(e.Namespaces, ns)
+				same := len(e.Path) == len(found.Path)
 				switch {
 				case !ok, len(e.Path) > len(found.Path):
-					found, ok = e, true
-				case len(e.Path) == len(found.Path) && e.Mode == ModeReadWrite:
+					found, foundSpec, ok = e, spec, true
+				case same && spec > foundSpec:
+					found, foundSpec = e, spec
+				case same && spec == foundSpec && e.Mode == ModeReadWrite:
 					found = e
 				}
 			}
