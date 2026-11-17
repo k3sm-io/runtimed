@@ -173,6 +173,20 @@
  * DYLD_INSERT_LIBRARIES) keeps its own names and gets EPERM, and no rewrite
  * can reach another pod's prefix, because this one only ever writes its own.
  *
+ * System V IPC refusal (a sixth job, always on and unconfigured). Seatbelt
+ * does not mediate shmget, semget or msgget: they create objects under the
+ * pod profile's (deny default), while every later use (shmat, shmctl,
+ * semop, semctl, msgsnd, msgctl) is EPERM, removal included. An object a pod
+ * creates is therefore one it can never use or remove, and it holds a slot of
+ * a host-wide table (kern.sysv.shmmni is 32) until runtimed's sweeper removes
+ * it. So the three create calls fail here, before the kernel sees them, with
+ * ENOSYS, the errno a kernel without System V IPC gives: a workload reports
+ * "function not implemented" and can fall back, instead of half-succeeding.
+ * Like the rest of this shim it is a compatibility aid, not the boundary: a
+ * process without the shim still creates objects, the profile still refuses
+ * every use of them, and the sweeper (runtimed pkg/runtime/sysvsweep.go) is
+ * what returns their slots.
+ *
  * Darwin user-dir suffix stickiness (a fifth job, configured by
  *   DIRHELPER_USER_DIR_SUFFIX - the pod's per-pod user-dir suffix, "k3sm.<pod id>"
  * and read ONCE, by the same load-time constructor). libSystem's dirhelper
@@ -208,6 +222,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/clonefile.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -830,6 +848,27 @@ int k3sm_sem_unlink(const char *name) {
     return sem_unlink(k3sm_sem_name(name, buf));
 }
 
+/* -------- System V IPC refusal -------- */
+
+/* Each fails before the kernel creates anything (see the banner). */
+int k3sm_shmget(key_t key, size_t size, int flags) {
+    (void)key, (void)size, (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+int k3sm_semget(key_t key, int nsems, int flags) {
+    (void)key, (void)nsems, (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+int k3sm_msgget(key_t key, int flags) {
+    (void)key, (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
 /* -------- DIRHELPER_USER_DIR_SUFFIX stickiness -------- */
 
 #define K3SM_DIRSFX_NAME "DIRHELPER_USER_DIR_SUFFIX="
@@ -1288,4 +1327,7 @@ __attribute__((used)) static const interpose_t k3sm_path_interposers[]
         {(const void *)k3sm_posix_spawn, (const void *)posix_spawn},
         {(const void *)k3sm_sem_open, (const void *)sem_open},
         {(const void *)k3sm_sem_unlink, (const void *)sem_unlink},
+        {(const void *)k3sm_shmget, (const void *)shmget},
+        {(const void *)k3sm_semget, (const void *)semget},
+        {(const void *)k3sm_msgget, (const void *)msgget},
 };

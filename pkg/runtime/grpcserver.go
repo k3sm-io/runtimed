@@ -118,6 +118,10 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	gcCtx, gcCancel := context.WithCancel(ctx)
 	defer gcCancel()
 	go s.rt.RunImageGC(gcCtx, 0, image.ReclaimConfig{})
+	// The System V IPC sweeper shares that lifetime: it returns at once on a
+	// daemon that may not sweep (sysvsweep.go), and otherwise removes the
+	// objects pods create but can never use or remove themselves.
+	go s.rt.RunSysVSweep(gcCtx, 0)
 
 	// Watch ctx: on cancellation, GracefulStop unblocks grpc.Serve. The goroutine
 	// always exits — either ctx fires (we stop, Serve returns) or Serve returns
