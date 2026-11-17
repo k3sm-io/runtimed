@@ -26,7 +26,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/execsession"
@@ -315,20 +314,15 @@ func TestPodProfileAllocatesOnlyItsOwnPTY(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = stdin.Close(); _ = a.Process.Kill(); _ = a.Wait() })
 	r := bufio.NewReader(stdout)
+	// A plain blocking read: the helper is a real process, and a hang is
+	// caught by go test's own -timeout rather than a wall-clock wait here.
 	readLine := func() string {
 		t.Helper()
-		ch := make(chan string, 1)
-		go func() { s, _ := r.ReadString('\n'); ch <- strings.TrimSpace(s) }()
-		select {
-		case s := <-ch:
-			if s == "" {
-				t.Fatal("pod A's helper output ended")
-			}
-			return s
-		case <-time.After(30 * time.Second):
-			t.Fatal("pod A's helper did not answer in 30 s")
+		s, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("pod A's helper output ended: %v (last %q)", err, s)
 		}
-		return ""
+		return strings.TrimSpace(s)
 	}
 	var slave string
 	for {
