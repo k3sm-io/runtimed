@@ -52,7 +52,9 @@ func (r *Runtime) hostShares(box *runtimev1.PodBox) ([]sandbox.HostShare, error)
 			r.log.Warn("delegated host share not admitted", "uid", d.UID, "entry", d.Entry.String(), "reason", d.Reason)
 		}
 	}
-	grants, err := hostshare.Authorize(eff.Entries, box)
+	// The namespace is the request's: this daemon cannot see the cluster,
+	// and a share line naming namespaces admits only a box in one of them.
+	grants, err := hostshare.Authorize(eff.Entries, box.GetNamespace(), box)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +71,7 @@ func (r *Runtime) hostShares(box *runtimev1.PodBox) ([]sandbox.HostShare, error)
 		// delegating uid are the node's own decision.
 		attrs := []any{"pod", box.GetPodId(), "namespace", box.GetNamespace(),
 			"name", box.GetName(), "volume", g.Volume, "path", g.Path, "mode", mode, "entry", g.Entry.String()}
-		if uid, ok := eff.Owners[g.Entry]; ok {
+		if uid, ok := eff.Owner(g.Entry); ok {
 			attrs = append(attrs, "delegated_uid", uid)
 		}
 		r.log.Info("host share granted", attrs...)

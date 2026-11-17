@@ -78,6 +78,11 @@ type Delegation struct {
 	// Prefix is the delegated directory, canonical (symlinks resolved) when
 	// root recorded it. It passes ValidateEntry as an rw entry.
 	Prefix string
+	// Namespaces caps the namespaces the user's entries may name (the same
+	// names and prefix patterns as Entry.Namespaces). An entry naming none
+	// inherits the cap; an entry naming one outside it is dropped. Empty is
+	// uncapped: the user's entries may be node-wide.
+	Namespaces []string
 }
 
 // String renders d as its line in the node's file.
@@ -86,7 +91,20 @@ func (d Delegation) String() string {
 	for i, m := range d.Modes {
 		ms[i] = string(m)
 	}
-	return fmt.Sprintf("%s uid=%d user=%s modes=%s %s", delegateKeyword, d.UID, d.User, strings.Join(ms, ","), d.Prefix)
+	nss := ""
+	if f := formatNamespaces(d.Namespaces); f != "" {
+		nss = f + " "
+	}
+	return fmt.Sprintf("%s uid=%d user=%s modes=%s %s%s", delegateKeyword, d.UID, d.User, strings.Join(ms, ","), nss, d.Prefix)
+}
+
+// Scope returns e as the node admits it under d: an entry naming no
+// namespace under a capped delegation takes the cap.
+func (d Delegation) Scope(e Entry) Entry {
+	if len(e.Namespaces) == 0 && len(d.Namespaces) > 0 {
+		e.Namespaces = slices.Clone(d.Namespaces)
+	}
+	return e
 }
 
 // Allows reports whether d lets its user add a share of mode m.
@@ -121,6 +139,9 @@ func validateDelegation(d Delegation, validate func(Entry) error) error {
 	if err := validate(Entry{Mode: ModeReadWrite, Path: d.Prefix}); err != nil {
 		return fmt.Errorf("delegation prefix: %w", err)
 	}
+	if err := ValidateNamespaces(d.Namespaces); err != nil {
+		return fmt.Errorf("delegation of %q: %w", d.Prefix, err)
+	}
 	return nil
 }
 
@@ -140,8 +161,8 @@ func ParseModes(s string) ([]Mode, error) {
 }
 
 func parseDelegation(fields []string, validate func(Entry) error) (Delegation, error) {
-	if len(fields) != 5 {
-		return Delegation{}, fmt.Errorf("%w: want \"delegate uid=<n> user=<name> modes=<m,...> <prefix>\"", ErrInvalidEntry)
+	if len(fields) != 5 && len(fields) != 6 {
+		return Delegation{}, fmt.Errorf("%w: want \"delegate uid=<n> user=<name> modes=<m,...> [namespaces=<n,...>] <prefix>\"", ErrInvalidEntry)
 	}
 	kv := func(f, key string) (string, error) {
 		v, ok := strings.CutPrefix(f, key+"=")
@@ -170,7 +191,14 @@ func parseDelegation(fields []string, validate func(Entry) error) (Delegation, e
 	if err != nil {
 		return Delegation{}, err
 	}
-	d := Delegation{UID: uint32(uid), User: user, Modes: modes, Prefix: fields[4]}
+	d := Delegation{UID: uint32(uid), User: user, Modes: modes, Prefix: fields[len(fields)-1]}
+	if len(fields) == 6 {
+		// A malformed cap fails the file: the delegation is never read as
+		// uncapped.
+		if d.Namespaces, err = parseNamespacesField(fields[4]); err != nil {
+			return Delegation{}, err
+		}
+	}
 	return d, validateDelegation(d, validate)
 }
 
@@ -206,10 +234,18 @@ type Effective struct {
 	Delegations []Delegation
 	// Exposes are the node file's exposure grants, as written by root.
 	Exposes []ExposeGrant
-	// Owners maps an admitted delegated entry to the uid whose file holds it.
-	// An entry absent from it came from the root-owned file.
-	Owners  map[Entry]uint32
+	// Owners maps an admitted delegated entry, by its String, to the uid
+	// whose file holds it. An entry absent from it came from the root-owned
+	// file. Owner looks an entry up.
+	Owners  map[string]uint32
 	Dropped []Dropped
+}
+
+// Owner returns the uid whose delegated file holds e, an entry of
+// e.Entries; false for an entry of the root-owned file.
+func (eff Effective) Owner(e Entry) (uint32, bool) {
+	uid, ok := eff.Owners[e.String()]
+	return uid, ok
 }
 
 // LoadEffective reads the node's file at path and every delegated user's
@@ -233,6 +269,8 @@ func LoadEffectiveFor(path string, nodeUID uint32) (Effective, error) {
 // CheckDelegated reports whether delegation d admits e, the entry of the user
 // d names, now. It holds when:
 //   - e passes ValidateEntry and d allows e's mode;
+//   - e's namespaces are within d's namespace cap, when d has one
+//     (an entry naming none takes the cap when the node reads it);
 //   - e's path is d's prefix or under it, compared with ASCII case folded the
 //     way APFS and Seatbelt compare paths;
 //   - the path resolves to itself (no symlink anywhere in it);
@@ -285,10 +323,10 @@ func (l loader) loadEffective(path string) (Effective, error) {
 	if err != nil {
 		return Effective{}, err
 	}
-	eff := Effective{Entries: slices.Clone(f.Entries), Delegations: f.Delegations, Exposes: f.Exposes, Owners: map[Entry]uint32{}}
-	root := map[Entry]bool{}
+	eff := Effective{Entries: slices.Clone(f.Entries), Delegations: f.Delegations, Exposes: f.Exposes, Owners: map[string]uint32{}}
+	root := map[string]bool{}
 	for _, e := range f.Entries {
-		root[e] = true
+		root[e.String()] = true
 	}
 	byUID := map[uint32][]Delegation{}
 	var uids []uint32
@@ -315,6 +353,7 @@ func (l loader) loadEffective(path string) (Effective, error) {
 			for _, d := range byUID[uid] {
 				err := l.checkDelegated(d, e)
 				if err == nil {
+					e = d.Scope(e)
 					admitted = true
 					break
 				}
@@ -326,13 +365,13 @@ func (l loader) loadEffective(path string) (Effective, error) {
 				eff.Dropped = append(eff.Dropped, Dropped{UID: uid, Entry: e, Reason: why.Error()})
 				continue
 			}
-			if root[e] {
+			if root[e.String()] {
 				continue
 			}
-			if _, dup := eff.Owners[e]; dup {
+			if _, dup := eff.Owners[e.String()]; dup {
 				continue
 			}
-			eff.Owners[e] = uid
+			eff.Owners[e.String()] = uid
 			eff.Entries = append(eff.Entries, e)
 		}
 	}
@@ -374,6 +413,9 @@ func (l loader) checkDelegated(d Delegation, e Entry) error {
 	}
 	if !d.Allows(e.Mode) {
 		return bad("mode %s is not delegated under %s", e.Mode, d.Prefix)
+	}
+	if err := namespacesWithin(e.Namespaces, d.Namespaces); err != nil {
+		return bad("%v", err)
 	}
 	if !atOrUnderFold(e.Path, d.Prefix) {
 		return bad("outside the delegated prefix %s", d.Prefix)

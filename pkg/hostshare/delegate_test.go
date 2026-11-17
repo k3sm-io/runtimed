@@ -173,10 +173,10 @@ func TestCheckDelegatedPrefixContainment(t *testing.T) {
 		t.Fatal(err)
 	}
 	ok := []Entry{
-		{ModeReadWrite, f.prefix},
-		{ModeReadWrite, app},
-		{ModeReadOnly, filepath.Join(app, "src")},
-		{ModeSocket, sock},
+		{Mode: ModeReadWrite, Path: f.prefix},
+		{Mode: ModeReadWrite, Path: app},
+		{Mode: ModeReadOnly, Path: filepath.Join(app, "src")},
+		{Mode: ModeSocket, Path: sock},
 	}
 	for _, e := range ok {
 		if err := f.l.checkDelegated(d, e); err != nil {
@@ -184,19 +184,19 @@ func TestCheckDelegatedPrefixContainment(t *testing.T) {
 		}
 	}
 	bad := map[string]Entry{
-		"sibling_of_prefix":            {ModeReadWrite, filepath.Join(f.root, "Other")},
-		"shares_the_prefix_string":     {ModeReadWrite, f.prefix + "-secrets"},
-		"parent_of_prefix":             {ModeReadWrite, f.root},
-		"dot_dot_escape":               {ModeReadWrite, f.prefix + "/../Other"},
-		"symlink_out_of_prefix":        {ModeReadWrite, filepath.Join(f.prefix, "out")},
-		"symlink_inside_prefix":        {ModeReadWrite, filepath.Join(f.prefix, "in")},
-		"through_symlink":              {ModeReadWrite, filepath.Join(f.prefix, "in", "x")},
-		"dot_directory_inside":         {ModeReadWrite, filepath.Join(f.prefix, ".git")},
-		"missing":                      {ModeReadWrite, filepath.Join(f.prefix, "nope")},
-		"socket_mode_on_a_dir":         {ModeSocket, app},
-		"dir_mode_on_a_socket":         {ModeReadWrite, sock},
-		"a_file_is_never_an_entry":     {ModeReadWrite, filepath.Join(app, "file")},
-		"a_hard_link_is_never_a_entry": {ModeReadOnly, filepath.Join(app, "hardlink")},
+		"sibling_of_prefix":            {Mode: ModeReadWrite, Path: filepath.Join(f.root, "Other")},
+		"shares_the_prefix_string":     {Mode: ModeReadWrite, Path: f.prefix + "-secrets"},
+		"parent_of_prefix":             {Mode: ModeReadWrite, Path: f.root},
+		"dot_dot_escape":               {Mode: ModeReadWrite, Path: f.prefix + "/../Other"},
+		"symlink_out_of_prefix":        {Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "out")},
+		"symlink_inside_prefix":        {Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "in")},
+		"through_symlink":              {Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "in", "x")},
+		"dot_directory_inside":         {Mode: ModeReadWrite, Path: filepath.Join(f.prefix, ".git")},
+		"missing":                      {Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "nope")},
+		"socket_mode_on_a_dir":         {Mode: ModeSocket, Path: app},
+		"dir_mode_on_a_socket":         {Mode: ModeReadWrite, Path: sock},
+		"a_file_is_never_an_entry":     {Mode: ModeReadWrite, Path: filepath.Join(app, "file")},
+		"a_hard_link_is_never_a_entry": {Mode: ModeReadOnly, Path: filepath.Join(app, "hardlink")},
 	}
 	if err := os.Mkdir(filepath.Join(f.prefix, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestCheckDelegatedPrefixContainment(t *testing.T) {
 			t.Errorf("%s: checkDelegated(%v) = %v, want ErrNotDelegated", name, e, err)
 		}
 	}
-	if err := f.l.checkDelegated(f.delegation(ModeReadOnly), Entry{ModeReadWrite, app}); !errors.Is(err, ErrNotDelegated) {
+	if err := f.l.checkDelegated(f.delegation(ModeReadOnly), Entry{Mode: ModeReadWrite, Path: app}); !errors.Is(err, ErrNotDelegated) {
 		t.Errorf("checkDelegated(rw under an ro-only delegation) = %v, want ErrNotDelegated", err)
 	}
 }
@@ -218,7 +218,7 @@ func TestCheckDelegatedCaseFolding(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	upper := strings.TrimSuffix(f.prefix, "Code") + "CODE"
-	e := Entry{ModeReadWrite, upper + "/app"}
+	e := Entry{Mode: ModeReadWrite, Path: upper + "/app"}
 	_, statErr := os.Lstat(upper)
 	err := f.l.checkDelegated(f.delegation(), e)
 	switch {
@@ -228,7 +228,7 @@ func TestCheckDelegatedCaseFolding(t *testing.T) {
 		t.Errorf("case-sensitive volume: checkDelegated(%v) = nil, want a refusal", e)
 	}
 	// A refused name in another case is refused whatever the volume.
-	if err := f.l.checkDelegated(f.delegation(), Entry{ModeReadWrite, filepath.Join(f.prefix, "app", ".GIT")}); err == nil {
+	if err := f.l.checkDelegated(f.delegation(), Entry{Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "app", ".GIT")}); err == nil {
 		t.Error("checkDelegated(dot directory) = nil, want a refusal")
 	}
 }
@@ -240,19 +240,19 @@ func TestCheckDelegatedOwnership(t *testing.T) {
 	// nothing under it, because the prefix and the path are not that uid's.
 	d := f.delegation()
 	d.UID = f.uid + 1
-	if err := f.l.checkDelegated(d, Entry{ModeReadWrite, filepath.Join(f.prefix, "app")}); !errors.Is(err, ErrNotDelegated) {
+	if err := f.l.checkDelegated(d, Entry{Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "app")}); !errors.Is(err, ErrNotDelegated) {
 		t.Errorf("checkDelegated(owned by another uid) = %v, want ErrNotDelegated", err)
 	}
 	// The pods' own uid is never a delegated user.
 	l := f.l
 	l.selfUID = f.uid
-	if err := l.checkDelegated(f.delegation(), Entry{ModeReadWrite, filepath.Join(f.prefix, "app")}); !errors.Is(err, ErrNotDelegated) {
+	if err := l.checkDelegated(f.delegation(), Entry{Mode: ModeReadWrite, Path: filepath.Join(f.prefix, "app")}); !errors.Is(err, ErrNotDelegated) {
 		t.Errorf("checkDelegated(delegated to the daemon's own uid) = %v, want ErrNotDelegated", err)
 	}
 	// A root-owned tree delegated to the test user admits nothing: the
 	// owner check runs on the real filesystem, not on the record.
 	rd := Delegation{UID: f.uid, User: "dev", Modes: []Mode{ModeReadWrite}, Prefix: "/usr"}
-	if err := f.l.checkDelegated(rd, Entry{ModeReadWrite, "/usr/bin"}); !errors.Is(err, ErrNotDelegated) {
+	if err := f.l.checkDelegated(rd, Entry{Mode: ModeReadWrite, Path: "/usr/bin"}); !errors.Is(err, ErrNotDelegated) {
 		t.Errorf("checkDelegated(root-owned tree) = %v, want ErrNotDelegated", err)
 	}
 }
@@ -261,7 +261,7 @@ func TestLoadEffectiveDelegated(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	app := filepath.Join(f.prefix, "app")
-	f.writeNode(t, File{Entries: []Entry{{ModeReadOnly, "/opt/data"}}, Delegations: []Delegation{f.delegation()}})
+	f.writeNode(t, File{Entries: []Entry{{Mode: ModeReadOnly, Path: "/opt/data"}}, Delegations: []Delegation{f.delegation()}})
 	// The user's file has one good line and two it could only have written
 	// by hand: a path outside the prefix, and a symlink inside it pointing
 	// out. Enforcement re-validates, so only the good one is admitted.
@@ -273,13 +273,13 @@ func TestLoadEffectiveDelegated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(eff.Entries) != 2 || eff.Entries[1] != (Entry{ModeReadWrite, app}) {
+	if len(eff.Entries) != 2 || eff.Entries[1].String() != (Entry{Mode: ModeReadWrite, Path: app}).String() {
 		t.Fatalf("Entries = %v, want the root entry and %s", eff.Entries, app)
 	}
-	if eff.Owners[Entry{ModeReadWrite, app}] != f.uid {
+	if uid, ok := eff.Owner(Entry{Mode: ModeReadWrite, Path: app}); !ok || uid != f.uid {
 		t.Errorf("Owners = %v, want %s owned by %d", eff.Owners, app, f.uid)
 	}
-	if _, ok := eff.Owners[Entry{ModeReadOnly, "/opt/data"}]; ok {
+	if _, ok := eff.Owner(Entry{Mode: ModeReadOnly, Path: "/opt/data"}); ok {
 		t.Error("a root entry is recorded as delegated")
 	}
 	if len(eff.Dropped) != 2 {
@@ -287,7 +287,7 @@ func TestLoadEffectiveDelegated(t *testing.T) {
 	}
 
 	t.Run("revoking_the_delegation_drops_the_users_entries", func(t *testing.T) {
-		f.writeNode(t, File{Entries: []Entry{{ModeReadOnly, "/opt/data"}}})
+		f.writeNode(t, File{Entries: []Entry{{Mode: ModeReadOnly, Path: "/opt/data"}}})
 		eff, err := f.l.loadEffective(f.nodeFile)
 		if err != nil {
 			t.Fatal(err)
@@ -295,7 +295,7 @@ func TestLoadEffectiveDelegated(t *testing.T) {
 		if len(eff.Entries) != 1 || len(eff.Owners) != 0 {
 			t.Errorf("after revoke: Entries = %v, want only the root entry", eff.Entries)
 		}
-		f.writeNode(t, File{Entries: []Entry{{ModeReadOnly, "/opt/data"}}, Delegations: []Delegation{f.delegation()}})
+		f.writeNode(t, File{Entries: []Entry{{Mode: ModeReadOnly, Path: "/opt/data"}}, Delegations: []Delegation{f.delegation()}})
 	})
 }
 
@@ -383,7 +383,7 @@ func TestCaseSensitiveVolumeIsRefused(t *testing.T) {
 	t.Parallel()
 	fs := caseSensitiveFS{fakeFS{kinds: map[string]string{"/Volumes/dev/app": "dir"}}}
 	box := hostPathBox("/Volumes/dev/app", "Directory", "/Volumes/dev/app", "")
-	if _, err := authorize([]Entry{{ModeReadWrite, "/Volumes/dev"}}, box, fs); !errors.Is(err, ErrNotShared) {
+	if _, err := authorize([]Entry{{Mode: ModeReadWrite, Path: "/Volumes/dev"}}, "default", box, fs); !errors.Is(err, ErrNotShared) {
 		t.Errorf("authorize on a case-sensitive volume = %v, want ErrNotShared", err)
 	}
 	dir, err := filepath.EvalSymlinks(t.TempDir())
