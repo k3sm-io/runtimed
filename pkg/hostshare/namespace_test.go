@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -355,5 +356,61 @@ func TestLoadEffectiveNamespace(t *testing.T) {
 	}
 	if _, err := authorize(eff.Entries, "default", hostPathBox(src, "", src, "", true), fs); !errors.Is(err, ErrNotShared) {
 		t.Errorf("authorize(default, inherited cap) = %v, want ErrNotShared", err)
+	}
+}
+
+// TestAuthorizeNamespaceSamePathModes pins two lines for one path with
+// different modes and namespace sets: the controller's namespace keeps
+// read-write while every project namespace gets the tree read-only. Where
+// the sets overlap (yurei-system also matches yurei-*), the existing
+// precedence decides: between two lines for the same path, read-write wins.
+func TestAuthorizeNamespaceSamePathModes(t *testing.T) {
+	t.Parallel()
+	const code = "/Users/dev/Code"
+	in := "rw " + code + " namespaces=yurei-system\nro " + code + " namespaces=yurei-*\nrw " + code + "/app namespaces=yurei-app\n"
+	entries, err := Parse(strings.NewReader(in))
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("Parse(two lines for one path) = %v, %v, want both kept", entries, err)
+	}
+	if again, err := Parse(strings.NewReader(string(Format(entries)))); err != nil || len(again) != 3 {
+		t.Errorf("Format round trip = %v, %v, want both lines for %s kept", again, err, code)
+	}
+	fs := fakeFS{kinds: map[string]string{code: "dir", code + "/app": "dir", code + "/lib": "dir"}}
+	for _, tc := range []struct {
+		name, ns, path string
+		ro             bool
+		want           *Grant // nil: refused
+	}{
+		{"project_ro_admitted", "yurei-foo", code, true, &Grant{Volume: "code", Path: code, ReadOnly: true}},
+		{"project_ro_below", "yurei-foo", code + "/lib", true, &Grant{Volume: "code", Path: code + "/lib", ReadOnly: true}},
+		{"project_rw_refused", "yurei-foo", code, false, nil},
+		{"system_rw", "yurei-system", code, false, &Grant{Volume: "code", Path: code}},
+		{"system_ro_mount", "yurei-system", code, true, &Grant{Volume: "code", Path: code, ReadOnly: true}},
+		{"own_repo_rw", "yurei-app", code + "/app", false, &Grant{Volume: "code", Path: code + "/app"}},
+		{"own_root_still_ro", "yurei-app", code, false, nil},
+		{"default_refused", "default", code, true, nil},
+		{"default_refused_rw", "default", code, false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := authorize(entries, tc.ns, hostPathBox(tc.path, "", tc.path, "", tc.ro), fs)
+			if tc.want == nil {
+				if !errors.Is(err, ErrNotShared) {
+					t.Fatalf("authorize(%s, %s, ro=%v) = %v, %v, want ErrNotShared", tc.ns, tc.path, tc.ro, got, err)
+				}
+				return
+			}
+			if err != nil || len(got) != 1 {
+				t.Fatalf("authorize(%s, %s, ro=%v) = %v, %v, want one grant", tc.ns, tc.path, tc.ro, got, err)
+			}
+			g := got[0]
+			g.Entry = Entry{}
+			if !reflect.DeepEqual(g, *tc.want) {
+				t.Errorf("grant = %+v, want %+v", g, *tc.want)
+			}
+		})
+	}
+	if e, ok := match(entries, "yurei-system", code, "Directory"); !ok || e.Mode != ModeReadWrite {
+		t.Errorf("match(yurei-system) = %v %v, want the rw line (read-write wins on one path)", e, ok)
 	}
 }
