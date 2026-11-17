@@ -204,7 +204,7 @@ func MergeRunSpec(cfg ImageRunConfig, req RunSpecRequest) (RunSpec, error) {
 	lookup := envLookup(env)
 	expanded := make([]string, len(argv))
 	for i, a := range argv {
-		expanded[i] = expandVars(a, lookup)
+		expanded[i] = ExpandVars(a, lookup)
 	}
 
 	workdir := c.GetWorkingDir()
@@ -361,7 +361,12 @@ func envLookup(env []string) map[string]string {
 	return m
 }
 
-// expandVars performs upstream's $(VAR) expansion over one string.
+// ExpandVars performs upstream's $(VAR) expansion over one string.
+//
+// It is the one copy of the grammar: the command and args expansion here uses
+// it, and so does the provider's expansion of container env values, which
+// upstream applies with the same rules. A second copy would drift on exactly
+// the edge cases below.
 //
 // The grammar is small and its edge cases are the whole point, so they are
 // enumerated rather than inferred: "$$" is a literal "$"; "$(NAME)" is replaced
@@ -373,7 +378,7 @@ func envLookup(env []string) map[string]string {
 // string is upstream's choice and it is the safe one: a container whose argv
 // carries a shell snippet must not have that snippet silently emptied by a
 // runtime that does not know what it means.
-func expandVars(s string, lookup map[string]string) string {
+func ExpandVars(s string, lookup map[string]string) string {
 	if !strings.Contains(s, "$") {
 		return s
 	}

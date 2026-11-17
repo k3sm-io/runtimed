@@ -133,8 +133,8 @@ func TestMergeRunSpecExpandsVars(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := expandVars(tc.in, tc.lookup); got != tc.want {
-				t.Errorf("expandVars(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := ExpandVars(tc.in, tc.lookup); got != tc.want {
+				t.Errorf("ExpandVars(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
