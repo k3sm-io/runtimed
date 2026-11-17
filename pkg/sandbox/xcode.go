@@ -320,7 +320,12 @@ func xcodeToolchainStanza(dir string) string {
 		// Xcode's git: its system gitconfig and templates, and the helpers it
 		// execs for a fetch (git-remote-https). SwiftPM resolves a package's
 		// dependencies through it (B1786 rig, RC5: "unable to access
-		// .../usr/share/git-core/gitconfig"). None of the helpers is entitled.
+		// .../usr/share/git-core/gitconfig"). No Mach-O helper is entitled. The
+		// profile already allowed exec, so reading libexec/git-core also lets the
+		// git subcommands that are scripts (git-submodule, git-send-email) run;
+		// same sandbox, same uid. The system gitconfig sets the osxkeychain
+		// credential helper, which fails at once with no securityd mach-lookup
+		// (measured on the rig: -50, no hang).
 		filepath.Join(dir, "usr", "share", "git-core"),
 		filepath.Join(dir, "usr", "libexec", "git-core"),
 		filepath.Join(dir, "Toolchains", "XcodeDefault.xctoolchain"),
