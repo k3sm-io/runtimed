@@ -20,6 +20,8 @@ package shadowset
 
 import (
 	"os"
+	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -50,7 +52,14 @@ func TestEntriesMatchTheDisk(t *testing.T) {
 			if !lfi.Mode().IsRegular() {
 				t.Fatalf("source %s is not a regular file (%v)", e.Source, lfi.Mode())
 			}
-			if !restricted(t, e.Source) {
+			switch {
+			case e.Entitled:
+				// Not SF_RESTRICTED: the reason for the copy is the private
+				// entitlements, which make dyld and dirhelper treat it as restricted.
+				if !hasPrivateEntitlement(t, e.Source) {
+					t.Errorf("source %s carries no Apple-private entitlement: it keeps the interposers without a copy", e.Source)
+				}
+			case !restricted(t, e.Source):
 				t.Errorf("source %s is not SF_RESTRICTED: it keeps the interposers without a copy", e.Source)
 			}
 			for _, h := range e.Hosts {
@@ -61,6 +70,14 @@ func TestEntriesMatchTheDisk(t *testing.T) {
 				}
 				if !fi.Mode().IsRegular() {
 					t.Errorf("exec path %s does not resolve to a regular file (%v)", h, fi.Mode())
+				}
+				if e.Entitled {
+					// Its one exec path is the Source itself, which is not
+					// SF_RESTRICTED (checked above for the entitlement instead).
+					if !os.SameFile(fi, lfi) {
+						t.Errorf("exec path %s is not the same file as the source %s", h, e.Source)
+					}
+					continue
 				}
 				if !restricted(t, h) {
 					t.Errorf("exec path %s is not SF_RESTRICTED", h)
@@ -82,4 +99,15 @@ func restricted(t *testing.T, p string) bool {
 		t.Fatalf("stat %s: %v", p, err)
 	}
 	return st.Flags&sfRestricted != 0
+}
+
+// hasPrivateEntitlement reports whether codesign lists a com.apple.private.*
+// entitlement on p.
+func hasPrivateEntitlement(t *testing.T, p string) bool {
+	t.Helper()
+	out, err := exec.Command("codesign", "-d", "--entitlements", "-", "--xml", p).CombinedOutput()
+	if err != nil {
+		t.Fatalf("codesign -d --entitlements %s: %v: %s", p, err, out)
+	}
+	return strings.Contains(string(out), "com.apple.private.")
 }

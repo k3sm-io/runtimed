@@ -50,18 +50,21 @@
 ;; at the node's DEVELOPER_DIR. Lab-derived by ablation — every path
 ;; below was a real denial; nothing here is writable, and neither the
 ;; application bundle nor its Contents is ever granted as a subpath.
-;; Covers the compilers, linker, SDK, xcrun, and the xcodebuild
-;; subcommands that only interrogate the install. A full xcodebuild
-;; build is out of reach of ANY read grant: it needs job-creation,
-;; mach-lookup and host-user state under /Users, which stays denied.
+;; Covers the compilers, linker, SDK, xcrun and xcodebuild, including an
+;; xcodebuild build run through the node's shadow copy (the IDE
+;; plug-ins are read for it). No mach-lookup and no job-creation: the
+;; builds measured needed neither, and they stay denied.
 (allow file-read*
   (subpath "/Applications/Xcode.app/Contents/Developer/usr/bin")
   (subpath "/Applications/Xcode.app/Contents/Developer/usr/lib")
+  (subpath "/Applications/Xcode.app/Contents/Developer/usr/share/git-core")
+  (subpath "/Applications/Xcode.app/Contents/Developer/usr/libexec/git-core")
   (subpath "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain")
   (subpath "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer")
   (subpath "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/XcodeKit.framework")
   (subpath "/Applications/Xcode.app/Contents/SharedFrameworks")
   (subpath "/Applications/Xcode.app/Contents/Frameworks")
+  (subpath "/Applications/Xcode.app/Contents/PlugIns")
   )
 ;; the developer-dir chain is OPENED as directories by xcrun (metadata
 ;; alone fails: "developer directory isn't accessible") and Toolchains
@@ -94,6 +97,7 @@
 ;; separate operation, so this is not an exec boundary.
 (deny file-read*
   (regex #"^/Applications/Xcode\.app/Contents/Frameworks/.*\.xpc/")
+  (regex #"^/Applications/Xcode\.app/Contents/PlugIns/.*\.(app|appex|xpc)/")
   (regex #"^/Applications/Xcode\.app/Contents/Developer/Platforms/MacOSX\.platform/Developer/.*\.(app|xpc)/")
   )
 ;; AF_UNIX: deny connect() to every container's resident shim.
