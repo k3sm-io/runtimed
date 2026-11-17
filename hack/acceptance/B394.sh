@@ -40,7 +40,7 @@ AUTOSIGNER_FPR="B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
 DEV_FPR="647F28654894E3BD457199BE38DBBDC86092693E"
 
 if ! command -v gpg >/dev/null 2>&1 || ! command -v gpgconf >/dev/null 2>&1; then
-  echo "B394: host gpg and gpgconf are required (brew install gnupg)" >&2
+  echo "B394: host gpg and gpgconf are required (gpg runs in a k3sm pod, never installed on the host; see CONTRIBUTING.md)" >&2
   exit 1
 fi
 
