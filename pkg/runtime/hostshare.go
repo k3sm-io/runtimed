@@ -24,9 +24,14 @@ import (
 
 // hostShares decides box's hostPath volumes against the node's allowlist
 // (Config.HostSharesFile) and returns the sandbox grants for them. It is the
-// runtime's own decision, made from the root-owned file and never from the
-// request: a pod shares this daemon's uid and can reach its gRPC socket, so a
-// CreatePod that arrives without the provider's check must meet the same one.
+// runtime's own decision: which paths are shared, and how, comes from the
+// root-owned file and never from the request, because a pod shares this
+// daemon's uid and can reach its gRPC socket, so a CreatePod that arrives
+// without the provider's check must meet the same one. The one input taken
+// from the request is the pod's namespace, which a namespaced line is matched
+// against: a pod that sends its own CreatePod can name any namespace, so the
+// namespace scope binds what the cluster schedules, not a pod speaking to this
+// socket directly (the residual risk in k3sm's host-shares design).
 //
 // A pod with no mounted hostPath volume gets nil without the file being read.
 // Every grant is logged at Info with the pod, the path and the mode, and the
