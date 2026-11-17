@@ -86,7 +86,7 @@ func TestLookups(t *testing.T) {
 		{"/usr/bin/readlink", "readlink", false},
 		{"/usr/bin/awk", "awk", false},
 		{"/usr/bin/xcrun", "xcrun", false},
-		{"/usr/bin/xcodebuild", "xcodebuild", false},
+		{"/usr/bin/xcodebuild", "", false},
 		{XcodebuildSource, "xcodebuild", false},
 		{"/usr/bin/swift", "", false},
 		{"/usr/bin/python3", "", false},

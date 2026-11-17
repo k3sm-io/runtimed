@@ -115,9 +115,10 @@ package sandbox
 // links a program that then runs, `swift build --disable-sandbox` does the same for
 // a package, and `xcodebuild -showsdks` lists the macOS SDK.
 //
-// Also covered since B1786 (Xcode 27.1, macOS 27.2): a full `xcodebuild build`
-// of a project or package, with -derivedDataPath in the data volume and ad-hoc
-// signing. The 2026-09 reading that this needs job-creation and mach-lookup to
+// Also covered since B1786 (Xcode 27.1, macOS 27.2): an `xcodebuild build` of
+// the projects measured (a macOS app target, Swift packages), with
+// -derivedDataPath in the data volume and ad-hoc signing. A build step that
+// needs a system service is not covered and fails closed. The 2026-09 reading that this needs job-creation and mach-lookup to
 // coreservicesd, lsd, FSEvents and DiskArbitration was wrong about cause: those
 // denials are logged but none is fatal (SWBBuildService runs as an ordinary
 // child, inside this sandbox). Ablation of a wide lab profile found three real
@@ -373,10 +374,10 @@ func xcodeToolchainStanza(dir string) string {
 	b.WriteString(";; at the node's DEVELOPER_DIR. Lab-derived by ablation — every path\n")
 	b.WriteString(";; below was a real denial; nothing here is writable, and neither the\n")
 	b.WriteString(";; application bundle nor its Contents is ever granted as a subpath.\n")
-	b.WriteString(";; Covers the compilers, linker, SDK, xcrun and xcodebuild, including a\n")
-	b.WriteString(";; full xcodebuild build run through the node's shadow copy (the IDE\n")
-	b.WriteString(";; plug-ins are read for it). No mach-lookup and no job-creation: a\n")
-	b.WriteString(";; build needs neither, and they stay denied.\n")
+	b.WriteString(";; Covers the compilers, linker, SDK, xcrun and xcodebuild, including an\n")
+	b.WriteString(";; xcodebuild build run through the node's shadow copy (the IDE\n")
+	b.WriteString(";; plug-ins are read for it). No mach-lookup and no job-creation: the\n")
+	b.WriteString(";; builds measured needed neither, and they stay denied.\n")
 	b.WriteString("(allow file-read*\n")
 	writeFirmlinkSubpaths(&b, subpaths)
 	b.WriteString("  )\n")

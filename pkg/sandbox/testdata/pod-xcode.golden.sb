@@ -50,10 +50,10 @@
 ;; at the node's DEVELOPER_DIR. Lab-derived by ablation — every path
 ;; below was a real denial; nothing here is writable, and neither the
 ;; application bundle nor its Contents is ever granted as a subpath.
-;; Covers the compilers, linker, SDK, xcrun and xcodebuild, including a
-;; full xcodebuild build run through the node's shadow copy (the IDE
-;; plug-ins are read for it). No mach-lookup and no job-creation: a
-;; build needs neither, and they stay denied.
+;; Covers the compilers, linker, SDK, xcrun and xcodebuild, including an
+;; xcodebuild build run through the node's shadow copy (the IDE
+;; plug-ins are read for it). No mach-lookup and no job-creation: the
+;; builds measured needed neither, and they stay denied.
 (allow file-read*
   (subpath "/Applications/Xcode.app/Contents/Developer/usr/bin")
   (subpath "/Applications/Xcode.app/Contents/Developer/usr/lib")

@@ -71,15 +71,18 @@ func TestEntriesMatchTheDisk(t *testing.T) {
 				if !fi.Mode().IsRegular() {
 					t.Errorf("exec path %s does not resolve to a regular file (%v)", h, fi.Mode())
 				}
-				if h == e.Source && e.Entitled {
+				if e.Entitled {
+					// Its one exec path is the Source itself, which is not
+					// SF_RESTRICTED (checked above for the entitlement instead).
+					if !os.SameFile(fi, lfi) {
+						t.Errorf("exec path %s is not the same file as the source %s", h, e.Source)
+					}
 					continue
 				}
 				if !restricted(t, h) {
 					t.Errorf("exec path %s is not SF_RESTRICTED", h)
 				}
-				// An Entitled entry's other exec paths are the libxcselect
-				// trampoline, a different file that execs Source.
-				if !e.Shell && !e.Entitled && !os.SameFile(fi, lfi) {
+				if !e.Shell && !os.SameFile(fi, lfi) {
 					t.Errorf("exec path %s is not the same file as the source %s", h, e.Source)
 				}
 			}

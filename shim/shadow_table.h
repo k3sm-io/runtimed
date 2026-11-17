@@ -79,7 +79,6 @@ static const struct {
     {"/usr/bin/base64", "base64"},
     {"/usr/bin/xcrun", "xcrun"},
     {"/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild", "xcodebuild"},
-    {"/usr/bin/xcodebuild", "xcodebuild"},
 };
 
 #endif /* K3SM_SHADOW_TABLE_H */

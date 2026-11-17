@@ -17,6 +17,7 @@ limitations under the License.
 package sandbox
 
 import (
+	"debug/macho"
 	"errors"
 	"os"
 	"os/exec"
@@ -928,4 +929,68 @@ func TestXcodeToolchainGrantReadsEveryPlatformManifest(t *testing.T) {
 			t.Errorf("a confined read of %s succeeded; the manifest grant reaches past Info.plist", other)
 		}
 	}
+}
+
+// TestXcodePlugInsCarveCoversEveryEntitledExecutable is the guard on the PlugIns
+// read grant (B1786): on this host's Xcode, no Mach-O executable that the grant
+// leaves readable (outside the .app/.appex/.xpc carve) carries an Apple-private
+// entitlement. The carve is extension-based, so a future Xcode that ships an
+// entitled helper in a .bundle or a plain directory fails this test instead of
+// being handed out silently.
+func TestXcodePlugInsCarveCoversEveryEntitledExecutable(t *testing.T) {
+	plugins := filepath.Join(filepath.Dir(xcodeDevDir), "PlugIns")
+	if _, err := os.Stat(plugins); err != nil {
+		t.Skipf("SKIP: no %s on this host", plugins)
+	}
+	carved := regexp.MustCompile(`/[^/]*\.(app|appex|xpc)/`)
+	checked, carvedExes := 0, 0
+	err := filepath.Walk(plugins, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // an unreadable subtree is not this test's concern
+		}
+		if info.IsDir() || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+			return nil
+		}
+		if !isMachOExecutable(p) {
+			return nil
+		}
+		if carved.MatchString(strings.TrimPrefix(p, plugins)) {
+			carvedExes++
+			return nil
+		}
+		checked++
+		out, err := exec.Command("codesign", "-d", "--entitlements", "-", "--xml", p).CombinedOutput()
+		if err != nil {
+			t.Errorf("codesign -d %s: %v: %s", p, err, out)
+			return nil
+		}
+		if strings.Contains(string(out), "com.apple.private.") {
+			t.Errorf("%s is a readable executable with an Apple-private entitlement; widen the PlugIns carve", p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("checked %d uncarved executables under %s (%d carved)", checked, plugins, carvedExes)
+	// Non-vacuous: the walk must see the carved helpers' executables, or it
+	// is not reading Mach-O at all.
+	if carvedExes == 0 {
+		t.Fatalf("no Mach-O executable found under %s at all; the scan proves nothing", plugins)
+	}
+}
+
+// isMachOExecutable reports whether p is a thin or fat Mach-O whose (first)
+// slice is an MH_EXECUTE image.
+func isMachOExecutable(p string) bool {
+	if ff, err := macho.OpenFat(p); err == nil {
+		defer ff.Close()
+		return len(ff.Arches) > 0 && ff.Arches[0].Type == macho.TypeExec
+	}
+	f, err := macho.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return f.Type == macho.TypeExec
 }

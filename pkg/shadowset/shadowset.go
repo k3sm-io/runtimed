@@ -46,12 +46,7 @@ type Entry struct {
 	// Entitled marks a copy made because the source carries Apple-private
 	// entitlements, not because it is SF_RESTRICTED: dyld and dirhelper treat
 	// such a process as restricted (no DYLD_* and no per-pod user dirs), and
-	// the ad-hoc re-sign drops the entitlements, so the copy is not. An
-	// Entitled entry may also list the libxcselect trampoline's exec path
-	// (/usr/bin/<tool>, a different, SF_RESTRICTED file that would exec Source
-	// through DEVELOPER_DIR without the interposers). The swap maps it straight
-	// to the copy: in a pod DEVELOPER_DIR names the one Xcode the profile
-	// grants, so skipping the trampoline changes which file runs, not what.
+	// the ad-hoc re-sign drops the entitlements, so the copy is not.
 	Entitled bool
 }
 
@@ -115,10 +110,13 @@ var entries = []Entry{
 	// atomic saves and the per-pod user dirs miss it) and writes the shared
 	// /var/folders trees of the daemon user. The xcodebuild copy is rooted at the
 	// default Xcode location; a node whose Xcode lives elsewhere gets no copy
-	// and its pods keep the host binary, as before.
+	// and its pods keep the host binary, as before. The libxcselect trampoline
+	// /usr/bin/xcodebuild is NOT mapped: it resolves the developer dir from the
+	// pod's DEVELOPER_DIR, which may name another Xcode than the copy's, so a
+	// pod reaches the copy through $DEVELOPER_DIR/usr/bin or xcrun instead.
 	{Copy: "xcrun", Source: "/usr/bin/xcrun", Hosts: []string{"/usr/bin/xcrun"}},
 	{Copy: "xcodebuild", Source: XcodebuildSource,
-		Hosts:  []string{XcodebuildSource, "/usr/bin/xcodebuild"},
+		Hosts:  []string{XcodebuildSource},
 		Relink: true, Entitled: true},
 }
 
