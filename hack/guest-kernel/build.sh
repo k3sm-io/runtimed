@@ -498,7 +498,7 @@ verify_provenance() {
     extracted="$(host_verify_sums "$signed")"
   else
     echo "  host gpg not found; verifying inside the pinned toolchain image instead"
-    echo "  (install one with 'brew install gnupg' to verify without a toolchain pod)"
+    echo "  (gpg runs in the toolchain pod; never install it on the host)"
     extracted="$(container_verify_sums "$signed")"
   fi
 
@@ -825,7 +825,7 @@ repro() {
 # dirmngr is told disable-ipv6 because a host that routes no IPv6 otherwise
 # fails on the keyserver's AAAA record with no-route-to-host.
 refresh_keys() {
-  command -v gpg >/dev/null || die "--refresh-keys needs host gpg (brew install gnupg)"
+  command -v gpg >/dev/null || die "--refresh-keys needs gpg; it runs in the toolchain pod, never installed on the host"
   local keyservers="hkps://keyserver.ubuntu.com hkps://pgp.mit.edu hkps://keys.openpgp.org"
   local fpr home status
   mkdir -p "$KEYS_DIR"

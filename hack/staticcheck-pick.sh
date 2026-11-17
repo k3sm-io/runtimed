@@ -12,7 +12,7 @@ staticcheck_pick() {
 	local c v sc_seen="" sc_gopath sc_hint
 	sc=""
 	sc_gopath="$(go env GOPATH)"
-	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
+	sc_hint="runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}; or, beside another pin: GOBIN=<tmp> go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} && mv <tmp>/staticcheck ${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}"
 	for c in "${sc_gopath}/bin/staticcheck-${STATICCHECK_VERSION}" "$(command -v staticcheck 2>/dev/null || true)" "${sc_gopath}/bin/staticcheck"; do
 		[ -n "$c" ] && [ -x "$c" ] || continue
 		v="$("$c" -version 2>/dev/null | awk '{print $2}')" || v=""

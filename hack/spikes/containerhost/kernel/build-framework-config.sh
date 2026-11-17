@@ -210,7 +210,7 @@ verify_provenance() {
     extracted="$(host_verify_sums "$signed")"
   else
     echo "  host gpg not found; verifying inside the pinned toolchain image instead"
-    echo "  (install one with 'brew install gnupg' to verify without Docker)"
+    echo "  (gpg runs in a k3sm pod, never installed on the host)"
     extracted="$(container_verify_sums "$signed")"
   fi
 

@@ -287,15 +287,41 @@ if grep -qx "module k3sm.io/runtimed" go.mod 2>/dev/null; then
 	done
 	if [ -z "$gv" ]; then
 		if [ -z "$gv_seen" ]; then
-			echo "==> [runtimed] govulncheck: not installed; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION})" >&2
+			echo "==> [runtimed] govulncheck: not installed; the gate needs ${GOVULNCHECK_VERSION} (runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION})" >&2
 		else
-			echo "==> [runtimed] govulncheck: wrong version; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}). Found:" >&2
+			echo "==> [runtimed] govulncheck: wrong version; the gate needs ${GOVULNCHECK_VERSION} (runs in a k3sm pod, never installed on the host (containers only, CONTRIBUTING.md); the pinned build in the pod: go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}). Found:" >&2
 			printf '%s' "$gv_seen" >&2
 		fi
 		exit 1
 	fi
 	echo "==> [runtimed] govulncheck ${GOVULNCHECK_VERSION} ./..."
 	GOWORK=off CGO_ENABLED=$CGO "$gv" ./...
+fi
+
+# DCO sign-off (there is no CI on GitHub: this stage is the check). Every commit this
+# branch adds over origin/main must carry a Signed-off-by line whose email is the
+# author's, matched as a FIXED string (an ERE breaks on id+user@users.noreply addresses).
+# A lone clone without origin/main skips, saying so; a synced main checks nothing.
+echo "==> [runtimed] DCO sign-off (commits not on origin/main)"
+dco_signed() { # <author-email> <message>: exit 0 iff a Signed-off-by line names the email
+	printf '%s\n' "$2" | grep -iE '^Signed-off-by: ' | grep -qiF "<$1>"
+}
+dco_signed 'a+b@users.noreply.github.com' 'x
+
+Signed-off-by: A <a+b@users.noreply.github.com>' || { echo "FAIL: [runtimed] DCO self-test: a signed commit was rejected"; exit 1; }
+! dco_signed 'a@example.com' 'x
+
+Co-authored-by: A <a@example.com>' || { echo "FAIL: [runtimed] DCO self-test: an unsigned commit passed"; exit 1; }
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+	dco_bad=0
+	for sha in $(git rev-list --no-merges origin/main..HEAD); do
+		dco_signed "$(git show -s --format='%ae' "$sha")" "$(git show -s --format='%B' "$sha")" \
+			|| { echo "    UNSIGNED: $(git show -s --format='%h %s' "$sha")"; dco_bad=1; }
+	done
+	[ "$dco_bad" = 0 ] || { echo "FAIL: [runtimed] sign off the commits above: git commit -s (see CONTRIBUTING.md)"; exit 1; }
+	echo "    sign-off OK ($(git rev-list --no-merges --count origin/main..HEAD) new commit(s))"
+else
+	echo "    SKIP: no origin/main ref in this clone, nothing to compare against"
 fi
 
 echo "OK: runtimed ci green"
