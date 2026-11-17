@@ -204,7 +204,7 @@ func MergeRunSpec(cfg ImageRunConfig, req RunSpecRequest) (RunSpec, error) {
 	lookup := envLookup(env)
 	expanded := make([]string, len(argv))
 	for i, a := range argv {
-		expanded[i] = expandVars(a, lookup)
+		expanded[i] = ExpandVars(a, lookup)
 	}
 
 	workdir := c.GetWorkingDir()
@@ -361,7 +361,12 @@ func envLookup(env []string) map[string]string {
 	return m
 }
 
-// expandVars performs upstream's $(VAR) expansion over one string.
+// ExpandVars performs upstream's $(VAR) expansion over one string.
+//
+// It is the one copy of the grammar: the command and args expansion here uses
+// it, and so does the provider's expansion of container env values, which
+// upstream applies with the same rules. A second copy would drift on exactly
+// the edge cases below.
 //
 // The grammar is small and its edge cases are the whole point, so they are
 // enumerated rather than inferred: "$$" is a literal "$"; "$(NAME)" is replaced
@@ -373,12 +378,34 @@ func envLookup(env []string) map[string]string {
 // string is upstream's choice and it is the safe one: a container whose argv
 // carries a shell snippet must not have that snippet silently emptied by a
 // runtime that does not know what it means.
-func expandVars(s string, lookup map[string]string) string {
+func ExpandVars(s string, lookup map[string]string) string {
+	out, _ := ExpandVarsLimit(s, lookup, -1)
+	return out
+}
+
+// ExpandVarsLimit is ExpandVars with a cap on the length of the result. It
+// returns false, and no string, when the expansion would exceed limit bytes; a
+// negative limit means no cap.
+//
+// The cap exists because the expansion amplifies: a chain of values that each
+// reference the one before twice doubles at every step, so a few kilobytes of
+// pod spec can ask a node daemon for gigabytes. The check runs before each
+// substitution is written, so the memory held never exceeds the limit by more
+// than one value already in lookup.
+func ExpandVarsLimit(s string, lookup map[string]string, limit int) (string, bool) {
 	if !strings.Contains(s, "$") {
-		return s
+		if limit >= 0 && len(s) > limit {
+			return "", false
+		}
+		return s, true
 	}
 	var b strings.Builder
 	b.Grow(len(s))
+	// noClose records that an earlier "$(" found no ")" after it. Every later
+	// "$(" sits in a suffix of that one, so it cannot find one either; skipping
+	// the rescan keeps a value of many unterminated "$(" linear rather than
+	// quadratic. A later "$$" is still a literal "$", as upstream.
+	noClose := false
 	for i := 0; i < len(s); {
 		if s[i] != '$' {
 			b.WriteByte(s[i])
@@ -390,11 +417,16 @@ func expandVars(s string, lookup map[string]string) string {
 			i += 2
 			continue
 		}
-		if i+1 < len(s) && s[i+1] == '(' {
+		if i+1 < len(s) && s[i+1] == '(' && !noClose {
 			end := strings.IndexByte(s[i+2:], ')')
-			if end >= 0 {
+			if end < 0 {
+				noClose = true
+			} else {
 				name := s[i+2 : i+2+end]
 				if v, ok := lookup[name]; ok {
+					if limit >= 0 && b.Len()+len(v) > limit {
+						return "", false
+					}
 					b.WriteString(v)
 				} else {
 					b.WriteString(s[i : i+3+end])
@@ -406,7 +438,10 @@ func expandVars(s string, lookup map[string]string) string {
 		b.WriteByte('$')
 		i++
 	}
-	return b.String()
+	if limit >= 0 && b.Len() > limit {
+		return "", false
+	}
+	return b.String(), true
 }
 
 // IsHostPathReference reports whether an image reference is the absolute-HOST-PATH
