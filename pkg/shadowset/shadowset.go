@@ -16,6 +16,10 @@ limitations under the License.
 
 package shadowset
 
+// XcodebuildSource is the xcodebuild the node copies: the one inside the
+// default Xcode install. Its copy is the only Relink entry.
+const XcodebuildSource = "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild"
+
 // Entry is one re-signed copy and the exec paths it stands in for.
 type Entry struct {
 	// Copy is the copy's file name in the node's shadow directory.
@@ -34,6 +38,21 @@ type Entry struct {
 	// it (a direct exec of a host-shell script interpreter, and its policy
 	// gate); the plain swap applies to every entry.
 	Shell bool
+	// Relink marks a copy cloned out of an application bundle: the installer
+	// rewrites each of its @executable_path LC_RPATH entries to the absolute
+	// path it resolves to from Source, before re-signing, so the copy still
+	// finds the bundle's frameworks from the shadow directory.
+	Relink bool
+	// Entitled marks a copy made because the source carries Apple-private
+	// entitlements, not because it is SF_RESTRICTED: dyld and dirhelper treat
+	// such a process as restricted (no DYLD_* and no per-pod user dirs), and
+	// the ad-hoc re-sign drops the entitlements, so the copy is not. An
+	// Entitled entry may also list the libxcselect trampoline's exec path
+	// (/usr/bin/<tool>, a different, SF_RESTRICTED file that would exec Source
+	// through DEVELOPER_DIR without the interposers). The swap maps it straight
+	// to the copy: in a pod DEVELOPER_DIR names the one Xcode the profile
+	// grants, so skipping the trampoline changes which file runs, not what.
+	Entitled bool
 }
 
 // entries is the list. /bin/sh maps to the bash copy: /bin/sh is Apple's
@@ -88,6 +107,19 @@ var entries = []Entry{
 	{Copy: "gzip", Source: "/usr/bin/gzip", Hosts: []string{"/usr/bin/gzip"}},
 	{Copy: "gunzip", Source: "/usr/bin/gunzip", Hosts: []string{"/usr/bin/gunzip", "/usr/bin/zcat"}},
 	{Copy: "base64", Source: "/usr/bin/base64", Hosts: []string{"/usr/bin/base64"}},
+
+	// The Xcode front ends (B1786). xcrun is a platform binary: without a copy
+	// it cannot use the pod's per-pod temp dir, so it never caches a lookup and
+	// spawns xcodebuild for every one. xcodebuild carries Apple-private
+	// entitlements: without a copy it loses the path-rebase shim (so Foundation
+	// atomic saves and the per-pod user dirs miss it) and writes the shared
+	// /var/folders trees of the daemon user. The xcodebuild copy is rooted at the
+	// default Xcode location; a node whose Xcode lives elsewhere gets no copy
+	// and its pods keep the host binary, as before.
+	{Copy: "xcrun", Source: "/usr/bin/xcrun", Hosts: []string{"/usr/bin/xcrun"}},
+	{Copy: "xcodebuild", Source: XcodebuildSource,
+		Hosts:  []string{XcodebuildSource, "/usr/bin/xcodebuild"},
+		Relink: true, Entitled: true},
 }
 
 // byHost indexes entries by exec path.

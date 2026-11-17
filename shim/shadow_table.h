@@ -26,7 +26,7 @@ limitations under the License.
 #define K3SM_SHADOW_TABLE_H
 
 /* The longest copy name, in bytes. */
-#define K3SM_SHADOW_COPY_MAX 8
+#define K3SM_SHADOW_COPY_MAX 10
 
 static const struct {
     const char *host;
@@ -77,6 +77,9 @@ static const struct {
     {"/usr/bin/gunzip", "gunzip"},
     {"/usr/bin/zcat", "gunzip"},
     {"/usr/bin/base64", "base64"},
+    {"/usr/bin/xcrun", "xcrun"},
+    {"/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild", "xcodebuild"},
+    {"/usr/bin/xcodebuild", "xcodebuild"},
 };
 
 #endif /* K3SM_SHADOW_TABLE_H */
