@@ -27,9 +27,11 @@ import (
 )
 
 // OpenPTY allocates a pseudoterminal master/slave pair on macOS for a tty exec.
-// It must run unconfined: a process under a pod profile cannot open /dev/ptmx
-// or a tty node, which is why the daemon allocates a resident shim's ptys and
-// hands the slave over (supervisor.SendPtyHandoff).
+// It runs unconfined, in the daemon, and the daemon hands the slave to a
+// resident shim (supervisor.SendPtyHandoff): a pod process may allocate pairs of
+// its own (the pod profile's pty tier, sandbox.podPTY), but it can open a slave
+// only while that slave carries its own sandbox's pty extension, which a pair
+// the daemon cloned never does.
 // golang.org/x/sys/unix has no posix_openpt(3) binding, so it uses the BSD path:
 // open the /dev/ptmx clone device, grant + unlock the slave (TIOCPTYGRANT /
 // TIOCPTYUNLK), resolve the slave node name (TIOCPTYGNAME), then open it

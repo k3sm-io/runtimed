@@ -223,8 +223,8 @@ func (s *shimServer) Follow(req *shimv1.FollowRequest, stream shimv1.ContainerSh
 // Exec runs one exec session in the container's context: the container's
 // resolved environment and working directory, the pod's rlimit plan and QoS
 // band (exec mode), under the shim's own confinement. Sessions keep their own
-// session/group exactly as the daemon's do (Setsid+Setctty for a tty, Setpgid
-// otherwise) and are torn down with their stream (execsession's invariant).
+// session/group exactly as the daemon's do (Setsid+Setctty for a tty, Setsid
+// and no terminal otherwise) and are torn down with their stream (execsession's invariant).
 func (s *shimServer) Exec(stream shimv1.ContainerShim_ExecServer) error {
 	first, err := stream.Recv()
 	if err != nil {

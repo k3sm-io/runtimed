@@ -53,9 +53,13 @@ type Stream interface {
 // is not safe to call concurrently from the stdout and stderr pumps).
 //
 // With tty the command gets a fresh pty and its own session with the pty as
-// controlling terminal (Setsid+Setctty); without, its own process group
-// (Setpgid), so a client ^C never reaches the server. Either way the session's
-// pid is its group id. onStart, when non-nil, is called with that pid once the
+// controlling terminal (Setsid+Setctty); without, its own session with NO
+// controlling terminal (Setsid), so a client ^C never reaches the server and
+// the command cannot reach the caller's terminal: the pod profile allows
+// /dev/tty, which the kernel resolves to the opener's controlling terminal, and
+// a session inherited from a daemon started in a Terminal or SSH window would
+// make that the operator's (TestRunWithoutTTYLeadsItsOwnSession). Either way
+// the session's pid is its group id. onStart, when non-nil, is called with that pid once the
 // command has started.
 func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool, onStart func(pid int)) error {
 	send := serializedSend(stream)
@@ -93,7 +97,7 @@ func Run(stream Stream, cmd *exec.Cmd, tty, wantStdin bool, onStart func(pid int
 			PumpReader(master, func(b []byte) error { return send(&runtimev1.ExecResponse{Stdout: b}) })
 		}()
 	} else {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own pgrp; a client ^C never reaches the server
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // own session, no controlling terminal (see the Run doc)
 		if wantStdin {
 			w, err := cmd.StdinPipe()
 			if err != nil {
