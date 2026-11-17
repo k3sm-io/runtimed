@@ -69,9 +69,12 @@ type ShimGrant struct {
 //   - file-read* on the shim dir (subpath), which the run tree's protected deny
 //     would otherwise hide;
 //   - file-ioctl on tty nodes: a tty exec session's controlling-terminal
-//     ioctls on the slave the daemon handed over. No file-read or file-write
-//     is granted on any tty, so no process under this profile can OPEN a
-//     terminal, its own or another session's (TestShimProfileReach);
+//     ioctls on the slave the daemon handed over. This tier grants no
+//     file-read or file-write on any tty; the only open the profile allows is
+//     the pod profile's own pty tier (podPTY), which reaches a slave only
+//     while it carries this sandbox's pty extension, so no process under this
+//     profile can OPEN the daemon's terminal or another session's
+//     (TestShimProfileReach, TestPodProfileAllocatesOnlyItsOwnPTY);
 //   - signal to its own children and its own process group: the shim forwards
 //     a TERM to its container, delivers the Signal RPC to the pod group it
 //     leads, and kills an exec session whose stream ended. The container runs

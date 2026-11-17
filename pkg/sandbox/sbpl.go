@@ -134,6 +134,51 @@ var systemProtectedPrefixes = []string{
 // carries (shimSignal).
 const podSignal = "(allow signal (target children))\n(allow signal (target pgrp))\n"
 
+// podPTY lets a pod process allocate and use pseudo-terminals of its own and
+// nothing else under /dev beyond the four literals of the read tier. It is the
+// App Sandbox's own pty stanza (/System/Library/Sandbox/Profiles/application.sb
+// on macOS 27), narrowed:
+//
+//   - (allow pseudo-tty): the clone operation posix_openpt(3) performs. Without
+//     it the open of /dev/ptmx fails even when the path is allowed.
+//   - read, write and ioctl on the /dev/ptmx clone device. Opening it always
+//     makes a NEW pair, so it reaches no existing terminal; the ioctls are the
+//     grant, unlock and name calls (TIOCPTYGRANT, TIOCPTYUNLK, TIOCPTYGNAME) that
+//     grantpt, unlockpt and ptsname make on the master.
+//   - read, write and ioctl on a slave /dev/ttysNNN only while it carries the
+//     com.apple.sandbox.pty extension. The sandbox issues that extension to the
+//     sandbox instance that cloned the pair, and it does not outlive the pair.
+//     Measured on macOS 27.2 (TestPodProfileAllocatesOnlyItsOwnPTY): another
+//     pod under identical profile text and the same uid is denied the slave;
+//     the host's own terminals are denied; and once a pod frees a pair and the
+//     host is given the same number, the pod that freed it is denied. Pods share
+//     the daemon's uid (no per-pod uid isolation, supervisor.Credential), so
+//     this extension, not the node's mode bits, is what keeps a pod off every
+//     terminal but its own. The pattern needs three or more digits, the clone
+//     naming (ttys%03d), so the legacy BSD pty slaves /dev/ttys0 to ttysf, which
+//     are mode 0666, never match; libsandbox ignores a {3,} bound, so the
+//     digits are spelled out. The ioctls are every tty request (termios,
+//     winsize, TIOCSCTTY, the process-group calls), on terminals the pod owns.
+//   - read, write and ioctl on /dev/tty. It is not a device of its own: the
+//     kernel opens the caller's controlling terminal (ENXIO without one), and a
+//     pod's controlling terminal is one it allocated or the one runtimed handed
+//     to a kubectl exec -t session. Programs that read keys or a password from
+//     the terminal rather than stdin (less, a pager, git and ssh prompts, fzf)
+//     open it.
+//
+// No listing of /dev is granted, so ttyname(3) fails with ERANGE in a pod;
+// ptsname(3) or fcntl(F_GETPATH) on the slave name it instead.
+const podPTY = ";; pty: allocate pseudo-terminals of the pod's own; a slave only with the\n" +
+	";; sandbox's per-instance pty extension; /dev/tty is the caller's own ctty.\n" +
+	"(allow pseudo-tty)\n" +
+	"(allow file-read* file-write* file-ioctl\n" +
+	"  (literal \"/dev/ptmx\")\n" +
+	"  (literal \"/dev/tty\"))\n" +
+	"(allow file-read* file-write* file-ioctl\n" +
+	"  (require-all\n" +
+	"    (regex #\"^/dev/ttys[0-9][0-9][0-9]+$\")\n" +
+	"    (extension \"com.apple.sandbox.pty\")))\n"
+
 // systemTLSConfigDir is the system TLS configuration directory (LibreSSL's
 // openssl.cnf, the CA bundle cert.pem, certs/) a pod may read. Generate grants
 // it read-only in both firmlink forms.
@@ -822,6 +867,12 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	b.WriteString("(allow file-write*\n")
 	writeFirmlinkSubpaths(&b, writePaths)
 	b.WriteString("  (literal \"/dev/null\"))\n")
+
+	// Pseudo-terminals the pod allocates itself (podPTY): a TUI, an in-pod
+	// terminal multiplexer or a session agent opens its own pair with
+	// posix_openpt/openpty. Emitted in the allows tier; nothing later in the
+	// profile names /dev, so tier order does not change its reach.
+	b.WriteString(podPTY)
 
 	if networkRequested(sp) {
 		b.WriteString(networkStanza)
