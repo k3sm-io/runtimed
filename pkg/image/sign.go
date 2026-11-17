@@ -131,8 +131,16 @@ func AdHocSign(ctx context.Context, path string) error {
 // ErrSignTarget reports that a binary to be ad-hoc signed does not resolve to a
 // regular file inside its root: the path is outside the root, its symlink chain
 // leaves the root or dangles, or a component was swapped for a symlink between
-// the resolution and the open.
+// the resolution and the open. A target that names nothing in the image also
+// carries ErrEntrypointNotInImage.
 var ErrSignTarget = errors.New("image: sign target is not a regular file inside its root")
+
+// ErrEntrypointNotInImage reports that a binary to be signed names nothing the
+// image carries: a FROM scratch image whose ENTRYPOINT is /bin/sh, say, or a
+// link whose chain ends at a name the image does not hold. It always comes
+// wrapped with ErrSignTarget, and names the cause so the fix (ship the program
+// in the image, or name the one it ships) is the obvious one.
+var ErrEntrypointNotInImage = errors.New("image: entrypoint is not in the image")
 
 // ErrSignStaging reports a sign staging directory that is not a directory
 // private to this process: not a directory, not owned by the effective uid, or
@@ -250,7 +258,8 @@ func signByReplace(ctx context.Context, staging, root, target string, sign signF
 		return fmt.Errorf("%w: resolve %s in %s: %w", ErrSignTarget, target, root, err)
 	}
 	if !exists || resolved == "" {
-		return fmt.Errorf("%w: %s does not resolve to a file in %s", ErrSignTarget, target, root)
+		return fmt.Errorf("%w: %w: %s names nothing the image carries under %s",
+			ErrSignTarget, ErrEntrypointNotInImage, target, root)
 	}
 	if afterResolve != nil {
 		afterResolve(filepath.Join(root, filepath.FromSlash(resolved)))
