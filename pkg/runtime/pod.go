@@ -3279,6 +3279,16 @@ const (
 	pathShimMountsEnv = "K3SM_MOUNT_PATHS"
 )
 
+// imageRootEnv names, for a pulled-image container, the host directory its
+// image tree is materialized in (the pod data volume, rootfsPath). It is the
+// documented way for a workload to build an absolute path into its own image:
+// a native pod has no chroot, so "/app" is the HOST's /app, and only the
+// container's volume-mount prefixes are rebased (the path-rebase shim). It is
+// a public contract kept apart from pathShimRootfsEnv on purpose: that one is
+// the shim's activation knob, set only with mounts, and may change with the
+// shim. Runtime-owned, like K3SM_SHADOW_DIR: a spec value is dropped.
+const imageRootEnv = "K3SM_IMAGE_ROOT"
+
 // semPrefixEnv names the pod's POSIX semaphore prefix (sandbox.PosixSemPrefix)
 // for the path-rebase shim, which moves a workload's sem_open/sem_unlink names
 // under it. It is runtime-owned like K3SM_SHADOW_DIR: a spec value is dropped.
@@ -3441,10 +3451,15 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		}
 	}
 	env := make([]string, 0, len(base)+5)
-	if !envHasName(base, tmpDirEnv) || !envHasName(base, clangModuleCacheEnv) {
+	if !envHasName(base, tmpDirEnv) || !envHasName(base, clangModuleCacheEnv) || !hostBinaryRoute(c) {
 		dataVol, err := r.rootfsPath(box)
 		if err != nil {
 			return nil, err
+		}
+		// The image root, for a pulled image only: a host-binary container
+		// has no image tree to name.
+		if !hostBinaryRoute(c) {
+			env = append(env, imageRootEnv+"="+dataVol)
 		}
 		if !envHasName(base, tmpDirEnv) {
 			env = append(env, tmpDirEnv+"="+podTmpDir(dataVol))
@@ -3477,7 +3492,9 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		// DIRHELPER_USER_DIR_SUFFIX likewise: only the links runtimed made
 		// may be named (a missing one would have dirhelper make an
 		// undeletable directory in the shared tree).
-		if name, _, _ := strings.Cut(e, "="); name == shadowDirEnv || name == supervisor.ChildReportEnv || name == semPrefixEnv || name == userDirSuffixEnv {
+		// K3SM_IMAGE_ROOT likewise: only rootfsPath derives it, so the
+		// documented image root is always the real one.
+		if runtimeOwnedEnv(e) {
 			continue
 		}
 		env = append(env, e)
@@ -3539,6 +3556,17 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		env = append(env, dyldInsertEnv+"="+strings.Join(inserts, ":"))
 	}
 	return env, nil
+}
+
+// runtimeOwnedEnv reports whether a "K=V" entry names a variable only the
+// runtime may set, so containerEnv drops a spec value for it.
+func runtimeOwnedEnv(e string) bool {
+	switch name, _, _ := strings.Cut(e, "="); name {
+	case shadowDirEnv, supervisor.ChildReportEnv, semPrefixEnv, userDirSuffixEnv,
+		imageRootEnv:
+		return true
+	}
+	return false
 }
 
 // envHasName reports whether env (in "K=V" form) already sets name. It is how
