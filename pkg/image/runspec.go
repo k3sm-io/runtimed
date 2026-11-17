@@ -379,8 +379,25 @@ func envLookup(env []string) map[string]string {
 // carries a shell snippet must not have that snippet silently emptied by a
 // runtime that does not know what it means.
 func ExpandVars(s string, lookup map[string]string) string {
+	out, _ := ExpandVarsLimit(s, lookup, -1)
+	return out
+}
+
+// ExpandVarsLimit is ExpandVars with a cap on the length of the result. It
+// returns false, and no string, when the expansion would exceed limit bytes; a
+// negative limit means no cap.
+//
+// The cap exists because the expansion amplifies: a chain of values that each
+// reference the one before twice doubles at every step, so a few kilobytes of
+// pod spec can ask a node daemon for gigabytes. The check runs before each
+// substitution is written, so the memory held never exceeds the limit by more
+// than one value already in lookup.
+func ExpandVarsLimit(s string, lookup map[string]string, limit int) (string, bool) {
 	if !strings.Contains(s, "$") {
-		return s
+		if limit >= 0 && len(s) > limit {
+			return "", false
+		}
+		return s, true
 	}
 	var b strings.Builder
 	b.Grow(len(s))
@@ -400,6 +417,9 @@ func ExpandVars(s string, lookup map[string]string) string {
 			if end >= 0 {
 				name := s[i+2 : i+2+end]
 				if v, ok := lookup[name]; ok {
+					if limit >= 0 && b.Len()+len(v) > limit {
+						return "", false
+					}
 					b.WriteString(v)
 				} else {
 					b.WriteString(s[i : i+3+end])
@@ -411,7 +431,10 @@ func ExpandVars(s string, lookup map[string]string) string {
 		b.WriteByte('$')
 		i++
 	}
-	return b.String()
+	if limit >= 0 && b.Len() > limit {
+		return "", false
+	}
+	return b.String(), true
 }
 
 // IsHostPathReference reports whether an image reference is the absolute-HOST-PATH

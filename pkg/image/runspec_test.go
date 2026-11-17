@@ -164,6 +164,35 @@ func TestMergeRunSpecExpandsVars(t *testing.T) {
 // TestMergeRunSpecEnvAndWorkingDir pins the other two merged fields: the pod's
 // env overrides the image's BY NAME and IN place (image order is preserved), and
 // the pod's workingDir wins over the image's while an unset one falls through.
+// TestExpandVarsLimit pins the cap: a result within the limit is the same as
+// ExpandVars gives, one past it is refused without building it, and a negative
+// limit means no cap.
+func TestExpandVarsLimit(t *testing.T) {
+	lookup := map[string]string{"A": "xxxx"}
+	cases := []struct {
+		name   string
+		in     string
+		limit  int
+		want   string
+		wantOK bool
+	}{
+		{"within", "$(A)$(A)", 8, "xxxxxxxx", true},
+		{"one_past", "$(A)$(A)", 7, "", false},
+		{"literal_past", "plain", 4, "", false},
+		{"literal_within", "plain", 5, "plain", true},
+		{"no_cap", "$(A)$(A)$(A)", -1, "xxxxxxxxxxxx", true},
+		{"undefined_counts_verbatim", "$(NOPE)", 6, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ExpandVarsLimit(tc.in, lookup, tc.limit)
+			if got != tc.want || ok != tc.wantOK {
+				t.Errorf("ExpandVarsLimit(%q, %d) = %q, %v, want %q, %v", tc.in, tc.limit, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestMergeRunSpecEnvAndWorkingDir(t *testing.T) {
 	cfg := ImageRunConfig{
 		Env:        []string{"PATH=/usr/bin", "LANG=C", "APP=image"},
