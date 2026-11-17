@@ -74,7 +74,8 @@ type ShimGrant struct {
 //     the pod profile's own pty tier (podPTY), which reaches a slave only
 //     while it carries this sandbox's pty extension, so no process under this
 //     profile can OPEN the daemon's terminal or another session's
-//     (TestShimProfileReach, TestPodProfileAllocatesOnlyItsOwnPTY);
+//     (TestShimProfileReach, TestPodProfileAllocatesOnlyItsOwnPTY); the pod
+//     profile's TIOCSTI and TIOCCONS deny is emitted again after it;
 //   - signal to its own children and its own process group: the shim forwards
 //     a TERM to its container, delivers the Signal RPC to the pod group it
 //     leads, and kills an exec session whose stream ended. The container runs
@@ -125,6 +126,7 @@ func ShimProfile(podProfile string, g ShimGrant) (string, error) {
 	writeFirmlinkSubpaths(&b, []string{g.Dir})
 	b.WriteString("  )\n")
 	b.WriteString(shimTTYIoctl)
+	b.WriteString(podTTYIoctlDeny)
 	b.WriteString(shimSignal)
 	b.WriteString(shimSched)
 	return b.String(), nil

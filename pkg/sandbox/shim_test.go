@@ -201,6 +201,7 @@ func TestShimProfileIsThePodProfilePlusTheGrant(t *testing.T) {
 		`allow signal (target children)`,
 		`allow signal (target pgrp)`,
 		`allow system-sched (target self)`,
+		`deny file-ioctl (ioctl-command TIOCSTI) (ioctl-command TIOCCONS)`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("the grant:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

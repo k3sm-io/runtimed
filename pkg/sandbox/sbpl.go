@@ -160,11 +160,19 @@ const podSignal = "(allow signal (target children))\n(allow signal (target pgrp)
 //     digits are spelled out. The ioctls are every tty request (termios,
 //     winsize, TIOCSCTTY, the process-group calls), on terminals the pod owns.
 //   - read, write and ioctl on /dev/tty. It is not a device of its own: the
-//     kernel opens the caller's controlling terminal (ENXIO without one), and a
-//     pod's controlling terminal is one it allocated or the one runtimed handed
-//     to a kubectl exec -t session. Programs that read keys or a password from
-//     the terminal rather than stdin (less, a pager, git and ssh prompts, fzf)
-//     open it.
+//     kernel opens the caller's controlling terminal (ENXIO without one).
+//     Every pod process starts as or under a session leader with no inherited
+//     terminal (the container's POSIX_SPAWN_SETSID, an exec session's Setsid,
+//     execsession.TestRunWithoutTTYLeadsItsOwnSession), so a pod's controlling
+//     terminal is one it allocated or the one runtimed handed to a kubectl exec
+//     -t session, never the terminal of a daemon started in a Terminal or SSH
+//     window. Programs that read keys or a password from the terminal rather
+//     than stdin (less, a pager, git and ssh prompts, fzf) open it.
+//   - a deny of TIOCSTI (push bytes into a terminal's input) and TIOCCONS
+//     (redirect console output) on every file. The kernel already refuses both
+//     to a non-root process that does not own the terminal as its controlling
+//     one; the deny keeps a pod that runs as root off them too. The shim
+//     profile repeats it after its own tty ioctl tier (ShimProfile).
 //
 // No listing of /dev is granted, so ttyname(3) fails with ERANGE in a pod;
 // ptsname(3) or fcntl(F_GETPATH) on the slave name it instead.
@@ -177,7 +185,13 @@ const podPTY = ";; pty: allocate pseudo-terminals of the pod's own; a slave only
 	"(allow file-read* file-write* file-ioctl\n" +
 	"  (require-all\n" +
 	"    (regex #\"^/dev/ttys[0-9][0-9][0-9]+$\")\n" +
-	"    (extension \"com.apple.sandbox.pty\")))\n"
+	"    (extension \"com.apple.sandbox.pty\")))\n" +
+	podTTYIoctlDeny
+
+// podTTYIoctlDeny denies the two terminal ioctls no pod needs (see podPTY). It
+// names no path, so it holds for every file, and ShimProfile emits it again after
+// its tty ioctl allow so last-match-wins keeps it denied there too.
+const podTTYIoctlDeny = "(deny file-ioctl (ioctl-command TIOCSTI) (ioctl-command TIOCCONS))\n"
 
 // systemTLSConfigDir is the system TLS configuration directory (LibreSSL's
 // openssl.cnf, the CA bundle cert.pem, certs/) a pod may read. Generate grants

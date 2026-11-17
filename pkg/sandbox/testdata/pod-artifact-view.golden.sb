@@ -37,6 +37,7 @@
   (require-all
     (regex #"^/dev/ttys[0-9][0-9][0-9]+$")
     (extension "com.apple.sandbox.pty")))
+(deny file-ioctl (ioctl-command TIOCSTI) (ioctl-command TIOCCONS))
 ;; network: default-deny (no allow-network).
 ;; AF_UNIX: deny connect() to every container's resident shim.
 (deny network-outbound

@@ -204,6 +204,7 @@ var ptyStanzaLines = []string{
 	`(literal "/dev/tty"))`,
 	`(regex #"^/dev/ttys[0-9][0-9][0-9]+$")`,
 	`(extension "com.apple.sandbox.pty")))`,
+	`(deny file-ioctl (ioctl-command TIOCSTI) (ioctl-command TIOCCONS))`,
 }
 
 // devLiteralsAllowed is every /dev path a pod profile may name: the four read
@@ -398,7 +399,7 @@ func TestPodProfileAllocatesOnlyItsOwnPTY(t *testing.T) {
 		}
 	}()
 	reused := false
-	for i := 0; i < 8 && !reused; i++ {
+	for i := 0; i < 64 && !reused; i++ {
 		m, s, err := execsession.OpenPTY()
 		if err != nil {
 			t.Fatalf("host OpenPTY: %v", err)
@@ -407,8 +408,7 @@ func TestPodProfileAllocatesOnlyItsOwnPTY(t *testing.T) {
 		reused = s.Name() == slave
 	}
 	if !reused {
-		t.Logf("the host was not given %s again in 8 allocations; the reuse leg did not run", slave)
-		return
+		t.Skipf("every other leg passed; the reuse leg did not run: the host was not given %s again in 64 allocations (another process took it)", slave)
 	}
 	if _, err := io.WriteString(stdin, "reopen\n"); err != nil {
 		t.Fatal(err)
