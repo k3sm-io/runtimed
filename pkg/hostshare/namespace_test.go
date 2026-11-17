@@ -362,8 +362,8 @@ func TestLoadEffectiveNamespace(t *testing.T) {
 // TestAuthorizeNamespaceSamePathModes pins two lines for one path with
 // different modes and namespace sets: the controller's namespace keeps
 // read-write while every project namespace gets the tree read-only. Where
-// the sets overlap (yurei-system also matches yurei-*), the existing
-// precedence decides: between two lines for the same path, read-write wins.
+// the sets overlap (yurei-system also matches yurei-*), the line naming the
+// namespace exactly wins over the pattern (TestMatchNamespaceSpecificity).
 func TestAuthorizeNamespaceSamePathModes(t *testing.T) {
 	t.Parallel()
 	const code = "/Users/dev/Code"
@@ -411,6 +411,81 @@ func TestAuthorizeNamespaceSamePathModes(t *testing.T) {
 		})
 	}
 	if e, ok := match(entries, "yurei-system", code, "Directory"); !ok || e.Mode != ModeReadWrite {
-		t.Errorf("match(yurei-system) = %v %v, want the rw line (read-write wins on one path)", e, ok)
+		t.Errorf("match(yurei-system) = %v %v, want the rw line (the exact name wins on one path)", e, ok)
 	}
+}
+
+// TestMatchNamespaceSpecificity pins the same-path tie-break: among lines for
+// one path that admit the pod's namespace, an exact name beats a pattern, a
+// longer pattern beats a shorter one, and any namespaced line beats a
+// node-wide one; read-write wins only between lines equally specific. So a
+// narrower ro line is never overridden by a broader rw line.
+func TestMatchNamespaceSpecificity(t *testing.T) {
+	t.Parallel()
+	const p = "/Users/dev/Code"
+	for _, tc := range []struct {
+		name    string
+		entries []Entry
+		ns      string
+		want    Mode
+	}{
+		{"exact_ro_beats_pattern_rw", []Entry{
+			{Mode: ModeReadWrite, Path: p, Namespaces: []string{"team-*"}},
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"team-untrusted"}},
+		}, "team-untrusted", ModeReadOnly},
+		{"pattern_rw_for_the_rest", []Entry{
+			{Mode: ModeReadWrite, Path: p, Namespaces: []string{"team-*"}},
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"team-untrusted"}},
+		}, "team-a", ModeReadWrite},
+		{"namespaced_ro_beats_node_wide_rw", []Entry{
+			{Mode: ModeReadWrite, Path: p},
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"untrusted"}},
+		}, "untrusted", ModeReadOnly},
+		{"node_wide_rw_for_the_rest", []Entry{
+			{Mode: ModeReadWrite, Path: p},
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"untrusted"}},
+		}, "other", ModeReadWrite},
+		{"pattern_ro_beats_node_wide_rw", []Entry{
+			{Mode: ModeReadWrite, Path: p},
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"guest-*"}},
+		}, "guest-a", ModeReadOnly},
+		{"longer_pattern_ro_beats_shorter_rw", []Entry{
+			{Mode: ModeReadWrite, Path: p, Namespaces: []string{"team-*"}},
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"team-ext-*"}},
+		}, "team-ext-a", ModeReadOnly},
+		{"yurei_system_exact_rw", []Entry{
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"yurei-*"}},
+			{Mode: ModeReadWrite, Path: p, Namespaces: []string{"yurei-system"}},
+		}, "yurei-system", ModeReadWrite},
+		{"yurei_project_pattern_ro", []Entry{
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"yurei-*"}},
+			{Mode: ModeReadWrite, Path: p, Namespaces: []string{"yurei-system"}},
+		}, "yurei-foo", ModeReadOnly},
+		{"equal_specificity_rw_wins", []Entry{
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"a"}},
+			{Mode: ModeReadWrite, Path: p, Namespaces: []string{"b", "a"}},
+		}, "a", ModeReadWrite},
+		{"more_specific_path_still_first", []Entry{
+			{Mode: ModeReadOnly, Path: p, Namespaces: []string{"a"}},
+			{Mode: ModeReadWrite, Path: p + "/app"},
+		}, "a", ModeReadWrite},
+	} {
+		path := p
+		if tc.name == "more_specific_path_still_first" {
+			path = p + "/app"
+		}
+		// Order must not matter.
+		for _, es := range [][]Entry{tc.entries, reversed(tc.entries)} {
+			got, ok := match(es, tc.ns, path, "Directory")
+			if !ok || got.Mode != tc.want {
+				t.Errorf("%s: match(%s) = %v %v, want mode %s", tc.name, tc.ns, got, ok, tc.want)
+			}
+		}
+	}
+}
+
+func reversed(es []Entry) []Entry {
+	out := slices.Clone(es)
+	slices.Reverse(out)
+	return out
 }

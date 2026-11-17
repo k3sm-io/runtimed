@@ -47,8 +47,10 @@ limitations under the License.
 // Namespaces. A share line may name the namespaces whose pods it admits
 // (namespaces=<n1>,<n2>,..., each a namespace name or a prefix pattern ending
 // in one '*'); a line naming none is node-wide, as every line was before. The
-// decision considers only the lines that admit the pod's namespace, then
-// applies the usual most-specific-wins and rw/ro rules among them, and a
+// decision considers only the lines that admit the pod's namespace; among
+// them the most specific path wins, then, on one path, the line naming the
+// namespace most specifically (an exact name, then the longer pattern, then
+// node-wide), and read-write only between lines equally specific. A
 // refusal names the pod's namespace but never another one. A delegation may
 // cap the namespaces its user's lines name: a line within the cap is admitted
 // as written, a line naming none takes the cap, and a line outside it is

@@ -113,6 +113,29 @@ func admitsNamespace(nss []string, ns string) bool {
 	return slices.ContainsFunc(nss, func(n string) bool { return namespaceMatches(n, ns) })
 }
 
+// exactSpecificity ranks an exact namespace name above every pattern, whose
+// rank is 1 plus its prefix length (at most 62).
+const exactSpecificity = 1 << 16
+
+// namespaceSpecificity ranks how narrowly a list names namespace ns: 0 for a
+// node-wide list, 1 plus the prefix length for the longest matching pattern,
+// exactSpecificity for an exact name. A list that does not admit ns is never
+// asked (match considers only admitting entries).
+func namespaceSpecificity(nss []string, ns string) int {
+	best := 0
+	for _, n := range nss {
+		if !namespaceMatches(n, ns) {
+			continue
+		}
+		r := exactSpecificity
+		if p, ok := strings.CutSuffix(n, "*"); ok {
+			r = 1 + len(p)
+		}
+		best = max(best, r)
+	}
+	return best
+}
+
 // namespacesWithin reports whether a delegated entry's namespaces stay
 // inside its delegation's cap. An uncapped delegation allows any list; an
 // entry naming none under a cap inherits the cap (Delegation.Scope). Under a

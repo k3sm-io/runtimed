@@ -578,7 +578,11 @@ func authorizeOne(entries []Entry, namespace string, v *runtimev1.Volume, ro, rw
 }
 
 // match returns the entry that admits p for a volume of hostPath type typ in
-// namespace ns. Only entries that admit ns are considered; among those,
+// namespace ns. Only entries that admit ns are considered. Between two of
+// them for the same path, the one that names ns more specifically wins
+// (namespaceSpecificity: an exact name, then the longer pattern, then
+// node-wide), so a narrower ro line is never overridden by a broader rw one;
+// read-write wins only between lines equally specific. Otherwise,
 // directory entries the most specific one wins, so `ro /p/secrets`
 // narrows `rw /p`; between two entries for the same path read-write wins.
 // Paths compare with ASCII case folded, as APFS and Seatbelt compare them, so
@@ -587,6 +591,7 @@ func authorizeOne(entries []Entry, namespace string, v *runtimev1.Volume, ro, rw
 // mounts `/p` itself gets `rw /p`, secrets included.
 func match(entries []Entry, ns, p, typ string) (Entry, bool) {
 	var found Entry
+	foundSpec := 0
 	ok := false
 	for _, e := range entries {
 		if ValidateEntry(e) != nil || !e.Admits(ns) {
@@ -599,10 +604,14 @@ func match(entries []Entry, ns, p, typ string) (Entry, bool) {
 			}
 		case ModeReadWrite, ModeReadOnly:
 			if typ != "Socket" && atOrUnderFold(p, e.Path) {
+				spec := namespaceSpecificity(e.Namespaces, ns)
+				same := len(e.Path) == len(found.Path)
 				switch {
 				case !ok, len(e.Path) > len(found.Path):
-					found, ok = e, true
-				case len(e.Path) == len(found.Path) && e.Mode == ModeReadWrite:
+					found, foundSpec, ok = e, spec, true
+				case same && spec > foundSpec:
+					found, foundSpec = e, spec
+				case same && spec == foundSpec && e.Mode == ModeReadWrite:
 					found = e
 				}
 			}
