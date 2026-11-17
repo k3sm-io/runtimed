@@ -130,6 +130,7 @@ func TestMergeRunSpecExpandsVars(t *testing.T) {
 		{"empty_value", "[$(A)]", map[string]string{"A": ""}, "[]"},
 		{"empty_name", "$()", map[string]string{"": "z"}, "z"},
 		{"no_dollar", "plain", nil, "plain"},
+		{"escape_after_unterminated", "$(A $$ $(A", map[string]string{"A": "x"}, "$(A $ $(A"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

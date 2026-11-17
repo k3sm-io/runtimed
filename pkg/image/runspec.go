@@ -401,6 +401,11 @@ func ExpandVarsLimit(s string, lookup map[string]string, limit int) (string, boo
 	}
 	var b strings.Builder
 	b.Grow(len(s))
+	// noClose records that an earlier "$(" found no ")" after it. Every later
+	// "$(" sits in a suffix of that one, so it cannot find one either; skipping
+	// the rescan keeps a value of many unterminated "$(" linear rather than
+	// quadratic. A later "$$" is still a literal "$", as upstream.
+	noClose := false
 	for i := 0; i < len(s); {
 		if s[i] != '$' {
 			b.WriteByte(s[i])
@@ -412,9 +417,11 @@ func ExpandVarsLimit(s string, lookup map[string]string, limit int) (string, boo
 			i += 2
 			continue
 		}
-		if i+1 < len(s) && s[i+1] == '(' {
+		if i+1 < len(s) && s[i+1] == '(' && !noClose {
 			end := strings.IndexByte(s[i+2:], ')')
-			if end >= 0 {
+			if end < 0 {
+				noClose = true
+			} else {
 				name := s[i+2 : i+2+end]
 				if v, ok := lookup[name]; ok {
 					if limit >= 0 && b.Len()+len(v) > limit {
