@@ -33,6 +33,13 @@ mkdir -p "$OUT_DIR"
 # pkg/runtime TestPathShimLoadsIntoArm64e. TestPathShimIsUniversalBinary asserts
 # the other two slices -- assert the ARTIFACT, never these flags.
 #
+# The x86_64 slice is deliberate and stays. It is a compatibility slice in a shipped
+# library, not an x86 build of anything k3sm runs for itself, so the arm64-only
+# rule for our own builds, images and runners does not apply to it. The operator
+# confirmed this on 2026-11-20 ("Keep the slice"). Do not remove it to satisfy
+# that rule: without it dyld kills every Intel binary a pod starts, and the
+# k3sm.io/rosetta node label would advertise what can no longer run.
+#
 # A multi-arch compile makes the clang driver leave one empty "<source>-<hex>"
 # directory per -arch in TMPDIR, so clang gets a scratch TMPDIR of its own that
 # the EXIT trap removes.
