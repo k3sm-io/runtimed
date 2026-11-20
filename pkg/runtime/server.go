@@ -254,6 +254,9 @@ type hostStop struct {
 	// logsClosed, when set, runs after the log writers close and before the
 	// reap records are retired: DeletePod removes the pod dir there.
 	logsClosed func()
+	// ownCreate is set by a refused create's unwind: the one CreatePod in
+	// flight for this pod id is the pod being stopped, not a new instance.
+	ownCreate bool
 }
 
 // stopHostPod is the host-process pod stop, the one sequence DeletePod and a
@@ -429,6 +432,32 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 	// here can be read as an OOM.
 	r.endExecSessions(p)
 	survivors := r.sweepPodTrees(podID, p)
+	// The group signals and the tree sweep above cannot reach a process that
+	// called setsid and whose parent then exited: launchd is its parent and it
+	// leads its own group. It still runs under this pod's Seatbelt policy, which
+	// is how this sweep finds it (poddescendants.go). It gets whatever remains
+	// of the pod's grace between SIGTERM and SIGKILL. It runs before the reap
+	// records are retired and before DeletePod removes the pod dir, which the
+	// identity probe names.
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	r.sweepPodDescendants(ctx, podID, podSweep{
+		grace: remaining,
+		mayProceed: func() bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			// A different instance under this id, registered or being
+			// created, has the same policy: stop rather than touch it.
+			own := 0
+			if s.ownCreate {
+				own = 1
+			}
+			q, live := r.pods[podID]
+			return (!live || q == p) && r.creating[podID] <= own
+		},
+	})
 
 	if s.swept != nil {
 		s.swept()

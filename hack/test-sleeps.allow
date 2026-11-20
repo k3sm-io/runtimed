@@ -3,7 +3,7 @@
 # The seeded deadlines are staggered by package, one package a week, so they do
 # not all expire together. Fixing a test means deleting its entry and lowering
 # the count; adding an entry means raising it, in the same reviewed change.
-# count: 105
+# count: 106
 internal/execshim/ring_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 internal/execshim/ring_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 pkg/crilog/writer_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-11
@@ -57,6 +57,7 @@ pkg/runtime/podprocesscount_test.go:time.Sleep seeded 2026-10-29, predates the l
 pkg/runtime/residentshim_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-15
 pkg/runtime/restartstartedat_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-15
 pkg/runtime/runtime_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-15
+pkg/runtime/setsid_integration_darwin_test.go:time.Sleep B1868, polls real pod processes (pid file, reparent to launchd, exit) in an integration-tagged test 2027-02-15
 pkg/runtime/shadow_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-15
 pkg/runtime/shadow_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-02-15
 pkg/runtime/sidecar_test.go:time.After seeded 2026-10-29, predates the lint 2027-02-15
