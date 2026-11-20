@@ -34,7 +34,14 @@ limitations under the License.
 // and the last successful publisher wins. Only a pod whose main containers all
 // exited 0 publishes: a failed, killed or still-running build never does.
 //
-// Disk use, recorded rather than hidden: there is no eviction beyond keeping one
+// Trust, stated plainly: within one namespace and key the cache is a shared
+// channel across time. Any pod that may carry the annotation there and exits 0
+// decides what the next build on that key starts from, so builds of different
+// trust (a fork's pull request and a release) must not share a key, and are
+// better kept in different namespaces. Isolation holds between namespaces and
+// between concurrent pods, not between successive builds of one key.
+//
+// Disk use, recorded rather than hidden: there is no quota and no eviction beyond keeping one
 // snapshot per (namespace, key, Xcode build). A key that is never used again, or
 // a snapshot for an Xcode build the node no longer has, stays until an operator
 // removes <work-dir>/xcode-cache/<namespace>/<key>. A clone shares blocks with
@@ -197,9 +204,12 @@ func plistString(r io.Reader, name string) (string, error) {
 // FS is the filesystem seam: production is APFS clonefile and renamex_np; the
 // tests may substitute either.
 type FS interface {
-	// CloneTree makes dst a copy of the directory tree src. dst must not
-	// exist; its parent must.
-	CloneTree(src, dst string) error
+	// CloneAt makes dstName under the directory dstDirFd a copy of the
+	// directory tree srcName under the directory srcDirFd, never following a
+	// link at either final name. Either fd may be unix.AT_FDCWD with an
+	// absolute name, for a path only the daemon can write. The destination
+	// must not exist.
+	CloneAt(srcDirFd int, srcName string, dstDirFd int, dstName string) error
 	// Swap atomically exchanges two existing paths.
 	Swap(a, b string) error
 }
@@ -285,20 +295,25 @@ func (s Store) Checkout(e Entry, home string) ([]string, error) {
 		if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {
 			continue
 		}
-		dst := filepath.Join(home, part)
-		if _, err := os.Lstat(dst); err == nil {
+		// The destination's parents are created and opened one component at
+		// a time, never through a link, and the clone lands relative to the
+		// pinned parent: nothing in home is resolved by path.
+		parent, _, err := pinDir(home, filepath.Dir(part), true)
+		if err != nil {
+			return cloned, fmt.Errorf("xcode cache: checkout %s: %w", part, err)
+		}
+		name := filepath.Base(part)
+		var st unix.Stat_t
+		if err := unix.Fstatat(int(parent.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+			parent.Close()
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			return cloned, fmt.Errorf("xcode cache: checkout %s: %w", part, err)
+		err = s.fs().CloneAt(unix.AT_FDCWD, src, int(parent.Fd()), name)
+		if err != nil {
+			_ = os.RemoveAll(filepath.Join(home, part))
 		}
-		// The parents just made (or found) must be real directories, so the
-		// clone lands inside home and nowhere a link points.
-		if _, err := realDir(home, filepath.Dir(part)); err != nil {
-			return cloned, fmt.Errorf("xcode cache: checkout %s: %w", part, err)
-		}
-		if err := s.fs().CloneTree(src, dst); err != nil {
-			_ = os.RemoveAll(dst)
+		parent.Close()
+		if err != nil {
 			return cloned, fmt.Errorf("xcode cache: checkout %s: %w", part, err)
 		}
 		cloned = append(cloned, part)
@@ -334,20 +349,45 @@ func (s Store) Stage(e Entry, home, stage string) (incoming string, parts []stri
 	if stage == "" || strings.ContainsAny(stage, `/\`) || strings.Contains(stage, "..") {
 		return "", nil, fmt.Errorf("%w: staging name %q", ErrInvalid, stage)
 	}
+	// Each part's parent directory is opened one component at a time with
+	// O_NOFOLLOW and held open, and the clone below is made relative to that
+	// descriptor. The home was written by the pod, and a process that escaped
+	// the pod's stop could still swap a directory for a link: a path-based
+	// check-then-clone would then have the daemon clone whatever the link
+	// names (another namespace's snapshot, another pod's home) into this
+	// cache. Pinned descriptors name the inodes that were checked, and
+	// CLONE_NOFOLLOW covers the last name, so a swap can at worst publish a
+	// link as a link, which Checkout never clones.
+	type pinned struct {
+		part   string
+		parent *os.File
+	}
+	var pins []pinned
+	defer func() {
+		for _, p := range pins {
+			p.parent.Close()
+		}
+	}()
 	for _, part := range Parts {
-		// Every component a real directory, never a symlink: the home was
-		// written by the pod, and a planted link (home/Library pointing into a
-		// daemon-private tree) would otherwise have the daemon clone what it
-		// names into the cache, for the next pod on the key to read. The pod's
-		// processes are all stopped by the time a publish stages, so the walk
-		// cannot race them.
-		ok, err := realDir(home, part)
+		parent, ok, err := pinDir(home, filepath.Dir(part), false)
 		if err != nil {
 			return "", nil, err
 		}
-		if ok {
-			parts = append(parts, part)
+		if !ok {
+			continue
 		}
+		var st unix.Stat_t
+		err = unix.Fstatat(int(parent.Fd()), filepath.Base(part), &st, unix.AT_SYMLINK_NOFOLLOW)
+		switch {
+		case err == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK:
+			parent.Close()
+			return "", nil, fmt.Errorf("%w: %s is a symlink", ErrInvalid, filepath.Join(home, part))
+		case err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR:
+			parent.Close()
+			continue
+		}
+		pins = append(pins, pinned{part, parent})
+		parts = append(parts, part)
 	}
 	if len(parts) == 0 {
 		return "", nil, nil
@@ -360,13 +400,13 @@ func (s Store) Stage(e Entry, home, stage string) (incoming string, parts []stri
 	if err := os.RemoveAll(incoming); err != nil {
 		return "", nil, fmt.Errorf("xcode cache: stage: clear: %w", err)
 	}
-	for _, part := range parts {
+	for i, part := range parts {
 		dst := filepath.Join(incoming, part)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			_ = os.RemoveAll(incoming)
 			return "", nil, fmt.Errorf("xcode cache: stage %s: %w", part, err)
 		}
-		if err := s.fs().CloneTree(filepath.Join(home, part), dst); err != nil {
+		if err := s.fs().CloneAt(int(pins[i].parent.Fd()), filepath.Base(part), unix.AT_FDCWD, dst); err != nil {
 			_ = os.RemoveAll(incoming)
 			return "", nil, fmt.Errorf("xcode cache: stage %s: %w", part, err)
 		}
@@ -394,6 +434,7 @@ func (s Store) Commit(e Entry, incoming string) error {
 		return err
 	}
 	defer unlock()
+	sweepStale(dir, incoming)
 	snap := filepath.Join(dir, SnapshotName)
 	if _, err := os.Lstat(snap); err == nil {
 		if err := s.fs().Swap(incoming, snap); err != nil {
@@ -407,35 +448,79 @@ func (s Store) Commit(e Entry, incoming string) error {
 	return nil
 }
 
-// realDir reports whether base/rel exists as a directory reached through real
-// directories only: every component of rel is Lstat'd, and a symlink or a
-// non-directory anywhere is refused (an error for a symlink, false for a plain
-// absent path). base itself is trusted (the daemon made it).
-func realDir(base, rel string) (bool, error) {
+// staleStage is how old another publisher's staging dir must be before a
+// commit removes it: a stage is committed within the lock wait, so one this old
+// was orphaned (the daemon exited between the stage and the commit).
+const staleStage = time.Hour
+
+// sweepStale removes orphaned staging dirs under dir, other than keep.
+func sweepStale(dir, keep string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		p := filepath.Join(dir, e.Name())
+		if !strings.HasPrefix(e.Name(), incomingPrefix) || p == keep {
+			continue
+		}
+		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > staleStage {
+			_ = os.RemoveAll(p)
+		}
+	}
+}
+
+// pinDir opens base/rel as a directory, one component at a time with
+// O_NOFOLLOW, and returns the open directory. A symlink anywhere, base
+// included, is refused (ErrInvalid). A missing or non-directory component
+// returns ok=false, unless create is set, which makes a missing one (0700).
+// The caller closes the returned file.
+func pinDir(base, rel string, create bool) (*os.File, bool, error) {
+	const flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	fd, err := unix.Open(base, flags, 0)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: open %s: %v", ErrInvalid, base, err)
+	}
 	cur := base
 	for _, c := range strings.Split(filepath.Clean(rel), string(filepath.Separator)) {
 		if c == "" || c == "." {
 			continue
 		}
 		if c == ".." {
-			return false, fmt.Errorf("%w: %q leaves %s", ErrInvalid, rel, base)
+			unix.Close(fd)
+			return nil, false, fmt.Errorf("%w: %q leaves %s", ErrInvalid, rel, base)
 		}
 		cur = filepath.Join(cur, c)
-		fi, err := os.Lstat(cur)
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+		var st unix.Stat_t
+		err := unix.Fstatat(fd, c, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(err, unix.ENOENT) && create {
+			if err = unix.Mkdirat(fd, c, 0o700); err == nil {
+				err = unix.Fstatat(fd, c, &st, unix.AT_SYMLINK_NOFOLLOW)
+			}
 		}
+		switch {
+		case errors.Is(err, unix.ENOENT):
+			unix.Close(fd)
+			return nil, false, nil
+		case err != nil:
+			unix.Close(fd)
+			return nil, false, fmt.Errorf("xcode cache: %s: %w", cur, err)
+		case st.Mode&unix.S_IFMT == unix.S_IFLNK:
+			unix.Close(fd)
+			return nil, false, fmt.Errorf("%w: %s is a symlink", ErrInvalid, cur)
+		case st.Mode&unix.S_IFMT != unix.S_IFDIR:
+			unix.Close(fd)
+			return nil, false, nil
+		}
+		next, err := unix.Openat(fd, c, flags, 0)
+		unix.Close(fd)
 		if err != nil {
-			return false, fmt.Errorf("xcode cache: %w", err)
+			// Swapped between the stat and the open: a link now, or gone.
+			return nil, false, fmt.Errorf("%w: open %s: %v", ErrInvalid, cur, err)
 		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return false, fmt.Errorf("%w: %s is a symlink", ErrInvalid, cur)
-		}
-		if !fi.IsDir() {
-			return false, nil
-		}
+		fd = next
 	}
-	return true, nil
+	return os.NewFile(uintptr(fd), cur), true, nil
 }
 
 // lock takes a flock of kind how on path, creating it, retrying a busy lock

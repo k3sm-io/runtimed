@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // apfsFS off darwin has no clonefile or RENAME_SWAP: it byte-copies and swaps
@@ -30,7 +31,19 @@ import (
 // tests run off darwin; production is darwin-only.
 type apfsFS struct{}
 
-func (apfsFS) CloneTree(src, dst string) error {
+func (apfsFS) CloneAt(srcDirFd int, srcName string, dstDirFd int, dstName string) error {
+	return copyTree(fdPath(srcDirFd, srcName), fdPath(dstDirFd, dstName))
+}
+
+// fdPath names name under dirFd through /proc (Linux only; unit tests).
+func fdPath(dirFd int, name string) string {
+	if filepath.IsAbs(name) {
+		return name
+	}
+	return filepath.Join("/proc/self/fd", strconv.Itoa(dirFd), name)
+}
+
+func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err

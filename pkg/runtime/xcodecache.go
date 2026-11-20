@@ -58,11 +58,16 @@ func (r *Runtime) xcodeBuildFor(developerDir string) (string, error) {
 		return b.build, b.err
 	}
 	build, err := xcodecache.ReadBuildVersion(developerDir)
+	if err != nil {
+		// Not remembered: one unreadable moment must not turn the cache off
+		// until the daemon restarts.
+		return "", err
+	}
 	if r.xcodeCache.builds == nil {
 		r.xcodeCache.builds = map[string]xcodeBuild{}
 	}
-	r.xcodeCache.builds[developerDir] = xcodeBuild{build: build, err: err}
-	return build, err
+	r.xcodeCache.builds[developerDir] = xcodeBuild{build: build}
+	return build, nil
 }
 
 // xcodeCacheEntry returns the cache entry a pod asked for, and false when it
@@ -155,15 +160,11 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 	}
 	log := r.log.With("pod", box.GetPodId(), "namespace", e.Namespace, "key", e.Key, "xcode_build", e.Build)
 	store := r.xcodeCacheStore()
-	// The pod owns its data volume, so it could have replaced its home with a
-	// link; the home itself is checked here and every component below it by
-	// Stage. Residual, recorded: the walk is race-free only because the pod's
-	// processes are stopped, and a process that left the pod's process group
-	// (POSIX_SPAWN_SETSID, B1868) survives the stop and could still swap a
-	// directory for a link mid-clone. clonefile is given CLONE_NOFOLLOW and
-	// copies a link as a link, so such a race can publish a dangling or
-	// misleading link into the pod's own namespace's cache, never the content
-	// of a tree the pod could not read.
+	// The pod owns its data volume, so it could have replaced its home, or any
+	// directory under it, with a link. Stage opens every directory on the way
+	// with O_NOFOLLOW and clones relative to the open descriptors, so a
+	// process that survived the pod's stop (one that left its process group,
+	// B1868) cannot redirect the clone by swapping a path after it was checked.
 	home := podHomeDir(dataVol)
 	if err := realPodHome(home); err != nil {
 		log.Warn("xcode cache publish skipped", "err", err)

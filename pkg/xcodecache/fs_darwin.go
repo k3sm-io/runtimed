@@ -24,8 +24,8 @@ import "golang.org/x/sys/unix"
 // copy-on-write in one call on APFS, and swaps with renamex_np(RENAME_SWAP).
 type apfsFS struct{}
 
-func (apfsFS) CloneTree(src, dst string) error {
-	return unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW)
+func (apfsFS) CloneAt(srcDirFd int, srcName string, dstDirFd int, dstName string) error {
+	return unix.Clonefileat(srcDirFd, srcName, dstDirFd, dstName, unix.CLONE_NOFOLLOW)
 }
 
 func (apfsFS) Swap(a, b string) error {

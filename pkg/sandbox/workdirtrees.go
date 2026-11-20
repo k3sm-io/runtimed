@@ -86,8 +86,10 @@ const (
 	// (<WorkDir>/xcode-cache/<namespace>/<key>/<Xcode build>/home-cache, see
 	// pkg/xcodecache). Only the daemon reads or writes it: a pod receives a
 	// private copy-on-write clone inside its own data volume at create and never
-	// reaches the shared snapshot, so a pod can neither read another
-	// namespace's build products nor plant a poisoned one for the next build.
+	// reaches the shared snapshot, so a pod cannot read another namespace's
+	// build products or write a snapshot directly. What a pod that succeeded
+	// leaves in its home is published for its own namespace and key (see
+	// pkg/xcodecache on that trust boundary).
 	XcodeCacheSubdir = "xcode-cache"
 )
 

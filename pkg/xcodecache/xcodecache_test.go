@@ -245,12 +245,12 @@ type failFS struct {
 	n int
 }
 
-func (f *failFS) CloneTree(src, dst string) error {
+func (f *failFS) CloneAt(sfd int, src string, dfd int, dst string) error {
 	f.n++
 	if f.n == 2 {
 		return errors.New("injected")
 	}
-	return f.apfsFS.CloneTree(src, dst)
+	return f.apfsFS.CloneAt(sfd, src, dfd, dst)
 }
 
 func TestFailedStageLeavesSnapshotAndNoStage(t *testing.T) {
@@ -426,5 +426,72 @@ func TestStageRefusesSymlinkedComponents(t *testing.T) {
 	}
 	if _, err := s.Publish(entry, home2, "p2"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Publish of a symlinked part = %v, want ErrInvalid", err)
+	}
+}
+
+// swapFS swaps home/Library for a link to another tree just before the first
+// clone, as a process that survived the pod's stop could.
+type swapFS struct {
+	apfsFS
+	home, elsewhere string
+	done            bool
+}
+
+func (f *swapFS) CloneAt(sfd int, src string, dfd int, dst string) error {
+	if !f.done {
+		f.done = true
+		lib := filepath.Join(f.home, "Library")
+		if err := os.Rename(lib, lib+".moved"); err != nil {
+			return err
+		}
+		if err := os.Symlink(filepath.Join(f.elsewhere, "Library"), lib); err != nil {
+			return err
+		}
+	}
+	return f.apfsFS.CloneAt(sfd, src, dfd, dst)
+}
+
+// The stage clones the directories it checked, not whatever their paths name
+// by the time the clone runs: a swap after the check publishes the pod's own
+// tree, never the link's target.
+func TestStageClonesThePinnedTreeNotASwappedPath(t *testing.T) {
+	victim := t.TempDir()
+	writeHome(t, victim, "stolen")
+	home := t.TempDir()
+	writeHome(t, home, "mine")
+	s := Store{Root: t.TempDir(), FS: &swapFS{home: home, elsewhere: victim}}
+	if _, err := s.Publish(entry, home, "p"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	for _, p := range Parts {
+		if v := readPart(t, filepath.Join(s.Dir(entry), SnapshotName), p); v != "mine" {
+			t.Errorf("%s = %q, want the pod's own tree (mine)", p, v)
+		}
+	}
+}
+
+func TestCommitSweepsOrphanedStages(t *testing.T) {
+	s := Store{Root: t.TempDir()}
+	orphan := filepath.Join(s.Dir(entry), incomingPrefix+"dead")
+	fresh := filepath.Join(s.Dir(entry), incomingPrefix+"live")
+	for _, d := range []string{orphan, fresh} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * staleStage)
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	writeHome(t, home, "x")
+	if _, err := s.Publish(entry, home, "p"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("orphaned stage survived a commit: %v", err)
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Errorf("a fresh stage was swept: %v", err)
 	}
 }
