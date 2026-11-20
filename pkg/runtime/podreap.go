@@ -1006,12 +1006,17 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 	// below is the last moment an adopted pod can still be excluded.
 	r.podReapStarted = true
 	owned := make(map[int]bool)
-	for _, p := range r.pods {
+	adopted := make(map[string]bool)
+	for id, p := range r.pods {
 		for _, pgid := range p.containerPgids() {
 			owned[pgid] = true
 		}
+		if p.adopted {
+			adopted[id] = true
+		}
 	}
 	r.mu.Unlock()
+	sweepIDs := startupSweepPodIDs(records, adopted)
 
 	records, pinned := r.reapRecordedSurvivors(records)
 	kill, drop, keepWarn := startupPodReapDecision(records, owned, r.procGroup)
@@ -1057,6 +1062,14 @@ func (r *Runtime) reapOrphanedPodsOnce() error {
 		if !pinned[keyOf(rec)] {
 			r.removePodProcRecord(rec.PodID, rec.Pgid)
 		}
+	}
+	// The previous run's pods that nothing re-attached may have left processes
+	// outside every recorded group: a setsid descendant whose parent exited
+	// (B1868). Each still runs under its pod's Seatbelt policy. Only processes
+	// that started before this run are candidates, so a pod this run created
+	// under the same id is never touched; SIGKILL at once, as for the groups.
+	for _, podID := range sweepIDs {
+		r.sweepPodDescendants(context.Background(), podID, podSweep{bornBefore: r.startedAtNano})
 	}
 	for _, f := range quarantine {
 		r.log.Warn("removing malformed reap record", "path", f)
