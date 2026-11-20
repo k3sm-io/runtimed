@@ -429,6 +429,44 @@ func TestStageRefusesSymlinkedComponents(t *testing.T) {
 	}
 }
 
+// A pod can replace a directory ABOVE its home (its rootfs) with a link to
+// another pod's. StageAt and CheckoutAt walk from a base the pod cannot
+// replace and refuse the link; Stage and Checkout on the same path, which
+// resolve it, are the contrast that shows what the anchor is for.
+func TestAnchoredWalkRefusesALinkAboveHome(t *testing.T) {
+	victim := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(victim, "home", Parts[0]), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(victim, "home", Parts[0], "key"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	podDir := t.TempDir()
+	if err := os.Symlink(victim, filepath.Join(podDir, "rootfs")); err != nil {
+		t.Fatal(err)
+	}
+	s := Store{Root: t.TempDir()}
+	homeRel := filepath.Join("rootfs", "home")
+	if incoming, parts, err := s.StageAt(entry, podDir, homeRel, "p"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("StageAt through a linked rootfs = (%q, %v, %v), want ErrInvalid", incoming, parts, err)
+	}
+	if ents, _ := os.ReadDir(s.Dir(entry)); len(ents) != 0 {
+		t.Fatalf("StageAt left %d entries in the store", len(ents))
+	}
+	if _, err := s.CheckoutAt(entry, podDir, homeRel); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("CheckoutAt through a linked rootfs = %v, want ErrInvalid", err)
+	}
+	// The contrast: the unanchored call resolves the link and stages the
+	// other tree. This is what the runtime must never do with a pod's path.
+	incoming, parts, err := s.Stage(entry, filepath.Join(podDir, homeRel), "q")
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("Stage by path = (%q, %v, %v), want the one part staged", incoming, parts, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(incoming, Parts[0], "key")); err != nil || string(b) != "secret" {
+		t.Fatalf("the contrast did not read the linked tree: %q, %v", b, err)
+	}
+}
+
 // swapFS swaps home/Library for a link to another tree just before the first
 // clone, as a process that survived the pod's stop could.
 type swapFS struct {

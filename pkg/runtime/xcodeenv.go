@@ -19,13 +19,13 @@ package runtime
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -87,24 +87,38 @@ func podHomeDir(dataVol string) string { return filepath.Join(dataVol, podHomeNa
 // provisionPodHome creates the pod home (0700, like the pod temp dir) and its
 // git configuration. An existing configuration is left alone, so a pod
 // re-attached after a daemon restart keeps whatever its workload changed.
+//
+// Nothing is resolved through a link. The data volume is the pod's, and a
+// process of an earlier instance of the pod can still be running when the
+// next one is created, so the volume, the home and the file are each opened
+// with O_NOFOLLOW relative to the directory above: a volume or home that was
+// swapped for a link is refused, and the daemon never writes a git
+// configuration into a directory the link names.
 func provisionPodHome(dataVol string) error {
+	const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 	home := podHomeDir(dataVol)
-	// Never through a link: the data volume is the pod's, so a home that is
-	// not a real directory is refused rather than followed.
-	if fi, err := os.Lstat(home); err == nil && !fi.IsDir() {
-		return fmt.Errorf("pod home %s exists and is not a directory (%v)", home, fi.Mode().Type())
+	vol, err := unix.Open(dataVol, dirFlags, 0)
+	if err != nil {
+		return fmt.Errorf("open pod data volume %s: %w", dataVol, err)
 	}
-	if err := os.Mkdir(home, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+	defer unix.Close(vol)
+	if err := unix.Mkdirat(vol, podHomeName, 0o700); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("create pod home %s: %w", home, err)
 	}
+	dir, err := unix.Openat(vol, podHomeName, dirFlags, 0)
+	if err != nil {
+		return fmt.Errorf("pod home %s is not a directory the daemon can open without following a link: %w", home, err)
+	}
+	defer unix.Close(dir)
 	p := filepath.Join(home, podGitConfigName)
-	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if errors.Is(err, fs.ErrExist) {
+	fd, err := unix.Openat(dir, podGitConfigName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if errors.Is(err, unix.EEXIST) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("create pod git config %s: %w", p, err)
 	}
+	f := os.NewFile(uintptr(fd), p)
 	if _, err := f.WriteString(podGitConfig); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("write pod git config %s: %w", p, err)

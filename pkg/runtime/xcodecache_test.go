@@ -207,6 +207,29 @@ func TestXcodeCachePublishAtDelete(t *testing.T) {
 		deleteWithPhase(t, rt, box, runtimev1.PodPhase_POD_PHASE_SUCCEEDED)
 		wantSnapshot(t, rt, "old")
 	})
+	// A pod can replace its own rootfs with a link to another pod's. The
+	// publish must not follow it: that would hand the other pod's build
+	// products to this pod's cache key, where its next pod reads them.
+	t.Run("a rootfs replaced by a symlink never publishes", func(t *testing.T) {
+		rt := xcodeCacheRuntime(t)
+		seedXcodeCache(t, rt, "old")
+		box := xcodeCacheBox(rt, "pod-xc-rootfs-link", "app")
+		mustCreatePod(t, rt, box)
+		victim := t.TempDir()
+		writeCacheParts(t, podHomeDir(victim), "stolen")
+		rootfs, err := rt.rootfsPath(box)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(rootfs, rootfs+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, rootfs); err != nil {
+			t.Fatal(err)
+		}
+		deleteWithPhase(t, rt, box, runtimev1.PodPhase_POD_PHASE_SUCCEEDED)
+		wantSnapshot(t, rt, "old")
+	})
 	// Deleting a pod this daemon does not hold publishes nothing.
 	t.Run("an unknown pod publishes nothing", func(t *testing.T) {
 		rt := xcodeCacheRuntime(t)

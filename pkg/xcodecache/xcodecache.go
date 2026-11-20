@@ -276,8 +276,26 @@ func (s Store) wait() time.Duration {
 // alone. On an error a partly cloned part is removed, so home holds each part
 // whole or not at all.
 func (s Store) Checkout(e Entry, home string) ([]string, error) {
+	return s.CheckoutAt(e, home, ".")
+}
+
+// CheckoutAt is Checkout for a home that lies under a directory its owner can
+// rearrange: base is a directory the pod cannot replace (its pod dir), and
+// homeRel is the home's path below it. Every component of homeRel is opened
+// with O_NOFOLLOW, so a component the pod swapped for a link (its rootfs, for
+// one) is refused instead of followed into another pod's tree. The home must
+// already exist.
+func (s Store) CheckoutAt(e Entry, base, homeRel string) ([]string, error) {
 	if err := e.Validate(); err != nil {
 		return nil, err
+	}
+	home := filepath.Join(base, homeRel)
+	if h, ok, err := pinDir(base, homeRel, false); err != nil {
+		return nil, fmt.Errorf("xcode cache: checkout: %w", err)
+	} else if !ok {
+		return nil, fmt.Errorf("%w: home %s is not a directory", ErrInvalid, home)
+	} else {
+		h.Close()
 	}
 	dir := s.Dir(e)
 	snap := filepath.Join(dir, SnapshotName)
@@ -298,7 +316,7 @@ func (s Store) Checkout(e Entry, home string) ([]string, error) {
 		// The destination's parents are created and opened one component at
 		// a time, never through a link, and the clone lands relative to the
 		// pinned parent: nothing in home is resolved by path.
-		parent, _, err := pinDir(home, filepath.Dir(part), true)
+		parent, _, err := pinDir(base, filepath.Join(homeRel, filepath.Dir(part)), true)
 		if err != nil {
 			return cloned, fmt.Errorf("xcode cache: checkout %s: %w", part, err)
 		}
@@ -343,6 +361,17 @@ func (s Store) Publish(e Entry, home, stage string) ([]string, error) {
 // reader's lock, can run after home is gone. An empty incoming means home held
 // nothing to publish.
 func (s Store) Stage(e Entry, home, stage string) (incoming string, parts []string, err error) {
+	return s.StageAt(e, home, ".", stage)
+}
+
+// StageAt is Stage for a home that lies under a directory its owner can
+// rearrange: base is a directory the pod cannot replace (its pod dir), and
+// homeRel is the home's path below it. Every component of homeRel is opened
+// with O_NOFOLLOW. A pod can replace its own rootfs with a link to another
+// pod's; resolving the home by path would then stage the OTHER pod's build
+// products into this pod's cache, where its next pod reads them.
+func (s Store) StageAt(e Entry, base, homeRel, stage string) (incoming string, parts []string, err error) {
+	home := filepath.Join(base, homeRel)
 	if err := e.Validate(); err != nil {
 		return "", nil, err
 	}
@@ -369,7 +398,7 @@ func (s Store) Stage(e Entry, home, stage string) (incoming string, parts []stri
 		}
 	}()
 	for _, part := range Parts {
-		parent, ok, err := pinDir(home, filepath.Dir(part), false)
+		parent, ok, err := pinDir(base, filepath.Join(homeRel, filepath.Dir(part)), false)
 		if err != nil {
 			return "", nil, err
 		}

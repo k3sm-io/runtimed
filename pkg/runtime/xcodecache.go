@@ -126,7 +126,8 @@ func (r *Runtime) checkoutXcodeCache(box *runtimev1.PodBox, dataVol string) {
 		return
 	}
 	start := time.Now()
-	parts, err := r.xcodeCacheStore().Checkout(e, home)
+	base, homeRel := podHomeAnchor(dataVol)
+	parts, err := r.xcodeCacheStore().CheckoutAt(e, base, homeRel)
 	if err != nil {
 		log.Warn("xcode cache checkout failed; the build starts cold for what was not cloned",
 			"cloned", parts, "err", err)
@@ -170,7 +171,11 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 		log.Warn("xcode cache publish skipped", "err", err)
 		return nil
 	}
-	incoming, parts, err := store.Stage(e, home, box.GetPodId())
+	// The pod can also replace its data volume itself (its rootfs) with a
+	// link to another pod's, so the walk starts at the pod dir, which it
+	// cannot replace.
+	base, homeRel := podHomeAnchor(dataVol)
+	incoming, parts, err := store.StageAt(e, base, homeRel, box.GetPodId())
 	if err != nil {
 		log.Warn("xcode cache publish skipped: stage", "err", err)
 		return nil
@@ -186,6 +191,14 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 		}
 		log.Info("xcode cache published", "parts", parts, "took", time.Since(start).String())
 	}
+}
+
+// podHomeAnchor splits the pod home's path into the pod dir, which a pod
+// cannot replace (it lies in the pods root its profile denies), and the home's
+// path below it, whose every component (the rootfs, the home) the pod can
+// replace with a link and the cache therefore opens with O_NOFOLLOW.
+func podHomeAnchor(dataVol string) (base, homeRel string) {
+	return filepath.Dir(dataVol), filepath.Join(filepath.Base(dataVol), podHomeName)
 }
 
 // realPodHome reports whether home is a real directory (Lstat: not a link).
