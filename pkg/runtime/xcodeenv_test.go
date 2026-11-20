@@ -195,3 +195,20 @@ func TestProvisionPodHomeRefusesALink(t *testing.T) {
 		t.Errorf("a git config was written through the link (stat err %v)", err)
 	}
 }
+
+// TestProvisionPodHomeRefusesALinkedVolume: a data volume that is itself a
+// symlink (a pod can replace its own rootfs with one) is refused, and nothing
+// is written where the link points.
+func TestProvisionPodHomeRefusesALinkedVolume(t *testing.T) {
+	elsewhere := t.TempDir()
+	dataVol := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.Symlink(elsewhere, dataVol); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisionPodHome(dataVol); err == nil {
+		t.Fatal("provisionPodHome followed a symlinked data volume")
+	}
+	if _, err := os.Lstat(filepath.Join(elsewhere, podHomeName)); !os.IsNotExist(err) {
+		t.Errorf("a home was made through the link (lstat err %v)", err)
+	}
+}

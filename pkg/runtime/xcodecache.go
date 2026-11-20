@@ -18,8 +18,8 @@ package runtime
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,16 +117,16 @@ func (r *Runtime) checkoutXcodeCache(box *runtimev1.PodBox, dataVol string) {
 		return
 	}
 	log := r.log.With("pod", box.GetPodId(), "namespace", e.Namespace, "key", e.Key, "xcode_build", e.Build)
-	home := podHomeDir(dataVol)
 	// The home was provisioned earlier in this createPod (provisionPodHome,
-	// which every pod with the toolchain grant gets) and no container has run
-	// yet; a home that is not a real directory is refused, never followed.
-	if err := realPodHome(home); err != nil {
+	// which every pod with the toolchain grant gets). It is reached from the
+	// pod dir without following a link (podHomeAnchor, CheckoutAt).
+	base, homeRel, err := r.podHomeAnchor(box, dataVol)
+	if err != nil {
 		log.Warn("xcode cache checkout skipped", "err", err)
 		return
 	}
 	start := time.Now()
-	parts, err := r.xcodeCacheStore().Checkout(e, home)
+	parts, err := r.xcodeCacheStore().CheckoutAt(e, base, homeRel)
 	if err != nil {
 		log.Warn("xcode cache checkout failed; the build starts cold for what was not cloned",
 			"cloned", parts, "err", err)
@@ -165,12 +165,15 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 	// with O_NOFOLLOW and clones relative to the open descriptors, so a
 	// process that survived the pod's stop (one that left its process group,
 	// B1868) cannot redirect the clone by swapping a path after it was checked.
-	home := podHomeDir(dataVol)
-	if err := realPodHome(home); err != nil {
+	// The pod can also replace its data volume itself (its rootfs) with a
+	// link to another pod's, so the walk starts at the pod dir, which it
+	// cannot replace.
+	base, homeRel, err := r.podHomeAnchor(box, dataVol)
+	if err != nil {
 		log.Warn("xcode cache publish skipped", "err", err)
 		return nil
 	}
-	incoming, parts, err := store.Stage(e, home, box.GetPodId())
+	incoming, parts, err := store.StageAt(e, base, homeRel, box.GetPodId())
 	if err != nil {
 		log.Warn("xcode cache publish skipped: stage", "err", err)
 		return nil
@@ -188,14 +191,23 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 	}
 }
 
-// realPodHome reports whether home is a real directory (Lstat: not a link).
-func realPodHome(home string) error {
-	fi, err := os.Lstat(home)
+// podHomeAnchor returns the pod dir, which a pod cannot replace (it lies in
+// the pods root its profile denies), and the pod home's path below it, whose
+// every component (the rootfs, the home) the pod can replace with a link and
+// the cache therefore opens with O_NOFOLLOW.
+//
+// The pod dir comes from the pod id, never from the data volume's path, and
+// the data volume must be a direct child of it. Were the volume nested deeper,
+// a walk anchored at its parent would start below a directory the pod can
+// swap, and would protect nothing without failing: so that layout is refused.
+func (r *Runtime) podHomeAnchor(box *runtimev1.PodBox, dataVol string) (base, homeRel string, err error) {
+	base, err = r.podDir(box.GetPodId())
 	if err != nil {
-		return fmt.Errorf("pod home: %w", err)
+		return "", "", err
 	}
-	if !fi.IsDir() {
-		return fmt.Errorf("pod home %s is not a directory (%v)", home, fi.Mode().Type())
+	rel, err := filepath.Rel(base, filepath.Clean(dataVol))
+	if err != nil || rel == "." || rel == ".." || strings.ContainsRune(rel, filepath.Separator) {
+		return "", "", fmt.Errorf("pod data volume %s is not a direct child of the pod dir %s", dataVol, base)
 	}
-	return nil
+	return base, filepath.Join(rel, podHomeName), nil
 }

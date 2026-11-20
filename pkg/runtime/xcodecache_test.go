@@ -207,6 +207,34 @@ func TestXcodeCachePublishAtDelete(t *testing.T) {
 		deleteWithPhase(t, rt, box, runtimev1.PodPhase_POD_PHASE_SUCCEEDED)
 		wantSnapshot(t, rt, "old")
 	})
+	// A pod can replace its own rootfs with a link to another pod's. The
+	// publish must not follow it: that would hand the other pod's build
+	// products to this pod's cache key, where its next pod reads them.
+	t.Run("a rootfs replaced by a symlink never publishes", func(t *testing.T) {
+		rt := xcodeCacheRuntime(t)
+		seedXcodeCache(t, rt, "old")
+		box := xcodeCacheBox(rt, "pod-xc-rootfs-link", "app")
+		mustCreatePod(t, rt, box)
+		victim := t.TempDir()
+		writeCacheParts(t, podHomeDir(victim), "stolen")
+		rootfs, err := rt.rootfsPath(box)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(rootfs, rootfs+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, rootfs); err != nil {
+			t.Fatal(err)
+		}
+		deleteWithPhase(t, rt, box, runtimev1.PodPhase_POD_PHASE_SUCCEEDED)
+		wantSnapshot(t, rt, "old")
+		for _, part := range xcodecache.Parts {
+			if b, err := os.ReadFile(filepath.Join(podHomeDir(victim), part, "f")); err != nil || string(b) != "stolen" {
+				t.Errorf("the other tree's %s was touched by the delete: %q, %v", part, b, err)
+			}
+		}
+	})
 	// Deleting a pod this daemon does not hold publishes nothing.
 	t.Run("an unknown pod publishes nothing", func(t *testing.T) {
 		rt := xcodeCacheRuntime(t)
@@ -217,4 +245,35 @@ func TestXcodeCachePublishAtDelete(t *testing.T) {
 			t.Error("a snapshot appeared for an unknown pod")
 		}
 	})
+}
+
+// TestPodHomeAnchor: the walk's base is the pod dir derived from the pod id,
+// and a data volume that is not its direct child is refused, because a base
+// below a directory the pod can swap would protect nothing.
+func TestPodHomeAnchor(t *testing.T) {
+	rt := xcodeCacheRuntime(t)
+	box := xcodeCacheBox(rt, "pod-xc-anchor", "app")
+	podDir, err := rt.podDir(box.GetPodId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs, err := rt.rootfsPath(box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, rel, err := rt.podHomeAnchor(box, rootfs)
+	if err != nil || base != podDir || filepath.Join(base, rel) != podHomeDir(rootfs) {
+		t.Fatalf("podHomeAnchor(%s) = (%q, %q, %v), want base %q and the pod home", rootfs, base, rel, err, podDir)
+	}
+	for _, bad := range []string{
+		filepath.Join(rootfs, "nested"),
+		podDir,
+		filepath.Dir(podDir),
+		filepath.Join(filepath.Dir(podDir), "another-pod", "rootfs"),
+		t.TempDir(),
+	} {
+		if _, _, err := rt.podHomeAnchor(box, bad); err == nil {
+			t.Errorf("podHomeAnchor accepted the data volume %s", bad)
+		}
+	}
 }
