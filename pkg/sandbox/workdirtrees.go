@@ -82,6 +82,13 @@ const (
 	// mounts, never the root, so it cannot open a file in another model's view
 	// or reach a view still being built in a staging directory beside it.
 	ArtifactViewsSubdir = "artifacts"
+	// XcodeCacheSubdir is the per-node Xcode build cache
+	// (<WorkDir>/xcode-cache/<namespace>/<key>/<Xcode build>/home-cache, see
+	// pkg/xcodecache). Only the daemon reads or writes it: a pod receives a
+	// private copy-on-write clone inside its own data volume at create and never
+	// reaches the shared snapshot, so a pod can neither read another
+	// namespace's build products nor plant a poisoned one for the next build.
+	XcodeCacheSubdir = "xcode-cache"
 )
 
 // ReapStoreSubdirs returns the work-dir-relative reap-store dirs, in deny order:
@@ -125,7 +132,8 @@ func SharedVolumeTempDir(mountPoint string) (string, bool) {
 // operator, unpacked, snapshots, ingest), the guest-artifact cache
 // (guest-artifacts), the artifact download staging dir (artifact-partial), the
 // artifact views root (artifacts) and the retained consoles of failed vm boots
-// (vmboot-failures), which hold other pods' guest output.
+// (vmboot-failures), which hold other pods' guest output, and the shared
+// Xcode build cache (xcode-cache), which holds every namespace's build products.
 //
 // The returned slice is freshly allocated, so a caller cannot mutate the
 // deny-set by holding on to it.
@@ -146,5 +154,6 @@ func DaemonTreeSubdirs() []string {
 		ArtifactPartialSubdir,
 		ArtifactViewsSubdir,
 		VMBootFailureSubdir,
+		XcodeCacheSubdir,
 	}
 }

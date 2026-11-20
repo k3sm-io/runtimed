@@ -356,6 +356,8 @@ type Runtime struct {
 	// per-pod user dir links live in (userdirs.go); zero means off. Set once by
 	// New, read-only after.
 	userDirs darwinUserDirs
+	// xcodeCache is the node's Xcode build cache (xcodecache.go).
+	xcodeCache xcodeCacheState
 	// workVolume is the mount point of the volume cfg.Root is on, as statfs
 	// spells it; "" when New could not tell. The profile denies its shared
 	// replacement directory and the path-rebase shim rebases it
