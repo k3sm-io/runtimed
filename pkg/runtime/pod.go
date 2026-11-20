@@ -696,6 +696,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
 	}
+	// The Xcode pod's home (xcodeenv.go), once Generate has validated the
+	// grant: containerEnv names it, so the directory a pod is told about is
+	// the directory that was made.
+	if sp.GetXcodeToolchainDir() != "" {
+		if err := provisionPodHome(rootfs); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP, err
+		}
+	}
 
 	// fsGroup: chown the writable pod data volume to the supplemental group
 	// root-side, before any container's privilege drop (a uid-dropped, sandboxed
@@ -3486,6 +3494,13 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 	if dir := box.GetSandboxProfile().GetXcodeToolchainDir(); dir != "" && !envHasName(base, developerDirEnv) {
 		env = append(env, developerDirEnv+"="+dir)
 	}
+	// The rest of the Xcode pod defaults (xcodeenv.go): HOME,
+	// CFFIXED_USER_HOME, USER, LOGNAME and a PATH, each only when unset.
+	xenv, err := r.xcodeEnv(box, c, base)
+	if err != nil {
+		return nil, err
+	}
+	env = append(env, xenv...)
 	explicitDyld := false
 	for _, e := range base {
 		// K3SM_SHADOW_DIR is runtime-owned: only Config.ShadowBinDir may set
