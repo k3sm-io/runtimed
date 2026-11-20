@@ -124,7 +124,9 @@ func shadowRewrite(path string, argv []string, rw execRewrite) (shadowExec, bool
 
 	if copyName, ok := shadowset.CopyFor(target); ok && rw.dir != "" {
 		if cp := filepath.Join(rw.dir, copyName); admit(cp) {
-			out := append([]string{}, argv...)
+			// The copy's appended arguments, exactly as the interposer
+			// appends them (shadowset.AppendFor, k3sm_fill_argv).
+			out := shadowset.AppendFor(copyName, argv)
 			if target == "/bin/sh" {
 				out[0] = asSh(out[0])
 			}

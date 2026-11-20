@@ -84,4 +84,30 @@ static const struct {
     {"/Applications/Xcode.app/Contents/Developer/usr/bin/ibtoold", "ibtoold"},
 };
 
+/* The most arguments appended to one copy's argv. */
+#define K3SM_SHADOW_APPEND_MAX 3
+
+static const char *const k3sm_append_unless_none[] = {NULL};
+static const char *const k3sm_append_unless_0[] = {"-create-xcframework", "-exportArchive", "-exportLocalizations", "-importLocalizations", "-exportNotarizedApp", NULL};
+
+static const struct {
+    const char *copy;
+    const char *arg;
+    const char *key;
+    const char *const *unless;
+} k3sm_shadow_append[] = {
+    {"xcodebuild", "-IDEPackageSupportDisableManifestSandbox=YES", "-IDEPackageSupportDisableManifestSandbox", k3sm_append_unless_none},
+    {"xcodebuild", "-IDEPackageSupportDisablePluginExecutionSandbox=YES", "-IDEPackageSupportDisablePluginExecutionSandbox", k3sm_append_unless_none},
+    {"xcodebuild", "SWIFTC_DISABLE_SANDBOX=YES", "SWIFTC_DISABLE_SANDBOX", k3sm_append_unless_0},
+    {NULL, NULL, NULL, NULL},
+};
+
+static const char *const k3sm_shadow_required[] = {
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/actool",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/ibtool",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/ibtoold",
+    NULL,
+};
+
 #endif /* K3SM_SHADOW_TABLE_H */
