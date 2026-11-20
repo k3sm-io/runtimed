@@ -213,6 +213,15 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		return &runtimev1.DeletePodResponse{}, nil
 	}
 
+	// Read the phase BEFORE anything is stopped: SUCCEEDED here means every main
+	// container exited 0 on its own, which is the one condition under which the
+	// pod's Xcode build cache is published (stageXcodeCache). Once the stop below
+	// signals a container, its exit no longer says whether the build succeeded.
+	p.mu.Lock()
+	succeeded := p.phase == runtimev1.PodPhase_POD_PHASE_SUCCEEDED
+	p.mu.Unlock()
+	var commitXcodeCache func()
+
 	r.stopHostPod(ctx, p, hostStop{
 		grace: grace,
 		swept: func() {
@@ -228,6 +237,12 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 			}
 		},
 		logsClosed: func() {
+			// Stage the cache publish while the pod's home still exists: every
+			// process of the pod is stopped and swept by now, so the tree is
+			// quiescent.
+			if dataVol, err := r.rootfsPath(p.box); err == nil {
+				commitXcodeCache = r.stageXcodeCache(p.box, dataVol, succeeded)
+			}
 			if err := r.removePodDir(req.GetPodId()); err != nil {
 				r.log.Warn("remove pod dir", "pod", req.GetPodId(), "err", err)
 			}
@@ -236,6 +251,16 @@ func (r *Runtime) DeletePod(ctx context.Context, req *runtimev1.DeletePodRequest
 		},
 	})
 	r.releasePodArtifacts(ctx, p.box, 0)
+	// The commit may wait (bounded, xcodecache.DefaultLockWait) on another
+	// pod's checkout, so it never holds up the delete: the staged clone is
+	// already independent of the pod directory removed above.
+	if commitXcodeCache != nil {
+		if run := r.xcodeCache.runCommit; run != nil {
+			run(commitXcodeCache)
+		} else {
+			go commitXcodeCache()
+		}
+	}
 	p.mu.Lock()
 	shimDirs := p.shimDirs
 	p.mu.Unlock()

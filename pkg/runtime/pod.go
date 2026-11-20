@@ -705,6 +705,13 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 	}
 
+	// The Xcode build cache (k3sm.io/xcode-cache): a private copy-on-write clone
+	// of the key's snapshot into the pod's home, inside the data volume the
+	// profile just granted. After the profile, so the toolchain dir it keys on
+	// has been validated; before the fsGroup walk, so the clone is owned like the
+	// rest of the volume. It degrades to a cold build and never fails the create.
+	r.checkoutXcodeCache(box, rootfs)
+
 	// fsGroup: chown the writable pod data volume to the supplemental group
 	// root-side, before any container's privilege drop (a uid-dropped, sandboxed
 	// process can no longer chown). The supervisor runs this synchronously here,
