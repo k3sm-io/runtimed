@@ -17,11 +17,10 @@ limitations under the License.
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -35,25 +34,95 @@ var ErrFSGroupRootUnbounded = errors.New("fsGroup chown root is outside the perm
 // maxFSGroupDepth directories.
 var ErrFSGroupTreeTooDeep = errors.New("fsGroup chown tree is too deep")
 
-// ErrFSGroupEntryChanged is returned when an entry stopped being the kind of
-// file the walk listed it as before the walk had finished with it: something
-// is rearranging the tree under the walk, and the walk stops.
+// ErrFSGroupTreeTooLarge is returned when the tree under root holds more
+// entries than maxFSGroupEntries, or more directories waiting to be listed
+// than maxFSGroupPendingDirs.
+var ErrFSGroupTreeTooLarge = errors.New("fsGroup chown tree is too large")
+
+// ErrFSGroupEntryChanged is returned when an entry stopped being what the walk
+// listed it as before the walk had finished with it: something is rearranging
+// the tree under the walk, and the walk stops.
 var ErrFSGroupEntryChanged = errors.New("fsGroup chown entry changed under the walk")
 
-// maxFSGroupDepth bounds how many directories deep the walk goes below root.
-// The by-path walk this replaced stopped at PATH_MAX, about half as deep; the
-// bound keeps a pod-authored chain of directories from costing the daemon
-// unbounded work. A var so a test can lower it.
-var maxFSGroupDepth = 1024
+// The walk's bounds. The tree is written by the pod, so each bounds what a pod
+// can make the daemon spend, and each fails closed: the walk stops with an
+// error before it changes anything past the bound. They are vars so a test can
+// lower them.
+var (
+	// maxFSGroupDepth is how many directories deep the walk goes below root.
+	// The by-path walk this replaced stopped at PATH_MAX, about half as deep.
+	maxFSGroupDepth = 1024
+	// maxFSGroupEntries is how many entries the walk changes in all.
+	maxFSGroupEntries = 8 << 20
+	// maxFSGroupPendingDirs is how many directories may be waiting to be
+	// listed at once. Each costs one small node (a parent pointer, a name and
+	// two numbers), so this bounds the walk's memory: about 100 MB at the
+	// bound, for a tree with a million directories side by side.
+	maxFSGroupPendingDirs = 1 << 20
+	// maxFSGroupHeldDirs is how many directory descriptors the walk keeps
+	// open: the directories on the way to the one being listed, the deepest
+	// ones when the tree is deeper than this.
+	maxFSGroupHeldDirs = 32
+)
 
-// fsGroupDirFlags opens a directory for the walk: never through a symlink.
-const fsGroupDirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+// fsGroupDirFlags opens a directory for the walk: never through a symlink, and
+// never blocking, in case the name has become a FIFO or a device by the time
+// it is opened.
+const fsGroupDirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
 
-// fsGroupBeforeApply, when set, is called with an entry's path after the walk
-// has read what the entry is and before it changes the entry. It is the seam a
-// test uses to swap an entry in that window, as a pod process can; production
-// leaves it nil.
-var fsGroupBeforeApply func(path string)
+// fsGroupFileFlags opens a regular file or a FIFO for the walk. O_NONBLOCK
+// makes the open of a FIFO return at once whether or not it has a writer.
+const fsGroupFileFlags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
+
+// fsGroupReportExamples is how many skipped paths a report names.
+const fsGroupReportExamples = 8
+
+// The walk's test seams: each, when set, is called with an entry's path at a
+// point where a pod process could rearrange the tree. Production leaves them
+// nil.
+var (
+	// fsGroupBeforeApply runs after the walk has read what an entry is and
+	// before it opens or changes it.
+	fsGroupBeforeApply func(path string)
+	// fsGroupBeforeChmod runs after an entry's group is set and before its
+	// mode is.
+	fsGroupBeforeChmod func(path string)
+)
+
+// FSGroupReport says what a walk did not change, and why. A skipped entry is
+// not an error: the pod starts, and the entry keeps the group and mode it had.
+type FSGroupReport struct {
+	// Changed counts the entries whose group (and, unless a symlink, mode)
+	// the walk set.
+	Changed int
+	// MultiLink counts regular files, FIFOs and symlinks with more than one
+	// hard link.
+	MultiLink int
+	// Special counts sockets, device nodes and anything else the walk does
+	// not open.
+	Special int
+	// OtherDevice counts directories on a different device from root: a
+	// mount point, which the walk does not cross.
+	OtherDevice int
+	// Unopenable counts regular files and FIFOs the daemon could not open
+	// (it has no read permission on them, which cannot happen to root).
+	Unopenable int
+	// Examples names up to fsGroupReportExamples skipped entries, each as
+	// "<reason>: <path>".
+	Examples []string
+}
+
+// Skipped is the number of entries the walk left as they were.
+func (r FSGroupReport) Skipped() int {
+	return r.MultiLink + r.Special + r.OtherDevice + r.Unopenable
+}
+
+func (r *FSGroupReport) skip(counter *int, reason, path string) {
+	*counter++
+	if len(r.Examples) < fsGroupReportExamples {
+		r.Examples = append(r.Examples, reason+": "+path)
+	}
+}
 
 // ChownForFSGroup recursively sets group ownership of root to gid and makes it
 // group-accessible, so a pod that drops to a non-root uid (with fsGroup in its
@@ -77,66 +146,81 @@ var fsGroupBeforeApply func(path string)
 // rather than a package constant because this package deliberately imports
 // nothing from k3sm.io: it is the low-level process layer, and reaching into
 // pkg/image or pkg/mount for the layout (or the containment predicate) would
-// invert that layering.
+// invert that layering. bound itself is the caller's to vouch for: it must be
+// a directory the pod cannot replace.
 //
-// Nothing below bound is resolved by path. The tree is the pod's: a pod can
-// replace its rootfs, or any directory or file under it, with a symlink, and a
-// process of an earlier instance of the pod can still be running while the
-// next one is created. A walk by path would then chown and chmod whatever the
-// link names, as root. So bound is opened without following a link, and every
-// directory from there down is opened with O_NOFOLLOW relative to the open
-// directory above it. A directory is changed through its own descriptor
-// (fchown, fchmod); any other entry is changed by name relative to its open
-// parent with AT_SYMLINK_NOFOLLOW (fchownat, fchmodat), so an entry swapped for
-// a link is changed as a link, never through it. A directory that turned into
-// a link between being listed and being opened fails the walk (ELOOP), and so
-// does any other entry that changed kind before its mode was set
-// (ErrFSGroupEntryChanged): each is a refusal, and the caller fails the pod's
-// create. bound itself is the
-// caller's to vouch for: it must be a directory the pod cannot replace.
+// The tree is the pod's, and the walk trusts nothing in it. A pod can replace
+// its rootfs, or any directory or file under it, with a symlink or with a hard
+// link to a file elsewhere, and a process of an earlier instance of the pod can
+// still be running while the next one is created. So:
 //
-// What each kind of entry gets, which is what the by-path walk gave a tree
-// nobody was rearranging:
+//   - Nothing below bound is resolved by path. bound is opened without
+//     following a link, and every directory from there down is opened with
+//     O_NOFOLLOW relative to the open directory above it.
+//   - Every entry is changed through a descriptor opened on it, never by name:
+//     the entry is opened, what was opened is examined (fstat), and the group
+//     and mode are set on that same descriptor (fchown, fchmod), with the mode
+//     read from it. What a name means after the open cannot matter.
+//   - An entry with more than one hard link is skipped. A second link may lie
+//     outside the tree, where the file is somebody else's, and the walk cannot
+//     tell: counting the links it meets is no proof against a process that
+//     moves one while the walk runs. The profile denies a pod a link to a file
+//     outside its rootfs (pkg/sandbox TestPodHardLinkIntoItsRootfsUnderSandboxExec
+//     measures that), so this is a second layer, and it holds if the first
+//     fails.
+//   - A directory on another device than root is a mount point; it is skipped
+//     and not entered.
+//   - Sockets and device nodes are skipped: a socket cannot be opened, and
+//     opening a device can act on it.
+//   - An entry that is no longer the kind of file it was listed as stops the
+//     walk (ErrFSGroupEntryChanged), and so does a listed directory that
+//     cannot be opened as one. An entry that is gone by the time the walk
+//     reaches it is passed over: nothing is changed by not changing it.
+//
+// What the walk gives each kind of entry it does change is what the by-path
+// walk gave a tree nobody was rearranging:
 //
 //   - a directory: group gid, the owner's rwx copied to the group, and setgid,
 //     so files created later inherit the group;
-//   - a regular file, FIFO, socket or device node: group gid and the owner's
-//     rwx copied to the group. They are never opened (opening a FIFO blocks,
-//     opening a device can act on it);
-//   - a symlink: group gid on the link itself and no mode change (a symlink
-//     mode is meaningless), and the walk does not descend through it. A root
-//     that is itself a symlink is handled the same way and nothing below its
-//     target is touched;
+//   - a regular file or FIFO: group gid and the owner's rwx copied to the
+//     group. A FIFO is opened non-blocking, which returns at once;
+//   - a symlink: group gid on the link itself (it is opened as a link) and no
+//     mode change, and the walk does not go through it. A root that is itself
+//     a symlink is handled the same way and nothing below its target is
+//     touched. On a system that cannot open a symlink as itself, links are
+//     left alone;
 //   - the special bits an entry has once its group is set are kept: the
 //     sticky bit always, and setuid and setgid unless the chown cleared them,
 //     which it does for a caller that is not root.
 //
-// fchmodat with AT_SYMLINK_NOFOLLOW is what Darwin provides and this runtime
-// targets (TestFchmodatNoFollowLeavesTheTarget measures it: the link's own
-// mode changes, its target's does not). A system that rejects the flag fails
-// the walk on the first non-directory rather than following a link.
+// It differs from that walk in what it skips (above), and in refusing a
+// symlinked directory between bound and root, which the by-path walk followed.
+// The report says what was skipped; the caller logs it.
 //
-// The first error stops the walk and is returned. A gid <= 0 is rejected: 0
-// (wheel) is never a valid fsGroup target and a negative gid is a programming
-// error.
-func ChownForFSGroup(bound, root string, gid int) error {
+// The walk is bounded (see maxFSGroupDepth and the bounds beside it), keeps at
+// most maxFSGroupHeldDirs directories open however deep the tree is, and
+// checks ctx once per directory. The first error stops it. A gid <= 0 is
+// rejected: 0 (wheel) is never a valid fsGroup target and a negative gid is a
+// programming error.
+func ChownForFSGroup(ctx context.Context, bound, root string, gid int) (FSGroupReport, error) {
+	var rep FSGroupReport
 	if gid <= 0 {
-		return fmt.Errorf("fsGroup chown: invalid gid %d", gid)
+		return rep, fmt.Errorf("fsGroup chown: invalid gid %d", gid)
 	}
 	if !strictlyUnder(root, bound) {
-		return fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, root, bound)
+		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, root, bound)
 	}
 	bound, root = filepath.Clean(bound), filepath.Clean(root)
 	rel, err := filepath.Rel(bound, root)
 	if err != nil {
-		return fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, root, bound)
+		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, root, bound)
 	}
 	comps := strings.Split(rel, string(filepath.Separator))
 
 	// The directory holding root, reached from bound one component at a time.
 	parent, err := unix.Open(bound, fsGroupDirFlags, 0)
 	if err != nil {
-		return fmt.Errorf("fsGroup chown: open %s: %w", bound, err)
+		return rep, fmt.Errorf("fsGroup chown: open %s: %w", bound, err)
 	}
 	defer func() { unix.Close(parent) }()
 	at := bound
@@ -144,150 +228,318 @@ func ChownForFSGroup(bound, root string, gid int) error {
 		at = filepath.Join(at, c)
 		next, err := unix.Openat(parent, c, fsGroupDirFlags, 0)
 		if err != nil {
-			return fmt.Errorf("fsGroup chown: open %s: %w", at, err)
+			return rep, fmt.Errorf("fsGroup chown: open %s: %w", at, err)
 		}
 		unix.Close(parent)
 		parent = next
 	}
 
-	rootFd, isDir, err := fsGroupApply(parent, comps[len(comps)-1], root, gid)
-	if err != nil || !isDir {
+	w := &fsGroupWalk{ctx: ctx, gid: gid, root: root, rep: &rep}
+	defer w.closeHeld()
+	rootNode, err := w.apply(parent, comps[len(comps)-1], nil)
+	if err != nil || rootNode == nil {
+		return rep, err
+	}
+	return rep, w.walk(parent, comps[len(comps)-1], rootNode)
+}
+
+// fsGroupNode is a directory the walk has changed and has still to list: its
+// name in its parent, and the device and inode it had when it was changed, so
+// that what is opened under that name later is known to be the same directory.
+type fsGroupNode struct {
+	parent   *fsGroupNode
+	name     string
+	dev, ino uint64
+	depth    int // 0 for root
+}
+
+// path is the node's path, for messages.
+func (n *fsGroupNode) path(root string) string {
+	if n == nil || n.parent == nil {
+		return root
+	}
+	return filepath.Join(n.parent.path(root), n.name)
+}
+
+// fsGroupHeld is one directory the walk keeps open.
+type fsGroupHeld struct {
+	node *fsGroupNode
+	fd   int
+}
+
+// fsGroupWalk is the state of one walk.
+type fsGroupWalk struct {
+	ctx     context.Context
+	gid     int
+	root    string
+	rep     *FSGroupReport
+	rootDev uint64
+	rootSet bool
+	// entries counts every entry examined, against maxFSGroupEntries.
+	entries int
+	// held is the chain of open directories from root (held[0], always
+	// kept) towards the directory being listed, shallowest first. When the
+	// chain is longer than maxFSGroupHeldDirs the shallowest below root are
+	// closed, and re-opened from root if the walk comes back to them.
+	held []fsGroupHeld
+}
+
+func (w *fsGroupWalk) closeHeld() {
+	for _, h := range w.held {
+		unix.Close(h.fd)
+	}
+	w.held = nil
+}
+
+// walk lists root and everything below it, depth first. rootParent and
+// rootName are where root was opened from.
+func (w *fsGroupWalk) walk(rootParent int, rootName string, rootNode *fsGroupNode) error {
+	fd, err := w.openNode(rootParent, rootName, rootNode)
+	if err != nil {
 		return err
 	}
-	defer unix.Close(rootFd)
+	if fd < 0 {
+		return nil // root went away between being changed and being listed
+	}
+	w.held = append(w.held, fsGroupHeld{node: rootNode, fd: fd})
 
-	// Depth first, with an explicit stack of directories still to list, each
-	// named by its components below root. A directory is re-opened from the
-	// pinned root when its turn comes, so the walk holds a fixed handful of
-	// descriptors however deep the tree is, and every re-open is again made
-	// without following a link.
-	pending := [][]string{nil}
+	pending := []*fsGroupNode{rootNode}
 	for len(pending) > 0 {
+		if err := w.ctx.Err(); err != nil {
+			return fmt.Errorf("fsGroup chown %s: %w", w.root, err)
+		}
 		dir := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		subdirs, err := fsGroupListAndApply(rootFd, root, dir, gid)
+		fd, err := w.hold(dir)
 		if err != nil {
 			return err
 		}
-		if len(subdirs) > 0 && len(dir)+1 > maxFSGroupDepth {
-			return fmt.Errorf("%w: %s nests more than %d directories below %s",
-				ErrFSGroupTreeTooDeep, filepath.Join(append([]string{root}, dir...)...), maxFSGroupDepth, root)
+		if fd < 0 {
+			continue // the directory, or one above it, is gone
 		}
-		// Pushed in reverse so the walk visits names in lexical order.
-		for i := len(subdirs) - 1; i >= 0; i-- {
-			child := make([]string, len(dir)+1)
-			copy(child, dir)
-			child[len(dir)] = subdirs[i]
-			pending = append(pending, child)
+		pending, err = w.list(fd, dir, pending)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// fsGroupListAndApply opens the directory dir (components below the open root
-// directory rootFd), applies the fsGroup change to each of its entries, and
-// returns the names of the entries that are directories, sorted. The directory
-// itself was changed when its parent was listed.
-func fsGroupListAndApply(rootFd int, root string, dir []string, gid int) ([]string, error) {
-	path := root
-	fd, err := unix.Openat(rootFd, ".", fsGroupDirFlags, 0)
+// list changes every entry of the open directory dir and appends the
+// directories among them to pending.
+func (w *fsGroupWalk) list(fd int, dir *fsGroupNode, pending []*fsGroupNode) ([]*fsGroupNode, error) {
+	// A descriptor of its own for reading, so that the held one keeps no read
+	// position.
+	rd, err := unix.Openat(fd, ".", fsGroupDirFlags, 0)
 	if err != nil {
-		return nil, fmt.Errorf("fsGroup chown: open %s: %w", path, err)
+		return pending, fmt.Errorf("fsGroup chown: open %s: %w", dir.path(w.root), err)
 	}
-	for _, c := range dir {
-		path = filepath.Join(path, c)
-		next, err := unix.Openat(fd, c, fsGroupDirFlags, 0)
-		unix.Close(fd)
+	defer unix.Close(rd)
+	buf := make([]byte, 32<<10)
+	names := make([]string, 0, 256)
+	for {
+		if err := w.ctx.Err(); err != nil {
+			return pending, fmt.Errorf("fsGroup chown %s: %w", w.root, err)
+		}
+		n, err := unix.ReadDirent(rd, buf)
 		if err != nil {
-			return nil, fmt.Errorf("fsGroup chown: open %s: %w", path, err)
+			return pending, fmt.Errorf("fsGroup chown: read %s: %w", dir.path(w.root), err)
 		}
-		fd = next
-	}
-	f := os.NewFile(uintptr(fd), path)
-	defer f.Close()
-	names, err := f.Readdirnames(-1)
-	if err != nil {
-		return nil, fmt.Errorf("fsGroup chown: read %s: %w", path, err)
-	}
-	sort.Strings(names)
-	var subdirs []string
-	for _, name := range names {
-		child, isDir, err := fsGroupApply(fd, name, filepath.Join(path, name), gid)
-		if err != nil {
-			return nil, err
+		if n <= 0 {
+			return pending, nil
 		}
-		if isDir {
-			unix.Close(child)
-			subdirs = append(subdirs, name)
+		names = names[:0]
+		_, _, names = unix.ParseDirent(buf[:n], -1, names)
+		for _, name := range names {
+			child, err := w.apply(fd, name, dir)
+			if err != nil {
+				return pending, err
+			}
+			if child == nil {
+				continue
+			}
+			if len(pending) >= maxFSGroupPendingDirs {
+				return pending, fmt.Errorf("%w: more than %d directories waiting to be listed under %s",
+					ErrFSGroupTreeTooLarge, maxFSGroupPendingDirs, w.root)
+			}
+			pending = append(pending, child)
 		}
 	}
-	return subdirs, nil
 }
 
-// fsGroupApply applies the fsGroup change to the entry name of the open
-// directory parent; path is only for messages. For a directory it returns the
-// directory's own open descriptor, which the caller closes, and isDir true.
-func fsGroupApply(parent int, name, path string, gid int) (fd int, isDir bool, err error) {
+// hold returns an open descriptor for dir, which stays owned by the walk. It
+// keeps the directories on the way to dir open and closes the ones that are
+// not on that way. A directory that has to be re-opened is checked against the
+// device and inode recorded when it was changed. It returns -1 when dir, or a
+// directory above it that had to be re-opened, is gone.
+func (w *fsGroupWalk) hold(dir *fsGroupNode) (int, error) {
+	// chain[d] is dir's ancestor at depth d; chain[dir.depth] is dir.
+	chain := make([]*fsGroupNode, dir.depth+1)
+	for n := dir; n != nil; n = n.parent {
+		chain[n.depth] = n
+	}
+	// Keep the held directories that are on the chain; they are a prefix of
+	// held, because held is itself a chain.
+	keep := 0
+	for keep < len(w.held) && w.held[keep].node.depth <= dir.depth && chain[w.held[keep].node.depth] == w.held[keep].node {
+		keep++
+	}
+	for _, h := range w.held[keep:] {
+		unix.Close(h.fd)
+	}
+	w.held = w.held[:keep]
+	last := w.held[len(w.held)-1]
+	for d := last.node.depth + 1; d <= dir.depth; d++ {
+		fd, err := w.openNode(last.fd, chain[d].name, chain[d])
+		if err != nil {
+			return -1, err
+		}
+		if fd < 0 {
+			return -1, nil
+		}
+		if len(w.held) >= maxFSGroupHeldDirs {
+			// Close the shallowest below root; the open of chain[d] above was
+			// made relative to the deepest, which stays.
+			unix.Close(w.held[1].fd)
+			w.held = append(w.held[:1], w.held[2:]...)
+		}
+		last = fsGroupHeld{node: chain[d], fd: fd}
+		w.held = append(w.held, last)
+	}
+	return last.fd, nil
+}
+
+// openNode opens the directory node by its name under the open directory
+// parent, and checks it is the directory that was changed under that name. It
+// returns -1 when the name is gone.
+func (w *fsGroupWalk) openNode(parent int, name string, node *fsGroupNode) (int, error) {
+	fd, err := unix.Openat(parent, name, fsGroupDirFlags, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return -1, nil
+	}
+	if err != nil {
+		return -1, fmt.Errorf("%w: open %s: %v", ErrFSGroupEntryChanged, node.path(w.root), err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("fsGroup chown %s: %w", node.path(w.root), err)
+	}
+	if uint64(st.Dev) != node.dev || uint64(st.Ino) != node.ino {
+		unix.Close(fd)
+		return -1, fmt.Errorf("%w: %s is not the directory the walk changed", ErrFSGroupEntryChanged, node.path(w.root))
+	}
+	return fd, nil
+}
+
+// apply changes the entry name of the open directory parent, which is the
+// directory dir (nil when the entry is root itself). For a directory it
+// returns the node to list later; for anything else, and for an entry it
+// skipped, nil.
+func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode) (*fsGroupNode, error) {
+	node := &fsGroupNode{parent: dir, name: name}
+	if dir != nil {
+		node.depth = dir.depth + 1
+	}
+	path := func() string {
+		if dir == nil {
+			return w.root
+		}
+		return node.path(w.root)
+	}
+	w.entries++
+	if w.entries > maxFSGroupEntries {
+		return nil, fmt.Errorf("%w: more than %d entries under %s", ErrFSGroupTreeTooLarge, maxFSGroupEntries, w.root)
+	}
 	var st unix.Stat_t
 	if err := unix.Fstatat(parent, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return -1, false, fmt.Errorf("fsGroup chown %s: %w", path, err)
+		if dir != nil && errors.Is(err, unix.ENOENT) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+	}
+	kind := uint32(st.Mode) & unix.S_IFMT
+	if kind == unix.S_IFDIR && node.depth > maxFSGroupDepth {
+		return nil, fmt.Errorf("%w: %s nests more than %d directories below %s",
+			ErrFSGroupTreeTooDeep, path(), maxFSGroupDepth, w.root)
 	}
 	if fsGroupBeforeApply != nil {
-		fsGroupBeforeApply(path)
+		fsGroupBeforeApply(path())
 	}
-	switch st.Mode & unix.S_IFMT {
-	case unix.S_IFLNK:
-		// The link itself, never its target, and no mode change.
-		if err := unix.Fchownat(parent, name, -1, gid, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return -1, false, fmt.Errorf("fsGroup chown %s: %w", path, err)
-		}
-		return -1, false, nil
+
+	var flags int
+	switch kind {
 	case unix.S_IFDIR:
-		// Opened first, then changed through the descriptor: what is changed
-		// is the directory that was opened, whatever the name means by now. A
-		// name that became a link fails the open.
-		fd, err := unix.Openat(parent, name, fsGroupDirFlags, 0)
-		if err != nil {
-			return -1, false, fmt.Errorf("fsGroup chown: open %s: %w", path, err)
+		flags = fsGroupDirFlags
+	case unix.S_IFREG, unix.S_IFIFO:
+		flags = fsGroupFileFlags
+	case unix.S_IFLNK:
+		if !fsGroupCanOpenLinks {
+			return nil, nil
 		}
-		if err := unix.Fchown(fd, -1, gid); err != nil {
-			unix.Close(fd)
-			return -1, false, fmt.Errorf("fsGroup chown %s: %w", path, err)
-		}
-		// The mode is read after the chown, as the by-path walk read it: a
-		// chown by an unprivileged caller clears setuid and setgid, and the
-		// walk must not put them back.
-		if err := unix.Fstat(fd, &st); err != nil {
-			unix.Close(fd)
-			return -1, false, fmt.Errorf("fsGroup chown %s: %w", path, err)
-		}
-		if err := unix.Fchmod(fd, fsGroupMode(uint32(st.Mode), true)); err != nil {
-			unix.Close(fd)
-			return -1, false, fmt.Errorf("fsGroup chmod %s: %w", path, err)
-		}
-		return fd, true, nil
+		flags = fsGroupLinkFlags
 	default:
-		// A file, FIFO, socket or device: changed by name relative to the open
-		// parent and without following a link, and never opened. If the name
-		// was swapped for a link after the stat above, the chown changes the
-		// link, and the second stat sees that the entry is no longer what was
-		// listed and stops the walk before any mode is changed.
-		kind := st.Mode & unix.S_IFMT
-		if err := unix.Fchownat(parent, name, -1, gid, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return -1, false, fmt.Errorf("fsGroup chown %s: %w", path, err)
-		}
-		// The mode is read after the chown: see the directory case.
-		if err := unix.Fstatat(parent, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return -1, false, fmt.Errorf("fsGroup chown %s: %w", path, err)
-		}
-		if st.Mode&unix.S_IFMT != kind {
-			return -1, false, fmt.Errorf("%w: %s changed kind while it was being walked", ErrFSGroupEntryChanged, path)
-		}
-		if err := unix.Fchmodat(parent, name, fsGroupMode(uint32(st.Mode), false), unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return -1, false, fmt.Errorf("fsGroup chmod %s: %w", path, err)
-		}
-		return -1, false, nil
+		w.rep.skip(&w.rep.Special, "a socket or device", path())
+		return nil, nil
 	}
+	fd, err := unix.Openat(parent, name, flags, 0)
+	switch {
+	case err == nil:
+	case dir != nil && errors.Is(err, unix.ENOENT):
+		return nil, nil
+	case kind != unix.S_IFDIR && errors.Is(err, unix.EACCES):
+		w.rep.skip(&w.rep.Unopenable, "not readable by the daemon", path())
+		return nil, nil
+	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
+		return nil, fmt.Errorf("%w: open %s: %v", ErrFSGroupEntryChanged, path(), err)
+	default:
+		return nil, fmt.Errorf("fsGroup chown: open %s: %w", path(), err)
+	}
+	defer unix.Close(fd)
+
+	// From here on only the descriptor is used: what was opened is what is
+	// examined and what is changed.
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+	}
+	if uint32(st.Mode)&unix.S_IFMT != kind {
+		return nil, fmt.Errorf("%w: %s changed kind while it was being walked", ErrFSGroupEntryChanged, path())
+	}
+	if kind == unix.S_IFDIR {
+		if !w.rootSet {
+			w.rootDev, w.rootSet = uint64(st.Dev), true
+		} else if uint64(st.Dev) != w.rootDev {
+			w.rep.skip(&w.rep.OtherDevice, "a directory on another device", path())
+			return nil, nil
+		}
+	} else if st.Nlink > 1 {
+		w.rep.skip(&w.rep.MultiLink, "more than one hard link", path())
+		return nil, nil
+	}
+	if err := unix.Fchown(fd, -1, w.gid); err != nil {
+		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+	}
+	w.rep.Changed++
+	if kind == unix.S_IFLNK {
+		return nil, nil // a symlink's mode is meaningless
+	}
+	if fsGroupBeforeChmod != nil {
+		fsGroupBeforeChmod(path())
+	}
+	// The mode is read after the chown, as the by-path walk read it: a chown
+	// by an unprivileged caller clears setuid and setgid, and the walk must
+	// not put them back.
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+	}
+	if err := unix.Fchmod(fd, fsGroupMode(uint32(st.Mode), kind == unix.S_IFDIR)); err != nil {
+		return nil, fmt.Errorf("fsGroup chmod %s: %w", path(), err)
+	}
+	if kind != unix.S_IFDIR {
+		return nil, nil
+	}
+	node.dev, node.ino = uint64(st.Dev), uint64(st.Ino)
+	return node, nil
 }
 
 // fsGroupMode is the mode an entry with mode st gets: its permission and

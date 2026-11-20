@@ -737,9 +737,19 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
 	if fsGroup := int(box.GetPodSecurityContext().GetFsGroup()); fsGroup > 0 {
-		if err := supervisor.ChownForFSGroup(podDir, rootfs, fsGroup); err != nil {
+		rep, err := supervisor.ChownForFSGroup(ctx, podDir, rootfs, fsGroup)
+		if err != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("fsGroup chown for pod %s: %w", box.GetPodId(), err)
+		}
+		if rep.Skipped() > 0 {
+			// Not a failure: the entries keep the group and mode they had, and
+			// a process that relies on the fsGroup for one of them is refused
+			// by the file's own mode.
+			r.log.Warn("fsGroup: some entries of the pod's data volume were left as they were",
+				"pod", box.GetPodId(), "fs_group", fsGroup, "changed", rep.Changed,
+				"multi_link", rep.MultiLink, "special", rep.Special, "other_device", rep.OtherDevice,
+				"unopenable", rep.Unopenable, "examples", rep.Examples)
 		}
 	}
 
