@@ -429,6 +429,26 @@ func (r *Runtime) stopHostPod(ctx context.Context, p *pod, s hostStop) {
 	// here can be read as an OOM.
 	r.endExecSessions(p)
 	survivors := r.sweepPodTrees(podID, p)
+	// The group signals and the tree sweep above cannot reach a process that
+	// called setsid and whose parent then exited: launchd is its parent and it
+	// leads its own group. It still runs under this pod's Seatbelt policy, which
+	// is how this sweep finds it (poddescendants.go). It gets whatever remains
+	// of the pod's grace between SIGTERM and SIGKILL. It runs before the reap
+	// records are retired and before DeletePod removes the pod dir, whose
+	// rootfs the identity probe needs.
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	r.sweepPodDescendants(ctx, podID, podSweep{
+		grace: remaining,
+		mayProceed: func() bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			q, live := r.pods[podID]
+			return !live || q == p
+		},
+	})
 
 	if s.swept != nil {
 		s.swept()
