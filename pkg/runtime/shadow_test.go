@@ -237,8 +237,9 @@ func rootOwnedLstat(p string) (shadowStat, error) {
 // TestShadowRewriteCoversTheSet pins the runtime's rewrite to the shadowset
 // list, the same list the interposer's generated table is pinned to (pkg/
 // shadowset/gen TestShadowTableIsCurrent): every exec path of every entry is
-// rewritten to <dir>/<Copy> with argv unchanged (bar /bin/sh's argv[0]), and
-// an exec path the list does not name is left alone.
+// rewritten to <dir>/<Copy> with argv unchanged (bar /bin/sh's argv[0]) but
+// for the entry's own AppendArgs, and an exec path the list does not name is
+// left alone.
 func TestShadowRewriteCoversTheSet(t *testing.T) {
 	const dir = "/Library/k3sm/shadow"
 	notScript := func(string) ([]byte, error) { return machoMagic, nil }
@@ -250,8 +251,8 @@ func TestShadowRewriteCoversTheSet(t *testing.T) {
 				t.Errorf("shadowRewrite(%s) = %q, %v; want %s", h, got.path, ok, filepath.Join(dir, e.Copy))
 				continue
 			}
-			if !slices.Equal(got.argv, argv) {
-				t.Errorf("shadowRewrite(%s) argv = %q, want it unchanged %q", h, got.argv, argv)
+			if want := shadowset.AppendFor(e.Copy, argv); !slices.Equal(got.argv, want) {
+				t.Errorf("shadowRewrite(%s) argv = %q, want %q (unchanged bar the entry's appends)", h, got.argv, want)
 			}
 		}
 	}
