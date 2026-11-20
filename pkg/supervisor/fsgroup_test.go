@@ -806,12 +806,15 @@ func TestFSGroupWalkCostIsBounded(t *testing.T) {
 	}
 }
 
-// changedCount counts the entries under root whose group is gid.
-func changedCount(t *testing.T, root string, gid int) int {
+// changedCount counts the entries under root the walk has changed. The trees
+// it is used on are made with owner-only modes, so a changed entry is one with
+// a group permission bit; the group itself would not tell, when the process
+// has only one group to chown to.
+func changedCount(t *testing.T, root string) int {
 	t.Helper()
 	n := 0
 	for _, st := range treeState(t, root) {
-		if int(st.Gid) == gid {
+		if st.Mode&0o070 != 0 {
 			n++
 		}
 	}
@@ -882,20 +885,27 @@ func TestFSGroupWalkBoundsFailClosed(t *testing.T) {
 		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupTreeTooLarge) {
 			t.Errorf("a tree of 45 entries with the budget at 20 = %v, want ErrFSGroupTreeTooLarge", err)
 		}
-		if n := changedCount(t, root, gid); n > 20 {
-			t.Errorf("%d entries were changed with the budget at 20", n)
+		if n := changedCount(t, root); n == 0 || n > 20 {
+			t.Errorf("%d entries were changed with the budget at 20, want some and at most 20", n)
 		}
 	})
-	t.Run("pending directories", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupPendingDirs, 10)
+	t.Run("waiting directories", func(t *testing.T) {
+		// Each waiting directory named dNNN is charged fsGroupNodeCost + 4
+		// bytes, so this budget pays for exactly ten of them.
+		lowerFSGroupBound(t, &maxFSGroupPendingBytes, 10*(fsGroupNodeCost+4))
 		podDir, root := wide(t, 10, 0)
 		gid := fsGroupTestGid(t, root)
 		if _, err := walkFSGroup(podDir, root, gid); err != nil {
-			t.Errorf("10 directories side by side with the budget at 10: %v", err)
+			t.Errorf("10 directories side by side with a budget for 10: %v", err)
 		}
 		podDir, root = wide(t, 30, 0)
 		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupTreeTooLarge) {
-			t.Errorf("30 directories side by side with the budget at 10 = %v, want ErrFSGroupTreeTooLarge", err)
+			t.Errorf("30 directories side by side with a budget for 10 = %v, want ErrFSGroupTreeTooLarge", err)
+		}
+		// The root and the ten the budget paid for, and not the eleventh: the
+		// bound is checked before a directory is changed.
+		if n := changedCount(t, root); n != 11 {
+			t.Errorf("%d directories were changed with a budget for 10 waiting, want the root and 10", n)
 		}
 	})
 }
@@ -935,8 +945,8 @@ func TestFSGroupWalkStopsWhenItsContextEnds(t *testing.T) {
 
 // TestFSGroupWalkPassesOverWhatIsGone: an entry a pod process deletes after
 // the walk listed it, a file or a whole directory still waiting to be listed,
-// is passed over, and the walk finishes the rest. Not changing what is gone
-// changes nothing.
+// is passed over and counted, and the walk finishes the rest. Not changing
+// what is gone changes nothing.
 func TestFSGroupWalkPassesOverWhatIsGone(t *testing.T) {
 	podDir := t.TempDir()
 	root := filepath.Join(podDir, "rootfs")
@@ -950,26 +960,35 @@ func TestFSGroupWalkPassesOverWhatIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	gid := fsGroupTestGid(t, root)
+	goneDir := filepath.Join(root, "a", "gone-dir")
 	removed := 0
 	setFSGroupHooks(t, func(path string) {
-		switch path {
-		case goneFile:
-			// Gone between the listing and the open.
+		// Gone between the listing and the open.
+		if path == goneFile {
 			if err := os.Remove(goneFile); err == nil {
 				removed++
 			}
-		case filepath.Join(root, "z"):
-			// A directory already changed and waiting to be listed goes away.
-			if err := os.RemoveAll(filepath.Join(root, "a", "gone-dir")); err == nil {
+		}
+	}, func(path string) {
+		// A directory goes away once the walk has changed it and is keeping
+		// it to list later.
+		if path == goneDir {
+			if err := os.RemoveAll(goneDir); err == nil {
 				removed++
 			}
 		}
-	}, nil)
-	if _, err := walkFSGroup(podDir, root, gid); err != nil {
+	})
+	rep, err := walkFSGroup(podDir, root, gid)
+	if err != nil {
 		t.Fatalf("the walk over a tree losing entries: %v", err)
 	}
 	if removed != 2 {
 		t.Fatalf("%d of the 2 removals ran; the test did not exercise the case", removed)
+	}
+	// Passed over, and said so: a create must not succeed with a subtree left
+	// unchanged and nothing to show for it.
+	if rep.Vanished != 2 || rep.Skipped() != 2 {
+		t.Errorf("report = %+v, want the file and the directory counted as vanished", rep)
 	}
 	if got := modeOf(t, filepath.Join(root, "z", "kept")); got.Perm() != 0o770 || got&os.ModeSetgid == 0 {
 		t.Errorf("a directory after the removed ones has mode %v, want group rwx and setgid", got)
@@ -1042,5 +1061,300 @@ func TestFSGroupWalkReportsWhatItSkips(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
 	if _, err := walkFSGroup(podDir, root, gid); err == nil {
 		t.Error("the walk skipped a directory it could not open")
+	}
+}
+
+// TestFSGroupMode pins the mode rule, including the part an unprivileged test
+// run cannot reach through the walk: a chown by root keeps setuid and setgid,
+// and a file that still has either does not get the owner's write bit copied
+// to the group.
+func TestFSGroupMode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		in           uint32
+		isDir        bool
+		want         uint32
+		wantWithheld bool
+	}{
+		{"a private file", 0o600, false, 0o660, false},
+		{"an executable", 0o755, false, 0o775, false},
+		{"a read-only file", 0o400, false, 0o440, false},
+		{"a directory gets setgid", 0o700, true, 0o2770, false},
+		{"a sticky directory keeps the bit", 0o1700, true, 0o3770, false},
+		{"a setuid file is not made group-writable", 0o4755, false, 0o4755, true},
+		{"a setgid file is not made group-writable", 0o2700, false, 0o2750, true},
+		{"a setuid file that is group-writable already stays so", 0o4775, false, 0o4775, false},
+		{"a setuid file its owner cannot write withholds nothing", 0o4555, false, 0o4555, false},
+		{"the file type bits are not part of the mode", unix.S_IFREG | 0o600, false, 0o660, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, withheld := fsGroupMode(tc.in, tc.isDir)
+			if got != tc.want || withheld != tc.wantWithheld {
+				t.Errorf("fsGroupMode(%o, %v) = (%o, %v), want (%o, %v)", tc.in, tc.isDir, got, withheld, tc.want, tc.wantWithheld)
+			}
+		})
+	}
+}
+
+// TestFSGroupWalkRechecksWhatItOpened: a name that is swapped, after the walk
+// read what it was, for a different kind of file that the same open still
+// opens, is caught by examining the descriptor, and nothing is changed. A
+// regular file replaced by a directory opens read-only; a symlink replaced by
+// a regular file opens under O_SYMLINK. Without the re-check the walk would
+// treat the one as a file and chown the other as a link.
+func TestFSGroupWalkRechecksWhatItOpened(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, p string) // what the walk lists
+		swap func(p string) error         // what it then finds
+	}{
+		{
+			name: "a regular file replaced by a directory",
+			make: func(t *testing.T, p string) {
+				if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			swap: func(p string) error {
+				if err := os.Remove(p); err != nil {
+					return err
+				}
+				return os.Mkdir(p, 0o700)
+			},
+		},
+		{
+			name: "a symlink replaced by a regular file",
+			make: func(t *testing.T, p string) {
+				if err := os.Symlink("nowhere", p); err != nil {
+					t.Fatal(err)
+				}
+			},
+			swap: func(p string) error {
+				if err := os.Remove(p); err != nil {
+					return err
+				}
+				return os.WriteFile(p, []byte("x"), 0o600)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !fsGroupCanOpenLinks {
+				t.Skip("links are not opened on this system")
+			}
+			podDir := t.TempDir()
+			root := filepath.Join(podDir, "rootfs")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			p := filepath.Join(root, "entry")
+			tc.make(t, p)
+			gid := fsGroupTestGid(t, root)
+			hook, ran := oneShot(t, p, func() error { return tc.swap(p) })
+			setFSGroupHooks(t, hook, nil)
+			base := openDescriptors(t)
+			_, err := walkFSGroup(podDir, root, gid)
+			if !*ran {
+				t.Fatal("the walk never reached the entry")
+			}
+			if !errors.Is(err, ErrFSGroupEntryChanged) {
+				t.Errorf("the walk = %v, want ErrFSGroupEntryChanged", err)
+			}
+			if got := modeOf(t, p).Perm(); got&0o070 != 0 {
+				t.Errorf("what replaced the entry has mode %o, want it untouched", got)
+			}
+			if after := openDescriptors(t); after != base {
+				t.Errorf("descriptors after the refused walk = %d, before = %d: the error path leaked", after, base)
+			}
+		})
+	}
+}
+
+// TestFSGroupWalkListsTheDirectoryItChanged: a directory that is replaced,
+// after the walk changed it and before its turn to be listed, by a different
+// directory of the same name is not listed: the walk recorded which directory
+// it changed (device and inode) and stops when the name leads elsewhere.
+func TestFSGroupWalkListsTheDirectoryItChanged(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	a := filepath.Join(root, "a")
+	if err := os.MkdirAll(a, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gid := fsGroupTestGid(t, root)
+	planted := filepath.Join(a, "planted")
+	hook, ran := oneShot(t, a, func() error {
+		if err := os.Rename(a, a+".moved"); err != nil {
+			return err
+		}
+		if err := os.Mkdir(a, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(planted, []byte("x"), 0o600)
+	})
+	// In the window after the directory was changed: the node the walk keeps
+	// for it names the original.
+	setFSGroupHooks(t, nil, hook)
+	base := openDescriptors(t)
+	_, err := walkFSGroup(podDir, root, gid)
+	if !*ran {
+		t.Fatal("the walk never reached the directory")
+	}
+	if !errors.Is(err, ErrFSGroupEntryChanged) {
+		t.Errorf("the walk = %v, want ErrFSGroupEntryChanged", err)
+	}
+	if got := modeOf(t, planted).Perm(); got != 0o600 {
+		t.Errorf("a file in the directory that took the name has mode %o, want it untouched", got)
+	}
+	if after := openDescriptors(t); after != base {
+		t.Errorf("descriptors after the refused walk = %d, before = %d: the error path leaked", after, base)
+	}
+}
+
+// TestFSGroupWalkErrorPathsLeakNothing: a walk stopped by a budget or by its
+// context closes every descriptor it had open, as one stopped by a changed
+// entry does (the tests above).
+func TestFSGroupWalkErrorPathsLeakNothing(t *testing.T) {
+	build := func(t *testing.T) (podDir, root string) {
+		podDir = t.TempDir()
+		root = filepath.Join(podDir, "rootfs")
+		for _, d := range []string{"a/b/c/d/e", "f/g/h", "i"} {
+			if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return podDir, root
+	}
+	t.Run("the entry budget", func(t *testing.T) {
+		lowerFSGroupBound(t, &maxFSGroupEntries, 5)
+		podDir, root := build(t)
+		gid := fsGroupTestGid(t, root)
+		base := openDescriptors(t)
+		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupTreeTooLarge) {
+			t.Fatalf("the walk = %v, want ErrFSGroupTreeTooLarge", err)
+		}
+		if after := openDescriptors(t); after != base {
+			t.Errorf("descriptors after = %d, before = %d", after, base)
+		}
+	})
+	t.Run("the depth bound", func(t *testing.T) {
+		lowerFSGroupBound(t, &maxFSGroupDepth, 2)
+		podDir, root := build(t)
+		gid := fsGroupTestGid(t, root)
+		base := openDescriptors(t)
+		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupTreeTooDeep) {
+			t.Fatalf("the walk = %v, want ErrFSGroupTreeTooDeep", err)
+		}
+		if after := openDescriptors(t); after != base {
+			t.Errorf("descriptors after = %d, before = %d", after, base)
+		}
+	})
+	t.Run("a cancelled context", func(t *testing.T) {
+		podDir, root := build(t)
+		gid := fsGroupTestGid(t, root)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		seen := 0
+		setFSGroupHooks(t, func(string) {
+			if seen++; seen == 4 {
+				cancel()
+			}
+		}, nil)
+		base := openDescriptors(t)
+		if _, err := ChownForFSGroup(ctx, podDir, root, gid); !errors.Is(err, context.Canceled) {
+			t.Fatalf("the walk = %v, want context.Canceled", err)
+		}
+		if after := openDescriptors(t); after != base {
+			t.Errorf("descriptors after = %d, before = %d", after, base)
+		}
+	})
+}
+
+// TestFSGroupWalkSkipsHardLinksInsideTheTree: hard links between two names in
+// the tree, as an image layer's extraction leaves them, are skipped and
+// reported like any other multiply-linked file. The walk cannot tell them from
+// a link that leads outside, and says what it left alone.
+func TestFSGroupWalkSkipsHardLinksInsideTheTree(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	bin := filepath.Join(root, "usr", "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"tool", "plain"} {
+		if err := os.WriteFile(filepath.Join(bin, f), []byte("x"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One program under three names, the way a layer ships a multi-call tool.
+	for _, alias := range []string{"alias-a", "alias-b"} {
+		if err := os.Link(filepath.Join(bin, "tool"), filepath.Join(bin, alias)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gid := fsGroupTestGid(t, root)
+	rep, err := walkFSGroup(podDir, root, gid)
+	if err != nil {
+		t.Fatalf("ChownForFSGroup: %v", err)
+	}
+	if rep.MultiLink != 3 || rep.Skipped() != 3 || len(rep.Examples) != 3 {
+		t.Errorf("report = %+v, want the three names of the linked file skipped and named", rep)
+	}
+	if got := modeOf(t, filepath.Join(bin, "tool")).Perm(); got != 0o700 {
+		t.Errorf("the hard-linked file has mode %o, want it untouched (0700)", got)
+	}
+	if got := modeOf(t, filepath.Join(bin, "plain")).Perm(); got != 0o770 {
+		t.Errorf("the file with one link has mode %o, want 0770", got)
+	}
+}
+
+// TestFSGroupWalkSkipCostIsBounded: skipping an entry costs no path. A pod
+// that puts many entries the walk skips at the bottom of a deep tree would
+// otherwise make the daemon build a path, in time proportional to the depth,
+// for each one. The walk builds a path only for the examples it keeps, and a
+// directory's path once per listing: for 400 skipped entries 150 levels down,
+// at most one build for the directory and none per entry beyond the kept
+// examples. Counted through the walk's seam, not timed.
+func TestFSGroupWalkSkipCostIsBounded(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	const depth, skipped = 150, 400
+	deep := root
+	for i := 0; i < depth; i++ {
+		deep = filepath.Join(deep, "d")
+	}
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(deep, "f000")
+	if err := os.WriteFile(first, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < skipped; i++ {
+		if err := os.Link(first, filepath.Join(deep, fmt.Sprintf("f%03d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gid := fsGroupTestGid(t, root)
+	builds := 0
+	fsGroupOnPathBuild = func() { builds++ }
+	t.Cleanup(func() { fsGroupOnPathBuild = nil })
+	rep, err := walkFSGroup(podDir, root, gid)
+	fsGroupOnPathBuild = nil
+	if err != nil {
+		t.Fatalf("ChownForFSGroup: %v", err)
+	}
+	if rep.MultiLink != skipped {
+		t.Fatalf("skipped %d entries, want %d", rep.MultiLink, skipped)
+	}
+	if len(rep.Examples) != fsGroupReportExamples {
+		t.Errorf("the report names %d entries, want %d", len(rep.Examples), fsGroupReportExamples)
+	}
+	if builds > 1 {
+		t.Errorf("the walk built %d paths for %d skipped entries in one directory, want at most 1", builds, skipped)
+	}
+	for _, ex := range rep.Examples {
+		if len(ex) > fsGroupExampleMax {
+			t.Errorf("an example is %d bytes, want at most %d", len(ex), fsGroupExampleMax)
+		}
 	}
 }
