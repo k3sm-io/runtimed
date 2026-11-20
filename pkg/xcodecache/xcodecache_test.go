@@ -277,6 +277,97 @@ func TestFailedStageLeavesSnapshotAndNoStage(t *testing.T) {
 	}
 }
 
+// redirectFS fails the first clone after leaving a partial tree at its
+// destination and swapping home/Library for a link to another tree, as a
+// process left over from an earlier instance of the pod could while the daemon
+// checks out. The cleanup that follows runs as root in production.
+type redirectFS struct {
+	apfsFS
+	home, elsewhere string
+}
+
+func (f *redirectFS) CloneAt(sfd int, src string, dfd int, dst string) error {
+	if err := unix.Mkdirat(dfd, dst, 0o700); err != nil {
+		return err
+	}
+	fd, err := unix.Openat(dfd, filepath.Join(dst, "partial"), unix.O_WRONLY|unix.O_CREAT, 0o600)
+	if err != nil {
+		return err
+	}
+	unix.Close(fd)
+	lib := filepath.Join(f.home, "Library")
+	if err := os.Rename(lib, lib+".moved"); err != nil {
+		return err
+	}
+	if err := os.Symlink(filepath.Join(f.elsewhere, "Library"), lib); err != nil {
+		return err
+	}
+	return errors.New("injected")
+}
+
+// The cleanup after a failed checkout removes what the daemon made, relative
+// to the directory it pinned. It must not remove the tree that the part's PATH
+// names by then: here that path leads through a link into another pod's home.
+func TestFailedCheckoutCleanupDoesNotFollowASwappedPath(t *testing.T) {
+	s := Store{Root: t.TempDir()}
+	src := t.TempDir()
+	writeHome(t, src, "x")
+	if _, err := s.Publish(entry, src, "p"); err != nil {
+		t.Fatal(err)
+	}
+	victim := t.TempDir()
+	writeHome(t, victim, "victim")
+	home := t.TempDir()
+	s.FS = &redirectFS{home: home, elsewhere: victim}
+	if _, err := s.Checkout(entry, home); err == nil {
+		t.Fatal("Checkout with a failing clone succeeded")
+	}
+	for _, p := range Parts {
+		if v := readPart(t, victim, p); v != "victim" {
+			t.Errorf("the other tree's %s = %q after the cleanup, want it untouched", p, v)
+		}
+	}
+	moved := filepath.Join(home, "Library.moved", strings.TrimPrefix(Parts[0], "Library/"))
+	if _, err := os.Lstat(moved); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the daemon's own partial clone was left behind at %s: %v", moved, err)
+	}
+}
+
+// removeTreeAt unlinks a link as a link and never descends through one.
+func TestRemoveTreeAtDoesNotFollowLinks(t *testing.T) {
+	keep := t.TempDir()
+	if err := os.WriteFile(filepath.Join(keep, "f"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "tree", "a", "b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tree", "a", "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(keep, filepath.Join(dir, "tree", "a", "b", "link")); err != nil {
+		t.Fatal(err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := removeTreeAt(int(d.Fd()), "tree"); err != nil {
+		t.Fatalf("removeTreeAt: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "tree")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("tree survived: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(keep, "f")); err != nil || string(b) != "keep" {
+		t.Errorf("the link's target was touched: %q, %v", b, err)
+	}
+	if err := removeTreeAt(int(d.Fd()), "tree"); err != nil {
+		t.Errorf("removing a name that is gone: %v", err)
+	}
+}
+
 func TestFailedCheckoutLeavesNoPartialPart(t *testing.T) {
 	s := Store{Root: t.TempDir()}
 	src := t.TempDir()

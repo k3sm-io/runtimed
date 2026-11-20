@@ -328,7 +328,10 @@ func (s Store) CheckoutAt(e Entry, base, homeRel string) ([]string, error) {
 		}
 		err = s.fs().CloneAt(unix.AT_FDCWD, src, int(parent.Fd()), name)
 		if err != nil {
-			_ = os.RemoveAll(filepath.Join(home, part))
+			// Removed relative to the pinned parent, never by path: the
+			// daemon runs this as root, and a path through the home could
+			// by now name another tree.
+			_ = removeTreeAt(int(parent.Fd()), name)
 		}
 		parent.Close()
 		if err != nil {
@@ -337,6 +340,53 @@ func (s Store) CheckoutAt(e Entry, base, homeRel string) ([]string, error) {
 		cloned = append(cloned, part)
 	}
 	return cloned, nil
+}
+
+// removeTreeAt removes name and everything below it, relative to the open
+// directory dirfd. It never follows a link: a link is unlinked as a link, and
+// each directory is opened with O_NOFOLLOW relative to its parent's
+// descriptor, so a component swapped for a link while it runs is refused
+// rather than descended. A name that is not there is not an error.
+func removeTreeAt(dirfd int, name string) error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		if err := unix.Unlinkat(dirfd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			return err
+		}
+		return nil
+	}
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	d := os.NewFile(uintptr(fd), name)
+	names, rerr := d.Readdirnames(-1)
+	var first error
+	for _, n := range names {
+		if err := removeTreeAt(fd, n); err != nil && first == nil {
+			first = err
+		}
+	}
+	d.Close()
+	if rerr != nil && first == nil {
+		first = rerr
+	}
+	if first != nil {
+		return first
+	}
+	if err := unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	return nil
 }
 
 // Publish replaces the entry's snapshot with a clone of the parts present in
