@@ -189,6 +189,24 @@ func TestXcodeCachePublishAtDelete(t *testing.T) {
 			wantSnapshot(t, rt, "old")
 		})
 	}
+	// A pod that swapped its home for a link gets nothing published through it.
+	t.Run("a home replaced by a symlink never publishes", func(t *testing.T) {
+		rt := xcodeCacheRuntime(t)
+		seedXcodeCache(t, rt, "old")
+		box := xcodeCacheBox(rt, "pod-xc-link", "app")
+		mustCreatePod(t, rt, box)
+		elsewhere := t.TempDir()
+		writeCacheParts(t, elsewhere, "stolen")
+		home := podHome(t, rt, box)
+		if err := os.RemoveAll(home); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(elsewhere, home); err != nil {
+			t.Fatal(err)
+		}
+		deleteWithPhase(t, rt, box, runtimev1.PodPhase_POD_PHASE_SUCCEEDED)
+		wantSnapshot(t, rt, "old")
+	})
 	// Deleting a pod this daemon does not hold publishes nothing.
 	t.Run("an unknown pod publishes nothing", func(t *testing.T) {
 		rt := xcodeCacheRuntime(t)

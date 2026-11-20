@@ -17,6 +17,7 @@ limitations under the License.
 package runtime
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,17 +27,6 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/xcodecache"
 )
-
-// podHomeName is the pod's home directory, one subdirectory of its data volume.
-// The cache checks its parts out under it at create and publishes them from it
-// at delete.
-//
-// TODO(xcode-defaults): share this const with the HOME/CFFIXED_USER_HOME
-// defaulting once both changes are on main; both name the same "home".
-const podHomeName = "home"
-
-// podHomeDir is the pod's home in its data volume.
-func podHomeDir(dataVol string) string { return filepath.Join(dataVol, podHomeName) }
 
 // xcodeCacheState is the daemon's view of the node's Xcode build cache: the
 // store, and the developer dir's Xcode build, read once per dir (a node fact
@@ -123,8 +113,11 @@ func (r *Runtime) checkoutXcodeCache(box *runtimev1.PodBox, dataVol string) {
 	}
 	log := r.log.With("pod", box.GetPodId(), "namespace", e.Namespace, "key", e.Key, "xcode_build", e.Build)
 	home := podHomeDir(dataVol)
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		log.Warn("xcode cache checkout skipped: create the pod home", "err", err)
+	// The home was provisioned earlier in this createPod (provisionPodHome,
+	// which every pod with the toolchain grant gets) and no container has run
+	// yet; a home that is not a real directory is refused, never followed.
+	if err := realPodHome(home); err != nil {
+		log.Warn("xcode cache checkout skipped", "err", err)
 		return
 	}
 	start := time.Now()
@@ -162,7 +155,21 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 	}
 	log := r.log.With("pod", box.GetPodId(), "namespace", e.Namespace, "key", e.Key, "xcode_build", e.Build)
 	store := r.xcodeCacheStore()
-	incoming, parts, err := store.Stage(e, podHomeDir(dataVol), box.GetPodId())
+	// The pod owns its data volume, so it could have replaced its home with a
+	// link; the home itself is checked here and every component below it by
+	// Stage. Residual, recorded: the walk is race-free only because the pod's
+	// processes are stopped, and a process that left the pod's process group
+	// (POSIX_SPAWN_SETSID, B1868) survives the stop and could still swap a
+	// directory for a link mid-clone. clonefile is given CLONE_NOFOLLOW and
+	// copies a link as a link, so such a race can publish a dangling or
+	// misleading link into the pod's own namespace's cache, never the content
+	// of a tree the pod could not read.
+	home := podHomeDir(dataVol)
+	if err := realPodHome(home); err != nil {
+		log.Warn("xcode cache publish skipped", "err", err)
+		return nil
+	}
+	incoming, parts, err := store.Stage(e, home, box.GetPodId())
 	if err != nil {
 		log.Warn("xcode cache publish skipped: stage", "err", err)
 		return nil
@@ -178,4 +185,16 @@ func (r *Runtime) stageXcodeCache(box *runtimev1.PodBox, dataVol string, succeed
 		}
 		log.Info("xcode cache published", "parts", parts, "took", time.Since(start).String())
 	}
+}
+
+// realPodHome reports whether home is a real directory (Lstat: not a link).
+func realPodHome(home string) error {
+	fi, err := os.Lstat(home)
+	if err != nil {
+		return fmt.Errorf("pod home: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("pod home %s is not a directory (%v)", home, fi.Mode().Type())
+	}
+	return nil
 }
