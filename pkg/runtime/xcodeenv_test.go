@@ -179,3 +179,19 @@ func TestProvisionPodHome(t *testing.T) {
 		t.Errorf("a re-provision rewrote the workload's git config: %q", b)
 	}
 }
+
+// TestProvisionPodHomeRefusesALink: a home that is a symlink (planted in the
+// pod's own data volume) is refused, never followed.
+func TestProvisionPodHomeRefusesALink(t *testing.T) {
+	dataVol := t.TempDir()
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, podHomeDir(dataVol)); err != nil {
+		t.Fatal(err)
+	}
+	if err := provisionPodHome(dataVol); err == nil {
+		t.Fatal("provisionPodHome followed a symlinked home")
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, podGitConfigName)); !os.IsNotExist(err) {
+		t.Errorf("a git config was written through the link (stat err %v)", err)
+	}
+}

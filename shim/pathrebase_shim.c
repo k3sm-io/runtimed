@@ -1021,7 +1021,10 @@ static void k3sm_refuse_required(const char *host) {
     static const char b[] = " in this pod: the node has no usable re-signed copy of it in its shadow "
                             "directory, and the original cannot work in a pod (it hangs or fails "
                             "without naming the cause). Run `sudo k3sm install` on the node (again "
-                            "after every Xcode update); `k3sm doctor` shows the shadow set.\n";
+                            "after every Xcode update). If the install skipped the copy (an "
+                            "Xcode not owned by root, or not signed by Apple), `k3sm doctor` "
+                            "names the reason, and only a root-owned, Apple-signed Xcode at "
+                            "/Applications/Xcode.app gets one.\n";
     (void)!write(2, a, sizeof(a) - 1);
     (void)!write(2, host, strlen(host));
     (void)!write(2, b, sizeof(b) - 1);
@@ -1224,8 +1227,10 @@ static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_sc
     }
     /* A Required host whose copy was not usable above: refused, never run.
      * Only on a node with a shadow set (K3SM_SHADOW_DIR), which is where the
-     * copy is expected to exist. */
-    if (pl->kind == K3SM_EXEC_ASIS && g_shadow_dir_len != 0 && k3sm_shadow_is_required(target)) {
+     * copy is expected to exist, and only when the copy was looked up: an
+     * argv past the rewrite bound skips the lookup and runs as before. */
+    if (pl->kind == K3SM_EXEC_ASIS && !too_many_args && g_shadow_dir_len != 0 &&
+        k3sm_shadow_is_required(target)) {
         pl->kind = K3SM_EXEC_REFUSE;
         pl->exec_path = target;
         return;

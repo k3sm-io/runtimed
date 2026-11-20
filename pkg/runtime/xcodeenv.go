@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -88,11 +89,16 @@ func podHomeDir(dataVol string) string { return filepath.Join(dataVol, podHomeNa
 // re-attached after a daemon restart keeps whatever its workload changed.
 func provisionPodHome(dataVol string) error {
 	home := podHomeDir(dataVol)
-	if err := os.MkdirAll(home, 0o700); err != nil {
+	// Never through a link: the data volume is the pod's, so a home that is
+	// not a real directory is refused rather than followed.
+	if fi, err := os.Lstat(home); err == nil && !fi.IsDir() {
+		return fmt.Errorf("pod home %s exists and is not a directory (%v)", home, fi.Mode().Type())
+	}
+	if err := os.Mkdir(home, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("create pod home %s: %w", home, err)
 	}
 	p := filepath.Join(home, podGitConfigName)
-	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if errors.Is(err, fs.ErrExist) {
 		return nil
 	}
