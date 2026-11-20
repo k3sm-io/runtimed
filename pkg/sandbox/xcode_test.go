@@ -536,6 +536,17 @@ func TestXcodeToolchainGrantReachesTheToolchain(t *testing.T) {
 		}
 	})
 
+	// actool and ibtool stat-walk their own path down from D to find ibtoold; a
+	// profile that grants D/usr/bin but not D/usr itself makes them print
+	// "Could not locate ibtoold." (exit 0, no output), and every asset catalog
+	// in an xcodebuild build fails. The plist is the proof the tool ran.
+	t.Run("actool-locates-ibtoold", func(t *testing.T) {
+		out, code := confined(t, filepath.Join(dir, "usr", "bin", "actool"), "--version")
+		if code != 0 || strings.Contains(out, "Could not locate ibtoold") || !strings.Contains(out, "<plist") {
+			t.Errorf("actool --version exited %d under the grant and printed:\n%s\nwant its version plist", code, out)
+		}
+	})
+
 	t.Run("swiftc-compiles-and-the-binary-runs", func(t *testing.T) {
 		src := filepath.Join(dataVol, "main.swift")
 		if err := os.WriteFile(src, []byte(`print("hello from a pod")`+"\n"), 0o644); err != nil {

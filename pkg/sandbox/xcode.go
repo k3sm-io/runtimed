@@ -379,6 +379,30 @@ func xcodeToolchainStanza(dir string) string {
 			metadata = append(metadata, anc)
 		}
 	}
+	// And the directories BETWEEN D and each granted subpath under it (D/usr,
+	// D/usr/share, D/Library/Frameworks, ...), which the walk above (ancestors
+	// of D) never reaches. actool and ibtool find ibtoold by stat-walking their
+	// own path: with D/usr unreadable they print "Could not locate ibtoold."
+	// and every asset catalog fails (measured on Xcode 27.1, the yureisha App).
+	// Existence only: listing usr names nothing the subpaths do not already.
+	literalSeen := map[string]bool{}
+	for _, l := range literals {
+		literalSeen[l] = true
+	}
+	for _, sp := range subpaths {
+		var between []string
+		for p := filepath.Dir(sp); strings.HasPrefix(p, dir+"/"); p = filepath.Dir(p) {
+			between = append(between, p)
+		}
+		for i := len(between) - 1; i >= 0; i-- {
+			p := between[i]
+			if metaSeen[p] || literalSeen[p] {
+				continue
+			}
+			metaSeen[p] = true
+			metadata = append(metadata, p)
+		}
+	}
 
 	var b strings.Builder
 	b.WriteString(";; xcode: developer-toolchain READ access (xcode_toolchain_dir) rooted\n")
