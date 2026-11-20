@@ -890,13 +890,12 @@ type Deps struct {
 	// startup reap checks before signalling a recorded survivor. Defaults to
 	// supervisor.ProcSessionID.
 	ProcSession func(pid int) (sid int, ok bool)
-	// PolicyProbe asks a process's Seatbelt policy whether it allows a write
-	// to a path, the identity the pod descendant sweep uses to find a pod's
-	// setsid descendants (sandbox.ProbeWritePolicy). It defaults to
-	// sandbox.ProbeWritePolicy ONLY when Spawner is also the default, for the
-	// ProcTable reason above; with an injected Spawner and no PolicyProbe the
-	// sweep is off.
-	PolicyProbe func(pid int, path string) (sandboxed, allowed, ok bool)
+	// PolicyProbe asks a process's Seatbelt policy whether it allows an
+	// operation on a path, the identity the pod descendant sweep uses to find
+	// a pod's setsid descendants. It defaults to sandbox.ProbePolicy ONLY when
+	// Spawner is also the default, for the ProcTable reason above; with an
+	// injected Spawner and no PolicyProbe the sweep is off.
+	PolicyProbe func(pid int, op sandbox.PolicyOp, path string) (sandboxed, allowed, ok bool)
 	// KillProcess signals one process by pid (a tree member, or a survivor a
 	// reap record names). Defaults to supervisor.KillPID.
 	KillProcess func(pid int, sig syscall.Signal) error
@@ -1168,7 +1167,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	}
 	var policyProbe podPolicyProbe = deps.PolicyProbe
 	if policyProbe == nil && deps.Spawner == nil {
-		policyProbe = sandbox.ProbeWritePolicy
+		policyProbe = sandbox.ProbePolicy
 	}
 	killProcess := deps.KillProcess
 	if killProcess == nil {

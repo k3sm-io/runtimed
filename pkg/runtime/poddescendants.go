@@ -1,5 +1,4 @@
 /*
-/*
 Copyright The k3sm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,7 @@ Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
+limitations under the License.
 */
 
 package runtime
@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // A native pod's processes are reaped by process group (DeletePod, the startup
@@ -34,62 +35,80 @@ import (
 //
 // What such a process cannot leave is its Seatbelt policy. Every process a pod
 // starts inherits the pod's policy, and neither setsid nor reparenting changes
-// it. The pod profile denies the whole pods root and re-allows only this pod's
-// own rootfs (sandbox.Generate), so a policy that allows a write to
-// <pods>/<id>/rootfs is this pod's and no other pod's. libsandbox answers that
-// question for a pid (sandbox.ProbeWritePolicy). Two measured facts shape the
-// check:
+// it. libsandbox answers, for a pid, whether its policy allows an operation on
+// a path (sandbox.ProbePolicy), so the pod's profile itself names its
+// processes. The profile (sandbox.Generate) denies the whole pods root and the
+// reap stores to every pod, and allows each pod a stat of its OWN pod dir, the
+// literal <pods>/<id> (the ancestor grant that lets a tool walk down to its
+// rootfs). A process is pod <id>'s when its policy says all of:
 //
-//   - an unsandboxed process (and a profile that allows everything) answers
-//     "allowed" for every path. So a member must ALSO be sandboxed and must be
-//     DENIED a write to the pods root itself, which every pod profile denies
-//     and no permissive profile does;
-//   - a path that does not exist answers "denied". So the grant probe is the
-//     rootfs directory, which exists for as long as the pod dir does; when it
-//     is gone the identity is unavailable and nothing is signalled.
+//   - it is sandboxed (an unsandboxed process answers "allowed" to everything);
+//   - a stat of <pods>/<id> is ALLOWED: no other pod's profile names that
+//     literal;
+//   - a stat of the reap store root is DENIED: every pod profile denies it,
+//     and a profile that lets its process stat the whole filesystem (an App
+//     Sandbox app, a permissive profile) does not;
+//   - a write to the pods root is DENIED, likewise.
+//
+// The probe RESOLVES its path (measured: a symlink answers for its target), so
+// every node named here is one a pod process cannot replace: all three sit
+// under the profile's pods-root and reap-store denies. The pod's rootfs, which
+// the pod can remove and replace with a link to another pod's, is deliberately
+// not part of the identity. A path that does not exist answers "denied", so
+// each node must exist; when one does not, the identity is unavailable and
+// nothing is signalled.
 //
 // The uid is never part of the identity: every pod runs as the same account.
 
-// podPolicyProbe asks a process's Seatbelt policy whether it allows a write to
-// path (sandbox.ProbeWritePolicy).
-type podPolicyProbe func(pid int, path string) (sandboxed, allowed, ok bool)
+// podPolicyProbe asks a process's Seatbelt policy whether it allows op on path
+// (sandbox.ProbePolicy).
+type podPolicyProbe func(pid int, op sandbox.PolicyOp, path string) (sandboxed, allowed, ok bool)
 
 // podIdentity is what a process's policy must say to be one of a pod's
-// processes: allow a write to grant (the pod's rootfs) and deny one to canary
-// (the pods root).
+// processes: allow a stat of anchor (the pod's own dir), deny a stat of
+// statCanary (the reap store root) and deny a write to writeCanary (the pods
+// root).
 type podIdentity struct {
-	grant, canary string
+	anchor, statCanary, writeCanary string
+}
+
+// valid reports whether the three nodes are set and distinct.
+func (id podIdentity) valid() bool {
+	return id.anchor != "" && id.statCanary != "" && id.writeCanary != "" &&
+		id.anchor != id.statCanary && id.anchor != id.writeCanary && id.statCanary != id.writeCanary
 }
 
 // holds reports whether pid's policy is this pod's. Every doubt (a failed
-// query, an unsandboxed process, a policy that allows the canary) answers false.
+// query, an unsandboxed process, a policy that allows a canary) answers false.
 func (id podIdentity) holds(probe podPolicyProbe, pid int) bool {
-	if probe == nil || id.grant == "" || id.canary == "" || id.grant == id.canary || pid <= 1 {
+	if probe == nil || !id.valid() || pid <= 1 {
 		return false
 	}
-	sb, own, ok := probe(pid, id.grant)
-	if !ok || !sb || !own {
+	if sb, own, ok := probe(pid, sandbox.PolicyReadMetadata, id.anchor); !ok || !sb || !own {
 		return false
 	}
-	sb, other, ok := probe(pid, id.canary)
-	return ok && sb && !other
+	if sb, any, ok := probe(pid, sandbox.PolicyReadMetadata, id.statCanary); !ok || !sb || any {
+		return false
+	}
+	sb, write, ok := probe(pid, sandbox.PolicyWriteData, id.writeCanary)
+	return ok && sb && !write
 }
 
 // podIdentityFor derives podID's identity, or ok=false when it cannot be probed:
-// an id that is not a legal pod id, or a rootfs that is not a real directory.
+// an id that is not a legal pod id, or a node that is not a real directory.
 func (r *Runtime) podIdentityFor(podID string) (podIdentity, bool) {
-	id, err := image.ParsePodID(podID)
+	pid, err := image.ParsePodID(podID)
 	if err != nil {
 		return podIdentity{}, false
 	}
-	grant, canary := r.cache.PodRootfs(id), r.cache.PodsRoot()
-	for _, dir := range []string{grant, canary} {
+	id := podIdentity{anchor: r.cache.PodDir(pid), statCanary: r.podReapRoot(), writeCanary: r.cache.PodsRoot()}
+	for _, dir := range []string{id.anchor, id.statCanary, id.writeCanary} {
 		fi, err := os.Lstat(dir)
 		if err != nil || !fi.IsDir() {
 			return podIdentity{}, false
 		}
 	}
-	return podIdentity{grant: grant, canary: canary}, true
+	return id, id.valid()
 }
 
 // podMember is one live process whose policy is the pod's, named by its exact
@@ -131,6 +150,11 @@ func (r *Runtime) signalMember(id podIdentity, m podMember, sig syscall.Signal) 
 	if !id.holds(r.policyProbe, m.pid) {
 		return false
 	}
+	// Once more after the policy queries, so the instance the policy vouched
+	// for is the one signalled.
+	if st, ok := r.procStart(m.pid); !ok || st != m.start {
+		return false
+	}
 	return r.killProcess(m.pid, sig) == nil
 }
 
@@ -162,7 +186,7 @@ func (r *Runtime) sweepPodDescendants(ctx context.Context, podID string, s podSw
 	}
 	id, ok := r.podIdentityFor(podID)
 	if !ok {
-		r.log.Warn("pod descendant sweep skipped: the pod's rootfs is gone, so its processes cannot be identified",
+		r.log.Warn("pod descendant sweep skipped: the pod dir or a reap store is gone, so its processes cannot be identified",
 			"pod", podID)
 		return 0
 	}

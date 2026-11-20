@@ -829,7 +829,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 // not one of them: the first phase stops it with the mains. The log-tail drain
 // adds at most drainGrace after it.
 func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
-	r.stopHostPod(ctx, p, hostStop{grace: podDefaultGrace(0, p)})
+	r.stopHostPod(ctx, p, hostStop{grace: podDefaultGrace(0, p), ownCreate: true})
 }
 
 // compileProfile compiles a host-process pod's SBPL profile from its spec and

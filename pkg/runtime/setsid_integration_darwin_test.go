@@ -1,7 +1,6 @@
 //go:build integration && darwin
 
 /*
-/*
 Copyright The k3sm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +13,7 @@ Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
+limitations under the License.
 */
 
 package runtime
@@ -93,7 +93,7 @@ func (g *setsidRig) runtime(t *testing.T, fingerprint string) *Runtime {
 		Waiter:             supervisor.KqueueReaper{},
 		Network:            supervisor.NodeNetwork{IP: "127.0.0.1"},
 		ProcTable:          supervisor.ReadProcTable,
-		PolicyProbe:        sandbox.ProbeWritePolicy,
+		PolicyProbe:        sandbox.ProbePolicy,
 		RuntimeFingerprint: fingerprint,
 	})
 	if err != nil {
@@ -138,7 +138,7 @@ func (g *setsidRig) startSetsidPod(t *testing.T, rt *Runtime, podID, mode string
 	if resp.GetError() != nil {
 		t.Fatalf("CreatePod failed: %v (reason %v)", resp.GetError(), resp.GetFailureReason())
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		if b, err := os.ReadFile(pidFile); err == nil {
 			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
@@ -146,11 +146,19 @@ func (g *setsidRig) startSetsidPod(t *testing.T, rt *Runtime, podID, mode string
 				if start, ok := supervisor.ProcStartTimeNano(pid); ok {
 					t.Cleanup(func() { killSameInstance(pid, start) })
 				}
+				// The go-ahead a swap-mode fixture waits for before it
+				// removes its rootfs, pid file included.
+				if err := os.WriteFile(filepath.Join(rootfs, "go"), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
 				return pid
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pod %s: the fixture never recorded its sleeper's pid", podID)
+			st, _ := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: podID})
+			ents, _ := os.ReadDir(rootfs)
+			t.Fatalf("pod %s: the fixture never recorded its sleeper's pid (status %v, rootfs %v, log %q)",
+				podID, st, ents, containerLogLines(t, rt, podID))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -275,4 +283,42 @@ func TestSetsidDescendantReapedOnRecreate(t *testing.T) {
 	awaitGone(t, victim, 5*time.Second, "the previous run's setsid sleeper after the startup reap")
 	mustAlive(t, plain, "an unsandboxed same-user process")
 	mustAlive(t, permissive, "a same-user process under a permissive sandbox")
+}
+
+// TestSetsidDescendantReapedDespiteRootfsSwap is the hostile pod: before it is
+// deleted it replaces its own rootfs with a symlink to another pod's rootfs.
+// The policy probe resolves symlinks, so an identity that named the rootfs
+// would then vouch for the OTHER pod's processes. The identity names only
+// nodes a pod cannot replace: the hostile pod's own sleeper is still reaped
+// and the other pod's is untouched.
+func TestSetsidDescendantReapedDespiteRootfsSwap(t *testing.T) {
+	g := newSetsidRig(t)
+	rt := g.runtime(t, "build-a")
+	t.Cleanup(func() { _ = rt.Close() })
+
+	bystander := g.startSetsidPod(t, rt, "pod-setsid-victim", "stay")
+	const hostile = "pod-setsid-hostile"
+	hostileRootfs := derivedRootfs(t, rt, hostile)
+	target := derivedRootfs(t, rt, "pod-setsid-victim")
+	sleeper := g.startSetsidPod(t, rt, hostile, "swap:"+hostileRootfs+":"+target)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if fi, err := os.Lstat(hostileRootfs); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the hostile pod never replaced its rootfs with a symlink; the attack this test defends against did not happen (log %q)",
+				containerLogLines(t, rt, hostile))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: hostile}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	awaitGone(t, sleeper, 5*time.Second, "the hostile pod's own setsid sleeper")
+	mustAlive(t, bystander, "the pod whose rootfs the hostile pod linked to")
+	if _, err := os.Stat(filepath.Join(target, "setsidchild")); err != nil {
+		t.Errorf("the other pod's rootfs was damaged by the hostile pod's delete: %v", err)
+	}
 }

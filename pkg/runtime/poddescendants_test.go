@@ -1,5 +1,4 @@
 /*
-/*
 Copyright The k3sm Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,7 @@ Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
+limitations under the License.
 */
 
 package runtime
@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -26,53 +27,70 @@ import (
 	"testing/synctest"
 	"time"
 
+	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // policyAnswer is a fake process's Seatbelt policy: whether it is sandboxed,
-// whether it allows a write to the pod's grant and to the canary, and whether
-// each query fails.
+// whether it allows a stat of the pod's dir, a stat of the reap store root and
+// a write to the pods root, and which query fails.
 type policyAnswer struct {
-	sandboxed, grant, canary bool
-	grantErr, canaryErr      bool
+	sandboxed, anchor, statCanary, writeCanary bool
+	failOn                                     string
 }
 
+// The four policies the identity must tell apart.
+var (
+	podPolicy        = policyAnswer{sandboxed: true, anchor: true}
+	otherPodPolicy   = policyAnswer{sandboxed: true}
+	unsandboxed      = policyAnswer{anchor: true, statCanary: true, writeCanary: true}
+	permissivePolicy = policyAnswer{sandboxed: true, anchor: true, statCanary: true, writeCanary: true}
+	// appSandboxPolicy stats the whole filesystem and writes none of it.
+	appSandboxPolicy = policyAnswer{sandboxed: true, anchor: true, statCanary: true}
+)
+
 func fakeProbe(id podIdentity, answers map[int]policyAnswer) podPolicyProbe {
-	return func(pid int, path string) (bool, bool, bool) {
+	return func(pid int, op sandbox.PolicyOp, path string) (bool, bool, bool) {
 		a, known := answers[pid]
 		if !known {
 			return false, false, false
 		}
-		switch path {
-		case id.grant:
-			return a.sandboxed, a.grant, !a.grantErr
-		case id.canary:
-			return a.sandboxed, a.canary, !a.canaryErr
+		switch {
+		case path == id.anchor && op == sandbox.PolicyReadMetadata:
+			return a.sandboxed, a.anchor, a.failOn != "anchor"
+		case path == id.statCanary && op == sandbox.PolicyReadMetadata:
+			return a.sandboxed, a.statCanary, a.failOn != "statCanary"
+		case path == id.writeCanary && op == sandbox.PolicyWriteData:
+			return a.sandboxed, a.writeCanary, a.failOn != "writeCanary"
 		}
-		// Any other path: a pod policy denies it, an unsandboxed process may.
-		return a.sandboxed, !a.sandboxed, true
+		// The identity asks nothing else; an unexpected query fails.
+		return false, false, false
 	}
 }
 
 // TestPodIdentityHolds pins the identity rule case by case: only a sandboxed
-// process whose policy allows the pod's rootfs AND denies the pods root is the
-// pod's, and every doubt answers "not the pod's".
+// process whose policy allows a stat of the pod's own dir AND denies both
+// canaries is the pod's, and every doubt answers "not the pod's".
 func TestPodIdentityHolds(t *testing.T) {
-	id := podIdentity{grant: "/r/pods/a/rootfs", canary: "/r/pods"}
+	id := podIdentity{anchor: "/r/pods/a", statCanary: "/r/podreap", writeCanary: "/r/pods"}
+	withFail := func(a policyAnswer, on string) policyAnswer { a.failOn = on; return a }
 	for _, tc := range []struct {
 		name string
 		a    policyAnswer
 		pid  int
 		want bool
 	}{
-		{"the pod's process", policyAnswer{sandboxed: true, grant: true}, 10, true},
-		{"unsandboxed same-user process (allows everything)", policyAnswer{grant: true, canary: true}, 10, false},
-		{"permissive sandbox (allows the pods root)", policyAnswer{sandboxed: true, grant: true, canary: true}, 10, false},
-		{"another pod's process (denied this rootfs)", policyAnswer{sandboxed: true}, 10, false},
-		{"grant query failed", policyAnswer{sandboxed: true, grant: true, grantErr: true}, 10, false},
-		{"canary query failed", policyAnswer{sandboxed: true, grant: true, canaryErr: true}, 10, false},
-		{"launchd", policyAnswer{sandboxed: true, grant: true}, 1, false},
-		{"pid zero", policyAnswer{sandboxed: true, grant: true}, 0, false},
+		{"the pod's process", podPolicy, 10, true},
+		{"unsandboxed same-user process (allows everything)", unsandboxed, 10, false},
+		{"permissive sandbox (allows everything)", permissivePolicy, 10, false},
+		{"app sandbox (stats everything, writes nothing here)", appSandboxPolicy, 10, false},
+		{"sandbox that stats only the pod dir but may write the pods root", policyAnswer{sandboxed: true, anchor: true, writeCanary: true}, 10, false},
+		{"another pod's process (denied this pod dir)", otherPodPolicy, 10, false},
+		{"anchor query failed", withFail(podPolicy, "anchor"), 10, false},
+		{"stat canary query failed", withFail(podPolicy, "statCanary"), 10, false},
+		{"write canary query failed", withFail(podPolicy, "writeCanary"), 10, false},
+		{"launchd", podPolicy, 1, false},
+		{"pid zero", podPolicy, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			probe := fakeProbe(id, map[int]policyAnswer{tc.pid: tc.a})
@@ -82,8 +100,17 @@ func TestPodIdentityHolds(t *testing.T) {
 		})
 	}
 	t.Run("degenerate identities never hold", func(t *testing.T) {
-		probe := func(int, string) (bool, bool, bool) { return true, true, true }
-		for _, bad := range []podIdentity{{}, {grant: "/x"}, {canary: "/x"}, {grant: "/x", canary: "/x"}} {
+		// A probe that would vouch for anything: allowed where the identity
+		// wants allowed, denied where it wants denied.
+		probe := func(_ int, op sandbox.PolicyOp, path string) (bool, bool, bool) {
+			return true, op == sandbox.PolicyReadMetadata && path == "/x", true
+		}
+		for _, bad := range []podIdentity{
+			{}, {anchor: "/x"}, {anchor: "/x", statCanary: "/y"},
+			{anchor: "/x", statCanary: "/x", writeCanary: "/z"},
+			{anchor: "/x", statCanary: "/y", writeCanary: "/x"},
+			{anchor: "/x", statCanary: "/y", writeCanary: "/y"},
+		} {
 			if bad.holds(probe, 10) {
 				t.Errorf("%+v holds", bad)
 			}
@@ -92,6 +119,55 @@ func TestPodIdentityHolds(t *testing.T) {
 			t.Error("a nil probe holds")
 		}
 	})
+}
+
+// TestPodIdentityNamesOnlyNodesAPodCannotReplace: the probe resolves symlinks,
+// so the identity must name the pod dir, the reap store root and the pods
+// root, and never the pod's rootfs, which the pod may replace with a link.
+func TestPodIdentityNamesOnlyNodesAPodCannotReplace(t *testing.T) {
+	rt := newTestRuntime(t, Deps{Spawner: &mcProbeSpawner{}, Waiter: newBlockingWaiter()})
+	const podID = "pod-idn"
+	rootfs := derivedRootfs(t, rt, podID)
+	if _, ok := rt.podIdentityFor(podID); ok {
+		t.Fatal("an identity was derived for a pod with no dir")
+	}
+	for _, dir := range []string{rootfs, rt.podReapRoot()} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id, ok := rt.podIdentityFor(podID)
+	if !ok {
+		t.Fatal("no identity for a pod whose dir exists")
+	}
+	want := podIdentity{anchor: filepath.Dir(rootfs), statCanary: rt.podReapRoot(), writeCanary: rt.cache.PodsRoot()}
+	if id != want {
+		t.Errorf("identity = %+v, want %+v", id, want)
+	}
+	// A pod that replaced its rootfs with a link to another pod's changes
+	// nothing the identity names.
+	if err := os.Remove(rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if again, ok := rt.podIdentityFor(podID); !ok || again != want {
+		t.Errorf("identity after the rootfs became a link = %+v (ok %v), want %+v", again, ok, want)
+	}
+	// A pod dir that is itself a link is refused.
+	if err := os.RemoveAll(filepath.Dir(rootfs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Dir(rootfs)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rt.podIdentityFor(podID); ok {
+		t.Error("an identity was derived through a symlinked pod dir")
+	}
+	if _, ok := rt.podIdentityFor("../escape"); ok {
+		t.Error("an identity was derived for an illegal pod id")
+	}
 }
 
 func TestStartupSweepPodIDs(t *testing.T) {
@@ -161,12 +237,14 @@ func sweepRig(t *testing.T, podID string, h *fakeHost, answers func(podIdentity)
 		ProcStartTime: h.start,
 		KillProcess:   h.kill,
 	})
-	if err := os.MkdirAll(derivedRootfs(t, rt, podID), 0o755); err != nil {
-		t.Fatal(err)
+	for _, dir := range []string{derivedRootfs(t, rt, podID), rt.podReapRoot()} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	id, ok := rt.podIdentityFor(podID)
 	if !ok {
-		t.Fatal("podIdentityFor: no identity for a pod whose rootfs exists")
+		t.Fatal("podIdentityFor: no identity for a pod whose dir exists")
 	}
 	rt.policyProbe = fakeProbe(id, answers(id))
 	return rt, id
@@ -174,20 +252,21 @@ func sweepRig(t *testing.T, podID string, h *fakeHost, answers func(podIdentity)
 
 // podMix: 100 and 101 are the pod's (101 ignores SIGTERM), 200 is another
 // pod's, 300 is an unsandboxed same-user process, 400 sits under a permissive
-// sandbox.
+// sandbox, 500 under an app sandbox.
 func podMix(podIdentity) map[int]policyAnswer {
 	return map[int]policyAnswer{
-		100: {sandboxed: true, grant: true},
-		101: {sandboxed: true, grant: true},
-		200: {sandboxed: true},
-		300: {grant: true, canary: true},
-		400: {sandboxed: true, grant: true, canary: true},
+		100: podPolicy,
+		101: podPolicy,
+		200: otherPodPolicy,
+		300: unsandboxed,
+		400: permissivePolicy,
+		500: appSandboxPolicy,
 	}
 }
 
 func newMixHost() *fakeHost {
 	return &fakeHost{
-		procs:   map[int]int64{100: 10, 101: 11, 200: 20, 300: 30, 400: 40},
+		procs:   map[int]int64{100: 10, 101: 11, 200: 20, 300: 30, 400: 40, 500: 50},
 		ignores: map[int]bool{101: true},
 	}
 }
@@ -213,8 +292,8 @@ func TestSweepPodDescendantsKillsOnlyThePods(t *testing.T) {
 			if got := alive(h, 100, 101); len(got) != 0 {
 				t.Errorf("pod processes %v survived", got)
 			}
-			if got := alive(h, 200, 300, 400); len(got) != 3 {
-				t.Errorf("only %v of the non-pod processes 200, 300, 400 survived", got)
+			if got := alive(h, 200, 300, 400, 500); len(got) != 4 {
+				t.Errorf("only %v of the non-pod processes 200, 300, 400, 500 survived", got)
 			}
 			want := []pidSignal{{100, syscall.SIGTERM}, {101, syscall.SIGTERM}, {101, syscall.SIGKILL}}
 			got := h.signals()
@@ -234,7 +313,7 @@ func TestSweepPodDescendantsKillsOnlyThePods(t *testing.T) {
 					t.Errorf("unexpected signal %v", s)
 				}
 			}
-			if got := alive(h, 200, 300, 400); len(got) != 3 {
+			if got := alive(h, 200, 300, 400, 500); len(got) != 4 {
 				t.Errorf("only %v of the non-pod processes survived", got)
 			}
 		})
@@ -273,11 +352,11 @@ func TestSweepPodDescendantsKillsOnlyThePods(t *testing.T) {
 			}
 		})
 	})
-	t.Run("a pod without a rootfs is not swept", func(t *testing.T) {
+	t.Run("a pod without a dir is not swept", func(t *testing.T) {
 		h := newMixHost()
 		rt, _ := sweepRig(t, "pod-swn", h, podMix)
 		if n := rt.sweepPodDescendants(context.Background(), "pod-gone", podSweep{}); n != 0 || len(h.signals()) != 0 {
-			t.Errorf("swept %d processes of a pod with no rootfs (signals %v)", n, h.signals())
+			t.Errorf("swept %d processes of a pod with no dir (signals %v)", n, h.signals())
 		}
 	})
 	t.Run("an unwired probe turns the sweep off", func(t *testing.T) {
