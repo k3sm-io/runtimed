@@ -89,6 +89,11 @@
   (literal "/Applications")
   (literal "/Applications/Xcode.app")
   (literal "/Applications/Xcode.app/Contents")
+  (literal "/Applications/Xcode.app/Contents/Developer/usr")
+  (literal "/Applications/Xcode.app/Contents/Developer/usr/share")
+  (literal "/Applications/Xcode.app/Contents/Developer/usr/libexec")
+  (literal "/Applications/Xcode.app/Contents/Developer/Library")
+  (literal "/Applications/Xcode.app/Contents/Developer/Library/Frameworks")
   )
 ;; carve: the helper .xpc/.app bundles inside the trees granted above
 ;; are not part of the interdependent dylib set, and some carry private

@@ -124,13 +124,22 @@ func shadowRewrite(path string, argv []string, rw execRewrite) (shadowExec, bool
 
 	if copyName, ok := shadowset.CopyFor(target); ok && rw.dir != "" {
 		if cp := filepath.Join(rw.dir, copyName); admit(cp) {
-			out := append([]string{}, argv...)
+			// The copy's appended arguments, exactly as the interposer
+			// appends them (shadowset.AppendFor, k3sm_fill_argv).
+			out := shadowset.AppendFor(copyName, argv)
 			if target == "/bin/sh" {
 				out[0] = asSh(out[0])
 			}
 			return shadowExec{path: cp, argv: out}, true
 		}
 	}
+	// Unlike the interposer, a Required host (shadowset.IsRequired) whose copy
+	// is refused is not refused here: the runtime's own spawn of a container
+	// whose command is Xcode's xcodebuild falls through to the host binary,
+	// with shadowExecFor's Warn naming sudo k3sm install, and the provider's
+	// XcodebuildCopyUnavailable Event says so on the pod. Refusing would fail a
+	// container start where the interposer fails one exec; the gap is recorded
+	// rather than closed.
 	if head, err := rw.readHead(target); err == nil {
 		if interp, arg, ok := parseShebang(head); ok {
 			script := func(file, name string) (shadowExec, bool) {

@@ -87,6 +87,57 @@ limitations under the License.
 			fmt.Fprintf(&b, "    {%s, %s},\n", strconv.Quote(h), strconv.Quote(e.Copy))
 		}
 	}
-	b.WriteString("};\n\n#endif /* K3SM_SHADOW_TABLE_H */\n")
+	b.WriteString("};\n\n")
+
+	// The arguments the swap appends to a copy's argv (shadowset.AppendFor),
+	// one row each, and the most any one copy gets, which sizes the rewritten
+	// argv. A NULL-terminated unless list per row; a row with none points at
+	// the shared empty list.
+	maxAppend := 0
+	for _, e := range entries {
+		maxAppend = max(maxAppend, len(e.AppendArgs))
+	}
+	fmt.Fprintf(&b, "/* The most arguments appended to one copy's argv. */\n#define K3SM_SHADOW_APPEND_MAX %d\n\n", maxAppend)
+	b.WriteString("static const char *const k3sm_append_unless_none[] = {NULL};\n")
+	n := 0
+	for _, e := range entries {
+		for _, a := range e.AppendArgs {
+			if len(a.UnlessAny) == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "static const char *const k3sm_append_unless_%d[] = {", n)
+			for _, u := range a.UnlessAny {
+				fmt.Fprintf(&b, "%s, ", strconv.Quote(u))
+			}
+			b.WriteString("NULL};\n")
+			n++
+		}
+	}
+	b.WriteString("\nstatic const struct {\n    const char *copy;\n    const char *arg;\n    const char *key;\n    const char *const *unless;\n} k3sm_shadow_append[] = {\n")
+	n = 0
+	for _, e := range entries {
+		for _, a := range e.AppendArgs {
+			unless := "k3sm_append_unless_none"
+			if len(a.UnlessAny) != 0 {
+				unless = fmt.Sprintf("k3sm_append_unless_%d", n)
+				n++
+			}
+			fmt.Fprintf(&b, "    {%s, %s, %s, %s},\n", strconv.Quote(e.Copy), strconv.Quote(a.Arg), strconv.Quote(a.Key), unless)
+		}
+	}
+	b.WriteString("    {NULL, NULL, NULL, NULL},\n};\n\n")
+
+	// The exec paths whose copy is Required: the interposer refuses an exec of
+	// one whose copy is not usable instead of running the host binary.
+	b.WriteString("static const char *const k3sm_shadow_required[] = {\n")
+	for _, e := range entries {
+		if !e.Required {
+			continue
+		}
+		for _, h := range e.Hosts {
+			fmt.Fprintf(&b, "    %s,\n", strconv.Quote(h))
+		}
+	}
+	b.WriteString("    NULL,\n};\n\n#endif /* K3SM_SHADOW_TABLE_H */\n")
 	return b.Bytes()
 }
