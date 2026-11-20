@@ -16,9 +16,21 @@ limitations under the License.
 
 package shadowset
 
+// XcodeDeveloperBin is the default Xcode install's developer-tool directory,
+// where every Relink entry's source lives.
+const XcodeDeveloperBin = "/Applications/Xcode.app/Contents/Developer/usr/bin"
+
 // XcodebuildSource is the xcodebuild the node copies: the one inside the
-// default Xcode install. Its copy is the only Relink entry.
-const XcodebuildSource = "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild"
+// default Xcode install.
+const XcodebuildSource = XcodeDeveloperBin + "/xcodebuild"
+
+// The asset-catalog and Interface Builder compilers the node copies (actool
+// and ibtool are launchers that exec ibtoold, which does the work).
+const (
+	ActoolSource  = XcodeDeveloperBin + "/actool"
+	IbtoolSource  = XcodeDeveloperBin + "/ibtool"
+	IbtooldSource = XcodeDeveloperBin + "/ibtoold"
+)
 
 // Entry is one re-signed copy and the exec paths it stands in for.
 type Entry struct {
@@ -48,6 +60,12 @@ type Entry struct {
 	// such a process as restricted (no DYLD_* and no per-pod user dirs), and
 	// the ad-hoc re-sign drops the entitlements, so the copy is not.
 	Entitled bool
+	// LibraryValidated marks a copy made because the source is signed with
+	// library validation (CodeDirectory flag 0x2000) and no entitlement:
+	// dyld then refuses the ad-hoc signed path-rebase shim, so a Foundation
+	// atomic write misses the shim's redirect and fails in the pod. The ad-hoc
+	// re-sign drops the flag, so the copy loads the shim.
+	LibraryValidated bool
 }
 
 // entries is the list. /bin/sh maps to the bash copy: /bin/sh is Apple's
@@ -118,6 +136,21 @@ var entries = []Entry{
 	{Copy: "xcodebuild", Source: XcodebuildSource,
 		Hosts:  []string{XcodebuildSource},
 		Relink: true, Entitled: true},
+
+	// The asset-catalog compilers (Xcode 27.1, the yureisha App). actool,
+	// ibtool and ibtoold are signed with library validation, so none of them
+	// loads the path-rebase shim, and ibtoold's atomic write of AppIcon.icns
+	// stages in the volume's .TemporaryItems, which the profile denies:
+	// "You don't have permission to save the file AppIcon.icns". actool and
+	// ibtool look for ibtoold beside themselves first, so the three copies
+	// sit together in the shadow directory and the launcher copies exec the
+	// ibtoold copy. Rooted at the default Xcode location, like xcodebuild.
+	{Copy: "actool", Source: ActoolSource, Hosts: []string{ActoolSource},
+		Relink: true, LibraryValidated: true},
+	{Copy: "ibtool", Source: IbtoolSource, Hosts: []string{IbtoolSource},
+		Relink: true, LibraryValidated: true},
+	{Copy: "ibtoold", Source: IbtooldSource, Hosts: []string{IbtooldSource},
+		Relink: true, LibraryValidated: true},
 }
 
 // byHost indexes entries by exec path.

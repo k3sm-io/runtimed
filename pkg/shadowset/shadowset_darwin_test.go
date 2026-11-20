@@ -53,6 +53,12 @@ func TestEntriesMatchTheDisk(t *testing.T) {
 				t.Fatalf("source %s is not a regular file (%v)", e.Source, lfi.Mode())
 			}
 			switch {
+			case e.LibraryValidated:
+				// Not SF_RESTRICTED and not entitled: the reason for the copy is
+				// the library-validation flag, which refuses the ad-hoc shim.
+				if !libraryValidated(t, e.Source) {
+					t.Errorf("source %s is not signed with library validation: it keeps the interposers without a copy", e.Source)
+				}
 			case e.Entitled:
 				// Not SF_RESTRICTED: the reason for the copy is the private
 				// entitlements, which make dyld and dirhelper treat it as restricted.
@@ -71,7 +77,7 @@ func TestEntriesMatchTheDisk(t *testing.T) {
 				if !fi.Mode().IsRegular() {
 					t.Errorf("exec path %s does not resolve to a regular file (%v)", h, fi.Mode())
 				}
-				if e.Entitled {
+				if e.Entitled || e.LibraryValidated {
 					// Its one exec path is the Source itself, which is not
 					// SF_RESTRICTED (checked above for the entitlement instead).
 					if !os.SameFile(fi, lfi) {
@@ -110,4 +116,15 @@ func hasPrivateEntitlement(t *testing.T, p string) bool {
 		t.Fatalf("codesign -d --entitlements %s: %v: %s", p, err, out)
 	}
 	return strings.Contains(string(out), "com.apple.private.")
+}
+
+// libraryValidated reports whether codesign shows the library-validation
+// CodeDirectory flag (0x2000) on p.
+func libraryValidated(t *testing.T, p string) bool {
+	t.Helper()
+	out, err := exec.Command("codesign", "-dv", p).CombinedOutput()
+	if err != nil {
+		t.Fatalf("codesign -dv %s: %v: %s", p, err, out)
+	}
+	return strings.Contains(string(out), "library-validation")
 }
