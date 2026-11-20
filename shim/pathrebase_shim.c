@@ -975,7 +975,7 @@ static int k3sm_trusted(const char *path, int want_dir) {
  * setting *is_sh when host is /bin/sh; else returns 0 (the caller then runs
  * the real function on the original path).
  */
-static int k3sm_shadow_copy(const char *host, char *buf, int *is_sh) {
+static int k3sm_shadow_copy(const char *host, char *buf, int *is_sh, const char **copy) {
     if (g_shadow_dir_len == 0 || host == NULL) {
         return 0;
     }
@@ -990,7 +990,54 @@ static int k3sm_shadow_copy(const char *host, char *buf, int *is_sh) {
             return 0;
         }
         *is_sh = strcmp(host, "/bin/sh") == 0;
+        if (copy != NULL) {
+            *copy = k3sm_shadow_map[i].copy;
+        }
         return 1;
+    }
+    return 0;
+}
+
+/*
+ * k3sm_shadow_is_required reports whether host's copy is Required
+ * (pkg/shadowset Entry.Required): the host binary cannot work in a pod
+ * without it, so an exec with no usable copy is refused rather than run.
+ */
+static int k3sm_shadow_is_required(const char *host) {
+    for (size_t i = 0; k3sm_shadow_required[i] != NULL; i++) {
+        if (strcmp(host, k3sm_shadow_required[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * k3sm_refuse_required tells the pod, on stderr, why an exec of a Required
+ * host binary was refused. write(2) only: this runs between fork and exec.
+ */
+static void k3sm_refuse_required(const char *host) {
+    static const char a[] = "k3sm: refusing to run ";
+    static const char b[] = " in this pod: the node has no usable re-signed copy of it in its shadow "
+                            "directory, and the original cannot work in a pod (it hangs or fails "
+                            "without naming the cause). Run `sudo k3sm install` on the node (again "
+                            "after every Xcode update). If the install skipped the copy (an "
+                            "Xcode not owned by root, or not signed by Apple), `k3sm doctor` "
+                            "names the reason, and only a root-owned, Apple-signed Xcode at "
+                            "/Applications/Xcode.app gets one.\n";
+    (void)!write(2, a, sizeof(a) - 1);
+    (void)!write(2, host, strlen(host));
+    (void)!write(2, b, sizeof(b) - 1);
+}
+
+/* k3sm_argv_has reports whether argv[1..argc) holds s, or s=<value> when
+ * as_key (pkg/shadowset argvHasKey / argvHasAny). */
+static int k3sm_argv_has(char *const argv[], size_t argc, const char *s, int as_key) {
+    size_t n = strlen(s);
+    for (size_t i = 1; i < argc; i++) {
+        if (strcmp(argv[i], s) == 0 || (as_key && strncmp(argv[i], s, n) == 0 && argv[i][n] == '=')) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -1096,12 +1143,13 @@ static void k3sm_report(const char *target) {
 }
 
 /* What an exec becomes. */
-enum { K3SM_EXEC_ASIS, K3SM_EXEC_PATH, K3SM_EXEC_DIRECT, K3SM_EXEC_SCRIPT };
+enum { K3SM_EXEC_ASIS, K3SM_EXEC_PATH, K3SM_EXEC_DIRECT, K3SM_EXEC_SCRIPT, K3SM_EXEC_REFUSE };
 
 typedef struct {
     int kind;
     const char *exec_path;  /* the file to exec (all kinds but ASIS) */
     const char *argv0;      /* DIRECT: the new argv[0], or NULL to keep it */
+    const char *copy;       /* DIRECT: the copy's name (its appended arguments) */
     const char *interp_name; /* SCRIPT: argv[0] (the interpreter as written) */
     const char *script;     /* SCRIPT: the (rebased) script path */
     int report;              /* the exec runs a restricted binary, unshimmed */
@@ -1147,8 +1195,9 @@ static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_sc
     const char *runs = target; /* what the kernel will execute */
     int moved = target != path;
     int is_sh = 0;
+    pl->copy = NULL;
     if (!too_many_args && argv != NULL) {
-        if (k3sm_shadow_copy(target, pl->copy_buf, &is_sh)) {
+        if (k3sm_shadow_copy(target, pl->copy_buf, &is_sh, &pl->copy)) {
             pl->kind = K3SM_EXEC_DIRECT;
             pl->exec_path = pl->copy_buf;
             pl->argv0 = NULL;
@@ -1160,7 +1209,7 @@ static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_sc
         if (may_read_script && (g_shadow_dir_len != 0 || g_cfg.enabled) &&
             k3sm_shebang(target, pl->interp, pl->arg)) {
             const char *ri = k3sm_rebase(pl->interp, pl->interp_buf);
-            if (k3sm_shadow_copy(pl->interp, pl->copy_buf, &is_sh)) {
+            if (k3sm_shadow_copy(pl->interp, pl->copy_buf, &is_sh, NULL)) {
                 pl->kind = K3SM_EXEC_SCRIPT;
                 pl->exec_path = pl->copy_buf;
                 pl->interp_name = is_sh && !k3sm_basename_is_sh(pl->interp) ? "sh" : pl->interp;
@@ -1175,6 +1224,16 @@ static void k3sm_plan_exec(const char *path, char *const argv[], int may_read_sc
                 pl->script = target;
             }
         }
+    }
+    /* A Required host whose copy was not usable above: refused, never run.
+     * Only on a node with a shadow set (K3SM_SHADOW_DIR), which is where the
+     * copy is expected to exist, and only when the copy was looked up: an
+     * argv past the rewrite bound skips the lookup and runs as before. */
+    if (pl->kind == K3SM_EXEC_ASIS && !too_many_args && g_shadow_dir_len != 0 &&
+        k3sm_shadow_is_required(target)) {
+        pl->kind = K3SM_EXEC_REFUSE;
+        pl->exec_path = target;
+        return;
     }
     if (pl->kind == K3SM_EXEC_ASIS && moved) {
         pl->kind = K3SM_EXEC_PATH;
@@ -1200,7 +1259,7 @@ static size_t k3sm_argc(char *const argv[]) {
 }
 
 /* k3sm_fill_argv writes the rewritten vector for a DIRECT or SCRIPT plan into
- * nargv (capacity argc + 3, the caller's VLA). */
+ * nargv (capacity argc + 3 + K3SM_SHADOW_APPEND_MAX, the caller's VLA). */
 static void k3sm_fill_argv(const k3sm_exec_plan_t *pl, char *const argv[], size_t argc, char **nargv) {
     size_t j = 0;
     if (pl->kind == K3SM_EXEC_DIRECT) {
@@ -1212,6 +1271,23 @@ static void k3sm_fill_argv(const k3sm_exec_plan_t *pl, char *const argv[], size_
                 j = 1;
             }
             nargv[0] = (char *)pl->argv0;
+        }
+        /* The copy's appended arguments (pkg/shadowset AppendFor), each unless
+         * the caller passed its key or one of its unless arguments. */
+        for (size_t k = 0; pl->copy != NULL && j > 0 && k3sm_shadow_append[k].copy != NULL; k++) {
+            if (strcmp(k3sm_shadow_append[k].copy, pl->copy) != 0 ||
+                k3sm_argv_has(argv, argc, k3sm_shadow_append[k].key, 1)) {
+                continue;
+            }
+            int unless = 0;
+            for (size_t u = 0; k3sm_shadow_append[k].unless[u] != NULL; u++) {
+                if (k3sm_argv_has(argv, argc, k3sm_shadow_append[k].unless[u], 0)) {
+                    unless = 1;
+                }
+            }
+            if (!unless) {
+                nargv[j++] = (char *)k3sm_shadow_append[k].arg;
+            }
         }
         nargv[j] = NULL;
         return;
@@ -1245,11 +1321,15 @@ int k3sm_execve(const char *path, char *const argv[], char *const envp_in[]) {
         k3sm_report(pl.report_target);
     }
     switch (pl.kind) {
+    case K3SM_EXEC_REFUSE:
+        k3sm_refuse_required(pl.exec_path);
+        errno = ENOEXEC;
+        return -1;
     case K3SM_EXEC_PATH:
         return execve(pl.exec_path, argv, envp);
     case K3SM_EXEC_DIRECT:
     case K3SM_EXEC_SCRIPT: {
-        char *nargv[argc + 3]; /* sized only now, argc <= K3SM_MAX_REWRITE_ARGC */
+        char *nargv[argc + 3 + K3SM_SHADOW_APPEND_MAX]; /* sized only now, argc <= K3SM_MAX_REWRITE_ARGC */
         k3sm_fill_argv(&pl, argv, argc, nargv);
         return execve(pl.exec_path, nargv, envp);
     }
@@ -1273,12 +1353,16 @@ int k3sm_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_action
     k3sm_plan_exec(path, argv, may_read, fa == NULL, argc > K3SM_MAX_REWRITE_ARGC, &pl);
     int rc;
     switch (pl.kind) {
+    case K3SM_EXEC_REFUSE:
+        k3sm_refuse_required(pl.exec_path);
+        rc = ENOEXEC;
+        break;
     case K3SM_EXEC_PATH:
         rc = posix_spawn(pid, pl.exec_path, fa, attr, argv, envp);
         break;
     case K3SM_EXEC_DIRECT:
     case K3SM_EXEC_SCRIPT: {
-        char *nargv[argc + 3]; /* sized only now, argc <= K3SM_MAX_REWRITE_ARGC */
+        char *nargv[argc + 3 + K3SM_SHADOW_APPEND_MAX]; /* sized only now, argc <= K3SM_MAX_REWRITE_ARGC */
         k3sm_fill_argv(&pl, argv, argc, nargv);
         rc = posix_spawn(pid, pl.exec_path, fa, attr, nargv, envp);
         break;

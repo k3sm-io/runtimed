@@ -16,9 +16,21 @@ limitations under the License.
 
 package shadowset
 
+// XcodeDeveloperBin is the default Xcode install's developer-tool directory,
+// where every Relink entry's source lives.
+const XcodeDeveloperBin = "/Applications/Xcode.app/Contents/Developer/usr/bin"
+
 // XcodebuildSource is the xcodebuild the node copies: the one inside the
-// default Xcode install. Its copy is the only Relink entry.
-const XcodebuildSource = "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild"
+// default Xcode install.
+const XcodebuildSource = XcodeDeveloperBin + "/xcodebuild"
+
+// The asset-catalog and Interface Builder compilers the node copies (actool
+// and ibtool are launchers that exec ibtoold, which does the work).
+const (
+	ActoolSource  = XcodeDeveloperBin + "/actool"
+	IbtoolSource  = XcodeDeveloperBin + "/ibtool"
+	IbtooldSource = XcodeDeveloperBin + "/ibtoold"
+)
 
 // Entry is one re-signed copy and the exec paths it stands in for.
 type Entry struct {
@@ -48,6 +60,113 @@ type Entry struct {
 	// such a process as restricted (no DYLD_* and no per-pod user dirs), and
 	// the ad-hoc re-sign drops the entitlements, so the copy is not.
 	Entitled bool
+	// LibraryValidated marks a copy made because the source is signed with
+	// library validation (CodeDirectory flag 0x2000) and no entitlement:
+	// dyld then refuses the ad-hoc signed path-rebase shim, so a Foundation
+	// atomic write misses the shim's redirect and fails in the pod. The ad-hoc
+	// re-sign drops the flag, so the copy loads the shim.
+	LibraryValidated bool
+	// Required marks a copy without which the host binary cannot work in a
+	// pod at all (it hangs or fails in ways that do not name the cause). The
+	// path-rebase shim refuses an exec of a Host whose copy is missing or not
+	// trusted, with a message naming sudo k3sm install, instead of running the
+	// host binary.
+	Required bool
+	// AppendArgs are arguments the exec swap appends to argv when it runs
+	// the copy (AppendFor).
+	AppendArgs []AppendArg
+}
+
+// AppendArg is one argument the swap appends to a copy's argv.
+type AppendArg struct {
+	// Arg is the argument appended, such as "SWIFTC_DISABLE_SANDBOX=YES".
+	Arg string
+	// Key suppresses the append when argv[1:] already carries it, as the
+	// argument itself or as Key=<value>: the caller's own value wins.
+	Key string
+	// UnlessAny suppresses the append when argv[1:] carries any of these
+	// arguments (a tool mode of the copy that would reject Arg).
+	UnlessAny []string
+}
+
+// AppendFor returns argv with copy's AppendArgs appended, each unless argv
+// already carries its Key or one of its UnlessAny arguments. argv itself is
+// never modified; with nothing to append the result equals argv.
+func AppendFor(copy string, argv []string) []string {
+	out := append([]string{}, argv...)
+	for _, e := range entries {
+		if e.Copy != copy {
+			continue
+		}
+		for _, a := range e.AppendArgs {
+			if argvHasKey(argv, a.Key) || argvHasAny(argv, a.UnlessAny) {
+				continue
+			}
+			out = append(out, a.Arg)
+		}
+	}
+	return out
+}
+
+func argvHasKey(argv []string, key string) bool {
+	for i := 1; i < len(argv); i++ {
+		if argv[i] == key || (len(argv[i]) > len(key) && argv[i][:len(key)+1] == key+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func argvHasAny(argv []string, any []string) bool {
+	for i := 1; i < len(argv); i++ {
+		for _, a := range any {
+			if argv[i] == a {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsRequired reports whether host is an exec path of a Required entry.
+func IsRequired(host string) bool {
+	i, ok := byHost[host]
+	return ok && entries[i].Required
+}
+
+// MaxAppendArgs is the most arguments AppendFor adds for any one copy, which
+// sizes the interposer's rewritten argv.
+func MaxAppendArgs() int {
+	n := 0
+	for _, e := range entries {
+		n = max(n, len(e.AppendArgs))
+	}
+	return n
+}
+
+// xcodebuildToolModes are the xcodebuild modes that load no project and
+// reject a build setting on the command line.
+var xcodebuildToolModes = []string{
+	"-create-xcframework", "-exportArchive", "-exportLocalizations",
+	"-importLocalizations", "-exportNotarizedApp",
+}
+
+// xcodebuildAppendArgs turn off the three nested sandboxes an xcodebuild build
+// starts, each of which macOS refuses inside the pod's own Seatbelt sandbox:
+// SwiftPM's manifest evaluation and its package plug-ins (sandbox-exec:
+// "sandbox_apply: Operation not permitted", so no package dependency
+// resolves), and the Swift compiler's macro plug-in server ("swift-plugin-server
+// produced malformed response"). The first two are user defaults that only the
+// argument domain reaches, because a pod reaches no cfprefsd: defaults write
+// and a Preferences plist were both measured to have no effect. The third is a
+// build setting, which xcodebuild does not take from the environment. Turning
+// them off runs the manifest, the plug-ins and the macros in the pod's own
+// sandbox, the same confinement swift build --disable-sandbox gives (the
+// documented SwiftPM setting for a pod).
+var xcodebuildAppendArgs = []AppendArg{
+	{Arg: "-IDEPackageSupportDisableManifestSandbox=YES", Key: "-IDEPackageSupportDisableManifestSandbox"},
+	{Arg: "-IDEPackageSupportDisablePluginExecutionSandbox=YES", Key: "-IDEPackageSupportDisablePluginExecutionSandbox"},
+	{Arg: "SWIFTC_DISABLE_SANDBOX=YES", Key: "SWIFTC_DISABLE_SANDBOX", UnlessAny: xcodebuildToolModes},
 }
 
 // entries is the list. /bin/sh maps to the bash copy: /bin/sh is Apple's
@@ -117,7 +236,22 @@ var entries = []Entry{
 	{Copy: "xcrun", Source: "/usr/bin/xcrun", Hosts: []string{"/usr/bin/xcrun"}},
 	{Copy: "xcodebuild", Source: XcodebuildSource,
 		Hosts:  []string{XcodebuildSource},
-		Relink: true, Entitled: true},
+		Relink: true, Entitled: true, Required: true, AppendArgs: xcodebuildAppendArgs},
+
+	// The asset-catalog compilers (Xcode 27.1, the yureisha App). actool,
+	// ibtool and ibtoold are signed with library validation, so none of them
+	// loads the path-rebase shim, and ibtoold's atomic write of AppIcon.icns
+	// stages in the volume's .TemporaryItems, which the profile denies:
+	// "You don't have permission to save the file AppIcon.icns". actool and
+	// ibtool look for ibtoold beside themselves first, so the three copies
+	// sit together in the shadow directory and the launcher copies exec the
+	// ibtoold copy. Rooted at the default Xcode location, like xcodebuild.
+	{Copy: "actool", Source: ActoolSource, Hosts: []string{ActoolSource},
+		Relink: true, LibraryValidated: true, Required: true},
+	{Copy: "ibtool", Source: IbtoolSource, Hosts: []string{IbtoolSource},
+		Relink: true, LibraryValidated: true, Required: true},
+	{Copy: "ibtoold", Source: IbtooldSource, Hosts: []string{IbtooldSource},
+		Relink: true, LibraryValidated: true, Required: true},
 }
 
 // byHost indexes entries by exec path.
@@ -136,6 +270,10 @@ func Entries() []Entry {
 	out := make([]Entry, len(entries))
 	for i, e := range entries {
 		e.Hosts = append([]string(nil), e.Hosts...)
+		e.AppendArgs = append([]AppendArg(nil), e.AppendArgs...)
+		for j := range e.AppendArgs {
+			e.AppendArgs[j].UnlessAny = append([]string(nil), e.AppendArgs[j].UnlessAny...)
+		}
 		out[i] = e
 	}
 	return out
