@@ -725,6 +725,12 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// wide to be a real second layer — <PodsRoot>/<victim-id>/rootfs is strictly
 	// under it, so it would wave through the cross-pod case that is hazard #1 for
 	// the primary guard, and the two layers would fail together.
+	//
+	// The pod dir is also where the walk pins itself: it opens the pod dir,
+	// which a pod cannot replace, and reaches the rootfs and everything below
+	// it without following a link, so a rootfs or a directory the pod swapped
+	// for a link (a process of an earlier instance can still be running) is
+	// not walked into another pod's tree.
 	podDir, err := r.podDir(box.GetPodId())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
