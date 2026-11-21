@@ -33,18 +33,15 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// outcomeBound is how long a test waits for an outcome that should arrive
-// almost at once. It only turns a hang into a failure; no test asserts an upper
-// time, so a loaded host is slow, never red.
-const outcomeBound = 60 * time.Second
-
 // readResult is one Read's return values, carried off a goroutine.
 type readResult struct {
 	n   int
 	err error
 }
 
-// readAsync runs one Read of s on a goroutine and returns where its result lands.
+// readAsync runs one Read of s on a goroutine and returns where its result
+// lands. Callers receive from it with no timer: a Read that never returns is
+// caught by go test -timeout.
 func readAsync(s *stallReader) <-chan readResult {
 	done := make(chan readResult, 1)
 	go func() {
@@ -52,18 +49,6 @@ func readAsync(s *stallReader) <-chan readResult {
 		done <- readResult{n, err}
 	}()
 	return done
-}
-
-// awaitRead waits for a Read started by readAsync, failing with msg if it never returns.
-func awaitRead(t *testing.T, done <-chan readResult, msg string) readResult {
-	t.Helper()
-	select {
-	case r := <-done:
-		return r
-	case <-time.After(outcomeBound):
-		t.Fatal(msg)
-		return readResult{}
-	}
 }
 
 // countingCloser is a pipe reader whose Close is counted and returns err, so a
@@ -84,7 +69,7 @@ func (c *countingCloser) Close() error {
 // (newStallReader, a real time.AfterFunc) under -race: a body.Read that blocks
 // is cut with the sentinel, the stall stays reported, and Close afterwards
 // returns the one body.Close error without closing the body twice. The window
-// is short and the wait on the outcome is generous; nothing asserts how fast
+// is short and the wait on the outcome has no timer; nothing asserts how fast
 // the watchdog fired.
 func TestStallReaderRealTimer(t *testing.T) {
 	pr, pw := io.Pipe()
@@ -93,7 +78,9 @@ func TestStallReaderRealTimer(t *testing.T) {
 	body := &countingCloser{PipeReader: pr, err: closeErr}
 	s := newStallReader(body, 5*time.Millisecond, nil)
 
-	r := awaitRead(t, readAsync(s), "Read never returned: the real watchdog never closed the blocked body")
+	// The body blocks until it is closed, so only the watchdog can end this
+	// Read; how soon it fires changes nothing the test asserts.
+	r := <-readAsync(s)
 	if r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
 		t.Fatalf("Read = %d, %v; want 0, ErrLayerBodyStalled", r.n, r.err)
 	}
@@ -198,11 +185,11 @@ func TestStallReaderClose(t *testing.T) {
 			name: "Close after the watchdog fired",
 			run: func(t *testing.T, s *stallReader, ft *fakeTimer) error {
 				done := readAsync(s)
-				waitArmed(t, ft, "the Read never armed the watchdog")
+				waitArmed(ft)
 				if !ft.advance(window) {
 					t.Fatal("watchdog did not fire at a whole window")
 				}
-				return awaitRead(t, done, "Read never returned after the watchdog fired").err
+				return (<-done).err
 			},
 			readErrs: []error{ErrLayerBodyStalled},
 		},
@@ -210,13 +197,13 @@ func TestStallReaderClose(t *testing.T) {
 			name: "Close racing a fire",
 			run: func(t *testing.T, s *stallReader, ft *fakeTimer) error {
 				done := readAsync(s)
-				waitArmed(t, ft, "the Read never armed the watchdog")
+				waitArmed(ft)
 				var wg sync.WaitGroup
 				wg.Add(2)
 				go func() { defer wg.Done(); ft.advance(window) }()
 				go func() { defer wg.Done(); _ = s.Close() }()
 				wg.Wait()
-				return awaitRead(t, done, "Read never returned after Close raced the watchdog").err
+				return (<-done).err
 			},
 			// Close first: the timer is stopped and the Read sees the closed
 			// body; the fire first: the Read reports the stall.
@@ -226,11 +213,11 @@ func TestStallReaderClose(t *testing.T) {
 			name: "Close racing a Read in flight",
 			run: func(t *testing.T, s *stallReader, ft *fakeTimer) error {
 				done := readAsync(s)
-				waitArmed(t, ft, "the Read never armed the watchdog")
+				waitArmed(ft)
 				if err := s.Close(); err != closeErr {
 					t.Fatalf("Close = %v, want the body's close error", err)
 				}
-				r := awaitRead(t, done, "Read never returned after Close: the body was not closed")
+				r := <-done
 				if ft.advance(10 * window) {
 					t.Fatal("watchdog fired after Close stopped it")
 				}
@@ -246,7 +233,7 @@ func TestStallReaderClose(t *testing.T) {
 				if err := s.Close(); err != closeErr {
 					t.Fatalf("Close = %v, want the body's close error", err)
 				}
-				return awaitRead(t, done, "Read never returned after Close").err
+				return (<-done).err
 			},
 			readErrs: []error{io.ErrClosedPipe},
 		},
@@ -258,7 +245,7 @@ func TestStallReaderClose(t *testing.T) {
 			defer pw.Close()
 			body := &countingCloser{PipeReader: pr, err: closeErr}
 			s := newFakeStallReader(body, window, ft)
-			waitArmed(t, ft, "the stopped timer start created never armed")
+			waitArmed(ft)
 
 			readErr := tt.run(t, s, ft)
 			if len(tt.readErrs) > 0 && !isOneOf(readErr, tt.readErrs) {
@@ -284,13 +271,13 @@ func TestStallReaderClose(t *testing.T) {
 		ft := newFakeTimer()
 		body := &unwindingReader{ft: ft, window: window, closed: make(chan struct{})}
 		s := newFakeStallReader(body, window, ft)
-		waitArmed(t, ft, "the stopped timer start created never armed")
+		waitArmed(ft)
 		done := readAsync(s)
-		waitArmed(t, ft, "the Read never armed the watchdog")
+		waitArmed(ft)
 		if err := s.Close(); err != nil {
 			t.Fatalf("Close = %v, want nil", err)
 		}
-		r := awaitRead(t, done, "Read never returned after Close")
+		r := <-done
 		if body.fired.Load() {
 			t.Fatal("the watchdog fired after Close: Close did not stop the timer")
 		}
@@ -362,31 +349,11 @@ func TestLayerPullRetryAfterStall(t *testing.T) {
 	}
 	p := mustPullerIndex(t, cache, RemoteFetch, NoLocalIndex{})
 
-	pull := func(msg string) (*PullResult, error) {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), outcomeBound)
-		defer cancel()
-		type pullResult struct {
-			res *PullResult
-			err error
-		}
-		done := make(chan pullResult, 1)
-		go func() {
-			res, err := p.Pull(ctx, ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-			done <- pullResult{res, err}
-		}()
-		select {
-		case got := <-done:
-			return got.res, got.err
-		case <-time.After(outcomeBound):
-			t.Fatal(msg)
-			return nil, nil
-		}
-	}
+	ft := newFakeTimer()
+	p.stallAfterFunc = ft.afterFunc
 
-	// Long enough that a loaded host delivers the first bytes before it expires.
-	p.layerStallWindow = 200 * time.Millisecond
-	res, err := pull("the stalled pull did not return")
+	got := pullFiringStalls(t, p, ref, ft, sent)
+	res, err := got.res, got.err
 	if res != nil && res.Lease != nil {
 		res.Lease.Release()
 	}
@@ -403,10 +370,10 @@ func TestLayerPullRetryAfterStall(t *testing.T) {
 	}
 	assertNoPartialBlobs(t, cache)
 
-	// The retry runs on the default window, so a loaded host never cuts the
-	// healthy body; the code path is the same newStallReader in the same fetch.
-	p.layerStallWindow = 0
-	res, err = pull("the retried pull did not return")
+	// The retry runs on the same fake timer, never advanced, so a loaded host
+	// never cuts the healthy body; the code path is the same watchdog in the
+	// same fetch.
+	res, err = p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
 	if err != nil {
 		t.Fatalf("retry Pull after a stall: %v", err)
 	}
@@ -473,10 +440,10 @@ func TestStallReaderLostStopRace(t *testing.T) {
 		t.Helper()
 		drainArmed(ft)
 		done := readAsync(s)
-		waitArmed(t, ft, "the Read never armed the watchdog")
+		waitArmed(ft)
 		stale := ft.lastCallback()
 		go func() { _, _ = pw.Write([]byte(b)) }()
-		if r := awaitRead(t, done, "Read never returned its bytes"); r.n != len(b) || r.err != nil {
+		if r := <-done; r.n != len(b) || r.err != nil {
 			t.Fatalf("Read = %d, %v; want %d, nil", r.n, r.err, len(b))
 		}
 		return stale
@@ -526,18 +493,18 @@ func TestStallReaderLostStopRace(t *testing.T) {
 		ft := newFakeTimer()
 		body := &lingeringBody{release: make(chan struct{})}
 		s := newFakeStallReader(body, window, ft)
-		waitArmed(t, ft, "the stopped timer start created never armed")
+		waitArmed(ft)
 
 		drainArmed(ft)
 		done := readAsync(s)
-		waitArmed(t, ft, "the Read never armed the watchdog")
+		waitArmed(ft)
 		stale := ft.lastCallback()
 		if err := s.Close(); err != nil {
 			t.Fatalf("Close = %v, want nil", err)
 		}
 		stale()
 		close(body.release)
-		awaitRead(t, done, "the in-flight Read never returned")
+		<-done
 		if got := body.closes.Load(); got != 1 {
 			t.Fatalf("body closed %d times, want 1 (by Close)", got)
 		}
@@ -557,24 +524,24 @@ func TestStallReaderLostStopRace(t *testing.T) {
 		stale := readOne(t, s, ft, pw, "ab")
 		drainArmed(ft)
 		done := readAsync(s)
-		waitArmed(t, ft, "the second Read never armed the watchdog")
+		waitArmed(ft)
 		stale()
 		if got := body.closes.Load(); got != 0 {
 			t.Fatalf("a stale fire closed the body under a later Read %d times, want 0", got)
 		}
 		go func() { _, _ = pw.Write([]byte("cd")) }()
-		if r := awaitRead(t, done, "the in-flight Read never returned"); r.n != 2 || r.err != nil {
+		if r := <-done; r.n != 2 || r.err != nil {
 			t.Fatalf("in-flight Read = %d, %v; want 2, nil", r.n, r.err)
 		}
 
 		// The later Read's own window still cuts it.
 		drainArmed(ft)
 		done = readAsync(s)
-		waitArmed(t, ft, "the third Read never armed the watchdog")
+		waitArmed(ft)
 		if !ft.advance(window) {
 			t.Fatal("the third Read's own window did not fire")
 		}
-		if r := awaitRead(t, done, "the stalled Read never returned"); r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
+		if r := <-done; r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
 			t.Fatalf("stalled Read = %d, %v; want 0, ErrLayerBodyStalled", r.n, r.err)
 		}
 		if got := body.closes.Load(); got != 1 {

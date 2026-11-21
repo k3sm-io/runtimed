@@ -98,8 +98,11 @@ func layerBodyServer(t *testing.T, body func(w http.ResponseWriter, r *http.Requ
 
 // TestLayerPullStalledBodyAborts is the gate for the layer-body watchdog end
 // to end: a layer whose body stops after a few bytes while the server holds the
-// connection fails the pull with ErrLayerBodyStalled. That a body which keeps
-// delivering is never cut is pinned with a fake timer in TestStallReader.
+// connection fails the pull with ErrLayerBodyStalled. The watchdog runs on the
+// fake timer through the Puller's seam, so the test never waits on the wall
+// clock; a pull whose body is not watched never returns, and go test -timeout
+// fails it. That a body which keeps delivering is never cut is pinned in
+// TestStallReader.
 func TestLayerPullStalledBodyAborts(t *testing.T) {
 	// The server holds the connection, sending nothing more, until the test
 	// releases it; nothing here depends on how long the stall lasts.
@@ -123,29 +126,9 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := mustPullerIndex(t, cache, RemoteFetch, NoLocalIndex{})
-	// Short enough to fire promptly, long enough that a loaded host delivers the
-	// 16 bytes before the window can expire.
-	p.layerStallWindow = 200 * time.Millisecond
-	// The outer guard only turns a regression (a pull that never returns) into a
-	// failure; the happy path never waits on it.
-	const guard = 60 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), guard)
-	defer cancel()
-	type pullResult struct {
-		res *PullResult
-		err error
-	}
-	done := make(chan pullResult, 1)
-	go func() {
-		res, err := p.Pull(ctx, ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
-		done <- pullResult{res, err}
-	}()
-	var got pullResult
-	select {
-	case got = <-done:
-	case <-time.After(guard):
-		t.Fatal("Pull did not return: the stall watchdog never aborted the held body")
-	}
+	ft := newFakeTimer()
+	p.stallAfterFunc = ft.afterFunc
+	got := pullFiringStalls(t, p, ref, ft, sent)
 	if got.res != nil && got.res.Lease != nil {
 		got.res.Lease.Release()
 	}
@@ -160,6 +143,41 @@ func TestLayerPullStalledBodyAborts(t *testing.T) {
 	case <-sent:
 	default:
 		t.Fatal("Pull failed before the server flushed the 16 body bytes")
+	}
+}
+
+// pullResult is one Pull's return values, carried off a goroutine.
+type pullResult struct {
+	res *PullResult
+	err error
+}
+
+// pullFiringStalls runs one Pull of ref on p, whose stallAfterFunc is
+// ft.afterFunc, and returns its result. Once sent is closed (the server has
+// flushed the bytes it sends before holding the body), every watchdog window a
+// body Read arms is run out on the fake clock, so a held body is cut at once
+// and a body that keeps arriving is cut only between its bytes, never before
+// the server sent them. Nothing waits on the wall clock: a Pull that never
+// returns, because nothing watches the body, is caught by go test -timeout.
+func pullFiringStalls(t *testing.T, p *Puller, ref string, ft *fakeTimer, sent <-chan struct{}) pullResult {
+	t.Helper()
+	done := make(chan pullResult, 1)
+	go func() {
+		res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+		done <- pullResult{res, err}
+	}()
+	select {
+	case got := <-done:
+		return got
+	case <-sent:
+	}
+	for {
+		select {
+		case got := <-done:
+			return got
+		case <-ft.armed:
+			ft.advance(p.stallWindow())
+		}
 	}
 }
 
@@ -239,15 +257,10 @@ func (ft *fakeTimer) lastCallback() func() {
 	return ft.fs[len(ft.fs)-1]
 }
 
-// waitArmed waits for the fake timer to be armed, failing with msg if it never is.
-func waitArmed(t *testing.T, ft *fakeTimer, msg string) {
-	t.Helper()
-	select {
-	case <-ft.armed:
-	case <-time.After(10 * time.Second):
-		t.Fatal(msg)
-	}
-}
+// waitArmed waits for the fake timer to be armed. There is no timer on the
+// wait: a hang is caught by go test -timeout, whose goroutine dump shows the
+// caller's line.
+func waitArmed(ft *fakeTimer) { <-ft.armed }
 
 // newFakeStallReader is newStallReader with ft in place of time.AfterFunc.
 func newFakeStallReader(body io.ReadCloser, window time.Duration, ft *fakeTimer) *stallReader {
@@ -392,7 +405,7 @@ func TestStallReader(t *testing.T) {
 		defer pw.Close()
 		s := newFakeStallReader(pr, window, ft)
 		defer s.Close()
-		waitArmed(t, ft, "the stopped timer start created never armed")
+		waitArmed(ft)
 		type result struct {
 			n   int
 			err error
@@ -402,19 +415,16 @@ func TestStallReader(t *testing.T) {
 			n, err := s.Read(make([]byte, 8))
 			done <- result{n, err}
 		}()
-		waitArmed(t, ft, "the Read never armed the watchdog")
+		waitArmed(ft)
 		if ft.advance(window - time.Nanosecond) {
 			t.Fatal("watchdog fired before a whole window")
 		}
 		if !ft.advance(time.Nanosecond) {
 			t.Fatal("watchdog did not fire at a whole window")
 		}
-		var r result
-		select {
-		case r = <-done:
-		case <-time.After(10 * time.Second):
-			t.Fatal("Read never returned after the watchdog fired: the body was never closed")
-		}
+		// A Read that never returns (the body was never closed) is caught by go
+		// test -timeout.
+		r := <-done
 		if r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
 			t.Fatalf("Read = %d, %v; want 0, ErrLayerBodyStalled", r.n, r.err)
 		}
