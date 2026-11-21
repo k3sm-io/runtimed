@@ -113,6 +113,12 @@ type PartialStore struct {
 
 	mu      sync.Mutex
 	claimed map[string]struct{} // digests with a live Claim
+
+	// beforeSweepLock, when set, runs in Sweep for each stale partial after
+	// the listing's stat and before mu is taken for its claim check and
+	// unlink, with mu NOT held. It is UNEXPORTED and exists only so a test
+	// can change the entry in that window; production never sets it.
+	beforeSweepLock func(name string)
 }
 
 // Claim makes the caller the one writer of digest's partial within this
@@ -192,17 +198,24 @@ func (s *PartialStore) Admit(digest string, want int64) error {
 	return err
 }
 
+// maxForeignLogs caps the foreign entries one Sweep names on Log, so a
+// directory stuffed with stray names cannot flood the log.
+const maxForeignLogs = 16
+
 // Sweep removes the regular files in Dir whose mtime is older than maxAge at
 // now, except the partial of a claimed digest. A partial is a file named by
 // the store's own grammar (sha256-<64 hex>.partial). Any other name is
 // foreign: nothing this package writes, and yet Admit counts it against
 // MaxBytes, so an old foreign regular file is removed too, or a stray file
-// would hold the budget forever. Every foreign entry is named in a Warn on
-// Log (bounded and quoted, since the name is not ours), removed or not. A
+// would hold the budget forever. Each foreign entry is named in a Warn on
+// Log (bounded and quoted, since the name is not ours), removed or not, up to
+// maxForeignLogs per sweep; one more line counts the rest. A
 // symlink or a directory is left alone, whatever its name. Dir is opened
 // O_NOFOLLOW and every entry is stat'ed and unlinked relative to that
 // descriptor (fstatat AT_SYMLINK_NOFOLLOW, unlinkat without AT_REMOVEDIR), so
 // neither a swapped entry nor a link in an entry's place redirects a removal.
+// A partial is stat'ed again under the claim lock just before its unlink and
+// spared unless that fresh stat still shows a stale regular file.
 // A missing Dir sweeps nothing. Per-entry failures are joined; the sweep goes
 // on past them. removed counts partials and foreign files alike.
 //
@@ -213,6 +226,13 @@ func (s *PartialStore) Admit(digest string, want int64) error {
 func (s *PartialStore) Sweep(now time.Time, maxAge time.Duration) (removed int, err error) {
 	cutoff := now.Add(-maxAge)
 	var errs []error
+	foreign := 0
+	defer func() {
+		if extra := foreign - maxForeignLogs; extra > 0 && s.Log != nil {
+			s.Log.Warn("partial sweep: more foreign entries in the partial dir not named",
+				"dir", s.Dir, "unnamed", extra, "named", maxForeignLogs)
+		}
+	}()
 	err = s.eachEntry(func(fd int, name string, st *unix.Stat_t) error {
 		regular := st.Mode&unix.S_IFMT == unix.S_IFREG
 		stale := time.Unix(st.Mtim.Unix()).Before(cutoff)
@@ -228,7 +248,8 @@ func (s *PartialStore) Sweep(now time.Time, maxAge time.Duration) (removed int, 
 					removed++
 				}
 			}
-			if s.Log != nil {
+			foreign++
+			if s.Log != nil && foreign <= maxForeignLogs {
 				s.Log.Warn("partial sweep: foreign entry in the partial dir",
 					"dir", s.Dir, "name", quoteBounded(name, 128),
 					"regular", regular, "stale", stale, "removed", gone)
@@ -239,9 +260,26 @@ func (s *PartialStore) Sweep(now time.Time, maxAge time.Duration) (removed int, 
 			return nil
 		}
 		digest := strings.Replace(strings.TrimSuffix(name, ".partial"), "-", ":", 1)
+		if s.beforeSweepLock != nil {
+			s.beforeSweepLock(name)
+		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if _, held := s.claimed[digest]; held {
+			return nil
+		}
+		// The listing's stat is older than the claim check: a Resume that
+		// claimed, grew and released the partial since then left a fresh
+		// mtime (or another file) behind it. Decide again from a stat taken
+		// under mu, where no Claim can land before the unlink.
+		var now unix.Stat_t
+		if err := unix.Fstatat(fd, name, &now, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				errs = append(errs, fmt.Errorf("sweep partial %s: %w", name, err))
+			}
+			return nil
+		}
+		if now.Mode&unix.S_IFMT != unix.S_IFREG || !time.Unix(now.Mtim.Unix()).Before(cutoff) {
 			return nil
 		}
 		if err := unix.Unlinkat(fd, name, 0); err != nil {

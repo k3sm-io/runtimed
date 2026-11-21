@@ -150,7 +150,8 @@ func StatfsSample(path string) (FilesystemSample, error) {
 //     files (see EnumerateTrees for why, and for what that figure over- and
 //     under-counts);
 //   - a partial contributes its apparent size, by stat alone: no partial is
-//     opened to measure it. Partials are freed only by the partial sweep
+//     opened to measure it, and a partial dir that cannot be measured counts
+//     zero (logged). Partials are freed only by the partial sweep
 //     (PartialMaxAge), never by a prune.
 //
 // It is explicitly not an estimate of what a prune could reclaim: blobs and tree
@@ -172,11 +173,7 @@ func (c *Cache) StoreBytes() (int64, error) {
 	for _, t := range trees {
 		n += t.Size
 	}
-	partial, err := c.partialBytes()
-	if err != nil {
-		return 0, err
-	}
-	return n + partial, nil
+	return n + c.partialBytes(), nil
 }
 
 // ReclaimConfig configures one disk-pressure reclaim pass.

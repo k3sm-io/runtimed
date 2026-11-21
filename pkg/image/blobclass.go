@@ -308,11 +308,7 @@ func (c *Cache) StoreBytesByClass(ctx context.Context) (map[string]int64, error)
 	for _, t := range trees {
 		out[ClassImage] += t.Size
 	}
-	partial, err := c.partialBytes()
-	if err != nil {
-		return nil, err
-	}
-	if partial > 0 {
+	if partial := c.partialBytes(); partial > 0 {
 		out[ClassPartial] += partial
 	}
 	return out, nil

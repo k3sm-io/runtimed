@@ -1018,6 +1018,14 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	// puller reserve declared bytes on it before they fetch, so neither can
 	// overcommit the store volume against the other.
 	space := &image.SpaceLedger{}
+	// The cache's one partial store keeps the bytes of a layer cut mid-fetch,
+	// so the next pull asks for the rest with a Range request instead of
+	// starting the layer again. It is opened whatever the puller, so its
+	// directory exists, is swept at start and counts in the store's bytes
+	// even under an injected Puller. A refused directory is logged by
+	// OpenPartialStore and yields nil, and a nil store fetches every layer
+	// from byte 0: the daemon still pulls.
+	partials := cache.OpenPartialStore(log)
 	puller := deps.Puller
 	if puller == nil {
 		// image.RemoteFetch is named explicitly: it is the decision that chooses
@@ -1047,16 +1055,12 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		if cfg.LocalBlobSource != nil {
 			opts = append(opts, image.WithLocalBlobSource(cfg.LocalBlobSource))
 		}
-		// The cache's one partial store keeps the bytes of a layer cut
-		// mid-fetch, so the next pull asks for the rest with a Range request
-		// instead of starting the layer again. It is fed over the direct blob
-		// routes paired with RemoteFetch and RemoteMirrorFetch, named here for
-		// the same reason those are. A refused store directory is logged by
-		// OpenPartialStore and yields nil, and a nil store fetches every layer
-		// from byte 0: the daemon still pulls.
+		// The partial store is fed over the direct blob routes paired with
+		// RemoteFetch and RemoteMirrorFetch, named here for the same reason
+		// those are.
 		opts = append(opts,
 			image.WithRegistryBlobSource(image.RemoteBlobSource, image.RemoteMirrorBlobSource),
-			image.WithPartialStore(cache.OpenPartialStore(log)))
+			image.WithPartialStore(partials))
 		p, err := image.NewPuller(cache, image.RemoteFetch, index, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)

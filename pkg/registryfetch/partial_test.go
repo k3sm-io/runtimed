@@ -513,6 +513,79 @@ func TestSweepNamesForeignEntries(t *testing.T) {
 			t.Errorf("sweep log for %s: named %v removed %v; want named, removed %v", n, ok, g, rm)
 		}
 	}
+
+	// A dir stuffed with foreign names: maxForeignLogs are named, and one
+	// summary line counts the rest.
+	buf.Reset()
+	const strays = maxForeignLogs + 5
+	for i := range strays {
+		if err := os.WriteFile(filepath.Join(s.Dir, fmt.Sprintf("stray-%02d", i)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Sweep(now, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	named, summaries := 0, 0
+	for _, raw := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+		var l struct {
+			Msg     string `json:"msg"`
+			Name    string `json:"name"`
+			Unnamed int    `json:"unnamed"`
+		}
+		if err := json.Unmarshal(raw, &l); err != nil {
+			t.Fatalf("log line %q: %v", raw, err)
+		}
+		switch {
+		case l.Name != "":
+			named++
+		case l.Unnamed > 0:
+			summaries++
+			if wantRest := strays + 1 - maxForeignLogs; l.Unnamed != wantRest { // + fresh.tmp
+				t.Errorf("summary counts %d unnamed, want %d", l.Unnamed, wantRest)
+			}
+		}
+	}
+	if named != maxForeignLogs || summaries != 1 {
+		t.Fatalf("sweep log named %d entries with %d summaries, want %d and 1", named, summaries, maxForeignLogs)
+	}
+}
+
+// TestSweepRechecksUnderClaimLock: a partial the listing saw stale but that
+// was refreshed before Sweep took the claim lock (a Resume that claimed, grew
+// and released it in that window) is decided from a fresh stat and kept; one
+// still stale at the re-check goes.
+func TestSweepRechecksUnderClaimLock(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	s := &PartialStore{Dir: t.TempDir()}
+	refreshed := filepath.Join(s.Dir, "sha256-"+strings.Repeat("a", 64)+".partial")
+	stale := filepath.Join(s.Dir, "sha256-"+strings.Repeat("b", 64)+".partial")
+	for _, p := range []string{refreshed, stale} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.beforeSweepLock = func(name string) {
+		if name == filepath.Base(refreshed) {
+			if err := os.Chtimes(refreshed, now, now); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	removed, err := s.Sweep(now, 24*time.Hour)
+	if err != nil || removed != 1 {
+		t.Fatalf("Sweep = %d, %v; want 1, nil", removed, err)
+	}
+	if _, err := os.Lstat(refreshed); err != nil {
+		t.Fatalf("partial refreshed before the claim lock was removed: %v", err)
+	}
+	if _, err := os.Lstat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial still stale at the re-check was kept: %v", err)
+	}
 }
 
 // TestUsageCountsRegularFilesByStat: Usage sums the apparent size of every

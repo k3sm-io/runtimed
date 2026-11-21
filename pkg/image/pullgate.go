@@ -253,6 +253,13 @@ func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Mani
 			// in place (another claimant, the partial budget or cap, a
 			// refused partial file), this under-charges by the partial's
 			// bytes, at most the partial store's budget in total.
+			//
+			// The same bounded under-charge follows when a reclaim pass this
+			// reservation triggers sweeps the partial before resumeBlob
+			// claims it: the sweep removes it only when it is older than
+			// PartialMaxAge and only while it is unclaimed, and the Claim is
+			// taken later, in resumeBlob, so the layer is then fetched from
+			// byte 0 against a charge that counted the swept bytes as had.
 			b.Have = p.partials.Bytes(digest, d.Size)
 		}
 		missing = append(missing, b)

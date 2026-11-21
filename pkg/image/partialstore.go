@@ -100,10 +100,22 @@ func (c *Cache) sweepPartials(now time.Time, log *slog.Logger) {
 
 // partialBytes is what the partial store holds, by stat alone (Usage): no
 // partial is opened to measure it. A cache whose store is not open holds none.
-func (c *Cache) partialBytes() (int64, error) {
+// A directory that cannot be measured (replaced by a symlink or a file after
+// the store was opened) is logged at Warn on the store's log and counts as
+// zero: the partials are an optimisation, and a fault in their directory must
+// not fail the measurement of the content the store really holds.
+func (c *Cache) partialBytes() int64 {
 	s := c.partials.Load()
 	if s == nil {
-		return 0, nil
+		return 0
 	}
-	return s.Usage()
+	n, err := s.Usage()
+	if err != nil {
+		if s.Log != nil {
+			s.Log.Warn("image partial store not measured; its bytes are not counted",
+				"dir", s.Dir, "err", err)
+		}
+		return 0
+	}
+	return n
 }

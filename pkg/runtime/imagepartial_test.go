@@ -182,3 +182,20 @@ func TestImagePullerResumesFromPartial(t *testing.T) {
 		t.Fatalf("partial store holds %d entries after the commit, want 0", len(entries))
 	}
 }
+
+// TestPartialStoreOpenedWithInjectedPuller: runtime.New opens the cache's
+// partial store whatever the puller, so under an injected Puller its private
+// directory still exists beside blobs/ (and is swept and counted).
+func TestPartialStoreOpenedWithInjectedPuller(t *testing.T) {
+	root := t.TempDir()
+	if _, err := New(Config{Root: root}, testDeps(t, Deps{Puller: &fakePuller{}})); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	fi, err := os.Lstat(filepath.Join(root, image.PartialSubdir))
+	if err != nil {
+		t.Fatalf("partial store dir under an injected Puller: %v", err)
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("partial store dir mode = %v, want a 0700 directory", fi.Mode())
+	}
+}

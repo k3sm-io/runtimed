@@ -23,6 +23,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -420,4 +421,72 @@ func checkResumeUnderClaim(t *testing.T, fset *token.FileSet, fname string, fd *
 		}
 		return true
 	})
+}
+
+// TestStoreBytesSurvivesUnmeasurablePartialDir: a partial dir replaced after
+// the store was opened (by a symlink or a file) is logged and counted as
+// zero, and StoreBytes and StoreBytesByClass still report the blob and tree
+// total with no error.
+func TestStoreBytesSurvivesUnmeasurablePartialDir(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		replace func(t *testing.T, path string)
+	}{
+		{"a symlink", func(t *testing.T, path string) {
+			if err := os.Symlink(t.TempDir(), path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a regular file", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewCache(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			s := c.OpenPartialStore(slog.New(slog.NewTextHandler(&buf, nil)))
+			if s == nil {
+				t.Fatal("partial store refused")
+			}
+			if _, err := c.CommitBlob(digestOf([]byte("blob")), 4, func(w io.Writer) error {
+				_, err := io.WriteString(w, "blob")
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			writePartial(t, s.Dir, 'a', 100, partialFixtureNow)
+			want, err := c.StoreBytes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want -= 100 // the blob and tree total, without the partial
+			if want != 4 {
+				t.Fatalf("fixture: blob and tree total %d, want 4", want)
+			}
+			if err := os.RemoveAll(s.Dir); err != nil {
+				t.Fatal(err)
+			}
+			tc.replace(t, s.Dir)
+
+			got, err := c.StoreBytes()
+			if err != nil || got != want {
+				t.Fatalf("StoreBytes = %d, %v; want %d, nil", got, err, want)
+			}
+			classes, err := c.StoreBytesByClass(context.Background())
+			if err != nil {
+				t.Fatalf("StoreBytesByClass: %v", err)
+			}
+			if _, ok := classes[ClassPartial]; ok {
+				t.Fatalf("ClassPartial reported over an unmeasurable dir: %v", classes)
+			}
+			if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "image partial store not measured") {
+				t.Fatalf("unmeasurable partial dir not logged at Warn: %q", buf.String())
+			}
+		})
+	}
 }
