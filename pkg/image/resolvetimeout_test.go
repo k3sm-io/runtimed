@@ -18,6 +18,7 @@ package image
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log"
@@ -33,7 +34,10 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 // setResolveSeams replaces the resolve timer with ft and the header timeout
@@ -119,6 +123,39 @@ func TestResolveTimeoutIsPullFailure(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "http://") || strings.Contains(err.Error(), "/v2/") {
 			t.Errorf("err = %q names the request URL; the cancelled request's error must be dropped", err)
+		}
+	})
+
+	t.Run("an auth ping that never answers is inside the same bound", func(t *testing.T) {
+		ft := newFakeTimer()
+		setResolveSeams(t, ft, time.Hour)
+		release := make(chan struct{})
+		reached := make(chan struct{})
+		var once sync.Once
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			once.Do(func() { close(reached) })
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(srv.Close)
+		t.Cleanup(func() { close(release) })
+		u, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		errc := make(chan error, 1)
+		go func() {
+			_, err := RemoteFetch(context.Background(), u.Host+"/ping/app:v1", nil, nativePolicy())
+			errc <- err
+		}()
+		<-reached
+		if !ft.advance(resolveTimeout) {
+			t.Fatal("the resolve timer was not armed while the auth ping was held")
+		}
+		if err := <-errc; !errors.Is(err, ErrResolveTimeout) {
+			t.Fatalf("err = %v, want ErrResolveTimeout", err)
 		}
 	})
 
@@ -330,3 +367,97 @@ func TestExternalTransportHeaderTimeout(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestResolveTimeoutFallsBackToPublicMirror drives the public-mirror fallback
+// with an upstream that completes TLS, answers the ping and then never answers
+// the manifest request: the resolve bound (a hand-fired fake) ends the
+// upstream fetch with ErrResolveTimeout, which counts as unreachable, so the
+// cluster registry's copy serves the pull.
+func TestResolveTimeoutFallsBackToPublicMirror(t *testing.T) {
+	const ref = "docker.io/team/app:v1"
+	ft := newFakeTimer()
+	setResolveSeams(t, ft, time.Hour)
+
+	mirrorCA := newTestCA(t, "cluster-ca")
+	mirror := newRegistryServer(t, mirrorCA, "registry-k3sm", nil)
+	mirror.push(t, "docker.io/team/app:v1", nativeImage(t))
+
+	upCA := newTestCA(t, "upstream-ca")
+	release := make(chan struct{})
+	reached := make(chan struct{})
+	var once sync.Once
+	up := newRegistryServer(t, upCA, "index.docker.io", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		once.Do(func() { close(reached) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	// Registered after the server's cleanups, so it runs first and frees the
+	// held handler before the server closes.
+	t.Cleanup(func() { close(release) })
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(upCA.pem) {
+		t.Fatal("upstream CA PEM holds no certificate")
+	}
+	fetch, asked := upstreamFetch(dialTo(up.addr), roots)
+
+	cache, idx := newIndexedCache(t)
+	p := flatPuller(t, idx, cache, fetch, RegistryEndpoint{Addr: mirror.addr, TLS: true, CAPEM: mirrorCA.pem}, "", nil, nil)
+	before := mirror.requests.Load()
+	type result struct {
+		res *PullResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := p.Pull(context.Background(), ref, nil, nativePolicy(), runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS)
+		done <- result{res, err}
+	}()
+	<-reached
+	if !ft.advance(resolveTimeout) {
+		t.Fatal("the upstream resolve timer was not armed while its manifest request was held")
+	}
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("Pull(%q): %v, want the cluster registry's copy", ref, got.err)
+	}
+	if asked.Load() != 1 {
+		t.Errorf("upstream asked %d times, want 1", asked.Load())
+	}
+	if mirror.requests.Load() == before {
+		t.Error("the cluster registry's copy was not contacted")
+	}
+	if r := got.res.Manifest.GetReference(); r != ref {
+		t.Errorf("recorded reference = %q, want %q", r, ref)
+	}
+}
+
+// TestResolveTimerFiringAsResolveSucceeds pins the race the timer cannot
+// otherwise lose quietly: the bound runs out while the resolve is finishing
+// and the resolve still returns an image. Its context is already cancelled,
+// so its lazy layer fetches would fail; the pull reports ErrResolveTimeout
+// instead of handing that image on.
+func TestResolveTimerFiringAsResolveSucceeds(t *testing.T) {
+	ft := newFakeTimer()
+	setResolveSeams(t, ft, time.Hour)
+	img := testImage(t, "darwin", "arm64", "")
+	var rctx context.Context
+	got, err := boundedResolve(context.Background(), "example.test/app:v1", func(c context.Context) (ggcrv1.Image, error) {
+		rctx = c
+		if !ft.advance(resolveTimeout) {
+			t.Fatal("the resolve timer was not armed")
+		}
+		return img, nil
+	})
+	if !errors.Is(err, ErrResolveTimeout) || got != nil {
+		t.Fatalf("boundedResolve = %v, %v; want nil, ErrResolveTimeout", got, err)
+	}
+	if context.Cause(rctx) != ErrResolveTimeout {
+		t.Errorf("resolve context cause = %v, want ErrResolveTimeout", context.Cause(rctx))
+	}
+}

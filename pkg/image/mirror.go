@@ -418,6 +418,9 @@ const (
 //   - a CONNECTION-class failure — connection refused/reset, host or network
 //     unreachable, a dial or read timeout, a DNS failure, or any other
 //     *net.OpError. The node's own registry is not listening.
+//   - ErrResolveTimeout — the resolve phase ran out of its bound with no answer:
+//     the registry accepts connections and never replies. It carries no HTTP
+//     answer, so the exclusions below cannot apply to it.
 //
 // NOT ELIGIBLE — the primary ANSWERED, and its answer is the pull's answer.
 // Falling back here would be substituting a different host's opinion for a
@@ -510,8 +513,12 @@ func authDiagnostic(terr *transport.Error) bool {
 // a read against a dead local listener actually produces; net.DNSError and
 // *net.OpError catch the same class arriving in a different shape, and the
 // net.Error timeout check catches a deadline the http client imposed rather than
-// the kernel.
+// the kernel. ErrResolveTimeout is the same class one level up: the resolve
+// phase's bound ran out with no answer from the registry.
 func connectionClass(err error) bool {
+	if errors.Is(err, ErrResolveTimeout) {
+		return true
+	}
 	for _, errno := range []syscall.Errno{
 		syscall.ECONNREFUSED,
 		syscall.ECONNRESET,

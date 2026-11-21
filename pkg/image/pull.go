@@ -124,6 +124,10 @@ var registryTransportCache transportClone
 // the timeout differs from the cached one (a test swapping
 // remote.DefaultTransport or shortening headerTimeout); the replaced clone's
 // idle connections are closed so it leaks none.
+//
+// The cache keys on the source POINTER, so remote.DefaultTransport must be
+// replaced, never mutated in place: a field changed on the cached source would
+// not reach the clone.
 type transportClone struct {
 	mu      sync.Mutex
 	src     *http.Transport
@@ -263,14 +267,19 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 // OriginSplit, the transport Session uses for blobs): cred authenticates only
 // requests to r's registry, and a redirect to another host goes over plain tr,
 // so neither the credential nor that host's 401 challenge reaches the token
-// logic. cred rides the split transport, so remoteFetch gets none.
+// logic. cred rides the split transport, so the resolve gets none.
+//
+// OriginSplit pings the registry and fetches the initial token, so it runs
+// inside the same resolve bound as the manifest fetch: one bound per pull.
 func splitFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, tr http.RoundTripper) (ggcrv1.Image, error) {
-	reg := registryfetch.Registry{Transport: tr}
-	rt, err := reg.OriginSplit(ctx, r.Context(), cred.registryfetchCredential())
-	if err != nil {
-		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
-	}
-	return remoteFetch(ctx, r, ref, nil, policy, remote.WithTransport(rt))
+	return boundedResolve(ctx, ref, func(rctx context.Context) (ggcrv1.Image, error) {
+		reg := registryfetch.Registry{Transport: tr}
+		rt, err := reg.OriginSplit(rctx, r.Context(), cred.registryfetchCredential())
+		if err != nil {
+			return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
+		}
+		return remoteResolve(rctx, r, ref, nil, policy, remote.WithTransport(rt))
+	})
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
@@ -280,31 +289,38 @@ func splitFetch(ctx context.Context, r name.Reference, ref string, cred *Registr
 // spells it, used only in messages.
 //
 // Sharing it is deliberate: every fail-closed property documented on RemoteFetch
-// is a property of THIS function, so the mirror path cannot drift into a second
-// fetcher with a weaker platform story.
+// is a property of THIS function (remoteResolve, under splitFetch's bound or
+// its own), so the mirror path cannot drift into a second fetcher with a weaker
+// platform story.
 //
 // extra carries a transport a caller pins (the flat registry's endpoint dial and
 // trust anchor); it is appended after the defaults so it rides every round trip,
 // the index children included.
 //
-// The resolve phase (remote.Get, resolveImage, the config and its platform
-// check, with every token round trip they need) is bounded by resolveTimeout:
-// a registry that answers too slowly fails the pull with ErrResolveTimeout
-// rather than holding it until ctx ends. A cancellation of ctx itself stays a
-// context error.
+// The resolve phase is bounded by resolveTimeout (boundedResolve).
 func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, extra ...remote.Option) (ggcrv1.Image, error) {
-	want, err := Candidates(policy)
-	if err != nil {
-		return nil, fmt.Errorf("pull %q: %w", ref, err)
-	}
+	return boundedResolve(ctx, ref, func(rctx context.Context) (ggcrv1.Image, error) {
+		return remoteResolve(rctx, r, ref, cred, policy, extra...)
+	})
+}
+
+// boundedResolve runs resolve under a context derived from ctx that
+// resolveTimeout cancels with ErrResolveTimeout: a registry that answers too
+// slowly anywhere in the resolve phase (the auth ping and token exchange, the
+// manifest, an index child, the config, and ggcr's retries of any of them)
+// fails the pull with ErrResolveTimeout rather than holding it until ctx ends.
+// A cancellation of ctx itself stays a context error.
+//
+// On success the derived context is deliberately NOT cancelled: the returned
+// image fetches its layers lazily with the context remote.Get was given, so
+// cancelling it would fail every layer. The finished timer can no longer fire,
+// and the derived context stays registered under ctx until ctx ends. The
+// callers pass per-request contexts (the image pull and pod create paths in
+// pkg/runtime), so it does not outlive the request.
+func boundedResolve(ctx context.Context, ref string, resolve func(rctx context.Context) (ggcrv1.Image, error)) (ggcrv1.Image, error) {
 	rctx, cancel := context.WithCancelCause(ctx)
 	rt := newResolveTimer(cancel)
-	opts := []remote.Option{remote.WithContext(rctx)}
-	opts = append(opts, extra...)
-	if cred != nil {
-		opts = append(opts, remote.WithAuth(cred.authenticator()))
-	}
-	img, err := resolveConfigured(r, ref, want, opts)
+	img, err := resolve(rctx)
 	if fired := rt.finish(); err == nil && fired {
 		// The bound ran out in the instant the resolve finished: rctx is
 		// cancelled, so the image could not fetch its layers.
@@ -321,24 +337,35 @@ func remoteFetch(ctx context.Context, r name.Reference, ref string, cred *Regist
 		timedOut := errors.Is(err, errResolveTimedOut) ||
 			(cancelled && context.Cause(rctx) == ErrResolveTimeout && ctx.Err() == nil)
 		if timedOut {
-			// The underlying ggcr error is dropped: it is only the
-			// cancellation, and its url.Error spells out the request URL.
+			// The underlying error is dropped: it is only the cancellation,
+			// and a url.Error spells out the request URL.
 			return nil, fmt.Errorf("pull %q: resolve exceeded %s: %w", ref, resolveTimeout, ErrResolveTimeout)
 		}
 		return nil, err
 	}
-	// rctx is deliberately NOT cancelled here: the returned image fetches its
-	// layers lazily with the context remote.Get was given, so cancelling it
-	// would fail every layer. The finished timer can no longer fire, and rctx
-	// ends with the caller's ctx.
 	return img, nil
 }
 
-// errResolveTimedOut is resolveConfigured's internal marker that the timer
-// fired as the resolve finished; remoteFetch turns it into ErrResolveTimeout.
+// remoteResolve is the unbounded resolve phase over rctx: the platform
+// candidates, the options every round trip carries, then resolveConfigured.
+func remoteResolve(rctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, extra ...remote.Option) (ggcrv1.Image, error) {
+	want, err := Candidates(policy)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
+	opts := []remote.Option{remote.WithContext(rctx)}
+	opts = append(opts, extra...)
+	if cred != nil {
+		opts = append(opts, remote.WithAuth(cred.authenticator()))
+	}
+	return resolveConfigured(r, ref, want, opts)
+}
+
+// errResolveTimedOut is boundedResolve's internal marker that the timer fired
+// as the resolve finished; it is turned into ErrResolveTimeout.
 var errResolveTimedOut = errors.New("resolve timer fired")
 
-// resolveConfigured is the resolve phase remoteFetch bounds: the manifest
+// resolveConfigured is the resolve phase boundedResolve bounds: the manifest
 // fetch, the explicit index traversal and the child's own config check. Every
 // error carries the "pull %q:" prefix.
 func resolveConfigured(r name.Reference, ref string, want []Platform, opts []remote.Option) (ggcrv1.Image, error) {

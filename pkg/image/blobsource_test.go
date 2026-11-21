@@ -64,6 +64,9 @@ func TestBlobSourcePerPath(t *testing.T) {
 	}
 	// flatTransport marks a case whose transport must be the flat registry's own.
 	var flatTransport http.RoundTripper = &http.Transport{}
+	// externalTransport marks a case whose transport must be the image fetch's
+	// external transport, the header-timeout clone registryTransport returns.
+	var externalTransport http.RoundTripper = &http.Transport{}
 
 	for _, tc := range []struct {
 		name          string
@@ -84,7 +87,7 @@ func TestBlobSourcePerPath(t *testing.T) {
 			},
 			wantOK:        true,
 			wantRef:       "registry.example.com/team/app:v1",
-			wantTransport: registryTransport(),
+			wantTransport: externalTransport,
 			wantCred:      wantCred,
 		},
 		{
@@ -93,7 +96,7 @@ func TestBlobSourcePerPath(t *testing.T) {
 			route:         func(p *Puller) (BlobSource, bool, error) { return p.primaryBlobSource("ubuntu", nil) },
 			wantOK:        true,
 			wantRef:       "index.docker.io/library/ubuntu:latest",
-			wantTransport: registryTransport(),
+			wantTransport: externalTransport,
 		},
 		{
 			name:          "flat path: pinned-CA endpoint transport, converted credential",
@@ -120,7 +123,7 @@ func TestBlobSourcePerPath(t *testing.T) {
 			},
 			wantOK:        true,
 			wantRef:       mirror.Host + "/team/app:v1",
-			wantTransport: registryTransport(),
+			wantTransport: externalTransport,
 			wantPlainHTTP: true,
 		},
 		{
@@ -185,6 +188,22 @@ func TestBlobSourcePerPath(t *testing.T) {
 			if want == flatTransport {
 				want = p.flat.transport
 				assertPinnedFlatTransport(t, p.flat.transport, ca)
+				if got := p.flat.transport.ResponseHeaderTimeout; got != headerTimeout {
+					t.Errorf("flat ResponseHeaderTimeout = %s, want %s", got, headerTimeout)
+				}
+			}
+			if want == externalTransport {
+				// The same value the image fetch dials over (RemoteFetch passes
+				// registryTransport() to splitFetch), so blobs and manifests
+				// share one connection pool and one header bound.
+				want = registryTransport()
+				ht, ok := src.Registry.Transport.(*http.Transport)
+				if !ok {
+					t.Fatalf("Transport is %T, want *http.Transport", src.Registry.Transport)
+				}
+				if ht.ResponseHeaderTimeout != headerTimeout {
+					t.Errorf("ResponseHeaderTimeout = %s, want %s", ht.ResponseHeaderTimeout, headerTimeout)
+				}
 			}
 			if src.Registry.Transport != want {
 				t.Errorf("Transport = %p, want %p", src.Registry.Transport, want)
