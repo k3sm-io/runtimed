@@ -80,22 +80,43 @@ func scrubURLs(s string) string {
 }
 
 // reduceURL is raw with only its scheme, host and path. A raw URL that does
-// not parse, or an opaque one, first loses everything up to the last '@'
-// after its scheme, so no user info survives whatever it holds, and is then
-// cut at its first '?' or '#' (a path or query holding '@' loses more than it
-// must).
+// not parse, or an opaque one, is first cut at its first '?' or '#', so no
+// query or fragment survives whatever it holds. User info is then stripped
+// from the authority alone: the text after "://" up to the first '/', and
+// only an '@' inside it marks user info. An '@' that cannot be placed (one
+// past the first '/' but before the cut, as user info holding a '/' leaves
+// it, or one past the cut but before any '/', as user info holding a '?' or
+// '#' leaves it) makes the authority ambiguous, and the result is the scheme
+// with a fixed placeholder host, never raw bytes.
 func reduceURL(raw string) string {
 	if u, err := url.Parse(raw); err == nil && u.Opaque == "" {
 		r := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}
 		return r.String()
 	}
-	if scheme, rest, ok := strings.Cut(raw, "://"); ok {
-		if at := strings.LastIndex(rest, "@"); at >= 0 {
-			raw = scheme + "://" + rest[at+1:]
+	scheme, rest, ok := strings.Cut(raw, "://")
+	if !ok {
+		if i := strings.IndexAny(raw, "?#"); i >= 0 {
+			raw = raw[:i]
 		}
+		return raw
 	}
-	if i := strings.IndexAny(raw, "?#"); i >= 0 {
-		raw = raw[:i]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		slash = len(rest)
 	}
-	return raw
+	cut := strings.IndexAny(rest, "?#")
+	if cut < 0 {
+		cut = len(rest)
+	}
+	if strings.Contains(rest[min(slash, cut):max(slash, cut)], "@") {
+		return scheme + "://" + redactedHost
+	}
+	kept := rest[:cut]
+	if at := strings.LastIndex(kept[:min(slash, cut)], "@"); at >= 0 {
+		kept = kept[at+1:]
+	}
+	return scheme + "://" + kept
 }
+
+// redactedHost stands in for an authority reduceURL cannot bound.
+const redactedHost = "redacted"

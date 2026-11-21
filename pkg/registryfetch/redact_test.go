@@ -211,8 +211,11 @@ func TestReduceURL(t *testing.T) {
 		{"https://blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 		{"https://u:p@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 		{"mailto:x?sig=s", "mailto:x"},
-		{"https://u:p/w@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
-		{"https://u:p?ss@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
+		{"https://u:p/w@blobs.example/%zz?sig=s", "https://redacted"},
+		{"https://u:p?ss@blobs.example/%zz?sig=s", "https://redacted"},
+		{"https://blobs.example/%zz?email=a@b.com&sig=S", "https://blobs.example/%zz"},
+		{"https://u:p?x@host/path", "https://redacted"},
+		{"https://blobs.example/a/%zz/b?sig=s#frag", "https://blobs.example/a/%zz/b"},
 	} {
 		if got := reduceURL(tc.in); got != tc.want {
 			t.Errorf("reduceURL(%q) = %q, want %q", tc.in, got, tc.want)
