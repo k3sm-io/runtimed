@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -537,6 +538,11 @@ type Puller struct {
 	// pull resumes with a Range request (WithPartialStore). Nil — the default —
 	// fetches every layer from byte 0.
 	partials *registryfetch.PartialStore
+
+	// stallAfterFunc makes the watchdog timers of every layer body
+	// (newLayerBody), each of defaultLayerStallWindow. Nil means
+	// timeAfterFunc; tests set a hand-fired fake.
+	stallAfterFunc func(time.Duration, func()) stallTimer
 }
 
 // primaryBlobSource yields the direct blob route for ref on the primary path
@@ -967,8 +973,9 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 			if oerr != nil {
 				return oerr
 			}
-			defer rc.Close()
-			_, cerr := io.Copy(w, rc)
+			body := p.newLayerBody(rc)
+			defer body.Close()
+			_, cerr := io.Copy(w, body)
 			return cerr
 		}
 		var wrote bool
@@ -1193,6 +1200,11 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 // empties the file it was handed, so a failed Remove still leaves a
 // zero-length partial that the next resume starts from byte 0, with no Range
 // header.
+//
+// A stalled body (ErrLayerBodyStalled, from transferBlob's watchdog) fails the
+// pull like a cut: it is no verdict on the bytes, so Poisoned does not match it
+// and the partial keeps what arrived; the commit's whole-blob digest check is
+// unchanged.
 func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
 	release, cerr := p.partials.Claim(digest)
 	if cerr != nil {
@@ -1218,7 +1230,7 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		Transfer: func(f *os.File, have int64) error {
 			reached = true
 			from = have
-			err := transferBlob(ctx, src, digest, size, f, have)
+			err := p.transferBlob(ctx, src, digest, size, f, have)
 			if errors.Is(err, registryfetch.ErrBlobRange) {
 				if terr := f.Truncate(0); terr != nil {
 					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
@@ -1348,11 +1360,16 @@ func partialEnvErr(err error) bool {
 // route's body (registryfetch.Registry.Blob) already stops at size with an
 // error, so there the partial stays at size and the next pull verifies it in
 // CommitBlob or removes it.
-func transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64) error {
-	body, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
+//
+// The body is read through the layer stall watchdog (newLayerBody): a body
+// that stops moving fails with ErrLayerBodyStalled, and the bytes before the
+// stall stay synced in f for the next pull to resume, as any cut does.
+func (p *Puller) transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64) error {
+	rc, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
 	if err != nil {
 		return fmt.Errorf("fetch blob %s from %d: %w", digest, have, err)
 	}
+	body := p.newLayerBody(rc)
 	defer body.Close()
 	switch {
 	case start == have:
@@ -1387,6 +1404,15 @@ func transferBlob(ctx context.Context, src BlobSource, digest string, size int64
 	}
 	return nil
 }
+
+// newLayerBody wraps a layer body in the stall watchdog: the puller's window,
+// its timers made by stallAfterFunc.
+func (p *Puller) newLayerBody(rc io.ReadCloser) *stallReader {
+	return newStallReader(rc, p.stallWindow(), p.stallAfterFunc)
+}
+
+// stallWindow is the layer-body progress window, defaultLayerStallWindow.
+func (p *Puller) stallWindow() time.Duration { return defaultLayerStallWindow }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
 func descriptorFromGGCR(d ggcrv1.Descriptor) *runtimev1.Descriptor {

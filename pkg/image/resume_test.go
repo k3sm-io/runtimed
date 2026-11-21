@@ -61,6 +61,7 @@ type cutRegistry struct {
 	body     []byte
 	mu       sync.Mutex
 	cuts     int      // GETs still to cut
+	stalls   int      // cut GETs that hold the connection instead of dropping it
 	badRange int      // ranged GETs still to answer with a wrong Content-Range
 	overrun  int      // uncut GETs still to answer 200 with one byte past the blob
 	ranges   []string // the Range header of every layer GET, in order
@@ -76,6 +77,8 @@ type cutRegistry struct {
 	inflight    int
 	maxInflight int
 	arrivals    int
+	// release frees every stalled GET; the fixture closes it at cleanup.
+	release chan struct{}
 }
 
 // holdServes makes every later served layer GET wait until the returned hold
@@ -96,6 +99,15 @@ func (c *cutRegistry) held() (arrivals, peak int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.arrivals, c.maxInflight
+}
+
+// stall makes the next n layer GETs send cutAt bytes, flush, and then hold the
+// connection open, sending nothing more, until the client goes away.
+func (c *cutRegistry) stall(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cuts = n
+	c.stalls = n
 }
 
 // arm sets the fixture's fault counters under its mutex.
@@ -131,7 +143,8 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &cutRegistry{layer: mfst.Layers[0].Digest, size: mfst.Layers[0].Size, cutAt: cutAt, body: body}
+	c := &cutRegistry{layer: mfst.Layers[0].Digest, size: mfst.Layers[0].Size, cutAt: cutAt, body: body,
+		release: make(chan struct{})}
 	if int64(len(body)) != c.size || cutAt <= 0 || cutAt >= c.size {
 		t.Fatalf("fixture: layer %d bytes, descriptor %d, cut at %d", len(body), c.size, cutAt)
 	}
@@ -147,6 +160,10 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 		cut := c.cuts > 0
 		if cut {
 			c.cuts--
+		}
+		stall := cut && c.stalls > 0
+		if stall {
+			c.stalls--
 		}
 		bad := !cut && c.badRange > 0 && r.Header.Get("Range") != ""
 		if bad {
@@ -206,12 +223,22 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(c.body[:c.cutAt])
 			w.(http.Flusher).Flush()
+			if stall {
+				// The body stops moving; the connection stays open.
+				select {
+				case <-c.release:
+				case <-r.Context().Done():
+				}
+				return
+			}
 			panic(http.ErrAbortHandler) // the connection drops mid-body
 		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(c.body))
 	}))
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	t.Cleanup(srv.Close)
+	// Registered after srv.Close, so it runs first and frees a stalled handler.
+	t.Cleanup(func() { close(c.release) })
 	u, err := url.Parse(srv.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -240,6 +267,12 @@ func (c *cutRegistry) takeRanges() []string {
 // partial store in dir.
 func resumePuller(t *testing.T, c *cutRegistry, cache *Cache, partials *registryfetch.PartialStore) *Puller {
 	t.Helper()
+	return resumePullerVia(t, cache, partials, http.DefaultTransport)
+}
+
+// resumePullerVia is resumePuller with blob GETs sent over rt.
+func resumePullerVia(t *testing.T, cache *Cache, partials *registryfetch.PartialStore, rt http.RoundTripper) *Puller {
+	t.Helper()
 	fetch := func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
 		r, err := name.ParseReference(ref)
 		if err != nil {
@@ -254,7 +287,7 @@ func resumePuller(t *testing.T, c *cutRegistry, cache *Cache, partials *registry
 		}
 		return BlobSource{
 			Ref:        r.Name(),
-			Registry:   registryfetch.Registry{Transport: http.DefaultTransport, PlainHTTP: true},
+			Registry:   registryfetch.Registry{Transport: rt, PlainHTTP: true},
 			Credential: cred.registryfetchCredential(),
 		}, nil
 	}
@@ -443,6 +476,120 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 			t.Fatalf("pull over a wrong range answer made %d ranged requests, want 1", ranged)
 		}
 	})
+}
+
+// bodyCount is a RoundTripper that reports, by closing reached, the moment the
+// consumer of a response body to a GET for path has read want bytes of it.
+type bodyCount struct {
+	rt      http.RoundTripper
+	path    string
+	want    int64
+	once    sync.Once
+	reached chan struct{}
+}
+
+func (b *bodyCount) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := b.rt.RoundTrip(r)
+	if err != nil || r.Method != http.MethodGet || r.URL.Path != b.path {
+		return resp, err
+	}
+	resp.Body = &countedBody{ReadCloser: resp.Body, b: b}
+	return resp, nil
+}
+
+// countedBody counts one response body's bytes for its bodyCount.
+type countedBody struct {
+	io.ReadCloser
+	b *bodyCount
+	n int64
+}
+
+func (c *countedBody) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	c.n += int64(n)
+	if c.n >= c.b.want {
+		c.b.once.Do(func() { close(c.b.reached) })
+	}
+	return n, err
+}
+
+// TestPullResumeStalledBodyKeepsPartial pins the stall watchdog on the resumed
+// fetch: a layer body that sends cutAt bytes and then stops moving, with the
+// connection held open, fails the pull with ErrLayerBodyStalled once the
+// watchdog fires; the stall is not a verdict on the bytes, so the partial keeps
+// exactly the cutAt bytes, and the next pull resumes from there with a Range
+// request and commits a layer that verifies. The watchdog runs on the fake
+// timer; nothing waits on the wall clock.
+func TestPullResumeStalledBodyKeepsPartial(t *testing.T) {
+	const cutAt = 4096
+	c := newCutRegistry(t, cutAt)
+	c.stall(1)
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "partials")
+	count := &bodyCount{rt: http.DefaultTransport, path: "/v2/test/app/blobs/" + c.layer.String(),
+		want: cutAt, reached: make(chan struct{})}
+	p := resumePullerVia(t, cache, &registryfetch.PartialStore{Dir: dir}, count)
+	ft := newFakeTimer()
+	p.stallAfterFunc = ft.afterFunc
+
+	done := make(chan error, 1)
+	go func() {
+		res, err := pullAlways(p, c.ref)
+		if res != nil && res.Lease != nil {
+			res.Lease.Release()
+		}
+		done <- err
+	}()
+	// Fire nothing until the watchdog's reader has taken all cutAt bytes, so the
+	// fire can only cut the silence after them. A pull that ends first fails
+	// below; a pull that never ends is caught by go test -timeout.
+	var first error
+	ended := false
+	select {
+	case first = <-done:
+		ended = true
+	case <-count.reached:
+	}
+	for !ended {
+		select {
+		case first = <-done:
+			ended = true
+		case <-ft.armed:
+			ft.advance(p.stallWindow())
+		}
+	}
+	if !errors.Is(first, ErrLayerBodyStalled) {
+		t.Fatalf("first pull error = %v, want ErrLayerBodyStalled", first)
+	}
+	fi, err := os.Stat(partialPath(dir, c.layer))
+	if err != nil {
+		t.Fatalf("no partial after the stalled pull: %v", err)
+	}
+	if fi.Size() != cutAt {
+		t.Fatalf("partial holds %d bytes after the stall, want %d", fi.Size(), cutAt)
+	}
+	if got := c.takeRanges(); len(got) != 1 || got[0] != "" {
+		t.Fatalf("first pull layer Range headers = %q, want one GET with none", got)
+	}
+
+	// The fake timer is never advanced again, so the healthy resumed body
+	// cannot be cut.
+	res, err := pullAlways(p, c.ref)
+	if err != nil {
+		t.Fatalf("second pull: %v", err)
+	}
+	res.Lease.Release()
+	want := "bytes=" + strconv.FormatInt(cutAt, 10) + "-"
+	if got := c.takeRanges(); len(got) != 1 || got[0] != want {
+		t.Fatalf("second pull layer Range headers = %q, want [%q]", got, want)
+	}
+	verifyLayer(t, cache, c)
+	if _, err := os.Stat(partialPath(dir, c.layer)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial survived its commit: %v", err)
+	}
 }
 
 // TestPullResumeOverrunEmptiesThePartial pins the overrun branch: a registry
