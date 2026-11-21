@@ -248,7 +248,11 @@ func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Mani
 		b := BlobSpace{Size: d.Size}
 		if resume && p.partials != nil && digest != mfst.Config.Digest.String() {
 			// The partial's bytes are already off free space, as on the
-			// artifact path; an overlong partial counts as nothing.
+			// artifact path; an overlong partial counts as nothing. When
+			// resumeBlob falls back to a whole fetch that leaves the partial
+			// in place (another claimant, the partial budget or cap, a
+			// refused partial file), this under-charges by the partial's
+			// bytes, at most the partial store's budget in total.
 			b.Have = p.partials.Bytes(digest, d.Size)
 		}
 		missing = append(missing, b)
