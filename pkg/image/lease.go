@@ -51,11 +51,19 @@ const DefaultLeaseTTL = 15 * time.Minute
 // took one from a failed pull, needs no branch.
 //
 // A pull keeps its lease alive while bytes arrive (Renew, Reader): the TTL
-// bounds how long a lease outlives the last sign of progress, not how long a
-// slow pull may take. Renewal is driven by the reads themselves, so nothing
-// runs on the lease's behalf once the pull stops reading: a pull that ends, by
-// success, failure or cancellation, stops renewing in the same instant, and
-// an unreleased lease lapses one TTL after its last renewal.
+// bounds how long a lease outlives the last read that returned bytes, not how
+// long a slow pull may take. Renewal is driven by the reads themselves, so
+// nothing runs on the lease's behalf once the pull stops reading: a pull that
+// ends, by success, failure or cancellation, stops renewing in the same
+// instant, and an unreleased lease lapses one TTL after its last renewal.
+//
+// Two limits follow from renewing on reads. Work that reads nothing through a
+// Reader does not renew: the clone and re-hash of a local or partial copy
+// (CommitFromLocal) and the replay of a partial into CommitBlob. And nothing
+// caps the total: a body that keeps delivering bytes, however slowly, keeps
+// its lease. The layer stall watchdog (newLayerBody) ends a body that goes
+// silent for its window, which is shorter than DefaultLeaseTTL, so a silent
+// pull fails before its lease lapses; it does not bound a slow drip.
 type Lease struct {
 	c       *Cache
 	id      uint64

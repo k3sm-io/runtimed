@@ -531,10 +531,11 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // RESIDUAL, a pre-existing limit of the lease TTL rather than of this
 // ordering: a lease not renewed for DefaultLeaseTTL (or its own ttl) stops
 // counting. A pull's arriving bytes renew its lease (Lease.Reader), so this
-// needs a pull that receives nothing for a whole TTL. A pull that leased and
-// found a blob present before the executor's pin read, stalled until its
-// lease expired, and wrote its record
-// and hold after that read but before the entry's critical section is not
+// needs a pull that reads no bytes through its lease for a whole TTL (a
+// stalled body, or a clone and re-hash longer than a TTL; see Lease). A pull
+// that leased and found a blob present before the executor's pin read,
+// stalled until its lease expired, and wrote its record and hold after that
+// read but before the entry's critical section is not
 // seen there (no live lease, a pin set read before the record, no lease
 // acquired since that read), so the blob it found present is unlinked and
 // the record and hold name an absent blob. The pull path has no presence
