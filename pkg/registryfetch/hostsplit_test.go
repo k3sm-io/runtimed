@@ -379,3 +379,106 @@ func TestBlobRedirectChallengeScopeDoesNotReachToken(t *testing.T) {
 		t.Fatalf("origin token endpoint saw scopes %q, want exactly one request for [%q]", scopes, want)
 	}
 }
+
+// sessionClient opens a Session on origin with the real authenticating
+// transport swapped for stamp and returns its client.
+func sessionClient(t *testing.T, stamp *stampingAuth, origin string) *http.Client {
+	t.Helper()
+	host := strings.TrimPrefix(origin, "http://")
+	reg := &Registry{Transport: http.DefaultTransport, PlainHTTP: true, newAuth: stamp.newAuth}
+	_, client, err := reg.Session(context.Background(), host+"/models/tiny:v1", redirectCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// TestSessionCheckRedirectStripsCallerHeaders: a caller's own Authorization
+// and Cookie reach A, and A's 307 to its host name on another port reaches B
+// with neither. net/http alone would copy both there, since it compares host
+// names and ignores the port.
+func TestSessionCheckRedirectStripsCallerHeaders(t *testing.T) {
+	b, blog := serveOK(t)
+	a, alog := serveRedirectTo(t, b.URL)
+	client := sessionClient(t, stampAuth(t), a.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, a.URL+"/v2/models/tiny/blobs/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Basic caller")
+	req.Header.Set("Cookie", "caller=1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if ah := alog.seen(); len(ah) != 1 || ah[0].auth == "" || ah[0].cookie == "" {
+		t.Fatalf("origin saw %q, want one request with Authorization and Cookie", ah)
+	}
+	if bh := blog.seen(); len(bh) != 1 || bh[0].auth != "" || bh[0].cookie != "" {
+		t.Fatalf("other port saw %q, want one request with no Authorization and no Cookie", bh)
+	}
+}
+
+// TestSessionCheckRedirectKeepsSameOriginHeaders: a redirect within the
+// origin keeps the caller's headers, as net/http does. Cookie2 is checked
+// because the stand-in authenticating transport overwrites Authorization and
+// Cookie on every origin request.
+func TestSessionCheckRedirectKeepsSameOriginHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		seen = append(seen, req.Header.Get("Cookie2"))
+		mu.Unlock()
+		if req.URL.Path == "/first" {
+			http.Redirect(w, req, "/second", http.StatusTemporaryRedirect)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	client := sessionClient(t, &stampingAuth{}, srv.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Cookie2", "caller=1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[1] != "caller=1" {
+		t.Fatalf("origin saw Cookie2 %q, want it kept on the same-origin hop", seen)
+	}
+}
+
+// TestSessionCheckRedirectStopsAfterTen: a redirect loop stops after ten
+// hops, net/http's own limit.
+func TestSessionCheckRedirectStopsAfterTen(t *testing.T) {
+	log := &credLog{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.note(req)
+		http.Redirect(w, req, "/again", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	client := sessionClient(t, &stampingAuth{}, srv.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("want an error from a redirect loop")
+	}
+	if !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("err = %v, want the ten-redirect limit", err)
+	}
+	if n := len(log.seen()); n != 10 {
+		t.Fatalf("server saw %d requests, want 10", n)
+	}
+}

@@ -168,7 +168,34 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 		auth:   rt,
 		plain:  g.Transport,
 	}
-	return r, &http.Client{Transport: split}, nil
+	return r, &http.Client{Transport: split, CheckRedirect: stripCrossOrigin}, nil
+}
+
+// maxRedirects is net/http's own default redirect limit.
+const maxRedirects = 10
+
+// crossOriginHeaders are the headers net/http drops on a redirect to another
+// domain; stripCrossOrigin drops them on any change of origin.
+var crossOriginHeaders = []string{"Authorization", "Www-Authenticate", "Cookie", "Cookie2"}
+
+// stripCrossOrigin is the Session client's CheckRedirect. net/http copies a
+// caller's headers to a redirect target whose host name matches, whatever its
+// port or scheme; this removes the credential headers whenever the target's
+// scheme or host:port differs from the first request's, and keeps net/http's
+// ten-redirect limit. An https to http redirect is followed, not refused: it
+// is another origin, so it carries no credential either way.
+func stripCrossOrigin(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	first := via[0].URL
+	fs, ts := strings.ToLower(first.Scheme), strings.ToLower(req.URL.Scheme)
+	if fs != ts || canonicalHost(fs, first.Host) != canonicalHost(ts, req.URL.Host) {
+		for _, h := range crossOriginHeaders {
+			req.Header.Del(h)
+		}
+	}
+	return nil
 }
 
 // hostSplit routes a request to auth when its scheme and host:port are the
