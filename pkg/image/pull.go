@@ -210,7 +210,21 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
-	return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(registryTransport()))
+	return splitFetch(ctx, r, ref, cred, policy, registryTransport())
+}
+
+// splitFetch is remoteFetch over tr split by origin (registryfetch's
+// OriginSplit, the transport Session uses for blobs): cred authenticates only
+// requests to r's registry, and a redirect to another host goes over plain tr,
+// so neither the credential nor that host's 401 challenge reaches the token
+// logic. cred rides the split transport, so remoteFetch gets none.
+func splitFetch(ctx context.Context, r name.Reference, ref string, cred *RegistryCredential, policy PlatformPolicy, tr http.RoundTripper) (ggcrv1.Image, error) {
+	reg := registryfetch.Registry{Transport: tr}
+	rt, err := reg.OriginSplit(ctx, r.Context(), cred.registryfetchCredential())
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: %w", ref, boundErr(err))
+	}
+	return remoteFetch(ctx, r, ref, nil, policy, remote.WithTransport(rt))
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
@@ -975,12 +989,14 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 			}
 			body := p.newLayerBody(rc)
 			defer body.Close()
-			_, cerr := io.Copy(w, body)
+			// Arriving bytes renew the lease, so a layer slower than the
+			// lease TTL keeps the blobs this pull already holds.
+			_, cerr := io.Copy(w, lease.Reader(body))
 			return cerr
 		}
 		var wrote bool
 		if src != nil {
-			wrote, err = p.resumeBlob(ctx, *src, desc.Digest.String(), desc.Size, whole)
+			wrote, err = p.resumeBlob(ctx, *src, desc.Digest.String(), desc.Size, lease, whole)
 		} else {
 			wrote, err = p.writeBlob(desc.Digest.String(), desc.Size, whole)
 		}
@@ -1021,6 +1037,9 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 		return nil, fmt.Errorf("pull %q: record image index: %w", ref, err)
 	}
 
+	// The caller still records its own reference before it releases the
+	// lease; start that window from a fresh TTL where the throttle allows.
+	lease.Renew()
 	return &PullResult{
 		Manifest: out,
 		CacheHit: !wroteAny,
@@ -1205,7 +1224,11 @@ func (p *Puller) commitLocal(digest string, size int64) (wrote, ok bool) {
 // pull like a cut: it is no verdict on the bytes, so Poisoned does not match it
 // and the partial keeps what arrived; the commit's whole-blob digest check is
 // unchanged.
-func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, whole func(io.Writer) error) (wrote bool, err error) {
+//
+// Every read of the transfer that returns bytes renews lease (Lease.Reader), as
+// the whole-layer fill does, so a slow resumed layer keeps the blobs this pull
+// already holds. A nil lease renews nothing.
+func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, size int64, lease *Lease, whole func(io.Writer) error) (wrote bool, err error) {
 	release, cerr := p.partials.Claim(digest)
 	if cerr != nil {
 		p.logger().Debug("layer partial not claimable; fetching it whole",
@@ -1230,7 +1253,7 @@ func (p *Puller) resumeBlob(ctx context.Context, src BlobSource, digest string, 
 		Transfer: func(f *os.File, have int64) error {
 			reached = true
 			from = have
-			err := p.transferBlob(ctx, src, digest, size, f, have)
+			err := p.transferBlob(ctx, src, digest, size, lease, f, have)
 			if errors.Is(err, registryfetch.ErrBlobRange) {
 				if terr := f.Truncate(0); terr != nil {
 					return errors.Join(err, fmt.Errorf("reset partial %s: %w", digest, terr))
@@ -1364,7 +1387,7 @@ func partialEnvErr(err error) bool {
 // The body is read through the layer stall watchdog (newLayerBody): a body
 // that stops moving fails with ErrLayerBodyStalled, and the bytes before the
 // stall stay synced in f for the next pull to resume, as any cut does.
-func (p *Puller) transferBlob(ctx context.Context, src BlobSource, digest string, size int64, f *os.File, have int64) error {
+func (p *Puller) transferBlob(ctx context.Context, src BlobSource, digest string, size int64, lease *Lease, f *os.File, have int64) error {
 	rc, start, err := src.Registry.Blob(ctx, src.Ref, src.Credential, digest, size, have)
 	if err != nil {
 		return fmt.Errorf("fetch blob %s from %d: %w", digest, have, err)
@@ -1384,7 +1407,7 @@ func (p *Puller) transferBlob(ctx context.Context, src BlobSource, digest string
 	if _, err := f.Seek(have, io.SeekStart); err != nil {
 		return fmt.Errorf("seek partial %s: %w", digest, err)
 	}
-	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(body, size-have+1))
+	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(lease.Reader(body), size-have+1))
 	serr := f.Sync()
 	if have+n > size || errors.Is(cerr, registryfetch.ErrBlobOverrun) {
 		// A body past the descriptor size is wrong whatever its prefix holds:

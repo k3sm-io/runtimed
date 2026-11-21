@@ -1,0 +1,665 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package registryfetch
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+)
+
+// credSeen is the Authorization and Cookie one server saw on one request.
+type credSeen struct{ auth, cookie string }
+
+// credLog records the credential headers of each request a server sees.
+type credLog struct {
+	mu   sync.Mutex
+	reqs []credSeen
+}
+
+func (l *credLog) note(req *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reqs = append(l.reqs, credSeen{req.Header.Get("Authorization"), req.Header.Get("Cookie")})
+}
+
+func (l *credLog) seen() []credSeen {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]credSeen(nil), l.reqs...)
+}
+
+// stampingAuth stands in for the authenticating transport: it attaches an
+// Authorization and a Cookie to every request it sees and records its URL.
+type stampingAuth struct {
+	inner http.RoundTripper
+	mu    sync.Mutex
+	urls  []string
+}
+
+func (s *stampingAuth) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	s.urls = append(s.urls, req.URL.String())
+	s.mu.Unlock()
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Bearer x")
+	req.Header.Set("Cookie", "session=x")
+	return s.inner.RoundTrip(req)
+}
+
+func (s *stampingAuth) seen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.urls...)
+}
+
+// stampAuth returns a stampingAuth; its newAuth is the Registry.newAuth seam
+// that wraps the inner transport Session passes.
+func stampAuth(t *testing.T) *stampingAuth {
+	t.Helper()
+	return &stampingAuth{}
+}
+
+func (s *stampingAuth) newAuth(_ context.Context, _ name.Registry, _ authn.Authenticator, inner http.RoundTripper, _ []string) (http.RoundTripper, error) {
+	s.inner = inner
+	return s, nil
+}
+
+// serveOK starts a server that records each request and answers 200.
+func serveOK(t *testing.T) (*httptest.Server, *credLog) {
+	t.Helper()
+	log := &credLog{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.note(req)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, log
+}
+
+// serveRedirectTo starts origin A, which records each request and answers it
+// with a 307 to target plus the request path.
+func serveRedirectTo(t *testing.T, target string) (*httptest.Server, *credLog) {
+	t.Helper()
+	log := &credLog{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.note(req)
+		http.Redirect(w, req, target+req.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, log
+}
+
+// getVia opens a Session, with stamp as the authenticating transport, for a
+// repository on origin and GETs path on it.
+func getVia(t *testing.T, stamp *stampingAuth, inner http.RoundTripper, origin, path string) (*http.Response, error) {
+	t.Helper()
+	host := strings.TrimPrefix(origin, "http://")
+	reg := &Registry{Transport: inner, PlainHTTP: true, newAuth: stamp.newAuth}
+	_, client, err := reg.Session(context.Background(), host+"/models/tiny:v1", redirectCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, origin+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client.Do(req)
+}
+
+// TestSessionCheckRedirectStripsCredentials: the authenticating transport
+// stamps an Authorization and a Cookie on every request it sees; A gets both,
+// and A's 307 to another host B reaches B with neither, because B's request
+// never passes through the authenticating transport.
+func TestSessionCheckRedirectStripsCredentials(t *testing.T) {
+	stamp := stampAuth(t)
+	b, blog := serveOK(t)
+	bURL := strings.Replace(b.URL, "127.0.0.1", "localhost", 1)
+	a, alog := serveRedirectTo(t, bURL)
+	resp, err := getVia(t, stamp, http.DefaultTransport, a.URL, "/v2/models/tiny/blobs/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if ah := alog.seen(); len(ah) != 1 || ah[0].auth != "Bearer x" || ah[0].cookie != "session=x" {
+		t.Fatalf("origin saw %q, want one request with Authorization and Cookie", ah)
+	}
+	if bh := blog.seen(); len(bh) != 1 || bh[0].auth != "" || bh[0].cookie != "" {
+		t.Fatalf("second host saw %q, want one request with no Authorization and no Cookie", bh)
+	}
+	if got := stamp.seen(); len(got) != 1 || !strings.HasPrefix(got[0], a.URL) {
+		t.Fatalf("authenticating transport saw %q, want only the origin request", got)
+	}
+}
+
+// TestSessionRedirectToOtherPortIsAnotherHost: B is A's host name on another
+// port; the redirect there passes the authenticating transport by.
+func TestSessionRedirectToOtherPortIsAnotherHost(t *testing.T) {
+	stamp := stampAuth(t)
+	b, blog := serveOK(t)
+	a, alog := serveRedirectTo(t, b.URL)
+	resp, err := getVia(t, stamp, http.DefaultTransport, a.URL, "/v2/models/tiny/blobs/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if ah := alog.seen(); len(ah) != 1 || ah[0].auth != "Bearer x" {
+		t.Fatalf("origin saw %q, want one request with Authorization", ah)
+	}
+	if bh := blog.seen(); len(bh) != 1 || bh[0].auth != "" || bh[0].cookie != "" {
+		t.Fatalf("other port saw %q, want one request with no credential", bh)
+	}
+	if got := stamp.seen(); len(got) != 1 {
+		t.Fatalf("authenticating transport saw %q, want only the origin request", got)
+	}
+}
+
+// plainRecorder is the registry's plain transport: it records each URL and
+// answers https requests itself with a 200 (no TLS server shares A's port),
+// passing the rest to http.DefaultTransport.
+type plainRecorder struct {
+	mu   sync.Mutex
+	urls []string
+	reqs []credSeen
+}
+
+func (p *plainRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	p.mu.Lock()
+	p.urls = append(p.urls, req.URL.String())
+	p.reqs = append(p.reqs, credSeen{req.Header.Get("Authorization"), req.Header.Get("Cookie")})
+	p.mu.Unlock()
+	if req.URL.Scheme == "https" {
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok")), Request: req,
+		}, nil
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// TestSessionRedirectToOtherSchemeIsAnotherHost: A redirects to its own
+// host:port under https. httptest cannot serve two schemes on one port, so
+// the plain transport answers the https request itself; the point is that it,
+// not the authenticating transport, receives it, with no credential.
+func TestSessionRedirectToOtherSchemeIsAnotherHost(t *testing.T) {
+	stamp := stampAuth(t)
+	plain := &plainRecorder{}
+	log := &credLog{}
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.note(req)
+		target := strings.Replace(srv.URL, "http://", "https://", 1)
+		http.Redirect(w, req, target+req.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	resp, err := getVia(t, stamp, plain, srv.URL, "/v2/models/tiny/blobs/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if ah := log.seen(); len(ah) != 1 || ah[0].auth != "Bearer x" {
+		t.Fatalf("origin saw %q, want one request with Authorization", ah)
+	}
+	if got := stamp.seen(); len(got) != 1 || !strings.HasPrefix(got[0], "http://") {
+		t.Fatalf("authenticating transport saw %q, want only the http origin request", got)
+	}
+	plain.mu.Lock()
+	defer plain.mu.Unlock()
+	var https []credSeen
+	for i, u := range plain.urls {
+		if strings.HasPrefix(u, "https://") {
+			https = append(https, plain.reqs[i])
+		}
+	}
+	if len(https) != 1 || https[0].auth != "" || https[0].cookie != "" {
+		t.Fatalf("plain transport saw https requests %q (urls %q), want one with no credential", https, plain.urls)
+	}
+}
+
+// routeRecorder records that it was asked and answers 204.
+type routeRecorder struct{ n int }
+
+func (r *routeRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.n++
+	return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+}
+
+// TestSessionWiresRoutes: Session itself puts the newAuth result on the
+// registry's origin and Registry.Transport on every other host.
+func TestSessionWiresRoutes(t *testing.T) {
+	authMark, plainMark := &routeRecorder{}, &routeRecorder{}
+	reg := &Registry{
+		Transport: plainMark,
+		newAuth: func(context.Context, name.Registry, authn.Authenticator, http.RoundTripper, []string) (http.RoundTripper, error) {
+			return authMark, nil
+		},
+	}
+	_, client, err := reg.Session(context.Background(), "registry.example/models/tiny:v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(u string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	get("https://registry.example/v2/models/tiny/blobs/x")
+	if authMark.n != 1 || plainMark.n != 0 {
+		t.Fatalf("registry origin: auth %d plain %d, want auth 1 plain 0", authMark.n, plainMark.n)
+	}
+	get("https://blobs.example/x")
+	if authMark.n != 1 || plainMark.n != 1 {
+		t.Fatalf("other host: auth %d plain %d, want auth 1 plain 1", authMark.n, plainMark.n)
+	}
+}
+
+// challengeRecorder answers every request with 401 and a Bearer challenge.
+type challengeRecorder struct{ n int }
+
+func (c *challengeRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.n++
+	h := http.Header{"Www-Authenticate": {`Bearer realm="https://token.example/token",scope="repository:evil/x:push"`}}
+	return &http.Response{StatusCode: http.StatusUnauthorized, Header: h, Body: http.NoBody, Request: req}, nil
+}
+
+// TestSessionStripsForeignChallenge: through Session's client, a response
+// from another origin arrives without its WWW-Authenticate challenge, and a
+// response from the registry's own origin keeps it.
+func TestSessionStripsForeignChallenge(t *testing.T) {
+	authMark, plainMark := &challengeRecorder{}, &challengeRecorder{}
+	reg := &Registry{
+		Transport: plainMark,
+		newAuth: func(context.Context, name.Registry, authn.Authenticator, http.RoundTripper, []string) (http.RoundTripper, error) {
+			return authMark, nil
+		},
+	}
+	_, client, err := reg.Session(context.Background(), "registry.example/models/tiny:v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		url  string
+		keep bool
+	}{
+		{"https://registry.example/v2/models/tiny/blobs/x", true},
+		{"https://blobs.example/x", false},
+	} {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Www-Authenticate") != ""; got != tc.keep {
+			t.Errorf("%s: challenge kept = %v, want %v", tc.url, got, tc.keep)
+		}
+	}
+	if authMark.n != 1 || plainMark.n != 1 {
+		t.Errorf("auth %d plain %d, want 1 and 1", authMark.n, plainMark.n)
+	}
+}
+
+// TestHostSplitRoutes: scheme and host:port decide the route, with default
+// ports filled in and host names compared case-insensitively.
+func TestHostSplitRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		name, scheme, host, url string
+		auth                    bool
+	}{
+		{"same origin", "https", "registry.example", "https://registry.example/v2/", true},
+		{"explicit default port", "https", "registry.example", "https://registry.example:443/v2/", true},
+		{"host case", "https", "registry.example:443", "https://REGISTRY.example/v2/", true},
+		{"http default port", "http", "registry.example", "http://registry.example:80/v2/", true},
+		{"other port", "https", "registry.example", "https://registry.example:5000/v2/", false},
+		{"other host", "https", "registry.example", "https://blobs.example/v2/", false},
+		{"suffixed host", "https", "registry.example", "https://registry.example.evil/v2/", false},
+		{"ipv6 same port", "http", "[::1]:5000", "http://[::1]:5000/v2/", true},
+		{"ipv6 other port", "http", "[::1]:5000", "http://[::1]:5001/v2/", false},
+		{"trailing dot is another host", "https", "registry.example", "https://registry.example./v2/", false},
+		{"userinfo routes by host", "https", "registry.example", "https://user:pass@registry.example/v2/", true},
+	} {
+		auth, plain := &routeRecorder{}, &routeRecorder{}
+		h := &hostSplit{scheme: tc.scheme, host: canonicalHost(tc.scheme, tc.host), auth: auth, plain: plain}
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := h.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := auth.n == 1 && plain.n == 0; got != tc.auth {
+			t.Errorf("%s: registry %s://%s, request %s: auth %d plain %d, want auth route %v",
+				tc.name, tc.scheme, tc.host, tc.url, auth.n, plain.n, tc.auth)
+		}
+	}
+}
+
+// TestHostSplitRefusesDowngrade: a plain http request for an https registry
+// reaches neither route and is refused with ErrRedirectDowngrade, whose
+// message names the scheme and host but not the path or query. A client
+// stacked on the split (go-containerregistry's remote package builds its own
+// http.Client) has no Session checkRedirect to refuse such a hop first.
+func TestHostSplitRefusesDowngrade(t *testing.T) {
+	for _, tc := range []struct{ name, url string }{
+		{"other scheme", "http://registry.example/v2/x?X-Amz-Signature=secret"},
+		{"other scheme same port", "http://registry.example:443/v2/x?X-Amz-Signature=secret"},
+		{"other host", "http://blobs.example/x?X-Amz-Signature=secret"},
+	} {
+		auth, plain := &routeRecorder{}, &routeRecorder{}
+		h := &hostSplit{scheme: "https", host: canonicalHost("https", "registry.example"), auth: auth, plain: plain}
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := h.RoundTrip(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if !errors.Is(err, ErrRedirectDowngrade) {
+			t.Errorf("%s: err %v, want ErrRedirectDowngrade", tc.name, err)
+		}
+		if err != nil && (strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "/x")) {
+			t.Errorf("%s: error %q names the path or query", tc.name, err)
+		}
+		if auth.n != 0 || plain.n != 0 {
+			t.Errorf("%s: auth %d plain %d, want neither route", tc.name, auth.n, plain.n)
+		}
+	}
+	// A plain http registry is not a downgrade.
+	auth, plain := &routeRecorder{}, &routeRecorder{}
+	h := &hostSplit{scheme: "http", host: canonicalHost("http", "registry.example"), auth: auth, plain: plain}
+	req, err := http.NewRequest(http.MethodGet, "http://blobs.example/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := h.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("plain http registry, other host: %v", err)
+	}
+	resp.Body.Close()
+	if auth.n != 0 || plain.n != 1 {
+		t.Errorf("plain http registry, other host: auth %d plain %d, want plain 1", auth.n, plain.n)
+	}
+}
+
+// TestBlobRedirectChallengeScopeDoesNotReachToken: with the real
+// authenticating transport, A demands a bearer token and redirects the blob
+// GET to B, whose 401 challenge asks for scope "repository:evil/x:push". A's
+// token endpoint is asked exactly once, and only for the original pull scope.
+func TestBlobRedirectChallengeScopeDoesNotReachToken(t *testing.T) {
+	_, digest := blobData(1000)
+	blog := &credLog{}
+	var asrv *httptest.Server
+	bsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		blog.note(req)
+		// The realm is A's own token endpoint, so only the scope is foreign.
+		w.Header().Set("WWW-Authenticate",
+			`Bearer realm="`+asrv.URL+`/token",service="redirect-test",scope="repository:evil/x:push"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(bsrv.Close)
+	bURL := strings.Replace(bsrv.URL, "127.0.0.1", "localhost", 1)
+	var (
+		mu     sync.Mutex
+		scopes [][]string
+	)
+	asrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		challenge := func() {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="http://`+req.Host+`/token",service="redirect-test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+		switch {
+		case req.URL.Path == "/v2/":
+			challenge()
+		case req.URL.Path == "/token":
+			mu.Lock()
+			scopes = append(scopes, req.URL.Query()["scope"])
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"token":"`+redirectToken+`"}`)
+		case req.Header.Get("Authorization") != "Bearer "+redirectToken:
+			challenge()
+		default:
+			http.Redirect(w, req, bURL+req.URL.Path, http.StatusTemporaryRedirect)
+		}
+	}))
+	t.Cleanup(asrv.Close)
+	host := strings.TrimPrefix(asrv.URL, "http://")
+	reg := &Registry{Transport: http.DefaultTransport, PlainHTTP: true}
+	body, _, err := reg.Blob(context.Background(), host+"/models/tiny:v1", redirectCred, digest, 1000, 0)
+	if err == nil {
+		body.Close()
+		t.Fatal("a 401 from the second host was accepted as the blob")
+	}
+	if bh := blog.seen(); len(bh) != 1 || bh[0].auth != "" {
+		t.Fatalf("second host saw %q, want one request with no Authorization", bh)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := "repository:models/tiny:pull"
+	if len(scopes) != 1 || len(scopes[0]) != 1 || scopes[0][0] != want {
+		t.Fatalf("origin token endpoint saw scopes %q, want exactly one request for [%q]", scopes, want)
+	}
+}
+
+// sessionClient opens a Session on origin with the real authenticating
+// transport swapped for stamp and returns its client.
+func sessionClient(t *testing.T, stamp *stampingAuth, origin string) *http.Client {
+	t.Helper()
+	host := strings.TrimPrefix(origin, "http://")
+	reg := &Registry{Transport: http.DefaultTransport, PlainHTTP: true, newAuth: stamp.newAuth}
+	_, client, err := reg.Session(context.Background(), host+"/models/tiny:v1", redirectCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// TestSessionCheckRedirectStripsCallerHeaders: a caller's own Authorization
+// and Cookie reach A, and A's 307 to its host name on another port reaches B
+// with neither. net/http alone would copy both there, since it compares host
+// names and ignores the port.
+func TestSessionCheckRedirectStripsCallerHeaders(t *testing.T) {
+	b, blog := serveOK(t)
+	a, alog := serveRedirectTo(t, b.URL)
+	client := sessionClient(t, stampAuth(t), a.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, a.URL+"/v2/models/tiny/blobs/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Basic caller")
+	req.Header.Set("Cookie", "caller=1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if ah := alog.seen(); len(ah) != 1 || ah[0].auth == "" || ah[0].cookie == "" {
+		t.Fatalf("origin saw %q, want one request with Authorization and Cookie", ah)
+	}
+	if bh := blog.seen(); len(bh) != 1 || bh[0].auth != "" || bh[0].cookie != "" {
+		t.Fatalf("other port saw %q, want one request with no Authorization and no Cookie", bh)
+	}
+}
+
+// TestSessionCheckRedirectKeepsSameOriginHeaders: a redirect within the
+// origin keeps the caller's headers, as net/http does. Cookie2 is checked
+// because the stand-in authenticating transport overwrites Authorization and
+// Cookie on every origin request.
+func TestSessionCheckRedirectKeepsSameOriginHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		seen = append(seen, req.Header.Get("Cookie2"))
+		mu.Unlock()
+		if req.URL.Path == "/first" {
+			http.Redirect(w, req, "/second", http.StatusTemporaryRedirect)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	client := sessionClient(t, &stampingAuth{}, srv.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Cookie2", "caller=1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[1] != "caller=1" {
+		t.Fatalf("origin saw Cookie2 %q, want it kept on the same-origin hop", seen)
+	}
+}
+
+// TestSessionCheckRedirectStopsAfterTen: a redirect loop stops after ten
+// hops, net/http's own limit.
+func TestSessionCheckRedirectStopsAfterTen(t *testing.T) {
+	log := &credLog{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.note(req)
+		http.Redirect(w, req, "/again", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	client := sessionClient(t, &stampingAuth{}, srv.URL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("want an error from a redirect loop")
+	}
+	if !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("err = %v, want the ten-redirect limit", err)
+	}
+	if n := len(log.seen()); n != 10 {
+		t.Fatalf("server saw %d requests, want 10", n)
+	}
+}
+
+// TestSessionRefusesHTTPSToHTTPRedirect: an https origin's 307 to a plain
+// http host is refused before the second host gets a request.
+func TestSessionRefusesHTTPSToHTTPRedirect(t *testing.T) {
+	b, blog := serveOK(t)
+	a := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, b.URL+req.URL.Path+"?X-Amz-Signature=secret", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(a.Close)
+	host := strings.TrimPrefix(a.URL, "https://")
+	reg := &Registry{Transport: a.Client().Transport, newAuth: (&stampingAuth{}).newAuth}
+	_, client, err := reg.Session(context.Background(), host+"/models/tiny:v1", redirectCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, a.URL+"/v2/models/tiny/blobs/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("want the downgrade refused")
+	}
+	if !errors.Is(err, ErrRedirectDowngrade) {
+		t.Fatalf("err = %v, want ErrRedirectDowngrade", err)
+	}
+	// net/http's url.Error carries the target URL itself; the check is on
+	// the error this package returns inside it.
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v, want a *url.Error", err)
+	}
+	if msg := ue.Err.Error(); strings.Contains(msg, "secret") || strings.Contains(msg, "/v2/") {
+		t.Fatalf("redirect error %q, want neither the target's path nor its query", msg)
+	}
+	if n := len(blog.seen()); n != 0 {
+		t.Fatalf("http host saw %d requests, want 0", n)
+	}
+}
+
+// TestCheckRedirectSchemeRules: https to http is refused unless the registry
+// is plain http; http to https is followed; a cross-origin hop loses every
+// credential header, Proxy-Authorization included.
+func TestCheckRedirectSchemeRules(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		plainHTTP bool
+		from, to  string
+		refused   bool
+		stripped  bool
+	}{
+		{"https to http refused", false, "https://r.example/a", "http://r.example/b", true, false},
+		{"https to http with plain registry", true, "https://r.example/a", "http://r.example/b", false, true},
+		{"http to https followed", false, "http://r.example/a", "https://r.example/b", false, true},
+		{"same origin kept", false, "https://r.example/a", "https://r.example:443/b", false, false},
+		{"other host stripped", false, "https://r.example/a", "https://blobs.example/b", false, true},
+	} {
+		first, err := http.NewRequest(http.MethodGet, tc.from, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, err := http.NewRequest(http.MethodGet, tc.to, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range crossOriginHeaders {
+			next.Header.Set(h, "x")
+		}
+		err = checkRedirect(tc.plainHTTP)(next, []*http.Request{first})
+		if got := errors.Is(err, ErrRedirectDowngrade); got != tc.refused {
+			t.Errorf("%s: err = %v, want refused %v", tc.name, err, tc.refused)
+			continue
+		}
+		if tc.refused {
+			continue
+		}
+		for _, h := range crossOriginHeaders {
+			if got := next.Header.Get(h) == ""; got != tc.stripped {
+				t.Errorf("%s: %s stripped %v, want %v", tc.name, h, got, tc.stripped)
+			}
+		}
+	}
+}
