@@ -18,10 +18,13 @@ limitations under the License.
 
 package mount
 
-import "k3sm.io/runtimed/pkg/image"
+import "golang.org/x/sys/unix"
 
-// defaultCloner is the production Cloner used to copy a selected subPath element
-// into the rebased mount path: an APFS copy-on-write clone (unix.Clonefile) with a
-// byte-copy fallback on EXDEV/ENOTSUP. The staging dir and the destination live on
-// the same volume (the per-pod dir), so the clone is CoW in the common case.
-func defaultCloner() image.Cloner { return image.APFSCloner{} }
+// clonefileAt makes dstName under dstDir an APFS copy-on-write clone of the
+// regular file srcName under srcDir (clonefileat(2)), not following a link at
+// srcName. The staging dir and the destination live on the same volume (the
+// per-pod dir), so the clone is CoW in the common case; cloneFileAt
+// byte-copies when the volumes cannot clone.
+func clonefileAt(srcDir int, srcName string, dstDir int, dstName string) error {
+	return unix.Clonefileat(srcDir, srcName, dstDir, dstName, unix.CLONE_NOFOLLOW)
+}

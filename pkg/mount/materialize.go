@@ -20,13 +20,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/pathsafe"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -60,7 +64,8 @@ type Mount struct {
 	// projected volumes, or when the VolumeMount sets read_only).
 	ReadOnly bool
 	// Credential marks a secret / SA-token (or a projected volume containing one):
-	// it gets the SBPL read-only sub-scope so the pod cannot overwrite it.
+	// it gets the SBPL read-only sub-scope, so the pod cannot write the files
+	// at its path (not integrity against the pod: see the package doc).
 	Credential bool
 }
 
@@ -280,27 +285,47 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 		return nil, err
 	}
 
-	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}}}
+	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}, Mounts: map[string]MountIdentity{}}}
 	for _, pm := range plans {
 		if pm.class == classImage {
 			continue // linked by LinkImageVolumes, never materialized
+		}
+		// The data volume itself is the daemon's path and is created by path
+		// like the pod dir; everything below it is reached from it without
+		// following a link (openUnder), which also refuses a data volume that
+		// is a symlink. See openAnchor for what that trusts: a profile whose
+		// dataVolumePath is the pod dir lets the pod replace the data volume.
+		if err := os.MkdirAll(dataVol, 0o755); err != nil {
+			return nil, fmt.Errorf("create pod data volume %s: %w", dataVol, err)
 		}
 		var credential bool
 		switch pm.class {
 		case classSubPath:
 			credential, err = materializeSubPath(ctx, podIP, pm.vol, dataVol, pm.dest, pm.mount.GetSubPath(), box, r)
 		case classGeneration:
-			if err = os.MkdirAll(pm.dest, 0o755); err != nil {
+			// The mount dir is created and opened from the data volume one
+			// component at a time without following a link, and refused when
+			// a component is a symlink or not a directory: the pod owns every
+			// directory below the data volume.
+			var dir *dirTarget
+			if dir, err = openUnder(dataVol, pm.dest, true); err != nil {
 				err = fmt.Errorf("create mount dir %s: %w", pm.dest, err)
 				break
 			}
 			rd := newRender(box, podIP, r, time.Now, pm.dest, nil)
-			credential, _, err = rd.generation(ctx, pm)
+			credential, _, err = rd.generation(ctx, pm, dir)
+			dir.close()
 			if err == nil {
 				layout.State.record(pm, rd)
 			}
 		default:
-			credential, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, pm.vol, pm.dest)
+			var dir *dirTarget
+			if dir, err = openUnder(dataVol, pm.dest, true); err != nil {
+				err = fmt.Errorf("create mount dir %s: %w", pm.dest, err)
+				break
+			}
+			credential, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, pm.vol, dir)
+			dir.close()
 		}
 		if err != nil {
 			return nil, fmt.Errorf("materialize volume %s: %w", pm.mount.GetName(), err)
@@ -343,13 +368,18 @@ type render struct {
 	now   func() time.Time
 
 	// tokenBase is the mount dir token records are keyed under ("" for a flat
-	// render, which records nothing). prev is the previous records; liveDir the
-	// volume's current generation dir, set by generation() ("" when there is
-	// none). A token whose record is still fresh is re-read from liveDir instead
-	// of re-minted.
+	// render, which records nothing). prev is the previous records; live the
+	// volume's current generation dir, open, set by generation() (nil when
+	// there is none). A token whose record is still fresh is re-read from live
+	// instead of re-minted.
 	tokenBase string
 	prev      map[string]TokenIssue
-	liveDir   string
+	live      *dirTarget
+
+	// expect is the mount's identity the previous render left (nil at create
+	// or after a daemon restart); identity is the one this render leaves.
+	expect   *MountIdentity
+	identity MountIdentity
 
 	// fetched / allImmutable: at least one ConfigMap/Secret was fetched, and
 	// every one fetched reported Immutable. volatile: the volume has a token or
@@ -382,13 +412,13 @@ func (rd *render) immutable() bool {
 	return rd.fetched && rd.allImmutable && !rd.volatile
 }
 
-// generation renders pm's volume as a new atomic-writer generation under
-// pm.dest and flips to it (writeGeneration), returning whether the volume is a
-// credential and whether the flip happened (false: the content equalled the
-// live generation, which is kept).
-func (rd *render) generation(ctx context.Context, pm plannedMount) (credential, flipped bool, err error) {
-	flipped, err = writeGeneration(pm.dest, func(gen, live string) error {
-		rd.liveDir = live
+// generation renders pm's volume as a new atomic-writer generation in dir (the
+// open mount dir pm.dest) and flips to it (writeGeneration), returning whether
+// the volume is a credential and whether the flip happened (false: the content
+// equalled the live generation, which is kept).
+func (rd *render) generation(ctx context.Context, pm plannedMount, dir *dirTarget) (credential, flipped bool, err error) {
+	flipped, rd.identity, err = writeGeneration(dir, rd.expect, func(gen, live *dirTarget) error {
+		rd.live = live
 		var rerr error
 		credential, rerr = rd.volume(ctx, pm.vol, gen)
 		return rerr
@@ -396,13 +426,11 @@ func (rd *render) generation(ctx context.Context, pm plannedMount) (credential, 
 	return credential, flipped, err
 }
 
-// volume writes vol's single source into target, returning whether the volume
-// is a credential (credentialSource: secret / projected-with-secret-or-token).
-func (rd *render) volume(ctx context.Context, vol *runtimev1.Volume, target string) (credential bool, err error) {
+// volume writes vol's single source into target, an open directory, returning
+// whether the volume is a credential (credentialSource: secret /
+// projected-with-secret-or-token).
+func (rd *render) volume(ctx context.Context, vol *runtimev1.Volume, target *dirTarget) (credential bool, err error) {
 	credential = credentialSource(vol)
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return credential, fmt.Errorf("create mount dir %s: %w", target, err)
-	}
 	switch {
 	case vol.GetConfigMap() != nil:
 		return credential, rd.configMap(ctx, vol.GetConfigMap(), target)
@@ -457,7 +485,12 @@ func materializeSubPath(ctx context.Context, podIP string, vol *runtimev1.Volume
 		}
 	}()
 
-	credential, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, staging)
+	stage, err := openAnchor(staging)
+	if err != nil {
+		return false, fmt.Errorf("open subPath staging dir: %w", err)
+	}
+	credential, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, stage)
+	stage.close()
 	if err != nil {
 		return credential, err
 	}
@@ -507,35 +540,122 @@ func materializeSubPath(ctx context.Context, podIP string, vol *runtimev1.Volume
 	// tree (MaterializeTree); a FILE element IS the mount path (clone the file only,
 	// after creating its parent) — never MkdirAll(dest) for a file (that is EISDIR).
 	//
-	// SECURITY INVARIANT (dir case): MaterializeTree copies interior symlinks
-	// verbatim, and containment is verified only at the selection point (resolved),
-	// not per interior entry. This is safe ONLY because every source materialized
-	// here renders REGULAR FILES ONLY — configMap/secret/downwardAPI/projected write
-	// key->bytes, and an emptyDir is empty at this up-front, once-per-pod-create pass
-	// (no restart path re-materializes a container-populated emptyDir). If a future
-	// source can contain a symlink, the dir path MUST re-check containment per entry:
-	// an absolute interior symlink would resolve against the HOST root at runtime
-	// (k3sm has no mount namespace) — the CVE-2021-25741 escape class.
+	// The selection is copied through descriptors at both ends: the staged
+	// element is opened in the daemon-owned staging dir, the destination's
+	// directories are created and opened from the data volume one component at
+	// a time without following a link (a component that is a symlink or not a
+	// directory is refused), and each file is cloned with clonefileat(2) and
+	// CLONE_NOFOLLOW relative to the destination's descriptor (byte-copied
+	// through descriptors where APFS cannot clone). A directory selection
+	// holds regular files and directories only: anything else in it is
+	// refused (cloneTreeAt), the CVE-2021-25741 class, since a symlink would
+	// resolve against the host root at runtime (k3sm has no mount namespace).
 	if kind.IsDir() {
-		if err := os.MkdirAll(dest, 0o755); err != nil {
-			return credential, fmt.Errorf("create sub_path mount dir %s: %w", dest, err)
-		}
-		if _, err := image.MaterializeTree(defaultCloner(), resolved, dest); err != nil {
+		if err := cloneTreeAt(dataVol, resolved, dest); err != nil {
 			return credential, fmt.Errorf("materialize sub_path dir %q: %w", subPath, err)
 		}
 		return credential, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return credential, fmt.Errorf("create sub_path parent %s: %w", filepath.Dir(dest), err)
-	}
-	if _, err := defaultCloner().Clone(resolved, dest); err != nil {
+	if err := cloneFileTo(dataVol, resolved, dest); err != nil {
 		return credential, fmt.Errorf("clone sub_path file %q: %w", subPath, err)
 	}
 	return credential, nil
 }
 
+// cloneFileTo copies the staged regular file src to dest under dataVol. src's
+// directory is the daemon's own staging dir; dest's parent is reached from
+// dataVol without following a link, and dest must not exist.
+func cloneFileTo(dataVol, src, dest string) error {
+	sp, err := openAnchor(filepath.Dir(src))
+	if err != nil {
+		return err
+	}
+	defer sp.close()
+	dp, err := openUnder(dataVol, filepath.Dir(dest), true)
+	if err != nil {
+		return fmt.Errorf("create sub_path parent %s: %w", filepath.Dir(dest), err)
+	}
+	defer dp.close()
+	return cloneFileAt(sp.fd, filepath.Base(src), dp.fd, filepath.Base(dest))
+}
+
+// cloneTreeAt copies the staged directory src into dest under dataVol, keeping
+// its structure and modes. dest and every directory below it are reached from
+// dataVol without following a link; a file already at a destination name is
+// left in place (as image.MaterializeTree leaves it), and src may hold only
+// regular files and directories.
+func cloneTreeAt(dataVol, src, dest string) error {
+	st, err := openAnchor(src)
+	if err != nil {
+		return err
+	}
+	defer st.close()
+	dt, err := openUnder(dataVol, dest, true)
+	if err != nil {
+		return fmt.Errorf("create sub_path mount dir %s: %w", dest, err)
+	}
+	defer dt.close()
+	return walkAt(st, func(rel string, sst *unix.Stat_t, parent int, name string) error {
+		switch uint32(sst.Mode) & unix.S_IFMT {
+		case unix.S_IFDIR:
+			fd, err := pathsafe.OpenDirFrom(dt.fd, dt.path, rel, true, uint32(sst.Mode)&0o777|0o100)
+			if err != nil {
+				return err
+			}
+			unix.Close(fd)
+			return nil
+		case unix.S_IFREG:
+			pfd, err := pathsafe.OpenDirFrom(dt.fd, dt.path, filepath.Dir(rel), false, 0)
+			if err != nil {
+				return err
+			}
+			defer unix.Close(pfd)
+			var dst unix.Stat_t
+			if unix.Fstatat(pfd, name, &dst, unix.AT_SYMLINK_NOFOLLOW) == nil {
+				return nil // already there: left in place
+			}
+			return cloneFileAt(parent, name, pfd, name)
+		default:
+			return fmt.Errorf("sub_path entry %q is neither a regular file nor a directory", rel)
+		}
+	})
+}
+
+// cloneFileAt clones the regular file srcName under srcDir to dstName under
+// dstDir (which must not exist), never following a link at either end, and
+// byte-copies through descriptors where the volumes cannot clone.
+func cloneFileAt(srcDir int, srcName string, dstDir int, dstName string) error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(srcDir, srcName, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if uint32(st.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("%s is not a regular file", srcName)
+	}
+	err := clonefileAt(srcDir, srcName, dstDir, dstName)
+	if err == nil || !image.IsCloneUnsupported(err) {
+		return err
+	}
+	in, err := unix.Openat(srcDir, srcName, unix.O_RDONLY|fileOpenFlags, 0)
+	if err != nil {
+		return err
+	}
+	inf := os.NewFile(uintptr(in), srcName)
+	defer inf.Close()
+	out, err := unix.Openat(dstDir, dstName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|fileOpenFlags, 0o600)
+	if err != nil {
+		return err
+	}
+	outf := os.NewFile(uintptr(out), dstName)
+	defer outf.Close()
+	if _, err := io.Copy(outf, inf); err != nil {
+		return err
+	}
+	return unix.Fchmod(out, uint32(st.Mode)&0o7777)
+}
+
 // configMap writes a ConfigMap's keys as files under target.
-func (rd *render) configMap(ctx context.Context, src *runtimev1.ConfigMapVolumeSource, target string) error {
+func (rd *render) configMap(ctx context.Context, src *runtimev1.ConfigMapVolumeSource, target *dirTarget) error {
 	data, err := rd.fetchConfigMap(ctx, src.GetName(), src.GetOptional())
 	if err != nil {
 		return err
@@ -545,7 +665,7 @@ func (rd *render) configMap(ctx context.Context, src *runtimev1.ConfigMapVolumeS
 
 // secret writes a Secret's keys as files under target (read-only sub-scope
 // applied SBPL-side by the caller).
-func (rd *render) secret(ctx context.Context, src *runtimev1.SecretVolumeSource, target string) error {
+func (rd *render) secret(ctx context.Context, src *runtimev1.SecretVolumeSource, target *dirTarget) error {
 	data, err := rd.fetchSecret(ctx, src.GetSecretName(), src.GetOptional())
 	if err != nil {
 		return err
@@ -556,7 +676,7 @@ func (rd *render) secret(ctx context.Context, src *runtimev1.SecretVolumeSource,
 // renderEmptyDir is a no-op beyond the MkdirAll the caller already did.
 
 // renderDownwardAPI writes each downward-API field projection as a file.
-func renderDownwardAPI(src *runtimev1.DownwardAPIVolumeSource, target string, box *runtimev1.PodBox, podIP string) error {
+func renderDownwardAPI(src *runtimev1.DownwardAPIVolumeSource, target *dirTarget, box *runtimev1.PodBox, podIP string) error {
 	dflt := modeOr(src.GetDefaultMode())
 	for _, item := range src.GetItems() {
 		val, err := resolveDownwardField(box, podIP, item.GetFieldRef().GetFieldPath())
@@ -576,7 +696,7 @@ func renderDownwardAPI(src *runtimev1.DownwardAPIVolumeSource, target string, bo
 
 // projected layers each projection source into the same target dir. Whether
 // the volume is a credential is credentialSource's verdict, not this walk's.
-func (rd *render) projected(ctx context.Context, src *runtimev1.ProjectedVolumeSource, target string) error {
+func (rd *render) projected(ctx context.Context, src *runtimev1.ProjectedVolumeSource, target *dirTarget) error {
 	dflt := modeOr(src.GetDefaultMode())
 	for _, p := range src.GetSources() {
 		switch {
@@ -627,7 +747,7 @@ func (rd *render) projected(ctx context.Context, src *runtimev1.ProjectedVolumeS
 // the live generation rather than re-minted (the kubelet token manager's rule);
 // any other — no record, a record past 80% of its lifetime, or a live file that
 // cannot be read — is minted fresh and recorded.
-func (rd *render) token(ctx context.Context, sat *runtimev1.ServiceAccountTokenProjection, mode os.FileMode, target string) error {
+func (rd *render) token(ctx context.Context, sat *runtimev1.ServiceAccountTokenProjection, mode os.FileMode, target *dirTarget) error {
 	rd.volatile = true
 	if rd.r == nil {
 		return errNoResolver
@@ -637,9 +757,9 @@ func (rd *render) token(ctx context.Context, sat *runtimev1.ServiceAccountTokenP
 		key = filepath.Join(rd.tokenBase, sat.GetPath())
 	}
 	now := rd.now()
-	if key != "" && rd.liveDir != "" {
+	if key != "" && rd.live != nil {
 		if iss, ok := rd.prev[key]; ok && !iss.due(now) {
-			if b, err := readContained(rd.liveDir, sat.GetPath()); err == nil {
+			if b, err := readFileAt(rd.live, sat.GetPath(), maxVolumeBytes); err == nil {
 				rd.tokens[key] = iss
 				return writeFile(target, sat.GetPath(), b, mode)
 			}
@@ -704,27 +824,10 @@ func resolveData(kind, ns, name string, optional bool, fetch func() (SourceData,
 	return src, nil
 }
 
-// readContained reads the regular file rel under base, refusing a path that
-// escapes base or names anything but a regular file.
-func readContained(base, rel string) ([]byte, error) {
-	p := filepath.Join(base, rel)
-	if rel == "" || !isUnder(p, base) {
-		return nil, fmt.Errorf("path %q escapes %s", rel, base)
-	}
-	fi, err := os.Lstat(p)
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", p)
-	}
-	return os.ReadFile(p)
-}
-
 // writeKeyed writes data into target. With items set, only the named keys are
 // projected (to their item paths/modes); otherwise every key is written to a file
 // of the same name. A selected key absent from data is an error unless optional.
-func writeKeyed(target string, data map[string][]byte, items []*runtimev1.KeyToPath, dflt os.FileMode, optional bool) error {
+func writeKeyed(target *dirTarget, data map[string][]byte, items []*runtimev1.KeyToPath, dflt os.FileMode, optional bool) error {
 	if len(items) > 0 {
 		for _, item := range items {
 			val, ok := data[item.GetKey()]
@@ -753,28 +856,6 @@ func writeKeyed(target string, data map[string][]byte, items []*runtimev1.KeyToP
 		if err := writeFile(target, k, data[k], dflt); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// writeFile writes content to rel under base, creating parent dirs, then chmods
-// to mode exactly (independent of umask). rel may not escape base.
-func writeFile(base, rel string, content []byte, mode os.FileMode) error {
-	if rel == "" {
-		return errors.New("empty file path in volume projection")
-	}
-	p := filepath.Join(base, rel)
-	if !isUnder(p, base) {
-		return fmt.Errorf("projection path %q escapes the volume", rel)
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return fmt.Errorf("create dir for %s: %w", p, err)
-	}
-	if err := os.WriteFile(p, content, mode); err != nil {
-		return fmt.Errorf("write %s: %w", p, err)
-	}
-	if err := os.Chmod(p, mode); err != nil {
-		return fmt.Errorf("chmod %s: %w", p, err)
 	}
 	return nil
 }

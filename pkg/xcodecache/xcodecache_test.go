@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 func TestValidKey(t *testing.T) {
@@ -354,7 +356,7 @@ func TestRemoveTreeAtDoesNotFollowLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	if err := removeTreeAt(int(d.Fd()), "tree"); err != nil {
+	if err := pathsafe.RemoveTreeAt(int(d.Fd()), "tree", removeBounds); err != nil {
 		t.Fatalf("removeTreeAt: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "tree")); !errors.Is(err, os.ErrNotExist) {
@@ -363,7 +365,7 @@ func TestRemoveTreeAtDoesNotFollowLinks(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(keep, "f")); err != nil || string(b) != "keep" {
 		t.Errorf("the link's target was touched: %q, %v", b, err)
 	}
-	if err := removeTreeAt(int(d.Fd()), "tree"); err != nil {
+	if err := pathsafe.RemoveTreeAt(int(d.Fd()), "tree", removeBounds); err != nil {
 		t.Errorf("removing a name that is gone: %v", err)
 	}
 }
