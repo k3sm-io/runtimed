@@ -475,7 +475,10 @@ type Posture struct {
 	// keystorepaths.SockDir trees, under <WorkDir>
 	// always and under this value when it is set and differs, are denied every
 	// read, write and unix-socket connect or bind as the profile's last rule.
-	// A pods root under such a name is refused (ErrInvalidDataRoot).
+	// A pods root under such a name is refused (ErrInvalidDataRoot). An empty
+	// value does not refuse the profile (the standalone daemon has no data root
+	// to name): the keystore denies then stand under <WorkDir> alone, where the
+	// default node keeps its data root; they are never skipped.
 	DataRoot string
 	// StateDir is the role's real state directory: the k3sm --work-dir itself,
 	// which holds the CA keys, the kine database and the node password. The

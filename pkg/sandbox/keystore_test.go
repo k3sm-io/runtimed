@@ -666,3 +666,42 @@ func TestValidateRefusesKeystoreExtraPaths(t *testing.T) {
 		}
 	}
 }
+
+// TestEmptyDataRootFailsClosed pins what a profile with no data root does. It
+// cannot refuse: the standalone k3sm-runtimed has no data-root setting, and
+// the zero Posture is documented usable. So it denies the keystore paths
+// under the work dir, where the default node keeps its data root, rather than
+// rendering no keystore deny at all; and a set data root the denies cannot be
+// written from (relative, unclean, "/", a quote the profile would rewrite)
+// refuses the whole profile.
+func TestEmptyDataRootFailsClosed(t *testing.T) {
+	for _, work := range []string{"", DefaultWorkDir, "/opt/k3sm-pods"} {
+		dir := work
+		if dir == "" {
+			dir = DefaultWorkDir
+		}
+		prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dir + "/pods/p1/rootfs"}, GenerateOptions{Posture: Posture{WorkDir: work}})
+		if err != nil {
+			t.Fatalf("work dir %q: Generate: %v", work, err)
+		}
+		rules := sbplRules(t, prof)
+		for _, spelling := range dataRootSpellings(dir) {
+			for _, n := range keystoreNames {
+				for _, op := range keystoreOps {
+					if ok, by := verdict(t, rules, sbplQuery{op: op, path: filepath.Join(spelling, n)}); ok {
+						t.Errorf("work dir %q: %s %s allowed by %s", work, op, n, by)
+					}
+				}
+			}
+		}
+		if !strings.Contains(prof, `(regex #"`+keystorePrefixPattern(firmlinkForms(dir)[len(firmlinkForms(dir))-1])+`")`) {
+			t.Errorf("work dir %q: no keystore regex deny under the work dir:\n%s", work, prof)
+		}
+	}
+	for _, bad := range []string{"relative/k3sm", "/var/lib/k3sm/", "/", "/var/lib/k3\"sm"} {
+		_, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: DefaultWorkDir + "/pods/p1/rootfs"}, GenerateOptions{Posture: Posture{DataRoot: bad}})
+		if !errors.Is(err, ErrInvalidDataRoot) {
+			t.Errorf("data root %q: err = %v, want ErrInvalidDataRoot", bad, err)
+		}
+	}
+}
