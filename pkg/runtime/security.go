@@ -61,6 +61,33 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 	}
 }
 
+// fsGroupOwners is the set of uids whose entries the fsGroup walk may regroup
+// in a pod's tree (supervisor.ChownForFSGroup): the uid each of the pod's
+// containers runs as, and the daemon's own uid (euid). Image content is
+// extracted and cloned into the rootfs by the daemon, which applies no tar
+// owner on the native dialect (pkg/image LayerApplier.Ownership), so the daemon
+// owns it; a container that requests no drop also runs at the daemon's uid,
+// the same rule resolveCredential's callers apply. An entry any other uid owns
+// came from outside the pod's content, for instance renamed in from a writable
+// share, and the walk leaves it alone.
+func fsGroupOwners(box *runtimev1.PodBox, euid int) []int {
+	owners := []int{euid}
+	seen := map[int]bool{euid: true}
+	for _, list := range [][]*runtimev1.Container{box.GetInitContainers(), box.GetContainers(), box.GetEphemeralContainers()} {
+		for _, c := range list {
+			cred := resolveCredential(box, c)
+			if !cred.Drop || cred.UID == 0 {
+				continue // runs at the daemon's uid
+			}
+			if !seen[cred.UID] {
+				seen[cred.UID] = true
+				owners = append(owners, cred.UID)
+			}
+		}
+	}
+	return owners
+}
+
 // firstNonZero returns the first non-zero value, or 0 if all are zero.
 func firstNonZero(vals ...int) int {
 	for _, v := range vals {

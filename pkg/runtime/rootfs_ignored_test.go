@@ -157,9 +157,9 @@ func assertOneRetiredWarning(t *testing.T, logs *levelCapture, podID, value stri
 // rather than failing with EPERM) against the hostile path, and the before/after
 // permTree snapshots of the victim trees would differ.
 func TestCreatePodIgnoresCallerRootfsPath(t *testing.T) {
-	gid := os.Getgid()
+	gid := testFSGroupGid()
 	if gid <= 0 {
-		t.Fatal("test process gid <= 0 (running as root?): this gate runs unprivileged by design — the fsGroup sink assertions need a >0 gid the test owns — so run it as a normal user rather than skipping a security leg")
+		t.Fatal("the test process has no gid above 0 that the fsGroup walk accepts (running as root?): this gate runs unprivileged by design — the fsGroup sink assertions need a >0 gid the test owns — so run it as a normal user rather than skipping a security leg")
 	}
 
 	t.Run("hostile-values-are-ignored", func(t *testing.T) {

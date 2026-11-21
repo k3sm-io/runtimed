@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -45,6 +46,39 @@ var ErrFSGroupTreeTooLarge = errors.New("fsGroup chown tree is too large")
 // gone before it is listed: something is rearranging the tree under the walk,
 // and the walk stops.
 var ErrFSGroupEntryChanged = errors.New("fsGroup chown entry changed under the walk")
+
+// ErrFSGroupForeignOwner is returned when root itself is owned by a uid outside
+// the owners the caller names: the tree is not the pod's to regroup.
+var ErrFSGroupForeignOwner = errors.New("fsGroup chown root is owned by a uid the pod does not run as")
+
+// ErrFSGroupGidRefused is returned for a gid the walk will not hand a pod's
+// tree to: wheel, or one of the system groups in fsGroupRefusedGids.
+var ErrFSGroupGidRefused = errors.New("fsGroup chown gid is a system group")
+
+// fsGroupRefusedGids are the macOS system groups whose membership is a
+// privilege (wheel is refused with every gid <= 0). A blanket refusal of
+// every gid below 500 is not made here: the foreign-user admission policy
+// (k3sm pkg/policy) admits only fsGroup == the pod-execution uid, which on
+// the shipped posture is the _k3sm service user's uid (below 500), so it would
+// refuse every fsGroup pod admission lets through.
+var fsGroupRefusedGids = map[int]string{
+	1:  "daemon",
+	2:  "kmem",
+	3:  "sys",
+	4:  "tty",
+	5:  "operator",
+	8:  "procview",
+	9:  "procmod",
+	20: "staff",
+	80: "admin",
+}
+
+// FSGroupGidRefused reports whether ChownForFSGroup refuses gid: wheel and
+// anything <= 0, and the system groups in fsGroupRefusedGids.
+func FSGroupGidRefused(gid int) bool {
+	_, refused := fsGroupRefusedGids[gid]
+	return gid <= 0 || refused
+}
 
 // The walk's bounds. The tree is written by the pod, so each bounds what a pod
 // can make the daemon spend, and each fails closed: the walk stops with an
@@ -118,6 +152,9 @@ var (
 	// fsGroupOnReopen runs each time the walk re-opens a directory level it
 	// had closed, before the open.
 	fsGroupOnReopen func()
+	// fsGroupOwnerOf, when set, replaces the owner the walk read from an
+	// opened entry: an unprivileged test cannot make a file another uid owns.
+	fsGroupOwnerOf func(path string, uid uint32) uint32
 )
 
 // FSGroupReport says what a walk did not change, and why. A skipped entry is
@@ -144,10 +181,15 @@ type FSGroupReport struct {
 	// came. What lay below such a directory was not changed. Root itself
 	// being gone is an error, not a count.
 	Vanished int
-	// SetID counts files with the setuid or setgid bit. They get the group
-	// and the owner's read and execute bits, and are not made group-writable:
-	// whoever can write such a file can run code as its owner or group. They
-	// are counted in Changed, not in Skipped.
+	// ForeignOwner counts entries owned by a uid outside the owners the
+	// caller named: something put there from outside the pod's own content,
+	// such as an entry renamed in from a writable share. A directory counted
+	// here is not entered.
+	ForeignOwner int
+	// SetID counts files whose setuid or setgid bit the walk cleared before
+	// setting their group, as a chown on Linux does: a file the pod wrote
+	// must not become setgid to the fsGroup, or setuid to its owner with a
+	// group that can write it. They are counted in Changed, not in Skipped.
 	SetID int
 	// Examples names up to fsGroupReportExamples of the entries counted in
 	// the fields after Changed, each as "<reason>: <path>", cut to
@@ -157,7 +199,7 @@ type FSGroupReport struct {
 
 // Skipped is the number of entries the walk left as they were.
 func (r FSGroupReport) Skipped() int {
-	return r.MultiLink + r.Special + r.OtherDevice + r.Unopenable + r.Vanished
+	return r.MultiLink + r.Special + r.OtherDevice + r.Unopenable + r.Vanished + r.ForeignOwner
 }
 
 // note counts one entry under counter and, while there is room, names it. The
@@ -172,14 +214,20 @@ func (r *FSGroupReport) note(counter *int, reason string, path func() string) {
 	r.Examples = append(r.Examples, fsGroupClip(reason+": "+path()))
 }
 
-// fsGroupClip cuts s to fsGroupExampleMax bytes. Every path the walk puts in
-// an example or an error goes through it: the paths are the pod's to choose,
-// and both end up in the daemon's log.
+// fsGroupClip cuts s to fsGroupExampleMax bytes, on a UTF-8 boundary. Every
+// path the walk puts in an example or an error goes through it: the paths are
+// the pod's to choose, and both end up in the daemon's log.
 func fsGroupClip(s string) string {
-	if len(s) > fsGroupExampleMax {
-		return s[:fsGroupExampleMax-3] + "..."
+	if len(s) <= fsGroupExampleMax {
+		return s
 	}
-	return s
+	n := fsGroupExampleMax - 3
+	// Back off to the start of a rune, at most utf8.UTFMax-1 bytes: a name
+	// that is not UTF-8 at all is still cut near the limit.
+	for i := 0; i < utf8.UTFMax-1 && n > 0 && !utf8.RuneStart(s[n]); i++ {
+		n--
+	}
+	return s[:n] + "..."
 }
 
 // ChownForFSGroup recursively sets group ownership of root to gid and makes it
@@ -212,12 +260,18 @@ func fsGroupClip(s string) string {
 // link to a file elsewhere, and a process of an earlier instance of the pod can
 // still be running while the next one is created. What the walk guarantees is
 // that everything it changes is an inode that had a name in the tree when the
-// walk opened it (and, for a file, no other name). It does not cover an inode
-// renamed into the tree from outside it (rename-in: the sandbox profile is what
-// keeps a pod from reaching files outside its tree to move them in), nor a
-// subtree the walk holds open that is renamed out of the tree while it is held
-// (the walk goes on inside it; the pod can only move its own directories, and
-// only to where it can write). So:
+// walk opened it (and, for a file, no other name) and is owned by one of the
+// uids in owners. The caller names those: the uids the pod's processes run as
+// and the uid that owns the content the daemon put in the tree. An inode
+// renamed into the tree from outside it keeps its one link, and the sandbox
+// does not stop that from a location the pod may write: pkg/sandbox
+// TestPodRenameIntoItsRootfsUnderSandboxExec measures a file and a directory
+// moved in from a read-write host share (the same holds for any writable
+// volume on the same file system). The owner check is what keeps such an
+// entry, when another tenant owns it, from being regrouped; one owned by a uid
+// in owners is not told apart from the pod's own. A subtree the walk holds
+// open that is renamed out of the tree while it is held is not covered: the
+// walk goes on inside it, still changing only entries owned by owners. So:
 //
 //   - Nothing below bound is resolved by path. bound is opened without
 //     following a link, and every directory from there down is opened with
@@ -231,13 +285,16 @@ func fsGroupClip(s string) string {
 //     tell: counting the links it meets is no proof against a process that
 //     moves one while the walk runs. The check covers the links that exist
 //     when the entry is opened and examined. It does not cover a link made
-//     between that fstat and the fchown, which needs no second layer: the
-//     file had one link, inside the tree, so it was the pod's own, and a link
-//     the pod adds to its own file gives it nothing. Nor does it cover a file
-//     MOVED into the tree, which keeps one link. The profile denies a pod a
-//     link to a file outside its rootfs (pkg/sandbox
-//     TestPodHardLinkIntoItsRootfsUnderSandboxExec measures that for the
-//     cases it lists); the skip is a second layer behind that.
+//     between that fstat and the fchown: a link the pod adds then, to a file
+//     in owners' hands, gives it nothing it could not do to that file
+//     already. Nor does it cover a file MOVED into the tree, which keeps one
+//     link (the owner check below covers that). The profile denies a pod a
+//     link to a file outside its rootfs except in a location it may write
+//     (pkg/sandbox TestPodHardLinkIntoItsRootfsUnderSandboxExec measures the
+//     cases it lists, a read-write share among them).
+//   - An entry owned by a uid outside owners is skipped and counted
+//     (FSGroupReport.ForeignOwner), and a directory so owned is not entered.
+//     A root so owned is an error (ErrFSGroupForeignOwner).
 //   - A directory on another device than root is a mount point; it is skipped
 //     and not entered.
 //   - Sockets and device nodes are skipped: a socket cannot be opened, and
@@ -257,22 +314,22 @@ func fsGroupClip(s string) string {
 //   - a directory: group gid, the owner's rwx copied to the group, and setgid,
 //     so files created later inherit the group;
 //   - a regular file or FIFO: group gid and the owner's rwx copied to the
-//     group. A FIFO is opened non-blocking, which returns at once. A file
-//     that still has the setuid or setgid bit once its group is set (it does
-//     when the caller is root) gets the owner's read and execute bits and
-//     not write: a group that could write it could run code as its owner;
+//     group. A FIFO is opened non-blocking, which returns at once. Its setuid
+//     and setgid bits are cleared before its group is set, as a chown on
+//     Linux clears them, and the walk counts that (FSGroupReport.SetID): on
+//     Darwin a chown by root keeps them, and a file the pod wrote would come
+//     out setgid to the fsGroup;
 //   - a symlink: group gid on the link itself (it is opened as a link) and no
 //     mode change, and the walk does not go through it. A root that is itself
 //     a symlink is handled the same way and nothing below its target is
 //     touched. On a system that cannot open a symlink as itself, links are
 //     left alone and counted in FSGroupReport.Special;
-//   - the special bits an entry has once its group is set are kept: the
-//     sticky bit always, and setuid and setgid unless the chown cleared them,
-//     which it does for a caller that is not root.
+//   - the sticky bit is kept, and a directory's setuid bit.
 //
-// It differs from that walk in what it skips (above), in not making a setuid
-// or setgid file group-writable, and in refusing a symlinked directory between
-// bound and root, which the by-path walk followed. The report says what was
+// It differs from that walk in what it skips (above), in clearing setuid and
+// setgid on what is not a directory (the by-path walk kept them when it ran as
+// root), and in refusing a symlinked directory between bound and root, which
+// the by-path walk followed. The report says what was
 // skipped; the caller logs it.
 //
 // The walk is bounded (see maxFSGroupDepth and the bounds beside it), keeps at
@@ -281,11 +338,26 @@ func fsGroupClip(s string) string {
 // directory level it re-opens. It has no time bound of its own; the context is
 // the caller's. The first error stops it, and the paths in errors are cut to
 // fsGroupExampleMax bytes. A gid <= 0 is rejected: 0 (wheel) is never a valid
-// fsGroup target and a negative gid is a programming error.
-func ChownForFSGroup(ctx context.Context, bound, root string, gid int) (FSGroupReport, error) {
+// fsGroup target and a negative gid is a programming error. A gid in
+// fsGroupRefusedGids is refused with ErrFSGroupGidRefused, and an empty
+// owners, or a negative uid in it, is a programming error.
+func ChownForFSGroup(ctx context.Context, bound, root string, gid int, owners []int) (FSGroupReport, error) {
 	var rep FSGroupReport
 	if gid <= 0 {
 		return rep, fmt.Errorf("fsGroup chown: invalid gid %d", gid)
+	}
+	if name, ok := fsGroupRefusedGids[gid]; ok {
+		return rep, fmt.Errorf("%w: gid %d (%s)", ErrFSGroupGidRefused, gid, name)
+	}
+	if len(owners) == 0 {
+		return rep, errors.New("fsGroup chown: no owners named")
+	}
+	owned := make(map[uint32]bool, len(owners))
+	for _, u := range owners {
+		if u < 0 {
+			return rep, fmt.Errorf("fsGroup chown: invalid owner uid %d", u)
+		}
+		owned[uint32(u)] = true
 	}
 	if !strictlyUnder(root, bound) {
 		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, fsGroupClip(root), fsGroupClip(bound))
@@ -314,7 +386,7 @@ func ChownForFSGroup(ctx context.Context, bound, root string, gid int) (FSGroupR
 		parent = next
 	}
 
-	w := &fsGroupWalk{ctx: ctx, gid: gid, root: root, rootMsg: fsGroupClip(root), rep: &rep}
+	w := &fsGroupWalk{ctx: ctx, gid: gid, owned: owned, root: root, rootMsg: fsGroupClip(root), rep: &rep}
 	defer w.closeHeld()
 	rootNode, err := w.apply(parent, comps[len(comps)-1], nil, func() string { return root })
 	if err != nil || rootNode == nil {
@@ -363,9 +435,11 @@ type fsGroupHeld struct {
 
 // fsGroupWalk is the state of one walk.
 type fsGroupWalk struct {
-	ctx  context.Context
-	gid  int
-	root string
+	ctx context.Context
+	gid int
+	// owned is the uids whose entries the walk may change.
+	owned map[uint32]bool
+	root  string
 	// rootMsg is root cut for messages.
 	rootMsg string
 	rep     *FSGroupReport
@@ -670,6 +744,17 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 	if uint32(st.Mode)&unix.S_IFMT != kind {
 		return nil, fmt.Errorf("%w: %s changed kind while it was being walked", ErrFSGroupEntryChanged, fsGroupClip(path()))
 	}
+	uid := st.Uid
+	if fsGroupOwnerOf != nil {
+		uid = fsGroupOwnerOf(path(), uid)
+	}
+	if !w.owned[uid] {
+		if dir == nil {
+			return nil, fmt.Errorf("%w: %s is owned by uid %d", ErrFSGroupForeignOwner, w.rootMsg, uid)
+		}
+		w.rep.note(&w.rep.ForeignOwner, "owned by a uid the pod does not run as", path)
+		return nil, nil
+	}
 	if kind == unix.S_IFDIR {
 		if !w.rootSet {
 			w.rootDev, w.rootSet = uint64(st.Dev), true
@@ -681,6 +766,14 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 		w.rep.note(&w.rep.MultiLink, "more than one hard link", path)
 		return nil, nil
 	}
+	if kind != unix.S_IFDIR && kind != unix.S_IFLNK && uint32(st.Mode)&(unix.S_ISUID|unix.S_ISGID) != 0 {
+		// Cleared before the group is set, so the file is never setgid to
+		// the fsGroup, not even between the two calls.
+		if err := unix.Fchmod(fd, uint32(st.Mode)&0o7777&^(unix.S_ISUID|unix.S_ISGID)); err != nil {
+			return nil, fmt.Errorf("fsGroup chmod %s: %w", fsGroupClip(path()), err)
+		}
+		w.rep.note(&w.rep.SetID, "setuid or setgid, cleared", path)
+	}
 	if err := unix.Fchown(fd, -1, w.gid); err != nil {
 		return nil, fmt.Errorf("fsGroup chown %s: %w", fsGroupClip(path()), err)
 	}
@@ -691,16 +784,11 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 	if fsGroupBeforeChmod != nil {
 		fsGroupBeforeChmod(path())
 	}
-	// The mode is read after the chown, as the by-path walk read it: a chown
-	// by an unprivileged caller clears setuid and setgid, and the walk must
-	// not put them back.
+	// The mode is read after the chown, from the descriptor.
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, fmt.Errorf("fsGroup chown %s: %w", fsGroupClip(path()), err)
 	}
-	mode, withheld := fsGroupMode(uint32(st.Mode), kind == unix.S_IFDIR)
-	if withheld {
-		w.rep.note(&w.rep.SetID, "setuid or setgid, not made group-writable", path)
-	}
+	mode := fsGroupMode(uint32(st.Mode), kind == unix.S_IFDIR)
 	if err := unix.Fchmod(fd, mode); err != nil {
 		return nil, fmt.Errorf("fsGroup chmod %s: %w", fsGroupClip(path()), err)
 	}
@@ -712,23 +800,16 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 	return node, nil
 }
 
-// fsGroupMode is the mode an entry with mode st gets: its permission and
-// special bits with the owner's rwx copied to the group, and setgid on a
-// directory. A file that is setuid or setgid does not get the owner's write
-// bit copied (a group that can write such a file can run code as its owner or
-// group); withheld reports that this left the group without a write bit the
-// owner has. A group write bit the file already had is not taken away.
-func fsGroupMode(st uint32, isDir bool) (mode uint32, withheld bool) {
-	mode = st & 0o7777
+// fsGroupMode is the mode an entry with mode st gets: its permission bits with
+// the owner's rwx copied to the group, the sticky bit kept, setgid added on a
+// directory, and setuid and setgid cleared on anything else.
+func fsGroupMode(st uint32, isDir bool) uint32 {
+	mode := st & 0o7777
 	grant := (mode & 0o700) >> 3
 	if isDir {
-		return mode | grant | unix.S_ISGID, false
+		return mode | grant | unix.S_ISGID
 	}
-	if mode&(unix.S_ISUID|unix.S_ISGID) != 0 && grant&0o020 != 0 {
-		grant &^= 0o020
-		withheld = mode&0o020 == 0
-	}
-	return mode | grant, withheld
+	return (mode &^ (unix.S_ISUID | unix.S_ISGID)) | grant
 }
 
 // strictlyUnder reports whether path is a proper descendant of base (both

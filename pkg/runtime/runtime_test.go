@@ -1697,8 +1697,9 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 501, RunAsGroup: 20},
 		}},
 	}
-	// fsGroup chown is exercised only when the test gid is a real (>0) group.
-	if gid := os.Getgid(); gid > 0 {
+	// fsGroup chown is exercised only when the test process has a real (>0)
+	// group the walk accepts.
+	if gid := testFSGroupGid(); gid > 0 {
 		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: int64(gid)}
 	}
 
@@ -1879,3 +1880,38 @@ func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {
 
 // guard against accidentally importing a real registry in unit tests.
 var _ = errors.New
+
+// testFSGroupGid returns a group of the test process that the fsGroup walk
+// accepts (supervisor.FSGroupGidRefused), its primary group first, or 0 when
+// it has none.
+func testFSGroupGid() int {
+	groups, _ := os.Getgroups()
+	for _, g := range append([]int{os.Getgid()}, groups...) {
+		if !supervisor.FSGroupGidRefused(g) {
+			return g
+		}
+	}
+	return 0
+}
+
+// TestFSGroupOwners: the fsGroup walk may regroup entries owned by the daemon
+// (image content, and containers that request no drop) and by the uid each
+// container drops to, and no other.
+func TestFSGroupOwners(t *testing.T) {
+	box := &runtimev1.PodBox{
+		PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 600},
+		InitContainers:     []*runtimev1.Container{{Name: "init", SecurityContext: &runtimev1.SecurityContext{RunAsUser: 700}}},
+		Containers: []*runtimev1.Container{
+			{Name: "pod-level"},
+			{Name: "own", SecurityContext: &runtimev1.SecurityContext{RunAsUser: 800}},
+			{Name: "again", SecurityContext: &runtimev1.SecurityContext{RunAsUser: 800}},
+		},
+	}
+	if got, want := fsGroupOwners(box, 250), []int{250, 700, 600, 800}; !reflect.DeepEqual(got, want) {
+		t.Errorf("fsGroupOwners = %v, want %v", got, want)
+	}
+	plain := &runtimev1.PodBox{Containers: []*runtimev1.Container{{Name: "main"}}}
+	if got, want := fsGroupOwners(plain, 250), []int{250}; !reflect.DeepEqual(got, want) {
+		t.Errorf("fsGroupOwners with no drop = %v, want %v", got, want)
+	}
+}

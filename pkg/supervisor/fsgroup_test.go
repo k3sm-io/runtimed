@@ -23,10 +23,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
 	"testing"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -74,8 +76,12 @@ func byPathFSGroupWalk(root string, gid int, hook, beforeChmod func(path string)
 
 // walkFSGroup runs the walk under test with a background context and returns
 // its report and error.
+// testOwners names the test process as the only owner whose entries the walk
+// may change: everything a test makes is the test process's.
+var testOwners = []int{os.Geteuid()}
+
 func walkFSGroup(bound, root string, gid int) (FSGroupReport, error) {
-	return ChownForFSGroup(context.Background(), bound, root, gid)
+	return ChownForFSGroup(context.Background(), bound, root, gid, testOwners)
 }
 
 // setFSGroupHooks installs the walk's seams for one test.
@@ -105,14 +111,14 @@ func fsGroupTestGid(t *testing.T, dir string) int {
 	}
 	groups, _ := os.Getgroups()
 	for _, g := range groups {
-		if g > 0 && g != int(st.Gid) {
+		if _, refused := fsGroupRefusedGids[g]; g > 0 && !refused && g != int(st.Gid) {
 			return g
 		}
 	}
-	if g := os.Getgid(); g > 0 {
-		return g
+	if _, refused := fsGroupRefusedGids[os.Getgid()]; os.Getgid() > 0 && !refused {
+		return os.Getgid()
 	}
-	t.Skip("the test process has no gid above 0 to chown to")
+	t.Skip("the test process has no gid above 0 outside the refused system groups to chown to")
 	return 0
 }
 
@@ -929,7 +935,7 @@ func TestFSGroupWalkStopsWhenItsContextEnds(t *testing.T) {
 			cancel()
 		}
 	}, nil)
-	_, err := ChownForFSGroup(ctx, podDir, root, gid)
+	_, err := ChownForFSGroup(ctx, podDir, root, gid, testOwners)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("the walk under a cancelled context = %v, want context.Canceled", err)
 	}
@@ -939,7 +945,7 @@ func TestFSGroupWalkStopsWhenItsContextEnds(t *testing.T) {
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	if _, err := ChownForFSGroup(ctx2, podDir, root, gid); !errors.Is(err, context.Canceled) {
+	if _, err := ChownForFSGroup(ctx2, podDir, root, gid, testOwners); !errors.Is(err, context.Canceled) {
 		t.Errorf("the walk started under a cancelled context = %v, want context.Canceled", err)
 	}
 }
@@ -1067,31 +1073,28 @@ func TestFSGroupWalkReportsWhatItSkips(t *testing.T) {
 
 // TestFSGroupMode pins the mode rule, including the part an unprivileged test
 // run cannot reach through the walk: a chown by root keeps setuid and setgid,
-// and a file that still has either does not get the owner's write bit copied
-// to the group.
+// so the mode the walk sets must clear them on anything but a directory.
 func TestFSGroupMode(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		in           uint32
-		isDir        bool
-		want         uint32
-		wantWithheld bool
+		name  string
+		in    uint32
+		isDir bool
+		want  uint32
 	}{
-		{"a private file", 0o600, false, 0o660, false},
-		{"an executable", 0o755, false, 0o775, false},
-		{"a read-only file", 0o400, false, 0o440, false},
-		{"a directory gets setgid", 0o700, true, 0o2770, false},
-		{"a sticky directory keeps the bit", 0o1700, true, 0o3770, false},
-		{"a setuid file is not made group-writable", 0o4755, false, 0o4755, true},
-		{"a setgid file is not made group-writable", 0o2700, false, 0o2750, true},
-		{"a setuid file that is group-writable already stays so", 0o4775, false, 0o4775, false},
-		{"a setuid file its owner cannot write withholds nothing", 0o4555, false, 0o4555, false},
-		{"the file type bits are not part of the mode", unix.S_IFREG | 0o600, false, 0o660, false},
+		{"a private file", 0o600, false, 0o660},
+		{"an executable", 0o755, false, 0o775},
+		{"a read-only file", 0o400, false, 0o440},
+		{"a directory gets setgid", 0o700, true, 0o2770},
+		{"a sticky directory keeps the bit", 0o1700, true, 0o3770},
+		{"a setuid file loses setuid", 0o4755, false, 0o0775},
+		{"a setgid file loses setgid", 0o2755, false, 0o0775},
+		{"a file with both loses both", 0o6700, false, 0o0770},
+		{"a sticky file keeps the bit", 0o1600, false, 0o1660},
+		{"the file type bits are not part of the mode", unix.S_IFREG | 0o600, false, 0o660},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, withheld := fsGroupMode(tc.in, tc.isDir)
-			if got != tc.want || withheld != tc.wantWithheld {
-				t.Errorf("fsGroupMode(%o, %v) = (%o, %v), want (%o, %v)", tc.in, tc.isDir, got, withheld, tc.want, tc.wantWithheld)
+			if got := fsGroupMode(tc.in, tc.isDir); got != tc.want {
+				t.Errorf("fsGroupMode(%o, %v) = %o, want %o", tc.in, tc.isDir, got, tc.want)
 			}
 		})
 	}
@@ -1261,7 +1264,7 @@ func TestFSGroupWalkErrorPathsLeakNothing(t *testing.T) {
 			}
 		}, nil)
 		base := openDescriptors(t)
-		if _, err := ChownForFSGroup(ctx, podDir, root, gid); !errors.Is(err, context.Canceled) {
+		if _, err := ChownForFSGroup(ctx, podDir, root, gid, testOwners); !errors.Is(err, context.Canceled) {
 			t.Fatalf("the walk = %v, want context.Canceled", err)
 		}
 		if after := openDescriptors(t); after != base {
@@ -1447,7 +1450,7 @@ func TestFSGroupWalkReopenCostIsCharged(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		fsGroupOnReopen = cancel
-		if _, err := ChownForFSGroup(ctx, podDir, root, gid); !errors.Is(err, context.Canceled) {
+		if _, err := ChownForFSGroup(ctx, podDir, root, gid, testOwners); !errors.Is(err, context.Canceled) {
 			t.Errorf("the walk cancelled at its first re-open = %v, want context.Canceled", err)
 		}
 	})
@@ -1500,5 +1503,159 @@ func TestFSGroupWalkClipsErrorPaths(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), deep) {
 		t.Error("the error carries the whole path")
+	}
+}
+
+// TestFSGroupWalkLeavesForeignOwnersAlone: an entry owned by a uid outside the
+// owners the caller names (another tenant's file or directory renamed in from
+// a writable share keeps its one link and its owner) is left unchanged and
+// counted, and a directory so owned is not entered. A root so owned is an
+// error. An unprivileged test cannot make a file another uid owns, so the
+// owner the walk reads is replaced through the walk's seam for the named
+// paths; everything else about each entry is real.
+func TestFSGroupWalkLeavesForeignOwnersAlone(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	for _, d := range []string{"own/sub", "theirs/inner"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string]string{
+		"own/mine":         "x",
+		"their-file":       "x",
+		"theirs/inner/doc": "x",
+	}
+	for f, body := range files {
+		if err := os.WriteFile(filepath.Join(root, f), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gid := fsGroupTestGid(t, root)
+	const other = 4242
+	foreign := map[string]bool{
+		filepath.Join(root, "their-file"): true,
+		filepath.Join(root, "theirs"):     true,
+	}
+	fsGroupOwnerOf = func(path string, uid uint32) uint32 {
+		if foreign[path] {
+			return other
+		}
+		return uid
+	}
+	t.Cleanup(func() { fsGroupOwnerOf = nil })
+	before := treeState(t, root)
+	rep, err := walkFSGroup(podDir, root, gid)
+	if err != nil {
+		t.Fatalf("ChownForFSGroup: %v", err)
+	}
+	after := treeState(t, root)
+	for _, rel := range []string{"their-file", "theirs", "theirs/inner", "theirs/inner/doc"} {
+		if after[rel] != before[rel] {
+			t.Errorf("%s changed: mode %07o gid %d -> mode %07o gid %d; another uid's entry, or one below it, must be left alone",
+				rel, before[rel].Mode, before[rel].Gid, after[rel].Mode, after[rel].Gid)
+		}
+	}
+	if got := modeOf(t, filepath.Join(root, "own", "mine")).Perm(); got != 0o660 {
+		t.Errorf("the pod's own file has mode %o, want 0660", got)
+	}
+	if rep.ForeignOwner != 2 || rep.Skipped() != 2 {
+		t.Errorf("report = %+v, want the foreign file and directory counted", rep)
+	}
+
+	// A root another uid owns is not the pod's tree at all.
+	foreign[root] = true
+	if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupForeignOwner) {
+		t.Errorf("a root another uid owns = %v, want ErrFSGroupForeignOwner", err)
+	}
+}
+
+// TestFSGroupWalkClearsSetID: a file with setuid or setgid has the bits
+// cleared before its group is set, as a chown on Linux does, so a file the pod
+// wrote never comes out setgid to the fsGroup; directories keep (and get)
+// setgid. The test runs unprivileged, where the chown would clear the bits on
+// its own, so the clear is seen through the report and through the order: the
+// bits are already gone when the group is set.
+func TestFSGroupWalkClearsSetID(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, mode := range map[string]os.FileMode{
+		"suid": 0o755 | os.ModeSetuid,
+		"sgid": 0o755 | os.ModeSetgid,
+	} {
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		if got := modeOf(t, p); got&(os.ModeSetuid|os.ModeSetgid) == 0 {
+			t.Fatalf("%s has mode %v; the test could not set the bit", name, got)
+		}
+	}
+	gid := fsGroupTestGid(t, root)
+	atChown := map[string]os.FileMode{}
+	setFSGroupHooks(t, nil, func(path string) {
+		atChown[filepath.Base(path)] = modeOf(t, path)
+	})
+	rep, err := walkFSGroup(podDir, root, gid)
+	if err != nil {
+		t.Fatalf("ChownForFSGroup: %v", err)
+	}
+	for _, name := range []string{"suid", "sgid"} {
+		if m := atChown[name]; m&(os.ModeSetuid|os.ModeSetgid) != 0 {
+			t.Errorf("%s still had mode %v once its group was set", name, m)
+		}
+		got := modeOf(t, filepath.Join(root, name))
+		if got&(os.ModeSetuid|os.ModeSetgid) != 0 || got.Perm() != 0o775 {
+			t.Errorf("%s has mode %v, want 0775 with no setuid or setgid", name, got)
+		}
+	}
+	if rep.SetID != 2 {
+		t.Errorf("report = %+v, want both files counted as cleared", rep)
+	}
+	if got := modeOf(t, root); got&os.ModeSetgid == 0 {
+		t.Errorf("the root directory has mode %v, want setgid", got)
+	}
+}
+
+// TestFSGroupRefusesSystemGids: a gid that is a macOS system group whose
+// membership is a privilege is refused before anything is changed.
+func TestFSGroupRefusesSystemGids(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := treeState(t, root)
+	for _, gid := range []int{1, 2, 3, 4, 5, 8, 9, 20, 80} {
+		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupGidRefused) {
+			t.Errorf("gid %d = %v, want ErrFSGroupGidRefused", gid, err)
+		}
+	}
+	if !reflect.DeepEqual(treeState(t, root), before) {
+		t.Error("a refused gid changed the tree")
+	}
+	if _, err := ChownForFSGroup(context.Background(), podDir, root, 4242, nil); err == nil {
+		t.Error("an empty owner set was accepted")
+	}
+}
+
+// TestFSGroupClipKeepsUTF8: a path cut for a message is cut at the start of a
+// rune, so the message stays valid UTF-8.
+func TestFSGroupClipKeepsUTF8(t *testing.T) {
+	for pad := 0; pad < 4; pad++ {
+		s := strings.Repeat("a", pad) + strings.Repeat("é€😀", 40)
+		got := fsGroupClip(s)
+		if len(got) > fsGroupExampleMax {
+			t.Errorf("pad %d: %d bytes, want at most %d", pad, len(got), fsGroupExampleMax)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("pad %d: the clipped path is not valid UTF-8: %q", pad, got)
+		}
 	}
 }

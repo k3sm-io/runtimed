@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -737,12 +738,18 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
 	if fsGroup := int(box.GetPodSecurityContext().GetFsGroup()); fsGroup > 0 {
-		rep, err := supervisor.ChownForFSGroup(ctx, podDir, rootfs, fsGroup)
+		rep, err := supervisor.ChownForFSGroup(ctx, podDir, rootfs, fsGroup, fsGroupOwners(box, os.Geteuid()))
 		if err != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("fsGroup chown for pod %s: %w", box.GetPodId(), err)
 		}
 		if rep.Skipped() > 0 || rep.SetID > 0 {
+			// The examples are paths the pod chose: quoted, so a name with a
+			// newline or a control character cannot forge a log line.
+			examples := make([]string, len(rep.Examples))
+			for i, ex := range rep.Examples {
+				examples[i] = strconv.Quote(ex)
+			}
 			// Not a failure: the entries keep the group and mode they had, and
 			// a process that relies on the fsGroup for one of them is refused
 			// by the file's own mode. The examples are few and each is cut
@@ -750,8 +757,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			r.log.Warn("fsGroup: some entries of the pod's data volume were not given the group's access",
 				"pod", box.GetPodId(), "fs_group", fsGroup, "changed", rep.Changed,
 				"multi_link", rep.MultiLink, "special", rep.Special, "other_device", rep.OtherDevice,
-				"unopenable", rep.Unopenable, "vanished", rep.Vanished, "setid_not_group_writable", rep.SetID,
-				"examples", rep.Examples)
+				"unopenable", rep.Unopenable, "vanished", rep.Vanished, "foreign_owner", rep.ForeignOwner,
+				"setid_cleared", rep.SetID, "examples", examples)
 		}
 	}
 
