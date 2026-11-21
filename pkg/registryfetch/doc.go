@@ -65,7 +65,7 @@ limitations under the License.
 //   - A partial whose commit succeeds is removed; a failure to remove it is
 //     logged to PartialStore.Log (when set) and does not fail the Resume.
 //
-// Four opt-in helpers serve a caller that shares one store across
+// Five opt-in helpers serve a caller that shares one store across
 // concurrent pulls; a caller that uses none of them sees no change. Claim
 // gives one writer per digest within a store, without blocking; its refusal
 // says whether the digest is held (ErrPartialClaimed, retryable) or malformed
@@ -74,9 +74,11 @@ limitations under the License.
 // Resume runs it for the blob's size before touching the store; it fails
 // closed on a negative or over-cap size and sums without overflow. A zero
 // MaxBytes means no cap; a negative one is refused (ErrPartialCap). Sweep
-// removes old, unclaimed partials, matching only the store's own file-name
-// grammar and unlinking relative to a descriptor of the directory opened
-// O_NOFOLLOW, so it never follows a link. Remove deletes one digest's
+// removes old, unclaimed partials and old regular files under a foreign name
+// (which Admit would otherwise count forever), names every foreign entry on
+// PartialStore.Log, and unlinks relative to a descriptor of the directory
+// opened O_NOFOLLOW, so it never follows a link. Usage sums the same files
+// Admit counts, by stat alone. Remove deletes one digest's
 // partial and treats a missing one as success; the caller must hold the
 // digest's Claim and have no Resume of it running, because Remove does not
 // look at claims. The stall watchdog and the blob

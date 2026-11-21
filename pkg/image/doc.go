@@ -37,9 +37,16 @@ limitations under the License.
 //     see Cache.CommitBlob, the single home of that invariant, and the ceiling
 //     below. A pull can also fetch a layer over a direct ranged route and keep
 //     the bytes received in a partial file between attempts, so a cut pull
-//     continues from where it stopped; this is off unless the caller supplies a
-//     partial store (WithPartialStore), and without one every layer is fetched
-//     from byte 0.
+//     continues from where it stopped with a Range request. The cache owns the
+//     one partial store (Cache.OpenPartialStore): <root>/image-partial, a
+//     sibling of blobs/ that every pod is denied, capped at
+//     PartialStoreMaxBytes (a layer larger than the cap is fetched whole) and
+//     swept of partials older than PartialMaxAge at open and at the start of
+//     each reclaim pass, sparing the digest a running pull has claimed. Its
+//     bytes count in StoreBytes (ClassPartial) and only the sweep frees them.
+//     The daemon wires the store with the RemoteFetch blob route; a puller
+//     given no store (WithPartialStore), or a store whose directory was
+//     refused, fetches every layer from byte 0.
 //
 //   - Mirror (fallback): when the node's OWN ingest registry misses a
 //     node-relative reference (localhost:<port>/...), consult the peer ingest

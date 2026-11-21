@@ -27,9 +27,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
+
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // DefaultRoot is the on-disk root for the content-addressed image cache and pod
@@ -103,6 +106,13 @@ type Cache struct {
 	// is a field, not a call to time.Now, so the lease TTL and the reclaim grace
 	// window are testable without sleeping.
 	now func() time.Time
+
+	// partialOnce builds partials once (OpenPartialStore). partials is the
+	// cache's one partial store, nil until it is opened or when its directory
+	// was refused; it is atomic because a reclaim pass and StoreBytes read it
+	// without a lock.
+	partialOnce sync.Once
+	partials    atomic.Pointer[registryfetch.PartialStore]
 
 	// sameVolume decides whether a local blob source's file and the blob store
 	// share a volume (CommitFromLocal). Nil means sameDevice, the st_dev

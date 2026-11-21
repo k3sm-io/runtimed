@@ -392,8 +392,8 @@ func TestGenerateVMReapStoreDenied(t *testing.T) {
 // keys + kine datastore (server), the node-agent state (agent), the daemon
 // control sockets + wireguard mesh private key (run), the content-addressed blob
 // store (blobs), the per-pod SBPL staging dir (sbpl), the two root-privileged
-// reap stores (podreap, vmreap), the five image-store siblings (index, operator,
-// unpacked, snapshots, ingest) and the pinned guest-artifact cache
+// reap stores (podreap, vmreap), the six image-store siblings (index, operator,
+// unpacked, snapshots, ingest, image-partial) and the pinned guest-artifact cache
 // (guest-artifacts). Each must be both rejected as a caller-supplied path and
 // EMITTED as a deny after the allows — a validate-set entry alone would not
 // survive an ancestor grant, and an emitted deny placed before the allows would
@@ -428,6 +428,9 @@ func TestWorkDirDenyRootsCoverControlPlaneTrees(t *testing.T) {
 		// never re-verified at clone; ingest is where an archive is read before
 		// its blobs are verified at all.
 		"index", "operator", "unpacked", "snapshots", "ingest",
+		// The layer bytes a cut pull kept for the next one to resume:
+		// another workload's layer mid-transfer, before it is verified.
+		"image-partial",
 		// The pinned kernel + initramfs every vm pod boots. Corrupting the set
 		// fails the node's vm capability closed until an operator clears it.
 		"guest-artifacts",
