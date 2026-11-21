@@ -435,21 +435,29 @@ const (
 //   - ErrNoPlatformMatch / ErrNestedIndex — the reference RESOLVED and this node
 //     cannot run what it resolved to. That verdict is about the image, not about
 //     the host that served it.
+//   - ErrSizeOverflow / ErrDeclaredSizeRejected — the primary SERVED a manifest
+//     and its declared sizes were refused (negative, wrapping, or more than this
+//     volume can hold). Like content failing verification, it is the primary's
+//     answer about its own image, so the pull reports it rather than asking a
+//     peer to override it. A MIRROR serving such a manifest is a per-mirror
+//     failure instead (see pullFromMirrors).
 //   - context cancellation or deadline — the CALLER gave up. Continuing to dial
 //     peers after that would burn the caller's budget on work it no longer wants.
 //   - this node's own pre-fetch verdicts (ErrPullRefusedDiskPressure,
-//     ErrImageNotPresent) — no fetch was attempted at all.
+//     ErrInsufficientSpace, ErrImageNotPresent) — no blob fetch was attempted
+//     at all.
 func mirrorFallbackEligible(err error) bool {
 	if err == nil {
 		return false
 	}
 	// The caller's own decisions and this node's own verdicts, first: they can
 	// wrap or be wrapped by anything below, and none of them is about the host.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if localRefusal(err) {
 		return false
 	}
 	if errors.Is(err, ErrNoPlatformMatch) || errors.Is(err, ErrNestedIndex) ||
-		errors.Is(err, ErrPullRefusedDiskPressure) || errors.Is(err, ErrImageNotPresent) {
+		errors.Is(err, ErrSizeOverflow) || errors.Is(err, ErrDeclaredSizeRejected) ||
+		errors.Is(err, ErrImageNotPresent) {
 		return false
 	}
 	var terr *transport.Error
@@ -469,6 +477,21 @@ func mirrorFallbackEligible(err error) bool {
 		}
 	}
 	return connectionClass(err)
+}
+
+// localRefusal reports whether err is the caller giving up (a done context) or
+// this node refusing for space (ErrPullRefusedDiskPressure, ErrInsufficientSpace).
+// Neither depends on which host served the image, so no other host is tried
+// after one: the primary fetch (mirrorFallbackEligible) and each mirror's ingest
+// stop on it, and it is the error the caller gets.
+//
+// ErrSizeOverflow and ErrDeclaredSizeRejected are NOT local: they refuse the
+// sizes a source's manifest declares, so one hostile or broken source must not
+// stop a pull that a later source could serve. The loops record them as that
+// source's failure and try the next; no reclaim pass ran for either.
+func localRefusal(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrPullRefusedDiskPressure) || errors.Is(err, ErrInsufficientSpace)
 }
 
 // authDiagnostic reports whether a registry error carries an authorization
@@ -622,6 +645,9 @@ func (p *Puller) pullFromMirrors(ctx context.Context, fetchRef, recordRef string
 			continue
 		}
 		res, err := p.ingest(ctx, recordRef, img, want)
+		if localRefusal(err) {
+			return nil, err
+		}
 		if err != nil {
 			log.Debug("cluster mirror served content this node refused", "ref", recordRef, "mirror", m.Host, "error", err)
 			failures = append(failures, mirrorFailure(m.Host, err))

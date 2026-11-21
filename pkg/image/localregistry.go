@@ -166,8 +166,12 @@ func (p *Puller) pullFromLocalRegistry(ctx context.Context, ref string, policy P
 	// a bare name here just as it answers an explicitly node-relative one. The
 	// recorded reference stays the user's original either way.
 	if mirrors := p.mirrorCandidates(localRef, err); len(mirrors) > 0 {
-		if res, merr := p.pullFromMirrors(ctx, localRef, ref, policy, want, mirrors, err); merr == nil {
+		res, merr := p.pullFromMirrors(ctx, localRef, ref, policy, want, mirrors, err)
+		if merr == nil {
 			return res, nil
+		}
+		if localRefusal(merr) {
+			return nil, merr
 		}
 	}
 	if !mirrorFallbackEligible(err) {

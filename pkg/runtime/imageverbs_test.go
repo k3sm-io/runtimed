@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -252,6 +253,9 @@ func TestPullImageDrivesTheDaemonsOwnPuller(t *testing.T) {
 		}{
 			{"absent under a policy that forbids fetching", image.ErrImageNotPresent, codes.NotFound},
 			{"refused under disk pressure", image.ErrPullRefusedDiskPressure, codes.ResourceExhausted},
+			{"declared layers do not fit in free space", fmt.Errorf("%w: %w", image.ErrPullRefusedDiskPressure, image.ErrInsufficientSpace), codes.ResourceExhausted},
+			{"declared sizes wrap", image.ErrSizeOverflow, codes.FailedPrecondition},
+			{"declared sizes exceed the volume", image.ErrDeclaredSizeRejected, codes.FailedPrecondition},
 			{"no manifest for the platform", image.ErrNoPlatformMatch, codes.FailedPrecondition},
 		}
 		for _, tc := range cases {

@@ -17,8 +17,11 @@ limitations under the License.
 package image
 
 import (
+	"context"
 	"errors"
 	"fmt"
+
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"k3sm.io/runtimed/pkg/registryfetch"
 )
@@ -90,8 +93,18 @@ var ErrPullRefusedDiskPressure = errors.New("image: refusing to start a pull, th
 //   - the logger (WithPullLogger) selects a sink, never a behavior;
 //   - the local blob source (WithLocalBlobSource) is absent on every node whose
 //     registry does not share the cache's volume, and it cannot change which
-//     bytes are committed: a local copy is committed only on a digest match.
+//     bytes are committed: a local copy is committed only on a digest match;
+//   - the space ledger (WithSpaceLedger) defaults to one private to the puller,
+//     which still reserves every pull against the others this puller runs; the
+//     daemon shares one with its artifact puller.
 type PullerOption func(*Puller)
+
+// WithSpaceLedger has the puller reserve its pulls on l, the ledger the
+// daemon also hands its artifact puller, so the two paths cannot overcommit the
+// store volume against each other. Nil means a ledger private to this puller.
+func WithSpaceLedger(l *SpaceLedger) PullerOption {
+	return func(p *Puller) { p.ledger = l }
+}
 
 // WithLocalBlobSource has the puller offer each blob to src before fetching it:
 // a blob src holds on the cache's volume is cloned and re-hashed
@@ -140,6 +153,12 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 	return func(p *Puller) { p.freeBytes = free }
 }
 
+// WithTotalBytes overrides how the store volume's total capacity is sampled
+// for the space reservation. Nil means StatfsTotalBytes.
+func WithTotalBytes(total TotalBytesFunc) PullerOption {
+	return func(p *Puller) { p.totalBytes = total }
+}
+
 // admitFetch decides whether this node may BEGIN acquiring new image content.
 //
 // It is fail-closed on both axes:
@@ -158,21 +177,18 @@ func WithFreeBytes(free FreeBytesFunc) PullerOption {
 // or Never serve is never affected, and no code path can acquire new content
 // without passing here.
 //
+// The gate is an early subset of the reservation check (reserveSpace), which
+// is why free space is sampled twice per pull: this one refuses before the
+// manifest is fetched, that one once its declared sizes are known.
+//
 // RECORDED residual, not fixed here: the ingest path (LoadImage and the image-load CLI)
 // writes the same store without traversing this function, so an operator
 // streaming a tarball can still fill the volume. That path is not a pull and its
 // admission is its own item's business.
 func (p *Puller) admitFetch(ref string) error {
-	floor := p.floorBytes
-	if floor == 0 {
-		floor = DefaultPullRefuseFreeBytes
-	}
-	free := p.freeBytes
-	if free == nil {
-		free = StatfsFreeBytes
-	}
+	floor := p.pullFloor()
 	root := p.cache.Root()
-	avail, err := free(root)
+	avail, err := p.sampleFree()(root)
 	if err != nil {
 		return fmt.Errorf("pull %q: %w: %w on %s: %v", ref, ErrPullRefusedDiskPressure, ErrFreeSpaceUnknown, root, err)
 	}
@@ -181,4 +197,87 @@ func (p *Puller) admitFetch(ref string) error {
 			ref, ErrPullRefusedDiskPressure, avail, root, floor)
 	}
 	return nil
+}
+
+// pullFloor is the free-space floor a fetch must leave: WithPullFloor, or
+// DefaultPullRefuseFreeBytes.
+func (p *Puller) pullFloor() uint64 {
+	if p.floorBytes == 0 {
+		return DefaultPullRefuseFreeBytes
+	}
+	return p.floorBytes
+}
+
+// sampleFree is the free-space sampler: WithFreeBytes, or StatfsFreeBytes.
+func (p *Puller) sampleFree() FreeBytesFunc {
+	if p.freeBytes == nil {
+		return StatfsFreeBytes
+	}
+	return p.freeBytes
+}
+
+// reserveSpace claims on the puller's SpaceLedger, before any layer is
+// requested, the bytes this pull may still add to the content store: the
+// declared size of every blob mfst names that the store does not hold (the
+// config and the missing layers), plus the commit-time allowance for the
+// largest of them, the same allowance the artifact pull reserves (layers commit
+// one at a time here). It is measured against free space minus the pull floor,
+// with one reclaim pass when short and a dry run shows the pass could make room.
+//
+// A refusal for space is ErrInsufficientSpace and also ErrPullRefusedDiskPressure,
+// so a caller that keys on the admission refusal keys on this one too. A
+// declared size that is negative or sums past uint64 refuses with
+// ErrSizeOverflow, and a claim above the volume's capacity with
+// ErrDeclaredSizeRejected; neither is ErrPullRefusedDiskPressure, because both
+// refuse the serving registry's manifest rather than this node's free space. A pull missing nothing reserves nothing (a nil Reservation).
+//
+// The unpacked tree the layers are later extracted into is not covered; see
+// SpaceLedger.
+func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Manifest, resume bool) (*Reservation, error) {
+	seen := make(map[string]bool, len(mfst.Layers)+1)
+	var missing []BlobSpace
+	for _, d := range append([]ggcrv1.Descriptor{mfst.Config}, mfst.Layers...) {
+		digest := d.Digest.String()
+		if seen[digest] {
+			continue
+		}
+		seen[digest] = true
+		if p.cache.Has(digest) {
+			continue
+		}
+		b := BlobSpace{Size: d.Size}
+		if resume && p.partials != nil && digest != mfst.Config.Digest.String() {
+			// The partial's bytes are already off free space, as on the
+			// artifact path; an overlong partial counts as nothing. When
+			// resumeBlob falls back to a whole fetch that leaves the partial
+			// in place (another claimant, the partial budget or cap, a
+			// refused partial file), this under-charges by the partial's
+			// bytes, at most the partial store's budget in total.
+			b.Have = p.partials.Bytes(digest, d.Size)
+		}
+		missing = append(missing, b)
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	need, err := SpaceNeeded(missing, 1)
+	if err != nil {
+		return nil, fmt.Errorf("pull %q: declared blob sizes: %w", ref, err)
+	}
+	r, err := p.ledger.Reserve(ctx, SpaceClaim{
+		Need:       need,
+		Path:       p.cache.Root(),
+		FloorBytes: p.pullFloor(),
+		FreeBytes:  p.sampleFree(),
+		TotalBytes: p.totalBytes,
+		Reclaimer:  p.cache,
+		Log:        p.logger(),
+	})
+	if err != nil {
+		if errors.Is(err, ErrInsufficientSpace) || errors.Is(err, ErrFreeSpaceUnknown) {
+			return nil, fmt.Errorf("pull %q: %w: %w", ref, ErrPullRefusedDiskPressure, err)
+		}
+		return nil, fmt.Errorf("pull %q: %w", ref, err)
+	}
+	return r, nil
 }
