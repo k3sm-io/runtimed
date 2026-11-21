@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -43,6 +45,9 @@ var (
 	// ErrBlobOverrun reports a blob body longer than the size it was opened
 	// for; it is returned by the body's Read.
 	ErrBlobOverrun = errors.New("registryfetch: blob body is longer than its size")
+	// ErrRedirectDowngrade reports an https registry redirecting a request to
+	// plain http; the Session client refuses to follow it.
+	ErrRedirectDowngrade = errors.New("registryfetch: redirect from https to http")
 )
 
 // ReferenceError is the error for a reference that does not parse. It
@@ -105,6 +110,11 @@ func present(s string) string {
 type Registry struct {
 	Transport http.RoundTripper
 	PlainHTTP bool
+
+	// newAuth builds the authenticating transport for one repository; nil
+	// means transport.NewWithContext. It is a field, not a package variable,
+	// so a test sets it on its own Registry and mutates no shared state.
+	newAuth func(ctx context.Context, reg name.Registry, auth authn.Authenticator, t http.RoundTripper, scopes []string) (http.RoundTripper, error)
 }
 
 func (g *Registry) parse(ref string) (name.Reference, error) {
@@ -131,6 +141,12 @@ func authenticator(cred *Credential) authn.Authenticator {
 
 // Session parses ref and returns an authenticated client for its repository,
 // scoped to pull, over the registry's transport.
+//
+// The client splits requests by origin: one whose scheme and host:port are
+// the registry's goes through the authenticating transport, and any other
+// goes straight to the registry's plain Transport. Real registries redirect
+// blob GETs to object storage on another host; that host must get no
+// credential, and its 401 challenges must never reach the token logic.
 func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (name.Reference, *http.Client, error) {
 	if g.Transport == nil {
 		return nil, nil, ErrTransportRequired
@@ -140,12 +156,91 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 		return nil, nil, err
 	}
 	repo := r.Context()
-	rt, err := transport.NewWithContext(ctx, repo.Registry, authenticator(cred), g.Transport,
+	newAuth := g.newAuth
+	if newAuth == nil {
+		newAuth = transport.NewWithContext
+	}
+	rt, err := newAuth(ctx, repo.Registry, authenticator(cred), g.Transport,
 		[]string{repo.Scope(transport.PullScope)})
 	if err != nil {
 		return nil, nil, fmt.Errorf("registry auth: %w", bound(err))
 	}
-	return r, &http.Client{Transport: rt}, nil
+	split := &hostSplit{
+		scheme: repo.Registry.Scheme(),
+		host:   canonicalHost(repo.Registry.Scheme(), repo.RegistryStr()),
+		auth:   rt,
+		plain:  g.Transport,
+	}
+	return r, &http.Client{Transport: split, CheckRedirect: checkRedirect(g.PlainHTTP)}, nil
+}
+
+// maxRedirects is net/http's own default redirect limit.
+const maxRedirects = 10
+
+// crossOriginHeaders are the headers net/http drops on a redirect to another
+// domain, plus Proxy-Authorization; checkRedirect drops them on any change of
+// origin.
+var crossOriginHeaders = []string{"Authorization", "Proxy-Authorization", "Www-Authenticate", "Cookie", "Cookie2"}
+
+// checkRedirect returns the Session client's CheckRedirect. net/http copies a
+// caller's headers to a redirect target whose host name matches, whatever its
+// port or scheme; the returned func removes the credential headers whenever
+// the target's scheme or host:port differs from the first request's, and
+// keeps net/http's ten-redirect limit. An https to http redirect is refused
+// unless the registry is plain http itself: the bytes on such a hop could be
+// replaced on the path, even though no credential goes with them.
+func checkRedirect(plainHTTP bool) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		}
+		first := via[0].URL
+		fs, ts := strings.ToLower(first.Scheme), strings.ToLower(req.URL.Scheme)
+		if fs == "https" && ts == "http" && !plainHTTP {
+			// Scheme and host only: a redirect target's query can carry a
+			// presigned signature.
+			return fmt.Errorf("%w: to %s://%s", ErrRedirectDowngrade, req.URL.Scheme, req.URL.Host)
+		}
+		if fs != ts || canonicalHost(fs, first.Host) != canonicalHost(ts, req.URL.Host) {
+			for _, h := range crossOriginHeaders {
+				req.Header.Del(h)
+			}
+		}
+		return nil
+	}
+}
+
+// hostSplit routes a request to auth when its scheme and host:port are the
+// registry's, and to plain otherwise, so the authenticating transport never
+// sees a request for another origin.
+type hostSplit struct {
+	scheme, host string
+	auth, plain  http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper.
+func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
+	scheme := strings.ToLower(req.URL.Scheme)
+	if scheme == h.scheme && canonicalHost(scheme, req.URL.Host) == h.host {
+		return h.auth.RoundTrip(req)
+	}
+	return h.plain.RoundTrip(req)
+}
+
+// canonicalHost is host lower-cased with the scheme's default port filled in
+// when it names none.
+func canonicalHost(scheme, host string) string {
+	u := url.URL{Host: host}
+	name, port := strings.ToLower(u.Hostname()), u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(name, port)
 }
 
 // Blob opens the size-byte blob digest in ref's repository from offset, with
@@ -169,9 +264,9 @@ func (g *Registry) Blob(ctx context.Context, ref string, cred *Credential, diges
 		return nil, 0, err
 	}
 	repo := r.Context()
-	url := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", repo.Registry.Scheme(), repo.RegistryStr(), repo.RepositoryStr(), digest)
+	blobURL := fmt.Sprintf("%s://%s/v2/%s/blobs/%s", repo.Registry.Scheme(), repo.RegistryStr(), repo.RepositoryStr(), digest)
 	get := func(from int64) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
 		if err != nil {
 			return nil, err
 		}
