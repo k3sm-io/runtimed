@@ -170,6 +170,8 @@ func RemoteMirrorBlobSource(ref string, mirror Mirror) (BlobSource, error) {
 // mirrorBlobSource yields the direct blob route for mirrorRef on m, the
 // arguments pullFromMirrors hands mirrorFetch. ok is false when
 // WithRegistryBlobSource paired no mirror route.
+//
+//lint:ignore U1000 the blob route the daemon wiring of WithPartialStore calls; pinned by blobsource_test.go until then
 func (p *Puller) mirrorBlobSource(mirrorRef string, m Mirror) (_ BlobSource, ok bool, _ error) {
 	if p.mirrorBlobs == nil {
 		return BlobSource{}, false, nil

@@ -213,7 +213,7 @@ func RemoteFetch(ctx context.Context, ref string, cred *RegistryCredential, poli
 }
 
 // remoteFetch is the registry round trip shared by every fetcher: RemoteFetch,
-// RemoteInsecureFetch, RemoteMirrorFetch and the flat registry's endpointFetch.
+// RemoteInsecureFetch, RemoteMirrorFetch and the flat registry's endpointFetchOver.
 // r is the ALREADY-PARSED reference (a cluster mirror and an admitted cluster
 // registry parse with name.Insecure, see Mirror.PlainHTTP), and ref is the reference as the caller
 // spells it, used only in messages.

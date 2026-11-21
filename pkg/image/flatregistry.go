@@ -199,17 +199,12 @@ func endpointTransport(host string, ep RegistryEndpoint, pool *x509.CertPool) *h
 	return tr
 }
 
-// endpointFetch returns the FetchFunc that reaches the registry named host at
-// ep. The reference keeps host as its authority, so the request, the TLS server
-// name and every log line name the registry; only the DIAL is redirected, and
-// only for host itself. A dial to anything else (a redirect off the registry) is
-// refused: the cluster's own registry has no business sending this node
-// elsewhere.
-func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchFunc {
-	return endpointFetchOver(host, ep, endpointTransport(host, ep, pool))
-}
-
-// endpointFetchOver is endpointFetch over an already-built endpointTransport,
+// endpointFetchOver returns the FetchFunc that reaches the registry named host
+// at ep over an already-built endpointTransport. The reference keeps host as
+// its authority, so the request, the TLS server name and every log line name
+// the registry; only the DIAL is redirected, and only for host itself. A dial
+// to anything else (a redirect off the registry) is refused: the cluster's own
+// registry has no business sending this node elsewhere. It is used
 // so the fetcher and the flat registry's blob route (endpointBlobSource) share
 // one transport value.
 func endpointFetchOver(host string, ep RegistryEndpoint, tr http.RoundTripper) FetchFunc {
@@ -264,6 +259,8 @@ func endpointReference(host string, ep RegistryEndpoint, ref string) (name.Refer
 // fetched with cred: the caller passes the credential it passes p.flat.fetch
 // (nil for a bare name or a public-mirror reference). ok is false when no flat
 // registry is mapped.
+//
+//lint:ignore U1000 the blob route the daemon wiring of WithPartialStore calls; pinned by blobsource_test.go until then
 func (p *Puller) flatBlobSource(canonical string, cred *RegistryCredential) (_ BlobSource, ok bool, _ error) {
 	if p.flat == nil {
 		return BlobSource{}, false, nil
