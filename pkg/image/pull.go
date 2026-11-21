@@ -1369,7 +1369,10 @@ func transferBlob(ctx context.Context, src BlobSource, digest string, size int64
 	}
 	n, cerr := io.Copy(struct{ io.Writer }{f}, io.LimitReader(body, size-have+1))
 	serr := f.Sync()
-	if have+n > size {
+	if have+n > size || errors.Is(cerr, registryfetch.ErrBlobOverrun) {
+		// A body past the descriptor size is wrong whatever its prefix holds:
+		// keep none of it, so the next pull starts from 0 rather than
+		// resuming over bytes from a source known to overrun.
 		_ = f.Truncate(0) // the overrun error is the one reported
 		return fmt.Errorf("fetch blob %s: more than %d bytes: %w", digest, size, ErrBlobTooLarge)
 	}

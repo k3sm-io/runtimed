@@ -62,6 +62,7 @@ type cutRegistry struct {
 	mu       sync.Mutex
 	cuts     int      // GETs still to cut
 	badRange int      // ranged GETs still to answer with a wrong Content-Range
+	overrun  int      // uncut GETs still to answer 200 with one byte past the blob
 	ranges   []string // the Range header of every layer GET, in order
 	// wholeOn200 makes every uncut GET ignore Range and answer 200 whole.
 	wholeOn200 bool
@@ -151,6 +152,10 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 		if bad {
 			c.badRange--
 		}
+		over := !cut && !bad && c.overrun > 0
+		if over {
+			c.overrun--
+		}
 		whole := !cut && !bad && c.wholeOn200
 		hold := c.hold
 		if hold != nil && !cut {
@@ -174,6 +179,13 @@ func newCutRegistry(t *testing.T, cutAt int64) *cutRegistry {
 			c.mu.Lock()
 			c.inflight--
 			c.mu.Unlock()
+		}
+		if over {
+			// No Content-Length: the body runs one byte past the descriptor size.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(c.body)
+			_, _ = w.Write([]byte{0x5a})
+			return
 		}
 		if whole {
 			w.Header().Set("Content-Length", strconv.FormatInt(c.size, 10))
@@ -431,6 +443,45 @@ func TestPullResumesCutLayerWithRange(t *testing.T) {
 			t.Fatalf("pull over a wrong range answer made %d ranged requests, want 1", ranged)
 		}
 	})
+}
+
+// TestPullResumeOverrunEmptiesThePartial pins the overrun branch: a registry
+// whose body runs past the descriptor size fails the pull with ErrBlobTooLarge
+// and leaves no bytes in the partial, so the next pull fetches from 0 with no
+// Range instead of resuming over a body known to be wrong.
+func TestPullResumeOverrunEmptiesThePartial(t *testing.T) {
+	c := newCutRegistry(t, 4096)
+	c.mu.Lock()
+	c.overrun = 1
+	c.mu.Unlock()
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "partials")
+	store := &registryfetch.PartialStore{Dir: dir}
+	p := resumePuller(t, c, cache, store)
+
+	if _, err := pullAlways(p, c.ref); !errors.Is(err, ErrBlobTooLarge) {
+		t.Fatalf("pull over an overlong body: err = %v, want ErrBlobTooLarge", err)
+	}
+	if cache.Has(c.layer.String()) {
+		t.Fatal("an overlong layer is in the cache")
+	}
+	if got := store.Bytes(c.layer.String(), c.size); got != 0 {
+		t.Fatalf("partial holds %d bytes after an overlong body, want 0", got)
+	}
+	c.takeRanges()
+
+	res, err := pullAlways(p, c.ref)
+	if err != nil {
+		t.Fatalf("pull after the overlong body: %v", err)
+	}
+	res.Lease.Release()
+	if got := c.takeRanges(); len(got) != 1 || got[0] != "" {
+		t.Fatalf("pull after the overlong body Range headers = %q, want one GET from 0", got)
+	}
+	verifyLayer(t, cache, c)
 }
 
 // TestPullResumesRestartsOn200ToRange pins the restart branch of the resumable
