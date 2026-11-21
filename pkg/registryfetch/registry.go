@@ -255,9 +255,10 @@ func (c *ceilingBody) Close() error { return c.rc.Close() }
 
 // parseContentRange parses exactly "bytes <first>-<last>/<total>": the
 // lowercase unit, one space, and three ASCII decimals with no sign and no
-// leading zero (a lone 0 aside), each within int64. Anything else (an
-// unsatisfied "*", a missing part, trailing text) is refused. It checks the
-// grammar only; Blob compares the numbers with what it asked for.
+// leading zero (a lone 0 aside), each within int64, with first <= last <
+// total as RFC 9110 section 14.4 requires of a satisfied range. Anything else
+// (an unsatisfied "*", a missing part, trailing text, a disordered range) is
+// refused. Blob still compares the numbers with what it asked for.
 func parseContentRange(v string) (first, last, total int64, ok bool) {
 	rest, ok := strings.CutPrefix(v, "bytes ")
 	if !ok {
@@ -275,7 +276,7 @@ func parseContentRange(v string) (first, last, total int64, ok bool) {
 	first, oks[0] = decimal(a)
 	last, oks[1] = decimal(b)
 	total, oks[2] = decimal(c)
-	if !oks[0] || !oks[1] || !oks[2] {
+	if !oks[0] || !oks[1] || !oks[2] || first > last || last >= total {
 		return 0, 0, 0, false
 	}
 	return first, last, total, true

@@ -386,6 +386,9 @@ func TestParseContentRange(t *testing.T) {
 		{"bytes 1-2/3\x00", 0, 0, 0, false},
 		{"bytes \u0661-2/3", 0, 0, 0, false},
 		{"items 300-999/1000", 0, 0, 0, false},
+		{"bytes 5-4/10", 0, 0, 0, false},
+		{"bytes 0-10/10", 0, 0, 0, false},
+		{"bytes 0-0/0", 0, 0, 0, false},
 		{"", 0, 0, 0, false},
 	} {
 		first, last, total, ok := parseContentRange(tc.in)
