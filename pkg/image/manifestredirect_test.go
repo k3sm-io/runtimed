@@ -18,11 +18,16 @@ package image
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/google/go-containerregistry/pkg/name"
+
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // TestManifestFetchRedirectDoesNotReachTokenLogic pins that a manifest GET the
@@ -115,5 +120,60 @@ func TestManifestFetchRedirectDoesNotReachTokenLogic(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// downgradeTransport stands in for an https registry, registry.example,
+// whose manifest GETs redirect to plain http on blobs.example. It records
+// every plain http request it is asked to send.
+type downgradeTransport struct {
+	mu    sync.Mutex
+	plain []string
+}
+
+func (d *downgradeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	res := &http.Response{Header: http.Header{}, Body: http.NoBody, Request: req}
+	switch {
+	case req.URL.Scheme == "http":
+		d.mu.Lock()
+		d.plain = append(d.plain, req.URL.Host)
+		d.mu.Unlock()
+		res.StatusCode = http.StatusNotFound
+	case req.URL.Path == "/v2/":
+		res.StatusCode = http.StatusOK
+	case strings.HasPrefix(req.URL.Path, "/v2/repo/x/manifests/"):
+		res.StatusCode = http.StatusTemporaryRedirect
+		res.Header.Set("Location", "http://blobs.example/x")
+	default:
+		res.StatusCode = http.StatusNotFound
+	}
+	return res, nil
+}
+
+// TestManifestFetchRefusesDowngrade pins that a manifest GET an https
+// registry redirects to plain http is refused with
+// registryfetch.ErrRedirectDowngrade before the http request is sent.
+// go-containerregistry's own redirect check allows a redirect to any public
+// host, whatever the scheme. (net/http's url.Error around the refusal still
+// carries the full target URL, as it does for Session's checkRedirect.)
+func TestManifestFetchRefusesDowngrade(t *testing.T) {
+	ref := "registry.example/repo/x:tag"
+	r, err := name.ParseReference(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Context().Registry.Scheme() != "https" {
+		t.Fatalf("registry scheme %q; the row needs https", r.Context().Registry.Scheme())
+	}
+	tr := &downgradeTransport{}
+	_, err = splitFetch(context.Background(), r, ref, &RegistryCredential{Username: "u", Password: "p"},
+		nativePolicy(), tr)
+	if !errors.Is(err, registryfetch.ErrRedirectDowngrade) {
+		t.Fatalf("splitFetch: err %v, want ErrRedirectDowngrade", err)
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if len(tr.plain) != 0 {
+		t.Errorf("plain http requests sent to %q; want none", tr.plain)
 	}
 }

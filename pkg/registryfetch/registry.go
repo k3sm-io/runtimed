@@ -249,6 +249,9 @@ func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
 	if h.scheme == "https" && scheme == "http" {
 		// Scheme and host only, as checkRedirect: the query can carry a
 		// presigned signature.
+		if req.Body != nil {
+			_ = req.Body.Close() // a RoundTripper closes the body, even on error
+		}
 		return nil, fmt.Errorf("%w: to %s://%s", ErrRedirectDowngrade, req.URL.Scheme, req.URL.Host)
 	}
 	res, err := h.plain.RoundTrip(req)

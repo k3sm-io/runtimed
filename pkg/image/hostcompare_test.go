@@ -18,6 +18,7 @@ package image
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -69,10 +70,11 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 		scheme   string // the request URL's scheme
 		host     string // the request URL's host
 		creds    bool
+		refused  bool // an https registry's plain http request: ErrRedirectDowngrade
 	}{
 		{name: "same host same port", registry: "registry.example:5000", scheme: "https", host: "registry.example:5000", creds: true},
 		{name: "same host other port", registry: "registry.example:5000", scheme: "https", host: "registry.example:5001"},
-		{name: "same host and port, scheme https to http", registry: "registry.example:5000", scheme: "http", host: "registry.example:5000"},
+		{name: "same host and port, scheme https to http", registry: "registry.example:5000", scheme: "http", host: "registry.example:5000", refused: true},
 		{name: "same host and port, scheme http to https", registry: "registry.example:5000", insecure: true, scheme: "https", host: "registry.example:5000"},
 		{name: "scheme in upper case", registry: "registry.example", scheme: "HTTPS", host: "registry.example", creds: true},
 		{name: "host letter case, request upper", registry: "registry.example", scheme: "https", host: "Registry.Example", creds: true},
@@ -123,6 +125,17 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 				Header: http.Header{},
 			}).WithContext(context.Background())
 			resp, err := rt.RoundTrip(req)
+			if tc.refused {
+				if !errors.Is(err, registryfetch.ErrRedirectDowngrade) {
+					t.Fatalf("RoundTrip: err %v, want ErrRedirectDowngrade", err)
+				}
+				inner.mu.Lock()
+				defer inner.mu.Unlock()
+				for _, a := range inner.auth[1:] {
+					t.Errorf("refused request still reached the transport (Authorization %q)", a)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("RoundTrip: %v", err)
 			}

@@ -294,8 +294,6 @@ func TestHostSplitRoutes(t *testing.T) {
 		{"explicit default port", "https", "registry.example", "https://registry.example:443/v2/", true},
 		{"host case", "https", "registry.example:443", "https://REGISTRY.example/v2/", true},
 		{"http default port", "http", "registry.example", "http://registry.example:80/v2/", true},
-		{"other scheme", "https", "registry.example", "http://registry.example/v2/", false},
-		{"other scheme same port", "https", "registry.example", "http://registry.example:443/v2/", false},
 		{"other port", "https", "registry.example", "https://registry.example:5000/v2/", false},
 		{"other host", "https", "registry.example", "https://blobs.example/v2/", false},
 		{"suffixed host", "https", "registry.example", "https://registry.example.evil/v2/", false},
@@ -319,6 +317,54 @@ func TestHostSplitRoutes(t *testing.T) {
 			t.Errorf("%s: registry %s://%s, request %s: auth %d plain %d, want auth route %v",
 				tc.name, tc.scheme, tc.host, tc.url, auth.n, plain.n, tc.auth)
 		}
+	}
+}
+
+// TestHostSplitRefusesDowngrade: a plain http request for an https registry
+// reaches neither route and is refused with ErrRedirectDowngrade, whose
+// message names the scheme and host but not the path or query. A client
+// stacked on the split (go-containerregistry's remote package builds its own
+// http.Client) has no Session checkRedirect to refuse such a hop first.
+func TestHostSplitRefusesDowngrade(t *testing.T) {
+	for _, tc := range []struct{ name, url string }{
+		{"other scheme", "http://registry.example/v2/x?X-Amz-Signature=secret"},
+		{"other scheme same port", "http://registry.example:443/v2/x?X-Amz-Signature=secret"},
+		{"other host", "http://blobs.example/x?X-Amz-Signature=secret"},
+	} {
+		auth, plain := &routeRecorder{}, &routeRecorder{}
+		h := &hostSplit{scheme: "https", host: canonicalHost("https", "registry.example"), auth: auth, plain: plain}
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := h.RoundTrip(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if !errors.Is(err, ErrRedirectDowngrade) {
+			t.Errorf("%s: err %v, want ErrRedirectDowngrade", tc.name, err)
+		}
+		if err != nil && (strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "/x")) {
+			t.Errorf("%s: error %q names the path or query", tc.name, err)
+		}
+		if auth.n != 0 || plain.n != 0 {
+			t.Errorf("%s: auth %d plain %d, want neither route", tc.name, auth.n, plain.n)
+		}
+	}
+	// A plain http registry is not a downgrade.
+	auth, plain := &routeRecorder{}, &routeRecorder{}
+	h := &hostSplit{scheme: "http", host: canonicalHost("http", "registry.example"), auth: auth, plain: plain}
+	req, err := http.NewRequest(http.MethodGet, "http://blobs.example/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := h.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("plain http registry, other host: %v", err)
+	}
+	resp.Body.Close()
+	if auth.n != 0 || plain.n != 1 {
+		t.Errorf("plain http registry, other host: auth %d plain %d, want plain 1", auth.n, plain.n)
 	}
 }
 
