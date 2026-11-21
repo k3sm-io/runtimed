@@ -25,7 +25,7 @@ import (
 	"sort"
 	"strings"
 
-	"k3sm.io/runtimed/pkg/pathsafe"
+	"golang.org/x/sys/unix"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -232,28 +232,35 @@ func viewTarget(view, subPath string) (string, error) {
 	return target, nil
 }
 
-// placeLink makes dest a symlink to target. The parents of dest are refused if
-// any is a symlink (they are created otherwise), a stale symlink at dest is
+// placeLink makes dest a symlink to target. The parents of dest are created
+// and opened from dataVol one component at a time without following a link,
+// and refused if any is a symlink or not a directory; dest is then examined,
+// replaced and created relative to that descriptor: a stale symlink at dest is
 // replaced, and any other existing entry is refused.
 func placeLink(dataVol, dest, target string) error {
-	parent := filepath.Dir(dest)
-	if err := pathsafe.RefuseSymlinkedPath(dataVol, parent); err != nil {
-		return fmt.Errorf("refusing mount parent %s: %w", parent, err)
+	// The data volume is the daemon's path (see openAnchor for what that
+	// trusts).
+	if err := os.MkdirAll(dataVol, 0o755); err != nil {
+		return fmt.Errorf("create pod data volume %s: %w", dataVol, err)
 	}
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return fmt.Errorf("create mount parent %s: %w", parent, err)
+	parent, err := openUnder(dataVol, filepath.Dir(dest), true)
+	if err != nil {
+		return fmt.Errorf("refusing mount parent %s: %w", filepath.Dir(dest), err)
 	}
-	if fi, err := os.Lstat(dest); err == nil {
-		if fi.Mode()&os.ModeSymlink == 0 {
+	defer parent.close()
+	name := filepath.Base(dest)
+	var st unix.Stat_t
+	if err := unix.Fstatat(parent.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		if uint32(st.Mode)&unix.S_IFMT != unix.S_IFLNK {
 			return fmt.Errorf("%s already exists and is not a symlink", dest)
 		}
-		if err := os.Remove(dest); err != nil {
+		if err := unix.Unlinkat(parent.fd, name, 0); err != nil {
 			return fmt.Errorf("replace stale view link %s: %w", dest, err)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !errors.Is(err, unix.ENOENT) {
 		return fmt.Errorf("lstat view link %s: %w", dest, err)
 	}
-	if err := os.Symlink(target, dest); err != nil {
+	if err := unix.Symlinkat(target, parent.fd, name); err != nil {
 		return fmt.Errorf("symlink %s -> %s: %w", dest, target, err)
 	}
 	return nil

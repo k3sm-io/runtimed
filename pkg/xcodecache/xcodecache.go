@@ -54,6 +54,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -61,6 +62,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 // Annotation opts a pod into the cache. Its value is the cache key, scoped to
@@ -95,6 +98,10 @@ var (
 
 // ErrInvalid marks a key, namespace or Xcode build the cache refuses.
 var ErrInvalid = errors.New("xcode cache")
+
+// removeBounds bounds the removal of a part whose clone failed: a cache
+// tree nests far less than this, and it may hold any number of entries.
+var removeBounds = pathsafe.TreeBounds{Depth: 1024}
 
 // ValidKey reports whether key can name a cache entry: a lowercase letter or
 // digit, then up to 62 of [a-z0-9._-]. ".." and anything with a slash are
@@ -331,7 +338,7 @@ func (s Store) CheckoutAt(e Entry, base, homeRel string) ([]string, error) {
 			// Removed relative to the pinned parent, never by path: the
 			// daemon runs this as root, and a path through the home could
 			// by now name another tree.
-			_ = removeTreeAt(int(parent.Fd()), name)
+			_ = pathsafe.RemoveTreeAt(int(parent.Fd()), name, removeBounds)
 		}
 		parent.Close()
 		if err != nil {
@@ -340,53 +347,6 @@ func (s Store) CheckoutAt(e Entry, base, homeRel string) ([]string, error) {
 		cloned = append(cloned, part)
 	}
 	return cloned, nil
-}
-
-// removeTreeAt removes name and everything below it, relative to the open
-// directory dirfd. It never follows a link: a link is unlinked as a link, and
-// each directory is opened with O_NOFOLLOW relative to its parent's
-// descriptor, so a component swapped for a link while it runs is refused
-// rather than descended. A name that is not there is not an error.
-func removeTreeAt(dirfd int, name string) error {
-	var st unix.Stat_t
-	if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil
-		}
-		return err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		if err := unix.Unlinkat(dirfd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-			return err
-		}
-		return nil
-	}
-	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil
-		}
-		return err
-	}
-	d := os.NewFile(uintptr(fd), name)
-	names, rerr := d.Readdirnames(-1)
-	var first error
-	for _, n := range names {
-		if err := removeTreeAt(fd, n); err != nil && first == nil {
-			first = err
-		}
-	}
-	d.Close()
-	if rerr != nil && first == nil {
-		first = rerr
-	}
-	if first != nil {
-		return first
-	}
-	if err := unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
-		return err
-	}
-	return nil
 }
 
 // Publish replaces the entry's snapshot with a clone of the parts present in
@@ -550,56 +510,27 @@ func sweepStale(dir, keep string) {
 }
 
 // pinDir opens base/rel as a directory, one component at a time with
-// O_NOFOLLOW, and returns the open directory. A symlink anywhere, base
-// included, is refused (ErrInvalid). A missing or non-directory component
-// returns ok=false, unless create is set, which makes a missing one (0700).
-// The caller closes the returned file.
+// O_NOFOLLOW (pathsafe.OpenDirFrom), and returns the open directory. A symlink
+// anywhere, base included, is refused (ErrInvalid). A missing or non-directory
+// component returns ok=false, unless create is set, which makes a missing one
+// (0700). The caller closes the returned file.
 func pinDir(base, rel string, create bool) (*os.File, bool, error) {
-	const flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	fd, err := unix.Open(base, flags, 0)
+	bfd, err := unix.Open(base, pathsafe.DirFlags, 0)
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: open %s: %v", ErrInvalid, base, err)
 	}
-	cur := base
-	for _, c := range strings.Split(filepath.Clean(rel), string(filepath.Separator)) {
-		if c == "" || c == "." {
-			continue
-		}
-		if c == ".." {
-			unix.Close(fd)
-			return nil, false, fmt.Errorf("%w: %q leaves %s", ErrInvalid, rel, base)
-		}
-		cur = filepath.Join(cur, c)
-		var st unix.Stat_t
-		err := unix.Fstatat(fd, c, &st, unix.AT_SYMLINK_NOFOLLOW)
-		if errors.Is(err, unix.ENOENT) && create {
-			if err = unix.Mkdirat(fd, c, 0o700); err == nil {
-				err = unix.Fstatat(fd, c, &st, unix.AT_SYMLINK_NOFOLLOW)
-			}
-		}
-		switch {
-		case errors.Is(err, unix.ENOENT):
-			unix.Close(fd)
-			return nil, false, nil
-		case err != nil:
-			unix.Close(fd)
-			return nil, false, fmt.Errorf("xcode cache: %s: %w", cur, err)
-		case st.Mode&unix.S_IFMT == unix.S_IFLNK:
-			unix.Close(fd)
-			return nil, false, fmt.Errorf("%w: %s is a symlink", ErrInvalid, cur)
-		case st.Mode&unix.S_IFMT != unix.S_IFDIR:
-			unix.Close(fd)
-			return nil, false, nil
-		}
-		next, err := unix.Openat(fd, c, flags, 0)
-		unix.Close(fd)
-		if err != nil {
-			// Swapped between the stat and the open: a link now, or gone.
-			return nil, false, fmt.Errorf("%w: open %s: %v", ErrInvalid, cur, err)
-		}
-		fd = next
+	defer unix.Close(bfd)
+	fd, err := pathsafe.OpenDirFrom(bfd, base, rel, create, 0o700)
+	switch {
+	case err == nil:
+		return os.NewFile(uintptr(fd), filepath.Join(base, rel)), true, nil
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, unix.ENOTDIR):
+		return nil, false, nil
+	case errors.Is(err, pathsafe.ErrSymlinkedPath), errors.Is(err, pathsafe.ErrPathOutsideRoot):
+		return nil, false, fmt.Errorf("%w: %v", ErrInvalid, err)
+	default:
+		return nil, false, fmt.Errorf("xcode cache: %w", err)
 	}
-	return os.NewFile(uintptr(fd), cur), true, nil
 }
 
 // lock takes a flock of kind how on path, creating it, retrying a busy lock

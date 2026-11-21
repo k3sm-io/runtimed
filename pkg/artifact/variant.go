@@ -69,6 +69,8 @@ type PullOption func(*pullOptions)
 
 type pullOptions struct {
 	variant string
+	// hold is WithHold's callback; nil when the caller holds nothing.
+	hold func(context.Context, *Result) error
 }
 
 // WithVariant selects the index entry whose AnnotationVariant equals variant.

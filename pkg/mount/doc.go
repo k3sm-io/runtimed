@@ -37,8 +37,15 @@ limitations under the License.
 //
 // Secrets and the projected ServiceAccount token are reported as credentials in
 // the returned Layout so the caller hands them to sandbox.Generate as the
-// read-only sub-scope (file-read* + an explicit file-write* deny) — a pod can
-// read its credentials but never overwrite them.
+// read-only sub-scope (file-read* + an explicit file-write* deny): a pod cannot
+// write the files at its credential mount paths. That is a rule on paths, not
+// on the files: a pod can rename a parent of a credential mount aside (it
+// writes its rootfs), after which the live generation's files sit outside the
+// sub-scope and the pod can change them, and it can put a directory of its own
+// at the mount path. So the live generation's content is not
+// integrity-protected against the pod itself; the daemon never reads it back
+// unless it is the generation the daemon recorded (see below), and a refresh
+// of a replaced mount dir renders it fresh.
 //
 // # Refresh: the atomic-writer layout
 //
@@ -53,6 +60,61 @@ limitations under the License.
 // whose sources were all immutable, and re-mints a ServiceAccount token only
 // when under 20% of its lifetime remains. A failed resolve or render leaves the
 // live generation in place.
+//
+// # Writes into the pod tree go through descriptors
+//
+// The pod owns every directory below its data volume and can rename one away
+// and plant a symlink, or a file, in its place at any time, including between
+// Materialize and a Refresh (a process of an earlier instance can do it before
+// Materialize). So a mount dir is opened from the data volume one component at
+// a time with O_NOFOLLOW|O_DIRECTORY (openUnder, pathsafe.OpenDirFrom), and a
+// component that is a symlink or not a directory fails the mount (at create)
+// or the volume's refresh. Every step of the atomic writer — the generation
+// dir, the files rendered into it, the check of what was rendered, the ..data
+// flip, the key links, the removal of the old generation and of dropped keys,
+// and the re-read of a still-fresh token — then acts relative to that
+// descriptor or the generation's own: mkdirat, openat with O_CREAT|O_EXCL and
+// O_NOFOLLOW, fchmod, symlinkat, renameat, readlinkat, unlinkat and a
+// descriptor-relative tree removal (pathsafe.RemoveTreeAt). A subPath
+// selection is cloned into place with clonefileat(2) relative to the pinned
+// destination, and an image volume's view link is placed with symlinkat. What
+// a name means after it was opened cannot redirect a write.
+//
+// The pod can also write into the tree while the daemon works in it: plant a
+// name in a generation being rendered, or point ..data at a directory of its
+// own. So a render writes only names it created (a planted one is refused,
+// never truncated), a rendered or re-read file must have one link, the mount
+// dir and the live generation must be the ones the previous render recorded
+// (RefreshState.Mounts) before anything is read back from the live
+// generation, and every read and walk of a generation is bounded
+// (maxVolumeBytes, maxTreeEntries, maxTreeDepth; over a bound the volume's
+// refresh fails).
+//
+// The rendered files are owned by the daemon's uid, which is the uid a pod
+// runs as unless it drops to another one, so their mode bits protect nothing
+// from the pod: the SBPL read-only sub-scope on a credential mount's path is
+// the only thing that keeps a pod from writing the files there, and it holds
+// only while those files stay at that path (above).
+//
+// Every tree a refresh removes from a mount dir can be the pod's, so removal
+// is bounded too (pathsafe.RemoveTreeAt with removeBounds), and holds a
+// constant number of descriptors however deep the tree is: a ..data that is no
+// link is renamed aside to a ..trash_ name first and removed from there (over
+// a bound the refresh fails and the rest stays aside; the next refresh
+// renders), a generation the pod grew while it was rendered is removed within
+// the bound, and the previous generation is removed only when it was the
+// trusted live one. A mount dir that is not the one recorded is rendered as
+// after a restart: fresh, with nothing read from it, and recorded anew. A
+// render that would write more than maxVolumeBytes fails, so a volume too
+// large to refresh fails its create.
+//
+// Still by path: the data volume itself and the pod dir above it (the
+// daemon's own paths; see openAnchor for what that trusts), the subPath
+// staging dir (a daemon-owned sibling of the data volume, created and
+// removed by path), and a vm pod's share roots and emptyDir share dirs
+// (MaterializeShares creates them under the pod dir after
+// pathsafe.RefuseSymlinkedPath, a pre-check; the proj volumes rendered into
+// them go through descriptors).
 //
 // # subPath
 //

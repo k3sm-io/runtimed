@@ -96,9 +96,41 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
 	c.nextLease++
+	if c.leaseWatch != nil {
+		for _, d := range held {
+			c.leaseWatch[d] = struct{}{}
+		}
+	}
 	l := &Lease{c: c, id: c.nextLease, digests: held, expires: c.now().Add(ttl)}
 	c.leases[l.id] = l
 	return l
+}
+
+// beginLeaseWatch starts collecting the digests of every lease acquired from
+// now on (see Cache.leaseWatch). Its only caller is executePrune, which takes
+// pruneMu itself for the whole pass, so at most one watch is open at a time
+// and begin/end never nest.
+func (c *Cache) beginLeaseWatch() {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.leaseWatch = make(map[string]struct{})
+}
+
+// endLeaseWatch stops collecting lease digests.
+func (c *Cache) endLeaseWatch() {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	c.leaseWatch = nil
+}
+
+// leaseWatchNamesLocked reports whether a lease acquired since the watch began
+// (or since the watch was last reset) names d. The caller holds leaseMu. Its
+// only caller is executePrune's critical section (unlinkUnlessLeased), which
+// resets the watch in that same section when it is about to re-read its pins,
+// so a lease acquired during that re-read lands in the fresh watch.
+func (c *Cache) leaseWatchNamesLocked(d string) bool {
+	_, ok := c.leaseWatch[d]
+	return ok
 }
 
 // leasedDigests returns the set of digests currently pinned by a live lease,
@@ -106,16 +138,41 @@ func (c *Cache) AcquireLease(digests []string, ttl time.Duration) *Lease {
 func (c *Cache) leasedDigests() map[string]bool {
 	c.leaseMu.Lock()
 	defer c.leaseMu.Unlock()
-	now := c.now()
+	c.expireLeasesLocked()
 	out := make(map[string]bool)
-	for id, l := range c.leases {
-		if now.After(l.expires) {
-			delete(c.leases, id)
-			continue
-		}
+	for _, l := range c.leases {
 		for _, d := range l.digests {
 			out[d] = true
 		}
 	}
 	return out
+}
+
+// leaseHasLocked reports whether a live lease pins digest, dropping leases
+// whose TTL has passed exactly as leasedDigests does. The caller holds leaseMu,
+// which is how executePrune makes a blob's lease check and its unlink one
+// critical section with respect to AcquireLease. It allocates nothing, so a
+// per-blob check costs one scan of the live leases rather than a copy of their
+// set.
+func (c *Cache) leaseHasLocked(digest string) bool {
+	c.expireLeasesLocked()
+	for _, l := range c.leases {
+		for _, d := range l.digests {
+			if d == digest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// expireLeasesLocked deletes every lease whose TTL has passed. The caller holds
+// leaseMu. It is the one statement of the expiry rule.
+func (c *Cache) expireLeasesLocked() {
+	now := c.now()
+	for id, l := range c.leases {
+		if now.After(l.expires) {
+			delete(c.leases, id)
+		}
+	}
 }

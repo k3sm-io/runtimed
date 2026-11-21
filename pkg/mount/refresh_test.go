@@ -158,7 +158,7 @@ func layoutShape(t *testing.T, dir string) map[string]string {
 		switch {
 		case name == gen:
 			name = "<gen>"
-			snap, err := snapshotTree(filepath.Join(dir, gen))
+			snap, err := snapshotTree(openTestDir(t, filepath.Join(dir, gen)), true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,24 +187,24 @@ func layoutShape(t *testing.T, dir string) map[string]string {
 func countFlips(t *testing.T, want map[string]string) *int {
 	t.Helper()
 	n := 0
-	orig := rename
-	rename = func(oldpath, newpath string) error {
-		if filepath.Base(newpath) == dataLink {
+	orig := renameAt
+	renameAt = func(fromfd int, from string, tofd int, to string) error {
+		if to == dataLink {
 			n++
-			target, err := os.Readlink(oldpath)
+			target, err := readlinkAt(fromfd, from)
 			if err != nil {
-				t.Errorf("flip source %s is not a symlink: %v", oldpath, err)
+				t.Errorf("flip source %s is not a symlink: %v", from, err)
 			}
-			gen := filepath.Join(filepath.Dir(newpath), target)
+			dir := &dirTarget{fd: tofd}
 			for k, v := range want {
-				if got, err := os.ReadFile(filepath.Join(gen, k)); err != nil || string(got) != v {
+				if got, err := readFileAt(dir, filepath.Join(target, k), maxVolumeBytes); err != nil || string(got) != v {
 					t.Errorf("at the flip, %s/%s = %q (%v), want %q: the new tree must be complete before it goes live", target, k, got, err, v)
 				}
 			}
 		}
-		return orig(oldpath, newpath)
+		return orig(fromfd, from, tofd, to)
 	}
-	t.Cleanup(func() { rename = orig })
+	t.Cleanup(func() { renameAt = orig })
 	return &n
 }
 
@@ -496,21 +496,21 @@ func TestWriteGenerationRefusesUnsafeGenerations(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			wantErr: "resolves outside mount dir",
+			wantErr: "no longer the directory that was rendered",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			if _, err := writeGeneration(dir, func(gen, _ string) error {
-				return os.WriteFile(filepath.Join(gen, "k"), []byte("old"), 0o644)
+			if _, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
+				return os.WriteFile(gen.join("k"), []byte("old"), 0o644)
 			}); err != nil {
 				t.Fatalf("seed generation: %v", err)
 			}
 			oldGen := liveGen(t, dir)
 
 			flips := countFlips(t, nil)
-			flipped, err := writeGeneration(dir, func(gen, _ string) error {
-				tc.plant(t, gen)
+			flipped, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
+				tc.plant(t, gen.path)
 				return nil
 			})
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -555,14 +555,14 @@ func TestRefreshHousekeepingFailureAfterFlipIsAWarning(t *testing.T) {
 
 	// A new key needs a new top-level link; make exactly that rename fail.
 	r.set("app", false, "a", "2", "b", "new")
-	orig := rename
-	rename = func(oldpath, newpath string) error {
-		if filepath.Base(newpath) == "b" {
+	orig := renameAt
+	renameAt = func(fromfd int, from string, tofd int, to string) error {
+		if to == "b" {
 			return errors.New("injected link failure")
 		}
-		return orig(oldpath, newpath)
+		return orig(fromfd, from, tofd, to)
 	}
-	t.Cleanup(func() { rename = orig })
+	t.Cleanup(func() { renameAt = orig })
 
 	res, err := Refresh(ctx, root, box, r, RefreshOptions{State: layout.State})
 	if err == nil || !strings.Contains(err.Error(), "injected link failure") || !strings.Contains(err.Error(), "cfg") {
@@ -581,4 +581,15 @@ func TestRefreshHousekeepingFailureAfterFlipIsAWarning(t *testing.T) {
 	if got := readString(t, filepath.Join(dir, "a")); got != "2" {
 		t.Errorf("a = %q, want 2", got)
 	}
+}
+
+// openTestDir opens dir as a dirTarget for the test's lifetime.
+func openTestDir(t *testing.T, dir string) *dirTarget {
+	t.Helper()
+	d, err := openAnchor(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.close)
+	return d
 }

@@ -197,6 +197,11 @@ type ReclaimConfig struct {
 	// observe it.
 	afterInventory func()
 
+	// afterRoots runs after the root and lease reads the plan is built from,
+	// before any unlink. It is UNEXPORTED for the same reason as afterInventory:
+	// an in-package test drives a pull that roots a planned blob in that window.
+	afterRoots func()
+
 	// SweepDerived, when set, removes content derived from records rather than
 	// from blobs whose record is gone: the artifact views, which pkg/runtime
 	// wires in (this package cannot import their owner). A triggered pass that
@@ -417,6 +422,9 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	for d := range c.leasedDigests() {
 		leased = append(leased, d)
 	}
+	if cfg.afterRoots != nil {
+		cfg.afterRoots()
+	}
 	plan, err := PlanPrune(nodes, trees, roots, leased, grace, now())
 	if err != nil {
 		return nil, err
@@ -433,8 +441,15 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// eligible or keep one: holds, pins, pod records and leases have already
 	// decided membership above. What the executor re-checks before each unlink
 	// is narrower: the path still fits the blob grammar, Lstat still reports a
-	// regular file, and its mtime is still older than grace. It does not re-read
-	// the roots; the leases are re-read before each executor run (dropLeased).
+	// regular file, and its mtime is still older than grace. Once per batch,
+	// under pruneMu and before the first unlink, it also re-reads the leases and
+	// the roots (pinnedNow), so a pull that rooted a planned blob since the plan
+	// keeps it. Before each entry it re-reads them again if a lease acquired
+	// since the last read names that entry's digest, checked in the same
+	// critical section as the unlink, so a pull that leased, rooted and
+	// released a blob during the batch keeps it; and in that section it
+	// re-reads the live leases, so a pull still holding its lease keeps it
+	// too. The residual (a lease past its TTL) is executePrune's to state.
 	artifactDels, restDels := orderEvictions(plan.Delete, classes)
 	plan.Delete = append(append([]PruneDecision(nil), artifactDels...), restDels...)
 	rep.ReclaimedByClass = map[string]int64{}
@@ -501,8 +516,8 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	// target stops having given up the cheaper thing — and it can never orphan
 	// a tree, because a tree is only ever condemned in the same pass that
 	// condemns the blobs it was built from.
-	artifactDels = c.dropLeased(artifactDels, rep)
-	artExec, err := c.ExecutePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop)
+	pinned := func() (map[string]PruneReason, error) { return c.pinnedNow(cfg.UntrackedPod) }
+	artExec, err := c.executePrune(&PrunePlan{Delete: artifactDels}, grace, now(), stop, pinned)
 	if err != nil {
 		return nil, err
 	}
@@ -519,8 +534,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		rep.KeptTrees = append(rep.KeptTrees, KeptTree{Store: s.Store, Key: s.Key, Path: s.Path, Reason: ReasonKeptUnknownProvenance, Detail: s.Reason})
 	}
 
-	restDels = c.dropLeased(restDels, rep)
-	restExec, err := c.ExecutePrune(&PrunePlan{Delete: restDels}, grace, now(), stop)
+	restExec, err := c.executePrune(&PrunePlan{Delete: restDels}, grace, now(), stop, pinned)
 	if err != nil {
 		return nil, err
 	}
@@ -530,6 +544,7 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 		exec.Deleted += e.Deleted
 		exec.DeletedBytes += e.DeletedBytes
 		exec.Skipped = append(exec.Skipped, e.Skipped...)
+		rep.Kept = append(rep.Kept, e.pinned...)
 	}
 	rep.Removed = exec.Removed
 	rep.ReclaimedBytes += exec.DeletedBytes
@@ -566,26 +581,38 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	return rep, nil
 }
 
-// dropLeased returns dels without the decisions whose digest a live lease
-// pins now, reporting each dropped one in rep.Kept as ReasonKeptLeased. The
-// planner read the leases once; an ingest that leased a planned blob since
-// (a cache hit on an old blob, which no grace window covers) is honoured
-// here, just before the executor runs. A lease taken during the executor's own
-// run is not seen; the grace re-check and the next pass are what remain.
-func (c *Cache) dropLeased(dels []PruneDecision, rep *ReclaimReport) []PruneDecision {
-	leased := c.leasedDigests()
-	if len(leased) == 0 {
-		return dels
+// pinnedNow returns every digest a live lease or a root names now: a lease
+// as ReasonKeptLeased, a root as ReasonKeptInUse. The planner read both once;
+// an ingest that took a planned blob since (a cache hit on an old blob, which
+// no grace window covers) leases it, records it, holds it and releases the
+// lease, and this re-read just before an unlink batch honours whichever of
+// those it finds.
+//
+// LEASES FIRST, roots second. A pull writes its record and hold while its
+// lease is live, so a lease released before the lease read left a root that
+// the later root read sees, and a lease live at the lease read is seen
+// itself. Reversed, a pull that wrote its hold after the root read and
+// released its lease before the lease read would be seen by neither.
+//
+// It fails closed like the plan's own root read: an incomplete root set is an
+// error, and the batch unlinks nothing.
+func (c *Cache) pinnedNow(untracked UntrackedPodFunc) (map[string]PruneReason, error) {
+	out := make(map[string]PruneReason)
+	for d := range c.leasedDigests() {
+		out[d] = ReasonKeptLeased
 	}
-	out := dels[:0:0]
-	for _, d := range dels {
-		if d.Node.Digest != "" && leased[d.Node.Digest] {
-			rep.Kept = append(rep.Kept, KeptBlob{Digest: d.Node.Digest, Path: d.Node.Path, Reason: ReasonKeptLeased})
-			continue
+	roots, _, err := c.roots(untracked)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range roots {
+		for _, d := range r.Digests() {
+			if _, ok := out[d]; !ok {
+				out[d] = ReasonKeptInUse
+			}
 		}
-		out = append(out, d)
 	}
-	return out
+	return out, nil
 }
 
 // newlySkipped returns the pod dirs in skipped that the previous pass did not

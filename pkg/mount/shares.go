@@ -191,7 +191,17 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string
 				if !ok {
 					return fmt.Errorf("container %s: bind references undefined volume %q", cname, b.VolumeName)
 				}
-				if _, err := newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, dir); err != nil {
+				// Rendered through a descriptor opened from the pod dir without
+				// following a link: the walk above is a pre-check, this is the
+				// handle the writes go through.
+				d, err := openUnder(podDir, dir, true)
+				if err != nil {
+					return fmt.Errorf("open share dir %s for volume %s: %w", dir, b.VolumeName, err)
+				}
+				d.replace = true // a re-run create renders over the last one
+				_, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, d)
+				d.close()
+				if err != nil {
 					return fmt.Errorf("materialize volume %s: %w", b.VolumeName, err)
 				}
 			default:
