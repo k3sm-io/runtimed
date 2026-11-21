@@ -102,6 +102,9 @@ var (
 	ErrSizeCap            = errors.New("artifact: declared size exceeds its cap")
 	ErrSizeOverflow       = errors.New("artifact: space arithmetic overflows")
 	ErrPartialDir         = errors.New("artifact: partial dir is not the private cache child")
+	// ErrBlobReclaimed reports a blob the pull's re-check found unlinked by a
+	// reclaim pass and still absent after its one refetch.
+	ErrBlobReclaimed = errors.New("artifact: a blob was reclaimed during the pull and is still absent after a refetch")
 	// ErrGuestLayersMismatch reports a guest manifest whose layers or config
 	// are not the set PullGuestArtifact was told to expect.
 	ErrGuestLayersMismatch = errors.New("artifact: the guest manifest does not declare exactly the expected layers")
@@ -208,6 +211,11 @@ type Puller struct {
 	// recordStripes serialize the read-modify-write of one record key (see
 	// record), so concurrent subset pulls of one manifest never lose a layer.
 	recordStripes [32]sync.Mutex
+
+	// afterPresence, when set, runs once the presence check (and any fetch it
+	// led to) is done and before the record is written: the window in which a
+	// reclaim pass can unlink a blob the check saw. Tests only.
+	afterPresence func()
 }
 
 // New returns a Puller.
@@ -467,13 +475,7 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 		}
 	}()
 
-	var missing []blob
-	for _, b := range need {
-		if !p.deps.Blobs.Has(b.digest) {
-			missing = append(missing, b)
-		}
-	}
-	if len(missing) > 0 {
+	if missing := p.absent(need); len(missing) > 0 {
 		r, err := p.reserve(ctx, missing)
 		if err != nil {
 			return nil, err
@@ -485,7 +487,27 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 		}
 		res.Fetched = true
 	}
+	if p.afterPresence != nil {
+		p.afterPresence()
+	}
 	if err := p.record(ctx, ref, typ, mdigest, raw, m.Config.Digest, res.LayerDigests, podOnly); err != nil {
+		return nil, err
+	}
+	if o.hold != nil {
+		if err := o.hold(ctx, res); err != nil {
+			return nil, err
+		}
+	}
+	// The lease-to-hold handoff ends here: the record, and the caller's hold
+	// when it passed one, now name every blob, so a reclaim pass that reads
+	// its pins from now on keeps them. A pass that planned a blob before the
+	// lease existed can still have unlinked it after the presence check, so
+	// the blobs are checked again, still under the lease, and what is gone is
+	// fetched once more. This narrows the race rather than closing it:
+	// reclaim's lease check and its unlink are not atomic with AcquireLease,
+	// so a pull that fits entirely between the two can still lose a blob
+	// after this re-check.
+	if err := p.recheck(ctx, ref, cred, need, res); err != nil {
 		return nil, err
 	}
 	p.log.Info("artifact pulled", "reference", ref, "digest", mdigest, "type", typ,
@@ -493,6 +515,78 @@ func (p *Puller) pull(ctx context.Context, ref string, cred *image.RegistryCrede
 	res.Lease = lease
 	ok = true
 	return res, nil
+}
+
+// WithHold runs hold after the pull's record is written and before the pull
+// re-checks its blobs. A caller whose own durable reference (a pod's hold)
+// must name the blobs passes it here, so that the re-check covers the moment
+// the lease stops being the only pin.
+//
+// The contract:
+//   - hold is called at most once per pull, and only after the record is
+//     written, with the pull's lease live.
+//   - Inside hold only the Result's ManifestDigest, ConfigDigest and
+//     LayerDigests are valid: Lease is nil, and Fetched is provisional (the
+//     re-check may still set it).
+//   - An error from hold fails the pull with that error.
+//   - The hold may already be written when the pull then fails (the re-check
+//     refetch fails, or ErrBlobReclaimed): the caller owns it and releases it
+//     on that failure.
+func WithHold(hold func(context.Context, *Result) error) PullOption {
+	return func(o *pullOptions) { o.hold = hold }
+}
+
+// RunHold runs the WithHold callback among opts, if any, against res. It is
+// how an ArtifactPuller other than *Puller (a test double) honours WithHold.
+// *Puller runs the callback itself, inside the pull under the lease. A puller
+// must not call RunHold and then delegate to *Puller: the hold would run twice.
+func RunHold(ctx context.Context, res *Result, opts ...PullOption) error {
+	o, err := applyOptions(opts)
+	if err != nil {
+		return err
+	}
+	if o.hold == nil {
+		return nil
+	}
+	return o.hold(ctx, res)
+}
+
+// recheck confirms every blob in need is still committed, and fetches the ones
+// a reclaim pass unlinked since the presence check. It refetches at most once:
+// a blob still absent after that fails the pull with ErrBlobReclaimed.
+func (p *Puller) recheck(ctx context.Context, ref string, cred *image.RegistryCredential, need []blob, res *Result) error {
+	gone := p.absent(need)
+	if len(gone) == 0 {
+		return nil
+	}
+	p.log.Warn("artifact blobs reclaimed during the pull, fetching them again",
+		"reference", ref, "blobs", len(gone))
+	r, err := p.reserve(ctx, gone)
+	if err != nil {
+		return err
+	}
+	err = p.fetchAll(ctx, ref, cred, gone, r)
+	r.release()
+	if err != nil {
+		return err
+	}
+	res.Fetched = true
+	if still := p.absent(need); len(still) > 0 {
+		return fmt.Errorf("%s: %d blob(s) absent after a refetch, first %s: %w",
+			image.QuoteBounded(ref, 512), len(still), still[0].digest, ErrBlobReclaimed)
+	}
+	return nil
+}
+
+// absent returns the blobs of need the store does not hold.
+func (p *Puller) absent(need []blob) []blob {
+	var gone []blob
+	for _, b := range need {
+		if !p.deps.Blobs.Has(b.digest) {
+			gone = append(gone, b)
+		}
+	}
+	return gone
 }
 
 // fetchManifest fetches ref's manifest under the stall timeout as a whole: a

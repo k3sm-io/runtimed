@@ -44,6 +44,12 @@ var (
 	// errArtifactCredential marks a failure to resolve the pod's pull
 	// credential, before any registry request.
 	errArtifactCredential = errors.New("resolve pull credential")
+	// errHoldNotWritten marks a pull that returned without running the pod's
+	// hold (artifact.WithHold); the mount fails closed on it.
+	errHoldNotWritten = errors.New("the artifact puller returned without writing the pod's hold")
+	// errHoldRunTwice marks a puller that ran the pod's hold callback more
+	// than once (artifact.WithHold allows one run); the mount fails closed.
+	errHoldRunTwice = errors.New("the artifact puller ran the pod's hold more than once")
 )
 
 // artifactPullReason types an ArtifactPullRefused failure, so the provider can
@@ -130,24 +136,53 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	case <-ctx.Done():
 		return pullRefused(ctx.Err())
 	}
+	// The lease pins the blobs until the pod's hold names the manifest; from
+	// then on the hold keeps the manifest's blobs and views for the pod's life,
+	// even if a moved tag replaces the record that names it. The hold is
+	// written inside the pull (artifact.WithHold), so the pull re-checks the
+	// blobs after it, still under the lease, and refetches any a reclaim pass
+	// unlinked in between; that narrows the race to the window in which
+	// reclaim's lease check and its unlink are not atomic with the lease.
+	//
+	// holdErr stays errHoldNotWritten until the puller runs the hold. A pull
+	// that fails after its hold was written leaves the hold in place; the
+	// failed create releases it (CreatePod's failure path,
+	// releasePodArtifacts).
+	//
+	// A second run never overwrites the first one's result: it fails the
+	// mount closed, so a puller that runs the hold twice cannot turn a failed
+	// hold into a success.
+	holdErr := errHoldNotWritten
+	holdRan := false
+	hold := artifact.WithHold(func(ctx context.Context, res *artifact.Result) error {
+		if holdRan {
+			holdErr = errHoldRunTwice
+			return holdErr
+		}
+		holdRan = true
+		holdErr = r.holdManifest(ctx, box, res)
+		return holdErr
+	})
 	res, err := func() (*artifact.Result, error) {
 		defer func() { <-r.artifactSem }()
 		cred, err := r.pullCredential(ctx, box, ref)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errArtifactCredential, err)
 		}
-		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil)
+		return r.artifacts.PullForPod(ctx, ref, cred, runtimev1.ArtifactPolicy_ARTIFACT_POLICY_IMAGE_VOLUME, nil, hold)
 	}()
-	if err != nil {
+	if err != nil && (holdErr == nil || errors.Is(holdErr, errHoldNotWritten)) {
 		return pullRefused(err)
 	}
-	// The lease pins the blobs until the pod's hold names the manifest; from
-	// then on the hold keeps the manifest's blobs and views for the pod's life,
-	// even if a moved tag replaces the record that names it.
-	defer res.Lease.Release()
-	if err := r.holdManifest(ctx, box, res); err != nil {
+	if err == nil {
+		defer res.Lease.Release()
+	}
+	if holdErr != nil {
+		// The hold failed, a pull that reported success never wrote it, or
+		// the puller ran it twice: no hold the mount can trust names the
+		// blobs, so the mount fails closed.
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
-			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), err)
+			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), holdErr)
 	}
 	view, err := r.views.View(ctx, res.ManifestDigest, nil)
 	if err != nil {
