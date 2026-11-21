@@ -71,7 +71,7 @@ func (s *stallFetcher) Manifest(ctx context.Context, ref string, cred *image.Reg
 	return nil, "", ctx.Err()
 }
 
-func (s *stallFetcher) Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, offset int64) (io.ReadCloser, int64, error) {
+func (s *stallFetcher) Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, _, offset int64) (io.ReadCloser, int64, error) {
 	s.mu.Lock()
 	data := s.blobs[digest][offset:]
 	s.mu.Unlock()

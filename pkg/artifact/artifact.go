@@ -140,10 +140,13 @@ type Fetcher interface {
 	// Manifest returns the manifest bytes ref names and the media type the
 	// registry served them as. It must return at most MaxManifestBytes+1 bytes.
 	Manifest(ctx context.Context, ref string, cred *image.RegistryCredential) (raw []byte, mediaType string, err error)
-	// Blob opens the blob digest in ref's repository from offset. It returns the
-	// offset the body actually starts at: offset for a honoured Range, 0 when
-	// the server sent the whole blob.
-	Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, offset int64) (body io.ReadCloser, start int64, err error)
+	// Blob opens the size-byte blob digest in ref's repository from offset. It
+	// returns the offset the body actually starts at: offset for a honoured
+	// Range, 0 when the server sent the whole blob. An implementation returns
+	// at most size-offset bytes from start and errors if the source goes past
+	// that; callers still keep their own length check for an implementation
+	// that does not.
+	Blob(ctx context.Context, ref string, cred *image.RegistryCredential, digest string, size, offset int64) (body io.ReadCloser, start int64, err error)
 }
 
 // Config configures a Puller.

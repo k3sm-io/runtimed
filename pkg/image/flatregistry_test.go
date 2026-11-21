@@ -435,3 +435,9 @@ func TestFlatRegistryFetchRefusesAnotherRegistry(t *testing.T) {
 		t.Fatalf("fetch of a foreign reference = %v, want a refusal", err)
 	}
 }
+
+// endpointFetch is endpointFetchOver over a fresh endpointTransport: the
+// FetchFunc for host at ep with pool as its trust anchor.
+func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchFunc {
+	return endpointFetchOver(host, ep, endpointTransport(host, ep, pool))
+}
