@@ -76,8 +76,8 @@ var effectiveUID = os.Geteuid
 
 var (
 	sha256Digest = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-	// partialName is the file-name grammar path produces; Sweep touches
-	// nothing else.
+	// partialName is the file-name grammar path produces; Sweep spares a
+	// claimed digest only under it, and names every other entry as foreign.
 	partialName = regexp.MustCompile(`^sha256-[a-f0-9]{64}\.partial$`)
 )
 
@@ -192,14 +192,19 @@ func (s *PartialStore) Admit(digest string, want int64) error {
 	return err
 }
 
-// Sweep removes the partials whose mtime is older than maxAge at now and
-// whose digest is not claimed. Only regular files named by the store's own
-// grammar (sha256-<64 hex>.partial) are candidates; a symlink, a directory
-// or a foreign name is left alone. Dir is opened O_NOFOLLOW and every entry
-// is stat'ed and unlinked relative to that descriptor (fstatat
-// AT_SYMLINK_NOFOLLOW, unlinkat without AT_REMOVEDIR), so neither a swapped
-// entry nor a link in an entry's place redirects a removal. A missing Dir
-// sweeps nothing. Per-entry failures are joined; the sweep goes on past them.
+// Sweep removes the regular files in Dir whose mtime is older than maxAge at
+// now, except the partial of a claimed digest. A partial is a file named by
+// the store's own grammar (sha256-<64 hex>.partial). Any other name is
+// foreign: nothing this package writes, and yet Admit counts it against
+// MaxBytes, so an old foreign regular file is removed too, or a stray file
+// would hold the budget forever. Every foreign entry is named in a Warn on
+// Log (bounded and quoted, since the name is not ours), removed or not. A
+// symlink or a directory is left alone, whatever its name. Dir is opened
+// O_NOFOLLOW and every entry is stat'ed and unlinked relative to that
+// descriptor (fstatat AT_SYMLINK_NOFOLLOW, unlinkat without AT_REMOVEDIR), so
+// neither a swapped entry nor a link in an entry's place redirects a removal.
+// A missing Dir sweeps nothing. Per-entry failures are joined; the sweep goes
+// on past them. removed counts partials and foreign files alike.
 //
 // Sweep protects only claimed digests: it does not know about a Resume in
 // progress, so it can unlink the partial of an unclaimed one out from under
@@ -209,10 +214,28 @@ func (s *PartialStore) Sweep(now time.Time, maxAge time.Duration) (removed int, 
 	cutoff := now.Add(-maxAge)
 	var errs []error
 	err = s.eachEntry(func(fd int, name string, st *unix.Stat_t) error {
-		if !partialName.MatchString(name) || st.Mode&unix.S_IFMT != unix.S_IFREG {
+		regular := st.Mode&unix.S_IFMT == unix.S_IFREG
+		stale := time.Unix(st.Mtim.Unix()).Before(cutoff)
+		if !partialName.MatchString(name) {
+			gone := false
+			if regular && stale {
+				if err := unix.Unlinkat(fd, name, 0); err != nil {
+					if !errors.Is(err, unix.ENOENT) {
+						errs = append(errs, fmt.Errorf("sweep foreign file %s: %w", quoteBounded(name, 128), err))
+					}
+				} else {
+					gone = true
+					removed++
+				}
+			}
+			if s.Log != nil {
+				s.Log.Warn("partial sweep: foreign entry in the partial dir",
+					"dir", s.Dir, "name", quoteBounded(name, 128),
+					"regular", regular, "stale", stale, "removed", gone)
+			}
 			return nil
 		}
-		if !time.Unix(st.Mtim.Unix()).Before(cutoff) {
+		if !regular || !stale {
 			return nil
 		}
 		digest := strings.Replace(strings.TrimSuffix(name, ".partial"), "-", ":", 1)
@@ -234,6 +257,22 @@ func (s *PartialStore) Sweep(now time.Time, maxAge time.Duration) (removed int, 
 		return removed, err
 	}
 	return removed, errors.Join(errs...)
+}
+
+// Usage is the summed apparent size of the regular files in Dir, every name
+// counted, exactly as Admit counts them: st_size from fstatat
+// (AT_SYMLINK_NOFOLLOW) relative to Dir opened O_NOFOLLOW, so no partial is
+// ever opened and no link followed. A missing Dir is zero; a Dir that is a
+// symlink or not a directory is an error matching ErrPartialDir.
+func (s *PartialStore) Usage() (int64, error) {
+	var n int64
+	err := s.eachEntry(func(_ int, _ string, st *unix.Stat_t) error {
+		if st.Mode&unix.S_IFMT == unix.S_IFREG && st.Size > 0 {
+			n += st.Size
+		}
+		return nil
+	})
+	return n, err
 }
 
 // eachEntry opens Dir O_NOFOLLOW and calls fn with the directory descriptor,

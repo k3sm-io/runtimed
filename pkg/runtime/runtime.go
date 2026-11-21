@@ -1047,6 +1047,16 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		if cfg.LocalBlobSource != nil {
 			opts = append(opts, image.WithLocalBlobSource(cfg.LocalBlobSource))
 		}
+		// The cache's one partial store keeps the bytes of a layer cut
+		// mid-fetch, so the next pull asks for the rest with a Range request
+		// instead of starting the layer again. It is fed over the direct blob
+		// routes paired with RemoteFetch and RemoteMirrorFetch, named here for
+		// the same reason those are. A refused store directory is logged by
+		// OpenPartialStore and yields nil, and a nil store fetches every layer
+		// from byte 0: the daemon still pulls.
+		opts = append(opts,
+			image.WithRegistryBlobSource(image.RemoteBlobSource, image.RemoteMirrorBlobSource),
+			image.WithPartialStore(cache.OpenPartialStore(log)))
 		p, err := image.NewPuller(cache, image.RemoteFetch, index, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("init image puller: %w", err)

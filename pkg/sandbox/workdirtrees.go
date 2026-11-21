@@ -76,6 +76,12 @@ const (
 	// reads another workload's model weights mid-transfer; one able to write
 	// here makes every resume of that layer fail its digest check.
 	ArtifactPartialSubdir = "artifact-partial"
+	// ImagePartialSubdir mirrors image.PartialSubdir: the staging dir
+	// (<WorkDir>/image-partial) an image layer cut mid-fetch keeps its received
+	// bytes in until the next pull resumes and commits it. A pod able to read
+	// here reads another workload's layer mid-transfer; one able to write here
+	// makes every resume of that layer fail its digest check.
+	ImagePartialSubdir = "image-partial"
 	// ArtifactViewsSubdir is the root (<WorkDir>/artifacts) of the read-only
 	// artifact views: one directory of cloned files per manifest and path set.
 	// The root is denied as a whole; a pod is granted the one view directory it
@@ -133,7 +139,8 @@ func SharedVolumeTempDir(mountPoint string) (string, bool) {
 // per-pod SBPL staging dir (sbpl), the five image-store siblings (index,
 // operator, unpacked, snapshots, ingest), the guest-artifact cache
 // (guest-artifacts), the artifact download staging dir (artifact-partial), the
-// artifact views root (artifacts) and the retained consoles of failed vm boots
+// image layer download staging dir (image-partial), the artifact views root
+// (artifacts) and the retained consoles of failed vm boots
 // (vmboot-failures), which hold other pods' guest output, and the shared
 // Xcode build cache (xcode-cache), which holds every namespace's build products.
 //
@@ -154,6 +161,7 @@ func DaemonTreeSubdirs() []string {
 		ImageIngestSubdir,
 		GuestArtifactsSubdir,
 		ArtifactPartialSubdir,
+		ImagePartialSubdir,
 		ArtifactViewsSubdir,
 		VMBootFailureSubdir,
 		XcodeCacheSubdir,

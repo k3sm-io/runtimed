@@ -134,7 +134,8 @@ func StatfsSample(path string) (FilesystemSample, error) {
 
 // StoreBytes is what the image store holds: the summed logical size of the
 // content-addressed blobs plus the accounted size of every committed tree in
-// unpacked/ and snapshots/.
+// unpacked/ and snapshots/, plus the bytes kept in the partial store
+// (PartialSubdir) once it is open.
 //
 // Both halves are counted because both are content this daemon wrote and only
 // this daemon removes. Counting blobs alone under-reported the store by the
@@ -147,7 +148,10 @@ func StatfsSample(path string) (FilesystemSample, error) {
 //   - a blob contributes its Lstat size;
 //   - a tree contributes the size its own record accounts for, not a walk of its
 //     files (see EnumerateTrees for why, and for what that figure over- and
-//     under-counts).
+//     under-counts);
+//   - a partial contributes its apparent size, by stat alone: no partial is
+//     opened to measure it. Partials are freed only by the partial sweep
+//     (PartialMaxAge), never by a prune.
 //
 // It is explicitly not an estimate of what a prune could reclaim: blobs and tree
 // payloads whose extents are cloned into a live pod rootfs contribute their full
@@ -168,7 +172,11 @@ func (c *Cache) StoreBytes() (int64, error) {
 	for _, t := range trees {
 		n += t.Size
 	}
-	return n, nil
+	partial, err := c.partialBytes()
+	if err != nil {
+		return 0, err
+	}
+	return n + partial, nil
 }
 
 // ReclaimConfig configures one disk-pressure reclaim pass.
@@ -316,7 +324,10 @@ type KeptBlob struct {
 // plan — and if the root set cannot be enumerated in full, nothing is deleted
 // (ErrRootsIncomplete). Reclaim is not best-effort about liveness; it refuses.
 //
-// The pass sweeps two stores: the content-addressed blobs, and the derived trees
+// Every pass that is not a dry run, triggered or not, first sweeps the partial
+// store of partials older than PartialMaxAge (sparing those a running pull has
+// claimed), best effort and before any lock is taken. The prune proper then
+// sweeps two stores: the content-addressed blobs, and the derived trees
 // under unpacked/ and snapshots/. Trees are decided from the same root set under
 // their own rule (planTrees) and removed by a separate executor that cannot
 // reach a blob. The one property that spans both: nothing read out of a tree
@@ -361,6 +372,14 @@ func (c *Cache) ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*R
 	log := cfg.Log
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
+	// Stale partials go first, on every pass that is not a dry run, before
+	// any lock is taken: the sweep spares the partial of every running pull
+	// (its Claim) and is best effort, so it can neither block nor fail the
+	// pass. Partials are not content, so the prune below never plans one.
+	if !cfg.DryRun {
+		c.sweepPartials(now(), log)
 	}
 
 	before, err := free(c.root)

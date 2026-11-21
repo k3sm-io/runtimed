@@ -44,12 +44,16 @@ const (
 	// ClassUnattributed is content nothing names: a blob whose image entry and
 	// records are all gone, and an ingest temp.
 	ClassUnattributed = "unattributed"
+	// ClassPartial is the bytes of layers cut mid-fetch, kept in the partial
+	// store (PartialSubdir) for the next pull to resume. They are not yet
+	// content: only the partial sweep frees them, never a prune.
+	ClassPartial = "partial"
 )
 
 // IsArtifactClass reports whether class names artifact content: an
 // artifactType, or ClassArtifact.
 func IsArtifactClass(class string) bool {
-	return class != "" && class != ClassImage && class != ClassUnattributed
+	return class != "" && class != ClassImage && class != ClassUnattributed && class != ClassPartial
 }
 
 // maxClassBytes caps an artifact class key: it is registry-supplied text that
@@ -269,8 +273,8 @@ func (c *Cache) podImageDigests() []string {
 }
 
 // StoreBytesByClass is StoreBytes split by class: ClassImage, one class per
-// artifactType, ClassArtifact and ClassUnattributed (see readBlobClasses for
-// what names what). Each blob is one file per digest, so a blob several
+// artifactType, ClassArtifact, ClassUnattributed (see readBlobClasses for
+// what names what) and ClassPartial, the partial store measured by stat. Each blob is one file per digest, so a blob several
 // images or artifacts share counts once, under the class classOf gives it.
 // The classes sum to StoreBytes over the same inventory.
 //
@@ -303,6 +307,13 @@ func (c *Cache) StoreBytesByClass(ctx context.Context) (map[string]int64, error)
 	}
 	for _, t := range trees {
 		out[ClassImage] += t.Size
+	}
+	partial, err := c.partialBytes()
+	if err != nil {
+		return nil, err
+	}
+	if partial > 0 {
+		out[ClassPartial] += partial
 	}
 	return out, nil
 }

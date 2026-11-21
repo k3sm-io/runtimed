@@ -59,6 +59,7 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 			{"image.UnpackedSubdir", sandbox.ImageUnpackedSubdir, image.UnpackedSubdir},
 			{"image.SnapshotsSubdir", sandbox.ImageSnapshotsSubdir, image.SnapshotsSubdir},
 			{"image.IngestSubdir", sandbox.ImageIngestSubdir, image.IngestSubdir},
+			{"image.PartialSubdir", sandbox.ImagePartialSubdir, image.PartialSubdir},
 			{"guestartifacts.GuestArtifactsSubdir", sandbox.GuestArtifactsSubdir, guestartifacts.GuestArtifactsSubdir},
 		} {
 			if tc.mirror != tc.source {
@@ -99,6 +100,7 @@ func TestEveryDaemonPrivateSubdirIsDenied(t *testing.T) {
 			image.UnpackedSubdir,
 			image.SnapshotsSubdir,
 			image.IngestSubdir,
+			image.PartialSubdir,
 			// pkg/guestartifacts'.
 			guestartifacts.GuestArtifactsSubdir,
 		}
