@@ -30,6 +30,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // FlatRegistry maps the cluster's ONE registry name to the endpoint this node
@@ -106,8 +108,12 @@ type flatRegistry struct {
 	host string
 	// aliases is the lowercased alias set.
 	aliases map[string]struct{}
+	// transport is the endpoint transport fetch and blobs share.
+	transport *http.Transport
 	// fetch fetches a reference whose authority is host from the endpoint.
 	fetch FetchFunc
+	// blobs is fetch's direct blob route, over the same transport.
+	blobs BlobSourceFunc
 }
 
 // flatRegistryDialTimeout bounds one dial to the endpoint.
@@ -154,7 +160,9 @@ func (p *Puller) newFlatRegistry(f FlatRegistry) (*flatRegistry, error) {
 		}
 		fr.aliases[strings.ToLower(a)] = struct{}{}
 	}
-	fr.fetch = endpointFetch(f.Host, f.Endpoint, pool)
+	fr.transport = endpointTransport(f.Host, f.Endpoint, pool)
+	fr.fetch = endpointFetchOver(f.Host, f.Endpoint, fr.transport)
+	fr.blobs = endpointBlobSource(f.Host, f.Endpoint, fr.transport)
 	return fr, nil
 }
 
@@ -191,29 +199,77 @@ func endpointTransport(host string, ep RegistryEndpoint, pool *x509.CertPool) *h
 	return tr
 }
 
-// endpointFetch returns the FetchFunc that reaches the registry named host at
-// ep. The reference keeps host as its authority, so the request, the TLS server
-// name and every log line name the registry; only the DIAL is redirected, and
-// only for host itself. A dial to anything else (a redirect off the registry) is
-// refused: the cluster's own registry has no business sending this node
-// elsewhere.
-func endpointFetch(host string, ep RegistryEndpoint, pool *x509.CertPool) FetchFunc {
-	tr := endpointTransport(host, ep, pool)
+// endpointFetchOver returns the FetchFunc that reaches the registry named host
+// at ep over an already-built endpointTransport. The reference keeps host as
+// its authority, so the request, the TLS server name and every log line name
+// the registry; only the DIAL is redirected, and only for host itself. A dial
+// to anything else (a redirect off the registry) is refused: the cluster's own
+// registry has no business sending this node elsewhere. It is used
+// so the fetcher and the flat registry's blob route (endpointBlobSource) share
+// one transport value.
+func endpointFetchOver(host string, ep RegistryEndpoint, tr http.RoundTripper) FetchFunc {
+	return func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
+		r, err := endpointReference(host, ep, ref)
+		if err != nil {
+			return nil, err
+		}
+		return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(tr))
+	}
+}
+
+// endpointBlobSource is the BlobSourceFunc paired with endpointFetchOver over
+// the same tr: the pinned-endpoint transport (its dial-only-host rule and its
+// single trust anchor), PlainHTTP exactly when ep is not TLS (endpointFetch's
+// name.Insecure), and cred converted field for field. A reference naming any
+// other registry is refused, as the fetcher refuses it, so the credential is
+// never yielded for a host other than the flat registry's own.
+func endpointBlobSource(host string, ep RegistryEndpoint, tr http.RoundTripper) BlobSourceFunc {
+	return func(ref string, cred *RegistryCredential) (BlobSource, error) {
+		r, err := endpointReference(host, ep, ref)
+		if err != nil {
+			return BlobSource{}, err
+		}
+		return BlobSource{
+			Ref:        r.Name(),
+			Registry:   registryfetch.Registry{Transport: tr, PlainHTTP: !ep.TLS},
+			Credential: cred.registryfetchCredential(),
+		}, nil
+	}
+}
+
+// endpointReference parses ref with the scheme ep calls for and refuses a
+// reference whose authority is not host.
+func endpointReference(host string, ep RegistryEndpoint, ref string) (name.Reference, error) {
 	var opts []name.Option
 	if !ep.TLS {
 		opts = append(opts, name.Insecure)
 	}
-	return func(ctx context.Context, ref string, cred *RegistryCredential, policy PlatformPolicy) (ggcrv1.Image, error) {
-		r, err := name.ParseReference(ref, opts...)
-		if err != nil {
-			return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
-		}
-		if got := r.Context().RegistryStr(); !strings.EqualFold(got, host) {
-			return nil, fmt.Errorf("reference %s names registry %s, not the flat registry %s",
-				quoteBounded(ref, maxReferenceLen), quoteBounded(got, maxMirrorHostLen), quoteBounded(host, maxMirrorHostLen))
-		}
-		return remoteFetch(ctx, r, ref, cred, policy, remote.WithTransport(tr))
+	r, err := name.ParseReference(ref, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("parse reference %q: %w: %w", ref, ErrInvalidReference, boundErr(err))
 	}
+	if got := r.Context().RegistryStr(); !strings.EqualFold(got, host) {
+		return nil, fmt.Errorf("reference %s names registry %s, not the flat registry %s",
+			quoteBounded(ref, maxReferenceLen), quoteBounded(got, maxMirrorHostLen), quoteBounded(host, maxMirrorHostLen))
+	}
+	return r, nil
+}
+
+// flatBlobSource yields the flat registry's direct blob route for canonical,
+// fetched with cred: the caller passes the credential it passes p.flat.fetch
+// (nil for a bare name or a public-mirror reference). ok is false when no flat
+// registry is mapped.
+//
+//lint:ignore U1000 the blob route the daemon wiring of WithPartialStore calls; pinned by blobsource_test.go until then
+func (p *Puller) flatBlobSource(canonical string, cred *RegistryCredential) (_ BlobSource, ok bool, _ error) {
+	if p.flat == nil {
+		return BlobSource{}, false, nil
+	}
+	src, err := p.flat.blobs(canonical, cred)
+	if err != nil {
+		return BlobSource{}, false, err
+	}
+	return src, true, nil
 }
 
 // ArtifactTransport returns the transport that reaches the flat registry f

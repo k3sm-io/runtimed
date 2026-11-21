@@ -28,7 +28,10 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // Mirror is one CLUSTER MIRROR candidate: a peer node's ingest registry,
@@ -141,7 +144,43 @@ func RemoteMirrorFetch(ctx context.Context, ref string, mirror Mirror, policy Pl
 	if err != nil {
 		return nil, err
 	}
-	return remoteFetch(ctx, r, ref, nil, policy)
+	return remoteFetch(ctx, r, ref, nil, policy, remote.WithTransport(registryTransport()))
+}
+
+// MirrorBlobSourceFunc yields the direct blob route for ref on mirror, the
+// counterpart of a MirrorFetchFunc for the same arguments. Like it, it takes
+// no RegistryCredential: a mirror candidate is always fetched anonymously.
+type MirrorBlobSourceFunc func(ref string, mirror Mirror) (BlobSource, error)
+
+// RemoteMirrorBlobSource is the MirrorBlobSourceFunc paired with
+// RemoteMirrorFetch: the reference re-derived and asserted by
+// Mirror.reference, registryTransport, PlainHTTP exactly as the candidate
+// sets it, and no credential.
+func RemoteMirrorBlobSource(ref string, mirror Mirror) (BlobSource, error) {
+	r, err := mirror.reference(ref)
+	if err != nil {
+		return BlobSource{}, err
+	}
+	return BlobSource{
+		Ref:      r.Name(),
+		Registry: registryfetch.Registry{Transport: registryTransport(), PlainHTTP: mirror.PlainHTTP},
+	}, nil
+}
+
+// mirrorBlobSource yields the direct blob route for mirrorRef on m, the
+// arguments pullFromMirrors hands mirrorFetch. ok is false when
+// WithRegistryBlobSource paired no mirror route.
+//
+//lint:ignore U1000 the blob route the daemon wiring of WithPartialStore calls; pinned by blobsource_test.go until then
+func (p *Puller) mirrorBlobSource(mirrorRef string, m Mirror) (_ BlobSource, ok bool, _ error) {
+	if p.mirrorBlobs == nil {
+		return BlobSource{}, false, nil
+	}
+	src, err := p.mirrorBlobs(mirrorRef, m)
+	if err != nil {
+		return BlobSource{}, false, err
+	}
+	return src, true, nil
 }
 
 // reference renders ref as the reference to ask THIS candidate for: the registry
