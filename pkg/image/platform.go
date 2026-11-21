@@ -26,6 +26,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/registryfetch"
 )
 
 // ErrNoPlatformMatch is the sentinel every fail-closed platform decision wraps:
@@ -652,7 +653,11 @@ func conformingToken(s string) bool {
 // only by ggcr's 100 MiB limit. Everything this package returns reaches slog,
 // the Pod status message and kine, so a foreign message is DATA to be quoted,
 // never a message to be adopted.
-func boundErr(err error) error { return &boundedError{err: err} }
+//
+// The error is passed through registryfetch.RedactURLError first: a fetch's
+// *url.Error names the full URL of the request that failed, and a redirect
+// target's query can carry a presigned signature.
+func boundErr(err error) error { return &boundedError{err: registryfetch.RedactURLError(err)} }
 
 // boundedError is boundErr's carrier.
 type boundedError struct{ err error }

@@ -147,6 +147,10 @@ func authenticator(cred *Credential) authn.Authenticator {
 // goes straight to the registry's plain Transport. Real registries redirect
 // blob GETs to object storage on another host; that host must get no
 // credential, and its 401 challenges must never reach the token logic.
+//
+// The client's Do wraps a failure in a *url.Error naming the full URL of the
+// request that failed, a redirect target's query included; pass that error
+// through RedactURLError before it is logged or wrapped.
 func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (name.Reference, *http.Client, error) {
 	if g.Transport == nil {
 		return nil, nil, ErrTransportRequired
@@ -263,11 +267,12 @@ type hostSplit struct {
 // RoundTrip implements http.RoundTripper.
 func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
 	scheme := strings.ToLower(req.URL.Scheme)
-	if scheme == h.scheme && canonicalHost(scheme, req.URL.Host) == h.host {
-		return h.auth.RoundTrip(req)
-	}
-	if h.httpsHost != "" && scheme == "https" && canonicalHost(scheme, req.URL.Host) == h.httpsHost {
-		return h.auth.RoundTrip(req)
+	if scheme == h.scheme && canonicalHost(scheme, req.URL.Host) == h.host ||
+		h.httpsHost != "" && scheme == "https" && canonicalHost(scheme, req.URL.Host) == h.httpsHost {
+		// The authenticating transport's token fetch is a client of its own,
+		// so its errors can be *url.Error too.
+		res, err := h.auth.RoundTrip(req)
+		return res, RedactURLError(err)
 	}
 	if isDowngrade(h.scheme, scheme) {
 		// Scheme and host only, as checkRedirect: the query can carry a
@@ -281,7 +286,7 @@ func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
 	if res != nil {
 		res.Header.Del("WWW-Authenticate")
 	}
-	return res, err
+	return res, RedactURLError(err)
 }
 
 // isDowngrade reports whether a hop from scheme from to scheme to leaves
@@ -466,11 +471,13 @@ type boundedError struct{ err error }
 func (e *boundedError) Error() string { return quoteBounded(e.err.Error(), maxForeignErrBytes) }
 func (e *boundedError) Unwrap() error { return e.err }
 
+// bound also passes err through RedactURLError, so no *url.Error this
+// package returns names a query.
 func bound(err error) error {
 	if err == nil {
 		return nil
 	}
-	return &boundedError{err: err}
+	return &boundedError{err: RedactURLError(err)}
 }
 
 // quoteBounded ASCII-quotes at most max bytes of s, marking a cut with "...".
