@@ -753,7 +753,7 @@ func TestPullResumesFallsBackOnPartialStoreEnv(t *testing.T) {
 			_, werr := w.Write(c.body)
 			return werr
 		}
-		_, err = p.resumeBlob(ctx, BlobSource{}, c.layer.String(), c.size, whole)
+		_, err = p.resumeBlob(ctx, BlobSource{}, c.layer.String(), c.size, nil, whole)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("resumeBlob with a cancelled context: err = %v, want context.Canceled", err)
 		}
