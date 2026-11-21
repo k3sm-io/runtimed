@@ -91,9 +91,15 @@ func ruleIndex(lines []string, rule, sub string) int {
 // TestArtifactViewReadOnlyNoExec pins the view stanza: the read grant names
 // this view only and follows the deny on the views root (last match wins), the
 // exec and executable-map deny covers it, the write deny on it is the last rule
-// of the profile, and the views root and the blob cache stay denied.
+// of the profile before the keystore denies (which close every profile), and
+// the views root and the blob cache stay denied.
 func TestArtifactViewReadOnlyNoExec(t *testing.T) {
 	prof := viewProfile(t)
+	stanza := keystoreDenyStanza(keystoreRoots(DefaultWorkDir, ""))
+	if !strings.HasSuffix(prof, stanza) {
+		t.Fatalf("the profile does not end with the keystore denies:\n%s", prof)
+	}
+	prof = strings.TrimSuffix(prof, stanza)
 	lines := strings.Split(prof, "\n")
 	view := viewPath(DefaultWorkDir, viewManifestA)
 	root := filepath.Join(DefaultWorkDir, ArtifactViewsSubdir)

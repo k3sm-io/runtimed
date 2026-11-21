@@ -165,3 +165,30 @@
   (subpath "/var/lib/k3sm/artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
   (subpath "/private/var/lib/k3sm/artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
   )
+;; KEYSTORE: every data-root name beginning keystore- and the whole
+;; keystore-run tree: no read, stat, write, create, unlink, rename,
+;; connect or bind. LAST, so no allow above can re-open them.
+(deny file-read* file-read-metadata file-write*
+  (regex #"^/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")
+  (subpath "/var/lib/k3sm/keystore-run")
+  (regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")
+  (subpath "/private/var/lib/k3sm/keystore-run")
+  (regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")
+  (subpath "/System/Volumes/Data/private/var/lib/k3sm/keystore-run")
+  )
+(deny network-outbound
+  (remote unix-socket (regex #"^/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))
+  (remote unix-socket (subpath "/var/lib/k3sm/keystore-run"))
+  (remote unix-socket (regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))
+  (remote unix-socket (subpath "/private/var/lib/k3sm/keystore-run"))
+  (remote unix-socket (regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))
+  (remote unix-socket (subpath "/System/Volumes/Data/private/var/lib/k3sm/keystore-run"))
+  )
+(deny network-bind
+  (local unix-socket (regex #"^/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))
+  (local unix-socket (subpath "/var/lib/k3sm/keystore-run"))
+  (local unix-socket (regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))
+  (local unix-socket (subpath "/private/var/lib/k3sm/keystore-run"))
+  (local unix-socket (regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))
+  (local unix-socket (subpath "/System/Volumes/Data/private/var/lib/k3sm/keystore-run"))
+  )

@@ -467,6 +467,12 @@ type Posture struct {
 	// must not be at or under either child (ErrInvalidDataRoot). Generate refuses
 	// the whole profile rather than drop a deny. The caller passes a path with no
 	// symlink but the /var, /tmp and /etc firmlinks, in it or in either child.
+	//
+	// The keystore denies follow it too: every name beginning
+	// KeystoreDataRootPrefix and the whole KeystoreRunDir tree, under <WorkDir>
+	// always and under this value when it is set and differs, are denied every
+	// read, write and unix-socket connect or bind as the profile's last rule.
+	// A pods root under such a name is refused (ErrInvalidDataRoot).
 	DataRoot string
 	// StateDir is the role's real state directory: the k3sm --work-dir itself,
 	// which holds the CA keys, the kine database and the node password. The
@@ -655,7 +661,8 @@ type GenerateOptions struct {
 // which lives under the denied pods root, and the file-read-metadata grant on
 // that volume's — and every PV root's — strict ancestors); and last the read-only
 // credential sub-scope, whose file-write* deny therefore wins even inside the
-// writable data volume.
+// writable data volume; and, closing every profile, the keystore denies
+// (keystoreDenyStanza), which no allow anywhere can re-open.
 //
 // The ancestor grant belongs to that narrow re-allow tier for the same reason the
 // data volume does, and it would be inert anywhere earlier: the nodes it names
@@ -1096,7 +1103,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 
 	// --- artifact views: read one view, never write, exec or map it executable --
 	// After the protected denies, so the read grant is not voided by the deny on
-	// the views root; the write deny is the last rule in the profile.
+	// the views root; the write deny is the last rule before the keystore denies.
 	if len(viewPaths) > 0 {
 		b.WriteString(";; artifact views (image volumes): read this pod's views only, emitted\n")
 		b.WriteString(";; after the views-root deny; no exec, no executable mapping (hygiene\n")
@@ -1111,6 +1118,9 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		writeFirmlinkSubpaths(&b, viewPaths)
 		b.WriteString("  )\n")
 	}
+
+	// --- keystore denies (the last rule: nothing below can re-open them) ---
+	b.WriteString(keystoreDenyStanza(keystoreRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot)))
 
 	out := b.String()
 	// self-check the network grant against what sp asked for, before the profile
@@ -1535,6 +1545,11 @@ func resolveDataRoot(dir, podsRoot string) (string, error) {
 		if denied := filepath.Join(dir, sub); underAnyForm(podsRoot, denied) {
 			return "", fmt.Errorf("%w: the pods root %q is at or under %q", ErrInvalidDataRoot, podsRoot, denied)
 		}
+	}
+	// The keystore denies are the profile's last rule, so a pods root under a
+	// keystore name would be denied to every pod, its own volume included.
+	if underKeystoreName(podsRoot, dir) {
+		return "", fmt.Errorf("%w: the pods root %q is under a %s name of %q", ErrInvalidDataRoot, podsRoot, KeystoreDataRootPrefix, dir)
 	}
 	return dir, nil
 }

@@ -1,0 +1,523 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sandbox
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
+)
+
+// sbplNode is one parsed SBPL datum: an atom, a string, or a list.
+type sbplNode struct {
+	atom  string
+	str   string
+	isStr bool
+	list  []sbplNode
+	isLst bool
+}
+
+// String renders n back as SBPL, for failure messages.
+func (n sbplNode) String() string {
+	switch {
+	case n.isStr:
+		return fmt.Sprintf("%q", n.str)
+	case n.isLst:
+		parts := make([]string, len(n.list))
+		for i, c := range n.list {
+			parts[i] = c.String()
+		}
+		return "(" + strings.Join(parts, " ") + ")"
+	}
+	return n.atom
+}
+
+// parseSBPL reads every top-level datum of a rendered profile. It knows the
+// subset Generate emits: ";" comments, lists, atoms, "..." strings and #"..."
+// regex strings (whose body is kept raw).
+func parseSBPL(t *testing.T, src string) []sbplNode {
+	t.Helper()
+	var stack [][]sbplNode
+	var top []sbplNode
+	push := func(n sbplNode) {
+		if len(stack) == 0 {
+			top = append(top, n)
+			return
+		}
+		stack[len(stack)-1] = append(stack[len(stack)-1], n)
+	}
+	for i := 0; i < len(src); {
+		c := src[i]
+		switch {
+		case c == ';':
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+		case c == ' ' || c == '\n' || c == '\t':
+			i++
+		case c == '(':
+			stack = append(stack, nil)
+			i++
+		case c == ')':
+			if len(stack) == 0 {
+				t.Fatalf("unbalanced ) at %d", i)
+			}
+			l := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			push(sbplNode{list: l, isLst: true})
+			i++
+		case c == '"' || (c == '#' && i+1 < len(src) && src[i+1] == '"'):
+			raw := c == '#'
+			if raw {
+				i++
+			}
+			i++
+			var b strings.Builder
+			for i < len(src) && src[i] != '"' {
+				if src[i] == '\\' && !raw {
+					i++
+				}
+				b.WriteByte(src[i])
+				i++
+			}
+			i++
+			push(sbplNode{str: b.String(), isStr: true})
+		default:
+			j := i
+			for j < len(src) && !strings.ContainsRune(" \n\t()", rune(src[j])) {
+				j++
+			}
+			push(sbplNode{atom: src[i:j]})
+			i = j
+		}
+	}
+	if len(stack) != 0 {
+		t.Fatalf("unbalanced profile: %d open lists", len(stack))
+	}
+	return top
+}
+
+// sbplRule is one (allow ...) or (deny ...) directive.
+type sbplRule struct {
+	allow   bool
+	ops     []string
+	filters []sbplNode
+	text    string
+}
+
+func sbplRules(t *testing.T, profile string) []sbplRule {
+	t.Helper()
+	var rules []sbplRule
+	for _, n := range parseSBPL(t, profile) {
+		if !n.isLst || len(n.list) == 0 || (n.list[0].atom != "allow" && n.list[0].atom != "deny") {
+			continue
+		}
+		r := sbplRule{allow: n.list[0].atom == "allow", text: n.String()}
+		for _, x := range n.list[1:] {
+			if x.isLst {
+				r.filters = append(r.filters, x)
+			} else {
+				r.ops = append(r.ops, x.atom)
+			}
+		}
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+// tri is a three-valued match: a filter kind this evaluator does not model is
+// "maybe", and a maybe on the way to the verdict fails the test rather than
+// guessing.
+type tri int
+
+const (
+	no tri = iota
+	yes
+	maybe
+)
+
+// sbplQuery is one access: a file operation on a path, or a unix-socket
+// connect (network-outbound) or bind (network-bind) at a path.
+type sbplQuery struct {
+	op   string
+	path string
+}
+
+func (q sbplQuery) socket() bool { return strings.HasPrefix(q.op, "network-") }
+
+func opMatches(ruleOp, op string) bool {
+	if ruleOp == op || ruleOp == "default" {
+		return true
+	}
+	return strings.HasSuffix(ruleOp, "*") && strings.HasPrefix(op, strings.TrimSuffix(ruleOp, "*"))
+}
+
+func pathFilter(t *testing.T, f sbplNode, p string) tri {
+	t.Helper()
+	if len(f.list) != 2 || !f.list[1].isStr {
+		return maybe
+	}
+	arg := f.list[1].str
+	switch f.list[0].atom {
+	case "subpath":
+		if isUnder(p, arg) {
+			return yes
+		}
+		return no
+	case "literal":
+		if p == arg {
+			return yes
+		}
+		return no
+	case "prefix":
+		if strings.HasPrefix(p, arg) {
+			return yes
+		}
+		return no
+	case "regex":
+		re, err := regexp.Compile(arg)
+		if err != nil {
+			t.Fatalf("regex %q does not compile: %v", arg, err)
+		}
+		if re.MatchString(p) {
+			return yes
+		}
+		return no
+	}
+	return maybe
+}
+
+func filterMatches(t *testing.T, f sbplNode, q sbplQuery) tri {
+	t.Helper()
+	if !f.isLst || len(f.list) == 0 {
+		return maybe
+	}
+	head := f.list[0].atom
+	switch head {
+	case "require-all", "require-any":
+		acc := yes
+		if head == "require-any" {
+			acc = no
+		}
+		for _, sub := range f.list[1:] {
+			m := filterMatches(t, sub, q)
+			switch {
+			case head == "require-all" && m == no, head == "require-any" && m == yes:
+				return m
+			case m == maybe:
+				acc = maybe
+			}
+		}
+		return acc
+	case "require-not":
+		if len(f.list) != 2 {
+			return maybe
+		}
+		switch filterMatches(t, f.list[1], q) {
+		case yes:
+			return no
+		case no:
+			return yes
+		}
+		return maybe
+	case "remote", "local":
+		if !q.socket() || len(f.list) != 3 {
+			return no
+		}
+		if f.list[1].atom != "unix-socket" {
+			return no
+		}
+		if (head == "remote") != (q.op == "network-outbound") {
+			return no
+		}
+		return pathFilter(t, f.list[2], q.path)
+	case "subpath", "literal", "prefix", "regex":
+		if q.socket() {
+			return no
+		}
+		return pathFilter(t, f, q.path)
+	}
+	return maybe
+}
+
+// verdict evaluates q against rules, last match wins, and returns whether it
+// is allowed and the deciding rule. A maybe met before a definite match fails.
+func verdict(t *testing.T, rules []sbplRule, q sbplQuery) (bool, string) {
+	t.Helper()
+	for i := len(rules) - 1; i >= 0; i-- {
+		r := rules[i]
+		applies := false
+		for _, op := range r.ops {
+			applies = applies || opMatches(op, q.op)
+		}
+		if !applies {
+			continue
+		}
+		m := yes
+		if len(r.filters) > 0 {
+			m = no
+			for _, f := range r.filters {
+				switch filterMatches(t, f, q) {
+				case yes:
+					m = yes
+				case maybe:
+					if m == no {
+						m = maybe
+					}
+				}
+				if m == yes {
+					break
+				}
+			}
+		}
+		switch m {
+		case yes:
+			return r.allow, r.text
+		case maybe:
+			t.Fatalf("%s %s: rule %s has a filter this evaluator cannot decide", q.op, q.path, r.text)
+		}
+	}
+	return false, "(deny default)"
+}
+
+// keystoreOps are the operation classes every keystore path is refused: reads
+// (data, metadata, xattrs), the writes (data, create, unlink — a rename is an
+// unlink and a create — mode, owner, flags, xattrs, times), a unix-socket
+// connect and a unix-socket bind.
+var keystoreOps = []string{
+	"file-read-data", "file-read-metadata", "file-read-xattr",
+	"file-write-data", "file-write-create", "file-write-unlink", "file-write-mode",
+	"file-write-owner", "file-write-flags", "file-write-xattr", "file-write-times",
+	"network-outbound", "network-bind",
+}
+
+// keystoreNames are the data-root-relative keystore paths, every class: the
+// files the design names, a name a later change could add, a case variant, the
+// run directory, its socket and a path deep inside it.
+var keystoreNames = []string{
+	"keystore-floor.json",
+	"keystore-delivery.json",
+	"keystore-user-floor.log",
+	"keystore-user-floor.log.new",
+	"keystore-audit.log",
+	"keystore-audit.log.4",
+	"keystore-audit.log.new",
+	"keystore-maintenance",
+	"keystore-later-addition",
+	"KEYSTORE-Floor.json",
+	"keystore-run",
+	"keystore-run/keys.sock",
+	"keystore-run/sub/deep",
+}
+
+// dataRootSpellings returns the spellings a pod can reach root through: as
+// written, its /private form under a firmlink, and the data-volume alias.
+func dataRootSpellings(root string) []string {
+	forms := firmlinkForms(root)
+	return append(forms, dataVolumeAlias+forms[len(forms)-1])
+}
+
+// TestDataRootDeniesKeystorePathsEveryProfile renders every pod profile variant
+// and checks, over the whole rendered profile, that every keystore path class is
+// refused for every operation class and through every spelling of the data root,
+// whatever allows the variant carries (extra paths at the data root, volumes,
+// credentials, exposures, views, host shares, an explicit keystore re-allow),
+// and that a sibling of the data root that is not a keystore name stays
+// reachable, so a refusal is the keystore denies and not the default.
+func TestDataRootDeniesKeystorePathsEveryProfile(t *testing.T) {
+	const (
+		varRoot    = "/var/lib/k3sm"
+		customPods = "/opt/k3sm-pods"
+		optRoot    = "/opt/k3sm-data"
+	)
+	type variant struct {
+		name    string
+		root    string // the data root the keystore lives at
+		sp      *runtimev1.SandboxProfile
+		opts    GenerateOptions
+		network bool
+	}
+	pod := func(workDir string) *runtimev1.SandboxProfile {
+		return &runtimev1.SandboxProfile{
+			DataVolumePath: filepath.Join(workDir, "pods", "p1", "rootfs"),
+			AllowNetwork:   true,
+		}
+	}
+	withRootGrant := func(sp *runtimev1.SandboxProfile, root string) *runtimev1.SandboxProfile {
+		sp.ExtraReadPaths = append(sp.ExtraReadPaths, root)
+		sp.ExtraWritePaths = append(sp.ExtraWritePaths, root)
+		return sp
+	}
+	withBackend := func(sp *runtimev1.SandboxProfile, b runtimev1.SandboxBackend) *runtimev1.SandboxProfile {
+		sp.Backend = b
+		return sp
+	}
+	native := func() *runtimev1.SandboxProfile { return withRootGrant(pod(varRoot), varRoot) }
+	variants := []variant{
+		{name: "native, default posture (data root is the work-dir)", root: varRoot, sp: native(), network: true},
+		{name: "native, data root set to the work-dir", root: varRoot, sp: native(),
+			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot, DataRoot: varRoot}}, network: true},
+		{name: "native, no network", root: varRoot, sp: func() *runtimev1.SandboxProfile {
+			sp := native()
+			sp.AllowNetwork = false
+			return sp
+		}()},
+		{name: "native, /private spelling of the data root", root: "/private" + varRoot, sp: withRootGrant(pod(varRoot), "/private"+varRoot),
+			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot, DataRoot: "/private" + varRoot}}, network: true},
+		{name: "custom pod root distinct from the data root", root: varRoot, sp: withRootGrant(pod(customPods), varRoot),
+			opts: GenerateOptions{Posture: Posture{WorkDir: customPods, DataRoot: varRoot}}, network: true},
+		{name: "custom pod root, data root off the firmlinks", root: optRoot, sp: withRootGrant(pod(customPods), optRoot),
+			opts: GenerateOptions{Posture: Posture{WorkDir: customPods, DataRoot: optRoot}}, network: true},
+		{name: "pod root under the data root", root: varRoot, sp: withRootGrant(pod(varRoot+"/node"), varRoot),
+			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot + "/node", DataRoot: varRoot}}, network: true},
+		{name: "pod root a parent of the data root", root: varRoot, sp: withRootGrant(pod("/var/lib"), varRoot),
+			opts: GenerateOptions{Posture: Posture{WorkDir: "/var/lib", DataRoot: varRoot}}, network: true},
+		{name: "vm backend (rendered: the runtime never renders one, vm.go WrapCommand)", root: varRoot,
+			sp: withBackend(native(), runtimev1.SandboxBackend_SANDBOX_BACKEND_VM), network: true},
+		{name: "seatbelt in-process backend", root: varRoot,
+			sp: withBackend(native(), runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_INPROC), network: true},
+		{name: "uid-jail backend", root: varRoot,
+			sp: withBackend(native(), runtimev1.SandboxBackend_SANDBOX_BACKEND_UIDJAIL), network: true},
+		{name: "xcode toolchain", root: varRoot, sp: func() *runtimev1.SandboxProfile {
+			sp := native()
+			sp.XcodeToolchainDir = xcodeDevDir
+			return sp
+		}(), network: true},
+		{name: "gpu", root: varRoot, sp: func() *runtimev1.SandboxProfile {
+			sp := native()
+			sp.AllowGpu = true
+			return sp
+		}(), network: true},
+		{name: "expose-paths", root: varRoot, sp: native(), opts: GenerateOptions{
+			Posture:     Posture{WorkDir: varRoot, DataRoot: varRoot},
+			ExposePaths: []string{filepath.Join(varRoot, ExposeSubdir, "ns", "pod", "vol")},
+		}, network: true},
+		{name: "expose-paths under a data root distinct from the pod root", root: varRoot, sp: withRootGrant(pod(customPods), varRoot), opts: GenerateOptions{
+			Posture:     Posture{WorkDir: customPods, DataRoot: varRoot},
+			ExposePaths: []string{filepath.Join(varRoot, ExposeSubdir, "ns", "pod", "vol")},
+		}, network: true},
+		{name: "volumes, credentials, views and host shares", root: varRoot, sp: native(), opts: GenerateOptions{
+			Posture:           Posture{WorkDir: varRoot, DataRoot: varRoot},
+			WritePaths:        []string{varRoot + "/storage/pvc-rw"},
+			ReadPaths:         []string{varRoot + "/storage/pvc-ro"},
+			ReadOnlyPaths:     []string{varRoot + "/pods/p1/rootfs/var/run/secrets"},
+			ArtifactViewPaths: []string{viewPath(varRoot, viewManifestA)},
+			HostShares:        []HostShare{{Path: "/Users/dev/Code/app"}, {Path: "/Users/dev/Code/app/q.sock", Socket: true}},
+			PodUID:            "0123abcd-0000-0000-0000-000000000000",
+		}, network: true},
+		{name: "wasm pod (the k3sm-wasmhost helper: rootfs and volume preopens)", root: varRoot,
+			sp: withBackend(native(), runtimev1.SandboxBackend_SANDBOX_BACKEND_WASM), opts: GenerateOptions{
+				Posture:    Posture{WorkDir: varRoot, DataRoot: varRoot},
+				WritePaths: []string{varRoot + "/storage/pvc-rw"},
+				ReadPaths:  []string{varRoot + "/storage/pvc-ro"},
+			}},
+		{name: "exec session (re-applies the pod's own staged profile, runtime/exec.go)", root: varRoot, sp: native(),
+			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot, DataRoot: varRoot}}, network: true},
+		{name: "explicit keystore re-allow through extra paths", root: varRoot, sp: func() *runtimev1.SandboxProfile {
+			sp := native()
+			for _, n := range []string{"keystore-run", "keystore-floor.json"} {
+				sp.ExtraReadPaths = append(sp.ExtraReadPaths, filepath.Join(varRoot, n))
+				sp.ExtraWritePaths = append(sp.ExtraWritePaths, filepath.Join(varRoot, n))
+			}
+			return sp
+		}(), network: true},
+	}
+
+	for _, v := range variants {
+		t.Run(v.name, func(t *testing.T) {
+			prof, err := Generate(v.sp, v.opts)
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			rules := sbplRules(t, prof)
+			for _, spelling := range dataRootSpellings(v.root) {
+				paths := []string{KeystoreSocketPath(spelling)}
+				for _, n := range keystoreNames {
+					paths = append(paths, filepath.Join(spelling, n))
+				}
+				for _, p := range paths {
+					for _, op := range keystoreOps {
+						if ok, by := verdict(t, rules, sbplQuery{op: op, path: p}); ok {
+							t.Errorf("%s %s is allowed, by %s", op, p, by)
+						}
+					}
+				}
+			}
+			// The positive control: the variant's own grant at the data root
+			// reaches a sibling that is not a keystore name.
+			for _, spelling := range firmlinkForms(v.root) {
+				for _, n := range []string{"keystore", "keystore.json", "not-keystore-x", "keystore_floor.json"} {
+					p := filepath.Join(spelling, n)
+					ops := []string{"file-read-data", "file-write-create"}
+					if v.network {
+						ops = append(ops, "network-outbound", "network-bind")
+					}
+					for _, op := range ops {
+						if ok, by := verdict(t, rules, sbplQuery{op: op, path: p}); !ok {
+							t.Errorf("control: %s %s is refused, by %s", op, p, by)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestKeystoreDenyStanzaShape pins the rendered form the gate test reads: the
+// regex is anchored on the data root and case-folded, and the stanza is the
+// last thing in the profile.
+func TestKeystoreDenyStanzaShape(t *testing.T) {
+	prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/opt/k3sm-pods/pods/p1/rootfs"},
+		GenerateOptions{Posture: Posture{WorkDir: "/opt/k3sm-pods", DataRoot: "/var/lib/k3sm"}})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for _, want := range []string{
+		`(regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
+		`(regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
+		`(subpath "/private/var/lib/k3sm/keystore-run")`,
+		`(local unix-socket (regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))`,
+		`(remote unix-socket (subpath "/var/lib/k3sm/keystore-run"))`,
+	} {
+		if !strings.Contains(prof, want) {
+			t.Errorf("profile lacks %s", want)
+		}
+	}
+	if i := strings.LastIndex(prof, "(allow "); i > strings.Index(prof, ";; KEYSTORE:") {
+		t.Errorf("an allow follows the keystore denies at %d", i)
+	}
+	if got, want := KeystoreSocketPath("/var/lib/k3sm"), "/var/lib/k3sm/keystore-run/keys.sock"; got != want {
+		t.Errorf("KeystoreSocketPath = %q, want %q", got, want)
+	}
+}
+
+// TestDataRootRefusesPodRootUnderKeystoreName pins that a pods root the
+// keystore denies would swallow is refused rather than rendered unusable.
+func TestDataRootRefusesPodRootUnderKeystoreName(t *testing.T) {
+	for _, workDir := range []string{"/var/lib/k3sm/keystore-pods", "/private/var/lib/k3sm/KEYSTORE-x"} {
+		_, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"},
+			GenerateOptions{Posture: Posture{WorkDir: workDir, DataRoot: "/var/lib/k3sm"}})
+		if !errors.Is(err, ErrInvalidDataRoot) {
+			t.Errorf("work dir %s: err = %v, want ErrInvalidDataRoot", workDir, err)
+		}
+	}
+}
