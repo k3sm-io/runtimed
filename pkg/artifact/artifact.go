@@ -39,6 +39,7 @@ import (
 	artifactv1 "k3sm.io/apis/artifact/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/registryfetch"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -817,11 +818,14 @@ type boundedError struct{ err error }
 func (e *boundedError) Error() string { return image.QuoteBounded(e.err.Error(), maxForeignErrBytes) }
 func (e *boundedError) Unwrap() error { return e.err }
 
+// bound passes err through registryfetch.RedactURLError first: a fetch's
+// *url.Error names the full URL of the request that failed, and a redirect
+// target's query can carry a presigned signature.
 func bound(err error) error {
 	if err == nil {
 		return nil
 	}
-	return &boundedError{err: err}
+	return &boundedError{err: registryfetch.RedactURLError(err)}
 }
 
 // tarLayer reports an archive layer type, which needs an extractor (a
