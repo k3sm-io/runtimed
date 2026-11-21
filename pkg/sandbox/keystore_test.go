@@ -315,12 +315,14 @@ func verdict(t *testing.T, rules []sbplRule, q sbplQuery) (bool, string) {
 
 // keystoreOps are the operation classes every keystore path is refused: reads
 // (data, metadata, xattrs), the writes (data, create, unlink — a rename is an
-// unlink and a create — mode, owner, flags, xattrs, times), a unix-socket
-// connect and a unix-socket bind.
+// unlink and a create — mode, owner, flags, xattrs, times), a hard link
+// (file-link, which file-write* does not cover), a unix-socket connect and a
+// unix-socket bind.
 var keystoreOps = []string{
 	"file-read-data", "file-read-metadata", "file-read-xattr",
 	"file-write-data", "file-write-create", "file-write-unlink", "file-write-mode",
 	"file-write-owner", "file-write-flags", "file-write-xattr", "file-write-times",
+	"file-link",
 	"network-outbound", "network-bind",
 }
 
@@ -502,6 +504,7 @@ func TestKeystoreDenyStanzaShape(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	for _, want := range []string{
+		"(deny file-read* file-read-metadata file-write* file-link\n",
 		`(regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
 		`(regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
 		`(subpath "/private/var/lib/k3sm/keystore-run")`,

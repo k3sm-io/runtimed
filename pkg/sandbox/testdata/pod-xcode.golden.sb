@@ -215,8 +215,8 @@
   )
 ;; KEYSTORE: every data-root name beginning keystore- and the whole
 ;; keystore-run and keystore-sock trees: no read, stat, write, create, unlink, rename,
-;; connect or bind. LAST, so no allow above can re-open them.
-(deny file-read* file-read-metadata file-write*
+;; hard link, connect or bind. LAST, so no allow above can re-open them.
+(deny file-read* file-read-metadata file-write* file-link
   (regex #"^/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")
   (subpath "/var/lib/k3sm/keystore-run")
   (subpath "/var/lib/k3sm/keystore-sock")
