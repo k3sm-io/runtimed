@@ -32,13 +32,52 @@ import (
 // that arrived before the stall (resumeBlob).
 var ErrLayerBodyStalled = errors.New("image: layer body stalled")
 
+// ErrResolveTimeout is returned (wrapped) when the resolve phase of a pull (the
+// manifest fetch, any index child, the token round trips they need, and the
+// image config) does not finish within registryResolveTimeout. It is an
+// ordinary, retryable pull failure: nothing was written, and a retry starts the
+// resolve over.
+var ErrResolveTimeout = errors.New("image: registry resolve timed out")
+
+// registryHeaderTimeout bounds the wait for a registry's response headers on
+// every registry transport this package builds or clones: the flat registry's
+// endpointTransport (and so ArtifactTransport) and the clone of ggcr's default
+// transport that registryTransport returns. It is time to first response byte
+// only, never a body: a slow layer body is the stall watchdog's
+// (defaultLayerStallWindow). It sits above the 30s dial and the 10s TLS
+// handshake, so a registry that is reachable but slow to start answering (a
+// cold blob store, a token service under load) is not cut, while one that
+// accepted the connection and never answers fails the request instead of
+// holding it until the caller's context ends.
+const registryHeaderTimeout = 60 * time.Second
+
+// registryResolveTimeout bounds the whole resolve phase of one pull in
+// remoteFetch. ggcr's retry layer can repeat a request, and so repeat the
+// header wait, and an index costs a second manifest plus a config fetch; this
+// is the cap on all of it together. It is twice the header timeout, so one
+// slow first answer plus a retry fits, and it matches the 2 min stall window,
+// so neither phase of a pull may sit silent for longer than the other.
+const registryResolveTimeout = 2 * time.Minute
+
+// headerTimeout and resolveTimeout are the values the transports and
+// remoteFetch read; they are variables only so a test can shorten them.
+var (
+	headerTimeout  = registryHeaderTimeout
+	resolveTimeout = registryResolveTimeout
+)
+
+// resolveAfterFunc makes remoteFetch's resolve timer. It is timeAfterFunc in
+// production; a test replaces it with a hand-fired fake.
+var resolveAfterFunc = timeAfterFunc
+
 // defaultLayerStallWindow is how long a layer body may deliver nothing before
 // the fetch is aborted. It sits above the transport's 30s dial, 10s TLS
 // handshake and 90s idle-connection timeouts: a registry that is merely slow
 // keeps sending bytes and is never cut, while a body that has gone silent no
 // longer hangs until the caller's context ends. It bounds silence only: a body
-// that trickles a byte inside every window, and the wait for response headers
-// before the body exists, are not covered by this watchdog.
+// that trickles a byte inside every window is not covered by this watchdog,
+// and the wait for response headers before the body exists is
+// registryHeaderTimeout's, not this watchdog's.
 const defaultLayerStallWindow = 2 * time.Minute
 
 // stallReader is a progress watchdog on one layer body. It times only the

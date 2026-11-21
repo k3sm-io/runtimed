@@ -169,7 +169,8 @@ func (p *Puller) newFlatRegistry(f FlatRegistry) (*flatRegistry, error) {
 // the registry named host at ep and refuses to dial anything else, carrying the
 // endpoint's own trust anchor when ep.TLS is set. It is shared with
 // ArtifactTransport so the artifact path cannot drift into a second transport
-// with a weaker dial or trust story.
+// with a weaker dial or trust story. Its ResponseHeaderTimeout is
+// registryHeaderTimeout, set here once for both.
 func endpointTransport(host string, ep RegistryEndpoint, pool *x509.CertPool) *http.Transport {
 	dialer := &net.Dialer{Timeout: flatRegistryDialTimeout, KeepAlive: 30 * time.Second}
 	tr := &http.Transport{
@@ -187,6 +188,7 @@ func endpointTransport(host string, ep RegistryEndpoint, pool *x509.CertPool) *h
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: headerTimeout,
 	}
 	if ep.TLS {
 		serverName := host

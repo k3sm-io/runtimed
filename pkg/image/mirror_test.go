@@ -566,6 +566,7 @@ func TestMirrorFallbackEligibility(t *testing.T) {
 		{"broken pipe", fmt.Errorf("write: %w", syscall.EPIPE), true},
 		{"dns failure", &net.DNSError{Err: "no such host", Name: "peer"}, true},
 		{"a dial timeout", &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}, true},
+		{"the resolve bound ran out with no answer", fmt.Errorf("pull %q: resolve exceeded 2m0s: %w", localRef, ErrResolveTimeout), true},
 
 		// Not eligible: the primary ANSWERED, or this node already decided.
 		{"401 unauthorized", registryStatus(http.StatusUnauthorized), false},

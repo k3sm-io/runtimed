@@ -172,7 +172,10 @@ func firstLine(msg string) string {
 //     timeout, a TLS handshake timeout, a response-header timeout);
 //   - a connection reset or aborted (ECONNRESET, ECONNABORTED), which is how a
 //     TLS handshake fails for a network reason short of a timeout: the peer, or
-//     a middlebox, dropped the connection mid-handshake.
+//     a middlebox, dropped the connection mid-handshake;
+//   - ErrResolveTimeout: the resolve phase ran out of its bound with no answer
+//     (a registry that accepts connections and never replies). It never wraps
+//     an HTTP answer or a TLS failure, so the exclusions below cannot hide one.
 //
 // NEVER UNREACHABLE, checked first because they can wrap or ride inside the
 // shapes above:
@@ -199,6 +202,9 @@ func upstreamUnreachable(err error) bool {
 	}
 	if tlsTrustFailure(err) {
 		return false
+	}
+	if errors.Is(err, ErrResolveTimeout) {
+		return true
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {

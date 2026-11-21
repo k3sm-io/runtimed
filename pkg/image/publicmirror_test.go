@@ -479,6 +479,7 @@ func TestUpstreamUnreachableClassifies(t *testing.T) {
 		{"network unreachable", wrap(op(syscall.ENETUNREACH)), true},
 		{"ETIMEDOUT", wrap(op(syscall.ETIMEDOUT)), true},
 		{"reset in the handshake", wrap(&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}), true},
+		{"the resolve bound ran out with no answer", fmt.Errorf("pull %q: resolve exceeded 2m0s: %w", "x", ErrResolveTimeout), true},
 		{"404", wrap(&transport.Error{StatusCode: 404}), false},
 		{"401", &transport.Error{StatusCode: 401}, false},
 		{"403", &transport.Error{StatusCode: 403}, false},
