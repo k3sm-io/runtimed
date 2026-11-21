@@ -62,6 +62,7 @@
   (subpath "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain")
   (subpath "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer")
   (subpath "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/XcodeKit.framework")
+  (subpath "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework")
   (subpath "/Applications/Xcode.app/Contents/SharedFrameworks")
   (subpath "/Applications/Xcode.app/Contents/Frameworks")
   (subpath "/Applications/Xcode.app/Contents/PlugIns")

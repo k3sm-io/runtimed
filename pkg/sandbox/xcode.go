@@ -331,6 +331,14 @@ func xcodeToolchainStanza(dir string) string {
 		filepath.Join(dir, "Toolchains", "XcodeDefault.xctoolchain"),
 		filepath.Join(dir, "Platforms", "MacOSX.platform", "Developer"),
 		filepath.Join(dir, "Library", "Frameworks", "XcodeKit.framework"),
+		// Xcode's bundled Python: D/usr/bin/python3 (and python3.9) is a symlink
+		// into this framework, and its interpreter loads @executable_path/../Python3
+		// and its standard library from here. Without it the exec fails EPERM
+		// (exit 71) even though usr/bin is granted, while the Command Line Tools'
+		// python3 works (sessionhost-xcode-python3-eperm-20261121). Its two
+		// interpreters carry only com.apple.application-identifier, an identity
+		// and not a capability (TestXcodePython3FrameworkHasNoPrivilegedEntitlement).
+		filepath.Join(dir, "Library", "Frameworks", "Python3.framework"),
 	}
 	// The two bundle-level subtrees: the Swift driver links @rpath/llbuild.framework
 	// out of SharedFrameworks, and xcodebuild dlopens libxcodebuildLoader.dylib out

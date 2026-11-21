@@ -98,6 +98,7 @@ func TestXcodeToolchainStanzaShape(t *testing.T) {
 			`(subpath "` + xcodeDevDir + `/Toolchains/XcodeDefault.xctoolchain")`,
 			`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
 			`(subpath "` + xcodeDevDir + `/Library/Frameworks/XcodeKit.framework")`,
+			`(subpath "` + xcodeDevDir + `/Library/Frameworks/Python3.framework")`,
 			`(subpath "` + bundle + `/Contents/SharedFrameworks")`,
 			`(subpath "` + bundle + `/Contents/Frameworks")`,
 			`(literal "` + xcodeDevDir + `")`,
@@ -560,6 +561,21 @@ func TestXcodeToolchainGrantReachesTheToolchain(t *testing.T) {
 		out, code := confined(t, filepath.Join(dataVol, "one"))
 		if code != 0 || !strings.Contains(out, "hello from a pod") {
 			t.Errorf("the binary swiftc built exited %d and said %q; want 0 and the sentinel", code, out)
+		}
+	})
+
+	// Xcode's bundled python3 is a symlink from D/usr/bin into
+	// D/Library/Frameworks/Python3.framework; without that subtree the exec is
+	// EPERM (exit 71) (sessionhost-xcode-python3-eperm-20261121). The stdlib
+	// import proves the framework's lib tree is readable too, not just the binary.
+	t.Run("xcode-python3-runs-from-its-framework", func(t *testing.T) {
+		py := filepath.Join(dir, "usr", "bin", "python3")
+		if _, err := os.Lstat(py); err != nil {
+			t.Skipf("no %s on this host", py)
+		}
+		out, code := confined(t, py, "-c", "import json, sys; print(json.dumps(sys.prefix))")
+		if code != 0 || !strings.Contains(out, "Python3.framework") {
+			t.Errorf("%s exited %d under the grant and printed:\n%s\nwant 0 and a sys.prefix inside Python3.framework", py, code, out)
 		}
 	})
 
@@ -1029,6 +1045,48 @@ func TestXcodeGitCoreHasNoEntitledExecutable(t *testing.T) {
 		}
 		if strings.Contains(string(out), "<key>") {
 			t.Errorf("%s carries entitlements; the git-core grant would hand them out", p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked == 0 {
+		t.Fatalf("no Mach-O executable under %s; the scan proves nothing", dir)
+	}
+	t.Logf("checked %d executables under %s", checked, dir)
+}
+
+// TestXcodePython3FrameworkHasNoPrivilegedEntitlement pins that the
+// Python3.framework grant (sessionhost-xcode-python3-eperm-20261121) hands a pod no
+// privilege: a read-and-exec grant over a Mach-O carrying a privileged
+// entitlement would extend what the pod can do beyond the file scope the stanza
+// claims. Its two interpreters (bin/python3.9 and Resources/Python.app) carry
+// exactly one key, com.apple.application-identifier = com.apple.python3: an
+// identity, not a capability, and the same one the Command Line Tools' python3
+// carries, which pods already run. Any other key fails the test.
+func TestXcodePython3FrameworkHasNoPrivilegedEntitlement(t *testing.T) {
+	allowed := map[string]bool{"com.apple.application-identifier": true}
+	keyRE := regexp.MustCompile(`<key>([^<]*)</key>`)
+	dir := filepath.Join(xcodeDevDir, "Library", "Frameworks", "Python3.framework")
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("SKIP: no %s on this host", dir)
+	}
+	checked := 0
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !info.Mode().IsRegular() || !isMachOExecutable(p) {
+			return nil //nolint:nilerr // an unreadable entry is not this test's concern
+		}
+		checked++
+		out, err := exec.Command("codesign", "-d", "--entitlements", "-", "--xml", p).CombinedOutput()
+		if err != nil {
+			t.Errorf("codesign -d %s: %v: %s", p, err, out)
+			return nil
+		}
+		for _, m := range keyRE.FindAllStringSubmatch(string(out), -1) {
+			if !allowed[m[1]] {
+				t.Errorf("%s carries entitlement %q; the Python3.framework grant would hand it out", p, m[1])
+			}
 		}
 		return nil
 	})
