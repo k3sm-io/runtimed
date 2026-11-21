@@ -21,10 +21,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -37,8 +40,8 @@ import (
 // descriptors, kept here as the reference: the ordinary-tree test compares
 // results with it, and the swap tests run it as the contrast that shows what a
 // walk by path does when an entry is swapped under it. hook is called where
-// fsGroupBeforeApply is: after the walk read what the entry is, before it
-// changes it; beforeChmod is called where fsGroupBeforeChmod is: after the
+// fsGroupTuning.beforeApply is: after the walk read what the entry is, before it
+// changes it; beforeChmod is called where fsGroupTuning.beforeChmod is: after the
 // group is set, before the mode is.
 func byPathFSGroupWalk(root string, gid int, hook, beforeChmod func(path string)) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -78,17 +81,24 @@ func byPathFSGroupWalk(root string, gid int, hook, beforeChmod func(path string)
 // its report and error.
 // testOwners names the test process as the only owner whose entries the walk
 // may change: everything a test makes is the test process's.
-var testOwners = []int{os.Geteuid()}
+var testOwners = FSGroupOwners{UIDs: []int{os.Geteuid()}}
+
+// testTune is the tuning the tests' walks run under: fsGroupDefaults, with a
+// test's bounds and seams set for that test by the helpers below. The test
+// process's groups are all assigned groups, which the gid allow-list refuses,
+// so the tests walk with chownForFSGroup, past the policy; the policy has
+// tests of its own.
+var testTune = fsGroupDefaults()
 
 func walkFSGroup(bound, root string, gid int) (FSGroupReport, error) {
-	return ChownForFSGroup(context.Background(), bound, root, gid, testOwners)
+	return chownForFSGroup(context.Background(), bound, root, gid, testOwners, testTune)
 }
 
 // setFSGroupHooks installs the walk's seams for one test.
 func setFSGroupHooks(t *testing.T, beforeApply, beforeChmod func(string)) {
 	t.Helper()
-	fsGroupBeforeApply, fsGroupBeforeChmod = beforeApply, beforeChmod
-	t.Cleanup(func() { fsGroupBeforeApply, fsGroupBeforeChmod = nil, nil })
+	testTune.beforeApply, testTune.beforeChmod = beforeApply, beforeChmod
+	t.Cleanup(func() { testTune.beforeApply, testTune.beforeChmod = nil, nil })
 }
 
 // lowerFSGroupBound sets one of the walk's bounds for one test.
@@ -99,8 +109,8 @@ func lowerFSGroupBound(t *testing.T, bound *int, v int) {
 	t.Cleanup(func() { *bound = old })
 }
 
-// fsGroupTestGid returns a gid the test process may chown to, and skips when
-// there is none above 0. It prefers a supplementary group that differs from
+// fsGroupTestGid returns a gid the test process may chown to, outside
+// fsGroupNeverGids, and fails the test when there is none. It prefers a supplementary group that differs from
 // the group new files get in dir, so that a chown is visible as well as a
 // chmod; when the process has only one group the mode assertions still hold.
 func fsGroupTestGid(t *testing.T, dir string) int {
@@ -111,14 +121,14 @@ func fsGroupTestGid(t *testing.T, dir string) int {
 	}
 	groups, _ := os.Getgroups()
 	for _, g := range groups {
-		if _, refused := fsGroupRefusedGids[g]; g > 0 && !refused && g != int(st.Gid) {
+		if _, never := fsGroupNeverGids[g]; g > 0 && !never && g != int(st.Gid) {
 			return g
 		}
 	}
-	if _, refused := fsGroupRefusedGids[os.Getgid()]; os.Getgid() > 0 && !refused {
+	if _, never := fsGroupNeverGids[os.Getgid()]; os.Getgid() > 0 && !never {
 		return os.Getgid()
 	}
-	t.Skip("the test process has no gid above 0 outside the refused system groups to chown to")
+	t.Fatal("the test process has no gid above 0 to chown to (running as root?): the fsGroup tests run unprivileged by design, and a skipped walk test would report green")
 	return 0
 }
 
@@ -755,7 +765,7 @@ func openDescriptors(t *testing.T) int {
 // pod-authored, so the descriptors are what a pod can make the daemon spend;
 // its memory is bounded by the budgets TestFSGroupWalkBoundsFailClosed pins.
 func TestFSGroupWalkCostIsBounded(t *testing.T) {
-	lowerFSGroupBound(t, &maxFSGroupHeldDirs, 8)
+	lowerFSGroupBound(t, &testTune.heldDirs, 8)
 	podDir := t.TempDir()
 	root := filepath.Join(podDir, "rootfs")
 	const depth, width = 60, 40
@@ -798,7 +808,7 @@ func TestFSGroupWalkCostIsBounded(t *testing.T) {
 	}
 	// Held directories, the pod dir, the listing's own descriptor, and the
 	// one listing /dev/fd opens.
-	if limit := maxFSGroupHeldDirs + 6; most > limit {
+	if limit := testTune.heldDirs + 6; most > limit {
 		t.Errorf("the walk had %d descriptors open at its most, want at most %d for a tree %d deep", most, limit, depth)
 	}
 	if got := modeOf(t, leaf).Perm(); got != 0o660 {
@@ -865,7 +875,7 @@ func TestFSGroupWalkBoundsFailClosed(t *testing.T) {
 	}
 
 	t.Run("depth", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupDepth, 3)
+		lowerFSGroupBound(t, &testTune.depth, 3)
 		podDir, root := chain(t, 3)
 		gid := fsGroupTestGid(t, root)
 		if _, err := walkFSGroup(podDir, root, gid); err != nil {
@@ -881,7 +891,7 @@ func TestFSGroupWalkBoundsFailClosed(t *testing.T) {
 		}
 	})
 	t.Run("entries", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupEntries, 20)
+		lowerFSGroupBound(t, &testTune.entries, 20)
 		// The root is one entry: 19 more reach the budget exactly.
 		podDir, root := wide(t, 4, 15)
 		gid := fsGroupTestGid(t, root)
@@ -899,7 +909,7 @@ func TestFSGroupWalkBoundsFailClosed(t *testing.T) {
 	t.Run("waiting directories", func(t *testing.T) {
 		// Each waiting directory named dNNN is charged fsGroupNodeCost + 4
 		// bytes, so this budget pays for exactly ten of them.
-		lowerFSGroupBound(t, &maxFSGroupPendingBytes, 10*(fsGroupNodeCost+4))
+		lowerFSGroupBound(t, &testTune.pendingBytes, 10*(fsGroupNodeCost+4))
 		podDir, root := wide(t, 10, 0)
 		gid := fsGroupTestGid(t, root)
 		if _, err := walkFSGroup(podDir, root, gid); err != nil {
@@ -935,7 +945,7 @@ func TestFSGroupWalkStopsWhenItsContextEnds(t *testing.T) {
 			cancel()
 		}
 	}, nil)
-	_, err := ChownForFSGroup(ctx, podDir, root, gid, testOwners)
+	_, err := chownForFSGroup(ctx, podDir, root, gid, testOwners, testTune)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("the walk under a cancelled context = %v, want context.Canceled", err)
 	}
@@ -945,7 +955,7 @@ func TestFSGroupWalkStopsWhenItsContextEnds(t *testing.T) {
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	if _, err := ChownForFSGroup(ctx2, podDir, root, gid, testOwners); !errors.Is(err, context.Canceled) {
+	if _, err := chownForFSGroup(ctx2, podDir, root, gid, testOwners, testTune); !errors.Is(err, context.Canceled) {
 		t.Errorf("the walk started under a cancelled context = %v, want context.Canceled", err)
 	}
 }
@@ -1229,7 +1239,7 @@ func TestFSGroupWalkErrorPathsLeakNothing(t *testing.T) {
 		return podDir, root
 	}
 	t.Run("the entry budget", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupEntries, 5)
+		lowerFSGroupBound(t, &testTune.entries, 5)
 		podDir, root := build(t)
 		gid := fsGroupTestGid(t, root)
 		base := openDescriptors(t)
@@ -1241,7 +1251,7 @@ func TestFSGroupWalkErrorPathsLeakNothing(t *testing.T) {
 		}
 	})
 	t.Run("the depth bound", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupDepth, 2)
+		lowerFSGroupBound(t, &testTune.depth, 2)
 		podDir, root := build(t)
 		gid := fsGroupTestGid(t, root)
 		base := openDescriptors(t)
@@ -1264,7 +1274,7 @@ func TestFSGroupWalkErrorPathsLeakNothing(t *testing.T) {
 			}
 		}, nil)
 		base := openDescriptors(t)
-		if _, err := ChownForFSGroup(ctx, podDir, root, gid, testOwners); !errors.Is(err, context.Canceled) {
+		if _, err := chownForFSGroup(ctx, podDir, root, gid, testOwners, testTune); !errors.Is(err, context.Canceled) {
 			t.Fatalf("the walk = %v, want context.Canceled", err)
 		}
 		if after := openDescriptors(t); after != base {
@@ -1340,10 +1350,10 @@ func TestFSGroupWalkSkipCostIsBounded(t *testing.T) {
 	}
 	gid := fsGroupTestGid(t, root)
 	builds := 0
-	fsGroupOnPathBuild = func() { builds++ }
-	t.Cleanup(func() { fsGroupOnPathBuild = nil })
+	testTune.onPathBuild = func() { builds++ }
+	t.Cleanup(func() { testTune.onPathBuild = nil })
 	rep, err := walkFSGroup(podDir, root, gid)
-	fsGroupOnPathBuild = nil
+	testTune.onPathBuild = nil
 	if err != nil {
 		t.Fatalf("ChownForFSGroup: %v", err)
 	}
@@ -1392,11 +1402,11 @@ func reopenTree(t *testing.T, root string, spine, side int) int {
 // budget at exactly entries + re-opens, and stops with ErrFSGroupTreeTooLarge
 // one below it.
 func TestFSGroupWalkReopenCostIsCharged(t *testing.T) {
-	lowerFSGroupBound(t, &maxFSGroupHeldDirs, 4)
+	lowerFSGroupBound(t, &testTune.heldDirs, 4)
 	const spine, side = 30, 6
 	reopens := 0
-	fsGroupOnReopen = func() { reopens++ }
-	t.Cleanup(func() { fsGroupOnReopen = nil })
+	testTune.onReopen = func() { reopens++ }
+	t.Cleanup(func() { testTune.onReopen = nil })
 
 	podDir := t.TempDir()
 	root := filepath.Join(podDir, "rootfs")
@@ -1422,7 +1432,7 @@ func TestFSGroupWalkReopenCostIsCharged(t *testing.T) {
 	budget := entries + reopens
 
 	t.Run("at the budget", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupEntries, budget)
+		lowerFSGroupBound(t, &testTune.entries, budget)
 		podDir := t.TempDir()
 		root := filepath.Join(podDir, "rootfs")
 		reopenTree(t, root, spine, side)
@@ -1431,7 +1441,7 @@ func TestFSGroupWalkReopenCostIsCharged(t *testing.T) {
 		}
 	})
 	t.Run("one below it", func(t *testing.T) {
-		lowerFSGroupBound(t, &maxFSGroupEntries, budget-1)
+		lowerFSGroupBound(t, &testTune.entries, budget-1)
 		podDir := t.TempDir()
 		root := filepath.Join(podDir, "rootfs")
 		reopenTree(t, root, spine, side)
@@ -1449,8 +1459,8 @@ func TestFSGroupWalkReopenCostIsCharged(t *testing.T) {
 		reopenTree(t, root, spine, side)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		fsGroupOnReopen = cancel
-		if _, err := ChownForFSGroup(ctx, podDir, root, gid, testOwners); !errors.Is(err, context.Canceled) {
+		testTune.onReopen = cancel
+		if _, err := chownForFSGroup(ctx, podDir, root, gid, testOwners, testTune); !errors.Is(err, context.Canceled) {
 			t.Errorf("the walk cancelled at its first re-open = %v, want context.Canceled", err)
 		}
 	})
@@ -1492,7 +1502,7 @@ func TestFSGroupWalkClipsErrorPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	gid := fsGroupTestGid(t, root)
-	lowerFSGroupBound(t, &maxFSGroupDepth, 2)
+	lowerFSGroupBound(t, &testTune.depth, 2)
 	_, err := walkFSGroup(podDir, root, gid)
 	if !errors.Is(err, ErrFSGroupTreeTooDeep) {
 		t.Fatalf("the walk = %v, want ErrFSGroupTreeTooDeep", err)
@@ -1537,13 +1547,13 @@ func TestFSGroupWalkLeavesForeignOwnersAlone(t *testing.T) {
 		filepath.Join(root, "their-file"): true,
 		filepath.Join(root, "theirs"):     true,
 	}
-	fsGroupOwnerOf = func(path string, uid uint32) uint32 {
+	testTune.ownerOf = func(path string, uid uint32) uint32 {
 		if foreign[path] {
 			return other
 		}
 		return uid
 	}
-	t.Cleanup(func() { fsGroupOwnerOf = nil })
+	t.Cleanup(func() { testTune.ownerOf = nil })
 	before := treeState(t, root)
 	rep, err := walkFSGroup(podDir, root, gid)
 	if err != nil {
@@ -1623,25 +1633,192 @@ func TestFSGroupWalkClearsSetID(t *testing.T) {
 	}
 }
 
-// TestFSGroupRefusesSystemGids: a gid that is a macOS system group whose
-// membership is a privilege is refused before anything is changed.
-func TestFSGroupRefusesSystemGids(t *testing.T) {
+// unassignedGid is a gid at or above fsGroupMinGid that names no group on
+// this host.
+func unassignedGid(t *testing.T) int {
+	t.Helper()
+	for gid := 4242; gid < 4342; gid++ {
+		if _, err := user.LookupGroupId(strconv.Itoa(gid)); err != nil {
+			var unknown user.UnknownGroupIdError
+			if errors.As(err, &unknown) {
+				return gid
+			}
+		}
+	}
+	t.Fatal("every gid from 4242 to 4341 names a group on this host")
+	return 0
+}
+
+// TestFSGroupGidAllowList: the gids a pod may be given are an allow-list. By
+// default that is an unassigned gid from fsGroupMinGid to MaxInt32; every
+// macOS group below that is refused, the ones a deny-list missed among them,
+// and so is 250, the one fsGroup the k3sm admission policy admits today (the
+// _k3sm uid, which on macOS is also the gid of _analyticsusers). A node may
+// admit gids of its own, except fsGroupNeverGids. A refused gid changes
+// nothing.
+func TestFSGroupGidAllowList(t *testing.T) {
+	free := unassignedGid(t)
+	refused := []int{0, -1, math.MaxInt32 + 1, math.MaxUint32,
+		1, 2, 3, 4, 5, 8, 9, 12, 20, 29, 61, 80, 98, 204, 250, 395, 396, 397, 398, 399, 400, 701, 999}
+	for _, gid := range refused {
+		if err := FSGroupGidAllowed(gid, nil); !errors.Is(err, ErrFSGroupGidRefused) {
+			t.Errorf("gid %d = %v, want ErrFSGroupGidRefused", gid, err)
+		}
+	}
+	for _, gid := range []int{free, fsGroupMinGid} {
+		if _, err := user.LookupGroupId(strconv.Itoa(gid)); err == nil {
+			continue // assigned on this host: the refusal below covers it
+		}
+		if err := FSGroupGidAllowed(gid, nil); err != nil {
+			t.Errorf("unassigned gid %d = %v, want allowed", gid, err)
+		}
+	}
+	for gid := fsGroupMinGid; gid < fsGroupMinGid+2000; gid++ {
+		if g, err := user.LookupGroupId(strconv.Itoa(gid)); err == nil {
+			if err := FSGroupGidAllowed(gid, nil); !errors.Is(err, ErrFSGroupGidRefused) {
+				t.Errorf("gid %d, the group %q here, = %v, want refused", gid, g.Name, err)
+			}
+			break
+		}
+	}
+	if err := FSGroupGidAllowed(12, []int{12}); err != nil {
+		t.Errorf("an admitted gid = %v, want allowed", err)
+	}
+	for _, gid := range []int{0, 20, 80, math.MaxInt32 + 1} {
+		if err := FSGroupGidAllowed(gid, []int{gid}); !errors.Is(err, ErrFSGroupGidRefused) {
+			t.Errorf("admitted gid %d = %v, want refused all the same", gid, err)
+		}
+	}
+
 	podDir := t.TempDir()
 	root := filepath.Join(podDir, "rootfs")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	before := treeState(t, root)
-	for _, gid := range []int{1, 2, 3, 4, 5, 8, 9, 20, 80} {
-		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupGidRefused) {
-			t.Errorf("gid %d = %v, want ErrFSGroupGidRefused", gid, err)
+	for _, gid := range refused {
+		if _, err := ChownForFSGroup(context.Background(), podDir, root, gid, testOwners, nil); !errors.Is(err, ErrFSGroupGidRefused) {
+			t.Errorf("ChownForFSGroup gid %d = %v, want ErrFSGroupGidRefused", gid, err)
+		}
+		if err := PrepareFSGroupRoot(podDir, root, gid, os.Geteuid(), nil); !errors.Is(err, ErrFSGroupGidRefused) {
+			t.Errorf("PrepareFSGroupRoot gid %d = %v, want ErrFSGroupGidRefused", gid, err)
 		}
 	}
 	if !reflect.DeepEqual(treeState(t, root), before) {
 		t.Error("a refused gid changed the tree")
 	}
-	if _, err := ChownForFSGroup(context.Background(), podDir, root, 4242, nil); err == nil {
-		t.Error("an empty owner set was accepted")
+	if _, err := ChownForFSGroup(context.Background(), podDir, root, free, FSGroupOwners{}, nil); err == nil || errors.Is(err, ErrFSGroupGidRefused) {
+		t.Errorf("an empty owner set = %v, want refused as such", err)
+	}
+	for _, o := range []FSGroupOwners{{UIDs: []int{-1}}, {UIDs: []int{math.MaxInt32 + 1}}, {UIDs: []int{0}, InGroup: []int{math.MaxInt32 + 1}}} {
+		if _, err := chownForFSGroup(context.Background(), podDir, root, fsGroupTestGid(t, root), o, testTune); err == nil {
+			t.Errorf("owners %+v were accepted", o)
+		}
+	}
+	if _, err := chownForFSGroup(context.Background(), podDir, root, math.MaxInt32+1, testOwners, testTune); err == nil {
+		t.Error("a gid above MaxInt32 was accepted past the policy")
+	}
+}
+
+// TestFSGroupGidLookupAsksDirectoryServices: a group that lives only in the
+// system's directory services, not in /etc/group, is found by the lookup the
+// allow-list makes, so such a group is not taken for an unassigned gid.
+func TestFSGroupGidLookupAsksDirectoryServices(t *testing.T) {
+	etc, err := os.ReadFile("/etc/group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, _ := os.Getgroups()
+	for _, g := range groups {
+		if strings.Contains(string(etc), ":"+strconv.Itoa(g)+":") {
+			continue
+		}
+		grp, err := user.LookupGroupId(strconv.Itoa(g))
+		if err != nil {
+			t.Fatalf("gid %d, a group of this process missing from /etc/group, was not found: %v", g, err)
+		}
+		t.Logf("gid %d (%s) is in directory services only, and the lookup finds it", g, grp.Name)
+		return
+	}
+	t.Log("every group of this process is in /etc/group; nothing to measure here")
+}
+
+// TestFSGroupLeavesRootOwnedEntriesRenamedIn: a daemon running as root whose
+// pod drops to another uid names root only in owners.InGroup. A file and a
+// directory root owns, renamed into the tree from a writable share, keep
+// their group and mode (the pod would otherwise have the walk give its group
+// a root-owned file, then rename it back out); what the daemon put in the
+// pod's root, which carries the gid already because the root was given it
+// first (PrepareFSGroupRoot), still gets the group's mode. The owner seam
+// stands in for root's ownership, which an unprivileged test cannot make.
+func TestFSGroupLeavesRootOwnedEntriesRenamedIn(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	share := t.TempDir()
+	for _, d := range []string{root, filepath.Join(share, "rootdir", "inner")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gid := fsGroupTestGid(t, root)
+	if err := PrepareFSGroupRoot(podDir, root, gid, os.Geteuid(), []int{gid}); err != nil {
+		t.Fatalf("PrepareFSGroupRoot: %v", err)
+	}
+	// What the daemon makes after the root has the group: it takes the group.
+	if err := os.MkdirAll(filepath.Join(root, "daemon-dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "daemon-dir", "secret"), []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// What a pod process renames in from a share: it keeps its group.
+	if err := os.WriteFile(filepath.Join(share, "rootfile"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"rootfile", "rootdir"} {
+		if err := os.Rename(filepath.Join(share, n), filepath.Join(root, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "pods-own"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const podUID = 4243
+	rootOwned := map[string]bool{
+		filepath.Clean(root):                        true,
+		filepath.Join(root, "daemon-dir"):           true,
+		filepath.Join(root, "daemon-dir", "secret"): true,
+		filepath.Join(root, "rootfile"):             true,
+		filepath.Join(root, "rootdir"):              true,
+		filepath.Join(root, "rootdir", "inner"):     true,
+	}
+	testTune.ownerOf = func(path string, uid uint32) uint32 {
+		if rootOwned[path] {
+			return 0
+		}
+		return podUID
+	}
+	t.Cleanup(func() { testTune.ownerOf = nil })
+	before := treeState(t, root)
+	rep, err := chownForFSGroup(context.Background(), podDir, root, gid,
+		FSGroupOwners{UIDs: []int{podUID}, InGroup: []int{0}}, testTune)
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	after := treeState(t, root)
+	for _, rel := range []string{"rootfile", "rootdir", "rootdir/inner"} {
+		if after[rel] != before[rel] {
+			t.Errorf("%s, root's and renamed in, changed: mode %07o gid %d -> mode %07o gid %d",
+				rel, before[rel].Mode, before[rel].Gid, after[rel].Mode, after[rel].Gid)
+		}
+	}
+	for rel, perm := range map[string]os.FileMode{"daemon-dir": 0o775, "daemon-dir/secret": 0o660, "pods-own": 0o660, ".": 0o775} {
+		if after[rel].Gid != uint32(gid) || os.FileMode(after[rel].Mode).Perm() != perm {
+			t.Errorf("%s: mode %o gid %d, want mode %o gid %d", rel, os.FileMode(after[rel].Mode).Perm(), after[rel].Gid, perm, gid)
+		}
+	}
+	if rep.ForeignOwner != 2 {
+		t.Errorf("report = %+v, want the renamed-in file and directory counted as foreign", rep)
 	}
 }
 

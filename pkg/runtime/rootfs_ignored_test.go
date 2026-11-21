@@ -181,7 +181,7 @@ func TestCreatePodIgnoresCallerRootfsPath(t *testing.T) {
 		mustMkdirMode(t, evil, 0o700)
 
 		logs := &levelCapture{}
-		rt := newTestRuntimeCfg(t, Config{Root: root, Logger: slog.New(logs)}, testDeps(t, Deps{Cache: cache}))
+		rt := newTestRuntimeCfg(t, Config{Root: root, Logger: slog.New(logs), FSGroupAdmitted: []int{gid}}, testDeps(t, Deps{Cache: cache}))
 		podsRoot := cache.PodsRoot()
 
 		// The victim pod's materialized data volume (secrets + projected

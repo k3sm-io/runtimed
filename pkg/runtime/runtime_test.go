@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1698,9 +1700,10 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 		}},
 	}
 	// fsGroup chown is exercised only when the test process has a real (>0)
-	// group the walk accepts.
+	// group the walk accepts once the node admits it.
 	if gid := testFSGroupGid(); gid > 0 {
 		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: int64(gid)}
+		rt.cfg.FSGroupAdmitted = []int{gid}
 	}
 
 	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
@@ -1882,12 +1885,15 @@ func TestRuntimeConfigThreadsPostureVIPs(t *testing.T) {
 var _ = errors.New
 
 // testFSGroupGid returns a group of the test process that the fsGroup walk
-// accepts (supervisor.FSGroupGidRefused), its primary group first, or 0 when
+// accepts (supervisor.FSGroupGidAllowed, once admitted), its primary group first, or 0 when
 // it has none.
 func testFSGroupGid() int {
 	groups, _ := os.Getgroups()
 	for _, g := range append([]int{os.Getgid()}, groups...) {
-		if !supervisor.FSGroupGidRefused(g) {
+		// The test process's groups are all assigned groups, which the
+		// default allow-list refuses; a test admits the one it uses
+		// (Config.FSGroupAdmitted), which works for any but the never-list.
+		if supervisor.FSGroupGidAllowed(g, []int{g}) == nil {
 			return g
 		}
 	}
@@ -1895,8 +1901,11 @@ func testFSGroupGid() int {
 }
 
 // TestFSGroupOwners: the fsGroup walk may regroup entries owned by the daemon
-// (image content, and containers that request no drop) and by the uid each
-// container drops to, and no other.
+// (what it puts in the tree, and containers that request no drop) and by the
+// uid each container drops to, and no other. A daemon running as root whose
+// pod drops to another uid names root only as an in-group owner, so a
+// root-owned entry a pod renamed in is not regrouped; on the shipped posture
+// (the daemon and every pod the service user) nothing changes.
 func TestFSGroupOwners(t *testing.T) {
 	box := &runtimev1.PodBox{
 		PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 600},
@@ -1907,11 +1916,54 @@ func TestFSGroupOwners(t *testing.T) {
 			{Name: "again", SecurityContext: &runtimev1.SecurityContext{RunAsUser: 800}},
 		},
 	}
-	if got, want := fsGroupOwners(box, 250), []int{250, 700, 600, 800}; !reflect.DeepEqual(got, want) {
-		t.Errorf("fsGroupOwners = %v, want %v", got, want)
-	}
 	plain := &runtimev1.PodBox{Containers: []*runtimev1.Container{{Name: "main"}}}
-	if got, want := fsGroupOwners(plain, 250), []int{250}; !reflect.DeepEqual(got, want) {
-		t.Errorf("fsGroupOwners with no drop = %v, want %v", got, want)
+	studio := &runtimev1.PodBox{
+		PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 250},
+		Containers:         []*runtimev1.Container{{Name: "main"}},
+	}
+	rootDrop := &runtimev1.PodBox{Containers: []*runtimev1.Container{
+		{Name: "root"},
+		{Name: "app", SecurityContext: &runtimev1.SecurityContext{RunAsUser: 501}},
+	}}
+	for _, tc := range []struct {
+		name string
+		box  *runtimev1.PodBox
+		euid int
+		want supervisor.FSGroupOwners
+	}{
+		{"drops under a service-user daemon", box, 250, supervisor.FSGroupOwners{UIDs: []int{250, 700, 600, 800}}},
+		{"no drop", plain, 250, supervisor.FSGroupOwners{UIDs: []int{250}}},
+		{"the shipped posture: daemon and pod the service user", studio, 250, supervisor.FSGroupOwners{UIDs: []int{250}}},
+		{"drops under a root daemon", box, 0, supervisor.FSGroupOwners{UIDs: []int{700, 600, 800}, InGroup: []int{0}}},
+		{"a root container beside a drop under a root daemon", rootDrop, 0, supervisor.FSGroupOwners{UIDs: []int{501}, InGroup: []int{0}}},
+		{"no drop under a root daemon", plain, 0, supervisor.FSGroupOwners{UIDs: []int{0}}},
+	} {
+		if got := fsGroupOwners(tc.box, tc.euid); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: fsGroupOwners = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestCreatePodRefusesAnFSGroupOutsideTheAllowList: a pod whose fsGroup the
+// allow-list refuses is refused before it has a directory. 250 is the one
+// fsGroup the k3sm admission policy admits today (the _k3sm uid); on macOS it
+// is also _analyticsusers, an assigned group, so such a pod now fails its
+// create closed.
+func TestCreatePodRefusesAnFSGroupOutsideTheAllowList(t *testing.T) {
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}})
+	for _, gid := range []int64{250, 20, 80, 12, 999, -5, int64(math.MaxInt32) + 1} {
+		id := "pod-fsg-" + strconv.FormatInt(gid&0xffff, 10)
+		box := hostBinBox(rt, id)
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: gid}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport: %v", err)
+		}
+		if resp.GetError() == nil || resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			t.Errorf("fsGroup %d: CreatePod = %v (reason %v), want refused as an invalid pod box", gid, resp.GetError(), resp.GetFailureReason())
+		}
+		if _, err := os.Stat(filepath.Join(rt.cache.PodsRoot(), id)); !os.IsNotExist(err) {
+			t.Errorf("fsGroup %d: the refused pod left its dir (stat err %v)", gid, err)
+		}
 	}
 }

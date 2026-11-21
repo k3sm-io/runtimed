@@ -61,17 +61,28 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 	}
 }
 
-// fsGroupOwners is the set of uids whose entries the fsGroup walk may regroup
-// in a pod's tree (supervisor.ChownForFSGroup): the uid each of the pod's
-// containers runs as, and the daemon's own uid (euid). Image content is
-// extracted and cloned into the rootfs by the daemon, which applies no tar
-// owner on the native dialect (pkg/image LayerApplier.Ownership), so the daemon
-// owns it; a container that requests no drop also runs at the daemon's uid,
-// the same rule resolveCredential's callers apply. An entry any other uid owns
-// came from outside the pod's content, for instance renamed in from a writable
-// share, and the walk leaves it alone.
-func fsGroupOwners(box *runtimev1.PodBox, euid int) []int {
-	owners := []int{euid}
+// fsGroupOwners says whose entries the fsGroup walk may change in a pod's
+// tree (supervisor.ChownForFSGroup): the uid each of the pod's containers
+// runs as, and the daemon's own uid (euid), which owns what the daemon puts
+// in the tree (volumes, the pod's temp and home dirs, the Xcode cache) and is
+// the uid of a container that requests no drop, the same rule
+// resolveCredential's callers apply. An entry any other uid owns came from
+// outside the pod's content, for instance renamed in from a writable share,
+// and the walk leaves it alone.
+//
+// On a daemon running as root whose pod drops to another uid, root is named
+// only in InGroup: a pod can rename into its tree a file or directory root
+// owns from any location it may write, and with root among the owners the
+// walk would give the pod's group the owner's access to it, which the pod
+// could then rename back out with the access it gained. What the daemon puts
+// in the tree is told apart by its group instead: createPod gives the rootfs
+// the fsGroup before it puts anything there (supervisor.PrepareFSGroupRoot),
+// every entry it makes then takes that group, and an entry renamed in keeps
+// its own. A daemon running as another uid (the service user, which every pod
+// also runs as on the shipped posture) is unchanged: it and the pods are one
+// uid, and so one trust domain to the walk.
+func fsGroupOwners(box *runtimev1.PodBox, euid int) supervisor.FSGroupOwners {
+	var drops []int
 	seen := map[int]bool{euid: true}
 	for _, list := range [][]*runtimev1.Container{box.GetInitContainers(), box.GetContainers(), box.GetEphemeralContainers()} {
 		for _, c := range list {
@@ -81,11 +92,14 @@ func fsGroupOwners(box *runtimev1.PodBox, euid int) []int {
 			}
 			if !seen[cred.UID] {
 				seen[cred.UID] = true
-				owners = append(owners, cred.UID)
+				drops = append(drops, cred.UID)
 			}
 		}
 	}
-	return owners
+	if euid == 0 && len(drops) > 0 {
+		return supervisor.FSGroupOwners{UIDs: drops, InGroup: []int{0}}
+	}
+	return supervisor.FSGroupOwners{UIDs: append([]int{euid}, drops...)}
 }
 
 // firstNonZero returns the first non-zero value, or 0 if all are zero.

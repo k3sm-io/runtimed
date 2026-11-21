@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -539,6 +540,20 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 				errInvalidPodBox, vol, medium)
 	}
 
+	// A pod's fsGroup must be a gid the allow-list admits
+	// (supervisor.FSGroupGidAllowed), decided before the pod has a network or
+	// a directory, so a refused one leaves nothing to unwind.
+	if fsGroup := box.GetPodSecurityContext().GetFsGroup(); fsGroup != 0 {
+		if fsGroup < 0 || fsGroup > math.MaxInt32 {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: fsGroup %d: %w", errInvalidPodBox, fsGroup, supervisor.ErrFSGroupGidRefused)
+		}
+		if err := supervisor.FSGroupGidAllowed(int(fsGroup), r.cfg.FSGroupAdmitted); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: fsGroup: %w", errInvalidPodBox, err)
+		}
+	}
+
 	// Exposure volumes are decided here, before the pod has a network or a
 	// directory: a node with no ExposeACL, an exposure no grant admits or a
 	// mount path that would nest refuses the pod with nothing to unwind. The
@@ -574,6 +589,24 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
+	}
+	// The fsGroup owners, and, when the daemon runs as root and the pod drops
+	// to another uid, the rootfs's group now, before anything is put in it:
+	// every entry the daemon makes below takes it, which is how the walk tells
+	// them from a root-owned entry a pod renames in (fsGroupOwners).
+	euid := os.Geteuid()
+	owners := fsGroupOwners(box, euid)
+	fsGroup := int(box.GetPodSecurityContext().GetFsGroup())
+	if fsGroup > 0 && len(owners.InGroup) > 0 {
+		podDir, err := r.podDir(box.GetPodId())
+		if err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: %w", errInvalidPodBox, err)
+		}
+		if err := supervisor.PrepareFSGroupRoot(podDir, rootfs, fsGroup, euid, r.cfg.FSGroupAdmitted); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("fsGroup for pod %s: %w", box.GetPodId(), err)
+		}
 	}
 	// The pod's temp directory, before anything can need it. See
 	// provisionPodTmpDir for why a pod has none otherwise.
@@ -737,8 +770,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
-	if fsGroup := int(box.GetPodSecurityContext().GetFsGroup()); fsGroup > 0 {
-		rep, err := supervisor.ChownForFSGroup(ctx, podDir, rootfs, fsGroup, fsGroupOwners(box, os.Geteuid()))
+	if fsGroup > 0 {
+		rep, err := supervisor.ChownForFSGroup(ctx, podDir, rootfs, fsGroup, owners, r.cfg.FSGroupAdmitted)
 		if err != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("fsGroup chown for pod %s: %w", box.GetPodId(), err)
