@@ -956,8 +956,10 @@ func (p *Puller) ingestVia(ctx context.Context, ref string, img ggcrv1.Image, wa
 	// requested, so a pull that cannot fit is refused before it spends the
 	// volume rather than bounded only one layer at a time at commit. Taken
 	// here, after the lease, every fetching path (primary, flat, local, mirror)
-	// is covered. The reservation ends with ingest, on every path.
-	space, err := p.reserveSpace(ctx, ref, mfst)
+	// is covered. A layer this pull will resume through src is charged only
+	// the bytes its partial lacks. The reservation ends with ingest, on every
+	// path.
+	space, err := p.reserveSpace(ctx, ref, mfst, src != nil)
 	if err != nil {
 		return nil, err
 	}

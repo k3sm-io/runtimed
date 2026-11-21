@@ -233,7 +233,7 @@ func (p *Puller) sampleFree() FreeBytesFunc {
 //
 // The unpacked tree the layers are later extracted into is not covered; see
 // SpaceLedger.
-func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Manifest) (*Reservation, error) {
+func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Manifest, resume bool) (*Reservation, error) {
 	seen := make(map[string]bool, len(mfst.Layers)+1)
 	var missing []BlobSpace
 	for _, d := range append([]ggcrv1.Descriptor{mfst.Config}, mfst.Layers...) {
@@ -245,7 +245,13 @@ func (p *Puller) reserveSpace(ctx context.Context, ref string, mfst *ggcrv1.Mani
 		if p.cache.Has(digest) {
 			continue
 		}
-		missing = append(missing, BlobSpace{Size: d.Size})
+		b := BlobSpace{Size: d.Size}
+		if resume && p.partials != nil && digest != mfst.Config.Digest.String() {
+			// The partial's bytes are already off free space, as on the
+			// artifact path; an overlong partial counts as nothing.
+			b.Have = p.partials.Bytes(digest, d.Size)
+		}
+		missing = append(missing, b)
 	}
 	if len(missing) == 0 {
 		return nil, nil
