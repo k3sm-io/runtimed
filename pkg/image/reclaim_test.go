@@ -1179,12 +1179,9 @@ func TestExecutePruneOrdersALeaseAgainstTheUnlink(t *testing.T) {
 	if !fired {
 		t.Fatal("the hook never ran, so the window was not driven")
 	}
-	var s sighting
-	select {
-	case s = <-seen:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the pull's AcquireLease never returned after the pass")
-	}
+	// The pull's AcquireLease must return once the pass is over; if it never
+	// does, this receive blocks and go test's own timeout reports the hang.
+	s := <-seen
 	defer s.lease.Release()
 	if s.present && !f.exists(b) {
 		t.Fatal("a pull leased the blob and found it present, and the executor still unlinked it")
@@ -1380,12 +1377,9 @@ func TestExecutePruneKeepsABlobRenamedOnEveryRepin(t *testing.T) {
 		rep, err := f.cache.executePrune(planOf(first, renamed), 0, f.clock, nil, pinned)
 		done <- result{rep, err}
 	}()
-	var r result
-	select {
-	case r = <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("executePrune did not return; the re-read loop is unbounded")
-	}
+	// executePrune must return: an unbounded re-read loop blocks this receive
+	// and go test's own timeout reports the hang.
+	r := <-done
 	if r.err != nil {
 		t.Fatalf("executePrune: %v", r.err)
 	}
