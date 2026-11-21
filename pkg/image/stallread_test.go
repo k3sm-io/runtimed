@@ -19,6 +19,8 @@ package image
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log"
@@ -472,4 +474,35 @@ func TestStallReader(t *testing.T) {
 			t.Fatalf("Read error = %v, want the body's error unchanged", err)
 		}
 	})
+}
+
+// TestStallEOFShortBodyNotCommitted pins the cache side of the watchdog's EOF
+// rule: a body that ends with io.EOF in the same instant the watchdog fires is
+// passed through as complete, so a short body arriving that way must still be
+// refused by the commit's size and digest checks and never reach the cache.
+func TestStallEOFShortBodyNotCommitted(t *testing.T) {
+	data := bytes.Repeat([]byte("layer bytes "), 128)
+	sum := sha256.Sum256(data)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	cache, err := NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ft := newFakeTimer()
+	// The watchdog fires inside the Read, which then returns 16 bytes and EOF.
+	body := newFakeStallReader(&firingReader{ft: ft, fire: true, n: 16, err: io.EOF}, time.Minute, ft)
+	defer body.Close()
+	wrote, err := cache.CommitBlob(digest, int64(len(data)), func(w io.Writer) error {
+		_, cerr := io.Copy(w, body)
+		return cerr
+	})
+	if !body.stalled.Load() {
+		t.Fatal("the watchdog did not fire: the row does not exercise EOF at a stall")
+	}
+	if err == nil || wrote {
+		t.Fatalf("CommitBlob of a 16-byte body for a %d-byte blob = (%v, %v), want a refusal", len(data), wrote, err)
+	}
+	if cache.Has(digest) {
+		t.Fatal("a short body ending in EOF at a stall reached the cache")
+	}
 }
