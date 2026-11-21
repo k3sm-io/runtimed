@@ -68,9 +68,11 @@ type scrubbedError struct {
 func (e *scrubbedError) Error() string { return e.msg }
 func (e *scrubbedError) Unwrap() error { return e.err }
 
-// urlInText matches an http or https URL in error text up to a quote, a
-// space or a control byte, so a %q-quoted URL ends at its closing quote.
-var urlInText = regexp.MustCompile(`(?i)https?://[^\s"'<>\\]+`)
+// urlInText matches an http or https URL in error text up to white space or
+// an unescaped double quote. A backslash escape (\" or \u0026, as %q and
+// JSON render them) is taken whole, so a match never ends inside a query and
+// leaves its tail behind; a %q-quoted URL ends at its closing quote.
+var urlInText = regexp.MustCompile(`(?i)https?://(?:[^\s"\\]|\\.)+`)
 
 // scrubURLs reduces every http or https URL in s with reduceURL.
 func scrubURLs(s string) string {
@@ -78,21 +80,22 @@ func scrubURLs(s string) string {
 }
 
 // reduceURL is raw with only its scheme, host and path. A raw URL that does
-// not parse, or an opaque one, is cut at its first '?' or '#' instead, and
-// loses everything up to the last '@' after its scheme, so no user info
-// survives (a path holding '@' loses more than it must).
+// not parse, or an opaque one, first loses everything up to the last '@'
+// after its scheme, so no user info survives whatever it holds, and is then
+// cut at its first '?' or '#' (a path or query holding '@' loses more than it
+// must).
 func reduceURL(raw string) string {
 	if u, err := url.Parse(raw); err == nil && u.Opaque == "" {
 		r := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}
 		return r.String()
 	}
-	if i := strings.IndexAny(raw, "?#"); i >= 0 {
-		raw = raw[:i]
-	}
 	if scheme, rest, ok := strings.Cut(raw, "://"); ok {
 		if at := strings.LastIndex(rest, "@"); at >= 0 {
 			raw = scheme + "://" + rest[at+1:]
 		}
+	}
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		raw = raw[:i]
 	}
 	return raw
 }

@@ -212,6 +212,7 @@ func TestReduceURL(t *testing.T) {
 		{"https://u:p@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 		{"mailto:x?sig=s", "mailto:x"},
 		{"https://u:p/w@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
+		{"https://u:p?ss@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 	} {
 		if got := reduceURL(tc.in); got != tc.want {
 			t.Errorf("reduceURL(%q) = %q, want %q", tc.in, got, tc.want)
@@ -255,6 +256,15 @@ func TestRedactURLErrorScrubsRenderedURL(t *testing.T) {
 	}
 	if again := RedactURLError(err); again.Error() != msg {
 		t.Fatalf("second pass = %s, want %s", again, msg)
+	}
+	for _, text := range []string{
+		`json: "https://t.example/x?a=1\u0026X-Amz-Signature=` + queryMarker + `"`,
+		`quoted: "https://t.example/x?a=\"` + queryMarker + `\"" after`,
+		"single: 'https://t.example/x?a=1'" + queryMarker + "<b>",
+	} {
+		if got := RedactURLError(errors.New(text)).Error(); strings.Contains(got, queryMarker) || !strings.Contains(got, "https://t.example/x") {
+			t.Errorf("scrub(%s) = %s, want the URL without any of its query", text, got)
+		}
 	}
 	plain := errors.New("no URL here: https://h.example/p")
 	if got := RedactURLError(plain); got != plain {
