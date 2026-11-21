@@ -386,6 +386,7 @@ func TestPullGuestArtifactLeaseOutlivesInstall(t *testing.T) {
 		PartialDir:   e.partial,
 		StorePath:    e.cache.Root(),
 		FreeBytes:    func(string) (uint64, error) { return e.free.Load(), nil },
+		TotalBytes:   testCapacity,
 		FloorBytes:   100,
 	}, Deps{Blobs: e.cache, Leases: lz, Reclaimer: e.reclaim, Index: e.index, Fetcher: e.fetch})
 	if err != nil {
@@ -508,6 +509,7 @@ func TestGuestStoreRegistryErrorBoundedAndQuoted(t *testing.T) {
 			p, err := New(Config{
 				RegistryHost: testHost, PartialDir: e.partial, StorePath: e.cache.Root(),
 				FreeBytes:  func(string) (uint64, error) { return e.free.Load(), nil },
+				TotalBytes: testCapacity,
 				FloorBytes: 100,
 			}, Deps{Blobs: e.cache, Leases: e.cache, Reclaimer: e.reclaim, Index: e.index, Fetcher: hf})
 			if err != nil {

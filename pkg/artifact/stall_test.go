@@ -102,6 +102,7 @@ func stallPuller(t *testing.T, e *env, f Fetcher, idle *fakeIdle) *Puller {
 		PartialDir:   e.partial,
 		StorePath:    e.cache.Root(),
 		FreeBytes:    func(string) (uint64, error) { return e.free.Load(), nil },
+		TotalBytes:   testCapacity,
 		FloorBytes:   100,
 		afterFunc:    idle.after,
 	}, Deps{Blobs: e.cache, Leases: e.cache, Reclaimer: e.reclaim, Index: e.index, Fetcher: f})

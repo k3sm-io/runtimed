@@ -248,6 +248,10 @@ func newEnv(t *testing.T) *env {
 		partial: filepath.Join(root, "artifact-partial")}
 }
 
+// testCapacity is a volume capacity far above anything a test declares, so the
+// reservation's capacity check never samples the real disk.
+func testCapacity(string) (uint64, error) { return 1 << 50, nil }
+
 func (e *env) puller(t *testing.T) *Puller {
 	t.Helper()
 	p, err := New(Config{
@@ -255,6 +259,7 @@ func (e *env) puller(t *testing.T) *Puller {
 		PartialDir:   e.partial,
 		StorePath:    e.cache.Root(),
 		FreeBytes:    func(string) (uint64, error) { return e.free.Load(), nil },
+		TotalBytes:   testCapacity,
 		FloorBytes:   100,
 	}, Deps{Blobs: e.cache, Leases: e.cache, Reclaimer: e.reclaim, Index: e.index, Fetcher: e.fetch})
 	if err != nil {

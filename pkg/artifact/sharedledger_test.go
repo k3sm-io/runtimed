@@ -114,7 +114,8 @@ func TestImageAndArtifactPullsShareOneLedger(t *testing.T) {
 		free := func(string) (uint64, error) { return e.free.Load(), nil }
 		ip, err := image.NewPuller(e.cache, func(context.Context, string, *image.RegistryCredential, image.PlatformPolicy) (ggcrv1.Image, error) {
 			return img, nil
-		}, image.NoLocalIndex{}, image.WithPullFloor(floor), image.WithFreeBytes(free), image.WithSpaceLedger(ledger))
+		}, image.NoLocalIndex{}, image.WithPullFloor(floor), image.WithFreeBytes(free), image.WithSpaceLedger(ledger),
+			image.WithTotalBytes(testCapacity))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -123,6 +124,7 @@ func TestImageAndArtifactPullsShareOneLedger(t *testing.T) {
 			PartialDir:   e.partial,
 			StorePath:    e.cache.Root(),
 			FreeBytes:    free,
+			TotalBytes:   testCapacity,
 			FloorBytes:   floor,
 			Ledger:       ledger,
 		}, Deps{Blobs: e.cache, Leases: e.cache, Reclaimer: e.reclaim, Index: e.index, Fetcher: e.fetch})

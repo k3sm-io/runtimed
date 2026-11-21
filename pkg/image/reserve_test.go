@@ -123,7 +123,7 @@ func TestPullRefusesWhenDeclaredLayersExceedFreeSpace(t *testing.T) {
 	ledger := &SpaceLedger{}
 	free := uint64(floor) + declaredNeed(t, img) - 1 // admitted, one byte short of the reservation
 	p, err := NewPuller(cache, RemoteFetch, NoLocalIndex{},
-		WithPullFloor(floor), WithFreeBytes(fixedFreeBytes(free)), WithSpaceLedger(ledger))
+		WithPullFloor(floor), WithFreeBytes(fixedFreeBytes(free)), WithSpaceLedger(ledger), WithTotalBytes(testCapacity))
 	if err != nil {
 		t.Fatalf("NewPuller: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestPullRefusesWhenDeclaredLayersExceedFreeSpace(t *testing.T) {
 	// Positive control: one more byte of free space and the same pull fits,
 	// fetches its layers, and leaves the ledger empty.
 	p, err = NewPuller(cache, RemoteFetch, NoLocalIndex{},
-		WithPullFloor(floor), WithFreeBytes(fixedFreeBytes(free+1)), WithSpaceLedger(ledger))
+		WithPullFloor(floor), WithFreeBytes(fixedFreeBytes(free+1)), WithSpaceLedger(ledger), WithTotalBytes(testCapacity))
 	if err != nil {
 		t.Fatalf("NewPuller: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestPullReservationReleasedOnEveryPath(t *testing.T) {
 				return tc.layer
 			}}
 			p, err := NewPuller(cache, staticFetch(img), NoLocalIndex{},
-				WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(ledger))
+				WithFreeBytes(fixedFreeBytes(64<<30)), WithSpaceLedger(ledger), WithTotalBytes(testCapacity))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -268,11 +268,11 @@ func TestPullReservationSharedLedgerAdmitsOnlyOne(t *testing.T) {
 	var bLayers atomic.Int32
 	countedB := hookedImage{Image: b, onLayer: func() error { bLayers.Add(1); return nil }}
 
-	pa, err := NewPuller(cache, staticFetch(heldA), NoLocalIndex{}, WithPullFloor(floor), WithFreeBytes(free), WithSpaceLedger(ledger))
+	pa, err := NewPuller(cache, staticFetch(heldA), NoLocalIndex{}, WithPullFloor(floor), WithFreeBytes(free), WithSpaceLedger(ledger), WithTotalBytes(testCapacity))
 	if err != nil {
 		t.Fatal(err)
 	}
-	pb, err := NewPuller(cache, staticFetch(countedB), NoLocalIndex{}, WithPullFloor(floor), WithFreeBytes(free), WithSpaceLedger(ledger))
+	pb, err := NewPuller(cache, staticFetch(countedB), NoLocalIndex{}, WithPullFloor(floor), WithFreeBytes(free), WithSpaceLedger(ledger), WithTotalBytes(testCapacity))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestPullRefusesHostileDeclaredSizes(t *testing.T) {
 			img := hookedImage{Image: declaredImage{Image: pullPolicyImage(t), sizes: tc.sizes},
 				onLayer: func() error { opened.Add(1); return nil }}
 			p, err := NewPuller(cache, staticFetch(img), NoLocalIndex{},
-				WithFreeBytes(fixedFreeBytes(math.MaxUint64)), WithSpaceLedger(ledger))
+				WithFreeBytes(fixedFreeBytes(math.MaxUint64)), WithSpaceLedger(ledger), WithTotalBytes(testCapacity))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -378,6 +378,10 @@ func (c *countingReclaimer) ReclaimUnderPressure(context.Context, ReclaimConfig)
 	c.passes.Add(1)
 	return &ReclaimReport{}, nil
 }
+
+// testCapacity is a volume capacity far above anything a test declares, so a
+// pull-level test never samples the real disk for the capacity check.
+var testCapacity = fixedTotalBytes(1 << 50)
 
 func fixedTotalBytes(n uint64) TotalBytesFunc {
 	return func(string) (uint64, error) { return n, nil }
