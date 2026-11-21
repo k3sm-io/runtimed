@@ -663,7 +663,7 @@ func TestLivePodBlobsSurviveReclaim(t *testing.T) {
 //     when the executor reaches it, with no root naming the blob, so only the
 //     live lease can keep it (ReasonKeptLeased). Released, a second pass
 //     removes it, so the pin is not vacuous. The executor reads leases twice
-//     (once per batch in pinnedNow, once per unlink via leaseHas), and this
+//     (once per batch in pinnedNow, once per unlink via leaseHasLocked), and this
 //     case fails only when both reads are gone.
 //
 // An unreferenced blob next to it is removed, so neither pass is vacuous.

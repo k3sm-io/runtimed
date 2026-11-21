@@ -148,18 +148,12 @@ func (c *Cache) leasedDigests() map[string]bool {
 	return out
 }
 
-// leaseHas reports whether a live lease pins digest, dropping leases whose TTL
-// has passed exactly as leasedDigests does. It allocates nothing, so a per-blob
-// re-check costs one scan of the live leases rather than a copy of their set.
-func (c *Cache) leaseHas(digest string) bool {
-	c.leaseMu.Lock()
-	defer c.leaseMu.Unlock()
-	return c.leaseHasLocked(digest)
-}
-
-// leaseHasLocked is leaseHas for a caller that already holds leaseMu, which is
-// how executePrune makes a blob's lease check and its unlink one critical
-// section with respect to AcquireLease.
+// leaseHasLocked reports whether a live lease pins digest, dropping leases
+// whose TTL has passed exactly as leasedDigests does. The caller holds leaseMu,
+// which is how executePrune makes a blob's lease check and its unlink one
+// critical section with respect to AcquireLease. It allocates nothing, so a
+// per-blob check costs one scan of the live leases rather than a copy of their
+// set.
 func (c *Cache) leaseHasLocked(digest string) bool {
 	c.expireLeasesLocked()
 	for _, l := range c.leases {

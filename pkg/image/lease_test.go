@@ -94,3 +94,11 @@ func TestLeaseConcurrentUse(t *testing.T) {
 		}
 	}
 }
+
+// leaseHas is leaseHasLocked taking leaseMu itself, for tests that ask about
+// one digest from outside a critical section.
+func (c *Cache) leaseHas(digest string) bool {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+	return c.leaseHasLocked(digest)
+}
