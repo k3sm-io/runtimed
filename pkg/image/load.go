@@ -260,7 +260,8 @@ func (l *Loader) Load(ctx context.Context, req LoadRequest, src io.Reader) (*Loa
 				return oerr
 			}
 			defer rc.Close()
-			_, cerr := io.Copy(w, rc)
+			// Arriving bytes renew the lease, as a pull's do.
+			_, cerr := io.Copy(w, lease.Reader(rc))
 			return cerr
 		}); err != nil {
 			return nil, fmt.Errorf("load image %q: %w", ref, err)
