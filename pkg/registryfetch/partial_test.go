@@ -684,25 +684,20 @@ func TestResumeRefusesNonRegularPartial(t *testing.T) {
 			if err := plant(s.path(digest)); err != nil {
 				t.Fatal(err)
 			}
-			done := make(chan error, 1)
-			go func() {
-				var got []byte
-				done <- s.Resume(Fill{
-					Digest: digest, Size: 100,
-					Transfer: func(*os.File, int64) error { return errors.New("Transfer ran on a non-regular partial") },
-					Commit:   verifyCommit(digest, 100, &got),
-				})
-			}()
-			select {
-			case err := <-done:
-				if !errors.Is(err, ErrPartialFile) {
-					t.Fatalf("err = %v, want ErrPartialFile", err)
-				}
-				if name != "fifo" && !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.ELOOP) {
-					t.Fatalf("err = %v, lost the underlying errno", err)
-				}
-			case <-time.After(10 * time.Second):
-				t.Fatal("Resume blocked on a non-regular partial")
+			// Called inline: an open that waited for a FIFO peer would hang
+			// here until the go test -timeout fails the binary with a stack,
+			// which needs no wall-clock guard in the test itself.
+			var got []byte
+			err := s.Resume(Fill{
+				Digest: digest, Size: 100,
+				Transfer: func(*os.File, int64) error { return errors.New("Transfer ran on a non-regular partial") },
+				Commit:   verifyCommit(digest, 100, &got),
+			})
+			if !errors.Is(err, ErrPartialFile) {
+				t.Fatalf("err = %v, want ErrPartialFile", err)
+			}
+			if name != "fifo" && !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.ELOOP) {
+				t.Fatalf("err = %v, lost the underlying errno", err)
 			}
 		})
 	}
