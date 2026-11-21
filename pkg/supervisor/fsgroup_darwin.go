@@ -24,5 +24,14 @@ const fsGroupCanOpenLinks = true
 
 // fsGroupLinkFlags opens a symlink itself (O_SYMLINK), not what it names. If
 // the name has become something else, that is what is opened, and the walk
-// sees it is no longer a link and stops.
-const fsGroupLinkFlags = unix.O_RDONLY | unix.O_SYMLINK | unix.O_NONBLOCK | unix.O_CLOEXEC
+// sees it is no longer a link and stops. O_NOCTTY keeps a name that has become
+// a terminal from becoming the daemon's.
+//
+// O_NOFOLLOW is not added. Measured on macOS 27.2.1 (arm64): openat of a
+// symlink with O_SYMLINK opens the link (S_IFLNK); with O_SYMLINK|O_NOFOLLOW,
+// or O_NOFOLLOW alone, it fails with ELOOP, so the two together refuse the
+// very link the walk means to open. A regular file opens with either. O_SYMLINK
+// does follow a symlink in a middle component of a path, but the walk only
+// ever opens a single name relative to a directory it holds open, so there is
+// no middle component.
+const fsGroupLinkFlags = unix.O_RDONLY | unix.O_SYMLINK | unix.O_NONBLOCK | unix.O_NOCTTY | unix.O_CLOEXEC

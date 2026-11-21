@@ -35,34 +35,43 @@ var ErrFSGroupRootUnbounded = errors.New("fsGroup chown root is outside the perm
 var ErrFSGroupTreeTooDeep = errors.New("fsGroup chown tree is too deep")
 
 // ErrFSGroupTreeTooLarge is returned when the tree under root holds more
-// entries than maxFSGroupEntries, or more directories waiting to be listed
+// entries than maxFSGroupEntries (with the directories the walk re-opens
+// charged against the same budget), or more directories waiting to be listed
 // than maxFSGroupPendingBytes pays for.
 var ErrFSGroupTreeTooLarge = errors.New("fsGroup chown tree is too large")
 
 // ErrFSGroupEntryChanged is returned when an entry stopped being what the walk
-// listed it as before the walk had finished with it: something is rearranging
-// the tree under the walk, and the walk stops.
+// listed it as before the walk had finished with it, or when root itself is
+// gone before it is listed: something is rearranging the tree under the walk,
+// and the walk stops.
 var ErrFSGroupEntryChanged = errors.New("fsGroup chown entry changed under the walk")
 
 // The walk's bounds. The tree is written by the pod, so each bounds what a pod
 // can make the daemon spend, and each fails closed: the walk stops with an
-// error before it changes anything past the bound. They are vars so a test can
-// lower them.
+// error at the bound. The entries it changed before the bound stay changed, a
+// partial state the caller's failed create discards; nothing at or past the
+// bound is changed. They are vars so a test can lower them.
 var (
 	// maxFSGroupDepth is how many directories deep the walk goes below root.
 	// The by-path walk this replaced stopped at PATH_MAX, about half as deep.
 	maxFSGroupDepth = 1024
-	// maxFSGroupEntries is how many entries the walk examines in all.
+	// maxFSGroupEntries is how many entries the walk examines in all, plus
+	// how many directory levels it re-opens to get back to a directory whose
+	// ancestors it had to close (see maxFSGroupHeldDirs). Each of either costs
+	// a bounded number of system calls, so the walk makes at most a few times
+	// this many, whatever the tree's shape.
 	maxFSGroupEntries = 8 << 20
 	// maxFSGroupPendingBytes bounds the memory held for directories that have
 	// been changed and are waiting to be listed: each is charged
-	// fsGroupNodeCost plus the length of its name. 128 MB is about 1.3 million
-	// waiting directories with short names, or half a million with names of
-	// the maximum length.
+	// fsGroupNodeCost plus the length of its name. 128 MiB is about 1.38
+	// million waiting directories with one-byte names (128 MiB / 97), or about
+	// 382 thousand with names of the maximum length (128 MiB / (96 + 255)).
 	maxFSGroupPendingBytes = 128 << 20
 	// maxFSGroupHeldDirs is how many directory descriptors the walk keeps
 	// open: the directories on the way to the one being listed, the deepest
-	// ones when the tree is deeper than this.
+	// ones when the tree is deeper than this. A directory closed this way is
+	// re-opened, level by level from the deepest held ancestor, when the walk
+	// comes back below it, and each level is charged to maxFSGroupEntries.
 	maxFSGroupHeldDirs = 32
 )
 
@@ -106,6 +115,9 @@ var (
 	// fsGroupOnPathBuild runs each time the walk builds a directory's path
 	// from its nodes, which costs time in proportion to its depth.
 	fsGroupOnPathBuild func()
+	// fsGroupOnReopen runs each time the walk re-opens a directory level it
+	// had closed, before the open.
+	fsGroupOnReopen func()
 )
 
 // FSGroupReport says what a walk did not change, and why. A skipped entry is
@@ -118,7 +130,8 @@ type FSGroupReport struct {
 	// hard link.
 	MultiLink int
 	// Special counts sockets, device nodes and anything else the walk does
-	// not open.
+	// not open, which includes symlinks on a system that cannot open a link
+	// as itself.
 	Special int
 	// OtherDevice counts directories on a different device from root: a
 	// mount point, which the walk does not cross.
@@ -127,8 +140,9 @@ type FSGroupReport struct {
 	// (it has no read permission on them, which cannot happen to root).
 	Unopenable int
 	// Vanished counts entries that were gone when the walk reached them,
-	// and directories that were gone when their turn to be listed came. What
-	// lay below such a directory was not changed.
+	// and directories below root that were gone when their turn to be listed
+	// came. What lay below such a directory was not changed. Root itself
+	// being gone is an error, not a count.
 	Vanished int
 	// SetID counts files with the setuid or setgid bit. They get the group
 	// and the owner's read and execute bits, and are not made group-writable:
@@ -155,11 +169,17 @@ func (r *FSGroupReport) note(counter *int, reason string, path func() string) {
 	if len(r.Examples) >= fsGroupReportExamples {
 		return
 	}
-	ex := reason + ": " + path()
-	if len(ex) > fsGroupExampleMax {
-		ex = ex[:fsGroupExampleMax-3] + "..."
+	r.Examples = append(r.Examples, fsGroupClip(reason+": "+path()))
+}
+
+// fsGroupClip cuts s to fsGroupExampleMax bytes. Every path the walk puts in
+// an example or an error goes through it: the paths are the pod's to choose,
+// and both end up in the daemon's log.
+func fsGroupClip(s string) string {
+	if len(s) > fsGroupExampleMax {
+		return s[:fsGroupExampleMax-3] + "..."
 	}
-	r.Examples = append(r.Examples, ex)
+	return s
 }
 
 // ChownForFSGroup recursively sets group ownership of root to gid and makes it
@@ -190,7 +210,14 @@ func (r *FSGroupReport) note(counter *int, reason string, path func() string) {
 // The tree is the pod's, and the walk trusts nothing in it. A pod can replace
 // its rootfs, or any directory or file under it, with a symlink or with a hard
 // link to a file elsewhere, and a process of an earlier instance of the pod can
-// still be running while the next one is created. So:
+// still be running while the next one is created. What the walk guarantees is
+// that everything it changes is an inode that had a name in the tree when the
+// walk opened it (and, for a file, no other name). It does not cover an inode
+// renamed into the tree from outside it (rename-in: the sandbox profile is what
+// keeps a pod from reaching files outside its tree to move them in), nor a
+// subtree the walk holds open that is renamed out of the tree while it is held
+// (the walk goes on inside it; the pod can only move its own directories, and
+// only to where it can write). So:
 //
 //   - Nothing below bound is resolved by path. bound is opened without
 //     following a link, and every directory from there down is opened with
@@ -218,10 +245,11 @@ func (r *FSGroupReport) note(counter *int, reason string, path func() string) {
 //   - An entry that is no longer the kind of file it was listed as stops the
 //     walk (ErrFSGroupEntryChanged), and so does a listed directory that
 //     cannot be opened as one, or that is a different directory when its turn
-//     to be listed comes. An entry or a waiting directory that is gone by
-//     then is passed over and counted (FSGroupReport.Vanished): nothing is
-//     changed by not changing it, and the report says a subtree may have been
-//     left as it was.
+//     to be listed comes, and so does root being gone before it is listed. An
+//     entry or a waiting directory below root that is gone by then is passed
+//     over and counted (FSGroupReport.Vanished): nothing is changed by not
+//     changing it, and the report says a subtree may have been left as it
+//     was.
 //
 // What the walk gives each kind of entry it does change is what the by-path
 // walk gave a tree nobody was rearranging:
@@ -237,7 +265,7 @@ func (r *FSGroupReport) note(counter *int, reason string, path func() string) {
 //     mode change, and the walk does not go through it. A root that is itself
 //     a symlink is handled the same way and nothing below its target is
 //     touched. On a system that cannot open a symlink as itself, links are
-//     left alone;
+//     left alone and counted in FSGroupReport.Special;
 //   - the special bits an entry has once its group is set are kept: the
 //     sticky bit always, and setuid and setgid unless the chown cleared them,
 //     which it does for a caller that is not root.
@@ -249,30 +277,30 @@ func (r *FSGroupReport) note(counter *int, reason string, path func() string) {
 //
 // The walk is bounded (see maxFSGroupDepth and the bounds beside it), keeps at
 // most maxFSGroupHeldDirs directories open however deep the tree is, and
-// looks at ctx at every directory and every fsGroupContextEvery entries. It
-// has no time bound of its own; the context is the caller's. The first error
-// stops it. A gid <= 0 is
-// rejected: 0 (wheel) is never a valid fsGroup target and a negative gid is a
-// programming error.
+// looks at ctx at every directory, every fsGroupContextEvery entries and every
+// directory level it re-opens. It has no time bound of its own; the context is
+// the caller's. The first error stops it, and the paths in errors are cut to
+// fsGroupExampleMax bytes. A gid <= 0 is rejected: 0 (wheel) is never a valid
+// fsGroup target and a negative gid is a programming error.
 func ChownForFSGroup(ctx context.Context, bound, root string, gid int) (FSGroupReport, error) {
 	var rep FSGroupReport
 	if gid <= 0 {
 		return rep, fmt.Errorf("fsGroup chown: invalid gid %d", gid)
 	}
 	if !strictlyUnder(root, bound) {
-		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, root, bound)
+		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, fsGroupClip(root), fsGroupClip(bound))
 	}
 	bound, root = filepath.Clean(bound), filepath.Clean(root)
 	rel, err := filepath.Rel(bound, root)
 	if err != nil {
-		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, root, bound)
+		return rep, fmt.Errorf("%w: %q is not inside %q", ErrFSGroupRootUnbounded, fsGroupClip(root), fsGroupClip(bound))
 	}
 	comps := strings.Split(rel, string(filepath.Separator))
 
 	// The directory holding root, reached from bound one component at a time.
 	parent, err := unix.Open(bound, fsGroupDirFlags, 0)
 	if err != nil {
-		return rep, fmt.Errorf("fsGroup chown: open %s: %w", bound, err)
+		return rep, fmt.Errorf("fsGroup chown: open %s: %w", fsGroupClip(bound), err)
 	}
 	defer func() { unix.Close(parent) }()
 	at := bound
@@ -280,13 +308,13 @@ func ChownForFSGroup(ctx context.Context, bound, root string, gid int) (FSGroupR
 		at = filepath.Join(at, c)
 		next, err := unix.Openat(parent, c, fsGroupDirFlags, 0)
 		if err != nil {
-			return rep, fmt.Errorf("fsGroup chown: open %s: %w", at, err)
+			return rep, fmt.Errorf("fsGroup chown: open %s: %w", fsGroupClip(at), err)
 		}
 		unix.Close(parent)
 		parent = next
 	}
 
-	w := &fsGroupWalk{ctx: ctx, gid: gid, root: root, rep: &rep}
+	w := &fsGroupWalk{ctx: ctx, gid: gid, root: root, rootMsg: fsGroupClip(root), rep: &rep}
 	defer w.closeHeld()
 	rootNode, err := w.apply(parent, comps[len(comps)-1], nil, func() string { return root })
 	if err != nil || rootNode == nil {
@@ -308,23 +336,23 @@ type fsGroupNode struct {
 // cost is what the node is charged against maxFSGroupPendingBytes.
 func (n *fsGroupNode) cost() int { return fsGroupNodeCost + len(n.name) }
 
-// path is the node's path, for messages. It costs time in proportion to the
-// node's depth, so the walk builds one only for an error it is about to
-// return, a kept example or a test seam, and at most once per directory
-// listing.
+// path is the node's path, for messages, cut to fsGroupExampleMax bytes. It
+// costs time in proportion to the node's depth, so the walk builds one only
+// for an error it is about to return, a kept example or a test seam, and at
+// most once per directory listing.
 func (n *fsGroupNode) path(root string) string {
 	if fsGroupOnPathBuild != nil {
 		fsGroupOnPathBuild()
 	}
 	if n == nil || n.parent == nil {
-		return root
+		return fsGroupClip(root)
 	}
 	names := make([]string, n.depth+1)
 	names[0] = root
 	for m := n; m.parent != nil; m = m.parent {
 		names[m.depth] = m.name
 	}
-	return strings.Join(names, string(filepath.Separator))
+	return fsGroupClip(strings.Join(names, string(filepath.Separator)))
 }
 
 // fsGroupHeld is one directory the walk keeps open.
@@ -335,9 +363,11 @@ type fsGroupHeld struct {
 
 // fsGroupWalk is the state of one walk.
 type fsGroupWalk struct {
-	ctx     context.Context
-	gid     int
-	root    string
+	ctx  context.Context
+	gid  int
+	root string
+	// rootMsg is root cut for messages.
+	rootMsg string
 	rep     *FSGroupReport
 	rootDev uint64
 	rootSet bool
@@ -350,8 +380,13 @@ type fsGroupWalk struct {
 	// held is the chain of open directories from root (held[0], always
 	// kept) towards the directory being listed, shallowest first. When the
 	// chain is longer than maxFSGroupHeldDirs the shallowest below root are
-	// closed, and re-opened from root if the walk comes back to them.
+	// closed, and re-opened from the deepest held ancestor if the walk comes
+	// back below them.
 	held []fsGroupHeld
+	// chain is hold's buffer, reused for every directory: chain[d] is the
+	// ancestor at depth d of the directory being held. It grows to the
+	// deepest directory listed, at most maxFSGroupDepth+1 entries.
+	chain []*fsGroupNode
 }
 
 func (w *fsGroupWalk) closeHeld() {
@@ -363,7 +398,7 @@ func (w *fsGroupWalk) closeHeld() {
 
 func (w *fsGroupWalk) ctxErr() error {
 	if err := w.ctx.Err(); err != nil {
-		return fmt.Errorf("fsGroup chown %s: %w", w.root, err)
+		return fmt.Errorf("fsGroup chown %s: %w", w.rootMsg, err)
 	}
 	return nil
 }
@@ -376,9 +411,9 @@ func (w *fsGroupWalk) walk(rootParent int, rootName string, rootNode *fsGroupNod
 		return err
 	}
 	if fd < 0 {
-		// Root went away between being changed and being listed.
-		w.rep.note(&w.rep.Vanished, "gone before it was listed", func() string { return w.root })
-		return nil
+		// Root went away between being changed and being listed: nothing
+		// below it was changed, and the caller must not take the tree as done.
+		return fmt.Errorf("%w: %s is gone before it was listed", ErrFSGroupEntryChanged, w.rootMsg)
 	}
 	w.held = append(w.held, fsGroupHeld{node: rootNode, fd: fd})
 
@@ -473,12 +508,17 @@ func (w *fsGroupWalk) list(fd int, dir *fsGroupNode) (bool, error) {
 
 // hold returns an open descriptor for dir, which stays owned by the walk. It
 // keeps the directories on the way to dir open and closes the ones that are
-// not on that way. A directory that has to be re-opened is checked against the
+// not on that way. The levels between the deepest held ancestor and dir are
+// opened one at a time from that ancestor; every one of them but dir itself
+// was open before and is a re-open, charged against maxFSGroupEntries, with
+// ctx looked at before it. A directory opened here is checked against the
 // device and inode recorded when it was changed. It returns -1 when dir, or a
 // directory above it that had to be re-opened, is gone.
 func (w *fsGroupWalk) hold(dir *fsGroupNode) (int, error) {
-	// chain[d] is dir's ancestor at depth d; chain[dir.depth] is dir.
-	chain := make([]*fsGroupNode, dir.depth+1)
+	if cap(w.chain) < dir.depth+1 {
+		w.chain = make([]*fsGroupNode, dir.depth+1, 2*dir.depth+2)
+	}
+	chain := w.chain[:dir.depth+1]
 	for n := dir; n != nil; n = n.parent {
 		chain[n.depth] = n
 	}
@@ -494,6 +534,19 @@ func (w *fsGroupWalk) hold(dir *fsGroupNode) (int, error) {
 	w.held = w.held[:keep]
 	last := w.held[len(w.held)-1]
 	for d := last.node.depth + 1; d <= dir.depth; d++ {
+		if d < dir.depth {
+			w.entries++
+			if w.entries > maxFSGroupEntries {
+				return -1, fmt.Errorf("%w: more than %d entries and re-opened directories under %s",
+					ErrFSGroupTreeTooLarge, maxFSGroupEntries, w.rootMsg)
+			}
+			if fsGroupOnReopen != nil {
+				fsGroupOnReopen()
+			}
+			if err := w.ctxErr(); err != nil {
+				return -1, err
+			}
+		}
 		fd, err := w.openNode(last.fd, chain[d].name, chain[d])
 		if err != nil {
 			return -1, err
@@ -510,6 +563,7 @@ func (w *fsGroupWalk) hold(dir *fsGroupNode) (int, error) {
 		last = fsGroupHeld{node: chain[d], fd: fd}
 		w.held = append(w.held, last)
 	}
+	clear(chain)
 	return last.fd, nil
 }
 
@@ -548,7 +602,8 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 	}
 	w.entries++
 	if w.entries > maxFSGroupEntries {
-		return nil, fmt.Errorf("%w: more than %d entries under %s", ErrFSGroupTreeTooLarge, maxFSGroupEntries, w.root)
+		return nil, fmt.Errorf("%w: more than %d entries and re-opened directories under %s",
+			ErrFSGroupTreeTooLarge, maxFSGroupEntries, w.rootMsg)
 	}
 	var st unix.Stat_t
 	if err := unix.Fstatat(parent, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
@@ -556,7 +611,7 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 			w.rep.note(&w.rep.Vanished, "gone before it was changed", path)
 			return nil, nil
 		}
-		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+		return nil, fmt.Errorf("fsGroup chown %s: %w", fsGroupClip(path()), err)
 	}
 	kind := uint32(st.Mode) & unix.S_IFMT
 	if kind == unix.S_IFDIR {
@@ -564,11 +619,11 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 		// directory past either is not changed.
 		if node.depth > maxFSGroupDepth {
 			return nil, fmt.Errorf("%w: %s nests more than %d directories below %s",
-				ErrFSGroupTreeTooDeep, path(), maxFSGroupDepth, w.root)
+				ErrFSGroupTreeTooDeep, fsGroupClip(path()), maxFSGroupDepth, w.rootMsg)
 		}
 		if w.pendingBytes+node.cost() > maxFSGroupPendingBytes {
 			return nil, fmt.Errorf("%w: the directories waiting to be listed under %s need more than %d bytes",
-				ErrFSGroupTreeTooLarge, w.root, maxFSGroupPendingBytes)
+				ErrFSGroupTreeTooLarge, w.rootMsg, maxFSGroupPendingBytes)
 		}
 	}
 	if fsGroupBeforeApply != nil {
@@ -583,6 +638,7 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 		flags = fsGroupFileFlags
 	case unix.S_IFLNK:
 		if !fsGroupCanOpenLinks {
+			w.rep.note(&w.rep.Special, "a symlink, which this system cannot open as itself", path)
 			return nil, nil
 		}
 		flags = fsGroupLinkFlags
@@ -600,19 +656,19 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 		w.rep.note(&w.rep.Unopenable, "not readable by the daemon", path)
 		return nil, nil
 	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
-		return nil, fmt.Errorf("%w: open %s: %v", ErrFSGroupEntryChanged, path(), err)
+		return nil, fmt.Errorf("%w: open %s: %v", ErrFSGroupEntryChanged, fsGroupClip(path()), err)
 	default:
-		return nil, fmt.Errorf("fsGroup chown: open %s: %w", path(), err)
+		return nil, fmt.Errorf("fsGroup chown: open %s: %w", fsGroupClip(path()), err)
 	}
 	defer unix.Close(fd)
 
 	// From here on only the descriptor is used: what was opened is what is
 	// examined and what is changed.
 	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+		return nil, fmt.Errorf("fsGroup chown %s: %w", fsGroupClip(path()), err)
 	}
 	if uint32(st.Mode)&unix.S_IFMT != kind {
-		return nil, fmt.Errorf("%w: %s changed kind while it was being walked", ErrFSGroupEntryChanged, path())
+		return nil, fmt.Errorf("%w: %s changed kind while it was being walked", ErrFSGroupEntryChanged, fsGroupClip(path()))
 	}
 	if kind == unix.S_IFDIR {
 		if !w.rootSet {
@@ -626,10 +682,10 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 		return nil, nil
 	}
 	if err := unix.Fchown(fd, -1, w.gid); err != nil {
-		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+		return nil, fmt.Errorf("fsGroup chown %s: %w", fsGroupClip(path()), err)
 	}
-	w.rep.Changed++
 	if kind == unix.S_IFLNK {
+		w.rep.Changed++
 		return nil, nil // a symlink's mode is meaningless
 	}
 	if fsGroupBeforeChmod != nil {
@@ -639,15 +695,16 @@ func (w *fsGroupWalk) apply(parent int, name string, dir *fsGroupNode, path func
 	// by an unprivileged caller clears setuid and setgid, and the walk must
 	// not put them back.
 	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, fmt.Errorf("fsGroup chown %s: %w", path(), err)
+		return nil, fmt.Errorf("fsGroup chown %s: %w", fsGroupClip(path()), err)
 	}
 	mode, withheld := fsGroupMode(uint32(st.Mode), kind == unix.S_IFDIR)
 	if withheld {
 		w.rep.note(&w.rep.SetID, "setuid or setgid, not made group-writable", path)
 	}
 	if err := unix.Fchmod(fd, mode); err != nil {
-		return nil, fmt.Errorf("fsGroup chmod %s: %w", path(), err)
+		return nil, fmt.Errorf("fsGroup chmod %s: %w", fsGroupClip(path()), err)
 	}
+	w.rep.Changed++
 	if kind != unix.S_IFDIR {
 		return nil, nil
 	}

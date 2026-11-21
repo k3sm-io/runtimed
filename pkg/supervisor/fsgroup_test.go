@@ -822,9 +822,10 @@ func changedCount(t *testing.T, root string) int {
 }
 
 // TestFSGroupWalkBoundsFailClosed: a tree past the depth bound, the entry
-// budget or the pending-directory budget stops the walk with its own error,
-// and nothing past the bound is changed. A tree exactly at each bound is
-// walked.
+// budget or the pending-directory budget stops the walk with its own error.
+// The entries before the bound stay changed (a partial state the failed create
+// discards) and nothing at or past it is changed. A tree exactly at each bound
+// is walked.
 func TestFSGroupWalkBoundsFailClosed(t *testing.T) {
 	chain := func(t *testing.T, levels int) (podDir, root string) {
 		podDir = t.TempDir()
@@ -1356,5 +1357,148 @@ func TestFSGroupWalkSkipCostIsBounded(t *testing.T) {
 		if len(ex) > fsGroupExampleMax {
 			t.Errorf("an example is %d bytes, want at most %d", len(ex), fsGroupExampleMax)
 		}
+	}
+}
+
+// reopenTree builds a spine of spine directories below root and, at each
+// level of it, a side branch side directories deep. With
+// maxFSGroupHeldDirs lowered below side, whichever of a level's two children
+// the walk lists first, it closes ancestors of the other on the way down and
+// has to re-open them to come back: re-opens happen whatever order the
+// directory is read in. It returns the number of entries in the tree.
+func reopenTree(t *testing.T, root string, spine, side int) int {
+	t.Helper()
+	p := root
+	for i := 0; i < spine; i++ {
+		p = filepath.Join(p, "s")
+		q := filepath.Join(p, "b")
+		for j := 1; j < side; j++ {
+			q = filepath.Join(q, "b")
+		}
+		if err := os.MkdirAll(q, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return 1 + spine + spine*side
+}
+
+// TestFSGroupWalkReopenCostIsCharged: getting back to a directory whose
+// ancestors the walk closed costs one open per level it re-opens, and each of
+// those is charged to the same budget as the entries. Counted through the
+// walk's seam on a deep spine with side branches: the walk finishes with the
+// budget at exactly entries + re-opens, and stops with ErrFSGroupTreeTooLarge
+// one below it.
+func TestFSGroupWalkReopenCostIsCharged(t *testing.T) {
+	lowerFSGroupBound(t, &maxFSGroupHeldDirs, 4)
+	const spine, side = 30, 6
+	reopens := 0
+	fsGroupOnReopen = func() { reopens++ }
+	t.Cleanup(func() { fsGroupOnReopen = nil })
+
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	entries := reopenTree(t, root, spine, side)
+	gid := fsGroupTestGid(t, root)
+	rep, err := walkFSGroup(podDir, root, gid)
+	if err != nil {
+		t.Fatalf("ChownForFSGroup: %v", err)
+	}
+	if rep.Changed != entries {
+		t.Fatalf("changed %d entries, want %d", rep.Changed, entries)
+	}
+	if reopens == 0 {
+		t.Fatal("the walk re-opened nothing; the tree does not exercise the case")
+	}
+	// Each listed directory re-opens at most the levels between root and
+	// it, and the walk charges all of them: the walk costs at most
+	// maxFSGroupEntries opens of either kind.
+	if most := spine * (spine + side) * 2; reopens > most {
+		t.Errorf("the walk re-opened %d levels, want at most %d", reopens, most)
+	}
+	t.Logf("%d entries, %d re-opened levels", entries, reopens)
+	budget := entries + reopens
+
+	t.Run("at the budget", func(t *testing.T) {
+		lowerFSGroupBound(t, &maxFSGroupEntries, budget)
+		podDir := t.TempDir()
+		root := filepath.Join(podDir, "rootfs")
+		reopenTree(t, root, spine, side)
+		if _, err := walkFSGroup(podDir, root, gid); err != nil {
+			t.Errorf("the walk with the budget at entries + re-opens (%d): %v", budget, err)
+		}
+	})
+	t.Run("one below it", func(t *testing.T) {
+		lowerFSGroupBound(t, &maxFSGroupEntries, budget-1)
+		podDir := t.TempDir()
+		root := filepath.Join(podDir, "rootfs")
+		reopenTree(t, root, spine, side)
+		base := openDescriptors(t)
+		if _, err := walkFSGroup(podDir, root, gid); !errors.Is(err, ErrFSGroupTreeTooLarge) {
+			t.Errorf("the walk with the budget one below entries + re-opens = %v, want ErrFSGroupTreeTooLarge", err)
+		}
+		if after := openDescriptors(t); after != base {
+			t.Errorf("descriptors after = %d, before = %d", after, base)
+		}
+	})
+	t.Run("a context ended during re-opens", func(t *testing.T) {
+		podDir := t.TempDir()
+		root := filepath.Join(podDir, "rootfs")
+		reopenTree(t, root, spine, side)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		fsGroupOnReopen = cancel
+		if _, err := ChownForFSGroup(ctx, podDir, root, gid); !errors.Is(err, context.Canceled) {
+			t.Errorf("the walk cancelled at its first re-open = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// TestFSGroupWalkRootGoneIsAnError: root removed after the walk changed it and
+// before it was listed is an error, not a count: the create must not go on
+// with nothing below root changed.
+func TestFSGroupWalkRootGoneIsAnError(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	if err := os.MkdirAll(filepath.Join(root, "a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gid := fsGroupTestGid(t, root)
+	removed := false
+	setFSGroupHooks(t, nil, func(path string) {
+		if path == root && !removed {
+			removed = os.RemoveAll(root) == nil
+		}
+	})
+	_, err := walkFSGroup(podDir, root, gid)
+	if !removed {
+		t.Fatal("the removal did not run; the test did not exercise the case")
+	}
+	if !errors.Is(err, ErrFSGroupEntryChanged) {
+		t.Errorf("the walk over a root removed before it was listed = %v, want ErrFSGroupEntryChanged", err)
+	}
+}
+
+// TestFSGroupWalkClipsErrorPaths: the path in an error is cut the way an
+// example is: the pod chooses it, and it is logged.
+func TestFSGroupWalkClipsErrorPaths(t *testing.T) {
+	podDir := t.TempDir()
+	root := filepath.Join(podDir, "rootfs")
+	long := strings.Repeat("n", 200)
+	deep := filepath.Join(root, long, long, long)
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gid := fsGroupTestGid(t, root)
+	lowerFSGroupBound(t, &maxFSGroupDepth, 2)
+	_, err := walkFSGroup(podDir, root, gid)
+	if !errors.Is(err, ErrFSGroupTreeTooDeep) {
+		t.Fatalf("the walk = %v, want ErrFSGroupTreeTooDeep", err)
+	}
+	// The message holds the clipped path, the clipped root and its own words.
+	if most := 2*fsGroupExampleMax + 100; len(err.Error()) > most {
+		t.Errorf("the error is %d bytes, want at most %d: %.80q...", len(err.Error()), most, err.Error())
+	}
+	if strings.Contains(err.Error(), deep) {
+		t.Error("the error carries the whole path")
 	}
 }
