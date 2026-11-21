@@ -54,6 +54,37 @@ limitations under the License.
 // when under 20% of its lifetime remains. A failed resolve or render leaves the
 // live generation in place.
 //
+// # Writes into the pod tree go through descriptors
+//
+// The pod owns every directory below its data volume and can rename one away
+// and plant a symlink, or a file, in its place at any time, including between
+// Materialize and a Refresh (a process of an earlier instance can do it before
+// Materialize). So a mount dir is opened from the data volume one component at
+// a time with O_NOFOLLOW|O_DIRECTORY (openUnder, pathsafe.OpenDirFrom), and a
+// component that is a symlink or not a directory fails the mount (at create)
+// or the volume's refresh. Every step of the atomic writer — the generation
+// dir, the files rendered into it, the check of what was rendered, the ..data
+// flip, the key links, the removal of the old generation and of dropped keys,
+// and the re-read of a still-fresh token — then acts relative to that
+// descriptor or the generation's own: mkdirat, openat with O_CREAT|O_EXCL and
+// O_NOFOLLOW, fchmod, symlinkat, renameat, readlinkat, unlinkat and a
+// descriptor-relative tree removal (pathsafe.RemoveTreeAt). What a name means
+// after it was opened cannot redirect a write.
+//
+// An image volume's view link (LinkImageVolumes) is placed the same way.
+//
+// Still by path: the data volume itself (it lies in the pod dir, which the pod
+// cannot write), the subPath staging dir (a daemon-owned sibling of the data
+// volume), a vm pod's share roots and emptyDir share dirs (MaterializeShares
+// creates them under the pod dir after pathsafe.RefuseSymlinkedPath, a
+// pre-check; the proj volumes rendered into them go through descriptors), and
+// the subPath clone into its destination. The destination's
+// directories are created and checked through descriptors first, but the
+// clone (image.MaterializeTree for a directory, Cloner.Clone for a file) then
+// takes the path, so a pod process already running when the pod is created
+// could swap a component between the check and the clone. subPath mounts are
+// never refreshed, so this window exists at create only.
+//
 // # subPath
 //
 // A VolumeMount subPath selects a single element within the volume: the container

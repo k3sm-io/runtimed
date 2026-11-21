@@ -20,11 +20,16 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"k3sm.io/runtimed/pkg/pathsafe"
 )
 
 // The kubelet atomic-writer layout (pkg/volume/util/atomic_writer.go upstream).
@@ -43,83 +48,92 @@ const (
 	dataLink = "..data"
 	// dataLinkTmp is the fresh symlink renamed over dataLink to flip it.
 	dataLinkTmp = "..data_tmp"
-	// generationLayout is the time layout of a generation dir name; MkdirTemp
-	// appends a random numeric suffix, which makes every name unique.
+	// generationLayout is the time layout of a generation dir name;
+	// makeGeneration appends a random numeric suffix, retrying a name that
+	// exists, which makes every name unique.
 	generationLayout = "..2006_01_02_15_04_05."
 	// generationMode is a generation dir's mode: a pod that runs as a
 	// different uid must still traverse it.
 	generationMode os.FileMode = 0o755
 )
 
-// rename is os.Rename, a seam so a test can observe the flip.
-var rename = os.Rename
+// renameAt is unix.Renameat, a seam so a test can observe the flip.
+var renameAt = unix.Renameat
 
 // writeGeneration renders one generation of dir and makes it live. fill renders
 // the content into gen (a fresh, empty generation dir inside dir) and is handed
-// live, the current generation dir ("" if there is none).
+// live, the current generation dir (nil if there is none).
+//
+// dir is an open directory (dirTarget), reached from a directory the pod
+// cannot replace without following a link (openUnder). Every step below acts
+// relative to it, or to the generation's own descriptor, and never through a
+// path: a pod can rename any directory of its data volume away and plant a
+// symlink in its place, and a path through it would make the daemon create,
+// replace and remove entries wherever the link points.
 //
 // The steps, in order, and what each guarantees:
 //
 //  1. fill renders into a new generation dir. On any error the new dir is
 //     removed and the live generation is untouched.
 //  2. The new generation is checked (verifyGeneration): regular files and
-//     directories only, no top-level name starting "..", and it resolves under
-//     dir — the CVE-2021-25741 containment check, done before anything a
-//     reader can reach points at it.
+//     directories only, and no top-level name starting "..". It is walked
+//     through its descriptor, so what is checked is what was rendered — the
+//     CVE-2021-25741 containment check, done before anything a reader can
+//     reach points at it.
 //  3. A generation identical to the live one is discarded (no flip): a refresh
 //     of unchanged data changes nothing on disk.
-//  4. ..data is flipped by renaming a freshly created symlink over it — one
-//     rename(2), atomic for every reader.
+//  4. The generation's name must still be the directory that was rendered;
+//     then ..data is flipped by renaming a freshly created symlink over it —
+//     one rename(2), atomic for every reader.
 //  5. Missing top-level <key> -> ..data/<key> symlinks are created; one that
 //     already exists is left alone.
 //  6. The previous generation is removed, then any top-level symlink into
 //     ..data whose key no longer exists.
 //
 // It never writes into the live generation. flipped reports whether step 4 ran.
-func writeGeneration(dir string, fill func(gen, live string) error) (flipped bool, err error) {
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		return false, fmt.Errorf("stat mount dir: %w", err)
-	}
-	if !fi.IsDir() {
-		return false, fmt.Errorf("mount dir %s is not a directory", dir)
-	}
-
-	var live, oldGen string
-	if target, lerr := os.Readlink(filepath.Join(dir, dataLink)); lerr == nil {
+func writeGeneration(dir *dirTarget, fill func(gen, live *dirTarget) error) (flipped bool, err error) {
+	var live *dirTarget
+	var oldGen string
+	if target, lerr := readlinkAt(dir.fd, dataLink); lerr == nil {
 		if !isGenerationName(target) {
-			return false, fmt.Errorf("%s/%s points at %q, not a generation dir", dir, dataLink, target)
+			return false, fmt.Errorf("%s/%s points at %q, not a generation dir", dir.path, dataLink, target)
 		}
 		oldGen = target
-		live = filepath.Join(dir, target)
-	} else if !errors.Is(lerr, fs.ErrNotExist) {
-		return false, fmt.Errorf("read %s/%s: %w", dir, dataLink, lerr)
+		lfd, err := unix.Openat(dir.fd, target, pathsafe.DirFlags, 0)
+		if err != nil {
+			return false, fmt.Errorf("open live generation %s: %w", dir.join(target), err)
+		}
+		live = &dirTarget{fd: lfd, path: dir.join(target)}
+		defer live.close()
+	} else if !errors.Is(lerr, unix.ENOENT) {
+		return false, fmt.Errorf("read %s/%s: %w", dir.path, dataLink, lerr)
 	}
 
-	gen, err := os.MkdirTemp(dir, time.Now().UTC().Format(generationLayout))
+	genName, gen, err := makeGeneration(dir)
 	if err != nil {
-		return false, fmt.Errorf("create generation dir: %w", err)
+		return false, err
 	}
+	defer gen.close()
 	keep := false
 	defer func() {
 		if !keep {
-			if rmErr := os.RemoveAll(gen); rmErr != nil && err == nil {
-				err = fmt.Errorf("remove discarded generation %s: %w", gen, rmErr)
+			if rmErr := pathsafe.RemoveTreeAt(dir.fd, genName); rmErr != nil && err == nil {
+				err = fmt.Errorf("remove discarded generation %s: %w", gen.path, rmErr)
 			}
 		}
 	}()
-	if err := os.Chmod(gen, generationMode); err != nil {
+	if err := unix.Fchmod(gen.fd, uint32(generationMode)); err != nil {
 		return false, fmt.Errorf("chmod generation dir: %w", err)
 	}
 
 	if err := fill(gen, live); err != nil {
 		return false, err
 	}
-	keys, err := verifyGeneration(dir, gen)
+	keys, err := verifyGeneration(gen)
 	if err != nil {
 		return false, err
 	}
-	if live != "" {
+	if live != nil {
 		same, err := sameTree(live, gen)
 		if err != nil {
 			return false, err
@@ -129,17 +143,20 @@ func writeGeneration(dir string, fill func(gen, live string) error) (flipped boo
 		}
 	}
 
-	// Flip ..data: one rename of a fresh symlink over the old one.
-	tmp := filepath.Join(dir, dataLinkTmp)
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return false, fmt.Errorf("clear %s: %w", tmp, err)
+	// Flip ..data: one rename of a fresh symlink over the old one, to a name
+	// that is still the directory rendered and verified above.
+	if !sameEntry(dir.fd, genName, gen.fd) {
+		return false, fmt.Errorf("generation %s is no longer the directory that was rendered", gen.path)
 	}
-	if err := os.Symlink(filepath.Base(gen), tmp); err != nil {
-		return false, fmt.Errorf("create %s: %w", tmp, err)
+	if err := unix.Unlinkat(dir.fd, dataLinkTmp, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return false, fmt.Errorf("clear %s: %w", dir.join(dataLinkTmp), err)
 	}
-	if err := rename(tmp, filepath.Join(dir, dataLink)); err != nil {
-		_ = os.Remove(tmp) // best effort; the next write clears it too
-		return false, fmt.Errorf("flip %s/%s: %w", dir, dataLink, err)
+	if err := unix.Symlinkat(genName, dir.fd, dataLinkTmp); err != nil {
+		return false, fmt.Errorf("create %s: %w", dir.join(dataLinkTmp), err)
+	}
+	if err := renameAt(dir.fd, dataLinkTmp, dir.fd, dataLink); err != nil {
+		_ = unix.Unlinkat(dir.fd, dataLinkTmp, 0) // best effort; the next write clears it too
+		return false, fmt.Errorf("flip %s/%s: %w", dir.path, dataLink, err)
 	}
 	keep = true
 
@@ -150,7 +167,7 @@ func writeGeneration(dir string, fill func(gen, live string) error) (flipped boo
 		}
 	}
 	if oldGen != "" {
-		if err := os.RemoveAll(filepath.Join(dir, oldGen)); err != nil {
+		if err := pathsafe.RemoveTreeAt(dir.fd, oldGen); err != nil {
 			errs = append(errs, fmt.Errorf("remove previous generation %s: %w", oldGen, err))
 		}
 	}
@@ -158,6 +175,31 @@ func writeGeneration(dir string, fill func(gen, live string) error) (flipped boo
 		errs = append(errs, err)
 	}
 	return true, errors.Join(errs...)
+}
+
+// makeGeneration creates a new, uniquely named generation dir in dir (0700
+// until the caller sets generationMode) and opens it without following a
+// link. Its name is generationLayout at the current time plus a random
+// suffix, as os.MkdirTemp names one.
+func makeGeneration(dir *dirTarget) (string, *dirTarget, error) {
+	prefix := time.Now().UTC().Format(generationLayout)
+	for try := 0; try < 10000; try++ {
+		name := prefix + strconv.FormatUint(uint64(rand.Uint32()), 10)
+		err := unix.Mkdirat(dir.fd, name, 0o700)
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		if err != nil {
+			return "", nil, fmt.Errorf("create generation dir: %w", err)
+		}
+		fd, err := unix.Openat(dir.fd, name, pathsafe.DirFlags, 0)
+		if err != nil {
+			_ = pathsafe.RemoveTreeAt(dir.fd, name)
+			return "", nil, fmt.Errorf("open generation dir %s: %w", dir.join(name), err)
+		}
+		return name, &dirTarget{fd: fd, path: dir.join(name)}, nil
+	}
+	return "", nil, fmt.Errorf("create generation dir in %s: no free name", dir.path)
 }
 
 // isGenerationName reports whether name is a single path component shaped like
@@ -172,33 +214,14 @@ func isGenerationName(name string) bool {
 // directory — a render writes key->bytes only, so a symlink here is either a
 // bug or an attack, and refusing it closes the CVE-2021-25741 class (a link
 // resolved against the host root, k3sm having no mount namespace). No top-level
-// name may start with "..", the namespace the layout itself uses. And the
-// generation, resolved, must sit under the resolved mount dir.
-func verifyGeneration(dir, gen string) (map[string]struct{}, error) {
-	dirResolved, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve mount dir: %w", err)
-	}
-	genResolved, err := filepath.EvalSymlinks(gen)
-	if err != nil {
-		return nil, fmt.Errorf("resolve generation dir: %w", err)
-	}
-	if !IsStrictlyUnder(genResolved, dirResolved) {
-		return nil, fmt.Errorf("generation %s resolves outside mount dir %s", gen, dir)
-	}
+// name may start with "..", the namespace the layout itself uses. The walk goes
+// through gen's descriptor and never follows a link, so every entry it checks
+// is inside the generation that was rendered.
+func verifyGeneration(gen *dirTarget) (map[string]struct{}, error) {
 	keys := map[string]struct{}{}
-	err = filepath.WalkDir(gen, func(p string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if p == gen {
-			return nil
-		}
-		rel, rerr := filepath.Rel(gen, p)
-		if rerr != nil || !isUnder(p, gen) {
-			return fmt.Errorf("entry %s escapes the generation", p)
-		}
-		if !d.Type().IsRegular() && !d.IsDir() {
+	err := walkAt(gen, func(rel string, st *unix.Stat_t, _ int, _ string) error {
+		kind := uint32(st.Mode) & unix.S_IFMT
+		if kind != unix.S_IFREG && kind != unix.S_IFDIR {
 			return fmt.Errorf("entry %q is neither a regular file nor a directory", rel)
 		}
 		if !strings.ContainsRune(rel, filepath.Separator) {
@@ -218,22 +241,22 @@ func verifyGeneration(dir, gen string) (map[string]struct{}, error) {
 // linkKey makes <dir>/<key> the relative symlink ..data/<key>. An existing
 // correct link is kept; anything else at the name is replaced by renaming a
 // fresh link over it (a non-empty directory there fails the rename, and the
-// error is returned rather than the directory removed).
-func linkKey(dir, key string) error {
+// error is returned rather than the directory removed). Every name is
+// resolved relative to dir.
+func linkKey(dir *dirTarget, key string) error {
 	want := dataLink + string(filepath.Separator) + key
-	p := filepath.Join(dir, key)
-	if got, err := os.Readlink(p); err == nil && got == want {
+	if got, err := readlinkAt(dir.fd, key); err == nil && got == want {
 		return nil
 	}
-	tmp := filepath.Join(dir, "..tmp_"+key)
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("clear %s: %w", tmp, err)
+	tmp := "..tmp_" + key
+	if err := unix.Unlinkat(dir.fd, tmp, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("clear %s: %w", dir.join(tmp), err)
 	}
-	if err := os.Symlink(want, tmp); err != nil {
+	if err := unix.Symlinkat(want, dir.fd, tmp); err != nil {
 		return fmt.Errorf("create link for key %q: %w", key, err)
 	}
-	if err := rename(tmp, p); err != nil {
-		_ = os.Remove(tmp) // best effort; the next write clears it too
+	if err := renameAt(dir.fd, tmp, dir.fd, key); err != nil {
+		_ = unix.Unlinkat(dir.fd, tmp, 0) // best effort; the next write clears it too
 		return fmt.Errorf("link key %q: %w", key, err)
 	}
 	return nil
@@ -241,25 +264,24 @@ func linkKey(dir, key string) error {
 
 // pruneKeys removes every top-level symlink of dir that points into ..data but
 // whose key is not in keys (a key the new generation dropped).
-func pruneKeys(dir string, keys map[string]struct{}) error {
-	entries, err := os.ReadDir(dir)
+func pruneKeys(dir *dirTarget, keys map[string]struct{}) error {
+	names, err := listAt(dir.fd, dir.path)
 	if err != nil {
 		return fmt.Errorf("list mount dir: %w", err)
 	}
 	var errs []error
-	for _, e := range entries {
-		name := e.Name()
-		if strings.HasPrefix(name, "..") || e.Type()&fs.ModeSymlink == 0 {
+	for _, name := range names {
+		if strings.HasPrefix(name, "..") {
 			continue
 		}
 		if _, ok := keys[name]; ok {
 			continue
 		}
-		target, err := os.Readlink(filepath.Join(dir, name))
+		target, err := readlinkAt(dir.fd, name)
 		if err != nil || !strings.HasPrefix(target, dataLink+string(filepath.Separator)) {
-			continue
+			continue // not a symlink, or not one of ours
 		}
-		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		if err := unix.Unlinkat(dir.fd, name, 0); err != nil {
 			errs = append(errs, fmt.Errorf("remove stale key %q: %w", name, err))
 		}
 	}
@@ -275,7 +297,7 @@ func pruneKeys(dir string, keys map[string]struct{}) error {
 // the last rendered bytes in memory to compare against, would hold every pod's
 // Secret and token bytes in the daemon for the pod's lifetime. Projected volumes
 // are small, so the read is chosen over caching credential bytes.
-func sameTree(a, b string) (bool, error) {
+func sameTree(a, b *dirTarget) (bool, error) {
 	ta, err := snapshotTree(a)
 	if err != nil {
 		return false, err
@@ -302,28 +324,16 @@ type treeEntry struct {
 	data []byte
 }
 
-// snapshotTree reads every entry under root: its type+permission bits and, for
-// a regular file, its content.
-func snapshotTree(root string) (map[string]treeEntry, error) {
+// snapshotTree reads every entry under the open directory root: its
+// type+permission bits and, for a regular file, its content, each reached
+// relative to its parent's descriptor without following a link.
+func snapshotTree(root *dirTarget) (map[string]treeEntry, error) {
 	out := map[string]treeEntry{}
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if p == root {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return err
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		e := treeEntry{mode: info.Mode()}
-		if info.Mode().IsRegular() {
-			if e.data, err = os.ReadFile(p); err != nil {
+	err := walkAt(root, func(rel string, st *unix.Stat_t, parent int, name string) error {
+		e := treeEntry{mode: fileMode(st)}
+		if e.mode.IsRegular() {
+			var err error
+			if e.data, err = readFileAt(&dirTarget{fd: parent, path: filepath.Dir(root.join(rel))}, name); err != nil {
 				return err
 			}
 		}
@@ -331,7 +341,7 @@ func snapshotTree(root string) (map[string]treeEntry, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("read generation %s: %w", root, err)
+		return nil, fmt.Errorf("read generation %s: %w", root.path, err)
 	}
 	return out, nil
 }

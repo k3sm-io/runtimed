@@ -184,8 +184,20 @@ func Refresh(ctx context.Context, root string, box *runtimev1.PodBox, r Resolver
 			res.Volumes = append(res.Volumes, out)
 			continue
 		}
+		// The mount dir is opened from the data volume one component at a
+		// time without following a link, and refused when a component is a
+		// symlink or not a directory: between two refreshes the pod can
+		// rearrange every directory below its data volume.
+		dir, oerr := openUnder(root, pm.dest, false)
+		if oerr != nil {
+			out.Outcome, out.Err = RefreshFailed, oerr
+			errs = append(errs, fmt.Errorf("refresh volume %s: %w", pm.mount.GetName(), oerr))
+			res.Volumes = append(res.Volumes, out)
+			continue
+		}
 		rd := newRender(box, opts.PodIP, r, now, pm.dest, opts.State.Tokens)
-		_, flipped, gerr := rd.generation(ctx, pm)
+		_, flipped, gerr := rd.generation(ctx, pm, dir)
+		dir.close()
 		switch {
 		case gerr != nil && flipped:
 			// The flip happened; only post-flip housekeeping failed, so the new
