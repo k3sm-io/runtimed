@@ -87,35 +87,34 @@ func (c Credential) Validate(euid int) error {
 // keychain and sockets.
 const LoginUIDFloor = 501
 
-// ErrPodUIDRefused reports a pod credential whose process would end up at a uid
-// a pod may not hold: one in the login range (LoginUIDFloor and above), a
-// negative one, or uid 0 after a requested drop.
+// ErrPodUIDRefused reports a pod credential whose drop target a pod may not
+// hold: one in the login range (LoginUIDFloor and above), a negative one, or
+// uid 0 (a drop that leaves the process root).
 var ErrPodUIDRefused = errors.New("supervisor: pod uid refused")
 
-// FinalUID returns the uid the pod process holds after the launch sequence:
-// c.UID when a drop is requested, else euid, the identity it inherits.
-func (c Credential) FinalUID(euid int) int {
-	if c.Drop {
-		return c.UID
-	}
-	return euid
-}
-
-// CheckPodUID refuses, with ErrPodUIDRefused, a credential whose final uid
-// (FinalUID) is in the login range or negative, whatever the pod's runAsUser or
-// runAsGroup asked for, and a drop that leaves the process at uid 0 (a
-// runAsGroup with no runAsUser on a root daemon), which counts as no drop.
-// The runtime checks it before it wraps a command, and RunLaunchSequence and
+// CheckPodUID refuses, with ErrPodUIDRefused, a drop whose target uid is in the
+// login range or negative, whatever the pod's runAsUser or runAsGroup asked
+// for, and a drop that leaves the process at uid 0 (a runAsGroup with no
+// runAsUser on a root daemon), which counts as no drop.
+//
+// A credential with no drop is always allowed: the pod inherits the
+// daemon's own uid, root, the service user, or a rootless developer server's
+// login uid, and so holds nothing that uid does not already hold. Keeping a
+// pod off the keystore under a rootless server is the keystore listener's
+// rule (it starts only under the service uid), not this one. The runtime
+// checks a credential before it wraps a command, and RunLaunchSequence and
 // the resident shim's drop check it again in the process that drops.
-func (c Credential) CheckPodUID(euid int) error {
-	final := c.FinalUID(euid)
+func (c Credential) CheckPodUID() error {
+	if !c.Drop {
+		return nil
+	}
 	switch {
-	case c.Drop && final == 0:
+	case c.UID == 0:
 		return fmt.Errorf("%w: the drop leaves the process at uid 0", ErrPodUIDRefused)
-	case final < 0:
-		return fmt.Errorf("%w: uid %d is negative", ErrPodUIDRefused, final)
-	case final >= LoginUIDFloor:
-		return fmt.Errorf("%w: uid %d is in the login range (%d and above)", ErrPodUIDRefused, final, LoginUIDFloor)
+	case c.UID < 0:
+		return fmt.Errorf("%w: uid %d is negative", ErrPodUIDRefused, c.UID)
+	case c.UID >= LoginUIDFloor:
+		return fmt.Errorf("%w: uid %d is in the login range (%d and above)", ErrPodUIDRefused, c.UID, LoginUIDFloor)
 	}
 	return nil
 }
@@ -319,7 +318,7 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 	if err := cred.Validate(euid); err != nil {
 		return done, err
 	}
-	if err := cred.CheckPodUID(euid); err != nil {
+	if err := cred.CheckPodUID(); err != nil {
 		return done, err
 	}
 	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the

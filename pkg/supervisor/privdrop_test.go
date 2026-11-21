@@ -822,9 +822,10 @@ func normGroups(g []int) []int {
 }
 
 // TestRunLaunchSequenceRefusesPodUID pins the spawn-time half of the pod uid
-// refusal: a final uid of 501 or above (the drop target, or the inherited euid
-// when there is no drop), or uid 0 after a drop, fails before any step runs.
-// uid 250, the service user, is the control.
+// refusal: a drop target of 501 or above or below 0, or uid 0 after a drop,
+// fails before any step runs. With no drop the inherited euid is allowed,
+// whatever it is (a root daemon, a rootless one at a login uid). uid 250, the
+// service user, is the control.
 func TestRunLaunchSequenceRefusesPodUID(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -837,8 +838,9 @@ func TestRunLaunchSequenceRefusesPodUID(t *testing.T) {
 		{"drop to 2147483647", Credential{UID: 2147483647, GID: 20, Drop: true}, 0, true},
 		{"drop to a negative uid", Credential{UID: -1, GID: 20, Drop: true}, 0, true},
 		{"drop leaves uid 0", Credential{UID: 0, GID: 20, Drop: true}, 0, true},
-		{"no drop at euid 501", Credential{}, 501, true},
-		{"no drop at euid 2147483647", Credential{}, 2147483647, true},
+		{"no drop at euid 501 (rootless)", Credential{}, 501, false},
+		{"no drop at euid 2147483647", Credential{}, 2147483647, false},
+		{"no drop at euid 0 (root daemon)", Credential{}, 0, false},
 		{"drop to 250", Credential{UID: 250, GID: 250, Drop: true}, 0, false},
 		{"no drop at euid 250", Credential{}, 250, false},
 	} {

@@ -19,6 +19,7 @@ package runtime
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -185,11 +186,12 @@ func TestResolveRlimitPlan_UnknownTypeWarnsAndSkips(t *testing.T) {
 }
 
 // TestPodUIDInLoginRangeRefused pins the second keystore layer: a native pod
-// whose process would end at a uid of 501 or above is refused before the
-// command is wrapped, whichever field asked for the uid, and so is a drop that
+// whose drop target is a uid of 501 or above is refused before the command is
+// wrapped, whichever field asked for the uid, and so is a drop that
 // leaves the process at uid 0 (runAsGroup alone). uid 250, the service user,
-// is the control. The no-drop half (the daemon's own uid) is checked at spawn:
-// supervisor.TestRunLaunchSequenceRefusesPodUID.
+// is the control. The spawn-time half is
+// supervisor.TestRunLaunchSequenceRefusesPodUID. With no drop the inherited euid
+// is allowed, root and a rootless server's login uid alike.
 func TestPodUIDInLoginRangeRefused(t *testing.T) {
 	type src struct {
 		name string
@@ -237,9 +239,17 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 			}
 		})
 	}
-	t.Run("no drop is left to the spawn check", func(t *testing.T) {
-		if err := checkPodUID(resolveCredential(&runtimev1.PodBox{}, &runtimev1.Container{})); err != nil {
-			t.Errorf("no-drop credential: %v", err)
-		}
-	})
+	// No drop: the pod inherits the daemon's own uid, root or a rootless
+	// developer's login uid, and holds nothing that uid does not already hold.
+	for _, euid := range []int{501, 0, 250} {
+		t.Run(fmt.Sprintf("inherited euid %d allowed with no drop", euid), func(t *testing.T) {
+			cred := resolveCredential(&runtimev1.PodBox{}, &runtimev1.Container{})
+			if cred.Drop {
+				t.Fatalf("fixture: cred = %+v, want no drop", cred)
+			}
+			if err := cred.CheckPodUID(); err != nil {
+				t.Errorf("euid %d: %v", euid, err)
+			}
+		})
+	}
 }
