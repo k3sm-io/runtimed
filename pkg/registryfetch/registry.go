@@ -155,7 +155,37 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 	if err != nil {
 		return nil, nil, err
 	}
-	repo := r.Context()
+	split, err := g.originSplit(ctx, r.Context(), cred, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r, &http.Client{Transport: split, CheckRedirect: checkRedirect(g.PlainHTTP)}, nil
+}
+
+// OriginSplit returns the round tripper Session's client uses for repo: a
+// request whose scheme and host:port are repo's registry's goes through an
+// authenticating transport scoped to pull, and any other goes to the plain
+// Transport. A response from another origin reaches the caller without its
+// WWW-Authenticate challenges, so an authenticating layer a caller stacks on
+// top (go-containerregistry's remote package always adds one) cannot turn a
+// redirect target's 401 into a token request. Pass it to remote.WithTransport
+// without remote.WithAuth.
+//
+// Unlike Session's client, it also counts an http registry's own host over
+// https as the registry's origin. The remote package names a private, .local
+// or loopback registry http, pings https first and, when TLS answers,
+// rewrites its requests to https above this transport; Session's requests
+// are rewritten below it, so Session keeps the strict rule.
+func (g *Registry) OriginSplit(ctx context.Context, repo name.Repository, cred *Credential) (http.RoundTripper, error) {
+	return g.originSplit(ctx, repo, cred, true)
+}
+
+// originSplit is OriginSplit; upgrade says whether an http registry's host
+// over https is its origin too.
+func (g *Registry) originSplit(ctx context.Context, repo name.Repository, cred *Credential, upgrade bool) (http.RoundTripper, error) {
+	if g.Transport == nil {
+		return nil, ErrTransportRequired
+	}
 	newAuth := g.newAuth
 	if newAuth == nil {
 		newAuth = transport.NewWithContext
@@ -163,15 +193,18 @@ func (g *Registry) Session(ctx context.Context, ref string, cred *Credential) (n
 	rt, err := newAuth(ctx, repo.Registry, authenticator(cred), g.Transport,
 		[]string{repo.Scope(transport.PullScope)})
 	if err != nil {
-		return nil, nil, fmt.Errorf("registry auth: %w", bound(err))
+		return nil, fmt.Errorf("registry auth: %w", bound(err))
 	}
-	split := &hostSplit{
+	h := &hostSplit{
 		scheme: repo.Registry.Scheme(),
 		host:   canonicalHost(repo.Registry.Scheme(), repo.RegistryStr()),
 		auth:   rt,
 		plain:  g.Transport,
 	}
-	return r, &http.Client{Transport: split, CheckRedirect: checkRedirect(g.PlainHTTP)}, nil
+	if upgrade && h.scheme == "http" {
+		h.httpsHost = canonicalHost("https", repo.RegistryStr())
+	}
+	return h, nil
 }
 
 // maxRedirects is net/http's own default redirect limit.
@@ -196,7 +229,7 @@ func checkRedirect(plainHTTP bool) func(*http.Request, []*http.Request) error {
 		}
 		first := via[0].URL
 		fs, ts := strings.ToLower(first.Scheme), strings.ToLower(req.URL.Scheme)
-		if fs == "https" && ts == "http" && !plainHTTP {
+		if isDowngrade(fs, ts) && !plainHTTP {
 			// Scheme and host only: a redirect target's query can carry a
 			// presigned signature.
 			return fmt.Errorf("%w: to %s://%s", ErrRedirectDowngrade, req.URL.Scheme, req.URL.Host)
@@ -212,10 +245,19 @@ func checkRedirect(plainHTTP bool) func(*http.Request, []*http.Request) error {
 
 // hostSplit routes a request to auth when its scheme and host:port are the
 // registry's, and to plain otherwise, so the authenticating transport never
-// sees a request for another origin.
+// sees a request for another origin. A plain response loses its
+// WWW-Authenticate header, so no layer above can act on its challenge. A
+// plain http request for an https registry is refused with
+// ErrRedirectDowngrade: it can only be a redirect, and a client stacked on
+// top (go-containerregistry's remote package builds its own) has no
+// checkRedirect of Session's to refuse it first.
 type hostSplit struct {
 	scheme, host string
-	auth, plain  http.RoundTripper
+	// httpsHost, set only for an http registry, is its host:port over https
+	// (the https default port when the registry names none), which also
+	// counts as the registry's origin: an upgrade, never a downgrade.
+	httpsHost   string
+	auth, plain http.RoundTripper
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -224,7 +266,29 @@ func (h *hostSplit) RoundTrip(req *http.Request) (*http.Response, error) {
 	if scheme == h.scheme && canonicalHost(scheme, req.URL.Host) == h.host {
 		return h.auth.RoundTrip(req)
 	}
-	return h.plain.RoundTrip(req)
+	if h.httpsHost != "" && scheme == "https" && canonicalHost(scheme, req.URL.Host) == h.httpsHost {
+		return h.auth.RoundTrip(req)
+	}
+	if isDowngrade(h.scheme, scheme) {
+		// Scheme and host only, as checkRedirect: the query can carry a
+		// presigned signature.
+		if req.Body != nil {
+			_ = req.Body.Close() // a RoundTripper closes the body, even on error
+		}
+		return nil, fmt.Errorf("%w: to %s://%s", ErrRedirectDowngrade, req.URL.Scheme, req.URL.Host)
+	}
+	res, err := h.plain.RoundTrip(req)
+	if res != nil {
+		res.Header.Del("WWW-Authenticate")
+	}
+	return res, err
+}
+
+// isDowngrade reports whether a hop from scheme from to scheme to leaves
+// https for plain http; both are lower case. checkRedirect and hostSplit
+// share it so the rule has one home.
+func isDowngrade(from, to string) bool {
+	return from == "https" && to == "http"
 }
 
 // canonicalHost is host lower-cased with the scheme's default port filled in
