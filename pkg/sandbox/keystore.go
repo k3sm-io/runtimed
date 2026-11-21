@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"k3sm.io/runtimed/pkg/keystorepaths"
@@ -76,6 +77,10 @@ func keystorePrefixPattern(root string) string {
 	return "^" + regexp.QuoteMeta(root) + "/" + fold.String()
 }
 
+// keystoreStanzaHead is the first line of every keystore stanza; keystoreStanzaOf
+// finds the stanza in a rendered profile by it.
+const keystoreStanzaHead = ";; KEYSTORE: every data-root name beginning " + keystorepaths.DataRootPrefix + " and the whole\n"
+
 // keystoreDenyStanza renders the keystore denies for roots: file reads
 // (metadata included), every file write (create, unlink and rename among them), a
 // hard link (file-link, which file-write* does not cover),
@@ -83,32 +88,36 @@ func keystorePrefixPattern(root string) string {
 // that begins keystorepaths.DataRootPrefix and on the whole keystorepaths.RunDir tree, in
 // every keystoreForms spelling.
 //
-// Generate emits it as the LAST rule of the profile. Seatbelt is
+// Every profile producer emits it as its LAST rule: Generate after the pod
+// profile, ShimProfile again after the shim grant (keystoreStanzaOf). Seatbelt is
 // last-match-wins, so no allow anywhere in the profile (an extra path, a
-// volume, an exposure, a credential, a view, a host share) can re-open a
-// keystore path, whatever the validators let through.
+// volume, an exposure, a credential, a view, a host share, a shim grant) can
+// re-open a keystore path, whatever the validators let through.
+func keystoreDenyStanza(roots []string) string {
+	var forms []string
+	for _, root := range roots {
+		forms = append(forms, keystoreForms(root)...)
+	}
+	return renderKeystoreStanza(forms)
+}
+
+// renderKeystoreStanza renders the stanza for forms, the root spellings
+// keystoreForms returned, deduplicated in order.
 //
 // The regex is written raw, not through %q, for the reason writeXcodeHelperCarve
 // gives: Go quoting would double its escapes. The roots reaching it passed
 // checkDenyDir or are a validated work-dir, so they carry no quote.
-func keystoreDenyStanza(roots []string) string {
+func renderKeystoreStanza(forms []string) string {
+	forms = dedupeInOrder(forms)
 	var filters []string
-	for _, root := range roots {
-		for _, form := range keystoreForms(root) {
-			filters = append(filters,
-				"(regex #\""+keystorePrefixPattern(form)+"\")",
-				fmt.Sprintf("(subpath %q)", filepath.Join(form, keystorepaths.RunDir)),
-				fmt.Sprintf("(subpath %q)", filepath.Join(form, keystorepaths.SockDir)))
-		}
+	for _, form := range forms {
+		filters = append(filters,
+			"(regex #\""+keystorePrefixPattern(form)+"\")",
+			fmt.Sprintf("(subpath %q)", filepath.Join(form, keystorepaths.RunDir)),
+			fmt.Sprintf("(subpath %q)", filepath.Join(form, keystorepaths.SockDir)))
 	}
-	seen := make(map[string]bool, len(filters))
-	filters = slices.DeleteFunc(filters, func(f string) bool {
-		dup := seen[f]
-		seen[f] = true
-		return dup
-	})
 	var b strings.Builder
-	b.WriteString(";; KEYSTORE: every data-root name beginning " + keystorepaths.DataRootPrefix + " and the whole\n")
+	b.WriteString(keystoreStanzaHead)
 	b.WriteString(";; " + keystorepaths.RunDir + " and " + keystorepaths.SockDir + " trees: no read, stat, write, create, unlink, rename,\n")
 	b.WriteString(";; hard link, connect or bind. LAST, so no allow above can re-open them.\n")
 	b.WriteString("(deny file-read* file-read-metadata file-write* file-link\n")
@@ -127,6 +136,49 @@ func keystoreDenyStanza(roots []string) string {
 	}
 	b.WriteString("  )\n")
 	return b.String()
+}
+
+// dedupeInOrder drops every repeat of an element, keeping first occurrences in
+// order.
+func dedupeInOrder(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	return slices.DeleteFunc(slices.Clone(in), func(s string) bool {
+		dup := seen[s]
+		seen[s] = true
+		return dup
+	})
+}
+
+// keystoreStanzaOf returns the keystore stanza a Generate profile ends with,
+// and the root spellings it denies. It fails unless profile ends with exactly
+// the stanza renderKeystoreStanza writes for those spellings, so a profile that
+// lost, truncated or edited its stanza is refused, not extended.
+func keystoreStanzaOf(profile string) (string, []string, error) {
+	i := strings.LastIndex(profile, keystoreStanzaHead)
+	if i < 0 {
+		return "", nil, fmt.Errorf("the profile carries no keystore denies")
+	}
+	stanza := profile[i:]
+	suffix := "/" + keystorepaths.RunDir + "\")"
+	var forms []string
+	for _, line := range strings.Split(stanza, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "(deny network-outbound" {
+			break
+		}
+		if !strings.HasPrefix(line, "(subpath ") || !strings.HasSuffix(line, suffix) {
+			continue
+		}
+		p, err := strconv.Unquote(strings.TrimSuffix(strings.TrimPrefix(line, "(subpath "), ")"))
+		if err != nil {
+			return "", nil, fmt.Errorf("the keystore denies do not parse: %w", err)
+		}
+		forms = append(forms, strings.TrimSuffix(p, "/"+keystorepaths.RunDir))
+	}
+	if len(forms) == 0 || renderKeystoreStanza(forms) != stanza {
+		return "", nil, fmt.Errorf("the keystore denies are not the profile's last rule as rendered")
+	}
+	return stanza, forms, nil
 }
 
 // underKeystoreName reports whether p is at or under a

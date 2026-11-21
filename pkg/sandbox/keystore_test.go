@@ -375,6 +375,9 @@ func TestDataRootDeniesKeystorePathsEveryProfile(t *testing.T) {
 		sp      *runtimev1.SandboxProfile
 		opts    GenerateOptions
 		network bool
+		// shimOnly checks the shim profile alone: an exec session runs under
+		// the resident shim's profile, which it inherits.
+		shimOnly bool
 	}
 	pod := func(workDir string) *runtimev1.SandboxProfile {
 		return &runtimev1.SandboxProfile{
@@ -450,47 +453,99 @@ func TestDataRootDeniesKeystorePathsEveryProfile(t *testing.T) {
 				WritePaths: []string{varRoot + "/storage/pvc-rw"},
 				ReadPaths:  []string{varRoot + "/storage/pvc-ro"},
 			}},
-		{name: "exec session (re-applies the pod's own staged profile, runtime/exec.go)", root: varRoot, sp: native(),
-			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot, DataRoot: varRoot}}, network: true},
+		{name: "exec session (inherits the resident shim's profile, ShimProfile)", root: varRoot, sp: native(),
+			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot, DataRoot: varRoot}}, network: true, shimOnly: true},
 	}
 
 	for _, v := range variants {
 		t.Run(v.name, func(t *testing.T) {
-			prof, err := Generate(v.sp, v.opts)
+			pod, err := Generate(v.sp, v.opts)
 			if err != nil {
 				t.Fatalf("Generate: %v", err)
 			}
-			rules := sbplRules(t, prof)
-			for _, spelling := range dataRootSpellings(v.root) {
-				paths := []string{keystorepaths.SocketPath(spelling)}
-				for _, n := range keystoreNames {
-					paths = append(paths, filepath.Join(spelling, n))
-				}
-				for _, p := range paths {
-					for _, op := range keystoreOps {
-						if ok, by := verdict(t, rules, sbplQuery{op: op, path: p}); ok {
-							t.Errorf("%s %s is allowed, by %s", op, p, by)
-						}
-					}
-				}
+			shim, err := ShimProfile(pod, ShimGrant{Dir: filepath.Join(ShimRoot(v.opts.Posture.WorkDir), "0a1b2c3d")})
+			if err != nil {
+				t.Fatalf("ShimProfile: %v", err)
 			}
-			// The positive control: the variant's own grant at the data root
-			// reaches a sibling that is not a keystore name.
-			for _, spelling := range firmlinkForms(v.root) {
-				for _, n := range []string{"keystore", "keystore.json", "not-keystore-x", "keystore_floor.json"} {
-					p := filepath.Join(spelling, n)
-					ops := []string{"file-read-data", "file-write-create"}
-					if v.network {
-						ops = append(ops, "network-outbound", "network-bind")
-					}
-					for _, op := range ops {
-						if ok, by := verdict(t, rules, sbplQuery{op: op, path: p}); !ok {
-							t.Errorf("control: %s %s is refused, by %s", op, p, by)
-						}
-					}
-				}
+			profiles := map[string]string{"pod": pod, "shim": shim}
+			if v.shimOnly {
+				delete(profiles, "pod")
+			}
+			for which, prof := range profiles {
+				t.Run(which, func(t *testing.T) { checkKeystoreVerdicts(t, prof, v.root, v.network) })
 			}
 		})
+	}
+}
+
+// checkKeystoreVerdicts runs the keystore verdict loop over one rendered
+// profile: every keystore path class refused for every operation class through
+// every spelling of root, and a non-keystore sibling reachable.
+func checkKeystoreVerdicts(t *testing.T, prof, root string, network bool) {
+	t.Helper()
+	rules := sbplRules(t, prof)
+	for _, spelling := range dataRootSpellings(root) {
+		paths := []string{keystorepaths.SocketPath(spelling)}
+		for _, n := range keystoreNames {
+			paths = append(paths, filepath.Join(spelling, n))
+		}
+		for _, p := range paths {
+			for _, op := range keystoreOps {
+				if ok, by := verdict(t, rules, sbplQuery{op: op, path: p}); ok {
+					t.Errorf("%s %s is allowed, by %s", op, p, by)
+				}
+			}
+		}
+	}
+	// The positive control: the variant's own grant at the data root
+	// reaches a sibling that is not a keystore name.
+	for _, spelling := range firmlinkForms(root) {
+		for _, n := range []string{"keystore", "keystore.json", "not-keystore-x", "keystore_floor.json"} {
+			p := filepath.Join(spelling, n)
+			ops := []string{"file-read-data", "file-write-create"}
+			if network {
+				ops = append(ops, "network-outbound", "network-bind")
+			}
+			for _, op := range ops {
+				if ok, by := verdict(t, rules, sbplQuery{op: op, path: p}); !ok {
+					t.Errorf("control: %s %s is refused, by %s", op, p, by)
+				}
+			}
+		}
+	}
+}
+
+// TestShimProfileKeepsTheKeystoreDeniesLast pins that the shim profile, the
+// second profile producer, ends with the pod profile's keystore denies after
+// its own grant, and refuses a grant dir that names a keystore path.
+func TestShimProfileKeepsTheKeystoreDeniesLast(t *testing.T) {
+	const root = "/var/lib/k3sm"
+	pod, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: root + "/pods/p1/rootfs"},
+		GenerateOptions{Posture: Posture{WorkDir: root, DataRoot: root}})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	shim, err := ShimProfile(pod, ShimGrant{Dir: root + "/run/shim/0a1b2c3d"})
+	if err != nil {
+		t.Fatalf("ShimProfile: %v", err)
+	}
+	stanza := keystoreDenyStanza(keystoreRoots(root, root))
+	if !strings.HasSuffix(shim, stanza) {
+		t.Errorf("the shim profile does not end with the keystore denies:\n%s", shim[len(pod):])
+	}
+	if i := strings.LastIndex(shim, "(allow "); i > strings.LastIndex(shim, ";; KEYSTORE:") {
+		t.Errorf("an allow follows the shim profile's keystore denies at %d", i)
+	}
+	for _, dir := range []string{
+		root + "/keystore-run", root + "/keystore-sock", root + "/keystore-run/x", root + "/KEYSTORE-Run",
+		"/private" + root + "/keystore-sock/x", dataVolumeAlias + "/private" + root + "/keystore-floor.json",
+	} {
+		if _, err := ShimProfile(pod, ShimGrant{Dir: dir}); !errors.Is(err, ErrInvalidShimGrant) {
+			t.Errorf("grant dir %s: err = %v, want ErrInvalidShimGrant", dir, err)
+		}
+	}
+	if _, err := ShimProfile(strings.TrimSuffix(pod, stanza), ShimGrant{Dir: root + "/run/shim/0a1b2c3d"}); !errors.Is(err, ErrInvalidShimGrant) {
+		t.Errorf("a pod profile without the keystore denies: err = %v, want ErrInvalidShimGrant", err)
 	}
 }
 
