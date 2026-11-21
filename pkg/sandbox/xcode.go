@@ -338,6 +338,10 @@ func xcodeToolchainStanza(dir string) string {
 		// python3 works (sessionhost-xcode-python3-eperm-20261121). Its two
 		// interpreters carry only com.apple.application-identifier, an identity
 		// and not a capability (TestXcodePython3FrameworkHasNoPrivilegedEntitlement).
+		// Its Resources/Python.app is deliberately readable and is not carved like
+		// the PlugIns and platform bundles: it is the interpreter the framework's
+		// bin/python3.9 execs, it carries the same single identity entitlement,
+		// and a carve regex over .app bundles must not catch it.
 		filepath.Join(dir, "Library", "Frameworks", "Python3.framework"),
 	}
 	// The two bundle-level subtrees: the Swift driver links @rpath/llbuild.framework
