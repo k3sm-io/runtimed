@@ -220,7 +220,7 @@ type countingReclaimer struct {
 func (r *countingReclaimer) ReclaimUnderPressure(_ context.Context, cfg image.ReclaimConfig) (*image.ReclaimReport, error) {
 	if cfg.DryRun {
 		r.dry.Add(1)
-		return &image.ReclaimReport{DryRun: true, ReclaimedBytes: int64(r.gain)}, nil
+		return &image.ReclaimReport{DryRun: true, Triggered: true, ReclaimedBytes: int64(r.gain)}, nil
 	}
 	r.calls.Add(1)
 	if r.free != nil {

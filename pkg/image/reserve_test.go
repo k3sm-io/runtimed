@@ -19,6 +19,7 @@ package image
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -378,6 +379,7 @@ func TestPullRefusesHostileDeclaredSizes(t *testing.T) {
 type countingReclaimer struct {
 	dry, real   atomic.Int32
 	swept       atomic.Int32 // passes asked to sweep derived content
+	untriggered bool         // the dry run found free space above its floor
 	reclaimable int64
 	dryErr      error
 	free        *atomic.Uint64
@@ -392,7 +394,7 @@ func (c *countingReclaimer) ReclaimUnderPressure(_ context.Context, cfg ReclaimC
 		if c.dryErr != nil {
 			return nil, c.dryErr
 		}
-		return &ReclaimReport{DryRun: true, ReclaimedBytes: c.reclaimable}, nil
+		return &ReclaimReport{DryRun: true, Triggered: !c.untriggered, ReclaimedBytes: c.reclaimable}, nil
 	}
 	c.real.Add(1)
 	if c.free != nil {
@@ -500,24 +502,28 @@ func TestPullRefusesAboveCapacityWithoutReclaim(t *testing.T) {
 func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 	const floor, free, reclaimable, capacity = 100, 1_000, 2_000, 10_000
 	for _, tc := range []struct {
-		name     string
-		need     uint64
-		held     uint64
-		dryErr   error
-		wantErr  error
-		wantDry  int32
-		wantReal int32
+		name        string
+		need        uint64
+		held        uint64
+		dryErr      error
+		untriggered bool
+		wantErr     error
+		wantDry     int32
+		wantReal    int32
 	}{
 		{name: "beyond_reclaimable", need: free + reclaimable + 1 - floor, wantErr: ErrInsufficientSpace, wantDry: 1},
 		{name: "exactly_reclaimable", need: free + reclaimable - floor, wantDry: 1, wantReal: 1},
 		{name: "dry_run_error", need: free, dryErr: errors.New("inventory: EIO"), wantErr: ErrInsufficientSpace, wantDry: 1},
+		{name: "dry_run_free_unknown", need: free, dryErr: fmt.Errorf("%w: statfs: EIO", ErrFreeSpaceUnknown), wantErr: ErrFreeSpaceUnknown, wantDry: 1},
+		{name: "dry_run_cancelled", need: free, dryErr: context.Canceled, wantErr: context.Canceled, wantDry: 1},
+		{name: "dry_run_untriggered", need: free + reclaimable + 1 - floor, untriggered: true, wantErr: ErrInsufficientSpace, wantDry: 1, wantReal: 1},
 		{name: "above_capacity_with_held", need: capacity / 2, held: capacity/2 - floor + 1, wantErr: ErrInsufficientSpace},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var avail atomic.Uint64
 			avail.Store(free)
 			ledger := &SpaceLedger{held: tc.held}
-			rec := &countingReclaimer{reclaimable: reclaimable, dryErr: tc.dryErr, free: &avail}
+			rec := &countingReclaimer{reclaimable: reclaimable, dryErr: tc.dryErr, untriggered: tc.untriggered, free: &avail}
 			r, err := ledger.Reserve(context.Background(), SpaceClaim{
 				Need: tc.need, Path: t.TempDir(), FloorBytes: floor,
 				FreeBytes:  func(string) (uint64, error) { return avail.Load(), nil },
@@ -528,6 +534,9 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 			}
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Reserve error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.dryErr != nil && !errors.Is(err, ErrInsufficientSpace) {
+				t.Errorf("Reserve error = %v after a failed plan, want it also ErrInsufficientSpace", err)
 			}
 			if got := rec.dry.Load(); got != tc.wantDry {
 				t.Errorf("dry-run passes = %d, want %d", got, tc.wantDry)

@@ -222,7 +222,7 @@ func (p *Puller) sampleFree() FreeBytesFunc {
 // config and the missing layers), plus the commit-time allowance for the
 // largest of them, the same allowance the artifact pull reserves (layers commit
 // one at a time here). It is measured against free space minus the pull floor,
-// with one reclaim pass when short.
+// with one reclaim pass when short and a dry run shows the pass could make room.
 //
 // A refusal for space is ErrInsufficientSpace and also ErrPullRefusedDiskPressure,
 // so a caller that keys on the admission refusal keys on this one too. A

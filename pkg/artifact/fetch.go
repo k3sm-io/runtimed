@@ -72,8 +72,8 @@ func (p *Puller) spaceNeeded(missing []blob) (uint64, error) {
 }
 
 // reserve claims space for missing on the shared ledger before the first byte,
-// running one reclaim pass when short, and refuses with ErrInsufficientSpace
-// when still short (image.SpaceLedger.Reserve).
+// running one reclaim pass when short and a dry run shows it could make room,
+// and refuses with ErrInsufficientSpace otherwise (image.SpaceLedger.Reserve).
 func (p *Puller) reserve(ctx context.Context, missing []blob) (*image.Reservation, error) {
 	need, err := p.spaceNeeded(missing)
 	if err != nil {

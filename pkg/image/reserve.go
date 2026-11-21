@@ -29,8 +29,9 @@ import (
 // ErrInsufficientSpace reports a pull refused before its first blob request:
 // the bytes its manifest declares, added to what other in-flight pulls have
 // reserved, would take the store volume below its free-space floor, and reclaim
-// could not make room (by its plan, or by its one real pass). The image pull and the artifact pull return
-// this one sentinel (artifact.ErrInsufficientSpace is the same value).
+// could not make room, by its plan or by its one real pass. The image pull and
+// the artifact pull return this one sentinel (artifact.ErrInsufficientSpace is
+// the same value).
 var ErrInsufficientSpace = errors.New("image: refusing the pull, the store volume would fall below its free-space floor")
 
 // ErrSizeOverflow reports space arithmetic that would wrap, or a negative
@@ -84,7 +85,11 @@ func (l *SpaceLedger) Reserved() uint64 {
 // SpaceReclaimer runs one disk-pressure reclaim pass; *Cache satisfies it.
 // Reserve calls it first with ReclaimConfig.DryRun set and reads the bytes the
 // plan would delete from ReclaimReport.ReclaimedBytes, then runs the real pass
-// only when those bytes could make the claim fit.
+// only when those bytes could make the claim fit. So an implementation must
+// honor DryRun by unlinking nothing, must report in a dry run's ReclaimedBytes
+// at least what its real pass could free, and must return an error when it
+// cannot plan: a dry run that reports too little refuses claims that would
+// fit, and one that ignores DryRun evicts twice.
 type SpaceReclaimer interface {
 	ReclaimUnderPressure(ctx context.Context, cfg ReclaimConfig) (*ReclaimReport, error)
 }
@@ -102,9 +107,9 @@ type SpaceClaim struct {
 	// TotalBytes samples the volume's total capacity, checked before the
 	// reclaim pass. Nil means StatfsTotalBytes.
 	TotalBytes TotalBytesFunc
-	// Reclaimer plans (dry run) and then runs the one reclaim pass when the
-	// claim does not fit. Nil
-	// means no pass: a claim that does not fit is refused at once.
+	// Reclaimer plans a dry run and then runs the one reclaim pass when the
+	// claim does not fit. Nil means no pass: a claim that does not fit is
+	// refused at once.
 	Reclaimer SpaceReclaimer
 	// Log receives a failed reclaim pass. Nil discards.
 	Log *slog.Logger
@@ -149,8 +154,10 @@ func (r *Reservation) Release() {
 // The dry run's bytes are the whole plan, blobs and trees, and the real pass
 // unlinks no blob or tree outside the plan it makes under the same rules, so
 // the dry run does not under-count what the real pass can free in the content
-// store; the two plans differ only by holds and leases that change between
-// them. The two places a real pass differs from a dry run
+// store; the two plans differ only by what changes between them (holds,
+// leases, a node aging past the grace window). Sizes are logical, so under
+// APFS clonefile the plan over-counts: a claim that passes it can still be
+// short after the real pass. The two places a real pass differs from a dry run
 // add no blob or tree to it. ReclaimConfig.SweepDerived runs only when set, and
 // Reserve sets it on neither pass. BoundReleasedArtifacts runs on every real
 // pass and removes only released artifact record copies from the index: they
@@ -161,8 +168,15 @@ func (r *Reservation) Release() {
 // that fits only once they are gone is refused until the daemon's own pressure
 // pass has removed them.
 //
+// The dry run unlinks nothing, but it is a full pass otherwise: it walks the
+// store under the ledger mutex, and it reports a pod dir newly skipped by the
+// root set, so the real pass after it does not report that dir again.
+//
 // An unsamplable volume (free space or, before a pass, capacity) refuses with
 // ErrFreeSpaceUnknown, and a sum that would wrap refuses with ErrSizeOverflow.
+// A failed plan keeps its cause in the chain beside ErrInsufficientSpace, so a
+// volume the plan could not sample is also ErrFreeSpaceUnknown and a done
+// context is also its context error.
 func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, error) {
 	free := c.FreeBytes
 	if free == nil {
@@ -222,15 +236,20 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		dry.DryRun = true
 		plan, derr := c.Reclaimer.ReclaimUnderPressure(ctx, dry)
 		if derr != nil {
-			return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan failed: %v: %w",
-				c.Need, avail, c.FloorBytes, derr, ErrInsufficientSpace)
+			return nil, fmt.Errorf("need %d bytes, %d free, floor %d: reclaim plan failed: %w: %w",
+				c.Need, avail, c.FloorBytes, boundErr(derr), ErrInsufficientSpace)
 		}
 		var reclaimable uint64
 		if plan != nil && plan.ReclaimedBytes > 0 {
 			reclaimable = uint64(plan.ReclaimedBytes)
 		}
-		// A sum that wraps is past every want, so only a sum that does not
-		// wrap can be short.
+		// A plan that did not trigger sampled free space at or above want
+		// itself, so the earlier sample is stale and the re-check after the
+		// pass decides. A sum that wraps is past every want, so only a sum
+		// that does not wrap can be short.
+		if plan != nil && !plan.Triggered {
+			reclaimable = want
+		}
 		if reach, oerr := addChecked(avail, reclaimable); oerr == nil && reach < want {
 			return nil, fmt.Errorf("need %d bytes, %d free, %d reclaimable, %d reserved by other pulls, floor %d: %w",
 				c.Need, avail, reclaimable, l.held, c.FloorBytes, ErrInsufficientSpace)
