@@ -243,3 +243,61 @@ func TestCreatePodImageVolumeRefusesPullWithoutHold(t *testing.T) {
 		t.Errorf("reason = %v, want ROOTFS_SETUP", resp.GetFailureReason())
 	}
 }
+
+// holdPuller runs the WithHold callback runs times against res, then reports
+// success with res, as a puller that misuses the hold contract would.
+type holdPuller struct {
+	*scriptedArtifactPuller
+	res  artifact.Result
+	runs int
+}
+
+func (h holdPuller) PullForPod(ctx context.Context, _ string, _ *image.RegistryCredential, _ runtimev1.ArtifactPolicy, _ []string, opts ...artifact.PullOption) (*artifact.Result, error) {
+	res := h.res
+	for range h.runs {
+		if err := artifact.RunHold(ctx, &res, opts...); err != nil {
+			return nil, err
+		}
+	}
+	return &res, nil
+}
+
+// TestCreatePodImageVolumeHoldFailures: a hold the index refuses, and a hold
+// a puller runs twice, each fail the mount closed with ArtifactMountRefused
+// and ROOTFS_SETUP, naming the cause, and the failed create leaves no hold.
+func TestCreatePodImageVolumeHoldFailures(t *testing.T) {
+	good := artifact.Result{ManifestDigest: sha([]byte("m")), ConfigDigest: sha([]byte("c")), LayerDigests: []string{sha([]byte("l"))}}
+	bad := good
+	bad.ConfigDigest = "sha256:not-a-digest"
+	for _, tc := range []struct {
+		name string
+		p    holdPuller
+		want string
+	}{
+		{"index refuses the hold", holdPuller{res: bad, runs: 1}, "record the mounted manifest in the pod's hold"},
+		{"hold run twice", holdPuller{res: good, runs: 2}, errHoldRunTwice.Error()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.p.scriptedArtifactPuller = &scriptedArtifactPuller{}
+			rt := newTestRuntime(t, Deps{ArtifactPuller: tc.p})
+			resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: imageVolumeBox(rt, "pod-holdfail", artifactTestHost+"/models/tiny:v1")})
+			if err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			if msg := resp.GetError().GetMessage(); !strings.HasPrefix(msg, "ArtifactMountRefused") || !strings.Contains(msg, tc.want) {
+				t.Errorf("error = %q, want ArtifactMountRefused naming %q", msg, tc.want)
+			}
+			if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP {
+				t.Errorf("reason = %v, want ROOTFS_SETUP", resp.GetFailureReason())
+			}
+			holds, err := rt.index.ArtifactHolds(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, _ := image.ParsePodID("pod-holdfail")
+			if h, ok := holds[pid]; ok {
+				t.Errorf("the failed create left the pod's hold behind: %+v", h)
+			}
+		})
+	}
+}
