@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -489,7 +490,7 @@ func TestSessionCheckRedirectStopsAfterTen(t *testing.T) {
 func TestSessionRefusesHTTPSToHTTPRedirect(t *testing.T) {
 	b, blog := serveOK(t)
 	a := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		http.Redirect(w, req, b.URL+req.URL.Path, http.StatusTemporaryRedirect)
+		http.Redirect(w, req, b.URL+req.URL.Path+"?X-Amz-Signature=secret", http.StatusTemporaryRedirect)
 	}))
 	t.Cleanup(a.Close)
 	host := strings.TrimPrefix(a.URL, "https://")
@@ -509,6 +510,15 @@ func TestSessionRefusesHTTPSToHTTPRedirect(t *testing.T) {
 	}
 	if !errors.Is(err, ErrRedirectDowngrade) {
 		t.Fatalf("err = %v, want ErrRedirectDowngrade", err)
+	}
+	// net/http's url.Error carries the target URL itself; the check is on
+	// the error this package returns inside it.
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v, want a *url.Error", err)
+	}
+	if msg := ue.Err.Error(); strings.Contains(msg, "secret") || strings.Contains(msg, "/v2/") {
+		t.Fatalf("redirect error %q, want neither the target's path nor its query", msg)
 	}
 	if n := len(blog.seen()); n != 0 {
 		t.Fatalf("http host saw %d requests, want 0", n)

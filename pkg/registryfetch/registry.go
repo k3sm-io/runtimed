@@ -197,7 +197,9 @@ func checkRedirect(plainHTTP bool) func(*http.Request, []*http.Request) error {
 		first := via[0].URL
 		fs, ts := strings.ToLower(first.Scheme), strings.ToLower(req.URL.Scheme)
 		if fs == "https" && ts == "http" && !plainHTTP {
-			return fmt.Errorf("%w: %s", ErrRedirectDowngrade, req.URL.Redacted())
+			// Scheme and host only: a redirect target's query can carry a
+			// presigned signature.
+			return fmt.Errorf("%w: to %s://%s", ErrRedirectDowngrade, req.URL.Scheme, req.URL.Host)
 		}
 		if fs != ts || canonicalHost(fs, first.Host) != canonicalHost(ts, req.URL.Host) {
 			for _, h := range crossOriginHeaders {
