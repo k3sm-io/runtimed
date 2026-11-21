@@ -31,11 +31,16 @@ import (
 // keystore file a later change adds is denied without a change here.
 const KeystoreDataRootPrefix = "keystore-"
 
-// KeystoreRunDir is the data-root directory that holds the keystore's socket
-// (KeystoreSocketPath). Every pod profile denies the whole tree.
+// KeystoreRunDir is the keystore's data-root run directory. Every pod profile
+// denies the whole tree.
 const KeystoreRunDir = "keystore-run"
 
-// keystoreSocketName is the keystore socket's name inside KeystoreRunDir.
+// KeystoreSockDir is the root-owned data-root directory that holds the
+// keystore's socket (KeystoreSocketPath). Every pod profile denies the whole
+// tree; the KeystoreDataRootPrefix deny covers it too.
+const KeystoreSockDir = "keystore-sock"
+
+// keystoreSocketName is the keystore socket's name inside KeystoreSockDir.
 const keystoreSocketName = "keys.sock"
 
 // dataVolumeAlias is the mount point of the macOS data volume. A path under a
@@ -44,10 +49,10 @@ const keystoreSocketName = "keys.sock"
 const dataVolumeAlias = "/System/Volumes/Data"
 
 // KeystoreSocketPath returns the keystore socket path under dataRoot:
-// <dataRoot>/keystore-run/keys.sock. It is the one spelling of the path, for
+// <dataRoot>/keystore-sock/keys.sock. It is the one spelling of the path, for
 // the server that binds it and for every deny that keeps a pod off it.
 func KeystoreSocketPath(dataRoot string) string {
-	return filepath.Join(dataRoot, KeystoreRunDir, keystoreSocketName)
+	return filepath.Join(dataRoot, KeystoreSockDir, keystoreSocketName)
 }
 
 // keystoreRoots returns the directories whose keystore names every pod profile
@@ -115,7 +120,8 @@ func keystoreDenyStanza(roots []string) string {
 		for _, form := range keystoreForms(root) {
 			filters = append(filters,
 				"(regex #\""+keystorePrefixPattern(form)+"\")",
-				fmt.Sprintf("(subpath %q)", filepath.Join(form, KeystoreRunDir)))
+				fmt.Sprintf("(subpath %q)", filepath.Join(form, KeystoreRunDir)),
+				fmt.Sprintf("(subpath %q)", filepath.Join(form, KeystoreSockDir)))
 		}
 	}
 	seen := make(map[string]bool, len(filters))
@@ -126,7 +132,7 @@ func keystoreDenyStanza(roots []string) string {
 	})
 	var b strings.Builder
 	b.WriteString(";; KEYSTORE: every data-root name beginning " + KeystoreDataRootPrefix + " and the whole\n")
-	b.WriteString(";; " + KeystoreRunDir + " tree: no read, stat, write, create, unlink, rename,\n")
+	b.WriteString(";; " + KeystoreRunDir + " and " + KeystoreSockDir + " trees: no read, stat, write, create, unlink, rename,\n")
 	b.WriteString(";; connect or bind. LAST, so no allow above can re-open them.\n")
 	b.WriteString("(deny file-read* file-read-metadata file-write*\n")
 	for _, f := range filters {

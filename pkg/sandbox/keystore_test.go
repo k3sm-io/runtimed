@@ -158,8 +158,9 @@ const (
 // sbplQuery is one access: a file operation on a path, or a unix-socket
 // connect (network-outbound) or bind (network-bind) at a path.
 type sbplQuery struct {
-	op   string
-	path string
+	op     string
+	path   string
+	target string // for a process operation: self, children, pgrp or others
 }
 
 func (q sbplQuery) socket() bool { return strings.HasPrefix(q.op, "network-") }
@@ -239,6 +240,17 @@ func filterMatches(t *testing.T, f sbplNode, q sbplQuery) tri {
 			return yes
 		}
 		return maybe
+	case "target":
+		if q.target == "" || len(f.list) != 2 {
+			return no
+		}
+		switch f.list[1].atom {
+		case q.target:
+			return yes
+		case "self", "children", "pgrp", "others":
+			return no
+		}
+		return maybe
 	case "remote", "local":
 		if !q.socket() || len(f.list) != 3 {
 			return no
@@ -251,7 +263,7 @@ func filterMatches(t *testing.T, f sbplNode, q sbplQuery) tri {
 		}
 		return pathFilter(t, f.list[2], q.path)
 	case "subpath", "literal", "prefix", "regex":
-		if q.socket() {
+		if q.socket() || q.target != "" {
 			return no
 		}
 		return pathFilter(t, f, q.path)
@@ -327,6 +339,9 @@ var keystoreNames = []string{
 	"keystore-run",
 	"keystore-run/keys.sock",
 	"keystore-run/sub/deep",
+	"keystore-sock",
+	"keystore-sock/keys.sock",
+	"keystore-sock/sub/deep",
 }
 
 // dataRootSpellings returns the spellings a pod can reach root through: as
@@ -495,6 +510,7 @@ func TestKeystoreDenyStanzaShape(t *testing.T) {
 		`(regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
 		`(regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
 		`(subpath "/private/var/lib/k3sm/keystore-run")`,
+		`(subpath "/private/var/lib/k3sm/keystore-sock")`,
 		`(local unix-socket (regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))`,
 		`(remote unix-socket (subpath "/var/lib/k3sm/keystore-run"))`,
 	} {
@@ -505,7 +521,7 @@ func TestKeystoreDenyStanzaShape(t *testing.T) {
 	if i := strings.LastIndex(prof, "(allow "); i > strings.Index(prof, ";; KEYSTORE:") {
 		t.Errorf("an allow follows the keystore denies at %d", i)
 	}
-	if got, want := KeystoreSocketPath("/var/lib/k3sm"), "/var/lib/k3sm/keystore-run/keys.sock"; got != want {
+	if got, want := KeystoreSocketPath("/var/lib/k3sm"), "/var/lib/k3sm/keystore-sock/keys.sock"; got != want {
 		t.Errorf("KeystoreSocketPath = %q, want %q", got, want)
 	}
 }
@@ -519,5 +535,61 @@ func TestDataRootRefusesPodRootUnderKeystoreName(t *testing.T) {
 		if !errors.Is(err, ErrInvalidDataRoot) {
 			t.Errorf("work dir %s: err = %v, want ErrInvalidDataRoot", workDir, err)
 		}
+	}
+}
+
+// processInfoOps are the process-info operations a pod could aim at another
+// process to read its state (its memory map, descriptors, code signature) or
+// steer it.
+var processInfoOps = []string{
+	"process-info-pidinfo", "process-info-pidfdinfo", "process-info-pidfileportinfo",
+	"process-info-setcontrol", "process-info-dirtycontrol", "process-info-rusage",
+	"process-info-codesignature", "process-info-listpids",
+}
+
+// TestPodProfileDeniesProcessInfoAndSignalToOthers pins that no pod profile
+// variant lets a pod inspect or signal a process outside it, the k3sm server
+// in particular, which runs as the same uid and holds key material in memory:
+// every process-info operation is refused on every target, and a signal is
+// refused to any process outside the pod's own children and process group,
+// which stay reachable as the control. It reads the profile as rendered today:
+// no rule grants process-info, and the only signal grants are podSignal's.
+func TestPodProfileDeniesProcessInfoAndSignalToOthers(t *testing.T) {
+	const work = "/var/lib/k3sm"
+	dataVol := work + "/pods/p1/rootfs"
+	for name, in := range map[string]struct {
+		sp   *runtimev1.SandboxProfile
+		opts GenerateOptions
+	}{
+		"native":                   {sp: &runtimev1.SandboxProfile{DataVolumePath: dataVol}},
+		"networked":                {sp: &runtimev1.SandboxProfile{DataVolumePath: dataVol, AllowNetwork: true}},
+		"xcode":                    {sp: &runtimev1.SandboxProfile{DataVolumePath: dataVol, XcodeToolchainDir: xcodeDevDir}},
+		"gpu":                      {sp: &runtimev1.SandboxProfile{DataVolumePath: dataVol, AllowGpu: true}},
+		"wasm":                     {sp: &runtimev1.SandboxProfile{DataVolumePath: dataVol, Backend: runtimev1.SandboxBackend_SANDBOX_BACKEND_WASM}},
+		"custom pod root":          {sp: &runtimev1.SandboxProfile{DataVolumePath: "/opt/k3sm-pods/pods/p1/rootfs"}, opts: GenerateOptions{Posture: Posture{WorkDir: "/opt/k3sm-pods", DataRoot: work}}},
+		"semaphores and user dirs": {sp: &runtimev1.SandboxProfile{DataVolumePath: dataVol}, opts: GenerateOptions{PodUID: "0123abcd-0000-0000-0000-000000000000"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			prof, err := Generate(in.sp, in.opts)
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			rules := sbplRules(t, prof)
+			for _, target := range []string{"others", "self", "children", "pgrp"} {
+				for _, op := range processInfoOps {
+					if ok, by := verdict(t, rules, sbplQuery{op: op, target: target}); ok {
+						t.Errorf("%s on %s is allowed, by %s", op, target, by)
+					}
+				}
+			}
+			if ok, by := verdict(t, rules, sbplQuery{op: "signal", target: "others"}); ok {
+				t.Errorf("signal to a process outside the pod is allowed, by %s", by)
+			}
+			for _, target := range []string{"children", "pgrp"} {
+				if ok, by := verdict(t, rules, sbplQuery{op: "signal", target: target}); !ok {
+					t.Errorf("control: signal to the pod's %s is refused, by %s", target, by)
+				}
+			}
+		})
 	}
 }
