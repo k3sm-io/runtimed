@@ -377,12 +377,16 @@ func TestPullRefusesHostileDeclaredSizes(t *testing.T) {
 // reclaimable to *free when free is set.
 type countingReclaimer struct {
 	dry, real   atomic.Int32
+	swept       atomic.Int32 // passes asked to sweep derived content
 	reclaimable int64
 	dryErr      error
 	free        *atomic.Uint64
 }
 
 func (c *countingReclaimer) ReclaimUnderPressure(_ context.Context, cfg ReclaimConfig) (*ReclaimReport, error) {
+	if cfg.SweepDerived != nil {
+		c.swept.Add(1)
+	}
 	if cfg.DryRun {
 		c.dry.Add(1)
 		if c.dryErr != nil {
@@ -530,6 +534,11 @@ func TestReserveRefusesBeyondReclaimableWithoutEviction(t *testing.T) {
 			}
 			if got := rec.real.Load(); got != tc.wantReal {
 				t.Errorf("real reclaim passes = %d, want %d", got, tc.wantReal)
+			}
+			// The dry run's bytes stand for the real pass only while neither
+			// pass sweeps derived content, which the dry run cannot plan.
+			if got := rec.swept.Load(); got != 0 {
+				t.Errorf("%d passes were asked to sweep derived content, want 0", got)
 			}
 			wantHeld := tc.held
 			if tc.wantErr == nil {

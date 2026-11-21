@@ -146,11 +146,20 @@ func (r *Reservation) Release() {
 //     pass run, asked to bring free space up to the sum, and the check is
 //     repeated; still short is ErrInsufficientSpace.
 //
-// Stated limit: the dry run skips the bound of released artifact records,
-// which the real pass runs on every pass, and those bytes are not in its
-// plan. (Reserve sets no ReclaimConfig.SweepDerived, so its real pass does not
-// sweep artifact views either.) A pull that would fit only after that bound is
-// refused; the daemon's own pressure pass runs it.
+// The dry run's bytes are the whole plan, blobs and trees, and the real pass
+// unlinks no blob or tree outside the plan it makes under the same rules, so
+// the dry run does not under-count what the real pass can free in the content
+// store; the two plans differ only by holds and leases that change between
+// them. The two places a real pass differs from a dry run
+// add no blob or tree to it. ReclaimConfig.SweepDerived runs only when set, and
+// Reserve sets it on neither pass. BoundReleasedArtifacts runs on every real
+// pass and removes only released artifact record copies from the index: they
+// are eviction-order hints and never roots, so dropping them cannot change the
+// plan. What it frees is those small index files, which every release already
+// bounds to MaxReleasedArtifactBytes, so in practice only a commit temp a crash
+// left or a copy that no longer decodes. No margin is kept for them: a claim
+// that fits only once they are gone is refused until the daemon's own pressure
+// pass has removed them.
 //
 // An unsamplable volume (free space or, before a pass, capacity) refuses with
 // ErrFreeSpaceUnknown, and a sum that would wrap refuses with ErrSizeOverflow.
@@ -220,6 +229,8 @@ func (l *SpaceLedger) Reserve(ctx context.Context, c SpaceClaim) (*Reservation, 
 		if plan != nil && plan.ReclaimedBytes > 0 {
 			reclaimable = uint64(plan.ReclaimedBytes)
 		}
+		// A sum that wraps is past every want, so only a sum that does not
+		// wrap can be short.
 		if reach, oerr := addChecked(avail, reclaimable); oerr == nil && reach < want {
 			return nil, fmt.Errorf("need %d bytes, %d free, %d reclaimable, %d reserved by other pulls, floor %d: %w",
 				c.Need, avail, reclaimable, l.held, c.FloorBytes, ErrInsufficientSpace)
