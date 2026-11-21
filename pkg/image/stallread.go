@@ -89,10 +89,14 @@ type stallTimer interface {
 // timeAfterFunc is the production afterFunc: a real time.AfterFunc.
 func timeAfterFunc(d time.Duration, f func()) stallTimer { return time.AfterFunc(d, f) }
 
-// newStallReader wraps body with a watchdog of the given window. The timer is
-// created stopped; each Read arms a fresh one for the duration of one body.Read.
-func newStallReader(body io.ReadCloser, window time.Duration) *stallReader {
-	return (&stallReader{body: body, window: window, afterFunc: timeAfterFunc}).start()
+// newStallReader wraps body with a watchdog of the given window, its timers
+// made by afterFunc (nil means timeAfterFunc). The timer is created stopped;
+// each Read arms a fresh one for the duration of one body.Read.
+func newStallReader(body io.ReadCloser, window time.Duration, afterFunc func(time.Duration, func()) stallTimer) *stallReader {
+	if afterFunc == nil {
+		afterFunc = timeAfterFunc
+	}
+	return (&stallReader{body: body, window: window, afterFunc: afterFunc}).start()
 }
 
 // start creates the watchdog timer through s.afterFunc, stopped, and returns s.

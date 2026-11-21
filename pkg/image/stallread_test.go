@@ -251,7 +251,7 @@ func waitArmed(t *testing.T, ft *fakeTimer, msg string) {
 
 // newFakeStallReader is newStallReader with ft in place of time.AfterFunc.
 func newFakeStallReader(body io.ReadCloser, window time.Duration, ft *fakeTimer) *stallReader {
-	return (&stallReader{body: body, window: window, afterFunc: ft.afterFunc}).start()
+	return newStallReader(body, window, ft.afterFunc)
 }
 
 // clockedReader delivers one byte of data per Read, each taking step of the

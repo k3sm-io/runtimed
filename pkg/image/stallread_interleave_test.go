@@ -91,7 +91,7 @@ func TestStallReaderRealTimer(t *testing.T) {
 	defer pw.Close()
 	closeErr := errors.New("body close")
 	body := &countingCloser{PipeReader: pr, err: closeErr}
-	s := newStallReader(body, 5*time.Millisecond)
+	s := newStallReader(body, 5*time.Millisecond, nil)
 
 	r := awaitRead(t, readAsync(s), "Read never returned: the real watchdog never closed the blocked body")
 	if r.n != 0 || !errors.Is(r.err, ErrLayerBodyStalled) {
