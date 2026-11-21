@@ -283,6 +283,55 @@ func TestSessionWiresRoutes(t *testing.T) {
 	}
 }
 
+// challengeRecorder answers every request with 401 and a Bearer challenge.
+type challengeRecorder struct{ n int }
+
+func (c *challengeRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.n++
+	h := http.Header{"Www-Authenticate": {`Bearer realm="https://token.example/token",scope="repository:evil/x:push"`}}
+	return &http.Response{StatusCode: http.StatusUnauthorized, Header: h, Body: http.NoBody, Request: req}, nil
+}
+
+// TestSessionStripsForeignChallenge: through Session's client, a response
+// from another origin arrives without its WWW-Authenticate challenge, and a
+// response from the registry's own origin keeps it.
+func TestSessionStripsForeignChallenge(t *testing.T) {
+	authMark, plainMark := &challengeRecorder{}, &challengeRecorder{}
+	reg := &Registry{
+		Transport: plainMark,
+		newAuth: func(context.Context, name.Registry, authn.Authenticator, http.RoundTripper, []string) (http.RoundTripper, error) {
+			return authMark, nil
+		},
+	}
+	_, client, err := reg.Session(context.Background(), "registry.example/models/tiny:v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		url  string
+		keep bool
+	}{
+		{"https://registry.example/v2/models/tiny/blobs/x", true},
+		{"https://blobs.example/x", false},
+	} {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Www-Authenticate") != ""; got != tc.keep {
+			t.Errorf("%s: challenge kept = %v, want %v", tc.url, got, tc.keep)
+		}
+	}
+	if authMark.n != 1 || plainMark.n != 1 {
+		t.Errorf("auth %d plain %d, want 1 and 1", authMark.n, plainMark.n)
+	}
+}
+
 // TestHostSplitRoutes: scheme and host:port decide the route, with default
 // ports filled in and host names compared case-insensitively.
 func TestHostSplitRoutes(t *testing.T) {
