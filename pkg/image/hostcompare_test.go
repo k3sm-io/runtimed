@@ -75,7 +75,14 @@ func TestHostCompareCredentialTransport(t *testing.T) {
 		{name: "same host same port", registry: "registry.example:5000", scheme: "https", host: "registry.example:5000", creds: true},
 		{name: "same host other port", registry: "registry.example:5000", scheme: "https", host: "registry.example:5001"},
 		{name: "same host and port, scheme https to http", registry: "registry.example:5000", scheme: "http", host: "registry.example:5000", refused: true},
-		{name: "same host and port, scheme http to https", registry: "registry.example:5000", insecure: true, scheme: "https", host: "registry.example:5000"},
+		// An http registry's own host:port over https is an upgrade the module
+		// makes itself when TLS answers its ping, so it is the registry's origin.
+		{name: "same host and port, scheme http to https", registry: "registry.example:5000", insecure: true, scheme: "https", host: "registry.example:5000", creds: true},
+		{name: "private registry named http, request https", registry: "10.0.0.5:5000", scheme: "https", host: "10.0.0.5:5000", creds: true},
+		{name: "private registry without port, https default port", registry: "10.0.0.5", scheme: "https", host: "10.0.0.5", creds: true},
+		{name: "private registry without port, https on port 80", registry: "10.0.0.5", scheme: "https", host: "10.0.0.5:80"},
+		{name: "private registry, https on another port", registry: "10.0.0.5:5000", scheme: "https", host: "10.0.0.5:5001"},
+		{name: "private registry, https on another host", registry: "10.0.0.5:5000", scheme: "https", host: "10.0.0.6:5000"},
 		{name: "scheme in upper case", registry: "registry.example", scheme: "HTTPS", host: "registry.example", creds: true},
 		{name: "host letter case, request upper", registry: "registry.example", scheme: "https", host: "Registry.Example", creds: true},
 		{name: "host letter case, registry upper", registry: "Registry.Example", scheme: "https", host: "registry.example", creds: true},
