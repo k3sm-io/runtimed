@@ -614,6 +614,12 @@ func pullStatusError(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, image.ErrPullRefusedDiskPressure):
 		return status.Error(codes.ResourceExhausted, err.Error())
+	case errors.Is(err, image.ErrSizeOverflow), errors.Is(err, image.ErrDeclaredSizeRejected):
+		// The serving registry's manifest declares sizes that wrap or exceed the
+		// volume's capacity: a verdict on the manifest, not on this node's free
+		// space, so it is not retried as a resource shortfall. The artifact pull
+		// maps the same sentinels the same way.
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, image.ErrLoadReferenceInvalid):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case image.IsTerminalPlatformError(err):
