@@ -490,7 +490,10 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // this call unlinked before the error, and nothing is unlinked after it. A
 // caller must still treat the call as failed. Every other error (bad
 // arguments, the blobs root, the first pin read) returns a nil report and
-// is raised before any unlink.
+// is raised before any unlink. ReclaimUnderPressure, the only caller with a
+// pin function, discards that partial report and fails the whole pass, so
+// blobs it unlinked before the error are not counted in its report; the
+// next pass plans again from what is on disk.
 //
 // When pinned is non-nil the executor also asks the cache's own lease table
 // (leaseHasLocked) about each entry's digest inside the critical section, and
@@ -507,6 +510,12 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // is pruneMu then leaseMu, and pinned, which takes leaseMu itself, is never
 // called with leaseMu held.
 //
+// The critical section holds leaseMu across the Lstat and the Remove, so an
+// AcquireLease (a pull, a load, a pod create) waits for one unlink at a time.
+// That is the price of the invariant below: an unlink that ran outside
+// leaseMu could not be ordered against a lease taken during it. The lock is
+// dropped between entries, so the wait is bounded by a single unlink.
+//
 // INVARIANT, which holds only when pinned is non-nil: an entry is unlinked
 // only by a critical section whose watch check came back clean, so every
 // lease naming its digest was acquired either before the pin read the
@@ -515,18 +524,20 @@ type pinnedFunc func() (map[string]PruneReason, error)
 // before it writes either) or after that critical section, which AcquireLease
 // cannot enter, so it returns only after the Remove is done.
 //
-// The pull path's own presence re-check under its lease (pkg/artifact)
-// refetches a removed blob only when the Remove precedes that re-check. The
-// clean critical section guarantees that for every lease acquired after the
-// executor's pin read, because the re-check runs after AcquireLease returns.
+// A pull leases every blob it needs before it checks which are present, so
+// a presence check made after AcquireLease returns sees any Remove the clean
+// critical section above has already done, and fetches that blob again.
 //
 // RESIDUAL, a pre-existing limit of the lease TTL rather than of this
 // ordering: a lease that outlives DefaultLeaseTTL (or its own ttl) stops
-// counting. A pull that leased before the executor's pin read, stalled until
-// its lease expired, and writes its record and runs its re-check after that
-// read but before the entry's critical section is not seen there (no live
-// lease, a pin set read before the record, no lease acquired since that
-// read), so the blob it just found present is unlinked.
+// counting. A pull that leased and found a blob present before the
+// executor's pin read, stalled until its lease expired, and wrote its record
+// and hold after that read but before the entry's critical section is not
+// seen there (no live lease, a pin set read before the record, no lease
+// acquired since that read), so the blob it found present is unlinked and
+// the record and hold name an absent blob. The pull path has no presence
+// check after its record and hold today, so such a pull reports success and
+// the consumer that reads the blob fails; a retry fetches it again.
 func (c *Cache) executePrune(plan *PrunePlan, grace time.Duration, now time.Time, stop func() bool, pinned pinnedFunc) (*ExecuteReport, error) {
 	if plan == nil {
 		return nil, errors.New("execute prune: nil plan")
