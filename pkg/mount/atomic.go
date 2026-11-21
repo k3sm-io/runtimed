@@ -92,9 +92,12 @@ type MountIdentity struct {
 //
 // The steps, in order, and what each guarantees:
 //
+//  0. A mount dir that is not the one expect names is rendered as if expect
+//     were nil.
 //  1. A ..data that is not a symlink (a directory or a file the pod put there)
-//     is removed, so it cannot freeze the mount's rotation; one that names
-//     something other than a generation is replaced by the flip.
+//     is renamed aside and removed within removeBounds, so it cannot freeze
+//     the mount's rotation; one that names something other than a generation
+//     is replaced by the flip.
 //  2. fill renders into a new generation dir. On any error the new dir is
 //     removed and the live generation is untouched.
 //  3. The new generation is checked (verifyGeneration): regular files with
@@ -109,8 +112,9 @@ type MountIdentity struct {
 //     one rename(2), atomic for every reader.
 //  6. Missing top-level <key> -> ..data/<key> symlinks are created; one that
 //     already exists is left alone.
-//  7. The generation ..data named before is removed, then any top-level
-//     symlink into ..data whose key no longer exists.
+//  7. The generation ..data named before is removed if it was trusted
+//     (within removeBounds), then any top-level symlink into ..data whose key
+//     no longer exists.
 //
 // It never writes into the live generation. flipped reports whether step 5 ran.
 func writeGeneration(dir *dirTarget, expect *MountIdentity, fill func(gen, live *dirTarget) error) (flipped bool, now MountIdentity, err error) {
@@ -120,7 +124,11 @@ func writeGeneration(dir *dirTarget, expect *MountIdentity, fill func(gen, live 
 	}
 	now.DirDev, now.DirIno = uint64(dst.Dev), uint64(dst.Ino)
 	if expect != nil && (expect.DirDev != now.DirDev || expect.DirIno != now.DirIno) {
-		return false, now, fmt.Errorf("mount dir %s is not the directory that was materialized", dir.path)
+		// Not the directory the last render left (a tool in the pod moved a
+		// parent aside and made a new one): nothing in it is trusted, as
+		// after a restart. The render is fresh and records this directory,
+		// so a session host's credentials keep rotating.
+		expect = nil
 	}
 
 	var live *dirTarget
@@ -137,8 +145,11 @@ func writeGeneration(dir *dirTarget, expect *MountIdentity, fill func(gen, live 
 		// A link to something that is no generation: the flip replaces it.
 	case errors.Is(lerr, unix.EINVAL):
 		// Not a symlink: a directory or file the pod made. The flip cannot
-		// rename over a directory, so it goes first.
-		if err := pathsafe.RemoveTreeAt(dir.fd, dataLink); err != nil {
+		// rename over a directory, so it is renamed aside first, to a name
+		// the daemon picks, and removed within removeBounds. Over a bound
+		// this refresh fails with the rest left under the trash name; the
+		// next one finds no ..data and renders.
+		if err := trashAt(dir, dataLink); err != nil {
 			return false, now, fmt.Errorf("remove %s/%s, which is not a symlink: %w", dir.path, dataLink, err)
 		}
 	default:
@@ -153,7 +164,7 @@ func writeGeneration(dir *dirTarget, expect *MountIdentity, fill func(gen, live 
 	keep := false
 	defer func() {
 		if !keep {
-			if rmErr := pathsafe.RemoveTreeAt(dir.fd, genName); rmErr != nil && err == nil {
+			if rmErr := pathsafe.RemoveTreeAt(dir.fd, genName, removeBounds); rmErr != nil && err == nil {
 				err = fmt.Errorf("remove discarded generation %s: %w", gen.path, rmErr)
 			}
 		}
@@ -204,8 +215,11 @@ func writeGeneration(dir *dirTarget, expect *MountIdentity, fill func(gen, live 
 			errs = append(errs, err)
 		}
 	}
-	if oldGen != "" && oldGen != genName {
-		if err := pathsafe.RemoveTreeAt(dir.fd, oldGen); err != nil {
+	// Only the trusted live generation is removed: an untrusted one is the
+	// pod's own directory (or one this daemon rendered before a restart),
+	// and is left where it is.
+	if live != nil && oldGen != "" && oldGen != genName {
+		if err := pathsafe.RemoveTreeAt(dir.fd, oldGen, removeBounds); err != nil {
 			errs = append(errs, fmt.Errorf("remove previous generation %s: %w", oldGen, err))
 		}
 	}
@@ -233,6 +247,27 @@ func openTrusted(dir *dirTarget, name string, expect *MountIdentity) (*dirTarget
 	return &dirTarget{fd: fd, path: dir.join(name)}, idOf(&st), true
 }
 
+// trashAt renames name in dir aside to a fresh "..trash_<n>" name and
+// removes it from there within removeBounds, never by path. Renaming first
+// means a tree too large to remove leaves dir usable.
+func trashAt(dir *dirTarget, name string) error {
+	for try := 0; try < 100; try++ {
+		trash := "..trash_" + strconv.FormatUint(uint64(rand.Uint32()), 10)
+		var st unix.Stat_t
+		if err := unix.Fstatat(dir.fd, trash, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+			continue // taken; a rename onto it could replace what is there
+		}
+		if err := unix.Renameat(dir.fd, name, dir.fd, trash); err != nil {
+			if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENOTDIR) {
+				continue // planted between the check and the rename
+			}
+			return fmt.Errorf("rename aside: %w", err)
+		}
+		return pathsafe.RemoveTreeAt(dir.fd, trash, removeBounds)
+	}
+	return fmt.Errorf("rename aside: no free trash name in %s", dir.path)
+}
+
 // makeGeneration creates a new, uniquely named generation dir in dir (0700
 // until the caller sets generationMode) and opens it without following a
 // link. Its name is generationLayout at the current time plus a random
@@ -250,7 +285,7 @@ func makeGeneration(dir *dirTarget) (string, *dirTarget, error) {
 		}
 		fd, err := unix.Openat(dir.fd, name, pathsafe.DirFlags, 0)
 		if err != nil {
-			_ = pathsafe.RemoveTreeAt(dir.fd, name)
+			_ = pathsafe.RemoveTreeAt(dir.fd, name, removeBounds)
 			return "", nil, fmt.Errorf("open generation dir %s: %w", dir.join(name), err)
 		}
 		return name, &dirTarget{fd: fd, path: dir.join(name)}, nil

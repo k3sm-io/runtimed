@@ -44,11 +44,14 @@ import (
 // replace lets writeFile unlink a name it did not create and make a new file
 // in its place, for a flat render into a directory an earlier create of the
 // same pod may have rendered into (a vm pod's share dir); a generation never
-// sets it.
+// sets it. written is the bytes the files in created now hold, bounded by
+// maxVolumeBytes, so a volume too large to be refreshed fails its render.
 type dirTarget struct {
 	fd      int
 	path    string
 	created map[string]fileID
+	sizes   map[string]int64
+	written int64
 	replace bool
 }
 
@@ -64,7 +67,8 @@ func idOf(st *unix.Stat_t) fileID { return fileID{dev: uint64(st.Dev), ino: uint
 // is bounded and over a bound the volume's refresh fails. A ConfigMap or Secret
 // holds at most 1 MiB; the byte bound sits well above that.
 const (
-	// maxVolumeBytes bounds the file bytes read from one generation.
+	// maxVolumeBytes bounds the file bytes written to, and read from, one
+	// generation.
 	maxVolumeBytes = 8 << 20
 	// maxTreeEntries bounds the entries walked in one generation.
 	maxTreeEntries = 16384
@@ -72,9 +76,16 @@ const (
 	maxTreeDepth = 64
 )
 
-// errTreeTooLarge is returned when a generation walk or read passes one of the
-// bounds above.
-var errTreeTooLarge = errors.New("generation is larger than a projected volume can be")
+// errTreeTooLarge is returned when a generation render, walk, read or
+// removal passes one of the bounds above. It is pathsafe.ErrTreeTooLarge, so
+// a removal over removeBounds is the same error.
+var errTreeTooLarge = pathsafe.ErrTreeTooLarge
+
+// removeBounds bounds every removal of a tree from a mount dir (a discarded
+// or previous generation, or a ..data that was no link): the pod can grow any
+// of them, and RemoveTreeAt stops at these with errTreeTooLarge. A tree that
+// verifyGeneration accepts is within them.
+var removeBounds = pathsafe.TreeBounds{Depth: maxTreeDepth + 1, Entries: maxTreeEntries + 1}
 
 // close releases the descriptor.
 func (d *dirTarget) close() {
@@ -162,6 +173,9 @@ func writeFile(t *dirTarget, rel string, content []byte, mode os.FileMode) error
 	}
 	defer unix.Close(pfd)
 	key := filepath.Clean(rel)
+	if total := t.written - t.sizes[key] + int64(len(content)); total > maxVolumeBytes {
+		return fmt.Errorf("%w: %s would bring the volume to %d bytes, over %d", errTreeTooLarge, t.join(rel), total, maxVolumeBytes)
+	}
 	fd, err := unix.Openat(pfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|fileOpenFlags, 0o600)
 	again := false
 	if errors.Is(err, unix.EEXIST) {
@@ -204,6 +218,11 @@ func writeFile(t *dirTarget, rel string, content []byte, mode os.FileMode) error
 		}
 		t.created[key] = idOf(&st)
 	}
+	if t.sizes == nil {
+		t.sizes = map[string]int64{}
+	}
+	t.written += int64(len(content)) - t.sizes[key]
+	t.sizes[key] = int64(len(content))
 	if _, err := f.Write(content); err != nil {
 		return fmt.Errorf("write %s: %w", t.join(rel), err)
 	}

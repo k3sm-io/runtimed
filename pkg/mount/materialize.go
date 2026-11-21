@@ -64,7 +64,8 @@ type Mount struct {
 	// projected volumes, or when the VolumeMount sets read_only).
 	ReadOnly bool
 	// Credential marks a secret / SA-token (or a projected volume containing one):
-	// it gets the SBPL read-only sub-scope so the pod cannot overwrite it.
+	// it gets the SBPL read-only sub-scope, so the pod cannot write the files
+	// at its path (not integrity against the pod: see the package doc).
 	Credential bool
 }
 

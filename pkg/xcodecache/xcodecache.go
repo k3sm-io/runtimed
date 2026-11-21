@@ -99,6 +99,10 @@ var (
 // ErrInvalid marks a key, namespace or Xcode build the cache refuses.
 var ErrInvalid = errors.New("xcode cache")
 
+// removeBounds bounds the removal of a part whose clone failed: a cache
+// tree nests far less than this, and it may hold any number of entries.
+var removeBounds = pathsafe.TreeBounds{Depth: 1024}
+
 // ValidKey reports whether key can name a cache entry: a lowercase letter or
 // digit, then up to 62 of [a-z0-9._-]. ".." and anything with a slash are
 // refused by construction, so a key can never leave its namespace directory.
@@ -334,7 +338,7 @@ func (s Store) CheckoutAt(e Entry, base, homeRel string) ([]string, error) {
 			// Removed relative to the pinned parent, never by path: the
 			// daemon runs this as root, and a path through the home could
 			// by now name another tree.
-			_ = pathsafe.RemoveTreeAt(int(parent.Fd()), name)
+			_ = pathsafe.RemoveTreeAt(int(parent.Fd()), name, removeBounds)
 		}
 		parent.Close()
 		if err != nil {

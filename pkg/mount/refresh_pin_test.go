@@ -239,8 +239,9 @@ func TestRefreshRefusesAnUnsafeMountDir(t *testing.T) {
 // TestRefreshDoesNotFollowPlantedLinks: the names the layout itself uses, set
 // by the pod to symlinks that lead out of its tree, are never followed. A
 // ..data that names a generation-shaped link is not trusted as the live
-// generation: the volume is rendered fresh, the flip replaces ..data, and the
-// planted link is removed as a link. A key name that is a link to a file
+// generation: the volume is rendered fresh and the flip replaces ..data. The
+// planted link is left where it is (only a trusted previous generation is
+// removed) and never followed. A key name that is a link to a file
 // outside is replaced as a link, and the file it named is left alone.
 func TestRefreshDoesNotFollowPlantedLinks(t *testing.T) {
 	t.Run("..data names a link to outside", func(t *testing.T) {
@@ -263,8 +264,8 @@ func TestRefreshDoesNotFollowPlantedLinks(t *testing.T) {
 		if got := liveGen(t, dir); got == "..evil" {
 			t.Error("..data still names the planted link")
 		}
-		if _, err := os.Lstat(filepath.Join(dir, "..evil")); err == nil {
-			t.Error("the planted link was not removed")
+		if fi, err := os.Lstat(filepath.Join(dir, "..evil")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("the planted link was not left as a link (lstat %v, err %v)", fi, err)
 		}
 		f.checkVictim(t)
 	})
@@ -481,23 +482,5 @@ func TestRefreshReplacesADataDirectory(t *testing.T) {
 	}
 	if got := readString(t, filepath.Join(dir, "a")); got != "pod-chosen-2" {
 		t.Errorf("a = %q, want the refreshed value", got)
-	}
-}
-
-// TestRefreshRefusesAReplacedMountDir: the mount dir renamed away and a plain
-// directory made in its place is not the directory Materialize rendered into.
-func TestRefreshRefusesAReplacedMountDir(t *testing.T) {
-	f := newPinFixture(t)
-	layout := f.materialize(t)
-	dir := filepath.Join(f.root, "data/x/cfg")
-	if err := os.Rename(dir, dir+".away"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	res, err := f.refresh(t, layout)
-	if err == nil || !strings.Contains(err.Error(), "not the directory that was materialized") || res.Volumes[0].Outcome != RefreshFailed {
-		t.Errorf("Refresh = %v (outcome %s), want RefreshFailed for a replaced mount dir", err, res.Volumes[0].Outcome)
 	}
 }

@@ -37,8 +37,15 @@ limitations under the License.
 //
 // Secrets and the projected ServiceAccount token are reported as credentials in
 // the returned Layout so the caller hands them to sandbox.Generate as the
-// read-only sub-scope (file-read* + an explicit file-write* deny) — a pod can
-// read its credentials but never overwrite them.
+// read-only sub-scope (file-read* + an explicit file-write* deny): a pod cannot
+// write the files at its credential mount paths. That is a rule on paths, not
+// on the files: a pod can rename a parent of a credential mount aside (it
+// writes its rootfs), after which the live generation's files sit outside the
+// sub-scope and the pod can change them, and it can put a directory of its own
+// at the mount path. So the live generation's content is not
+// integrity-protected against the pod itself; the daemon never reads it back
+// unless it is the generation the daemon recorded (see below), and a refresh
+// of a replaced mount dir renders it fresh.
 //
 // # Refresh: the atomic-writer layout
 //
@@ -85,8 +92,21 @@ limitations under the License.
 //
 // The rendered files are owned by the daemon's uid, which is the uid a pod
 // runs as unless it drops to another one, so their mode bits protect nothing
-// from the pod: the SBPL read-only sub-scope on a credential mount is the
-// only thing that keeps a pod from overwriting its credentials.
+// from the pod: the SBPL read-only sub-scope on a credential mount's path is
+// the only thing that keeps a pod from writing the files there, and it holds
+// only while those files stay at that path (above).
+//
+// Every tree a refresh removes from a mount dir can be the pod's, so removal
+// is bounded too (pathsafe.RemoveTreeAt with removeBounds), and holds a
+// constant number of descriptors however deep the tree is: a ..data that is no
+// link is renamed aside to a ..trash_ name first and removed from there (over
+// a bound the refresh fails and the rest stays aside; the next refresh
+// renders), a generation the pod grew while it was rendered is removed within
+// the bound, and the previous generation is removed only when it was the
+// trusted live one. A mount dir that is not the one recorded is rendered as
+// after a restart: fresh, with nothing read from it, and recorded anew. A
+// render that would write more than maxVolumeBytes fails, so a volume too
+// large to refresh fails its create.
 //
 // Still by path: the data volume itself and the pod dir above it (the
 // daemon's own paths; see openAnchor for what that trusts), the subPath
