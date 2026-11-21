@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"k3sm.io/runtimed/pkg/pathsafe"
@@ -237,9 +238,10 @@ func TestRefreshRefusesAnUnsafeMountDir(t *testing.T) {
 
 // TestRefreshDoesNotFollowPlantedLinks: the names the layout itself uses, set
 // by the pod to symlinks that lead out of its tree, are never followed. A
-// ..data that names a generation-shaped link is refused before anything is
-// written; a key name that is a link to a file outside is replaced as a link,
-// and the file it named is left alone.
+// ..data that names a generation-shaped link is not trusted as the live
+// generation: the volume is rendered fresh, the flip replaces ..data, and the
+// planted link is removed as a link. A key name that is a link to a file
+// outside is replaced as a link, and the file it named is left alone.
 func TestRefreshDoesNotFollowPlantedLinks(t *testing.T) {
 	t.Run("..data names a link to outside", func(t *testing.T) {
 		f := newPinFixture(t)
@@ -255,8 +257,14 @@ func TestRefreshDoesNotFollowPlantedLinks(t *testing.T) {
 			t.Fatal(err)
 		}
 		res, err := f.refresh(t, layout)
-		if err == nil || res.Volumes[0].Outcome != RefreshFailed {
-			t.Errorf("Refresh = %v (outcome %s), want RefreshFailed", err, res.Volumes[0].Outcome)
+		if err != nil || res.Volumes[0].Outcome != RefreshUpdated {
+			t.Errorf("Refresh = %v (outcome %s), want a fresh render made live", err, res.Volumes[0].Outcome)
+		}
+		if got := liveGen(t, dir); got == "..evil" {
+			t.Error("..data still names the planted link")
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "..evil")); err == nil {
+			t.Error("the planted link was not removed")
 		}
 		f.checkVictim(t)
 	})
@@ -293,9 +301,203 @@ func TestRefreshDoesNotFollowPlantedLinks(t *testing.T) {
 		if err := os.Symlink("..evil", filepath.Join(dir, dataLink)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Materialize(context.Background(), f.box, f.root, "", f.r); err == nil {
-			t.Error("Materialize over a planted ..data succeeded")
+		if _, err := Materialize(context.Background(), f.box, f.root, "", f.r); err != nil {
+			t.Errorf("Materialize over a planted ..data: %v, want a fresh render", err)
+		}
+		if got := liveGen(t, dir); got == "..evil" {
+			t.Error("..data still names the planted link")
 		}
 		f.checkVictim(t)
 	})
+}
+
+// TestWriteFileRefusesAPlantedHardLink: a pod watching a new generation dir can
+// plant a name in it while the render waits on the resolver, a hard link to a
+// file it may not write among them. writeFile refuses a name this render did
+// not create (and never truncates it), and verifyGeneration refuses a file
+// with more than one link, so the target is never written and the generation
+// never goes live.
+func TestWriteFileRefusesAPlantedHardLink(t *testing.T) {
+	outside := t.TempDir()
+	target := filepath.Join(outside, "other-tenant")
+	if err := os.WriteFile(target, []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("writeFile", func(t *testing.T) {
+		dir := t.TempDir()
+		flips := countFlips(t, nil)
+		_, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
+			if err := os.Link(target, gen.join("k")); err != nil {
+				t.Fatal(err)
+			}
+			return writeFile(gen, "k", []byte("pod-chosen"), 0o644)
+		})
+		if err == nil || !strings.Contains(err.Error(), "did not create") {
+			t.Errorf("err = %v, want writeFile to refuse the planted name", err)
+		}
+		if *flips != 0 {
+			t.Error("the generation went live")
+		}
+	})
+	t.Run("verifyGeneration", func(t *testing.T) {
+		dir := t.TempDir()
+		_, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
+			if err := writeFile(gen, "a", []byte("x"), 0o644); err != nil {
+				return err
+			}
+			return os.Link(target, gen.join("k"))
+		})
+		if err == nil || !strings.Contains(err.Error(), "hard links") {
+			t.Errorf("err = %v, want verifyGeneration to refuse the linked file", err)
+		}
+	})
+	t.Run("a second write of a name this render created", func(t *testing.T) {
+		dir := t.TempDir()
+		_, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
+			if err := writeFile(gen, "k", []byte("first, longer"), 0o644); err != nil {
+				return err
+			}
+			return writeFile(gen, "k", []byte("second"), 0o600)
+		})
+		if err != nil {
+			t.Fatalf("writeGeneration: %v", err)
+		}
+		if got := readString(t, filepath.Join(dir, "k")); got != "second" {
+			t.Errorf("k = %q, want the second write, truncated", got)
+		}
+	})
+	if got := readString(t, target); got != "theirs" {
+		t.Errorf("the linked file became %q", got)
+	}
+}
+
+// tokenPinBox is a pod with one projected ServiceAccount token at /sa.
+func tokenPinBox() *runtimev1.PodBox {
+	return mountBox([]*runtimev1.Volume{{Name: "tok", Projected: &runtimev1.ProjectedVolumeSource{
+		Sources: []*runtimev1.VolumeProjection{
+			{ServiceAccountToken: &runtimev1.ServiceAccountTokenProjection{Path: "token", ExpirationSeconds: 3600}},
+		},
+	}}}, &runtimev1.VolumeMount{Name: "tok", MountPath: "/sa"})
+}
+
+// TestRefreshTrustsOnlyTheGenerationItMadeLive: a pod points ..data at a
+// directory of its own whose token is a hard link to a file it can name but
+// not read. The token is fresh, so the refresh would re-read it from the live
+// generation; it must not: the live generation is not the one the last render
+// made live, so it is not trusted, a token is minted, and the linked file's
+// bytes never reach the generation the pod reads.
+func TestRefreshTrustsOnlyTheGenerationItMadeLive(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "unreadable-by-the-pod")
+	if err := os.WriteFile(secret, []byte("NOT-FOR-THE-POD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newRefreshResolver()
+	box := tokenPinBox()
+	layout, err := Materialize(ctx, box, root, "", r)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	dir := filepath.Join(root, "sa")
+	planted := filepath.Join(dir, "..2020_01_01_00_00_00.1")
+	if err := os.Mkdir(planted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(secret, filepath.Join(planted, "token")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(planted), filepath.Join(dir, "..data_pod")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "..data_pod"), filepath.Join(dir, dataLink)); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Refresh(ctx, root, box, r, RefreshOptions{State: layout.State})
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if r.count("token") != 2 {
+		t.Errorf("token mints = %d, want a fresh mint for an untrusted live generation", r.count("token"))
+	}
+	if got := readString(t, filepath.Join(dir, "token")); got != "TOKEN-2" {
+		t.Errorf("token = %q, want the fresh TOKEN-2", got)
+	}
+	if res.Volumes[0].Outcome != RefreshUpdated {
+		t.Errorf("outcome = %s, want Updated", res.Volumes[0].Outcome)
+	}
+	if got := readString(t, secret); got != "NOT-FOR-THE-POD" {
+		t.Errorf("the linked file changed: %q", got)
+	}
+
+	// And the generation it made live is trusted next time: a fresh token is
+	// re-read, not minted.
+	if _, err := Refresh(ctx, root, box, r, RefreshOptions{State: res.State}); err != nil {
+		t.Fatalf("second Refresh: %v", err)
+	}
+	if r.count("token") != 2 {
+		t.Errorf("token mints = %d after a refresh of a trusted generation, want still 2", r.count("token"))
+	}
+}
+
+// TestRefreshBoundsWhatItReadsFromThePod: the live generation is the pod's to
+// write in a writable mount. A tree nested past maxTreeDepth there makes the
+// comparison fail for that volume rather than walk it.
+func TestRefreshBoundsWhatItReadsFromThePod(t *testing.T) {
+	f := newPinFixture(t)
+	layout := f.materialize(t)
+	dir := filepath.Join(f.root, "data/x/cfg")
+	deep := filepath.Join(dir, liveGen(t, dir))
+	for i := 0; i < maxTreeDepth+2; i++ {
+		deep = filepath.Join(deep, "d")
+	}
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := f.refresh(t, layout)
+	if !errors.Is(err, errTreeTooLarge) || res.Volumes[0].Outcome != RefreshFailed {
+		t.Errorf("Refresh = %v (outcome %s), want RefreshFailed with errTreeTooLarge", err, res.Volumes[0].Outcome)
+	}
+}
+
+// TestRefreshReplacesADataDirectory: a ..data the pod made a directory would
+// freeze the mount (a symlink cannot be renamed over a directory). It is
+// removed and the volume rendered fresh.
+func TestRefreshReplacesADataDirectory(t *testing.T) {
+	f := newPinFixture(t)
+	layout := f.materialize(t)
+	dir := filepath.Join(f.root, "data/x/cfg")
+	if err := os.Remove(filepath.Join(dir, dataLink)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, dataLink, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := f.refresh(t, layout)
+	if err != nil || res.Volumes[0].Outcome != RefreshUpdated {
+		t.Fatalf("Refresh = %v (outcome %s), want Updated", err, res.Volumes[0].Outcome)
+	}
+	if got := readString(t, filepath.Join(dir, "a")); got != "pod-chosen-2" {
+		t.Errorf("a = %q, want the refreshed value", got)
+	}
+}
+
+// TestRefreshRefusesAReplacedMountDir: the mount dir renamed away and a plain
+// directory made in its place is not the directory Materialize rendered into.
+func TestRefreshRefusesAReplacedMountDir(t *testing.T) {
+	f := newPinFixture(t)
+	layout := f.materialize(t)
+	dir := filepath.Join(f.root, "data/x/cfg")
+	if err := os.Rename(dir, dir+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := f.refresh(t, layout)
+	if err == nil || !strings.Contains(err.Error(), "not the directory that was materialized") || res.Volumes[0].Outcome != RefreshFailed {
+		t.Errorf("Refresh = %v (outcome %s), want RefreshFailed for a replaced mount dir", err, res.Volumes[0].Outcome)
+	}
 }

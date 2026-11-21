@@ -198,6 +198,7 @@ func MaterializeShares(ctx context.Context, box *runtimev1.PodBox, podDir string
 				if err != nil {
 					return fmt.Errorf("open share dir %s for volume %s: %w", dir, b.VolumeName, err)
 				}
+				d.replace = true // a re-run create renders over the last one
 				_, err = newRender(box, podIP, r, time.Now, "", nil).volume(ctx, vol, d)
 				d.close()
 				if err != nil {

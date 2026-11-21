@@ -18,9 +18,9 @@ limitations under the License.
 
 package mount
 
-import "k3sm.io/runtimed/pkg/image"
+import "errors"
 
-// defaultCloner is the portable (non-darwin) Cloner: it always byte-copies. There
-// is no APFS clone off darwin; runtimed targets darwin/arm64, so this exists only
-// so the package builds and unit-tests run on a non-darwin host.
-func defaultCloner() image.Cloner { return image.ByteCopier{} }
+// clonefileAt is unsupported off darwin, where there is no APFS clone:
+// cloneFileAt byte-copies instead. runtimed targets darwin/arm64, so this
+// exists only so the package builds and unit-tests run on a non-darwin host.
+func clonefileAt(int, string, int, string) error { return errors.ErrUnsupported }

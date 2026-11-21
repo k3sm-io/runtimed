@@ -238,7 +238,8 @@ func viewTarget(view, subPath string) (string, error) {
 // replaced and created relative to that descriptor: a stale symlink at dest is
 // replaced, and any other existing entry is refused.
 func placeLink(dataVol, dest, target string) error {
-	// The data volume lies in the pod dir, which the pod cannot write.
+	// The data volume is the daemon's path (see openAnchor for what that
+	// trusts).
 	if err := os.MkdirAll(dataVol, 0o755); err != nil {
 		return fmt.Errorf("create pod data volume %s: %w", dataVol, err)
 	}

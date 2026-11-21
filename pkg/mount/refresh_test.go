@@ -158,7 +158,7 @@ func layoutShape(t *testing.T, dir string) map[string]string {
 		switch {
 		case name == gen:
 			name = "<gen>"
-			snap, err := snapshotTree(openTestDir(t, filepath.Join(dir, gen)))
+			snap, err := snapshotTree(openTestDir(t, filepath.Join(dir, gen)), true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -197,7 +197,7 @@ func countFlips(t *testing.T, want map[string]string) *int {
 			}
 			dir := &dirTarget{fd: tofd}
 			for k, v := range want {
-				if got, err := readFileAt(dir, filepath.Join(target, k)); err != nil || string(got) != v {
+				if got, err := readFileAt(dir, filepath.Join(target, k), maxVolumeBytes); err != nil || string(got) != v {
 					t.Errorf("at the flip, %s/%s = %q (%v), want %q: the new tree must be complete before it goes live", target, k, got, err, v)
 				}
 			}
@@ -501,7 +501,7 @@ func TestWriteGenerationRefusesUnsafeGenerations(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			if _, err := writeGeneration(openTestDir(t, dir), func(gen, _ *dirTarget) error {
+			if _, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
 				return os.WriteFile(gen.join("k"), []byte("old"), 0o644)
 			}); err != nil {
 				t.Fatalf("seed generation: %v", err)
@@ -509,7 +509,7 @@ func TestWriteGenerationRefusesUnsafeGenerations(t *testing.T) {
 			oldGen := liveGen(t, dir)
 
 			flips := countFlips(t, nil)
-			flipped, err := writeGeneration(openTestDir(t, dir), func(gen, _ *dirTarget) error {
+			flipped, _, err := writeGeneration(openTestDir(t, dir), nil, func(gen, _ *dirTarget) error {
 				tc.plant(t, gen.path)
 				return nil
 			})

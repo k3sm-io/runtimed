@@ -68,22 +68,33 @@ limitations under the License.
 // and the re-read of a still-fresh token — then acts relative to that
 // descriptor or the generation's own: mkdirat, openat with O_CREAT|O_EXCL and
 // O_NOFOLLOW, fchmod, symlinkat, renameat, readlinkat, unlinkat and a
-// descriptor-relative tree removal (pathsafe.RemoveTreeAt). What a name means
-// after it was opened cannot redirect a write.
+// descriptor-relative tree removal (pathsafe.RemoveTreeAt). A subPath
+// selection is cloned into place with clonefileat(2) relative to the pinned
+// destination, and an image volume's view link is placed with symlinkat. What
+// a name means after it was opened cannot redirect a write.
 //
-// An image volume's view link (LinkImageVolumes) is placed the same way.
+// The pod can also write into the tree while the daemon works in it: plant a
+// name in a generation being rendered, or point ..data at a directory of its
+// own. So a render writes only names it created (a planted one is refused,
+// never truncated), a rendered or re-read file must have one link, the mount
+// dir and the live generation must be the ones the previous render recorded
+// (RefreshState.Mounts) before anything is read back from the live
+// generation, and every read and walk of a generation is bounded
+// (maxVolumeBytes, maxTreeEntries, maxTreeDepth; over a bound the volume's
+// refresh fails).
 //
-// Still by path: the data volume itself (it lies in the pod dir, which the pod
-// cannot write), the subPath staging dir (a daemon-owned sibling of the data
-// volume), a vm pod's share roots and emptyDir share dirs (MaterializeShares
-// creates them under the pod dir after pathsafe.RefuseSymlinkedPath, a
-// pre-check; the proj volumes rendered into them go through descriptors), and
-// the subPath clone into its destination. The destination's
-// directories are created and checked through descriptors first, but the
-// clone (image.MaterializeTree for a directory, Cloner.Clone for a file) then
-// takes the path, so a pod process already running when the pod is created
-// could swap a component between the check and the clone. subPath mounts are
-// never refreshed, so this window exists at create only.
+// The rendered files are owned by the daemon's uid, which is the uid a pod
+// runs as unless it drops to another one, so their mode bits protect nothing
+// from the pod: the SBPL read-only sub-scope on a credential mount is the
+// only thing that keeps a pod from overwriting its credentials.
+//
+// Still by path: the data volume itself and the pod dir above it (the
+// daemon's own paths; see openAnchor for what that trusts), the subPath
+// staging dir (a daemon-owned sibling of the data volume, created and
+// removed by path), and a vm pod's share roots and emptyDir share dirs
+// (MaterializeShares creates them under the pod dir after
+// pathsafe.RefuseSymlinkedPath, a pre-check; the proj volumes rendered into
+// them go through descriptors).
 //
 // # subPath
 //

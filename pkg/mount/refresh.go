@@ -64,16 +64,24 @@ type RefreshState struct {
 	// Tokens holds, per projected token file (mount dir joined with the
 	// projection path), when that token was issued.
 	Tokens map[string]TokenIssue
+	// Mounts holds, per generation-backed mount dir, the directory and the
+	// generation the last render made live in it (MountIdentity). Refresh
+	// refuses a mount dir that is not that directory, and trusts the live
+	// generation only when it is that one.
+	Mounts map[string]MountIdentity
 }
 
 // clone returns a deep copy of s with non-nil maps.
 func (s RefreshState) clone() RefreshState {
-	out := RefreshState{Immutable: maps.Clone(s.Immutable), Tokens: maps.Clone(s.Tokens)}
+	out := RefreshState{Immutable: maps.Clone(s.Immutable), Tokens: maps.Clone(s.Tokens), Mounts: maps.Clone(s.Mounts)}
 	if out.Immutable == nil {
 		out.Immutable = map[string]bool{}
 	}
 	if out.Tokens == nil {
 		out.Tokens = map[string]TokenIssue{}
+	}
+	if out.Mounts == nil {
+		out.Mounts = map[string]MountIdentity{}
 	}
 	return out
 }
@@ -88,6 +96,10 @@ func (s *RefreshState) record(pm plannedMount, rd *render) {
 		}
 	}
 	maps.Copy(s.Tokens, rd.tokens)
+	if s.Mounts == nil {
+		s.Mounts = map[string]MountIdentity{}
+	}
+	s.Mounts[pm.dest] = rd.identity
 }
 
 // RefreshOptions parameterizes one Refresh.
@@ -196,6 +208,9 @@ func Refresh(ctx context.Context, root string, box *runtimev1.PodBox, r Resolver
 			continue
 		}
 		rd := newRender(box, opts.PodIP, r, now, pm.dest, opts.State.Tokens)
+		if id, ok := opts.State.Mounts[pm.dest]; ok {
+			rd.expect = &id
+		}
 		_, flipped, gerr := rd.generation(ctx, pm, dir)
 		dir.close()
 		switch {

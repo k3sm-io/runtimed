@@ -60,58 +60,94 @@ const (
 // renameAt is unix.Renameat, a seam so a test can observe the flip.
 var renameAt = unix.Renameat
 
+// MountIdentity is what a render leaves for the next Refresh of one
+// generation-backed mount: the mount dir's device and inode, and the name,
+// device and inode of the generation made live in it. Refresh trusts the live
+// generation it finds only when it is exactly that one; the pod can write a
+// mount dir (a configMap mount it may write, or anything it renames into the
+// mount path) and could otherwise plant a ..data naming a directory of its
+// own, whose files the daemon would read back as the live generation.
+type MountIdentity struct {
+	DirDev, DirIno   uint64
+	Live             string
+	LiveDev, LiveIno uint64
+}
+
 // writeGeneration renders one generation of dir and makes it live. fill renders
 // the content into gen (a fresh, empty generation dir inside dir) and is handed
-// live, the current generation dir (nil if there is none).
+// live, the current generation dir, or nil when there is none it can trust.
+// expect is what the previous render of dir left (nil at create, or after a
+// daemon restart): the mount dir must still be that directory, and the
+// generation ..data names is trusted as live only when it is the one expect
+// names. An untrusted or missing live generation means a full render (a token
+// is minted fresh) and a flip, never a comparison. It returns the identity to
+// expect next time.
 //
-// dir is an open directory (dirTarget), reached from a directory the pod
-// cannot replace without following a link (openUnder). Every step below acts
-// relative to it, or to the generation's own descriptor, and never through a
-// path: a pod can rename any directory of its data volume away and plant a
-// symlink in its place, and a path through it would make the daemon create,
-// replace and remove entries wherever the link points.
+// dir is an open directory (dirTarget), reached from the data volume without
+// following a link (openUnder). Every step below acts relative to it, or to
+// the generation's own descriptor, and never through a path: a pod can rename
+// any directory of its data volume away and plant a symlink in its place, and
+// a path through it would make the daemon create, replace and remove entries
+// wherever the link points.
 //
 // The steps, in order, and what each guarantees:
 //
-//  1. fill renders into a new generation dir. On any error the new dir is
+//  1. A ..data that is not a symlink (a directory or a file the pod put there)
+//     is removed, so it cannot freeze the mount's rotation; one that names
+//     something other than a generation is replaced by the flip.
+//  2. fill renders into a new generation dir. On any error the new dir is
 //     removed and the live generation is untouched.
-//  2. The new generation is checked (verifyGeneration): regular files and
-//     directories only, and no top-level name starting "..". It is walked
-//     through its descriptor, so what is checked is what was rendered — the
-//     CVE-2021-25741 containment check, done before anything a reader can
-//     reach points at it.
-//  3. A generation identical to the live one is discarded (no flip): a refresh
-//     of unchanged data changes nothing on disk.
-//  4. The generation's name must still be the directory that was rendered;
+//  3. The new generation is checked (verifyGeneration): regular files with
+//     one link and directories only, and no top-level name starting "..". It
+//     is walked through its descriptor, so what is checked is what was
+//     rendered — the CVE-2021-25741 containment check, done before anything a
+//     reader can reach points at it.
+//  4. A generation identical to a trusted live one is discarded (no flip): a
+//     refresh of unchanged data changes nothing on disk.
+//  5. The generation's name must still be the directory that was rendered;
 //     then ..data is flipped by renaming a freshly created symlink over it —
 //     one rename(2), atomic for every reader.
-//  5. Missing top-level <key> -> ..data/<key> symlinks are created; one that
+//  6. Missing top-level <key> -> ..data/<key> symlinks are created; one that
 //     already exists is left alone.
-//  6. The previous generation is removed, then any top-level symlink into
-//     ..data whose key no longer exists.
+//  7. The generation ..data named before is removed, then any top-level
+//     symlink into ..data whose key no longer exists.
 //
-// It never writes into the live generation. flipped reports whether step 4 ran.
-func writeGeneration(dir *dirTarget, fill func(gen, live *dirTarget) error) (flipped bool, err error) {
+// It never writes into the live generation. flipped reports whether step 5 ran.
+func writeGeneration(dir *dirTarget, expect *MountIdentity, fill func(gen, live *dirTarget) error) (flipped bool, now MountIdentity, err error) {
+	var dst unix.Stat_t
+	if err := unix.Fstat(dir.fd, &dst); err != nil {
+		return false, now, fmt.Errorf("stat mount dir %s: %w", dir.path, err)
+	}
+	now.DirDev, now.DirIno = uint64(dst.Dev), uint64(dst.Ino)
+	if expect != nil && (expect.DirDev != now.DirDev || expect.DirIno != now.DirIno) {
+		return false, now, fmt.Errorf("mount dir %s is not the directory that was materialized", dir.path)
+	}
+
 	var live *dirTarget
 	var oldGen string
-	if target, lerr := readlinkAt(dir.fd, dataLink); lerr == nil {
-		if !isGenerationName(target) {
-			return false, fmt.Errorf("%s/%s points at %q, not a generation dir", dir.path, dataLink, target)
-		}
+	switch target, lerr := readlinkAt(dir.fd, dataLink); {
+	case lerr == nil && isGenerationName(target):
 		oldGen = target
-		lfd, err := unix.Openat(dir.fd, target, pathsafe.DirFlags, 0)
-		if err != nil {
-			return false, fmt.Errorf("open live generation %s: %w", dir.join(target), err)
+		if l, id, ok := openTrusted(dir, target, expect); ok {
+			live = l
+			defer live.close()
+			now.Live, now.LiveDev, now.LiveIno = target, id.dev, id.ino
 		}
-		live = &dirTarget{fd: lfd, path: dir.join(target)}
-		defer live.close()
-	} else if !errors.Is(lerr, unix.ENOENT) {
-		return false, fmt.Errorf("read %s/%s: %w", dir.path, dataLink, lerr)
+	case lerr == nil, errors.Is(lerr, unix.ENOENT):
+		// A link to something that is no generation: the flip replaces it.
+	case errors.Is(lerr, unix.EINVAL):
+		// Not a symlink: a directory or file the pod made. The flip cannot
+		// rename over a directory, so it goes first.
+		if err := pathsafe.RemoveTreeAt(dir.fd, dataLink); err != nil {
+			return false, now, fmt.Errorf("remove %s/%s, which is not a symlink: %w", dir.path, dataLink, err)
+		}
+	default:
+		return false, now, fmt.Errorf("read %s/%s: %w", dir.path, dataLink, lerr)
 	}
 
 	genName, gen, err := makeGeneration(dir)
 	if err != nil {
-		return false, err
+		return false, now, err
 	}
 	defer gen.close()
 	keep := false
@@ -123,42 +159,44 @@ func writeGeneration(dir *dirTarget, fill func(gen, live *dirTarget) error) (fli
 		}
 	}()
 	if err := unix.Fchmod(gen.fd, uint32(generationMode)); err != nil {
-		return false, fmt.Errorf("chmod generation dir: %w", err)
+		return false, now, fmt.Errorf("chmod generation dir: %w", err)
 	}
 
 	if err := fill(gen, live); err != nil {
-		return false, err
+		return false, now, err
 	}
 	keys, err := verifyGeneration(gen)
 	if err != nil {
-		return false, err
+		return false, now, err
 	}
 	if live != nil {
 		same, err := sameTree(live, gen)
 		if err != nil {
-			return false, err
+			return false, now, err
 		}
 		if same {
-			return false, nil
+			return false, now, nil
 		}
 	}
 
 	// Flip ..data: one rename of a fresh symlink over the old one, to a name
 	// that is still the directory rendered and verified above.
-	if !sameEntry(dir.fd, genName, gen.fd) {
-		return false, fmt.Errorf("generation %s is no longer the directory that was rendered", gen.path)
+	var gst unix.Stat_t
+	if err := unix.Fstat(gen.fd, &gst); err != nil || !sameEntry(dir.fd, genName, gen.fd) {
+		return false, now, fmt.Errorf("generation %s is no longer the directory that was rendered", gen.path)
 	}
 	if err := unix.Unlinkat(dir.fd, dataLinkTmp, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-		return false, fmt.Errorf("clear %s: %w", dir.join(dataLinkTmp), err)
+		return false, now, fmt.Errorf("clear %s: %w", dir.join(dataLinkTmp), err)
 	}
 	if err := unix.Symlinkat(genName, dir.fd, dataLinkTmp); err != nil {
-		return false, fmt.Errorf("create %s: %w", dir.join(dataLinkTmp), err)
+		return false, now, fmt.Errorf("create %s: %w", dir.join(dataLinkTmp), err)
 	}
 	if err := renameAt(dir.fd, dataLinkTmp, dir.fd, dataLink); err != nil {
 		_ = unix.Unlinkat(dir.fd, dataLinkTmp, 0) // best effort; the next write clears it too
-		return false, fmt.Errorf("flip %s/%s: %w", dir.path, dataLink, err)
+		return false, now, fmt.Errorf("flip %s/%s: %w", dir.path, dataLink, err)
 	}
 	keep = true
+	now.Live, now.LiveDev, now.LiveIno = genName, uint64(gst.Dev), uint64(gst.Ino)
 
 	var errs []error
 	for key := range keys {
@@ -166,7 +204,7 @@ func writeGeneration(dir *dirTarget, fill func(gen, live *dirTarget) error) (fli
 			errs = append(errs, err)
 		}
 	}
-	if oldGen != "" {
+	if oldGen != "" && oldGen != genName {
 		if err := pathsafe.RemoveTreeAt(dir.fd, oldGen); err != nil {
 			errs = append(errs, fmt.Errorf("remove previous generation %s: %w", oldGen, err))
 		}
@@ -174,7 +212,25 @@ func writeGeneration(dir *dirTarget, fill func(gen, live *dirTarget) error) (fli
 	if err := pruneKeys(dir, keys); err != nil {
 		errs = append(errs, err)
 	}
-	return true, errors.Join(errs...)
+	return true, now, errors.Join(errs...)
+}
+
+// openTrusted opens the generation name in dir without following a link and
+// reports it trusted only when expect names it with the same device and inode.
+func openTrusted(dir *dirTarget, name string, expect *MountIdentity) (*dirTarget, fileID, bool) {
+	if expect == nil || expect.Live != name {
+		return nil, fileID{}, false
+	}
+	fd, err := unix.Openat(dir.fd, name, pathsafe.DirFlags, 0)
+	if err != nil {
+		return nil, fileID{}, false
+	}
+	var st unix.Stat_t
+	if unix.Fstat(fd, &st) != nil || uint64(st.Dev) != expect.LiveDev || uint64(st.Ino) != expect.LiveIno {
+		unix.Close(fd)
+		return nil, fileID{}, false
+	}
+	return &dirTarget{fd: fd, path: dir.join(name)}, idOf(&st), true
 }
 
 // makeGeneration creates a new, uniquely named generation dir in dir (0700
@@ -210,8 +266,8 @@ func isGenerationName(name string) bool {
 }
 
 // verifyGeneration checks a rendered generation before it can go live and
-// returns its top-level entry names. Every entry must be a regular file or a
-// directory — a render writes key->bytes only, so a symlink here is either a
+// returns its top-level entry names. Every entry must be a regular file with
+// one link or a directory — a render writes key->bytes only, so a symlink here is either a
 // bug or an attack, and refusing it closes the CVE-2021-25741 class (a link
 // resolved against the host root, k3sm having no mount namespace). No top-level
 // name may start with "..", the namespace the layout itself uses. The walk goes
@@ -223,6 +279,9 @@ func verifyGeneration(gen *dirTarget) (map[string]struct{}, error) {
 		kind := uint32(st.Mode) & unix.S_IFMT
 		if kind != unix.S_IFREG && kind != unix.S_IFDIR {
 			return fmt.Errorf("entry %q is neither a regular file nor a directory", rel)
+		}
+		if kind == unix.S_IFREG && st.Nlink != 1 {
+			return fmt.Errorf("entry %q has %d hard links; a rendered file has one", rel, st.Nlink)
 		}
 		if !strings.ContainsRune(rel, filepath.Separator) {
 			if strings.HasPrefix(rel, "..") {
@@ -265,7 +324,7 @@ func linkKey(dir *dirTarget, key string) error {
 // pruneKeys removes every top-level symlink of dir that points into ..data but
 // whose key is not in keys (a key the new generation dropped).
 func pruneKeys(dir *dirTarget, keys map[string]struct{}) error {
-	names, err := listAt(dir.fd, dir.path)
+	names, err := listAt(dir.fd, dir.path, maxTreeEntries)
 	if err != nil {
 		return fmt.Errorf("list mount dir: %w", err)
 	}
@@ -289,7 +348,9 @@ func pruneKeys(dir *dirTarget, keys map[string]struct{}) error {
 }
 
 // sameTree reports whether two generation dirs hold the same entries with the
-// same kinds, permission bits, and file contents.
+// same kinds, permission bits, and file contents. The kinds, bits and sizes
+// are compared first, and the contents are read only when those all agree;
+// each tree's reads are bounded (snapshotTree).
 //
 // The trade, stated: every refresh of a changeable volume re-renders it and then
 // re-reads and diffs BOTH generations in full — for a token or downwardAPI
@@ -298,21 +359,23 @@ func pruneKeys(dir *dirTarget, keys map[string]struct{}) error {
 // Secret and token bytes in the daemon for the pod's lifetime. Projected volumes
 // are small, so the read is chosen over caching credential bytes.
 func sameTree(a, b *dirTarget) (bool, error) {
-	ta, err := snapshotTree(a)
-	if err != nil {
-		return false, err
-	}
-	tb, err := snapshotTree(b)
-	if err != nil {
-		return false, err
-	}
-	if len(ta) != len(tb) {
-		return false, nil
-	}
-	for rel, ea := range ta {
-		eb, ok := tb[rel]
-		if !ok || ea.mode != eb.mode || !bytes.Equal(ea.data, eb.data) {
+	for _, withData := range []bool{false, true} {
+		ta, err := snapshotTree(a, withData)
+		if err != nil {
+			return false, err
+		}
+		tb, err := snapshotTree(b, withData)
+		if err != nil {
+			return false, err
+		}
+		if len(ta) != len(tb) {
 			return false, nil
+		}
+		for rel, ea := range ta {
+			eb, ok := tb[rel]
+			if !ok || ea.mode != eb.mode || ea.size != eb.size || !bytes.Equal(ea.data, eb.data) {
+				return false, nil
+			}
 		}
 	}
 	return true, nil
@@ -321,21 +384,29 @@ func sameTree(a, b *dirTarget) (bool, error) {
 // treeEntry is one entry of a snapshotTree.
 type treeEntry struct {
 	mode os.FileMode
+	size int64
 	data []byte
 }
 
 // snapshotTree reads every entry under the open directory root: its
-// type+permission bits and, for a regular file, its content, each reached
-// relative to its parent's descriptor without following a link.
-func snapshotTree(root *dirTarget) (map[string]treeEntry, error) {
+// type+permission bits, its size and, for a regular file when withData is
+// set, its content, each reached relative to its parent's descriptor without
+// following a link. The walk is bounded (walkAt), and so is the content read
+// in all: more than maxVolumeBytes is errTreeTooLarge.
+func snapshotTree(root *dirTarget, withData bool) (map[string]treeEntry, error) {
 	out := map[string]treeEntry{}
+	budget := int64(maxVolumeBytes)
 	err := walkAt(root, func(rel string, st *unix.Stat_t, parent int, name string) error {
-		e := treeEntry{mode: fileMode(st)}
-		if e.mode.IsRegular() {
+		e := treeEntry{mode: fileMode(st), size: st.Size}
+		if withData && e.mode.IsRegular() {
+			if e.size > budget {
+				return fmt.Errorf("%w: more than %d bytes under %s", errTreeTooLarge, maxVolumeBytes, root.path)
+			}
 			var err error
-			if e.data, err = readFileAt(&dirTarget{fd: parent, path: filepath.Dir(root.join(rel))}, name); err != nil {
+			if e.data, err = readFileAt(&dirTarget{fd: parent, path: filepath.Dir(root.join(rel))}, name, budget); err != nil {
 				return err
 			}
+			budget -= int64(len(e.data))
 		}
 		out[rel] = e
 		return nil

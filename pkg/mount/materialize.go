@@ -20,13 +20,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/pathsafe"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -280,15 +284,16 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 		return nil, err
 	}
 
-	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}}}
+	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}, Mounts: map[string]MountIdentity{}}}
 	for _, pm := range plans {
 		if pm.class == classImage {
 			continue // linked by LinkImageVolumes, never materialized
 		}
-		// The data volume itself lies in the pod dir, which the pod cannot
-		// write, so it is created by path like the pod dir; everything below
-		// it is reached from it without following a link (openUnder), which
-		// also refuses a data volume that is a symlink.
+		// The data volume itself is the daemon's path and is created by path
+		// like the pod dir; everything below it is reached from it without
+		// following a link (openUnder), which also refuses a data volume that
+		// is a symlink. See openAnchor for what that trusts: a profile whose
+		// dataVolumePath is the pod dir lets the pod replace the data volume.
 		if err := os.MkdirAll(dataVol, 0o755); err != nil {
 			return nil, fmt.Errorf("create pod data volume %s: %w", dataVol, err)
 		}
@@ -370,6 +375,11 @@ type render struct {
 	prev      map[string]TokenIssue
 	live      *dirTarget
 
+	// expect is the mount's identity the previous render left (nil at create
+	// or after a daemon restart); identity is the one this render leaves.
+	expect   *MountIdentity
+	identity MountIdentity
+
 	// fetched / allImmutable: at least one ConfigMap/Secret was fetched, and
 	// every one fetched reported Immutable. volatile: the volume has a token or
 	// downward-API source, whose content can change regardless.
@@ -406,7 +416,7 @@ func (rd *render) immutable() bool {
 // the volume is a credential and whether the flip happened (false: the content
 // equalled the live generation, which is kept).
 func (rd *render) generation(ctx context.Context, pm plannedMount, dir *dirTarget) (credential, flipped bool, err error) {
-	flipped, err = writeGeneration(dir, func(gen, live *dirTarget) error {
+	flipped, rd.identity, err = writeGeneration(dir, rd.expect, func(gen, live *dirTarget) error {
 		rd.live = live
 		var rerr error
 		credential, rerr = rd.volume(ctx, pm.vol, gen)
@@ -529,41 +539,118 @@ func materializeSubPath(ctx context.Context, podIP string, vol *runtimev1.Volume
 	// tree (MaterializeTree); a FILE element IS the mount path (clone the file only,
 	// after creating its parent) — never MkdirAll(dest) for a file (that is EISDIR).
 	//
-	// SECURITY INVARIANT (dir case): MaterializeTree copies interior symlinks
-	// verbatim, and containment is verified only at the selection point (resolved),
-	// not per interior entry. This is safe ONLY because every source materialized
-	// here renders REGULAR FILES ONLY — configMap/secret/downwardAPI/projected write
-	// key->bytes, and an emptyDir is empty at this up-front, once-per-pod-create pass
-	// (no restart path re-materializes a container-populated emptyDir). If a future
-	// source can contain a symlink, the dir path MUST re-check containment per entry:
-	// an absolute interior symlink would resolve against the HOST root at runtime
-	// (k3sm has no mount namespace) — the CVE-2021-25741 escape class.
-	//
-	// The destination's directories are created and checked from the data
-	// volume one component at a time without following a link, and a
-	// component that is a symlink or not a directory is refused. The clone
-	// itself is then made by path: a window remains between the check and the
-	// clone (see the package doc).
+	// The selection is copied through descriptors at both ends: the staged
+	// element is opened in the daemon-owned staging dir, the destination's
+	// directories are created and opened from the data volume one component at
+	// a time without following a link (a component that is a symlink or not a
+	// directory is refused), and each file is cloned with clonefileat(2) and
+	// CLONE_NOFOLLOW relative to the destination's descriptor (byte-copied
+	// through descriptors where APFS cannot clone). A directory selection
+	// holds regular files and directories only: anything else in it is
+	// refused (cloneTreeAt), the CVE-2021-25741 class, since a symlink would
+	// resolve against the host root at runtime (k3sm has no mount namespace).
 	if kind.IsDir() {
-		d, err := openUnder(dataVol, dest, true)
-		if err != nil {
-			return credential, fmt.Errorf("create sub_path mount dir %s: %w", dest, err)
-		}
-		d.close()
-		if _, err := image.MaterializeTree(defaultCloner(), resolved, dest); err != nil {
+		if err := cloneTreeAt(dataVol, resolved, dest); err != nil {
 			return credential, fmt.Errorf("materialize sub_path dir %q: %w", subPath, err)
 		}
 		return credential, nil
 	}
-	d, err := openUnder(dataVol, filepath.Dir(dest), true)
-	if err != nil {
-		return credential, fmt.Errorf("create sub_path parent %s: %w", filepath.Dir(dest), err)
-	}
-	d.close()
-	if _, err := defaultCloner().Clone(resolved, dest); err != nil {
+	if err := cloneFileTo(dataVol, resolved, dest); err != nil {
 		return credential, fmt.Errorf("clone sub_path file %q: %w", subPath, err)
 	}
 	return credential, nil
+}
+
+// cloneFileTo copies the staged regular file src to dest under dataVol. src's
+// directory is the daemon's own staging dir; dest's parent is reached from
+// dataVol without following a link, and dest must not exist.
+func cloneFileTo(dataVol, src, dest string) error {
+	sp, err := openAnchor(filepath.Dir(src))
+	if err != nil {
+		return err
+	}
+	defer sp.close()
+	dp, err := openUnder(dataVol, filepath.Dir(dest), true)
+	if err != nil {
+		return fmt.Errorf("create sub_path parent %s: %w", filepath.Dir(dest), err)
+	}
+	defer dp.close()
+	return cloneFileAt(sp.fd, filepath.Base(src), dp.fd, filepath.Base(dest))
+}
+
+// cloneTreeAt copies the staged directory src into dest under dataVol, keeping
+// its structure and modes. dest and every directory below it are reached from
+// dataVol without following a link; a file already at a destination name is
+// left in place (as image.MaterializeTree leaves it), and src may hold only
+// regular files and directories.
+func cloneTreeAt(dataVol, src, dest string) error {
+	st, err := openAnchor(src)
+	if err != nil {
+		return err
+	}
+	defer st.close()
+	dt, err := openUnder(dataVol, dest, true)
+	if err != nil {
+		return fmt.Errorf("create sub_path mount dir %s: %w", dest, err)
+	}
+	defer dt.close()
+	return walkAt(st, func(rel string, sst *unix.Stat_t, parent int, name string) error {
+		switch uint32(sst.Mode) & unix.S_IFMT {
+		case unix.S_IFDIR:
+			fd, err := pathsafe.OpenDirFrom(dt.fd, dt.path, rel, true, uint32(sst.Mode)&0o777|0o100)
+			if err != nil {
+				return err
+			}
+			unix.Close(fd)
+			return nil
+		case unix.S_IFREG:
+			pfd, err := pathsafe.OpenDirFrom(dt.fd, dt.path, filepath.Dir(rel), false, 0)
+			if err != nil {
+				return err
+			}
+			defer unix.Close(pfd)
+			var dst unix.Stat_t
+			if unix.Fstatat(pfd, name, &dst, unix.AT_SYMLINK_NOFOLLOW) == nil {
+				return nil // already there: left in place
+			}
+			return cloneFileAt(parent, name, pfd, name)
+		default:
+			return fmt.Errorf("sub_path entry %q is neither a regular file nor a directory", rel)
+		}
+	})
+}
+
+// cloneFileAt clones the regular file srcName under srcDir to dstName under
+// dstDir (which must not exist), never following a link at either end, and
+// byte-copies through descriptors where the volumes cannot clone.
+func cloneFileAt(srcDir int, srcName string, dstDir int, dstName string) error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(srcDir, srcName, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if uint32(st.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("%s is not a regular file", srcName)
+	}
+	err := clonefileAt(srcDir, srcName, dstDir, dstName)
+	if err == nil || !image.IsCloneUnsupported(err) {
+		return err
+	}
+	in, err := unix.Openat(srcDir, srcName, unix.O_RDONLY|fileOpenFlags, 0)
+	if err != nil {
+		return err
+	}
+	inf := os.NewFile(uintptr(in), srcName)
+	defer inf.Close()
+	out, err := unix.Openat(dstDir, dstName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|fileOpenFlags, 0o600)
+	if err != nil {
+		return err
+	}
+	outf := os.NewFile(uintptr(out), dstName)
+	defer outf.Close()
+	if _, err := io.Copy(outf, inf); err != nil {
+		return err
+	}
+	return unix.Fchmod(out, uint32(st.Mode)&0o7777)
 }
 
 // configMap writes a ConfigMap's keys as files under target.
@@ -671,7 +758,7 @@ func (rd *render) token(ctx context.Context, sat *runtimev1.ServiceAccountTokenP
 	now := rd.now()
 	if key != "" && rd.live != nil {
 		if iss, ok := rd.prev[key]; ok && !iss.due(now) {
-			if b, err := readFileAt(rd.live, sat.GetPath()); err == nil {
+			if b, err := readFileAt(rd.live, sat.GetPath(), maxVolumeBytes); err == nil {
 				rd.tokens[key] = iss
 				return writeFile(target, sat.GetPath(), b, mode)
 			}

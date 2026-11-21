@@ -38,11 +38,43 @@ import (
 // that descriptor, never through a path string.
 
 // dirTarget is an open directory the daemon writes into, with its path for
-// messages. The path is never used to reach the directory.
+// messages. The path is never used to reach the directory. created records
+// the files writeFile created under it in this render (by path relative to
+// it), with the device and inode each got: only those may be written again.
+// replace lets writeFile unlink a name it did not create and make a new file
+// in its place, for a flat render into a directory an earlier create of the
+// same pod may have rendered into (a vm pod's share dir); a generation never
+// sets it.
 type dirTarget struct {
-	fd   int
-	path string
+	fd      int
+	path    string
+	created map[string]fileID
+	replace bool
 }
+
+// fileID is a file's device and inode.
+type fileID struct{ dev, ino uint64 }
+
+// idOf is st's fileID.
+func idOf(st *unix.Stat_t) fileID { return fileID{dev: uint64(st.Dev), ino: uint64(st.Ino)} }
+
+// The bounds on what the daemon reads from a pod tree. The pod can write the
+// live generation and the mount dir it sits in (a writable configMap mount),
+// and can plant entries in a new generation while it is rendered, so each read
+// is bounded and over a bound the volume's refresh fails. A ConfigMap or Secret
+// holds at most 1 MiB; the byte bound sits well above that.
+const (
+	// maxVolumeBytes bounds the file bytes read from one generation.
+	maxVolumeBytes = 8 << 20
+	// maxTreeEntries bounds the entries walked in one generation.
+	maxTreeEntries = 16384
+	// maxTreeDepth bounds how deep a generation walk goes.
+	maxTreeDepth = 64
+)
+
+// errTreeTooLarge is returned when a generation walk or read passes one of the
+// bounds above.
+var errTreeTooLarge = errors.New("generation is larger than a projected volume can be")
 
 // close releases the descriptor.
 func (d *dirTarget) close() {
@@ -55,8 +87,14 @@ func (d *dirTarget) close() {
 // join is the path of name under d, for messages.
 func (d *dirTarget) join(name string) string { return filepath.Join(d.path, name) }
 
-// openAnchor opens base, a directory the pod cannot replace (the pod dir, or
-// a data volume whose parent is the pod dir), without following a link.
+// openAnchor opens base without following a link. base is the data volume (or,
+// for a vm pod's shares, the pod dir): the daemon's own path, trusted down to
+// and including its last component, which O_NOFOLLOW refuses if it is a
+// symlink. That trust holds while the pod cannot write base's parent. A
+// profile whose dataVolumePath is the pod dir itself grants the pod exactly
+// that, and then the pod can rename the data volume away and put another
+// directory in its place; what is reached from base is then that directory,
+// still inside the pod's own grant.
 func openAnchor(base string) (*dirTarget, error) {
 	fd, err := unix.Open(base, pathsafe.DirFlags, 0)
 	if err != nil {
@@ -102,11 +140,14 @@ func splitRel(rel string) (dir, name string, err error) {
 }
 
 // writeFile writes content to rel under the open directory t, creating parent
-// dirs (0755),
-// then sets mode exactly (independent of umask). Every component is reached
-// relative to t without following a link; the file itself is created with
-// O_EXCL, or, when a projection earlier in the same render wrote it, reopened
-// without following and checked to be a regular file.
+// dirs (0755), then sets mode exactly (independent of umask). Every component
+// is reached relative to t without following a link. The file is created with
+// O_EXCL and recorded in t.created. A name that exists already is written
+// again only when this render created it (a later projection of the same
+// render overwriting an earlier one): it is reopened without O_TRUNC and
+// without following, must still be that file with one link, and is then
+// truncated. Any other existing name is refused: a pod can plant an entry in
+// a generation while it is rendered, a hard link to another file among them.
 func writeFile(t *dirTarget, rel string, content []byte, mode os.FileMode) error {
 	if rel == "" {
 		return errors.New("empty file path in volume projection")
@@ -120,9 +161,23 @@ func writeFile(t *dirTarget, rel string, content []byte, mode os.FileMode) error
 		return fmt.Errorf("create dir for %s: %w", t.join(rel), err)
 	}
 	defer unix.Close(pfd)
+	key := filepath.Clean(rel)
 	fd, err := unix.Openat(pfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|fileOpenFlags, 0o600)
+	again := false
 	if errors.Is(err, unix.EEXIST) {
-		fd, err = unix.Openat(pfd, name, unix.O_WRONLY|unix.O_TRUNC|fileOpenFlags, 0)
+		_, ours := t.created[key]
+		switch {
+		case ours:
+			again = true
+			fd, err = unix.Openat(pfd, name, unix.O_WRONLY|fileOpenFlags, 0)
+		case t.replace:
+			// Unlinking a name never touches what another link names.
+			if err = unix.Unlinkat(pfd, name, 0); err == nil {
+				fd, err = unix.Openat(pfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|fileOpenFlags, 0o600)
+			}
+		default:
+			return fmt.Errorf("write %s: it exists and this render did not create it", t.join(rel))
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("write %s: %w", t.join(rel), err)
@@ -133,8 +188,21 @@ func writeFile(t *dirTarget, rel string, content []byte, mode os.FileMode) error
 	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("write %s: %w", t.join(rel), err)
 	}
-	if uint32(st.Mode)&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("write %s: not a regular file", t.join(rel))
+	if uint32(st.Mode)&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return fmt.Errorf("write %s: not a regular file with one link", t.join(rel))
+	}
+	if again {
+		if t.created[key] != idOf(&st) {
+			return fmt.Errorf("write %s: not the file this render created", t.join(rel))
+		}
+		if err := unix.Ftruncate(fd, 0); err != nil {
+			return fmt.Errorf("write %s: %w", t.join(rel), err)
+		}
+	} else {
+		if t.created == nil {
+			t.created = map[string]fileID{}
+		}
+		t.created[key] = idOf(&st)
 	}
 	if _, err := f.Write(content); err != nil {
 		return fmt.Errorf("write %s: %w", t.join(rel), err)
@@ -146,8 +214,11 @@ func writeFile(t *dirTarget, rel string, content []byte, mode os.FileMode) error
 }
 
 // readFileAt reads the regular file rel under t, reached without following a
-// link, refusing a path that escapes t or names anything but a regular file.
-func readFileAt(t *dirTarget, rel string) ([]byte, error) {
+// link, refusing a path that escapes t, anything but a regular file with one
+// link (a second link could name a file the pod may not read, and the daemon
+// would copy it into a generation the pod reads), and a file larger than max
+// bytes (errTreeTooLarge).
+func readFileAt(t *dirTarget, rel string, max int64) ([]byte, error) {
 	dir, name, err := splitRel(rel)
 	if err != nil {
 		return nil, err
@@ -167,10 +238,20 @@ func readFileAt(t *dirTarget, rel string) ([]byte, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, err
 	}
-	if uint32(st.Mode)&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("%s is not a regular file", t.join(rel))
+	if uint32(st.Mode)&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return nil, fmt.Errorf("%s is not a regular file with one link", t.join(rel))
 	}
-	return io.ReadAll(f)
+	if st.Size > max {
+		return nil, fmt.Errorf("%w: %s is %d bytes", errTreeTooLarge, t.join(rel), st.Size)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("%w: %s grew past %d bytes", errTreeTooLarge, t.join(rel), max)
+	}
+	return b, nil
 }
 
 // readlinkAt reads the symlink name under dirfd.
@@ -184,19 +265,30 @@ func readlinkAt(dirfd int, name string) (string, error) {
 }
 
 // listAt returns the names in the open directory dirfd, read through a
-// descriptor of its own so dirfd keeps no read position.
-func listAt(dirfd int, path string) ([]string, error) {
+// descriptor of its own so dirfd keeps no read position. A directory with more
+// than max names is refused with errTreeTooLarge, read in batches so the
+// refusal costs no more than max names.
+func listAt(dirfd int, path string, max int) ([]string, error) {
 	fd, err := unix.Openat(dirfd, ".", pathsafe.DirFlags, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list %s: %w", path, err)
 	}
 	d := os.NewFile(uintptr(fd), path)
 	defer d.Close()
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		return nil, fmt.Errorf("list %s: %w", path, err)
+	var names []string
+	for {
+		batch, err := d.Readdirnames(256)
+		names = append(names, batch...)
+		if len(names) > max {
+			return nil, fmt.Errorf("%w: more than %d entries in %s", errTreeTooLarge, max, path)
+		}
+		if errors.Is(err, io.EOF) {
+			return names, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list %s: %w", path, err)
+		}
 	}
-	return names, nil
 }
 
 // fileMode is the os.FileMode of st: its type and permission and special bits.
@@ -227,13 +319,21 @@ func fileMode(st *unix.Stat_t) os.FileMode {
 // walkAt calls visit for every entry below the open directory t, depth first,
 // with its path relative to t and its lstat. Directories are entered relative
 // to their parent's descriptor without following a link; visit returning an
-// error stops the walk.
+// error stops the walk. More than maxTreeEntries entries, or a directory more
+// than maxTreeDepth deep, stops it with errTreeTooLarge.
 func walkAt(t *dirTarget, visit func(rel string, st *unix.Stat_t, parent int, name string) error) error {
-	var walk func(fd int, prefix string) error
-	walk = func(fd int, prefix string) error {
-		names, err := listAt(fd, filepath.Join(t.path, prefix))
+	seen := 0
+	var walk func(fd int, prefix string, depth int) error
+	walk = func(fd int, prefix string, depth int) error {
+		if depth > maxTreeDepth {
+			return fmt.Errorf("%w: %s nests more than %d deep", errTreeTooLarge, t.join(prefix), maxTreeDepth)
+		}
+		names, err := listAt(fd, filepath.Join(t.path, prefix), maxTreeEntries-seen)
 		if err != nil {
 			return err
+		}
+		if seen += len(names); seen > maxTreeEntries {
+			return fmt.Errorf("%w: more than %d entries under %s", errTreeTooLarge, maxTreeEntries, t.path)
 		}
 		for _, name := range names {
 			rel := filepath.Join(prefix, name)
@@ -251,7 +351,7 @@ func walkAt(t *dirTarget, visit func(rel string, st *unix.Stat_t, parent int, na
 			if err != nil {
 				return fmt.Errorf("open %s: %w", t.join(rel), err)
 			}
-			err = walk(sub, rel)
+			err = walk(sub, rel, depth+1)
 			unix.Close(sub)
 			if err != nil {
 				return err
@@ -259,7 +359,7 @@ func walkAt(t *dirTarget, visit func(rel string, st *unix.Stat_t, parent int, na
 		}
 		return nil
 	}
-	return walk(t.fd, "")
+	return walk(t.fd, "", 1)
 }
 
 // sameEntry reports whether name under dirfd is, without following a link,
