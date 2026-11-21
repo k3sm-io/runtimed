@@ -18,6 +18,7 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -631,10 +632,7 @@ func TestParseCredentialErrors(t *testing.T) {
 // chowns to the test process's own gid (a group it is a member of), so no root is
 // needed; the real fsGroup chown under an arbitrary gid is the m2.sh e2e.
 func TestChownForFSGroup(t *testing.T) {
-	gid := os.Getgid()
-	if gid <= 0 {
-		t.Skip("test process gid <= 0 (running as root?); fsGroup chown asserts a >0 gid")
-	}
+	gid := fsGroupTestGid(t, t.TempDir())
 	// The walk is bounded by the pods root; root is a pod's data volume strictly
 	// inside it, mirroring the daemon's real shape.
 	podsRoot := t.TempDir()
@@ -648,7 +646,7 @@ func TestChownForFSGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ChownForFSGroup(podsRoot, root, gid); err != nil {
+	if _, err := ChownForFSGroup(context.Background(), podsRoot, root, gid, testOwners, []int{gid}); err != nil {
 		t.Fatalf("ChownForFSGroup: %v", err)
 	}
 
@@ -683,7 +681,7 @@ func TestChownForFSGroup(t *testing.T) {
 // never a valid target; negative is a bug).
 func TestChownForFSGroupRejectsRootGid(t *testing.T) {
 	bound := t.TempDir()
-	if err := ChownForFSGroup(bound, filepath.Join(bound, "pod-a", "rootfs"), 0); err == nil {
+	if _, err := ChownForFSGroup(context.Background(), bound, filepath.Join(bound, "pod-a", "rootfs"), 0, testOwners, []int{0}); err == nil {
 		t.Error("ChownForFSGroup(_, _, 0) = nil, want error")
 	}
 }
@@ -694,10 +692,7 @@ func TestChownForFSGroupRejectsRootGid(t *testing.T) {
 // pre-created victim's mode is asserted unchanged, because an error return alone
 // would not distinguish "refused" from "escalated, then failed late".
 func TestChownForFSGroupRejectsUnboundedRoot(t *testing.T) {
-	gid := os.Getgid()
-	if gid <= 0 {
-		t.Skip("test process gid <= 0 (running as root?); fsGroup chown asserts a >0 gid")
-	}
+	gid := fsGroupTestGid(t, t.TempDir())
 	outside := t.TempDir()
 	bound := filepath.Join(outside, "pods")
 	victim := filepath.Join(outside, "server")
@@ -729,7 +724,7 @@ func TestChownForFSGroupRejectsUnboundedRoot(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			before := modeOf(t, victim)
-			err := ChownForFSGroup(bound, tc.root, gid)
+			_, err := ChownForFSGroup(context.Background(), bound, tc.root, gid, testOwners, []int{gid})
 			if !errors.Is(err, ErrFSGroupRootUnbounded) {
 				t.Errorf("ChownForFSGroup(%q, %q, %d) = %v, want ErrFSGroupRootUnbounded", bound, tc.root, gid, err)
 			}
@@ -742,7 +737,7 @@ func TestChownForFSGroupRejectsUnboundedRoot(t *testing.T) {
 	// positive CONTROL: a root strictly inside the bound is still walked, so the
 	// table above cannot pass by refusing everything.
 	pod := filepath.Join(bound, "pod-a", "rootfs")
-	if err := ChownForFSGroup(bound, pod, gid); err != nil {
+	if _, err := ChownForFSGroup(context.Background(), bound, pod, gid, testOwners, []int{gid}); err != nil {
 		t.Fatalf("ChownForFSGroup(bound, %q, %d) = %v, want nil", pod, gid, err)
 	}
 	if got := modeOf(t, pod); got.Perm()&0o070 != 0o070 || got&os.ModeSetgid == 0 {

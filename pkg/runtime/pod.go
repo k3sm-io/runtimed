@@ -22,8 +22,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -538,6 +540,20 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 				errInvalidPodBox, vol, medium)
 	}
 
+	// A pod's fsGroup must be a gid the allow-list admits
+	// (supervisor.FSGroupGidAllowed), decided before the pod has a network or
+	// a directory, so a refused one leaves nothing to unwind.
+	if fsGroup := box.GetPodSecurityContext().GetFsGroup(); fsGroup != 0 {
+		if fsGroup < 0 || fsGroup > math.MaxInt32 {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: fsGroup %d: %w", errInvalidPodBox, fsGroup, supervisor.ErrFSGroupGidRefused)
+		}
+		if err := supervisor.FSGroupGidAllowed(int(fsGroup), r.cfg.FSGroupAdmitted); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: fsGroup: %w", errInvalidPodBox, err)
+		}
+	}
+
 	// Exposure volumes are decided here, before the pod has a network or a
 	// directory: a node with no ExposeACL, an exposure no grant admits or a
 	// mount path that would nest refuses the pod with nothing to unwind. The
@@ -573,6 +589,24 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("create rootfs %s: %w", rootfs, err)
+	}
+	// The fsGroup owners, and, when the daemon runs as root and the pod drops
+	// to another uid, the rootfs's group now, before anything is put in it:
+	// every entry the daemon makes below takes it, which is how the walk tells
+	// them from a root-owned entry a pod renames in (fsGroupOwners).
+	euid := os.Geteuid()
+	owners := fsGroupOwners(box, euid)
+	fsGroup := int(box.GetPodSecurityContext().GetFsGroup())
+	if fsGroup > 0 && len(owners.InGroup) > 0 {
+		podDir, err := r.podDir(box.GetPodId())
+		if err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				fmt.Errorf("%w: %w", errInvalidPodBox, err)
+		}
+		if err := supervisor.PrepareFSGroupRoot(podDir, rootfs, fsGroup, euid, r.cfg.FSGroupAdmitted); err != nil {
+			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
+				fmt.Errorf("fsGroup for pod %s: %w", box.GetPodId(), err)
+		}
 	}
 	// The pod's temp directory, before anything can need it. See
 	// provisionPodTmpDir for why a pod has none otherwise.
@@ -725,15 +759,39 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// wide to be a real second layer — <PodsRoot>/<victim-id>/rootfs is strictly
 	// under it, so it would wave through the cross-pod case that is hazard #1 for
 	// the primary guard, and the two layers would fail together.
+	//
+	// The pod dir is also where the walk pins itself: it opens the pod dir,
+	// which a pod cannot replace, and reaches the rootfs and everything below
+	// it without following a link, so a rootfs or a directory the pod swapped
+	// for a link (a process of an earlier instance can still be running) is
+	// not walked into another pod's tree.
 	podDir, err := r.podDir(box.GetPodId())
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 			fmt.Errorf("%w: %w", errInvalidPodBox, err)
 	}
-	if fsGroup := int(box.GetPodSecurityContext().GetFsGroup()); fsGroup > 0 {
-		if err := supervisor.ChownForFSGroup(podDir, rootfs, fsGroup); err != nil {
+	if fsGroup > 0 {
+		rep, err := supervisor.ChownForFSGroup(ctx, podDir, rootfs, fsGroup, owners, r.cfg.FSGroupAdmitted)
+		if err != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("fsGroup chown for pod %s: %w", box.GetPodId(), err)
+		}
+		if rep.Skipped() > 0 || rep.SetID > 0 {
+			// The examples are paths the pod chose: quoted, so a name with a
+			// newline or a control character cannot forge a log line.
+			examples := make([]string, len(rep.Examples))
+			for i, ex := range rep.Examples {
+				examples[i] = strconv.Quote(ex)
+			}
+			// Not a failure: the entries keep the group and mode they had, and
+			// a process that relies on the fsGroup for one of them is refused
+			// by the file's own mode. The examples are few and each is cut
+			// short (supervisor.FSGroupReport), so a pod cannot grow this line.
+			r.log.Warn("fsGroup: some entries of the pod's data volume were not given the group's access",
+				"pod", box.GetPodId(), "fs_group", fsGroup, "changed", rep.Changed,
+				"multi_link", rep.MultiLink, "special", rep.Special, "other_device", rep.OtherDevice,
+				"unopenable", rep.Unopenable, "vanished", rep.Vanished, "foreign_owner", rep.ForeignOwner,
+				"setid_cleared", rep.SetID, "examples", examples)
 		}
 	}
 

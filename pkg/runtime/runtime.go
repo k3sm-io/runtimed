@@ -334,6 +334,13 @@ type Config struct {
 	// are guest processes that never enter startContainer, so neither the
 	// rewrite nor the exec observation runs for them.
 	ShadowBinDir string
+	// FSGroupAdmitted are gids this node admits as a pod's fsGroup beside the
+	// default allow-list (an unassigned gid from 1000 up; see
+	// supervisor.FSGroupGidAllowed): a group the operator made for sharing
+	// files with pods. A gid whose membership is a privilege on any macOS
+	// host (staff, admin, wheel and the like) is refused even when named
+	// here. No flag sets it yet; empty means the default allow-list only.
+	FSGroupAdmitted []int
 	// LocalBlobSource is a blob store on this machine the puller offers each
 	// blob to before fetching it (image.WithLocalBlobSource). Optional: set it
 	// only on a node whose cluster registry store shares the image cache's
