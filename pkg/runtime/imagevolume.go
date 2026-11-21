@@ -47,6 +47,9 @@ var (
 	// errHoldNotWritten marks a pull that returned without running the pod's
 	// hold (artifact.WithHold); the mount fails closed on it.
 	errHoldNotWritten = errors.New("the artifact puller returned without writing the pod's hold")
+	// errHoldRunTwice marks a puller that ran the pod's hold callback more
+	// than once (artifact.WithHold allows one run); the mount fails closed.
+	errHoldRunTwice = errors.New("the artifact puller ran the pod's hold more than once")
 )
 
 // artifactPullReason types an ArtifactPullRefused failure, so the provider can
@@ -145,8 +148,18 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 	// that fails after its hold was written leaves the hold in place; the
 	// failed create releases it (CreatePod's failure path,
 	// releasePodArtifacts).
+	//
+	// A second run never overwrites the first one's result: it fails the
+	// mount closed, so a puller that runs the hold twice cannot turn a failed
+	// hold into a success.
 	holdErr := errHoldNotWritten
+	holdRan := false
 	hold := artifact.WithHold(func(ctx context.Context, res *artifact.Result) error {
+		if holdRan {
+			holdErr = errHoldRunTwice
+			return holdErr
+		}
+		holdRan = true
 		holdErr = r.holdManifest(ctx, box, res)
 		return holdErr
 	})
@@ -165,8 +178,9 @@ func (r *Runtime) imageVolumeView(ctx context.Context, box *runtimev1.PodBox, vo
 		defer res.Lease.Release()
 	}
 	if holdErr != nil {
-		// The hold failed, or a pull that reported success never wrote it:
-		// either way no hold names the blobs, so the mount fails closed.
+		// The hold failed, a pull that reported success never wrote it, or
+		// the puller ran it twice: no hold the mount can trust names the
+		// blobs, so the mount fails closed.
 		return "", runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 			fmt.Errorf("%w: pod %s image volume %s: %w", ErrArtifactMountRefused, box.GetPodId(), vol.GetName(), holdErr)
 	}
