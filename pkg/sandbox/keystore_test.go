@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 
+	"k3sm.io/runtimed/pkg/keystorepaths"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -465,7 +467,7 @@ func TestDataRootDeniesKeystorePathsEveryProfile(t *testing.T) {
 			}
 			rules := sbplRules(t, prof)
 			for _, spelling := range dataRootSpellings(v.root) {
-				paths := []string{KeystoreSocketPath(spelling)}
+				paths := []string{keystorepaths.SocketPath(spelling)}
 				for _, n := range keystoreNames {
 					paths = append(paths, filepath.Join(spelling, n))
 				}
@@ -521,8 +523,8 @@ func TestKeystoreDenyStanzaShape(t *testing.T) {
 	if i := strings.LastIndex(prof, "(allow "); i > strings.Index(prof, ";; KEYSTORE:") {
 		t.Errorf("an allow follows the keystore denies at %d", i)
 	}
-	if got, want := KeystoreSocketPath("/var/lib/k3sm"), "/var/lib/k3sm/keystore-sock/keys.sock"; got != want {
-		t.Errorf("KeystoreSocketPath = %q, want %q", got, want)
+	if got, want := keystorepaths.SocketPath("/var/lib/k3sm"), "/var/lib/k3sm/keystore-sock/keys.sock"; got != want {
+		t.Errorf("keystorepaths.SocketPath = %q, want %q", got, want)
 	}
 }
 

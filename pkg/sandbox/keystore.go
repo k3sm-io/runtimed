@@ -22,38 +22,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"k3sm.io/runtimed/pkg/keystorepaths"
 )
-
-// KeystoreDataRootPrefix is the name prefix of every keystore entry directly
-// under the data root: its files (the floor and delivery records, the logs and
-// their archives, the maintenance marker, staging files) and KeystoreRunDir.
-// Every pod profile denies every data-root name that begins with it, so a
-// keystore file a later change adds is denied without a change here.
-const KeystoreDataRootPrefix = "keystore-"
-
-// KeystoreRunDir is the keystore's data-root run directory. Every pod profile
-// denies the whole tree.
-const KeystoreRunDir = "keystore-run"
-
-// KeystoreSockDir is the root-owned data-root directory that holds the
-// keystore's socket (KeystoreSocketPath). Every pod profile denies the whole
-// tree; the KeystoreDataRootPrefix deny covers it too.
-const KeystoreSockDir = "keystore-sock"
-
-// keystoreSocketName is the keystore socket's name inside KeystoreSockDir.
-const keystoreSocketName = "keys.sock"
 
 // dataVolumeAlias is the mount point of the macOS data volume. A path under a
 // firmlink (/private/var/...) is also reachable through it, so a keystore deny
 // is written in that spelling too.
 const dataVolumeAlias = "/System/Volumes/Data"
-
-// KeystoreSocketPath returns the keystore socket path under dataRoot:
-// <dataRoot>/keystore-sock/keys.sock. It is the one spelling of the path, for
-// the server that binds it and for every deny that keeps a pod off it.
-func KeystoreSocketPath(dataRoot string) string {
-	return filepath.Join(dataRoot, KeystoreSockDir, keystoreSocketName)
-}
 
 // keystoreRoots returns the directories whose keystore names every pod profile
 // denies: the work-dir, then the data root when it is set and differs. The
@@ -83,13 +59,13 @@ func keystoreForms(root string) []string {
 }
 
 // keystorePrefixPattern returns the anchored regex that matches every name
-// under root beginning KeystoreDataRootPrefix, and everything below such a
+// under root beginning keystorepaths.DataRootPrefix, and everything below such a
 // name. The prefix is matched in either letter case: the data volume is case
 // insensitive by default, so KEYSTORE-run names the same directory, and a pod
 // that could create it would plant the server's directory before the server.
 func keystorePrefixPattern(root string) string {
 	var fold strings.Builder
-	for _, r := range KeystoreDataRootPrefix {
+	for _, r := range keystorepaths.DataRootPrefix {
 		lo, up := strings.ToLower(string(r)), strings.ToUpper(string(r))
 		if lo == up {
 			fold.WriteString(regexp.QuoteMeta(lo))
@@ -103,7 +79,7 @@ func keystorePrefixPattern(root string) string {
 // keystoreDenyStanza renders the keystore denies for roots: file reads
 // (metadata included), every file write (create, unlink and rename among them),
 // connect(2) to a unix socket and bind(2) of one, on every name under each root
-// that begins KeystoreDataRootPrefix and on the whole KeystoreRunDir tree, in
+// that begins keystorepaths.DataRootPrefix and on the whole keystorepaths.RunDir tree, in
 // every keystoreForms spelling.
 //
 // Generate emits it as the LAST rule of the profile. Seatbelt is
@@ -120,8 +96,8 @@ func keystoreDenyStanza(roots []string) string {
 		for _, form := range keystoreForms(root) {
 			filters = append(filters,
 				"(regex #\""+keystorePrefixPattern(form)+"\")",
-				fmt.Sprintf("(subpath %q)", filepath.Join(form, KeystoreRunDir)),
-				fmt.Sprintf("(subpath %q)", filepath.Join(form, KeystoreSockDir)))
+				fmt.Sprintf("(subpath %q)", filepath.Join(form, keystorepaths.RunDir)),
+				fmt.Sprintf("(subpath %q)", filepath.Join(form, keystorepaths.SockDir)))
 		}
 	}
 	seen := make(map[string]bool, len(filters))
@@ -131,8 +107,8 @@ func keystoreDenyStanza(roots []string) string {
 		return dup
 	})
 	var b strings.Builder
-	b.WriteString(";; KEYSTORE: every data-root name beginning " + KeystoreDataRootPrefix + " and the whole\n")
-	b.WriteString(";; " + KeystoreRunDir + " and " + KeystoreSockDir + " trees: no read, stat, write, create, unlink, rename,\n")
+	b.WriteString(";; KEYSTORE: every data-root name beginning " + keystorepaths.DataRootPrefix + " and the whole\n")
+	b.WriteString(";; " + keystorepaths.RunDir + " and " + keystorepaths.SockDir + " trees: no read, stat, write, create, unlink, rename,\n")
 	b.WriteString(";; connect or bind. LAST, so no allow above can re-open them.\n")
 	b.WriteString("(deny file-read* file-read-metadata file-write*\n")
 	for _, f := range filters {
@@ -152,13 +128,13 @@ func keystoreDenyStanza(roots []string) string {
 	return b.String()
 }
 
-// underKeystoreName reports whether p is at or under a KeystoreDataRootPrefix
+// underKeystoreName reports whether p is at or under a keystorepaths.DataRootPrefix
 // name of root, in any firmlink spelling and either letter case.
 func underKeystoreName(p, root string) bool {
 	for _, form := range comparisonForms(p) {
 		for _, r := range comparisonForms(root) {
 			ps, rs := strings.Split(form, "/"), strings.Split(r, "/")
-			if len(ps) > len(rs) && underFold(form, r) && strings.HasPrefix(strings.ToLower(ps[len(rs)]), KeystoreDataRootPrefix) {
+			if len(ps) > len(rs) && underFold(form, r) && strings.HasPrefix(strings.ToLower(ps[len(rs)]), keystorepaths.DataRootPrefix) {
 				return true
 			}
 		}

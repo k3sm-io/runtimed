@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 
+	"k3sm.io/runtimed/pkg/keystorepaths"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -469,7 +471,8 @@ type Posture struct {
 	// symlink but the /var, /tmp and /etc firmlinks, in it or in either child.
 	//
 	// The keystore denies follow it too: every name beginning
-	// KeystoreDataRootPrefix and the whole KeystoreRunDir tree, under <WorkDir>
+	// keystorepaths.DataRootPrefix and the whole keystorepaths.RunDir and
+	// keystorepaths.SockDir trees, under <WorkDir>
 	// always and under this value when it is set and differs, are denied every
 	// read, write and unix-socket connect or bind as the profile's last rule.
 	// A pods root under such a name is refused (ErrInvalidDataRoot).
@@ -1549,7 +1552,7 @@ func resolveDataRoot(dir, podsRoot string) (string, error) {
 	// The keystore denies are the profile's last rule, so a pods root under a
 	// keystore name would be denied to every pod, its own volume included.
 	if underKeystoreName(podsRoot, dir) {
-		return "", fmt.Errorf("%w: the pods root %q is under a %s name of %q", ErrInvalidDataRoot, podsRoot, KeystoreDataRootPrefix, dir)
+		return "", fmt.Errorf("%w: the pods root %q is under a %s name of %q", ErrInvalidDataRoot, podsRoot, keystorepaths.DataRootPrefix, dir)
 	}
 	return dir, nil
 }
