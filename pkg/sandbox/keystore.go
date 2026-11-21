@@ -128,9 +128,14 @@ func keystoreDenyStanza(roots []string) string {
 	return b.String()
 }
 
-// underKeystoreName reports whether p is at or under a keystorepaths.DataRootPrefix
-// name of root, in any firmlink spelling and either letter case.
+// underKeystoreName reports whether p is at or under a
+// keystorepaths.DataRootPrefix name of root, in any firmlink spelling, through
+// the data-volume alias, and in either letter case.
 func underKeystoreName(p, root string) bool {
+	p = filepath.Clean(p)
+	if isUnder(p, dataVolumeAlias) && p != dataVolumeAlias {
+		p = strings.TrimPrefix(p, dataVolumeAlias)
+	}
 	for _, form := range comparisonForms(p) {
 		for _, r := range comparisonForms(root) {
 			ps, rs := strings.Split(form, "/"), strings.Split(r, "/")
@@ -140,4 +145,25 @@ func underKeystoreName(p, root string) bool {
 		}
 	}
 	return false
+}
+
+// validateKeystoreReach refuses, with ErrProtectedPath, any caller-supplied
+// path at or under a keystore name of one of roots (underKeystoreName). The
+// last-rule deny would override such a grant anyway; refusing it means a pod
+// that asks for one fails to start rather than starting with a grant that
+// silently does nothing.
+func validateKeystoreReach(roots []string, groups ...[]string) error {
+	for _, g := range groups {
+		for _, p := range g {
+			if p == "" {
+				continue
+			}
+			for _, root := range roots {
+				if underKeystoreName(p, root) {
+					return fmt.Errorf("%w: %q names a keystore path under %q", ErrProtectedPath, p, root)
+				}
+			}
+		}
+	}
+	return nil
 }

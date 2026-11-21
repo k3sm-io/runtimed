@@ -357,7 +357,8 @@ func dataRootSpellings(root string) []string {
 // and checks, over the whole rendered profile, that every keystore path class is
 // refused for every operation class and through every spelling of the data root,
 // whatever allows the variant carries (extra paths at the data root, volumes,
-// credentials, exposures, views, host shares, an explicit keystore re-allow),
+// credentials, exposures, views, host shares; an explicit keystore re-allow is
+// refused outright, TestValidateRefusesKeystoreExtraPaths),
 // and that a sibling of the data root that is not a keystore name stays
 // reachable, so a refusal is the keystore denies and not the default.
 func TestDataRootDeniesKeystorePathsEveryProfile(t *testing.T) {
@@ -449,14 +450,6 @@ func TestDataRootDeniesKeystorePathsEveryProfile(t *testing.T) {
 			}},
 		{name: "exec session (re-applies the pod's own staged profile, runtime/exec.go)", root: varRoot, sp: native(),
 			opts: GenerateOptions{Posture: Posture{WorkDir: varRoot, DataRoot: varRoot}}, network: true},
-		{name: "explicit keystore re-allow through extra paths", root: varRoot, sp: func() *runtimev1.SandboxProfile {
-			sp := native()
-			for _, n := range []string{"keystore-run", "keystore-floor.json"} {
-				sp.ExtraReadPaths = append(sp.ExtraReadPaths, filepath.Join(varRoot, n))
-				sp.ExtraWritePaths = append(sp.ExtraWritePaths, filepath.Join(varRoot, n))
-			}
-			return sp
-		}(), network: true},
 	}
 
 	for _, v := range variants {
@@ -593,5 +586,83 @@ func TestPodProfileDeniesProcessInfoAndSignalToOthers(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestValidateRefusesKeystoreExtraPaths pins that a caller-supplied path naming
+// a keystore path is refused before a line is rendered, not only overridden by
+// the last-rule deny: extra read and write paths, the volume sources (read,
+// write and read-only), host shares and expose-paths, at or under a keystore-*
+// name of the data root or the work dir, in every spelling and letter case.
+// The data root itself and a non-keystore sibling stay accepted.
+func TestValidateRefusesKeystoreExtraPaths(t *testing.T) {
+	const (
+		work = "/opt/k3sm-pods"
+		data = "/var/lib/k3sm"
+	)
+	posture := Posture{WorkDir: work, DataRoot: data}
+	dataVol := work + "/pods/p1/rootfs"
+	var bad []string
+	for _, root := range []string{data, work} {
+		for _, spelling := range dataRootSpellings(root) {
+			for _, n := range []string{"keystore-floor.json", "keystore-run", "keystore-sock/keys.sock", "KEYSTORE-Run/x", "Keystore-later"} {
+				bad = append(bad, filepath.Join(spelling, n))
+			}
+		}
+	}
+	sp := func() *runtimev1.SandboxProfile { return &runtimev1.SandboxProfile{DataVolumePath: dataVol} }
+	for _, p := range bad {
+		for name, gen := range map[string]func() error{
+			"extra read": func() error {
+				s := sp()
+				s.ExtraReadPaths = []string{p}
+				_, err := Generate(s, GenerateOptions{Posture: posture})
+				return err
+			},
+			"extra write": func() error {
+				s := sp()
+				s.ExtraWritePaths = []string{p}
+				_, err := Generate(s, GenerateOptions{Posture: posture})
+				return err
+			},
+			"volume read": func() error {
+				_, err := Generate(sp(), GenerateOptions{Posture: posture, ReadPaths: []string{p}})
+				return err
+			},
+			"volume write": func() error {
+				_, err := Generate(sp(), GenerateOptions{Posture: posture, WritePaths: []string{p}})
+				return err
+			},
+			"volume read-only": func() error {
+				_, err := Generate(sp(), GenerateOptions{Posture: posture, ReadOnlyPaths: []string{p}})
+				return err
+			},
+			"host share": func() error {
+				_, err := Generate(sp(), GenerateOptions{Posture: posture, HostShares: []HostShare{{Path: p}}})
+				return err
+			},
+			"host socket share": func() error {
+				_, err := Generate(sp(), GenerateOptions{Posture: posture, HostShares: []HostShare{{Path: p, Socket: true}}})
+				return err
+			},
+		} {
+			if err := gen(); err == nil {
+				t.Errorf("%s %s: accepted, want a refusal", name, p)
+			}
+		}
+	}
+	// An expose-path is held to <root>/expose/<ns>/<pod>/<vol>, so it can never
+	// name a keystore path; one that tries is refused by shape.
+	for _, p := range []string{data + "/keystore-run/a/b/c", data + "/expose/../keystore-run/a/b"} {
+		if _, err := Generate(sp(), GenerateOptions{Posture: posture, ExposePaths: []string{p}}); err == nil {
+			t.Errorf("expose-path %s: accepted, want a refusal", p)
+		}
+	}
+	for _, p := range []string{data, data + "/keystore", data + "/not-keystore-x", "/private" + data + "/keystore.json"} {
+		s := sp()
+		s.ExtraReadPaths = []string{p}
+		if _, err := Generate(s, GenerateOptions{Posture: posture}); err != nil {
+			t.Errorf("control %s: %v", p, err)
+		}
 	}
 }

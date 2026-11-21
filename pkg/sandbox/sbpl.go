@@ -724,6 +724,19 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		return "", fmt.Errorf("%w: %q is not a proper descendant of %q", ErrDataVolumeUnbounded, sp.GetDataVolumePath(), podsRoot)
 	}
 
+	// No caller-supplied path may name a keystore path, in any spelling or
+	// case; the last-rule deny would override it, and a grant that does nothing
+	// is refused rather than rendered.
+	sharePaths := make([]string, 0, len(opts.HostShares))
+	for _, sh := range opts.HostShares {
+		sharePaths = append(sharePaths, sh.Path)
+	}
+	if err := validateKeystoreReach(keystoreRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot),
+		sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths,
+		sharePaths, opts.ExposePaths, opts.ArtifactViewPaths, []string{sp.GetXcodeToolchainDir()}); err != nil {
+		return "", err
+	}
+
 	// Validate every caller-supplied path before emitting any allow: a path under
 	// the protected deny-set is rejected outright (fail closed). The pod's own
 	// data volume is carved out (it is re-allowed by design below).
