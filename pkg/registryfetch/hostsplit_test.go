@@ -18,6 +18,7 @@ package registryfetch
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -480,5 +481,80 @@ func TestSessionCheckRedirectStopsAfterTen(t *testing.T) {
 	}
 	if n := len(log.seen()); n != 10 {
 		t.Fatalf("server saw %d requests, want 10", n)
+	}
+}
+
+// TestSessionRefusesHTTPSToHTTPRedirect: an https origin's 307 to a plain
+// http host is refused before the second host gets a request.
+func TestSessionRefusesHTTPSToHTTPRedirect(t *testing.T) {
+	b, blog := serveOK(t)
+	a := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, b.URL+req.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(a.Close)
+	host := strings.TrimPrefix(a.URL, "https://")
+	reg := &Registry{Transport: a.Client().Transport, newAuth: (&stampingAuth{}).newAuth}
+	_, client, err := reg.Session(context.Background(), host+"/models/tiny:v1", redirectCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, a.URL+"/v2/models/tiny/blobs/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("want the downgrade refused")
+	}
+	if !errors.Is(err, ErrRedirectDowngrade) {
+		t.Fatalf("err = %v, want ErrRedirectDowngrade", err)
+	}
+	if n := len(blog.seen()); n != 0 {
+		t.Fatalf("http host saw %d requests, want 0", n)
+	}
+}
+
+// TestCheckRedirectSchemeRules: https to http is refused unless the registry
+// is plain http; http to https is followed; a cross-origin hop loses every
+// credential header, Proxy-Authorization included.
+func TestCheckRedirectSchemeRules(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		plainHTTP bool
+		from, to  string
+		refused   bool
+		stripped  bool
+	}{
+		{"https to http refused", false, "https://r.example/a", "http://r.example/b", true, false},
+		{"https to http with plain registry", true, "https://r.example/a", "http://r.example/b", false, true},
+		{"http to https followed", false, "http://r.example/a", "https://r.example/b", false, true},
+		{"same origin kept", false, "https://r.example/a", "https://r.example:443/b", false, false},
+		{"other host stripped", false, "https://r.example/a", "https://blobs.example/b", false, true},
+	} {
+		first, err := http.NewRequest(http.MethodGet, tc.from, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, err := http.NewRequest(http.MethodGet, tc.to, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range crossOriginHeaders {
+			next.Header.Set(h, "x")
+		}
+		err = checkRedirect(tc.plainHTTP)(next, []*http.Request{first})
+		if got := errors.Is(err, ErrRedirectDowngrade); got != tc.refused {
+			t.Errorf("%s: err = %v, want refused %v", tc.name, err, tc.refused)
+			continue
+		}
+		if tc.refused {
+			continue
+		}
+		for _, h := range crossOriginHeaders {
+			if got := next.Header.Get(h) == ""; got != tc.stripped {
+				t.Errorf("%s: %s stripped %v, want %v", tc.name, h, got, tc.stripped)
+			}
+		}
 	}
 }
