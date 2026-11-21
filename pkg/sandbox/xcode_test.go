@@ -98,6 +98,7 @@ func TestXcodeToolchainStanzaShape(t *testing.T) {
 			`(subpath "` + xcodeDevDir + `/Toolchains/XcodeDefault.xctoolchain")`,
 			`(subpath "` + xcodeDevDir + `/Platforms/MacOSX.platform/Developer")`,
 			`(subpath "` + xcodeDevDir + `/Library/Frameworks/XcodeKit.framework")`,
+			`(subpath "` + xcodeDevDir + `/Library/Frameworks/Python3.framework")`,
 			`(subpath "` + bundle + `/Contents/SharedFrameworks")`,
 			`(subpath "` + bundle + `/Contents/Frameworks")`,
 			`(literal "` + xcodeDevDir + `")`,
@@ -563,6 +564,44 @@ func TestXcodeToolchainGrantReachesTheToolchain(t *testing.T) {
 		}
 	})
 
+	// Xcode's bundled python3 is a symlink from D/usr/bin into
+	// D/Library/Frameworks/Python3.framework; without that subtree the exec is
+	// EPERM (exit 71) (sessionhost-xcode-python3-eperm-20261121). The stdlib
+	// import proves the framework's lib tree is readable too, not just the binary.
+	t.Run("xcode-python3-runs-from-its-framework", func(t *testing.T) {
+		py := filepath.Join(dir, "usr", "bin", "python3")
+		if _, err := os.Lstat(py); err != nil {
+			t.Skipf("no %s on this host", py)
+		}
+		// -I: ignore PYTHON* and the user site, so the host's environment cannot
+		// change what this run proves.
+		out, code := confined(t, py, "-I", "-c", "import json, sys; print(json.dumps(sys.prefix))")
+		if code != 0 || !strings.Contains(out, "Python3.framework") {
+			t.Errorf("%s exited %d under the grant and printed:\n%s\nwant 0 and a sys.prefix inside Python3.framework", py, code, out)
+		}
+	})
+
+	// CEILING for the framework grant: it is read and exec only. A pod that could
+	// write site-packages could plant a .pth every later Xcode python3 on the node
+	// runs. Run unprivileged, the framework's root:wheel modes refuse the write
+	// too, so this case is a profile check only when the gate runs as root; the
+	// golden and TestXcodeGrantStaysReadOnlyAndFileScoped pin the SBPL side.
+	t.Run("xcode-python3-framework-stays-read-only", func(t *testing.T) {
+		py := filepath.Join(dir, "usr", "bin", "python3")
+		if _, err := os.Lstat(py); err != nil {
+			t.Skipf("no %s on this host", py)
+		}
+		target := filepath.Join(dir, "Library", "Frameworks", "Python3.framework", "Versions", "Current", "lib", "k3sm-ceiling-probe.pth")
+		script := "import sys\ntry:\n    open(sys.argv[1], 'w').close()\nexcept PermissionError:\n    print('denied'); sys.exit(0)\nprint('WROTE'); sys.exit(3)\n"
+		out, code := confined(t, py, "-I", "-c", script, target)
+		if code != 0 || !strings.Contains(out, "denied") {
+			t.Errorf("a write into Python3.framework from a confined python3 exited %d and printed:\n%s\nwant a PermissionError: the grant must stay read-only", code, out)
+		}
+		if _, err := os.Lstat(target); err == nil {
+			t.Errorf("%s exists after the confined write attempt", target)
+		}
+	})
+
 	// CEILING: a pod must NOT be able to drive a project-evaluating build. This is
 	// the half that would silently rot — a future widening that "fixes xcodebuild"
 	// by granting Mach services or /Users would pass every reach case above.
@@ -994,6 +1033,20 @@ func TestXcodePlugInsCarveCoversEveryEntitledExecutable(t *testing.T) {
 
 // isMachOExecutable reports whether p is a thin or fat Mach-O whose (first)
 // slice is an MH_EXECUTE image.
+// isMachO reports whether p is a Mach-O of any type (executable, dylib, bundle).
+func isMachO(p string) bool {
+	if ff, err := macho.OpenFat(p); err == nil {
+		_ = ff.Close()
+		return true
+	}
+	f, err := macho.Open(p)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
 func isMachOExecutable(p string) bool {
 	if ff, err := macho.OpenFat(p); err == nil {
 		defer ff.Close()
@@ -1039,4 +1092,64 @@ func TestXcodeGitCoreHasNoEntitledExecutable(t *testing.T) {
 		t.Fatalf("no Mach-O executable under %s; the scan proves nothing", dir)
 	}
 	t.Logf("checked %d executables under %s", checked, dir)
+}
+
+// TestXcodePython3FrameworkHasNoPrivilegedEntitlement pins that the
+// Python3.framework grant (sessionhost-xcode-python3-eperm-20261121) hands a pod no
+// privilege: a read-and-exec grant over a Mach-O carrying a privileged
+// entitlement would extend what the pod can do beyond the file scope the stanza
+// claims. Its two interpreters (bin/python3.9 and Resources/Python.app) carry
+// exactly one key, com.apple.application-identifier = com.apple.python3: an
+// identity, not a capability, and the same one the Command Line Tools' python3
+// carries, which pods already run. Any other key fails the test.
+//
+// It scans every Mach-O in the subtree, not only executables (the framework is
+// mostly lib-dynload extensions), and checks the value as well as the key. It
+// also pins the bundled Python version this scan was last reviewed against: an
+// Xcode that ships another version fails here, loudly, so the scan is re-read
+// before pods are granted a new interpreter unseen.
+func TestXcodePython3FrameworkHasNoPrivilegedEntitlement(t *testing.T) {
+	const reviewedVersion = "3.9"
+	allowed := map[string]string{"com.apple.application-identifier": "com.apple.python3"}
+	pairRE := regexp.MustCompile(`<key>([^<]*)</key>\s*<string>([^<]*)</string>`)
+	keyRE := regexp.MustCompile(`<key>([^<]*)</key>`)
+	dir := filepath.Join(xcodeDevDir, "Library", "Frameworks", "Python3.framework")
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("SKIP: no %s on this host", dir)
+	}
+	if cur, err := os.Readlink(filepath.Join(dir, "Versions", "Current")); err != nil || cur != reviewedVersion {
+		t.Fatalf("Python3.framework Versions/Current is %q (%v), not the reviewed %s: re-review the framework's contents and entitlements, then update reviewedVersion", cur, err, reviewedVersion)
+	}
+	checked := 0
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !info.Mode().IsRegular() || !isMachO(p) {
+			return nil //nolint:nilerr // an unreadable entry is not this test's concern
+		}
+		checked++
+		out, err := exec.Command("codesign", "-d", "--entitlements", "-", "--xml", p).CombinedOutput()
+		if err != nil {
+			t.Errorf("codesign -d %s: %v: %s", p, err, out)
+			return nil
+		}
+		values := map[string]string{}
+		for _, m := range pairRE.FindAllStringSubmatch(string(out), -1) {
+			values[m[1]] = m[2]
+		}
+		for _, m := range keyRE.FindAllStringSubmatch(string(out), -1) {
+			want, ok := allowed[m[1]]
+			if !ok {
+				t.Errorf("%s carries entitlement %q; the Python3.framework grant would hand it out", p, m[1])
+			} else if values[m[1]] != want {
+				t.Errorf("%s carries %s = %q, want %q", p, m[1], values[m[1]], want)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked == 0 {
+		t.Fatalf("no Mach-O file under %s; the scan proves nothing", dir)
+	}
+	t.Logf("checked %d Mach-O files under %s", checked, dir)
 }
