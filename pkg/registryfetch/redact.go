@@ -80,43 +80,32 @@ func scrubURLs(s string) string {
 }
 
 // reduceURL is raw with only its scheme, host and path. A raw URL that does
-// not parse, or an opaque one, is first cut at its first '?' or '#', so no
-// query or fragment survives whatever it holds. User info is then stripped
-// from the authority alone: the text after "://" up to the first '/', and
-// only an '@' inside it marks user info. An '@' that cannot be placed (one
-// past the first '/' but before the cut, as user info holding a '/' leaves
-// it, or one past the cut but before any '/', as user info holding a '?' or
-// '#' leaves it) makes the authority ambiguous, and the result is the scheme
-// with a fixed placeholder host, never raw bytes.
+// not parse, or an opaque one, fails closed: without "://" after a valid
+// scheme it is a fixed placeholder; with an '@' anywhere past the "://" it is
+// the scheme and that placeholder, since the '@' may close user info whose
+// bounds cannot be trusted; otherwise it is cut at its first '?' or '#', so
+// no query or fragment survives.
 func reduceURL(raw string) string {
 	if u, err := url.Parse(raw); err == nil && u.Opaque == "" {
 		r := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}
 		return r.String()
 	}
 	scheme, rest, ok := strings.Cut(raw, "://")
-	if !ok {
-		if i := strings.IndexAny(raw, "?#"); i >= 0 {
-			raw = raw[:i]
-		}
-		return raw
+	if !ok || !validScheme.MatchString(scheme) {
+		return redacted
 	}
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		slash = len(rest)
+	if strings.Contains(rest, "@") {
+		return scheme + "://" + redacted
 	}
-	cut := strings.IndexAny(rest, "?#")
-	if cut < 0 {
-		cut = len(rest)
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
 	}
-	if strings.Contains(rest[min(slash, cut):max(slash, cut)], "@") {
-		return scheme + "://" + redactedHost
-	}
-	kept := rest[:cut]
-	if at := strings.LastIndex(kept[:min(slash, cut)], "@"); at >= 0 {
-		kept = kept[at+1:]
-	}
-	return scheme + "://" + kept
+	return scheme + "://" + rest
 }
 
-// redactedHost stands in for an authority reduceURL cannot bound.
-const redactedHost = "redacted"
+// validScheme matches a URL scheme as RFC 3986 section 3.1 spells it.
+var validScheme = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+
+// redacted stands in for an unparsed URL, or its authority, that reduceURL
+// does not keep.
+const redacted = "redacted"

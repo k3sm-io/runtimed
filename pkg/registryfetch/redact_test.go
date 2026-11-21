@@ -202,23 +202,35 @@ func TestRedirectErrorOmitsTargetQuery(t *testing.T) {
 	}
 }
 
-// TestReduceURL: only scheme, host and path survive, parsed or not.
+// TestReduceURL: only scheme, host and path survive a URL that parses; one
+// that does not, or an opaque one, keeps its scheme and nothing past it when
+// it holds an '@' anywhere, and is a fixed placeholder when it has no valid
+// scheme. No result holds the row's secret, a '?' or a '#'.
 func TestReduceURL(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{"https://blobs.example/a/b?X-Amz-Signature=s#frag", "https://blobs.example/a/b"},
-		{"https://u:p@blobs.example:8443/a%2Fb?q=1", "https://blobs.example:8443/a%2Fb"},
-		{"http://blobs.example", "http://blobs.example"},
-		{"https://blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
-		{"https://u:p@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
-		{"mailto:x?sig=s", "mailto:x"},
-		{"https://u:p/w@blobs.example/%zz?sig=s", "https://redacted"},
-		{"https://u:p?ss@blobs.example/%zz?sig=s", "https://redacted"},
-		{"https://blobs.example/%zz?email=a@b.com&sig=S", "https://blobs.example/%zz"},
-		{"https://u:p?x@host/path", "https://redacted"},
-		{"https://blobs.example/a/%zz/b?sig=s#frag", "https://blobs.example/a/%zz/b"},
+	for _, tc := range []struct{ in, want, secret string }{
+		{"https://blobs.example/a/b?X-Amz-Signature=s#frag", "https://blobs.example/a/b", "X-Amz-Signature"},
+		{"https://u:p@blobs.example:8443/a%2Fb?q=1", "https://blobs.example:8443/a%2Fb", "u:p"},
+		{"http://blobs.example", "http://blobs.example", "@"},
+		{"https://blobs.example/%zz?sig=s", "https://blobs.example/%zz", "sig="},
+		{"https://u:p@blobs.example/%zz?sig=s", "https://redacted", "u:p"},
+		{"mailto:x?sig=s", "redacted", "sig="},
+		{"https://u:p/w@blobs.example/%zz?sig=s", "https://redacted", "u:p"},
+		{"https://u:p?ss@blobs.example/%zz?sig=s", "https://redacted", "u:p"},
+		{"https://u:p?x@host/path", "https://redacted", "u:p"},
+		{"https://blobs.example/a/%zz/b?sig=s#frag", "https://blobs.example/a/%zz/b", "sig="},
+		{"//user:pw@host/%zz", "redacted", "user:pw"},
+		{"user:pw@host/%zz", "redacted", "pw@"},
+		{"https:user:pw@host/p", "redacted", "user:pw"},
+		{"https://user:pa?ss/word@host/p%zz", "https://redacted", "user:pa"},
+		{"foo?sig=S://h\x7f", "redacted", "sig=S"},
+		{"https://blobs.example/%zz?email=a@b.com&sig=S", "https://redacted", "a@b.com"},
 	} {
-		if got := reduceURL(tc.in); got != tc.want {
+		got := reduceURL(tc.in)
+		if got != tc.want {
 			t.Errorf("reduceURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		if strings.Contains(got, tc.secret) || strings.ContainsAny(got, "?#") {
+			t.Errorf("reduceURL(%q) = %q, holds %q, '?' or '#'", tc.in, got, tc.secret)
 		}
 	}
 }
