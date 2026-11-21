@@ -211,6 +211,7 @@ func TestReduceURL(t *testing.T) {
 		{"https://blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 		{"https://u:p@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 		{"mailto:x?sig=s", "mailto:x"},
+		{"https://u:p/w@blobs.example/%zz?sig=s", "https://blobs.example/%zz"},
 	} {
 		if got := reduceURL(tc.in); got != tc.want {
 			t.Errorf("reduceURL(%q) = %q, want %q", tc.in, got, tc.want)
@@ -235,5 +236,56 @@ func TestRedactURLErrorKeepsCause(t *testing.T) {
 	}
 	if got := RedactURLError(cause); got != cause {
 		t.Fatalf("RedactURLError(cause) = %v, want cause itself", got)
+	}
+}
+
+// TestRedactURLErrorScrubsRenderedURL: a wrapper that has already rendered a
+// URL into its text (go-containerregistry's refused token-server redirect
+// does) loses the URL's query and fragment, and still reaches its cause.
+func TestRedactURLErrorScrubsRenderedURL(t *testing.T) {
+	cause := errors.New("cause")
+	inner := fmt.Errorf("refusing token-server redirect to %q: %w", "https://t.example/token?sig="+queryMarker+"#f", cause)
+	err := RedactURLError(&url.Error{Op: "Get", URL: "https://r.example/v2/", Err: inner})
+	msg := err.Error()
+	if strings.Contains(msg, queryMarker) || strings.Contains(msg, "#f") || !strings.Contains(msg, `"https://t.example/token"`) {
+		t.Fatalf("err = %s, want the rendered URL without its query or fragment", msg)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("err = %v, want it to reach the cause", err)
+	}
+	if again := RedactURLError(err); again.Error() != msg {
+		t.Fatalf("second pass = %s, want %s", again, msg)
+	}
+	plain := errors.New("no URL here: https://h.example/p")
+	if got := RedactURLError(plain); got != plain {
+		t.Fatalf("RedactURLError(%v) = %v, want it unchanged", plain, got)
+	}
+}
+
+// failingRoute is a round tripper whose every request fails with a
+// *url.Error naming the request's URL, as a client inside a transport (the
+// authenticating transport's token fetch) fails.
+type failingRoute struct{}
+
+func (failingRoute) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: errors.New("refused")}
+}
+
+// TestHostSplitRedactsRouteErrors: an error either route returns reaches
+// hostSplit's caller without the request's query.
+func TestHostSplitRedactsRouteErrors(t *testing.T) {
+	h := &hostSplit{scheme: "https", host: canonicalHost("https", "registry.example"), auth: failingRoute{}, plain: failingRoute{}}
+	for _, u := range []string{
+		"https://registry.example/v2/x?sig=" + queryMarker,
+		"https://blobs.example/x?sig=" + queryMarker,
+	} {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = h.RoundTrip(req)
+		if err == nil || strings.Contains(err.Error(), queryMarker) {
+			t.Fatalf("%s: err = %v, want an error without the query", u, err)
+		}
 	}
 }
