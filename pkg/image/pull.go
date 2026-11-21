@@ -539,12 +539,9 @@ type Puller struct {
 	// fetches every layer from byte 0.
 	partials *registryfetch.PartialStore
 
-	// layerStallWindow is how long a layer body may deliver no byte before its
-	// fetch is aborted with ErrLayerBodyStalled (stallread.go). Zero means
-	// defaultLayerStallWindow; tests set it directly.
-	layerStallWindow time.Duration
 	// stallAfterFunc makes the watchdog timers of every layer body
-	// (newLayerBody). Nil means timeAfterFunc; tests set a hand-fired fake.
+	// (newLayerBody), each of defaultLayerStallWindow. Nil means
+	// timeAfterFunc; tests set a hand-fired fake.
 	stallAfterFunc func(time.Duration, func()) stallTimer
 }
 
@@ -1414,14 +1411,8 @@ func (p *Puller) newLayerBody(rc io.ReadCloser) *stallReader {
 	return newStallReader(rc, p.stallWindow(), p.stallAfterFunc)
 }
 
-// stallWindow is the layer-body progress window: layerStallWindow, or
-// defaultLayerStallWindow when unset.
-func (p *Puller) stallWindow() time.Duration {
-	if p.layerStallWindow > 0 {
-		return p.layerStallWindow
-	}
-	return defaultLayerStallWindow
-}
+// stallWindow is the layer-body progress window, defaultLayerStallWindow.
+func (p *Puller) stallWindow() time.Duration { return defaultLayerStallWindow }
 
 // descriptorFromGGCR converts a go-containerregistry descriptor to the apis type.
 func descriptorFromGGCR(d ggcrv1.Descriptor) *runtimev1.Descriptor {
