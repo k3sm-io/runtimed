@@ -1696,7 +1696,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 				{Name: "cfg", MountPath: "/etc/cfg"},
 				{Name: "sec", MountPath: "/etc/sec", ReadOnly: true},
 			},
-			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 501, RunAsGroup: 20},
+			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 250, RunAsGroup: 20},
 		}},
 	}
 	// fsGroup chown is exercised only when the test process has a real (>0)
@@ -1734,7 +1734,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	// (3) the run-as identity reached the spawned exec-shim argv (fakeBackend
 	// mirrors the shim arg shape [shim, uid, gid, groups, profile, argv...]).
 	argv := sp.specs[len(sp.specs)-1].Argv
-	if len(argv) < 4 || argv[1] != "501" || argv[2] != "20" {
+	if len(argv) < 4 || argv[1] != "250" || argv[2] != "20" {
 		t.Errorf("drop credential not in spawn argv: %v", argv)
 	}
 
@@ -1744,8 +1744,8 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	if len(cs) != 1 || len(cs[0].GetVolumeMounts()) != 2 {
 		t.Fatalf("container status volume_mounts mirror missing: %+v", cs)
 	}
-	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 501 || u.GetGid() != 20 {
-		t.Errorf("container status user mirror = %+v, want uid 501 gid 20", u)
+	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 250 || u.GetGid() != 20 {
+		t.Errorf("container status user mirror = %+v, want uid 250 gid 20", u)
 	}
 
 	w.release(1001)

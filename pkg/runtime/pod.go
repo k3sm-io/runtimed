@@ -1908,6 +1908,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// binary — in that irreversible order. The shim starts with an empty
 	// environment; env reaches the pod binary as the launch payload.
 	cred := resolveCredential(p.box, c)
+	if err := checkPodUID(cred); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("container %s: %w", c.GetName(), err)
+	}
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, execArgv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,

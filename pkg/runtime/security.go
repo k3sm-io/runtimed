@@ -61,6 +61,18 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 	}
 }
 
+// checkPodUID refuses, before anything is spawned, a credential whose drop
+// would leave the pod process in the login range or at uid 0
+// (supervisor.Credential.CheckPodUID). A credential without a drop runs at
+// the daemon's own uid, which the exec-shim checks again at spawn
+// (supervisor.RunLaunchSequence), so it is not refused here.
+func checkPodUID(cred supervisor.Credential) error {
+	if !cred.Drop {
+		return nil
+	}
+	return cred.CheckPodUID(0)
+}
+
 // fsGroupOwners says whose entries the fsGroup walk may change in a pod's
 // tree (supervisor.ChownForFSGroup): the uid each of the pod's containers
 // runs as, and the daemon's own uid (euid), which owns what the daemon puts

@@ -35,7 +35,7 @@ func (r *recDrop) chown(p string, _, _ int) error {
 }
 
 func TestDropShim(t *testing.T) {
-	drop := supervisor.Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}
+	drop := supervisor.Credential{UID: 250, GID: 20, Groups: []int{20}, Drop: true}
 	t.Run("no drop changes nothing", func(t *testing.T) {
 		r := &recDrop{}
 		if err := dropShim(r, r.chown, supervisor.Credential{}, 0, "/d"); err != nil || len(r.calls) != 0 {
@@ -54,7 +54,7 @@ func TestDropShim(t *testing.T) {
 	})
 	t.Run("an unprivileged shim refuses a drop", func(t *testing.T) {
 		r := &recDrop{}
-		if err := dropShim(r, r.chown, drop, 501, "/d"); err == nil || len(r.calls) != 0 {
+		if err := dropShim(r, r.chown, drop, 250, "/d"); err == nil || len(r.calls) != 0 {
 			t.Fatalf("err=%v calls=%v, want a refusal and no call", err, r.calls)
 		}
 	})

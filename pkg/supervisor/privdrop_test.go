@@ -125,14 +125,14 @@ func TestRunLaunchSequenceOrder(t *testing.T) {
 	}{
 		{
 			name: "drop-requested-as-root",
-			cred: Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true},
+			cred: Credential{UID: 250, GID: 20, Groups: []int{20, 999}, Drop: true},
 			euid: 0,
 			want: []LaunchStep{StepSetgid, StepInitgroups, StepSetuid, StepSandboxApply, StepExec},
 		},
 		{
 			name: "no-drop-unprivileged-in-seatbelt",
 			cred: Credential{Drop: false},
-			euid: 501, // non-root daemon: Drop=false must NOT attempt any setuid
+			euid: 250, // non-root daemon: Drop=false must NOT attempt any setuid
 			want: []LaunchStep{StepSandboxApply, StepExec},
 		},
 	}
@@ -204,7 +204,7 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 			seam := &recordingSeam{hasFail: true, failAt: tc.failAt, failErr: boom}
 			// euid 0 (root): the drop is permitted, so the injected failAt — not
 			// the euid guard — is what stops the sequence.
-			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}}, 0)
+			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 250, GID: 20, Groups: []int{20}, Drop: true}}, 0)
 			if !errors.Is(err, boom) {
 				t.Fatalf("want wrapped boom, got %v", err)
 			}
@@ -228,7 +228,7 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 // a stray Drop=true fails closed rather than silently mis-running the pod.
 func TestRunLaunchSequenceRefusesDropAsNonRoot(t *testing.T) {
 	seam := &recordingSeam{}
-	done, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 501, GID: 20, Drop: true}}, 501)
+	done, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 250, GID: 20, Drop: true}}, 250)
 	if !errors.Is(err, ErrDropRequiresRoot) {
 		t.Fatalf("want ErrDropRequiresRoot, got %v", err)
 	}
@@ -251,7 +251,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}}
 		// drop requested as root: the full sequence runs.
 		done, err := RunLaunchSequence(seam, LaunchSpec{
-			Cred:    Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true},
+			Cred:    Credential{UID: 250, GID: 20, Groups: []int{20}, Drop: true},
 			Rlimits: plan,
 		}, 0)
 		if err != nil {
@@ -279,7 +279,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 			{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 256, Max: 512}},
 			{Resource: unix.RLIMIT_AS, Lim: unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}},
 		}
-		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -299,7 +299,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 	// An empty plan adds no StepSetrlimit and calls the seam zero times.
 	t.Run("empty-plan-adds-no-step", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, LaunchSpec{}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -329,7 +329,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		// Request hard = 1<<20 (a raise above the inherited 4096): the unprivileged
 		// posture cannot raise it, so it must be clamped to 4096, not fail the pod.
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 8192, Max: 1 << 20}}}
-		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250)
 		if err != nil {
 			t.Fatalf("clamp must not be fatal, got err=%v", err)
 		}
@@ -368,7 +368,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 2048, Max: 4096}}}
 		// Root drop posture: euid 0, full sequence.
 		if _, err := RunLaunchSequence(seam, LaunchSpec{
-			Cred:    Credential{UID: 501, GID: 20, Drop: true},
+			Cred:    Credential{UID: 250, GID: 20, Drop: true},
 			Rlimits: plan,
 		}, 0); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
@@ -388,7 +388,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 			inherited: map[int]unix.Rlimit{unix.RLIMIT_NPROC: {Cur: 512, Max: 1024}},
 		}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 100, Max: 200}}}
-		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
 		if len(seam.rlimitCalls) != 1 {
@@ -407,7 +407,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		seam := &recordingSeam{}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{
 			Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}}}
-		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
 		if len(seam.rlimitCalls) != 1 {
@@ -433,7 +433,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 
 		seam := &recordingSeam{}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 16, Max: 1024}}}
-		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
 		if len(seam.rlimitCalls) != 1 {
@@ -460,7 +460,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	t.Run("bg-with-drop-ordered-after-drop-before-sandbox", func(t *testing.T) {
 		seam := &recordingSeam{}
 		spec := LaunchSpec{
-			Cred:    Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true},
+			Cred:    Credential{UID: 250, GID: 20, Groups: []int{20}, Drop: true},
 			Rlimits: []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}},
 			BgQoS:   true,
 		}
@@ -491,7 +491,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 
 	t.Run("bg-no-drop-unprivileged", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -508,7 +508,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	// default band is the absence of the call, not an explicit reset.
 	t.Run("guaranteed-burstable-no-call-at-all", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, LaunchSpec{}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -525,7 +525,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	t.Run("setpriority-failure-fail-closed", func(t *testing.T) {
 		boom := errors.New("boom")
 		seam := &recordingSeam{hasFail: true, failAt: StepSetpriority, failErr: boom}
-		_, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		_, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 250)
 		if !errors.Is(err, boom) {
 			t.Fatalf("want wrapped boom, got %v", err)
 		}
@@ -540,7 +540,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	// command is never exec'd outside the band the pod asked for.
 	t.Run("exec-session-eperm-surfaces", func(t *testing.T) {
 		seam := &recordingSeam{hasFail: true, failAt: StepSetpriority, failErr: unix.EPERM}
-		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 250)
 		if !errors.Is(err, unix.EPERM) {
 			t.Fatalf("want a wrapped EPERM, got %v", err)
 		}
@@ -559,9 +559,9 @@ func TestCredentialValidate(t *testing.T) {
 		euid    int
 		wantErr bool
 	}{
-		{"drop-as-root-ok", Credential{UID: 501, GID: 20, Drop: true}, 0, false},
-		{"drop-as-nonroot-refused", Credential{UID: 501, GID: 20, Drop: true}, 501, true},
-		{"no-drop-as-nonroot-ok", Credential{Drop: false}, 501, false},
+		{"drop-as-root-ok", Credential{UID: 250, GID: 20, Drop: true}, 0, false},
+		{"drop-as-nonroot-refused", Credential{UID: 250, GID: 20, Drop: true}, 250, true},
+		{"no-drop-as-nonroot-ok", Credential{Drop: false}, 250, false},
 		{"no-drop-as-root-ok", Credential{Drop: false}, 0, false},
 	}
 	for _, tc := range cases {
@@ -589,7 +589,7 @@ func TestCredentialShimRoundTrip(t *testing.T) {
 		cred Credential
 	}{
 		{"no-drop", Credential{Drop: false}},
-		{"drop-with-groups", Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true}},
+		{"drop-with-groups", Credential{UID: 250, GID: 20, Groups: []int{20, 999}, Drop: true}},
 		{"drop-no-groups", Credential{UID: 1000, GID: 1000, Drop: true}},
 		{"drop-root-gid", Credential{UID: 1000, GID: 0, Groups: []int{0}, Drop: true}},
 	}
@@ -819,4 +819,44 @@ func normGroups(g []int) []int {
 		return []int{}
 	}
 	return g
+}
+
+// TestRunLaunchSequenceRefusesPodUID pins the spawn-time half of the pod uid
+// refusal: a final uid of 501 or above (the drop target, or the inherited euid
+// when there is no drop), or uid 0 after a drop, fails before any step runs.
+// uid 250, the service user, is the control.
+func TestRunLaunchSequenceRefusesPodUID(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cred    Credential
+		euid    int
+		refused bool
+	}{
+		{"drop to 501", Credential{UID: 501, GID: 20, Drop: true}, 0, true},
+		{"drop to 502", Credential{UID: 502, GID: 20, Drop: true}, 0, true},
+		{"drop to 2147483647", Credential{UID: 2147483647, GID: 20, Drop: true}, 0, true},
+		{"drop to a negative uid", Credential{UID: -1, GID: 20, Drop: true}, 0, true},
+		{"drop leaves uid 0", Credential{UID: 0, GID: 20, Drop: true}, 0, true},
+		{"no drop at euid 501", Credential{}, 501, true},
+		{"no drop at euid 2147483647", Credential{}, 2147483647, true},
+		{"drop to 250", Credential{UID: 250, GID: 250, Drop: true}, 0, false},
+		{"no drop at euid 250", Credential{}, 250, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seam := &recordingSeam{}
+			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: tc.cred}, tc.euid)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("RunLaunchSequence: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrPodUIDRefused) {
+				t.Fatalf("err = %v, want ErrPodUIDRefused", err)
+			}
+			if len(seam.calls) != 0 {
+				t.Errorf("steps ran before the refusal: %v", seam.calls)
+			}
+		})
+	}
 }

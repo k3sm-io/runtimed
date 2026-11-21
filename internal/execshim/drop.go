@@ -40,6 +40,9 @@ func dropShim(seam dropSeam, chown func(path string, uid, gid int) error, cred s
 	if err := cred.Validate(euid); err != nil {
 		return err
 	}
+	if err := cred.CheckPodUID(euid); err != nil {
+		return err
+	}
 	if !cred.Drop {
 		return nil
 	}

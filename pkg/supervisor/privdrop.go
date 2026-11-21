@@ -82,6 +82,44 @@ func (c Credential) Validate(euid int) error {
 	return nil
 }
 
+// LoginUIDFloor is the first uid macOS gives a login account. A pod process
+// never runs at or above it: such a uid is a person's, with that person's files,
+// keychain and sockets.
+const LoginUIDFloor = 501
+
+// ErrPodUIDRefused reports a pod credential whose process would end up at a uid
+// a pod may not hold: one in the login range (LoginUIDFloor and above), a
+// negative one, or uid 0 after a requested drop.
+var ErrPodUIDRefused = errors.New("supervisor: pod uid refused")
+
+// FinalUID returns the uid the pod process holds after the launch sequence:
+// c.UID when a drop is requested, else euid, the identity it inherits.
+func (c Credential) FinalUID(euid int) int {
+	if c.Drop {
+		return c.UID
+	}
+	return euid
+}
+
+// CheckPodUID refuses, with ErrPodUIDRefused, a credential whose final uid
+// (FinalUID) is in the login range or negative, whatever the pod's runAsUser or
+// runAsGroup asked for, and a drop that leaves the process at uid 0 (a
+// runAsGroup with no runAsUser on a root daemon), which counts as no drop.
+// The runtime checks it before it wraps a command, and RunLaunchSequence and
+// the resident shim's drop check it again in the process that drops.
+func (c Credential) CheckPodUID(euid int) error {
+	final := c.FinalUID(euid)
+	switch {
+	case c.Drop && final == 0:
+		return fmt.Errorf("%w: the drop leaves the process at uid 0", ErrPodUIDRefused)
+	case final < 0:
+		return fmt.Errorf("%w: uid %d is negative", ErrPodUIDRefused, final)
+	case final >= LoginUIDFloor:
+		return fmt.Errorf("%w: uid %d is in the login range (%d and above)", ErrPodUIDRefused, final, LoginUIDFloor)
+	}
+	return nil
+}
+
 // noDropSentinel is the uid/gid argv token meaning "no privilege drop". It is
 // distinct from any real id (ids are non-negative), so it round-trips a Drop
 // decision through the exec-shim argv without an extra flag.
@@ -279,6 +317,9 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 	var done []LaunchStep
 	cred := spec.Cred
 	if err := cred.Validate(euid); err != nil {
+		return done, err
+	}
+	if err := cred.CheckPodUID(euid); err != nil {
 		return done, err
 	}
 	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the
