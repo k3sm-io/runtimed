@@ -27,14 +27,18 @@ import (
 
 // ErrLayerBodyStalled is returned (wrapped) when a layer body delivers no byte
 // for a whole stall window. The fetch is aborted by closing the body; the error
-// is an ordinary fetch failure, and a retry of the pull starts the layer over.
+// is an ordinary fetch failure. A retry of the pull starts a whole-fetched layer
+// over, and resumes a layer fetched through the partial store from the bytes
+// that arrived before the stall (resumeBlob).
 var ErrLayerBodyStalled = errors.New("image: layer body stalled")
 
 // defaultLayerStallWindow is how long a layer body may deliver nothing before
 // the fetch is aborted. It sits above the transport's 30s dial, 10s TLS
 // handshake and 90s idle-connection timeouts: a registry that is merely slow
-// keeps sending bytes and is never cut, while a body that has stopped moving no
-// longer hangs until the caller's context ends.
+// keeps sending bytes and is never cut, while a body that has gone silent no
+// longer hangs until the caller's context ends. It bounds silence only: a body
+// that trickles a byte inside every window, and the wait for response headers
+// before the body exists, are not covered by this watchdog.
 const defaultLayerStallWindow = 2 * time.Minute
 
 // stallReader is a progress watchdog on one layer body. It times only the
@@ -45,7 +49,8 @@ const defaultLayerStallWindow = 2 * time.Minute
 // Read, and Read reports ErrLayerBodyStalled with the read's error as the cause.
 //
 // Lifetime: the timer is a time.AfterFunc (made through afterFunc, which tests
-// replace with a hand-fired fake), so no goroutine exists until it fires, and it is stopped whenever no body.Read is in flight. Close stops it,
+// replace with a hand-fired fake), so no goroutine exists until it fires, and
+// it is stopped whenever no body.Read is in flight. Close stops it,
 // and Close and the timer share one sync.Once around the body's Close.
 // Close returns after any callback that has entered the shared once has
 // finished; a callback scheduled but not yet running may finish after Close,

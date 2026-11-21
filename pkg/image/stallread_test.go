@@ -98,7 +98,8 @@ func layerBodyServer(t *testing.T, body func(w http.ResponseWriter, r *http.Requ
 
 // TestLayerPullStalledBodyAborts is the gate for the layer-body watchdog end
 // to end: a layer whose body stops after a few bytes while the server holds the
-// connection fails the pull with ErrLayerBodyStalled. The watchdog runs on the
+// connection fails the pull with ErrLayerBodyStalled (see pullFiringStalls for
+// what the fire order does and does not show). The watchdog runs on the
 // fake timer through the Puller's seam, so the test never waits on the wall
 // clock; a pull whose body is not watched never returns, and go test -timeout
 // fails it. That a body which keeps delivering is never cut is pinned in
@@ -155,10 +156,13 @@ type pullResult struct {
 // pullFiringStalls runs one Pull of ref on p, whose stallAfterFunc is
 // ft.afterFunc, and returns its result. Once sent is closed (the server has
 // flushed the bytes it sends before holding the body), every watchdog window a
-// body Read arms is run out on the fake clock, so a held body is cut at once
-// and a body that keeps arriving is cut only between its bytes, never before
-// the server sent them. Nothing waits on the wall clock: a Pull that never
-// returns, because nothing watches the body, is caught by go test -timeout.
+// body Read arms is run out on the fake clock, so a held body is cut at once.
+// sent is a server-side signal only: a fire may land on a Read that had not yet
+// received the flushed bytes, so this helper shows that a watched body is cut,
+// not that the cut came after the client read data. That bytes-then-silence
+// case is pinned client-side by TestPullResumeStalledBodyKeepsPartial. Nothing
+// waits on the wall clock: a Pull that never returns, because nothing watches
+// the body, is caught by go test -timeout.
 func pullFiringStalls(t *testing.T, p *Puller, ref string, ft *fakeTimer, sent <-chan struct{}) pullResult {
 	t.Helper()
 	done := make(chan pullResult, 1)
