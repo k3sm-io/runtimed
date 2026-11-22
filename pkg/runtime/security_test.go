@@ -259,14 +259,37 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 	}
 	// No drop: the pod inherits the daemon's own uid, root or a rootless
 	// developer's login uid, and holds nothing that uid does not already hold.
-	for _, euid := range []int{501, 0, 250} {
-		t.Run(fmt.Sprintf("inherited euid %d allowed with no drop", euid), func(t *testing.T) {
-			cred := resolveCredential(&runtimev1.PodBox{}, &runtimev1.Container{})
-			if cred.Drop {
-				t.Fatalf("fixture: cred = %+v, want no drop", cred)
+	// Each euid is the one the dropping process would check against
+	// (Credential.Validate), so the case is judged as that daemon would judge
+	// it, and a drop to 500, the last uid on the allowed side, runs only under
+	// a root daemon.
+	noDrop := resolveCredential(&runtimev1.PodBox{}, &runtimev1.Container{})
+	if noDrop.Drop {
+		t.Fatalf("fixture: cred = %+v, want no drop", noDrop)
+	}
+	boundary := resolveCredential(&runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 500, RunAsGroup: 300}}, &runtimev1.Container{})
+	for _, tc := range []struct {
+		euid    int
+		cred    supervisor.Credential
+		allowed bool
+	}{
+		{501, noDrop, true},
+		{0, noDrop, true},
+		{testService.UID, noDrop, true},
+		{0, boundary, true},
+		{testService.UID, boundary, false},
+		{501, boundary, false},
+	} {
+		t.Run(fmt.Sprintf("euid %d drop %v to uid %d", tc.euid, tc.cred.Drop, tc.cred.UID), func(t *testing.T) {
+			err := tc.cred.Validate(tc.euid)
+			if err == nil {
+				err = r.checkPodUID(tc.cred)
 			}
-			if err := r.checkPodUID(cred); err != nil {
-				t.Errorf("euid %d: %v", euid, err)
+			if tc.allowed && err != nil {
+				t.Errorf("refused: %v", err)
+			}
+			if !tc.allowed && !errors.Is(err, supervisor.ErrDropRequiresRoot) {
+				t.Errorf("err = %v, want ErrDropRequiresRoot", err)
 			}
 		})
 	}

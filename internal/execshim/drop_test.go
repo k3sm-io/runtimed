@@ -59,6 +59,20 @@ func TestDropShim(t *testing.T) {
 			t.Fatalf("err=%v calls=%v, want a refusal and no call", err, r.calls)
 		}
 	})
+	t.Run("a drop to a login-range uid is refused before any call", func(t *testing.T) {
+		r := &recDrop{}
+		to := supervisor.Credential{UID: 501, GID: 300, Groups: []int{300}, Drop: true}
+		if err := dropShim(r, r.chown, to, 0, svc, "/d"); !errors.Is(err, supervisor.ErrPodUIDRefused) || len(r.calls) != 0 {
+			t.Fatalf("err=%v calls=%v, want ErrPodUIDRefused and no call", err, r.calls)
+		}
+	})
+	t.Run("a drop into staff is refused before any call", func(t *testing.T) {
+		r := &recDrop{}
+		to := supervisor.Credential{UID: 300, GID: 300, Groups: []int{300, 20}, Drop: true}
+		if err := dropShim(r, r.chown, to, 0, svc, "/d"); !errors.Is(err, supervisor.ErrPodGroupRefused) || len(r.calls) != 0 {
+			t.Fatalf("err=%v calls=%v, want ErrPodGroupRefused and no call", err, r.calls)
+		}
+	})
 	t.Run("a drop to the service uid is refused before any call", func(t *testing.T) {
 		r := &recDrop{}
 		to := supervisor.Credential{UID: svc.UID, GID: 300, Groups: []int{300}, Drop: true}
