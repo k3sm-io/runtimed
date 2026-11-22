@@ -329,7 +329,8 @@ func TestStateDirDeniedUnderACustomLeaf(t *testing.T) {
 		dataRoot, stateDir string
 		// once lists every subpath form that must appear exactly once.
 		once []string
-		// sameAsUnset is set when the field must not change the profile at all.
+		// sameAsUnset is set when the field must not change the profile
+		// above the keystore stanza at all.
 		sameAsUnset bool
 	}{
 		"custom leaf under the data root": {
@@ -370,8 +371,21 @@ func TestStateDirDeniedUnderACustomLeaf(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			unset := render(t, Posture{WorkDir: workDir, DataRoot: tc.dataRoot})
-			out := render(t, Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir})
+			// The keystore stanza closing each profile is split off: the state
+			// dir adds its own keystore denies there (TestWorkDirKeystoreDenyHidesExistence),
+			// and the rest of the profile is what these rows pin.
+			split := func(profile string) (string, string) {
+				i := strings.LastIndex(profile, keystoreStanzaHead)
+				if i < 0 {
+					t.Fatalf("no keystore stanza in:\n%s", profile)
+				}
+				return profile[:i], profile[i:]
+			}
+			unset, _ := split(render(t, Posture{WorkDir: workDir, DataRoot: tc.dataRoot}))
+			out, stanza := split(render(t, Posture{WorkDir: workDir, DataRoot: tc.dataRoot, StateDir: tc.stateDir}))
+			if want := keystoreDenyStanza(keystoreRoots(workDir, tc.dataRoot, tc.stateDir)); stanza != want {
+				t.Errorf("keystore stanza:\n%s\nwant (work dir, data root, state dir):\n%s", stanza, want)
+			}
 			for _, form := range tc.once {
 				if n := strings.Count(out, "(subpath \""+form+"\")\n"); n != 1 {
 					t.Errorf("subpath %q appears %d times, want 1:\n%s", form, n, out)

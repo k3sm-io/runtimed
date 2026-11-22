@@ -891,7 +891,7 @@ func TestGenerateDeniedUnixSockets(t *testing.T) {
 	}
 	// The keystore denies carry their own unix-socket rules; they are counted
 	// by their own tests.
-	out = strings.Replace(out, keystoreDenyStanza(keystoreRoots(DefaultWorkDir, "")), "", 1)
+	out = strings.Replace(out, keystoreDenyStanza(keystoreRoots(DefaultWorkDir, "", "")), "", 1)
 	if n := strings.Count(out, "(remote unix-socket"); n != 2 {
 		t.Errorf("want exactly the two firmlink forms of the shim-root deny, got %d unix-socket rules:\n%s", n, out)
 	}

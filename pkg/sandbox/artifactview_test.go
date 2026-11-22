@@ -95,7 +95,7 @@ func ruleIndex(lines []string, rule, sub string) int {
 // the views root and the blob cache stay denied.
 func TestArtifactViewReadOnlyNoExec(t *testing.T) {
 	prof := viewProfile(t)
-	stanza := keystoreDenyStanza(keystoreRoots(DefaultWorkDir, ""))
+	stanza := keystoreDenyStanza(keystoreRoots(DefaultWorkDir, "", ""))
 	if !strings.HasSuffix(prof, stanza) {
 		t.Fatalf("the profile does not end with the keystore denies:\n%s", prof)
 	}
