@@ -550,6 +550,27 @@ func TestShimProfileKeepsTheKeystoreDeniesLast(t *testing.T) {
 	if _, err := ShimProfile(strings.TrimSuffix(pod, stanza), ShimGrant{Dir: root + "/run/shim/0a1b2c3d"}); !errors.Is(err, ErrInvalidShimGrant) {
 		t.Errorf("a pod profile without the keystore denies: err = %v, want ErrInvalidShimGrant", err)
 	}
+	// A pod profile whose stanza is not its last rule as rendered is refused,
+	// not extended: a rule after it, a stanza cut short, or one whose root
+	// spelling was edited (in the file denies, where the forms are parsed
+	// from, or in a socket deny, which the parse does not read).
+	body := strings.TrimSuffix(pod, stanza)
+	formLine := `(subpath "/private/var/lib/k3sm/keystore-run")`
+	bindLine := `(local unix-socket (subpath "/private/var/lib/k3sm/keystore-sock"))`
+	for _, tc := range []struct{ name, edited string }{
+		{"a rule appended after the stanza", pod + "(allow file-read* (subpath \"" + root + "/keystore-sock\"))\n"},
+		{"a truncated stanza", body + stanza[:len(stanza)/2]},
+		{"a stanza missing its last line", body + strings.TrimSuffix(stanza, "  )\n")},
+		{"an edited form in the file denies", body + strings.Replace(stanza, formLine, `(subpath "/private/var/lib/k3sm-x/keystore-run")`, 1)},
+		{"an edited form in the bind denies", body + strings.Replace(stanza, bindLine, `(local unix-socket (subpath "/private/var/lib/k3sm/keystore-sockx"))`, 1)},
+	} {
+		if tc.edited == pod {
+			t.Fatalf("%s: the edit changed nothing", tc.name)
+		}
+		if _, err := ShimProfile(tc.edited, ShimGrant{Dir: root + "/run/shim/0a1b2c3d"}); !errors.Is(err, ErrInvalidShimGrant) {
+			t.Errorf("%s: err = %v, want ErrInvalidShimGrant", tc.name, err)
+		}
+	}
 }
 
 // TestKeystoreDenyStanzaShape pins the rendered form the gate test reads: the
