@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -125,21 +127,21 @@ func TestRunLaunchSequenceOrder(t *testing.T) {
 	}{
 		{
 			name: "drop-requested-as-root",
-			cred: Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true},
+			cred: Credential{UID: 300, GID: 300, Groups: []int{300, 400}, Drop: true},
 			euid: 0,
 			want: []LaunchStep{StepSetgid, StepInitgroups, StepSetuid, StepSandboxApply, StepExec},
 		},
 		{
 			name: "no-drop-unprivileged-in-seatbelt",
 			cred: Credential{Drop: false},
-			euid: 501, // non-root daemon: Drop=false must NOT attempt any setuid
+			euid: 250, // non-root daemon: Drop=false must NOT attempt any setuid
 			want: []LaunchStep{StepSandboxApply, StepExec},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seam := &recordingSeam{}
-			done, err := RunLaunchSequence(seam, LaunchSpec{Cred: tc.cred}, tc.euid)
+			done, err := RunLaunchSequence(seam, LaunchSpec{LookupGroup: noHostGroups, Cred: tc.cred}, tc.euid)
 			if err != nil {
 				t.Fatalf("RunLaunchSequence: %v", err)
 			}
@@ -204,7 +206,7 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 			seam := &recordingSeam{hasFail: true, failAt: tc.failAt, failErr: boom}
 			// euid 0 (root): the drop is permitted, so the injected failAt — not
 			// the euid guard — is what stops the sequence.
-			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true}}, 0)
+			_, err := RunLaunchSequence(seam, LaunchSpec{LookupGroup: noHostGroups, Cred: Credential{UID: 300, GID: 300, Groups: []int{300}, Drop: true}}, 0)
 			if !errors.Is(err, boom) {
 				t.Fatalf("want wrapped boom, got %v", err)
 			}
@@ -228,7 +230,7 @@ func TestRunLaunchSequenceFailClosed(t *testing.T) {
 // a stray Drop=true fails closed rather than silently mis-running the pod.
 func TestRunLaunchSequenceRefusesDropAsNonRoot(t *testing.T) {
 	seam := &recordingSeam{}
-	done, err := RunLaunchSequence(seam, LaunchSpec{Cred: Credential{UID: 501, GID: 20, Drop: true}}, 501)
+	done, err := RunLaunchSequence(seam, LaunchSpec{LookupGroup: noHostGroups, Cred: Credential{UID: 300, GID: 300, Drop: true}}, 250)
 	if !errors.Is(err, ErrDropRequiresRoot) {
 		t.Fatalf("want ErrDropRequiresRoot, got %v", err)
 	}
@@ -251,8 +253,9 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}}
 		// drop requested as root: the full sequence runs.
 		done, err := RunLaunchSequence(seam, LaunchSpec{
-			Cred:    Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true},
-			Rlimits: plan,
+			LookupGroup: noHostGroups,
+			Cred:        Credential{UID: 300, GID: 300, Groups: []int{300}, Drop: true},
+			Rlimits:     plan,
 		}, 0)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
@@ -279,7 +282,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 			{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 256, Max: 512}},
 			{Resource: unix.RLIMIT_AS, Lim: unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}},
 		}
-		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -299,7 +302,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 	// An empty plan adds no StepSetrlimit and calls the seam zero times.
 	t.Run("empty-plan-adds-no-step", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, LaunchSpec{}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -329,7 +332,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		// Request hard = 1<<20 (a raise above the inherited 4096): the unprivileged
 		// posture cannot raise it, so it must be clamped to 4096, not fail the pod.
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 8192, Max: 1 << 20}}}
-		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250)
 		if err != nil {
 			t.Fatalf("clamp must not be fatal, got err=%v", err)
 		}
@@ -368,8 +371,9 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 2048, Max: 4096}}}
 		// Root drop posture: euid 0, full sequence.
 		if _, err := RunLaunchSequence(seam, LaunchSpec{
-			Cred:    Credential{UID: 501, GID: 20, Drop: true},
-			Rlimits: plan,
+			LookupGroup: noHostGroups,
+			Cred:        Credential{UID: 300, GID: 300, Drop: true},
+			Rlimits:     plan,
 		}, 0); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -388,7 +392,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 			inherited: map[int]unix.Rlimit{unix.RLIMIT_NPROC: {Cur: 512, Max: 1024}},
 		}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NPROC, Lim: unix.Rlimit{Cur: 100, Max: 200}}}
-		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
 		if len(seam.rlimitCalls) != 1 {
@@ -407,7 +411,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 		seam := &recordingSeam{}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{
 			Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}}}
-		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
 		if len(seam.rlimitCalls) != 1 {
@@ -433,7 +437,7 @@ func TestRunLaunchSequence_Rlimits(t *testing.T) {
 
 		seam := &recordingSeam{}
 		plan := []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 16, Max: 1024}}}
-		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 501); err != nil {
+		if _, err := RunLaunchSequence(seam, LaunchSpec{Rlimits: plan}, 250); err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
 		if len(seam.rlimitCalls) != 1 {
@@ -460,9 +464,10 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	t.Run("bg-with-drop-ordered-after-drop-before-sandbox", func(t *testing.T) {
 		seam := &recordingSeam{}
 		spec := LaunchSpec{
-			Cred:    Credential{UID: 501, GID: 20, Groups: []int{20}, Drop: true},
-			Rlimits: []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}},
-			BgQoS:   true,
+			LookupGroup: noHostGroups,
+			Cred:        Credential{UID: 300, GID: 300, Groups: []int{300}, Drop: true},
+			Rlimits:     []PlannedRlimit{{Resource: unix.RLIMIT_NOFILE, Lim: unix.Rlimit{Cur: 1024, Max: 4096}}},
+			BgQoS:       true,
 		}
 		done, err := RunLaunchSequence(seam, spec, 0)
 		if err != nil {
@@ -491,7 +496,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 
 	t.Run("bg-no-drop-unprivileged", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -508,7 +513,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	// default band is the absence of the call, not an explicit reset.
 	t.Run("guaranteed-burstable-no-call-at-all", func(t *testing.T) {
 		seam := &recordingSeam{}
-		done, err := RunLaunchSequence(seam, LaunchSpec{}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{}, 250)
 		if err != nil {
 			t.Fatalf("RunLaunchSequence: %v", err)
 		}
@@ -525,7 +530,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	t.Run("setpriority-failure-fail-closed", func(t *testing.T) {
 		boom := errors.New("boom")
 		seam := &recordingSeam{hasFail: true, failAt: StepSetpriority, failErr: boom}
-		_, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		_, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 250)
 		if !errors.Is(err, boom) {
 			t.Fatalf("want wrapped boom, got %v", err)
 		}
@@ -540,7 +545,7 @@ func TestRunLaunchSequence_QoSPriority(t *testing.T) {
 	// command is never exec'd outside the band the pod asked for.
 	t.Run("exec-session-eperm-surfaces", func(t *testing.T) {
 		seam := &recordingSeam{hasFail: true, failAt: StepSetpriority, failErr: unix.EPERM}
-		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 501)
+		done, err := RunLaunchSequence(seam, LaunchSpec{BgQoS: true}, 250)
 		if !errors.Is(err, unix.EPERM) {
 			t.Fatalf("want a wrapped EPERM, got %v", err)
 		}
@@ -559,9 +564,9 @@ func TestCredentialValidate(t *testing.T) {
 		euid    int
 		wantErr bool
 	}{
-		{"drop-as-root-ok", Credential{UID: 501, GID: 20, Drop: true}, 0, false},
-		{"drop-as-nonroot-refused", Credential{UID: 501, GID: 20, Drop: true}, 501, true},
-		{"no-drop-as-nonroot-ok", Credential{Drop: false}, 501, false},
+		{"drop-as-root-ok", Credential{UID: 250, GID: 20, Drop: true}, 0, false},
+		{"drop-as-nonroot-refused", Credential{UID: 250, GID: 20, Drop: true}, 250, true},
+		{"no-drop-as-nonroot-ok", Credential{Drop: false}, 250, false},
 		{"no-drop-as-root-ok", Credential{Drop: false}, 0, false},
 	}
 	for _, tc := range cases {
@@ -589,7 +594,7 @@ func TestCredentialShimRoundTrip(t *testing.T) {
 		cred Credential
 	}{
 		{"no-drop", Credential{Drop: false}},
-		{"drop-with-groups", Credential{UID: 501, GID: 20, Groups: []int{20, 999}, Drop: true}},
+		{"drop-with-groups", Credential{UID: 250, GID: 20, Groups: []int{20, 999}, Drop: true}},
 		{"drop-no-groups", Credential{UID: 1000, GID: 1000, Drop: true}},
 		{"drop-root-gid", Credential{UID: 1000, GID: 0, Groups: []int{0}, Drop: true}},
 	}
@@ -819,4 +824,311 @@ func normGroups(g []int) []int {
 		return []int{}
 	}
 	return g
+}
+
+// TestRunLaunchSequenceRefusesPodUID pins the spawn-time half of the pod uid
+// refusal: a drop target of 501 or above or below 0, or uid 0 after a drop,
+// fails before any step runs. With no drop the inherited euid is allowed,
+// whatever it is (a root daemon, a rootless one at a login uid). uid 250, the
+// service user, is the control.
+func TestRunLaunchSequenceRefusesPodUID(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cred    Credential
+		euid    int
+		svc     ServiceIdentity
+		refused bool
+	}{
+		{"drop to 501", Credential{UID: 501, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to 502", Credential{UID: 502, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to 2147483647", Credential{UID: 2147483647, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to a negative uid", Credential{UID: -1, GID: 300, Drop: true}, 0, testService, true},
+		{"drop leaves uid 0", Credential{UID: 0, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to the service uid", Credential{UID: testService.UID, GID: 300, Drop: true}, 0, testService, true},
+		{"no drop at euid 501 (rootless)", Credential{}, 501, testService, false},
+		{"no drop at euid 2147483647", Credential{}, 2147483647, testService, false},
+		{"no drop at euid 0 (root daemon)", Credential{}, 0, testService, false},
+		{"no drop at the service euid", Credential{}, testService.UID, testService, false},
+		{"drop to 300", Credential{UID: 300, GID: 300, Drop: true}, 0, testService, false},
+		{"drop to 500 (the last allowed uid)", Credential{UID: 500, GID: 300, Drop: true}, 0, testService, false},
+		{"drop to 1 (a system role uid, the stated residual)", Credential{UID: 1, GID: 300, Drop: true}, 0, testService, false},
+		{"drop to 250 on a host with no service user", Credential{UID: 250, GID: 300, Drop: true}, 0, ServiceIdentity{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seam := &recordingSeam{}
+			_, err := RunLaunchSequence(seam, LaunchSpec{LookupGroup: noHostGroups, Cred: tc.cred, Service: tc.svc}, tc.euid)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("RunLaunchSequence: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrPodUIDRefused) {
+				t.Fatalf("err = %v, want ErrPodUIDRefused", err)
+			}
+			if len(seam.calls) != 0 {
+				t.Errorf("steps ran before the refusal: %v", seam.calls)
+			}
+		})
+	}
+}
+
+// testService is the service user the pod-identity tests pin: uid 250, the
+// shipped _k3sm uid, with a primary gid of its own.
+var testService = ServiceIdentity{UID: 250, GID: 250, Known: true}
+
+// noHostGroups is the GroupLookup the pod-identity tests run under: the host
+// assigns no gid a group, so a test's verdict does not hang on the groups of
+// the Mac it runs on (this one assigns 300 and 400 among others).
+func noHostGroups(int) (string, bool, error) { return "", false, nil }
+
+// hostGroups is a GroupLookup that assigns exactly the groups in assigned.
+func hostGroups(assigned map[int]string) GroupLookup {
+	return func(gid int) (string, bool, error) {
+		name, ok := assigned[gid]
+		return name, ok, nil
+	}
+}
+
+// TestRunLaunchSequenceRefusesPodGroups pins the group half of the pod-only
+// rule at spawn time: a drop whose primary gid or any supplemental group is
+// wheel, a system group fsGroupNeverGids names (daemon, kmem, sys, tty,
+// operator, procview, procmod, staff, admin, _developer), the service user's
+// primary gid, negative, 501 or above, or past the gid_t range is refused
+// before any step runs (a value that would wrap onto staff included), and a
+// drop to the other gids up to 500 runs when the host assigns them no group
+// (noHostGroups; TestPodGroupsHostAssigned pins an assigned one). A
+// credential with no drop is never judged.
+func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
+	refused := []int{0, 1, 2, 3, 4, 5, 8, 9, 20, 80, 204, testService.GID, -1, 501, 502, 999, math.MaxInt32 + 1, math.MaxUint32 + 1, 1<<32 + 20}
+	for _, gid := range refused {
+		for name, cred := range map[string]Credential{
+			"primary gid":        {UID: 300, GID: gid, Groups: []int{300}, Drop: true},
+			"supplemental group": {UID: 300, GID: 300, Groups: []int{300, gid}, Drop: true},
+		} {
+			t.Run(fmt.Sprintf("%s %d refused", name, gid), func(t *testing.T) {
+				seam := &recordingSeam{}
+				_, err := RunLaunchSequence(seam, LaunchSpec{LookupGroup: noHostGroups, Cred: cred, Service: testService}, 0)
+				if !errors.Is(err, ErrPodGroupRefused) {
+					t.Fatalf("err = %v, want ErrPodGroupRefused", err)
+				}
+				if len(seam.calls) != 0 {
+					t.Errorf("steps ran before the refusal: %v", seam.calls)
+				}
+			})
+		}
+	}
+	for _, gid := range []int{300, 500} {
+		t.Run(fmt.Sprintf("gid %d allowed", gid), func(t *testing.T) {
+			cred := Credential{UID: 300, GID: gid, Groups: []int{gid, 400}, Drop: true}
+			if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{LookupGroup: noHostGroups, Cred: cred, Service: testService}, 0); err != nil {
+				t.Fatalf("RunLaunchSequence: %v", err)
+			}
+		})
+	}
+	// An fsGroup (a supplemental group other than the primary gid) of 501 or
+	// above is allowed when FSGroupGidAllowed admits it: 1000 names no group
+	// on the host, so the default allow-list admits it. The same gid as the
+	// primary, or one the allow-list refuses, stays refused.
+	t.Run("fsGroup 1000 under the default allow-list allowed", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 300, Groups: []int{300, 1000}, Drop: true}
+		if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{LookupGroup: noHostGroups, Cred: cred, Service: testService}, 0); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+	})
+	for name, cred := range map[string]Credential{
+		"primary gid 1000":                  {UID: 300, GID: 1000, Groups: []int{1000}, Drop: true},
+		"primary gid 2147483647":            {UID: 300, GID: math.MaxInt32, Drop: true},
+		"fsGroup 501, below the allow-list": {UID: 300, GID: 300, Groups: []int{300, 501}, Drop: true},
+		"fsGroup 999, below the allow-list": {UID: 300, GID: 300, Groups: []int{300, 999}, Drop: true},
+		"fsGroup past the gid_t range":      {UID: 300, GID: 300, Groups: []int{300, 1 << 32}, Drop: true},
+	} {
+		t.Run(name+" refused", func(t *testing.T) {
+			if err := cred.CheckPodIdentity(testService, nil, noHostGroups); !errors.Is(err, ErrPodGroupRefused) {
+				t.Fatalf("err = %v, want ErrPodGroupRefused", err)
+			}
+		})
+	}
+	t.Run("an admitted fsGroup is judged by the node's list", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 300, Groups: []int{300, 600}, Drop: true}
+		if err := cred.CheckPodIdentity(testService, nil, noHostGroups); !errors.Is(err, ErrPodGroupRefused) {
+			t.Fatalf("not admitted: err = %v, want ErrPodGroupRefused", err)
+		}
+		if err := cred.CheckPodIdentity(testService, []int{600}, noHostGroups); err != nil {
+			t.Fatalf("admitted: %v", err)
+		}
+	})
+	// nobody is the one gid past 500 a drop may hold as its primary group:
+	// it is what a runAsUser with no group drops to.
+	t.Run("the nobody gid allowed", func(t *testing.T) {
+		if got := NobodyGID(); got != nobodyGIDFallback {
+			t.Logf("nobody resolves to %d on this host", got)
+		}
+		cred := Credential{UID: 300, GID: NobodyGID(), Groups: []int{NobodyGID()}, Drop: true}
+		if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{LookupGroup: noHostGroups, Cred: cred, Service: testService}, 0); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+	})
+	t.Run("an explicit gid 0 still refused", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 0, Drop: true}
+		if err := cred.CheckPodIdentity(testService, nil, noHostGroups); !errors.Is(err, ErrPodGroupRefused) {
+			t.Fatalf("err = %v, want ErrPodGroupRefused", err)
+		}
+	})
+	t.Run("no drop is not judged", func(t *testing.T) {
+		cred := Credential{GID: 20, Groups: []int{0, 20, 80, 501}}
+		if err := cred.CheckPodIdentity(testService, nil, noHostGroups); err != nil {
+			t.Fatalf("CheckPodIdentity: %v", err)
+		}
+	})
+}
+
+// TestPodGroupsHostAssigned pins the allow-list on the gids below the login
+// range: a primary or supplemental gid the host assigns a group (12 everyone,
+// 98 _lpadmin, 400 com.apple.access_remote_ae on macOS) is refused, an
+// unassigned one (300 here) is allowed, a lookup that fails refuses, and the
+// fsGroupNeverGids are refused even when the lookup says the host assigns
+// them nothing.
+func TestPodGroupsHostAssigned(t *testing.T) {
+	assigned := hostGroups(map[int]string{12: "everyone", 98: "_lpadmin", 400: "com.apple.access_remote_ae"})
+	creds := func(gid int) map[string]Credential {
+		return map[string]Credential{
+			"primary gid":        {UID: 300, GID: gid, Groups: []int{gid}, Drop: true},
+			"supplemental group": {UID: 300, GID: 300, Groups: []int{300, gid}, Drop: true},
+		}
+	}
+	for _, gid := range []int{12, 98, 400} {
+		for name, cred := range creds(gid) {
+			t.Run(fmt.Sprintf("assigned %s %d refused", name, gid), func(t *testing.T) {
+				seam := &recordingSeam{}
+				_, err := RunLaunchSequence(seam, LaunchSpec{LookupGroup: assigned, Cred: cred, Service: testService}, 0)
+				if !errors.Is(err, ErrPodGroupRefused) || !strings.Contains(err.Error(), "host-assigned system group") {
+					t.Fatalf("err = %v, want ErrPodGroupRefused for a host-assigned system group", err)
+				}
+				if len(seam.calls) != 0 {
+					t.Errorf("steps ran before the refusal: %v", seam.calls)
+				}
+			})
+		}
+	}
+	t.Run("unassigned gid 300 allowed", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 300, Groups: []int{300}, Drop: true}
+		if err := cred.CheckPodIdentity(testService, nil, assigned); err != nil {
+			t.Fatalf("CheckPodIdentity: %v", err)
+		}
+	})
+	t.Run("a lookup error refuses", func(t *testing.T) {
+		boom := errors.New("directory services unavailable")
+		failing := func(int) (string, bool, error) { return "", false, boom }
+		for name, cred := range creds(300) {
+			if err := cred.CheckPodIdentity(testService, nil, failing); !errors.Is(err, ErrPodGroupRefused) || !errors.Is(err, boom) {
+				t.Errorf("%s: err = %v, want ErrPodGroupRefused wrapping the lookup error", name, err)
+			}
+		}
+	})
+	t.Run("the never-list refused when the lookup says unassigned", func(t *testing.T) {
+		for gid := range fsGroupNeverGids {
+			for name, cred := range creds(gid) {
+				if err := cred.CheckPodIdentity(testService, nil, noHostGroups); !errors.Is(err, ErrPodGroupRefused) {
+					t.Errorf("%s %d: err = %v, want ErrPodGroupRefused", name, gid, err)
+				}
+			}
+		}
+	})
+	t.Run("nobody allowed whatever the lookup answers", func(t *testing.T) {
+		everything := func(int) (string, bool, error) { return "nobody", true, nil }
+		cred := Credential{UID: 300, GID: NobodyGID(), Groups: []int{NobodyGID()}, Drop: true}
+		if err := cred.CheckPodIdentity(testService, nil, everything); err != nil {
+			t.Fatalf("CheckPodIdentity: %v", err)
+		}
+	})
+}
+
+// TestResolveServiceIdentityInstalledOwner pins the fail-closed half of the
+// service uid rule: when the directory lookup answers "not found", the owner
+// of an installed directory stands in for the service user, and a drop to it
+// is refused. A lookup that finds the account is taken as it is, an owner read
+// that fails refuses, and a directory that does not exist adds nothing.
+func TestResolveServiceIdentityInstalledOwner(t *testing.T) {
+	notFound := func() (ServiceIdentity, error) { return ServiceIdentity{}, nil }
+	const sockDir, workDir = "/data/keystore-sock", "/data/work"
+	owners := map[string]int{sockDir: 260, workDir: 270}
+	owner := func(dir string) (int, bool, error) {
+		uid, ok := owners[dir]
+		return uid, ok, nil
+	}
+
+	svc, err := ResolveServiceIdentity(notFound, owner, sockDir, "", workDir, "/data/absent")
+	if err != nil {
+		t.Fatalf("ResolveServiceIdentity: %v", err)
+	}
+	if svc.Known || len(svc.Installed) != 2 {
+		t.Fatalf("svc = %+v, want not Known with the two installed owners", svc)
+	}
+	for _, uid := range []int{260, 270} {
+		cred := Credential{UID: uid, GID: 300, Drop: true}
+		if err := cred.CheckPodUID(svc); !errors.Is(err, ErrPodUIDRefused) {
+			t.Errorf("drop to the installed owner %d: err = %v, want ErrPodUIDRefused", uid, err)
+		}
+		if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{LookupGroup: noHostGroups, Cred: cred, Service: svc}, 0); !errors.Is(err, ErrPodUIDRefused) {
+			t.Errorf("RunLaunchSequence to the installed owner %d: err = %v, want ErrPodUIDRefused", uid, err)
+		}
+	}
+	if err := (Credential{UID: 261, GID: 300, Drop: true}).CheckPodUID(svc); err != nil {
+		t.Errorf("drop to 261, which owns nothing installed: %v", err)
+	}
+
+	t.Run("a found account is taken as it is", func(t *testing.T) {
+		called := false
+		got, err := ResolveServiceIdentity(func() (ServiceIdentity, error) { return testService, nil },
+			func(string) (int, bool, error) { called = true; return 0, false, nil }, sockDir)
+		if err != nil || called || !got.Known || got.UID != testService.UID || len(got.Installed) != 0 {
+			t.Fatalf("got %+v, %v (owner read: %v), want the looked-up account and no owner read", got, err, called)
+		}
+	})
+	t.Run("a lookup error is returned", func(t *testing.T) {
+		boom := errors.New("directory services down")
+		if _, err := ResolveServiceIdentity(func() (ServiceIdentity, error) { return ServiceIdentity{}, boom }, owner, sockDir); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the lookup error", err)
+		}
+	})
+	t.Run("an owner read that fails refuses", func(t *testing.T) {
+		boom := errors.New("EACCES")
+		if _, err := ResolveServiceIdentity(notFound, func(string) (int, bool, error) { return 0, false, boom }, sockDir); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the owner read error", err)
+		}
+	})
+	t.Run("DirOwner reads a real directory", func(t *testing.T) {
+		dir := t.TempDir()
+		uid, ok, err := DirOwner(dir)
+		if err != nil || !ok || uid != os.Getuid() {
+			t.Fatalf("DirOwner(%s) = %d, %v, %v, want %d, true, nil", dir, uid, ok, err, os.Getuid())
+		}
+		if _, ok, err := DirOwner(dir + "/absent"); ok || err != nil {
+			t.Fatalf("DirOwner(absent) = %v, %v, want false, nil", ok, err)
+		}
+	})
+	// A symlink at an installed path is not followed and is not "absent": it
+	// is an error, so the resolve fails and every drop is refused, whether it
+	// names a directory or nothing.
+	t.Run("DirOwner refuses a symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for name, link := range map[string]string{"to a directory": target, "dangling": filepath.Join(dir, "absent")} {
+			path := filepath.Join(dir, "link "+name)
+			if err := os.Symlink(link, path); err != nil {
+				t.Fatal(err)
+			}
+			uid, ok, err := DirOwner(path)
+			if !errors.Is(err, ErrInstalledDirSymlink) || ok {
+				t.Errorf("%s: DirOwner = %d, %v, %v, want a symlink error", name, uid, ok, err)
+			}
+			if _, err := ResolveServiceIdentity(notFound, DirOwner, path); !errors.Is(err, ErrInstalledDirSymlink) {
+				t.Errorf("%s: ResolveServiceIdentity = nil error, want the symlink refused", name)
+			}
+		}
+	})
 }

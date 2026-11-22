@@ -19,9 +19,15 @@ package supervisor
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"math"
+	"os"
+	"os/user"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -80,6 +86,314 @@ func (c Credential) Validate(euid int) error {
 		return fmt.Errorf("%w: euid=%d", ErrDropRequiresRoot, euid)
 	}
 	return nil
+}
+
+// LoginUIDFloor is the first uid macOS gives a login account. A pod process
+// never runs at or above it: such a uid is a person's, with that person's files,
+// keychain and sockets.
+const LoginUIDFloor = 501
+
+// ServiceUser is the account an installed k3sm node runs its service as
+// (k3sm's defaults.ServiceUser). It owns the keystore, so a pod never drops to
+// its uid (CheckPodUID).
+const ServiceUser = "_k3sm"
+
+// ServiceIdentity is the ServiceUser account as this host resolves it. Known is
+// false when the directory lookup finds no such account. Installed holds the
+// owners of the node's installed directories (ResolveServiceIdentity), read
+// only when Known is false: an installed node whose account the lookup cannot
+// find still has the uid that owns its keystore, and CheckPodUID refuses a
+// drop to each of them.
+type ServiceIdentity struct {
+	UID       int
+	GID       int
+	Known     bool
+	Installed []InstalledOwner
+}
+
+// InstalledOwner is one installed directory and the uid that owns it.
+type InstalledOwner struct {
+	Dir string
+	UID int
+}
+
+// ErrInstalledDirSymlink reports an installed directory whose path is a
+// symlink (DirOwner). Its owner is not read through the link, and a caller
+// refuses every drop on it.
+var ErrInstalledDirSymlink = errors.New("supervisor: installed directory is a symlink")
+
+// DirOwner reports the uid that owns path, read with lstat: a symlink is not
+// followed. A path that does not exist reports ok false and no error. A path
+// that is a symlink, whether it names a directory or nothing, is
+// ErrInstalledDirSymlink and not "absent", since the uid that owns the link is
+// not the owner of what the node installed there. Only the last element is
+// judged; the directories above it are taken as the host lays them out. Any
+// other lstat failure is returned. It is ResolveServiceIdentity's production
+// owner.
+func DirOwner(path string) (uid int, ok bool, err error) {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return 0, false, fmt.Errorf("%w: %s", ErrInstalledDirSymlink, path)
+	}
+	st, isStat := fi.Sys().(*syscall.Stat_t)
+	if !isStat {
+		return 0, false, fmt.Errorf("lstat %s: no owner in %T", path, fi.Sys())
+	}
+	return int(st.Uid), true, nil
+}
+
+// ResolveServiceIdentity resolves ServiceUser with lookup, and, when lookup
+// finds no such account, reads the owner of each installed directory in dirs
+// (an empty entry is skipped) with owner, DirOwner in production. Each
+// directory that exists adds its owner to Installed, so a node whose account
+// the directory services do not answer for still refuses a drop to the uid
+// that owns its keystore: "not found" fails closed on what is installed. The
+// caller passes the keystore's socket directory (keystorepaths.SockDir under
+// the data root) and the k3sm work dir, the ones it knows.
+//
+// A lookup error is returned as it is. An owner read that fails for any reason
+// but "does not exist" is returned too, so the caller refuses every drop
+// rather than allowing one past a directory it could not read.
+func ResolveServiceIdentity(lookup func() (ServiceIdentity, error), owner func(string) (int, bool, error), dirs ...string) (ServiceIdentity, error) {
+	svc, err := lookup()
+	if err != nil || svc.Known {
+		return svc, err
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		uid, ok, err := owner(dir)
+		if err != nil {
+			return ServiceIdentity{}, fmt.Errorf("service user %s not found: read the owner of the installed %s: %w", ServiceUser, dir, err)
+		}
+		if ok {
+			svc.Installed = append(svc.Installed, InstalledOwner{Dir: dir, UID: uid})
+		}
+	}
+	return svc, nil
+}
+
+// LookupServiceIdentity resolves ServiceUser through the system's directory
+// services (getpwnam), so an account that lives only there counts. A host with
+// no such account returns the zero ServiceIdentity and no error; any other
+// failure is returned, and a caller that drops refuses the drop on it. A
+// caller that knows the node's installed directories resolves through
+// ResolveServiceIdentity instead, so "not found" does not leave the keystore's
+// owner uid open to a drop. The exec-shim calls this alone: it is handed no
+// data root or work dir, and the runtime has already refused the drop on the
+// installed owners before it spawned the shim.
+func LookupServiceIdentity() (ServiceIdentity, error) {
+	u, err := user.Lookup(ServiceUser)
+	if err != nil {
+		var unknown user.UnknownUserError
+		if errors.As(err, &unknown) {
+			return ServiceIdentity{}, nil
+		}
+		return ServiceIdentity{}, fmt.Errorf("look up the service user %s: %w", ServiceUser, err)
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return ServiceIdentity{}, fmt.Errorf("service user %s: uid %q: %w", ServiceUser, u.Uid, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return ServiceIdentity{}, fmt.Errorf("service user %s: gid %q: %w", ServiceUser, u.Gid, err)
+	}
+	return ServiceIdentity{UID: uid, GID: gid, Known: true}, nil
+}
+
+// ErrPodUIDRefused reports a pod credential whose drop target a pod may not
+// hold: one in the login range (LoginUIDFloor and above), a negative one, uid 0
+// (a drop that leaves the process root), or the service user's uid.
+var ErrPodUIDRefused = errors.New("supervisor: pod uid refused")
+
+// CheckPodUID refuses, with ErrPodUIDRefused, a drop whose target uid is in the
+// login range or negative, whatever the pod's runAsUser or runAsGroup asked
+// for; a drop that leaves the process at uid 0 (a runAsGroup with no
+// runAsUser on a root daemon), which counts as no drop; and a drop to svc's
+// uid when svc is Known, since the service user owns the keystore and its
+// socket and a process at that uid passes the keystore's peer check. When svc
+// is not Known, a drop to the owner of any of svc.Installed is refused for
+// the same reason: the lookup's "not found" does not make the installed
+// keystore's owner safe to hold.
+//
+// The system role uids 1 to 500, other than the service user's, stay allowed.
+// That is a stated residual: such a uid may own files or sockets of its own
+// role on the host, and what keeps a pod at one of them off those is the
+// pod's Seatbelt profile, not this check.
+//
+// A credential with no drop is always allowed: the pod inherits the
+// daemon's own uid, root, the service user, or a rootless developer server's
+// login uid, and so holds nothing that uid does not already hold. Keeping a
+// pod off the keystore under a no-drop daemon is the Seatbelt profile's
+// keystore denies and the keystore listener's rule (it starts only under the
+// service uid), not this one. The runtime checks a credential before it wraps
+// a command, and RunLaunchSequence and the resident shim's drop check it
+// again in the process that drops.
+func (c Credential) CheckPodUID(svc ServiceIdentity) error {
+	if !c.Drop {
+		return nil
+	}
+	switch {
+	case c.UID == 0:
+		return fmt.Errorf("%w: the drop leaves the process at uid 0", ErrPodUIDRefused)
+	case c.UID < 0:
+		return fmt.Errorf("%w: uid %d is negative", ErrPodUIDRefused, c.UID)
+	case c.UID >= LoginUIDFloor:
+		return fmt.Errorf("%w: uid %d is in the login range (%d and above)", ErrPodUIDRefused, c.UID, LoginUIDFloor)
+	case svc.Known && c.UID == svc.UID:
+		return fmt.Errorf("%w: uid %d is the service user %s, which owns the keystore", ErrPodUIDRefused, c.UID, ServiceUser)
+	}
+	if !svc.Known {
+		for _, o := range svc.Installed {
+			if c.UID == o.UID {
+				return fmt.Errorf("%w: uid %d owns the installed %s, and the service user %s was not found", ErrPodUIDRefused, c.UID, o.Dir, ServiceUser)
+			}
+		}
+	}
+	return nil
+}
+
+// NobodyGroup is macOS's unprivileged group, the primary group a pod drops to
+// when it names a user but no group (NobodyGID).
+const NobodyGroup = "nobody"
+
+// nobodyGIDFallback is NobodyGroup's gid on macOS, -2 as a 32-bit gid_t, used
+// when the directory lookup fails.
+const nobodyGIDFallback = 4294967294
+
+// NobodyGID returns NobodyGroup's gid, looked up once by name through the
+// system's directory services (getgrnam), with nobodyGIDFallback when the
+// lookup fails or answers a value that is not a gid. A negative answer (-2)
+// is taken as the gid_t it spells.
+var NobodyGID = sync.OnceValue(func() int {
+	g, err := user.LookupGroup(NobodyGroup)
+	if err != nil {
+		return nobodyGIDFallback
+	}
+	gid, err := strconv.ParseInt(g.Gid, 10, 64)
+	if err != nil || gid < math.MinInt32 || gid > math.MaxUint32 {
+		return nobodyGIDFallback
+	}
+	if gid < 0 {
+		gid += 1 << 32
+	}
+	return int(gid)
+})
+
+// ErrPodGroupRefused reports a pod credential whose drop would leave the
+// process in a group a pod may not hold (CheckPodGroups).
+var ErrPodGroupRefused = errors.New("supervisor: pod group refused")
+
+// podNeverGid names the group gid is when a dropped pod never holds it,
+// whatever asked for it: wheel (0), or one of fsGroupNeverGids (daemon, kmem,
+// sys, tty, operator, procview, procmod, staff, admin, _developer).
+// Membership in each is a privilege on any macOS host. The fsGroup list is
+// the one source, so a group added to it is refused as a primary gid and as
+// every supplemental group too.
+func podNeverGid(gid int) (string, bool) {
+	if gid == 0 {
+		return "wheel", true
+	}
+	name, ok := fsGroupNeverGids[gid]
+	return name, ok
+}
+
+// CheckPodGroups refuses, with ErrPodGroupRefused, a drop whose primary gid or
+// any supplemental group (runAsGroup and fsGroup among them) is wheel (0) or
+// one of the system groups fsGroupNeverGids names (podNeverGid), svc's
+// primary gid when svc is Known, a host-assigned system group (a gid of 1 to
+// LoginUIDFloor-1 that lookup finds a group for), negative, LoginUIDFloor or
+// above, or outside the gid_t range. The range is checked on the int, before
+// the drop narrows it to a 32-bit gid_t, so a value that would wrap onto a
+// refused gid is refused as itself.
+//
+// The gids 1 to LoginUIDFloor-1 are an allow-list: one is allowed only when
+// the host assigns it no group, the same "unassigned" rule FSGroupGidAllowed
+// applies from fsGroupMinGid up. macOS gives its own roles groups there
+// (everyone, _lpadmin, the com.apple.access_ groups and the rest), and
+// membership in one may reach files or services of that role. The
+// fsGroupNeverGids are refused whatever lookup answers, and a lookup that
+// fails for any reason but "no such group" refuses. lookup is the group
+// lookup (LookupGroupID when nil).
+//
+// NobodyGID is allowed wherever it appears: it is the group a pod with a
+// user and no group drops to, and it owns nothing a pod should reach.
+//
+// One other gid of LoginUIDFloor or above is allowed: the fsGroup, a supplemental
+// group other than the primary gid (resolveCredential adds no other), when
+// FSGroupGidAllowed admits it with the node's admitted list. That allow-list
+// holds only gids that name no group on the host, or groups the node made for
+// its pods, so membership grants nothing beyond the files given to it. A
+// caller that does not have the node's list (the exec-shim) passes nil and
+// judges by the default allow-list alone.
+//
+// It is a pod-only rule: a credential with no drop is always allowed, so the
+// daemon's own groups, which a no-drop pod inherits, are not judged here.
+func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int, lookup GroupLookup) error {
+	if !c.Drop {
+		return nil
+	}
+	lookup = lookup.or()
+	check := func(what string, gid int, fsGroup bool) error {
+		switch {
+		case gid > math.MaxUint32:
+			return fmt.Errorf("%w: %s %d is outside the gid_t range", ErrPodGroupRefused, what, gid)
+		case gid < 0:
+			return fmt.Errorf("%w: %s %d is negative", ErrPodGroupRefused, what, gid)
+		case svc.Known && gid == svc.GID:
+			return fmt.Errorf("%w: %s %d is the service user %s's primary group", ErrPodGroupRefused, what, gid, ServiceUser)
+		}
+		if name, ok := podNeverGid(gid); ok {
+			return fmt.Errorf("%w: %s %d is %s", ErrPodGroupRefused, what, gid, name)
+		}
+		if gid == NobodyGID() {
+			return nil
+		}
+		if gid < LoginUIDFloor {
+			name, assigned, err := lookup(gid)
+			if err != nil {
+				return fmt.Errorf("%w: %s %d: look up the group: %w", ErrPodGroupRefused, what, gid, err)
+			}
+			if assigned {
+				return fmt.Errorf("%w: %s %d is the host-assigned system group %q", ErrPodGroupRefused, what, gid, name)
+			}
+			return nil
+		}
+		if !fsGroup {
+			return fmt.Errorf("%w: %s %d is %d or above", ErrPodGroupRefused, what, gid, LoginUIDFloor)
+		}
+		if err := FSGroupGidAllowedWith(gid, fsGroupAdmitted, lookup); err != nil {
+			return fmt.Errorf("%w: fsGroup %d is %d or above and not admitted: %w", ErrPodGroupRefused, gid, LoginUIDFloor, err)
+		}
+		return nil
+	}
+	if err := check("primary gid", c.GID, false); err != nil {
+		return err
+	}
+	for _, g := range c.Groups {
+		if err := check("supplemental group", g, g != c.GID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CheckPodIdentity is CheckPodUID then CheckPodGroups: the whole pod-only rule
+// on a drop target. Every place a pod credential is checked calls it; lookup
+// is the group lookup CheckPodGroups asks (LookupGroupID when nil).
+func (c Credential) CheckPodIdentity(svc ServiceIdentity, fsGroupAdmitted []int, lookup GroupLookup) error {
+	if err := c.CheckPodUID(svc); err != nil {
+		return err
+	}
+	return c.CheckPodGroups(svc, fsGroupAdmitted, lookup)
 }
 
 // noDropSentinel is the uid/gid argv token meaning "no privilege drop". It is
@@ -279,6 +593,9 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 	var done []LaunchStep
 	cred := spec.Cred
 	if err := cred.Validate(euid); err != nil {
+		return done, err
+	}
+	if err := cred.CheckPodIdentity(spec.Service, nil, spec.LookupGroup); err != nil {
 		return done, err
 	}
 	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the

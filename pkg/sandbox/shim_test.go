@@ -179,7 +179,8 @@ func grantRules(t *testing.T, suffix string) []string {
 
 // TestShimProfileIsThePodProfilePlusTheGrant pins the shim profile's shape: the
 // pod profile unchanged, plus a grant that writes NOTHING (the shim profile's
-// write set is exactly the pod profile's) and carries no network rule.
+// write set is exactly the pod profile's) and carries no network rule, then the
+// pod profile's keystore denies again.
 func TestShimProfileIsThePodProfilePlusTheGrant(t *testing.T) {
 	pod, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: "/var/lib/k3sm/pods/p1/rootfs", AllowNetwork: true}, GenerateOptions{})
 	if err != nil {
@@ -193,7 +194,14 @@ func TestShimProfileIsThePodProfilePlusTheGrant(t *testing.T) {
 	if !strings.HasPrefix(shim, pod) {
 		t.Fatal("the shim profile does not start with the pod profile unchanged")
 	}
-	got := grantRules(t, strings.TrimPrefix(shim, pod))
+	stanza, _, err := keystoreStanzaOf(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(shim, stanza) {
+		t.Fatal("the shim profile does not end with the pod profile's keystore denies")
+	}
+	got := grantRules(t, strings.TrimSuffix(strings.TrimPrefix(shim, pod), stanza))
 	want := []string{
 		`allow file-ioctl (regex #"^/dev/ttys[0-9]+$")`,
 		`allow file-read* (subpath "/private/var/lib/k3sm/run/shim/0a1b2c3d")`,

@@ -359,6 +359,17 @@ type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
 	cfg Config
+	// lookupService and installedOwner resolve the service user and the
+	// owners of its installed directories (supervisor.ResolveServiceIdentity).
+	// checkPodUID resolves through them at every check, so a directory
+	// installed after New counts from the next start or exec. Read-only after
+	// New.
+	lookupService  func() (supervisor.ServiceIdentity, error)
+	installedOwner func(path string) (uid int, ok bool, err error)
+	// lookupGroup is the group lookup checkPodUID judges a drop's gids below
+	// the login range with (supervisor.Credential.CheckPodGroups); nil is
+	// supervisor.LookupGroupID. Read-only after New.
+	lookupGroup supervisor.GroupLookup
 	// userDirs is the node user's shared Darwin temp and cache trees the
 	// per-pod user dir links live in (userdirs.go); zero means off. Set once by
 	// New, read-only after.
@@ -917,6 +928,18 @@ type Deps struct {
 	// holder on the first call, so the release is ordered after the wait began
 	// by an event rather than by a sleep. Nil in production.
 	rootLockBusy func()
+	// lookupService resolves the service user, whose uid no pod may drop to
+	// (supervisor.Credential.CheckPodUID). Nil selects
+	// supervisor.LookupServiceIdentity; tests pin an identity.
+	lookupService func() (supervisor.ServiceIdentity, error)
+	// installedOwner reads the owner uid of an installed directory when the
+	// service user lookup finds no account (supervisor.ResolveServiceIdentity).
+	// Nil selects supervisor.DirOwner; tests pin an owner.
+	installedOwner func(path string) (uid int, ok bool, err error)
+	// lookupGroup answers whether the host assigns a gid below the login
+	// range a group (supervisor.GroupLookup), which a pod drop may then not
+	// hold. Nil selects supervisor.LookupGroupID; tests pin the answers.
+	lookupGroup supervisor.GroupLookup
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -1271,8 +1294,25 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		workVolume = ""
 	}
 
+	lookupService := deps.lookupService
+	if lookupService == nil {
+		lookupService = supervisor.LookupServiceIdentity
+	}
+	installedOwner := deps.installedOwner
+	if installedOwner == nil {
+		installedOwner = supervisor.DirOwner
+	}
+	// Resolved here only to warn at startup; checkPodUID resolves again at
+	// every check and refuses a drop on the failure it then sees.
+	if _, err := supervisor.ResolveServiceIdentity(lookupService, installedOwner, serviceInstalledDirs(cfg)...); err != nil {
+		log.Warn("service user unknown: every pod privilege drop is refused", "user", supervisor.ServiceUser, "err", err)
+	}
+
 	rt := &Runtime{
 		cfg:            cfg,
+		lookupService:  lookupService,
+		installedOwner: installedOwner,
+		lookupGroup:    deps.lookupGroup,
 		workVolume:     workVolume,
 		userDirs:       resolveDarwinUserDirs(userDirsProbe, log),
 		home:           daemonHome(cfg.Root),

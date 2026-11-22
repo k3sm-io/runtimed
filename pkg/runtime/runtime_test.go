@@ -870,6 +870,16 @@ func testDeps(t *testing.T, d Deps) Deps {
 	if d.Network == nil {
 		d.Network = supervisor.NodeNetwork{IP: "10.1.2.3"}
 	}
+	// The service user is pinned, not looked up: whether this host has a
+	// _k3sm account must not decide which drops a test may make.
+	if d.lookupService == nil {
+		d.lookupService = func() (supervisor.ServiceIdentity, error) { return testService, nil }
+	}
+	// The host's groups are pinned too: whether this Mac assigns gid 300 or
+	// 400 a group must not decide which drops a test may make.
+	if d.lookupGroup == nil {
+		d.lookupGroup = noHostGroups
+	}
 	// The per-pod Darwin user dirs default OFF in unit tests: the real probe
 	// names this user's shared /var/folders trees, and a pod test would make
 	// links there. userdirs_test.go opts in with temp trees (fakeUserDirs).
@@ -1696,7 +1706,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 				{Name: "cfg", MountPath: "/etc/cfg"},
 				{Name: "sec", MountPath: "/etc/sec", ReadOnly: true},
 			},
-			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 501, RunAsGroup: 20},
+			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 300, RunAsGroup: 300},
 		}},
 	}
 	// fsGroup chown is exercised only when the test process has a real (>0)
@@ -1734,7 +1744,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	// (3) the run-as identity reached the spawned exec-shim argv (fakeBackend
 	// mirrors the shim arg shape [shim, uid, gid, groups, profile, argv...]).
 	argv := sp.specs[len(sp.specs)-1].Argv
-	if len(argv) < 4 || argv[1] != "501" || argv[2] != "20" {
+	if len(argv) < 4 || argv[1] != "300" || argv[2] != "300" {
 		t.Errorf("drop credential not in spawn argv: %v", argv)
 	}
 
@@ -1744,8 +1754,8 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	if len(cs) != 1 || len(cs[0].GetVolumeMounts()) != 2 {
 		t.Fatalf("container status volume_mounts mirror missing: %+v", cs)
 	}
-	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 501 || u.GetGid() != 20 {
-		t.Errorf("container status user mirror = %+v, want uid 501 gid 20", u)
+	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 300 || u.GetGid() != 300 {
+		t.Errorf("container status user mirror = %+v, want uid 300 gid 300", u)
 	}
 
 	w.release(1001)
@@ -1966,4 +1976,41 @@ func TestCreatePodRefusesAnFSGroupOutsideTheAllowList(t *testing.T) {
 			t.Errorf("fsGroup %d: the refused pod left its dir (stat err %v)", gid, err)
 		}
 	}
+}
+
+// TestCreatePodFSGroupGateAsksDepsLookupGroup: the create-time fsGroup gate
+// asks the runtime's group lookup (Deps.lookupGroup), not the host's directly.
+// A gid above the default floor that the pinned lookup calls an assigned group
+// is refused before the pod has a directory; the same gid under a lookup that
+// assigns it none passes the gate.
+func TestCreatePodFSGroupGateAsksDepsLookupGroup(t *testing.T) {
+	const gid = 1999999
+	assigned := func(g int) (string, bool, error) { return "pinned", g == gid, nil }
+	t.Run("an assigned group refused", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, lookupGroup: assigned})
+		box := hostBinBox(rt, "pod-fsg-seam")
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: gid}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport: %v", err)
+		}
+		if resp.GetError() == nil || resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			t.Errorf("CreatePod = %v (reason %v), want refused as an invalid pod box", resp.GetError(), resp.GetFailureReason())
+		}
+		if _, err := os.Stat(filepath.Join(rt.cache.PodsRoot(), "pod-fsg-seam")); !os.IsNotExist(err) {
+			t.Errorf("the refused pod left its dir (stat err %v)", err)
+		}
+	})
+	t.Run("an unassigned gid passes the gate", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, lookupGroup: noHostGroups})
+		box := hostBinBox(rt, "pod-fsg-seam")
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: gid}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport: %v", err)
+		}
+		if resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			t.Errorf("CreatePod = %v (reason %v), want past the fsGroup gate", resp.GetError(), resp.GetFailureReason())
+		}
+	})
 }

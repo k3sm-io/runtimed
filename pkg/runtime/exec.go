@@ -116,6 +116,9 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 		c = &runtimev1.Container{}
 	}
 	cred := resolveCredential(p.box, c)
+	if err := r.checkPodUID(cred); err != nil {
+		return status.Errorf(codes.PermissionDenied, "exec: %v", err)
+	}
 
 	// Reuse the pod's confinement: WrapCommand returns the exec-shim invocation
 	// that re-applies the pod's profile + drop + rlimit plan + qos band (the full

@@ -1684,7 +1684,7 @@ func TestFSGroupGidAllowList(t *testing.T) {
 	if err := FSGroupGidAllowed(12, []int{12}); err != nil {
 		t.Errorf("an admitted gid = %v, want allowed", err)
 	}
-	for _, gid := range []int{0, 20, 80, math.MaxInt32 + 1} {
+	for _, gid := range []int{0, 5, 9, 20, 80, 204, math.MaxInt32 + 1} {
 		if err := FSGroupGidAllowed(gid, []int{gid}); !errors.Is(err, ErrFSGroupGidRefused) {
 			t.Errorf("admitted gid %d = %v, want refused all the same", gid, err)
 		}

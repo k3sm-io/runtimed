@@ -217,6 +217,13 @@ func RunPodLaunch(profile string, argv []string, spec supervisor.LaunchSpec, pay
 	}
 	path, execArgv, env := takeExecHandoff(argv, payload)
 	seam := &podLaunchSeam{profile: profile, path: path, argv: execArgv, env: env}
+	if spec.Cred.Drop {
+		svc, err := supervisor.LookupServiceIdentity()
+		if err != nil {
+			return err
+		}
+		spec.Service = svc
+	}
 	// euid is the shim's own effective uid (== the daemon's). RunLaunchSequence
 	// refuses a drop when it is non-root, so an unprivileged _k3sm daemon fails
 	// closed rather than attempting a doomed setuid.

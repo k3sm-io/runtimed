@@ -109,12 +109,26 @@ type ShimGrant struct {
 // No network rule is added: the shim's sockets are bound before it confines
 // itself, and accept(2) on a pre-bound socket needs no grant (measured), so the
 // shim profile's network scope is the pod profile's.
+//
+// The pod profile's keystore denies (keystoreDenyStanza) are emitted again
+// after the grant, so they stay the profile's last rule, and a grant dir at or
+// under a keystore name is refused. A pod profile that does not end with the
+// keystore denies is refused with ErrInvalidShimGrant.
 func ShimProfile(podProfile string, g ShimGrant) (string, error) {
 	if err := Validate(podProfile); err != nil {
 		return "", fmt.Errorf("%w: %w", ErrInvalidShimGrant, err)
 	}
 	if g.Dir == "" || !filepath.IsAbs(g.Dir) || filepath.Clean(g.Dir) != g.Dir || g.Dir == "/" {
 		return "", fmt.Errorf("%w: %q is not an absolute clean path", ErrInvalidShimGrant, g.Dir)
+	}
+	keystore, forms, err := keystoreStanzaOf(podProfile)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalidShimGrant, err)
+	}
+	for _, form := range forms {
+		if underKeystoreName(g.Dir, form) {
+			return "", fmt.Errorf("%w: %q names a keystore path under %q", ErrInvalidShimGrant, g.Dir, form)
+		}
 	}
 	var b strings.Builder
 	b.WriteString(podProfile)
@@ -129,6 +143,7 @@ func ShimProfile(podProfile string, g ShimGrant) (string, error) {
 	b.WriteString(podTTYIoctlDeny)
 	b.WriteString(shimSignal)
 	b.WriteString(shimSched)
+	b.WriteString(keystore)
 	return b.String(), nil
 }
 

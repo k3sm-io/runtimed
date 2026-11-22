@@ -541,14 +541,15 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// A pod's fsGroup must be a gid the allow-list admits
-	// (supervisor.FSGroupGidAllowed), decided before the pod has a network or
-	// a directory, so a refused one leaves nothing to unwind.
+	// (supervisor.FSGroupGidAllowedWith, asking r.lookupGroup, the host's
+	// groups when nil), decided before the pod has a network or a directory,
+	// so a refused one leaves nothing to unwind.
 	if fsGroup := box.GetPodSecurityContext().GetFsGroup(); fsGroup != 0 {
 		if fsGroup < 0 || fsGroup > math.MaxInt32 {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 				fmt.Errorf("%w: fsGroup %d: %w", errInvalidPodBox, fsGroup, supervisor.ErrFSGroupGidRefused)
 		}
-		if err := supervisor.FSGroupGidAllowed(int(fsGroup), r.cfg.FSGroupAdmitted); err != nil {
+		if err := supervisor.FSGroupGidAllowedWith(int(fsGroup), r.cfg.FSGroupAdmitted, r.lookupGroup); err != nil {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
 				fmt.Errorf("%w: fsGroup: %w", errInvalidPodBox, err)
 		}
@@ -1908,6 +1909,10 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// binary — in that irreversible order. The shim starts with an empty
 	// environment; env reaches the pod binary as the launch payload.
 	cred := resolveCredential(p.box, c)
+	if err := r.checkPodUID(cred); err != nil {
+		return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+			fmt.Errorf("container %s: %w", c.GetName(), err)
+	}
 	shimPath, shimArgv, cleanup, err := r.backend.WrapCommand(ctx, p.profile, execArgv, resolveLaunchSpec(p.box, cred))
 	if err != nil {
 		return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,

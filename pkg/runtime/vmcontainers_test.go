@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,7 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
+	"k3sm.io/runtimed/pkg/supervisor"
 
 	guestv1 "k3sm.io/apis/guest/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -1012,4 +1014,98 @@ func TestVMImagePullFailureIsTypedLikeTheHostSpine(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVMPodGuestUIDNotRefused pins that the host's pod-identity rule
+// (checkPodUID) is not applied to a vm pod's guest identity: a runAsUser of
+// 1000, which the rule refuses for a host process as a login-range uid, names
+// a user inside the Linux guest and means nothing on the host. The vm path
+// resolves it on its own (resolveVMContainer) and carries it to the guest.
+//
+// The groups too: a runAsGroup of 1000 names a group inside the guest and
+// reaches its GID and SupplementalGIDs, although the host's group rule refuses
+// 1000 as a host process's primary gid and the host's group lookup here
+// assigns every gid a group, so no host group rule is applied. An fsGroup of
+// 1000 is refused, but only by the vm path's own refusal
+// (errVMFsGroupUnsupported), never by a host group rule.
+func TestVMPodGuestUIDNotRefused(t *testing.T) {
+	const ref = "docker.io/library/app:1"
+	for name, set := range map[string]func(*runtimev1.PodBox){
+		"container runAsUser 1000": func(b *runtimev1.PodBox) {
+			b.Containers[0].SecurityContext = &runtimev1.SecurityContext{RunAsUser: 1000}
+		},
+		"pod runAsUser 1000": func(b *runtimev1.PodBox) {
+			b.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 1000}
+		},
+		"container runAsUser and runAsGroup 1000": func(b *runtimev1.PodBox) {
+			b.Containers[0].SecurityContext = &runtimev1.SecurityContext{RunAsUser: 1000, RunAsGroup: 1000}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newImageWorld(map[string]image.ImageRunConfig{ref: {Entrypoint: []string{"/app"}}})
+			rt, vmb := newVMImageRuntime(t, w)
+			box := vmBoxWith(rt, "pod-guestuid", nil, []*runtimev1.Container{{Name: "c", Image: ref}})
+			set(box)
+			if err := rt.checkPodUID(resolveCredential(box, box.Containers[0])); !errors.Is(err, supervisor.ErrPodUIDRefused) {
+				t.Fatalf("fixture: the host rule = %v, want it to refuse uid 1000 for a host process", err)
+			}
+			got := oneVMContainer(t, createVMSpec(t, rt, vmb, box))
+			if got.UID != 1000 {
+				t.Errorf("guest uid = %d, want 1000", got.UID)
+			}
+		})
+	}
+	everyGroupAssigned := func(int) (string, bool, error) { return "host-role", true, nil }
+	for name, set := range map[string]func(*runtimev1.PodBox){
+		"pod runAsGroup 1000": func(b *runtimev1.PodBox) {
+			b.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 1000, RunAsGroup: 1000}
+		},
+		"container runAsGroup 1000": func(b *runtimev1.PodBox) {
+			b.Containers[0].SecurityContext = &runtimev1.SecurityContext{RunAsUser: 1000, RunAsGroup: 1000}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newImageWorld(map[string]image.ImageRunConfig{ref: {Entrypoint: []string{"/app"}}})
+			rt, vmb := newVMImageRuntimeWith(t, w, Deps{lookupGroup: everyGroupAssigned})
+			box := vmBoxWith(rt, "pod-guestgid", nil, []*runtimev1.Container{{Name: "c", Image: ref}})
+			set(box)
+			host := resolveCredential(box, box.Containers[0])
+			host.UID = 300
+			if err := rt.checkPodUID(host); !errors.Is(err, supervisor.ErrPodGroupRefused) {
+				t.Fatalf("fixture: the host rule = %v, want it to refuse gid 1000 for a host process", err)
+			}
+			got := oneVMContainer(t, createVMSpec(t, rt, vmb, box))
+			if got.GID != 1000 {
+				t.Errorf("guest gid = %d, want 1000", got.GID)
+			}
+			if !slices.Contains(got.SupplementalGIDs, 1000) {
+				t.Errorf("guest groups = %v, want 1000 among them", got.SupplementalGIDs)
+			}
+		})
+	}
+	// A vm pod's fsGroup does not reach the guest on this platform: the pod
+	// is refused (errVMFsGroupUnsupported, no idmapped mounts on virtiofs).
+	// That refusal is the vm path's own; no host group rule refuses it.
+	t.Run("pod fsGroup 1000 refused only as unsupported on the vm", func(t *testing.T) {
+		w := newImageWorld(map[string]image.ImageRunConfig{ref: {Entrypoint: []string{"/app"}}})
+		rt, vmb := newVMImageRuntimeWith(t, w, Deps{lookupGroup: everyGroupAssigned})
+		box := vmBoxWith(rt, "pod-guestfsgroup", nil, []*runtimev1.Container{{Name: "c", Image: ref}})
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{RunAsUser: 1000, RunAsGroup: 1000, FsGroup: 1000}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		msg := resp.GetError().GetMessage()
+		if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX || !strings.Contains(msg, errVMFsGroupUnsupported.Error()) {
+			t.Fatalf("CreatePod = %q (reason %v), want the vm fsGroup refusal", msg, resp.GetFailureReason())
+		}
+		for _, host := range []string{"pod group refused", "fsGroup gid is not one a pod may be given", "host-assigned system group"} {
+			if strings.Contains(msg, host) {
+				t.Errorf("refusal %q names the host group rule %q", msg, host)
+			}
+		}
+		if n, _ := vmb.created(); n != 0 {
+			t.Errorf("CreateVM called %d times, want 0", n)
+		}
+	})
 }

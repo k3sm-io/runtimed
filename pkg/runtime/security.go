@@ -17,10 +17,13 @@ limitations under the License.
 package runtime
 
 import (
+	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -36,7 +39,8 @@ import (
 //
 // A drop is requested iff the resolved uid OR gid is non-zero. A fully-zero
 // identity means the pod runs as the daemon (root-in-Seatbelt) — the documented
-// fallback until untrusted tenancy routes to the vm backend.
+// fallback until untrusted tenancy routes to the vm backend. A drop with a
+// uid and no gid takes supervisor.NobodyGID as its primary group.
 func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor.Credential {
 	psc := box.GetPodSecurityContext()
 	sc := c.GetSecurityContext()
@@ -44,6 +48,12 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 	uid := firstNonZero(int(sc.GetRunAsUser()), int(psc.GetRunAsUser()), int(box.GetUid()))
 	gid := firstNonZero(int(sc.GetRunAsGroup()), int(psc.GetRunAsGroup()), int(box.GetGid()))
 	fsGroup := int(psc.GetFsGroup())
+	drop := uid != 0 || gid != 0
+	// A user with no group drops to nobody, not to gid 0 (wheel): the proto
+	// cannot tell an unset run_as_group from 0, and wheel is refused.
+	if uid != 0 && gid == 0 {
+		gid = supervisor.NobodyGID()
+	}
 
 	var groups []int
 	if gid != 0 {
@@ -57,8 +67,55 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 		UID:    uid,
 		GID:    gid,
 		Groups: groups,
-		Drop:   uid != 0 || gid != 0,
+		Drop:   drop,
 	}
+}
+
+// serviceInstalledDirs are the installed directories whose owner stands in
+// for the service user when the directory lookup finds no account
+// (supervisor.ResolveServiceIdentity): the keystore's socket directory under
+// the k3sm data root (cfg.DataRoot), and the k3sm role's work dir
+// (cfg.StateDir). Each is named only when the node configured it.
+func serviceInstalledDirs(cfg Config) []string {
+	var dirs []string
+	if cfg.DataRoot != "" {
+		dirs = append(dirs, filepath.Join(cfg.DataRoot, keystorepaths.SockDir))
+	}
+	if cfg.StateDir != "" {
+		dirs = append(dirs, cfg.StateDir)
+	}
+	return dirs
+}
+
+// checkPodUID refuses, before anything is spawned, a credential whose drop
+// would leave the pod process in the login range, below 0, at uid 0 or at the
+// service user's uid, or in a group a pod may not hold, a host-assigned system
+// group among them (supervisor.Credential.CheckPodIdentity, asking
+// Deps.lookupGroup).
+//
+// The service user is resolved at every check that drops, not once in New
+// (supervisor.ResolveServiceIdentity over the lookup and the owners of
+// serviceInstalledDirs): a keystore or work dir installed after the daemon
+// started counts from the next start or exec. That costs one getpwnam and, when
+// it finds no account, one owner read per installed dir. When the resolve fails the
+// drop is refused. A credential without a drop runs at the daemon's own uid
+// and is allowed without a lookup.
+func (r *Runtime) checkPodUID(cred supervisor.Credential) error {
+	if !cred.Drop {
+		return nil
+	}
+	lookup, owner := r.lookupService, r.installedOwner
+	if lookup == nil {
+		lookup = supervisor.LookupServiceIdentity
+	}
+	if owner == nil {
+		owner = supervisor.DirOwner
+	}
+	svc, err := supervisor.ResolveServiceIdentity(lookup, owner, serviceInstalledDirs(r.cfg)...)
+	if err != nil {
+		return fmt.Errorf("%w: %w", supervisor.ErrPodUIDRefused, err)
+	}
+	return cred.CheckPodIdentity(svc, r.cfg.FSGroupAdmitted, r.lookupGroup)
 }
 
 // fsGroupOwners says whose entries the fsGroup walk may change in a pod's
