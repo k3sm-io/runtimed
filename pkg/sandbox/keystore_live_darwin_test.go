@@ -132,7 +132,9 @@ const keystoreDenied = "DENIED:EPERM"
 // every folded spelling reaches the real file, which shows the data volume
 // folds the name and the folded spellings are the real keystore. The same
 // operations on a non-keystore sibling are the in-sandbox control and must
-// succeed.
+// succeed; in the keystore root that includes unlinking, renaming and binding
+// a sibling name, so the EPERM on the keystore names is the stanza's and not
+// that of a write grant the profile lacks.
 func TestKeystoreDeniesUnderSandboxExec(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
@@ -305,6 +307,13 @@ func TestKeystoreDeniesUnderSandboxExec(t *testing.T) {
 							{"link", sib, fresh(dataVol, "h")},
 							{"stat", sib},
 							{"exists", sib},
+							// The writes the keystore attempts above make, on
+							// sibling names in the same root under the same
+							// write grant: their EPERM is the stanza's, not a
+							// missing grant's.
+							{"unlink", sibling(dr.root)},
+							{"rename", sibling(dr.root), fresh(root, "r")},
+							{"bind", fresh(root, "b") + ".sock"},
 						}
 					} else {
 						controls = [][]string{
