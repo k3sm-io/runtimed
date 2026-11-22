@@ -85,6 +85,36 @@ var fsGroupNeverGids = map[int]string{
 	204: "_developer",
 }
 
+// GroupLookup reports the name of the group the host assigns to gid, with
+// ok false when the host assigns it none. An error is any failure but "no
+// such group", and a caller refuses on it. LookupGroupID is the production
+// one; a nil GroupLookup means it.
+type GroupLookup func(gid int) (name string, ok bool, err error)
+
+// LookupGroupID is the production GroupLookup. It asks the system's directory
+// services (getgrgid, through user.LookupGroupId), so groups that live only
+// there, not in /etc/group, count too. "No such group" answers ok false and
+// no error.
+func LookupGroupID(gid int) (string, bool, error) {
+	g, err := user.LookupGroupId(strconv.Itoa(gid))
+	if err == nil {
+		return g.Name, true, nil
+	}
+	var unknown user.UnknownGroupIdError
+	if errors.As(err, &unknown) {
+		return "", false, nil
+	}
+	return "", false, err
+}
+
+// or returns lookup, or LookupGroupID when lookup is nil.
+func (lookup GroupLookup) or() GroupLookup {
+	if lookup == nil {
+		return LookupGroupID
+	}
+	return lookup
+}
+
 // FSGroupGidAllowed says whether a pod may be given gid as its fsGroup: it
 // becomes a supplementary group of every process of the pod, and the walk
 // gives it the owner's access to the pod's tree. It is an allow-list. A gid
@@ -95,10 +125,14 @@ var fsGroupNeverGids = map[int]string{
 // host. A gid with no group gives its members access to nothing but the
 // files given to it, so membership grants a pod no more than its own tree;
 // an existing group may own files elsewhere, so it is allowed only when the
-// node names it. The group lookup asks the system's directory services
-// (getgrgid), so groups that live only there, not in /etc/group, count too,
-// and a lookup that fails for any reason but "no such group" refuses.
+// node names it. The group lookup is LookupGroupID, and a lookup that fails
+// for any reason but "no such group" refuses.
 func FSGroupGidAllowed(gid int, admitted []int) error {
+	return fsGroupGidAllowed(gid, admitted, LookupGroupID)
+}
+
+// fsGroupGidAllowed is FSGroupGidAllowed with the group lookup it asks.
+func fsGroupGidAllowed(gid int, admitted []int, lookup GroupLookup) error {
 	if gid <= 0 || gid > math.MaxInt32 {
 		return fmt.Errorf("%w: gid %d is outside 1..%d", ErrFSGroupGidRefused, gid, math.MaxInt32)
 	}
@@ -111,13 +145,12 @@ func FSGroupGidAllowed(gid int, admitted []int) error {
 	if gid < fsGroupMinGid {
 		return fmt.Errorf("%w: gid %d is below %d, where macOS and installers assign groups, and the node does not admit it", ErrFSGroupGidRefused, gid, fsGroupMinGid)
 	}
-	g, err := user.LookupGroupId(strconv.Itoa(gid))
-	if err == nil {
-		return fmt.Errorf("%w: gid %d is the group %q on this host, and the node does not admit it", ErrFSGroupGidRefused, gid, g.Name)
-	}
-	var unknown user.UnknownGroupIdError
-	if !errors.As(err, &unknown) {
+	name, assigned, err := lookup.or()(gid)
+	if err != nil {
 		return fmt.Errorf("%w: gid %d: look up the group: %v", ErrFSGroupGidRefused, gid, err)
+	}
+	if assigned {
+		return fmt.Errorf("%w: gid %d is the group %q on this host, and the node does not admit it", ErrFSGroupGidRefused, gid, name)
 	}
 	return nil
 }

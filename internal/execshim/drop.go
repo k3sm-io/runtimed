@@ -36,12 +36,13 @@ type dropSeam interface {
 // — every pod of the shipped unprivileged daemon — changes nothing; a drop is
 // refused unless euid is 0 (supervisor.Credential.Validate), exactly as the
 // launch sequence refuses it, and so is a drop CheckPodIdentity refuses (svc is the
-// service user as the shim resolved it).
-func dropShim(seam dropSeam, chown func(path string, uid, gid int) error, cred supervisor.Credential, euid int, svc supervisor.ServiceIdentity, paths ...string) error {
+// service user as the shim resolved it, and lookup the group lookup it judges
+// the gids below the login range with, supervisor.LookupGroupID when nil).
+func dropShim(seam dropSeam, chown func(path string, uid, gid int) error, cred supervisor.Credential, euid int, svc supervisor.ServiceIdentity, lookup supervisor.GroupLookup, paths ...string) error {
 	if err := cred.Validate(euid); err != nil {
 		return err
 	}
-	if err := cred.CheckPodIdentity(svc, nil); err != nil {
+	if err := cred.CheckPodIdentity(svc, nil, lookup); err != nil {
 		return err
 	}
 	if !cred.Drop {

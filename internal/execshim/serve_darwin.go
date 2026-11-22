@@ -242,7 +242,7 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 			return abort(supervisor.ShimExitSetup, fmt.Errorf("drop the shim to the pod credential: %w", err))
 		}
 	}
-	if err := dropShim(supervisor.UnixDropper{}, os.Chown, cred, os.Geteuid(), svc, spec.Dir, spec.LogPath); err != nil {
+	if err := dropShim(supervisor.UnixDropper{}, os.Chown, cred, os.Geteuid(), svc, nil, spec.Dir, spec.LogPath); err != nil {
 		return abort(supervisor.ShimExitSetup, fmt.Errorf("drop the shim to the pod credential: %w", err))
 	}
 	if err := confine(string(shimProfile)); err != nil {

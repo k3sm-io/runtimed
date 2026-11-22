@@ -875,6 +875,11 @@ func testDeps(t *testing.T, d Deps) Deps {
 	if d.lookupService == nil {
 		d.lookupService = func() (supervisor.ServiceIdentity, error) { return testService, nil }
 	}
+	// The host's groups are pinned too: whether this Mac assigns gid 300 or
+	// 400 a group must not decide which drops a test may make.
+	if d.lookupGroup == nil {
+		d.lookupGroup = noHostGroups
+	}
 	// The per-pod Darwin user dirs default OFF in unit tests: the real probe
 	// names this user's shared /var/folders trees, and a pod test would make
 	// links there. userdirs_test.go opts in with temp trees (fakeUserDirs).

@@ -198,7 +198,7 @@ func TestResolveRlimitPlan_UnknownTypeWarnsAndSkips(t *testing.T) {
 // supervisor.TestRunLaunchSequenceRefusesPodUID. With no drop the inherited euid
 // is allowed, root and a rootless server's login uid alike.
 func TestPodUIDInLoginRangeRefused(t *testing.T) {
-	r := &Runtime{service: testService}
+	r := &Runtime{service: testService, lookupGroup: noHostGroups}
 	type src struct {
 		name string
 		box  func(uid int64) (*runtimev1.PodBox, *runtimev1.Container)
@@ -240,7 +240,7 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 		}
 		t.Run(s.name+"/unresolved service user refuses every drop", func(t *testing.T) {
 			box, c := s.box(300)
-			unknown := &Runtime{serviceErr: errors.New("directory services down")}
+			unknown := &Runtime{lookupGroup: noHostGroups, serviceErr: errors.New("directory services down")}
 			if err := unknown.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodUIDRefused) {
 				t.Errorf("err = %v, want ErrPodUIDRefused", err)
 			}
@@ -303,10 +303,12 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 // fsGroup is staff, admin, a system group such as operator (5), procmod (9)
 // or _developer (204), the service user's primary gid, 501 or above or past
 // the gid_t range is refused, read from the int64 field as sent; a pod with
-// the other gids up to 500 (300, 400) is allowed. A pod with no drop is not
-// judged on the groups it would have asked for.
+// the other gids up to 500 (300, 400) is allowed when the host assigns them no
+// group (the fixtures pin noHostGroups), and refused through the runtime's
+// Deps.lookupGroup when it is a host-assigned system group. A pod with no drop
+// is not judged on the groups it would have asked for.
 func TestPodGroupsRefused(t *testing.T) {
-	r := &Runtime{service: testService}
+	r := &Runtime{service: testService, lookupGroup: noHostGroups}
 	srcs := map[string]func(gid int64) (*runtimev1.PodBox, *runtimev1.Container){
 		"container runAsGroup": func(gid int64) (*runtimev1.PodBox, *runtimev1.Container) {
 			return &runtimev1.PodBox{}, &runtimev1.Container{SecurityContext: &runtimev1.SecurityContext{RunAsUser: 300, RunAsGroup: gid}}
@@ -356,7 +358,7 @@ func TestPodGroupsRefused(t *testing.T) {
 		if err := r.checkPodUID(cred); !errors.Is(err, supervisor.ErrPodGroupRefused) {
 			t.Errorf("not admitted: err = %v, want ErrPodGroupRefused", err)
 		}
-		admits := &Runtime{service: testService, cfg: Config{FSGroupAdmitted: []int{600}}}
+		admits := &Runtime{service: testService, lookupGroup: noHostGroups, cfg: Config{FSGroupAdmitted: []int{600}}}
 		if err := admits.checkPodUID(cred); err != nil {
 			t.Errorf("admitted: %v", err)
 		}
@@ -385,6 +387,21 @@ func TestPodGroupsRefused(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a host-assigned system group refused through Deps.lookupGroup", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{lookupGroup: func(gid int) (string, bool, error) {
+			return "com.apple.access_remote_ae", gid == 400, nil
+		}})
+		for name, src := range srcs {
+			box, c := src(400)
+			if err := rt.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodGroupRefused) {
+				t.Errorf("%s 400: err = %v, want ErrPodGroupRefused", name, err)
+			}
+			box, c = src(300)
+			if err := rt.checkPodUID(resolveCredential(box, c)); err != nil {
+				t.Errorf("%s 300, unassigned: %v", name, err)
+			}
+		}
+	})
 	t.Run("no drop is not judged", func(t *testing.T) {
 		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{FsGroup: 20}}
 		cred := resolveCredential(box, &runtimev1.Container{})
@@ -400,6 +417,11 @@ func TestPodGroupsRefused(t *testing.T) {
 // testService is the service user the pod-identity tests pin: uid 250, the
 // shipped _k3sm uid, with a primary gid of its own.
 var testService = supervisor.ServiceIdentity{UID: 250, GID: 250, Known: true}
+
+// noHostGroups is the group lookup the runtime's pod-identity tests run under:
+// the host assigns no gid a group, so a verdict does not hang on the groups of
+// the Mac the test runs on (macOS assigns 300 and 400 among others).
+func noHostGroups(int) (string, bool, error) { return "", false, nil }
 
 // TestServiceUIDFromInstalledDirs pins the runtime half of the fail-closed
 // service uid rule: with the service user lookup answering "not found", the

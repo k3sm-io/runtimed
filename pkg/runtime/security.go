@@ -73,8 +73,9 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 
 // checkPodUID refuses, before anything is spawned, a credential whose drop
 // would leave the pod process in the login range, below 0, at uid 0 or at the
-// service user's uid, or in a group a pod may not hold
-// (supervisor.Credential.CheckPodIdentity). The service user is
+// service user's uid, or in a group a pod may not hold, a host-assigned system
+// group among them (supervisor.Credential.CheckPodIdentity, asking
+// Deps.lookupGroup). The service user is
 // the one New resolved (Deps.lookupService); when that lookup failed every
 // drop is refused. A credential without a drop runs at the daemon's own uid
 // and is allowed.
@@ -98,7 +99,7 @@ func (r *Runtime) checkPodUID(cred supervisor.Credential) error {
 	if cred.Drop && r.serviceErr != nil {
 		return fmt.Errorf("%w: %w", supervisor.ErrPodUIDRefused, r.serviceErr)
 	}
-	return cred.CheckPodIdentity(r.service, r.cfg.FSGroupAdmitted)
+	return cred.CheckPodIdentity(r.service, r.cfg.FSGroupAdmitted, r.lookupGroup)
 }
 
 // fsGroupOwners says whose entries the fsGroup walk may change in a pod's

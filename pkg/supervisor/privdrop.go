@@ -296,10 +296,20 @@ func podNeverGid(gid int) (string, bool) {
 // CheckPodGroups refuses, with ErrPodGroupRefused, a drop whose primary gid or
 // any supplemental group (runAsGroup and fsGroup among them) is wheel (0) or
 // one of the system groups fsGroupNeverGids names (podNeverGid), svc's
-// primary gid when svc is Known, negative, LoginUIDFloor or above, or outside
-// the gid_t range. The range is checked on the int, before the drop narrows
-// it to a 32-bit gid_t, so a value that would wrap onto a refused gid is
-// refused as itself.
+// primary gid when svc is Known, a host-assigned system group (a gid of 1 to
+// LoginUIDFloor-1 that lookup finds a group for), negative, LoginUIDFloor or
+// above, or outside the gid_t range. The range is checked on the int, before
+// the drop narrows it to a 32-bit gid_t, so a value that would wrap onto a
+// refused gid is refused as itself.
+//
+// The gids 1 to LoginUIDFloor-1 are an allow-list: one is allowed only when
+// the host assigns it no group, the same "unassigned" rule FSGroupGidAllowed
+// applies from fsGroupMinGid up. macOS gives its own roles groups there
+// (everyone, _lpadmin, the com.apple.access_ groups and the rest), and
+// membership in one may reach files or services of that role. The
+// fsGroupNeverGids are refused whatever lookup answers, and a lookup that
+// fails for any reason but "no such group" refuses. lookup is the group
+// lookup (LookupGroupID when nil).
 //
 // NobodyGID is allowed wherever it appears: it is the group a pod with a
 // user and no group drops to, and it owns nothing a pod should reach.
@@ -314,10 +324,11 @@ func podNeverGid(gid int) (string, bool) {
 //
 // It is a pod-only rule: a credential with no drop is always allowed, so the
 // daemon's own groups, which a no-drop pod inherits, are not judged here.
-func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int) error {
+func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int, lookup GroupLookup) error {
 	if !c.Drop {
 		return nil
 	}
+	lookup = lookup.or()
 	check := func(what string, gid int, fsGroup bool) error {
 		switch {
 		case gid > math.MaxUint32:
@@ -333,13 +344,21 @@ func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int) e
 		if gid == NobodyGID() {
 			return nil
 		}
-		if gid >= LoginUIDFloor {
-			if !fsGroup {
-				return fmt.Errorf("%w: %s %d is %d or above", ErrPodGroupRefused, what, gid, LoginUIDFloor)
+		if gid < LoginUIDFloor {
+			name, assigned, err := lookup(gid)
+			if err != nil {
+				return fmt.Errorf("%w: %s %d: look up the group: %w", ErrPodGroupRefused, what, gid, err)
 			}
-			if err := FSGroupGidAllowed(gid, fsGroupAdmitted); err != nil {
-				return fmt.Errorf("%w: fsGroup %d is %d or above and not admitted: %w", ErrPodGroupRefused, gid, LoginUIDFloor, err)
+			if assigned {
+				return fmt.Errorf("%w: %s %d is the host-assigned system group %q", ErrPodGroupRefused, what, gid, name)
 			}
+			return nil
+		}
+		if !fsGroup {
+			return fmt.Errorf("%w: %s %d is %d or above", ErrPodGroupRefused, what, gid, LoginUIDFloor)
+		}
+		if err := fsGroupGidAllowed(gid, fsGroupAdmitted, lookup); err != nil {
+			return fmt.Errorf("%w: fsGroup %d is %d or above and not admitted: %w", ErrPodGroupRefused, gid, LoginUIDFloor, err)
 		}
 		return nil
 	}
@@ -355,12 +374,13 @@ func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int) e
 }
 
 // CheckPodIdentity is CheckPodUID then CheckPodGroups: the whole pod-only rule
-// on a drop target. Every place a pod credential is checked calls it.
-func (c Credential) CheckPodIdentity(svc ServiceIdentity, fsGroupAdmitted []int) error {
+// on a drop target. Every place a pod credential is checked calls it; lookup
+// is the group lookup CheckPodGroups asks (LookupGroupID when nil).
+func (c Credential) CheckPodIdentity(svc ServiceIdentity, fsGroupAdmitted []int, lookup GroupLookup) error {
 	if err := c.CheckPodUID(svc); err != nil {
 		return err
 	}
-	return c.CheckPodGroups(svc, fsGroupAdmitted)
+	return c.CheckPodGroups(svc, fsGroupAdmitted, lookup)
 }
 
 // noDropSentinel is the uid/gid argv token meaning "no privilege drop". It is
@@ -562,7 +582,7 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 	if err := cred.Validate(euid); err != nil {
 		return done, err
 	}
-	if err := cred.CheckPodIdentity(spec.Service, nil); err != nil {
+	if err := cred.CheckPodIdentity(spec.Service, nil, spec.LookupGroup); err != nil {
 		return done, err
 	}
 	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the

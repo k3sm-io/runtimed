@@ -364,6 +364,10 @@ type Runtime struct {
 	// Read-only after New.
 	service    supervisor.ServiceIdentity
 	serviceErr error
+	// lookupGroup is the group lookup checkPodUID judges a drop's gids below
+	// the login range with (supervisor.Credential.CheckPodGroups); nil is
+	// supervisor.LookupGroupID. Read-only after New.
+	lookupGroup supervisor.GroupLookup
 	// userDirs is the node user's shared Darwin temp and cache trees the
 	// per-pod user dir links live in (userdirs.go); zero means off. Set once by
 	// New, read-only after.
@@ -930,6 +934,10 @@ type Deps struct {
 	// service user lookup finds no account (supervisor.ResolveServiceIdentity).
 	// Nil selects supervisor.DirOwner; tests pin an owner.
 	installedOwner func(path string) (uid int, ok bool, err error)
+	// lookupGroup answers whether the host assigns a gid below the login
+	// range a group (supervisor.GroupLookup), which a pod drop may then not
+	// hold. Nil selects supervisor.LookupGroupID; tests pin the answers.
+	lookupGroup supervisor.GroupLookup
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -1301,6 +1309,7 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		cfg:            cfg,
 		service:        service,
 		serviceErr:     serviceErr,
+		lookupGroup:    deps.lookupGroup,
 		workVolume:     workVolume,
 		userDirs:       resolveDarwinUserDirs(userDirsProbe, log),
 		home:           daemonHome(cfg.Root),
