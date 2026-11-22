@@ -370,7 +370,7 @@ func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int, l
 		if !fsGroup {
 			return fmt.Errorf("%w: %s %d is %d or above", ErrPodGroupRefused, what, gid, LoginUIDFloor)
 		}
-		if err := fsGroupGidAllowed(gid, fsGroupAdmitted, lookup); err != nil {
+		if err := FSGroupGidAllowedWith(gid, fsGroupAdmitted, lookup); err != nil {
 			return fmt.Errorf("%w: fsGroup %d is %d or above and not admitted: %w", ErrPodGroupRefused, gid, LoginUIDFloor, err)
 		}
 		return nil

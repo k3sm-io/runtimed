@@ -1977,3 +1977,40 @@ func TestCreatePodRefusesAnFSGroupOutsideTheAllowList(t *testing.T) {
 		}
 	}
 }
+
+// TestCreatePodFSGroupGateAsksDepsLookupGroup: the create-time fsGroup gate
+// asks the runtime's group lookup (Deps.lookupGroup), not the host's directly.
+// A gid above the default floor that the pinned lookup calls an assigned group
+// is refused before the pod has a directory; the same gid under a lookup that
+// assigns it none passes the gate.
+func TestCreatePodFSGroupGateAsksDepsLookupGroup(t *testing.T) {
+	const gid = 1999999
+	assigned := func(g int) (string, bool, error) { return "pinned", g == gid, nil }
+	t.Run("an assigned group refused", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, lookupGroup: assigned})
+		box := hostBinBox(rt, "pod-fsg-seam")
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: gid}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport: %v", err)
+		}
+		if resp.GetError() == nil || resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			t.Errorf("CreatePod = %v (reason %v), want refused as an invalid pod box", resp.GetError(), resp.GetFailureReason())
+		}
+		if _, err := os.Stat(filepath.Join(rt.cache.PodsRoot(), "pod-fsg-seam")); !os.IsNotExist(err) {
+			t.Errorf("the refused pod left its dir (stat err %v)", err)
+		}
+	})
+	t.Run("an unassigned gid passes the gate", func(t *testing.T) {
+		rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, lookupGroup: noHostGroups})
+		box := hostBinBox(rt, "pod-fsg-seam")
+		box.PodSecurityContext = &runtimev1.PodSecurityContext{FsGroup: gid}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod transport: %v", err)
+		}
+		if resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			t.Errorf("CreatePod = %v (reason %v), want past the fsGroup gate", resp.GetError(), resp.GetFailureReason())
+		}
+	})
+}

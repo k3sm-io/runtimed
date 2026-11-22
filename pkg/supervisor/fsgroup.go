@@ -128,11 +128,12 @@ func (lookup GroupLookup) or() GroupLookup {
 // node names it. The group lookup is LookupGroupID, and a lookup that fails
 // for any reason but "no such group" refuses.
 func FSGroupGidAllowed(gid int, admitted []int) error {
-	return fsGroupGidAllowed(gid, admitted, LookupGroupID)
+	return FSGroupGidAllowedWith(gid, admitted, nil)
 }
 
-// fsGroupGidAllowed is FSGroupGidAllowed with the group lookup it asks.
-func fsGroupGidAllowed(gid int, admitted []int, lookup GroupLookup) error {
+// FSGroupGidAllowedWith is FSGroupGidAllowed with the group lookup it asks
+// (LookupGroupID when nil).
+func FSGroupGidAllowedWith(gid int, admitted []int, lookup GroupLookup) error {
 	if gid <= 0 || gid > math.MaxInt32 {
 		return fmt.Errorf("%w: gid %d is outside 1..%d", ErrFSGroupGidRefused, gid, math.MaxInt32)
 	}
