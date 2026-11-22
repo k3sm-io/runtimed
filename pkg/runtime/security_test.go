@@ -355,10 +355,28 @@ func TestPodGroupsRefused(t *testing.T) {
 			t.Errorf("admitted: %v", err)
 		}
 	})
-	t.Run("a drop that leaves gid 0 is refused", func(t *testing.T) {
-		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300}}
-		if err := r.checkPodUID(resolveCredential(box, &runtimev1.Container{})); !errors.Is(err, supervisor.ErrPodGroupRefused) {
-			t.Errorf("err = %v, want ErrPodGroupRefused", err)
+	// A runAsUser with no group drops to nobody, not to gid 0 (wheel), and is
+	// allowed: the pod runs as 300:nobody. The proto cannot tell an explicit
+	// runAsGroup 0 from an unset one, so an explicit 0 lands here too; a
+	// credential that still carries gid 0 is refused
+	// (supervisor.TestRunLaunchSequenceRefusesPodGroups).
+	t.Run("runAsUser with no group drops to nobody and is allowed", func(t *testing.T) {
+		for name, box := range map[string]*runtimev1.PodBox{
+			"pod runAsUser":       {PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300}},
+			"box uid":             {Uid: 300},
+			"container runAsUser": {},
+		} {
+			c := &runtimev1.Container{}
+			if name == "container runAsUser" {
+				c.SecurityContext = &runtimev1.SecurityContext{RunAsUser: 300}
+			}
+			cred := resolveCredential(box, c)
+			if !cred.Drop || cred.UID != 300 || cred.GID != supervisor.NobodyGID() {
+				t.Fatalf("%s: cred = %+v, want a drop to 300:%d", name, cred, supervisor.NobodyGID())
+			}
+			if err := r.checkPodUID(cred); err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
 		}
 	})
 	t.Run("no drop is not judged", func(t *testing.T) {

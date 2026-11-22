@@ -37,7 +37,8 @@ import (
 //
 // A drop is requested iff the resolved uid OR gid is non-zero. A fully-zero
 // identity means the pod runs as the daemon (root-in-Seatbelt) — the documented
-// fallback until untrusted tenancy routes to the vm backend.
+// fallback until untrusted tenancy routes to the vm backend. A drop with a
+// uid and no gid takes supervisor.NobodyGID as its primary group.
 func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor.Credential {
 	psc := box.GetPodSecurityContext()
 	sc := c.GetSecurityContext()
@@ -45,6 +46,12 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 	uid := firstNonZero(int(sc.GetRunAsUser()), int(psc.GetRunAsUser()), int(box.GetUid()))
 	gid := firstNonZero(int(sc.GetRunAsGroup()), int(psc.GetRunAsGroup()), int(box.GetGid()))
 	fsGroup := int(psc.GetFsGroup())
+	drop := uid != 0 || gid != 0
+	// A user with no group drops to nobody, not to gid 0 (wheel): the proto
+	// cannot tell an unset run_as_group from 0, and wheel is refused.
+	if uid != 0 && gid == 0 {
+		gid = supervisor.NobodyGID()
+	}
 
 	var groups []int
 	if gid != 0 {
@@ -58,7 +65,7 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 		UID:    uid,
 		GID:    gid,
 		Groups: groups,
-		Drop:   uid != 0 || gid != 0,
+		Drop:   drop,
 	}
 }
 

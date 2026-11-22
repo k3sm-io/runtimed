@@ -24,6 +24,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -168,6 +169,33 @@ func (c Credential) CheckPodUID(svc ServiceIdentity) error {
 	return nil
 }
 
+// NobodyGroup is macOS's unprivileged group, the primary group a pod drops to
+// when it names a user but no group (NobodyGID).
+const NobodyGroup = "nobody"
+
+// nobodyGIDFallback is NobodyGroup's gid on macOS, -2 as a 32-bit gid_t, used
+// when the directory lookup fails.
+const nobodyGIDFallback = 4294967294
+
+// NobodyGID returns NobodyGroup's gid, looked up once by name through the
+// system's directory services (getgrnam), with nobodyGIDFallback when the
+// lookup fails or answers a value that is not a gid. A negative answer (-2)
+// is taken as the gid_t it spells.
+var NobodyGID = sync.OnceValue(func() int {
+	g, err := user.LookupGroup(NobodyGroup)
+	if err != nil {
+		return nobodyGIDFallback
+	}
+	gid, err := strconv.ParseInt(g.Gid, 10, 64)
+	if err != nil || gid < math.MinInt32 || gid > math.MaxUint32 {
+		return nobodyGIDFallback
+	}
+	if gid < 0 {
+		gid += 1 << 32
+	}
+	return int(gid)
+})
+
 // ErrPodGroupRefused reports a pod credential whose drop would leave the
 // process in a group a pod may not hold (CheckPodGroups).
 var ErrPodGroupRefused = errors.New("supervisor: pod group refused")
@@ -187,7 +215,10 @@ var podNeverGids = map[int]string{
 // the int, before the drop narrows it to a 32-bit gid_t, so a value that
 // would wrap onto a refused gid is refused as itself.
 //
-// One gid of LoginUIDFloor or above is allowed: the fsGroup, a supplemental
+// NobodyGID is allowed wherever it appears: it is the group a pod with a
+// user and no group drops to, and it owns nothing a pod should reach.
+//
+// One other gid of LoginUIDFloor or above is allowed: the fsGroup, a supplemental
 // group other than the primary gid (resolveCredential adds no other), when
 // FSGroupGidAllowed admits it with the node's admitted list. That allow-list
 // holds only gids that name no group on the host, or groups the node made for
@@ -212,6 +243,9 @@ func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int) e
 		}
 		if name, ok := podNeverGids[gid]; ok {
 			return fmt.Errorf("%w: %s %d is %s", ErrPodGroupRefused, what, gid, name)
+		}
+		if gid == NobodyGID() {
+			return nil
 		}
 		if gid >= LoginUIDFloor {
 			if !fsGroup {

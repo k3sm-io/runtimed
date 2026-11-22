@@ -939,6 +939,23 @@ func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
 			t.Fatalf("admitted: %v", err)
 		}
 	})
+	// nobody is the one gid past 500 a drop may hold as its primary group:
+	// it is what a runAsUser with no group drops to.
+	t.Run("the nobody gid allowed", func(t *testing.T) {
+		if got := NobodyGID(); got != nobodyGIDFallback {
+			t.Logf("nobody resolves to %d on this host", got)
+		}
+		cred := Credential{UID: 300, GID: NobodyGID(), Groups: []int{NobodyGID()}, Drop: true}
+		if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{Cred: cred, Service: testService}, 0); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+	})
+	t.Run("an explicit gid 0 still refused", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 0, Drop: true}
+		if err := cred.CheckPodIdentity(testService, nil); !errors.Is(err, ErrPodGroupRefused) {
+			t.Fatalf("err = %v, want ErrPodGroupRefused", err)
+		}
+	})
 	t.Run("no drop is not judged", func(t *testing.T) {
 		cred := Credential{GID: 20, Groups: []int{0, 20, 80, 501}}
 		if err := cred.CheckPodIdentity(testService, nil); err != nil {
