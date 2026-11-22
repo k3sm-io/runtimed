@@ -198,7 +198,7 @@ func TestResolveRlimitPlan_UnknownTypeWarnsAndSkips(t *testing.T) {
 // supervisor.TestRunLaunchSequenceRefusesPodUID. With no drop the inherited euid
 // is allowed, root and a rootless server's login uid alike.
 func TestPodUIDInLoginRangeRefused(t *testing.T) {
-	r := &Runtime{service: testService, lookupGroup: noHostGroups}
+	r := &Runtime{lookupService: pinService(testService), lookupGroup: noHostGroups}
 	type src struct {
 		name string
 		box  func(uid int64) (*runtimev1.PodBox, *runtimev1.Container)
@@ -240,7 +240,9 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 		}
 		t.Run(s.name+"/unresolved service user refuses every drop", func(t *testing.T) {
 			box, c := s.box(300)
-			unknown := &Runtime{lookupGroup: noHostGroups, serviceErr: errors.New("directory services down")}
+			unknown := &Runtime{lookupGroup: noHostGroups, lookupService: func() (supervisor.ServiceIdentity, error) {
+				return supervisor.ServiceIdentity{}, errors.New("directory services down")
+			}}
 			if err := unknown.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodUIDRefused) {
 				t.Errorf("err = %v, want ErrPodUIDRefused", err)
 			}
@@ -308,7 +310,7 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 // Deps.lookupGroup when it is a host-assigned system group. A pod with no drop
 // is not judged on the groups it would have asked for.
 func TestPodGroupsRefused(t *testing.T) {
-	r := &Runtime{service: testService, lookupGroup: noHostGroups}
+	r := &Runtime{lookupService: pinService(testService), lookupGroup: noHostGroups}
 	srcs := map[string]func(gid int64) (*runtimev1.PodBox, *runtimev1.Container){
 		"container runAsGroup": func(gid int64) (*runtimev1.PodBox, *runtimev1.Container) {
 			return &runtimev1.PodBox{}, &runtimev1.Container{SecurityContext: &runtimev1.SecurityContext{RunAsUser: 300, RunAsGroup: gid}}
@@ -358,7 +360,7 @@ func TestPodGroupsRefused(t *testing.T) {
 		if err := r.checkPodUID(cred); !errors.Is(err, supervisor.ErrPodGroupRefused) {
 			t.Errorf("not admitted: err = %v, want ErrPodGroupRefused", err)
 		}
-		admits := &Runtime{service: testService, lookupGroup: noHostGroups, cfg: Config{FSGroupAdmitted: []int{600}}}
+		admits := &Runtime{lookupService: pinService(testService), lookupGroup: noHostGroups, cfg: Config{FSGroupAdmitted: []int{600}}}
 		if err := admits.checkPodUID(cred); err != nil {
 			t.Errorf("admitted: %v", err)
 		}
@@ -422,6 +424,11 @@ var testService = supervisor.ServiceIdentity{UID: 250, GID: 250, Known: true}
 // the host assigns no gid a group, so a verdict does not hang on the groups of
 // the Mac the test runs on (macOS assigns 300 and 400 among others).
 func noHostGroups(int) (string, bool, error) { return "", false, nil }
+
+// pinService is a service user lookup that answers svc.
+func pinService(svc supervisor.ServiceIdentity) func() (supervisor.ServiceIdentity, error) {
+	return func() (supervisor.ServiceIdentity, error) { return svc, nil }
+}
 
 // TestServiceUIDFromInstalledDirs pins the runtime half of the fail-closed
 // service uid rule: with the service user lookup answering "not found", the

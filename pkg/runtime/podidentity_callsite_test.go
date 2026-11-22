@@ -18,6 +18,10 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -25,6 +29,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // TestStartContainerRefusesAPodIdentity drives startContainer through
@@ -95,5 +101,56 @@ func TestExecRefusesAPodIdentity(t *testing.T) {
 	defer be.mu.Unlock()
 	if len(be.argvs) != wrapped {
 		t.Errorf("Exec wrapped a command after the refusal: %v", be.argvs[wrapped:])
+	}
+}
+
+// TestStartContainerResolvesTheServiceOwnerEachStart pins that the service
+// identity is resolved at each start, not once in New: with the service user
+// lookup answering "not found" and the installed work dir not there yet, a
+// start that drops to uid 270 runs; once the work dir is created, owned by
+// 270, a later start's drop to 270 is refused before anything is wrapped.
+func TestStartContainerResolvesTheServiceOwnerEachStart(t *testing.T) {
+	const owner = 270
+	stateDir := filepath.Join(t.TempDir(), "node-work")
+	be := &recordingExecBackend{}
+	rt := newTestRuntimeCfg(t, Config{StateDir: stateDir}, Deps{
+		Backend:       be,
+		lookupService: func() (supervisor.ServiceIdentity, error) { return supervisor.ServiceIdentity{}, nil },
+		installedOwner: func(dir string) (int, bool, error) {
+			if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+				return 0, false, nil
+			} else if err != nil {
+				return 0, false, err
+			}
+			return owner, true, nil
+		},
+	})
+	start := func(name string) *runtimev1.CreatePodResponse {
+		t.Helper()
+		box := hostBinBox(rt, name)
+		box.Containers[0].SecurityContext = &runtimev1.SecurityContext{RunAsUser: owner, RunAsGroup: 300}
+		resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+		if err != nil {
+			t.Fatalf("CreatePod %s: %v", name, err)
+		}
+		return resp
+	}
+	if resp := start("pod-before-install"); resp.GetError() != nil {
+		t.Fatalf("start before the work dir exists = %v, want it to run", resp.GetError())
+	}
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	be.mu.Lock()
+	wrapped := len(be.argvs)
+	be.mu.Unlock()
+	resp := start("pod-after-install")
+	if resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX || !strings.Contains(resp.GetError().GetMessage(), "pod uid refused") {
+		t.Fatalf("start after the work dir is installed = %v (reason %v), want a pod uid refusal", resp.GetError(), resp.GetFailureReason())
+	}
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	if len(be.argvs) != wrapped {
+		t.Errorf("wrapped %d commands after the install, want none", len(be.argvs)-wrapped)
 	}
 }

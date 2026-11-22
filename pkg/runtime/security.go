@@ -71,14 +71,6 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 	}
 }
 
-// checkPodUID refuses, before anything is spawned, a credential whose drop
-// would leave the pod process in the login range, below 0, at uid 0 or at the
-// service user's uid, or in a group a pod may not hold, a host-assigned system
-// group among them (supervisor.Credential.CheckPodIdentity, asking
-// Deps.lookupGroup). The service user is
-// the one New resolved (Deps.lookupService); when that lookup failed every
-// drop is refused. A credential without a drop runs at the daemon's own uid
-// and is allowed.
 // serviceInstalledDirs are the installed directories whose owner stands in
 // for the service user when the directory lookup finds no account
 // (supervisor.ResolveServiceIdentity): the keystore's socket directory under
@@ -95,11 +87,35 @@ func serviceInstalledDirs(cfg Config) []string {
 	return dirs
 }
 
+// checkPodUID refuses, before anything is spawned, a credential whose drop
+// would leave the pod process in the login range, below 0, at uid 0 or at the
+// service user's uid, or in a group a pod may not hold, a host-assigned system
+// group among them (supervisor.Credential.CheckPodIdentity, asking
+// Deps.lookupGroup).
+//
+// The service user is resolved at every check that drops, not once in New
+// (supervisor.ResolveServiceIdentity over the lookup and the owners of
+// serviceInstalledDirs): a keystore or work dir installed after the daemon
+// started counts from the next start or exec. That costs one getpwnam and, when
+// it finds no account, one owner read per installed dir. When the resolve fails the
+// drop is refused. A credential without a drop runs at the daemon's own uid
+// and is allowed without a lookup.
 func (r *Runtime) checkPodUID(cred supervisor.Credential) error {
-	if cred.Drop && r.serviceErr != nil {
-		return fmt.Errorf("%w: %w", supervisor.ErrPodUIDRefused, r.serviceErr)
+	if !cred.Drop {
+		return nil
 	}
-	return cred.CheckPodIdentity(r.service, r.cfg.FSGroupAdmitted, r.lookupGroup)
+	lookup, owner := r.lookupService, r.installedOwner
+	if lookup == nil {
+		lookup = supervisor.LookupServiceIdentity
+	}
+	if owner == nil {
+		owner = supervisor.DirOwner
+	}
+	svc, err := supervisor.ResolveServiceIdentity(lookup, owner, serviceInstalledDirs(r.cfg)...)
+	if err != nil {
+		return fmt.Errorf("%w: %w", supervisor.ErrPodUIDRefused, err)
+	}
+	return cred.CheckPodIdentity(svc, r.cfg.FSGroupAdmitted, r.lookupGroup)
 }
 
 // fsGroupOwners says whose entries the fsGroup walk may change in a pod's

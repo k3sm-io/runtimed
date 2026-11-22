@@ -359,11 +359,13 @@ type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
 	cfg Config
-	// service is the service user as New resolved it, and serviceErr the
-	// lookup's failure, on which every drop is refused (checkPodUID).
-	// Read-only after New.
-	service    supervisor.ServiceIdentity
-	serviceErr error
+	// lookupService and installedOwner resolve the service user and the
+	// owners of its installed directories (supervisor.ResolveServiceIdentity).
+	// checkPodUID resolves through them at every check, so a directory
+	// installed after New counts from the next start or exec. Read-only after
+	// New.
+	lookupService  func() (supervisor.ServiceIdentity, error)
+	installedOwner func(path string) (uid int, ok bool, err error)
 	// lookupGroup is the group lookup checkPodUID judges a drop's gids below
 	// the login range with (supervisor.Credential.CheckPodGroups); nil is
 	// supervisor.LookupGroupID. Read-only after New.
@@ -1300,15 +1302,16 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if installedOwner == nil {
 		installedOwner = supervisor.DirOwner
 	}
-	service, serviceErr := supervisor.ResolveServiceIdentity(lookupService, installedOwner, serviceInstalledDirs(cfg)...)
-	if serviceErr != nil {
-		log.Warn("service user unknown: every pod privilege drop is refused", "user", supervisor.ServiceUser, "err", serviceErr)
+	// Resolved here only to warn at startup; checkPodUID resolves again at
+	// every check and refuses a drop on the failure it then sees.
+	if _, err := supervisor.ResolveServiceIdentity(lookupService, installedOwner, serviceInstalledDirs(cfg)...); err != nil {
+		log.Warn("service user unknown: every pod privilege drop is refused", "user", supervisor.ServiceUser, "err", err)
 	}
 
 	rt := &Runtime{
 		cfg:            cfg,
-		service:        service,
-		serviceErr:     serviceErr,
+		lookupService:  lookupService,
+		installedOwner: installedOwner,
 		lookupGroup:    deps.lookupGroup,
 		workVolume:     workVolume,
 		userDirs:       resolveDarwinUserDirs(userDirsProbe, log),
