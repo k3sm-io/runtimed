@@ -94,7 +94,11 @@ type GroupLookup func(gid int) (name string, ok bool, err error)
 // LookupGroupID is the production GroupLookup. It asks the system's directory
 // services (getgrgid, through user.LookupGroupId), so groups that live only
 // there, not in /etc/group, count too. "No such group" answers ok false and
-// no error.
+// no error. The pod-group rules depend on os/user reaching getgrgid in
+// libSystem: on darwin Go calls it with or without cgo, and only a build with
+// the osusergo tag swaps in a reader of /etc/group alone, which misses groups
+// held only in directory services (TestCheckPodGroupsProductionLookup runs
+// the rules through this lookup).
 func LookupGroupID(gid int) (string, bool, error) {
 	g, err := user.LookupGroupId(strconv.Itoa(gid))
 	if err == nil {
