@@ -187,33 +187,47 @@ var podNeverGids = map[int]string{
 // the int, before the drop narrows it to a 32-bit gid_t, so a value that
 // would wrap onto a refused gid is refused as itself.
 //
+// One gid of LoginUIDFloor or above is allowed: the fsGroup, a supplemental
+// group other than the primary gid (resolveCredential adds no other), when
+// FSGroupGidAllowed admits it with the node's admitted list. That allow-list
+// holds only gids that name no group on the host, or groups the node made for
+// its pods, so membership grants nothing beyond the files given to it. A
+// caller that does not have the node's list (the exec-shim) passes nil and
+// judges by the default allow-list alone.
+//
 // It is a pod-only rule: a credential with no drop is always allowed, so the
 // daemon's own groups, which a no-drop pod inherits, are not judged here.
-func (c Credential) CheckPodGroups(svc ServiceIdentity) error {
+func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int) error {
 	if !c.Drop {
 		return nil
 	}
-	check := func(what string, gid int) error {
+	check := func(what string, gid int, fsGroup bool) error {
 		switch {
 		case gid > math.MaxUint32:
 			return fmt.Errorf("%w: %s %d is outside the gid_t range", ErrPodGroupRefused, what, gid)
 		case gid < 0:
 			return fmt.Errorf("%w: %s %d is negative", ErrPodGroupRefused, what, gid)
-		case gid >= LoginUIDFloor:
-			return fmt.Errorf("%w: %s %d is %d or above", ErrPodGroupRefused, what, gid, LoginUIDFloor)
 		case svc.Known && gid == svc.GID:
 			return fmt.Errorf("%w: %s %d is the service user %s's primary group", ErrPodGroupRefused, what, gid, ServiceUser)
 		}
 		if name, ok := podNeverGids[gid]; ok {
 			return fmt.Errorf("%w: %s %d is %s", ErrPodGroupRefused, what, gid, name)
 		}
+		if gid >= LoginUIDFloor {
+			if !fsGroup {
+				return fmt.Errorf("%w: %s %d is %d or above", ErrPodGroupRefused, what, gid, LoginUIDFloor)
+			}
+			if err := FSGroupGidAllowed(gid, fsGroupAdmitted); err != nil {
+				return fmt.Errorf("%w: fsGroup %d is %d or above and not admitted: %w", ErrPodGroupRefused, gid, LoginUIDFloor, err)
+			}
+		}
 		return nil
 	}
-	if err := check("primary gid", c.GID); err != nil {
+	if err := check("primary gid", c.GID, false); err != nil {
 		return err
 	}
 	for _, g := range c.Groups {
-		if err := check("supplemental group", g); err != nil {
+		if err := check("supplemental group", g, g != c.GID); err != nil {
 			return err
 		}
 	}
@@ -222,11 +236,11 @@ func (c Credential) CheckPodGroups(svc ServiceIdentity) error {
 
 // CheckPodIdentity is CheckPodUID then CheckPodGroups: the whole pod-only rule
 // on a drop target. Every place a pod credential is checked calls it.
-func (c Credential) CheckPodIdentity(svc ServiceIdentity) error {
+func (c Credential) CheckPodIdentity(svc ServiceIdentity, fsGroupAdmitted []int) error {
 	if err := c.CheckPodUID(svc); err != nil {
 		return err
 	}
-	return c.CheckPodGroups(svc)
+	return c.CheckPodGroups(svc, fsGroupAdmitted)
 }
 
 // noDropSentinel is the uid/gid argv token meaning "no privilege drop". It is
@@ -428,7 +442,7 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 	if err := cred.Validate(euid); err != nil {
 		return done, err
 	}
-	if err := cred.CheckPodIdentity(spec.Service); err != nil {
+	if err := cred.CheckPodIdentity(spec.Service, nil); err != nil {
 		return done, err
 	}
 	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the

@@ -73,7 +73,7 @@ func (r *Runtime) checkPodUID(cred supervisor.Credential) error {
 	if cred.Drop && r.serviceErr != nil {
 		return fmt.Errorf("%w: %w", supervisor.ErrPodUIDRefused, r.serviceErr)
 	}
-	return cred.CheckPodIdentity(r.service)
+	return cred.CheckPodIdentity(r.service, r.cfg.FSGroupAdmitted)
 }
 
 // fsGroupOwners says whose entries the fsGroup walk may change in a pod's

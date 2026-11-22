@@ -315,7 +315,7 @@ func TestPodGroupsRefused(t *testing.T) {
 		},
 	}
 	for name, src := range srcs {
-		for _, gid := range []int64{20, 80, int64(testService.GID), 501, 1000, math.MaxUint32 + 1, 1<<32 + 20} {
+		for _, gid := range []int64{20, 80, int64(testService.GID), 501, 999, math.MaxUint32 + 1, 1<<32 + 20} {
 			t.Run(fmt.Sprintf("%s %d refused", name, gid), func(t *testing.T) {
 				box, c := src(gid)
 				if err := r.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodGroupRefused) {
@@ -338,6 +338,23 @@ func TestPodGroupsRefused(t *testing.T) {
 			}
 		})
 	}
+	t.Run("fsGroup 1000 with a drop allowed under the default allow-list", func(t *testing.T) {
+		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300, RunAsGroup: 300, FsGroup: 1000}}
+		if err := r.checkPodUID(resolveCredential(box, &runtimev1.Container{})); err != nil {
+			t.Errorf("fsGroup 1000: %v", err)
+		}
+	})
+	t.Run("fsGroup 600 refused unless the node admits it", func(t *testing.T) {
+		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300, RunAsGroup: 300, FsGroup: 600}}
+		cred := resolveCredential(box, &runtimev1.Container{})
+		if err := r.checkPodUID(cred); !errors.Is(err, supervisor.ErrPodGroupRefused) {
+			t.Errorf("not admitted: err = %v, want ErrPodGroupRefused", err)
+		}
+		admits := &Runtime{service: testService, cfg: Config{FSGroupAdmitted: []int{600}}}
+		if err := admits.checkPodUID(cred); err != nil {
+			t.Errorf("admitted: %v", err)
+		}
+	})
 	t.Run("a drop that leaves gid 0 is refused", func(t *testing.T) {
 		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300}}
 		if err := r.checkPodUID(resolveCredential(box, &runtimev1.Container{})); !errors.Is(err, supervisor.ErrPodGroupRefused) {

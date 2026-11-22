@@ -881,7 +881,7 @@ var testService = ServiceIdentity{UID: 250, GID: 250, Known: true}
 // wrap onto staff included), and a drop to gids 1 to 500 otherwise runs. A
 // credential with no drop is never judged.
 func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
-	refused := []int{0, 20, 80, testService.GID, -1, 501, 502, 1000, math.MaxInt32, math.MaxUint32 + 1, 1<<32 + 20}
+	refused := []int{0, 20, 80, testService.GID, -1, 501, 502, 999, math.MaxInt32 + 1, math.MaxUint32 + 1, 1<<32 + 20}
 	for _, gid := range refused {
 		for name, cred := range map[string]Credential{
 			"primary gid":        {UID: 300, GID: gid, Groups: []int{300}, Drop: true},
@@ -907,9 +907,41 @@ func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
 			}
 		})
 	}
+	// An fsGroup (a supplemental group other than the primary gid) of 501 or
+	// above is allowed when FSGroupGidAllowed admits it: 1000 names no group
+	// on the host, so the default allow-list admits it. The same gid as the
+	// primary, or one the allow-list refuses, stays refused.
+	t.Run("fsGroup 1000 under the default allow-list allowed", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 300, Groups: []int{300, 1000}, Drop: true}
+		if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{Cred: cred, Service: testService}, 0); err != nil {
+			t.Fatalf("RunLaunchSequence: %v", err)
+		}
+	})
+	for name, cred := range map[string]Credential{
+		"primary gid 1000":                  {UID: 300, GID: 1000, Groups: []int{1000}, Drop: true},
+		"primary gid 2147483647":            {UID: 300, GID: math.MaxInt32, Drop: true},
+		"fsGroup 501, below the allow-list": {UID: 300, GID: 300, Groups: []int{300, 501}, Drop: true},
+		"fsGroup 999, below the allow-list": {UID: 300, GID: 300, Groups: []int{300, 999}, Drop: true},
+		"fsGroup past the gid_t range":      {UID: 300, GID: 300, Groups: []int{300, 1 << 32}, Drop: true},
+	} {
+		t.Run(name+" refused", func(t *testing.T) {
+			if err := cred.CheckPodIdentity(testService, nil); !errors.Is(err, ErrPodGroupRefused) {
+				t.Fatalf("err = %v, want ErrPodGroupRefused", err)
+			}
+		})
+	}
+	t.Run("an admitted fsGroup is judged by the node's list", func(t *testing.T) {
+		cred := Credential{UID: 300, GID: 300, Groups: []int{300, 600}, Drop: true}
+		if err := cred.CheckPodIdentity(testService, nil); !errors.Is(err, ErrPodGroupRefused) {
+			t.Fatalf("not admitted: err = %v, want ErrPodGroupRefused", err)
+		}
+		if err := cred.CheckPodIdentity(testService, []int{600}); err != nil {
+			t.Fatalf("admitted: %v", err)
+		}
+	})
 	t.Run("no drop is not judged", func(t *testing.T) {
 		cred := Credential{GID: 20, Groups: []int{0, 20, 80, 501}}
-		if err := cred.CheckPodIdentity(testService); err != nil {
+		if err := cred.CheckPodIdentity(testService, nil); err != nil {
 			t.Fatalf("CheckPodIdentity: %v", err)
 		}
 	})
