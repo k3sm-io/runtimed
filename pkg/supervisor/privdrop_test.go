@@ -965,3 +965,69 @@ func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveServiceIdentityInstalledOwner pins the fail-closed half of the
+// service uid rule: when the directory lookup answers "not found", the owner
+// of an installed directory stands in for the service user, and a drop to it
+// is refused. A lookup that finds the account is taken as it is, an owner read
+// that fails refuses, and a directory that does not exist adds nothing.
+func TestResolveServiceIdentityInstalledOwner(t *testing.T) {
+	notFound := func() (ServiceIdentity, error) { return ServiceIdentity{}, nil }
+	const sockDir, workDir = "/data/keystore-sock", "/data/work"
+	owners := map[string]int{sockDir: 260, workDir: 270}
+	owner := func(dir string) (int, bool, error) {
+		uid, ok := owners[dir]
+		return uid, ok, nil
+	}
+
+	svc, err := ResolveServiceIdentity(notFound, owner, sockDir, "", workDir, "/data/absent")
+	if err != nil {
+		t.Fatalf("ResolveServiceIdentity: %v", err)
+	}
+	if svc.Known || len(svc.Installed) != 2 {
+		t.Fatalf("svc = %+v, want not Known with the two installed owners", svc)
+	}
+	for _, uid := range []int{260, 270} {
+		cred := Credential{UID: uid, GID: 300, Drop: true}
+		if err := cred.CheckPodUID(svc); !errors.Is(err, ErrPodUIDRefused) {
+			t.Errorf("drop to the installed owner %d: err = %v, want ErrPodUIDRefused", uid, err)
+		}
+		if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{Cred: cred, Service: svc}, 0); !errors.Is(err, ErrPodUIDRefused) {
+			t.Errorf("RunLaunchSequence to the installed owner %d: err = %v, want ErrPodUIDRefused", uid, err)
+		}
+	}
+	if err := (Credential{UID: 261, GID: 300, Drop: true}).CheckPodUID(svc); err != nil {
+		t.Errorf("drop to 261, which owns nothing installed: %v", err)
+	}
+
+	t.Run("a found account is taken as it is", func(t *testing.T) {
+		called := false
+		got, err := ResolveServiceIdentity(func() (ServiceIdentity, error) { return testService, nil },
+			func(string) (int, bool, error) { called = true; return 0, false, nil }, sockDir)
+		if err != nil || called || !got.Known || got.UID != testService.UID || len(got.Installed) != 0 {
+			t.Fatalf("got %+v, %v (owner read: %v), want the looked-up account and no owner read", got, err, called)
+		}
+	})
+	t.Run("a lookup error is returned", func(t *testing.T) {
+		boom := errors.New("directory services down")
+		if _, err := ResolveServiceIdentity(func() (ServiceIdentity, error) { return ServiceIdentity{}, boom }, owner, sockDir); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the lookup error", err)
+		}
+	})
+	t.Run("an owner read that fails refuses", func(t *testing.T) {
+		boom := errors.New("EACCES")
+		if _, err := ResolveServiceIdentity(notFound, func(string) (int, bool, error) { return 0, false, boom }, sockDir); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the owner read error", err)
+		}
+	})
+	t.Run("DirOwner reads a real directory", func(t *testing.T) {
+		dir := t.TempDir()
+		uid, ok, err := DirOwner(dir)
+		if err != nil || !ok || uid != os.Getuid() {
+			t.Fatalf("DirOwner(%s) = %d, %v, %v, want %d, true, nil", dir, uid, ok, err, os.Getuid())
+		}
+		if _, ok, err := DirOwner(dir + "/absent"); ok || err != nil {
+			t.Fatalf("DirOwner(absent) = %v, %v, want false, nil", ok, err)
+		}
+	})
+}

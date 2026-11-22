@@ -19,12 +19,15 @@ package supervisor
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
+	"os"
 	"os/user"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -96,17 +99,83 @@ const LoginUIDFloor = 501
 const ServiceUser = "_k3sm"
 
 // ServiceIdentity is the ServiceUser account as this host resolves it. Known is
-// false on a host with no such account, where nothing owns a keystore as it.
+// false when the directory lookup finds no such account. Installed holds the
+// owners of the node's installed directories (ResolveServiceIdentity), read
+// only when Known is false: an installed node whose account the lookup cannot
+// find still has the uid that owns its keystore, and CheckPodUID refuses a
+// drop to each of them.
 type ServiceIdentity struct {
-	UID   int
-	GID   int
-	Known bool
+	UID       int
+	GID       int
+	Known     bool
+	Installed []InstalledOwner
+}
+
+// InstalledOwner is one installed directory and the uid that owns it.
+type InstalledOwner struct {
+	Dir string
+	UID int
+}
+
+// DirOwner reports the uid that owns path, following a symlink to what it
+// names. A path that does not exist reports ok false and no error; any other
+// stat failure is returned. It is ResolveServiceIdentity's production owner.
+func DirOwner(path string) (uid int, ok bool, err error) {
+	fi, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	st, isStat := fi.Sys().(*syscall.Stat_t)
+	if !isStat {
+		return 0, false, fmt.Errorf("stat %s: no owner in %T", path, fi.Sys())
+	}
+	return int(st.Uid), true, nil
+}
+
+// ResolveServiceIdentity resolves ServiceUser with lookup, and, when lookup
+// finds no such account, reads the owner of each installed directory in dirs
+// (an empty entry is skipped) with owner, DirOwner in production. Each
+// directory that exists adds its owner to Installed, so a node whose account
+// the directory services do not answer for still refuses a drop to the uid
+// that owns its keystore: "not found" fails closed on what is installed. The
+// caller passes the keystore's socket directory (keystorepaths.SockDir under
+// the data root) and the k3sm work dir, the ones it knows.
+//
+// A lookup error is returned as it is. An owner read that fails for any reason
+// but "does not exist" is returned too, so the caller refuses every drop
+// rather than allowing one past a directory it could not read.
+func ResolveServiceIdentity(lookup func() (ServiceIdentity, error), owner func(string) (int, bool, error), dirs ...string) (ServiceIdentity, error) {
+	svc, err := lookup()
+	if err != nil || svc.Known {
+		return svc, err
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		uid, ok, err := owner(dir)
+		if err != nil {
+			return ServiceIdentity{}, fmt.Errorf("service user %s not found: read the owner of the installed %s: %w", ServiceUser, dir, err)
+		}
+		if ok {
+			svc.Installed = append(svc.Installed, InstalledOwner{Dir: dir, UID: uid})
+		}
+	}
+	return svc, nil
 }
 
 // LookupServiceIdentity resolves ServiceUser through the system's directory
 // services (getpwnam), so an account that lives only there counts. A host with
 // no such account returns the zero ServiceIdentity and no error; any other
-// failure is returned, and a caller that drops refuses the drop on it.
+// failure is returned, and a caller that drops refuses the drop on it. A
+// caller that knows the node's installed directories resolves through
+// ResolveServiceIdentity instead, so "not found" does not leave the keystore's
+// owner uid open to a drop. The exec-shim calls this alone: it is handed no
+// data root or work dir, and the runtime has already refused the drop on the
+// installed owners before it spawned the shim.
 func LookupServiceIdentity() (ServiceIdentity, error) {
 	u, err := user.Lookup(ServiceUser)
 	if err != nil {
@@ -137,7 +206,10 @@ var ErrPodUIDRefused = errors.New("supervisor: pod uid refused")
 // for; a drop that leaves the process at uid 0 (a runAsGroup with no
 // runAsUser on a root daemon), which counts as no drop; and a drop to svc's
 // uid when svc is Known, since the service user owns the keystore and its
-// socket and a process at that uid passes the keystore's peer check.
+// socket and a process at that uid passes the keystore's peer check. When svc
+// is not Known, a drop to the owner of any of svc.Installed is refused for
+// the same reason: the lookup's "not found" does not make the installed
+// keystore's owner safe to hold.
 //
 // The system role uids 1 to 500, other than the service user's, stay allowed.
 // That is a stated residual: such a uid may own files or sockets of its own
@@ -165,6 +237,13 @@ func (c Credential) CheckPodUID(svc ServiceIdentity) error {
 		return fmt.Errorf("%w: uid %d is in the login range (%d and above)", ErrPodUIDRefused, c.UID, LoginUIDFloor)
 	case svc.Known && c.UID == svc.UID:
 		return fmt.Errorf("%w: uid %d is the service user %s, which owns the keystore", ErrPodUIDRefused, c.UID, ServiceUser)
+	}
+	if !svc.Known {
+		for _, o := range svc.Installed {
+			if c.UID == o.UID {
+				return fmt.Errorf("%w: uid %d owns the installed %s, and the service user %s was not found", ErrPodUIDRefused, c.UID, o.Dir, ServiceUser)
+			}
+		}
 	}
 	return nil
 }

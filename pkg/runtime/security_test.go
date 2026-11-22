@@ -22,12 +22,15 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -397,3 +400,38 @@ func TestPodGroupsRefused(t *testing.T) {
 // testService is the service user the pod-identity tests pin: uid 250, the
 // shipped _k3sm uid, with a primary gid of its own.
 var testService = supervisor.ServiceIdentity{UID: 250, GID: 250, Known: true}
+
+// TestServiceUIDFromInstalledDirs pins the runtime half of the fail-closed
+// service uid rule: with the service user lookup answering "not found", the
+// owner of the keystore's socket directory under Config.DataRoot, or of
+// Config.StateDir, is refused as a drop target, and a uid that owns neither
+// is not.
+func TestServiceUIDFromInstalledDirs(t *testing.T) {
+	root := t.TempDir()
+	dataRoot := filepath.Join(filepath.Dir(root), "node-data")
+	stateDir := filepath.Join(filepath.Dir(root), "node-work")
+	sockDir := filepath.Join(dataRoot, keystorepaths.SockDir)
+	owners := map[string]int{sockDir: 260, stateDir: 270}
+	var read []string
+	rt := newTestRuntimeCfg(t, Config{Root: root, PodLogsDir: filepath.Join(root, "podlogs"), DataRoot: dataRoot, StateDir: stateDir}, Deps{
+		lookupService: func() (supervisor.ServiceIdentity, error) { return supervisor.ServiceIdentity{}, nil },
+		installedOwner: func(dir string) (int, bool, error) {
+			read = append(read, dir)
+			uid, ok := owners[dir]
+			return uid, ok, nil
+		},
+	})
+	if want := []string{sockDir, stateDir}; !slices.Equal(read, want) {
+		t.Fatalf("owners read = %q, want %q", read, want)
+	}
+	for _, uid := range []int64{260, 270} {
+		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: uid, RunAsGroup: 300}}
+		if err := rt.checkPodUID(resolveCredential(box, &runtimev1.Container{})); !errors.Is(err, supervisor.ErrPodUIDRefused) {
+			t.Errorf("drop to the installed owner %d: err = %v, want ErrPodUIDRefused", uid, err)
+		}
+	}
+	box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 261, RunAsGroup: 300}}
+	if err := rt.checkPodUID(resolveCredential(box, &runtimev1.Container{})); err != nil {
+		t.Errorf("drop to 261: %v", err)
+	}
+}

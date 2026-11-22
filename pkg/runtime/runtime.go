@@ -926,6 +926,10 @@ type Deps struct {
 	// (supervisor.Credential.CheckPodUID). Nil selects
 	// supervisor.LookupServiceIdentity; tests pin an identity.
 	lookupService func() (supervisor.ServiceIdentity, error)
+	// installedOwner reads the owner uid of an installed directory when the
+	// service user lookup finds no account (supervisor.ResolveServiceIdentity).
+	// Nil selects supervisor.DirOwner; tests pin an owner.
+	installedOwner func(path string) (uid int, ok bool, err error)
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -1284,7 +1288,11 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 	if lookupService == nil {
 		lookupService = supervisor.LookupServiceIdentity
 	}
-	service, serviceErr := lookupService()
+	installedOwner := deps.installedOwner
+	if installedOwner == nil {
+		installedOwner = supervisor.DirOwner
+	}
+	service, serviceErr := supervisor.ResolveServiceIdentity(lookupService, installedOwner, serviceInstalledDirs(cfg)...)
 	if serviceErr != nil {
 		log.Warn("service user unknown: every pod privilege drop is refused", "user", supervisor.ServiceUser, "err", serviceErr)
 	}

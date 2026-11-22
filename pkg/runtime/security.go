@@ -19,9 +19,11 @@ package runtime
 import (
 	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -76,6 +78,22 @@ func resolveCredential(box *runtimev1.PodBox, c *runtimev1.Container) supervisor
 // the one New resolved (Deps.lookupService); when that lookup failed every
 // drop is refused. A credential without a drop runs at the daemon's own uid
 // and is allowed.
+// serviceInstalledDirs are the installed directories whose owner stands in
+// for the service user when the directory lookup finds no account
+// (supervisor.ResolveServiceIdentity): the keystore's socket directory under
+// the k3sm data root (cfg.DataRoot), and the k3sm role's work dir
+// (cfg.StateDir). Each is named only when the node configured it.
+func serviceInstalledDirs(cfg Config) []string {
+	var dirs []string
+	if cfg.DataRoot != "" {
+		dirs = append(dirs, filepath.Join(cfg.DataRoot, keystorepaths.SockDir))
+	}
+	if cfg.StateDir != "" {
+		dirs = append(dirs, cfg.StateDir)
+	}
+	return dirs
+}
+
 func (r *Runtime) checkPodUID(cred supervisor.Credential) error {
 	if cred.Drop && r.serviceErr != nil {
 		return fmt.Errorf("%w: %w", supervisor.ErrPodUIDRefused, r.serviceErr)
