@@ -340,6 +340,9 @@ var keystoreNames = []string{
 	"keystore-maintenance",
 	"keystore-later-addition",
 	"KEYSTORE-Floor.json",
+	"Keystore-floor.json",
+	"keyſtore-run/keys.sock",
+	"KEYſTORE-sock/x",
 	"keystore-run",
 	"keystore-run/keys.sock",
 	"keystore-run/sub/deep",
@@ -500,7 +503,7 @@ func checkKeystoreVerdicts(t *testing.T, prof, root string, network bool) {
 	// The positive control: the variant's own grant at the data root
 	// reaches a sibling that is not a keystore name.
 	for _, spelling := range firmlinkForms(root) {
-		for _, n := range []string{"keystore", "keystore.json", "not-keystore-x", "keystore_floor.json"} {
+		for _, n := range []string{"keystore", "keystore.json", "not-keystore-x", "keystore_floor.json", "xeystore-run", "ke{store-x"} {
 			p := filepath.Join(spelling, n)
 			ops := []string{"file-read-data", "file-write-create"}
 			if network {
@@ -560,11 +563,11 @@ func TestKeystoreDenyStanzaShape(t *testing.T) {
 	}
 	for _, want := range []string{
 		"(deny file-read* file-read-metadata file-write* file-link\n",
-		`(regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
-		`(regex #"^/System/Volumes/Data/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-")`,
+		`(regex #"^/private/var/lib/k3sm/(K|k|K)[Ee][Yy](S|s|ſ)[Tt][Oo][Rr][Ee]-")`,
+		`(regex #"^/System/Volumes/Data/private/var/lib/k3sm/(K|k|K)[Ee][Yy](S|s|ſ)[Tt][Oo][Rr][Ee]-")`,
 		`(subpath "/private/var/lib/k3sm/keystore-run")`,
 		`(subpath "/private/var/lib/k3sm/keystore-sock")`,
-		`(local unix-socket (regex #"^/private/var/lib/k3sm/[Kk][Ee][Yy][Ss][Tt][Oo][Rr][Ee]-"))`,
+		`(local unix-socket (regex #"^/private/var/lib/k3sm/(K|k|K)[Ee][Yy](S|s|ſ)[Tt][Oo][Rr][Ee]-"))`,
 		`(remote unix-socket (subpath "/var/lib/k3sm/keystore-run"))`,
 	} {
 		if !strings.Contains(prof, want) {
@@ -663,9 +666,14 @@ func TestValidateRefusesKeystoreExtraPaths(t *testing.T) {
 	var bad []string
 	for _, root := range []string{data, work} {
 		for _, spelling := range dataRootSpellings(root) {
-			for _, n := range []string{"keystore-floor.json", "keystore-run", "keystore-sock/keys.sock", "KEYSTORE-Run/x", "Keystore-later"} {
+			for _, n := range []string{"keystore-floor.json", "keystore-run", "keystore-sock/keys.sock", "KEYSTORE-Run/x", "Keystore-later",
+				"Keystore-run/x", "keyſtore-sock/keys.sock", "KEYſTORE-floor.json"} {
 				bad = append(bad, filepath.Join(spelling, n))
 			}
+		}
+		// The data-volume alias in any letter case or fold.
+		for _, alias := range []string{"/system/volumes/data", "/SYSTEM/VOLUMES/DATA", "/ſyſtem/Volumeſ/Data"} {
+			bad = append(bad, alias+firmlinkForms(root)[len(firmlinkForms(root))-1]+"/keystore-run/x")
 		}
 	}
 	sp := func() *runtimev1.SandboxProfile { return &runtimev1.SandboxProfile{DataVolumePath: dataVol} }

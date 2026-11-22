@@ -23,6 +23,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/keystorepaths"
 )
@@ -61,20 +63,71 @@ func keystoreForms(root string) []string {
 
 // keystorePrefixPattern returns the anchored regex that matches every name
 // under root beginning keystorepaths.DataRootPrefix, and everything below such a
-// name. The prefix is matched in either letter case: the data volume is case
-// insensitive by default, so KEYSTORE-run names the same directory, and a pod
-// that could create it would plant the server's directory before the server.
+// name. The prefix is matched in every spelling the data volume folds onto it:
+// the volume is case insensitive by default, so KEYSTORE-run names the same
+// directory, and APFS folds U+212A (Kelvin sign) to k and U+017F (long s) to
+// s, so a pod that could create either spelling would plant the server's
+// directory before the server.
+//
+// A letter with only its two ASCII cases is a class ([Ee]); one with a
+// non-ASCII fold is an alternation of the literal UTF-8 spellings ((K|k|K)).
+// SBPL's regex takes no \x{...} escape (inside a class it reads the escape as
+// the characters x, {, 2, 1, A and }, measured: [Kk\x{212A}]eystore- denied
+// xeystore-), and a class holding a multi-byte character may be read as a
+// class of its bytes, so the alternation is the one form that means the fold.
 func keystorePrefixPattern(root string) string {
 	var fold strings.Builder
 	for _, r := range keystorepaths.DataRootPrefix {
-		lo, up := strings.ToLower(string(r)), strings.ToUpper(string(r))
-		if lo == up {
-			fold.WriteString(regexp.QuoteMeta(lo))
-			continue
+		spellings := foldSpellings(r)
+		switch {
+		case len(spellings) == 1:
+			fold.WriteString(regexp.QuoteMeta(spellings[0]))
+		case len(spellings) == 2:
+			fold.WriteString("[" + spellings[0] + spellings[1] + "]")
+		default:
+			fold.WriteString("(" + strings.Join(spellings, "|") + ")")
 		}
-		fold.WriteString("[" + up + lo + "]")
 	}
 	return "^" + regexp.QuoteMeta(root) + "/" + fold.String()
+}
+
+// foldSpellings returns every rune that folds onto r (its unicode.SimpleFold
+// orbit), upper case ASCII first, then lower, then the rest in orbit order.
+func foldSpellings(r rune) []string {
+	orbit := []rune{r}
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		orbit = append(orbit, f)
+	}
+	slices.SortStableFunc(orbit, func(a, b rune) int {
+		rank := func(x rune) int {
+			switch {
+			case x < utf8.RuneSelf && unicode.IsUpper(x):
+				return 0
+			case x < utf8.RuneSelf:
+				return 1
+			}
+			return 2
+		}
+		return rank(a) - rank(b)
+	})
+	out := make([]string, len(orbit))
+	for i, x := range orbit {
+		out[i] = string(x)
+	}
+	return out
+}
+
+// foldName folds s the way the data volume compares names: each rune to the
+// least rune of its unicode.SimpleFold orbit, then to lower case, so K, k and
+// U+212A all become k and S, s and U+017F all become s.
+func foldName(s string) string {
+	return strings.Map(func(r rune) rune {
+		least := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			least = min(least, f)
+		}
+		return unicode.ToLower(least)
+	}, s)
 }
 
 // keystoreStanzaHead is the first line of every keystore stanza; keystoreStanzaOf
@@ -183,16 +236,20 @@ func keystoreStanzaOf(profile string) (string, []string, error) {
 
 // underKeystoreName reports whether p is at or under a
 // keystorepaths.DataRootPrefix name of root, in any firmlink spelling, through
-// the data-volume alias, and in either letter case.
+// the data-volume alias (in any letter case), and in any letter case or
+// fold of the name (foldName).
 func underKeystoreName(p, root string) bool {
 	p = filepath.Clean(p)
-	if isUnder(p, dataVolumeAlias) && p != dataVolumeAlias {
-		p = strings.TrimPrefix(p, dataVolumeAlias)
+	// The alias is stripped in any letter case and fold, segment by segment:
+	// its spelling as written may not be its byte length (U+017F for s).
+	aliasSegs := strings.Count(dataVolumeAlias, "/")
+	if segs := strings.Split(p, "/"); underFold(p, dataVolumeAlias) && len(segs) > aliasSegs+1 {
+		p = "/" + strings.Join(segs[aliasSegs+1:], "/")
 	}
 	for _, form := range comparisonForms(p) {
 		for _, r := range comparisonForms(root) {
 			ps, rs := strings.Split(form, "/"), strings.Split(r, "/")
-			if len(ps) > len(rs) && underFold(form, r) && strings.HasPrefix(strings.ToLower(ps[len(rs)]), keystorepaths.DataRootPrefix) {
+			if len(ps) > len(rs) && underFold(form, r) && strings.HasPrefix(foldName(ps[len(rs)]), keystorepaths.DataRootPrefix) {
 				return true
 			}
 		}
