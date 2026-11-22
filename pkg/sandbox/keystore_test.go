@@ -319,7 +319,7 @@ func verdict(t *testing.T, rules []sbplRule, q sbplQuery) (bool, string) {
 // (file-link, which file-write* does not cover), a unix-socket connect and a
 // unix-socket bind.
 var keystoreOps = []string{
-	"file-read-data", "file-read-metadata", "file-read-xattr",
+	"file-read-data", "file-read-metadata", "file-read-xattr", "file-test-existence",
 	"file-write-data", "file-write-create", "file-write-unlink", "file-write-mode",
 	"file-write-owner", "file-write-flags", "file-write-xattr", "file-write-times",
 	"file-link",
@@ -562,7 +562,7 @@ func TestKeystoreDenyStanzaShape(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	for _, want := range []string{
-		"(deny file-read* file-read-metadata file-write* file-link\n",
+		"(deny file-read* file-read-metadata file-test-existence file-write* file-link\n",
 		`(regex #"^/private/var/lib/k3sm/(K|k|K)[Ee][Yy](S|s|ſ)[Tt][Oo][Rr][Ee]-")`,
 		`(regex #"^/System/Volumes/Data/private/var/lib/k3sm/(K|k|K)[Ee][Yy](S|s|ſ)[Tt][Oo][Rr][Ee]-")`,
 		`(subpath "/private/var/lib/k3sm/keystore-run")`,

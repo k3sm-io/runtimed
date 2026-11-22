@@ -135,7 +135,9 @@ func foldName(s string) string {
 const keystoreStanzaHead = ";; KEYSTORE: every data-root name beginning " + keystorepaths.DataRootPrefix + " and the whole\n"
 
 // keystoreDenyStanza renders the keystore denies for roots: file reads
-// (metadata included), every file write (create, unlink and rename among them), a
+// (metadata included), an existence test (file-test-existence, the
+// access(2) F_OK check, which file-read* does not cover: measured, access
+// succeeded under a file-read* file-read-metadata deny), every file write (create, unlink and rename among them), a
 // hard link (file-link, which file-write* does not cover),
 // connect(2) to a unix socket and bind(2) of one, on every name under each root
 // that begins keystorepaths.DataRootPrefix and on the whole keystorepaths.RunDir tree, in
@@ -171,9 +173,9 @@ func renderKeystoreStanza(forms []string) string {
 	}
 	var b strings.Builder
 	b.WriteString(keystoreStanzaHead)
-	b.WriteString(";; " + keystorepaths.RunDir + " and " + keystorepaths.SockDir + " trees: no read, stat, write, create, unlink, rename,\n")
-	b.WriteString(";; hard link, connect or bind. LAST, so no allow above can re-open them.\n")
-	b.WriteString("(deny file-read* file-read-metadata file-write* file-link\n")
+	b.WriteString(";; " + keystorepaths.RunDir + " and " + keystorepaths.SockDir + " trees: no read, stat, existence test, write, create,\n")
+	b.WriteString(";; unlink, rename, hard link, connect or bind. LAST, so no allow above can re-open them.\n")
+	b.WriteString("(deny file-read* file-read-metadata file-test-existence file-write* file-link\n")
 	for _, f := range filters {
 		b.WriteString("  " + f + "\n")
 	}

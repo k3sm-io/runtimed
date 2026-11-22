@@ -154,9 +154,9 @@
   (literal "/private/var/lib/k3sm/pods/pod-gpu123")
   )
 ;; KEYSTORE: every data-root name beginning keystore- and the whole
-;; keystore-run and keystore-sock trees: no read, stat, write, create, unlink, rename,
-;; hard link, connect or bind. LAST, so no allow above can re-open them.
-(deny file-read* file-read-metadata file-write* file-link
+;; keystore-run and keystore-sock trees: no read, stat, existence test, write, create,
+;; unlink, rename, hard link, connect or bind. LAST, so no allow above can re-open them.
+(deny file-read* file-read-metadata file-test-existence file-write* file-link
   (regex #"^/var/lib/k3sm/(K|k|K)[Ee][Yy](S|s|ſ)[Tt][Oo][Rr][Ee]-")
   (subpath "/var/lib/k3sm/keystore-run")
   (subpath "/var/lib/k3sm/keystore-sock")
