@@ -117,20 +117,33 @@ type InstalledOwner struct {
 	UID int
 }
 
-// DirOwner reports the uid that owns path, following a symlink to what it
-// names. A path that does not exist reports ok false and no error; any other
-// stat failure is returned. It is ResolveServiceIdentity's production owner.
+// ErrInstalledDirSymlink reports an installed directory whose path is a
+// symlink (DirOwner). Its owner is not read through the link, and a caller
+// refuses every drop on it.
+var ErrInstalledDirSymlink = errors.New("supervisor: installed directory is a symlink")
+
+// DirOwner reports the uid that owns path, read with lstat: a symlink is not
+// followed. A path that does not exist reports ok false and no error. A path
+// that is a symlink, whether it names a directory or nothing, is
+// ErrInstalledDirSymlink and not "absent", since the uid that owns the link is
+// not the owner of what the node installed there. Only the last element is
+// judged; the directories above it are taken as the host lays them out. Any
+// other lstat failure is returned. It is ResolveServiceIdentity's production
+// owner.
 func DirOwner(path string) (uid int, ok bool, err error) {
-	fi, err := os.Stat(path)
+	fi, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, false, nil
 	}
 	if err != nil {
 		return 0, false, err
 	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return 0, false, fmt.Errorf("%w: %s", ErrInstalledDirSymlink, path)
+	}
 	st, isStat := fi.Sys().(*syscall.Stat_t)
 	if !isStat {
-		return 0, false, fmt.Errorf("stat %s: no owner in %T", path, fi.Sys())
+		return 0, false, fmt.Errorf("lstat %s: no owner in %T", path, fi.Sys())
 	}
 	return int(st.Uid), true, nil
 }

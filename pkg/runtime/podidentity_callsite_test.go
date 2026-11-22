@@ -154,3 +154,32 @@ func TestStartContainerResolvesTheServiceOwnerEachStart(t *testing.T) {
 		t.Errorf("wrapped %d commands after the install, want none", len(be.argvs)-wrapped)
 	}
 }
+
+// TestSymlinkedWorkDirRefusesDrops pins that the installed work dir's owner is
+// read without following a symlink: with the service user lookup answering
+// "not found" and Config.StateDir a symlink, the real owner read
+// (supervisor.DirOwner) fails, and every drop is refused, naming the symlink.
+func TestSymlinkedWorkDirRefusesDrops(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(dir, "node-work")
+	if err := os.Symlink(target, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	rt := newTestRuntimeCfg(t, Config{StateDir: stateDir}, Deps{
+		lookupService: func() (supervisor.ServiceIdentity, error) { return supervisor.ServiceIdentity{}, nil },
+	})
+	for _, uid := range []int64{260, 300} {
+		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: uid, RunAsGroup: 300}}
+		err := rt.checkPodUID(resolveCredential(box, &runtimev1.Container{}))
+		if !errors.Is(err, supervisor.ErrPodUIDRefused) || !errors.Is(err, supervisor.ErrInstalledDirSymlink) {
+			t.Errorf("drop to %d: err = %v, want ErrPodUIDRefused naming the symlink", uid, err)
+		}
+	}
+	if err := rt.checkPodUID(resolveCredential(&runtimev1.PodBox{}, &runtimev1.Container{})); err != nil {
+		t.Errorf("no drop: %v", err)
+	}
+}

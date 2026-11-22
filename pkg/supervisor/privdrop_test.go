@@ -1108,4 +1108,27 @@ func TestResolveServiceIdentityInstalledOwner(t *testing.T) {
 			t.Fatalf("DirOwner(absent) = %v, %v, want false, nil", ok, err)
 		}
 	})
+	// A symlink at an installed path is not followed and is not "absent": it
+	// is an error, so the resolve fails and every drop is refused, whether it
+	// names a directory or nothing.
+	t.Run("DirOwner refuses a symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for name, link := range map[string]string{"to a directory": target, "dangling": filepath.Join(dir, "absent")} {
+			path := filepath.Join(dir, "link "+name)
+			if err := os.Symlink(link, path); err != nil {
+				t.Fatal(err)
+			}
+			uid, ok, err := DirOwner(path)
+			if !errors.Is(err, ErrInstalledDirSymlink) || ok {
+				t.Errorf("%s: DirOwner = %d, %v, %v, want a symlink error", name, uid, ok, err)
+			}
+			if _, err := ResolveServiceIdentity(notFound, DirOwner, path); !errors.Is(err, ErrInstalledDirSymlink) {
+				t.Errorf("%s: ResolveServiceIdentity = nil error, want the symlink refused", name)
+			}
+		}
+	})
 }
