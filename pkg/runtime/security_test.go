@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -204,10 +205,10 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 			return &runtimev1.PodBox{}, &runtimev1.Container{SecurityContext: &runtimev1.SecurityContext{RunAsUser: uid, RunAsGroup: 300}}
 		}},
 		{"pod runAsUser", func(uid int64) (*runtimev1.PodBox, *runtimev1.Container) {
-			return &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: uid}}, &runtimev1.Container{}
+			return &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: uid, RunAsGroup: 300}}, &runtimev1.Container{}
 		}},
 		{"box uid", func(uid int64) (*runtimev1.PodBox, *runtimev1.Container) {
-			return &runtimev1.PodBox{Uid: uint32(uid)}, &runtimev1.Container{}
+			return &runtimev1.PodBox{Uid: uint32(uid), Gid: 300}, &runtimev1.Container{}
 		}},
 	}
 	for _, s := range srcs {
@@ -243,8 +244,8 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 		})
 	}
 	for name, box := range map[string]*runtimev1.PodBox{
-		"pod runAsGroup only": {PodSecurityContext: &runtimev1.PodSecurityContext{RunAsGroup: 20}},
-		"box gid only":        {Gid: 20},
+		"pod runAsGroup only": {PodSecurityContext: &runtimev1.PodSecurityContext{RunAsGroup: 300}},
+		"box gid only":        {Gid: 300},
 	} {
 		t.Run("uid 0 after the drop/"+name, func(t *testing.T) {
 			cred := resolveCredential(box, &runtimev1.Container{})
@@ -269,6 +270,67 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPodGroupsRefused pins the group half of the pod-only rule before a
+// command is wrapped: a drop whose runAsGroup (container or pod), box gid or
+// fsGroup is wheel, staff, admin, the service user's primary gid, 501 or above
+// or past the gid_t range is refused, read from the int64 field as sent; a
+// pod with gids 1 to 500 otherwise is allowed. A pod with no drop is not
+// judged on the groups it would have asked for.
+func TestPodGroupsRefused(t *testing.T) {
+	r := &Runtime{service: testService}
+	srcs := map[string]func(gid int64) (*runtimev1.PodBox, *runtimev1.Container){
+		"container runAsGroup": func(gid int64) (*runtimev1.PodBox, *runtimev1.Container) {
+			return &runtimev1.PodBox{}, &runtimev1.Container{SecurityContext: &runtimev1.SecurityContext{RunAsUser: 300, RunAsGroup: gid}}
+		},
+		"pod runAsGroup": func(gid int64) (*runtimev1.PodBox, *runtimev1.Container) {
+			return &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300, RunAsGroup: gid}}, &runtimev1.Container{}
+		},
+		"fsGroup": func(gid int64) (*runtimev1.PodBox, *runtimev1.Container) {
+			return &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300, RunAsGroup: 300, FsGroup: gid}}, &runtimev1.Container{}
+		},
+	}
+	for name, src := range srcs {
+		for _, gid := range []int64{20, 80, int64(testService.GID), 501, 1000, math.MaxUint32 + 1, 1<<32 + 20} {
+			t.Run(fmt.Sprintf("%s %d refused", name, gid), func(t *testing.T) {
+				box, c := src(gid)
+				if err := r.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodGroupRefused) {
+					t.Errorf("err = %v, want ErrPodGroupRefused", err)
+				}
+			})
+		}
+		t.Run(name+" 400 allowed", func(t *testing.T) {
+			box, c := src(400)
+			if err := r.checkPodUID(resolveCredential(box, c)); err != nil {
+				t.Errorf("gid 400: %v", err)
+			}
+		})
+	}
+	for _, gid := range []uint32{20, 80, 501} {
+		t.Run(fmt.Sprintf("box gid %d refused", gid), func(t *testing.T) {
+			box := &runtimev1.PodBox{Uid: 300, Gid: gid}
+			if err := r.checkPodUID(resolveCredential(box, &runtimev1.Container{})); !errors.Is(err, supervisor.ErrPodGroupRefused) {
+				t.Errorf("err = %v, want ErrPodGroupRefused", err)
+			}
+		})
+	}
+	t.Run("a drop that leaves gid 0 is refused", func(t *testing.T) {
+		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: 300}}
+		if err := r.checkPodUID(resolveCredential(box, &runtimev1.Container{})); !errors.Is(err, supervisor.ErrPodGroupRefused) {
+			t.Errorf("err = %v, want ErrPodGroupRefused", err)
+		}
+	})
+	t.Run("no drop is not judged", func(t *testing.T) {
+		box := &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{FsGroup: 20}}
+		cred := resolveCredential(box, &runtimev1.Container{})
+		if cred.Drop {
+			t.Fatalf("fixture: cred = %+v, want no drop", cred)
+		}
+		if err := r.checkPodUID(cred); err != nil {
+			t.Errorf("no drop: %v", err)
+		}
+	})
 }
 
 // testService is the service user the pod-identity tests pin: uid 250, the
