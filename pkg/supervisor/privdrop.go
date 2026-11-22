@@ -200,20 +200,27 @@ var NobodyGID = sync.OnceValue(func() int {
 // process in a group a pod may not hold (CheckPodGroups).
 var ErrPodGroupRefused = errors.New("supervisor: pod group refused")
 
-// podNeverGids are the groups a dropped pod never holds, whatever asked for
-// them: membership in each is a privilege on any macOS host.
-var podNeverGids = map[int]string{
-	0:  "wheel",
-	20: "staff",
-	80: "admin",
+// podNeverGid names the group gid is when a dropped pod never holds it,
+// whatever asked for it: wheel (0), or one of fsGroupNeverGids (daemon, kmem,
+// sys, tty, operator, procview, procmod, staff, admin, _developer).
+// Membership in each is a privilege on any macOS host. The fsGroup list is
+// the one source, so a group added to it is refused as a primary gid and as
+// every supplemental group too.
+func podNeverGid(gid int) (string, bool) {
+	if gid == 0 {
+		return "wheel", true
+	}
+	name, ok := fsGroupNeverGids[gid]
+	return name, ok
 }
 
 // CheckPodGroups refuses, with ErrPodGroupRefused, a drop whose primary gid or
-// any supplemental group (runAsGroup and fsGroup among them) is wheel (0),
-// staff (20) or admin (80), svc's primary gid when svc is Known, negative,
-// LoginUIDFloor or above, or outside the gid_t range. The range is checked on
-// the int, before the drop narrows it to a 32-bit gid_t, so a value that
-// would wrap onto a refused gid is refused as itself.
+// any supplemental group (runAsGroup and fsGroup among them) is wheel (0) or
+// one of the system groups fsGroupNeverGids names (podNeverGid), svc's
+// primary gid when svc is Known, negative, LoginUIDFloor or above, or outside
+// the gid_t range. The range is checked on the int, before the drop narrows
+// it to a 32-bit gid_t, so a value that would wrap onto a refused gid is
+// refused as itself.
 //
 // NobodyGID is allowed wherever it appears: it is the group a pod with a
 // user and no group drops to, and it owns nothing a pod should reach.
@@ -241,7 +248,7 @@ func (c Credential) CheckPodGroups(svc ServiceIdentity, fsGroupAdmitted []int) e
 		case svc.Known && gid == svc.GID:
 			return fmt.Errorf("%w: %s %d is the service user %s's primary group", ErrPodGroupRefused, what, gid, ServiceUser)
 		}
-		if name, ok := podNeverGids[gid]; ok {
+		if name, ok := podNeverGid(gid); ok {
 			return fmt.Errorf("%w: %s %d is %s", ErrPodGroupRefused, what, gid, name)
 		}
 		if gid == NobodyGID() {

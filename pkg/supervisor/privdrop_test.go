@@ -876,12 +876,14 @@ var testService = ServiceIdentity{UID: 250, GID: 250, Known: true}
 
 // TestRunLaunchSequenceRefusesPodGroups pins the group half of the pod-only
 // rule at spawn time: a drop whose primary gid or any supplemental group is
-// wheel, staff, admin, the service user's primary gid, negative, 501 or above,
-// or past the gid_t range is refused before any step runs (a value that would
-// wrap onto staff included), and a drop to gids 1 to 500 otherwise runs. A
-// credential with no drop is never judged.
+// wheel, a system group fsGroupNeverGids names (daemon, kmem, sys, tty,
+// operator, procview, procmod, staff, admin, _developer), the service user's
+// primary gid, negative, 501 or above, or past the gid_t range is refused
+// before any step runs (a value that would wrap onto staff included), and a
+// drop to the other gids up to 500 runs. A credential with no drop is never
+// judged.
 func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
-	refused := []int{0, 20, 80, testService.GID, -1, 501, 502, 999, math.MaxInt32 + 1, math.MaxUint32 + 1, 1<<32 + 20}
+	refused := []int{0, 1, 2, 3, 4, 5, 8, 9, 20, 80, 204, testService.GID, -1, 501, 502, 999, math.MaxInt32 + 1, math.MaxUint32 + 1, 1<<32 + 20}
 	for _, gid := range refused {
 		for name, cred := range map[string]Credential{
 			"primary gid":        {UID: 300, GID: gid, Groups: []int{300}, Drop: true},
@@ -899,7 +901,7 @@ func TestRunLaunchSequenceRefusesPodGroups(t *testing.T) {
 			})
 		}
 	}
-	for _, gid := range []int{1, 300, 500} {
+	for _, gid := range []int{300, 500} {
 		t.Run(fmt.Sprintf("gid %d allowed", gid), func(t *testing.T) {
 			cred := Credential{UID: 300, GID: gid, Groups: []int{gid, 400}, Drop: true}
 			if _, err := RunLaunchSequence(&recordingSeam{}, LaunchSpec{Cred: cred, Service: testService}, 0); err != nil {

@@ -297,9 +297,10 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 
 // TestPodGroupsRefused pins the group half of the pod-only rule before a
 // command is wrapped: a drop whose runAsGroup (container or pod), box gid or
-// fsGroup is wheel, staff, admin, the service user's primary gid, 501 or above
-// or past the gid_t range is refused, read from the int64 field as sent; a
-// pod with gids 1 to 500 otherwise is allowed. A pod with no drop is not
+// fsGroup is staff, admin, a system group such as operator (5), procmod (9)
+// or _developer (204), the service user's primary gid, 501 or above or past
+// the gid_t range is refused, read from the int64 field as sent; a pod with
+// the other gids up to 500 (300, 400) is allowed. A pod with no drop is not
 // judged on the groups it would have asked for.
 func TestPodGroupsRefused(t *testing.T) {
 	r := &Runtime{service: testService}
@@ -315,7 +316,7 @@ func TestPodGroupsRefused(t *testing.T) {
 		},
 	}
 	for name, src := range srcs {
-		for _, gid := range []int64{20, 80, int64(testService.GID), 501, 999, math.MaxUint32 + 1, 1<<32 + 20} {
+		for _, gid := range []int64{5, 9, 20, 80, 204, int64(testService.GID), 501, 999, math.MaxUint32 + 1, 1<<32 + 20} {
 			t.Run(fmt.Sprintf("%s %d refused", name, gid), func(t *testing.T) {
 				box, c := src(gid)
 				if err := r.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodGroupRefused) {
@@ -323,14 +324,16 @@ func TestPodGroupsRefused(t *testing.T) {
 				}
 			})
 		}
-		t.Run(name+" 400 allowed", func(t *testing.T) {
-			box, c := src(400)
-			if err := r.checkPodUID(resolveCredential(box, c)); err != nil {
-				t.Errorf("gid 400: %v", err)
-			}
-		})
+		for _, gid := range []int64{300, 400} {
+			t.Run(fmt.Sprintf("%s %d allowed", name, gid), func(t *testing.T) {
+				box, c := src(gid)
+				if err := r.checkPodUID(resolveCredential(box, c)); err != nil {
+					t.Errorf("gid %d: %v", gid, err)
+				}
+			})
+		}
 	}
-	for _, gid := range []uint32{20, 80, 501} {
+	for _, gid := range []uint32{5, 204, 20, 80, 501} {
 		t.Run(fmt.Sprintf("box gid %d refused", gid), func(t *testing.T) {
 			box := &runtimev1.PodBox{Uid: 300, Gid: gid}
 			if err := r.checkPodUID(resolveCredential(box, &runtimev1.Container{})); !errors.Is(err, supervisor.ErrPodGroupRefused) {

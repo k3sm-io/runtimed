@@ -73,15 +73,16 @@ const fsGroupMinGid = 1000
 // whose membership is a privilege on any macOS host (wheel is refused with
 // every gid <= 0).
 var fsGroupNeverGids = map[int]string{
-	1:  "daemon",
-	2:  "kmem",
-	3:  "sys",
-	4:  "tty",
-	5:  "operator",
-	8:  "procview",
-	9:  "procmod",
-	20: "staff",
-	80: "admin",
+	1:   "daemon",
+	2:   "kmem",
+	3:   "sys",
+	4:   "tty",
+	5:   "operator",
+	8:   "procview",
+	9:   "procmod",
+	20:  "staff",
+	80:  "admin",
+	204: "_developer",
 }
 
 // FSGroupGidAllowed says whether a pod may be given gid as its fsGroup: it
