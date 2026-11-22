@@ -359,6 +359,11 @@ type Runtime struct {
 	runtimev1.UnimplementedRuntimeServer
 
 	cfg Config
+	// service is the service user as New resolved it, and serviceErr the
+	// lookup's failure, on which every drop is refused (checkPodUID).
+	// Read-only after New.
+	service    supervisor.ServiceIdentity
+	serviceErr error
 	// userDirs is the node user's shared Darwin temp and cache trees the
 	// per-pod user dir links live in (userdirs.go); zero means off. Set once by
 	// New, read-only after.
@@ -917,6 +922,10 @@ type Deps struct {
 	// holder on the first call, so the release is ordered after the wait began
 	// by an event rather than by a sleep. Nil in production.
 	rootLockBusy func()
+	// lookupService resolves the service user, whose uid no pod may drop to
+	// (supervisor.Credential.CheckPodUID). Nil selects
+	// supervisor.LookupServiceIdentity; tests pin an identity.
+	lookupService func() (supervisor.ServiceIdentity, error)
 }
 
 // New constructs a Runtime from cfg and deps, filling production defaults for any
@@ -1271,8 +1280,19 @@ func New(cfg Config, deps Deps) (*Runtime, error) {
 		workVolume = ""
 	}
 
+	lookupService := deps.lookupService
+	if lookupService == nil {
+		lookupService = supervisor.LookupServiceIdentity
+	}
+	service, serviceErr := lookupService()
+	if serviceErr != nil {
+		log.Warn("service user unknown: every pod privilege drop is refused", "user", supervisor.ServiceUser, "err", serviceErr)
+	}
+
 	rt := &Runtime{
 		cfg:            cfg,
+		service:        service,
+		serviceErr:     serviceErr,
 		workVolume:     workVolume,
 		userDirs:       resolveDarwinUserDirs(userDirsProbe, log),
 		home:           daemonHome(cfg.Root),

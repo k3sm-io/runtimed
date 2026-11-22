@@ -831,22 +831,27 @@ func TestRunLaunchSequenceRefusesPodUID(t *testing.T) {
 		name    string
 		cred    Credential
 		euid    int
+		svc     ServiceIdentity
 		refused bool
 	}{
-		{"drop to 501", Credential{UID: 501, GID: 20, Drop: true}, 0, true},
-		{"drop to 502", Credential{UID: 502, GID: 20, Drop: true}, 0, true},
-		{"drop to 2147483647", Credential{UID: 2147483647, GID: 20, Drop: true}, 0, true},
-		{"drop to a negative uid", Credential{UID: -1, GID: 20, Drop: true}, 0, true},
-		{"drop leaves uid 0", Credential{UID: 0, GID: 20, Drop: true}, 0, true},
-		{"no drop at euid 501 (rootless)", Credential{}, 501, false},
-		{"no drop at euid 2147483647", Credential{}, 2147483647, false},
-		{"no drop at euid 0 (root daemon)", Credential{}, 0, false},
-		{"drop to 250", Credential{UID: 250, GID: 250, Drop: true}, 0, false},
-		{"no drop at euid 250", Credential{}, 250, false},
+		{"drop to 501", Credential{UID: 501, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to 502", Credential{UID: 502, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to 2147483647", Credential{UID: 2147483647, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to a negative uid", Credential{UID: -1, GID: 300, Drop: true}, 0, testService, true},
+		{"drop leaves uid 0", Credential{UID: 0, GID: 300, Drop: true}, 0, testService, true},
+		{"drop to the service uid", Credential{UID: testService.UID, GID: 300, Drop: true}, 0, testService, true},
+		{"no drop at euid 501 (rootless)", Credential{}, 501, testService, false},
+		{"no drop at euid 2147483647", Credential{}, 2147483647, testService, false},
+		{"no drop at euid 0 (root daemon)", Credential{}, 0, testService, false},
+		{"no drop at the service euid", Credential{}, testService.UID, testService, false},
+		{"drop to 300", Credential{UID: 300, GID: 300, Drop: true}, 0, testService, false},
+		{"drop to 500 (the last allowed uid)", Credential{UID: 500, GID: 300, Drop: true}, 0, testService, false},
+		{"drop to 1 (a system role uid, the stated residual)", Credential{UID: 1, GID: 300, Drop: true}, 0, testService, false},
+		{"drop to 250 on a host with no service user", Credential{UID: 250, GID: 300, Drop: true}, 0, ServiceIdentity{}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			seam := &recordingSeam{}
-			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: tc.cred}, tc.euid)
+			_, err := RunLaunchSequence(seam, LaunchSpec{Cred: tc.cred, Service: tc.svc}, tc.euid)
 			if !tc.refused {
 				if err != nil {
 					t.Fatalf("RunLaunchSequence: %v", err)
@@ -862,3 +867,7 @@ func TestRunLaunchSequenceRefusesPodUID(t *testing.T) {
 		})
 	}
 }
+
+// testService is the service user the pod-identity tests pin: uid 250, the
+// shipped _k3sm uid, with a primary gid of its own.
+var testService = ServiceIdentity{UID: 250, GID: 250, Known: true}

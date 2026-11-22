@@ -35,12 +35,13 @@ type dropSeam interface {
 // the pod user), then setgid → initgroups → setuid. A credential without a drop
 // — every pod of the shipped unprivileged daemon — changes nothing; a drop is
 // refused unless euid is 0 (supervisor.Credential.Validate), exactly as the
-// launch sequence refuses it.
-func dropShim(seam dropSeam, chown func(path string, uid, gid int) error, cred supervisor.Credential, euid int, paths ...string) error {
+// launch sequence refuses it, and so is a drop CheckPodUID refuses (svc is the
+// service user as the shim resolved it).
+func dropShim(seam dropSeam, chown func(path string, uid, gid int) error, cred supervisor.Credential, euid int, svc supervisor.ServiceIdentity, paths ...string) error {
 	if err := cred.Validate(euid); err != nil {
 		return err
 	}
-	if err := cred.CheckPodUID(); err != nil {
+	if err := cred.CheckPodUID(svc); err != nil {
 		return err
 	}
 	if !cred.Drop {

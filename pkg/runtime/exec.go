@@ -116,7 +116,7 @@ func (r *Runtime) Exec(stream runtimev1.Runtime_ExecServer) error {
 		c = &runtimev1.Container{}
 	}
 	cred := resolveCredential(p.box, c)
-	if err := checkPodUID(cred); err != nil {
+	if err := r.checkPodUID(cred); err != nil {
 		return status.Errorf(codes.PermissionDenied, "exec: %v", err)
 	}
 

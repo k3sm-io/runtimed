@@ -188,18 +188,20 @@ func TestResolveRlimitPlan_UnknownTypeWarnsAndSkips(t *testing.T) {
 // TestPodUIDInLoginRangeRefused pins the second keystore layer: a native pod
 // whose drop target is a uid of 501 or above is refused before the command is
 // wrapped, whichever field asked for the uid, and so is a drop that
-// leaves the process at uid 0 (runAsGroup alone). uid 250, the service user,
-// is the control. The spawn-time half is
+// leaves the process at uid 0 (runAsGroup alone), and so is a drop to the
+// service user's uid (testService), or any drop when the service user could not
+// be resolved. uids 300 and 500 are the controls. The spawn-time half is
 // supervisor.TestRunLaunchSequenceRefusesPodUID. With no drop the inherited euid
 // is allowed, root and a rootless server's login uid alike.
 func TestPodUIDInLoginRangeRefused(t *testing.T) {
+	r := &Runtime{service: testService}
 	type src struct {
 		name string
 		box  func(uid int64) (*runtimev1.PodBox, *runtimev1.Container)
 	}
 	srcs := []src{
 		{"container runAsUser", func(uid int64) (*runtimev1.PodBox, *runtimev1.Container) {
-			return &runtimev1.PodBox{}, &runtimev1.Container{SecurityContext: &runtimev1.SecurityContext{RunAsUser: uid, RunAsGroup: 20}}
+			return &runtimev1.PodBox{}, &runtimev1.Container{SecurityContext: &runtimev1.SecurityContext{RunAsUser: uid, RunAsGroup: 300}}
 		}},
 		{"pod runAsUser", func(uid int64) (*runtimev1.PodBox, *runtimev1.Container) {
 			return &runtimev1.PodBox{PodSecurityContext: &runtimev1.PodSecurityContext{RunAsUser: uid}}, &runtimev1.Container{}
@@ -213,15 +215,30 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 			t.Run(s.name+"/refused", func(t *testing.T) {
 				box, c := s.box(uid)
 				cred := resolveCredential(box, c)
-				if err := checkPodUID(cred); !errors.Is(err, supervisor.ErrPodUIDRefused) {
+				if err := r.checkPodUID(cred); !errors.Is(err, supervisor.ErrPodUIDRefused) {
 					t.Errorf("uid %d: err = %v, want ErrPodUIDRefused", uid, err)
 				}
 			})
 		}
-		t.Run(s.name+"/service user allowed", func(t *testing.T) {
-			box, c := s.box(250)
-			if err := checkPodUID(resolveCredential(box, c)); err != nil {
-				t.Errorf("uid 250: %v", err)
+		t.Run(s.name+"/service user refused", func(t *testing.T) {
+			box, c := s.box(int64(testService.UID))
+			if err := r.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodUIDRefused) {
+				t.Errorf("uid %d: err = %v, want ErrPodUIDRefused", testService.UID, err)
+			}
+		})
+		for _, uid := range []int64{300, 500} {
+			t.Run(fmt.Sprintf("%s/uid %d allowed", s.name, uid), func(t *testing.T) {
+				box, c := s.box(uid)
+				if err := r.checkPodUID(resolveCredential(box, c)); err != nil {
+					t.Errorf("uid %d: %v", uid, err)
+				}
+			})
+		}
+		t.Run(s.name+"/unresolved service user refuses every drop", func(t *testing.T) {
+			box, c := s.box(300)
+			unknown := &Runtime{serviceErr: errors.New("directory services down")}
+			if err := unknown.checkPodUID(resolveCredential(box, c)); !errors.Is(err, supervisor.ErrPodUIDRefused) {
+				t.Errorf("err = %v, want ErrPodUIDRefused", err)
 			}
 		})
 	}
@@ -234,7 +251,7 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 			if !cred.Drop || cred.UID != 0 {
 				t.Fatalf("fixture: cred = %+v, want a drop to uid 0", cred)
 			}
-			if err := checkPodUID(cred); !errors.Is(err, supervisor.ErrPodUIDRefused) {
+			if err := r.checkPodUID(cred); !errors.Is(err, supervisor.ErrPodUIDRefused) {
 				t.Errorf("err = %v, want ErrPodUIDRefused", err)
 			}
 		})
@@ -247,9 +264,13 @@ func TestPodUIDInLoginRangeRefused(t *testing.T) {
 			if cred.Drop {
 				t.Fatalf("fixture: cred = %+v, want no drop", cred)
 			}
-			if err := cred.CheckPodUID(); err != nil {
+			if err := r.checkPodUID(cred); err != nil {
 				t.Errorf("euid %d: %v", euid, err)
 			}
 		})
 	}
 }
+
+// testService is the service user the pod-identity tests pin: uid 250, the
+// shipped _k3sm uid, with a primary gid of its own.
+var testService = supervisor.ServiceIdentity{UID: 250, GID: 250, Known: true}

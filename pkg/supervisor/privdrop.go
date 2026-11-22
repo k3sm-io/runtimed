@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/user"
 	"strconv"
 	"strings"
 
@@ -87,24 +88,69 @@ func (c Credential) Validate(euid int) error {
 // keychain and sockets.
 const LoginUIDFloor = 501
 
+// ServiceUser is the account an installed k3sm node runs its service as
+// (k3sm's defaults.ServiceUser). It owns the keystore, so a pod never drops to
+// its uid (CheckPodUID).
+const ServiceUser = "_k3sm"
+
+// ServiceIdentity is the ServiceUser account as this host resolves it. Known is
+// false on a host with no such account, where nothing owns a keystore as it.
+type ServiceIdentity struct {
+	UID   int
+	GID   int
+	Known bool
+}
+
+// LookupServiceIdentity resolves ServiceUser through the system's directory
+// services (getpwnam), so an account that lives only there counts. A host with
+// no such account returns the zero ServiceIdentity and no error; any other
+// failure is returned, and a caller that drops refuses the drop on it.
+func LookupServiceIdentity() (ServiceIdentity, error) {
+	u, err := user.Lookup(ServiceUser)
+	if err != nil {
+		var unknown user.UnknownUserError
+		if errors.As(err, &unknown) {
+			return ServiceIdentity{}, nil
+		}
+		return ServiceIdentity{}, fmt.Errorf("look up the service user %s: %w", ServiceUser, err)
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return ServiceIdentity{}, fmt.Errorf("service user %s: uid %q: %w", ServiceUser, u.Uid, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return ServiceIdentity{}, fmt.Errorf("service user %s: gid %q: %w", ServiceUser, u.Gid, err)
+	}
+	return ServiceIdentity{UID: uid, GID: gid, Known: true}, nil
+}
+
 // ErrPodUIDRefused reports a pod credential whose drop target a pod may not
-// hold: one in the login range (LoginUIDFloor and above), a negative one, or
-// uid 0 (a drop that leaves the process root).
+// hold: one in the login range (LoginUIDFloor and above), a negative one, uid 0
+// (a drop that leaves the process root), or the service user's uid.
 var ErrPodUIDRefused = errors.New("supervisor: pod uid refused")
 
 // CheckPodUID refuses, with ErrPodUIDRefused, a drop whose target uid is in the
 // login range or negative, whatever the pod's runAsUser or runAsGroup asked
-// for, and a drop that leaves the process at uid 0 (a runAsGroup with no
-// runAsUser on a root daemon), which counts as no drop.
+// for; a drop that leaves the process at uid 0 (a runAsGroup with no
+// runAsUser on a root daemon), which counts as no drop; and a drop to svc's
+// uid when svc is Known, since the service user owns the keystore and its
+// socket and a process at that uid passes the keystore's peer check.
+//
+// The system role uids 1 to 500, other than the service user's, stay allowed.
+// That is a stated residual: such a uid may own files or sockets of its own
+// role on the host, and what keeps a pod at one of them off those is the
+// pod's Seatbelt profile, not this check.
 //
 // A credential with no drop is always allowed: the pod inherits the
 // daemon's own uid, root, the service user, or a rootless developer server's
 // login uid, and so holds nothing that uid does not already hold. Keeping a
-// pod off the keystore under a rootless server is the keystore listener's
-// rule (it starts only under the service uid), not this one. The runtime
-// checks a credential before it wraps a command, and RunLaunchSequence and
-// the resident shim's drop check it again in the process that drops.
-func (c Credential) CheckPodUID() error {
+// pod off the keystore under a no-drop daemon is the Seatbelt profile's
+// keystore denies and the keystore listener's rule (it starts only under the
+// service uid), not this one. The runtime checks a credential before it wraps
+// a command, and RunLaunchSequence and the resident shim's drop check it
+// again in the process that drops.
+func (c Credential) CheckPodUID(svc ServiceIdentity) error {
 	if !c.Drop {
 		return nil
 	}
@@ -115,6 +161,8 @@ func (c Credential) CheckPodUID() error {
 		return fmt.Errorf("%w: uid %d is negative", ErrPodUIDRefused, c.UID)
 	case c.UID >= LoginUIDFloor:
 		return fmt.Errorf("%w: uid %d is in the login range (%d and above)", ErrPodUIDRefused, c.UID, LoginUIDFloor)
+	case svc.Known && c.UID == svc.UID:
+		return fmt.Errorf("%w: uid %d is the service user %s, which owns the keystore", ErrPodUIDRefused, c.UID, ServiceUser)
 	}
 	return nil
 }
@@ -318,7 +366,7 @@ func RunLaunchSequence(seam LaunchSeam, spec LaunchSpec, euid int) ([]LaunchStep
 	if err := cred.Validate(euid); err != nil {
 		return done, err
 	}
-	if err := cred.CheckPodUID(); err != nil {
+	if err := cred.CheckPodUID(spec.Service); err != nil {
 		return done, err
 	}
 	// rlimits FIRST — before the drop. Raising a hard limit needs euid 0, and the

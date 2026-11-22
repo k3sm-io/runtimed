@@ -236,7 +236,13 @@ func bringUp(spec supervisor.ShimSpec) (*shimServer, int, error) {
 		_, _, _ = supervisor.KqueueReaper{}.WaitExit(context.Background(), child)
 		return nil, code, err
 	}
-	if err := dropShim(supervisor.UnixDropper{}, os.Chown, cred, os.Geteuid(), spec.Dir, spec.LogPath); err != nil {
+	var svc supervisor.ServiceIdentity
+	if cred.Drop {
+		if svc, err = supervisor.LookupServiceIdentity(); err != nil {
+			return abort(supervisor.ShimExitSetup, fmt.Errorf("drop the shim to the pod credential: %w", err))
+		}
+	}
+	if err := dropShim(supervisor.UnixDropper{}, os.Chown, cred, os.Geteuid(), svc, spec.Dir, spec.LogPath); err != nil {
 		return abort(supervisor.ShimExitSetup, fmt.Errorf("drop the shim to the pod credential: %w", err))
 	}
 	if err := confine(string(shimProfile)); err != nil {

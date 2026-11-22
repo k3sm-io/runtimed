@@ -870,6 +870,11 @@ func testDeps(t *testing.T, d Deps) Deps {
 	if d.Network == nil {
 		d.Network = supervisor.NodeNetwork{IP: "10.1.2.3"}
 	}
+	// The service user is pinned, not looked up: whether this host has a
+	// _k3sm account must not decide which drops a test may make.
+	if d.lookupService == nil {
+		d.lookupService = func() (supervisor.ServiceIdentity, error) { return testService, nil }
+	}
 	// The per-pod Darwin user dirs default OFF in unit tests: the real probe
 	// names this user's shared /var/folders trees, and a pod test would make
 	// links there. userdirs_test.go opts in with temp trees (fakeUserDirs).
@@ -1696,7 +1701,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 				{Name: "cfg", MountPath: "/etc/cfg"},
 				{Name: "sec", MountPath: "/etc/sec", ReadOnly: true},
 			},
-			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 250, RunAsGroup: 20},
+			SecurityContext: &runtimev1.SecurityContext{RunAsUser: 300, RunAsGroup: 300},
 		}},
 	}
 	// fsGroup chown is exercised only when the test process has a real (>0)
@@ -1734,7 +1739,7 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	// (3) the run-as identity reached the spawned exec-shim argv (fakeBackend
 	// mirrors the shim arg shape [shim, uid, gid, groups, profile, argv...]).
 	argv := sp.specs[len(sp.specs)-1].Argv
-	if len(argv) < 4 || argv[1] != "250" || argv[2] != "20" {
+	if len(argv) < 4 || argv[1] != "300" || argv[2] != "300" {
 		t.Errorf("drop credential not in spawn argv: %v", argv)
 	}
 
@@ -1744,8 +1749,8 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 	if len(cs) != 1 || len(cs[0].GetVolumeMounts()) != 2 {
 		t.Fatalf("container status volume_mounts mirror missing: %+v", cs)
 	}
-	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 250 || u.GetGid() != 20 {
-		t.Errorf("container status user mirror = %+v, want uid 250 gid 20", u)
+	if u := cs[0].GetUser().GetLinux(); u.GetUid() != 300 || u.GetGid() != 300 {
+		t.Errorf("container status user mirror = %+v, want uid 300 gid 300", u)
 	}
 
 	w.release(1001)

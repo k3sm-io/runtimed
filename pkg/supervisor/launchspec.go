@@ -50,6 +50,10 @@ type LaunchSpec struct {
 	// reset). See docs/resources.md for the contention-policy rationale and the
 	// cooperative (non-enforcing) nature of the band.
 	BgQoS bool
+	// Service is the service user as the dropping process resolved it
+	// (LookupServiceIdentity). It is not carried on the shim argv: the shim
+	// resolves it itself before a drop, and CheckPodUID refuses a drop to it.
+	Service ServiceIdentity
 }
 
 // Shim argv token vocabulary. The rlimit and qos tokens are single fixed-position

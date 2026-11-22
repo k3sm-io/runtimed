@@ -27,6 +27,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/runtimed/pkg/supervisor"
 	"k3sm.io/runtimed/pkg/sysvipc"
 )
 
@@ -108,7 +109,7 @@ type sysvSweeper struct {
 
 // sysvSweepUser is the only account whose objects the sweeper touches: the
 // installed daemon's service user (k3sm's defaults.ServiceUser).
-const sysvSweepUser = "_k3sm"
+const sysvSweepUser = supervisor.ServiceUser
 
 // sysvSweepGrace is how long an object must stand unchanged and unused before
 // it is removed.
