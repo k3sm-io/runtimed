@@ -532,7 +532,7 @@ func TestShimProfileKeepsTheKeystoreDeniesLast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ShimProfile: %v", err)
 	}
-	stanza := keystoreDenyStanza(keystoreRoots(root, root))
+	stanza := keystoreDenyStanza(keystoreRoots(root, root, ""))
 	if !strings.HasSuffix(shim, stanza) {
 		t.Errorf("the shim profile does not end with the keystore denies:\n%s", shim[len(pod):])
 	}

@@ -490,9 +490,16 @@ type Posture struct {
 	// firmlink forms, and validateExtraPaths refuses any caller-supplied path at
 	// or under it, IN ADDITION to every other deny. A value that renders exactly
 	// the forms of a tree already denied (one of the <WorkDir> or DataRoot
-	// children, the default server and agent leaves) adds no line, so a node whose
-	// work dir has a default leaf keeps its profile byte for byte. A value outside
-	// the data root is denied as its own tree all the same.
+	// children, the default server and agent leaves) adds no protected-tier
+	// line. A value outside the data root is denied as its own tree all the
+	// same.
+	//
+	// The keystore denies follow it too, as they follow DataRoot: every name
+	// under it beginning keystorepaths.DataRootPrefix is denied read, stat,
+	// existence test and write as the profile's last rule, so a keystore name
+	// there answers EPERM whether or not it exists. The whole-tree deny alone
+	// answers ENOENT for an absent name. These lines are added for a default
+	// leaf too, so a set state dir always changes the keystore stanza.
 	//
 	// Empty adds nothing: the profile is the one the node had before this field
 	// existed.
@@ -734,7 +741,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	for _, sh := range opts.HostShares {
 		sharePaths = append(sharePaths, sh.Path)
 	}
-	if err := validateKeystoreReach(keystoreRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot),
+	if err := validateKeystoreReach(keystoreRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot, opts.Posture.StateDir),
 		sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths,
 		sharePaths, opts.ExposePaths, opts.ArtifactViewPaths, []string{sp.GetXcodeToolchainDir()}); err != nil {
 		return "", err
@@ -1139,7 +1146,7 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	}
 
 	// --- keystore denies (the last rule: nothing below can re-open them) ---
-	b.WriteString(keystoreDenyStanza(keystoreRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot)))
+	b.WriteString(keystoreDenyStanza(keystoreRoots(filepath.Dir(podsRoot), opts.Posture.DataRoot, opts.Posture.StateDir)))
 
 	out := b.String()
 	// self-check the network grant against what sp asked for, before the profile
@@ -1305,8 +1312,8 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	// The control-plane secrets' real location, under the same two rules: the
 	// <WorkDir> denies above stay, and a tree already denied adds nothing. That
 	// covers a data root equal to <WorkDir> and a state dir with a default leaf,
-	// so both render the profile the node had before (a changed profile refuses
-	// every re-attach as drift). The list is DataRootDenyTrees, the one the
+	// so neither adds a protected-tier line (a state dir still adds its keystore
+	// denies to the closing stanza; see Posture.StateDir). The list is DataRootDenyTrees, the one the
 	// caller's resolved-path check walks.
 	dataRoot, err := resolveDataRoot(p.DataRoot, podsRoot)
 	if err != nil {

@@ -35,14 +35,25 @@ import (
 const dataVolumeAlias = "/System/Volumes/Data"
 
 // keystoreRoots returns the directories whose keystore names every pod profile
-// denies: the work-dir, then the data root when it is set and differs. The
-// work-dir is always among them for the reason the server and agent denies are:
-// on a node whose data root is its work-dir, an unset Posture.DataRoot still
-// gets the denies.
-func keystoreRoots(workDir, dataRoot string) []string {
+// denies: the work-dir, then the data root and the role's state dir
+// (Posture.StateDir) when each is set and not already listed. The work-dir is
+// always among them for the reason the server and agent denies are: on a node
+// whose data root is its work-dir, an unset Posture.DataRoot still gets the
+// denies.
+//
+// The state dir is among them because the role keeps keystore- files there
+// too (the delivery state record), and its whole-tree deny is not enough: a
+// file-read* deny answers EPERM for a present name but ENOENT for an absent
+// one, and does not cover the access(2) F_OK test at all (measured: OK on a
+// present name), so a pod could tell which keystore names exist. The stanza's
+// file-test-existence and metadata denies answer EPERM either way
+// (TestWorkDirKeystoreDenyHidesExistence).
+func keystoreRoots(workDir, dataRoot, stateDir string) []string {
 	roots := []string{workDir}
-	if dataRoot != "" && dataRoot != workDir {
-		roots = append(roots, dataRoot)
+	for _, r := range []string{dataRoot, stateDir} {
+		if r != "" && !slices.Contains(roots, r) {
+			roots = append(roots, r)
+		}
 	}
 	return roots
 }
@@ -143,10 +154,11 @@ const keystoreStanzaHead = ";; KEYSTORE: every data-root name beginning " + keys
 //
 // file-test-existence closes one existence oracle, the access(2) F_OK check,
 // which file-read* does not cover (measured: access succeeded under a
-// file-read* file-read-metadata deny). It does not hide that a keystore name
-// exists: a pod that can list the data root reads the names there, and the
-// stanza does not make any other answer the same for a present name and an
-// absent one.
+// file-read* file-read-metadata deny). With it, a read, a stat and an
+// existence test of a keystore name answer EPERM whether or not the name
+// exists (measured in the state dir, TestWorkDirKeystoreDenyHidesExistence).
+// It does not hide the names from a listing: a pod that can list a root (a
+// data root it holds a read grant on) reads the names there.
 //
 // Every profile producer emits it as its LAST rule: Generate after the pod
 // profile, ShimProfile again after the shim grant (keystoreStanzaOf). Seatbelt is
