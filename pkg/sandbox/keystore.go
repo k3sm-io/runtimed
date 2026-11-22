@@ -170,10 +170,17 @@ const keystoreStanzaHead = ";; KEYSTORE: every data-root name beginning " + keys
 //
 // file-test-existence closes one existence oracle, the access(2) F_OK check,
 // which file-read* does not cover (measured: access succeeded under a
-// file-read* file-read-metadata deny). With it, a read, a stat and an
-// existence test of a keystore name answer EPERM whether or not the name
-// exists (measured in the state dir, TestWorkDirKeystoreDenyHidesExistence).
-// It does not hide the names from a listing: a pod that can list a root (a
+// file-read* file-read-metadata deny). With it, a read, a stat, an existence
+// test and every write of a keystore name answer EPERM whether or not the
+// name exists (measured in the state dir,
+// TestWorkDirKeystoreDenyHidesExistence).
+//
+// It hides keystore-named entries only. Every other name in a root it covers
+// is outside it: in the state dir the token, tls, db and kubeconfig entries
+// meet only the whole-tree deny, which answers EPERM (or OK, for the access(2)
+// F_OK test) for a present name and ENOENT for an absent one, so a pod can
+// still tell which of those exist. That gap is tracked separately. Nor does
+// the stanza hide the names from a listing: a pod that can list a root (a
 // data root it holds a read grant on) reads the names there.
 //
 // Every profile producer emits it as its LAST rule: Generate after the pod

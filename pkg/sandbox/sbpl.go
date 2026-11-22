@@ -498,8 +498,16 @@ type Posture struct {
 	// under it beginning keystorepaths.DataRootPrefix is denied read, stat,
 	// existence test and write as the profile's last rule, so a keystore name
 	// there answers EPERM whether or not it exists. The whole-tree deny alone
-	// answers ENOENT for an absent name. These lines are added for a default
-	// leaf too, so a set state dir always changes the keystore stanza.
+	// answers ENOENT for an absent name. A state dir that is one of the data
+	// root's server or agent leaves (under the work-dir when DataRoot is
+	// unset) adds no stanza line, since those leaves are keystore roots
+	// already; any other value adds its own.
+	//
+	// The stanza hides keystore-named entries only. The other names in the
+	// state dir (its token, tls, db and kubeconfig entries) meet only the
+	// whole-tree deny, which answers EPERM (or OK, for the access(2) F_OK
+	// test) for a present name and ENOENT for an absent one, so a pod can
+	// still tell which of them exist. That gap is tracked separately.
 	//
 	// Empty adds nothing: the profile is the one the node had before this field
 	// existed.
@@ -1312,9 +1320,10 @@ func resolvePosture(p Posture) (podsRoot string, workDirDenyRoots []string, prot
 	// The control-plane secrets' real location, under the same two rules: the
 	// <WorkDir> denies above stay, and a tree already denied adds nothing. That
 	// covers a data root equal to <WorkDir> and a state dir with a default leaf,
-	// so neither adds a protected-tier line (a state dir still adds its keystore
-	// denies to the closing stanza; see Posture.StateDir). The list is DataRootDenyTrees, the one the
-	// caller's resolved-path check walks.
+	// so both render the profile the node had before (a changed profile refuses
+	// every re-attach as drift; the keystore stanza dedupes the same way, see
+	// keystoreRoots). The list is DataRootDenyTrees, the one the caller's
+	// resolved-path check walks.
 	dataRoot, err := resolveDataRoot(p.DataRoot, podsRoot)
 	if err != nil {
 		return "", nil, nil, err
