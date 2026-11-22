@@ -135,13 +135,18 @@ func foldName(s string) string {
 const keystoreStanzaHead = ";; KEYSTORE: every data-root name beginning " + keystorepaths.DataRootPrefix + " and the whole\n"
 
 // keystoreDenyStanza renders the keystore denies for roots: file reads
-// (metadata included), an existence test (file-test-existence, the
-// access(2) F_OK check, which file-read* does not cover: measured, access
-// succeeded under a file-read* file-read-metadata deny), every file write (create, unlink and rename among them), a
-// hard link (file-link, which file-write* does not cover),
-// connect(2) to a unix socket and bind(2) of one, on every name under each root
-// that begins keystorepaths.DataRootPrefix and on the whole keystorepaths.RunDir tree, in
-// every keystoreForms spelling.
+// (metadata included), an existence test, every file write (create, unlink
+// and rename among them), a hard link (file-link, which file-write* does not
+// cover), connect(2) to a unix socket and bind(2) of one, on every name under
+// each root that begins keystorepaths.DataRootPrefix and on the whole
+// keystorepaths.RunDir tree, in every keystoreForms spelling.
+//
+// file-test-existence closes one existence oracle, the access(2) F_OK check,
+// which file-read* does not cover (measured: access succeeded under a
+// file-read* file-read-metadata deny). It does not hide that a keystore name
+// exists: a pod that can list the data root reads the names there, and the
+// stanza does not make any other answer the same for a present name and an
+// absent one.
 //
 // Every profile producer emits it as its LAST rule: Generate after the pod
 // profile, ShimProfile again after the shim grant (keystoreStanzaOf). Seatbelt is
