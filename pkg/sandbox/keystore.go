@@ -35,11 +35,14 @@ import (
 const dataVolumeAlias = "/System/Volumes/Data"
 
 // keystoreRoots returns the directories whose keystore names every pod profile
-// denies: the work-dir, then the data root and the role's state dir
-// (Posture.StateDir) when each is set and not already listed. The work-dir is
-// always among them for the reason the server and agent denies are: on a node
-// whose data root is its work-dir, an unset Posture.DataRoot still gets the
-// denies.
+// denies: the work-dir, the data root when set, the DataRootDenySubdirs leaves
+// of the data root (<data root>/server and <data root>/agent; under the
+// work-dir when the data root is unset), then the role's state dir
+// (Posture.StateDir) when set, each skipped when already listed. The work-dir
+// and its leaves stand in for an unset data root for the reason the server and
+// agent denies do: on a node whose data root is its work-dir, an unset
+// Posture.DataRoot still gets the denies, and the profile is the same as with
+// the work-dir named.
 //
 // The state dir is among them because the role keeps keystore- files there
 // too (the delivery state record), and its whole-tree deny is not enough: a
@@ -47,14 +50,27 @@ const dataVolumeAlias = "/System/Volumes/Data"
 // one, and does not cover the access(2) F_OK test at all (measured: OK on a
 // present name), so a pod could tell which keystore names exist. The stanza's
 // file-test-existence and metadata denies answer EPERM either way
-// (TestWorkDirKeystoreDenyHidesExistence).
+// (TestWorkDirKeystoreDenyHidesExistence). The leaves are among them for a
+// node that leaves Posture.StateDir unset: its state dir is one of them. They
+// come before the state dir so that a state dir naming a leaf, in any firmlink
+// spelling, renders the same stanza as an unset one. Only exact repeats are
+// skipped here; renderKeystoreStanza drops a spelling already rendered.
 func keystoreRoots(workDir, dataRoot, stateDir string) []string {
 	roots := []string{workDir}
-	for _, r := range []string{dataRoot, stateDir} {
+	add := func(r string) {
 		if r != "" && !slices.Contains(roots, r) {
 			roots = append(roots, r)
 		}
 	}
+	add(dataRoot)
+	leavesOf := dataRoot
+	if leavesOf == "" {
+		leavesOf = workDir
+	}
+	for _, sub := range DataRootDenySubdirs() {
+		add(filepath.Join(leavesOf, sub))
+	}
+	add(stateDir)
 	return roots
 }
 

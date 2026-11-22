@@ -803,3 +803,47 @@ func TestEmptyDataRootFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// TestKeystoreStanzaCoversTheDataRootLeaves pins the keystore roots of a node
+// that sets Posture.DataRoot and leaves Posture.StateDir unset: its state dir
+// is <data root>/server or <data root>/agent, so the stanza names both, in every
+// spelling, once each. A state dir that is one of those leaves, in either
+// firmlink spelling, renders the same stanza; one with another leaf adds its
+// own lines. The paths are literals so a renamed leaf fails here.
+func TestKeystoreStanzaCoversTheDataRootLeaves(t *testing.T) {
+	const (
+		workDir  = "/opt/k3sm-pods"
+		dataRoot = "/var/k3sm-data"
+	)
+	stanza := func(t *testing.T, stateDir string) string {
+		t.Helper()
+		out, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: workDir + "/pods/p1/rootfs"},
+			GenerateOptions{Posture: Posture{WorkDir: workDir, DataRoot: dataRoot, StateDir: stateDir}})
+		if err != nil {
+			t.Fatalf("Generate(state dir %q): %v", stateDir, err)
+		}
+		s, _, err := keystoreStanzaOf(out)
+		if err != nil {
+			t.Fatalf("keystoreStanzaOf(state dir %q): %v", stateDir, err)
+		}
+		return s
+	}
+	unset := stanza(t, "")
+	for _, root := range []string{workDir, dataRoot, dataRoot + "/server", dataRoot + "/agent"} {
+		for _, form := range keystoreForms(root) {
+			line := "(regex #\"" + keystorePrefixPattern(form) + "\")\n"
+			if n := strings.Count(unset, "  "+line); n != 1 {
+				t.Errorf("file deny for %s appears %d times, want 1:\n%s", form, n, unset)
+			}
+		}
+	}
+	for _, sd := range []string{dataRoot + "/server", dataRoot + "/agent", "/private" + dataRoot + "/server"} {
+		if got := stanza(t, sd); got != unset {
+			t.Errorf("state dir %s changed the stanza:\n--- unset ---\n%s\n--- set ---\n%s", sd, unset, got)
+		}
+	}
+	custom := stanza(t, dataRoot+"/cp")
+	if custom == unset || !strings.Contains(custom, "(subpath \""+dataRoot+"/cp/keystore-run\")") {
+		t.Errorf("state dir %s/cp added no keystore denies:\n%s", dataRoot, custom)
+	}
+}
