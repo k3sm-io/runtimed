@@ -653,7 +653,8 @@ func TestPodProfileDeniesProcessInfoAndSignalToOthers(t *testing.T) {
 // TestValidateRefusesKeystoreExtraPaths pins that a caller-supplied path naming
 // a keystore path is refused before a line is rendered, not only overridden by
 // the last-rule deny: extra read and write paths, the volume sources (read,
-// write and read-only), host shares and expose-paths, at or under a keystore-*
+// write and read-only), host shares, the Xcode toolchain dir, artifact views
+// and expose-paths, with ErrProtectedPath, at or under a keystore-*
 // name of the data root or the work dir, in every spelling and letter case.
 // The data root itself and a non-keystore sibling stay accepted.
 func TestValidateRefusesKeystoreExtraPaths(t *testing.T) {
@@ -711,9 +712,19 @@ func TestValidateRefusesKeystoreExtraPaths(t *testing.T) {
 				_, err := Generate(sp(), GenerateOptions{Posture: posture, HostShares: []HostShare{{Path: p, Socket: true}}})
 				return err
 			},
+			"xcode toolchain dir": func() error {
+				s := sp()
+				s.XcodeToolchainDir = p
+				_, err := Generate(s, GenerateOptions{Posture: posture})
+				return err
+			},
+			"artifact view": func() error {
+				_, err := Generate(sp(), GenerateOptions{Posture: posture, ArtifactViewPaths: []string{p}})
+				return err
+			},
 		} {
-			if err := gen(); err == nil {
-				t.Errorf("%s %s: accepted, want a refusal", name, p)
+			if err := gen(); !errors.Is(err, ErrProtectedPath) {
+				t.Errorf("%s %s: err = %v, want ErrProtectedPath", name, p, err)
 			}
 		}
 	}
