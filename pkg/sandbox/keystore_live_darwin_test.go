@@ -33,8 +33,10 @@ import (
 // the error, with its errno name when it has one. cdconnect chdirs to its path
 // and connects to the relative name in its third argument; link hard-links its
 // path to the third argument and rename renames it onto the third argument;
-// create makes a new file (O_CREAT|O_EXCL), mkdir a directory, unlink removes
-// a file and bind listens on a unix socket at the path.
+// create makes a new file (O_CREAT|O_EXCL), open opens one for writing,
+// creating it if absent (O_CREAT|O_WRONLY), symlink makes a symlink at the path
+// pointing at the third argument, readlink reads one, mkdir makes a directory,
+// unlink removes a file and bind listens on a unix socket at the path.
 const keystoreProbeGo = `package main
 
 import (
@@ -80,6 +82,15 @@ func main() {
 		if f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err == nil {
 			f.Close()
 		}
+	case "open":
+		var f *os.File
+		if f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			f.Close()
+		}
+	case "symlink":
+		err = os.Symlink(os.Args[3], path)
+	case "readlink":
+		_, err = os.Readlink(path)
 	case "mkdir":
 		err = syscall.Mkdir(path, 0o755)
 	case "rename":

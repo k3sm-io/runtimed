@@ -35,12 +35,20 @@ import (
 // stanza's file-test-existence deny, emitted for the work dir too, answers
 // EPERM either way.
 //
-// For a missing keystore-x and an existing keystore-y, read, stat and the
-// access(2) F_OK test must each answer exactly DENIED:EPERM, in every
-// spelling of the work dir, for a work dir with the default server leaf and
-// one with another leaf. Unsandboxed, the same probes answer ENOENT for
-// keystore-x and OK for keystore-y: the control that the two names do differ
-// and only the deny makes them look alike.
+// For a missing keystore-x and an existing keystore-y, every attempt must
+// answer exactly DENIED:EPERM, the same for both names: read, stat, the
+// access(2) F_OK test, open(O_CREAT|O_WRONLY), unlink, rename onto and away
+// from the name, a hard link from and onto it, a symlink at it and readlink.
+// Read, stat and the F_OK test also run on the folded spellings KEYSTORE-,
+// Keystore- and the Kelvin sign for k. Each runs in every spelling of the
+// work dir, for a work dir with the default server leaf and one with another
+// leaf, under the pod and the shim profile, and after each one the files are
+// checked unchanged from outside the sandbox.
+//
+// Unsandboxed, read, stat and the F_OK test answer ENOENT for keystore-x and
+// OK for keystore-y in every folded spelling: the control that the two names
+// do differ, that the folds name the real file, and that only the deny makes
+// them look alike.
 func TestWorkDirKeystoreDenyHidesExistence(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Skip("sandbox-exec not present")
@@ -100,8 +108,10 @@ func TestWorkDirKeystoreDenyHidesExistence(t *testing.T) {
 				if got := probe("", op, filepath.Join(r, "keystore-x")); !strings.HasPrefix(got, "ERR:ENOENT") {
 					t.Errorf("unsandboxed, leaf %s, root %s: %s keystore-x = %s, want ERR:ENOENT", leaf, rname, op, got)
 				}
-				if got := probe("", op, filepath.Join(r, "keystore-y")); got != "OK" {
-					t.Errorf("unsandboxed, leaf %s, root %s: %s keystore-y = %s, want OK", leaf, rname, op, got)
+				for _, name := range []string{"keystore-y", "KEYSTORE-y", "Keystore-y", "\u212Aeystore-y"} {
+					if got := probe("", op, filepath.Join(r, name)); got != "OK" {
+						t.Errorf("unsandboxed, leaf %s, root %s: %s %s = %s, want OK (the volume does not fold this spelling)", leaf, rname, op, name, got)
+					}
 				}
 			}
 		}
@@ -117,21 +127,77 @@ func TestWorkDirKeystoreDenyHidesExistence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ShimProfile: %v", err)
 		}
+		// unchanged is the unsandboxed control after each sandboxed attempt:
+		// keystore-x is still absent, keystore-y still holds what it was
+		// written with, and no folded spelling of either was made.
+		unchanged := func(t *testing.T, after []string) {
+			t.Helper()
+			if got := probe("", "stat", filepath.Join(stateDir, "keystore-x")); !strings.HasPrefix(got, "ERR:ENOENT") {
+				t.Errorf("after %q: unsandboxed stat keystore-x = %s, want ERR:ENOENT", after, got)
+			}
+			if b, err := os.ReadFile(filepath.Join(stateDir, "keystore-y")); err != nil || string(b) != "{}" {
+				t.Errorf("after %q: keystore-y = %q, %v, want it unchanged", after, b, err)
+			}
+			if ents, err := os.ReadDir(stateDir); err != nil {
+				t.Fatal(err)
+			} else if len(ents) != 1 {
+				t.Errorf("after %q: state dir holds %d entries, want keystore-y alone", after, len(ents))
+			}
+		}
 		for which, prof := range map[string]string{"pod": pod, "shim": shim} {
 			t.Run(leaf+"/"+which, func(t *testing.T) {
 				sb := filepath.Join(base, leaf+"-"+which+".sb")
 				if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
 					t.Fatal(err)
 				}
+				n := 0
+				fresh := func(stem string) string {
+					n++
+					return filepath.Join(dataVol, leaf+"-"+which+"-"+stem+strconv.Itoa(n))
+				}
+				// sibling makes a file in the pod's writable rootfs, outside
+				// the sandbox, for a rename or link onto a keystore name.
+				sibling := func() string {
+					p := fresh("s")
+					if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					return p
+				}
 				for rname, rootOf := range rootSpellings {
 					r := rootOf(stateDir)
+					var attempts [][]string
 					for _, name := range []string{"keystore-x", "keystore-y"} {
-						for _, op := range []string{"read", "stat", "exists"} {
-							p := filepath.Join(r, name)
-							if got := probe(sb, op, p); got != keystoreDenied {
-								t.Errorf("root %s: %s %s = %s, want %s", rname, op, p, got, keystoreDenied)
-							}
+						p := filepath.Join(r, name)
+						attempts = append(attempts,
+							[]string{"read", p},
+							[]string{"stat", p},
+							[]string{"exists", p},
+							[]string{"open", p},
+							[]string{"unlink", p},
+							[]string{"rename", sibling(), p},
+							[]string{"rename", p, fresh("r")},
+							[]string{"link", p, fresh("h")},
+							[]string{"link", sibling(), p},
+							[]string{"symlink", p, "/etc/hosts"},
+							[]string{"readlink", p},
+						)
+					}
+					// The folds the stanza's regex matches: letter case and
+					// the Kelvin sign (U+212A) for k.
+					for _, name := range []string{"KEYSTORE-", "Keystore-", "\u212Aeystore-"} {
+						for _, leafName := range []string{name + "x", name + "y"} {
+							p := filepath.Join(r, leafName)
+							attempts = append(attempts, []string{"read", p}, []string{"stat", p}, []string{"exists", p})
 						}
+					}
+					for _, a := range attempts {
+						got := probe(sb, a...)
+						t.Logf("%s / root %s: %s %q: %s", which, rname, a[0], a[1:], got)
+						if got != keystoreDenied {
+							t.Errorf("root %s: %s %q = %s, want %s", rname, a[0], a[1:], got, keystoreDenied)
+						}
+						unchanged(t, a)
 					}
 				}
 			})
