@@ -183,24 +183,33 @@ type shimLaunchPlan struct {
 // renders the shim profile — the pod profile plus the shim grant, written beside
 // the staged pod profile so cleanup and the startup sweep remove both — clears
 // any earlier instance's exit record from the dir, and returns the Process plus
-// the cleanup extended to the shim profile.
+// the cleanup extended to the shim profile, and the device and inode of the log
+// file it created, which bind a later read of that file to the file this
+// daemon made (readCRILogTail).
 //
 // The shim is spawned with an EMPTY environment: the pod environment, DYLD
 // interposes included, crosses over the shim's stdin, and the shim spawns the
 // container's launch-mode shim with an empty environment too, handing it on as
 // the launch payload (supervisor.ShimSpec.ContainerSpawn).
-func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, cleanup func() error) (*supervisor.Process, func() error, error) {
-	w, err := crilog.Open(plan.logPath)
+func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, cleanup func() error) (*supervisor.Process, func() error, logFileIdent, error) {
+	// crilog.OpenAppend is the CRI log open itself (its flags, mode and
+	// directory creation), so this is the file the shim then appends to. Its
+	// device and inode are taken from the open descriptor, never re-resolved.
+	f, err := crilog.OpenAppend(plan.logPath)
 	if err != nil {
-		return nil, cleanup, fmt.Errorf("create container log %s: %w", plan.logPath, err)
+		return nil, cleanup, logFileIdent{}, fmt.Errorf("create container log %s: %w", plan.logPath, err)
 	}
-	_ = w.Close()
+	ident, err := fileIdentOf(f)
+	_ = f.Close()
+	if err != nil {
+		return nil, cleanup, logFileIdent{}, fmt.Errorf("stat container log %s: %w", plan.logPath, err)
+	}
 	shimText, err := sandbox.ShimProfile(p.profile, sandbox.ShimGrant{Dir: dir})
 	if err != nil {
-		return nil, cleanup, err
+		return nil, cleanup, logFileIdent{}, err
 	}
 	if len(plan.shimArgv) < 4 || plan.shimArgv[1] != supervisor.ShimModeLaunch || plan.shimArgv[2] != supervisor.LaunchSpecToken {
-		return nil, cleanup, fmt.Errorf("unexpected exec-shim argv %q", plan.shimArgv)
+		return nil, cleanup, logFileIdent{}, fmt.Errorf("unexpected exec-shim argv %q", plan.shimArgv)
 	}
 	// ShimSpec.Launch is the argv after the mode and spec tokens; the shim
 	// adds both back when it spawns the container.
@@ -208,14 +217,14 @@ func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, clean
 	podProfile := launch[5]
 	shimProfile := podProfile + ".shim.sb"
 	if err := os.WriteFile(shimProfile, []byte(shimText), 0o600); err != nil {
-		return nil, cleanup, fmt.Errorf("stage the shim profile: %w", err)
+		return nil, cleanup, logFileIdent{}, fmt.Errorf("stage the shim profile: %w", err)
 	}
 	both := func() error {
 		_ = os.Remove(shimProfile)
 		return cleanup()
 	}
 	if err := supervisor.RemoveExitRecord(dir); err != nil {
-		return nil, both, err
+		return nil, both, logFileIdent{}, err
 	}
 	proc := supervisor.NewShimProcess(r.spawner, r.waiter,
 		supervisor.SpawnSpec{Path: plan.shimPath, Argv: []string{plan.shimPath, supervisor.ShimModeServe}, Env: []string{}, Dir: plan.workingDir},
@@ -234,7 +243,7 @@ func (r *Runtime) spawnBesideShim(p *pod, plan shimLaunchPlan, dir string, clean
 			ProcStart: r.procStart,
 			Kill:      r.signalGroup,
 		})
-	return proc, both, nil
+	return proc, both, ident, nil
 }
 
 // noteLogStreamLost records the pod's log-stream-lost condition, keeping the

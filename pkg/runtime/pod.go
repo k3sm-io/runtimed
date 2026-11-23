@@ -390,6 +390,15 @@ type containerProc struct {
 	// fanout delivers the same chunks to live Attach subscribers. It retains
 	// nothing; see logFanout.
 	fanout *logFanout
+	// tail holds the last few KiB of a plain init container's output for the
+	// error that rejects its pod if it fails (outputTail). nil for every
+	// other container, and for one whose output its resident shim pumps
+	// (failedInitTail reads that one's log file instead).
+	tail *outputTail
+	// logIdent is the device and inode of the CRI log file runtimed created
+	// for a resident-shim container (spawnBesideShim); zero otherwise. A
+	// read-back of that file must find the same file (readCRILogTail).
+	logIdent logFileIdent
 	// state is updated as the container runs/terminates.
 	state *runtimev1.ContainerStatus
 	// restarting marks the container as mid-RestartContainer: its old process is
@@ -1807,21 +1816,92 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	}
 	removeContainerLocked(p, cp.name)
 	p.mu.Unlock()
+	var tail string
 	if werr != nil || code != 0 {
+		tail = r.failedInitTail(p, cp, code, werr)
 		// The step refuses the sequence, and the entry just left p.containers,
 		// so no teardown will ever reach its log writer: release it here, on
 		// the drained-or-bounded terms a replaced instance's log gets.
 		r.releaseReplacedContainerLog(cp)
 	}
 	if werr != nil {
+		if tail != "" {
+			return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+				fmt.Errorf("init container %s wait: %w: output: %s", cp.name, werr, tail)
+		}
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s wait: %w", cp.name, werr)
 	}
 	if code != 0 {
+		if tail != "" {
+			return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+				fmt.Errorf("init container %s exited %d: output: %s", cp.name, code, tail)
+		}
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s exited %d", cp.name, code)
 	}
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// failedInitTail renders a failed plain init container's output tail as one
+// quoted line (strconv.Quote over outputTail.render) and logs that same value
+// once at Warn. It returns "" when the container printed nothing printable or
+// its output cannot be read.
+//
+// Locking: it holds no runtime-wide lock. Its callers, finishInitStep under
+// startSequence (from createPod, which runs after CreatePod has released r.mu)
+// and resumeInitSequence (StartContainer, likewise outside r.mu), hold neither
+// r.mu nor p.mu here, and p.mu is taken below only to read the log path, never
+// across the bounded drain wait or the file read, so a slow drain delays only
+// this pod's create or start.
+//
+// On the in-daemon pump path (cp.tail set) it first waits, bounded by the
+// drain grace, for the log pumps to reach EOF: the reaper unblocks Wait
+// independently of the pumps, and the dying container's last line (the one
+// that says why) is exactly what an early read would miss.
+//
+// On the resident-shim path (no daemon-held log writer, so no tail) the shim
+// held the container's stdio and wrote its CRI log file, and its reported exit
+// is also the edge after which it wrote nothing more, so the tail is read from
+// the end of that file, at the log_path runtimed configured for the container.
+// The caller runs this before anything releases, rotates or removes the file.
+func (r *Runtime) failedInitTail(p *pod, cp *containerProc, code int, werr error) string {
+	var tail string
+	switch {
+	case cp.tail != nil:
+		if cp.proc != nil {
+			timer := time.NewTimer(r.drainGraceDuration())
+			select {
+			case <-cp.proc.LogsDrained():
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+		tail = cp.tail.render()
+	case cp.logw == nil && cp.proc != nil:
+		p.mu.Lock()
+		logPath := cp.state.GetLogPath()
+		p.mu.Unlock()
+		if logPath == "" {
+			return ""
+		}
+		t, err := readCRILogTail(logPath, cp.logIdent, os.Geteuid())
+		if err != nil {
+			r.log.Warn("could not read a failed init container's log tail",
+				"pod", p.box.GetPodId(), "container", cp.name, "err", err)
+			return ""
+		}
+		tail = t.render()
+	default:
+		return ""
+	}
+	if tail == "" {
+		return ""
+	}
+	quoted := strconv.Quote(tail)
+	r.log.Warn("init container failed; its last output follows",
+		"pod", p.box.GetPodId(), "container", cp.name, "exit_code", code, "wait_err", werr, "output", quoted)
+	return quoted
 }
 
 // blockRemainingLocked records every init container from index fromInit onward,
@@ -1960,17 +2040,19 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// CRI log itself and outlives this daemon, or — for a backend whose helper
 	// cannot stay resident — through pipes into a log writer held here.
 	var (
-		logw    *crilog.Writer
-		fanout  *logFanout
-		proc    *supervisor.Process
-		shimDir string
+		logw     *crilog.Writer
+		fanout   *logFanout
+		tail     *outputTail
+		logIdent logFileIdent
+		proc     *supervisor.Process
+		shimDir  string
 	)
 	if hostsResidentShim(r.backend) {
 		if shimDir, err = r.containerShimDir(p, c.GetName()); err != nil {
 			_ = cleanup()
 			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
 		}
-		proc, cleanup, err = r.spawnBesideShim(p, shimLaunchPlan{
+		proc, cleanup, logIdent, err = r.spawnBesideShim(p, shimLaunchPlan{
 			podID: p.box.GetPodId(), container: c.GetName(),
 			shimPath: shimPath, shimArgv: shimArgv,
 			env: env, argv0: argv0, workingDir: workingDir, logPath: logPath,
@@ -1980,6 +2062,12 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 				fmt.Errorf("prepare the resident shim for %s: %w", c.GetName(), err)
 		}
+		// A shim that drops to the container's credential chowns the log to
+		// it (execshim dropShim), so that uid, the one this daemon resolved
+		// and handed the shim in the launch spec above, may own the file too.
+		if cred.Drop {
+			logIdent.runAsUID, logIdent.dropped = cred.UID, true
+		}
 	} else {
 		if logw, err = crilog.Open(logPath); err != nil {
 			_ = cleanup()
@@ -1987,6 +2075,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 				fmt.Errorf("open container log for %s: %w", c.GetName(), err)
 		}
 		fanout = &logFanout{}
+		if isInit && !isSidecarSpec(c) {
+			tail = &outputTail{}
+		}
 		// An EMPTY environment: env and the argv[0] override reach the
 		// exec-shim as its launch payload, never through its own environ.
 		proc = supervisor.NewProcess(r.spawner, r.waiter, supervisor.SpawnSpec{
@@ -1995,7 +2086,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			Env:    []string{},
 			Launch: &supervisor.LaunchPayload{Env: env, Argv0: argv0},
 			Dir:    workingDir,
-		}, containerLogSink(logw, fanout))
+		}, containerLogSink(logw, fanout, tail))
 	}
 	closeLog := func() {
 		if logw != nil {
@@ -2008,6 +2099,8 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		initDeclared: isInit,
 		logw:         logw,
 		fanout:       fanout,
+		tail:         tail,
+		logIdent:     logIdent,
 		env:          env,
 		workingDir:   workingDir,
 		proc:         proc,

@@ -37,7 +37,8 @@ import (
 // file when the restart failed: settleGuestRestartLog), and keeps no in-memory
 // copy of a container's output — the
 // 256 KiB ring that used to serve GetLogs is gone, along with the truncation
-// and the eviction it forced. The node owns the directory tree, the reader
+// and the eviction it forced. The one exception is a plain init container's
+// few-KiB outputTail, which only ever feeds the error that rejects its pod. The node owns the directory tree, the reader
 // `kubectl logs` is served from, rotation, and every deletion, which is the
 // same split the kubelet and containerd have upstream.
 
@@ -197,15 +198,20 @@ func (f *logFanout) subscribe() (<-chan logChunk, func()) {
 
 // containerLogSink is the supervisor.LogSink for one container: it writes the
 // chunk to the container's CRI log file and then fans it out to live attach
-// subscribers.
+// subscribers. When tail is non-nil (a plain init container) the chunk is
+// first recorded there, before the write, so a failed init container's last
+// output survives even a log file that refused it (see outputTail).
 //
 // The ORDER is load-bearing. The file is the durable record and the fan-out is
 // a courtesy, so the write goes first and its error is returned — which stops
 // that stream's pump and closes its read end, handing the container an EPIPE
 // (see crilog.Writer for why that beats a silent hang). Publishing first would
 // let an attached terminal show output that never reached disk.
-func containerLogSink(w *crilog.Writer, fan *logFanout) func(crilog.Stream, []byte, bool) error {
+func containerLogSink(w *crilog.Writer, fan *logFanout, tail *outputTail) func(crilog.Stream, []byte, bool) error {
 	return func(stream crilog.Stream, chunk []byte, partial bool) error {
+		if tail != nil {
+			tail.record(chunk, partial)
+		}
 		if err := w.Write(stream, chunk, partial); err != nil {
 			return err
 		}
