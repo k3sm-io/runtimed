@@ -42,6 +42,9 @@ never talks to the control plane directly.
 - **`mount`** — materializes a Pod's volume sources (ConfigMap, Secret, emptyDir, downward API,
   projected volumes, and `subPath` selection) into the Pod's on-disk directory. Because there is
   no mount namespace, a "mount" here is real files written under the Pod's writable data volume.
+  A volume mounted at several paths is one directory, and each extra path is a symlink to it.
+  A mount nested under such a path, under an image, PVC or exposure mount, or under a Secret
+  or other credential volume is refused when the Pod is created.
 - **`runtime`** — the in-process runtime server that implements the `apis` runtime gRPC contract.
   It wires together `image`, `sandbox`, and `supervisor` behind the Pod-level API a caller
   actually talks to.
