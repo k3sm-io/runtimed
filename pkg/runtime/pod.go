@@ -392,7 +392,8 @@ type containerProc struct {
 	fanout *logFanout
 	// tail holds the last few KiB of a plain init container's output for the
 	// error that rejects its pod if it fails (outputTail). nil for every
-	// other container, and for one whose output its resident shim pumps.
+	// other container, and for one whose output its resident shim pumps
+	// (failedInitTail reads that one's log file instead).
 	tail *outputTail
 	// state is updated as the container runs/terminates.
 	state *runtimev1.ContainerStatus
@@ -1839,24 +1840,49 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 }
 
 // failedInitTail renders a failed plain init container's output tail and logs
-// it once at Warn. It first waits, bounded by the drain grace, for the log
-// pumps to reach EOF: the reaper unblocks Wait independently of the pumps, and
-// the dying container's last line (the one that says why) is exactly what an
-// early read would miss. It returns "" for a container with no tail (one whose
-// resident shim pumps its output) or no printable output.
+// it once at Warn. It returns "" when the container printed nothing printable
+// or its output cannot be read.
+//
+// On the in-daemon pump path (cp.tail set) it first waits, bounded by the
+// drain grace, for the log pumps to reach EOF: the reaper unblocks Wait
+// independently of the pumps, and the dying container's last line (the one
+// that says why) is exactly what an early read would miss.
+//
+// On the resident-shim path (no daemon-held log writer, so no tail) the shim
+// held the container's stdio and wrote its CRI log file, and its reported exit
+// is also the edge after which it wrote nothing more, so the tail is read from
+// the end of that file, at the log_path runtimed configured for the container.
+// The caller runs this before anything releases, rotates or removes the file.
 func (r *Runtime) failedInitTail(p *pod, cp *containerProc, code int, werr error) string {
-	if cp.tail == nil {
+	var tail string
+	switch {
+	case cp.tail != nil:
+		if cp.proc != nil {
+			timer := time.NewTimer(r.drainGraceDuration())
+			select {
+			case <-cp.proc.LogsDrained():
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+		tail = cp.tail.render()
+	case cp.logw == nil && cp.proc != nil:
+		p.mu.Lock()
+		logPath := cp.state.GetLogPath()
+		p.mu.Unlock()
+		if logPath == "" {
+			return ""
+		}
+		t, err := readCRILogTail(logPath)
+		if err != nil {
+			r.log.Warn("could not read a failed init container's log tail",
+				"pod", p.box.GetPodId(), "container", cp.name, "err", err)
+			return ""
+		}
+		tail = t.render()
+	default:
 		return ""
 	}
-	if cp.proc != nil {
-		timer := time.NewTimer(r.drainGraceDuration())
-		select {
-		case <-cp.proc.LogsDrained():
-		case <-timer.C:
-		}
-		timer.Stop()
-	}
-	tail := cp.tail.render()
 	if tail != "" {
 		r.log.Warn("init container failed; its last output follows",
 			"pod", p.box.GetPodId(), "container", cp.name, "exit_code", code, "wait_err", werr, "output", tail)

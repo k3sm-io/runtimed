@@ -17,10 +17,14 @@ limitations under the License.
 package runtime
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 // The bounds of a failed init container's output tail: at most this many
@@ -34,6 +38,9 @@ const (
 	// twice the rendered bound so stripped control bytes and a cut first line
 	// still leave a full tail to render.
 	initTailWindowBytes = 2 * initTailMaxBytes
+	// shimLogTailBytes is how much of a resident-shim init container's CRI
+	// log file is read back, from its end, when no in-daemon tail exists.
+	shimLogTailBytes = 4096
 )
 
 // outputTail keeps the last few KiB of one plain init container's output in
@@ -43,10 +50,12 @@ const (
 // whole pod, a rejected pod is never registered and keeps no log directory,
 // so the CRI log file is not there to read afterwards. The tail is what lets
 // the rejection say why ("init container X exited 74: <its last lines>").
-// It is NOT a log: it is filled from the log pump alongside the file write
-// (containerLogSink), never read back from disk, and only a plain init
-// container gets one, so a pod's memory cost is initTailWindowBytes per init
-// container while it runs.
+// It is NOT a log. On the in-daemon pump path it is filled alongside the file
+// write (containerLogSink), and only a plain init container gets one, so a
+// pod's memory cost is initTailWindowBytes per init container while it runs.
+// On the resident-shim path the daemon never sees the output, so the tail is
+// built after the exit from the end of the CRI log file the shim wrote
+// (readCRILogTail), through the same record/render rules.
 //
 // Concurrency: record is called from both of a container's pump goroutines
 // (stdout and stderr) with no serialisation between them, so mu guards buf.
@@ -147,4 +156,89 @@ func sanitizeTail(b []byte) string {
 		}
 	}
 	return sb.String()
+}
+
+// readCRILogTail builds a tail from the last shimLogTailBytes of the CRI log
+// file at path, which must be the path runtimed itself configured for the
+// container (its status log_path), never one taken from the pod.
+//
+// The file's content is pod-written, so it is opened O_NOFOLLOW (a symlink in
+// the final component is refused) and O_NONBLOCK (a FIFO planted there cannot
+// hang the open), checked by fstat to be a regular file, and read with one
+// bounded pread from its end. The bytes are parsed by parseCRILine and fed to
+// an outputTail, so the message rules are those of the in-daemon path.
+func readCRILogTail(path string) (*outputTail, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open container log %s: %w", path, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("stat container log %s: %w", path, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, fmt.Errorf("container log %s is not a regular file", path)
+	}
+	off := st.Size - shimLogTailBytes
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size-off)
+	n, err := unix.Pread(fd, buf, off)
+	if err != nil {
+		return nil, fmt.Errorf("read container log %s: %w", path, err)
+	}
+	return criTail(buf[:max(n, 0)], off > 0), nil
+}
+
+// criTail feeds the CRI log lines in b to a fresh outputTail. cut says b
+// starts mid-file, so its first line is a fragment and is skipped. A line
+// that is not a well-formed CRI frame is skipped, never fed raw.
+func criTail(b []byte, cut bool) *outputTail {
+	t := &outputTail{}
+	for i := 0; len(b) > 0; i++ {
+		line := b
+		if j := bytes.IndexByte(b, '\n'); j >= 0 {
+			line, b = b[:j], b[j+1:]
+		} else {
+			b = nil
+		}
+		if i == 0 && cut {
+			continue
+		}
+		if msg, partial, ok := parseCRILine(line); ok {
+			t.record(msg, partial)
+		}
+	}
+	return t
+}
+
+// parseCRILine splits one CRI log line, without its newline, of the form
+// "<timestamp> <stdout|stderr> <F|P> <message>" and returns the message bytes
+// (a sub-slice of line) and whether the P (partial) tag was set. ok is false
+// for anything that is not exactly that framing.
+func parseCRILine(line []byte) (msg []byte, partial bool, ok bool) {
+	ts, rest, found := bytes.Cut(line, []byte{' '})
+	if !found || len(ts) == 0 {
+		return nil, false, false
+	}
+	stream, rest, found := bytes.Cut(rest, []byte{' '})
+	if !found || (string(stream) != "stdout" && string(stream) != "stderr") {
+		return nil, false, false
+	}
+	tag, msg, found := bytes.Cut(rest, []byte{' '})
+	if !found {
+		// An empty F line may be written without the separator before the
+		// (empty) message.
+		tag, msg = rest, nil
+	}
+	switch string(tag) {
+	case "F":
+		return msg, false, true
+	case "P":
+		return msg, true, true
+	default:
+		return nil, false, false
+	}
 }

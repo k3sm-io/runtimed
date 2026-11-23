@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("2026-11-22T10:00:00Z stderr F init failed\nfragment without newline")

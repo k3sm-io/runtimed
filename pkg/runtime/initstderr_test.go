@@ -19,11 +19,13 @@ package runtime
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"unicode/utf8"
 
+	"k3sm.io/runtimed/pkg/crilog"
 	"k3sm.io/runtimed/pkg/supervisor"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -188,4 +190,83 @@ func TestFailedInitStderrSurvivesRejectedCreate(t *testing.T) {
 			t.Errorf("a clean init logged a failure tail:\n%s", logs.String())
 		}
 	})
+}
+
+// TestFailedShimInitStderrSurvivesRejectedCreate drives finishInitStep, the
+// step whose error becomes CreatePod's rejection, with an init container shaped
+// as the resident-shim path leaves it: no daemon-held log writer and no
+// in-daemon tail, because the shim held the container's stdio and wrote its
+// CRI log file itself. The rejection must carry the last line of that file.
+func TestFailedShimInitStderrSurvivesRejectedCreate(t *testing.T) {
+	const line = "yurei-agentd install-tree: refused io-error: /opt/yurei (No such file or directory)"
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  string
+	}{
+		{name: "one stderr line", lines: []string{line}, want: line},
+		{name: "a large file is read from its end", lines: append(repeatLines("noise "+strings.Repeat("y", 60), 300), line), want: line},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+			rt := newTestRuntimeCfg(t, cfg, Deps{})
+			logPath := filepath.Join(t.TempDir(), "install-tools", "0.log")
+			w, err := crilog.Open(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, l := range tc.lines {
+				if err := w.Write(crilog.StreamStderr, []byte(l), false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			proc := supervisor.NewProcess(&fakeSpawner{}, &firstExitsWaiter{code: 74}, supervisor.SpawnSpec{Path: "/bin/true"},
+				func(crilog.Stream, []byte, bool) error { return nil })
+			if err := proc.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			spec := &runtimev1.Container{Name: "install-tools"}
+			cp := &containerProc{
+				name: "install-tools", spec: spec, initDeclared: true, proc: proc,
+				state: &runtimev1.ContainerStatus{Name: "install-tools", LogPath: logPath},
+			}
+			p := &pod{box: &runtimev1.PodBox{PodId: "pod-shim-init", InitContainers: []*runtimev1.Container{spec}},
+				containers: []*containerProc{cp}}
+
+			reason, err := rt.finishInitStep(context.Background(), p, cp)
+			if err == nil {
+				t.Fatal("finishInitStep succeeded for an init container that exited 74")
+			}
+			if reason != runtimev1.FailureReason_FAILURE_REASON_SPAWN {
+				t.Errorf("reason = %v, want SPAWN", reason)
+			}
+			msg := createFailure(reason, err).GetError().GetMessage()
+			if !strings.HasPrefix(msg, "init container install-tools exited 74: ") || !strings.Contains(msg, tc.want) {
+				t.Errorf("rejection %q does not carry %q", msg, tc.want)
+			}
+			if strings.Contains(msg, "stderr F ") {
+				t.Errorf("rejection %q carries CRI framing", msg)
+			}
+			if tail := strings.TrimPrefix(msg, "init container install-tools exited 74: "); len(tail) > initTailMaxBytes ||
+				strings.Count(tail, "\n")+1 > initTailMaxLines {
+				t.Errorf("tail %q exceeds the bounds", tail)
+			}
+			if c := strings.Count(logs.String(), "init container failed"); c != 1 {
+				t.Errorf("logged the tail %d times at Warn, want once:\n%s", c, logs.String())
+			}
+		})
+	}
+}
+
+func repeatLines(l string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = l
+	}
+	return out
 }

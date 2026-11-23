@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("ts stderr P \xe2\x80\nts stderr F \xae\u202e\u2028x\t\ty\n")
