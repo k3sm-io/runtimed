@@ -72,7 +72,13 @@ limitations under the License.
 // read-write, the selection stays writable for every container at every path,
 // and the volume is reported in Layout.MixedReadOnly so the runtime can warn.
 // This differs from the kubelet, where the read-only container alone would be
-// denied.
+// denied. The common pattern of an init container populating an emptyDir that
+// later containers mount read-only therefore leaves the emptyDir writable.
+//
+// The verdict is taken over the containers the pod is created with. An
+// ephemeral container is added after the profile is compiled and does not
+// count: it runs under the pod's profile as it stands, so it can write an
+// emptyDir the pod's containers left writable whatever its own mount says.
 //
 // Layout.Scope also reports the writable mount roots. One nested under a
 // read-only mount (an emptyDir at /app/tmp inside a configMap at /app) gets its

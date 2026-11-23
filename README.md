@@ -49,7 +49,10 @@ never talks to the control plane directly.
   kubelet. An emptyDir is read-only when mounted `readOnly: true`; a Pod has one sandbox profile
   for all its containers, so that is enforced per volume (and `subPath`): when one container mounts
   an emptyDir read-only and another mounts it read-write, it stays writable for every container,
-  and the runtime logs a warning naming the volume.
+  and the runtime logs a warning naming the volume. Only an emptyDir that every container mounts
+  read-only is protected: the common pattern of an init container populating an emptyDir that
+  later containers mount read-only leaves it writable. Ephemeral containers are added after the
+  profile is built and are not counted; they run under whatever the Pod's profile already says.
 - **`runtime`** — the in-process runtime server that implements the `apis` runtime gRPC contract.
   It wires together `image`, `sandbox`, and `supervisor` behind the Pod-level API a caller
   actually talks to.
