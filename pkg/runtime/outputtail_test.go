@@ -38,14 +38,14 @@ func TestReadCRILogTailRefusesNonRegularFiles(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readCRILogTail(link, identOfPath(t, target)); err == nil {
+	if _, err := readCRILogTail(link, identOfPath(t, target), os.Geteuid()); err == nil {
 		t.Error("read a tail through a symlink")
 	}
 	fifo := filepath.Join(dir, "fifo.log")
 	if err := unix.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readCRILogTail(fifo, identOfPath(t, target)); err == nil {
+	if _, err := readCRILogTail(fifo, identOfPath(t, target), os.Geteuid()); err == nil {
 		t.Error("read a tail from a FIFO")
 	}
 }
@@ -69,7 +69,7 @@ func TestReadCRILogTailIsBoundToTheCreatedFile(t *testing.T) {
 
 	t.Run("the created file is read", func(t *testing.T) {
 		_, path, id := setup(t)
-		tail, err := readCRILogTail(path, id)
+		tail, err := readCRILogTail(path, id, os.Geteuid())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,7 +85,7 @@ func TestReadCRILogTailIsBoundToTheCreatedFile(t *testing.T) {
 		if err := os.WriteFile(path, []byte(frame), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readCRILogTail(path, id); err == nil {
+		if _, err := readCRILogTail(path, id, os.Geteuid()); err == nil {
 			t.Error("read a tail from a different inode")
 		}
 	})
@@ -101,7 +101,7 @@ func TestReadCRILogTailIsBoundToTheCreatedFile(t *testing.T) {
 		if err := os.Link(other, path); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readCRILogTail(path, id); err == nil {
+		if _, err := readCRILogTail(path, id, os.Geteuid()); err == nil {
 			t.Error("read a tail through a hard link to another file")
 		}
 	})
@@ -110,7 +110,7 @@ func TestReadCRILogTailIsBoundToTheCreatedFile(t *testing.T) {
 		if err := os.Link(path, filepath.Join(dir, "extra")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readCRILogTail(path, id); err == nil {
+		if _, err := readCRILogTail(path, id, os.Geteuid()); err == nil {
 			t.Error("read a tail from a file with two links")
 		}
 	})
@@ -129,16 +129,49 @@ func TestReadCRILogTailIsBoundToTheCreatedFile(t *testing.T) {
 		if err := os.Symlink(elsewhere, filepath.Dir(path)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readCRILogTail(path, id); err == nil {
+		if _, err := readCRILogTail(path, id, os.Geteuid()); err == nil {
 			t.Error("read a tail through a symlinked parent directory")
 		}
 	})
 	t.Run("no recorded identity", func(t *testing.T) {
 		_, path, _ := setup(t)
-		if _, err := readCRILogTail(path, logFileIdent{}); err == nil {
+		if _, err := readCRILogTail(path, logFileIdent{}, os.Geteuid()); err == nil {
 			t.Error("read a tail with no recorded identity")
 		}
 	})
+}
+
+// TestReadCRILogTailOwner: the file may be owned by this daemon's euid or by
+// the run-as uid runtimed assigned the container (its shim chowns the log to
+// it), and by no other uid. The daemon euid is passed as a different uid, so
+// the file's real owner stands in for the container's without a chown.
+func TestReadCRILogTailOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "0.log")
+	if err := os.WriteFile(path, []byte("2026-01-01T00:00:00Z stderr F owned\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id := identOfPath(t, path)
+	owner := os.Geteuid()
+	otherEUID := owner + 4242
+
+	runAs := id
+	runAs.runAsUID, runAs.dropped = owner, true
+	tail, err := readCRILogTail(path, runAs, otherEUID)
+	if err != nil {
+		t.Fatalf("a file owned by the container's run-as uid: %v", err)
+	}
+	if got := tail.render(); got != "owned" {
+		t.Errorf("tail = %q, want %q", got, "owned")
+	}
+
+	other := id
+	other.runAsUID, other.dropped = owner+1, true
+	if _, err := readCRILogTail(path, other, otherEUID); err == nil {
+		t.Error("read a tail from a file owned by neither the daemon nor the container")
+	}
+	if _, err := readCRILogTail(path, id, otherEUID); err == nil {
+		t.Error("read a tail from a file not owned by the daemon, for a container that does not drop")
+	}
 }
 
 // TestCRITailSkipsTheCutFragmentAndBadFrames: a mid-file read drops its first

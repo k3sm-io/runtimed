@@ -1885,7 +1885,7 @@ func (r *Runtime) failedInitTail(p *pod, cp *containerProc, code int, werr error
 		if logPath == "" {
 			return ""
 		}
-		t, err := readCRILogTail(logPath, cp.logIdent)
+		t, err := readCRILogTail(logPath, cp.logIdent, os.Geteuid())
 		if err != nil {
 			r.log.Warn("could not read a failed init container's log tail",
 				"pod", p.box.GetPodId(), "container", cp.name, "err", err)
@@ -2061,6 +2061,12 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			_ = cleanup()
 			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
 				fmt.Errorf("prepare the resident shim for %s: %w", c.GetName(), err)
+		}
+		// A shim that drops to the container's credential chowns the log to
+		// it (execshim dropShim), so that uid, the one this daemon resolved
+		// and handed the shim in the launch spec above, may own the file too.
+		if cred.Drop {
+			logIdent.runAsUID, logIdent.dropped = cred.UID, true
 		}
 	} else {
 		if logw, err = crilog.Open(logPath); err != nil {

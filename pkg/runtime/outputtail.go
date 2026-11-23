@@ -175,10 +175,14 @@ func sanitizeTail(b []byte) string {
 }
 
 // logFileIdent names one file by device and inode. ok is false for the zero
-// value, which matches no file.
+// value, which matches no file. dropped and runAsUID record that the
+// container's shim drops to runAsUID, the credential runtimed resolved for
+// it, and so chowns the log to that uid.
 type logFileIdent struct {
 	dev, ino uint64
 	ok       bool
+	runAsUID int
+	dropped  bool
 }
 
 // fileIdentOf returns the device and inode of the open file f.
@@ -200,13 +204,18 @@ func fileIdentOf(f *os.File) (logFileIdent, error) {
 // what makes the read safe. After an O_NOFOLLOW|O_NONBLOCK open (a symlink in
 // the final component is refused, a FIFO cannot hang the open) the descriptor
 // is fstat'ed and the read goes ahead only for a regular file with the
-// recorded device and inode, exactly one link, owned by this daemon's euid. A
+// recorded device and inode, exactly one link, owned by this daemon's euid or
+// by the uid runtimed itself assigned the container's shim (want.runAsUID,
+// when it drops: the shim chowns the log to it). A
 // file swapped in at the path, a symlinked parent directory leading elsewhere,
 // or a hard link to some other file all fail that check, and the caller then
 // renders no tail. The read is one bounded pread from the end; the bytes are
 // parsed by parseCRILine and fed to an outputTail, so the message rules are
 // those of the in-daemon path.
-func readCRILogTail(path string, want logFileIdent) (*outputTail, error) {
+//
+// euid is this daemon's effective uid (os.Geteuid in production; a parameter
+// so a test can exercise the owner rule without root).
+func readCRILogTail(path string, want logFileIdent, euid int) (*outputTail, error) {
 	if !want.ok {
 		return nil, fmt.Errorf("container log %s: no recorded identity", path)
 	}
@@ -226,8 +235,8 @@ func readCRILogTail(path string, want logFileIdent) (*outputTail, error) {
 		return nil, fmt.Errorf("container log %s is not the file runtimed created", path)
 	case st.Nlink != 1:
 		return nil, fmt.Errorf("container log %s has %d links, want 1", path, st.Nlink)
-	case int64(st.Uid) != int64(os.Geteuid()):
-		return nil, fmt.Errorf("container log %s is owned by uid %d, not this daemon", path, st.Uid)
+	case int64(st.Uid) != int64(euid) && (!want.dropped || int64(st.Uid) != int64(want.runAsUID)):
+		return nil, fmt.Errorf("container log %s is owned by uid %d, neither this daemon nor the container", path, st.Uid)
 	}
 	off := st.Size - shimLogTailBytes
 	if off < 0 {
