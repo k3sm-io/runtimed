@@ -45,7 +45,8 @@ const defaultFileMode os.FileMode = 0o644
 // which of them are credentials (secrets / SA-token) that must get the SBPL
 // read-only sub-scope.
 type Layout struct {
-	// Mounts is one entry per unique materialized mount path.
+	// Mounts is one entry per unique mount path: each materialized mount, and
+	// each alias of one (AliasOf set).
 	Mounts []Mount
 	// State is the refresh state the create-time render leaves behind: which
 	// volumes are wholly immutable and when each ServiceAccount token was
@@ -67,6 +68,10 @@ type Mount struct {
 	// it gets the SBPL read-only sub-scope, so the pod cannot write the files
 	// at its path (not integrity against the pod: see the package doc).
 	Credential bool
+	// AliasOf is, for a second mount path of a volume selection already
+	// materialized at another path, that path: Path is then a symlink to it
+	// (placeAlias). It is empty for a materialized mount.
+	AliasOf string
 }
 
 // CredentialPaths returns the materialized paths that are credentials, sorted —
@@ -100,6 +105,9 @@ func CredentialPaths(box *runtimev1.PodBox, dataVol string) ([]string, error) {
 	for _, pm := range plans {
 		if credentialSource(pm.vol) {
 			out = append(out, pm.dest)
+			for _, a := range pm.aliases {
+				out = append(out, a.dest)
+			}
 		}
 	}
 	sort.Strings(out)
@@ -174,13 +182,23 @@ func classify(vol *runtimev1.Volume, subPath string) mountClass {
 	}
 }
 
-// plannedMount is one de-duplicated volume mount of a pod: the mount, its
-// volume, the rebased destination, and its class.
+// plannedMount is one de-duplicated volume selection of a pod: the mount that
+// first selected it, its volume, the rebased destination it is materialized
+// at, its class, and the other destinations that alias it.
 type plannedMount struct {
+	mount   *runtimev1.VolumeMount
+	vol     *runtimev1.Volume
+	dest    string
+	class   mountClass
+	aliases []aliasMount
+}
+
+// aliasMount is a further destination of a planned selection: a container
+// mounting the same (volume, subPath) at another mount path. It is a symlink
+// to the planned destination (placeAlias), never a second copy.
+type aliasMount struct {
 	mount *runtimev1.VolumeMount
-	vol   *runtimev1.Volume
 	dest  string
-	class mountClass
 }
 
 // planMounts walks every container VolumeMount of box (init containers first)
@@ -188,6 +206,14 @@ type plannedMount struct {
 // volume check, the escape check, and the destination conflict guard. PVC
 // mounts are omitted: pkg/volume binds them. It is the one walk Materialize and
 // Refresh share.
+//
+// Each (volume, subPath) selection is planned once, at the first destination
+// that names it (init containers first); a later container mounting the same
+// selection at another mount path adds an alias to that plan instead of a
+// second plan (kubelet parity: an emptyDir is one directory per pod, mounted at
+// each container's mount path). An image volume is the exception: each of its
+// destinations stays its own plan, because LinkImageVolumes links every one of
+// them to the same shared view already.
 func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 	volumes := make(map[string]*runtimev1.Volume, len(box.GetVolumes()))
 	for _, v := range box.GetVolumes() {
@@ -198,6 +224,9 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 	// The subPath is part of the identity because k3sm has no mount namespace, so a
 	// single on-disk destination can hold exactly one selection.
 	seen := make(map[string]seenMount)
+	// planned: selection -> its index in plans, so a second destination of the
+	// same selection becomes an alias of the first.
+	planned := make(map[seenMount]int)
 
 	containers := make([]*runtimev1.Container, 0, len(box.GetInitContainers())+len(box.GetContainers()))
 	containers = append(containers, box.GetInitContainers()...)
@@ -241,7 +270,8 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 			// The conflict guard keys on the destination (rebased mount path, no
 			// subPath): two subPaths of one volume at DIFFERENT mount paths do not
 			// false-conflict. A repeat of the SAME (volume, subPath) at the same path
-			// de-dups (the same volume mounted into multiple containers). But two
+			// de-dups (the same volume mounted into multiple containers), and at a
+			// different path becomes an alias of the first (below). But two
 			// mounts that target one destination with DIFFERENT selections — a distinct
 			// volume, OR the same volume with a different subPath — cannot both be
 			// materialized on the shared tree, so that is a hard error rather than a
@@ -253,8 +283,26 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 				return nil, fmt.Errorf("mounts %q(subPath %q) and %q(subPath %q) both target %q",
 					prev.name, prev.subPath, vm.GetName(), vm.GetSubPath(), dest)
 			}
-			seen[dest] = seenMount{name: vm.GetName(), subPath: vm.GetSubPath()}
-			plans = append(plans, plannedMount{mount: vm, vol: vol, dest: dest, class: classify(vol, vm.GetSubPath())})
+			sel := seenMount{name: vm.GetName(), subPath: vm.GetSubPath()}
+			seen[dest] = sel
+			class := classify(vol, vm.GetSubPath())
+			if i, ok := planned[sel]; ok && class != classImage {
+				// The same selection at another destination: one directory,
+				// reached at both. A destination inside another of the same
+				// selection (or containing it) would put the volume inside
+				// itself, so it is refused.
+				pm := &plans[i]
+				for _, other := range append([]string{pm.dest}, aliasDests(pm.aliases)...) {
+					if isUnder(dest, other) || isUnder(other, dest) {
+						return nil, fmt.Errorf("volume %s (subPath %q): mount path %q and %q nest inside one another",
+							vm.GetName(), vm.GetSubPath(), other, dest)
+					}
+				}
+				pm.aliases = append(pm.aliases, aliasMount{mount: vm, dest: dest})
+				continue
+			}
+			planned[sel] = len(plans)
+			plans = append(plans, plannedMount{mount: vm, vol: vol, dest: dest, class: class})
 		}
 	}
 	return plans, nil
@@ -336,8 +384,98 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 			ReadOnly:   pm.mount.GetReadOnly() || credential || pm.vol.GetProjected() != nil,
 			Credential: credential,
 		})
+		for _, a := range pm.aliases {
+			layout.Mounts = append(layout.Mounts, Mount{
+				Name:       a.mount.GetName(),
+				Path:       a.dest,
+				ReadOnly:   a.mount.GetReadOnly() || credential || pm.vol.GetProjected() != nil,
+				Credential: credential,
+				AliasOf:    pm.dest,
+			})
+		}
+	}
+	// The aliases are placed once every selection is rendered, so an alias
+	// never sits in a mount dir that a later render still has to create.
+	for _, pm := range plans {
+		for _, a := range pm.aliases {
+			if err := placeAlias(dataVol, a.dest, pm.dest); err != nil {
+				return nil, fmt.Errorf("alias volume %s at %s: %w", a.mount.GetName(), a.dest, err)
+			}
+		}
 	}
 	return layout, nil
+}
+
+// aliasDests returns the destinations of aliases.
+func aliasDests(aliases []aliasMount) []string {
+	out := make([]string, 0, len(aliases))
+	for _, a := range aliases {
+		out = append(out, a.dest)
+	}
+	return out
+}
+
+// placeAlias makes alias, a further mount path of a selection materialized at
+// dest, a symlink to dest, so every container reaches the one directory (or
+// file, for a subPath file selection). Both lie under dataVol.
+//
+// The link is relative (its target climbs from alias's parent to dest), so it
+// resolves inside the data volume wherever that volume sits and never spells
+// the host path in what a readlink returns. A process going through the
+// path-rebase shim at the alias's mount path reaches "<dataVol><mount path>"
+// and the kernel follows the link to dest. The Seatbelt profile judges the
+// resolved path, which is dest under the data volume, so the data volume's
+// grant covers it, and a credential's read-only sub-scope on dest covers every
+// access through the alias; the alias path itself is in the sub-scope as well
+// (Layout.Mounts, CredentialPaths), which keeps the link from being unlinked
+// or replaced.
+//
+// The parents of alias are created and opened from dataVol one component at
+// a time without following a link, and refused when one is a symlink or not
+// a directory; alias is then examined and created relative to that
+// descriptor. A symlink already at alias is replaced (a re-create), an empty
+// directory there (from the image rootfs) is removed, as a mount covers it,
+// and anything else is refused rather than hidden.
+//
+// Why the alias is safe against the pod: the pod owns the data volume, so it
+// can rename the alias away and put its own entry (another link, a directory)
+// in its place. That only rearranges its own tree. It could already create any
+// symlink there, the profile still judges every access by the resolved path,
+// and the daemon never writes through an alias: Refresh renders into dest,
+// reached from the data volume without following a link.
+func placeAlias(dataVol, alias, dest string) error {
+	target, err := filepath.Rel(filepath.Dir(alias), dest)
+	if err != nil {
+		return err
+	}
+	parent, err := openUnder(dataVol, filepath.Dir(alias), true)
+	if err != nil {
+		return fmt.Errorf("refusing alias parent %s: %w", filepath.Dir(alias), err)
+	}
+	defer parent.close()
+	name := filepath.Base(alias)
+	var st unix.Stat_t
+	if err := unix.Fstatat(parent.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		switch uint32(st.Mode) & unix.S_IFMT {
+		case unix.S_IFLNK:
+			err = unix.Unlinkat(parent.fd, name, 0)
+		case unix.S_IFDIR:
+			// rmdir removes only an empty directory: ENOTEMPTY refuses one
+			// with content.
+			err = unix.Unlinkat(parent.fd, name, unix.AT_REMOVEDIR)
+		default:
+			err = errors.New("it exists and is neither a symlink nor a directory")
+		}
+		if err != nil {
+			return fmt.Errorf("replace %s: %w", alias, err)
+		}
+	} else if !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("lstat %s: %w", alias, err)
+	}
+	if err := unix.Symlinkat(target, parent.fd, name); err != nil {
+		return fmt.Errorf("symlink %s -> %s: %w", alias, target, err)
+	}
+	return nil
 }
 
 // resolveTarget rebases mountPath under dataVol, returning the container-visible

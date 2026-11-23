@@ -29,6 +29,13 @@ limitations under the License.
 // validates against the protected deny-set. A mount path that would escape the
 // data volume via "../" is rejected.
 //
+// A volume selection (volume name plus subPath) is materialized once, at the
+// first mount path that names it (init containers first). Another container
+// mounting the same selection at a different mount path gets a relative
+// symlink there to that one directory (placeAlias), so an emptyDir an init
+// container fills is what the main container sees, as with the kubelet's one
+// directory per pod. Two different selections at one mount path are an error.
+//
 // The runtime proto (k3sm.io/apis runtime/v1) carries only the volume source
 // *reference* — a ConfigMap/Secret name, the SA-token audience — not the bytes,
 // because runtimed never talks to the apiserver. The data is supplied by a
