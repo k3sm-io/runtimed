@@ -116,9 +116,14 @@ func (l *Layout) ReadOnlyPaths() []string {
 func (l *Layout) Scope() ReadOnlyScope {
 	var sc ReadOnlyScope
 	for _, m := range l.Mounts {
-		// An alias is a symlink to its selection's directory: the directory
-		// carries the rule, which covers every access through the link.
+		// An alias is a symlink to its selection's directory, which carries the
+		// rule for every access through the link. A read-only selection's
+		// alias carries it too (see the package doc); a writable one's adds
+		// nothing.
 		if m.AliasOf != "" {
+			if m.ReadOnly {
+				sc.ReadOnly = append(sc.ReadOnly, m.Path)
+			}
 			continue
 		}
 		if m.ReadOnly {
@@ -157,7 +162,9 @@ func ScopeFor(box *runtimev1.PodBox, dataVol string) (ReadOnlyScope, error) {
 		ro := readOnlyMount(pm, credentialSource(pm.vol), intent)
 		mix.note(pm, ro, intent)
 		if ro {
+			// The selection's aliases carry the rule as well (see the package doc).
 			sc.ReadOnly = append(sc.ReadOnly, pm.dest)
+			sc.ReadOnly = append(sc.ReadOnly, aliasDests(pm.aliases)...)
 		} else {
 			sc.Writable = append(sc.Writable, pm.dest)
 		}
@@ -649,8 +656,8 @@ func aliasDests(aliases []aliasMount) []string {
 // and the kernel follows the link to dest. The Seatbelt profile judges the
 // resolved path, which is dest under the data volume, so the data volume's
 // grant covers it, and a read-only sub-scope on dest covers every access
-// through the alias. The alias path itself carries no rule (Layout.Scope skips
-// it): the link is the pod's own entry, as below.
+// through the alias. The alias path of a read-only selection carries the rule
+// as well (see the package doc).
 //
 // The parents of alias are created and opened from dataVol one component at
 // a time without following a link, and refused when one is a symlink or not

@@ -76,8 +76,8 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 			t.Errorf("read-only mount %s is not in the profile's read-only sub-scope:\n%s", p, stanza)
 		}
 	}
-	if a := filepath.Join(rootfs, "scratch-alias"); strings.Contains(stanza, a) {
-		t.Errorf("alias link %s carries a rule; the directory at /scratch does:\n%s", a, stanza)
+	if a := filepath.Join(rootfs, "scratch-alias"); !strings.Contains(stanza, "(subpath \""+a+"\")") {
+		t.Errorf("alias link %s of a read-only selection carries no rule:\n%s", a, stanza)
 	}
 	if shared := filepath.Join(rootfs, "shared"); strings.Contains(stanza, shared) {
 		t.Errorf("mixed mount %s is in the read-only sub-scope; one container mounts it read-write:\n%s", shared, stanza)

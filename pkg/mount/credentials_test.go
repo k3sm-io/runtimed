@@ -153,13 +153,13 @@ func TestReadOnlyPathsMatchesMaterialize(t *testing.T) {
 		if !reflect.DeepEqual(sc, layout.Scope()) {
 			t.Fatalf("ScopeFor = %+v, Materialize reported %+v", sc, layout.Scope())
 		}
-		// Aliases carry no rule: /ro-work is a link to scratch's writable
-		// /work, /var/logs one to logs' read-only /logs.
+		// /ro-work is a link to scratch's writable /work and carries nothing;
+		// /var/logs is one to logs' read-only /logs and carries the rule.
 		if want := []string{filepath.Join(dataVol, "work")}; !reflect.DeepEqual(sc.Writable, want) {
 			t.Fatalf("Writable = %v, want %v", sc.Writable, want)
 		}
 		pure, mixed := sc.ReadOnly, sc.Mixed
-		want := []string{filepath.Join(dataVol, "etc", "cm"), filepath.Join(dataVol, "logs")}
+		want := []string{filepath.Join(dataVol, "etc", "cm"), filepath.Join(dataVol, "logs"), filepath.Join(dataVol, "var", "logs")}
 		if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) || !reflect.DeepEqual(pure, want) {
 			t.Fatalf("ReadOnlyPaths = %v, Materialize = %v, want %v", pure, layout.ReadOnlyPaths(), want)
 		}

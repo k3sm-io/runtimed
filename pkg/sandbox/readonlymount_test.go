@@ -329,8 +329,9 @@ func TestReadOnlyConfigMapAtomicWriterDenied(t *testing.T) {
 
 // TestReadOnlyConfigMapAliasDeniesWrites pins a configMap mounted at two paths:
 // it is one directory at the first path and a symlink to it at the second.
-// The scope puts the read-only rule on the directory only, and a write through
-// the alias is denied as well, because Seatbelt judges the resolved path.
+// A write through the alias is denied, because Seatbelt judges the resolved
+// path, and the alias link itself cannot be unlinked or renamed, because the
+// scope lists its path too.
 func TestReadOnlyConfigMapAliasDeniesWrites(t *testing.T) {
 	box := roBox([]*runtimev1.Volume{{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cfg"}}},
 		&runtimev1.VolumeMount{Name: "cfg", MountPath: "/etc/cfg"})
@@ -355,5 +356,17 @@ func TestReadOnlyConfigMapAliasDeniesWrites(t *testing.T) {
 		if exists(filepath.Join(primary, "new")) {
 			t.Errorf("the pod created a file in the configMap through %s", dir)
 		}
+	}
+	// The alias link itself carries the rule: it cannot be unlinked, renamed
+	// aside, or moved with its parent.
+	_ = run("/bin/rm", "-f", alias)
+	_ = run("/bin/mv", alias, alias+".old")
+	srv := filepath.Dir(alias)
+	_ = run("/bin/mv", srv, srv+".old")
+	if fi, err := os.Lstat(alias); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the alias link %s was removed or replaced: %v, %v", alias, fi, err)
+	}
+	if exists(alias+".old") || exists(srv+".old") {
+		t.Errorf("the pod moved the alias link aside")
 	}
 }
