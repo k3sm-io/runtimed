@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -151,7 +152,7 @@ func TestSameVolumeDifferentMountPathsShareOneDir(t *testing.T) {
 		if got := layout.CredentialPaths(); !reflect.DeepEqual(got, wantCreds) {
 			t.Errorf("Layout.CredentialPaths() = %v, want %v", got, wantCreds)
 		}
-		pure, err := CredentialPaths(box, dataVol)
+		pure, err := planCredentialPaths(box, dataVol)
 		if err != nil {
 			t.Fatalf("CredentialPaths: %v", err)
 		}
@@ -206,7 +207,7 @@ func TestSameVolumeDifferentMountPathsShareOneDir(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "both target") {
 			t.Fatalf("Materialize = %v, want the destination conflict error", err)
 		}
-		if _, err := CredentialPaths(box, dataVol); err == nil {
+		if _, err := planCredentialPaths(box, dataVol); err == nil {
 			t.Fatal("CredentialPaths accepted two volumes at one path")
 		}
 	})
@@ -291,7 +292,7 @@ func TestNestedMountsUnderLinksAndCredentialsRefused(t *testing.T) {
 	for _, tc := range refused {
 		t.Run(tc.name, func(t *testing.T) {
 			dataVol := filepath.Join(t.TempDir(), "rootfs")
-			if _, err := CredentialPaths(tc.box, dataVol); err == nil || !strings.Contains(err.Error(), "is nested under") {
+			if _, err := planCredentialPaths(tc.box, dataVol); err == nil || !strings.Contains(err.Error(), "is nested under") {
 				t.Fatalf("CredentialPaths = %v, want the nesting refusal", err)
 			}
 			if _, err := Materialize(context.Background(), tc.box, dataVol, "", &r); err == nil || !strings.Contains(err.Error(), "is nested under") {
@@ -357,7 +358,7 @@ func TestCredentialPathsEqualsLayoutWithAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}
-	pure, err := CredentialPaths(box, dataVol)
+	pure, err := planCredentialPaths(box, dataVol)
 	if err != nil {
 		t.Fatalf("CredentialPaths: %v", err)
 	}
@@ -397,4 +398,23 @@ func TestPlaceAliasReplacesStaleLinkAtomically(t *testing.T) {
 	if len(names) != 1 {
 		t.Fatalf("entries under opt = %v, want only the alias", names)
 	}
+}
+
+// planCredentialPaths is the credential paths a pure walk of box derives: each
+// credential selection's directory and its aliases, sorted. It is what
+// Layout.CredentialPaths reports after a render.
+func planCredentialPaths(box *runtimev1.PodBox, dataVol string) ([]string, error) {
+	plans, err := planMounts(box, filepath.Clean(dataVol))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, pm := range plans {
+		if credentialSource(pm.vol) {
+			out = append(out, pm.dest)
+			out = append(out, aliasDests(pm.aliases)...)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

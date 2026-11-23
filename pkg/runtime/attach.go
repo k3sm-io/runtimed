@@ -81,7 +81,7 @@ import (
 //
 // The confinement profile IS rebuilt: it is recompiled from the spec and this
 // daemon's posture, through the pure halves of the create-time volume work
-// (mount.CredentialPaths, volume.Binder.Plan), and the pod is adopted only when
+// (mount.ReadOnlyPaths, volume.Binder.Plan), and the pod is adopted only when
 // that compilation hashes to the digest every adopted container recorded at
 // spawn (PodReapRecord.ProfileSHA256). A pod whose profile drifted — a changed
 // posture flag, a record from before the digest — is refused and created
@@ -527,8 +527,8 @@ func attachableContainers(box *runtimev1.PodBox) []*runtimev1.Container {
 }
 
 // boxProfile compiles a host-process pod's SBPL profile from its spec alone,
-// through the pure halves of the create-time volume work: mount.CredentialPaths
-// for the credential read-only sub-scope, volume.Binder.Plan for the PV
+// through the pure halves of the create-time volume work: mount.ReadOnlyPaths
+// for the read-only sub-scope, volume.Binder.Plan for the PV
 // read/write scope and the image volumes' links for their view grants
 // (linkedImageViews) and volume.PlanExposures for the exposure leaves, then
 // compileProfile — the derivation createPod feeds from
@@ -538,9 +538,9 @@ func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var credPaths []string
+	var roPaths []string
 	if len(box.GetVolumes()) > 0 {
-		if credPaths, err = mount.CredentialPaths(box, rootfs); err != nil {
+		if roPaths, _, err = mount.ReadOnlyPaths(box, rootfs); err != nil {
 			return "", err
 		}
 	}
@@ -564,7 +564,7 @@ func (r *Runtime) boxProfile(box *runtimev1.PodBox) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return r.compileProfile(box, rootfs, box.GetPodIp(), credPaths, pvWrite, pvRead, views, exposes)
+	return r.compileProfile(box, rootfs, box.GetPodIp(), roPaths, pvWrite, pvRead, views, exposes)
 }
 
 // isSidecarSpec reports whether an init-list container is a native sidecar

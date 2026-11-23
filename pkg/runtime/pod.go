@@ -650,12 +650,12 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
-	// projected) into the pod data volume. Secrets + the projected
-	// SA-token come back as credential paths that get the SBPL read-only
-	// sub-scope below. PVC sources are skipped here and bound by the
-	// volume.Binder below — they are durable, lifecycle-decoupled, and live
-	// outside the pod data volume.
-	var credPaths []string
+	// projected) into the pod data volume. Secrets, projected volumes and
+	// read_only mounts come back as the read-only paths that get the SBPL
+	// read-only sub-scope below (mount.ReadOnlyPaths). PVC sources are skipped
+	// here and bound by the volume.Binder below — they are durable,
+	// lifecycle-decoupled, and live outside the pod data volume.
+	var roPaths []string
 	var projState mount.RefreshState
 	if len(box.GetVolumes()) > 0 {
 		layout, merr := mount.Materialize(ctx, box, rootfs, ip, r.resolver)
@@ -663,8 +663,14 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("materialize volumes for pod %s: %w", box.GetPodId(), merr)
 		}
-		credPaths = layout.CredentialPaths()
+		roPaths = layout.ReadOnlyPaths()
 		projState = layout.State
+		// The pod has one profile, so a volume its containers mount both
+		// read-only and read-write at one path stays writable for all of them.
+		if len(layout.MixedReadOnly) > 0 {
+			r.log.Warn("volume mounted read-only by one container and read-write by another stays writable for the whole pod",
+				"pod", box.GetPodId(), "volumes", layout.MixedReadOnly)
+		}
 	}
 	// Link each image volume's view at its mount path; the views come back as
 	// the profile's read-only, no-exec grants.
@@ -733,7 +739,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
-	profile, err := r.compileProfile(box, rootfs, ip, credPaths, pvWritePaths, pvReadPaths, viewPaths, exposeLeaves)
+	profile, err := r.compileProfile(box, rootfs, ip, roPaths, pvWritePaths, pvReadPaths, viewPaths, exposeLeaves)
 	if err != nil {
 		if errors.Is(err, errInvalidPodBox) {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
@@ -919,8 +925,8 @@ func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 // this daemon's node posture: the one derivation createPod and AttachPod share,
 // so a pod re-attached after a daemon restart runs its restarted containers
 // under the profile the create compiled (AttachPod verifies that by hash;
-// profileDigest). rootfs is the pod's derived rootfs; ip is the pod IP; credPaths
-// are the credential mounts (the read-only sub-scope, mount.CredentialPaths);
+// profileDigest). rootfs is the pod's derived rootfs; ip is the pod IP; roPaths
+// are the read-only mounts (the read-only sub-scope, mount.ReadOnlyPaths);
 // pvWrite and pvRead are the bound PV dirs (volume.Binder.Plan); views are the
 // artifact view directories its image mounts link to (mount.LinkImageVolumes),
 // each granted read-only and no-exec; exposes are the pod's exposure leaves
@@ -929,7 +935,7 @@ func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 //
 // An underived data volume is errInvalidPodBox (wrapped); any other failure is
 // the generator's.
-func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credPaths, pvWrite, pvRead, views, exposes []string) (string, error) {
+func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, roPaths, pvWrite, pvRead, views, exposes []string) (string, error) {
 	// The data volume the profile is about to re-allow read+write must be one this
 	// runtime derived for this pod. Checked here, immediately before the
 	// only call that consumes it: sandbox.Generate emits it after the protected
@@ -991,7 +997,7 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, credP
 			ShadowBinDir: r.cfg.ShadowBinDir,
 		},
 		PodIP:         ip,
-		ReadOnlyPaths: credPaths,
+		ReadOnlyPaths: roPaths,
 		WritePaths:    pvWrite,
 		ReadPaths:     pvRead,
 		// Each image volume's view: read, never write, exec or map executable.

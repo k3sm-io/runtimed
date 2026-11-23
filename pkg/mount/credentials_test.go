@@ -18,6 +18,7 @@ package mount
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -25,13 +26,14 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestCredentialPathsMatchesMaterialize pins CredentialPaths as the pure half
-// of Materialize's credential verdict: over every volume source kind, with and
-// without a subPath, the paths it derives from the spec alone equal the ones a
-// real render reports. A daemon re-attaching to a pod recompiles the pod's SBPL
-// read-only sub-scope from this, so a disagreement would compile a different
-// profile than the create did.
-func TestCredentialPathsMatchesMaterialize(t *testing.T) {
+// TestReadOnlyPathsMatchesMaterialize pins ReadOnlyPaths as the pure half of
+// Materialize's read-only verdict: over every volume source kind, with and
+// without a subPath, and with and without read_only on the mount, the paths it
+// derives from the spec alone equal the ones a real render reports, and every
+// credential is among them. A daemon re-attaching to a pod recompiles the pod's
+// SBPL read-only sub-scope from this, so a disagreement would compile a
+// different profile than the create did.
+func TestReadOnlyPathsMatchesMaterialize(t *testing.T) {
 	r := fakeResolver{
 		cms:     map[string]map[string][]byte{"cm": {"k": []byte("v")}},
 		secrets: map[string]map[string][]byte{"sec": {"k": []byte("s")}},
@@ -52,6 +54,8 @@ func TestCredentialPathsMatchesMaterialize(t *testing.T) {
 		vol        *runtimev1.Volume
 		subPath    string
 		credential bool
+		// projected is a projected volume: read-only whatever the mount says.
+		projected bool
 	}{
 		{name: "configMap", vol: &runtimev1.Volume{Name: "v", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}}},
 		{name: "secret", vol: &runtimev1.Volume{Name: "v", Secret: &runtimev1.SecretVolumeSource{SecretName: "sec"}}, credential: true},
@@ -59,42 +63,94 @@ func TestCredentialPathsMatchesMaterialize(t *testing.T) {
 		{name: "downwardAPI", vol: &runtimev1.Volume{Name: "v", DownwardApi: &runtimev1.DownwardAPIVolumeSource{Items: []*runtimev1.DownwardAPIVolumeFile{
 			{Path: "name", FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
 		}}}},
-		{name: "projected configMap", vol: projected(cmProj)},
-		{name: "projected downwardAPI", vol: projected(downProj)},
-		{name: "projected secret", vol: projected(cmProj, secProj), credential: true},
-		{name: "projected token", vol: projected(tokProj, cmProj), credential: true},
+		{name: "projected configMap", vol: projected(cmProj), projected: true},
+		{name: "projected downwardAPI", vol: projected(downProj), projected: true},
+		{name: "projected secret", vol: projected(cmProj, secProj), credential: true, projected: true},
+		{name: "projected token", vol: projected(tokProj, cmProj), credential: true, projected: true},
 		{name: "persistentVolumeClaim is not materialized here", vol: &runtimev1.Volume{Name: "v", PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}},
 		{name: "subPath of a configMap", vol: &runtimev1.Volume{Name: "v", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}}, subPath: "k"},
 		{name: "subPath of a secret", vol: &runtimev1.Volume{Name: "v", Secret: &runtimev1.SecretVolumeSource{SecretName: "sec"}}, subPath: "k", credential: true},
 		{name: "subPath of an emptyDir", vol: &runtimev1.Volume{Name: "v", EmptyDir: &runtimev1.EmptyDirVolumeSource{}}, subPath: "d"},
-		{name: "subPath of a projected token", vol: projected(tokProj), subPath: "token", credential: true},
+		{name: "subPath of a projected token", vol: projected(tokProj), subPath: "token", credential: true, projected: true},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dataVol := filepath.Join(t.TempDir(), "rootfs")
-			box := boxWith(tc.vol)
-			box.Containers[0].VolumeMounts[0].SubPath = tc.subPath
-			layout, err := Materialize(context.Background(), box, dataVol, "10.1.2.3", r)
-			if err != nil {
-				t.Fatalf("Materialize: %v", err)
-			}
-			pure, err := CredentialPaths(box, dataVol)
-			if err != nil {
-				t.Fatalf("CredentialPaths: %v", err)
-			}
-			rendered := layout.CredentialPaths()
-			if !reflect.DeepEqual(pure, rendered) {
-				t.Fatalf("CredentialPaths = %v, Materialize reported %v", pure, rendered)
-			}
-			var want []string
-			if tc.credential {
-				want = []string{filepath.Join(dataVol, "etc", "v")}
-			}
-			if !reflect.DeepEqual(pure, want) {
-				t.Fatalf("CredentialPaths = %v, want %v", pure, want)
-			}
-		})
+		for _, readOnly := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/readOnly=%v", tc.name, readOnly), func(t *testing.T) {
+				dataVol := filepath.Join(t.TempDir(), "rootfs")
+				box := boxWith(tc.vol)
+				box.Containers[0].VolumeMounts[0].SubPath = tc.subPath
+				box.Containers[0].VolumeMounts[0].ReadOnly = readOnly
+				layout, err := Materialize(context.Background(), box, dataVol, "10.1.2.3", r)
+				if err != nil {
+					t.Fatalf("Materialize: %v", err)
+				}
+				pure, mixed, err := ReadOnlyPaths(box, dataVol)
+				if err != nil {
+					t.Fatalf("ReadOnlyPaths: %v", err)
+				}
+				if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) {
+					t.Fatalf("ReadOnlyPaths = %v, Materialize reported %v", pure, layout.ReadOnlyPaths())
+				}
+				if len(mixed) != 0 || len(layout.MixedReadOnly) != 0 {
+					t.Fatalf("one container reported mixed volumes: pure %v, Materialize %v", mixed, layout.MixedReadOnly)
+				}
+				placed := filepath.Join(dataVol, "etc", "v")
+				var wantCreds, wantRO []string
+				if tc.credential {
+					wantCreds = []string{placed}
+				}
+				materialized := tc.vol.GetPersistentVolumeClaim() == nil
+				if materialized && (tc.credential || tc.projected || readOnly) {
+					wantRO = []string{placed}
+				}
+				if got := layout.CredentialPaths(); !reflect.DeepEqual(got, wantCreds) {
+					t.Fatalf("CredentialPaths = %v, want %v", got, wantCreds)
+				}
+				if !reflect.DeepEqual(pure, wantRO) {
+					t.Fatalf("ReadOnlyPaths = %v, want %v", pure, wantRO)
+				}
+			})
+		}
 	}
+
+	t.Run("read_only is per path, over every container", func(t *testing.T) {
+		scratch := &runtimev1.Volume{Name: "scratch", EmptyDir: &runtimev1.EmptyDirVolumeSource{}}
+		cm := &runtimev1.Volume{Name: "cm", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}}
+		mnt := func(name, path string, ro bool) *runtimev1.VolumeMount {
+			return &runtimev1.VolumeMount{Name: name, MountPath: path, ReadOnly: ro}
+		}
+		dataVol := filepath.Join(t.TempDir(), "rootfs")
+		box := &runtimev1.PodBox{
+			PodId: "pod-1", Namespace: "default", Name: "demo",
+			Volumes: []*runtimev1.Volume{scratch, cm},
+			InitContainers: []*runtimev1.Container{{Name: "init", VolumeMounts: []*runtimev1.VolumeMount{
+				mnt("scratch", "/work", false), // read-write here, read-only in main: stays writable
+				mnt("cm", "/etc/cm", true),
+			}}},
+			Containers: []*runtimev1.Container{{Name: "main", VolumeMounts: []*runtimev1.VolumeMount{
+				mnt("scratch", "/work", true),
+				mnt("scratch", "/ro-work", true), // an alias of the writable /work
+				mnt("cm", "/etc/cm", true),       // read-only everywhere
+			}}},
+		}
+		layout, err := Materialize(context.Background(), box, dataVol, "10.1.2.3", r)
+		if err != nil {
+			t.Fatalf("Materialize: %v", err)
+		}
+		pure, mixed, err := ReadOnlyPaths(box, dataVol)
+		if err != nil {
+			t.Fatalf("ReadOnlyPaths: %v", err)
+		}
+		// /ro-work is an alias of scratch's one directory (at /work), which a
+		// container mounts read-write: it stays writable.
+		want := []string{filepath.Join(dataVol, "etc", "cm")}
+		if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) || !reflect.DeepEqual(pure, want) {
+			t.Fatalf("ReadOnlyPaths = %v, Materialize = %v, want %v", pure, layout.ReadOnlyPaths(), want)
+		}
+		if wantMixed := []string{"scratch"}; !reflect.DeepEqual(mixed, wantMixed) || !reflect.DeepEqual(layout.MixedReadOnly, wantMixed) {
+			t.Fatalf("mixed = %v, Materialize = %v, want %v", mixed, layout.MixedReadOnly, wantMixed)
+		}
+	})
 
 	t.Run("every source in one box", func(t *testing.T) {
 		dataVol := filepath.Join(t.TempDir(), "rootfs")
@@ -109,21 +165,21 @@ func TestCredentialPathsMatchesMaterialize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Materialize: %v", err)
 		}
-		pure, err := CredentialPaths(box, dataVol)
+		pure, _, err := ReadOnlyPaths(box, dataVol)
 		if err != nil {
-			t.Fatalf("CredentialPaths: %v", err)
+			t.Fatalf("ReadOnlyPaths: %v", err)
 		}
 		want := []string{filepath.Join(dataVol, "etc", "sec"), filepath.Join(dataVol, "etc", "tok")}
-		if !reflect.DeepEqual(pure, layout.CredentialPaths()) || !reflect.DeepEqual(pure, want) {
-			t.Fatalf("CredentialPaths = %v, Materialize = %v, want %v", pure, layout.CredentialPaths(), want)
+		if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) || !reflect.DeepEqual(pure, want) {
+			t.Fatalf("ReadOnlyPaths = %v, Materialize = %v, want %v", pure, layout.ReadOnlyPaths(), want)
 		}
 	})
 
 	t.Run("an undefined volume is refused by both halves", func(t *testing.T) {
 		box := boxWith(&runtimev1.Volume{Name: "cm", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}})
 		box.Volumes = nil
-		if _, err := CredentialPaths(box, t.TempDir()); err == nil {
-			t.Fatal("CredentialPaths accepted a mount of an undefined volume")
+		if _, _, err := ReadOnlyPaths(box, t.TempDir()); err == nil {
+			t.Fatal("ReadOnlyPaths accepted a mount of an undefined volume")
 		}
 	})
 }

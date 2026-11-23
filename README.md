@@ -45,6 +45,10 @@ never talks to the control plane directly.
   A volume mounted at several paths is one directory, and each extra path is a symlink to it.
   A mount nested under such a path, under an image, PVC or exposure mount, or under a Secret
   or other credential volume is refused when the Pod is created.
+  Secrets, projected volumes and `readOnly: true` mounts are made read-only by the Pod's sandbox
+  profile. A Pod has one profile for all its containers, so `readOnly` is enforced per mount path:
+  when one container mounts a volume read-only and another mounts it read-write at the same path,
+  it stays writable for every container, and the runtime logs a warning naming the volume.
 - **`runtime`** — the in-process runtime server that implements the `apis` runtime gRPC contract.
   It wires together `image`, `sandbox`, and `supervisor` behind the Pod-level API a caller
   actually talks to.
