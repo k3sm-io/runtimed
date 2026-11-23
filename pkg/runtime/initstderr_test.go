@@ -19,10 +19,13 @@ package runtime
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/crilog"
@@ -105,21 +108,21 @@ func TestFailedInitStderrSurvivesRejectedCreate(t *testing.T) {
 			name:    "one stderr line",
 			payload: line + "\n",
 			code:    74,
-			want:    []string{"init container install-tools exited 74: ", line},
+			want:    []string{line},
 		},
 		{
 			name:    "10 KB of output is bounded to the last lines",
 			payload: big.String(),
 			code:    74,
-			want:    []string{"init container install-tools exited 74: ", "final " + line},
-			deny:    []string{"noise line " + strings.Repeat("x", 40) + " a\n"},
+			want:    []string{"final " + line},
+			deny:    []string{"noise line " + strings.Repeat("x", 40) + " a |"},
 		},
 		{
 			name:    "control bytes and invalid UTF-8 are stripped",
-			payload: "bad\x1b[31mred\x1b[0m\x00nul\x07bell\xff\xfeend\r\n",
+			payload: "bad\x1b[31mred\x1b[0m\x00nul\x07bell\xff\xfe\u200b\ufeff\U000e0041\ue000end\r\n",
 			code:    74,
-			want:    []string{"init container install-tools exited 74: ", "bad", "red", "nul", "bell", "end"},
-			deny:    []string{"\x1b", "\x00", "\x07", "\xff", "\r"},
+			want:    []string{"bad", "red", "nul", "bell", "end"},
+			deny:    []string{"\x1b", "\x00", "\x07", "\xff", "\r", "\u200b", "\ufeff", "\U000e0041", "\ue000"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -143,26 +146,16 @@ func TestFailedInitStderrSurvivesRejectedCreate(t *testing.T) {
 				t.Errorf("failure_reason = %v, want SPAWN", got)
 			}
 			msg := resp.GetError().GetMessage()
+			tail := rejectionTail(t, msg)
 			for _, w := range tc.want {
-				if !strings.Contains(msg, w) {
+				if !strings.Contains(tail, w) {
 					t.Errorf("rejection %q does not carry %q", msg, w)
 				}
 			}
 			for _, d := range tc.deny {
-				if strings.Contains(msg, d) {
+				if strings.Contains(tail, d) {
 					t.Errorf("rejection %q carries %q", msg, d)
 				}
-			}
-			if !utf8.ValidString(msg) {
-				t.Errorf("rejection %q is not valid UTF-8", msg)
-			}
-			prefix := "init container install-tools exited 74: "
-			tail := strings.TrimPrefix(msg, prefix)
-			if len(tail) > initTailMaxBytes {
-				t.Errorf("tail is %d bytes, want at most %d", len(tail), initTailMaxBytes)
-			}
-			if n := strings.Count(tail, "\n") + 1; n > initTailMaxLines {
-				t.Errorf("tail has %d lines, want at most %d", n, initTailMaxLines)
 			}
 			if c := strings.Count(logs.String(), "init container failed"); c != 1 {
 				t.Errorf("logged the tail %d times at Warn, want once:\n%s", c, logs.String())
@@ -233,7 +226,8 @@ func TestFailedShimInitStderrSurvivesRejectedCreate(t *testing.T) {
 			spec := &runtimev1.Container{Name: "install-tools"}
 			cp := &containerProc{
 				name: "install-tools", spec: spec, initDeclared: true, proc: proc,
-				state: &runtimev1.ContainerStatus{Name: "install-tools", LogPath: logPath},
+				state:    &runtimev1.ContainerStatus{Name: "install-tools", LogPath: logPath},
+				logIdent: identOfPath(t, logPath),
 			}
 			p := &pod{box: &runtimev1.PodBox{PodId: "pod-shim-init", InitContainers: []*runtimev1.Container{spec}},
 				containers: []*containerProc{cp}}
@@ -246,15 +240,12 @@ func TestFailedShimInitStderrSurvivesRejectedCreate(t *testing.T) {
 				t.Errorf("reason = %v, want SPAWN", reason)
 			}
 			msg := createFailure(reason, err).GetError().GetMessage()
-			if !strings.HasPrefix(msg, "init container install-tools exited 74: ") || !strings.Contains(msg, tc.want) {
+			tail := rejectionTail(t, msg)
+			if !strings.Contains(tail, tc.want) {
 				t.Errorf("rejection %q does not carry %q", msg, tc.want)
 			}
-			if strings.Contains(msg, "stderr F ") {
+			if strings.Contains(tail, "stderr F ") {
 				t.Errorf("rejection %q carries CRI framing", msg)
-			}
-			if tail := strings.TrimPrefix(msg, "init container install-tools exited 74: "); len(tail) > initTailMaxBytes ||
-				strings.Count(tail, "\n")+1 > initTailMaxLines {
-				t.Errorf("tail %q exceeds the bounds", tail)
 			}
 			if c := strings.Count(logs.String(), "init container failed"); c != 1 {
 				t.Errorf("logged the tail %d times at Warn, want once:\n%s", c, logs.String())
@@ -269,4 +260,57 @@ func repeatLines(l string, n int) []string {
 		out[i] = l
 	}
 	return out
+}
+
+// rejectionTail checks that msg is "init container install-tools exited 74:
+// output: <quoted>", with the quoted tail one line within the bounds, valid
+// UTF-8 and free of control, format and private-use runes, and returns the
+// unquoted tail.
+func rejectionTail(t *testing.T, msg string) string {
+	t.Helper()
+	const prefix = "init container install-tools exited 74: output: "
+	if !strings.HasPrefix(msg, prefix) {
+		t.Fatalf("rejection %q does not start with %q", msg, prefix)
+	}
+	tail, err := strconv.Unquote(strings.TrimPrefix(msg, prefix))
+	if err != nil {
+		t.Fatalf("rejection %q: the output is not one quoted string: %v", msg, err)
+	}
+	if len(tail) > initTailMaxBytes {
+		t.Errorf("tail is %d bytes, want at most %d", len(tail), initTailMaxBytes)
+	}
+	if n := strings.Count(tail, tailLineSep) + 1; n > initTailMaxLines {
+		t.Errorf("tail has %d lines, want at most %d", n, initTailMaxLines)
+	}
+	assertTailRunes(t, tail)
+	return tail
+}
+
+// assertTailRunes fails on invalid UTF-8 or any Cc, Cf or Co rune.
+func assertTailRunes(t *testing.T, tail string) {
+	t.Helper()
+	if !utf8.ValidString(tail) {
+		t.Fatalf("tail %q is not valid UTF-8", tail)
+	}
+	for _, r := range tail {
+		if unicode.In(r, unicode.Cc, unicode.Cf, unicode.Co) {
+			t.Fatalf("tail %q carries rune %U", tail, r)
+		}
+	}
+}
+
+// identOfPath is the device and inode of the file at path, as spawnBesideShim
+// records them from the descriptor it opened.
+func identOfPath(t *testing.T, path string) logFileIdent {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	id, err := fileIdentOf(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }

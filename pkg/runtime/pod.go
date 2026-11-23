@@ -395,6 +395,10 @@ type containerProc struct {
 	// other container, and for one whose output its resident shim pumps
 	// (failedInitTail reads that one's log file instead).
 	tail *outputTail
+	// logIdent is the device and inode of the CRI log file runtimed created
+	// for a resident-shim container (spawnBesideShim); zero otherwise. A
+	// read-back of that file must find the same file (readCRILogTail).
+	logIdent logFileIdent
 	// state is updated as the container runs/terminates.
 	state *runtimev1.ContainerStatus
 	// restarting marks the container as mid-RestartContainer: its old process is
@@ -1823,7 +1827,7 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	if werr != nil {
 		if tail != "" {
 			return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
-				fmt.Errorf("init container %s wait: %w: %s", cp.name, werr, tail)
+				fmt.Errorf("init container %s wait: %w: output: %s", cp.name, werr, tail)
 		}
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s wait: %w", cp.name, werr)
@@ -1831,7 +1835,7 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	if code != 0 {
 		if tail != "" {
 			return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
-				fmt.Errorf("init container %s exited %d: %s", cp.name, code, tail)
+				fmt.Errorf("init container %s exited %d: output: %s", cp.name, code, tail)
 		}
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s exited %d", cp.name, code)
@@ -1839,9 +1843,17 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 }
 
-// failedInitTail renders a failed plain init container's output tail and logs
-// it once at Warn. It returns "" when the container printed nothing printable
-// or its output cannot be read.
+// failedInitTail renders a failed plain init container's output tail as one
+// quoted line (strconv.Quote over outputTail.render) and logs that same value
+// once at Warn. It returns "" when the container printed nothing printable or
+// its output cannot be read.
+//
+// Locking: it holds no runtime-wide lock. Its callers, finishInitStep under
+// startSequence (from createPod, which runs after CreatePod has released r.mu)
+// and resumeInitSequence (StartContainer, likewise outside r.mu), hold neither
+// r.mu nor p.mu here, and p.mu is taken below only to read the log path, never
+// across the bounded drain wait or the file read, so a slow drain delays only
+// this pod's create or start.
 //
 // On the in-daemon pump path (cp.tail set) it first waits, bounded by the
 // drain grace, for the log pumps to reach EOF: the reaper unblocks Wait
@@ -1873,7 +1885,7 @@ func (r *Runtime) failedInitTail(p *pod, cp *containerProc, code int, werr error
 		if logPath == "" {
 			return ""
 		}
-		t, err := readCRILogTail(logPath)
+		t, err := readCRILogTail(logPath, cp.logIdent)
 		if err != nil {
 			r.log.Warn("could not read a failed init container's log tail",
 				"pod", p.box.GetPodId(), "container", cp.name, "err", err)
@@ -1883,11 +1895,13 @@ func (r *Runtime) failedInitTail(p *pod, cp *containerProc, code int, werr error
 	default:
 		return ""
 	}
-	if tail != "" {
-		r.log.Warn("init container failed; its last output follows",
-			"pod", p.box.GetPodId(), "container", cp.name, "exit_code", code, "wait_err", werr, "output", tail)
+	if tail == "" {
+		return ""
 	}
-	return tail
+	quoted := strconv.Quote(tail)
+	r.log.Warn("init container failed; its last output follows",
+		"pod", p.box.GetPodId(), "container", cp.name, "exit_code", code, "wait_err", werr, "output", quoted)
+	return quoted
 }
 
 // blockRemainingLocked records every init container from index fromInit onward,
@@ -2026,18 +2040,19 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	// CRI log itself and outlives this daemon, or — for a backend whose helper
 	// cannot stay resident — through pipes into a log writer held here.
 	var (
-		logw    *crilog.Writer
-		fanout  *logFanout
-		tail    *outputTail
-		proc    *supervisor.Process
-		shimDir string
+		logw     *crilog.Writer
+		fanout   *logFanout
+		tail     *outputTail
+		logIdent logFileIdent
+		proc     *supervisor.Process
+		shimDir  string
 	)
 	if hostsResidentShim(r.backend) {
 		if shimDir, err = r.containerShimDir(p, c.GetName()); err != nil {
 			_ = cleanup()
 			return nil, runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP, err
 		}
-		proc, cleanup, err = r.spawnBesideShim(p, shimLaunchPlan{
+		proc, cleanup, logIdent, err = r.spawnBesideShim(p, shimLaunchPlan{
 			podID: p.box.GetPodId(), container: c.GetName(),
 			shimPath: shimPath, shimArgv: shimArgv,
 			env: env, argv0: argv0, workingDir: workingDir, logPath: logPath,
@@ -2079,6 +2094,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		logw:         logw,
 		fanout:       fanout,
 		tail:         tail,
+		logIdent:     logIdent,
 		env:          env,
 		workingDir:   workingDir,
 		proc:         proc,

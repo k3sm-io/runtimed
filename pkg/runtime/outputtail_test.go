@@ -20,9 +20,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,16 +38,107 @@ func TestReadCRILogTailRefusesNonRegularFiles(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readCRILogTail(link); err == nil {
+	if _, err := readCRILogTail(link, identOfPath(t, target)); err == nil {
 		t.Error("read a tail through a symlink")
 	}
 	fifo := filepath.Join(dir, "fifo.log")
 	if err := unix.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readCRILogTail(fifo); err == nil {
+	if _, err := readCRILogTail(fifo, identOfPath(t, target)); err == nil {
 		t.Error("read a tail from a FIFO")
 	}
+}
+
+// TestReadCRILogTailIsBoundToTheCreatedFile: the shim-path read goes ahead
+// only for the very file runtimed created at the path. Every way of making
+// the path name some other file yields no tail.
+func TestReadCRILogTailIsBoundToTheCreatedFile(t *testing.T) {
+	const frame = "2026-01-01T00:00:00Z stderr F the real line\n"
+	setup := func(t *testing.T) (dir, path string, id logFileIdent) {
+		dir = t.TempDir()
+		path = filepath.Join(dir, "init", "0.log")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(frame), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return dir, path, identOfPath(t, path)
+	}
+
+	t.Run("the created file is read", func(t *testing.T) {
+		_, path, id := setup(t)
+		tail, err := readCRILogTail(path, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := tail.render(); got != "the real line" {
+			t.Errorf("tail = %q", got)
+		}
+	})
+	t.Run("a file swapped in at the path", func(t *testing.T) {
+		_, path, id := setup(t)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(frame), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCRILogTail(path, id); err == nil {
+			t.Error("read a tail from a different inode")
+		}
+	})
+	t.Run("a hard link to another file", func(t *testing.T) {
+		dir, path, id := setup(t)
+		other := filepath.Join(dir, "other")
+		if err := os.WriteFile(other, []byte(frame), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(other, path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCRILogTail(path, id); err == nil {
+			t.Error("read a tail through a hard link to another file")
+		}
+	})
+	t.Run("an extra hard link to the created file", func(t *testing.T) {
+		dir, path, id := setup(t)
+		if err := os.Link(path, filepath.Join(dir, "extra")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCRILogTail(path, id); err == nil {
+			t.Error("read a tail from a file with two links")
+		}
+	})
+	t.Run("a symlinked parent directory", func(t *testing.T) {
+		dir, path, id := setup(t)
+		elsewhere := filepath.Join(dir, "elsewhere")
+		if err := os.MkdirAll(elsewhere, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(elsewhere, "0.log"), []byte(frame), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(elsewhere, filepath.Dir(path)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCRILogTail(path, id); err == nil {
+			t.Error("read a tail through a symlinked parent directory")
+		}
+	})
+	t.Run("no recorded identity", func(t *testing.T) {
+		_, path, _ := setup(t)
+		if _, err := readCRILogTail(path, logFileIdent{}); err == nil {
+			t.Error("read a tail with no recorded identity")
+		}
+	})
 }
 
 // TestCRITailSkipsTheCutFragmentAndBadFrames: a mid-file read drops its first
@@ -62,7 +151,7 @@ func TestCRITailSkipsTheCutFragmentAndBadFrames(t *testing.T) {
 		"2026-01-01T00:00:00Z stderr X bad tag\n" +
 		"2026-01-01T00:00:00Z stderr P two-\n" +
 		"2026-01-01T00:00:00Z stderr F joined\n"
-	if got, want := criTail([]byte(in), true).render(), "one\ntwo-joined"; got != want {
+	if got, want := criTail([]byte(in), true).render(), "one | two-joined"; got != want {
 		t.Errorf("tail = %q, want %q", got, want)
 	}
 }
@@ -91,21 +180,48 @@ func FuzzParseCRILine(f *testing.F) {
 			t.Fatalf("message %q is not the end of line %q", msg, b)
 		}
 		for _, cut := range []bool{false, true} {
-			out := criTail(b, cut).render()
-			if len(out) > initTailMaxBytes {
-				t.Fatalf("tail is %d bytes", len(out))
-			}
-			if out != "" && strings.Count(out, "\n")+1 > initTailMaxLines {
-				t.Fatalf("tail has too many lines: %q", out)
-			}
-			if !utf8.ValidString(out) {
-				t.Fatalf("tail is not valid UTF-8: %q", out)
-			}
-			for _, r := range out {
-				if r != '\n' && (r < 0x20 || r == 0x7f) {
-					t.Fatalf("tail carries control byte %q", r)
-				}
-			}
+			checkTailInvariants(t, criTail(b, cut))
 		}
 	})
+}
+
+// FuzzOutputTailRecord fuzzes the in-daemon ring: data is cut into chunks
+// whose lengths and partial flags come from shape, as the two pumps would
+// deliver them, and the rendered tail must keep the message rules.
+func FuzzOutputTailRecord(f *testing.F) {
+	f.Add([]byte("yurei-agentd install-tree: refused io-error"), []byte{0x40})
+	f.Add([]byte("a\x1b[31mb\x00c\xff\xfe\u200b\ufeff\U000e0041\ue000d"), []byte{3, 5, 7, 2})
+	f.Add(bytes.Repeat([]byte("noise line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"), 200), []byte{0xff, 0x80, 0x01})
+	f.Add([]byte("\xe2\x80\xae\xe2\x80"), []byte{1, 1, 1, 1, 1})
+	f.Add(bytes.Repeat([]byte{'z'}, 9000), []byte{0xfe, 0xfe, 0xfe})
+	f.Fuzz(func(t *testing.T, data, shape []byte) {
+		tail := &outputTail{}
+		for i := 0; len(data) > 0; i++ {
+			n := len(data)
+			partial := false
+			if len(shape) > 0 {
+				s := shape[i%len(shape)]
+				n = min(n, int(s)*37+1)
+				partial = s&1 == 1
+			}
+			tail.record(data[:n], partial)
+			data = data[n:]
+		}
+		checkTailInvariants(t, tail)
+	})
+}
+
+// checkTailInvariants asserts the message rules on a tail: at most
+// initTailMaxLines lines, a rendered line within initTailMaxBytes, valid
+// UTF-8, and no Cc, Cf or Co rune.
+func checkTailInvariants(t *testing.T, tail *outputTail) {
+	t.Helper()
+	if n := len(tail.renderLines()); n > initTailMaxLines {
+		t.Fatalf("tail has %d lines", n)
+	}
+	out := tail.render()
+	if len(out) > initTailMaxBytes {
+		t.Fatalf("tail is %d bytes", len(out))
+	}
+	assertTailRunes(t, out)
 }

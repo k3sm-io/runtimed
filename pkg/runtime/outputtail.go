@@ -19,6 +19,7 @@ package runtime
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"unicode"
@@ -89,13 +90,40 @@ func (t *outputTail) record(chunk []byte, partial bool) {
 	}
 }
 
-// render returns the tail as at most initTailMaxLines non-empty lines joined
-// by newlines, at most initTailMaxBytes long, with invalid UTF-8 and control
-// characters removed (a tab becomes a space). It returns "" when the
-// container printed nothing printable.
+// render returns the tail as ONE line: at most initTailMaxLines non-empty
+// output lines joined by " | ", at most initTailMaxBytes long, with invalid
+// UTF-8 and control, format and private-use characters removed (a tab
+// becomes a space). It returns "" when the container printed nothing
+// printable. The caller quotes it (strconv.Quote) before it goes into an
+// error or a log line.
 func (t *outputTail) render() string {
+	kept := t.renderLines()
+	out := strings.Join(kept, tailLineSep)
+	for len(out) > initTailMaxBytes && len(kept) > 1 {
+		kept = kept[1:]
+		out = strings.Join(kept, tailLineSep)
+	}
+	if len(out) > initTailMaxBytes {
+		// One line longer than the bound: keep its end, which is where a
+		// failing program usually says what went wrong.
+		const ellipsis = "..."
+		start := len(out) - (initTailMaxBytes - len(ellipsis))
+		for start < len(out) && !utf8.RuneStart(out[start]) {
+			start++
+		}
+		out = ellipsis + out[start:]
+	}
+	return out
+}
+
+// tailLineSep joins a rendered tail's lines into one line.
+const tailLineSep = " | "
+
+// renderLines returns the last initTailMaxLines non-empty sanitised lines of
+// the tail, each trimmed, before render bounds their joined length.
+func (t *outputTail) renderLines() []string {
 	if t == nil {
-		return ""
+		return nil
 	}
 	t.mu.Lock()
 	text := sanitizeTail(t.buf)
@@ -115,27 +143,15 @@ func (t *outputTail) render() string {
 	if len(kept) > initTailMaxLines {
 		kept = kept[len(kept)-initTailMaxLines:]
 	}
-	out := strings.Join(kept, "\n")
-	for len(out) > initTailMaxBytes && len(kept) > 1 {
-		kept = kept[1:]
-		out = strings.Join(kept, "\n")
-	}
-	if len(out) > initTailMaxBytes {
-		// One line longer than the bound: keep its end, which is where a
-		// failing program usually says what went wrong.
-		const ellipsis = "..."
-		start := len(out) - (initTailMaxBytes - len(ellipsis))
-		for start < len(out) && !utf8.RuneStart(out[start]) {
-			start++
-		}
-		out = ellipsis + out[start:]
-	}
-	return out
+	return kept
 }
 
-// sanitizeTail drops invalid UTF-8 and every control character except the
-// newline, and turns a tab into a space, so the tail cannot carry terminal
-// escapes, NULs or broken encodings into an Event or a log line.
+// sanitizeTail drops invalid UTF-8, every control character (Cc) except the
+// newline, every format character (Cf: zero-width characters, the BOM, bidi
+// overrides, tag characters), every private-use character (Co) and the
+// Unicode line and paragraph separators, and turns a tab into a space, so the
+// tail cannot carry terminal escapes, NULs, hidden or reordered text or broken
+// encodings into an Event or a log line.
 func sanitizeTail(b []byte) string {
 	var sb strings.Builder
 	sb.Grow(len(b))
@@ -149,8 +165,8 @@ func sanitizeTail(b []byte) string {
 			sb.WriteByte('\n')
 		case r == '\t':
 			sb.WriteByte(' ')
-		case unicode.IsControl(r), r == ' ', r == ' ', unicode.Is(unicode.Bidi_Control, r):
-			// control, line-separator and bidi-override runes: dropped
+		case unicode.In(r, unicode.Cc, unicode.Cf, unicode.Co), r == '\u2028', r == '\u2029':
+			// control, format, private-use and separator runes: dropped
 		default:
 			sb.WriteRune(r)
 		}
@@ -158,16 +174,42 @@ func sanitizeTail(b []byte) string {
 	return sb.String()
 }
 
+// logFileIdent names one file by device and inode. ok is false for the zero
+// value, which matches no file.
+type logFileIdent struct {
+	dev, ino uint64
+	ok       bool
+}
+
+// fileIdentOf returns the device and inode of the open file f.
+func fileIdentOf(f *os.File) (logFileIdent, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return logFileIdent{}, err
+	}
+	return logFileIdent{dev: uint64(st.Dev), ino: st.Ino, ok: true}, nil
+}
+
 // readCRILogTail builds a tail from the last shimLogTailBytes of the CRI log
-// file at path, which must be the path runtimed itself configured for the
-// container (its status log_path), never one taken from the pod.
+// file at path, provided it is still the very file runtimed created there
+// (want, recorded by spawnBesideShim from the descriptor it opened).
 //
-// The file's content is pod-written, so it is opened O_NOFOLLOW (a symlink in
-// the final component is refused) and O_NONBLOCK (a FIFO planted there cannot
-// hang the open), checked by fstat to be a regular file, and read with one
-// bounded pread from its end. The bytes are parsed by parseCRILine and fed to
-// an outputTail, so the message rules are those of the in-daemon path.
-func readCRILogTail(path string) (*outputTail, error) {
+// The path is derived from PodBox fields (log_directory and the container
+// name), not chosen by runtimed alone, and the file's content is pod-written,
+// so the path is not trusted to name the right file: the dev/ino binding is
+// what makes the read safe. After an O_NOFOLLOW|O_NONBLOCK open (a symlink in
+// the final component is refused, a FIFO cannot hang the open) the descriptor
+// is fstat'ed and the read goes ahead only for a regular file with the
+// recorded device and inode, exactly one link, owned by this daemon's euid. A
+// file swapped in at the path, a symlinked parent directory leading elsewhere,
+// or a hard link to some other file all fail that check, and the caller then
+// renders no tail. The read is one bounded pread from the end; the bytes are
+// parsed by parseCRILine and fed to an outputTail, so the message rules are
+// those of the in-daemon path.
+func readCRILogTail(path string, want logFileIdent) (*outputTail, error) {
+	if !want.ok {
+		return nil, fmt.Errorf("container log %s: no recorded identity", path)
+	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open container log %s: %w", path, err)
@@ -177,8 +219,15 @@ func readCRILogTail(path string) (*outputTail, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, fmt.Errorf("stat container log %s: %w", path, err)
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFREG:
 		return nil, fmt.Errorf("container log %s is not a regular file", path)
+	case uint64(st.Dev) != want.dev || st.Ino != want.ino:
+		return nil, fmt.Errorf("container log %s is not the file runtimed created", path)
+	case st.Nlink != 1:
+		return nil, fmt.Errorf("container log %s has %d links, want 1", path, st.Nlink)
+	case int64(st.Uid) != int64(os.Geteuid()):
+		return nil, fmt.Errorf("container log %s is owned by uid %d, not this daemon", path, st.Uid)
 	}
 	off := st.Size - shimLogTailBytes
 	if off < 0 {
