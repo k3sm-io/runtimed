@@ -45,6 +45,14 @@ never talks to the control plane directly.
   A volume mounted at several paths is one directory, and each extra path is a symlink to it.
   A mount nested under such a path, under an image, PVC or exposure mount, or under a Secret
   or other credential volume is refused when the Pod is created.
+  ConfigMap, Secret, downward API and projected volumes are always read-only, as under the
+  kubelet. An emptyDir is read-only when mounted `readOnly: true`; a Pod has one sandbox profile
+  for all its containers, so that is enforced per volume (and `subPath`): when one container mounts
+  an emptyDir read-only and another mounts it read-write, it stays writable for every container,
+  and the runtime logs a warning naming the volume. Only an emptyDir that every container mounts
+  read-only is protected: the common pattern of an init container populating an emptyDir that
+  later containers mount read-only leaves it writable. Ephemeral containers are added after the
+  profile is built and are not counted; they run under whatever the Pod's profile already says.
 - **`runtime`** — the in-process runtime server that implements the `apis` runtime gRPC contract.
   It wires together `image`, `sandbox`, and `supervisor` behind the Pod-level API a caller
   actually talks to.

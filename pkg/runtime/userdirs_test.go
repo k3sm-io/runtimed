@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"k3sm.io/runtimed/pkg/mount"
 	"k3sm.io/runtimed/pkg/sandbox"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -95,7 +96,7 @@ func TestPodUserDirs(t *testing.T) {
 		const podID = "pod-ud-prof"
 		box := hostBinBox(rt, podID)
 		mustCreatePod(t, rt, box)
-		prof, err := rt.compileProfile(box, derivedRootfs(t, rt, podID), "", nil, nil, nil, nil, nil)
+		prof, err := rt.compileProfile(box, derivedRootfs(t, rt, podID), "", mount.ReadOnlyScope{}, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -35,11 +35,14 @@ limitations under the License.
 // symlink there to that one directory (placeAlias), so an emptyDir an init
 // container fills is what the main container sees, as with the kubelet's one
 // directory per pod. Two different selections at one mount path are an error.
-// Mount.ReadOnly on an alias is the read-only intent of that container's mount,
-// not per-container enforcement: every alias reaches the same directory, and
-// the profile judges the resolved path, so a container that mounts the
-// selection read-only still writes it through the path's writable twin unless
-// the selection is a credential (whose sub-scope covers the one directory).
+// Mount.ReadOnly on an alias is the selection's verdict (below), the same as
+// on its directory. The profile judges the resolved path, so the read-only
+// rule on the directory covers the files through every alias. A read-only
+// selection's alias paths carry the rule too (Layout.Scope, ScopeFor), because
+// it is what keeps the link itself: without it a pod could unlink a secret's
+// alias and put its own directory there, and another container reading that
+// path would get forged contents. An alias's parents get the same ancestor
+// deny as the directory's, so the link cannot be moved aside with them.
 //
 // Nested mounts are refused at plan time when the daemon would walk through a
 // link it placed or plant entries inside a credential: a mount path under an
@@ -57,16 +60,41 @@ limitations under the License.
 // wires one backed by its apiserver client; unit tests wire a fake.
 //
 // Secrets and the projected ServiceAccount token are reported as credentials in
-// the returned Layout so the caller hands them to sandbox.Generate as the
-// read-only sub-scope (file-read* + an explicit file-write* deny): a pod cannot
-// write the files at its credential mount paths. That is a rule on paths, not
-// on the files: a pod can rename a parent of a credential mount aside (it
-// writes its rootfs), after which the live generation's files sit outside the
-// sub-scope and the pod can change them, and it can put a directory of its own
-// at the mount path. So the live generation's content is not
-// integrity-protected against the pod itself; the daemon never reads it back
-// unless it is the generation the daemon recorded (see below), and a refresh
-// of a replaced mount dir renders it fresh.
+// the returned Layout, and the Layout's ReadOnlyPaths go to sandbox.Generate as
+// the read-only sub-scope (file-read* + an explicit file-write* deny): a pod
+// cannot write the files at those mount paths. Every configMap, secret,
+// downwardAPI and projected mount is read-only whatever its read_only flag
+// says, as the kubelet has mounted these API-data volumes since 1.10.
+//
+// An emptyDir is read-only only when read_only is asked of it everywhere. The
+// pod's containers share ONE Seatbelt profile (the runtime compiles it per pod,
+// and every spawn and exec of the pod runs under it), so read_only is enforced
+// per selection (a volume plus its subPath), not per container: an emptyDir
+// mount is read-only only when every container that mounts the selection, at
+// any path, sets read_only. Where one container mounts it read-only and another
+// read-write, the selection stays writable for every container at every path,
+// and the volume is reported in Layout.MixedReadOnly so the runtime can warn.
+// This differs from the kubelet, where the read-only container alone would be
+// denied. The common pattern of an init container populating an emptyDir that
+// later containers mount read-only therefore leaves the emptyDir writable.
+//
+// The verdict is taken over the containers the pod is created with. An
+// ephemeral container is added after the profile is compiled and does not
+// count: it runs under the pod's profile as it stands, so it can write an
+// emptyDir the pod's containers left writable whatever its own mount says.
+//
+// Layout.Scope also reports the writable mount roots. One nested under a
+// read-only mount (an emptyDir at /app/tmp inside a configMap at /app) gets its
+// write back after the read-only deny, so it stays writable.
+//
+// The read-only sub-scope is a rule on paths, not on the files. So that a pod
+// cannot rename a read-only mount aside and write its files at the new path,
+// the profile also denies writes to the entry of every directory between the
+// data volume and a read-only mount (the pod still creates files inside
+// them). The pod still owns the rest of its rootfs, though, so the live
+// generation's content is not integrity-protected against the pod itself; the
+// daemon never reads it back unless it is the generation the daemon recorded
+// (see below), and a refresh of a replaced mount dir renders it fresh.
 //
 // # Refresh: the atomic-writer layout
 //

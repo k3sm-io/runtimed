@@ -37,7 +37,9 @@ import (
 // alias). Through the secret's alias a write, an unlink and a rename are
 // denied with EPERM and a read succeeds: the credential sub-scope covers the
 // one directory whichever path reaches it. Through the emptyDir's alias all
-// four succeed.
+// four succeed. The profile is built from Layout.Scope, as compileProfile
+// builds it: the secret's alias link carries the rule too, so it cannot be
+// unlinked and replaced.
 func TestSeatbeltThroughVolumeAlias(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Fatalf("sandbox-exec is missing, so nothing can be measured: %v", err)
@@ -69,9 +71,12 @@ func TestSeatbeltThroughVolumeAlias(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataVol, "yurei-project-tools", "k"), []byte("tool"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The scope compileProfile passes.
+	sc := layout.Scope()
 	prof, err := sandbox.Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, sandbox.GenerateOptions{
-		Posture:       sandbox.Posture{WorkDir: work},
-		ReadOnlyPaths: layout.CredentialPaths(),
+		Posture:            sandbox.Posture{WorkDir: work},
+		ReadOnlyPaths:      sc.ReadOnly,
+		WritableMountPaths: sc.Writable,
 	})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -112,14 +117,15 @@ func TestSeatbeltThroughVolumeAlias(t *testing.T) {
 
 	t.Run("emptyDir alias is writable", func(t *testing.T) {
 		alias := filepath.Join(dataVol, "opt", "tools")
-		for name, script := range map[string]string{
-			"read":   "cat " + alias + "/k",
-			"write":  "echo y > " + alias + "/w",
-			"rename": "mv " + alias + "/w " + alias + "/w2",
-			"unlink": "rm " + alias + "/w2",
+		// The steps build on each other, so they run in order.
+		for _, step := range []struct{ name, script string }{
+			{"read", "cat " + alias + "/k"},
+			{"write", "echo y > " + alias + "/w"},
+			{"rename", "mv " + alias + "/w " + alias + "/w2"},
+			{"unlink", "rm " + alias + "/w2"},
 		} {
-			if out, err := run(script); err != nil {
-				t.Fatalf("%s through the emptyDir alias: %v\n%s", name, err, out)
+			if out, err := run(step.script); err != nil {
+				t.Fatalf("%s through the emptyDir alias: %v\n%s", step.name, err, out)
 			}
 		}
 		if _, err := os.Lstat(filepath.Join(dataVol, "yurei-project-tools", "w2")); !os.IsNotExist(err) {
