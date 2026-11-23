@@ -3519,6 +3519,22 @@ const (
 	podModuleCacheName  = "clang-modules"
 )
 
+// xcrunDBEnv is the variable libxcrun reads for the absolute path of its
+// lookup cache file. Without it xcrun puts the cache under
+// confstr(_CS_DARWIN_USER_TEMP_DIR), the daemon uid's shared /var/folders
+// tree, which the profile denies, and warns "couldn't create cache file" on
+// every run. xcrun is a platform binary, so it ignores
+// DIRHELPER_USER_DIR_SUFFIX and never loads the path-rebase shim; its plain
+// environment is the one input it keeps (dyld scrubs only DYLD_*). The value
+// is a file in the pod temp dir, which provisionPodTmpDir makes 0700 at create
+// whatever else is on, so no SBPL change is needed. (Not the per-pod user temp
+// target: that dir exists only while the user dir links are on.) libxcrun
+// ignores a relative value.
+const xcrunDBEnv = "xcrun_db"
+
+// podXcrunDB is the pod's xcrun cache file, inside its data volume.
+func podXcrunDB(dataVol string) string { return filepath.Join(podTmpDir(dataVol), "xcrun_db") }
+
 // developerDirEnv is the environment variable Apple's toolchain shims consult
 // to locate the active developer directory, and the one containerEnv publishes
 // from a pod's validated SandboxProfile.xcode_toolchain_dir.
@@ -3635,7 +3651,7 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		}
 	}
 	env := make([]string, 0, len(base)+5)
-	if !envHasName(base, tmpDirEnv) || !envHasName(base, clangModuleCacheEnv) || !hostBinaryRoute(c) {
+	if !envHasName(base, tmpDirEnv) || !envHasName(base, clangModuleCacheEnv) || !envHasName(base, xcrunDBEnv) || !hostBinaryRoute(c) {
 		dataVol, err := r.rootfsPath(box)
 		if err != nil {
 			return nil, err
@@ -3652,6 +3668,10 @@ func (r *Runtime) containerEnv(box *runtimev1.PodBox, c *runtimev1.Container, ba
 		// cache keeps it.
 		if !envHasName(base, clangModuleCacheEnv) {
 			env = append(env, clangModuleCacheEnv+"="+podModuleCacheDir(dataVol))
+		}
+		// And for xcrun's cache file: a spec value wins.
+		if !envHasName(base, xcrunDBEnv) {
+			env = append(env, xcrunDBEnv+"="+podXcrunDB(dataVol))
 		}
 	}
 	// The per-pod Darwin user dir suffix (userdirs.go): only while both links
