@@ -99,7 +99,7 @@ func startTermProcSpawner(t *testing.T, dir, name string, spawner supervisor.Spa
 	t.Cleanup(func() { _ = logw.Close() })
 	fan := &logFanout{}
 
-	var sink supervisor.LogSink = containerLogSink(logw, fan)
+	var sink supervisor.LogSink = containerLogSink(logw, fan, nil)
 	if decorate != nil {
 		sink = decorate(sink)
 	}

@@ -390,6 +390,10 @@ type containerProc struct {
 	// fanout delivers the same chunks to live Attach subscribers. It retains
 	// nothing; see logFanout.
 	fanout *logFanout
+	// tail holds the last few KiB of a plain init container's output for the
+	// error that rejects its pod if it fails (outputTail). nil for every
+	// other container, and for one whose output its resident shim pumps.
+	tail *outputTail
 	// state is updated as the container runs/terminates.
 	state *runtimev1.ContainerStatus
 	// restarting marks the container as mid-RestartContainer: its old process is
@@ -1807,21 +1811,57 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	}
 	removeContainerLocked(p, cp.name)
 	p.mu.Unlock()
+	var tail string
 	if werr != nil || code != 0 {
+		tail = r.failedInitTail(p, cp, code, werr)
 		// The step refuses the sequence, and the entry just left p.containers,
 		// so no teardown will ever reach its log writer: release it here, on
 		// the drained-or-bounded terms a replaced instance's log gets.
 		r.releaseReplacedContainerLog(cp)
 	}
 	if werr != nil {
+		if tail != "" {
+			return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+				fmt.Errorf("init container %s wait: %w: %s", cp.name, werr, tail)
+		}
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s wait: %w", cp.name, werr)
 	}
 	if code != 0 {
+		if tail != "" {
+			return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
+				fmt.Errorf("init container %s exited %d: %s", cp.name, code, tail)
+		}
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s exited %d", cp.name, code)
 	}
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
+}
+
+// failedInitTail renders a failed plain init container's output tail and logs
+// it once at Warn. It first waits, bounded by the drain grace, for the log
+// pumps to reach EOF: the reaper unblocks Wait independently of the pumps, and
+// the dying container's last line (the one that says why) is exactly what an
+// early read would miss. It returns "" for a container with no tail (one whose
+// resident shim pumps its output) or no printable output.
+func (r *Runtime) failedInitTail(p *pod, cp *containerProc, code int, werr error) string {
+	if cp.tail == nil {
+		return ""
+	}
+	if cp.proc != nil {
+		timer := time.NewTimer(r.drainGraceDuration())
+		select {
+		case <-cp.proc.LogsDrained():
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+	tail := cp.tail.render()
+	if tail != "" {
+		r.log.Warn("init container failed; its last output follows",
+			"pod", p.box.GetPodId(), "container", cp.name, "exit_code", code, "wait_err", werr, "output", tail)
+	}
+	return tail
 }
 
 // blockRemainingLocked records every init container from index fromInit onward,
@@ -1962,6 +2002,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 	var (
 		logw    *crilog.Writer
 		fanout  *logFanout
+		tail    *outputTail
 		proc    *supervisor.Process
 		shimDir string
 	)
@@ -1987,6 +2028,9 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 				fmt.Errorf("open container log for %s: %w", c.GetName(), err)
 		}
 		fanout = &logFanout{}
+		if isInit && !isSidecarSpec(c) {
+			tail = &outputTail{}
+		}
 		// An EMPTY environment: env and the argv[0] override reach the
 		// exec-shim as its launch payload, never through its own environ.
 		proc = supervisor.NewProcess(r.spawner, r.waiter, supervisor.SpawnSpec{
@@ -1995,7 +2039,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 			Env:    []string{},
 			Launch: &supervisor.LaunchPayload{Env: env, Argv0: argv0},
 			Dir:    workingDir,
-		}, containerLogSink(logw, fanout))
+		}, containerLogSink(logw, fanout, tail))
 	}
 	closeLog := func() {
 		if logw != nil {
@@ -2008,6 +2052,7 @@ func (r *Runtime) startContainer(ctx context.Context, p *pod, rootfs string, c *
 		initDeclared: isInit,
 		logw:         logw,
 		fanout:       fanout,
+		tail:         tail,
 		env:          env,
 		workingDir:   workingDir,
 		proc:         proc,
