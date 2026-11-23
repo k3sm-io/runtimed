@@ -37,7 +37,8 @@ import (
 // alias). Through the secret's alias a write, an unlink and a rename are
 // denied with EPERM and a read succeeds: the credential sub-scope covers the
 // one directory whichever path reaches it. Through the emptyDir's alias all
-// four succeed.
+// four succeed. The profile is built from Layout.Scope, which puts the rule on
+// the directory and none on the alias link.
 func TestSeatbeltThroughVolumeAlias(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Fatalf("sandbox-exec is missing, so nothing can be measured: %v", err)
@@ -69,9 +70,12 @@ func TestSeatbeltThroughVolumeAlias(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataVol, "yurei-project-tools", "k"), []byte("tool"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The scope compileProfile passes: the rule is on the one directory.
+	sc := layout.Scope()
 	prof, err := sandbox.Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, sandbox.GenerateOptions{
-		Posture:       sandbox.Posture{WorkDir: work},
-		ReadOnlyPaths: layout.CredentialPaths(),
+		Posture:            sandbox.Posture{WorkDir: work},
+		ReadOnlyPaths:      sc.ReadOnly,
+		WritableMountPaths: sc.Writable,
 	})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -94,11 +98,10 @@ func TestSeatbeltThroughVolumeAlias(t *testing.T) {
 			t.Fatalf("read through the alias = %q, %v; want the secret", out, err)
 		}
 		for name, script := range map[string]string{
-			"write":       "echo x > " + alias + "/k",
-			"create":      "echo x > " + alias + "/new",
-			"unlink":      "rm -f " + alias + "/k",
-			"rename":      "mv " + alias + "/k " + alias + "/k2",
-			"unlink link": "rm -f " + alias,
+			"write":  "echo x > " + alias + "/k",
+			"create": "echo x > " + alias + "/new",
+			"unlink": "rm -f " + alias + "/k",
+			"rename": "mv " + alias + "/k " + alias + "/k2",
 		} {
 			out, err := run(script)
 			if err == nil || !strings.Contains(out, eperm) {

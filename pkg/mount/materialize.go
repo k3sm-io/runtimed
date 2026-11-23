@@ -648,10 +648,9 @@ func aliasDests(aliases []aliasMount) []string {
 // path-rebase shim at the alias's mount path reaches "<dataVol><mount path>"
 // and the kernel follows the link to dest. The Seatbelt profile judges the
 // resolved path, which is dest under the data volume, so the data volume's
-// grant covers it, and a credential's read-only sub-scope on dest covers every
-// access through the alias; the alias path itself is in the sub-scope as well
-// (Layout.Mounts, CredentialPaths), which keeps the link from being unlinked
-// or replaced.
+// grant covers it, and a read-only sub-scope on dest covers every access
+// through the alias. The alias path itself carries no rule (Layout.Scope skips
+// it): the link is the pod's own entry, as below.
 //
 // The parents of alias are created and opened from dataVol one component at
 // a time without following a link, and refused when one is a symlink or not

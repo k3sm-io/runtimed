@@ -35,11 +35,11 @@ limitations under the License.
 // symlink there to that one directory (placeAlias), so an emptyDir an init
 // container fills is what the main container sees, as with the kubelet's one
 // directory per pod. Two different selections at one mount path are an error.
-// Mount.ReadOnly on an alias is the read-only intent of that container's mount,
-// not per-container enforcement: every alias reaches the same directory, and
-// the profile judges the resolved path, so a container that mounts the
-// selection read-only still writes it through the path's writable twin unless
-// the selection is a credential (whose sub-scope covers the one directory).
+// Mount.ReadOnly on an alias is the selection's verdict (below), the same as
+// on its directory. The profile carries the read-only rule on the directory
+// only: it judges the resolved path, so the rule covers every access through
+// an alias, and a rule on the link's own path would cover nothing but the
+// link.
 //
 // Nested mounts are refused at plan time when the daemon would walk through a
 // link it placed or plant entries inside a credential: a mount path under an

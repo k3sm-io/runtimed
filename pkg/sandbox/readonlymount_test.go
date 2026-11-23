@@ -326,3 +326,34 @@ func TestReadOnlyConfigMapAtomicWriterDenied(t *testing.T) {
 		t.Errorf("key k = %q, %v; want v", b, err)
 	}
 }
+
+// TestReadOnlyConfigMapAliasDeniesWrites pins a configMap mounted at two paths:
+// it is one directory at the first path and a symlink to it at the second.
+// The scope puts the read-only rule on the directory only, and a write through
+// the alias is denied as well, because Seatbelt judges the resolved path.
+func TestReadOnlyConfigMapAliasDeniesWrites(t *testing.T) {
+	box := roBox([]*runtimev1.Volume{{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cfg"}}},
+		&runtimev1.VolumeMount{Name: "cfg", MountPath: "/etc/cfg"})
+	box.Containers = append(box.Containers, &runtimev1.Container{Name: "second", VolumeMounts: []*runtimev1.VolumeMount{
+		{Name: "cfg", MountPath: "/srv/cfg"},
+	}})
+	dataVol, run := roProfile(t, "roalias", box, roResolver{data: map[string][]byte{"k": []byte("v")}})
+	primary, alias := filepath.Join(dataVol, "etc", "cfg"), filepath.Join(dataVol, "srv", "cfg")
+	if fi, err := os.Lstat(alias); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s is not an alias link: %v, %v", alias, fi, err)
+	}
+	if err := run("/bin/cat", filepath.Join(alias, "k")); err != nil {
+		t.Fatalf("the configMap is not readable through its alias: %v", err)
+	}
+	for _, dir := range []string{primary, alias} {
+		_ = run("/bin/sh", "-c", `printf x >> "$1/k"`, "sh", dir)
+		_ = run("/usr/bin/touch", filepath.Join(dir, "new"))
+		_ = run("/bin/rm", "-f", filepath.Join(dir, "k"))
+		if b, err := os.ReadFile(filepath.Join(primary, "k")); err != nil || string(b) != "v" {
+			t.Errorf("after writes through %s, k = %q, %v; want v", dir, b, err)
+		}
+		if exists(filepath.Join(primary, "new")) {
+			t.Errorf("the pod created a file in the configMap through %s", dir)
+		}
+	}
+}

@@ -55,7 +55,10 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 	}
 	box.Containers = append(box.Containers, &runtimev1.Container{
 		Name: "writer", Image: "/bin/sleep",
-		VolumeMounts: []*runtimev1.VolumeMount{{Name: "shared", MountPath: "/shared"}},
+		VolumeMounts: []*runtimev1.VolumeMount{
+			{Name: "shared", MountPath: "/shared"},
+			{Name: "scratch", MountPath: "/scratch-alias", ReadOnly: true}, // an alias of /scratch
+		},
 	})
 	mustCreatePod(t, rt, box)
 
@@ -72,6 +75,9 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 		if !strings.Contains(stanza, "(subpath \""+p+"\")") {
 			t.Errorf("read-only mount %s is not in the profile's read-only sub-scope:\n%s", p, stanza)
 		}
+	}
+	if a := filepath.Join(rootfs, "scratch-alias"); strings.Contains(stanza, a) {
+		t.Errorf("alias link %s carries a rule; the directory at /scratch does:\n%s", a, stanza)
 	}
 	if shared := filepath.Join(rootfs, "shared"); strings.Contains(stanza, shared) {
 		t.Errorf("mixed mount %s is in the read-only sub-scope; one container mounts it read-write:\n%s", shared, stanza)
