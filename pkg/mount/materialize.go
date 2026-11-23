@@ -42,7 +42,7 @@ import (
 const defaultFileMode os.FileMode = 0o644
 
 // Layout describes the volumes materialized for one pod: the per-mount roots, and
-// which of them must get the SBPL read-only sub-scope (ReadOnlyPaths).
+// which of them must get the SBPL read-only sub-scope (Scope).
 type Layout struct {
 	// Mounts is one entry per unique mount path: each materialized mount, and
 	// each alias of one (AliasOf set).
@@ -94,38 +94,62 @@ func (l *Layout) CredentialPaths() []string {
 	return out
 }
 
+// ReadOnlyScope is a pod's write scope over its materialized mounts, the
+// input to sandbox.GenerateOptions: ReadOnly are the mount roots that get the
+// SBPL read-only sub-scope (ReadOnlyPaths), Writable the rest
+// (WritableMountPaths, which re-allows one nested under a read-only root), and
+// Mixed the volumes whose containers disagree about read_only (the caller
+// warns). Each list is sorted.
+type ReadOnlyScope struct {
+	ReadOnly []string
+	Writable []string
+	Mixed    []string
+}
+
 // ReadOnlyPaths returns the materialized paths that get the SBPL read-only
 // sub-scope, sorted: the input to sandbox.GenerateOptions.ReadOnlyPaths.
 func (l *Layout) ReadOnlyPaths() []string {
-	var out []string
-	for _, m := range l.Mounts {
-		// An alias is a symlink to its selection's directory: a rule on the
-		// link's path would not cover the files, the one on the directory does.
-		if m.ReadOnly && m.AliasOf == "" {
-			out = append(out, m.Path)
-		}
-	}
-	sort.Strings(out)
-	return out
+	return l.Scope().ReadOnly
 }
 
-// ReadOnlyPaths returns, without rendering anything, the paths Materialize
-// would report as read-only for box under dataVol, and the volumes it would
-// report as mixed — exactly what Materialize(ctx, box, dataVol, ...)
-// .ReadOnlyPaths() and .MixedReadOnly return on success, sorted the same way.
-// It is the pure half of the read-only verdict: the same walk (planMounts) and
-// the same predicate (readOnlyMount) the render path uses, so a caller that
-// must re-derive a pod's SBPL read-only sub-scope from its spec alone (a daemon
-// re-attaching to a pod another run created) gets the verdict the create-time
-// render reached, by construction rather than by a parallel copy.
-func ReadOnlyPaths(box *runtimev1.PodBox, dataVol string) (paths, mixed []string, err error) {
+// Scope returns the layout's ReadOnlyScope.
+func (l *Layout) Scope() ReadOnlyScope {
+	var sc ReadOnlyScope
+	for _, m := range l.Mounts {
+		// An alias is a symlink to its selection's directory: the directory
+		// carries the rule, which covers every access through the link.
+		if m.AliasOf != "" {
+			continue
+		}
+		if m.ReadOnly {
+			sc.ReadOnly = append(sc.ReadOnly, m.Path)
+		} else {
+			sc.Writable = append(sc.Writable, m.Path)
+		}
+	}
+	sort.Strings(sc.ReadOnly)
+	sort.Strings(sc.Writable)
+	sc.Mixed = l.MixedReadOnly
+	return sc
+}
+
+// ScopeFor returns, without rendering anything, the ReadOnlyScope Materialize
+// would report for box under dataVol — exactly Materialize(ctx, box, dataVol,
+// ...).Scope() on success. It is the pure half of the read-only verdict: the
+// same walk (planMounts) and the same predicate (readOnlyMount) the render path
+// uses, so a caller that must re-derive a pod's SBPL write scope from its spec
+// alone (a daemon re-attaching to a pod another run created) gets the verdict
+// the create-time render reached, by construction rather than by a parallel
+// copy.
+func ScopeFor(box *runtimev1.PodBox, dataVol string) (ReadOnlyScope, error) {
 	dataVol = filepath.Clean(dataVol)
 	plans, err := planMounts(box, dataVol)
 	if err != nil {
-		return nil, nil, err
+		return ReadOnlyScope{}, err
 	}
 	intent := readOnlyIntents(box)
 	var mix mixedSet
+	var sc ReadOnlyScope
 	for _, pm := range plans {
 		if pm.class == classImage {
 			continue // linked by LinkImageVolumes, never materialized
@@ -133,11 +157,15 @@ func ReadOnlyPaths(box *runtimev1.PodBox, dataVol string) (paths, mixed []string
 		ro := readOnlyMount(pm, credentialSource(pm.vol), intent)
 		mix.note(pm, ro, intent)
 		if ro {
-			paths = append(paths, pm.dest)
+			sc.ReadOnly = append(sc.ReadOnly, pm.dest)
+		} else {
+			sc.Writable = append(sc.Writable, pm.dest)
 		}
 	}
-	sort.Strings(paths)
-	return paths, mix.sorted(), nil
+	sort.Strings(sc.ReadOnly)
+	sort.Strings(sc.Writable)
+	sc.Mixed = mix.sorted()
+	return sc, nil
 }
 
 // readOnlyIntent is what the containers of a pod ask of one selection (a
@@ -175,7 +203,7 @@ func readOnlyIntents(box *runtimev1.PodBox) map[seenMount]readOnlyIntent {
 }
 
 // readOnlyMount is the ONE read-only predicate: Materialize sets Mount.ReadOnly
-// from it and ReadOnlyPaths reads it, so the create-time profile and a
+// from it and ScopeFor reads it, so the create-time profile and a
 // re-attach's recompiled one cannot disagree. A configMap, secret, downwardAPI
 // or projected mount is read-only whatever its read_only flag says (kubelet
 // parity: the kubelet has mounted these API-data volumes read-only since
@@ -225,7 +253,7 @@ func (m mixedSet) sorted() []string {
 // credentialSource reports whether vol's source is a credential that gets the
 // SBPL read-only sub-scope: a secret, or a projected volume carrying a secret
 // or a ServiceAccount token. It is the ONE credential predicate: the render
-// (render.volume) reports it and ReadOnlyPaths reads it (both through
+// (render.volume) reports it and ScopeFor reads it (both through
 // readOnlyMount), so the two cannot disagree about which mounts a pod may not
 // overwrite.
 func credentialSource(vol *runtimev1.Volume) bool {

@@ -327,6 +327,10 @@ var ErrInvalidStateDir = errors.New("sbpl: invalid state dir")
 // manifest directory, or anything outside them.
 var ErrInvalidArtifactView = errors.New("sbpl: invalid artifact view path")
 
+// ErrInvalidMountPath is returned by Generate for a WritableMountPaths entry
+// that is not strictly under the pod's data volume.
+var ErrInvalidMountPath = errors.New("sbpl: invalid writable mount path")
+
 // ErrInvalidExposePath is returned by Generate when a GenerateOptions.ExposePaths
 // entry is not exactly one exposure leaf, <root>/<namespace>/<pod>/<volume>
 // under an exposures root (exposeRoots): never the root, a namespace or pod
@@ -558,10 +562,16 @@ type GenerateOptions struct {
 	// ReadOnlyPaths get a read-only sub-scope: granted file-read* and explicitly
 	// denied file-write*, emitted last so the write-deny wins even when the path
 	// lies inside the writable data volume. These are the mounts a pod must
-	// not write (mount.ReadOnlyPaths): every configMap, secret, downwardAPI
+	// not write (mount.ScopeFor): every configMap, secret, downwardAPI
 	// and projected mount, and every emptyDir all of the pod's containers
 	// declare read_only.
 	ReadOnlyPaths []string
+	// WritableMountPaths are the pod's writable materialized mount roots, each
+	// strictly under the data volume. One nested under a ReadOnlyPaths entry
+	// (an emptyDir at /app/tmp under a configMap at /app) gets a write
+	// re-allow after the read-only deny, so it stays writable; the rest are
+	// writable through the data volume already and render nothing.
+	WritableMountPaths []string
 	// WritePaths get a read+write allow: the read-write persistent-volume mount
 	// roots. A PVC-backed dir lives outside the pod data volume on the APFS
 	// storage root (so it survives pod teardown — ReclaimPolicy Retain), so unlike
@@ -763,6 +773,14 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	if err := validateExtraPaths(dataVol, protectedPrefixes, sp.GetExtraReadPaths(), sp.GetExtraWritePaths(), opts.ReadOnlyPaths, opts.WritePaths, opts.ReadPaths); err != nil {
 		return "", err
 	}
+	// A writable mount root re-allows write after the read-only denies, so it
+	// must lie strictly inside the pod's own data volume: anything else could
+	// re-open a path the profile denies.
+	for _, w := range opts.WritableMountPaths {
+		if !filepath.IsAbs(w) || !strictlyUnder(w, dataVol) {
+			return "", fmt.Errorf("%w: writable mount %q is not strictly under the data volume %q", ErrInvalidMountPath, w, dataVol)
+		}
+	}
 
 	// The developer-toolchain read grant (xcode_toolchain_dir) is validated here,
 	// against the same deny-set, so a bad value fails the whole profile before a
@@ -818,6 +836,8 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		return "", fmt.Errorf("%w: %q", ErrInvalidShadowBinDir, shadowDir)
 	}
 	credPaths := dedupeSorted(opts.ReadOnlyPaths)
+	nestedWrite := nestedWritable(credPaths, opts.WritableMountPaths)
+	roAncestors := readOnlyAncestors(dataVol, credPaths)
 	deniedSockets := dedupeSorted(sp.GetDeniedUnixSocketPaths())
 	// The semaphore prefix is derived and shape-checked before anything is
 	// written, so a pod UID that yields no valid prefix fails the profile.
@@ -1134,6 +1154,28 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 		b.WriteString("  )\n")
 		b.WriteString("(deny file-write*\n")
 		writeFirmlinkSubpaths(&b, credPaths)
+		b.WriteString("  )\n")
+	}
+	// A writable mount nested under a read-only one gets its write back after
+	// the deny above (last match wins).
+	if len(nestedWrite) > 0 {
+		b.WriteString(";; writable mounts nested under a read-only mount: re-allowed after its deny.\n")
+		b.WriteString("(allow file-write*\n")
+		writeFirmlinkSubpaths(&b, nestedWrite)
+		b.WriteString("  )\n")
+	}
+	// The directories between the data volume and a read-only mount: their own
+	// entries may not be renamed or removed, or the pod could move the mount
+	// aside and write its files at the new path. A literal covers the entry
+	// alone, so the pod still creates siblings inside them.
+	if len(roAncestors) > 0 {
+		b.WriteString(";; ancestors of the read-only mounts: not renamed or removed.\n")
+		b.WriteString("(deny file-write*\n")
+		for _, a := range roAncestors {
+			for _, form := range firmlinkForms(a) {
+				b.WriteString(fmt.Sprintf("  (literal %q)\n", form))
+			}
+		}
 		b.WriteString("  )\n")
 	}
 
@@ -1941,6 +1983,37 @@ func containsDirective(profile, dir string) bool {
 		}
 	}
 	return false
+}
+
+// nestedWritable returns, deduped and sorted, the writable mount roots that
+// lie strictly under one of the read-only paths.
+func nestedWritable(readOnly, writable []string) []string {
+	var out []string
+	for _, w := range writable {
+		for _, ro := range readOnly {
+			if strictlyUnder(w, ro) {
+				out = append(out, filepath.Clean(w))
+				break
+			}
+		}
+	}
+	return dedupeSorted(out)
+}
+
+// readOnlyAncestors returns, deduped and sorted, every directory strictly
+// between dataVol and a read-only path under it. A read-only path outside the
+// data volume has none: nothing above it is the pod's to rename.
+func readOnlyAncestors(dataVol string, readOnly []string) []string {
+	var out []string
+	for _, ro := range readOnly {
+		if !strictlyUnder(ro, dataVol) {
+			continue
+		}
+		for d := filepath.Dir(filepath.Clean(ro)); strictlyUnder(d, dataVol); d = filepath.Dir(d) {
+			out = append(out, d)
+		}
+	}
+	return dedupeSorted(out)
 }
 
 // dedupeSorted returns the unique, non-empty, lexically sorted elements of in so

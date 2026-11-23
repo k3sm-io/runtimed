@@ -188,3 +188,141 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 		}
 	}
 }
+
+// roProfile materializes box under a fresh data volume, writes the profile
+// compileProfile would build from the layout's scope, and returns the data
+// volume and a runner for argv under that profile.
+func roProfile(t *testing.T, tag string, box *runtimev1.PodBox, r mount.Resolver) (string, func(args ...string) error) {
+	t.Helper()
+	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
+		t.Fatalf("sandbox-exec is missing, so nothing can be measured: %v", err)
+	}
+	base := filepath.Join("/private/tmp", "k3sm-"+tag+"-"+strconv.Itoa(os.Getpid()))
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	work := filepath.Join(base, "work")
+	dataVol := filepath.Join(work, "pods", "p1", "rootfs")
+	layout, err := mount.Materialize(context.Background(), box, dataVol, "10.1.2.3", r)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	sc := layout.Scope()
+	prof, err := Generate(&runtimev1.SandboxProfile{DataVolumePath: dataVol}, GenerateOptions{
+		Posture:            Posture{WorkDir: work},
+		ReadOnlyPaths:      sc.ReadOnly,
+		WritableMountPaths: sc.Writable,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	sb := filepath.Join(base, "p.sb")
+	if err := os.WriteFile(sb, []byte(prof), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dataVol, func(args ...string) error {
+		return exec.Command("/usr/bin/sandbox-exec", append([]string{"-f", sb}, args...)...).Run()
+	}
+}
+
+func roBox(vols []*runtimev1.Volume, mounts ...*runtimev1.VolumeMount) *runtimev1.PodBox {
+	return &runtimev1.PodBox{
+		PodId: "p1", Namespace: "default", Name: "ro", Volumes: vols,
+		Containers: []*runtimev1.Container{{Name: "main", VolumeMounts: mounts}},
+	}
+}
+
+func exists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// TestReadOnlyMountAncestorsDenyRename pins the ancestor guard: with a
+// read-only configMap at /etc/cfg, the pod cannot rename /etc (which would
+// move the mount aside and leave its files writable at the new path) nor the
+// mount directory itself, but still creates files beside it in /etc and in
+// the data volume root.
+func TestReadOnlyMountAncestorsDenyRename(t *testing.T) {
+	dataVol, run := roProfile(t, "roanc", roBox(
+		[]*runtimev1.Volume{{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cfg"}}},
+		&runtimev1.VolumeMount{Name: "cfg", MountPath: "/etc/cfg"},
+	), roResolver{data: map[string][]byte{"k": []byte("v")}})
+	etc := filepath.Join(dataVol, "etc")
+
+	_ = run("/bin/mv", etc, etc+".old")
+	if !exists(filepath.Join(etc, "cfg", "k")) || exists(etc+".old") {
+		t.Errorf("the pod renamed %s, an ancestor of a read-only mount", etc)
+	}
+	_ = run("/bin/mv", filepath.Join(etc, "cfg"), filepath.Join(etc, "cfg2"))
+	if !exists(filepath.Join(etc, "cfg", "k")) || exists(filepath.Join(etc, "cfg2")) {
+		t.Errorf("the pod renamed the read-only mount directory")
+	}
+	_ = run("/bin/rm", "-rf", etc)
+	if !exists(filepath.Join(etc, "cfg", "k")) {
+		t.Errorf("the pod removed %s", etc)
+	}
+	if err := run("/usr/bin/touch", filepath.Join(etc, "sibling")); err != nil || !exists(filepath.Join(etc, "sibling")) {
+		t.Errorf("the pod could not create a sibling file in %s: %v", etc, err)
+	}
+	if err := run("/usr/bin/touch", filepath.Join(dataVol, "root-file")); err != nil || !exists(filepath.Join(dataVol, "root-file")) {
+		t.Errorf("the data volume root is not writable: %v", err)
+	}
+}
+
+// TestNestedWritableMountUnderReadOnly pins the write re-allow: an emptyDir
+// at /app/tmp inside a configMap at /app stays writable while /app does not.
+func TestNestedWritableMountUnderReadOnly(t *testing.T) {
+	dataVol, run := roProfile(t, "ronest", roBox(
+		[]*runtimev1.Volume{
+			{Name: "app", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "app"}},
+			{Name: "tmp", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
+		},
+		&runtimev1.VolumeMount{Name: "app", MountPath: "/app"},
+		&runtimev1.VolumeMount{Name: "tmp", MountPath: "/app/tmp"},
+	), roResolver{data: map[string][]byte{"k": []byte("v")}})
+	app, tmp := filepath.Join(dataVol, "app"), filepath.Join(dataVol, "app", "tmp")
+
+	if err := run("/bin/sh", "-c", `printf x > "$1/f" && mv "$1/f" "$1/g" && chmod 600 "$1/g" && rm "$1/g" && mkdir "$1/d"`, "sh", tmp); err != nil {
+		t.Errorf("the nested emptyDir %s is not writable: %v", tmp, err)
+	}
+	if !exists(filepath.Join(tmp, "d")) {
+		t.Errorf("mkdir in the nested emptyDir did not happen")
+	}
+	_ = run("/usr/bin/touch", filepath.Join(app, "new"))
+	if exists(filepath.Join(app, "new")) {
+		t.Errorf("the pod created a file in the read-only configMap %s", app)
+	}
+	_ = run("/bin/rm", "-f", filepath.Join(app, "k"))
+	if !exists(filepath.Join(app, "k")) {
+		t.Errorf("the pod unlinked a key of the read-only configMap %s", app)
+	}
+}
+
+// TestReadOnlyConfigMapAtomicWriterDenied pins the atomic-writer layout of a
+// read-only configMap against the pod: it cannot swap ..data to another
+// generation, rename the live generation directory, or plant a symlink.
+func TestReadOnlyConfigMapAtomicWriterDenied(t *testing.T) {
+	dataVol, run := roProfile(t, "roaw", roBox(
+		[]*runtimev1.Volume{{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cfg"}}},
+		&runtimev1.VolumeMount{Name: "cfg", MountPath: "/etc/cfg"},
+	), roResolver{data: map[string][]byte{"k": []byte("v")}})
+	cfg := filepath.Join(dataVol, "etc", "cfg")
+	gen, err := os.Readlink(filepath.Join(cfg, "..data"))
+	if err != nil {
+		t.Fatalf("no ..data link in %s: %v", cfg, err)
+	}
+
+	_ = run("/bin/ln", "-sfh", "..elsewhere", filepath.Join(cfg, "..data"))
+	if now, _ := os.Readlink(filepath.Join(cfg, "..data")); now != gen {
+		t.Errorf("the pod swapped ..data from %q to %q", gen, now)
+	}
+	_ = run("/bin/mv", filepath.Join(cfg, gen), filepath.Join(cfg, "..moved"))
+	if !exists(filepath.Join(cfg, gen)) || exists(filepath.Join(cfg, "..moved")) {
+		t.Errorf("the pod renamed the generation directory %s", gen)
+	}
+	_ = run("/bin/ln", "-s", "/private/tmp", filepath.Join(cfg, "planted"))
+	if exists(filepath.Join(cfg, "planted")) {
+		t.Errorf("the pod planted a symlink in the read-only configMap")
+	}
+	if b, err := os.ReadFile(filepath.Join(cfg, "k")); err != nil || string(b) != "v" {
+		t.Errorf("key k = %q, %v; want v", b, err)
+	}
+}

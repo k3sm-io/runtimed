@@ -29,7 +29,7 @@ import (
 // TestReadOnlyMountsCreateMatchesReattach pins the read-only sub-scope a
 // native pod's profile carries for its read_only mounts, and that a daemon
 // re-attaching to the pod derives the same profile from the spec alone
-// (boxProfile, which reads mount.ReadOnlyPaths). An emptyDir every container
+// (boxProfile, which reads mount.ScopeFor). An emptyDir every container
 // mounts read_only and a downwardAPI volume mounted without it are in the
 // sub-scope; an
 // emptyDir one container mounts read-only and another read-write is not, and
@@ -45,11 +45,13 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 			{Path: "name", FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
 		}}},
 		{Name: "shared", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
+		{Name: "tmp", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
 	}
 	box.Containers[0].VolumeMounts = []*runtimev1.VolumeMount{
 		{Name: "scratch", MountPath: "/scratch", ReadOnly: true},
 		{Name: "info", MountPath: "/etc/info"}, // API data: read-only without the flag
 		{Name: "shared", MountPath: "/shared", ReadOnly: true},
+		{Name: "tmp", MountPath: "/etc/info/tmp"}, // writable, nested in read-only info
 	}
 	box.Containers = append(box.Containers, &runtimev1.Container{
 		Name: "writer", Image: "/bin/sleep",
@@ -73,6 +75,14 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 	}
 	if shared := filepath.Join(rootfs, "shared"); strings.Contains(stanza, shared) {
 		t.Errorf("mixed mount %s is in the read-only sub-scope; one container mounts it read-write:\n%s", shared, stanza)
+	}
+	// The writable emptyDir nested in info gets its write back, and /etc, the
+	// ancestor of info, may not be renamed.
+	if p := filepath.Join(rootfs, "etc", "info", "tmp"); !strings.Contains(stanza, "(allow file-write*\n  (subpath \""+p+"\")") {
+		t.Errorf("nested writable mount %s is not re-allowed:\n%s", p, stanza)
+	}
+	if p := filepath.Join(rootfs, "etc"); !strings.Contains(stanza, "(literal \""+p+"\")") {
+		t.Errorf("ancestor %s of a read-only mount is not guarded:\n%s", p, stanza)
 	}
 	// The re-attach derivation is the create's: the same profile, byte for byte.
 	if again, err := rt.boxProfile(box); err != nil || again != profile {

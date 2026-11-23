@@ -150,7 +150,7 @@ func TestArtifactMountUnderSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LinkImageVolumes: %v", err)
 	}
-	profile, err := rt.compileProfile(box, rootfs, "", nil, nil, nil, grants, nil)
+	profile, err := rt.compileProfile(box, rootfs, "", mount.ReadOnlyScope{}, nil, nil, grants, nil)
 	if err != nil {
 		t.Fatalf("compileProfile: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestArtifactViewHardLinkAlias(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LinkImageVolumes: %v", err)
 			}
-			profile, err := rt.compileProfile(box, rootfs, "", nil, nil, nil, grants, nil)
+			profile, err := rt.compileProfile(box, rootfs, "", mount.ReadOnlyScope{}, nil, nil, grants, nil)
 			if err != nil {
 				t.Fatalf("compileProfile: %v", err)
 			}

@@ -652,10 +652,10 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
 	// projected) into the pod data volume. API-data volumes and read_only
 	// emptyDirs come back as the read-only paths that get the SBPL
-	// read-only sub-scope below (mount.ReadOnlyPaths). PVC sources are skipped
+	// read-only sub-scope below (mount.ScopeFor). PVC sources are skipped
 	// here and bound by the volume.Binder below — they are durable,
 	// lifecycle-decoupled, and live outside the pod data volume.
-	var roPaths []string
+	var roScope mount.ReadOnlyScope
 	var projState mount.RefreshState
 	if len(box.GetVolumes()) > 0 {
 		layout, merr := mount.Materialize(ctx, box, rootfs, ip, r.resolver)
@@ -663,13 +663,13 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 			return nil, runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP,
 				fmt.Errorf("materialize volumes for pod %s: %w", box.GetPodId(), merr)
 		}
-		roPaths = layout.ReadOnlyPaths()
+		roScope = layout.Scope()
 		projState = layout.State
 		// The pod has one profile, so an emptyDir its containers mount both
 		// read-only and read-write stays writable for all of them.
-		if len(layout.MixedReadOnly) > 0 {
+		if len(roScope.Mixed) > 0 {
 			r.log.Warn("volume mounted read-only by one container and read-write by another stays writable for the whole pod",
-				"pod", box.GetPodId(), "volumes", layout.MixedReadOnly)
+				"pod", box.GetPodId(), "volumes", roScope.Mixed)
 		}
 	}
 	// Link each image volume's view at its mount path; the views come back as
@@ -739,7 +739,7 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 
 	// Generate the SBPL after materialization + PV binding so the credential mounts
 	// get the read-only sub-scope and the PV mount roots get the read/write scope.
-	profile, err := r.compileProfile(box, rootfs, ip, roPaths, pvWritePaths, pvReadPaths, viewPaths, exposeLeaves)
+	profile, err := r.compileProfile(box, rootfs, ip, roScope, pvWritePaths, pvReadPaths, viewPaths, exposeLeaves)
 	if err != nil {
 		if errors.Is(err, errInvalidPodBox) {
 			return nil, runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX, err
@@ -925,8 +925,10 @@ func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 // this daemon's node posture: the one derivation createPod and AttachPod share,
 // so a pod re-attached after a daemon restart runs its restarted containers
 // under the profile the create compiled (AttachPod verifies that by hash;
-// profileDigest). rootfs is the pod's derived rootfs; ip is the pod IP; roPaths
-// are the read-only mounts (the read-only sub-scope, mount.ReadOnlyPaths);
+// profileDigest). rootfs is the pod's derived rootfs; ip is the pod IP; roScope
+// is the materialized mounts' write scope (mount.ScopeFor): its read-only
+// roots get the read-only sub-scope, and a writable root nested under one of
+// them gets its write back;
 // pvWrite and pvRead are the bound PV dirs (volume.Binder.Plan); views are the
 // artifact view directories its image mounts link to (mount.LinkImageVolumes),
 // each granted read-only and no-exec; exposes are the pod's exposure leaves
@@ -935,7 +937,7 @@ func (r *Runtime) unwindRefusedCreate(ctx context.Context, p *pod) {
 //
 // An underived data volume is errInvalidPodBox (wrapped); any other failure is
 // the generator's.
-func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, roPaths, pvWrite, pvRead, views, exposes []string) (string, error) {
+func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, roScope mount.ReadOnlyScope, pvWrite, pvRead, views, exposes []string) (string, error) {
 	// The data volume the profile is about to re-allow read+write must be one this
 	// runtime derived for this pod. Checked here, immediately before the
 	// only call that consumes it: sandbox.Generate emits it after the protected
@@ -997,9 +999,11 @@ func (r *Runtime) compileProfile(box *runtimev1.PodBox, rootfs, ip string, roPat
 			ShadowBinDir: r.cfg.ShadowBinDir,
 		},
 		PodIP:         ip,
-		ReadOnlyPaths: roPaths,
-		WritePaths:    pvWrite,
-		ReadPaths:     pvRead,
+		ReadOnlyPaths: roScope.ReadOnly,
+		// A writable mount nested under a read-only one keeps its write.
+		WritableMountPaths: roScope.Writable,
+		WritePaths:         pvWrite,
+		ReadPaths:          pvRead,
 		// Each image volume's view: read, never write, exec or map executable.
 		ArtifactViewPaths: views,
 		// The pod's own exposure leaves, re-allowed after the exposures-root

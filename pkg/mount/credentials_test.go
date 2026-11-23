@@ -86,10 +86,14 @@ func TestReadOnlyPathsMatchesMaterialize(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Materialize: %v", err)
 				}
-				pure, mixed, err := ReadOnlyPaths(box, dataVol)
+				sc, err := ScopeFor(box, dataVol)
 				if err != nil {
-					t.Fatalf("ReadOnlyPaths: %v", err)
+					t.Fatalf("ScopeFor: %v", err)
 				}
+				if !reflect.DeepEqual(sc, layout.Scope()) {
+					t.Fatalf("ScopeFor = %+v, Materialize reported %+v", sc, layout.Scope())
+				}
+				pure, mixed := sc.ReadOnly, sc.Mixed
 				if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) {
 					t.Fatalf("ReadOnlyPaths = %v, Materialize reported %v", pure, layout.ReadOnlyPaths())
 				}
@@ -142,12 +146,19 @@ func TestReadOnlyPathsMatchesMaterialize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Materialize: %v", err)
 		}
-		pure, mixed, err := ReadOnlyPaths(box, dataVol)
+		sc, err := ScopeFor(box, dataVol)
 		if err != nil {
-			t.Fatalf("ReadOnlyPaths: %v", err)
+			t.Fatalf("ScopeFor: %v", err)
 		}
-		// /var/logs is an alias of logs' one directory at /logs, which carries
-		// the rule; /ro-work is an alias of scratch's writable /work.
+		if !reflect.DeepEqual(sc, layout.Scope()) {
+			t.Fatalf("ScopeFor = %+v, Materialize reported %+v", sc, layout.Scope())
+		}
+		// Aliases carry no rule: /ro-work is a link to scratch's writable
+		// /work, /var/logs one to logs' read-only /logs.
+		if want := []string{filepath.Join(dataVol, "work")}; !reflect.DeepEqual(sc.Writable, want) {
+			t.Fatalf("Writable = %v, want %v", sc.Writable, want)
+		}
+		pure, mixed := sc.ReadOnly, sc.Mixed
 		want := []string{filepath.Join(dataVol, "etc", "cm"), filepath.Join(dataVol, "logs")}
 		if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) || !reflect.DeepEqual(pure, want) {
 			t.Fatalf("ReadOnlyPaths = %v, Materialize = %v, want %v", pure, layout.ReadOnlyPaths(), want)
@@ -170,10 +181,14 @@ func TestReadOnlyPathsMatchesMaterialize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Materialize: %v", err)
 		}
-		pure, _, err := ReadOnlyPaths(box, dataVol)
+		sc, err := ScopeFor(box, dataVol)
 		if err != nil {
-			t.Fatalf("ReadOnlyPaths: %v", err)
+			t.Fatalf("ScopeFor: %v", err)
 		}
+		if !reflect.DeepEqual(sc, layout.Scope()) {
+			t.Fatalf("ScopeFor = %+v, Materialize reported %+v", sc, layout.Scope())
+		}
+		pure := sc.ReadOnly
 		want := []string{filepath.Join(dataVol, "etc", "cm"), filepath.Join(dataVol, "etc", "sec"), filepath.Join(dataVol, "etc", "tok")}
 		if !reflect.DeepEqual(pure, layout.ReadOnlyPaths()) || !reflect.DeepEqual(pure, want) {
 			t.Fatalf("ReadOnlyPaths = %v, Materialize = %v, want %v", pure, layout.ReadOnlyPaths(), want)
@@ -183,8 +198,8 @@ func TestReadOnlyPathsMatchesMaterialize(t *testing.T) {
 	t.Run("an undefined volume is refused by both halves", func(t *testing.T) {
 		box := boxWith(&runtimev1.Volume{Name: "cm", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}})
 		box.Volumes = nil
-		if _, _, err := ReadOnlyPaths(box, t.TempDir()); err == nil {
-			t.Fatal("ReadOnlyPaths accepted a mount of an undefined volume")
+		if _, err := ScopeFor(box, t.TempDir()); err == nil {
+			t.Fatal("ScopeFor accepted a mount of an undefined volume")
 		}
 	})
 }

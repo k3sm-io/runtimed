@@ -74,13 +74,18 @@ limitations under the License.
 // This differs from the kubelet, where the read-only container alone would be
 // denied.
 //
-// The read-only sub-scope is a rule on paths, not on the files: a pod can
-// rename a parent of a credential mount aside (it writes its rootfs), after
-// which the live generation's files sit outside the sub-scope and the pod can
-// change them, and it can put a directory of its own at the mount path. So the
-// live generation's content is not integrity-protected against the pod itself;
-// the daemon never reads it back unless it is the generation the daemon
-// recorded (see below), and a refresh of a replaced mount dir renders it fresh.
+// Layout.Scope also reports the writable mount roots. One nested under a
+// read-only mount (an emptyDir at /app/tmp inside a configMap at /app) gets its
+// write back after the read-only deny, so it stays writable.
+//
+// The read-only sub-scope is a rule on paths, not on the files. So that a pod
+// cannot rename a read-only mount aside and write its files at the new path,
+// the profile also denies writes to the entry of every directory between the
+// data volume and a read-only mount (the pod still creates files inside
+// them). The pod still owns the rest of its rootfs, though, so the live
+// generation's content is not integrity-protected against the pod itself; the
+// daemon never reads it back unless it is the generation the daemon recorded
+// (see below), and a refresh of a replaced mount dir renders it fresh.
 //
 // # Refresh: the atomic-writer layout
 //
