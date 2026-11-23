@@ -46,6 +46,21 @@ limitations under the License.
 //     hardware). The backend is OS-version-gated and FAILS closed:
 //     if unavailable it refuses to start the pod rather than running unconfined.
 //
+// Volume mount paths and binaries that do not load the path-rebase shim: a
+// volume mounted at an absolute container path such as HOME=/home/agent is a
+// symlink in the pod's data volume, reached through the path-rebase shim
+// (shim/). git, xcrun and every other platform or library-validated binary
+// never load that shim (dyld scrubs DYLD_* from them, or library validation
+// refuses the dylib), so they resolve /home/agent on the host, where the PVC
+// is not. The profile grants file-read-metadata on the host /home link node
+// alone, so such a lookup answers ENOENT rather than EPERM and git runs
+// without a global config, but it does not see a .gitconfig kept on the PVC.
+// Point GIT_CONFIG_GLOBAL at the file's rootfs path (<data volume>/home/agent/
+// .gitconfig), or give the pod a HOME that is not a mount symlink. The
+// runtime sets xcrun_db to a file in the pod's own temp dir for the same
+// class of binary: xcrun ignores DIRHELPER_USER_DIR_SUFFIX and would
+// otherwise try the shared, denied /var/folders tree.
+//
 // The cgo libsandbox SPI is private and deprecated. sandbox_compile_string /
 // sandbox_apply are called by the exec-shim (internal/execshim/execshim_darwin.go);
 // this package only compiles, never applies, through the same SPI resolved by

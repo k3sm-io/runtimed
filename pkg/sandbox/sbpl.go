@@ -939,6 +939,24 @@ func Generate(sp *runtimev1.SandboxProfile, opts GenerateOptions) (string, error
 	writeFirmlinkSubpaths(&b, []string{systemTLSConfigDir})
 	b.WriteString("  )\n")
 
+	// The /home lookup for a binary that does not load the path-rebase shim.
+	// A pod whose HOME is a volume mount (/home/agent, linked in the data
+	// volume to its PVC) reaches it through the shim, but git, xcrun and every
+	// other platform or library-validated binary never load the shim (dyld
+	// scrubs DYLD_*, or library validation refuses the dylib), so their
+	// stat/access of $HOME/.gitconfig names the host /home. That is a symlink
+	// to /System/Volumes/Data/home, and Seatbelt checks the link node itself
+	// during the lookup: with no rule for it the answer was EPERM, which git
+	// treats as fatal (exit 128), where ENOENT is a config it skips. Measured
+	// with sandbox-exec on macOS 27. The grant is the one link node, metadata
+	// only: no subpath, no data, and nothing under the target, which the
+	// /System read already covers. /home is not a firmlink, so it has one
+	// form. The binary still does not see the PVC at that path; see the
+	// package doc for the GIT_CONFIG_GLOBAL advice.
+	b.WriteString(";; metadata: the host /home link node, so a shimless binary's lookup of a\n")
+	b.WriteString(";; mount-path HOME answers ENOENT, not EPERM. The link only, no subpath.\n")
+	b.WriteString("(allow file-read-metadata (literal \"/home\"))\n")
+
 	b.WriteString(";; write: validated extra write paths (+ /dev/null); the pod's own\n")
 	b.WriteString(";; data volume is re-allowed below, after the protected denies.\n")
 	b.WriteString("(allow file-write*\n")
