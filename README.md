@@ -130,6 +130,15 @@ isolation, or that need an actual Linux environment, run instead in the per-Pod 
 backend described above. It is a separate kernel per Pod, so it is the isolation to use for
 untrusted tenancy.
 
+Volume mounts at absolute container paths (a PVC at `/home/agent`, say) are symlinks inside the
+Pod's data volume, reached through the path-rebase shim. Platform and library-validated
+binaries, `git` and `xcrun` among them, never load that shim, so they do not see the mount at its
+container path: with `HOME=/home/agent`, `git` finds no global config (a lookup there answers
+"not found", not "permission denied") and ignores a `.gitconfig` kept on the PVC. Set
+`GIT_CONFIG_GLOBAL` to the file's path inside the Pod's data volume, or use a `HOME` that is not a
+volume mount. `xcrun` keeps its lookup cache in the Pod's own temp directory through the
+`xcrun_db` variable, which the runtime sets unless the Pod does.
+
 ## Building and testing
 
 CGO is required. `runtimed` isolates its use of private and deprecated Darwin interfaces —
