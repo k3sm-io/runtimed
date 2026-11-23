@@ -236,3 +236,165 @@ func TestSameVolumeDifferentMountPathsShareOneDir(t *testing.T) {
 		}
 	})
 }
+
+// nestBox is a pod whose init container mounts initMounts and whose main
+// container mounts mainMounts, over vols.
+func nestBox(vols []*runtimev1.Volume, initMounts, mainMounts []*runtimev1.VolumeMount) *runtimev1.PodBox {
+	return &runtimev1.PodBox{
+		PodId:          "pod-1",
+		Namespace:      "default",
+		Name:           "demo",
+		Volumes:        vols,
+		InitContainers: []*runtimev1.Container{{Name: "init", VolumeMounts: initMounts}},
+		Containers:     []*runtimev1.Container{{Name: "main", VolumeMounts: mainMounts}},
+	}
+}
+
+// TestNestedMountsUnderLinksAndCredentialsRefused pins the plan-time nesting
+// check: a mount path under an alias, under a selection that has aliases,
+// under an image / PVC / exposure link, or under a credential directory is
+// refused, by the pure walk and by Materialize alike. A mount nested in a
+// plain directory with no alias is kept as main allowed it.
+func TestNestedMountsUnderLinksAndCredentialsRefused(t *testing.T) {
+	vm := func(name, path string) *runtimev1.VolumeMount {
+		return &runtimev1.VolumeMount{Name: name, MountPath: path}
+	}
+	empty := func(name string) *runtimev1.Volume {
+		return &runtimev1.Volume{Name: name, EmptyDir: &runtimev1.EmptyDirVolumeSource{}}
+	}
+	pvc := &runtimev1.Volume{Name: "data", PersistentVolumeClaim: &runtimev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}
+	expose := &runtimev1.Volume{Name: "share", Expose: &runtimev1.ExposeVolumeSource{}}
+	secret := &runtimev1.Volume{Name: "creds", Secret: &runtimev1.SecretVolumeSource{SecretName: "sec"}}
+	cm := &runtimev1.Volume{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}}
+	r := fakeResolver{
+		cms:     map[string]map[string][]byte{"cm": {"k": []byte("v")}},
+		secrets: map[string]map[string][]byte{"sec": {"k": []byte("s")}},
+	}
+
+	refused := []struct {
+		name string
+		box  *runtimev1.PodBox
+	}{
+		{"PVC under an aliased destination", nestBox([]*runtimev1.Volume{empty("tools"), pvc},
+			[]*runtimev1.VolumeMount{vm("tools", "/a")}, []*runtimev1.VolumeMount{vm("tools", "/b"), vm("data", "/a/data")})},
+		{"PVC under an alias path", nestBox([]*runtimev1.Volume{empty("tools"), pvc},
+			[]*runtimev1.VolumeMount{vm("tools", "/a")}, []*runtimev1.VolumeMount{vm("tools", "/b"), vm("data", "/b/data")})},
+		{"alias under another selection's destination", nestBox([]*runtimev1.Volume{empty("tools"), empty("outer")},
+			[]*runtimev1.VolumeMount{vm("tools", "/t"), vm("outer", "/x")}, []*runtimev1.VolumeMount{vm("tools", "/x/t")})},
+		{"emptyDir under a credential", nestBox([]*runtimev1.Volume{secret, empty("scratch")},
+			nil, []*runtimev1.VolumeMount{vm("creds", "/s"), vm("scratch", "/s/sub")})},
+		{"emptyDir under a PVC", nestBox([]*runtimev1.Volume{pvc, empty("scratch")},
+			nil, []*runtimev1.VolumeMount{vm("data", "/d"), vm("scratch", "/d/sub")})},
+		{"emptyDir under an exposure", nestBox([]*runtimev1.Volume{expose, empty("scratch")},
+			nil, []*runtimev1.VolumeMount{vm("share", "/e"), vm("scratch", "/e/sub")})},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			dataVol := filepath.Join(t.TempDir(), "rootfs")
+			if _, err := CredentialPaths(tc.box, dataVol); err == nil || !strings.Contains(err.Error(), "is nested under") {
+				t.Fatalf("CredentialPaths = %v, want the nesting refusal", err)
+			}
+			if _, err := Materialize(context.Background(), tc.box, dataVol, "", &r); err == nil || !strings.Contains(err.Error(), "is nested under") {
+				t.Fatalf("Materialize = %v, want the nesting refusal", err)
+			}
+			if _, err := os.Lstat(dataVol); err == nil {
+				t.Errorf("Materialize wrote %s before refusing the plan", dataVol)
+			}
+		})
+	}
+
+	// Kept as main allowed it: distinct volumes nested in a plain directory,
+	// no alias and no credential outside.
+	allowed := []struct {
+		name string
+		box  *runtimev1.PodBox
+	}{
+		{"configMap inside an emptyDir", nestBox([]*runtimev1.Volume{empty("scratch"), cm},
+			nil, []*runtimev1.VolumeMount{vm("scratch", "/a"), vm("cfg", "/a/cfg")})},
+		{"secret inside an emptyDir", nestBox([]*runtimev1.Volume{empty("scratch"), secret},
+			nil, []*runtimev1.VolumeMount{vm("scratch", "/a"), vm("creds", "/a/creds")})},
+		{"PVC inside an emptyDir", nestBox([]*runtimev1.Volume{empty("scratch"), pvc},
+			nil, []*runtimev1.VolumeMount{vm("scratch", "/a"), vm("data", "/a/data")})},
+	}
+	for _, tc := range allowed {
+		t.Run(tc.name, func(t *testing.T) {
+			dataVol := filepath.Join(t.TempDir(), "rootfs")
+			if _, err := Materialize(context.Background(), tc.box, dataVol, "", &r); err != nil {
+				t.Fatalf("Materialize: %v", err)
+			}
+		})
+	}
+}
+
+// TestCredentialPathsEqualsLayoutWithAliases pins the pure credential verdict
+// against the render's with aliases present: a re-attaching daemon recompiles
+// the profile from CredentialPaths, and its digest must equal the create's.
+func TestCredentialPathsEqualsLayoutWithAliases(t *testing.T) {
+	r := fakeResolver{
+		cms:     map[string]map[string][]byte{"cm": {"k": []byte("v")}},
+		secrets: map[string]map[string][]byte{"sec": {"k": []byte("s")}},
+		token:   "TOKEN",
+	}
+	vm := func(name, path, sub string) *runtimev1.VolumeMount {
+		return &runtimev1.VolumeMount{Name: name, MountPath: path, SubPath: sub}
+	}
+	box := nestBox([]*runtimev1.Volume{
+		{Name: "creds", Secret: &runtimev1.SecretVolumeSource{SecretName: "sec"}},
+		{Name: "tok", Projected: &runtimev1.ProjectedVolumeSource{Sources: []*runtimev1.VolumeProjection{
+			{ServiceAccountToken: &runtimev1.ServiceAccountTokenProjection{Audience: "api", ExpirationSeconds: 3600, Path: "token"}},
+		}}},
+		{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cm"}},
+		{Name: "tools", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
+	}, []*runtimev1.VolumeMount{
+		vm("creds", "/etc/creds", ""), vm("tok", "/var/run/tok", ""), vm("cfg", "/etc/cfg", ""),
+		vm("creds", "/etc/one-key", "k"), vm("tools", "/tools", ""),
+	}, []*runtimev1.VolumeMount{
+		vm("creds", "/srv/creds", ""), vm("tok", "/srv/tok", ""), vm("cfg", "/srv/cfg", ""),
+		vm("creds", "/srv/one-key", "k"), vm("tools", "/opt/tools", ""),
+	})
+	dataVol := filepath.Join(t.TempDir(), "rootfs")
+	layout, err := Materialize(context.Background(), box, dataVol, "", &r)
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	pure, err := CredentialPaths(box, dataVol)
+	if err != nil {
+		t.Fatalf("CredentialPaths: %v", err)
+	}
+	if got := layout.CredentialPaths(); !reflect.DeepEqual(pure, got) {
+		t.Fatalf("CredentialPaths() = %v, Layout.CredentialPaths() = %v; want equal", pure, got)
+	}
+	var want []string
+	for _, p := range []string{"/etc/creds", "/etc/one-key", "/srv/creds", "/srv/one-key", "/srv/tok", "/var/run/tok"} {
+		want = append(want, filepath.Join(dataVol, p))
+	}
+	if !reflect.DeepEqual(pure, want) {
+		t.Fatalf("CredentialPaths() = %v, want %v", pure, want)
+	}
+}
+
+// TestPlaceAliasReplacesStaleLinkAtomically pins that a stale alias link is
+// swapped for the new one by a rename (the name never goes missing) and leaves
+// no temporary entry behind.
+func TestPlaceAliasReplacesStaleLinkAtomically(t *testing.T) {
+	dataVol := filepath.Join(t.TempDir(), "rootfs")
+	if err := os.MkdirAll(filepath.Join(dataVol, "opt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("stale", filepath.Join(dataVol, "opt", "tools")); err != nil {
+		t.Fatal(err)
+	}
+	if err := placeAlias(dataVol, filepath.Join(dataVol, "opt", "tools"), filepath.Join(dataVol, "first")); err != nil {
+		t.Fatalf("placeAlias: %v", err)
+	}
+	if got, err := os.Readlink(filepath.Join(dataVol, "opt", "tools")); err != nil || got != "../first" {
+		t.Fatalf("alias link = %q, %v; want ../first", got, err)
+	}
+	names, err := os.ReadDir(filepath.Join(dataVol, "opt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 {
+		t.Fatalf("entries under opt = %v, want only the alias", names)
+	}
+}

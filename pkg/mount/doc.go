@@ -35,6 +35,20 @@ limitations under the License.
 // symlink there to that one directory (placeAlias), so an emptyDir an init
 // container fills is what the main container sees, as with the kubelet's one
 // directory per pod. Two different selections at one mount path are an error.
+// Mount.ReadOnly on an alias is the read-only intent of that container's mount,
+// not per-container enforcement: every alias reaches the same directory, and
+// the profile judges the resolved path, so a container that mounts the
+// selection read-only still writes it through the path's writable twin unless
+// the selection is a credential (whose sub-scope covers the one directory).
+//
+// Nested mounts are refused at plan time when the daemon would walk through a
+// link it placed or plant entries inside a credential: a mount path under an
+// alias, under a selection that has aliases, under an image, PVC or exposure
+// mount (each a daemon-placed symlink), or under a credential volume. The
+// kubelet allows these; on a shared tree without a mount namespace they would
+// put one volume's entries inside another's directory. A mount nested in a
+// plain materialized directory (emptyDir, configMap, downwardAPI, projected
+// without a credential) with no alias stays allowed.
 //
 // The runtime proto (k3sm.io/apis runtime/v1) carries only the volume source
 // *reference* — a ConfigMap/Secret name, the SA-token audience — not the bytes,

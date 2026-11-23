@@ -233,6 +233,9 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 	containers = append(containers, box.GetContainers()...)
 
 	var plans []plannedMount
+	// linked: the PVC and exposure mounts, which pkg/volume links into place.
+	// They take part in the nesting check only (checkNesting).
+	var linked []nestPath
 	for _, c := range containers {
 		for _, vm := range c.GetVolumeMounts() {
 			vol, ok := volumes[vm.GetName()]
@@ -243,6 +246,7 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 			// to a stable dir OUTSIDE the pod tree and symlinks them into the rootfs.
 			// They are not materialized (rebased) here.
 			if vol.GetPersistentVolumeClaim() != nil {
+				linked = appendLinked(linked, dataVol, vm)
 				continue
 			}
 			// A hostPath source is a host share: it is never materialized or
@@ -258,6 +262,7 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 			// account is granted by ACL and the pod reaches through a symlink
 			// at its mount path, as a PVC. It is not materialized here.
 			if vol.GetExpose() != nil {
+				linked = appendLinked(linked, dataVol, vm)
 				continue
 			}
 			// The destination is the rebased mount path ONLY — subPath selects a
@@ -305,7 +310,83 @@ func planMounts(box *runtimev1.PodBox, dataVol string) ([]plannedMount, error) {
 			plans = append(plans, plannedMount{mount: vm, vol: vol, dest: dest, class: class})
 		}
 	}
+	if err := checkNesting(plans, linked); err != nil {
+		return nil, err
+	}
 	return plans, nil
+}
+
+// nestPath is one mount path of a pod as the nesting check sees it.
+type nestPath struct {
+	path string
+	name string
+	// what names the kind of mount for the error, when it refuses the nesting:
+	// "" for a plain materialized directory, which may hold another mount.
+	what string
+}
+
+// appendLinked adds vm, a mount pkg/volume links into the data volume, to
+// linked. A mount path that escapes the data volume is left to pkg/volume,
+// which refuses it.
+func appendLinked(linked []nestPath, dataVol string, vm *runtimev1.VolumeMount) []nestPath {
+	dest, err := resolveTarget(dataVol, vm.GetMountPath())
+	if err != nil {
+		return linked
+	}
+	return append(linked, nestPath{path: dest, name: vm.GetName(), what: "a linked volume"})
+}
+
+// checkNesting refuses a mount path that sits under another mount path of the
+// pod when either side is a link the daemon places, or the outer one is a
+// credential:
+//
+//   - an alias (placeAlias), or the materialized destination of a selection
+//     that has aliases: an alias is a daemon-placed symlink, and a mount below
+//     one, or below the directory it names, would have the daemon walk through
+//     it or put entries in a directory other mount paths also reach;
+//   - an image, PVC or exposure mount: each is a symlink the daemon places, so
+//     a mount below it would have the daemon walk through that link;
+//   - a credential (secret, or projected with a secret or token): a mount below
+//     it would plant entries inside the credential directory.
+//
+// A mount nested in a plain materialized directory (emptyDir, configMap,
+// downwardAPI, projected without a credential) that has no alias stays
+// allowed, as it is with the kubelet. Two different selections at one path are
+// the conflict guard's (planMounts), not this check's.
+func checkNesting(plans []plannedMount, linked []nestPath) error {
+	paths := append([]nestPath(nil), linked...)
+	for _, pm := range plans {
+		var what string
+		switch {
+		case pm.class == classImage:
+			what = "an image volume"
+		case len(pm.aliases) > 0:
+			what = "a volume mounted at more than one path"
+		case credentialSource(pm.vol):
+			what = "a credential volume"
+		}
+		paths = append(paths, nestPath{path: pm.dest, name: pm.mount.GetName(), what: what})
+		for _, a := range pm.aliases {
+			paths = append(paths, nestPath{path: a.dest, name: a.mount.GetName(), what: "an alias"})
+		}
+	}
+	for _, outer := range paths {
+		for _, inner := range paths {
+			if !IsStrictlyUnder(inner.path, outer.path) {
+				continue
+			}
+			what := outer.what
+			if what == "" && inner.what == "an alias" {
+				what = "a directory an alias would be planted in"
+			}
+			if what == "" {
+				continue
+			}
+			return fmt.Errorf("mount path %s (volume %s) is nested under %s (volume %s, %s): a mount below it is refused",
+				inner.path, inner.name, outer.path, outer.name, what)
+		}
+	}
+	return nil
 }
 
 // Materialize renders every volume referenced by a container VolumeMount in box
@@ -458,22 +539,33 @@ func placeAlias(dataVol, alias, dest string) error {
 	if err := unix.Fstatat(parent.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
 		switch uint32(st.Mode) & unix.S_IFMT {
 		case unix.S_IFLNK:
-			err = unix.Unlinkat(parent.fd, name, 0)
+			// Replaced atomically below: there is never a moment the name
+			// is missing.
 		case unix.S_IFDIR:
 			// rmdir removes only an empty directory: ENOTEMPTY refuses one
 			// with content.
-			err = unix.Unlinkat(parent.fd, name, unix.AT_REMOVEDIR)
+			if err := unix.Unlinkat(parent.fd, name, unix.AT_REMOVEDIR); err != nil {
+				return fmt.Errorf("replace %s: %w", alias, err)
+			}
+			if err := unix.Symlinkat(target, parent.fd, name); err != nil {
+				return fmt.Errorf("symlink %s -> %s: %w", alias, target, err)
+			}
+			return nil
 		default:
-			err = errors.New("it exists and is neither a symlink nor a directory")
-		}
-		if err != nil {
-			return fmt.Errorf("replace %s: %w", alias, err)
+			return fmt.Errorf("replace %s: it exists and is neither a symlink nor a directory", alias)
 		}
 	} else if !errors.Is(err, unix.ENOENT) {
 		return fmt.Errorf("lstat %s: %w", alias, err)
 	}
-	if err := unix.Symlinkat(target, parent.fd, name); err != nil {
-		return fmt.Errorf("symlink %s -> %s: %w", alias, target, err)
+	// The link is made under a temporary name in the held parent and renamed
+	// over the final name, so a stale link is swapped in one step.
+	tmp := fmt.Sprintf(".k3sm-alias-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if err := unix.Symlinkat(target, parent.fd, tmp); err != nil {
+		return fmt.Errorf("symlink %s -> %s: %w", parent.join(tmp), target, err)
+	}
+	if err := unix.Renameat(parent.fd, tmp, parent.fd, name); err != nil {
+		_ = unix.Unlinkat(parent.fd, tmp, 0) // best effort: the rename's error is the one reported
+		return fmt.Errorf("rename alias into place at %s: %w", alias, err)
 	}
 	return nil
 }
