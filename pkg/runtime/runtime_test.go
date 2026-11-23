@@ -1732,13 +1732,22 @@ func TestCreatePodMaterializesVolumesAndDrops(t *testing.T) {
 		t.Errorf("secret not materialized: %q", got)
 	}
 
-	// (2) the generated SBPL carries the secret's read-only sub-scope.
+	// (2) the generated SBPL carries the read-only sub-scope for the secret
+	// and the configMap (an API-data volume is read-only whatever its flag).
 	rt.mu.Lock()
 	profile := rt.pods["pod-vol"].profile
 	rt.mu.Unlock()
-	secPath := filepath.Join(dataVol, "etc/sec")
-	if !strings.Contains(profile, "(deny file-write*\n  (subpath \""+secPath+"\")") {
-		t.Errorf("SBPL missing secret read-only sub-scope for %s:\n%s", secPath, profile)
+	at := strings.Index(profile, ";; credentials (secrets / SA-token)")
+	if at < 0 {
+		t.Fatalf("SBPL has no read-only sub-scope:\n%s", profile)
+	}
+	deny := profile[at:]
+	deny = deny[strings.Index(deny, "(deny file-write*"):]
+	deny = deny[:strings.Index(deny, "  )")]
+	for _, p := range []string{filepath.Join(dataVol, "etc/sec"), filepath.Join(dataVol, "etc/cfg")} {
+		if !strings.Contains(deny, "(subpath \""+p+"\")") {
+			t.Errorf("SBPL missing read-only sub-scope for %s:\n%s", p, profile)
+		}
 	}
 
 	// (3) the run-as identity reached the spawned exec-shim argv (fakeBackend

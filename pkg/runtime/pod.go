@@ -650,8 +650,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 	}
 
 	// Materialize volume sources (configMap / secret / emptyDir / downwardAPI /
-	// projected) into the pod data volume. Secrets, projected volumes and
-	// read_only mounts come back as the read-only paths that get the SBPL
+	// projected) into the pod data volume. API-data volumes and read_only
+	// emptyDirs come back as the read-only paths that get the SBPL
 	// read-only sub-scope below (mount.ReadOnlyPaths). PVC sources are skipped
 	// here and bound by the volume.Binder below — they are durable,
 	// lifecycle-decoupled, and live outside the pod data volume.
@@ -665,8 +665,8 @@ func (r *Runtime) createPod(ctx context.Context, box *runtimev1.PodBox) (_ *pod,
 		}
 		roPaths = layout.ReadOnlyPaths()
 		projState = layout.State
-		// The pod has one profile, so a volume its containers mount both
-		// read-only and read-write at one path stays writable for all of them.
+		// The pod has one profile, so an emptyDir its containers mount both
+		// read-only and read-write stays writable for all of them.
 		if len(layout.MixedReadOnly) > 0 {
 			r.log.Warn("volume mounted read-only by one container and read-write by another stays writable for the whole pod",
 				"pod", box.GetPodId(), "volumes", layout.MixedReadOnly)

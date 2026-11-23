@@ -52,11 +52,13 @@ var roOps = []string{"create", "write", "rename", "chmod", "unlink"}
 // TestReadOnlyVolumeMountDeniesWrites runs, under sandbox-exec, a native pod
 // profile built the way compileProfile builds it: materialize the pod's
 // volumes (mount.Materialize) and hand the layout's read-only paths to
-// Generate. An emptyDir and a configMap every container mounts read_only must
-// refuse create, write, rename, chmod and unlink at the materialized path. The
-// pod has one profile, so an emptyDir one container mounts read-write and
-// another read-only stays writable (and is reported mixed, which the runtime
-// warns about), as does the rest of the data volume.
+// Generate. An emptyDir and a configMap every container mounts read_only, and
+// a configMap and a downwardAPI volume mounted without it (API-data volumes are
+// read-only whatever the flag says, as under the kubelet), must refuse create,
+// write, rename, chmod and unlink at the materialized path. The pod has one
+// profile, so an emptyDir selection one container mounts read-write stays
+// writable at every path it is mounted at (and is reported mixed, which the
+// runtime warns about), as does the rest of the data volume.
 func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 	if _, err := os.Stat("/usr/bin/sandbox-exec"); err != nil {
 		t.Fatalf("sandbox-exec is missing, so nothing can be measured: %v", err)
@@ -67,8 +69,10 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 	dataVol := filepath.Join(work, "pods", "p1", "rootfs")
 
 	cmData := map[string][]byte{}
+	var fields []*runtimev1.DownwardAPIVolumeFile
 	for _, op := range roOps {
 		cmData[op] = []byte("cm")
+		fields = append(fields, &runtimev1.DownwardAPIVolumeFile{Path: op, FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "metadata.name"}})
 	}
 	box := &runtimev1.PodBox{
 		PodId: "p1", Namespace: "default", Name: "ro",
@@ -76,6 +80,8 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 			{Name: "scratch", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
 			{Name: "cfg", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cfg"}},
 			{Name: "shared", EmptyDir: &runtimev1.EmptyDirVolumeSource{}},
+			{Name: "cfgflagless", ConfigMap: &runtimev1.ConfigMapVolumeSource{Name: "cfg"}},
+			{Name: "info", DownwardApi: &runtimev1.DownwardAPIVolumeSource{Items: fields}},
 		},
 		InitContainers: []*runtimev1.Container{{Name: "init", VolumeMounts: []*runtimev1.VolumeMount{
 			{Name: "shared", MountPath: "/shared"},
@@ -83,7 +89,12 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 		Containers: []*runtimev1.Container{{Name: "build", VolumeMounts: []*runtimev1.VolumeMount{
 			{Name: "scratch", MountPath: "/scratch", ReadOnly: true},
 			{Name: "cfg", MountPath: "/etc/cfg", ReadOnly: true},
+			// The same emptyDir selection, read-only here and read-write in init.
 			{Name: "shared", MountPath: "/shared", ReadOnly: true},
+			{Name: "shared", MountPath: "/shared-ro", ReadOnly: true},
+			// API-data volumes without read_only: read-only all the same.
+			{Name: "cfgflagless", MountPath: "/etc/cfg-flagless"},
+			{Name: "info", MountPath: "/etc/info"},
 		}}},
 	}
 	layout, err := mount.Materialize(context.Background(), box, dataVol, "10.1.2.3", roResolver{data: cmData})
@@ -96,8 +107,12 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 	scratch := filepath.Join(dataVol, "scratch")
 	cfg := filepath.Join(dataVol, "etc", "cfg")
 	shared := filepath.Join(dataVol, "shared")
-	for _, dir := range []string{scratch, shared, dataVol} {
+	sharedRO := filepath.Join(dataVol, "shared-ro")
+	cfgFlagless := filepath.Join(dataVol, "etc", "cfg-flagless")
+	info := filepath.Join(dataVol, "etc", "info")
+	for _, dir := range []string{scratch, shared, sharedRO, dataVol} {
 		for _, op := range roOps {
+			// O_TRUNC through any link a later layout puts at sharedRO.
 			if err := os.WriteFile(filepath.Join(dir, op), []byte("cm"), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -132,9 +147,10 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 			_, err := os.Lstat(filepath.Join(dir, "created"))
 			return err == nil
 		case "write":
+			before, _ := os.ReadFile(f)
 			_ = run("/bin/sh", "-c", `printf x >> "$1"`, "sh", f)
 			b, err := os.ReadFile(f)
-			return err == nil && string(b) != "cm"
+			return err == nil && len(b) != len(before)
 		case "rename":
 			_ = run("/bin/mv", f, filepath.Join(dir, "renamed"))
 			_, err := os.Lstat(filepath.Join(dir, "renamed"))
@@ -157,7 +173,10 @@ func TestReadOnlyVolumeMountDeniesWrites(t *testing.T) {
 	}{
 		{"emptyDir mounted read_only", scratch, false},
 		{"configMap mounted read_only", cfg, false},
+		{"configMap mounted without read_only", cfgFlagless, false},
+		{"downwardAPI mounted without read_only", info, false},
 		{"emptyDir mounted read-write by another container", shared, true},
+		{"the same emptyDir at a path only read-only mounts use", sharedRO, true},
 		{"the data volume outside any mount", dataVol, true},
 	} {
 		for _, op := range roOps {

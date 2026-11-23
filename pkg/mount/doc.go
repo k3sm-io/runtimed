@@ -57,27 +57,30 @@ limitations under the License.
 // wires one backed by its apiserver client; unit tests wire a fake.
 //
 // Secrets and the projected ServiceAccount token are reported as credentials in
-// the returned Layout, and the Layout's ReadOnlyPaths (credentials, projected
-// volumes, and read_only mounts) go to sandbox.Generate as the read-only
-// sub-scope (file-read* + an explicit file-write* deny): a pod cannot write the
-// files at those mount paths.
+// the returned Layout, and the Layout's ReadOnlyPaths go to sandbox.Generate as
+// the read-only sub-scope (file-read* + an explicit file-write* deny): a pod
+// cannot write the files at those mount paths. Every configMap, secret,
+// downwardAPI and projected mount is read-only whatever its read_only flag
+// says, as the kubelet has mounted these API-data volumes since 1.10.
 //
-// The pod's containers share ONE Seatbelt profile (the runtime compiles it per
-// pod, and every spawn and exec of the pod runs under it), so read_only is
-// enforced per path, not per container: an emptyDir, configMap or downwardAPI
-// mount is read-only only when every container that mounts the selection at
-// that path sets read_only. Where one container mounts it read-only and another
-// read-write, the path stays writable for every container, and the volume is
-// reported in Layout.MixedReadOnly so the runtime can warn. This differs from
-// the kubelet, where the read-only container alone would be denied.
+// An emptyDir is read-only only when read_only is asked of it everywhere. The
+// pod's containers share ONE Seatbelt profile (the runtime compiles it per pod,
+// and every spawn and exec of the pod runs under it), so read_only is enforced
+// per selection (a volume plus its subPath), not per container: an emptyDir
+// mount is read-only only when every container that mounts the selection, at
+// any path, sets read_only. Where one container mounts it read-only and another
+// read-write, the selection stays writable for every container at every path,
+// and the volume is reported in Layout.MixedReadOnly so the runtime can warn.
+// This differs from the kubelet, where the read-only container alone would be
+// denied.
 //
 // The read-only sub-scope is a rule on paths, not on the files: a pod can
-// rename a parent of a credential mount aside (it writes its rootfs), after which the live generation's files sit outside the
-// sub-scope and the pod can change them, and it can put a directory of its own
-// at the mount path. So the live generation's content is not
-// integrity-protected against the pod itself; the daemon never reads it back
-// unless it is the generation the daemon recorded (see below), and a refresh
-// of a replaced mount dir renders it fresh.
+// rename a parent of a credential mount aside (it writes its rootfs), after
+// which the live generation's files sit outside the sub-scope and the pod can
+// change them, and it can put a directory of its own at the mount path. So the
+// live generation's content is not integrity-protected against the pod itself;
+// the daemon never reads it back unless it is the generation the daemon
+// recorded (see below), and a refresh of a replaced mount dir renders it fresh.
 //
 // # Refresh: the atomic-writer layout
 //

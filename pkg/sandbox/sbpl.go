@@ -558,9 +558,9 @@ type GenerateOptions struct {
 	// ReadOnlyPaths get a read-only sub-scope: granted file-read* and explicitly
 	// denied file-write*, emitted last so the write-deny wins even when the path
 	// lies inside the writable data volume. These are the mounts a pod must
-	// not write (mount.ReadOnlyPaths): the credential mounts (secrets + the
-	// projected ServiceAccount token), projected volumes, and every mount all
-	// of the pod's containers declare read_only.
+	// not write (mount.ReadOnlyPaths): every configMap, secret, downwardAPI
+	// and projected mount, and every emptyDir all of the pod's containers
+	// declare read_only.
 	ReadOnlyPaths []string
 	// WritePaths get a read+write allow: the read-write persistent-volume mount
 	// roots. A PVC-backed dir lives outside the pod data volume on the APFS

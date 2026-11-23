@@ -29,8 +29,9 @@ import (
 // TestReadOnlyMountsCreateMatchesReattach pins the read-only sub-scope a
 // native pod's profile carries for its read_only mounts, and that a daemon
 // re-attaching to the pod derives the same profile from the spec alone
-// (boxProfile, which reads mount.ReadOnlyPaths). An emptyDir and a
-// downwardAPI volume every container mounts read_only are in the sub-scope; an
+// (boxProfile, which reads mount.ReadOnlyPaths). An emptyDir every container
+// mounts read_only and a downwardAPI volume mounted without it are in the
+// sub-scope; an
 // emptyDir one container mounts read-only and another read-write is not, and
 // the create warns once, naming it.
 func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
@@ -47,7 +48,7 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 	}
 	box.Containers[0].VolumeMounts = []*runtimev1.VolumeMount{
 		{Name: "scratch", MountPath: "/scratch", ReadOnly: true},
-		{Name: "info", MountPath: "/etc/info", ReadOnly: true},
+		{Name: "info", MountPath: "/etc/info"}, // API data: read-only without the flag
 		{Name: "shared", MountPath: "/shared", ReadOnly: true},
 	}
 	box.Containers = append(box.Containers, &runtimev1.Container{
@@ -67,7 +68,7 @@ func TestReadOnlyMountsCreateMatchesReattach(t *testing.T) {
 	stanza := profile[at:]
 	for _, p := range []string{filepath.Join(rootfs, "scratch"), filepath.Join(rootfs, "etc", "info")} {
 		if !strings.Contains(stanza, "(subpath \""+p+"\")") {
-			t.Errorf("read_only mount %s is not in the profile's read-only sub-scope:\n%s", p, stanza)
+			t.Errorf("read-only mount %s is not in the profile's read-only sub-scope:\n%s", p, stanza)
 		}
 	}
 	if shared := filepath.Join(rootfs, "shared"); strings.Contains(stanza, shared) {

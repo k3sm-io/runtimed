@@ -48,8 +48,9 @@ type Layout struct {
 	// each alias of one (AliasOf set).
 	Mounts []Mount
 	// MixedReadOnly names, sorted, the volumes some container mounts read-only
-	// and another mounts read-write at the same path: the pod has one profile,
-	// so such a path stays writable (see the package doc). The caller warns.
+	// and another mounts read-write (one selection, any paths): the pod has one
+	// profile, so such a selection stays writable (see the package doc). The
+	// caller warns.
 	MixedReadOnly []string
 	// State is the refresh state the create-time render leaves behind: which
 	// volumes are wholly immutable and when each ServiceAccount token was
@@ -65,8 +66,9 @@ type Mount struct {
 	// the pod data volume — see the package doc).
 	Path string
 	// ReadOnly is the enforced read-only verdict (readOnlyMount): true for
-	// secrets, SA-token and projected volumes, and when EVERY container that
-	// mounts the selection at Path sets read_only. A ReadOnly mount gets the
+	// every configMap, secret, downwardAPI and projected volume, and for an
+	// emptyDir when EVERY container that mounts the selection (volume plus
+	// subPath), at any path, sets read_only. A ReadOnly mount gets the
 	// SBPL read-only sub-scope.
 	ReadOnly bool
 	// Credential marks a secret / SA-token (or a projected volume containing one):
@@ -122,7 +124,7 @@ func ReadOnlyPaths(box *runtimev1.PodBox, dataVol string) (paths, mixed []string
 	if err != nil {
 		return nil, nil, err
 	}
-	intent := readOnlyIntents(box, dataVol)
+	intent := readOnlyIntents(box)
 	var mix mixedSet
 	for _, pm := range plans {
 		if pm.class == classImage {
@@ -138,32 +140,35 @@ func ReadOnlyPaths(box *runtimev1.PodBox, dataVol string) (paths, mixed []string
 	return paths, mix.sorted(), nil
 }
 
-// readOnlyIntent is what the containers of a pod ask of one rebased
-// destination: whether every mount of it sets read_only, and whether any does.
+// readOnlyIntent is what the containers of a pod ask of one selection (a
+// volume plus its subPath): whether every mount of it sets read_only, and
+// whether any does.
 type readOnlyIntent struct {
 	all, any bool
 }
 
-// readOnlyIntents folds every container's read_only flag per rebased
-// destination (init containers included). planMounts keeps the first mount of
-// a destination and drops the repeats, so the flag of every repeat is read
-// here. A mount whose path does not rebase is skipped: planMounts refuses it.
-func readOnlyIntents(box *runtimev1.PodBox, dataVol string) map[string]readOnlyIntent {
-	out := map[string]readOnlyIntent{}
+// selectionOf is the selection pm materializes: the volume and its subPath.
+func selectionOf(vm *runtimev1.VolumeMount) seenMount {
+	return seenMount{name: vm.GetName(), subPath: vm.GetSubPath()}
+}
+
+// readOnlyIntents folds every container's read_only flag per selection (init
+// containers included), whatever mount path each container uses: planMounts
+// keeps the first mount of a destination and drops the repeats, so the flag of
+// every repeat is read here. The verdict is per selection, not per path,
+// because one selection's mount paths can share one directory.
+func readOnlyIntents(box *runtimev1.PodBox) map[seenMount]readOnlyIntent {
+	out := map[seenMount]readOnlyIntent{}
 	containers := append(append([]*runtimev1.Container{}, box.GetInitContainers()...), box.GetContainers()...)
 	for _, c := range containers {
 		for _, vm := range c.GetVolumeMounts() {
-			dest, err := resolveTarget(dataVol, vm.GetMountPath())
-			if err != nil {
-				continue
-			}
-			ro := vm.GetReadOnly()
-			prev, seen := out[dest]
+			sel, ro := selectionOf(vm), vm.GetReadOnly()
+			prev, seen := out[sel]
 			if !seen {
-				out[dest] = readOnlyIntent{all: ro, any: ro}
+				out[sel] = readOnlyIntent{all: ro, any: ro}
 				continue
 			}
-			out[dest] = readOnlyIntent{all: prev.all && ro, any: prev.any || ro}
+			out[sel] = readOnlyIntent{all: prev.all && ro, any: prev.any || ro}
 		}
 	}
 	return out
@@ -171,23 +176,34 @@ func readOnlyIntents(box *runtimev1.PodBox, dataVol string) map[string]readOnlyI
 
 // readOnlyMount is the ONE read-only predicate: Materialize sets Mount.ReadOnly
 // from it and ReadOnlyPaths reads it, so the create-time profile and a
-// re-attach's recompiled one cannot disagree. A mount is read-only when its
-// source is a credential (credentialSource) or a projected volume, or when
-// every container that mounts the selection at its path sets read_only. The
-// pod's containers share one SBPL profile, so a path one container mounts
-// read-write stays writable for all of them.
-func readOnlyMount(pm plannedMount, credential bool, intent map[string]readOnlyIntent) bool {
-	return credential || pm.vol.GetProjected() != nil || intent[pm.dest].all
+// re-attach's recompiled one cannot disagree. A configMap, secret, downwardAPI
+// or projected mount is read-only whatever its read_only flag says (kubelet
+// parity: the kubelet has mounted these API-data volumes read-only since
+// 1.10); credential is credentialSource, a subset of them. Any other mount
+// (an emptyDir) is read-only when every container that mounts its selection,
+// at any path, sets read_only. The pod's containers share one SBPL profile, so
+// a selection one container mounts read-write stays writable for all of them.
+// The verdict lands on every materialized directory of the selection: a
+// Seatbelt rule on a symlink path does not cover its target, so the directory
+// that holds the files is the path that must carry it.
+func readOnlyMount(pm plannedMount, credential bool, intent map[seenMount]readOnlyIntent) bool {
+	return credential || apiDataSource(pm.vol) || intent[selectionOf(pm.mount)].all
 }
 
-// mixedSet collects the volumes whose read_only flags disagree at a path that
-// therefore stays writable.
+// apiDataSource reports whether vol is an API-data volume (configMap, secret,
+// downwardAPI or projected), which a pod never writes.
+func apiDataSource(vol *runtimev1.Volume) bool {
+	return vol.GetConfigMap() != nil || vol.GetSecret() != nil || vol.GetDownwardApi() != nil || vol.GetProjected() != nil
+}
+
+// mixedSet collects the volumes whose read_only flags disagree for a
+// selection that therefore stays writable.
 type mixedSet map[string]bool
 
-// note records pm's volume when the containers mount it read-only and
-// read-write at one path and the verdict (ro) left it writable.
-func (m *mixedSet) note(pm plannedMount, ro bool, intent map[string]readOnlyIntent) {
-	if ro || !intent[pm.dest].any {
+// note records pm's volume when the containers mount its selection read-only
+// and read-write and the verdict (ro) left it writable.
+func (m *mixedSet) note(pm plannedMount, ro bool, intent map[seenMount]readOnlyIntent) {
+	if ro || !intent[selectionOf(pm.mount)].any {
 		return
 	}
 	if *m == nil {
@@ -508,7 +524,7 @@ func Materialize(ctx context.Context, box *runtimev1.PodBox, dataVol, podIP stri
 	}
 
 	layout := &Layout{State: RefreshState{Immutable: map[string]bool{}, Tokens: map[string]TokenIssue{}, Mounts: map[string]MountIdentity{}}}
-	intent := readOnlyIntents(box, dataVol)
+	intent := readOnlyIntents(box)
 	var mix mixedSet
 	for _, pm := range plans {
 		if pm.class == classImage {

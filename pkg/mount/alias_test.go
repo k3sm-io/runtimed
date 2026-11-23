@@ -159,10 +159,15 @@ func TestSameVolumeDifferentMountPathsShareOneDir(t *testing.T) {
 		if !reflect.DeepEqual(pure, wantCreds) {
 			t.Errorf("CredentialPaths() = %v, want %v", pure, wantCreds)
 		}
+		// An API-data volume is read-only at every path; the profile's rule is
+		// on the one directory, which the alias resolves to.
 		for _, m := range layout.Mounts {
-			if m.ReadOnly != wantCred || m.Credential != wantCred {
-				t.Errorf("mount %+v: want ReadOnly and Credential = %v", m, wantCred)
+			if !m.ReadOnly || m.Credential != wantCred {
+				t.Errorf("mount %+v: want ReadOnly, and Credential = %v", m, wantCred)
 			}
+		}
+		if got, want := layout.ReadOnlyPaths(), []string{filepath.Join(dataVol, "etc/first")}; !reflect.DeepEqual(got, want) {
+			t.Errorf("Layout.ReadOnlyPaths() = %v, want only the directory %v", got, want)
 		}
 
 		update()
