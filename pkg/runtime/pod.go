@@ -93,7 +93,10 @@ type pod struct {
 	// lets the node compute the pod Initialized. One record per name: a rerun
 	// of the step replaces it, and a rerun of the sequence from an init index
 	// clears the records from that index on (clearCompletedInitsLocked). It
-	// lives exactly as long as the pod. Guarded by mu.
+	// lives as long as the pod, for one daemon lifetime: it is not persisted,
+	// and AttachPod does not rebuild it, because a completed plain init's reap
+	// record is removed once its group is empty (watchContainerExit), so a
+	// restarted daemon has nothing to rebuild it from. Guarded by mu.
 	completedInits []*runtimev1.ContainerStatus
 
 	// stopping marks the pod as being torn down: DeletePod sets it under mu
@@ -1610,10 +1613,9 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // triggered them.
 func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, initFrom int) (runtimev1.FailureReason, error) {
 	inits := p.box.GetInitContainers()
-	// The steps from initFrom on are about to run again (or for the first
-	// time), so whatever an earlier run of them recorded no longer describes
-	// this pod; the records are rebuilt as each step completes, the kubelet's
-	// own semantics for a rerun init sequence.
+	// The steps from initFrom on are steps not yet run in this sequence, so
+	// no completed-init record may stand for any of them until it completes
+	// here; each step's record is written again as it completes.
 	p.mu.Lock()
 	clearCompletedInitsLocked(p, inits[min(initFrom, len(inits)):])
 	p.mu.Unlock()
@@ -3020,7 +3022,16 @@ func removeContainerLocked(p *pod, name string) {
 // reason taxonomy every exit uses (Completed for 0, Error with the exit code
 // otherwise, and the OOM and external-kill reasons) — and it is never shared
 // with the containerProc, whose own state the kqueue reaper still writes when
-// it observes the same exit. Caller holds p.mu.
+// it observes the same exit.
+//
+// That later reaper write lands on cp.state after cp has left p.containers,
+// and it can differ slightly from this record: its FinishedAt is taken after
+// the log drain-wait, and it may see an OOM or external-kill verdict that was
+// not yet set here. The difference is harmless because nothing reads the
+// orphaned cp.state for status any more — podStatus reports this record, and
+// the reaper's publish renders through podStatus too — so the pod reports one
+// outcome per init container, the one recorded when its step finished.
+// Caller holds p.mu.
 func recordCompletedInitLocked(p *pod, cp *containerProc, code, sig int, werr error) {
 	rec := proto.CloneOf(containerStatusOf(cp))
 	term := cp.state.GetState().GetTerminated()
