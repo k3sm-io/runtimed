@@ -85,6 +85,16 @@ type pod struct {
 	message    string
 	podIP      string
 	containers []*containerProc
+	// completedInits is the terminated record of each plain init container
+	// that ran to completion (or failed) in this pod's start sequence, in the
+	// order they finished. A completed plain init leaves p.containers
+	// (finishInitStep), so this is the only place its outcome lives; podStatus
+	// reports it under init_container_statuses in spec order, which is what
+	// lets the node compute the pod Initialized. One record per name: a rerun
+	// of the step replaces it, and a rerun of the sequence from an init index
+	// clears the records from that index on (clearCompletedInitsLocked). It
+	// lives exactly as long as the pod. Guarded by mu.
+	completedInits []*runtimev1.ContainerStatus
 
 	// stopping marks the pod as being torn down: DeletePod sets it under mu
 	// BEFORE it snapshots the containers to stop, and it is never cleared (a pod
@@ -1600,6 +1610,13 @@ func (r *Runtime) oomKill(p *pod, footprint uint64) {
 // triggered them.
 func (r *Runtime) startSequence(ctx context.Context, p *pod, rootfs string, initFrom int) (runtimev1.FailureReason, error) {
 	inits := p.box.GetInitContainers()
+	// The steps from initFrom on are about to run again (or for the first
+	// time), so whatever an earlier run of them recorded no longer describes
+	// this pod; the records are rebuilt as each step completes, the kubelet's
+	// own semantics for a rerun init sequence.
+	p.mu.Lock()
+	clearCompletedInitsLocked(p, inits[min(initFrom, len(inits)):])
+	p.mu.Unlock()
 	for i := initFrom; i < len(inits); i++ {
 		c := inits[i]
 		claimed, ok := r.claimStart(p, c.GetName())
@@ -1774,8 +1791,8 @@ func (r *Runtime) killUntrackedSpawn(ctx context.Context, p *pod, cp *containerP
 // finishInitStep completes one init step for an already-spawned container: a
 // native sidecar is not waited (KEP-753 spawn-equals-started, so the sequence
 // proceeds while it runs), and a plain init container is waited to completion
-// and then dropped from the tracked set, which is where a completed init
-// container has always lived — nowhere.
+// and then dropped from the tracked set, leaving its terminated record in
+// p.completedInits (recordCompletedInitLocked) for the status to report.
 //
 // A non-zero exit or a failed wait is a POD-class SPAWN failure, unchanged: an
 // init container that ran and failed is not an image problem and has no waiting
@@ -1813,7 +1830,7 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 	if cp.sidecar() {
 		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, nil
 	}
-	code, _, werr := cp.proc.Wait(ctx)
+	code, sig, werr := cp.proc.Wait(ctx)
 	if werr != nil && ctx.Err() != nil {
 		return runtimev1.FailureReason_FAILURE_REASON_SPAWN,
 			fmt.Errorf("init container %s wait: %w", cp.name, werr)
@@ -1824,6 +1841,7 @@ func (r *Runtime) finishInitStep(ctx context.Context, p *pod, cp *containerProc)
 		return installFailureReason(errPodStopping),
 			fmt.Errorf("init container %s: %w", cp.name, errPodStopping)
 	}
+	recordCompletedInitLocked(p, cp, code, sig, werr)
 	removeContainerLocked(p, cp.name)
 	p.mu.Unlock()
 	var tail string
@@ -2982,10 +3000,10 @@ func waitingContainersLocked(p *pod) int {
 // removeContainerLocked drops the pod's entry for name, if any. It is how a
 // plain init container leaves the tracked set the moment it completes: the
 // long-lived container list holds running/waiting containers, and a completed
-// init container is neither (the model predates this change — an init container
-// that ran was never tracked at all; the WAITING placeholder a blocked sequence
-// leaves for one is what has to be cleared when it finally runs). Caller holds
-// p.mu.
+// init container is neither (the WAITING placeholder a blocked sequence leaves
+// for one is what has to be cleared when it finally runs). Its outcome is kept
+// apart, in p.completedInits (recordCompletedInitLocked), which is what reports
+// it. Caller holds p.mu.
 func removeContainerLocked(p *pod, name string) {
 	for i, cp := range p.containers {
 		if cp.name == name {
@@ -2993,6 +3011,52 @@ func removeContainerLocked(p *pod, name string) {
 			return
 		}
 	}
+}
+
+// recordCompletedInitLocked keeps the terminated record of a plain init
+// container that finishInitStep just waited, replacing any earlier record of
+// the same name. The record is a copy of the container's status with its state
+// set to the Terminated this exit derives through terminatedLocked — the one
+// reason taxonomy every exit uses (Completed for 0, Error with the exit code
+// otherwise, and the OOM and external-kill reasons) — and it is never shared
+// with the containerProc, whose own state the kqueue reaper still writes when
+// it observes the same exit. Caller holds p.mu.
+func recordCompletedInitLocked(p *pod, cp *containerProc, code, sig int, werr error) {
+	rec := proto.CloneOf(containerStatusOf(cp))
+	term := cp.state.GetState().GetTerminated()
+	if term == nil {
+		term = terminatedLocked(p, cp, code, sig, werr)
+	}
+	rec.State = &runtimev1.ContainerState{Terminated: proto.CloneOf(term)}
+	rec.Ready = false
+	for i, prev := range p.completedInits {
+		if prev.GetName() == rec.GetName() {
+			p.completedInits[i] = rec
+			return
+		}
+	}
+	p.completedInits = append(p.completedInits, rec)
+}
+
+// clearCompletedInitsLocked drops the completed-init records of the named
+// init steps, the ones a start sequence is about to run again. Caller holds
+// p.mu.
+func clearCompletedInitsLocked(p *pod, steps []*runtimev1.Container) {
+	if len(p.completedInits) == 0 || len(steps) == 0 {
+		return
+	}
+	rerun := make(map[string]bool, len(steps))
+	for _, c := range steps {
+		rerun[c.GetName()] = true
+	}
+	kept := p.completedInits[:0]
+	for _, rec := range p.completedInits {
+		if !rerun[rec.GetName()] {
+			kept = append(kept, rec)
+		}
+	}
+	clear(p.completedInits[len(kept):])
+	p.completedInits = kept
 }
 
 // resolvedBinary is what resolveBinary determined for one container: the on-disk

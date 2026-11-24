@@ -119,12 +119,20 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 		t.Errorf("spawned %d processes, want 3 (sidecar + init + main)", n)
 	}
 
-	// The sidecar reports in init_container_statuses: running, started=true; the
-	// main is the only container_statuses entry (the status split).
+	// The sidecar reports in init_container_statuses: running, started=true,
+	// followed in spec order by the completed plain init (Terminated,
+	// Completed); the main is the only container_statuses entry (the status
+	// split).
 	st := res.resp.GetStatus()
 	ics := st.GetInitContainerStatuses()
-	if len(ics) != 1 || ics[0].GetName() != "sc" {
-		t.Fatalf("init_container_statuses = %+v, want the one sidecar", ics)
+	if len(ics) != 2 || ics[0].GetName() != "sc" || ics[1].GetName() != "ip" {
+		t.Fatalf("init_container_statuses = %+v, want [sc ip] in spec order", ics)
+	}
+	if term := ics[1].GetState().GetTerminated(); term == nil || term.GetExitCode() != 0 || term.GetReason() != "Completed" {
+		t.Errorf("plain init state = %+v, want Terminated exit 0 Completed", ics[1].GetState())
+	}
+	if ics[1].GetStartedSet() {
+		t.Errorf("plain init started_set = true, want unset (started is a sidecar field)")
 	}
 	if ics[0].GetState().GetRunning() == nil {
 		t.Errorf("sidecar state = %+v, want Running", ics[0].GetState())

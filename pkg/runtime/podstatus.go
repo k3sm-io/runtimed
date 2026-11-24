@@ -40,19 +40,24 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 		st.PodIps = []string{p.podIP}
 	}
 	// Long-lived containers split by declaration list: an init-declared container
-	// (today only native sidecars are tracked long-lived from the init list)
-	// reports under init_container_statuses, mains under container_statuses.
-	// An ephemeral (debug) container reports under ephemeral_container_statuses.
+	// (a native sidecar, a plain init still running, or a Waiting placeholder for
+	// an init step not reached) reports under init_container_statuses, mains
+	// under container_statuses. An ephemeral (debug) container reports under
+	// ephemeral_container_statuses. A plain init container that already ran is
+	// no longer tracked; its terminated record (p.completedInits) reports under
+	// init_container_statuses too, merged in spec order (initStatusesLocked).
+	var tracked []*containerProc
 	for _, cp := range p.containers {
 		switch {
 		case cp.ephemeral:
 			st.EphemeralContainerStatuses = append(st.EphemeralContainerStatuses, containerStatusOf(cp))
 		case cp.initDeclared:
-			st.InitContainerStatuses = append(st.InitContainerStatuses, containerStatusOf(cp))
+			tracked = append(tracked, cp)
 		default:
 			st.ContainerStatuses = append(st.ContainerStatuses, containerStatusOf(cp))
 		}
 	}
+	st.InitContainerStatuses = initStatusesLocked(p, tracked)
 	if cond := shimInactiveConditionLocked(p); cond != nil {
 		st.Conditions = append(st.Conditions, cond)
 	}
@@ -76,6 +81,44 @@ func (r *Runtime) podStatus(p *pod) *runtimev1.PodStatus {
 		st.GuestTransportAddress = p.guestLease
 	}
 	return st
+}
+
+// initStatusesLocked renders a host-process pod's init_container_statuses in
+// the order the init list declares them: for each declared init container, its
+// tracked entry when it has one (a running or waiting step, a sidecar), else
+// its completed-init record. A tracked init entry whose name the init list no
+// longer holds is still reported, after the declared ones, so nothing tracked
+// drops out of the status. Each completed record is copied, so a caller cannot
+// mutate pod state through the snapshot. Caller holds p.mu.
+func initStatusesLocked(p *pod, tracked []*containerProc) []*runtimev1.ContainerStatus {
+	if len(tracked) == 0 && len(p.completedInits) == 0 {
+		return nil
+	}
+	byName := make(map[string]*containerProc, len(tracked))
+	for _, cp := range tracked {
+		byName[cp.name] = cp
+	}
+	done := make(map[string]*runtimev1.ContainerStatus, len(p.completedInits))
+	for _, rec := range p.completedInits {
+		done[rec.GetName()] = rec
+	}
+	out := make([]*runtimev1.ContainerStatus, 0, len(tracked)+len(p.completedInits))
+	emitted := make(map[string]bool, len(tracked))
+	for _, c := range p.box.GetInitContainers() {
+		name := c.GetName()
+		if cp, ok := byName[name]; ok {
+			out = append(out, containerStatusOf(cp))
+			emitted[name] = true
+		} else if rec, ok := done[name]; ok {
+			out = append(out, proto.CloneOf(rec))
+		}
+	}
+	for _, cp := range tracked {
+		if !emitted[cp.name] {
+			out = append(out, containerStatusOf(cp))
+		}
+	}
+	return out
 }
 
 // appendGuestContainerStatusesLocked adds p's guest-derived container statuses

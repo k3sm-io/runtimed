@@ -546,9 +546,8 @@ func TestStartContainerResumesTheInitSequence(t *testing.T) {
 	// Three spawns: the healed init-a, then init-b, then the main. Two would mean
 	// the sequence restarted at the mains and skipped the init container that was
 	// blocked behind the failure — the mutation this assertion exists for. (Both
-	// plain init containers leave the tracked set as they complete, which is
-	// where a completed init container has always lived, so the spawn seam is
-	// what witnesses them.)
+	// plain init containers leave the tracked set as they complete, so the
+	// spawn seam is what witnesses that each one was actually spawned.)
 	sp.mu.Lock()
 	spawned := len(sp.specs)
 	sp.mu.Unlock()
