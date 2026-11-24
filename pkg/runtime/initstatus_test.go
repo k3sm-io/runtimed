@@ -171,3 +171,187 @@ func TestFailedPlainInitContainerReportsTerminatedError(t *testing.T) {
 		t.Errorf("init-b state = %+v, want Waiting %s", ics[1].GetState(), waitingPodInitializing)
 	}
 }
+
+// TestInitStatusesFollowSpecOrderAroundASidecar: with an init list of
+// [plain, sidecar, plain], init_container_statuses lists the three in that
+// order — the completed records are merged with the tracked sidecar by spec
+// position, not appended after it.
+func TestInitStatusesFollowSpecOrderAroundASidecar(t *testing.T) {
+	const podID = "pod-init-order"
+	// ip1 (1001) and ip2 (1003) exit 0; the sidecar (1002) and main (1004) run.
+	w := &codeByPIDWaiter{codes: map[int]int{1001: 0, 1003: 0}}
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: w})
+	box := hostBinBox(rt, podID)
+	box.InitContainers = []*runtimev1.Container{
+		{Name: "ip1", Image: "/bin/true"},
+		{Name: "sc", Image: "/bin/sleep", RestartPolicy: runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS},
+		{Name: "ip2", Image: "/bin/true"},
+	}
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+	}
+	ics := resp.GetStatus().GetInitContainerStatuses()
+	var names []string
+	for _, cs := range ics {
+		names = append(names, cs.GetName())
+	}
+	if len(names) != 3 || names[0] != "ip1" || names[1] != "sc" || names[2] != "ip2" {
+		t.Fatalf("init_container_statuses names = %v, want [ip1 sc ip2]", names)
+	}
+	assertCompletedInit(t, "CreatePod", ics, "ip1", 0, "Completed")
+	assertCompletedInit(t, "CreatePod", ics, "ip2", 0, "Completed")
+	if ics[1].GetState().GetRunning() == nil {
+		t.Errorf("sidecar state = %+v, want Running", ics[1].GetState())
+	}
+}
+
+// completedInitsOf returns a copy of the completed-init records of podID.
+func completedInitsOf(t *testing.T, rt *Runtime, podID string) []*runtimev1.ContainerStatus {
+	t.Helper()
+	p, ok := rt.lookupPod(podID)
+	if !ok {
+		t.Fatalf("pod %s not registered", podID)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*runtimev1.ContainerStatus(nil), p.completedInits...)
+}
+
+// TestResumedSequenceClearsRecordsOfLaterSteps: a start sequence resumed
+// after init step idx drops the records of the steps from idx+1 on before it
+// runs them, so a step that then does not complete (here: its image fails, so
+// it is left Waiting) carries no record from an earlier run. The resumed step
+// itself keeps the record its own completion just wrote.
+func TestResumedSequenceClearsRecordsOfLaterSteps(t *testing.T) {
+	const (
+		podID   = "pod-init-clear"
+		goodRef = "example.com/good:v1"
+		badRef  = "example.com/bad:v1"
+		bRef    = "example.com/b-bad:v1"
+	)
+	pull := &fakePuller{errByRef: map[string]error{
+		badRef: errors.New("manifest unknown: no such image"),
+		bRef:   errors.New("manifest unknown: no such image"),
+	}}
+	w := &codeByPIDWaiter{codes: map[int]int{1001: 0}}
+	rt := newTestRuntime(t, Deps{
+		Puller:   pull,
+		Spawner:  &fakeSpawner{},
+		Unpacker: &fakeUnpacker{runCfg: image.ImageRunConfig{Cmd: []string{"/app"}}},
+		Waiter:   w,
+	})
+	box := pullBox(rt, podID, pulledContainer("main", goodRef))
+	box.InitContainers = []*runtimev1.Container{
+		pulledContainer("init-a", badRef),
+		pulledContainer("init-b", bRef),
+	}
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+	}
+	// A record for the later step, as an earlier run of it would have left.
+	p, _ := rt.lookupPod(podID)
+	p.mu.Lock()
+	p.completedInits = append(p.completedInits, &runtimev1.ContainerStatus{
+		Name:  "init-b",
+		State: &runtimev1.ContainerState{Terminated: &runtimev1.ContainerStateTerminated{ExitCode: 99, Reason: "Error"}},
+	})
+	p.mu.Unlock()
+
+	pull.healRef(badRef)
+	if _, err := rt.StartContainer(context.Background(),
+		&runtimev1.StartContainerRequest{PodId: podID, Container: "init-a"}); err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	recs := completedInitsOf(t, rt, podID)
+	if len(recs) != 1 || recs[0].GetName() != "init-a" {
+		t.Fatalf("completed-init records after the resume = %+v, want only init-a", recs)
+	}
+	if got := recs[0].GetState().GetTerminated(); got.GetExitCode() != 0 || got.GetReason() != "Completed" {
+		t.Errorf("init-a record = %+v, want exit 0 Completed", got)
+	}
+}
+
+// TestRerunInitStepReplacesItsRecord: recording a step that already has a
+// record replaces it by name, so a pod never reports two outcomes for one
+// init container.
+func TestRerunInitStepReplacesItsRecord(t *testing.T) {
+	const podID = "pod-init-rerun"
+	w := &codeByPIDWaiter{codes: map[int]int{1001: 0}}
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: w})
+	box := hostBinBox(rt, podID)
+	box.InitContainers = []*runtimev1.Container{{Name: "init", Image: "/bin/true"}}
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+	}
+	first := completedInitsOf(t, rt, podID)
+	if len(first) != 1 {
+		t.Fatalf("records after create = %+v, want one", first)
+	}
+
+	// The step's second run, recorded through the same path finishInitStep
+	// uses, exiting 7.
+	p, _ := rt.lookupPod(podID)
+	rerun := &containerProc{
+		name:         "init",
+		spec:         box.InitContainers[0],
+		initDeclared: true,
+		state: &runtimev1.ContainerStatus{
+			Name:        "init",
+			Image:       "/bin/true",
+			ContainerId: "rerun-id",
+			State:       &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: nowProto()}},
+		},
+	}
+	p.mu.Lock()
+	recordCompletedInitLocked(p, rerun, 7, 0, nil)
+	p.mu.Unlock()
+
+	recs := completedInitsOf(t, rt, podID)
+	if len(recs) != 1 {
+		t.Fatalf("records after the rerun = %+v, want exactly one for init", recs)
+	}
+	if got := recs[0].GetState().GetTerminated(); got.GetExitCode() != 7 || got.GetReason() != "Error" {
+		t.Errorf("record after the rerun = %+v, want exit 7 Error (the rerun's outcome)", got)
+	}
+	gs, err := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: podID})
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	assertCompletedInit(t, "GetPodStatus", gs.GetStatus().GetInitContainerStatuses(), "init", 7, "Error")
+}
+
+// TestDeletedPodReportsNoInitRecords: the records live with the pod, so once
+// DeletePod has run neither GetPodStatus nor the watch snapshot reports
+// anything for it.
+func TestDeletedPodReportsNoInitRecords(t *testing.T) {
+	const podID = "pod-init-delete"
+	w := &codeByPIDWaiter{codes: map[int]int{1001: 0, 1002: 0}}
+	rt := newTestRuntime(t, Deps{Spawner: &fakeSpawner{}, Waiter: w})
+	box := hostBinBox(rt, podID)
+	box.TerminationGracePeriodSeconds = 0
+	box.InitContainers = []*runtimev1.Container{{Name: "init", Image: "/bin/true"}}
+	resp, err := rt.CreatePod(context.Background(), &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("CreatePod: %v / %v", err, resp.GetError())
+	}
+	assertCompletedInit(t, "CreatePod", resp.GetStatus().GetInitContainerStatuses(), "init", 0, "Completed")
+
+	if _, err := rt.DeletePod(context.Background(), &runtimev1.DeletePodRequest{PodId: podID}); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	gs, err := rt.GetPodStatus(context.Background(), &runtimev1.GetPodStatusRequest{PodId: podID})
+	if err != nil {
+		t.Fatalf("GetPodStatus: %v", err)
+	}
+	if gs.GetStatus() != nil || gs.GetError() == nil {
+		t.Errorf("GetPodStatus after DeletePod = %+v, want NotFound and no status", gs)
+	}
+	for _, st := range rt.snapshotStatuses("") {
+		if st.GetPodId() == podID {
+			t.Errorf("watch snapshot still reports deleted pod %s: %+v", podID, st.GetInitContainerStatuses())
+		}
+	}
+}
