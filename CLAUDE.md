@@ -1,5 +1,12 @@
 # runtimed — k3sm native macOS runtime
 
+@.claude/rules/native-builds.md
+
+Use the `yurei build` queue via the runtime's executable absolute `YUREI_BIN`; verify native pod placement.
+Preserve BypassGuard and every real human gate; this policy never widens credential, money, release or irreversible authority.
+
+All build and test examples below run through the approved native Darwin pod route; older host exceptions are superseded.
+
 Module **`k3sm.io/runtimed`** (≈ containerd). The native-Darwin runtime daemon: turns Pods into
 isolated **native processes** — `pkg/sandbox` (Seatbelt/SBPL backends), a supervisor
 (posix_spawn/kqueue, userspace memory/CPU limits), image (OCI → APFS `clonefile`), exposing a gRPC
